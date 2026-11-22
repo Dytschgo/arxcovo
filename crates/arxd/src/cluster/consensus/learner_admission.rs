@@ -1,9 +1,17 @@
 //! One retained membership intent, with the existing Owners and proposal unit.
-use super::{membership_observation::AdmissionObservation, *};
+use super::{
+    membership_observation::{
+        AdmissionObservation, AdmissionReadError, LearnerLag, MembershipReadError,
+    },
+    *,
+};
 use crate::cluster::{c13_diagnostics::record, pki::verify::AuthenticatedPeer};
 use openraft::{
-    ChangeMembers, errors::PreconditionFailed, raft::Precondition,
-    type_config::async_runtime::watch::WatchReceiver,
+    ChangeMembers,
+    errors::PreconditionFailed,
+    metrics::RaftDataMetrics,
+    raft::Precondition,
+    type_config::{alias::WatchReceiverOf, async_runtime::watch::WatchReceiver},
 };
 use std::{
     future::{Future, poll_fn},
@@ -60,6 +68,7 @@ impl Drop for Intent {
 }
 
 pub(super) const BUDGET: Duration = Duration::from_secs(5);
+const REOBSERVE_WAIT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Reply {
@@ -91,6 +100,35 @@ pub(super) fn covers(progress: LogPos, target: LogPos) -> bool {
 }
 
 type RetainedNode = tokio::sync::Mutex<ConsensusNode>;
+type NodeGuard<'a> = tokio::sync::MutexGuard<'a, ConsensusNode>;
+type AdmissionRead = Result<AdmissionObservation, AdmissionReadError>;
+type MembershipResult = Result<Id, RaftError<Arx, ClientWriteError<Arx>>>;
+
+async fn wait_for_learner(
+    mut metrics: WatchReceiverOf<Arx, RaftDataMetrics<Arx>>,
+    lag: LearnerLag,
+) -> bool {
+    loop {
+        {
+            // Check the latest value while arming the watch for the next one.
+            let data = metrics.borrow_and_update();
+            let Some(replication) = &data.replication else {
+                return false;
+            };
+            if replication
+                .get(&lag.node)
+                .copied()
+                .flatten()
+                .is_some_and(|matched| covers(pos(matched), lag.committed))
+            {
+                return true;
+            }
+        }
+        if metrics.changed().await.is_err() {
+            return false;
+        }
+    }
+}
 
 pub(super) struct PromotionStart(oneshot::Receiver<()>);
 
@@ -116,7 +154,7 @@ fn finish_registration<N, R, G>(
     let (ready, start) = oneshot::channel();
     let registered = register(&node, PromotionStart(start));
     // Owners may poll the worker before registration returns. Release all
-    // registration locks before its single fresh observation can touch the node.
+    // registration locks before its first fresh observation can touch the node.
     drop(node);
     drop(extra_guard);
     let _ = ready.send(());
@@ -176,6 +214,25 @@ impl StopGate {
                 };
                 read.as_mut().poll(cx).map(Ok)
             }) => result,
+        }
+    }
+
+    async fn wait_for_progress(
+        &self,
+        cutoff: Instant,
+        progress: impl Future<Output = bool>,
+    ) -> bool {
+        let stopped = self.stopped.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        if !self.is_open() || Instant::now() >= cutoff {
+            return false;
+        }
+        tokio::select! {
+            biased;
+            () = stopped.as_mut() => false,
+            () = tokio::time::sleep_until(cutoff) => false,
+            ready = progress => ready && Instant::now() < cutoff,
         }
     }
 
@@ -413,29 +470,101 @@ impl Controller {
         let Some(node) = self.node.upgrade() else {
             return Reply::Refused;
         };
-        let (raft, observed) = {
-            let Some(node) = self
-                .lock_node_for_stage(&node, deadline, "admission-worker")
-                .await
-            else {
-                return Reply::Refused;
-            };
-            let Some(raft) = node.raft.clone() else {
-                return Reply::Refused;
-            };
-            let observed = self
-                .gate
-                .observe(
-                    node.admission_observation(peer, address, None),
-                    Reply::Refused,
-                )
-                .await;
-            (raft, observed)
-        };
-        let observed = match observed {
+        self.run_attempt(
+            &node,
+            deadline,
+            submitted,
+            |node, position| async move {
+                let raft = node.raft.clone().ok_or(Reply::Refused)?;
+                Ok((
+                    raft,
+                    node.admission_observation(peer, address, position).await,
+                ))
+            },
+            |raft, lag| wait_for_learner(raft.data_metrics(), lag),
+            |raft, guards| async move {
+                let add = ChangeMembers::AddNodes(BTreeMap::from([(
+                    peer.node().get(),
+                    BasicNode::new(address.to_string()),
+                )]));
+                raft.change_membership_if(add, true, guards)
+                    .await
+                    .map(|response| response.log_id)
+            },
+        )
+        .await
+    }
+
+    async fn preproposal_read<'a, T, F: Future<Output = Result<T, Reply>>>(
+        &self,
+        node: &'a RetainedNode,
+        deadline: Instant,
+        observe: impl FnOnce(NodeGuard<'a>) -> F,
+    ) -> Result<T, Reply> {
+        let node = self
+            .lock_node_for_stage(node, deadline, "admission-worker")
+            .await
+            .ok_or(Reply::Refused)?;
+        self.gate
+            .observe(
+                async {
+                    if Instant::now() >= deadline {
+                        return Err(Reply::Refused);
+                    }
+                    tokio::select! {
+                        biased;
+                        () = tokio::time::sleep_until(deadline) => Err(Reply::Refused),
+                        observed = observe(node) => observed,
+                    }
+                },
+                Reply::Refused,
+            )
+            .await?
+    }
+
+    async fn run_attempt<'a, R, O, W, D>(
+        &self,
+        node: &'a RetainedNode,
+        deadline: Instant,
+        submitted: &AtomicBool,
+        mut observe: impl FnMut(NodeGuard<'a>, Option<LogPos>) -> O,
+        wait: impl FnOnce(&R, LearnerLag) -> W,
+        dispatch: impl FnOnce(R, [Precondition<Arx>; 3]) -> D,
+    ) -> Reply
+    where
+        O: Future<Output = Result<(R, AdmissionRead), Reply>>,
+        W: Future<Output = bool>,
+        D: Future<Output = MembershipResult>,
+    {
+        let (mut raft, mut observed) = match self
+            .preproposal_read(node, deadline, |node| observe(node, None))
+            .await
+        {
             Ok(observed) => observed,
             Err(reply) => return reply,
         };
+        // The first retained-node guard was dropped when preproposal_read returned.
+        // Keep the same owner, membership intent and permit through the single reread.
+        let reobserve = match observed {
+            Err(AdmissionReadError::ViewChanged) => true,
+            Err(AdmissionReadError::LearnerBehind(lag)) => {
+                let cutoff = deadline.min(Instant::now() + REOBSERVE_WAIT);
+                if !self.gate.wait_for_progress(cutoff, wait(&raft, lag)).await {
+                    return self.refuse_observation(AdmissionReadError::LearnerBehind(lag));
+                }
+                true
+            }
+            _ => false,
+        };
+        if reobserve {
+            (raft, observed) = match self
+                .preproposal_read(node, deadline, |node| observe(node, None))
+                .await
+            {
+                Ok(observed) => observed,
+                Err(_) => return self.refuse_observation(AdmissionReadError::ViewChanged),
+            };
+        }
         let (leader, membership, tail) = match observed {
             Ok(AdmissionObservation::Answer(reply)) => return reply,
             Ok(AdmissionObservation::Add {
@@ -443,35 +572,13 @@ impl Controller {
                 membership,
                 tail,
             }) => (leader, membership, tail),
-            Err(error) => {
-                use super::membership_observation::MembershipReadError;
-                record(
-                    "admission-membership",
-                    match error {
-                        MembershipReadError::Busy => "busy",
-                        MembershipReadError::NotLeader => "not-leader",
-                        MembershipReadError::Unavailable => "unavailable",
-                        MembershipReadError::RetryLater => "view-changed",
-                        MembershipReadError::PeerRefused => "identity",
-                    },
-                );
-                #[cfg(test)]
-                if self.hooks.active.load(Ordering::Relaxed) {
-                    eprintln!("C10 fresh membership read refused: {error:?}");
-                }
-                let _ = error;
-                return Reply::Refused;
-            }
+            Err(error) => return self.refuse_observation(error),
         };
         #[cfg(test)]
         if !self.hooks.pause(deadline).await {
             return Reply::Refused;
         }
 
-        let add = ChangeMembers::AddNodes(BTreeMap::from([(
-            peer.node().get(),
-            BasicNode::new(address.to_string()),
-        )]));
         let guards = [
             Precondition::LastMembershipLogId {
                 last_membership_log_id: Some(membership),
@@ -484,16 +591,14 @@ impl Controller {
             },
         ];
         let result = self
-            .submit_membership(deadline, submitted, || {
-                raft.change_membership_if(add, true, guards)
-            })
+            .submit_membership(deadline, submitted, || dispatch(raft, guards))
             .await;
         let result = match result {
             Ok(result) => result,
             Err(reply) => return reply,
         };
-        let response = match result {
-            Ok(response) => response,
+        let position = match result {
+            Ok(position) => pos(position),
             Err(RaftError::APIError(ClientWriteError::PreconditionFailed(
                 PreconditionFailed::LastLogIdMismatch { expected, actual },
             ))) if expected == Some(tail) => {
@@ -520,9 +625,32 @@ impl Controller {
                 return Reply::Unknown;
             }
         };
-        let position = pos(response.log_id);
-        self.confirm_admission(&node, peer, address, position, deadline)
-            .await
+        self.confirm_admission(node, position, deadline, |node| {
+            observe(node, Some(position))
+        })
+        .await
+    }
+
+    fn refuse_observation(&self, error: AdmissionReadError) -> Reply {
+        self.gate.report_if_open(|| {
+            let category = match error {
+                AdmissionReadError::ViewChanged | AdmissionReadError::LearnerBehind(_) => {
+                    "view-changed"
+                }
+                AdmissionReadError::Capacity
+                | AdmissionReadError::Refused(MembershipReadError::RetryLater) => "refused",
+                AdmissionReadError::Refused(MembershipReadError::Busy) => "busy",
+                AdmissionReadError::Refused(MembershipReadError::NotLeader) => "not-leader",
+                AdmissionReadError::Refused(MembershipReadError::Unavailable) => "unavailable",
+                AdmissionReadError::Refused(MembershipReadError::PeerRefused) => "identity",
+            };
+            self.record_diagnostic("admission-membership", category);
+            #[cfg(test)]
+            if self.hooks.active.load(Ordering::Relaxed) {
+                eprintln!("C10 fresh membership read refused: {error:?}");
+            }
+        });
+        Reply::Refused
     }
 
     async fn submit_membership<F: Future>(
@@ -557,13 +685,12 @@ impl Controller {
         .await
     }
 
-    async fn confirm_admission(
+    async fn confirm_admission<'a, R, F: Future<Output = Result<(R, AdmissionRead), Reply>>>(
         &self,
-        node: &RetainedNode,
-        peer: AuthenticatedPeer,
-        address: SocketAddr,
-        position: LogPos,
+        node: &'a RetainedNode,
+        _position: LogPos,
         deadline: Instant,
+        observe: impl FnOnce(NodeGuard<'a>) -> F,
     ) -> Reply {
         let Some(node) = self
             .lock_node_for_stage(node, deadline, "admission-confirm")
@@ -571,19 +698,14 @@ impl Controller {
         else {
             return Reply::Unknown;
         };
-        match self
-            .gate
-            .observe(
-                node.admission_observation(peer, address, Some(position)),
-                Reply::Unknown,
-            )
-            .await
-        {
-            Ok(Ok(AdmissionObservation::Answer(reply))) | Err(reply) => reply,
+        match self.gate.observe(observe(node), Reply::Unknown).await {
+            Ok(Ok((_, Ok(AdmissionObservation::Answer(reply))))) | Err(reply) => reply,
             _ => {
                 #[cfg(test)]
                 if self.hooks.active.load(Ordering::Relaxed) {
-                    eprintln!("C10 post-apply membership confirmation unavailable at {position:?}");
+                    eprintln!(
+                        "C10 post-apply membership confirmation unavailable at {_position:?}"
+                    );
                 }
                 Reply::Unknown
             }

@@ -205,6 +205,98 @@ mod tests {
     }
 
     #[test]
+    fn admission_reobserves_bound_learner_progress_through_redeem() {
+        use crate::cluster::enrollment::JoinCode;
+
+        let (mut state, sample, blob, (cluster, _, _)) = fixture();
+        let membership = WireMembership::decode(blob.1.bytes()).unwrap();
+        let anchor = state.voter_anchor(&membership).unwrap();
+        let code = JoinCode::generate(cluster, [2; 32], anchor, |bytes: &mut [u8]| {
+            bytes.fill(3);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        let redeem = position(3);
+        assert!(matches!(
+            state.apply(
+                &Command::Mint {
+                    cluster,
+                    actor: [1; 16],
+                    request: [2; 16],
+                    code: code.code_id(),
+                    verifier: code.verifier(),
+                    proposed_at_ms: 101,
+                },
+                position(2),
+                Some(&membership),
+            ),
+            Outcome::Minted { replay: false, .. }
+        ));
+        assert!(matches!(
+            state.apply(
+                &Command::redeem(
+                    cluster,
+                    [3; 16],
+                    code.code_id(),
+                    &code.proof(),
+                    key(3),
+                    anchor,
+                    102
+                ),
+                redeem,
+                Some(&membership),
+            ),
+            Outcome::Enrolled(_)
+        ));
+        let peer = (cluster, node(4), key(3));
+        let address = "192.168.0.4:9000".parse().unwrap();
+        let observe = |progress: &Progress, peer| {
+            decision(
+                uniform(1, &sample, redeem, Some(&blob)).unwrap(),
+                &state,
+                peer,
+                address,
+                Some(progress),
+                None,
+            )
+        };
+        let before = Progress {
+            committed: redeem,
+            tail: redeem,
+            matched: BTreeMap::from([(2, Some(position(2)))]),
+        };
+        let lag = LearnerLag {
+            node: 2,
+            committed: redeem,
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                finish_admission(observe(&before, peer), None, false),
+                Err(AdmissionReadError::LearnerBehind(observed)) if observed == lag
+            ));
+        }
+        let mut after = before.clone();
+        after.matched.insert(2, Some(redeem));
+        assert!(matches!(
+            finish_admission(observe(&before, peer), None, before != after),
+            Err(AdmissionReadError::ViewChanged)
+        ));
+        after.tail = position(4);
+        assert!(matches!(
+            finish_admission(observe(&after, peer), None, false),
+            Ok(AdmissionObservation::Add { leader, membership, tail })
+                if leader == sample.vote.leader_id && membership == id(blob.0) && tail == id(position(4))
+        ));
+        let wrong_peer = (cluster, peer.1, key(9));
+        assert!(matches!(
+            finish_admission(observe(&before, wrong_peer), None, true),
+            Err(AdmissionReadError::Refused(
+                MembershipReadError::PeerRefused
+            ))
+        ));
+    }
+
+    #[test]
     fn admission_fresh_candidate_counts_revoked_slots_and_checks_exact_match() {
         let (_, _, _, peer) = fixture();
         let mut state = EnrollmentState::new(peer.0, node(4));
@@ -247,7 +339,7 @@ mod tests {
                 Some(&progress),
                 None
             ),
-            Err(MembershipReadError::RetryLater)
+            Err(AdmissionReadError::Refused(MembershipReadError::RetryLater))
         ));
         progress.matched.insert(3, Some(position(4)));
         assert!(matches!(
@@ -296,7 +388,7 @@ mod tests {
                 Some(&progress),
                 None
             ),
-            Err(MembershipReadError::RetryLater)
+            Err(AdmissionReadError::Capacity)
         ));
     }
 
@@ -341,7 +433,9 @@ mod tests {
                 None,
                 None
             ),
-            Err(MembershipReadError::PeerRefused)
+            Err(AdmissionReadError::Refused(
+                MembershipReadError::PeerRefused
+            ))
         ));
         assert!(matches!(
             decision(
@@ -355,7 +449,7 @@ mod tests {
                     ..position(1)
                 })
             ),
-            Err(MembershipReadError::RetryLater)
+            Err(AdmissionReadError::Refused(MembershipReadError::RetryLater))
         ));
         assert!(matches!(
             decision(candidate(membership), &state, peer, address, None, Some(position(1))),
@@ -671,6 +765,26 @@ pub(super) enum AdmissionObservation {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AdmissionReadError {
+    Refused(MembershipReadError),
+    Capacity,
+    ViewChanged,
+    LearnerBehind(LearnerLag),
+}
+
+impl From<MembershipReadError> for AdmissionReadError {
+    fn from(error: MembershipReadError) -> Self {
+        Self::Refused(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LearnerLag {
+    pub(super) node: u64,
+    pub(super) committed: LogPos,
+}
+
 fn decision(
     observed: ObservedMembership,
     state: &EnrollmentState,
@@ -678,7 +792,7 @@ fn decision(
     address: SocketAddr,
     progress: Option<&Progress>,
     submitted: Option<LogPos>,
-) -> Result<AdmissionObservation, MembershipReadError> {
+) -> Result<AdmissionObservation, AdmissionReadError> {
     use AdmissionObservation::{Add, Answer};
     let retry = MembershipReadError::RetryLater;
     let binding = state.authorize_peer(peer.0, peer.1, peer.2);
@@ -688,12 +802,12 @@ fn decision(
 
     if let Some(submitted) = submitted {
         if !covers(watermark, submitted) || member.is_none_or(|m| m.addr != address.to_string()) {
-            return Err(retry);
+            return Err(retry.into());
         }
         return match binding {
             Ok(()) => Ok(Answer(Reply::Applied(watermark, address))),
             Err(PeerRefusal::NotMember) => Ok(Answer(Reply::Revoked(watermark, address))),
-            Err(_) => Err(MembershipReadError::PeerRefused),
+            Err(_) => Err(MembershipReadError::PeerRefused.into()),
         };
     }
 
@@ -708,25 +822,34 @@ fn decision(
 
     let progress = progress.ok_or(retry)?;
     let probe = KeyDigest::of_spki(b"bounded admission registry presence").expect("bounded digest");
-    if observed.membership.nodes().count() >= MAX_MEMBERS
-        || !covers(observed.applied, progress.committed)
-        || !covers(progress.committed, watermark)
-        || observed.membership.non_write_voter_ids().any(|other| {
-            let other_id = NodeId::new(other).expect("canonical membership node");
-            let bound = matches!(
-                state.authorize_peer(peer.0, other_id, probe),
-                Ok(()) | Err(PeerRefusal::KeyMismatch)
-            );
-            bound
-                && !progress
-                    .matched
-                    .get(&other)
-                    .copied()
-                    .flatten()
-                    .is_some_and(|p| covers(p, progress.committed))
-        })
-    {
-        return Err(retry);
+    if observed.membership.nodes().count() >= MAX_MEMBERS {
+        return Err(AdmissionReadError::Capacity);
+    }
+    if !covers(observed.applied, progress.committed) || !covers(progress.committed, watermark) {
+        return Err(retry.into());
+    }
+    let mut lagging = None;
+    for other in observed.membership.non_write_voter_ids() {
+        let other_id = NodeId::new(other).expect("canonical membership node");
+        if matches!(
+            state.authorize_peer(peer.0, other_id, probe),
+            Ok(()) | Err(PeerRefusal::KeyMismatch)
+        ) {
+            match progress.matched.get(&other).copied().flatten() {
+                Some(p) if covers(p, progress.committed) => {}
+                // A different log ID at the same index is a hard refusal.
+                Some(p) if p.index == progress.committed.index => return Err(retry.into()),
+                _ => {
+                    lagging.get_or_insert(LearnerLag {
+                        node: other,
+                        committed: progress.committed,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(lag) = lagging {
+        return Err(AdmissionReadError::LearnerBehind(lag));
     }
     Ok(Add {
         leader: observed.leader,
@@ -735,18 +858,44 @@ fn decision(
     })
 }
 
+fn finish_admission(
+    result: Result<AdmissionObservation, AdmissionReadError>,
+    submitted: Option<LogPos>,
+    view_changed: bool,
+) -> Result<AdmissionObservation, AdmissionReadError> {
+    match result {
+        Ok(AdmissionObservation::Answer(Reply::AddressConflict)) if view_changed => {
+            Err(MembershipReadError::RetryLater.into())
+        }
+        Ok(_) | Err(AdmissionReadError::LearnerBehind(_)) if view_changed => {
+            if submitted.is_some() {
+                Err(MembershipReadError::RetryLater.into())
+            } else {
+                Err(AdmissionReadError::ViewChanged)
+            }
+        }
+        _ => result,
+    }
+}
+
 impl ConsensusNode {
     pub(super) async fn admission_observation(
         &self,
         peer: AuthenticatedPeer,
         address: SocketAddr,
         submitted: Option<LogPos>,
-    ) -> Result<AdmissionObservation, MembershipReadError> {
+    ) -> Result<AdmissionObservation, AdmissionReadError> {
         let peer = identity(peer)?;
         let unavailable = MembershipReadError::Unavailable;
         let retry = MembershipReadError::RetryLater;
         let raft = self.raft.as_ref().ok_or(unavailable)?;
         let before = Sample::capture(raft)?;
+        if !before.vote.committed
+            || before.current_leader != Some(self.id)
+            || before.vote.leader_id.node_id != self.id
+        {
+            return Err(MembershipReadError::NotLeader.into());
+        }
         let progress =
             if submitted.is_none() && before.effective.1.get_node(&peer.1.get()).is_none() {
                 Some(Progress::capture(self, &before)?)
@@ -759,32 +908,43 @@ impl ConsensusNode {
         let (leader, result) = self
             .fresh_read(move |store| {
                 if store.is_poisoned() {
-                    return Ok(Err(unavailable));
+                    return Ok(Err(unavailable.into()));
                 }
-                Ok(store
-                    .applied()
-                    .ok_or(retry)
-                    .and_then(|applied| uniform(local, &initial, applied, store.membership()))
-                    .and_then(|observed| {
-                        decision(
-                            observed,
-                            store.state(),
-                            peer,
-                            address,
-                            initial_progress.as_ref(),
-                            submitted,
-                        )
-                    }))
+                Ok((|| {
+                    let applied = store.applied().ok_or(retry)?;
+                    let observed = uniform(local, &initial, applied, store.membership())?;
+                    decision(
+                        observed,
+                        store.state(),
+                        peer,
+                        address,
+                        initial_progress.as_ref(),
+                        submitted,
+                    )
+                })())
             })
             .await
-            .map_err(|_| unavailable)?;
-        if leader != before.vote.leader_id
-            || Sample::capture(raft)? != before
-            || progress.is_some_and(|p| Progress::capture(self, &before).ok() != Some(p))
-        {
-            return Err(retry);
+            .map_err(|e| match e {
+                ReadError::NotLeader => MembershipReadError::NotLeader,
+                _ => unavailable,
+            })?;
+        if matches!(result, Err(error) if !matches!(error, AdmissionReadError::LearnerBehind(_))) {
+            return result;
         }
-        result
+        let after = Sample::capture(raft)?;
+        if !after.vote.committed
+            || after.current_leader != Some(self.id)
+            || after.vote.leader_id.node_id != self.id
+        {
+            return Err(MembershipReadError::NotLeader.into());
+        }
+        let view_changed = leader != before.vote.leader_id
+            || after != before
+            || match progress {
+                Some(progress) => Progress::capture(self, &before)? != progress,
+                None => false,
+            };
+        finish_admission(result, submitted, view_changed)
     }
 }
 
