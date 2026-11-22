@@ -43,19 +43,22 @@ class ManagerObservationTests(unittest.TestCase):
 
     def test_r2_receipt_uses_fixed_read_only_queries_and_shapes(self):
         calls = []
+        dpkg = "/usr/bin/dpkg-query-real"
 
         def run(argv, timeout=None):
             calls.append((argv, timeout))
             return diagnostic.Capture("completed", 0, b"255.4-1ubuntu8.18", b"private")
 
+        vetted = {path: path for path in diagnostic.R2_TOOLS}
+        vetted.update({"/usr/sbin/nft": None, "/usr/bin/dpkg-query": dpkg})
         with patch.object(diagnostic.os, "uname", return_value=SimpleNamespace(
             release="7.0.0-1014-aws"), create=True), patch.object(
-            diagnostic, "runner_tool_present", side_effect=lambda path: path != "/usr/sbin/nft"
+            diagnostic, "vetted_runner_tool", side_effect=vetted.__getitem__
         ) as tools:
             encoded = diagnostic.observe("linux", run, self.R2_ENV)
         self.assertEqual(calls, [
             (["/usr/bin/systemctl", *diagnostic.SYSTEMD_ARGS], None),
-            (["/usr/bin/dpkg-query", "-W", "-f=${Version}", "systemd"], 1),
+            ([dpkg, "-W", "-f=${Version}", "systemd"], 1),
         ])
         self.assertEqual([call.args[0] for call in tools.call_args_list], list(diagnostic.R2_TOOLS))
         self.assertLessEqual(len(encoded), 2048)
@@ -73,13 +76,13 @@ class ManagerObservationTests(unittest.TestCase):
                             ("ImageVersion", "private-image")]:
             with self.subTest(field=name):
                 env = {**self.R2_ENV, name: value}
-                with patch.object(diagnostic, "runner_tool_present") as tools:
+                with patch.object(diagnostic, "vetted_runner_tool") as tools:
                     encoded = diagnostic.observe("linux", lambda _: diagnostic.Capture("unavailable"), env)
                 tools.assert_not_called()
                 self.assertNotIn("r2_runner", json.loads(encoded))
         with patch.object(diagnostic.os, "uname", return_value=SimpleNamespace(
             release="7.private\nvalue"), create=True), patch.object(
-            diagnostic, "runner_tool_present", return_value=True
+            diagnostic, "vetted_runner_tool", side_effect=lambda path: path
         ):
             for result in (diagnostic.Capture("completed", 0, b"255\nprivate"),
                            diagnostic.Capture("completed", 1, b"255.4-1ubuntu8.18"),
@@ -91,7 +94,9 @@ class ManagerObservationTests(unittest.TestCase):
     def test_r2_package_query_refuses_an_unvetted_executable(self):
         with patch.object(diagnostic.os, "uname", return_value=SimpleNamespace(
             release="7.0.0-1014-aws"), create=True), patch.object(
-            diagnostic, "runner_tool_present", side_effect=lambda path: path != "/usr/bin/dpkg-query"
+            diagnostic, "vetted_runner_tool", side_effect=lambda path: (
+                None if path == "/usr/bin/dpkg-query" else path
+            )
         ):
             def unexpected_query(*args, **kwargs):
                 self.fail("unvetted package executable was invoked")
@@ -102,27 +107,53 @@ class ManagerObservationTests(unittest.TestCase):
 
     def test_r2_tool_metadata_refuses_unsafe_locations_and_permissions(self):
         system = diagnostic.Path("/usr/sbin/nft")
-        with patch.object(diagnostic.Path, "resolve", return_value=diagnostic.Path("/tmp/nft")), \
-             patch.object(diagnostic.Path, "lstat") as metadata:
-            self.assertFalse(diagnostic.runner_tool_present("/usr/sbin/nft"))
+        with patch.object(diagnostic.Path, "lstat") as metadata:
+            self.assertIsNone(diagnostic.vetted_runner_tool("/tmp/nft"))
             metadata.assert_not_called()
-        with patch.object(diagnostic.Path, "resolve", return_value=system):
-            for uid, mode, expected in [(0, 0o100755, True), (1001, 0o100755, False),
-                                        (0, 0o100775, False), (0, 0o100644, False),
-                                        (0, 0o100001, False), (0, 0o040755, False)]:
-                ancestry = [SimpleNamespace(st_uid=0, st_mode=0o040755)] * len(system.parents)
-                with patch.object(diagnostic.Path, "lstat", side_effect=[
-                    *ancestry, SimpleNamespace(st_uid=uid, st_mode=mode)
-                ]):
-                    self.assertEqual(diagnostic.runner_tool_present("/usr/sbin/nft"), expected)
-            for uid, mode in [(0, 0o040777), (1001, 0o040755), (0, 0o120755)]:
-                with patch.object(diagnostic.Path, "lstat", return_value=SimpleNamespace(
-                    st_uid=uid, st_mode=mode
-                )) as metadata:
-                    self.assertFalse(diagnostic.runner_tool_present("/usr/sbin/nft"))
-                    metadata.assert_called_once()
-        with patch.object(diagnostic.Path, "resolve", side_effect=FileNotFoundError):
-            self.assertFalse(diagnostic.runner_tool_present("/usr/sbin/nft"))
+        for uid, mode, expected in [(0, 0o100755, "/usr/sbin/nft"), (1001, 0o100755, None),
+                                    (0, 0o100775, None), (0, 0o100644, None),
+                                    (0, 0o100001, None), (0, 0o040755, None)]:
+            ancestry = [SimpleNamespace(st_uid=0, st_mode=0o040755)] * len(system.parents)
+            with patch.object(diagnostic.Path, "lstat", side_effect=[
+                *ancestry, SimpleNamespace(st_uid=uid, st_mode=mode)
+            ]):
+                self.assertEqual(diagnostic.vetted_runner_tool("/usr/sbin/nft"), expected)
+        for uid, mode in [(0, 0o040777), (1001, 0o040755), (0, 0o120755)]:
+            with patch.object(diagnostic.Path, "lstat", return_value=SimpleNamespace(
+                st_uid=uid, st_mode=mode
+            )) as metadata:
+                self.assertIsNone(diagnostic.vetted_runner_tool("/usr/sbin/nft"))
+                metadata.assert_called_once()
+        with patch.object(diagnostic.Path, "lstat", side_effect=FileNotFoundError):
+            self.assertIsNone(diagnostic.vetted_runner_tool("/usr/sbin/nft"))
+
+    def test_r2_tool_checks_every_symlink_hop_and_bounds_cycles(self):
+        path = diagnostic.Path
+        literal = path("/usr/sbin/nft")
+        alias = path("/usr/bin/nft-alias")
+        target = path("/usr/bin/nft-real")
+        directory = SimpleNamespace(st_uid=0, st_mode=0o040755)
+        symlink = SimpleNamespace(st_uid=0, st_mode=0o120777)
+        executable = SimpleNamespace(st_uid=0, st_mode=0o100755)
+        entries = dict.fromkeys((*literal.parents, *target.parents), directory)
+        entries.update({literal: symlink, alias: symlink, target: executable})
+        links = {literal: alias, alias: path(target.name)}
+        with patch.object(path, "lstat", autospec=True, side_effect=entries.__getitem__), \
+             patch.object(path, "readlink", autospec=True, side_effect=links.__getitem__) as readlink:
+            self.assertEqual(diagnostic.vetted_runner_tool(literal), target.as_posix())
+            links[alias] = path("/tmp/private-alias")
+            self.assertIsNone(diagnostic.vetted_runner_tool(literal))
+            links[alias] = path(target.name)
+            entries[alias] = SimpleNamespace(st_uid=1001, st_mode=0o120777)
+            self.assertIsNone(diagnostic.vetted_runner_tool(literal))
+            entries[alias] = symlink
+            entries[alias.parent] = SimpleNamespace(st_uid=0, st_mode=0o040777)
+            self.assertIsNone(diagnostic.vetted_runner_tool(literal))
+            entries[alias.parent] = directory
+            links[alias] = literal
+            readlink.reset_mock()
+            self.assertIsNone(diagnostic.vetted_runner_tool(literal))
+            self.assertEqual(readlink.call_count, 8)
 
     def test_absence_phrases_are_observations_not_guessed_success(self):
         result = diagnostic.Capture("completed", 113, b"",

@@ -133,21 +133,29 @@ def summarize(label, target, result, platform):
     return row
 
 
-def runner_tool_present(path):
+def vetted_runner_tool(path):
+    candidate = Path(path)
+    system_dirs = (Path("/usr/bin"), Path("/usr/sbin"))
     try:
-        candidate = Path(path)
-        target = candidate.resolve(strict=True)
-        if target.parent not in (Path("/usr/bin"), Path("/usr/sbin")):
-            return False
-        for parent in dict.fromkeys((*candidate.parents, *target.parents)):
-            info = parent.lstat()
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-                return False
-        info = target.lstat()
-    except (OSError, RuntimeError):
-        return False
-    return (info.st_uid == 0 and stat.S_ISREG(info.st_mode)
-            and bool(info.st_mode & 0o100) and not (info.st_mode & 0o022))
+        for _ in range(8):
+            if candidate.parent not in system_dirs:
+                return None
+            for parent in reversed(candidate.parents):
+                info = parent.lstat()
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                    return None
+            info = candidate.lstat()
+            if info.st_uid != 0:
+                return None
+            if stat.S_ISLNK(info.st_mode):
+                candidate = candidate.parent / candidate.readlink()
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_mode & 0o100 and not (info.st_mode & 0o022):
+                return candidate.as_posix()
+            return None
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def r2_runner_receipt(env, run):
@@ -160,9 +168,10 @@ def r2_runner_receipt(env, run):
     if not re.fullmatch(r"[0-9]{8}\.[0-9]{1,5}\.[0-9]{1,5}", image):
         return None
     kernel = os.uname().release
-    tools = {path: runner_tool_present(path) for path in R2_TOOLS}
-    package = (run(list(R2_SYSTEMD_ARGS), timeout=1)
-               if tools[R2_SYSTEMD_ARGS[0]] else Capture("unavailable"))
+    tools = {path: vetted_runner_tool(path) for path in R2_TOOLS}
+    dpkg = tools[R2_SYSTEMD_ARGS[0]]
+    package = (run([dpkg, *R2_SYSTEMD_ARGS[1:]], timeout=1)
+               if dpkg is not None else Capture("unavailable"))
     return {
         "image_os": "ubuntu24",
         "image_version": image,
@@ -171,7 +180,7 @@ def r2_runner_receipt(env, run):
                             if package.status == "completed" and package.code == 0
                             and re.fullmatch(rb"[0-9][0-9A-Za-z.+:~_-]{0,63}", package.stdout)
                             else None),
-        "tools": tools,
+        "tools": {path: target is not None for path, target in tools.items()},
     }
 
 
