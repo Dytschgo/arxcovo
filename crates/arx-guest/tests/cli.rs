@@ -1,13 +1,135 @@
+use std::io::{Read, Write};
+use std::process::{ChildStdin, ChildStdout, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const GUEST: &str = env!("CARGO_BIN_EXE_arx-guest");
+
+fn run_guest(
+    args: &[&str],
+    exchange: impl FnOnce(ChildStdin, &mut ChildStdout) + Send + 'static,
+) -> Output {
+    fn drain(stream: impl Read) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        stream.take(1024).read_to_end(&mut bytes).unwrap();
+        assert!(bytes.len() < 1024, "unexpectedly large CLI output");
+        bytes
+    }
+
+    let mut child = Command::new(GUEST)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let errors = child.stderr.take().unwrap();
+    let stdout = thread::spawn(move || {
+        exchange(input, &mut output);
+        drain(output)
+    });
+    let stderr = thread::spawn(move || drain(errors));
+
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            child.wait().unwrap();
+            let _ = stdout.join();
+            let _ = stderr.join();
+            panic!("guest process did not exit before the deadline");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    }
+}
+
 #[test]
-fn scaffold_starts_without_host_side_effects() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_arx-guest"))
-        .output()
-        .expect("binary starts");
+fn version_exits_successfully() {
+    let output = run_guest(&["--version"], |_, _| {});
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "arx-guest 0.1.0: scaffold only\n"
+        concat!("arx-guest ", env!("CARGO_PKG_VERSION"), "\n")
     );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn bare_unknown_and_extra_arguments_fail_with_fixed_usage() {
+    for args in [
+        &[][..],
+        &["unknown"],
+        &["--version", "unexpected"],
+        &["serve-stdio", "unexpected"],
+    ] {
+        let output = run_guest(args, |_, _| {});
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, b"Usage: arx-guest --version | serve-stdio\n");
+    }
+}
+
+#[test]
+fn stdio_round_trip_flushes_each_response_and_exits_on_eof() {
+    let output = run_guest(&["serve-stdio"], |mut input, output| {
+        for (request, expected) in [
+            (
+                r#"{"type":"Hello","version":1,"challenge":"0123456789abcdef0123456789abcdef"}"#,
+                r#"{"type":"HelloAck","version":1,"challenge":"0123456789abcdef0123456789abcdef","script_execution":"unavailable"}"#,
+            ),
+            (r#"{"type":"Ping","id":1}"#, r#"{"type":"Pong","id":1}"#),
+            (
+                r#"{"type":"RunScript","id":2,"script":"echo hello","timeout_s":1}"#,
+                r#"{"type":"ScriptResult","id":2,"status":"Unavailable"}"#,
+            ),
+        ] {
+            input
+                .write_all(&(request.len() as u32).to_be_bytes())
+                .unwrap();
+            input.write_all(request.as_bytes()).unwrap();
+            input.flush().unwrap();
+
+            let mut prefix = [0; 4];
+            output.read_exact(&mut prefix).unwrap();
+            assert_eq!(u32::from_be_bytes(prefix) as usize, expected.len());
+            let mut response = vec![0; expected.len()];
+            output.read_exact(&mut response).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&response).unwrap(),
+                serde_json::from_str::<serde_json::Value>(expected).unwrap()
+            );
+        }
+    });
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn stdio_reports_protocol_error_and_exits() {
+    let output = run_guest(&["serve-stdio"], |mut input, _| {
+        input.write_all(&[0, 0]).unwrap();
+    });
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"arx-guest: truncated guest frame prefix\n");
+}
+
+#[test]
+fn stdio_exits_on_clean_eof_before_hello() {
+    let output = run_guest(&["serve-stdio"], |_, _| {});
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
 }
 
