@@ -105,102 +105,141 @@ impl PromotionStart {
     }
 }
 
+fn finish_registration<N, R, G>(
+    node: tokio::sync::MutexGuard<'_, N>,
+    extra_guard: G,
+    register: impl FnOnce(&N, PromotionStart) -> R,
+) -> R {
+    let (ready, start) = oneshot::channel();
+    let registered = register(&node, PromotionStart(start));
+    // Owners may poll the worker before registration returns. Release all
+    // registration locks before its single fresh observation can touch the node.
+    drop(node);
+    drop(extra_guard);
+    let _ = ready.send(());
+    registered
+}
+
 pub(super) fn register_with_node<N, R>(
     node: &tokio::sync::Mutex<N>,
     register: impl FnOnce(&N, PromotionStart) -> R,
 ) -> Result<R, Reply> {
     let node = node.try_lock().map_err(|_| Reply::Refused)?;
-    let (ready, start) = oneshot::channel();
-    let registered = register(&node, PromotionStart(start));
-    // Owners may poll the worker before registration returns. Release this
-    // borrow before its single fresh observation can touch the node.
-    drop(node);
-    let _ = ready.send(());
-    Ok(registered)
+    Ok(finish_registration(node, (), register))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NodeWaitError {
-    Busy,
-    Deadline,
+struct StopGate {
+    closed: Mutex<bool>,
+    stopped: tokio::sync::Notify,
 }
 
-async fn lock_node_bounded<'a, N>(
-    node: &'a tokio::sync::Mutex<N>,
-    deadline: Instant,
-) -> Result<tokio::sync::MutexGuard<'a, N>, NodeWaitError> {
-    let retry_until = peer_registry::store_wait_deadline(Some(deadline));
-    loop {
-        if Instant::now() >= retry_until {
-            return Err(NodeWaitError::Deadline);
+impl StopGate {
+    fn new() -> Self {
+        Self {
+            closed: Mutex::new(false),
+            stopped: tokio::sync::Notify::new(),
         }
-        if let Ok(guard) = node.try_lock() {
-            if Instant::now() >= retry_until {
-                drop(guard);
-                return Err(NodeWaitError::Deadline);
-            }
-            return Ok(guard);
+    }
+
+    fn stop(&self) {
+        if let Ok(mut closed) = self.closed.lock() {
+            *closed = true;
         }
-        if !peer_registry::poll_store_until(retry_until).await {
-            return Err(NodeWaitError::Busy);
+        self.stopped.notify_waiters();
+    }
+
+    fn is_open(&self) -> bool {
+        self.closed.lock().is_ok_and(|closed| !*closed)
+    }
+
+    fn lock_open(&self) -> Option<std::sync::MutexGuard<'_, bool>> {
+        let closed = self.closed.lock().ok()?;
+        (!*closed).then_some(closed)
+    }
+
+    fn report_if_open(&self, report: impl FnOnce()) {
+        if let Some(_open) = self.lock_open() {
+            report();
         }
     }
 }
 
-async fn register_with_node_bounded<N, R, G>(
-    node: &tokio::sync::Mutex<N>,
+async fn wait_for_node_bounded<'a, N, R>(
+    node: &'a tokio::sync::Mutex<N>,
+    gate: &StopGate,
     deadline: Instant,
-    mut check_open: impl FnMut() -> Result<G, Reply>,
-    register: impl FnOnce(&N, PromotionStart) -> R,
+    on_locked: impl FnOnce(tokio::sync::MutexGuard<'a, N>, std::sync::MutexGuard<'_, bool>) -> R,
     on_busy: impl FnOnce(),
-) -> Result<R, Reply> {
+) -> Option<R> {
     let retry_until = peer_registry::store_wait_deadline(Some(deadline));
-    let mut register = Some(register);
+    let mut on_locked = Some(on_locked);
     loop {
+        let stopped = gate.stopped.notified();
+        tokio::pin!(stopped);
+        // Register the stop waiter before checking `closed` so a concurrent
+        // `stop()` cannot miss the wakeup between the check and `select!`.
+        stopped.as_mut().enable();
         enum Attempt<R> {
             Done(R),
             Busy,
-            Expired,
+            StopOrExpired,
         }
         let attempt = {
-            let open = check_open()?;
+            let open = gate.lock_open()?;
             if Instant::now() >= retry_until {
-                Attempt::Expired
-            } else if let Ok(node) = node.try_lock() {
+                Attempt::StopOrExpired
+            } else if let Ok(guard) = node.try_lock() {
                 if Instant::now() >= retry_until {
-                    Attempt::Expired
+                    drop(guard);
+                    Attempt::StopOrExpired
                 } else {
-                    let (ready, start) = oneshot::channel();
-                    let registered =
-                        register.take().expect("single registration")(&node, PromotionStart(start));
-                    // Owners may poll the worker before registration returns. Release this
-                    // borrow before its single fresh observation can touch the node.
-                    drop(node);
-                    drop(open);
-                    let _ = ready.send(());
-                    Attempt::Done(registered)
+                    Attempt::Done(on_locked.take().expect("single lock acquisition")(
+                        guard, open,
+                    ))
                 }
             } else {
                 Attempt::Busy
             }
         };
         match attempt {
-            Attempt::Done(registered) => return Ok(registered),
-            Attempt::Expired => return Err(Reply::Refused),
+            Attempt::Done(value) => return Some(value),
+            Attempt::StopOrExpired => return None,
             Attempt::Busy => {
-                if !peer_registry::poll_store_until(retry_until).await {
-                    let _ = check_open()?;
-                    on_busy();
-                    return Err(Reply::Refused);
+                let keep_waiting = tokio::select! {
+                    biased;
+                    () = stopped.as_mut() => return None,
+                    keep = peer_registry::poll_store_until(retry_until) => keep,
+                };
+                if !keep_waiting {
+                    gate.report_if_open(on_busy);
+                    return None;
                 }
             }
         }
     }
 }
 
+async fn register_with_node_bounded<N, R>(
+    node: &tokio::sync::Mutex<N>,
+    gate: &StopGate,
+    deadline: Instant,
+    register: impl FnOnce(&N, PromotionStart) -> R,
+    on_busy: impl FnOnce(),
+) -> Result<R, Reply> {
+    wait_for_node_bounded(
+        node,
+        gate,
+        deadline,
+        |node, open| finish_registration(node, open, register),
+        on_busy,
+    )
+    .await
+    .ok_or(Reply::Refused)
+}
+
 pub(super) struct Controller {
     node: Weak<RetainedNode>,
-    closed: Mutex<bool>,
+    gate: StopGate,
     intent: Arc<IntentSlot>,
     #[cfg(test)]
     pub(super) hooks: Hooks,
@@ -210,7 +249,7 @@ impl Controller {
     pub(super) fn new(node: &Arc<RetainedNode>) -> Arc<Self> {
         Arc::new(Self {
             node: Arc::downgrade(node),
-            closed: Mutex::new(false),
+            gate: StopGate::new(),
             intent: Arc::default(),
             #[cfg(test)]
             hooks: Hooks::default(),
@@ -218,13 +257,11 @@ impl Controller {
     }
 
     pub(super) fn stop(&self) {
-        if let Ok(mut closed) = self.closed.lock() {
-            *closed = true;
-        }
+        self.gate.stop();
     }
 
     pub(super) fn open(&self) -> bool {
-        self.closed.lock().is_ok_and(|closed| !*closed)
+        self.gate.is_open()
     }
 
     pub(super) async fn intent_released(&self) {
@@ -235,10 +272,7 @@ impl Controller {
         &self,
         work: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<oneshot::Receiver<()>, Reply> {
-        let closed = self.closed.lock().map_err(|_| Reply::Refused)?;
-        if *closed {
-            return Err(Reply::Refused);
-        }
+        let _open = self.gate.lock_open().ok_or(Reply::Refused)?;
         let intent = Intent::waking(&self.intent)?;
         let node = self.node.upgrade().ok_or(Reply::Refused)?;
         register_with_node(&node, |node, start| {
@@ -262,14 +296,6 @@ impl Controller {
         Some((pos(metrics.cluster_committed?), matched))
     }
 
-    fn check_open(&self) -> Result<std::sync::MutexGuard<'_, bool>, Reply> {
-        let closed = self.closed.lock().map_err(|_| Reply::Refused)?;
-        if *closed {
-            return Err(Reply::Refused);
-        }
-        Ok(closed)
-    }
-
     fn record_diagnostic(&self, stage: &'static str, category: &'static str) {
         #[cfg(test)]
         if let Ok(mut recorded) = self.hooks.diagnostics.lock() {
@@ -284,14 +310,17 @@ impl Controller {
         deadline: Instant,
         stage: &'static str,
     ) -> Option<tokio::sync::MutexGuard<'a, ConsensusNode>> {
-        match lock_node_bounded(node, deadline).await {
-            Ok(guard) => Some(guard),
-            Err(NodeWaitError::Busy) => {
-                self.record_diagnostic(stage, "node-busy");
-                None
-            }
-            Err(NodeWaitError::Deadline) => None,
-        }
+        wait_for_node_bounded(
+            node,
+            &self.gate,
+            deadline,
+            |guard, open| {
+                drop(open);
+                guard
+            },
+            || self.record_diagnostic(stage, "node-busy"),
+        )
+        .await
     }
 
     pub(super) async fn admit(
@@ -326,7 +355,7 @@ impl Controller {
     ) -> Result<oneshot::Receiver<Reply>, Reply> {
         peer.authenticated_identity().map_err(|_| Reply::Refused)?;
         {
-            let _open = self.check_open()?;
+            let _open = self.gate.lock_open().ok_or(Reply::Refused)?;
             if Instant::now() >= deadline {
                 return Err(Reply::Refused);
             }
@@ -336,8 +365,8 @@ impl Controller {
         let controller = self.clone();
         register_with_node_bounded(
             &node,
+            &self.gate,
             deadline,
-            || self.check_open(),
             |node, start| {
                 node.register_admission(
                     intent,
