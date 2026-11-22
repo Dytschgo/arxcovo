@@ -1,9 +1,8 @@
 //! The autoinstall identity uses Subiquity's locked password marker. On
 //! 24.04.3 account creation can be deferred to target cloud-init, so late
 //! commands neither inspect nor change accounts. Removing and disabling the
-//! target datasource also disables that deferred creation path. The 4b2
-//! detached health check must establish the expected account presence and
-//! lock state before qualification.
+//! target datasource also disables that deferred creation path. Detached
+//! health asserts there is no login-capable account before qualification.
 //!
 //! Subiquity can copy installer logs after late commands. The seed supplies
 //! no reusable credentials. Acceptance on a real install must confirm that
@@ -244,6 +243,44 @@ printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
         Ok((meta, user_data(guest_pin, service, finalize)))
     }
 }
+
+/// Run once over the script-capable channel of the detached verification boot.
+pub(super) const DETACHED_HEALTH: &str = r#"set -eu
+export LC_ALL=C
+printf '%s\n' ubuntu-noble-amd64-v1 | cmp -s - /etc/arxcovo/template-finalized
+test -x /usr/local/bin/arx-guest
+test -f /etc/systemd/system/arx-guest.service
+systemctl is-active --quiet arx-guest.service
+test -f /etc/cloud/cloud-init.disabled
+test ! -e /var/lib/cloud/seed
+test ! -e /etc/cloud/cloud.cfg.d/99-installer.cfg
+test ! -e /usr/sbin/sshd
+test ! -e /root/.ssh
+for key in /etc/ssh/ssh_host_*; do
+    test ! -e "$key"
+done
+test "$(wc -c </etc/machine-id)" -eq 33
+grep -Eq '^[0-9a-f]{32}$' /etc/machine-id
+test "$(cat /etc/machine-id)" != 00000000000000000000000000000000
+test "$(readlink /var/lib/dbus/machine-id)" = /etc/machine-id
+awk -F: '
+    FILENAME == ARGV[1] {
+        if (NF != 9 || $1 == "" || locked[$1]++ || $2 !~ /^[!*]/) bad = 1
+        next
+    }
+    {
+        if (NF != 7 || !($1 in locked) || seen[$1]++) bad = 1
+        if ($1 == "root") {
+            if ($3 != "0") bad = 1
+            root = 1
+        } else if ($3 !~ /^[0-9]+$/ || $3 + 0 == 0 ||
+                   $7 !~ /^\/(usr\/)?(sbin\/nologin|bin\/false|bin\/sync|sbin\/halt|sbin\/shutdown)$/) {
+            bad = 1
+        }
+    }
+    END { if (bad || !root) exit 1 }
+' /etc/shadow /etc/passwd
+"#;
 
 fn required(pin: Option<AssetPin>) -> Result<AssetPin, RecipeError> {
     pin.filter(|pin| pin.length != 0)
