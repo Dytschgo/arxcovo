@@ -8,9 +8,11 @@ pub mod qemu_args;
 pub mod qemu_img;
 pub mod qmp;
 pub mod runtime;
+mod template;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
 pub use controller::VmController;
 pub use model::*;
 pub use policy::{Capacity, HostObservation, Resources, VmPolicy};
+pub use template::{AssetPin, RecipeError, UbuntuAssets, UbuntuRecipe};
