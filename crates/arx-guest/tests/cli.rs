@@ -7,6 +7,7 @@ const GUEST: &str = env!("CARGO_BIN_EXE_arx-guest");
 
 fn run_guest(
     args: &[&str],
+    stderr: Stdio,
     exchange: impl FnOnce(ChildStdin, &mut ChildStdout) + Send + 'static,
 ) -> Output {
     fn drain(stream: impl Read) -> Vec<u8> {
@@ -20,18 +21,18 @@ fn run_guest(
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(stderr)
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
-    let errors = child.stderr.take().unwrap();
+    let errors = child.stderr.take();
     let stdout = thread::spawn(move || {
         exchange(input, &mut output);
         drain(output)
     });
-    let stderr = thread::spawn(move || drain(errors));
+    let stderr = thread::spawn(move || errors.map(drain).unwrap_or_default());
 
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -55,7 +56,7 @@ fn run_guest(
 
 #[test]
 fn version_exits_successfully() {
-    let output = run_guest(&["--version"], |_, _| {});
+    let output = run_guest(&["--version"], Stdio::piped(), |_, _| {});
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
@@ -72,7 +73,7 @@ fn bare_unknown_and_extra_arguments_fail_with_fixed_usage() {
         &["--version", "unexpected"],
         &["serve-stdio", "unexpected"],
     ] {
-        let output = run_guest(args, |_, _| {});
+        let output = run_guest(args, Stdio::piped(), |_, _| {});
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         assert_eq!(output.stderr, b"Usage: arx-guest --version | serve-stdio\n");
@@ -81,7 +82,7 @@ fn bare_unknown_and_extra_arguments_fail_with_fixed_usage() {
 
 #[test]
 fn stdio_round_trip_flushes_each_response_and_exits_on_eof() {
-    let output = run_guest(&["serve-stdio"], |mut input, output| {
+    let output = run_guest(&["serve-stdio"], Stdio::piped(), |mut input, output| {
         for (request, expected) in [
             (
                 r#"{"type":"Hello","version":1,"challenge":"0123456789abcdef0123456789abcdef"}"#,
@@ -101,13 +102,10 @@ fn stdio_round_trip_flushes_each_response_and_exits_on_eof() {
 
             let mut prefix = [0; 4];
             output.read_exact(&mut prefix).unwrap();
-            assert_eq!(u32::from_be_bytes(prefix) as usize, expected.len());
+            assert_eq!(prefix, (expected.len() as u32).to_be_bytes());
             let mut response = vec![0; expected.len()];
             output.read_exact(&mut response).unwrap();
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&response).unwrap(),
-                serde_json::from_str::<serde_json::Value>(expected).unwrap()
-            );
+            assert_eq!(response, expected.as_bytes());
         }
     });
     assert!(output.status.success());
@@ -117,7 +115,7 @@ fn stdio_round_trip_flushes_each_response_and_exits_on_eof() {
 
 #[test]
 fn stdio_reports_protocol_error_and_exits() {
-    let output = run_guest(&["serve-stdio"], |mut input, _| {
+    let output = run_guest(&["serve-stdio"], Stdio::piped(), |mut input, _| {
         input.write_all(&[0, 0]).unwrap();
     });
     assert_eq!(output.status.code(), Some(1));
@@ -126,8 +124,19 @@ fn stdio_reports_protocol_error_and_exits() {
 }
 
 #[test]
+fn stdio_protocol_error_keeps_exit_code_when_stderr_is_closed() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = run_guest(&["serve-stdio"], Stdio::from(writer), |mut input, _| {
+        input.write_all(&[0, 0]).unwrap();
+    });
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn stdio_exits_on_clean_eof_before_hello() {
-    let output = run_guest(&["serve-stdio"], |_, _| {});
+    let output = run_guest(&["serve-stdio"], Stdio::piped(), |_, _| {});
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());

@@ -63,6 +63,72 @@ fn reads_fragmented_frames_and_clean_eof() {
 }
 
 #[test]
+fn hello_and_ping_encode_to_golden_bytes() {
+    for (request, expected) in [
+        (
+            Request::Hello {
+                version: PROTOCOL_VERSION,
+                challenge: CHALLENGE.to_owned(),
+            },
+            HELLO,
+        ),
+        (Request::Ping { id: 1 }, PING),
+    ] {
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        assert_eq!(bytes, frame(expected));
+    }
+}
+
+#[test]
+fn preserves_transport_reported_unexpected_eof() {
+    struct UnexpectedEof;
+
+    impl Read for UnexpectedEof {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::UnexpectedEof.into())
+        }
+    }
+
+    let ping = frame(PING);
+    for received in [0, 2, 5] {
+        let mut reader = (&ping[..received]).chain(UnexpectedEof);
+        assert!(matches!(
+            read_frame::<Request>(&mut reader),
+            Err(ProtocolError::Io(io::ErrorKind::UnexpectedEof))
+        ));
+    }
+}
+
+#[test]
+fn retries_an_interrupted_read_at_a_frame_boundary() {
+    struct InterruptedOnce<'a> {
+        remaining: &'a [u8],
+        interrupted: bool,
+    }
+
+    impl Read for InterruptedOnce<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.remaining.read(bytes)
+        }
+    }
+
+    let ping = frame(PING);
+    let mut reader = InterruptedOnce {
+        remaining: &ping,
+        interrupted: false,
+    };
+    assert!(matches!(
+        read_frame(&mut reader),
+        Ok(Some(Request::Ping { id: 1 }))
+    ));
+}
+
+#[test]
 fn distinguishes_truncated_prefix_from_truncated_payload() {
     let bytes = frame(PING);
     for len in 1..bytes.len() {

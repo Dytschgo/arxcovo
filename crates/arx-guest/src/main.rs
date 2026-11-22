@@ -1,5 +1,5 @@
 use std::env;
-use std::io;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use arx_guest::{ScriptExecution, ScriptExecutor, ScriptOutcome, serve};
@@ -23,7 +23,11 @@ fn main() -> ExitCode {
         args.next(),
     ) {
         (Some("--version"), None) => {
-            println!("arx-guest {}", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(
+                io::stdout().lock(),
+                "arx-guest {}",
+                env!("CARGO_PKG_VERSION")
+            );
             ExitCode::SUCCESS
         }
         (Some("serve-stdio"), None) => {
@@ -34,13 +38,16 @@ fn main() -> ExitCode {
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
-                    eprintln!("arx-guest: {error}");
+                    let _ = writeln!(io::stderr().lock(), "arx-guest: {error}");
                     ExitCode::FAILURE
                 }
             }
         }
         _ => {
-            eprintln!("Usage: arx-guest --version | serve-stdio");
+            let _ = writeln!(
+                io::stderr().lock(),
+                "Usage: arx-guest --version | serve-stdio"
+            );
             ExitCode::from(2)
         }
     }

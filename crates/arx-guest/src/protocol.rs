@@ -225,10 +225,8 @@ struct WireTags {
 /// Reads one frame, returning `None` only at EOF before a new prefix.
 pub fn read_frame<M: Message>(reader: &mut impl Read) -> Result<Option<M>, ProtocolError> {
     let mut prefix = [0; 4];
-    match reader.read_exact(&mut prefix[..1]) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error.into()),
+    if read_retrying_interrupts(reader, &mut prefix[..1])? == 0 {
+        return Ok(None);
     }
     read_remaining(reader, &mut prefix[1..], ProtocolError::TruncatedPrefix)?;
 
@@ -252,18 +250,28 @@ pub fn read_frame<M: Message>(reader: &mut impl Read) -> Result<Option<M>, Proto
     Ok(Some(message))
 }
 
+fn read_retrying_interrupts(reader: &mut impl Read, bytes: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(bytes) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
 fn read_remaining(
     reader: &mut impl Read,
-    bytes: &mut [u8],
+    mut bytes: &mut [u8],
     truncated: ProtocolError,
 ) -> Result<(), ProtocolError> {
-    reader.read_exact(bytes).map_err(|error| {
-        if error.kind() == io::ErrorKind::UnexpectedEof {
-            truncated
-        } else {
-            error.into()
+    while !bytes.is_empty() {
+        let count = read_retrying_interrupts(reader, bytes)?;
+        if count == 0 {
+            return Err(truncated);
         }
-    })
+        bytes = &mut bytes[count..];
+    }
+    Ok(())
 }
 
 /// Writes and flushes one frame after validation and bounded serialization.
