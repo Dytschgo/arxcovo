@@ -15,6 +15,83 @@ pub fn private(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Match the actual handle's owner and the complete, ordered, explicit DACL.
+/// The masks supplied here are object-specific rights, with no generic grants.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) mod vm_acl {
+    use std::{os::windows::io::AsRawHandle, ptr};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{Authorization::*, *},
+    };
+
+    pub(crate) struct Entry {
+        pub deny: bool,
+        pub sid: PSID,
+        pub mask: u32,
+    }
+
+    /// All SID pointers must refer to valid SIDs throughout this call.
+    pub(crate) unsafe fn exact(
+        handle: &impl AsRawHandle,
+        expected_owner: PSID,
+        expected: &[Entry],
+    ) -> bool {
+        let mut owner = ptr::null_mut();
+        let mut dacl = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        // The descriptor owns the owner and DACL views.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return false;
+        }
+        // GetSecurityInfo returned Windows-owned SID and ACL storage.
+        let verified = unsafe {
+            !owner.is_null() && EqualSid(owner, expected_owner) != 0 && matches(dacl, expected)
+        };
+        // Release the single allocation after inspecting its views.
+        unsafe { LocalFree(descriptor) };
+        verified
+    }
+
+    /// The ACL and expected SIDs must remain live for the call.
+    pub(crate) unsafe fn matches(dacl: *const ACL, expected: &[Entry]) -> bool {
+        // Only basic object-local ACEs in the intended order are recognized.
+        unsafe {
+            !dacl.is_null()
+                && usize::from((*dacl).AceCount) == expected.len()
+                && expected.iter().enumerate().all(|(index, entry)| {
+                    let mut ace = ptr::null_mut();
+                    if GetAce(dacl, index as u32, &mut ace) == 0 {
+                        return false;
+                    }
+                    let header = &*ace.cast::<ACE_HEADER>();
+                    if header.AceFlags != 0
+                        || header.AceType != u8::from(entry.deny)
+                        || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
+                    {
+                        return false;
+                    }
+                    // Basic allow and deny ACEs have the same mask and SID layout.
+                    let basic = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+                    let sid = ptr::addr_of!(basic.SidStart).cast_mut().cast();
+                    basic.Mask == entry.mask && EqualSid(sid, entry.sid) != 0
+                })
+        }
+    }
+}
+
 #[cfg(windows)]
 pub fn private(path: &Path) -> Result<()> {
     use std::{os::windows::ffi::OsStrExt, ptr};
