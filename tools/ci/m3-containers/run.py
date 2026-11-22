@@ -160,6 +160,9 @@ class Qualification:
         except ERRORS as error:
             self.receipt["cleanup"] = "incomplete"
             self.latch(error)
+        diagnostic = getattr(self.resources, "failure_diagnostic", None)
+        if diagnostic is not None:
+            self.receipt["diagnostic"] = diagnostic
         return self.receipt
 
     def latch(self, error):

@@ -12,9 +12,46 @@ import stat
 import subprocess
 import time
 
-from fixture import (INNER, NETWORK, OUTER, Refusal, allocate, bounded_read, data_layout,
+from fixture import (INNER, NETWORK, OUTER, Refusal, allocate, bounded_read, capture, data_layout,
                      filesystem_facts, host_command, image_stat, private_directory,
-                     remaining, require, unique_pairs)
+                     remaining, require, unique_pairs, vet_tool)
+
+
+LIVENESS_GATES = {
+    ("a", "boot0"): ("a0", "boot0"),
+    ("b", "boot0"): ("b0", "boot0"),
+    ("c", "boot0"): ("c0", "boot0"),
+    ("b", "boot1"): ("b1", "boot1"),
+    ("b", "daemon/listeners1"): ("b1", "listeners1"),
+}
+BOOTSTRAP_MESSAGE = re.compile(r"R2 bootstrap ([a-z0-9-]{1,40}) errno=([0-9]{1,4})")
+# Keep this vocabulary aligned with bootstrap.c. Text with the right shape
+# can still have come from a different process's stderr within the unit.
+BOOTSTRAP_CATEGORIES = frozenset("""
+    ambient ambient-clear arguments await-broker await-build-ready await-kill-leaf
+    await-kill-reaped await-kill-target await-network-go await-path barrier-direction broker-barrier
+    broker-barrier-send broker-exec broker-membership broker-release broker-uid build-keepcaps
+    build-leaf build-probe-trigger cap-bounding-drop cap-bounding-read cap-bounding-retained caps
+    cgroup-controllers cgroup-domain cgroup-name cgroup-namespace cgroup-parent-pids child
+    close-range control-fd control-wait control-write core-limit daemon-keepcaps data-path
+    delegate-marker delegate-marker-fresh-runs device-inventory device-node dns-port-scope
+    enter-netns exclusive-bind exclusive-rebind expected-denial extra-device extra-fd fd-limit
+    filesystem-view fork in-namespace-accept in-namespace-connect init-groups ipv4-address
+    ipv6-address ipv6-only kill-target-empty kill-target-populated kill-target-status leaf-memory
+    leaf-pids leaf-swap listen-poll listener-bind listener-count listener-finish
+    listener-positive-control listener-retire listener-start missing-device mkdir mount mount-base
+    mount-count mount-instance netns-path network-close network-connect-result network-connected
+    network-deny-tcp network-deny-udp network-echo network-nonce network-poll network-route
+    network-socket network-trigger nnp nss-files-only out-write output-fd outside-close
+    outside-peer outside-peer-close parent-peer-close path path-identity peer-close peer-pid
+    persistent-image pid-one pid-render pivot private-denial private-mountinfo private-namespaces
+    private-pts ptmx pty-barrier pty-controlling pty-echo pty-master pty-mode pty-paste pty-ready
+    pty-session pty-transfer read-open read-size report role role-capget role-drop-authority
+    role-group role-locked-expired role-passwd role-passwd-reverse root-identity signals slot-denial
+    socket-denial sole-pid status-key status-value stdin stdin-device systemd-cgroup-owner
+    systemd-placement tcp-control udp-control unexpected-acl-xattr unexpected-probe-exit
+    version-cargo version-cc version-exec version-output version-rustc workspace-root workspace-slot-mount
+""".split())
 
 
 def dev_majmin(dev):
@@ -67,6 +104,7 @@ class Resources:
         self.tools = tools
         self.cleanup_stack = []
         self.facts = {}
+        self.failure_diagnostic = None
 
     def cmd(self, tool, end, *args, **options):
         return host_command(tool, end, *args, tools=self.tools, **options)
@@ -493,15 +531,57 @@ class Resources:
         require(all(len(row) == 2 for row in rows) and len(dict(rows)) == len(rows), "unit-fields")
         return dict(rows)
 
-    def stop_unit(self, unit, invocation, end, *, crash=False):
+    def attributed_unit(self, unit, invocation, end):
         facts = self.unit_info(unit, end)
         if facts.get("LoadState") != "not-found":
-            require(facts.get("Id") == unit and facts.get("InvocationID") == invocation
-                    and facts.get("ControlGroup") == f"/system.slice/{unit}", "unit-attribution")
+            require(facts.get("LoadState") == "loaded" and facts.get("Id") == unit
+                    and facts.get("InvocationID") == invocation
+                    and facts.get("ControlGroup") in ("", f"/system.slice/{unit}")
+                    and facts.get("ActiveState")
+                    and re.fullmatch(r"0|[1-9][0-9]{0,9}", facts.get("MainPID", "")),
+                    "unit-attribution")
+        return facts
+
+    def stop_unit(self, unit, invocation, end, *, crash=False):
+        facts = self.attributed_unit(unit, invocation, end)
+        cgroup = Path("/sys/fs/cgroup/system.slice") / unit
+        if facts["LoadState"] == "not-found":
+            require(not crash, "unit-attribution")
+            require(not cgroup.exists(), "unit-cgroup-residue")
+            return
+
+        terminal = facts["ControlGroup"] == ""
+        if terminal:
+            require(not crash and facts["ActiveState"] in ("failed", "inactive")
+                    and facts["MainPID"] == "0", "unit-attribution")
+            require(not cgroup.exists(), "unit-cgroup-residue")
+        else:
             if crash:
                 self.cmd("systemctl", end, "kill", "--kill-whom=all", "--signal=SIGKILL", unit)
             self.cmd("systemctl", end, "stop", unit)
-        require(not (Path("/sys/fs/cgroup/system.slice") / unit).exists(), "unit-cgroup-residue")
+            facts = self.attributed_unit(unit, invocation, end)
+            require(facts["LoadState"] == "not-found" or (
+                facts["ActiveState"] in ("failed", "inactive") and facts["MainPID"] == "0"
+            ), "unit-attribution")
+
+        reset = facts.get("ActiveState") == "failed" and facts["LoadState"] != "not-found"
+        if reset:
+            self.cmd("systemctl", end, "reset-failed", unit)
+        if not terminal or reset:
+            settle_end = min(end, time.monotonic() + 0.5)
+            for _ in range(20):
+                if not cgroup.exists():
+                    break
+                delay = settle_end - time.monotonic()
+                if delay <= 0:
+                    break
+                time.sleep(min(delay, 0.025))
+        if terminal or reset:
+            facts = self.attributed_unit(unit, invocation, end)
+            require(facts["LoadState"] == "not-found" or (
+                facts["ActiveState"] == "inactive" and facts["ControlGroup"] == "" and facts["MainPID"] == "0"
+            ), "unit-attribution")
+        require(not cgroup.exists(), "unit-cgroup-residue")
 
     def start(self, instance, end):
         require(instance in ("a0", "b0", "b1", "c0"), "boot-instance")
@@ -524,18 +604,48 @@ class Resources:
             if facts.get("LoadState") != "not-found":
                 invocation = facts.get("InvocationID", "")
                 require(re.fullmatch(r"[0-9a-f]{32}", invocation), "unit-invocation")
-                self.remember("unit", lambda deadline: self.stop_unit(unit, invocation, deadline))
+                self.remember(f"unit-{instance}", lambda deadline: self.stop_unit(unit, invocation, deadline))
         validate_unit(unit, facts)
         group = Path("/sys/fs/cgroup") / facts["ControlGroup"].lstrip("/")
         observe_limits(group)
         return unit, invocation, int(facts["MainPID"])
+
+    def diagnose_exit(self, node, path, unit, invocation, end):
+        instance, gate = LIVENESS_GATES[node, path]
+        diagnostic = {"instance": instance, "gate": gate}
+        try:
+            require(unit == f"arx-r2-{self.id}-{instance}.service"
+                    and re.fullmatch(r"[0-9a-f]{32}", invocation), "journal-attribution")
+            journal_end = time.monotonic() + min(remaining(end), 2.0)
+            journalctl = vet_tool("/usr/bin/journalctl")
+            output = capture([journalctl, "--no-pager", "--boot=0", "--output=json", "--lines=16",
+                              f"_SYSTEMD_UNIT={unit}", f"_SYSTEMD_INVOCATION_ID={invocation}"],
+                             journal_end, limit=32768)
+            lines = output.decode("utf-8").removesuffix("\n").split("\n")
+            require(1 <= len(lines) <= 16, "journal-inventory")
+            bootstrap = []
+            for line in lines:
+                record = json.loads(line, object_pairs_hook=unique_pairs,
+                                    parse_constant=lambda _: require(False, "journal-json"))
+                require(isinstance(record, dict), "journal-json")
+                message = record.get("MESSAGE")
+                match = BOOTSTRAP_MESSAGE.fullmatch(message) if isinstance(message, str) else None
+                if match and match[1] in BOOTSTRAP_CATEGORIES and len(bootstrap) < 8:
+                    bootstrap.append({"category": match[1], "errno": int(match[2])})
+            diagnostic["bootstrap"] = bootstrap
+        except (OSError, ValueError, RecursionError, subprocess.SubprocessError):
+            diagnostic["journal"] = "unavailable"
+        self.failure_diagnostic = diagnostic
 
     def event(self, node, path, expected, end, *, process=None):
         file = self.root / node / "probe" / path
         while not file.exists():
             remaining(end)
             if process is not None:
-                require(Path(f"/proc/{process}").exists(), "probe-process-exited")
+                unit, invocation, pid = process
+                if not Path(f"/proc/{pid}").exists():
+                    self.diagnose_exit(node, path, unit, invocation, end)
+                    raise Refusal("probe-process-exited")
             time.sleep(0.01)
         require(stat.S_ISREG(file.lstat().st_mode), "probe-receipt-type")
         raw = bounded_read(file, 256)
@@ -550,9 +660,9 @@ class Resources:
         a = self.start("a0", end)
         c = self.start("c0", end)
         b = self.start("b0", end)
-        for node, (unit, _invocation, pid) in zip("acb", (a, c, b)):
-            self.event(node, "boot0", b"r2-init-v1\n", end, process=pid)
-            self.check_namespace(node, unit, pid, end)
+        for node, process in zip("acb", (a, c, b)):
+            self.event(node, "boot0", b"r2-init-v1\n", end, process=process)
+            self.check_namespace(node, process[0], process[2], end)
         for node in "ac":
             self.event(node, "daemon/listeners", b"r2-listeners-v1\n", end)
         marker = self.root / "b/probe/persistent"
@@ -570,8 +680,8 @@ class Resources:
         finally:
             os.close(with_pid)
         restarted = self.start("b1", end)
-        self.event("b", "boot1", b"r2-init-v1\n", end, process=restarted[2])
-        self.event("b", "daemon/listeners1", b"r2-listeners-v1\n", end, process=restarted[2])
+        self.event("b", "boot1", b"r2-init-v1\n", end, process=restarted)
+        self.event("b", "daemon/listeners1", b"r2-listeners-v1\n", end, process=restarted)
         after = marker.stat()
         require((after.st_dev, after.st_ino, after.st_mtime_ns) == (before.st_dev, before.st_ino, before.st_mtime_ns),
                 "restart-image-identity")

@@ -3,11 +3,13 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import re
 import stat
 import subprocess
+import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from fixture import INNER, MIB, NETWORK, OUTER, Refusal, TOOLS, load_pins, filesystem_facts
 import isolation
@@ -574,6 +576,133 @@ class Network(unittest.TestCase):
             isolation.counter_delta(initial, {**later, "ipv6": (*initial["ipv6"][:2], 9, 660)})
 
 
+class Bootstrap(unittest.TestCase):
+    def test_marker_timeouts_and_post_reap_cgroup_settle(self):
+        source = (Path(__file__).parent / "bootstrap.c").read_text(encoding="ascii")
+        self.assertEqual(re.findall(r'\bwait_path\(([^;\n]+)\);', source)[1:], [
+            '"/run/r2/kill-target", "await-kill-target"',
+            '"/run/r2/kill-reaped", "await-kill-reaped"',
+            '"/run/r2/kill-leaf", "await-kill-leaf"',
+            '"/run/r2/broker", "await-broker"',
+            'ready, "await-build-ready"',
+            'trigger, "await-network-go"',
+        ])
+        self.assertIn("refuse(timeout_category);", source)
+        self.assertIn('wait_path("/run/r2/kill-reaped", "await-kill-reaped");\n'
+                      '    wait_leaf_empty();\n    report("/run/r2/broker",', source)
+        settle = source.split("static void wait_leaf_empty(void)")[1].split("\n}")[0]
+        self.assertIn(r'const char empty[] = "populated 0\nfrozen 0\n";', settle)
+        self.assertIn(r'const char populated[] = "populated 1\nfrozen 0\n";', settle)
+        self.assertIn('CHECK(fd >= 0, "kill-target-empty");', settle)
+        self.assertIn('close(fd) == 0 && count == (ssize_t)(sizeof(empty) - 1)', settle)
+        self.assertIn('if (memcmp(text, empty, sizeof(empty) - 1) == 0)\n            return;', settle)
+        self.assertIn('CHECK(memcmp(text, populated, sizeof(populated) - 1) == 0 && attempt < 50, '
+                      '"kill-target-empty");\n        CHECK(usleep(10000) == 0, "kill-target-empty");', settle)
+
+    def test_journal_vocabulary_matches_emitted_bootstrap_categories(self):
+        source = (Path(__file__).parent / "bootstrap.c").read_text(encoding="ascii")
+        categories = set(re.findall(
+            r'(?s)\b(?:CHECK|exact|child_ok|wait_path)\([^;]*?,\s*"([a-z0-9-]{1,40})"\);', source))
+        categories.update(re.findall(r'\brefuse\("([a-z0-9-]{1,40})"\)', source))
+        build = source.split("static void build_checks(void)")[1].split("\n}")[0]
+        version_tools = re.findall(r'\{"([^"]+)", "(version-[a-z]+)"\}', build)
+        self.assertEqual(version_tools, [("/opt/rust/bin/cargo", "version-cargo"),
+                                         ("/opt/rust/bin/rustc", "version-rustc"),
+                                         ("/usr/bin/cc", "version-cc")])
+        self.assertIn("child_ok(child, tools[i].category);", build)
+        categories.update(category for _, category in version_tools)
+        self.assertEqual(categories, isolation.BOOTSTRAP_CATEGORIES)
+
+
+class ProbeExit(unittest.TestCase):
+    def setUp(self):
+        self.resources = Cleanup.make_resources()
+        self.invocation = "a" * 32
+        self.end = time.monotonic() + 5
+
+    def missing_marker(self, node, instance, path):
+        unit = f"arx-r2-{self.resources.id}-{instance}.service"
+        with patch.object(Path, "exists", return_value=False), \
+             self.assertRaisesRegex(Refusal, "^probe-process-exited$"):
+            self.resources.event(node, path, b"r2-init-v1\n", self.end,
+                                 process=(unit, self.invocation, 123))
+        return unit
+
+    def test_journal_is_scoped_and_only_returns_known_bounded_bootstrap_records(self):
+        messages = [
+            "ld-linux: cannot open /private/example",
+            "secret=example",
+            "R2 bootstrap private-token-fragment errno=123",
+            "R2 bootstrap /private/example errno=1",
+            "R2 bootstrap version-cc errno=12345",
+            "R2 bootstrap version-cc errno=1\n",
+            [65, 66],
+            *[f"R2 bootstrap version-rustc errno={index:04}" for index in range(9)],
+        ]
+        output = "\n".join(json.dumps({"MESSAGE": message, "OTHER": "secret=example"})
+                           for message in messages).encode("ascii")
+        with patch.object(isolation, "vet_tool", return_value="/usr/bin/journalctl") as vet, \
+             patch.object(isolation, "capture", return_value=output) as capture:
+            started = time.monotonic()
+            unit = self.missing_marker("b", "b1", "daemon/listeners1")
+            finished = time.monotonic()
+        vet.assert_called_once_with("/usr/bin/journalctl")
+        capture.assert_called_once()
+        argv, journal_end = capture.call_args.args
+        self.assertEqual(argv, ["/usr/bin/journalctl", "--no-pager", "--boot=0",
+                                "--output=json", "--lines=16", f"_SYSTEMD_UNIT={unit}",
+                                f"_SYSTEMD_INVOCATION_ID={self.invocation}"])
+        self.assertLessEqual(started + 2.0, journal_end)
+        self.assertLessEqual(journal_end, min(finished + 2.0, self.end))
+        self.assertEqual(capture.call_args.kwargs, {"limit": 32768})
+        self.assertEqual(self.resources.failure_diagnostic, {
+            "instance": "b1", "gate": "listeners1",
+            "bootstrap": [{"category": "version-rustc", "errno": index} for index in range(8)],
+        })
+
+    def test_unavailable_journal_keeps_original_liveness_refusal(self):
+        gates = [
+            ("a", "a0", "boot0", "boot0"),
+            ("c", "c0", "boot0", "boot0"),
+            ("b", "b0", "boot0", "boot0"),
+            ("b", "b1", "boot1", "boot1"),
+            ("b", "b1", "daemon/listeners1", "listeners1"),
+        ]
+        failures = [
+            {"vet_error": Refusal("runner-tool")},
+            {"capture_error": subprocess.TimeoutExpired(["journalctl"], 2)},
+            {"capture_error": Refusal("command-status")},
+            {"capture_error": Refusal("command-output-bound")},
+            {"output": b'{"MESSAGE":"R2 bootstrap child errno=0"}\nnot json'},
+            {"output": b'{"MESSAGE":"duplicate","MESSAGE":"R2 bootstrap child errno=0"}'},
+            {"output": b'{"MESSAGE":"R2 bootstrap child errno=0","OTHER":NaN}'},
+            {"output": b""},
+        ]
+        for node, instance, path, gate in gates:
+            for failure in failures:
+                with self.subTest(instance=instance, gate=gate, failure=failure), \
+                     patch.object(isolation, "vet_tool", return_value="/usr/bin/journalctl",
+                                  side_effect=failure.get("vet_error")), \
+                     patch.object(isolation, "capture", return_value=failure.get("output"),
+                                  side_effect=failure.get("capture_error")) as capture:
+                    self.missing_marker(node, instance, path)
+                    if "vet_error" in failure:
+                        capture.assert_not_called()
+                    self.assertEqual(self.resources.failure_diagnostic,
+                                     {"instance": instance, "gate": gate, "journal": "unavailable"})
+
+    def test_ready_marker_does_not_vet_or_read_journal(self):
+        with patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "lstat", return_value=SimpleNamespace(st_mode=stat.S_IFREG)), \
+             patch.object(isolation, "bounded_read", return_value=b"r2-init-v1\n"), \
+             patch.object(isolation, "vet_tool") as vet, patch.object(isolation, "capture") as capture:
+            unit = f"arx-r2-{self.resources.id}-a0.service"
+            self.resources.event("a", "boot0", b"r2-init-v1\n", self.end, process=(unit, self.invocation, 123))
+        vet.assert_not_called()
+        capture.assert_not_called()
+        self.assertIsNone(self.resources.failure_diagnostic)
+
+
 class Cleanup(unittest.TestCase):
     @staticmethod
     def make_resources():
@@ -582,6 +711,134 @@ class Cleanup(unittest.TestCase):
             load_pins(),
             {**TOOLS, "ip": "/usr/bin/ip"},
         )
+
+    @staticmethod
+    def unit_facts(unit, **fields):
+        return {
+            "Id": unit, "InvocationID": "a" * 32, "LoadState": "loaded",
+            "ControlGroup": f"/system.slice/{unit}", "ActiveState": "active", "MainPID": "123",
+            "MemoryMax": str(OUTER["memory"]), "MemorySwapMax": str(OUTER["swap"]),
+            "TasksMax": str(OUTER["pids"]), "CPUQuotaPerSecUSec": "1s",
+            "LimitNOFILE": str(OUTER["nofile"]), "LimitCORE": str(OUTER["core"]),
+            **fields,
+        }
+
+    def test_terminal_cleanup_resets_only_matching_failed_unit(self):
+        resources = self.make_resources()
+        unit = f"arx-r2-{resources.id}-a0.service"
+        end = time.monotonic() + 5
+        inactive = self.unit_facts(unit, ControlGroup="", ActiveState="inactive", MainPID="0")
+        for state in ("failed", "inactive"):
+            with self.subTest(state=state), \
+                 patch.object(resources, "unit_info", side_effect=[{**inactive, "ActiveState": state}, inactive]), \
+                 patch.object(resources, "cmd") as cmd, patch.object(Path, "exists", return_value=False):
+                resources.stop_unit(unit, inactive["InvocationID"], end)
+                if state == "failed":
+                    cmd.assert_called_once_with("systemctl", end, "reset-failed", unit)
+                else:
+                    cmd.assert_not_called()
+
+    def test_cleanup_refuses_ambiguous_unit_without_sending_commands(self):
+        resources = self.make_resources()
+        unit = f"arx-r2-{resources.id}-a0.service"
+        terminal = self.unit_facts(unit, ControlGroup="", ActiveState="failed", MainPID="0")
+        for properties, residue, category in [
+            ({"InvocationID": "b" * 32}, False, "unit-attribution"),
+            ({"Id": "foreign.service"}, False, "unit-attribution"),
+            ({"ActiveState": "active"}, False, "unit-attribution"),
+            ({"ActiveState": "activating"}, False, "unit-attribution"),
+            ({"ActiveState": "deactivating"}, False, "unit-attribution"),
+            ({"ActiveState": "inactive", "MainPID": "123"}, False, "unit-attribution"),
+            ({"ControlGroup": "/system.slice/foreign.service"}, False, "unit-attribution"),
+            ({}, True, "unit-cgroup-residue"),
+        ]:
+            with self.subTest(properties=properties, residue=residue), \
+                 patch.object(resources, "unit_info", return_value={**terminal, **properties}), \
+                 patch.object(resources, "cmd") as cmd, patch.object(Path, "exists", return_value=residue), \
+                 self.assertRaisesRegex(Refusal, f"^{category}$"):
+                resources.stop_unit(unit, terminal["InvocationID"], time.monotonic() + 5)
+            cmd.assert_not_called()
+        for missing in ("LoadState", "ControlGroup", "ActiveState", "MainPID"):
+            with self.subTest(missing=missing), \
+                 patch.object(resources, "unit_info", return_value={k: v for k, v in terminal.items() if k != missing}), \
+                 patch.object(resources, "cmd") as cmd, self.assertRaisesRegex(Refusal, "^unit-attribution$"):
+                resources.stop_unit(unit, terminal["InvocationID"], time.monotonic() + 5)
+            cmd.assert_not_called()
+
+    def test_crash_resets_failed_unit_then_registered_cleanup_is_idempotent(self):
+        resources = self.make_resources()
+        unit = f"arx-r2-{resources.id}-b0.service"
+        end = time.monotonic() + 5
+        not_found = {"LoadState": "not-found"}
+        live = self.unit_facts(unit)
+        failed = self.unit_facts(unit, ControlGroup="", ActiveState="failed", MainPID="0")
+        with patch.object(resources, "unit_info", side_effect=[not_found, live, live, failed, not_found, not_found]), \
+             patch.object(resources, "cmd") as cmd, patch.object(isolation, "observe_limits"), \
+             patch.object(Path, "exists", side_effect=[True, False, False, False]), \
+             patch.object(isolation.time, "sleep") as sleep:
+            started_unit, invocation, _ = resources.start("b0", end)
+            resources.stop_unit(started_unit, invocation, end, crash=True)
+            self.assertEqual(resources.cleanup(end), [])
+        self.assertEqual(cmd.call_args_list[1:], [
+            call("systemctl", end, "kill", "--kill-whom=all", "--signal=SIGKILL", unit),
+            call("systemctl", end, "stop", unit),
+            call("systemctl", end, "reset-failed", unit),
+        ])
+        sleep.assert_called_once_with(0.025)
+
+    def test_crash_refuses_terminal_or_missing_unit_without_sending_commands(self):
+        resources = self.make_resources()
+        unit = f"arx-r2-{resources.id}-b0.service"
+        failed = self.unit_facts(unit, ControlGroup="", ActiveState="failed", MainPID="0")
+        for facts in (failed, {"LoadState": "not-found"}):
+            with self.subTest(facts=facts), patch.object(resources, "unit_info", return_value=facts), \
+                 patch.object(resources, "cmd") as cmd, self.assertRaisesRegex(Refusal, "^unit-attribution$"):
+                resources.stop_unit(unit, failed["InvocationID"], time.monotonic() + 5, crash=True)
+            cmd.assert_not_called()
+
+    def test_cgroup_residue_after_stop_is_bounded_by_retry_count_and_phase_deadline(self):
+        resources = self.make_resources()
+        unit = f"arx-r2-{resources.id}-c0.service"
+        live = self.unit_facts(unit)
+        not_found = {"LoadState": "not-found"}
+        for end, delay_count in [(15, 20), (10, 0)]:
+            with self.subTest(end=end), \
+                 patch.object(resources, "unit_info", side_effect=[live, not_found]), \
+                 patch.object(resources, "cmd") as cmd, patch.object(Path, "exists", return_value=True), \
+                 patch.object(isolation.time, "monotonic", return_value=10), \
+                 patch.object(isolation.time, "sleep") as sleep, \
+                 self.assertRaisesRegex(Refusal, "^unit-cgroup-residue$"):
+                resources.stop_unit(unit, live["InvocationID"], end)
+            cmd.assert_called_once_with("systemctl", end, "stop", unit)
+            self.assertEqual(sleep.call_args_list, [call(0.025)] * delay_count)
+
+    def test_refuses_unit_identity_drift_after_stop_or_reset(self):
+        resources = self.make_resources()
+        unit = f"arx-r2-{resources.id}-b1.service"
+        end = time.monotonic() + 5
+        live = self.unit_facts(unit)
+        failed = self.unit_facts(unit, ControlGroup="", ActiveState="failed", MainPID="0")
+        foreign = {**failed, "InvocationID": "b" * 32}
+        for before, command in [(live, "stop"), (failed, "reset-failed")]:
+            with self.subTest(command=command), patch.object(resources, "unit_info", side_effect=[before, foreign]), \
+                 patch.object(resources, "cmd") as cmd, patch.object(Path, "exists", return_value=False), \
+                 self.assertRaisesRegex(Refusal, "^unit-attribution$"):
+                resources.stop_unit(unit, live["InvocationID"], end)
+            cmd.assert_called_once_with("systemctl", end, command, unit)
+
+    def test_cleanup_labels_distinguish_unit_failures(self):
+        resources = self.make_resources()
+        b0, c0 = (f"arx-r2-{resources.id}-{instance}.service" for instance in ("b0", "c0"))
+        not_found = {"LoadState": "not-found"}
+        facts = [not_found, self.unit_facts(b0), not_found, self.unit_facts(c0),
+                 self.unit_facts(c0, InvocationID="b" * 32), self.unit_facts(b0, ControlGroup="")]
+        end = time.monotonic() + 5
+        with patch.object(resources, "unit_info", side_effect=facts), \
+             patch.object(resources, "cmd") as cmd, patch.object(isolation, "observe_limits"):
+            resources.start("b0", end)
+            resources.start("c0", end)
+            self.assertEqual(resources.cleanup(end), ["unit-c0", "unit-b0"])
+        self.assertEqual([command.args[0] for command in cmd.call_args_list], ["unit", "unit"])
 
     def test_cleanup_keeps_trying_and_refuses_ambiguous_mount(self):
         resources = self.make_resources()

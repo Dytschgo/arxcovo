@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 import fixture
+import isolation
 import run
 
 
@@ -577,9 +578,29 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(receipt["cleanup_errors"], ["unit"])
         self.assertEqual(receipt["cleanup"], "incomplete")
 
+    def test_probe_exit_diagnostic_is_included_in_the_encoded_failure_receipt(self):
+        identity = {"repo": "org/repo", "head": "a"*40, "run": "1", "attempt": "1"}
+        resources = isolation.Resources(identity, fixture.load_pins())
+        unit = f"arx-r2-{resources.id}-b0.service"
+
+        def contain(end):
+            resources.event("b", "boot0", b"r2-init-v1\n", end, process=(unit, "a" * 32, 123))
+
+        with patch.object(resources, "contain", side_effect=contain), patch.object(Path, "exists", return_value=False), \
+             patch.object(isolation, "vet_tool", return_value="/usr/bin/journalctl"), \
+             patch.object(isolation, "capture", return_value=b'{"MESSAGE":"R2 bootstrap await-broker errno=2"}\n'):
+            receipt = run.Qualification().run(lambda _end: (identity, {}, resources), lambda *_: {})
+        encoded = run.encode_receipt(receipt)
+        self.assertTrue(encoded.isascii())
+        self.assertEqual(json.loads(encoded)["diagnostic"], {
+            "instance": "b0", "gate": "boot0", "bootstrap": [{"category": "await-broker", "errno": 2}],
+        })
+        self.assertEqual(receipt["first"], {"phase": "contain", "category": "probe-process-exited"})
+        self.assertEqual(receipt["cleanup"], "confirmed")
+
     def test_success_requires_every_phase_and_complete_cleanup(self):
         steps = []
-        resource = SimpleNamespace(facts={}, contain=lambda _: steps.append("contain"),
+        resource = SimpleNamespace(facts={}, failure_diagnostic=None, contain=lambda _: steps.append("contain"),
                                    network=lambda _: steps.append("network"), cleanup=lambda _: [])
         result = run.Qualification().run(lambda _end: ({}, {}, resource), lambda *_: {})
         self.assertEqual(steps, ["contain", "network"])
@@ -587,3 +608,4 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(sum(fixture.TIME.values()), 85)
         self.assertEqual(result["cleanup"], "confirmed")
         self.assertIsNone(result["first"])
+        self.assertNotIn("diagnostic", result)

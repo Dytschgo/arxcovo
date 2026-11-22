@@ -206,10 +206,10 @@ static void security(unsigned int mask, bool ambient)
     check_fds();
 }
 
-static void child_ok(pid_t pid)
+static void child_ok(pid_t pid, const char *category)
 {
     int status;
-    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0, "child");
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0, category);
 }
 
 static pid_t fork_child(void)
@@ -441,7 +441,7 @@ static void pty_probe(void)
     CHECK(close(barrier[1]) == 0 && read(barrier[0], &byte, 1) == 1 && byte == '1'
           && close(barrier[0]) == 0
           && write(master, sentinel, sizeof(sentinel) - 1) == (ssize_t)sizeof(sentinel) - 1, "pty-paste");
-    child_ok(child);
+    child_ok(child, "child");
     struct pollfd reading = {master, POLLIN, 0};
     CHECK(poll(&reading, 1, 0) >= 0 && !(reading.revents & POLLIN) && close(master) == 0, "pty-echo");
 }
@@ -501,22 +501,48 @@ static void build_checks(void)
     CHECK(rename(SLOT, "/data/workspace/replaced") == -1 && errno == EACCES, "slot-denial");
     int fd = open(SLOT "/out/r2", O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0600);
     CHECK(fd >= 0 && close(fd) == 0 && unlink(SLOT "/out/r2") == 0, "out-write");
-    const char *const tools[] = {"/opt/rust/bin/cargo", "/opt/rust/bin/rustc", "/usr/bin/cc"};
+    const struct {
+        const char *path;
+        const char *category;
+    } tools[] = {
+        {"/opt/rust/bin/cargo", "version-cargo"},
+        {"/opt/rust/bin/rustc", "version-rustc"},
+        {"/usr/bin/cc", "version-cc"},
+    };
     for (size_t i = 0; i < sizeof(tools)/sizeof(tools[0]); ++i) {
         pid_t child = fork_child();
         if (child == 0) {
-            char *const args[] = {(char *)tools[i], "--version", NULL};
+            char *const args[] = {(char *)tools[i].path, "--version", NULL};
             int null = open("/dev/null", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
             CHECK(null >= 3 && dup2(null, STDOUT_FILENO) == STDOUT_FILENO && close(null) == 0, "version-output");
-            execve(tools[i], args, tool_env);
+            execve(tools[i].path, args, tool_env);
             refuse("version-exec");
         }
-        child_ok(child);
+        child_ok(child, tools[i].category);
     }
 }
 
 static void report(const char *path, const char *value);
-static void wait_path(const char *path);
+static void wait_path(const char *path, const char *timeout_category);
+
+static void wait_leaf_empty(void)
+{
+    const char empty[] = "populated 0\nfrozen 0\n";
+    const char populated[] = "populated 1\nfrozen 0\n";
+    char text[sizeof(empty)];
+
+    // Reaping can precede the kernel's last cgroup population update.
+    for (unsigned int attempt = 0; ; ++attempt) {
+        int fd = open(LEAF "/cgroup.events", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        CHECK(fd >= 0, "kill-target-empty");
+        ssize_t count = read(fd, text, sizeof(text));
+        CHECK(close(fd) == 0 && count == (ssize_t)(sizeof(empty) - 1), "kill-target-empty");
+        if (memcmp(text, empty, sizeof(empty) - 1) == 0)
+            return;
+        CHECK(memcmp(text, populated, sizeof(populated) - 1) == 0 && attempt < 50, "kill-target-empty");
+        CHECK(usleep(10000) == 0, "kill-target-empty");
+    }
+}
 
 static void broker(void)
 {
@@ -543,11 +569,11 @@ static void broker(void)
     exact(LEAF "/memory.swap.max", "0\n", "leaf-swap");
     exact(LEAF "/pids.max", "32\n", "leaf-pids");
     report("/run/r2/kill-leaf", "r2-kill-v1\n");
-    wait_path("/run/r2/kill-target");
+    wait_path("/run/r2/kill-target", "await-kill-target");
     exact(LEAF "/cgroup.events", "populated 1\nfrozen 0\n", "kill-target-populated");
     write_text(LEAF "/cgroup.kill", "1");
-    wait_path("/run/r2/kill-reaped");
-    exact(LEAF "/cgroup.events", "populated 0\nfrozen 0\n", "kill-target-empty");
+    wait_path("/run/r2/kill-reaped", "await-kill-reaped");
+    wait_leaf_empty();
     report("/run/r2/broker", "r2-broker-v1\n");
     while (true)
         pause();
@@ -571,7 +597,7 @@ static void device_inventory(void)
     CHECK(closedir(directory) == 0 && seen == 63, "missing-device");
 }
 
-static void wait_path(const char *path)
+static void wait_path(const char *path, const char *timeout_category)
 {
     for (unsigned int i = 0; i < 500; ++i) {
         if (access(path, F_OK) == 0)
@@ -579,7 +605,7 @@ static void wait_path(const char *path)
         CHECK(errno == ENOENT, "await-path");
         usleep(10000);
     }
-    refuse("await-path-timeout");
+    refuse(timeout_category);
 }
 
 static void report(const char *path, const char *value)
@@ -647,7 +673,7 @@ static void init(const char *id, char node, int outside_peer, char generation)
         pid_write(SUP "/cgroup.procs", child);
         pid_exact(SUP "/cgroup.procs", child);
         CHECK(write(barrier[0], "1", 1) == 1 && close(barrier[0]) == 0, "broker-barrier-send");
-        wait_path("/run/r2/kill-leaf");
+        wait_path("/run/r2/kill-leaf", "await-kill-leaf");
         pid_t disposable = fork_child();
         if (disposable == 0) {
             pid_write(LEAF "/cgroup.procs", getpid());
@@ -660,7 +686,7 @@ static void init(const char *id, char node, int outside_peer, char generation)
         CHECK(waitpid(disposable, &status, 0) == disposable && WIFSIGNALED(status)
               && WTERMSIG(status) == SIGKILL, "kill-target-status");
         report("/run/r2/kill-reaped", "r2-kill-v1\n");
-        wait_path("/run/r2/broker");
+        wait_path("/run/r2/broker", "await-broker");
         const char *ready = generation == '0' ? "/data/probe/build/ready0" : "/data/probe/build/ready1";
         pid_t build = fork_child();
         if (build == 0) {
@@ -672,7 +698,7 @@ static void init(const char *id, char node, int outside_peer, char generation)
             report(ready, "r2-build-v1\n");
             network(node, BUILD, generation);
         }
-        wait_path(ready);
+        wait_path(ready, "await-build-ready");
     }
     if (node == 'c') {
         /* Port 53 is only a synthetic listener in C's private network namespace. */
@@ -722,7 +748,7 @@ int main(int argc, char **argv)
     CHECK(close(pair[0]) == 0 && close(pair[1]) == 0, "outside-close");
     reset_fds();
     capabilities(0, false);
-    child_ok(child);
+    child_ok(child, "child");
     return 0;
 }
 
@@ -912,7 +938,7 @@ static void network(char node, uid_t uid, char generation)
               ? "/data/probe/daemon/listeners0" : "/data/probe/daemon/listeners1");
     const char *trigger = build ? "/data/probe/build/go" : "/data/probe/daemon/go";
     const char *results = build ? "/data/probe/build/result" : "/data/probe/daemon/result";
-    wait_path(trigger);
+    wait_path(trigger, "await-network-go");
     exact(trigger, "r2-network-v1\n", "network-trigger");
     attempt(a);
     for (size_t i = 0; i < sizeof(c)/sizeof(c[0]); ++i)
