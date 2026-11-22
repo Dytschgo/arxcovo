@@ -13,28 +13,60 @@ const VM: Id = [2; 16];
 const MIB: u64 = 1024 * 1024;
 
 #[derive(Clone)]
-struct TestClock(Arc<Mutex<ClockReading>>);
+struct TestClock {
+    reading: Arc<Mutex<ClockReading>>,
+    next_sample: Arc<Mutex<Option<Arc<ClockPause>>>>,
+}
+
+struct ClockPause {
+    sampled: Barrier,
+    resume: Barrier,
+}
 
 impl TestClock {
     fn new() -> Self {
-        Self(Arc::new(Mutex::new(ClockReading {
-            utc_ms: NOW,
-            monotonic: Instant::now(),
-        })))
+        Self {
+            reading: Arc::new(Mutex::new(ClockReading {
+                utc_ms: NOW,
+                monotonic: Instant::now(),
+            })),
+            next_sample: Arc::default(),
+        }
     }
 
     fn wall(&self, now: i64) {
-        self.0.lock().unwrap().utc_ms = now;
+        self.reading.lock().unwrap().utc_ms = now;
     }
 
     fn advance(&self, seconds: u64) {
-        self.0.lock().unwrap().monotonic += Duration::from_secs(seconds);
+        self.reading.lock().unwrap().monotonic += Duration::from_secs(seconds);
+    }
+
+    fn pause_next_sample(&self) -> Arc<ClockPause> {
+        let pause = Arc::new(ClockPause {
+            sampled: Barrier::new(2),
+            resume: Barrier::new(2),
+        });
+        assert!(
+            self.next_sample
+                .lock()
+                .unwrap()
+                .replace(pause.clone())
+                .is_none()
+        );
+        pause
     }
 }
 
 impl Clock for TestClock {
     fn now(&self) -> ClockReading {
-        *self.0.lock().unwrap()
+        let reading = *self.reading.lock().unwrap();
+        let pause = self.next_sample.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.sampled.wait();
+            pause.resume.wait();
+        }
+        reading
     }
 }
 
@@ -530,16 +562,16 @@ fn full_ledger_retains_replay_after_receipt_pruning_then_recovers() {
     let first = f.finish(f.admit(script(VM, 101, "bounded fixture")));
     let mut raw = db(f.dir.path());
     let tx = raw.transaction().unwrap();
-    for nonce in 102..610 {
+    for nonce in 102_u64..610 {
         tx.execute(
-            "INSERT INTO activity(principal,actor,vm,action,started_ms,status,finished_ms)
-            VALUES('alice','agent',?1,2,?2,1,?2)",
-            params![VM, NOW],
+            "INSERT INTO activity(principal,actor,vm,action,started_ms,status,finished_ms,terminal_order)
+            VALUES('alice','agent',?1,2,?2,1,?2,?3)",
+            params![VM, NOW, nonce],
         )
         .unwrap();
-        let key = [NOW.to_be_bytes(), (nonce as u64).to_be_bytes()].concat();
+        let key = [NOW.to_be_bytes(), nonce.to_be_bytes()].concat();
         tx.execute(
-            "INSERT INTO vm_operations VALUES('alice',?1,?2,2,?3,?4,1)",
+            "INSERT INTO vm_operations VALUES('alice',?1,?2,2,?3,?4,1,NULL)",
             params![key, VM, tx.last_insert_rowid(), NOW + RETRY_WINDOW_MS],
         )
         .unwrap();
@@ -634,23 +666,29 @@ fn utc_lease_and_monotonic_work_deadlines_use_separate_clocks() {
         NOW + 604_800_000
     );
     assert_eq!(
-        f.controller.extend_lease("alice", VM, 60).unwrap(),
+        f.controller
+            .extend_lease("alice", VM, key(NOW, 201), 60)
+            .unwrap(),
         Err(Refusal::Invalid)
     );
     assert_eq!(
-        f.controller.extend_lease("bob", VM, 604_800).unwrap(),
+        f.controller
+            .extend_lease("bob", VM, key(NOW, 201), 604_800)
+            .unwrap(),
         Err(Refusal::NotFound)
     );
     let shift = NOW + 30_000;
     f.clock.wall(shift);
     let expires = f
         .controller
-        .extend_lease("alice", VM, DEFAULT_LEASE_SECONDS)
+        .extend_lease("alice", VM, key(NOW, 202), DEFAULT_LEASE_SECONDS)
         .unwrap()
         .unwrap();
     assert_eq!(expires, shift + 604_800_000);
     assert_eq!(
-        f.controller.extend_lease("alice", VM, u64::MAX).unwrap(),
+        f.controller
+            .extend_lease("alice", VM, key(NOW, 203), u64::MAX)
+            .unwrap(),
         Err(Refusal::Invalid)
     );
 
@@ -699,20 +737,48 @@ fn utc_lease_and_monotonic_work_deadlines_use_separate_clocks() {
 }
 
 #[test]
-fn expiry_and_extension_are_atomic_across_utc_jumps() {
+fn extension_wins_if_it_samples_before_the_deadline() {
+    let f = Fixture::sealed();
+    f.ready(VM, Some(60));
+    f.clock.wall(NOW + 59_999);
+    let pause = f.clock.pause_next_sample();
+    thread::scope(|s| {
+        let extend = s.spawn(|| {
+            f.controller
+                .extend_lease("alice", VM, key(NOW, 20), 120)
+                .unwrap()
+        });
+        pause.sampled.wait();
+        f.clock.wall(NOW + 60_000);
+        let sweep = s.spawn(|| f.controller.claim_expired().unwrap());
+        pause.resume.wait();
+        assert_eq!(extend.join().unwrap(), Ok(NOW + 179_999));
+        assert!(sweep.join().unwrap().is_empty());
+    });
+    assert_eq!(
+        scalar(f.dir.path(), "SELECT expires_ms FROM vm_instances"),
+        NOW + 179_999
+    );
+}
+
+#[test]
+fn expiry_claim_wins_even_if_utc_moves_back_before_extension() {
     let f = Fixture::sealed();
     f.ready(VM, Some(60));
     f.clock.wall(NOW + 60_000);
-    let barrier = Barrier::new(2);
+    let pause = f.clock.pause_next_sample();
     let (claims, extension) = thread::scope(|s| {
-        let sweep = s.spawn(|| {
-            barrier.wait();
-            f.controller.claim_expired().unwrap()
-        });
+        let sweep = s.spawn(|| f.controller.claim_expired().unwrap());
+        pause.sampled.wait();
+        f.clock.wall(NOW + 59_999);
         let extend = s.spawn(|| {
-            barrier.wait();
-            f.controller.extend_lease("alice", VM, 120).unwrap()
+            f.controller
+                .extend_lease("alice", VM, key(NOW, 20), 120)
+                .unwrap()
         });
+        let second = s.spawn(|| f.controller.claim_expired().unwrap());
+        pause.resume.wait();
+        assert!(second.join().unwrap().is_empty());
         (sweep.join().unwrap(), extend.join().unwrap())
     });
     assert_eq!(extension, Err(Refusal::Expired));
@@ -721,7 +787,9 @@ fn expiry_and_extension_are_atomic_across_utc_jumps() {
     };
     f.clock.wall(NOW - 1);
     assert_eq!(
-        f.controller.extend_lease("alice", VM, 120).unwrap(),
+        f.controller
+            .extend_lease("alice", VM, key(NOW - 1, 21), 120)
+            .unwrap(),
         Err(Refusal::Expired)
     );
     assert!(f.controller.claim_expired().unwrap().is_empty());
@@ -1085,6 +1153,246 @@ fn shutdown_is_durable_and_blocks_dispatch_after_lookup() {
             .is_err()
     );
     assert!(f.controller.recovery_intents().unwrap().is_empty());
+}
+
+#[test]
+fn extension_replays_the_original_expiry_across_reopen() {
+    let f = Fixture::sealed();
+    f.ready(VM, Some(60));
+    let original = key(NOW, 20);
+    assert_eq!(
+        f.controller
+            .extend_lease("alice", VM, original, 120)
+            .unwrap(),
+        Ok(NOW + 120_000)
+    );
+    f.clock.wall(NOW + 30_000);
+    assert_eq!(
+        f.controller
+            .extend_lease("alice", VM, original, u64::MAX)
+            .unwrap(),
+        Ok(NOW + 120_000)
+    );
+    assert_eq!(
+        f.controller
+            .extend_lease("alice", [3; 16], original, 180)
+            .unwrap(),
+        Err(Refusal::KeyCollision)
+    );
+    assert_eq!(
+        f.controller.extend_lease("bob", VM, original, 180).unwrap(),
+        Err(Refusal::NotFound)
+    );
+    let mut collision = request(VM, 20, Operation::Start, DiskClaim::default());
+    collision.request_id = original;
+    refused(f.admit(collision), Refusal::KeyCollision);
+    assert_eq!(
+        f.controller
+            .extend_lease("alice", VM, key(NOW, 21), 180)
+            .unwrap(),
+        Ok(NOW + 210_000)
+    );
+    let Fixture {
+        controller,
+        dir,
+        clock,
+    } = f;
+    drop(controller);
+    let controller = VmController::open(dir.path(), VmPolicy::default(), clock).unwrap();
+    assert_eq!(
+        controller.extend_lease("alice", VM, original, 240).unwrap(),
+        Ok(NOW + 120_000)
+    );
+    assert_eq!(
+        scalar(dir.path(), "SELECT expires_ms FROM vm_instances"),
+        NOW + 210_000
+    );
+    assert_eq!(
+        scalar(
+            dir.path(),
+            "SELECT count(*) FROM activity WHERE action=8 AND status=1"
+        ),
+        2
+    );
+}
+
+#[test]
+fn late_cleanup_confirmation_survives_terminal_pruning_and_backward_utc() {
+    let f = Fixture::sealed();
+    f.running();
+    let pending = admitted(f.admit(script(VM, 101, "uncertain cleanup fixture")));
+    assert_eq!(
+        f.controller
+            .finish(&pending, Completion::CleanupUnconfirmed)
+            .unwrap(),
+        Status::Interrupted
+    );
+    let claim = f.controller.recovery_intents().unwrap()[0];
+    db(f.dir.path()).execute_batch(
+        "DELETE FROM activity WHERE status<>0;
+         WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<128)
+         INSERT INTO activity(principal,actor,vm,action,started_ms,finished_ms,status,terminal_order)
+         SELECT 'alice','agent',zeroblob(16),8,1800000000000,1800000000000,1,n FROM seq;",
+    ).unwrap();
+    f.clock.wall(NOW - 1);
+    f.controller
+        .finish_recovery(claim, CleanupResult::Confirmed)
+        .unwrap();
+    assert_eq!(
+        scalar(
+            f.dir.path(),
+            "SELECT count(*) FROM activity WHERE status<>0"
+        ),
+        128
+    );
+    let proof: (i64, bool, i64) = db(f.dir.path())
+        .query_row(
+            "SELECT status,cleanup_confirmed,terminal_order FROM activity WHERE id=?1",
+            [claim.activity_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(proof, (1, true, 129));
+}
+
+#[test]
+fn hardlinked_vm_database_cannot_reconcile_another_roots_pending_work() {
+    let f = Fixture::sealed();
+    let pending = admitted(f.clone_vm(VM, 2, None));
+    let alias = private_dir();
+    let original_path = f.dir.path().join("activity.sqlite3");
+    let alias_path = alias.path().join("activity.sqlite3");
+    let mut active = Some(f.controller);
+    if let Err(error) = std::fs::hard_link(&original_path, &alias_path) {
+        // Some filesystems require the original to be closed to create a
+        // link. The persisted pending row still detects an unsafe reopen.
+        drop(active.take());
+        if let Err(retry) = std::fs::hard_link(&original_path, &alias_path) {
+            if retry.kind() == std::io::ErrorKind::Unsupported {
+                return;
+            }
+            panic!("hard-link fixture: {error}; closed-file retry: {retry}");
+        }
+    }
+    let rejected = VmController::open(alias.path(), VmPolicy::default(), f.clock.clone());
+    let Err(error) = rejected else {
+        panic!("hard-linked VM state was accepted")
+    };
+    assert!(error.to_string().contains("single-link"), "{error:#}");
+    assert_eq!(scalar(f.dir.path(), "SELECT status FROM vm_operations"), 0);
+    std::fs::remove_file(alias_path).unwrap();
+    if let Some(controller) = active {
+        assert_eq!(
+            controller.finish(&pending, Completion::Succeeded).unwrap(),
+            Status::Succeeded
+        );
+    }
+}
+
+#[test]
+fn caller_saturation_leaves_exactly_one_cleanup_slot_per_instance() {
+    let f = Fixture::sealed();
+    let _workers: Vec<_> = (10..18)
+        .map(|vm| admitted(f.clone_vm([vm; 16], vm.into(), Some(60))))
+        .collect();
+    refused(f.clone_vm([18; 16], 18, Some(60)), Refusal::PendingFull);
+    f.clock.wall(NOW + 60_000);
+    let barrier = Barrier::new(2);
+    let (first, second) = thread::scope(|s| {
+        let sweep = || {
+            barrier.wait();
+            f.controller.claim_expired().unwrap()
+        };
+        let first = s.spawn(sweep);
+        let second = s.spawn(sweep);
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert!(first.is_empty() || second.is_empty());
+    let claims: Vec<_> = first.into_iter().chain(second).collect();
+    assert_eq!(claims.len(), 8);
+    assert_eq!(
+        scalar(
+            f.dir.path(),
+            "SELECT count(*) FROM activity WHERE status=0 AND action<=6"
+        ),
+        8
+    );
+    assert_eq!(
+        scalar(
+            f.dir.path(),
+            "SELECT count(*) FROM activity WHERE status=0 AND action IN (7,10)"
+        ),
+        8
+    );
+    assert_eq!(
+        scalar(f.dir.path(), "SELECT count(*) FROM activity WHERE status=0"),
+        16
+    );
+    f.controller
+        .finish_expiry(claims[0], CleanupResult::Confirmed)
+        .unwrap();
+    assert_eq!(
+        scalar(f.dir.path(), "SELECT count(*) FROM activity WHERE status=0"),
+        14
+    );
+    assert!(f.controller.claim_expired().unwrap().is_empty());
+}
+
+#[test]
+fn confirmed_expiry_keeps_only_a_bounded_owner_scoped_tombstone() {
+    let f = Fixture::sealed();
+    f.ready(VM, Some(60));
+    f.clock.wall(NOW + 60_000);
+    let claim = f.controller.claim_expired().unwrap()[0];
+    f.controller
+        .finish_expiry(claim, CleanupResult::Unconfirmed)
+        .unwrap();
+    assert_eq!(f.controller.expired_status("alice", VM).unwrap(), None);
+    f.controller
+        .finish_expiry(claim, CleanupResult::Confirmed)
+        .unwrap();
+    assert_eq!(
+        f.controller.expired_status("alice", VM).unwrap(),
+        Some(ExpiredVm {
+            expired_at_ms: NOW + 60_000,
+            activity_id: claim.activity_id,
+        })
+    );
+    assert_eq!(f.controller.expired_status("bob", VM).unwrap(), None);
+    assert_eq!(scalar(f.dir.path(), "SELECT count(*) FROM vm_instances"), 0);
+    assert_eq!(
+        scalar(f.dir.path(), "SELECT count(*) FROM vm_disk_claims"),
+        0
+    );
+    assert_eq!(scalar(f.dir.path(), "SELECT count(*) FROM vm_templates"), 1);
+    refused(f.clone_vm(VM, 3, Some(60)), Refusal::Busy);
+    for vm in 10..42 {
+        f.ready([vm; 16], Some(60));
+        f.clock.wall(NOW + (i64::from(vm) - 8) * 60_000);
+        let claim = f.controller.claim_expired().unwrap()[0];
+        f.controller
+            .finish_expiry(claim, CleanupResult::Confirmed)
+            .unwrap();
+    }
+    assert_eq!(
+        scalar(f.dir.path(), "SELECT count(*) FROM vm_tombstones"),
+        32
+    );
+    assert_eq!(f.controller.expired_status("alice", VM).unwrap(), None);
+    let Fixture {
+        controller,
+        dir,
+        clock,
+    } = f;
+    drop(controller);
+    let controller = VmController::open(dir.path(), VmPolicy::default(), clock.clone()).unwrap();
+    let last = controller
+        .expired_status("alice", [41; 16])
+        .unwrap()
+        .unwrap();
+    clock.wall(last.expired_at_ms + 24 * 60 * 60 * 1000);
+    assert_eq!(controller.expired_status("alice", [41; 16]).unwrap(), None);
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM vm_tombstones"), 0);
 }
 
 #[test]

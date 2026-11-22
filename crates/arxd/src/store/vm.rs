@@ -2,11 +2,12 @@
 //! shared and service openers have no route into this module.
 use super::{check_size, validate_principal};
 use crate::vm::{
-    Action, Completion, ExpiryClaim, Id, Receipt, RecoveryClaim, Refusal, RequestId, Status,
+    Action, Completion, ExpiredVm, ExpiryClaim, Id, RETRY_WINDOW_MS, Receipt, RecoveryClaim,
+    Refusal, RequestId, Status,
 };
 use anyhow::{Result, bail, ensure};
 use rusqlite::{
-    Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use std::{fs, path::Path, sync::Mutex, time::Duration};
 
@@ -24,8 +25,10 @@ CREATE TABLE activity (
     status INTEGER NOT NULL DEFAULT 0 CHECK(status BETWEEN 0 AND 4),
     reason INTEGER CHECK(reason BETWEEN 1 AND 18),
     finished_ms INTEGER CHECK(finished_ms BETWEEN 0 AND 253402300799999),
+    terminal_order INTEGER UNIQUE CHECK(terminal_order>0),
     cleanup_confirmed INTEGER CHECK(cleanup_confirmed IN (0,1)),
     CHECK((status=0)=(finished_ms IS NULL)),
+    CHECK((status=0)=(terminal_order IS NULL)),
     CHECK((status=4)=(reason IS NOT NULL)),
     CHECK((actor='daemon')=(action IN (7,9,10)) AND (actor='agent' OR principal='arxd')),
     CHECK((vm_owner IS NOT NULL)=(action IN (7,10)))
@@ -42,10 +45,12 @@ CREATE TABLE vm_operations (
         AND principal NOT GLOB '*[^a-zA-Z0-9_-]*'),
     request_key BLOB NOT NULL CHECK(length(request_key)=16),
     vm BLOB NOT NULL CHECK(length(vm)=16),
-    action INTEGER NOT NULL CHECK(action BETWEEN 1 AND 6),
+    action INTEGER NOT NULL CHECK(action BETWEEN 1 AND 6 OR action=8),
     activity_id INTEGER NOT NULL UNIQUE CHECK(activity_id>0),
     valid_through_ms INTEGER NOT NULL CHECK(valid_through_ms>=0),
     status INTEGER NOT NULL DEFAULT 0 CHECK(status BETWEEN 0 AND 3),
+    lease_end_ms INTEGER CHECK(lease_end_ms BETWEEN 0 AND 253402300799999),
+    CHECK((action=8)=(lease_end_ms IS NOT NULL)),
     PRIMARY KEY(principal,request_key)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE vm_templates (
@@ -71,6 +76,13 @@ CREATE TABLE vm_instances (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX vm_expiry ON vm_instances(expires_ms,id);
 CREATE INDEX vm_owner ON vm_instances(principal,id);
+CREATE TABLE vm_tombstones (
+    id BLOB PRIMARY KEY CHECK(length(id)=16),
+    principal TEXT NOT NULL CHECK(length(CAST(principal AS BLOB)) BETWEEN 1 AND 64
+        AND principal NOT GLOB '*[^a-zA-Z0-9_-]*'),
+    activity_id INTEGER NOT NULL UNIQUE REFERENCES activity(id),
+    expired_at_ms INTEGER NOT NULL CHECK(expired_at_ms BETWEEN 0 AND 253402300799999)
+) STRICT, WITHOUT ROWID;
 CREATE TABLE vm_snapshots (
     vm BLOB NOT NULL REFERENCES vm_instances(id) ON DELETE CASCADE,
     id BLOB NOT NULL CHECK(length(id)=16),
@@ -90,15 +102,21 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-pub(crate) const MAX_PENDING: i64 = 8;
+pub(crate) const MAX_CALLER_PENDING: i64 = 8;
+// One cleanup slot per live instance, shared by expiry and recovery. Cleanup
+// stays available at caller saturation. At most 16 pending rows are visible.
+pub(crate) const MAX_INSTANCES: i64 = 8;
 const MAX_RECEIPTS: i64 = 128;
 const MAX_LEDGER: i64 = 512;
+const MAX_TOMBSTONES: i64 = 32;
+const TOMBSTONE_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
 // Leave space for finishing every pending operation, all eight expiry claims
 // and their cleanup updates. New admission checks this after all its inserts.
 const HEADROOM_PAGES: u64 = 64;
 
 pub(crate) struct VmStore {
     db: Mutex<Connection>,
+    _database: fs::File,
     _lock: fs::File,
 }
 
@@ -110,33 +128,32 @@ impl VmStore {
 
         let lock_path = dir.join("activity.lock");
         check_existing_file(&lock_path)?;
-        let mut options = fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let lock = options.open(lock_path)?;
+        let lock = state_options().write(true).create(true).open(&lock_path)?;
         lock.try_lock()?;
+        verify_state_identity(&lock, &lock_path)?;
 
         let path = dir.join("activity.sqlite3");
         let exists = check_existing_file(&path)?;
         for suffix in ["-journal", "-wal", "-shm"] {
             check_existing_file(&dir.join(format!("activity.sqlite3{suffix}")))?;
         }
+        let database = if exists {
+            state_options().open(&path)?
+        } else {
+            state_options().write(true).create_new(true).open(&path)?
+        };
+        // Unix flock pins the inode against a second VM opener even if the
+        // pathname moves. SQLite uses separate POSIX record locks.
         #[cfg(unix)]
-        if !exists {
-            use std::os::unix::fs::OpenOptionsExt;
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)?;
-        }
-        #[cfg(windows)]
-        let _ = exists;
-        let mut db = Connection::open(path)?;
+        database.try_lock()?;
+        verify_state_identity(&database, &path)?;
+        let mut db = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        verify_state_identity(&database, &path)?;
         db.busy_timeout(Duration::from_millis(250))?;
         check_size(&db)?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -162,6 +179,7 @@ impl VmStore {
         tx.commit()?;
         Ok(Self {
             db: Mutex::new(db),
+            _database: database,
             _lock: lock,
         })
     }
@@ -184,11 +202,78 @@ fn check_existing_file(path: &Path) -> Result<bool> {
             crate::config::checked_path(path)?;
             ensure!(meta.is_file(), "regular VM state file required");
             crate::security::private(path)?;
+            state_identity(&state_options().open(path)?)?;
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+fn state_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        // Deny deletion/replacement while an identity guard is held.
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options
+}
+
+fn verify_state_identity(file: &fs::File, path: &Path) -> Result<()> {
+    ensure!(check_existing_file(path)?, "VM state file disappeared");
+    ensure!(
+        state_identity(file)? == state_identity(&state_options().open(path)?)?,
+        "VM state file identity changed"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn state_identity(file: &fs::File) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata()?;
+    ensure!(
+        m.is_file() && m.nlink() == 1,
+        "single-link regular VM state file required"
+    );
+    Ok((m.dev(), m.ino()))
+}
+
+#[cfg(windows)]
+fn state_identity(file: &fs::File) -> Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    ensure!(
+        info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0
+            && info.nNumberOfLinks == 1,
+        "single-link regular VM state file required"
+    );
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
 }
 
 pub(crate) fn count(db: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<i64> {
@@ -270,8 +355,9 @@ pub(crate) fn refusal(
     if headroom(db)? {
         validate_principal(principal)?;
         db.execute(
-            "INSERT INTO activity(principal,vm,action,started_ms,status,reason,finished_ms,actor)
-             VALUES(?1,?2,?3,?4,4,?5,?4,'agent')",
+            "INSERT INTO activity(principal,vm,action,started_ms,status,reason,finished_ms,actor,terminal_order)
+             VALUES(?1,?2,?3,?4,4,?5,?4,'agent',
+               (SELECT coalesce(max(terminal_order),0)+1 FROM activity))",
             params![principal, vm, action as i64, now, reason as i64],
         )?;
         prune(db)?;
@@ -287,10 +373,15 @@ pub(crate) fn finish(
     now: i64,
     cleanup: Option<bool>,
 ) -> Result<()> {
-    ensure!(db.execute(
-        "UPDATE activity SET status=?2,finished_ms=?3,cleanup_confirmed=?4 WHERE id=?1 AND status=0",
-        params![id, status.code(), now, cleanup],
-    )? == 1, "VM activity already terminal");
+    ensure!(
+        db.execute(
+            "UPDATE activity SET status=?2,finished_ms=?3,cleanup_confirmed=?4,
+           terminal_order=(SELECT coalesce(max(terminal_order),0)+1 FROM activity)
+         WHERE id=?1 AND status=0",
+            params![id, status.code(), now, cleanup],
+        )? == 1,
+        "VM activity already terminal"
+    );
     db.execute(
         "UPDATE vm_operations SET status=?2 WHERE activity_id=?1",
         params![id, status.code()],
@@ -301,13 +392,16 @@ pub(crate) fn finish(
 fn prune(db: &Connection) -> Result<()> {
     db.execute(
         "DELETE FROM activity WHERE id IN
-         (SELECT id FROM activity WHERE status<>0 ORDER BY id DESC LIMIT -1 OFFSET ?1)",
+         (SELECT id FROM activity WHERE status<>0
+          ORDER BY (EXISTS(SELECT 1 FROM vm_tombstones WHERE activity_id=activity.id)
+                 OR EXISTS(SELECT 1 FROM vm_instances WHERE cleanup_id=activity.id)) DESC,
+                   terminal_order DESC LIMIT -1 OFFSET ?1)",
         [MAX_RECEIPTS],
     )?;
     Ok(())
 }
 
-pub(crate) fn retry_time(db: &Connection, now: i64) -> Result<i64> {
+fn retry_time(db: &Connection, now: i64) -> Result<i64> {
     Ok(db.query_row(
         "UPDATE vm_retry_clock SET high_water_ms=max(high_water_ms,?1) RETURNING high_water_ms",
         [now],
@@ -315,26 +409,86 @@ pub(crate) fn retry_time(db: &Connection, now: i64) -> Result<i64> {
     )?)
 }
 
-pub(crate) fn retry_receipt(
-    db: &Connection,
-    principal: &str,
-    key: RequestId,
-) -> Result<Option<(i64, Id, Receipt)>> {
-    Ok(db.query_row(
-        "SELECT action,vm,activity_id,status FROM vm_operations WHERE principal=?1 AND request_key=?2",
-        params![principal, key.key],
-        |row| Ok((row.get(0)?, row.get(1)?, Receipt {
-            activity_id: row.get(2)?, status: Status::from_code(row.get(3)?)?,
-        })),
-    ).optional()?)
+pub(crate) struct Binding<'a> {
+    pub principal: &'a str,
+    pub key: RequestId,
+    pub vm: Id,
+    pub action: Action,
 }
 
-pub(crate) fn reserve_ledger_slot(db: &Connection, now: i64) -> Result<bool> {
-    db.execute(
-        "DELETE FROM vm_operations WHERE status<>0 AND valid_through_ms<?1",
-        [now],
-    )?;
-    Ok(count(db, "SELECT count(*) FROM vm_operations", [])? < MAX_LEDGER)
+pub(crate) struct Replay {
+    pub receipt: Receipt,
+    pub lease_end: Option<i64>,
+}
+
+impl Binding<'_> {
+    pub(crate) fn replay(
+        &self,
+        db: &Connection,
+        now: i64,
+        closed: bool,
+    ) -> Result<Result<Option<Replay>, Refusal>> {
+        let retry_now = retry_time(db, now)?;
+        if self.valid_through() < retry_now {
+            return Ok(Err(Refusal::StaleKey));
+        }
+        let previous = db
+            .query_row(
+                "SELECT action,vm,activity_id,status,lease_end_ms FROM vm_operations
+             WHERE principal=?1 AND request_key=?2",
+                params![self.principal, self.key.key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Id>(1)?,
+                        Receipt {
+                            activity_id: row.get(2)?,
+                            status: Status::from_code(row.get(3)?)?,
+                        },
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((action, vm, receipt, lease_end)) = previous {
+            return Ok(if action == self.action as i64 && vm == self.vm {
+                Ok(Some(Replay { receipt, lease_end }))
+            } else {
+                Err(Refusal::KeyCollision)
+            });
+        }
+        if self.key.issued_at_ms > now {
+            return Ok(Err(Refusal::StaleKey));
+        }
+        if closed {
+            return Ok(Err(Refusal::Shutdown));
+        }
+        if !headroom(db)? {
+            return Ok(Err(Refusal::StateHeadroom));
+        }
+        db.execute(
+            "DELETE FROM vm_operations WHERE status<>0 AND valid_through_ms<?1",
+            [retry_now],
+        )?;
+        if count(db, "SELECT count(*) FROM vm_operations", [])? >= MAX_LEDGER {
+            return Ok(Err(Refusal::ReplayFull));
+        }
+        Ok(Ok(None))
+    }
+
+    fn valid_through(&self) -> i64 {
+        self.key.issued_at_ms + RETRY_WINDOW_MS
+    }
+
+    pub(crate) fn record(&self, db: &Connection, now: i64, lease_end: Option<i64>) -> Result<i64> {
+        let id = activity(db, self.principal, self.vm, self.action, now)?;
+        db.execute(
+            "INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,valid_through_ms,lease_end_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![self.principal, self.key.key, self.vm, self.action as i64, id, self.valid_through(), lease_end],
+        )?;
+        Ok(id)
+    }
 }
 
 pub(crate) fn disk_bytes(db: &Connection) -> Result<Option<u64>> {
@@ -356,6 +510,7 @@ pub(crate) fn disk_bytes(db: &Connection) -> Result<Option<u64>> {
 
 /// Preserve all charges on uncertainty, including on restart.
 pub(crate) fn recover(db: &Connection, now: i64) -> Result<()> {
+    purge_tombstones(db, now)?;
     db.execute("UPDATE vm_instances SET state=4 WHERE state=0", [])?;
     let mut stmt = db.prepare(
         "SELECT id FROM vm_instances WHERE state IN (1,2)
@@ -367,13 +522,15 @@ pub(crate) fn recover(db: &Connection, now: i64) -> Result<()> {
     for vm in interrupted {
         begin_recovery(db, vm, now)?;
     }
-    db.execute("UPDATE vm_operations SET status=3 WHERE status=0", [])?;
-    db.execute(
-        "UPDATE activity SET status=3,finished_ms=?1,cleanup_confirmed=0
-        WHERE status=0 AND action<=6",
-        [now],
-    )?;
-    prune(db)
+    let mut stmt =
+        db.prepare("SELECT id FROM activity WHERE status=0 AND action<=6 ORDER BY id LIMIT ?1")?;
+    let pending = stmt
+        .query_map([MAX_CALLER_PENDING], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in pending {
+        finish(db, id, Status::Interrupted, now, Some(false))?;
+    }
+    Ok(())
 }
 
 fn begin_recovery(db: &Connection, vm: Id, now: i64) -> Result<()> {
@@ -452,6 +609,7 @@ fn release_staging(db: &Connection, id: i64) -> Result<()> {
 }
 
 pub(crate) fn expiry_claims(db: &Connection, now: i64) -> Result<Vec<ExpiryClaim>> {
+    purge_tombstones(db, now)?;
     let mut stmt = db.prepare(
         "SELECT id,cleanup_id FROM vm_instances WHERE (state<>4 OR cleanup_id IS NULL)
         AND (state=4 OR expires_ms<=?1) ORDER BY expires_ms,id LIMIT 8",
@@ -463,17 +621,65 @@ pub(crate) fn expiry_claims(db: &Connection, now: i64) -> Result<Vec<ExpiryClaim
         .collect::<rusqlite::Result<Vec<_>>>()?;
     due.into_iter()
         .map(|(vm, previous)| {
+            if let Some(previous) = previous {
+                db.execute(
+                    "UPDATE vm_instances SET state=4,cleanup_id=NULL WHERE id=?1",
+                    [vm],
+                )?;
+                finish(db, previous, Status::Interrupted, now, Some(false))?;
+            }
             let activity_id = activity(db, "arxd", vm, Action::Expire, now)?;
             db.execute(
                 "UPDATE vm_instances SET state=4,cleanup_id=?2 WHERE id=?1",
                 params![vm, activity_id],
             )?;
-            if let Some(previous) = previous {
-                finish(db, previous, Status::Interrupted, now, Some(false))?;
-            }
             Ok(ExpiryClaim { vm, activity_id })
         })
         .collect()
+}
+
+pub(crate) fn purge_tombstones(db: &Connection, now: i64) -> Result<()> {
+    db.execute(
+        "DELETE FROM vm_tombstones WHERE expired_at_ms<=?1",
+        [now - TOMBSTONE_LIFETIME_MS],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn record_expired(db: &Connection, claim: ExpiryClaim, now: i64) -> Result<()> {
+    purge_tombstones(db, now)?;
+    db.execute(
+        "INSERT INTO vm_tombstones(id,principal,activity_id,expired_at_ms)
+        SELECT id,principal,cleanup_id,?2 FROM vm_instances WHERE id=?1",
+        params![claim.vm, now],
+    )?;
+    db.execute(
+        "DELETE FROM vm_tombstones WHERE id IN
+        (SELECT id FROM vm_tombstones ORDER BY (id=?2) DESC, expired_at_ms DESC, activity_id DESC
+         LIMIT -1 OFFSET ?1)",
+        params![MAX_TOMBSTONES, claim.vm],
+    )?;
+    db.execute("DELETE FROM vm_instances WHERE id=?1", [claim.vm])?;
+    finish(db, claim.activity_id, Status::Succeeded, now, Some(true))
+}
+
+pub(crate) fn expired_status(
+    db: &Connection,
+    principal: &str,
+    vm: Id,
+) -> Result<Option<ExpiredVm>> {
+    Ok(db
+        .query_row(
+            "SELECT expired_at_ms,activity_id FROM vm_tombstones WHERE id=?1 AND principal=?2",
+            params![vm, principal],
+            |row| {
+                Ok(ExpiredVm {
+                    expired_at_ms: row.get(0)?,
+                    activity_id: row.get(1)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 pub(crate) fn expiry_intents(db: &Connection) -> Result<Vec<ExpiryClaim>> {

@@ -74,38 +74,22 @@ impl<C: Clock> VmController<C> {
     ) -> Result<Admission> {
         let now = clock.utc_ms;
         let action = request.operation.action();
-        let key = request.request_id;
-        let valid_through = key.issued_at_ms + RETRY_WINDOW_MS;
-        let retry_now = store::retry_time(db, now)?;
-        if valid_through < retry_now {
-            return Ok(Admission::Refused(Refusal::StaleKey));
-        }
-        if let Some((prior_action, prior_vm, receipt)) =
-            store::retry_receipt(db, request.principal, key)?
-        {
-            return Ok(if prior_action == action as i64 && prior_vm == request.vm {
-                Admission::Existing(receipt)
-            } else {
-                Admission::Refused(Refusal::KeyCollision)
-            });
-        }
-        if key.issued_at_ms > now {
-            return Ok(Admission::Refused(Refusal::StaleKey));
-        }
-        if closed {
-            return Ok(Admission::Refused(Refusal::Shutdown));
-        }
-        if !store::headroom(db)? {
-            return Ok(Admission::Refused(Refusal::StateHeadroom));
-        }
-        if !store::reserve_ledger_slot(db, retry_now)? {
-            return Ok(Admission::Refused(Refusal::ReplayFull));
+        let binding = store::Binding {
+            principal: request.principal,
+            key: request.request_id,
+            vm: request.vm,
+            action,
+        };
+        match binding.replay(db, now, closed)? {
+            Ok(Some(prior)) => return Ok(Admission::Existing(prior.receipt)),
+            Err(reason) => return Ok(Admission::Refused(reason)),
+            Ok(None) => {}
         }
         if store::count(
             db,
             "SELECT count(*) FROM activity WHERE status=0 AND action<=6",
             [],
-        )? >= store::MAX_PENDING
+        )? >= store::MAX_CALLER_PENDING
         {
             return Ok(Admission::Refused(Refusal::PendingFull));
         }
@@ -127,12 +111,7 @@ impl<C: Clock> VmController<C> {
             Ok(target) => target,
             Err(reason) => return Ok(Admission::Refused(reason)),
         };
-        let id = store::activity(db, request.principal, request.vm, action, now)?;
-        db.execute(
-            "INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,valid_through_ms)
-             VALUES(?1,?2,?3,?4,?5,?6)",
-            params![request.principal, key.key, request.vm, action as i64, id, valid_through],
-        )?;
+        let id = binding.record(db, now, None)?;
         target.insert(db, request, id)?;
         store::require_headroom(db)?;
         Ok(Admission::Admitted(PendingOperation {
@@ -213,41 +192,65 @@ impl<C: Clock> VmController<C> {
     }
 
     /// Extend relative to the current UTC time. A due or claimed instance
-    /// cannot be revived through extension.
+    /// cannot be revived through extension. An admitted retry returns the
+    /// expiry recorded by the original request, even when its TTL changes.
     pub fn extend_lease(
         &self,
         principal: &str,
         vm: Id,
+        request_id: RequestId,
         seconds: u64,
     ) -> Result<Result<i64, Refusal>> {
         let closed = self
             .closed
             .lock()
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
-        if *closed {
-            return Ok(Err(Refusal::Shutdown));
-        }
         if validate_principal(principal).is_err() {
             return Ok(Err(Refusal::Invalid));
         }
         let result = self.store.transact(|db| {
             let now = utc(self.clock.now())?;
+            let binding = store::Binding {
+                principal,
+                vm,
+                key: request_id,
+                action: Action::Extend,
+            };
+            match binding.replay(db, now, *closed)? {
+                Ok(Some(prior)) => {
+                    ensure!(
+                        prior.receipt.status == Status::Succeeded,
+                        "invalid extension receipt"
+                    );
+                    return Ok(Ok(prior
+                        .lease_end
+                        .ok_or_else(|| anyhow::anyhow!("missing extension result"))?));
+                }
+                Err(reason) => {
+                    store::refusal(db, principal, vm, Action::Extend, now, reason)?;
+                    return Ok(Err(reason));
+                }
+                Ok(None) => {}
+            }
+            store::purge_tombstones(db, now)?;
             let requested = lease(now, Some(seconds));
             let row = owned_vm(db, principal, vm)?;
             let decision = match (row, requested) {
                 (_, Err(reason)) => Err(reason),
+                (None, _) if store::expired_status(db, principal, vm)?.is_some() => {
+                    Err(Refusal::Expired)
+                }
                 (None, _) => Err(Refusal::NotFound),
                 (Some((state, expires)), _) if state == 4 || expires <= now => {
                     Err(Refusal::Expired)
                 }
                 (Some((_, expires)), Ok(end)) if end < expires => Err(Refusal::Invalid),
                 (Some(_), Ok(end)) => {
-                    store::require_headroom(db)?;
                     db.execute(
                         "UPDATE vm_instances SET expires_ms=?2 WHERE id=?1",
                         params![vm, end],
                     )?;
-                    let id = store::activity(db, principal, vm, Action::Extend, now)?;
+                    let id = binding.record(db, now, Some(end))?;
                     store::finish(db, id, Status::Succeeded, now, None)?;
                     store::require_headroom(db)?;
                     Ok(end)
@@ -302,8 +305,16 @@ impl<C: Clock> VmController<C> {
             if let Some(id) = pending {
                 store::finish(db, id, Status::Interrupted, now, Some(true))?;
             }
-            db.execute("DELETE FROM vm_instances WHERE id=?1", [claim.vm])?;
-            store::finish(db, claim.activity_id, Status::Succeeded, now, Some(true))
+            store::record_expired(db, claim, now)
+        })
+    }
+
+    /// Short-lived, owner-scoped confirmation of an expired instance.
+    pub fn expired_status(&self, principal: &str, vm: Id) -> Result<Option<ExpiredVm>> {
+        validate_principal(principal)?;
+        self.store.transact(|db| {
+            store::purge_tombstones(db, utc(self.clock.now())?)?;
+            store::expired_status(db, principal, vm)
         })
     }
 
@@ -467,12 +478,14 @@ fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Tar
         {
             return Ok(Err(Refusal::NotFound));
         }
-        if store::count(db, "SELECT count(*) FROM vm_instances", [])? >= 8 {
+        if store::count(db, "SELECT count(*) FROM vm_instances", [])? >= store::MAX_INSTANCES {
             return Ok(Err(Refusal::InstanceLimit));
         }
+        store::purge_tombstones(db, now)?;
         if store::count(
             db,
-            "SELECT EXISTS(SELECT 1 FROM vm_instances WHERE id=?1)",
+            "SELECT EXISTS(SELECT 1 FROM vm_instances WHERE id=?1)
+            OR EXISTS(SELECT 1 FROM vm_tombstones WHERE id=?1)",
             [request.vm],
         )? != 0
         {

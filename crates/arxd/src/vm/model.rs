@@ -242,6 +242,12 @@ pub struct ExpiryClaim {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpiredVm {
+    pub expired_at_ms: i64,
+    pub activity_id: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryClaim {
     pub vm: Id,
     pub activity_id: i64,
