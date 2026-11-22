@@ -187,7 +187,7 @@ test('Rust retains every native, Python and package validation with exact comman
             $linked = @(Get-Content -LiteralPath $linkMessages | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'arxd' -and ($_.target.kind -contains 'bin') -and $_.manifest_path -eq $manifest -and $_.executable })
             if ($linked.Count -ne 1 -or $linked[0].executable -ne $arxd) { throw 'Invalid arxd compiler-artifact' }
             $item = Get-Item -LiteralPath $arxd
-            if ($item.LinkType -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.PSIsContainer) { throw 'Invalid arxd artifact' }
+            if (($item.LinkType -and $item.LinkType -ne 'HardLink') -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.PSIsContainer) { throw 'Invalid arxd artifact' }
             $receipt = [ordered]@{
               schema = 'arxcovo/r2-artifact/1'
               head = $env:GITHUB_SHA
