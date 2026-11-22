@@ -20,7 +20,7 @@ import time
 # Python isolated mode removes the script directory from sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fixture import (ENV, HERE, LIVE_TIME, MIB, ROOT, TIME, TOOLS, Refusal, bounded_read, capture,
+from fixture import (ANCHOR_TEST, ENV, HERE, LIVE_TIME, MIB, ROOT, TIME, TOOLS, Refusal, bounded_read, capture,
                      file_digest, host_command, load_pins, plain_path, require, select_daemon,
                      stage_copy, stage_rootfs, verify_manifest, vet_tools, build_descriptor, install_live,
                      node_endpoint, open_artifact, remaining, select_anchor_probe)
@@ -333,6 +333,38 @@ def time_evidence(raw):
     return ordinal, outcome, sample, checkpoint, handle
 
 
+def anchor_client_status(stdout):
+    # Single-threaded libtest writes the name prefix before running the test.
+    # Parallel libtest prints it on a separate line after the test's output.
+    prefix = b"test " + ANCHOR_TEST.encode("ascii") + b" ... "
+    outcomes = {"input-refused", "anchor-received", "anchor-refused", "anchor-unconfirmed", "deadline"}
+    allowed = {word.encode("ascii"): word for word in outcomes}
+    markers = []
+    summaries = []
+    for line in stdout.splitlines():
+        message = line.removeprefix(prefix)
+        if message.startswith(b"C16_ANCHOR "):
+            markers.append(message.removeprefix(b"C16_ANCHOR "))
+        if line.startswith(b"test result:"):
+            summaries.append(line)
+    outcome = allowed.get(markers[0], "missing") if len(markers) == 1 else "missing"
+    summary = None
+    if len(summaries) == 1:
+        summary = re.fullmatch(rb"test result: ok\. ([0-9]+) passed; 0 failed; 0 ignored; .+", summaries[0])
+    count = {b"0": "0", b"1": "1"}.get(summary[1], "other") if summary else "other"
+    return outcome, count
+
+
+def anchor_owner_delta(before, after):
+    categories = {0: "absent", 1: "accepted", 2: "refused", 3: "busy", 4: "unavailable"}
+    delta, category = "missing", "missing"
+    if after is not None and len(after) == 53 and after[0] == 1:
+        ordinal, outcome = after[1:3]
+        delta = {0: "0", 1: "1"}.get(ordinal - before[0], "other")
+        category = categories.get(outcome, "other")
+    return {"ordinal_delta": delta, "before": categories.get(before[1], "other"), "after": category}
+
+
 def check_reconnect(before, after, mint_clock, start_epoch, end_epoch, counts):
     require(before[:2] == (1, 1) and after[:2] == (2, 2)
             and before[4] == after[4] and mint_clock <= before[2] <= after[2]
@@ -566,6 +598,7 @@ class Campaign:
         self.status = {"anchor_queries": 0, "redeems": 0, "ca_handoffs": 0, "builds": 0,
                        "engine_starts": 0, "leader_kill": 0, "normal_closes": 0}
         self.checkpoints = {}
+        self.anchor_diagnostic = None
         self.identities = None
 
     def owner(self, node, action, tag, width, end, data=b""):
@@ -644,8 +677,15 @@ class Campaign:
         first = log_audit(self.data("a"))
         require(first[0] == {1: 1, 3: 2, 4: 1, 6: 1}, "first-binding")
         result = child_reply(self.resources, "b", "anchor", end, paste, limit=1024)
-        require(sum(line == b"C16_ANCHOR anchor-refused" for line in result.splitlines()) == 1
-                and b"test result: ok. 1 passed;" in result, "anchor-client-refusal")
+        outcome, passed = anchor_client_status(result)
+        if (outcome, passed) != ("anchor-refused", "1"):
+            try:
+                raw_time = self.owner("a", "owner-time", 16, 53, min(end, time.monotonic() + 2))
+            except ERRORS:
+                raw_time = None
+            self.anchor_diagnostic = {"token": outcome, "passed": passed,
+                                      "owner_time": anchor_owner_delta(before, raw_time)}
+            raise Refusal("anchor-client-refusal")
         after = time_evidence(self.owner("a", "owner-time", 16, 53, end))
         evidence = self.evidence("a", end)
         latest = log_audit(self.data("a"))
@@ -846,6 +886,8 @@ def live_run(env, uid):
         sealed = True
     except ERRORS as error:
         driver.latch(error)
+        if campaign is not None and driver.receipt["first"]["category"] == "anchor-client-refusal":
+            driver.receipt["anchor_diagnostic"] = campaign.anchor_diagnostic
 
     def cleanup(end):
         if sealed:

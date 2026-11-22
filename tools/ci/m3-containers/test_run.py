@@ -692,6 +692,65 @@ class LiveCampaign(unittest.TestCase):
     def receipt(term, leader, index, tag):
         return struct.pack(">QQQ", term, leader, index) + bytes([tag])*32
 
+    def test_consumed_reconnect_accepts_both_libtest_stdout_layouts(self):
+        before = bytes((1, 1, 1, 1, 1)) + struct.pack(">QQ", 120, 121) + b"h"*32
+        after = bytes((1, 2, 2, 1, 1)) + struct.pack(">QQ", 130, 131) + b"h"*32
+        prefix = b"test " + fixture.ANCHOR_TEST.encode("ascii") + b" ... "
+        summary = b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+        for stdout in (b"C16_ANCHOR anchor-refused\n" + prefix + b"ok\n" + summary,
+                       prefix + b"C16_ANCHOR anchor-refused\nok\n" + summary):
+            with self.subTest(serial=stdout.startswith(prefix)):
+                resources = SimpleNamespace(root=Path("/fixture"))
+                campaign = run.Campaign(resources)
+                with patch.object(campaign, "owner", side_effect=[before, after]) as owner, patch.object(
+                    campaign, "ready", return_value=b"\x04\x01\x01"
+                ), patch.object(campaign, "evidence", return_value=b"\x04\x02\x01"), patch.object(
+                    run, "log_audit", return_value=({1: 1, 3: 2, 4: 1, 6: 1}, [], [], (5, 1))
+                ), patch.object(run, "child_reply", return_value=stdout) as child:
+                    campaign.retry_consumed(bytearray(b"test-only"), 100, 1000)
+                child.assert_called_once_with(resources, "b", "anchor", 1000, bytearray(b"test-only"), limit=1024)
+                self.assertEqual(owner.call_args_list, [call("a", "owner-time", 16, 53, 1000)] * 2)
+
+    def test_anchor_stdout_classifies_only_closed_tokens_and_one_summary(self):
+        summary = b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+        for outcome in ("input-refused", "anchor-received", "anchor-refused", "anchor-unconfirmed", "deadline"):
+            with self.subTest(outcome=outcome):
+                self.assertEqual(run.anchor_client_status(b"C16_ANCHOR " + outcome.encode() + b"\n" + summary),
+                                 (outcome, "1"))
+        for line in (b"C16_ANCHOR injected\n", b"test wrong::name ... C16_ANCHOR anchor-refused\n",
+                     b"C16_ANCHOR anchor-refused\nC16_ANCHOR deadline\n"):
+            self.assertEqual(run.anchor_client_status(line + summary), ("missing", "1"))
+        self.assertEqual(run.anchor_client_status(summary.replace(b"1 passed", b"0 passed")), ("missing", "0"))
+        self.assertEqual(run.anchor_client_status(summary.replace(b"1 passed", b"42 passed")), ("missing", "other"))
+        self.assertEqual(run.anchor_client_status(summary + summary), ("missing", "other"))
+        self.assertEqual(run.anchor_client_status(summary.replace(b"ok.", b"FAILED.")), ("missing", "other"))
+
+    def test_anchor_refusal_diagnostics_keep_only_tokens_and_owner_delta(self):
+        before = bytes((1, 1, 1, 1, 1)) + struct.pack(">QQ", 120, 121) + b"h"*32
+        after = bytes((1, 2, 2, 1, 1)) + struct.pack(">QQ", 130, 131) + b"h"*32
+        stdout = (b"raw-output-sentinel\nC16_ANCHOR anchor-unconfirmed\n"
+                  b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
+        for reply, expected_after, delta in ((after, "refused", "1"),
+                                             (fixture.Refusal("owner-reply"), "missing", "missing")):
+            with self.subTest(delta=delta):
+                campaign = run.Campaign(SimpleNamespace(root=Path("/fixture")))
+                with patch.object(campaign, "owner", side_effect=[before, reply]) as owner, patch.object(
+                    campaign, "ready", return_value=b"\x04\x01\x01"
+                ), patch.object(campaign, "evidence") as evidence, patch.object(
+                    run, "log_audit", return_value=({1: 1, 3: 2, 4: 1, 6: 1}, [], [], (5, 1))
+                ), patch.object(run, "child_reply", return_value=stdout):
+                    with self.assertRaisesRegex(fixture.Refusal, "^anchor-client-refusal$"):
+                        campaign.retry_consumed(bytearray(b"paste-sentinel"), 100, 1000)
+                self.assertEqual(owner.call_count, 2)
+                evidence.assert_not_called()
+                self.assertEqual(campaign.anchor_diagnostic, {
+                    "token": "anchor-unconfirmed", "passed": "1",
+                    "owner_time": {"ordinal_delta": delta, "before": "accepted", "after": expected_after},
+                })
+                encoded = run.encode_receipt(campaign.anchor_diagnostic)
+                for secret in ("raw-output-sentinel", "paste-sentinel", "hhhh", "130"):
+                    self.assertNotIn(secret, encoded)
+
     def test_reconnect_requires_same_query_valid_sample_epoch_and_counts(self):
         good = bytes((1, 1, 1, 1, 1)) + struct.pack(">QQ", 120, 121) + b"d"*32
         rejected = bytes((1, 2, 2, 1, 1)) + struct.pack(">QQ", 130, 131) + b"d"*32
@@ -839,6 +898,26 @@ class LiveCampaign(unittest.TestCase):
         self.assertEqual(sum(fixture.LIVE_TIME.values()), 240)
         self.assertEqual(set(result["durations_seconds"]), set(fixture.LIVE_TIME))
         self.assertTrue(run.encode_receipt(result).isascii())
+
+    def test_live_receipt_preserves_anchor_diagnostic_and_first_failure(self):
+        resources = Mock()
+        resources.facts = {}
+        resources.cleanup.return_value = ["unit-a2"]
+        resources.failure_diagnostic = None
+        campaign = Mock()
+        campaign.activate.side_effect = fixture.Refusal("anchor-client-refusal")
+        campaign.anchor_diagnostic = {
+            "token": "input-refused", "passed": "1",
+            "owner_time": {"ordinal_delta": "0", "before": "accepted", "after": "accepted"},
+        }
+        with patch.object(run, "checked_metadata", return_value=({"modules": {}}, None, None, None, None)), \
+             patch.object(run, "Resources", return_value=resources), patch.object(run, "stage", return_value={}), \
+             patch.object(run, "Campaign", return_value=campaign):
+            result = json.loads(run.encode_receipt(run.live_run({}, 1001)))
+        self.assertEqual(result["anchor_diagnostic"], campaign.anchor_diagnostic)
+        self.assertEqual(result["first"], {"phase": "activation", "category": "anchor-client-refusal"})
+        self.assertEqual(result["cleanup"], "incomplete")
+        campaign.build_and_mint.assert_not_called()
 
     def test_live_activation_refusal_prevents_build_loss_and_restart(self):
         res = Mock()
