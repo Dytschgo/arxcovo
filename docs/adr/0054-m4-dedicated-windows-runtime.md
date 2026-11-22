@@ -136,44 +136,52 @@ claimed.
 
 Guest readiness for an installed boot has an absolute, fixed budget of
 180 s from the accepted `cont`. No recipe, profile or caller can extend it.
-The merged v1 guest protocol is host-initiated: the guest service reads
-exactly one `Hello` first and treats a second one as a protocol error.
-Firmware can open the port first. OVMF's VirtioSerialDxe opens a named port
-before Linux, QEMU then moves a pending frame into the firmware queue, and
-`ExitBootServices` resets that queue.
+Two facts shape the design:
+- Firmware can open the port first. OVMF's VirtioSerialDxe opens a named
+  port before Linux, QEMU then moves a pending frame into the firmware
+  queue, and `ExitBootServices` resets that queue.
+- QEMU 11.1.3 rate-limits `VSERPORT_CHANGE` to one event per second per
+  device and keeps only the newest pending one, so a quick close and reopen
+  can arrive as a repeated open.
 
-Readiness is therefore driven by QEMU's port-state events. The fixed port
-device id `arxguestport` is part of the recipe. The bounded QMP event set
-includes `VSERPORT_CHANGE {id, open}`. The id must match exactly; other
-ports' events are skipped and counted, and a malformed port event refuses.
-- The host writes no `Hello` until it has observed `open = true` for that
-  port.
-- Each open sends one fresh 128-bit challenge.
-- `open = false` voids the outstanding challenge.
-- A reply echoing a voided challenge is discarded, never accepted. Only an
-  echo of the latest challenge, with script support advertised, completes
-  readiness.
-- A challenge the host never issued, or a malformed or oversized reply,
+Readiness therefore treats any challenge as possibly lost, and relies on
+the guest-side change from the separate arx-guest PR: a fresh `Hello` at any
+point resets the guest session, and the service answers every `Hello` with
+an ack echoing it and keeps serving. The host side works as follows:
+- The fixed port device id `arxguestport` is part of the recipe. The bounded
+  QMP event set includes `VSERPORT_CHANGE {id, open}`, checked with the same
+  envelope rules as every event. The id must match exactly; other ports'
+  events are skipped and counted, and a malformed port event refuses.
+- The host sends a fresh 128-bit challenge on every reported open of its
+  port, including a repeated open.
+- It also retries on a 1, 2, 4 and then 8 s schedule while the port is not
+  known to be closed, including before any event arrives. Each open
+  restarts the schedule at 1 s. A close only pauses the retries until the
+  next open; it voids nothing.
+- At most 32 challenges are issued per boot; the next one refuses. No `Hello`
+  is written at or after the budget's deadline.
+- Every challenge is a fresh nonce written only to this boot's verified
+  pipe. An ack echoing any of them, with script support advertised, proves
+  the guest service is live in this boot and completes readiness. A
+  challenge not issued in this boot, or a malformed or oversized frame,
   refuses.
-- If a close and a reply are both pending, the close is handled first.
-- At most 8 opens are accepted; the next one refuses.
-- Once a reply's first byte arrives, the frame must complete within 10 s.
-- A result that completes at or after any deadline still refuses, because
+- The command channel inherits the readiness framer's buffered bytes, so
+  nothing read past the accepted reply is lost. It skips a late ack of each
+  other challenge from this boot at most once, before matching responses.
+- Once a reply's first byte arrives, the frame must complete within 10 s. A
+  result that completes at or after any deadline still refuses, because
   Tokio polls ready I/O before an expired timer.
 - Cancellation stops the wait at once.
 - There is no serial reconnect: the one verified pipe handle is kept
   throughout.
 
-Residual: QEMU does not read the pipe while the guest port is closed. A
-`Hello` written just as firmware closes the port can therefore stay
-buffered and reach the Linux service ahead of the fresh one. The service
-then answers the stale challenge, receives a second `Hello`, takes a
-protocol error and exits. Readiness then converges only through the
-service manager (systemd) restarting the service. That restart produces a
-close and an open, and a new fresh challenge. The host discards the echo of
-the stale challenge throughout. This convergence path, the firmware
-behavior, the event timing and the 180 s budget against real cold boots are
-**unverified on real hardware** against the pinned QEMU and EDK2 binaries.
+No systemd restart is needed for convergence. A stale `Hello` and a fresh
+one both reach the service, which answers each, and the host accepts the
+first valid echo. This design, the guest-side reset it depends on, the
+firmware behavior, QEMU's event coalescing and timing, the retry schedule
+and the 180 s budget against real cold boots are **unverified on real
+hardware** against the pinned QEMU, EDK2 and guest binaries. Readiness on a
+real guest also requires the guest-side reset PR to land first.
 
 Installer boots are refused. A plan with installer media is
 `PlanKind::InstallerBoot`, and the native launcher's first check, before any
@@ -284,19 +292,25 @@ server PID differs. Other tests cover:
   records a late write is refused; and an in-time write is accepted. The
   boot-side settle future is polled directly to `Pending` before the worker
   is released;
-- event-driven guest readiness on the paused tokio clock, with in-memory
-  QMP and serial streams:
-  - firmware consumes the first challenge, and Linux receives and answers a
-    fresh one;
-  - an echo of a voided challenge is never accepted;
-  - nothing is written before the first open;
-  - the open-cycle cap refuses;
-  - the budget spans every cycle;
-  - other ports are ignored, and malformed port events refuse;
-  - a stale buffered `Hello` converges through a service restart;
+- guest readiness on the paused tokio clock, with in-memory QMP and serial
+  streams and a fake guest that answers every `Hello` in order:
+  - firmware consumes a challenge, a close pauses retries, and the next open
+    gets a fresh challenge;
+  - a stale and a fresh `Hello` are both acked, the first valid echo is
+    accepted, and the command channel skips the later ack;
+  - a coalesced repeated open sends a fresh challenge;
+  - with no events at all, the 1 s retry reaches the guest;
+  - the 32-challenge cap refuses, and the budget bounds every retry;
+  - a challenge from outside this boot, or an unissued, oversized or
+    malformed ack, refuses;
+  - no `Hello` is written at or after the deadline;
+  - other ports are ignored, and malformed port events, including an
+    out-of-range timestamp, refuse;
+  - a partial reply survives losing the select to a port event, and a
+    partial QMP record survives losing it to a retry, with no lost or
+    duplicated bytes;
   - a late service inside the budget passes, and a silent one refuses at
     exactly 180 s;
-  - unissued, oversized and malformed acks refuse;
   - a stalled frame refuses after 10 s;
   - cancellation stops the wait;
   - a reply that is ready together with the expired deadline refuses;
