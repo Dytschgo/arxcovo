@@ -1847,7 +1847,7 @@ impl<'a> NativeLaunch<'a> {
         // The acknowledgement does not touch the gate. Accept it only once the
         // worker has finished its write and recorded it as in time.
         self.gate.settle(Duration::from_secs(2)).await?;
-        let guest = GuestChannel::handshake(pipe, cancel)
+        let guest = GuestChannel::ready(pipe, &mut qmp, cancel)
             .await
             .map_err(|_| NativeRefusal::GuestEndpointUnverified)?;
         Ok((qmp, guest))

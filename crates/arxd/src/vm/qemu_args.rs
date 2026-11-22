@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 pub const QEMU_VERSION: &str = "11.1.3";
 pub const MACHINE: &str = "pc-q35-11.1";
 pub const GUEST_PORT: &str = "org.arxcovo.agent.0";
+/// The fixed QEMU device id of the guest port; `VSERPORT_CHANGE` names it.
+pub const GUEST_PORT_ID: &str = "arxguestport";
 pub const NETWORK: &str = "user,id=arxnet0,restrict=on,ipv6=off";
 
 pub struct SerialName(String);
@@ -317,7 +319,9 @@ impl BootRecipe<'_> {
             "-chardev".into(),
             format!("pipe,id=arxguest,path={}", self.serial.basename()),
             "-device".into(),
-            format!("virtserialport,bus=arxserial.0,chardev=arxguest,name={GUEST_PORT}"),
+            format!(
+                "virtserialport,bus=arxserial.0,chardev=arxguest,id={GUEST_PORT_ID},name={GUEST_PORT}"
+            ),
         ]);
         block(
             &mut args,

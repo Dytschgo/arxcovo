@@ -35,7 +35,15 @@ pub(super) async fn bounded<T>(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(ChannelError::Cancelled),
-        result = timeout_at(deadline, action) => result.map_err(|_| ChannelError::Timeout)?,
+        result = timeout_at(deadline, action) => {
+            let value = result.map_err(|_| ChannelError::Timeout)??;
+            // Tokio polls ready I/O before an expired timer. The cutoff is
+            // absolute, so a result completed at or after it still refuses.
+            if Instant::now() >= deadline {
+                return Err(ChannelError::Timeout);
+            }
+            Ok(value)
+        }
     }
 }
 
@@ -165,22 +173,25 @@ struct Stream<R, W> {
     reader: BufReader<R>,
     writer: W,
     next_id: u16,
+    /// The record read so far. Persisting it makes `record` cancel-safe.
+    pending: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
+    /// Cancel-safe: a dropped call keeps its partial record for the next one.
     async fn record<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, ChannelError> {
-        let mut bytes = Vec::new();
         loop {
             match self.reader.read_u8().await {
                 Ok(b'\n') => break,
-                Ok(_) if bytes.len() == MAX_RECORD => return Err(ChannelError::Oversize),
-                Ok(byte) => bytes.push(byte),
+                Ok(_) if self.pending.len() == MAX_RECORD => return Err(ChannelError::Oversize),
+                Ok(byte) => self.pending.push(byte),
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                     return Err(ChannelError::Eof);
                 }
                 Err(_) => return Err(ChannelError::Io),
             }
         }
+        let bytes = std::mem::take(&mut self.pending);
         serde_json::from_slice(&bytes).map_err(|_| ChannelError::Invalid)
     }
 
@@ -256,6 +267,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
             reader: BufReader::new(reader),
             writer,
             next_id: 1,
+            pending: Vec::new(),
         };
         bounded(cancel, Instant::now() + SETUP, async {
             let Greeting { qmp: greeting } = stream.record().await?;
@@ -354,6 +366,63 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
             Ok(())
         })
         .await
+    }
+}
+
+/// Bounds the events a readiness wait may skip while watching one port.
+#[derive(Default)]
+pub struct PortWatch {
+    skipped: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortChange {
+    id: String,
+    open: bool,
+}
+
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
+    /// Next `VSERPORT_CHANGE` for the virtio-serial port device `port`, as
+    /// `open`. Available only after the startup `cont`, while no command is
+    /// outstanding, so any reply is unexpected. Events for other ports and
+    /// other bounded events are skipped and counted; a malformed port event,
+    /// any `SHUTDOWN`, or more than `MAX_EVENTS` skips refuses. Cancel-safe:
+    /// the stream stays in place and partial records persist.
+    pub async fn port_change(
+        &mut self,
+        port: &str,
+        watch: &mut PortWatch,
+    ) -> Result<bool, ChannelError> {
+        if !self.started {
+            return Err(ChannelError::Unexpected);
+        }
+        let stream = self.stream.as_mut().ok_or(ChannelError::Closed)?;
+        loop {
+            let Record::Event(event) = stream.record().await? else {
+                return Err(ChannelError::Unexpected);
+            };
+            if event.event == "VSERPORT_CHANGE" {
+                let data = event.data.ok_or(ChannelError::Invalid)?;
+                let change: PortChange = serde_json::from_value(Value::Object(data))
+                    .map_err(|_| ChannelError::Invalid)?;
+                if change.id.is_empty() || change.id.len() > 128 {
+                    return Err(ChannelError::Invalid);
+                }
+                if change.id == port {
+                    return Ok(change.open);
+                }
+            } else if event.event == "SHUTDOWN" {
+                event.guest_shutdown()?;
+                return Err(ChannelError::Unexpected);
+            } else {
+                event.guest_shutdown()?;
+            }
+            if watch.skipped == MAX_EVENTS {
+                return Err(ChannelError::Oversize);
+            }
+            watch.skipped += 1;
+        }
     }
 }
 
