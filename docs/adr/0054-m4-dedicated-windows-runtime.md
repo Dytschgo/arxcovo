@@ -35,6 +35,18 @@ roots. The Job confines process lifetime and applies memory and CPU controls.
 The dedicated account and filesystem ACLs govern access to files and
 credentials.
 
+Launch plans are sealed. `CommandPlan` has private fields, no public
+constructor and read-only accessors. Only the typed boot recipe and the
+fixed qemu-img info and create builders produce one. A mutating qemu-img plan
+holds a borrowed `OfflineLease`. The native launcher requires the lease for
+`PlanKind::Mutate` and keeps it borrowed for the life of the launch. The
+private process-creation path takes argv only from a sealed plan in
+production builds. Test fixtures may re-execute only the test binary.
+Visibility alone makes caller-supplied argv unrepresentable, so no
+compile-fail harness is used. `OfflineLease` and `LaunchAuthority` stay
+uninhabited, so no mutating plan or native launch can be constructed in this
+slice.
+
 ## Channels and containment
 
 QMP uses synchronous child stdin/stdout and separate stderr. Parent workers
@@ -73,7 +85,13 @@ the exact build.
 
 QMP uses the startup hold `-S`. The single internal `cont` is available
 after valid capabilities, a prelaunch status, qualified endpoint custody and
-a fresh resource check. The guest protocol subsequently requires a fresh
+a fresh resource check. The resource revalidator runs at two points. The
+first is immediately before `ResumeThread`, after the cancellation and
+held-child checks. The second is between receipt of the prelaunch
+`query-status` reply and `cont`. Guest execution therefore never starts on a
+sample older than the five-second freshness window. A refusal at the first
+point leaves the thread suspended. A refusal at the second sends no `cont`
+and closes the channel. The guest protocol subsequently requires a fresh
 challenge echo and advertised script support. Graceful stop requires a
 matching guest shutdown event, a clean child exit, Job-empty, worker joins
 and artifact release. Containment termination yields a dirty release when
@@ -101,6 +119,27 @@ must compare against that pin. A live identity that differs from it must
 refuse with `PathCustodyUnverified`. This is a gate before activation, not
 slice 3 behavior.
 
+Path custody walks relative to held handles. The volume root is the only
+object opened by absolute name. Each later component is opened with
+`NtCreateFile` relative to the already-checked parent handle, using
+`FILE_OPEN_REPARSE_POINT` and `OBJ_DONT_REPARSE`, and then its reparse,
+sparse, compressed, type, link-count and volume attributes are checked. The
+pin keeps every ancestor open without write or delete sharing. A later
+rename of a checked ancestor fails. A junction cannot be set on a held
+ancestor, because a mount point needs an empty directory and the share mode
+denies write access. Even if a reparse point appeared on a held ancestor,
+the next open is relative to the held object and does not parse that
+ancestor's name again. The leaf reopen goes through the same parent handle.
+
+QEMU and qemu-img still open their image, firmware, disk and data paths by
+name. That residual sits inside the same-account trust boundary above:
+another process under the supervisor SID could race those name-based opens
+in a way the supervisor's pins do not fully prevent. Before activation, the
+runtime must re-verify the volume, file ID and digest of each artifact the
+child consumes, both before launch and after QEMU has opened them, and
+refuse or quarantine on any mismatch. This residual is an activation gate.
+It is not closed in slice 3.
+
 WTS is the proposed owner activity source. The candidate samples local
 sessions, binds the local SAM account to the pinned SID, verifies session
 incarnation across queries and accepts only fresh, active, unlocked owner
@@ -120,12 +159,30 @@ loss. For supervisor loss, a disposable parent process owns the only Job
 handle and the observer holds only a wait handle on the grandchild. The
 same tests cover hard-link and rename refusal, junctions as an intermediate
 component and as a leaf, the volume-root binding, and exact-owner and
-ordered explicit-DACL matching with positive and negative cases. A
-restrictive outer runner Job is reported as a typed unsupported case. These
-tests ran under the developer's interactive account. Native WHPX, the
+ordered explicit-DACL matching with positive and negative cases. They also
+race the custody walk: a component swapped for a junction after its parent
+is pinned is refused, held ancestors resist rename and junction attempts,
+and a relative open follows the held parent after its name moves. The
+wrong-PID fixture serves exactly the expected owner and DACL, so only the
+server PID differs. Other tests cover the resource revalidator refusing at
+resume and at `cont`.
+
+An access denial counts as a restrictive outer runner Job only when it
+comes from process creation and an identical creation without the Job-list
+attribute succeeds. In that case the fixture prints a `SKIP vm-job-fixture`
+or `SKIP vm-supervisor-loss` line and returns. Nextest shows that line for a
+passing test only with `--no-capture` or `--success-output`. Any other
+denial fails the test.
+
+These tests ran under the developer's interactive account. Native WHPX, the
 dedicated standard account, effective pipe ACLs against distinct SIDs,
-physical disk ceilings and WTS owner activity are **unverified on real
-hardware**. The optional Linux TCG fixture requires an explicit
-digest-pinned manifest and was not exercised.
+physical disk ceilings, the volume-identity pin, QEMU's own name-based opens
+and WTS owner activity are **unverified on real hardware**. The optional
+Linux TCG fixture covers only QMP startup. It requires an explicit
+digest-pinned manifest and was not exercised. Disk, synthetic qcow2 and
+qemu-img backing behavior through the production recipe pieces belong to
+the M4 PR 6 smoke. The production recipe types use Windows drive-letter
+paths, and mutating qemu-img plans need the uninhabited offline lease, so
+this Linux fixture cannot exercise them.
 The release gate stays closed pending independent review, passing checks
 and owner qualification of the exact package and native controls.
