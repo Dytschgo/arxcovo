@@ -380,32 +380,60 @@ def ledger_slots(receipts):
     return bytes((1, len(receipts))) + b"".join(receipts).ljust(224, b"\0")
 
 
-def ledger_checkpoint(raw):
-    require(len(raw) == 164 and raw[0] == 1 and raw[1] in (3, 4, 5)
-            and raw[2] in (1, 2) and raw[3] in (0, 1), "ledger-checkpoint")
+LEDGER_RETRIES = 3
+LEDGER_BACKOFF = 0.04
+LEDGER_PEER = 2
+
+
+class LedgerRefusal(Refusal):
+    def __init__(self, category, predicate):
+        super().__init__(category)
+        self.predicate = predicate
+
+
+def ledger_require(condition, predicate, category="ledger-checkpoint"):
+    if not condition:
+        raise LedgerRefusal(category, predicate)
+
+
+def decode_ledger_checkpoint(raw, evidence):
+    evidence["width"] = min(len(raw), 165)
+    ledger_require(len(raw) == 164, "width")
     member, epoch, leader = struct.unpack(">QQQ", raw[4:28])
     voters = struct.unpack(">QQQ", raw[140:])
     membership, applied = position(raw[92:116]), position(raw[116:140])
-    require(voters == (1, 2, 3) and member in voters and leader in voters
-            and (raw[2] == 1) == (leader == member) and covers(applied, membership)
-            and any(raw[28:44]) and any(raw[60:92]), "ledger-checkpoint")
+    evidence.update(status=raw[1], role=raw[2], member=member, epoch=(epoch, leader), voters=voters,
+                    membership=membership, applied=applied)
+    ledger_require(raw[0] == 1, "version")
+    ledger_require(raw[1] in (LEDGER_PEER, 3, 4, 5), "status")
+    ledger_require(raw[2] in (1, 2), "role")
+    ledger_require(raw[3] in (0, 1), "custody-code")
+    ledger_require(voters == (1, 2, 3), "voters")
+    ledger_require(member in voters, "voter-member")
+    ledger_require(leader in voters, "voter-leader")
+    ledger_require((raw[2] == 1) == (leader == member), "leader-role")
+    ledger_require(covers(applied, membership), "applied-membership")
+    ledger_require(any(raw[28:44]), "installation-id")
+    ledger_require(any(raw[60:92]), "installation-key-digest")
     return {"node": member, "epoch": (epoch, leader), "member_pos": membership, "applied": applied,
-            "identity": raw[28:92], "custody": bool(raw[3])}
+            "identity": raw[28:92], "custody": bool(raw[3]), "status": raw[1]}
 
 
 def check_checkpoint_set(observations, nodes, receipts, identities=None):
-    require(set(observations) == set(nodes), "ledger-node-inventory")
+    ledger_require(set(observations) == set(nodes), "node-inventory", "ledger-node-inventory")
     records = list(observations.values())
     epoch, membership = records[0]["epoch"], records[0]["member_pos"]
-    require(all(r["epoch"] == epoch and r["member_pos"] == membership for r in records)
-            and all(r["identity"][16:32] == bytes([16]) * 16 for r in records)
-            and len({r["identity"][:16] for r in records}) == len(records), "ledger-consistency")
+    ledger_require(all(r["epoch"] == epoch for r in records), "shared-epoch", "ledger-consistency")
+    ledger_require(all(r["member_pos"] == membership for r in records), "shared-membership", "ledger-consistency")
+    ledger_require(all(r["identity"][16:32] == bytes([16]) * 16 for r in records), "cluster-id", "ledger-consistency")
+    ledger_require(len({r["identity"][:16] for r in records}) == len(records), "unique-installation", "ledger-consistency")
     for node, record in observations.items():
-        require(record["node"] == "abc".index(node) + 1 and record["custody"] == (node != "a")
-                and all(covers(record["applied"], position(slot[:24])) for slot in receipts),
-                "ledger-node-proof")
+        ledger_require(record["node"] == "abc".index(node) + 1, "expected-member", "ledger-node-proof")
+        ledger_require(record["custody"] == (node != "a"), "expected-custody", "ledger-node-proof")
+        ledger_require(all(covers(record["applied"], position(slot[:24])) for slot in receipts),
+                       "applied-mints", "ledger-node-proof")
         if identities is not None:
-            require(record["identity"] == identities[node], "ledger-installation-drift")
+            ledger_require(record["identity"] == identities[node], "expected-installation", "ledger-installation-drift")
     return epoch, membership
 
 
@@ -638,6 +666,7 @@ class Campaign:
         self.checkpoints = {}
         self.anchor_diagnostic = None
         self.build_diagnostic = None
+        self.ledger_diagnostic = {}
         self.identities = None
 
     def owner(self, node, action, tag, width, end, data=b""):
@@ -824,11 +853,40 @@ class Campaign:
             self.receipts.append(raw[1:])
         ledger_slots(self.receipts)
 
-    def observe(self, label, nodes, end):
+    def read_ledger(self, label, node, end, payload, validate):
+        diagnostic = None
+        for attempt in range(LEDGER_RETRIES + 1):
+            if diagnostic is not None:
+                diagnostic["retries"] = attempt
+            evidence = {}
+            try:
+                raw = self.owner(node, "owner-ledger", 18, 164, end, payload)
+                record = decode_ledger_checkpoint(raw, evidence)
+                validate(record)
+                # R7 has already proved the Mint slots. Retry only the lifecycle sample.
+                ledger_require(record["status"] != LEDGER_PEER, "peer-status")
+                remaining(end)
+                return record
+            except LedgerRefusal as error:
+                evidence["predicate"] = error.predicate
+                # Keep only the first rejection and any different terminal rejection.
+                if diagnostic is None:
+                    diagnostic = {"retries": 0, "first": evidence}
+                    self.ledger_diagnostic.setdefault(label, {})[node] = diagnostic
+                if error.predicate == "peer-status" and attempt < LEDGER_RETRIES:
+                    if time.monotonic() + LEDGER_BACKOFF < end:
+                        time.sleep(LEDGER_BACKOFF)
+                        if time.monotonic() < end:
+                            continue
+                if evidence != diagnostic["first"]:
+                    diagnostic["last"] = evidence
+                raise
+
+    def observe(self, label, nodes, end, *, after_term=None, expected_epoch=None):
         payload = ledger_slots(self.receipts)
         observations = {}
-        for node in nodes:
-            goal = position(self.receipts[-1][:24])
+        goal = position(self.receipts[-1][:24])
+        for index, node in enumerate(nodes):
             while True:
                 remaining(end)
                 try:
@@ -842,10 +900,22 @@ class Campaign:
                     if covers(position(prefix[11:35]), goal):
                         break
                 time.sleep(0.04)
-            raw = self.owner(node, "owner-ledger", 18, 164, end, payload)
-            observations[node] = ledger_checkpoint(raw)
-        epoch, member_pos = check_checkpoint_set(observations, nodes, self.receipts, self.identities)
-        require(member_pos == self.membership[-1][0], "ledger-membership-position")
+            def validate(record):
+                # Check consistency with every qualified observation before a retry is possible.
+                epoch, member_pos = check_checkpoint_set({**observations, node: record}, nodes[:index + 1],
+                                                         self.receipts, self.identities)
+                ledger_require(member_pos == self.membership[-1][0], "expected-membership",
+                               "ledger-membership-position")
+                if expected_epoch is not None:
+                    ledger_require(epoch == expected_epoch, "recovery-epoch", "recovery-epoch")
+                elif after_term is not None:
+                    ledger_require(epoch[0] > after_term, "survivor-term", "survivor-epoch")
+                    ledger_require(epoch[1] == goal[1], "survivor-leader", "survivor-epoch")
+                else:
+                    ledger_require(epoch[1] == 1, "founder-leader", "founder-leader-precondition")
+
+            observations[node] = self.read_ledger(label, node, end, payload, validate)
+        epoch, member_pos = observations[nodes[0]]["epoch"], observations[nodes[0]]["member_pos"]
         if self.identities is None:
             self.identities = {node: row["identity"] for node, row in observations.items()}
         self.checkpoints[label] = {"epoch": epoch, "membership": member_pos,
@@ -860,13 +930,16 @@ class Campaign:
         self.ready("a", (5,), end)
         self.mint_ledger("a", end)
         self.pre_epoch = self.observe("before_loss", "abc", end)
-        require(self.pre_epoch[1] == 1, "founder-leader-precondition")
 
     def recover(self, end):
-        raw = self.owner("a", "owner-ledger", 18, 164, end, ledger_slots(self.receipts))
-        held = ledger_checkpoint(raw)
-        require(held["node"] == 1 and held["epoch"] == self.pre_epoch and held["identity"] == self.identities["a"]
-                and held["member_pos"] == self.membership[-1][0], "kill-epoch-drift")
+        def validate_held(held):
+            ledger_require(held["node"] == 1, "expected-member", "kill-epoch-drift")
+            ledger_require(held["epoch"] == self.pre_epoch, "kill-epoch", "kill-epoch-drift")
+            ledger_require(held["identity"] == self.identities["a"], "expected-installation", "kill-epoch-drift")
+            ledger_require(held["member_pos"] == self.membership[-1][0], "expected-membership", "kill-epoch-drift")
+            check_checkpoint_set({"a": held}, "a", self.receipts, self.identities)
+
+        self.read_ledger("pre_kill", "a", end, ledger_slots(self.receipts), validate_held)
         images = [self.resources.root / name for name in ("root.ext4", "a.ext4")]
         original = [image_id(path) for path in images]
         quiescent_data(self.data("a"))
@@ -881,14 +954,12 @@ class Campaign:
             time.sleep(min(0.04, remaining(end)))
         leader = candidates[0]
         self.mint_ledger(leader, end)
-        after = self.observe("during_loss", "bc", end)
-        require(after[0] > self.pre_epoch[0] and after[1] == "abc".index(leader) + 1,
-                "survivor-epoch")
+        after = self.observe("during_loss", "bc", end, after_term=self.pre_epoch[0])
         require([image_id(path) for path in images] == original, "restart-image-drift")
         quiescent_data(self.data("a"))
         self.resources.restore_founder_endpoint(end)
         self.start("a3", (3, 4, 5), end)
-        require(self.observe("after_recovery", "abc", end) == after, "recovery-epoch")
+        self.observe("after_recovery", "abc", end, expected_epoch=after)
         require([image_id(path) for path in images] == original, "restart-image-drift")
         self.checkpoints["restart"] = {"same_data_image": True, "fresh_volatile_state": True}
         self.survivor = leader
@@ -961,6 +1032,8 @@ def live_run(env, uid):
         driver.latch(error)
     if driver.resources and driver.resources.failure_diagnostic is not None:
         driver.receipt.setdefault("diagnostic", driver.resources.failure_diagnostic)
+    if campaign is not None and campaign.ledger_diagnostic:
+        driver.receipt["ledger_diagnostic"] = campaign.ledger_diagnostic
     return driver.receipt
 
 
