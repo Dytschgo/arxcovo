@@ -536,8 +536,80 @@ class Cleanup(unittest.TestCase):
             ("link", resources.bridge),
         ])
 
+    @staticmethod
+    def build_policy_nft_rows(family, table_name, table_handle_id, chains):
+        rows = [
+            {"metainfo": {"version": "1.0.9", "json_schema_version": 1}},
+            {"table": {"family": family, "name": table_name, "handle": table_handle_id}},
+        ]
+        rule_handle = table_handle_id * 100
+        for chain_name, (hook, body) in chains.items():
+            rows.append({
+                "chain": {
+                    "family": family, "table": table_name, "name": chain_name,
+                    "type": "filter", "hook": hook, "prio": -310, "policy": "accept",
+                }
+            })
+            for label, source, verdict in body:
+                exprs = []
+                tokens = source.split()
+                idx = 0
+                emitted_l3 = False
+                emitted_l4 = False
+                while idx < len(tokens):
+                    head = tokens[idx]
+                    if head in ("iifname", "oifname"):
+                        exprs.append({"match": {"op": "==", "left": {"meta": {"key": head}},
+                                                "right": tokens[idx + 1].strip('"')}})
+                        idx += 2
+                    elif head == "ct":
+                        exprs.append({"match": {"op": "in", "left": {"ct": {"key": tokens[idx + 1]}},
+                                                "right": tokens[idx + 2]}})
+                        idx += 3
+                    elif head == "arp":
+                        if family == "bridge" and not emitted_l3:
+                            exprs.append({"match": {"op": "==", "left": {"payload": {"protocol": "ether", "field": "type"}},
+                                                    "right": "arp"}})
+                            emitted_l3 = True
+                        exprs.append({"match": {"op": "==", "left": {"payload": {"protocol": "arp",
+                                                "field": f"{tokens[idx + 1]} {tokens[idx + 2]}"}},
+                                                "right": tokens[idx + 3]}})
+                        idx += 4
+                    elif head in ("ip", "ip6"):
+                        if not emitted_l3:
+                            if family == "bridge":
+                                exprs.append({"match": {"op": "==", "left": {"payload": {"protocol": "ether", "field": "type"}},
+                                                        "right": head}})
+                            else:
+                                exprs.append({"match": {"op": "==", "left": {"meta": {"key": "nfproto"}},
+                                                        "right": "ipv4" if head == "ip" else "ipv6"}})
+                            emitted_l3 = True
+                        exprs.append({"match": {"op": "==", "left": {"payload": {"protocol": head, "field": tokens[idx + 1]}},
+                                                "right": tokens[idx + 2]}})
+                        idx += 3
+                    elif head in ("tcp", "udp"):
+                        if not emitted_l4:
+                            exprs.append({"match": {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": head}})
+                            emitted_l4 = True
+                        exprs.append({"match": {"op": "==", "left": {"payload": {"protocol": head, "field": tokens[idx + 1]}},
+                                                "right": int(tokens[idx + 2])}})
+                        idx += 3
+                    else:
+                        exprs.append({"match": {"op": "==", "left": {"payload": {"protocol": head, "field": tokens[idx + 1]}},
+                                                "right": tokens[idx + 2]}})
+                        idx += 3
+                rule_handle += 1
+                rows.append({
+                    "rule": {
+                        "family": family, "table": table_name, "chain": chain_name,
+                        "handle": rule_handle, "comment": f"r2-{label}",
+                        "expr": [*exprs, {"counter": {"packets": 0, "bytes": 0}}, {verdict: None}],
+                    }
+                })
+        return rows
+
     def test_committed_unobserved_link_netns_and_nft_cleanup_with_cleanup_reserve(self):
-        # 1. Committed-but-unobserved link: ip link add commits, first readback fails, cleanup recovers with reserve.
+        # 1a. Committed-but-unobserved bridge: ip link add commits, first readback fails, cleanup recovers with reserve.
         resources = self.make_resources()
         live_links = {}
         deleted_links = []
@@ -573,7 +645,7 @@ class Cleanup(unittest.TestCase):
             self.assertEqual(deleted_links, [resources.bridge])
             self.assertEqual(live_links, {})
 
-        # Unobserved link with unprovable attribution (wrong kind or foreign alias) must be refused.
+        # Unobserved bridge with unprovable attribution (wrong kind or foreign alias) must be refused.
         for bad_row in (
             {"ifname": resources.bridge, "ifindex": 202, "address": NETWORK["local"][1],
              "linkinfo": {"info_kind": "dummy"}},
@@ -587,6 +659,97 @@ class Cleanup(unittest.TestCase):
                     with self.assertRaisesRegex(Refusal, "link-attribution"):
                         resources.remove_link(resources.bridge, None, 10, tagged=False,
                                               expected_kind="bridge", expected_mac=NETWORK["local"][1])
+                    self.assertEqual(del_calls, [])
+
+        # 1b. Committed-but-unobserved veth: positive recovery requires verified bidirectional peer attribution in attributed netns.
+        resources = self.make_resources()
+        veth_name = resources.links["a"]
+        ns_name = resources.namespaces["a"]
+        ns_path = Path("/run/netns") / ns_name
+        ns_id = (7, 901)
+        veth_live = {}
+        peer_live = {}
+        veth_deleted = []
+        fail_veth_readback = [True]
+
+        def fake_ip_veth(_end, *args, **kwargs):
+            if args[:2] == ("link", "add"):
+                veth_live[veth_name] = {
+                    "ifname": veth_name, "ifindex": 301, "link_index": 2, "link_netnsid": 0,
+                    "ifalias": "", "linkinfo": {"info_kind": "veth"},
+                }
+                peer_live["eth0"] = {
+                    "ifname": "eth0", "ifindex": 2, "link_index": 301, "link_netnsid": 0,
+                    "linkinfo": {"info_kind": "veth"},
+                }
+                return ""
+            if args[:3] == ("-j", "-d", "link"):
+                if fail_veth_readback[0]:
+                    fail_veth_readback[0] = False
+                    raise Refusal("ip-phase-deadline")
+                name = args[-1]
+                if name not in veth_live:
+                    return f'Device "{name}" does not exist.\n'
+                return json.dumps([veth_live[name]])
+            if args[:2] == ("-n", ns_name) and args[2:5] == ("-j", "-d", "link"):
+                name = args[-1]
+                if name not in peer_live:
+                    return f'Device "{name}" does not exist.\n'
+                return json.dumps([peer_live[name]])
+            if args[:2] == ("link", "del"):
+                veth_deleted.append(args[3])
+                veth_live.pop(args[3], None)
+                peer_live.pop("eth0", None)
+                return ""
+            return ""
+
+        with patch.object(resources, "ip", side_effect=fake_ip_veth), \
+             patch.object(Path, "exists", lambda p: p == ns_path), \
+             patch.object(Path, "stat", lambda p: SimpleNamespace(st_dev=ns_id[0], st_ino=ns_id[1])):
+            with self.assertRaisesRegex(Refusal, "ip-phase-deadline"):
+                resources.add_link(veth_name, 0, "type", "veth", "peer", "name", "eth0", "netns", ns_name,
+                                   kind="veth", peer_node="a", peer_ns_identity=ns_id)
+            self.assertEqual(resources.cleanup(10), [])
+            self.assertEqual(veth_deleted, [veth_name])
+            self.assertEqual(veth_live, {})
+
+        # Unobserved unrelated same-name veth with missing or mismatched peer attribution must NOT be deleted.
+        base_host_veth = {
+            "ifname": veth_name, "ifindex": 301, "link_index": 2, "link_netnsid": 0,
+            "ifalias": "", "linkinfo": {"info_kind": "veth"},
+        }
+        for label, host_row, peer_rows, ns_stat_pair in (
+            ("missing-peer", base_host_veth, [], ns_id),
+            ("mismatched-peer-link-index", base_host_veth, [{
+                "ifname": "eth0", "ifindex": 2, "link_index": 999, "link_netnsid": 0,
+                "linkinfo": {"info_kind": "veth"},
+            }], ns_id),
+            ("mismatched-peer-ifindex", base_host_veth, [{
+                "ifname": "eth0", "ifindex": 5, "link_index": 301, "link_netnsid": 0,
+                "linkinfo": {"info_kind": "veth"},
+            }], ns_id),
+            ("same-netns-no-link-netnsid", {
+                "ifname": veth_name, "ifindex": 301, "link_index": 2, "ifalias": "",
+                "linkinfo": {"info_kind": "veth"},
+            }, [{
+                "ifname": "eth0", "ifindex": 2, "link_index": 301, "link_netnsid": 0,
+                "linkinfo": {"info_kind": "veth"},
+            }], ns_id),
+            ("substituted-peer-netns", base_host_veth, [{
+                "ifname": "eth0", "ifindex": 2, "link_index": 301, "link_netnsid": 0,
+                "linkinfo": {"info_kind": "veth"},
+            }], (7, 999)),
+        ):
+            with self.subTest(bad_veth=label):
+                del_calls = []
+                with patch.object(resources, "links_at", return_value=[host_row]), \
+                     patch.object(resources, "ns_links_at", return_value=peer_rows), \
+                     patch.object(Path, "exists", lambda p: p == ns_path), \
+                     patch.object(Path, "stat", lambda p: SimpleNamespace(st_dev=ns_stat_pair[0], st_ino=ns_stat_pair[1])), \
+                     patch.object(resources, "ip", side_effect=lambda *a, **kw: del_calls.append(a)):
+                    with self.assertRaisesRegex(Refusal, "link-attribution"):
+                        resources.remove_link(veth_name, None, 10, tagged=False,
+                                              expected_kind="veth", peer_node="a", peer_ns_identity=ns_id)
                     self.assertEqual(del_calls, [])
 
         # 2. Committed-but-unobserved namespace: netns add commits then times out before stat(); cleanup recovers.
@@ -628,10 +791,11 @@ class Cleanup(unittest.TestCase):
                 resources.remove_namespace("a", None, 10, allow_unobserved=True)
             mocked_ip.assert_not_called()
 
-        # 3. Committed-but-unobserved nft tables: nft -f commits both tables, handle readback hits expired setup deadline;
-        # cleanup uses fresh cleanup deadline and removes both tables after links are gone.
+        # 3. Committed-but-unobserved nft tables: nft -f commits both complete two-chain tables, handle readback hits
+        # expired setup deadline; cleanup uses fresh cleanup deadline, verifies exact complete policy, and deletes both.
         resources = self.make_resources()
         resources.remember("link", lambda _end: None)
+        expected_graph = isolation.policy(resources.bridge, resources.links)
         live_tables = {}
         deleted_tables = []
         setup_end = 100
@@ -640,13 +804,7 @@ class Cleanup(unittest.TestCase):
         def fake_nft(end, *args):
             if args[0] == "-f":
                 for fam, h in (("bridge", 31), ("inet", 32)):
-                    live_tables[fam] = [
-                        {"table": {"family": fam, "name": resources.table, "handle": h}},
-                        {"chain": {"family": fam, "table": resources.table, "name": "r2_forward",
-                                   "type": "filter", "hook": "forward", "prio": -310, "policy": "accept"}},
-                        {"rule": {"family": fam, "table": resources.table, "chain": "r2_forward",
-                                  "handle": h + 10, "comment": "r2-peer", "expr": []}},
-                    ]
+                    live_tables[fam] = self.build_policy_nft_rows(fam, resources.table, h, expected_graph[fam])
                 return ""
             if args[:2] == ("-j", "-a"):
                 if end == setup_end:
@@ -669,27 +827,141 @@ class Cleanup(unittest.TestCase):
             self.assertEqual(set(deleted_tables), {"bridge", "inet"})
             self.assertEqual(live_tables, {})
 
-        # Unobserved nft table with an alien chain must refuse deletion.
-        alien_rows = [
+        # Table-only, incomplete-chain, arbitrary-empty-expr, and alien-chain unobserved tables must NOT be deleted.
+        full_bridge = self.build_policy_nft_rows("bridge", resources.table, 41, expected_graph["bridge"])
+        only_forward = [row for row in full_bridge
+                        if not ("chain" in row and row["chain"]["name"] == "r2_input")
+                        and not ("rule" in row and row["rule"]["chain"] == "r2_input")]
+        empty_expr_table = [
             {"table": {"family": "bridge", "name": resources.table, "handle": 41}},
-            {"chain": {"family": "bridge", "table": resources.table, "name": "alien_chain",
+            {"chain": {"family": "bridge", "table": resources.table, "name": "r2_forward",
                        "type": "filter", "hook": "forward", "prio": -310, "policy": "accept"}},
+            {"rule": {"family": "bridge", "table": resources.table, "chain": "r2_forward",
+                      "handle": 4101, "comment": "r2-peer", "expr": []}},
         ]
-        nft_calls = []
+        for label, bad_rows in (
+            ("table-only", [{"table": {"family": "bridge", "name": resources.table, "handle": 41}}]),
+            ("incomplete-one-chain", only_forward),
+            ("missing-last-rule", full_bridge[:-1]),
+            ("empty-expr-r2-comment", empty_expr_table),
+            ("alien-chain", [
+                {"table": {"family": "bridge", "name": resources.table, "handle": 41}},
+                {"chain": {"family": "bridge", "table": resources.table, "name": "alien_chain",
+                           "type": "filter", "hook": "forward", "prio": -310, "policy": "accept"}},
+            ]),
+        ):
+            with self.subTest(bad_nft=label):
+                nft_calls = []
 
-        def fake_alien_nft(_end, *args):
-            nft_calls.append(args)
-            if args == ("list", "tables"):
-                return f"table bridge {resources.table}\n"
-            if args[:2] == ("-j", "-a"):
-                return json.dumps({"nftables": alien_rows})
-            raise AssertionError(f"unexpected nft delete: {args}")
+                def fake_bad_nft(_end, *args, rows=bad_rows):
+                    nft_calls.append(args)
+                    if args == ("list", "tables"):
+                        return f"table bridge {resources.table}\n"
+                    if args[:2] == ("-j", "-a"):
+                        return json.dumps({"nftables": rows})
+                    raise AssertionError(f"unexpected nft delete: {args}")
 
-        with patch.object(resources, "nft", side_effect=fake_alien_nft), \
-             patch.object(resources, "links_at", return_value=[]):
-            with self.assertRaisesRegex(Refusal, "nft-attribution"):
-                resources.remove_table("bridge", None, cleanup_end, expected_chains={"r2_forward", "r2_input"})
-            self.assertFalse(any(call[:2] == ("delete", "table") for call in nft_calls))
+                with patch.object(resources, "nft", side_effect=fake_bad_nft), \
+                     patch.object(resources, "links_at", return_value=[]):
+                    with self.assertRaisesRegex(Refusal, "nft-"):
+                        resources.remove_table("bridge", None, cleanup_end, expected_policy=expected_graph["bridge"])
+                    self.assertFalse(any(call[:2] == ("delete", "table") for call in nft_calls))
+
+    def test_committed_unobserved_mount_recovery_and_backing_mismatch_refusal(self):
+        import fixture
+        size = 256 * MIB
+        orig_dev = (8 << 8) | 1
+        orig_ino = 71001
+        setup_end = 100
+        cleanup_end = 200
+
+        def run_case(*, tamper_backing_before_cleanup):
+            resources = self.make_resources()
+            image = resources.root / "a.ext4"
+            mount = resources.root / "a"
+            img_stat = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_nlink=1,
+                                       st_size=size, st_blocks=size // 512, st_dev=orig_dev, st_ino=orig_ino)
+            mounted = [False]
+            attached = [False]
+            current_back_ino = [orig_ino]
+            umount_calls = []
+            detach_calls = []
+
+            def fake_capture(argv, end, **kwargs):
+                exe = argv[0]
+                if exe == TOOLS["mkfs"]:
+                    return b""
+                if exe == TOOLS["loop"] and "-J" in argv:
+                    rows = []
+                    if attached[0]:
+                        rows.append({
+                            "name": "/dev/loop2", "back-file": image.as_posix(),
+                            "back-ino": current_back_ino[0], "back-maj:min": isolation.dev_majmin(orig_dev),
+                            "ro": False, "offset": 0, "sizelimit": 0,
+                        })
+                    return json.dumps({"loopdevices": rows}).encode("ascii")
+                if exe == TOOLS["loop"] and "--find" in argv:
+                    attached[0] = True
+                    return b"/dev/loop2\n"
+                if exe == TOOLS["loop"] and "-d" in argv:
+                    detach_calls.append((end, argv))
+                    attached[0] = False
+                    return b""
+                if exe == TOOLS["mount"]:
+                    mounted[0] = True
+                    return b""
+                if exe == TOOLS["findmnt"]:
+                    if mounted[0] and end == setup_end:
+                        raise Refusal("phase-deadline")
+                    if mounted[0]:
+                        return f"188 {mount.as_posix()} /dev/loop2 ext4 /\n".encode("ascii")
+                    return b""
+                if exe == TOOLS["umount"]:
+                    umount_calls.append((end, argv))
+                    mounted[0] = False
+                    return b""
+                return b""
+
+            def fake_bounded_read(path, _limit):
+                if path.name == "mountinfo":
+                    if mounted[0]:
+                        return f"188 29 7:2 / {mount.as_posix()} rw,nosuid - ext4 /dev/loop2 rw\n".encode("ascii")
+                    return b""
+                if path.name == "size":
+                    return f"{size // 512}\n".encode("ascii")
+                raise AssertionError(path)
+
+            with patch.object(fixture, "capture", side_effect=fake_capture), \
+                 patch.object(isolation, "allocate"), \
+                 patch.object(isolation, "private_directory"), \
+                 patch.object(isolation, "bounded_read", side_effect=fake_bounded_read), \
+                 patch.object(Path, "lstat", return_value=img_stat):
+                with self.assertRaisesRegex(Refusal, "findmnt-phase-deadline"):
+                    resources.volume("a", resources.root / "data-a", setup_end)
+                self.assertTrue(mounted[0])
+                self.assertEqual([label for label, _ in resources.cleanup_stack], ["loop-a", "mount-a"])
+                if tamper_backing_before_cleanup:
+                    current_back_ino[0] = orig_ino + 1
+                errors = resources.cleanup(cleanup_end)
+            return errors, umount_calls, detach_calls, mounted[0], attached[0]
+
+        # Positive recovery: pre-registered mount callback verifies backing loop/image dev+ino under cleanup_end and umounts.
+        errors, umounts, detaches, still_mounted, still_attached = run_case(tamper_backing_before_cleanup=False)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(umounts), 1)
+        self.assertEqual(umounts[0][0], cleanup_end)
+        self.assertEqual(len(detaches), 1)
+        self.assertEqual(detaches[0][0], cleanup_end)
+        self.assertFalse(still_mounted)
+        self.assertFalse(still_attached)
+
+        # Negative refusal: backing mismatch before cleanup refuses umount and losetup -d through pre-registered callbacks.
+        errors, umounts, detaches, still_mounted, still_attached = run_case(tamper_backing_before_cleanup=True)
+        self.assertEqual(errors, ["mount-a", "loop-a"])
+        self.assertEqual(umounts, [])
+        self.assertEqual(detaches, [])
+        self.assertTrue(still_mounted)
+        self.assertTrue(still_attached)
 
     def test_mkfs_alias_to_mke2fs_passes_explicit_ext4_type(self):
         import fixture

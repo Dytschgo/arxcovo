@@ -232,11 +232,17 @@ class Resources:
             return []
         return json_rows(output)
 
-    def add_link(self, name, end, *add_args, kind, mac=None):
+    def ns_links_at(self, end, node, name):
+        output = self.ip(end, "-n", self.namespaces[node], "-j", "-d", "link", "show", "dev", name, statuses=(0, 1))
+        if output.startswith("Device ") and output.rstrip().endswith("does not exist."):
+            return []
+        return json_rows(output)
+
+    def add_link(self, name, end, *add_args, kind, mac=None, peer_node=None, peer_ns_identity=None):
         state = {"index": None, "tagged": False}
-        self.remember("link", lambda deadline, n=name, s=state, k=kind, m=mac:
+        self.remember("link", lambda deadline, n=name, s=state, k=kind, m=mac, pn=peer_node, pi=peer_ns_identity:
                       self.remove_link(n, s["index"], deadline, tagged=s["tagged"],
-                                       expected_kind=k, expected_mac=m))
+                                       expected_kind=k, expected_mac=m, peer_node=pn, peer_ns_identity=pi))
         self.ip(end, "link", "add", "name", name, *add_args)
         rows = self.links_at(end, name)
         require(len(rows) == 1 and type(rows[0].get("ifindex")) is int, "link-attribution")
@@ -247,7 +253,8 @@ class Resources:
                 and rows[0].get("ifalias") == self.table, "link-attribution")
         state["tagged"] = True
 
-    def remove_link(self, name, index, end, *, tagged=True, expected_kind=None, expected_mac=None):
+    def remove_link(self, name, index, end, *, tagged=True, expected_kind=None, expected_mac=None,
+                    peer_node=None, peer_ns_identity=None):
         rows = self.links_at(end, name)
         if rows:
             require(len(rows) == 1, "link-attribution")
@@ -260,9 +267,29 @@ class Resources:
                         "link-attribution")
                 require(type(row.get("ifindex")) is int and row.get("ifname", name) == name, "link-attribution")
                 require(row.get("linkinfo", {}).get("info_kind") == expected_kind, "link-attribution")
-                if expected_mac is not None:
-                    require(row.get("address") == expected_mac, "link-attribution")
                 require(row.get("ifalias") in (None, "", self.table), "link-attribution")
+                if expected_kind == "bridge":
+                    require(expected_mac is not None and row.get("address") == expected_mac, "link-attribution")
+                else:
+                    require(peer_node in self.namespaces and peer_ns_identity is not None, "link-attribution")
+                    peer_ns_path = Path("/run/netns") / self.namespaces[peer_node]
+                    require(peer_ns_path.exists(), "link-attribution")
+                    peer_ns_info = peer_ns_path.stat()
+                    require((peer_ns_info.st_dev, peer_ns_info.st_ino) == peer_ns_identity, "link-attribution")
+                    host_ifindex = row["ifindex"]
+                    host_link_index = row.get("link_index")
+                    host_netnsid = row.get("link_netnsid")
+                    require(type(host_link_index) is int and type(host_netnsid) is int and host_netnsid >= 0,
+                            "link-attribution")
+                    peer_rows = self.ns_links_at(end, peer_node, "eth0")
+                    require(len(peer_rows) == 1, "link-attribution")
+                    peer = peer_rows[0]
+                    require(peer.get("ifname") == "eth0"
+                            and peer.get("linkinfo", {}).get("info_kind") == "veth"
+                            and peer.get("ifindex") == host_link_index
+                            and peer.get("link_index") == host_ifindex
+                            and type(peer.get("link_netnsid")) is int and peer["link_netnsid"] >= 0,
+                            "link-attribution")
             self.ip(end, "link", "del", "dev", name)
         require(not self.links_at(end, name), "link-residue")
 
@@ -283,6 +310,7 @@ class Resources:
         self.ip(end, "netns", "add", namespace)
         info = path.stat()
         state["identity"] = (info.st_dev, info.st_ino)
+        return state["identity"]
 
     def remove_namespace(self, node, identity, end, *, allow_unobserved=False):
         name = self.namespaces[node]
@@ -311,9 +339,10 @@ class Resources:
         self.ip(end, "link", "set", "dev", self.bridge, "addrgenmode", "none")
         for node, (address, mac) in NETWORK["nodes"].items():
             namespace = self.namespaces[node]
-            self.add_namespace(node, end)
+            ns_identity = self.add_namespace(node, end)
             link = self.links[node]
-            self.add_link(link, end, "type", "veth", "peer", "name", "eth0", "netns", namespace, kind="veth")
+            self.add_link(link, end, "type", "veth", "peer", "name", "eth0", "netns", namespace,
+                          kind="veth", peer_node=node, peer_ns_identity=ns_identity)
             self.ip(end, "link", "set", "dev", link, "master", self.bridge, "addrgenmode", "none")
             self.ns(end, node, "link", "set", "dev", "eth0", "address", mac, "addrgenmode", "none")
             self.ns(end, node, "address", "add", f"{address}/24", "dev", "eth0")
@@ -342,12 +371,11 @@ class Resources:
         config.write_text("\n".join(lines) + "\n", encoding="ascii")
         first_link = next(index for index, (label, _) in enumerate(self.cleanup_stack) if label == "link")
         handles = {}
-        for family in rules:
-            expected_chains = set(rules[family])
+        for family, chains in rules.items():
             self.cleanup_stack.insert(
                 first_link,
-                ("nft", lambda deadline, f=family, h=handles, c=expected_chains:
-                 self.remove_table(f, h.get(f), deadline, expected_chains=c)),
+                ("nft", lambda deadline, f=family, h=handles, c=chains:
+                 self.remove_table(f, h.get(f), deadline, expected_policy=c)),
             )
         self.nft(end, "-f", config)
         for family in rules:
@@ -359,7 +387,7 @@ class Resources:
         return json.loads(self.nft(end, "-j", "-a", "list", "table", family, self.table),
                           object_pairs_hook=unique_pairs)["nftables"]
 
-    def remove_table(self, family, handle, end, *, expected_chains=None):
+    def remove_table(self, family, handle, end, *, expected_policy=None):
         if f"table {family} {self.table}" not in self.nft(end, "list", "tables").splitlines():
             return
         require(not any(self.links_at(end, name) for name in (self.bridge, *self.links.values())),
@@ -369,24 +397,10 @@ class Resources:
         if handle is not None:
             require(current_handle == handle, "nft-attribution")
         else:
-            require(expected_chains is not None, "nft-attribution")
-            for row in rows:
-                if "metainfo" in row or "table" in row:
-                    continue
-                if "chain" in row:
-                    chain = row["chain"]
-                    require(chain.get("family") == family and chain.get("table") == self.table
-                            and chain.get("name") in expected_chains and chain.get("type") == "filter"
-                            and chain.get("prio") == -310 and chain.get("policy") == "accept",
-                            "nft-attribution")
-                elif "rule" in row:
-                    rule = row["rule"]
-                    require(rule.get("family") == family and rule.get("table") == self.table
-                            and rule.get("chain") in expected_chains
-                            and isinstance(rule.get("comment"), str) and rule["comment"].startswith("r2-"),
-                            "nft-attribution")
-                else:
-                    raise Refusal("nft-attribution")
+            require(expected_policy is not None, "nft-attribution")
+            # An atomic nft -f transaction commits the complete expected policy;
+            # verify both chains, hooks and every rule before deleting an unobserved table.
+            read_counters(rows, expected_policy, family, self.table)
         self.nft(end, "delete", "table", family, self.table)
         require(f"table {family} {self.table}" not in self.nft(end, "list", "tables").splitlines(),
                 "nft-residue")
