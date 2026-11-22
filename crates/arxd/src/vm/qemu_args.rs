@@ -35,7 +35,11 @@ pub struct BootRecipe<'a> {
     pub firmware: &'a Artifact,
     pub vars: &'a Artifact,
     pub disk: &'a Artifact,
+    /// First cluster of `disk`, read through its held custody pin.
+    pub disk_header: &'a [u8],
     pub backing: Option<&'a Artifact>,
+    /// First cluster of `backing`, present exactly when `backing` is.
+    pub backing_header: Option<&'a [u8]>,
     pub serial: &'a SerialName,
     pub boot: BootPurpose<'a>,
     pub ram_mib: u32,
@@ -175,12 +179,14 @@ fn offline_info_args<'a>(
     ))
 }
 
-/// Validated `qemu-img create` of a staging image. Holds the lease.
+/// Validated `qemu-img create` of a staging image. Holds the lease. A backed
+/// create checks the golden's first cluster: qemu-img opens the declared
+/// backing with traversal enabled, so it must itself be unbacked.
 pub(super) fn create<'a>(
     lease: &'a OfflineLease,
     image: &'a Artifact,
     staging: &Artifact,
-    backing: Option<&Artifact>,
+    backing: Option<(&Artifact, &[u8])>,
     size: u64,
     ceiling: u64,
 ) -> Result<CommandPlan<'a>, InvalidImage> {
@@ -198,7 +204,7 @@ pub(super) fn create<'a>(
 fn create_args<'a>(
     image: &'a Artifact,
     staging: &Artifact,
-    backing: Option<&Artifact>,
+    backing: Option<(&Artifact, &[u8])>,
     size: u64,
     ceiling: u64,
 ) -> Result<(&'a LocalPath, Vec<String>), InvalidImage> {
@@ -219,12 +225,13 @@ fn create_args<'a>(
     ]
     .map(str::to_owned)
     .to_vec();
-    if let Some(backing) = backing {
+    if let Some((golden, header)) = backing {
+        inspect_header(header, None)?;
         args.extend([
             "-F".into(),
             "qcow2".into(),
             "-b".into(),
-            role(backing, ArtifactRole::Golden)?.as_str().into(),
+            role(golden, ArtifactRole::Golden)?.as_str().into(),
         ]);
     }
     args.extend([
@@ -235,11 +242,23 @@ fn create_args<'a>(
 }
 
 impl BootRecipe<'_> {
+    /// Refuses with `InvalidPath` on any role, size or qcow2 metadata
+    /// violation. The disk may reference only the approved golden, the golden
+    /// must be unbacked, and neither may name an external data file.
     pub fn plan(&self) -> Result<CommandPlan<'_>, InvalidPath> {
         use ArtifactRole::*;
         if !(1..=4).contains(&self.vcpus) || !(256..=8192).contains(&self.ram_mib) {
             return Err(InvalidPath);
         }
+        let approved = match (self.backing, self.backing_header) {
+            (Some(golden), Some(header)) => {
+                inspect_header(header, None).map_err(|InvalidImage| InvalidPath)?;
+                Some(golden.path_for(Golden)?)
+            }
+            (None, None) => None,
+            _ => return Err(InvalidPath),
+        };
+        inspect_header(self.disk_header, approved).map_err(|InvalidImage| InvalidPath)?;
         let image = self.image.path_for(Qemu)?;
         let mut args: Vec<String> = [
             "-no-user-config",
@@ -365,10 +384,12 @@ mod tests {
         Artifact::new(role, LocalPath::parse(path).unwrap()).unwrap()
     }
 
+    /// A v11.1.3 `QCowHeader` (112 bytes, `block/qcow2.h`) with the optional
+    /// backing-format extension, the end marker and the backing name.
     fn header(backing: Option<&str>) -> Vec<u8> {
         let mut header = vec![0; CLUSTER];
         header[..4].copy_from_slice(b"QFI\xfb");
-        for (at, val) in [(4, 3u32), (20, 16), (96, 4), (100, 104)] {
+        for (at, val) in [(4, 3u32), (20, 16), (96, 4), (100, 112)] {
             header[at..at + 4].copy_from_slice(&val.to_be_bytes());
         }
         header[24..32].copy_from_slice(&1_048_576u64.to_be_bytes());
@@ -378,9 +399,9 @@ mod tests {
             header[16..20].copy_from_slice(&(backing.len() as u32).to_be_bytes());
             header[at..at + backing.len()].copy_from_slice(backing.as_bytes());
             // Backing-format extension "qcow2", then the end marker.
-            header[104..108].copy_from_slice(&0xe279_2acau32.to_be_bytes());
-            header[108..112].copy_from_slice(&5u32.to_be_bytes());
-            header[112..117].copy_from_slice(b"qcow2");
+            header[112..116].copy_from_slice(&0xe279_2acau32.to_be_bytes());
+            header[116..120].copy_from_slice(&5u32.to_be_bytes());
+            header[120..125].copy_from_slice(b"qcow2");
         }
         header
     }
@@ -434,7 +455,30 @@ mod tests {
 
         // create validation.
         let ceiling = 1 << 30;
-        assert!(create_args(&tool, &staging, Some(&golden), 1 << 20, ceiling).is_ok());
+        let unbacked = Some((&golden, plain.as_slice()));
+        assert!(create_args(&tool, &staging, unbacked, 1 << 20, ceiling).is_ok());
+        assert!(
+            create_args(
+                &tool,
+                &staging,
+                Some((&golden, backed.as_slice())),
+                1 << 20,
+                ceiling
+            )
+            .is_err(),
+            "golden with its own backing"
+        );
+        assert!(
+            create_args(
+                &tool,
+                &staging,
+                Some((&golden, corrupt.as_slice())),
+                1 << 20,
+                ceiling
+            )
+            .is_err(),
+            "golden with an external data file"
+        );
         assert!(
             create_args(&tool, &staging, None, 0, ceiling).is_err(),
             "zero size"
@@ -456,7 +500,14 @@ mod tests {
             "tool role"
         );
         assert!(
-            create_args(&tool, &staging, Some(&disk), 1 << 20, ceiling).is_err(),
+            create_args(
+                &tool,
+                &staging,
+                Some((&disk, plain.as_slice())),
+                1 << 20,
+                ceiling
+            )
+            .is_err(),
             "backing role"
         );
     }

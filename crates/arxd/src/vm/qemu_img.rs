@@ -11,34 +11,62 @@ const MAX_INFO: usize = 16_384;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidImage;
 
-/// Only the runtime recipe's qcow2 subset. Inspect the first cluster before
-/// allowing qemu-img to resolve any embedded reference.
+/// `QCowHeader` sizes in QEMU v11.1.3 `block/qcow2.h`: the version-3 fields
+/// end at byte 104 (`header_length` is at 100), and the 11.1.3 writer adds
+/// `compression_type` at 104 plus 7 padding bytes, for 112 in total.
+const V3_BASE: usize = 104;
+const V3_PINNED: usize = 112;
+/// `QCOW2_INCOMPAT_COMPRESSION` (bit 3). Every other incompatible bit is
+/// refused: dirty (0), corrupt (1), external data file (2), extended L2 (4)
+/// and anything unknown.
+const INCOMPAT_COMPRESSION: u64 = 1 << 3;
+/// `QCOW2_COMPRESSION_TYPE_ZLIB` and `QCOW2_COMPRESSION_TYPE_ZSTD`.
+const COMPRESSION_ZLIB: u8 = 0;
+const COMPRESSION_ZSTD: u8 = 1;
+/// QEMU limits a backing file name to 1023 bytes.
+const MAX_BACKING_NAME: usize = 1023;
+
+/// Only the runtime recipe's qcow2 subset, parsed against the pinned v11.1.3
+/// layout. Inspect the first cluster before allowing qemu-img or QEMU to
+/// resolve any embedded reference. `expected` is the one approved backing
+/// file; `None` requires an unbacked image.
 pub fn inspect_header(cluster: &[u8], expected: Option<&LocalPath>) -> Result<u64, InvalidImage> {
     if cluster.len() != CLUSTER || &cluster[..4] != b"QFI\xfb" {
         return Err(InvalidImage);
     }
     let u32_at = |i| u32::from_be_bytes(cluster[i..i + 4].try_into().unwrap());
     let u64_at = |i| u64::from_be_bytes(cluster[i..i + 8].try_into().unwrap());
+    let header_length = u32_at(100) as usize;
+    let compression = match header_length {
+        V3_BASE => COMPRESSION_ZLIB,
+        V3_PINNED if cluster[105..V3_PINNED].iter().all(|&byte| byte == 0) => cluster[104],
+        _ => return Err(InvalidImage),
+    };
+    let incompatible = match compression {
+        COMPRESSION_ZLIB => 0,
+        COMPRESSION_ZSTD => INCOMPAT_COMPRESSION,
+        _ => return Err(InvalidImage),
+    };
     let virtual_size = u64_at(24);
-    let offset = usize::try_from(u64_at(8)).map_err(|_| InvalidImage)?;
-    let len = u32_at(16) as usize;
     if u32_at(4) != 3
         || u32_at(20) != 16
         || virtual_size == 0
         || u32_at(32) != 0
         || u32_at(60) != 0
-        || u64_at(72) != 0
+        || u64_at(72) != incompatible
         || u64_at(80) != 0
         || u64_at(88) != 0
         || u32_at(96) != 4
-        || u32_at(100) != 104
     {
         return Err(InvalidImage);
     }
+    let offset = usize::try_from(u64_at(8)).map_err(|_| InvalidImage)?;
+    let len = u32_at(16) as usize;
     let end = match expected {
         None if offset == 0 && len == 0 => CLUSTER,
         Some(backing)
-            if offset >= 112
+            if len <= MAX_BACKING_NAME
+                && offset >= header_length + 8
                 && offset.checked_add(len).and_then(|e| cluster.get(offset..e))
                     == Some(backing.as_str().as_bytes()) =>
         {
@@ -46,7 +74,8 @@ pub fn inspect_header(cluster: &[u8], expected: Option<&LocalPath>) -> Result<u6
         }
         _ => return Err(InvalidImage),
     };
-    let mut entries = &cluster[104..end];
+    // Header extensions are bounded by the backing name or the first cluster.
+    let mut entries = &cluster[header_length..end];
     let mut backing_format = false;
     let mut feature_table = false;
     while entries.len() >= 8 {
@@ -63,6 +92,7 @@ pub fn inspect_header(cluster: &[u8], expected: Option<&LocalPath>) -> Result<u6
                 backing_format = true
             }
             0x6803_f857 if !feature_table && len.is_multiple_of(48) => feature_table = true,
+            // External data file, encryption, bitmaps and anything unknown.
             _ => return Err(InvalidImage),
         }
         entries = &entries[next..];
@@ -91,12 +121,13 @@ pub fn offline_info<'a>(
     qemu_args::offline_info(lease, image, disk, header, backing)
 }
 
-/// Exclusive qcow2 creation of a staging image under the offline lease.
+/// Exclusive qcow2 creation of a staging image under the offline lease. A
+/// backing golden comes with its first cluster, which must be unbacked.
 pub fn create<'a>(
     lease: &'a OfflineLease,
     image: &'a Artifact,
     staging: &Artifact,
-    backing: Option<&Artifact>,
+    backing: Option<(&Artifact, &[u8])>,
     size: u64,
     ceiling: u64,
 ) -> Result<CommandPlan<'a>, InvalidImage> {
