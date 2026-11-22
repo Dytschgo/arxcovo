@@ -36,6 +36,12 @@ class FixtureTests(unittest.TestCase):
                 modified = {**pins, "rootfs": {**pins["rootfs"], key: value}}
                 with self.assertRaisesRegex(fixture.Refusal, "pins-schema"):
                     fixture.check_pins(modified)
+        profiles = pins["host"]["profiles"]
+        for replacement in (profiles[:1], [profiles[0], profiles[0]],
+                            [{**profiles[0], "kernel": profiles[1]["kernel"]}, profiles[1]]):
+            modified = {**pins, "host": {**pins["host"], "profiles": replacement}}
+            with self.assertRaisesRegex(fixture.Refusal, "pins-schema"):
+                fixture.check_pins(modified)
         with self.assertRaisesRegex(fixture.Refusal, "duplicate-json-key"):
             json.loads('{"host": 1, "host": 2}', object_pairs_hook=fixture.unique_pairs)
 
@@ -108,28 +114,63 @@ class FixtureTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    @staticmethod
+    def hosted_env(profile):
+        head = "a"*40
+        return {**run.FIXED, "GITHUB_RUN_ID": "661", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": head,
+                "GITHUB_WORKFLOW_REF": run.REPO + "/.github/workflows/ci.yml@refs/pull/7/merge",
+                "GITHUB_WORKFLOW_SHA": head, "ImageOS": profile["image_os"],
+                "ImageVersion": profile["image_version"]}
+
     def test_userland_mismatch_refuses_before_privileged_resources(self):
         pins = fixture.load_pins()
-        mismatch = {**pins, "rootfs": {**pins["rootfs"], "userland": "24.04"}}
+        mismatch = {**pins, "rootfs": {**pins["rootfs"], "userland": "26.04"}}
         with self.assertRaisesRegex(fixture.Refusal, "offline-userland-input"):
             run.require_userland(mismatch)
-        matching = {**pins, "rootfs": {**pins["rootfs"], "userland": pins["host"]["os"]}}
-        run.require_userland(matching)
+        run.require_userland(pins)
 
     def test_provenance_refuses_mismatched_source_run_attempt_os_and_job(self):
-        head = "a"*40
         host = fixture.load_pins()["host"]
-        values = {**run.FIXED, "GITHUB_RUN_ID": "661", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": head,
-                  "GITHUB_WORKFLOW_REF": run.REPO + "/.github/workflows/ci.yml@refs/pull/7/merge",
-                  "GITHUB_WORKFLOW_SHA": head, "ImageOS": host["image_os"], "ImageVersion": host["image_version"]}
-        self.assertEqual(run.provenance(values, host, head)["head"], head)
+        values = self.hosted_env(host["profiles"][0])
+        head = values["GITHUB_SHA"]
+        receipt, selected = run.provenance(values, host, head)
+        self.assertEqual(receipt["head"], head)
+        self.assertEqual(selected, host["profiles"][0])
         for key, invalid in (("GITHUB_SHA", "b"*40), ("GITHUB_WORKFLOW_SHA", "b"*40), ("GITHUB_RUN_ID", "../../"),
                              ("GITHUB_RUN_ATTEMPT", "01"), ("GITHUB_WORKFLOW_REF", "another-workflow"),
-                             ("ImageOS", "ubuntu24"), ("ImageVersion", "new"), ("GITHUB_REPOSITORY", "outsider/fork"),
+                             ("ImageOS", "ubuntu26"), ("ImageVersion", "new"), ("GITHUB_REPOSITORY", "outsider/fork"),
                              ("RUNNER_ENVIRONMENT", "self-hosted"), ("GITHUB_JOB", "verify")):
             with self.subTest(key=key):
                 with self.assertRaises(fixture.Refusal):
                     run.provenance({**values, key: invalid}, host, head)
+
+    def test_each_runner_profile_requires_its_own_kernel_and_package(self):
+        host = fixture.load_pins()["host"]
+        first, second = host["profiles"]
+        for profile, other in ((first, second), (second, first)):
+            env = self.hosted_env(profile)
+            head = env["GITHUB_SHA"]
+            end = 1
+            with self.subTest(image=profile["image_version"]), patch.object(
+                run, "os_version", return_value="24.04"
+            ), patch.object(run.os, "uname", create=True) as uname, patch.object(
+                run, "host_command", return_value=profile["systemd_package"]
+            ) as package:
+                uname.return_value = SimpleNamespace(release=other["kernel"], machine="x86_64")
+                with self.assertRaisesRegex(fixture.Refusal, "runner-kernel-os"):
+                    run.checked_runner_platform(env, host, head, end)
+                package.assert_not_called()
+
+                uname.return_value = SimpleNamespace(release=profile["kernel"], machine="x86_64")
+                receipt = run.checked_runner_platform(env, host, head, end)
+                package.assert_called_once_with("dpkg", end, "-W", "-f=${Version}", "systemd")
+                self.assertEqual(receipt["image_version"], profile["image_version"])
+                self.assertEqual(receipt["kernel"], profile["kernel"])
+                self.assertEqual(receipt["systemd"], profile["systemd_package"])
+
+                package.return_value = "255.4-1ubuntu8.19"
+                with self.assertRaisesRegex(fixture.Refusal, "runner-systemd"):
+                    run.checked_runner_platform(env, host, head, end)
 
     def test_only_dry_dispatches_and_uses_no_legacy_driver(self):
         expected = {"first": None, "cleanup": "confirmed"}

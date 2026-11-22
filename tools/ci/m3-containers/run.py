@@ -42,10 +42,13 @@ def provenance(env, host, checkout):
     require(re.fullmatch(re.escape(REPO) + r"/\.github/workflows/ci\.yml@refs/(heads/main|pull/[1-9][0-9]{0,14}/merge)",
                          workflow) and env.get("GITHUB_WORKFLOW_SHA") == head == checkout,
             "source-workflow-head")
-    require(env.get("ImageOS") == host["image_os"] and env.get("ImageVersion") == host["image_version"],
-            "runner-image")
+    profiles = [profile for profile in host["profiles"]
+                if (profile["image_os"], profile["image_version"])
+                == (env.get("ImageOS"), env.get("ImageVersion"))]
+    require(len(profiles) == 1, "runner-image")
+    profile = profiles[0]
     return {"repo": REPO, "head": head, "run": run, "attempt": attempt, "job": "rust (ubuntu-latest)",
-            "image_os": host["image_os"], "image_version": host["image_version"]}
+            "image_os": profile["image_os"], "image_version": profile["image_version"]}, profile
 
 
 def require_userland(pins):
@@ -64,6 +67,17 @@ def os_version(file):
     return values.get("VERSION_ID")
 
 
+def checked_runner_platform(env, host, head, end):
+    receipt, profile = provenance(env, host, head)
+    uname = os.uname()
+    require(os_version(Path("/usr/lib/os-release")) == host["os"]
+            and uname.release == profile["kernel"] and uname.machine == "x86_64", "runner-kernel-os")
+    systemd = host_command("dpkg", end, "-W", "-f=${Version}", "systemd").strip()
+    require(systemd == profile["systemd_package"], "runner-systemd")
+    receipt.update(os=host["os"], kernel=uname.release, systemd=systemd)
+    return receipt
+
+
 def checked_metadata(env, pins, uid, end):
     require(sys.platform == "linux" and uid > 0, "hosted-entry")
     host = pins["host"]
@@ -73,13 +87,8 @@ def checked_metadata(env, pins, uid, end):
     plain_path(workspace, (0, uid), directory=True)
     plain_path(scratch, (0, uid), directory=True)
     head = host_command("git", end, "-c", f"safe.directory={workspace}", "-C", workspace, "rev-parse", "HEAD").strip()
-    receipt = provenance(env, host, head)
-    require(os_version(Path("/usr/lib/os-release")) == host["os"]
-            and os.uname().release == host["kernel"] and os.uname().machine == "x86_64", "runner-kernel-os")
-    systemd = host_command("dpkg", end, "-W", "-f=${Version}", "systemd").strip()
-    require(systemd == host["systemd_package"], "runner-systemd")
+    receipt = checked_runner_platform(env, host, head, end)
     require_userland(pins)
-    receipt.update(os=host["os"], kernel=host["kernel"], systemd=systemd)
     tools = {}
     for name, tool in TOOLS.items():
         resolved = Path(tool).resolve(strict=True)

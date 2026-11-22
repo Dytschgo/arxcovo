@@ -28,6 +28,12 @@ TOOLS = {
     "findmnt": "/usr/bin/findmnt", "ldd": "/usr/bin/ldd",
     "dpkg": "/usr/bin/dpkg-query", "git": "/usr/bin/git",
 }
+HOST_PROFILES = [
+    {"image_os": "ubuntu24", "image_version": "20261116.133.1",
+     "kernel": "7.0.0-1014-aws", "systemd_package": "255.4-1ubuntu8.18"},
+    {"image_os": "ubuntu24", "image_version": "20261116.376.1",
+     "kernel": "7.0.0-1017-azure", "systemd_package": "255.4-1ubuntu8.18"},
+]
 NETWORK = {
     "nodes": {node: [f"198.18.72.{i}", f"02:72:00:00:00:{i}"] for i, node in enumerate("abc", 11)},
     "prefix": 24, "ports": {"peer": 22171, "enrollment": 22172, "build": 22173, "forbidden": 22174},
@@ -68,24 +74,21 @@ def bounded_read(path, limit):
 def check_pins(pins):
     # Structural equality also rejects an unknown nested key. JSON canonical comparison
     # distinguishes bool, float and integer representations.
-    host = pins.get("host", {})
     expected = {
         "schema": "arxcovo/r2/1",
         "host": {
-            "label": "ubuntu-latest", "os": "26.04", "image_os": "ubuntu26",
-            "image_version": "20261116.202.1", "kernel": "7.0.0-1020-azure",
-            "systemd_package": "259.9-0ubuntu0.1", "rust": "1.95.0-x86_64-unknown-linux-gnu",
+            "label": "ubuntu-24.04", "os": "24.04", "profiles": HOST_PROFILES,
+            "rust": "1.95.0-x86_64-unknown-linux-gnu",
             "parent": "/var/lib", "tools": TOOLS,
         },
         "rootfs": {
-            "userland": pins.get("rootfs", {}).get("userland"),
+            "userland": "24.04",
             "bytes": 1024*MIB, "data_bytes": 256*MIB, "run_bytes": 4*MIB,
             "tmp_bytes": 8*MIB, "dev_bytes": MIB, "block_size": 4096, "data_inodes": 16384,
         },
         "roles": ROLES, "network": NETWORK, "outer": OUTER, "inner": INNER, "seconds": TIME,
     }
-    require(json.dumps(expected, sort_keys=True) == json.dumps(pins, sort_keys=True)
-            and expected["rootfs"]["userland"] in ("24.04", host.get("os")), "pins-schema")
+    require(json.dumps(expected, sort_keys=True) == json.dumps(pins, sort_keys=True), "pins-schema")
     return pins
 
 
