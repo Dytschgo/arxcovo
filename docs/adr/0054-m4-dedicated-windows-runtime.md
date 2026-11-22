@@ -57,6 +57,20 @@ prove endpoint access, instance-creation rights and disconnect behavior.
 Reconnect requires fresh endpoint proof. Failed or ambiguous identity
 returns a typed refusal.
 
+Same-account access is the accepted trust boundary. The default DACL grants
+the supervisor account `FILE_ALL_ACCESS`, which includes
+`FILE_CREATE_PIPE_INSTANCE`, `WRITE_DAC` and write-owner rights, so QEMU can
+create its endpoint and the supervisor can inspect it. Any process running
+under the supervisor SID can therefore also create a competing instance or
+rewrite the endpoint descriptor. The runtime cannot tell same-SID processes
+apart. The server-PID, liveness, Job-membership and handle-DACL checks bind
+one connection to the held child, but they do not exclude same-account code.
+The dedicated account must run only the supervisor and its Job children.
+Its full DACL access is part of that boundary, not a defect in the
+endpoint policy. The serial endpoint stays `GuestEndpointUnverified` until
+owner qualification covers the distinct-SID, NETWORK and wrong-PID cases on
+the exact build.
+
 QMP uses the startup hold `-S`. The single internal `cont` is available
 after valid capabilities, a prelaunch status, qualified endpoint custody and
 a fresh resource check. The guest protocol subsequently requires a fresh
@@ -76,6 +90,17 @@ components, unknown volume transitions and aliased file leaves. Activation
 requires evidence of actual capacity enforcement, immutable artifacts,
 safe layout and exclusive release.
 
+The configured drive letter must name a real volume root. Path custody
+resolves the drive root with `GetVolumeNameForVolumeMountPointW`, opens the
+returned `\\?\Volume{GUID}\` root and requires the same volume serial and
+file ID as the held drive-letter root handle. A `SUBST` drive or other
+drive-letter alias for a folder fails this check. The runtime profile does
+not yet carry a pinned volume identity. Before activation, the profile must
+pin the owner-prepared volume's GUID path and serial, and every custody pin
+must compare against that pin. A live identity that differs from it must
+refuse with `PathCustodyUnverified`. This is a gate before activation, not
+slice 3 behavior.
+
 WTS is the proposed owner activity source. The candidate samples local
 sessions, binds the local SAM account to the pinned SID, verifies session
 incarnation across queries and accepts only fresh, active, unlocked owner
@@ -87,10 +112,20 @@ qualification.
 
 ## Evidence and activation
 
-The scoped build reached the failure budget before nextest could run.
-The isolated Windows fixture launch, actual pipe ACL behavior, WHPX,
-dedicated-account Job enforcement, physical disk limits and WTS activity
-observations are **unverified on real hardware**. The optional Linux TCG
-fixture requires an explicit digest-pinned manifest and was not exercised.
+Default Windows tests use disposable NTFS paths and a child re-executed
+from the test binary. They need no WHPX or QEMU. They cover creation-time
+Job membership while suspended, the exact inherited-handle list, a forged
+pipe-server PID refused before any exchange, Job handle loss and supervisor
+loss. For supervisor loss, a disposable parent process owns the only Job
+handle and the observer holds only a wait handle on the grandchild. The
+same tests cover hard-link and rename refusal, junctions as an intermediate
+component and as a leaf, the volume-root binding, and exact-owner and
+ordered explicit-DACL matching with positive and negative cases. A
+restrictive outer runner Job is reported as a typed unsupported case. These
+tests ran under the developer's interactive account. Native WHPX, the
+dedicated standard account, effective pipe ACLs against distinct SIDs,
+physical disk ceilings and WTS owner activity are **unverified on real
+hardware**. The optional Linux TCG fixture requires an explicit
+digest-pinned manifest and was not exercised.
 The release gate stays closed pending independent review, passing checks
 and owner qualification of the exact package and native controls.
