@@ -3,7 +3,7 @@ use arxd::{
     config::{Config, VmRuntimeProfile},
     service::Shutdown,
     vm::{
-        guest::{FRAME_BOUND, GUEST_READY_BUDGET, GuestChannel, MAX_OPEN_CYCLES},
+        guest::{FRAME_BOUND, GUEST_READY_BUDGET, GuestChannel, MAX_CHALLENGES, RETRY_FIRST},
         paths::{Artifact, ArtifactRole, LocalPath},
         qemu_args::{BootPurpose, BootRecipe, GUEST_PORT_ID, NETWORK, PlanKind, SerialName},
         qemu_img,
@@ -759,24 +759,24 @@ type HostQmp = Qmp<tokio::io::ReadHalf<DuplexStream>, tokio::io::WriteHalf<Duple
 type Readiness =
     tokio::task::JoinHandle<(Result<GuestChannel<DuplexStream>, ChannelError>, HostQmp)>;
 
-/// A QMP peer past the startup `cont` that forwards injected events, and a
+/// A QMP peer past the startup `cont` that forwards injected raw bytes, and a
 /// serial pipe pair standing in for the verified Windows pipe. The paused
 /// tokio clock is the injected clock in every readiness test.
 async fn started_vm() -> (
     HostQmp,
-    tokio::sync::mpsc::UnboundedSender<Value>,
+    tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     DuplexStream,
     DuplexStream,
 ) {
     let (host, peer) = duplex(4096);
     let (read, write) = split(host);
-    let (events, mut inject) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let (events, mut inject) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     tokio::spawn(async move {
         let mut peer = BufReader::new(peer);
         hello(&mut peer).await;
         start(&mut peer).await;
-        while let Some(event) = inject.recv().await {
-            record(&mut peer, event).await;
+        while let Some(bytes) = inject.recv().await {
+            peer.get_mut().write_all(&bytes).await.unwrap();
         }
         std::future::pending::<()>().await;
     });
@@ -794,8 +794,12 @@ fn readiness(mut qmp: HostQmp, serial: DuplexStream, cancel: Shutdown) -> Readin
     })
 }
 
-fn port(open: bool) -> Value {
-    json!({"event": "VSERPORT_CHANGE", "data": {"id": GUEST_PORT_ID, "open": open}})
+fn line(record: Value) -> Vec<u8> {
+    format!("{record}\n").into_bytes()
+}
+
+fn port(open: bool) -> Vec<u8> {
+    line(json!({"event": "VSERPORT_CHANGE", "data": {"id": GUEST_PORT_ID, "open": open}}))
 }
 
 /// The next Hello the guest side receives, bounded so a missing one fails.
@@ -809,16 +813,22 @@ async fn guest_hello(guest: &mut DuplexStream) -> String {
     challenge
 }
 
-async fn guest_ack(guest: &mut DuplexStream, challenge: &str) {
-    guest_reply(
-        guest,
-        Response::HelloAck {
+fn ack_frame(challenge: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    write_frame(
+        &mut bytes,
+        &Response::HelloAck {
             version: 1,
             challenge: challenge.to_owned(),
             script_execution: ScriptExecution::Available,
         },
     )
-    .await;
+    .unwrap();
+    bytes
+}
+
+async fn guest_ack(guest: &mut DuplexStream, challenge: &str) {
+    guest.write_all(&ack_frame(challenge)).await.unwrap();
 }
 
 /// True when no byte has been written to the guest side. End of stream,
@@ -828,6 +838,34 @@ async fn quiet(guest: &mut DuplexStream) -> bool {
         tokio::time::timeout(Duration::from_millis(1), guest.read_u8()).await,
         Ok(Ok(_))
     )
+}
+
+/// Counts the Hellos waiting on the guest side, stopping at silence or EOF.
+async fn drain_hellos(guest: &mut DuplexStream) -> usize {
+    let mut count = 0;
+    loop {
+        let Ok(Ok(size)) = tokio::time::timeout(Duration::from_millis(1), guest.read_u32()).await
+        else {
+            return count;
+        };
+        let mut bytes = size.to_be_bytes().to_vec();
+        bytes.resize(4 + size as usize, 0);
+        guest.read_exact(&mut bytes[4..]).await.unwrap();
+        let request: Request = read_frame(&mut bytes.as_slice()).unwrap().unwrap();
+        assert!(matches!(request, Request::Hello { .. }), "expected hello");
+        count += 1;
+    }
+}
+
+/// Answers one Ping on the guest side.
+fn pong_once(mut guest: DuplexStream) -> tokio::task::JoinHandle<DuplexStream> {
+    tokio::spawn(async move {
+        let Request::Ping { id } = guest_request(&mut guest).await else {
+            panic!("expected ping")
+        };
+        guest_reply(&mut guest, Response::Pong { id }).await;
+        guest
+    })
 }
 
 fn polled_pending<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> bool {
@@ -885,80 +923,128 @@ async fn guest_requires_current_echo_support_and_matching_request_id() {
     }
 }
 
-/// OVMF's VirtioSerialDxe opens the port before Linux, QEMU moves the Hello
-/// into the firmware queue, and ExitBootServices resets it. The host must
-/// wait for the port, void the lost challenge and send Linux a fresh one.
+/// OVMF's VirtioSerialDxe opens the port before Linux and drops the Hello it
+/// takes at ExitBootServices. A close pauses retries; the next open gets a
+/// fresh challenge.
 #[tokio::test(start_paused = true)]
-async fn firmware_consumes_the_first_challenge_and_linux_gets_a_fresh_one() {
+async fn firmware_consumes_a_hello_and_the_next_open_gets_a_fresh_one() {
     let (qmp, events, serial, mut guest) = started_vm().await;
     let task = readiness(qmp, serial, Shutdown::default());
-    tokio::time::sleep(Duration::from_secs(30)).await;
-    assert!(
-        quiet(&mut guest).await,
-        "the host wrote before the port opened"
-    );
     events.send(port(true)).unwrap(); // firmware opens the port
-    let firmware = guest_hello(&mut guest).await; // drained into the firmware queue
-    events.send(port(false)).unwrap(); // ExitBootServices: the Hello is lost
+    let firmware = guest_hello(&mut guest).await; // never answered
+    events.send(port(false)).unwrap(); // ExitBootServices resets the queue
     tokio::time::sleep(Duration::from_secs(20)).await;
     assert!(
         quiet(&mut guest).await,
-        "the host wrote while the port was closed"
+        "retries continued while the port was closed"
     );
     events.send(port(true)).unwrap(); // the Linux service opens the port
     let fresh = guest_hello(&mut guest).await;
     assert_ne!(fresh, firmware);
     guest_ack(&mut guest, &fresh).await;
+    assert!(task.await.unwrap().0.is_ok());
+}
+
+/// A stale buffered Hello and the fresh one both reach the service, which
+/// answers each in order. The first valid echo is accepted, and the later
+/// ack, read in the same chunk, is skipped by the command channel.
+#[tokio::test(start_paused = true)]
+async fn stale_and_fresh_hellos_are_both_acked_and_the_first_echo_is_accepted() {
+    let (qmp, events, serial, mut guest) = started_vm().await;
+    let task = readiness(qmp, serial, Shutdown::default());
+    events.send(port(true)).unwrap(); // Hello 1, left buffered by firmware
+    events.send(port(false)).unwrap();
+    events.send(port(true)).unwrap(); // Hello 2 for the Linux service
+    let stale = guest_hello(&mut guest).await;
+    let fresh = guest_hello(&mut guest).await;
+    assert_ne!(stale, fresh);
+    let mut both = ack_frame(&stale);
+    both.extend(ack_frame(&fresh));
+    guest.write_all(&both).await.unwrap();
     let (result, _qmp) = task.await.unwrap();
-    assert!(result.is_ok());
+    let mut channel = result.unwrap();
+    let peer = pong_once(guest);
+    assert_eq!(channel.ping(&Shutdown::default()).await, Ok(()));
+    drop(peer.await.unwrap());
+}
+
+/// QEMU coalesces a rapid close and reopen into a repeated open.
+#[tokio::test(start_paused = true)]
+async fn a_coalesced_repeated_open_sends_a_fresh_challenge() {
+    let (qmp, events, serial, mut guest) = started_vm().await;
+    let task = readiness(qmp, serial, Shutdown::default());
+    events.send(port(true)).unwrap();
+    let lost = guest_hello(&mut guest).await;
+    events.send(port(true)).unwrap(); // no close was reported in between
+    let fresh = guest_hello(&mut guest).await;
+    assert_ne!(lost, fresh);
+    guest_ack(&mut guest, &fresh).await;
+    assert!(task.await.unwrap().0.is_ok());
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_echo_of_a_voided_challenge_is_never_accepted() {
-    let (qmp, events, serial, mut guest) = started_vm().await;
+async fn with_no_events_at_all_a_retry_reaches_the_guest() {
+    let (qmp, _events, serial, mut guest) = started_vm().await;
     let start = tokio::time::Instant::now();
     let task = readiness(qmp, serial, Shutdown::default());
-    events.send(port(true)).unwrap();
-    let voided = guest_hello(&mut guest).await;
-    events.send(port(false)).unwrap();
-    events.send(port(true)).unwrap();
-    let _fresh = guest_hello(&mut guest).await;
-    // Only the voided challenge is echoed; it is discarded, never accepted.
-    guest_ack(&mut guest, &voided).await;
-    let (result, _qmp) = task.await.unwrap();
-    assert_eq!(result.err(), Some(ChannelError::Timeout));
-    assert_eq!(start.elapsed(), GUEST_READY_BUDGET);
+    let challenge = guest_hello(&mut guest).await;
+    assert_eq!(start.elapsed(), RETRY_FIRST);
+    guest_ack(&mut guest, &challenge).await;
+    assert!(task.await.unwrap().0.is_ok());
 }
 
 #[tokio::test(start_paused = true)]
-async fn open_cycles_are_capped() {
+async fn issued_challenges_are_capped() {
     let (qmp, events, serial, mut guest) = started_vm().await;
     let task = readiness(qmp, serial, Shutdown::default());
-    for _ in 0..MAX_OPEN_CYCLES {
+    for _ in 0..=MAX_CHALLENGES {
         events.send(port(true)).unwrap();
-        guest_hello(&mut guest).await;
-        events.send(port(false)).unwrap();
     }
-    events.send(port(true)).unwrap();
     let (result, _qmp) = task.await.unwrap();
     assert_eq!(result.err(), Some(ChannelError::Refused));
-    assert!(quiet(&mut guest).await, "a Hello was sent past the cap");
+    assert_eq!(drain_hellos(&mut guest).await, MAX_CHALLENGES);
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_budget_spans_every_open_cycle() {
-    let (qmp, events, serial, mut guest) = started_vm().await;
+async fn the_budget_bounds_every_retry() {
+    let (qmp, _events, serial, mut guest) = started_vm().await;
     let start = tokio::time::Instant::now();
     let task = readiness(qmp, serial, Shutdown::default());
-    for _ in 0..3 {
-        tokio::time::sleep(Duration::from_secs(40)).await;
-        events.send(port(true)).unwrap();
-        guest_hello(&mut guest).await;
-        events.send(port(false)).unwrap();
-    }
     let (result, _qmp) = task.await.unwrap();
     assert_eq!(result.err(), Some(ChannelError::Timeout));
     assert_eq!(start.elapsed(), GUEST_READY_BUDGET);
+    // Retries at 1, 3, 7 and then every 8 s up to 175 s, all inside the budget.
+    let sent = drain_hellos(&mut guest).await;
+    assert!((20..=26).contains(&sent), "{sent} retries");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_challenge_from_outside_this_boot_is_rejected() {
+    let (qmp, events, serial, mut guest) = started_vm().await;
+    let task = readiness(qmp, serial, Shutdown::default());
+    events.send(port(true)).unwrap();
+    guest_hello(&mut guest).await;
+    guest_ack(&mut guest, &"a".repeat(32)).await;
+    assert_eq!(task.await.unwrap().0.err(), Some(ChannelError::Unexpected));
+}
+
+/// An open and the expired deadline are both ready on the first poll after
+/// expiry: no Hello may be written.
+#[tokio::test(start_paused = true)]
+async fn no_hello_is_written_at_or_after_the_deadline() {
+    let (mut qmp, events, serial, mut guest) = started_vm().await;
+    let cancel = Shutdown::default();
+    let mut ready = Box::pin(GuestChannel::ready(serial, &mut qmp, &cancel));
+    assert!(polled_pending(ready.as_mut())); // the deadline is fixed now
+    events.send(port(true)).unwrap();
+    // Let the QMP peer forward the event without polling `ready`.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    tokio::time::advance(GUEST_READY_BUDGET).await;
+    assert_eq!(ready.await.err(), Some(ChannelError::Timeout));
+    assert!(
+        quiet(&mut guest).await,
+        "a Hello was written after the deadline"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -966,10 +1052,13 @@ async fn other_ports_are_ignored_and_malformed_port_events_refuse() {
     let (qmp, events, serial, mut guest) = started_vm().await;
     let task = readiness(qmp, serial, Shutdown::default());
     events
-        .send(json!({"event": "VSERPORT_CHANGE", "data": {"id": "other-port", "open": true}}))
+        .send(line(
+            json!({"event": "VSERPORT_CHANGE", "data": {"id": "other-port", "open": true}}),
+        ))
         .unwrap();
-    events.send(json!({"event": "RESUME"})).unwrap();
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    events.send(line(json!({"event": "RESUME"}))).unwrap();
+    // Before the first 1 s retry: another port's open released no Hello.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         quiet(&mut guest).await,
         "another port's open released a Hello"
@@ -984,42 +1073,67 @@ async fn other_ports_are_ignored_and_malformed_port_events_refuse() {
         json!({"event": "VSERPORT_CHANGE", "data": {"id": GUEST_PORT_ID, "open": "yes"}}),
         json!({"event": "VSERPORT_CHANGE", "data": {"id": GUEST_PORT_ID, "open": true, "x": 1}}),
         json!({"event": "VSERPORT_CHANGE"}),
+        json!({
+            "event": "VSERPORT_CHANGE",
+            "data": {"id": GUEST_PORT_ID, "open": true},
+            "timestamp": {"seconds": 1, "microseconds": 1_000_000},
+        }),
     ] {
         let (qmp, events, serial, mut guest) = started_vm().await;
         let task = readiness(qmp, serial, Shutdown::default());
-        events.send(malformed).unwrap();
+        events.send(line(malformed)).unwrap();
         assert_eq!(task.await.unwrap().0.err(), Some(ChannelError::Invalid));
         assert!(quiet(&mut guest).await);
     }
 }
 
-/// QEMU stops reading the pipe while the port is closed, so a Hello written
-/// as firmware closed can stay buffered and reach the Linux service ahead of
-/// the fresh one. The service acks the stale Hello, then sees a second Hello,
-/// errors and exits; systemd restarts it. The host discards the stale echo
-/// and accepts only the latest challenge.
+/// The serial branch has consumed half an ack when a port event wins the
+/// select. The event is handled once, and the ack completes intact.
 #[tokio::test(start_paused = true)]
-async fn a_stale_buffered_hello_converges_through_a_service_restart() {
+async fn a_partial_reply_survives_losing_the_select_to_a_port_event() {
     let (qmp, events, serial, mut guest) = started_vm().await;
     let task = readiness(qmp, serial, Shutdown::default());
-    events.send(port(true)).unwrap(); // firmware opens; Hello 1 is written
-    events.send(port(false)).unwrap(); // firmware closes before QEMU drains it
-    events.send(port(true)).unwrap(); // Linux opens; Hello 2 is written
+    events.send(port(true)).unwrap();
     let first = guest_hello(&mut guest).await;
-    guest_ack(&mut guest, &first).await; // the service answers the stale Hello
-    let second = guest_hello(&mut guest).await; // duplicate Hello: protocol error
-    events.send(port(false)).unwrap(); // the service exits
-    events.send(port(true)).unwrap(); // systemd restarts it
-    let third = guest_hello(&mut guest).await;
-    assert!(first != second && second != third && first != third);
-    guest_ack(&mut guest, &third).await;
+    let ack = ack_frame(&first);
+    let (head, tail) = ack.split_at(ack.len() / 2);
+    guest.write_all(head).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    events.send(port(true)).unwrap(); // wins while the reply is partial
+    let second = guest_hello(&mut guest).await;
+    assert_ne!(first, second);
+    guest.write_all(tail).await.unwrap();
     let (result, _qmp) = task.await.unwrap();
-    assert!(result.is_ok());
+    let mut channel = result.unwrap();
+    // The guest answers the second Hello too; the channel skips that ack.
+    guest_ack(&mut guest, &second).await;
+    let peer = pong_once(guest);
+    assert_eq!(channel.ping(&Shutdown::default()).await, Ok(()));
+    drop(peer.await.unwrap());
+}
+
+/// The QMP branch has consumed half a port event when the retry timer wins
+/// the select. The record completes intact and yields exactly one open.
+#[tokio::test(start_paused = true)]
+async fn a_partial_qmp_record_survives_losing_the_select_to_a_retry() {
+    let (qmp, events, serial, mut guest) = started_vm().await;
+    let task = readiness(qmp, serial, Shutdown::default());
+    let open = port(true);
+    let (head, tail) = open.split_at(open.len() / 2);
+    events.send(head.to_vec()).unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let retried = guest_hello(&mut guest).await; // the 1 s retry won
+    events.send(tail.to_vec()).unwrap();
+    let opened = guest_hello(&mut guest).await; // one event, one Hello
+    assert_ne!(retried, opened);
+    guest_ack(&mut guest, &opened).await;
+    assert!(task.await.unwrap().0.is_ok());
+    assert!(quiet(&mut guest).await, "the event was duplicated");
 }
 
 #[tokio::test(start_paused = true)]
 async fn guest_readiness_tolerates_a_late_service_within_the_fixed_budget() {
-    // Opens late but inside the budget.
+    // The service answers late but inside the budget, here the oldest retry.
     let (qmp, events, serial, mut guest) = started_vm().await;
     let start = tokio::time::Instant::now();
     let task = readiness(qmp, serial, Shutdown::default());
@@ -1030,7 +1144,7 @@ async fn guest_readiness_tolerates_a_late_service_within_the_fixed_budget() {
     assert!(task.await.unwrap().0.is_ok());
     assert!(start.elapsed() >= GUEST_READY_BUDGET - Duration::from_secs(1));
 
-    // Never opens: refused exactly at the budget.
+    // Never answers: refused exactly at the budget.
     let (qmp, _events, serial, _guest) = started_vm().await;
     let start = tokio::time::Instant::now();
     let task = readiness(qmp, serial, Shutdown::default());
@@ -1040,11 +1154,10 @@ async fn guest_readiness_tolerates_a_late_service_within_the_fixed_budget() {
 
 #[tokio::test(start_paused = true)]
 async fn guest_readiness_refuses_unissued_garbage_and_stalled_acks() {
-    // An ack written before the port opened, for a challenge never issued.
-    let (qmp, events, serial, mut guest) = started_vm().await;
+    // An ack written before any Hello, for a challenge never issued.
+    let (qmp, _events, serial, mut guest) = started_vm().await;
     guest_ack(&mut guest, &"f".repeat(32)).await;
     let task = readiness(qmp, serial, Shutdown::default());
-    events.send(port(true)).unwrap();
     assert_eq!(task.await.unwrap().0.err(), Some(ChannelError::Unexpected));
     // An oversized frame prefix, and a well-sized frame that is not a response.
     for garbage in [u32::MAX.to_be_bytes().to_vec(), b"\0\0\0\x05junk!".to_vec()] {

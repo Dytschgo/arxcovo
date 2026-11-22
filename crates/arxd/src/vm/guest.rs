@@ -10,43 +10,53 @@ use arx_guest::protocol::{
 use std::time::Duration;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    time::{Instant, timeout_at},
+    time::{Instant, sleep_until, timeout_at},
 };
 
 /// Absolute budget, from the accepted startup `cont`, for the guest service
-/// to open its port and answer a fresh challenge. Fixed: no recipe, profile
-/// or caller can extend it.
+/// to answer a challenge issued in this boot. Fixed: no recipe, profile or
+/// caller can extend it.
 pub const GUEST_READY_BUDGET: Duration = Duration::from_secs(180);
 
 /// Once the first byte of a response arrives, the rest of that frame must
 /// arrive within this bound, inside any outer deadline.
 pub const FRAME_BOUND: Duration = Duration::from_secs(10);
 
-/// Port opens accepted during readiness: firmware, the guest service and a
-/// few service restarts. One more refuses.
-pub const MAX_OPEN_CYCLES: u8 = 8;
+/// Challenges a boot may issue. Issuing one more refuses.
+pub const MAX_CHALLENGES: usize = 32;
+
+/// Retry schedule while the port is not known to be closed: 1 s, then
+/// doubling to an 8 s cap. Each port open restarts it at 1 s.
+pub const RETRY_FIRST: Duration = Duration::from_secs(1);
+pub const RETRY_MAX: Duration = Duration::from_secs(8);
 
 /// Protocol state for a single authenticated transport. The Windows adapter
 /// must verify the held server and this exact pipe handle before constructing it.
 pub struct GuestChannel<T> {
     transport: Option<T>,
     next_id: u32,
+    /// Bytes already read past the accepted readiness reply, kept in order.
+    inbound: Inbound,
+    /// This boot's other challenges. A late ack for one is skipped once.
+    stale: Vec<String>,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> GuestChannel<T> {
-    /// Installed-boot readiness, driven by QEMU's port-state events.
+    /// Installed-boot readiness.
     ///
-    /// The v1 protocol is host-initiated: the guest service reads exactly one
-    /// `Hello` first and treats a second one as a protocol error. Firmware can
-    /// open the virtio-serial port before Linux (OVMF's VirtioSerialDxe does),
-    /// take a frame into its queue and reset that queue at ExitBootServices.
-    /// So the host writes nothing until `VSERPORT_CHANGE` reports our fixed
-    /// port open, and sends one fresh challenge per open. A close voids the
-    /// outstanding challenge: an echo of any voided challenge is discarded and
-    /// never accepted, and only an echo of the latest challenge, with scripts
-    /// available, completes readiness. Everything stays inside the fixed
-    /// `GUEST_READY_BUDGET` from the accepted `cont`, with at most
-    /// `MAX_OPEN_CYCLES` opens. There is no serial reconnect.
+    /// The guest service answers every `Hello` with an ack echoing it and
+    /// resets its session, so the host may send a fresh challenge whenever
+    /// it might have been lost. Firmware can open the port first and drop a
+    /// frame, and QEMU coalesces rapid `VSERPORT_CHANGE` close/open pairs.
+    /// The host therefore sends a fresh challenge on every reported open of
+    /// its port (including a repeated open) and on a 1/2/4/8 s retry schedule
+    /// while the port is not known to be closed; a close only pauses the
+    /// retries. Each challenge is a fresh nonce written only to this boot's
+    /// verified pipe, so an echo of any of them, with scripts available,
+    /// proves the guest service is live in this boot. A challenge not issued
+    /// in this boot, or a malformed or oversized frame, refuses. At most
+    /// `MAX_CHALLENGES` are issued, no write happens at or after the fixed
+    /// `GUEST_READY_BUDGET`, and there is no serial reconnect.
     pub async fn ready<R, W>(
         mut transport: T,
         qmp: &mut Qmp<R, W>,
@@ -57,54 +67,67 @@ impl<T: AsyncRead + AsyncWrite + Unpin> GuestChannel<T> {
         W: AsyncWrite + Unpin,
     {
         let ready_by = Instant::now() + GUEST_READY_BUDGET;
-        bounded(cancel, ready_by, async {
+        let mut inbound = Inbound::default();
+        let mut issued: Vec<String> = Vec::new();
+        let accepted = bounded(cancel, ready_by, async {
             let mut watch = PortWatch::default();
-            let mut inbound = Inbound::default();
-            let mut voided = Vec::new();
-            let mut current: Option<String> = None;
-            let mut opens = 0;
+            let mut delay = RETRY_FIRST;
+            // With no event yet the port state is unknown, so retries run.
+            let mut next_retry = Some(Instant::now() + RETRY_FIRST);
             loop {
-                let Some(challenge) = &current else {
-                    // Closed: the host never writes before the port opens.
-                    if qmp.port_change(GUEST_PORT_ID, &mut watch).await? {
-                        opens += 1;
-                        if opens > MAX_OPEN_CYCLES {
-                            return Err(ChannelError::Refused);
-                        }
-                        current = Some(send_hello(&mut transport).await?);
+                let retry_at = next_retry;
+                let retry = async move {
+                    match retry_at {
+                        Some(at) => sleep_until(at).await,
+                        None => std::future::pending().await,
                     }
-                    continue;
                 };
-                tokio::select! {
-                    // A close observed together with a reply wins: refuse
-                    // rather than accept an echo that may predate the close.
+                let send = tokio::select! {
                     biased;
                     open = qmp.port_change(GUEST_PORT_ID, &mut watch) => {
                         if open? {
-                            // QEMU reports changes only; open while open is not one.
-                            return Err(ChannelError::Unexpected);
+                            delay = RETRY_FIRST;
+                            true
+                        } else {
+                            // A close only pauses retries until the next open.
+                            next_retry = None;
+                            false
                         }
-                        voided.push(current.take().expect("an open port has a challenge"));
                     }
                     reply = inbound.next_frame(&mut transport) => match reply? {
                         Response::HelloAck {
-                            challenge: echo,
+                            challenge,
                             script_execution: ScriptExecution::Available,
                             ..
-                        } if echo == *challenge => break,
-                        // A late echo of a voided challenge, for example from a
-                        // guest that read a stale buffered Hello, is discarded.
-                        Response::HelloAck { challenge: echo, .. } if voided.contains(&echo) => {}
+                        } if issued.contains(&challenge) => return Ok(challenge),
                         _ => return Err(ChannelError::Unexpected),
                     },
+                    () = retry => {
+                        // The next retry waits twice as long, up to the cap.
+                        delay = (delay * 2).min(RETRY_MAX);
+                        true
+                    }
+                };
+                if send {
+                    if issued.len() == MAX_CHALLENGES {
+                        return Err(ChannelError::Refused);
+                    }
+                    // No write at or after the absolute cutoff.
+                    if Instant::now() >= ready_by {
+                        return Err(ChannelError::Timeout);
+                    }
+                    issued.push(send_hello(&mut transport).await?);
+                    next_retry = Some(Instant::now() + delay);
                 }
             }
-            Ok(())
         })
         .await?;
+        issued.retain(|challenge| *challenge != accepted);
         Ok(Self {
             transport: Some(transport),
             next_id: 1,
+            inbound,
+            stale: issued,
         })
     }
 
@@ -157,58 +180,41 @@ impl<T: AsyncRead + AsyncWrite + Unpin> GuestChannel<T> {
     ) -> Result<(T, Response), ChannelError> {
         let mut transport = self.transport.take().ok_or(ChannelError::Closed)?;
         self.next_id = self.next_id.checked_add(1).ok_or(ChannelError::Closed)?;
+        let inbound = &mut self.inbound;
+        let stale = &mut self.stale;
         let response = bounded(
             cancel,
             Instant::now() + Duration::from_secs(seconds),
-            exchange(&mut transport, &request),
+            async {
+                send_frame(&mut transport, &request).await?;
+                loop {
+                    match inbound.next_frame(&mut transport).await? {
+                        // A late ack for another of this boot's challenges, each
+                        // skipped at most once.
+                        Response::HelloAck { challenge, .. } if stale.contains(&challenge) => {
+                            stale.retain(|issued| *issued != challenge);
+                        }
+                        response => return Ok(response),
+                    }
+                }
+            },
         )
         .await?;
         Ok((transport, response))
     }
 }
 
-async fn exchange(
-    transport: &mut (impl AsyncRead + AsyncWrite + Unpin),
+async fn send_frame(
+    transport: &mut (impl AsyncWrite + Unpin),
     request: &Request,
-) -> Result<Response, ChannelError> {
+) -> Result<(), ChannelError> {
     let mut frame = Vec::new();
     write_frame(&mut frame, request).map_err(|_| ChannelError::Invalid)?;
     transport
         .write_all(&frame)
         .await
         .map_err(|_| ChannelError::Io)?;
-    transport.flush().await.map_err(|_| ChannelError::Io)?;
-    // Silence before the first byte is bounded only by the caller's deadline.
-    let mut prefix = [0; 4];
-    transport
-        .read_exact(&mut prefix[..1])
-        .await
-        .map_err(read_error)?;
-    let frame_by = Instant::now() + FRAME_BOUND;
-    let rest = async {
-        transport
-            .read_exact(&mut prefix[1..])
-            .await
-            .map_err(read_error)?;
-        let size = u32::from_be_bytes(prefix) as usize;
-        if !(1..=MAX_FRAME).contains(&size) {
-            return Err(ChannelError::Oversize);
-        }
-        frame.resize(size, 0);
-        transport.read_exact(&mut frame).await.map_err(read_error)
-    };
-    timeout_at(frame_by, rest)
-        .await
-        .map_err(|_| ChannelError::Timeout)??;
-    if Instant::now() >= frame_by {
-        return Err(ChannelError::Timeout);
-    }
-    read_frame(&mut std::io::Read::chain(
-        prefix.as_slice(),
-        frame.as_slice(),
-    ))
-    .map_err(|_| ChannelError::Invalid)?
-    .ok_or(ChannelError::Eof)
+    transport.flush().await.map_err(|_| ChannelError::Io)
 }
 
 /// Sends one fresh 128-bit challenge and returns it.
@@ -216,25 +222,20 @@ async fn send_hello(transport: &mut (impl AsyncWrite + Unpin)) -> Result<String,
     let mut random = [0; 16];
     getrandom::fill(&mut random).map_err(|_| ChannelError::Io)?;
     let challenge = hex::encode(random);
-    let mut frame = Vec::new();
-    write_frame(
-        &mut frame,
+    send_frame(
+        transport,
         &Request::Hello {
             version: PROTOCOL_VERSION,
             challenge: challenge.clone(),
         },
     )
-    .map_err(|_| ChannelError::Invalid)?;
-    transport
-        .write_all(&frame)
-        .await
-        .map_err(|_| ChannelError::Io)?;
-    transport.flush().await.map_err(|_| ChannelError::Io)?;
+    .await?;
     Ok(challenge)
 }
 
 /// Cancel-safe response framing for use inside `select!`. Bytes read so far
-/// and the time the current frame started persist across dropped calls.
+/// and the time the current frame started persist across dropped calls, and
+/// bytes past one frame stay buffered for the next call.
 #[derive(Default)]
 struct Inbound {
     bytes: Vec<u8>,

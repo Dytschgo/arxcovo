@@ -144,15 +144,22 @@ struct Timestamp {
 }
 
 impl Event {
-    fn guest_shutdown(self) -> Result<bool, ChannelError> {
+    /// The envelope check shared by every event, port events included.
+    fn envelope(&self) -> Result<(), ChannelError> {
         if self.event.is_empty()
             || self.event.len() > 64
             || self
                 .timestamp
+                .as_ref()
                 .is_some_and(|t| !(-1..1_000_000).contains(&t.microseconds))
         {
             return Err(ChannelError::Invalid);
         }
+        Ok(())
+    }
+
+    fn guest_shutdown(self) -> Result<bool, ChannelError> {
+        self.envelope()?;
         if self.event != "SHUTDOWN" {
             return Ok(false);
         }
@@ -402,6 +409,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
             let Record::Event(event) = stream.record().await? else {
                 return Err(ChannelError::Unexpected);
             };
+            event.envelope()?;
             if event.event == "VSERPORT_CHANGE" {
                 let data = event.data.ok_or(ChannelError::Invalid)?;
                 let change: PortChange = serde_json::from_value(Value::Object(data))
