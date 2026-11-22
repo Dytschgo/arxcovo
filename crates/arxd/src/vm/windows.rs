@@ -9,7 +9,10 @@ use super::{
     paths::{FileIdentity, LocalPath},
     qemu_args::{CommandPlan, PlanKind, SerialName},
     qmp::Qmp,
-    runtime::{LaunchAuthority, NativeRefusal, OfflineLease, StopDisposition, StopEvidence},
+    runtime::{
+        FRESHNESS, LaunchAuthority, NativeRefusal, OfflineLease, StopDisposition, StopEvidence,
+        fresh_observation,
+    },
 };
 use crate::{security::vm_acl, service::Shutdown};
 use std::{
@@ -203,10 +206,11 @@ fn open_relative(
         SecurityDescriptor: null(),
         SecurityQualityOfService: null(),
     };
+    // Every branch requests data access, so the pin participates in sharing
+    // checks: no branch shares delete, so rename and delete of a pinned
+    // object are refused. A writable leaf shares write for its consumer.
     let access = if create {
         FILE_GENERIC_WRITE | FILE_GENERIC_READ
-    } else if mutable {
-        FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE
     } else {
         FILE_GENERIC_READ | READ_CONTROL
     };
@@ -335,8 +339,14 @@ fn ptr_of<T>(value: &mut T) -> *mut core::ffi::c_void {
     std::ptr::from_mut(value).cast()
 }
 
+/// Owns a proc-thread attribute list and every value it references. Values
+/// are copied into boxed slices whose heap addresses never move. `Drop`
+/// destroys the list in its body, and Rust drops the fields, including the
+/// values, only afterwards. Every exit path, including creation errors,
+/// therefore keeps each value live through `DeleteProcThreadAttributeList`.
 struct Attributes {
     storage: Vec<usize>,
+    values: Vec<Box<[HANDLE]>>,
 }
 
 impl Attributes {
@@ -352,7 +362,10 @@ impl Attributes {
         succeeded(unsafe {
             InitializeProcThreadAttributeList(storage.as_mut_ptr().cast(), 2, 0, &mut bytes)
         })?;
-        Ok(Self { storage })
+        Ok(Self {
+            storage,
+            values: Vec::with_capacity(2),
+        })
     }
 
     fn pointer(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
@@ -360,14 +373,19 @@ impl Attributes {
     }
 
     fn insert(&mut self, attribute: usize, handles: &[HANDLE]) -> io::Result<()> {
-        // The caller retains the attribute value array until this list is destroyed.
+        // Retain the copy before the list can reference it, so even a failed
+        // update leaves no dangling value.
+        self.values.push(handles.into());
+        let value = self.values.last().expect("value retained above");
+        let (address, size) = (value.as_ptr(), size_of_val(&**value));
+        // The boxed value lives in this guard until after list destruction.
         succeeded(unsafe {
             UpdateProcThreadAttribute(
                 self.pointer(),
                 0,
                 attribute,
-                handles.as_ptr().cast(),
-                size_of_val(handles),
+                address.cast(),
+                size,
                 null_mut(),
                 null_mut(),
             )
@@ -378,6 +396,7 @@ impl Attributes {
 impl Drop for Attributes {
     fn drop(&mut self) {
         // Created by InitializeProcThreadAttributeList in this allocation.
+        // `self.values` is dropped only after this body returns.
         unsafe { DeleteProcThreadAttributeList(self.pointer()) };
     }
 }
@@ -693,16 +712,16 @@ fn create_suspended(
             });
         }
     }
-    // The Job array outlives the attribute list, which is destroyed below.
-    let jobs = match assignment {
-        Assignment::Job(job) => Some([job.0.as_raw_handle()]),
+    // The guard copies and owns each value until after list destruction.
+    match assignment {
+        Assignment::Job(job) => attributes
+            .insert(
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                &[job.0.as_raw_handle()],
+            )
+            .map_err(at(SpawnStage::Attributes))?,
         #[cfg(test)]
-        Assignment::ControlWithoutJob => None,
-    };
-    if let Some(jobs) = &jobs {
-        attributes
-            .insert(PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, jobs)
-            .map_err(at(SpawnStage::Attributes))?;
+        Assignment::ControlWithoutJob => {}
     }
     attributes
         .insert(PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, &handles)
@@ -1386,10 +1405,68 @@ impl Drop for WorkerSet {
     }
 }
 
+/// Freshness gate for host dispatch of the startup `cont`. While it is armed,
+/// the input worker starts a pipe write only before the sample deadline and
+/// requires the write to complete before it. A late or ambiguous write trips
+/// the gate permanently: the worker stops and closes the child's stdin, and the
+/// boot refuses even if QEMU acknowledged the command. This bounds host
+/// dispatch time only; when the guest actually starts executing is QEMU's.
+#[derive(Default)]
+struct DispatchGate {
+    state: std::sync::Mutex<GateState>,
+    #[cfg(test)]
+    stall: std::sync::Mutex<(Duration, Duration)>,
+}
+
+#[derive(Default)]
+struct GateState {
+    deadline: Option<std::time::Instant>,
+    tripped: bool,
+}
+
+impl DispatchGate {
+    fn state(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn arm(&self, deadline: std::time::Instant) {
+        self.state().deadline = Some(deadline);
+    }
+
+    /// Whether a write may start, or has completed, at `now`.
+    fn permits(&self, now: std::time::Instant) -> bool {
+        let mut state = self.state();
+        if state.deadline.is_some_and(|deadline| now >= deadline) {
+            state.tripped = true;
+        }
+        !state.tripped
+    }
+
+    /// Ends the window. Any write in it that missed the deadline refuses.
+    fn close(&self) -> Result<(), NativeRefusal> {
+        let mut state = self.state();
+        state.deadline = None;
+        if state.tripped {
+            Err(NativeRefusal::ReservesUnverified)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    fn stall(&self, before_write: bool) {
+        let (before, after) = *self.stall.lock().unwrap();
+        std::thread::sleep(if before_write { before } else { after });
+    }
+}
+
 /// Bounded asynchronous ends of the synchronous pipes. A full output buffer
 /// applies backpressure, and stderr is drained without retaining peer bytes.
 fn start_stdio(
     stdio: Stdio,
+    gate: std::sync::Arc<DispatchGate>,
 ) -> io::Result<(tokio::io::DuplexStream, tokio::io::DuplexStream, WorkerSet)> {
     use std::io::Write;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -1439,11 +1516,23 @@ fn start_stdio(
             if count == 0 || cancel.is_cancelled() {
                 break;
             }
+            #[cfg(test)]
+            gate.stall(true);
+            // Dispatch only within the armed sample's freshness window.
+            if !gate.permits(std::time::Instant::now()) {
+                break;
+            }
             if let Err(error) = pipe.write_all(&bytes[..count]) {
                 if cancel.is_cancelled() || error.kind() == io::ErrorKind::BrokenPipe {
                     break;
                 }
                 return Err(error);
+            }
+            #[cfg(test)]
+            gate.stall(false);
+            // A write that completed late is ambiguous delivery: fail closed.
+            if !gate.permits(std::time::Instant::now()) {
+                break;
             }
         }
         Ok(())
@@ -1533,6 +1622,7 @@ struct LaunchInputs<'a> {
 struct NativeLaunch<'a> {
     child: Child,
     workers: Option<WorkerSet>,
+    gate: std::sync::Arc<DispatchGate>,
     _pins: Vec<PathPin>,
     // A mutating qemu-img launch stays borrowed against its offline lease.
     _offline: Option<&'a OfflineLease>,
@@ -1549,9 +1639,9 @@ impl<'a> NativeLaunch<'a> {
         token: &VmToken,
         inputs: LaunchInputs<'a>,
     ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
-        // A mutating plan carries its lease by construction; refuse otherwise.
+        // Writable-image plans carry their lease by construction; refuse otherwise.
         let offline = match inputs.plan.kind() {
-            PlanKind::Mutate => Some(
+            PlanKind::Mutate | PlanKind::InspectWritable => Some(
                 inputs
                     .plan
                     .offline_lease()
@@ -1559,6 +1649,7 @@ impl<'a> NativeLaunch<'a> {
             ),
             PlanKind::Boot | PlanKind::Inspect => None,
         };
+        let gate = std::sync::Arc::new(DispatchGate::default());
         let (stdio, parent) = token.stdio().map_err(|_| NativeRefusal::QmpUnverified)?;
         let job = Job::new(inputs.memory, Some(inputs.cpu_rate))
             .map_err(|_| NativeRefusal::JobUnverified)?;
@@ -1581,11 +1672,12 @@ impl<'a> NativeLaunch<'a> {
             .verify(&actual)
             .map_err(|_| NativeRefusal::IdentityUnverified)?;
         let (read, write, workers) =
-            start_stdio(parent).map_err(|_| NativeRefusal::QmpUnverified)?;
+            start_stdio(parent, gate.clone()).map_err(|_| NativeRefusal::QmpUnverified)?;
         Ok((
             Self {
                 child,
                 workers: Some(workers),
+                gate,
                 _pins: inputs.pins,
                 _offline: offline,
             },
@@ -1601,7 +1693,8 @@ impl<'a> NativeLaunch<'a> {
         read: tokio::io::DuplexStream,
         write: tokio::io::DuplexStream,
         cancel: &Shutdown,
-        mut revalidate: impl FnMut() -> Result<(), NativeRefusal>,
+        // Returns the monotonic capture time of a fresh resource sample.
+        mut revalidate: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
     ) -> Result<(PipeQmp, SerialGuest), NativeRefusal> {
         self.child.resume_checked(cancel, &mut revalidate)?;
         // Workers are already draining. Do not await the QMP greeting while
@@ -1618,19 +1711,27 @@ impl<'a> NativeLaunch<'a> {
         let mut qmp = Qmp::handshake(read, write, cancel)
             .await
             .map_err(|_| NativeRefusal::QmpUnverified)?;
-        // Resample between the prelaunch status receipt and `cont`, so guest
-        // execution never starts on a sample older than the freshness window.
+        // Resample between the prelaunch status receipt and `cont`, and arm the
+        // input worker with that sample's deadline, so the `cont` bytes reach
+        // the child's stdin only while the sample is fresh.
         let mut refused = None;
+        let gate = self.gate.clone();
         let released = qmp
             .release_startup_hold(cancel, || match revalidate() {
-                Ok(()) => true,
+                Ok(captured) => {
+                    gate.arm(captured + FRESHNESS);
+                    true
+                }
                 Err(reason) => {
                     refused = Some(reason);
                     false
                 }
             })
             .await;
+        let dispatched_in_time = self.gate.close();
         released.map_err(|_| refused.unwrap_or(NativeRefusal::QmpUnverified))?;
+        // QEMU may acknowledge a `cont` that reached it late; refuse anyway.
+        dispatched_in_time?;
         let guest = GuestChannel::handshake(pipe, cancel)
             .await
             .map_err(|_| NativeRefusal::GuestEndpointUnverified)?;
@@ -1688,14 +1789,19 @@ impl Child {
     fn resume_checked(
         &mut self,
         cancel: &Shutdown,
-        revalidate: &mut dyn FnMut() -> Result<(), NativeRefusal>,
+        revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
         if cancel.is_cancelled() {
             return Err(NativeRefusal::JobUnverified);
         }
         self.verify_live()
             .map_err(|_| NativeRefusal::JobUnverified)?;
-        revalidate()?;
+        let captured = revalidate()?;
+        fresh_observation(
+            captured,
+            std::time::Instant::now(),
+            NativeRefusal::ReservesUnverified,
+        )?;
         self.resume().map_err(|_| NativeRefusal::JobUnverified)
     }
 }
@@ -1875,8 +1981,19 @@ mod tests {
         // The suspended control never runs an instruction; discard it.
         succeeded(unsafe { TerminateProcess(process.as_raw_handle(), 1) }).unwrap();
         assert!(wait(&process, 2000).unwrap());
-        println!("SKIP vm-job-fixture: {UNSUPPORTED}");
-        eprintln!("SKIP vm-job-fixture: {UNSUPPORTED}");
+        skip_unsupported("vm-job-fixture");
+    }
+
+    /// A local skip stays visible on stdout and stderr. Hosted CI, which sets
+    /// `CI=true`, must take the supported path, so a skip there fails.
+    fn skip_unsupported(context: &str) {
+        let line = format!("SKIP {context}: {UNSUPPORTED}");
+        println!("{line}");
+        eprintln!("{line}");
+        assert!(
+            std::env::var_os("CI").is_none_or(|value| value != "true"),
+            "{line}; CI=true requires the supported Job path"
+        );
     }
 
     #[test]
@@ -1929,7 +2046,7 @@ mod tests {
         };
         let pid = child.verify_live().unwrap();
         assert_eq!(child.job.active().unwrap(), 1);
-        let (mut read, mut write, workers) = start_stdio(stdio).unwrap();
+        let (mut read, mut write, workers) = start_stdio(stdio, Default::default()).unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(30), read.read_u8())
                 .await
@@ -1952,7 +2069,7 @@ mod tests {
             return;
         };
         let process = child.process.try_clone().unwrap();
-        let (mut read, _write, workers) = start_stdio(stdio).unwrap();
+        let (mut read, _write, workers) = start_stdio(stdio, Default::default()).unwrap();
         child.resume().unwrap();
         ready(&mut read).await;
         assert!(!wait(&process, 0).unwrap());
@@ -2425,6 +2542,8 @@ mod tests {
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", SUPERVISOR, "--ignored", "--nocapture"])
                 .env(NONCE, &nonce)
+                // The parent reports; this observer applies the CI policy.
+                .env_remove("CI")
                 .stdin(Pipe::null())
                 .stdout(Pipe::piped())
                 .stderr(Pipe::null())
@@ -2448,8 +2567,7 @@ mod tests {
         let fields: Vec<&str> = report.split(' ').collect();
         let pid: u32 = match fields.as_slice() {
             ["ARX_SUPERVISOR_UNSUPPORTED", seen] if *seen == nonce => {
-                println!("SKIP vm-supervisor-loss: {UNSUPPORTED}");
-                eprintln!("SKIP vm-supervisor-loss: {UNSUPPORTED}");
+                skip_unsupported("vm-supervisor-loss");
                 return;
             }
             ["ARX_SUPERVISOR", pid, seen] if *seen == nonce => pid.parse().unwrap(),
@@ -2554,7 +2672,7 @@ mod tests {
         let Some((mut child, stdio)) = fixture_launch(0) else {
             return;
         };
-        let (mut read, mut write, workers) = start_stdio(stdio).unwrap();
+        let (mut read, mut write, workers) = start_stdio(stdio, Default::default()).unwrap();
         let mut calls = 0;
         let fresh = Shutdown::default();
         let refused = child.resume_checked(&fresh, &mut || {
@@ -2575,7 +2693,7 @@ mod tests {
         cancelled.cancel();
         let refused = child.resume_checked(&cancelled, &mut || {
             calls += 1;
-            Ok(())
+            Ok(std::time::Instant::now())
         });
         assert_eq!(refused, Err(NativeRefusal::JobUnverified));
         assert_eq!(calls, 1);
@@ -2583,7 +2701,7 @@ mod tests {
         child
             .resume_checked(&fresh, &mut || {
                 calls += 1;
-                Ok(())
+                Ok(std::time::Instant::now())
             })
             .unwrap();
         assert_eq!(calls, 2);
@@ -2592,5 +2710,193 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         child.reap(deadline).await.unwrap();
         workers.join(deadline).await.unwrap();
+    }
+
+    #[test]
+    fn attribute_values_outlive_the_list_on_a_creation_error() {
+        let job = Job::new(64 * 1024 * 1024, None).unwrap();
+        // The guard copies values, so a caller's temporary array may end first.
+        let mut attributes = Attributes::new().unwrap();
+        {
+            let temporary = [job.0.as_raw_handle()];
+            attributes
+                .insert(PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, &temporary)
+                .unwrap();
+            assert_ne!(attributes.values[0].as_ptr(), temporary.as_ptr());
+        }
+        assert_eq!(&*attributes.values[0], &[job.0.as_raw_handle()]);
+        drop(attributes);
+        // Failure injection: both attributes are set, then creation fails.
+        let (child_io, _parent_io) = fixture_stdio();
+        let image = std::env::current_exe().unwrap();
+        let missing = image.with_file_name("arx-missing-fixture-image.exe");
+        let args: [String; 0] = [];
+        let launch = Launch::Fixture {
+            image: &missing,
+            args: &args,
+        };
+        for _ in 0..32 {
+            let failure = create_suspended(
+                &launch,
+                image.parent().unwrap(),
+                &fixture_environment(0),
+                Assignment::Job(&job),
+                &child_io,
+            )
+            .unwrap_err();
+            assert_eq!(failure.stage, SpawnStage::Create);
+            assert_eq!(
+                failure.error.raw_os_error(),
+                Some(ERROR_FILE_NOT_FOUND as i32)
+            );
+        }
+        assert_eq!(job.active().unwrap(), 0);
+    }
+
+    const CONT: &[u8] = b"{\"execute\":\"cont\",\"id\":3}\n";
+
+    /// Bytes waiting in the child's stdin pipe, without consuming them.
+    fn queued(pipe: &OwnedHandle) -> u32 {
+        let mut available = 0;
+        // Peek only reports the count; a closed writer with no data is zero.
+        let ok = unsafe {
+            PeekNamedPipe(
+                pipe.as_raw_handle(),
+                null_mut(),
+                0,
+                null_mut(),
+                &mut available,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(ERROR_BROKEN_PIPE as i32)
+            );
+            return 0;
+        }
+        available
+    }
+
+    async fn settle(pipe: &OwnedHandle, expected: usize) -> usize {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while (queued(pipe) as usize) < expected && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        queued(pipe) as usize
+    }
+
+    #[tokio::test]
+    async fn input_worker_refuses_a_cont_dispatched_after_the_sample_deadline() {
+        let (child_io, parent_io) = fixture_stdio();
+        let gate = std::sync::Arc::new(DispatchGate::default());
+        let (_read, mut write, workers) = start_stdio(parent_io, gate.clone()).unwrap();
+        // Positive control: a fresh sample lets the record reach the child.
+        gate.arm(std::time::Instant::now() + FRESHNESS);
+        write.write_all(CONT).await.unwrap();
+        assert_eq!(settle(&child_io.input, CONT.len()).await, CONT.len());
+        assert_eq!(gate.close(), Ok(()));
+        // QMP queues `cont` inside the window, but the worker reaches the
+        // pipe only after the sample deadline has passed.
+        *gate.stall.lock().unwrap() = (Duration::from_millis(150), Duration::ZERO);
+        gate.arm(std::time::Instant::now() + Duration::from_millis(50));
+        write.write_all(CONT).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            queued(&child_io.input) as usize,
+            CONT.len(),
+            "a `cont` reached the child after the sample expired"
+        );
+        assert_eq!(gate.close(), Err(NativeRefusal::ReservesUnverified));
+        assert!(
+            workers.workers[1].0.is_finished(),
+            "the input worker kept the child's stdin open"
+        );
+        workers
+            .join(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cont_write_completing_after_the_deadline_fails_closed() {
+        let (child_io, parent_io) = fixture_stdio();
+        let gate = std::sync::Arc::new(DispatchGate::default());
+        let (_read, mut write, workers) = start_stdio(parent_io, gate.clone()).unwrap();
+        // The write starts in time but is only known complete after the deadline.
+        *gate.stall.lock().unwrap() = (Duration::ZERO, Duration::from_millis(150));
+        gate.arm(std::time::Instant::now() + Duration::from_millis(50));
+        write.write_all(CONT).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(queued(&child_io.input) as usize, CONT.len());
+        assert_eq!(gate.close(), Err(NativeRefusal::ReservesUnverified));
+        assert!(
+            workers.workers[1].0.is_finished(),
+            "the input stayed open after an ambiguous dispatch"
+        );
+        workers
+            .join(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn an_existing_writable_leaf_pin_refuses_rename_and_delete() {
+        let (_dir, root) = fixture_root();
+        let disk = format!(r"{root}\disk.qcow2");
+        let moved = format!(r"{root}\moved.qcow2");
+        std::fs::write(&disk, b"existing").unwrap();
+        let pin = PathPin::open(&LocalPath::parse(&disk).unwrap(), false, true).unwrap();
+        assert!(std::fs::rename(&disk, &moved).is_err(), "rename succeeded");
+        assert!(std::fs::remove_file(&disk).is_err(), "delete succeeded");
+        // The link count is checked once at pin time; the held pin then
+        // refuses a new alias (observed as a sharing violation).
+        assert!(
+            std::fs::hard_link(&disk, format!(r"{root}\alias.qcow2")).is_err(),
+            "hard link added to a pinned leaf"
+        );
+        // The consumer can still open the pinned disk for read and write.
+        let consumer = OpenOptions::new().read(true).write(true).open(&disk);
+        assert!(consumer.is_ok(), "pin excludes its read/write consumer");
+        drop((consumer, pin));
+        // Control: without the pin the same rename succeeds.
+        std::fs::rename(&disk, &moved).unwrap();
+    }
+
+    /// The parent of an exclusive create can be empty, so the nonempty-directory
+    /// rule does not protect it. Whatever the file system allows, creation
+    /// must not land in the junction target.
+    #[test]
+    fn a_junction_on_an_empty_pinned_parent_does_not_redirect_creation() {
+        let (_dir, root) = fixture_root();
+        let a = format!(r"{root}\a");
+        let elsewhere = format!(r"{root}\elsewhere");
+        for dir in [&a, &elsewhere] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let path = LocalPath::parse(&format!(r"{a}\new.img")).unwrap();
+        let mut converted = None;
+        let result = PathPin::pin_observed(&path, false, true, true, &mut |pinned| {
+            if pinned == a {
+                converted = Some(set_junction(&a, &elsewhere, FILE_WRITE_ATTRIBUTES));
+            }
+        });
+        let converted = converted.expect("the race hook did not run");
+        println!(
+            "empty pinned parent: junction via attribute-only handle = {:?}; walk = {}",
+            converted.as_ref().map_err(|error| error.raw_os_error()),
+            if result.is_ok() { "pinned" } else { "refused" }
+        );
+        assert!(
+            !Path::new(&format!(r"{elsewhere}\new.img")).exists(),
+            "creation followed a junction set on a pinned parent"
+        );
+        // Either the conversion is refused or the relative walk refuses.
+        assert!(converted.is_err() || result.is_err());
+        if converted.is_ok() {
+            drop(result);
+            std::fs::remove_dir(&a).unwrap();
+        }
     }
 }

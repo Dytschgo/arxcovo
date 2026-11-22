@@ -1,5 +1,6 @@
 use super::{
     paths::{Artifact, ArtifactRole, InvalidPath, LocalPath},
+    qemu_img::{CLUSTER, InvalidImage, inspect_header},
     runtime::OfflineLease,
 };
 use serde_json::{Value, json};
@@ -41,26 +42,33 @@ pub struct BootRecipe<'a> {
     pub vcpus: u32,
 }
 
-/// What a sealed plan does. Only the typed builders in this module choose it.
+/// What a sealed plan does. Only the validated builders in this module choose it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlanKind {
     /// The fixed QEMU recipe.
     Boot,
-    /// Read-only qemu-img inspection of a trusted artifact.
+    /// Read-only qemu-img inspection of the immutable golden image.
     Inspect,
-    /// Mutating qemu-img operation, bound to a borrowed offline lease.
+    /// qemu-img inspection of a writable image, bound to an offline lease.
+    InspectWritable,
+    /// Mutating qemu-img operation, bound to an offline lease.
     Mutate,
 }
 
 enum Binding<'a> {
     Boot,
     Inspect,
-    Mutate(&'a OfflineLease),
+    Offline {
+        lease: &'a OfflineLease,
+        mutate: bool,
+    },
 }
 
-/// A sealed program image and argv. The fields are private and the only
-/// constructors are this module's operation-specific builders, so no caller
-/// can construct, extend or edit the argv the native launcher consumes.
+/// A sealed program image and argv. The fields are private. The only
+/// constructors are this module's validated builders: `BootRecipe::plan`,
+/// `golden_info`, `offline_info` and `create`. Each one checks roles, header
+/// and size before it returns a plan, so no crate-internal caller can mint an
+/// unvalidated plan or edit the argv the native launcher consumes.
 pub struct CommandPlan<'a> {
     image: &'a LocalPath,
     args: Vec<String>,
@@ -80,39 +88,128 @@ impl<'a> CommandPlan<'a> {
         match self.binding {
             Binding::Boot => PlanKind::Boot,
             Binding::Inspect => PlanKind::Inspect,
-            Binding::Mutate(_) => PlanKind::Mutate,
+            Binding::Offline { mutate: false, .. } => PlanKind::InspectWritable,
+            Binding::Offline { mutate: true, .. } => PlanKind::Mutate,
         }
     }
 
-    /// Present exactly for mutating plans; the launcher keeps it borrowed.
+    /// Present exactly for writable-image plans; the launcher keeps it
+    /// borrowed for the whole helper launch.
     pub fn offline_lease(&self) -> Option<&'a OfflineLease> {
         match self.binding {
-            Binding::Mutate(lease) => Some(lease),
+            Binding::Offline { lease, .. } => Some(lease),
             Binding::Boot | Binding::Inspect => None,
         }
     }
 }
 
-/// Fixed read-only `qemu-img info` of an already role-checked image.
-pub(super) fn qemu_img_info<'a>(image: &'a LocalPath, disk: &LocalPath) -> CommandPlan<'a> {
-    CommandPlan {
-        image,
-        args: ["info", "--output=json", "-f", "qcow2", disk.as_str()]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        binding: Binding::Inspect,
-    }
+fn role(artifact: &Artifact, role: ArtifactRole) -> Result<&LocalPath, InvalidImage> {
+    artifact.path_for(role).map_err(|InvalidPath| InvalidImage)
 }
 
-/// Fixed `qemu-img create` on a staging role. Requires the offline lease.
-pub(super) fn qemu_img_create<'a>(
+fn info_args(disk: &LocalPath) -> Vec<String> {
+    ["info", "--output=json", "-f", "qcow2", disk.as_str()]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Validated read-only `qemu-img info` of the immutable golden image.
+pub(super) fn golden_info<'a>(
+    image: &'a Artifact,
+    golden: &Artifact,
+    header: &[u8],
+) -> Result<CommandPlan<'a>, InvalidImage> {
+    let (image, args) = golden_info_args(image, golden, header)?;
+    Ok(CommandPlan {
+        image,
+        args,
+        binding: Binding::Inspect,
+    })
+}
+
+fn golden_info_args<'a>(
+    image: &'a Artifact,
+    golden: &Artifact,
+    header: &[u8],
+) -> Result<(&'a LocalPath, Vec<String>), InvalidImage> {
+    inspect_header(header, None)?;
+    Ok((
+        role(image, ArtifactRole::QemuImg)?,
+        info_args(role(golden, ArtifactRole::Golden)?),
+    ))
+}
+
+/// Validated `qemu-img info` of a writable guest disk. Holds the lease.
+pub(super) fn offline_info<'a>(
     lease: &'a OfflineLease,
-    image: &'a LocalPath,
-    staging: &LocalPath,
-    backing: Option<&LocalPath>,
+    image: &'a Artifact,
+    disk: &Artifact,
+    header: &[u8],
+    backing: Option<&Artifact>,
+) -> Result<CommandPlan<'a>, InvalidImage> {
+    let (image, args) = offline_info_args(image, disk, header, backing)?;
+    Ok(CommandPlan {
+        image,
+        args,
+        binding: Binding::Offline {
+            lease,
+            mutate: false,
+        },
+    })
+}
+
+fn offline_info_args<'a>(
+    image: &'a Artifact,
+    disk: &Artifact,
+    header: &[u8],
+    backing: Option<&Artifact>,
+) -> Result<(&'a LocalPath, Vec<String>), InvalidImage> {
+    let backing = backing
+        .map(|artifact| role(artifact, ArtifactRole::Golden))
+        .transpose()?;
+    inspect_header(header, backing)?;
+    Ok((
+        role(image, ArtifactRole::QemuImg)?,
+        info_args(role(disk, ArtifactRole::GuestDisk)?),
+    ))
+}
+
+/// Validated `qemu-img create` of a staging image. Holds the lease.
+pub(super) fn create<'a>(
+    lease: &'a OfflineLease,
+    image: &'a Artifact,
+    staging: &Artifact,
+    backing: Option<&Artifact>,
     size: u64,
-) -> CommandPlan<'a> {
+    ceiling: u64,
+) -> Result<CommandPlan<'a>, InvalidImage> {
+    let (image, args) = create_args(image, staging, backing, size, ceiling)?;
+    Ok(CommandPlan {
+        image,
+        args,
+        binding: Binding::Offline {
+            lease,
+            mutate: true,
+        },
+    })
+}
+
+fn create_args<'a>(
+    image: &'a Artifact,
+    staging: &Artifact,
+    backing: Option<&Artifact>,
+    size: u64,
+    ceiling: u64,
+) -> Result<(&'a LocalPath, Vec<String>), InvalidImage> {
+    let cluster = CLUSTER as u64;
+    let peak = size
+        .div_ceil(cluster)
+        .checked_mul(cluster + 32)
+        .and_then(|n| n.checked_add(4 * cluster));
+    if size == 0 || peak.is_none_or(|peak| peak > ceiling) {
+        return Err(InvalidImage);
+    }
     let mut args = [
         "create",
         "-f",
@@ -127,15 +224,14 @@ pub(super) fn qemu_img_create<'a>(
             "-F".into(),
             "qcow2".into(),
             "-b".into(),
-            backing.as_str().into(),
+            role(backing, ArtifactRole::Golden)?.as_str().into(),
         ]);
     }
-    args.extend([staging.as_str().into(), size.to_string()]);
-    CommandPlan {
-        image,
-        args,
-        binding: Binding::Mutate(lease),
-    }
+    args.extend([
+        role(staging, ArtifactRole::Staging)?.as_str().into(),
+        size.to_string(),
+    ]);
+    Ok((role(image, ArtifactRole::QemuImg)?, args))
 }
 
 impl BootRecipe<'_> {
@@ -259,4 +355,109 @@ fn block(
         spec["backing"] = backing;
     }
     args.extend(["-blockdev".into(), spec.to_string()]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artifact(role: ArtifactRole, path: &str) -> Artifact {
+        Artifact::new(role, LocalPath::parse(path).unwrap()).unwrap()
+    }
+
+    fn header(backing: Option<&str>) -> Vec<u8> {
+        let mut header = vec![0; CLUSTER];
+        header[..4].copy_from_slice(b"QFI\xfb");
+        for (at, val) in [(4, 3u32), (20, 16), (96, 4), (100, 104)] {
+            header[at..at + 4].copy_from_slice(&val.to_be_bytes());
+        }
+        header[24..32].copy_from_slice(&1_048_576u64.to_be_bytes());
+        if let Some(backing) = backing {
+            let at = 512;
+            header[8..16].copy_from_slice(&(at as u64).to_be_bytes());
+            header[16..20].copy_from_slice(&(backing.len() as u32).to_be_bytes());
+            header[at..at + backing.len()].copy_from_slice(backing.as_bytes());
+            // Backing-format extension "qcow2", then the end marker.
+            header[104..108].copy_from_slice(&0xe279_2acau32.to_be_bytes());
+            header[108..112].copy_from_slice(&5u32.to_be_bytes());
+            header[112..117].copy_from_slice(b"qcow2");
+        }
+        header
+    }
+
+    /// The lease is uninhabited in this slice, so the leased constructors are
+    /// exercised through the same private validation they call first.
+    #[test]
+    fn every_constructor_validates_role_header_and_size_before_a_plan() {
+        let tool = artifact(ArtifactRole::QemuImg, "E:/bundle/qemu-img.exe");
+        let golden = artifact(ArtifactRole::Golden, "D:/vm/golden.qcow2");
+        let disk = artifact(ArtifactRole::GuestDisk, "D:/vm/disk.qcow2");
+        let staging = artifact(ArtifactRole::Staging, "D:/vm/staging.qcow2");
+        let plain = header(None);
+        let backed = header(Some(r"D:\vm\golden.qcow2"));
+        let mut corrupt = plain.clone();
+        corrupt[79] = 4; // external data file feature
+
+        // golden_info: role and header checks are inside the constructor.
+        assert!(golden_info(&tool, &golden, &plain).is_ok());
+        assert!(golden_info(&golden, &golden, &plain).is_err(), "tool role");
+        assert!(golden_info(&tool, &disk, &plain).is_err(), "golden role");
+        assert!(golden_info(&tool, &golden, &corrupt).is_err(), "header");
+        assert!(
+            golden_info(&tool, &golden, &backed).is_err(),
+            "backed golden"
+        );
+
+        // offline_info validation.
+        assert!(offline_info_args(&tool, &disk, &backed, Some(&golden)).is_ok());
+        assert!(offline_info_args(&tool, &disk, &plain, None).is_ok());
+        assert!(
+            offline_info_args(&tool, &golden, &plain, None).is_err(),
+            "disk role"
+        );
+        assert!(
+            offline_info_args(&disk, &disk, &plain, None).is_err(),
+            "tool role"
+        );
+        assert!(
+            offline_info_args(&tool, &disk, &corrupt, None).is_err(),
+            "header"
+        );
+        assert!(
+            offline_info_args(&tool, &disk, &plain, Some(&golden)).is_err(),
+            "missing backing"
+        );
+        assert!(
+            offline_info_args(&tool, &disk, &backed, Some(&disk)).is_err(),
+            "backing role"
+        );
+
+        // create validation.
+        let ceiling = 1 << 30;
+        assert!(create_args(&tool, &staging, Some(&golden), 1 << 20, ceiling).is_ok());
+        assert!(
+            create_args(&tool, &staging, None, 0, ceiling).is_err(),
+            "zero size"
+        );
+        assert!(
+            create_args(&tool, &staging, None, 1 << 30, ceiling).is_err(),
+            "peak above ceiling"
+        );
+        assert!(
+            create_args(&tool, &staging, None, u64::MAX, u64::MAX).is_err(),
+            "overflow"
+        );
+        assert!(
+            create_args(&tool, &disk, None, 1 << 20, ceiling).is_err(),
+            "staging role"
+        );
+        assert!(
+            create_args(&staging, &staging, None, 1 << 20, ceiling).is_err(),
+            "tool role"
+        );
+        assert!(
+            create_args(&tool, &staging, Some(&disk), 1 << 20, ceiling).is_err(),
+            "backing role"
+        );
+    }
 }

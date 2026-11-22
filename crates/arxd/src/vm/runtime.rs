@@ -109,13 +109,16 @@ impl QualificationEvidence {
     }
 }
 
+/// Maximum age of a host observation used to admit or start work.
+pub const FRESHNESS: Duration = Duration::from_secs(5);
+
 pub fn fresh_observation(
     captured: Instant,
     now: Instant,
     missing: NativeRefusal,
 ) -> Result<(), NativeRefusal> {
     now.checked_duration_since(captured)
-        .filter(|age| *age <= Duration::from_secs(5))
+        .filter(|age| *age <= FRESHNESS)
         .map(|_| ())
         .ok_or(missing)
 }

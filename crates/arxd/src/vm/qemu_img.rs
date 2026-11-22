@@ -1,11 +1,11 @@
 use super::{
-    paths::{Artifact, ArtifactRole, InvalidPath, LocalPath},
+    paths::{Artifact, LocalPath},
     qemu_args::{self, CommandPlan},
     runtime::OfflineLease,
 };
 use serde::Deserialize;
 
-const CLUSTER: usize = 65_536;
+pub(super) const CLUSTER: usize = 65_536;
 const MAX_INFO: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,40 +70,28 @@ pub fn inspect_header(cluster: &[u8], expected: Option<&LocalPath>) -> Result<u6
     Err(InvalidImage)
 }
 
+/// Read-only inspection of the immutable golden image. Validation happens in
+/// the sealed constructor.
 pub fn golden_info<'a>(
     image: &'a Artifact,
     golden: &Artifact,
     header: &[u8],
 ) -> Result<CommandPlan<'a>, InvalidImage> {
-    inspect_header(header, None)?;
-    info(image, golden, ArtifactRole::Golden)
+    qemu_args::golden_info(image, golden, header)
 }
 
+/// Inspection of a writable guest disk under the offline lease.
 pub fn offline_info<'a>(
-    _lease: &OfflineLease,
+    lease: &'a OfflineLease,
     image: &'a Artifact,
     disk: &Artifact,
     header: &[u8],
     backing: Option<&Artifact>,
 ) -> Result<CommandPlan<'a>, InvalidImage> {
-    let backing = backing
-        .map(|artifact| role(artifact, ArtifactRole::Golden))
-        .transpose()?;
-    inspect_header(header, backing)?;
-    info(image, disk, ArtifactRole::GuestDisk)
+    qemu_args::offline_info(lease, image, disk, header, backing)
 }
 
-fn info<'a>(
-    image: &'a Artifact,
-    disk: &Artifact,
-    disk_role: ArtifactRole,
-) -> Result<CommandPlan<'a>, InvalidImage> {
-    Ok(qemu_args::qemu_img_info(
-        role(image, ArtifactRole::QemuImg)?,
-        role(disk, disk_role)?,
-    ))
-}
-
+/// Exclusive qcow2 creation of a staging image under the offline lease.
 pub fn create<'a>(
     lease: &'a OfflineLease,
     image: &'a Artifact,
@@ -112,27 +100,7 @@ pub fn create<'a>(
     size: u64,
     ceiling: u64,
 ) -> Result<CommandPlan<'a>, InvalidImage> {
-    let clusters = size.div_ceil(CLUSTER as u64);
-    let peak = clusters
-        .checked_mul(CLUSTER as u64 + 32)
-        .and_then(|n| n.checked_add(4 * CLUSTER as u64));
-    if size == 0 || peak.is_none_or(|peak| peak > ceiling) {
-        return Err(InvalidImage);
-    }
-    let backing = backing
-        .map(|artifact| role(artifact, ArtifactRole::Golden))
-        .transpose()?;
-    Ok(qemu_args::qemu_img_create(
-        lease,
-        role(image, ArtifactRole::QemuImg)?,
-        role(staging, ArtifactRole::Staging)?,
-        backing,
-        size,
-    ))
-}
-
-fn role(artifact: &Artifact, role: ArtifactRole) -> Result<&LocalPath, InvalidImage> {
-    artifact.path_for(role).map_err(|InvalidPath| InvalidImage)
+    qemu_args::create(lease, image, staging, backing, size, ceiling)
 }
 
 #[derive(Deserialize)]
