@@ -2,7 +2,12 @@
 
 ## Current state (2026-11-22)
 
-- **Main and last merges.** `main` is **green** at `428de5ec` (PR #248, M3 step
+- **Main and last merges.** `main` is **green** at `21c86102` (PR #252, M3 step
+  16a Part 3, live C16 three-container acceptance). Push CI `45049365881` passed all
+  9 jobs (`rust (ubuntu-latest)` `314 s`; live C16 `16.949 s` on an Azure runner,
+  `ubuntu24 / 20261116.376.1 / 7.0.0-1017-azure`, `first: null`, `cleanup:
+  confirmed`; log `D:/Temp/arx-coordinator/main-45049365881-ubuntu.log`, SHA256
+  `a230a5e6…fd71`). Before that, `main` was green at `428de5ec` (PR #248, M3 step
   16a Part 2 — R2 zero-daemon Proposal A three-container containment dry-run &
   ADR 0052). Push CI `45036710149` passed all 9 jobs in `522 s` wall (`rust
   (ubuntu-latest)` `277 s` including C13 `3.434 s`, A10, C14, and R2 dry-run
@@ -202,26 +207,39 @@
   `agent-review: success` status `59595112179`), and merged as `428de5ec`. Push CI
   `45036710149` verified R2 zero-daemon dry-run on `main` in **`8.151 s`** (`ubuntu24 / 20261116.133.1 / 7.0.0-1014-aws / 255.4-1ubuntu8.18`, `first: null`, `cleanup: confirmed`).
   [PR #248](https://github.com/Dytschgo/arxcovo/pull/248)
-- **M3 step 16a Part 3 (Live C16 three-container acceptance — in progress).**
-  Existing 9-job CI topology qualified (`236 s`–`277 s` Ubuntu Rust baseline +
-  `240 s` C16 ceiling + `60 s` planning margin ≤ `720 s`). Sol 6.2/high builder
-  (`isolation: worktree` off `428de5ec`) stopped cleanly at the Rust write fence
-  with zero edits and zero failed fixes (`D:/Temp/arx-m3-c16-live/report.md`,
-  SHA256 `6aca65e9…3e06`) after proving `peer_control_wire::qualified` rejects
-  RFC 2544 `198.18.72.0/24` before founder `Found`. Coordinator decision adopted
-  under owner 2026-11-21 delegated authority: keep production
-  `peer_control_wire::qualified` untouched, repin the isolated R2/C16 bridge
-  subnet to RFC1918 `192.168.72.0/24` (with host-route collision refusal in
-  `isolation.py` preflight), and grant a narrow 1-file `#[cfg(test)]` Rust fence
-  amendment for `crates/arxd/src/cluster/consensus/bound_start/runtime/c16_probe.rs`
-  only. Sol 6.2/high builder resumed on local branch `feat/m3-c16-live-acceptance`.
-- **Milestones & verification boundary.** M2 remains open for its
-  owner-dependent acceptance; M3 remains in progress (16a Part 1 R7 merged;
-  Part 2 R2 zero-daemon dry-run merged and verified on hosted Ubuntu 24.04; Part
-  3 live C16 in progress). Live C16 is **unverified on hosted runner**;
-  installed service, physical suspend, and native multi-host paths remain
-  **unverified on real hardware**. Preserved holds: Engine Sol `3/3 exhausted`,
-  historical Opus `0/2`, D6 freeze.
+- **PR #252 merged** as `21c86102` (M3 step 16a Part 3, live C16 three-container
+  acceptance; reviewed head `bcc727e9`). The isolated R2/C16 bridge subnet was repinned
+  to RFC1918 `192.168.72.0/24` with a host-route collision refusal, production
+  `peer_control_wire::qualified` stayed untouched, and a 1-file `#[cfg(test)]` fence
+  amendment covered `bound_start/runtime/c16_probe.rs`. Sol 6.2/high builder, tally 2/3
+  (report `D:/Temp/arx-m3-c16-live/report.md`, SHA256 `d4a593fd…4ade`); the second counted
+  failure was a libtest output-format mismatch on the one-CPU cgroup, fixed in the
+  launcher only. Pre-push reviews: HOLD (SHA256 `3f9d1dae…0df6`), PASS (SHA256 `89f718f3…9620`),
+  PASS (SHA256 `b3c5cdb4…75e3`), PASS (SHA256 `5d30a046…04dc`). PR CI `45048031980` passed all 10
+  checks with live C16 in `14.116 s` on an AWS runner (`7.0.0-1014-aws`; log SHA256
+  `3071b903…5b6d`). Exact-head review PASS (`D:/Temp/arx-pr252-exact-review/review.md`,
+  SHA256 `91ea2a0a…89d6`), agent-review status `59599655996`. C16 accounting, identical on
+  the PR run and on `main`: engine starts 4, normal closes 3, one deliberate leader kill,
+  Found 1, owner Mints 6, AnchorQuery 3, Redeem 2, enrollment proposals 9, AddNodes 2,
+  joint 1, flatten 1, CA handoffs 2, builds 1; the surviving pair elected a new leader
+  (epoch `[2,3]`) and the ledger kept every acknowledged write.
+- **M3 acceptance passed for the conditional hosted Linux profile.** KICKOFF M3 asks
+  that a 3-node cluster survive one node going offline without losing writes (C16, above)
+  and that an expired or reused join code be rejected (C15, PR #234; D5 elapsed
+  qualification, PR #237/#242). Both pass on GitHub-hosted Ubuntu 24.04. Installed
+  service, physical suspend and native multi-host paths remain **unverified on real
+  hardware**. M2 remains open only for its owner-dependent acceptance.
+- **M4 started (Windows host + QEMU/WHPX test VMs).** A Sol 6.2/high design proposes seven
+  sequential PRs (`D:/Temp/arx-m4-plan/plan.md`, SHA256 `7332b865…f778`); it is under
+  independent review before adoption. The Gemini 4 Neon interim coordinator started the
+  PR 1 builder (bounded `arx-guest` protocol) in a C: worktree; the returning
+  coordinator cancelled it under the D: worktree rule and relaunched it in
+  `D:/ArxcovoData/wt/m4pr1` (not a counted failure). Owner-host evidence for M4 (WHPX,
+  the dedicated standard account, disk cap and CPU/RAM reserve per
+  `docs/dev-host-setup.md`) is pending and is not an agent step.
+- **Milestones & verification boundary.** M1 accepted; M2 open for owner-dependent
+  acceptance; M3 complete for the conditional hosted Linux profile; M4 in progress.
+  Preserved holds: Engine Sol `3/3 exhausted`, historical Opus `0/2`, D6 freeze.
 
 ## Checkpoint (2026-11-21, coordinator Gemini 4 Neon / high)
 
