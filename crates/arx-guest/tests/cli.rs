@@ -4,6 +4,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const GUEST: &str = env!("CARGO_BIN_EXE_arx-guest");
+#[cfg(target_os = "linux")]
+const USAGE: &[u8] = b"Usage: arx-guest --version | serve-stdio | serve-virtio\n";
+#[cfg(not(target_os = "linux"))]
+const USAGE: &[u8] = b"Usage: arx-guest --version | serve-stdio\n";
 
 fn run_guest(
     args: &[&str],
@@ -72,11 +76,14 @@ fn bare_unknown_and_extra_arguments_fail_with_fixed_usage() {
         &["unknown"],
         &["--version", "unexpected"],
         &["serve-stdio", "unexpected"],
+        &["serve-virtio", "/dev/null"],
+        #[cfg(not(target_os = "linux"))]
+        &["serve-virtio"],
     ] {
         let output = run_guest(args, Stdio::piped(), |_, _| {});
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
-        assert_eq!(output.stderr, b"Usage: arx-guest --version | serve-stdio\n");
+        assert_eq!(output.stderr, USAGE);
     }
 }
 
@@ -121,6 +128,26 @@ fn stdio_reports_protocol_error_and_exits() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert_eq!(output.stderr, b"arx-guest: truncated guest frame prefix\n");
+}
+
+#[test]
+fn stdio_protocol_error_redacts_script_bytes() {
+    let output = run_guest(&["serve-stdio"], Stdio::piped(), |mut input, _| {
+        let request =
+            br#"{"type":"RunScript","id":1,"script":"arx-private-script-sentinel","timeout_s":1}"#;
+        input
+            .write_all(&(request.len() as u32).to_be_bytes())
+            .unwrap();
+        input.write_all(request).unwrap();
+    });
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+    assert!(
+        !String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("arx-private-script-sentinel")
+    );
 }
 
 #[test]
