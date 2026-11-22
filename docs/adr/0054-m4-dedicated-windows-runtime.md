@@ -132,8 +132,33 @@ and closes the channel.
 
 This bounds when the host *dispatches* `cont`. When QEMU reads it and when
 the guest begins executing are outside the host's control, and are not
-claimed. The guest protocol subsequently requires a fresh
-challenge echo and advertised script support. Graceful stop requires a
+claimed.
+
+Guest readiness for an installed boot has an absolute, fixed budget of
+180 s from the accepted `cont`. No recipe, profile or caller can extend it.
+The merged v1 guest protocol is host-initiated: the guest service reads
+exactly one `Hello` first and treats a second one as a protocol error. So
+the host sends one fresh 128-bit challenge and tolerates silence until the
+budget expires. Until the guest opens its virtio-serial port, QEMU leaves
+that frame unread in the host pipe. A service that starts late therefore
+still receives this boot's challenge, and only an ack that echoes it, with
+script support advertised, is accepted. Stale, replayed, malformed or
+oversized replies refuse. Once a reply's first byte arrives, the rest of
+that frame must arrive within 10 s. Cancellation stops the wait at once.
+There is no retry, no second `Hello` and no reconnect. These properties come
+from the protocol and QEMU's multiport virtio-serial behavior; they are
+**unverified on real hardware** against the pinned binary.
+
+Installer boots are refused. A plan with installer media is
+`PlanKind::InstallerBoot`, and the native launcher's first check, before any
+handle, Job or process exists, returns `InstallerPhaseUnavailable`. No guest
+service runs during installation, so the installer phase needs a QMP-only
+power-off observation and the two-medium (ISO plus CIDATA) recipe. Both are
+deferred to the explicit runtime-fence follow-up proposed in the slice 4
+design (§1 last row, §4 step 2, §7). The installer phase stays an
+activation gate.
+
+Graceful stop requires a
 matching guest shutdown event, a clean child exit, Job-empty, worker joins
 and artifact release. Containment termination yields a dirty release when
 all custody checks pass. Inconclusive release keeps the generation charged
@@ -230,7 +255,15 @@ server PID differs. Other tests cover:
 - the dispatch gate, driven deterministically by an injected clock and a
   blocking post-write checkpoint: a stale sample never arms; an expired
   sample writes nothing; an acknowledgement observed before the worker
-  records a late write is refused; and an in-time write is accepted;
+  records a late write is refused; and an in-time write is accepted. The
+  boot-side settle future is polled directly to `Pending` before the worker
+  is released;
+- guest readiness on the paused tokio clock: a late service inside the
+  budget passes; a silent or too-late service refuses exactly at 180 s;
+  stale, replayed, oversized and malformed acks refuse; a stalled frame
+  refuses after 10 s; and cancellation stops the wait without delay;
+- an installer recipe refused with `InstallerPhaseUnavailable` at the
+  launcher's first check;
 - the 112-byte v11.1.3 create headers, with each refused feature,
   compression and extension case, and boot recipes with foreign, missing or
   extra backing references or an external data file;
