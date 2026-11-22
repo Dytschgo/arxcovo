@@ -442,7 +442,7 @@ async fn anchor_probe_distinguishes_a_complete_terminal_refusal_from_failed_deli
         pin::Pin,
         task::{Context, Poll},
     };
-    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+    use tokio::io::{AsyncRead, ReadBuf};
 
     struct Reset;
     impl AsyncRead for Reset {
@@ -473,7 +473,7 @@ async fn anchor_probe_distinguishes_a_complete_terminal_refusal_from_failed_deli
         assert_eq!(refusal, expected);
     }
 
-    let mut reset = TERMINAL_ANCHOR.as_slice().chain(Reset);
+    let mut reset = tokio::io::AsyncReadExt::chain(TERMINAL_ANCHOR.as_slice(), Reset);
     let mut refusal = false;
     assert!(
         receive_anchor_probe(&mut reset, deadline, &mut refusal)
