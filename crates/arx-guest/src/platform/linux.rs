@@ -6,6 +6,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,7 +25,8 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(1);
 
 pub(crate) fn serve_virtio() -> Result<(), &'static str> {
     let port = open_port().map_err(|_| "virtio setup failed")?;
-    serve_connection(&port, &port, CgroupRoot::qualify().ok())
+    let runner = CgroupRoot::qualify().ok().map(ScriptRunner::new);
+    serve_connection(&port, &port, runner)
 }
 
 fn open_port() -> io::Result<File> {
@@ -72,11 +74,11 @@ fn verify_port_name(device: libc::dev_t) -> io::Result<()> {
 fn serve_connection(
     reader: impl Read,
     writer: impl Write,
-    cgroups: Option<CgroupRoot>,
+    runner: Option<ScriptRunner>,
 ) -> Result<(), &'static str> {
     let retired = Cell::new(false);
     let mut executor = LinuxExecutor {
-        cgroups,
+        runner,
         retired: &retired,
     };
     let result = serve(
@@ -114,13 +116,13 @@ impl<W: Write> Write for SessionWriter<'_, W> {
 }
 
 struct LinuxExecutor<'a> {
-    cgroups: Option<CgroupRoot>,
+    runner: Option<ScriptRunner>,
     retired: &'a Cell<bool>,
 }
 
 impl ScriptExecutor for LinuxExecutor<'_> {
     fn script_execution(&self) -> ScriptExecution {
-        if self.cgroups.is_some() {
+        if self.runner.is_some() {
             ScriptExecution::Available
         } else {
             ScriptExecution::Unavailable
@@ -128,10 +130,10 @@ impl ScriptExecutor for LinuxExecutor<'_> {
     }
 
     fn run_script(&mut self, script: &str, timeout_s: u32) -> ScriptOutcome {
-        let Some(cgroups) = &self.cgroups else {
+        let Some(runner) = &self.runner else {
             return ScriptOutcome::Unavailable;
         };
-        match cgroups.run(script, Duration::from_secs(timeout_s.into())) {
+        match runner.run(script, Duration::from_secs(timeout_s.into())) {
             Ok(outcome) => outcome,
             Err(_) => {
                 self.retired.set(true);
@@ -189,12 +191,20 @@ impl CgroupRoot {
         root.new_command()
             .and_then(|mut group| {
                 group.kill()?;
-                group.finish(Instant::now() + CLEANUP_BUDGET)
+                group.wait_empty(Instant::now() + CLEANUP_BUDGET)?;
+                root.remove_command(&group)
             })
             .map_err(|_| Qualification::CommandSlot)?;
         Ok(root)
     }
+}
 
+trait CommandCgroups {
+    fn new_command(&self) -> io::Result<CommandGroup>;
+    fn remove_command(&self, group: &CommandGroup) -> io::Result<()>;
+}
+
+impl CommandCgroups for CgroupRoot {
     fn new_command(&self) -> io::Result<CommandGroup> {
         let path = self.path.join(COMMAND_SLOT);
         fs::create_dir(&path)?;
@@ -206,17 +216,44 @@ impl CgroupRoot {
         group
     }
 
+    fn remove_command(&self, group: &CommandGroup) -> io::Result<()> {
+        fs::remove_dir(&group.path)
+    }
+}
+
+type Spawn = dyn Fn(&mut Command) -> io::Result<Child> + Send + Sync;
+
+struct ScriptRunner {
+    cgroups: Box<dyn CommandCgroups>,
+    spawn: Arc<Spawn>,
+    max_budget: Duration,
+    cleanup_budget: Duration,
+    drop_privileges: bool,
+}
+
+impl ScriptRunner {
+    fn new(root: CgroupRoot) -> Self {
+        Self {
+            drop_privileges: root.owner == 0,
+            cgroups: Box::new(root),
+            spawn: Arc::new(Command::spawn),
+            max_budget: Duration::from_secs(arx_guest::MAX_TIMEOUT_S.into()),
+            cleanup_budget: CLEANUP_BUDGET,
+        }
+    }
+
     fn run(&self, script: &str, budget: Duration) -> io::Result<ScriptOutcome> {
-        let deadline = Instant::now() + budget;
-        let mut group = self.new_command()?;
-        let mut child = script_command(script, Some(&group.procs), self.owner == 0)
-            .and_then(|mut command| command.spawn())
-            .ok();
+        let deadline = Instant::now() + budget.min(self.max_budget);
+        let mut group = self.cgroups.new_command()?;
+        let mut child = match script_command(script, Some(&group.procs), self.drop_privileges) {
+            Ok(command) => spawn_until(command, Arc::clone(&self.spawn), deadline)?,
+            Err(_) => None,
+        };
         let result = match &mut child {
             Some(child) => observe(child, deadline),
             None => Ok(Observation::LaunchFailed),
         };
-        let cleanup_deadline = Instant::now() + CLEANUP_BUDGET;
+        let cleanup_deadline = Instant::now() + self.cleanup_budget;
         // A child whose wait reached the deadline is still unreaped. Its PID
         // pins the process group identity for killpg.
         let group_kill = match (&child, &result) {
@@ -228,13 +265,45 @@ impl CgroupRoot {
             Some(child) => reap(child, cleanup_deadline),
             None => Ok(()),
         };
-        let cleanup = group.finish(cleanup_deadline);
+        let cleanup = group
+            .wait_empty(cleanup_deadline)
+            .and_then(|()| self.cgroups.remove_command(&group));
         group_kill?;
         cgroup_kill?;
         cleanup?;
         reap?;
         Ok(result?.outcome())
     }
+}
+
+fn spawn_until(
+    mut command: Command,
+    spawn: Arc<Spawn>,
+    deadline: Instant,
+) -> io::Result<Option<Child>> {
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    let (sender, receiver) = mpsc::sync_channel(0);
+    // A stalled pre-exec handshake may still own a child with unknown cgroup
+    // membership. Detach the worker: the session retires and leaves its slot
+    // in place for fail-closed restart and outer VM teardown.
+    thread::Builder::new().spawn(move || {
+        let child = spawn(&mut command).ok();
+        let late = if Instant::now() >= deadline {
+            drop(sender);
+            child
+        } else {
+            sender.send(child).err().and_then(|error| error.0)
+        };
+        if let Some(mut child) = late {
+            let _ = kill_process_group(&child);
+            let _ = reap(&mut child, Instant::now() + CLEANUP_BUDGET);
+        }
+    })?;
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| io::ErrorKind::TimedOut.into())
 }
 
 fn supervisor_path(service: &str) -> io::Result<PathBuf> {
@@ -304,16 +373,20 @@ impl CommandGroup {
         if bounded_read(File::open(pids)?, 128)?.trim_end().as_bytes() != PIDS_MAX {
             return Err(invalid());
         }
-        let mut group = Self {
-            path: path.to_owned(),
-            procs: control(path, "cgroup.procs", owner)?,
-            kill: control(path, "cgroup.kill", owner)?,
-            events: File::open(path.join("cgroup.events"))?,
-        };
+        let mut group = Self::open_controls(path, owner)?;
         if group.populated()? {
             return Err(invalid());
         }
         Ok(group)
+    }
+
+    fn open_controls(path: &Path, owner: u32) -> io::Result<Self> {
+        Ok(Self {
+            path: path.to_owned(),
+            procs: control(path, "cgroup.procs", owner)?,
+            kill: control(path, "cgroup.kill", owner)?,
+            events: File::open(path.join("cgroup.events"))?,
+        })
     }
 
     fn populated(&mut self) -> io::Result<bool> {
@@ -333,11 +406,11 @@ impl CommandGroup {
         self.kill.write_all(b"1")
     }
 
-    fn finish(&mut self, deadline: Instant) -> io::Result<()> {
+    fn wait_empty(&mut self, deadline: Instant) -> io::Result<()> {
         while self.populated()? {
             pause_until(deadline)?;
         }
-        fs::remove_dir(&self.path)
+        Ok(())
     }
 }
 
@@ -371,8 +444,9 @@ fn script_command(
         .stderr(Stdio::null())
         .process_group(0);
     let procs = procs.map(File::try_clone).transpose()?;
-    // SAFETY: the closure owns the duplicated descriptor. It uses no locks
-    // or allocations and writes only a fixed static byte before exec.
+    // SAFETY: the closure owns the duplicated descriptor and writes a fixed
+    // byte. Raw credential syscalls avoid libc's setxid locks and broadcasts
+    // after fork, when only the calling thread survives.
     unsafe {
         command.pre_exec(move || {
             if let Some(file) = &procs
@@ -382,14 +456,16 @@ fn script_command(
             }
             let one: libc::c_ulong = 1;
             let zero: libc::c_ulong = 0;
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, one, zero, zero, zero) != 0 {
+            let gid = libc::c_ulong::from(SCRIPT_GID);
+            let uid = libc::c_ulong::from(SCRIPT_UID);
+            if drop_privileges
+                && (libc::syscall(libc::SYS_setgroups, zero, std::ptr::null::<libc::gid_t>()) != 0
+                    || libc::syscall(libc::SYS_setresgid, gid, gid, gid) != 0
+                    || libc::syscall(libc::SYS_setresuid, uid, uid, uid) != 0)
+            {
                 return Err(io::Error::last_os_error());
             }
-            if drop_privileges
-                && (libc::setgroups(0, std::ptr::null()) != 0
-                    || libc::setresgid(SCRIPT_GID, SCRIPT_GID, SCRIPT_GID) != 0
-                    || libc::setresuid(SCRIPT_UID, SCRIPT_UID, SCRIPT_UID) != 0)
-            {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, one, zero, zero, zero) != 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -421,15 +497,23 @@ impl Observation {
 }
 
 fn observe(child: &mut Child, deadline: Instant) -> io::Result<Observation> {
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait()? {
+    observe_until(|| child.try_wait(), || pause_until(deadline))
+}
+
+fn observe_until(
+    mut try_wait: impl FnMut() -> io::Result<Option<ExitStatus>>,
+    mut pause: impl FnMut() -> io::Result<()>,
+) -> io::Result<Observation> {
+    loop {
+        if let Some(status) = try_wait()? {
             return Ok(Observation::Exited(status));
         }
-        if pause_until(deadline).is_err() {
-            break;
+        if pause().is_err() {
+            // The child may have exited after the last poll. Prefer an
+            // observed status before classifying the deadline as a timeout.
+            return Ok(try_wait()?.map_or(Observation::Deadline, Observation::Exited));
         }
     }
-    Ok(Observation::Deadline)
 }
 
 fn reap(child: &mut Child, deadline: Instant) -> io::Result<()> {
@@ -482,8 +566,11 @@ fn invalid() -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{DirBuilderExt, FileExt};
     use std::os::unix::process::ExitStatusExt;
     use std::process::ChildStdout;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use arx_guest::{Request, Response, ScriptStatus, read_frame, write_frame};
 
@@ -591,7 +678,7 @@ mod tests {
         };
         let mut responses = Vec::new();
         assert_eq!(
-            serve_connection(&requests[..], &mut responses, Some(root)),
+            serve_connection(&requests[..], &mut responses, Some(ScriptRunner::new(root))),
             Err("script containment failed")
         );
         let mut responses = &responses[..];
@@ -599,6 +686,82 @@ mod tests {
         assert!(
             responses.is_empty(),
             "untrustworthy result reached the wire"
+        );
+    }
+
+    #[test]
+    fn stalled_spawn_retires_the_session_without_joining() {
+        let fixture = Arc::new(FakeCgroups::new());
+        let mut runner = fixture.runner();
+        runner.max_budget = Duration::from_millis(150);
+        let (entered, worker) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let resume = Mutex::new(resume);
+        runner.spawn = Arc::new(move |_| {
+            entered.send(()).unwrap();
+            let _ = resume.lock().unwrap().recv_timeout(Duration::from_secs(2));
+            finished.send(()).unwrap();
+            Err(io::ErrorKind::WouldBlock.into())
+        });
+        let (result, bytes) = run_exit_seven(runner);
+        worker.recv_timeout(FIXTURE_BUDGET).unwrap();
+        let still_blocked = completion.try_recv() == Err(mpsc::TryRecvError::Empty);
+        let _ = release.send(());
+        assert!(still_blocked, "the service waited for the stalled spawn");
+        completion.recv_timeout(FIXTURE_BUDGET).unwrap();
+        assert_retired(result, &bytes);
+    }
+
+    #[test]
+    fn production_cleanup_writes_kill_and_waits_for_empty_before_result() {
+        let fixture = Arc::new(FakeCgroups::new());
+        let release = Arc::clone(&fixture);
+        let peer = thread::spawn(move || -> io::Result<()> {
+            let deadline = Instant::now() + FIXTURE_BUDGET;
+            while fs::read(release.0.join("cgroup.kill"))? != b"1" {
+                pause_until(deadline)?;
+            }
+            // Keep the real events descriptor valid while changing its value.
+            control(&release.0, "cgroup.events", effective_uid())?
+                .write_all_at(b"0", b"populated ".len() as u64)
+        });
+        let (result, bytes) = run_exit_seven(fixture.runner());
+        peer.join()
+            .unwrap()
+            .expect("production did not write cgroup.kill");
+        assert_eq!(result, Ok(()));
+        let mut bytes = bytes.as_slice();
+        expect_hello(&mut bytes, ScriptExecution::Available);
+        expect_exit_seven(&mut bytes);
+    }
+
+    #[test]
+    fn production_cleanup_retires_without_result_while_group_stays_populated() {
+        let fixture = Arc::new(FakeCgroups::new());
+        let mut runner = fixture.runner();
+        runner.cleanup_budget = Duration::from_millis(20);
+        let (result, bytes) = run_exit_seven(runner);
+        assert_eq!(fs::read(fixture.0.join("cgroup.procs")).unwrap(), b"0");
+        assert_eq!(fs::read(fixture.0.join("cgroup.kill")).unwrap(), b"1");
+        assert_retired(result, &bytes);
+    }
+
+    #[test]
+    fn exit_observed_at_deadline_wins_over_timeout() {
+        let clock = Cell::new(Duration::ZERO);
+        let exit_time = Duration::from_millis(9);
+        let deadline = Duration::from_millis(10);
+        let result = observe_until(
+            || Ok((clock.get() >= exit_time).then(|| ExitStatus::from_raw(7 << 8))),
+            || {
+                clock.set(deadline);
+                Err(io::ErrorKind::TimedOut.into())
+            },
+        );
+        assert_eq!(
+            result.unwrap().outcome(),
+            ScriptOutcome::Exited { exit_code: 7 }
         );
     }
 
@@ -649,37 +812,120 @@ mod tests {
         assert!(group.populated().unwrap());
         assert!(matches!(discover(), Err(Qualification::CommandSlot)));
         group.kill().unwrap();
-        group.finish(Instant::now() + FIXTURE_BUDGET).unwrap();
+        group.wait_empty(Instant::now() + FIXTURE_BUDGET).unwrap();
+        root.remove_command(&group).unwrap();
         ready(&pipe);
         assert_eq!(pipe.read(&mut [0]).unwrap(), 0);
         assert!(!group.path.exists());
+        let runner = ScriptRunner::new(root);
         if owner == 0 {
             assert_eq!(
-                root.run(
-                    "test \"$(id -u):$(id -g):$(id -G)\" = 65534:65534:65534",
-                    FIXTURE_BUDGET,
-                )
-                .unwrap(),
+                runner
+                    .run(
+                        "test \"$(id -u):$(id -g):$(id -G)\" = 65534:65534:65534",
+                        FIXTURE_BUDGET,
+                    )
+                    .unwrap(),
                 ScriptOutcome::Exited { exit_code: 0 }
             );
         }
         assert_eq!(
-            root.run("while :; do :; done", Duration::from_millis(10))
+            runner
+                .run("while :; do :; done", Duration::from_millis(50))
                 .unwrap(),
             ScriptOutcome::TimedOut
         );
         assert!(!group.path.exists());
 
-        let requests = script_request("exit 7");
-        let mut responses = Vec::new();
-        assert_eq!(
-            serve_connection(&requests[..], &mut responses, Some(root)),
-            Ok(())
-        );
+        let (result, responses) = run_exit_seven(runner);
+        assert_eq!(result, Ok(()));
         let mut responses = &responses[..];
         expect_hello(&mut responses, ScriptExecution::Available);
+        expect_exit_seven(&mut responses);
+        eprintln!("cgroup fixture exercised");
+    }
+
+    struct FakeCgroups(PathBuf);
+
+    impl FakeCgroups {
+        fn new() -> Self {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let name = format!(
+                "arx-guest-cgroup-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = std::env::temp_dir().join(name);
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            let fixture = Self(path);
+            for (file, contents) in [
+                ("cgroup.procs", &b""[..]),
+                ("cgroup.kill", &b""[..]),
+                ("cgroup.events", &b"populated 1\n"[..]),
+            ] {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(fixture.0.join(file))
+                    .unwrap()
+                    .write_all(contents)
+                    .unwrap();
+            }
+            fixture
+        }
+
+        fn runner(self: &Arc<Self>) -> ScriptRunner {
+            ScriptRunner {
+                cgroups: Box::new(Arc::clone(self)),
+                spawn: Arc::new(Command::spawn),
+                max_budget: FIXTURE_BUDGET,
+                cleanup_budget: FIXTURE_BUDGET,
+                drop_privileges: false,
+            }
+        }
+    }
+
+    impl CommandCgroups for Arc<FakeCgroups> {
+        fn new_command(&self) -> io::Result<CommandGroup> {
+            CommandGroup::open_controls(&self.0, effective_uid())
+        }
+
+        fn remove_command(&self, _: &CommandGroup) -> io::Result<()> {
+            // Regular fixture files are removed by Drop. The production
+            // read and write operations still use the same open controls.
+            Ok(())
+        }
+    }
+
+    impl Drop for FakeCgroups {
+        fn drop(&mut self) {
+            for file in ["cgroup.procs", "cgroup.kill", "cgroup.events"] {
+                let _ = fs::remove_file(self.0.join(file));
+            }
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    fn run_exit_seven(runner: ScriptRunner) -> (Result<(), &'static str>, Vec<u8>) {
+        let mut bytes = Vec::new();
+        let result = serve_connection(
+            script_request("exit 7").as_slice(),
+            &mut bytes,
+            Some(runner),
+        );
+        (result, bytes)
+    }
+
+    fn assert_retired(result: Result<(), &'static str>, mut bytes: &[u8]) {
+        expect_hello(&mut bytes, ScriptExecution::Available);
+        assert!(bytes.is_empty(), "untrustworthy result reached the wire");
+        assert_eq!(result, Err("script containment failed"));
+    }
+
+    fn expect_exit_seven(responses: &mut &[u8]) {
         assert!(matches!(
-            read_frame::<Response>(&mut responses).unwrap(),
+            read_frame::<Response>(responses).unwrap(),
             Some(Response::ScriptResult {
                 id: 1,
                 status: ScriptStatus::Exited,
@@ -687,7 +933,6 @@ mod tests {
             })
         ));
         assert!(responses.is_empty());
-        eprintln!("cgroup fixture exercised");
     }
 
     fn script_request(script: &str) -> Vec<u8> {
