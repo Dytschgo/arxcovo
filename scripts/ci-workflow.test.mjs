@@ -18,7 +18,10 @@ test('CI runs unconditional Rust and UI matrices in parallel behind the existing
   assert.deepEqual(Object.keys(jobs), ['rust', 'ui', 'verify']);
   for (const id of ['rust', 'ui']) {
     const env = id === 'rust' ? "    env:\n      CARGO_PROFILE_DEV_DEBUG: '0'\n" : '';
-    assert.equal(jobs[id].split('    steps:\n')[0], `    name: ${id} (\${{ matrix.os }})\n${matrix}    runs-on: \${{ matrix.os }}\n    timeout-minutes: 12\n${env}`);
+    const runner = id === 'rust'
+      ? "${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}"
+      : '${{ matrix.os }}';
+    assert.equal(jobs[id].split('    steps:\n')[0], `    name: ${id} (\${{ matrix.os }})\n${matrix}    runs-on: ${runner}\n    timeout-minutes: 12\n${env}`);
     assert.doesNotMatch(jobs[id], /^ {4}(?:needs|if|environment|services|concurrency):/m);
   }
   assert.equal(jobs.verify, `    name: verify (\${{ matrix.os }})\n    needs: [rust, ui]\n    if: \${{ always() }}\n${matrix}    runs-on: ubuntu-latest\n    timeout-minutes: 12\n    steps:\n      - name: Require every Rust and UI worker to succeed\n        shell: pwsh\n        run: ${gate}\n`);
