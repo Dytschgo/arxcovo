@@ -60,6 +60,16 @@ impl<'a> CandidateRuntime<'a> {
         NativeCapability::Unavailable(reason)
     }
 
+    /// Refuse before the lifecycle can stage anything. The native launcher's
+    /// sealed-plan check enforces the same refusal at the launch boundary.
+    #[allow(
+        dead_code,
+        reason = "The private lifecycle has no production entry point yet"
+    )]
+    pub(super) fn template_installer(&self) -> Result<std::convert::Infallible, NativeRefusal> {
+        Err(NativeRefusal::InstallerPhaseUnavailable)
+    }
+
     /// The callback is the first boundary for external effects. Even a valid
     /// portable admission is insufficient to reach it.
     pub fn dispatch<T>(

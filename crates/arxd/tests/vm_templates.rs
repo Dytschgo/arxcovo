@@ -292,11 +292,13 @@ fn read_iso(iso: &[u8]) -> Parsed<BTreeMap<String, &[u8]>> {
     claim(&mut claimed, 0..descriptor_end.ok_or("descriptor end")?)?;
     let primary = directory(iso, primary.ok_or("primary")?, false, &mut claimed)?;
     let joliet = directory(iso, supplementary.ok_or("Joliet")?, true, &mut claimed)?;
-    if primary.len() != 5 || joliet.len() != 5 {
+    if primary.len() != 7 || joliet.len() != 7 {
         return Err("file count");
     }
     let mut file_bytes = BTreeMap::new();
     for (name, alias, limit) in [
+        ("arx-account-audit", "ARXAUDIT", 16 * 1024),
+        ("arx-account-audit.service", "ARXAUDIT.SVC", 4096),
         ("arx-guest", "ARXGUEST", 32 * 1024 * 1024),
         ("arx-guest.service", "ARXGUEST.SVC", 64 * 1024 * 1024),
         ("arx-finalize", "FINALIZE", 64 * 1024 * 1024),
@@ -318,6 +320,8 @@ fn read_iso(iso: &[u8]) -> Parsed<BTreeMap<String, &[u8]>> {
     for name in [
         "meta-data",
         "user-data",
+        "arx-account-audit",
+        "arx-account-audit.service",
         "arx-guest.service",
         "arx-finalize",
     ] {
@@ -382,10 +386,24 @@ fn golden_seed_is_deterministic() {
     assert_eq!(iso, fixture());
     assert_eq!(
         hex::encode(Sha256::digest(&iso)),
-        "839ce0a9d6b0820013700b30e9ad4bbc23f77d730a0e1f99ff78feb3c3f1f82f",
+        "08fd082e494459e6a3ed24857ee59b4039feaf312b32e74ebc1d740a6aa66755",
     );
     assert!(read_iso(&iso).is_ok());
     assert_ne!(iso, fixture_recipe().render_seed([0; 16], GUEST).unwrap());
+}
+
+#[test]
+fn absent_file_identifiers_use_descriptor_filler() {
+    let iso = fixture();
+    assert_eq!(&iso[16 * BLOCK + 702..16 * BLOCK + 813], &[b' '; 111]);
+    for field in iso[17 * BLOCK + 702..17 * BLOCK + 813].chunks_exact(37) {
+        assert_eq!(field[36], 0);
+        assert!(
+            field[..36]
+                .chunks_exact(2)
+                .all(|character| character == b"\0 ")
+        );
+    }
 }
 
 fn check_hashes(files: &BTreeMap<String, &[u8]>, recipe: &UbuntuRecipe) -> Parsed<()> {
@@ -411,16 +429,20 @@ fn profile_pin_binds_the_emitted_literals() {
         ("arx-guest", "{guest_hash}"),
         ("arx-guest.service", "{service_hash}"),
         ("arx-finalize", "{finalize_hash}"),
+        ("arx-account-audit.service", "{audit_unit_hash}"),
+        ("arx-account-audit", "{audit_script_hash}"),
     ] {
         let hash = hex::encode(Sha256::digest(files[file]));
         assert_eq!(template.matches(&hash).count(), 1);
         template = template.replace(&hash, token);
     }
     let profile = [
-        b"arxcovo-nocloud-v1\n".as_slice(),
+        b"arxcovo-nocloud-v2\n".as_slice(),
         template.as_bytes(),
         files["arx-guest.service"],
         files["arx-finalize"],
+        files["arx-account-audit.service"],
+        files["arx-account-audit"],
     ]
     .join(&0);
     let observed = pin(&profile);
@@ -438,6 +460,43 @@ fn profile_pin_binds_the_emitted_literals() {
         RecipeError::Unqualified,
     ));
     assert!(out.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn root_audit_rejects_empty_or_inline_passwd_password_fields() {
+    use std::{fs, process::Command};
+
+    let iso = fixture();
+    let files = read_iso(&iso).unwrap();
+    let audit = std::str::from_utf8(files["arx-account-audit"]).unwrap();
+    let (_, tail) = audit.split_once("awk -F: '").unwrap();
+    let (predicate, _) = tail.split_once("' /etc/shadow /etc/passwd").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let shadow = root.path().join("shadow");
+    let passwd = root.path().join("passwd");
+    fs::write(&shadow, "root:!:20000:0:99999:7:::\n").unwrap();
+    for (password, accepted) in [
+        ("x", true),
+        ("*", true),
+        ("", false),
+        ("!", false),
+        ("inline", false),
+    ] {
+        fs::write(
+            &passwd,
+            format!("root:{password}:0:0:root:/root:/bin/bash\n"),
+        )
+        .unwrap();
+        let status = Command::new("awk")
+            .args(["-F:", predicate])
+            .arg(&shadow)
+            .arg(&passwd)
+            .env("LC_ALL", "C")
+            .status()
+            .unwrap();
+        assert_eq!(status.success(), accepted, "{password:?}");
+    }
 }
 
 #[test]
@@ -510,18 +569,59 @@ fn readback_contains_only_the_fixed_offline_profile() {
     };
     let mount = command_index("mount -t iso9660 -o ro,nosuid,nodev,noexec -L CIDATA");
     let verify = command_index("sha256sum --check --strict");
+    let audit_verify = commands
+        .iter()
+        .rposition(|line| line.trim_start() == "sha256sum --check --strict")
+        .unwrap();
     let install = command_index(r#"install -m 0755 "$seed/arx-guest" "#);
     let enable = command_index("systemctl --root=/target enable arx-guest.service");
     let finalize =
         command_index("curtin in-target --target=/target -- /bin/sh /usr/local/sbin/arx-finalize");
-    assert!(mount < verify && verify < install && install < enable && enable < finalize);
+    assert!(
+        mount < verify
+            && verify < audit_verify
+            && audit_verify < install
+            && install < enable
+            && enable < finalize
+    );
     for asset in ["arx-guest", "arx-guest.service", "arx-finalize"] {
         let hash = hex::encode(Sha256::digest(files[asset]));
         assert!(commands[verify - 1].contains(&format!("'{hash}' {asset}")));
     }
+    for (asset, install_line) in [
+        (
+            "arx-account-audit",
+            r#"install -o 0 -g 0 -m 0700 "$seed/arx-account-audit" /target/usr/local/sbin/arx-account-audit"#,
+        ),
+        (
+            "arx-account-audit.service",
+            r#"install -o 0 -g 0 -m 0644 "$seed/arx-account-audit.service" /target/etc/systemd/system/arx-account-audit.service"#,
+        ),
+    ] {
+        let hash = hex::encode(Sha256::digest(files[asset]));
+        assert!(commands[audit_verify - 1].contains(&format!("'{hash}' {asset}")));
+        let audit_install = command_index(install_line);
+        assert!(audit_verify < audit_install && audit_install < finalize);
+    }
+    let audit_unit = text("arx-account-audit.service");
+    for line in [
+        "Before=arx-guest.service",
+        "Type=oneshot",
+        "User=root",
+        "Group=root",
+        "RemainAfterExit=yes",
+        "RuntimeDirectory=arx-account-audit",
+        "RuntimeDirectoryMode=0755",
+        "ExecStart=/usr/local/sbin/arx-account-audit",
+        "WantedBy=multi-user.target",
+    ] {
+        assert!(audit_unit.lines().any(|entry| entry == line));
+    }
     let service = text("arx-guest.service");
     for line in [
         "User=root",
+        "Wants=arx-account-audit.service",
+        "After=systemd-udevd.service arx-account-audit.service",
         "ExecStart=/usr/local/bin/arx-guest serve-virtio",
         "Delegate=pids",
         "DelegateSubgroup=arx-supervisor",
@@ -549,6 +649,7 @@ fn readback_contains_only_the_fixed_offline_profile() {
         "rm -f /etc/machine-id /var/lib/dbus/machine-id",
         "install -m 0444 /dev/null /etc/machine-id",
         "ln -s /etc/machine-id /var/lib/dbus/machine-id",
+        "systemctl --root=/ enable arx-account-audit.service",
         "rm -f /usr/local/sbin/arx-finalize",
     ] {
         assert!(finalize.contains(action));
@@ -578,12 +679,10 @@ fn independent_reader_rejects_malformed_images() {
     bad[primary + 6] ^= 1;
     assert_eq!(read_iso(&bad), Err("32-bit endian split"));
 
-    // First Joliet entry is arx-finalize. Locate its primary alias.
-    let service = primary + usize::from(clean[primary]);
-    let finalize = service + usize::from(clean[service]);
+    // Both first entries are the account audit executable.
     for (block, expected) in [(u32::MAX, "extent bounds"), (23, "extent overlap")] {
         bad = clean.clone();
-        for offset in [finalize + 2, joliet + 2] {
+        for offset in [primary + 2, joliet + 2] {
             bad[offset..offset + 4].copy_from_slice(&block.to_le_bytes());
             bad[offset + 4..offset + 8].copy_from_slice(&block.to_be_bytes());
         }
@@ -602,11 +701,10 @@ fn independent_reader_rejects_malformed_images() {
     bad = clean.clone();
     bad[identifier_end - 1] = b'2';
     assert_eq!(read_iso(&bad), Err("file version"));
-    let guest = joliet + first.len();
-    let unit = guest + usize::from(clean[guest]);
+    let unit = joliet + first.len();
     let after_unit = unit + usize::from(clean[unit]);
     bad = clean.clone();
-    bad[guest..after_unit].rotate_left(unit - guest);
+    bad[joliet..after_unit].rotate_left(first.len());
     assert_eq!(read_iso(&bad), Err("directory order"));
 
     bad = clean.clone();
