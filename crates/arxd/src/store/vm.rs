@@ -7,7 +7,8 @@ use crate::vm::{
 };
 use anyhow::{Result, bail, ensure};
 use rusqlite::{
-    Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, ffi,
+    params,
 };
 use std::{fs, path::Path, sync::Mutex, time::Duration};
 
@@ -122,6 +123,14 @@ pub(crate) struct VmStore {
 
 impl VmStore {
     pub(crate) fn open(dir: &Path, now: i64) -> Result<Self> {
+        Self::open_inner(dir, now, open_sqlite)
+    }
+
+    fn open_inner(
+        dir: &Path,
+        now: i64,
+        connect: impl FnOnce(&Path) -> Result<Connection>,
+    ) -> Result<Self> {
         crate::config::checked_path(dir)?;
         crate::security::private(dir)?;
         ensure!(dir.is_dir(), "VM state directory required");
@@ -147,12 +156,12 @@ impl VmStore {
         #[cfg(unix)]
         database.try_lock()?;
         verify_state_identity(&database, &path)?;
-        let mut db = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
+        let expected = state_identity(&database)?;
+        let mut db = connect(&path)?;
+        ensure!(
+            sqlite_main_identity(&mut db)? == expected && state_identity(&database)? == expected,
+            "SQLite VM main database identity changed"
+        );
         verify_state_identity(&database, &path)?;
         db.busy_timeout(Duration::from_millis(250))?;
         check_size(&db)?;
@@ -194,6 +203,15 @@ impl VmStore {
         tx.commit()?;
         Ok(result)
     }
+}
+
+fn open_sqlite(path: &Path) -> Result<Connection> {
+    Ok(Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?)
 }
 
 fn check_existing_file(path: &Path) -> Result<bool> {
@@ -257,14 +275,29 @@ fn state_identity(file: &fs::File) -> Result<(u64, u64)> {
 #[cfg(windows)]
 fn state_identity(file: &fs::File) -> Result<(u64, u64)> {
     use std::os::windows::io::AsRawHandle;
+    windows_identity(file.as_raw_handle())
+}
+
+#[cfg(windows)]
+fn windows_identity(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<(u64, u64)> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        GetFileInformationByHandle,
+        FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType,
     };
+    ensure!(
+        !handle.is_null() && handle != INVALID_HANDLE_VALUE,
+        "invalid VM state handle"
+    );
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    // Both the retained Rust file and SQLite's borrowed handle outlive this query.
+    ensure!(
+        unsafe {
+            GetFileType(handle) == FILE_TYPE_DISK
+                && GetFileInformationByHandle(handle, &mut info) != 0
+        },
+        "unavailable VM state file identity"
+    );
     ensure!(
         info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0
             && info.nNumberOfLinks == 1,
@@ -274,6 +307,94 @@ fn state_identity(file: &fs::File) -> Result<(u64, u64)> {
         u64::from(info.dwVolumeSerialNumber),
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
     ))
+}
+
+fn sqlite_main_identity(db: &mut Connection) -> Result<(u64, u64)> {
+    use std::ffi::CStr;
+
+    // The bundled extension qualifies both the native VFS and the main file's
+    // I/O methods before we use either platform's file-control contract.
+    // The exclusive connection borrow spans qualification and measurement.
+    let handle = unsafe { db.handle() };
+    ensure!(
+        unsafe {
+            ffi::sqlite3_libversion_number() == 3050002
+                && CStr::from_ptr(ffi::sqlite3_sourceid()).to_bytes() == b"2025-06-28 14:00:48 2af157d77fb1304a74176eaee7fbc7c7e932d946bf25325e9c26c91db19e3079"
+                && ffi::sqlite3_arxcovo_bound_abi_v1() == 1
+                && ffi::sqlite3_arxcovo_qualify_main_v1(handle) == ffi::SQLITE_OK
+        },
+        "unqualified SQLite VM main database"
+    );
+    #[cfg(unix)]
+    {
+        const MAGIC: u32 = 0x41525849;
+        const _: () = assert!(size_of::<ffi::ArxIdentityV1>() == 80);
+        let mut identity = ffi::ArxIdentityV1 {
+            magic: MAGIC,
+            abi_version: 1,
+            struct_bytes: 80,
+            status: u32::MAX,
+            os_errno: 0,
+            vfs_kind: 0,
+            dev_lo: 0,
+            dev_hi: 0,
+            ino_lo: 0,
+            ino_hi: 0,
+            nlink_lo: 0,
+            nlink_hi: 0,
+            mode: 0,
+            flags: 0,
+            reserved: [0; 6],
+        };
+        // The pinned Unix operation fstats the actual descriptor and writes
+        // exactly the versioned result structure supplied here.
+        let rc = unsafe {
+            ffi::sqlite3_file_control(
+                handle,
+                c"main".as_ptr(),
+                ffi::ARX_FCNTL_IDENTITY_V1,
+                std::ptr::from_mut(&mut identity).cast(),
+            )
+        };
+        let vfs_kind = if cfg!(target_os = "macos") { 2 } else { 1 };
+        ensure!(
+            rc == ffi::SQLITE_OK
+                && identity.magic == MAGIC
+                && identity.abi_version == 1
+                && identity.struct_bytes == 80
+                && identity.status == 0
+                && identity.os_errno == 0
+                && identity.vfs_kind == vfs_kind
+                && identity.nlink_lo == 1
+                && identity.nlink_hi == 0
+                && identity.mode & 0o170077 == 0o100000
+                && identity.flags == 0
+                && identity.reserved == [0; 6],
+            "unavailable SQLite VM main database identity"
+        );
+        Ok((
+            (u64::from(identity.dev_hi) << 32) | u64::from(identity.dev_lo),
+            (u64::from(identity.ino_hi) << 32) | u64::from(identity.ino_lo),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        let mut borrowed: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::sqlite3_file_control(
+                handle,
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
+                std::ptr::from_mut(&mut borrowed).cast(),
+            )
+        };
+        ensure!(
+            rc == ffi::SQLITE_OK,
+            "unavailable SQLite VM main database handle"
+        );
+        // SQLite retains ownership. Inspect the handle without adopting or closing it.
+        windows_identity(borrowed)
+    }
 }
 
 pub(crate) fn count(db: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<i64> {
@@ -707,4 +828,74 @@ pub(crate) fn recovery_intents(db: &Connection) -> Result<Vec<RecoveryClaim>> {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::application::tests::private_temp;
+
+    #[test]
+    fn substituted_sqlite_main_refuses_before_reconciliation() {
+        let now = 1_800_000_000_000;
+        let original = private_temp();
+        let replacement = private_temp();
+        for dir in [&original, &replacement] {
+            VmStore::open(dir.path(), now)
+                .unwrap()
+                .transact(|db| {
+                    Binding {
+                        principal: "fixture",
+                        key: RequestId::parse("00000000000000000000000000000001").unwrap(),
+                        vm: [1; 16],
+                        action: Action::Script,
+                    }
+                    .record(db, now, None)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        let other_path = replacement.path().join("activity.sqlite3");
+        let parked = original.path().join("parked.sqlite3");
+        let result = VmStore::open_inner(original.path(), now, |path| {
+            #[cfg(unix)]
+            {
+                // Put both names back before returning, so a before/after
+                // pathname-only check would accept the substituted connection.
+                fs::rename(path, &parked)?;
+                fs::rename(&other_path, path)?;
+                let opened = open_sqlite(path)?;
+                fs::rename(path, &other_path)?;
+                fs::rename(&parked, path)?;
+                Ok(opened)
+            }
+            #[cfg(windows)]
+            {
+                // The retained guard denies rename here. Present a connection
+                // to the other database to exercise the independent handle check.
+                let error = fs::rename(path, &parked).unwrap_err();
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+                );
+                open_sqlite(&other_path)
+            }
+        });
+        let Err(error) = result else {
+            panic!("SQLite opened an unexpected main database");
+        };
+        assert_eq!(
+            error.to_string(),
+            "SQLite VM main database identity changed"
+        );
+        for dir in [&original, &replacement] {
+            let raw = open_sqlite(&dir.path().join("activity.sqlite3")).unwrap();
+            assert_eq!(
+                count(&raw, "SELECT status FROM vm_operations", []).unwrap(),
+                0
+            );
+            assert_eq!(count(&raw, "SELECT status FROM activity", []).unwrap(), 0);
+        }
+    }
 }
