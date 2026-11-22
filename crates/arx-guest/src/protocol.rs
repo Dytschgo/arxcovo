@@ -87,7 +87,6 @@ pub enum ProtocolError {
     InvalidExitCode,
     ExpectedHello,
     UnsupportedVersion,
-    DuplicateHello,
 }
 
 impl fmt::Display for ProtocolError {
@@ -107,7 +106,6 @@ impl fmt::Display for ProtocolError {
             Self::InvalidExitCode => "invalid guest script exit code",
             Self::ExpectedHello => "expected guest handshake",
             Self::UnsupportedVersion => "unsupported guest protocol version",
-            Self::DuplicateHello => "duplicate guest handshake",
         })
     }
 }

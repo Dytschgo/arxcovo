@@ -9,6 +9,8 @@ use arx_guest::{
 const CHALLENGE: &str = "0123456789abcdef0123456789abcdef";
 const HELLO: &[u8] =
     br#"{"type":"Hello","version":1,"challenge":"0123456789abcdef0123456789abcdef"}"#;
+const WRONG_VERSION_HELLO: &[u8] =
+    br#"{"type":"Hello","version":2,"challenge":"0123456789abcdef0123456789abcdef"}"#;
 const PING: &[u8] = br#"{"type":"Ping","id":1}"#;
 
 fn frame(payload: &[u8]) -> Vec<u8> {
@@ -272,9 +274,7 @@ fn requires_a_valid_hello_before_any_other_request() {
             ProtocolError::ExpectedHello,
         ),
         (
-            frame(
-                br#"{"type":"Hello","version":2,"challenge":"0123456789abcdef0123456789abcdef"}"#,
-            ),
+            frame(WRONG_VERSION_HELLO),
             ProtocolError::UnsupportedVersion,
         ),
     ] {
@@ -342,8 +342,19 @@ fn assert_closes_after_hello(next_frame: &[u8], expected: ProtocolError) {
 }
 
 #[test]
-fn rejects_duplicate_hello_and_stops_reading() {
-    assert_closes_after_hello(&frame(HELLO), ProtocolError::DuplicateHello);
+fn rejects_an_unsupported_version_after_hello() {
+    assert_closes_after_hello(
+        &frame(WRONG_VERSION_HELLO),
+        ProtocolError::UnsupportedVersion,
+    );
+}
+
+#[test]
+fn enforces_the_frame_limit_after_hello() {
+    assert_closes_after_hello(
+        &(MAX_FRAME as u32 + 1).to_be_bytes(),
+        ProtocolError::InvalidFrameLength,
+    );
 }
 
 #[test]
@@ -508,56 +519,130 @@ fn reports_errors_without_input_or_io_details() {
     }
 }
 
+struct Executor<'a> {
+    script: &'a str,
+    calls: std::slice::Iter<'a, (u32, ScriptOutcome)>,
+}
+
+impl ScriptExecutor for Executor<'_> {
+    fn script_execution(&self) -> ScriptExecution {
+        ScriptExecution::Available
+    }
+
+    fn run_script(&mut self, script: &str, timeout_s: u32) -> ScriptOutcome {
+        assert_eq!(script, self.script);
+        let &(expected_timeout, outcome) = self.calls.next().expect("unexpected script");
+        assert_eq!(timeout_s, expected_timeout);
+        outcome
+    }
+}
+
+#[test]
+fn resets_on_hello_before_and_after_a_script() {
+    let next_challenge = "11111111111111111111111111111111";
+    let final_challenge = "22222222222222222222222222222222";
+    let hello = |challenge: &str| Request::Hello {
+        version: PROTOCOL_VERSION,
+        challenge: challenge.to_owned(),
+    };
+    let script = "echo hello";
+    let calls = [
+        (MIN_TIMEOUT_S, ScriptOutcome::Exited { exit_code: 7 }),
+        (MAX_TIMEOUT_S, ScriptOutcome::Exited { exit_code: 0 }),
+    ];
+    let mut executor = Executor {
+        script,
+        calls: calls.iter(),
+    };
+    let mut requests = Vec::new();
+    for request in [
+        hello(CHALLENGE),
+        hello(next_challenge),
+        run_script(1, script, MIN_TIMEOUT_S),
+        hello(final_challenge),
+        run_script(1, script, MAX_TIMEOUT_S),
+    ] {
+        write_frame(&mut requests, &request).unwrap();
+    }
+    let mut responses = Vec::new();
+    serve(requests.as_slice(), &mut responses, &mut executor).unwrap();
+    assert_eq!(executor.calls.len(), 0);
+
+    let ack = |challenge: &str| Response::HelloAck {
+        version: PROTOCOL_VERSION,
+        challenge: challenge.to_owned(),
+        script_execution: ScriptExecution::Available,
+    };
+    let script_result = |exit_code| Response::ScriptResult {
+        id: 1,
+        status: ScriptStatus::Exited,
+        exit_code: Some(exit_code),
+    };
+    let mut output = responses.as_slice();
+    for expected in [
+        ack(CHALLENGE),
+        ack(next_challenge),
+        script_result(7),
+        ack(final_challenge),
+        script_result(0),
+    ] {
+        assert!(
+            matches!(read_frame::<Response>(&mut output), Ok(Some(actual)) if actual == expected)
+        );
+    }
+    assert!(output.is_empty());
+}
+
+#[test]
+fn keeps_serving_after_many_hellos() {
+    let script = "echo hello";
+    let calls = [(MIN_TIMEOUT_S, ScriptOutcome::Exited { exit_code: 0 })];
+    let mut executor = Executor {
+        script,
+        calls: calls.iter(),
+    };
+    let mut requests = Vec::new();
+    for nonce in 0..1024 {
+        write_frame(
+            &mut requests,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+                challenge: format!("{nonce:032x}"),
+            },
+        )
+        .unwrap();
+    }
+    write_frame(&mut requests, &run_script(1, script, MIN_TIMEOUT_S)).unwrap();
+    serve(requests.as_slice(), io::sink(), &mut executor).unwrap();
+    assert_eq!(executor.calls.len(), 0);
+}
+
 #[test]
 fn dispatches_valid_scripts_and_returns_all_executor_statuses_in_order() {
-    struct Executor<'a> {
-        script: &'a str,
-        outcomes: std::slice::Iter<'a, ScriptOutcome>,
-    }
-
-    impl ScriptExecutor for Executor<'_> {
-        fn script_execution(&self) -> ScriptExecution {
-            ScriptExecution::Available
-        }
-
-        fn run_script(&mut self, script: &str, timeout_s: u32) -> ScriptOutcome {
-            assert_eq!(script, self.script);
-            let expected_timeout = if self.outcomes.len() == 5 {
-                MIN_TIMEOUT_S
-            } else {
-                MAX_TIMEOUT_S
-            };
-            assert_eq!(timeout_s, expected_timeout);
-            *self.outcomes.next().expect("unexpected script")
-        }
-    }
-
-    let outcomes = [
-        ScriptOutcome::Exited {
-            exit_code: u32::MAX,
-        },
-        ScriptOutcome::Unavailable,
-        ScriptOutcome::TimedOut,
-        ScriptOutcome::LaunchFailed,
-        ScriptOutcome::Terminated,
+    let calls = [
+        (
+            MIN_TIMEOUT_S,
+            ScriptOutcome::Exited {
+                exit_code: u32::MAX,
+            },
+        ),
+        (MAX_TIMEOUT_S, ScriptOutcome::Unavailable),
+        (MAX_TIMEOUT_S, ScriptOutcome::TimedOut),
+        (MAX_TIMEOUT_S, ScriptOutcome::LaunchFailed),
+        (MAX_TIMEOUT_S, ScriptOutcome::Terminated),
     ];
     let script = "é".repeat(2048);
     let mut executor = Executor {
         script: &script,
-        outcomes: outcomes.iter(),
+        calls: calls.iter(),
     };
     let mut requests = frame(HELLO);
-    for (index, id) in (1..=5).enumerate() {
-        let timeout = if index == 0 {
-            MIN_TIMEOUT_S
-        } else {
-            MAX_TIMEOUT_S
-        };
+    for (id, (timeout, _)) in (1..).zip(calls) {
         write_frame(&mut requests, &run_script(id, &script, timeout)).unwrap();
     }
     let mut responses = Vec::new();
     serve(requests.as_slice(), &mut responses, &mut executor).unwrap();
-    assert_eq!(executor.outcomes.len(), 0);
+    assert_eq!(executor.calls.len(), 0);
 
     let fixtures = [
         r#"{"type":"HelloAck","version":1,"challenge":"0123456789abcdef0123456789abcdef","script_execution":"available"}"#,

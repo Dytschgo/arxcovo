@@ -1,3 +1,13 @@
+//! The first request must be a Hello. Every valid Hello starts a fresh session
+//! and receives a HelloAck echoing its challenge. A Hello buffered across a
+//! virtio-serial port close can reach the guest before the host's fresh Hello,
+//! so both are serviced on the same connection.
+//!
+//! Requests are processed serially. A Hello arriving during a script is read
+//! only after the script finishes and its result is written. The host matches
+//! the HelloAck to its challenge and discards frames before the matching ack.
+//! The loop retains no challenge or request history across resets.
+
 use std::io::{Read, Write};
 
 use crate::protocol::{
@@ -27,24 +37,20 @@ pub fn serve(
     mut writer: impl Write,
     executor: &mut impl ScriptExecutor,
 ) -> Result<(), ProtocolError> {
-    let Some(request) = read_frame(&mut reader)? else {
-        return Ok(());
-    };
-    let Request::Hello { version, challenge } = request else {
-        return Err(ProtocolError::ExpectedHello);
-    };
-    write_frame(
-        &mut writer,
-        &Response::HelloAck {
-            version,
-            challenge,
-            script_execution: executor.script_execution(),
-        },
-    )?;
-
+    let mut handshake_complete = false;
     while let Some(request) = read_frame(&mut reader)? {
+        if !handshake_complete && !matches!(request, Request::Hello { .. }) {
+            return Err(ProtocolError::ExpectedHello);
+        }
         let response = match request {
-            Request::Hello { .. } => return Err(ProtocolError::DuplicateHello),
+            Request::Hello { version, challenge } => {
+                handshake_complete = true;
+                Response::HelloAck {
+                    version,
+                    challenge,
+                    script_execution: executor.script_execution(),
+                }
+            }
             Request::Ping { id } => Response::Pong { id },
             Request::RunScript {
                 id,
