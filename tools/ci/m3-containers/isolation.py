@@ -550,9 +550,9 @@ class Resources:
         a = self.start("a0", end)
         c = self.start("c0", end)
         b = self.start("b0", end)
-        for node, (_unit, _invocation, pid) in zip("acb", (a, c, b)):
+        for node, (unit, _invocation, pid) in zip("acb", (a, c, b)):
             self.event(node, "boot0", b"r2-init-v1\n", end, process=pid)
-            self.check_namespace(node, pid, end)
+            self.check_namespace(node, unit, pid, end)
         for node in "ac":
             self.event(node, "daemon/listeners", b"r2-listeners-v1\n", end)
         marker = self.root / "b/probe/persistent"
@@ -575,12 +575,13 @@ class Resources:
         after = marker.stat()
         require((after.st_dev, after.st_ino, after.st_mtime_ns) == (before.st_dev, before.st_ino, before.st_mtime_ns),
                 "restart-image-identity")
-        self.check_namespace("b", restarted[2], end)
+        self.check_namespace("b", restarted[0], restarted[2], end)
         require(restarted[2] != b[2], "restart-process-identity")
         self.facts["restart"] = "same-data-fresh-run"
 
-    def check_namespace(self, node, pid, end):
+    def check_namespace(self, node, unit, pid, end):
         remaining(end)
+        require(re.fullmatch(rf"arx-r2-{self.id}-{node}[01]\.service", unit), "unit-attribution")
         outer = Path(f"/proc/{pid}")
         children = bounded_read(outer / f"task/{pid}/children", 1024).decode("ascii").split()
         require(len(children) == 1 and re.fullmatch(r"[1-9][0-9]{0,9}", children[0]), "namespace-init")
@@ -589,7 +590,8 @@ class Resources:
         require(re.search(r"^NSpid:\s+" + children[0] + r"\s+1$", status, re.M) is not None,
                 "namespace-init-pid")
         check_security_status(status, 0, 0)
-        check_mount_inventory(bounded_read(init / "mountinfo", 8192).decode("ascii"), node == "b")
+        check_mount_inventory(bounded_read(init / "mountinfo", 8192).decode("ascii"), node == "b",
+                              cgroup_root=f"/system.slice/{unit}")
         for namespace in ("mnt", "uts", "ipc", "pid", "net", "cgroup"):
             actual = (init / "ns" / namespace).stat().st_ino
             require(actual != (Path("/proc/self/ns") / namespace).stat().st_ino, "namespace-host-alias")
@@ -602,10 +604,9 @@ class Resources:
         self.facts[node]["lsm"] = lsm
         if node == "b":
             cgroup = bounded_read(outer / "cgroup", 256).decode("ascii").strip()
-            require(re.fullmatch(r"0::/system\.slice/arx-r2-[0-9a-f]{16}-b[01]\.service/init", cgroup),
-                    "broker-host-membership")
-            unit = Path("/sys/fs/cgroup") / cgroup[4:].removesuffix("/init") / "system.slice/arxd.service"
-            self.facts[node]["broker"] = self.check_delegate(unit, init)
+            require(cgroup == f"0::/system.slice/{unit}/init", "broker-host-membership")
+            delegate = Path("/sys/fs/cgroup") / cgroup[4:].removesuffix("/init") / "system.slice/arxd.service"
+            self.facts[node]["broker"] = self.check_delegate(delegate, init)
 
     @staticmethod
     def check_delegate(unit, init):
@@ -1001,15 +1002,23 @@ def check_security_status(status, caps, uid):
             and "Groups" in fields and not fields["Groups"].strip(), "process-locks")
 
 
-def check_mount_inventory(contents, broker):
+def check_mount_inventory(contents, broker, cgroup_root="/"):
+    require(
+        isinstance(cgroup_root, str)
+        and (cgroup_root == "/"
+             or (cgroup_root.startswith("/") and not cgroup_root.endswith("/")
+                 and "//" not in cgroup_root and ".." not in cgroup_root.split("/"))),
+        "mount-cgroup-root",
+    )
     cgroup = "/sys/fs/cgroup"
     expected = {
         "/": ("ext4", "/", "ro"), "/data": ("ext4", "/", "rw"), "/proc": ("proc", "/", "rw"),
         "/run": ("tmpfs", "/", "rw"), "/tmp": ("tmpfs", "/", "rw"), "/dev": ("tmpfs", "/", "rw"),
-        "/dev/pts": ("devpts", "/", "rw"), cgroup: ("cgroup2", "/", "ro"),
+        "/dev/pts": ("devpts", "/", "rw"), cgroup: ("cgroup2", cgroup_root, "ro"),
     }
     if broker:
-        expected[cgroup + "/system.slice/arxd.service"] = ("cgroup2", "/system.slice/arxd.service", "rw")
+        delegate_root = "/system.slice/arxd.service" if cgroup_root == "/" else f"{cgroup_root}/system.slice/arxd.service"
+        expected[cgroup + "/system.slice/arxd.service"] = ("cgroup2", delegate_root, "rw")
     observed = {}
     ids = set()
     for line in contents.splitlines():

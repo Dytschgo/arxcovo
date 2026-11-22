@@ -19,14 +19,16 @@ BRIDGE = "r2" + "1"*11
 TABLE = "r2_" + "1"*16
 
 
-def mounts():
+def mounts(*, broker=True, cgroup_root="/"):
+    delegate_root = "/system.slice/arxd.service" if cgroup_root == "/" else f"{cgroup_root}/system.slice/arxd.service"
     data = [
         ("/", "/", "ro", "ext4"), ("/", "/data", "rw", "ext4"),
         ("/", "/proc", "rw", "proc"), ("/", "/run", "rw", "tmpfs"),
         ("/", "/tmp", "rw", "tmpfs"), ("/", "/dev", "rw", "tmpfs"),
-        ("/", "/dev/pts", "rw", "devpts"), ("/", "/sys/fs/cgroup", "ro", "cgroup2"),
-        ("/system.slice/arxd.service", "/sys/fs/cgroup/system.slice/arxd.service", "rw", "cgroup2"),
+        ("/", "/dev/pts", "rw", "devpts"), (cgroup_root, "/sys/fs/cgroup", "ro", "cgroup2"),
     ]
+    if broker:
+        data.append((delegate_root, "/sys/fs/cgroup/system.slice/arxd.service", "rw", "cgroup2"))
     return "\n".join(f"{i} 1 0:1 {src} {dest} {flag},nosuid - {kind} none rw"
                      for i, (src, dest, flag, kind) in enumerate(data, 2))
 
@@ -56,6 +58,99 @@ class Namespaces(unittest.TestCase):
                     isolation.check_mount_inventory(candidate, True)
         with self.assertRaisesRegex(Refusal, "mount-inventory"):
             isolation.check_mount_inventory(good, False)
+
+    def test_mount_inventory_host_unit_cgroup_root_and_escape_refusals(self):
+        run_id = "1" * 16
+        b0_root = f"/system.slice/arx-r2-{run_id}-b0.service"
+        b1_root = f"/system.slice/arx-r2-{run_id}-b1.service"
+        a0_root = f"/system.slice/arx-r2-{run_id}-a0.service"
+        c0_root = f"/system.slice/arx-r2-{run_id}-c0.service"
+
+        b0_good = mounts(broker=True, cgroup_root=b0_root)
+        a0_good = mounts(broker=False, cgroup_root=a0_root)
+        isolation.check_mount_inventory(b0_good, True, cgroup_root=b0_root)
+        isolation.check_mount_inventory(a0_good, False, cgroup_root=a0_root)
+
+        refusal_cases = (
+            ("broker-host-root-escape", mounts(broker=True, cgroup_root="/"), True, b0_root),
+            ("broker-cgroup-root-only-escape", b0_good.replace(f" {b0_root} /sys/fs/cgroup ", " / /sys/fs/cgroup "), True, b0_root),
+            ("broker-wrong-unit", mounts(broker=True, cgroup_root=b1_root), True, b0_root),
+            ("broker-unprefixed-delegate",
+             b0_good.replace(f" {b0_root}/system.slice/arxd.service ", " /system.slice/arxd.service "), True, b0_root),
+            ("broker-wrong-unit-delegate",
+             b0_good.replace(f" {b0_root}/system.slice/arxd.service ", f" {b1_root}/system.slice/arxd.service "), True, b0_root),
+            ("nonbroker-host-root-escape", mounts(broker=False, cgroup_root="/"), False, a0_root),
+            ("nonbroker-wrong-unit", mounts(broker=False, cgroup_root=c0_root), False, a0_root),
+            ("nonbroker-unexpected-delegate", mounts(broker=True, cgroup_root=a0_root), False, a0_root),
+        )
+        for label, candidate, broker, expected_root in refusal_cases:
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(Refusal, "^mount-inventory$"):
+                    isolation.check_mount_inventory(candidate, broker, cgroup_root=expected_root)
+
+        for bad_root in ("", "system.slice/unit.service", f"{b0_root}/", f"{b0_root}/../other", "/system.slice//unit"):
+            with self.subTest(bad_root=bad_root):
+                with self.assertRaisesRegex(Refusal, "^mount-cgroup-root$"):
+                    isolation.check_mount_inventory(b0_good, True, cgroup_root=bad_root)
+
+    def test_check_namespace_verifies_host_unit_cgroup_root_and_broker_unit_membership(self):
+        resources = Cleanup.make_resources()
+        resources.facts = {"a": {}, "b": {}, "c": {}}
+        b0_unit = f"arx-r2-{resources.id}-b0.service"
+        b1_unit = f"arx-r2-{resources.id}-b1.service"
+        a0_unit = f"arx-r2-{resources.id}-a0.service"
+        b0_root = f"/system.slice/{b0_unit}"
+        a0_root = f"/system.slice/{a0_unit}"
+
+        def run_check(node, unit, mountinfo_text, outer_cgroup_text):
+            outer_pid = 4100
+            init_pid = 4101
+            reads = {
+                Path(f"/proc/{outer_pid}/task/{outer_pid}/children"): f"{init_pid}\n".encode("ascii"),
+                Path(f"/proc/{init_pid}/status"): (
+                    f"NSpid:\t{init_pid}\t1\nSeccomp:\t0\n" + status(0, 0)
+                ).encode("ascii"),
+                Path(f"/proc/{init_pid}/mountinfo"): mountinfo_text.encode("ascii"),
+                Path(f"/proc/{init_pid}/attr/current"): b"unconfined\n",
+                Path(f"/proc/{outer_pid}/cgroup"): outer_cgroup_text.encode("ascii"),
+            }
+            net_path = Path("/run/netns") / resources.namespaces[node]
+            ns_inos = {
+                Path("/proc/self/ns/mnt"): 101, Path("/proc/self/ns/uts"): 102,
+                Path("/proc/self/ns/ipc"): 103, Path("/proc/self/ns/pid"): 104,
+                Path("/proc/self/ns/net"): 105, Path("/proc/self/ns/cgroup"): 106,
+                Path(f"/proc/{init_pid}/ns/mnt"): 201, Path(f"/proc/{init_pid}/ns/uts"): 202,
+                Path(f"/proc/{init_pid}/ns/ipc"): 203, Path(f"/proc/{init_pid}/ns/pid"): 204,
+                Path(f"/proc/{init_pid}/ns/net"): 205, Path(f"/proc/{init_pid}/ns/cgroup"): 206,
+                net_path: 205,
+            }
+            delegate_calls = []
+
+            def fake_delegate(delegate_path, init_path):
+                delegate_calls.append((delegate_path, init_path))
+                return {"caps": 193}
+
+            with patch.object(isolation, "remaining", return_value=10.0), \
+                 patch.object(isolation, "bounded_read", side_effect=lambda path, _limit: reads[path]), \
+                 patch.object(Path, "stat", lambda p: SimpleNamespace(st_ino=ns_inos[p])), \
+                 patch.object(resources, "check_delegate", side_effect=fake_delegate):
+                resources.check_namespace(node, unit, outer_pid, 100.0)
+            return delegate_calls
+
+        # Matching host-perspective cgroup_root passes for both broker (b0) and non-broker (a0).
+        calls = run_check("b", b0_unit, mounts(broker=True, cgroup_root=b0_root), f"0::{b0_root}/init\n")
+        self.assertEqual(calls, [(Path("/sys/fs/cgroup") / f"system.slice/{b0_unit}/system.slice/arxd.service", Path("/proc/4101"))])
+        self.assertEqual(run_check("a", a0_unit, mounts(broker=False, cgroup_root=a0_root), f"0::{a0_root}/init\n"), [])
+
+        # Host root "/" mountinfo is refused when unit-scoped host cgroup_root is expected.
+        with self.assertRaisesRegex(Refusal, "^mount-inventory$"):
+            run_check("b", b0_unit, mounts(broker=True, cgroup_root="/"), f"0::{b0_root}/init\n")
+        # Mismatched broker unit (b1 cgroup while checking b0 unit) is refused.
+        with self.assertRaisesRegex(Refusal, "^broker-host-membership$"):
+            run_check("b", b0_unit, mounts(broker=True, cgroup_root=b0_root), f"0::/system.slice/{b1_unit}/init\n")
+        # Wrong node unit attribution is refused before reading /proc.
+        with self.assertRaisesRegex(Refusal, "^unit-attribution$"):
+            run_check("a", b0_unit, mounts(broker=False, cgroup_root=a0_root), f"0::{a0_root}/init\n")
 
     def test_exact_caps_nnp_uid_gid_groups_and_umask(self):
         good = status()
