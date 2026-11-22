@@ -176,10 +176,31 @@ fn stale_observations_and_uncertain_release_do_not_authorize_work() {
         ),
         Err(NativeRefusal::OwnerActivityUnverified)
     );
-    assert_eq!(capacity(75, 20, 40, 100, 15).unwrap().free_bytes, 35);
-    assert_eq!(capacity(75, 20, 25, 100, 15).unwrap().free_bytes, 25);
-    assert!(capacity(75, 26, 25, 100, 15).is_err());
-    assert!(capacity(0, 1, 25, 101, 15).is_err());
+    // (allocated, inner_free, outer_free, total, ceiling, floor)
+    assert_eq!(capacity(75, 20, 40, 100, 100, 15).unwrap().free_bytes, 35); // min(40, 20 + 15)
+    assert_eq!(capacity(75, 20, 25, 100, 100, 15).unwrap().free_bytes, 25); // outer bound
+    assert_eq!(
+        capacity(75, 26, 25, 100, 100, 15).err(),
+        Some(NativeRefusal::DiskCeilingUnverified) // allocated + inner_free > total
+    );
+    assert_eq!(
+        capacity(0, 1, 25, 101, 100, 15).err(),
+        Some(NativeRefusal::DiskCeilingUnverified) // total > ceiling
+    );
+    // A volume exactly at the configured ceiling is admissible.
+    assert_eq!(capacity(0, 0, 10, 100, 100, 15).unwrap().free_bytes, 10);
+    assert_eq!(
+        capacity(0, 0, 10, 0, 100, 15).err(),
+        Some(NativeRefusal::DiskCeilingUnverified) // zero-sized volume
+    );
+    assert_eq!(
+        capacity(0, 1, 5, 10, 10, u64::MAX).err(),
+        Some(NativeRefusal::DiskCeilingUnverified) // inner_free + floor overflows
+    );
+    assert_eq!(
+        capacity(u64::MAX, 1, 5, u64::MAX, u64::MAX, 0).err(),
+        Some(NativeRefusal::DiskCeilingUnverified) // allocated + inner_free overflows
+    );
     let mut release = StopEvidence {
         process_exited: true,
         guest_shutdown: true,
