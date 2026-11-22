@@ -133,3 +133,247 @@ fn watermarks_compare_exact_identity_at_equality() {
     assert!(!covers(LogPos { index: 11, ..p }, p));
     assert!(covers(LogPos { index: 13, ..p }, p));
 }
+
+async fn no_engine_fixture() -> (
+    AuthenticatedPeer,
+    Arc<RetainedNode>,
+    Arc<Controller>,
+    tempfile::TempDir,
+) {
+    let (genuine, sm, dir) = super::super::peer_transport::admission_test_peer().await;
+    let sm_released = sm.0.lock().unwrap().released();
+    let node = Arc::new(RetainedNode::new(ConsensusNode {
+        id: 1,
+        read_permits: Arc::new(Semaphore::new(READ_PERMITS)),
+        issue_permits: Arc::new(Semaphore::new(issue::MAX_ISSUING)),
+        read_blocking: Arc::default(),
+        raft: None,
+        log_released: release_pair().1,
+        sm_released,
+        log_weak: Weak::new(),
+        sm_weak: Arc::downgrade(&sm.0),
+        sm: Some(sm),
+        permits: Arc::new(Semaphore::new(1)),
+        owners: Mutex::default(),
+    }));
+    let controller = Controller::new(&node);
+    (genuine, node, controller, dir)
+}
+
+fn take_diagnostics(controller: &Controller) -> Vec<(&'static str, &'static str)> {
+    std::mem::take(&mut *controller.hooks.diagnostics.lock().unwrap())
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_register_waits_for_node_release_within_store_wait() {
+    let node = Arc::new(tokio::sync::Mutex::new(0usize));
+    let held = node.clone().try_lock_owned().unwrap();
+    let start = Instant::now();
+    let deadline = start + BUDGET;
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(12)).await;
+        drop(held);
+    });
+    let mut busy = false;
+    let mut worker = register_with_node_bounded(
+        &node,
+        deadline,
+        || Ok(()),
+        |_, start| {
+            let node = node.clone();
+            Box::pin(start.after_release(
+                async move {
+                    *node
+                        .try_lock()
+                        .expect("registration unlocked before worker observation") += 1;
+                    Reply::Pending
+                },
+                Reply::Refused,
+            ))
+        },
+        || busy = true,
+    )
+    .await
+    .unwrap();
+    releaser.await.unwrap();
+    assert!(!busy);
+    assert!(Instant::now() >= start + Duration::from_millis(12));
+    assert!(Instant::now() < start + peer_registry::STORE_WAIT);
+    assert_eq!(*node.try_lock().unwrap(), 0);
+    assert_eq!(worker.as_mut().await, Reply::Pending);
+    assert_eq!(*node.try_lock().unwrap(), 1);
+
+    let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+    let address: SocketAddr = "192.168.1.2:1234".parse().unwrap();
+    let held = retained.clone().try_lock_owned().unwrap();
+    let start = Instant::now();
+    let deadline = start + BUDGET;
+    let mut admit = std::pin::pin!(controller.admit(genuine, address, deadline));
+    assert!(futures_util::poll!(&mut admit).is_pending());
+    tokio::time::advance(Duration::from_millis(12)).await;
+    assert!(futures_util::poll!(&mut admit).is_pending());
+    drop(held);
+    // Reaches no-Engine `register_admission` (`raft: None`) after acquiring `node`,
+    // without recording `node-busy`.
+    assert_eq!(admit.await, Reply::Refused);
+    assert!(Instant::now() < start + peer_registry::STORE_WAIT);
+    assert!(take_diagnostics(&controller).is_empty());
+    assert!(controller.intent_released().now_or_never().is_some());
+    assert!(!controller.intent.load(Ordering::Relaxed));
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_worker_and_confirm_wait_for_node_release_within_store_wait() {
+    let address: SocketAddr = "192.168.1.2:1234".parse().unwrap();
+    let position = LogPos {
+        term: 1,
+        leader: 1,
+        index: 7,
+    };
+
+    // Generic worker & confirm bounded lock acquisition succeeds after a 12 ms hold.
+    for expected in [Reply::Pending, Reply::Applied(position, address)] {
+        let node = Arc::new(tokio::sync::Mutex::new(expected));
+        let held = node.clone().try_lock_owned().unwrap();
+        let start = Instant::now();
+        let deadline = start + BUDGET;
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(12)).await;
+            drop(held);
+        });
+        let guard = lock_node_bounded(&node, deadline).await.unwrap();
+        assert_eq!(*guard, expected);
+        drop(guard);
+        releaser.await.unwrap();
+        assert!(Instant::now() >= start + Duration::from_millis(12));
+        assert!(Instant::now() < start + peer_registry::STORE_WAIT);
+    }
+
+    // Exercise the actual Controller `admission-worker` and `admission-confirm` stages
+    // against a non-Engine RetainedNode held for 12 ms.
+    let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+
+    let held = retained.clone().try_lock_owned().unwrap();
+    let submitted = AtomicBool::new(false);
+    let start = Instant::now();
+    let deadline = start + BUDGET;
+    let mut worker = std::pin::pin!(controller.run(genuine, address, deadline, &submitted));
+    assert!(futures_util::poll!(&mut worker).is_pending());
+    tokio::time::advance(Duration::from_millis(12)).await;
+    assert!(futures_util::poll!(&mut worker).is_pending());
+    drop(held);
+    assert_eq!(worker.await, Reply::Refused);
+    assert!(!submitted.load(Ordering::SeqCst));
+    assert!(Instant::now() < start + peer_registry::STORE_WAIT);
+    assert!(take_diagnostics(&controller).is_empty());
+
+    let held = retained.clone().try_lock_owned().unwrap();
+    let start = Instant::now();
+    let deadline = start + BUDGET;
+    let mut confirm = std::pin::pin!(
+        controller.confirm_admission(&retained, genuine, address, position, deadline)
+    );
+    assert!(futures_util::poll!(&mut confirm).is_pending());
+    tokio::time::advance(Duration::from_millis(12)).await;
+    assert!(futures_util::poll!(&mut confirm).is_pending());
+    drop(held);
+    assert_eq!(confirm.await, Reply::Unknown);
+    assert!(Instant::now() < start + peer_registry::STORE_WAIT);
+    assert!(take_diagnostics(&controller).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_paths_fail_closed_and_record_node_busy_at_cap_and_tighter_deadline() {
+    let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+    let address: SocketAddr = "192.168.1.2:1234".parse().unwrap();
+    let position = LogPos {
+        term: 1,
+        leader: 1,
+        index: 9,
+    };
+
+    for (outer_budget, expected_wait) in [
+        (BUDGET, peer_registry::STORE_WAIT),
+        (Duration::from_millis(5), Duration::from_millis(5)),
+    ] {
+        // 1. admission-register
+        let held = retained.clone().try_lock_owned().unwrap();
+        let start = Instant::now();
+        let deadline = start + outer_budget;
+        let mut admit = std::pin::pin!(controller.admit(genuine, address, deadline));
+        assert!(futures_util::poll!(&mut admit).is_pending());
+        tokio::time::advance(expected_wait).await;
+        assert_eq!(Instant::now(), start + expected_wait);
+        assert_eq!(
+            futures_util::poll!(&mut admit),
+            std::task::Poll::Ready(Reply::Refused)
+        );
+        drop(held);
+        assert_eq!(
+            take_diagnostics(&controller),
+            vec![("admission-register", "node-busy")]
+        );
+        assert!(!controller.intent.load(Ordering::Relaxed));
+
+        // 2. admission-worker
+        let held = retained.clone().try_lock_owned().unwrap();
+        let submitted = AtomicBool::new(false);
+        let start = Instant::now();
+        let deadline = start + outer_budget;
+        let mut worker = std::pin::pin!(controller.run(genuine, address, deadline, &submitted));
+        assert!(futures_util::poll!(&mut worker).is_pending());
+        tokio::time::advance(expected_wait).await;
+        assert_eq!(Instant::now(), start + expected_wait);
+        assert_eq!(
+            futures_util::poll!(&mut worker),
+            std::task::Poll::Ready(Reply::Refused)
+        );
+        drop(held);
+        assert!(!submitted.load(Ordering::SeqCst));
+        assert_eq!(
+            take_diagnostics(&controller),
+            vec![("admission-worker", "node-busy")]
+        );
+
+        // 3. admission-confirm
+        let held = retained.clone().try_lock_owned().unwrap();
+        let start = Instant::now();
+        let deadline = start + outer_budget;
+        let mut confirm = std::pin::pin!(
+            controller.confirm_admission(&retained, genuine, address, position, deadline)
+        );
+        assert!(futures_util::poll!(&mut confirm).is_pending());
+        tokio::time::advance(expected_wait).await;
+        assert_eq!(Instant::now(), start + expected_wait);
+        assert_eq!(
+            futures_util::poll!(&mut confirm),
+            std::task::Poll::Ready(Reply::Unknown)
+        );
+        drop(held);
+        assert_eq!(
+            take_diagnostics(&controller),
+            vec![("admission-confirm", "node-busy")]
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_register_stops_promptly_during_node_contention_without_node_busy() {
+    let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+    let address: SocketAddr = "192.168.1.2:1234".parse().unwrap();
+    let held = retained.clone().try_lock_owned().unwrap();
+    let start = Instant::now();
+    let deadline = start + BUDGET;
+    let mut admit = std::pin::pin!(controller.admit(genuine, address, deadline));
+    assert!(futures_util::poll!(&mut admit).is_pending());
+    controller.stop();
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(
+        futures_util::poll!(&mut admit),
+        std::task::Poll::Ready(Reply::Refused)
+    );
+    drop(held);
+    assert!(Instant::now() < start + peer_registry::STORE_WAIT);
+    assert!(take_diagnostics(&controller).is_empty());
+    assert!(!controller.intent.load(Ordering::Relaxed));
+}

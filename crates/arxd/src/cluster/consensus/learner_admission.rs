@@ -119,6 +119,85 @@ pub(super) fn register_with_node<N, R>(
     Ok(registered)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeWaitError {
+    Busy,
+    Deadline,
+}
+
+async fn lock_node_bounded<'a, N>(
+    node: &'a tokio::sync::Mutex<N>,
+    deadline: Instant,
+) -> Result<tokio::sync::MutexGuard<'a, N>, NodeWaitError> {
+    let retry_until = peer_registry::store_wait_deadline(Some(deadline));
+    loop {
+        if Instant::now() >= retry_until {
+            return Err(NodeWaitError::Deadline);
+        }
+        if let Ok(guard) = node.try_lock() {
+            if Instant::now() >= retry_until {
+                drop(guard);
+                return Err(NodeWaitError::Deadline);
+            }
+            return Ok(guard);
+        }
+        if !peer_registry::poll_store_until(retry_until).await {
+            return Err(NodeWaitError::Busy);
+        }
+    }
+}
+
+async fn register_with_node_bounded<N, R, G>(
+    node: &tokio::sync::Mutex<N>,
+    deadline: Instant,
+    mut check_open: impl FnMut() -> Result<G, Reply>,
+    register: impl FnOnce(&N, PromotionStart) -> R,
+    on_busy: impl FnOnce(),
+) -> Result<R, Reply> {
+    let retry_until = peer_registry::store_wait_deadline(Some(deadline));
+    let mut register = Some(register);
+    loop {
+        enum Attempt<R> {
+            Done(R),
+            Busy,
+            Expired,
+        }
+        let attempt = {
+            let open = check_open()?;
+            if Instant::now() >= retry_until {
+                Attempt::Expired
+            } else if let Ok(node) = node.try_lock() {
+                if Instant::now() >= retry_until {
+                    Attempt::Expired
+                } else {
+                    let (ready, start) = oneshot::channel();
+                    let registered =
+                        register.take().expect("single registration")(&node, PromotionStart(start));
+                    // Owners may poll the worker before registration returns. Release this
+                    // borrow before its single fresh observation can touch the node.
+                    drop(node);
+                    drop(open);
+                    let _ = ready.send(());
+                    Attempt::Done(registered)
+                }
+            } else {
+                Attempt::Busy
+            }
+        };
+        match attempt {
+            Attempt::Done(registered) => return Ok(registered),
+            Attempt::Expired => return Err(Reply::Refused),
+            Attempt::Busy => {
+                if !peer_registry::poll_store_until(retry_until).await {
+                    let _ = check_open()?;
+                    on_busy();
+                    return Err(Reply::Refused);
+                }
+            }
+        }
+    }
+}
+
 pub(super) struct Controller {
     node: Weak<RetainedNode>,
     closed: Mutex<bool>,
@@ -183,6 +262,38 @@ impl Controller {
         Some((pos(metrics.cluster_committed?), matched))
     }
 
+    fn check_open(&self) -> Result<std::sync::MutexGuard<'_, bool>, Reply> {
+        let closed = self.closed.lock().map_err(|_| Reply::Refused)?;
+        if *closed {
+            return Err(Reply::Refused);
+        }
+        Ok(closed)
+    }
+
+    fn record_diagnostic(&self, stage: &'static str, category: &'static str) {
+        #[cfg(test)]
+        if let Ok(mut recorded) = self.hooks.diagnostics.lock() {
+            recorded.push((stage, category));
+        }
+        record(stage, category);
+    }
+
+    async fn lock_node_for_stage<'a>(
+        &self,
+        node: &'a RetainedNode,
+        deadline: Instant,
+        stage: &'static str,
+    ) -> Option<tokio::sync::MutexGuard<'a, ConsensusNode>> {
+        match lock_node_bounded(node, deadline).await {
+            Ok(guard) => Some(guard),
+            Err(NodeWaitError::Busy) => {
+                self.record_diagnostic(stage, "node-busy");
+                None
+            }
+            Err(NodeWaitError::Deadline) => None,
+        }
+    }
+
     pub(super) async fn admit(
         self: &Arc<Self>,
         peer: AuthenticatedPeer,
@@ -192,7 +303,9 @@ impl Controller {
         #[cfg(test)]
         self.hooks.requests.fetch_add(1, Ordering::Relaxed);
         let submitted = Arc::new(AtomicBool::new(false));
-        let result = self.register(peer, address, deadline, submitted.clone());
+        let result = self
+            .register(peer, address, deadline, submitted.clone())
+            .await;
         let rx = match result {
             Ok(rx) => rx,
             Err(answer) => return answer,
@@ -204,7 +317,7 @@ impl Controller {
         }
     }
 
-    fn register(
+    async fn register(
         self: &Arc<Self>,
         peer: AuthenticatedPeer,
         address: SocketAddr,
@@ -212,23 +325,31 @@ impl Controller {
         submitted: Arc<AtomicBool>,
     ) -> Result<oneshot::Receiver<Reply>, Reply> {
         peer.authenticated_identity().map_err(|_| Reply::Refused)?;
-        let closed = self.closed.lock().map_err(|_| Reply::Refused)?;
-        if *closed || Instant::now() >= deadline {
-            return Err(Reply::Refused);
+        {
+            let _open = self.check_open()?;
+            if Instant::now() >= deadline {
+                return Err(Reply::Refused);
+            }
         }
         let intent = Intent::waking(&self.intent)?;
         let node = self.node.upgrade().ok_or(Reply::Refused)?;
         let controller = self.clone();
-        register_with_node(&node, |node, start| {
-            node.register_admission(
-                intent,
-                start.after_release(
-                    async move { controller.run(peer, address, deadline, &submitted).await },
-                    Reply::Refused,
-                ),
-            )
-        })
-        .inspect_err(|_| record("admission-register", "node-busy"))?
+        register_with_node_bounded(
+            &node,
+            deadline,
+            || self.check_open(),
+            |node, start| {
+                node.register_admission(
+                    intent,
+                    start.after_release(
+                        async move { controller.run(peer, address, deadline, &submitted).await },
+                        Reply::Refused,
+                    ),
+                )
+            },
+            || self.record_diagnostic("admission-register", "node-busy"),
+        )
+        .await?
     }
 
     async fn run(
@@ -242,8 +363,10 @@ impl Controller {
             return Reply::Refused;
         };
         let (raft, observed) = {
-            let Ok(node) = node.try_lock() else {
-                record("admission-worker", "node-busy");
+            let Some(node) = self
+                .lock_node_for_stage(&node, deadline, "admission-worker")
+                .await
+            else {
                 return Reply::Refused;
             };
             let Some(raft) = node.raft.clone() else {
@@ -334,8 +457,22 @@ impl Controller {
             }
         };
         let position = pos(response.log_id);
-        let Ok(node) = node.try_lock() else {
-            record("admission-confirm", "node-busy");
+        self.confirm_admission(&node, peer, address, position, deadline)
+            .await
+    }
+
+    async fn confirm_admission(
+        &self,
+        node: &RetainedNode,
+        peer: AuthenticatedPeer,
+        address: SocketAddr,
+        position: LogPos,
+        deadline: Instant,
+    ) -> Reply {
+        let Some(node) = self
+            .lock_node_for_stage(node, deadline, "admission-confirm")
+            .await
+        else {
             return Reply::Unknown;
         };
         match node
@@ -394,6 +531,7 @@ pub(super) struct Hooks {
     pub(super) suppress_success: AtomicBool,
     pub(super) lost_reply: Mutex<Option<Reply>>,
     pub(super) barrier: Mutex<Option<Barrier>>,
+    pub(super) diagnostics: Mutex<Vec<(&'static str, &'static str)>>,
     pub(super) promotion: super::initial_promotion::Hooks,
 }
 
