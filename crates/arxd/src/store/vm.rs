@@ -1,18 +1,19 @@
 //! The VM profile has its own activity schema and database version. The
 //! shared and service openers have no route into this module.
+//! A v5 VM opener rejects v6. Upgraded state must be opened with v6-capable code.
 use super::{check_size, validate_principal};
 use crate::vm::{
     Action, Completion, ExpiredVm, ExpiryClaim, Id, RETRY_WINDOW_MS, Receipt, RecoveryClaim,
     Refusal, RequestId, Status,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, ffi,
     params,
 };
 use std::{fs, path::Path, sync::Mutex, time::Duration};
 
-const SCHEMA: &str = "
+const SCHEMA_V5: &str = "
 CREATE TABLE activity (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     principal TEXT NOT NULL CHECK(length(CAST(principal AS BLOB)) BETWEEN 1 AND 64
@@ -103,6 +104,172 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
+const VM_SCHEMA_VERSION: u32 = 6;
+
+// Activity IDs also serve as audit order and as references from cleanup and
+// tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
+// Action 11 is private build storage. The public Action codes stay as they were.
+const MIGRATE_V6: &str = "
+CREATE TABLE activity_v6 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    principal TEXT NOT NULL CHECK(length(CAST(principal AS BLOB)) BETWEEN 1 AND 64
+        AND principal NOT GLOB '*[^a-zA-Z0-9_-]*'),
+    actor TEXT NOT NULL CHECK(actor IN ('agent','daemon')),
+    vm_owner TEXT CHECK(length(CAST(vm_owner AS BLOB)) BETWEEN 1 AND 64
+        AND vm_owner NOT GLOB '*[^a-zA-Z0-9_-]*'),
+    vm BLOB CHECK(length(vm)=16),
+    action INTEGER NOT NULL CHECK(action BETWEEN 1 AND 11),
+    started_ms INTEGER NOT NULL CHECK(started_ms BETWEEN 0 AND 253402300799999),
+    status INTEGER NOT NULL DEFAULT 0 CHECK(status BETWEEN 0 AND 4),
+    reason INTEGER CHECK(reason BETWEEN 1 AND 18),
+    finished_ms INTEGER CHECK(finished_ms BETWEEN 0 AND 253402300799999),
+    terminal_order INTEGER UNIQUE CHECK(terminal_order>0),
+    cleanup_confirmed INTEGER CHECK(cleanup_confirmed IN (0,1)),
+    CHECK(vm IS NOT NULL OR action=11),
+    CHECK((status=0)=(finished_ms IS NULL)),
+    CHECK((status=0)=(terminal_order IS NULL)),
+    CHECK((status=4)=(reason IS NOT NULL)),
+    CHECK((actor='daemon')=(action IN (7,9,10)) AND (actor='agent' OR principal='arxd')),
+    CHECK((vm_owner IS NOT NULL)=(action IN (7,10)))
+) STRICT;
+INSERT INTO activity_v6 SELECT * FROM activity;
+INSERT INTO sqlite_sequence(name,seq) SELECT 'activity_v6',seq FROM sqlite_sequence
+    WHERE name='activity' AND NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='activity_v6');
+UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT seq FROM sqlite_sequence WHERE name='activity'),0))
+    WHERE name='activity_v6';
+DROP TABLE activity;
+ALTER TABLE activity_v6 RENAME TO activity;
+CREATE INDEX activity_principal ON activity(principal,id);
+CREATE UNIQUE INDEX pending_vm ON activity(vm) WHERE status=0 AND action<=6;
+
+CREATE TABLE vm_operations_v6 (
+    principal TEXT NOT NULL CHECK(length(CAST(principal AS BLOB)) BETWEEN 1 AND 64
+        AND principal NOT GLOB '*[^a-zA-Z0-9_-]*'),
+    request_key BLOB NOT NULL CHECK(length(request_key)=16),
+    operation_id BLOB NOT NULL UNIQUE DEFAULT (randomblob(16)) CHECK(length(operation_id)=16),
+    vm BLOB CHECK(length(vm)=16),
+    action INTEGER NOT NULL CHECK(action BETWEEN 1 AND 6 OR action IN (8,11)),
+    activity_id INTEGER NOT NULL UNIQUE CHECK(activity_id>0),
+    valid_through_ms INTEGER NOT NULL CHECK(valid_through_ms>=0),
+    status INTEGER NOT NULL DEFAULT 0 CHECK(status BETWEEN 0 AND 3),
+    lease_end_ms INTEGER CHECK(lease_end_ms BETWEEN 0 AND 253402300799999),
+    binding_kind TEXT NOT NULL DEFAULT 'legacy_vm'
+        CHECK(binding_kind IN ('legacy_vm','vm','template','recipe')),
+    subject_id BLOB CHECK(length(subject_id)=16),
+    recipe_id TEXT CHECK(length(recipe_id) BETWEEN 1 AND 64
+        AND length(recipe_id)=length(CAST(recipe_id AS BLOB))
+        AND recipe_id NOT GLOB '*[^a-z0-9-]*'),
+    recipe_digest BLOB CHECK(length(recipe_digest)=32),
+    request_digest BLOB CHECK(length(request_digest)=32),
+    script_result TEXT CHECK(script_result IN
+        ('legacy','exited','unavailable','timed_out','launch_failed','terminated','interrupted')),
+    script_exit_code INTEGER CHECK(script_exit_code BETWEEN 0 AND 4294967295),
+    CHECK((action=8)=(lease_end_ms IS NOT NULL)),
+    CHECK((action=11)=(vm IS NULL)),
+    CHECK((action=11)=(binding_kind='recipe')),
+    CHECK((binding_kind IN ('vm','template'))=(subject_id IS NOT NULL)),
+    CHECK((binding_kind='recipe')=(recipe_id IS NOT NULL)
+        AND (binding_kind='recipe')=(recipe_digest IS NOT NULL)),
+    CHECK(binding_kind NOT IN ('vm','template') OR (action=1)=(binding_kind='template')),
+    CHECK(binding_kind<>'vm' OR subject_id=vm),
+    CHECK((binding_kind='template')=(request_digest IS NOT NULL)),
+    CHECK(action=2 OR script_result IS NULL),
+    CHECK(action<>2 OR status=0 OR script_result IS NOT NULL),
+    CHECK(script_result IS NULL OR status<>0 OR script_result='legacy'),
+    CHECK((script_result IS 'exited')=(script_exit_code IS NOT NULL)),
+    PRIMARY KEY(principal,request_key)
+) STRICT, WITHOUT ROWID;
+-- Ledger rows can outlive their activity projection. Copy directly from the ledger.
+INSERT INTO vm_operations_v6(principal,request_key,vm,action,activity_id,valid_through_ms,
+    status,lease_end_ms,script_result)
+    SELECT principal,request_key,vm,action,activity_id,valid_through_ms,status,lease_end_ms,
+        CASE WHEN action=2 THEN 'legacy' END FROM vm_operations;
+DROP TABLE vm_operations;
+ALTER TABLE vm_operations_v6 RENAME TO vm_operations;
+
+-- Build charges live independently of instances. Completed build evidence can
+-- outlive its retry ledger. The sealed charge lives in the referenced template.
+CREATE TABLE vm_build_intents (
+    id BLOB PRIMARY KEY CHECK(length(id)=16),
+    operation_id BLOB UNIQUE REFERENCES vm_operations(operation_id) ON DELETE SET NULL,
+    recipe_id TEXT NOT NULL CHECK(length(recipe_id) BETWEEN 1 AND 64
+        AND length(recipe_id)=length(CAST(recipe_id AS BLOB))
+        AND recipe_id NOT GLOB '*[^a-z0-9-]*'),
+    recipe_digest BLOB NOT NULL CHECK(length(recipe_digest)=32),
+    staging_bytes INTEGER NOT NULL CHECK(staging_bytes>=0),
+    template_id BLOB UNIQUE REFERENCES vm_templates(id),
+    health_verified INTEGER NOT NULL DEFAULT 0 CHECK(health_verified IN (0,1)),
+    state TEXT NOT NULL CHECK(state IN ('pending','sealed','pending_disposal','quarantined')),
+    CHECK((state='sealed')=(template_id IS NOT NULL)),
+    CHECK((state='sealed')=(staging_bytes=0)),
+    CHECK(state<>'sealed' OR health_verified=1),
+    CHECK(state<>'pending' OR operation_id IS NOT NULL)
+) STRICT, WITHOUT ROWID;
+CREATE UNIQUE INDEX vm_pending_build ON vm_build_intents(recipe_digest) WHERE state='pending';
+
+CREATE TABLE vm_generations (
+    id BLOB PRIMARY KEY CHECK(length(id)=16),
+    build_id BLOB REFERENCES vm_build_intents(id),
+    vm_id BLOB REFERENCES vm_instances(id),
+    generation INTEGER NOT NULL CHECK(generation>0),
+    active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
+    CHECK((build_id IS NULL)<>(vm_id IS NULL)),
+    UNIQUE(build_id,generation),
+    UNIQUE(vm_id,generation)
+) STRICT, WITHOUT ROWID;
+CREATE UNIQUE INDEX vm_active_build_generation ON vm_generations(build_id) WHERE active=1;
+CREATE UNIQUE INDEX vm_active_instance_generation ON vm_generations(vm_id) WHERE active=1;
+
+-- object_key is a generated ID used with the role to derive a relative name.
+-- File evidence uses opaque binary identities and bounded content digests.
+CREATE TABLE vm_artifacts (
+    generation_id BLOB NOT NULL REFERENCES vm_generations(id),
+    role TEXT NOT NULL CHECK(role IN ('disk','vars','seed','verification_overlay')),
+    object_key BLOB NOT NULL UNIQUE CHECK(length(object_key)=16),
+    state TEXT NOT NULL CHECK(state IN
+        ('planned','created','identified','sealed','active','pending_disposal','quarantined')),
+    volume_id BLOB CHECK(length(volume_id)=8),
+    directory_id BLOB CHECK(length(directory_id) IN (8,16)),
+    file_id BLOB CHECK(length(file_id) IN (8,16)),
+    content_digest BLOB CHECK(length(content_digest)=32),
+    bytes INTEGER CHECK(bytes>0),
+    CHECK((volume_id IS NULL)=(directory_id IS NULL)
+        AND (volume_id IS NULL)=(file_id IS NULL)),
+    CHECK(state NOT IN ('identified','sealed','active') OR file_id IS NOT NULL),
+    CHECK(state<>'sealed' OR (content_digest IS NOT NULL AND bytes IS NOT NULL)),
+    PRIMARY KEY(generation_id,role)
+) STRICT, WITHOUT ROWID;
+
+ALTER TABLE vm_instances ADD COLUMN cleanup_route TEXT
+    CHECK(cleanup_route IN ('staging','lease','legacy_unknown'))
+    CHECK(cleanup_route IS NULL OR state=4);
+-- The first disk claim is the originating clone: its persistent charge stays
+-- until instance deletion. An old claim taken before the deadline also proves
+-- staging cleanup. Absent origin evidence, an older claim may be ambiguous.
+WITH origin AS (
+    SELECT v.id,v.expires_ms,v.cleanup_id,a.started_ms,
+        coalesce(o.status,c.status) AS clone_status
+    FROM vm_instances v
+    LEFT JOIN activity a ON a.id=v.cleanup_id
+    LEFT JOIN vm_disk_claims d ON d.activity_id=(SELECT min(activity_id) FROM vm_disk_claims WHERE vm=v.id)
+    LEFT JOIN vm_operations o ON o.activity_id=d.activity_id AND o.action=1
+    LEFT JOIN activity c ON c.id=d.activity_id AND c.action=1
+    WHERE v.state=4
+)
+UPDATE vm_instances SET cleanup_route=CASE
+    WHEN origin.cleanup_id IS NULL OR origin.started_ms<origin.expires_ms
+        OR origin.clone_status IN (0,2,3) THEN 'staging'
+    WHEN origin.clone_status=1 THEN 'lease'
+    ELSE 'legacy_unknown' END
+    FROM origin WHERE vm_instances.id=origin.id;
+CREATE TRIGGER vm_cleanup_route AFTER UPDATE OF state ON vm_instances
+    WHEN NEW.state=4 AND OLD.state<>4 AND NEW.cleanup_route IS NULL
+    BEGIN
+        UPDATE vm_instances SET cleanup_route=CASE WHEN OLD.state=0 THEN 'staging' ELSE 'lease' END
+            WHERE id=NEW.id;
+    END;
+";
+
 pub(crate) const MAX_CALLER_PENDING: i64 = 8;
 // One cleanup slot per live instance, shared by expiry and recovery. Cleanup
 // stays available at caller saturation. At most 16 pending rows are visible.
@@ -163,26 +330,55 @@ impl VmStore {
         db.busy_timeout(Duration::from_millis(250))?;
         check_size(&db)?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        ensure!(matches!(version, 0 | 5), "unsupported VM state version");
+        ensure!(
+            matches!(version, 0 | 5 | VM_SCHEMA_VERSION),
+            "unsupported VM state version"
+        );
+        let upgrade = version != VM_SCHEMA_VERSION;
         db.execute_batch(
             "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY;
             PRAGMA foreign_keys=ON; PRAGMA max_page_count=1024;",
         )?;
+        // SQLite's table replacement procedure suspends FK enforcement on this
+        // connection so the original activity name can retain its dependents.
+        // Validate every FK before publishing the replacement and restore
+        // enforcement before handing the connection to any caller.
+        if upgrade {
+            db.pragma_update(None, "foreign_keys", false)?;
+        }
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        match tx.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))? {
-            0 => {
-                ensure!(
-                    count(&tx, "SELECT count(*) FROM sqlite_schema", [])? == 0,
-                    "VM state must start with an empty database"
-                );
-                tx.execute_batch(SCHEMA)?;
-            }
-            5 => {}
-            _ => bail!("unsupported VM state version"),
+        ensure!(
+            tx.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))? == version,
+            "VM state version changed"
+        );
+        if version == 0 {
+            ensure!(
+                count(&tx, "SELECT count(*) FROM sqlite_schema", [])? == 0,
+                "VM state must start with an empty database"
+            );
+            tx.execute_batch(SCHEMA_V5)?;
+        }
+        if upgrade {
+            tx.execute_batch(MIGRATE_V6)?;
         }
         recover(&tx, now)?;
         check_size(&tx)?;
+        if upgrade {
+            require_headroom(&tx)?;
+            ensure!(
+                count(
+                    &tx,
+                    "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+                    []
+                )? == 1,
+                "invalid VM state foreign keys"
+            );
+            tx.pragma_update(None, "user_version", VM_SCHEMA_VERSION)?;
+        }
         tx.commit()?;
+        if upgrade {
+            db.pragma_update(None, "foreign_keys", true)?;
+        }
         Ok(Self {
             db: Mutex::new(db),
             _database: database,
@@ -601,8 +797,9 @@ impl Binding<'_> {
     pub(crate) fn record(&self, db: &Connection, now: i64, lease_end: Option<i64>) -> Result<i64> {
         let id = activity(db, self.principal, self.vm, self.action, now)?;
         db.execute(
-            "INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,valid_through_ms,lease_end_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,valid_through_ms,
+                lease_end_ms,script_result)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,CASE WHEN ?4=2 THEN 'legacy' END)",
             params![self.principal, self.key.key, self.vm, self.action as i64, id, self.valid_through(), lease_end],
         )?;
         Ok(id)
@@ -832,30 +1029,326 @@ mod tests {
     use super::*;
     use crate::service::application::tests::private_temp;
 
+    const NOW: i64 = 100;
+
+    fn v5_fixture(dir: &Path) -> Connection {
+        let db = Connection::open(dir.join("activity.sqlite3")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                dir.join("activity.sqlite3"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        db.execute_batch("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;")
+            .unwrap();
+        db.execute_batch(SCHEMA_V5).unwrap();
+        db.execute_batch(
+            "INSERT INTO activity(id,principal,actor,vm_owner,vm,action,started_ms,status,
+                  finished_ms,terminal_order,cleanup_confirmed) VALUES
+                  (10,'alice','agent',NULL,unhex(printf('%032x',1)),1,10,1,11,1,1),
+                  (11,'alice','agent',NULL,unhex(printf('%032x',1)),2,21,0,NULL,NULL,NULL),
+                  (12,'bob','agent',NULL,unhex(printf('%032x',2)),1,12,2,13,2,1),
+                  (13,'arxd','daemon','bob',unhex(printf('%032x',2)),7,15,0,NULL,NULL,NULL),
+                  (14,'arxd','daemon','bob',unhex(printf('%032x',3)),7,16,1,17,3,1),
+                  (15,'alice','agent',NULL,unhex(printf('%032x',1)),8,17,1,17,4,NULL),
+                  (16,'bob','agent',NULL,unhex(printf('%032x',4)),1,18,0,NULL,NULL,NULL),
+                  (17,'bob','agent',NULL,unhex(printf('%032x',5)),1,19,1,20,5,1),
+                  (18,'arxd','daemon','bob',unhex(printf('%032x',5)),7,99,0,NULL,NULL,NULL),
+                  (19,'arxd','daemon','bob',unhex(printf('%032x',6)),7,99,0,NULL,NULL,NULL);
+             INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,valid_through_ms,
+                 status,lease_end_ms)
+                 SELECT principal,unhex(printf('%032x',id)),vm,action,id,86400000+started_ms,status,
+                     CASE WHEN action=8 THEN 400 END FROM activity WHERE actor='agent';
+             INSERT INTO vm_operations VALUES
+                 ('bob',unhex(printf('%032x',11)),unhex(printf('%032x',3)),2,9,86400009,3,NULL);
+             INSERT INTO vm_templates VALUES(zeroblob(16),1,zeroblob(32),zeroblob(32),zeroblob(32),40);
+             INSERT INTO vm_instances(id,template,principal,expires_ms,state,cleanup_id) VALUES
+                 (unhex(printf('%032x',1)),zeroblob(16),'alice',400,2,NULL),
+                 (unhex(printf('%032x',2)),zeroblob(16),'bob',200,4,13),
+                 (unhex(printf('%032x',4)),zeroblob(16),'bob',300,0,NULL),
+                 (unhex(printf('%032x',5)),zeroblob(16),'bob',99,4,18),
+                 (unhex(printf('%032x',6)),zeroblob(16),'bob',99,4,19);
+             INSERT INTO vm_tombstones VALUES(unhex(printf('%032x',3)),'bob',14,17);
+             INSERT INTO vm_snapshots VALUES(unhex(printf('%032x',1)),zeroblob(16),1);
+             INSERT INTO vm_disk_claims VALUES
+                 (8,unhex(printf('%032x',6)),NULL,17,0),
+                 (10,unhex(printf('%032x',1)),NULL,5,0),
+                 (12,unhex(printf('%032x',2)),NULL,7,2),
+                 (16,unhex(printf('%032x',4)),NULL,11,3),
+                 (17,unhex(printf('%032x',5)),NULL,13,0);
+             UPDATE sqlite_sequence SET seq=80 WHERE name='activity';
+             UPDATE vm_retry_clock SET high_water_ms=90;
+             COMMIT;",
+        )
+        .unwrap();
+        db
+    }
+
+    fn ledger_ids(db: &Connection) -> Result<Vec<(i64, Id)>> {
+        let mut stmt =
+            db.prepare("SELECT activity_id,operation_id FROM vm_operations ORDER BY activity_id")?;
+        Ok(stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    #[test]
+    fn v5_upgrade_preserves_rows_and_recovers_with_stable_operation_ids() {
+        let dir = private_temp();
+        drop(v5_fixture(dir.path()));
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        let ids = store.transact(|db| {
+            assert_eq!(count(db, "PRAGMA user_version", [])?, 6);
+            // The previous VM opener's gate was exactly 0 | 5.
+            assert!(!matches!(count(db, "PRAGMA user_version", [])?, 0 | 5));
+            assert_eq!(count(db, "PRAGMA foreign_keys", [])?, 1);
+            assert_eq!(count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?, 0);
+            assert_eq!(count(db, "SELECT seq FROM sqlite_sequence WHERE name='activity'", [])?, 81);
+            assert_eq!(count(db, "SELECT high_water_ms FROM vm_retry_clock", [])?, 90);
+            assert_eq!(disk_bytes(db)?, Some(98));
+            assert_eq!(count(db, "SELECT count(*) FROM vm_snapshots WHERE ready=1", [])?, 1);
+            assert_eq!(count(db, "SELECT activity_id FROM vm_tombstones WHERE principal='bob' AND expired_at_ms=17", [])?, 14);
+            assert_eq!(count(db, "SELECT count(*) FROM vm_instances WHERE (principal='alice' AND
+                 expires_ms=400 AND state=3 AND cleanup_id=81) OR (principal='bob' AND state=4 AND
+                 cleanup_route='staging' AND ((expires_ms=200 AND cleanup_id=13) OR
+                 (expires_ms=300 AND cleanup_id IS NULL)))", [])?, 3);
+            assert_eq!(count(db, "SELECT count(*) FROM vm_instances WHERE expires_ms=99 AND state=4
+                 AND ((cleanup_id=18 AND cleanup_route='lease')
+                 OR (cleanup_id=19 AND cleanup_route='legacy_unknown'))", [])?, 2);
+            assert_eq!(count(db, "SELECT count(*) FROM activity WHERE id IN (11,16) AND
+                 status=3 AND finished_ms=?1 AND cleanup_confirmed=0", [NOW])?, 2);
+            assert_eq!(count(db, "SELECT count(*) FROM vm_operations WHERE action=2 AND
+                 script_result='legacy' AND script_exit_code IS NULL AND status=3", [])?, 2);
+            assert_eq!(count(db, "SELECT count(*) FROM vm_operations WHERE binding_kind='legacy_vm'
+                 AND subject_id IS NULL AND request_digest IS NULL", [])?, 7);
+
+            let key = RequestId::parse("0000000000000000000000000000000b").unwrap();
+            for (principal, vm, id) in [("alice", 1, 11), ("bob", 3, 9)] {
+                let mut subject = [0; 16];
+                subject[15] = vm;
+                let replay = Binding { principal, key, vm: subject, action: Action::Script }
+                    .replay(db, NOW, false)?.unwrap().unwrap();
+                assert_eq!(replay.receipt, Receipt { activity_id: id, status: Status::Interrupted });
+            }
+            let mut vm = [0; 16];
+            vm[15] = 1;
+            let extend = Binding {
+                principal: "alice", vm, action: Action::Extend,
+                key: RequestId::parse("0000000000000000000000000000000f").unwrap(),
+            }.replay(db, NOW, false)?.unwrap().unwrap();
+            assert_eq!(extend.receipt, Receipt { activity_id: 15, status: Status::Succeeded });
+            assert_eq!(extend.lease_end, Some(400));
+
+            assert_eq!(count(db, "SELECT count(DISTINCT operation_id) FROM vm_operations", [])?, 7);
+            assert!(headroom(db)?);
+            ledger_ids(db)
+        }).unwrap();
+        assert_eq!(
+            ids.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [9, 10, 11, 12, 15, 16, 17]
+        );
+        drop(store);
+
+        let reopened = VmStore::open(dir.path(), NOW).unwrap();
+        reopened
+            .transact(|db| {
+                assert_eq!(ledger_ids(db)?, ids);
+                assert_eq!(
+                    count(
+                        db,
+                        "SELECT seq FROM sqlite_sequence WHERE name='activity'",
+                        []
+                    )?,
+                    81
+                );
+                assert_eq!(
+                    count(db, "SELECT count(*) FROM activity WHERE id>80", [])?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn v5_upgrade_rolls_back_on_recovery_error_and_can_retry() {
+        let dir = private_temp();
+        let db = v5_fixture(dir.path());
+        db.execute_batch(
+            "CREATE TRIGGER fixture_error BEFORE UPDATE OF state ON vm_instances
+             BEGIN SELECT raise(ABORT,'fixture migration fault'); END;",
+        )
+        .unwrap();
+        drop(db);
+        let path = dir.path().join("activity.sqlite3");
+        let before = fs::read(&path).unwrap();
+        let error = VmStore::open(dir.path(), NOW).err().unwrap();
+        assert!(error.to_string().contains("fixture migration fault"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let db = open_sqlite(&path).unwrap();
+        assert_eq!(count(&db, "PRAGMA user_version", []).unwrap(), 5);
+        db.execute_batch("DROP TRIGGER fixture_error").unwrap();
+        drop(db);
+        assert!(VmStore::open(dir.path(), NOW).is_ok());
+    }
+
+    #[test]
+    fn v5_upgrade_rolls_back_when_state_has_no_headroom() {
+        let dir = private_temp();
+        let db = v5_fixture(dir.path());
+        db.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE fixture_padding(bytes BLOB);
+             INSERT INTO fixture_padding VALUES(zeroblob(3940000));
+             COMMIT;",
+        )
+        .unwrap();
+        check_size(&db).unwrap();
+        drop(db);
+        let path = dir.path().join("activity.sqlite3");
+        let before = fs::read(&path).unwrap();
+        let error = VmStore::open(dir.path(), NOW).err().unwrap();
+        assert!(full(&error), "{error}");
+        assert!(fs::read(&path).unwrap() == before);
+        let db = open_sqlite(&path).unwrap();
+        assert_eq!(count(&db, "PRAGMA user_version", []).unwrap(), 5);
+        db.execute_batch("DROP TABLE fixture_padding").unwrap();
+        drop(db);
+        assert!(VmStore::open(dir.path(), NOW).is_ok());
+    }
+
+    #[test]
+    fn future_vm_version_leaves_state_unchanged() {
+        let dir = private_temp();
+        let db = v5_fixture(dir.path());
+        db.pragma_update(None, "user_version", 7).unwrap();
+        drop(db);
+        let path = dir.path().join("activity.sqlite3");
+        let before = fs::read(&path).unwrap();
+        let error = VmStore::open(dir.path(), NOW).err().unwrap();
+        assert_eq!(error.to_string(), "unsupported VM state version");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn general_and_service_profiles_keep_v4_schema() {
+        for open in [
+            super::super::Activity::open,
+            super::super::Activity::open_service_fixture,
+        ] {
+            let dir = private_temp();
+            drop(open(dir.path()).unwrap());
+            let path = dir.path().join("activity.sqlite3");
+            let before = fs::read(&path).unwrap();
+            assert!(VmStore::open(dir.path(), NOW).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            drop(open(dir.path()).unwrap());
+            let db = open_sqlite(&path).unwrap();
+            assert_eq!(count(&db, "PRAGMA user_version", []).unwrap(), 4);
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT count(*) FROM sqlite_schema WHERE name GLOB 'vm_*'",
+                    []
+                )
+                .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn v6_checks_bindings_evidence_and_script_result_in_db_and_journal() {
+        let dir = private_temp();
+        let path = dir.path().join("activity.sqlite3");
+        let journal = dir.path().join("activity.sqlite3-journal");
+        let sentinels = [
+            "fixture-script-contents-9cc20e7f",
+            "fixture-token-23deea7d903170f8",
+            "C:/fixture-absolute-path-48fd070a",
+            "S-1-5-21-11112222-33334444-55556666-7777",
+        ];
+        let scan = |path: &Path| {
+            let bytes = fs::read(path).unwrap();
+            for sentinel in sentinels {
+                assert!(
+                    !bytes
+                        .windows(sentinel.len())
+                        .any(|w| w == sentinel.as_bytes())
+                );
+            }
+        };
+        let old = v5_fixture(dir.path());
+        old.execute_batch("BEGIN IMMEDIATE; UPDATE vm_retry_clock SET high_water_ms=91;")
+            .unwrap();
+        scan(&path);
+        scan(&journal);
+        old.execute_batch("ROLLBACK;").unwrap();
+        drop(old);
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        scan(&path);
+        store.transact(|db| {
+            for sentinel in sentinels {
+                assert!(db.execute("UPDATE vm_operations SET script_result=?1 WHERE activity_id=9", [sentinel]).is_err());
+            }
+            assert!(db.execute("UPDATE vm_operations SET script_result='exited' WHERE activity_id=9", []).is_err());
+            assert!(db.execute("UPDATE vm_operations SET script_result='timed_out',script_exit_code=7 WHERE activity_id=9", []).is_err());
+            db.execute("UPDATE vm_operations SET script_result='exited',script_exit_code=7 WHERE activity_id=9", [])?;
+            assert!(db.execute("UPDATE vm_operations SET binding_kind='template',subject_id=zeroblob(16) WHERE activity_id=10", []).is_err());
+            db.execute("UPDATE vm_operations SET binding_kind='template',subject_id=zeroblob(16),
+                request_digest=zeroblob(32) WHERE activity_id=10", [])?;
+
+            db.execute_batch(
+                "INSERT INTO activity(principal,actor,action,started_ms) VALUES('alice','agent',11,100);
+                 INSERT INTO vm_operations(principal,request_key,operation_id,action,activity_id,
+                    valid_through_ms,binding_kind,recipe_id,recipe_digest)
+                    VALUES('alice',zeroblob(16),zeroblob(16),11,last_insert_rowid(),86400100,
+                        'recipe','ubuntu-fixture',zeroblob(32));
+                 INSERT INTO vm_build_intents(id,operation_id,recipe_id,recipe_digest,staging_bytes,state)
+                    VALUES(zeroblob(16),zeroblob(16),'ubuntu-fixture',zeroblob(32),100,'pending');
+                 INSERT INTO vm_generations(id,build_id,generation) VALUES(zeroblob(16),zeroblob(16),1);
+                 INSERT INTO vm_artifacts(generation_id,role,object_key,state)
+                    VALUES(zeroblob(16),'disk',zeroblob(16),'planned');",
+            )?;
+            for sentinel in sentinels {
+                assert!(db.execute("UPDATE vm_artifacts SET object_key=CAST(?1 AS BLOB)", [sentinel]).is_err());
+            }
+            assert!(db.execute("UPDATE vm_artifacts SET state='identified'", []).is_err());
+            assert!(db.execute("UPDATE vm_build_intents SET staging_bytes=-1", []).is_err());
+            assert!(db.execute("UPDATE vm_generations SET build_id=randomblob(16)", []).is_err());
+            assert!(db.execute("INSERT INTO vm_generations(id,build_id,generation) VALUES(randomblob(16),zeroblob(16),1)", []).is_err());
+            db.execute("UPDATE vm_artifacts SET state='identified',volume_id=zeroblob(8),
+                directory_id=zeroblob(8),file_id=zeroblob(8)", [])?;
+            db.execute("INSERT INTO vm_operations(principal,request_key,operation_id,action,
+                activity_id,valid_through_ms,binding_kind,recipe_id,recipe_digest)
+                VALUES('bob',zeroblob(16),randomblob(16),11,200,86400100,'recipe',
+                    'ubuntu-fixture',zeroblob(32))", [])?;
+            assert!(db.execute("INSERT INTO vm_build_intents(id,operation_id,recipe_id,recipe_digest,staging_bytes,state)
+                SELECT randomblob(16),operation_id,'ubuntu-fixture',zeroblob(32),100,'pending'
+                FROM vm_operations WHERE activity_id=200", []).is_err());
+            scan(&journal);
+            Ok(())
+        }).unwrap();
+        scan(&path);
+    }
+
     #[test]
     fn substituted_sqlite_main_refuses_before_reconciliation() {
-        let now = 1_800_000_000_000;
         let original = private_temp();
         let replacement = private_temp();
-        for dir in [&original, &replacement] {
-            VmStore::open(dir.path(), now)
-                .unwrap()
-                .transact(|db| {
-                    Binding {
-                        principal: "fixture",
-                        key: RequestId::parse("00000000000000000000000000000001").unwrap(),
-                        vm: [1; 16],
-                        action: Action::Script,
-                    }
-                    .record(db, now, None)?;
-                    Ok(())
-                })
-                .unwrap();
-        }
+        let paths = [&original, &replacement].map(|dir| {
+            drop(v5_fixture(dir.path()));
+            let path = dir.path().join("activity.sqlite3");
+            let before = fs::read(&path).unwrap();
+            (path, before)
+        });
 
         let other_path = replacement.path().join("activity.sqlite3");
         let parked = original.path().join("parked.sqlite3");
-        let result = VmStore::open_inner(original.path(), now, |path| {
+        let result = VmStore::open_inner(original.path(), NOW, |path| {
             #[cfg(unix)]
             {
                 // Put both names back before returning, so a before/after
@@ -886,13 +1379,19 @@ mod tests {
             error.to_string(),
             "SQLite VM main database identity changed"
         );
-        for dir in [&original, &replacement] {
-            let raw = open_sqlite(&dir.path().join("activity.sqlite3")).unwrap();
+        for (path, before) in paths {
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let raw = open_sqlite(&path).unwrap();
+            assert_eq!(count(&raw, "PRAGMA user_version", []).unwrap(), 5);
             assert_eq!(
-                count(&raw, "SELECT status FROM vm_operations", []).unwrap(),
+                count(
+                    &raw,
+                    "SELECT status FROM vm_operations WHERE activity_id=11",
+                    []
+                )
+                .unwrap(),
                 0
             );
-            assert_eq!(count(&raw, "SELECT status FROM activity", []).unwrap(), 0);
         }
     }
 }
