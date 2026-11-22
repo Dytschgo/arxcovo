@@ -25,12 +25,23 @@ use std::{
     ptr::{null, null_mut},
     time::Duration,
 };
+use windows_sys::Wdk::{
+    Foundation::OBJECT_ATTRIBUTES,
+    Storage::FileSystem::{
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    },
+};
 use windows_sys::Win32::{
     Foundation::*,
     Security::{Authentication::Identity::*, Authorization::ConvertStringSidToSidW, *},
     Storage::FileSystem::*,
     System::{
-        IO::CancelSynchronousIo, JobObjects::*, Pipes::*, RemoteDesktop::*, SystemInformation::*,
+        IO::{CancelSynchronousIo, IO_STATUS_BLOCK},
+        JobObjects::*,
+        Pipes::*,
+        RemoteDesktop::*,
+        SystemInformation::*,
         Threading::*,
     },
 };
@@ -74,33 +85,63 @@ impl PathPin {
     }
 
     fn pin(path: &LocalPath, directory: bool, mutable: bool, create: bool) -> io::Result<Self> {
-        let parts = &path.as_str()[3..];
-        let root = &path.as_str()[..3];
+        Self::pin_observed(path, directory, mutable, create, &mut |_| {})
+    }
+
+    /// Walks from the volume root, opening each component relative to the
+    /// already-checked parent handle that the pin keeps open. `observe` runs
+    /// after each directory is pinned; tests use it to race the walk.
+    fn pin_observed(
+        path: &LocalPath,
+        directory: bool,
+        mutable: bool,
+        create: bool,
+        observe: &mut dyn FnMut(&str),
+    ) -> io::Result<Self> {
+        let raw = path.as_str();
+        let root = &raw[..3];
         // A drive alias for a network, optical, or removable device is refused.
         if unsafe { GetDriveTypeW(wide(root).as_ptr()) } != 3 {
             return Err(io::Error::other("expected a fixed local volume"));
         }
-        let mut ancestors = Vec::new();
-        let mut volume = None;
-        for end in std::iter::once(3)
-            .chain(parts.match_indices('\\').map(|(at, _)| at + 3))
-            .chain((!parts.is_empty()).then_some(path.as_str().len()))
-        {
-            let last = end == path.as_str().len();
-            let expected_directory = !last || directory;
-            let file = open_path(&path.as_str()[..end], last && mutable, last && create)?;
-            let (identity, allocated) = file_identity(&file, expected_directory)?;
-            if end == 3 {
-                verify_ntfs(&file)?;
-                verify_volume_root(root, identity)?;
-                volume = Some(identity.volume);
+        // The volume root is the only open by absolute name, and it must be
+        // the volume's own root object.
+        let root_file = open_directory(root)?;
+        let (root_identity, root_allocated) = file_identity(&root_file, true)?;
+        verify_ntfs(&root_file)?;
+        verify_volume_root(root, root_identity)?;
+        if raw.len() == 3 {
+            if create || !directory {
+                return Err(io::Error::other("the volume root is a directory"));
             }
-            if Some(identity.volume) != volume {
+            return Ok(Self {
+                _ancestors: Vec::new(),
+                leaf: root_file,
+                identity: root_identity,
+                allocated: root_allocated,
+            });
+        }
+        observe(root);
+        let names: Vec<&str> = raw[3..].split('\\').collect();
+        let mut ancestors = vec![root_file];
+        let mut end = 2;
+        for (index, name) in names.iter().enumerate() {
+            end += 1 + name.len();
+            let last = index + 1 == names.len();
+            let node = if last && !directory {
+                Node::File
+            } else {
+                Node::Directory
+            };
+            let parent = ancestors.last().expect("the volume root is pinned");
+            let file = open_relative(parent, name, node, last && mutable, last && create)?;
+            let (identity, allocated) = file_identity(&file, node == Node::Directory)?;
+            if identity.volume != root_identity.volume {
                 return Err(io::Error::other("unexpected volume transition"));
             }
             if last {
-                // Reopen by the pinned spelling and compare the actual object.
-                let check = open_path(path.as_str(), mutable, false)?;
+                // Reopen through the same held parent and compare the object.
+                let check = open_relative(parent, name, node, mutable, false)?;
                 if file_identity(&check, directory)?.0 != identity {
                     return Err(io::Error::other("path binding changed"));
                 }
@@ -112,28 +153,96 @@ impl PathPin {
                 });
             }
             ancestors.push(file);
+            observe(&raw[..end]);
         }
         Err(io::Error::other("path has no leaf"))
     }
 }
 
-fn open_path(path: &str, mutable: bool, create: bool) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options
-        .access_mode(if create {
-            FILE_GENERIC_WRITE | FILE_GENERIC_READ
-        } else if mutable {
-            FILE_READ_ATTRIBUTES | READ_CONTROL
-        } else {
-            FILE_GENERIC_READ | READ_CONTROL
-        })
-        .share_mode(FILE_SHARE_READ | if mutable { FILE_SHARE_WRITE } else { 0 })
+/// No-follow read open of a directory by absolute name. Only volume roots
+/// are opened this way.
+fn open_directory(path: &str) -> io::Result<File> {
+    OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ | READ_CONTROL)
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        // The explicit access mode above takes precedence; std requires the
-        // write flag before it accepts exclusive creation.
-        .write(create)
-        .create_new(create);
-    options.open(path)
+        .open(path)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Node {
+    Directory,
+    File,
+}
+
+/// Opens one name relative to a held, already-checked directory handle. The
+/// parent's current name is never parsed again, a reparse point on the named
+/// object is opened rather than followed, and any reparse encountered fails.
+fn open_relative(
+    parent: &File,
+    name: &str,
+    node: Node,
+    mutable: bool,
+    create: bool,
+) -> io::Result<File> {
+    if name.is_empty() || name.contains(['\\', '/', ':']) {
+        return Err(io::Error::other("not a single path component"));
+    }
+    let mut units: Vec<u16> = name.encode_utf16().collect();
+    let bytes = u16::try_from(units.len() * 2).map_err(io::Error::other)?;
+    let object = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: units.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: &object,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        SecurityDescriptor: null(),
+        SecurityQualityOfService: null(),
+    };
+    let access = if create {
+        FILE_GENERIC_WRITE | FILE_GENERIC_READ
+    } else if mutable {
+        FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE
+    } else {
+        FILE_GENERIC_READ | READ_CONTROL
+    };
+    let share = FILE_SHARE_READ | if mutable { FILE_SHARE_WRITE } else { 0 };
+    let options = FILE_OPEN_REPARSE_POINT
+        | FILE_SYNCHRONOUS_IO_NONALERT
+        | match node {
+            Node::Directory => FILE_DIRECTORY_FILE,
+            Node::File => FILE_NON_DIRECTORY_FILE,
+        };
+    let mut handle = null_mut();
+    // Zero is a valid initial state for this output-only status block.
+    let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // The name buffer, attributes and parent handle outlive this call.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            access,
+            &attributes,
+            &mut status_block,
+            null(),
+            FILE_ATTRIBUTE_NORMAL,
+            share,
+            if create { FILE_CREATE } else { FILE_OPEN },
+            options,
+            null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // Translate the NTSTATUS for the typed custody refusal.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    // NtCreateFile succeeded and transferred a fresh handle.
+    Ok(File::from(unsafe { owned(handle) }?))
 }
 
 fn verify_ntfs(root: &File) -> io::Result<()> {
@@ -173,7 +282,7 @@ fn verify_volume_root(root: &str, pinned: FileIdentity) -> io::Result<()> {
     if !volume.starts_with(r"\\?\Volume{") || !volume.ends_with(r"}\") {
         return Err(io::Error::other("unexpected volume name"));
     }
-    let actual = file_identity(&open_path(&volume, false, false)?, true)?.0;
+    let actual = file_identity(&open_directory(&volume)?, true)?.0;
     if actual != pinned {
         return Err(io::Error::other("drive letter is not a volume root"));
     }
@@ -1875,12 +1984,12 @@ mod tests {
     fn custody_pins_the_drive_letter_to_its_volume_root() {
         let (_dir, root) = fixture_root();
         let drive = &root[..3];
-        let pinned = file_identity(&open_path(drive, false, false).unwrap(), true)
+        let pinned = file_identity(&open_directory(drive).unwrap(), true)
             .unwrap()
             .0;
         verify_volume_root(drive, pinned).unwrap();
         // A folder on the same volume is not that volume's root object.
-        let folder = file_identity(&open_path(&root, false, false).unwrap(), true)
+        let folder = file_identity(&open_directory(&root).unwrap(), true)
             .unwrap()
             .0;
         assert_eq!(folder.volume, pinned.volume);
@@ -1892,19 +2001,24 @@ mod tests {
     /// Unprivileged directory junction made with FSCTL_SET_REPARSE_POINT.
     fn fixture_junction(path: &str, target: &str) {
         std::fs::create_dir(path).unwrap();
+        set_junction(path, target, GENERIC_WRITE).unwrap();
+    }
+
+    /// Tries to make an existing directory a mount-point junction through a
+    /// handle with the given access.
+    fn set_junction(path: &str, target: &str, access: u32) -> io::Result<()> {
         // A fresh directory handle that addresses the reparse point itself.
         let handle = unsafe {
             owned(CreateFileW(
                 wide(path).as_ptr(),
-                GENERIC_WRITE,
-                0,
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 null(),
                 OPEN_EXISTING,
                 FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
                 null_mut(),
             ))
-        }
-        .unwrap();
+        }?;
         let substitute = wide(format!(r"\??\{target}"));
         let print = wide(target);
         let mut data = Vec::new();
@@ -1937,7 +2051,124 @@ mod tests {
                 null_mut(),
             )
         })
+    }
+
+    /// Identity of an object by name, for comparing what a walk pinned.
+    fn identity_of(path: &str, directory: bool) -> FileIdentity {
+        let file = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap();
+        file_identity(&file, directory).unwrap().0
+    }
+
+    #[test]
+    fn relative_opens_follow_the_held_parent_object_not_its_name() {
+        let (_dir, root) = fixture_root();
+        let original = format!(r"{root}\original");
+        let elsewhere = format!(r"{root}\elsewhere");
+        for dir in [&original, &elsewhere] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(format!(r"{dir}\leaf.img"), dir.as_bytes()).unwrap();
+        }
+        let expected = identity_of(&format!(r"{original}\leaf.img"), false);
+        assert_ne!(
+            identity_of(&format!(r"{elsewhere}\leaf.img"), false),
+            expected
+        );
+        // Unlike a pin, this parent handle permits its name to change.
+        let parent = OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&original)
+            .unwrap();
+        // Move the checked parent away and put a junction at its old name.
+        std::fs::rename(&original, format!(r"{root}\moved")).unwrap();
+        fixture_junction(&original, &elsewhere);
+        let leaf = open_relative(&parent, "leaf.img", Node::File, true, false).unwrap();
+        assert_eq!(file_identity(&leaf, false).unwrap().0, expected);
+        // A multi-component name cannot leave the held parent.
+        assert!(open_relative(&parent, r"x\leaf.img", Node::File, true, false).is_err());
+        drop((leaf, parent));
+        std::fs::remove_dir(&original).unwrap();
+    }
+
+    #[test]
+    fn custody_walk_refuses_a_component_swapped_for_a_junction_mid_walk() {
+        let (_dir, root) = fixture_root();
+        let a = format!(r"{root}\a");
+        let b = format!(r"{a}\b");
+        let elsewhere = format!(r"{root}\elsewhere");
+        for dir in [&a, &b, &elsewhere] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(format!(r"{b}\leaf.img"), b"b").unwrap();
+        std::fs::write(format!(r"{elsewhere}\leaf.img"), b"e").unwrap();
+        let path = LocalPath::parse(&format!(r"{b}\leaf.img")).unwrap();
+        // Positive control: an unraced walk pins the real leaf.
+        assert!(PathPin::pin_observed(&path, false, true, false, &mut |_| {}).is_ok());
+        let mut swapped = false;
+        let result = PathPin::pin_observed(&path, false, true, false, &mut |pinned| {
+            if pinned == a {
+                // `a` is pinned and `b` is not yet opened.
+                std::fs::remove_file(format!(r"{b}\leaf.img")).unwrap();
+                std::fs::remove_dir(&b).unwrap();
+                fixture_junction(&b, &elsewhere);
+                swapped = true;
+            }
+        });
+        assert!(swapped, "the race hook did not run");
+        assert!(
+            result.is_err(),
+            "the walk followed a junction swapped in after its parent was pinned"
+        );
+        std::fs::remove_dir(&b).unwrap();
+    }
+
+    #[test]
+    fn pinned_ancestors_cannot_be_renamed_or_made_junctions_during_the_walk() {
+        let (_dir, root) = fixture_root();
+        let a = format!(r"{root}\a");
+        let b = format!(r"{a}\b");
+        let elsewhere = format!(r"{root}\elsewhere");
+        for dir in [&a, &b, &elsewhere] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(format!(r"{b}\leaf.img"), b"b").unwrap();
+        let expected = identity_of(&format!(r"{b}\leaf.img"), false);
+        let path = LocalPath::parse(&format!(r"{b}\leaf.img")).unwrap();
+        let mut attempts = Vec::new();
+        let pin = PathPin::pin_observed(&path, false, true, false, &mut |pinned| {
+            if pinned == b {
+                // Both checked ancestors are held. Try to redirect each one.
+                attempts.push(("rename a", std::fs::rename(&a, format!(r"{root}\a2")).err()));
+                attempts.push(("rename b", std::fs::rename(&b, format!(r"{a}\b2")).err()));
+                attempts.push((
+                    "junction a (write)",
+                    set_junction(&a, &elsewhere, GENERIC_WRITE).err(),
+                ));
+                attempts.push((
+                    "junction a (attributes only)",
+                    set_junction(&a, &elsewhere, FILE_WRITE_ATTRIBUTES).err(),
+                ));
+            }
+        })
         .unwrap();
+        assert_eq!(attempts.len(), 4, "the race hook did not run");
+        for (attempt, error) in &attempts {
+            assert!(
+                error.is_some(),
+                "{attempt} succeeded against a pinned ancestor"
+            );
+        }
+        assert_eq!(pin.identity, expected);
+        drop(pin);
+        // Still plain directories: identity_of refuses a reparse point.
+        identity_of(&a, true);
+        identity_of(&b, true);
     }
 
     #[test]
