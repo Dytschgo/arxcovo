@@ -3,7 +3,7 @@
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import selectors
 import signal
@@ -101,25 +101,39 @@ def load_pins():
 
 def capture(argv, end, *, env=ENV, limit=65536, statuses=(0,)):
     """Read bounded output without logging user-controlled environment or stdout."""
-    with subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, start_new_session=True) as child:
+    child = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        result = bytearray()
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            while selector.select(remaining(end)):
+                block = os.read(child.stdout.fileno(), min(4096, limit + 1 - len(result)))
+                if not block:
+                    break
+                checked_output(result, block, limit)
+            else:
+                raise Refusal("command-deadline")
         try:
-            result = bytearray()
-            with selectors.DefaultSelector() as selector:
-                selector.register(child.stdout, selectors.EVENT_READ)
-                while selector.select(remaining(end)):
-                    block = os.read(child.stdout.fileno(), min(4096, limit + 1 - len(result)))
-                    if not block:
-                        break
-                    checked_output(result, block, limit)
-                else:
-                    raise Refusal("command-deadline")
-            require(child.wait(timeout=remaining(end)) in statuses, "command-status")
-            return bytes(result)
-        except BaseException:
-            if child.poll() is None:
+            status = child.wait(timeout=remaining(end))
+        except subprocess.TimeoutExpired:
+            raise Refusal("command-deadline") from None
+        require(status in statuses, "command-status")
+        return bytes(result)
+    except BaseException:
+        if child.poll() is None:
+            try:
                 os.killpg(child.pid, signal.SIGKILL)
-            raise
+            except (AttributeError, ProcessLookupError, OSError):
+                child.kill()
+        try:
+            child.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    finally:
+        if child.stdout is not None:
+            child.stdout.close()
 
 
 def checked_output(result, block, limit):
@@ -127,10 +141,77 @@ def checked_output(result, block, limit):
     result.extend(block)
 
 
-def host_command(tool, end, *args, **options):
+TOOL_LEAF = r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}"
+TOOL_ABS = re.compile(r"/usr/s?bin/" + TOOL_LEAF)
+TOOL_REL = re.compile(TOOL_LEAF)
+TOOL_SIBLING = re.compile(r"\.\./s?bin/" + TOOL_LEAF)
+TOOL_MERGED = re.compile(r"/s?bin/" + TOOL_LEAF)
+
+
+def vet_tool(raw_path, *, lstat=os.lstat, readlink=os.readlink):
+    """Vet a pinned host tool path and every symlink hop before execution."""
+    raw = os.fspath(raw_path)
+    require(isinstance(raw, str) and TOOL_ABS.fullmatch(raw) is not None, "runner-tool")
+    seen = set()
+    current = raw
+    for _ in range(8):
+        require(current not in seen, "runner-tool")
+        seen.add(current)
+        candidate = PurePosixPath(current)
+        require(candidate.parent in (PurePosixPath("/usr/bin"), PurePosixPath("/usr/sbin")), "runner-tool")
+        try:
+            for ancestor in reversed(candidate.parents):
+                info = lstat(ancestor.as_posix())
+                require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and info.st_mode & 0o022 == 0,
+                        "runner-tool")
+            info = lstat(current)
+        except OSError:
+            raise Refusal("runner-tool") from None
+        require(info.st_uid == 0, "runner-tool")
+        if stat.S_ISLNK(info.st_mode):
+            try:
+                target = readlink(current)
+            except OSError:
+                raise Refusal("runner-tool") from None
+            require(isinstance(target, str) and target != "" and "\x00" not in target, "runner-tool")
+            if TOOL_REL.fullmatch(target):
+                current = f"{candidate.parent.as_posix()}/{target}"
+            elif TOOL_ABS.fullmatch(target):
+                current = target
+            elif TOOL_SIBLING.fullmatch(target):
+                current = f"/usr/{target[3:]}"
+            elif TOOL_MERGED.fullmatch(target):
+                alias = "/bin" if target.startswith("/bin/") else "/sbin"
+                expected_dir = "usr/bin" if alias == "/bin" else "usr/sbin"
+                try:
+                    alias_info = lstat(alias)
+                    require(alias_info.st_uid == 0 and stat.S_ISLNK(alias_info.st_mode), "runner-tool")
+                    alias_target = readlink(alias)
+                except OSError:
+                    raise Refusal("runner-tool") from None
+                require(alias_target in (expected_dir, "/" + expected_dir), "runner-tool")
+                current = f"/{expected_dir}/{target.split('/', 2)[2]}"
+            else:
+                raise Refusal("runner-tool")
+            continue
+        require(stat.S_ISREG(info.st_mode) and info.st_mode & 0o100 and info.st_mode & 0o022 == 0,
+                "runner-tool")
+        return current
+    raise Refusal("runner-tool")
+
+
+def vet_tools(tools=TOOLS, *, lstat=os.lstat, readlink=os.readlink):
+    require(isinstance(tools, dict) and set(tools) == set(TOOLS), "runner-tool")
+    return {name: vet_tool(tools[name], lstat=lstat, readlink=readlink) for name in TOOLS}
+
+
+def host_command(tool, end, *args, tools=None, **options):
     require(tool in TOOLS, "tool-identity")
+    require(isinstance(tools, dict) and tool in tools, "tool-unvetted")
+    executable = tools[tool]
+    require(isinstance(executable, str) and TOOL_ABS.fullmatch(executable) is not None, "tool-unvetted")
     try:
-        return capture([TOOLS[tool], *map(str, args)], end, **options).decode("ascii")
+        return capture([executable, *map(str, args)], end, **options).decode("ascii")
     except Refusal as error:
         raise Refusal(f"{tool}-{error}") from None
 
@@ -214,14 +295,90 @@ def stage_copy(path, destination, end, owners, *, elf=False, mode=0o644, limit=5
     return digest
 
 
-def select_daemon(target, workspace, owner, loader_receipt, end):
-    require(target == workspace / "target" and loader_receipt.name == "build-messages.jsonl", "artifact-receipt")
-    path = target / "debug/arxd"
-    with open_artifact(loader_receipt, (0, owner), 64*MIB) as (_, receipt):
-        with open_artifact(path, (0, owner), 256*MIB, executable=True) as (binary, value):
-            require(value.st_mtime_ns >= receipt.st_mtime_ns, "stale-artifact")
-            inspect_elf(binary, value.st_size)
-            digest = stream_hash(binary, value.st_size, end)
+def validate_build_messages(raw, target, workspace):
+    sqlite_ok = False
+    arxd_ok = False
+    expected_manifest = (PurePosixPath(workspace.as_posix()) / "crates/arxd/Cargo.toml").as_posix()
+    target_posix = PurePosixPath(target.as_posix())
+    lines = raw.splitlines()
+    require(1 <= len(lines) <= 50000, "artifact-build-messages")
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            raise Refusal("artifact-build-messages") from None
+        if not isinstance(entry, dict):
+            continue
+        reason = entry.get("reason")
+        if reason == "build-script-executed":
+            pkg_id = entry.get("package_id", "")
+            out_dir = entry.get("out_dir", "")
+            if ("libsqlite3-sys" in str(pkg_id)
+                    and entry.get("linked_libs") == ["static=sqlite3"]
+                    and not entry.get("cfgs") and not entry.get("env")
+                    and isinstance(out_dir, str) and out_dir.startswith("/")):
+                out_path = PurePosixPath(out_dir)
+                if ".." not in out_path.parts and out_path.is_relative_to(target_posix):
+                    sqlite_ok = True
+        elif reason == "compiler-artifact":
+            tgt = entry.get("target")
+            manifest = entry.get("manifest_path")
+            if (isinstance(tgt, dict) and tgt.get("name") == "arxd"
+                    and isinstance(tgt.get("kind"), list) and "bin" in tgt["kind"]
+                    and manifest == expected_manifest):
+                arxd_ok = True
+    require(sqlite_ok and arxd_ok, "artifact-build-messages")
+
+
+def select_daemon(target_raw, workspace, owner, proof_root, identity, end):
+    if target_raw:
+        target = Path(target_raw)
+    else:
+        target = workspace / "target"
+    plain_path(target, (0, owner), directory=True)
+    profile = target / "debug"
+    plain_path(profile, (0, owner), directory=True)
+    loader_receipt = proof_root / "build-messages.jsonl"
+    artifact_receipt = proof_root / "arxd-receipt.json"
+    with open_artifact(loader_receipt, (0, owner), 64*MIB) as (messages_stream, loader_stat):
+        raw_messages = messages_stream.read(loader_stat.st_size + 1)
+        require(len(raw_messages) == loader_stat.st_size, "artifact-truncated")
+    messages_sha256 = hashlib.sha256(raw_messages).hexdigest()
+    validate_build_messages(raw_messages, target, workspace)
+    with open_artifact(artifact_receipt, (0, owner), 65536) as (receipt_stream, receipt_stat):
+        raw_receipt = receipt_stream.read(receipt_stat.st_size + 1)
+        require(len(raw_receipt) == receipt_stat.st_size, "artifact-truncated")
+    try:
+        receipt_data = json.loads(raw_receipt, object_pairs_hook=unique_pairs)
+    except ValueError:
+        raise Refusal("artifact-receipt") from None
+    expected_keys = {
+        "schema", "head", "run", "attempt", "target_dir",
+        "executable", "sha256", "bytes", "build_messages_sha256",
+    }
+    require(isinstance(receipt_data, dict) and set(receipt_data) == expected_keys
+            and receipt_data["schema"] == "arxcovo/r2-artifact/1", "artifact-receipt")
+    require(receipt_data["head"] == identity["head"]
+            and receipt_data["run"] == identity["run"]
+            and receipt_data["attempt"] == identity["attempt"], "artifact-receipt-identity")
+    require(receipt_data["build_messages_sha256"] == messages_sha256, "artifact-receipt-binding")
+    path = profile / "arxd"
+    require(receipt_data["target_dir"] == target.as_posix()
+            and receipt_data["executable"] == path.as_posix(), "artifact-receipt-path")
+    require(type(receipt_data["bytes"]) is int and 0 < receipt_data["bytes"] <= 256*MIB
+            and isinstance(receipt_data["sha256"], str)
+            and re.fullmatch(r"[a-f0-9]{64}", receipt_data["sha256"]) is not None, "artifact-receipt")
+    candidates = [item for item in profile.iterdir()
+                  if item.name == "arxd" or (item.name.startswith("arxd-") and not item.name.endswith(".d"))]
+    require(candidates == [path], "artifact-candidates")
+    with open_artifact(path, (0, owner), 256*MIB, executable=True) as (binary, value):
+        require(value.st_mtime_ns >= loader_stat.st_mtime_ns, "stale-artifact")
+        require(value.st_size == receipt_data["bytes"], "artifact-digest-mismatch")
+        inspect_elf(binary, value.st_size)
+        digest = stream_hash(binary, value.st_size, end)
+        require(digest == receipt_data["sha256"], "artifact-digest-mismatch")
     return path, digest
 
 
@@ -292,7 +449,39 @@ def host_file(path, roots, owners=(0,)):
         return canonical
 
 
-def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end):
+def stage_compiler_path(raw_value, *, resolve=None, links=("bin", "lib", "lib64")):
+    """Canonicalize a GCC search-path lookup into a clean in-image manifest key."""
+    require(isinstance(raw_value, str) and raw_value.startswith("/") and "\x00" not in raw_value
+            and not raw_value.endswith("/") and not raw_value.endswith("/."), "compiler-input-path")
+    parts = raw_value.split("/")
+    stack = []
+    traversed_dirs = []
+    for segment in parts[1:]:
+        require(segment != "" and segment != ".", "compiler-input-path")
+        if segment == "..":
+            require(bool(stack), "compiler-input-path")
+            if stack[0] == "usr" or stack[0] in links:
+                prefix = stack if stack[0] == "usr" else ["usr", *stack]
+                traversed_dirs.append("/".join(prefix))
+            stack.pop()
+        else:
+            stack.append(segment)
+    require(len(stack) >= 2, "compiler-input-path")
+    if stack[0] in links:
+        normalized = PurePosixPath("/usr", *stack)
+    else:
+        normalized = PurePosixPath("/", *stack)
+    require(normalized.is_relative_to(PurePosixPath("/usr")) and ".." not in normalized.parts,
+            "compiler-input-path")
+    relative = normalized.relative_to("/").as_posix()
+    if resolve is not None:
+        raw_canonical = resolve(raw_value)
+        norm_canonical = resolve(normalized.as_posix())
+        require(raw_canonical == norm_canonical, "compiler-input-path")
+    return relative, traversed_dirs
+
+
+def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end, vetted):
     """Populate a merged-/usr tree from named inputs and their loader closure."""
     rootfs = host["rootfs"]
     require(rootfs["userland"] == host["host"]["os"], "offline-userland-input")
@@ -305,7 +494,7 @@ def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end):
     role_files(tree)
     hashes = {}
     usr = (Path("/usr"),)
-    compiler = host_file(Path(TOOLS["cc"]), usr)
+    compiler = host_file(Path(vetted["cc"]), usr)
     binaries = {
         "usr/bin/sh": host_file(Path("/usr/bin/dash"), usr),
         "usr/bin/cc": compiler, "usr/bin/as": host_file(Path("/usr/bin/as"), usr),
@@ -318,8 +507,10 @@ def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end):
     for name in compiler_inputs:
         argument = "-print-prog-name" if name in ("cc1", "collect2") else "-print-file-name"
         value = capture([compiler, f"{argument}={name}"], end, limit=2048).decode("ascii").strip()
-        source = host_file(Path(value), usr)
-        relative = str(Path(value).relative_to("/"))
+        relative, traversed_dirs = stage_compiler_path(value, resolve=lambda item: host_file(Path(item), usr))
+        source = host_file(Path("/") / relative, usr)
+        for directory in traversed_dirs:
+            (tree / directory).mkdir(mode=0o755, parents=True, exist_ok=True)
         binaries[relative] = source
         if name in ("cc1", "collect2"):
             compiler_exec.append(source)
@@ -338,14 +529,14 @@ def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end):
         binaries[str(Path("opt/rust") / path.relative_to(toolchain))] = host_file(path, (toolchain,), (0, host_uid))
     helper = stage / "bootstrap"
     host_command("cc", end, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
-                 "-o", helper, stage / "bootstrap.c", limit=8192)
+                 "-o", helper, stage / "bootstrap.c", tools=vetted, limit=8192)
     binaries["fixture/probe"] = helper
     for executable in [helper, compiler, *compiler_exec, binaries["usr/bin/sh"], binaries["usr/bin/as"],
                        binaries["usr/bin/ld"], binaries["opt/rust/bin/cargo"], binaries["opt/rust/bin/rustc"]]:
         # ldd runs only on the fixed compiler/toolchain and our inert helper. The
         # selected daemon never enters this execution path.
         env = {**ENV, "LD_LIBRARY_PATH": str(rust_libs)} if executable.is_relative_to(toolchain) else ENV
-        closure = host_command("ldd", end, executable, env=env, limit=8192)
+        closure = host_command("ldd", end, executable, env=env, tools=vetted, limit=8192)
         for record in closure.splitlines():
             if re.fullmatch(r"\s*linux-vdso\.so\.1 \(0x[0-9a-f]+\)", record):
                 continue

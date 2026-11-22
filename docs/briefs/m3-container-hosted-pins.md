@@ -7,16 +7,16 @@ R2 qualifies Proposal A's containment on the existing Linux Rust worker before a
 | Input | Pin |
 | --- | --- |
 | Worker | GitHub-hosted x64 `ubuntu-24.04` runner, CI workflow, `rust (ubuntu-latest)` job |
-| AWS profile | Ubuntu 24.04.5 LTS, `ubuntu24`, `20261116.133.1`, `7.0.0-1014-aws` |
-| Azure profile | Ubuntu 24.04.5 LTS, `ubuntu24`, `20261116.376.1`, `7.0.0-1017-azure` |
-| systemd package pin | `255.4-1ubuntu8.18` on either profile. Direct package receipt pending. |
+| AWS profile | Ubuntu 24.04.5 LTS, `ubuntu24`, `20261116.133.1`, `7.0.0-1014-aws`, systemd `255.4-1ubuntu8.18` |
+| Azure profile | Ubuntu 24.04.5 LTS, `ubuntu24`, `20261116.376.1`, `7.0.0-1017-azure`, systemd `255.4-1ubuntu8.18` (all 13 pinned tools verified true) |
+| systemd package pin | `255.4-1ubuntu8.18` on both profiles, verified by direct hosted Ubuntu 24.04 receipts |
 | Host arena | Attributed directory under /var/lib with fixed sudo -n entry |
-| Tools | gcc, nft, ip, mkfs.ext4, losetup, systemd-run, systemctl, mount, umount, findmnt, ldd, dpkg-query and git at pinned system paths |
+| Tools | gcc, nft, ip, mkfs.ext4, losetup, systemd-run, systemctl, mount, umount, findmnt, ldd, dpkg-query and git at pinned system paths (raw symlink hops vetted before any root host command; canonical executables invoked) |
 | Rust | The workflow-installed 1.95.0 x86_64-unknown-linux-gnu toolchain, using real Cargo and rustc binaries |
 | Source receipt | Checked checkout SHA and workflow SHA/ref, repository, run and attempt; source bytes matched to git blobs |
-| Artifact receipt | Exact effective target path, ELF interpreter and SHA-256, and loaded image readback |
+| Artifact receipt | Effective `CARGO_TARGET_DIR` (default `workspace/target`), SQLite-loader-checked `build-messages.jsonl` digest, content-bound `arxd-receipt.json` matching HEAD/run/attempt and ELF SHA-256, and loaded image readback |
 
-The two profiles come from the existing A10 platform receipts. The launcher selects by the exact image identity, then requires that profile's kernel and systemd package. It records the actual tool versions after validating their paths. [AWS worker](https://github.com/Dytschgo/arxcovo/actions/runs/44972183382/job/137054159821) · [Azure worker](https://github.com/Dytschgo/arxcovo/actions/runs/44972860364/job/137056214973)
+The two profiles come from the direct hosted Ubuntu 24.04 receipts (`20261116.133.1 / 7.0.0-1014-aws / 255.4-1ubuntu8.18` on AWS and `20261116.376.1 / 7.0.0-1017-azure / 255.4-1ubuntu8.18` on Azure with all 13 pinned tools verified true). The launcher vets all 13 tool paths before running `git`, `dpkg-query` or any other root command, selects by exact image identity, requires that profile's kernel and systemd package, and records actual tool versions from the vetted executables. [AWS receipt](https://github.com/Dytschgo/arxcovo/actions/runs/44974576640/job/137061567775) · [Azure receipt](https://github.com/Dytschgo/arxcovo/actions/runs/44978108723/job/137072425820)
 
 The sealed fixture uses the pinned host's Ubuntu 24.04 userland. The entry refuses a host/userland mismatch with `offline-userland-input`. The fixture's allowlist copies shell, loader closure, compiler and linker inputs, Rust libraries and target stdlib before sealing.
 

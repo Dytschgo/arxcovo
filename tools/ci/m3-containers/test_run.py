@@ -1,11 +1,13 @@
 """Pure controls for the R2 launcher and stage receipts."""
 
+from contextlib import contextmanager
 import hashlib
 import io
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import stat
 import struct
+import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -84,10 +86,276 @@ class FixtureTests(unittest.TestCase):
 
     def test_artifact_selection_rejects_wrong_path_before_open(self):
         root = Path("checkout")
-        for target, receipt in ((root / "debug", Path("build-messages.jsonl")),
-                                (root / "target", Path("other.jsonl"))):
-            with self.assertRaisesRegex(fixture.Refusal, "artifact-receipt"):
-                fixture.select_daemon(target, root, 123, receipt, 0)
+        identity = {"head": "a"*40, "run": "1", "attempt": "1"}
+        with self.assertRaisesRegex(fixture.Refusal, "absolute-path"):
+            fixture.select_daemon("relative/target", root, 123, root / "proof", identity, 0)
+        with self.assertRaisesRegex(fixture.Refusal, "absolute-path"):
+            fixture.select_daemon("/tmp/../target", root, 123, root / "proof", identity, 0)
+
+    def test_artifact_selection_binds_elf_to_checked_build_receipt(self):
+        workspace = Path("/work/arxcovo")
+        proof_root = Path("/work/_temp/arx-bound-sqlite")
+        identity = {"head": "a"*40, "run": "661", "attempt": "1"}
+        good_elf = elf()
+        good_sha = hashlib.sha256(good_elf).hexdigest()
+        other_elf = good_elf + b"\x90" * 16
+        self.assertNotEqual(hashlib.sha256(other_elf).hexdigest(), good_sha)
+
+        def build_messages(target):
+            return ("\n".join((
+                json.dumps({
+                    "reason": "build-script-executed",
+                    "package_id": "path+file:///work/arxcovo/vendor/libsqlite3-sys-0.35.0#0.35.0",
+                    "linked_libs": ["static=sqlite3"],
+                    "cfgs": [], "env": [],
+                    "out_dir": f"{target.as_posix()}/debug/build/libsqlite3-sys-1234/out",
+                }),
+                json.dumps({
+                    "reason": "compiler-artifact",
+                    "manifest_path": "/work/arxcovo/crates/arxd/Cargo.toml",
+                    "target": {"name": "arxd", "kind": ["bin"]},
+                }),
+            )) + "\n").encode("ascii")
+
+        def make_receipt(target, messages_bytes, *, sha=good_sha, size=len(good_elf), **overrides):
+            body = {
+                "schema": "arxcovo/r2-artifact/1",
+                "head": identity["head"], "run": identity["run"], "attempt": identity["attempt"],
+                "target_dir": target.as_posix(),
+                "executable": (target / "debug/arxd").as_posix(),
+                "sha256": sha, "bytes": size,
+                "build_messages_sha256": hashlib.sha256(messages_bytes).hexdigest(),
+                **overrides,
+            }
+            return json.dumps(body).encode("ascii")
+
+        def run_select(target_raw, files, candidates=None):
+            target = Path(target_raw) if target_raw else workspace / "target"
+            profile = target / "debug"
+            entries = [profile / "arxd", profile / "arxd.d"] if candidates is None else candidates
+
+            @contextmanager
+            def fake_open(path, owners, size, *, executable=False):
+                data, mtime = files[path.as_posix()]
+                yield io.BytesIO(data), SimpleNamespace(st_size=len(data), st_mtime_ns=mtime)
+
+            with patch.object(fixture, "plain_path", side_effect=lambda p, *a, **kw: p), \
+                 patch.object(fixture, "open_artifact", side_effect=fake_open), \
+                 patch.object(Path, "iterdir", return_value=iter(entries)):
+                return fixture.select_daemon(target_raw, workspace, 1001, proof_root, identity,
+                                             fixture.time.monotonic() + 5)
+
+        # Positive: default workspace/target and explicit validated CARGO_TARGET_DIR override.
+        for target_raw, effective in (("", workspace / "target"), ("/mnt/custom-target", Path("/mnt/custom-target"))):
+            with self.subTest(target=target_raw or "default"):
+                msgs = build_messages(effective)
+                rcpt = make_receipt(effective, msgs)
+                files = {
+                    (proof_root / "build-messages.jsonl").as_posix(): (msgs, 100),
+                    (proof_root / "arxd-receipt.json").as_posix(): (rcpt, 200),
+                    (effective / "debug/arxd").as_posix(): (good_elf, 200),
+                }
+                path, digest = run_select(target_raw, files)
+                self.assertEqual(path, effective / "debug/arxd")
+                self.assertEqual(digest, good_sha)
+
+        # Negative: newer substituted unrelated ELF alongside a plausible receipt must be refused.
+        default_target = workspace / "target"
+        msgs = build_messages(default_target)
+        rcpt = make_receipt(default_target, msgs)
+        base_files = {
+            (proof_root / "build-messages.jsonl").as_posix(): (msgs, 100),
+            (proof_root / "arxd-receipt.json").as_posix(): (rcpt, 200),
+            (default_target / "debug/arxd").as_posix(): (other_elf, 999),
+        }
+        with self.assertRaisesRegex(fixture.Refusal, "artifact-digest-mismatch"):
+            run_select("", base_files)
+
+        # Same-size substituted valid ELF with different bytes (e_entry) must also be refused.
+        same_size_other = bytearray(good_elf)
+        same_size_other[24] ^= 0x01
+        with self.assertRaisesRegex(fixture.Refusal, "artifact-digest-mismatch"):
+            run_select("", {**base_files, (default_target / "debug/arxd").as_posix(): (bytes(same_size_other), 999)})
+
+        # Unrelated nonempty build-messages.jsonl is refused.
+        unrelated = b'{"reason":"note","message":"unrelated"}\n'
+        with self.assertRaisesRegex(fixture.Refusal, "artifact-build-messages"):
+            run_select("", {
+                (proof_root / "build-messages.jsonl").as_posix(): (unrelated, 100),
+                (proof_root / "arxd-receipt.json").as_posix(): (make_receipt(default_target, unrelated), 200),
+                (default_target / "debug/arxd").as_posix(): (good_elf, 200),
+            })
+
+        # Mismatched build_messages_sha256, mismatched HEAD, stale binary, and multiple candidates are refused.
+        for label, override_files, candidates, pattern in (
+            ("binding", {(proof_root / "arxd-receipt.json").as_posix(): (make_receipt(default_target, b"wrong"), 200),
+                         (default_target / "debug/arxd").as_posix(): (good_elf, 200)}, None, "artifact-receipt-binding"),
+            ("head", {(proof_root / "arxd-receipt.json").as_posix(): (make_receipt(default_target, msgs, head="b"*40), 200),
+                      (default_target / "debug/arxd").as_posix(): (good_elf, 200)}, None, "artifact-receipt-identity"),
+            ("stale", {(default_target / "debug/arxd").as_posix(): (good_elf, 50)}, None, "stale-artifact"),
+            ("multiple", {(default_target / "debug/arxd").as_posix(): (good_elf, 200)},
+             [default_target / "debug/arxd", default_target / "debug/arxd-alt"], "artifact-candidates"),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(fixture.Refusal, pattern):
+                    run_select("", {**base_files, **override_files}, candidates=candidates)
+
+    def test_gcc_multiarch_search_paths_canonicalize_for_manifest(self):
+        ubuntu_lookups = {
+            "/usr/libexec/gcc/x86_64-linux-gnu/13/cc1": "usr/libexec/gcc/x86_64-linux-gnu/13/cc1",
+            "/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a": "usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a",
+            "/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crt1.o": "usr/lib/x86_64-linux-gnu/crt1.o",
+            "/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/Scrt1.o": "usr/lib/x86_64-linux-gnu/Scrt1.o",
+            "/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crti.o": "usr/lib/x86_64-linux-gnu/crti.o",
+            "/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crtn.o": "usr/lib/x86_64-linux-gnu/crtn.o",
+            "/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libc.so": "usr/lib/x86_64-linux-gnu/libc.so",
+            "/usr/lib/gcc/x86_64-linux-gnu/13/../../../../lib/x86_64-linux-gnu/libc_nonshared.a":
+                "usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        }
+        canonical_map = {
+            **{raw: "/" + key for raw, key in ubuntu_lookups.items()},
+            **{"/" + key: "/" + key for key in ubuntu_lookups.values()},
+        }
+        for raw, expected in ubuntu_lookups.items():
+            with self.subTest(raw=raw):
+                relative, traversed = fixture.stage_compiler_path(raw, resolve=canonical_map.__getitem__)
+                self.assertEqual(relative, expected)
+                self.assertNotIn("..", PurePosixPath(relative).parts)
+                if ".." in raw:
+                    self.assertIn("usr/lib/gcc/x86_64-linux-gnu/13", traversed)
+
+        # Escapes, bare unfound names, trailing slashes/dots, and symlink-before-parent divergence must fail.
+        for bad in (
+            "crt1.o",
+            "/tmp/crt1.o",
+            "/usr/lib/gcc/x86_64-linux-gnu/13/../../../../../etc/passwd",
+            "/usr/../../etc/shadow",
+            "/usr/lib/x86_64-linux-gnu/crt1.o/",
+            "/usr/lib/x86_64-linux-gnu/crt1.o/.",
+            "/usr/lib/./x86_64-linux-gnu/crt1.o",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(fixture.Refusal, "compiler-input-path"):
+                    fixture.stage_compiler_path(bad)
+        with self.assertRaisesRegex(fixture.Refusal, "compiler-input-path"):
+            fixture.stage_compiler_path(
+                "/usr/lib/symlinked/../x86_64-linux-gnu/crt1.o",
+                resolve=lambda item: "/usr/other/crt1.o" if "symlinked" in item else "/usr/lib/x86_64-linux-gnu/crt1.o",
+            )
+
+    def test_tool_vetting_accepts_valid_aliases_and_rejects_broken_suffixes(self):
+        dir_ok = SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755)
+        reg_ok = SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG | 0o755)
+        suid_ok = SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG | 0o4755)
+        lnk_ok = SimpleNamespace(st_uid=0, st_mode=stat.S_IFLNK | 0o777)
+
+        def make_fs(extra_stats=None, extra_links=None):
+            stats = {
+                "/": dir_ok, "/usr": dir_ok, "/usr/bin": dir_ok, "/usr/sbin": dir_ok,
+                "/bin": lnk_ok, "/sbin": lnk_ok,
+                "/usr/bin/git": reg_ok,
+                "/usr/bin/mount": suid_ok,
+                "/usr/bin/gcc": lnk_ok,
+                "/usr/bin/gcc-13": lnk_ok,
+                "/usr/bin/x86_64-linux-gnu-gcc-13": reg_ok,
+                "/usr/sbin/ip": lnk_ok,
+                "/usr/bin/ip": reg_ok,
+                **(extra_stats or {}),
+            }
+            links = {
+                "/bin": "usr/bin", "/sbin": "usr/sbin",
+                "/usr/bin/gcc": "gcc-13",
+                "/usr/bin/gcc-13": "x86_64-linux-gnu-gcc-13",
+                "/usr/sbin/ip": "/bin/ip",
+                **(extra_links or {}),
+            }
+            return stats.__getitem__, links.__getitem__
+
+        lstat_fn, readlink_fn = make_fs()
+        self.assertEqual(fixture.vet_tool("/usr/bin/git", lstat=lstat_fn, readlink=readlink_fn), "/usr/bin/git")
+        self.assertEqual(fixture.vet_tool("/usr/bin/mount", lstat=lstat_fn, readlink=readlink_fn), "/usr/bin/mount")
+        self.assertEqual(fixture.vet_tool("/usr/bin/gcc", lstat=lstat_fn, readlink=readlink_fn),
+                         "/usr/bin/x86_64-linux-gnu-gcc-13")
+        self.assertEqual(fixture.vet_tool("/usr/sbin/ip", lstat=lstat_fn, readlink=readlink_fn), "/usr/bin/ip")
+
+        # Sibling-relative ../bin/ip alias is also accepted cleanly.
+        lstat_fn, readlink_fn = make_fs(extra_links={"/usr/sbin/ip": "../bin/ip"})
+        self.assertEqual(fixture.vet_tool("/usr/sbin/ip", lstat=lstat_fn, readlink=readlink_fn), "/usr/bin/ip")
+
+        # Broken trailing-slash, terminal-dot, out-of-policy, unsafe ownership/mode, bad /bin alias, and cycles fail.
+        for label, extra_stats, extra_links in (
+            ("trailing-slash-merged", None, {"/usr/sbin/ip": "/bin/ip/"}),
+            ("trailing-slash-abs", None, {"/usr/sbin/ip": "/usr/bin/ip/"}),
+            ("trailing-slash-rel", None, {"/usr/bin/gcc": "gcc-13/"}),
+            ("terminal-dot-merged", None, {"/usr/sbin/ip": "/bin/ip/."}),
+            ("terminal-dot-abs", None, {"/usr/sbin/ip": "/usr/bin/ip/."}),
+            ("terminal-dot-rel", None, {"/usr/bin/gcc": "gcc-13/."}),
+            ("bare-dot", None, {"/usr/bin/gcc": "."}),
+            ("out-of-policy", None, {"/usr/sbin/ip": "/tmp/ip"}),
+            ("bad-merged-bin", None, {"/bin": "/tmp/bin"}),
+            ("non-root-link", {"/usr/sbin/ip": SimpleNamespace(st_uid=1000, st_mode=stat.S_IFLNK | 0o777)}, None),
+            ("writable-dir", {"/usr/sbin": SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o775)}, None),
+            ("writable-leaf", {"/usr/bin/ip": SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG | 0o775)}, None),
+            ("cycle", None, {"/usr/bin/gcc": "gcc-13", "/usr/bin/gcc-13": "gcc"}),
+        ):
+            with self.subTest(case=label):
+                ls, rl = make_fs(extra_stats, extra_links)
+                target_path = "/usr/bin/gcc" if "rel" in label or label in ("bare-dot", "cycle") else "/usr/sbin/ip"
+                with self.assertRaisesRegex(fixture.Refusal, "runner-tool"):
+                    fixture.vet_tool(target_path, lstat=ls, readlink=rl)
+
+        # Unvetted host_command refuses before spawning capture.
+        with patch.object(fixture, "capture") as mocked_capture:
+            with self.assertRaisesRegex(fixture.Refusal, "tool-unvetted"):
+                fixture.host_command("git", 1, "--version")
+            mocked_capture.assert_not_called()
+
+    def test_capture_timeout_kills_reaps_and_raises_refusal(self):
+        fake_stdout = SimpleNamespace(fileno=lambda: 3, close=lambda: None)
+        killed = []
+        waits = []
+
+        class FakePopen:
+            def __init__(self, *args, **kwargs):
+                self.pid = 4242
+                self.stdout = fake_stdout
+                self.alive = True
+
+            def poll(self):
+                return None if self.alive else -9
+
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                if len(waits) == 1:
+                    raise subprocess.TimeoutExpired(["fake"], timeout)
+                self.alive = False
+                return -9
+
+            def kill(self):
+                killed.append("kill")
+                self.alive = False
+
+        class FakeSelector:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def register(self, fileobj, events):
+                pass
+
+            def select(self, timeout):
+                return [(None, None)]
+
+        with patch.object(fixture.subprocess, "Popen", FakePopen), \
+             patch.object(fixture.selectors, "DefaultSelector", FakeSelector), \
+             patch.object(fixture.os, "read", return_value=b""), \
+             patch.object(fixture.os, "killpg", side_effect=lambda pid, sig: killed.append((pid, sig)), create=True):
+            with self.assertRaisesRegex(fixture.Refusal, "command-deadline"):
+                fixture.capture(["/usr/bin/true"], fixture.time.monotonic() + 5)
+        self.assertTrue(killed)
+        self.assertEqual(len(waits), 2)
 
     def test_unallocated_short_or_aliased_images_fail(self):
         size = 256*fixture.MIB
@@ -146,6 +414,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_each_runner_profile_requires_its_own_kernel_and_package(self):
         host = fixture.load_pins()["host"]
+        vetted = {**fixture.TOOLS, "ip": "/usr/bin/ip"}
         first, second = host["profiles"]
         for profile, other in ((first, second), (second, first)):
             env = self.hosted_env(profile)
@@ -158,19 +427,66 @@ class RunnerTests(unittest.TestCase):
             ) as package:
                 uname.return_value = SimpleNamespace(release=other["kernel"], machine="x86_64")
                 with self.assertRaisesRegex(fixture.Refusal, "runner-kernel-os"):
-                    run.checked_runner_platform(env, host, head, end)
+                    run.checked_runner_platform(env, host, head, end, vetted)
                 package.assert_not_called()
 
                 uname.return_value = SimpleNamespace(release=profile["kernel"], machine="x86_64")
-                receipt = run.checked_runner_platform(env, host, head, end)
-                package.assert_called_once_with("dpkg", end, "-W", "-f=${Version}", "systemd")
+                receipt = run.checked_runner_platform(env, host, head, end, vetted)
+                package.assert_called_once_with("dpkg", end, "-W", "-f=${Version}", "systemd", tools=vetted)
                 self.assertEqual(receipt["image_version"], profile["image_version"])
                 self.assertEqual(receipt["kernel"], profile["kernel"])
                 self.assertEqual(receipt["systemd"], profile["systemd_package"])
 
                 package.return_value = "255.4-1ubuntu8.19"
                 with self.assertRaisesRegex(fixture.Refusal, "runner-systemd"):
-                    run.checked_runner_platform(env, host, head, end)
+                    run.checked_runner_platform(env, host, head, end, vetted)
+
+    def test_preflight_vets_tools_before_any_host_command(self):
+        pins = fixture.load_pins()
+        profile = pins["host"]["profiles"][0]
+        workspace = run.ROOT
+        scratch = workspace.parent.parent / "_temp"
+        env = {
+            **self.hosted_env(profile),
+            "GITHUB_WORKSPACE": str(workspace),
+            "RUNNER_TEMP": str(scratch),
+            "CARGO_TARGET_DIR": str(workspace / "target"),
+        }
+        # Refusal during tool vetting must stop before git, dpkg-query or any other command runs.
+        with patch.object(run.sys, "platform", "linux"), \
+             patch.object(run, "plain_path", side_effect=lambda p, *a, **kw: p), \
+             patch.object(run, "vet_tools", side_effect=fixture.Refusal("runner-tool")), \
+             patch.object(run, "host_command") as mocked_cmd:
+            with self.assertRaisesRegex(fixture.Refusal, "runner-tool"):
+                run.checked_metadata(env, pins, 1001, 10)
+            mocked_cmd.assert_not_called()
+
+        # When vetting succeeds, vet_tools runs first and callers receive the vetted canonical paths.
+        order = []
+        vetted = {**fixture.TOOLS, "ip": "/usr/bin/ip", "cc": "/usr/bin/x86_64-linux-gnu-gcc-13"}
+
+        def fake_vet(_tools):
+            order.append("vet_tools")
+            return vetted
+
+        def fake_cmd(tool, _end, *args, tools=None, **kwargs):
+            order.append((tool, tools[tool]))
+            if tool == "git":
+                return env["GITHUB_SHA"] + "\n"
+            raise fixture.Refusal("stop-after-platform")
+
+        with patch.object(run.sys, "platform", "linux"), \
+             patch.object(run, "plain_path", side_effect=lambda p, *a, **kw: p), \
+             patch.object(run, "vet_tools", side_effect=fake_vet), \
+             patch.object(run, "host_command", side_effect=fake_cmd), \
+             patch.object(run, "os_version", return_value="24.04"), \
+             patch.object(run.os, "uname", return_value=SimpleNamespace(release=profile["kernel"], machine="x86_64"),
+                          create=True):
+            with self.assertRaisesRegex(fixture.Refusal, "stop-after-platform"):
+                run.checked_metadata(env, pins, 1001, 10)
+        self.assertEqual(order[0], "vet_tools")
+        self.assertEqual(order[1], ("git", "/usr/bin/git"))
+        self.assertEqual(order[2], ("dpkg", "/usr/bin/dpkg-query"))
 
     def test_only_dry_dispatches_and_uses_no_legacy_driver(self):
         expected = {"first": None, "cleanup": "confirmed"}

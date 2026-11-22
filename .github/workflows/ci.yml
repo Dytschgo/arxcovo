@@ -117,6 +117,26 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo nextest run --workspace --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($IsLinux) {
+            $proofRoot = Join-Path $env:RUNNER_TEMP 'arx-bound-sqlite'
+            $messages = Join-Path $proofRoot 'build-messages.jsonl'
+            $targetDir = $env:CARGO_TARGET_DIR.TrimEnd('/')
+            $arxd = Join-Path $targetDir 'debug/arxd'
+            $item = Get-Item -LiteralPath $arxd
+            if ($item.LinkType -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.PSIsContainer) { throw 'Invalid arxd artifact' }
+            $receipt = [ordered]@{
+              schema = 'arxcovo/r2-artifact/1'
+              head = $env:GITHUB_SHA
+              run = $env:GITHUB_RUN_ID
+              attempt = $env:GITHUB_RUN_ATTEMPT
+              target_dir = $targetDir
+              executable = $arxd
+              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $arxd).Hash.ToLowerInvariant()
+              bytes = [int64]$item.Length
+              build_messages_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $messages).Hash.ToLowerInvariant()
+            }
+            $receipt | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $proofRoot 'arxd-receipt.json') -Encoding ascii -NoNewline
+          }
       - name: Hosted distinct-UID custody qualification
         if: runner.os == 'Linux'
         shell: bash

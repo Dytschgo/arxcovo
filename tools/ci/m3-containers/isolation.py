@@ -9,11 +9,35 @@ import select
 import shutil
 import socket
 import stat
+import subprocess
 import time
 
 from fixture import (INNER, NETWORK, OUTER, Refusal, allocate, bounded_read, data_layout,
                      filesystem_facts, host_command, image_stat, private_directory,
                      remaining, require, unique_pairs)
+
+
+def dev_majmin(dev):
+    if hasattr(os, "major") and hasattr(os, "minor"):
+        return f"{os.major(dev)}:{os.minor(dev)}"
+    major = ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfff)
+    minor = (dev & 0xff) | ((dev >> 12) & ~0xff)
+    return f"{major}:{minor}"
+
+
+def mountinfo_entries(target, contents=None):
+    if contents is None:
+        contents = bounded_read(Path("/proc/self/mountinfo"), 256*1024).decode("ascii")
+    expected = target.as_posix() if isinstance(target, Path) else str(target)
+    matches = []
+    for line in contents.splitlines():
+        left, separator, right = line.partition(" - ")
+        fields = left.split()
+        tail = right.split()
+        require(separator and len(fields) >= 6 and len(tail) >= 3 and fields[0].isdecimal(), "mount-info")
+        if fields[4] == expected:
+            matches.append((int(fields[0]), fields[3], tail[0], tail[1]))
+    return matches
 
 
 def json_rows(value):
@@ -32,7 +56,7 @@ def token(receipt):
 
 
 class Resources:
-    def __init__(self, receipt, pins):
+    def __init__(self, receipt, pins, tools=None):
         self.id = token(receipt)
         self.root = Path("/var/lib") / f"arx-r2-{self.id}"
         self.bridge = "r2" + self.id[:11]
@@ -40,8 +64,12 @@ class Resources:
         self.namespaces = {node: f"r2-{self.id}-{node}" for node in "abc"}
         self.links = {node: f"{self.bridge}{node}" for node in "abc"}
         self.budget = pins["rootfs"]
+        self.tools = tools
         self.cleanup_stack = []
         self.facts = {}
+
+    def cmd(self, tool, end, *args, **options):
+        return host_command(tool, end, *args, tools=self.tools, **options)
 
     def remember(self, label, cleanup):
         self.cleanup_stack.append((label, cleanup))
@@ -51,7 +79,7 @@ class Resources:
         for label, action in reversed(self.cleanup_stack):
             try:
                 action(end)
-            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError):
                 errors.append(label)
         return errors
 
@@ -82,13 +110,13 @@ class Resources:
         return list(parent.glob(f"arx-r2-{self.id}-?.service")) + list(parent.glob(f"arx-r2-{self.id}-??.service"))
 
     def loop_rows(self, end, file=None):
-        args = ["-J", "-l", "-O", "NAME,BACK-FILE,RO,SIZELIMIT,OFFSET"]
+        args = ["-J", "-l", "-O", "NAME,BACK-FILE,BACK-INO,BACK-MAJ:MIN,RO,SIZELIMIT,OFFSET"]
         if file is not None:
             args.extend(("-j", str(file)))
-        data = json.loads(host_command("loop", end, *args), object_pairs_hook=unique_pairs)
+        data = json.loads(self.cmd("loop", end, *args), object_pairs_hook=unique_pairs)
         rows = data["loopdevices"]
         require(isinstance(rows, list) and len(rows) <= 128, "loop-inventory")
-        return [row for row in rows if Path(row["back-file"]).is_relative_to(self.root)]
+        return [row for row in rows if row.get("back-file") and Path(row["back-file"]).is_relative_to(self.root)]
 
     def volume(self, name, source, end):
         require(name in ("root", "a", "b", "c") and source.parent == self.root, "volume-name")
@@ -100,64 +128,86 @@ class Resources:
         flags = ["-q", "-F", "-b", "4096", "-m", "0", "-E", "nodiscard,lazy_itable_init=0,lazy_journal_init=0"]
         if not sealed:
             flags.extend(("-N", str(self.budget["data_inodes"])))
-        host_command("mkfs", end, *flags, "-d", source, image)
+        self.cmd("mkfs", end, *flags, "-d", source, image)
         if sealed:
             image.chmod(0o400)
-        image_stat(image.lstat(), size)
+        img_info = image.lstat()
+        image_stat(img_info, size)
+        backing = (img_info.st_dev, img_info.st_ino)
         require(not self.loop_rows(end, image), "loop-already-attached")
         args = ["--find", "--show", "--nooverlap"]
         if sealed:
             args.append("--read-only")
+        loop_box = [None]
         try:
-            loop = host_command("loop", end, *args, image).strip()
+            loop_box[0] = self.cmd("loop", end, *args, image).strip()
         finally:
-            self.remember(f"loop-{name}", lambda deadline: self.release_loop(image, size, sealed, deadline))
-        self.check_loop(image, loop, size, sealed, end)
+            self.remember(f"loop-{name}", lambda deadline, b=backing, lb=loop_box:
+                          self.release_loop(image, size, sealed, b, lb[0], deadline))
+        loop = loop_box[0]
+        self.check_loop(image, loop, size, sealed, backing, end)
         private_directory(mount, 0o755)
+        require(not mountinfo_entries(mount) and not self.mounts(mount, end), "mount-preexisting")
+        mount_box = [None]
         try:
-            host_command("mount", end, "-t", "ext4", "-o",
-                         "ro,nodev,nosuid" if sealed else "rw,nodev,nosuid,noexec", loop, mount)
+            self.cmd("mount", end, "-t", "ext4", "-o",
+                     "ro,nodev,nosuid" if sealed else "rw,nodev,nosuid,noexec", loop, mount)
+            mount_box[0] = self.check_mount(mount, loop, end)
         finally:
-            self.remember(f"mount-{name}", lambda deadline: self.release_mount(mount, loop, deadline))
-        self.check_mount(mount, loop, end)
+            self.remember(f"mount-{name}", lambda deadline, box=mount_box:
+                          self.release_mount(mount, loop, box[0], deadline))
         stats = os.statvfs(mount)
         require(bool(stats.f_flag & os.ST_RDONLY) == sealed, "volume-readonly")
         self.facts[name] = filesystem_facts(stats, self.budget, writable=not sealed)
         return mount
 
-    def check_loop(self, image, loop, size, sealed, end):
+    def check_loop(self, image, loop, size, sealed, backing, end):
         require(re.fullmatch(r"/dev/loop[0-9]{1,4}", loop), "loop-name")
         rows = self.loop_rows(end, image)
         require(len(rows) == 1, "ambiguous-loop")
         row = rows[0]
-        require(row["name"] == loop and row["back-file"] == str(image) and row["ro"] is sealed
+        require(row["name"] == loop and row["back-file"] == image.as_posix() and row["ro"] is sealed
                 and row["offset"] == 0 and row["sizelimit"] == 0, "loop-identity")
-        image_stat(image.lstat(), size)
+        require(type(row.get("back-ino")) is int and row["back-ino"] == backing[1]
+                and row.get("back-maj:min") == dev_majmin(backing[0]), "loop-identity")
+        current = image.lstat()
+        image_stat(current, size)
+        require((current.st_dev, current.st_ino) == backing, "loop-identity")
         actual = bounded_read(Path("/sys/class/block") / Path(loop).name / "size", 32)
         require(int(actual) * 512 == size, "loop-size")
 
-    def release_loop(self, image, size, sealed, end):
+    def release_loop(self, image, size, sealed, backing, expected_loop, end):
         rows = self.loop_rows(end, image)
         if rows:
             require(len(rows) == 1, "ambiguous-loop")
             loop = rows[0]["name"]
-            self.check_loop(image, loop, size, sealed, end)
-            host_command("loop", end, "-d", loop)
+            if expected_loop is not None:
+                require(loop == expected_loop, "loop-identity")
+            self.check_loop(image, loop, size, sealed, backing, end)
+            self.cmd("loop", end, "-d", loop)
         require(not self.loop_rows(end, image), "loop-still-attached")
 
-    @staticmethod
-    def mounts(path, end):
-        return host_command("findmnt", end, "-nr", "-o", "TARGET,SOURCE,FSTYPE,FSROOT",
-                            "--mountpoint", path, statuses=(0, 1)).splitlines()
+    def mounts(self, path, end):
+        return self.cmd("findmnt", end, "-nr", "-o", "ID,TARGET,SOURCE,FSTYPE,FSROOT",
+                        "--mountpoint", path, statuses=(0, 1)).splitlines()
 
-    def check_mount(self, path, loop, end):
-        require_same(self.mounts(path, end), [f"{path} {loop} ext4 /"], "mount-identity")
+    def check_mount(self, path, loop, end, expected_id=None):
+        entries = mountinfo_entries(path)
+        require(len(entries) == 1, "mount-identity")
+        mount_id, fsroot, fstype, source = entries[0]
+        require(fsroot == "/" and fstype == "ext4" and source == loop, "mount-identity")
+        if expected_id is not None:
+            require(mount_id == expected_id, "mount-identity")
+        require_same(self.mounts(path, end), [f"{mount_id} {path.as_posix()} {loop} ext4 /"], "mount-identity")
+        return mount_id
 
-    def release_mount(self, path, loop, end):
-        if self.mounts(path, end):
-            self.check_mount(path, loop, end)
-            host_command("umount", end, path)
-        require(not self.mounts(path, end), "mount-still-active")
+    def release_mount(self, path, loop, expected_id, end):
+        entries = mountinfo_entries(path)
+        if entries or self.mounts(path, end):
+            require(expected_id is not None, "mount-identity")
+            self.check_mount(path, loop, end, expected_id=expected_id)
+            self.cmd("umount", end, path)
+        require(not mountinfo_entries(path) and not self.mounts(path, end), "mount-still-active")
 
     def stage_data(self, end):
         for node in self.namespaces:
@@ -169,7 +219,7 @@ class Resources:
             self.volume(node, source, end)
 
     def ip(self, end, *args, **options):
-        return host_command("ip", end, *args, **options)
+        return self.cmd("ip", end, *args, **options)
 
     def ns(self, end, node, *args):
         return self.ip(end, "-n", self.namespaces[node], *args)
@@ -180,52 +230,70 @@ class Resources:
             return []
         return json_rows(output)
 
-    def tag_link(self, name, end):
-        self.ip(end, "link", "set", "dev", name, "alias", self.table)
-        rows = self.links_at(end, name)
-        require(len(rows) == 1 and rows[0].get("ifalias") == self.table, "link-attribution")
-        index = rows[0]["ifindex"]
-        self.remember("link", lambda deadline: self.remove_link(name, index, deadline))
+    def add_link(self, name, end, *add_args):
+        state = {"index": None, "tagged": False}
+        try:
+            self.ip(end, "link", "add", "name", name, *add_args)
+            rows = self.links_at(end, name)
+            require(len(rows) == 1 and type(rows[0].get("ifindex")) is int, "link-attribution")
+            state["index"] = rows[0]["ifindex"]
+            self.ip(end, "link", "set", "dev", name, "alias", self.table)
+            rows = self.links_at(end, name)
+            require(len(rows) == 1 and rows[0]["ifindex"] == state["index"]
+                    and rows[0].get("ifalias") == self.table, "link-attribution")
+            state["tagged"] = True
+        finally:
+            self.remember("link", lambda deadline, n=name, s=state:
+                          self.remove_link(n, s["index"], deadline, tagged=s["tagged"]))
 
-    def remove_link(self, name, index, end):
+    def remove_link(self, name, index, end, *, tagged=True):
         rows = self.links_at(end, name)
         if rows:
-            require(len(rows) == 1 and rows[0]["ifindex"] == index
-                    and rows[0].get("ifalias") == self.table, "link-attribution")
+            require(len(rows) == 1 and index is not None and rows[0]["ifindex"] == index
+                    and (not tagged or rows[0].get("ifalias") == self.table), "link-attribution")
             self.ip(end, "link", "del", "dev", name)
         require(not self.links_at(end, name), "link-residue")
 
     def network_names(self, end):
         namespaces = self.ip(end, "netns", "list").splitlines()
-        tables = host_command("nft", end, "list", "tables").splitlines()
+        tables = self.cmd("nft", end, "list", "tables").splitlines()
         return (any(line.split()[0] in self.namespaces.values() for line in namespaces)
                 or any(line.split()[-1] == self.table for line in tables)
                 or any(self.links_at(end, name) for name in (self.bridge, *self.links.values())))
 
+    def add_namespace(self, node, end):
+        namespace = self.namespaces[node]
+        path = Path("/run/netns") / namespace
+        identity = [None]
+        try:
+            self.ip(end, "netns", "add", namespace)
+            info = path.stat()
+            identity[0] = (info.st_dev, info.st_ino)
+        finally:
+            self.remember("namespace", lambda deadline, n=node, box=identity:
+                          self.remove_namespace(n, box[0], deadline))
+
     def remove_namespace(self, node, identity, end):
         name = self.namespaces[node]
         path = Path("/run/netns") / name
+        if not path.exists():
+            return
         current = path.stat()
-        require((current.st_dev, current.st_ino) == identity, "netns-attribution")
+        require(identity is not None and (current.st_dev, current.st_ino) == identity, "netns-attribution")
         require(not self.ip(end, "netns", "pids", name).strip(), "netns-children")
         self.ip(end, "netns", "del", name)
         require(not path.exists(), "netns-residue")
 
     def make_links(self, end):
         require(not self.network_names(end), "network-preexisting")
-        self.ip(end, "link", "add", "name", self.bridge, "address", NETWORK["local"][1], "type", "bridge",
-                "stp_state", "0", "mcast_snooping", "0")
-        self.tag_link(self.bridge, end)
+        self.add_link(self.bridge, end, "address", NETWORK["local"][1], "type", "bridge",
+                      "stp_state", "0", "mcast_snooping", "0")
         self.ip(end, "link", "set", "dev", self.bridge, "addrgenmode", "none")
         for node, (address, mac) in NETWORK["nodes"].items():
             namespace = self.namespaces[node]
-            self.ip(end, "netns", "add", namespace)
-            info = (Path("/run/netns") / namespace).stat()
-            self.remember("namespace", lambda deadline, node=node, identity=(info.st_dev, info.st_ino):
-                          self.remove_namespace(node, identity, deadline))
+            self.add_namespace(node, end)
             link = self.links[node]
-            self.ip(end, "link", "add", "name", link, "type", "veth", "peer", "name", "eth0", "netns", namespace)
-            self.tag_link(link, end)
+            self.add_link(link, end, "type", "veth", "peer", "name", "eth0", "netns", namespace)
             self.ip(end, "link", "set", "dev", link, "master", self.bridge, "addrgenmode", "none")
             self.ns(end, node, "link", "set", "dev", "eth0", "address", mac, "addrgenmode", "none")
             self.ns(end, node, "address", "add", f"{address}/24", "dev", "eth0")
@@ -234,7 +302,7 @@ class Resources:
                     self.ns(end, node, "neigh", "add", peer, "lladdr", peer_mac, "nud", "permanent", "dev", "eth0")
 
     def nft(self, end, *args):
-        return host_command("nft", end, *args)
+        return self.cmd("nft", end, *args)
 
     def apply_policy(self, end):
         rules = policy(self.bridge, self.links)
@@ -253,12 +321,21 @@ class Resources:
         config = self.root / "policy.nft"
         config.write_text("\n".join(lines) + "\n", encoding="ascii")
         first_link = next(index for index, (label, _) in enumerate(self.cleanup_stack) if label == "link")
-        self.nft(end, "-f", config)
-        for family in rules:
-            rows = self.nft_table(family, end)
-            handle = table_handle(rows, family, self.table)
-            self.cleanup_stack.insert(first_link, ("nft", lambda deadline, family=family, handle=handle:
-                                                    self.remove_table(family, handle, deadline)))
+        handles = {}
+        try:
+            self.nft(end, "-f", config)
+            for family in rules:
+                handles[family] = table_handle(self.nft_table(family, end), family, self.table)
+        finally:
+            for family in rules:
+                if family not in handles:
+                    try:
+                        handles[family] = table_handle(self.nft_table(family, end), family, self.table)
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError):
+                        continue
+            for family, handle in handles.items():
+                self.cleanup_stack.insert(first_link, ("nft", lambda deadline, f=family, h=handle:
+                                                        self.remove_table(f, h, deadline)))
         self.rule_graph = rules
         self.rule_receipt = self.counters(end)
 
@@ -343,7 +420,7 @@ class Resources:
     def unit_info(self, unit, end):
         keys = ("Id", "LoadState", "ActiveState", "ControlGroup", "MainPID", "InvocationID",
                 "MemoryMax", "MemorySwapMax", "TasksMax", "CPUQuotaPerSecUSec", "LimitNOFILE", "LimitCORE")
-        result = host_command("systemctl", end, "show", unit, "--property=" + ",".join(keys), statuses=(0, 1))
+        result = self.cmd("systemctl", end, "show", unit, "--property=" + ",".join(keys), statuses=(0, 1))
         rows = [line.split("=", 1) for line in result.splitlines()]
         require(all(len(row) == 2 for row in rows) and len(dict(rows)) == len(rows), "unit-fields")
         return dict(rows)
@@ -354,8 +431,8 @@ class Resources:
             require(facts.get("Id") == unit and facts.get("InvocationID") == invocation
                     and facts.get("ControlGroup") == f"/system.slice/{unit}", "unit-attribution")
             if crash:
-                host_command("systemctl", end, "kill", "--kill-whom=all", "--signal=SIGKILL", unit)
-            host_command("systemctl", end, "stop", unit)
+                self.cmd("systemctl", end, "kill", "--kill-whom=all", "--signal=SIGKILL", unit)
+            self.cmd("systemctl", end, "stop", unit)
         require(not (Path("/sys/fs/cgroup/system.slice") / unit).exists(), "unit-cgroup-residue")
 
     def start(self, instance, end):
@@ -370,8 +447,8 @@ class Resources:
         }
         args = [f"--property={name}={value}" for name, value in properties.items()]
         try:
-            host_command("unit", end, "--quiet", "--unit", unit, *args,
-                         self.root / "bootstrap", "boot", self.id, instance)
+            self.cmd("unit", end, "--quiet", "--unit", unit, *args,
+                     self.root / "bootstrap", "boot", self.id, instance)
         finally:
             # An incomplete launch still owns any attributable invocation under the
             # freshly reserved name, which must go through the same stop checks.
@@ -558,17 +635,48 @@ def validate_unit(unit, facts):
             and re.fullmatch(r"[0-9a-f]{32}", facts.get("InvocationID", "")), "unit-envelope")
 
 
-def observe_limits(group):
+def observe_limits(group, root=Path("/sys/fs/cgroup")):
+    require(group.is_relative_to(root) and group != root, "cgroup-root")
+    controllers = bounded_read(root / "cgroup.controllers", 512).decode("ascii").split()
+    require({"memory", "pids", "cpu"} <= set(controllers), "cgroup-root")
     files = {"memory.max": str(OUTER["memory"]), "memory.swap.max": str(OUTER["swap"]),
              "pids.max": str(OUTER["pids"])}
     for name, expected in files.items():
-        require(bounded_read(group / name, 64).decode("ascii").strip() == expected, "cgroup-outer-limit")
-    quota, period = bounded_read(group / "cpu.max", 64).decode("ascii").split()
+        try:
+            value = bounded_read(group / name, 64).decode("ascii").strip()
+        except FileNotFoundError:
+            raise Refusal("cgroup-outer-limit") from None
+        require(value == expected, "cgroup-outer-limit")
+    try:
+        parts = bounded_read(group / "cpu.max", 64).decode("ascii").split()
+    except FileNotFoundError:
+        raise Refusal("cgroup-cpu") from None
+    require(len(parts) == 2, "cgroup-cpu")
+    quota, period = parts
     require(quota.isdecimal() and period.isdecimal() and 0 < int(quota) == int(period), "cgroup-cpu")
-    for parent in (group.parent, group.parent.parent):
+    ancestors = []
+    cursor = group.parent
+    while cursor != root:
+        ancestors.append(cursor)
+        cursor = cursor.parent
+    require(len(ancestors) >= 1, "cgroup-ancestor-limit")
+    # Linux cgroup v2 exposes memory.max, memory.swap.max, pids.max and cpu.max
+    # only on non-root cgroups, never on the host hierarchy root.
+    for parent in ancestors:
         for name, ceiling in files.items():
-            value = bounded_read(parent / name, 64).decode("ascii").strip()
+            try:
+                value = bounded_read(parent / name, 64).decode("ascii").strip()
+            except FileNotFoundError:
+                raise Refusal("cgroup-ancestor-limit") from None
             require(value == "max" or value.isdecimal() and int(value) >= int(ceiling), "cgroup-ancestor-limit")
+        try:
+            a_parts = bounded_read(parent / "cpu.max", 64).decode("ascii").split()
+        except FileNotFoundError:
+            raise Refusal("cgroup-ancestor-cpu") from None
+        require(len(a_parts) == 2 and a_parts[1].isdecimal() and int(a_parts[1]) > 0, "cgroup-ancestor-cpu")
+        if a_parts[0] != "max":
+            require(a_parts[0].isdecimal() and int(a_parts[0]) * int(period) >= int(quota) * int(a_parts[1]),
+                    "cgroup-ancestor-cpu")
 
 
 def policy(bridge, links):
@@ -668,7 +776,7 @@ def read_counters(rows, chains, family, name):
         require(index < len(chains[key][1]), "nft-extra-rule")
         label, source, verdict = chains[key][1][index]
         require(comment == "r2-" + label and expr[-1] == {verdict: None}, "nft-rule-order-verdict")
-        rules_readback(expr[:-2], source)
+        rules_readback(expr[:-2], source, family)
         counter = expr[-2].get("counter", {})
         packets, total = counter.get("packets"), counter.get("bytes")
         require(type(packets) is int and type(total) is int and packets >= 0 and total >= 0, "nft-counter")
@@ -680,9 +788,53 @@ def read_counters(rows, chains, family, name):
     return facts
 
 
-def rules_readback(expressions, source):
+def allowed_nft_dependencies(source, family):
+    padded = f" {source} "
+    has_ip = " ip " in padded
+    has_ip6 = " ip6 " in padded
+    has_arp = " arp " in padded
+    has_tcp = " tcp " in padded
+    has_udp = " udp " in padded
+    deps = set()
+    if family == "bridge":
+        if has_ip:
+            deps.add(("payload", "ether", "type", "ip"))
+        if has_ip6:
+            deps.add(("payload", "ether", "type", "ip6"))
+        if has_arp:
+            deps.update((
+                ("payload", "ether", "type", "arp"),
+                ("payload", "arp", "htype", 1),
+                ("payload", "arp", "ptype", "ip"),
+                ("payload", "arp", "hlen", 6),
+                ("payload", "arp", "plen", 4),
+            ))
+    elif family == "inet":
+        if has_ip:
+            deps.add(("meta", "nfproto", "ipv4"))
+        if has_ip6:
+            deps.add(("meta", "nfproto", "ipv6"))
+    if has_tcp:
+        deps.add(("meta", "l4proto", "tcp"))
+        if has_ip:
+            deps.add(("payload", "ip", "protocol", "tcp"))
+        if has_ip6:
+            deps.add(("payload", "ip6", "nexthdr", "tcp"))
+    if has_udp:
+        deps.add(("meta", "l4proto", "udp"))
+        if has_ip:
+            deps.add(("payload", "ip", "protocol", "udp"))
+        if has_ip6:
+            deps.add(("payload", "ip6", "nexthdr", "udp"))
+    return deps
+
+
+def rules_readback(expressions, source, family="bridge"):
     # Match the expressions the kernel returned, including each protocol, field
-    # and literal operand. nft may report an implicit protocol dependency.
+    # and literal operand, while permitting only exact implicit protocol
+    # dependencies implied by this rule's family and explicit predicates.
+    allowed_deps = allowed_nft_dependencies(source, family)
+    seen_deps = set()
     rendered = []
     for expr in expressions:
         match = expr.get("match", {})
@@ -690,12 +842,26 @@ def rules_readback(expressions, source):
         require((match.get("op") == "==" or "ct" in left and match.get("op") == "in")
                 and len(left) == 1, "nft-match")
         if "meta" in left:
-            rendered.append(f'{left["meta"]["key"]} "{right}"')
+            key = left["meta"]["key"]
+            dep = ("meta", key, right)
+            if dep in allowed_deps:
+                require(dep not in seen_deps, "nft-match-drift")
+                seen_deps.add(dep)
+                continue
+            require(key in ("iifname", "oifname") and isinstance(right, str), "nft-expression")
+            rendered.append(f'{key} "{right}"')
         elif "payload" in left:
             field = left["payload"]
+            dep = ("payload", field["protocol"], field["field"], right)
+            if dep in allowed_deps:
+                require(dep not in seen_deps, "nft-match-drift")
+                seen_deps.add(dep)
+                continue
             rendered.append(f'{field["protocol"]} {field["field"]} {right}')
         elif "ct" in left:
-            rendered.append(f'ct {left["ct"]["key"]} {right}')
+            value = right[0] if isinstance(right, list) and len(right) == 1 else right
+            require(isinstance(value, str), "nft-match")
+            rendered.append(f'ct {left["ct"]["key"]} {value}')
         else:
             raise Refusal("nft-expression")
     require(" ".join(rendered) == source, "nft-match-drift")

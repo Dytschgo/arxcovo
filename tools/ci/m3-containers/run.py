@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fixture import (ENV, HERE, MIB, ROOT, TIME, TOOLS, Refusal, bounded_read, capture,
                      file_digest, host_command, load_pins, plain_path, require, select_daemon,
-                     stage_copy, stage_rootfs, verify_manifest)
+                     stage_copy, stage_rootfs, verify_manifest, vet_tools)
 from isolation import Resources
 
 REPO = "Dytschgo/arxcovo"
@@ -67,12 +67,12 @@ def os_version(file):
     return values.get("VERSION_ID")
 
 
-def checked_runner_platform(env, host, head, end):
+def checked_runner_platform(env, host, head, end, tools):
     receipt, profile = provenance(env, host, head)
     uname = os.uname()
     require(os_version(Path("/usr/lib/os-release")) == host["os"]
             and uname.release == profile["kernel"] and uname.machine == "x86_64", "runner-kernel-os")
-    systemd = host_command("dpkg", end, "-W", "-f=${Version}", "systemd").strip()
+    systemd = host_command("dpkg", end, "-W", "-f=${Version}", "systemd", tools=tools).strip()
     require(systemd == profile["systemd_package"], "runner-systemd")
     receipt.update(os=host["os"], kernel=uname.release, systemd=systemd)
     return receipt
@@ -86,22 +86,18 @@ def checked_metadata(env, pins, uid, end):
     require(workspace == ROOT and workspace.parent.parent / "_temp" == scratch, "checkout-location")
     plain_path(workspace, (0, uid), directory=True)
     plain_path(scratch, (0, uid), directory=True)
-    head = host_command("git", end, "-c", f"safe.directory={workspace}", "-C", workspace, "rev-parse", "HEAD").strip()
-    receipt = checked_runner_platform(env, host, head, end)
     require_userland(pins)
+    vetted = vet_tools(host["tools"])
+    head = host_command("git", end, "-c", f"safe.directory={workspace}", "-C", workspace,
+                        "rev-parse", "HEAD", tools=vetted).strip()
+    receipt = checked_runner_platform(env, host, head, end, vetted)
     tools = {}
-    for name, tool in TOOLS.items():
-        resolved = Path(tool).resolve(strict=True)
-        plain_path(resolved, (0,), directory=False)
-        value = resolved.stat()
-        require(stat.S_ISREG(value.st_mode) and value.st_uid == 0 and value.st_mode & 0o100
-                and not value.st_mode & 0o022, "runner-tool")
-        if name in ("cc", "nft", "ip", "mkfs", "loop", "unit", "mount", "umount"):
-            argument = "-V" if name in ("ip", "mkfs") else "--version"
-            output = host_command(name, end, argument, limit=8192)
-            first = output.splitlines()[0].strip()
-            require(re.fullmatch(r"[\w .,+:/()'#~=-]{1,160}", first), "runner-tool-version")
-            tools[name] = first
+    for name in ("cc", "nft", "ip", "mkfs", "loop", "unit", "mount", "umount"):
+        argument = "-V" if name in ("ip", "mkfs") else "--version"
+        output = host_command(name, end, argument, tools=vetted, limit=8192)
+        first = output.splitlines()[0].strip()
+        require(re.fullmatch(r"[\w .,+:/()'#~=-]{1,160}", first), "runner-tool-version")
+        tools[name] = first
     receipt["tools"] = tools
     stats = os.statvfs("/var/lib")
     require(stats.f_bavail * stats.f_frsize >= 4*1024*MIB, "runner-disk")
@@ -110,8 +106,8 @@ def checked_metadata(env, pins, uid, end):
             and stat.S_ISCHR(Path("/dev/loop-control").stat().st_mode)
             and all((Path("/proc/self/ns") / item).is_symlink()
                     for item in ("cgroup", "mnt", "net", "pid", "ipc", "uts")), "kernel-prerequisites")
-    source = select_daemon(Path(env.get("CARGO_TARGET_DIR", "")), workspace, uid,
-                           scratch / "arx-bound-sqlite/build-messages.jsonl", end)
+    source = select_daemon(env.get("CARGO_TARGET_DIR", ""), workspace, uid,
+                           scratch / "arx-bound-sqlite", receipt, end)
     home = Path(__import__("pwd").getpwuid(uid).pw_dir)
     toolchain = home / ".rustup/toolchains" / host["rust"]
     plain_path(toolchain, (0, uid), directory=True)
@@ -120,11 +116,11 @@ def checked_metadata(env, pins, uid, end):
         path = HERE / name
         digest = file_digest(path, end, MIB, (0, uid))
         revision = host_command("git", end, "-c", f"safe.directory={workspace}", "-C", workspace,
-                                "show", f"{head}:tools/ci/m3-containers/{name}", limit=MIB)
+                                "show", f"{head}:tools/ci/m3-containers/{name}", tools=vetted, limit=MIB)
         require(hashlib.sha256(revision.encode("ascii")).hexdigest() == digest, "source-module-digest")
         sources[name] = digest
     receipt["modules"] = sources
-    return receipt, source, toolchain
+    return receipt, source, toolchain, vetted
 
 
 class Qualification:
@@ -174,13 +170,13 @@ class Qualification:
 
 
 def stage(resources, assets, end):
-    pins, artifact, toolchain, uid, sources = assets
+    pins, artifact, toolchain, uid, sources, vetted = assets
     daemon, expected_digest = artifact
     resources.arena()
     require(stage_copy(HERE / "bootstrap.c", resources.root / "bootstrap.c", end, (0, uid), limit=MIB)
             == sources["bootstrap.c"], "helper-digest")
     tree = resources.root / "tree"
-    manifest, manifest_digest = stage_rootfs(pins, tree, resources.root, daemon, toolchain, uid, end)
+    manifest, manifest_digest = stage_rootfs(pins, tree, resources.root, daemon, toolchain, uid, end, vetted)
     require(manifest["files"]["fixture/arxd"] == expected_digest, "artifact-digest-drift")
     mounted = resources.volume("root", tree, end)
     image = resources.root / "root.ext4"
@@ -194,8 +190,8 @@ def stage(resources, assets, end):
 def dry_run(env, uid):
     def preflight(end):
         pins = load_pins()
-        receipt, daemon, tools = checked_metadata(env, pins, uid, end)
-        return receipt, (pins, daemon, tools, uid, receipt["modules"]), Resources(receipt, pins)
+        receipt, daemon, tools, vetted = checked_metadata(env, pins, uid, end)
+        return receipt, (pins, daemon, tools, uid, receipt["modules"], vetted), Resources(receipt, pins, vetted)
     return Qualification().run(preflight, stage)
 
 
