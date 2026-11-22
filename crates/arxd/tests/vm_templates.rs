@@ -382,10 +382,24 @@ fn golden_seed_is_deterministic() {
     assert_eq!(iso, fixture());
     assert_eq!(
         hex::encode(Sha256::digest(&iso)),
-        "839ce0a9d6b0820013700b30e9ad4bbc23f77d730a0e1f99ff78feb3c3f1f82f",
+        "f78fdc5ef4ef2cf032b6a891aab5a5855880e7f4705a543d76d6ed2d69942866",
     );
     assert!(read_iso(&iso).is_ok());
     assert_ne!(iso, fixture_recipe().render_seed([0; 16], GUEST).unwrap());
+}
+
+#[test]
+fn absent_file_identifiers_use_descriptor_filler() {
+    let iso = fixture();
+    assert_eq!(&iso[16 * BLOCK + 702..16 * BLOCK + 813], &[b' '; 111]);
+    for field in iso[17 * BLOCK + 702..17 * BLOCK + 813].chunks_exact(37) {
+        assert_eq!(field[36], 0);
+        assert!(
+            field[..36]
+                .chunks_exact(2)
+                .all(|character| character == b"\0 ")
+        );
+    }
 }
 
 fn check_hashes(files: &BTreeMap<String, &[u8]>, recipe: &UbuntuRecipe) -> Parsed<()> {

@@ -195,8 +195,15 @@ fn descriptor(joliet: bool, sectors: u32) -> [u8; SECTOR] {
     block[140..144].copy_from_slice(&path.to_le_bytes());
     block[148..152].copy_from_slice(&(path + 1).to_be_bytes());
     record(&mut block[156..190], root_extent(root), b"\0", true);
-    // The three optional file identifiers are unused.
-    if !joliet {
+    // ECMA-119 uses filler for absent identifiers. Joliet uses UCS-2
+    // spaces, with a zero byte in the odd position of each field.
+    if joliet {
+        for field in block[702..813].chunks_exact_mut(37) {
+            for character in field.chunks_exact_mut(2) {
+                character.copy_from_slice(b"\0 ");
+            }
+        }
+    } else {
         block[702..813].fill(b' ');
     }
     for offset in [813, 830, 864] {
