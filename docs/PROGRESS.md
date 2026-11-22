@@ -373,6 +373,11 @@
   - **Execution account.** Host execution is the owner's current login (ADR 0029 `current_user`). Agents may install or enable only the M4 host prerequisites (WHPX, QEMU, the D: cap and reserve), additively, with any UAC step asked of the owner once. Existing VMs are untouched.
   - **Scope.** [ADR 0058](adr/0058-v1-scope-static-vms-and-cloudflare.md) moves static VMs into v1, with an Ubuntu web server as the first target and no agent delete of static VMs or backups. It also moves Cloudflare Tunnel publishing into v1: off by default, owner-supplied credential requested once when needed, CI with fakes, the real tunnel **unverified on real hardware**.
   - **Recorded in** AGENTS.md and the ROADMAP.
+- **Owner instruction (2026-11-23, relayed by the babysitter): models and capacity.** Recorded in the ADR 0056 addendum and AGENTS.md routing.
+  - There is no fixed agent cap, within the machine, reserve, D: scratch and CI guardrails.
+  - Main coding stays with Sol and Opus, and UI with Claude.
+  - Side work may use Luna, Muse or Grok until their limits run out.
+  - The authoritative `agent-review` is still an independent Sol or Opus reviewer.
 - **Since #263:** PR #265 merged as `57ccda6a` (4c1, the VM store v6 migration; Sol builder 1/3; review PASS `29e404c5…1751`, status `59611896549`). PR #264 merged as `da0c493b` (4b2, the Ubuntu lifecycle stages; Sol builder 2/3; HOLD `e4259731…91dd` because health read `/etc/shadow` as 65534, then PASS `2cee46f7…bd34`, status `59612317649`). The slice 5 design is adopted (`D:/Temp/arx-m4-slice5/design.md`, SHA256 `68024cb3…e937`). The 5a Windows guest Sol builder stopped at 3/3 (report SHA256 `2bc8c69d…21e2`); an Opus 5.5 high diagnosis is running, then a new Opus builder. 4c2a (durable build and clone settlement) is in progress.
 - **Process notes.** The coordinator now reads every failed job of each PR CI run before
   relying on a summary. Reviewers are asked to classify activation-gate residuals and
