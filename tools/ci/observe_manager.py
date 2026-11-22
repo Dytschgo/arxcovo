@@ -148,7 +148,18 @@ def vetted_runner_tool(path):
             if info.st_uid != 0:
                 return None
             if stat.S_ISLNK(info.st_mode):
-                candidate = candidate.parent / candidate.readlink()
+                target = os.readlink(candidate)
+                if candidate == Path("/usr/sbin/ip") and target == "/bin/ip":
+                    # Ubuntu's iproute2 alias crosses the merged /usr link.
+                    alias = Path("/bin")
+                    info = alias.lstat()
+                    if (info.st_uid != 0 or not stat.S_ISLNK(info.st_mode)
+                            or os.readlink(alias) not in ("usr/bin", "/usr/bin")):
+                        return None
+                    target = "/usr/bin/ip"
+                elif not re.fullmatch(r"(?:/usr/s?bin/)?[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", target):
+                    return None
+                candidate = candidate.parent / target
                 continue
             if stat.S_ISREG(info.st_mode) and info.st_mode & 0o100 and not (info.st_mode & 0o022):
                 return candidate.as_posix()

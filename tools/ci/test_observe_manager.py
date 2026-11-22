@@ -137,23 +137,66 @@ class ManagerObservationTests(unittest.TestCase):
         executable = SimpleNamespace(st_uid=0, st_mode=0o100755)
         entries = dict.fromkeys((*literal.parents, *target.parents), directory)
         entries.update({literal: symlink, alias: symlink, target: executable})
-        links = {literal: alias, alias: path(target.name)}
+        links = {literal: alias.as_posix(), alias: target.name}
         with patch.object(path, "lstat", autospec=True, side_effect=entries.__getitem__), \
-             patch.object(path, "readlink", autospec=True, side_effect=links.__getitem__) as readlink:
+             patch.object(diagnostic.os, "readlink", side_effect=links.__getitem__) as readlink:
             self.assertEqual(diagnostic.vetted_runner_tool(literal), target.as_posix())
-            links[alias] = path("/tmp/private-alias")
+            links[alias] = "/tmp/private-alias"
             self.assertIsNone(diagnostic.vetted_runner_tool(literal))
-            links[alias] = path(target.name)
+            links[alias] = target.name
             entries[alias] = SimpleNamespace(st_uid=1001, st_mode=0o120777)
             self.assertIsNone(diagnostic.vetted_runner_tool(literal))
             entries[alias] = symlink
             entries[alias.parent] = SimpleNamespace(st_uid=0, st_mode=0o040777)
             self.assertIsNone(diagnostic.vetted_runner_tool(literal))
             entries[alias.parent] = directory
-            links[alias] = literal
+            links[alias] = literal.as_posix()
             readlink.reset_mock()
             self.assertIsNone(diagnostic.vetted_runner_tool(literal))
             self.assertEqual(readlink.call_count, 8)
+
+    def test_r2_package_query_refuses_a_raw_link_that_requires_a_directory(self):
+        path = diagnostic.Path
+        literal = path("/usr/bin/dpkg-query")
+        target = path("/usr/bin/dpkg-query-real")
+        directory = SimpleNamespace(st_uid=0, st_mode=0o040755)
+        entries = dict.fromkeys(literal.parents, directory)
+        entries[literal] = SimpleNamespace(st_uid=0, st_mode=0o120777)
+        entries[target] = SimpleNamespace(st_uid=0, st_mode=0o100755)
+
+        def metadata(candidate):
+            if candidate not in entries:
+                raise FileNotFoundError
+            return entries[candidate]
+
+        for suffix in ("/", "/."):
+            with self.subTest(suffix=suffix), patch.object(
+                path, "lstat", autospec=True, side_effect=metadata
+            ), patch.object(diagnostic.os, "readlink", return_value=target.as_posix() + suffix), \
+                 patch.object(diagnostic.os, "uname", return_value=SimpleNamespace(
+                     release="7.0.0-1014-aws"
+                 ), create=True), patch.object(diagnostic, "capture") as query:
+                receipt = diagnostic.r2_runner_receipt(self.R2_ENV, query)
+            self.assertFalse(receipt["tools"][literal.as_posix()])
+            self.assertIsNone(receipt["systemd_package"])
+            query.assert_not_called()
+
+    def test_r2_ip_accepts_only_the_vetted_ubuntu_merged_usr_alias(self):
+        path = diagnostic.Path
+        literal, alias, target = map(path, ("/usr/sbin/ip", "/bin", "/usr/bin/ip"))
+        directory = SimpleNamespace(st_uid=0, st_mode=0o040755)
+        symlink = SimpleNamespace(st_uid=0, st_mode=0o120777)
+        entries = dict.fromkeys((*literal.parents, *target.parents), directory)
+        entries.update({literal: symlink, alias: symlink, target: SimpleNamespace(st_uid=0, st_mode=0o100755)})
+        links = {literal: "/bin/ip", alias: "usr/bin"}
+        with patch.object(path, "lstat", autospec=True, side_effect=entries.__getitem__), \
+             patch.object(diagnostic.os, "readlink", side_effect=links.__getitem__):
+            self.assertEqual(diagnostic.vetted_runner_tool(literal), target.as_posix())
+            links[alias] = "usr/bin/."
+            self.assertIsNone(diagnostic.vetted_runner_tool(literal))
+            links[alias] = "usr/bin"
+            entries[alias] = SimpleNamespace(st_uid=1001, st_mode=0o120777)
+            self.assertIsNone(diagnostic.vetted_runner_tool(literal))
 
     def test_absence_phrases_are_observations_not_guessed_success(self):
         result = diagnostic.Capture("completed", 113, b"",
