@@ -1,0 +1,248 @@
+use std::time::Instant;
+
+pub const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+pub const DEFAULT_LEASE_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+pub(crate) const MAX_UTC_MS: i64 = 253_402_300_799_999;
+
+/// Opaque generated VM, template, or snapshot identity. Never a filesystem path.
+pub type Id = [u8; 16];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestId {
+    pub(crate) key: Id,
+    pub(crate) issued_at_ms: i64,
+}
+
+impl RequestId {
+    /// The first 16 hex digits encode Unix milliseconds. The remaining 16
+    /// encode a caller-generated nonce. Retries must reuse the original key.
+    pub fn parse(value: &str) -> Result<Self, Refusal> {
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(Refusal::Invalid);
+        }
+        let mut key = [0; 16];
+        hex::decode_to_slice(value, &mut key).map_err(|_| Refusal::Invalid)?;
+        let issued_at_ms = i64::from_be_bytes(key[..8].try_into().expect("fixed timestamp width"));
+        if !(0..=MAX_UTC_MS).contains(&issued_at_ms) {
+            return Err(Refusal::Invalid);
+        }
+        Ok(Self { key, issued_at_ms })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ClockReading {
+    pub utc_ms: i64,
+    pub monotonic: Instant,
+}
+
+pub trait Clock: Send + Sync {
+    fn now(&self) -> ClockReading;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i64)]
+pub enum Action {
+    Clone = 1,
+    Script,
+    Start,
+    Stop,
+    Snapshot,
+    Restore,
+    Expire,
+    Extend,
+    SealTemplate,
+    Recover,
+}
+
+pub enum Operation<'a> {
+    Clone {
+        template: Id,
+        lease_seconds: Option<u64>,
+    },
+    Script {
+        script: &'a str,
+        timeout_seconds: u64,
+    },
+    Start,
+    Stop,
+    Snapshot {
+        snapshot: Id,
+    },
+    Restore {
+        snapshot: Id,
+    },
+}
+
+impl Operation<'_> {
+    pub(crate) fn action(&self) -> Action {
+        match self {
+            Self::Clone { .. } => Action::Clone,
+            Self::Script { .. } => Action::Script,
+            Self::Start => Action::Start,
+            Self::Stop => Action::Stop,
+            Self::Snapshot { .. } => Action::Snapshot,
+            Self::Restore { .. } => Action::Restore,
+        }
+    }
+}
+
+pub struct Request<'a> {
+    pub principal: &'a str,
+    pub request_id: RequestId,
+    pub vm: Id,
+    pub operation: Operation<'a>,
+    pub disk: DiskClaim,
+}
+
+/// Worst-case additional bytes. Include old/new coexistence and temporary
+/// artifacts in staging, and format overhead in metadata.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DiskClaim {
+    pub staging: u64,
+    pub images: u64,
+    pub metadata: u64,
+}
+
+impl DiskClaim {
+    pub(crate) fn persistent(self) -> Option<u64> {
+        self.images.checked_add(self.metadata)
+    }
+
+    pub(crate) fn total(self) -> Option<u64> {
+        self.persistent()?.checked_add(self.staging)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i64)]
+pub enum Guest {
+    UbuntuX86_64 = 1,
+    WindowsX86_64,
+}
+
+pub struct SealedTemplate {
+    pub id: Id,
+    pub guest: Guest,
+    pub recipe_digest: [u8; 32],
+    pub disk_digest: [u8; 32],
+    pub vars_digest: [u8; 32],
+    pub disk: DiskClaim,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i64)]
+pub enum Refusal {
+    Invalid = 1,
+    StaleKey,
+    KeyCollision,
+    ReplayFull,
+    PendingFull,
+    NotFound,
+    Busy,
+    Expired,
+    TemplateLimit,
+    InstanceLimit,
+    SnapshotLimit,
+    Disk,
+    StateHeadroom,
+    UnknownHost,
+    OwnerActive,
+    Cpu,
+    Ram,
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Pending,
+    Succeeded,
+    Failed,
+    Interrupted,
+}
+
+impl Status {
+    pub(crate) fn code(self) -> i64 {
+        match self {
+            Self::Pending => 0,
+            Self::Succeeded => 1,
+            Self::Failed => 2,
+            Self::Interrupted => 3,
+        }
+    }
+
+    pub(crate) fn from_code(code: i64) -> rusqlite::Result<Self> {
+        match code {
+            0 => Ok(Self::Pending),
+            1 => Ok(Self::Succeeded),
+            2 => Ok(Self::Failed),
+            3 => Ok(Self::Interrupted),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Receipt {
+    pub activity_id: i64,
+    pub status: Status,
+}
+
+#[derive(Debug)]
+pub enum Admission {
+    Admitted(PendingOperation),
+    Existing(Receipt),
+    Refused(Refusal),
+}
+
+/// Only a fresh admission yields a worker handle. A status lookup has no
+/// dispatch authority. Deadlines are process-local and never persisted.
+#[derive(Debug)]
+pub struct PendingOperation {
+    pub(crate) activity_id: i64,
+    pub(crate) deadline: Instant,
+    pub(crate) binding: std::sync::Arc<()>,
+}
+
+impl PendingOperation {
+    pub fn activity_id(&self) -> i64 {
+        self.activity_id
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Completion {
+    Succeeded,
+    Failed,
+    CleanupUnconfirmed,
+}
+
+/// Indicates the external reaper has independently proved release of the
+/// resources charged to this intent. This metadata slice performs no I/O
+/// against VM artifacts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupResult {
+    Confirmed,
+    Unconfirmed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpiryClaim {
+    pub vm: Id,
+    pub activity_id: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryClaim {
+    pub vm: Id,
+    pub activity_id: i64,
+}
