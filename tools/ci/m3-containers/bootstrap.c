@@ -792,6 +792,11 @@ static int listen_case(const struct network_case *probe)
 {
     struct sockaddr_storage address;
     int fd = endpoint(probe->address, probe->port, probe->transport, &address);
+    if (probe->transport == SOCK_STREAM) {
+        // The positive control can leave TCP TIME_WAIT state across a same-netns restart.
+        int reuse = 1;
+        CHECK(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0, "listener-bind");
+    }
     CHECK(bind(fd, (struct sockaddr *)&address, address_size(&address)) == 0, "listener-bind");
     CHECK(probe->transport == SOCK_DGRAM || listen(fd, 4) == 0, "listener-start");
     return fd;

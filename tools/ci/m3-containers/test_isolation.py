@@ -599,6 +599,21 @@ class Bootstrap(unittest.TestCase):
         self.assertIn('CHECK(memcmp(text, populated, sizeof(populated) - 1) == 0 && attempt < 50, '
                       '"kill-target-empty");\n        CHECK(usleep(10000) == 0, "kill-target-empty");', settle)
 
+    def test_only_tcp_listeners_enable_address_reuse_before_bind(self):
+        source = (Path(__file__).parent / "bootstrap.c").read_text(encoding="ascii")
+        listener = source.split("static int listen_case(")[1].split("\n}")[0]
+        self.assertRegex(listener,
+                         r"if \(probe->transport == SOCK_STREAM\) \{\s*(?://[^\n]*\n\s*)?"
+                         r"int reuse = 1;\s*"
+                         r"CHECK\(setsockopt\(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof\(reuse\)\)"
+                         r' == 0, "listener-bind"\);\s*\}\s*CHECK\(bind\(')
+        self.assertEqual(listener.count("SO_REUSEADDR"), 1)
+        unix = source.split("static int bind_socket(")[1].split("\n}")[0]
+        self.assertIn("socket(AF_UNIX,", unix)
+        self.assertNotIn("SO_REUSEADDR", unix)
+        endpoint = source.split("static int endpoint(")[1].split("\n}")[0]
+        self.assertNotIn("SO_REUSEADDR", endpoint)
+
     def test_journal_vocabulary_matches_emitted_bootstrap_categories(self):
         source = (Path(__file__).parent / "bootstrap.c").read_text(encoding="ascii")
         categories = set(re.findall(
