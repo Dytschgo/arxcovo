@@ -151,10 +151,7 @@ impl VmStore {
         } else {
             state_options().write(true).create_new(true).open(&path)?
         };
-        // Unix flock pins the inode against a second VM opener even if the
-        // pathname moves. SQLite uses separate POSIX record locks.
-        #[cfg(unix)]
-        database.try_lock()?;
+        // The guard stays unlocked because SQLite owns the database locks.
         verify_state_identity(&database, &path)?;
         let expected = state_identity(&database)?;
         let mut db = connect(&path)?;
