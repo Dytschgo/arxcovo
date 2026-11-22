@@ -2,7 +2,13 @@
 
 ## Current state (2026-11-22)
 
-- **Main and last merges.** `main` is **green** at `21c86102` (PR #252, M3 step
+- **Main and last merges.** `main` is **green** at `40b9964b` (PR #257); push CI
+  `45060763474` passed. Later merges: PR #253 `fe4aeb21` (docs; push CI `45052134556`
+  green), PR #254 `bbb8c543` (M4 PR 1; `45054473530` red on attempt 1 from a macOS
+  CI-budget fixture timeout, green on attempt 2), PR #256 `5e30d1c9` (CI-budget fixture;
+  `45056799498` red on attempt 1 from an intermittent live C16 ledger check, green on
+  attempt 2), PR #255 `ef03fafb` (M4 PR 2; `45058175725` green), PR #257 `40b9964b` (C16
+  harness). Earlier: `main` was green at `21c86102` (PR #252, M3 step
   16a Part 3, live C16 three-container acceptance). Push CI `45049365881` passed all
   9 jobs (`rust (ubuntu-latest)` `314 s`; live C16 `16.949 s` on an Azure runner,
   `ubuntu24 / 20261116.376.1 / 7.0.0-1017-azure`, `first: null`, `cleanup:
@@ -241,6 +247,70 @@
   `D:/ArxcovoData/wt/m4pr1` (not a counted failure). Owner setup for M4 (WHPX, the dedicated standard account, disk cap and CPU/RAM reserve
   per `docs/dev-host-setup.md`) is pending. M4 native paths remain **unverified on real
   hardware**.
+- **PR #254 merged** as `bbb8c543` (M4 PR 1: bounded `arx-guest` protocol v1 and stdio
+  session). Serialized frame payloads are capped at 32 KiB and scripts at
+  4 KiB of decoded UTF-8, with NUL rejected. The strict serde codec has golden byte
+  fixtures. The guest scaffold handles requests serially. Slice 3 owns enforcement of one
+  outstanding host request. `HelloAck` requires the closed `script_execution` capability (the scaffold advertises `unavailable`); results are
+  `Exited {u32}`, `Unavailable`, `TimedOut`, `LaunchFailed` or `Terminated`, with no output
+  returned. Plan-review S1 amendments were applied to the builder mid-build. Sol builder
+  0/3 (report SHA256 `77654cb1…ad4b`); review HOLD (SHA256 `f8937151…0804`: stderr-closed panic,
+  reader `UnexpectedEof` treated as clean EOF, fixtures not byte-exact), re-review PASS
+  (SHA256 `3e32fd23…cbed`); after a docs-only refresh, re-verification PASS (SHA256 `72e1142f…4420`),
+  agent-review status `59601489191`.
+- **PR #255 merged** as `ef03fafb` (M4 PR 2: durable VM admission and expiry core; no native
+  operations). The VM profile has its own SQLite database, so the shared `Activity`
+  opener is unchanged. A bounded 24 h replay ledger is status-only and never replays a
+  script; leases, caps, an eight-slot expiry cleanup reserve, bounded tombstones and
+  headroom for terminal records are included. The Sol 6.2 high builder was at 2/3
+  through round 3. The round-three hosted macOS failure exhausted its tally at 3/3. Reviews HOLD (SHA256 `19565afa…9e41`: extend bypassed the ledger, pruning,
+  hard links, the pending budget, tombstones, a one-outcome race test), HOLD (SHA256
+  `be0fb2ac…3daa`: the guard compared a fresh path rather than SQLite's opened handle), and PASS
+  on source (SHA256 `069d1e53…e255`). Hosted macOS failed with `database is locked` in round 3
+  (run 45055670526, log SHA256 `91991b95…2c90`). The coordinator later reported missing the
+  same error in a different VM test in round 2 (run 45054700048). Under the owner's 2026-11-22 instruction to use Opus when Sol is stuck, an Opus
+  diagnosis (SHA256 `37df8f83…2482`) traced it to a Unix `flock` on the SQLite file, which shares
+  macOS's lock list with SQLite's own `fcntl` locks. The Opus 5.5 high builder removed it on its single
+  authorized attempt, with no failed fixes (report SHA256 `b8634eb8…00fb`). macOS then
+  passed 969 tests including the 22 VM tests (log SHA256 `e50f4fb7…9c7e`). Accepted residual:
+  on Unix, a same-account actor could rename the database into a second, unopened
+  directory (ADR 0035 non-goal). Final Sol review PASS (SHA256 `1f349e08…9d5b`), status
+  `59602745672`.
+- **PR #256 merged** as `5e30d1c9` (test only): the large-buffer CI-budget fixture timed out in the outer
+  spawn on macOS (log SHA256 `794b0134…d7c1`). A Windows probe confirmed the inner Node
+  process waited for stdin EOF. The macOS log did not identify the inner cause. The
+  fixture now reads a temporary file with a 10 s inner bound and keeps the real
+  1 MiB/8 MiB semantics. The builder finished at 0/3 (report SHA256 `eaf64156…05ee`). Review PASS (SHA256 `2db20094…7c7c`),
+  status `59602316177`.
+- **PR #257 merged** as `40b9964b` (C16 harness only). Live C16 failed once on `main` with
+  `first: {phase: build, category: ledger-checkpoint}` after the build and both activity
+  rows were verified (log SHA256 `20c6d87e…1a8f`). The diagnosis (SHA256 `973d6a9f…6b75`) ranks a
+  transient `Peer` status in the R7 reply as the leading explanation. The receipt omitted
+  the failed node and reply fields, so the exact predicate is unknown. The harness had
+  already read back both committed build activity rows before the R7 check. The harness now validates the full checkpoint first, retries only an otherwise
+  valid `Peer`-only reply up to three times within the deadline, and records the failed
+  predicate with sanitized per-node evidence. The builder finished at 0/3 (report SHA256 `b6bfd6a7…3b25`). Review HOLD (SHA256
+  `1bcdcca6…13b3`: a retry could erase a duplicate installation ID or an epoch mismatch), re-review
+  PASS (SHA256 `f450a049…309a`), status `59603744564`; the PR's live C16 passed with `first: null`.
+- **M4 plan adopted with required changes** (`D:/Temp/arx-m4-plan-review/review.md`, SHA256
+  `f56b94b8…b74a`). The coordinator proceeded with M4 while M2 owner acceptance
+  remained open, treating standing pre-approval as covering that decision. Slice 2 uses a VM-specific database and a 24 h status-only replay ledger; the
+  slice 3 design is adopted (`D:/Temp/arx-m4-slice3/design.md`, SHA256 `44931d79…79de`): a Windows x64 build
+  from pinned QEMU 11.1.3 source, with the exact binary receipt pending, QMP over private stdio, the serial pipe checked
+  for DACL and server PID before I/O, a suspended child in a kill-on-close Job, a dedicated
+  NTFS volume, a WTS owner-session signal, and native admission closed by default.
+- **M4 PR 3 in progress (confined Windows QEMU runtime).** The Sol 6.2 high builder
+  exhausted its 3/3 tally on Windows compilation (report SHA256 `252bfbd5…2aa6`). An Opus 5.5
+  high diagnosis (SHA256 `99b578d0…3d0c`) found four E0061 errors in one integration-test
+  target, three missing hosted-Windows fixture groups (junctions, effective DACL and
+  separate-process supervisor loss), and a volume-root identity gap to fix or record before
+  native activation. The Opus 5.5 high builder has its own three-failure budget, with
+  independent Sol 6.2 high review to follow. Native paths remain **unverified on real
+  hardware**.
+- **Process notes.** The coordinator now reads every failed job of each PR CI run before
+  relying on a summary. Long shell here-strings caused unanswerable delegate approval
+  stalls, so briefs now require file-edit tools. An interim Gemini coordinator's C:
+  worktree was replaced with a D: worktree.
 - **Milestones & verification boundary.** M1 accepted; M2 open for owner-dependent
   acceptance; M3 complete for the conditional hosted Linux profile; M4 in progress.
   Preserved holds: Engine Sol `3/3 exhausted`, historical Opus `0/2`, D6 freeze.
