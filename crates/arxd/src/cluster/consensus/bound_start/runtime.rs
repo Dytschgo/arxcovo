@@ -479,23 +479,7 @@ impl Running {
             }
             let raft = node.raft.as_ref()?;
             let metrics = raft.metrics();
-            let qualified_epoch = || {
-                let m = metrics.borrow_watched();
-                let epoch = m.vote.leader_id;
-                let role = match m.state {
-                    openraft::ServerState::Leader if epoch.node_id == node.id => 1,
-                    openraft::ServerState::Follower if epoch.node_id != node.id => 2,
-                    _ => return None,
-                };
-                if m.running_state.is_err()
-                    || !m.vote.committed
-                    || m.current_leader != Some(epoch.node_id)
-                    || m.committed_membership_config != m.membership_config
-                {
-                    return None;
-                }
-                Some((epoch, role, (*m.committed_membership_config.log_id())?))
-            };
+            let qualified_epoch = || qualified_ledger_epoch(&metrics.borrow_watched(), node.id);
             let (epoch, role, membership) = qualified_epoch()?;
             let log = node.log_weak.upgrade()?;
             let stored = observe_local_ledger(
@@ -527,7 +511,12 @@ impl Running {
 
     fn ledger_origin(&self, state: &State) -> Option<LedgerOrigin> {
         let installation = Self::retained_installation_id(state)?;
-        let custody = self.ledger_custody(state)?;
+        let custody = qualified_ledger_custody(state, self.strict_written, || {
+            state
+                .learner
+                .as_ref()
+                .is_some_and(learner::Operation::voter_custody)
+        })?;
         let peer = match state.status {
             Status::FounderReady => state.founder.as_ref()?.delegated_build()?,
             Status::LearnerReady => state.learner.as_ref()?.delegated_build()?,
@@ -541,25 +530,6 @@ impl Running {
             cluster,
             member,
         })
-    }
-
-    fn ledger_custody(&self, state: &State) -> Option<bool> {
-        if state.close_requested || !state.process_owned {
-            return None;
-        }
-        match state.status {
-            Status::FounderReady if state.learner.is_none() => Some(false),
-            Status::LearnerReady
-                if self.strict_written
-                    && state
-                        .learner
-                        .as_ref()
-                        .is_some_and(learner::Operation::voter_custody) =>
-            {
-                Some(true)
-            }
-            _ => None,
-        }
     }
 
     pub(crate) async fn observe(&mut self) -> Result<Readiness, Error> {
@@ -705,6 +675,42 @@ impl Running {
             .learner
             .as_ref()
             .is_some_and(learner::Operation::voter_custody)
+    }
+}
+
+fn qualified_ledger_epoch(
+    m: &openraft::RaftMetrics<Arx>,
+    member: u64,
+) -> Option<(LeaderId, u8, Id)> {
+    let epoch = m.vote.leader_id;
+    let role = match m.state {
+        openraft::ServerState::Leader if epoch.node_id == member => 1,
+        openraft::ServerState::Follower if epoch.node_id != member => 2,
+        _ => return None,
+    };
+    if m.id != member
+        || m.running_state.is_err()
+        || !m.vote.committed
+        || m.current_leader != Some(epoch.node_id)
+        || m.committed_membership_config != m.membership_config
+    {
+        return None;
+    }
+    Some((epoch, role, (*m.committed_membership_config.log_id())?))
+}
+
+fn qualified_ledger_custody(
+    state: &State,
+    strict_written: bool,
+    voter_custody: impl FnOnce() -> bool,
+) -> Option<bool> {
+    if state.close_requested || !state.process_owned {
+        return None;
+    }
+    match state.status {
+        Status::FounderReady if state.learner.is_none() => Some(false),
+        Status::LearnerReady if strict_written && voter_custody() => Some(true),
+        _ => None,
     }
 }
 

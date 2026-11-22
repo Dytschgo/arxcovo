@@ -12,12 +12,12 @@ use std::{
 };
 use tokio::{net::unix::pipe::Receiver, time::timeout};
 
-// Fixed C16 fixture route and original A enrollment endpoint.
+// Match the fixed C16 fixture route and original A enrollment port in R2 pins.
 const ROUTE: LocalRoute = LocalRoute {
-    network: IpAddr::V4(Ipv4Addr::new(10, 77, 16, 0)),
+    network: IpAddr::V4(Ipv4Addr::new(198, 18, 72, 0)),
     prefix: 24,
 };
-const ISSUER: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 77, 16, 11), 7444));
+const ISSUER: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 18, 72, 11), 22172));
 const BUDGET: Duration = Duration::from_secs(5);
 
 fn private_pipe(fd: OwnedFd) -> io::Result<Receiver> {
@@ -55,7 +55,7 @@ async fn c16_distinct_reconnect_anchor_only() {
         let Some(transfer) = read_transfer(pipe).await else {
             return "input-refused";
         };
-        match preproof::anchor(
+        match preproof::probe_anchor(
             ISSUER,
             &transfer.code,
             &transfer.root,
@@ -64,8 +64,9 @@ async fn c16_distinct_reconnect_anchor_only() {
         )
         .await
         {
-            Ok(_) => "anchor-received",
-            Err(_) => "anchor-unconfirmed",
+            preproof::AnchorProbe::Received => "anchor-received",
+            preproof::AnchorProbe::TerminalRefusal => "anchor-refused",
+            preproof::AnchorProbe::Unconfirmed => "anchor-unconfirmed",
         }
     })
     .await
@@ -90,8 +91,8 @@ async fn probe_reads_bounded_anonymous_input_and_only_accepts_the_original_endpo
     .unwrap();
     for (endpoint, accept) in [
         (ISSUER, true),
-        ("10.77.16.11:7445".parse().unwrap(), false),
-        ("10.77.17.11:7444".parse().unwrap(), false),
+        ("198.18.72.11:22173".parse().unwrap(), false),
+        ("198.18.73.11:22172".parse().unwrap(), false),
     ] {
         let fixture = transfer::encode(endpoint, root, &code).unwrap();
         let (mut output, input) = pipe::pipe().unwrap();

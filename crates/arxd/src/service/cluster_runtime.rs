@@ -698,10 +698,15 @@ mod private_work_tests {
             stop: &stop,
             deadline: Instant::now() + cluster_owner::PRIVATE_WORK_WAIT,
         };
+        let reply = budget.observe(|| DispatchReply::Ledger([1; cluster_owner::LEDGER_REPLY_LEN]));
+        assert!(
+            matches!(reply, DispatchReply::Ledger(bytes) if bytes == [1; cluster_owner::LEDGER_REPLY_LEN])
+        );
         let reply = budget.observe(|| {
             stop.cancel();
             DispatchReply::Ledger([1; cluster_owner::LEDGER_REPLY_LEN])
         });
+        assert!(stop.is_cancelled());
         assert!(matches!(reply, DispatchReply::Control(Reply::Refused)));
         let reply = budget.observe(|| panic!("closed observation was invoked"));
         assert!(matches!(reply, DispatchReply::Control(Reply::Refused)));

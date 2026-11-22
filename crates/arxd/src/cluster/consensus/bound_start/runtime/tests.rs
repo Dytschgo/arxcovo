@@ -269,6 +269,52 @@ mod ledger {
     }
 
     #[test]
+    fn ledger_epoch_and_custody_require_named_member_and_retained_authority() {
+        let membership = Some(id(position(1)));
+        for (node, state, role) in [
+            (1, openraft::ServerState::Leader, 1),
+            (2, openraft::ServerState::Follower, 2),
+        ] {
+            let mut metrics = openraft::RaftMetrics::<Arx>::new_initial(node);
+            metrics.vote = openraft::Vote::new(1, 1);
+            metrics.vote.committed = true;
+            metrics.current_leader = Some(1);
+            metrics.state = state;
+            metrics.membership_config = Arc::new(openraft::StoredMembership::new(
+                membership,
+                metrics.membership_config.membership().clone(),
+            ));
+            metrics.committed_membership_config = metrics.membership_config.clone();
+            assert_eq!(
+                qualified_ledger_epoch(&metrics, node),
+                Some((metrics.vote.leader_id, role, id(position(1))))
+            );
+            assert!(qualified_ledger_epoch(&metrics, 3).is_none());
+            let mut unconfirmed = metrics.clone();
+            unconfirmed.vote.committed = false;
+            assert!(qualified_ledger_epoch(&unconfirmed, node).is_none());
+            metrics.committed_membership_config = Arc::default();
+            assert!(qualified_ledger_epoch(&metrics, node).is_none());
+        }
+
+        let job = Job::anchor();
+        let mut state = job.state();
+        state.status = Status::FounderReady;
+        assert_eq!(qualified_ledger_custody(&state, false, || true), None);
+        state.process_owned = true;
+        assert_eq!(
+            qualified_ledger_custody(&state, false, || panic!("founder queried voter custody")),
+            Some(false)
+        );
+        state.status = Status::LearnerReady;
+        assert_eq!(qualified_ledger_custody(&state, false, || true), None);
+        assert_eq!(qualified_ledger_custody(&state, true, || false), None);
+        assert_eq!(qualified_ledger_custody(&state, true, || true), Some(true));
+        state.close_requested = true;
+        assert_eq!(qualified_ledger_custody(&state, true, || true), None);
+    }
+
+    #[test]
     fn checkpoint_uses_qualified_founder_and_promoted_voter_identity() {
         let stores = Fixture::new(vec![[1, 2, 3].into()]);
         let first = stores.pending(2, 1);
