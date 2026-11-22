@@ -92,6 +92,7 @@ impl PathPin {
             let (identity, allocated) = file_identity(&file, expected_directory)?;
             if end == 3 {
                 verify_ntfs(&file)?;
+                verify_volume_root(root, identity)?;
                 volume = Some(identity.volume);
             }
             if Some(identity.volume) != volume {
@@ -152,6 +153,29 @@ fn verify_ntfs(root: &File) -> io::Result<()> {
     })?;
     if &fs[..5] != wide("NTFS").as_slice() {
         return Err(io::Error::other("expected NTFS"));
+    }
+    Ok(())
+}
+
+/// A SUBST or other drive-letter alias for a folder is not a volume mount
+/// point. The pinned drive-letter root must be the volume's own root object.
+fn verify_volume_root(root: &str, pinned: FileIdentity) -> io::Result<()> {
+    let mut name = [0u16; 64];
+    // The fixed buffer exceeds the 49-unit `\\?\Volume{GUID}\` name.
+    succeeded(unsafe {
+        GetVolumeNameForVolumeMountPointW(wide(root).as_ptr(), name.as_mut_ptr(), name.len() as u32)
+    })?;
+    let end = name
+        .iter()
+        .position(|&unit| unit == 0)
+        .ok_or_else(|| io::Error::other("unterminated volume name"))?;
+    let volume = String::from_utf16(&name[..end]).map_err(io::Error::other)?;
+    if !volume.starts_with(r"\\?\Volume{") || !volume.ends_with(r"}\") {
+        return Err(io::Error::other("unexpected volume name"));
+    }
+    let actual = file_identity(&open_path(&volume, false, false)?, true)?.0;
+    if actual != pinned {
+        return Err(io::Error::other("drive letter is not a volume root"));
     }
     Ok(())
 }
@@ -1528,14 +1552,34 @@ fn allocated_under(root: &LocalPath, expected: u64, limit: usize) -> Result<u64,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::{
+        io::{Read, Write},
+        os::windows::fs::MetadataExt,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    };
+
     const FIXTURE: &str = "vm::windows::tests::fixture_child";
+    const SLEEPER: &str = "vm::windows::tests::fixture_sleeper";
+    const SUPERVISOR: &str = "vm::windows::tests::fixture_supervisor";
+    const NONCE: &str = "ARX_VM_SUPERVISOR_NONCE";
+    const UNSUPPORTED: &str =
+        "VM Job fixture unsupported: outer runner Job rejected creation-time assignment";
+
+    /// A disposable NTFS directory under its final long spelling, so neither
+    /// an 8.3 TEMP alias nor a junctioned TEMP ancestor decides a result.
+    fn fixture_root() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let text = canonical.to_str().unwrap();
+        let text = text.strip_prefix(r"\\?\").unwrap_or(text).to_owned();
+        (dir, text)
+    }
 
     fn fixture_stdio() -> (Stdio, Stdio) {
-        use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-
         let mut descriptor = null_mut();
         // Test-only descriptor gives the current creator/owner and SYSTEM access.
         succeeded(unsafe {
@@ -1570,10 +1614,14 @@ mod tests {
     }
 
     fn fixture_launch(probe: usize) -> Option<(Child, Stdio)> {
+        fixture_spawn(FIXTURE, probe)
+    }
+
+    fn fixture_spawn(fixture: &str, probe: usize) -> Option<(Child, Stdio)> {
         let (child_io, parent_io) = fixture_stdio();
         let job = Job::new(256 * 1024 * 1024, None).unwrap();
         let image = std::env::current_exe().unwrap();
-        let args = ["--exact", FIXTURE, "--ignored", "--nocapture"].map(str::to_owned);
+        let args = ["--exact", fixture, "--ignored", "--nocapture"].map(str::to_owned);
         let result = spawn(
             &image,
             &args,
@@ -1591,9 +1639,7 @@ mod tests {
                 succeeded(unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut outer) })
                     .unwrap();
                 assert_ne!(outer, 0, "access denied without a runner Job");
-                eprintln!(
-                    "VM Job fixture unsupported: outer runner Job rejected creation-time assignment"
-                );
+                eprintln!("{UNSUPPORTED}");
                 None
             }
             Err(error) => panic!("fixture launch failed: {error}"),
@@ -1687,18 +1733,386 @@ mod tests {
 
     #[test]
     fn custody_rejects_hard_links_and_retains_the_path_binding() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("owned.img");
-        let policy = LocalPath::parse(target.to_str().unwrap()).unwrap();
+        let (_dir, root) = fixture_root();
+        let target = format!(r"{root}\owned.img");
+        let policy = LocalPath::parse(&target).unwrap();
         let pin = PathPin::create(&policy).unwrap();
         assert!(PathPin::create(&policy).is_err());
-        assert!(std::fs::rename(&target, dir.path().join("replacement.img")).is_err());
+        assert!(std::fs::rename(&target, format!(r"{root}\replacement.img")).is_err());
         drop(pin);
-        std::fs::hard_link(&target, dir.path().join("alias.img")).unwrap();
+        std::fs::hard_link(&target, format!(r"{root}\alias.img")).unwrap();
         assert!(matches!(
             PathPin::open(&policy, false, true),
             Err(NativeRefusal::PathCustodyUnverified)
         ));
+    }
+
+    #[test]
+    fn custody_pins_the_drive_letter_to_its_volume_root() {
+        let (_dir, root) = fixture_root();
+        let drive = &root[..3];
+        let pinned = file_identity(&open_path(drive, false, false).unwrap(), true)
+            .unwrap()
+            .0;
+        verify_volume_root(drive, pinned).unwrap();
+        // A folder on the same volume is not that volume's root object.
+        let folder = file_identity(&open_path(&root, false, false).unwrap(), true)
+            .unwrap()
+            .0;
+        assert_eq!(folder.volume, pinned.volume);
+        assert!(verify_volume_root(drive, folder).is_err());
+        // A folder spelling is not a volume mount point at all.
+        assert!(verify_volume_root(&format!(r"{root}\"), pinned).is_err());
+    }
+
+    /// Unprivileged directory junction made with FSCTL_SET_REPARSE_POINT.
+    fn fixture_junction(path: &str, target: &str) {
+        std::fs::create_dir(path).unwrap();
+        // A fresh directory handle that addresses the reparse point itself.
+        let handle = unsafe {
+            owned(CreateFileW(
+                wide(path).as_ptr(),
+                GENERIC_WRITE,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            ))
+        }
+        .unwrap();
+        let substitute = wide(format!(r"\??\{target}"));
+        let print = wide(target);
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xA000_0003_u32.to_le_bytes()); // IO_REPARSE_TAG_MOUNT_POINT
+        let names = u16::try_from((substitute.len() + print.len()) * 2).unwrap();
+        data.extend_from_slice(&(8 + names).to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        for value in [
+            0,
+            (substitute.len() - 1) * 2,
+            substitute.len() * 2,
+            (print.len() - 1) * 2,
+        ] {
+            data.extend_from_slice(&u16::try_from(value).unwrap().to_le_bytes());
+        }
+        for unit in substitute.into_iter().chain(print) {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut returned = 0;
+        // The input buffer is a complete mount-point reparse record.
+        succeeded(unsafe {
+            windows_sys::Win32::System::IO::DeviceIoControl(
+                handle.as_raw_handle(),
+                0x0009_00A4, // FSCTL_SET_REPARSE_POINT
+                data.as_ptr().cast(),
+                u32::try_from(data.len()).unwrap(),
+                null_mut(),
+                0,
+                &mut returned,
+                null_mut(),
+            )
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn custody_refuses_junction_components_and_leaves() {
+        let (_dir, root) = fixture_root();
+        let real = format!(r"{root}\real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(format!(r"{real}\leaf.img"), b"x").unwrap();
+        let middle = format!(r"{root}\middle");
+        let leaf = format!(r"{root}\leaf");
+        fixture_junction(&middle, &real);
+        fixture_junction(&leaf, &real);
+        let path = |raw: &str| LocalPath::parse(raw).unwrap();
+        let refused = |result: Result<PathPin, NativeRefusal>| {
+            matches!(result, Err(NativeRefusal::PathCustodyUnverified))
+        };
+        // Positive controls: the same objects pin under their real spelling.
+        assert!(PathPin::open(&path(&real), true, false).is_ok());
+        assert!(PathPin::open(&path(&format!(r"{real}\leaf.img")), false, true).is_ok());
+        assert!(PathPin::create(&path(&format!(r"{real}\control.img"))).is_ok());
+        // A junction as an intermediate component.
+        let through = path(&format!(r"{middle}\leaf.img"));
+        assert!(refused(PathPin::open(&through, false, true)));
+        assert!(refused(PathPin::open(&through, false, false)));
+        assert!(refused(PathPin::create(&path(&format!(
+            r"{middle}\new.img"
+        )))));
+        assert!(
+            !Path::new(&format!(r"{real}\new.img")).exists(),
+            "creation followed the junction"
+        );
+        // A junction as the leaf, as a directory, a file, or a creation target.
+        assert!(refused(PathPin::open(&path(&leaf), true, false)));
+        assert!(refused(PathPin::open(&path(&leaf), false, true)));
+        assert!(refused(PathPin::create(&path(&leaf))));
+        for junction in [&middle, &leaf] {
+            let kind = std::fs::symlink_metadata(junction).unwrap();
+            assert!(
+                kind.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+                "junction fixture was replaced"
+            );
+            std::fs::remove_dir(junction).unwrap();
+        }
+        assert!(Path::new(&format!(r"{real}\leaf.img")).exists());
+    }
+
+    struct Descriptor(PSECURITY_DESCRIPTOR);
+
+    impl Descriptor {
+        fn parse(sddl: &str) -> Self {
+            let mut raw = null_mut();
+            // The SDDL string is NUL-terminated and the result uses LocalFree.
+            succeeded(unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide(sddl).as_ptr(),
+                    1,
+                    &mut raw,
+                    null_mut(),
+                )
+            })
+            .unwrap();
+            Self(raw)
+        }
+
+        fn dacl(&self) -> *const ACL {
+            let (mut present, mut defaulted, mut dacl) = (0, 0, null_mut());
+            // The ACL view remains backed by this descriptor allocation.
+            succeeded(unsafe {
+                GetSecurityDescriptorDacl(self.0, &mut present, &mut dacl, &mut defaulted)
+            })
+            .unwrap();
+            dacl
+        }
+    }
+
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            // Allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    /// The current TokenUser allocation and its SDDL string form.
+    fn current_user() -> (Vec<usize>, String) {
+        // The pseudo-handle needs no close; the token handle is owned.
+        let token = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
+        let data = token_data(&token, TokenUser).unwrap();
+        let mut text = null_mut();
+        // The SID stays inside `data`; the string is LocalFree'd after copying.
+        let string = unsafe {
+            let sid = (*data.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+            succeeded(ConvertSidToStringSidW(sid, &mut text)).unwrap();
+            let len = (0..).take_while(|&at| *text.add(at) != 0).count();
+            let string = String::from_utf16(std::slice::from_raw_parts(text, len)).unwrap();
+            LocalFree(text.cast());
+            string
+        };
+        (data, string)
+    }
+
+    fn create_with(path: &str, sddl: &str) -> File {
+        let descriptor = Descriptor::parse(sddl);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        // The descriptor outlives this synchronous exclusive creation.
+        let handle = unsafe {
+            owned(CreateFileW(
+                wide(path).as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                0,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            ))
+        }
+        .unwrap();
+        File::from(handle)
+    }
+
+    #[test]
+    fn vm_acl_requires_the_exact_owner_and_ordered_explicit_dacl() {
+        let (_dir, root) = fixture_root();
+        let (user_data, user) = current_user();
+        // `user_data` backs this SID for the rest of the test.
+        let me = unsafe { (*user_data.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let network = LocalSid::parse("S-1-5-2").unwrap();
+        let system = LocalSid::parse("S-1-5-18").unwrap();
+        let entry = |deny, sid, mask| vm_acl::Entry { deny, sid, mask };
+        let expected = [
+            entry(true, network.0, FILE_ALL_ACCESS),
+            entry(false, me, FILE_ALL_ACCESS),
+            entry(false, system.0, FILE_GENERIC_READ),
+        ];
+        let exact_sddl = format!("O:{user}D:P(D;;FA;;;NU)(A;;FA;;;{user})(A;;0x120089;;;SY)");
+        let file = create_with(&format!(r"{root}\exact.bin"), &exact_sddl);
+        // Every SID pointer is backed by a value that outlives the check.
+        let check = |file: &File, owner: PSID, entries: &[vm_acl::Entry]| unsafe {
+            vm_acl::exact(file, owner, entries)
+        };
+        assert!(check(&file, me, &expected), "positive exact match");
+        assert!(!check(&file, system.0, &expected), "wrong owner");
+        let reordered = [
+            entry(false, me, FILE_ALL_ACCESS),
+            entry(true, network.0, FILE_ALL_ACCESS),
+            entry(false, system.0, FILE_GENERIC_READ),
+        ];
+        assert!(!check(&file, me, &reordered), "reordered entries");
+        let wider = [
+            entry(true, network.0, FILE_ALL_ACCESS),
+            entry(false, me, FILE_ALL_ACCESS),
+            entry(false, system.0, FILE_ALL_ACCESS),
+        ];
+        assert!(!check(&file, me, &wider), "wrong mask");
+        let allowed = [
+            entry(false, network.0, FILE_ALL_ACCESS),
+            entry(false, me, FILE_ALL_ACCESS),
+            entry(false, system.0, FILE_GENERIC_READ),
+        ];
+        assert!(!check(&file, me, &allowed), "deny recorded as allow");
+        assert!(!check(&file, me, &expected[..2]), "unexpected extra ACE");
+        let extra = create_with(
+            &format!(r"{root}\extra.bin"),
+            &format!("{exact_sddl}(A;;0x120089;;;WD)"),
+        );
+        assert!(!check(&extra, me, &expected), "extra Everyone ACE");
+        let open = create_with(
+            &format!(r"{root}\null.bin"),
+            &format!("O:{user}D:NO_ACCESS_CONTROL"),
+        );
+        assert!(!check(&open, me, &expected), "null DACL");
+        assert!(!check(&open, me, &[]), "null DACL with no entries");
+        // Inherited and inheritable flags are never an exact explicit match.
+        let only_system = [entry(false, system.0, FILE_ALL_ACCESS)];
+        for (sddl, accepted) in [
+            ("D:(A;;FA;;;SY)", true),
+            ("D:(A;ID;FA;;;SY)", false),
+            ("D:(A;OI;FA;;;SY)", false),
+            ("D:(A;CIIO;FA;;;SY)", false),
+            ("D:(D;;FA;;;SY)", false),
+        ] {
+            let descriptor = Descriptor::parse(sddl);
+            // The descriptor backs the ACL for this call.
+            let matched = unsafe { vm_acl::matches(descriptor.dacl(), &only_system) };
+            assert_eq!(matched, accepted, "{sddl}");
+        }
+        // A missing DACL never matches.
+        assert!(!unsafe { vm_acl::matches(null(), &[]) });
+    }
+
+    #[test]
+    #[ignore = "grandchild-only fixture for the supervisor-loss test"]
+    fn fixture_sleeper() {
+        if std::env::var_os("ARX_VM_JOB_FIXTURE").is_none() {
+            return;
+        }
+        std::io::stdout().write_all(b"ARX_JOB_READY\n").unwrap();
+        std::io::stdout().flush().unwrap();
+        // Outlives every bounded observer wait unless its Job reaps it.
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "disposable parent fixture for the supervisor-loss test"]
+    fn fixture_supervisor() {
+        let Ok(nonce) = std::env::var(NONCE) else {
+            return;
+        };
+        assert!(nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let mut out = std::io::stdout();
+        let Some((mut child, stdio)) = fixture_spawn(SLEEPER, 0) else {
+            writeln!(out, "ARX_SUPERVISOR_UNSUPPORTED {nonce}").unwrap();
+            out.flush().unwrap();
+            return;
+        };
+        child.resume().unwrap();
+        let mut pipe = File::from(stdio.output);
+        let mut seen = Vec::new();
+        let mut bytes = [0; 512];
+        while !seen.windows(13).any(|window| window == b"ARX_JOB_READY") {
+            let count = pipe.read(&mut bytes).unwrap();
+            assert!(count > 0 && seen.len() < 4096, "sleeper readiness absent");
+            seen.extend_from_slice(&bytes[..count]);
+        }
+        let pid = child.verify_live().unwrap();
+        writeln!(out, "ARX_SUPERVISOR {pid} {nonce}").unwrap();
+        out.flush().unwrap();
+        // The observer terminates this process. Only this process holds the Job.
+        std::thread::sleep(Duration::from_secs(30));
+        child.job.terminate().unwrap();
+    }
+
+    struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn supervisor_loss_reaps_the_job_child_through_kill_on_close() {
+        use std::{io::BufRead, process::Stdio as Pipe, sync::mpsc};
+
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let nonce = hex::encode(nonce);
+        // A plain disposable parent: this observer creates no Job for it.
+        let mut parent = KillOnDrop(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", SUPERVISOR, "--ignored", "--nocapture"])
+                .env(NONCE, &nonce)
+                .stdin(Pipe::null())
+                .stdout(Pipe::piped())
+                .stderr(Pipe::null())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = parent.0.stdout.take().unwrap();
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().take(64) {
+                let Ok(line) = line else { break };
+                if let Some(at) = line.find("ARX_SUPERVISOR") {
+                    let _ = send.send(line[at..].to_owned());
+                    break;
+                }
+            }
+        });
+        let report = receive
+            .recv_timeout(Duration::from_secs(10))
+            .expect("supervisor fixture report");
+        let fields: Vec<&str> = report.split(' ').collect();
+        let pid: u32 = match fields.as_slice() {
+            ["ARX_SUPERVISOR_UNSUPPORTED", seen] if *seen == nonce => {
+                eprintln!("{UNSUPPORTED}");
+                return;
+            }
+            ["ARX_SUPERVISOR", pid, seen] if *seen == nonce => pid.parse().unwrap(),
+            _ => panic!("unexpected supervisor report"),
+        };
+        // Only a wait right: no Job, process-control or thread authority.
+        let grandchild = unsafe { owned(OpenProcess(SYNCHRONIZE, 0, pid)) }.unwrap();
+        // The live parent holds the grandchild's handle, so the PID was not reused.
+        assert!(
+            parent.0.try_wait().unwrap().is_none(),
+            "parent exited early"
+        );
+        assert!(!wait(&grandchild, 0).unwrap(), "grandchild exited early");
+        parent.0.kill().unwrap();
+        assert!(
+            wait(&grandchild, 2000).unwrap(),
+            "kill-on-close Job did not reap the grandchild after supervisor loss"
+        );
+        parent.0.wait().unwrap();
     }
 
     #[tokio::test]
