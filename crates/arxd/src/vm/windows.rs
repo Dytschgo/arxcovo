@@ -128,6 +128,9 @@ fn open_path(path: &str, mutable: bool, create: bool) -> io::Result<File> {
         })
         .share_mode(FILE_SHARE_READ | if mutable { FILE_SHARE_WRITE } else { 0 })
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        // The explicit access mode above takes precedence; std requires the
+        // write flag before it accepts exclusive creation.
+        .write(create)
         .create_new(create);
     options.open(path)
 }
