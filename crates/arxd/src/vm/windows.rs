@@ -1405,60 +1405,180 @@ impl Drop for WorkerSet {
     }
 }
 
-/// Freshness gate for host dispatch of the startup `cont`. While it is armed,
-/// the input worker starts a pipe write only before the sample deadline and
-/// requires the write to complete before it. A late or ambiguous write trips
-/// the gate permanently: the worker stops and closes the child's stdin, and the
-/// boot refuses even if QEMU acknowledged the command. This bounds host
-/// dispatch time only; when the guest actually starts executing is QEMU's.
-#[derive(Default)]
-struct DispatchGate {
-    state: std::sync::Mutex<GateState>,
-    #[cfg(test)]
-    stall: std::sync::Mutex<(Duration, Duration)>,
+/// Evidence for host dispatch of the startup `cont`. Once armed, only the
+/// stdin worker changes it, and it decides each transition at the pipe write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dispatch {
+    /// No startup window; writes are not tracked.
+    Idle,
+    /// A fresh sample allows dispatch until this deadline.
+    Armed(std::time::Instant),
+    /// A write started before the deadline and has not returned yet.
+    Writing(std::time::Instant),
+    /// Every write in the window started and completed before the deadline.
+    WrittenInTime(std::time::Instant),
+    /// The worker reached the pipe after the deadline and wrote nothing.
+    Expired,
+    /// A write completed late or failed, or the worker stopped mid-window.
+    Ambiguous,
 }
 
+/// Freshness gate for the startup `cont`. Boot arms it from a fresh sample,
+/// the stdin worker records what happened at each write, and boot accepts the
+/// QMP acknowledgement only when the settled state is `WrittenInTime`. The
+/// acknowledgement itself never changes the state. This bounds when the host
+/// dispatches `cont`; when the guest starts executing belongs to QEMU.
+struct DispatchGate {
+    state: tokio::sync::watch::Sender<Dispatch>,
+    #[cfg(test)]
+    test: GateHooks,
+}
+
+#[cfg(test)]
 #[derive(Default)]
-struct GateState {
-    deadline: Option<std::time::Instant>,
-    tripped: bool,
+struct GateHooks {
+    /// Injected monotonic time; `None` uses the real clock.
+    clock: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Called with `true` before and `false` after each tracked write.
+    checkpoint: std::sync::Mutex<Option<Checkpoint>>,
+}
+
+#[cfg(test)]
+type Checkpoint = Box<dyn Fn(bool) + Send>;
+
+impl Default for DispatchGate {
+    fn default() -> Self {
+        Self {
+            state: tokio::sync::watch::Sender::new(Dispatch::Idle),
+            #[cfg(test)]
+            test: GateHooks::default(),
+        }
+    }
 }
 
 impl DispatchGate {
-    fn state(&self) -> std::sync::MutexGuard<'_, GateState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn arm(&self, deadline: std::time::Instant) {
-        self.state().deadline = Some(deadline);
-    }
-
-    /// Whether a write may start, or has completed, at `now`.
-    fn permits(&self, now: std::time::Instant) -> bool {
-        let mut state = self.state();
-        if state.deadline.is_some_and(|deadline| now >= deadline) {
-            state.tripped = true;
+    fn now(&self) -> std::time::Instant {
+        #[cfg(test)]
+        if let Some(now) = *self.test.clock.lock().unwrap() {
+            return now;
         }
-        !state.tripped
-    }
-
-    /// Ends the window. Any write in it that missed the deadline refuses.
-    fn close(&self) -> Result<(), NativeRefusal> {
-        let mut state = self.state();
-        state.deadline = None;
-        if state.tripped {
-            Err(NativeRefusal::ReservesUnverified)
-        } else {
-            Ok(())
-        }
+        std::time::Instant::now()
     }
 
     #[cfg(test)]
-    fn stall(&self, before_write: bool) {
-        let (before, after) = *self.stall.lock().unwrap();
-        std::thread::sleep(if before_write { before } else { after });
+    fn checkpoint(&self, before_write: bool) {
+        if let Some(hook) = &*self.test.checkpoint.lock().unwrap() {
+            hook(before_write);
+        }
+    }
+
+    fn current(&self) -> Dispatch {
+        *self.state.borrow()
+    }
+
+    /// Boot: arm from a sample captured after the prelaunch status receipt.
+    /// A stale sample, or a gate that is not idle, refuses without arming.
+    fn arm(&self, captured: std::time::Instant) -> Result<(), NativeRefusal> {
+        fresh_observation(captured, self.now(), NativeRefusal::ReservesUnverified)?;
+        let deadline = captured + FRESHNESS;
+        let mut armed = false;
+        self.state.send_modify(|state| {
+            if *state == Dispatch::Idle {
+                *state = Dispatch::Armed(deadline);
+                armed = true;
+            }
+        });
+        if armed {
+            Ok(())
+        } else {
+            Err(NativeRefusal::ReservesUnverified)
+        }
+    }
+
+    /// Worker: whether this write may start. Untracked when idle.
+    fn begin_write(&self) -> bool {
+        let now = self.now();
+        let mut start = false;
+        self.state.send_modify(|state| match *state {
+            Dispatch::Idle => start = true,
+            Dispatch::Armed(deadline) | Dispatch::WrittenInTime(deadline) => {
+                start = now < deadline;
+                *state = if start {
+                    Dispatch::Writing(deadline)
+                } else {
+                    Dispatch::Expired
+                };
+            }
+            // A single worker never overlaps writes; treat it as unknown.
+            Dispatch::Writing(_) => *state = Dispatch::Ambiguous,
+            Dispatch::Expired | Dispatch::Ambiguous => {}
+        });
+        start
+    }
+
+    /// Worker: record whether the write it started completed in time.
+    fn end_write(&self, completed: bool) {
+        let now = self.now();
+        self.state.send_modify(|state| {
+            if let Dispatch::Writing(deadline) = *state {
+                *state = if completed && now < deadline {
+                    Dispatch::WrittenInTime(deadline)
+                } else {
+                    Dispatch::Ambiguous
+                };
+            }
+        });
+    }
+
+    /// Worker exit: an armed or in-flight window can no longer be confirmed.
+    fn worker_stopped(&self) {
+        self.state.send_modify(|state| {
+            if matches!(*state, Dispatch::Armed(_) | Dispatch::Writing(_)) {
+                *state = Dispatch::Ambiguous;
+            }
+        });
+    }
+
+    fn tripped(&self) -> bool {
+        matches!(self.current(), Dispatch::Expired | Dispatch::Ambiguous)
+    }
+
+    /// Boot, after the QMP acknowledgement: wait until the worker has finished
+    /// any write it started, then accept only `WrittenInTime` and disarm.
+    /// Every other outcome leaves the gate tripped.
+    async fn settle(&self, limit: Duration) -> Result<(), NativeRefusal> {
+        let mut watch = self.state.subscribe();
+        let finished = matches!(
+            tokio::time::timeout(
+                limit,
+                watch.wait_for(|state| !matches!(state, Dispatch::Writing(_)))
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        let mut accepted = false;
+        self.state.send_modify(|state| match *state {
+            Dispatch::WrittenInTime(_) if finished => {
+                *state = Dispatch::Idle;
+                accepted = true;
+            }
+            Dispatch::Expired | Dispatch::Ambiguous => {}
+            _ => *state = Dispatch::Ambiguous,
+        });
+        if accepted {
+            Ok(())
+        } else {
+            Err(NativeRefusal::ReservesUnverified)
+        }
+    }
+}
+
+/// Marks an armed window unconfirmable however the stdin worker exits.
+struct WorkerStop(std::sync::Arc<DispatchGate>);
+
+impl Drop for WorkerStop {
+    fn drop(&mut self) {
+        self.0.worker_stopped();
     }
 }
 
@@ -1503,6 +1623,7 @@ fn start_stdio(
     })?);
     let cancel = set.cancel.clone();
     set.workers.push(Worker::start("arx-vm-input", move || {
+        let _stopped = WorkerStop(gate.clone());
         let mut pipe = File::from(stdio.input);
         let mut bytes = [0; 4096];
         while !cancel.is_cancelled() {
@@ -1516,22 +1637,25 @@ fn start_stdio(
             if count == 0 || cancel.is_cancelled() {
                 break;
             }
-            #[cfg(test)]
-            gate.stall(true);
-            // Dispatch only within the armed sample's freshness window.
-            if !gate.permits(std::time::Instant::now()) {
+            // Past the armed deadline nothing is written and stdin closes.
+            if !gate.begin_write() {
                 break;
             }
-            if let Err(error) = pipe.write_all(&bytes[..count]) {
+            #[cfg(test)]
+            gate.checkpoint(true);
+            let written = pipe.write_all(&bytes[..count]);
+            #[cfg(test)]
+            gate.checkpoint(false);
+            // The worker, not the QMP reply, records whether it was in time.
+            gate.end_write(written.is_ok());
+            if let Err(error) = written {
                 if cancel.is_cancelled() || error.kind() == io::ErrorKind::BrokenPipe {
                     break;
                 }
                 return Err(error);
             }
-            #[cfg(test)]
-            gate.stall(false);
-            // A write that completed late is ambiguous delivery: fail closed.
-            if !gate.permits(std::time::Instant::now()) {
+            // A late completion is ambiguous delivery: stop and close stdin.
+            if gate.tripped() {
                 break;
             }
         }
@@ -1712,26 +1836,24 @@ impl<'a> NativeLaunch<'a> {
             .await
             .map_err(|_| NativeRefusal::QmpUnverified)?;
         // Resample between the prelaunch status receipt and `cont`, and arm the
-        // input worker with that sample's deadline, so the `cont` bytes reach
-        // the child's stdin only while the sample is fresh.
+        // stdin worker with that sample's deadline.
         let mut refused = None;
         let gate = self.gate.clone();
         let released = qmp
-            .release_startup_hold(cancel, || match revalidate() {
-                Ok(captured) => {
-                    gate.arm(captured + FRESHNESS);
-                    true
-                }
-                Err(reason) => {
-                    refused = Some(reason);
-                    false
+            .release_startup_hold(cancel, || {
+                match revalidate().and_then(|captured| gate.arm(captured)) {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        refused = Some(reason);
+                        false
+                    }
                 }
             })
             .await;
-        let dispatched_in_time = self.gate.close();
         released.map_err(|_| refused.unwrap_or(NativeRefusal::QmpUnverified))?;
-        // QEMU may acknowledge a `cont` that reached it late; refuse anyway.
-        dispatched_in_time?;
+        // The acknowledgement does not touch the gate. Accept it only once the
+        // worker has finished its write and recorded it as in time.
+        self.gate.settle(Duration::from_secs(2)).await?;
         let guest = GuestChannel::handshake(pipe, cancel)
             .await
             .map_err(|_| NativeRefusal::GuestEndpointUnverified)?;
@@ -2754,6 +2876,8 @@ mod tests {
     }
 
     const CONT: &[u8] = b"{\"execute\":\"cont\",\"id\":3}\n";
+    /// Upper bound for waits in the dispatch tests. Ordering never depends on it.
+    const BOUND: Duration = Duration::from_secs(10);
 
     /// Bytes waiting in the child's stdin pipe, without consuming them.
     fn queued(pipe: &OwnedHandle) -> u32 {
@@ -2779,64 +2903,169 @@ mod tests {
         available
     }
 
-    async fn settle(pipe: &OwnedHandle, expected: usize) -> usize {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while (queued(pipe) as usize) < expected && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    struct Gated {
+        child: Stdio,
+        gate: std::sync::Arc<DispatchGate>,
+        write: tokio::io::DuplexStream,
+        workers: WorkerSet,
+        _read: tokio::io::DuplexStream,
+    }
+
+    /// Real pipes and the production stdin worker, with an injected clock.
+    fn gated(now: std::time::Instant) -> Gated {
+        let (child, parent) = fixture_stdio();
+        let gate = std::sync::Arc::new(DispatchGate::default());
+        *gate.test.clock.lock().unwrap() = Some(now);
+        let (_read, write, workers) = start_stdio(parent, gate.clone()).unwrap();
+        Gated {
+            child,
+            gate,
+            write,
+            workers,
+            _read,
         }
-        queued(pipe) as usize
+    }
+
+    fn set_clock(gate: &DispatchGate, now: std::time::Instant) {
+        *gate.test.clock.lock().unwrap() = Some(now);
+    }
+
+    /// Parks the worker after each tracked write until the test releases it.
+    fn park_after_write(
+        gate: &DispatchGate,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, parked) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        *gate.test.checkpoint.lock().unwrap() = Some(Box::new(move |before_write| {
+            if !before_write {
+                reached.send(()).unwrap();
+                released.recv_timeout(BOUND).unwrap();
+            }
+        }));
+        (parked, release)
+    }
+
+    async fn state_becomes(gate: &DispatchGate, expected: Dispatch) {
+        let mut watch = gate.state.subscribe();
+        tokio::time::timeout(BOUND, watch.wait_for(|state| *state == expected))
+            .await
+            .expect("dispatch state did not settle")
+            .unwrap();
+    }
+
+    async fn input_worker_exits(set: &WorkerSet) {
+        tokio::time::timeout(BOUND, async {
+            while !set.workers[1].0.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the input worker kept the child's stdin open");
+    }
+
+    async fn still_pending(task: &tokio::task::JoinHandle<Result<(), NativeRefusal>>) {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "boot decided before the worker finished its write"
+        );
+    }
+
+    #[test]
+    fn a_stale_cont_sample_never_arms_the_gate() {
+        let base = std::time::Instant::now();
+        let gate = DispatchGate::default();
+        set_clock(&gate, base + FRESHNESS + Duration::from_millis(1));
+        assert_eq!(gate.arm(base), Err(NativeRefusal::ReservesUnverified));
+        assert_eq!(gate.current(), Dispatch::Idle);
+        set_clock(&gate, base);
+        gate.arm(base).unwrap();
+        // A second arm while a window is open is refused.
+        assert_eq!(gate.arm(base), Err(NativeRefusal::ReservesUnverified));
     }
 
     #[tokio::test]
-    async fn input_worker_refuses_a_cont_dispatched_after_the_sample_deadline() {
-        let (child_io, parent_io) = fixture_stdio();
-        let gate = std::sync::Arc::new(DispatchGate::default());
-        let (_read, mut write, workers) = start_stdio(parent_io, gate.clone()).unwrap();
-        // Positive control: a fresh sample lets the record reach the child.
-        gate.arm(std::time::Instant::now() + FRESHNESS);
-        write.write_all(CONT).await.unwrap();
-        assert_eq!(settle(&child_io.input, CONT.len()).await, CONT.len());
-        assert_eq!(gate.close(), Ok(()));
-        // QMP queues `cont` inside the window, but the worker reaches the
-        // pipe only after the sample deadline has passed.
-        *gate.stall.lock().unwrap() = (Duration::from_millis(150), Duration::ZERO);
-        gate.arm(std::time::Instant::now() + Duration::from_millis(50));
-        write.write_all(CONT).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
+    async fn an_expired_sample_writes_nothing_and_closes_stdin() {
+        let base = std::time::Instant::now();
+        let mut io = gated(base);
+        io.gate.arm(base).unwrap();
+        // The deadline passes before the worker reaches the pipe.
+        set_clock(&io.gate, base + FRESHNESS);
+        io.write.write_all(CONT).await.unwrap();
+        state_becomes(&io.gate, Dispatch::Expired).await;
+        input_worker_exits(&io.workers).await;
+        assert_eq!(queued(&io.child.input), 0, "a `cont` reached the child");
         assert_eq!(
-            queued(&child_io.input) as usize,
-            CONT.len(),
-            "a `cont` reached the child after the sample expired"
+            io.gate.settle(BOUND).await,
+            Err(NativeRefusal::ReservesUnverified)
         );
-        assert_eq!(gate.close(), Err(NativeRefusal::ReservesUnverified));
-        assert!(
-            workers.workers[1].0.is_finished(),
-            "the input worker kept the child's stdin open"
-        );
-        workers
-            .join(tokio::time::Instant::now() + Duration::from_secs(2))
+        io.workers
+            .join(tokio::time::Instant::now() + BOUND)
+            .await
+            .unwrap();
+    }
+
+    /// The reviewer's interleaving: QEMU reads the bytes and acknowledges while
+    /// the worker is still between its write and recording the result, and
+    /// the deadline passes in that gap. Boot must wait, then refuse.
+    #[tokio::test]
+    async fn an_acknowledgement_before_a_late_write_is_recorded_is_refused() {
+        let base = std::time::Instant::now();
+        let mut io = gated(base);
+        let (parked, release) = park_after_write(&io.gate);
+        io.gate.arm(base).unwrap();
+        io.write.write_all(CONT).await.unwrap();
+        parked.recv_timeout(BOUND).unwrap();
+        // The bytes are in the pipe; the worker has not recorded the write.
+        assert_eq!(queued(&io.child.input) as usize, CONT.len());
+        assert!(matches!(io.gate.current(), Dispatch::Writing(_)));
+        // Boot observes the acknowledgement now.
+        let gate = io.gate.clone();
+        let boot = tokio::spawn(async move { gate.settle(BOUND).await });
+        still_pending(&boot).await;
+        set_clock(&io.gate, base + FRESHNESS);
+        release.send(()).unwrap();
+        assert_eq!(boot.await.unwrap(), Err(NativeRefusal::ReservesUnverified));
+        assert_eq!(io.gate.current(), Dispatch::Ambiguous);
+        input_worker_exits(&io.workers).await;
+        io.workers
+            .join(tokio::time::Instant::now() + BOUND)
             .await
             .unwrap();
     }
 
     #[tokio::test]
-    async fn a_cont_write_completing_after_the_deadline_fails_closed() {
-        let (child_io, parent_io) = fixture_stdio();
-        let gate = std::sync::Arc::new(DispatchGate::default());
-        let (_read, mut write, workers) = start_stdio(parent_io, gate.clone()).unwrap();
-        // The write starts in time but is only known complete after the deadline.
-        *gate.stall.lock().unwrap() = (Duration::ZERO, Duration::from_millis(150));
-        gate.arm(std::time::Instant::now() + Duration::from_millis(50));
-        write.write_all(CONT).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert_eq!(queued(&child_io.input) as usize, CONT.len());
-        assert_eq!(gate.close(), Err(NativeRefusal::ReservesUnverified));
-        assert!(
-            workers.workers[1].0.is_finished(),
-            "the input stayed open after an ambiguous dispatch"
-        );
-        workers
-            .join(tokio::time::Instant::now() + Duration::from_secs(2))
+    async fn an_acknowledged_cont_written_in_time_is_accepted() {
+        let base = std::time::Instant::now();
+        let mut io = gated(base);
+        let (parked, release) = park_after_write(&io.gate);
+        io.gate.arm(base).unwrap();
+        io.write.write_all(CONT).await.unwrap();
+        parked.recv_timeout(BOUND).unwrap();
+        let gate = io.gate.clone();
+        let boot = tokio::spawn(async move { gate.settle(BOUND).await });
+        still_pending(&boot).await;
+        // Completed one tick before the deadline.
+        set_clock(&io.gate, base + FRESHNESS - Duration::from_nanos(1));
+        release.send(()).unwrap();
+        assert_eq!(boot.await.unwrap(), Ok(()));
+        assert_eq!(io.gate.current(), Dispatch::Idle);
+        // After startup, later commands pass through untracked.
+        *io.gate.test.checkpoint.lock().unwrap() = None;
+        set_clock(&io.gate, base + FRESHNESS * 10);
+        io.write.write_all(CONT).await.unwrap();
+        tokio::time::timeout(BOUND, async {
+            while (queued(&io.child.input) as usize) < 2 * CONT.len() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an untracked command did not reach the child");
+        assert!(!io.workers.workers[1].0.is_finished());
+        io.workers
+            .join(tokio::time::Instant::now() + BOUND)
             .await
             .unwrap();
     }
