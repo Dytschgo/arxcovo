@@ -349,9 +349,9 @@
   first-boot account; installer residue), PASS `3f3d094c…ba30`, status `59609122872`.
   Unverified ISO and derived-asset pins make the recipe `recipe_unqualified`. Target
   cloud-init is disabled, so the template has no login account; installer logs copied
-  after late-commands are documented non-secret residue by construction (no credential
-  material in the inputs); inspecting those logs on a real offline install remains an open
-  acceptance item. A real offline install is **unverified on real hardware**.
+  after late-commands are documented residue. The seed supplies no reusable credentials,
+  but whether those logs contain secrets is **unverified on real hardware** and requires
+  inspection during a real offline install. A real offline install is **unverified on real hardware**.
 - **PR #262 merged** as `b1e3f19c` (guest: a fresh Hello resets the session). Sol 6.2 high
   builder 1/3 (report SHA256 `997fbbb0…0637`); review PASS `2a34f9bc…a175`, status
   `59610038207`. Linux virtio reset and port reopen, the OVMF-to-Linux handoff, script
