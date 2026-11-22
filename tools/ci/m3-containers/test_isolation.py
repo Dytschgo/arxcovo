@@ -329,11 +329,14 @@ class Network(unittest.TestCase):
         self.assertEqual(set(isolation.read_counters(inet_rows, inet_subset, "inet", TABLE)),
                          {"local", "host-input-0", "outside"})
 
-        # Wrong-protocol, wrong-family, duplicate, or catch-all extra dependencies must be refused.
+        # Wrong-protocol, contradictory ARP EtherType, wrong-family, duplicate, or catch-all extra deps must be refused.
+        arp_source = next(src for name, src, _ in bridge_subset["r2_forward"][1] if name == "arp-a-b")
+        self.assertEqual(isolation.source_protocols(arp_source), {"ether", "arp"})
         for label, family, subset, base_rows, idx, bad_expr in (
             ("wrong-l4", "bridge", bridge_subset, bridge_rows, 3, m_meta("l4proto", "udp")),
             ("wrong-family-dep", "bridge", bridge_subset, bridge_rows, 3, m_meta("nfproto", "ipv4")),
             ("duplicate-dep", "bridge", bridge_subset, bridge_rows, 3, m_pay("ether", "type", "ip")),
+            ("arp-contradictory-ethertype", "bridge", bridge_subset, bridge_rows, 7, m_pay("ether", "type", "ip")),
             ("extra-on-catchall", "bridge", bridge_subset, bridge_rows, 8, m_pay("ether", "type", "ip")),
             ("ether-in-inet", "inet", inet_subset, inet_rows, 2, m_pay("ether", "type", "ip")),
         ):
@@ -532,3 +535,239 @@ class Cleanup(unittest.TestCase):
             ("netns", resources.namespaces["a"]),
             ("link", resources.bridge),
         ])
+
+    def test_committed_unobserved_link_netns_and_nft_cleanup_with_cleanup_reserve(self):
+        # 1. Committed-but-unobserved link: ip link add commits, first readback fails, cleanup recovers with reserve.
+        resources = self.make_resources()
+        live_links = {}
+        deleted_links = []
+        fail_first_readback = [True]
+
+        def fake_ip_link(end, *args, **kwargs):
+            if args[:2] == ("link", "add"):
+                name = args[3]
+                live_links[name] = {
+                    "ifname": name, "ifindex": 201, "ifalias": "",
+                    "address": NETWORK["local"][1], "linkinfo": {"info_kind": "bridge"},
+                }
+                return ""
+            if args[:3] == ("-j", "-d", "link"):
+                name = args[-1]
+                if fail_first_readback[0]:
+                    fail_first_readback[0] = False
+                    raise Refusal("ip-phase-deadline")
+                if name not in live_links:
+                    return f'Device "{name}" does not exist.\n'
+                return json.dumps([live_links[name]])
+            if args[:2] == ("link", "del"):
+                name = args[3]
+                deleted_links.append(name)
+                live_links.pop(name, None)
+                return ""
+            return ""
+
+        with patch.object(resources, "ip", side_effect=fake_ip_link):
+            with self.assertRaisesRegex(Refusal, "ip-phase-deadline"):
+                resources.add_link(resources.bridge, 0, "type", "bridge", kind="bridge", mac=NETWORK["local"][1])
+            self.assertEqual(resources.cleanup(10), [])
+            self.assertEqual(deleted_links, [resources.bridge])
+            self.assertEqual(live_links, {})
+
+        # Unobserved link with unprovable attribution (wrong kind or foreign alias) must be refused.
+        for bad_row in (
+            {"ifname": resources.bridge, "ifindex": 202, "address": NETWORK["local"][1],
+             "linkinfo": {"info_kind": "dummy"}},
+            {"ifname": resources.bridge, "ifindex": 202, "address": NETWORK["local"][1],
+             "linkinfo": {"info_kind": "bridge"}, "ifalias": "foreign_table"},
+        ):
+            with self.subTest(bad_link=bad_row):
+                del_calls = []
+                with patch.object(resources, "links_at", return_value=[bad_row]), \
+                     patch.object(resources, "ip", side_effect=lambda *a, **kw: del_calls.append(a)):
+                    with self.assertRaisesRegex(Refusal, "link-attribution"):
+                        resources.remove_link(resources.bridge, None, 10, tagged=False,
+                                              expected_kind="bridge", expected_mac=NETWORK["local"][1])
+                    self.assertEqual(del_calls, [])
+
+        # 2. Committed-but-unobserved namespace: netns add commits then times out before stat(); cleanup recovers.
+        resources = self.make_resources()
+        ns_name = resources.namespaces["a"]
+        ns_path = Path("/run/netns") / ns_name
+        ns_live = [False]
+        ns_deleted = []
+
+        def fake_ip_ns(_end, *args, **kwargs):
+            if args[:2] == ("netns", "add"):
+                ns_live[0] = True
+                raise Refusal("ip-command-deadline")
+            if args[:2] == ("netns", "list"):
+                return f"{ns_name}\n" if ns_live[0] else ""
+            if args[:2] == ("netns", "pids"):
+                return ""
+            if args[:2] == ("netns", "del"):
+                ns_deleted.append(args[2])
+                ns_live[0] = False
+                return ""
+            return ""
+
+        nsfs_line = f"55 21 0:4 / {ns_path.as_posix()} rw - nsfs nsfs rw\n".encode("ascii")
+        with patch.object(resources, "ip", side_effect=fake_ip_ns), \
+             patch.object(Path, "exists", lambda p: ns_live[0] if p == ns_path else False), \
+             patch.object(Path, "lstat", lambda p: SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG | 0o444)), \
+             patch.object(isolation, "bounded_read", return_value=nsfs_line):
+            with self.assertRaisesRegex(Refusal, "ip-command-deadline"):
+                resources.add_namespace("a", 0)
+            self.assertEqual(resources.cleanup(10), [])
+            self.assertEqual(ns_deleted, [ns_name])
+
+        # Unobserved namespace that is a symlink or non-nsfs mount must refuse deletion.
+        with patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "lstat", return_value=SimpleNamespace(st_uid=0, st_mode=stat.S_IFLNK | 0o777)), \
+             patch.object(resources, "ip") as mocked_ip:
+            with self.assertRaisesRegex(Refusal, "netns-attribution"):
+                resources.remove_namespace("a", None, 10, allow_unobserved=True)
+            mocked_ip.assert_not_called()
+
+        # 3. Committed-but-unobserved nft tables: nft -f commits both tables, handle readback hits expired setup deadline;
+        # cleanup uses fresh cleanup deadline and removes both tables after links are gone.
+        resources = self.make_resources()
+        resources.remember("link", lambda _end: None)
+        live_tables = {}
+        deleted_tables = []
+        setup_end = 100
+        cleanup_end = 200
+
+        def fake_nft(end, *args):
+            if args[0] == "-f":
+                for fam, h in (("bridge", 31), ("inet", 32)):
+                    live_tables[fam] = [
+                        {"table": {"family": fam, "name": resources.table, "handle": h}},
+                        {"chain": {"family": fam, "table": resources.table, "name": "r2_forward",
+                                   "type": "filter", "hook": "forward", "prio": -310, "policy": "accept"}},
+                        {"rule": {"family": fam, "table": resources.table, "chain": "r2_forward",
+                                  "handle": h + 10, "comment": "r2-peer", "expr": []}},
+                    ]
+                return ""
+            if args[:2] == ("-j", "-a"):
+                if end == setup_end:
+                    raise Refusal("nft-phase-deadline")
+                return json.dumps({"nftables": live_tables[args[4]]})
+            if args == ("list", "tables"):
+                return "\n".join(f"table {fam} {resources.table}" for fam in live_tables)
+            if args[:2] == ("delete", "table"):
+                deleted_tables.append(args[2])
+                live_tables.pop(args[2], None)
+                return ""
+            return ""
+
+        with patch.object(Path, "write_text", return_value=0), \
+             patch.object(resources, "nft", side_effect=fake_nft), \
+             patch.object(resources, "links_at", return_value=[]):
+            with self.assertRaisesRegex(Refusal, "nft-phase-deadline"):
+                resources.apply_policy(setup_end)
+            self.assertEqual(resources.cleanup(cleanup_end), [])
+            self.assertEqual(set(deleted_tables), {"bridge", "inet"})
+            self.assertEqual(live_tables, {})
+
+        # Unobserved nft table with an alien chain must refuse deletion.
+        alien_rows = [
+            {"table": {"family": "bridge", "name": resources.table, "handle": 41}},
+            {"chain": {"family": "bridge", "table": resources.table, "name": "alien_chain",
+                       "type": "filter", "hook": "forward", "prio": -310, "policy": "accept"}},
+        ]
+        nft_calls = []
+
+        def fake_alien_nft(_end, *args):
+            nft_calls.append(args)
+            if args == ("list", "tables"):
+                return f"table bridge {resources.table}\n"
+            if args[:2] == ("-j", "-a"):
+                return json.dumps({"nftables": alien_rows})
+            raise AssertionError(f"unexpected nft delete: {args}")
+
+        with patch.object(resources, "nft", side_effect=fake_alien_nft), \
+             patch.object(resources, "links_at", return_value=[]):
+            with self.assertRaisesRegex(Refusal, "nft-attribution"):
+                resources.remove_table("bridge", None, cleanup_end, expected_chains={"r2_forward", "r2_input"})
+            self.assertFalse(any(call[:2] == ("delete", "table") for call in nft_calls))
+
+    def test_mkfs_alias_to_mke2fs_passes_explicit_ext4_type(self):
+        import fixture
+        dir_ok = SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755)
+        reg_ok = SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG | 0o755)
+        lnk_ok = SimpleNamespace(st_uid=0, st_mode=stat.S_IFLNK | 0o777)
+        stats = {"/": dir_ok, "/usr": dir_ok, "/usr/sbin": dir_ok, "/usr/sbin/mkfs.ext4": lnk_ok, "/usr/sbin/mke2fs": reg_ok}
+        canonical_mkfs = fixture.vet_tool("/usr/sbin/mkfs.ext4", lstat=stats.__getitem__,
+                                          readlink=lambda p: "mke2fs")
+        self.assertEqual(canonical_mkfs, "/usr/sbin/mke2fs")
+
+        for vol_name, size in (("root", 1024 * MIB), ("a", 256 * MIB)):
+            with self.subTest(volume=vol_name):
+                resources = isolation.Resources(
+                    {"repo": "org/repo", "head": "a"*40, "run": "1", "attempt": "1"},
+                    load_pins(),
+                    {**TOOLS, "mkfs": canonical_mkfs},
+                )
+                captured_argvs = []
+                orig_dev = (8 << 8) | 1
+                orig_ino = 70001
+                image = resources.root / f"{vol_name}.ext4"
+                mount = resources.root / vol_name
+                img_stat = SimpleNamespace(st_mode=stat.S_IFREG | (0o400 if vol_name == "root" else 0o600),
+                                           st_uid=0, st_nlink=1, st_size=size, st_blocks=size // 512,
+                                           st_dev=orig_dev, st_ino=orig_ino)
+                mounted = [False]
+                attached = [False]
+
+                def fake_capture(argv, _end, **kwargs):
+                    captured_argvs.append(argv)
+                    exe = argv[0]
+                    if exe == "/usr/sbin/mke2fs":
+                        return b""
+                    if exe == TOOLS["loop"] and "-J" in argv:
+                        rows = []
+                        if attached[0]:
+                            rows.append({
+                                "name": "/dev/loop2", "back-file": image.as_posix(),
+                                "back-ino": orig_ino, "back-maj:min": isolation.dev_majmin(orig_dev),
+                                "ro": vol_name == "root", "offset": 0, "sizelimit": 0,
+                            })
+                        return json.dumps({"loopdevices": rows}).encode("ascii")
+                    if exe == TOOLS["loop"] and "--find" in argv:
+                        attached[0] = True
+                        return b"/dev/loop2\n"
+                    if exe == TOOLS["findmnt"]:
+                        if mounted[0]:
+                            return f"188 {mount.as_posix()} /dev/loop2 ext4 /\n".encode("ascii")
+                        return b""
+                    if exe == TOOLS["mount"]:
+                        mounted[0] = True
+                        return b""
+                    return b""
+
+                def fake_bounded_read(path, _limit):
+                    if path.name == "mountinfo":
+                        if mounted[0]:
+                            return f"188 29 7:2 / {mount.as_posix()} ro,nosuid - ext4 /dev/loop2 ro\n".encode("ascii")
+                        return b""
+                    if path.name == "size":
+                        return f"{size // 512}\n".encode("ascii")
+                    raise AssertionError(path)
+
+                fake_vfs = SimpleNamespace(
+                    f_flag=(getattr(isolation.os, "ST_RDONLY", 1) if vol_name == "root" else 0),
+                    f_frsize=4096, f_bavail=60000, f_blocks=63000, f_favail=16380, f_files=16384,
+                )
+                with patch.object(fixture, "capture", side_effect=fake_capture), \
+                     patch.object(isolation, "allocate"), \
+                     patch.object(isolation, "private_directory"), \
+                     patch.object(isolation, "bounded_read", side_effect=fake_bounded_read), \
+                     patch.object(Path, "chmod"), \
+                     patch.object(Path, "lstat", return_value=img_stat), \
+                     patch.object(isolation.os, "ST_RDONLY", 1, create=True), \
+                     patch.object(isolation.os, "statvfs", return_value=fake_vfs, create=True):
+                    resources.volume(vol_name, resources.root / "tree", 10)
+
+                mkfs_calls = [argv for argv in captured_argvs if argv[0] == "/usr/sbin/mke2fs"]
+                self.assertEqual(len(mkfs_calls), 1)
+                self.assertEqual(mkfs_calls[0][1:3], ["-t", "ext4"])

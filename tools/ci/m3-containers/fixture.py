@@ -332,6 +332,38 @@ def validate_build_messages(raw, target, workspace):
     require(sqlite_ok and arxd_ok, "artifact-build-messages")
 
 
+def validate_link_messages(raw, workspace, expected_executable):
+    expected_manifest = (PurePosixPath(workspace.as_posix()) / "crates/arxd/Cargo.toml").as_posix()
+    lines = raw.splitlines()
+    require(1 <= len(lines) <= 50000, "artifact-link-messages")
+    matched = []
+    finished_ok = False
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            raise Refusal("artifact-link-messages") from None
+        if not isinstance(entry, dict):
+            continue
+        reason = entry.get("reason")
+        if reason == "compiler-artifact":
+            tgt = entry.get("target")
+            profile = entry.get("profile")
+            if (isinstance(tgt, dict) and tgt.get("name") == "arxd"
+                    and isinstance(tgt.get("kind"), list) and "bin" in tgt["kind"]):
+                require(entry.get("manifest_path") == expected_manifest
+                        and isinstance(profile, dict) and profile.get("test") is False
+                        and isinstance(entry.get("executable"), str)
+                        and entry["executable"] == expected_executable, "artifact-link-messages")
+                matched.append(entry["executable"])
+        elif reason == "build-finished":
+            require(entry.get("success") is True, "artifact-link-messages")
+            finished_ok = True
+    require(len(matched) == 1 and finished_ok, "artifact-link-messages")
+
+
 def select_daemon(target_raw, workspace, owner, proof_root, identity, end):
     if target_raw:
         target = Path(target_raw)
@@ -340,31 +372,40 @@ def select_daemon(target_raw, workspace, owner, proof_root, identity, end):
     plain_path(target, (0, owner), directory=True)
     profile = target / "debug"
     plain_path(profile, (0, owner), directory=True)
+    path = profile / "arxd"
     loader_receipt = proof_root / "build-messages.jsonl"
+    link_receipt = proof_root / "arxd-build-messages.jsonl"
     artifact_receipt = proof_root / "arxd-receipt.json"
     with open_artifact(loader_receipt, (0, owner), 64*MIB) as (messages_stream, loader_stat):
         raw_messages = messages_stream.read(loader_stat.st_size + 1)
         require(len(raw_messages) == loader_stat.st_size, "artifact-truncated")
     messages_sha256 = hashlib.sha256(raw_messages).hexdigest()
     validate_build_messages(raw_messages, target, workspace)
+    with open_artifact(link_receipt, (0, owner), 64*MIB) as (link_stream, link_stat):
+        raw_link = link_stream.read(link_stat.st_size + 1)
+        require(len(raw_link) == link_stat.st_size, "artifact-truncated")
+    require(link_stat.st_mtime_ns >= loader_stat.st_mtime_ns, "stale-artifact")
+    link_sha256 = hashlib.sha256(raw_link).hexdigest()
+    validate_link_messages(raw_link, workspace, path.as_posix())
     with open_artifact(artifact_receipt, (0, owner), 65536) as (receipt_stream, receipt_stat):
         raw_receipt = receipt_stream.read(receipt_stat.st_size + 1)
         require(len(raw_receipt) == receipt_stat.st_size, "artifact-truncated")
+    require(receipt_stat.st_mtime_ns >= link_stat.st_mtime_ns, "stale-artifact")
     try:
         receipt_data = json.loads(raw_receipt, object_pairs_hook=unique_pairs)
     except ValueError:
         raise Refusal("artifact-receipt") from None
     expected_keys = {
         "schema", "head", "run", "attempt", "target_dir",
-        "executable", "sha256", "bytes", "build_messages_sha256",
+        "executable", "sha256", "bytes", "build_messages_sha256", "link_messages_sha256",
     }
     require(isinstance(receipt_data, dict) and set(receipt_data) == expected_keys
             and receipt_data["schema"] == "arxcovo/r2-artifact/1", "artifact-receipt")
     require(receipt_data["head"] == identity["head"]
             and receipt_data["run"] == identity["run"]
             and receipt_data["attempt"] == identity["attempt"], "artifact-receipt-identity")
-    require(receipt_data["build_messages_sha256"] == messages_sha256, "artifact-receipt-binding")
-    path = profile / "arxd"
+    require(receipt_data["build_messages_sha256"] == messages_sha256
+            and receipt_data["link_messages_sha256"] == link_sha256, "artifact-receipt-binding")
     require(receipt_data["target_dir"] == target.as_posix()
             and receipt_data["executable"] == path.as_posix(), "artifact-receipt-path")
     require(type(receipt_data["bytes"]) is int and 0 < receipt_data["bytes"] <= 256*MIB

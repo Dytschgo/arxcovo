@@ -125,7 +125,8 @@ class Resources:
         image = self.root / f"{name}.ext4"
         mount = self.root / name
         allocate(image, size)
-        flags = ["-q", "-F", "-b", "4096", "-m", "0", "-E", "nodiscard,lazy_itable_init=0,lazy_journal_init=0"]
+        flags = ["-t", "ext4", "-q", "-F", "-b", "4096", "-m", "0",
+                 "-E", "nodiscard,lazy_itable_init=0,lazy_journal_init=0"]
         if not sealed:
             flags.extend(("-N", str(self.budget["data_inodes"])))
         self.cmd("mkfs", end, *flags, "-d", source, image)
@@ -139,23 +140,19 @@ class Resources:
         if sealed:
             args.append("--read-only")
         loop_box = [None]
-        try:
-            loop_box[0] = self.cmd("loop", end, *args, image).strip()
-        finally:
-            self.remember(f"loop-{name}", lambda deadline, b=backing, lb=loop_box:
-                          self.release_loop(image, size, sealed, b, lb[0], deadline))
+        self.remember(f"loop-{name}", lambda deadline, b=backing, lb=loop_box:
+                      self.release_loop(image, size, sealed, b, lb[0], deadline))
+        loop_box[0] = self.cmd("loop", end, *args, image).strip()
         loop = loop_box[0]
         self.check_loop(image, loop, size, sealed, backing, end)
         private_directory(mount, 0o755)
         require(not mountinfo_entries(mount) and not self.mounts(mount, end), "mount-preexisting")
         mount_box = [None]
-        try:
-            self.cmd("mount", end, "-t", "ext4", "-o",
-                     "ro,nodev,nosuid" if sealed else "rw,nodev,nosuid,noexec", loop, mount)
-            mount_box[0] = self.check_mount(mount, loop, end)
-        finally:
-            self.remember(f"mount-{name}", lambda deadline, box=mount_box:
-                          self.release_mount(mount, loop, box[0], deadline))
+        self.remember(f"mount-{name}", lambda deadline, box=mount_box, b=backing, img=image, sz=size, sl=sealed:
+                      self.release_mount(mount, loop, box[0], deadline, unobserved_loop=(img, sz, sl, b)))
+        self.cmd("mount", end, "-t", "ext4", "-o",
+                 "ro,nodev,nosuid" if sealed else "rw,nodev,nosuid,noexec", loop, mount)
+        mount_box[0] = self.check_mount(mount, loop, end)
         stats = os.statvfs(mount)
         require(bool(stats.f_flag & os.ST_RDONLY) == sealed, "volume-readonly")
         self.facts[name] = filesystem_facts(stats, self.budget, writable=not sealed)
@@ -201,11 +198,16 @@ class Resources:
         require_same(self.mounts(path, end), [f"{mount_id} {path.as_posix()} {loop} ext4 /"], "mount-identity")
         return mount_id
 
-    def release_mount(self, path, loop, expected_id, end):
+    def release_mount(self, path, loop, expected_id, end, *, unobserved_loop=None):
         entries = mountinfo_entries(path)
         if entries or self.mounts(path, end):
-            require(expected_id is not None, "mount-identity")
-            self.check_mount(path, loop, end, expected_id=expected_id)
+            if expected_id is not None:
+                self.check_mount(path, loop, end, expected_id=expected_id)
+            else:
+                require(unobserved_loop is not None and path.parent == self.root, "mount-identity")
+                img, sz, sl, backing = unobserved_loop
+                self.check_loop(img, loop, sz, sl, backing, end)
+                self.check_mount(path, loop, end)
             self.cmd("umount", end, path)
         require(not mountinfo_entries(path) and not self.mounts(path, end), "mount-still-active")
 
@@ -230,27 +232,37 @@ class Resources:
             return []
         return json_rows(output)
 
-    def add_link(self, name, end, *add_args):
+    def add_link(self, name, end, *add_args, kind, mac=None):
         state = {"index": None, "tagged": False}
-        try:
-            self.ip(end, "link", "add", "name", name, *add_args)
-            rows = self.links_at(end, name)
-            require(len(rows) == 1 and type(rows[0].get("ifindex")) is int, "link-attribution")
-            state["index"] = rows[0]["ifindex"]
-            self.ip(end, "link", "set", "dev", name, "alias", self.table)
-            rows = self.links_at(end, name)
-            require(len(rows) == 1 and rows[0]["ifindex"] == state["index"]
-                    and rows[0].get("ifalias") == self.table, "link-attribution")
-            state["tagged"] = True
-        finally:
-            self.remember("link", lambda deadline, n=name, s=state:
-                          self.remove_link(n, s["index"], deadline, tagged=s["tagged"]))
+        self.remember("link", lambda deadline, n=name, s=state, k=kind, m=mac:
+                      self.remove_link(n, s["index"], deadline, tagged=s["tagged"],
+                                       expected_kind=k, expected_mac=m))
+        self.ip(end, "link", "add", "name", name, *add_args)
+        rows = self.links_at(end, name)
+        require(len(rows) == 1 and type(rows[0].get("ifindex")) is int, "link-attribution")
+        state["index"] = rows[0]["ifindex"]
+        self.ip(end, "link", "set", "dev", name, "alias", self.table)
+        rows = self.links_at(end, name)
+        require(len(rows) == 1 and rows[0]["ifindex"] == state["index"]
+                and rows[0].get("ifalias") == self.table, "link-attribution")
+        state["tagged"] = True
 
-    def remove_link(self, name, index, end, *, tagged=True):
+    def remove_link(self, name, index, end, *, tagged=True, expected_kind=None, expected_mac=None):
         rows = self.links_at(end, name)
         if rows:
-            require(len(rows) == 1 and index is not None and rows[0]["ifindex"] == index
-                    and (not tagged or rows[0].get("ifalias") == self.table), "link-attribution")
+            require(len(rows) == 1, "link-attribution")
+            row = rows[0]
+            if index is not None:
+                require(row.get("ifindex") == index
+                        and (not tagged or row.get("ifalias") == self.table), "link-attribution")
+            else:
+                require(name in (self.bridge, *self.links.values()) and expected_kind in ("bridge", "veth"),
+                        "link-attribution")
+                require(type(row.get("ifindex")) is int and row.get("ifname", name) == name, "link-attribution")
+                require(row.get("linkinfo", {}).get("info_kind") == expected_kind, "link-attribution")
+                if expected_mac is not None:
+                    require(row.get("address") == expected_mac, "link-attribution")
+                require(row.get("ifalias") in (None, "", self.table), "link-attribution")
             self.ip(end, "link", "del", "dev", name)
         require(not self.links_at(end, name), "link-residue")
 
@@ -264,22 +276,30 @@ class Resources:
     def add_namespace(self, node, end):
         namespace = self.namespaces[node]
         path = Path("/run/netns") / namespace
-        identity = [None]
-        try:
-            self.ip(end, "netns", "add", namespace)
-            info = path.stat()
-            identity[0] = (info.st_dev, info.st_ino)
-        finally:
-            self.remember("namespace", lambda deadline, n=node, box=identity:
-                          self.remove_namespace(n, box[0], deadline))
+        require(not path.exists(), "network-preexisting")
+        state = {"identity": None}
+        self.remember("namespace", lambda deadline, n=node, s=state:
+                      self.remove_namespace(n, s["identity"], deadline, allow_unobserved=True))
+        self.ip(end, "netns", "add", namespace)
+        info = path.stat()
+        state["identity"] = (info.st_dev, info.st_ino)
 
-    def remove_namespace(self, node, identity, end):
+    def remove_namespace(self, node, identity, end, *, allow_unobserved=False):
         name = self.namespaces[node]
         path = Path("/run/netns") / name
         if not path.exists():
             return
-        current = path.stat()
-        require(identity is not None and (current.st_dev, current.st_ino) == identity, "netns-attribution")
+        if identity is not None:
+            current = path.stat()
+            require((current.st_dev, current.st_ino) == identity, "netns-attribution")
+        else:
+            require(allow_unobserved, "netns-attribution")
+            linfo = path.lstat()
+            require(not stat.S_ISLNK(linfo.st_mode) and linfo.st_uid == 0, "netns-attribution")
+            listed = [line.split()[0] for line in self.ip(end, "netns", "list").splitlines() if line.strip()]
+            require(name in listed, "netns-attribution")
+            entries = mountinfo_entries(path)
+            require(len(entries) == 1 and entries[0][2] == "nsfs", "netns-attribution")
         require(not self.ip(end, "netns", "pids", name).strip(), "netns-children")
         self.ip(end, "netns", "del", name)
         require(not path.exists(), "netns-residue")
@@ -287,13 +307,13 @@ class Resources:
     def make_links(self, end):
         require(not self.network_names(end), "network-preexisting")
         self.add_link(self.bridge, end, "address", NETWORK["local"][1], "type", "bridge",
-                      "stp_state", "0", "mcast_snooping", "0")
+                      "stp_state", "0", "mcast_snooping", "0", kind="bridge", mac=NETWORK["local"][1])
         self.ip(end, "link", "set", "dev", self.bridge, "addrgenmode", "none")
         for node, (address, mac) in NETWORK["nodes"].items():
             namespace = self.namespaces[node]
             self.add_namespace(node, end)
             link = self.links[node]
-            self.add_link(link, end, "type", "veth", "peer", "name", "eth0", "netns", namespace)
+            self.add_link(link, end, "type", "veth", "peer", "name", "eth0", "netns", namespace, kind="veth")
             self.ip(end, "link", "set", "dev", link, "master", self.bridge, "addrgenmode", "none")
             self.ns(end, node, "link", "set", "dev", "eth0", "address", mac, "addrgenmode", "none")
             self.ns(end, node, "address", "add", f"{address}/24", "dev", "eth0")
@@ -322,20 +342,16 @@ class Resources:
         config.write_text("\n".join(lines) + "\n", encoding="ascii")
         first_link = next(index for index, (label, _) in enumerate(self.cleanup_stack) if label == "link")
         handles = {}
-        try:
-            self.nft(end, "-f", config)
-            for family in rules:
-                handles[family] = table_handle(self.nft_table(family, end), family, self.table)
-        finally:
-            for family in rules:
-                if family not in handles:
-                    try:
-                        handles[family] = table_handle(self.nft_table(family, end), family, self.table)
-                    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError):
-                        continue
-            for family, handle in handles.items():
-                self.cleanup_stack.insert(first_link, ("nft", lambda deadline, f=family, h=handle:
-                                                        self.remove_table(f, h, deadline)))
+        for family in rules:
+            expected_chains = set(rules[family])
+            self.cleanup_stack.insert(
+                first_link,
+                ("nft", lambda deadline, f=family, h=handles, c=expected_chains:
+                 self.remove_table(f, h.get(f), deadline, expected_chains=c)),
+            )
+        self.nft(end, "-f", config)
+        for family in rules:
+            handles[family] = table_handle(self.nft_table(family, end), family, self.table)
         self.rule_graph = rules
         self.rule_receipt = self.counters(end)
 
@@ -343,10 +359,34 @@ class Resources:
         return json.loads(self.nft(end, "-j", "-a", "list", "table", family, self.table),
                           object_pairs_hook=unique_pairs)["nftables"]
 
-    def remove_table(self, family, handle, end):
+    def remove_table(self, family, handle, end, *, expected_chains=None):
+        if f"table {family} {self.table}" not in self.nft(end, "list", "tables").splitlines():
+            return
         require(not any(self.links_at(end, name) for name in (self.bridge, *self.links.values())),
                 "nft-live-link")
-        require(table_handle(self.nft_table(family, end), family, self.table) == handle, "nft-attribution")
+        rows = self.nft_table(family, end)
+        current_handle = table_handle(rows, family, self.table)
+        if handle is not None:
+            require(current_handle == handle, "nft-attribution")
+        else:
+            require(expected_chains is not None, "nft-attribution")
+            for row in rows:
+                if "metainfo" in row or "table" in row:
+                    continue
+                if "chain" in row:
+                    chain = row["chain"]
+                    require(chain.get("family") == family and chain.get("table") == self.table
+                            and chain.get("name") in expected_chains and chain.get("type") == "filter"
+                            and chain.get("prio") == -310 and chain.get("policy") == "accept",
+                            "nft-attribution")
+                elif "rule" in row:
+                    rule = row["rule"]
+                    require(rule.get("family") == family and rule.get("table") == self.table
+                            and rule.get("chain") in expected_chains
+                            and isinstance(rule.get("comment"), str) and rule["comment"].startswith("r2-"),
+                            "nft-attribution")
+                else:
+                    raise Refusal("nft-attribution")
         self.nft(end, "delete", "table", family, self.table)
         require(f"table {family} {self.table}" not in self.nft(end, "list", "tables").splitlines(),
                 "nft-residue")
@@ -788,13 +828,39 @@ def read_counters(rows, chains, family, name):
     return facts
 
 
+def source_protocols(source):
+    tokens = source.split()
+    protocols = set()
+    index = 0
+    while index < len(tokens):
+        head = tokens[index]
+        if head in ("iifname", "oifname"):
+            require(index + 1 < len(tokens), "nft-source")
+            index += 2
+        elif head == "ct":
+            require(index + 2 < len(tokens), "nft-source")
+            index += 3
+        elif head == "arp":
+            require(index + 3 < len(tokens) and tokens[index + 1] in ("saddr", "daddr")
+                    and tokens[index + 2] in ("ether", "ip"), "nft-source")
+            protocols.add("arp")
+            index += 4
+        elif head in ("ether", "ip", "ip6", "tcp", "udp"):
+            require(index + 2 < len(tokens), "nft-source")
+            protocols.add(head)
+            index += 3
+        else:
+            raise Refusal("nft-source")
+    return protocols
+
+
 def allowed_nft_dependencies(source, family):
-    padded = f" {source} "
-    has_ip = " ip " in padded
-    has_ip6 = " ip6 " in padded
-    has_arp = " arp " in padded
-    has_tcp = " tcp " in padded
-    has_udp = " udp " in padded
+    protocols = source_protocols(source)
+    has_ip = "ip" in protocols
+    has_ip6 = "ip6" in protocols
+    has_arp = "arp" in protocols
+    has_tcp = "tcp" in protocols
+    has_udp = "udp" in protocols
     deps = set()
     if family == "bridge":
         if has_ip:

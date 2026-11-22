@@ -117,7 +117,23 @@ class FixtureTests(unittest.TestCase):
                 }),
             )) + "\n").encode("ascii")
 
-        def make_receipt(target, messages_bytes, *, sha=good_sha, size=len(good_elf), **overrides):
+        def link_messages(target, *, executable=True, test_profile=False, finished=True):
+            artifact = {
+                "reason": "compiler-artifact",
+                "manifest_path": "/work/arxcovo/crates/arxd/Cargo.toml",
+                "target": {"name": "arxd", "kind": ["bin"]},
+                "profile": {"test": test_profile},
+            }
+            if executable is True:
+                artifact["executable"] = f"{target.as_posix()}/debug/arxd"
+            elif executable is not None:
+                artifact["executable"] = executable
+            rows = [json.dumps(artifact)]
+            if finished:
+                rows.append(json.dumps({"reason": "build-finished", "success": True}))
+            return ("\n".join(rows) + "\n").encode("ascii")
+
+        def make_receipt(target, messages_bytes, link_bytes, *, sha=good_sha, size=len(good_elf), **overrides):
             body = {
                 "schema": "arxcovo/r2-artifact/1",
                 "head": identity["head"], "run": identity["run"], "attempt": identity["attempt"],
@@ -125,6 +141,7 @@ class FixtureTests(unittest.TestCase):
                 "executable": (target / "debug/arxd").as_posix(),
                 "sha256": sha, "bytes": size,
                 "build_messages_sha256": hashlib.sha256(messages_bytes).hexdigest(),
+                "link_messages_sha256": hashlib.sha256(link_bytes).hexdigest(),
                 **overrides,
             }
             return json.dumps(body).encode("ascii")
@@ -149,9 +166,11 @@ class FixtureTests(unittest.TestCase):
         for target_raw, effective in (("", workspace / "target"), ("/mnt/custom-target", Path("/mnt/custom-target"))):
             with self.subTest(target=target_raw or "default"):
                 msgs = build_messages(effective)
-                rcpt = make_receipt(effective, msgs)
+                links = link_messages(effective)
+                rcpt = make_receipt(effective, msgs, links)
                 files = {
                     (proof_root / "build-messages.jsonl").as_posix(): (msgs, 100),
+                    (proof_root / "arxd-build-messages.jsonl").as_posix(): (links, 150),
                     (proof_root / "arxd-receipt.json").as_posix(): (rcpt, 200),
                     (effective / "debug/arxd").as_posix(): (good_elf, 200),
                 }
@@ -162,9 +181,11 @@ class FixtureTests(unittest.TestCase):
         # Negative: newer substituted unrelated ELF alongside a plausible receipt must be refused.
         default_target = workspace / "target"
         msgs = build_messages(default_target)
-        rcpt = make_receipt(default_target, msgs)
+        links = link_messages(default_target)
+        rcpt = make_receipt(default_target, msgs, links)
         base_files = {
             (proof_root / "build-messages.jsonl").as_posix(): (msgs, 100),
+            (proof_root / "arxd-build-messages.jsonl").as_posix(): (links, 150),
             (proof_root / "arxd-receipt.json").as_posix(): (rcpt, 200),
             (default_target / "debug/arxd").as_posix(): (other_elf, 999),
         }
@@ -177,20 +198,51 @@ class FixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(fixture.Refusal, "artifact-digest-mismatch"):
             run_select("", {**base_files, (default_target / "debug/arxd").as_posix(): (bytes(same_size_other), 999)})
 
+        # Negative: cargo-check-style link messages without executable field must be refused.
+        check_only_links = link_messages(default_target, executable=None)
+        with self.assertRaisesRegex(fixture.Refusal, "artifact-link-messages"):
+            run_select("", {
+                **base_files,
+                (proof_root / "arxd-build-messages.jsonl").as_posix(): (check_only_links, 150),
+                (proof_root / "arxd-receipt.json").as_posix(): (make_receipt(default_target, msgs, check_only_links), 200),
+                (default_target / "debug/arxd").as_posix(): (good_elf, 200),
+            })
+
+        # Negative: substituted ELF carrying its own digest in receipt without matching Cargo executable evidence is refused.
+        other_sha = hashlib.sha256(other_elf).hexdigest()
+        for bad_link_case, bad_links in (
+            ("no-executable", check_only_links),
+            ("wrong-executable", link_messages(default_target, executable="/tmp/other/arxd")),
+            ("test-profile", link_messages(default_target, test_profile=True)),
+            ("unfinished", link_messages(default_target, finished=False)),
+        ):
+            with self.subTest(substituted_with_self_receipt=bad_link_case):
+                self_rcpt = make_receipt(default_target, msgs, bad_links, sha=other_sha, size=len(other_elf))
+                with self.assertRaisesRegex(fixture.Refusal, "artifact-link-messages"):
+                    run_select("", {
+                        (proof_root / "build-messages.jsonl").as_posix(): (msgs, 100),
+                        (proof_root / "arxd-build-messages.jsonl").as_posix(): (bad_links, 150),
+                        (proof_root / "arxd-receipt.json").as_posix(): (self_rcpt, 200),
+                        (default_target / "debug/arxd").as_posix(): (other_elf, 999),
+                    })
+
         # Unrelated nonempty build-messages.jsonl is refused.
         unrelated = b'{"reason":"note","message":"unrelated"}\n'
         with self.assertRaisesRegex(fixture.Refusal, "artifact-build-messages"):
             run_select("", {
                 (proof_root / "build-messages.jsonl").as_posix(): (unrelated, 100),
-                (proof_root / "arxd-receipt.json").as_posix(): (make_receipt(default_target, unrelated), 200),
+                (proof_root / "arxd-build-messages.jsonl").as_posix(): (links, 150),
+                (proof_root / "arxd-receipt.json").as_posix(): (make_receipt(default_target, unrelated, links), 200),
                 (default_target / "debug/arxd").as_posix(): (good_elf, 200),
             })
 
-        # Mismatched build_messages_sha256, mismatched HEAD, stale binary, and multiple candidates are refused.
+        # Mismatched digests, mismatched HEAD, stale binary, and multiple candidates are refused.
         for label, override_files, candidates, pattern in (
-            ("binding", {(proof_root / "arxd-receipt.json").as_posix(): (make_receipt(default_target, b"wrong"), 200),
-                         (default_target / "debug/arxd").as_posix(): (good_elf, 200)}, None, "artifact-receipt-binding"),
-            ("head", {(proof_root / "arxd-receipt.json").as_posix(): (make_receipt(default_target, msgs, head="b"*40), 200),
+            ("binding-build", {(proof_root / "arxd-receipt.json").as_posix(): (make_receipt(default_target, b"wrong", links), 200),
+                               (default_target / "debug/arxd").as_posix(): (good_elf, 200)}, None, "artifact-receipt-binding"),
+            ("binding-link", {(proof_root / "arxd-receipt.json").as_posix(): (make_receipt(default_target, msgs, b"wrong"), 200),
+                              (default_target / "debug/arxd").as_posix(): (good_elf, 200)}, None, "artifact-receipt-binding"),
+            ("head", {(proof_root / "arxd-receipt.json").as_posix(): (make_receipt(default_target, msgs, links, head="b"*40), 200),
                       (default_target / "debug/arxd").as_posix(): (good_elf, 200)}, None, "artifact-receipt-identity"),
             ("stale", {(default_target / "debug/arxd").as_posix(): (good_elf, 50)}, None, "stale-artifact"),
             ("multiple", {(default_target / "debug/arxd").as_posix(): (good_elf, 200)},
