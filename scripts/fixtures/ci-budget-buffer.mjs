@@ -1,7 +1,9 @@
 // Runs only synthetic IO. No gh executable, credentials, or network are used.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempDisposableSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { SourceTextModule, SyntheticModule, createContext } from 'node:vm';
 
 const scenario = process.argv[2];
@@ -74,9 +76,15 @@ function fakeExec(command, args, options) {
   // Only large reads in buffer scenarios need the subprocess transport.
   if (!probesBuffer || bytes <= 1024 * 1024) return payload;
   try {
-    // Exercise the real execFileSync byte bound, with synthetic JSON on stdin.
-    return execFileSync(process.execPath, ['-e', "process.stdout.write(require('node:fs').readFileSync(0))"], {
-      ...options, input: payload, stdio: ['pipe', 'pipe', 'pipe'],
+    // Use a finite input file so the child never waits for stdin EOF.
+    // Keep stdout piped to exercise the real execFileSync byte bound.
+    using directory = mkdtempDisposableSync(join(tmpdir(), 'arxcovo-ci-budget-'));
+    const file = join(directory.path, 'response.json');
+    writeFileSync(file, payload);
+    return execFileSync(process.execPath, [
+      '-e', "const {readFileSync, writeFileSync} = require('node:fs'); writeFileSync(1, readFileSync(process.argv[1]));", file,
+    ], {
+      ...options, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000,
     });
   } catch (error) {
     transportErrors.push(error.code);
