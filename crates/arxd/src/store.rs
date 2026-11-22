@@ -3,6 +3,8 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, sync::Mutex, time::Duration};
 
+pub(crate) mod vm;
+
 #[cfg(test)]
 mod account_choice_tests;
 #[cfg(all(test, windows))]
@@ -1118,7 +1120,7 @@ impl ListActivity {
         Ok(())
     }
 }
-fn validate_principal(s: &str) -> Result<()> {
+pub(crate) fn validate_principal(s: &str) -> Result<()> {
     if s.is_empty()
         || s.len() > 64
         || !s
