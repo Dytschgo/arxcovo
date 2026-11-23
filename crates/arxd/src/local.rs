@@ -136,11 +136,44 @@ fn verified_peer<S>(stream: S, identity_matches: Result<bool>) -> Option<S> {
 
 /// Exposed for the daemon and tests; construction reserves the endpoint exclusively.
 // None is a rejected/disconnected peer; Err is a listener failure.
-trait Acceptor {
+pub(crate) trait Acceptor {
     type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
     fn accept(&mut self) -> impl std::future::Future<Output = Result<Option<Self::Stream>>> + Send;
 }
 pub struct Listener(platform::Listener, Vec<crate::service::native::Observed>);
+impl Acceptor for Listener {
+    type Stream = <platform::Listener as Acceptor>::Stream;
+    fn accept(&mut self) -> impl std::future::Future<Output = Result<Option<Self::Stream>>> + Send {
+        self.0.accept()
+    }
+}
+
+/// A real listener whose next accept fails once `trip` is notified, to
+/// witness fatal listener handling through the actual local transport.
+#[cfg(test)]
+pub(crate) struct TripAcceptor {
+    inner: Listener,
+    trip: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl TripAcceptor {
+    pub(crate) fn new(inner: Listener, trip: Arc<tokio::sync::Notify>) -> Self {
+        Self { inner, trip }
+    }
+}
+
+#[cfg(test)]
+impl Acceptor for TripAcceptor {
+    type Stream = <Listener as Acceptor>::Stream;
+    async fn accept(&mut self) -> Result<Option<Self::Stream>> {
+        tokio::select! {
+            biased;
+            _ = self.trip.notified() => bail!("listener failed"),
+            stream = self.inner.accept() => stream,
+        }
+    }
+}
 impl Listener {
     pub fn bind(endpoint: &Endpoint) -> Result<Self> {
         endpoint.validate()?;
@@ -218,7 +251,7 @@ const VM_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// audit, and only then runs final recovery. An unresolved drain stage takes
 /// precedence over the initiating result as `server-drain-unconfirmed`.
 pub(crate) async fn serve_vm_profile(
-    listener: Listener,
+    listener: impl Acceptor + Send + 'static,
     config: Arc<crate::config::Config>,
     supervisor: Arc<crate::mcp::vm::Supervisor>,
     interrupt: impl std::future::Future<Output = Result<()>>,
@@ -283,13 +316,13 @@ pub(crate) async fn serve_vm_profile(
 }
 
 pub(crate) async fn run_vm_listener(
-    listener: Listener,
+    listener: impl Acceptor,
     config: Arc<crate::config::Config>,
     supervisor: Arc<crate::mcp::vm::Supervisor>,
     stop: crate::service::Shutdown,
 ) -> Result<()> {
     run_listener_with(
-        listener.0,
+        listener,
         config,
         None,
         stop,

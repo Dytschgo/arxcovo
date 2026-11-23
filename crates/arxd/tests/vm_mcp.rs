@@ -319,6 +319,16 @@ async fn foreground_profile_boundaries() {
         let state = root.join(label);
         std::fs::create_dir(&state).unwrap();
         let mut config = json!({"state_dir":state,"agents":agents,"local":{"address":address,"client_identity":owner}});
+        // The omitted profile keeps legacy selection, including HTTP.
+        let http = enabled.is_none().then(|| {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            config["listen"] = json!(format!("127.0.0.1:{port}"));
+            port
+        });
         if let Some(enabled) = enabled {
             config["test_vms"] = json!({"enabled":enabled,"recipes":recipes});
             config["local"]["client_identity"] = json!(client_identity);
@@ -347,6 +357,7 @@ async fn foreground_profile_boundaries() {
                 assert!(tools.tools.iter().all(|tool| !tool.name.starts_with("vm_")));
                 client.cancel().await.unwrap();
                 let _ = process.kill().await;
+                http_has_no_vm_routes(http.unwrap(), &token).await;
             }
             #[cfg(windows)]
             Some(enabled) => {
@@ -388,34 +399,28 @@ async fn foreground_profile_boundaries() {
             "candidate created non-state artifacts"
         );
     }
+}
 
-    let state = root.join("http");
-    std::fs::create_dir(&state).unwrap();
-    let config = std::sync::Arc::new(arxd::config::Config {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        state_dir: state.clone(),
-        agents: serde_json::from_value(agents).unwrap(),
-        ..Default::default()
-    });
-    let activity = std::sync::Arc::new(arxd::store::Activity::open(&state).unwrap());
-    let listener = arxd::http::bind(config.clone()).await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let router = arxd::http::router(config, address, activity);
-    let http = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+/// Probe the legacy binary's HTTP listener: unchanged tools, no VM routes.
+async fn http_has_no_vm_routes(port: u16, token: &str) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp"))
-            .auth_header(&token),
+        StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp"))
+            .auth_header(token),
     );
     let client = ().serve(transport).await.unwrap();
-    assert!(
-        client
-            .list_tools(None)
-            .await
-            .unwrap()
-            .tools
-            .iter()
-            .all(|tool| !tool.name.starts_with("vm_"))
-    );
+    let tools = client.list_tools(None).await.unwrap().tools;
+    assert!(tools.iter().any(|tool| tool.name == "list_activity"));
+    assert!(tools.iter().all(|tool| !tool.name.starts_with("vm_")));
     assert!(
         client
             .call_tool(CallToolRequestParams::new("vm_catalog"))
@@ -423,6 +428,4 @@ async fn foreground_profile_boundaries() {
             .is_err()
     );
     client.cancel().await.unwrap();
-    http.abort();
-    let _ = http.await;
 }

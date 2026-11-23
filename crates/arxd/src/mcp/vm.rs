@@ -185,6 +185,11 @@ pub(crate) struct Supervisor {
     runtime: Option<VmRuntimeProfile>,
     #[cfg(test)]
     ticks: Mutex<Option<tests::TestTicks>>,
+    /// Parks the next tool call before admission.
+    #[cfg(test)]
+    hold: Mutex<Option<tests::Hold>>,
+    #[cfg(test)]
+    closed_connections: std::sync::atomic::AtomicUsize,
 }
 
 impl Supervisor {
@@ -240,6 +245,10 @@ impl Supervisor {
             runtime,
             #[cfg(test)]
             ticks: Mutex::new(None),
+            #[cfg(test)]
+            hold: Mutex::new(None),
+            #[cfg(test)]
+            closed_connections: Default::default(),
         }))
     }
 
@@ -386,6 +395,11 @@ impl Drop for Connection {
     fn drop(&mut self) {
         let _gate = self.0.supervisor.gate.lock();
         self.0.closed.store(true, Ordering::Relaxed);
+        #[cfg(test)]
+        self.0
+            .supervisor
+            .closed_connections
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -554,6 +568,19 @@ impl ServerHandler for VmInventory {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        // Dropped after dispatch, or when the SDK drops this handler.
+        #[cfg(test)]
+        let hold = self
+            .supervisor
+            .hold
+            .lock()
+            .ok()
+            .and_then(|mut hold| hold.take());
+        #[cfg(test)]
+        if let Some(hold) = &hold {
+            hold.entered.notify_one();
+            hold.release.notified().await;
+        }
         let result = self.dispatch(request, || context.ct.is_cancelled());
         let (value, error) = match result {
             Ok(mut object) => {
@@ -1890,19 +1917,10 @@ mod tests {
 
     type Client = RunningService<RoleClient, ()>;
 
-    async fn client(endpoint: &Endpoint, token: &str) -> Client {
-        let stream = local::connect_vm_fixture(&endpoint.address, &endpoint.client_identity, token)
-            .await
-            .unwrap();
-        let (read, write) = split(stream);
-        ().serve(AsyncRwTransport::new_client(read, write))
-            .await
-            .unwrap()
-    }
-
     async fn call(client: &Client, name: &str, args: Value) -> Value {
         let result = client.call_tool(request(name, args)).await.unwrap();
         let row = result.structured_content.expect("one structured result");
+        assert!(result.content.is_empty());
         assert_eq!(result.is_error, Some(row["ok"] == false));
         row
     }
@@ -1928,23 +1946,216 @@ mod tests {
         .expect("operation did not settle")
     }
 
-    async fn raw_initialize<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
-        stream: T,
-    ) -> BufReader<T> {
-        let mut stream = BufReader::new(stream);
-        stream.get_mut().write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":0,\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}\n").await.unwrap();
-        let mut reply = String::new();
-        stream.read_line(&mut reply).await.unwrap();
-        assert!(
-            serde_json::from_str::<Value>(&reply).unwrap()["result"]["capabilities"]["tools"]
-                .is_object()
-        );
-        stream
-            .get_mut()
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+    /// Parks one tool call between SDK dispatch and admission. `done` fires
+    /// when the parked handler finishes or the SDK drops it.
+    pub(super) struct Hold {
+        pub(super) entered: Arc<Notify>,
+        pub(super) release: Arc<Notify>,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            if let Some(done) = self.done.take() {
+                let _ = done.send(());
+            }
+        }
+    }
+
+    type Raw = BufReader<Box<dyn Stream>>;
+    trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+    impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
+
+    async fn wire(raw: &mut Raw, value: Value) {
+        raw.get_mut()
+            .write_all(format!("{value}\n").as_bytes())
             .await
             .unwrap();
-        stream
+    }
+
+    async fn reply(raw: &mut Raw, id: u64) -> Value {
+        loop {
+            let mut line = String::new();
+            assert!(
+                raw.read_line(&mut line).await.unwrap() > 0,
+                "session closed"
+            );
+            let value: Value = serde_json::from_str(&line).unwrap();
+            if value["id"] == id {
+                return value;
+            }
+        }
+    }
+
+    struct Harness {
+        temp: tempfile::TempDir,
+        media: std::path::PathBuf,
+        now: Arc<AtomicI64>,
+        supervisor: Option<Arc<Supervisor>>,
+        endpoint: Endpoint,
+        tokens: [String; 2],
+        ticks: tokio::sync::mpsc::UnboundedSender<()>,
+        trip: Arc<Notify>,
+        interrupt: Option<tokio::sync::oneshot::Sender<()>>,
+        server: Option<JoinHandle<Result<()>>>,
+        hold_build: Arc<Notify>,
+        hold_script: Arc<Notify>,
+    }
+
+    impl Harness {
+        async fn start(fail_cancelled: bool) -> Self {
+            let temp = crate::service::application::tests::private_temp();
+            let media = temp.path().join("fixture-media");
+            fs::create_dir(&media).unwrap();
+            let now = Arc::new(AtomicI64::new(UTC));
+            let supervisor = Supervisor::new(
+                temp.path(),
+                VmPolicy::default(),
+                ForegroundClock {
+                    utc: Some(now.clone()),
+                },
+                Some(RECIPE),
+                NativeRefusal::QualificationMissing,
+                None,
+            )
+            .unwrap();
+            let hold_build = Arc::new(Notify::new());
+            let hold_script = Arc::new(Notify::new());
+            let mut fixture = Fixture::new(&media);
+            fixture.build_hold = Some(hold_build.clone());
+            fixture.script_hold = Some(hold_script.clone());
+            fixture.fail_cancelled = fail_cancelled;
+            supervisor.gate.lock().unwrap().fixture = Some(fixture);
+            let (ticks, receiver) = tokio::sync::mpsc::unbounded_channel();
+            *supervisor.ticks.lock().unwrap() = Some(TestTicks(receiver));
+            supervisor.startup_sweep().unwrap();
+            let endpoint = Endpoint {
+                #[cfg(unix)]
+                address: temp.path().join("vm.sock").to_str().unwrap().into(),
+                #[cfg(windows)]
+                address: format!(
+                    r"\\.\pipe\arxcovo-mcp-{}",
+                    hex::encode(crate::store::vm::new_id().unwrap())
+                ),
+                client_identity: local::vm_supervisor_identity().unwrap(),
+            };
+            let tokens = ["a".repeat(64), "b".repeat(64)];
+            let config = Arc::new(Config {
+                agents: ["alpha", "beta"]
+                    .into_iter()
+                    .zip(&tokens)
+                    .map(|(principal, token)| Agent {
+                        principal: principal.into(),
+                        token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
+                    })
+                    .collect(),
+                ..Config::default()
+            });
+            let trip = Arc::new(Notify::new());
+            let (interrupt, interrupted) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(local::serve_vm_profile(
+                local::TripAcceptor::new(Listener::bind(&endpoint).unwrap(), trip.clone()),
+                config,
+                supervisor.clone(),
+                async move {
+                    let _ = interrupted.await;
+                    Ok(())
+                },
+            ));
+            Self {
+                temp,
+                media,
+                now,
+                supervisor: Some(supervisor),
+                endpoint,
+                tokens,
+                ticks,
+                trip,
+                interrupt: Some(interrupt),
+                server: Some(server),
+                hold_build,
+                hold_script,
+            }
+        }
+
+        fn supervisor(&self) -> &Arc<Supervisor> {
+            self.supervisor.as_ref().unwrap()
+        }
+
+        async fn connect(&self, token: &str) -> Result<Box<dyn Stream>> {
+            let stream = local::connect_vm_fixture(
+                &self.endpoint.address,
+                &self.endpoint.client_identity,
+                token,
+            )
+            .await?;
+            Ok(Box::new(stream))
+        }
+
+        async fn client(&self, which: usize) -> Client {
+            let (read, write) = split(self.connect(&self.tokens[which]).await.unwrap());
+            ().serve(AsyncRwTransport::new_client(read, write))
+                .await
+                .unwrap()
+        }
+
+        async fn raw(&self) -> Raw {
+            let mut stream = BufReader::new(self.connect(&self.tokens[0]).await.unwrap());
+            wire(
+                &mut stream,
+                json!({"jsonrpc":"2.0","method":"initialize","id":0,"params":{
+                "protocolVersion":"2025-06-18","capabilities":{},
+                "clientInfo":{"name":"fixture","version":"1"}}}),
+            )
+            .await;
+            assert!(reply(&mut stream, 0).await["result"]["capabilities"]["tools"].is_object());
+            wire(
+                &mut stream,
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            )
+            .await;
+            stream
+        }
+
+        fn hold(&self) -> (Arc<Notify>, Arc<Notify>, tokio::sync::oneshot::Receiver<()>) {
+            let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+            let (done, finished) = tokio::sync::oneshot::channel();
+            *self.supervisor().hold.lock().unwrap() = Some(Hold {
+                entered: entered.clone(),
+                release: release.clone(),
+                done: Some(done),
+            });
+            (entered, release, finished)
+        }
+
+        /// Alpha's audit and receipt rows, read through the controller.
+        fn audit(&self) -> Vec<crate::vm::ActivityReceipt> {
+            self.supervisor()
+                .controller
+                .foreground_activity("alpha", None, None, 100)
+                .unwrap()
+        }
+
+        async fn tick(&self) {
+            self.ticks.send(()).unwrap();
+        }
+    }
+
+    /// Every file under the state root, including SQLite journal files.
+    fn state_bytes(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut files = vec![];
+        let mut directories = vec![root.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(entry.path());
+                } else if let Ok(bytes) = fs::read(entry.path()) {
+                    files.push((entry.path(), bytes));
+                }
+            }
+        }
+        files
     }
 
     #[tokio::test]
@@ -1955,59 +2166,9 @@ mod tests {
     }
 
     async fn journey() {
-        let temp = crate::service::application::tests::private_temp();
-        let media = temp.path().join("fixture-media");
-        fs::create_dir(&media).unwrap();
-        let now = Arc::new(AtomicI64::new(UTC));
-        let supervisor = Supervisor::new(
-            temp.path(),
-            VmPolicy::default(),
-            ForegroundClock {
-                utc: Some(now.clone()),
-            },
-            Some(RECIPE),
-            NativeRefusal::QualificationMissing,
-            None,
-        )
-        .unwrap();
-        let hold_build = Arc::new(Notify::new());
-        let hold_script = Arc::new(Notify::new());
-        let mut fixture = Fixture::new(&media);
-        fixture.build_hold = Some(hold_build.clone());
-        fixture.script_hold = Some(hold_script.clone());
-        supervisor.gate.lock().unwrap().fixture = Some(fixture);
-        let endpoint = Endpoint {
-            #[cfg(unix)]
-            address: temp.path().join("vm.sock").to_str().unwrap().into(),
-            #[cfg(windows)]
-            address: format!(
-                r"\\.\pipe\arxcovo-mcp-{}",
-                hex::encode(crate::store::vm::new_id().unwrap())
-            ),
-            client_identity: local::vm_supervisor_identity().unwrap(),
-        };
-        let token_a = "a".repeat(64);
-        let token_b = "b".repeat(64);
-        let config = Arc::new(Config {
-            agents: [("alpha", &token_a), ("beta", &token_b)]
-                .into_iter()
-                .map(|(principal, token)| Agent {
-                    principal: principal.into(),
-                    token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
-                })
-                .collect(),
-            ..Config::default()
-        });
-        let listener = Listener::bind(&endpoint).unwrap();
-        let stop = Shutdown::default();
-        let server = tokio::spawn(local::run_vm_listener(
-            listener,
-            config,
-            supervisor.clone(),
-            stop.clone(),
-        ));
-        let a = client(&endpoint, &token_a).await;
-        let b = client(&endpoint, &token_b).await;
+        let mut h = Harness::start(false).await;
+        let a = h.client(0).await;
+        let b = h.client(1).await;
         let tools = a.list_tools(None).await.unwrap();
         let names = tools
             .tools
@@ -2015,6 +2176,11 @@ mod tests {
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
         assert_eq!(names, ToolName::ALL.map(ToolName::name));
+        assert!(
+            tools.tools.iter().all(|tool| {
+                tool.input_schema.get("additionalProperties") == Some(&json!(false))
+            })
+        );
         for name in ["run_command", "discover_tools"] {
             assert_eq!(
                 call(&a, name, json!({})).await,
@@ -2022,34 +2188,66 @@ mod tests {
             );
         }
         assert_eq!(
-            call(&a, "list_hosts", json!({})).await["hosts"][0]["execution"]["available"],
-            false
+            call(&a, "no_such_tool", json!({})).await,
+            json!({"ok":false,"reason":"unknown_tool"})
         );
-        let rejected = local::connect_vm_fixture(
-            &endpoint.address,
-            &endpoint.client_identity,
-            &"c".repeat(64),
-        )
-        .await;
+        assert_eq!(
+            call(&a, "list_hosts", json!({})).await["hosts"][0]["execution"],
+            json!({"available":false,"reason":"host_execution_disabled"})
+        );
+        let rejected = h.connect(&"c".repeat(64)).await;
         assert_eq!(rejected.err().unwrap().to_string(), "peer-auth-rejected");
         #[cfg(windows)]
         let wrong = String::from("S-1-5-18");
         #[cfg(unix)]
         let wrong = (unsafe { libc::geteuid() } ^ 1).to_string();
-        let rejected = local::connect_vm_fixture(&endpoint.address, &wrong, &token_a).await;
+        let rejected = local::connect_vm_fixture(&h.endpoint.address, &wrong, &h.tokens[0]).await;
         assert_eq!(
             rejected.err().unwrap().to_string(),
             "peer-connect-or-identity"
         );
 
         let recipe = hex::encode(RECIPE.0);
-        let first = call(&a, "vm_catalog", json!({})).await;
-        assert_eq!(
-            first["entries"],
-            json!([{"recipe_id":recipe,"guest":"ubuntu","state":"buildable"}])
-        );
         let build_args = json!({"recipe_id":recipe,"request_id":key(1)});
-        let closed = supervisor.connection("alpha".into());
+        let call_build = |id: u64| {
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"vm_template_build","arguments":build_args}})
+        };
+
+        // MCP cancellation through the SDK before admission opens no work
+        // and leaves the session usable.
+        let mut raw = h.raw().await;
+        let (entered, release, done) = h.hold();
+        wire(&mut raw, call_build(7)).await;
+        entered.notified().await;
+        wire(
+            &mut raw,
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":7,"reason":"fixture"}}),
+        )
+        .await;
+        wire(&mut raw, json!({"jsonrpc":"2.0","id":8,"method":"ping"})).await;
+        assert!(reply(&mut raw, 8).await["result"].is_object());
+        release.notify_one();
+        done.await.unwrap();
+        // EOF while a call waits for admission closes that connection's path.
+        let (entered, release, done) = h.hold();
+        let closed = h.supervisor().closed_connections.load(Ordering::Relaxed);
+        wire(&mut raw, call_build(9)).await;
+        entered.notified().await;
+        drop(raw);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while h.supervisor().closed_connections.load(Ordering::Relaxed) == closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release.notify_one();
+        done.await.unwrap();
+        assert!(h.audit().is_empty(), "cancelled calls opened work");
+        // Direct detached handlers obey the same closed flags.
+        let closed = h.supervisor().connection("alpha".into());
         let detached = closed.inventory();
         drop(closed);
         assert_eq!(
@@ -2059,113 +2257,161 @@ mod tests {
                 .0,
             "shutdown"
         );
-        let active = supervisor.connection("alpha".into());
-        assert_eq!(
-            active
-                .inventory()
-                .dispatch(request("vm_template_build", build_args.clone()), || true)
-                .unwrap_err()
-                .0,
-            "shutdown"
-        );
-        assert_eq!(
-            call(&a, "list_activity", json!({})).await["activities"],
-            json!([])
-        );
+        let active = h.supervisor().connection("alpha".into());
 
+        let first = call(&a, "vm_catalog", json!({})).await;
+        assert_eq!(
+            first,
+            json!({"ok":true,"arch":"x86_64","capability":{"available":true},
+                "entries":[{"recipe_id":recipe,"guest":"ubuntu","state":"buildable"}]})
+        );
         let build = call(&a, "vm_template_build", build_args.clone()).await;
         let pending = call(&a, "vm_catalog", json!({"limit":1})).await;
-        let cursor = pending["next_cursor"].as_str().unwrap();
+        let cursor = pending["next_cursor"].as_str().unwrap().to_owned();
         let second = call(&a, "vm_catalog", json!({"cursor":cursor})).await;
         assert_eq!(
             second["entries"],
             json!([{"operation_id":build["operation_id"],"recipe_id":recipe,"state":"building"}])
         );
+        assert!(second.get("next_cursor").is_none());
         assert_eq!(
             call(&b, "vm_catalog", json!({})).await["entries"],
             first["entries"]
         );
-        let mut altered = cursor.to_string();
+        let mut altered = cursor.clone();
         altered.replace_range(0..1, "Z");
         for (peer, tool, item) in [
-            (&b, "vm_catalog", cursor),
-            (&a, "vm_list", cursor),
+            (&b, "vm_catalog", cursor.as_str()),
+            (&a, "vm_list", cursor.as_str()),
             (&a, "vm_catalog", altered.as_str()),
         ] {
             assert_eq!(
-                call(peer, tool, json!({"cursor":item})).await["reason"],
-                "invalid_cursor"
+                call(peer, tool, json!({"cursor":item})).await,
+                json!({"ok":false,"reason":"invalid_cursor"})
             );
         }
         let operation = json!({"operation_id":build["operation_id"]});
         assert_eq!(
-            call(&b, "vm_operation", operation.clone()).await["reason"],
-            "not_found"
+            call(&b, "vm_operation", operation.clone()).await,
+            json!({"ok":false,"reason":"not_found"})
         );
         assert_eq!(
-            call(&a, "vm_operation", operation).await["stage"],
-            "staging"
+            call(&a, "vm_operation", operation).await,
+            json!({"ok":true,"operation_id":build["operation_id"],"action":"template_build",
+                "state":"pending","stage":"staging","recipe_id":recipe})
         );
-        hold_build.notify_one();
-        let template = terminal(&a, &build).await["template_id"].clone();
-        assert!(template.is_string());
-        let reused = call(&b, "vm_template_build", build_args).await;
+        h.hold_build.notify_one();
+        let built = terminal(&a, &build).await;
+        let template = built["template_id"].clone();
+        assert_eq!(
+            built,
+            json!({"ok":true,"operation_id":build["operation_id"],"action":"template_build",
+                "state":"succeeded","cleanup":"confirmed","recipe_id":recipe,"template_id":template})
+        );
+        let reused = call(&b, "vm_template_build", build_args.clone()).await;
         assert_ne!(reused["operation_id"], build["operation_id"]);
         assert_eq!(terminal(&b, &reused).await["template_id"], template);
 
+        // Scope and subject state precede native or fixture eligibility.
+        assert_eq!(
+            call(
+                &a,
+                "vm_create",
+                json!({"template_id":"0".repeat(32),"request_id":key(20)})
+            )
+            .await,
+            json!({"ok":false,"reason":"not_found"})
+        );
         let create = json!({"template_id":template,"request_id":key(2),"ttl_s":60});
         let clone = call(&a, "vm_create", create.clone()).await;
         let clone_result = terminal(&a, &clone).await;
-        assert_eq!(clone_result["state"], "succeeded", "{clone_result}");
         let vm = clone_result["vm_id"].clone();
-        let clone_again = call(&a, "vm_create", create).await;
-        assert_eq!(clone, clone_again);
+        assert_eq!(
+            clone_result,
+            json!({"ok":true,"operation_id":clone["operation_id"],"action":"create",
+                "state":"succeeded","cleanup":"confirmed","vm_id":vm,"template_id":template})
+        );
+        assert_eq!(call(&a, "vm_create", create).await, clone);
         assert_eq!(
             call(
                 &a,
                 "vm_create",
                 json!({"template_id":template,"request_id":key(2),"ttl_s":61})
             )
-            .await["reason"],
-            "key_collision"
+            .await,
+            json!({"ok":false,"reason":"key_collision"})
         );
+        let other = call(
+            &a,
+            "vm_create",
+            json!({"template_id":template,"request_id":key(21)}),
+        )
+        .await;
+        let other_vm = terminal(&a, &other).await["vm_id"].clone();
         let get = json!({"vm_id":vm});
-        assert_eq!(call(&a, "vm_get", get.clone()).await["state"], "stopped");
         assert_eq!(
-            call(&a, "vm_list", json!({})).await["entries"][0]["vm_id"],
-            vm
+            call(&a, "vm_get", get.clone()).await,
+            json!({"ok":true,"vm_id":vm,"template_id":template,"guest":"ubuntu",
+                "state":"stopped","ready":false,"expires_at_ms":UTC+60_000,"snapshots":[]})
+        );
+        // Two caller-owned VMs page with a principal- and tool-bound cursor.
+        let page = call(&a, "vm_list", json!({"limit":1})).await;
+        let list_cursor = page["next_cursor"].as_str().unwrap().to_owned();
+        let rest = call(&a, "vm_list", json!({"cursor":list_cursor})).await;
+        let mut seen = [
+            page["entries"][0]["vm_id"].clone(),
+            rest["entries"][0]["vm_id"].clone(),
+        ];
+        seen.sort_by_key(|id| id.to_string());
+        let mut expected = [vm.clone(), other_vm.clone()];
+        expected.sort_by_key(|id| id.to_string());
+        assert_eq!(seen, expected);
+        assert!(rest.get("next_cursor").is_none());
+        assert_eq!(
+            call(&b, "vm_list", json!({"cursor":list_cursor})).await["reason"],
+            "invalid_cursor"
         );
         assert_eq!(call(&b, "vm_get", get.clone()).await["reason"], "not_found");
         assert_eq!(call(&b, "vm_list", json!({})).await["entries"], json!([]));
-        assert_eq!(
-            call(&b, "vm_stop", json!({"vm_id":vm,"request_id":key(3)})).await["reason"],
-            "not_found"
-        );
+        for (tool, args) in [
+            ("vm_stop", json!({"vm_id":vm,"request_id":key(3)})),
+            ("vm_start", json!({"vm_id":vm,"request_id":key(3)})),
+            (
+                "vm_extend",
+                json!({"vm_id":vm,"request_id":key(3),"ttl_s":60}),
+            ),
+        ] {
+            assert_eq!(
+                call(&b, tool, args).await,
+                json!({"ok":false,"reason":"not_found"})
+            );
+        }
         assert_eq!(
             call(
                 &a,
                 "vm_run_script",
                 json!({"vm_id":vm,"request_id":key(3),"script":"exit 0"})
             )
-            .await["reason"],
-            "not_ready"
+            .await,
+            json!({"ok":false,"reason":"not_ready"})
         );
         let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(4)})).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal(&a, &start).await,
+            json!({"ok":true,"operation_id":start["operation_id"],"action":"start",
+                "state":"succeeded","cleanup":"confirmed","vm_id":vm})
+        );
         assert_eq!(call(&a, "vm_get", get.clone()).await["ready"], true);
 
-        let raw = local::connect_vm_fixture(&endpoint.address, &endpoint.client_identity, &token_a)
-            .await
-            .unwrap();
-        let mut raw = raw_initialize(raw).await;
+        // A committed script survives the caller's lost reply and disconnect.
+        let mut raw = h.raw().await;
         let script_args = json!({"vm_id":vm,"request_id":key(5),"script":"exit 7"});
-        let wire = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vm_run_script","arguments":script_args}});
-        raw.get_mut()
-            .write_all(format!("{wire}\n").as_bytes())
-            .await
-            .unwrap();
-        // Await durable admission through a separate session. Discard the raw
-        // caller's reply and disconnect while the admitted worker is held.
+        wire(
+            &mut raw,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"vm_run_script","arguments":script_args}}),
+        )
+        .await;
         let pending = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let row =
@@ -2173,11 +2419,14 @@ mod tests {
                 if row["action"] == "run_script" && row["state"] == "pending" {
                     break row;
                 }
+                tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
         drop(raw);
+        // The channel stays healthy while its one exchange slot is held.
+        assert_eq!(call(&a, "vm_get", get.clone()).await["ready"], true);
         let script = call(
             &a,
             "vm_run_script",
@@ -2185,37 +2434,81 @@ mod tests {
         )
         .await;
         assert_eq!(script["operation_id"], pending["operation_id"]);
+        let audit = h.audit().len();
         for args in [
-            json!({"vm_id":vm,"request_id":key(5),"script":null}),
-            json!({"vm_id":vm,"request_id":key(5),"script":"\0"}),
-            json!({"vm_id":vm,"request_id":key(5),"script":"é".repeat(2049)}),
-            json!({"vm_id":vm,"request_id":key(5),"script":"exit 0","timeout_s":1.5}),
-            json!({"vm_id":vm,"request_id":key(5),"script":"exit 0","timeout_s":"30"}),
-            json!({"vm_id":"F".repeat(32),"request_id":key(5),"script":"exit 0"}),
-            json!({"vm_id":vm,"request_id":key(5),"script":"exit 0","interpreter":"sh"}),
+            json!({"vm_id":vm,"request_id":key(6),"script":null}),
+            json!({"vm_id":vm,"request_id":key(6),"script":"\0"}),
+            json!({"vm_id":vm,"request_id":key(6),"script":"é".repeat(2049)}),
+            json!({"vm_id":vm,"request_id":key(6),"script":"exit 0","timeout_s":1.5}),
+            json!({"vm_id":vm,"request_id":key(6),"script":"exit 0","timeout_s":"30"}),
+            json!({"vm_id":vm,"request_id":key(6),"script":"exit 0","timeout_s":121}),
+            json!({"vm_id":vm,"request_id":key(6).to_uppercase(),"script":"exit 0"}),
+            json!({"vm_id":"F".repeat(32),"request_id":key(6),"script":"exit 0"}),
+            json!({"vm_id":vm,"request_id":key(6),"script":"exit 0","interpreter":"sh"}),
         ] {
-            assert_eq!(call(&a, "vm_run_script", args).await["reason"], "invalid");
+            assert_eq!(
+                call(&a, "vm_run_script", args).await,
+                json!({"ok":false,"reason":"invalid"})
+            );
         }
-        hold_script.notify_one();
+        // Trusted invalid calls are audited once each, correlated only to
+        // the caller-owned VM; the foreign-shaped ID stays uncorrelated.
+        let rows = h.audit();
+        assert_eq!(rows.len(), audit + 8, "one refusal per correlatable call");
+        assert!(rows[..8].iter().all(|row| {
+            row.state == 4 && row.reason == Some(Refusal::Invalid as i64) && row.vm.is_some()
+        }));
+        // A trusted call with non-object arguments is refused, not dropped;
+        // a read refusal spends no audit row.
+        let mut raw = h.raw().await;
+        for (id, name, arguments) in [
+            (2, "vm_template_build", Value::Null),
+            (3, "vm_list", json!("x")),
+            (4, "vm_list", json!([])),
+        ] {
+            wire(
+                &mut raw,
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":name,"arguments":arguments}}),
+            )
+            .await;
+            let result = reply(&mut raw, id).await["result"].clone();
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["structuredContent"],
+                json!({"ok":false,"reason":"invalid"})
+            );
+        }
+        drop(raw);
+        let rows = h.audit();
+        assert_eq!(rows.len(), audit + 9);
+        assert_eq!(
+            (rows[0].action, rows[0].state, rows[0].reason, rows[0].vm),
+            (BUILD_ACTION, 4, Some(Refusal::Invalid as i64), None)
+        );
+
+        h.hold_script.notify_one();
         let done = terminal(&a, &script).await;
         assert_eq!(
-            (
-                done["state"].as_str(),
-                done["script_status"].as_str(),
-                done["exit_code"].as_u64()
-            ),
-            (Some("failed"), Some("exited"), Some(7))
+            done,
+            json!({"ok":true,"operation_id":script["operation_id"],"action":"run_script",
+                "state":"failed","cleanup":"confirmed","vm_id":vm,"script_status":"exited",
+                "exit_code":7})
         );
-        let stop_vm = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(6)})).await;
-        assert_eq!(terminal(&a, &stop_vm).await["state"], "succeeded");
+        let stop_vm = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(7)})).await;
         assert_eq!(
-            call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(7)})).await["reason"],
-            "busy"
+            terminal(&a, &stop_vm).await,
+            json!({"ok":true,"operation_id":stop_vm["operation_id"],"action":"stop",
+                "state":"succeeded","cleanup":"confirmed","vm_id":vm})
+        );
+        assert_eq!(
+            call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(8)})).await,
+            json!({"ok":false,"reason":"busy"})
         );
         let extend = call(
             &a,
             "vm_extend",
-            json!({"vm_id":vm,"request_id":key(8),"ttl_s":120}),
+            json!({"vm_id":vm,"request_id":key(9),"ttl_s":120}),
         )
         .await;
         assert_eq!(extend["expires_at_ms"], UTC + 120_000);
@@ -2223,23 +2516,46 @@ mod tests {
             call(
                 &a,
                 "vm_extend",
-                json!({"vm_id":vm,"request_id":key(8),"ttl_s":180})
+                json!({"vm_id":vm,"request_id":key(9),"ttl_s":180})
             )
             .await,
             extend
         );
-        now.store(UTC + 120_000, Ordering::Relaxed);
-        assert_eq!(call(&a, "vm_get", get.clone()).await["state"], "teardown");
-        supervisor.sweep().unwrap();
         assert_eq!(
-            call(&a, "vm_get", get.clone()).await,
-            json!({
-                "ok":true,"vm_id":vm,"state":"expired","ready":false,"expired_at_ms":UTC+120_000,"cleanup":"confirmed","snapshots":[]
-            })
+            call(
+                &a,
+                "vm_operation",
+                json!({"operation_id":extend["operation_id"]})
+            )
+            .await,
+            json!({"ok":true,"operation_id":extend["operation_id"],"action":"extend",
+                "state":"succeeded","vm_id":vm,"expires_at_ms":UTC+120_000})
         );
-        assert_eq!(call(&b, "vm_get", get).await["reason"], "not_found");
-        assert_eq!(call(&a, "vm_list", json!({})).await["entries"], json!([]));
-        assert_eq!(fs::read_dir(&media).unwrap().count(), 2);
+
+        // Expiry through the supervised reaper runner on an injected tick.
+        h.now.store(UTC + 120_000, Ordering::Relaxed);
+        assert_eq!(call(&a, "vm_get", get.clone()).await["state"], "teardown");
+        h.tick().await;
+        let tombstone = json!({"ok":true,"vm_id":vm,"state":"expired","ready":false,
+            "expired_at_ms":UTC+120_000,"cleanup":"confirmed","snapshots":[]});
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while call(&a, "vm_get", get.clone()).await != tombstone {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(call(&b, "vm_get", get.clone()).await["reason"], "not_found");
+        assert_eq!(
+            call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(10)})).await,
+            json!({"ok":false,"reason":"expired"})
+        );
+        let listed = call(&a, "vm_list", json!({})).await["entries"].clone();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["vm_id"], other_vm);
+        // The golden pair and the live clone remain; the expired pair is gone.
+        assert_eq!(fs::read_dir(&h.media).unwrap().count(), 4);
+
         let activity = call(
             &a,
             "list_activity",
@@ -2258,63 +2574,151 @@ mod tests {
             call(&b, "list_activity", json!({"activity_id":own})).await["activities"],
             json!([])
         );
+        let files = state_bytes(h.temp.path());
+        assert!(
+            files
+                .iter()
+                .any(|(path, _)| path.ends_with("activity.sqlite3"))
+        );
         for sentinel in [
             "exit 7",
             "exit 0",
-            &token_a,
-            &token_b,
-            media.to_str().unwrap(),
+            h.tokens[0].as_str(),
+            h.tokens[1].as_str(),
+            h.media.to_str().unwrap(),
         ] {
             assert!(!activity.to_string().contains(sentinel));
-            let db = fs::read(temp.path().join("activity.sqlite3")).unwrap();
-            assert!(
-                !db.windows(sentinel.len())
-                    .any(|bytes| bytes == sentinel.as_bytes())
-            );
+            for (path, bytes) in &files {
+                assert!(
+                    !bytes
+                        .windows(sentinel.len())
+                        .any(|window| window == sentinel.as_bytes()),
+                    "sentinel in {}",
+                    path.display()
+                );
+            }
         }
 
-        frame_cases(&endpoint, &token_a).await;
-        // A detached SDK handler can still hold the inventory after the
-        // listener leaves, but neither admission nor a refusal write survives.
-        supervisor.close();
-        stop.cancel();
-        server.await.unwrap().unwrap();
-        supervisor
-            .drain_workers(Duration::from_secs(5))
-            .await
-            .unwrap();
-        supervisor.recover(Duration::from_secs(5)).await.unwrap();
+        let audit = h.audit().len();
+        frame_cases(&h).await;
+        assert_eq!(h.audit().len(), audit, "untrusted frames were audited");
+
+        // Ctrl+C equivalent: drain, join and recover, then refuse detached work.
+        h.interrupt.take().unwrap().send(()).unwrap();
+        h.server.take().unwrap().await.unwrap().unwrap();
         assert_eq!(
             active
                 .inventory()
-                .dispatch(request("vm_template_build", json!({})), || false)
+                .dispatch(request("vm_template_build", build_args.clone()), || false)
                 .unwrap_err()
                 .0,
             "shutdown"
         );
+        drop((a, b, active, detached));
+
+        // A restart keeps durable receipts but invalidates old cursors.
+        h.supervisor = None;
+        let reopened = Supervisor::new(
+            h.temp.path(),
+            VmPolicy::default(),
+            ForegroundClock {
+                utc: Some(h.now.clone()),
+            },
+            Some(RECIPE),
+            NativeRefusal::QualificationMissing,
+            None,
+        )
+        .unwrap();
+        let connection = reopened.connection("alpha".into());
+        let inventory = connection.inventory();
+        assert_eq!(
+            inventory
+                .dispatch(request("vm_list", json!({"cursor":list_cursor})), || false)
+                .unwrap_err()
+                .0,
+            "invalid_cursor"
+        );
+        assert_eq!(
+            inventory
+                .dispatch(
+                    request(
+                        "vm_operation",
+                        json!({"operation_id":build["operation_id"]})
+                    ),
+                    || false
+                )
+                .unwrap()["template_id"],
+            template
+        );
     }
 
-    async fn frame_cases(endpoint: &Endpoint, token: &str) {
+    async fn frame_cases(h: &Harness) {
         const PREFIX: &[u8] = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":1,\"params\":{\"name\":\"vm_list\",\"arguments\":{}}}";
         for (frame, valid) in [
             ([PREFIX, &vec![b' '; local::FRAME_LIMIT - PREFIX.len() - 1], b"\n"].concat(), true),
             ([PREFIX, &vec![b' '; local::FRAME_LIMIT - PREFIX.len()], b"\n"].concat(), false),
             (b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":1,\"params\":{\"name\":\"vm_list\",\"arguments\":{\"limit\":1,\"l\\u0069mit\":2}}}\n".to_vec(), false),
+            (b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":1,\"params\":{\"name\":\"vm_template_build\",\"arguments\":null},\"params\":{}}\n".to_vec(), false),
             ([b"{\"text\":\"".as_slice(), &[255], b"\"}\n"].concat(), false),
             ([vec![b'['; 17], vec![b']'; 17], vec![b'\n']].concat(), false),
             ([PREFIX, b" {}\n"].concat(), false),
         ] {
-            let raw = local::connect_vm_fixture(&endpoint.address, &endpoint.client_identity, token).await.unwrap();
-            let mut raw = raw_initialize(raw).await;
+            let mut raw = h.raw().await;
             let _ = raw.get_mut().write_all(&frame).await;
-            let mut reply = String::new();
-            let read = raw.read_line(&mut reply).await;
+            let mut line = String::new();
+            let read = raw.read_line(&mut line).await;
             if valid {
                 assert!(read.unwrap() > 0);
-                assert_eq!(serde_json::from_str::<Value>(&reply).unwrap()["result"]["structuredContent"]["ok"], true);
+                assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["result"]["structuredContent"]["ok"], true);
             } else {
                 assert!(matches!(read, Ok(0) | Err(_)), "rejected frame had a reply");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn fatal_listener_failure_drains_and_drain_failure_takes_precedence() {
+        for (fail_cancelled, category) in [
+            (false, "server-listener"),
+            (true, "server-drain-unconfirmed"),
+        ] {
+            let mut h = Harness::start(fail_cancelled).await;
+            let a = h.client(0).await;
+            let build = call(
+                &a,
+                "vm_template_build",
+                json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(1)}),
+            )
+            .await;
+            assert_eq!(build["ok"], true, "{build}");
+            // The outstanding worker is held when the listener fails.
+            h.trip.notify_one();
+            let result = h.server.take().unwrap().await.unwrap();
+            assert_eq!(result.unwrap_err().to_string(), category);
+            let operation =
+                Id::try_from(hex::decode(build["operation_id"].as_str().unwrap()).unwrap())
+                    .unwrap();
+            let status = h
+                .supervisor()
+                .controller
+                .operation_status("alpha", operation)
+                .unwrap()
+                .unwrap();
+            // A build cancelled before it touched storage settles as failed
+            // with confirmed cleanup (4c2a `cancel_untouched_build`).
+            assert_eq!(
+                (status.state, status.cleanup),
+                (Status::Failed, Some("confirmed"))
+            );
+            assert!(call_after_close(&a).await, "admission survived the failure");
+        }
+    }
+
+    /// After teardown the client's session is gone or refuses fresh work.
+    async fn call_after_close(client: &Client) -> bool {
+        match client.call_tool(request("vm_catalog", json!({}))).await {
+            Err(_) => true,
+            Ok(result) => result.structured_content.unwrap()["reason"] == "shutdown",
         }
     }
 }
