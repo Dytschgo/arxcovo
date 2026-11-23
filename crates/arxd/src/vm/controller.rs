@@ -1985,6 +1985,25 @@ impl<C: Clock> VmController<C> {
         })
     }
 
+    /// Commits `published` and the successful receipt in one transaction,
+    /// only while `authorized` holds inside it and the intent is still
+    /// `publishing`. Returns `false`, with no change, otherwise.
+    pub(crate) fn commit_publication(
+        &self,
+        operation: OperationRef,
+        nonce: &str,
+        authorized: impl FnOnce() -> bool,
+    ) -> Result<bool> {
+        let now = utc(self.clock.now())?;
+        self.store.transact(|db| {
+            if !authorized() || !store::publish::commit(db, nonce)? {
+                return Ok(false);
+            }
+            store::publish::finish(db, operation.receipt.activity_id, now, None, None)?;
+            Ok(true)
+        })
+    }
+
     pub(crate) fn finish_publication(
         &self,
         operation: OperationRef,

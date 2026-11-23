@@ -694,8 +694,41 @@ mod vm {
             }
         }
 
-        /// Test-only ownership witness. Production requires TokenUser on every held object,
-        /// so a hosted failure here names ownership instead of a closed custody error.
+        /// (owner equals TokenUser, DACL is protected), read from an opened handle.
+        fn custody_of(path: &Path) -> (bool, bool) {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .unwrap();
+            let user = token_info(TokenUser);
+            unsafe {
+                let (mut owner, mut dacl, mut descriptor) = (null_mut(), null_mut(), null_mut());
+                assert_eq!(
+                    GetSecurityInfo(
+                        file.as_raw_handle(),
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                        &mut owner,
+                        null_mut(),
+                        &mut dacl,
+                        null_mut(),
+                        &mut descriptor,
+                    ),
+                    0
+                );
+                let owner_is_user = !owner.is_null() && EqualSid(owner, user_sid(&user)) != 0;
+                let (mut control, mut revision) = (0, 0);
+                let protected = !dacl.is_null()
+                    && GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
+                    && control & SE_DACL_PROTECTED != 0;
+                LocalFree(descriptor);
+                (owner_is_user, protected)
+            }
+        }
+
+        /// Test-only custody witness. Production requires TokenUser on the held parent and
+        /// leaf, so a hosted failure here names ownership instead of a closed custody error.
         fn assert_owned(label: &str, path: &Path) {
             let (user, admins) = owner_of(path);
             assert!(
@@ -704,34 +737,35 @@ mod vm {
             );
         }
 
-        fn set_owner_to_user(path: &Path) {
-            let user = token_info(TokenUser);
-            let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            let status = unsafe {
-                SetNamedSecurityInfoW(
-                    wide.as_ptr(),
-                    SE_FILE_OBJECT,
-                    OWNER_SECURITY_INFORMATION,
-                    user_sid(&user),
-                    null_mut(),
-                    null_mut(),
-                    null_mut(),
-                )
-            };
-            assert_eq!(status, 0);
+        fn assert_secured(label: &str, path: &Path) {
+            assert_owned(label, path);
+            assert!(
+                custody_of(path).1,
+                "{label}: fixture DACL must be protected"
+            );
+            assert!(
+                crate::security::private(path).is_ok(),
+                "{label}: fixture DACL must pass the private-DACL predicate"
+            );
         }
 
-        fn protect_fixture(root: &Path) {
-            // Protect the fixture if hosted CI uses shared scratch.
+        /// A protected TokenUser-only DACL, then TokenUser as owner, independent of the
+        /// creating token's default owner (Administrators on an elevated hosted runner).
+        /// The DACL comes first: the current owner may always write it, and it grants the
+        /// WRITE_OWNER right the owner change needs.
+        fn secure(path: &Path) {
+            let directory = fs::symlink_metadata(path).unwrap().is_dir();
             unsafe {
                 let user = token_info(TokenUser);
                 let sid = user_sid(&user);
                 let mut sid_text = null_mut();
                 assert_ne!(ConvertSidToStringSidW(sid, &mut sid_text), 0);
                 let length = (0..184).find(|&i| *sid_text.add(i) == 0).unwrap();
-                let sid = String::from_utf16(std::slice::from_raw_parts(sid_text, length)).unwrap();
+                let sid_string =
+                    String::from_utf16(std::slice::from_raw_parts(sid_text, length)).unwrap();
                 LocalFree(sid_text.cast());
-                let sddl: Vec<_> = format!("D:P(A;OICI;FA;;;{sid})")
+                let inherit = if directory { "OICI" } else { "" };
+                let sddl: Vec<_> = format!("D:P(A;{inherit};FA;;;{sid_string})")
                     .encode_utf16()
                     .chain(Some(0))
                     .collect();
@@ -750,9 +784,9 @@ mod vm {
                     GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted),
                     0
                 );
-                let path: Vec<_> = root.as_os_str().encode_wide().chain(Some(0)).collect();
-                let result = SetNamedSecurityInfoW(
-                    path.as_ptr(),
+                let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+                let dacl = SetNamedSecurityInfoW(
+                    wide.as_ptr(),
                     SE_FILE_OBJECT,
                     DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                     null_mut(),
@@ -761,7 +795,26 @@ mod vm {
                     null_mut(),
                 );
                 LocalFree(descriptor);
-                assert_eq!(result, 0);
+                assert_eq!(dacl, 0, "protect DACL {}", path.display());
+                let owner = SetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    sid,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                );
+                assert_eq!(owner, 0, "set owner {}", path.display());
+            }
+        }
+
+        /// Secures and verifies every object the fixture created directly under `root`.
+        fn secure_children(root: &Path) {
+            for entry in fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                secure(&path);
+                assert_secured(&path.display().to_string(), &path);
             }
         }
 
@@ -872,13 +925,15 @@ mod vm {
             }
         }
 
-        /// The previous DACL-only setup under the creating token's default owner. Where that
-        /// owner differs from TokenUser, as on an elevated hosted runner, this is the red leg:
-        /// the DACL passes, the owner differs and the real loader refuses. Assigning the same
-        /// leaf to TokenUser is the green leg with unchanged path, bytes and DACL.
+        /// The probe root gets TokenUser and a protected DACL first, because the loader checks
+        /// the held parent's owner as well as the leaf's. The leaf keeps the creating token's
+        /// default owner. Where that differs from TokenUser, as on an elevated hosted runner,
+        /// this is the red leg: the DACL passes, the leaf owner differs and the real loader
+        /// refuses. Securing the same leaf is the green leg with unchanged path and bytes.
         fn ownership_probe(root: &Path) {
             let tunnel = TunnelId::parse(TUNNEL).unwrap();
-            protect_fixture(root);
+            secure(root);
+            assert_secured("probe root", root);
             let leaf = root.join("credential.json");
             fs::write(&leaf, encrypt_fixture(credential_json())).unwrap();
             let token_owner_is_user = token_owner_is_user();
@@ -886,24 +941,26 @@ mod vm {
             let private = crate::security::private(&leaf).is_ok();
             let first = TunnelCredential::load(&leaf, ZONE, &tunnel).map(drop);
             eprintln!(
-                "connector ownership probe: token_owner_is_user={token_owner_is_user} leaf_owner_is_user={owner_is_user} leaf_owner_is_builtin_admins={owner_is_admins} private_dacl={private} load={first:?}"
+                "connector ownership probe: token_owner_is_user={token_owner_is_user} root_owner_is_user={} leaf_owner_is_user={owner_is_user} leaf_owner_is_builtin_admins={owner_is_admins} private_dacl={private} load={first:?}",
+                owner_of(root).0
             );
             assert!(private, "fixture DACL must pass the private-DACL predicate");
             assert_eq!(owner_is_user, token_owner_is_user);
             if owner_is_user {
                 assert_eq!(first, Ok(()));
                 eprintln!("connector ownership probe: red leg not applicable on this token");
-                return;
+            } else {
+                assert_eq!(first, Err(ConnectorError::Credential));
             }
-            assert_eq!(first, Err(ConnectorError::Credential));
-            set_owner_to_user(&leaf);
-            assert_owned("probe credential", &leaf);
-            assert!(crate::security::private(&leaf).is_ok());
+            secure(&leaf);
+            assert_secured("probe credential", &leaf);
             assert_eq!(
                 TunnelCredential::load(&leaf, ZONE, &tunnel).map(drop),
                 Ok(())
             );
-            eprintln!("connector ownership probe: red leg refused, owned leaf loaded");
+            if !owner_is_user {
+                eprintln!("connector ownership probe: red leg refused, owned leaf loaded");
+            }
         }
 
         /// Runs the fixture once in an exact-test child so only that child's TokenOwner changes.
@@ -974,7 +1031,8 @@ mod vm {
                 .tempdir()
                 .unwrap();
             let root = temp.path();
-            protect_fixture(root);
+            secure(root);
+            assert_secured("fixture root", root);
             let (binary, binary_receipt) = fixture_binary(root);
             let (origin_port, ca_path, ca_receipt, origin_task) = origin(root).await;
             let route = route();
@@ -983,13 +1041,16 @@ mod vm {
             let tunnel = TunnelId::parse(TUNNEL).unwrap();
             let credential_path = root.join("credential.json");
             fs::write(&credential_path, encrypt_fixture(credential_json())).unwrap();
+            // Every object the fixture created: the fake's source, image and debug files, the
+            // origin CA and the credential.
+            secure_children(root);
             for (label, path) in [
                 ("fixture root", root),
                 ("fake executable", binary.as_path()),
                 ("origin CA", ca_path.as_path()),
                 ("credential", credential_path.as_path()),
             ] {
-                assert_owned(label, path);
+                assert_secured(label, path);
             }
             let credential = TunnelCredential::load(&credential_path, ZONE, &tunnel).unwrap();
             assert!(!format!("{credential:?}").contains(FAKE_SECRET));
@@ -1008,7 +1069,8 @@ mod vm {
                 )
                 .unwrap();
             }
-            assert_owned("machine-scope credential", &machine_path);
+            secure(&machine_path);
+            assert_secured("machine-scope credential", &machine_path);
             assert_eq!(
                 TunnelCredential::load(&machine_path, ZONE, &tunnel).map(drop),
                 Err(ConnectorError::Credential)

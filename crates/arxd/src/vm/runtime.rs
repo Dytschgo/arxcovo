@@ -414,7 +414,7 @@ pub(crate) mod publication {
         service::Shutdown,
         store::vm::publish::{Intent, Phase, Update},
         vm::{
-            Clock, FailureReason as Failure, Id, OperationRef, Refusal, VmController,
+            Clock, FailureReason as Failure, Id, OperationRef, Refusal, RequestId, VmController,
             paths::{ArtifactPin, LocalPath},
             publish::{
                 Hostname, TunnelId,
@@ -430,7 +430,10 @@ pub(crate) mod publication {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     pub(crate) struct Profile {
-        hostnames: [String; 1],
+        /// Validated once at deserialization and carried typed into the
+        /// intent and connector. ADR 0064 extends this bounded list.
+        #[serde(deserialize_with = "hostnames")]
+        hostnames: [Hostname; 1],
         static_name: String,
         host_id: String,
         tunnel_id: String,
@@ -442,6 +445,13 @@ pub(crate) mod publication {
         connector: PathBuf,
         connector_length: u64,
         connector_sha256: String,
+    }
+
+    fn hostnames<'de, D: serde::Deserializer<'de>>(input: D) -> Result<[Hostname; 1], D::Error> {
+        let [name] = <[String; 1]>::deserialize(input)?;
+        Hostname::parse(&name)
+            .map(|name| [name])
+            .map_err(|_| serde::de::Error::custom("invalid publication hostname"))
     }
 
     impl Profile {
@@ -459,10 +469,6 @@ pub(crate) mod publication {
             let connector = Self::path(&self.connector)?;
             ensure!(
                 cfg!(all(windows, target_arch = "x86_64"))
-                    && self
-                        .hostnames
-                        .iter()
-                        .all(|name| Hostname::parse(name).is_ok())
                     && TunnelId::parse(&self.tunnel_id).is_ok()
                     && hex_id(&self.account_id)
                     && hex_id(&self.zone_id)
@@ -494,7 +500,7 @@ pub(crate) mod publication {
         pub(crate) fn intent(&self, vm: Id, origin: &Origin) -> Result<Intent> {
             let mut hash = Sha256::new();
             for bytes in [
-                self.hostnames[0].as_bytes(),
+                self.hostnames[0].as_str().as_bytes(),
                 self.static_name.as_bytes(),
                 self.host_id.as_bytes(),
                 self.tunnel_id.as_bytes(),
@@ -616,7 +622,7 @@ pub(crate) mod publication {
         let invalid = |_| Failure::DnsUnavailable;
         Route::new(
             &intent.zone,
-            Hostname::parse(&intent.hostname).map_err(invalid)?,
+            intent.hostname.clone(),
             &TunnelId::parse(&intent.tunnel).map_err(invalid)?,
             &intent.nonce,
         )
@@ -727,8 +733,7 @@ pub(crate) mod publication {
             if !origin.current() || shutdown.is_cancelled() {
                 return Err(Failure::OriginUnavailable);
             }
-            let hostname =
-                Hostname::parse(&intent.hostname).map_err(|_| Failure::ConnectorFailed)?;
+            let hostname = intent.hostname.clone();
             let tunnel = TunnelId::parse(&intent.tunnel).map_err(|_| Failure::ConnectorFailed)?;
             let origin_name = origin.name()?;
             match self {
@@ -774,6 +779,8 @@ pub(crate) mod publication {
                 Self::Fixture(fake) => {
                     // The fixture holds no process that could outlive a failed start.
                     *unsettled = None;
+                    fake.starts
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     *fake.ingress.lock().unwrap() = Some(crate::vm::publish::ingress(
                         &tunnel,
                         std::array::from_ref(&hostname),
@@ -791,8 +798,51 @@ pub(crate) mod publication {
 
     struct Live {
         vm: Id,
+        /// The activation that started this connector. Deferred stops are
+        /// bound to it, so they can never stop a later activation of `vm`.
+        generation: u64,
         origin: Origin,
         connector: LocalProcess,
+    }
+
+    /// The current activation's owner and revocation token. Kept in memory so
+    /// an authenticated owner unpublish revokes it without SQLite, the
+    /// dispatch gate or the effects slot.
+    struct Activation {
+        generation: u64,
+        vm: Id,
+        owner: String,
+        key: RequestId,
+        token: Shutdown,
+    }
+
+    /// Bound for the in-process record of admitted publication request keys.
+    const ADMITTED_KEYS: usize = 64;
+
+    #[derive(Default)]
+    struct Activations {
+        current: Option<Activation>,
+        /// The last generation issued. Generations only increase.
+        issued: u64,
+        /// Publication keys admitted in this process. A same-key replay is
+        /// status-only, so it never revokes a later activation.
+        admitted: std::collections::VecDeque<(String, Id)>,
+    }
+
+    impl Activations {
+        fn admit(&mut self, owner: &str, key: RequestId) {
+            if self
+                .admitted
+                .iter()
+                .any(|(principal, id)| principal == owner && *id == key.key)
+            {
+                return;
+            }
+            if self.admitted.len() == ADMITTED_KEYS {
+                self.admitted.pop_front();
+            }
+            self.admitted.push_back((owner.to_owned(), key.key));
+        }
     }
 
     /// A token cancelled by either input, for one bounded await.
@@ -825,12 +875,24 @@ pub(crate) mod publication {
     #[derive(Default)]
     pub(crate) struct Publication {
         effects: Arc<Mutex<()>>,
+        /// Never held across a SQLite call, so a local stop never waits on
+        /// the store.
         local: Mutex<Option<Live>>,
-        /// The current activation's owner revocation. It is synchronous so an
-        /// authenticated unpublish wins without the effects slot, SQLite or DNS.
-        activation: std::sync::Mutex<Option<(Id, Shutdown)>>,
+        /// Synchronous and short, so an authenticated unpublish wins without
+        /// the effects slot, SQLite or DNS.
+        activations: std::sync::Mutex<Activations>,
         #[cfg(test)]
         pub(crate) fake: std::sync::Mutex<Option<Arc<Fake>>>,
+        /// Parks a publish worker after its final token check, before its
+        /// commit transaction.
+        #[cfg(test)]
+        pub(crate) commit_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// Parks the next deferred revocation stop.
+        #[cfg(test)]
+        pub(crate) stop_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// Parks the next unpublish worker before it waits for the slot.
+        #[cfg(test)]
+        pub(crate) unpublish_gate: std::sync::Mutex<Option<FakeGate>>,
     }
 
     impl Publication {
@@ -858,44 +920,97 @@ pub(crate) mod publication {
             self.effects.clone().lock_owned().await
         }
 
-        fn activations(&self) -> std::sync::MutexGuard<'_, Option<(Id, Shutdown)>> {
-            self.activation
+        fn activations(&self) -> std::sync::MutexGuard<'_, Activations> {
+            self.activations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
 
-        /// A fresh revocation token for the activation admitted next.
-        pub(crate) fn activation(&self, vm: Id) -> Shutdown {
+        /// Issues the generation and revocation token for the activation
+        /// admitted next. The caller holds the effects slot.
+        pub(crate) fn activation(&self, vm: Id, owner: &str, key: RequestId) -> (u64, Shutdown) {
+            let mut activations = self.activations();
+            activations.issued += 1;
+            let generation = activations.issued;
             let token = Shutdown::default();
-            *self.activations() = Some((vm, token.clone()));
-            token
+            activations.admit(owner, key);
+            activations.current = Some(Activation {
+                generation,
+                vm,
+                owner: owner.to_owned(),
+                key,
+                token: token.clone(),
+            });
+            (generation, token)
         }
 
-        /// Synchronous owner revocation. Afterwards the activation for `vm`
-        /// cannot commit `published` and every readiness check fails, so the
-        /// reaper drives DNS cleanup even when no unpublish was admitted.
-        pub(crate) fn revoke(&self, vm: Id) {
-            if let Some((id, token)) = self.activations().as_ref()
-                && *id == vm
-            {
-                token.cancel();
+        /// Records an admitted unpublish key for the in-memory replay fence.
+        pub(crate) fn admitted(&self, owner: &str, key: RequestId) {
+            self.activations().admit(owner, key);
+        }
+
+        /// Owner revocation before any store, gate, slot or DNS dependency.
+        /// Revokes the current activation of `vm` when `owner` admitted it and
+        /// `key` is not a request fault the replay ledger would refuse or
+        /// replay: the activation's own publish key (a collision), a key this
+        /// process already admitted for publication (a replay), or a key minted
+        /// before the activation's publish. Returns the generation whose
+        /// connector the caller stops, also when it was already revoked, so a
+        /// failed stop stays retryable.
+        pub(crate) fn revoke_owned(&self, owner: &str, vm: Id, key: RequestId) -> Option<u64> {
+            let activations = self.activations();
+            let current = activations.current.as_ref()?;
+            let fresh = current.vm == vm
+                && current.owner == owner
+                && current.key.key != key.key
+                && key.issued_at_ms >= current.key.issued_at_ms
+                && !activations
+                    .admitted
+                    .iter()
+                    .any(|(principal, id)| principal == owner && *id == key.key);
+            if !fresh {
+                return None;
             }
+            current.token.cancel();
+            Some(current.generation)
+        }
+
+        /// Revokes the current activation of `vm` after an admitted owner
+        /// unpublish committed `revoking`.
+        pub(crate) fn revoke(&self, vm: Id) -> Option<u64> {
+            let activations = self.activations();
+            let current = activations
+                .current
+                .as_ref()
+                .filter(|current| current.vm == vm)?;
+            current.token.cancel();
+            Some(current.generation)
         }
 
         fn revoked(&self, vm: Id) -> bool {
             self.activations()
+                .current
                 .as_ref()
-                .is_some_and(|(id, token)| *id == vm && token.is_cancelled())
+                .is_some_and(|current| current.vm == vm && current.token.is_cancelled())
+        }
+
+        /// A deferred revocation stop, bound to one activation generation.
+        pub(crate) async fn stop_activation(&self, generation: u64) -> bool {
+            #[cfg(test)]
+            let _ = hold(&self.stop_gate).await;
+            self.stop_where(|live| live.generation == generation).await
         }
 
         /// Called before VM release. Local Job termination is independent of
         /// Cloudflare credentials, SQLite writes and outstanding DNS requests.
         pub(crate) async fn stop_local(&self, vm: Option<Id>) -> bool {
+            self.stop_where(|live| vm.is_none_or(|id| live.vm == id))
+                .await
+        }
+
+        async fn stop_where(&self, matches: impl Fn(&Live) -> bool) -> bool {
             let mut local = self.local.lock().await;
-            let Some(live) = local
-                .as_mut()
-                .filter(|live| vm.is_none_or(|id| live.vm == id))
-            else {
+            let Some(live) = local.as_mut().filter(|live| matches(live)) else {
                 return true;
             };
             if !live.connector.stop().await {
@@ -931,41 +1046,44 @@ pub(crate) mod publication {
             intent: Intent,
             prepared: Prepared,
             origin: Origin,
-            revoked: &Shutdown,
+            (generation, revoked): (u64, &Shutdown),
             shutdown: &Shutdown,
         ) -> Result<()> {
             let result = self
-                .activate(controller, &intent, prepared, origin, revoked, shutdown)
+                .activate(
+                    controller, &intent, prepared, &origin, generation, revoked, shutdown,
+                )
                 .await;
-            if result.is_ok() {
-                // Commit while holding the local slot. A concurrently retiring
-                // origin cannot be used by a successor boot, and an owner
-                // revocation observed here always wins.
-                let local = self.local.lock().await;
-                if local.as_ref().is_some_and(|live| live.origin.current())
-                    && !shutdown.is_cancelled()
-                    && !revoked.is_cancelled()
-                    && !self.revoked(intent.vm)
-                {
-                    let written = controller.finish_publication(
-                        operation,
-                        Some((&intent.nonce, Update::Phase(Phase::Published, None))),
-                        None,
-                        None,
-                    );
-                    drop(local);
-                    if written.is_ok() {
-                        return Ok(());
+            let authorized =
+                || origin.current() && !shutdown.is_cancelled() && !revoked.is_cancelled();
+            let live = self
+                .local
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|live| live.generation == generation);
+            if result.is_ok() && live && authorized() {
+                #[cfg(test)]
+                let _ = hold(&self.commit_gate).await;
+                // The final authorization runs inside the commit transaction,
+                // and the durable transition requires a still-`publishing`
+                // intent. An owner revocation, an origin retirement or a
+                // committed `revoking` before it always wins. The local slot is
+                // not held here, so a revocation stop never waits on SQLite.
+                match controller.commit_publication(operation, &intent.nonce, authorized) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.stop_activation(generation).await;
+                        return Err(error);
                     }
-                    self.stop_local(Some(intent.vm)).await;
-                    return written;
                 }
             }
 
             let (failure, acknowledged) = match result {
                 Err((failure, acknowledged)) => (failure, acknowledged),
-                Ok(()) if revoked.is_cancelled() => (Failure::Cancelled, None),
-                Ok(()) => (Failure::OriginUnavailable, None),
+                Ok(()) if !origin.current() => (Failure::OriginUnavailable, None),
+                Ok(()) => (Failure::Cancelled, None),
             };
             let clean = self
                 .cleanup(
@@ -981,12 +1099,14 @@ pub(crate) mod publication {
 
         /// Errors carry any acknowledged record ID that could not be made
         /// durable, so this worker's cleanup can still target it.
+        #[allow(clippy::too_many_arguments)] // The activation identity and both cancellations.
         async fn activate<C: Clock>(
             &self,
             controller: &VmController<C>,
             intent: &Intent,
             prepared: Prepared,
-            origin: Origin,
+            origin: &Origin,
+            generation: u64,
             revoked: &Shutdown,
             shutdown: &Shutdown,
         ) -> Result<(), (Failure, Option<RecordId>)> {
@@ -1015,11 +1135,12 @@ pub(crate) mod publication {
                 let mut unsettled = None;
                 let started = prepared
                     .start
-                    .connect(intent, &origin, &stop.0, &mut unsettled)
+                    .connect(intent, origin, &stop.0, &mut unsettled)
                     .await;
                 if let Some(connector) = unsettled {
                     *local = Some(Live {
                         vm: intent.vm,
+                        generation,
                         origin: origin.clone(),
                         connector,
                     });
@@ -1027,6 +1148,7 @@ pub(crate) mod publication {
                 let connector = started.map_err(|failure| (failure, None))?;
                 *local = Some(Live {
                     vm: intent.vm,
+                    generation,
                     origin: origin.clone(),
                     connector,
                 });
@@ -1076,6 +1198,9 @@ pub(crate) mod publication {
                 .map_err(|failure| (failure, None))
         }
 
+        /// Waits for the effects slot. Its pending receipt keeps publish
+        /// admission for `vm` closed, so no later activation can start before
+        /// this worker settles.
         pub(crate) async fn unpublish<C: Clock>(
             &self,
             controller: &VmController<C>,
@@ -1083,6 +1208,9 @@ pub(crate) mod publication {
             vm: Id,
             shutdown: &Shutdown,
         ) -> Result<()> {
+            #[cfg(test)]
+            let _ = hold(&self.unpublish_gate).await;
+            let _slot = self.slot().await;
             let clean = self
                 .cleanup(controller, vm, None, None, Some(shutdown))
                 .await?;
@@ -1126,6 +1254,8 @@ pub(crate) mod publication {
             acknowledged: Option<RecordId>,
             shutdown: Option<&Shutdown>,
         ) -> Result<bool> {
+            // Under the effects slot only this VM's current or leftover
+            // connector can be live, so a VM-scoped stop is exact here.
             let local = self.stop_local(Some(vm)).await;
             let Some(intent) = controller
                 .publication_intent()?
@@ -1228,6 +1358,8 @@ pub(crate) mod publication {
         pub(crate) foreign: std::sync::atomic::AtomicBool,
         pub(crate) health: std::sync::atomic::AtomicU8,
         pub(crate) local: std::sync::atomic::AtomicBool,
+        /// Connector starts, including failed ones.
+        pub(crate) starts: std::sync::atomic::AtomicUsize,
         pub(crate) posts: std::sync::atomic::AtomicUsize,
         pub(crate) deletes: std::sync::atomic::AtomicUsize,
         pub(crate) ingress: std::sync::Mutex<Option<String>>,
@@ -1268,7 +1400,7 @@ pub(crate) mod publication {
         /// A replaced owner binding, for drift witnesses.
         pub(crate) fn drifted(host: Id, name: &str, hostname: &str, zone: &str) -> Self {
             Self {
-                hostnames: [hostname.into()],
+                hostnames: [Hostname::parse(hostname).unwrap()],
                 static_name: name.into(),
                 host_id: hex::encode(host),
                 tunnel_id: "12345678-1234-4321-8234-123456789abc".into(),

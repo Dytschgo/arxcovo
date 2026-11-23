@@ -111,7 +111,7 @@ pub(crate) struct Intent {
     pub generation: Id,
     pub boot: Id,
     pub revision: [u8; 32],
-    pub hostname: String,
+    pub hostname: crate::vm::publish::Hostname,
     pub tunnel: String,
     pub zone: String,
     pub credential_ref: String,
@@ -168,7 +168,8 @@ pub(crate) fn current(db: &Connection) -> Result<Option<Intent>> {
                     generation: row.get(1)?,
                     boot: row.get(2)?,
                     revision: row.get(3)?,
-                    hostname: row.get(4)?,
+                    hostname: crate::vm::publish::Hostname::parse(&row.get::<_, String>(4)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     tunnel: row.get(5)?,
                     zone: row.get(6)?,
                     credential_ref: row.get(7)?,
@@ -198,7 +199,7 @@ pub(crate) fn reserve(db: &Connection, intent: &Intent) -> Result<()> {
                 intent.generation,
                 intent.boot,
                 intent.revision,
-                intent.hostname,
+                intent.hostname.as_str(),
                 intent.tunnel,
                 intent.zone,
                 intent.credential_ref,
@@ -248,6 +249,18 @@ pub(crate) fn update(db: &Connection, nonce: &str, change: Update<'_>) -> Result
     };
     ensure!(changed == 1, "publication intent changed");
     Ok(())
+}
+
+/// The publish worker's final transition. It changes only a still
+/// `publishing` intent with durable record evidence, so a `revoking` or
+/// `cleanup_pending` intent committed by an owner unpublish, the reaper or
+/// recovery is never overwritten. Returns whether it committed.
+pub(crate) fn commit(db: &Connection, nonce: &str) -> Result<bool> {
+    Ok(db.execute(
+        "UPDATE vm_publication SET phase='published',cleanup_reason=NULL
+         WHERE nonce=?1 AND phase='publishing' AND post_possible=1 AND record IS NOT NULL",
+        [nonce],
+    )? == 1)
 }
 
 pub(crate) fn finish(

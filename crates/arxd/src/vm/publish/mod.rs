@@ -11,13 +11,13 @@ pub(super) mod connector;
 pub(super) mod windows;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct InvalidInput;
+pub(crate) struct InvalidInput;
 
 #[derive(Clone, Eq, PartialEq)]
-pub(super) struct Hostname(String);
+pub(crate) struct Hostname(String);
 
 impl Hostname {
-    pub(super) fn parse(value: &str) -> Result<Self, InvalidInput> {
+    pub(crate) fn parse(value: &str) -> Result<Self, InvalidInput> {
         if value.len() > 253
             || !value.contains('.')
             || !value
@@ -40,7 +40,7 @@ impl Hostname {
         Ok(Self(value.to_owned()))
     }
 
-    pub(super) fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
