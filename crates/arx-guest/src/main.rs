@@ -4,12 +4,14 @@ use std::process::ExitCode;
 
 use arx_guest::{ScriptExecution, ScriptExecutor, ScriptOutcome, serve};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod platform;
 
 #[cfg(target_os = "linux")]
 const USAGE: &str = "Usage: arx-guest --version | serve-stdio | serve-virtio";
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+const USAGE: &str = "Usage: arx-guest --version | serve-stdio | serve-service";
+#[cfg(not(any(target_os = "linux", windows)))]
 const USAGE: &str = "Usage: arx-guest --version | serve-stdio";
 
 struct UnavailableExecutor;
@@ -53,6 +55,14 @@ fn main() -> ExitCode {
         }
         #[cfg(target_os = "linux")]
         (Some("serve-virtio"), None) => match platform::serve_virtio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(category) => {
+                let _ = writeln!(io::stderr().lock(), "arx-guest: {category}");
+                ExitCode::FAILURE
+            }
+        },
+        #[cfg(windows)]
+        (Some("serve-service"), None) => match platform::serve_service() {
             Ok(()) => ExitCode::SUCCESS,
             Err(category) => {
                 let _ = writeln!(io::stderr().lock(), "arx-guest: {category}");
