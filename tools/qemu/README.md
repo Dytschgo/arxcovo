@@ -52,12 +52,18 @@ Windows route selection and the socket operation are separate calls.
   forwarding, SMB and TFTP. Public DNS uses literal public IPv4 resolvers
   through the same TCP and UDP gates.
 - TCP checks the translated peer immediately before the outbound connect.
-  Writes to that socket, including urgent data, recheck the peer. UDP looks
-  up sockets by both endpoints, checks the translated peer before connecting
+  The asynchronous zero-byte connect probe, writes and urgent data all
+  recheck the peer. UDP looks up sockets by both endpoints. It checks the
+  translated peer before connecting
   and before every datagram, and sends through that connected socket. Windows
-  filters received UDP datagrams to the socket's connected peer. The frozen
-  table in the patch includes 15 prefixes. Its conservative entries cover
-  all of the IETF protocol-assignment block and the expired 6to4 relay block.
+  filters received UDP datagrams to the socket's connected peer. A VM can
+  have one policy backend with at most 256 live UDP host sockets. At capacity,
+  new peers are dropped without opening a socket. A failed first send or
+  policy refusal releases the new socket immediately. UDP sockets expire
+  after 30 seconds without a successful guest send, measured on the host's
+  monotonic clock. The frozen table in the patch includes 15 prefixes. Its
+  conservative entries cover all of the IETF protocol-assignment block and
+  the expired 6to4 relay block.
   [IANA IPv4 special-purpose registry](https://www.iana.org/assignments/iana-ipv4-special-registry/)
 - Each outbound socket sets Windows IP_UNICAST_IF and binds the enrolled
   source. Route lookup must return the enrolled interface index and LUID,
@@ -93,7 +99,7 @@ repository's scratch and host reserves. Configure from the build directory.
   --enable-slirp --enable-zstd \
   --disable-gtk --disable-sdl --disable-opengl --disable-vnc --disable-spice \
   --disable-guest-agent --disable-docs --disable-werror --disable-download \
-  --enable-strip --prefix=D:/ArxcovoData/qemu/11.1.3-arx-egress-1 \
+  --enable-strip --prefix=D:/ArxcovoData/qemu/11.1.3-arx-egress-2 \
   --bindir=. --datadir=. --with-suffix=share
 meson test --no-rebuild arx-egress
 ```

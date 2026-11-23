@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "build": "11.1.3-arx-egress-1",
+  "build": "11.1.3-arx-egress-2",
   "manifest_id": "qemu-11.1.3-arx-public-egress-windows-x64",
   "architecture": "windows-x86_64",
-  "install_path": "D:/ArxcovoData/qemu/11.1.3-arx-egress-1",
+  "install_path": "D:/ArxcovoData/qemu/11.1.3-arx-egress-2",
   "qemu_source": {
     "version": "11.1.3",
     "url": "https://download.qemu.org/qemu-11.1.3.tar.xz",
@@ -19,7 +19,7 @@
     "msys2_recipe_sha256": "a5ed73ec3656c530a2c92dd136a0ecdb7ed15c0087f1c3630141829e420bbebc",
     "linkage": "static"
   },
-  "patch_sha256": "065846032a02b3f014670083131fb474cabee31dcc13227724332eb94fc52e3b",
+  "patch_sha256": "c1baf0c0c5360695109ff96152adc66e038fb922fb7c27d2db74b8292fac9cc0",
   "toolchain": {
     "name": "MSYS2 UCRT64",
     "msys2_base": "20261120",
@@ -56,7 +56,7 @@
       "--disable-werror",
       "--disable-download",
       "--enable-strip",
-      "--prefix=D:/ArxcovoData/qemu/11.1.3-arx-egress-1",
+      "--prefix=D:/ArxcovoData/qemu/11.1.3-arx-egress-2",
       "--bindir=.",
       "--datadir=.",
       "--with-suffix=share"
@@ -69,11 +69,11 @@
     "zstd": "YES 1.5.7"
   },
   "manifest_file": "MANIFEST.sha256",
-  "manifest_sha256": "c1a32b3e858d886dcb82f9d89420304e64c8ab85299eadcde79ef1f8a7559077",
+  "manifest_sha256": "932738b2b45bc2da88c3785210465f9d23c228c686101b06d52e988cd9597773",
   "payload_file_count": 136,
   "receipt_file": "RECEIPT.txt",
-  "receipt_sha256": "2d4ab2ebf5b4e9f1dbfcbd9e685e46052f5a2bf99de8c4f86ae4ae834e9947ef",
-  "qemu_system_size": 28692254,
-  "qemu_system_sha256": "61de908074c19e815a832670cb0ddaacf2b6121a2214400329db14acc9585687",
-  "qemu_img_sha256": "50ffddf11a5653527f7e5873ae0181c37908713489660894d553ac5cf1888fcf"
+  "receipt_sha256": "68cbd5c35db0f270b82808ed7167920823e7d678667cefe9357191f0eded5402",
+  "qemu_system_size": 28692871,
+  "qemu_system_sha256": "8a9ba75905f7026003a4c4bf87cfb70a5099f18500969f185590e742b367b0ee",
+  "qemu_img_sha256": "ceb9e343d074204675830ff23ea5752b7a8032f258160f4f8442ebd49226cb15"
 }
