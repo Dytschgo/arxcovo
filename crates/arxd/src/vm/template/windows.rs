@@ -4,16 +4,34 @@
 
 use super::{
     AssetPin, RecipeError,
+    lifecycle::{Boot, Failure, Readiness, TemplateRuntime, clean},
     media::{Image, MAX_GUEST},
 };
+use crate::vm::{
+    BuildSlots, Id, PairSlots,
+    guest::GUEST_READY_BUDGET,
+    runtime::{InstallerBudget, InstallerPhase, InstallerRecipe, NativeRefusal},
+};
+use arx_guest::protocol::ScriptStatus;
 use sha2::{Digest, Sha256};
 use std::{
     fmt::Write as _,
     io::{Read, Write},
     time::Duration,
 };
+use tokio::time::Instant;
 
 pub(super) const ID: &str = "windows11-x64-test-v1";
+
+/// Catalog identity stays fixed as exact media observations change the digest.
+/// Use a domain separate from owner-configured Ubuntu digest-derived IDs.
+pub(super) fn catalog_id() -> Id {
+    let digest = Sha256::new()
+        .chain_update(b"arxcovo.recipe.catalog.v1\0")
+        .chain_update(ID.as_bytes())
+        .finalize();
+    digest[..16].try_into().expect("SHA-256 prefix")
+}
 const MARKER: &[u8] = b"arxcovo-windows-test-seed-v1\n";
 const UNATTEND: &str = "urn:schemas-microsoft-com:unattend";
 const WCM: &str = "http://schemas.microsoft.com/WMIConfig/2002/State";
@@ -43,6 +61,13 @@ const MAX_RECEIPT: u64 = 256 * 1024;
 const MAX_FIRMWARE: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "owner Windows image inspection is qualification work"
+    )
+)]
 pub(super) enum InstallImage {
     Wim,
     Esd,
@@ -678,7 +703,6 @@ pub(super) enum Stage {
     DetachedReadiness,
     Generalize,
     DetachedVerification,
-    CloneIdentity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -686,12 +710,14 @@ pub(super) enum StageFailure {
     Timeout,
     UnexpectedStage,
     Failed,
+    #[cfg(test)]
     Residue,
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum StageEvidence {
     Clean,
+    #[cfg(test)]
     Residue,
     Failed,
 }
@@ -720,6 +746,7 @@ impl BuildStages {
                 return Err(StageFailure::UnexpectedStage);
             }
             match evidence {
+                #[cfg(test)]
                 StageEvidence::Residue => return Err(StageFailure::Residue),
                 StageEvidence::Failed => return Err(StageFailure::Failed),
                 StageEvidence::Clean => {}
@@ -728,8 +755,7 @@ impl BuildStages {
                 Stage::Install => Some(Stage::DetachedReadiness),
                 Stage::DetachedReadiness => Some(Stage::Generalize),
                 Stage::Generalize => Some(Stage::DetachedVerification),
-                Stage::DetachedVerification => Some(Stage::CloneIdentity),
-                Stage::CloneIdentity => None,
+                Stage::DetachedVerification => None,
             })
         })();
         self.0.map(|_| ())
@@ -740,8 +766,208 @@ impl BuildStages {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InstalledTarget {
+    Readiness(PairSlots),
+    Verification(PairSlots),
+}
+
+impl InstalledTarget {
+    fn probe(self) -> String {
+        let validation = match self {
+            Self::Readiness(_) => "$validation = $true\n",
+            Self::Verification(_) => "$validation = $false\n",
+        };
+        [validation, DETACHED_HEALTH].concat()
+    }
+}
+
+// The restricted guest returns only exit status. The same probe checks both
+// detached boots, with a fixed phase-specific expectation for finalizer state.
+const DETACHED_HEALTH: &str = r#"$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+try {
+    $setup = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup'
+    $image = Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State' -Name ImageState
+    if ($image -cne 'IMAGE_STATE_COMPLETE' -or $setup.SystemSetupInProgress -ne 0 -or
+        ($setup.PSObject.Properties['OOBEInProgress'] -and $setup.OOBEInProgress -ne 0)) { exit 1 }
+    if ([IO.DriveInfo]::GetDrives().DriveType -contains 'CDRom') { exit 1 }
+    $service = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\arx-guest'
+    if ($service.Start -ne 2 -or $service.ObjectName -ine 'NT AUTHORITY\LocalService') { exit 1 }
+    foreach ($name in @('viostor','vioser','netkvm')) {
+        $devices = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter "Service = '$name'")
+        if ($devices.Count -ne 1 -or $devices[0].ConfigManagerErrorCode -ne 0) { exit 1 }
+    }
+    if (@(Get-LocalUser | Where-Object { $_.Name -ieq 'ArxBootstrap' }).Count -ne 0) { exit 1 }
+    $programs = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+    if ([string]::IsNullOrEmpty($programs)) { exit 1 }
+    $phase = Join-Path $programs 'Arxcovo\setup.phase'
+    $system = Join-Path $env:SystemRoot 'System32'
+    if ((Test-Path -LiteralPath (Join-Path $system 'arxseed.loc')) -or
+        (Test-Path -LiteralPath (Join-Path $system 'arxseed.pin'))) { exit 1 }
+    foreach ($relative in @('Panther\Unattend.xml','Panther\Unattend\Unattend.xml','System32\Sysprep\Unattend.xml')) {
+        if (Test-Path -LiteralPath (Join-Path $env:SystemRoot $relative)) { exit 1 }
+    }
+    if ($validation) {
+        $boot = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks
+        if ((Get-Item -LiteralPath $phase).Length -notin (3..32) -or
+            [IO.File]::ReadAllText($phase) -cne "2:$boot") { exit 1 }
+    } elseif ((Test-Path -LiteralPath $phase) -or
+              (Test-Path -LiteralPath (Join-Path $system 'arxsetup.ps1')) -or
+              @(Get-ScheduledTask | Where-Object { $_.TaskName -eq 'ArxcovoTemplateFinalize' }).Count -ne 0) {
+        exit 1
+    }
+    exit 0
+} catch { exit 1 }
+"#;
+
+pub(super) struct WindowsBuild {
+    started_at: Instant,
+    budget: InstallerBudget,
+    stages: BuildStages,
+    boots: Vec<Boot>,
+}
+
+impl WindowsBuild {
+    pub(super) fn install(
+        runtime: &mut dyn TemplateRuntime,
+        slots: BuildSlots,
+    ) -> Result<Self, Failure> {
+        let budget = InstallerBudget::start(InstallerRecipe::Windows);
+        let mut build = Self {
+            started_at: budget.clip(BUILD_LIMIT) - BUILD_LIMIT,
+            budget,
+            stages: BuildStages::default(),
+            boots: Vec::with_capacity(4),
+        };
+        build.qmp(runtime, slots, InstallerPhase::WindowsSetup, Stage::Install)?;
+        build.installed(
+            runtime,
+            InstalledTarget::Readiness(slots.pair),
+            Stage::DetachedReadiness,
+        )?;
+        build.qmp(
+            runtime,
+            slots,
+            InstallerPhase::WindowsFinalize,
+            Stage::Generalize,
+        )?;
+        Ok(build)
+    }
+
+    pub(super) fn verify(
+        &mut self,
+        runtime: &mut dyn TemplateRuntime,
+        slots: PairSlots,
+    ) -> Result<(), Failure> {
+        self.installed(
+            runtime,
+            InstalledTarget::Verification(slots),
+            Stage::DetachedVerification,
+        )
+    }
+
+    pub(super) fn check_seal(&self) -> Result<(), Failure> {
+        self.deadline(BUILD_LIMIT)?;
+        if self.stages.can_seal() {
+            Ok(())
+        } else {
+            Err(Failure::Native(NativeRefusal::InstallerPhaseMismatch))
+        }
+    }
+
+    fn qmp(
+        &mut self,
+        runtime: &mut dyn TemplateRuntime,
+        slots: BuildSlots,
+        phase: InstallerPhase,
+        stage: Stage,
+    ) -> Result<(), Failure> {
+        let plan = self
+            .budget
+            .stage(phase, BUILD_LIMIT)
+            .ok_or(Failure::Native(NativeRefusal::InstallerPhaseMismatch))?;
+        if Instant::now() >= plan.deadline() {
+            return Err(Failure::Native(NativeRefusal::InstallerDeadlineExpired));
+        }
+        let observed = runtime
+            .windows_installer(slots, plan)
+            .and_then(|(boot, observed)| {
+                if observed != phase {
+                    return Err(Failure::Native(NativeRefusal::InstallerPhaseMismatch));
+                }
+                self.fresh(boot)
+            });
+        self.advance(stage, observed)
+    }
+
+    fn installed(
+        &mut self,
+        runtime: &mut dyn TemplateRuntime,
+        target: InstalledTarget,
+        stage: Stage,
+    ) -> Result<(), Failure> {
+        let ready_by = self.deadline(GUEST_READY_BUDGET)?;
+        let (boot, ready) = runtime.windows_installed(target, ready_by)?;
+        let checked = (|| {
+            if Instant::now() >= ready_by {
+                return Err(Failure::Native(NativeRefusal::InstallerDeadlineExpired));
+            }
+            self.fresh(boot)?;
+            if ready != Readiness::ScriptChannel {
+                return Err(Failure::Readiness(ready));
+            }
+            let deadline = self.deadline(Duration::from_secs(30))?;
+            let health = runtime.windows_health(boot, &target.probe(), deadline);
+            if Instant::now() >= deadline {
+                return Err(Failure::Native(NativeRefusal::InstallerDeadlineExpired));
+            }
+            if health? != (ScriptStatus::Exited, Some(0)) {
+                return Err(Failure::Health);
+            }
+            Ok(())
+        })();
+        let stopped = clean(runtime.windows_stop(boot, self.budget.clip(BUILD_LIMIT)));
+        self.advance(stage, stopped.and(checked))
+    }
+
+    fn advance(&mut self, stage: Stage, observed: Result<(), Failure>) -> Result<(), Failure> {
+        let evidence = if observed.is_ok() {
+            StageEvidence::Clean
+        } else {
+            StageEvidence::Failed
+        };
+        let advanced = self
+            .stages
+            .observe(self.started_at.elapsed(), stage, evidence);
+        observed?;
+        advanced.map_err(|reason| {
+            Failure::Native(match reason {
+                StageFailure::Timeout => NativeRefusal::InstallerDeadlineExpired,
+                _ => NativeRefusal::InstallerPhaseMismatch,
+            })
+        })
+    }
+
+    fn fresh(&mut self, boot: Boot) -> Result<(), Failure> {
+        if self.boots.contains(&boot) {
+            return Err(Failure::ReusedBoot);
+        }
+        self.boots.push(boot);
+        Ok(())
+    }
+
+    fn deadline(&self, limit: Duration) -> Result<Instant, Failure> {
+        let deadline = self.budget.clip(limit);
+        if Instant::now() >= deadline {
+            return Err(Failure::Native(NativeRefusal::InstallerDeadlineExpired));
+        }
+        Ok(deadline)
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::{
         io::Cursor,
@@ -773,7 +999,7 @@ mod tests {
         }
     }
 
-    fn fixture() -> WindowsPins<'static> {
+    pub(in crate::vm::template) fn fixture() -> WindowsPins<'static> {
         WindowsPins {
             iso: pin(ISO),
             edition: EDITION,
@@ -794,9 +1020,18 @@ mod tests {
         change: impl FnOnce(&mut WindowsAssets<'_>),
         out: &mut Vec<u8>,
     ) -> Result<[u8; 32], RecipeError> {
+        with_assets(|mut assets, guest| {
+            change(&mut assets);
+            recipe.write_test_seed(assets, guest, out)
+        })
+    }
+
+    pub(in crate::vm::template) fn with_assets<T>(
+        use_assets: impl FnOnce(WindowsAssets<'_>, &[u8]) -> T,
+    ) -> T {
         let mut files = [const { Cursor::new(DRIVER) }; 9];
         let [a, b, c, d, e, f, g, h, i] = &mut files;
-        let mut assets = WindowsAssets {
+        let assets = WindowsAssets {
             iso: &mut Cursor::new(ISO),
             edition: EDITION,
             driver_medium: &mut Cursor::new(MEDIUM),
@@ -806,8 +1041,7 @@ mod tests {
             firmware_vars: &mut Cursor::new(VARS),
             qemu_receipt: QEMU_RECEIPT,
         };
-        change(&mut assets);
-        recipe.write_test_seed(assets, GUEST, out)
+        use_assets(assets, GUEST)
     }
 
     #[test]
@@ -851,13 +1085,7 @@ mod tests {
     #[test]
     fn deadline_failure_residue_and_out_of_order_evidence_block_seal() {
         use Stage::*;
-        let sequence = [
-            Install,
-            DetachedReadiness,
-            Generalize,
-            DetachedVerification,
-            CloneIdentity,
-        ];
+        let sequence = [Install, DetachedReadiness, Generalize, DetachedVerification];
         for (broken, elapsed, stage, evidence, reason) in [
             (
                 Install,
@@ -888,9 +1116,9 @@ mod tests {
                 StageFailure::UnexpectedStage,
             ),
             (
-                CloneIdentity,
+                DetachedVerification,
                 BUILD_LIMIT,
-                CloneIdentity,
+                DetachedVerification,
                 StageEvidence::Clean,
                 StageFailure::Timeout,
             ),
