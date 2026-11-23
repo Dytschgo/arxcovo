@@ -988,8 +988,7 @@ class DiscoveryIntegrationTests(unittest.TestCase):
         context = root / 'context'
         context.mkdir()
         blobs = {}
-        for relative in ('tools/ci/custody/Containerfile', 'tools/ci/custody/run.py',
-                         'crates/arxd/src/cluster/pki/custody/hosted_probe.rs', '.github/workflows/ci.yml'):
+        for relative in run.PINNED_SOURCES:
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             blobs[relative] = ('public-source-' + relative).encode()
@@ -1289,13 +1288,19 @@ class A3ProcessTests(unittest.TestCase):
         self.assertIsNone(h.first)
 
     def test_git_source_pipe_accepts_over_64_kib_and_refuses_over_256_kib(self):
-        source = 'a' * 40 + ':tools/ci/custody/run.py'
+        sha = 'a' * 40
+        pinned = run.PINNED_SOURCES[1]
+        exact = ['git', 'show', sha + ':' + pinned]
         cases = (
-            ('git-source-just-over-64-kib', ['git', 'show', source], run.PIPE_CAP + 1, None),
-            ('git-source-just-over-256-kib', ['git', 'show', source], run.GIT_SOURCE_CAP + 1, 'PipeOverflow'),
-            ('other-command-just-over-64-kib', ['git', 'rev-parse', 'HEAD'], run.PIPE_CAP + 1, 'PipeOverflow'),
+            ('exact-just-over-64-kib', exact, sha, run.PIPE_CAP + 1, None, run.GIT_SOURCE_CAP),
+            ('exact-just-over-256-kib', exact, sha, run.GIT_SOURCE_CAP + 1, 'PipeOverflow', run.GIT_SOURCE_CAP),
+            ('other-command-just-over-64-kib', ['git', 'rev-parse', 'HEAD'], sha, run.PIPE_CAP + 1, 'PipeOverflow', run.PIPE_CAP),
+            ('unpinned-path', ['git', 'show', sha + ':tools/ci/custody/test_run.py'], sha, run.PIPE_CAP + 1, 'PipeOverflow', run.PIPE_CAP),
+            ('extra-option', ['git', 'show', '--textconv', sha + ':' + pinned], sha, run.PIPE_CAP + 1, 'PipeOverflow', run.PIPE_CAP),
+            ('other-revision', ['git', 'show', 'b' * 40 + ':' + pinned], sha, run.PIPE_CAP + 1, 'PipeOverflow', run.PIPE_CAP),
+            ('unverified-source', exact, None, run.PIPE_CAP + 1, 'PipeOverflow', run.PIPE_CAP),
         )
-        for label, argv, size, expected in cases:
+        for label, argv, verified, size, expected, limit in cases:
             with self.subTest(label=label):
                 clock = Clock()
                 payload = b'x' * size
@@ -1352,13 +1357,18 @@ class A3ProcessTests(unittest.TestCase):
 
                 child.kill = kill
 
-                def spawn(_argv, _deadline, _clock):
+                seen = {}
+
+                def spawn(bound, _deadline, _clock):
+                    seen['argv'] = bound
                     return child
 
                 def fake_read(fd, _n):
                     return streams[fd].chunks.pop(0)
 
                 h = run.Harness(clock, spawn)
+                h.source = verified
+                h.tools = {'git': SimpleNamespace(recheck=lambda: '/usr/bin/git')}
                 output = io.StringIO()
                 with redirect_stdout(output), patch.object(run.os, 'read', fake_read), patch.object(run.time, 'sleep', clock.sleep):
                     if expected is None:
@@ -1366,15 +1376,16 @@ class A3ProcessTests(unittest.TestCase):
                     else:
                         with self.assertRaisesRegex(run.Refusal, expected):
                             h.command(argv, 'preflight')
-                expected_limit = run.GIT_SOURCE_CAP if argv[1] == 'show' else run.PIPE_CAP
-                self.assertEqual(child.limit, expected_limit)
+                self.assertEqual(seen['argv'][0], '/usr/bin/git')
+                self.assertEqual(seen['argv'][1:], argv[1:])
+                self.assertEqual(child.limit, limit)
                 if expected is None:
                     self.assertIsNone(h.first)
                     self.assertFalse(child.killed)
                     self.assertTrue(child.reaped)
                 else:
                     self.assertEqual(h.first, expected)
-                    self.assertEqual(len(child.out), expected_limit)
+                    self.assertEqual(len(child.out), limit)
                     self.assertTrue(child.killed)
                     records = [json.loads(line) for line in output.getvalue().splitlines()]
                     refusal = next(r for r in records if r['event'] == 'command-refusal')

@@ -26,6 +26,12 @@ PINS = '65e3a466c1a118beba6243b37c90743a187858a91c6b16d246154aa1cb5e7d36'
 MIB = 1024 * 1024
 PIPE_CAP = 64 * 1024
 GIT_SOURCE_CAP = 256 * 1024
+PINNED_SOURCES = (
+    'tools/ci/custody/Containerfile',
+    'tools/ci/custody/run.py',
+    'crates/arxd/src/cluster/pki/custody/hosted_probe.rs',
+    '.github/workflows/ci.yml',
+)
 MODES = {'create-founder', 'create-learner', 'deny-build', 'same-uid-control', 'release', 'restart-founder', 'restart-learner'}
 LIMIT = 1024 * 1024
 
@@ -482,6 +488,12 @@ def command_role(argv):
     return argv[0] if argv[0] in TOOLS else 'candidate-list'
 
 
+def pinned_git_show(argv, source):
+    """256 KiB only for git show of one verified HEAD blob of a pinned input."""
+    return (len(argv) == 3 and argv[0] == 'git' and argv[1] == 'show' and isinstance(source, str)
+            and any(argv[2] == source + ':' + path for path in PINNED_SOURCES))
+
+
 def choose(candidates):
     matches = [p for p, listing, before, after in candidates if exact_listing(listing) and before == after]
     require(len(matches) == 1 and all(before == after for _, _, before, after in candidates), 'ProbeSelection', 'choose', 'len(matches) == 1 and all((before == after for _, _, before, after in candidates))')
@@ -632,6 +644,7 @@ class Harness:
         self.evidence = 0
         self.evidence_exhausted = False
         self.tools = None
+        self.source = None
         self.case_results = set()
         self.scratch = None
 
@@ -713,8 +726,8 @@ class Harness:
         failure = None
         try:
             child = self.spawn(self.bound_argv(argv), deadline, self.clock)
-            # git-source is git show of the four pinned inputs. Every other command stays at 64 KiB.
-            child.limit = GIT_SOURCE_CAP if command_role(argv) == 'git-source' else PIPE_CAP
+            # Caller's argv. bound_argv may replace the git path before spawn.
+            child.limit = GIT_SOURCE_CAP if pinned_git_show(argv, self.source) else PIPE_CAP
             self.children.append(child)
             while True:
                 if not cleanup and self.holder:
@@ -1056,6 +1069,7 @@ class Harness:
         self.record_scratch('root')
         source = self.command(['git', 'rev-parse', 'HEAD'], 'preflight').decode().strip()
         require(re.fullmatch(r'[a-f0-9]{40}', source), 'SourcePin', 'qualify', "re.fullmatch('[a-f0-9]{40}', source)")
+        self.source = source
         # Coordinator must persist adoption before hosted execution.
         # PINS is amendment A4, the applicable revision. ADOPTED_PINS is the
         # 2026-11-20 brief digest and stays in the ADR as the historical pin.
@@ -1132,8 +1146,7 @@ class Harness:
             selected = objects[choose(candidates)]
             selected.stage(context / 'arxd-tests')
             inputs = {}
-            for relative in ('tools/ci/custody/Containerfile', 'tools/ci/custody/run.py',
-                             'crates/arxd/src/cluster/pki/custody/hosted_probe.rs', '.github/workflows/ci.yml'):
+            for relative in PINNED_SOURCES:
                 with BuildInput(checkout / relative, checkout, relative, self.record, checkpoint) as obj:
                     blob = self.command(['git', 'show', source + ':' + relative], 'preflight')
                     require(hashlib.sha256(blob).hexdigest() == obj.sha, 'SourcePin', relative, 'immutable_git_blob')
