@@ -55,6 +55,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "libc",
+ "log",
  "openraft",
  "rand 0.9.2",
  "rcgen",
@@ -73,6 +74,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "tracing",
  "windows-sys 0.61.2",
  "x509-parser",
 ]

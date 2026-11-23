@@ -1,5 +1,6 @@
 mod media;
 mod ubuntu;
+pub mod ubuntu_web;
 #[allow(
     dead_code,
     reason = "5c supplies the Windows lifecycle caller; native admission is closed"
