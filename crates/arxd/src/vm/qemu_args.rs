@@ -5,7 +5,7 @@ use super::{
 };
 use serde_json::{Value, json};
 
-pub const QEMU_VERSION: &str = "11.1.3";
+pub const QEMU_VERSION: &str = "11.1.0";
 pub const MACHINE: &str = "pc-q35-11.1";
 pub const GUEST_PORT: &str = "org.arxcovo.agent.0";
 /// The fixed QEMU device id of the guest port; `VSERPORT_CHANGE` names it.
@@ -407,7 +407,7 @@ mod tests {
         Artifact::new(role, LocalPath::parse(path).unwrap()).unwrap()
     }
 
-    /// A v11.1.3 `QCowHeader` (112 bytes, `block/qcow2.h`) with the optional
+    /// An 11.1.x `QCowHeader` (112 bytes, `block/qcow2.h`) with the optional
     /// backing-format extension, the end marker and the backing name.
     fn header(backing: Option<&str>) -> Vec<u8> {
         let mut header = vec![0; CLUSTER];
