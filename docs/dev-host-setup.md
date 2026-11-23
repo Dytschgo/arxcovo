@@ -51,7 +51,9 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    selector, edition, architecture, build and language against the entitled
    media. The owner also supplies the official Ubuntu 24.04.3 live-server
    amd64 ISO, the prepared capped-volume identity and provisioning evidence,
-   the driver qualification receipt and controlled witness enrollment.
+   a separate small disposable fixed-size NTFS trial volume on D: backing and
+   its identity and provisioning evidence, the driver qualification receipt
+   and controlled witness enrollment. Use step 3 if the trial volume is absent.
    Validate the Windows answer file in Windows SIM against the exact image.
    Pin sizes and hashes, the viostor, vioserial and NetKVM INF/CAT/SYS files,
    catalog signer and offline trust decision, PCI IDs and port ABI. Extract
@@ -78,13 +80,17 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    allows one running VM, at most 8 GiB guest RAM and 4 vCPUs, within the owner
    reserves. [D: scratch procedure](dev-scratch.md)
 
-3. **Resolve a prerequisite only if preflight shows it missing.** No UAC is
-   expected. If the Medium-token read-only check shows WHPX is missing and
-   review confirms that enabling Windows Hypervisor Platform is the remedy,
-   record the exact command below in the local evidence and the separate
-   docs-only [PROGRESS](PROGRESS.md) batch. Ask the owner once to run it in an
-   elevated PowerShell. The owner handles any required reboot. Rerun the WHPX
-   proof under the Medium console token before proceeding.
+3. **Resolve prerequisites identified by read-only preflight.** Collect all
+   necessary elevated commands (WHPX, cap correction and trial-volume setup,
+   including its deferred rollback) in **one reviewed owner request**. Record
+   the exact commands in the local evidence and separate docs-only
+   [PROGRESS](PROGRESS.md) batch, and ask the owner once to run the applicable
+   setup commands from elevated PowerShell. If cap correction needs elevation,
+   derive and review its exact command from verified unused target geometry
+   before including it in the batch. Keep private target identity data local.
+   If the Medium-token check shows WHPX is missing and review confirms the
+   remedy, include the DISM line below. Use the D: environment assignments
+   for every block in the batch. The owner handles any required reboot.
 
    ```powershell
    $env:TMP = 'D:/Temp/arx-m4-activation/tmp'
@@ -95,10 +101,34 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    dism.exe /Online /Enable-Feature /FeatureName:HypervisorPlatform /All /NoRestart
    ```
 
-   If the disk cap needs administrative correction, derive an exact command
-   from verified unused target geometry, review and record it before asking the
-   owner once for UAC, and repeat preflight after correction. Proceed only with
-   verified geometry and enforcement. If the QEMU package is missing, install
+   If the trial volume is missing, use the following DiskPart command for a
+   new 1 GiB fixed VHDX on D:. A verified unused `T:` provides the real volume
+   root required by ADR 0054. Before review and again before running, verify
+   that the exact backing file and script paths are unused, their parent
+   directories are owned and free of reparse points, and D: will retain the
+   50 GiB floor after the full allocation and overhead. Keep the trial within
+   the aggregate cap. If a precondition fails, resolve it before including an
+   exact reviewed command in the request. The script selects only the new
+   VHDX by path and stops on any error. Use DiskPart without Hyper-V cmdlets.
+   [Microsoft fixed-VHDX procedure](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/boot-to-vhd--native-boot--add-a-virtual-hard-disk-to-the-boot-menu?view=windows-11#step-1-create-a-vhdx-from-diskpart) · [DiskPart scripts](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/diskpart-scripts-and-examples)
+
+   ```powershell
+   @'
+   create vdisk file=D:\ArxcovoData\qualify\trial.vhdx maximum=1024 type=fixed
+   select vdisk file=D:\ArxcovoData\qualify\trial.vhdx
+   attach vdisk
+   create partition primary
+   format quick fs=ntfs label=ArxcovoTrial
+   assign letter=T
+   '@ | Set-Content -LiteralPath 'D:\Temp\arx-m4-activation\trial-create.txt' -Encoding ascii -ErrorAction Stop
+   diskpart.exe /s 'D:\Temp\arx-m4-activation\trial-create.txt'
+   if ($LASTEXITCODE -ne 0) { throw 'Trial volume provisioning failed' }
+   ```
+
+   Repeat preflight from the Medium console after any setup. Recheck WHPX,
+   physical capacity and the free-space floor. Verify and pin the trial
+   volume and backing identity, full allocation, and NTFS geometry before
+   allowing writes. If the QEMU package is missing, install
    only the exact reviewed portable payload under the owned package root and
    rerun the receipt, manifest and payload checks. The scoped prerequisite
    exception covers WHPX, the reviewed QEMU package and the disk cap and
@@ -119,8 +149,8 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    coalesced port events within the bounded retry policy. Close any stage
    whose consumer opens cannot be established.
    Exercise token, Job, ACL, wrong-PID, slot and path refusals and scoped
-   supervisor loss. Test disk exhaustion on a small disposable fixed volume
-   provisioned the same way, with pre-allocation denial and no pressure on
+   supervisor loss. Test disk exhaustion on the disposable trial volume
+   supplied under step 1, with pre-allocation denial and no pressure on
    shared D:. Exercise recent input, idle, lock/unlock, switch/disconnect and
    ambiguous WTS, as well as CPU/RAM/disk reserve loss and bounded quiescence.
    Use owner-arranged unrelated-principal and NETWORK witnesses. Missing or
@@ -199,6 +229,23 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    capabilities and the forward-only store in place. If a separate B2
    publishing trial ran, withdraw only its attributed public route through
    B2 unpublish.
+
+   After the trial or during rollback, the owner runs the deferred command
+   from the step 3 batch only for the VHDX created by that batch. First prove
+   all trial handles are released, the backing file matches the recorded
+   identity under the same checked path, and the detach script path is fresh
+   under the task-owned scratch root. If release, identity or detach is
+   uncertain, retain the file and its charge.
+
+   ```powershell
+   @'
+   select vdisk file=D:\ArxcovoData\qualify\trial.vhdx
+   detach vdisk
+   '@ | Set-Content -LiteralPath 'D:\Temp\arx-m4-activation\trial-detach.txt' -Encoding ascii -ErrorAction Stop
+   diskpart.exe /s 'D:\Temp\arx-m4-activation\trial-detach.txt'
+   if ($LASTEXITCODE -ne 0) { throw 'Trial volume detach failed' }
+   Remove-Item -LiteralPath 'D:\ArxcovoData\qualify\trial.vhdx' -ErrorAction Stop
+   ```
 
 ## Foreground VM profile: state root custody
 

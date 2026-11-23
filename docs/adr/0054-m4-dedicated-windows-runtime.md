@@ -533,7 +533,8 @@ console logon in the foreground under [ADR 0029](0029-owner-selectable-windows-e
 distinct owner and supervisor SID pins, and the distinct-SID/local-SAM WTS
 match above for this mode. An explicit dedicated account remains possible with
 its own identity boundary and qualification. Each execution mode requires its
-own evidence and fails closed on an identity mismatch.
+own evidence and fails closed on an identity mismatch. There is no fallback
+between modes.
 
 ### Execution identity and shared-SID trust
 
@@ -559,7 +560,10 @@ Keep private roots and immutable inputs pinned by held handles. Require
 verified consumer opens and deny-replacement and no-redirection custody
 through handoff. Close any effect whose custody the pinned QEMU or helper
 cannot prove. These controls bind effects and limit child access and lifetime.
-Audit the execution mode as `current_user` and keep raw identities local.
+They do not protect against malicious code running under the same Windows
+account (same SID) that interferes with the daemon, pipe or resources. Audit
+the execution mode as `current_user` with no dedicated-account isolation
+claim, and keep raw identities local.
 
 ### Console activity and capacity
 
@@ -574,8 +578,8 @@ disconnect, session switch, ambiguity or stale observations also close
 admission. Bring owned work to bounded quiescence when the owner returns or
 activity or reserves cannot be established. Uncertain release stays charged.
 The owner chooses one console-idle window for the unattended live test.
-Explicitly pin any static VM to the opportunistic host, subject to the same
-activity and reserve rules.
+A static VM runs on this opportunistic host only when explicitly pinned to
+it, subject to the same activity and reserve rules.
 
 Enforce an aggregate **200 GiB VM disk cap on D:** with **at least 50 GiB
 always free on D:**. Verify physical fixed-size NTFS capacity and, for fixed
