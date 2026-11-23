@@ -1,3 +1,5 @@
+export const RUST_UBUNTU_RUNNER = 'ubuntu-24.04';
+
 export function budget(latest, candidate, speed) {
   if (!latest || !Number.isFinite(latest.seconds) || latest.seconds < 0) throw Error('No valid completed main CI baseline');
   if ((creditable(latest) ? latest.chargedSeconds : latest.seconds) <= 900) return true;
@@ -27,8 +29,14 @@ export function queueMeasurement(wall, run, payload, listed, kind, repositoryId)
       !Number.isFinite(S) || !Number.isFinite(U) || U - S !== wall.seconds || U - S < 0 || U - S > 604800) return unavailable('run-invalid');
   if (!payload || ![3, 9].includes(payload.total_count) || !Array.isArray(payload.jobs) || payload.jobs.length !== payload.total_count) return unavailable('jobs-invalid');
   const split = payload.total_count === 9;
-  const names = new Map((split ? ['rust', 'ui', 'verify'] : ['verify']).flatMap(phase =>
-    ['ubuntu-latest', 'windows-latest', 'macos-latest'].map(os => [`${phase} (${os})`, { label: split && phase === 'verify' ? 'ubuntu-latest' : os, gate: split && phase === 'verify' }])));
+  const names = new Map((split ? ['rust', 'ui', 'verify'] : ['verify']).flatMap(phase => {
+    const gate = split && phase === 'verify';
+    return ['ubuntu-latest', 'windows-latest', 'macos-latest'].map(os => {
+      let label = gate ? 'ubuntu-latest' : os;
+      if (phase === 'rust' && os === 'ubuntu-latest') label = RUST_UBUNTU_RUNNER;
+      return [`${phase} (${os})`, { label, gate }];
+    });
+  }));
   const ids = new Set(), intervals = [];
   for (const job of payload.jobs) {
     const expected = names.get(job?.name);
