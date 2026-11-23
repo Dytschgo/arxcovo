@@ -198,7 +198,10 @@ pub struct OriginPortLease {
 impl OriginPortLease {
     pub fn acquire() -> std::io::Result<Self> {
         let mut nonce = [0];
-        getrandom::fill(&mut nonce).map_err(std::io::Error::other)?;
+        // getrandom's error type implements std::error::Error only with its
+        // `std` feature, which feature unification enables on some targets
+        // but not others; go through Display so every target builds.
+        getrandom::fill(&mut nonce).map_err(|e| std::io::Error::other(e.to_string()))?;
         let size = ORIGIN_PORT_LAST - ORIGIN_PORT_FIRST + 1;
         for attempt in 0..size {
             let port = ORIGIN_PORT_FIRST + (u16::from(nonce[0]) + attempt) % size;
