@@ -1067,15 +1067,20 @@ fn admission_refuses_missing_or_mismatched_evidence_with_typed_reasons() {
         },
     };
     let route = route();
-    let other_enrolled = ArtifactPin {
-        sha256: [0x55; 32],
-        ..pin
-    };
+    // Admission reads both pins from a real validated profile.
+    let enrolled = enrolled_profile(pin, patched);
+    let other_policy = enrolled_profile(
+        ArtifactPin {
+            sha256: [0x55; 32],
+            ..pin
+        },
+        patched,
+    );
+    let unenrolled = parse(&profile()).unwrap();
     let full = EgressEvidence {
         policy: Some(&custodied),
-        enrolled_policy: Some(&pin),
+        profile: Some(&enrolled),
         route: Some(&route),
-        binary: Some(&patched),
         executable: Some(&executable),
     };
 
@@ -1092,14 +1097,21 @@ fn admission_refuses_missing_or_mismatched_evidence_with_typed_reasons() {
         ),
         (
             EgressEvidence {
-                enrolled_policy: None,
+                profile: None,
                 ..full
             },
-            PolicyMissing,
+            Unenrolled,
         ),
         (
             EgressEvidence {
-                enrolled_policy: Some(&other_enrolled),
+                profile: Some(&unenrolled),
+                ..full
+            },
+            Unenrolled,
+        ),
+        (
+            EgressEvidence {
+                profile: Some(&other_policy),
                 ..full
             },
             PolicyMismatch,
@@ -1123,6 +1135,7 @@ fn admission_refuses_missing_or_mismatched_evidence_with_typed_reasons() {
             gateway: Ipv4Addr::new(192, 168, 1, 254),
             ..route
         };
+        let stock_profile = enrolled_profile(pin, stock);
         for (evidence, refusal) in [
             (
                 EgressEvidence {
@@ -1140,14 +1153,14 @@ fn admission_refuses_missing_or_mismatched_evidence_with_typed_reasons() {
             ),
             (
                 EgressEvidence {
-                    binary: None,
+                    profile: Some(&other_policy),
                     ..full
                 },
-                BinaryMissing,
+                PolicyMismatch,
             ),
             (
                 EgressEvidence {
-                    binary: Some(&stock),
+                    profile: Some(&stock_profile),
                     ..full
                 },
                 BinaryStock,
@@ -1171,6 +1184,66 @@ fn admission_refuses_missing_or_mismatched_evidence_with_typed_reasons() {
             NativeRefusal::NetworkFenceUnverified
         );
     }
+}
+
+/// Permissions that drift after custody opened are caught at verification,
+/// for the held anchor directory as well as the leaf.
+#[test]
+fn custody_rechecks_the_held_anchor_and_leaf_at_verification() {
+    let dir = PrivateDir::new();
+    let pin = dir.write("policy.txt", policy_text().as_bytes());
+    let custodied = CustodiedPolicy::open(dir.path(), "policy.txt", pin).unwrap();
+    assert_eq!(custodied.verify(), Ok(()));
+    let leaf = dir.path().join("policy.txt");
+    let refused = Err(EgressRefusal::PolicyCustody);
+    #[cfg(unix)]
+    {
+        set_mode(dir.path(), 0o750);
+        assert_eq!(custodied.verify(), refused, "anchor group bits");
+        set_mode(dir.path(), 0o700);
+        assert_eq!(custodied.verify(), Ok(()));
+        set_mode(&leaf, 0o640);
+        assert_eq!(custodied.verify(), refused, "leaf group bits");
+        set_mode(&leaf, 0o600);
+        assert_eq!(custodied.verify(), Ok(()));
+    }
+    #[cfg(windows)]
+    {
+        for (path, aces, protected, label) in [
+            (
+                dir.path(),
+                "(A;;FA;;;{u})(A;;FA;;;SY)",
+                true,
+                "anchor extra entry",
+            ),
+            (dir.path(), "(A;;FA;;;{u})", false, "anchor unprotected"),
+            (dir.path(), "(A;OICI;FA;;;{u})", true, "anchor inheritable"),
+            (
+                leaf.as_path(),
+                "(A;;FA;;;{u})(A;;FR;;;WD)",
+                true,
+                "leaf extra entry",
+            ),
+            (leaf.as_path(), "(A;;FA;;;{u})", false, "leaf unprotected"),
+        ] {
+            win::set_dacl(path, aces, protected);
+            assert_eq!(custodied.verify(), refused, "{label}");
+            win::protect(path);
+            assert_eq!(custodied.verify(), Ok(()), "{label} restored");
+        }
+    }
+}
+
+fn enrolled_profile(policy: ArtifactPin, binary: EgressBinaryPin) -> VmRuntimeProfile {
+    let pin = |pin: ArtifactPin| json!({"length": pin.size, "sha256": hex::encode(pin.sha256)});
+    let mut value = profile();
+    value["public_egress"] = json!({
+        "manifest": EGRESS_MANIFEST,
+        "qemu": pin(binary.qemu),
+        "receipt": pin(binary.receipt),
+        "policy": pin(policy),
+    });
+    parse(&value).unwrap()
 }
 
 fn profile() -> Value {

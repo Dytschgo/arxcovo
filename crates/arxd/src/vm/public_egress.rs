@@ -201,6 +201,9 @@ pub enum EgressRefusal {
     /// The plan is not a sealed public-egress boot or its lease is not held.
     PlanMismatch,
     PolicyMissing,
+    /// No validated profile, or the profile enrolls no public-egress build
+    /// and policy.
+    Unenrolled,
     /// The anchored path, privacy, link or identity checks failed.
     PolicyCustody,
     /// A first line other than `version=1`.
@@ -573,11 +576,10 @@ impl EgressBinaryPin {
 pub struct EgressEvidence<'a> {
     /// The policy object held read-only by the supervisor.
     pub policy: Option<&'a CustodiedPolicy>,
-    /// The profile's enrolled policy pin.
-    pub enrolled_policy: Option<&'a ArtifactPin>,
+    /// The validated runtime profile. Admission reads the enrolled policy
+    /// pin and the patched-binary pin from it, never from loose values.
+    pub profile: Option<&'a crate::config::VmRuntimeProfile>,
     pub route: Option<&'a RouteObservation>,
-    /// The profile's configured patched-binary pin.
-    pub binary: Option<&'a EgressBinaryPin>,
     /// The patched executable object held read-only by the supervisor.
     pub executable: Option<&'a HeldExecutable>,
 }
@@ -608,11 +610,15 @@ fn admit_against(
         })
         .ok_or(EgressRefusal::PlanMismatch)?;
     let policy = evidence.policy.ok_or(EgressRefusal::PolicyMissing)?;
+    // Re-verifies the leaf and the anchor directory through their held
+    // handles, so the exact held spelling still resolves to the held object.
     policy.verify()?;
-    let enrolled = evidence
-        .enrolled_policy
-        .ok_or(EgressRefusal::PolicyMissing)?;
-    if *enrolled != policy.pin()
+    let profile = evidence.profile.ok_or(EgressRefusal::Unenrolled)?;
+    let (enrolled, binary) = profile
+        .public_egress_policy_pin()
+        .zip(profile.public_egress_binary())
+        .ok_or(EgressRefusal::Unenrolled)?;
+    if enrolled != policy.pin()
         || !policy
             .held
             .names(planned_policy, ArtifactRole::PublicEgressPolicy)
@@ -620,10 +626,7 @@ fn admit_against(
         return Err(EgressRefusal::PolicyMismatch);
     }
     policy.policy().verify_route(evidence.route)?;
-    let qualified = evidence
-        .binary
-        .ok_or(EgressRefusal::BinaryMissing)?
-        .qualify_against(reviewed)?;
+    let qualified = binary.qualify_against(reviewed)?;
     let executable = evidence.executable.ok_or(EgressRefusal::BinaryMissing)?;
     executable.verify()?;
     if executable.held.pin != qualified.pin().qemu
@@ -712,12 +715,15 @@ impl Held {
         )
     }
 
-    /// Exact path, identity and pin equality with a planned artifact.
+    /// Exact, case-preserving path equality plus identity and pin equality
+    /// with a planned artifact. NTFS directories can be case-sensitive, so
+    /// another case may name another object. `verify` proves that this exact
+    /// spelling still resolves to the held identity.
     fn names(&self, planned: &Artifact, role: ArtifactRole) -> bool {
         self.local_path().is_some_and(|local| {
             planned
                 .path_for(role)
-                .is_ok_and(|path| path.as_str().eq_ignore_ascii_case(local.as_str()))
+                .is_ok_and(|path| path.as_str() == local.as_str())
         }) && planned.identity() == Some(self.identity)
             && planned.pin() == Some(self.pin)
     }
@@ -739,7 +745,9 @@ enum HeldError {
 /// owner-only mode leaves the same effective UID as the only principal that
 /// could rename, the stated POSIX trust boundary.
 pub struct CustodiedPolicy {
-    _directory: File,
+    directory: File,
+    directory_path: PathBuf,
+    directory_identity: FileIdentity,
     held: Held,
     policy: PublicEgressPolicy,
 }
@@ -777,21 +785,36 @@ impl CustodiedPolicy {
         crate::config::checked_path(directory).map_err(custody)?;
         let held_directory = custody::directory(directory).map_err(custody)?;
         custody::private(&held_directory).map_err(custody)?;
+        let directory_identity = custody::directory_identity(&held_directory).map_err(custody)?;
         let (held, bytes) = Held::open(directory.join(name), expected, MAX_POLICY_BYTES, true)
             .map_err(|error| match error {
                 HeldError::Custody => EgressRefusal::PolicyCustody,
                 HeldError::Content => EgressRefusal::PolicyMismatch,
             })?;
         let policy = PublicEgressPolicy::parse(&bytes)?;
-        Ok(Self {
-            _directory: held_directory,
+        let custodied = Self {
+            directory: held_directory,
+            directory_path: directory.to_owned(),
+            directory_identity,
             held,
             policy,
-        })
+        };
+        custodied.verify()?;
+        Ok(custodied)
     }
 
-    /// The name still denotes the held, still private object.
+    /// Both names still denote the held objects, and both held handles are
+    /// still private: the leaf and the anchor directory, rechecked now.
     pub fn verify(&self) -> Result<(), EgressRefusal> {
+        let anchor = custody::private(&self.directory).is_ok()
+            && custody::directory_identity(&self.directory)
+                .is_ok_and(|identity| identity == self.directory_identity)
+            && custody::directory(&self.directory_path)
+                .and_then(|named| custody::directory_identity(&named))
+                .is_ok_and(|identity| identity == self.directory_identity);
+        if !anchor {
+            return Err(EgressRefusal::PolicyCustody);
+        }
         self.held
             .verify(true)
             .map_err(|_| EgressRefusal::PolicyCustody)
@@ -1026,6 +1049,47 @@ mod custody {
     }
 
     #[cfg(unix)]
+    pub(super) fn directory_identity(directory: &fs::File) -> Result<FileIdentity> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = directory.metadata()?;
+        ensure!(meta.is_dir(), "directory required");
+        Ok(FileIdentity {
+            volume: meta.dev(),
+            file: u128::from(meta.ino()).to_be_bytes(),
+        })
+    }
+
+    #[cfg(windows)]
+    pub(super) fn directory_identity(directory: &fs::File) -> Result<FileIdentity> {
+        use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        let metadata = directory.metadata()?;
+        ensure!(
+            metadata.is_dir() && metadata.file_attributes() & 0x400 == 0,
+            "ordinary directory required"
+        );
+        let mut id = FILE_ID_INFO::default();
+        // `directory` owns the handle; the query writes its fixed-size output.
+        ensure!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    directory.as_raw_handle(),
+                    FileIdInfo,
+                    std::ptr::from_mut(&mut id).cast(),
+                    size_of::<FILE_ID_INFO>() as u32,
+                ) != 0
+            },
+            "directory identity unavailable"
+        );
+        Ok(FileIdentity {
+            volume: id.VolumeSerialNumber,
+            file: id.FileId.Identifier,
+        })
+    }
+
+    #[cfg(unix)]
     pub(super) fn identity(file: &fs::File) -> Result<FileIdentity> {
         use std::os::unix::fs::MetadataExt;
         let meta = file.metadata()?;
@@ -1184,8 +1248,8 @@ mod tests {
 
     /// The positive path needs a reviewed build, which only this private
     /// seam can supply; production always refuses until one is reviewed.
-    /// Every mismatch keeps the same digest or bytes where it can, so only
-    /// the object binding refuses it.
+    /// Every mismatch keeps the same digest, bytes, identity or pin where it
+    /// can, so only the binding under test refuses it.
     #[cfg(windows)]
     #[test]
     fn admission_binds_the_held_objects_to_the_exact_plan_inputs() {
@@ -1237,11 +1301,11 @@ mod tests {
             receipt: pin(3),
         };
         let reviewed = review(configured);
+        let enrolled = fixtures::profile(Some((policy_pin, configured)));
         let evidence = EgressEvidence {
             policy: Some(&custodied),
-            enrolled_policy: Some(&policy_pin),
+            profile: Some(&enrolled),
             route: Some(&route),
-            binary: Some(&configured),
             executable: Some(&executable),
         };
         assert_eq!(
@@ -1252,13 +1316,50 @@ mod tests {
             admit(&plan, evidence),
             Err(EgressRefusal::BinaryUnqualified)
         );
-        let unrelated = EgressBinaryPin {
-            qemu: other_pin,
-            ..configured
-        };
-        let other_enrolled = pin(4);
+        // Real validated profiles that enroll something else.
+        let unenrolled = fixtures::profile(None);
+        let other_policy = fixtures::profile(Some((pin(4), configured)));
+        let unrelated = fixtures::profile(Some((
+            policy_pin,
+            EgressBinaryPin {
+                qemu: other_pin,
+                ..configured
+            },
+        )));
         use EgressRefusal::*;
         for (case, refusal, label) in [
+            (
+                EgressEvidence {
+                    profile: None,
+                    ..evidence
+                },
+                Unenrolled,
+                "no profile",
+            ),
+            (
+                EgressEvidence {
+                    profile: Some(&unenrolled),
+                    ..evidence
+                },
+                Unenrolled,
+                "profile without a public-egress enrollment",
+            ),
+            (
+                EgressEvidence {
+                    profile: Some(&other_policy),
+                    ..evidence
+                },
+                PolicyMismatch,
+                "profile enrolls another policy pin",
+            ),
+            (
+                EgressEvidence {
+                    profile: Some(&unrelated),
+                    ..evidence
+                },
+                BinaryUnqualified,
+                "receipt reused for another executable",
+            ),
             (
                 EgressEvidence {
                     policy: Some(&same_digest),
@@ -1266,22 +1367,6 @@ mod tests {
                 },
                 PolicyMismatch,
                 "same-digest policy at another path",
-            ),
-            (
-                EgressEvidence {
-                    enrolled_policy: None,
-                    ..evidence
-                },
-                PolicyMissing,
-                "unenrolled policy",
-            ),
-            (
-                EgressEvidence {
-                    enrolled_policy: Some(&other_enrolled),
-                    ..evidence
-                },
-                PolicyMismatch,
-                "other enrolled pin",
             ),
             (
                 EgressEvidence {
@@ -1307,14 +1392,6 @@ mod tests {
                 BinaryMissing,
                 "no held executable",
             ),
-            (
-                EgressEvidence {
-                    binary: Some(&unrelated),
-                    ..evidence
-                },
-                BinaryUnqualified,
-                "receipt reused for another executable",
-            ),
         ] {
             assert_eq!(
                 admit_against(&plan, case, &reviewed),
@@ -1322,56 +1399,130 @@ mod tests {
                 "{label}"
             );
         }
-        // Plans naming a different object with the same pin.
+        // Plans whose spelling differs from the held path while they advertise
+        // the held identity and pin, or whose identity is forged.
+        let held_policy_path = policy
+            .path_for(ArtifactRole::PublicEgressPolicy)
+            .unwrap()
+            .as_str()
+            .to_owned();
+        let held_image_path = image
+            .path_for(ArtifactRole::PublicEgressQemu)
+            .unwrap()
+            .as_str()
+            .to_owned();
+        let advertise = |role, path: &str, identity, pin| {
+            Artifact::new(role, LocalPath::parse(path).unwrap())
+                .unwrap()
+                .with_identity(identity)
+                .with_pin(pin)
+        };
         let fake = FileIdentity {
             volume: 1,
             file: [7; 16],
         };
-        let forged_policy = Artifact::new(
-            ArtifactRole::PublicEgressPolicy,
-            policy
-                .path_for(ArtifactRole::PublicEgressPolicy)
-                .unwrap()
-                .clone(),
-        )
-        .unwrap()
-        .with_identity(fake)
-        .with_pin(policy_pin);
-        let twin_policy = same_digest.artifact().unwrap();
-        let forged_image = Artifact::new(
-            ArtifactRole::PublicEgressQemu,
-            image
-                .path_for(ArtifactRole::PublicEgressQemu)
-                .unwrap()
-                .clone(),
-        )
-        .unwrap()
-        .with_identity(fake)
-        .with_pin(exe_pin);
-        let copy_image = copy.artifact().unwrap();
-        for (image, policy, refusal) in [
-            (&image, &forged_policy, PolicyMismatch),
-            (&image, &twin_policy, PolicyMismatch),
-            (&forged_image, &policy, BinaryMismatch),
-            (&copy_image, &policy, BinaryMismatch),
+        let twin_policy_path = same_digest.artifact().unwrap();
+        let twin_policy_path = twin_policy_path
+            .path_for(ArtifactRole::PublicEgressPolicy)
+            .unwrap()
+            .as_str();
+        let copy_image_path = copy.artifact().unwrap();
+        let copy_image_path = copy_image_path
+            .path_for(ArtifactRole::PublicEgressQemu)
+            .unwrap()
+            .as_str();
+        let policy_role = ArtifactRole::PublicEgressPolicy;
+        let image_role = ArtifactRole::PublicEgressQemu;
+        let case_policy = advertise(
+            policy_role,
+            &held_policy_path.replace("policy.txt", "POLICY.TXT"),
+            custodied.identity(),
+            policy_pin,
+        );
+        let moved_policy = advertise(
+            policy_role,
+            twin_policy_path,
+            custodied.identity(),
+            policy_pin,
+        );
+        let forged_policy = advertise(policy_role, &held_policy_path, fake, policy_pin);
+        let case_image = advertise(
+            image_role,
+            &held_image_path.replace("qemu.exe", "QEMU.EXE"),
+            executable.identity(),
+            exe_pin,
+        );
+        let moved_image = advertise(image_role, copy_image_path, executable.identity(), exe_pin);
+        let forged_image = advertise(image_role, &held_image_path, fake, exe_pin);
+        for (image, policy, refusal, label) in [
+            (
+                &image,
+                &case_policy,
+                PolicyMismatch,
+                "policy path in another case",
+            ),
+            (
+                &image,
+                &moved_policy,
+                PolicyMismatch,
+                "policy path of the twin",
+            ),
+            (
+                &image,
+                &forged_policy,
+                PolicyMismatch,
+                "forged policy identity",
+            ),
+            (
+                &case_image,
+                &policy,
+                BinaryMismatch,
+                "image path in another case",
+            ),
+            (
+                &moved_image,
+                &policy,
+                BinaryMismatch,
+                "image path of the copy",
+            ),
+            (
+                &forged_image,
+                &policy,
+                BinaryMismatch,
+                "forged image identity",
+            ),
         ] {
             let sealed = recipe(image, policy);
             let plan = sealed.plan().unwrap();
-            assert_eq!(admit_against(&plan, evidence, &reviewed), Err(refusal));
+            assert_eq!(
+                admit_against(&plan, evidence, &reviewed),
+                Err(refusal),
+                "{label}"
+            );
         }
         // A plan that faithfully names and holds other executable bytes is
         // still refused: the held bytes must be the qualified build.
         let other_image = other.artifact().unwrap();
         let sealed = recipe(&other_image, &policy);
-        let plan = sealed.plan().unwrap();
+        let other_plan = sealed.plan().unwrap();
         let faithful = EgressEvidence {
             executable: Some(&other),
             ..evidence
         };
         assert_eq!(
-            admit_against(&plan, faithful, &reviewed),
+            admit_against(&other_plan, faithful, &reviewed),
             Err(BinaryMismatch)
         );
+        // Anchor drift after custody opened: admission re-verifies the held
+        // directory handle, not just the leaf.
+        fixtures::set_dacl(dir.path(), "(A;;FA;;;{u})(A;;FA;;;SY)");
+        assert_eq!(
+            admit_against(&plan, evidence, &reviewed),
+            Err(PolicyCustody),
+            "anchor gained a second entry"
+        );
+        fixtures::set_dacl(dir.path(), "(A;;FA;;;{u})");
+        assert!(admit_against(&plan, evidence, &reviewed).is_ok());
     }
 
     mod fixtures {
@@ -1455,6 +1606,37 @@ mod tests {
         /// non-inheritable TokenUser FullControl entry.
         #[cfg(windows)]
         fn protect(path: &Path) {
+            set_dacl(path, "(A;;FA;;;{u})");
+        }
+
+        /// A validated profile, optionally enrolling a policy pin and a
+        /// patched-binary pin.
+        #[cfg(windows)]
+        pub(super) fn profile(
+            enrollment: Option<(ArtifactPin, EgressBinaryPin)>,
+        ) -> crate::config::VmRuntimeProfile {
+            let pin = |pin: ArtifactPin| serde_json::json!({"length": pin.size, "sha256": hex::encode(pin.sha256)});
+            let mut value = serde_json::json!({
+                "enabled": true, "owner_sid": "S-1-5-21-1-2-3-1001",
+                "supervisor_sid": "S-1-5-21-1-2-3-1002", "bundle": "E:/pinned bundle",
+                "volume": "D:/", "state": "D:/test_vms/state",
+                "disk_ceiling_bytes": 10_737_418_240_u64, "manifest": "qemu-11.1.3-windows-x64",
+            });
+            if let Some((policy, binary)) = enrollment {
+                value["public_egress"] = serde_json::json!({
+                    "manifest": EGRESS_MANIFEST,
+                    "qemu": pin(binary.qemu),
+                    "receipt": pin(binary.receipt),
+                    "policy": pin(policy),
+                });
+            }
+            crate::config::VmRuntimeProfile::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+        }
+
+        /// TokenUser owner and a protected DACL `aces`, where `{u}` names
+        /// TokenUser.
+        #[cfg(windows)]
+        pub(super) fn set_dacl(path: &Path, aces: &str) {
             use std::{os::windows::ffi::OsStrExt, ptr};
             use windows_sys::Win32::{
                 Foundation::{CloseHandle, LocalFree},
@@ -1481,7 +1663,7 @@ mod tests {
                 let n = (0..184).find(|i| *text.add(*i) == 0).unwrap();
                 let sid_text = String::from_utf16(std::slice::from_raw_parts(text, n)).unwrap();
                 LocalFree(text.cast());
-                let sddl: Vec<u16> = format!("D:P(A;;FA;;;{sid_text})")
+                let sddl: Vec<u16> = format!("D:P{}", aces.replace("{u}", &sid_text))
                     .encode_utf16()
                     .chain(Some(0))
                     .collect();

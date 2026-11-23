@@ -583,8 +583,10 @@ permission bit may be set. On Windows, TokenUser must own each object, the
 DACL must be protected, and the DACL must consist of exactly one explicit,
 non-inheritable TokenUser FullControl entry, checked with the same
 `vm_acl::exact` helper as the runtime inputs above. Custody reads the bytes
-through the held handle and verifies the pin over exactly those bytes. It
-re-verifies that the name still denotes the held, still private object.
+through the held handle and verifies the pin over exactly those bytes. At
+every verification, including admission, it re-checks the anchor directory
+and the leaf through their held handles: both names still denote the held
+objects, and both handles still meet the privacy rule.
 Windows holds the file without write or delete sharing and the directory
 without delete sharing. The patched executable is held read-only the same
 way and measured through its handle. As a bundle input it carries no
@@ -595,9 +597,14 @@ mismatched:
 
 - the plan or its lease;
 - the policy's presence, custody, grammar, completeness or fingerprint;
-- a held policy that differs from the enrolled profile pin;
+- a missing validated profile or public-egress enrollment (`Unenrolled`).
+  Admission reads the enrolled policy pin and the patched-binary pin from
+  the validated `VmRuntimeProfile` itself, never from loose values;
+- a held policy that differs from the profile's enrolled pin;
 - a held policy or executable that is not the exact object the plan's argv
-  names, by local path, file identity and content pin;
+  names. The normalized local path must equal the argv spelling exactly,
+  case included, because NTFS directories can be case-sensitive. The file
+  identity and content pin must also match;
 - a route other than the enrolled default uplink (index, LUID, source and
   gateway);
 - a patched binary that is missing, stock or unqualified, or whose held
