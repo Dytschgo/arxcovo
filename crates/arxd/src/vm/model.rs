@@ -156,6 +156,7 @@ pub enum Refusal {
     Cpu,
     Ram,
     Shutdown,
+    CleanupUnconfirmed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
