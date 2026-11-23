@@ -176,7 +176,7 @@ function decodeSnapshot(v: unknown, path: string): Snapshot {
   return {
     id: id(o.id, `${path}.id`),
     name: str(o.name, `${path}.name`, 128),
-    createdAt: iso(o.createdAt, `${path}.createdAt`),
+    createdAt: nullable(o.createdAt, x => iso(x, `${path}.createdAt`)),
     sizeBytes: nullable(o.sizeBytes, x => int(x, `${path}.sizeBytes`)),
   };
 }
@@ -199,8 +199,8 @@ export function decodeVm(v: unknown, path = 'vm'): Vm {
     state: oneOf(o.state, VM_STATES, `${path}.state`),
     ready: bool(o.ready, `${path}.ready`),
     expiresAt,
-    cpus: int(o.cpus, `${path}.cpus`, 1, 1024),
-    memoryBytes: int(o.memoryBytes, `${path}.memoryBytes`),
+    cpus: nullable(o.cpus, x => int(x, `${path}.cpus`, 1, 1024)),
+    memoryBytes: nullable(o.memoryBytes, x => int(x, `${path}.memoryBytes`)),
     diskBytes: int(o.diskBytes, `${path}.diskBytes`),
     snapshots: arr(o.snapshots, `${path}.snapshots`, LIMITS.snapshots, decodeSnapshot),
   };

@@ -37,8 +37,8 @@ export function VmDetailView({ id }: { id: string }) {
                 <section className="panel" aria-labelledby="vm-size">
                   <h2 id="vm-size">Size</h2>
                   <Facts items={[
-                    ['vCPUs', String(vm.cpus)],
-                    ['Memory', formatBytes(vm.memoryBytes)],
+                    ['vCPUs', vm.cpus === null ? '—' : String(vm.cpus)],
+                    ['Memory', vm.memoryBytes === null ? '—' : formatBytes(vm.memoryBytes)],
                     ['Disk', formatBytes(vm.diskBytes)],
                   ]} />
                 </section>
@@ -50,7 +50,7 @@ export function VmDetailView({ id }: { id: string }) {
                     {vm.snapshots.map(s => (
                       <li key={s.id} className="row">
                         <span className="row-title">{s.name}</span>
-                        <time dateTime={s.createdAt}>{formatDate(s.createdAt)}</time>
+                        {s.createdAt === null ? <span>—</span> : <time dateTime={s.createdAt}>{formatDate(s.createdAt)}</time>}
                         <span>{s.sizeBytes === null ? '—' : formatBytes(s.sizeBytes)}</span>
                       </li>
                     ))}

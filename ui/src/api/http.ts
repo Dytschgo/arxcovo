@@ -1,4 +1,5 @@
-// HTTP + WebSocket adapter for the proposed dashboard API (docs/dashboard-api.md).
+// HTTP + WebSocket adapter for the dashboard API (docs/dashboard-api.md).
+// The VM decoder accepts null for metadata that older catalogs did not record.
 // The session lives in an httpOnly cookie the page cannot read; the CSRF token
 // lives only in this object's memory and is sent on every unsafe request.
 import { decodeActivityPage, decodeHost, decodeHosts, decodeSession, decodeVm, decodeVms, isIsoInstant, isValidId } from './decode';

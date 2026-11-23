@@ -1,6 +1,6 @@
 //! The VM profile has its own activity schema and database version. The
 //! shared and service openers have no route into this module.
-//! Each VM opener rejects later versions: v5 rejects v6 and v6 rejects v7.
+//! Each VM opener rejects later versions.
 //! Upgrades are forward-only. Upgraded state needs a matching or newer opener.
 use super::{check_size, validate_principal};
 use crate::vm::{
@@ -108,7 +108,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 7;
+const VM_SCHEMA_VERSION: u32 = 8;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -300,6 +300,12 @@ const TOMBSTONE_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
 // and their cleanup updates. New admission checks this after all its inserts.
 const HEADROOM_PAGES: u64 = 64;
 
+const MIGRATE_V8: &str = "
+ALTER TABLE vm_instances ADD COLUMN dashboard_cpus INTEGER CHECK(dashboard_cpus BETWEEN 1 AND 1024);
+ALTER TABLE vm_instances ADD COLUMN dashboard_memory INTEGER CHECK(dashboard_memory BETWEEN 1 AND 9007199254740991);
+ALTER TABLE vm_snapshots ADD COLUMN dashboard_created_ms INTEGER CHECK(dashboard_created_ms BETWEEN 0 AND 253402300799999);
+";
+
 pub(crate) struct VmStore {
     db: Mutex<Connection>,
     _database: fs::File,
@@ -349,7 +355,7 @@ impl VmStore {
         check_size(&db)?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
-            matches!(version, 0 | 5 | 6 | VM_SCHEMA_VERSION),
+            matches!(version, 0 | 5 | 6 | 7 | VM_SCHEMA_VERSION),
             "unsupported VM state version"
         );
         let replace = matches!(version, 0 | 5);
@@ -381,8 +387,11 @@ impl VmStore {
         if replace {
             tx.execute_batch(MIGRATE_V6)?;
         }
-        if upgrade {
+        if version < 7 {
             tx.execute_batch(MIGRATE_V7)?;
+        }
+        if upgrade {
+            tx.execute_batch(MIGRATE_V8)?;
         }
         recover(&tx, now)?;
         check_size(&tx)?;
@@ -428,6 +437,134 @@ fn open_sqlite(path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?)
+}
+
+pub(crate) struct DashboardCatalog {
+    db: Mutex<Connection>,
+    _database: fs::File,
+}
+
+pub(crate) struct DashboardVm {
+    pub id: Id,
+    pub template: Id,
+    pub guest: Guest,
+    pub state: &'static str,
+    pub expires_at_ms: i64,
+    pub cpus: Option<u32>,
+    pub memory: Option<u64>,
+    pub disk: u64,
+    pub snapshots: Vec<DashboardSnapshot>,
+}
+
+pub(crate) struct DashboardSnapshot {
+    pub id: Id,
+    pub created_at_ms: Option<i64>,
+    pub size: Option<u64>,
+}
+
+impl DashboardCatalog {
+    /// Acquire a read-only connection to the controller's catalog without
+    /// running recovery or taking ownership from the controller.
+    pub(crate) fn open(dir: &Path) -> Result<Self> {
+        crate::config::checked_path(dir)?;
+        crate::security::private(dir)?;
+        let path = dir.join("activity.sqlite3");
+        ensure!(check_existing_file(&path)?, "VM catalog not found");
+        for suffix in ["-journal", "-wal", "-shm"] {
+            check_existing_file(&dir.join(format!("activity.sqlite3{suffix}")))?;
+        }
+        let database = state_options().open(&path)?;
+        let mut db = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        verify_state_identity(&database, &path)?;
+        ensure!(
+            sqlite_main_identity(&mut db)? == state_identity(&database)?,
+            "VM catalog changed"
+        );
+        db.busy_timeout(Duration::from_millis(250))?;
+        db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;")?;
+        check_size(&db)?;
+        let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        ensure!(
+            version == VM_SCHEMA_VERSION,
+            "VM catalog must be opened by the current controller"
+        );
+        Ok(Self {
+            db: Mutex::new(db),
+            _database: database,
+        })
+    }
+
+    pub(crate) fn list(&self, id: Option<Id>, now: i64) -> Result<Vec<DashboardVm>> {
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM catalog unavailable"))?;
+        let tx = db.transaction()?;
+        check_size(&tx)?;
+        let mut stmt = tx.prepare(
+            "SELECT v.id,v.template,t.guest,v.state,v.expires_ms,
+                    v.dashboard_cpus,v.dashboard_memory,
+                    (SELECT coalesce(sum(d.persistent),0) FROM vm_disk_claims d
+                     WHERE d.vm=v.id AND d.snapshot IS NULL),
+                    EXISTS(SELECT 1 FROM activity a WHERE a.vm=v.id AND a.status=0 AND a.action=5)
+             FROM vm_instances v JOIN vm_templates t ON t.id=v.template
+             WHERE (?1 IS NULL OR v.id=?1) ORDER BY v.id LIMIT 1024",
+        )?;
+        let rows = stmt.query_map([id], |row| {
+            let expires = row.get::<_, i64>(4)?;
+            let state = match (
+                row.get::<_, i64>(3)?,
+                expires <= now,
+                row.get::<_, bool>(8)?,
+            ) {
+                (0..=4, true, _) | (4, _, _) => "destroying",
+                (0, _, _) => "creating",
+                (1 | 2, _, true) => "snapshotting",
+                (1, _, _) => "stopped",
+                (2, _, _) => "running",
+                (3, _, _) => "failed",
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            Ok(DashboardVm {
+                id: row.get(0)?,
+                template: row.get(1)?,
+                guest: match row.get::<_, i64>(2)? {
+                    1 => Guest::UbuntuX86_64,
+                    2 => Guest::WindowsX86_64,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                },
+                state,
+                expires_at_ms: expires,
+                cpus: row.get(5)?,
+                memory: row.get(6)?,
+                disk: row.get(7)?,
+                snapshots: Vec::new(),
+            })
+        })?;
+        let mut vms = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut snapshots = tx.prepare(
+            "SELECT s.id,s.dashboard_created_ms,
+                    (SELECT sum(d.persistent) FROM vm_disk_claims d WHERE d.vm=s.vm AND d.snapshot=s.id)
+             FROM vm_snapshots s WHERE s.vm=?1 AND s.ready=1 ORDER BY s.id LIMIT 256",
+        )?;
+        for vm in &mut vms {
+            vm.snapshots = snapshots
+                .query_map([vm.id], |row| {
+                    Ok(DashboardSnapshot {
+                        id: row.get(0)?,
+                        created_at_ms: row.get(1)?,
+                        size: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        }
+        Ok(vms)
+    }
 }
 
 fn check_existing_file(path: &Path) -> Result<bool> {
@@ -1540,9 +1677,9 @@ pub(crate) fn settle_with_script(
     )?;
     let success = status == Status::Succeeded;
     db.execute(
-        "UPDATE vm_snapshots SET ready=1 WHERE ?2 AND (vm,id) IN
+        "UPDATE vm_snapshots SET ready=1,dashboard_created_ms=?3 WHERE ?2 AND (vm,id) IN
         (SELECT vm,snapshot FROM vm_disk_claims WHERE activity_id=?1)",
-        params![id, success],
+        params![id, success, now],
     )?;
     db.execute(
         "DELETE FROM vm_snapshots WHERE NOT ?2 AND (vm,id) IN
@@ -2412,7 +2549,7 @@ mod tests {
                  (unhex(printf('%032x',5)),zeroblob(16),'bob',99,4,18),
                  (unhex(printf('%032x',6)),zeroblob(16),'bob',99,4,19);
              INSERT INTO vm_tombstones VALUES(unhex(printf('%032x',3)),'bob',14,17);
-             INSERT INTO vm_snapshots VALUES(unhex(printf('%032x',1)),zeroblob(16),1);
+             INSERT INTO vm_snapshots(vm,id,ready) VALUES(unhex(printf('%032x',1)),zeroblob(16),1);
              INSERT INTO vm_disk_claims VALUES
                  (8,unhex(printf('%032x',6)),NULL,17,0),
                  (10,unhex(printf('%032x',1)),NULL,5,0),

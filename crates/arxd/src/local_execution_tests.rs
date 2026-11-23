@@ -30,6 +30,7 @@ async fn foreground_listener_stop_joins_connections_and_rejects_later_calls() {
         development_execution: None,
         local: None,
         listen: None,
+        dashboard: None,
         state_dir: state.path().into(),
         agents: vec![crate::config::Agent {
             principal: "fixture-agent".into(),
@@ -194,6 +195,7 @@ async fn development_execution_over_real_bridge_pipe_and_sdk() {
         execution_settings: None,
         local: None,
         listen: None,
+        dashboard: None,
         state_dir: state.path().into(),
         agents: vec![agent("alpha", &alpha), agent("beta", &beta)],
     });
@@ -536,6 +538,7 @@ async fn dedicated_fake_bridge_schema_audit_and_storage_boundaries() {
         execution_settings: None,
         local: None,
         listen: None,
+        dashboard: None,
         state_dir: state.path().into(),
         agents: vec![agent("alpha", &alpha), agent("beta", &beta)],
     });
@@ -715,6 +718,7 @@ async fn dedicated_sdk_cancellation(automatic_timeout: bool) {
         execution_settings: None,
         local: None,
         listen: None,
+        dashboard: None,
         state_dir: state.path().into(),
         agents: vec![crate::config::Agent {
             principal: "alpha".into(),
@@ -817,6 +821,7 @@ async fn held_then_shutdown(point: crate::development::Checkpoint) -> HeldShutdo
         development_execution: None,
         local: None,
         listen: None,
+        dashboard: None,
         state_dir: state.path().into(),
         agents: vec![crate::config::Agent {
             principal: "fixture-agent".into(),

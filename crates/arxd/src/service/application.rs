@@ -336,6 +336,7 @@ impl<H: Hooks> Application for ServiceApplication<H> {
             development_execution: None,
             execution_settings: None,
             listen: None,
+            dashboard: None,
             state_dir: self.layout.as_ref().ok_or(ExitCode::Layout)?.state().into(),
             local: None,
             agents: config

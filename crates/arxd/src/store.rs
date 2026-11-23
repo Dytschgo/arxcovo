@@ -591,6 +591,61 @@ impl Activity {
     pub fn list(&self, principal: &str, read_id: i64, args: &ListActivity) -> Result<ActivityPage> {
         self.list_filtered(principal, read_id, args, None)
     }
+
+    /// The authenticated dashboard is an owner reader. This projection has no
+    /// MCP principal or audit id and cannot be called through the MCP tool.
+    pub(crate) fn dashboard_list(
+        &self,
+        args: &ListActivity,
+        outcome: Option<Outcome>,
+        tool: Option<&str>,
+    ) -> Result<Vec<DashboardActivity>> {
+        args.validate()?;
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        validate_columns(&db)?;
+        let mut stmt = db.prepare(
+            "SELECT id, CASE WHEN length(CAST(principal AS BLOB)) BETWEEN 1 AND 64 THEN principal END,
+                    actor_kind, CASE WHEN length(CAST(tool AS BLOB)) <= 64 THEN tool END,
+                    CASE WHEN length(CAST(outcome AS BLOB)) <= 16 THEN outcome END,
+                    exit_code, started_at_ms, finished_at_ms
+             FROM activity WHERE (?1 IS NULL OR id<?1) AND (?2 OR class<>'read')
+                AND (?3 IS NULL OR outcome=?3) AND (?4 IS NULL OR tool=?4)
+             ORDER BY id DESC LIMIT ?5",
+        )?;
+        let mut result = Vec::new();
+        let mut rows = stmt.query(params![
+            args.before_id,
+            args.include_reads,
+            outcome.map(Outcome::as_str),
+            tool,
+            args.limit + 1
+        ])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            validate_principal(&name)?;
+            let tool = Tool::parse(&row.get::<_, String>(3)?)?;
+            let outcome = Outcome::parse(&row.get::<_, String>(4)?)?;
+            let actor = match row.get_ref(2)?.as_str()? {
+                "agent" => "agent",
+                "daemon" if name == "arxd" => "system",
+                _ => anyhow::bail!("invalid activity actor"),
+            };
+            result.push(DashboardActivity {
+                id: row.get(0)?,
+                name,
+                actor,
+                tool,
+                outcome,
+                exit_code: row.get(5)?,
+                started: row.get(6)?,
+                finished: row.get(7)?,
+            });
+        }
+        Ok(result)
+    }
     /// Exact IDs share all pagination visibility and bounded decoding fences.
     pub(crate) fn list_filtered(
         &self,
@@ -1099,6 +1154,17 @@ impl ActivityRow {
 pub struct ActivityPage {
     pub activities: Vec<ActivityRow>,
     pub next_before_id: Option<i64>,
+}
+
+pub(crate) struct DashboardActivity {
+    pub id: i64,
+    pub name: String,
+    pub actor: &'static str,
+    pub tool: Tool,
+    pub outcome: Outcome,
+    pub exit_code: Option<i64>,
+    pub started: Option<i64>,
+    pub finished: Option<i64>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
