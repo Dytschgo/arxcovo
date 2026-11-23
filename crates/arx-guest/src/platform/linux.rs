@@ -1417,8 +1417,11 @@ mod tests {
 
     #[test]
     fn delegated_cgroup_kills_detached_descendant_and_confirms_empty() {
-        // The local emulator can provision this disposable unit-shaped tree
-        // and run this test on it as an ordinary user. Hosted CI may lack it.
+        // The held gate in this fixture runs only where a delegated cgroup v2
+        // tree exists. Local QEMU provisions that tree; hosted CI does not, so
+        // discovery fails and the test prints SKIP. That return is not gate
+        // coverage. Hosted dash covers the same gate in the process-group
+        // fixture, short_deadline_kills_process_group_and_reaps_owned_child.
         let owner = effective_uid();
         let service = if owner == 0 {
             SERVICE
@@ -1435,7 +1438,8 @@ mod tests {
         let root = match discover() {
             Ok(root) => root,
             Err(reason) => {
-                eprintln!("cgroup fixture skipped: {reason:?}");
+                // One line, then return. This is not a pass of the held gate.
+                eprintln!("SKIP delegated-cgroup: {reason:?}");
                 return;
             }
         };
@@ -1488,12 +1492,17 @@ mod tests {
                 ScriptOutcome::Exited { exit_code: 0 }
             );
         }
+        // The loop cannot finish. Reaching `held` above and spending this
+        // whole budget are both required; a return before either is not coverage.
+        let timeout = Duration::from_millis(50);
+        let started = Instant::now();
         assert_eq!(
-            runner
-                // The loop cannot finish. This is the production timeout budget.
-                .run("while :; do :; done", Duration::from_millis(50))
-                .unwrap(),
+            runner.run("while :; do :; done", timeout).unwrap(),
             ScriptOutcome::TimedOut
+        );
+        assert!(
+            started.elapsed() >= timeout,
+            "delegated-cgroup returned before the production timeout"
         );
         assert!(!group.path.exists());
 
