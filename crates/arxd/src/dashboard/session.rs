@@ -26,6 +26,13 @@ pub(super) fn cookie_key(text: &str) -> Option<Key> {
     Some(Sha256::digest(text.as_bytes()).into())
 }
 
+/// One registry keyed by the session ID's SHA-256 digest. A single lock
+/// linearizes lookup, renewal, rotation and removal.
+///
+/// B2 seam: streams add a per-session generation and registered
+/// cancellation (plus expiry wakeups) under this same lock, so logout,
+/// rotation and expiry close upgraded connections; stream checks must not
+/// renew `touched`.
 pub(super) struct Sessions {
     active: Mutex<Data>,
     hash_slot: Arc<tokio::sync::Semaphore>,

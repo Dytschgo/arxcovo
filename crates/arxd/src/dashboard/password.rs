@@ -84,7 +84,55 @@ fn file_options() -> OpenOptions {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_GENERIC_READ, FILE_GENERIC_WRITE, WRITE_OWNER,
+        };
+        options.access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_OWNER);
+    }
     options
+}
+
+/// Makes the current token user the owner of a file this process created.
+/// An elevated administrator token defaults new objects to the
+/// Administrators group, which the private-file owner check refuses.
+#[cfg(windows)]
+fn own(file: &File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{Authorization::*, *},
+    };
+    let identity = crate::local::current_identity()?;
+    let text: Vec<u16> = identity.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: the SID is allocated by the conversion, used while live and
+    // freed once; the handle is borrowed from the open file.
+    unsafe {
+        let mut sid = std::ptr::null_mut();
+        ensure!(
+            ConvertStringSidToSidW(text.as_ptr(), &mut sid) != 0,
+            "identity unavailable"
+        );
+        let status = SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            sid,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        LocalFree(sid);
+        ensure!(status == 0, "cannot set private owner");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn own(_: &File) -> Result<()> {
+    Ok(())
 }
 
 fn lock(dir: &Path) -> Result<File> {
@@ -92,7 +140,10 @@ fn lock(dir: &Path) -> Result<File> {
     ensure!(dir.is_dir(), "private state directory required");
     let path = dir.join(LOCK_FILE);
     let file = match file_options().read(true).open(&path) {
-        Ok(file) => file,
+        Ok(file) => {
+            own(&file)?;
+            file
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             check_private(&path)?;
             ensure!(path.is_file(), "invalid password lock");
@@ -145,6 +196,7 @@ fn write_password(dir: &Path, password: &str) -> Result<()> {
     let temp = dir.join(format!("dashboard-password-{}.tmp", super::random_token()?));
     let mut file = file_options().open(&temp)?;
     let write = (|| {
+        own(&file)?;
         check_private(&temp)?;
         file.write_all(value.as_bytes())?;
         file.sync_all()?;

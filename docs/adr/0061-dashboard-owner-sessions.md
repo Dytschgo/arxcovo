@@ -1,4 +1,4 @@
-# ADR 0060 Dashboard owner sessions
+# ADR 0061 Dashboard owner sessions
 
 ## Decision
 
@@ -53,7 +53,9 @@ installation account.
 The foreground listener projects the daemon's local inventory and owner-wide
 activity feed. The VM endpoint reads a configured controller catalog through
 a read-only connection. Schema v8 records CPU and memory at admission and
-the timestamp of successful snapshot creation. Older rows preserve unknown
+the timestamp of successful snapshot creation. The v7-to-v8 upgrade only adds
+nullable columns and keeps the forward-only rule of ADR 0060: a v7 opener
+refuses v8 state. Older rows preserve unknown
 values as null in the API. The dashboard reports the test VM catalog's
 recorded resources and does not probe guests as part of an HTTP read.
 

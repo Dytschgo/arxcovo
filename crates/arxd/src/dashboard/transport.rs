@@ -51,7 +51,7 @@ impl Listener {
         let socket = TcpListener::bind(config.listen).await?;
         let address = socket.local_addr()?;
         let authority = match &config.tls {
-            Some(tls) => tls.authority.clone(),
+            Some(tls) => canonical_authority(&tls.authority, config.listen)?,
             None if address.port() == 80 => "localhost".to_owned(),
             None => format!("localhost:{}", address.port()),
         };
@@ -111,8 +111,10 @@ async fn serve(io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, router:
     .await;
 }
 
-pub(super) fn validate_authority(raw: &str, listen: SocketAddr) -> Result<()> {
-    let authority: Authority = raw.parse()?;
+/// Returns the configured HTTPS authority in the form a browser serializes
+/// into `Host` and `Origin`: lowercase host, and the port only when it is
+/// not the HTTPS default 443 (written without leading zeros).
+pub(super) fn canonical_authority(raw: &str, listen: SocketAddr) -> Result<String> {
     ensure!(
         raw.len() <= 255
             && raw
@@ -120,12 +122,25 @@ pub(super) fn validate_authority(raw: &str, listen: SocketAddr) -> Result<()> {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-:[]".contains(&b)),
         "invalid dashboard authority"
     );
-    let port = authority.port_u16().unwrap_or(443);
+    let authority: Authority = raw.parse()?;
+    let host = authority.host();
+    let port = match &raw[host.len()..] {
+        "" => 443,
+        rest => {
+            let digits = rest
+                .strip_prefix(':')
+                .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| anyhow::anyhow!("invalid dashboard authority port"))?;
+            digits.parse::<u16>()?
+        }
+    };
     ensure!(
-        !authority.host().is_empty()
-            && listen.port() == port
-            && (authority.port().is_none() || authority.port_u16().is_some()),
+        !host.is_empty() && port != 0 && listen.port() == port,
         "dashboard authority must match listener port"
     );
-    Ok(())
+    Ok(if port == 443 {
+        host.to_owned()
+    } else {
+        format!("{host}:{port}")
+    })
 }

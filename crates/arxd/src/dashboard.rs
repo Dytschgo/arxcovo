@@ -58,7 +58,7 @@ pub struct DashboardTls {
 impl DashboardConfig {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if let Some(tls) = &self.tls {
-            transport::validate_authority(&tls.authority, self.listen)?;
+            transport::canonical_authority(&tls.authority, self.listen)?;
             ensure!(
                 (1..=4).contains(&tls.certificates.len()),
                 "dashboard certificate count out of bounds"

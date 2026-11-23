@@ -2573,6 +2573,76 @@ mod tests {
     }
 
     #[test]
+    fn v7_upgrade_preserves_rows_with_null_dashboard_columns() {
+        let dir = private_temp();
+        drop(v5_fixture(dir.path()));
+        drop(VmStore::open(dir.path(), NOW).unwrap());
+        // Model a merged v7 catalog: the v7 schema is v8 without the
+        // dashboard columns, so drop them and roll the version back.
+        let db = Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+        db.execute_batch(
+            "ALTER TABLE vm_instances DROP COLUMN dashboard_cpus;
+             ALTER TABLE vm_instances DROP COLUMN dashboard_memory;
+             ALTER TABLE vm_snapshots DROP COLUMN dashboard_created_ms;
+             PRAGMA user_version=7;",
+        )
+        .unwrap();
+        let rows = |db: &Connection| -> Result<[i64; 4]> {
+            Ok([
+                count(db, "SELECT count(*) FROM vm_instances", [])?,
+                count(db, "SELECT count(*) FROM vm_snapshots", [])?,
+                count(db, "SELECT count(*) FROM activity", [])?,
+                count(db, "SELECT count(*) FROM vm_operations", [])?,
+            ])
+        };
+        let before = rows(&db).unwrap();
+        assert!(before[0] > 0 && before[1] > 0);
+        drop(db);
+        assert!(DashboardCatalog::open(dir.path()).is_err());
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store
+            .transact(|db| {
+                assert_eq!(
+                    count(db, "PRAGMA user_version", [])?,
+                    i64::from(VM_SCHEMA_VERSION)
+                );
+                assert_eq!(rows(db)?, before);
+                assert_eq!(
+                    count(
+                        db,
+                        "SELECT count(*) FROM vm_instances
+                         WHERE dashboard_cpus IS NULL AND dashboard_memory IS NULL",
+                        []
+                    )?,
+                    before[0]
+                );
+                assert_eq!(
+                    count(
+                        db,
+                        "SELECT count(*) FROM vm_snapshots WHERE dashboard_created_ms IS NULL",
+                        []
+                    )?,
+                    before[1]
+                );
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let catalog = DashboardCatalog::open(dir.path()).unwrap();
+        let vms = catalog.list(None, NOW).unwrap();
+        assert_eq!(vms.len() as i64, before[0]);
+        assert!(
+            vms.iter()
+                .all(|vm| vm.cpus.is_none() && vm.memory.is_none())
+        );
+        assert!(
+            vms.iter()
+                .flat_map(|vm| &vm.snapshots)
+                .all(|snapshot| snapshot.created_at_ms.is_none())
+        );
+    }
+
+    #[test]
     fn v5_upgrade_preserves_rows_and_recovers_with_stable_operation_ids() {
         let dir = private_temp();
         drop(v5_fixture(dir.path()));

@@ -34,6 +34,76 @@ fn directory() -> tempfile::TempDir {
     crate::service::application::tests::private_temp()
 }
 
+/// Creates an owner-only child directory regardless of the process umask,
+/// then verifies it with the production privacy check.
+fn private_dir(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(path).unwrap();
+    crate::security::private(path).unwrap();
+}
+
+/// Makes the current token user (TokenUser) the owner of a fixture object
+/// with a protected owner-only DACL. Elevated runners otherwise default new
+/// objects to an Administrators owner, which the private-file check refuses.
+#[cfg(windows)]
+fn set_owner_private(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{Authorization::*, *},
+    };
+    let identity = crate::local::current_identity().unwrap();
+    let sddl: Vec<u16> = format!("O:{identity}D:P(A;OICI;FA;;;{identity})")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let mut sd = ptr::null_mut();
+        assert_ne!(
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut sd,
+                ptr::null_mut()
+            ),
+            0
+        );
+        let (mut owner, mut owner_defaulted) = (ptr::null_mut(), 0);
+        assert_ne!(
+            GetSecurityDescriptorOwner(sd, &mut owner, &mut owner_defaulted),
+            0
+        );
+        let (mut present, mut defaulted, mut acl) = (0, 0, ptr::null_mut());
+        assert_ne!(
+            GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted),
+            0
+        );
+        let result = SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            ptr::null_mut(),
+            acl,
+            ptr::null_mut(),
+        );
+        LocalFree(sd);
+        assert_eq!(result, 0, "fixture owner and DACL assignment");
+    }
+    crate::local::owned(path).unwrap();
+    crate::security::private(path).unwrap();
+}
+
 impl Fixture {
     fn new() -> Self {
         Self::with_catalog(false)
@@ -52,7 +122,7 @@ impl Fixture {
         })));
         let vm_catalog = catalog.then(|| {
             let root = dir.path().join("vm");
-            fs::create_dir(&root).unwrap();
+            private_dir(&root);
             let _controller =
                 crate::vm::VmController::open(&root, crate::vm::VmPolicy::default(), SystemClock)
                     .unwrap();
@@ -470,13 +540,29 @@ async fn owner_reads_bounds_pagination_and_no_credentials_in_activity() {
     let serialized = page.to_string();
     assert!(!serialized.contains(PASSWORD));
     assert!(!serialized.contains(cookie.split_once('=').unwrap().1));
-    let hosts = body(f.get("/api/v1/hosts", &cookie).await).await;
-    assert_eq!(hosts["hosts"].as_array().unwrap().len(), 1);
-    let id = hosts["hosts"][0]["id"].as_str().unwrap();
-    assert_eq!(
-        body(f.get(&format!("/api/v1/hosts/{id}"), &cookie).await).await["id"],
-        id
-    );
+    // The v1 host contract covers Windows and Linux on x86_64 and arm64; the
+    // reader answers other platforms (macOS CI) with the unavailable envelope.
+    let supported = matches!(std::env::consts::OS, "windows" | "linux")
+        && matches!(std::env::consts::ARCH, "x86_64" | "aarch64");
+    if supported {
+        let hosts = body(f.get("/api/v1/hosts", &cookie).await).await;
+        assert_eq!(hosts["hosts"].as_array().unwrap().len(), 1);
+        let id = hosts["hosts"][0]["id"].as_str().unwrap();
+        assert_eq!(
+            body(f.get(&format!("/api/v1/hosts/{id}"), &cookie).await).await["id"],
+            id
+        );
+    } else {
+        let id = f.activity.host_id().unwrap();
+        for path in ["/api/v1/hosts".to_owned(), format!("/api/v1/hosts/{id}")] {
+            error(
+                f.get(&path, &cookie).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+            )
+            .await;
+        }
+    }
     error(
         f.get("/api/v1/hosts/unknown", &cookie).await,
         StatusCode::NOT_FOUND,
@@ -487,6 +573,27 @@ async fn owner_reads_bounds_pagination_and_no_credentials_in_activity() {
         body(f.get("/api/v1/vms", &cookie).await).await,
         json!({"vms":[]})
     );
+}
+
+#[test]
+fn only_a_dashboard_only_config_may_omit_agents() {
+    let dir = directory();
+    let config = |dashboard: bool, listen: bool| Config {
+        state_dir: dir.path().into(),
+        listen: listen.then(|| "127.0.0.1:4445".parse().unwrap()),
+        dashboard: dashboard.then(|| DashboardConfig {
+            listen: "127.0.0.1:4444".parse().unwrap(),
+            dist: PathBuf::new(),
+            tls: None,
+            vm_state: None,
+        }),
+        ..Default::default()
+    };
+    assert!(config(true, false).validate().is_ok());
+    // An MCP listener still requires at least one agent credential.
+    assert!(config(true, true).validate().is_err());
+    assert!(config(false, true).validate().is_err());
+    assert!(config(false, false).validate().is_err());
 }
 
 #[tokio::test]
@@ -500,10 +607,79 @@ async fn refuses_non_loopback_without_tls() {
     assert!(Listener::bind(&settings).await.is_err());
 }
 
+#[test]
+fn https_authority_uses_the_browser_serialization() {
+    let listen = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+    for (raw, port, canonical) in [
+        ("owner.example", 443, "owner.example"),
+        ("owner.example:443", 443, "owner.example"),
+        ("owner.example:0443", 443, "owner.example"),
+        ("owner.example:8443", 8443, "owner.example:8443"),
+        ("owner.example:08443", 8443, "owner.example:8443"),
+        ("[::1]:443", 443, "[::1]"),
+        ("[::1]:8443", 8443, "[::1]:8443"),
+    ] {
+        assert_eq!(
+            transport::canonical_authority(raw, listen(port)).unwrap(),
+            canonical,
+            "{raw}"
+        );
+    }
+    for (raw, port) in [
+        ("Owner.Example", 443),
+        ("owner.example:", 443),
+        ("owner.example:8443", 443),
+        ("owner.example", 8443),
+        ("owner.example:99999", 443),
+        ("owner@owner.example", 443),
+        (":443", 443),
+    ] {
+        assert!(
+            transport::canonical_authority(raw, listen(port)).is_err(),
+            "{raw}"
+        );
+    }
+
+    // A browser omits the default port from both Host and Origin.
+    let check = |boundary: &Boundary, host: &str, origin: &str| {
+        let request = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/session")
+            .header("host", host)
+            .header("origin", origin)
+            .body(Body::empty())
+            .unwrap();
+        boundary.check(&request, true).is_ok()
+    };
+    let default = Boundary::new(
+        transport::canonical_authority("owner.example:443", listen(443)).unwrap(),
+        true,
+    );
+    assert!(check(&default, "owner.example", "https://owner.example"));
+    assert!(!check(
+        &default,
+        "owner.example",
+        "https://owner.example:443"
+    ));
+    assert!(!check(&default, "owner.example", "http://owner.example"));
+    let other = Boundary::new(
+        transport::canonical_authority("owner.example:08443", listen(8443)).unwrap(),
+        true,
+    );
+    assert!(check(
+        &other,
+        "owner.example:8443",
+        "https://owner.example:8443"
+    ));
+    assert!(!check(&other, "owner.example", "https://owner.example"));
+}
+
 #[tokio::test]
 async fn configured_host_certificate_serves_https() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = directory();
+    #[cfg(windows)]
+    set_owner_private(dir.path());
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let certificate_path = dir.path().join("cert.der");
     let key_path = dir.path().join("key.der");
@@ -517,6 +693,8 @@ async fn configured_host_certificate_serves_https() {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
+        #[cfg(windows)]
+        set_owner_private(path);
     }
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = probe.local_addr().unwrap();
@@ -675,13 +853,23 @@ fn static_startup_refuses_junctions() {
     fs::create_dir(dist.join("target")).unwrap();
     fs::write(dist.join("index.html"), "ok").unwrap();
     assert!(Assets::load(dist).is_ok());
-    let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe");
+    // Separate components: a forward slash in the image path makes cmd.exe
+    // parse its own command line as a switch and run `md` instead.
+    let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32")
+        .join("cmd.exe");
     let output = std::process::Command::new(cmd)
         .current_dir(dir.path())
         .raw_arg("/d /c mklink /J link target")
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "mklink fixture failed: {}; stderr: {}; stdout: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
     assert!(Assets::load(&dist.join("link")).is_err());
     assert!(Assets::load(dist).is_err());
     fs::remove_dir(dist.join("link")).unwrap();

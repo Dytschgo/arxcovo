@@ -594,6 +594,8 @@ impl Activity {
 
     /// The authenticated dashboard is an owner reader. This projection has no
     /// MCP principal or audit id and cannot be called through the MCP tool.
+    /// B2 seam: owner-initiated dashboard actions add a typed owner writer
+    /// and its projection here, without relaxing the MCP actor filters.
     pub(crate) fn dashboard_list(
         &self,
         args: &ListActivity,
