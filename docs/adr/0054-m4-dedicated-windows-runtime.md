@@ -523,3 +523,109 @@ probe to authenticate the static generation's origin. A port conflict or
 unrelated listener cannot establish readiness. The port, private identity
 and raw probe response never enter MCP. Native behavior is **unverified on
 real hardware**. See [ADR 0063](0063-vm-store-v9-forward-only.md) for storage.
+
+## Amendment 2026-11-23 — Public-only egress variant for the static VM (ADR 0064 E1b)
+
+[ADR 0064](0064-v1-scope-docker-static-vm.md) adds a second sealed network
+for an installed static boot, `StaticNetwork::PublicEgress`, beside the
+restricted origin above. It names its read-only custodied policy artifact
+and seals a distinct plan kind, `PublicEgressBoot`. Its netdev is exactly
+`user,id=arxnet0,restrict=off,ipv4=on,ipv6=off,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,arx-public-egress=<custodied-policy>,hostfwd=tcp:127.0.0.1:<leased-port>-10.0.2.15:443`,
+followed by `-device virtio-net-pci,netdev=arxnet0`. The policy path is
+passed as a QEMU keyval string, with any comma doubled. The port is the A2
+supervisor lease from the fixed 49152–49215 range. The restricted origin,
+TEST boots and installer purposes keep their settled argv byte for byte.
+
+`arx-public-egress` exists only in the separately pinned patched
+QEMU/libslirp build from E1a. The plan requires a distinct
+`PublicEgressQemu` artifact role, so the stock `Qemu` image cannot run it
+and the patched image cannot run any other recipe. Both the policy and the
+image must name held objects: each carries a file identity and a bounded
+content pin.
+
+The candidate profile may carry an optional `public_egress` section. It
+holds the manifest `qemu-11.1.3-arx-public-egress-windows-x64`, the pins
+of the console executable and its receipt, and the enrolled policy pin.
+The patched build links libslirp statically, so it has no DLL slot. The
+section never replaces the stock `manifest`, which TEST VMs keep. A
+configured pin is not a qualified pin. Qualification requires an exact
+entry in the compiled reviewed-build list that pairs the receipt with the
+executable bytes it vouches for. A reviewed receipt never qualifies any
+other executable. The list stays empty until the E1a source, build and
+native receipt are independently reviewed. That receipt must cover the
+full payload and the loaded-dependency set. Any pin that names the
+reviewed stock 11.1.3 executable or receipt is refused.
+
+The policy artifact follows the E1a policy v1 contract. It is at most
+32 KiB of printable ASCII with LF line endings and a final LF, and has no
+spaces or blank lines. The fields appear in this order:
+
+- `version=1`;
+- `interface_index` and `interface_luid`, as nonzero canonical decimals;
+- `source` and `gateway`, as canonical IPv4 addresses that are nonzero and
+  distinct;
+- zero to 512 distinct `deny=` CIDRs, with prefixes 1–32 and clear host bits;
+- `fingerprint`, the lowercase SHA-256 of every preceding byte.
+
+The compiled special-purpose table and the synthetic subnet always apply in
+addition to the `deny=` lines. The table covers 0/8, 10/8, 100.64/10,
+127/8, 169.254/16, 172.16/12, 192.0.0/24, the documentation, benchmarking
+and 6to4 relay ranges, 192.168/16, multicast, reserved and broadcast.
+Admission is stricter than the backend: the enrolled source and gateway
+must already lie in the deny union. The in-file digest checks integrity
+only. The supervisor authenticates the whole file by the enrolled pin.
+
+Custody opens the policy read-only under an anchored directory and refuses
+links, reparse points, extra hard links and unsafe leaf names. It checks
+privacy through the held handles of both the directory and the file. On
+POSIX, the effective UID must own each object and no group or other
+permission bit may be set. On Windows, TokenUser must own each object, the
+DACL must be protected, and the DACL must consist of exactly one explicit,
+non-inheritable TokenUser FullControl entry, checked with the same
+`vm_acl::exact` helper as the runtime inputs above. Custody reads the bytes
+through the held handle and verifies the pin over exactly those bytes. At
+every verification, including admission, it re-checks the anchor directory
+and the leaf through their held handles: both names still denote the held
+objects, and both handles still meet the privacy rule.
+Windows holds the file without write or delete sharing and the directory
+without delete sharing. The patched executable is held read-only the same
+way and measured through its handle. As a bundle input it carries no
+owner-only rule.
+
+Admission refuses with a typed `EgressRefusal` when evidence is missing or
+mismatched:
+
+- the plan or its lease;
+- the policy's presence, custody, grammar, completeness or fingerprint;
+- a missing validated profile or public-egress enrollment (`Unenrolled`).
+  Admission checks enrollment first. It reads the enrolled policy pin and
+  the patched-binary pin from the validated `VmRuntimeProfile` itself,
+  never from loose values. Only `VmRuntimeProfile::parse`, with its size
+  limit and semantic validation, can produce that type. It implements no
+  `Deserialize` and has a private field, and the foreground file's runtime
+  section also goes through `parse`;
+- a held policy that differs from the profile's enrolled pin;
+- a held policy or executable that is not the exact object the plan's argv
+  names. The normalized local path must equal the argv spelling exactly,
+  case included, because NTFS directories can be case-sensitive. The file
+  identity and content pin must also match;
+- a route other than the enrolled default uplink (index, LUID, source and
+  gateway);
+- a patched binary that is missing, stock or unqualified, or whose held
+  bytes are not the qualified executable.
+
+Only a Windows drive path can name a plan input, so POSIX custody never
+binds a plan. Every such refusal maps to the existing
+`NetworkFenceUnverified`, so the MCP refusal vocabulary is unchanged. The
+reference matcher mirrors the backend's checks for tests. It allows only
+TCP and UDP. It drops the synthetic subnet, including the 10.0.2.2 and
+10.0.2.3 aliases, before translation, and checks the deny union both before
+translation and on the final socket destination. The single loopback
+forward is host-initiated only. A guest-initiated flow to the forward peer
+is refused.
+
+Admission success is a portable check only. The Windows launcher refuses
+`PublicEgressBoot` with `NetworkFenceUnverified`, as it refuses
+`StaticWebBoot`, and `LaunchAuthority` stays uninhabited. The patched
+build, Windows route and socket behavior, policy custody on the owner host
+and real egress are **unverified on real hardware**.
