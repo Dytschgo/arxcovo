@@ -1,0 +1,380 @@
+// HTTP + WebSocket adapter for the proposed dashboard API (docs/dashboard-api.md).
+// The session lives in an httpOnly cookie the page cannot read; the CSRF token
+// lives only in this object's memory and is sent on every unsafe request.
+import { decodeActivityPage, decodeHost, decodeHosts, decodeSession, decodeVm, decodeVms, isValidId } from './decode';
+import { Emitter } from './emitter';
+import {
+  ACTIVITY_OUTCOMES,
+  ApiError,
+  type ActivityOutcome,
+  type ActivityPage,
+  type ActivityQuery,
+  type ApiErrorCode,
+  type ArxApi,
+  type ConsoleFrame,
+  type ConsoleStatus,
+  type ConsoleStream,
+  type Credentials,
+  type Host,
+  type Session,
+  type TerminalCommand,
+  type TerminalEvent,
+  type TerminalSession,
+  type TerminalStatus,
+  type Vm,
+} from './types';
+
+export const API_PREFIX = '/api/v1';
+export const CSRF_HEADER = 'X-Arx-CSRF';
+const MAX_BODY_CHARS = 2 * 1024 * 1024;
+const MAX_WS_TEXT = 128 * 1024;
+const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+
+type WebSocketCtor = new (url: string) => WebSocket;
+
+export interface HttpApiOptions {
+  /** Origin the dashboard was served from; '' means same origin. */
+  baseUrl?: string;
+  fetch?: typeof fetch;
+  WebSocket?: WebSocketCtor;
+  /** Used to resolve relative URLs; defaults to window.location.href. */
+  pageUrl?: string;
+}
+
+const STATUS_CODES: Record<number, ApiErrorCode> = { 400: 'invalid_request', 401: 'unauthorized', 403: 'forbidden', 404: 'not_found', 422: 'invalid_request', 429: 'rate_limited' };
+
+const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
+  unauthorized: 'Your session has ended. Sign in again.',
+  forbidden: 'The server refused this request.',
+  not_found: 'Not found.',
+  invalid_request: 'The server rejected the request.',
+  rate_limited: 'Too many attempts. Wait a moment and try again.',
+  unavailable: 'arxd is unavailable right now.',
+  bad_response: 'The server sent a response the dashboard does not understand.',
+  network: 'Cannot reach arxd.',
+};
+
+function errorFor(status: number, body: unknown): ApiError {
+  const code = STATUS_CODES[status] ?? (status >= 500 ? 'unavailable' : 'invalid_request');
+  let message = DEFAULT_MESSAGES[code];
+  if (typeof body === 'object' && body !== null && 'error' in body) {
+    const e = (body as { error: unknown }).error;
+    if (typeof e === 'object' && e !== null && typeof (e as { message?: unknown }).message === 'string') {
+      const m = (e as { message: string }).message;
+      if (m.length > 0 && m.length <= 200) message = m;
+    }
+  }
+  return new ApiError(code, message, status);
+}
+
+function pathId(id: string): string {
+  if (!isValidId(id)) throw new ApiError('invalid_request', 'Invalid identifier.');
+  return encodeURIComponent(id);
+}
+
+export function activitySearch(query: ActivityQuery = {}): string {
+  const params = new URLSearchParams();
+  const limit = query.limit ?? 20;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new ApiError('invalid_request', 'Activity limit must be 1 to 50.');
+  params.set('limit', String(limit));
+  if (query.beforeId !== undefined) {
+    if (!Number.isInteger(query.beforeId) || query.beforeId < 1) throw new ApiError('invalid_request', 'Invalid activity cursor.');
+    params.set('before_id', String(query.beforeId));
+  }
+  if (query.outcome !== undefined) {
+    if (!ACTIVITY_OUTCOMES.includes(query.outcome)) throw new ApiError('invalid_request', 'Invalid outcome filter.');
+    params.set('outcome', query.outcome);
+  }
+  if (query.tool) {
+    if (!/^[a-z_]{1,64}$/.test(query.tool)) throw new ApiError('invalid_request', 'Invalid tool filter.');
+    params.set('tool', query.tool);
+  }
+  if (query.hostId) params.set('host_id', pathId(query.hostId));
+  if (query.includeReads) params.set('include_reads', 'true');
+  return params.toString();
+}
+
+export class HttpApi implements ArxApi {
+  readonly kind = 'http' as const;
+  private csrfToken: string | null = null;
+  private readonly baseUrl: string;
+  private readonly fetchImpl: typeof fetch;
+  private readonly WebSocketImpl: WebSocketCtor | undefined;
+  private readonly pageUrl: string;
+
+  constructor(options: HttpApiOptions = {}) {
+    this.baseUrl = options.baseUrl ?? '';
+    this.fetchImpl = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
+    this.WebSocketImpl = options.WebSocket ?? (globalThis.WebSocket as WebSocketCtor | undefined);
+    this.pageUrl = options.pageUrl ?? (typeof window === 'undefined' ? 'http://127.0.0.1/' : window.location.href);
+  }
+
+  private async request(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown): Promise<unknown> {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (method !== 'GET') {
+      if (path !== `${API_PREFIX}/session` || method !== 'POST') {
+        if (!this.csrfToken) throw new ApiError('unauthorized', DEFAULT_MESSAGES.unauthorized);
+        headers[CSRF_HEADER] = this.csrfToken;
+      }
+    }
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        credentials: 'same-origin',
+        cache: 'no-store',
+        redirect: 'error',
+      });
+    } catch {
+      throw new ApiError('network', DEFAULT_MESSAGES.network);
+    }
+    const text = await response.text().catch(() => '');
+    if (text.length > MAX_BODY_CHARS) throw new ApiError('bad_response', DEFAULT_MESSAGES.bad_response, response.status);
+    let parsed: unknown = null;
+    if (text.length > 0) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        if (response.ok) throw new ApiError('bad_response', DEFAULT_MESSAGES.bad_response, response.status);
+      }
+    }
+    if (!response.ok) {
+      if (response.status === 401) this.csrfToken = null;
+      throw errorFor(response.status, parsed);
+    }
+    return parsed;
+  }
+
+  async getSession(): Promise<Session | null> {
+    try {
+      const session = decodeSession(await this.request('GET', `${API_PREFIX}/session`));
+      this.csrfToken = session.csrfToken;
+      return session;
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'unauthorized') return null;
+      throw error;
+    }
+  }
+
+  async login(credentials: Credentials): Promise<Session> {
+    const session = decodeSession(await this.request('POST', `${API_PREFIX}/session`, { username: credentials.username, password: credentials.password }));
+    this.csrfToken = session.csrfToken;
+    return session;
+  }
+
+  async logout(): Promise<void> {
+    try {
+      if (this.csrfToken) await this.request('DELETE', `${API_PREFIX}/session`);
+    } finally {
+      this.csrfToken = null;
+    }
+  }
+
+  async listHosts(): Promise<Host[]> {
+    return decodeHosts(await this.request('GET', `${API_PREFIX}/hosts`));
+  }
+
+  async getHost(id: string): Promise<Host> {
+    return decodeHost(await this.request('GET', `${API_PREFIX}/hosts/${pathId(id)}`));
+  }
+
+  async listActivity(query: ActivityQuery = {}): Promise<ActivityPage> {
+    return decodeActivityPage(await this.request('GET', `${API_PREFIX}/activity?${activitySearch(query)}`));
+  }
+
+  async listVms(): Promise<Vm[]> {
+    return decodeVms(await this.request('GET', `${API_PREFIX}/vms`));
+  }
+
+  async getVm(id: string): Promise<Vm> {
+    return decodeVm(await this.request('GET', `${API_PREFIX}/vms/${pathId(id)}`));
+  }
+
+  private async ticket(path: string): Promise<{ url: string; ticket: string }> {
+    const body = await this.request('POST', path);
+    if (typeof body !== 'object' || body === null) throw new ApiError('bad_response', DEFAULT_MESSAGES.bad_response);
+    const { streamPath, ticket } = body as { streamPath?: unknown; ticket?: unknown };
+    if (typeof streamPath !== 'string' || !/^\/api\/v1\/streams\/[A-Za-z0-9_-]{1,128}$/.test(streamPath)) throw new ApiError('bad_response', DEFAULT_MESSAGES.bad_response);
+    if (typeof ticket !== 'string' || ticket.length < 16 || ticket.length > 256) throw new ApiError('bad_response', DEFAULT_MESSAGES.bad_response);
+    return { url: this.wsUrl(streamPath), ticket };
+  }
+
+  wsUrl(path: string): string {
+    const url = new URL(`${this.baseUrl}${path}`, this.pageUrl);
+    if (url.protocol === 'https:') url.protocol = 'wss:';
+    else if (url.protocol === 'http:') url.protocol = 'ws:';
+    else throw new ApiError('network', 'The dashboard origin cannot open a stream.');
+    return url.toString();
+  }
+
+  private socket(url: string): WebSocket {
+    if (!this.WebSocketImpl) throw new ApiError('network', 'WebSocket is not available.');
+    return new this.WebSocketImpl(url);
+  }
+
+  async openTerminal(hostId: string): Promise<TerminalSession> {
+    const { url, ticket } = await this.ticket(`${API_PREFIX}/hosts/${pathId(hostId)}/terminal`);
+    return new WsTerminalSession(this.socket(url), ticket);
+  }
+
+  async openConsole(vmId: string): Promise<ConsoleStream> {
+    const { url, ticket } = await this.ticket(`${API_PREFIX}/vms/${pathId(vmId)}/console`);
+    return new WsConsoleStream(this.socket(url), ticket);
+  }
+}
+
+function parseText(data: unknown): Record<string, unknown> | null {
+  if (typeof data !== 'string' || data.length > MAX_WS_TEXT) return null;
+  try {
+    const v: unknown = JSON.parse(data);
+    return typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Decodes one server→client terminal message; null for anything malformed. */
+export function decodeTerminalMessage(data: unknown): TerminalEvent | null {
+  const m = parseText(data);
+  if (!m) return null;
+  const cid = typeof m.commandId === 'string' && m.commandId.length <= 64 ? m.commandId : null;
+  switch (m.type) {
+    case 'ready':
+      return { type: 'status', status: 'ready' };
+    case 'started':
+      if (!cid || typeof m.tool !== 'string' || !Array.isArray(m.args) || !m.args.every(a => typeof a === 'string')) return null;
+      return { type: 'started', commandId: cid, tool: m.tool, args: m.args as string[] };
+    case 'output':
+      if (!cid || (m.stream !== 'stdout' && m.stream !== 'stderr') || typeof m.data !== 'string') return null;
+      return { type: 'output', commandId: cid, stream: m.stream, data: m.data };
+    case 'exit':
+      if (!cid || !(m.exitCode === null || Number.isInteger(m.exitCode)) || !ACTIVITY_OUTCOMES.includes(m.outcome as ActivityOutcome)) return null;
+      return { type: 'exit', commandId: cid, exitCode: m.exitCode as number | null, outcome: m.outcome as ActivityOutcome, truncated: m.truncated === true };
+    case 'error':
+      if (typeof m.code !== 'string' || typeof m.message !== 'string') return null;
+      return { type: 'error', code: m.code.slice(0, 64), message: m.message.slice(0, 200) };
+    default:
+      return null;
+  }
+}
+
+class WsTerminalSession implements TerminalSession {
+  private current: TerminalStatus = 'connecting';
+  private readonly events = new Emitter<[TerminalEvent]>();
+
+  constructor(private readonly ws: WebSocket, ticket: string) {
+    ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'auth', ticket })));
+    ws.addEventListener('message', (e: MessageEvent) => {
+      const event = decodeTerminalMessage(e.data);
+      if (!event) return this.fail('bad_message', 'The terminal stream sent an unreadable message.');
+      if (event.type === 'status') this.setStatus(event.status);
+      else {
+        if (event.type === 'started') this.setStatus('running');
+        this.events.emit(event);
+        if (event.type === 'exit') this.setStatus('ready');
+      }
+    });
+    ws.addEventListener('error', () => this.fail('network', 'The terminal connection failed.'));
+    ws.addEventListener('close', () => {
+      if (this.current !== 'error') this.setStatus('closed');
+    });
+  }
+
+  get status(): TerminalStatus {
+    return this.current;
+  }
+
+  private setStatus(status: TerminalStatus): void {
+    if (this.current === status) return;
+    this.current = status;
+    this.events.emit({ type: 'status', status });
+  }
+
+  private fail(code: string, message: string): void {
+    this.events.emit({ type: 'error', code, message });
+    this.setStatus('error');
+    this.ws.close();
+  }
+
+  onEvent(listener: (event: TerminalEvent) => void): () => void {
+    return this.events.on(listener);
+  }
+
+  run(command: TerminalCommand): void {
+    if (this.current !== 'ready') throw new ApiError('invalid_request', 'The terminal is not ready for a command.');
+    this.ws.send(JSON.stringify({ type: 'run', tool: command.tool, args: command.args, timeoutS: command.timeoutS }));
+  }
+
+  cancel(): void {
+    if (this.current === 'running') this.ws.send(JSON.stringify({ type: 'cancel' }));
+  }
+
+  close(): void {
+    this.ws.close();
+    this.setStatus('closed');
+    this.events.clear();
+  }
+}
+
+class WsConsoleStream implements ConsoleStream {
+  private current: ConsoleStatus = 'connecting';
+  private readonly frames = new Emitter<[ConsoleFrame]>();
+  private readonly statuses = new Emitter<[ConsoleStatus, string | undefined]>();
+  private pending: Omit<ConsoleFrame, 'data'> | null = null;
+
+  constructor(private readonly ws: WebSocket, ticket: string) {
+    ws.binaryType = 'blob';
+    ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'auth', ticket })));
+    ws.addEventListener('message', (e: MessageEvent) => {
+      if (typeof e.data === 'string') {
+        const m = parseText(e.data);
+        if (m?.type === 'frame' && Number.isInteger(m.seq) && Number.isInteger(m.width) && Number.isInteger(m.height) && (m.mime === 'image/png' || m.mime === 'image/jpeg') && typeof m.capturedAt === 'string') {
+          this.pending = { seq: m.seq as number, width: m.width as number, height: m.height as number, mime: m.mime, capturedAt: m.capturedAt };
+          this.setStatus('streaming');
+        } else if (m?.type === 'closed') {
+          this.setStatus('closed', typeof m.reason === 'string' ? m.reason.slice(0, 200) : undefined);
+        } else {
+          this.setStatus('error', 'The console stream sent an unreadable message.');
+          ws.close();
+        }
+        return;
+      }
+      const blob = e.data instanceof Blob ? e.data : null;
+      if (!blob || !this.pending || blob.size > MAX_FRAME_BYTES) return;
+      this.frames.emit({ ...this.pending, data: new Blob([blob], { type: this.pending.mime }) });
+      this.pending = null;
+    });
+    ws.addEventListener('error', () => this.setStatus('error', 'The console connection failed.'));
+    ws.addEventListener('close', () => {
+      if (this.current !== 'error') this.setStatus('closed');
+    });
+  }
+
+  get status(): ConsoleStatus {
+    return this.current;
+  }
+
+  private setStatus(status: ConsoleStatus, reason?: string): void {
+    if (this.current === status) return;
+    this.current = status;
+    this.statuses.emit(status, reason);
+  }
+
+  onFrame(listener: (frame: ConsoleFrame) => void): () => void {
+    return this.frames.on(listener);
+  }
+
+  onStatus(listener: (status: ConsoleStatus, reason?: string) => void): () => void {
+    return this.statuses.on(listener);
+  }
+
+  close(): void {
+    this.ws.close();
+    this.setStatus('closed');
+    this.frames.clear();
+    this.statuses.clear();
+  }
+}
