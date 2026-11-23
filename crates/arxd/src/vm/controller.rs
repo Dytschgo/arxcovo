@@ -145,7 +145,7 @@ impl<C: Clock> VmController<C> {
             .record(db, now, Some(request.vm), None)?
             .receipt
             .activity_id;
-        target.insert(db, request, id)?;
+        target.insert(db, request, id, resources)?;
         store::require_headroom(db)?;
         Ok(Admission::Admitted(PendingOperation {
             activity_id: id,
@@ -495,7 +495,7 @@ impl<C: Clock> VmController<C> {
                     Err(reason) => return Ok(Err(reason)),
                 };
                 let operation = binding.record(db, now, Some(request.vm), None)?;
-                target.insert(db, &request, operation.receipt.activity_id)?;
+                target.insert(db, &request, operation.receipt.activity_id, resources)?;
                 let slots = store::plan_clone(db, request.vm)?;
                 store::require_headroom(db)?;
                 Ok(Ok(CloneAdmission::Fresh(request.vm, slots, PendingOperation {
@@ -1030,12 +1030,21 @@ enum Target {
 }
 
 impl Target {
-    fn insert(self, db: &Connection, request: &Request<'_>, id: i64) -> Result<()> {
+    fn insert(
+        self,
+        db: &Connection,
+        request: &Request<'_>,
+        id: i64,
+        resources: Resources,
+    ) -> Result<()> {
         let snapshot = match self {
             Self::Existing => None,
             Self::Clone { template, expires } => {
-                db.execute("INSERT INTO vm_instances(id,template,principal,expires_ms) VALUES(?1,?2,?3,?4)",
-                    params![request.vm, template, request.principal, expires])?;
+                db.execute("INSERT INTO vm_instances(id,template,principal,expires_ms,dashboard_cpus,dashboard_memory)
+                    VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![request.vm, template, request.principal, expires,
+                        (resources.vcpus <= 1024).then_some(resources.vcpus),
+                        (resources.guest_ram <= 9_007_199_254_740_991).then_some(resources.guest_ram)])?;
                 None
             }
             Self::Snapshot(snapshot) => {

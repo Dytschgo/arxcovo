@@ -42,6 +42,7 @@ fn config(path: &Path) -> (Config, String) {
             execution_settings: None,
             local: None,
             listen: Some("127.0.0.1:0".parse().unwrap()),
+            dashboard: None,
             state_dir: path.to_owned(),
             agents: vec![Agent {
                 principal: "test-agent".into(),
@@ -61,6 +62,133 @@ async fn server(config: Config) -> (String, tokio::task::JoinHandle<()>) {
         axum::serve(listener, router).await.unwrap();
     });
     (format!("http://{addr}/mcp"), task)
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[tokio::test]
+async fn dashboard_foreground_provisions_password_and_keeps_credentials_out_of_logs() {
+    use std::{process::Stdio, time::Duration};
+    use tokio::{io::AsyncWriteExt, process::Command};
+
+    let dir = private_dir();
+    let state = dir.path();
+    let password = "synthetic-dashboard-provision-sentinel";
+    let binary = env!("CARGO_BIN_EXE_arxd");
+    let mut setup = Command::new(binary)
+        .args(["dashboard-password", "--state-dir"])
+        .arg(state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = setup.stdin.take().unwrap();
+    stdin.write_all(password.as_bytes()).await.unwrap();
+    stdin.write_all(b"\n").await.unwrap();
+    drop(stdin);
+    let setup = setup.wait_with_output().await.unwrap();
+    assert!(setup.status.success(), "CLI refused synthetic fixture");
+    let hash = std::fs::read_to_string(state.join("dashboard-owner.phc")).unwrap();
+    assert!(hash.starts_with("$argon2id$v=19$m=65536,t=3,p=1$"));
+    assert!(!hash.contains(password));
+
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    drop(socket);
+    let origin = format!("http://localhost:{}", addr.port());
+    let dist = state.join("dist");
+    std::fs::create_dir(&dist).unwrap();
+    std::fs::write(dist.join("index.html"), "<!doctype html>").unwrap();
+    let config_path = state.join("dashboard.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "state_dir": state,
+            "agents": [],
+            "dashboard": {"listen": addr, "dist": dist}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut daemon = Command::new(binary)
+        .arg("--config")
+        .arg(config_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .resolve("localhost", addr)
+        .build()
+        .unwrap();
+    let html = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(response) = client.get(&origin).send().await {
+                break response;
+            }
+            assert!(
+                daemon.try_wait().unwrap().is_none(),
+                "dashboard startup refused fixture"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(html.status(), 200);
+    assert!(html.headers().contains_key("content-security-policy"));
+    let login = client
+        .post(format!("{origin}/api/v1/session"))
+        .header("origin", &origin)
+        .json(&serde_json::json!({"username": "owner", "password": password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    let cookie = login.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let session_id = cookie.split_once('=').unwrap().1;
+    let activity = client
+        .get(format!("{origin}/api/v1/activity?include_reads=true"))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(activity.status(), 200);
+    let feed = activity.text().await.unwrap();
+    daemon.start_kill().unwrap();
+    let output = daemon.wait_with_output().await.unwrap();
+    for bytes in [
+        &setup.stdout,
+        &setup.stderr,
+        &output.stdout,
+        &output.stderr,
+        &feed.into_bytes(),
+    ] {
+        assert!(
+            !bytes
+                .windows(password.len())
+                .any(|value| value == password.as_bytes())
+        );
+        assert!(
+            !bytes
+                .windows(session_id.len())
+                .any(|value| value == session_id.as_bytes())
+        );
+    }
 }
 // Keep a subprocess owned by its live SDK session. A shutdown deadline must not
 // become a lifetime limit for a client still issuing requests.

@@ -91,7 +91,7 @@ export type VmState = 'creating' | 'running' | 'stopped' | 'snapshotting' | 'mig
 export interface Snapshot {
   id: string;
   name: string;
-  createdAt: string;
+  createdAt: string | null;
   sizeBytes: number | null;
 }
 
@@ -109,8 +109,8 @@ export interface Vm {
   ready: boolean;
   /** Null for static VMs, which never expire. */
   expiresAt: string | null;
-  cpus: number;
-  memoryBytes: number;
+  cpus: number | null;
+  memoryBytes: number | null;
   diskBytes: number;
   snapshots: Snapshot[];
 }

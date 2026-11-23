@@ -11,6 +11,9 @@ const NOW: i64 = 1_800_000_000_000;
 const TEMPLATE: Id = [1; 16];
 const VM: Id = [2; 16];
 const MIB: u64 = 1024 * 1024;
+/// The VM store's `user_version`. `store::vm::VM_SCHEMA_VERSION` is
+/// crate-private, so this integration test mirrors it; update both together.
+const VM_SCHEMA_VERSION: i64 = 8;
 
 #[derive(Clone)]
 struct TestClock {
@@ -329,7 +332,10 @@ fn shared_and_vm_openers_keep_distinct_versions_and_locks() {
     );
 
     let f = Fixture::sealed();
-    assert_eq!(scalar(f.dir.path(), "PRAGMA user_version"), 7);
+    assert_eq!(
+        scalar(f.dir.path(), "PRAGMA user_version"),
+        VM_SCHEMA_VERSION
+    );
     assert!(VmController::open(f.dir.path(), VmPolicy::default(), f.clock.clone()).is_err());
     let Fixture {
         controller,
@@ -338,12 +344,12 @@ fn shared_and_vm_openers_keep_distinct_versions_and_locks() {
     } = f;
     drop(controller);
     assert!(Activity::open(dir.path()).is_err());
-    assert_eq!(scalar(dir.path(), "PRAGMA user_version"), 7);
+    assert_eq!(scalar(dir.path(), "PRAGMA user_version"), VM_SCHEMA_VERSION);
     drop(VmController::open(dir.path(), VmPolicy::default(), clock).unwrap());
     assert_eq!(scalar(dir.path(), "SELECT count(*) FROM vm_templates"), 1);
 
     db(dir.path())
-        .pragma_update(None, "user_version", 8)
+        .pragma_update(None, "user_version", VM_SCHEMA_VERSION + 1)
         .unwrap();
     assert!(Activity::open(dir.path()).is_err());
     assert!(VmController::open(dir.path(), VmPolicy::default(), TestClock::new()).is_err());
