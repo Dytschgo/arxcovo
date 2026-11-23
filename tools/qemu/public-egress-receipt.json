@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "build": "11.1.3-arx-egress-1",
+  "manifest_id": "qemu-11.1.3-arx-public-egress-windows-x64",
+  "architecture": "windows-x86_64",
+  "install_path": "D:/ArxcovoData/qemu/11.1.3-arx-egress-1",
+  "qemu_source": {
+    "version": "11.1.3",
+    "url": "https://download.qemu.org/qemu-11.1.3.tar.xz",
+    "sha256": "5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22",
+    "signature_sha256": "362dc9aacb38575aea217380b55065416843dc84cbaf0dd58aab5a5e44d41c8f",
+    "signature_fingerprint": "CEACC9E15534EBABB82D3FA03353C9CEF108B584"
+  },
+  "libslirp_source": {
+    "version": "4.9.7",
+    "url": "https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v4.9.7/libslirp-v4.9.7.tar.bz2",
+    "sha256": "363dfacf2821758c52388303b691093030b43ce8fd63142a55e878cbeb9a889c",
+    "msys2_recipe_commit": "9e6d9cf944bcef12dfa1af20cb37a90ae01a6ba7",
+    "msys2_recipe_sha256": "a5ed73ec3656c530a2c92dd136a0ecdb7ed15c0087f1c3630141829e420bbebc",
+    "linkage": "static"
+  },
+  "patch_sha256": "065846032a02b3f014670083131fb474cabee31dcc13227724332eb94fc52e3b",
+  "toolchain": {
+    "name": "MSYS2 UCRT64",
+    "msys2_base": "20261120",
+    "base_sha256": "adde59fcb53760bd0fd2aa3c3e8da516f03159b771dc62b77c340e4ac187fcdd",
+    "packages": [
+      "mingw-w64-ucrt-x86_64-gcc 16.2.0-7",
+      "mingw-w64-ucrt-x86_64-gettext-runtime 1.0-1",
+      "mingw-w64-ucrt-x86_64-glib2 2.90.1-1",
+      "mingw-w64-ucrt-x86_64-libiconv 1.19.1-1",
+      "mingw-w64-ucrt-x86_64-meson 1.12.1-2",
+      "mingw-w64-ucrt-x86_64-ninja 1.13.2-1",
+      "mingw-w64-ucrt-x86_64-pcre2 10.49-2",
+      "mingw-w64-ucrt-x86_64-pixman 0.46.4-3",
+      "mingw-w64-ucrt-x86_64-pkgconf 1~3.0.11-2",
+      "mingw-w64-ucrt-x86_64-python 3.14.10-4",
+      "mingw-w64-ucrt-x86_64-zlib 1.4-2",
+      "mingw-w64-ucrt-x86_64-zstd 1.5.7-2"
+    ]
+  },
+  "configure": {
+    "arguments": [
+      "--target-list=x86_64-softmmu",
+      "--enable-whpx",
+      "--enable-tools",
+      "--enable-slirp",
+      "--enable-zstd",
+      "--disable-gtk",
+      "--disable-sdl",
+      "--disable-opengl",
+      "--disable-vnc",
+      "--disable-spice",
+      "--disable-guest-agent",
+      "--disable-docs",
+      "--disable-werror",
+      "--disable-download",
+      "--enable-strip",
+      "--prefix=D:/ArxcovoData/qemu/11.1.3-arx-egress-1",
+      "--bindir=.",
+      "--datadir=.",
+      "--with-suffix=share"
+    ],
+    "target": "x86_64-softmmu",
+    "whpx": "YES",
+    "mingw": "YES",
+    "relocatable": "YES",
+    "slirp": "YES (patched static 4.9.7)",
+    "zstd": "YES 1.5.7"
+  },
+  "manifest_file": "MANIFEST.sha256",
+  "manifest_sha256": "c1a32b3e858d886dcb82f9d89420304e64c8ab85299eadcde79ef1f8a7559077",
+  "payload_file_count": 136,
+  "receipt_file": "RECEIPT.txt",
+  "receipt_sha256": "2d4ab2ebf5b4e9f1dbfcbd9e685e46052f5a2bf99de8c4f86ae4ae834e9947ef",
+  "qemu_system_size": 28692254,
+  "qemu_system_sha256": "61de908074c19e815a832670cb0ddaacf2b6121a2214400329db14acc9585687",
+  "qemu_img_sha256": "50ffddf11a5653527f7e5873ae0181c37908713489660894d553ac5cf1888fcf"
+}
