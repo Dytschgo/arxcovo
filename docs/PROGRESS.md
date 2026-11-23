@@ -1,9 +1,10 @@
 # Arxcovo progress
 
-## Current state (2026-11-22)
+## Current state (2026-11-23)
 
-- **Main and last merges.** `main` is **green** at `830b9de7` (PR #259, M4 PR 3); push CI
-  `45078865824` passed. Merges since `40b9964b`: PR #258 `8fb9c148` (docs; `45062860274`
+- **Main and last merges.** Last merged PR is **#273** at `eb4141a7` (M4 PR 5a, Windows guest agent); the prior merge was **#271** at `f4360120` (M6 dashboard UI).
+  `main` was **green** at `830b9de7` (PR #259, M4 PR 3); push CI `45078865824` passed.
+  Merges since `40b9964b`: PR #258 `8fb9c148` (docs; `45062860274`
   green), PR #260 `3e00dbc5` (M4 PR 4a; `45070826878` green), PR #261 `94bd68a9` (M4 PR
   4b1; `45075434704` green), PR #262 `b1e3f19c` (guest Hello reset; `45077937197` green),
   PR #259 `830b9de7`. Earlier: `main` was green at `40b9964b` (PR #257); push CI
@@ -378,12 +379,26 @@
   - Main coding stays with Sol and Opus, and UI with Claude.
   - Side work may use Muse and Grok first until their usage limits run out, then Luna, Sol or Opus. Substitutions are recorded and never reset counters.
   - The authoritative `agent-review` is still an independent Sol or Opus reviewer.
-- **Since #263:** PR #265 merged as `57ccda6a` (4c1, the VM store v6 migration; Sol builder 1/3; review PASS `29e404c5…1751`, status `59611896549`). PR #264 merged as `da0c493b` (4b2, the Ubuntu lifecycle stages; Sol builder 2/3; HOLD `e4259731…91dd` because health read `/etc/shadow` as 65534, then PASS `2cee46f7…bd34`, status `59612317649`). The slice 5 design is adopted (`D:/Temp/arx-m4-slice5/design.md`, SHA256 `68024cb3…e937`). The 5a Windows guest Sol builder stopped at 3/3 (report SHA256 `2bc8c69d…21e2`); a fresh Opus 5.5 high diagnosis followed, then a new Opus builder with its own budget under the owner's 2026-11-22 instruction to use Opus when Sol is stuck (not a counter reset). 4c2a (durable build and clone settlement) is in progress.
+- **Since #263:** PR #265 merged as `57ccda6a` (4c1, the VM store v6 migration; Sol builder 1/3; review PASS `29e404c5…1751`, status `59611896549`). PR #264 merged as `da0c493b` (4b2, the Ubuntu lifecycle stages; Sol builder 2/3; HOLD `e4259731…91dd` because health read `/etc/shadow` as 65534, then PASS `2cee46f7…bd34`, status `59612317649`). The slice 5 design is adopted (`D:/Temp/arx-m4-slice5/design.md`, SHA256 `68024cb3…e937`). The 5a Windows guest Sol builder stopped at 3/3 (report SHA256 `2bc8c69d…21e2`); a fresh Opus 5.5 high diagnosis followed, then a new Opus builder with its own budget under the owner's 2026-11-22 instruction to use Opus when Sol is stuck (not a counter reset). 4c2a (durable build and clone settlement) later merged as #267 (see the next entry).
+- **Since #265 (2026-11-23).** Last merged PR is **#273** at `eb4141a7`; the prior merge was **#271** at `f4360120`. This batch does not accept a milestone. Paths already **unverified on real hardware** stay unverified.
+  - **PR #267** merged as `afedc4f9` (4c2a: durable build and linked-clone settlement with receipts). Sol builder 3/3 exhausted; fresh diagnosis `27ae68c8…6548`; new Opus builder 0/3 added the VM store v7 cleanup-proof column with backfill and took the clone template from the immutable ledger subject ([ADR 0060](adr/0060-vm-store-v7-forward-only.md)). HOLD `017bb74c…a66`, PASS `c70e410e…9d15` on `4d5cac1c`, re-verify PASS `a0d94293…6d7c` on `d2790579`, status `59615366017`. Real VM build and clone paths remain **unverified on real hardware**.
+  - **PR #269** merged as `03d0eeb0` (M5 script vault: gated activation and template tool inventory). Sol builder 1/3. HOLD `3c2bec5e…4ee1` (SDK debug tracing could log script payloads), PASS `79b3231b…9276`, status `59614629516` on `180d09e4`; refreshed to `3a136fbf` (2361 identical lines); merged status `59615719826`. Rejecting a broken script version in a throwaway VM is **unverified on real hardware**; M5 acceptance waits for the M4 tester.
+  - **PR #270** merged as `78f9d460` (deterministic Linux fixtures and a direct exec-pipe deadline test). Grok builder. HOLD `b4040e87…527e`, HOLD `639ebeb2…99c5`, source re-check `54f52fb3…de98`, status `59616081352`.
+  - **PR #274** merged as `2560eb3e` (static A1: Ubuntu web-server recipe and static VM model). Sol builder 0/3. HOLD `9a57bf58…e813`, PASS `2fa1a868…70e4` on `b5ba4083`, re-verify PASS `d9c51c5f…8d9748` on `984c7ff2`, status `59619819945`. Real nginx installation, loopback forwarding and TLS are **unverified on real hardware**.
+  - **PR #276** merged as `5689b5ee` (Cloudflare B1: tunnel connector, DNS reconciliation and fakes). Sol builder 3/3 exhausted after a tooling recount to 2/3 and the hosted Windows connector fixture failure; Opus builder 0/3. Diagnosis `D:/Temp/arx-cf-b1-stuck/review.md` SHA256 `B299268C…995E96E`. HOLD `ba386a0e…bac95`, PASS `78cb5c1a…394b`, status `59620232351`. Hosted CI `45093347949` was green. The real tunnel and live DNS stay **unverified on real hardware**.
+  - **PR #275** merged as `2afb6704` (4c2b: VM reaper, periodic expiry and shutdown recovery). Sol builder 3/3 exhausted; Opus builder 0/3. HOLD `a31f1be0…943d`, HOLD `f5418e03…eb87`, PASS `821ca58c…c03a` on `69906bb2`, status `59620696170`. VM store schema v7 (introduced in #267) is [ADR 0060](adr/0060-vm-store-v7-forward-only.md). Windows handle-based removal and Job teardown are **unverified on real hardware**.
+  - **PR #277** merged as `aa15651d` (5b: Windows 11 offline TEST recipe, provisioning media and ADR 0055). Sol builder 1/3. HOLD `c6cbee73…fc88`, PASS `98c6b0f6…68f1`, status `59616040234` on `0289eaee` (behind); merged status `59621290609`. Windows Setup, offline OOBE, drivers, SCM installation and Sysprep are **unverified on real hardware**.
+  - **PR #271** merged as `f4360120` (M6 UI: dashboard views, typed API contract and locked-down Electron shell). Claude builder, counted 2/3. Source PASS `02143164…7053` on `3f59b584`; refreshed to `7e07cba3` (6164 identical lines); status `59632956122`. Review 4 `2fb5beb7…eb9f` deferred Windows non-symlink reparse detection (see ROADMAP). Real console frames are **unverified on real hardware**.
+  - **PR #273** merged as `eb4141a7` (5a: Windows guest agent, ADR 0059, hosted-only PowerShell quarantine). Pre-refresh re-check PASS `956e5707…24ac` on `13ca2353`; refreshed to `ed80a56d` (5235 identical lines); CI `45136357327` passed on PR head `ed80a56d`; refresh re-check PASS, status `59633820094`. The owner-host guest path is **unverified on real hardware**.
+  - **In flight.** PR #278 (installer runtime) source PASS `B9C6D9E1…3C33C2` on `18c09ef3` (Sol builder 1/3). PR #279 (4d): Sol 3/3 and Opus 3/3 exhausted. **Owner decision 2026-11-23: per-case authorization of a new Opus builder (0/3).** Diagnosis `D:/Temp/arx-m4-pr4d-stuck2/review.md` SHA256 `41952FA6…A94E` (fixture private permissions: POSIX `create_dir` 0755; Windows owner from the token). That builder has started. QEMU/WHPX execution and real state-directory custody for #279 remain **unverified on real hardware**. M6 backend B1 started (Sol 6.2 high, 0/3).
 - **Process notes.** The coordinator now reads every failed job of each PR CI run before
   relying on a summary. Reviewers are asked to classify activation-gate residuals and
   theoretical hardening as non-blocking P3. Long shell here-strings caused unanswerable delegate approval
   stalls, so briefs now require file-edit tools. An interim Gemini coordinator's C:
-  worktree was replaced with a D: worktree.
+  worktree was replaced with a D: worktree. Delegated reviewers cannot watch CI, so the
+  coordinator watches each run and then asks the reviewer to publish. The GitHub API rate
+  limit was exhausted (0/5000) by too many parallel watchers, so fewer and longer watchers
+  are used now. The hosted 5a quarantine engages only on an `ImageOS` prefix `win25`.
 - **Milestones & verification boundary.** M1 accepted; M2 open for owner-dependent
   acceptance; M3 complete for the conditional hosted Linux profile; M4 in progress.
   Preserved holds: Engine Sol `3/3 exhausted`, historical Opus `0/2`, D6 freeze.
