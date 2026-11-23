@@ -1648,16 +1648,18 @@ mod tests {
 
         /// Open the slot and prove, through the held handles, that it is the
         /// recorded object in the recorded directory with the pinned content.
-        /// A same-content replacement fails the identity check.
+        /// A same-content replacement fails the identity check. On POSIX the
+        /// leaf is opened relative to the verified parent descriptor.
         fn hold(
             &self,
             slot: ArtifactSlot,
             proof: ArtifactEvidence,
             delete: bool,
-        ) -> Result<fs::File> {
+        ) -> Result<custody::Held> {
             let path = self.0.path(slot.role, slot.key);
-            let parent = path
+            let (parent, name) = path
                 .parent()
+                .zip(path.file_name())
                 .ok_or_else(|| anyhow::anyhow!("fixture slot parent"))?;
             let directory = custody::open(parent, true, false)?;
             ensure!(
@@ -1668,7 +1670,7 @@ mod tests {
                     },
                 "fixture directory changed"
             );
-            let mut file = custody::open_for(&path, delete)?;
+            let mut file = custody::open_leaf(&directory, &path, name, delete)?;
             ensure!(
                 custody::identity(&file, false)? == proof.identity,
                 "fixture artifact identity changed"
@@ -1677,7 +1679,11 @@ mod tests {
                 proof.pin.verify(&mut file, 131_072)?,
                 "fixture artifact changed"
             );
-            Ok(file)
+            Ok(custody::Held {
+                directory,
+                file,
+                name: name.to_owned(),
+            })
         }
 
         fn verify(&self, slot: ArtifactSlot, proof: ArtifactEvidence) -> Result<()> {
@@ -1685,10 +1691,23 @@ mod tests {
         }
 
         /// Dispose of exactly the recorded object. Ok only when that object
-        /// is proven gone; anything else leaves custody unproven.
+        /// is proven gone; anything else leaves custody unproven and never
+        /// removes a different entry.
         fn remove(&self, slot: ArtifactSlot, proof: ArtifactEvidence) -> Result<()> {
-            let file = self.hold(slot, proof, true)?;
-            custody::dispose(&file, &self.0.path(slot.role, slot.key))
+            self.remove_with(slot, proof, || {})
+        }
+
+        /// As [`Artifacts::remove`], running `between` after verification and
+        /// before disposal, to witness a concurrent slot change.
+        fn remove_with(
+            &self,
+            slot: ArtifactSlot,
+            proof: ArtifactEvidence,
+            between: impl FnOnce(),
+        ) -> Result<()> {
+            let held = self.hold(slot, proof, true)?;
+            between();
+            custody::dispose(&held)
         }
     }
 
@@ -1697,6 +1716,15 @@ mod tests {
     mod custody {
         use super::*;
         use crate::vm::paths::FileIdentity;
+
+        /// A verified leaf with its verified parent and slot name.
+        pub(super) struct Held {
+            #[cfg_attr(windows, allow(dead_code))]
+            pub(super) directory: fs::File,
+            pub(super) file: fs::File,
+            #[cfg_attr(windows, allow(dead_code))]
+            pub(super) name: std::ffi::OsString,
+        }
 
         pub(super) fn open(
             path: &Path,
@@ -1737,8 +1765,13 @@ mod tests {
 
         /// The slot's file, held exclusively. On Windows a disposing handle
         /// also carries DELETE so removal targets this exact object.
-        pub(super) fn open_for(path: &Path, delete: bool) -> std::io::Result<fs::File> {
-            #[cfg(windows)]
+        #[cfg(windows)]
+        pub(super) fn open_leaf(
+            _: &fs::File,
+            path: &Path,
+            _: &std::ffi::OsStr,
+            delete: bool,
+        ) -> std::io::Result<fs::File> {
             if delete {
                 use std::os::windows::fs::OpenOptionsExt;
                 use windows_sys::Win32::Storage::FileSystem::*;
@@ -1748,8 +1781,38 @@ mod tests {
                     .share_mode(0)
                     .open(path);
             }
-            let _ = delete;
             open(path, false, true)
+        }
+
+        /// The leaf, opened relative to the verified parent descriptor.
+        #[cfg(unix)]
+        pub(super) fn open_leaf(
+            directory: &fs::File,
+            _: &Path,
+            name: &std::ffi::OsStr,
+            _: bool,
+        ) -> std::io::Result<fs::File> {
+            use std::os::unix::ffi::OsStrExt;
+            let name = std::ffi::CString::new(name.as_bytes())?;
+            openat(directory, &name)
+        }
+
+        #[cfg(unix)]
+        fn openat(directory: &fs::File, name: &std::ffi::CStr) -> std::io::Result<fs::File> {
+            use std::os::unix::io::{AsRawFd, FromRawFd};
+            // The directory descriptor stays open for the synchronous call.
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The new descriptor is owned only by the returned file.
+            Ok(unsafe { fs::File::from_raw_fd(fd) })
         }
 
         fn id(value: u64) -> Id {
@@ -1806,7 +1869,8 @@ mod tests {
         /// Mark the verified handle's own object for deletion. The handle is
         /// exclusive, so no other open can intervene before close.
         #[cfg(windows)]
-        pub(super) fn dispose(file: &fs::File, _: &Path) -> Result<()> {
+        pub(super) fn dispose(held: &Held) -> Result<()> {
+            let file = &held.file;
             use std::os::windows::io::AsRawHandle;
             use windows_sys::Win32::Storage::FileSystem::*;
             let info = FILE_DISPOSITION_INFO { DeleteFile: true };
@@ -1825,13 +1889,59 @@ mod tests {
             Ok(())
         }
 
-        /// Unlink the slot name, then prove from the held descriptor that the
-        /// verified object itself lost its only link.
+        /// POSIX names are not handles, so never unlink an unproven name. Move
+        /// the slot entry to a fresh private name in the verified parent,
+        /// prove that name is the held object, and only then unlink it. A
+        /// different object is moved back if its slot is still free, and is
+        /// never deleted.
         #[cfg(unix)]
-        pub(super) fn dispose(file: &fs::File, path: &Path) -> Result<()> {
-            use std::os::unix::fs::MetadataExt;
-            fs::remove_file(path)?;
-            ensure!(file.metadata()?.nlink() == 0, "fixture disposal unproven");
+        pub(super) fn dispose(held: &Held) -> Result<()> {
+            use std::ffi::CString;
+            use std::os::unix::{ffi::OsStrExt, fs::MetadataExt, io::AsRawFd};
+            let dir = held.directory.as_raw_fd();
+            let name = CString::new(held.name.as_bytes())?;
+            let mut nonce = [0; 16];
+            getrandom::fill(&mut nonce)
+                .map_err(|error| anyhow::anyhow!("fixture disposal nonce: {error}"))?;
+            let quarantine = CString::new(format!(".arx-dispose-{}", hex::encode(nonce)))?;
+            // Both descriptors and names stay alive for each synchronous call.
+            ensure!(
+                unsafe { libc::renameat(dir, name.as_ptr(), dir, quarantine.as_ptr()) } == 0,
+                "fixture disposal move: {}",
+                std::io::Error::last_os_error()
+            );
+            let expected = held.file.metadata()?;
+            let same = openat(&held.directory, &quarantine)
+                .and_then(|moved| moved.metadata())
+                .is_ok_and(|moved| {
+                    moved.is_file()
+                        && moved.nlink() == 1
+                        && (moved.dev(), moved.ino()) == (expected.dev(), expected.ino())
+                });
+            if !same {
+                let mut probe = std::mem::MaybeUninit::<libc::stat>::uninit();
+                let slot_free = unsafe {
+                    libc::fstatat(
+                        dir,
+                        name.as_ptr(),
+                        probe.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0;
+                if slot_free {
+                    unsafe { libc::renameat(dir, quarantine.as_ptr(), dir, name.as_ptr()) };
+                }
+                anyhow::bail!("fixture disposal target changed");
+            }
+            ensure!(
+                unsafe { libc::unlinkat(dir, quarantine.as_ptr(), 0) } == 0,
+                "fixture disposal unlink: {}",
+                std::io::Error::last_os_error()
+            );
+            ensure!(
+                held.file.metadata()?.nlink() == 0,
+                "fixture disposal unproven"
+            );
             Ok(())
         }
     }
@@ -2013,6 +2123,9 @@ mod tests {
         /// The disk leaf is written and the VARS write is interrupted after
         /// creating a partial file whose identity is not captured.
         Interrupted,
+        /// Both leaves are written, then the disk moves aside and an
+        /// identical replacement takes its slot before the first boot.
+        ReplaceBeforeBoot,
     }
 
     pub(super) struct Fixture {
@@ -2597,13 +2710,25 @@ mod tests {
                 }
                 return Err(failed([Retained(disk_file), Unknown]));
             }
-            None => {}
+            Some(StaticFault::ReplaceBeforeBoot) | None => {}
         }
         let Ok(vars_file) = artifacts.stage(slots.vars, &vars) else {
             return Err(failed([Retained(disk_file), Unknown]));
         };
         let files = [disk_file, vars_file];
         let committed = [Retained(disk_file), Retained(vars_file)];
+        if let Some(StaticFault::ReplaceBeforeBoot) = fault {
+            let path = artifacts.0.path(slots.disk.role, slots.disk.key);
+            let _ = fs::rename(&path, path.with_file_name("moved-original"));
+            let _ = artifacts.stage(slots.disk, &disk);
+        }
+        // The first private boot uses the same recorded-pair check as a
+        // later start: identity and content through held handles.
+        for (slot, proof) in [(slots.disk, disk_file), (slots.vars, vars_file)] {
+            artifacts
+                .verify(slot, proof)
+                .map_err(|_| failed(committed))?;
+        }
         let boot = Boot::start(cancel).await.map_err(|_| CopyFailure {
             reason: FailureReason::BootFailed,
             slots: committed,
@@ -3871,6 +3996,96 @@ mod tests {
         };
         assert!(artifacts.remove(slot(2), wrong).is_err());
         assert!(artifacts.0.path(slot(2).role, slot(2).key).exists());
+    }
+
+    /// A change after verification and before disposal never removes the
+    /// other entry. POSIX moves only a proven name; Windows holds the leaf
+    /// exclusively, so the slot cannot change at all.
+    #[test]
+    fn candidate_disposal_survives_a_replacement_after_verification() {
+        let temp = crate::service::application::tests::private_temp();
+        let media = temp.path().join("fixture-media");
+        fs::create_dir(&media).unwrap();
+        protect_fixture(&media, true).unwrap();
+        let artifacts = Artifacts(Arc::new(FixtureCustody::open(&media).unwrap()));
+        let slot = ArtifactSlot {
+            generation: [9; 16],
+            role: "static_disk",
+            key: [3; 16],
+        };
+        let staged = artifacts.stage(slot, b"static leaf").unwrap();
+        let path = artifacts.0.path(slot.role, slot.key);
+        let moved = media.join("moved-original");
+        #[cfg_attr(windows, allow(unused_mut))]
+        let mut replacement = None;
+        let result = artifacts.remove_with(slot, staged, || {
+            #[cfg(unix)]
+            {
+                fs::rename(&path, &moved).unwrap();
+                replacement = Some(artifacts.stage(slot, b"static leaf").unwrap());
+            }
+            #[cfg(windows)]
+            {
+                assert!(fs::rename(&path, &moved).is_err());
+                assert!(fs::remove_file(&path).is_err());
+            }
+        });
+        let names = || {
+            fs::read_dir(&media)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        match replacement {
+            Some(replacement) => {
+                assert!(result.is_err());
+                // The replacement is back in its slot and the original kept.
+                artifacts.verify(slot, replacement).unwrap();
+                assert_eq!(fs::read(&moved).unwrap(), b"static leaf");
+                assert!(!names().iter().any(|name| name.starts_with(".arx-dispose-")));
+            }
+            None => {
+                result.unwrap();
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn static_first_boot_requires_the_recorded_pair() {
+        let h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let template = web_template(&h, &a, 401).await;
+        h.fixture(|f| f.static_fault = Some(StaticFault::ReplaceBeforeBoot));
+        let failed = call(
+            &a,
+            "static_vm_create",
+            json!({"name":"replaced-site","template_id":template,"request_id":key(402)}),
+        )
+        .await;
+        let failed = terminal(&a, &failed).await;
+        assert_eq!(
+            (&failed["reason"], &failed["cleanup"]),
+            (&json!("clone_failed"), &json!("cleanup_unconfirmed"))
+        );
+        let (state, persistent, staging) = static_charge(&h, "replaced-site").unwrap();
+        assert_eq!((state, staging), (4, 65_536));
+        assert!(persistent > 0);
+        // Both recorded objects and the replacement survive, quarantined.
+        assert!(h.media.join("moved-original").exists());
+        assert_eq!(static_paths(&h.media).len(), 2);
+        let db = read_state(&h);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM vm_artifacts a JOIN vm_generations g ON g.id=a.generation_id
+                 JOIN vm_static_instances s ON s.id=g.static_id
+                 WHERE s.name='replaced-site' AND a.state='quarantined' AND a.file_id IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
     }
 
     #[tokio::test]
