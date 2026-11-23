@@ -10,8 +10,8 @@ There is no authority issuer in this slice.
 
 ## Distribution and launch recipe
 
-The candidate pin for TEST-VM qualification is the Stefan Weil QEMU 11.1.0
-Windows x64 build described in the amendment below. Qualification still
+The candidate pin for TEST-VM qualification is the reviewed local QEMU 11.1.3
+Windows x64 build described in the 2026-11-23 amendment below. Qualification
 requires reviewing source and toolchain provenance and pinning the SHA-256
 and size of the console QEMU and matching qemu-img executables, the libslirp
 and loaded DLL set, ROM/data, and the EDK2 CODE and VARS images. Version
@@ -140,7 +140,7 @@ Two facts shape the design:
 - Firmware can open the port first. OVMF's VirtioSerialDxe opens a named
   port before Linux, QEMU then moves a pending frame into the firmware
   queue, and `ExitBootServices` resets that queue.
-- QEMU 11.1.0 rate-limits `VSERPORT_CHANGE` to one event per second per
+- QEMU 11.1.3 rate-limits `VSERPORT_CHANGE` to one event per second per
   device and keeps only the newest pending one, so a quick close and reopen
   can arrive as a repeated open.
 
@@ -337,7 +337,9 @@ this Linux fixture cannot exercise them.
 The release gate stays closed pending independent review, passing checks
 and owner qualification of the exact package and native controls.
 
-## Amendment — Windows x64 pin for TEST-VM qualification
+## Historical amendment — Weil 11.1.0 Windows x64 pin
+
+The 2026-11-23 amendment below supersedes this pin.
 
 The previous candidate was QEMU 11.1.3. That release is available as source.
 The official Windows binary catalog provides the 11.1.0 build identified in
@@ -382,6 +384,56 @@ on any replacement. Native admission stays closed. M4 native activation
 still requires the amendment in ADR 0058 that replaces the dedicated-account
 identity gate with the `current_user` identity gate.
 [Upstream stable comparison](https://gitlab.com/qemu-project/qemu/-/compare/v11.1.0...v11.1.3)
+
+## Amendment 2026-11-23 — Reviewed local QEMU 11.1.3 Windows x64 build
+
+The candidate profile accepts only `qemu-11.1.3-windows-x64`. A profile
+naming `qemu-11.1.0-windows-x64` is rejected with `InvalidVmProfile`.
+The QMP greeting must report 11.1.3 before capability negotiation.
+
+The local distribution was built from the upstream 11.1.3 tarball with
+SHA-256 `5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22`.
+The detached signature verified against QEMU's release fingerprint
+`CEACC9E15534EBABB82D3FA03353C9CEF108B584`. The build used the signed
+MSYS2 x86_64 UCRT64 base dated 2026-11-20, GCC 16.2.0, Meson 1.12.1,
+Ninja 1.13.2, and Python 3.14.10. The configuration selected
+`x86_64-softmmu` with `--enable-whpx`, tools, libslirp 4.9.7, and zstd
+1.5.7. One local Meson patch skips the developer-bundle symlink hook,
+which requires symlink privileges on Windows. Its SHA-256 is
+`35c1a14b1f9b6498ec43f5269dde137d9c0af288b97d10518ae6ca270ce6cb32`.
+Independent comparison with the signed archive found only that change
+to source files. [Source archive](https://download.qemu.org/qemu-11.1.3.tar.xz) · [Detached signature](https://download.qemu.org/qemu-11.1.3.tar.xz.sig)
+
+The build and independent review confirmed three stable fixes in the
+signed source:
+
+| Fix | Stable commit | First release |
+| --- | --- | --- |
+| Virtio-net bounds fix for CVE-2026-66900 | `ec2fdc85829a5090ebaea2f4094b9616a4ea6309` | 11.1.2 |
+| Block read-modify-write atomicity and data corruption | `7e6a8d069ff627ca8cfe6392b9ffdee2ee7ef2aa`, backport of `0bd5a1b3d60cca595e19bb73eec83307259be671` | 11.1.3 |
+| ATAPI CD read hang during block drain | `1e4ab5af46a76f7aad63573686bc354a8bbe9a0d` | 11.1.1 |
+
+Both executables and the shipped DLLs are Authenticode `NotSigned`. The
+reviewed SHA-256 pins are the trust anchor for this build. The source
+signature authenticates the upstream tarball. The installation receipt
+binds an exhaustive manifest, resolving the initial review's HOLD on
+partial receipt coverage. The independent re-check verified the exact
+136-file payload, including the virtio option ROM, BIOS, and EDK2 data.
+
+| Pin | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `RECEIPT.txt` | | `e0e33d3fb433c467f5f530bcb8cc8ce41bb8c3b10133bd54718915b7357b852e` |
+| `MANIFEST.sha256` | | `f1cf73c8ecae163e31467a3985fc13749aee1f12a8747756eb136108a1015759` |
+| `qemu-system-x86_64.exe` | 28531009 | `0eff2d9977e8c8a6963d099ec3d2ebdae999b351c55d59c5ed3abcf97b0535f5` |
+| `qemu-img.exe` | 2520350 | `0765417c097a7d9d7ddf5b0bf7cdb4ab033d11767d3839005111e367862a0f9f` |
+
+This review lifts the 11.1.0 distribution restriction on untrusted
+guests and persistent VM disks for the reviewed 11.1.3 payload. The
+paused WHPX smoke started `pc-q35-11.1` with no disk or network, observed
+QMP version 11.1.3 and `prelaunch`, and quit cleanly. Native VM execution
+with the production recipe is **unverified on real hardware**. Native
+admission still requires the activation custody and resource gates and
+the ADR 0058 `current_user` identity gate.
 
 ## Amendment — Typed installer boot and passive poweroff
 
