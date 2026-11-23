@@ -251,6 +251,166 @@ pub enum ForegroundConfig {
 pub struct VmForeground {
     pub(crate) config: Config,
     pub(crate) profile: TestVms,
+    /// The validated state root, held from validation through composition
+    /// and serving. `config.state_dir` is its canonical name.
+    pub(crate) root: Box<RootPin>,
+}
+
+/// The identity of the validated VM state root, bound to its canonical name.
+///
+/// Windows holds the root and every ancestor directory open without delete
+/// sharing, so no component of the name can be renamed, deleted or replaced
+/// while the pin lives; [`RootPin::verify`] then also compares volume and
+/// file ID from the handle with a fresh open of the name.
+///
+/// POSIX holds a non-following descriptor, which keeps the object alive but
+/// does not lock the name. Validation requires every ancestor to be
+/// non-replaceable by any other principal (owned by the effective UID or
+/// root, and not group/other writable unless sticky with the child owned by
+/// the effective UID or root), so only the same effective UID, which can
+/// already control this process, could rename a component. That is the
+/// stated POSIX trust boundary for this diagnostic-only profile. `verify`
+/// compares device and inode against a fresh non-following lookup and so
+/// refuses a persistent replacement made before composition or bind.
+pub(crate) struct RootPin {
+    #[cfg(windows)]
+    _ancestors: Vec<std::fs::File>,
+    leaf: std::fs::File,
+    identity: (u64, u64),
+}
+
+impl RootPin {
+    fn acquire(root: &Path) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            let mut ancestors = Vec::new();
+            let mut prefix = PathBuf::new();
+            let mut components = root.components().peekable();
+            while let Some(part) = components.next() {
+                prefix.push(part);
+                if matches!(part, Component::Prefix(_)) {
+                    continue;
+                }
+                let handle = pin_directory(&prefix)?;
+                if components.peek().is_none() {
+                    let identity = directory_identity(&handle)?;
+                    return Ok(Self {
+                        _ancestors: ancestors,
+                        leaf: handle,
+                        identity,
+                    });
+                }
+                directory_identity(&handle)?;
+                ancestors.push(handle);
+            }
+            bail!("invalid VM state")
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            stable_ancestry(root)?;
+            let leaf = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(root)?;
+            let identity = directory_identity(&leaf)?;
+            let pin = Self { leaf, identity };
+            pin.verify(root)?;
+            Ok(pin)
+        }
+    }
+
+    /// The canonical name still denotes the pinned directory.
+    pub(crate) fn verify(&self, root: &Path) -> Result<()> {
+        #[cfg(windows)]
+        let current = directory_identity(&pin_directory(root)?)?;
+        #[cfg(unix)]
+        let current = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::symlink_metadata(root)?;
+            anyhow::ensure!(metadata.is_dir(), "VM state directory required");
+            (metadata.dev(), metadata.ino())
+        };
+        anyhow::ensure!(
+            current == self.identity && directory_identity(&self.leaf)? == self.identity,
+            "VM state root replaced"
+        );
+        Ok(())
+    }
+}
+
+/// An ordinary local directory opened without following a reparse point and
+/// without delete sharing.
+#[cfg(windows)]
+fn pin_directory(path: &Path) -> Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?)
+}
+
+#[cfg(windows)]
+fn directory_identity(file: &std::fs::File) -> Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // The handle is owned by `file` for the duration of both queries.
+    anyhow::ensure!(
+        unsafe {
+            GetFileType(file.as_raw_handle()) == FILE_TYPE_DISK
+                && GetFileInformationByHandle(file.as_raw_handle(), &mut info) != 0
+        },
+        "VM state identity unavailable"
+    );
+    anyhow::ensure!(
+        info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+            == FILE_ATTRIBUTE_DIRECTORY,
+        "ordinary VM state directory required"
+    );
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+#[cfg(unix)]
+fn directory_identity(file: &std::fs::File) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_dir(), "VM state directory required");
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// No principal other than the effective UID (or root) can rename or replace
+/// any ancestor entry of `root`: each parent is owned by the effective UID or
+/// root and is not group/other writable, unless it is sticky and the child is
+/// owned by the effective UID or root. Mode bits include the Linux ACL mask.
+#[cfg(unix)]
+fn stable_ancestry(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let euid = unsafe { libc::geteuid() };
+    let trusted = |uid: u32| uid == euid || uid == 0;
+    let mut child = std::fs::symlink_metadata(root)?;
+    for parent in root.ancestors().skip(1) {
+        let metadata = std::fs::symlink_metadata(parent)?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && trusted(metadata.uid())
+                && (metadata.mode() & 0o022 == 0
+                    || (metadata.mode() & 0o1000 != 0 && trusted(child.uid()))),
+            "replaceable VM state ancestor"
+        );
+        child = metadata;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -311,7 +471,7 @@ impl ForegroundConfig {
         crate::local::require_owner(path)?;
         let file: VmFile = serde_json::from_value(value)
             .map_err(|_| anyhow::anyhow!("invalid VM configuration"))?;
-        let state_dir = file.test_vms.validate(&file.state_dir, &file.local)?;
+        let (state_dir, root) = file.test_vms.validate(&file.state_dir, &file.local)?;
         let config = Config {
             state_dir,
             agents: file.agents,
@@ -326,17 +486,21 @@ impl ForegroundConfig {
             "reserved VM principal"
         );
         config.validate()?;
+        root.verify(&config.state_dir)?;
         Ok(Self::TestVms(VmForeground {
             config,
             profile: file.test_vms,
+            root: Box::new(root),
         }))
     }
 }
 
 impl TestVms {
-    /// Returns the canonical exclusive root that composition must open; the
-    /// raw configured string is never reopened after validation.
-    fn validate(&self, root: &Path, local: &crate::local::Endpoint) -> Result<PathBuf> {
+    /// Returns the canonical exclusive root that composition must open and
+    /// its pin; the raw configured string is never reopened after
+    /// validation. The pin is taken before the path-based owner, privacy and
+    /// overlap checks, so on Windows they inspect the pinned objects.
+    fn validate(&self, root: &Path, local: &crate::local::Endpoint) -> Result<(PathBuf, RootPin)> {
         use crate::vm::paths::LocalPath;
 
         let layout = crate::service::layout::Layout::system()?;
@@ -350,6 +514,7 @@ impl TestVms {
             "reserved local endpoint"
         );
         let root = vm_path(root)?;
+        let pin = RootPin::acquire(&root)?;
         anyhow::ensure!(root.is_dir(), "VM state directory required");
         crate::security::private(&root)?;
         crate::local::require_owner(&root)?;
@@ -374,14 +539,24 @@ impl TestVms {
             "socket inside VM state"
         );
         let actual = crate::local::vm_supervisor_identity()?;
-        anyhow::ensure!(
-            local.client_identity != actual,
-            "VM client and supervisor must differ"
-        );
+        // Windows serves a distinct local account through the pipe DACL.
+        // POSIX is diagnostic-only: its socket and parent are private to the
+        // supervisor UID, so that UID is the only client that can connect.
         #[cfg(windows)]
+        {
+            anyhow::ensure!(
+                local.client_identity != actual,
+                "VM client and supervisor must differ"
+            );
+            anyhow::ensure!(
+                local_account_sid(&local.client_identity),
+                "invalid VM client identity"
+            );
+        }
+        #[cfg(unix)]
         anyhow::ensure!(
-            local_account_sid(&local.client_identity),
-            "invalid VM client identity"
+            local.client_identity == actual,
+            "VM client must be the supervisor"
         );
 
         if let Some(runtime) = &self.runtime {
@@ -406,7 +581,8 @@ impl TestVms {
                 recipe.digest(&root)?;
             }
         }
-        Ok(root)
+        pin.verify(&root)?;
+        Ok((root, pin))
     }
 
     pub(crate) fn recipe(&self) -> Result<Option<([u8; 16], [u8; 32])>> {

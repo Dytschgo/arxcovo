@@ -18,112 +18,260 @@ fn binary() -> Command {
     command
 }
 
+/// Write an owner-private fixture file. The mode, owner and DACL are set on
+/// the object itself, so neither the umask nor the token's default owner
+/// (Builtin Administrators on elevated hosted Windows runners) leaks in.
+/// An overwrite reapplies and re-verifies the same protection.
 fn save(path: &Path, body: impl AsRef<[u8]>) {
     #[cfg(unix)]
     {
-        use std::{io::Write, os::unix::fs::OpenOptionsExt};
-        std::fs::OpenOptions::new()
+        use std::{
+            io::Write,
+            os::unix::fs::{OpenOptionsExt, PermissionsExt},
+        };
+        let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(path)
-            .unwrap()
-            .write_all(body.as_ref())
             .unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        file.write_all(body.as_ref()).unwrap();
     }
     #[cfg(windows)]
-    std::fs::write(path, body).unwrap();
+    {
+        std::fs::write(path, body).unwrap();
+        win::protect(path, false);
+    }
+    assert_private(path, false);
+}
+
+/// Create an owner-private fixture directory (0700, or TokenUser owner with
+/// a protected, inheritable TokenUser-only DACL).
+fn private_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        std::fs::create_dir(path).unwrap();
+        win::protect(path, true);
+    }
+    assert_private(path, true);
+}
+
+/// Distinguishes the three properties the product checks: the Unix mode and
+/// owner UID, or the Windows owner SID and the exact protected DACL.
+fn assert_private(path: &Path, directory: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        assert_eq!(metadata.is_dir(), directory, "{}", path.display());
+        assert_eq!(
+            metadata.mode() & 0o7777,
+            if directory { 0o700 } else { 0o600 },
+            "fixture mode: {}",
+            path.display()
+        );
+        assert_eq!(
+            metadata.uid(),
+            unsafe { libc::geteuid() },
+            "fixture owner UID: {}",
+            path.display()
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(std::fs::symlink_metadata(path).unwrap().is_dir(), directory);
+        let (owner_is_user, dacl_is_private) = win::inspect(path, directory);
+        assert!(owner_is_user, "fixture owner SID: {}", path.display());
+        assert!(dacl_is_private, "fixture DACL: {}", path.display());
+    }
 }
 
 #[cfg(unix)]
 fn private_temp() -> (tempfile::TempDir, String, String) {
     use std::os::unix::fs::PermissionsExt;
+    // Canonical, so macOS /var is not an alias of /private/var.
     let root = std::env::temp_dir().canonicalize().unwrap();
     let temp = tempfile::tempdir_in(root).unwrap();
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_private(temp.path(), true);
     let uid = unsafe { libc::geteuid() };
     (temp, uid.to_string(), (uid ^ 1).to_string())
 }
 
 #[cfg(windows)]
 fn private_temp() -> (tempfile::TempDir, String, String) {
-    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, LocalFree},
-        Security::{Authorization::*, *},
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
-    };
     let temp = tempfile::tempdir().unwrap();
-    let sid = unsafe {
-        let mut handle = ptr::null_mut();
-        assert_ne!(
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle),
-            0
-        );
-        let mut len = 0;
-        GetTokenInformation(handle, TokenUser, ptr::null_mut(), 0, &mut len);
-        let mut buffer = vec![0usize; (len as usize).div_ceil(size_of::<usize>())];
-        assert_ne!(
-            GetTokenInformation(handle, TokenUser, buffer.as_mut_ptr().cast(), len, &mut len),
-            0
-        );
-        CloseHandle(handle);
-        let owner = (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid;
-        let mut owner_text = ptr::null_mut();
-        assert_ne!(ConvertSidToStringSidW(owner, &mut owner_text), 0);
-        let len = (0..184).find(|i| *owner_text.add(*i) == 0).unwrap();
-        let sid = String::from_utf16(std::slice::from_raw_parts(owner_text, len)).unwrap();
-        LocalFree(owner_text.cast());
-        let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid})")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        let mut descriptor: *mut c_void = ptr::null_mut();
-        assert_ne!(
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                1,
-                &mut descriptor,
-                ptr::null_mut()
-            ),
-            0
-        );
-        let (mut present, mut defaulted) = (0, 0);
-        let mut acl = ptr::null_mut();
-        assert_ne!(
-            GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted),
-            0
-        );
-        let path: Vec<u16> = temp
-            .path()
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        assert_eq!(
-            SetNamedSecurityInfoW(
-                path.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION
-                    | PROTECTED_DACL_SECURITY_INFORMATION
-                    | OWNER_SECURITY_INFORMATION,
-                owner,
-                ptr::null_mut(),
-                acl,
-                ptr::null_mut()
-            ),
-            0
-        );
-        LocalFree(descriptor);
-        sid
-    };
+    win::protect(temp.path(), true);
+    assert_private(temp.path(), true);
+    let sid = win::user_text();
     let alternate = if sid == "S-1-5-21-11-22-33-1001" {
         "S-1-5-21-11-22-33-1002"
     } else {
         "S-1-5-21-11-22-33-1001"
     };
     (temp, sid, alternate.into())
+}
+
+#[cfg(windows)]
+mod win {
+    use std::{os::windows::ffi::OsStrExt, os::windows::io::AsRawHandle, path::Path, ptr};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, LocalFree},
+        Security::{Authorization::*, *},
+        Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    fn token_info(class: TOKEN_INFORMATION_CLASS) -> Vec<usize> {
+        unsafe {
+            let mut handle = ptr::null_mut();
+            assert_ne!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle),
+                0
+            );
+            let mut len = 0;
+            GetTokenInformation(handle, class, ptr::null_mut(), 0, &mut len);
+            let mut buffer = vec![0usize; (len as usize).div_ceil(size_of::<usize>())];
+            let ok = GetTokenInformation(handle, class, buffer.as_mut_ptr().cast(), len, &mut len);
+            CloseHandle(handle);
+            assert_ne!(ok, 0);
+            buffer
+        }
+    }
+
+    fn user_sid(user: &[usize]) -> PSID {
+        // The buffer came from TokenUser and outlives every use of the SID.
+        unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    }
+
+    pub(super) fn user_text() -> String {
+        let user = token_info(TokenUser);
+        unsafe {
+            let mut text = ptr::null_mut();
+            assert_ne!(ConvertSidToStringSidW(user_sid(&user), &mut text), 0);
+            let len = (0..184).find(|i| *text.add(*i) == 0).unwrap();
+            let sid = String::from_utf16(std::slice::from_raw_parts(text, len)).unwrap();
+            LocalFree(text.cast());
+            sid
+        }
+    }
+
+    /// Whether new objects already default to TokenUser as their owner.
+    pub(super) fn token_owner_is_user() -> bool {
+        let user = token_info(TokenUser);
+        let owner = token_info(TokenOwner);
+        unsafe {
+            EqualSid(
+                user_sid(&user),
+                (*owner.as_ptr().cast::<TOKEN_OWNER>()).Owner,
+            ) != 0
+        }
+    }
+
+    /// TokenUser owns the object, with a protected DACL that grants only
+    /// TokenUser (inheritably on directories). Both fields are set on this
+    /// exact object; inheritance from the parent supplies neither.
+    pub(super) fn protect(path: &Path, directory: bool) {
+        let user = token_info(TokenUser);
+        let flags = if directory { "OICI" } else { "" };
+        let sddl: Vec<u16> = format!("D:P(A;{flags};FA;;;{})", user_text())
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            let mut descriptor = ptr::null_mut();
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    ptr::null_mut()
+                ),
+                0
+            );
+            let (mut present, mut defaulted, mut acl) = (0, 0, ptr::null_mut());
+            assert_ne!(
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted),
+                0
+            );
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let status = SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                user_sid(&user),
+                ptr::null_mut(),
+                acl,
+                ptr::null_mut(),
+            );
+            LocalFree(descriptor);
+            assert_eq!(status, 0, "protect {}", path.display());
+        }
+    }
+
+    /// (owner equals TokenUser, DACL is protected with exactly one TokenUser
+    /// FullControl grant), read from an opened handle without following links.
+    pub(super) fn inspect(path: &Path, directory: bool) -> (bool, bool) {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .unwrap();
+        let user = token_info(TokenUser);
+        unsafe {
+            let (mut owner, mut dacl, mut descriptor) =
+                (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+            assert_eq!(
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut owner,
+                    ptr::null_mut(),
+                    &mut dacl,
+                    ptr::null_mut(),
+                    &mut descriptor,
+                ),
+                0
+            );
+            let owner_is_user = !owner.is_null() && EqualSid(owner, user_sid(&user)) != 0;
+            let (mut control, mut revision) = (0, 0);
+            let protected = GetSecurityDescriptorControl(descriptor, &mut control, &mut revision)
+                != 0
+                && control & SE_DACL_PROTECTED != 0;
+            let mut ace = ptr::null_mut();
+            let private = protected
+                && !dacl.is_null()
+                && (*dacl.cast::<ACL>()).AceCount == 1
+                && GetAce(dacl, 0, &mut ace) != 0
+                && {
+                    let header = &*ace.cast::<ACE_HEADER>();
+                    let allow = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+                    let sid = ptr::addr_of!(allow.SidStart).cast_mut().cast();
+                    header.AceType == 0
+                        && header.AceFlags & INHERITED_ACE as u8 == 0
+                        && (header.AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8
+                            != 0)
+                            == directory
+                        && allow.Mask == 0x1f01ff
+                        && EqualSid(sid, user_sid(&user)) != 0
+                };
+            LocalFree(descriptor);
+            (owner_is_user, private)
+        }
+    }
 }
 
 fn endpoint(temp: &Path) -> String {
@@ -276,9 +424,11 @@ async fn foreground_profile_boundaries() {
 
     let (vm_client, wrong_client) = vm_clients(&owner, &client_identity);
     let rejected_state = root.join("rejected");
-    std::fs::create_dir(&rejected_state).unwrap();
+    private_dir(&rejected_state);
     let good = json!({"state_dir":rejected_state,"agents":agents,"local":{"address":address,
         "client_identity":vm_client},"test_vms":{"enabled":false,"recipes":recipes}});
+    #[cfg(windows)]
+    default_owner_leg(&config_path, &good.to_string());
     save(&config_path, good.to_string());
     assert!(matches!(
         ForegroundConfig::load(&config_path).unwrap(),
@@ -295,9 +445,22 @@ async fn foreground_profile_boundaries() {
         config[field] = value;
         candidates.push(config.to_string());
     }
+    // The client identity rule is checked by its own message, so a generic
+    // permissions failure cannot pass for it.
     let mut wrong = good.clone();
     wrong["local"]["client_identity"] = json!(wrong_client);
-    candidates.push(wrong.to_string());
+    save(&config_path, wrong.to_string());
+    assert_eq!(
+        ForegroundConfig::load(&config_path)
+            .err()
+            .expect("wrong VM client accepted")
+            .to_string(),
+        if cfg!(windows) {
+            "VM client and supervisor must differ"
+        } else {
+            "VM client must be the supervisor"
+        }
+    );
     let mut reserved = good.clone();
     let service = arxd::service::layout::Layout::system().unwrap();
     let service = service.endpoint().to_str().unwrap();
@@ -308,10 +471,39 @@ async fn foreground_profile_boundaries() {
     };
     candidates.push(reserved.to_string());
     candidates.push(format!("{{\"test_vms\":null,{}", &good.to_string()[1..]));
+    let mut unknown = good.clone();
+    unknown["test_vms"]["extra"] = json!(1);
+    candidates.push(unknown.to_string());
     for invalid in candidates {
         save(&config_path, invalid);
         assert!(ForegroundConfig::load(&config_path).is_err());
     }
+    // A link or reparse-point root naming the valid state is refused.
+    let link = root.join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&rejected_state, &link).unwrap();
+    #[cfg(windows)]
+    assert!(
+        std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&rejected_state)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut linked = good.clone();
+    linked["state_dir"] = json!(link);
+    save(&config_path, linked.to_string());
+    let error = ForegroundConfig::load(&config_path)
+        .err()
+        .expect("linked VM root accepted")
+        .to_string();
+    assert!(
+        ["links forbidden", "reparse points forbidden"].contains(&error.as_str()),
+        "{error}"
+    );
     let exit = binary()
         .arg("--config")
         .arg(&config_path)
@@ -329,7 +521,7 @@ async fn foreground_profile_boundaries() {
         ("unqualified", Some(true)),
     ] {
         let state = root.join(label);
-        std::fs::create_dir(&state).unwrap();
+        private_dir(&state);
         let mut config = json!({"state_dir":state,"agents":agents,"local":{"address":address,"client_identity":owner}});
         // The omitted profile keeps legacy selection, including HTTP.
         let http = enabled.is_none().then(|| {
@@ -411,6 +603,26 @@ async fn foreground_profile_boundaries() {
     }
 }
 
+/// The pre-fix fixture wrote files under the private root's inherited DACL,
+/// leaving their owner to the token default. Where that default is not
+/// TokenUser (elevated hosted runners), this is the red leg: the DACL passes
+/// and the real loader refuses the owner. `save` then fixes only the owner
+/// and DACL of the same path and bytes.
+#[cfg(windows)]
+fn default_owner_leg(path: &Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    let (owner_is_user, _) = win::inspect(path, false);
+    let token_owner_is_user = win::token_owner_is_user();
+    assert_eq!(owner_is_user, token_owner_is_user);
+    let loaded = ForegroundConfig::load(path)
+        .map(drop)
+        .map_err(|e| e.to_string());
+    eprintln!("default owner leg: token_owner_is_user={token_owner_is_user} load={loaded:?}");
+    if !token_owner_is_user {
+        assert_eq!(loaded, Err("owner mismatch".into()));
+    }
+}
+
 /// Probe the legacy binary's HTTP listener: unchanged tools, no VM routes.
 async fn http_has_no_vm_routes(port: u16, token: &str) {
     tokio::time::timeout(Duration::from_secs(4), async {
@@ -448,38 +660,74 @@ async fn http_has_no_vm_routes(port: u16, token: &str) {
 async fn validated_root_replacement_is_refused() {
     let (temp, owner, alternate) = private_temp();
     let root = temp.path();
-    let state = root.join("state");
-    std::fs::create_dir(&state).unwrap();
+    let parent = root.join("parent");
+    private_dir(&parent);
+    let state = parent.join("state");
+    private_dir(&state);
     let token = "a".repeat(64);
     let agents = json!([{"principal":"fixture","token_sha256":hex::encode(Sha256::digest(token.as_bytes()))}]);
     let (vm_client, _) = vm_clients(&owner, &alternate);
     let config_path = root.join("server.json");
+    let address = endpoint(root);
     save(
         &config_path,
-        json!({"state_dir":state,"agents":agents,"local":{"address":endpoint(root),
+        json!({"state_dir":state,"agents":agents,"local":{"address":address,
             "client_identity":vm_client},"test_vms":{"enabled":false}})
         .to_string(),
     );
+    // POSIX: an ancestor another principal could rename entries in is
+    // refused; a sticky one is not, as the root entry is ours.
+    #[cfg(unix)]
+    for (mode, refused) in [(0o777, true), (0o1777, false), (0o700, false)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+        let loaded = ForegroundConfig::load(&config_path)
+            .map(drop)
+            .map_err(|error| error.to_string());
+        assert_eq!(
+            loaded,
+            if refused {
+                Err("replaceable VM state ancestor".to_owned())
+            } else {
+                Ok(())
+            },
+            "{mode:o}"
+        );
+    }
     let ForegroundConfig::TestVms(profile) = ForegroundConfig::load(&config_path).unwrap() else {
         panic!("candidate profile expected");
     };
-    let swap = std::fs::rename(&state, root.join("moved"));
+    let moved = root.join("moved");
     #[cfg(windows)]
     {
-        assert!(swap.is_err(), "the pinned VM root was replaced");
+        // ERROR_SHARING_VIOLATION: the pin holds the root and each ancestor
+        // without delete sharing, so neither can be renamed away.
+        let sharing = Some(32);
+        for (from, to) in [(&state, &moved), (&parent, &moved)] {
+            let swap = std::fs::rename(from, to).expect_err("pinned VM path renamed");
+            assert_eq!(swap.raw_os_error(), sharing, "{swap}");
+        }
         drop(profile);
+        // The same renames succeed once the pin is dropped.
+        std::fs::rename(&state, &moved).unwrap();
+        std::fs::rename(&moved, &state).unwrap();
+        std::fs::rename(&parent, &moved).unwrap();
+        std::fs::rename(&moved, &parent).unwrap();
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        swap.unwrap();
-        std::fs::create_dir(&state).unwrap();
-        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // POSIX keeps only the descriptor: a same-UID rename succeeds, and an
+        // equally private directory under the same name is refused before
+        // the store creates anything in either directory.
+        std::fs::rename(&state, &moved).unwrap();
+        private_dir(&state);
         let result =
             tokio::time::timeout(Duration::from_secs(2), arxd::local::run_vm_profile(profile))
                 .await
                 .expect("the replacement root was served");
         assert_eq!(result.unwrap_err().to_string(), "server-state");
         assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 0);
+        assert!(!endpoint_ready(&address), "the replacement root was bound");
     }
 }

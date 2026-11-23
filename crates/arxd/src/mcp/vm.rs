@@ -175,6 +175,8 @@ struct Gate {
 pub(crate) struct Supervisor {
     controller: Arc<Controller>,
     gate: Mutex<Gate>,
+    /// Lock-free foreground admission fence, sampled inside the gate.
+    fenced: AtomicBool,
     cancel: Shutdown,
     cursor_key: hmac::Key,
     host_id: Id,
@@ -190,9 +192,13 @@ pub(crate) struct Supervisor {
     hold: Mutex<Option<tests::Hold>>,
     #[cfg(test)]
     closed_connections: std::sync::atomic::AtomicUsize,
-    /// Blocks final recovery until the sender sends or drops.
+    /// Blocks final recovery until released; see [`tests::Stall`].
     #[cfg(test)]
-    stall_recovery: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    stall_recovery: Mutex<Option<tests::StallHook>>,
+    /// Acknowledges a fatal accept after the fence, then holds the listener
+    /// until its stop is issued.
+    #[cfg(test)]
+    fatal_accept: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Supervisor {
@@ -240,6 +246,7 @@ impl Supervisor {
                 #[cfg(test)]
                 drained: None,
             }),
+            fenced: AtomicBool::new(false),
             cancel: Shutdown::default(),
             cursor_key: hmac::Key::new(hmac::HMAC_SHA256, &secret),
             host_id,
@@ -254,6 +261,8 @@ impl Supervisor {
             closed_connections: Default::default(),
             #[cfg(test)]
             stall_recovery: Mutex::new(None),
+            #[cfg(test)]
+            fatal_accept: Mutex::new(None),
         }))
     }
 
@@ -271,17 +280,53 @@ impl Supervisor {
             .map_err(|_| anyhow::anyhow!("VM supervisor unavailable"))
     }
 
-    /// Close foreground admission, then controller admission. The same lock
-    /// covers connection close, request cancellation sampling and the
-    /// complete SQLite commit and worker registration.
+    /// Fence fresh foreground admission at once, without taking any lock, and
+    /// signal cancellation. Dispatch samples the fence inside the gate, so an
+    /// admission that has not reached its commit refuses as `shutdown`.
+    pub(crate) fn fence(&self) {
+        self.fenced.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
+    }
+
+    /// The close barrier: fence, then close foreground admission, then
+    /// controller admission. The same gate covers request cancellation
+    /// sampling and the complete SQLite commit and worker registration, so
+    /// once this returns every admitted operation is tracked.
     pub(crate) fn close(&self) {
+        self.fence();
         if let Ok(mut gate) = self.gate.lock() {
             gate.closed = true;
         }
         // A failed close leaves the controller gate poisoned, which already
         // refuses every admission; teardown continues either way.
         let _ = self.controller.close_admission();
-        self.cancel.cancel();
+    }
+
+    /// [`Supervisor::close`] off the async executor within `bound`. On expiry
+    /// the barrier is unresolved: the caller reports an unconfirmed drain and
+    /// the blocking close may still finish later.
+    pub(crate) async fn close_within(self: &Arc<Self>, bound: Duration) -> anyhow::Result<()> {
+        self.fence();
+        let supervisor = self.clone();
+        let mut task = tokio::task::spawn_blocking(move || supervisor.close());
+        match tokio::time::timeout(bound, &mut task).await {
+            Ok(result) => Ok(result?),
+            Err(_) => {
+                // Cancels the close only if it has not started.
+                task.abort();
+                anyhow::bail!("VM admission close unconfirmed")
+            }
+        }
+    }
+
+    /// Test-only acknowledgement of a fenced fatal accept; see the field.
+    #[cfg(test)]
+    pub(crate) async fn fatal_accept_observed(&self, stop: &Shutdown) {
+        let ack = self.fatal_accept.lock().ok().and_then(|mut ack| ack.take());
+        if let Some(ack) = ack {
+            let _ = ack.send(());
+            stop.cancelled().await;
+        }
     }
 
     fn candidate(&self) -> runtime::CandidateRuntime<'_> {
@@ -331,9 +376,9 @@ impl Supervisor {
     }
 
     /// Cancel and join every admitted worker and its terminal audit write.
-    /// Admission is closed first, so no new worker can be registered.
+    /// The caller has passed the close barrier, so no new worker can be
+    /// registered.
     pub(crate) async fn drain_workers(&self, bound: Duration) -> anyhow::Result<()> {
-        self.close();
         #[cfg(test)]
         {
             let jobs = self.lock()?.fixture.as_mut().map(tests::Fixture::take_jobs);
@@ -349,14 +394,22 @@ impl Supervisor {
     /// Final controller recovery, after the reaper and workers are joined,
     /// then one more custody turn. Unresolved custody, including build or
     /// staging quarantine and legacy uncertain rows, is an unconfirmed drain.
-    /// The blocking task stays owned until it returns, even past `bound`, so
-    /// it never writes after this call reports.
+    ///
+    /// The whole stage, including any fixture release, has one hard deadline.
+    /// Running blocking work cannot be cancelled: on expiry this returns
+    /// "VM recovery unconfirmed" while the detached task keeps the store and
+    /// its lock until it finishes. The foreground executable then exits
+    /// nonzero; an in-process caller must not treat the store as quiescent.
     pub(crate) async fn recover(self: &Arc<Self>, bound: Duration) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + bound;
+        let unconfirmed = || anyhow::anyhow!("VM recovery unconfirmed");
         #[cfg(test)]
         {
             let drained = self.lock()?.drained.take();
             if let Some(drained) = drained {
-                drained.release().await?;
+                tokio::time::timeout_at(deadline, drained.release())
+                    .await
+                    .map_err(|_| unconfirmed())??;
             }
         }
         #[cfg(test)]
@@ -368,9 +421,7 @@ impl Supervisor {
         let supervisor = self.clone();
         let mut task = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
-            if let Some(stall) = stall {
-                let _ = stall.recv();
-            }
+            let _completed = stall.map(tests::StallHook::enter);
             supervisor.controller.recover_after_drain()?;
             supervisor.sweep()?;
             anyhow::ensure!(
@@ -379,11 +430,12 @@ impl Supervisor {
             );
             Ok(())
         });
-        match tokio::time::timeout(bound, &mut task).await {
+        match tokio::time::timeout_at(deadline, &mut task).await {
             Ok(result) => result?,
             Err(_) => {
-                let _ = task.await;
-                anyhow::bail!("VM recovery unconfirmed")
+                // Cancels the recovery only if it has not started.
+                task.abort();
+                Err(unconfirmed())
             }
         }
     }
@@ -407,9 +459,12 @@ impl Connection {
 }
 
 impl Drop for Connection {
+    /// Lock-free, so an aborted connection task never waits on a stuck gate.
+    /// Dispatch samples the flag inside the gate: a call that already passed
+    /// the sample commits and registers its worker before the gate is
+    /// released, and so is tracked like any admission before the close.
     fn drop(&mut self) {
-        let _gate = self.0.supervisor.gate.lock();
-        self.0.closed.store(true, Ordering::Relaxed);
+        self.0.closed.store(true, Ordering::SeqCst);
         #[cfg(test)]
         self.0
             .supervisor
@@ -753,7 +808,11 @@ impl VmInventory {
         cancelled: impl FnOnce() -> bool,
     ) -> Outcome<Value> {
         let mut gate = self.supervisor.lock()?;
-        if gate.closed || self.closed.load(Ordering::Relaxed) || cancelled() {
+        if gate.closed
+            || self.supervisor.fenced.load(Ordering::SeqCst)
+            || self.closed.load(Ordering::SeqCst)
+            || cancelled()
+        {
             return Err(SHUTDOWN);
         }
         let name = request.name.as_ref();
@@ -2018,7 +2077,7 @@ mod tests {
     }
 
     impl Harness {
-        async fn start(fail_cancelled: bool, interrupt_on_close: bool) -> Self {
+        async fn start(fail_cancelled: bool, interrupt_on_fatal_accept: bool) -> Self {
             let temp = crate::service::application::tests::private_temp();
             let media = temp.path().join("fixture-media");
             fs::create_dir(&media).unwrap();
@@ -2068,20 +2127,21 @@ mod tests {
             });
             let trip = Arc::new(Notify::new());
             let (interrupt, interrupted) = tokio::sync::oneshot::channel::<()>();
-            // Optionally race an interrupt that fires as soon as a failed
-            // listener has closed admission, before its task is joined.
-            let watch = interrupt_on_close.then(|| supervisor.clone());
+            // Optionally race an interrupt that fires once a failed listener
+            // has fenced admission. The listener then completes only after
+            // teardown stops it, so the interrupt deterministically wins.
+            let fatal = interrupt_on_fatal_accept.then(|| {
+                let (ack, observed) = tokio::sync::oneshot::channel();
+                *supervisor.fatal_accept.lock().unwrap() = Some(ack);
+                observed
+            });
             let server = tokio::spawn(local::serve_vm_profile(
                 local::TripAcceptor::new(Listener::bind(&endpoint).unwrap(), trip.clone()),
                 config,
                 supervisor.clone(),
                 async move {
-                    match watch {
-                        Some(supervisor) => {
-                            while !supervisor.gate.lock().unwrap().closed {
-                                tokio::task::yield_now().await;
-                            }
-                        }
+                    match fatal {
+                        Some(observed) => observed.await.unwrap(),
                         None => {
                             let _ = interrupted.await;
                         }
@@ -2630,28 +2690,50 @@ mod tests {
         frame_cases(&h).await;
         assert_eq!(h.audit().len(), audit, "untrusted frames were audited");
         // A trusted call with non-object arguments at the exact frame limit
-        // keeps its classification through the pump's rewrite.
+        // keeps its classification through the pump's rewrite, including the
+        // one-byte value that grows the most. One byte more is untrusted.
+        let exact = |arguments: &str, extra: usize| {
+            let fixed = format!(
+                r#"{{"jsonrpc":"2.0","id":"","method":"tools/call","params":{{"name":"vm_template_build","arguments":{arguments}}}}}"#
+            );
+            let long_id = "x".repeat(local::FRAME_LIMIT - fixed.len() - 1 + extra);
+            let frame = fixed.replacen(r#""id":"""#, &format!(r#""id":"{long_id}""#), 1);
+            assert_eq!(frame.len() + 1, local::FRAME_LIMIT + extra);
+            (format!("{frame}\n"), long_id)
+        };
+        for (count, arguments) in [(1, "null"), (2, "0")] {
+            let mut raw = h.raw().await;
+            let (frame, long_id) = exact(arguments, 0);
+            raw.get_mut().write_all(frame.as_bytes()).await.unwrap();
+            let mut line = String::new();
+            assert!(
+                raw.read_line(&mut line).await.unwrap() > 0,
+                "the exact-limit trusted call was dropped"
+            );
+            let response: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], long_id);
+            assert_eq!(response["result"]["isError"], true);
+            assert_eq!(
+                response["result"]["structuredContent"],
+                json!({"ok":false,"reason":"invalid"})
+            );
+            let rows = h.audit();
+            assert_eq!(rows.len(), audit + count);
+            // The extra receipt is exactly the uncorrelated build refusal.
+            assert_eq!(
+                (rows[0].action, rows[0].state, rows[0].reason, rows[0].vm),
+                (BUILD_ACTION, 4, Some(Refusal::Invalid as i64), None)
+            );
+            assert_eq!((rows[0].operation, rows[0].cleanup), (None, None));
+        }
         let mut raw = h.raw().await;
-        let fixed = r#"{"jsonrpc":"2.0","id":"","method":"tools/call","params":{"name":"vm_template_build","arguments":null}}"#;
-        let long_id = "x".repeat(local::FRAME_LIMIT - fixed.len() - 1);
-        let frame = fixed.replacen(r#""id":"""#, &format!(r#""id":"{long_id}""#), 1);
-        assert_eq!(frame.len() + 1, local::FRAME_LIMIT);
-        raw.get_mut()
-            .write_all(format!("{frame}\n").as_bytes())
-            .await
-            .unwrap();
+        let _ = raw.get_mut().write_all(exact("0", 1).0.as_bytes()).await;
         let mut line = String::new();
         assert!(
-            raw.read_line(&mut line).await.unwrap() > 0,
-            "the exact-limit trusted call was dropped"
+            matches!(raw.read_line(&mut line).await, Ok(0) | Err(_)),
+            "an oversized rewrite-leg frame had a reply"
         );
-        let response: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(response["id"], long_id);
-        assert_eq!(
-            response["result"]["structuredContent"],
-            json!({"ok":false,"reason":"invalid"})
-        );
-        assert_eq!(h.audit().len(), audit + 1);
+        assert_eq!(h.audit().len(), audit + 2, "an oversized frame was audited");
         drop(raw);
 
         // Ctrl+C equivalent: drain, join and recover, then refuse detached work.
@@ -2770,10 +2852,75 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn stalled_final_recovery_is_bounded() {
-        let temp = crate::service::application::tests::private_temp();
-        let supervisor = Supervisor::new(
+    /// The supervisor side of a recovery stall: signals entry, blocks until
+    /// released (by send or by dropping the sender), and signals completion
+    /// when the recovery work returns on any path.
+    pub(super) struct StallHook {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        completed: std::sync::mpsc::Sender<()>,
+    }
+
+    pub(super) struct Completed(std::sync::mpsc::Sender<()>);
+
+    impl Drop for Completed {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    impl StallHook {
+        pub(super) fn enter(self) -> Completed {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            Completed(self.completed)
+        }
+    }
+
+    /// The test side. Dropping it releases the stall on every test outcome.
+    struct Stall {
+        entered: std::sync::mpsc::Receiver<()>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        completed: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Stall {
+        fn install(supervisor: &Supervisor) -> Self {
+            let (entered, entered_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let (completed, completed_rx) = std::sync::mpsc::channel();
+            *supervisor.stall_recovery.lock().unwrap() = Some(StallHook {
+                entered,
+                release: release_rx,
+                completed,
+            });
+            Self {
+                entered: entered_rx,
+                release: Some(release),
+                completed: completed_rx,
+            }
+        }
+
+        /// Release the stalled recovery and wait until its work returned.
+        fn release_and_join(mut self) {
+            drop(self.release.take());
+            self.completed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("released recovery did not complete");
+        }
+    }
+
+    struct Never;
+
+    impl local::Acceptor for Never {
+        type Stream = DuplexStream;
+        async fn accept(&mut self) -> Result<Option<DuplexStream>> {
+            std::future::pending().await
+        }
+    }
+
+    fn idle_supervisor(temp: &tempfile::TempDir) -> Arc<Supervisor> {
+        Supervisor::new(
             temp.path(),
             VmPolicy::default(),
             ForegroundClock { utc: None },
@@ -2781,9 +2928,35 @@ mod tests {
             NativeRefusal::Disabled,
             None,
         )
-        .unwrap();
-        let (release, stall) = std::sync::mpsc::channel::<()>();
-        *supervisor.stall_recovery.lock().unwrap() = Some(stall);
+        .unwrap()
+    }
+
+    /// Serve with an idle listener, interrupt at once and return the
+    /// teardown result, which must arrive well within the outer bound.
+    async fn interrupted_teardown(supervisor: &Arc<Supervisor>) -> String {
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            local::serve_vm_profile_within(
+                Never,
+                Arc::new(Config::default()),
+                supervisor.clone(),
+                async { Ok(()) },
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("teardown outlived its stage bounds");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        result.unwrap_err().to_string()
+    }
+
+    #[tokio::test]
+    async fn stalled_final_recovery_is_bounded() {
+        let temp = crate::service::application::tests::private_temp();
+        let supervisor = idle_supervisor(&temp);
+        // Directly: the stage returns at its deadline, not when work ends.
+        let stall = Stall::install(&supervisor);
         supervisor.close();
         let result = tokio::time::timeout(
             Duration::from_secs(2),
@@ -2792,8 +2965,52 @@ mod tests {
         .await
         .expect("final recovery outlived its bound");
         assert_eq!(result.unwrap_err().to_string(), "VM recovery unconfirmed");
-        // Let the detached blocking task finish before the runtime stops.
-        release.send(()).unwrap();
+        stall
+            .entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recovery was never entered");
+        stall.release_and_join();
+
+        // Composed: a stalled recovery makes the whole teardown unconfirmed.
+        let temp = crate::service::application::tests::private_temp();
+        let supervisor = idle_supervisor(&temp);
+        let stall = Stall::install(&supervisor);
+        assert_eq!(
+            interrupted_teardown(&supervisor).await,
+            "server-drain-unconfirmed"
+        );
+        stall
+            .entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recovery was never entered");
+        stall.release_and_join();
+    }
+
+    #[tokio::test]
+    async fn stuck_close_gate_cannot_hold_teardown_or_reach_recovery() {
+        let temp = crate::service::application::tests::private_temp();
+        let supervisor = idle_supervisor(&temp);
+        let stall = Stall::install(&supervisor);
+        let (locked, held) = std::sync::mpsc::channel();
+        let (unlock, release) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let supervisor = supervisor.clone();
+            move || {
+                let _gate = supervisor.gate.lock().unwrap();
+                locked.send(()).unwrap();
+                let _ = release.recv();
+            }
+        });
+        held.recv().unwrap();
+        let result = interrupted_teardown(&supervisor).await;
+        assert_eq!(result, "server-drain-unconfirmed");
+        assert!(
+            stall.entered.try_recv().is_err(),
+            "recovery ran past an unresolved close barrier"
+        );
+        drop(unlock);
+        holder.join().unwrap();
+        drop(stall);
     }
 
     /// After teardown the client's session is gone or refuses fresh work.

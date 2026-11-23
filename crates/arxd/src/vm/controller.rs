@@ -1256,6 +1256,10 @@ impl<C: Clock> VmController<C> {
     /// Check a validated replay before any native decision or fixture lookup.
     /// All callers serialize fresh admission, cancellation and this check in
     /// the foreground supervisor gate. The eventual admission checks it again.
+    ///
+    /// This is a transactional write seam, not a read: `Binding::replay` can
+    /// advance the persisted UTC replay high-water mark and prune expired
+    /// ledger entries in the same transaction.
     pub(crate) fn foreground_replay(
         &self,
         principal: &str,
@@ -1295,6 +1299,10 @@ impl<C: Clock> VmController<C> {
 
     /// Use the existing bounded v6 audit vocabulary and only correlate an ID
     /// after the same transaction proves caller ownership.
+    ///
+    /// This is a bounded, audit-only write: at most one refusal row (with its
+    /// audit pruning) after the headroom check, and no operation, ledger or
+    /// VM state change.
     pub(crate) fn foreground_refusal(
         &self,
         principal: &str,
