@@ -4,6 +4,7 @@ pub mod guest;
 mod model;
 pub mod paths;
 mod policy;
+mod publish;
 pub mod qemu_args;
 pub mod qemu_img;
 pub mod qmp;
