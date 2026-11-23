@@ -928,3 +928,20 @@ fn seed_and_user_data_contain_no_provisioning_credentials() {
         assert!(text.contains("password: '!'\n"));
     }
 }
+
+#[test]
+fn ubuntu_golden_build_id_changes_only_the_nocloud_metadata_extent() {
+    let golden = fixture();
+    let other = fixture_recipe().render_seed([0; 16], GUEST).unwrap();
+    assert_eq!(golden.len(), other.len());
+    let files = read_iso(&golden).unwrap();
+    let other_files = read_iso(&other).unwrap();
+    let meta = files["meta-data"];
+    assert_ne!(meta, other_files["meta-data"]);
+    let offset = meta.as_ptr() as usize - golden.as_ptr() as usize;
+    assert_eq!(&golden[..offset], &other[..offset]);
+    assert_eq!(
+        &golden[offset + meta.len()..],
+        &other[offset + meta.len()..]
+    );
+}

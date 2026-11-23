@@ -1,3 +1,4 @@
+use super::reaper::CleanupWork;
 use crate::config::VmRuntimeProfile;
 use std::time::{Duration, Instant};
 
@@ -328,4 +329,42 @@ impl StopEvidence {
 /// An observed process exit or fixture receipt cannot produce this lease.
 pub struct OfflineLease {
     _closed: std::convert::Infallible,
+}
+
+/// One teardown authority per work item. Implementations must bind it to the
+/// recorded subject and generation and serialize it against boot and stop.
+/// Every method must return by its monotonic deadline.
+pub(crate) trait ReaperRuntime {
+    /// Signal the outstanding worker and join it or return Unconfirmed.
+    /// Offline requires independent process, worker and artifact release proof,
+    /// including on restart. A missing PID is insufficient.
+    fn quiesce(&self, work: &CleanupWork, deadline: Instant) -> Quiesced;
+
+    fn graceful_stop(&self, work: &CleanupWork, deadline: Instant) -> StopDisposition;
+
+    /// Invoked only after quiesce returned an owned TEST Job for a lease
+    /// expiry. The adapter must revalidate the held Job before using it.
+    fn force_reap(&self, work: &CleanupWork, deadline: Instant) -> StopDisposition;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "native release authority is an activation gate")]
+pub(crate) enum Quiesced {
+    Offline,
+    OwnedTestJob,
+    Unconfirmed,
+}
+
+impl ReaperRuntime for CandidateRuntime<'_> {
+    fn quiesce(&self, _: &CleanupWork, _: Instant) -> Quiesced {
+        Quiesced::Unconfirmed
+    }
+
+    fn graceful_stop(&self, _: &CleanupWork, _: Instant) -> StopDisposition {
+        StopDisposition::ChargedQuarantine
+    }
+
+    fn force_reap(&self, _: &CleanupWork, _: Instant) -> StopDisposition {
+        StopDisposition::ChargedQuarantine
+    }
 }
