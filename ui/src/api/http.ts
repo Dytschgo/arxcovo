@@ -240,9 +240,15 @@ export class HttpApi implements ArxApi {
    * Only an actual HTTP 401 response confirms. A DELETE that could not be
    * sent (no token by the time it is dispatched) rejects, so the shell keeps
    * the session visible and offers the retry.
+   *
+   * The 204 ends only the session the DELETE was sent under. If a newer
+   * sign-in completed while it was in flight, that session's token is kept.
    */
   async logout(): Promise<void> {
     if (!this.csrfToken && (await this.getSession()) === null) return;
+    // The session this DELETE is sent under; request() dispatches it in this
+    // same tick, so it matches the generation request() reads.
+    const sent = this.generation;
     try {
       await this.request('DELETE', `${API_PREFIX}/session`, undefined, 204);
     } catch (error) {
@@ -252,7 +258,7 @@ export class HttpApi implements ArxApi {
       }
       throw error;
     }
-    this.setToken(null);
+    if (this.generation === sent) this.setToken(null);
   }
 
   private setToken(token: string | null): void {
