@@ -25,6 +25,16 @@ test('desktop serves the UI from app://arxcovo with isolation, CSP and locked na
     // Production adapter: no demo banner, and the unconnected API says so honestly.
     await expect(page.getByRole('note', { name: 'Demo data' })).toHaveCount(0);
     await expect(page.getByRole('alert')).toContainText('not connected to an arxd host');
+    // Signing in (POST) and signing out (DELETE) get the same documented 503, not a 405.
+    const methods = await page.evaluate(async () => {
+      const post = await fetch('/api/v1/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const del = await fetch('/api/v1/session', { method: 'DELETE' });
+      return { post: post.status, postBody: await post.json(), del: del.status };
+    });
+    expect(methods).toEqual({ post: 503, postBody: { error: { code: 'unavailable', message: 'This desktop build is not connected to an arxd host yet.' } }, del: 503 });
+    await page.getByLabel('Password').fill('anything');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await expect(page.getByRole('alert')).toHaveText('This desktop build is not connected to an arxd host yet.');
     const initialUrl = page.url();
     expect(initialUrl).toBe('app://arxcovo/index.html');
 
