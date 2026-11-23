@@ -109,7 +109,7 @@ offers a retry that sends `DELETE` again.
 }
 ```
 
-- `os`: `windows | macos | linux`. `arch`: `x86_64 | arm64`.
+- `os`: `windows | linux` (v1; macOS joins with Mac host support on the roadmap). `arch`: `x86_64 | arm64`.
 - `reachability`: `online | degraded | offline`; `reachabilityReason` is a
   short explanation when not online (for example the owner reserve is active).
 - `usedPercent`, `usedBytes`, `capBytes` are `null` when unknown or unset.
@@ -185,8 +185,12 @@ Both use a short-lived ticket so no credential appears in a URL:
    cookie and `Origin` on upgrade.
 3. The first client message is `{"type":"auth","ticket":"..."}`. Redemption
    is atomic (compare-and-delete): the ticket must match this stream id,
-   action, target and the cookie's live session. Anything else, a reused or
-   expired ticket, or no auth within 5 s closes the socket with 4401.
+   action, target and the cookie's live session, and it runs under the same
+   session lock as revocation (see "Stream lifetime"), so a ticket cannot be
+   redeemed after its session's generation changed. A reused, expired or
+   mismatched ticket, any other first message, or no auth within 5 s closes
+   the socket with **4408** ("ticket rejected": reconnectable, the session
+   may still be live). Only a failed *session* check closes with 4401.
 
 The client rejects a `streamPath` outside `/api/v1/streams/`.
 
@@ -196,14 +200,42 @@ Authorization is not only checked at the upgrade. The server must:
 
 - Close every stream of a session when that session is signed out, expires
   (idle or absolute) or is revoked, with WebSocket close code **4401**
-  ("session ended"). Implement this with a per-session generation counter
-  (or revocation flag) checked by the stream task: the stream records the
-  generation at redemption and stops as soon as it changes, and a session
-  registry wakes open streams on sign-out so the close is immediate rather
-  than waiting for the next message.
+  ("session ended"). Implement this with a per-session generation counter:
+  the stream records the generation at redemption, and a session registry
+  holds each open stream's cancellation handle so revocation reaches it
+  immediately rather than at the next message.
+
+**Ordering with revocation.** Revocation (sign-out, expiry, revocation) and
+every authorization decision a stream makes are linearized by one
+per-session lock:
+
+1. Revocation takes the lock, bumps the generation, marks the session dead,
+   then (still under the lock) triggers every registered stream's
+   cancellation handle. `DELETE /api/v1/session` answers 204 only after this.
+2. **Command admission.** A terminal `run` takes the same lock, checks the
+   session is live and the generation unchanged, and registers the command
+   with the executor's cancellation path *before* releasing the lock and
+   spawning. The executor's existing pre-spawn cancellation check then
+   refuses a command whose cancellation fired in between. Result: a command
+   admitted before the bump may run to its executor cleanup, but its output
+   stops at the close; a command not yet admitted is refused and never spawns.
+3. **Frame delivery.** Each console frame and each terminal output chunk is
+   sent only after a generation check, through a per-stream outbound queue.
+   On revocation the queue is cleared: frames or chunks still in flight are
+   dropped, and the 4401 close frame is the next and last thing sent.
+4. **Expiry wake-up.** At redemption the server arms a timer per stream for
+   the session's absolute expiry, and re-arms an idle-expiry timer whenever
+   the session's idle deadline moves. When either fires, the stream closes
+   with 4401 whether it is idle (no traffic) or busy (a command running or
+   frames flowing), following steps 1–3.
+
+Server integration tests (backend PR) must cover: revocation during command
+admission, expiry during a running command, revocation while a console frame
+send is pending, and ticket redemption racing revocation.
+
 - Re-validate the session (live, unexpired, same generation) before every
-  terminal `run` and before sending every console frame. A failed check
-  closes the socket with 4401 and runs nothing.
+  terminal `run` and before sending every console frame or output chunk, as
+  above. A failed check closes the socket with 4401 and runs nothing.
 - Close with **4403** when the target stops being allowed (for example the
   host is removed or the VM is deleted), and **1001** on shutdown. Close
   reasons are short (≤ 123 bytes) and contain no secrets.
@@ -213,8 +245,11 @@ Authorization is not only checked at the upgrade. The server must:
   the executor's kill timeout. A console stream stops capturing at once.
 
 The client treats any close it did not start as server-initiated: it shows
-the reason in the terminal or console view and offers Reconnect; on 4401 it
-also ends the local session and returns to the login form.
+the reason in the terminal or console view and offers Reconnect, and it
+ignores any message that arrives after the close. On 4401 it also forgets the
+in-memory CSRF token, ends the local session and returns to the login form.
+On 4408 it reports a ticket or handshake failure and offers Reconnect,
+without ending the session.
 
 ### Terminal: `POST /api/v1/hosts/{id}/terminal`
 
@@ -246,8 +281,7 @@ lifetime".
 
 ### Console: `POST /api/v1/vms/{id}/console`
 
-View-only frames for v1, from QEMU screendumps (or Screen Sharing capture for
-macOS guests). Interactive VNC (noVNC-style RFB over this same socket) can
+View-only frames for v1, from QEMU screendumps. Interactive VNC (noVNC-style RFB over this same socket) can
 replace it later without changing the ticket flow.
 
 Server → client, repeating pairs:
