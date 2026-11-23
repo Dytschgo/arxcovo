@@ -5,6 +5,7 @@ use crate::store::{
 };
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -77,19 +78,16 @@ impl<C: Clock> VmController<C> {
         let binding = store::Binding {
             principal: request.principal,
             key: request.request_id,
-            vm: request.vm,
-            action,
+            subject: Subject::Vm(request.vm),
+            action: action as i64,
         };
         match binding.replay(db, now, closed)? {
-            Ok(Some(prior)) => return Ok(Admission::Existing(prior.receipt)),
+            Ok(Some(prior)) => return Ok(Admission::Existing(prior.operation.receipt)),
             Err(reason) => return Ok(Admission::Refused(reason)),
             Ok(None) => {}
         }
-        if store::count(
-            db,
-            "SELECT count(*) FROM activity WHERE status=0 AND action<=6",
-            [],
-        )? >= store::MAX_CALLER_PENDING
+        if store::count(db, "SELECT count(*) FROM vm_operations WHERE status=0", [])?
+            >= store::MAX_CALLER_PENDING
         {
             return Ok(Admission::Refused(Refusal::PendingFull));
         }
@@ -111,7 +109,10 @@ impl<C: Clock> VmController<C> {
             Ok(target) => target,
             Err(reason) => return Ok(Admission::Refused(reason)),
         };
-        let id = binding.record(db, now, None)?;
+        let id = binding
+            .record(db, now, Some(request.vm), None)?
+            .receipt
+            .activity_id;
         target.insert(db, request, id)?;
         store::require_headroom(db)?;
         Ok(Admission::Admitted(PendingOperation {
@@ -131,11 +132,441 @@ impl<C: Clock> VmController<C> {
             "invalid VM worker handle"
         );
         self.store.transact(|db| {
+            ensure!(store::count(db,
+                "SELECT count(*) FROM vm_operations WHERE activity_id=?1 AND binding_kind IN ('recipe','template')",
+                [operation.activity_id],
+            )? == 0, "durable VM worker requires artifact settlement");
             let now = self.clock.now();
             if now.monotonic >= operation.deadline {
                 completion = Completion::CleanupUnconfirmed;
             }
             store::settle_operation(db, operation.activity_id, utc(now)?, completion)
+        })
+    }
+
+    #[allow(dead_code, reason = "foreground script execution is wired in 4d")]
+    pub(crate) fn finish_script(
+        &self,
+        worker: &PendingOperation,
+        result: ScriptResult,
+    ) -> Result<Status> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let clock = self.clock.now();
+            let (completion, script) = if clock.monotonic >= worker.deadline {
+                (Completion::CleanupUnconfirmed, None)
+            } else if result == ScriptResult::Exited(0) {
+                (Completion::Succeeded, Some(result))
+            } else {
+                (Completion::Failed, Some(result))
+            };
+            ensure!(store::count(db,
+                "SELECT count(*) FROM vm_operations WHERE activity_id=?1 AND action=2 AND status=0",
+                [worker.activity_id],
+            )? == 1, "invalid script worker");
+            store::settle_with_script(db, worker.activity_id, utc(clock)?, completion, script)
+        })
+    }
+
+    #[allow(dead_code, reason = "foreground MCP projection is wired in 4d")]
+    pub(crate) fn operation_status(
+        &self,
+        principal: &str,
+        id: Id,
+    ) -> Result<Result<OperationStatus, Refusal>> {
+        if validate_principal(principal).is_err() {
+            return Ok(Err(Refusal::NotFound));
+        }
+        self.store.transact(|db| {
+            Ok(
+                store::operation_status(db, principal, id, utc(self.clock.now())?)?
+                    .ok_or(Refusal::NotFound),
+            )
+        })
+    }
+
+    #[allow(dead_code, reason = "foreground MCP projection is wired in 4d")]
+    pub(crate) fn list_status(
+        &self,
+        principal: &str,
+        after: Option<Id>,
+        limit: u32,
+    ) -> Result<Result<Vec<VmStatus>, Refusal>> {
+        if validate_principal(principal).is_err() || !(1..=20).contains(&limit) {
+            return Ok(Err(Refusal::Invalid));
+        }
+        self.store.transact(|db| {
+            Ok(Ok(store::vm_status_rows(
+                db,
+                principal,
+                None,
+                after,
+                limit,
+                utc(self.clock.now())?,
+            )?))
+        })
+    }
+
+    #[allow(dead_code, reason = "foreground MCP projection is wired in 4d")]
+    pub(crate) fn get_status(&self, principal: &str, id: Id) -> Result<Result<VmStatus, Refusal>> {
+        if validate_principal(principal).is_err() {
+            return Ok(Err(Refusal::NotFound));
+        }
+        self.store.transact(|db| {
+            let now = utc(self.clock.now())?;
+            if let Some(item) = store::vm_status_rows(db, principal, Some(id), None, 1, now)?.pop()
+            {
+                return Ok(Ok(item));
+            }
+            store::purge_tombstones(db, now)?;
+            Ok(store::expired_status(db, principal, id)?
+                .map(|row| VmStatus {
+                    id,
+                    template: None,
+                    guest: None,
+                    state: "expired",
+                    ready: false,
+                    expires_at_ms: None,
+                    expired_at_ms: Some(row.expired_at_ms),
+                    cleanup: Some("confirmed"),
+                    snapshots: [],
+                })
+                .ok_or(Refusal::NotFound))
+        })
+    }
+
+    pub(crate) fn admit_build(
+        &self,
+        request: BuildRequest<'_>,
+        host: HostObservation,
+        resources: Resources,
+        verify_sealed: impl FnOnce(Id, PairSlots) -> Option<[ArtifactEvidence; 2]>,
+    ) -> Result<Result<BuildAdmission, Refusal>> {
+        if validate_principal(request.principal).is_err()
+            || request.recipe.len() != 32
+            || !request
+                .recipe
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Ok(Err(Refusal::Invalid));
+        }
+        let closed = self
+            .closed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        map_full(self.store.transact(|db| {
+            let clock = self.clock.now();
+            let now = utc(clock)?;
+            let binding = store::Binding {
+                principal: request.principal,
+                key: request.key,
+                subject: Subject::Recipe(request.recipe, request.digest),
+                action: BUILD_ACTION,
+            };
+            let decision = self.reserve_build(
+                db,
+                request,
+                &binding,
+                clock,
+                *closed,
+                host,
+                resources,
+                verify_sealed,
+            )?;
+            if let Err(reason) = decision {
+                store::refusal_for(db, request.principal, None, BUILD_ACTION, now, reason)?;
+            }
+            Ok(decision)
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_build(
+        &self,
+        db: &Connection,
+        request: BuildRequest<'_>,
+        binding: &store::Binding<'_>,
+        clock: ClockReading,
+        closed: bool,
+        host: HostObservation,
+        resources: Resources,
+        verify_sealed: impl FnOnce(Id, PairSlots) -> Option<[ArtifactEvidence; 2]>,
+    ) -> Result<Result<BuildAdmission, Refusal>> {
+        let now = utc(clock)?;
+        match binding.replay(db, now, closed)? {
+            Ok(Some(prior)) => return Ok(Ok(BuildAdmission::Existing(prior.operation))),
+            Err(reason) => return Ok(Err(reason)),
+            Ok(None) => {}
+        }
+        if let Some((template, slots)) = store::sealed_pair(db, request.recipe, request.digest)? {
+            // Only a bounded read through the qualified runtime is permitted here.
+            let Some([disk, vars]) = verify_sealed(template, slots) else {
+                return Ok(Err(Refusal::Busy));
+            };
+            if !store::evidence_matches(db, slots.disk, disk, "sealed")?
+                || !store::evidence_matches(db, slots.vars, vars, "sealed")?
+            {
+                return Ok(Err(Refusal::Busy));
+            }
+            let mut operation = binding.record(db, now, None, None)?;
+            store::finish(
+                db,
+                operation.receipt.activity_id,
+                Status::Succeeded,
+                now,
+                Some(true),
+            )?;
+            store::require_headroom(db)?;
+            operation.receipt.status = Status::Succeeded;
+            return Ok(Ok(BuildAdmission::Existing(operation)));
+        }
+        if store::count(db, "SELECT count(*) FROM vm_operations WHERE status=0", [])?
+            >= store::MAX_CALLER_PENDING
+        {
+            return Ok(Err(Refusal::PendingFull));
+        }
+        if store::count(
+            db,
+            "SELECT EXISTS(SELECT 1 FROM vm_build_intents WHERE state<>'sealed')
+                 OR EXISTS(SELECT 1 FROM vm_instances WHERE state IN (2,3,4))
+                 OR EXISTS(SELECT 1 FROM vm_operations WHERE status=0
+                     AND (action=3 OR binding_kind='template'))",
+            [],
+        )? != 0
+        {
+            return Ok(Err(Refusal::Busy));
+        }
+        if store::count(db, "SELECT count(*) FROM vm_templates", [])? >= 4 {
+            return Ok(Err(Refusal::TemplateLimit));
+        }
+        if request.retained.images == 0
+            || request.retained.staging != 0
+            || request.transient.images == 0
+        {
+            return Ok(Err(Refusal::Invalid));
+        }
+        let Some(peak) = request
+            .retained
+            .total()
+            .and_then(|bytes| bytes.checked_add(request.transient.total()?))
+            .filter(|bytes| i64::try_from(*bytes).is_ok())
+        else {
+            return Ok(Err(Refusal::Disk));
+        };
+        let capacity = match self.policy.host(host, resources) {
+            Ok(capacity) => capacity,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        if let Err(reason) = self.validate_disk(
+            db,
+            capacity,
+            DiskClaim {
+                staging: peak,
+                ..DiskClaim::default()
+            },
+        )? {
+            return Ok(Err(reason));
+        }
+        // 60 minutes for install plus bounded detached verification and release.
+        let pending = self.worker(clock, 3_900)?;
+        let operation = binding.record(db, now, None, None)?;
+        let slots = store::reserve_build(db, request, operation, peak)?;
+        store::require_headroom(db)?;
+        Ok(Ok(BuildAdmission::Fresh(
+            Box::new(slots),
+            PendingOperation {
+                activity_id: operation.receipt.activity_id,
+                ..pending
+            },
+            operation,
+        )))
+    }
+
+    pub(crate) fn admit_linked_clone(
+        &self,
+        mut request: Request<'_>,
+        host: HostObservation,
+        resources: Resources,
+        golden: PairSlots,
+        proof: [ArtifactEvidence; 2],
+    ) -> Result<Result<CloneAdmission, Refusal>> {
+        let Operation::Clone {
+            template,
+            lease_seconds,
+        } = request.operation
+        else {
+            return Ok(Err(Refusal::Invalid));
+        };
+        let seconds = lease_seconds.unwrap_or(DEFAULT_LEASE_SECONDS);
+        if validate_principal(request.principal).is_err() || lease(0, Some(seconds)).is_err() {
+            return Ok(Err(Refusal::Invalid));
+        }
+        let digest = Sha256::new()
+            .chain_update(b"arxcovo.clone.ttl.v1\0")
+            .chain_update(seconds.to_be_bytes())
+            .finalize()
+            .into();
+        let closed = self
+            .closed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        map_full(self.store.transact(|db| {
+            let clock = self.clock.now();
+            let now = utc(clock)?;
+            let binding = store::Binding {
+                principal: request.principal,
+                key: request.request_id,
+                subject: Subject::Template(template, digest),
+                action: Action::Clone as i64,
+            };
+            match binding.replay(db, now, *closed)? {
+                    Ok(Some(prior)) => return Ok(Ok(CloneAdmission::Existing(prior.operation))),
+                    Err(reason) => return Ok(Err(reason)),
+                    Ok(None) => {}
+                }
+                if store::count(db, "SELECT count(*) FROM vm_operations WHERE status=0", [])?
+                    >= store::MAX_CALLER_PENDING
+                {
+                    return Ok(Err(Refusal::PendingFull));
+                }
+                if store::count(db,
+                    "SELECT EXISTS(SELECT 1 FROM vm_build_intents WHERE state<>'sealed')
+                     OR EXISTS(SELECT 1 FROM vm_operations WHERE status=0 AND binding_kind='template')",
+                    [],
+                )? != 0 {
+                    return Ok(Err(Refusal::Busy));
+                }
+                if golden.disk.generation != golden.vars.generation || store::count(db,
+                    "SELECT count(*) FROM vm_build_intents b JOIN vm_generations g ON g.build_id=b.id
+                     WHERE b.template_id=?1 AND b.state='sealed' AND g.active=1 AND g.id=?2",
+                    params![template, golden.disk.generation],
+                )? != 1
+                    || !store::evidence_matches(db, golden.disk, proof[0], "sealed")?
+                    || !store::evidence_matches(db, golden.vars, proof[1], "sealed")?
+                {
+                    return Ok(Err(Refusal::NotFound));
+                }
+                let capacity = match self.policy.host(host, resources) {
+                    Ok(capacity) => capacity,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                if let Err(reason) = self.validate_disk(db, capacity, request.disk)? {
+                    return Ok(Err(reason));
+                }
+                let pending = self.worker(clock, 120)?;
+                request.vm = store::new_id()?;
+                let target = match target(db, &request, now)? {
+                    Ok(target) => target,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                let operation = binding.record(db, now, Some(request.vm), None)?;
+                target.insert(db, &request, operation.receipt.activity_id)?;
+                let slots = store::plan_clone(db, request.vm)?;
+                store::require_headroom(db)?;
+                Ok(Ok(CloneAdmission::Fresh(request.vm, slots, PendingOperation {
+                    activity_id: operation.receipt.activity_id, ..pending
+                }, operation)))
+        }))
+    }
+
+    fn worker(&self, clock: ClockReading, seconds: u64) -> Result<PendingOperation> {
+        Ok(PendingOperation {
+            activity_id: 0,
+            deadline: clock
+                .monotonic
+                .checked_add(Duration::from_secs(seconds))
+                .ok_or_else(|| anyhow::anyhow!("invalid VM deadline"))?,
+            binding: Arc::clone(&self.worker_binding),
+        })
+    }
+
+    fn check_worker(&self, worker: &PendingOperation) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.worker_binding, &worker.binding),
+            "invalid VM worker handle"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn build_evidence(
+        &self,
+        worker: &PendingOperation,
+        build: Id,
+        entries: &[(ArtifactSlot, Option<ArtifactEvidence>)],
+    ) -> Result<()> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            for &(slot, evidence) in entries {
+                ensure!(store::count(db,
+                    "SELECT count(*) FROM vm_build_intents b JOIN vm_operations o USING(operation_id)
+                     JOIN vm_generations g ON g.build_id=b.id WHERE b.id=?1 AND o.activity_id=?2
+                       AND b.state='pending' AND o.status=0 AND g.id=?3 AND g.active=0",
+                    params![build, worker.activity_id, slot.generation],
+                )? == 1, "invalid build artifact binding");
+                if let Some(evidence) = evidence {
+                    store::identify(db, slot, evidence)?;
+                } else {
+                    store::created(db, slot)?;
+                }
+            }
+            store::require_headroom(db)
+        })
+    }
+
+    pub(crate) fn finish_build(
+        &self,
+        worker: &PendingOperation,
+        slots: BuildSlots,
+        request: BuildRequest<'_>,
+        proof: [ArtifactEvidence; 2],
+    ) -> Result<Status> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let clock = self.clock.now();
+            let now = utc(clock)?;
+            if clock.monotonic >= worker.deadline {
+                store::abandon_build(db, slots.id, worker.activity_id, now)?;
+                return Ok(Status::Interrupted);
+            }
+            store::publish_build(db, worker.activity_id, slots, request, proof, now)?;
+            Ok(Status::Succeeded)
+        })
+    }
+
+    pub(crate) fn fail_build(
+        &self,
+        worker: &PendingOperation,
+        slots: BuildSlots,
+        untouched: bool,
+    ) -> Result<()> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let now = utc(self.clock.now())?;
+            if untouched {
+                store::cancel_untouched_build(db, slots, worker.activity_id, now)
+            } else {
+                store::abandon_build(db, slots.id, worker.activity_id, now)
+            }
+        })
+    }
+
+    pub(crate) fn finish_linked_clone(
+        &self,
+        worker: &PendingOperation,
+        slots: PairSlots,
+        proof: Option<[ArtifactEvidence; 2]>,
+    ) -> Result<Status> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let clock = self.clock.now();
+            store::settle_clone(
+                db,
+                worker.activity_id,
+                slots,
+                proof.filter(|_| clock.monotonic < worker.deadline),
+                utc(clock)?,
+            )
         })
     }
 
@@ -166,7 +597,13 @@ impl<C: Clock> VmController<C> {
             if let Err(reason) = self.validate_disk(db, capacity, template.disk)? {
                 return Ok(Err(reason));
             }
-            if store::count(db, "SELECT count(*) FROM vm_templates", [])? >= 4 {
+            if store::count(
+                db,
+                "SELECT (SELECT count(*) FROM vm_templates)
+                + (SELECT count(*) FROM vm_build_intents WHERE state<>'sealed')",
+                [],
+            )? >= 4
+            {
                 return Ok(Err(Refusal::TemplateLimit));
             }
             let written = db.execute(
@@ -212,14 +649,14 @@ impl<C: Clock> VmController<C> {
             let now = utc(self.clock.now())?;
             let binding = store::Binding {
                 principal,
-                vm,
+                subject: Subject::Vm(vm),
                 key: request_id,
-                action: Action::Extend,
+                action: Action::Extend as i64,
             };
             match binding.replay(db, now, *closed)? {
                 Ok(Some(prior)) => {
                     ensure!(
-                        prior.receipt.status == Status::Succeeded,
+                        prior.operation.receipt.status == Status::Succeeded,
                         "invalid extension receipt"
                     );
                     return Ok(Ok(prior
@@ -250,7 +687,10 @@ impl<C: Clock> VmController<C> {
                         "UPDATE vm_instances SET expires_ms=?2 WHERE id=?1",
                         params![vm, end],
                     )?;
-                    let id = binding.record(db, now, Some(end))?;
+                    let id = binding
+                        .record(db, now, Some(vm), Some(end))?
+                        .receipt
+                        .activity_id;
                     store::finish(db, id, Status::Succeeded, now, None)?;
                     store::require_headroom(db)?;
                     Ok(end)
@@ -551,7 +991,9 @@ fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Tar
             if store::count(
                 db,
                 "SELECT EXISTS(SELECT 1 FROM vm_instances WHERE state IN (2,3,4))
-                OR EXISTS(SELECT 1 FROM activity WHERE action=3 AND status=0)",
+                OR EXISTS(SELECT 1 FROM activity WHERE action=3 AND status=0)
+                OR EXISTS(SELECT 1 FROM vm_build_intents WHERE state<>'sealed')
+                OR EXISTS(SELECT 1 FROM vm_operations WHERE status=0 AND binding_kind='template')",
                 [],
             )? != 0
             {
