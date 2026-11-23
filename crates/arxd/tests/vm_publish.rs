@@ -307,9 +307,14 @@ mod vm {
         use std::{
             fs,
             num::NonZeroU16,
-            os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+            os::windows::{
+                ffi::OsStrExt,
+                fs::OpenOptionsExt,
+                io::{AsRawHandle, FromRawHandle, OwnedHandle},
+            },
             path::{Path, PathBuf},
             process::Command,
+            ptr::null_mut,
         };
 
         use arxd::vm::paths::ArtifactPin;
@@ -317,8 +322,14 @@ mod vm {
         use rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
         use sha2::{Digest, Sha256};
         use tokio_rustls::TlsAcceptor;
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::{Authorization::*, *},
+            Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT},
+            System::Threading::{
+                GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+            },
         };
 
         use super::publish::connector::{Connector, ConnectorError, Plan, TunnelCredential};
@@ -326,6 +337,8 @@ mod vm {
 
         const ORIGIN_NAME: &str = "generation.example.invalid";
         const FAKE_SECRET: &str = "SyntheticDontPrint012345678901234567890abcA=";
+        const FIXTURE_ENV: &str = "ARX_PUBLISH_CONNECTOR_FIXTURE";
+        const FIXTURE_NAME: &str = "vm::native::connector_fixture";
 
         // The separate executable receives cloudflared's actual argument list and
         // environment. Compile it from inline Rust to keep the B1 file fence.
@@ -389,14 +402,8 @@ mod vm {
             (image, pin)
         }
 
-        fn protect_fixture(root: &Path) {
-            use std::{os::windows::ffi::OsStrExt, ptr::null_mut};
-            use windows_sys::Win32::{
-                Foundation::LocalFree,
-                Security::{Authorization::*, *},
-                System::Threading::{GetCurrentProcess, OpenProcessToken},
-            };
-            // Protect the fixture if hosted CI uses shared scratch.
+        /// A word-aligned token information buffer for the current process.
+        fn token_info(class: TOKEN_INFORMATION_CLASS) -> Vec<usize> {
             unsafe {
                 let mut token = null_mut();
                 assert_ne!(
@@ -405,19 +412,104 @@ mod vm {
                 );
                 let token = OwnedHandle::from_raw_handle(token);
                 let mut size = 0;
-                GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut size);
-                let mut user = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
+                GetTokenInformation(token.as_raw_handle(), class, null_mut(), 0, &mut size);
+                assert!((1..=4096).contains(&size));
+                let mut buffer = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
                 assert_ne!(
                     GetTokenInformation(
                         token.as_raw_handle(),
-                        TokenUser,
-                        user.as_mut_ptr().cast(),
+                        class,
+                        buffer.as_mut_ptr().cast(),
                         size,
                         &mut size
                     ),
                     0
                 );
-                let sid = (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+                buffer
+            }
+        }
+
+        fn user_sid(user: &[usize]) -> PSID {
+            // The buffer came from TokenUser and outlives every use of the SID.
+            unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+        }
+
+        fn token_owner_is_user() -> bool {
+            let user = token_info(TokenUser);
+            let owner = token_info(TokenOwner);
+            unsafe {
+                EqualSid(
+                    user_sid(&user),
+                    (*owner.as_ptr().cast::<TOKEN_OWNER>()).Owner,
+                ) != 0
+            }
+        }
+
+        /// Reads the owner from an opened handle: (equals TokenUser, is Builtin Administrators).
+        fn owner_of(path: &Path) -> (bool, bool) {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .unwrap();
+            let user = token_info(TokenUser);
+            unsafe {
+                let (mut owner, mut descriptor) = (null_mut(), null_mut());
+                assert_eq!(
+                    GetSecurityInfo(
+                        file.as_raw_handle(),
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION,
+                        &mut owner,
+                        null_mut(),
+                        null_mut(),
+                        null_mut(),
+                        &mut descriptor,
+                    ),
+                    0
+                );
+                assert!(!owner.is_null());
+                let result = (
+                    EqualSid(owner, user_sid(&user)) != 0,
+                    IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0,
+                );
+                LocalFree(descriptor);
+                result
+            }
+        }
+
+        /// Test-only ownership witness. Production requires TokenUser on every held object,
+        /// so a hosted failure here names ownership instead of a closed custody error.
+        fn assert_owned(label: &str, path: &Path) {
+            let (user, admins) = owner_of(path);
+            assert!(
+                user,
+                "{label}: fixture owner must equal TokenUser (builtin_admins={admins})"
+            );
+        }
+
+        fn set_owner_to_user(path: &Path) {
+            let user = token_info(TokenUser);
+            let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let status = unsafe {
+                SetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    user_sid(&user),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                )
+            };
+            assert_eq!(status, 0);
+        }
+
+        fn protect_fixture(root: &Path) {
+            // Protect the fixture if hosted CI uses shared scratch.
+            unsafe {
+                let user = token_info(TokenUser);
+                let sid = user_sid(&user);
                 let mut sid_text = null_mut();
                 assert_ne!(ConvertSidToStringSidW(sid, &mut sid_text), 0);
                 let length = (0..184).find(|&i| *sid_text.add(i) == 0).unwrap();
@@ -530,8 +622,107 @@ mod vm {
             (port, ca_path, pin(pem.as_bytes()), task)
         }
 
+        fn credential_json() -> String {
+            json!({"AccountTag": ZONE, "TunnelID": TUNNEL, "TunnelSecret": FAKE_SECRET}).to_string()
+        }
+
+        /// The previous DACL-only setup under the creating token's default owner. Where that
+        /// owner differs from TokenUser, as on an elevated hosted runner, this is the red leg:
+        /// the DACL passes, the owner differs and the real loader refuses. Assigning the same
+        /// leaf to TokenUser is the green leg with unchanged path, bytes and DACL.
+        fn ownership_probe(root: &Path) {
+            let tunnel = TunnelId::parse(TUNNEL).unwrap();
+            protect_fixture(root);
+            let leaf = root.join("credential.json");
+            fs::write(&leaf, credential_json()).unwrap();
+            let token_owner_is_user = token_owner_is_user();
+            let (owner_is_user, owner_is_admins) = owner_of(&leaf);
+            let private = crate::security::private(&leaf).is_ok();
+            let first = TunnelCredential::load(&leaf, ZONE, &tunnel).map(drop);
+            eprintln!(
+                "connector ownership probe: token_owner_is_user={token_owner_is_user} leaf_owner_is_user={owner_is_user} leaf_owner_is_builtin_admins={owner_is_admins} private_dacl={private} load={first:?}"
+            );
+            assert!(private, "fixture DACL must pass the private-DACL predicate");
+            assert_eq!(owner_is_user, token_owner_is_user);
+            if owner_is_user {
+                assert_eq!(first, Ok(()));
+                eprintln!("connector ownership probe: red leg not applicable on this token");
+                return;
+            }
+            assert_eq!(first, Err(ConnectorError::Credential));
+            set_owner_to_user(&leaf);
+            assert_owned("probe credential", &leaf);
+            assert!(crate::security::private(&leaf).is_ok());
+            assert_eq!(
+                TunnelCredential::load(&leaf, ZONE, &tunnel).map(drop),
+                Ok(())
+            );
+            eprintln!("connector ownership probe: red leg refused, owned leaf loaded");
+        }
+
+        /// Runs the fixture once in an exact-test child so only that child's TokenOwner changes.
         #[tokio::test]
         async fn connector_publish_unpublish_receipt_and_restart_are_bounded() {
+            assert!(
+                std::env::var_os(FIXTURE_ENV).is_none(),
+                "connector fixture must not recurse"
+            );
+            let output = timeout(
+                Duration::from_secs(120),
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        FIXTURE_NAME,
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads",
+                        "1",
+                        "--format",
+                        "pretty",
+                        "--color",
+                        "never",
+                    ])
+                    .env(FIXTURE_ENV, "1")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("connector fixture exceeded its outer deadline")
+            .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for text in [&stdout, &stderr] {
+                assert!(
+                    !text.contains(FAKE_SECRET) && !text.contains(CANARY),
+                    "connector fixture output contained a synthetic credential"
+                );
+            }
+            // Ownership probe and leg timing lines only; credentials were excluded above.
+            eprintln!("{stderr}");
+            assert!(
+                output.status.success(),
+                "connector fixture failed\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains(&format!("test {FIXTURE_NAME} ... ok"))
+                    && stdout.contains("test result: ok. 1 passed;"),
+                "connector fixture did not run exactly once\n{stdout}"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "subprocess-only connector fixture; changes only the child's TokenOwner"]
+        async fn connector_fixture() {
+            assert_eq!(std::env::var(FIXTURE_ENV).as_deref(), Ok("1"));
+            let probe = tempfile::Builder::new()
+                .prefix("publish-probe-")
+                .tempdir()
+                .unwrap();
+            ownership_probe(probe.path());
+            // New objects, including the connector's generated YAML, get TokenUser as owner.
+            arxd::service::windows::set_current_token_owner().expect("normalize TokenOwner");
+            assert!(token_owner_is_user());
+
             let temp = tempfile::Builder::new()
                 .prefix("publish-")
                 .tempdir()
@@ -545,9 +736,15 @@ mod vm {
             let hostname = Hostname::parse(NAME).unwrap();
             let tunnel = TunnelId::parse(TUNNEL).unwrap();
             let credential_path = root.join("credential.json");
-            let contents =
-                json!({"AccountTag": ZONE, "TunnelID": TUNNEL, "TunnelSecret": FAKE_SECRET});
-            fs::write(&credential_path, contents.to_string()).unwrap();
+            fs::write(&credential_path, credential_json()).unwrap();
+            for (label, path) in [
+                ("fixture root", root),
+                ("fake executable", binary.as_path()),
+                ("origin CA", ca_path.as_path()),
+                ("credential", credential_path.as_path()),
+            ] {
+                assert_owned(label, path);
+            }
             let credential = TunnelCredential::load(&credential_path, ZONE, &tunnel).unwrap();
             assert!(!format!("{credential:?}").contains(FAKE_SECRET));
             let wrong_name = Hostname::parse("wrong.example.invalid").unwrap();
@@ -612,6 +809,7 @@ mod vm {
             assert!(fields[6].starts_with("127.0.0.1:"));
             assert_eq!(&fields[7..], &["--grace-period", "100ms", "run", "true"]);
             let pid = fields[0].parse().unwrap();
+            assert_owned("generated ingress config", Path::new(fields[2]));
             let config = fs::read_to_string(fields[2]).unwrap();
             assert!(!config.contains(FAKE_SECRET));
             assert!(config.contains("noTLSVerify: false"));
