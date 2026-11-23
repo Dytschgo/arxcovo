@@ -192,9 +192,20 @@ pub(crate) struct Supervisor {
     hold: Mutex<Option<tests::Hold>>,
     #[cfg(test)]
     closed_connections: std::sync::atomic::AtomicUsize,
+    /// The validated state root, owned by every store user: dispatch, the
+    /// reaper and any detached close or recovery hold this supervisor, so a
+    /// late store write after an unconfirmed result still runs under the
+    /// same namespace guarantee. `None` only for in-module fixtures.
+    root_pin: Option<Box<crate::config::RootPin>>,
     /// Blocks final recovery until released; see [`tests::Stall`].
     #[cfg(test)]
     stall_recovery: Mutex<Option<tests::StallHook>>,
+    /// Blocks the next dispatch while it holds the gate.
+    #[cfg(test)]
+    stall_dispatch: Mutex<Option<tests::StallHook>>,
+    /// Blocks the next sweep.
+    #[cfg(test)]
+    stall_sweep: Mutex<Option<tests::StallHook>>,
     /// Acknowledges a fatal accept after the fence, then holds the listener
     /// until its stop is issued.
     #[cfg(test)]
@@ -202,7 +213,11 @@ pub(crate) struct Supervisor {
 }
 
 impl Supervisor {
-    pub(crate) fn open(root: &Path, mut profile: TestVms) -> anyhow::Result<Arc<Self>> {
+    pub(crate) fn open(
+        root: &Path,
+        mut profile: TestVms,
+        pin: Box<crate::config::RootPin>,
+    ) -> anyhow::Result<Arc<Self>> {
         let reason = if !profile.enabled {
             NativeRefusal::Disabled
         } else if cfg!(all(windows, target_arch = "x86_64")) {
@@ -212,7 +227,7 @@ impl Supervisor {
         };
         let policy = profile.policy();
         let recipe = profile.recipe()?;
-        Self::new(
+        let mut supervisor = Self::new(
             root,
             policy,
             ForegroundClock {
@@ -222,7 +237,11 @@ impl Supervisor {
             recipe,
             reason,
             profile.runtime.take(),
-        )
+        )?;
+        Arc::get_mut(&mut supervisor)
+            .ok_or_else(|| anyhow::anyhow!("VM supervisor shared before open"))?
+            .root_pin = Some(pin);
+        Ok(supervisor)
     }
 
     fn new(
@@ -259,11 +278,24 @@ impl Supervisor {
             hold: Mutex::new(None),
             #[cfg(test)]
             closed_connections: Default::default(),
+            root_pin: None,
             #[cfg(test)]
             stall_recovery: Mutex::new(None),
             #[cfg(test)]
+            stall_dispatch: Mutex::new(None),
+            #[cfg(test)]
+            stall_sweep: Mutex::new(None),
+            #[cfg(test)]
             fatal_accept: Mutex::new(None),
         }))
+    }
+
+    /// The canonical root still denotes the pinned directory.
+    pub(crate) fn verify_root(&self, root: &Path) -> anyhow::Result<()> {
+        match &self.root_pin {
+            Some(pin) => pin.verify(root),
+            None => anyhow::bail!("VM state root not pinned"),
+        }
     }
 
     pub(crate) fn connection(self: &Arc<Self>, principal: String) -> Connection {
@@ -340,6 +372,13 @@ impl Supervisor {
 
     fn sweep(&self) -> anyhow::Result<()> {
         #[cfg(test)]
+        let _completed = self
+            .stall_sweep
+            .lock()
+            .ok()
+            .and_then(|mut stall| stall.take())
+            .map(tests::StallHook::enter);
+        #[cfg(test)]
         if let Some(reaper) = self.lock()?.fixture.as_ref().map(tests::Fixture::reaper) {
             self.controller.sweep_with(&reaper, &*reaper.custody)?;
             return Ok(());
@@ -349,30 +388,39 @@ impl Supervisor {
     }
 
     /// The supervised periodic reaper; the caller cancels and joins it.
-    pub(crate) async fn run_reaper(&self, stop: &Shutdown) -> anyhow::Result<()> {
+    ///
+    /// Each turn is the same bounded sweep as the startup sweep, run on the
+    /// blocking pool so controller locks and SQLite never occupy the
+    /// scheduler that drives the teardown deadlines. A turn in progress is
+    /// awaited before this returns, so the caller's bounded join covers it;
+    /// on expiry the drain is unconfirmed while the turn finishes detached.
+    pub(crate) async fn run_reaper(self: &Arc<Self>, stop: &Shutdown) -> anyhow::Result<()> {
         #[cfg(test)]
         if let Some(mut ticks) = self.ticks.lock().ok().and_then(|mut ticks| ticks.take()) {
-            let reaper = self.lock()?.fixture.as_ref().map(tests::Fixture::reaper);
-            return match reaper {
-                Some(reaper) => {
-                    self.controller
-                        .run_reaper_with(&reaper, &*reaper.custody, &mut ticks, stop)
-                        .await
-                }
-                None => {
-                    self.controller
-                        .run_reaper(&self.candidate(), &mut ticks, stop)
-                        .await
-                }
-            };
+            return self.reaper_turns(&mut ticks, stop).await;
         }
-        self.controller
-            .run_reaper(
-                &self.candidate(),
-                &mut MonotonicReaperTicks::default(),
-                stop,
-            )
+        self.reaper_turns(&mut MonotonicReaperTicks::default(), stop)
             .await
+    }
+
+    async fn reaper_turns(
+        self: &Arc<Self>,
+        ticks: &mut impl reaper::ReaperTick,
+        stop: &Shutdown,
+    ) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => return Ok(()),
+                more = ticks.next_tick() => {
+                    if !more {
+                        return Ok(());
+                    }
+                    let supervisor = self.clone();
+                    tokio::task::spawn_blocking(move || supervisor.sweep()).await??;
+                }
+            }
+        }
     }
 
     /// Cancel and join every admitted worker and its terminal audit write.
@@ -447,6 +495,20 @@ impl Supervisor {
         }
         let _ = gate;
         json!({"available":false,"reason":native_reason(self.native_refusal)})
+    }
+}
+
+impl Drop for Supervisor {
+    /// Production store users reach the store only through this supervisor,
+    /// so the pinned root outlives them all. Native workers that clone the
+    /// controller would break that; activation must keep this assertion.
+    fn drop(&mut self) {
+        debug_assert!(
+            self.root_pin.is_none()
+                || std::thread::panicking()
+                || Arc::strong_count(&self.controller) == 1,
+            "a VM store user outlived the pinned state root"
+        );
     }
 }
 
@@ -651,7 +713,17 @@ impl ServerHandler for VmInventory {
             hold.entered.notify_one();
             hold.release.notified().await;
         }
-        let result = self.dispatch(request, || context.ct.is_cancelled());
+        // Dispatch takes the blocking supervisor gate and SQLite, so it runs
+        // on the blocking pool: it can never occupy the scheduler that drives
+        // the teardown deadlines. A dispatch the SDK stops awaiting still
+        // finishes under the gate, which the close barrier waits for.
+        let inventory = self.clone();
+        let cancelled = context.ct.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            inventory.dispatch(request, || cancelled.is_cancelled())
+        })
+        .await
+        .unwrap_or(Err(STATE_UNAVAILABLE));
         let (value, error) = match result {
             Ok(mut object) => {
                 object["ok"] = Value::Bool(true);
@@ -808,6 +880,14 @@ impl VmInventory {
         cancelled: impl FnOnce() -> bool,
     ) -> Outcome<Value> {
         let mut gate = self.supervisor.lock()?;
+        #[cfg(test)]
+        let _completed = self
+            .supervisor
+            .stall_dispatch
+            .lock()
+            .ok()
+            .and_then(|mut stall| stall.take())
+            .map(tests::StallHook::enter);
         if gate.closed
             || self.supervisor.fenced.load(Ordering::SeqCst)
             || self.closed.load(Ordering::SeqCst)
@@ -2852,20 +2932,23 @@ mod tests {
         }
     }
 
-    /// The supervisor side of a recovery stall: signals entry, blocks until
-    /// released (by send or by dropping the sender), and signals completion
-    /// when the recovery work returns on any path.
+    /// The supervisor side of a stall (dispatch, sweep or recovery): signals
+    /// entry, blocks its blocking-pool thread until released (by send or by
+    /// dropping the sender), and signals completion when the stalled work
+    /// returns on any path.
     pub(super) struct StallHook {
-        entered: std::sync::mpsc::Sender<()>,
+        entered: tokio::sync::oneshot::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
-        completed: std::sync::mpsc::Sender<()>,
+        completed: tokio::sync::oneshot::Sender<()>,
     }
 
-    pub(super) struct Completed(std::sync::mpsc::Sender<()>);
+    pub(super) struct Completed(Option<tokio::sync::oneshot::Sender<()>>);
 
     impl Drop for Completed {
         fn drop(&mut self) {
-            let _ = self.0.send(());
+            if let Some(completed) = self.0.take() {
+                let _ = completed.send(());
+            }
         }
     }
 
@@ -2873,23 +2956,23 @@ mod tests {
         pub(super) fn enter(self) -> Completed {
             let _ = self.entered.send(());
             let _ = self.release.recv();
-            Completed(self.completed)
+            Completed(Some(self.completed))
         }
     }
 
     /// The test side. Dropping it releases the stall on every test outcome.
     struct Stall {
-        entered: std::sync::mpsc::Receiver<()>,
+        entered: tokio::sync::oneshot::Receiver<()>,
         release: Option<std::sync::mpsc::Sender<()>>,
-        completed: std::sync::mpsc::Receiver<()>,
+        completed: tokio::sync::oneshot::Receiver<()>,
     }
 
     impl Stall {
-        fn install(supervisor: &Supervisor) -> Self {
-            let (entered, entered_rx) = std::sync::mpsc::channel();
+        fn install(slot: &Mutex<Option<StallHook>>) -> Self {
+            let (entered, entered_rx) = tokio::sync::oneshot::channel();
             let (release, release_rx) = std::sync::mpsc::channel();
-            let (completed, completed_rx) = std::sync::mpsc::channel();
-            *supervisor.stall_recovery.lock().unwrap() = Some(StallHook {
+            let (completed, completed_rx) = tokio::sync::oneshot::channel();
+            *slot.lock().unwrap() = Some(StallHook {
                 entered,
                 release: release_rx,
                 completed,
@@ -2901,12 +2984,27 @@ mod tests {
             }
         }
 
-        /// Release the stalled recovery and wait until its work returned.
-        fn release_and_join(mut self) {
+        async fn entered(&mut self) {
+            tokio::time::timeout(Duration::from_secs(5), &mut self.entered)
+                .await
+                .expect("stalled work was never entered")
+                .unwrap();
+        }
+
+        fn not_entered(&mut self) -> bool {
+            matches!(
+                self.entered.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            )
+        }
+
+        /// Release the stalled work and wait until it returned.
+        async fn release_and_join(mut self) {
             drop(self.release.take());
-            self.completed
-                .recv_timeout(Duration::from_secs(5))
-                .expect("released recovery did not complete");
+            tokio::time::timeout(Duration::from_secs(5), &mut self.completed)
+                .await
+                .expect("released work did not complete")
+                .unwrap();
         }
     }
 
@@ -2956,7 +3054,7 @@ mod tests {
         let temp = crate::service::application::tests::private_temp();
         let supervisor = idle_supervisor(&temp);
         // Directly: the stage returns at its deadline, not when work ends.
-        let stall = Stall::install(&supervisor);
+        let mut stall = Stall::install(&supervisor.stall_recovery);
         supervisor.close();
         let result = tokio::time::timeout(
             Duration::from_secs(2),
@@ -2965,32 +3063,26 @@ mod tests {
         .await
         .expect("final recovery outlived its bound");
         assert_eq!(result.unwrap_err().to_string(), "VM recovery unconfirmed");
-        stall
-            .entered
-            .recv_timeout(Duration::from_secs(5))
-            .expect("recovery was never entered");
-        stall.release_and_join();
+        stall.entered().await;
+        stall.release_and_join().await;
 
         // Composed: a stalled recovery makes the whole teardown unconfirmed.
         let temp = crate::service::application::tests::private_temp();
         let supervisor = idle_supervisor(&temp);
-        let stall = Stall::install(&supervisor);
+        let mut stall = Stall::install(&supervisor.stall_recovery);
         assert_eq!(
             interrupted_teardown(&supervisor).await,
             "server-drain-unconfirmed"
         );
-        stall
-            .entered
-            .recv_timeout(Duration::from_secs(5))
-            .expect("recovery was never entered");
-        stall.release_and_join();
+        stall.entered().await;
+        stall.release_and_join().await;
     }
 
     #[tokio::test]
     async fn stuck_close_gate_cannot_hold_teardown_or_reach_recovery() {
         let temp = crate::service::application::tests::private_temp();
         let supervisor = idle_supervisor(&temp);
-        let stall = Stall::install(&supervisor);
+        let mut stall = Stall::install(&supervisor.stall_recovery);
         let (locked, held) = std::sync::mpsc::channel();
         let (unlock, release) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn({
@@ -3005,12 +3097,137 @@ mod tests {
         let result = interrupted_teardown(&supervisor).await;
         assert_eq!(result, "server-drain-unconfirmed");
         assert!(
-            stall.entered.try_recv().is_err(),
+            stall.not_entered(),
             "recovery ran past an unresolved close barrier"
         );
         drop(unlock);
         holder.join().unwrap();
         drop(stall);
+    }
+
+    /// Failure-path bound for a one-worker runtime whose own timers would stop
+    /// if the scheduler were blocked: a thread that releases the stall only if
+    /// the test has not disarmed it within the bound. The success path never
+    /// waits on it.
+    struct Watchdog {
+        disarm: std::sync::mpsc::Sender<()>,
+        thread: std::thread::JoinHandle<bool>,
+    }
+
+    impl Watchdog {
+        fn arm(release: std::sync::mpsc::Sender<()>) -> Self {
+            let (disarm, disarmed) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                let fired = matches!(
+                    disarmed.recv_timeout(Duration::from_secs(4)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                );
+                drop(release);
+                fired
+            });
+            Self { disarm, thread }
+        }
+
+        /// Disarm, release the stall and report whether the bound fired.
+        fn disarm(self) -> bool {
+            let _ = self.disarm.send(());
+            self.thread.join().unwrap()
+        }
+    }
+
+    /// With a single Tokio worker, a dispatch stalled inside the gate (as on
+    /// a stuck SQLite write) or a stalled periodic reaper turn must not stop
+    /// the teardown deadlines: the result is `server-drain-unconfirmed`
+    /// while the stall is still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn one_worker_stalled_dispatch_or_reaper_turn_cannot_hold_shutdown() {
+        for reaper in [false, true] {
+            let temp = crate::service::application::tests::private_temp();
+            let supervisor = idle_supervisor(&temp);
+            let ticks = reaper.then(|| {
+                let (ticks, receiver) = tokio::sync::mpsc::unbounded_channel();
+                *supervisor.ticks.lock().unwrap() = Some(TestTicks(receiver));
+                ticks
+            });
+            let mut stall = Stall::install(if reaper {
+                &supervisor.stall_sweep
+            } else {
+                &supervisor.stall_dispatch
+            });
+            // Armed before the stall can be entered, so even a blocked sole
+            // worker is released within the bound.
+            let watchdog = Watchdog::arm(stall.release.take().unwrap());
+            let endpoint = Endpoint {
+                #[cfg(unix)]
+                address: temp.path().join("vm.sock").to_str().unwrap().into(),
+                #[cfg(windows)]
+                address: format!(
+                    r"\\.\pipe\arxcovo-mcp-{}",
+                    hex::encode(crate::store::vm::new_id().unwrap())
+                ),
+                client_identity: local::vm_supervisor_identity().unwrap(),
+            };
+            let token = "a".repeat(64);
+            let config = Arc::new(Config {
+                agents: vec![Agent {
+                    principal: "alpha".into(),
+                    token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
+                }],
+                ..Config::default()
+            });
+            let (interrupt, interrupted) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(local::serve_vm_profile_within(
+                Listener::bind(&endpoint).unwrap(),
+                config,
+                supervisor.clone(),
+                async move {
+                    let _ = interrupted.await;
+                    Ok(())
+                },
+                Duration::from_millis(200),
+            ));
+            let call = match &ticks {
+                Some(ticks) => {
+                    ticks.send(()).unwrap();
+                    None
+                }
+                None => {
+                    let stream = local::connect_vm_fixture(
+                        &endpoint.address,
+                        &endpoint.client_identity,
+                        &token,
+                    )
+                    .await
+                    .unwrap();
+                    let (read, write) = split(stream);
+                    let client: Client =
+                        ().serve(AsyncRwTransport::new_client(read, write))
+                            .await
+                            .unwrap();
+                    Some(tokio::spawn(async move {
+                        let _ = client.call_tool(request("vm_catalog", json!({}))).await;
+                        client
+                    }))
+                }
+            };
+            stall.entered().await;
+            interrupt.send(()).unwrap();
+            let result = server.await.unwrap();
+            let fired = watchdog.disarm();
+            assert!(
+                !fired,
+                "teardown waited for the stalled work (reaper={reaper})"
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "server-drain-unconfirmed",
+                "reaper={reaper}"
+            );
+            stall.release_and_join().await;
+            if let Some(call) = call {
+                drop(call.await.unwrap());
+            }
+        }
     }
 
     /// After teardown the client's session is gone or refuses fresh work.

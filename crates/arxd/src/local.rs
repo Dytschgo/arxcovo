@@ -230,8 +230,8 @@ impl Listener {
 /// The foreground candidate has its own store, listener and shutdown path.
 ///
 /// The validated root pin is checked again immediately before the store
-/// opens, before the startup sweep and before bind, and is held for the
-/// whole serving and drain lifetime. A mismatch is `server-state`.
+/// opens, before the startup sweep and before bind. The supervisor then owns
+/// it for as long as any store user lives. A mismatch is `server-state`.
 pub async fn run_vm_profile(profile: crate::config::VmForeground) -> Result<()> {
     use crate::mcp::vm::Supervisor;
     let crate::config::VmForeground {
@@ -241,18 +241,22 @@ pub async fn run_vm_profile(profile: crate::config::VmForeground) -> Result<()> 
     } = profile;
     let endpoint = config.local.as_ref().context("server-config")?;
     root.verify(&config.state_dir).context("server-state")?;
-    let supervisor = Supervisor::open(&config.state_dir, profile).context("server-state")?;
-    root.verify(&config.state_dir).context("server-state")?;
+    // The supervisor owns the pin from here, so every store user, including
+    // a detached close or recovery after an unconfirmed result, keeps it.
+    let supervisor = Supervisor::open(&config.state_dir, profile, root).context("server-state")?;
+    supervisor
+        .verify_root(&config.state_dir)
+        .context("server-state")?;
     // One bounded sweep before any tool is published.
     supervisor.startup_sweep().context("server-state")?;
-    root.verify(&config.state_dir).context("server-state")?;
+    supervisor
+        .verify_root(&config.state_dir)
+        .context("server-state")?;
     let listener = Listener::bind(endpoint).context("server-bind")?;
-    let result = serve_vm_profile(listener, Arc::new(config), supervisor, async {
+    serve_vm_profile(listener, Arc::new(config), supervisor, async {
         tokio::signal::ctrl_c().await.context("server-listener")
     })
-    .await;
-    drop(root);
-    result
+    .await
 }
 
 /// Bound for each independent teardown stage after admission is fenced.

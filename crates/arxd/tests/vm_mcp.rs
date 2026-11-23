@@ -204,19 +204,30 @@ mod win {
                 0
             );
             let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            let status = SetNamedSecurityInfoW(
+            // The DACL first: the current owner may always write it, while
+            // changing the owner needs the WRITE_OWNER right it then grants
+            // (an inherited Modify-only grant, as on a build tree, lacks it).
+            let dacl = SetNamedSecurityInfoW(
                 wide.as_ptr(),
                 SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION
-                    | DACL_SECURITY_INFORMATION
-                    | PROTECTED_DACL_SECURITY_INFORMATION,
-                user_sid(&user),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
                 ptr::null_mut(),
                 acl,
                 ptr::null_mut(),
             );
             LocalFree(descriptor);
-            assert_eq!(status, 0, "protect {}", path.display());
+            assert_eq!(dacl, 0, "protect DACL {}", path.display());
+            let owner = SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                user_sid(&user),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(owner, 0, "protect owner {}", path.display());
         }
     }
 
@@ -730,4 +741,125 @@ async fn validated_root_replacement_is_refused() {
         assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 0);
         assert!(!endpoint_ready(&address), "the replacement root was bound");
     }
+}
+
+/// macOS: an otherwise acceptable 0700 root, or its parent, carrying an
+/// extended ACL that grants another principal namespace rights is refused
+/// before any state is created or the endpoint is bound. Hosted-first: no
+/// local macOS host ran this.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_extended_acl_on_root_or_ancestor_is_refused() {
+    let (temp, owner, alternate) = private_temp();
+    let root = temp.path();
+    let parent = root.join("parent");
+    private_dir(&parent);
+    let state = parent.join("state");
+    private_dir(&state);
+    let token = "a".repeat(64);
+    let agents = json!([{"principal":"fixture","token_sha256":hex::encode(Sha256::digest(token.as_bytes()))}]);
+    let (vm_client, _) = vm_clients(&owner, &alternate);
+    let config_path = root.join("server.json");
+    let address = endpoint(root);
+    save(
+        &config_path,
+        json!({"state_dir":state,"agents":agents,"local":{"address":address,
+            "client_identity":vm_client},"test_vms":{"enabled":false}})
+        .to_string(),
+    );
+    let chmod = |args: &[&str], path: &Path| {
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .args(args)
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    assert!(
+        ForegroundConfig::load(&config_path).is_ok(),
+        "positive control"
+    );
+    for target in [&parent, &state] {
+        chmod(
+            &[
+                "+a",
+                "group:everyone allow add_file,add_subdirectory,delete_child",
+            ],
+            target,
+        );
+        assert_eq!(
+            ForegroundConfig::load(&config_path)
+                .err()
+                .expect("extended ACL accepted")
+                .to_string(),
+            "extended ACL on VM state path"
+        );
+        let exit = binary()
+            .arg("--config")
+            .arg(&config_path)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(exit.status.code(), Some(3));
+        assert_eq!(exit.stderr, b"arxd: server-config\n");
+        assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+        assert!(!endpoint_ready(&address), "bound despite an extended ACL");
+        chmod(&["-N"], target);
+    }
+    assert!(ForegroundConfig::load(&config_path).is_ok(), "ACLs removed");
+}
+
+/// A private state root inside the executable's directory is refused by its
+/// own rule. macOS is excluded: build trees under a home folder can carry the
+/// system's `everyone deny delete` ACL, which the root walk refuses first.
+#[cfg(not(target_os = "macos"))]
+#[tokio::test]
+async fn executable_directory_overlap_is_refused() {
+    let (temp, owner, alternate) = private_temp();
+    let root = temp.path();
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let directory = executable.parent().unwrap();
+    #[cfg(windows)]
+    let directory = Path::new(
+        directory
+            .to_str()
+            .unwrap()
+            .strip_prefix(r"\\?\")
+            .unwrap_or(directory.to_str().unwrap()),
+    );
+    let Ok(inside) = tempfile::Builder::new()
+        .prefix("vm-overlap-")
+        .tempdir_in(directory)
+    else {
+        eprintln!("executable directory not writable here; overlap case skipped");
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(inside.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    win::protect(inside.path(), true);
+    assert_private(inside.path(), true);
+    let token = "a".repeat(64);
+    let agents = json!([{"principal":"fixture","token_sha256":hex::encode(Sha256::digest(token.as_bytes()))}]);
+    let (vm_client, _) = vm_clients(&owner, &alternate);
+    let config_path = root.join("server.json");
+    save(
+        &config_path,
+        json!({"state_dir":inside.path(),"agents":agents,"local":{"address":endpoint(root),
+            "client_identity":vm_client},"test_vms":{"enabled":false}})
+        .to_string(),
+    );
+    assert_eq!(
+        ForegroundConfig::load(&config_path)
+            .err()
+            .expect("state root inside the executable directory accepted")
+            .to_string(),
+        "executable VM state overlap"
+    );
+    assert_eq!(std::fs::read_dir(inside.path()).unwrap().count(), 0);
 }

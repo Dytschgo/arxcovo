@@ -261,7 +261,9 @@ pub struct VmForeground {
 /// Windows holds the root and every ancestor directory open without delete
 /// sharing, so no component of the name can be renamed, deleted or replaced
 /// while the pin lives; [`RootPin::verify`] then also compares volume and
-/// file ID from the handle with a fresh open of the name.
+/// file ID from the handle with a fresh open of the name. Operators must stop
+/// the foreground before renaming or moving the root or any parent folder
+/// (docs/dev-host-setup.md, "Foreground VM profile: state root custody").
 ///
 /// POSIX holds a non-following descriptor, which keeps the object alive but
 /// does not lock the name. Validation requires every ancestor to be
@@ -269,7 +271,8 @@ pub struct VmForeground {
 /// root, and not group/other writable unless sticky with the child owned by
 /// the effective UID or root), so only the same effective UID, which can
 /// already control this process, could rename a component. That is the
-/// stated POSIX trust boundary for this diagnostic-only profile. `verify`
+/// stated POSIX trust boundary for this diagnostic-only profile. On macOS
+/// the walk also refuses any extended ACL on the root or an ancestor. `verify`
 /// compares device and inode against a fresh non-following lookup and so
 /// refuses a persistent replacement made before composition or bind.
 pub(crate) struct RootPin {
@@ -393,9 +396,26 @@ fn directory_identity(file: &std::fs::File) -> Result<(u64, u64)> {
 /// any ancestor entry of `root`: each parent is owned by the effective UID or
 /// root and is not group/other writable, unless it is sticky and the child is
 /// owned by the effective UID or root. Mode bits include the Linux ACL mask.
+/// macOS ACLs are independent of the mode and can grant another principal
+/// add-file or delete-child rights, so on macOS the root and every ancestor
+/// must also carry no extended ACL entry; an unreadable ACL is refused too.
 #[cfg(unix)]
 fn stable_ancestry(root: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
+    #[cfg(target_os = "macos")]
+    for path in root.ancestors() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path);
+        anyhow::ensure!(
+            directory.is_ok_and(|directory| {
+                crate::service::native::macos_empty_acl(&directory).is_ok()
+            }),
+            "extended ACL on VM state path"
+        );
+    }
     let euid = unsafe { libc::geteuid() };
     let trusted = |uid: u32| uid == euid || uid == 0;
     let mut child = std::fs::symlink_metadata(root)?;
