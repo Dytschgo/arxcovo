@@ -252,3 +252,104 @@ pub struct RecoveryClaim {
     pub vm: Id,
     pub activity_id: i64,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Subject<'a> {
+    Vm(Id),
+    Template(Id, [u8; 32]),
+    Recipe(&'a str, [u8; 32]),
+}
+
+pub(crate) const BUILD_ACTION: i64 = 11;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OperationRef {
+    pub id: Id,
+    pub receipt: Receipt,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BuildRequest<'a> {
+    pub principal: &'a str,
+    pub key: RequestId,
+    pub recipe: &'a str,
+    pub digest: [u8; 32],
+    pub retained: DiskClaim,
+    pub transient: DiskClaim,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ArtifactSlot {
+    pub generation: Id,
+    pub role: &'static str,
+    pub key: Id,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PairSlots {
+    pub disk: ArtifactSlot,
+    pub vars: ArtifactSlot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BuildSlots {
+    pub id: Id,
+    pub pair: PairSlots,
+    pub seed: ArtifactSlot,
+    pub verification: PairSlots,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ArtifactEvidence {
+    pub identity: super::paths::FileIdentity,
+    pub directory: Id,
+    pub pin: super::paths::ArtifactPin,
+}
+
+#[derive(Debug)]
+pub(crate) enum BuildAdmission {
+    Fresh(Box<BuildSlots>, PendingOperation, OperationRef),
+    Existing(OperationRef),
+}
+
+#[derive(Debug)]
+pub(crate) enum CloneAdmission {
+    Fresh(Id, PairSlots, PendingOperation, OperationRef),
+    Existing(OperationRef),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScriptResult {
+    Exited(u32),
+    Unavailable,
+    TimedOut,
+    LaunchFailed,
+    Terminated,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OperationStatus {
+    pub id: Id,
+    pub action: &'static str,
+    pub state: Status,
+    pub stage: Option<&'static str>,
+    pub cleanup: Option<&'static str>,
+    pub vm: Option<Id>,
+    pub recipe: Option<String>,
+    pub template: Option<Id>,
+    pub expires_at_ms: Option<i64>,
+    pub script: Option<ScriptResult>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct VmStatus {
+    pub id: Id,
+    pub template: Option<Id>,
+    pub guest: Option<Guest>,
+    pub state: &'static str,
+    pub ready: bool,
+    pub expires_at_ms: Option<i64>,
+    pub expired_at_ms: Option<i64>,
+    pub cleanup: Option<&'static str>,
+    pub snapshots: [Id; 0],
+}

@@ -6,22 +6,20 @@ pub use ubuntu::{AssetPin, RecipeError, UbuntuAssets, UbuntuRecipe};
 
 #[allow(
     dead_code,
-    reason = "4c supplies the durable lifecycle caller; native admission is closed"
+    reason = "foreground lifecycle composition is deferred; native admission is closed"
 )]
 mod lifecycle {
     use super::{RecipeError, UbuntuAssets, UbuntuRecipe, ubuntu::DETACHED_HEALTH};
     use crate::vm::{
-        Admission, Clock, Completion, DiskClaim, Guest, HostObservation, Id, Operation, Receipt,
-        Refusal, Request, Resources, SealedTemplate, Status, VmController, VmPolicy,
-        paths::{ArtifactPin, FileIdentity},
+        ArtifactEvidence, BuildAdmission, BuildRequest, BuildSlots, Clock, CloneAdmission,
+        HostObservation, Id, OperationRef, PairSlots, Refusal, Request, Resources, Status,
+        VmController,
+        paths::ArtifactPin,
         runtime::{CandidateRuntime, NativeRefusal, StopDisposition},
     };
     use arx_guest::protocol::ScriptStatus;
     use sha2::{Digest, Sha256};
-    use std::{
-        sync::{Mutex, MutexGuard, TryLockError},
-        time::Duration,
-    };
+    use std::time::Duration;
 
     const HEALTH_TIMEOUT_S: u32 = 30;
     const INSTALL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -49,48 +47,47 @@ mod lifecycle {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct PinnedFile {
-        identity: FileIdentity,
-        bytes: ArtifactPin,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct Pair {
-        disk: PinnedFile,
-        vars: PinnedFile,
+        disk: ArtifactEvidence,
+        vars: ArtifactEvidence,
     }
 
     impl Pair {
         fn fits(self, images: u64) -> bool {
-            self.disk.bytes.size > 0
-                && self.vars.bytes.size > 0
+            self.disk.pin.size > 0
+                && self.vars.pin.size > 0
                 && self.disk.identity != self.vars.identity
                 && self
                     .disk
-                    .bytes
+                    .pin
                     .size
-                    .checked_add(self.vars.bytes.size)
+                    .checked_add(self.vars.pin.size)
                     .is_some_and(|size| size <= images)
+        }
+
+        fn evidence(self) -> [ArtifactEvidence; 2] {
+            [self.disk, self.vars]
         }
     }
 
     #[derive(Debug)]
     struct Golden {
         id: Id,
+        slots: PairSlots,
         files: Pair,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum LinkedSlot {
-        Verification(Id),
-        Clone(Id),
+        Verification(PairSlots),
+        Clone(Id, PairSlots),
     }
 
     #[derive(Debug)]
     struct Linked {
         slot: LinkedSlot,
         files: Pair,
-        backing: PinnedFile,
+        backing: ArtifactEvidence,
     }
 
     impl Linked {
@@ -98,7 +95,7 @@ mod lifecycle {
             self.slot == slot
                 && self.backing == golden.files.disk
                 && self.files.fits(images)
-                && self.files.vars.bytes == golden.files.vars.bytes
+                && self.files.vars.pin == golden.files.vars.pin
                 && [self.files.disk.identity, self.files.vars.identity]
                     .iter()
                     .all(|id| {
@@ -130,7 +127,7 @@ mod lifecycle {
         Readiness(Readiness),
         Health,
         Stop(StopDisposition),
-        CloneInterrupted,
+        Interrupted,
     }
 
     /// Trust boundary for storage and process effects. Implementations must
@@ -140,16 +137,21 @@ mod lifecycle {
         /// Create fresh backing-less disk, private VARS and read-only CIDATA
         /// in the reserved generation, under the supplied byte limits. Return
         /// the CIDATA pin from a bounded reread through its custody handle.
-        fn stage(&mut self, spec: &BuildSpec, seed: &[u8]) -> Result<ArtifactPin, Failure>;
+        fn stage(
+            &mut self,
+            slots: BuildSlots,
+            spec: &BuildRequest<'_>,
+            seed: &[u8],
+        ) -> Result<ArtifactEvidence, Failure>;
         /// Attach the installer and CIDATA, then observe poweroff and release.
         fn install(
             &mut self,
-            id: Id,
+            slots: BuildSlots,
             timeout: Duration,
         ) -> Result<(Boot, StopDisposition), Failure>;
         /// Reopen the backing-less candidate at its final generation paths and
         /// verify the image, role, identity, size and digest of both files.
-        fn capture_golden(&mut self, id: Id, images: u64) -> Result<Pair, Failure>;
+        fn capture_golden(&mut self, slots: PairSlots, images: u64) -> Result<Pair, Failure>;
         /// Create a fresh overlay with explicit qcow2 backing at the pinned
         /// golden disk and copy VARS into a distinct writable file. Return
         /// the verified immediate backing, with no other chain or data file.
@@ -173,7 +175,7 @@ mod lifecycle {
         fn stop(&mut self, boot: Boot) -> StopDisposition;
         /// Remove only the attributable, released CIDATA and verification pair.
         /// Keep the captured golden pair protected at its final paths.
-        fn discard_transients(&mut self, id: Id) -> Result<(), Failure>;
+        fn discard_transients(&mut self, slots: BuildSlots) -> Result<(), Failure>;
     }
 
     enum Installer<'a> {
@@ -195,123 +197,121 @@ mod lifecycle {
         }
     }
 
-    struct BuildSpec {
-        id: Id,
-        recipe_digest: [u8; 32],
-        golden: DiskClaim,
-        verification: DiskClaim,
-    }
-
-    impl BuildSpec {
-        fn peak(&self) -> Result<u64, Failure> {
-            if self.golden.images == 0 || self.golden.staging != 0 || self.verification.images == 0
-            {
-                return Err(Failure::Refused(Refusal::Invalid));
-            }
-            self.golden
-                .total()
-                .and_then(|golden| golden.checked_add(self.verification.total()?))
-                .filter(|peak| i64::try_from(*peak).is_ok())
-                .ok_or(Failure::Refused(Refusal::Disk))
-        }
-    }
-
-    // Share this gate among all slots served by one lifecycle. Once writes
-    // begin, keep the build charged on every incomplete outcome, including
-    // unwinding. 4c must preserve and reconcile that charge after restart.
-    #[derive(Default)]
-    struct Writer(Mutex<Option<(Id, u64)>>);
-
-    impl Writer {
-        fn acquire(&self) -> Result<MutexGuard<'_, Option<(Id, u64)>>, Failure> {
-            match self.0.try_lock() {
-                Ok(guard) if guard.is_none() => Ok(guard),
-                Ok(_) | Err(TryLockError::WouldBlock) => Err(Failure::Refused(Refusal::Busy)),
-                Err(TryLockError::Poisoned(_)) => Err(Failure::Refused(Refusal::Busy)),
-            }
-        }
-    }
-
     struct Lifecycle<'a, C> {
         controller: &'a VmController<C>,
-        writer: &'a Writer,
-        policy: VmPolicy,
         host: HostObservation,
         resources: Resources,
     }
 
     #[derive(Debug)]
+    enum BuildResult {
+        Created(Box<Golden>, OperationRef),
+        Existing(OperationRef),
+    }
+
+    #[derive(Debug)]
     enum CloneResult {
-        Created(Linked),
-        Existing(Receipt),
+        Created(Box<Linked>, OperationRef),
+        Existing(OperationRef),
     }
 
     impl<C: Clock> Lifecycle<'_, C> {
         fn build(
             &self,
             installer: Installer<'_>,
-            spec: &BuildSpec,
-            prepare: impl FnOnce() -> Result<Seed, RecipeError>,
-        ) -> Result<Golden, Failure> {
+            spec: BuildRequest<'_>,
+            prepare: impl FnOnce(Id) -> Result<Seed, RecipeError>,
+        ) -> Result<BuildResult, Failure> {
             let runtime = installer.admit()?;
-            let mut charge = self.writer.acquire()?;
-            let peak = spec.peak()?;
-            let capacity = self
-                .policy
-                .host(self.host, self.resources)
-                .map_err(Failure::Refused)?;
-            // The controller does not yet expose a ledger-inclusive build
-            // admission. This is the local peak check against observed bytes.
-            self.policy
-                .disk(capacity, 0, peak)
-                .map_err(Failure::Refused)?;
-            *charge = Some((spec.id, peak));
-            let seed = prepare().map_err(Failure::Seed).and_then(|seed| {
-                if seed.0.len() as u64 > spec.verification.staging {
+            let (slots, worker, mut operation) = match self
+                .controller
+                .admit_build(spec, self.host, self.resources, |_, pair| {
+                    runtime
+                        .capture_golden(pair, spec.retained.images)
+                        .ok()
+                        .map(Pair::evidence)
+                })
+                .map_err(Failure::Store)?
+                .map_err(Failure::Refused)?
+            {
+                BuildAdmission::Fresh(slots, worker, operation) => (*slots, worker, operation),
+                BuildAdmission::Existing(operation) => return Ok(BuildResult::Existing(operation)),
+            };
+            let seed = prepare(slots.id).map_err(Failure::Seed).and_then(|seed| {
+                if seed.0.len() as u64 > spec.transient.staging {
                     return Err(Failure::Refused(Refusal::Disk));
                 }
                 Ok(seed)
             });
             if seed.is_err() {
-                *charge = None;
+                self.controller
+                    .fail_build(&worker, slots, true)
+                    .map_err(Failure::Store)?;
             }
             let seed = seed?;
-            if runtime.stage(spec, &seed.0)? != seed.pin() {
-                return Err(Failure::Media);
-            }
-            let (installed, stop) = runtime.install(spec.id, INSTALL_TIMEOUT)?;
-            clean(stop)?;
+            let evidence = |entries: &[_]| {
+                self.controller
+                    .build_evidence(&worker, slots.id, entries)
+                    .map_err(Failure::Store)
+            };
+            let built = (|| {
+                let staged = runtime.stage(slots, &spec, &seed.0)?;
+                if staged.pin != seed.pin() {
+                    return Err(Failure::Media);
+                }
+                evidence(&[
+                    (slots.seed, None),
+                    (slots.seed, Some(staged)),
+                    (slots.pair.disk, None),
+                    (slots.pair.vars, None),
+                ])?;
+                let (installed, stop) = runtime.install(slots, INSTALL_TIMEOUT)?;
+                clean(stop)?;
 
-            let files = runtime.capture_golden(spec.id, spec.golden.images)?;
-            if !files.fits(spec.golden.images) {
-                return Err(Failure::Media);
+                let files = runtime.capture_golden(slots.pair, spec.retained.images)?;
+                if !files.fits(spec.retained.images) {
+                    return Err(Failure::Media);
+                }
+                evidence(&[
+                    (slots.pair.disk, Some(files.disk)),
+                    (slots.pair.vars, Some(files.vars)),
+                ])?;
+                let golden = Golden {
+                    id: slots.id,
+                    slots: slots.pair,
+                    files,
+                };
+                let slot = LinkedSlot::Verification(slots.verification);
+                let linked = runtime.link(&golden, slot, spec.transient.images)?;
+                if !linked.matches(&golden, slot, spec.transient.images) {
+                    return Err(Failure::Media);
+                }
+                evidence(&[
+                    (slots.verification.disk, None),
+                    (slots.verification.vars, None),
+                    (slots.verification.disk, Some(linked.files.disk)),
+                    (slots.verification.vars, Some(linked.files.vars)),
+                ])?;
+                verify_detached(runtime, &linked, installed)?;
+                runtime.discard_transients(slots)?;
+                unchanged(runtime, &golden, spec.retained.images)?;
+                Ok(golden)
+            })();
+            if built.is_err() {
+                self.controller
+                    .fail_build(&worker, slots, false)
+                    .map_err(Failure::Store)?;
             }
-            let golden = Golden { id: spec.id, files };
-            let slot = LinkedSlot::Verification(spec.id);
-            let linked = runtime.link(&golden, slot, spec.verification.images)?;
-            if !linked.matches(&golden, slot, spec.verification.images) {
-                return Err(Failure::Media);
+            let golden = built?;
+            let status = self
+                .controller
+                .finish_build(&worker, slots, spec, golden.files.evidence())
+                .map_err(Failure::Store)?;
+            if status != Status::Succeeded {
+                return Err(Failure::Interrupted);
             }
-            verify_detached(runtime, &linked, installed)?;
-            runtime.discard_transients(spec.id)?;
-            unchanged(runtime, &golden, spec.golden.images)?;
-            self.controller
-                .seal_template(
-                    SealedTemplate {
-                        id: golden.id,
-                        guest: Guest::UbuntuX86_64,
-                        recipe_digest: spec.recipe_digest,
-                        disk_digest: files.disk.bytes.sha256,
-                        vars_digest: files.vars.bytes.sha256,
-                        disk: spec.golden,
-                    },
-                    self.host,
-                    self.resources,
-                )
-                .map_err(Failure::Store)?
-                .map_err(Failure::Refused)?;
-            *charge = None;
-            Ok(golden)
+            operation.receipt.status = status;
+            Ok(BuildResult::Created(Box::new(golden), operation))
         }
 
         fn linked_clone(
@@ -320,24 +320,27 @@ mod lifecycle {
             golden: &Golden,
             request: Request<'_>,
         ) -> Result<CloneResult, Failure> {
-            if !matches!(request.operation, Operation::Clone { template, .. } if template == golden.id)
-            {
-                return Err(Failure::Refused(Refusal::Invalid));
-            }
-            let _writer = self.writer.acquire()?;
-            let slot = LinkedSlot::Clone(request.vm);
             let images = request.disk.images;
-            let pending = match self
+            let (vm, slots, pending, mut operation) = match self
                 .controller
-                .admit(request, self.host, self.resources)
+                .admit_linked_clone(
+                    request,
+                    self.host,
+                    self.resources,
+                    golden.slots,
+                    golden.files.evidence(),
+                )
                 .map_err(Failure::Store)?
+                .map_err(Failure::Refused)?
             {
-                Admission::Admitted(pending) => pending,
-                Admission::Existing(receipt) => return Ok(CloneResult::Existing(receipt)),
-                Admission::Refused(reason) => return Err(Failure::Refused(reason)),
+                CloneAdmission::Fresh(vm, slots, pending, operation) => {
+                    (vm, slots, pending, operation)
+                }
+                CloneAdmission::Existing(receipt) => return Ok(CloneResult::Existing(receipt)),
             };
+            let slot = LinkedSlot::Clone(vm, slots);
             let linked = (|| {
-                let golden_bytes = golden.files.disk.bytes.size + golden.files.vars.bytes.size;
+                let golden_bytes = golden.files.disk.pin.size + golden.files.vars.pin.size;
                 unchanged(runtime, golden, golden_bytes)?;
                 let pair = runtime.link(golden, slot, images)?;
                 if !pair.matches(golden, slot, images) {
@@ -346,20 +349,20 @@ mod lifecycle {
                 unchanged(runtime, golden, golden_bytes)?;
                 Ok(pair)
             })();
-            let completion = if linked.is_ok() {
-                Completion::Succeeded
-            } else {
-                Completion::CleanupUnconfirmed
-            };
             let status = self
                 .controller
-                .finish(&pending, completion)
+                .finish_linked_clone(
+                    &pending,
+                    slots,
+                    linked.as_ref().ok().map(|pair| pair.files.evidence()),
+                )
                 .map_err(Failure::Store)?;
             let pair = linked?;
             if status != Status::Succeeded {
-                return Err(Failure::CloneInterrupted);
+                return Err(Failure::Interrupted);
             }
-            Ok(CloneResult::Created(pair))
+            operation.receipt.status = status;
+            Ok(CloneResult::Created(Box::new(pair), operation))
         }
     }
 
@@ -375,7 +378,7 @@ mod lifecycle {
         golden: &Golden,
         images: u64,
     ) -> Result<(), Failure> {
-        if runtime.capture_golden(golden.id, images)? != golden.files {
+        if runtime.capture_golden(golden.slots, images)? != golden.files {
             return Err(Failure::ChangedPair);
         }
         Ok(())
@@ -411,7 +414,11 @@ mod lifecycle {
         use super::*;
         use crate::{
             service::application::tests::private_temp,
-            vm::{Capacity, ClockReading, RequestId},
+            vm::{
+                Admission, ArtifactSlot, Capacity, ClockReading, Completion, DEFAULT_LEASE_SECONDS,
+                DiskClaim, Operation, RETRY_WINDOW_MS, Receipt, RequestId, ScriptResult, VmPolicy,
+                paths::FileIdentity,
+            },
         };
         use rusqlite::Connection;
         use std::{
@@ -421,8 +428,6 @@ mod lifecycle {
             time::Instant,
         };
 
-        const BUILD: Id = [1; 16];
-        const INSTANCE: Id = [2; 16];
         const INSTALL: Boot = Boot([3; 16]);
         const DETACHED: Boot = Boot([4; 16]);
         const MIB: u64 = 1024 * 1024;
@@ -443,7 +448,6 @@ mod lifecycle {
         struct Fixture {
             controller: VmController<TestClock>,
             root: tempfile::TempDir,
-            writer: Writer,
         }
 
         impl Fixture {
@@ -452,18 +456,12 @@ mod lifecycle {
                 let controller =
                     VmController::open(root.path(), VmPolicy::default(), TestClock(Instant::now()))
                         .unwrap();
-                Self {
-                    controller,
-                    root,
-                    writer: Writer::default(),
-                }
+                Self { controller, root }
             }
 
             fn lifecycle(&self) -> Lifecycle<'_, TestClock> {
                 Lifecycle {
                     controller: &self.controller,
-                    writer: &self.writer,
-                    policy: VmPolicy::default(),
                     host: HostObservation {
                         owner_idle: Some(true),
                         logical_cpus: Some(8),
@@ -488,6 +486,8 @@ mod lifecycle {
                     live: None,
                     fault: None,
                     contend: None,
+                    build_slots: None,
+                    clone_slots: None,
                 }
             }
         }
@@ -506,6 +506,7 @@ mod lifecycle {
             WrongBacking,
             SharedVars,
             CrashAfterCloneWrite,
+            RecipeBinding,
         }
 
         struct Recording<'a> {
@@ -514,6 +515,8 @@ mod lifecycle {
             live: Option<Boot>,
             fault: Option<Fault>,
             contend: Option<&'a Fixture>,
+            build_slots: Option<BuildSlots>,
+            clone_slots: Option<PairSlots>,
         }
 
         fn db(root: &Path) -> Connection {
@@ -531,14 +534,15 @@ mod lifecycle {
                 .unwrap();
         }
 
-        fn file(path: &Path, id: u8) -> PinnedFile {
+        fn file(path: &Path, id: u8) -> ArtifactEvidence {
             let bytes = fs::read(path).unwrap();
-            PinnedFile {
+            ArtifactEvidence {
                 identity: FileIdentity {
                     volume: 1,
                     file: [id; 16],
                 },
-                bytes: ArtifactPin {
+                directory: [9; 16],
+                pin: ArtifactPin {
                     size: bytes.len() as u64,
                     sha256: Sha256::digest(bytes).into(),
                 },
@@ -546,19 +550,51 @@ mod lifecycle {
         }
 
         impl Recording<'_> {
+            fn slot_path(&self, slot: ArtifactSlot) -> PathBuf {
+                self.root
+                    .join(format!("{}-{}", slot.role, hex::encode(slot.key)))
+            }
+
             fn path(&self, name: &str) -> PathBuf {
-                self.root.join(name)
+                let build = || self.build_slots.unwrap();
+                let clone = || self.clone_slots.unwrap();
+                let slot = match name {
+                    "seed.iso" => build().seed,
+                    "golden.disk" => build().pair.disk,
+                    "golden.vars" => build().pair.vars,
+                    "verify.disk" => build().verification.disk,
+                    "verify.vars" => build().verification.vars,
+                    "clone.disk" => clone().disk,
+                    "clone.vars" => clone().vars,
+                    _ => panic!("unexpected fixture role"),
+                };
+                self.slot_path(slot)
             }
 
             fn build(&mut self, f: &Fixture) -> Result<Golden, Failure> {
-                f.lifecycle().build(Installer::Fixture(self), &spec(), seed)
+                match f
+                    .lifecycle()
+                    .build(Installer::Fixture(self), spec(), seed)?
+                {
+                    BuildResult::Created(golden, _) => Ok(*golden),
+                    BuildResult::Existing(_) => panic!("expected a fresh build"),
+                }
             }
         }
 
         impl TemplateRuntime for Recording<'_> {
-            fn stage(&mut self, spec: &BuildSpec, seed: &[u8]) -> Result<ArtifactPin, Failure> {
+            fn stage(
+                &mut self,
+                slots: BuildSlots,
+                _spec: &BuildRequest<'_>,
+                seed: &[u8],
+            ) -> Result<ArtifactEvidence, Failure> {
                 self.calls.push("stage");
-                assert_eq!(spec.id, BUILD);
+                assert_eq!(
+                    scalar(self.root, "SELECT staging_bytes FROM vm_build_intents"),
+                    5 * MIB as i64
+                );
+                self.build_slots = Some(slots);
                 assert_eq!(&seed[16 * 2048 + 40..16 * 2048 + 46], b"CIDATA");
                 create(&self.path("seed.iso"), seed);
                 if self.fault == Some(Fault::PartialStage) {
@@ -569,15 +605,15 @@ mod lifecycle {
                 if self.fault == Some(Fault::SeedMismatch) {
                     fs::write(self.path("seed.iso"), b"truncated seed").unwrap();
                 }
-                Ok(file(&self.path("seed.iso"), 7).bytes)
+                Ok(file(&self.path("seed.iso"), 7))
             }
 
             fn install(
                 &mut self,
-                id: Id,
+                slots: BuildSlots,
                 timeout: Duration,
             ) -> Result<(Boot, StopDisposition), Failure> {
-                assert_eq!(id, BUILD);
+                assert_eq!(Some(slots), self.build_slots);
                 assert_eq!(timeout.as_secs(), 3600);
                 self.calls.push("installer boot");
                 assert!(self.path("seed.iso").exists());
@@ -585,12 +621,12 @@ mod lifecycle {
                 if let Some(f) = self.contend {
                     let mut second_slot = f.runtime();
                     let mut second_spec = spec();
-                    second_spec.id = INSTANCE;
+                    second_spec.key = key(3);
                     assert!(matches!(
                         f.lifecycle().build(
                             Installer::Fixture(&mut second_slot),
-                            &second_spec,
-                            || panic!("second writer prepared a seed")
+                            second_spec,
+                            |_| panic!("second writer prepared a seed")
                         ),
                         Err(Failure::Refused(Refusal::Busy))
                     ));
@@ -608,16 +644,15 @@ mod lifecycle {
                 Ok((INSTALL, stop))
             }
 
-            fn capture_golden(&mut self, id: Id, images: u64) -> Result<Pair, Failure> {
-                assert_eq!(id, BUILD);
+            fn capture_golden(&mut self, slots: PairSlots, images: u64) -> Result<Pair, Failure> {
                 assert!(self.live.is_none());
                 self.calls.push("capture golden");
                 if self.fault == Some(Fault::Capture) {
                     return Err(Failure::Media);
                 }
                 let pair = Pair {
-                    disk: file(&self.path("golden.disk"), 1),
-                    vars: file(&self.path("golden.vars"), 2),
+                    disk: file(&self.slot_path(slots.disk), 1),
+                    vars: file(&self.slot_path(slots.vars), 2),
                 };
                 assert!(pair.fits(images));
                 Ok(pair)
@@ -629,23 +664,22 @@ mod lifecycle {
                 slot: LinkedSlot,
                 _images: u64,
             ) -> Result<Linked, Failure> {
-                assert_eq!(golden.id, BUILD);
                 assert!(self.live.is_none());
-                let (name, disk_id, vars_id) = match slot {
-                    LinkedSlot::Verification(BUILD) => ("verify", 3, 4),
-                    LinkedSlot::Clone(INSTANCE) => {
+                let (slots, disk_id, vars_id) = match slot {
+                    LinkedSlot::Verification(slots) => (slots, 3, 4),
+                    LinkedSlot::Clone(_, slots) => {
                         assert_eq!(scalar(self.root, "SELECT count(*) FROM vm_disk_claims"), 1);
-                        ("clone", 5, 6)
+                        self.clone_slots = Some(slots);
+                        (slots, 5, 6)
                     }
-                    _ => panic!("unexpected fixture generation"),
                 };
                 self.calls.push("link");
-                let disk = self.path(&format!("{name}.disk"));
-                let vars = self.path(&format!("{name}.vars"));
-                let backing_path = self.path("golden.disk");
+                let disk = self.slot_path(slots.disk);
+                let vars = self.slot_path(slots.vars);
+                let backing_path = self.slot_path(golden.slots.disk);
                 // This miniature overlay records the explicit backing name.
                 create(&disk, backing_path.to_str().unwrap().as_bytes());
-                create(&vars, &fs::read(self.path("golden.vars")).unwrap());
+                create(&vars, &fs::read(self.slot_path(golden.slots.vars)).unwrap());
                 assert_ne!(
                     self.fault,
                     Some(Fault::CrashAfterCloneWrite),
@@ -669,7 +703,10 @@ mod lifecycle {
             }
 
             fn boot_detached(&mut self, pair: &Linked) -> Result<Boot, Failure> {
-                assert_eq!(pair.slot, LinkedSlot::Verification(BUILD));
+                assert_eq!(
+                    pair.slot,
+                    LinkedSlot::Verification(self.build_slots.unwrap().verification)
+                );
                 self.calls.push("detached boot");
                 let boot = if self.fault == Some(Fault::ReuseChild) {
                     INSTALL
@@ -727,28 +764,42 @@ mod lifecycle {
                 stop
             }
 
-            fn discard_transients(&mut self, id: Id) -> Result<(), Failure> {
-                assert_eq!(id, BUILD);
+            fn discard_transients(&mut self, slots: BuildSlots) -> Result<(), Failure> {
+                assert_eq!(Some(slots), self.build_slots);
                 assert!(self.live.is_none());
                 assert_eq!(self.calls.last(), Some(&"graceful stop"));
                 self.calls.push("discard transients");
                 for name in ["seed.iso", "verify.disk", "verify.vars"] {
                     fs::remove_file(self.path(name)).unwrap();
                 }
+                if self.fault == Some(Fault::RecipeBinding) {
+                    db(self.root)
+                        .execute(
+                            "UPDATE vm_operations SET recipe_digest=?1 WHERE action=11",
+                            [[7_u8; 32]],
+                        )
+                        .unwrap();
+                }
                 Ok(())
             }
         }
 
-        fn spec() -> BuildSpec {
-            BuildSpec {
-                id: BUILD,
-                recipe_digest: [9; 32],
-                golden: DiskClaim {
+        fn key(nonce: u64) -> RequestId {
+            RequestId::parse(&format!("{NOW:016x}{nonce:016x}")).unwrap()
+        }
+
+        fn spec() -> BuildRequest<'static> {
+            BuildRequest {
+                principal: "fixture",
+                key: key(2),
+                recipe: "e03a3012c18d20b8691490b580ab41e9",
+                digest: [9; 32],
+                retained: DiskClaim {
                     images: MIB,
                     metadata: MIB,
                     staging: 0,
                 },
-                verification: DiskClaim {
+                transient: DiskClaim {
                     images: MIB,
                     metadata: MIB,
                     staging: MIB,
@@ -756,7 +807,7 @@ mod lifecycle {
             }
         }
 
-        fn seed() -> Result<Seed, RecipeError> {
+        fn seed(id: Id) -> Result<Seed, RecipeError> {
             use super::super::AssetPin;
             fn pin(bytes: &[u8]) -> AssetPin {
                 AssetPin {
@@ -774,16 +825,16 @@ mod lifecycle {
             };
             // The fixture uses the same CIDATA encoder without asserting
             // qualification of an owner ISO that the test does not have.
-            recipe.render_seed(BUILD, guest).map(Seed)
+            recipe.render_seed(id, guest).map(Seed)
         }
 
-        fn clone_request() -> Request<'static> {
+        fn clone_request(golden: &Golden) -> Request<'static> {
             Request {
                 principal: "fixture",
-                request_id: RequestId::parse(&format!("{NOW:016x}{:016x}", 1_u64)).unwrap(),
-                vm: INSTANCE,
+                request_id: key(1),
+                vm: [0; 16],
                 operation: Operation::Clone {
-                    template: BUILD,
+                    template: golden.id,
                     lease_seconds: None,
                 },
                 disk: DiskClaim {
@@ -823,16 +874,16 @@ mod lifecycle {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
-            assert_eq!(hashes.0, golden.files.disk.bytes.sha256);
-            assert_eq!(hashes.1, golden.files.vars.bytes.sha256);
-            assert!(f.writer.0.lock().unwrap().is_none());
+            assert_eq!(hashes.0, golden.files.disk.pin.sha256);
+            assert_eq!(hashes.1, golden.files.vars.pin.sha256);
+            assert_eq!(staging(&f), 0);
             assert!(!rt.path("seed.iso").exists());
             assert!(!rt.path("verify.disk").exists());
             assert!(!rt.path("verify.vars").exists());
 
-            let CloneResult::Created(clone) = f
+            let CloneResult::Created(clone, _) = f
                 .lifecycle()
-                .linked_clone(&mut rt, &golden, clone_request())
+                .linked_clone(&mut rt, &golden, clone_request(&golden))
                 .unwrap()
             else {
                 panic!("fresh clone was not created")
@@ -849,13 +900,16 @@ mod lifecycle {
             );
             fs::write(rt.path("clone.disk"), b"clone disk writes").unwrap();
             fs::write(rt.path("clone.vars"), b"clone firmware writes").unwrap();
-            assert_eq!(rt.capture_golden(BUILD, MIB).unwrap(), golden.files);
+            assert_eq!(rt.capture_golden(golden.slots, MIB).unwrap(), golden.files);
             let calls = rt.calls.len();
             assert!(matches!(
                 f.lifecycle()
-                    .linked_clone(&mut rt, &golden, clone_request()),
-                Ok(CloneResult::Existing(Receipt {
-                    status: Status::Succeeded,
+                    .linked_clone(&mut rt, &golden, clone_request(&golden)),
+                Ok(CloneResult::Existing(OperationRef {
+                    receipt: Receipt {
+                        status: Status::Succeeded,
+                        ..
+                    },
                     ..
                 }))
             ));
@@ -868,15 +922,16 @@ mod lifecycle {
             let candidate = CandidateRuntime::new(None);
             let lifecycle = f.lifecycle();
             let before = fs::read_dir(f.root.path()).unwrap().count();
-            // Holding the writer also proves the refusal precedes reservation.
-            let writer = f.writer.acquire().unwrap();
             assert!(matches!(
-                lifecycle.build(Installer::Candidate(&candidate), &spec(), || panic!(
+                lifecycle.build(Installer::Candidate(&candidate), spec(), |_| panic!(
                     "prepared"
                 )),
                 Err(Failure::Native(NativeRefusal::InstallerPhaseUnavailable))
             ));
-            assert!(writer.is_none());
+            assert_eq!(
+                scalar(f.root.path(), "SELECT count(*) FROM vm_build_intents"),
+                0
+            );
             assert_eq!(fs::read_dir(f.root.path()).unwrap().count(), before);
             assert_eq!(scalar(f.root.path(), "SELECT count(*) FROM activity"), 0);
         }
@@ -888,21 +943,27 @@ mod lifecycle {
             let mut lifecycle = f.lifecycle();
             lifecycle.host.capacity.as_mut().unwrap().free_bytes = 50 * GIB + 13 * MIB;
             assert!(matches!(
-                lifecycle.build(Installer::Fixture(&mut rt), &spec(), || panic!("prepared")),
+                lifecycle.build(Installer::Fixture(&mut rt), spec(), |_| panic!("prepared")),
                 Err(Failure::Refused(Refusal::Disk))
             ));
             assert!(matches!(
-                f.lifecycle()
-                    .build(Installer::Fixture(&mut rt), &spec(), || Seed::prepare(
+                f.lifecycle().build(
+                    Installer::Fixture(&mut rt),
+                    BuildRequest {
+                        key: key(4),
+                        ..spec()
+                    },
+                    |id| Seed::prepare(
                         &UbuntuRecipe::default(),
                         UbuntuAssets::default(),
-                        BUILD,
+                        id,
                         b"guest"
-                    )),
+                    )
+                ),
                 Err(Failure::Seed(RecipeError::Unqualified))
             ));
             assert!(rt.calls.is_empty());
-            assert!(f.writer.0.lock().unwrap().is_none());
+            assert_eq!(staging(&f), 0);
             rt.build(&f).unwrap();
         }
 
@@ -957,10 +1018,7 @@ mod lifecycle {
                     scalar(f.root.path(), "SELECT count(*) FROM vm_templates"),
                     0
                 );
-                assert_eq!(
-                    *f.writer.0.lock().unwrap(),
-                    Some((BUILD, spec().peak().unwrap()))
-                );
+                assert_eq!(staging(&f), 5 * MIB as i64);
             }
         }
 
@@ -979,7 +1037,7 @@ mod lifecycle {
                     // Fail after the template insert, when recording the seal activity.
                     db(f.root.path())
                         .execute_batch(
-                            "CREATE TRIGGER abort_seal BEFORE INSERT ON activity
+                            "CREATE TRIGGER abort_seal BEFORE UPDATE ON activity WHEN NEW.action=11
                         BEGIN SELECT RAISE(ABORT, 'fixture seal rollback'); END;",
                         )
                         .unwrap();
@@ -1002,11 +1060,18 @@ mod lifecycle {
                     scalar(f.root.path(), "SELECT count(*) FROM vm_templates"),
                     0
                 );
-                assert_eq!(
-                    *f.writer.0.lock().unwrap(),
-                    Some((BUILD, spec().peak().unwrap()))
-                );
-                assert!(matches!(rt.build(&f), Err(Failure::Refused(Refusal::Busy))));
+                assert_eq!(staging(&f), 5 * MIB as i64);
+                assert!(matches!(
+                    f.lifecycle().build(
+                        Installer::Fixture(&mut rt),
+                        BuildRequest {
+                            key: key(3),
+                            ..spec()
+                        },
+                        seed
+                    ),
+                    Err(Failure::Refused(Refusal::Busy))
+                ));
             }
         }
 
@@ -1018,7 +1083,7 @@ mod lifecycle {
             rt.fault = Some(Fault::WrongBacking);
             assert!(matches!(
                 f.lifecycle()
-                    .linked_clone(&mut rt, &golden, clone_request()),
+                    .linked_clone(&mut rt, &golden, clone_request(&golden)),
                 Err(Failure::Media)
             ));
             assert_eq!(
@@ -1029,12 +1094,23 @@ mod lifecycle {
                 (2 * MIB) as i64
             );
             assert_eq!(scalar(f.root.path(), "SELECT state FROM vm_instances"), 4);
+            assert_eq!(
+                scalar(
+                    f.root.path(),
+                    "SELECT count(*) FROM vm_instances WHERE cleanup_route='staging'"
+                ),
+                1
+            );
+            assert!(f.controller.claim_expired().unwrap().is_empty());
             let calls = rt.calls.len();
             assert!(matches!(
                 f.lifecycle()
-                    .linked_clone(&mut rt, &golden, clone_request()),
-                Ok(CloneResult::Existing(Receipt {
-                    status: Status::Interrupted,
+                    .linked_clone(&mut rt, &golden, clone_request(&golden)),
+                Ok(CloneResult::Existing(OperationRef {
+                    receipt: Receipt {
+                        status: Status::Interrupted,
+                        ..
+                    },
                     ..
                 }))
             ));
@@ -1049,7 +1125,7 @@ mod lifecycle {
             rt.fault = Some(Fault::CrashAfterCloneWrite);
             let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 f.lifecycle()
-                    .linked_clone(&mut rt, &golden, clone_request())
+                    .linked_clone(&mut rt, &golden, clone_request(&golden))
             }));
             assert!(interrupted.is_err());
             assert!(rt.path("clone.disk").exists());
@@ -1066,7 +1142,6 @@ mod lifecycle {
                 )
                 .unwrap(),
                 root,
-                writer: Writer::default(),
             };
             assert_eq!(
                 scalar(
@@ -1083,13 +1158,483 @@ mod lifecycle {
             assert!(matches!(
                 reopened
                     .lifecycle()
-                    .linked_clone(&mut fresh, &golden, clone_request()),
-                Ok(CloneResult::Existing(Receipt {
-                    status: Status::Interrupted,
+                    .linked_clone(&mut fresh, &golden, clone_request(&golden)),
+                Ok(CloneResult::Existing(OperationRef {
+                    receipt: Receipt {
+                        status: Status::Interrupted,
+                        ..
+                    },
                     ..
                 }))
             ));
             assert!(fresh.calls.is_empty());
+        }
+
+        fn reserve(f: &Fixture, spec: BuildRequest<'_>) -> Result<BuildAdmission, Refusal> {
+            let lifecycle = f.lifecycle();
+            f.controller
+                .admit_build(spec, lifecycle.host, lifecycle.resources, |_, _| {
+                    panic!("pending build must never read media")
+                })
+                .unwrap()
+        }
+
+        #[test]
+        fn build_publication_refuses_an_operation_recipe_mismatch() {
+            let f = Fixture::new();
+            let mut rt = f.runtime();
+            rt.fault = Some(Fault::RecipeBinding);
+            assert!(matches!(rt.build(&f), Err(Failure::Store(error))
+                if error.to_string().contains("invalid build publication binding")));
+            assert_eq!(staging(&f), 5 * MIB as i64);
+            assert_eq!(
+                scalar(f.root.path(), "SELECT count(*) FROM vm_templates"),
+                0
+            );
+            assert_eq!(
+                scalar(
+                    f.root.path(),
+                    "SELECT count(*) FROM vm_generations WHERE active=1"
+                ),
+                0
+            );
+        }
+
+        #[test]
+        fn durable_build_caps_count_retained_and_reserved_charges() {
+            let f = Fixture::new();
+            let mut lifecycle = f.lifecycle();
+            for index in 1..=4 {
+                f.controller
+                    .seal_template(
+                        crate::vm::SealedTemplate {
+                            id: [index; 16],
+                            guest: crate::vm::Guest::UbuntuX86_64,
+                            recipe_digest: [index; 32],
+                            disk_digest: [1; 32],
+                            vars_digest: [2; 32],
+                            disk: DiskClaim {
+                                images: 10 * MIB,
+                                ..DiskClaim::default()
+                            },
+                        },
+                        lifecycle.host,
+                        lifecycle.resources,
+                    )
+                    .unwrap()
+                    .unwrap();
+                if index == 1 {
+                    let free = &mut lifecycle.host.capacity.as_mut().unwrap().free_bytes;
+                    let previous = *free;
+                    *free = 50 * GIB + 20 * MIB;
+                    let mut rt = f.runtime();
+                    assert!(matches!(
+                        lifecycle.build(Installer::Fixture(&mut rt), spec(), |_| panic!(
+                            "overbilled build"
+                        )),
+                        Err(Failure::Refused(Refusal::Disk))
+                    ));
+                    lifecycle.host.capacity.as_mut().unwrap().free_bytes = previous;
+                }
+            }
+            assert_eq!(reserve(&f, spec()).unwrap_err(), Refusal::TemplateLimit);
+            assert_eq!(staging(&f), 0);
+        }
+
+        #[test]
+        fn concurrent_build_replay_keeps_one_writer_and_one_stable_receipt() {
+            let f = Fixture::new();
+            let (first, second) = std::thread::scope(|scope| {
+                let one = scope.spawn(|| reserve(&f, spec()).unwrap());
+                let two = scope.spawn(|| reserve(&f, spec()).unwrap());
+                (one.join().unwrap(), two.join().unwrap())
+            });
+            let ((slots, worker), fresh, replay) = match (first, second) {
+                (BuildAdmission::Fresh(s, w, op), BuildAdmission::Existing(replay))
+                | (BuildAdmission::Existing(replay), BuildAdmission::Fresh(s, w, op)) => {
+                    ((*s, w), op, replay)
+                }
+                _ => panic!("expected one durable writer"),
+            };
+            assert_eq!(fresh, replay);
+            assert_eq!(staging(&f), 5 * MIB as i64);
+            assert_eq!(
+                reserve(
+                    &f,
+                    BuildRequest {
+                        key: key(9),
+                        ..spec()
+                    }
+                )
+                .unwrap_err(),
+                Refusal::Busy
+            );
+            assert_eq!(
+                reserve(
+                    &f,
+                    BuildRequest {
+                        digest: [8; 32],
+                        ..spec()
+                    }
+                )
+                .unwrap_err(),
+                Refusal::KeyCollision
+            );
+            // The worker proves it never invoked stage, so it may release even
+            // though an observer cannot make that determination after restart.
+            f.controller.fail_build(&worker, slots, true).unwrap();
+            assert_eq!(staging(&f), 0);
+            let BuildAdmission::Existing(settled) = reserve(&f, spec()).unwrap() else {
+                panic!("terminal receipt must replay")
+            };
+            assert_eq!(settled.id, fresh.id);
+            assert_eq!(settled.receipt.status, Status::Failed);
+        }
+
+        #[test]
+        fn committed_build_and_clone_replay_and_project_only_to_the_caller() {
+            let f = Fixture::new();
+            let mut rt = f.runtime();
+            let BuildResult::Created(golden, build) = f
+                .lifecycle()
+                .build(Installer::Fixture(&mut rt), spec(), seed)
+                .unwrap()
+            else {
+                panic!("expected build")
+            };
+            let calls = rt.calls.len();
+            let mut replay_runtime = f.runtime();
+            std::thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    f.lifecycle()
+                        .build(Installer::Fixture(&mut rt), spec(), |_| {
+                            panic!("duplicate prepared seed")
+                        })
+                });
+                let second = scope.spawn(|| {
+                    f.lifecycle()
+                        .build(Installer::Fixture(&mut replay_runtime), spec(), |_| {
+                            panic!("duplicate prepared seed")
+                        })
+                });
+                for result in [first.join().unwrap(), second.join().unwrap()] {
+                    assert!(
+                        matches!(result, Ok(BuildResult::Existing(operation)) if operation == build)
+                    );
+                }
+            });
+            assert_eq!(rt.calls.len(), calls);
+            assert!(replay_runtime.calls.is_empty());
+            let BuildResult::Existing(reuse) = f
+                .lifecycle()
+                .build(
+                    Installer::Fixture(&mut rt),
+                    BuildRequest {
+                        principal: "other",
+                        ..spec()
+                    },
+                    |_| panic!("sealed recipe rebuilt"),
+                )
+                .unwrap()
+            else {
+                panic!("expected sealed reuse")
+            };
+            assert_ne!(reuse.id, build.id);
+            assert_eq!(rt.calls.last(), Some(&"capture golden"));
+            let status = |principal, id| f.controller.operation_status(principal, id).unwrap();
+            assert_eq!(
+                status("fixture", build.id).unwrap().template,
+                Some(golden.id)
+            );
+            assert_eq!(status("other", reuse.id).unwrap().template, Some(golden.id));
+            assert_eq!(status("other", build.id), Err(Refusal::NotFound));
+            assert_eq!(status("fixture", [0; 16]), Err(Refusal::NotFound));
+
+            let CloneResult::Created(clone, operation) = f
+                .lifecycle()
+                .linked_clone(&mut rt, &golden, clone_request(&golden))
+                .unwrap()
+            else {
+                panic!("expected clone")
+            };
+            let LinkedSlot::Clone(vm, _) = clone.slot else {
+                panic!("expected clone slot")
+            };
+            assert_eq!(
+                scalar(
+                    f.root.path(),
+                    "SELECT count(*) FROM vm_artifacts WHERE state='active'"
+                ),
+                2
+            );
+            assert_eq!(status("fixture", operation.id).unwrap().vm, Some(vm));
+            let mut request = clone_request(&golden);
+            request.operation = Operation::Clone {
+                template: golden.id,
+                lease_seconds: Some(DEFAULT_LEASE_SECONDS),
+            };
+            assert!(
+                matches!(f.lifecycle().linked_clone(&mut rt, &golden, request), Ok(CloneResult::Existing(prior)) if prior == operation)
+            );
+            let mut request = clone_request(&golden);
+            request.operation = Operation::Clone {
+                template: golden.id,
+                lease_seconds: Some(60),
+            };
+            assert!(matches!(
+                f.lifecycle().linked_clone(&mut rt, &golden, request),
+                Err(Failure::Refused(Refusal::KeyCollision))
+            ));
+            assert_eq!(
+                f.controller.get_status("other", vm).unwrap(),
+                Err(Refusal::NotFound)
+            );
+            let listed = f
+                .controller
+                .list_status("fixture", None, 1)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                listed,
+                [f.controller.get_status("fixture", vm).unwrap().unwrap()]
+            );
+            assert_eq!(listed[0].state, "stopped");
+            assert!(!listed[0].ready);
+            assert!(
+                f.controller
+                    .list_status("fixture", Some(vm), 1)
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                f.controller
+                    .list_status("other", None, 1)
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+            db(f.root.path())
+                .execute(
+                    "DELETE FROM activity WHERE id=?1",
+                    [build.receipt.activity_id],
+                )
+                .unwrap();
+            assert_eq!(
+                status("fixture", build.id).unwrap().template,
+                Some(golden.id)
+            );
+            db(f.root.path())
+                .execute(
+                    "UPDATE vm_retry_clock SET high_water_ms=?1",
+                    [NOW + RETRY_WINDOW_MS + 1],
+                )
+                .unwrap();
+            assert_eq!(status("fixture", build.id), Err(Refusal::NotFound));
+            drop(rt);
+            drop(replay_runtime);
+            let Fixture { controller, root } = f;
+            drop(controller);
+            let reopened =
+                VmController::open(root.path(), VmPolicy::default(), TestClock(Instant::now()))
+                    .unwrap();
+            assert_eq!(
+                reopened.get_status("fixture", vm).unwrap().unwrap().state,
+                "stopped"
+            );
+            assert_eq!(scalar(root.path(), "SELECT count(*) FROM vm_templates"), 1);
+            assert_eq!(
+                scalar(
+                    root.path(),
+                    "SELECT count(*) FROM vm_generations WHERE active=1"
+                ),
+                2
+            );
+            assert_eq!(
+                scalar(root.path(), "SELECT staging_bytes FROM vm_build_intents"),
+                0
+            );
+        }
+
+        #[test]
+        fn reopen_distinguishes_unknown_partial_and_identified_builds() {
+            for point in 0..=3 {
+                let f = Fixture::new();
+                let BuildAdmission::Fresh(slots, worker, operation) = reserve(&f, spec()).unwrap()
+                else {
+                    panic!("expected build")
+                };
+                let slots = *slots;
+                let mut rt = f.runtime();
+                if point > 0 {
+                    let seed = seed(slots.id).unwrap();
+                    let staged = rt.stage(slots, &spec(), &seed.0).unwrap();
+                    if point > 1 {
+                        let files = rt.capture_golden(slots.pair, MIB).unwrap();
+                        let mut entries = vec![
+                            (slots.seed, None),
+                            (slots.seed, Some(staged)),
+                            (slots.pair.disk, None),
+                            (slots.pair.vars, None),
+                            (slots.pair.disk, Some(files.disk)),
+                        ];
+                        if point == 3 {
+                            let golden = Golden {
+                                id: slots.id,
+                                slots: slots.pair,
+                                files,
+                            };
+                            let verified = rt
+                                .link(&golden, LinkedSlot::Verification(slots.verification), MIB)
+                                .unwrap();
+                            entries.extend([
+                                (slots.pair.vars, Some(files.vars)),
+                                (slots.verification.disk, None),
+                                (slots.verification.vars, None),
+                                (slots.verification.disk, Some(verified.files.disk)),
+                                (slots.verification.vars, Some(verified.files.vars)),
+                            ]);
+                        }
+                        f.controller
+                            .build_evidence(&worker, slots.id, &entries)
+                            .unwrap();
+                    }
+                }
+                drop(rt);
+                let Fixture { controller, root } = f;
+                drop(controller);
+                for _ in 0..2 {
+                    let reopened = VmController::open(
+                        root.path(),
+                        VmPolicy::default(),
+                        TestClock(Instant::now()),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        reopened
+                            .operation_status("fixture", operation.id)
+                            .unwrap()
+                            .unwrap()
+                            .state,
+                        Status::Interrupted
+                    );
+                    assert_eq!(
+                        scalar(root.path(), "SELECT staging_bytes FROM vm_build_intents"),
+                        5 * MIB as i64
+                    );
+                    assert_eq!(scalar(root.path(), "SELECT count(*) FROM vm_templates"), 0);
+                    assert_eq!(
+                        scalar(
+                            root.path(),
+                            "SELECT count(*) FROM vm_generations WHERE active=1"
+                        ),
+                        0
+                    );
+                    assert_eq!(
+                        scalar(
+                            root.path(),
+                            "SELECT count(*) FROM vm_artifacts WHERE state='pending_disposal'"
+                        ),
+                        [0, 0, 2, 5][point]
+                    );
+                    let phase: String = db(root.path())
+                        .query_row("SELECT state FROM vm_build_intents", [], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(
+                        phase,
+                        if point == 3 {
+                            "pending_disposal"
+                        } else {
+                            "quarantined"
+                        }
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn script_ledger_keeps_only_closed_result_and_no_sensitive_bytes() {
+            let f = Fixture::new();
+            let mut rt = f.runtime();
+            let golden = rt.build(&f).unwrap();
+            let CloneResult::Created(clone, _) = f
+                .lifecycle()
+                .linked_clone(&mut rt, &golden, clone_request(&golden))
+                .unwrap()
+            else {
+                panic!("expected clone")
+            };
+            let LinkedSlot::Clone(vm, _) = clone.slot else {
+                panic!("expected clone slot")
+            };
+            let lifecycle = f.lifecycle();
+            let admit = |operation, nonce| {
+                let Admission::Admitted(worker) = f
+                    .controller
+                    .admit(
+                        Request {
+                            principal: "fixture",
+                            request_id: key(nonce),
+                            vm,
+                            operation,
+                            disk: DiskClaim::default(),
+                        },
+                        lifecycle.host,
+                        lifecycle.resources,
+                    )
+                    .unwrap()
+                else {
+                    panic!("expected worker")
+                };
+                worker
+            };
+            f.controller
+                .finish(&admit(Operation::Start, 6), Completion::Succeeded)
+                .unwrap();
+            let script = "script-sentinel token-sentinel P:/path-sentinel S-1-5-21-987654321";
+            let worker = admit(
+                Operation::Script {
+                    script,
+                    timeout_seconds: 30,
+                },
+                7,
+            );
+            assert_eq!(
+                f.controller
+                    .finish_script(&worker, ScriptResult::Exited(7))
+                    .unwrap(),
+                Status::Failed
+            );
+            let operation: Id = db(f.root.path())
+                .query_row(
+                    "SELECT operation_id FROM vm_operations WHERE action=2",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                f.controller
+                    .operation_status("fixture", operation)
+                    .unwrap()
+                    .unwrap()
+                    .script,
+                Some(ScriptResult::Exited(7))
+            );
+            let contents = fs::read(f.root.path().join("activity.sqlite3")).unwrap();
+            for sentinel in script.split_ascii_whitespace() {
+                assert!(
+                    !contents
+                        .windows(sentinel.len())
+                        .any(|window| window == sentinel.as_bytes())
+                );
+            }
+        }
+
+        fn staging(f: &Fixture) -> i64 {
+            scalar(
+                f.root.path(),
+                "SELECT coalesce(sum(staging_bytes),0) FROM vm_build_intents",
+            )
         }
     }
 }
