@@ -662,6 +662,10 @@ struct ScriptChild {
     pidfd_error: Option<io::Error>,
     exec_reader: PipeReader,
     status: Option<ExitStatus>,
+    // Tests sample this instant after the exec pipe is readable. Production
+    // always uses the clock. None keeps that path.
+    #[cfg(test)]
+    exec_now: Option<Instant>,
 }
 
 impl ScriptChild {
@@ -676,6 +680,8 @@ impl ScriptChild {
             pidfd_error,
             exec_reader,
             status: None,
+            #[cfg(test)]
+            exec_now: None,
         }
     }
 
@@ -684,7 +690,14 @@ impl ScriptChild {
             return Err(error);
         }
         wait_readable(self.exec_reader.as_raw_fd(), deadline)?;
-        if Instant::now() >= deadline {
+        // A pipe that becomes readable as the deadline expires is still a
+        // timeout. Exec closes the writer; that close is not a successful wait
+        // once the budget is spent.
+        #[cfg(test)]
+        let now = self.exec_now.unwrap_or_else(Instant::now);
+        #[cfg(not(test))]
+        let now = Instant::now();
+        if now >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
         // The child writes one byte on failure. Exec closes the writer.
@@ -929,7 +942,6 @@ mod tests {
     use super::*;
 
     const CHALLENGE: &str = "0123456789abcdef0123456789abcdef";
-    const FIXTURE_BUDGET: Duration = Duration::from_millis(250);
 
     #[test]
     fn inherited_sigchld_ignore_is_reset_and_child_stays_waitable() {
@@ -1032,10 +1044,10 @@ mod tests {
             ("kill -TERM $$", ScriptOutcome::Terminated),
         ] {
             let mut child = launched(script, ChildSetup::default());
-            let observed = observe(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
+            let observed = observe(&mut child, Instant::now() + TEST_HANG_GUARD).unwrap();
             if matches!(observed, Observation::Deadline) {
                 child.kill().unwrap();
-                reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
+                reap(&mut child, Instant::now() + TEST_HANG_GUARD).unwrap();
             }
             assert_eq!(observed.outcome(), expected);
         }
@@ -1050,15 +1062,19 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(!child.wait_exec(Instant::now() + FIXTURE_BUDGET).unwrap());
-        reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
+        assert!(!child.wait_exec(Instant::now() + TEST_HANG_GUARD).unwrap());
+        reap(&mut child, Instant::now() + TEST_HANG_GUARD).unwrap();
     }
 
     #[test]
     fn short_deadline_kills_process_group_and_reaps_owned_child() {
+        let gate = HeldGate::open();
         let (mut pipe, output) = io::pipe().unwrap();
         let mut child = launched(
-            "sleep 2 & printf '%s\\n' \"$!\"; wait",
+            &format!(
+                "/bin/sh -c 'read _ <&{gate}' & printf '%s\\n' \"$!\"; wait",
+                gate = gate.fd()
+            ),
             ChildSetup {
                 stdout: Some(output.as_raw_fd()),
                 ..ChildSetup::default()
@@ -1068,13 +1084,15 @@ mod tests {
         let descendant = read_pid(&mut pipe);
         // SAFETY: getpgid reads kernel state and has no pointer parameters.
         assert_eq!(unsafe { libc::getpgid(descendant) }, child.pid);
+        // The descendant is held on the gate, so this deadline is already due
+        // and observe classifies it without sleeping.
         assert!(matches!(
-            observe(&mut child, Instant::now() + Duration::from_millis(10)).unwrap(),
+            observe(&mut child, Instant::now()).unwrap(),
             Observation::Deadline
         ));
         let pid = child.pid;
         child.kill().unwrap();
-        reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
+        reap(&mut child, Instant::now() + TEST_HANG_GUARD).unwrap();
         assert_eq!(
             child.try_wait().unwrap().unwrap().signal(),
             Some(libc::SIGKILL)
@@ -1184,7 +1202,7 @@ mod tests {
             // Keep the mutation witness from leaving its blocked child behind.
             let mut child = ScriptChild::new(pid, stall.ready);
             child.kill().unwrap();
-            reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
+            reap(&mut child, Instant::now() + TEST_HANG_GUARD).unwrap();
         }
         assert_eq!(release.expect("stalled child kept the port open"), 0);
         assert_eq!(inherited, 0, "the first child step did not close the port");
@@ -1193,11 +1211,60 @@ mod tests {
     }
 
     #[test]
+    fn production_exec_pipe_deadline_times_out() {
+        // The stall watchdog replaces wait_exec. This fixture calls the
+        // production pipe wait. The child holds the writer, and the injected
+        // clock is still inside the budget, so only wait_readable's deadline
+        // can time out.
+        let (started, ready) = io::pipe().unwrap();
+        let (gate, _held_gate) = io::pipe().unwrap();
+        let mut held = PreparedScript::new("exit 7")
+            .unwrap()
+            .fork(
+                &ReapOwner::verify().unwrap(),
+                ChildSetup {
+                    stall: Some(StallBeforeExec {
+                        ready: ready.as_raw_fd(),
+                        gate: gate.as_raw_fd(),
+                    }),
+                    ..ChildSetup::default()
+                },
+            )
+            .unwrap();
+        let expired = Instant::now();
+        held.exec_now = Some(
+            expired
+                .checked_sub(Duration::from_millis(1))
+                .expect("deadline is not the monotonic epoch"),
+        );
+        let error = held.wait_exec(expired).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        held.kill().unwrap();
+        reap(&mut held, Instant::now() + TEST_HANG_GUARD).unwrap();
+        drop((started, ready, gate));
+
+        // Exec closes the writer, so the pipe is readable before the hang
+        // guard. The injected clock is exactly the deadline, which must still
+        // lose to the budget instead of counting as a successful exec.
+        let mut child = PreparedScript::new("exit 0")
+            .unwrap()
+            .fork(&ReapOwner::verify().unwrap(), ChildSetup::default())
+            .unwrap();
+        let deadline = Instant::now() + TEST_HANG_GUARD;
+        child.exec_now = Some(deadline);
+        let error = child.wait_exec(deadline).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        reap(&mut child, Instant::now() + TEST_HANG_GUARD).unwrap();
+    }
+
+    #[test]
     fn production_cleanup_writes_kill_and_waits_for_empty_before_result() {
         let fixture = Arc::new(FakeCgroups::new());
         let release = Arc::clone(&fixture);
         let peer = thread::spawn(move || -> io::Result<()> {
-            let deadline = Instant::now() + FIXTURE_BUDGET;
+            // The kill write is the latch. The hang guard only fails a peer
+            // that never observes it; the success path does not sleep a budget.
+            let deadline = Instant::now() + TEST_HANG_GUARD;
             while fs::read(release.0.join("cgroup.kill"))? != b"1" {
                 pause_until(deadline)?;
             }
@@ -1269,9 +1336,13 @@ mod tests {
             }
         };
         let mut group = root.new_command().unwrap();
+        let gate = HeldGate::open();
         let (mut pipe, output) = io::pipe().unwrap();
         let mut child = launched(
-            "setsid /bin/sh -c 'printf \"%s\\n\" \"$$\"; exec sleep 2' & exit 0",
+            &format!(
+                "setsid /bin/sh -c 'printf \"%s\\n\" \"$$\"; read _ <&{gate}' & exit 0",
+                gate = gate.fd()
+            ),
             ChildSetup {
                 procs: Some(group.procs.as_raw_fd()),
                 drop_privileges: owner == 0,
@@ -1284,7 +1355,7 @@ mod tests {
         // SAFETY: getsid reads kernel state and has no pointer parameters.
         assert_eq!(unsafe { libc::getsid(descendant) }, descendant);
         assert_eq!(
-            observe(&mut child, Instant::now() + FIXTURE_BUDGET)
+            observe(&mut child, Instant::now() + TEST_HANG_GUARD)
                 .unwrap()
                 .outcome(),
             ScriptOutcome::Exited { exit_code: 0 }
@@ -1292,7 +1363,7 @@ mod tests {
         assert!(group.populated().unwrap());
         assert!(matches!(discover(), Err(Qualification::CommandSlot)));
         group.kill().unwrap();
-        group.wait_empty(Instant::now() + FIXTURE_BUDGET).unwrap();
+        group.wait_empty(Instant::now() + TEST_HANG_GUARD).unwrap();
         root.remove_command(&group).unwrap();
         ready(&pipe);
         assert_eq!(pipe.read(&mut [0]).unwrap(), 0);
@@ -1303,7 +1374,7 @@ mod tests {
                 runner
                     .run(
                         "test \"$(id -u):$(id -g):$(id -G)\" = 65534:65534:65534",
-                        FIXTURE_BUDGET,
+                        TEST_HANG_GUARD,
                     )
                     .unwrap(),
                 ScriptOutcome::Exited { exit_code: 0 }
@@ -1311,6 +1382,7 @@ mod tests {
         }
         assert_eq!(
             runner
+                // The loop cannot finish. This is the production timeout budget.
                 .run("while :; do :; done", Duration::from_millis(50))
                 .unwrap(),
             ScriptOutcome::TimedOut
@@ -1360,8 +1432,8 @@ mod tests {
                 cgroups: Box::new(Arc::clone(self)),
                 port: None,
                 reap_owner: ReapOwner::verify().unwrap(),
-                max_budget: FIXTURE_BUDGET,
-                cleanup_budget: FIXTURE_BUDGET,
+                max_budget: TEST_HANG_GUARD,
+                cleanup_budget: TEST_HANG_GUARD,
                 drop_privileges: false,
                 stall: None,
             }
@@ -1432,7 +1504,8 @@ mod tests {
             &Request::RunScript {
                 id: 1,
                 script: script.into(),
-                timeout_s: 1,
+                // Failure bound for scripts that do exit. Aligned with the hang guard.
+                timeout_s: 5,
             },
         )
         .unwrap();
@@ -1455,7 +1528,7 @@ mod tests {
             .unwrap()
             .fork(&ReapOwner::verify().unwrap(), setup)
             .unwrap();
-        assert!(child.wait_exec(Instant::now() + FIXTURE_BUDGET).unwrap());
+        assert!(child.wait_exec(Instant::now() + TEST_HANG_GUARD).unwrap());
         child
     }
 
@@ -1471,16 +1544,33 @@ mod tests {
     }
 
     fn ready(pipe: &impl AsRawFd) {
-        let mut fd = libc::pollfd {
-            fd: pipe.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: fd refers to a single initialized pollfd and poll is bounded.
-        assert_eq!(
-            unsafe { libc::poll(&mut fd, 1, FIXTURE_BUDGET.as_millis() as i32) },
-            1
-        );
-        assert_ne!(fd.revents & (libc::POLLIN | libc::POLLHUP), 0);
+        wait_readable(pipe.as_raw_fd(), Instant::now() + TEST_HANG_GUARD).unwrap();
+    }
+
+    /// Read end inherited by the shell. The write end stays open so a blocked
+    /// `read` cannot exit on its own timer.
+    struct HeldGate {
+        read: OwnedFd,
+        _write: PipeWriter,
+    }
+
+    impl HeldGate {
+        fn open() -> Self {
+            let (reader, write) = io::pipe().unwrap();
+            // SAFETY: F_DUPFD duplicates an open pipe to an fd at or above 3
+            // and leaves close-on-exec clear, so the shell inherits it.
+            let dup = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_DUPFD, 3) };
+            assert!(dup >= 3, "gate descriptor was not allocated");
+            drop(reader);
+            Self {
+                // SAFETY: F_DUPFD returned a fresh descriptor owned by this process.
+                read: unsafe { OwnedFd::from_raw_fd(dup) },
+                _write: write,
+            }
+        }
+
+        fn fd(&self) -> RawFd {
+            self.read.as_raw_fd()
+        }
     }
 }
