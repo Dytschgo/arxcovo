@@ -1,7 +1,7 @@
 use super::{
-    paths::{Artifact, ArtifactRole, InvalidPath, LocalPath},
+    paths::{Artifact, ArtifactPin, ArtifactRole, FileIdentity, InvalidPath, LocalPath},
     qemu_img::{CLUSTER, InvalidImage, inspect_header},
-    runtime::{NativeRefusal, OfflineLease},
+    runtime::{InstallerPhase, OfflineLease},
 };
 use serde_json::{Value, json};
 
@@ -26,9 +26,32 @@ impl SerialName {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum BootPurpose<'a> {
     Installed,
-    Installer(&'a Artifact),
+    UbuntuInstall {
+        iso: &'a Artifact,
+        cidata: &'a Artifact,
+        kernel: &'a Artifact,
+        initrd: &'a Artifact,
+    },
+    WindowsSetup {
+        iso: &'a Artifact,
+        answer: &'a Artifact,
+        drivers: &'a Artifact,
+    },
+    WindowsFinalize,
+}
+
+impl BootPurpose<'_> {
+    fn phase(self) -> Option<InstallerPhase> {
+        match self {
+            Self::Installed => None,
+            Self::UbuntuInstall { .. } => Some(InstallerPhase::UbuntuInstall),
+            Self::WindowsSetup { .. } => Some(InstallerPhase::WindowsSetup),
+            Self::WindowsFinalize => Some(InstallerPhase::WindowsFinalize),
+        }
+    }
 }
 
 pub struct BootRecipe<'a> {
@@ -53,8 +76,8 @@ pub struct BootRecipe<'a> {
 pub enum PlanKind {
     /// The fixed QEMU recipe for an installed disk.
     Boot,
-    /// The fixed QEMU recipe with installer media. Natively refused.
-    InstallerBoot,
+    /// A QMP-only installer or finalization recipe.
+    InstallerBoot(InstallerPhase),
     /// Read-only qemu-img inspection of the immutable golden image.
     Inspect,
     /// qemu-img inspection of a writable image, bound to an offline lease.
@@ -63,10 +86,17 @@ pub enum PlanKind {
     Mutate,
 }
 
+/// Expected custody for one artifact in a sealed installer plan.
+pub struct InstallerArtifact<'a> {
+    pub path: &'a LocalPath,
+    pub identity: FileIdentity,
+    pub pin: Option<ArtifactPin>,
+    pub role: ArtifactRole,
+}
+
 enum Binding<'a> {
-    Boot {
-        installer: bool,
-    },
+    Boot,
+    Installer(InstallerPhase, Vec<InstallerArtifact<'a>>),
     Inspect,
     Offline {
         lease: &'a OfflineLease,
@@ -96,8 +126,8 @@ impl<'a> CommandPlan<'a> {
 
     pub fn kind(&self) -> PlanKind {
         match self.binding {
-            Binding::Boot { installer: false } => PlanKind::Boot,
-            Binding::Boot { installer: true } => PlanKind::InstallerBoot,
+            Binding::Boot => PlanKind::Boot,
+            Binding::Installer(phase, _) => PlanKind::InstallerBoot(phase),
             Binding::Inspect => PlanKind::Inspect,
             Binding::Offline { mutate: false, .. } => PlanKind::InspectWritable,
             Binding::Offline { mutate: true, .. } => PlanKind::Mutate,
@@ -109,19 +139,14 @@ impl<'a> CommandPlan<'a> {
     pub fn offline_lease(&self) -> Option<&'a OfflineLease> {
         match self.binding {
             Binding::Offline { lease, .. } => Some(lease),
-            Binding::Boot { .. } | Binding::Inspect => None,
+            Binding::Boot | Binding::Installer(..) | Binding::Inspect => None,
         }
     }
 
-    /// The native launcher's first check, before any handle, Job or process
-    /// exists. An installer boot needs a phase the runtime does not provide
-    /// yet: no guest service runs during installation. Writable-image plans
-    /// return their lease, which the launcher keeps borrowed.
-    pub fn native_admission(&self) -> Result<Option<&'a OfflineLease>, NativeRefusal> {
-        match self.binding {
-            Binding::Boot { installer: true } => Err(NativeRefusal::InstallerPhaseUnavailable),
-            Binding::Boot { installer: false } | Binding::Inspect => Ok(None),
-            Binding::Offline { lease, .. } => Ok(Some(lease)),
+    pub fn installer_artifacts(&self) -> &[InstallerArtifact<'a>] {
+        match &self.binding {
+            Binding::Installer(_, artifacts) => artifacts,
+            _ => &[],
         }
     }
 }
@@ -269,6 +294,20 @@ impl BootRecipe<'_> {
         if !(1..=4).contains(&self.vcpus) || !(256..=8192).contains(&self.ram_mib) {
             return Err(InvalidPath);
         }
+        let phase = self.boot.phase();
+        let disk_role = if phase.is_some() {
+            TestInstallDisk
+        } else {
+            GuestDisk
+        };
+        let vars_role = if phase == Some(InstallerPhase::WindowsSetup) {
+            WindowsSetupVars
+        } else {
+            Vars
+        };
+        if phase.is_some() && self.backing.is_some() {
+            return Err(InvalidPath);
+        }
         let approved = match (self.backing, self.backing_header) {
             (Some(golden), Some(header)) => {
                 inspect_header(header, None).map_err(|InvalidImage| InvalidPath)?;
@@ -302,7 +341,11 @@ impl BootRecipe<'_> {
             "-device",
             "virtio-serial-pci,id=arxserial",
             "-device",
-            "virtio-blk-pci,drive=guestdisk,bootindex=2",
+            if phase == Some(InstallerPhase::WindowsSetup) {
+                "virtio-blk-pci,drive=guestdisk"
+            } else {
+                "virtio-blk-pci,drive=guestdisk,bootindex=2"
+            },
             "-L",
             self.data.path_for(Data)?.as_str(),
             "-machine",
@@ -317,7 +360,11 @@ impl BootRecipe<'_> {
             "-m".into(),
             self.ram_mib.to_string(),
             "-chardev".into(),
-            format!("pipe,id=arxguest,path={}", self.serial.basename()),
+            if phase.is_some() {
+                "null,id=arxguest".into()
+            } else {
+                format!("pipe,id=arxguest,path={}", self.serial.basename())
+            },
             "-device".into(),
             format!(
                 "virtserialport,bus=arxserial.0,chardev=arxguest,id={GUEST_PORT_ID},name={GUEST_PORT}"
@@ -335,7 +382,7 @@ impl BootRecipe<'_> {
             &mut args,
             "raw",
             "vars",
-            self.vars.path_for(Vars)?,
+            self.vars.path_for(vars_role)?,
             false,
             None,
         );
@@ -353,32 +400,115 @@ impl BootRecipe<'_> {
             &mut args,
             "qcow2",
             "guestdisk",
-            self.disk.path_for(GuestDisk)?,
+            self.disk.path_for(disk_role)?,
             false,
             Some(self.backing.map_or(Value::Null, |_| json!("golden"))),
         );
-        if let BootPurpose::Installer(media) = self.boot {
-            block(
-                &mut args,
-                "raw",
-                "installer",
-                media.path_for(InstallMedia)?,
-                true,
-                None,
-            );
-            args.extend([
-                "-device".into(),
-                "ide-cd,drive=installer,bus=ide.0,bootindex=1".into(),
-            ]);
-        }
+        let binding = match phase {
+            None => Binding::Boot,
+            Some(phase) => {
+                let mut artifacts = Vec::new();
+                for (artifact, role) in [
+                    (self.image, Qemu),
+                    (self.data, Data),
+                    (self.firmware, FirmwareCode),
+                    (self.vars, vars_role),
+                    (self.disk, disk_role),
+                ] {
+                    bind(&mut artifacts, artifact, role, role == WindowsSetupVars)?;
+                }
+                self.installer_args(&mut args, &mut artifacts)?;
+                Binding::Installer(phase, artifacts)
+            }
+        };
         Ok(CommandPlan {
             image,
             args,
-            binding: Binding::Boot {
-                installer: matches!(self.boot, BootPurpose::Installer(_)),
-            },
+            binding,
         })
     }
+
+    fn installer_args<'a>(
+        &'a self,
+        args: &mut Vec<String>,
+        artifacts: &mut Vec<InstallerArtifact<'a>>,
+    ) -> Result<(), InvalidPath> {
+        use ArtifactRole::*;
+        match self.boot {
+            BootPurpose::UbuntuInstall {
+                iso,
+                cidata,
+                kernel,
+                initrd,
+            } => {
+                let iso = bind(artifacts, iso, UbuntuInstallIso, true)?;
+                let cidata = bind(artifacts, cidata, UbuntuCidata, true)?;
+                let kernel = bind(artifacts, kernel, UbuntuKernel, true)?;
+                let initrd = bind(artifacts, initrd, UbuntuInitrd, true)?;
+                cd(args, "osiso", iso, "ide.0");
+                cd(args, "cidata", cidata, "ide.1");
+                args.extend([
+                    "-kernel".into(),
+                    kernel.as_str().into(),
+                    "-initrd".into(),
+                    initrd.as_str().into(),
+                    "-append".into(),
+                    "autoinstall ds=nocloud ---".into(),
+                ]);
+            }
+            BootPurpose::WindowsSetup {
+                iso,
+                answer,
+                drivers,
+            } => {
+                let iso = bind(artifacts, iso, WindowsInstallIso, true)?;
+                let answer = bind(artifacts, answer, WindowsAnswerSeed, true)?;
+                let drivers = bind(artifacts, drivers, WindowsDriverMedium, true)?;
+                // The qualified private VARS selects ide.0 through BootNext.
+                // Keep firmware's persistent disk order free of CD overrides.
+                cd(args, "osiso", iso, "ide.0");
+                args.extend([
+                    "-device".into(),
+                    "ich9-ahci,id=arxmedia,bus=pcie.0,addr=0x1e".into(),
+                ]);
+                cd(args, "answer", answer, "arxmedia.0");
+                cd(args, "drivers", drivers, "arxmedia.1");
+            }
+            BootPurpose::WindowsFinalize | BootPurpose::Installed => {}
+        }
+        Ok(())
+    }
+}
+
+fn bind<'a>(
+    artifacts: &mut Vec<InstallerArtifact<'a>>,
+    artifact: &'a Artifact,
+    role: ArtifactRole,
+    pinned: bool,
+) -> Result<&'a LocalPath, InvalidPath> {
+    let path = artifact.path_for(role)?;
+    let identity = artifact.identity().ok_or(InvalidPath)?;
+    let pin = artifact.pin();
+    if (pinned && pin.is_none())
+        || pin.is_some_and(|pin| pin.size == 0)
+        || artifacts.iter().any(|other| {
+            other.identity == identity || (other.path.contains(path) && path.contains(other.path))
+        })
+    {
+        return Err(InvalidPath);
+    }
+    artifacts.push(InstallerArtifact {
+        path,
+        identity,
+        pin,
+        role,
+    });
+    Ok(path)
+}
+
+fn cd(args: &mut Vec<String>, node: &str, path: &LocalPath, bus: &str) {
+    block(args, "raw", node, path, true, None);
+    args.extend(["-device".into(), format!("ide-cd,drive={node},bus={bus}")]);
 }
 
 fn block(
