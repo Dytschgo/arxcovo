@@ -1,5 +1,4 @@
-//! ISO9660 with a Joliet supplementary volume. Joliet carries the exact
-//! lower-case NoCloud names. Both namespaces reference the same file extents.
+//! Fixed ISO9660/Joliet seed profiles. Both namespaces share file extents.
 
 use std::io::{self, Write};
 
@@ -38,28 +37,75 @@ struct Extent {
     length: u32,
 }
 
-pub(super) struct Image<'a> {
-    files: [&'a [u8]; 7],
-    extents: [Extent; 7],
+pub(super) struct Image<'a, const N: usize = 7> {
+    files: [&'a [u8]; N],
+    extents: [Extent; N],
     sectors: u32,
+    label: &'static str,
+    primary: [&'static str; N],
+    joliet: [&'static str; N],
+    joliet_order: [usize; N],
 }
 
 impl<'a> Image<'a> {
     pub(super) fn new(files: [&'a [u8]; 7]) -> Option<Self> {
-        let (extents, sectors) = layout(files.map(<[u8]>::len))?;
+        let lengths = files.map(<[u8]>::len);
+        let (extents, sectors) = layout(lengths)?;
         Some(Self {
             files,
             extents,
             sectors,
+            label: "CIDATA",
+            primary: PRIMARY_NAMES,
+            joliet: JOLIET_NAMES,
+            joliet_order: [0, 1, 4, 2, 3, 5, 6],
         })
     }
+}
 
+impl<'a> Image<'a, 5> {
+    pub(super) fn windows(files: [&'a [u8]; 5]) -> Option<Self> {
+        let lengths = files.map(<[u8]>::len);
+        for (length, limit) in lengths
+            .into_iter()
+            .zip([MAX_GUEST, 1024, 128, 32 * 1024, 16 * 1024])
+        {
+            if length > limit {
+                return None;
+            }
+        }
+        let (extents, sectors) = file_extents(lengths)?;
+        Some(Self {
+            files,
+            extents,
+            sectors,
+            label: "ARXSETUP",
+            primary: [
+                "ARXGUEST.EXE;1",
+                "ARXPINS.TXT;1",
+                "ARXSEED.ID;1",
+                "ARXSETUP.PS1;1",
+                "AUTOUNAT.XML;1",
+            ],
+            joliet: [
+                "arxguest.exe;1",
+                "arxpins.txt;1",
+                "arxseed.id;1",
+                "arxsetup.ps1;1",
+                "Autounattend.xml;1",
+            ],
+            joliet_order: [0, 1, 2, 3, 4],
+        })
+    }
+}
+
+impl<const N: usize> Image<'_, N> {
     pub(super) fn write(&self, mut out: impl Write) -> io::Result<()> {
         for _ in 0..PRIMARY {
             out.write_all(&ZERO)?;
         }
-        out.write_all(&descriptor(false, self.sectors))?;
-        out.write_all(&descriptor(true, self.sectors))?;
+        out.write_all(&descriptor(false, self.sectors, self.label))?;
+        out.write_all(&descriptor(true, self.sectors, self.label))?;
         let mut end = ZERO;
         end[..7].copy_from_slice(b"\xffCD001\x01");
         out.write_all(&end)?;
@@ -84,18 +130,18 @@ impl<'a> Image<'a> {
         let mut offset = record(&mut data, root, b"\0", true);
         offset += record(&mut data[offset..], root, b"\x01", true);
         let order = if joliet {
-            [0, 1, 4, 2, 3, 5, 6]
+            self.joliet_order
         } else {
-            [0, 1, 2, 3, 4, 5, 6]
+            std::array::from_fn(|index| index)
         };
         for index in order {
             let name = if joliet {
-                JOLIET_NAMES[index]
+                self.joliet[index]
                     .encode_utf16()
                     .flat_map(u16::to_be_bytes)
                     .collect::<Vec<_>>()
             } else {
-                PRIMARY_NAMES[index].as_bytes().to_vec()
+                self.primary[index].as_bytes().to_vec()
             };
             offset += record(&mut data[offset..], self.extents[index], &name, false);
         }
@@ -108,11 +154,15 @@ fn layout(lengths: [usize; 7]) -> Option<([Extent; 7], u32)> {
     if guest > MAX_GUEST || meta > 1024 || user > 16 * 1024 {
         return None;
     }
+    file_extents(lengths)
+}
+
+fn file_extents<const N: usize>(lengths: [usize; N]) -> Option<([Extent; N], u32)> {
     let mut sector = JOLIET_ROOT + 1;
     let mut extents = [Extent {
         sector: 0,
         length: 0,
-    }; 7];
+    }; N];
     for (extent, length) in extents.iter_mut().zip(lengths) {
         let length = u32::try_from(length).ok()?;
         if length == 0 {
@@ -167,7 +217,7 @@ fn path_table(root: u32, big_endian: bool) -> [u8; SECTOR] {
     block
 }
 
-fn descriptor(joliet: bool, sectors: u32) -> [u8; SECTOR] {
+fn descriptor(joliet: bool, sectors: u32, label: &str) -> [u8; SECTOR] {
     let mut block = ZERO;
     block[0] = if joliet { 2 } else { 1 };
     block[1..7].copy_from_slice(b"CD001\x01");
@@ -181,10 +231,12 @@ fn descriptor(joliet: bool, sectors: u32) -> [u8; SECTOR] {
         }
     }
     if joliet {
-        block[40..52].copy_from_slice(b"\0C\0I\0D\0A\0T\0A");
+        for (pair, byte) in block[40..72].chunks_exact_mut(2).zip(label.bytes()) {
+            pair.copy_from_slice(&[0, byte]);
+        }
         block[88..91].copy_from_slice(b"%/E");
     } else {
-        block[40..46].copy_from_slice(b"CIDATA");
+        block[40..40 + label.len()].copy_from_slice(label.as_bytes());
     }
     let (root, path): (u32, u32) = if joliet {
         (JOLIET_ROOT, 21)
@@ -234,5 +286,26 @@ mod tests {
         let exact = (MAX_SECTORS - JOLIET_ROOT - 7) as usize * SECTOR;
         assert_eq!(layout([1, 1, 1, exact, 1, 1, 1]).unwrap().1, MAX_SECTORS);
         assert!(layout([1, 1, 1, exact + 1, 1, 1, 1]).is_none());
+    }
+
+    #[test]
+    fn windows_seed_layout_enforces_each_limit() {
+        for (slot, cap) in [MAX_GUEST, 1024, 128, 32 * 1024, 16 * 1024]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes = vec![1; if slot == 0 { 1 } else { cap + 1 }];
+            let mut files: [&[u8]; 5] = [b"x"; 5];
+            files[slot] = b"";
+            assert!(Image::windows(files).is_none());
+            if slot != 0 {
+                files[slot] = &bytes;
+                assert!(Image::windows(files).is_none());
+                files[slot] = &bytes[..cap];
+                assert!(Image::windows(files).is_some());
+            }
+        }
+        // Check the 32 MiB guest limit without allocating a large fixture.
+        assert!(file_extents([MAX_GUEST, 1, 1, 1, 1]).is_some());
     }
 }
