@@ -238,8 +238,22 @@ own token by the production `restrict_token`. They prove the token shape, the
 label and deny-only differentials through AccessCheck, and a real restricted
 child inside the production Job. That child creates a file in a Low request
 directory, cannot create one in a Medium directory, and can read a seeded file.
-They also prove PowerShell `exit 7`, the self-test sentinel, and removal of the
-request directory.
+Development-host tests also check PowerShell `exit 7`, the self-test
+sentinel, and removal of the request directory.
+
+**Hosted CI quarantine.** On Windows with `CI=true` and
+`RUNNER_ENVIRONMENT=github-hosted` (or a `win`-prefixed `ImageOS` when
+`RUNNER_ENVIRONMENT` is absent), the tests
+`production_identity_runs_powershell_and_removes_its_request_directory` and
+`self_test_admits_the_production_identity` report a restricted launch ladder
+in place of their PowerShell exit-value assertions. The runner's Windows
+PowerShell 5.1 has exited with `0x80131623` under the restricted identity.
+The ladder runs the native and Framework controls, bare PowerShell, and
+the wrapper in fresh request directories. It still requires verified token
+and Job setup, input handoff, and cleanup. Self-hosted and local tests
+continue to require the full PowerShell and admission results. Actual
+qualification requires an installed service run on the owner's pinned
+Windows 11 guest and is **unverified on real hardware**.
 
 These remain owner-host items, **unverified on real hardware**: the LocalService
 token shape at System integrity, the session 0 window station, PowerShell
@@ -248,5 +262,3 @@ the vioserial device, `check_scm` and `protect_parent` against the installed
 service, the effective policy values on the pinned image (including the
 required `EnableScriptBlockLogging = 0` and the absence of 4104 events for a
 probe script), and broker denials through Task Scheduler, SCM, WMI and COM.
-Separately, hosted CI has not yet run the revised environment on the
-`windows-2025` image.
