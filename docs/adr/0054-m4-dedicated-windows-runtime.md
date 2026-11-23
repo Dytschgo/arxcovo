@@ -10,13 +10,13 @@ There is no authority issuer in this slice.
 
 ## Distribution and launch recipe
 
-The candidate pin is upstream QEMU 11.1.3, built for Windows x64 with
-MinGW-w64/UCRT. Qualification requires a reviewed signed source and
-toolchain receipt, exact SHA-256 and size for the console QEMU and matching
-qemu-img executables, the libslirp and loaded DLL set, ROM/data, and the EDK2
-CODE and VARS images. No binary receipt is available. Version matching in the
-QMP greeting checks the protocol peer's declaration during startup.
-Distribution qualification independently checks the bytes on disk.
+The candidate pin for TEST-VM qualification is the Stefan Weil QEMU 11.1.0
+Windows x64 build described in the amendment below. Qualification still
+requires reviewing source and toolchain provenance and pinning the SHA-256
+and size of the console QEMU and matching qemu-img executables, the libslirp
+and loaded DLL set, ROM/data, and the EDK2 CODE and VARS images. Version
+matching in the QMP greeting checks the protocol peer's declaration during
+startup. Distribution qualification independently checks the bytes on disk.
 
 The fixed recipe selects WHPX, `pc-q35-11.1`, explicit raw pflash nodes
 with a read-only `edk2-x86_64-code.fd` and private writable copy of
@@ -48,7 +48,7 @@ qemu-img opens the declared backing with traversal enabled. Those clusters
 must be read through the held custody pins. The gap between that read and
 QEMU's own by-name open belongs to the activation gate below.
 
-Header parsing follows the QEMU v11.1.3 `block/qcow2.h` layout. A version-3
+Header parsing follows the QEMU 11.1.x `block/qcow2.h` layout. A version-3
 `header_length` of 104 or the pinned 112 is accepted, where 112 adds
 `compression_type` and zeroed padding. Compression must be zlib (0), or zstd
 (1) with incompatible bit 3. Every other incompatible bit, all compatible
@@ -140,7 +140,7 @@ Two facts shape the design:
 - Firmware can open the port first. OVMF's VirtioSerialDxe opens a named
   port before Linux, QEMU then moves a pending frame into the firmware
   queue, and `ExitBootServices` resets that queue.
-- QEMU 11.1.3 rate-limits `VSERPORT_CHANGE` to one event per second per
+- QEMU 11.1.0 rate-limits `VSERPORT_CHANGE` to one event per second per
   device and keeps only the newest pending one, so a quick close and reopen
   can arrive as a repeated open.
 
@@ -316,7 +316,7 @@ server PID differs. Other tests cover:
   - a reply that is ready together with the expired deadline refuses;
 - an installer recipe refused with `InstallerPhaseUnavailable` at the
   launcher's first check;
-- the 112-byte v11.1.3 create headers, with each refused feature,
+- the 112-byte 11.1.x create headers, with each refused feature,
   compression and extension case, and boot recipes with foreign, missing or
   extra backing references or an external data file;
 - an existing writable leaf refusing rename, delete and new hard links;
@@ -331,8 +331,8 @@ hosted runners set, the same classification fails the test instead. Hosted
 evidence therefore shows a pass only if the supported Job path ran, with no
 CI profile change. Any other denial fails the test everywhere.
 
-These tests ran under the developer's interactive account. Native WHPX, the
-dedicated standard account, effective pipe ACLs against distinct SIDs,
+These tests ran under the developer's interactive account. The full WHPX
+recipe, the dedicated standard account, effective pipe ACLs against distinct SIDs,
 physical disk ceilings, the volume-identity pin, QEMU's own name-based opens
 and WTS owner activity are **unverified on real hardware**. The optional
 Linux TCG fixture covers only QMP startup. It requires an explicit
@@ -343,3 +343,49 @@ paths, and mutating qemu-img plans need the uninhabited offline lease, so
 this Linux fixture cannot exercise them.
 The release gate stays closed pending independent review, passing checks
 and owner qualification of the exact package and native controls.
+
+## Amendment — Windows x64 pin for TEST-VM qualification
+
+The previous candidate was QEMU 11.1.3. That release is available as source.
+The official Windows binary catalog provides the 11.1.0 build identified in
+the slice 3 design. The candidate profile accepts only
+`qemu-11.1.0-windows-x64`. The QMP greeting must report version 11.1.0.
+[Windows binary catalog](https://qemu.weilnetz.de/w64/2026/) · [QEMU source archives](https://download.qemu.org/)
+
+The portable installation receipt identifies Stefan Weil's 2026-08-11 x64
+installer. The installer SHA-512 matched the publisher's checksum
+`5bcf9eed634e8575a37b74f445af41a2fe4106da512d0c30c368301d4c105037fdfab40a5287367a28a957624cddebbc8c07e16c88ab6634f554cdf3d16bf543`.
+Both executables reported `11.1.0 (v11.1.0-12130-ge470268ff4)`.
+Windows reported Authenticode `UnknownError` because the signer certificate
+expired on 2023-12-09, before the 2026-08-11 embedded timestamp. The owner
+explicitly approved installation after disclosure of the validity error.
+[Installer](https://qemu.weilnetz.de/w64/2026/qemu-w64-setup-20260811.exe) · [Publisher checksum](https://qemu.weilnetz.de/w64/2026/qemu-w64-setup-20260811.sha512)
+
+| Payload file | SHA-256 from the installation receipt |
+| --- | --- |
+| `qemu-system-x86_64.exe` | `47d57a6072e0bb3bd98f87926eb129eb1736dfe818c67b3b81ef7ce4edd0b3cd` |
+| `qemu-img.exe` | `9d930582d0d574bb106d89982c547688e10b8f356192d302cc3d0ae4e8674534` |
+| `share/edk2-x86_64-code.fd` | `33090cc07675baa5190d9f1e84bf5176b33bcbfa9bacac522961150cdb6dbb2a` |
+| `share/edk2-i386-vars.fd` | `5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e` |
+| `libslirp-0.dll` | `098093db72095516c877c371942444a508aaa3c546de563bd2ea36ba2e88a646` |
+
+The paused, diskless and networkless WHPX smoke used `pc-q35-11.1` and QMP
+over stdio. QMP greeted with 11.1.0, acknowledged `qmp_capabilities` and
+`quit`, and the process exited with code 0. Stderr reported an ignored
+interrupt-vector-0 request. The exact recipe, loaded dependencies and full
+guest boot remain **unverified on real hardware**.
+
+A diff of upstream `block/qcow2.h` at v11.1.0 and v11.1.3 was empty. The
+version-3 header layout and 112-byte fixtures apply to the 11.1 stable series.
+[v11.1.0 header](https://github.com/qemu/qemu/blob/v11.1.0/block/qcow2.h) · [v11.1.3 header](https://github.com/qemu/qemu/blob/v11.1.3/block/qcow2.h)
+
+The upstream stable delta includes an AHCI/ATAPI hang fix relevant to
+installer media, a virtio-net heap bounds fix (CVE-2026-66900), and a block
+I/O race fix for data corruption. The delta covers upstream tags. Downstream
+patch coverage in the Weil build remains unverified. Limit 11.1.0 to
+trusted, disposable TEST-VM qualification. Require a patched build before
+untrusted guests or persistent (static) VM disks, and rerun the real recipe
+on any replacement. Native admission stays closed. M4 native activation
+still requires the amendment in ADR 0058 that replaces the dedicated-account
+identity gate with the `current_user` identity gate.
+[Upstream stable comparison](https://gitlab.com/qemu-project/qemu/-/compare/v11.1.0...v11.1.3)
