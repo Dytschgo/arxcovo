@@ -350,8 +350,9 @@ impl Config {
             .map_err(|_| refusal)?;
         let path = PathBuf::from(local.as_str());
         // All interpolated strings passed the DNS, UUID or Windows LocalPath grammar.
+        // Origin verification stays at its secure default; the config names no TLS bypass key.
         let text = format!(
-            "tunnel: '{}'\nwarp-routing:\n  enabled: false\ningress:\n  - hostname: '{}'\n    service: 'https://127.0.0.1:{}'\n    originRequest:\n      originServerName: '{}'\n      caPool: '{}'\n      noTLSVerify: false\n  - service: http_status:404\n",
+            "tunnel: '{}'\nwarp-routing:\n  enabled: false\ningress:\n  - hostname: '{}'\n    service: 'https://127.0.0.1:{}'\n    originRequest:\n      originServerName: '{}'\n      caPool: '{}'\n  - service: http_status:404\n",
             plan.tunnel.as_str(),
             plan.hostname.as_str(),
             plan.origin_port,

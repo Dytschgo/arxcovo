@@ -812,7 +812,10 @@ mod vm {
             assert_owned("generated ingress config", Path::new(fields[2]));
             let config = fs::read_to_string(fields[2]).unwrap();
             assert!(!config.contains(FAKE_SECRET));
-            assert!(config.contains("noTLSVerify: false"));
+            // Verification is the connector default; the key is absent, never written as false.
+            assert!(!config.contains("noTLSVerify"));
+            assert!(config.contains(&format!("originServerName: '{ORIGIN_NAME}'")));
+            assert!(config.contains(&format!("caPool: '{}'", ca_path.display())));
             assert!(config.contains(&format!("https://127.0.0.1:{origin_port}")));
             assert!(config.ends_with("http_status:404\n"));
 
