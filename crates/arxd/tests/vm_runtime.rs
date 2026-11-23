@@ -31,7 +31,7 @@ fn profile() -> Value {
         "enabled": true, "owner_sid": "S-1-5-21-1-2-3-1001",
         "supervisor_sid": "S-1-5-21-1-2-3-1002", "bundle": "E:/pinned bundle",
         "volume": "D:/", "state": "D:/test_vms/state",
-        "disk_ceiling_bytes": 10_737_418_240_u64, "manifest": "qemu-11.1.0-windows-x64",
+        "disk_ceiling_bytes": 10_737_418_240_u64, "manifest": "qemu-11.1.3-windows-x64",
     })
 }
 
@@ -44,9 +44,9 @@ fn candidate_profile_is_closed_and_separate_from_foreground() {
     let original = profile();
     assert_eq!(
         parse(&original).unwrap().manifest_id(),
-        "qemu-11.1.0-windows-x64"
+        "qemu-11.1.3-windows-x64"
     );
-    assert_eq!(QEMU_VERSION, "11.1.0");
+    assert_eq!(QEMU_VERSION, "11.1.3");
     for forbidden in [
         "hostfwd",
         "guestfwd",
@@ -87,7 +87,7 @@ fn candidate_profile_is_closed_and_separate_from_foreground() {
 #[test]
 fn previous_qemu_manifest_is_refused_with_a_typed_error() {
     let mut previous = profile();
-    previous["manifest"] = json!("qemu-11.1.3-windows-x64");
+    previous["manifest"] = json!("qemu-11.1.0-windows-x64");
     assert!(matches!(parse(&previous), Err(error) if error.is::<InvalidVmProfile>()));
 }
 
@@ -556,7 +556,7 @@ fn image_metadata_cannot_introduce_external_files_or_backing() {
     );
 }
 
-const GREETING: &[u8] = b"{\"QMP\":{\"version\":{\"qemu\":{\"major\":11,\"minor\":1,\"micro\":0},\"package\":\"\"},\"capabilities\":[]}}\r\n";
+const GREETING: &[u8] = b"{\"QMP\":{\"version\":{\"qemu\":{\"major\":11,\"minor\":1,\"micro\":3},\"package\":\"\"},\"capabilities\":[]}}\r\n";
 
 async fn command(peer: &mut BufReader<DuplexStream>, name: &str, id: u16) {
     let mut line = String::new();
@@ -727,17 +727,35 @@ async fn qmp_rejects_invalid_results_duplicate_id_and_event_flood() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn qmp_setup_distinguishes_forged_version_partial_eof_and_timeout() {
-    for (input, error) in [
-        (b"{\"QMP\":{\"version\":{\"qemu\":{\"major\":11,\"minor\":1,\"micro\":3},\"package\":\"\"},\"capabilities\":[]}}\n".as_slice(), ChannelError::Invalid),
-        (b"{".as_slice(), ChannelError::Eof),
-    ] {
-        let (host, mut peer) = duplex(128);
-        peer.write_all(input).await.unwrap();
-        drop(peer);
-        let (reader, writer) = split(host);
-        assert_eq!(Qmp::handshake(reader, writer, &Shutdown::default()).await.err(), Some(error));
-    }
+async fn qmp_refuses_previous_qemu_version_before_capability_negotiation() {
+    let (host, mut peer) = duplex(128);
+    peer.write_all(b"{\"QMP\":{\"version\":{\"qemu\":{\"major\":11,\"minor\":1,\"micro\":0},\"package\":\"\"},\"capabilities\":[]}}\n")
+        .await
+        .unwrap();
+    let (reader, writer) = split(host);
+    assert_eq!(
+        Qmp::handshake(reader, writer, &Shutdown::default())
+            .await
+            .err(),
+        Some(ChannelError::Invalid)
+    );
+    let mut command = [0_u8; 1];
+    assert_eq!(peer.read(&mut command).await.unwrap(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn qmp_setup_distinguishes_partial_eof_and_timeout() {
+    let (host, mut peer) = duplex(128);
+    peer.write_all(b"{").await.unwrap();
+    drop(peer);
+    let (reader, writer) = split(host);
+    assert_eq!(
+        Qmp::handshake(reader, writer, &Shutdown::default())
+            .await
+            .err(),
+        Some(ChannelError::Eof)
+    );
+
     let (host, _silent_peer) = duplex(128);
     let (reader, writer) = split(host);
     assert_eq!(

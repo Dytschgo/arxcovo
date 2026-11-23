@@ -23,14 +23,11 @@ Relayed by the babysitter on the owner's behalf.
 
   The disk cap and owner reserve are not yet configured.
 
-- **QEMU install, 2026-11-23, by an agent under the scoped exception.**
-  - The Weil Windows installers linked from qemu.org stop at 11.1.0; no Weil 11.1.3 installer exists. The coordinator re-pinned the Windows binary to the official Weil 11.1.0 x64 build. That pin supersedes the earlier 11.1.3 candidate in ADR 0054, and the code and ADR are updated in a separate PR. MSYS2 publishes a Windows x64 `mingw-w64-ucrt-x86_64-qemu` package, which is the candidate patched build to evaluate, with package signatures and a receipt, before the patched-build gate below.
-  - It was extracted portably to `D:\ArxcovoData\qemu\11.1.0` without running the installer, so no UAC prompt was needed.
-  - The installer SHA-512 matches the publisher's checksum. The Authenticode certificate (Universität Mannheim) expired before the signing timestamp; the owner approved the install anyway.
-  - Receipt: `D:\ArxcovoData\qemu\11.1.0\RECEIPT.txt` (SHA-256 `5b8a9e63…6ab1`).
-  - Smoke test: `--version` reports 11.1.0, `-accel help` lists `whpx`, `pc-q35-11.1` is present, and a paused VM with no disk and no network started under WHPX, answered QMP and exited 0.
-  - A security review of 11.1.0→11.1.3 found an ATAPI hang, a virtio-net heap bounds fix (CVE-2026-66900) and a block I/O corruption fix. A patched build is required before untrusted guests or persistent VM disks.
-  - A full guest boot is **unverified on real hardware**.
+- **QEMU install, 2026-11-23.**
+  - The Windows x64 pin `qemu-11.1.3-windows-x64` identifies the portable local build at `D:\ArxcovoData\qemu\11.1.3`. It was built from signed QEMU 11.1.3 sources with MSYS2 UCRT64 and `--enable-whpx`. [ADR 0054](adr/0054-m4-dedicated-windows-runtime.md#amendment-2026-11-23--reviewed-local-qemu-1113-windows-x64-build)
+  - The package executables and DLLs are unsigned. Use the reviewed SHA-256 pins. The installation's `RECEIPT.txt` hashes to `e0e33d3fb433c467f5f530bcb8cc8ce41bb8c3b10133bd54718915b7357b852e` and binds `MANIFEST.sha256` at `f1cf73c8ecae163e31467a3985fc13749aee1f12a8747756eb136108a1015759`. An independent re-check verified all 136 payload files.
+  - Both executables reported 11.1.3. `-accel help` listed `whpx`. The paused, diskless and networkless `pc-q35-11.1` smoke negotiated QMP, reported `prelaunch` and exited cleanly. Full guest boot and production VM execution are **unverified on real hardware**.
+  - The reviewed build contains the virtio-net, block I/O and ATAPI fixes that lift the prior distribution restriction on untrusted guests and persistent VM disks. The superseded Weil 11.1.0 install at `D:\ArxcovoData\qemu\11.1.0` is kept for reference only. The candidate profile refuses its manifest ID.
 
 ## Foreground VM profile: state root custody
 
