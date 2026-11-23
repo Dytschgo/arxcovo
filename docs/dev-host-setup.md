@@ -25,9 +25,9 @@ Relayed by the babysitter on the owner's behalf.
 
 - **QEMU install, 2026-11-23, by an agent under the scoped exception.**
   - Official Windows builds stop at 11.1.0; 11.1.3 is source-only. The coordinator re-pinned the Windows binary to the official Weil 11.1.0 x64 build.
-  - It was extracted portably to `D:\ArxcovoData\qemu	.1.0` without running the installer, so no UAC prompt was needed.
+  - It was extracted portably to `D:\ArxcovoData\qemu\11.1.0` without running the installer, so no UAC prompt was needed.
   - The installer SHA-512 matches the publisher's checksum. The Authenticode certificate (Universität Mannheim) expired before the signing timestamp; the owner approved the install anyway.
-  - Receipt: `D:\ArxcovoData\qemu	.1.0\RECEIPT.txt` (SHA-256 `5b8a9e63…6ab1`).
+  - Receipt: `D:\ArxcovoData\qemu\11.1.0\RECEIPT.txt` (SHA-256 `5b8a9e63…6ab1`).
   - Smoke test: `--version` reports 11.1.0, `-accel help` lists `whpx`, `pc-q35-11.1` is present, and a paused VM with no disk and no network started under WHPX, answered QMP and exited 0.
   - A security review of 11.1.0→11.1.3 found an ATAPI hang, a virtio-net heap bounds fix (CVE-2026-66900) and a block I/O corruption fix. A patched build is required before untrusted guests or persistent VM disks.
   - A full guest boot is **unverified on real hardware**.
