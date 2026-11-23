@@ -598,8 +598,12 @@ mismatched:
 - the plan or its lease;
 - the policy's presence, custody, grammar, completeness or fingerprint;
 - a missing validated profile or public-egress enrollment (`Unenrolled`).
-  Admission reads the enrolled policy pin and the patched-binary pin from
-  the validated `VmRuntimeProfile` itself, never from loose values;
+  Admission checks enrollment first. It reads the enrolled policy pin and
+  the patched-binary pin from the validated `VmRuntimeProfile` itself,
+  never from loose values. Only `VmRuntimeProfile::parse`, with its size
+  limit and semantic validation, can produce that type. It implements no
+  `Deserialize` and has a private field, and the foreground file's runtime
+  section also goes through `parse`;
 - a held policy that differs from the profile's enrolled pin;
 - a held policy or executable that is not the exact object the plan's argv
   names. The normalized local path must equal the argv spelling exactly,

@@ -1087,7 +1087,17 @@ fn admission_refuses_missing_or_mismatched_evidence_with_typed_reasons() {
     use EgressRefusal::*;
     let mut checked = vec![(admit(&restricted, full), PlanMismatch)];
     for (evidence, refusal) in [
-        (EgressEvidence::default(), PolicyMissing),
+        // Enrollment is checked before custody, so no evidence at all, or a
+        // missing held policy without a profile, refuses as `Unenrolled`.
+        (EgressEvidence::default(), Unenrolled),
+        (
+            EgressEvidence {
+                policy: None,
+                profile: None,
+                ..full
+            },
+            Unenrolled,
+        ),
         (
             EgressEvidence {
                 policy: None,
@@ -1232,6 +1242,57 @@ fn custody_rechecks_the_held_anchor_and_leaf_at_verification() {
             assert_eq!(custodied.verify(), Ok(()), "{label} restored");
         }
     }
+}
+
+/// Admission reads its pins only from a `VmRuntimeProfile`, and only
+/// `VmRuntimeProfile::parse` (with its size limit and semantic validation)
+/// can produce one. The two bypasses do not compile:
+///
+/// - `serde_json::from_value::<VmRuntimeProfile>(..)` needs `Deserialize`,
+///   which the type does not implement. The probe below observes that at
+///   compile time: the inherent `deserializable` exists only when the bound
+///   holds, and method resolution otherwise picks the trait default.
+/// - `VmRuntimeProfile(..)` or a struct literal needs its private field,
+///   visible only inside `arxd::config`.
+#[test]
+fn only_parse_can_produce_the_profile_that_admission_reads() {
+    use std::marker::PhantomData;
+    struct Probe<T>(PhantomData<T>);
+    trait Fallback {
+        fn deserializable(&self) -> bool {
+            false
+        }
+    }
+    impl<T> Fallback for Probe<T> {}
+    impl<T: serde::de::DeserializeOwned> Probe<T> {
+        fn deserializable(&self) -> bool {
+            true
+        }
+    }
+    assert!(
+        Probe::<Value>(PhantomData).deserializable(),
+        "positive control"
+    );
+    assert!(
+        !Probe::<VmRuntimeProfile>(PhantomData).deserializable(),
+        "a deserialized profile would skip parse"
+    );
+    // Bytes that parse refuses never become a profile, enrolled or not.
+    for (field, value) in [
+        ("state", json!("test_vms/state")),
+        ("owner_sid", json!("S-1-5-21-1-2-3-1002")),
+        ("disk_ceiling_bytes", json!(0)),
+    ] {
+        let mut bad = profile();
+        bad["public_egress"] = egress_section();
+        bad[field] = value;
+        assert!(parse(&bad).is_err(), "{field}");
+    }
+    let mut oversized = profile();
+    oversized["public_egress"] = egress_section();
+    let mut bytes = serde_json::to_vec(&oversized).unwrap();
+    bytes.splice(1..1, std::iter::repeat_n(b' ', 16_384));
+    assert!(VmRuntimeProfile::parse(&bytes).is_err(), "size limit");
 }
 
 fn enrolled_profile(policy: ArtifactPin, binary: EgressBinaryPin) -> VmRuntimeProfile {

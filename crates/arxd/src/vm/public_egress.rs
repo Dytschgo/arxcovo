@@ -577,7 +577,8 @@ pub struct EgressEvidence<'a> {
     /// The policy object held read-only by the supervisor.
     pub policy: Option<&'a CustodiedPolicy>,
     /// The validated runtime profile. Admission reads the enrolled policy
-    /// pin and the patched-binary pin from it, never from loose values.
+    /// pin and the patched-binary pin from it, never from loose values. A
+    /// `VmRuntimeProfile` exists only through `VmRuntimeProfile::parse`.
     pub profile: Option<&'a crate::config::VmRuntimeProfile>,
     pub route: Option<&'a RouteObservation>,
     /// The patched executable object held read-only by the supervisor.
@@ -609,15 +610,17 @@ fn admit_against(
                 .is_some_and(OriginPortLease::verify)
         })
         .ok_or(EgressRefusal::PlanMismatch)?;
-    let policy = evidence.policy.ok_or(EgressRefusal::PolicyMissing)?;
-    // Re-verifies the leaf and the anchor directory through their held
-    // handles, so the exact held spelling still resolves to the held object.
-    policy.verify()?;
+    // Enrollment first: without it no held evidence matters. The profile can
+    // only have been built by `VmRuntimeProfile::parse`.
     let profile = evidence.profile.ok_or(EgressRefusal::Unenrolled)?;
     let (enrolled, binary) = profile
         .public_egress_policy_pin()
         .zip(profile.public_egress_binary())
         .ok_or(EgressRefusal::Unenrolled)?;
+    let policy = evidence.policy.ok_or(EgressRefusal::PolicyMissing)?;
+    // Re-verifies the leaf and the anchor directory through their held
+    // handles, so the exact held spelling still resolves to the held object.
+    policy.verify()?;
     if enrolled != policy.pin()
         || !policy
             .held
