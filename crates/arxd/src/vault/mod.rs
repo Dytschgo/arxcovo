@@ -120,6 +120,8 @@ enum Refusal {
     ScriptLimit,
     VersionLimit,
     ByteLimit,
+    PrincipalVersionLimit,
+    PrincipalByteLimit,
     StateUnavailable,
 }
 
@@ -140,6 +142,8 @@ impl Refusal {
             Self::ScriptLimit => "script_limit",
             Self::VersionLimit => "version_limit",
             Self::ByteLimit => "byte_limit",
+            Self::PrincipalVersionLimit => "principal_version_limit",
+            Self::PrincipalByteLimit => "principal_byte_limit",
             Self::StateUnavailable => "state_unavailable",
         }
     }

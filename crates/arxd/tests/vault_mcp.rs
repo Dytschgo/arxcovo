@@ -8,15 +8,57 @@ use rmcp::{ServiceExt, model::CallToolRequestParams, transport::async_rw::AsyncR
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    sync::Arc,
+    fmt::{self, Write},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{
+    Event, Metadata, Subscriber,
+    field::{Field, Visit},
+    span::{Attributes, Id, Record},
+};
 
 #[path = "vault_fixtures/private.rs"]
 mod private;
 
 type Peer = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+
+#[derive(Default)]
+struct Capture {
+    events: Arc<Mutex<String>>,
+    next_span: AtomicU64,
+}
+
+struct Fields<'a>(&'a mut String);
+
+impl Visit for Fields<'_> {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        writeln!(self.0, "{}={value:?}", field.name()).unwrap();
+    }
+}
+
+impl Subscriber for Capture {
+    fn enabled(&self, _: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn event(&self, event: &Event<'_>) {
+        event.record(&mut Fields(&mut self.events.lock().unwrap()));
+    }
+
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(self.next_span.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+    fn enter(&self, _: &Id) {}
+    fn exit(&self, _: &Id) {}
+}
 
 async fn client(endpoint: &Endpoint, token: &str) -> Peer {
     #[cfg(windows)]
@@ -55,12 +97,32 @@ async fn call(peer: &Peer, tool: &str, args: Value) -> Value {
 
 #[tokio::test]
 async fn vault_mcp_auth_scope_validation_replay_and_declarations() {
-    tokio::time::timeout(Duration::from_secs(5), journey())
+    assert_eq!(
+        tracing::level_filters::STATIC_MAX_LEVEL,
+        tracing::level_filters::LevelFilter::INFO
+    );
+    assert_eq!(log::STATIC_MAX_LEVEL, log::LevelFilter::Info);
+    let capture = Capture::default();
+    let events = capture.events.clone();
+    // The current-thread test runtime drives both peers and all SDK handlers.
+    // This subscriber accepts DEBUG and TRACE if a compiled callsite emits them.
+    let _guard = tracing::subscriber::set_default(capture);
+    let sentinel = format!("exit 0 # fixture-{}", rand::random::<u64>());
+    tokio::time::timeout(Duration::from_secs(5), journey(&sentinel))
         .await
         .unwrap();
+    let events = events.lock().unwrap();
+    assert!(
+        events.contains("Service initialized as server"),
+        "SDK INFO capture is live"
+    );
+    assert!(
+        !events.contains(&sentinel),
+        "SDK tool payload leaked into captured events"
+    );
 }
 
-async fn journey() {
+async fn journey(sentinel: &str) {
     let dir = private::private_dir();
     #[cfg(windows)]
     let endpoint = Endpoint {
@@ -123,11 +185,10 @@ async fn journey() {
         .unwrap()
         .as_millis();
     let key = |n: u64| format!("{now:016x}{n:016x}");
-    let sentinel = format!("exit 0 # fixture-{}", rand::random::<u64>());
     let args = json!({"os":"ubuntu","name":"build","script":sentinel,"request_id":key(1)});
     let version = call(&first, "vault_add_version", args.clone()).await;
     assert_eq!(version["ok"], true);
-    assert!(!version.to_string().contains(&sentinel));
+    assert!(!version.to_string().contains(sentinel));
     assert_eq!(
         call(&first, "vault_add_version", args.clone()).await,
         version
@@ -256,7 +317,7 @@ async fn journey() {
         );
     }
     let audit = call(&first, "list_activity", json!({"source":"vault"})).await;
-    assert!(!audit.to_string().contains(&sentinel));
+    assert!(!audit.to_string().contains(sentinel));
     let entries = audit["activities"].as_array().unwrap();
     assert_eq!(
         entries

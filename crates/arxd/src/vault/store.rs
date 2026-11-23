@@ -8,6 +8,9 @@ use std::{fs, path::Path, sync::Mutex, time::Duration};
 const MAX_SCRIPTS: i64 = 128;
 const MAX_VERSIONS: i64 = 64;
 const MAX_BYTES: i64 = 1024 * 1024;
+// Fewer versions than host-wide script slots also bounds named scripts per owner.
+const MAX_OWNER_VERSIONS: i64 = 96;
+const MAX_OWNER_BYTES: i64 = 256 * 1024;
 const MAX_REPLAY: i64 = 512;
 const MAX_AUDIT: i64 = 256;
 const MAX_PAGES: u64 = 1024;
@@ -299,11 +302,23 @@ impl WriteScope<'_> {
         } else if scalar(db, "SELECT count(*) FROM scripts", [])? >= MAX_SCRIPTS {
             return Ok(Err(Refusal::ScriptLimit));
         }
-        if scalar(db, "SELECT coalesce(sum(length(body)),0) FROM versions", [])?
-            + script.len() as i64
-            > MAX_BYTES
-        {
+        let (total_bytes, owner_versions, owner_bytes): (i64, i64, i64) = db.query_row(
+            "SELECT coalesce(sum(length(v.body)),0),
+                    count(*) FILTER (WHERE s.owner=?1),
+                    coalesce(sum(length(v.body)) FILTER (WHERE s.owner=?1),0)
+             FROM versions v JOIN scripts s ON s.seq=v.script",
+            [self.owner],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let bytes = script.len() as i64;
+        if total_bytes + bytes > MAX_BYTES {
             return Ok(Err(Refusal::ByteLimit));
+        }
+        if owner_versions >= MAX_OWNER_VERSIONS {
+            return Ok(Err(Refusal::PrincipalVersionLimit));
+        }
+        if owner_bytes + bytes > MAX_OWNER_BYTES {
+            return Ok(Err(Refusal::PrincipalByteLimit));
         }
         let seq = match existing {
             Some(seq) => seq,

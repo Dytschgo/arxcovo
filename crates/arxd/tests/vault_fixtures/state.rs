@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use std::fs;
 use std::sync::Mutex;
 
 #[path = "private.rs"]
@@ -271,4 +272,125 @@ fn vault_script_version_and_byte_caps_refuse_without_partial_rows() {
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn vault_owner_caps_keep_capacity_available_to_other_principals() {
+    let dir = private::private_dir();
+    let vault = Vault::open(dir.path(), None, NOW).unwrap();
+    vault
+        .store
+        .write(|db| {
+            db.execute_batch(
+                "
+            INSERT INTO scripts(seq,id,owner,os,name) VALUES
+                (1,randomblob(16),'agent-one','ubuntu','count'),
+                (2,randomblob(16),'agent-one','windows','count'),
+                (3,randomblob(16),'byte-owner','ubuntu','bytes');
+            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<95)
+            INSERT INTO versions(id,script,body,hash,created_ms)
+                SELECT randomblob(16),1+(i-1)/48,x'78',randomblob(32),1 FROM n;
+            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<63)
+            INSERT INTO versions(id,script,body,hash,created_ms)
+                SELECT randomblob(16),3,CAST(printf('%04096d',i) AS BLOB),randomblob(32),1 FROM n;
+        ",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(add(&vault, 1, "count", "x").is_ok());
+    assert_eq!(
+        add(&vault, 2, "refused-script", "x"),
+        Err(Refusal::PrincipalVersionLimit)
+    );
+    let add_as = |principal: &str, nonce: u64, name: &str, content: &str| {
+        vault.mutate(
+            principal,
+            Action::Add,
+            Ok(Write::Add {
+                request_id: key(nonce),
+                os: ScriptOs::Ubuntu,
+                name: name.into(),
+                script: content.into(),
+            }),
+            NOW,
+        )
+    };
+    assert!(add_as("byte-owner", 1, "bytes", &"x".repeat(MAX_SCRIPT)).is_ok());
+    assert_eq!(
+        add_as("byte-owner", 2, "refused-script", "x"),
+        Err(Refusal::PrincipalByteLimit)
+    );
+    assert!(add_as("another", 2, "refused-script", "x").is_ok());
+    vault
+        .store
+        .read(|db| {
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM scripts WHERE name='refused-script'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?,
+                1
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM replay", [], |r| r.get::<_, i64>(0))?,
+                3
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn vault_state_binding_rejects_substituted_main_and_linked_files() {
+    let dir = private::private_dir();
+    drop(Vault::open(dir.path(), None, NOW).unwrap());
+    let original = dir.path().join("vault.sqlite3");
+    let replacement = dir.path().join("replacement.sqlite3");
+    let parked = dir.path().join("parked.sqlite3");
+    fs::copy(&original, &replacement).unwrap();
+    {
+        let alternate = rusqlite::Connection::open(&replacement).unwrap();
+        alternate.pragma_update(None, "user_version", 7).unwrap();
+    }
+    let before = [&original, &replacement].map(|path| fs::read(path).unwrap());
+    let result = files::open_bound(dir.path(), |path| {
+        #[cfg(unix)]
+        {
+            // Restore both names before returning. Path-only checks would miss the swap.
+            fs::rename(path, &parked)?;
+            fs::rename(&replacement, path)?;
+            let opened = rusqlite::Connection::open(path)?;
+            fs::rename(path, &replacement)?;
+            fs::rename(&parked, path)?;
+            Ok(opened)
+        }
+        #[cfg(windows)]
+        {
+            let error = fs::rename(path, &parked).unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+            );
+            Ok(rusqlite::Connection::open(&replacement)?)
+        }
+    });
+    assert_eq!(result.err().unwrap().to_string(), "vault database changed");
+
+    let other_link = dir.path().join("alias.sqlite3");
+    fs::hard_link(&original, &other_link).unwrap();
+    let error = Vault::open(dir.path(), None, NOW).err().unwrap();
+    assert_eq!(error.to_string(), "single-link vault file required");
+    fs::remove_file(other_link).unwrap();
+    let journal_alias = dir.path().join("vault.sqlite3-journal");
+    fs::hard_link(&replacement, &journal_alias).unwrap();
+    let error = Vault::open(dir.path(), None, NOW).err().unwrap();
+    assert_eq!(error.to_string(), "single-link vault file required");
+    fs::remove_file(journal_alias).unwrap();
+    for (path, expected) in [&original, &replacement].into_iter().zip(before) {
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+    assert!(Vault::open(dir.path(), None, NOW).is_ok());
 }

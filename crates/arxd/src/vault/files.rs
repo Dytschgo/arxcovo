@@ -4,6 +4,13 @@ use rusqlite::{Connection, OpenFlags, ffi};
 use std::{fs, path::Path};
 
 pub(super) fn open(dir: &Path) -> Result<(Connection, fs::File, fs::File)> {
+    open_bound(dir, open_sqlite)
+}
+
+pub(super) fn open_bound(
+    dir: &Path,
+    connect: impl FnOnce(&Path) -> Result<Connection>,
+) -> Result<(Connection, fs::File, fs::File)> {
     crate::config::checked_path(dir)?;
     crate::security::private(dir)?;
     ensure!(dir.is_dir(), "vault state directory required");
@@ -24,18 +31,22 @@ pub(super) fn open(dir: &Path) -> Result<(Connection, fs::File, fs::File)> {
         options().write(true).create_new(true).open(&path)?
     };
     verify_path(&file, &path)?;
-    let mut db = Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )?;
+    let mut db = connect(&path)?;
     ensure!(
         sqlite_identity(&mut db)? == identity(&file)?,
         "vault database changed"
     );
     verify_path(&file, &path)?;
     Ok((db, file, lock))
+}
+
+fn open_sqlite(path: &Path) -> Result<Connection> {
+    Ok(Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?)
 }
 
 fn check_file(path: &Path) -> Result<bool> {
@@ -129,7 +140,8 @@ fn windows_identity(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<(u
 }
 
 fn sqlite_identity(db: &mut Connection) -> Result<(u64, u64)> {
-    // ADR 0035 requires the pinned library, native VFS and exact main-file methods.
+    // Match store/vm.rs::sqlite_main_identity, the canonical VM-store binding
+    // under ADR 0035. Keep ABI, native VFS and result checks in sync.
     let handle = unsafe { db.handle() };
     ensure!(
         unsafe {
