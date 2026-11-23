@@ -27,21 +27,30 @@ impl SerialName {
     }
 }
 
-/// Closed network policy of an installed static boot. Only the restricted
-/// loopback origin exists. An owner-enabled outbound policy would be a
-/// separate variant with its own guest route and DNS transition, never a
-/// change to this one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StaticNetwork {
+/// The patched backend's netdev option that names the custodied policy.
+/// Stock QEMU does not know it (ADR 0064).
+pub const PUBLIC_EGRESS_OPTION: &str = "arx-public-egress";
+/// The fixed public-egress user network before its policy and forward.
+pub const PUBLIC_EGRESS_NETWORK: &str =
+    "user,id=arxnet0,restrict=off,ipv4=on,ipv6=off,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3";
+
+/// Closed network policy of an installed static boot. Each variant is a
+/// separate sealed recipe; neither is a change to the other.
+#[derive(Clone, Copy, Debug)]
+pub enum StaticNetwork<'a> {
     /// The fixed restricted user network plus one IPv4 loopback forward to
     /// guest TCP 443.
     RestrictedOrigin,
+    /// ADR 0064: the patched backend's public-only egress policy, named by
+    /// its read-only custodied artifact, plus the same single loopback
+    /// forward. Requires the separately pinned `PublicEgressQemu` image.
+    PublicEgress(&'a Artifact),
 }
 
 #[derive(Clone, Copy)]
 pub enum BootPurpose<'a> {
     Installed,
-    InstalledStaticWeb(&'a OriginPortLease, StaticNetwork),
+    InstalledStaticWeb(&'a OriginPortLease, StaticNetwork<'a>),
     UbuntuInstall {
         iso: &'a Artifact,
         cidata: &'a Artifact,
@@ -91,6 +100,8 @@ pub enum PlanKind {
     Boot,
     /// A standalone static VM with the one reserved IPv4 origin forward.
     StaticWebBoot,
+    /// A static VM on the patched public-only egress backend (ADR 0064).
+    PublicEgressBoot,
     /// A QMP-only installer or finalization recipe.
     InstallerBoot(InstallerPhase),
     /// Read-only qemu-img inspection of the immutable golden image.
@@ -112,6 +123,10 @@ pub struct InstallerArtifact<'a> {
 enum Binding<'a> {
     Boot,
     StaticWeb(&'a OriginPortLease),
+    PublicEgress {
+        lease: &'a OriginPortLease,
+        policy: &'a Artifact,
+    },
     Installer(InstallerPhase, Vec<InstallerArtifact<'a>>),
     Inspect,
     Offline {
@@ -144,6 +159,7 @@ impl<'a> CommandPlan<'a> {
         match self.binding {
             Binding::Boot => PlanKind::Boot,
             Binding::StaticWeb(_) => PlanKind::StaticWebBoot,
+            Binding::PublicEgress { .. } => PlanKind::PublicEgressBoot,
             Binding::Installer(phase, _) => PlanKind::InstallerBoot(phase),
             Binding::Inspect => PlanKind::Inspect,
             Binding::Offline { mutate: false, .. } => PlanKind::InspectWritable,
@@ -153,7 +169,15 @@ impl<'a> CommandPlan<'a> {
 
     pub fn static_origin_lease(&self) -> Option<&OriginPortLease> {
         match &self.binding {
-            Binding::StaticWeb(lease) => Some(lease),
+            Binding::StaticWeb(lease) | Binding::PublicEgress { lease, .. } => Some(lease),
+            _ => None,
+        }
+    }
+
+    /// The custodied policy artifact named in a public-egress plan's argv.
+    pub fn public_egress_policy(&self) -> Option<&'a Artifact> {
+        match self.binding {
+            Binding::PublicEgress { policy, .. } => Some(policy),
             _ => None,
         }
     }
@@ -163,9 +187,11 @@ impl<'a> CommandPlan<'a> {
     pub fn offline_lease(&self) -> Option<&'a OfflineLease> {
         match self.binding {
             Binding::Offline { lease, .. } => Some(lease),
-            Binding::Boot | Binding::StaticWeb(_) | Binding::Installer(..) | Binding::Inspect => {
-                None
-            }
+            Binding::Boot
+            | Binding::StaticWeb(_)
+            | Binding::PublicEgress { .. }
+            | Binding::Installer(..)
+            | Binding::Inspect => None,
         }
     }
 
@@ -337,11 +363,26 @@ impl BootRecipe<'_> {
         if (phase.is_some() || static_origin.is_some()) && self.backing.is_some() {
             return Err(InvalidPath);
         }
-        let network = match static_origin {
-            None => NETWORK.to_owned(),
-            Some((lease, StaticNetwork::RestrictedOrigin)) => format!(
-                "{NETWORK},hostfwd=tcp:127.0.0.1:{}-10.0.2.15:443",
-                lease.port()
+        let (network, image_role, nic) = match static_origin {
+            None => (NETWORK.to_owned(), Qemu, "virtio-net-pci,netdev=arxnet0"),
+            Some((lease, StaticNetwork::RestrictedOrigin)) => (
+                format!(
+                    "{NETWORK},hostfwd=tcp:127.0.0.1:{}-10.0.2.15:443",
+                    lease.port()
+                ),
+                Qemu,
+                "virtio-net-pci,netdev=arxnet0,mac=52:54:00:12:34:56",
+            ),
+            Some((lease, StaticNetwork::PublicEgress(policy))) => (
+                format!(
+                    "{PUBLIC_EGRESS_NETWORK},{PUBLIC_EGRESS_OPTION}={},hostfwd=tcp:127.0.0.1:{}-10.0.2.15:443",
+                    // QEMU keyval doubles a literal comma. `LocalPath` admits
+                    // none today; escaping keeps the contract if that changes.
+                    custodied_policy(policy)?.as_str().replace(',', ",,"),
+                    lease.port()
+                ),
+                PublicEgressQemu,
+                "virtio-net-pci,netdev=arxnet0",
             ),
         };
         let approved = match (self.backing, self.backing_header) {
@@ -353,7 +394,7 @@ impl BootRecipe<'_> {
             _ => return Err(InvalidPath),
         };
         inspect_header(self.disk_header, approved).map_err(|InvalidImage| InvalidPath)?;
-        let image = self.image.path_for(Qemu)?;
+        let image = self.image.path_for(image_role)?;
         let mut args: Vec<String> = [
             "-no-user-config",
             "-nodefaults",
@@ -373,11 +414,7 @@ impl BootRecipe<'_> {
             "-netdev",
             &network,
             "-device",
-            if static_origin.is_some() {
-                "virtio-net-pci,netdev=arxnet0,mac=52:54:00:12:34:56"
-            } else {
-                "virtio-net-pci,netdev=arxnet0"
-            },
+            nic,
             "-device",
             "virtio-serial-pci,id=arxserial",
             "-device",
@@ -445,7 +482,13 @@ impl BootRecipe<'_> {
             Some(self.backing.map_or(Value::Null, |_| json!("golden"))),
         );
         let binding = match phase {
-            None => static_origin.map_or(Binding::Boot, |(lease, _)| Binding::StaticWeb(lease)),
+            None => match static_origin {
+                None => Binding::Boot,
+                Some((lease, StaticNetwork::RestrictedOrigin)) => Binding::StaticWeb(lease),
+                Some((lease, StaticNetwork::PublicEgress(policy))) => {
+                    Binding::PublicEgress { lease, policy }
+                }
+            },
             Some(phase) => {
                 let mut artifacts = Vec::new();
                 for (artifact, role) in [
@@ -520,6 +563,18 @@ impl BootRecipe<'_> {
         }
         Ok(())
     }
+}
+
+/// The policy must be a custodied, pinned, bounded read-only artifact.
+fn custodied_policy(policy: &Artifact) -> Result<&LocalPath, InvalidPath> {
+    let path = policy.path_for(ArtifactRole::PublicEgressPolicy)?;
+    let pinned = policy
+        .pin()
+        .is_some_and(|pin| (1..=super::public_egress::MAX_POLICY_BYTES).contains(&pin.size));
+    if policy.identity().is_none() || !pinned {
+        return Err(InvalidPath);
+    }
+    Ok(path)
 }
 
 fn bind<'a>(

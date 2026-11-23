@@ -523,3 +523,72 @@ probe to authenticate the static generation's origin. A port conflict or
 unrelated listener cannot establish readiness. The port, private identity
 and raw probe response never enter MCP. Native behavior is **unverified on
 real hardware**. See [ADR 0063](0063-vm-store-v9-forward-only.md) for storage.
+
+## Amendment 2026-11-23 — Public-only egress variant for the static VM (ADR 0064 E1b)
+
+[ADR 0064](0064-v1-scope-docker-static-vm.md) adds a second sealed network
+for an installed static boot, `StaticNetwork::PublicEgress`, beside the
+restricted origin above. It names its read-only custodied policy artifact
+and seals a distinct plan kind, `PublicEgressBoot`. Its netdev is exactly
+`user,id=arxnet0,restrict=off,ipv4=on,ipv6=off,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,arx-public-egress=<custodied-policy>,hostfwd=tcp:127.0.0.1:<leased-port>-10.0.2.15:443`,
+followed by `-device virtio-net-pci,netdev=arxnet0`. The policy path is
+passed as a QEMU keyval string, with any comma doubled. The port is the A2
+supervisor lease from the fixed 49152–49215 range. The restricted origin,
+TEST boots and installer purposes keep their settled argv byte for byte.
+
+`arx-public-egress` exists only in the separately pinned patched
+QEMU/libslirp build from E1a. The plan requires a distinct
+`PublicEgressQemu` artifact role, so the stock `Qemu` image cannot run it
+and the patched image cannot run any other recipe. The candidate profile
+may carry an optional `public_egress` section with manifest
+`qemu-11.1.3-arx-public-egress-windows-x64`, the pins of the console
+executable and its receipt, and the policy artifact's pin. The patched
+build links libslirp statically, so it has no DLL slot. The section never
+replaces the stock `manifest`, which TEST VMs keep. A configured pin is
+not a qualified pin. Qualification requires the receipt digest to appear
+in the compiled reviewed list, which stays empty until the E1a source,
+build and native receipt are independently reviewed. Any pin that names
+the reviewed stock 11.1.3 executable or receipt is refused.
+
+The policy artifact follows the E1a policy v1 contract. It is at most
+32 KiB of printable ASCII with LF line endings and a final LF, and has no
+spaces or blank lines. The fields appear in this order: `version=1`,
+`interface_index`, `interface_luid` (nonzero canonical decimals), `source`,
+`gateway` (canonical IPv4), zero to 512 distinct `deny=` CIDRs with
+prefixes 1–32 and clear host bits, and `fingerprint`. The fingerprint is
+the lowercase SHA-256 of every preceding byte. The compiled
+special-purpose table and the synthetic subnet always apply in addition
+to the `deny=` lines. The table covers 0/8, 10/8, 100.64/10, 127/8,
+169.254/16, 172.16/12, 192.0.0/24, the documentation, benchmarking and
+6to4 relay ranges, 192.168/16, multicast, reserved and broadcast.
+Admission is stricter than the backend: the enrolled source and gateway
+must already lie in the deny union. The in-file digest checks integrity
+only. The supervisor authenticates the whole file by its pin.
+
+Custody opens the policy read-only under an anchored private directory:
+0700/0600 on POSIX, a TokenUser owner and a protected owner-only DACL on
+Windows. It refuses links, reparse points, extra hard links and unsafe
+leaf names. It reads the bytes through the held handle, verifies the pin
+over exactly those bytes, and re-verifies that the name still denotes the
+held object. Windows holds the file without write or delete sharing and
+the directory without delete sharing.
+
+Admission refuses with a typed `EgressRefusal` when evidence is missing or
+mismatched. That covers the plan or its lease, the policy's presence,
+custody, grammar, completeness, fingerprint or pin, a route other than
+the enrolled default uplink (index, LUID, source and gateway), and a
+patched binary that is missing, stock, unqualified or measured with
+different bytes. Every such refusal maps to the existing
+`NetworkFenceUnverified`, so the MCP refusal vocabulary is unchanged. The
+reference matcher mirrors the backend's checks for tests. It allows only
+TCP and UDP. It drops the synthetic subnet, including the 10.0.2.2 and
+10.0.2.3 aliases, before translation, and checks the deny union both
+before translation and on the final socket destination. The single
+loopback forward is host-initiated only. A guest-initiated flow to the
+forward peer is refused.
+
+Admission success is a portable check only. The Windows launcher refuses
+`PublicEgressBoot` with `NetworkFenceUnverified`, as it refuses
+`StaticWebBoot`, and `LaunchAuthority` stays uninhabited. The patched
+build, Windows route and socket behavior, policy custody on the owner
+host and real egress are **unverified on real hardware**.

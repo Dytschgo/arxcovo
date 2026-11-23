@@ -21,12 +21,73 @@ pub struct VmRuntimeProfile {
     state: String,
     disk_ceiling_bytes: u64,
     manifest: VmManifest,
+    #[serde(default, deserialize_with = "present")]
+    public_egress: Option<Box<PublicEgressProfile>>,
 }
 
 #[derive(Deserialize)]
 enum VmManifest {
     #[serde(rename = "qemu-11.1.3-windows-x64")]
     Qemu1113WindowsX64,
+}
+
+/// ADR 0064: the separately pinned patched QEMU/libslirp manifest for a
+/// public-egress static boot, plus the enrolled policy artifact's pin. It
+/// never replaces the stock `manifest`, which TEST VMs keep. Admission still
+/// refuses these pins until a reviewed receipt qualifies them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicEgressProfile {
+    manifest: EgressManifest,
+    /// The console executable, which statically links patched libslirp.
+    qemu: PinSpec,
+    receipt: PinSpec,
+    policy: PinSpec,
+}
+
+#[derive(Deserialize)]
+enum EgressManifest {
+    #[serde(rename = "qemu-11.1.3-arx-public-egress-windows-x64")]
+    Qemu1113PublicEgressWindowsX64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinSpec {
+    length: u64,
+    sha256: String,
+}
+
+impl PinSpec {
+    fn pin(&self, limit: u64) -> Option<crate::vm::paths::ArtifactPin> {
+        let mut sha256 = [0; 32];
+        (self.sha256.len() == 64
+            && self
+                .sha256
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            && (1..=limit).contains(&self.length)
+            && hex::decode_to_slice(&self.sha256, &mut sha256).is_ok())
+        .then_some(crate::vm::paths::ArtifactPin {
+            size: self.length,
+            sha256,
+        })
+    }
+}
+
+impl PublicEgressProfile {
+    fn binary(&self) -> Option<crate::vm::public_egress::EgressBinaryPin> {
+        const EXECUTABLE_LIMIT: u64 = 512 * 1024 * 1024;
+        const RECEIPT_LIMIT: u64 = 1024 * 1024;
+        Some(crate::vm::public_egress::EgressBinaryPin {
+            qemu: self.qemu.pin(EXECUTABLE_LIMIT)?,
+            receipt: self.receipt.pin(RECEIPT_LIMIT)?,
+        })
+    }
+
+    fn policy(&self) -> Option<crate::vm::paths::ArtifactPin> {
+        self.policy.pin(crate::vm::public_egress::MAX_POLICY_BYTES)
+    }
 }
 
 #[derive(Debug)]
@@ -46,6 +107,13 @@ impl VmRuntimeProfile {
             bail!("VM profile too large");
         }
         let profile: Self = serde_json::from_slice(bytes).map_err(|_| InvalidVmProfile)?;
+        if profile
+            .public_egress
+            .as_ref()
+            .is_some_and(|egress| egress.binary().is_none() || egress.policy().is_none())
+        {
+            bail!(InvalidVmProfile);
+        }
         profile.validate_paths()?;
         Ok(profile)
     }
@@ -80,6 +148,28 @@ impl VmRuntimeProfile {
         match self.manifest {
             VmManifest::Qemu1113WindowsX64 => "qemu-11.1.3-windows-x64",
         }
+    }
+
+    /// The patched build's manifest identifier, when one is configured.
+    pub fn public_egress_manifest_id(&self) -> Option<&'static str> {
+        self.public_egress
+            .as_ref()
+            .map(|egress| match egress.manifest {
+                EgressManifest::Qemu1113PublicEgressWindowsX64 => {
+                    crate::vm::public_egress::EGRESS_MANIFEST
+                }
+            })
+    }
+
+    /// The configured patched-binary pin. Present is not qualified: admission
+    /// still requires a reviewed receipt.
+    pub fn public_egress_binary(&self) -> Option<crate::vm::public_egress::EgressBinaryPin> {
+        self.public_egress.as_ref()?.binary()
+    }
+
+    /// The enrolled policy artifact's pin.
+    pub fn public_egress_policy_pin(&self) -> Option<crate::vm::paths::ArtifactPin> {
+        self.public_egress.as_ref()?.policy()
     }
 }
 
