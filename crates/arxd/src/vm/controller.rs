@@ -1177,3 +1177,317 @@ fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Tar
         _ => Ok(Err(Refusal::Busy)),
     }
 }
+
+pub(crate) struct CatalogEntry {
+    pub kind: u8,
+    pub id: Id,
+    pub recipe: Option<String>,
+}
+
+pub(crate) struct ActivityReceipt {
+    pub id: i64,
+    pub action: i64,
+    pub state: i64,
+    pub reason: Option<i64>,
+    pub vm: Option<Id>,
+    pub operation: Option<Id>,
+    pub started_ms: i64,
+    pub finished_ms: Option<i64>,
+    pub cleanup: Option<bool>,
+}
+
+impl<C: Clock> VmController<C> {
+    pub(crate) fn foreground_catalog(
+        &self,
+        principal: &str,
+        recipe: Option<Id>,
+        after: (u8, Id),
+        limit: u32,
+    ) -> Result<Vec<CatalogEntry>> {
+        self.store.transact(|db| {
+            let mut query = db.prepare(
+                "SELECT kind,id,recipe FROM (
+                   SELECT 1 AS kind, ?1 AS id, NULL AS recipe WHERE ?1 IS NOT NULL
+                   UNION ALL
+                   SELECT 2, b.template_id, b.recipe_id FROM vm_build_intents b
+                     WHERE b.state='sealed'
+                   UNION ALL
+                   SELECT 3, b.operation_id, b.recipe_id FROM vm_build_intents b
+                     JOIN vm_operations o USING(operation_id)
+                     WHERE o.principal=?2 AND b.state='pending' AND o.status=0
+                 ) WHERE (kind,id)>(?3,?4) ORDER BY kind,id LIMIT ?5",
+            )?;
+            let rows =
+                query.query_map(params![recipe, principal, after.0, after.1, limit], |row| {
+                    Ok(CatalogEntry {
+                        kind: row.get(0)?,
+                        id: row.get(1)?,
+                        recipe: row.get(2)?,
+                    })
+                })?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    pub(crate) fn foreground_activity(
+        &self,
+        principal: &str,
+        before: Option<i64>,
+        exact: Option<i64>,
+        limit: u8,
+    ) -> Result<Vec<ActivityReceipt>> {
+        self.store.transact(|db| {
+            let mut query = db.prepare(
+                "SELECT a.id,a.action,a.status,a.reason,a.vm,o.operation_id,
+                        a.started_ms,a.finished_ms,a.cleanup_confirmed
+                   FROM activity a LEFT JOIN vm_operations o ON o.activity_id=a.id
+                   WHERE a.principal=?1 AND a.actor='agent'
+                     AND (?2 IS NULL OR a.id<?2) AND (?3 IS NULL OR a.id=?3)
+                   ORDER BY a.id DESC LIMIT ?4",
+            )?;
+            let rows = query.query_map(params![principal, before, exact, limit], |row| {
+                Ok(ActivityReceipt {
+                    id: row.get(0)?,
+                    action: row.get(1)?,
+                    state: row.get(2)?,
+                    reason: row.get(3)?,
+                    vm: row.get(4)?,
+                    operation: row.get(5)?,
+                    started_ms: row.get(6)?,
+                    finished_ms: row.get(7)?,
+                    cleanup: row.get(8)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// Check a validated replay before any native decision or fixture lookup.
+    /// All callers serialize fresh admission, cancellation and this check in
+    /// the foreground supervisor gate. The eventual admission checks it again.
+    ///
+    /// This is a transactional write seam, not a read: `Binding::replay` can
+    /// advance the persisted UTC replay high-water mark and prune expired
+    /// ledger entries in the same transaction.
+    pub(crate) fn foreground_replay(
+        &self,
+        principal: &str,
+        key: RequestId,
+        subject: Subject<'_>,
+        action: i64,
+    ) -> Result<Result<Option<store::Replay>, Refusal>> {
+        // Only closed admission preempts replay here. Custody uncertainty is
+        // decided by the eventual admission after scope and subject checks.
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        let closed = gate.closed;
+        let binding = store::Binding {
+            principal,
+            key,
+            subject,
+            action,
+        };
+        map_full(
+            self.store
+                .transact(|db| binding.replay(db, utc(self.clock.now())?, closed)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn foreground_operation_ref(&self, principal: &str, receipt: i64) -> Result<Id> {
+        self.store.transact(|db| {
+            Ok(db.query_row(
+                "SELECT operation_id FROM vm_operations WHERE activity_id=?1 AND principal=?2",
+                params![receipt, principal],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    /// Use the existing bounded v6 audit vocabulary and only correlate an ID
+    /// after the same transaction proves caller ownership.
+    ///
+    /// This is a bounded, audit-only write: at most one refusal row (with its
+    /// audit pruning) after the headroom check, and no operation, ledger or
+    /// VM state change.
+    pub(crate) fn foreground_refusal(
+        &self,
+        principal: &str,
+        action: i64,
+        vm: Option<Id>,
+        reason: Refusal,
+    ) -> Result<Result<(), Refusal>> {
+        map_full(self.store.transact(|db| {
+            store::require_headroom(db)?;
+            let now = utc(self.clock.now())?;
+            let vm = if let Some(vm) = vm {
+                (owned_vm(db, principal, vm)?.is_some()
+                    || store::expired_status(db, principal, vm)?.is_some())
+                .then_some(vm)
+            } else {
+                None
+            };
+            if action == BUILD_ACTION || vm.is_some() {
+                store::refusal_for(db, principal, vm, action, now, reason)?;
+            }
+            Ok(Ok(()))
+        }))
+    }
+
+    /// Read-only scope and subject-state check in the same order as fresh
+    /// admission, so a foreground refusal never reports native eligibility
+    /// before an unknown, foreign, expired or busy subject.
+    pub(crate) fn foreground_precheck(
+        &self,
+        principal: &str,
+        subject: ForegroundSubject,
+    ) -> Result<Result<(), Precheck>> {
+        if validate_principal(principal).is_err() {
+            return Ok(Err(Precheck::Refused(Refusal::NotFound)));
+        }
+        Ok(self
+            .precheck_inner(principal, subject)?
+            .map_err(|reason| match reason {
+                PrecheckInner::Offline => Precheck::NotReady,
+                PrecheckInner::Refused(reason) => Precheck::Refused(reason),
+            }))
+    }
+
+    fn precheck_inner(
+        &self,
+        principal: &str,
+        subject: ForegroundSubject,
+    ) -> Result<Result<(), PrecheckInner>> {
+        let refused = |result: Result<(), Refusal>| result.map_err(PrecheckInner::Refused);
+        self.store.transact(|db| {
+            let now = utc(self.clock.now())?;
+            let operation = match subject {
+                ForegroundSubject::Template(template) => {
+                    let sealed = store::count(
+                        db,
+                        "SELECT EXISTS(SELECT 1 FROM vm_templates WHERE id=?1)",
+                        [template],
+                    )? != 0;
+                    return Ok(refused(if sealed {
+                        Ok(())
+                    } else {
+                        Err(Refusal::NotFound)
+                    }));
+                }
+                ForegroundSubject::Extend(vm) => {
+                    return Ok(refused(match owned_vm(db, principal, vm)? {
+                        None if store::expired_status(db, principal, vm)?.is_some() => {
+                            Err(Refusal::Expired)
+                        }
+                        None => Err(Refusal::NotFound),
+                        Some(lease) => lease.check(now),
+                    }));
+                }
+                ForegroundSubject::Start(_) => Operation::Start,
+                ForegroundSubject::Stop(_) => Operation::Stop,
+                ForegroundSubject::Script(_) => Operation::Script {
+                    script: "",
+                    timeout_seconds: 0,
+                },
+            };
+            let vm = subject.vm();
+            match owned_vm(db, principal, vm)? {
+                None if store::expired_status(db, principal, vm)?.is_some() => {
+                    return Ok(Err(PrecheckInner::Refused(Refusal::Expired)));
+                }
+                // A live, owned generation that is not running has no channel.
+                Some(lease)
+                    if lease.check(now).is_ok()
+                        && lease.state != 2
+                        && matches!(subject, ForegroundSubject::Script(_)) =>
+                {
+                    return Ok(Err(PrecheckInner::Offline));
+                }
+                _ => {}
+            }
+            let request = Request {
+                principal,
+                request_id: RequestId {
+                    key: [0; 16],
+                    issued_at_ms: 0,
+                },
+                vm,
+                disk: DiskClaim::default(),
+                operation,
+            };
+            Ok(refused(target(db, &request, now)?.map(|_| ())))
+        })
+    }
+
+    /// One snapshot of up to `limit` caller-owned rows, so the foreground can
+    /// ask for a look-ahead row without a second transaction.
+    pub(crate) fn foreground_list(
+        &self,
+        principal: &str,
+        after: Option<Id>,
+        limit: u32,
+    ) -> Result<Result<Vec<VmStatus>, Refusal>> {
+        if validate_principal(principal).is_err() || !(1..=21).contains(&limit) {
+            return Ok(Err(Refusal::Invalid));
+        }
+        self.store.transact(|db| {
+            Ok(Ok(store::vm_status_rows(
+                db,
+                principal,
+                None,
+                after,
+                limit,
+                utc(self.clock.now())?,
+            )?))
+        })
+    }
+}
+
+impl<C: Clock> VmController<C> {
+    /// Whether the last reaper turn left custody or accounting unresolved.
+    /// The foreground reports an unresolved final drain from this flag.
+    pub(crate) fn foreground_custody_uncertain(&self) -> Result<bool> {
+        Ok(self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?
+            .custody_uncertain)
+    }
+}
+
+/// Why a foreground mutation cannot proceed before eligibility is checked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Precheck {
+    Refused(Refusal),
+    /// A script names an owned live VM that has no running boot.
+    NotReady,
+}
+
+enum PrecheckInner {
+    Refused(Refusal),
+    Offline,
+}
+
+/// The subject a foreground mutation names, for [`VmController::foreground_precheck`].
+#[derive(Clone, Copy)]
+pub(crate) enum ForegroundSubject {
+    Template(Id),
+    Start(Id),
+    Stop(Id),
+    Script(Id),
+    Extend(Id),
+}
+
+impl ForegroundSubject {
+    fn vm(self) -> Id {
+        match self {
+            Self::Template(id)
+            | Self::Start(id)
+            | Self::Stop(id)
+            | Self::Script(id)
+            | Self::Extend(id) => id,
+        }
+    }
+}
