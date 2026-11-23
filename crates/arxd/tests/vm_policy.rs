@@ -851,8 +851,12 @@ fn restart_retains_expiry_and_staging_cleanup_intents_without_replay() {
     drop(controller);
     let controller = VmController::open(dir.path(), VmPolicy::default(), clock).unwrap();
     assert_eq!(controller.expiry_intents().unwrap(), [claim]);
-    let [new_claim]: [ExpiryClaim; 1] = controller.claim_expired().unwrap().try_into().unwrap();
-    assert_eq!(new_claim.vm, creating);
+    assert!(controller.claim_expired().unwrap().is_empty());
+    assert!(
+        controller
+            .sweep_once(&runtime::CandidateRuntime::new(None))
+            .unwrap()
+    );
     assert_eq!(
         scalar(dir.path(), "SELECT sum(staging) FROM vm_disk_claims"),
         MIB as i64
@@ -864,10 +868,17 @@ fn restart_retains_expiry_and_staging_cleanup_intents_without_replay() {
             ..
         })
     ));
-    controller
-        .finish_expiry(new_claim, CleanupResult::Confirmed)
-        .unwrap();
-    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM vm_disk_claims"), 1);
+    assert_eq!(controller.expiry_intents().unwrap(), [claim]);
+    assert_eq!(controller.expired_status("alice", creating).unwrap(), None);
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM vm_disk_claims"), 2);
+    assert_eq!(
+        scalar(
+            dir.path(),
+            "SELECT count(*) FROM activity WHERE action=10 AND
+        principal='arxd' AND vm_owner='alice' AND cleanup_confirmed=0"
+        ),
+        1
+    );
 }
 
 #[test]
@@ -1122,7 +1133,17 @@ fn shutdown_is_durable_and_blocks_dispatch_after_lookup() {
     let f = Fixture::sealed();
     f.running();
     let pending = admitted(f.admit(script(VM, 101, "interrupted")));
-    f.controller.shutdown().unwrap();
+    assert!(f.controller.recover_after_drain().is_err());
+    f.controller.close_admission().unwrap();
+    assert!(matches!(
+        f.admit(script(VM, 101, "retry during drain")),
+        Admission::Existing(Receipt {
+            status: Status::Pending,
+            ..
+        })
+    ));
+    assert!(f.controller.recovery_intents().unwrap().is_empty());
+    f.controller.recover_after_drain().unwrap();
     assert!(matches!(
         f.admit(script(VM, 101, "retry")),
         Admission::Existing(Receipt {

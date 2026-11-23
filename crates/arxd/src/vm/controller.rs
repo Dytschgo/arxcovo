@@ -1,14 +1,22 @@
-use super::{model::*, policy::*};
-use crate::store::{
-    validate_principal,
-    vm::{self as store, VmStore},
+use super::{
+    model::*,
+    policy::*,
+    reaper::{self, ArtifactCustody, ClosedCustody, ReaperTick, Sweeps},
+    runtime::{CandidateRuntime, ReaperRuntime},
+};
+use crate::{
+    service::Shutdown,
+    store::{
+        validate_principal,
+        vm::{self as store, VmStore},
+    },
 };
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::{
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, TryLockError},
     time::Duration,
 };
 
@@ -18,8 +26,21 @@ pub struct VmController<C> {
     store: VmStore,
     policy: VmPolicy,
     clock: C,
-    closed: Mutex<bool>,
+    gate: Mutex<AdmissionGate>,
+    sweeps: Mutex<Sweeps>,
     worker_binding: Arc<()>,
+}
+
+#[derive(Default)]
+struct AdmissionGate {
+    closed: bool,
+    custody_uncertain: bool,
+}
+
+impl AdmissionGate {
+    fn rejects_fresh(&self) -> bool {
+        self.closed || self.custody_uncertain
+    }
 }
 
 impl<C: Clock> VmController<C> {
@@ -29,7 +50,8 @@ impl<C: Clock> VmController<C> {
             store,
             policy,
             clock,
-            closed: Mutex::new(false),
+            gate: Mutex::default(),
+            sweeps: Mutex::default(),
             worker_binding: Arc::new(()),
         })
     }
@@ -44,7 +66,7 @@ impl<C: Clock> VmController<C> {
             return Ok(Admission::Refused(Refusal::Invalid));
         }
         let closed = self
-            .closed
+            .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
         let result = self.store.transact(|db| {
@@ -52,7 +74,7 @@ impl<C: Clock> VmController<C> {
             let now = utc(clock)?;
             let action = request.operation.action();
 
-            let decision = self.admit_inner(db, &request, host, resources, clock, *closed)?;
+            let decision = self.admit_inner(db, &request, host, resources, clock, &closed)?;
             if let Admission::Refused(reason) = decision {
                 store::refusal(db, request.principal, request.vm, action, now, reason)?;
             }
@@ -71,7 +93,7 @@ impl<C: Clock> VmController<C> {
         host: HostObservation,
         resources: Resources,
         clock: ClockReading,
-        closed: bool,
+        gate: &AdmissionGate,
     ) -> Result<Admission> {
         let now = clock.utc_ms;
         let action = request.operation.action();
@@ -81,10 +103,18 @@ impl<C: Clock> VmController<C> {
             subject: Subject::Vm(request.vm),
             action: action as i64,
         };
-        match binding.replay(db, now, closed)? {
+        match binding.replay(db, now, gate.closed)? {
             Ok(Some(prior)) => return Ok(Admission::Existing(prior.operation.receipt)),
             Err(reason) => return Ok(Admission::Refused(reason)),
             Ok(None) => {}
+        }
+        if gate.custody_uncertain && action != Action::Stop {
+            if action != Action::Clone
+                && let Err(reason) = target(db, request, now)?
+            {
+                return Ok(Admission::Refused(reason));
+            }
+            return Ok(Admission::Refused(Refusal::Shutdown));
         }
         if store::count(db, "SELECT count(*) FROM vm_operations WHERE status=0", [])?
             >= store::MAX_CALLER_PENDING
@@ -252,7 +282,7 @@ impl<C: Clock> VmController<C> {
             return Ok(Err(Refusal::Invalid));
         }
         let closed = self
-            .closed
+            .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
         map_full(self.store.transact(|db| {
@@ -269,7 +299,7 @@ impl<C: Clock> VmController<C> {
                 request,
                 &binding,
                 clock,
-                *closed,
+                closed.rejects_fresh(),
                 host,
                 resources,
                 verify_sealed,
@@ -408,7 +438,7 @@ impl<C: Clock> VmController<C> {
             .finalize()
             .into();
         let closed = self
-            .closed
+            .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
         map_full(self.store.transact(|db| {
@@ -420,7 +450,7 @@ impl<C: Clock> VmController<C> {
                 subject: Subject::Template(template, digest),
                 action: Action::Clone as i64,
             };
-            match binding.replay(db, now, *closed)? {
+            match binding.replay(db, now, closed.rejects_fresh())? {
                     Ok(Some(prior)) => return Ok(Ok(CloneAdmission::Existing(prior.operation))),
                     Err(reason) => return Ok(Err(reason)),
                     Ok(None) => {}
@@ -578,10 +608,10 @@ impl<C: Clock> VmController<C> {
         resources: Resources,
     ) -> Result<Result<(), Refusal>> {
         let closed = self
-            .closed
+            .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
-        if *closed {
+        if closed.rejects_fresh() {
             return Ok(Err(Refusal::Shutdown));
         }
         let result = self.store.transact(|db| {
@@ -639,7 +669,7 @@ impl<C: Clock> VmController<C> {
         seconds: u64,
     ) -> Result<Result<i64, Refusal>> {
         let closed = self
-            .closed
+            .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
         if validate_principal(principal).is_err() {
@@ -653,7 +683,7 @@ impl<C: Clock> VmController<C> {
                 key: request_id,
                 action: Action::Extend as i64,
             };
-            match binding.replay(db, now, *closed)? {
+            match binding.replay(db, now, closed.closed)? {
                 Ok(Some(prior)) => {
                     ensure!(
                         prior.operation.receipt.status == Status::Succeeded,
@@ -681,6 +711,7 @@ impl<C: Clock> VmController<C> {
                 (Some((state, expires)), _) if state == 4 || expires <= now => {
                     Err(Refusal::Expired)
                 }
+                (Some(_), _) if closed.custody_uncertain => Err(Refusal::Shutdown),
                 (Some((_, expires)), Ok(end)) if end < expires => Err(Refusal::Invalid),
                 (Some(_), Ok(end)) => {
                     db.execute(
@@ -714,15 +745,14 @@ impl<C: Clock> VmController<C> {
         self.store.transact(|db| store::expiry_intents(db))
     }
 
-    /// A caller may settle a teardown only after proving owned workers are
-    /// stopped and every attributable artifact was removed.
+    /// Legacy metadata settlement. Durable artifacts require reaper custody.
     pub fn finish_expiry(&self, claim: ExpiryClaim, result: CleanupResult) -> Result<()> {
         self.store.transact(|db| {
             let now = utc(self.clock.now())?;
             let current: Option<i64> = db
                 .query_row(
                     "SELECT cleanup_id FROM vm_instances
-                WHERE id=?1 AND state=4 AND cleanup_id IS NOT NULL",
+                WHERE id=?1 AND cleanup_route='lease' AND cleanup_id IS NOT NULL",
                     [claim.vm],
                     |row| row.get(0),
                 )
@@ -735,16 +765,8 @@ impl<C: Clock> VmController<C> {
                 )?;
                 return Ok(());
             }
-            let pending: Option<i64> = db
-                .query_row(
-                    "SELECT id FROM activity WHERE vm=?1 AND status=0 AND action<=6",
-                    [claim.vm],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(id) = pending {
-                store::finish(db, id, Status::Interrupted, now, Some(true))?;
-            }
+            Self::require_legacy_cleanup(db, claim.vm)?;
+            store::interrupt_pending(db, claim.vm, now, true)?;
             store::record_expired(db, claim, now)
         })
     }
@@ -774,32 +796,139 @@ impl<C: Clock> VmController<C> {
                     params![vm, claim.activity_id])? == 1, "invalid recovery intent");
                 return Ok(());
             }
-            ensure!(
-                db.execute(
-                    "UPDATE vm_instances SET state=1,cleanup_id=NULL
-                     WHERE id=?1 AND state=3 AND cleanup_id=?2",
-                    params![vm, claim.activity_id]
-                )? == 1,
-                "invalid recovery intent"
-            );
-            db.execute("DELETE FROM vm_snapshots WHERE vm=?1 AND ready=0", [vm])?;
-            db.execute(
-                "DELETE FROM vm_disk_claims WHERE vm=?1 AND persistent=0",
-                [vm],
-            )?;
-            db.execute("UPDATE vm_disk_claims SET staging=0 WHERE vm=?1", [vm])?;
-            store::finish(db, claim.activity_id, Status::Succeeded, now, Some(true))
+            Self::require_legacy_cleanup(db, vm)?;
+            store::record_recovered(db, claim, now)
         })
     }
 
-    /// Close admission and reconcile pending work in the same lock order used
-    /// by admission. Cleanup intents survive process shutdown.
-    pub fn shutdown(&self) -> Result<()> {
-        let mut closed = self
-            .closed
+    fn require_legacy_cleanup(db: &Connection, vm: Id) -> Result<()> {
+        ensure!(
+            store::count(
+                db,
+                "SELECT count(*) FROM vm_generations WHERE vm_id=?1",
+                [vm]
+            )? == 0,
+            "durable VM cleanup requires custody"
+        );
+        Ok(())
+    }
+
+    /// Run once after open, under the store's supervisor lock, before the
+    /// foreground exposes tools. Returns false if another sweep is in flight.
+    pub fn sweep_once(&self, runtime: &CandidateRuntime<'_>) -> Result<bool> {
+        self.sweep_with(runtime, &ClosedCustody)
+    }
+
+    /// Run periodic turns after the startup sweep. The caller owns the task
+    /// and joins it during drain. UTC is sampled inside each claim transaction.
+    pub async fn run_reaper(
+        &self,
+        runtime: &CandidateRuntime<'_>,
+        ticks: &mut impl ReaperTick,
+        shutdown: &Shutdown,
+    ) -> Result<()> {
+        self.run_reaper_with(runtime, &ClosedCustody, ticks, shutdown)
+            .await
+    }
+
+    pub(crate) async fn run_reaper_with(
+        &self,
+        runtime: &(impl ReaperRuntime + Sync),
+        custody: &(impl ArtifactCustody + Sync),
+        ticks: &mut impl ReaperTick,
+        shutdown: &Shutdown,
+    ) -> Result<()> {
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return Ok(()),
+                more = ticks.next_tick() => {
+                    if !more {
+                        return Ok(());
+                    }
+                    self.sweep_with(runtime, custody)?;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn sweep_with(
+        &self,
+        runtime: &impl ReaperRuntime,
+        custody: &impl ArtifactCustody,
+    ) -> Result<bool> {
+        let mut sweeps = match self.sweeps.try_lock() {
+            Ok(sweeps) => sweeps,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => anyhow::bail!("VM reaper unavailable"),
+        };
+        let (items, mut uncertain) = {
+            let mut gate = self
+                .gate
+                .lock()
+                .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+            gate.custody_uncertain = true;
+            self.store.transact(|db| {
+                let now = utc(self.clock.now())?;
+                store::claim_staging(db, now)?;
+                store::expiry_claims(db, now)?;
+                let items = store::cleanup_kinds(db)?
+                    .into_iter()
+                    .map(|kind| store::cleanup_work(db, kind))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                Ok((items, store::legacy_cleanup_uncertain(db)?))
+            })?
+        };
+        sweeps.retain(&items);
+        for work in items {
+            if !sweeps.due(work.kind, self.clock.now().monotonic) {
+                uncertain = true;
+                continue;
+            }
+            let proved = reaper::reconcile(&work, runtime, custody, || self.clock.now().monotonic);
+            let confirmed = self
+                .store
+                .transact(|db| store::settle_cleanup(db, &work, utc(self.clock.now())?, proved))?;
+            uncertain |= !confirmed;
+            sweeps.settle(work.kind, self.clock.now().monotonic, confirmed);
+        }
+        self.gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?
+            .custody_uncertain = uncertain;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reaper_test_store(&self) -> &VmStore {
+        &self.store
+    }
+
+    /// Seal fresh admission while letting workers settle and callers replay.
+    pub fn close_admission(&self) -> Result<()> {
+        let mut gate = self
+            .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
-        *closed = true;
+        gate.closed = true;
+        Ok(())
+    }
+
+    /// Called after the supervisor has joined the runner and drained workers.
+    /// Mark residual metadata interrupted without invalidating a live worker.
+    pub fn recover_after_drain(&self) -> Result<()> {
+        let _sweep = self
+            .sweeps
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM reaper unavailable"))?;
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        ensure!(gate.closed, "close VM admission before recovery");
         self.store
             .transact(|db| store::recover(db, utc(self.clock.now())?))
     }

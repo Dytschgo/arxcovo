@@ -7,6 +7,8 @@ use crate::vm::{
     Action, ArtifactEvidence, ArtifactSlot, BuildRequest, BuildSlots, Completion, ExpiredVm,
     ExpiryClaim, Guest, Id, OperationRef, OperationStatus, PairSlots, RETRY_WINDOW_MS, Receipt,
     RecoveryClaim, Refusal, RequestId, ScriptResult, Status, Subject, VmStatus,
+    paths::FileIdentity,
+    reaper::{CleanupArtifact, CleanupKind, CleanupWork},
 };
 use anyhow::{Result, ensure};
 use rusqlite::{
@@ -748,7 +750,9 @@ fn finish_with_script(
         None => (None, None),
     };
     db.execute(
-        "UPDATE vm_operations SET status=?2,script_result=coalesce(?3,script_result),script_exit_code=?4,
+        "UPDATE vm_operations SET status=?2,script_result=CASE
+            WHEN action=2 AND binding_kind='vm' AND ?2=3 THEN 'interrupted'
+            ELSE coalesce(?3,script_result) END,script_exit_code=?4,
             cleanup_confirmed=?5
          WHERE activity_id=?1",
         params![id, status.code(), result, code, cleanup],
@@ -1517,10 +1521,8 @@ fn release_staging(db: &Connection, id: i64) -> Result<()> {
 pub(crate) fn expiry_claims(db: &Connection, now: i64) -> Result<Vec<ExpiryClaim>> {
     purge_tombstones(db, now)?;
     let mut stmt = db.prepare(
-        "SELECT id,cleanup_id FROM vm_instances v WHERE (state<>4 OR cleanup_id IS NULL)
-        AND (state=4 OR expires_ms<=?1)
-        AND NOT ((state=0 OR cleanup_route IS 'staging')
-            AND EXISTS(SELECT 1 FROM vm_generations WHERE vm_id=v.id))
+        "SELECT id,cleanup_id FROM vm_instances v WHERE state<>4 AND expires_ms<=?1
+        AND (state<>0 OR NOT EXISTS(SELECT 1 FROM vm_generations WHERE vm_id=v.id))
         ORDER BY expires_ms,id LIMIT 8",
     )?;
     let due = stmt
@@ -1532,14 +1534,14 @@ pub(crate) fn expiry_claims(db: &Connection, now: i64) -> Result<Vec<ExpiryClaim
         .map(|(vm, previous)| {
             if let Some(previous) = previous {
                 db.execute(
-                    "UPDATE vm_instances SET state=4,cleanup_id=NULL WHERE id=?1",
+                    "UPDATE vm_instances SET state=4,cleanup_route='lease',cleanup_id=NULL WHERE id=?1",
                     [vm],
                 )?;
                 finish(db, previous, Status::Interrupted, now, Some(false))?;
             }
             let activity_id = activity(db, "arxd", vm, Action::Expire, now)?;
             db.execute(
-                "UPDATE vm_instances SET state=4,cleanup_id=?2 WHERE id=?1",
+                "UPDATE vm_instances SET state=4,cleanup_route='lease',cleanup_id=?2 WHERE id=?1",
                 params![vm, activity_id],
             )?;
             Ok(ExpiryClaim { vm, activity_id })
@@ -1568,13 +1570,7 @@ pub(crate) fn record_expired(db: &Connection, claim: ExpiryClaim, now: i64) -> R
          LIMIT -1 OFFSET ?1)",
         params![MAX_TOMBSTONES, claim.vm],
     )?;
-    let mut stmt = db.prepare("SELECT id FROM vm_generations WHERE vm_id=?1")?;
-    for generation in stmt
-        .query_map([claim.vm], |row| row.get(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-    {
-        forget_generation(db, generation)?;
-    }
+    forget_generations(db, claim.vm, false)?;
     db.execute("DELETE FROM vm_instances WHERE id=?1", [claim.vm])?;
     finish(db, claim.activity_id, Status::Succeeded, now, Some(true))
 }
@@ -1600,7 +1596,8 @@ pub(crate) fn expired_status(
 
 pub(crate) fn expiry_intents(db: &Connection) -> Result<Vec<ExpiryClaim>> {
     let mut stmt = db.prepare(
-        "SELECT id,cleanup_id FROM vm_instances WHERE state=4 AND cleanup_id IS NOT NULL ORDER BY id LIMIT 8",
+        "SELECT id,cleanup_id FROM vm_instances WHERE cleanup_route='lease' AND cleanup_id IS NOT NULL
+         ORDER BY id LIMIT 8",
     )?;
     Ok(stmt
         .query_map([], |row| {
@@ -1623,6 +1620,288 @@ pub(crate) fn recovery_intents(db: &Connection) -> Result<Vec<RecoveryClaim>> {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(crate) fn claim_staging(db: &Connection, now: i64) -> Result<()> {
+    let mut stmt = db.prepare(
+        "SELECT v.id,v.cleanup_id,coalesce(a.status=0,0)
+         FROM vm_instances v LEFT JOIN activity a ON a.id=v.cleanup_id
+         WHERE v.cleanup_route='staging' AND (v.cleanup_id IS NULL OR a.action=7)
+         ORDER BY v.id LIMIT 8",
+    )?;
+    let staging = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Id>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (vm, old_expiry, pending) in staging {
+        let id = activity(db, "arxd", vm, Action::Recover, now)?;
+        db.execute(
+            "UPDATE vm_instances SET cleanup_id=?2 WHERE id=?1",
+            params![vm, id],
+        )?;
+        if let Some(old) = old_expiry.filter(|_| pending) {
+            finish(db, old, Status::Interrupted, now, Some(false))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn cleanup_kinds(db: &Connection) -> Result<Vec<CleanupKind>> {
+    let mut builds = db.prepare(
+        "SELECT id FROM vm_build_intents WHERE state IN ('pending_disposal','quarantined')
+         ORDER BY id LIMIT 4",
+    )?;
+    let mut items = builds
+        .query_map([], |row| Ok(CleanupKind::Build(row.get(0)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut staging = db.prepare(
+        "SELECT id,cleanup_id FROM vm_instances WHERE cleanup_route='staging' AND cleanup_id IS NOT NULL
+         ORDER BY id LIMIT 8",
+    )?;
+    items.extend(
+        staging
+            .query_map([], |row| {
+                Ok(CleanupKind::Staging {
+                    vm: row.get(0)?,
+                    activity_id: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    );
+    items.extend(expiry_intents(db)?.into_iter().map(CleanupKind::from));
+    items.extend(recovery_intents(db)?.into_iter().map(CleanupKind::from));
+    Ok(items)
+}
+
+pub(crate) fn legacy_cleanup_uncertain(db: &Connection) -> Result<bool> {
+    Ok(count(
+        db,
+        "SELECT count(*) FROM vm_instances WHERE cleanup_route='legacy_unknown'",
+        [],
+    )? > 0)
+}
+
+pub(crate) fn cleanup_work(db: &Connection, kind: CleanupKind) -> Result<Option<CleanupWork>> {
+    let id = kind.subject();
+    let build = matches!(kind, CleanupKind::Build(_));
+    let retain = matches!(kind, CleanupKind::Recovery { .. });
+    let (activity_id, state, route) = match kind {
+        CleanupKind::Build(_) => (None, None, None),
+        CleanupKind::Staging { activity_id, .. } => (Some(activity_id), Some(4), Some("staging")),
+        CleanupKind::Expiry { activity_id, .. } => (Some(activity_id), Some(4), Some("lease")),
+        CleanupKind::Recovery { activity_id, .. } => (Some(activity_id), Some(3), None),
+    };
+    let owned = if build {
+        count(
+            db,
+            "SELECT count(*) FROM vm_build_intents WHERE id=?1 AND state IN
+            ('pending_disposal','quarantined') AND template_id IS NULL
+            AND NOT EXISTS(SELECT 1 FROM vm_templates WHERE id=?1)",
+            [id],
+        )?
+    } else {
+        count(
+            db,
+            "SELECT count(*) FROM vm_instances WHERE id=?1 AND cleanup_id=?2
+            AND state=?3 AND cleanup_route IS ?4",
+            params![id, activity_id, state, route],
+        )?
+    };
+    if owned != 1 {
+        return Ok(None);
+    }
+    let mut stmt = db.prepare(
+        "SELECT g.id,g.generation,g.active,a.role,a.object_key,a.state,a.volume_id,a.directory_id,a.file_id
+         FROM vm_generations g LEFT JOIN vm_artifacts a ON a.generation_id=g.id
+         WHERE (?2 AND g.build_id=?1) OR (NOT ?2 AND g.vm_id=?1)
+         ORDER BY g.generation,a.role LIMIT 6",
+    )?;
+    let mut rows = stmt.query(params![id, build])?;
+    let mut layout = Vec::new();
+    let mut artifacts = Vec::new();
+    let mut complete = true;
+    while let Some(row) = rows.next()? {
+        let ordinal: i64 = row.get(1)?;
+        let active: bool = row.get(2)?;
+        let (Some(role), Some(state)): (Option<String>, Option<String>) =
+            (row.get(3)?, row.get(5)?)
+        else {
+            complete = false;
+            break;
+        };
+        let directory = row.get::<_, Option<Vec<u8>>>(7)?.and_then(identity_bytes);
+        let file = row.get::<_, Option<Vec<u8>>>(8)?.and_then(identity_bytes);
+        let volume = row.get::<_, Option<[u8; 8]>>(6)?.map(u64::from_be_bytes);
+        layout.push((ordinal, active, role.clone(), state));
+        artifacts.push(CleanupArtifact {
+            generation: row.get(0)?,
+            role,
+            key: row.get(4)?,
+            directory,
+            identity: volume
+                .zip(file)
+                .map(|(volume, file)| FileIdentity { volume, file }),
+            retain: active && retain,
+        });
+    }
+    let expected: &[(i64, &str)] = if build {
+        &[
+            (1, "disk"),
+            (1, "seed"),
+            (1, "vars"),
+            (2, "vars"),
+            (2, "verification_overlay"),
+        ]
+    } else {
+        &[(1, "disk"), (1, "vars")]
+    };
+    let active = !build && route != Some("staging");
+    let accounted = complete
+        && layout.len() == expected.len()
+        && layout
+            .iter()
+            .zip(expected)
+            .all(|((ordinal, live, role, state), expected)| {
+                (*ordinal, role.as_str()) == *expected
+                    && *live == active
+                    && if active {
+                        state == "active"
+                    } else {
+                        matches!(state.as_str(), "pending_disposal" | "quarantined")
+                    }
+            })
+        && (build
+            || count(
+                db,
+                "SELECT count(*) FROM vm_disk_claims WHERE vm=?1 AND snapshot IS NULL
+            AND persistent>0 AND (?2 OR staging=0)",
+                params![id, !active],
+            )? == 1
+                && count(db, "SELECT count(*) FROM vm_disk_claims WHERE vm=?1", [id])? == 1
+                && count(db, "SELECT count(*) FROM vm_snapshots WHERE vm=?1", [id])? == 0);
+    let pending_worker = if build {
+        None
+    } else {
+        db.query_row(
+            "SELECT id FROM activity WHERE vm=?1 AND status=0 AND action<=6",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?
+    };
+    Ok(Some(CleanupWork {
+        kind,
+        pending_worker,
+        artifacts,
+        accounted,
+    }))
+}
+
+fn identity_bytes(bytes: Vec<u8>) -> Option<Id> {
+    match bytes.len() {
+        16 => bytes.try_into().ok(),
+        8 => {
+            let mut id = [0; 16];
+            id[8..].copy_from_slice(&bytes);
+            Some(id)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn settle_cleanup(
+    db: &Connection,
+    work: &CleanupWork,
+    now: i64,
+    confirmed: bool,
+) -> Result<bool> {
+    let Some(current) = cleanup_work(db, work.kind)? else {
+        return Ok(true);
+    };
+    let confirmed = confirmed && current.accounted && current.artifacts == work.artifacts;
+    match work.kind {
+        CleanupKind::Build(id) if confirmed => {
+            forget_generations(db, id, true)?;
+            db.execute("DELETE FROM vm_build_intents WHERE id=?1", [id])?;
+        }
+        CleanupKind::Build(id) => {
+            db.execute(
+                "UPDATE vm_build_intents SET state='quarantined' WHERE id=?1",
+                [id],
+            )?;
+        }
+        CleanupKind::Staging { vm, activity_id } if confirmed => {
+            interrupt_pending(db, vm, now, true)?;
+            forget_generations(db, vm, false)?;
+            db.execute("DELETE FROM vm_instances WHERE id=?1", [vm])?;
+            finish(db, activity_id, Status::Succeeded, now, Some(true))?;
+        }
+        CleanupKind::Expiry { vm, activity_id } if confirmed => {
+            interrupt_pending(db, vm, now, true)?;
+            record_expired(db, ExpiryClaim { vm, activity_id }, now)?;
+        }
+        CleanupKind::Recovery { vm, activity_id } if confirmed => {
+            interrupt_pending(db, vm, now, true)?;
+            record_recovered(db, RecoveryClaim { vm, activity_id }, now)?;
+        }
+        CleanupKind::Staging { activity_id, .. }
+        | CleanupKind::Expiry { activity_id, .. }
+        | CleanupKind::Recovery { activity_id, .. } => {
+            db.execute(
+                "UPDATE activity SET cleanup_confirmed=0 WHERE id=?1",
+                [activity_id],
+            )?;
+        }
+    }
+    Ok(confirmed)
+}
+
+pub(crate) fn interrupt_pending(db: &Connection, vm: Id, now: i64, released: bool) -> Result<()> {
+    let pending = db
+        .query_row(
+            "SELECT id FROM activity WHERE vm=?1 AND status=0 AND action<=6",
+            [vm],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = pending {
+        finish(db, id, Status::Interrupted, now, Some(released))?;
+    }
+    Ok(())
+}
+
+fn forget_generations(db: &Connection, id: Id, build: bool) -> Result<()> {
+    let mut stmt = db.prepare(
+        "SELECT id FROM vm_generations
+        WHERE (?2 AND build_id=?1) OR (NOT ?2 AND vm_id=?1)",
+    )?;
+    let generations = stmt
+        .query_map(params![id, build], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for generation in generations {
+        forget_generation(db, generation)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn record_recovered(db: &Connection, claim: RecoveryClaim, now: i64) -> Result<()> {
+    let vm = claim.vm;
+    ensure!(db.execute(
+        "UPDATE vm_instances SET state=1,cleanup_id=NULL WHERE id=?1 AND state=3 AND cleanup_id=?2",
+        params![vm, claim.activity_id],
+    )? == 1, "invalid recovery intent");
+    db.execute("DELETE FROM vm_snapshots WHERE vm=?1 AND ready=0", [vm])?;
+    db.execute(
+        "DELETE FROM vm_disk_claims WHERE vm=?1 AND persistent=0",
+        [vm],
+    )?;
+    db.execute("UPDATE vm_disk_claims SET staging=0 WHERE vm=?1", [vm])?;
+    finish(db, claim.activity_id, Status::Succeeded, now, Some(true))
 }
 
 #[cfg(test)]
