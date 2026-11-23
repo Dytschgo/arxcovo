@@ -15,6 +15,32 @@ pub enum CaptureError {
     Fault,
 }
 
+/// CRC-32 (ISO-HDLC) as PNG specifies it for each chunk's type and data.
+fn crc32(data: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut n = 0;
+        while n < 256 {
+            let mut c = n as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+                k += 1;
+            }
+            table[n] = c;
+            n += 1;
+        }
+        table
+    };
+    !data.iter().fold(!0u32, |crc, &byte| {
+        TABLE[((crc ^ u32::from(byte)) & 0xFF) as usize] ^ (crc >> 8)
+    })
+}
+
 pub struct Frame {
     bytes: Bytes,
     width: u32,
@@ -41,6 +67,10 @@ impl Frame {
                 .get(..len.checked_add(12).ok_or(invalid)?)
                 .ok_or(invalid)?;
             tail = &tail[chunk.len()..];
+            let (body, stored) = chunk[4..].split_at(len + 4);
+            if word(stored) != Some(crc32(body)) {
+                return Err(invalid);
+            }
             match &chunk[4..8] {
                 b"IHDR" if dimensions.is_none() && len == 13 => {
                     let width = word(&chunk[8..]).ok_or(invalid)?;
@@ -131,12 +161,66 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    pub const PNG: &str = "89504E470D0A1A0A0000000D4948445200000001000000010804000000B51C0C020000000B4944415478DA63FCFF1F0003030200EFA345990000000049454E44AE426082";
+    /// A 2x3 RGB image generated with Python's zlib. Every chunk CRC was
+    /// rechecked with zlib.crc32, IDAT inflated to the expected scanlines,
+    /// and Pillow decoded the same six pixels independently.
+    pub const PNG: &str = "89504E470D0A1A0A0000000D4948445200000002000000030802000000368849D6000000174944415478DA63F8CFC0C000C20CFF81004437382800004BEB06DB3659029A0000000049454E44AE426082";
+    pub const PNG_SIZE: (u32, u32) = (2, 3);
+
+    /// Rewrites the CRC of the chunk starting at `at` after a field edit.
+    fn reseal(png: &mut [u8], at: usize) {
+        let len = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+        let crc = crc32(&png[at + 4..at + 8 + len]);
+        png[at + 8 + len..at + 12 + len].copy_from_slice(&crc.to_be_bytes());
+    }
+
+    #[test]
+    fn crc32_matches_the_standard_check_value() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b"IEND"), 0xAE42_6082);
+    }
+
+    #[test]
+    fn verified_png_decodes_dimensions_and_keeps_bytes() {
+        let png = hex::decode(PNG).unwrap();
+        let (width, height, bytes) = Frame::from_png(png.clone().into()).unwrap().image();
+        assert_eq!((width, height), PNG_SIZE);
+        assert_eq!(bytes.as_ref(), png);
+    }
+
+    #[test]
+    fn corrupted_chunk_crc_or_data_is_refused() {
+        let png = hex::decode(PNG).unwrap();
+        // IHDR is at 8, IDAT at 33 and IEND at 68 in this fixture.
+        let idat = 33;
+        let idat_len = u32::from_be_bytes(png[idat..idat + 4].try_into().unwrap()) as usize;
+        let mut cases = Vec::new();
+        for offset in [
+            8 + 4,               // IHDR type
+            8 + 8,               // IHDR data
+            8 + 21,              // IHDR stored CRC
+            idat + 8,            // IDAT data
+            idat + 8 + idat_len, // IDAT stored CRC
+            png.len() - 1,       // IEND stored CRC
+        ] {
+            let mut corrupt = png.clone();
+            corrupt[offset] ^= 0x01;
+            cases.push(corrupt);
+        }
+        for corrupt in cases {
+            assert!(matches!(
+                Frame::from_png(corrupt.into()),
+                Err(CaptureError::Fault)
+            ));
+        }
+    }
 
     #[test]
     fn zero_png_side_is_rejected() {
         let mut png = hex::decode(PNG).unwrap();
         png[16..20].fill(0);
+        // A stale CRC alone would refuse; reseal to reach the dimension check.
+        reseal(&mut png, 8);
         assert!(matches!(
             Frame::from_png(png.into()),
             Err(CaptureError::Fault)
@@ -252,7 +336,7 @@ pub(crate) mod tests {
             assert!(!leaf.exists());
             if index == 0 {
                 let (width, height, image) = frame.unwrap().image();
-                assert_eq!((width, height), (1, 1));
+                assert_eq!((width, height), PNG_SIZE);
                 assert_eq!(image.as_ref(), hex::decode(PNG).unwrap());
             } else {
                 assert!(matches!(frame, Err(CaptureError::Fault)));

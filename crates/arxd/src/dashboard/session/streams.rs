@@ -120,6 +120,8 @@ struct Slot {
     target: Option<Target>,
     revision: watch::Sender<()>,
     close: Option<(Close, Instant)>,
+    /// The writer has taken the closing message or close frame.
+    close_committed: bool,
     closing_message: Option<Message>,
     queue: VecDeque<Message>,
     control: Option<Message>,
@@ -160,8 +162,16 @@ impl Slot {
     }
 
     fn close(&mut self, close: Close, now: Instant, message: Option<Message>) {
-        if self.close.is_some() && close.code != Close::SESSION.code {
-            return;
+        if let Some((current, _)) = self.close {
+            // Session end always wins. A detected target replacement wins
+            // over an ordinary stop or fault close the writer has not taken.
+            let replaces = close.code == Close::SESSION.code
+                || (close.code == Close::TARGET.code
+                    && !self.close_committed
+                    && matches!(current.code, 1000 | 1011));
+            if !replaces {
+                return;
+            }
         }
         let deadline = self
             .close
@@ -303,6 +313,7 @@ impl Sessions {
                 revision,
                 target: None,
                 close: None,
+                close_committed: false,
                 closing_message: None,
                 queue: VecDeque::new(),
                 control: None,
@@ -566,6 +577,7 @@ impl Stream {
         self.with_slot(|slot, now, live| {
             slot.in_flight = false;
             if let Some((close, deadline)) = slot.close {
+                slot.close_committed = true;
                 if live && let Some(message) = slot.closing_message.take() {
                     return Write::Message(message, deadline);
                 }

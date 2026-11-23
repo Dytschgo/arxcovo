@@ -593,7 +593,7 @@ fn activity_v3_migration_preserves_legacy_modes_and_sequence_and_guards_current_
         assert_eq!(
             db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            4
+            5
         );
         let current = activity
             .start_execution("fixture-agent", "run_command", IdentityMode::CurrentUser)
@@ -771,7 +771,7 @@ fn failed_v3_migration_rolls_back_schema_and_rows() {
     );
     assert_eq!(
         db.query_row::<i64, _, _>(
-            "SELECT count(*) FROM sqlite_schema WHERE name='activity_v3'",
+            "SELECT count(*) FROM sqlite_schema WHERE name='activity_previous'",
             [],
             |r| r.get(0)
         )
@@ -825,7 +825,7 @@ fn legacy_v1_v2_activity_upgrade_preserves_host_sequence_and_unknown_identity() 
         assert_eq!(
             db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            4
+            5
         );
     }
 }

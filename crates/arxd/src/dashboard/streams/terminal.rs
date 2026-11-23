@@ -1,4 +1,4 @@
-use super::{Dashboard, Stream, TEXT_LIMIT, message};
+use super::{Close, Dashboard, Stream, TEXT_LIMIT, message};
 use crate::{
     development::{self, Admission, Cancellation, Execution, Request, ResultData},
     store::{Activity, Outcome, Reason, StopReason},
@@ -10,6 +10,12 @@ use std::sync::Arc;
 
 const OUTPUT_LIMIT: usize = 4096;
 const OUTPUT_CHUNK: usize = 2048;
+/// `started` reached the client but the terminal audit did not commit, so no
+/// result may follow. The fixed reason carries no command content.
+const AUDIT_FAILED: Close = Close {
+    code: 1011,
+    reason: "command audit failed",
+};
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -68,6 +74,7 @@ pub(super) async fn receive(state: &Dashboard, stream: &Stream, text: &str) -> b
             execution: execution.clone(),
             activity: state.activity.clone(),
             input,
+            accepted: false,
         };
         // Admission tracks the worker through terminal audit even when the
         // socket or peer goes away. Refusals are serialized per reader.
@@ -85,6 +92,8 @@ struct Command {
     execution: Arc<Execution>,
     activity: Arc<Activity>,
     input: Request,
+    /// Set once `started` is queued to the client.
+    accepted: bool,
 }
 
 impl Command {
@@ -117,10 +126,18 @@ impl Command {
     }
 
     fn run(mut self, mut admission: Admission, cancel: Cancellation) {
-        let frames = self
-            .run_tracked(&mut admission, &cancel)
-            .unwrap_or_else(|reason| vec![error(reason)]);
-        self.stream.complete(frames);
+        match self.run_tracked(&mut admission, &cancel) {
+            Ok(frames) => self.stream.complete(frames),
+            Err(reason) if self.accepted => {
+                // Only the terminal audit commit can fail after `started`.
+                // Output stays withheld and the unconfirmed admission keeps
+                // drain from reporting success. Close first so no new run is
+                // admitted before the command slot is released.
+                self.stream.close(AUDIT_FAILED, Some(error(reason)));
+                self.stream.complete(std::iter::empty());
+            }
+            Err(reason) => self.stream.complete([error(reason)]),
+        }
     }
 
     fn run_tracked(
@@ -142,7 +159,6 @@ impl Command {
         let started = message(json!({"type":"started","commandId":command_id,
             "tool":self.input.tool,"args":self.input.args}));
         let fits = matches!(&started, Message::Text(text) if text.len() <= TEXT_LIMIT);
-        let mut accepted = false;
         let result = if allowed && fits {
             if let Some(deadline) = self.stream.deadline() {
                 let remaining =
@@ -150,7 +166,7 @@ impl Command {
                 self.input.timeout_s = self.input.timeout_s.min(remaining.as_secs().max(1));
             }
             self.execution.run_owner_command(&self.input, cancel, || {
-                accepted = true;
+                self.accepted = true;
                 self.stream.queue([started]);
             })
         } else {
@@ -180,7 +196,9 @@ impl Command {
             .finish_typed(id, outcome, &metadata)
             .map_err(|_| Reason::StorageFailed)?;
         admission.completed();
-        if !accepted && let Some(reason) = reason {
+        if !self.accepted
+            && let Some(reason) = reason
+        {
             return Err(reason);
         }
         Ok(output_frames(&command_id, outcome, output))

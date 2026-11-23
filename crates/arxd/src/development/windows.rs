@@ -1312,6 +1312,7 @@ fn drain_io(
 }
 #[cfg(test)]
 thread_local! {
+    static BEFORE_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static BEFORE_RESUME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 
@@ -1437,8 +1438,26 @@ fn run_inner(
         let mut pi: PROCESS_INFORMATION = zeroed();
         let env = environment(settings);
         stage!(diag::Stage::CreateProcess);
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_CREATE.with(|hook| hook.take()) {
+            hook();
+        }
         if cancel.is_cancelled() {
-            return Err(Reason::Shutdown);
+            // Nothing was created, so there is nothing to clean up. Keep the
+            // shared cancelled-with-cleanup-facts classification.
+            return Ok(ResultData {
+                execution_mode: execution.identity_mode.as_str(),
+                claim: execution.claim(),
+                dedicated: false,
+                stop_reason: StopReason::Cancelled,
+                exit_code: None,
+                cleanup_confirmed: true,
+                matches_current_user: true,
+                stdout: String::new(),
+                stderr: String::new(),
+                stdout_dropped_bytes: 0,
+                stderr_dropped_bytes: 0,
+            });
         }
         diagnostic!(diag::create_call());
         ok(CreateProcessW(
@@ -3019,9 +3038,59 @@ pub(crate) mod tests {
         let cancel = Cancellation::default();
         cancel.cancel();
         let (result, native) = diag::observe(|| run_inner(&execution, &request, &cancel, true));
-        assert!(matches!(result, Err(Reason::Shutdown)));
+        let output = result.expect("pre-create cancellation keeps cleanup facts");
+        assert_eq!(output.stop_reason, StopReason::Cancelled);
+        assert!(output.cleanup_confirmed && output.matches_current_user);
+        assert_eq!(output.exit_code, None);
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
         assert_eq!(native.create_calls, 0);
         assert_eq!(native.resume_calls, 0);
+        assert!(!execution.quarantined.load(Ordering::Acquire));
+    }
+
+    /// A cancellation that lands after the shared worker's own check but
+    /// before `CreateProcessW` keeps the MCP audit classification: a failed
+    /// row with cancelled stop reason and cleanup facts, never a refusal.
+    #[test]
+    fn mcp_cancellation_racing_create_records_cancelled_with_cleanup_facts() {
+        let (_dir, execution, request) = fixture("handles");
+        let cancel = Cancellation::default();
+        let copy = cancel.clone();
+        BEFORE_CREATE.with(|hook| hook.replace(Some(Box::new(move || copy.cancel()))));
+        let (work, native) = diag::observe(|| execution.work(Some(&request), &cancel));
+        let (_, outcome, metadata) = work.expect("cancelled work is not a refusal");
+        assert_eq!(native.create_calls, 0);
+        assert_eq!(native.resume_calls, 0);
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(metadata.reason, None);
+        assert_eq!(metadata.stop_reason, Some(StopReason::Cancelled));
+        assert_eq!(metadata.cleanup_confirmed, Some(true));
+        assert_eq!(metadata.exit_code, None);
+        // The public MCP audit row reads exactly as the shared dispatch commits it.
+        let state = crate::service::application::tests::private_temp();
+        let activity = crate::store::Activity::open(state.path()).unwrap();
+        let id = activity
+            .start_development("fixture-agent", "run_command")
+            .unwrap();
+        activity.finish_typed(id, outcome, &metadata).unwrap();
+        let read = activity.start("fixture-agent", "list_activity").unwrap();
+        let page = activity
+            .list(
+                "fixture-agent",
+                read,
+                &crate::store::ListActivity {
+                    limit: 50,
+                    before_id: None,
+                    include_reads: false,
+                },
+            )
+            .unwrap();
+        let row = page.activities.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.outcome, Outcome::Failed);
+        assert_eq!(row.metadata.reason, None);
+        assert_eq!(row.metadata.stop_reason, Some(StopReason::Cancelled));
+        assert_eq!(row.metadata.cleanup_confirmed, Some(true));
+        assert!(!execution.quarantined.load(Ordering::Acquire));
     }
 
     #[test]

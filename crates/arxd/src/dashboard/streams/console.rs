@@ -109,7 +109,14 @@ async fn capture(state: Dashboard, job: Capture, vm: [u8; 16], generation: u64) 
             Err(error) => Err(error),
         };
         let viewers = job.viewers();
-        let result = result.and_then(|frame| live(&state, vm, generation).map(|_| frame));
+        // Revalidate after every capture, successful or not. A lease from a
+        // replaced generation may report its own stop or fault first; the
+        // authoritative replacement must win over that ordinary close.
+        let result = match (result, live(&state, vm, generation)) {
+            (_, Err(CaptureError::Replaced)) => Err(CaptureError::Replaced),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(frame), Ok(_)) => Ok(frame),
+        };
         match result {
             Ok(Some(frame)) => {
                 seq += 1;

@@ -157,9 +157,15 @@ async fn serve(state: Dashboard, connection: Connection, id: String, socket: Web
     let (sink, mut source) = socket.split();
     let stream = connection.stream();
     let reader = async {
+        // One per-socket message budget covers authentication too.
+        let mut rate = Bucket::new(16, 16);
         let auth = timeout(AUTH_TIMEOUT, async {
             loop {
-                match source.next().await {
+                let next = source.next().await;
+                if matches!(next, Some(Ok(_))) && !rate.take(Instant::now().into_std()) {
+                    return Err(RATE);
+                }
+                match next {
                     Some(Ok(Message::Text(text))) if text.len() <= 256 => {
                         let Auth::Auth { ticket } =
                             serde_json::from_str(&text).map_err(|_| Close::TICKET)?;
@@ -195,7 +201,6 @@ async fn serve(state: Dashboard, connection: Connection, id: String, socket: Web
         );
         targets.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut active = Instant::now();
-        let mut rate = Bucket::new(16, 16);
         loop {
             tokio::select! {
                 biased;

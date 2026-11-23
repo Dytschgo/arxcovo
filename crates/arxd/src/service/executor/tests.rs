@@ -657,7 +657,7 @@ async fn late_dispatch_after_drain_finishes_without_worker_or_poll() {
             let result = work.await;
             let drained = e.drain().await;
             // Always join old-behavior workers before any regression assertion.
-            assert_eq!(schema, 4);
+            assert_eq!(schema, 5);
             assert_eq!(registered, 0, "late dispatch registered an unjoined worker");
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             let failure = result.err().unwrap();

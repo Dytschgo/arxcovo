@@ -766,7 +766,7 @@ async fn wire_console_returns_one_png_pair_then_vm_stop() {
             meta["width"].as_u64(),
             meta["height"].as_u64()
         ),
-        (Some(1), Some(1), Some(1))
+        (Some(1), Some(2), Some(3))
     );
     assert_eq!(meta["mime"], "image/png");
     assert!(
@@ -908,4 +908,317 @@ async fn disconnected_command_cancels_and_finishes_owner_activity() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].actor, "owner");
     assert_eq!(entries[0].outcome, Outcome::Interrupted);
+}
+
+#[tokio::test]
+async fn audit_failure_after_started_ends_the_command_without_output() {
+    let (release, proceed) = std::sync::mpsc::channel::<std::path::PathBuf>();
+    let proceed = std::sync::Mutex::new(proceed);
+    let executor = Execution::owner_fixture(move |_, _| {
+        let database = proceed
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        // Remove the started owner row so its terminal audit cannot commit.
+        let raw = rusqlite::Connection::open(database).unwrap();
+        assert_eq!(
+            raw.execute("DELETE FROM activity WHERE actor_kind='owner'", [])
+                .unwrap(),
+            1
+        );
+        Ok(output(
+            StopReason::Exited,
+            "OUTPUT_SENTINEL".into(),
+            String::new(),
+        ))
+    });
+    let (f, route) = terminal_fixture(executor.clone());
+    let (cookie, csrf) = f.login(None).await;
+    let (path, proof) = ticket(&f, &route, &cookie, &csrf).await;
+    let wire = Wire::new(&f).await;
+    let mut peer = wire
+        .connect(&path, Some(&cookie), Some(ORIGIN))
+        .await
+        .unwrap();
+    send(&mut peer, json!({"type":"auth","ticket":proof})).await;
+    assert_eq!(receive_json(&mut peer).await["type"], "ready");
+    send(&mut peer, json!({"type":"run","tool":"git","args":[]})).await;
+    assert_eq!(receive_json(&mut peer).await["type"], "started");
+    release
+        .send(f._dir.path().join("activity.sqlite3"))
+        .unwrap();
+    // A content-free error, then the fixed close; never output or exit.
+    assert_eq!(
+        receive_json(&mut peer).await,
+        json!({"type":"error","code":"storage_failed",
+            "message":"The dashboard could not run the command."})
+    );
+    let ClientMessage::Close(Some(close)) = receive(&mut peer).await else {
+        panic!("expected close")
+    };
+    assert_eq!(u16::from(close.code), 1011);
+    assert_eq!(close.reason.as_str(), "command audit failed");
+    // The unconfirmed terminal audit keeps the drain signal negative.
+    assert!(!executor.drain().await);
+}
+
+/// A lease whose capture parks until released and then reports `Stopped`,
+/// as an old generation's display does once its VM was replaced.
+struct HeldDisplay {
+    generation: std::sync::atomic::AtomicU64,
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    gate: tokio::sync::Semaphore,
+}
+
+struct HeldSources(Arc<HeldDisplay>);
+
+impl console::Sources for HeldSources {
+    fn lease(&self, vm: [u8; 16]) -> Option<Arc<dyn console::Lease>> {
+        (vm == [1; 16]).then(|| self.0.clone() as Arc<dyn console::Lease>)
+    }
+}
+
+impl console::Lease for HeldDisplay {
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn state(&self) -> Result<(), crate::vm::console::CaptureError> {
+        Ok(())
+    }
+
+    fn capture(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<crate::vm::console::Frame>,
+                        crate::vm::console::CaptureError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            self.entered.send(()).unwrap();
+            self.gate.acquire().await.unwrap().forget();
+            Err(crate::vm::console::CaptureError::Stopped)
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn replacement_during_a_held_capture_wins_over_its_stale_stop() {
+    let vm = [1; 16];
+    let target = Target::Console { vm, generation: 1 };
+    let (entered, mut capturing) = tokio::sync::mpsc::unbounded_channel();
+    let display = Arc::new(HeldDisplay {
+        generation: 1.into(),
+        entered,
+        gate: tokio::sync::Semaphore::new(0),
+    });
+    let mut backends = Backends::new(None);
+    backends.console = Some(Arc::new(HeldSources(display.clone())));
+    let f = Fixture::with_streams(false, backends);
+    let (viewer, _, _, id, proof) = registered(&f, target.clone()).await;
+    assert!(viewer.redeem(&id, &proof, ORIGIN).is_ok());
+    let stream = viewer.stream();
+    assert!(console::check(&f.state, &stream, vm, 1));
+    timeout(Duration::from_secs(2), capturing.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // The VM is replaced while the old generation's capture is in flight.
+    display
+        .generation
+        .store(2, std::sync::atomic::Ordering::Release);
+    let mut revision = stream.revision().unwrap();
+    display.gate.add_permits(1);
+    let close = loop {
+        match stream.commit() {
+            Some(Write::Close(close, _)) => break close,
+            Some(Write::Wait) => revision.changed().await.unwrap(),
+            Some(Write::Message(message, _)) => panic!("stale close notice {message:?}"),
+            None => panic!("viewer released"),
+        }
+    };
+    assert_eq!(close.code, 4403);
+}
+
+#[tokio::test(start_paused = true)]
+async fn detected_replacement_overrides_only_an_untaken_ordinary_close() {
+    let f = Fixture::with_streams(false, Backends::new(None));
+    let target = Target::Console {
+        vm: [1; 16],
+        generation: 1,
+    };
+    let stopped = Close {
+        code: 1000,
+        reason: "VM stopped",
+    };
+    let notice = || Some(message(json!({"type":"closed","reason":"VM stopped"})));
+    // Not yet taken by the writer: the replacement wins and the notice is dropped.
+    let (first, _, _, id, proof) = registered(&f, target.clone()).await;
+    assert!(first.redeem(&id, &proof, ORIGIN).is_ok());
+    let stream = first.stream();
+    stream.close(stopped, notice());
+    stream.close(Close::TARGET, None);
+    assert!(matches!(stream.commit(), Some(Write::Close(close, _)) if close.code == 4403));
+    // Already taken: the ordinary close stands.
+    let (second, _, _, id, proof) = registered(&f, target).await;
+    assert!(second.redeem(&id, &proof, ORIGIN).is_ok());
+    let stream = second.stream();
+    stream.close(stopped, notice());
+    assert!(matches!(
+        stream.commit(),
+        Some(Write::Message(Message::Text(_), _))
+    ));
+    stream.close(Close::TARGET, None);
+    assert!(matches!(stream.commit(), Some(Write::Close(close, _)) if close.code == 1000));
+    drop((first, second));
+}
+
+/// Ignores transport keepalive frames while waiting for the server's close.
+async fn close_skipping_keepalive<S>(peer: &mut WebSocketStream<S>) -> u16
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let frame = timeout(Duration::from_secs(2), peer.next())
+            .await
+            .expect("server frame deadline")
+            .expect("server frame")
+            .expect("valid server frame");
+        match frame {
+            ClientMessage::Ping(_) | ClientMessage::Pong(_) => {}
+            ClientMessage::Close(Some(close)) => return close.code.into(),
+            other => panic!("unexpected frame before close: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn running_command_ends_on_session_expiry_or_shutdown_despite_traffic() {
+    for case in ["idle", "absolute", "shutdown"] {
+        let (entered, mut running) = tokio::sync::mpsc::unbounded_channel();
+        // Gated worker: it keeps running until the stream cancels it.
+        let executor = Execution::owner_fixture(move |_, cancel| {
+            entered.send(()).unwrap();
+            let start = std::time::Instant::now();
+            while !cancel.is_cancelled() {
+                assert!(start.elapsed() < Duration::from_secs(5), "never cancelled");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(output(
+                StopReason::Cancelled,
+                "OUTPUT_SENTINEL".into(),
+                String::new(),
+            ))
+        });
+        let (f, route) = terminal_fixture(executor.clone());
+        let (cookie, csrf) = f.login(None).await;
+        if case == "absolute" {
+            // Keep the session idle-fresh over HTTP until 3 h of its 7 d remain.
+            for _ in 0..15 {
+                f.clock.advance(Duration::from_secs(11 * 3600));
+                let renewal = f
+                    .send(
+                        f.request(Method::GET, "/api/v1/session", None)
+                            .header("cookie", &cookie),
+                        Body::empty(),
+                    )
+                    .await;
+                assert_eq!(renewal.status(), 200);
+            }
+        }
+        let (path, proof) = ticket(&f, &route, &cookie, &csrf).await;
+        let wire = Wire::new(&f).await;
+        let mut peer = wire
+            .connect(&path, Some(&cookie), Some(ORIGIN))
+            .await
+            .unwrap();
+        send(&mut peer, json!({"type":"auth","ticket":proof})).await;
+        assert_eq!(receive_json(&mut peer).await["type"], "ready");
+        send(&mut peer, json!({"type":"run","tool":"git","args":[]})).await;
+        assert_eq!(receive_json(&mut peer).await["type"], "started");
+        timeout(Duration::from_secs(2), running.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Stream traffic is not session activity. Wait for each pong so the
+        // server has consumed the traffic before it closes the socket.
+        for _ in 0..3 {
+            peer.send(ClientMessage::Ping(Default::default()))
+                .await
+                .unwrap();
+            assert!(matches!(receive(&mut peer).await, ClientMessage::Pong(_)));
+        }
+        let mut stop = None;
+        match case {
+            // The jump also passes the 4 h terminal lifetime; the session
+            // check runs first, so the stream still ends with 4401.
+            "idle" => f.clock.advance(Duration::from_secs(12 * 3600)),
+            // Within both the terminal lifetime and the idle window.
+            "absolute" => f.clock.advance(Duration::from_secs(3 * 3600)),
+            _ => {
+                let sessions = f.sessions.clone();
+                let clock = f.clock.clone();
+                stop = Some(tokio::spawn(async move {
+                    sessions.stop_streams(clock.as_ref()).await
+                }));
+            }
+        }
+        assert_eq!(
+            close_skipping_keepalive(&mut peer).await,
+            if case == "shutdown" { 1001 } else { 4401 },
+            "{case}"
+        );
+        assert!(executor.drain().await, "{case}");
+        if let Some(stop) = stop {
+            assert!(stop.await.unwrap().is_ok());
+        }
+        let entries = f
+            .activity
+            .dashboard_list(
+                &crate::store::ListActivity {
+                    limit: 20,
+                    before_id: None,
+                    include_reads: false,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(entries.len(), 1, "{case}");
+        assert_eq!(entries[0].actor, "owner");
+        assert_eq!(entries[0].outcome, Outcome::Interrupted, "{case}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pre_authentication_control_frames_share_the_socket_budget() {
+    let (f, route) = terminal_fixture(Execution::owner_fixture(|_, _| panic!("no runs")));
+    let (cookie, csrf) = f.login(None).await;
+    let (path, _) = ticket(&f, &route, &cookie, &csrf).await;
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let request = format!("ws://localhost:4444{path}")
+        .into_client_request()
+        .unwrap();
+    let (mut parts, ()) = request.into_parts();
+    parts.headers.insert("cookie", cookie.parse().unwrap());
+    parts.headers.insert("origin", ORIGIN.parse().unwrap());
+    let server = tokio::spawn(crate::dashboard::transport::serve(server, f.app.clone()));
+    let (mut peer, _) = client_async(axum::http::Request::from_parts(parts, ()), client)
+        .await
+        .unwrap();
+    // Paused time grants no refill: the 17th frame exceeds the 16-frame burst.
+    for _ in 0..17 {
+        peer.send(ClientMessage::Ping(Default::default()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(close_skipping_keepalive(&mut peer).await, 1008);
+    server.await.unwrap();
 }
