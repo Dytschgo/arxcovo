@@ -16,7 +16,9 @@ use windows_sys::Win32::{
     Foundation::*,
     Security::{Authorization::*, *},
     Storage::FileSystem::*,
-    System::{Console::*, JobObjects::*, Threading::*},
+    System::{
+        Console::*, JobObjects::*, SystemInformation::GetSystemWindowsDirectoryW, Threading::*,
+    },
 };
 use windows_sys::core::BOOL;
 
@@ -40,6 +42,26 @@ fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
 
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
+}
+
+fn connector_environment(credential: &str) -> io::Result<Vec<u16>> {
+    let mut root = [0u16; MAX_PATH as usize];
+    let length = unsafe { GetSystemWindowsDirectoryW(root.as_mut_ptr(), root.len() as u32) };
+    if length == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize >= root.len() {
+        return Err(refuse());
+    }
+    // Winsock needs SystemRoot to load its providers. Resolve it from Windows
+    // instead of trusting a caller's environment or inheriting other variables.
+    Ok("SystemRoot="
+        .encode_utf16()
+        .chain(root[..length as usize].iter().copied())
+        .chain("\0TUNNEL_CRED_CONTENTS=".encode_utf16())
+        .chain(credential.encode_utf16())
+        .chain([0, 0])
+        .collect())
 }
 
 fn refuse() -> io::Error {
@@ -258,9 +280,7 @@ impl Process {
             .collect::<Vec<_>>()
             .join(" ");
         let mut command = wide(OsStr::new(&command));
-        let mut env: Vec<u16> = format!("TUNNEL_CRED_CONTENTS={credential}\0\0")
-            .encode_utf16()
-            .collect();
+        let mut env = connector_environment(credential)?;
         let image = wide(executable.as_os_str());
         let cwd = wide(cwd.as_os_str());
         let mut startup = STARTUPINFOEXW::default();

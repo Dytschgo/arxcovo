@@ -341,6 +341,7 @@ mod vm {
                 let args: Vec<_> = env::args().skip(1).collect();
                 let credential = env::var("TUNNEL_CRED_CONTENTS").unwrap();
                 assert!(credential.contains("SyntheticDontPrint"));
+                assert!(env::var_os("SystemRoot").is_some());
                 assert!(env::var_os("TUNNEL_TOKEN").is_none());
                 assert!(env::var_os("PATH").is_none());
                 let mut witness = fs::OpenOptions::new().append(true).create(true)
@@ -582,6 +583,7 @@ mod vm {
             plan.origin_name = &origin_name;
             assert!(!witness_path.exists());
 
+            let publish_started = std::time::Instant::now();
             let (mut connector, id) = timeout(LEG, async {
                 assert_eq!(
                     admit(AgentPublishing::Enabled, true, true, Some(&hostname)),
@@ -598,7 +600,8 @@ mod vm {
                 (connector, id)
             })
             .await
-            .unwrap();
+            .expect("publish exceeded its deadline");
+            let publish_elapsed = publish_started.elapsed();
 
             let witness = fs::read_to_string(&witness_path).unwrap();
             assert!(!witness.contains(FAKE_SECRET));
@@ -618,13 +621,15 @@ mod vm {
             let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
             assert!(!process.is_null());
             let process = unsafe { OwnedHandle::from_raw_handle(process) };
+            let unpublish_started = std::time::Instant::now();
             timeout(LEG, async {
                 connector.stop().await.unwrap();
                 assert!(!connector.ready().await);
                 assert_eq!(fake.client.remove(&route, &id).await, Ok(Removal::Absent));
             })
             .await
-            .unwrap();
+            .expect("unpublish exceeded its deadline");
+            let unpublish_elapsed = unpublish_started.elapsed();
             drop(connector);
             let mut code = 0;
             assert_ne!(
@@ -637,7 +642,11 @@ mod vm {
             );
 
             fs::write(root.join("crash.flag"), "").unwrap();
-            let error = match timeout(LEG, Connector::start(&plan)).await.unwrap() {
+            let restart_started = std::time::Instant::now();
+            let error = match timeout(LEG, Connector::start(&plan))
+                .await
+                .expect("crash and restart exceeded their deadline")
+            {
                 Err(error) => error,
                 Ok(_) => panic!("crashing fake reached readiness"),
             };
@@ -648,6 +657,11 @@ mod vm {
                 3
             );
             assert_eq!(fake.state.lock().unwrap().post_count, 1);
+            let restart_elapsed = restart_started.elapsed();
+            eprintln!(
+                "Publication leg timing: publish {publish_elapsed:?}, unpublish {unpublish_elapsed:?}, crash/restart {restart_elapsed:?}"
+            );
+            assert!(publish_elapsed <= LEG && unpublish_elapsed <= LEG && restart_elapsed <= LEG);
             origin_task.abort();
         }
     }
