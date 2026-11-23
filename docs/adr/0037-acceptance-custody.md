@@ -67,14 +67,17 @@ qualify crash durability. The coordinator retains the full adopted revision.
 
 Amendment A4 (2026-11-23) revises only the hosted byte caps in
 `docs/briefs/m3-custody-hosted-pins.md`. The applicable brief SHA256 is
-`32503a622d15ba8f786878ce4dfaeb4fd674db3a0b528b6ce2b450ce9c067c55`.
+`394a6d37c538c81cf3dc5d114ede5d8865f445edba80a5ca80300b1a70dcdf22`.
 Per-candidate debug binary 256 MiB, staged context 257 MiB, inspect image
-`Size` 512 MiB. On main the largest debug test binary is 128,405,704 bytes
-(CI run 45138030124, ubuntu); PR #279 reaches 134,780,336 bytes. The
-2026-11-20 digest above stays the historical adoption pin. `RUNNER_TEMP`
-free space stays 1 GiB and covers the 321 MiB scratch (257 MiB context plus
-the 64 MiB fixture), not Docker's data root. Every other adopted security
-and time limit is unchanged.
+`Size` 768 MiB. Counting the candidate twice (gzip 268,517,359 plus unpacked
+268,435,456) and the pinned base twice (packed 29,793,297 plus decompressed
+tar 80,715,776) sums to 647,461,888 bytes, about 617.5 MiB; 768 MiB leaves
+157,844,480 bytes of headroom. On main the largest debug test binary is
+128,405,704 bytes (CI run 45138030124, ubuntu); PR #279 reaches 134,780,336
+bytes. The 2026-11-20 digest above stays the historical adoption pin.
+`RUNNER_TEMP` free space stays 1 GiB and covers the 321 MiB scratch (257 MiB
+context plus the 64 MiB fixture), not Docker's data root. Every other
+adopted security and time limit is unchanged.
 
 Implementation is split: slice 3a adds codec, CA/member owners and file-backend primitives; slice 3b will add the hosted distinct-UID harness and CI step. Slice 3a alone makes no custody-isolation qualification claim.
 

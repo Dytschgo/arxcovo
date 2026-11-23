@@ -22,7 +22,7 @@ BASE = 'docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe
 ADOPTED_PINS = '28f882cb018eb956c60c190f8718fb982923cd096adb608e15e194c51fa2e167'
 # SHA256 of docs/briefs/m3-custody-hosted-pins.md after amendment A4 (2026-11-23).
 # Recorded evidence uses this digest. ADR 0037 must quote it and ADOPTED_PINS.
-PINS = '32503a622d15ba8f786878ce4dfaeb4fd674db3a0b528b6ce2b450ce9c067c55'
+PINS = '394a6d37c538c81cf3dc5d114ede5d8865f445edba80a5ca80300b1a70dcdf22'
 MIB = 1024 * 1024
 MODES = {'create-founder', 'create-learner', 'deny-build', 'same-uid-control', 'release', 'restart-founder', 'restart-learner'}
 LIMIT = 1024 * 1024
@@ -1040,7 +1040,7 @@ class Harness:
         # RUNNER_TEMP only. Staged context is at most 257 MiB and the ext4 fixture
         # is 64 MiB, 321 MiB together. 1 GiB free covers that scratch. Docker stores
         # the image on its data root, which this check does not measure; image Size
-        # is capped separately at 512 MiB and is not added into this 1 GiB figure.
+        # is capped separately at 768 MiB and is not added into this 1 GiB figure.
         require(shutil.disk_usage(tmp).free >= 1024*MIB, 'DiskCapacity', 'qualify', 'shutil.disk_usage(tmp).free >= 1024 * MIB')
         self.root = Path(tempfile.mkdtemp(prefix='arx-custody-', dir=tmp))
         os.chmod(self.root, 0o700)
@@ -1062,13 +1062,16 @@ class Harness:
         self.image = (self.root / 'image.id').read_text().strip()
         require(re.fullmatch(r'sha256:[a-f0-9]{64}', self.image), 'ImageIdentity', 'qualify', "re.fullmatch('sha256:[a-f0-9]{64}', self.image)")
         image = json.loads(self.command(['docker', 'image', 'inspect', self.image], 'image'))[0]
-        # image['Size'] is Docker's inspect-reported image size. A packed driver can
-        # report less than the candidate (hosted evidence: context 84,499,396 bytes,
-        # Size 50,089,568). An unpacked driver adds the pinned Ubuntu base to the
-        # copied candidate. The candidate cap is 256 MiB; 512 MiB leaves 256 MiB
-        # for that base and either accounting. The pinned base layer is 29,793,297
-        # bytes compressed.
-        require(image['Id'] == self.image and image['Architecture'] == 'amd64' and image['Os'] == 'linux' and image['Size'] <= 512*MIB, 'ImageIdentity', 'qualify', "image['Id'] == self.image and image['Architecture'] == 'amd64' and (image['Os'] == 'linux') and (image['Size'] <= 512 * MIB)")
+        # image['Size'] is Docker's inspect-reported image size. Packed-only
+        # accounting can report less than the candidate (hosted evidence:
+        # context 84,499,396 bytes, Size 50,089,568). A driver that sums packed
+        # content and unpacked snapshot usage counts the candidate twice and the
+        # pinned Ubuntu base twice. Review figures: 256 MiB candidate gzip
+        # 268,517,359 plus unpacked 268,435,456, and the pinned layer packed
+        # 29,793,297 plus decompressed tar 80,715,776. That sum is 647,461,888
+        # bytes, about 617.5 MiB. 768 MiB leaves 157,844,480 bytes, about
+        # 150.5 MiB, of headroom.
+        require(image['Id'] == self.image and image['Architecture'] == 'amd64' and image['Os'] == 'linux' and image['Size'] <= 768*MIB, 'ImageIdentity', 'qualify', "image['Id'] == self.image and image['Architecture'] == 'amd64' and (image['Os'] == 'linux') and (image['Size'] <= 768 * MIB)")
         self.record('image', identity=self.image, bytes=image['Size'])
         self.record_scratch('image')
         self.run_nodes()
