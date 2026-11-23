@@ -11,7 +11,7 @@
 //! egress is **unverified on real hardware**.
 
 use super::{
-    paths::ArtifactPin,
+    paths::{Artifact, ArtifactPin, ArtifactRole, FileIdentity, LocalPath},
     qemu_args::{CommandPlan, PlanKind},
     runtime::NativeRefusal,
     static_web::OriginPortLease,
@@ -33,11 +33,6 @@ pub const MAX_POLICY_DENY: usize = 512;
 /// The manifest identifier of the patched build. It is distinct from the
 /// stock `qemu-11.1.3-windows-x64` manifest.
 pub const EGRESS_MANIFEST: &str = "qemu-11.1.3-arx-public-egress-windows-x64";
-
-/// Receipt digests of reviewed, qualified patched builds. Empty until the
-/// E1a build, its source and its native receipt are independently reviewed;
-/// until then every configured patched pin is refused as unqualified.
-pub const REVIEWED_EGRESS_RECEIPTS: &[[u8; 32]] = &[];
 
 /// The reviewed stock 11.1.3 executable (ADR 0054, #284). A public-egress pin
 /// may never name these bytes: stock QEMU does not express the policy.
@@ -217,7 +212,8 @@ pub enum EgressRefusal {
     PolicyIncomplete,
     /// The in-file digest does not match the preceding bytes.
     PolicyFingerprint,
-    /// The custodied bytes differ from the plan's or the profile's pin.
+    /// The held policy differs from the profile's enrolled pin or from the
+    /// exact path, identity or pin the plan names.
     PolicyMismatch,
     RouteUnknown,
     RouteMismatch,
@@ -226,8 +222,11 @@ pub enum EgressRefusal {
     BinaryStock,
     /// No reviewed receipt qualifies the configured patched build.
     BinaryUnqualified,
-    /// The measured binary differs from the qualified pin.
+    /// The held executable differs from the qualified pin or from the exact
+    /// path, identity or pin the plan names.
     BinaryMismatch,
+    /// The executable's path, link or identity checks failed.
+    BinaryCustody,
 }
 
 impl From<EgressRefusal> for NativeRefusal {
@@ -304,8 +303,8 @@ impl PublicEgressPolicy {
     /// version=1
     /// interface_index=<nonzero canonical u32 decimal>
     /// interface_luid=<nonzero canonical u64 decimal>
-    /// source=<canonical IPv4>
-    /// gateway=<canonical IPv4>
+    /// source=<canonical nonzero IPv4>
+    /// gateway=<canonical nonzero IPv4, distinct from source>
     /// deny=<canonical CIDR, prefix 1..=32, host bits clear>   0 to 512, distinct
     /// fingerprint=<lowercase SHA-256 of every preceding byte>
     /// ```
@@ -342,9 +341,11 @@ impl PublicEgressPolicy {
                 .ok_or(PolicyMalformed)?,
             source: field("source")
                 .and_then(parse_ipv4)
+                .filter(|address| !address.is_unspecified())
                 .ok_or(PolicyMalformed)?,
             gateway: field("gateway")
                 .and_then(parse_ipv4)
+                .filter(|address| !address.is_unspecified())
                 .ok_or(PolicyMalformed)?,
         };
         let mut deny = Vec::new();
@@ -513,6 +514,21 @@ pub struct EgressBinaryPin {
     pub receipt: ArtifactPin,
 }
 
+/// One reviewed patched build: the receipt and the exact executable bytes it
+/// vouches for. A receipt never qualifies any other executable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReviewedEgressBuild {
+    pub qemu: ArtifactPin,
+    pub receipt: ArtifactPin,
+}
+
+/// Reviewed, qualified patched builds. Empty until the E1a source, build and
+/// native receipt (which must cover the full payload and loaded-dependency
+/// set) are independently reviewed; until then every configured patched pin
+/// is refused as unqualified. Adding a receipt alone is not enough: each
+/// entry pins the executable together with its receipt.
+pub const REVIEWED_EGRESS_BUILDS: &[ReviewedEgressBuild] = &[];
+
 /// Proof that a configured pin is a reviewed, qualified patched build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QualifiedEgressBinary(EgressBinaryPin);
@@ -524,14 +540,14 @@ impl QualifiedEgressBinary {
 }
 
 impl EgressBinaryPin {
-    /// Refuses the stock bytes and any build without a reviewed receipt.
+    /// Refuses the stock bytes and any pair that is not a reviewed build.
     pub fn qualify(self) -> Result<QualifiedEgressBinary, EgressRefusal> {
-        self.qualify_against(REVIEWED_EGRESS_RECEIPTS)
+        self.qualify_against(REVIEWED_EGRESS_BUILDS)
     }
 
     fn qualify_against(
         self,
-        reviewed: &[[u8; 32]],
+        reviewed: &[ReviewedEgressBuild],
     ) -> Result<QualifiedEgressBinary, EgressRefusal> {
         let pins = [self.qemu, self.receipt];
         if pins.iter().any(|pin| pin.size == 0) {
@@ -542,7 +558,10 @@ impl EgressBinaryPin {
         }) {
             return Err(EgressRefusal::BinaryStock);
         }
-        if !reviewed.contains(&self.receipt.sha256) {
+        if !reviewed
+            .iter()
+            .any(|build| build.receipt == self.receipt && build.qemu == self.qemu)
+        {
             return Err(EgressRefusal::BinaryUnqualified);
         }
         Ok(QualifiedEgressBinary(self))
@@ -552,12 +571,15 @@ impl EgressBinaryPin {
 /// Evidence presented to admission. Every member is required.
 #[derive(Clone, Copy, Default)]
 pub struct EgressEvidence<'a> {
+    /// The policy object held read-only by the supervisor.
     pub policy: Option<&'a CustodiedPolicy>,
+    /// The profile's enrolled policy pin.
+    pub enrolled_policy: Option<&'a ArtifactPin>,
     pub route: Option<&'a RouteObservation>,
     /// The profile's configured patched-binary pin.
     pub binary: Option<&'a EgressBinaryPin>,
-    /// The pins measured through the launcher's held custody.
-    pub measured: Option<&'a EgressBinaryPin>,
+    /// The patched executable object held read-only by the supervisor.
+    pub executable: Option<&'a HeldExecutable>,
 }
 
 /// Admission of a sealed public-egress plan. Success is a portable check
@@ -566,17 +588,19 @@ pub fn admit(
     plan: &CommandPlan<'_>,
     evidence: EgressEvidence<'_>,
 ) -> Result<QualifiedEgressBinary, EgressRefusal> {
-    admit_against(plan, evidence, REVIEWED_EGRESS_RECEIPTS)
+    admit_against(plan, evidence, REVIEWED_EGRESS_BUILDS)
 }
 
+/// The held objects must be the exact objects the plan's argv names: same
+/// path, file identity and content pin, for the policy and the executable.
 fn admit_against(
     plan: &CommandPlan<'_>,
     evidence: EgressEvidence<'_>,
-    reviewed: &[[u8; 32]],
+    reviewed: &[ReviewedEgressBuild],
 ) -> Result<QualifiedEgressBinary, EgressRefusal> {
-    let planned = plan
+    let (planned_policy, planned_image) = plan
         .public_egress_policy()
-        .and_then(super::paths::Artifact::pin)
+        .zip(plan.public_egress_image())
         .filter(|_| plan.kind() == PlanKind::PublicEgressBoot)
         .filter(|_| {
             plan.static_origin_lease()
@@ -585,7 +609,14 @@ fn admit_against(
         .ok_or(EgressRefusal::PlanMismatch)?;
     let policy = evidence.policy.ok_or(EgressRefusal::PolicyMissing)?;
     policy.verify()?;
-    if policy.pin() != planned {
+    let enrolled = evidence
+        .enrolled_policy
+        .ok_or(EgressRefusal::PolicyMissing)?;
+    if *enrolled != policy.pin()
+        || !policy
+            .held
+            .names(planned_policy, ArtifactRole::PublicEgressPolicy)
+    {
         return Err(EgressRefusal::PolicyMismatch);
     }
     policy.policy().verify_route(evidence.route)?;
@@ -593,31 +624,130 @@ fn admit_against(
         .binary
         .ok_or(EgressRefusal::BinaryMissing)?
         .qualify_against(reviewed)?;
-    if evidence.measured != Some(&qualified.pin()) {
+    let executable = evidence.executable.ok_or(EgressRefusal::BinaryMissing)?;
+    executable.verify()?;
+    if executable.held.pin != qualified.pin().qemu
+        || !executable
+            .held
+            .names(planned_image, ArtifactRole::PublicEgressQemu)
+    {
         return Err(EgressRefusal::BinaryMismatch);
     }
     Ok(qualified)
 }
 
-/// A policy read through a held, read-only handle under an anchored private
-/// directory. On Windows the file is held without write or delete sharing
-/// and the directory without delete sharing, so neither can be replaced
-/// while custody lives. POSIX holds the descriptors and re-verifies the
-/// identity: the 0700/0600 owner-only mode leaves the same effective UID as
-/// the only principal that could rename, the stated POSIX trust boundary.
-pub struct CustodiedPolicy {
-    _directory: File,
+/// One object held through a read-only handle, with the identity and
+/// content pin measured through that handle.
+struct Held {
     file: File,
-    identity: (u64, u64),
+    identity: FileIdentity,
     path: PathBuf,
     pin: ArtifactPin,
+}
+
+impl Held {
+    /// Opens the leaf without following links, then verifies `expected`
+    /// over exactly the bytes read through the held handle.
+    fn open(
+        path: PathBuf,
+        expected: ArtifactPin,
+        limit: u64,
+        private: bool,
+    ) -> Result<(Self, Vec<u8>), HeldError> {
+        if !(1..=limit).contains(&expected.size) {
+            return Err(HeldError::Custody);
+        }
+        custody::check_leaf(&path).map_err(|_| HeldError::Custody)?;
+        let mut file = custody::read_only(&path).map_err(|_| HeldError::Custody)?;
+        if private {
+            custody::private(&file).map_err(|_| HeldError::Custody)?;
+        }
+        let identity = custody::identity(&file).map_err(|_| HeldError::Custody)?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(expected.size.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| HeldError::Custody)?;
+        if !matches!(expected.verify(bytes.as_slice(), limit), Ok(true)) {
+            return Err(HeldError::Content);
+        }
+        let held = Self {
+            file,
+            identity,
+            path,
+            pin: expected,
+        };
+        held.verify(private)?;
+        Ok((held, bytes))
+    }
+
+    /// The name still denotes the held object, which keeps its privacy.
+    fn verify(&self, private: bool) -> Result<(), HeldError> {
+        let held = custody::identity(&self.file);
+        let named = custody::check_leaf(&self.path)
+            .and_then(|()| custody::read_only(&self.path))
+            .and_then(|file| custody::identity(&file));
+        let private = !private || custody::private(&self.file).is_ok();
+        match (held, named) {
+            (Ok(held), Ok(named)) if private && held == self.identity && named == self.identity => {
+                Ok(())
+            }
+            _ => Err(HeldError::Custody),
+        }
+    }
+
+    /// The local spelling the plan would carry. Only a Windows drive path
+    /// has one, so POSIX custody can never bind to a plan.
+    fn local_path(&self) -> Option<LocalPath> {
+        let text = self.path.to_str()?;
+        LocalPath::parse(text.strip_prefix(r"\\?\").unwrap_or(text)).ok()
+    }
+
+    fn artifact(&self, role: ArtifactRole) -> Option<Artifact> {
+        Some(
+            Artifact::new(role, self.local_path()?)
+                .ok()?
+                .with_identity(self.identity)
+                .with_pin(self.pin),
+        )
+    }
+
+    /// Exact path, identity and pin equality with a planned artifact.
+    fn names(&self, planned: &Artifact, role: ArtifactRole) -> bool {
+        self.local_path().is_some_and(|local| {
+            planned
+                .path_for(role)
+                .is_ok_and(|path| path.as_str().eq_ignore_ascii_case(local.as_str()))
+        }) && planned.identity() == Some(self.identity)
+            && planned.pin() == Some(self.pin)
+    }
+}
+
+enum HeldError {
+    Custody,
+    Content,
+}
+
+/// A policy read through a held, read-only handle under an anchored private
+/// directory. Both held handles must be private to the current user: on
+/// POSIX, owned by the effective UID with no group or other bits; on
+/// Windows, owned by TokenUser with a protected DACL holding exactly one
+/// explicit, non-inheritable TokenUser FullControl entry (the ADR 0054
+/// `vm_acl::exact` rule). Windows holds the file without write or delete
+/// sharing and the directory without delete sharing, so neither can be
+/// replaced while custody lives. POSIX re-verifies the identity: the
+/// owner-only mode leaves the same effective UID as the only principal that
+/// could rename, the stated POSIX trust boundary.
+pub struct CustodiedPolicy {
+    _directory: File,
+    held: Held,
     policy: PublicEgressPolicy,
 }
 
 impl std::fmt::Debug for CustodiedPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CustodiedPolicy")
-            .field("pin", &self.pin)
+            .field("pin", &self.held.pin)
             .field("policy", &self.policy)
             .finish_non_exhaustive()
     }
@@ -641,62 +771,107 @@ impl CustodiedPolicy {
         expected: ArtifactPin,
     ) -> Result<Self, EgressRefusal> {
         let custody = |_| EgressRefusal::PolicyCustody;
-        if !leaf_name(name) || !(1..=MAX_POLICY_BYTES).contains(&expected.size) {
+        if !leaf_name(name) {
             return Err(EgressRefusal::PolicyCustody);
         }
         crate::config::checked_path(directory).map_err(custody)?;
-        crate::security::private(directory).map_err(custody)?;
         let held_directory = custody::directory(directory).map_err(custody)?;
-        let path = directory.join(name);
-        custody::check_leaf(&path).map_err(custody)?;
-        let mut file = custody::read_only(&path).map_err(custody)?;
-        let identity = custody::identity(&file).map_err(custody)?;
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take(MAX_POLICY_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| EgressRefusal::PolicyCustody)?;
-        if !matches!(
-            expected.verify(bytes.as_slice(), MAX_POLICY_BYTES),
-            Ok(true)
-        ) {
-            return Err(EgressRefusal::PolicyMismatch);
-        }
+        custody::private(&held_directory).map_err(custody)?;
+        let (held, bytes) = Held::open(directory.join(name), expected, MAX_POLICY_BYTES, true)
+            .map_err(|error| match error {
+                HeldError::Custody => EgressRefusal::PolicyCustody,
+                HeldError::Content => EgressRefusal::PolicyMismatch,
+            })?;
         let policy = PublicEgressPolicy::parse(&bytes)?;
-        let custodied = Self {
+        Ok(Self {
             _directory: held_directory,
-            file,
-            identity,
-            path,
-            pin: expected,
+            held,
             policy,
-        };
-        custodied.verify()?;
-        Ok(custodied)
+        })
     }
 
-    /// The name still denotes the held object.
+    /// The name still denotes the held, still private object.
     pub fn verify(&self) -> Result<(), EgressRefusal> {
-        let held = custody::identity(&self.file);
-        let named = custody::check_leaf(&self.path)
-            .and_then(|()| custody::read_only(&self.path))
-            .and_then(|file| custody::identity(&file));
-        match (held, named) {
-            (Ok(held), Ok(named)) if held == self.identity && named == self.identity => Ok(()),
-            _ => Err(EgressRefusal::PolicyCustody),
-        }
+        self.held
+            .verify(true)
+            .map_err(|_| EgressRefusal::PolicyCustody)
     }
 
     pub fn pin(&self) -> ArtifactPin {
-        self.pin
+        self.held.pin
+    }
+
+    pub fn identity(&self) -> FileIdentity {
+        self.held.identity
     }
 
     pub fn policy(&self) -> &PublicEgressPolicy {
         &self.policy
     }
+
+    /// The plan input for exactly this held object: its local path,
+    /// identity and pin. Refuses a path a plan cannot name.
+    pub fn artifact(&self) -> Result<Artifact, EgressRefusal> {
+        self.held
+            .artifact(ArtifactRole::PublicEgressPolicy)
+            .ok_or(EgressRefusal::PolicyCustody)
+    }
+}
+
+/// Upper bound of the patched executable.
+pub const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The patched executable, held read-only and measured through that handle.
+/// Windows holds it without write or delete sharing. It is a bundle input,
+/// not a private file, so no owner-only rule applies; the pin and the held
+/// identity bind it.
+pub struct HeldExecutable {
+    held: Held,
+}
+
+impl std::fmt::Debug for HeldExecutable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldExecutable")
+            .field("pin", &self.held.pin)
+            .field("identity", &self.held.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HeldExecutable {
+    pub fn open(path: &Path, expected: ArtifactPin) -> Result<Self, EgressRefusal> {
+        let (held, _) = Held::open(path.to_owned(), expected, MAX_EXECUTABLE_BYTES, false)
+            .map_err(|error| match error {
+                HeldError::Custody => EgressRefusal::BinaryCustody,
+                HeldError::Content => EgressRefusal::BinaryMismatch,
+            })?;
+        Ok(Self { held })
+    }
+
+    pub fn verify(&self) -> Result<(), EgressRefusal> {
+        self.held
+            .verify(false)
+            .map_err(|_| EgressRefusal::BinaryCustody)
+    }
+
+    pub fn pin(&self) -> ArtifactPin {
+        self.held.pin
+    }
+
+    pub fn identity(&self) -> FileIdentity {
+        self.held.identity
+    }
+
+    /// The `PublicEgressQemu` plan input for exactly this held object.
+    pub fn artifact(&self) -> Result<Artifact, EgressRefusal> {
+        self.held
+            .artifact(ArtifactRole::PublicEgressQemu)
+            .ok_or(EgressRefusal::BinaryCustody)
+    }
 }
 
 mod custody {
+    use super::FileIdentity;
     use anyhow::{Result, ensure};
     use std::{fs, path::Path};
 
@@ -704,9 +879,9 @@ mod custody {
         crate::config::checked_path(path)?;
         ensure!(
             fs::symlink_metadata(path)?.is_file(),
-            "regular policy file required"
+            "regular file required"
         );
-        crate::security::private(path)
+        Ok(())
     }
 
     pub(super) fn read_only(path: &Path) -> Result<fs::File> {
@@ -753,54 +928,156 @@ mod custody {
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         }
         let directory = options.open(path)?;
-        ensure!(directory.metadata()?.is_dir(), "policy directory required");
+        let metadata = directory.metadata()?;
+        ensure!(metadata.is_dir(), "directory required");
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            ensure!(
+                metadata.file_attributes() & 0x400 == 0,
+                "reparse point forbidden"
+            );
+        }
         Ok(directory)
     }
 
+    /// Owner-only through the held descriptor: the effective UID owns it and
+    /// no group or other permission bit is set.
     #[cfg(unix)]
-    pub(super) fn identity(file: &fs::File) -> Result<(u64, u64)> {
+    pub(super) fn private(file: &fs::File) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        ensure!(
+            metadata.uid() == euid && metadata.mode() & 0o077 == 0,
+            "owner-only permissions required"
+        );
+        Ok(())
+    }
+
+    /// Through the held handle: TokenUser owns it, the DACL is protected and
+    /// is exactly one explicit, non-inheritable TokenUser FullControl entry,
+    /// matched with the ADR 0054 `vm_acl::exact` helper.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) fn private(file: &fs::File) -> Result<()> {
+        use crate::security::vm_acl;
+        use std::{os::windows::io::AsRawHandle, ptr};
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, LocalFree},
+            Security::{Authorization::*, *},
+            Storage::FileSystem::FILE_ALL_ACCESS,
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        };
+        // Every Win32 output below is checked and released before return;
+        // the TokenUser buffer outlives every use of its SID.
+        unsafe {
+            let mut token = ptr::null_mut();
+            ensure!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) != 0,
+                "token unavailable"
+            );
+            let mut size = 0;
+            GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut size);
+            let mut user = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
+            let queried = size != 0
+                && size <= 4096
+                && GetTokenInformation(token, TokenUser, user.as_mut_ptr().cast(), size, &mut size)
+                    != 0;
+            CloseHandle(token);
+            ensure!(queried, "TokenUser unavailable");
+            let sid = (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+            let mut dacl = ptr::null_mut();
+            let mut descriptor = ptr::null_mut();
+            ensure!(
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut dacl,
+                    ptr::null_mut(),
+                    &mut descriptor,
+                ) == 0,
+                "security descriptor unavailable"
+            );
+            let (mut control, mut revision) = (0, 0);
+            let protected = GetSecurityDescriptorControl(descriptor, &mut control, &mut revision)
+                != 0
+                && control & SE_DACL_PROTECTED != 0;
+            LocalFree(descriptor);
+            let only_user = [vm_acl::Entry {
+                deny: false,
+                sid,
+                mask: FILE_ALL_ACCESS,
+            }];
+            ensure!(
+                protected && vm_acl::exact(file, sid, &only_user),
+                "TokenUser-owned protected owner-only DACL required"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(all(windows, not(target_arch = "x86_64")))]
+    pub(super) fn private(_: &fs::File) -> Result<()> {
+        anyhow::bail!("unsupported platform")
+    }
+
+    #[cfg(unix)]
+    pub(super) fn identity(file: &fs::File) -> Result<FileIdentity> {
         use std::os::unix::fs::MetadataExt;
         let meta = file.metadata()?;
         ensure!(
             meta.is_file() && meta.nlink() == 1,
-            "single-link policy file required"
+            "single-link file required"
         );
-        Ok((meta.dev(), meta.ino()))
+        Ok(FileIdentity {
+            volume: meta.dev(),
+            file: u128::from(meta.ino()).to_be_bytes(),
+        })
     }
 
+    /// The same volume serial and 128-bit file ID as the native launcher.
     #[cfg(windows)]
-    pub(super) fn identity(file: &fs::File) -> Result<(u64, u64)> {
+    pub(super) fn identity(file: &fs::File) -> Result<FileIdentity> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-            FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType,
+            FILE_ID_INFO, FILE_TYPE_DISK, FileIdInfo, GetFileInformationByHandle,
+            GetFileInformationByHandleEx, GetFileType,
         };
         let handle = file.as_raw_handle();
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        // `file` owns the handle for the duration of both queries.
+        let mut id = FILE_ID_INFO::default();
+        // `file` owns the handle for every query; each writes its own
+        // fixed-size output structure.
         ensure!(
             unsafe {
                 GetFileType(handle) == FILE_TYPE_DISK
                     && GetFileInformationByHandle(handle, &mut info) != 0
+                    && GetFileInformationByHandleEx(
+                        handle,
+                        FileIdInfo,
+                        std::ptr::from_mut(&mut id).cast(),
+                        size_of::<FILE_ID_INFO>() as u32,
+                    ) != 0
             } && info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
                 == 0
                 && info.nNumberOfLinks == 1,
-            "single-link policy file required"
+            "single-link file required"
         );
-        Ok((
-            u64::from(info.dwVolumeSerialNumber),
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        ))
+        Ok(FileIdentity {
+            volume: id.VolumeSerialNumber,
+            file: id.FileId.Identifier,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::{
-        paths::{Artifact, ArtifactRole, FileIdentity, LocalPath},
-        qemu_args::{BootPurpose, BootRecipe, SerialName, StaticNetwork},
-    };
 
     fn pin(byte: u8) -> ArtifactPin {
         ArtifactPin {
@@ -816,6 +1093,13 @@ mod tests {
         }
     }
 
+    fn review(binary: EgressBinaryPin) -> [ReviewedEgressBuild; 1] {
+        [ReviewedEgressBuild {
+            qemu: binary.qemu,
+            receipt: binary.receipt,
+        }]
+    }
+
     #[test]
     fn frozen_table_is_canonical_and_the_stock_constants_decode() {
         assert!(
@@ -826,14 +1110,15 @@ mod tests {
         assert_eq!(STOCK_QEMU_1113.sha256[..2], [0x0e, 0xff]);
         assert_eq!(STOCK_RECEIPT_1113_SHA256[31], 0x2e);
         assert!(
-            REVIEWED_EGRESS_RECEIPTS.is_empty(),
+            REVIEWED_EGRESS_BUILDS.is_empty(),
             "no patched build is reviewed yet"
         );
     }
 
+    /// A reviewed receipt vouches only for its own executable bytes.
     #[test]
-    fn only_a_reviewed_non_stock_receipt_qualifies() {
-        let reviewed = [[3; 32]];
+    fn only_a_reviewed_executable_and_receipt_pair_qualifies() {
+        let reviewed = review(binary());
         assert_eq!(binary().qualify(), Err(EgressRefusal::BinaryUnqualified));
         assert_eq!(
             binary()
@@ -841,55 +1126,97 @@ mod tests {
                 .map(QualifiedEgressBinary::pin),
             Ok(binary())
         );
+        for other in [
+            EgressBinaryPin {
+                qemu: pin(9),
+                ..binary()
+            },
+            EgressBinaryPin {
+                qemu: ArtifactPin { size: 7, ..pin(1) },
+                ..binary()
+            },
+            EgressBinaryPin {
+                receipt: pin(8),
+                ..binary()
+            },
+        ] {
+            assert_eq!(
+                other.qualify_against(&reviewed),
+                Err(EgressRefusal::BinaryUnqualified)
+            );
+        }
         let mut stock = binary();
         stock.qemu = STOCK_QEMU_1113;
         assert_eq!(
-            stock.qualify_against(&reviewed),
+            stock.qualify_against(&review(stock)),
             Err(EgressRefusal::BinaryStock)
         );
         let mut stock = binary();
         stock.receipt.sha256 = STOCK_RECEIPT_1113_SHA256;
         assert_eq!(
-            stock.qualify_against(&[STOCK_RECEIPT_1113_SHA256]),
+            stock.qualify_against(&review(stock)),
             Err(EgressRefusal::BinaryStock)
         );
         let mut empty = binary();
         empty.qemu.size = 0;
         assert_eq!(
-            empty.qualify_against(&reviewed),
+            empty.qualify_against(&review(empty)),
             Err(EgressRefusal::BinaryMissing)
         );
     }
 
-    /// The positive path needs a reviewed receipt, which only this private
-    /// seam can supply; production always refuses until one is reviewed.
+    /// POSIX custody has no drive path, so it can never seal or bind a plan.
+    #[cfg(unix)]
     #[test]
-    fn admission_accepts_only_matching_qualified_evidence() {
+    fn posix_custody_cannot_name_a_plan_input() {
         let dir = fixtures::private_dir();
         let body = fixtures::policy_text();
         let expected = fixtures::write_private(dir.path(), "policy.txt", body.as_bytes());
         let custodied = CustodiedPolicy::open(dir.path(), "policy.txt", expected).unwrap();
+        assert_eq!(
+            custodied.artifact().unwrap_err(),
+            EgressRefusal::PolicyCustody
+        );
+        let exe = fixtures::write_executable(dir.path(), "qemu", b"patched");
+        let held = HeldExecutable::open(&dir.path().join("qemu"), exe).unwrap();
+        assert_eq!(held.artifact().unwrap_err(), EgressRefusal::BinaryCustody);
+    }
+
+    /// The positive path needs a reviewed build, which only this private
+    /// seam can supply; production always refuses until one is reviewed.
+    /// Every mismatch keeps the same digest or bytes where it can, so only
+    /// the object binding refuses it.
+    #[cfg(windows)]
+    #[test]
+    fn admission_binds_the_held_objects_to_the_exact_plan_inputs() {
+        use crate::vm::qemu_args::{BootPurpose, BootRecipe, SerialName, StaticNetwork};
+        let dir = fixtures::private_dir();
+        let twin = fixtures::private_dir();
+        let body = fixtures::policy_text();
+        let policy_pin = fixtures::write_private(dir.path(), "policy.txt", body.as_bytes());
+        fixtures::write_private(twin.path(), "policy.txt", body.as_bytes());
+        let custodied = CustodiedPolicy::open(dir.path(), "policy.txt", policy_pin).unwrap();
+        let same_digest = CustodiedPolicy::open(twin.path(), "policy.txt", policy_pin).unwrap();
+        let exe_pin = fixtures::write_executable(dir.path(), "qemu.exe", b"patched qemu");
+        fixtures::write_executable(twin.path(), "qemu.exe", b"patched qemu");
+        let other_pin = fixtures::write_executable(dir.path(), "other.exe", b"other qemu");
+        let executable = HeldExecutable::open(&dir.path().join("qemu.exe"), exe_pin).unwrap();
+        let copy = HeldExecutable::open(&twin.path().join("qemu.exe"), exe_pin).unwrap();
+        let other = HeldExecutable::open(&dir.path().join("other.exe"), other_pin).unwrap();
+
         let lease = OriginPortLease::acquire().unwrap();
         let artifact =
             |role, path: &str| Artifact::new(role, LocalPath::parse(path).unwrap()).unwrap();
-        let policy = artifact(ArtifactRole::PublicEgressPolicy, "D:/vm/egress/policy.txt")
-            .with_identity(FileIdentity {
-                volume: 1,
-                file: [7; 16],
-            })
-            .with_pin(expected);
-        let image = artifact(
-            ArtifactRole::PublicEgressQemu,
-            "D:/egress/qemu-system-x86_64.exe",
-        );
+        let policy = custodied.artifact().unwrap();
+        let image = executable.artifact().unwrap();
         let data = artifact(ArtifactRole::Data, "D:/egress/share");
         let firmware = artifact(ArtifactRole::FirmwareCode, "D:/firmware/code.fd");
         let vars = artifact(ArtifactRole::StaticVars, "D:/vm/vars.fd");
         let disk = artifact(ArtifactRole::StaticDisk, "D:/vm/disk.qcow2");
         let header = fixtures::qcow2_header();
         let serial = SerialName::generate().unwrap();
-        let recipe = BootRecipe {
-            image: &image,
+        let recipe = |image, policy| BootRecipe {
+            image,
             data: &data,
             firmware: &firmware,
             vars: &vars,
@@ -898,19 +1225,24 @@ mod tests {
             backing: None,
             backing_header: None,
             serial: &serial,
-            boot: BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::PublicEgress(&policy)),
+            boot: BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::PublicEgress(policy)),
             ram_mib: 256,
             vcpus: 1,
         };
-        let plan = recipe.plan().unwrap();
+        let sealed = recipe(&image, &policy);
+        let plan = sealed.plan().unwrap();
         let route = fixtures::route();
-        let configured = binary();
-        let reviewed = [configured.receipt.sha256];
+        let configured = EgressBinaryPin {
+            qemu: exe_pin,
+            receipt: pin(3),
+        };
+        let reviewed = review(configured);
         let evidence = EgressEvidence {
             policy: Some(&custodied),
+            enrolled_policy: Some(&policy_pin),
             route: Some(&route),
             binary: Some(&configured),
-            measured: Some(&configured),
+            executable: Some(&executable),
         };
         assert_eq!(
             admit_against(&plan, evidence, &reviewed).map(QualifiedEgressBinary::pin),
@@ -920,38 +1252,132 @@ mod tests {
             admit(&plan, evidence),
             Err(EgressRefusal::BinaryUnqualified)
         );
-        let mut other = configured;
-        other.qemu.sha256 = [9; 32];
-        for (evidence, refusal) in [
+        let unrelated = EgressBinaryPin {
+            qemu: other_pin,
+            ..configured
+        };
+        let other_enrolled = pin(4);
+        use EgressRefusal::*;
+        for (case, refusal, label) in [
             (
                 EgressEvidence {
-                    measured: Some(&other),
+                    policy: Some(&same_digest),
                     ..evidence
                 },
-                EgressRefusal::BinaryMismatch,
+                PolicyMismatch,
+                "same-digest policy at another path",
             ),
             (
                 EgressEvidence {
-                    measured: None,
+                    enrolled_policy: None,
                     ..evidence
                 },
-                EgressRefusal::BinaryMismatch,
+                PolicyMissing,
+                "unenrolled policy",
             ),
             (
                 EgressEvidence {
-                    binary: None,
+                    enrolled_policy: Some(&other_enrolled),
                     ..evidence
                 },
-                EgressRefusal::BinaryMissing,
+                PolicyMismatch,
+                "other enrolled pin",
+            ),
+            (
+                EgressEvidence {
+                    executable: Some(&copy),
+                    ..evidence
+                },
+                BinaryMismatch,
+                "same-bytes executable at another path",
+            ),
+            (
+                EgressEvidence {
+                    executable: Some(&other),
+                    ..evidence
+                },
+                BinaryMismatch,
+                "different executable bytes",
+            ),
+            (
+                EgressEvidence {
+                    executable: None,
+                    ..evidence
+                },
+                BinaryMissing,
+                "no held executable",
+            ),
+            (
+                EgressEvidence {
+                    binary: Some(&unrelated),
+                    ..evidence
+                },
+                BinaryUnqualified,
+                "receipt reused for another executable",
             ),
         ] {
+            assert_eq!(
+                admit_against(&plan, case, &reviewed),
+                Err(refusal),
+                "{label}"
+            );
+        }
+        // Plans naming a different object with the same pin.
+        let fake = FileIdentity {
+            volume: 1,
+            file: [7; 16],
+        };
+        let forged_policy = Artifact::new(
+            ArtifactRole::PublicEgressPolicy,
+            policy
+                .path_for(ArtifactRole::PublicEgressPolicy)
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+        .with_identity(fake)
+        .with_pin(policy_pin);
+        let twin_policy = same_digest.artifact().unwrap();
+        let forged_image = Artifact::new(
+            ArtifactRole::PublicEgressQemu,
+            image
+                .path_for(ArtifactRole::PublicEgressQemu)
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+        .with_identity(fake)
+        .with_pin(exe_pin);
+        let copy_image = copy.artifact().unwrap();
+        for (image, policy, refusal) in [
+            (&image, &forged_policy, PolicyMismatch),
+            (&image, &twin_policy, PolicyMismatch),
+            (&forged_image, &policy, BinaryMismatch),
+            (&copy_image, &policy, BinaryMismatch),
+        ] {
+            let sealed = recipe(image, policy);
+            let plan = sealed.plan().unwrap();
             assert_eq!(admit_against(&plan, evidence, &reviewed), Err(refusal));
         }
+        // A plan that faithfully names and holds other executable bytes is
+        // still refused: the held bytes must be the qualified build.
+        let other_image = other.artifact().unwrap();
+        let sealed = recipe(&other_image, &policy);
+        let plan = sealed.plan().unwrap();
+        let faithful = EgressEvidence {
+            executable: Some(&other),
+            ..evidence
+        };
+        assert_eq!(
+            admit_against(&plan, faithful, &reviewed),
+            Err(BinaryMismatch)
+        );
     }
 
     mod fixtures {
         use super::*;
 
+        #[cfg(windows)]
         pub(super) fn route() -> RouteObservation {
             RouteObservation {
                 interface_index: 12,
@@ -996,8 +1422,15 @@ mod tests {
                     .unwrap();
             }
             #[cfg(windows)]
-            protect(dir.path(), true);
+            protect(dir.path());
             PrivateDir(dir)
+        }
+
+        fn digest(body: &[u8]) -> ArtifactPin {
+            ArtifactPin {
+                size: body.len() as u64,
+                sha256: Sha256::digest(body).into(),
+            }
         }
 
         pub(super) fn write_private(dir: &Path, name: &str, body: &[u8]) -> ArtifactPin {
@@ -1009,16 +1442,19 @@ mod tests {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
             }
             #[cfg(windows)]
-            protect(&path, false);
-            ArtifactPin {
-                size: body.len() as u64,
-                sha256: Sha256::digest(body).into(),
-            }
+            protect(&path);
+            digest(body)
         }
 
-        /// TokenUser owner and a protected DACL granting only TokenUser.
+        pub(super) fn write_executable(dir: &Path, name: &str, body: &[u8]) -> ArtifactPin {
+            std::fs::write(dir.join(name), body).unwrap();
+            digest(body)
+        }
+
+        /// TokenUser owner and a protected DACL with one explicit,
+        /// non-inheritable TokenUser FullControl entry.
         #[cfg(windows)]
-        fn protect(path: &Path, directory: bool) {
+        fn protect(path: &Path) {
             use std::{os::windows::ffi::OsStrExt, ptr};
             use windows_sys::Win32::{
                 Foundation::{CloseHandle, LocalFree},
@@ -1045,8 +1481,7 @@ mod tests {
                 let n = (0..184).find(|i| *text.add(*i) == 0).unwrap();
                 let sid_text = String::from_utf16(std::slice::from_raw_parts(text, n)).unwrap();
                 LocalFree(text.cast());
-                let flags = if directory { "OICI" } else { "" };
-                let sddl: Vec<u16> = format!("D:P(A;{flags};FA;;;{sid_text})")
+                let sddl: Vec<u16> = format!("D:P(A;;FA;;;{sid_text})")
                     .encode_utf16()
                     .chain(Some(0))
                     .collect();
@@ -1092,6 +1527,7 @@ mod tests {
 
         /// An unbacked 11.1.x qcow2 v3 header: magic, version 3, cluster bits
         /// 16, 1 MiB size, refcount order 4 and a 112-byte header length.
+        #[cfg(windows)]
         pub(super) fn qcow2_header() -> Vec<u8> {
             let mut header = vec![0; crate::vm::qemu_img::CLUSTER];
             header[..4].copy_from_slice(&[b'Q', b'F', b'I', 0xfb]);

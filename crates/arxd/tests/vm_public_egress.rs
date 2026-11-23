@@ -8,9 +8,9 @@ use arxd::{
         paths::{Artifact, ArtifactPin, ArtifactRole, FileIdentity, LocalPath},
         public_egress::{
             CustodiedPolicy, EGRESS_MANIFEST, EgressBinaryPin, EgressEvidence, EgressRefusal,
-            FROZEN_DENY, FlowRefusal, GuestFlow, Ipv4Cidr, LocalForward, MAX_POLICY_BYTES,
-            MAX_POLICY_DENY, PublicEgressPolicy, RouteObservation, STOCK_QEMU_1113,
-            STOCK_RECEIPT_1113_SHA256, SYNTHETIC_SUBNET, Transport, admit,
+            FROZEN_DENY, FlowRefusal, GuestFlow, HeldExecutable, Ipv4Cidr, LocalForward,
+            MAX_POLICY_BYTES, MAX_POLICY_DENY, PublicEgressPolicy, RouteObservation,
+            STOCK_QEMU_1113, STOCK_RECEIPT_1113_SHA256, SYNTHETIC_SUBNET, Transport, admit,
         },
         qemu_args::{BootPurpose, BootRecipe, NETWORK, PlanKind, SerialName, StaticNetwork},
         runtime::NativeRefusal,
@@ -108,7 +108,15 @@ impl Inputs {
         use ArtifactRole::*;
         Self {
             stock: artifact(Qemu, "D:/qemu/qemu-system-x86_64.exe"),
-            patched: artifact(PublicEgressQemu, "D:/qemu-egress/qemu-system-x86_64.exe"),
+            patched: artifact(PublicEgressQemu, "D:/qemu-egress/qemu-system-x86_64.exe")
+                .with_identity(FileIdentity {
+                    volume: 2,
+                    file: [9; 16],
+                })
+                .with_pin(ArtifactPin {
+                    size: 30_000_000,
+                    sha256: [0xa1; 32],
+                }),
             data: artifact(Data, "D:/qemu/share"),
             firmware: artifact(FirmwareCode, "D:/firmware/code.fd"),
             static_vars: artifact(StaticVars, "D:/vm/vars.fd"),
@@ -237,6 +245,11 @@ fn public_egress_requires_the_patched_image_and_a_custodied_bounded_policy() {
                 .is_err()
         );
     }
+    let unheld_image = artifact(PublicEgressQemu, "D:/qemu-egress/qemu-system-x86_64.exe");
+    assert!(
+        inputs.recipe(&unheld_image, egress(&good)).plan().is_err(),
+        "the patched image must name a held, pinned object"
+    );
     let restricted = BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::RestrictedOrigin);
     assert!(
         inputs.recipe(&inputs.patched, restricted).plan().is_err(),
@@ -442,6 +455,16 @@ fn policy_parse_accepts_exactly_the_v1_contract() {
             "duplicate",
         ),
         (seal(HEAD, &[" 45.12.8.0/24"]), PolicyMalformed, "space"),
+        (
+            seal(&head("source=192.168.1.20", "source=0.0.0.0"), &SITE),
+            PolicyMalformed,
+            "unspecified source",
+        ),
+        (
+            seal(&head("gateway=192.168.1.1", "gateway=0.0.0.0"), &SITE),
+            PolicyMalformed,
+            "unspecified gateway",
+        ),
         (
             seal(&head("gateway=192.168.1.1", "gateway=192.168.1.20"), &SITE),
             PolicyIncomplete,
@@ -779,7 +802,7 @@ impl PrivateDir {
         #[cfg(unix)]
         set_mode(dir.path(), 0o700);
         #[cfg(windows)]
-        win::protect(dir.path(), true, false);
+        win::protect(dir.path());
         Self(dir)
     }
 
@@ -793,7 +816,7 @@ impl PrivateDir {
         #[cfg(unix)]
         set_mode(&path, 0o600);
         #[cfg(windows)]
-        win::protect(&path, false, false);
+        win::protect(&path);
         digest_pin(body)
     }
 }
@@ -864,11 +887,46 @@ fn custody_reads_the_pinned_policy_read_only_through_a_held_handle() {
     #[cfg(unix)]
     set_mode(&dir.path().join("shared.txt"), 0o644);
     #[cfg(windows)]
-    win::protect(&dir.path().join("shared.txt"), false, true);
+    win::set_dacl(
+        &dir.path().join("shared.txt"),
+        "(A;;FA;;;{u})(A;;FR;;;WD)",
+        true,
+    );
     assert_eq!(
         CustodiedPolicy::open(dir.path(), "shared.txt", shared).unwrap_err(),
         PolicyCustody
     );
+    // Windows: an unprotected DACL, or an inheritable entry on the anchor,
+    // is weaker than the ADR 0054 owner-only rule.
+    #[cfg(windows)]
+    {
+        let unprotected = dir.write("unprotected.txt", body.as_bytes());
+        win::set_dacl(&dir.path().join("unprotected.txt"), "(A;;FA;;;{u})", false);
+        assert_eq!(
+            CustodiedPolicy::open(dir.path(), "unprotected.txt", unprotected).unwrap_err(),
+            PolicyCustody
+        );
+        let system = dir.write("system.txt", body.as_bytes());
+        win::set_dacl(
+            &dir.path().join("system.txt"),
+            "(A;;FA;;;{u})(A;;FA;;;SY)",
+            true,
+        );
+        assert_eq!(
+            CustodiedPolicy::open(dir.path(), "system.txt", system).unwrap_err(),
+            PolicyCustody
+        );
+        let inheriting = dir.path().join("inheriting");
+        std::fs::create_dir(&inheriting).unwrap();
+        let inner = dir.write("inheriting/policy.txt", body.as_bytes());
+        win::set_dacl(&inheriting, "(A;OICI;FA;;;{u})", true);
+        assert_eq!(
+            CustodiedPolicy::open(&inheriting, "policy.txt", inner).unwrap_err(),
+            PolicyCustody
+        );
+        win::set_dacl(&inheriting, "(A;;FA;;;{u})", true);
+        assert!(CustodiedPolicy::open(&inheriting, "policy.txt", inner).is_ok());
+    }
     // Replacement while custody lives: Windows refuses the rename outright;
     // POSIX allows it and `verify` detects the different object.
     let replacement = dir.path().join("replacement.txt");
@@ -910,34 +968,92 @@ fn custody_refuses_links_and_a_shared_anchor() {
     );
 }
 
-fn admission_fixture() -> (PrivateDir, ArtifactPin) {
+#[test]
+fn the_patched_executable_is_held_read_only_and_measured() {
+    use EgressRefusal::*;
     let dir = PrivateDir::new();
-    let pin = dir.write("policy.txt", policy_text().as_bytes());
-    (dir, pin)
+    let body = b"patched qemu bytes";
+    std::fs::write(dir.path().join("qemu.exe"), body).unwrap();
+    let pin = digest_pin(body);
+    let held = HeldExecutable::open(&dir.path().join("qemu.exe"), pin).unwrap();
+    assert_eq!(held.pin(), pin);
+    assert_eq!(held.verify(), Ok(()));
+    let other = ArtifactPin {
+        sha256: [0; 32],
+        ..pin
+    };
+    assert_eq!(
+        HeldExecutable::open(&dir.path().join("qemu.exe"), other).unwrap_err(),
+        BinaryMismatch
+    );
+    assert_eq!(
+        HeldExecutable::open(&dir.path().join("qemu.exe"), ArtifactPin { size: 0, ..pin })
+            .unwrap_err(),
+        BinaryCustody
+    );
+    assert_eq!(
+        HeldExecutable::open(&dir.path().join("missing.exe"), pin).unwrap_err(),
+        BinaryCustody
+    );
+    std::fs::write(dir.path().join("linked.exe"), body).unwrap();
+    std::fs::hard_link(dir.path().join("linked.exe"), dir.path().join("alias.exe")).unwrap();
+    assert_eq!(
+        HeldExecutable::open(&dir.path().join("linked.exe"), pin).unwrap_err(),
+        BinaryCustody
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.path().join("qemu.exe"), dir.path().join("link.exe"))
+            .unwrap();
+        assert_eq!(
+            HeldExecutable::open(&dir.path().join("link.exe"), pin).unwrap_err(),
+            BinaryCustody
+        );
+    }
+    #[cfg(windows)]
+    {
+        std::fs::write(dir.path().join("swap.exe"), body).unwrap();
+        assert!(
+            std::fs::rename(dir.path().join("swap.exe"), dir.path().join("qemu.exe")).is_err(),
+            "held executable was replaced"
+        );
+        assert!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join("qemu.exe"))
+                .is_err(),
+            "held executable is writable"
+        );
+        assert_eq!(held.verify(), Ok(()));
+        assert!(held.artifact().is_ok());
+    }
 }
 
 #[test]
 fn admission_refuses_missing_or_mismatched_evidence_with_typed_reasons() {
-    let (dir, pin) = admission_fixture();
+    let dir = PrivateDir::new();
+    let pin = dir.write("policy.txt", policy_text().as_bytes());
     let custodied = CustodiedPolicy::open(dir.path(), "policy.txt", pin).unwrap();
+    let exe_body = b"patched qemu bytes";
+    std::fs::write(dir.path().join("qemu.exe"), exe_body).unwrap();
+    let exe_pin = digest_pin(exe_body);
+    let executable = HeldExecutable::open(&dir.path().join("qemu.exe"), exe_pin).unwrap();
     let inputs = Inputs::new();
     let lease = OriginPortLease::acquire().unwrap();
-    let policy = policy_artifact(pin);
-    let plan = inputs.recipe(
+    // A plan naming another object that carries the same policy pin.
+    let forged = policy_artifact(pin);
+    let forged_plan = inputs.recipe(
         &inputs.patched,
-        BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::PublicEgress(&policy)),
+        BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::PublicEgress(&forged)),
     );
-    let plan = plan.plan().unwrap();
+    let forged_plan = forged_plan.plan().unwrap();
     let restricted = inputs.recipe(
         &inputs.stock,
         BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::RestrictedOrigin),
     );
     let restricted = restricted.plan().unwrap();
     let patched = EgressBinaryPin {
-        qemu: ArtifactPin {
-            size: 30_000_000,
-            sha256: [0xa1; 32],
-        },
+        qemu: exe_pin,
         receipt: ArtifactPin {
             size: 4096,
             sha256: [0xa2; 32],
@@ -951,22 +1067,20 @@ fn admission_refuses_missing_or_mismatched_evidence_with_typed_reasons() {
         },
     };
     let route = route();
-    let drifted = RouteObservation {
-        gateway: Ipv4Addr::new(192, 168, 1, 254),
-        ..route
+    let other_enrolled = ArtifactPin {
+        sha256: [0x55; 32],
+        ..pin
     };
     let full = EgressEvidence {
         policy: Some(&custodied),
+        enrolled_policy: Some(&pin),
         route: Some(&route),
         binary: Some(&patched),
-        measured: Some(&patched),
+        executable: Some(&executable),
     };
-    let other_dir = PrivateDir::new();
-    let other_pin = other_dir.write("policy.txt", seal(HEAD, &["45.12.8.0/24"]).as_bytes());
-    let other = CustodiedPolicy::open(other_dir.path(), "policy.txt", other_pin).unwrap();
 
     use EgressRefusal::*;
-    assert_eq!(admit(&restricted, full), Err(PlanMismatch));
+    let mut checked = vec![(admit(&restricted, full), PlanMismatch)];
     for (evidence, refusal) in [
         (EgressEvidence::default(), PolicyMissing),
         (
@@ -978,44 +1092,80 @@ fn admission_refuses_missing_or_mismatched_evidence_with_typed_reasons() {
         ),
         (
             EgressEvidence {
-                policy: Some(&other),
+                enrolled_policy: None,
+                ..full
+            },
+            PolicyMissing,
+        ),
+        (
+            EgressEvidence {
+                enrolled_policy: Some(&other_enrolled),
                 ..full
             },
             PolicyMismatch,
         ),
-        (
-            EgressEvidence {
-                route: None,
-                ..full
-            },
-            RouteUnknown,
-        ),
-        (
-            EgressEvidence {
-                route: Some(&drifted),
-                ..full
-            },
-            RouteMismatch,
-        ),
-        (
-            EgressEvidence {
-                binary: None,
-                ..full
-            },
-            BinaryMissing,
-        ),
-        (
-            EgressEvidence {
-                binary: Some(&stock),
-                measured: Some(&stock),
-                ..full
-            },
-            BinaryStock,
-        ),
-        // No reviewed receipt exists yet, so even a complete set refuses.
-        (full, BinaryUnqualified),
+        (full, PolicyMismatch),
     ] {
-        assert_eq!(admit(&plan, evidence), Err(refusal));
+        checked.push((admit(&forged_plan, evidence), refusal));
+    }
+    // Only a Windows drive path can name a plan input, so the bound plan is
+    // sealed from the held objects there; POSIX custody cannot bind at all.
+    #[cfg(windows)]
+    {
+        let policy = custodied.artifact().unwrap();
+        let image = executable.artifact().unwrap();
+        let bound = inputs.recipe(
+            &image,
+            BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::PublicEgress(&policy)),
+        );
+        let bound = bound.plan().unwrap();
+        let drifted = RouteObservation {
+            gateway: Ipv4Addr::new(192, 168, 1, 254),
+            ..route
+        };
+        for (evidence, refusal) in [
+            (
+                EgressEvidence {
+                    route: None,
+                    ..full
+                },
+                RouteUnknown,
+            ),
+            (
+                EgressEvidence {
+                    route: Some(&drifted),
+                    ..full
+                },
+                RouteMismatch,
+            ),
+            (
+                EgressEvidence {
+                    binary: None,
+                    ..full
+                },
+                BinaryMissing,
+            ),
+            (
+                EgressEvidence {
+                    binary: Some(&stock),
+                    ..full
+                },
+                BinaryStock,
+            ),
+            // No reviewed build exists yet, so even a complete set refuses.
+            (full, BinaryUnqualified),
+        ] {
+            checked.push((admit(&bound, evidence), refusal));
+        }
+    }
+    #[cfg(unix)]
+    {
+        let _ = stock;
+        assert_eq!(custodied.artifact().unwrap_err(), PolicyCustody);
+        assert_eq!(executable.artifact().unwrap_err(), BinaryCustody);
+    }
+    for (result, refusal) in checked {
+        assert_eq!(result, Err(refusal));
         assert_eq!(
             NativeRefusal::from(refusal),
             NativeRefusal::NetworkFenceUnverified
@@ -1160,9 +1310,14 @@ mod win {
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
 
-    /// TokenUser owner with a protected DACL granting only TokenUser, plus
-    /// an Everyone read grant when `shared`.
-    pub(super) fn protect(path: &Path, directory: bool, shared: bool) {
+    /// TokenUser owner and a protected DACL with one explicit,
+    /// non-inheritable TokenUser FullControl entry.
+    pub(super) fn protect(path: &Path) {
+        set_dacl(path, "(A;;FA;;;{u})", true);
+    }
+
+    /// TokenUser owner and the DACL `aces`, where `{u}` names TokenUser.
+    pub(super) fn set_dacl(path: &Path, aces: &str, protected: bool) {
         // Test-only Win32 calls on owned buffers that outlive each use.
         unsafe {
             let mut token = ptr::null_mut();
@@ -1182,9 +1337,7 @@ mod win {
             let n = (0..184).find(|i| *text.add(*i) == 0).unwrap();
             let sid_text = String::from_utf16(std::slice::from_raw_parts(text, n)).unwrap();
             LocalFree(text.cast());
-            let flags = if directory { "OICI" } else { "" };
-            let extra = if shared { "(A;;FR;;;WD)" } else { "" };
-            let sddl: Vec<u16> = format!("D:P(A;{flags};FA;;;{sid_text}){extra}")
+            let sddl: Vec<u16> = format!("D:{}", aces.replace("{u}", &sid_text))
                 .encode_utf16()
                 .chain(Some(0))
                 .collect();
@@ -1203,11 +1356,16 @@ mod win {
                 GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted),
                 0
             );
+            let protection = if protected {
+                PROTECTED_DACL_SECURITY_INFORMATION
+            } else {
+                UNPROTECTED_DACL_SECURITY_INFORMATION
+            };
             let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
             let dacl = SetNamedSecurityInfoW(
                 wide.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                DACL_SECURITY_INFORMATION | protection,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 acl,

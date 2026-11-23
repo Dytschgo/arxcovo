@@ -126,6 +126,7 @@ enum Binding<'a> {
     PublicEgress {
         lease: &'a OriginPortLease,
         policy: &'a Artifact,
+        image: &'a Artifact,
     },
     Installer(InstallerPhase, Vec<InstallerArtifact<'a>>),
     Inspect,
@@ -178,6 +179,14 @@ impl<'a> CommandPlan<'a> {
     pub fn public_egress_policy(&self) -> Option<&'a Artifact> {
         match self.binding {
             Binding::PublicEgress { policy, .. } => Some(policy),
+            _ => None,
+        }
+    }
+
+    /// The held patched executable a public-egress plan launches.
+    pub fn public_egress_image(&self) -> Option<&'a Artifact> {
+        match self.binding {
+            Binding::PublicEgress { image, .. } => Some(image),
             _ => None,
         }
     }
@@ -385,6 +394,9 @@ impl BootRecipe<'_> {
                 "virtio-net-pci,netdev=arxnet0",
             ),
         };
+        if image_role == PublicEgressQemu {
+            held_executable(self.image)?;
+        }
         let approved = match (self.backing, self.backing_header) {
             (Some(golden), Some(header)) => {
                 inspect_header(header, None).map_err(|InvalidImage| InvalidPath)?;
@@ -485,9 +497,11 @@ impl BootRecipe<'_> {
             None => match static_origin {
                 None => Binding::Boot,
                 Some((lease, StaticNetwork::RestrictedOrigin)) => Binding::StaticWeb(lease),
-                Some((lease, StaticNetwork::PublicEgress(policy))) => {
-                    Binding::PublicEgress { lease, policy }
-                }
+                Some((lease, StaticNetwork::PublicEgress(policy))) => Binding::PublicEgress {
+                    lease,
+                    policy,
+                    image: self.image,
+                },
             },
             Some(phase) => {
                 let mut artifacts = Vec::new();
@@ -563,6 +577,17 @@ impl BootRecipe<'_> {
         }
         Ok(())
     }
+}
+
+/// The patched executable must name a held object: identity and a bounded pin.
+fn held_executable(image: &Artifact) -> Result<(), InvalidPath> {
+    let pinned = image
+        .pin()
+        .is_some_and(|pin| (1..=super::public_egress::MAX_EXECUTABLE_BYTES).contains(&pin.size));
+    if image.identity().is_none() || !pinned {
+        return Err(InvalidPath);
+    }
+    Ok(())
 }
 
 /// The policy must be a custodied, pinned, bounded read-only artifact.
