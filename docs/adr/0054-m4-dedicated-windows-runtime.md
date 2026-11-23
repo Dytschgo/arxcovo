@@ -183,14 +183,9 @@ and the 180 s budget against real cold boots are **unverified on real
 hardware** against the pinned QEMU, EDK2 and guest binaries. Readiness on a
 real guest also requires the guest-side reset PR to land first.
 
-Installer boots are refused. A plan with installer media is
-`PlanKind::InstallerBoot`, and the native launcher's first check, before any
-handle, Job or process exists, returns `InstallerPhaseUnavailable`. No guest
-service runs during installation, so the installer phase needs a QMP-only
-power-off observation and the two-medium (ISO plus CIDATA) recipe. Both are
-deferred to the explicit runtime-fence follow-up proposed in the slice 4
-design (§1 last row, §4 step 2, §7). The installer phase stays an
-activation gate.
+The initial slice refused installer plans with `InstallerPhaseUnavailable`.
+The installer amendment below supplies their QMP-only startup and poweroff
+observation. Production dispatch remains subject to the activation gates.
 
 Graceful stop requires a
 matching guest shutdown event, a clean child exit, Job-empty, worker joins
@@ -314,8 +309,6 @@ server PID differs. Other tests cover:
   - a stalled frame refuses after 10 s;
   - cancellation stops the wait;
   - a reply that is ready together with the expired deadline refuses;
-- an installer recipe refused with `InstallerPhaseUnavailable` at the
-  launcher's first check;
 - the 112-byte 11.1.x create headers, with each refused feature,
   compression and extension case, and boot recipes with foreign, missing or
   extra backing references or an external data file;
@@ -389,3 +382,75 @@ on any replacement. Native admission stays closed. M4 native activation
 still requires the amendment in ADR 0058 that replaces the dedicated-account
 identity gate with the `current_user` identity gate.
 [Upstream stable comparison](https://gitlab.com/qemu-project/qemu/-/compare/v11.1.0...v11.1.3)
+
+## Amendment — Typed installer boot and passive poweroff
+
+The sealed launcher admits three QMP-only purposes under the existing
+operation-bound authority. Each requires a backing-less TEST installation
+disk and private writable VARS. The Ubuntu plan attaches the official ISO
+at q35 AHCI port 0 and CIDATA at port 1. It loads the pinned kernel and
+initrd directly, with the fixed append string `autoinstall ds=nocloud ---`.
+The Windows Setup plan attaches the official ISO at q35 AHCI port 0 and
+the answer and driver media at ports 0 and 1 of the additional AHCI
+controller at PCI address 0x1e. The Windows finalization plan boots only
+the disk and VARS. Optical nodes are explicit read-only raw devices.
+All three plans supply the existing named virtio-serial port through a
+null backend. Installed boot retains the private serial pipe and existing
+argv and readiness policy.
+
+Windows Setup uses a distinct, content-pinned initial private VARS role.
+Its qualification binds UEFI BootNext to the exact official ISO's
+noninteractive boot entry and requires persistent disk-only boot selection
+after the one-shot entry is consumed. Setup argv supplies neither a legacy
+boot order nor boot indexes. The firmware and installer pin must prove the
+initial CD handoff, its consumption, and disk boot through Setup resets.
+Later boots reuse the resulting candidate VARS as the ordinary writable
+role. The runtime matches the expected role, object identity and recipe
+pin against retained custody. For initial Windows Setup, the launcher
+reopens the same VARS under its held parent with deny-write sharing and
+rechecks the content pin through that handle before suspended creation.
+It retains the write exclusion until the handoff immediately before
+resuming QEMU, whose writable pflash open requires it. The ordinary
+object and ancestor pins stay held throughout. The remaining interval
+before QEMU's by-name open falls under the activation custody gate. The
+authority issuer must bind those inputs to the qualified recipe,
+operation and generation. There is no issuer.
+[QEMU boot selection](https://www.qemu.org/docs/master/system/bootindex.html) · [Windows file sharing](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+
+Installer startup shares the creation-time Job, QMP greeting,
+capabilities, prelaunch status, and resource-gated dispatch of cont. Its
+dispatch cutoff is clipped to the stage deadline. Completion waits on QMP
+and rechecks resources every five seconds. Windows Setup permits at most
+16 typed guest resets and expires after one hour without reset progress or
+poweroff. Ubuntu installation and Windows finalization refuse resets.
+All three require a validated SHUTDOWN from the guest with reason
+guest-shutdown. A STOP allows two seconds for that event. Host shutdown,
+panic, invalid or excessive events and early EOF fail the phase. Installed
+stop keeps its own solicited powerdown path.
+[QMP run-state events](https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html#vm-run-state)
+
+The lifecycle starts one monotonic recipe budget before its first launch.
+The maximum is 60 minutes for Ubuntu and three hours for Windows. Stages
+can only shorten the remaining deadline. Windows uses the same budget for
+detached installed-mode health, disk-only finalization and later detached
+verification. Reset and retry do not extend the absolute deadline.
+Terminal observation is followed by a clean held-process exit, empty Job,
+joined workers, exclusive reopen of disk and VARS, and the caller's bound
+generation release check before media custody can end. The reopen and
+read-only generation check run in a dedicated worker that owns custody
+for as long as it runs. Only the async caller can accept its evidence
+before the absolute release deadline. On expiry the caller closes the
+result channel, requests cancellation of pending worker I/O, and returns
+charged quarantine without waiting for that worker. The worker may finish
+an in-flight read, and has no authority to publish, detach, or release the
+generation. Teardown following a failed phase has an independent two-second
+recovery budget. A proved release after a phase failure is dirty. A clean
+installer release permits the next lifecycle step. Detached recipe health
+still gates capture and seal.
+
+The paused-clock and in-memory QMP fixtures cover the startup and poweroff
+contract. Native filesystem fixtures cover exclusive reopen and stale
+Windows Setup VARS. Paused-clock worker fixtures cover the deadline for a
+stalled reopen or generation check and discard evidence after expiry.
+Real Windows Setup, Subiquity, optical topology, one-shot firmware boot
+order and guest reset behavior are **unverified on real hardware**.
