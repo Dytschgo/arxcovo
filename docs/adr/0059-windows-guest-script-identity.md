@@ -39,7 +39,16 @@ The script token is derived from the service token by
   `NT SERVICE\arx-guest` service SID. Entries the source token lacks are ignored.
 - **No privileges.** Every privilege in the source token is deleted, including
   `SeChangeNotifyPrivilege`.
+- **Groups that stay enabled:** every other group in the source token is
+  unchanged. That includes `BUILTIN\Users`, `Authenticated Users`, `Everyone`,
+  `INTERACTIVE`/`SERVICE`, `LOCAL` and the logon SID, so ordinary read grants on
+  system files such as the .NET native images still apply. A test asserts that
+  these three broad groups keep their source attributes. The boundary is Low
+  integrity, no privileges and the Job, not removal of broad read groups.
 - **Explicit default DACL:** `D:(A;;GA;;;SY)(A;;GA;;<token user>)`.
+- **Explicit owner:** the token user. An elevated administrator token defaults
+  ownership to `BUILTIN\Administrators`, which is deny-only here, so objects
+  the script creates would otherwise be owned by a SID that grants it nothing.
 - **No restricting SIDs** and no `WRITE_RESTRICTED`.
 
 The child stays inside the creation-time Job: kill-on-close, 16 active
@@ -102,6 +111,11 @@ production admission closed. Tests inject the policy snapshot. Scripts that
 start their own transcript or enable module logging choose to do so
 themselves.
 
+The policy is checked at admission and again before every request. Each
+request starts a new interpreter that reads the policy afresh, so a value that
+changed or became unreadable after admission makes that request
+`Unavailable`. The check is the same 13 bounded registry reads.
+
 ### Fixed environment and module discovery
 
 The interpreter environment is fixed, sorted and free of caller bytes:
@@ -119,8 +133,35 @@ no cmdlets, so starting them never triggers module discovery. Hosted
 `windows-2025` CI failed admission (`0x80131623`) and timed out under the
 earlier environment, which extended discovery into the image's large Program
 Files module tree. That cause was inferred, not reproduced. The development
-host could not reproduce the failure. The tests print the `.NET Runtime`
-event (1025) on any unexpected PowerShell outcome.
+host could not reproduce the failure.
+
+After that change, hosted CI still ended both restricted runs with
+`0x80131623`. The unrestricted wrapper runs passed. Application Error event
+1000 named `System.Management.Automation.ni.dll`, with one fault offset for both
+runs. That module is where PowerShell's unhandled-exception handler raises
+FailFast: the native image had loaded and was running. The faulting module
+therefore does not show which exception was thrown. The trigger is unknown.
+
+**NGEN decision.** `COMPlus_ZapDisable=1` makes the CLR ignore native images
+and JIT instead. On this host it raises a restricted PowerShell start from
+about 0.18 s to about 1.65 s. It is **not** part of the fixed environment. It
+would only move the fault, at that cost for every request. Instead, failure
+diagnostics re-run the failing script both with and without it.
+
+**Diagnostics.** These run only on an unexpected PowerShell outcome, are
+bounded, and use only children the test launches. The test re-runs the script
+with the child's stdout and stderr captured, so PowerShell's own "An error has
+occurred that was not properly handled" text, with the exception type and
+stack, is printed. It then reports:
+- only `.NET Runtime` and `Application Error` events whose process id is that
+  child, inside the re-run's time window;
+- for the restricted identity, the token owner, integrity and session, and
+  the runner's elevation and UAC setting;
+- owner, a DACL summary and the AccessCheck result for the restricted token
+  on the native-image directories, `System.Management.Automation.ni.dll`,
+  `$PSHOME`, the GAC directory and three registry keys.
+
+Account, machine and user-SID text is removed from the output.
 
 ### Workspaces (D2)
 
@@ -136,9 +177,13 @@ with no result frame.
 Setup and removal run on worker threads that hold no port handle and no
 child. Setup must finish within the request deadline, plus a 2 s grace on
 cancellation. Removal must finish within 2 s, and never later than the
-request deadline plus 4 s, inside the host's budget-plus-5 s allowance. A
-missed step is left detached and the session retires. Nothing waits on it or
-uses its result.
+request deadline plus 4 s, inside the host's budget-plus-5 s allowance. That
+removal deadline is absolute: a late cancellation never restarts a grace
+period beyond it. Likewise, a setup grace never passes the request deadline
+plus 2 s. If a directory created during setup fails verification and cannot be
+removed, the session retires instead of reporting `LaunchFailed`. A missed
+step is left detached and the session retires. Nothing waits on it or uses its
+result.
 
 **Workspace size is `unqualified`.** It is not enforced in v1. Possible
 mechanisms are a fixed-size dedicated volume or an NTFS quota. A quota is per
