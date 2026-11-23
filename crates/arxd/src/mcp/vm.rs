@@ -240,7 +240,9 @@ struct Gate {
     publish_profile: Option<Arc<Profile>>,
     publish_jobs: tokio::task::JoinSet<anyhow::Result<()>>,
     publish_failed: bool,
-    publication_owner: Option<(Id, String, Shutdown)>,
+    /// The VM and principal of the latest admitted publish, held in memory so
+    /// owner revocation needs neither SQLite nor the effects slot.
+    publication_owner: Option<(Id, String)>,
     #[cfg(test)]
     fixture: Option<tests::Fixture>,
     #[cfg(test)]
@@ -1170,16 +1172,22 @@ impl VmInventory {
             ),
             _ => Subject::Vm(request.id),
         };
-        match controller.foreground_replay(&self.principal, request.key, subject, action) {
+        let replay = controller.foreground_replay(&self.principal, request.key, subject, action);
+        // Owner revocation precedes the replay-ledger, headroom, pending-limit
+        // and audit checks. A same-key replay is status-only, and a colliding
+        // or stale key is a request fault with no effect authority.
+        let request_fault = matches!(
+            replay,
+            Ok(Ok(Some(_))) | Ok(Err(Refusal::KeyCollision | Refusal::StaleKey))
+        );
+        if action == UNPUBLISH_ACTION && !request_fault {
+            self.revoke_publication(gate, request.id);
+        }
+        match replay {
             Ok(Ok(Some(replay))) => return Ok(receipt(replay.operation.id, replay.lease_end)),
             Ok(Ok(None)) => {}
             Ok(Err(reason)) => return self.refuse(action, request.vm(), reason.into()),
-            Err(error) => {
-                if action == UNPUBLISH_ACTION {
-                    self.stop_unaudited_publication(gate, request.id);
-                }
-                return Err(error.into());
-            }
+            Err(error) => return Err(error.into()),
         }
         // Scope and subject state precede native or fixture eligibility.
         let subject = match &request.work {
@@ -1231,20 +1239,19 @@ impl VmInventory {
         )
     }
 
-    /// A failed store must not keep a confirmed caller-owned Job reachable.
-    /// Retire the in-memory boot witness and leave the durable DNS intent for recovery.
-    fn stop_unaudited_publication(&self, gate: &mut Gate, vm: Id) {
-        let Some((_, _, retired)) = gate
+    /// Stops local ingress for the verified in-memory owner of `vm` before any
+    /// store, slot or DNS dependency. A failed stop stays retryable: every
+    /// later owner unpublish and reaper turn retries it.
+    fn revoke_publication(&self, gate: &mut Gate, vm: Id) {
+        if !gate
             .publication_owner
             .as_ref()
-            .filter(|(id, owner, _)| *id == vm && *owner == self.principal)
-        else {
-            return;
-        };
-        if retired.is_cancelled() {
+            .is_some_and(|(id, owner)| *id == vm && *owner == self.principal)
+        {
             return;
         }
-        retired.cancel();
+        let publisher = &self.supervisor.publisher;
+        publisher.revoke(vm);
         let supervisor = self.supervisor.clone();
         gate.publish_jobs.spawn(async move {
             anyhow::ensure!(
@@ -1264,16 +1271,7 @@ impl VmInventory {
         if publish && !gate.allow_agent_public_sites {
             return refuse(Refusal::PublicSitesDisabled);
         }
-        let mut owned = match controller.foreground_static_rows(&self.principal, Some(vm), None, 1)
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                if !publish {
-                    self.stop_unaudited_publication(gate, vm);
-                }
-                return Err(error.into());
-            }
-        };
+        let mut owned = controller.foreground_static_rows(&self.principal, Some(vm), None, 1)?;
         let Some(row) = owned.pop() else {
             return refuse(Refusal::NotFound);
         };
@@ -1283,8 +1281,15 @@ impl VmInventory {
         if publish && gate.publish_failed {
             return refuse(Refusal::StateUnavailable);
         }
-        let Some(slot) = supervisor.publisher.claim() else {
-            return refuse(Refusal::Busy);
+        // Publish needs the free effects slot. Unpublish never waits here: its
+        // local stop already ran, and its worker queues for the slot.
+        let slot = if publish {
+            let Some(slot) = supervisor.publisher.claim() else {
+                return refuse(Refusal::Busy);
+            };
+            Some(slot)
+        } else {
+            None
         };
         let prepared = if publish {
             let Some(profile) = gate.publish_profile.as_ref() else {
@@ -1323,21 +1328,17 @@ impl VmInventory {
         ) {
             Ok(Ok(operation)) => operation,
             Ok(Err(reason)) => return refuse(reason),
-            Err(error) => {
-                if !publish {
-                    self.stop_unaudited_publication(gate, vm);
-                }
-                return Err(error.into());
-            }
+            Err(error) => return Err(error.into()),
         };
-        if let Some((_, _, origin)) = &prepared {
-            gate.publication_owner = Some((vm, self.principal.clone(), origin.retired.clone()));
-        }
+        let revoked = prepared.is_some().then(|| {
+            gate.publication_owner = Some((vm, self.principal.clone()));
+            supervisor.publisher.activation(vm)
+        });
         let supervisor = supervisor.clone();
         gate.publish_jobs.spawn(async move {
-            let _slot = slot;
-            match prepared {
-                Some((intent, credentials, origin)) => {
+            match (prepared, revoked) {
+                (Some((intent, credentials, origin)), Some(revoked)) => {
+                    let _slot = slot;
                     supervisor
                         .publisher
                         .publish(
@@ -1346,11 +1347,13 @@ impl VmInventory {
                             intent,
                             credentials,
                             origin,
+                            &revoked,
                             &supervisor.cancel,
                         )
                         .await
                 }
-                None => {
+                _ => {
+                    let _slot = supervisor.publisher.slot().await;
                     supervisor
                         .publisher
                         .unpublish(&supervisor.controller, operation, vm, &supervisor.cancel)
@@ -3867,6 +3870,338 @@ mod tests {
                 "static_delete_forbidden"
             );
         }
+        h.shutdown().await.unwrap();
+    }
+
+    /// A running static VM enrolled for publication with a fake connector and
+    /// DNS API holding valid synthetic credentials. Keys `base..base+3`.
+    async fn enrolled(
+        h: &Harness,
+        a: &Client,
+        base: u64,
+    ) -> (Value, Arc<crate::vm::runtime::publication::Fake>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let build = call(
+            a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(WEB_RECIPE_ID), "request_id":key(base)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(a, &build).await["template_id"].clone();
+        let site = call(
+            a,
+            "static_vm_create",
+            json!({"name":"tunnel-site","template_id":template,"request_id":key(base + 1)}),
+        )
+        .await;
+        let vm = terminal(a, &site).await["vm_id"].clone();
+        let start = call(
+            a,
+            "vm_start",
+            json!({"vm_id":vm,"request_id":key(base + 2)}),
+        )
+        .await;
+        assert_eq!(terminal(a, &start).await["state"], "succeeded");
+        let fake = Arc::new(crate::vm::runtime::publication::Fake::default());
+        fake.credential.store(true, SeqCst);
+        enroll(
+            h,
+            &fake,
+            true,
+            Profile::synthetic(h.supervisor().host_id, "tunnel-site"),
+        );
+        (vm, fake)
+    }
+
+    fn enroll(
+        h: &Harness,
+        fake: &Arc<crate::vm::runtime::publication::Fake>,
+        allow: bool,
+        profile: Profile,
+    ) {
+        let supervisor = h.supervisor();
+        *supervisor.publisher.fake.lock().unwrap() = Some(fake.clone());
+        let mut gate = supervisor.gate.lock().unwrap();
+        gate.allow_agent_public_sites = allow;
+        gate.publish_profile = Some(Arc::new(profile));
+    }
+
+    async fn until(mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("condition not reached");
+    }
+
+    async fn phase(a: &Client, vm: &Value) -> Value {
+        call(a, "publish_status", json!({"vm_id":vm})).await
+    }
+
+    async fn settle(h: &Harness, a: &Client, vm: &Value) -> Value {
+        h.tick().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row = phase(a, vm).await;
+                if row["phase"] == "unpublished" {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("publication did not settle")
+    }
+
+    #[tokio::test]
+    async fn owner_unpublish_stops_local_ingress_before_dns_slot_and_store_pressure() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let b = h.client(1).await;
+        let (vm, fake) = enrolled(&h, &a, 700).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+
+        // A held DNS POST keeps the effects slot. Owner revocation still wins.
+        let (entered, in_post) = tokio::sync::oneshot::channel();
+        let (release, hold) = tokio::sync::oneshot::channel();
+        *fake.post_gate.lock().unwrap() = Some((entered, hold));
+        let pending = call(&a, "publish_site", args(710)).await;
+        tokio::time::timeout(Duration::from_secs(2), in_post)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fake.local.load(SeqCst));
+        // A foreign caller can neither see nor revoke the publication.
+        assert_eq!(
+            call(&b, "unpublish_site", args(711)).await["reason"],
+            "not_found"
+        );
+        assert!(fake.local.load(SeqCst));
+        let revoke = call(&a, "unpublish_site", args(712)).await;
+        assert_eq!(revoke["ok"], true, "{revoke}");
+        until(|| !fake.local.load(SeqCst)).await;
+        assert_eq!(fake.posts.load(SeqCst), 1);
+        assert_eq!(phase(&a, &vm).await["phase"], "revoking");
+        release.send(()).unwrap();
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(failed["state"], "failed");
+        assert_eq!(failed["reason"], "cancelled", "{failed}");
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (1, 1));
+        assert!(!fake.record.load(SeqCst));
+
+        // Exhausted store headroom refuses the unpublish after stopping ingress.
+        let published = call(&a, "publish_site", args(713)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert!(fake.local.load(SeqCst));
+        let store = h.supervisor().controller.store_for_test();
+        store
+            .transact(|db| {
+                db.execute_batch("CREATE TABLE pressure(filler BLOB) STRICT")?;
+                while crate::store::vm::headroom(db)? {
+                    db.execute("INSERT INTO pressure VALUES(zeroblob(2048))", [])?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let refused = call(&a, "unpublish_site", args(714)).await;
+        assert_eq!(refused["reason"], "state_headroom", "{refused}");
+        until(|| !fake.local.load(SeqCst)).await;
+        assert!(fake.record.load(SeqCst));
+        store
+            .transact(|db| Ok(db.execute_batch("DROP TABLE pressure")?))
+            .unwrap();
+        // The reaper completes the owner's revocation from the durable intent.
+        assert_eq!(settle(&h, &a, &vm).await["reason"], "cancelled");
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (2, 2));
+
+        // A saturated pending limit refuses after stopping ingress.
+        let published = call(&a, "publish_site", args(715)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert!(fake.local.load(SeqCst));
+        let store = h.supervisor().controller.store_for_test();
+        store
+            .transact(|db| {
+                for _ in 0..crate::store::vm::MAX_CALLER_PENDING {
+                    db.execute(
+                        "INSERT INTO activity(principal,actor,vm,action,started_ms)
+                         VALUES('alpha','agent',randomblob(16),2,0)",
+                        [],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let refused = call(&a, "unpublish_site", args(716)).await;
+        assert_eq!(refused["reason"], "pending_full", "{refused}");
+        until(|| !fake.local.load(SeqCst)).await;
+        store
+            .transact(|db| {
+                db.execute(
+                    "DELETE FROM activity WHERE status=0 AND action=2 AND principal='alpha'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        settle(&h, &a, &vm).await;
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (3, 3));
+
+        // An acknowledged record ID survives a failed verification lookup, so
+        // cleanup settles even though the record vanished before reconciliation.
+        fake.lose_after_post.store(true, SeqCst);
+        let lost = call(&a, "publish_site", args(717)).await;
+        let lost = terminal(&a, &lost).await;
+        assert_eq!(lost["reason"], "dns_unavailable", "{lost}");
+        assert_eq!(lost["cleanup"], "confirmed", "{lost}");
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert!(!fake.local.load(SeqCst));
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (4, 3));
+        drop((a, b));
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_ledger_survives_restart_drift_and_a_late_post() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 800).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let host = h.supervisor().host_id;
+        let original = Profile::synthetic(host, "tunnel-site");
+        let intent = |h: &Harness| h.supervisor().controller.publication_intent().unwrap();
+
+        // Shutdown after durable admission and before any external effect.
+        let (entered, in_preflight) = tokio::sync::oneshot::channel();
+        let (_release, hold) = tokio::sync::oneshot::channel();
+        *fake.preflight_gate.lock().unwrap() = Some((entered, hold));
+        let pending = call(&a, "publish_site", args(810)).await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        tokio::time::timeout(Duration::from_secs(2), in_preflight)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(phase(&a, &vm).await["phase"], "publishing");
+        drop(a);
+        h.shutdown().await.unwrap();
+        let mut h = h.reopen(|_| {}).await;
+        enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
+        let a = h.client(0).await;
+        assert!(intent(&h).is_none());
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert_ne!(terminal(&a, &pending).await["state"], "succeeded");
+        assert_eq!(fake.posts.load(SeqCst), 0);
+        assert!(!fake.local.load(SeqCst));
+
+        // Restart after DNS acknowledgement while cleanup credentials are gone.
+        let start = call(&a, "vm_start", args(811)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let published = call(&a, "publish_site", args(812)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let before = intent(&h).unwrap();
+        assert!(before.record.is_some());
+        fake.credential.store(false, SeqCst);
+        drop(a);
+        h.shutdown().await.unwrap();
+        assert!(!fake.local.load(SeqCst));
+        assert!(fake.record.load(SeqCst));
+
+        // A drifted owner binding with policy off: nothing republishes and
+        // the original route stays pinned.
+        let mut h = h.reopen(|_| {}).await;
+        enroll(
+            &h,
+            &fake,
+            false,
+            Profile::drifted(
+                host,
+                "tunnel-site",
+                "drift.example.invalid",
+                &"d".repeat(32),
+            ),
+        );
+        let a = h.client(0).await;
+        let after = intent(&h).unwrap();
+        assert_eq!(
+            (
+                &after.nonce,
+                after.generation,
+                after.boot,
+                after.revision,
+                &after.zone,
+                &after.hostname,
+                &after.credential_ref,
+                &after.record,
+            ),
+            (
+                &before.nonce,
+                before.generation,
+                before.boot,
+                before.revision,
+                &before.zone,
+                &before.hostname,
+                &before.credential_ref,
+                &before.record,
+            )
+        );
+        assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
+        let revoke = call(&a, "unpublish_site", args(813)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "failed");
+        assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
+        let start = call(&a, "vm_start", args(814)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        fake.credential.store(true, SeqCst);
+        h.supervisor().gate.lock().unwrap().allow_agent_public_sites = true;
+        assert_eq!(
+            call(&a, "publish_site", args(815)).await["reason"],
+            "publish_cleanup_pending"
+        );
+        fake.routes.lock().unwrap().clear();
+        settle(&h, &a, &vm).await;
+        let routes = fake.routes.lock().unwrap().clone();
+        assert!(!routes.is_empty());
+        let pinned = format!("{} publish.example.invalid ", "b".repeat(32));
+        assert!(
+            routes.iter().all(|route| route.starts_with(&pinned)),
+            "{routes:?}"
+        );
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (1, 1));
+        assert!(!fake.local.load(SeqCst));
+
+        // A POST that commits only after the first absence observation.
+        enroll(&h, &fake, true, original);
+        let (late, committed) = tokio::sync::oneshot::channel();
+        *fake.late_commit.lock().unwrap() = Some(committed);
+        let pending = call(&a, "publish_site", args(816)).await;
+        until(|| fake.posts.load(SeqCst) == 2).await;
+        let before = intent(&h).unwrap();
+        assert!(before.post_possible && before.record.is_none());
+        drop(a);
+        h.shutdown().await.unwrap();
+        assert!(!fake.record.load(SeqCst));
+        let mut h = h.reopen(|_| {}).await;
+        enroll(&h, &fake, false, Profile::synthetic(host, "tunnel-site"));
+        let a = h.client(0).await;
+        assert_ne!(terminal(&a, &pending).await["state"], "succeeded");
+        // An observed absence cannot discharge the possible POST.
+        fake.routes.lock().unwrap().clear();
+        h.tick().await;
+        until(|| !fake.routes.lock().unwrap().is_empty()).await;
+        let after = intent(&h).unwrap();
+        assert_eq!((&after.nonce, after.post_possible), (&before.nonce, true));
+        assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
+        late.send(()).unwrap();
+        until(|| fake.record.load(SeqCst)).await;
+        settle(&h, &a, &vm).await;
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (2, 2));
+        assert!(!fake.local.load(SeqCst));
+        drop(a);
         h.shutdown().await.unwrap();
     }
 

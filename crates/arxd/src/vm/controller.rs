@@ -1959,3 +1959,11 @@ impl<C: Clock> VmController<C> {
         })
     }
 }
+
+#[cfg(test)]
+impl<C: Clock> VmController<C> {
+    /// Direct store access for pressure and ledger witnesses.
+    pub(crate) fn store_for_test(&self) -> &VmStore {
+        &self.store
+    }
+}

@@ -11,9 +11,13 @@ mod security;
 mod vm {
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub use arxd::vm::paths;
-    #[allow(
-        dead_code,
-        reason = "compile the private B1 transport against loopback fixtures"
+    // Elsewhere the module's own Windows-only allowance applies.
+    #[cfg_attr(
+        all(windows, target_arch = "x86_64"),
+        allow(
+            dead_code,
+            reason = "compile the private transport against loopback fixtures"
+        )
     )]
     #[path = "publish/mod.rs"]
     mod publish;
@@ -303,12 +307,18 @@ mod vm {
                     state.failed_create_reply = lost_reply;
                     state.foreign_on_post = Some(foreign.clone());
                 }
-                let expected = if lost_reply {
-                    DnsError::Rejected
+                if lost_reply {
+                    assert_eq!(fake.client.create(&route).await, Err(DnsError::Rejected));
                 } else {
-                    DnsError::Conflict
-                };
-                assert_eq!(fake.client.create(&route).await, Err(expected));
+                    // The acknowledged ID is returned for durable custody, and
+                    // independent verification then refuses the shared name.
+                    let acknowledged = fake.client.create(&route).await.unwrap();
+                    assert_eq!(acknowledged.as_str(), ID);
+                    assert_eq!(
+                        fake.client.verify(&route, &acknowledged).await,
+                        Err(DnsError::Conflict)
+                    );
+                }
                 let Reconciled::OwnedWithConflict(id) =
                     fake.client.reconcile(&route).await.unwrap()
                 else {
@@ -436,6 +446,32 @@ mod vm {
     }
 
     #[tokio::test]
+    async fn dns_returns_an_acknowledged_id_even_when_verification_fails() {
+        timeout(LEG, async {
+            let fake = FakeDns::start().await;
+            let route = route();
+            let id = fake.client.create(&route).await.unwrap();
+            assert_eq!(id.as_str(), ID);
+            fake.state.lock().unwrap().hostile = Some(Hostile::Error);
+            assert_eq!(
+                fake.client.verify(&route, &id).await,
+                Err(DnsError::Rejected)
+            );
+            // The retained ID still targets cleanup after the record vanished.
+            {
+                let mut state = fake.state.lock().unwrap();
+                state.hostile = None;
+                state.records.clear();
+            }
+            assert_eq!(fake.client.remove(&route, &id).await, Ok(Removal::Absent));
+            let state = fake.state.lock().unwrap();
+            assert_eq!((state.post_count, state.delete_count), (1, 0));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn dns_refuses_to_delete_a_modified_owned_id() {
         timeout(LEG, async {
             let fake = FakeDns::start().await;
@@ -539,6 +575,12 @@ mod vm {
                 eprintln!("{}", credential);
                 if std::path::Path::new("crash.flag").exists() {
                     std::process::exit(17);
+                }
+                // Lives, but never opens its readiness listener.
+                if std::path::Path::new("hang.flag").exists() {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
                 }
                 let metrics = args.iter().position(|arg| arg == "--metrics").unwrap();
                 let listener = TcpListener::bind(&args[metrics + 1]).unwrap();
@@ -801,12 +843,15 @@ mod vm {
         }
 
         fn encrypt_fixture(value: String) -> Vec<u8> {
-            use std::ptr::{null, null_mut};
+            use windows_sys::Win32::Security::Cryptography::CRYPTPROTECT_UI_FORBIDDEN;
+            encrypt_fixture_with(value, CRYPTPROTECT_UI_FORBIDDEN)
+        }
+
+        fn encrypt_fixture_with(value: String, flags: u32) -> Vec<u8> {
+            use std::ptr::null;
             use windows_sys::Win32::{
                 Foundation::LocalFree,
-                Security::Cryptography::{
-                    CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
-                },
+                Security::Cryptography::{CRYPT_INTEGER_BLOB, CryptProtectData},
             };
             let mut value = value.into_bytes();
             let input = CRYPT_INTEGER_BLOB {
@@ -816,15 +861,7 @@ mod vm {
             let mut output = CRYPT_INTEGER_BLOB::default();
             unsafe {
                 assert_ne!(
-                    CryptProtectData(
-                        &input,
-                        null(),
-                        null(),
-                        null(),
-                        null(),
-                        CRYPTPROTECT_UI_FORBIDDEN,
-                        &mut output,
-                    ),
+                    CryptProtectData(&input, null(), null(), null(), null(), flags, &mut output,),
                     0,
                     "synthetic DPAPI encryption failed"
                 );
@@ -956,6 +993,26 @@ mod vm {
             }
             let credential = TunnelCredential::load(&credential_path, ZONE, &tunnel).unwrap();
             assert!(!format!("{credential:?}").contains(FAKE_SECRET));
+            // A machine-scope blob decrypts for any local account and is refused.
+            let machine_path = root.join("machine.json");
+            {
+                use windows_sys::Win32::Security::Cryptography::{
+                    CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
+                };
+                fs::write(
+                    &machine_path,
+                    encrypt_fixture_with(
+                        credential_json(),
+                        CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE,
+                    ),
+                )
+                .unwrap();
+            }
+            assert_owned("machine-scope credential", &machine_path);
+            assert_eq!(
+                TunnelCredential::load(&machine_path, ZONE, &tunnel).map(drop),
+                Err(ConnectorError::Credential)
+            );
             let wrong_name = Hostname::parse("wrong.example.invalid").unwrap();
             let origin_name = Hostname::parse(ORIGIN_NAME).unwrap();
             let bad_receipt = ArtifactPin {
@@ -991,14 +1048,11 @@ mod vm {
 
             let publish_started = std::time::Instant::now();
             let (mut connector, id) = timeout(LEG, async {
-                assert_eq!(
-                    admit(AgentPublishing::Enabled, true, true, Some(&hostname)),
-                    Ok(())
-                );
                 fake.client.preflight(&route).await.unwrap();
                 let connector = Connector::start(&plan).await.unwrap();
                 assert!(connector.ready().await);
                 let id = fake.client.create(&route).await.unwrap();
+                fake.client.verify(&route, &id).await.unwrap();
                 let record = &fake.state.lock().unwrap().records[0];
                 assert_eq!(record["comment"], format!("arxcovo:{NONCE}"));
                 assert_eq!(record["content"], format!("{TUNNEL}.cfargotunnel.com"));
@@ -1073,7 +1127,83 @@ mod vm {
                 "Publication leg timing: publish {publish_elapsed:?}, unpublish {unpublish_elapsed:?}, crash/restart {restart_elapsed:?}"
             );
             assert!(publish_elapsed <= LEG && unpublish_elapsed <= LEG && restart_elapsed <= LEG);
+
+            // A child that lives but never becomes ready is refused within the
+            // readiness bound, without a crash retry, and its Job is emptied.
+            fs::remove_file(root.join("crash.flag")).unwrap();
+            fs::write(root.join("hang.flag"), "").unwrap();
+            // Readiness bound, grace and Job kill, plus spawn slack.
+            const HANG_LEG: Duration = Duration::from_secs(3);
+            let hang_started = std::time::Instant::now();
+            let error = match timeout(HANG_LEG, Connector::start(&plan))
+                .await
+                .expect("startup hang exceeded its deadline")
+            {
+                Err(error) => error,
+                Ok(_) => panic!("hanging fake reached readiness"),
+            };
+            assert_eq!(error, ConnectorError::Readiness);
+            assert_gone(&witness_path, 4);
+            // Revocation during a hanging start aborts it before the readiness bound.
+            let retired = arxd::service::Shutdown::default();
+            let revoked = arxd::service::Shutdown::default();
+            let revoke = {
+                let revoked = revoked.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    revoked.cancel();
+                })
+            };
+            let revoke_started = std::time::Instant::now();
+            let mut held = None;
+            let error = match timeout(
+                HANG_LEG,
+                Connector::start_cancellable(&plan, &retired, &revoked, &mut held),
+            )
+            .await
+            .expect("revoked start exceeded its deadline")
+            {
+                Err(error) => error,
+                Ok(_) => panic!("revoked fake reached readiness"),
+            };
+            revoke.await.unwrap();
+            // `Origin`, not `Readiness`: revocation ended the start first.
+            assert_eq!(error, ConnectorError::Origin);
+            assert!(held.is_none(), "revoked start left an unsettled child");
+            assert_gone(&witness_path, 5);
+            assert_eq!(fake.state.lock().unwrap().post_count, 1);
+            eprintln!(
+                "Publication hang timing: refused {:?}, revoked {:?}",
+                hang_started.elapsed(),
+                revoke_started.elapsed()
+            );
             origin_task.abort();
+        }
+
+        /// The latest fake child, by its witness line, has exited.
+        fn assert_gone(witness_path: &Path, spawns: usize) {
+            let witness = fs::read_to_string(witness_path).unwrap();
+            assert_eq!(witness.lines().count(), spawns);
+            let pid: u32 = witness
+                .lines()
+                .last()
+                .unwrap()
+                .split('|')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            if process.is_null() {
+                return;
+            }
+            let process = unsafe { OwnedHandle::from_raw_handle(process) };
+            let mut code = 0;
+            assert_ne!(
+                unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) },
+                0
+            );
+            assert_ne!(code, 259, "fake connector child is still active");
         }
     }
 }

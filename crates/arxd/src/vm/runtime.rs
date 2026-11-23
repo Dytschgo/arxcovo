@@ -537,6 +537,10 @@ pub(crate) mod publication {
         pub(crate) boot: Id,
         pub(crate) port: NonZeroU16,
         pub(crate) ca_path: PathBuf,
+        #[cfg_attr(
+            not(all(windows, target_arch = "x86_64")),
+            allow(dead_code, reason = "read by the Windows connector plan")
+        )]
         pub(crate) ca_receipt: ArtifactPin,
         pub(crate) retired: Shutdown,
     }
@@ -768,6 +772,8 @@ pub(crate) mod publication {
                 }
                 #[cfg(test)]
                 Self::Fixture(fake) => {
+                    // The fixture holds no process that could outlive a failed start.
+                    *unsettled = None;
                     *fake.ingress.lock().unwrap() = Some(crate::vm::publish::ingress(
                         &tunnel,
                         std::array::from_ref(&hostname),
@@ -789,10 +795,40 @@ pub(crate) mod publication {
         connector: LocalProcess,
     }
 
+    /// A token cancelled by either input, for one bounded await.
+    struct Linked(Shutdown, tokio::task::AbortHandle);
+
+    impl Linked {
+        fn new(first: &Shutdown, second: &Shutdown) -> Self {
+            let token = Shutdown::default();
+            if first.is_cancelled() || second.is_cancelled() {
+                token.cancel();
+            }
+            let (first, second, linked) = (first.clone(), second.clone(), token.clone());
+            let task = tokio::spawn(async move {
+                tokio::select! {
+                    _ = first.cancelled() => {}
+                    _ = second.cancelled() => {}
+                }
+                linked.cancel();
+            });
+            Self(token, task.abort_handle())
+        }
+    }
+
+    impl Drop for Linked {
+        fn drop(&mut self) {
+            self.1.abort();
+        }
+    }
+
     #[derive(Default)]
     pub(crate) struct Publication {
         effects: Arc<Mutex<()>>,
         local: Mutex<Option<Live>>,
+        /// The current activation's owner revocation. It is synchronous so an
+        /// authenticated unpublish wins without the effects slot, SQLite or DNS.
+        activation: std::sync::Mutex<Option<(Id, Shutdown)>>,
         #[cfg(test)]
         pub(crate) fake: std::sync::Mutex<Option<Arc<Fake>>>,
     }
@@ -817,6 +853,41 @@ pub(crate) mod publication {
             self.effects.clone().try_lock_owned().ok()
         }
 
+        /// Waits for in-flight effects, for example a held DNS POST, to settle.
+        pub(crate) async fn slot(&self) -> OwnedMutexGuard<()> {
+            self.effects.clone().lock_owned().await
+        }
+
+        fn activations(&self) -> std::sync::MutexGuard<'_, Option<(Id, Shutdown)>> {
+            self.activation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// A fresh revocation token for the activation admitted next.
+        pub(crate) fn activation(&self, vm: Id) -> Shutdown {
+            let token = Shutdown::default();
+            *self.activations() = Some((vm, token.clone()));
+            token
+        }
+
+        /// Synchronous owner revocation. Afterwards the activation for `vm`
+        /// cannot commit `published` and every readiness check fails, so the
+        /// reaper drives DNS cleanup even when no unpublish was admitted.
+        pub(crate) fn revoke(&self, vm: Id) {
+            if let Some((id, token)) = self.activations().as_ref()
+                && *id == vm
+            {
+                token.cancel();
+            }
+        }
+
+        fn revoked(&self, vm: Id) -> bool {
+            self.activations()
+                .as_ref()
+                .is_some_and(|(id, token)| *id == vm && token.is_cancelled())
+        }
+
         /// Called before VM release. Local Job termination is independent of
         /// Cloudflare credentials, SQLite writes and outstanding DNS requests.
         pub(crate) async fn stop_local(&self, vm: Option<Id>) -> bool {
@@ -835,6 +906,9 @@ pub(crate) mod publication {
         }
 
         async fn ready(&self, intent: &Intent, shutdown: &Shutdown) -> Result<(), Failure> {
+            if self.revoked(intent.vm) {
+                return Err(Failure::Cancelled);
+            }
             let local = self.local.lock().await;
             let live = local
                 .as_ref()
@@ -849,6 +923,7 @@ pub(crate) mod publication {
             live.connector.ready().await
         }
 
+        #[allow(clippy::too_many_arguments)] // Explicit admission evidence and both cancellations.
         pub(crate) async fn publish<C: Clock>(
             &self,
             controller: &VmController<C>,
@@ -856,17 +931,21 @@ pub(crate) mod publication {
             intent: Intent,
             prepared: Prepared,
             origin: Origin,
+            revoked: &Shutdown,
             shutdown: &Shutdown,
         ) -> Result<()> {
             let result = self
-                .activate(controller, &intent, prepared, origin, shutdown)
+                .activate(controller, &intent, prepared, origin, revoked, shutdown)
                 .await;
             if result.is_ok() {
                 // Commit while holding the local slot. A concurrently retiring
-                // origin cannot be used by a successor boot.
+                // origin cannot be used by a successor boot, and an owner
+                // revocation observed here always wins.
                 let local = self.local.lock().await;
                 if local.as_ref().is_some_and(|live| live.origin.current())
                     && !shutdown.is_cancelled()
+                    && !revoked.is_cancelled()
+                    && !self.revoked(intent.vm)
                 {
                     let written = controller.finish_publication(
                         operation,
@@ -883,44 +962,60 @@ pub(crate) mod publication {
                 }
             }
 
-            let failure = result.err().unwrap_or(Failure::OriginUnavailable);
+            let (failure, acknowledged) = match result {
+                Err((failure, acknowledged)) => (failure, acknowledged),
+                Ok(()) if revoked.is_cancelled() => (Failure::Cancelled, None),
+                Ok(()) => (Failure::OriginUnavailable, None),
+            };
             let clean = self
-                .cleanup(controller, intent.vm, Some(failure), Some(shutdown))
+                .cleanup(
+                    controller,
+                    intent.vm,
+                    Some(failure),
+                    acknowledged,
+                    Some(shutdown),
+                )
                 .await?;
             controller.finish_publication(operation, None, Some(failure), Some(clean))
         }
 
+        /// Errors carry any acknowledged record ID that could not be made
+        /// durable, so this worker's cleanup can still target it.
         async fn activate<C: Clock>(
             &self,
             controller: &VmController<C>,
             intent: &Intent,
             prepared: Prepared,
             origin: Origin,
+            revoked: &Shutdown,
             shutdown: &Shutdown,
-        ) -> Result<(), Failure> {
-            let route = route(intent)?;
+        ) -> Result<(), (Failure, Option<RecordId>)> {
+            let route = route(intent).map_err(|failure| (failure, None))?;
             let map = |error| match error {
-                DnsError::Conflict => Failure::DnsConflict,
-                _ => Failure::DnsUnavailable,
+                DnsError::Conflict => (Failure::DnsConflict, None),
+                _ => (Failure::DnsUnavailable, None),
             };
             if !origin.current() || shutdown.is_cancelled() {
-                return Err(Failure::OriginUnavailable);
+                return Err((Failure::OriginUnavailable, None));
             }
             tokio::select! {
                 biased;
-                _ = origin.retired.cancelled() => return Err(Failure::OriginUnavailable),
-                _ = shutdown.cancelled() => return Err(Failure::Cancelled),
+                _ = revoked.cancelled() => return Err((Failure::Cancelled, None)),
+                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, None)),
+                _ = shutdown.cancelled() => return Err((Failure::Cancelled, None)),
                 result = prepared.dns.preflight(&route) => result.map_err(map)?,
             }
             {
                 let mut local = self.local.lock().await;
                 if local.is_some() {
-                    return Err(Failure::CleanupUnconfirmed);
+                    return Err((Failure::CleanupUnconfirmed, None));
                 }
+                // Revocation aborts a connector start that holds the local slot.
+                let stop = Linked::new(revoked, shutdown);
                 let mut unsettled = None;
                 let started = prepared
                     .start
-                    .connect(intent, &origin, shutdown, &mut unsettled)
+                    .connect(intent, &origin, &stop.0, &mut unsettled)
                     .await;
                 if let Some(connector) = unsettled {
                     *local = Some(Live {
@@ -929,32 +1024,56 @@ pub(crate) mod publication {
                         connector,
                     });
                 }
-                let connector = started?;
+                let connector = started.map_err(|failure| (failure, None))?;
                 *local = Some(Live {
                     vm: intent.vm,
                     origin: origin.clone(),
                     connector,
                 });
             }
-            self.ready(intent, shutdown).await?;
+            self.ready(intent, shutdown)
+                .await
+                .map_err(|failure| (failure, None))?;
             controller
                 .update_publication(&intent.nonce, Update::PostPossible)
-                .map_err(|_| Failure::CleanupUnconfirmed)?;
+                .map_err(|_| (Failure::CleanupUnconfirmed, None))?;
             // Check cancellation before submitting DNS. From the durable
-            // marker onwards an interrupted POST remains possible.
-            if !origin.current() || shutdown.is_cancelled() {
-                return Err(Failure::OriginUnavailable);
+            // marker onwards an interrupted POST remains possible, so only this
+            // pre-submission exit may withdraw the marker.
+            if !origin.current() || shutdown.is_cancelled() || revoked.is_cancelled() {
+                let _ = controller.update_publication(&intent.nonce, Update::PostWithdrawn);
+                let failure = if origin.current() {
+                    Failure::Cancelled
+                } else {
+                    Failure::OriginUnavailable
+                };
+                return Err((failure, None));
             }
+            // An owner revocation does not abandon a submitted POST: it
+            // completes or times out, and its acknowledged ID is then removed.
             let id = tokio::select! {
                 biased;
-                _ = origin.retired.cancelled() => return Err(Failure::OriginUnavailable),
-                _ = shutdown.cancelled() => return Err(Failure::Cancelled),
+                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, None)),
+                _ = shutdown.cancelled() => return Err((Failure::Cancelled, None)),
                 result = prepared.dns.create(&route) => result.map_err(map)?,
             };
-            controller
+            // The acknowledged ID is durable before verification, so a failed
+            // exact lookup can never discard it.
+            if controller
                 .update_publication(&intent.nonce, Update::Record(id.as_str()))
-                .map_err(|_| Failure::CleanupUnconfirmed)?;
-            self.ready(intent, shutdown).await
+                .is_err()
+            {
+                return Err((Failure::CleanupUnconfirmed, Some(id)));
+            }
+            tokio::select! {
+                biased;
+                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, None)),
+                _ = shutdown.cancelled() => return Err((Failure::Cancelled, None)),
+                result = prepared.dns.verify(&route, &id) => result.map_err(map)?,
+            }
+            self.ready(intent, shutdown)
+                .await
+                .map_err(|failure| (failure, None))
         }
 
         pub(crate) async fn unpublish<C: Clock>(
@@ -964,7 +1083,9 @@ pub(crate) mod publication {
             vm: Id,
             shutdown: &Shutdown,
         ) -> Result<()> {
-            let clean = self.cleanup(controller, vm, None, Some(shutdown)).await?;
+            let clean = self
+                .cleanup(controller, vm, None, None, Some(shutdown))
+                .await?;
             controller.finish_publication(
                 operation,
                 None,
@@ -992,7 +1113,8 @@ pub(crate) mod publication {
             } else {
                 intent.reason
             };
-            self.cleanup(controller, intent.vm, reason, None).await?;
+            self.cleanup(controller, intent.vm, reason, None, None)
+                .await?;
             Ok(())
         }
 
@@ -1001,6 +1123,7 @@ pub(crate) mod publication {
             controller: &VmController<C>,
             vm: Id,
             reason: Option<Failure>,
+            acknowledged: Option<RecordId>,
             shutdown: Option<&Shutdown>,
         ) -> Result<bool> {
             let local = self.stop_local(Some(vm)).await;
@@ -1015,10 +1138,10 @@ pub(crate) mod publication {
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => Err(Failure::Cancelled),
-                    result = self.remove_dns(controller, &intent) => result,
+                    result = self.remove_dns(controller, &intent, acknowledged) => result,
                 }
             } else {
-                self.remove_dns(controller, &intent).await
+                self.remove_dns(controller, &intent, acknowledged).await
             };
             let update = match (&dns, local) {
                 (Ok(()), true) => Update::Released(reason),
@@ -1042,6 +1165,7 @@ pub(crate) mod publication {
             &self,
             controller: &VmController<C>,
             intent: &Intent,
+            acknowledged: Option<RecordId>,
         ) -> Result<(), Failure> {
             if !intent.post_possible {
                 return Ok(());
@@ -1049,9 +1173,18 @@ pub(crate) mod publication {
             let dns = self.cleanup_dns(intent).ok_or(Failure::DnsUnavailable)?;
             let route = route(intent)?;
             let unavailable = |_| Failure::DnsUnavailable;
-            let id = match &intent.record {
-                Some(id) => RecordId::parse(id.clone()).map_err(|_| Failure::DnsUnavailable)?,
-                None => match dns.reconcile(&route).await.map_err(unavailable)? {
+            let id = match (&intent.record, acknowledged) {
+                (Some(id), _) => {
+                    RecordId::parse(id.clone()).map_err(|_| Failure::DnsUnavailable)?
+                }
+                // An acknowledged ID whose custody write failed: retry custody
+                // and target it either way.
+                (None, Some(id)) => {
+                    let _ =
+                        controller.update_publication(&intent.nonce, Update::Record(id.as_str()));
+                    id
+                }
+                (None, None) => match dns.reconcile(&route).await.map_err(unavailable)? {
                     Reconciled::Owned(id) | Reconciled::OwnedWithConflict(id) => {
                         controller
                             .update_publication(&intent.nonce, Update::Record(id.as_str()))
@@ -1098,25 +1231,49 @@ pub(crate) mod publication {
         pub(crate) posts: std::sync::atomic::AtomicUsize,
         pub(crate) deletes: std::sync::atomic::AtomicUsize,
         pub(crate) ingress: std::sync::Mutex<Option<String>>,
-        pub(crate) record: std::sync::atomic::AtomicBool,
-        pub(crate) post_gate: std::sync::Mutex<
-            Option<(
-                tokio::sync::oneshot::Sender<()>,
-                tokio::sync::oneshot::Receiver<()>,
-            )>,
-        >,
+        pub(crate) record: Arc<std::sync::atomic::AtomicBool>,
+        pub(crate) post_gate: std::sync::Mutex<Option<FakeGate>>,
+        pub(crate) preflight_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// The next POST commits only after release, in a task that outlives
+        /// the abandoned request, and never acknowledges.
+        pub(crate) late_commit: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        /// The next exact lookup fails after the acknowledged record vanished.
+        pub(crate) lose_after_post: std::sync::atomic::AtomicBool,
+        /// Every route tuple used for lookup or removal.
+        pub(crate) routes: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(test)]
+    pub(crate) type FakeGate = (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+
+    #[cfg(test)]
+    async fn hold(gate: &std::sync::Mutex<Option<FakeGate>>) -> Result<(), DnsError> {
+        let gate = gate.lock().unwrap().take();
+        if let Some((started, release)) = gate {
+            let _ = started.send(());
+            release.await.map_err(|_| DnsError::Unavailable)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
     impl Profile {
         pub(crate) fn synthetic(host: Id, name: &str) -> Self {
+            Self::drifted(host, name, "publish.example.invalid", &"b".repeat(32))
+        }
+
+        /// A replaced owner binding, for drift witnesses.
+        pub(crate) fn drifted(host: Id, name: &str, hostname: &str, zone: &str) -> Self {
             Self {
-                hostnames: ["publish.example.invalid".into()],
+                hostnames: [hostname.into()],
                 static_name: name.into(),
                 host_id: hex::encode(host),
                 tunnel_id: "12345678-1234-4321-8234-123456789abc".into(),
                 account_id: "a".repeat(32),
-                zone_id: "b".repeat(32),
+                zone_id: zone.into(),
                 private_root: "D:/synthetic".into(),
                 dns_ciphertext: "D:/synthetic/dns.dpapi".into(),
                 tunnel_ciphertext: "D:/synthetic/tunnel.dpapi".into(),
@@ -1146,6 +1303,7 @@ pub(crate) mod publication {
     #[cfg(test)]
     impl DnsApi for Fake {
         async fn preflight(&self, route: &Route) -> Result<(), DnsError> {
+            hold(&self.preflight_gate).await?;
             match self.reconcile(route).await? {
                 Reconciled::Absent => Ok(()),
                 _ => Err(DnsError::Conflict),
@@ -1158,18 +1316,30 @@ pub(crate) mod publication {
                 self.local.load(SeqCst),
                 "DNS activated before connector readiness"
             );
-            assert!(!self.record.swap(true, SeqCst), "repeated POST");
+            assert!(!self.record.load(SeqCst), "repeated POST");
             self.posts.fetch_add(1, SeqCst);
-            let gate = self.post_gate.lock().unwrap().take();
-            if let Some((started, release)) = gate {
-                let _ = started.send(());
-                release.await.map_err(|_| DnsError::Unavailable)?;
+            let late = self.late_commit.lock().unwrap().take();
+            if let Some(release) = late {
+                let record = self.record.clone();
+                tokio::spawn(async move {
+                    if release.await.is_ok() {
+                        record.store(true, SeqCst);
+                    }
+                });
+                return std::future::pending().await;
             }
+            self.record.store(true, SeqCst);
+            hold(&self.post_gate).await?;
             Ok(Self::id())
         }
 
-        async fn reconcile(&self, _: &Route) -> Result<Reconciled, DnsError> {
+        async fn reconcile(&self, route: &Route) -> Result<Reconciled, DnsError> {
             use std::sync::atomic::Ordering::SeqCst;
+            self.routes.lock().unwrap().push(route.witness());
+            if self.record.load(SeqCst) && self.lose_after_post.swap(false, SeqCst) {
+                self.record.store(false, SeqCst);
+                return Err(DnsError::Unavailable);
+            }
             Ok(
                 match (self.record.load(SeqCst), self.foreign.load(SeqCst)) {
                     (true, false) => Reconciled::Owned(Self::id()),
@@ -1180,8 +1350,9 @@ pub(crate) mod publication {
             )
         }
 
-        async fn remove(&self, _: &Route, id: &RecordId) -> Result<Removal, DnsError> {
+        async fn remove(&self, route: &Route, id: &RecordId) -> Result<Removal, DnsError> {
             use std::sync::atomic::Ordering::SeqCst;
+            self.routes.lock().unwrap().push(route.witness());
             assert!(
                 !self.local.load(SeqCst),
                 "DNS removed before local connector stopped"

@@ -166,6 +166,27 @@ pub fn private(path: &Path) -> Result<()> {
     }
 }
 
+/// The accepted DPAPI blob form: version 1, the default provider, and user
+/// scope. `CRYPTPROTECT_LOCAL_MACHINE` blobs decrypt for every local account,
+/// so a copied machine-scope file would not stay bound to the owner's login.
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+pub(crate) fn user_scope_dpapi(blob: &[u8]) -> bool {
+    // {df9d8cd0-1501-11d1-8c7a-00c04fc297eb}, in its little-endian wire form.
+    const PROVIDER: [u8; 16] = [
+        0xd0, 0x8c, 0x9d, 0xdf, 0x01, 0x15, 0xd1, 0x11, 0x8c, 0x7a, 0x00, 0xc0, 0x4f, 0xc2, 0x97,
+        0xeb,
+    ];
+    const LOCAL_MACHINE: u32 = 0x4;
+    // dwVersion, guidProvider, dwMasterKeyVersion, guidMasterKey, dwFlags.
+    let word = |at: usize| {
+        blob.get(at..at + 4)
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    word(0) == Some(1)
+        && blob.get(4..20) == Some(PROVIDER.as_slice())
+        && word(40).is_some_and(|flags| flags & LOCAL_MACHINE == 0)
+}
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) fn unprotect_current_user(
     ciphertext: &mut [u8],
@@ -180,6 +201,9 @@ pub(crate) fn unprotect_current_user(
     };
     use zeroize::Zeroize;
 
+    if !user_scope_dpapi(ciphertext) {
+        bail!("publication credential unavailable");
+    }
     let input = CRYPT_INTEGER_BLOB {
         cbData: u32::try_from(ciphertext.len())?,
         pbData: ciphertext.as_mut_ptr(),
@@ -211,5 +235,79 @@ pub(crate) fn unprotect_current_user(
         bytes.zeroize();
         LocalFree(output.pbData.cast());
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_scope_dpapi;
+
+    fn header(version: u32, provider: [u8; 16], flags: u32) -> Vec<u8> {
+        let mut blob = version.to_le_bytes().to_vec();
+        blob.extend_from_slice(&provider);
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&[7; 16]);
+        blob.extend_from_slice(&flags.to_le_bytes());
+        blob.extend_from_slice(&[0; 32]);
+        blob
+    }
+
+    const PROVIDER: [u8; 16] = [
+        0xd0, 0x8c, 0x9d, 0xdf, 0x01, 0x15, 0xd1, 0x11, 0x8c, 0x7a, 0x00, 0xc0, 0x4f, 0xc2, 0x97,
+        0xeb,
+    ];
+
+    #[test]
+    fn dpapi_scope_accepts_only_user_scope_version_one_blobs() {
+        assert!(user_scope_dpapi(&header(1, PROVIDER, 0x1)));
+        assert!(!user_scope_dpapi(&header(1, PROVIDER, 0x4)));
+        assert!(!user_scope_dpapi(&header(1, PROVIDER, 0x5)));
+        assert!(!user_scope_dpapi(&header(2, PROVIDER, 0)));
+        assert!(!user_scope_dpapi(&header(1, [0; 16], 0)));
+        assert!(!user_scope_dpapi(&header(1, PROVIDER, 0)[..43]));
+        assert!(!user_scope_dpapi(&[]));
+    }
+
+    /// Real DPAPI output under the current login, in both scopes.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn dpapi_scope_matches_real_protected_blobs() {
+        use std::ptr::null;
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::Cryptography::{
+                CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
+                CryptProtectData,
+            },
+        };
+        let protect = |flags| {
+            let mut value = b"synthetic scope probe".to_vec();
+            let input = CRYPT_INTEGER_BLOB {
+                cbData: value.len() as u32,
+                pbData: value.as_mut_ptr(),
+            };
+            let mut output = CRYPT_INTEGER_BLOB::default();
+            unsafe {
+                assert_ne!(
+                    CryptProtectData(&input, null(), null(), null(), null(), flags, &mut output),
+                    0
+                );
+                let blob =
+                    std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+                LocalFree(output.pbData.cast());
+                blob
+            }
+        };
+        let mut user = protect(CRYPTPROTECT_UI_FORBIDDEN);
+        let mut machine = protect(CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE);
+        assert!(user_scope_dpapi(&user));
+        assert!(!user_scope_dpapi(&machine));
+        assert_eq!(
+            super::unprotect_current_user(&mut user, 64)
+                .unwrap()
+                .as_slice(),
+            b"synthetic scope probe"
+        );
+        assert!(super::unprotect_current_user(&mut machine, 64).is_err());
     }
 }

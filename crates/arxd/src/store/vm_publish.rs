@@ -212,6 +212,8 @@ pub(crate) fn reserve(db: &Connection, intent: &Intent) -> Result<()> {
 
 pub(crate) enum Update<'a> {
     PostPossible,
+    /// The worker exited before submitting the POST it had marked.
+    PostWithdrawn,
     Record(&'a str),
     Phase(Phase, Option<FailureReason>),
     Released(Option<FailureReason>),
@@ -221,6 +223,10 @@ pub(crate) fn update(db: &Connection, nonce: &str, change: Update<'_>) -> Result
     let changed = match change {
         Update::PostPossible => db.execute(
             "UPDATE vm_publication SET post_possible=1 WHERE nonce=?1 AND phase='publishing' AND post_possible=0",
+            [nonce],
+        )?,
+        Update::PostWithdrawn => db.execute(
+            "UPDATE vm_publication SET post_possible=0 WHERE nonce=?1 AND phase='publishing' AND post_possible=1 AND record IS NULL",
             [nonce],
         )?,
         Update::Record(id) => db.execute(
@@ -276,14 +282,13 @@ pub(super) fn recover(db: &Connection, now: i64) -> Result<()> {
         "UPDATE vm_publication SET phase='cleanup_pending',cleanup_reason=coalesce(cleanup_reason,11)",
         [],
     )?;
-    let operation = db
-        .query_row(
-            "SELECT id FROM activity WHERE status=0 AND action IN (15,16)",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    if let Some(operation) = operation {
+    // A publish and an owner unpublish may both be pending: the unpublish
+    // waits for the publish worker's effects slot.
+    let operations = db
+        .prepare("SELECT id FROM activity WHERE status=0 AND action IN (15,16)")?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for operation in operations {
         super::finish(db, operation, Status::Interrupted, now, Some(false))?;
     }
     Ok(())

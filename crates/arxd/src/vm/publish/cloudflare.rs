@@ -108,6 +108,18 @@ impl Route {
     fn records(&self) -> String {
         format!("/client/v4/zones/{}/dns_records", self.zone)
     }
+
+    /// The exact persisted tuple, for fake witnesses only.
+    #[cfg(test)]
+    pub(in crate::vm) fn witness(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.zone,
+            self.name.as_str(),
+            self.target,
+            self.comment
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -178,9 +190,20 @@ pub(in crate::vm) enum Removal {
 
 pub(in crate::vm) trait DnsApi {
     async fn preflight(&self, route: &Route) -> Result<(), DnsError>;
+    /// Returns the validated, owned record ID acknowledged by the single POST.
+    /// The caller persists it before [`DnsApi::verify`], so a failed
+    /// verification never discards an acknowledged ID.
     async fn create(&self, route: &Route) -> Result<RecordId, DnsError>;
     async fn reconcile(&self, route: &Route) -> Result<Reconciled, DnsError>;
     async fn remove(&self, route: &Route, id: &RecordId) -> Result<Removal, DnsError>;
+
+    /// Independent exact-name evidence that `id` is the only record at the name.
+    async fn verify(&self, route: &Route, id: &RecordId) -> Result<(), DnsError> {
+        match self.reconcile(route).await? {
+            Reconciled::Owned(confirmed) if confirmed == *id => Ok(()),
+            _ => Err(DnsError::Conflict),
+        }
+    }
 }
 
 enum Transport {
@@ -241,6 +264,7 @@ impl DnsApi for CloudflareDns {
     }
 
     /// One POST only. On error the caller retains the intent and reconciles.
+    /// Success still requires [`DnsApi::verify`] after the ID is durable.
     async fn create(&self, route: &Route) -> Result<RecordId, DnsError> {
         let body = serde_json::to_vec(&Create {
             kind: "CNAME",
@@ -256,11 +280,7 @@ impl DnsApi for CloudflareDns {
         if !route.owned(&created) {
             return Err(DnsError::Conflict);
         }
-        let id = RecordId::parse(created.id).map_err(|_| DnsError::InvalidResponse)?;
-        match self.reconcile(route).await? {
-            Reconciled::Owned(confirmed) if confirmed == id => Ok(id),
-            _ => Err(DnsError::Conflict),
-        }
+        RecordId::parse(created.id).map_err(|_| DnsError::InvalidResponse)
     }
 
     async fn reconcile(&self, route: &Route) -> Result<Reconciled, DnsError> {

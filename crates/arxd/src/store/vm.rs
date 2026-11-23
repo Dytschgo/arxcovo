@@ -2928,6 +2928,35 @@ mod tests {
         let vm = [0x72; 16];
         let slots = static_fixture(&db, vm, "upgrade-site").unwrap();
         commit_static(&db, vm, slots, 1).unwrap();
+        // A publication-independent v9 binding and the active generation.
+        let binding = Binding {
+            principal: "alice",
+            key: RequestId {
+                key: [9; 16],
+                issued_at_ms: NOW,
+            },
+            subject: Subject::Vm(vm),
+            action: Action::Start as i64,
+        };
+        let recorded = binding.record(&db, NOW, Some(vm), None).unwrap();
+        // A settled receipt: a pending start would make the reopen recover.
+        finish(
+            &db,
+            recorded.receipt.activity_id,
+            Status::Failed,
+            NOW,
+            Some(true),
+        )
+        .unwrap();
+        let active = |db: &Connection| -> Result<Vec<Id>> {
+            let mut stmt =
+                db.prepare("SELECT id FROM vm_generations WHERE static_id=?1 AND active=1")?;
+            Ok(stmt
+                .query_map([vm], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?)
+        };
+        let generation = active(&db).unwrap();
+        assert_eq!(generation.len(), 1);
         db.execute_batch(
             "UPDATE sqlite_sequence SET seq=900 WHERE name='activity'; PRAGMA user_version=9;",
         )
@@ -2938,6 +2967,9 @@ mod tests {
         store.transact(|db| {
             assert_eq!(count(db, "PRAGMA user_version", [])?, 10);
             assert_eq!(ledger_ids(db)?, ledger);
+            let replay = binding.replay(db, NOW, false)?.unwrap().unwrap();
+            assert_eq!(replay.operation.id, recorded.id);
+            assert_eq!(active(db)?, generation);
             assert_eq!(static_vm::owned_state(db, "alice", vm)?, Some(StaticState::Stopped));
             assert_eq!(count(db, "SELECT count(*) FROM vm_publication", [])?, 0);
             assert_eq!(count(db, "SELECT count(*) FROM vm_static_instances WHERE publication_failure IS NULL", [])?, 1);
