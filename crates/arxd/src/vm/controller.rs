@@ -3,6 +3,7 @@ use super::{
     policy::*,
     reaper::{self, ArtifactCustody, ClosedCustody, ReaperTick, Sweeps},
     runtime::{CandidateRuntime, ReaperRuntime},
+    static_web::StaticState,
 };
 use crate::{
     service::Shutdown,
@@ -130,19 +131,34 @@ impl<C: Clock> VmController<C> {
         let Some(deadline) = clock.monotonic.checked_add(Duration::from_secs(seconds)) else {
             return Ok(Admission::Refused(Refusal::Invalid));
         };
-        let capacity = match self.policy.host(host, resources) {
-            Ok(capacity) => capacity,
-            Err(reason) => return Ok(Admission::Refused(reason)),
+        let check_target = || target(db, request, now);
+        let target = if action == Action::Stop {
+            if request.disk.total() != Some(0) {
+                return Ok(Admission::Refused(Refusal::Invalid));
+            }
+            match check_target()? {
+                Ok(target) => target,
+                Err(reason) => return Ok(Admission::Refused(reason)),
+            }
+        } else {
+            let capacity = match self.policy.host(host, resources) {
+                Ok(capacity) => capacity,
+                Err(reason) => return Ok(Admission::Refused(reason)),
+            };
+            if let Err(reason) = self.validate_disk(db, capacity, request.disk)? {
+                return Ok(Admission::Refused(reason));
+            }
+            match check_target()? {
+                Ok(target) => target,
+                Err(reason) => return Ok(Admission::Refused(reason)),
+            }
         };
-        if let Err(reason) = self.validate_disk(db, capacity, request.disk)? {
-            return Ok(Admission::Refused(reason));
-        }
-        let target = match target(db, request, now)? {
-            Ok(target) => target,
-            Err(reason) => return Ok(Admission::Refused(reason)),
+        let lease_end = match target {
+            Target::Clone { expires, .. } => Some(expires),
+            _ => None,
         };
         let id = binding
-            .record(db, now, Some(request.vm), None)?
+            .record(db, now, Some(request.vm), lease_end)?
             .receipt
             .activity_id;
         target.insert(db, request, id, resources)?;
@@ -154,10 +170,17 @@ impl<C: Clock> VmController<C> {
         }))
     }
 
-    pub fn finish(
+    pub fn finish(&self, operation: &PendingOperation, completion: Completion) -> Result<Status> {
+        self.finish_with_cause(operation, completion, None)
+    }
+
+    /// As [`VmController::finish`], recording the worker's proven, closed
+    /// failure cause independently of release proof.
+    pub(crate) fn finish_with_cause(
         &self,
         operation: &PendingOperation,
         mut completion: Completion,
+        cause: Option<FailureReason>,
     ) -> Result<Status> {
         ensure!(
             Arc::ptr_eq(&self.worker_binding, &operation.binding),
@@ -172,7 +195,14 @@ impl<C: Clock> VmController<C> {
             if now.monotonic >= operation.deadline {
                 completion = Completion::CleanupUnconfirmed;
             }
-            store::settle_operation(db, operation.activity_id, utc(now)?, completion)
+            store::settle_with_script(
+                db,
+                operation.activity_id,
+                utc(now)?,
+                completion,
+                None,
+                cause,
+            )
         })
     }
 
@@ -196,7 +226,14 @@ impl<C: Clock> VmController<C> {
                 "SELECT count(*) FROM vm_operations WHERE activity_id=?1 AND action=2 AND status=0",
                 [worker.activity_id],
             )? == 1, "invalid script worker");
-            store::settle_with_script(db, worker.activity_id, utc(clock)?, completion, script)
+            store::settle_with_script(
+                db,
+                worker.activity_id,
+                utc(clock)?,
+                completion,
+                script,
+                None,
+            )
         })
     }
 
@@ -251,6 +288,8 @@ impl<C: Clock> VmController<C> {
                 return Ok(Ok(item));
             }
             store::purge_tombstones(db, now)?;
+            // Correlation comes only from the attributed expiry receipt.
+            let proof = store::tombstone_proof(db, principal, id)?;
             Ok(store::expired_status(db, principal, id)?
                 .map(|row| VmStatus {
                     id,
@@ -260,8 +299,15 @@ impl<C: Clock> VmController<C> {
                     ready: false,
                     expires_at_ms: None,
                     expired_at_ms: Some(row.expired_at_ms),
-                    cleanup: Some("confirmed"),
+                    cleanup: proof.and_then(|(_, confirmed)| confirmed).map(|confirmed| {
+                        if confirmed {
+                            "confirmed"
+                        } else {
+                            "unconfirmed"
+                        }
+                    }),
                     snapshots: [],
+                    cleanup_activity: proof.map(|(activity, _)| activity),
                 })
                 .ok_or(Refusal::NotFound))
         })
@@ -293,7 +339,7 @@ impl<C: Clock> VmController<C> {
             let binding = store::Binding {
                 principal: request.principal,
                 key: request.key,
-                subject: Subject::Recipe(request.recipe, request.digest),
+                subject: Subject::Recipe(request.recipe, Some(request.digest)),
                 action: BUILD_ACTION,
             };
             let decision = self.reserve_build(
@@ -362,6 +408,7 @@ impl<C: Clock> VmController<C> {
             db,
             "SELECT EXISTS(SELECT 1 FROM vm_build_intents WHERE state<>'sealed')
                  OR EXISTS(SELECT 1 FROM vm_instances WHERE state IN (2,3,4))
+                 OR EXISTS(SELECT 1 FROM vm_static_instances WHERE state IN (0,2,3))
                  OR EXISTS(SELECT 1 FROM vm_operations WHERE status=0
                      AND (action=3 OR binding_kind='template'))",
             [],
@@ -466,6 +513,7 @@ impl<C: Clock> VmController<C> {
                 }
                 if store::count(db,
                     "SELECT EXISTS(SELECT 1 FROM vm_build_intents WHERE state<>'sealed')
+                     OR EXISTS(SELECT 1 FROM vm_static_instances WHERE state IN (0,2,3))
                      OR EXISTS(SELECT 1 FROM vm_operations WHERE status=0 AND binding_kind='template')",
                     [],
                 )? != 0 {
@@ -494,7 +542,10 @@ impl<C: Clock> VmController<C> {
                     Ok(target) => target,
                     Err(reason) => return Ok(Err(reason)),
                 };
-                let operation = binding.record(db, now, Some(request.vm), None)?;
+                let Target::Clone { expires, .. } = target else {
+                    anyhow::bail!("invalid linked clone target");
+                };
+                let operation = binding.record(db, now, Some(request.vm), Some(expires))?;
                 target.insert(db, &request, operation.receipt.activity_id, resources)?;
                 let slots = store::plan_clone(db, request.vm)?;
                 store::require_headroom(db)?;
@@ -574,26 +625,54 @@ impl<C: Clock> VmController<C> {
         slots: BuildSlots,
         untouched: bool,
     ) -> Result<()> {
+        self.fail_build_with(worker, slots, untouched, None)
+    }
+
+    /// As [`VmController::fail_build`]. A staged build failure records the
+    /// worker's proven cause; an untouched build stays a cancellation.
+    pub(crate) fn fail_build_with(
+        &self,
+        worker: &PendingOperation,
+        slots: BuildSlots,
+        untouched: bool,
+        cause: Option<FailureReason>,
+    ) -> Result<()> {
         self.check_worker(worker)?;
         self.store.transact(|db| {
             let now = utc(self.clock.now())?;
             if untouched {
                 store::cancel_untouched_build(db, slots, worker.activity_id, now)
             } else {
-                store::abandon_build(db, slots.id, worker.activity_id, now)
+                store::abandon_build_with(db, slots.id, worker.activity_id, now, cause)
             }
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_linked_clone(
         &self,
         worker: &PendingOperation,
         slots: PairSlots,
         proof: Option<[ArtifactEvidence; 2]>,
     ) -> Result<Status> {
+        self.finish_linked_clone_with(worker, slots, proof.ok_or(None))
+    }
+
+    /// As [`VmController::finish_linked_clone`]; a failed clone may carry
+    /// its worker's proven cause.
+    pub(crate) fn finish_linked_clone_with(
+        &self,
+        worker: &PendingOperation,
+        slots: PairSlots,
+        outcome: Result<[ArtifactEvidence; 2], Option<FailureReason>>,
+    ) -> Result<Status> {
         self.check_worker(worker)?;
         self.store.transact(|db| {
             let clock = self.clock.now();
+            let (proof, cause) = match outcome {
+                Ok(pair) => (Some(pair), None),
+                Err(cause) => (None, cause),
+            };
             store::settle_clone(
                 db,
                 worker.activity_id,
@@ -601,6 +680,7 @@ impl<C: Clock> VmController<C> {
                 proof,
                 clock.monotonic < worker.deadline,
                 utc(clock)?,
+                cause,
             )
         })
     }
@@ -903,6 +983,24 @@ impl<C: Clock> VmController<C> {
             uncertain |= !confirmed;
             sweeps.settle(&work, self.clock.now().monotonic, confirmed);
         }
+        // Committed static generations settle without any deletion route.
+        // Unproven release keeps them recovering, which fences launches.
+        let claims = self
+            .store
+            .transact(|db| store::static_vm::recovery_claims(db))?;
+        for claim in claims {
+            let start = self.clock.now().monotonic;
+            let released = start
+                .checked_add(STATIC_RELEASE_BUDGET)
+                .is_some_and(|deadline| {
+                    runtime.static_released(claim.vm, claim.generation, deadline)
+                        && self.clock.now().monotonic < deadline
+                });
+            self.store.transact(|db| {
+                store::static_vm::settle_recovery(db, claim, released, utc(self.clock.now())?)
+            })?;
+        }
+        uncertain |= self.store.transact(|db| store::static_vm::recovering(db))?;
         self.gate
             .lock()
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?
@@ -1025,6 +1123,7 @@ fn owned_vm(db: &Connection, principal: &str, vm: Id) -> Result<Option<VmLease>>
 
 enum Target {
     Existing,
+    Static,
     Clone { template: Id, expires: i64 },
     Snapshot(Id),
 }
@@ -1039,6 +1138,7 @@ impl Target {
     ) -> Result<()> {
         let snapshot = match self {
             Self::Existing => None,
+            Self::Static => return Ok(()),
             Self::Clone { template, expires } => {
                 db.execute("INSERT INTO vm_instances(id,template,principal,expires_ms,dashboard_cpus,dashboard_memory)
                     VALUES(?1,?2,?3,?4,?5,?6)",
@@ -1089,20 +1189,24 @@ fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Tar
         {
             return Ok(Err(Refusal::NotFound));
         }
-        if store::count(db, "SELECT count(*) FROM vm_instances", [])? >= store::MAX_INSTANCES {
+        if store::static_vm::instance_count(db)? >= store::MAX_INSTANCES {
             return Ok(Err(Refusal::InstanceLimit));
         }
         store::purge_tombstones(db, now)?;
         if store::count(
             db,
             "SELECT EXISTS(SELECT 1 FROM vm_instances WHERE id=?1)
-            OR EXISTS(SELECT 1 FROM vm_tombstones WHERE id=?1)",
+            OR EXISTS(SELECT 1 FROM vm_tombstones WHERE id=?1)
+            OR EXISTS(SELECT 1 FROM vm_static_instances WHERE id=?1)",
             [request.vm],
         )? != 0
         {
             return Ok(Err(Refusal::Busy));
         }
         return Ok(Ok(Target::Clone { template, expires }));
+    }
+    if let Some(state) = store::static_vm::owned_state(db, request.principal, request.vm)? {
+        return static_target(db, request, state);
     }
     let Some(lease) = owned_vm(db, request.principal, request.vm)? else {
         return Ok(Err(Refusal::NotFound));
@@ -1163,6 +1267,7 @@ fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Tar
             if store::count(
                 db,
                 "SELECT EXISTS(SELECT 1 FROM vm_instances WHERE state IN (2,3,4))
+                OR EXISTS(SELECT 1 FROM vm_static_instances WHERE state IN (0,2,3))
                 OR EXISTS(SELECT 1 FROM activity WHERE action=3 AND status=0)
                 OR EXISTS(SELECT 1 FROM vm_build_intents WHERE state<>'sealed')
                 OR EXISTS(SELECT 1 FROM vm_operations WHERE status=0 AND binding_kind='template')",
@@ -1200,7 +1305,7 @@ impl<C: Clock> VmController<C> {
     pub(crate) fn foreground_catalog(
         &self,
         principal: &str,
-        recipe: Option<Id>,
+        recipes: [Option<Id>; 2],
         after: (u8, Id),
         limit: u32,
     ) -> Result<Vec<CatalogEntry>> {
@@ -1208,6 +1313,8 @@ impl<C: Clock> VmController<C> {
             let mut query = db.prepare(
                 "SELECT kind,id,recipe FROM (
                    SELECT 1 AS kind, ?1 AS id, NULL AS recipe WHERE ?1 IS NOT NULL
+                   UNION
+                   SELECT 1, ?6, NULL WHERE ?6 IS NOT NULL
                    UNION ALL
                    SELECT 2, b.template_id, b.recipe_id FROM vm_build_intents b
                      WHERE b.state='sealed'
@@ -1217,14 +1324,16 @@ impl<C: Clock> VmController<C> {
                      WHERE o.principal=?2 AND b.state='pending' AND o.status=0
                  ) WHERE (kind,id)>(?3,?4) ORDER BY kind,id LIMIT ?5",
             )?;
-            let rows =
-                query.query_map(params![recipe, principal, after.0, after.1, limit], |row| {
+            let rows = query.query_map(
+                params![recipes[0], principal, after.0, after.1, limit, recipes[1]],
+                |row| {
                     Ok(CatalogEntry {
                         kind: row.get(0)?,
                         id: row.get(1)?,
                         recipe: row.get(2)?,
                     })
-                })?;
+                },
+            )?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
     }
@@ -1306,8 +1415,7 @@ impl<C: Clock> VmController<C> {
         })
     }
 
-    /// Use the existing bounded v6 audit vocabulary and only correlate an ID
-    /// after the same transaction proves caller ownership.
+    /// Store a bounded refusal with correlation verified in the same transaction.
     ///
     /// This is a bounded, audit-only write: at most one refusal row (with its
     /// audit pruning) after the headroom check, and no operation, ledger or
@@ -1322,16 +1430,7 @@ impl<C: Clock> VmController<C> {
         map_full(self.store.transact(|db| {
             store::require_headroom(db)?;
             let now = utc(self.clock.now())?;
-            let vm = if let Some(vm) = vm {
-                (owned_vm(db, principal, vm)?.is_some()
-                    || store::expired_status(db, principal, vm)?.is_some())
-                .then_some(vm)
-            } else {
-                None
-            };
-            if action == BUILD_ACTION || vm.is_some() {
-                store::refusal_for(db, principal, vm, action, now, reason)?;
-            }
+            store::refusal_for(db, principal, vm, action, now, reason)?;
             Ok(Ok(()))
         }))
     }
@@ -1393,6 +1492,12 @@ impl<C: Clock> VmController<C> {
                 },
             };
             let vm = subject.vm();
+            if matches!(subject, ForegroundSubject::Script(_))
+                && store::static_vm::owned_state(db, principal, vm)?
+                    .is_some_and(|state| state != StaticState::Running)
+            {
+                return Ok(Err(PrecheckInner::Offline));
+            }
             match owned_vm(db, principal, vm)? {
                 None if store::expired_status(db, principal, vm)?.is_some() => {
                     return Ok(Err(PrecheckInner::Refused(Refusal::Expired)));
@@ -1491,3 +1596,188 @@ impl ForegroundSubject {
         }
     }
 }
+
+fn static_target(
+    db: &Connection,
+    request: &Request<'_>,
+    state: StaticState,
+) -> Result<Result<Target, Refusal>> {
+    if request.disk.total() != Some(0) {
+        return Ok(Err(Refusal::Invalid));
+    }
+    if store::count(
+        db,
+        "SELECT EXISTS(SELECT 1 FROM activity WHERE vm=?1 AND status=0 AND (action<=6 OR action=12))",
+        [request.vm],
+    )? != 0
+    {
+        return Ok(Err(Refusal::Busy));
+    }
+    match (&request.operation, state) {
+        (Operation::Start, StaticState::Stopped) => {
+            if store::static_vm::launch_busy(db)? {
+                return Ok(Err(Refusal::Busy));
+            }
+        }
+        (Operation::Stop | Operation::Script { .. }, StaticState::Running) => {}
+        (Operation::Snapshot { .. } | Operation::Restore { .. }, _) => {
+            return Ok(Err(Refusal::NotFound));
+        }
+        _ => return Ok(Err(Refusal::Busy)),
+    }
+    Ok(Ok(Target::Static))
+}
+
+impl<C: Clock> VmController<C> {
+    pub(crate) fn foreground_host_id(&self) -> Result<Id> {
+        self.store.transact(|db| store::static_vm::host_id(db))
+    }
+
+    pub(crate) fn foreground_static_rows(
+        &self,
+        principal: &str,
+        exact: Option<Id>,
+        after: Option<Id>,
+        limit: u32,
+    ) -> Result<Vec<store::static_vm::StaticRow>> {
+        self.store
+            .transact(|db| store::static_vm::rows(db, principal, exact, after, limit))
+    }
+
+    pub(crate) fn foreground_static_template(
+        &self,
+        template: Id,
+        digest: Option<[u8; 32]>,
+    ) -> Result<Result<(), Refusal>> {
+        self.store.transact(|db| {
+            let recipe = db
+                .query_row(
+                    "SELECT recipe_digest FROM vm_templates WHERE id=?1 AND guest=1",
+                    [template],
+                    |row| row.get::<_, [u8; 32]>(0),
+                )
+                .optional()?;
+            Ok(match (recipe, digest) {
+                (None, _) => Err(Refusal::NotFound),
+                (Some(recipe), Some(digest)) if recipe == digest => Ok(()),
+                _ => Err(Refusal::RecipeUnqualified),
+            })
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(crate) fn admit_static(
+        &self,
+        binding: store::Binding<'_>,
+        name: &super::static_web::StaticName,
+        template: Id,
+        source: (PairSlots, [ArtifactEvidence; 2]),
+        web_digest: [u8; 32],
+        disk: DiskClaim,
+        host: HostObservation,
+        resources: Resources,
+    ) -> Result<Result<(Id, PairSlots, PendingOperation, OperationRef), Refusal>> {
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        map_full(self.store.transact(|db| {
+            let clock = self.clock.now();
+            let now = utc(clock)?;
+            match binding.replay(
+                db,
+                now,
+                gate.rejects_fresh() || store::has_failed_clone_cleanup(db)?,
+            )? {
+                Ok(None) => {}
+                Ok(Some(_)) => return Ok(Err(Refusal::Busy)),
+                Err(reason) => return Ok(Err(reason)),
+            }
+            if store::count(db, "SELECT count(*) FROM vm_operations WHERE status=0", [])?
+                >= store::MAX_CALLER_PENDING
+            {
+                return Ok(Err(Refusal::PendingFull));
+            }
+            if store::static_vm::instance_count(db)? >= store::MAX_INSTANCES {
+                return Ok(Err(Refusal::InstanceLimit));
+            }
+            if store::static_vm::name_occupied(db, name)? {
+                return Ok(Err(Refusal::NameUnavailable));
+            }
+            if store::static_vm::launch_busy(db)? {
+                return Ok(Err(Refusal::Busy));
+            }
+            let Some(provenance) = store::static_vm::source(db, template, source, web_digest)?
+            else {
+                return Ok(Err(Refusal::RecipeUnqualified));
+            };
+            let capacity = match self.policy.host(host, resources) {
+                Ok(capacity) => capacity,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            if let Err(reason) = self.validate_disk(db, capacity, disk)? {
+                return Ok(Err(reason));
+            }
+            let vm = store::static_vm::allocate_id(db)?;
+            let worker = self.worker(clock, 120)?;
+            let reference = binding.record(db, now, Some(vm), None)?;
+            let slots = store::static_vm::reserve(
+                db,
+                vm,
+                name,
+                binding.principal,
+                template,
+                provenance,
+                disk,
+            )?;
+            store::require_headroom(db)?;
+            Ok(Ok((
+                vm,
+                slots,
+                PendingOperation {
+                    activity_id: reference.receipt.activity_id,
+                    ..worker
+                },
+                reference,
+            )))
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_static(
+        &self,
+        worker: &PendingOperation,
+        slots: PairSlots,
+        outcome: Result<[ArtifactEvidence; 2], super::CopyFailure>,
+    ) -> Result<Status> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let clock = self.clock.now();
+            // A late worker can no longer vouch for its own effects.
+            let outcome = if clock.monotonic < worker.deadline {
+                outcome
+            } else {
+                Err(super::CopyFailure::unknown(
+                    FailureReason::CleanupUnconfirmed,
+                ))
+            };
+            store::static_vm::settle_create(db, worker.activity_id, slots, outcome, utc(clock)?)
+        })
+    }
+
+    /// The committed pair of an owned, stopped static VM, for a fresh
+    /// identity check by the launcher after reopen.
+    #[cfg(test)]
+    pub(crate) fn static_custody(
+        &self,
+        principal: &str,
+        vm: Id,
+    ) -> Result<Option<(PairSlots, [ArtifactEvidence; 2])>> {
+        self.store
+            .transact(|db| store::static_vm::active_pair(db, principal, vm))
+    }
+}
+
+/// Bound for one static release proof inside a reaper turn.
+const STATIC_RELEASE_BUDGET: Duration = Duration::from_secs(1);

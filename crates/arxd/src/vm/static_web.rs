@@ -54,6 +54,7 @@ pub struct StaticProvenance {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i64)]
 pub enum StaticState {
     Creating,
     Stopped,
@@ -179,5 +180,71 @@ impl FullCopyReservation {
         };
         claim.total()?;
         Some(claim)
+    }
+}
+
+/// Fixed loopback range selected by the supervisor. A held socket is a
+/// provisional reservation. Native activation must hand off and prove the
+/// listener against the held process and current boot before exposing health.
+pub const ORIGIN_PORT_FIRST: u16 = 49152;
+pub const ORIGIN_PORT_LAST: u16 = 49215;
+
+/// A daemon-selected reservation with no caller-supplied address or port.
+pub struct OriginPortLease {
+    listener: std::net::TcpListener,
+    port: u16,
+}
+
+impl OriginPortLease {
+    pub fn acquire() -> std::io::Result<Self> {
+        let mut nonce = [0];
+        // getrandom's error type implements std::error::Error only with its
+        // `std` feature, which feature unification enables on some targets
+        // but not others; go through Display so every target builds.
+        getrandom::fill(&mut nonce).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let size = ORIGIN_PORT_LAST - ORIGIN_PORT_FIRST + 1;
+        for attempt in 0..size {
+            let port = ORIGIN_PORT_FIRST + (u16::from(nonce[0]) + attempt) % size;
+            match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => return Ok(Self { listener, port }),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_listener(&self) -> std::io::Result<std::net::TcpListener> {
+        let listener = self.listener.try_clone()?;
+        listener.set_nonblocking(true)?;
+        Ok(listener)
+    }
+
+    /// For the qualified launcher to check a still-held provisional claim.
+    pub fn verify(&self) -> bool {
+        self.listener.local_addr().is_ok_and(|address| {
+            address == (std::net::Ipv4Addr::LOCALHOST, self.port).into()
+                && (ORIGIN_PORT_FIRST..=ORIGIN_PORT_LAST).contains(&self.port)
+        })
+    }
+}
+
+/// Per-generation identity. The TLS name is derived from the sealed
+/// generation ID and is independent of an agent-supplied display name.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct StaticOriginIdentity(Id);
+
+impl StaticOriginIdentity {
+    pub fn for_generation(generation: Id) -> Self {
+        Self(generation)
+    }
+
+    pub fn provisioning(self) -> super::ubuntu_web::OriginProvisioning {
+        super::ubuntu_web::OriginProvisioning::new(self.0)
     }
 }

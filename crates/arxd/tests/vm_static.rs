@@ -710,3 +710,18 @@ fn full_copy_claim_covers_growth_metadata_and_staging_without_overflow() {
         assert!(invalid.checked_claim().is_none());
     }
 }
+
+#[test]
+fn origin_port_leases_are_bounded_unique_and_release_the_listener() {
+    use arxd::vm::static_web::{ORIGIN_PORT_FIRST, ORIGIN_PORT_LAST, OriginPortLease};
+    use std::net::{Ipv4Addr, TcpListener};
+    let first = OriginPortLease::acquire().unwrap();
+    let second = OriginPortLease::acquire().unwrap();
+    let port = first.port();
+    assert!((ORIGIN_PORT_FIRST..=ORIGIN_PORT_LAST).contains(&port));
+    assert_ne!(port, second.port());
+    assert!(first.verify() && second.verify());
+    assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err());
+    drop(first);
+    assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+}

@@ -506,3 +506,20 @@ Windows Setup VARS. Paused-clock worker fixtures cover the deadline for a
 stalled reopen or generation check and discard evidence after expiry.
 Real Windows Setup, Subiquity, optical topology, one-shot firmware boot
 order and guest reset behavior are **unverified on real hardware**.
+
+## Installed static Ubuntu web variant
+
+The sealed installed-static recipe permits one inbound IPv4 loopback forward.
+Its netdev is exactly
+`user,id=arxnet0,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:<leased-port>-10.0.2.15:443`.
+Only the supervisor can reserve a port from the fixed range. The bound plan
+holds the claim and requires an unbacked static disk and private static VARS.
+All other boot purposes retain the fixed restricted network.
+
+The Windows launcher refuses this plan while the QEMU/libslirp pairing,
+listener handoff and process and Job proof are unqualified. Activation
+requires the held boot to own the exact loopback listener and a trusted TLS
+probe to authenticate the static generation's origin. A port conflict or
+unrelated listener cannot establish readiness. The port, private identity
+and raw probe response never enter MCP. Native behavior is **unverified on
+real hardware**. See [ADR 0063](0063-vm-store-v9-forward-only.md) for storage.

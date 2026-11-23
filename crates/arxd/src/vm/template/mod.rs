@@ -17,8 +17,8 @@ mod lifecycle {
     use super::{RecipeError, UbuntuAssets, UbuntuRecipe, ubuntu::DETACHED_HEALTH};
     use crate::vm::{
         ArtifactEvidence, BuildAdmission, BuildRequest, BuildSlots, Clock, CloneAdmission,
-        HostObservation, Id, OperationRef, PairSlots, Refusal, Request, Resources, Status,
-        VmController,
+        FailureReason, HostObservation, Id, OperationRef, PairSlots, Refusal, Request, Resources,
+        Status, VmController,
         paths::ArtifactPin,
         runtime::{CandidateRuntime, NativeRefusal, StopDisposition},
     };
@@ -118,6 +118,22 @@ mod lifecycle {
         PingOnly,
         Timeout,
         WrongPeer,
+    }
+
+    impl Failure {
+        /// The closed cause a failed staged build records. Store, policy and
+        /// interruption failures have no proven guest-side cause.
+        fn cause(&self, stage: FailureReason) -> Option<FailureReason> {
+            match self {
+                Self::Stop(_) => Some(FailureReason::DirtyStop),
+                Self::Health | Self::Readiness(_) | Self::ReusedBoot => {
+                    Some(FailureReason::HealthFailed)
+                }
+                Self::Seed(_) => Some(FailureReason::StagingFailed),
+                Self::Media | Self::ChangedPair => Some(stage),
+                Self::Native(_) | Self::Refused(_) | Self::Store(_) | Self::Interrupted => None,
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -259,6 +275,9 @@ mod lifecycle {
                     .build_evidence(&worker, slots.id, entries)
                     .map_err(Failure::Store)
             };
+            // Media faults before a clean install are staging failures;
+            // afterwards they fail the golden's capture and seal.
+            let stage = std::cell::Cell::new(FailureReason::StagingFailed);
             let built = (|| {
                 let staged = runtime.stage(slots, &spec, &seed.0)?;
                 if staged.pin != seed.pin() {
@@ -272,6 +291,7 @@ mod lifecycle {
                 ])?;
                 let (installed, stop) = runtime.install(slots, INSTALL_TIMEOUT)?;
                 clean(stop)?;
+                stage.set(FailureReason::SealFailed);
 
                 let files = runtime.capture_golden(slots.pair, spec.retained.images)?;
                 if !files.fits(spec.retained.images) {
@@ -302,9 +322,9 @@ mod lifecycle {
                 unchanged(runtime, &golden, spec.retained.images)?;
                 Ok(golden)
             })();
-            if built.is_err() {
+            if let Err(failure) = &built {
                 self.controller
-                    .fail_build(&worker, slots, false)
+                    .fail_build_with(&worker, slots, false, failure.cause(stage.get()))
                     .map_err(Failure::Store)?;
             }
             let golden = built?;
@@ -356,10 +376,13 @@ mod lifecycle {
             })();
             let status = self
                 .controller
-                .finish_linked_clone(
+                .finish_linked_clone_with(
                     &pending,
                     slots,
-                    linked.as_ref().ok().map(|pair| pair.files.evidence()),
+                    match &linked {
+                        Ok(pair) => Ok(pair.files.evidence()),
+                        Err(failure) => Err(failure.cause(FailureReason::CloneFailed)),
+                    },
                 )
                 .map_err(Failure::Store)?;
             let pair = linked?;
@@ -1019,6 +1042,22 @@ mod lifecycle {
                     }
                     pair => panic!("unexpected disposition {pair:?}"),
                 }
+                // The staged failure keeps its proven cause on the receipt.
+                let expected = match fault {
+                    Fault::Stop(_) | Fault::InstallerStop(_) => FailureReason::DirtyStop,
+                    Fault::GoldenWrite | Fault::WrongBacking | Fault::SharedVars => {
+                        FailureReason::SealFailed
+                    }
+                    _ => FailureReason::HealthFailed,
+                };
+                assert_eq!(
+                    scalar(
+                        f.root.path(),
+                        "SELECT failure_reason FROM vm_operations WHERE action=11"
+                    ),
+                    expected as i64,
+                    "{fault:?}"
+                );
                 assert_eq!(
                     scalar(f.root.path(), "SELECT count(*) FROM vm_templates"),
                     0
@@ -1099,6 +1138,14 @@ mod lifecycle {
                 (2 * MIB) as i64
             );
             assert_eq!(scalar(f.root.path(), "SELECT state FROM vm_instances"), 4);
+            // The worker's known clone failure survives the unproven release.
+            assert_eq!(
+                scalar(
+                    f.root.path(),
+                    "SELECT failure_reason FROM vm_operations WHERE action=1"
+                ),
+                FailureReason::CloneFailed as i64
+            );
             assert_eq!(
                 scalar(
                     f.root.path(),
