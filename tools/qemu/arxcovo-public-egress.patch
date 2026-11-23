@@ -1,0 +1,1660 @@
+diff --git a/meson.build b/meson.build
+index 40e3f4e..a4b107f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -15,7 +15,7 @@ add_test_setup('slow', exclude_suites: ['thorough'],
+ add_test_setup('thorough',
+                env: ['G_TEST_SLOW=1', 'SPEED=thorough', 'RUST_BACKTRACE=1'])
+
+-meson.add_postconf_script(find_program('scripts/symlink-install-tree.py'))
++# Local Windows package build: skip the unprivileged development bundle symlinks.
+
+ ####################
+ # Global variables #
+@@ -1278,8 +1278,11 @@ endif
+
+ slirp = not_found
+ if not get_option('slirp').auto() or have_system
+-  slirp = dependency('slirp', required: get_option('slirp'),
+-                     method: 'pkg-config')
++  if not get_option('slirp').disabled()
++    # Pair the option with the reviewed, patched slirp source. An installed
++    # system libslirp does not implement the policy.
++    slirp = subproject('slirp', default_options: ['default_library=static']).get_variable('libslirp_libdep')
++  endif
+   # slirp < 4.7 is incompatible with CFI support in QEMU.  This is because
+   # it passes function pointers within libslirp as callbacks for timers.
+   # When using a system-wide shared libslirp, the type information for the
+diff --git a/net/slirp.c b/net/slirp.c
+index 9e9941f..c5dbf8b 100644
+--- a/net/slirp.c
++++ b/net/slirp.c
+@@ -41,6 +41,7 @@
+ #include <libslirp.h>
+ #include "chardev/char-fe.h"
+ #include "system/system.h"
++#include "system/runstate.h"
+ #include "qemu/cutils.h"
+ #include "qapi/error.h"
+ #include "qobject/qdict.h"
+@@ -97,6 +98,7 @@ typedef struct SlirpState {
+     gchar *smb_dir;
+ #endif
+     GSList *fwd;
++    bool arx_public_egress;
+ } SlirpState;
+
+ static struct slirp_config_str *slirp_configs;
+@@ -429,6 +431,13 @@ static SaveVMHandlers savevm_slirp_state = {
+     .load_state = net_slirp_state_load,
+ };
+
++static void net_slirp_arx_fault(void)
++{
++    error_report("Arxcovo public egress lost its enrolled uplink");
++    qemu_system_vmstop_request_prepare();
++    qemu_system_vmstop_request(RUN_STATE_PAUSED);
++}
++
+ static int net_slirp_init(NetClientState *peer, const char *model,
+                           const char *name, int restricted,
+                           bool ipv4, const char *vnetwork, const char *vhost,
+@@ -440,6 +449,7 @@ static int net_slirp_init(NetClientState *peer, const char *model,
+                           const char *smb_export, const char *vsmbserver,
+                           const char **dnssearch, const char *vdomainname,
+                           const char *tftp_server_name,
++                          const char *arx_policy,
+                           Error **errp)
+ {
+     /* default settings according to historic slirp */
+@@ -463,6 +473,15 @@ static int net_slirp_init(NetClientState *peer, const char *model,
+     char *end;
+     struct slirp_config_str *config;
+
++    if (arx_policy) {
++        QTAILQ_FOREACH(s, &slirp_stacks, entry) {
++            if (s->arx_public_egress) {
++                error_setg(errp, "Only one Arxcovo public egress backend is allowed");
++                return -1;
++            }
++        }
++    }
++
+     if (!ipv4 && (vnetwork || vhost || vnameserver)) {
+         error_setg(errp, "IPv4 disabled but netmask/host/dns provided");
+         return -1;
+@@ -681,6 +700,13 @@ static int net_slirp_init(NetClientState *peer, const char *model,
+     s->poll_notifier.notify = net_slirp_poll_notify;
+     main_loop_poll_add_notifier(&s->poll_notifier);
+
++    if (arx_policy &&
++        !slirp_arx_enable(s->slirp, arx_policy, net_slirp_arx_fault)) {
++        error_setg(errp, "Arxcovo public egress policy or uplink refused");
++        goto error;
++    }
++    s->arx_public_egress = arx_policy != NULL;
++
+     for (config = slirp_configs; config; config = config->next) {
+         if (config->flags & SLIRP_CFG_HOSTFWD) {
+             if (slirp_hostfwd(s, config->str, errp) < 0) {
+@@ -1297,6 +1323,16 @@ int net_init_slirp(const Netdev *netdev, const char *name,
+            user->ip  ? g_strdup_printf("%s/24", user->ip) :
+            NULL;
+
++    if (user->arx_public_egress &&
++        (!ipv4 || ipv6 || user->q_restrict || user->guestfwd ||
++         user->tftp || user->tftp_server_name || user->bootfile ||
++         user->smb || user->smbserver || user->dnssearch ||
++         user->domainname || user->hostname)) {
++        g_free(vnet);
++        error_setg(errp, "Incompatible Arxcovo public egress options");
++        return -1;
++    }
++
+     dnssearch = slirp_dnssearch(user->dnssearch);
+
+     /* all optional fields are initialized to "all bits zero" */
+@@ -1311,7 +1347,7 @@ int net_init_slirp(const Netdev *netdev, const char *name,
+                          user->bootfile, user->dhcpstart,
+                          user->dns, user->ipv6_dns, user->smb,
+                          user->smbserver, dnssearch, user->domainname,
+-                         user->tftp_server_name, errp);
++                         user->tftp_server_name, user->arx_public_egress, errp);
+
+     while (slirp_configs) {
+         config = slirp_configs;
+diff --git a/qapi/net.json b/qapi/net.json
+index 1a63828..9fd23f3 100644
+--- a/qapi/net.json
++++ b/qapi/net.json
+@@ -356,6 +356,9 @@
+ # @hostfwd: redirect incoming TCP, UDP or UNIX host connections to
+ #     guest endpoints
+ #
++# @arx-public-egress: path to an enrolled Arxcovo IPv4 egress policy
++#     for the Windows static guest
++#
+ # @guestfwd: forward guest TCP connections
+ #
+ # @tftp-server-name: RFC2132 "TFTP server name" string (Since 3.1)
+@@ -385,6 +388,7 @@
+     '*smbserver': 'str',
+     '*hostfwd':   ['NetdevUserHostForward'],
+     '*guestfwd':  ['NetdevUserGuestForward'],
++    '*arx-public-egress': 'str',
+     '*tftp-server-name': 'str' } }
+
+ ##
+diff --git a/subprojects/slirp/meson.build b/subprojects/slirp/meson.build
+index 26a0b60..1b82233 100644
+--- a/subprojects/slirp/meson.build
++++ b/subprojects/slirp/meson.build
+@@ -95,6 +95,7 @@ add_project_arguments(cc.get_supported_arguments('-Wmissing-prototypes', '-Wstri
+ cargs = [
+   '-DG_LOG_DOMAIN="Slirp"',
+   '-DBUILDING_LIBSLIRP',
++  '-DLIBSLIRP_STATIC',
+ ]
+
+ if glib_static == true
+@@ -134,6 +135,7 @@ endif
+
+ sources = [
+   'src/arp_table.c',
++  'src/arx-egress.c',
+   'src/bootp.c',
+   'src/cksum.c',
+   'src/dhcpv6.c',
+@@ -272,6 +274,9 @@ endif
+
+ libslirp_libdep = declare_dependency(
+   link_with : lib,
++  version : version,
++  dependencies : libslirp_deps,
++  compile_args : ['-DLIBSLIRP_STATIC'],
+   include_directories : [include_directories('src'), include_directories('.')],
+ )
+ meson.override_dependency('slirp', libslirp_libdep)
+@@ -295,3 +300,21 @@ gatewaydnstest = executable('gatewaydnstest', 'test/gatewaydnstest.c',
+   dependencies: libslirp_deps,
+ )
+ test('gatewaydns', gatewaydnstest)
++
++if host_system == 'windows'
++  arx_test_wrap = [
++    'slirp_socket', 'slirp_set_nonblock', 'slirp_closesocket_wrap',
++    'slirp_setsockopt_wrap', 'slirp_bind_wrap', 'slirp_listen_wrap',
++    'slirp_getsockname_wrap', 'slirp_accept_wrap', 'slirp_connect_wrap',
++    'slirp_send_wrap', 'slirp_sendto_wrap',
++  ]
++  arx_test_link_args = []
++  foreach symbol : arx_test_wrap
++    arx_test_link_args += '-Wl,--wrap=' + symbol
++  endforeach
++  arx_egress_test = executable('arx-egress-test', 'test/arx-egress-test.c',
++    dependencies : libslirp_libdep,
++    link_args : arx_test_link_args,
++  )
++  test('arx-egress', arx_egress_test)
++endif
+diff --git a/subprojects/slirp/src/arx-egress.c b/subprojects/slirp/src/arx-egress.c
+new file mode 100644
+index 0000000..23fe8f8
+--- /dev/null
++++ b/subprojects/slirp/src/arx-egress.c
+@@ -0,0 +1,525 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++#include "slirp.h"
++
++void arx_udp_refresh(struct socket *so)
++{
++    so->arx_udp_deadline = g_get_monotonic_time() + 30 * G_USEC_PER_SEC;
++}
++
++bool arx_udp_expired(const struct socket *so)
++{
++    return so->arx_udp_deadline <= g_get_monotonic_time();
++}
++
++#ifdef _WIN32
++#include <iphlpapi.h>
++
++#define ARX_MAX_POLICY (32 * 1024)
++#define ARX_MAX_DENY 512
++#define ARX_MAX_ADDRESSES 4096
++
++struct ArxPrefix {
++    uint32_t network;
++    uint32_t mask;
++};
++
++#define ARX_PREFIX(net, bits) { (net), UINT32_MAX << (32 - (bits)) }
++
++/* Frozen IPv4 special-purpose policy. Keep the entire IETF assignments
++ * block and the deprecated 6to4 relay block closed, including exceptions. */
++static const struct ArxPrefix arx_special[] = {
++    ARX_PREFIX(0x00000000u, 8),  /* 0.0.0.0/8               This network */
++    ARX_PREFIX(0x0a000000u, 8),  /* 10.0.0.0/8              Private */
++    ARX_PREFIX(0x64400000u, 10), /* 100.64.0.0/10           Shared */
++    ARX_PREFIX(0x7f000000u, 8),  /* 127.0.0.0/8             Loopback */
++    ARX_PREFIX(0xa9fe0000u, 16), /* 169.254.0.0/16          Link-local */
++    ARX_PREFIX(0xac100000u, 12), /* 172.16.0.0/12           Private */
++    ARX_PREFIX(0xc0000000u, 24), /* 192.0.0.0/24            IETF assignments */
++    ARX_PREFIX(0xc0000200u, 24), /* 192.0.2.0/24            TEST-NET-1 */
++    ARX_PREFIX(0xc0586300u, 24), /* 192.88.99.0/24          Deprecated 6to4 */
++    ARX_PREFIX(0xc0a80000u, 16), /* 192.168.0.0/16          Private */
++    ARX_PREFIX(0xc6120000u, 15), /* 198.18.0.0/15           Benchmarking */
++    ARX_PREFIX(0xc6336400u, 24), /* 198.51.100.0/24         TEST-NET-2 */
++    ARX_PREFIX(0xcb007100u, 24), /* 203.0.113.0/24          TEST-NET-3 */
++    ARX_PREFIX(0xe0000000u, 4),  /* 224.0.0.0/4             Multicast */
++    ARX_PREFIX(0xf0000000u, 4),  /* 240.0.0.0/4             Reserved/broadcast */
++};
++
++struct ArxEgress {
++    HANDLE file;
++    HANDLE route_notify;
++    HANDLE address_notify;
++    HANDLE interface_notify;
++    uint32_t index;
++    NET_LUID luid;
++    struct in_addr source;
++    struct in_addr gateway;
++    GArray *deny;
++    gint faulted; /* Windows notifications run on another thread. */
++    bool quiesced;
++    void (*fault)(void);
++    gint64 next_health_check;
++};
++
++static bool prefix_matches(const struct ArxPrefix *table, size_t count,
++                           uint32_t address)
++{
++    for (size_t i = 0; i < count; i++) {
++        if ((address & table[i].mask) == table[i].network) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static void add_prefix(struct ArxEgress *policy, uint32_t address, unsigned bits)
++{
++    uint32_t mask = UINT32_MAX << (32 - bits);
++    struct ArxPrefix prefix = { address & mask, mask };
++    g_array_append_val(policy->deny, prefix);
++}
++
++static bool parse_decimal(const char *text, uint64_t max, uint64_t *value)
++{
++    uint64_t result = 0;
++
++    if (text[0] < '1' || text[0] > '9') {
++        return false;
++    }
++    for (; *text; text++) {
++        if (!g_ascii_isdigit(*text)) {
++            return false;
++        }
++        unsigned digit = *text - '0';
++        if (result > (max - digit) / 10) {
++            return false;
++        }
++        result = result * 10 + digit;
++    }
++    *value = result;
++    return true;
++}
++
++static bool parse_ipv4(const char *text, struct in_addr *address)
++{
++    char canonical[INET_ADDRSTRLEN];
++
++    return inet_pton(AF_INET, text, address) == 1 &&
++           inet_ntop(AF_INET, address, canonical, sizeof(canonical)) &&
++           strcmp(text, canonical) == 0;
++}
++
++static bool parse_deny(struct ArxEgress *policy, char *text)
++{
++    struct in_addr address;
++    uint64_t bits;
++    uint32_t host;
++    uint32_t mask;
++    char *slash = strchr(text, '/');
++
++    if (!slash || policy->deny->len == ARX_MAX_DENY) {
++        return false;
++    }
++    *slash = '\0';
++    if (!parse_ipv4(text, &address) || !parse_decimal(slash + 1, 32, &bits)) {
++        return false;
++    }
++    host = ntohl(address.s_addr);
++    mask = UINT32_MAX << (32 - bits);
++    if ((host & mask) != host) {
++        return false;
++    }
++    for (guint i = 0; i < policy->deny->len; i++) {
++        struct ArxPrefix existing = g_array_index(policy->deny, struct ArxPrefix, i);
++        if (existing.network == host && existing.mask == mask) {
++            return false;
++        }
++    }
++    add_prefix(policy, host, bits);
++    return true;
++}
++
++static bool parse_policy(struct ArxEgress *policy, char *bytes, DWORD count)
++{
++    static const char fingerprint_key[] = "fingerprint=";
++    size_t footer_size = sizeof(fingerprint_key) - 1 + 64 + 1;
++    char *footer;
++    char *digest;
++    gchar **lines;
++    uint64_t index;
++    uint64_t luid;
++    bool ok;
++
++    if (count <= footer_size || memchr(bytes, '\0', count)) {
++        return false;
++    }
++    footer = bytes + count - footer_size;
++    if (footer[-1] != '\n' || bytes[count - 1] != '\n' ||
++        memcmp(footer, fingerprint_key, sizeof(fingerprint_key) - 1) != 0) {
++        return false;
++    }
++    digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
++                                         (const guchar *)bytes, footer - bytes);
++    ok = memcmp(footer + sizeof(fingerprint_key) - 1, digest, 64) == 0;
++    g_free(digest);
++    if (!ok) {
++        return false;
++    }
++    footer[-1] = '\0';
++    lines = g_strsplit(bytes, "\n", -1);
++    ok = g_strv_length(lines) >= 5 &&
++         strcmp(lines[0], "version=1") == 0 &&
++         g_str_has_prefix(lines[1], "interface_index=") &&
++         parse_decimal(lines[1] + strlen("interface_index="), UINT32_MAX, &index) &&
++         g_str_has_prefix(lines[2], "interface_luid=") &&
++         parse_decimal(lines[2] + strlen("interface_luid="), UINT64_MAX, &luid) &&
++         g_str_has_prefix(lines[3], "source=") &&
++         parse_ipv4(lines[3] + strlen("source="), &policy->source) &&
++         g_str_has_prefix(lines[4], "gateway=") &&
++         parse_ipv4(lines[4] + strlen("gateway="), &policy->gateway) &&
++         policy->source.s_addr && policy->gateway.s_addr &&
++         policy->source.s_addr != policy->gateway.s_addr;
++    if (ok) {
++        policy->index = (uint32_t)index;
++        policy->luid.Value = luid;
++    }
++    for (guint i = 5; ok && lines[i]; i++) {
++        ok = g_str_has_prefix(lines[i], "deny=") &&
++             parse_deny(policy, lines[i] + strlen("deny="));
++    }
++    g_strfreev(lines);
++    return ok;
++}
++
++static bool load_policy(struct ArxEgress *policy, const char *path)
++{
++    BY_HANDLE_FILE_INFORMATION info;
++    WCHAR *wide;
++    char *bytes;
++    DWORD count;
++    bool ok;
++
++    /* The broker owns the parent path and authentication. Pin the plain
++     * file leaf open for the life of the backend, sharing only reads. */
++    if (strlen(path) < 4 || !g_ascii_isalpha(path[0]) || path[1] != ':' ||
++        (path[2] != '\\' && path[2] != '/') || strchr(path + 2, ':')) {
++        return false;
++    }
++    wide = g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
++    if (!wide) {
++        return false;
++    }
++    policy->file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ, NULL,
++                               OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
++    g_free(wide);
++    if (policy->file == INVALID_HANDLE_VALUE ||
++        GetFileType(policy->file) != FILE_TYPE_DISK ||
++        !GetFileInformationByHandle(policy->file, &info) ||
++        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
++                                  FILE_ATTRIBUTE_REPARSE_POINT)) ||
++        info.nFileSizeHigh || !info.nFileSizeLow ||
++        info.nFileSizeLow > ARX_MAX_POLICY) {
++        return false;
++    }
++    bytes = g_malloc(info.nFileSizeLow);
++    ok = ReadFile(policy->file, bytes, info.nFileSizeLow, &count, NULL) &&
++         count == info.nFileSizeLow && parse_policy(policy, bytes, count);
++    g_free(bytes);
++    return ok;
++}
++
++static bool route_matches(struct ArxEgress *policy, uint32_t destination)
++{
++    MIB_IPFORWARDROW route;
++    NET_LUID luid;
++
++    return GetBestRoute(destination, policy->source.s_addr, &route) == NO_ERROR &&
++           route.dwForwardDest == 0 && route.dwForwardMask == 0 &&
++           route.dwForwardNextHop == policy->gateway.s_addr &&
++           route.dwForwardIfIndex == policy->index &&
++           ConvertInterfaceIndexToLuid(policy->index, &luid) == NO_ERROR &&
++           luid.Value == policy->luid.Value;
++}
++
++static bool enroll_addresses(struct ArxEgress *policy)
++{
++    PMIB_UNICASTIPADDRESS_TABLE table;
++    bool source_found = false;
++
++    if (GetUnicastIpAddressTable(AF_INET, &table) != NO_ERROR) {
++        return false;
++    }
++    if (table->NumEntries > ARX_MAX_ADDRESSES) {
++        FreeMibTable(table);
++        return false;
++    }
++    for (ULONG i = 0; i < table->NumEntries; i++) {
++        const MIB_UNICASTIPADDRESS_ROW *row = &table->Table[i];
++        uint32_t addr = ntohl(row->Address.Ipv4.sin_addr.s_addr);
++
++        if (row->Address.si_family != AF_INET || row->OnLinkPrefixLength > 32) {
++            FreeMibTable(table);
++            return false;
++        }
++        add_prefix(policy, addr, 32);
++        if (row->OnLinkPrefixLength) {
++            add_prefix(policy, addr, row->OnLinkPrefixLength);
++        }
++        if (row->InterfaceLuid.Value == policy->luid.Value &&
++            row->Address.Ipv4.sin_addr.s_addr == policy->source.s_addr &&
++            row->DadState == IpDadStatePreferred && !row->SkipAsSource) {
++            source_found = true;
++        }
++    }
++    FreeMibTable(table);
++    return source_found;
++}
++
++static VOID CALLBACK route_changed(PVOID context, PMIB_IPFORWARD_ROW2 row,
++                                   MIB_NOTIFICATION_TYPE type)
++{
++    struct ArxEgress *policy = context;
++    g_atomic_int_set(&policy->faulted, true);
++}
++
++static VOID CALLBACK address_changed(PVOID context, PMIB_UNICASTIPADDRESS_ROW row,
++                                     MIB_NOTIFICATION_TYPE type)
++{
++    struct ArxEgress *policy = context;
++    g_atomic_int_set(&policy->faulted, true);
++}
++
++static VOID CALLBACK interface_changed(PVOID context, PMIB_IPINTERFACE_ROW row,
++                                       MIB_NOTIFICATION_TYPE type)
++{
++    struct ArxEgress *policy = context;
++    g_atomic_int_set(&policy->faulted, true);
++}
++
++static bool arm_monitors(struct ArxEgress *policy)
++{
++    return NotifyRouteChange2(AF_INET, route_changed, policy, FALSE,
++                              &policy->route_notify) == NO_ERROR &&
++           NotifyUnicastIpAddressChange(AF_INET, address_changed, policy, FALSE,
++                                        &policy->address_notify) == NO_ERROR &&
++           NotifyIpInterfaceChange(AF_INET, interface_changed, policy, FALSE,
++                                   &policy->interface_notify) == NO_ERROR;
++}
++
++static bool uplink_present(struct ArxEgress *policy)
++{
++    MIB_IF_ROW2 iface = { 0 };
++    MIB_UNICASTIPADDRESS_ROW addr;
++
++    iface.InterfaceLuid = policy->luid;
++    InitializeUnicastIpAddressEntry(&addr);
++    addr.InterfaceLuid = policy->luid;
++    addr.Address.Ipv4.sin_family = AF_INET;
++    addr.Address.Ipv4.sin_addr = policy->source;
++    return GetIfEntry2(&iface) == NO_ERROR &&
++           iface.OperStatus == IfOperStatusUp &&
++           GetUnicastIpAddressEntry(&addr) == NO_ERROR &&
++           addr.DadState == IpDadStatePreferred && !addr.SkipAsSource &&
++           route_matches(policy, 0);
++}
++
++bool slirp_arx_enable(Slirp *slirp, const char *path, void (*fault)(void))
++{
++    struct ArxEgress *policy;
++
++    if (slirp->arx || !fault || !slirp->in_enabled || slirp->in6_enabled ||
++        slirp->vnetwork_addr.s_addr != htonl(0x0a000200u) ||
++        slirp->vnetwork_mask.s_addr != htonl(0xffffff00u) ||
++        slirp->vhost_addr.s_addr != htonl(0x0a000202u) ||
++        slirp->vnameserver_addr.s_addr != htonl(0x0a000203u) ||
++        slirp->vdhcp_startaddr.s_addr != htonl(0x0a00020fu)) {
++        return false;
++    }
++
++    policy = g_new0(struct ArxEgress, 1);
++    policy->file = INVALID_HANDLE_VALUE;
++    policy->deny = g_array_new(FALSE, FALSE, sizeof(struct ArxPrefix));
++    policy->fault = fault;
++    slirp->arx = policy;
++
++    if (!load_policy(policy, path) ||
++        !arm_monitors(policy) ||
++        !enroll_addresses(policy) ||
++        !uplink_present(policy) || g_atomic_int_get(&policy->faulted)) {
++        arx_cleanup(slirp);
++        return false;
++    }
++    add_prefix(policy, ntohl(policy->gateway.s_addr), 32);
++    slirp->disable_dns = true;
++    slirp->disable_host_loopback = true;
++    slirp->disable_dhcp = true;
++    slirp->enable_emu = false;
++    return true;
++}
++
++bool arx_allows(Slirp *slirp, struct in_addr address)
++{
++    struct ArxEgress *policy = slirp->arx;
++    uint32_t host = ntohl(address.s_addr);
++
++    return !g_atomic_int_get(&policy->faulted) &&
++           (address.s_addr & slirp->vnetwork_mask.s_addr) !=
++               slirp->vnetwork_addr.s_addr &&
++           !prefix_matches(arx_special, G_N_ELEMENTS(arx_special), host) &&
++           !prefix_matches((const struct ArxPrefix *)policy->deny->data,
++                           policy->deny->len, host);
++}
++
++bool arx_check_peer(Slirp *slirp, const struct sockaddr_storage *peer)
++{
++    const struct sockaddr_in *dst = (const struct sockaddr_in *)peer;
++    struct ArxEgress *policy = slirp->arx;
++
++    if (peer->ss_family == AF_INET && dst->sin_port &&
++        arx_allows(slirp, dst->sin_addr)) {
++        if (!route_matches(policy, dst->sin_addr.s_addr)) {
++            g_atomic_int_set(&policy->faulted, true);
++        }
++        if (!g_atomic_int_get(&policy->faulted)) {
++            return true;
++        }
++    }
++    errno = EPERM;
++    return false;
++}
++
++int arx_bind(struct socket *so, unsigned short family)
++{
++    struct ArxEgress *policy = so->slirp->arx;
++    struct sockaddr_in source = { .sin_family = AF_INET, .sin_addr = policy->source };
++    DWORD index = htonl(policy->index);
++
++    if (family != AF_INET || g_atomic_int_get(&policy->faulted)) {
++        errno = EPERM;
++        return -1;
++    }
++    if (setsockopt(so->s, IPPROTO_IP, IP_UNICAST_IF, &index, sizeof(index)) < 0 ||
++        bind(so->s, (struct sockaddr *)&source, sizeof(source)) < 0) {
++        g_atomic_int_set(&policy->faulted, true);
++        return -1;
++    }
++    return 0;
++}
++
++int arx_exclusive_listener(slirp_os_socket sock)
++{
++    int exclusive = 1;
++    return setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
++                      &exclusive, sizeof(exclusive));
++}
++
++bool arx_hostfwd(Slirp *slirp, const struct sockaddr *host, socklen_t host_len,
++                 const struct sockaddr *guest, socklen_t guest_len, int flags)
++{
++    const struct sockaddr_in *h = (const struct sockaddr_in *)host;
++    const struct sockaddr_in *g = (const struct sockaddr_in *)guest;
++    const struct socket *head = &slirp->tcb;
++
++    if (flags || host_len != sizeof(*h) || guest_len != sizeof(*g) ||
++        h->sin_family != AF_INET || g->sin_family != AF_INET ||
++        h->sin_addr.s_addr != htonl(INADDR_LOOPBACK) ||
++        ntohs(h->sin_port) < 49152 || ntohs(h->sin_port) > 49215 ||
++        g->sin_addr.s_addr != slirp->vdhcp_startaddr.s_addr ||
++        g->sin_port != htons(443) || g_atomic_int_get(&slirp->arx->faulted)) {
++        return false;
++    }
++    for (const struct socket *so = head->so_next; so != head; so = so->so_next) {
++        if (so->so_state & SS_HOSTFWD) {
++            return false;
++        }
++    }
++    return true;
++}
++
++void arx_poll(Slirp *slirp, int poll_error)
++{
++    struct ArxEgress *policy = slirp->arx;
++    struct socket *so, *next;
++    gint64 now = g_get_monotonic_time();
++
++    if (policy->quiesced) {
++        return;
++    }
++    if (poll_error ||
++        (now >= policy->next_health_check && !uplink_present(policy))) {
++        g_atomic_int_set(&policy->faulted, true);
++    }
++    if (now >= policy->next_health_check) {
++        policy->next_health_check = now + G_USEC_PER_SEC;
++    }
++    if (!g_atomic_int_get(&policy->faulted)) {
++        return;
++    }
++    policy->quiesced = true;
++    for (so = slirp->tcb.so_next; so != &slirp->tcb; so = next) {
++        struct linger abort_pending = { 1, 0 };
++        next = so->so_next;
++        if (!(so->so_state & (SS_HOSTFWD | SS_INCOMING))) {
++            if (have_valid_socket(so->s)) {
++                setsockopt(so->s, SOL_SOCKET, SO_LINGER,
++                           &abort_pending, sizeof(abort_pending));
++            }
++            tcp_close(sototcpcb(so));
++        }
++    }
++    for (so = slirp->udb.so_next; so != &slirp->udb; so = next) {
++        next = so->so_next;
++        udp_detach(so);
++    }
++    policy->fault();
++}
++
++void arx_cleanup(Slirp *slirp)
++{
++    struct ArxEgress *policy = slirp->arx;
++
++    if (!policy) {
++        return;
++    }
++    /* Cancellation drains callbacks. If Windows cannot cancel one, retain
++     * its context until process exit so a late callback cannot use freed memory. */
++    bool drained = true;
++    HANDLE notifications[] = {
++        policy->route_notify, policy->address_notify, policy->interface_notify,
++    };
++    for (size_t i = 0; i < G_N_ELEMENTS(notifications); i++) {
++        if (notifications[i] && CancelMibChangeNotify2(notifications[i]) != NO_ERROR) {
++            drained = false;
++        }
++    }
++    if (policy->file != INVALID_HANDLE_VALUE) {
++        CloseHandle(policy->file);
++    }
++    g_array_free(policy->deny, TRUE);
++    if (drained) {
++        g_free(policy);
++    }
++    slirp->arx = NULL;
++}
++
++#else
++
++/* The option fails closed on hosts without the Windows uplink implementation. */
++bool slirp_arx_enable(Slirp *slirp, const char *path, void (*fault)(void))
++{
++    return false;
++}
++
++bool arx_allows(Slirp *slirp, struct in_addr address) { return false; }
++bool arx_check_peer(Slirp *slirp, const struct sockaddr_storage *peer) { return false; }
++int arx_bind(struct socket *so, unsigned short family) { return -1; }
++int arx_exclusive_listener(slirp_os_socket sock) { return -1; }
++void arx_poll(Slirp *slirp, int poll_error) {}
++void arx_cleanup(Slirp *slirp) {}
++bool arx_hostfwd(Slirp *slirp, const struct sockaddr *host, socklen_t host_len,
++                 const struct sockaddr *guest, socklen_t guest_len, int flags)
++{
++    return false;
++}
++
++#endif
+diff --git a/subprojects/slirp/src/arx-egress.h b/subprojects/slirp/src/arx-egress.h
+new file mode 100644
+index 0000000..a06db60
+--- /dev/null
++++ b/subprojects/slirp/src/arx-egress.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++#ifndef SLIRP_ARX_EGRESS_H
++#define SLIRP_ARX_EGRESS_H
++
++struct socket;
++
++bool arx_allows(Slirp *slirp, struct in_addr address);
++bool arx_check_peer(Slirp *slirp, const struct sockaddr_storage *peer);
++void arx_udp_refresh(struct socket *so);
++bool arx_udp_expired(const struct socket *so);
++int arx_bind(struct socket *so, unsigned short family);
++int arx_exclusive_listener(slirp_os_socket sock);
++void arx_poll(Slirp *slirp, int poll_error);
++void arx_cleanup(Slirp *slirp);
++bool arx_hostfwd(Slirp *slirp, const struct sockaddr *host, socklen_t host_len,
++                 const struct sockaddr *guest, socklen_t guest_len, int flags);
++
++#endif
+diff --git a/subprojects/slirp/src/ip_input.c b/subprojects/slirp/src/ip_input.c
+index c7a00da..0d81f60 100644
+--- a/subprojects/slirp/src/ip_input.c
++++ b/subprojects/slirp/src/ip_input.c
+@@ -116,6 +116,14 @@ void ip_input(struct mbuf *m)
+     NTOHS(ip->ip_id);
+     NTOHS(ip->ip_off);
+
++    if (slirp->arx &&
++        (hlen != sizeof(struct ip) || (ip->ip_off & ~IP_DF) ||
++         ip->ip_src.s_addr != slirp->vdhcp_startaddr.s_addr ||
++         (ip->ip_p != IPPROTO_TCP && ip->ip_p != IPPROTO_UDP) ||
++         (ip->ip_p == IPPROTO_UDP && !arx_allows(slirp, ip->ip_dst)))) {
++        goto bad;
++    }
++
+     /*
+      * Check that the amount of data in the buffers
+      * is as at least much as the IP header would have us expect.
+diff --git a/subprojects/slirp/src/libslirp.h b/subprojects/slirp/src/libslirp.h
+index 240dfe8..b5124fb 100644
+--- a/subprojects/slirp/src/libslirp.h
++++ b/subprojects/slirp/src/libslirp.h
+@@ -67,6 +67,9 @@ typedef SOCKET slirp_os_socket;
+ /* Opaque structure containing the slirp state */
+ typedef struct Slirp Slirp;
+
++SLIRP_EXPORT
++bool slirp_arx_enable(Slirp *slirp, const char *path, void (*fault)(void));
++
+ /* Flags passed to SlirpAddPollCb and to be returned by SlirpGetREventsCb. */
+ enum {
+     SLIRP_POLL_IN = 1 << 0,
+diff --git a/subprojects/slirp/src/misc.c b/subprojects/slirp/src/misc.c
+index 0cf1b6a..7a6bd27 100644
+--- a/subprojects/slirp/src/misc.c
++++ b/subprojects/slirp/src/misc.c
+@@ -447,6 +447,9 @@ int slirp_bind_outbound(struct socket *so, unsigned short af)
+     const struct sockaddr *addr = NULL;
+     int addr_size = 0;
+
++    if (so->slirp->arx) {
++        return arx_bind(so, af);
++    }
+     if (af == AF_INET && so->slirp->outbound_addr != NULL) {
+         addr = (struct sockaddr *)so->slirp->outbound_addr;
+         addr_size = sizeof(struct sockaddr_in);
+diff --git a/subprojects/slirp/src/slirp.c b/subprojects/slirp/src/slirp.c
+index 9b7526a..3a90b7f 100644
+--- a/subprojects/slirp/src/slirp.c
++++ b/subprojects/slirp/src/slirp.c
+@@ -768,6 +768,7 @@ void slirp_cleanup(Slirp *slirp)
+         g_free(e);
+     }
+
++    arx_cleanup(slirp);
+     ip_cleanup(slirp);
+     ip6_cleanup(slirp);
+     m_cleanup(slirp);
+@@ -816,6 +817,10 @@ void slirp_pollfds_fill_socket(Slirp *slirp, uint32_t *timeout,
+ {
+     struct socket *so, *so_next;
+
++    if (slirp->arx) {
++        *timeout = MIN(*timeout, 100);
++    }
++
+     /*
+      * First, TCP sockets
+      */
+@@ -899,6 +904,10 @@ void slirp_pollfds_fill_socket(Slirp *slirp, uint32_t *timeout,
+     for (so = slirp->udb.so_next; so != &slirp->udb; so = so_next) {
+         so_next = so->so_next;
+
++        if (slirp->arx && arx_udp_expired(so)) {
++            udp_detach(so);
++            continue;
++        }
+         so->pollfds_idx = -1;
+
+         /*
+@@ -1030,6 +1039,9 @@ void slirp_pollfds_poll(Slirp *slirp, int select_error,
+     struct socket *so, *so_next;
+     int ret;
+
++    if (slirp->arx) {
++        arx_poll(slirp, select_error);
++    }
+     curtime = (unsigned int) (slirp->cb->clock_get_ns(slirp->opaque) / SCALE_MS);
+
+     /*
+@@ -1126,7 +1138,8 @@ void slirp_pollfds_poll(Slirp *slirp, int select_error,
+                     /* Connected */
+                     so->so_state &= ~SS_ISFCONNECTING;
+
+-                    ret = send(so->s, (const void *)&ret, 0, 0);
++                    ret = slirp->arx ? slirp_send(so, &ret, 0, 0)
++                                     : send(so->s, &ret, 0, 0);
+                     if (ret < 0) {
+                         /* XXXXX Must fix, zero bytes is a NOP */
+                         if (errno == EAGAIN || errno == EWOULDBLOCK ||
+@@ -1284,6 +1297,9 @@ void slirp_input(Slirp *slirp, const uint8_t *pkt, int pkt_len)
+         return;
+
+     proto = (((uint16_t)pkt[12]) << 8) + pkt[13];
++    if (slirp->arx && proto != ETH_P_ARP && proto != ETH_P_IP) {
++        return;
++    }
+     switch (proto) {
+     case ETH_P_ARP:
+         arp_input(slirp, pkt, pkt_len);
+@@ -1479,6 +1495,10 @@ int slirp_remove_hostfwd(Slirp *slirp, int is_udp, struct in_addr host_addr,
+ int slirp_add_hostfwd(Slirp *slirp, int is_udp, struct in_addr host_addr,
+                       int host_port, struct in_addr guest_addr, int guest_port)
+ {
++    if (slirp->arx) {
++        errno = EPERM;
++        return -1;
++    }
+     if (!guest_addr.s_addr) {
+         guest_addr = slirp->vdhcp_startaddr;
+     }
+@@ -1526,6 +1546,12 @@ int slirp_add_hostxfwd(Slirp *slirp,
+     struct sockaddr_in gdhcp_addr;
+     int fwd_flags = SS_HOSTFWD;
+
++    if (slirp->arx &&
++        !arx_hostfwd(slirp, haddr, haddrlen, gaddr, gaddrlen, flags)) {
++        errno = EPERM;
++        return -1;
++    }
++
+     if (flags & SLIRP_HOSTFWD_V6ONLY)
+         fwd_flags |= SS_HOSTFWD_V6ONLY;
+
+@@ -1667,6 +1693,10 @@ slirp_ssize_t slirp_send(struct socket *so, const void *buf, size_t len, int fla
+         return -1;
+     }
+
++    if (so->slirp->arx && !(so->so_state & SS_INCOMING) &&
++        !arx_check_peer(so->slirp, &so->fhost.ss)) {
++        return -1;
++    }
+     return send(so->s, buf, len, flags);
+ }
+
+diff --git a/subprojects/slirp/src/slirp.h b/subprojects/slirp/src/slirp.h
+index 6333031..ba53fec 100644
+--- a/subprojects/slirp/src/slirp.h
++++ b/subprojects/slirp/src/slirp.h
+@@ -129,7 +129,10 @@ bool ndp_table_search(Slirp *slirp, struct in6_addr ip_addr,
+                       uint8_t out_ethaddr[ETH_ALEN]);
+
+ /* Slirp configuration, specified by the application */
++#include "arx-egress.h"
++
+ struct Slirp {
++    struct ArxEgress *arx;
+     int cfg_version;
+
+     unsigned time_fasttimo;
+diff --git a/subprojects/slirp/src/socket.c b/subprojects/slirp/src/socket.c
+index fa48cda..c4cffea 100644
+--- a/subprojects/slirp/src/socket.c
++++ b/subprojects/slirp/src/socket.c
+@@ -782,9 +782,20 @@ int sosendto(struct socket *so, struct mbuf *m)
+         return -1;
+     }
+
+-    /* Don't care what port we get */
+-    ret = sendto(so->s, m->m_data, m->m_len, 0, (struct sockaddr *)&addr,
+-                 sockaddr_size(&addr));
++    if (so->slirp->arx) {
++        if (!(so->so_state & SS_ISFCONNECTED) &&
++            (!arx_check_peer(so->slirp, &addr) ||
++             connect(so->s, (struct sockaddr *)&addr, sockaddr_size(&addr)) < 0)) {
++            return -1;
++        }
++        if (!arx_check_peer(so->slirp, &addr)) {
++            return -1;
++        }
++        ret = send(so->s, m->m_data, m->m_len, 0);
++    } else {
++        ret = sendto(so->s, m->m_data, m->m_len, 0, (struct sockaddr *)&addr,
++                     sockaddr_size(&addr));
++    }
+     if (ret < 0)
+         return -1;
+
+@@ -792,8 +803,11 @@ int sosendto(struct socket *so, struct mbuf *m)
+      * Kill the socket if there's no reply in 4 minutes,
+      * but only if it's an expirable socket
+      */
+-    if (so->so_expire)
++    if (so->slirp->arx) {
++        arx_udp_refresh(so);
++    } else if (so->so_expire) {
+         so->so_expire = curtime + SO_EXPIRE;
++    }
+     so->so_state &= SS_PERSISTENT_MASK;
+     so->so_state |= SS_ISFCONNECTED; /* So that it gets select()ed */
+     return 0;
+@@ -874,7 +888,8 @@ struct socket *tcpx_listen(Slirp *slirp,
+     s = slirp_socket(haddr->sa_family, SOCK_STREAM, 0);
+     if ((not_valid_socket(s)) ||
+         (haddr->sa_family == AF_INET6 && slirp_socket_set_v6only(s, (flags & SS_HOSTFWD_V6ONLY) != 0) < 0) ||
+-        (slirp_socket_set_fast_reuse(s) < 0) ||
++        ((slirp->arx ? arx_exclusive_listener(s)
++                     : slirp_socket_set_fast_reuse(s)) < 0) ||
+         (bind(s, haddr, haddrlen) < 0) ||
+         (listen(s, 1) < 0)) {
+         int tmperrno = errno; /* Don't clobber the real reason we failed */
+diff --git a/subprojects/slirp/src/socket.h b/subprojects/slirp/src/socket.h
+index c7c6834..f79d495 100644
+--- a/subprojects/slirp/src/socket.h
++++ b/subprojects/slirp/src/socket.h
+@@ -78,6 +78,7 @@ struct socket {
+
+     struct tcpcb *so_tcpcb; /* pointer to TCP protocol control block */
+     unsigned so_expire; /* When the socket will expire */
++    gint64 arx_udp_deadline; /* Monotonic microseconds, for policy UDP only */
+
+     int so_queued; /* Number of packets queued from this socket */
+     int so_nqueued; /* Number of packets queued in a row
+diff --git a/subprojects/slirp/src/tcp_input.c b/subprojects/slirp/src/tcp_input.c
+index 6617d38..8cde24b 100644
+--- a/subprojects/slirp/src/tcp_input.c
++++ b/subprojects/slirp/src/tcp_input.c
+@@ -364,6 +364,11 @@ findso:
+     }
+
+     so = solookup(&slirp->tcp_last_so, &slirp->tcb, &lhost, &fhost);
++    if (slirp->arx &&
++        !(so && (so->so_state & SS_INCOMING) && have_valid_socket(so->s)) &&
++        !arx_allows(slirp, ((struct sockaddr_in *)&fhost)->sin_addr)) {
++        goto drop;
++    }
+
+     /*
+      * If the state is CLOSED (i.e., TCB does not exist) then
+diff --git a/subprojects/slirp/src/tcp_subr.c b/subprojects/slirp/src/tcp_subr.c
+index b11ae25..ab1a3b9 100644
+--- a/subprojects/slirp/src/tcp_subr.c
++++ b/subprojects/slirp/src/tcp_subr.c
+@@ -425,6 +425,13 @@ int tcp_fconnect(struct socket *so, unsigned short af)
+         if (sotranslate_out(so, &addr) < 0) {
+             return -1;
+         }
++        if (so->slirp->arx && !arx_check_peer(so->slirp, &addr)) {
++            slirp_unregister_poll_socket(so);
++            closesocket(so->s);
++            so->s = SLIRP_INVALID_SOCKET;
++            errno = EPERM;
++            return -1;
++        }
+
+         /* We don't care what port we get */
+         ret = connect(s, (struct sockaddr *)&addr, sockaddr_size(&addr));
+diff --git a/subprojects/slirp/src/udp.c b/subprojects/slirp/src/udp.c
+index f2558c4..c647899 100644
+--- a/subprojects/slirp/src/udp.c
++++ b/subprojects/slirp/src/udp.c
+@@ -77,6 +77,8 @@ void udp_input(register struct mbuf *m, int iphlen)
+     struct sockaddr_storage lhost;
+     struct sockaddr_in *lhost4;
+     int ttl;
++    struct sockaddr_storage peer = { 0 };
++    bool release_on_error = false;
+
+     DEBUG_CALL("udp_input");
+     DEBUG_ARG("m = %p", m);
+@@ -107,6 +109,9 @@ void udp_input(register struct mbuf *m, int iphlen)
+      * If not enough data to reflect UDP length, drop.
+      */
+     len = ntohs((uint16_t)uh->uh_ulen);
++    if (slirp->arx && (len < sizeof(*uh) || len != ip->ip_len)) {
++        goto bad;
++    }
+
+     if (ip->ip_len != len) {
+         if (len > ip->ip_len) {
+@@ -170,9 +175,24 @@ void udp_input(register struct mbuf *m, int iphlen)
+     /*
+      * Locate pcb for datagram.
+      */
+-    so = solookup(&slirp->udp_last_so, &slirp->udb, &lhost, NULL);
++    if (slirp->arx) {
++        struct sockaddr_in *peer4 = (struct sockaddr_in *)&peer;
++        peer4->sin_family = AF_INET;
++        peer4->sin_addr = ip->ip_dst;
++        peer4->sin_port = uh->uh_dport;
++    }
++    so = solookup(&slirp->udp_last_so, &slirp->udb, &lhost,
++                  slirp->arx ? &peer : NULL);
++    if (so && slirp->arx && arx_udp_expired(so)) {
++        udp_detach(so);
++        so = NULL;
++    }
+
+     if (so == NULL) {
++        if (slirp->arx && !arx_check_peer(slirp, &peer)) {
++            goto bad;
++        }
++
+         /*
+          * If there's no socket for this packet,
+          * create one
+@@ -183,6 +203,7 @@ void udp_input(register struct mbuf *m, int iphlen)
+             sofree(so);
+             goto bad;
+         }
++        release_on_error = slirp->arx != NULL;
+
+         /*
+          * Setup fields
+@@ -244,6 +265,9 @@ void udp_input(register struct mbuf *m, int iphlen)
+
+     return;
+ bad:
++    if (release_on_error) {
++        udp_detach(so);
++    }
+     m_free(m);
+ }
+
+@@ -307,6 +331,19 @@ int udp_output(struct socket *so, struct mbuf *m, const struct sockaddr_in *sadd
+
+ slirp_os_socket udp_attach(struct socket *so, unsigned short af)
+ {
++    Slirp *slirp = so->slirp;
++
++    if (slirp->arx) {
++        const struct socket *head = &slirp->udb;
++        unsigned count = 0;
++        for (const struct socket *peer = head->so_next; peer != head;
++             peer = peer->so_next) {
++            if (++count == 256) {
++                errno = ENOBUFS;
++                return SLIRP_INVALID_SOCKET;
++            }
++        }
++    }
+     so->s = slirp_socket(af, SOCK_DGRAM, 0);
+     if (have_valid_socket(so->s)) {
+         if (slirp_bind_outbound(so, af) != 0) {
+@@ -332,8 +369,12 @@ slirp_os_socket udp_attach(struct socket *so, unsigned short af)
+         }
+ #endif
+
+-        so->so_expire = curtime + SO_EXPIRE;
+-        slirp_insque(so, &so->slirp->udb);
++        if (slirp->arx) {
++            arx_udp_refresh(so);
++        } else {
++            so->so_expire = curtime + SO_EXPIRE;
++        }
++        slirp_insque(so, &slirp->udb);
+         slirp_set_nonblock(so->s);
+         slirp_register_poll_socket(so);
+     }
+diff --git a/subprojects/slirp/test/arx-egress-test.c b/subprojects/slirp/test/arx-egress-test.c
+new file mode 100644
+index 0000000..3f8211a
+--- /dev/null
++++ b/subprojects/slirp/test/arx-egress-test.c
+@@ -0,0 +1,540 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++#include "../src/slirp.h"
++
++/* Socket-free fixture for the production packet, connect and send paths. */
++#define TEST_GUEST 0x0a00020fu
++#define TEST_GATEWAY 0x0a000202u
++#define TEST_DNS 0x0a000203u
++#define TEST_PUBLIC 0x08080808u
++#define TEST_ROUTE_GATEWAY 0xc0000201u
++
++static unsigned route_calls, fail_route_call;
++static gint64 now;
++
++static gint64 fake_time(void) { return now; }
++
++static DWORD fake_route(DWORD destination, DWORD source, PMIB_IPFORWARDROW row)
++{
++    if (++route_calls == fail_route_call) {
++        return ERROR_NOT_FOUND;
++    }
++    *row = (MIB_IPFORWARDROW) {
++        .dwForwardIfIndex = 7,
++        .dwForwardNextHop = htonl(TEST_ROUTE_GATEWAY),
++    };
++    return NO_ERROR;
++}
++
++static NETIO_STATUS fake_luid(NET_IFINDEX index, PNET_LUID luid)
++{
++    luid->Value = 1234;
++    return NO_ERROR;
++}
++
++#define GetBestRoute fake_route
++#define ConvertInterfaceIndexToLuid fake_luid
++#define g_get_monotonic_time fake_time
++#include "../src/arx-egress.c"
++#undef GetBestRoute
++#undef ConvertInterfaceIndexToLuid
++#undef g_get_monotonic_time
++
++static struct {
++    unsigned opened, live, closed, connects, sends, sendtos, pauses;
++    uint32_t peer;
++    uint16_t port;
++    bool send_fails, async_connect;
++    struct sockaddr_in bound;
++} host;
++
++#define WRAP(ret, name, parameters) \
++    ret __wrap_##name parameters;   \
++    ret __wrap_##name parameters
++
++WRAP(slirp_os_socket, slirp_socket, (int af, int type, int protocol))
++{
++    g_assert_cmpint(af, ==, AF_INET);
++    host.live++;
++    return ++host.opened;
++}
++
++WRAP(void, slirp_set_nonblock, (slirp_os_socket fd)) {}
++
++WRAP(int, slirp_closesocket_wrap, (slirp_os_socket fd))
++{
++    if (have_valid_socket(fd)) {
++        g_assert_cmpuint(host.live, >, 0);
++        host.live--;
++        host.closed++;
++    }
++    return 0;
++}
++
++WRAP(int, slirp_setsockopt_wrap,
++     (slirp_os_socket fd, int level, int option, const void *value, int len))
++{
++    return 0;
++}
++
++WRAP(int, slirp_bind_wrap,
++     (slirp_os_socket fd, const struct sockaddr *address, int len))
++{
++    host.bound = *(const struct sockaddr_in *)address;
++    return 0;
++}
++
++WRAP(int, slirp_listen_wrap, (slirp_os_socket fd, int backlog)) { return 0; }
++
++WRAP(int, slirp_getsockname_wrap,
++     (slirp_os_socket fd, struct sockaddr *address, int *len))
++{
++    memcpy(address, &host.bound, sizeof(host.bound));
++    *len = sizeof(host.bound);
++    return 0;
++}
++
++WRAP(slirp_os_socket, slirp_accept_wrap,
++     (slirp_os_socket fd, struct sockaddr *address, int *len))
++{
++    struct sockaddr_in peer = {
++        .sin_family = AF_INET, .sin_addr = { .s_addr = htonl(INADDR_LOOPBACK) },
++        .sin_port = htons(50123),
++    };
++    memcpy(address, &peer, sizeof(peer));
++    *len = sizeof(peer);
++    host.live++;
++    return ++host.opened;
++}
++
++static void observe_peer(const struct sockaddr *address)
++{
++    const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)address;
++    g_assert_cmpint(address->sa_family, ==, AF_INET);
++    host.peer = ntohl(ipv4->sin_addr.s_addr);
++    host.port = ntohs(ipv4->sin_port);
++}
++
++WRAP(int, slirp_connect_wrap,
++     (slirp_os_socket fd, const struct sockaddr *address, int len))
++{
++    host.connects++;
++    observe_peer(address);
++    if (host.async_connect) {
++        errno = EINPROGRESS;
++        return -1;
++    }
++    return 0;
++}
++
++WRAP(slirp_ssize_t, slirp_send_wrap,
++     (slirp_os_socket fd, const void *bytes, size_t len, int flags))
++{
++    host.sends++;
++    if (host.send_fails) {
++        errno = EHOSTUNREACH;
++        return -1;
++    }
++    return len;
++}
++
++WRAP(slirp_ssize_t, slirp_sendto_wrap,
++     (slirp_os_socket fd, const void *bytes, size_t len, int flags,
++      const struct sockaddr *address, int address_len))
++{
++    host.sendtos++;
++    observe_peer(address);
++    return len;
++}
++#undef WRAP
++
++static slirp_ssize_t discard(const void *bytes, size_t len, void *opaque) { return len; }
++static void watch_socket(slirp_os_socket fd, void *opaque) {}
++static int64_t virtual_time(void *opaque) { return 0; }
++static int add_poll(slirp_os_socket fd, int events, void *opaque) { return events; }
++static int writable(int index, void *opaque) { return index & SLIRP_POLL_OUT; }
++static void request_pause(void) { host.pauses++; }
++
++static Slirp *fixture(bool policy)
++{
++    static const SlirpCb cb = {
++        .send_packet = discard,
++        .clock_get_ns = virtual_time,
++        .register_poll_socket = watch_socket,
++        .unregister_poll_socket = watch_socket,
++    };
++    SlirpConfig cfg = {
++        .version = 6,
++        .in_enabled = true,
++        .disable_dns = true,
++        .disable_host_loopback = policy,
++        .vnetwork = { .s_addr = htonl(0x0a000200u) },
++        .vnetmask = { .s_addr = htonl(0xffffff00u) },
++        .vhost = { .s_addr = htonl(TEST_GATEWAY) },
++        .vnameserver = { .s_addr = htonl(TEST_DNS) },
++        .vdhcp_start = { .s_addr = htonl(TEST_GUEST) },
++    };
++    memset(&host, 0, sizeof(host));
++    route_calls = fail_route_call = 0;
++    now = G_USEC_PER_SEC;
++    Slirp *slirp = slirp_new(&cfg, &cb, NULL);
++    if (policy) {
++        slirp->arx = g_new0(struct ArxEgress, 1);
++        slirp->arx->file = INVALID_HANDLE_VALUE;
++        slirp->arx->deny = g_array_new(FALSE, FALSE, sizeof(struct ArxPrefix));
++        slirp->arx->index = 7;
++        slirp->arx->luid.Value = 1234;
++        slirp->arx->gateway.s_addr = htonl(TEST_ROUTE_GATEWAY);
++        slirp->arx->fault = request_pause;
++        slirp->arx->next_health_check = G_MAXINT64;
++    }
++    return slirp;
++}
++
++static void cleanup(Slirp *slirp)
++{
++    slirp_cleanup(slirp);
++    g_assert_cmpuint(host.live, ==, 0);
++}
++
++static void put16(uint8_t *p, uint16_t value)
++{
++    p[0] = value >> 8;
++    p[1] = value;
++}
++
++static uint16_t checksum(const uint8_t *p, size_t len)
++{
++    uint32_t sum = 0;
++    for (size_t i = 0; i < len; i += 2) {
++        sum += ((uint16_t)p[i] << 8) | p[i + 1];
++    }
++    while (sum >> 16) {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++    return ~(uint16_t)sum;
++}
++
++static void packet(Slirp *slirp, int protocol, uint32_t destination, uint16_t port)
++{
++    uint8_t frame[14 + 20 + 20] = { 0 };
++    uint8_t *ip = frame + 14;
++    uint8_t *transport = ip + 20;
++    unsigned len = protocol == IPPROTO_UDP ? 9 : 20;
++    uint32_t source = htonl(TEST_GUEST);
++    uint32_t dst = htonl(destination);
++
++    put16(frame + 12, ETH_P_IP);
++    ip[0] = 0x45;
++    put16(ip + 2, 20 + len);
++    ip[8] = 64;
++    ip[9] = protocol;
++    memcpy(ip + 12, &source, 4);
++    memcpy(ip + 16, &dst, 4);
++    put16(ip + 10, checksum(ip, 20));
++    put16(transport, 443);
++    put16(transport + 2, port);
++    if (protocol == IPPROTO_UDP) {
++        put16(transport + 4, len);
++        transport[8] = 1;
++    } else {
++        uint8_t pseudo[12 + 20] = { 0 };
++        transport[12] = 0x50;
++        transport[13] = TH_SYN;
++        put16(transport + 14, 4096);
++        memcpy(pseudo, ip + 12, 8);
++        pseudo[9] = protocol;
++        put16(pseudo + 10, len);
++        memcpy(pseudo + 12, transport, len);
++        put16(transport + 16, checksum(pseudo, sizeof(pseudo)));
++    }
++    slirp_input(slirp, frame, 14 + 20 + len);
++}
++
++static void test_pre_translation(void)
++{
++    Slirp *slirp = fixture(true);
++    /* Leave loopback translation available to the fixture so a native
++     * socket open would expose a missing input gate before the final gate. */
++    slirp->disable_host_loopback = false;
++    const uint32_t denied[] = { TEST_GATEWAY, TEST_DNS, 0x0a0002feu };
++    for (size_t i = 0; i < G_N_ELEMENTS(denied); i++) {
++        packet(slirp, IPPROTO_TCP, denied[i], 53);
++        packet(slirp, IPPROTO_UDP, denied[i], 53);
++    }
++    g_assert_cmpuint(host.opened, ==, 0);
++    g_assert_cmpuint(route_calls, ==, 0);
++    cleanup(slirp);
++}
++
++static void test_post_translation(void)
++{
++    Slirp *slirp = fixture(true);
++    /* A fixture-only public alias isolates the translated-peer check
++     * from the original destination gate. The shipped recipe fixes vhost. */
++    slirp->disable_host_loopback = false;
++    slirp->vhost_addr.s_addr = htonl(TEST_PUBLIC);
++    g_assert_true(arx_allows(slirp, slirp->vhost_addr));
++    struct socket *so = socreate(slirp, IPPROTO_TCP);
++    so->so_ffamily = AF_INET;
++    so->so_faddr.s_addr = htonl(TEST_PUBLIC);
++    so->so_fport = htons(443);
++    struct sockaddr_storage translated = so->fhost.ss;
++    g_assert_cmpint(sotranslate_out(so, &translated), ==, 0);
++    g_assert_cmphex(ntohl(((struct sockaddr_in *)&translated)->sin_addr.s_addr),
++                    ==, INADDR_LOOPBACK);
++    g_assert_cmpint(tcp_fconnect(so, AF_INET), ==, -1);
++    g_assert_cmpuint(host.live, ==, 0);
++    g_assert_cmpuint(host.connects, ==, 0);
++    sofree(so);
++
++    so = socreate(slirp, IPPROTO_UDP);
++    so->so_ffamily = AF_INET;
++    so->so_faddr.s_addr = htonl(TEST_PUBLIC);
++    so->so_fport = htons(53);
++    g_assert_true(have_valid_socket(udp_attach(so, AF_INET)));
++    struct mbuf *m = m_get(slirp);
++    m->m_len = 1;
++    m->m_data[0] = 1;
++    g_assert_cmpint(sosendto(so, m), ==, -1);
++    g_assert_cmpuint(host.connects, ==, 0);
++    g_assert_cmpuint(host.sends + host.sendtos, ==, 0);
++    m_free(m);
++    udp_detach(so);
++    cleanup(slirp);
++}
++
++static void test_public_and_stock(void)
++{
++    Slirp *slirp = fixture(true);
++    packet(slirp, IPPROTO_TCP, TEST_PUBLIC, 443);
++    g_assert_cmphex(host.peer, ==, TEST_PUBLIC);
++    g_assert_cmpuint(host.connects, ==, 1);
++    packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 53);
++    packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 53);
++    packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 54);
++    g_assert_cmpuint(host.connects, ==, 3);
++    g_assert_cmpuint(host.sends, ==, 3);
++    g_assert_cmpuint(host.sendtos, ==, 0);
++    g_assert_cmpuint(host.live, ==, 3);
++    g_assert_cmpuint(host.port, ==, 54);
++    cleanup(slirp);
++
++    slirp = fixture(false);
++    packet(slirp, IPPROTO_TCP, TEST_GATEWAY, 443);
++    g_assert_cmpuint(host.connects, ==, 1);
++    g_assert_cmphex(host.peer, ==, INADDR_LOOPBACK);
++    packet(slirp, IPPROTO_UDP, TEST_GATEWAY, 54);
++    packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 55);
++    g_assert_cmpuint(host.connects, ==, 1);
++    g_assert_cmpuint(host.sends, ==, 0);
++    g_assert_cmpuint(host.sendtos, ==, 2);
++    g_assert_cmpuint(host.live, ==, 2);
++    g_assert_cmphex(host.peer, ==, TEST_PUBLIC);
++    g_assert_cmpuint(route_calls, ==, 0);
++    cleanup(slirp);
++}
++
++static void test_udp_lifetime(void)
++{
++    Slirp *slirp = fixture(true);
++    host.send_fails = true;
++    packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 53);
++    g_assert_cmpuint(host.connects, ==, 1);
++    g_assert_cmpuint(host.sends, ==, 1);
++    g_assert_cmpuint(host.closed, ==, 1);
++    g_assert_cmpuint(host.live, ==, 0);
++    host.send_fails = false;
++    for (unsigned i = 0; i < 256; i++) {
++        packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 1000 + i);
++    }
++    unsigned opened_at_cap = host.opened;
++    g_assert_cmpuint(host.live, ==, 256);
++    packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 1260);
++    g_assert_cmpuint(host.opened, ==, opened_at_cap);
++
++    uint32_t timeout = 1000;
++    now += 30 * G_USEC_PER_SEC - 1;
++    slirp_pollfds_fill_socket(slirp, &timeout, add_poll, NULL);
++    g_assert_cmpuint(host.live, ==, 256);
++    packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 1000);
++    now++;
++    slirp_pollfds_fill_socket(slirp, &timeout, add_poll, NULL);
++    g_assert_cmpuint(host.live, ==, 1);
++    packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 1260);
++    g_assert_cmpuint(host.live, ==, 2);
++    cleanup(slirp);
++
++    slirp = fixture(true);
++    fail_route_call = 1;
++    packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 53);
++    g_assert_cmpuint(host.opened, ==, 0);
++    cleanup(slirp);
++
++    slirp = fixture(true);
++    fail_route_call = 3; /* After allocation and connect, before first send. */
++    packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 53);
++    g_assert_cmpuint(host.connects, ==, 1);
++    g_assert_cmpuint(host.sends, ==, 0);
++    g_assert_cmpuint(host.closed, ==, 1);
++    g_assert_cmpuint(host.live, ==, 0);
++    cleanup(slirp);
++}
++
++static void test_route_fault_and_forward(void)
++{
++    Slirp *slirp = fixture(true);
++    struct sockaddr_in host_addr = {
++        .sin_family = AF_INET, .sin_port = htons(49152),
++        .sin_addr = { .s_addr = htonl(INADDR_LOOPBACK) },
++    };
++    struct sockaddr_in guest = {
++        .sin_family = AF_INET, .sin_port = htons(443),
++        .sin_addr = { .s_addr = htonl(TEST_GUEST) },
++    };
++    g_assert_cmpint(slirp_add_hostxfwd(slirp, (struct sockaddr *)&host_addr,
++                                     sizeof(host_addr), (struct sockaddr *)&guest,
++                                     sizeof(guest), 0), ==, 0);
++    struct socket *listener = slirp->tcb.so_next;
++    tcp_connect(listener);
++    struct socket *incoming = slirp->tcb.so_next;
++    g_assert_true(incoming != listener);
++    g_assert_true(incoming->so_state & SS_INCOMING);
++    g_assert_cmphex(ntohl(incoming->so_faddr.s_addr), ==, TEST_GATEWAY);
++
++    packet(slirp, IPPROTO_UDP, TEST_PUBLIC, 53);
++    host.async_connect = true;
++    packet(slirp, IPPROTO_TCP, TEST_PUBLIC, 8443);
++    g_assert_cmpuint(host.connects, ==, 2);
++    struct socket *pending = slirp->tcb.so_next;
++    g_assert_true(pending != incoming);
++    g_assert_true(pending->so_state & SS_ISFCONNECTING);
++
++    uint32_t timeout = 1000;
++    slirp_pollfds_fill_socket(slirp, &timeout, add_poll, NULL);
++    unsigned sends = host.sends;
++    fail_route_call = route_calls + 1;
++    slirp_pollfds_poll(slirp, 0, writable, NULL);
++    g_assert_cmpuint(host.sends, ==, sends); /* Zero-byte probe also blocked. */
++    g_assert_true(g_atomic_int_get(&slirp->arx->faulted));
++
++    slirp_pollfds_poll(slirp, 0, writable, NULL);
++    g_assert_cmpuint(host.pauses, ==, 1);
++    g_assert_cmpuint(host.live, ==, 2); /* Listener and accepted connection. */
++    g_assert_cmpint(slirp_send(incoming, "x", 1, 0), ==, 1);
++    g_assert_cmpuint(host.sends, ==, sends + 1);
++    cleanup(slirp);
++}
++
++
++static void deny_both(Slirp *slirp, uint32_t host)
++{
++    struct sockaddr_storage peer = { 0 };
++    struct sockaddr_in *ipv4 = (struct sockaddr_in *)&peer;
++
++    ipv4->sin_family = AF_INET;
++    ipv4->sin_port = htons(443);
++    ipv4->sin_addr.s_addr = htonl(host);
++    g_assert_false(arx_allows(slirp, ipv4->sin_addr));
++    g_assert_false(arx_check_peer(slirp, &peer));
++    g_assert_false(g_atomic_int_get(&slirp->arx->faulted));
++}
++
++static void test_matcher(void)
++{
++    static const uint32_t boundaries[][2] = {
++        { 0x00000000, 0x00ffffff }, { 0x0a000000, 0x0affffff },
++        { 0x64400000, 0x647fffff }, { 0x7f000000, 0x7fffffff },
++        { 0xa9fe0000, 0xa9feffff }, { 0xac100000, 0xac1fffff },
++        { 0xc0000000, 0xc00000ff }, { 0xc0000200, 0xc00002ff },
++        { 0xc0586300, 0xc05863ff }, { 0xc0a80000, 0xc0a8ffff },
++        { 0xc6120000, 0xc613ffff }, { 0xc6336400, 0xc63364ff },
++        { 0xcb007100, 0xcb0071ff }, { 0xe0000000, 0xefffffff },
++        { 0xf0000000, 0xffffffff },
++    };
++    struct ArxEgress policy = {
++        .deny = g_array_new(FALSE, FALSE, sizeof(struct ArxPrefix)),
++    };
++    Slirp slirp = {
++        .arx = &policy,
++        .vnetwork_addr = { .s_addr = htonl(0x0a000200) },
++        .vnetwork_mask = { .s_addr = htonl(0xffffff00) },
++    };
++
++    g_assert_cmpuint(G_N_ELEMENTS(boundaries), ==, G_N_ELEMENTS(arx_special));
++    for (size_t i = 0; i < G_N_ELEMENTS(boundaries); i++) {
++        for (size_t j = 0; j < G_N_ELEMENTS(boundaries[i]); j++) {
++            deny_both(&slirp, boundaries[i][j]);
++        }
++    }
++    for (uint32_t addr = 0x0a000200; addr <= 0x0a0002ff; addr++) {
++        deny_both(&slirp, addr);
++    }
++    add_prefix(&policy, 0x08080400, 24);
++    deny_both(&slirp, 0x08080404);
++    g_assert_true(arx_allows(&slirp, (struct in_addr){ .s_addr = htonl(0x08080808) }));
++    g_assert_true(arx_allows(&slirp, (struct in_addr){ .s_addr = htonl(0x64800000) }));
++
++    struct sockaddr_storage peer = { .ss_family = AF_INET6 };
++    g_assert_false(arx_check_peer(&slirp, &peer));
++
++    /* Isolate the synthetic subnet rule from the compiled private ranges. */
++    slirp.vnetwork_addr.s_addr = htonl(0x08080800);
++    deny_both(&slirp, 0x08080808);
++    slirp.vnetwork_addr.s_addr = htonl(0x0a000200);
++
++    g_atomic_int_set(&policy.faulted, true);
++    g_assert_false(arx_allows(&slirp, (struct in_addr){ .s_addr = htonl(0x08080808) }));
++    g_array_free(policy.deny, TRUE);
++}
++
++static bool parse_fixture(const char *body, bool fingerprint_ok)
++{
++    struct ArxEgress policy = {
++        .deny = g_array_new(FALSE, FALSE, sizeof(struct ArxPrefix)),
++    };
++    g_autofree char *digest = g_compute_checksum_for_string(G_CHECKSUM_SHA256, body, -1);
++    if (!fingerprint_ok) {
++        digest[0] = digest[0] == '1' ? '0' : '1';
++    }
++    g_autofree char *policy_bytes = g_strdup_printf("%sfingerprint=%s\n", body, digest);
++    bool ok = parse_policy(&policy, policy_bytes, strlen(policy_bytes));
++
++    g_array_free(policy.deny, TRUE);
++    return ok;
++}
++
++static void test_parser(void)
++{
++#define HEADER "version=1\ninterface_index=7\ninterface_luid=1234\nsource=192.0.2.2\ngateway=192.0.2.1\n"
++    g_assert_true(parse_fixture(HEADER, true));
++    g_assert_true(parse_fixture(HEADER "deny=192.0.2.0/24\ndeny=8.8.4.4/32\n", true));
++    g_assert_false(parse_fixture(HEADER, false));
++    g_assert_false(parse_fixture("version=1\ninterface_index=7\ninterface_luid=18446744073709551616\nsource=192.0.2.2\ngateway=192.0.2.1\n", true));
++    g_assert_false(parse_fixture(HEADER "deny=192.0.2.1/24\n", true));
++    g_assert_false(parse_fixture(HEADER "deny=192.0.2.0/24\ndeny=192.0.2.0/24\n", true));
++    g_assert_false(parse_fixture(HEADER "deny=0.0.0.0/0\n", true));
++    g_assert_false(parse_fixture(HEADER "deny=8.8.4.4/33\n", true));
++    g_assert_false(parse_fixture(HEADER "unexpected=1\n", true));
++    g_assert_false(parse_fixture(HEADER "\n", true));
++    g_assert_false(parse_fixture("version=2\ninterface_index=7\ninterface_luid=1234\nsource=192.0.2.2\ngateway=192.0.2.1\n", true));
++    g_assert_false(parse_fixture("version=1\ninterface_index=4294967296\ninterface_luid=1234\nsource=192.0.2.2\ngateway=192.0.2.1\n", true));
++#undef HEADER
++}
++
++int main(int argc, char **argv)
++{
++    WSADATA wsa;
++
++    g_test_init(&argc, &argv, NULL);
++    g_assert_cmpint(WSAStartup(MAKEWORD(2, 2), &wsa), ==, 0);
++    g_test_add_func("/arx-egress/matcher", test_matcher);
++    g_test_add_func("/arx-egress/policy-parser", test_parser);
++    g_test_add_func("/arx-egress/pre-translation", test_pre_translation);
++    g_test_add_func("/arx-egress/post-translation", test_post_translation);
++    g_test_add_func("/arx-egress/public-and-stock", test_public_and_stock);
++    g_test_add_func("/arx-egress/udp-lifetime", test_udp_lifetime);
++    g_test_add_func("/arx-egress/route-fault-and-forward", test_route_fault_and_forward);
++    int result = g_test_run();
++    WSACleanup();
++    return result;
++}
