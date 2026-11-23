@@ -53,8 +53,8 @@ export function LoginView({ notice, error: initialError }: { notice?: string; er
           <input ref={passwordRef} name="password" type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required maxLength={1024} aria-invalid={error ? true : undefined} />
         </label>
         <button className="button button-primary" type="submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
-        {/* DEV is a build-time constant, so production bundles never contain the demo password. */}
-        {import.meta.env.DEV && api.kind === 'standin' ? (
+        {/* __ARX_STANDIN__ is false for every `vite build`, so bundles never contain the demo password. */}
+        {__ARX_STANDIN__ && api.kind === 'standin' ? (
           <p className="hint">Demo data: sign in as <code>owner</code> with password <code>arxcovo-demo</code>.</p>
         ) : (
           <p className="hint">The session is kept in a secure, HTTP-only cookie on this host.</p>
