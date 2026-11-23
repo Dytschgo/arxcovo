@@ -25,9 +25,20 @@ pub struct VmRuntimeProfile {
 
 #[derive(Deserialize)]
 enum VmManifest {
-    #[serde(rename = "qemu-11.1.3-windows-x64")]
-    Qemu1113WindowsX64,
+    #[serde(rename = "qemu-11.1.0-windows-x64")]
+    Qemu1110WindowsX64,
 }
+
+#[derive(Debug)]
+pub struct InvalidVmProfile;
+
+impl std::fmt::Display for InvalidVmProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid VM profile")
+    }
+}
+
+impl std::error::Error for InvalidVmProfile {}
 
 impl VmRuntimeProfile {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -36,8 +47,7 @@ impl VmRuntimeProfile {
         if bytes.len() > 16_384 {
             bail!("VM profile too large");
         }
-        let profile: Self =
-            serde_json::from_slice(bytes).map_err(|_| anyhow::anyhow!("invalid VM profile"))?;
+        let profile: Self = serde_json::from_slice(bytes).map_err(|_| InvalidVmProfile)?;
         let invalid_path = |_| anyhow::anyhow!("invalid VM profile path");
         let bundle = LocalPath::parse(&profile.bundle).map_err(invalid_path)?;
         let volume = LocalPath::parse(&profile.volume).map_err(invalid_path)?;
@@ -52,7 +62,7 @@ impl VmRuntimeProfile {
             || volume.overlaps(&bundle)
             || !(1..=crate::vm::VmPolicy::default().disk_cap).contains(&profile.disk_ceiling_bytes)
         {
-            bail!("invalid VM profile");
+            bail!(InvalidVmProfile);
         }
         Ok(profile)
     }
@@ -63,7 +73,7 @@ impl VmRuntimeProfile {
 
     pub fn manifest_id(&self) -> &'static str {
         match self.manifest {
-            VmManifest::Qemu1113WindowsX64 => "qemu-11.1.3-windows-x64",
+            VmManifest::Qemu1110WindowsX64 => "qemu-11.1.0-windows-x64",
         }
     }
 }
