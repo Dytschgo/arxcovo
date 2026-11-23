@@ -334,4 +334,59 @@ test.describe('cookie replay redaction', () => {
     });
     expect(await withoutStrayErrors(() => replaySessionStatus(options(1, { request })))).toBe(401);
   });
+
+  test('async: a throwing statusCode, then a destroy that emits a late error', async () => {
+    for (const timing of ['later', 'synchronously'] as const) {
+      let destroys = 0;
+      const request = scripted((req, respond) => {
+        const res = new EventEmitter() as EventEmitter & { destroy: () => void };
+        Object.defineProperty(res, 'statusCode', {
+          get: () => {
+            throw new Error(`status read ${JSON.stringify(req.headers)}`);
+          },
+        });
+        const late = () => res.emit('error', new Error(`late error ${JSON.stringify(req.headers)}`));
+        res.destroy = () => {
+          destroys += 1;
+          if (timing === 'later') setTimeout(late, 5);
+          else late();
+        };
+        respond(res);
+      });
+      const error = await withoutStrayErrors(() => failure(replaySessionStatus(options(1, { request }))));
+      expectRedacted(error, null);
+      // Failing is idempotent: the late error does not destroy again.
+      expect(destroys).toBe(1);
+    }
+  });
+
+  test('async: the response errors on its own after its callback failed', async () => {
+    // No destroy involved: the late error must still find a guarded listener,
+    // which requires every listener to be attached before statusCode is read.
+    const request = scripted((req, respond) => {
+      const res = new EventEmitter() as EventEmitter & { destroy: () => void };
+      res.destroy = () => undefined;
+      Object.defineProperty(res, 'statusCode', {
+        get: () => {
+          setTimeout(() => res.emit('error', new Error(`socket ${JSON.stringify(req.headers)}`)), 5);
+          throw new Error(`status read ${JSON.stringify(req.headers)}`);
+        },
+      });
+      respond(res);
+    });
+    const error = await withoutStrayErrors(() => failure(replaySessionStatus(options(1, { request }))));
+    expectRedacted(error, null);
+  });
+
+  test('async: a request whose destroy emits a late error after a timeout', async () => {
+    const request = scripted(req => {
+      req.destroy = function (this: FakeRequest) {
+        setTimeout(() => this.emit('error', new Error(`late ${JSON.stringify(this.headers)}`)), 5);
+        return this;
+      };
+      req.emit('timeout');
+    });
+    const error = await withoutStrayErrors(() => failure(replaySessionStatus(options(1, { request }))));
+    expectRedacted(error, null);
+  });
 });

@@ -56,11 +56,18 @@ export async function replaySessionStatus(options: ReplayOptions): Promise<200 |
   const seen: { status: number | null } = { status: null };
   try {
     return await new Promise<200 | 401>((resolve, reject) => {
-      // A holder rather than `let`s, so `fail` is safe at any moment.
-      const exchange: { req?: http.ClientRequest; res?: http.IncomingMessage } = {};
-      // Settle as failed, then stop the exchange. Stopping is best effort:
-      // its own errors are dropped because the outcome is already decided.
+      // A holder rather than `let`s, so `fail` is safe at any moment. An
+      // emitter is recorded only once its `error` listener is attached, so
+      // `fail` never destroys (and so never provokes an error from) an
+      // emitter that could not report it to us.
+      const exchange: { req?: http.ClientRequest; res?: http.IncomingMessage; failed: boolean } = { failed: false };
+      // Settle as failed once, then stop the exchange. Stopping is best
+      // effort: its own errors are dropped because the outcome is decided,
+      // and late events from it reach the guarded listeners, which ignore
+      // them because `failed` is already set.
       const fail = () => {
+        if (exchange.failed) return;
+        exchange.failed = true;
         reject(new Error('replay'));
         try {
           exchange.res?.destroy();
@@ -95,17 +102,18 @@ export async function replaySessionStatus(options: ReplayOptions): Promise<200 |
           headers: { host: `localhost:${port}`, cookie: `${options.cookieName}=${options.value}` },
         },
         guard((response: http.IncomingMessage) => {
-          exchange.res = response;
-          seen.status = response.statusCode ?? null;
+          // Every listener is attached before anything that can throw (such
+          // as reading `statusCode`) runs, starting with `error`.
           const chunks: Buffer[] = [];
           let size = 0;
+          response.on('error', guard(fail));
+          exchange.res = response;
+          response.on('aborted', guard(fail));
           response.on('data', guard((chunk: Buffer) => {
             size += chunk.length;
             if (size > BODY_LIMIT) fail();
             else chunks.push(chunk);
           }));
-          response.on('error', guard(fail));
-          response.on('aborted', guard(fail));
           response.on('end', guard(() => {
             if (seen.status === 401) return resolve(401);
             if (seen.status !== 200) return fail();
@@ -114,11 +122,14 @@ export async function replaySessionStatus(options: ReplayOptions): Promise<200 |
             if (typeof user?.name !== 'string') return fail();
             resolve(200);
           }));
+          seen.status = response.statusCode ?? null;
         }),
       );
+      // Request listeners are attached before anything else runs, `error`
+      // first; nothing that can throw comes between construction and them.
+      req.on('error', guard(fail));
       exchange.req = req;
       req.on('timeout', guard(fail));
-      req.on('error', guard(fail));
       req.end();
     });
   } catch {

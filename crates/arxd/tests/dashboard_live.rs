@@ -446,10 +446,16 @@ struct Hooks {
     before_remove_root: fn(&Path),
     /// Removes the run directory.
     close_run: fn(tempfile::TempDir) -> std::io::Result<()>,
+    /// Inspects a path after a removal attempt.
+    inspect: fn(&Path) -> std::io::Result<()>,
 }
 
 fn noop() {}
 fn noop_path(_: &Path) {}
+
+fn inspect_entry(path: &Path) -> std::io::Result<()> {
+    std::fs::symlink_metadata(path).map(|_| ())
+}
 
 const LIVE: Hooks = Hooks {
     verify: is_private,
@@ -457,6 +463,7 @@ const LIVE: Hooks = Hooks {
     after_root_ready: noop,
     before_remove_root: noop_path,
     close_run: tempfile::TempDir::close,
+    inspect: inspect_entry,
 };
 
 /// Allocate this run's own directory, a fresh randomly named child of an
@@ -521,14 +528,17 @@ fn prepare_run_with(
         Err(_) => return Err(refused("cannot inspect the path")),
     };
     // ---- write phase -------------------------------------------------------
-    let exists = |path: &Path| std::fs::symlink_metadata(path).is_ok();
-    // Remove what this call created (newest first) and report exactly what
-    // could not be removed.
+    // Only a positive NotFound proves a path is gone. Any other inspection
+    // result, including an error such as PermissionDenied, means it may
+    // still be there.
+    let gone = |path: &Path| matches!((hooks.inspect)(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+    // Remove what this call created (newest first) and report every path
+    // whose removal is not confirmed.
     let undo = |reason: &str, run: Option<PathBuf>| {
-        let mut leftovers: Vec<PathBuf> = run.into_iter().filter(|path| exists(path)).collect();
+        let mut leftovers: Vec<PathBuf> = run.into_iter().filter(|path| !gone(path)).collect();
         if !existed {
             (hooks.before_remove_root)(root);
-            if std::fs::remove_dir(root).is_err() && exists(root) {
+            if std::fs::remove_dir(root).is_err() && !gone(root) {
                 leftovers.push(root.to_owned());
             }
         }
@@ -703,7 +713,9 @@ fn run_cleanup_removes_only_its_own_directory() {
     std::fs::create_dir(mine.join("state")).unwrap();
     std::fs::write(mine.join("state").join("data"), b"data").unwrap();
     first.close().unwrap();
-    assert!(!mine.exists());
+    assert!(
+        matches!(std::fs::symlink_metadata(&mine), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    );
     assert!(other_run.path().is_dir());
     assert_eq!(std::fs::read(lookalike.join("keep")).unwrap(), b"keep");
 }
@@ -826,9 +838,21 @@ enum Expect {
     /// Refused after a write and fully rolled back: identical contents; only
     /// the timestamps of "." and "live-root" may differ.
     Restored,
-    /// Cleanup failed: `CleanupFailed` names exactly these paths (relative,
-    /// matched by prefix), they exist, and everything else is restored.
-    Leftovers(&'static [&'static str]),
+    /// Cleanup failed. The entries this call created that are still present
+    /// (after removing the test-injected entries listed in `injected`) must
+    /// equal the reported set exactly. A reported path that is absent is
+    /// allowed only when it matches an `unverifiable` prefix, meaning a path
+    /// the injected inspector could not confirm gone. Everything that
+    /// existed before is restored.
+    Leftovers {
+        injected: &'static [&'static str],
+        unverifiable: &'static [&'static str],
+    },
+}
+
+/// Inspection that fails as if access were denied.
+fn deny_inspect(_: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
 }
 
 type Setup = Box<dyn Fn(&Path) -> Option<std::ffi::OsString>>;
@@ -893,6 +917,14 @@ fn lose_identity() {
 #[test]
 fn every_refused_root_leaves_the_disk_unchanged() {
     use Expect::*;
+    const BLOCKED: Expect = Leftovers {
+        injected: &["live-root/blocker"],
+        unverifiable: &[],
+    };
+    const KEPT: Expect = Leftovers {
+        injected: &[],
+        unverifiable: &[],
+    };
     let s = std::path::MAIN_SEPARATOR;
     let root = move |b: &Path| at(b, &format!("{s}live-root"));
     let existing_root = move |b: &Path| {
@@ -1045,7 +1077,7 @@ fn every_refused_root_leaves_the_disk_unchanged() {
                 before_remove_root: block_removal,
                 ..LIVE
             },
-            Leftovers(&["live-root"]),
+            BLOCKED,
         ),
         row(
             "root removal fails after the run directory fails verification",
@@ -1055,7 +1087,7 @@ fn every_refused_root_leaves_the_disk_unchanged() {
                 before_remove_root: block_removal,
                 ..LIVE
             },
-            Leftovers(&["live-root"]),
+            BLOCKED,
         ),
         row(
             "run directory close fails under a new root",
@@ -1065,7 +1097,7 @@ fn every_refused_root_leaves_the_disk_unchanged() {
                 close_run: close_and_keep,
                 ..LIVE
             },
-            Leftovers(&["live-root/run-", "live-root"]),
+            KEPT,
         ),
         row(
             "run directory close fails under an existing root",
@@ -1075,7 +1107,42 @@ fn every_refused_root_leaves_the_disk_unchanged() {
                 close_run: close_and_keep,
                 ..LIVE
             },
-            Leftovers(&["live-root/run-"]),
+            KEPT,
+        ),
+        row(
+            "root removal and its inspection both fail",
+            root,
+            Hooks {
+                verify: fail_root,
+                before_remove_root: block_removal,
+                inspect: deny_inspect,
+                ..LIVE
+            },
+            BLOCKED,
+        ),
+        row(
+            "run directory close fails and its inspection fails",
+            existing_root,
+            Hooks {
+                verify: fail_run,
+                close_run: close_and_keep,
+                inspect: deny_inspect,
+                ..LIVE
+            },
+            KEPT,
+        ),
+        row(
+            "run directory removed but its removal cannot be confirmed",
+            existing_root,
+            Hooks {
+                verify: fail_run,
+                inspect: deny_inspect,
+                ..LIVE
+            },
+            Leftovers {
+                injected: &[],
+                unverifiable: &["live-root/run-"],
+            },
         ),
     ];
     // A parent owned by another account needs privileges to create, so the
@@ -1183,39 +1250,60 @@ fn every_refused_root_leaves_the_disk_unchanged() {
                 without_parent_times(&before),
                 "{name}: contents not restored"
             ),
-            (Leftovers(expected), Err(PrepareError::CleanupFailed { leftovers, .. })) => {
-                let reported: Vec<String> = leftovers
+            (
+                Leftovers {
+                    injected,
+                    unverifiable,
+                },
+                Err(PrepareError::CleanupFailed { leftovers, .. }),
+            ) => {
+                use std::collections::BTreeSet;
+                let relative = |path: &Path| {
+                    path.strip_prefix(&base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                };
+                let reported: BTreeSet<String> =
+                    leftovers.iter().map(|path| relative(path)).collect();
+                assert_eq!(
+                    reported.len(),
+                    leftovers.len(),
+                    "{name}: duplicate leftovers"
+                );
+                let known: BTreeSet<&str> =
+                    before.iter().map(|entry| entry.path.as_str()).collect();
+                let mut present: BTreeSet<String> = after
                     .iter()
-                    .map(|path| {
-                        assert!(path.exists(), "{name}: reported leftover does not exist");
-                        path.strip_prefix(&base)
-                            .unwrap()
-                            .to_string_lossy()
-                            .replace('\\', "/")
-                    })
+                    .filter(|entry| !known.contains(entry.path.as_str()))
+                    .map(|entry| entry.path.clone())
                     .collect();
-                assert_eq!(reported.len(), expected.len(), "{name}: leftovers");
-                for (path, prefix) in reported.iter().zip(expected) {
+                for extra in injected {
+                    assert!(present.remove(*extra), "{name}: injected {extra} missing");
+                }
+                // Every created entry still present is reported, and every
+                // reported path is present unless it could not be inspected.
+                let missing: Vec<&String> = present.difference(&reported).collect();
+                assert!(
+                    missing.is_empty(),
+                    "{name}: unreported leftovers {missing:?}"
+                );
+                for path in reported.difference(&present) {
                     assert!(
-                        path.starts_with(prefix),
-                        "{name}: leftover {path} vs {prefix}"
+                        unverifiable.iter().any(|prefix| path.starts_with(prefix)),
+                        "{name}: reported {path} is neither present nor unverifiable"
                     );
                 }
-                // Everything outside the reported leftovers is restored.
-                let outside = |entries: &[Entry]| {
-                    without_parent_times(entries)
-                        .into_iter()
-                        .filter(|entry| {
-                            !reported.iter().any(|left| {
-                                entry.path == *left || entry.path.starts_with(&format!("{left}/"))
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                };
+                // Everything that existed before is restored.
+                let previously: Vec<Entry> = after
+                    .iter()
+                    .filter(|entry| known.contains(entry.path.as_str()))
+                    .cloned()
+                    .collect();
                 assert_eq!(
-                    outside(&after),
-                    outside(&before),
-                    "{name}: more than the leftovers"
+                    without_parent_times(&previously),
+                    without_parent_times(&before),
+                    "{name}: pre-existing entries changed"
                 );
             }
             (_, Err(error)) => panic!("{name}: unexpected outcome {error}"),
@@ -1309,7 +1397,9 @@ fn live_dashboard_server() {
     println!("arx-live: dashboard ready at http://localhost:{port}/");
     // The Playwright global teardown creates this run's stop file.
     let stop = root.join(format!("stop-{token}"));
-    while !stop.exists() {
+    // Only a confirmed stop file stops the run; an inspection error keeps
+    // the daemon running and deletes nothing.
+    while !matches!(stop.try_exists(), Ok(true)) {
         if let Some(status) = daemon.0.try_wait().unwrap() {
             panic!("arxd exited before the suite finished: {status}");
         }

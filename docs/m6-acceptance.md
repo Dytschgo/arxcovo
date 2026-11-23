@@ -112,11 +112,15 @@ creation-time owner and protected DACL on Windows) and the run directory.
 Each is verified right after creation. Every helper on this path returns an
 error instead of panicking, including the Windows token and SID lookups, so
 a failure always reaches the rollback. Any failure after the first write
-removes what this call created, newest first. Each removal result is
-checked: if the run directory or a newly created root still exists
-afterwards, the result is `CleanupFailed` with those paths, and the launcher
-prints them for manual removal. Every launcher input is read before the
-first write.
+removes what this call created, newest first. Each removal is confirmed:
+only a successful removal, or an inspection that returns `NotFound`, counts
+as gone. Any other inspection result, including an error such as
+`PermissionDenied`, means the path may remain. If the run directory or a
+newly created root is not confirmed gone, the result is `CleanupFailed`
+with those paths, and the launcher prints them for manual removal. Every
+launcher input is read before the first write. The launcher's stop poll
+likewise acts only on a confirmed stop file; an inspection error keeps the
+daemon running and deletes nothing.
 
 Non-ignored tests in the same file run in the normal nextest job:
 
@@ -147,13 +151,21 @@ Non-ignored tests in the same file run in the normal nextest job:
       directory;
     - an identity lookup lost after a new root, or an existing root, is
       ready (Windows).
-  - **Leftover rows** must return `CleanupFailed` naming exactly the paths
-    that remain, which must exist, with everything else restored. They
-    inject:
+  - **Leftover rows** must return `CleanupFailed`. The set of entries
+    created by the call that are still present, after removing the entries
+    the test itself injected (the `blocker` file that makes a root removal
+    fail), must equal the reported set exactly. So an unreported run
+    directory under a reported root fails the test. A reported path may be
+    absent only where the injected inspector could not confirm it gone.
+    Every entry that existed before must be unchanged. The rows inject:
     - a root removal that fails after the new root fails verification, and
       after the run directory fails verification;
     - a run-directory close that fails and keeps the directory, under a new
-      root (both paths reported) and under an existing root.
+      root (both paths reported) and under an existing root;
+    - a root removal and its inspection both failing (`PermissionDenied`);
+    - a run-directory close that fails while its inspection also fails;
+    - a run directory that was removed although an inspection error means
+      its removal cannot be confirmed, so it is still reported.
 
   A positive control is accepted.
 - `run_cleanup_removes_only_its_own_directory` proves that another run's
@@ -180,6 +192,12 @@ the status.
   rejection of the same Promise. That covers the response, data, end, error,
   aborted and timeout callbacks, including a timeout whose `destroy()`
   throws. Nothing can escape as an uncaught exception.
+- On every emitter, every listener is attached, `error` first, before any
+  code in that callback that can throw runs. In particular, the response's
+  `statusCode` is read only after its listeners are in place, so a late
+  error after a failed callback still reaches a guarded listener. An emitter
+  is destroyed on failure only once its `error` listener is attached, and
+  failing is idempotent, so a destroy that re-emits does not loop.
 - A single try/catch discards the original error and throws a `ReplayError`
   with one of two fixed messages: "request failed", or the HTTP status.
 - Stopping the exchange after a failure is best effort, and its own errors
@@ -193,6 +211,10 @@ the status.
 - through a scripted request seam, asynchronous throws from a timeout whose
   `destroy()` throws, from the response callback, from the data listener
   with a throwing `destroy()`, and from an oversized body;
+- a throwing `statusCode` followed by a destroy that emits a late error,
+  later or synchronously, with the response destroyed exactly once;
+- a response that errors on its own after its callback failed;
+- a request whose destroy emits a late error after a timeout;
 - late events after the result.
 
 Each case traps uncaught exceptions and unhandled rejections and requires
