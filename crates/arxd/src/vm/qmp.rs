@@ -1,3 +1,4 @@
+use super::qemu_args::QEMU_VERSION;
 use crate::service::Shutdown;
 use serde::Deserialize;
 use serde_json::Value;
@@ -279,7 +280,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
         bounded(cancel, Instant::now() + SETUP, async {
             let Greeting { qmp: greeting } = stream.record().await?;
             let release = greeting.version.qemu;
-            if (release.major, release.minor, release.micro) != (11, 1, 3)
+            if format!("{}.{}.{}", release.major, release.minor, release.micro) != QEMU_VERSION
                 || greeting.version.package.len() > 256
                 || greeting.capabilities.len() > 16
                 || greeting

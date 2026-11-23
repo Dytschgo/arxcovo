@@ -362,6 +362,23 @@
   campaign (`phase=join category=assertion message=mint-refused`, owner mint exit 8,
   clean teardown), outside the diff; C13 then passed in 19 later runs through `830b9de7`
   (one of them a workflow cancelled after C13 passed).
+- **Owner instruction (2026-11-23, relayed by the babysitter): parallelize and speed up.** Recorded in [ADR 0056](adr/0056-parallel-milestones-and-throughput.md), AGENTS.md and the ROADMAP "Known issues / later release" list.
+  - M4, M5 (non-VM parts) and M6 run in parallel, each accepted only by its own check.
+  - Caps are raised to three builders and two reviewers (superseded the same day: no fixed cap, see the models-and-capacity entry below).
+  - Builders get bigger coherent slices, and PROGRESS updates are batched.
+  - No fast mode.
+  - Marginal intermittent bugs go to ROADMAP known issues; the intermittent C13 mint refusal is moved there.
+- **Owner instructions (2026-11-23, relayed by the babysitter): host setup, static VMs and Cloudflare.**
+  - **Host setup.** The read-only host check (docs/dev-host-setup.md) found WHPX usable from the owner's UAC-filtered login (a successful `WHvGetCapability` query) and no QEMU on PATH or in the common install directories. Later the same day an agent installed the official Weil QEMU 11.1.0 x64 portably under the scoped exception. The owner approved it despite an expired Authenticode certificate, and the SHA-512 matched. A paused WHPX start passed; a full guest boot is **unverified on real hardware**. A patched build is required before untrusted guests or persistent disks (see docs/dev-host-setup.md).
+  - **Execution account.** Host execution is the owner's current login (ADR 0029 `current_user`). Agents may install or enable only the M4 host prerequisites (WHPX, QEMU, the D: cap and reserve), additively, with any UAC step asked of the owner once. Existing VMs are untouched.
+  - **Scope.** [ADR 0058](adr/0058-v1-scope-static-vms-and-cloudflare.md) moves static VMs into v1, with an Ubuntu web server as the first target and no agent delete of static VMs or backups. It also moves Cloudflare Tunnel publishing into v1: off by default, owner-supplied credential requested once when needed, CI with fakes, the real tunnel **unverified on real hardware**.
+  - **Recorded in** AGENTS.md and the ROADMAP.
+- **Owner instruction (2026-11-23, relayed by the babysitter): models and capacity.** Recorded in the ADR 0056 addendum and AGENTS.md routing.
+  - There is no fixed agent cap, within the machine, reserve, D: scratch and CI guardrails.
+  - Main coding stays with Sol and Opus, and UI with Claude.
+  - Side work may use Muse and Grok first until their usage limits run out, then Luna, Sol or Opus. Substitutions are recorded and never reset counters.
+  - The authoritative `agent-review` is still an independent Sol or Opus reviewer.
+- **Since #263:** PR #265 merged as `57ccda6a` (4c1, the VM store v6 migration; Sol builder 1/3; review PASS `29e404c5…1751`, status `59611896549`). PR #264 merged as `da0c493b` (4b2, the Ubuntu lifecycle stages; Sol builder 2/3; HOLD `e4259731…91dd` because health read `/etc/shadow` as 65534, then PASS `2cee46f7…bd34`, status `59612317649`). The slice 5 design is adopted (`D:/Temp/arx-m4-slice5/design.md`, SHA256 `68024cb3…e937`). The 5a Windows guest Sol builder stopped at 3/3 (report SHA256 `2bc8c69d…21e2`); a fresh Opus 5.5 high diagnosis followed, then a new Opus builder with its own budget under the owner's 2026-11-22 instruction to use Opus when Sol is stuck (not a counter reset). 4c2a (durable build and clone settlement) is in progress.
 - **Process notes.** The coordinator now reads every failed job of each PR CI run before
   relying on a summary. Reviewers are asked to classify activation-gate residuals and
   theoretical hardening as non-blocking P3. Long shell here-strings caused unanswerable delegate approval

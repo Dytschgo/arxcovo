@@ -1,11 +1,13 @@
 use arx_guest::{Request, Response, ScriptExecution, read_frame, write_frame};
 use arxd::{
-    config::{Config, VmRuntimeProfile},
+    config::{Config, InvalidVmProfile, VmRuntimeProfile},
     service::Shutdown,
     vm::{
         guest::{FRAME_BOUND, GUEST_READY_BUDGET, GuestChannel, MAX_CHALLENGES, RETRY_FIRST},
         paths::{Artifact, ArtifactRole, LocalPath},
-        qemu_args::{BootPurpose, BootRecipe, GUEST_PORT_ID, NETWORK, PlanKind, SerialName},
+        qemu_args::{
+            BootPurpose, BootRecipe, GUEST_PORT_ID, NETWORK, PlanKind, QEMU_VERSION, SerialName,
+        },
         qemu_img,
         qmp::{ChannelError, Qmp, RunStatus},
         runtime::{
@@ -28,7 +30,7 @@ fn profile() -> Value {
         "enabled": true, "owner_sid": "S-1-5-21-1-2-3-1001",
         "supervisor_sid": "S-1-5-21-1-2-3-1002", "bundle": "E:/pinned bundle",
         "volume": "D:/", "state": "D:/test_vms/state",
-        "disk_ceiling_bytes": 10_737_418_240_u64, "manifest": "qemu-11.1.3-windows-x64",
+        "disk_ceiling_bytes": 10_737_418_240_u64, "manifest": "qemu-11.1.0-windows-x64",
     })
 }
 
@@ -41,8 +43,9 @@ fn candidate_profile_is_closed_and_separate_from_foreground() {
     let original = profile();
     assert_eq!(
         parse(&original).unwrap().manifest_id(),
-        "qemu-11.1.3-windows-x64"
+        "qemu-11.1.0-windows-x64"
     );
+    assert_eq!(QEMU_VERSION, "11.1.0");
     for forbidden in [
         "hostfwd",
         "guestfwd",
@@ -78,6 +81,13 @@ fn candidate_profile_is_closed_and_separate_from_foreground() {
         }))
         .is_err()
     );
+}
+
+#[test]
+fn previous_qemu_manifest_is_refused_with_a_typed_error() {
+    let mut previous = profile();
+    previous["manifest"] = json!("qemu-11.1.3-windows-x64");
+    assert!(matches!(parse(&previous), Err(error) if error.is::<InvalidVmProfile>()));
 }
 
 #[test]
@@ -224,16 +234,16 @@ fn put(cluster: &mut [u8], at: usize, bytes: &[u8]) {
     cluster[at..at + bytes.len()].copy_from_slice(bytes);
 }
 
-/// Cluster 0 of an image made by this PR's create recipe
+/// Synthetic cluster 0 for the fixed create recipe
 /// (`qemu-img create -f qcow2 -o compat=1.1,cluster_size=65536,lazy_refcounts=off`),
-/// built from the documented layout because no QEMU binary is available here.
-/// QEMU v11.1.3 `block/qcow2.h` declares the packed big-endian `QCowHeader`
+/// using the documented layout.
+/// QEMU 11.1.x `block/qcow2.h` declares the packed big-endian `QCowHeader`
 /// as 112 bytes for a new version-3 image. `qcow2_update_header` in
 /// `block/qcow2.c` then writes the backing-format extension (only when
 /// backed), the feature-name table, the end marker, and finally the backing
 /// file name. Layout fields the parser does not check (L1 and refcount
 /// placement) carry representative values for a 1 MiB image.
-fn qcow2_11_1_3(backing: Option<&str>) -> Vec<u8> {
+fn qcow2_11_1(backing: Option<&str>) -> Vec<u8> {
     let mut c = vec![0u8; 65_536];
     put(&mut c, 0, b"QFI\xfb"); // magic
     put(&mut c, 4, &3u32.to_be_bytes()); // version
@@ -284,10 +294,10 @@ fn qcow2_11_1_3(backing: Option<&str>) -> Vec<u8> {
 }
 
 #[test]
-fn qemu_11_1_3_create_headers_are_accepted_and_bounded() {
+fn qemu_11_1_create_headers_are_accepted_and_bounded() {
     let golden = LocalPath::parse("E:/golden/base.qcow2").unwrap();
-    let plain = qcow2_11_1_3(None);
-    let backed = qcow2_11_1_3(Some(golden.as_str()));
+    let plain = qcow2_11_1(None);
+    let backed = qcow2_11_1(Some(golden.as_str()));
     assert_eq!(qemu_img::inspect_header(&plain, None), Ok(1 << 20));
     assert_eq!(
         qemu_img::inspect_header(&backed, Some(&golden)),
@@ -355,9 +365,9 @@ fn boot_metadata_may_reference_only_the_approved_golden() {
     let disk = artifact(GuestDisk, "D:/vms/current.qcow2");
     let golden = artifact(Golden, "E:/golden/base.qcow2");
     let serial = SerialName::generate().unwrap();
-    let plain = qcow2_11_1_3(None);
-    let backed = qcow2_11_1_3(Some(r"E:\golden\base.qcow2"));
-    let foreign = qcow2_11_1_3(Some(r"E:\golden\other.qcow2"));
+    let plain = qcow2_11_1(None);
+    let backed = qcow2_11_1(Some(r"E:\golden\base.qcow2"));
+    let foreign = qcow2_11_1(Some(r"E:\golden\other.qcow2"));
     let mut external = backed.clone();
     external[79] |= 4; // QCOW2_INCOMPAT_DATA_FILE
     let plan = |disk_header: &[u8], backing: Option<&Artifact>, backing_header: Option<&[u8]>| {
@@ -415,8 +425,8 @@ fn qemu_has_one_restricted_network_and_explicit_block_and_monitor_roles() {
     let backing = artifact(Golden, "E:/golden/base.qcow2");
     let iso = artifact(InstallMedia, "E:/iso/installer.iso");
     let serial = SerialName::generate().unwrap();
-    let golden_header = qcow2_11_1_3(None);
-    let disk_header = qcow2_11_1_3(Some(r"E:\golden\base.qcow2"));
+    let golden_header = qcow2_11_1(None);
+    let disk_header = qcow2_11_1(Some(r"E:\golden\base.qcow2"));
     let mut recipe = BootRecipe {
         image: &image,
         data: &data,
@@ -547,7 +557,7 @@ fn image_metadata_cannot_introduce_external_files_or_backing() {
     );
 }
 
-const GREETING: &[u8] = b"{\"QMP\":{\"version\":{\"qemu\":{\"major\":11,\"minor\":1,\"micro\":3},\"package\":\"\"},\"capabilities\":[]}}\r\n";
+const GREETING: &[u8] = b"{\"QMP\":{\"version\":{\"qemu\":{\"major\":11,\"minor\":1,\"micro\":0},\"package\":\"\"},\"capabilities\":[]}}\r\n";
 
 async fn command(peer: &mut BufReader<DuplexStream>, name: &str, id: u16) {
     let mut line = String::new();
@@ -720,7 +730,7 @@ async fn qmp_rejects_invalid_results_duplicate_id_and_event_flood() {
 #[tokio::test(start_paused = true)]
 async fn qmp_setup_distinguishes_forged_version_partial_eof_and_timeout() {
     for (input, error) in [
-        (b"{\"QMP\":{\"version\":{\"qemu\":{\"major\":11,\"minor\":1,\"micro\":0},\"package\":\"\"},\"capabilities\":[]}}\n".as_slice(), ChannelError::Invalid),
+        (b"{\"QMP\":{\"version\":{\"qemu\":{\"major\":11,\"minor\":1,\"micro\":3},\"package\":\"\"},\"capabilities\":[]}}\n".as_slice(), ChannelError::Invalid),
         (b"{".as_slice(), ChannelError::Eof),
     ] {
         let (host, mut peer) = duplex(128);
@@ -1226,7 +1236,7 @@ fn installer_boots_are_refused_before_any_native_launch() {
     let disk = artifact(GuestDisk, "D:/vms/current.qcow2");
     let iso = artifact(InstallMedia, "E:/iso/installer.iso");
     let serial = SerialName::generate().unwrap();
-    let header = qcow2_11_1_3(None);
+    let header = qcow2_11_1(None);
     let recipe = |boot| BootRecipe {
         image: &image,
         data: &data,
