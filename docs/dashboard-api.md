@@ -219,19 +219,47 @@ per-session lock:
    refuses a command whose cancellation fired in between. Result: a command
    admitted before the bump may run to its executor cleanup, but its output
    stops at the close; a command not yet admitted is refused and never spawns.
-3. **Frame delivery.** Each console frame and each terminal output chunk is
-   sent only after a generation check, through a per-stream outbound queue.
-   On revocation the queue is cleared: frames or chunks still in flight are
-   dropped, and the 4401 close frame is the next and last thing sent.
+3. **Frame delivery: one serialized writer per stream.** Producers (the
+   executor's output, the console capturer) only enqueue application
+   messages; a single writer task owns the socket and is the only code that
+   hands data to the transport. For each message the writer takes the session
+   lock, checks the session is live and the generation unchanged, and, still
+   holding the lock, hands that one message to the transport (the WebSocket
+   send call). Taking the lock for that handoff is the last cancellable
+   point. A transport write is therefore either completed before the
+   revocation linearization point (step 1) or never started.
+   - On revocation, all pending application data is discarded: the queue is
+     cleared and the writer stops taking from it. Messages the writer had
+     dequeued but not yet handed off are dropped.
+   - Bytes already handed to the transport before the linearization point may
+     still be delivered: a WebSocket close cannot recall data written ahead
+     of it ([RFC 6455 §5.5.1](https://www.rfc-editor.org/rfc/rfc6455.html#section-5.5.1)).
+     Because the writer hands off one message at a time under the lock, this
+     is bounded to **at most one frame or message** already in flight.
+   - The 4401 close frame follows immediately as the writer's next and last
+     transport write.
+   - Bounded termination: if the close frame cannot be written within 5 s
+     (for example a stalled peer with a full send buffer), the server drops
+     the TCP connection.
 4. **Expiry wake-up.** At redemption the server arms a timer per stream for
    the session's absolute expiry, and re-arms an idle-expiry timer whenever
-   the session's idle deadline moves. When either fires, the stream closes
-   with 4401 whether it is idle (no traffic) or busy (a command running or
-   frames flowing), following steps 1–3.
+   the session's idle deadline moves. When a timer fires, its callback takes
+   the session lock and re-reads the *live* deadlines: it revokes only if the
+   absolute deadline has passed or the current idle deadline has passed.
+   A callback scheduled for an idle deadline that has since been renewed
+   does nothing except re-arm for the new deadline. A revoking callback then
+   follows steps 1–3, closing with 4401 whether the stream is idle (no
+   traffic) or busy (a command running or frames flowing).
 
 Server integration tests (backend PR) must cover: revocation during command
-admission, expiry during a running command, revocation while a console frame
-send is pending, and ticket redemption racing revocation.
+admission; expiry during a running command; revocation while console frames
+are queued (all discarded) versus a frame already handed to the transport (at
+most one delivered, then 4401); a stalled peer (connection dropped within the
+bound); ticket redemption racing revocation; and a session renewal racing a
+callback for the old idle deadline (the session stays live).
+
+The client already ignores everything that arrives after it observes a close,
+so the possible single in-flight message before a 4401 is harmless.
 
 - Re-validate the session (live, unexpired, same generation) before every
   terminal `run` and before sending every console frame or output chunk, as
@@ -318,7 +346,14 @@ The Electron shell serves `ui/dist` from `app://arxcovo` and answers
 `/api/*` with 503 `unavailable`, for every method including the sign-in
 `POST`, until host connection is designed (proposal: a host picker that loads
 the chosen host's served dashboard, with navigation locked to that host's
-origin). Asset reads require `ui/dist` itself to be a plain directory (not a
-symlink or junction), refuse links in every component below it, confine the
-real path under the validated root, and read through a handle whose file
-identity matches the validated file.
+origin).
+
+Assets are served from an immutable in-memory table built once at startup,
+never from the filesystem per request. Startup validates `ui/dist` (its real
+path equals the requested path, every ancestor is a plain directory, device
+and inode pinned), then walks the tree once with caps on file count, depth,
+per-file bytes and total bytes. It refuses any symlink, junction or other
+reparse point, reads each served file through a handle whose identity must
+match the walked file using a byte-bounded read, re-checks the directories
+leading to it, and finally re-verifies the root identity. Any failure stops
+the app from starting. Files changed on disk after startup are never served.
