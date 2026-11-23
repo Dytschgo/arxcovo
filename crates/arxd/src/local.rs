@@ -63,7 +63,9 @@ pub(crate) use platform::delegated::endpoint_controls;
 #[cfg(target_os = "linux")]
 pub(crate) use platform::delegated::{AgentListener, Profile, group_member};
 
-fn private_file(path: &Path) -> Result<Vec<u8>> {
+pub(crate) use platform::owned;
+
+pub(crate) fn private_file(path: &Path) -> Result<Vec<u8>> {
     crate::config::checked_path(path)?;
     crate::security::private(path)?;
     let parent = path
@@ -553,6 +555,7 @@ mod tests {
             execution_settings: None,
             local: None,
             listen: None,
+            dashboard: None,
             state_dir: dir.path().into(),
             agents: vec![crate::config::Agent {
                 principal: "fixture".into(),

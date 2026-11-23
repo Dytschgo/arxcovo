@@ -143,6 +143,7 @@ async fn journey(sentinel: &str) {
         state_dir: dir.path().into(),
         local: Some(endpoint.clone()),
         listen: None,
+        dashboard: None,
         execution: None,
         development_execution: None,
         execution_settings: None,

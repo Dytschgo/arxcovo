@@ -1,12 +1,11 @@
 # Dashboard HTTP API (proposed)
 
-Status: **proposed**. Nothing here is served by `arxd` yet. The dashboard's
-HTTP adapter (`ui/src/api/http.ts`) already speaks this contract, and the
+The dashboard's HTTP adapter (`ui/src/api/http.ts`) speaks this contract, and the
 TypeScript types in `ui/src/api/types.ts` with the decoders in
 `ui/src/api/decode.ts` are the precise shapes. A backend PR implements this
 document; any change to it must update those three files in the same PR.
 
-Until the backend lands, dev and test builds use a deterministic stand-in
+Dev and test builds use a deterministic stand-in
 adapter (`ui/src/api/standin.ts`) and show a "Demo data" banner. Production
 builds always use HTTP: the stand-in branch is compiled out, and the desktop
 smoke test asserts that no fixture data reaches `ui/dist`.
@@ -41,6 +40,33 @@ smoke test asserts that no fixture data reaches `ui/dist`.
 Chosen over a one-time pairing token because the dashboard is used daily from
 several browsers and Electron; a pairing token would need its own long-lived
 credential afterwards anyway. Pairing tokens remain the host *join* mechanism.
+
+Provision the password with `arxd dashboard-password --state-dir DIRECTORY`
+while the dashboard daemon is stopped. The command reads one UTF-8 line from
+standard input and hides terminal input. Use the same private state directory
+as the daemon's `state_dir`.
+
+Set `dashboard.listen` and `dashboard.dist` in the foreground daemon's
+private JSON config to enable the listener. The dist path is an absolute path
+to an owner-controlled production build. For plain loopback HTTP, open
+`http://localhost:<port>`. The Secure cookie uses the browser's localhost
+exception. HTTPS uses `dashboard.tls.authority`, DER certificate paths in
+`dashboard.tls.certificates` and a private DER key at
+`dashboard.tls.private_key`. Use the configured authority in the browser.
+The authority is a host with an optional port that must equal the
+`dashboard.listen` port. The daemon compares `Host` and `Origin` exactly with
+the browser's (WHATWG URL) serialization, so startup refuses any host not
+already written that way: a lowercase ASCII DNS name without empty labels
+(one trailing dot is kept), a dotted-quad IPv4 address (not `127.1` or
+`0x7f.0.0.1`), or a bracketed IPv6 address in compressed lowercase hex with
+no embedded IPv4 (`[::1]`, not `[0:0:0:0:0:0:0:1]`; `[::ffff:c000:201]`, not
+`[::ffff:192.0.2.1]`). Uppercase, userinfo and zone identifiers are refused.
+Only the port is normalized: the default 443 and leading zeros are dropped,
+so `owner.example:443` is served as `https://owner.example` and
+`owner.example:08443` as `https://owner.example:8443`.
+`dashboard.vm_state` can point to the controller's private catalog directory
+after the current controller has opened it. The listener and session details
+are recorded in [ADR 0061](adr/0061-dashboard-owner-sessions.md).
 
 Server requirements:
 
@@ -168,6 +194,9 @@ descending; `nextBeforeId` is the last returned id when more exist, else
   `null`.
 - `state`: `creating | running | stopped | snapshotting | migrating | failed | destroying`.
 - `ready`: the guest agent answered its readiness check.
+- `cpus`, `memoryBytes` and snapshot `createdAt` are `null` when the VM
+  catalog predates those observations. `diskBytes` is the VM's persistent
+  disk allocation recorded by the controller.
 - `snapshots` ≤ 256. The UI computes host compatibility from `arch`,
   `guestOs` and host reachability; the server remains the authority.
 

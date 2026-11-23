@@ -122,6 +122,17 @@ describe('data endpoints', () => {
     expect(() => activitySearch({ beforeId: 0 })).toThrow();
     expect(() => activitySearch({ tool: 'run;rm' })).toThrow();
   });
+
+  test('an older catalog can leave VM resources and snapshot time unknown', async () => {
+    const vm = {
+      ...FIXTURE_VMS[1],
+      cpus: null,
+      memoryBytes: null,
+      snapshots: FIXTURE_VMS[1].snapshots.map(snapshot => ({ ...snapshot, createdAt: null })),
+    };
+    const { fetchImpl } = fakeFetch({ ['GET /api/v1/vms/' + vm.id]: () => json(200, vm) });
+    expect(await new HttpApi({ fetch: fetchImpl }).getVm(vm.id)).toEqual(vm);
+  });
 });
 
 class FakeSocket extends EventTarget {
