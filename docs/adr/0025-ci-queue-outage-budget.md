@@ -227,3 +227,11 @@ The budget-only exception is consumed. Original five required checks and all
 protection fences were restored and verified. Earlier preparation/approval text
 is historical; no further exception is granted. CI44177880021 attempt1 passed:632s wall,629s charged,3s queue credit.
 Automatic trusted policy44179754154 succeeded.
+
+## Runner label correction (2026-11-23)
+
+Main CI run `45267529407` (`881e0966`, attempt 1) passed in 1605s wall time.
+The budget policy rejected its job metadata because `rust (ubuntu-latest)`
+reported the workflow's pinned label `ubuntu-24.04`. Matching that exact
+label restores 762s of idle queue credit, yielding 843s charged against the
+900s budget.
