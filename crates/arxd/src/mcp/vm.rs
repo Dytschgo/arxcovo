@@ -1646,20 +1646,193 @@ mod tests {
             Ok(evidence)
         }
 
-        fn verify(&self, slot: ArtifactSlot, proof: ArtifactEvidence) -> Result<()> {
+        /// Open the slot and prove, through the held handles, that it is the
+        /// recorded object in the recorded directory with the pinned content.
+        /// A same-content replacement fails the identity check.
+        fn hold(
+            &self,
+            slot: ArtifactSlot,
+            proof: ArtifactEvidence,
+            delete: bool,
+        ) -> Result<fs::File> {
             let path = self.0.path(slot.role, slot.key);
-            let metadata = fs::symlink_metadata(&path)?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("fixture slot parent"))?;
+            let directory = custody::open(parent, true, false)?;
             ensure!(
-                metadata.file_type().is_file()
-                    && proof.pin.verify(fs::File::open(path)?, 131_072)?,
+                custody::identity(&directory, true)?
+                    == crate::vm::paths::FileIdentity {
+                        volume: proof.identity.volume,
+                        file: proof.directory,
+                    },
+                "fixture directory changed"
+            );
+            let mut file = custody::open_for(&path, delete)?;
+            ensure!(
+                custody::identity(&file, false)? == proof.identity,
+                "fixture artifact identity changed"
+            );
+            ensure!(
+                proof.pin.verify(&mut file, 131_072)?,
                 "fixture artifact changed"
+            );
+            Ok(file)
+        }
+
+        fn verify(&self, slot: ArtifactSlot, proof: ArtifactEvidence) -> Result<()> {
+            self.hold(slot, proof, false).map(drop)
+        }
+
+        /// Dispose of exactly the recorded object. Ok only when that object
+        /// is proven gone; anything else leaves custody unproven.
+        fn remove(&self, slot: ArtifactSlot, proof: ArtifactEvidence) -> Result<()> {
+            let file = self.hold(slot, proof, true)?;
+            custody::dispose(&file, &self.0.path(slot.role, slot.key))
+        }
+    }
+
+    /// Handle-anchored identity for fixture objects, computed exactly as the
+    /// fixture custody records it. Pathname checks are evidence only.
+    mod custody {
+        use super::*;
+        use crate::vm::paths::FileIdentity;
+
+        pub(super) fn open(
+            path: &Path,
+            directory: bool,
+            exclusive: bool,
+        ) -> std::io::Result<fs::File> {
+            let mut options = fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let _ = exclusive;
+                let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+                options.custom_flags(if directory {
+                    flags | libc::O_DIRECTORY
+                } else {
+                    flags
+                });
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                use windows_sys::Win32::Storage::FileSystem::*;
+                let directory_flag = if directory {
+                    FILE_FLAG_BACKUP_SEMANTICS
+                } else {
+                    0
+                };
+                options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | directory_flag);
+                options.share_mode(if exclusive {
+                    0
+                } else {
+                    FILE_SHARE_READ | FILE_SHARE_WRITE
+                });
+            }
+            options.open(path)
+        }
+
+        /// The slot's file, held exclusively. On Windows a disposing handle
+        /// also carries DELETE so removal targets this exact object.
+        pub(super) fn open_for(path: &Path, delete: bool) -> std::io::Result<fs::File> {
+            #[cfg(windows)]
+            if delete {
+                use std::os::windows::fs::OpenOptionsExt;
+                use windows_sys::Win32::Storage::FileSystem::*;
+                return fs::OpenOptions::new()
+                    .access_mode(FILE_GENERIC_READ | DELETE)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .share_mode(0)
+                    .open(path);
+            }
+            let _ = delete;
+            open(path, false, true)
+        }
+
+        fn id(value: u64) -> Id {
+            let mut id = [0; 16];
+            id[8..].copy_from_slice(&value.to_be_bytes());
+            id
+        }
+
+        #[cfg(unix)]
+        pub(super) fn identity(file: &fs::File, directory: bool) -> Result<FileIdentity> {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            ensure!(
+                if directory {
+                    metadata.is_dir()
+                } else {
+                    metadata.is_file() && metadata.nlink() == 1
+                },
+                "invalid fixture object"
+            );
+            Ok(FileIdentity {
+                volume: metadata.dev(),
+                file: id(metadata.ino()),
+            })
+        }
+
+        #[cfg(windows)]
+        pub(super) fn identity(file: &fs::File, directory: bool) -> Result<FileIdentity> {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::*;
+            let handle = file.as_raw_handle();
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            // The borrowed handle remains open for the synchronous query.
+            ensure!(
+                unsafe {
+                    GetFileType(handle) == FILE_TYPE_DISK
+                        && GetFileInformationByHandle(handle, &mut info) != 0
+                },
+                "invalid fixture handle"
+            );
+            ensure!(
+                info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                    && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) == directory
+                    && (directory || info.nNumberOfLinks == 1),
+                "invalid fixture object"
+            );
+            let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+            Ok(FileIdentity {
+                volume: u64::from(info.dwVolumeSerialNumber),
+                file: id(index),
+            })
+        }
+
+        /// Mark the verified handle's own object for deletion. The handle is
+        /// exclusive, so no other open can intervene before close.
+        #[cfg(windows)]
+        pub(super) fn dispose(file: &fs::File, _: &Path) -> Result<()> {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::*;
+            let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+            // The borrowed handle remains open for the synchronous call.
+            ensure!(
+                unsafe {
+                    SetFileInformationByHandle(
+                        file.as_raw_handle(),
+                        FileDispositionInfo,
+                        (&info as *const FILE_DISPOSITION_INFO).cast(),
+                        std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                } != 0,
+                "fixture disposal refused"
             );
             Ok(())
         }
 
-        fn remove(&self, slot: ArtifactSlot, proof: ArtifactEvidence) -> Result<()> {
-            self.verify(slot, proof)?;
-            Ok(fs::remove_file(self.0.path(slot.role, slot.key))?)
+        /// Unlink the slot name, then prove from the held descriptor that the
+        /// verified object itself lost its only link.
+        #[cfg(unix)]
+        pub(super) fn dispose(file: &fs::File, path: &Path) -> Result<()> {
+            use std::os::unix::fs::MetadataExt;
+            fs::remove_file(path)?;
+            ensure!(file.metadata()?.nlink() == 0, "fixture disposal unproven");
+            Ok(())
         }
     }
 
@@ -2590,12 +2763,7 @@ mod tests {
             cancel: &Shutdown,
         ) -> Result<Self> {
             for (slot, proof) in [(slots.disk, disk), (slots.vars, vars)] {
-                let path = artifacts.0.path(slot.role, slot.key);
-                ensure!(
-                    fs::symlink_metadata(&path)?.is_file()
-                        && proof.pin.verify(fs::File::open(path)?, 131_072)?,
-                    "static fixture changed"
-                );
+                artifacts.verify(slot, proof)?;
             }
             let origin = crate::vm::static_web::OriginPortLease::acquire()?;
             ensure!(origin.verify(), "static origin listener mismatch");
@@ -3664,6 +3832,45 @@ mod tests {
             );
         }
         assert_eq!(static_paths(&h.media), files);
+    }
+
+    #[test]
+    fn candidate_disposal_and_boot_require_the_recorded_object_not_its_content() {
+        let temp = crate::service::application::tests::private_temp();
+        let media = temp.path().join("fixture-media");
+        fs::create_dir(&media).unwrap();
+        protect_fixture(&media, true).unwrap();
+        let artifacts = Artifacts(Arc::new(FixtureCustody::open(&media).unwrap()));
+        let slot = |key: u8| ArtifactSlot {
+            generation: [9; 16],
+            role: "static_disk",
+            key: [key; 16],
+        };
+        let staged = artifacts.stage(slot(1), b"static leaf").unwrap();
+        let path = artifacts.0.path(slot(1).role, slot(1).key);
+        // The original moves aside and an identical replacement takes the slot.
+        let moved = media.join("moved-original");
+        fs::rename(&path, &moved).unwrap();
+        let replacement = artifacts.stage(slot(1), b"static leaf").unwrap();
+        assert_eq!(replacement.pin, staged.pin);
+        assert_ne!(replacement.identity, staged.identity);
+        assert!(artifacts.verify(slot(1), staged).is_err());
+        assert!(artifacts.remove(slot(1), staged).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"static leaf");
+        assert_eq!(fs::read(&moved).unwrap(), b"static leaf");
+        // The genuine object is disposed of and proven gone.
+        artifacts.verify(slot(1), replacement).unwrap();
+        artifacts.remove(slot(1), replacement).unwrap();
+        assert!(!path.exists());
+        assert!(moved.exists());
+        // A recorded directory that differs refuses before any unlink.
+        let other = artifacts.stage(slot(2), b"static leaf").unwrap();
+        let wrong = ArtifactEvidence {
+            directory: [0xee; 16],
+            ..other
+        };
+        assert!(artifacts.remove(slot(2), wrong).is_err());
+        assert!(artifacts.0.path(slot(2).role, slot(2).key).exists());
     }
 
     #[tokio::test]
