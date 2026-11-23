@@ -610,29 +610,68 @@ async fn refuses_non_loopback_without_tls() {
 #[test]
 fn https_authority_uses_the_browser_serialization() {
     let listen = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
-    for (raw, port, canonical) in [
+    // Expected values are the WHATWG URL `host` of `https://<raw>/`, taken
+    // from Node's URL implementation; the configured host spelling must
+    // already equal it, and only a default or zero-padded port is rewritten.
+    let accepted = [
         ("owner.example", 443, "owner.example"),
         ("owner.example:443", 443, "owner.example"),
         ("owner.example:0443", 443, "owner.example"),
         ("owner.example:8443", 8443, "owner.example:8443"),
         ("owner.example:08443", 8443, "owner.example:8443"),
+        ("owner.example.:443", 443, "owner.example."),
+        ("1e.example", 443, "1e.example"),
+        ("127.0.0.1:8443", 8443, "127.0.0.1:8443"),
         ("[::1]:443", 443, "[::1]"),
         ("[::1]:8443", 8443, "[::1]:8443"),
-    ] {
+        ("[::]", 443, "[::]"),
+        ("[1::]", 443, "[1::]"),
+        ("[::ffff:c000:201]:8443", 8443, "[::ffff:c000:201]:8443"),
+        ("[2001:db8::1:0:0:1]", 443, "[2001:db8::1:0:0:1]"),
+        ("[1:0:0:2::3]", 443, "[1:0:0:2::3]"),
+    ];
+    for (raw, port, browser) in accepted {
         assert_eq!(
             transport::canonical_authority(raw, listen(port)).unwrap(),
-            canonical,
+            browser,
             "{raw}"
         );
     }
     for (raw, port) in [
+        // Noncanonical host spellings a browser would rewrite.
+        ("[0:0:0:0:0:0:0:1]", 443),
+        ("[0::1]", 443),
+        ("[::ffff:192.0.2.1]:8443", 8443),
+        ("[2001:0db8::1]", 443),
+        ("[2001:db8:0:0:1:0:0:1]", 443),
+        ("[1:0:0:2:0:0:0:3]", 443),
+        ("127.1", 443),
+        ("127.0.0.1.", 443),
+        ("01.2.3.4", 443),
+        ("0x7f.0.0.1", 443),
+        ("4294967295", 443),
+        ("a..b", 443),
+        (".a", 443),
+        // Hosts a browser refuses.
+        ("[:::1]", 443),
+        ("[1:2:3:4:5:6:7:8:9]", 443),
+        ("[::1", 443),
+        ("1.2.3.256", 443),
+        ("a.1", 443),
+        ("a.0x1", 443),
+        ("[fe80::1%25eth0]", 443),
+        // Spelling, userinfo and port errors.
         ("Owner.Example", 443),
+        ("[::FFFF:c000:201]", 443),
         ("owner.example:", 443),
         ("owner.example:8443", 443),
         ("owner.example", 8443),
         ("owner.example:99999", 443),
+        ("owner.example:+443", 443),
+        ("owner.example:443/", 443),
         ("owner@owner.example", 443),
         (":443", 443),
+        ("", 443),
     ] {
         assert!(
             transport::canonical_authority(raw, listen(port)).is_err(),
@@ -640,7 +679,8 @@ fn https_authority_uses_the_browser_serialization() {
         );
     }
 
-    // A browser omits the default port from both Host and Origin.
+    // Every accepted form passes the boundary with the browser's Host and
+    // Origin, and refuses the configured spelling when it differs.
     let check = |boundary: &Boundary, host: &str, origin: &str| {
         let request = axum::http::Request::builder()
             .method(Method::POST)
@@ -651,27 +691,26 @@ fn https_authority_uses_the_browser_serialization() {
             .unwrap();
         boundary.check(&request, true).is_ok()
     };
-    let default = Boundary::new(
-        transport::canonical_authority("owner.example:443", listen(443)).unwrap(),
-        true,
-    );
-    assert!(check(&default, "owner.example", "https://owner.example"));
-    assert!(!check(
-        &default,
-        "owner.example",
-        "https://owner.example:443"
-    ));
-    assert!(!check(&default, "owner.example", "http://owner.example"));
-    let other = Boundary::new(
-        transport::canonical_authority("owner.example:08443", listen(8443)).unwrap(),
-        true,
-    );
-    assert!(check(
-        &other,
-        "owner.example:8443",
-        "https://owner.example:8443"
-    ));
-    assert!(!check(&other, "owner.example", "https://owner.example"));
+    for (raw, port, browser) in accepted {
+        let boundary = Boundary::new(
+            transport::canonical_authority(raw, listen(port)).unwrap(),
+            true,
+        );
+        assert!(
+            check(&boundary, browser, &format!("https://{browser}")),
+            "{raw}"
+        );
+        assert!(
+            !check(&boundary, browser, &format!("http://{browser}")),
+            "{raw}"
+        );
+        if raw != browser {
+            assert!(
+                !check(&boundary, browser, &format!("https://{raw}")),
+                "{raw}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

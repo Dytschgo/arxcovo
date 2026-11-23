@@ -53,12 +53,17 @@ to an owner-controlled production build. For plain loopback HTTP, open
 exception. HTTPS uses `dashboard.tls.authority`, DER certificate paths in
 `dashboard.tls.certificates` and a private DER key at
 `dashboard.tls.private_key`. Use the configured authority in the browser.
-The authority is a lowercase host with an optional port that must equal the
-`dashboard.listen` port; uppercase hosts and userinfo are refused at startup.
-The daemon compares `Host` and `Origin` with the browser's serialized form:
-the default port 443 and leading zeros are dropped, so `owner.example:443`
-is served as `https://owner.example` and `owner.example:08443` as
-`https://owner.example:8443`.
+The authority is a host with an optional port that must equal the
+`dashboard.listen` port. The daemon compares `Host` and `Origin` exactly with
+the browser's (WHATWG URL) serialization, so startup refuses any host not
+already written that way: a lowercase ASCII DNS name without empty labels
+(one trailing dot is kept), a dotted-quad IPv4 address (not `127.1` or
+`0x7f.0.0.1`), or a bracketed IPv6 address in compressed lowercase hex with
+no embedded IPv4 (`[::1]`, not `[0:0:0:0:0:0:0:1]`; `[::ffff:c000:201]`, not
+`[::ffff:192.0.2.1]`). Uppercase, userinfo and zone identifiers are refused.
+Only the port is normalized: the default 443 and leading zeros are dropped,
+so `owner.example:443` is served as `https://owner.example` and
+`owner.example:08443` as `https://owner.example:8443`.
 `dashboard.vm_state` can point to the controller's private catalog directory
 after the current controller has opened it. The listener and session details
 are recorded in [ADR 0061](adr/0061-dashboard-owner-sessions.md).

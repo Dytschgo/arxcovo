@@ -76,72 +76,87 @@ fn check_private(path: &Path) -> Result<()> {
     crate::local::owned(path)
 }
 
-fn file_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_GENERIC_READ, FILE_GENERIC_WRITE, WRITE_OWNER,
-        };
-        options.access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_OWNER);
-    }
-    options
+/// Creates a new private file for reading and writing; it never opens an
+/// existing one.
+#[cfg(unix)]
+fn create_new(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
 }
 
-/// Makes the current token user the owner of a file this process created.
-/// An elevated administrator token defaults new objects to the
-/// Administrators group, which the private-file owner check refuses.
+/// Creates a new file whose owner is the current token user from the
+/// moment it exists. An elevated administrator token would otherwise default
+/// new objects to the Administrators group, which the private-file owner
+/// check refuses. The descriptor names only the owner, so the file still
+/// inherits the private directory's DACL.
 #[cfg(windows)]
-fn own(file: &File) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
+fn create_new(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
     use windows_sys::Win32::{
-        Foundation::LocalFree,
-        Security::{Authorization::*, *},
+        Foundation::{INVALID_HANDLE_VALUE, LocalFree},
+        Security::{Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW, *},
+        Storage::FileSystem::*,
     };
-    let identity = crate::local::current_identity()?;
-    let text: Vec<u16> = identity.encode_utf16().chain(Some(0)).collect();
-    // SAFETY: the SID is allocated by the conversion, used while live and
-    // freed once; the handle is borrowed from the open file.
+    let identity = crate::local::current_identity().map_err(std::io::Error::other)?;
+    let sddl: Vec<u16> = format!("O:{identity}")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both strings are NUL-terminated and outlive the calls; the
+    // descriptor is allocated by the conversion, used only while live and
+    // freed once; a valid returned handle is owned by the new File.
     unsafe {
-        let mut sid = std::ptr::null_mut();
-        ensure!(
-            ConvertStringSidToSidW(text.as_ptr(), &mut sid) != 0,
-            "identity unavailable"
-        );
-        let status = SetSecurityInfo(
-            file.as_raw_handle(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            sid,
+        let mut descriptor = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
         );
-        LocalFree(sid);
-        ensure!(status == 0, "cannot set private owner");
+        let error = std::io::Error::last_os_error();
+        LocalFree(descriptor);
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(error);
+        }
+        Ok(File::from_raw_handle(handle))
     }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn own(_: &File) -> Result<()> {
-    Ok(())
 }
 
 fn lock(dir: &Path) -> Result<File> {
     check_private(dir)?;
     ensure!(dir.is_dir(), "private state directory required");
     let path = dir.join(LOCK_FILE);
-    let file = match file_options().read(true).open(&path) {
+    let file = match create_new(&path) {
         Ok(file) => {
-            own(&file)?;
+            // Never leave a freshly created lock that later runs refuse.
+            if let Err(error) = check_private(&path) {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
             file
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -194,9 +209,8 @@ fn write_password(dir: &Path, password: &str) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
     let temp = dir.join(format!("dashboard-password-{}.tmp", super::random_token()?));
-    let mut file = file_options().open(&temp)?;
+    let mut file = create_new(&temp)?;
     let write = (|| {
-        own(&file)?;
         check_private(&temp)?;
         file.write_all(value.as_bytes())?;
         file.sync_all()?;
@@ -280,5 +294,27 @@ impl Echo {
 impl Drop for Echo {
     fn drop(&mut self) {
         let _ = self.restore();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_private_files_are_owned_at_creation_and_never_reopened() {
+        let dir = crate::service::application::tests::private_temp();
+        let path = dir.path().join("probe");
+        let mut file = create_new(&path).unwrap();
+        // On an elevated Windows token this fails unless the owner was set
+        // to the token user when the file was created.
+        check_private(&path).unwrap();
+        file.write_all(b"first").unwrap();
+        drop(file);
+        assert_eq!(
+            create_new(&path).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"first");
     }
 }
