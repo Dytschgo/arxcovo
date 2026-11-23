@@ -123,7 +123,10 @@ offers a retry that sends `DELETE` again. A client that holds no CSRF token
 is gone: it first sends `GET /api/v1/session`. A `401` there confirms there is
 nothing to revoke; a returned session is revoked with `DELETE` as above; any
 other failure is reported as a failed sign-out. Only an actual `401` response
-confirms: a `DELETE` the client could not send is a failed sign-out too.
+confirms: a `DELETE` the client could not send is a failed sign-out too. The
+`204` (or `401`) ends only the session the `DELETE` was sent under: if a newer
+sign-in completed while it was in flight, the client keeps that session's CSRF
+token.
 
 ## Hosts
 
