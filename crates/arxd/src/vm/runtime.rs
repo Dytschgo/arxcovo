@@ -17,9 +17,10 @@ pub enum NativeRefusal {
     OwnerActivityUnverified,
     ReservesUnverified,
     NetworkFenceUnverified,
-    /// Installer boots need a QMP-only power-off observation and a
-    /// two-medium recipe from the follow-up runtime fence.
+    /// Compatibility refusal for the unwired private template adapter.
     InstallerPhaseUnavailable,
+    InstallerPhaseMismatch,
+    InstallerDeadlineExpired,
 }
 
 pub enum NativeCapability {
@@ -60,8 +61,8 @@ impl<'a> CandidateRuntime<'a> {
         NativeCapability::Unavailable(reason)
     }
 
-    /// Refuse before the lifecycle can stage anything. The native launcher's
-    /// sealed-plan check enforces the same refusal at the launch boundary.
+    /// Refuse before the private lifecycle can stage anything. Native launch
+    /// independently requires an operation-bound LaunchAuthority.
     #[allow(
         dead_code,
         reason = "The private lifecycle has no production entry point yet"
@@ -167,6 +168,125 @@ pub enum StopDisposition {
     ChargedQuarantine,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallerRecipe {
+    Ubuntu,
+    Windows,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallerPhase {
+    UbuntuInstall,
+    WindowsSetup,
+    WindowsFinalize,
+}
+
+impl InstallerPhase {
+    pub fn recipe(self) -> InstallerRecipe {
+        match self {
+            Self::UbuntuInstall => InstallerRecipe::Ubuntu,
+            Self::WindowsSetup | Self::WindowsFinalize => InstallerRecipe::Windows,
+        }
+    }
+}
+
+/// Create once before the first launch and keep through detached verification.
+/// Per-stage limits can shorten this budget only.
+pub struct InstallerBudget {
+    recipe: InstallerRecipe,
+    deadline: tokio::time::Instant,
+}
+
+impl InstallerBudget {
+    pub fn start(recipe: InstallerRecipe) -> Self {
+        let maximum = match recipe {
+            InstallerRecipe::Ubuntu => Duration::from_secs(60 * 60),
+            InstallerRecipe::Windows => Duration::from_secs(3 * 60 * 60),
+        };
+        Self {
+            recipe,
+            deadline: tokio::time::Instant::now() + maximum,
+        }
+    }
+
+    /// Also used to clip installed-mode health and verification operations.
+    pub fn clip(&self, limit: Duration) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        if now >= self.deadline {
+            self.deadline
+        } else {
+            now + limit.min(self.deadline - now)
+        }
+    }
+
+    pub fn stage(&self, phase: InstallerPhase, limit: Duration) -> Option<InstallerStage> {
+        (self.recipe == phase.recipe()).then(|| InstallerStage {
+            phase,
+            deadline: self.clip(limit),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InstallerStage {
+    phase: InstallerPhase,
+    deadline: tokio::time::Instant,
+}
+
+impl InstallerStage {
+    pub fn phase(self) -> InstallerPhase {
+        self.phase
+    }
+
+    pub fn deadline(self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    /// Resolve a phase only after teardown has produced its release evidence.
+    pub fn complete(
+        self,
+        result: Result<(), InstallerFailureReason>,
+        observed: StopDisposition,
+        cancelled: bool,
+    ) -> Result<(), InstallerFailure> {
+        use InstallerFailureReason as Failure;
+        let reason = match result {
+            Err(reason) => reason,
+            Ok(()) if cancelled => Failure::Cancelled,
+            Ok(()) if tokio::time::Instant::now() >= self.deadline => Failure::Timeout,
+            Ok(()) if observed == StopDisposition::CleanRelease => return Ok(()),
+            Ok(()) => Failure::ReleaseUnverified,
+        };
+        let recovery = if observed == StopDisposition::ChargedQuarantine {
+            StopDisposition::ChargedQuarantine
+        } else {
+            StopDisposition::DirtyRelease
+        };
+        Err(InstallerFailure {
+            phase: self.phase,
+            reason,
+            recovery,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallerFailureReason {
+    Timeout,
+    Cancelled,
+    Native(NativeRefusal),
+    Protocol(super::qmp::ChannelError),
+    ReleaseUnverified,
+    ProcessFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstallerFailure {
+    pub phase: InstallerPhase,
+    pub reason: InstallerFailureReason,
+    pub recovery: StopDisposition,
+}
+
 #[derive(Default)]
 pub struct StopEvidence {
     pub guest_shutdown: bool,
@@ -178,6 +298,13 @@ pub struct StopEvidence {
 }
 
 impl StopEvidence {
+    /// The release check may acquire exclusive writer custody. It may only
+    /// run once the child, its whole Job and its workers have stopped.
+    pub fn verify_release(&mut self, verify: impl FnOnce() -> bool) {
+        self.artifacts_reopened =
+            self.process_exited && self.job_empty && self.workers_joined && verify();
+    }
+
     pub fn disposition(&self) -> StopDisposition {
         if !(self.process_exited
             && self.job_empty

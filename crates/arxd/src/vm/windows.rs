@@ -6,12 +6,12 @@
 
 use super::{
     guest::GuestChannel,
-    paths::{FileIdentity, LocalPath},
-    qemu_args::{CommandPlan, SerialName},
-    qmp::Qmp,
+    paths::{ArtifactPin, FileIdentity, LocalPath},
+    qemu_args::{CommandPlan, PlanKind, SerialName},
+    qmp::{ChannelError, Qmp},
     runtime::{
-        FRESHNESS, LaunchAuthority, NativeRefusal, OfflineLease, StopDisposition, StopEvidence,
-        fresh_observation,
+        FRESHNESS, InstallerFailure, InstallerFailureReason, InstallerStage, LaunchAuthority,
+        NativeRefusal, OfflineLease, StopDisposition, StopEvidence, fresh_observation,
     },
 };
 use crate::{security::vm_acl, service::Shutdown};
@@ -76,6 +76,9 @@ struct PathPin {
     leaf: File,
     identity: FileIdentity,
     allocated: u64,
+    path: LocalPath,
+    mutable: bool,
+    verified_content: Option<ArtifactPin>,
 }
 
 impl PathPin {
@@ -122,6 +125,9 @@ impl PathPin {
                 leaf: root_file,
                 identity: root_identity,
                 allocated: root_allocated,
+                path: path.clone(),
+                mutable,
+                verified_content: None,
             });
         }
         observe(root);
@@ -153,12 +159,43 @@ impl PathPin {
                     leaf: file,
                     identity,
                     allocated,
+                    path: path.clone(),
+                    mutable,
+                    verified_content: None,
                 });
             }
             ancestors.push(file);
             observe(&raw[..end]);
         }
         Err(io::Error::other("path has no leaf"))
+    }
+
+    /// Verify the recipe pin through the retained object before launch.
+    fn verify_content(&mut self, expected: ArtifactPin, limit: u64) -> Result<(), NativeRefusal> {
+        use std::io::{Seek, SeekFrom};
+        self.verified_content = None;
+        let verified = self
+            .leaf
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| expected.verify(&self.leaf, limit));
+        if !matches!(verified, Ok(true)) {
+            return Err(NativeRefusal::PathCustodyUnverified);
+        }
+        self.verified_content = Some(expected);
+        Ok(())
+    }
+
+    fn reopen_without_writer(&self) -> io::Result<File> {
+        let parent = self
+            ._ancestors
+            .last()
+            .ok_or_else(|| io::Error::other("no held parent"))?;
+        let name = self.path.as_str().rsplit('\\').next().unwrap_or_default();
+        let file = open_relative(parent, name, Node::File, false, false)?;
+        if file_identity(&file, false)?.0 != self.identity {
+            return Err(io::Error::other("release identity changed"));
+        }
+        Ok(file)
     }
 }
 
@@ -1479,8 +1516,17 @@ impl DispatchGate {
     /// Boot: arm from a sample captured after the prelaunch status receipt.
     /// A stale sample, or a gate that is not idle, refuses without arming.
     fn arm(&self, captured: std::time::Instant) -> Result<(), NativeRefusal> {
+        self.arm_until(captured, None)
+    }
+
+    fn arm_until(
+        &self,
+        captured: std::time::Instant,
+        cutoff: Option<std::time::Instant>,
+    ) -> Result<(), NativeRefusal> {
         fresh_observation(captured, self.now(), NativeRefusal::ReservesUnverified)?;
         let deadline = captured + FRESHNESS;
+        let deadline = cutoff.map_or(deadline, |cutoff| deadline.min(cutoff));
         let mut armed = false;
         self.state.send_modify(|state| {
             if *state == Dispatch::Idle {
@@ -1738,6 +1784,7 @@ struct LaunchInputs<'a> {
     loader_root: &'a LocalPath,
     memory: usize,
     cpu_rate: u32,
+    installer: Option<InstallerStage>,
     // The issuer must retain all executable, firmware, DLL/data, media,
     // volume and writable slot custody here, including their ancestors.
     pins: Vec<PathPin>,
@@ -1748,24 +1795,79 @@ struct NativeLaunch<'a> {
     workers: Option<WorkerSet>,
     gate: std::sync::Arc<DispatchGate>,
     _pins: Vec<PathPin>,
+    installer_writers: Vec<usize>,
+    kind: PlanKind,
+    installer: Option<InstallerStage>,
+    _authority: &'a LaunchAuthority,
     // A mutating qemu-img launch stays borrowed against its offline lease.
     _offline: Option<&'a OfflineLease>,
 }
 
 type PipeQmp = Qmp<tokio::io::DuplexStream, tokio::io::DuplexStream>;
 type SerialGuest = GuestChannel<tokio::net::windows::named_pipe::NamedPipeClient>;
+type BootIo = (tokio::io::DuplexStream, tokio::io::DuplexStream);
+
+enum BootOutcome {
+    Installed(Box<(PipeQmp, SerialGuest)>),
+    InstallerReleased,
+}
+
+enum BootFailure {
+    Native(NativeRefusal),
+    Installer(InstallerFailure),
+}
+
+impl From<ChannelError> for InstallerFailureReason {
+    fn from(error: ChannelError) -> Self {
+        match error {
+            ChannelError::Timeout => Self::Timeout,
+            ChannelError::Cancelled => Self::Cancelled,
+            error => Self::Protocol(error),
+        }
+    }
+}
 
 impl<'a> NativeLaunch<'a> {
     /// Shared entry for sealed QEMU and qemu-img plans. There is no issuer
     /// for LaunchAuthority in this slice.
     fn hold(
-        _authority: &LaunchAuthority,
+        authority: &'a LaunchAuthority,
         token: &VmToken,
         inputs: LaunchInputs<'a>,
     ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
-        // First, before any handle, Job or process: installer boots refuse,
-        // and writable-image plans yield the lease kept borrowed below.
-        let offline = inputs.plan.native_admission()?;
+        let kind = inputs.plan.kind();
+        match (kind, inputs.installer) {
+            (PlanKind::InstallerBoot(phase), Some(stage))
+                if phase == stage.phase() && tokio::time::Instant::now() >= stage.deadline() =>
+            {
+                return Err(NativeRefusal::InstallerDeadlineExpired);
+            }
+            (PlanKind::InstallerBoot(phase), Some(stage)) if phase == stage.phase() => {}
+            (PlanKind::InstallerBoot(_), _) | (_, Some(_)) => {
+                return Err(NativeRefusal::InstallerPhaseMismatch);
+            }
+            _ => {}
+        }
+        let mut installer_writers = Vec::new();
+        for expected in inputs.plan.installer_artifacts() {
+            let index = inputs
+                .pins
+                .iter()
+                .position(|pin| {
+                    pin.path.contains(expected.path)
+                        && expected.path.contains(&pin.path)
+                        && pin.identity == expected.identity
+                        && pin.mutable == expected.role.writable()
+                        && expected
+                            .pin
+                            .is_none_or(|digest| pin.verified_content == Some(digest))
+                })
+                .ok_or(NativeRefusal::PathCustodyUnverified)?;
+            if expected.role.writable() {
+                installer_writers.push(index);
+            }
+        }
+        let offline = inputs.plan.offline_lease();
         let gate = std::sync::Arc::new(DispatchGate::default());
         let (stdio, parent) = token.stdio().map_err(|_| NativeRefusal::QmpUnverified)?;
         let job = Job::new(inputs.memory, Some(inputs.cpu_rate))
@@ -1796,6 +1898,10 @@ impl<'a> NativeLaunch<'a> {
                 workers: Some(workers),
                 gate,
                 _pins: inputs.pins,
+                installer_writers,
+                kind,
+                installer: inputs.installer,
+                _authority: authority,
                 _offline: offline,
             },
             read,
@@ -1805,15 +1911,25 @@ impl<'a> NativeLaunch<'a> {
 
     async fn boot(
         &mut self,
-        token: &VmToken,
-        serial: &SerialName,
-        read: tokio::io::DuplexStream,
-        write: tokio::io::DuplexStream,
+        endpoint: Option<(&VmToken, &SerialName)>,
+        io: BootIo,
         cancel: &Shutdown,
         // Returns the monotonic capture time of a fresh resource sample.
         mut revalidate: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
-    ) -> Result<(PipeQmp, SerialGuest), NativeRefusal> {
-        self.child.resume_checked(cancel, &mut revalidate)?;
+        verify_release: impl FnOnce() -> bool,
+    ) -> Result<BootOutcome, BootFailure> {
+        if let Some(stage) = self.installer {
+            return self
+                .boot_installer(stage, io, cancel, &mut revalidate, verify_release)
+                .await
+                .map_err(BootFailure::Installer);
+        }
+        let (token, serial) = endpoint
+            .filter(|_| self.kind == PlanKind::Boot)
+            .ok_or(BootFailure::Native(NativeRefusal::QmpUnverified))?;
+        self.child
+            .resume_checked(cancel, &mut revalidate)
+            .map_err(BootFailure::Native)?;
         // Workers are already draining. Do not await the QMP greeting while
         // QEMU may be waiting for a client at CreateNamedPipe/ConnectNamedPipe.
         let pipe = connect_serial(
@@ -1824,17 +1940,44 @@ impl<'a> NativeLaunch<'a> {
             cancel,
             tokio::time::Instant::now() + Duration::from_secs(10),
         )
-        .await?;
+        .await
+        .map_err(BootFailure::Native)?;
+        let (read, write) = io;
         let mut qmp = Qmp::handshake(read, write, cancel)
             .await
-            .map_err(|_| NativeRefusal::QmpUnverified)?;
+            .map_err(|_| BootFailure::Native(NativeRefusal::QmpUnverified))?;
+        self.dispatch_cont(&mut qmp, cancel, &mut revalidate, None)
+            .await
+            .map_err(|error| {
+                BootFailure::Native(match error {
+                    InstallerFailureReason::Native(reason) => reason,
+                    _ => NativeRefusal::QmpUnverified,
+                })
+            })?;
+        let guest = GuestChannel::ready(pipe, &mut qmp, cancel)
+            .await
+            .map_err(|_| BootFailure::Native(NativeRefusal::GuestEndpointUnverified))?;
+        Ok(BootOutcome::Installed(Box::new((qmp, guest))))
+    }
+
+    async fn dispatch_cont(
+        &self,
+        qmp: &mut PipeQmp,
+        cancel: &Shutdown,
+        revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
+        stage: Option<InstallerStage>,
+    ) -> Result<(), InstallerFailureReason> {
         // Resample between the prelaunch status receipt and `cont`, and arm the
         // stdin worker with that sample's deadline.
         let mut refused = None;
         let gate = self.gate.clone();
         let released = qmp
             .release_startup_hold(cancel, || {
-                match revalidate().and_then(|captured| gate.arm(captured)) {
+                let armed = revalidate().and_then(|captured| match stage {
+                    Some(stage) => gate.arm_until(captured, Some(stage.deadline().into_std())),
+                    None => gate.arm(captured),
+                });
+                match armed {
                     Ok(()) => true,
                     Err(reason) => {
                         refused = Some(reason);
@@ -1843,14 +1986,96 @@ impl<'a> NativeLaunch<'a> {
                 }
             })
             .await;
-        released.map_err(|_| refused.unwrap_or(NativeRefusal::QmpUnverified))?;
+        released.map_err(|error| {
+            refused.map_or_else(|| error.into(), InstallerFailureReason::Native)
+        })?;
         // The acknowledgement does not touch the gate. Accept it only once the
         // worker has finished its write and recorded it as in time.
-        self.gate.settle(Duration::from_secs(2)).await?;
-        let guest = GuestChannel::ready(pipe, &mut qmp, cancel)
-            .await
-            .map_err(|_| NativeRefusal::GuestEndpointUnverified)?;
-        Ok((qmp, guest))
+        let grace = Duration::from_secs(2);
+        if let Some(stage) = stage {
+            let deadline = stage.deadline();
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(InstallerFailureReason::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(InstallerFailureReason::Timeout),
+                result = self.gate.settle(grace) => result,
+            }
+        } else {
+            self.gate.settle(grace).await
+        }.map_err(InstallerFailureReason::Native)
+    }
+
+    async fn boot_installer(
+        &mut self,
+        stage: InstallerStage,
+        io: BootIo,
+        cancel: &Shutdown,
+        revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
+        verify_release: impl FnOnce() -> bool,
+    ) -> Result<BootOutcome, InstallerFailure> {
+        use InstallerFailureReason as Failure;
+        use tokio::time::{Instant, sleep_until};
+        let grace = Duration::from_secs(2);
+        let deadline = stage.deadline();
+        let result = async {
+            if cancel.is_cancelled() {
+                return Err(Failure::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(Failure::Timeout);
+            }
+            self.child.resume_checked(cancel, revalidate).map_err(Failure::Native)?;
+            let (read, write) = io;
+            let mut qmp = Qmp::installer_handshake(read, write, cancel, stage).await?;
+            self.dispatch_cont(&mut qmp, cancel, revalidate, Some(stage)).await?;
+            {
+                let progress = qmp.observe_installer_shutdown(cancel);
+                tokio::pin!(progress);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(Failure::Cancelled),
+                        result = &mut progress => { result?; break; }
+                        _ = tokio::time::sleep(FRESHNESS) => {
+                            let captured = revalidate().map_err(Failure::Native)?;
+                            fresh_observation(captured, std::time::Instant::now(), NativeRefusal::ReservesUnverified)
+                                .map_err(Failure::Native)?;
+                        }
+                    }
+                }
+            }
+            // Keep QMP's stdin open while QEMU exits voluntarily.
+            let exit_by = deadline.min(Instant::now() + grace);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(Failure::Cancelled),
+                _ = sleep_until(exit_by) => Err(Failure::Timeout),
+                result = self.child.reap(exit_by) => {
+                    result.map_err(|_| Failure::ReleaseUnverified)?;
+                    (self.child.exit_code() == Ok(0)).then_some(()).ok_or(Failure::ProcessFailed)
+                }
+            }
+        }.await;
+
+        let release_by = match result {
+            Ok(()) => deadline.min(Instant::now() + grace),
+            Err(reason) => {
+                // Failure teardown has an independent bound after stage expiry.
+                if self.child.job.terminate().is_err() {
+                    return Err(InstallerFailure {
+                        phase: stage.phase(),
+                        reason,
+                        recovery: StopDisposition::ChargedQuarantine,
+                    });
+                }
+                Instant::now() + grace
+            }
+        };
+        let observed = self
+            .release_evidence(result.is_ok(), result.is_ok(), release_by, verify_release)
+            .await;
+        stage.complete(result, observed, cancel.is_cancelled())?;
+        Ok(BootOutcome::InstallerReleased)
     }
 
     /// Every caller, including a failed boot, must reconcile this owned launch.
@@ -1871,7 +2096,27 @@ impl<'a> NativeLaunch<'a> {
         } else if self.child.job.terminate().is_err() {
             return StopDisposition::ChargedQuarantine;
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        self.release_evidence(
+            observed.guest_shutdown,
+            observed.clean_process_exit,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            verify_release,
+        )
+        .await
+    }
+
+    async fn release_evidence(
+        &mut self,
+        guest_shutdown: bool,
+        clean_process_exit: bool,
+        deadline: tokio::time::Instant,
+        verify_release: impl FnOnce() -> bool,
+    ) -> StopDisposition {
+        let mut observed = StopEvidence {
+            guest_shutdown,
+            clean_process_exit,
+            ..StopEvidence::default()
+        };
         observed.process_exited = self.child.reap(deadline).await.is_ok();
         observed.job_empty = matches!(self.child.job.active(), Ok(0));
         observed.workers_joined = if let Some(workers) = self.workers.take() {
@@ -1879,10 +2124,20 @@ impl<'a> NativeLaunch<'a> {
         } else {
             false
         };
-        observed.artifacts_reopened = observed.process_exited
-            && observed.job_empty
-            && observed.workers_joined
-            && verify_release();
+        observed.verify_release(|| {
+            let in_time = || self.installer.is_none() || tokio::time::Instant::now() < deadline;
+            if !in_time() {
+                return false;
+            }
+            let guards = self
+                .installer_writers
+                .iter()
+                .map(|&index| self._pins[index].reopen_without_writer())
+                .collect::<io::Result<Vec<_>>>();
+            // These guards deny new writers while the bounded generation
+            // identity check runs. A late proof cannot release the slot.
+            guards.is_ok_and(|_guards| in_time() && verify_release() && in_time())
+        });
         observed.disposition()
     }
 }
@@ -2976,6 +3231,19 @@ mod tests {
         assert_eq!(gate.arm(base), Err(NativeRefusal::ReservesUnverified));
     }
 
+    #[test]
+    fn installer_dispatch_cannot_write_cont_at_the_stage_deadline() {
+        let base = std::time::Instant::now();
+        let cutoff = base + Duration::from_millis(10);
+        let gate = DispatchGate::default();
+        set_clock(&gate, base);
+        gate.arm_until(base, Some(cutoff)).unwrap();
+        assert_eq!(gate.current(), Dispatch::Armed(cutoff));
+        set_clock(&gate, cutoff);
+        assert!(!gate.begin_write());
+        assert_eq!(gate.current(), Dispatch::Expired);
+    }
+
     #[tokio::test]
     async fn an_expired_sample_writes_nothing_and_closes_stdin() {
         let base = std::time::Instant::now();
@@ -3087,6 +3355,22 @@ mod tests {
         drop((consumer, pin));
         // Control: without the pin the same rename succeeds.
         std::fs::rename(&disk, &moved).unwrap();
+    }
+
+    #[test]
+    fn installer_release_reopen_excludes_live_and_new_writers() {
+        let (_dir, root) = fixture_root();
+        let disk = format!(r"{root}\disk.qcow2");
+        std::fs::write(&disk, b"candidate").unwrap();
+        let pin = PathPin::open(&LocalPath::parse(&disk).unwrap(), false, true).unwrap();
+        let writer = || OpenOptions::new().read(true).write(true).open(&disk);
+        let live_writer = writer().unwrap();
+        assert!(pin.reopen_without_writer().is_err());
+        drop(live_writer);
+        let guard = pin.reopen_without_writer().unwrap();
+        assert!(writer().is_err());
+        drop(guard);
+        assert!(writer().is_ok());
     }
 
     /// The parent of an exclusive create can be empty, so the nonempty-directory
