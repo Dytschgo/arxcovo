@@ -2786,7 +2786,7 @@ mod tests {
     }
 
     #[test]
-    fn general_and_service_profiles_keep_v4_schema() {
+    fn general_and_service_profiles_keep_activity_schema() {
         for open in [
             super::super::Activity::open,
             super::super::Activity::open_service_fixture,
@@ -2799,7 +2799,7 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), before);
             drop(open(dir.path()).unwrap());
             let db = open_sqlite(&path).unwrap();
-            assert_eq!(count(&db, "PRAGMA user_version", []).unwrap(), 4);
+            assert_eq!(count(&db, "PRAGMA user_version", []).unwrap(), 5);
             assert_eq!(
                 count(
                     &db,

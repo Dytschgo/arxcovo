@@ -19,6 +19,7 @@ pub(crate) struct ToolCache {
     pub(crate) tools: serde_json::Value,
     pub(crate) observed_identity: serde_json::Value,
     pub(crate) observed_at_ms: u64,
+    pub(crate) current_user: bool,
 }
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -163,7 +164,7 @@ impl Activity {
                     [hex::encode(random)],
                 )?;
             }
-            1..=4 => {}
+            1..=5 => {}
             _ => anyhow::bail!("unsupported local state version"),
         }
         read_host_id(&tx)?;
@@ -181,12 +182,12 @@ impl Activity {
         if version < 3 {
             tx.execute_batch("ALTER TABLE activity ADD COLUMN identity_mode TEXT CHECK(identity_mode IS NULL OR (typeof(identity_mode)='text' AND identity_mode IN ('dedicated_account','development_current_user'))) CHECK(identity_mode IS NOT 'development_current_user' OR (observed_kind IS NULL AND observed_id IS NULL AND observed_gid IS NULL AND rights IS NULL AND (elevation IS NULL OR elevation=0) AND (integrity_rid IS NULL OR integrity_rid=8192) AND (observation_point IS NULL OR observation_point='pre_exec') AND (tree_boundary IS NULL OR tree_boundary='windows_job'))); PRAGMA user_version=3;")?;
         }
-        if version < 4 {
+        if version < 5 {
             validate_columns(&tx)?;
             // SQLite cannot widen a CHECK in place. Rebuild transactionally,
             // copying every historical value and the deleted-row sequence.
             tx.execute_batch(
-                "DROP INDEX activity_visibility; ALTER TABLE activity RENAME TO activity_v3;",
+                "DROP INDEX activity_visibility; ALTER TABLE activity RENAME TO activity_previous;",
             )?;
             tx.execute_batch(&schema())?;
             tx.execute_batch("ALTER TABLE activity ADD COLUMN identity_mode TEXT CHECK(identity_mode IS NULL OR (typeof(identity_mode)='text' AND identity_mode IN ('dedicated_account','development_current_user','current_user'))) CHECK(identity_mode NOT IN ('development_current_user','current_user') OR (observed_kind IS NULL AND observed_id IS NULL AND observed_gid IS NULL AND rights IS NULL AND (elevation IS NULL OR elevation=0) AND (integrity_rid IS NULL OR integrity_rid=8192) AND (observation_point IS NULL OR observation_point='pre_exec') AND (tree_boundary IS NULL OR tree_boundary='windows_job')));")?;
@@ -202,7 +203,7 @@ impl Activity {
             ];
             columns.extend(FIELDS.iter().map(|(name, _)| *name));
             let columns = columns.join(",");
-            tx.execute_batch(&format!("INSERT INTO activity({columns}) SELECT {columns} FROM activity_v3; INSERT INTO sqlite_sequence(name,seq) SELECT 'activity',seq FROM sqlite_sequence WHERE name='activity_v3' AND NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='activity'); UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT seq FROM sqlite_sequence WHERE name='activity_v3'),0)) WHERE name='activity'; DROP TABLE activity_v3; PRAGMA user_version=4;"))?;
+            tx.execute_batch(&format!("INSERT INTO activity({columns}) SELECT {columns} FROM activity_previous; INSERT INTO sqlite_sequence(name,seq) SELECT 'activity',seq FROM sqlite_sequence WHERE name='activity_previous' AND NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='activity'); UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT seq FROM sqlite_sequence WHERE name='activity_previous'),0)) WHERE name='activity'; DROP TABLE activity_previous; PRAGMA user_version=5;"))?;
         }
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS delegated_build(
@@ -255,6 +256,7 @@ impl Activity {
                 tools: response["tools"].clone(),
                 observed_identity: response["observed_identity"].clone(),
                 observed_at_ms: observation.1,
+                current_user: response["execution_mode"] == "current_user",
             });
         }
     }
@@ -315,6 +317,21 @@ impl Activity {
     pub fn start_execution(&self, principal: &str, tool: &str, mode: IdentityMode) -> Result<i64> {
         self.start_typed(principal, Tool::parse(tool)?, false, Some(mode))
     }
+
+    pub(crate) fn start_owner_command(&self, metadata: &Metadata) -> Result<i64> {
+        metadata.validate()?;
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO activity(principal,tool,outcome,actor_kind,class,started_at_ms,identity_mode,program,argc)
+             VALUES ('owner','run_command','started','owner','action',?1,'current_user',?2,?3)",
+            params![now_ms()?, metadata.program.map(Program::as_str), metadata.argc],
+        )?;
+        Self::retain_activity(tx)
+    }
     /// Lifecycle records are daemon-only, with a fixed principal.
     pub fn start_lifecycle(&self, event: Lifecycle) -> Result<i64> {
         self.start_typed(
@@ -341,8 +358,12 @@ impl Activity {
             .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
         let tx = db.transaction()?;
         tx.execute("INSERT INTO activity(principal,tool,outcome,actor_kind,class,started_at_ms,identity_mode) VALUES (?1,?2,'started',?3,?4,?5,?6)", params![principal,tool.as_str(),if daemon {"daemon"} else {"agent"},tool.class(),now_ms()?,mode.map(IdentityMode::as_str)])?;
+        Self::retain_activity(tx)
+    }
+
+    fn retain_activity(tx: rusqlite::Transaction<'_>) -> Result<i64> {
         let id = tx.last_insert_rowid();
-        tx.execute_batch("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 200) AND id NOT IN (SELECT activity_id FROM delegated_build); DELETE FROM activity WHERE class<>'read' AND id NOT IN (SELECT id FROM activity WHERE class<>'read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 1000) AND id NOT IN (SELECT activity_id FROM delegated_build);")?;
+        tx.execute_batch("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 200) AND id NOT IN (SELECT activity_id FROM delegated_build); DELETE FROM activity WHERE class<>'read' AND NOT (actor_kind='owner' AND outcome='started') AND id NOT IN (SELECT id FROM activity WHERE class<>'read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 1000) AND id NOT IN (SELECT activity_id FROM delegated_build);")?;
         check_size(&tx)?;
         tx.commit()?;
         Ok(id)
@@ -594,8 +615,6 @@ impl Activity {
 
     /// The authenticated dashboard is an owner reader. This projection has no
     /// MCP principal or audit id and cannot be called through the MCP tool.
-    /// B2 seam: owner-initiated dashboard actions add a typed owner writer
-    /// and its projection here, without relaxing the MCP actor filters.
     pub(crate) fn dashboard_list(
         &self,
         args: &ListActivity,
@@ -633,6 +652,7 @@ impl Activity {
             let actor = match row.get_ref(2)?.as_str()? {
                 "agent" => "agent",
                 "daemon" if name == "arxd" => "system",
+                "owner" if name == "owner" && tool == Tool::RunCommand => "owner",
                 _ => anyhow::bail!("invalid activity actor"),
             };
             result.push(DashboardActivity {
@@ -1250,7 +1270,9 @@ fn schema() -> String {
     r#"CREATE TABLE activity(
     id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(id>0),
     principal TEXT NOT NULL CHECK(typeof(principal)='text' AND length(CAST(principal AS BLOB)) BETWEEN 1 AND 64 AND principal NOT GLOB '*[^a-zA-Z0-9_-]*'),
-    actor_kind TEXT NOT NULL CHECK(actor_kind IN ('agent','daemon') AND (actor_kind<>'daemon' OR principal='arxd')),
+    actor_kind TEXT NOT NULL CHECK(actor_kind IN ('agent','daemon','owner')
+        AND (actor_kind<>'daemon' OR principal='arxd')
+        AND (actor_kind<>'owner' OR (principal='owner' AND tool='run_command' AND class='action'))),
     class TEXT NOT NULL CHECK(class IN ('read','action','lifecycle')),
     tool TEXT NOT NULL CHECK(tool IS NULL OR (typeof(tool)='text' AND tool IN ('list_hosts','list_activity','unknown_tool','run_command','discover_tools','service_start','service_stop'))),
     outcome TEXT NOT NULL CHECK(outcome IS NULL OR (typeof(outcome)='text' AND outcome IN ('started','succeeded','failed','rejected','refused','interrupted'))),

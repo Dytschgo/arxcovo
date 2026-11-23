@@ -56,10 +56,13 @@ false, and report actual current-user match and cleanup. Historical development
 and dedicated activity retain their provenance. Restart persistence is a separate
 check; a successful compile alone is not a completed owner journey.
 
-Opening existing activity state upgrades it to schema version 4. Earlier binaries
-refuse that version. Before upgrading an existing deployment, stop its daemon and
-preserve a private backup of its state directory. To roll back, stop the new daemon
-and restore that backup with the earlier binary; activity written after the backup
+Opening existing activity state upgrades it in place to schema version 5, which
+adds owner dashboard command rows (ADR 0062). The upgrade is forward-only: earlier
+binaries, including those that wrote version 4, refuse version 5, and no downgrade
+path exists. Before upgrading an existing deployment, stop its daemon and preserve
+a private backup of its state directory. That stopped-daemon backup is the rollback
+boundary. To roll back, stop the new daemon and restore the backup with the earlier
+binary; activity written after the backup, including owner dashboard commands,
 will not be present. Do not copy an active SQLite database as the backup. Initial
 current-user verification uses fresh task-owned state rather than owner history.
 
