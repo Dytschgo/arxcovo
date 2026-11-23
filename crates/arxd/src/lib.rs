@@ -8,6 +8,7 @@ mod mcp;
 mod security;
 pub mod service;
 pub mod store;
+pub mod vault;
 pub mod vm;
 
 pub mod cluster;
