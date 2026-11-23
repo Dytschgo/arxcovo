@@ -702,11 +702,17 @@ pub(crate) fn refusal_for(
 ) -> Result<()> {
     if headroom(db)? {
         validate_principal(principal)?;
+        // The v6 audit has fixed refusal codes. Classify cleanup contention
+        // as busy in that audit while returning its specific refusal to callers.
+        let audit_reason = match reason {
+            Refusal::CleanupUnconfirmed => Refusal::Busy,
+            reason => reason,
+        };
         db.execute(
             "INSERT INTO activity(principal,vm,action,started_ms,status,reason,finished_ms,actor,terminal_order)
              VALUES(?1,?2,?3,?4,4,?5,?4,'agent',
                (SELECT coalesce(max(terminal_order),0)+1 FROM activity))",
-            params![principal, vm, action, now, reason as i64],
+            params![principal, vm, action, now, audit_reason as i64],
         )?;
         prune(db)?;
         require_headroom(db)?;
@@ -1352,26 +1358,67 @@ pub(crate) fn settle_clone(
     activity_id: i64,
     pair: PairSlots,
     proof: Option<[ArtifactEvidence; 2]>,
+    before_worker_deadline: bool,
     now: i64,
 ) -> Result<Status> {
-    ensure!(count(db,
-        "SELECT count(*) FROM vm_operations o JOIN vm_instances v ON v.id=o.vm
+    ensure!(
+        pair.disk.generation == pair.vars.generation
+            && pair.disk.role == "disk"
+            && pair.vars.role == "vars",
+        "invalid clone settlement pair"
+    );
+    let (state, expires, receipt) = db.query_row(
+        "SELECT v.state,v.expires_ms,o.status FROM vm_operations o JOIN vm_instances v ON v.id=o.vm
          JOIN vm_generations g ON g.vm_id=v.id
-         WHERE o.activity_id=?1 AND o.action=1 AND o.status=0 AND o.binding_kind='template'
-           AND o.subject_id=v.template AND o.principal=v.principal AND g.id=?2 AND g.active=0 AND v.state=0",
+         WHERE o.activity_id=?1 AND o.action=1 AND o.binding_kind='template'
+           AND o.subject_id=v.template AND o.principal=v.principal AND g.id=?2 AND g.active=0
+           AND (v.state=0 OR v.cleanup_route='staging')",
         params![activity_id, pair.disk.generation],
-    )? == 1, "invalid clone settlement binding");
-    let status = if let Some([disk, vars]) = proof {
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                Status::from_code(row.get(2)?)?,
+            ))
+        },
+    )?;
+    ensure!(
+        receipt == Status::Pending || (state == 4 && receipt == Status::Interrupted),
+        "invalid clone settlement receipt"
+    );
+
+    if let Some([disk, vars]) = proof {
         ensure!(disk.identity != vars.identity, "shared clone artifact");
         for (slot, evidence) in [(pair.disk, disk), (pair.vars, vars)] {
-            created(db, slot)?;
-            identify(db, slot, evidence)?;
+            // A worker that lost the claim can still hand off identity for
+            // its own unpublished slots. Its publication and receipt stay fenced.
+            if state == 4 && evidence_matches(db, slot, evidence, "pending_disposal")? {
+                continue;
+            }
+            if state == 4 {
+                db.execute(
+                    "UPDATE vm_artifacts SET state='created'
+                     WHERE generation_id=?1 AND role=?2 AND object_key=?3
+                       AND state='quarantined' AND file_id IS NULL",
+                    params![slot.generation, slot.role, slot.key],
+                )?;
+            }
+            if !evidence_matches(db, slot, evidence, "identified")? {
+                created(db, slot)?;
+                identify(db, slot, evidence)?;
+            }
         }
+    }
+
+    let status = if state == 0 && expires > now && before_worker_deadline && proof.is_some() {
         activate(db, pair, "active")?;
         settle_operation(db, activity_id, now, Completion::Succeeded)?
     } else {
         abandon_inactive(db, Some(pair.disk.generation))?;
-        settle_operation(db, activity_id, now, Completion::CleanupUnconfirmed)?
+        if receipt == Status::Pending {
+            settle_operation(db, activity_id, now, Completion::CleanupUnconfirmed)?;
+        }
+        Status::Interrupted
     };
     require_headroom(db)?;
     Ok(status)
@@ -1520,9 +1567,9 @@ fn release_staging(db: &Connection, id: i64) -> Result<()> {
 
 pub(crate) fn expiry_claims(db: &Connection, now: i64) -> Result<Vec<ExpiryClaim>> {
     purge_tombstones(db, now)?;
+    claim_staging(db, now)?;
     let mut stmt = db.prepare(
         "SELECT id,cleanup_id FROM vm_instances v WHERE state<>4 AND expires_ms<=?1
-        AND (state<>0 OR NOT EXISTS(SELECT 1 FROM vm_generations WHERE vm_id=v.id))
         ORDER BY expires_ms,id LIMIT 8",
     )?;
     let due = stmt
@@ -1622,7 +1669,24 @@ pub(crate) fn recovery_intents(db: &Connection) -> Result<Vec<RecoveryClaim>> {
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-pub(crate) fn claim_staging(db: &Connection, now: i64) -> Result<()> {
+pub(crate) fn has_failed_clone_cleanup(db: &Connection) -> Result<bool> {
+    Ok(count(
+        db,
+        "SELECT EXISTS(SELECT 1 FROM vm_instances v
+        JOIN vm_generations g ON g.vm_id=v.id WHERE v.cleanup_route='staging')",
+        [],
+    )? != 0)
+}
+
+fn claim_staging(db: &Connection, now: i64) -> Result<()> {
+    // Use the staging route for an unpublished durable clone, including
+    // when its lease became due while the clone worker was still live.
+    db.execute(
+        "UPDATE vm_instances AS v SET state=4,cleanup_route='staging'
+         WHERE state=0 AND expires_ms<=?1
+           AND EXISTS(SELECT 1 FROM vm_generations WHERE vm_id=v.id)",
+        [now],
+    )?;
     let mut stmt = db.prepare(
         "SELECT v.id,v.cleanup_id,coalesce(a.status=0,0)
          FROM vm_instances v LEFT JOIN activity a ON a.id=v.cleanup_id
@@ -1639,6 +1703,14 @@ pub(crate) fn claim_staging(db: &Connection, now: i64) -> Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (vm, old_expiry, pending) in staging {
+        let mut stmt =
+            db.prepare("SELECT id FROM vm_generations WHERE vm_id=?1 AND active=0 LIMIT 2")?;
+        let generations = stmt
+            .query_map([vm], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<Id>>>()?;
+        for generation in generations {
+            abandon_inactive(db, Some(generation))?;
+        }
         let id = activity(db, "arxd", vm, Action::Recover, now)?;
         db.execute(
             "UPDATE vm_instances SET cleanup_id=?2 WHERE id=?1",
@@ -1824,6 +1896,9 @@ pub(crate) fn settle_cleanup(
         return Ok(true);
     };
     let confirmed = confirmed && current.accounted && current.artifacts == work.artifacts;
+    if let Some(vm) = work.kind.vm() {
+        interrupt_pending(db, vm, now, confirmed)?;
+    }
     match work.kind {
         CleanupKind::Build(id) if confirmed => {
             forget_generations(db, id, true)?;
@@ -1836,17 +1911,14 @@ pub(crate) fn settle_cleanup(
             )?;
         }
         CleanupKind::Staging { vm, activity_id } if confirmed => {
-            interrupt_pending(db, vm, now, true)?;
             forget_generations(db, vm, false)?;
             db.execute("DELETE FROM vm_instances WHERE id=?1", [vm])?;
             finish(db, activity_id, Status::Succeeded, now, Some(true))?;
         }
         CleanupKind::Expiry { vm, activity_id } if confirmed => {
-            interrupt_pending(db, vm, now, true)?;
             record_expired(db, ExpiryClaim { vm, activity_id }, now)?;
         }
         CleanupKind::Recovery { vm, activity_id } if confirmed => {
-            interrupt_pending(db, vm, now, true)?;
             record_recovered(db, RecoveryClaim { vm, activity_id }, now)?;
         }
         CleanupKind::Staging { activity_id, .. }

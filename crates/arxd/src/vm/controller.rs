@@ -108,7 +108,9 @@ impl<C: Clock> VmController<C> {
             Err(reason) => return Ok(Admission::Refused(reason)),
             Ok(None) => {}
         }
-        if gate.custody_uncertain && action != Action::Stop {
+        if action != Action::Stop
+            && (gate.custody_uncertain || store::has_failed_clone_cleanup(db)?)
+        {
             if action != Action::Clone
                 && let Err(reason) = target(db, request, now)?
             {
@@ -450,7 +452,9 @@ impl<C: Clock> VmController<C> {
                 subject: Subject::Template(template, digest),
                 action: Action::Clone as i64,
             };
-            match binding.replay(db, now, closed.rejects_fresh())? {
+            match binding.replay(
+                db, now, closed.rejects_fresh() || store::has_failed_clone_cleanup(db)?,
+            )? {
                     Ok(Some(prior)) => return Ok(Ok(CloneAdmission::Existing(prior.operation))),
                     Err(reason) => return Ok(Err(reason)),
                     Ok(None) => {}
@@ -594,7 +598,8 @@ impl<C: Clock> VmController<C> {
                 db,
                 worker.activity_id,
                 slots,
-                proof.filter(|_| clock.monotonic < worker.deadline),
+                proof,
+                clock.monotonic < worker.deadline,
                 utc(clock)?,
             )
         })
@@ -615,6 +620,9 @@ impl<C: Clock> VmController<C> {
             return Ok(Err(Refusal::Shutdown));
         }
         let result = self.store.transact(|db| {
+            if store::has_failed_clone_cleanup(db)? {
+                return Ok(Err(Refusal::Shutdown));
+            }
             store::require_headroom(db)?;
             let now = utc(self.clock.now())?;
             let capacity = match self.policy.host(host, resources) {
@@ -701,31 +709,32 @@ impl<C: Clock> VmController<C> {
             }
             store::purge_tombstones(db, now)?;
             let requested = lease(now, Some(seconds));
-            let row = owned_vm(db, principal, vm)?;
-            let decision = match (row, requested) {
+            let decision = match (owned_vm(db, principal, vm)?, requested) {
                 (_, Err(reason)) => Err(reason),
                 (None, _) if store::expired_status(db, principal, vm)?.is_some() => {
                     Err(Refusal::Expired)
                 }
                 (None, _) => Err(Refusal::NotFound),
-                (Some((state, expires)), _) if state == 4 || expires <= now => {
-                    Err(Refusal::Expired)
-                }
-                (Some(_), _) if closed.custody_uncertain => Err(Refusal::Shutdown),
-                (Some((_, expires)), Ok(end)) if end < expires => Err(Refusal::Invalid),
-                (Some(_), Ok(end)) => {
-                    db.execute(
-                        "UPDATE vm_instances SET expires_ms=?2 WHERE id=?1",
-                        params![vm, end],
-                    )?;
-                    let id = binding
-                        .record(db, now, Some(vm), Some(end))?
-                        .receipt
-                        .activity_id;
-                    store::finish(db, id, Status::Succeeded, now, None)?;
-                    store::require_headroom(db)?;
-                    Ok(end)
-                }
+                (Some(lease), Ok(end)) => match lease.check(now) {
+                    Err(reason) => Err(reason),
+                    Ok(()) if closed.custody_uncertain || store::has_failed_clone_cleanup(db)? => {
+                        Err(Refusal::Shutdown)
+                    }
+                    Ok(()) if end < lease.expires => Err(Refusal::Invalid),
+                    Ok(()) => {
+                        db.execute(
+                            "UPDATE vm_instances SET expires_ms=?2 WHERE id=?1",
+                            params![vm, end],
+                        )?;
+                        let id = binding
+                            .record(db, now, Some(vm), Some(end))?
+                            .receipt
+                            .activity_id;
+                        store::finish(db, id, Status::Succeeded, now, None)?;
+                        store::require_headroom(db)?;
+                        Ok(end)
+                    }
+                },
             };
             if let Err(reason) = decision {
                 store::refusal(db, principal, vm, Action::Extend, now, reason)?;
@@ -862,7 +871,7 @@ impl<C: Clock> VmController<C> {
             Err(TryLockError::WouldBlock) => return Ok(false),
             Err(TryLockError::Poisoned(_)) => anyhow::bail!("VM reaper unavailable"),
         };
-        let (items, mut uncertain) = {
+        let (mut items, mut uncertain) = {
             let mut gate = self
                 .gate
                 .lock()
@@ -870,7 +879,6 @@ impl<C: Clock> VmController<C> {
             gate.custody_uncertain = true;
             self.store.transact(|db| {
                 let now = utc(self.clock.now())?;
-                store::claim_staging(db, now)?;
                 store::expiry_claims(db, now)?;
                 let items = store::cleanup_kinds(db)?
                     .into_iter()
@@ -882,7 +890,7 @@ impl<C: Clock> VmController<C> {
                 Ok((items, store::legacy_cleanup_uncertain(db)?))
             })?
         };
-        sweeps.retain(&items);
+        sweeps.prepare(&mut items);
         for work in items {
             if !sweeps.due(work.kind, self.clock.now().monotonic) {
                 uncertain = true;
@@ -893,7 +901,7 @@ impl<C: Clock> VmController<C> {
                 .store
                 .transact(|db| store::settle_cleanup(db, &work, utc(self.clock.now())?, proved))?;
             uncertain |= !confirmed;
-            sweeps.settle(work.kind, self.clock.now().monotonic, confirmed);
+            sweeps.settle(&work, self.clock.now().monotonic, confirmed);
         }
         self.gate
             .lock()
@@ -980,12 +988,37 @@ fn timeout(operation: &Operation<'_>) -> Result<u64, Refusal> {
     }
 }
 
-fn owned_vm(db: &Connection, principal: &str, vm: Id) -> Result<Option<(i64, i64)>> {
+struct VmLease {
+    state: i64,
+    expires: i64,
+    cleanup_uncertain: bool,
+}
+
+impl VmLease {
+    fn check(&self, now: i64) -> Result<(), Refusal> {
+        if self.cleanup_uncertain {
+            Err(Refusal::CleanupUnconfirmed)
+        } else if self.state == 4 || self.expires <= now {
+            Err(Refusal::Expired)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn owned_vm(db: &Connection, principal: &str, vm: Id) -> Result<Option<VmLease>> {
     Ok(db
         .query_row(
-            "SELECT state,expires_ms FROM vm_instances WHERE id=?1 AND principal=?2",
+            "SELECT state,expires_ms,coalesce(cleanup_route<>'lease',0)
+             FROM vm_instances WHERE id=?1 AND principal=?2",
             params![vm, principal],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok(VmLease {
+                    state: row.get(0)?,
+                    expires: row.get(1)?,
+                    cleanup_uncertain: row.get(2)?,
+                })
+            },
         )
         .optional()?)
 }
@@ -1062,12 +1095,13 @@ fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Tar
         }
         return Ok(Ok(Target::Clone { template, expires }));
     }
-    let Some((state, expires)) = owned_vm(db, request.principal, request.vm)? else {
+    let Some(lease) = owned_vm(db, request.principal, request.vm)? else {
         return Ok(Err(Refusal::NotFound));
     };
-    if state == 4 || expires <= now {
-        return Ok(Err(Refusal::Expired));
+    if let Err(reason) = lease.check(now) {
+        return Ok(Err(reason));
     }
+    let state = lease.state;
     if !matches!(state, 1 | 2)
         || store::count(
             db,

@@ -91,6 +91,10 @@ impl CleanupKind {
             | Self::Recovery { vm: id, .. } => id,
         }
     }
+
+    pub(crate) fn vm(self) -> Option<Id> {
+        (!matches!(self, Self::Build(_))).then(|| self.subject())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,21 +132,38 @@ impl ArtifactCustody for ClosedCustody {
 #[derive(Default)]
 pub(super) struct Sweeps {
     retries: HashMap<CleanupKind, (u32, Instant)>,
+    workers: HashMap<Id, i64>,
 }
 
 impl Sweeps {
-    pub fn retain(&mut self, items: &[CleanupWork]) {
+    pub fn prepare(&mut self, items: &mut [CleanupWork]) {
         self.retries
             .retain(|key, _| items.iter().any(|work| work.kind == *key));
+        self.workers
+            .retain(|vm, _| items.iter().any(|work| work.kind.vm() == Some(*vm)));
+        for work in items {
+            if let Some(vm) = work.kind.vm() {
+                if let Some(worker) = work.pending_worker {
+                    self.workers.insert(vm, worker);
+                } else {
+                    // Caller settlement does not establish worker release.
+                    work.pending_worker = self.workers.get(&vm).copied();
+                }
+            }
+        }
     }
 
     pub fn due(&self, kind: CleanupKind, now: Instant) -> bool {
         self.retries.get(&kind).is_none_or(|(_, next)| now >= *next)
     }
 
-    pub fn settle(&mut self, kind: CleanupKind, now: Instant, confirmed: bool) {
+    pub fn settle(&mut self, work: &CleanupWork, now: Instant, confirmed: bool) {
+        let kind = work.kind;
         if confirmed {
             self.retries.remove(&kind);
+            if let Some(vm) = kind.vm() {
+                self.workers.remove(&vm);
+            }
         } else {
             let attempts = self.retries.get(&kind).map_or(0, |(n, _)| (*n + 1).min(4));
             let delay = Duration::from_secs((5 * (1 << attempts)).min(60));
@@ -206,7 +227,7 @@ pub(crate) mod fixture {
     impl FixtureCustody {
         pub(crate) fn open(root: &Path) -> Result<Self> {
             crate::config::checked_path(root)?;
-            let handle = open(root, true)?;
+            let handle = open(root, true, false)?;
             let directory = identity(&handle, true)?;
             Ok(Self {
                 root: root.to_path_buf(),
@@ -223,7 +244,7 @@ pub(crate) mod fixture {
             use std::io::Write;
             let path = self.path(slot.role, slot.key);
             fs::File::create_new(&path)?.write_all(bytes)?;
-            let file = open(&path, false)?;
+            let file = open(&path, false, true)?;
             Ok(ArtifactEvidence {
                 identity: identity(&file, false)?,
                 directory: self.directory.file,
@@ -234,7 +255,7 @@ pub(crate) mod fixture {
             })
         }
 
-        fn check(&self, slot: &CleanupArtifact) -> Result<bool> {
+        fn check(&self, slot: &CleanupArtifact) -> Result<(FileIdentity, bool)> {
             ensure!(
                 matches!(
                     slot.role.as_str(),
@@ -250,7 +271,7 @@ pub(crate) mod fixture {
                 slot.directory == Some(self.directory.file)
                     && recorded.volume == self.directory.volume
                     && identity(&self.handle, true)? == self.directory
-                    && identity(&open(&self.root, true)?, true)? == self.directory,
+                    && identity(&open(&self.root, true, false)?, true)? == self.directory,
                 "fixture directory changed"
             );
             let path = self.path(&slot.role, slot.key);
@@ -258,31 +279,88 @@ pub(crate) mod fixture {
                 Ok(_) => {
                     crate::config::checked_path(&path)?;
                     ensure!(
-                        identity(&open(&path, false)?, false)? == recorded,
+                        identity(&open(&path, false, true)?, false)? == recorded,
                         "fixture file changed"
                     );
-                    Ok(true)
+                    Ok((recorded, true))
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound && !slot.retain => Ok(false),
+                Err(error) if error.kind() == io::ErrorKind::NotFound && !slot.retain => {
+                    Ok((recorded, false))
+                }
                 Err(error) => Err(error.into()),
             }
         }
 
+        fn prove_absent(&self, identities: &[FileIdentity], deadline: Instant) -> Result<()> {
+            if identities.is_empty() {
+                return Ok(());
+            }
+            // This walk is evidence only. Deletion uses the exact role paths.
+            // Refuse on an incomplete scan, including links or volume changes.
+            let mut directories = vec![self.root.clone()];
+            let mut remaining = 256usize;
+            while let Some(directory) = directories.pop() {
+                ensure!(
+                    Instant::now() < deadline,
+                    "fixture absence deadline exceeded"
+                );
+                crate::config::checked_path(&directory)?;
+                let handle = open(&directory, true, false)?;
+                let directory_id = identity(&handle, true)?;
+                ensure!(
+                    directory_id.volume == self.directory.volume
+                        && (directory != self.root || directory_id == self.directory),
+                    "fixture directory changed"
+                );
+                for entry in fs::read_dir(&directory)? {
+                    ensure!(
+                        remaining > 0 && Instant::now() < deadline,
+                        "fixture absence scan exceeded its budget"
+                    );
+                    remaining -= 1;
+                    let entry = entry?;
+                    let path = entry.path();
+                    let kind = entry.file_type()?;
+                    crate::config::checked_path(&path)?;
+                    if kind.is_dir() {
+                        directories.push(path);
+                    } else if kind.is_file() {
+                        let actual = identity(&open(&path, false, false)?, false)?;
+                        ensure!(
+                            !identities.contains(&actual),
+                            "fixture artifact identity remains reachable"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+
         fn remove(&self, work: &CleanupWork, deadline: Instant) -> Result<()> {
+            let mut missing = Vec::new();
+            let mut disposed = Vec::new();
             for slot in &work.artifacts {
                 ensure!(Instant::now() < deadline, "fixture proof deadline exceeded");
-                self.check(slot)?;
+                let (recorded, present) = self.check(slot)?;
+                if !slot.retain {
+                    disposed.push(recorded);
+                    if !present {
+                        missing.push(recorded);
+                    }
+                }
             }
+            self.prove_absent(&missing, deadline)?;
             for slot in work.artifacts.iter().filter(|slot| !slot.retain) {
                 ensure!(
                     Instant::now() < deadline,
                     "fixture removal deadline exceeded"
                 );
-                if self.check(slot)? {
+                if self.check(slot)?.1 {
                     fs::remove_file(self.path(&slot.role, slot.key))?;
                 }
-                ensure!(!self.check(slot)?, "fixture file still present");
+                ensure!(!self.check(slot)?.1, "fixture file still present");
             }
+            self.prove_absent(&disposed, deadline)?;
             #[cfg(unix)]
             self.handle.sync_all()?;
             Ok(())
@@ -295,12 +373,13 @@ pub(crate) mod fixture {
         }
     }
 
-    fn open(path: &Path, directory: bool) -> io::Result<fs::File> {
+    fn open(path: &Path, directory: bool, exclusive: bool) -> io::Result<fs::File> {
         let mut options = fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
+            let _ = exclusive;
             let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
             options.custom_flags(if directory {
                 flags | libc::O_DIRECTORY
@@ -312,11 +391,16 @@ pub(crate) mod fixture {
         {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::*;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
-            options.share_mode(if directory {
-                FILE_SHARE_READ | FILE_SHARE_WRITE
+            let directory_flag = if directory {
+                FILE_FLAG_BACKUP_SEMANTICS
             } else {
                 0
+            };
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | directory_flag);
+            options.share_mode(if exclusive {
+                0
+            } else {
+                FILE_SHARE_READ | FILE_SHARE_WRITE
             });
         }
         options.open(path)
@@ -502,27 +586,9 @@ mod reaper_tests {
             number: u8,
             publish: bool,
         ) -> (Id, PairSlots) {
-            let (template, pair, proof) = golden;
-            let request = Request {
-                principal: OWNER,
-                request_id: key(NOW, number),
-                vm: [0; 16],
-                disk: disk(),
-                operation: Operation::Clone {
-                    template,
-                    lease_seconds: Some(60),
-                },
-            };
-            let CloneAdmission::Fresh(vm, slots, worker, _) = self
-                .ctl
-                .admit_linked_clone(request, host(), resources(), pair, proof)
-                .unwrap()
-                .unwrap()
-            else {
-                panic!("fresh clone required");
-            };
+            let (vm, slots, worker) = self.reserve_clone(golden, number);
             let roles = [slots.disk, slots.vars];
-            let files = roles.map(|slot| self.custody.stage(slot, b"clone").unwrap());
+            let files = self.stage_clone(slots);
             if publish {
                 assert_eq!(
                     self.ctl
@@ -545,6 +611,44 @@ mod reaper_tests {
                     .unwrap();
             }
             (vm, slots)
+        }
+
+        fn admit_clone(
+            &self,
+            golden: (Id, PairSlots, [ArtifactEvidence; 2]),
+            number: u8,
+        ) -> Result<CloneAdmission, Refusal> {
+            let (template, pair, proof) = golden;
+            let request = Request {
+                principal: OWNER,
+                request_id: key(NOW, number),
+                vm: [0; 16],
+                disk: disk(),
+                operation: Operation::Clone {
+                    template,
+                    lease_seconds: Some(60),
+                },
+            };
+            self.ctl
+                .admit_linked_clone(request, host(), resources(), pair, proof)
+                .unwrap()
+        }
+
+        fn reserve_clone(
+            &self,
+            golden: (Id, PairSlots, [ArtifactEvidence; 2]),
+            number: u8,
+        ) -> (Id, PairSlots, PendingOperation) {
+            let CloneAdmission::Fresh(vm, slots, worker, _) =
+                self.admit_clone(golden, number).unwrap()
+            else {
+                panic!("fresh clone required");
+            };
+            (vm, slots, worker)
+        }
+
+        fn stage_clone(&self, slots: PairSlots) -> [ArtifactEvidence; 2] {
+            [slots.disk, slots.vars].map(|slot| self.custody.stage(slot, b"clone").unwrap())
         }
 
         fn sweep(&self, runtime: &impl ReaperRuntime) {
@@ -646,6 +750,182 @@ mod reaper_tests {
 
     fn offline(_: &CleanupWork) -> Quiesced {
         Quiesced::Offline
+    }
+
+    #[test]
+    fn review_unconfirmed_sweep_settles_the_losing_receipt_once() {
+        let f = Fixture::new();
+        let (vm, slots) = f.clone(f.build(1, true), 2, true);
+        let start = f.worker(vm, 3, Operation::Start);
+        f.ctl.finish(&start, Completion::Succeeded).unwrap();
+        let stop = f.worker(vm, 4, Operation::Stop);
+        let receipt = || {
+            f.ctl
+                .reaper_test_store()
+                .transact(|db| {
+                    Ok(db.query_row(
+                        "SELECT a.status, a.cleanup_confirmed, a.terminal_order,
+                            o.status, o.cleanup_confirmed
+                     FROM activity a JOIN vm_operations o ON o.activity_id=a.id WHERE a.id=?1",
+                        [stop.activity_id()],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, Option<bool>>(1)?,
+                                row.get::<_, Option<i64>>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, Option<bool>>(4)?,
+                            ))
+                        },
+                    )?)
+                })
+                .unwrap()
+        };
+        f.clock.set(NOW + 60_000, 0);
+        f.sweep(&Runtime::new(|_| Quiesced::Unconfirmed));
+        let terminal = receipt();
+        assert!(
+            matches!(terminal, (3, Some(false), Some(_), 3, Some(false))),
+            "{terminal:?}"
+        );
+        f.assert_pair(slots, true);
+        assert_eq!(f.count("SELECT count(*) FROM vm_disk_claims"), 1);
+        f.clock.set(NOW + 60_000, 5);
+        f.sweep(&Runtime::new(|work| {
+            assert_eq!(work.pending_worker, Some(stop.activity_id()));
+            Quiesced::Offline
+        }));
+        assert_eq!(receipt(), terminal);
+        assert!(f.ctl.expired_status(OWNER, vm).unwrap().is_some());
+    }
+
+    #[test]
+    fn review_renamed_file_keeps_the_charge_and_survives_retry() {
+        let f = Fixture::new();
+        let (vm, slots) = f.clone(f.build(1, true), 2, true);
+        let original = f.custody.path(slots.disk.role, slots.disk.key);
+        let sibling = f.root.path().join("unmanaged");
+        fs::create_dir(&sibling).unwrap();
+        let renamed = sibling.join("renamed-disk");
+        fs::rename(&original, &renamed).unwrap();
+        f.clock.set(NOW + 60_000, 0);
+        f.sweep(&Runtime::new(offline));
+        assert_eq!(
+            f.count("SELECT count(*) FROM vm_disk_claims"),
+            1,
+            "rename released the charge"
+        );
+        assert!(f.ctl.expired_status(OWNER, vm).unwrap().is_none());
+        assert_eq!(fs::read(&renamed).unwrap(), b"clone");
+        assert!(f.custody.path(slots.vars.role, slots.vars.key).exists());
+        fs::rename(&renamed, &original).unwrap();
+        f.clock.set(NOW + 60_000, 5);
+        f.sweep(&Runtime::new(offline));
+        f.assert_pair(slots, false);
+        assert!(f.ctl.expired_status(OWNER, vm).unwrap().is_some());
+    }
+
+    #[test]
+    fn review_sweep_claims_due_creating_clone_before_worker_returns() {
+        let f = Fixture::new();
+        let (vm, slots, worker) = f.reserve_clone(f.build(1, true), 2);
+        let proof = f.stage_clone(slots);
+        f.clock.set(NOW + 61_000, 1);
+        assert!(f.clock.now().monotonic < worker.deadline());
+        f.sweep(&Runtime::new(|work| {
+            assert!(matches!(work.kind, CleanupKind::Staging { vm: claimed, .. } if claimed == vm));
+            assert_eq!(work.pending_worker, Some(worker.activity_id()));
+            Quiesced::Unconfirmed
+        }));
+        assert_eq!(
+            f.count("SELECT count(*) FROM vm_instances WHERE cleanup_route='staging'"),
+            1
+        );
+        f.clock.set(NOW, 0);
+        assert_eq!(
+            f.ctl
+                .finish_linked_clone(&worker, slots, Some(proof))
+                .unwrap(),
+            Status::Interrupted
+        );
+        assert_eq!(
+            f.count("SELECT count(*) FROM vm_generations WHERE vm_id IS NOT NULL AND active=1"),
+            0
+        );
+        f.clock.set(NOW, 5);
+        f.sweep(&Runtime::new(offline));
+        assert_eq!(f.count("SELECT count(*) FROM vm_disk_claims"), 0);
+        assert!(f.ctl.expired_status(OWNER, vm).unwrap().is_none());
+        f.assert_pair(slots, false);
+    }
+
+    #[test]
+    fn review_due_clone_cannot_publish_without_a_sweep() {
+        let f = Fixture::new();
+        let (vm, slots, worker) = f.reserve_clone(f.build(1, true), 2);
+        let proof = f.stage_clone(slots);
+        f.clock.set(NOW + 60_000, 1);
+        assert!(f.clock.now().monotonic < worker.deadline());
+        assert_eq!(
+            f.ctl
+                .finish_linked_clone(&worker, slots, Some(proof))
+                .unwrap(),
+            Status::Interrupted
+        );
+        assert_eq!(
+            f.count("SELECT count(*) FROM vm_instances WHERE cleanup_route='staging'"),
+            1
+        );
+        f.sweep(&Runtime::new(offline));
+        f.assert_pair(slots, false);
+        assert!(f.ctl.expired_status(OWNER, vm).unwrap().is_none());
+    }
+
+    #[test]
+    fn review_failed_clone_fences_fresh_admission_without_a_tick() {
+        let f = Fixture::new();
+        let golden = f.build(1, true);
+        let (_, slots, worker) = f.reserve_clone(golden, 2);
+        assert_eq!(
+            f.ctl.finish_linked_clone(&worker, slots, None).unwrap(),
+            Status::Interrupted
+        );
+        assert!(matches!(
+            f.admit_clone(golden, 2),
+            Ok(CloneAdmission::Existing(_))
+        ));
+        assert!(matches!(f.admit_clone(golden, 3), Err(Refusal::Shutdown)));
+        assert_eq!(f.count("SELECT count(*) FROM vm_disk_claims"), 1);
+    }
+
+    #[test]
+    fn review_failed_staging_refusals_distinguish_the_live_lease() {
+        let f = Fixture::new();
+        let (vm, slots, worker) = f.reserve_clone(f.build(1, true), 2);
+        assert_eq!(
+            f.ctl.finish_linked_clone(&worker, slots, None).unwrap(),
+            Status::Interrupted
+        );
+        let change = f.ctl.extend_lease(OWNER, vm, key(NOW, 3), 120).unwrap();
+        let action = f
+            .ctl
+            .admit(
+                Request {
+                    principal: OWNER,
+                    request_id: key(NOW, 4),
+                    vm,
+                    disk: DiskClaim::default(),
+                    operation: Operation::Start,
+                },
+                host(),
+                resources(),
+            )
+            .unwrap();
+        assert_eq!(change, Err(Refusal::CleanupUnconfirmed));
+        assert!(matches!(
+            action,
+            Admission::Refused(Refusal::CleanupUnconfirmed)
+        ));
     }
 
     #[test]
@@ -789,7 +1069,13 @@ mod reaper_tests {
             f.count("SELECT count(*) FROM vm_operations WHERE action IN (2,4) AND status=3"),
             2
         );
-        assert_eq!(f.count("SELECT count(*) FROM vm_operations WHERE script_result='interrupted' AND script_exit_code IS NULL"), 1);
+        assert_eq!(
+            f.count(
+                "SELECT count(*) FROM vm_operations WHERE script_result='interrupted'
+                AND script_exit_code IS NULL AND cleanup_confirmed=0"
+            ),
+            1
+        );
     }
 
     struct Ticks<'a>(&'a TestClock, std::vec::IntoIter<i64>);
