@@ -592,15 +592,18 @@ impl Supervisor {
             .map(|mut jobs| std::mem::take(&mut *jobs))
             .map_err(|_| anyhow::anyhow!("publication settlement unconfirmed"))?;
         tokio::time::timeout_at(deadline, async {
-            let local = self.publisher.stop_all().await;
-            let mut failed = !local;
+            let first = self.publisher.stop_all().await;
+            let mut failed = false;
             while let Some(job) = publish_jobs.join_next().await {
                 failed |= !matches!(job, Ok(Ok(())));
             }
             while let Some(job) = stops.set.join_next().await {
                 failed |= job.is_err();
             }
-            failed |= self.publisher.stop_unconfirmed();
+            // A deferred stop may have confirmed what the first attempt could
+            // not, so the final local state decides.
+            let local = first || self.publisher.stop_all().await;
+            failed |= !local || self.publisher.stop_unconfirmed();
             anyhow::ensure!(!failed, "publication settlement unconfirmed");
             Ok::<_, anyhow::Error>(())
         })
@@ -5179,6 +5182,9 @@ mod tests {
         release.send(()).unwrap();
         until(|| revocations_settled(h.supervisor())).await;
         assert!(!fake.local.load(SeqCst));
+        // The confirmed deferred stop retired the activation, with no reaper
+        // tick and no cleanup worker.
+        assert_eq!(h.supervisor().publisher.registry_len(), 0);
         settle(&h, &a, &vm).await;
         until(|| empty(&h)).await;
 
@@ -5192,6 +5198,118 @@ mod tests {
         assert_eq!(supervisor.publisher.registry_len(), 0);
         assert!(revocations_settled(&supervisor));
         assert!(!fake.local.load(SeqCst));
+    }
+
+    #[tokio::test]
+    async fn every_confirmed_stop_retires_its_activation_at_once() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1200).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+
+        // The publish success transaction fails: the worker's own confirmed
+        // stop retires the activation before any reaper turn.
+        trigger(
+            &h,
+            "CREATE TRIGGER refuse_commit BEFORE UPDATE OF phase ON vm_publication
+             WHEN NEW.phase='published'
+             BEGIN SELECT RAISE(ABORT, 'synthetic publish commit failure'); END;",
+        );
+        let pending = call(&a, "publish_site", args(1210)).await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        until(|| fake.posts.load(SeqCst) == 1).await;
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert!(!fake.local.load(SeqCst));
+        assert_eq!(h.supervisor().publisher.registry_len(), 0);
+        trigger(&h, "DROP TRIGGER refuse_commit");
+        settle(&h, &a, &vm).await;
+        assert_eq!(terminal(&a, &pending).await["state"], "failed");
+
+        // A colliding owner unpublish never reaches a cleanup worker. Its
+        // confirmed deferred stop retires the activation, with no reaper tick.
+        let published = call(&a, "publish_site", args(1211)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert_eq!(h.supervisor().publisher.registry_len(), 1);
+        assert_eq!(
+            call(&a, "unpublish_site", args(1211)).await["reason"],
+            "key_collision"
+        );
+        until(|| !fake.local.load(SeqCst)).await;
+        until(|| revocations_settled(h.supervisor())).await;
+        assert_eq!(h.supervisor().publisher.registry_len(), 0);
+        settle(&h, &a, &vm).await;
+
+        // Shutdown: its first stop fails, then a queued deferred stop
+        // succeeds. The drain checks the final local state.
+        let published = call(&a, "publish_site", args(1212)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let (stop, in_gate, release) = gate();
+        *h.supervisor().publisher.stop_gate.lock().unwrap() = Some(stop);
+        assert_eq!(
+            call(&a, "unpublish_site", args(1212)).await["reason"],
+            "key_collision"
+        );
+        entered(in_gate).await;
+        fake.stop_failures.store(1, SeqCst);
+        let releaser = {
+            let fake = fake.clone();
+            tokio::spawn(async move {
+                // Released only after the drain's first stop has failed.
+                while fake.stop_failures.load(SeqCst) != 0 {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                release.send(()).unwrap();
+            })
+        };
+        let supervisor = h.supervisor().clone();
+        drop(a);
+        h.shutdown().await.unwrap();
+        releaser.await.unwrap();
+        assert_eq!(supervisor.publisher.registry_len(), 0);
+        assert!(!supervisor.publisher.stop_unconfirmed());
+        assert!(revocations_settled(&supervisor));
+        assert!(!fake.local.load(SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_the_first_post_poll_keeps_the_no_submission_proof() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1220).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let (submit, in_gate, release) = gate();
+        *h.supervisor().publisher.submit_gate.lock().unwrap() = Some(submit);
+        let pending = call(&a, "publish_site", args(1230)).await;
+        // Past the pre-submission check, before the POST future is polled.
+        entered(in_gate).await;
+        fake.routes.lock().unwrap().clear();
+        let stop = call(&a, "vm_stop", args(1231)).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        release.send(()).unwrap();
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (
+                &json!("failed"),
+                &json!("origin_unavailable"),
+                &json!("confirmed")
+            ),
+            "{failed}"
+        );
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        // No DNS call of any kind after the marker.
+        assert_eq!(fake.posts.load(SeqCst), 0);
+        assert!(fake.routes.lock().unwrap().is_empty());
+        let start = call(&a, "vm_start", args(1232)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let published = call(&a, "publish_site", args(1233)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let revoke = call(&a, "unpublish_site", args(1234)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        drop(a);
+        h.shutdown().await.unwrap();
     }
 
     #[tokio::test]

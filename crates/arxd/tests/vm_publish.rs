@@ -834,6 +834,67 @@ mod vm {
             }
         }
 
+        /// (owner equals TokenUser, DACL protected, ACE count, inherited ACE count), read by
+        /// name with only READ_CONTROL, so it works while a creating handle denies sharing.
+        fn descriptor_of(path: &Path) -> (bool, bool, u16, usize) {
+            let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let user = token_info(TokenUser);
+            unsafe {
+                let (mut owner, mut dacl, mut descriptor) = (null_mut(), null_mut(), null_mut());
+                assert_eq!(
+                    GetNamedSecurityInfoW(
+                        wide.as_ptr(),
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                        &mut owner,
+                        null_mut(),
+                        &mut dacl,
+                        null_mut(),
+                        &mut descriptor,
+                    ),
+                    0
+                );
+                let owner_is_user = !owner.is_null() && EqualSid(owner, user_sid(&user)) != 0;
+                let (mut control, mut revision) = (0, 0);
+                let protected = !dacl.is_null()
+                    && GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
+                    && control & SE_DACL_PROTECTED != 0;
+                let count = if dacl.is_null() { 0 } else { (*dacl).AceCount };
+                let inherited = (0..count)
+                    .filter(|&index| {
+                        let mut ace = null_mut();
+                        GetAce(dacl, index.into(), &mut ace) != 0
+                            && (*ace.cast::<ACE_HEADER>()).AceFlags & INHERITED_ACE as u8 != 0
+                    })
+                    .count();
+                LocalFree(descriptor);
+                (owner_is_user, protected, count, inherited)
+            }
+        }
+
+        /// The connector creates its config with the private descriptor in the creation call:
+        /// inspected while the creating handle is open and the file is still empty.
+        #[test]
+        fn generated_config_has_its_private_descriptor_at_creation() {
+            let temp = tempfile::Builder::new()
+                .prefix("publish-create-")
+                .tempdir()
+                .unwrap();
+            let root = temp.path();
+            secure(root);
+            assert_secured("creation root", root);
+            let path = root.join("created.yml");
+            let file = super::publish::windows::create_private(&path).unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+            assert_eq!(descriptor_of(&path), (true, true, 1, 0));
+            assert!(crate::security::private(&path).is_ok());
+            drop(file);
+            assert!(
+                super::publish::windows::create_private(&path).is_err(),
+                "creation must be exclusive"
+            );
+        }
+
         /// Secures and verifies every object the fixture created directly under `root`.
         fn secure_children(root: &Path) {
             for entry in fs::read_dir(root).unwrap() {

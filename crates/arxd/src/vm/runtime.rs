@@ -841,6 +841,11 @@ pub(crate) mod publication {
         /// a failed withdrawal and a failed release in one outage still leave
         /// the proof to a later cleanup.
         unsubmitted: Option<String>,
+        /// The VM whose revoked activation was retired by a confirmed stop
+        /// before its publication's cleanup ran, so that cleanup still reports
+        /// the revocation as its cause. Not an activation: it matches no
+        /// unpublish, and that cleanup or the VM's next activation clears it.
+        revoked_retired: Option<Id>,
     }
 
     impl Activations {
@@ -916,6 +921,10 @@ pub(crate) mod publication {
         /// Parks the next unpublish worker before it waits for the slot.
         #[cfg(test)]
         pub(crate) unpublish_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// Parks a publish worker after its pre-submission cancellation check
+        /// and before its DNS POST future is first polled.
+        #[cfg(test)]
+        pub(crate) submit_gate: std::sync::Mutex<Option<FakeGate>>,
         /// Parks a publish worker after its durable possible-POST marker and
         /// before its pre-submission cancellation check.
         #[cfg(test)]
@@ -969,6 +978,9 @@ pub(crate) mod publication {
             activations.issued += 1;
             let generation = activations.issued;
             let token = Shutdown::default();
+            if activations.revoked_retired == Some(vm) {
+                activations.revoked_retired = None;
+            }
             activations.pending = Some(Activation {
                 generation,
                 vm,
@@ -1002,6 +1014,9 @@ pub(crate) mod publication {
             {
                 activations.current = None;
             }
+            if activations.revoked_retired == Some(vm) {
+                activations.revoked_retired = None;
+            }
         }
 
         /// Daemon shutdown after every connector was confirmed stopped.
@@ -1009,6 +1024,7 @@ pub(crate) mod publication {
             let mut activations = self.activations();
             activations.current = None;
             activations.pending = None;
+            activations.revoked_retired = None;
         }
 
         /// A live connector failed its last stop attempt. Only this closes
@@ -1073,10 +1089,12 @@ pub(crate) mod publication {
         }
 
         fn revoked(&self, vm: Id) -> bool {
-            self.activations()
-                .current
-                .as_ref()
-                .is_some_and(|current| current.vm == vm && current.token.is_cancelled())
+            let activations = self.activations();
+            activations.revoked_retired == Some(vm)
+                || activations
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.vm == vm && current.token.is_cancelled())
         }
 
         /// A deferred revocation stop, bound to one activation generation.
@@ -1111,6 +1129,17 @@ pub(crate) mod publication {
             let mut activations = self.activations();
             if activations.unconfirmed == Some(generation) {
                 activations.unconfirmed = None;
+            }
+            // That activation's connector is confirmed stopped and a worker
+            // never restarts it, so its publication's ingress has ended. A
+            // registered generation with no connector yet is kept: its
+            // cancelled worker still settles it.
+            if let Some(current) = activations
+                .current
+                .take_if(|current| current.generation == generation)
+                && current.token.is_cancelled()
+            {
+                activations.revoked_retired = Some(current.vm);
             }
             true
         }
@@ -1317,13 +1346,38 @@ pub(crate) mod publication {
                     };
                 return Err((failure, Evidence::NotSubmitted));
             }
+            #[cfg(test)]
+            let _ = hold(&self.submit_gate).await;
             // An owner revocation does not abandon a submitted POST: it
             // completes or times out, and its acknowledged ID is then removed.
+            // A retirement or shutdown that wins before the POST future is
+            // first polled has positive no-submission evidence; once polled,
+            // the POST stays possible.
+            let polled = std::sync::atomic::AtomicBool::new(false);
+            let create = async {
+                polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                prepared.dns.create(&route).await
+            };
             let id = tokio::select! {
                 biased;
-                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
-                _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
-                result = prepared.dns.create(&route) => result.map_err(map)?,
+                _ = origin.retired.cancelled() => Err(Failure::OriginUnavailable),
+                _ = shutdown.cancelled() => Err(Failure::Cancelled),
+                result = create => Ok(result.map_err(map)?),
+            };
+            let id = match id {
+                Ok(id) => id,
+                Err(cancelled) if polled.load(std::sync::atomic::Ordering::SeqCst) => {
+                    return Err((cancelled, Evidence::Unknown));
+                }
+                Err(cancelled) => {
+                    self.set_unsubmitted(Some(&intent.nonce));
+                    let failure =
+                        match controller.update_publication(&intent.nonce, Update::PostWithdrawn) {
+                            Ok(()) => cancelled,
+                            Err(_) => Failure::CleanupUnconfirmed,
+                        };
+                    return Err((failure, Evidence::NotSubmitted));
+                }
             };
             // The acknowledged ID is durable before verification, so a failed
             // exact lookup can never discard it.

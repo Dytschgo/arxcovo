@@ -158,50 +158,54 @@ fn token_user() -> io::Result<Vec<usize>> {
     Ok(user)
 }
 
-/// Creates `path` exclusively and, before any content is written, makes the
-/// current TokenUser its owner with a protected DACL granting only that user.
-/// The result does not depend on the token's default owner or on inheritance.
-pub(super) fn create_private(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .access_mode(FILE_GENERIC_WRITE | WRITE_DAC | WRITE_OWNER | READ_CONTROL)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    let protected = (|| {
-        let user = token_user()?;
-        // The SID lives in `user`, which outlives every use below.
-        let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-        if unsafe { IsValidSid(sid) } == 0 {
-            return Err(refuse());
-        }
-        let length = size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>()
-            + unsafe { GetLengthSid(sid) } as usize;
-        let mut acl = vec![0usize; length.div_ceil(size_of::<usize>())];
-        let acl = acl.as_mut_ptr().cast::<ACL>();
-        ok(unsafe { InitializeAcl(acl, length as u32, ACL_REVISION) })?;
-        ok(unsafe { AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS, sid) })?;
-        let status = unsafe {
-            SetSecurityInfo(
-                file.as_raw_handle(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION
-                    | DACL_SECURITY_INFORMATION
-                    | PROTECTED_DACL_SECURITY_INFORMATION,
-                sid,
-                null_mut(),
-                acl,
-                null(),
-            )
-        };
-        if status == 0 { Ok(()) } else { Err(refuse()) }
-    })();
-    if let Err(error) = protected {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(error);
+/// Creates `path` exclusively with TokenUser as owner and a protected DACL
+/// granting only that user, in the creation call itself, so no instant exists
+/// with inherited permissions or the token's default owner.
+pub(in crate::vm) fn create_private(path: &Path) -> io::Result<File> {
+    let user = token_user()?;
+    // The SID lives in `user`, which outlives every use below.
+    let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let mut text = null_mut();
+    ok(unsafe { ConvertSidToStringSidW(sid, &mut text) })?;
+    // SDDL SID strings are short and NUL-terminated.
+    let length = (0..256).find(|&index| unsafe { *text.add(index) } == 0);
+    let sid_text = length.map(|length| {
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) })
+    });
+    unsafe { LocalFree(text.cast()) };
+    let sid_text = sid_text.ok_or_else(refuse)?;
+    let sddl = wide(OsStr::new(&format!("O:{sid_text}D:P(A;;FA;;;{sid_text})")));
+    let mut descriptor = null_mut();
+    ok(unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    })?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let handle = unsafe {
+        CreateFileW(
+            wide(path.as_os_str()).as_ptr(),
+            FILE_GENERIC_WRITE,
+            0,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    let created = io::Error::last_os_error();
+    unsafe { LocalFree(descriptor) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(created);
     }
-    Ok(file)
+    Ok(File::from(owned(handle)?))
 }
 
 fn require_owner(file: &File) -> io::Result<()> {
