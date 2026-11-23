@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { budget, eligible, duration, queueMeasurement } from './policy.mjs';
+import { budget, eligible, duration, queueMeasurement, RUST_UBUNTU_RUNNER } from './policy.mjs';
 import { actualRuns } from './fixtures/ci-queue-credit-runs.mjs';
 import { historicalSplitFirstAttempt } from './fixtures/ci-split-first-attempt.mjs';
+import { pinnedRustFirstAttempt } from './fixtures/ci-pinned-rust-first-attempt.mjs';
 test('slow main blocks normal PR and unmeasured speed claims', () => {
   assert.throws(() => budget({ seconds: 901 }, null, false));
   assert.throws(() => budget({ seconds: 901 }, null, true));
@@ -37,8 +38,10 @@ function splitSample(workerSpans = Array(6).fill([0, 400, 500]), gateSpans = Arr
   data.jobs.jobs = ['rust', 'ui', 'verify'].flatMap((phase, phaseIndex) => data.jobs.jobs.map((job, osIndex) => {
     const i = phaseIndex * 3 + osIndex;
     const [c, s, e] = spans[i];
-    return { ...job, id: i + 1, name: job.name.replace('verify', phase),
-      labels: phase === 'verify' ? ['ubuntu-latest'] : job.labels,
+    const name = job.name.replace('verify', phase);
+    let labels = phase === 'verify' ? ['ubuntu-latest'] : job.labels;
+    if (name === 'rust (ubuntu-latest)') labels = [RUST_UBUNTU_RUNNER];
+    return { ...job, id: i + 1, name, labels,
       created_at: iso(c), started_at: iso(s), completed_at: iso(e) };
   }));
   data.jobs.total_count = 9;
@@ -57,14 +60,7 @@ function assertSplitInvalid(data, detail) {
 
 test('early-created nine-job gates are invalid and retain the original 900-second wall rule', () => {
   for (const seconds of [900, 901, 1000]) {
-    const data = sample(undefined, seconds);
-    const original = data.jobs.jobs;
-    data.jobs.jobs = ['rust', 'ui', 'verify'].flatMap((phase, phaseIndex) => original.map((job, osIndex) => ({
-      ...job, id: phaseIndex * 3 + osIndex + 1,
-      name: job.name.replace('verify', phase),
-      labels: phase === 'verify' ? ['ubuntu-latest'] : job.labels,
-    })));
-    data.jobs.total_count = 9;
+    const data = splitSample(undefined, Array(3).fill([0, 400, 500]), seconds);
     const result = measure(data);
     assert.equal(result.seconds, seconds);
     assert.equal(result.credit, 'unavailable:jobs-invalid');
@@ -79,8 +75,10 @@ test('early-created nine-job gates are invalid and retain the original 900-secon
   }
 });
 
-test('historical split metadata simulates prospective exact-nine geometry without retroactive acceptance', () => {
-  const result = measure(historicalSplitFirstAttempt, historicalSplitFirstAttempt.run, 'candidate', 1453422996);
+test('historical split timings retain exact-nine geometry when simulated with the pinned label', () => {
+  const data = structuredClone(historicalSplitFirstAttempt);
+  data.jobs.jobs.find(job => job.name === 'rust (ubuntu-latest)').labels = [RUST_UBUNTU_RUNNER];
+  const result = measure(data, data.run, 'candidate', 1453422996);
   assert.deepEqual([result.seconds, result.queueCreditSeconds, result.chargedSeconds, result.longestJobSeconds, result.credit],
     [949, 165, 784, 441, 'applied']);
   assert.equal(result.jobs.length, 9);
@@ -88,6 +86,19 @@ test('historical split metadata simulates prospective exact-nine geometry withou
   // This is only the new rule's regression geometry. The original run remains held;
   // 784 charged seconds also exceeds the authoritative main's 603 seconds.
   assert.ok(result.chargedSeconds > 603);
+});
+
+test('main run 45267529407 receives idle queue credit for its pinned Rust Ubuntu runner', () => {
+  const result = measure(pinnedRustFirstAttempt);
+  assert.deepEqual([result.seconds, result.queueCreditSeconds, result.chargedSeconds, result.longestJobSeconds, result.credit],
+    [1605, 762, 843, 586, 'applied']);
+  assert.equal(budget(result, null, false), true);
+});
+
+test('the Rust Ubuntu job rejects the unpinned ubuntu-latest label', () => {
+  const data = structuredClone(pinnedRustFirstAttempt);
+  data.jobs.jobs.find(job => job.name === 'rust (ubuntu-latest)').labels = ['ubuntu-latest'];
+  assertSplitInvalid(data, 'unpinned Rust Ubuntu runner');
 });
 
 test('exact-nine geometry retains overlapping waits, pre-creation gaps, no-pending idle and prefix/tail', () => {
