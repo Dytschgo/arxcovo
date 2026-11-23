@@ -2,6 +2,7 @@ use super::{
     paths::{Artifact, ArtifactPin, ArtifactRole, FileIdentity, InvalidPath, LocalPath},
     qemu_img::{CLUSTER, InvalidImage, inspect_header},
     runtime::{InstallerPhase, OfflineLease},
+    static_web::OriginPortLease,
 };
 use serde_json::{Value, json};
 
@@ -26,9 +27,21 @@ impl SerialName {
     }
 }
 
+/// Closed network policy of an installed static boot. Only the restricted
+/// loopback origin exists. An owner-enabled outbound policy would be a
+/// separate variant with its own guest route and DNS transition, never a
+/// change to this one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaticNetwork {
+    /// The fixed restricted user network plus one IPv4 loopback forward to
+    /// guest TCP 443.
+    RestrictedOrigin,
+}
+
 #[derive(Clone, Copy)]
 pub enum BootPurpose<'a> {
     Installed,
+    InstalledStaticWeb(&'a OriginPortLease, StaticNetwork),
     UbuntuInstall {
         iso: &'a Artifact,
         cidata: &'a Artifact,
@@ -46,7 +59,7 @@ pub enum BootPurpose<'a> {
 impl BootPurpose<'_> {
     fn phase(self) -> Option<InstallerPhase> {
         match self {
-            Self::Installed => None,
+            Self::Installed | Self::InstalledStaticWeb(..) => None,
             Self::UbuntuInstall { .. } => Some(InstallerPhase::UbuntuInstall),
             Self::WindowsSetup { .. } => Some(InstallerPhase::WindowsSetup),
             Self::WindowsFinalize => Some(InstallerPhase::WindowsFinalize),
@@ -76,6 +89,8 @@ pub struct BootRecipe<'a> {
 pub enum PlanKind {
     /// The fixed QEMU recipe for an installed disk.
     Boot,
+    /// A standalone static VM with the one reserved IPv4 origin forward.
+    StaticWebBoot,
     /// A QMP-only installer or finalization recipe.
     InstallerBoot(InstallerPhase),
     /// Read-only qemu-img inspection of the immutable golden image.
@@ -96,6 +111,7 @@ pub struct InstallerArtifact<'a> {
 
 enum Binding<'a> {
     Boot,
+    StaticWeb(&'a OriginPortLease),
     Installer(InstallerPhase, Vec<InstallerArtifact<'a>>),
     Inspect,
     Offline {
@@ -127,10 +143,18 @@ impl<'a> CommandPlan<'a> {
     pub fn kind(&self) -> PlanKind {
         match self.binding {
             Binding::Boot => PlanKind::Boot,
+            Binding::StaticWeb(_) => PlanKind::StaticWebBoot,
             Binding::Installer(phase, _) => PlanKind::InstallerBoot(phase),
             Binding::Inspect => PlanKind::Inspect,
             Binding::Offline { mutate: false, .. } => PlanKind::InspectWritable,
             Binding::Offline { mutate: true, .. } => PlanKind::Mutate,
+        }
+    }
+
+    pub fn static_origin_lease(&self) -> Option<&OriginPortLease> {
+        match &self.binding {
+            Binding::StaticWeb(lease) => Some(lease),
+            _ => None,
         }
     }
 
@@ -139,7 +163,9 @@ impl<'a> CommandPlan<'a> {
     pub fn offline_lease(&self) -> Option<&'a OfflineLease> {
         match self.binding {
             Binding::Offline { lease, .. } => Some(lease),
-            Binding::Boot | Binding::Installer(..) | Binding::Inspect => None,
+            Binding::Boot | Binding::StaticWeb(_) | Binding::Installer(..) | Binding::Inspect => {
+                None
+            }
         }
     }
 
@@ -295,19 +321,29 @@ impl BootRecipe<'_> {
             return Err(InvalidPath);
         }
         let phase = self.boot.phase();
-        let disk_role = if phase.is_some() {
-            TestInstallDisk
-        } else {
-            GuestDisk
+        let static_origin = match self.boot {
+            BootPurpose::InstalledStaticWeb(lease, network) if lease.verify() => {
+                Some((lease, network))
+            }
+            BootPurpose::InstalledStaticWeb(..) => return Err(InvalidPath),
+            _ => None,
         };
-        let vars_role = if phase == Some(InstallerPhase::WindowsSetup) {
-            WindowsSetupVars
-        } else {
-            Vars
+        let (disk_role, vars_role) = match (static_origin, phase) {
+            (Some(_), _) => (StaticDisk, StaticVars),
+            (_, Some(InstallerPhase::WindowsSetup)) => (TestInstallDisk, WindowsSetupVars),
+            (_, Some(_)) => (TestInstallDisk, Vars),
+            _ => (GuestDisk, Vars),
         };
-        if phase.is_some() && self.backing.is_some() {
+        if (phase.is_some() || static_origin.is_some()) && self.backing.is_some() {
             return Err(InvalidPath);
         }
+        let network = match static_origin {
+            None => NETWORK.to_owned(),
+            Some((lease, StaticNetwork::RestrictedOrigin)) => format!(
+                "{NETWORK},hostfwd=tcp:127.0.0.1:{}-10.0.2.15:443",
+                lease.port()
+            ),
+        };
         let approved = match (self.backing, self.backing_header) {
             (Some(golden), Some(header)) => {
                 inspect_header(header, None).map_err(|InvalidImage| InvalidPath)?;
@@ -335,9 +371,13 @@ impl BootRecipe<'_> {
             "-mon",
             "chardev=arxqmp,mode=control",
             "-netdev",
-            NETWORK,
+            &network,
             "-device",
-            "virtio-net-pci,netdev=arxnet0",
+            if static_origin.is_some() {
+                "virtio-net-pci,netdev=arxnet0,mac=52:54:00:12:34:56"
+            } else {
+                "virtio-net-pci,netdev=arxnet0"
+            },
             "-device",
             "virtio-serial-pci,id=arxserial",
             "-device",
@@ -405,7 +445,7 @@ impl BootRecipe<'_> {
             Some(self.backing.map_or(Value::Null, |_| json!("golden"))),
         );
         let binding = match phase {
-            None => Binding::Boot,
+            None => static_origin.map_or(Binding::Boot, |(lease, _)| Binding::StaticWeb(lease)),
             Some(phase) => {
                 let mut artifacts = Vec::new();
                 for (artifact, role) in [
@@ -474,7 +514,9 @@ impl BootRecipe<'_> {
                 cd(args, "answer", answer, "arxmedia.0");
                 cd(args, "drivers", drivers, "arxmedia.1");
             }
-            BootPurpose::WindowsFinalize | BootPurpose::Installed => {}
+            BootPurpose::WindowsFinalize
+            | BootPurpose::Installed
+            | BootPurpose::InstalledStaticWeb(..) => {}
         }
         Ok(())
     }

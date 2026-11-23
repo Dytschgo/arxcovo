@@ -76,6 +76,8 @@ pub enum ArtifactRole {
     VarsSeed,
     Vars,
     GuestDisk,
+    StaticDisk,
+    StaticVars,
     Golden,
     TestInstallDisk,
     WindowsSetupVars,
@@ -99,6 +101,8 @@ impl ArtifactRole {
             Self::Vars
                 | Self::WindowsSetupVars
                 | Self::GuestDisk
+                | Self::StaticDisk
+                | Self::StaticVars
                 | Self::TestInstallDisk
                 | Self::Staging
                 | Self::Scratch

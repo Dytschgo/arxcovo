@@ -345,6 +345,15 @@ pub(crate) trait ReaperRuntime {
     /// Invoked only after quiesce returned an owned TEST Job for a lease
     /// expiry. The adapter must revalidate the held Job before using it.
     fn force_reap(&self, work: &CleanupWork, deadline: Instant) -> StopDisposition;
+
+    /// Non-deleting release proof for a committed static generation after an
+    /// interrupted boot. True requires the same independent process, worker
+    /// and Job release proof as [`ReaperRuntime::quiesce`] for this exact VM
+    /// and generation. It grants no artifact authority. Closed by default.
+    fn static_released(&self, vm: super::Id, generation: super::Id, deadline: Instant) -> bool {
+        let _ = (vm, generation, deadline);
+        false
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
