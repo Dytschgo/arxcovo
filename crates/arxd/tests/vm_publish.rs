@@ -335,7 +335,7 @@ mod vm {
                     );
                 }
                 let state = fake.state.lock().unwrap();
-                assert_eq!(state.records, [foreign.clone()]);
+                assert_eq!(state.records, std::slice::from_ref(&foreign));
                 assert_eq!((state.post_count, state.delete_count), (1, 1));
             }
 
