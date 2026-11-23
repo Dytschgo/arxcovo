@@ -19,8 +19,8 @@ mod lifecycle {
     use super::{RecipeError, UbuntuAssets, UbuntuRecipe, ubuntu::DETACHED_HEALTH, windows};
     use crate::vm::{
         ArtifactEvidence, BuildAdmission, BuildRequest, BuildSlots, Clock, CloneAdmission,
-        FailureReason, HostObservation, Id, OperationRef, PairSlots, Refusal, Request, Resources,
-        Status, VmController,
+        FailureReason, HostObservation, Id, OperationRef, PairSlots, PendingOperation, Refusal,
+        Request, Resources, Status, VmController,
         paths::ArtifactPin,
         runtime::{CandidateRuntime, InstallerFailure, NativeRefusal, StopDisposition},
     };
@@ -164,7 +164,10 @@ mod lifecycle {
                     Some(FailureReason::HealthFailed)
                 }
                 Self::Seed(_) => Some(FailureReason::StagingFailed),
-                Self::Media | Self::ChangedPair | Self::Installer { .. } | Self::InstallerDeadline(_) => Some(stage),
+                Self::Media
+                | Self::ChangedPair
+                | Self::Installer { .. }
+                | Self::InstallerDeadline(_) => Some(stage),
                 Self::GeneralizationUnverified => Some(FailureReason::SealFailed),
                 Self::Native(_) | Self::Refused(_) | Self::Store(_) | Self::Interrupted => None,
             }
@@ -352,7 +355,7 @@ mod lifecycle {
             prepare: impl FnOnce(Id) -> Result<Seed, RecipeError>,
         ) -> Result<BuildResult, Failure> {
             let runtime = installer.admit()?;
-            let (slots, worker, mut operation) = match self
+            let admitted = match self
                 .controller
                 .admit_build(spec, self.host, self.resources, |_, pair| {
                     runtime
@@ -366,6 +369,16 @@ mod lifecycle {
                 BuildAdmission::Fresh(slots, worker, operation) => (*slots, worker, operation),
                 BuildAdmission::Existing(operation) => return Ok(BuildResult::Existing(operation)),
             };
+            Self::finish_reserved_build(self.controller, runtime, spec, admitted, prepare)
+        }
+
+        fn finish_reserved_build(
+            controller: &VmController<C>,
+            runtime: &mut dyn TemplateRuntime,
+            spec: BuildRequest<'_>,
+            (slots, worker, mut operation): (BuildSlots, PendingOperation, OperationRef),
+            prepare: impl FnOnce(Id) -> Result<Seed, RecipeError>,
+        ) -> Result<BuildResult, Failure> {
             let seed = prepare(slots.id).map_err(Failure::Seed).and_then(|seed| {
                 if seed.bytes().len() as u64 > spec.transient.staging {
                     return Err(Failure::Refused(Refusal::Disk));
@@ -374,13 +387,13 @@ mod lifecycle {
                 Ok(seed)
             });
             if seed.is_err() {
-                self.controller
+                controller
                     .fail_build(&worker, slots, true)
                     .map_err(Failure::Store)?;
             }
             let seed = seed?;
             let evidence = |entries: &[_]| {
-                self.controller
+                controller
                     .build_evidence(&worker, slots.id, entries)
                     .map_err(Failure::Store)
             };
@@ -451,13 +464,12 @@ mod lifecycle {
                 Ok(golden)
             })();
             if let Err(failure) = &built {
-                self.controller
+                controller
                     .fail_build_with(&worker, slots, false, failure.cause(stage.get()))
                     .map_err(Failure::Store)?;
             }
             let golden = built?;
-            let status = self
-                .controller
+            let status = controller
                 .finish_build(&worker, slots, spec, golden.files.evidence())
                 .map_err(Failure::Store)?;
             if status != Status::Succeeded {
@@ -563,6 +575,258 @@ mod lifecycle {
         })();
         clean(runtime.stop(boot))?;
         checked
+    }
+
+    #[cfg(test)]
+    mod foreground_fixture {
+        use super::*;
+        use crate::vm::{
+            ArtifactSlot,
+            runtime::{InstallerPhase, InstallerStage},
+        };
+        use tokio::time::Instant;
+
+        type WriteSlot<'a> = &'a dyn Fn(ArtifactSlot, &[u8]) -> anyhow::Result<ArtifactEvidence>;
+        type CheckSlot<'a> = &'a dyn Fn(ArtifactSlot, ArtifactEvidence) -> anyhow::Result<()>;
+
+        fn prepare_seed() -> Result<Seed, RecipeError> {
+            let recipe = windows::WindowsRecipe {
+                pins: Some(windows::tests::fixture()),
+            };
+            windows::tests::with_assets(|assets, guest| {
+                Seed::prepare_windows(&recipe, assets, guest)
+            })
+        }
+
+        impl<C: Clock> VmController<C> {
+            pub(crate) fn windows_fixture_digest() -> [u8; 32] {
+                let Seed::Windows(_, prepared) = prepare_seed().expect("fixture recipe") else {
+                    unreachable!("fixture recipe is Windows");
+                };
+                prepared.digest
+            }
+
+            pub(crate) fn finish_windows_fixture_build(
+                &self,
+                spec: BuildRequest<'_>,
+                admitted: (BuildSlots, PendingOperation, OperationRef),
+                write: WriteSlot<'_>,
+                verify: CheckSlot<'_>,
+                remove: CheckSlot<'_>,
+            ) -> anyhow::Result<(PairSlots, [ArtifactEvidence; 2])> {
+                let mut runtime = Runtime {
+                    slots: admitted.0,
+                    write,
+                    verify,
+                    remove,
+                    seed: None,
+                    candidate: None,
+                    verification: None,
+                    sequence: 0,
+                    active: None,
+                };
+                let outcome =
+                    Lifecycle::finish_reserved_build(self, &mut runtime, spec, admitted, |_| {
+                        prepare_seed()
+                    });
+                match outcome {
+                    Ok(BuildResult::Created(golden, _)) => {
+                        Ok((golden.slots, golden.files.evidence()))
+                    }
+                    Err(Failure::Store(error)) => Err(error),
+                    _ => anyhow::bail!("Windows fixture build did not seal"),
+                }
+            }
+        }
+
+        // Uses the MCP fixture's held-file custody and the template lifecycle's
+        // real durable settlement. The boot observations are synthetic.
+        struct Runtime<'a> {
+            slots: BuildSlots,
+            write: WriteSlot<'a>,
+            verify: CheckSlot<'a>,
+            remove: CheckSlot<'a>,
+            seed: Option<ArtifactEvidence>,
+            candidate: Option<Pair>,
+            verification: Option<Pair>,
+            sequence: u8,
+            active: Option<Boot>,
+        }
+
+        impl Runtime<'_> {
+            fn pair(&self, slots: PairSlots, disk: &[u8]) -> Result<Pair, Failure> {
+                Ok(Pair {
+                    disk: (self.write)(slots.disk, disk).map_err(Failure::Store)?,
+                    vars: (self.write)(slots.vars, b"vars").map_err(Failure::Store)?,
+                })
+            }
+
+            fn boot(&mut self, deadline: Instant) -> Result<Boot, Failure> {
+                if Instant::now() >= deadline {
+                    return Err(Failure::Native(NativeRefusal::InstallerDeadlineExpired));
+                }
+                assert!(self.active.is_none());
+                self.sequence += 1;
+                Ok(Boot([self.sequence; 16]))
+            }
+        }
+
+        impl TemplateRuntime for Runtime<'_> {
+            fn stage(
+                &mut self,
+                slots: BuildSlots,
+                _: &BuildRequest<'_>,
+                seed: &[u8],
+            ) -> Result<ArtifactEvidence, Failure> {
+                assert_eq!(slots, self.slots);
+                let held = (self.write)(slots.seed, seed).map_err(Failure::Store)?;
+                self.seed = Some(held);
+                self.candidate = Some(self.pair(slots.pair, b"candidate disk")?);
+                Ok(held)
+            }
+
+            fn install(
+                &mut self,
+                _: BuildSlots,
+                _: Duration,
+            ) -> Result<(Boot, StopDisposition), Failure> {
+                unreachable!("Windows fixture used Ubuntu installer")
+            }
+
+            fn capture_golden(&mut self, slots: PairSlots, _: u64) -> Result<Pair, Failure> {
+                assert!(self.active.is_none());
+                assert_eq!(slots, self.slots.pair);
+                assert!(self.sequence >= 3);
+                let pair = self.candidate.expect("staged candidate");
+                (self.verify)(slots.disk, pair.disk).map_err(Failure::Store)?;
+                (self.verify)(slots.vars, pair.vars).map_err(Failure::Store)?;
+                Ok(pair)
+            }
+
+            fn link(
+                &mut self,
+                golden: &Golden,
+                slot: LinkedSlot,
+                _: u64,
+            ) -> Result<Linked, Failure> {
+                assert_eq!(slot, LinkedSlot::Verification(self.slots.verification));
+                let files = self.pair(self.slots.verification, &golden.files.disk.pin.sha256)?;
+                self.verification = Some(files);
+                Ok(Linked {
+                    slot,
+                    files,
+                    backing: golden.files.disk,
+                })
+            }
+
+            fn boot_detached(&mut self, _: &Linked) -> Result<Boot, Failure> {
+                unreachable!("Windows fixture used Ubuntu detached boot")
+            }
+
+            fn ready(&mut self, _: Boot) -> Result<Readiness, Failure> {
+                unreachable!("Windows fixture used Ubuntu readiness")
+            }
+
+            fn health(
+                &mut self,
+                _: Boot,
+                _: &str,
+                _: u32,
+            ) -> Result<(ScriptStatus, Option<u32>), Failure> {
+                unreachable!("Windows fixture used Ubuntu health")
+            }
+
+            fn stop(&mut self, boot: Boot) -> StopDisposition {
+                assert_eq!(self.active.take(), Some(boot));
+                StopDisposition::CleanRelease
+            }
+
+            fn windows_installer(
+                &mut self,
+                slots: BuildSlots,
+                stage: InstallerStage,
+            ) -> Result<(Boot, InstallerPhase), Failure> {
+                assert_eq!(slots, self.slots);
+                assert!(matches!(
+                    (self.sequence, stage.phase()),
+                    (0, InstallerPhase::WindowsSetup) | (2, InstallerPhase::WindowsFinalize)
+                ));
+                let boot = self.boot(stage.deadline())?;
+                let observed_at = Instant::now();
+                stage
+                    .complete(Ok(()), StopDisposition::CleanRelease, false)
+                    .map_err(|report| Failure::Installer {
+                        report,
+                        observed_at,
+                    })?;
+                Ok((boot, stage.phase()))
+            }
+
+            fn windows_offline_setup_state(
+                &mut self,
+                slots: PairSlots,
+                files: Pair,
+                _: Instant,
+            ) -> Result<windows::OfflineSetupState, Failure> {
+                assert_eq!(self.sequence, 3);
+                assert_eq!(Some(files), self.candidate);
+                assert_eq!(self.capture_golden(slots, u64::MAX)?, files);
+                Ok(windows::OfflineSetupState {
+                    registry: "IMAGE_STATE_GENERALIZE_RESEAL_TO_OOBE".to_owned(),
+                    state_ini: "IMAGE_STATE_GENERALIZE_RESEAL_TO_OOBE".to_owned(),
+                })
+            }
+
+            fn windows_installed(
+                &mut self,
+                target: windows::InstalledTarget,
+                deadline: Instant,
+            ) -> Result<(Boot, Readiness), Failure> {
+                let expected = match self.sequence {
+                    1 => windows::InstalledTarget::Readiness(self.slots.pair),
+                    3 => windows::InstalledTarget::Verification(self.slots.verification),
+                    _ => panic!("Windows fixture boot sequence"),
+                };
+                assert_eq!(target, expected);
+                let boot = self.boot(deadline)?;
+                self.active = Some(boot);
+                Ok((boot, Readiness::ScriptChannel))
+            }
+
+            fn windows_health(
+                &mut self,
+                boot: Boot,
+                script: &str,
+                _: Instant,
+            ) -> Result<(ScriptStatus, Option<u32>), Failure> {
+                assert_eq!(self.active, Some(boot));
+                let phase = if self.sequence == 2 {
+                    "$true"
+                } else {
+                    "$false"
+                };
+                assert!(script.starts_with(&format!("$validation = {phase}\n")));
+                Ok((ScriptStatus::Exited, Some(0)))
+            }
+
+            fn windows_stop(&mut self, boot: Boot, _: Instant) -> StopDisposition {
+                self.stop(boot)
+            }
+
+            fn discard_transients(&mut self, slots: BuildSlots) -> Result<(), Failure> {
+                assert!(self.active.is_none());
+                assert_eq!(slots, self.slots);
+                let verify = self.verification.expect("staged verification pair");
+                for (slot, evidence) in [
+                    (slots.seed, self.seed.expect("staged seed")),
+                    (slots.verification.disk, verify.disk),
+                    (slots.verification.vars, verify.vars),
+                ] {
+                    (self.remove)(slot, evidence).map_err(Failure::Store)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1366,6 +1630,29 @@ mod lifecycle {
             assert_eq!(staging(&f), 0);
         }
 
+        #[test]
+        fn windows_worker_allows_three_hours_plus_preparation_and_settlement() {
+            let before = Instant::now();
+            let f = Fixture::new();
+            let after = Instant::now();
+            let BuildAdmission::Fresh(slots, ubuntu, _) = reserve(&f, spec()).unwrap() else {
+                panic!("expected Ubuntu worker");
+            };
+            f.controller.fail_build(&ubuntu, *slots, true).unwrap();
+            let recipe = hex::encode(windows::catalog_id());
+            let windows = BuildRequest {
+                key: key(3),
+                ..windows_spec(&recipe, &windows_seed())
+            };
+            let BuildAdmission::Fresh(_, worker, _) = reserve(&f, windows).unwrap() else {
+                panic!("expected Windows worker");
+            };
+            let ubuntu_budget = Duration::from_secs(3_900);
+            let windows_budget = Duration::from_secs(11_100);
+            assert!((before + ubuntu_budget..=after + ubuntu_budget).contains(&ubuntu.deadline));
+            assert!((before + windows_budget..=after + windows_budget).contains(&worker.deadline));
+        }
+
         #[tokio::test(start_paused = true)]
         async fn windows_lifecycle_seals_the_generalized_at_rest_pair_and_links_two_stopped_clones()
         {
@@ -1420,14 +1707,9 @@ mod lifecycle {
                 let LinkedSlot::Clone(vm, _) = clone.slot else {
                     panic!("expected clone slot")
                 };
-                assert_eq!(
-                    f.controller
-                        .get_status("fixture", vm)
-                        .unwrap()
-                        .unwrap()
-                        .state,
-                    "stopped"
-                );
+                let status = f.controller.get_status("fixture", vm).unwrap().unwrap();
+                assert_eq!(status.state, "stopped");
+                assert_eq!(status.guest, Some(crate::vm::Guest::WindowsX86_64));
                 assert_eq!(clone.backing, golden.files.disk);
                 assert_eq!(clone.files.vars.pin, golden.files.vars.pin);
                 fs::write(runtime.path("clone.vars"), [nonce as u8]).unwrap();

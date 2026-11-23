@@ -239,7 +239,8 @@ pub(crate) struct Supervisor {
     cancel: Shutdown,
     cursor_key: hmac::Key,
     host_id: Id,
-    recipes: [Option<Recipe>; 2],
+    // Two TEST recipes and the independent A2 web recipe share one page.
+    recipes: [Option<Recipe>; 3],
     native_refusal: NativeRefusal,
     /// The validated native runtime profile, if configured. It only selects
     /// the closed candidate runtime; it never authorizes a launch here.
@@ -301,6 +302,7 @@ impl Supervisor {
             .ok_or_else(|| anyhow::anyhow!("VM supervisor shared before open"))?;
         state.root_pin = Some(pin);
         state.recipes[1] = Some((WEB_RECIPE_ID, None));
+        state.recipes[2] = Some((Controller::windows_recipe_id(), None));
         Ok(supervisor)
     }
 
@@ -312,6 +314,10 @@ impl Supervisor {
         native_refusal: NativeRefusal,
         runtime: Option<VmRuntimeProfile>,
     ) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(
+            !recipe.is_some_and(|(id, _)| id == Controller::windows_recipe_id() || id == WEB_RECIPE_ID),
+            "VM recipe ID conflicts with a built-in entry"
+        );
         let mut secret = [0; 32];
         getrandom::fill(&mut secret).map_err(|_| anyhow::anyhow!("cursor key unavailable"))?;
         let controller = Arc::new(VmController::open(root, policy, clock)?);
@@ -329,7 +335,7 @@ impl Supervisor {
             cancel: Shutdown::default(),
             cursor_key: hmac::Key::new(hmac::HMAC_SHA256, &secret),
             host_id,
-            recipes: [recipe.map(|(id, digest)| (id, Some(digest))), None],
+            recipes: [recipe.map(|(id, digest)| (id, Some(digest))), None, None],
             native_refusal,
             runtime,
             #[cfg(test)]
@@ -1387,17 +1393,34 @@ fn static_row(row: crate::store::vm::static_vm::StaticRow, gate: &Gate) -> Value
 
 fn catalog_row(entry: &crate::vm::CatalogEntry, buildable: bool) -> Outcome<Value> {
     let id = hex::encode(entry.id);
-    Ok(match (entry.kind, entry.recipe.as_deref()) {
-        (1, _) if buildable => json!({"recipe_id":id,"guest":"ubuntu","state":"buildable"}),
-        (1, _) => {
-            json!({"recipe_id":id,"guest":"ubuntu","state":"unqualified","reason":"recipe_unqualified"})
-        }
-        (2, Some(recipe)) => {
-            json!({"template_id":id,"recipe_id":recipe,"guest":"ubuntu","state":"sealed"})
-        }
-        (3, Some(recipe)) => json!({"operation_id":id,"recipe_id":recipe,"state":"building"}),
-        _ => return Err(STATE_UNAVAILABLE),
-    })
+    Ok(
+        match (
+            entry.kind,
+            entry.recipe.as_deref(),
+            entry.guest.map(guest_wire),
+        ) {
+            (1, None, Some(guest)) if buildable => {
+                json!({"recipe_id":id,"guest":guest,"state":"buildable"})
+            }
+            (1, None, Some(guest)) => {
+                json!({"recipe_id":id,"guest":guest,"state":"unqualified","reason":"recipe_unqualified"})
+            }
+            (2, Some(recipe), Some(guest)) => {
+                json!({"template_id":id,"recipe_id":recipe,"guest":guest,"state":"sealed"})
+            }
+            (3, Some(recipe), None) => {
+                json!({"operation_id":id,"recipe_id":recipe,"state":"building"})
+            }
+            _ => return Err(STATE_UNAVAILABLE),
+        },
+    )
+}
+
+fn guest_wire(guest: Guest) -> &'static str {
+    match guest {
+        Guest::UbuntuX86_64 => "ubuntu",
+        Guest::WindowsX86_64 => "windows",
+    }
 }
 
 fn receipt(id: Id, expires: Option<i64>) -> Value {
@@ -1419,10 +1442,7 @@ fn vm_row(status: VmStatus, gate: &Gate, get: bool) -> Value {
         value["template_id"] = json!(hex::encode(template));
     }
     if let Some(guest) = status.guest {
-        value["guest"] = json!(match guest {
-            Guest::UbuntuX86_64 => "ubuntu",
-            Guest::WindowsX86_64 => "windows",
-        });
+        value["guest"] = json!(guest_wire(guest));
     }
     if let Some(expires) = status.expires_at_ms {
         value["expires_at_ms"] = json!(expires);
@@ -1626,6 +1646,10 @@ mod tests {
     };
     const WEB_TRANSIENT: DiskClaim = DiskClaim {
         images: 131_072,
+        ..TRANSIENT
+    };
+    const WINDOWS_TRANSIENT: DiskClaim = DiskClaim {
+        staging: 131_072,
         ..TRANSIENT
     };
 
@@ -2136,6 +2160,7 @@ mod tests {
         script_hold: Option<Arc<Notify>>,
         static_hold: Option<Arc<Notify>>,
         static_fault: Option<StaticFault>,
+        windows_recipe: bool,
         host: HostObservation,
         /// A cancelled build worker reports failure, to witness drain errors.
         fail_cancelled: bool,
@@ -2179,6 +2204,7 @@ mod tests {
                 script_hold: None,
                 static_hold: None,
                 static_fault: None,
+                windows_recipe: false,
                 host: HOST,
                 fail_cancelled: false,
                 failed: false,
@@ -2255,8 +2281,11 @@ mod tests {
                 Work::Build => {
                     let recipe = hex::encode(id);
                     let web = id == WEB_RECIPE_ID;
+                    let windows = id == Controller::windows_recipe_id();
                     let (retained, transient) = if web {
                         (WEB_RETAINED, WEB_TRANSIENT)
+                    } else if windows {
+                        (RETAINED, WINDOWS_TRANSIENT)
                     } else {
                         (RETAINED, TRANSIENT)
                     };
@@ -2307,6 +2336,18 @@ mod tests {
                             retained,
                             transient,
                         };
+                        if windows {
+                            let mut registry = live.lock().unwrap();
+                            let sealed = controller.finish_windows_fixture_build(
+                                spec,
+                                (slots, worker, reference),
+                                &|slot, bytes| artifacts.stage(slot, bytes),
+                                &|slot, proof| artifacts.verify(slot, proof),
+                                &|slot, proof| artifacts.remove(slot, proof),
+                            )?;
+                            registry.templates.insert(slots.id, sealed);
+                            return Ok(());
+                        }
                         let [disk, vars, seed, overlay, verify_vars] = [
                             slots.pair.disk,
                             slots.pair.vars,
@@ -3140,6 +3181,15 @@ mod tests {
             interrupt_on_fatal_accept: bool,
             web: bool,
         ) -> Self {
+            Self::start_configured(fail_cancelled, interrupt_on_fatal_accept, web, |_| {}).await
+        }
+
+        async fn start_configured(
+            fail_cancelled: bool,
+            interrupt_on_fatal_accept: bool,
+            web: bool,
+            configure: impl FnOnce(&mut Fixture),
+        ) -> Self {
             let temp = crate::service::application::tests::private_temp();
             let media = temp.path().join("fixture-media");
             fs::create_dir(&media).unwrap();
@@ -3150,7 +3200,7 @@ mod tests {
                 fail_cancelled,
                 interrupt_on_fatal_accept,
                 web,
-                |_| {},
+                configure,
             )
             .await
         }
@@ -3186,6 +3236,12 @@ mod tests {
             fixture.script_hold = Some(hold_script.clone());
             fixture.fail_cancelled = fail_cancelled;
             configure(&mut fixture);
+            if fixture.windows_recipe {
+                Arc::get_mut(&mut supervisor).unwrap().recipes[2] = Some((
+                    Controller::windows_recipe_id(),
+                    Some(Controller::windows_fixture_digest()),
+                ));
+            }
             supervisor.gate.lock().unwrap().fixture = Some(fixture);
             let (ticks, receiver) = tokio::sync::mpsc::unbounded_channel();
             *supervisor.ticks.lock().unwrap() = Some(TestTicks(receiver));
@@ -4101,6 +4157,90 @@ mod tests {
                 .is_err()
         );
         identity.probe(&lease, identity.name.clone()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_windows_fixture_build_and_clone_keep_guest_kind() {
+        let mut h = Harness::start_configured(false, false, true, |fixture| {
+            fixture.windows_recipe = true;
+        })
+        .await;
+        let client = h.client(0).await;
+        let windows = hex::encode(Controller::windows_recipe_id());
+        let first = call(&client, "vm_catalog", json!({"limit":1})).await;
+        assert_eq!(
+            first["entries"],
+            json!([{"recipe_id":hex::encode(RECIPE.0),"guest":"ubuntu","state":"buildable"}])
+        );
+        let rest = call(
+            &client,
+            "vm_catalog",
+            json!({"cursor":first["next_cursor"]}),
+        )
+        .await;
+        assert_eq!(
+            rest["entries"],
+            json!([
+                {"recipe_id":windows,"guest":"windows","state":"buildable"},
+                {"recipe_id":hex::encode(WEB_RECIPE_ID),"guest":"ubuntu","state":"buildable"},
+            ])
+        );
+        let build_args = json!({"recipe_id":windows,"request_id":key(90)});
+        let build = call(&client, "vm_template_build", build_args.clone()).await;
+        assert_eq!(build["ok"], true);
+        assert_eq!(call(&client, "vm_template_build", build_args).await, build);
+        let before = call(&client, "vm_catalog", json!({})).await;
+        assert_eq!(
+            before["entries"][3],
+            json!({
+                "operation_id":build["operation_id"],"recipe_id":windows,"state":"building"
+            })
+        );
+        h.hold_build.notify_one();
+        let sealed = terminal(&client, &build).await;
+        assert_eq!(sealed["state"], "succeeded", "{sealed}");
+        let template = &sealed["template_id"];
+        assert_eq!(
+            call(&client, "vm_catalog", json!({})).await["entries"][3],
+            json!({
+                "template_id":template,"recipe_id":windows,"guest":"windows","state":"sealed"
+            })
+        );
+        let create = call(
+            &client,
+            "vm_create",
+            json!({"template_id":template,"request_id":key(91)}),
+        )
+        .await;
+        let cloned = terminal(&client, &create).await;
+        let vm = &cloned["vm_id"];
+        let get = json!({"vm_id":vm});
+        let stopped = call(&client, "vm_get", get.clone()).await;
+        assert_eq!(stopped["guest"], "windows");
+        assert_eq!(stopped["state"], "stopped");
+        assert_eq!(stopped["ready"], false);
+        let start = call(
+            &client,
+            "vm_start",
+            json!({"vm_id":vm,"request_id":key(92)}),
+        )
+        .await;
+        assert_eq!(terminal(&client, &start).await["state"], "succeeded");
+        assert_eq!(call(&client, "vm_get", get).await["ready"], true);
+        let script = call(
+            &client,
+            "vm_run_script",
+            json!({
+                "vm_id":vm,"request_id":key(93),"script":"exit 0"
+            }),
+        )
+        .await;
+        h.hold_script.notify_one();
+        assert_eq!(terminal(&client, &script).await["state"], "succeeded");
+        let stop = call(&client, "vm_stop", json!({"vm_id":vm,"request_id":key(94)})).await;
+        assert_eq!(terminal(&client, &stop).await["state"], "succeeded");
+        client.cancel().await.unwrap();
+        h.shutdown().await.unwrap();
     }
 
     #[tokio::test]
