@@ -5,8 +5,9 @@
 use super::{check_size, validate_principal};
 use crate::vm::{
     Action, ArtifactEvidence, ArtifactSlot, BuildRequest, BuildSlots, Completion, ExpiredVm,
-    ExpiryClaim, Guest, Id, OperationRef, OperationStatus, PairSlots, RETRY_WINDOW_MS, Receipt,
-    RecoveryClaim, Refusal, RequestId, ScriptResult, Status, Subject, VmStatus,
+    ExpiryClaim, FailureReason, Guest, Id, OperationRef, OperationStatus, PairSlots,
+    RETRY_WINDOW_MS, Receipt, RecoveryClaim, Refusal, RequestId, ScriptResult, Status, Subject,
+    VmStatus,
     paths::FileIdentity,
     reaper::{CleanupArtifact, CleanupKind, CleanupWork},
 };
@@ -108,7 +109,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 8;
+const VM_SCHEMA_VERSION: u32 = 9;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -306,6 +307,175 @@ ALTER TABLE vm_instances ADD COLUMN dashboard_memory INTEGER CHECK(dashboard_mem
 ALTER TABLE vm_snapshots ADD COLUMN dashboard_created_ms INTEGER CHECK(dashboard_created_ms BETWEEN 0 AND 253402300799999);
 ";
 
+const MIGRATE_V9: &str = "CREATE TABLE activity_v9 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    principal TEXT NOT NULL CHECK(length(CAST(principal AS BLOB)) BETWEEN 1 AND 64
+        AND principal NOT GLOB '*[^a-zA-Z0-9_-]*'),
+    actor TEXT NOT NULL CHECK(actor IN ('agent','daemon')),
+    vm_owner TEXT CHECK(length(CAST(vm_owner AS BLOB)) BETWEEN 1 AND 64
+        AND vm_owner NOT GLOB '*[^a-zA-Z0-9_-]*'),
+    vm BLOB CHECK(length(vm)=16),
+    action INTEGER NOT NULL CHECK(action BETWEEN 1 AND 14),
+    started_ms INTEGER NOT NULL CHECK(started_ms BETWEEN 0 AND 253402300799999),
+    status INTEGER NOT NULL DEFAULT 0 CHECK(status BETWEEN 0 AND 4),
+    reason INTEGER CHECK(reason BETWEEN 1 AND 44),
+    finished_ms INTEGER CHECK(finished_ms BETWEEN 0 AND 253402300799999),
+    terminal_order INTEGER UNIQUE CHECK(terminal_order>0),
+    cleanup_confirmed INTEGER CHECK(cleanup_confirmed IN (0,1)),
+    CHECK(vm IS NOT NULL OR action=11 OR status=4),
+    CHECK(action NOT IN (13,14) OR status=4),
+    CHECK((status=0)=(finished_ms IS NULL)),
+    CHECK((status=0)=(terminal_order IS NULL)),
+    CHECK((status=4)=(reason IS NOT NULL)),
+    CHECK((actor='daemon')=(action IN (7,9,10)) AND (actor='agent' OR principal='arxd')),
+    CHECK((vm_owner IS NOT NULL)=(action IN (7,10)))
+) STRICT;
+INSERT INTO activity_v9
+    SELECT id,principal,actor,vm_owner,CASE WHEN status=4 AND NOT EXISTS(
+        SELECT 1 FROM vm_instances v WHERE v.id=a.vm AND v.principal=a.principal
+        UNION ALL SELECT 1 FROM vm_tombstones t WHERE t.id=a.vm AND t.principal=a.principal
+    ) THEN NULL ELSE vm END,action,started_ms,status,reason,finished_ms,terminal_order,cleanup_confirmed
+    FROM activity a;
+INSERT INTO sqlite_sequence(name,seq) SELECT 'activity_v9',seq FROM sqlite_sequence
+    WHERE name='activity' AND NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='activity_v9');
+UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT seq FROM sqlite_sequence WHERE name='activity'),0))
+    WHERE name='activity_v9';
+DROP TABLE activity;
+ALTER TABLE activity_v9 RENAME TO activity;
+CREATE INDEX activity_principal ON activity(principal,id);
+CREATE UNIQUE INDEX pending_vm ON activity(vm) WHERE status=0 AND (action<=6 OR action=12);
+
+CREATE TABLE vm_operations_v9 (
+    principal TEXT NOT NULL CHECK(length(CAST(principal AS BLOB)) BETWEEN 1 AND 64
+        AND principal NOT GLOB '*[^a-zA-Z0-9_-]*'),
+    request_key BLOB NOT NULL CHECK(length(request_key)=16),
+    operation_id BLOB NOT NULL UNIQUE DEFAULT (randomblob(16)) CHECK(length(operation_id)=16),
+    vm BLOB CHECK(length(vm)=16),
+    action INTEGER NOT NULL CHECK(action BETWEEN 1 AND 6 OR action IN (8,11,12)),
+    activity_id INTEGER NOT NULL UNIQUE CHECK(activity_id>0),
+    valid_through_ms INTEGER NOT NULL CHECK(valid_through_ms>=0),
+    status INTEGER NOT NULL DEFAULT 0 CHECK(status BETWEEN 0 AND 3),
+    lease_end_ms INTEGER CHECK(lease_end_ms BETWEEN 0 AND 253402300799999),
+    binding_kind TEXT NOT NULL DEFAULT 'legacy_vm'
+        CHECK(binding_kind IN ('legacy_vm','vm','template','recipe')),
+    subject_id BLOB CHECK(length(subject_id)=16),
+    recipe_id TEXT CHECK(length(recipe_id) BETWEEN 1 AND 64
+        AND length(recipe_id)=length(CAST(recipe_id AS BLOB))
+        AND recipe_id NOT GLOB '*[^a-z0-9-]*'),
+    recipe_digest BLOB CHECK(length(recipe_digest)=32),
+    request_digest BLOB CHECK(length(request_digest)=32),
+    script_result TEXT CHECK(script_result IN
+        ('legacy','exited','unavailable','timed_out','launch_failed','terminated','interrupted')),
+    script_exit_code INTEGER CHECK(script_exit_code BETWEEN 0 AND 4294967295),
+    cleanup_confirmed INTEGER CHECK(cleanup_confirmed IN (0,1))
+        CHECK(cleanup_confirmed IS NULL OR status BETWEEN 1 AND 3),
+    failure_reason INTEGER CHECK(failure_reason BETWEEN 1 AND 11)
+        CHECK(failure_reason IS NULL OR status IN (2,3)),
+    CHECK(action<>8 OR lease_end_ms IS NOT NULL),
+    CHECK(lease_end_ms IS NULL OR action IN (1,8)),
+    CHECK((action=11)=(vm IS NULL)),
+    CHECK((action=11)=(binding_kind='recipe')),
+    CHECK((binding_kind IN ('vm','template'))=(subject_id IS NOT NULL)),
+    CHECK((binding_kind='recipe')=(recipe_id IS NOT NULL)
+        AND (binding_kind='recipe')=(recipe_digest IS NOT NULL)),
+    CHECK(binding_kind NOT IN ('vm','template') OR (action IN (1,12))=(binding_kind='template')),
+    CHECK(binding_kind<>'vm' OR subject_id=vm),
+    CHECK((binding_kind='template')=(request_digest IS NOT NULL)),
+    CHECK(action=2 OR script_result IS NULL),
+    CHECK(action<>2 OR status=0 OR script_result IS NOT NULL),
+    CHECK(script_result IS NULL OR status<>0 OR script_result='legacy'),
+    CHECK((script_result IS 'exited')=(script_exit_code IS NOT NULL)),
+    PRIMARY KEY(principal,request_key)
+) STRICT, WITHOUT ROWID;
+INSERT INTO vm_operations_v9
+    SELECT principal,request_key,operation_id,vm,action,activity_id,valid_through_ms,status,
+        lease_end_ms,binding_kind,subject_id,recipe_id,recipe_digest,request_digest,
+        script_result,script_exit_code,cleanup_confirmed,CASE
+    WHEN status=3 AND cleanup_confirmed=0 THEN 11
+    WHEN status=3 AND action=2 THEN 9 END FROM vm_operations;
+DROP TABLE vm_operations;
+ALTER TABLE vm_operations_v9 RENAME TO vm_operations;
+
+CREATE TABLE vm_state_host (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    id BLOB NOT NULL UNIQUE CHECK(length(id)=16)
+) STRICT;
+INSERT INTO vm_state_host VALUES(1,randomblob(16));
+
+CREATE TABLE vm_static_instances (
+    id BLOB PRIMARY KEY CHECK(length(id)=16),
+    name TEXT NOT NULL UNIQUE CHECK(length(name) BETWEEN 1 AND 63
+        AND length(name)=length(CAST(name AS BLOB))
+        AND name NOT GLOB '*[^a-z0-9-]*' AND name NOT GLOB '-*' AND name NOT GLOB '*-'),
+    principal TEXT NOT NULL CHECK(length(CAST(principal AS BLOB)) BETWEEN 1 AND 64
+        AND principal NOT GLOB '*[^a-zA-Z0-9_-]*'),
+    host BLOB NOT NULL REFERENCES vm_state_host(id) CHECK(length(host)=16),
+    template BLOB NOT NULL CHECK(length(template)=16),
+    source_generation BLOB NOT NULL CHECK(length(source_generation)=16),
+    recipe_digest BLOB NOT NULL CHECK(length(recipe_digest)=32),
+    disk_digest BLOB NOT NULL CHECK(length(disk_digest)=32),
+    vars_digest BLOB NOT NULL CHECK(length(vars_digest)=32),
+    state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 4),
+    persistent INTEGER NOT NULL CHECK(persistent>0),
+    staging INTEGER NOT NULL CHECK(staging>=0),
+    CHECK(state NOT IN (1,2) OR staging=0)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX vm_static_owner ON vm_static_instances(principal,id);
+-- The exclusive store pins these rows to this host. Provenance is deliberately
+-- not an FK. Pending copies hold their existing source through admission.
+CREATE TABLE vm_generations_v9 (
+    id BLOB PRIMARY KEY CHECK(length(id)=16),
+    build_id BLOB REFERENCES vm_build_intents(id),
+    vm_id BLOB REFERENCES vm_instances(id),
+    static_id BLOB REFERENCES vm_static_instances(id),
+    generation INTEGER NOT NULL CHECK(generation>0),
+    active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
+    CHECK((build_id IS NOT NULL)+(vm_id IS NOT NULL)+(static_id IS NOT NULL)=1),
+    UNIQUE(build_id,generation),
+    UNIQUE(vm_id,generation),
+    UNIQUE(static_id,generation)
+) STRICT, WITHOUT ROWID;
+INSERT INTO vm_generations_v9(id,build_id,vm_id,generation,active)
+    SELECT id,build_id,vm_id,generation,active FROM vm_generations;
+DROP TABLE vm_generations;
+ALTER TABLE vm_generations_v9 RENAME TO vm_generations;
+CREATE UNIQUE INDEX vm_active_build_generation ON vm_generations(build_id) WHERE active=1;
+CREATE UNIQUE INDEX vm_active_instance_generation ON vm_generations(vm_id) WHERE active=1;
+CREATE UNIQUE INDEX vm_active_static_generation ON vm_generations(static_id) WHERE active=1;
+
+CREATE TABLE vm_artifacts_v9 (
+    generation_id BLOB NOT NULL REFERENCES vm_generations(id),
+    role TEXT NOT NULL CHECK(role IN ('disk','vars','seed','verification_overlay','static_disk','static_vars')),
+    object_key BLOB NOT NULL UNIQUE CHECK(length(object_key)=16),
+    state TEXT NOT NULL CHECK(state IN
+        ('planned','created','identified','sealed','active','pending_disposal','quarantined')),
+    volume_id BLOB CHECK(length(volume_id)=8),
+    directory_id BLOB CHECK(length(directory_id) IN (8,16)),
+    file_id BLOB CHECK(length(file_id) IN (8,16)),
+    content_digest BLOB CHECK(length(content_digest)=32),
+    bytes INTEGER CHECK(bytes>0),
+    CHECK((volume_id IS NULL)=(directory_id IS NULL)
+        AND (volume_id IS NULL)=(file_id IS NULL)),
+    CHECK(state NOT IN ('identified','sealed','active') OR file_id IS NOT NULL),
+    CHECK(state<>'sealed' OR (content_digest IS NOT NULL AND bytes IS NOT NULL)),
+    PRIMARY KEY(generation_id,role)
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO vm_artifacts_v9 SELECT * FROM vm_artifacts;
+DROP TABLE vm_artifacts;
+ALTER TABLE vm_artifacts_v9 RENAME TO vm_artifacts;
+
+CREATE TRIGGER vm_test_disjoint BEFORE INSERT ON vm_instances
+    WHEN EXISTS(SELECT 1 FROM vm_static_instances WHERE id=NEW.id)
+    BEGIN SELECT RAISE(ABORT,'occupied VM identity'); END;
+CREATE TRIGGER vm_static_disjoint BEFORE INSERT ON vm_static_instances
+    WHEN EXISTS(SELECT 1 FROM vm_instances WHERE id=NEW.id)
+      OR EXISTS(SELECT 1 FROM vm_tombstones WHERE id=NEW.id)
+    BEGIN SELECT RAISE(ABORT,'occupied VM identity'); END;";
+
+#[path = "vm_static.rs"]
+pub(crate) mod static_vm;
+
 pub(crate) struct VmStore {
     db: Mutex<Connection>,
     _database: fs::File,
@@ -355,7 +525,7 @@ impl VmStore {
         check_size(&db)?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
-            matches!(version, 0 | 5 | 6 | 7 | VM_SCHEMA_VERSION),
+            matches!(version, 0 | 5 | 6 | 7 | 8 | VM_SCHEMA_VERSION),
             "unsupported VM state version"
         );
         let replace = matches!(version, 0 | 5);
@@ -367,9 +537,8 @@ impl VmStore {
         // SQLite's table replacement procedure suspends FK enforcement on this
         // connection so the original activity name can retain its dependents.
         // Validate every FK before publishing the replacement and restore
-        // enforcement before handing the connection to any caller. The v7
-        // column addition replaces no table and keeps enforcement on.
-        if replace {
+        // enforcement before handing the connection to any caller.
+        if upgrade {
             db.pragma_update(None, "foreign_keys", false)?;
         }
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -390,8 +559,11 @@ impl VmStore {
         if version < 7 {
             tx.execute_batch(MIGRATE_V7)?;
         }
-        if upgrade {
+        if version < 8 {
             tx.execute_batch(MIGRATE_V8)?;
+        }
+        if upgrade {
+            tx.execute_batch(MIGRATE_V9)?;
         }
         recover(&tx, now)?;
         check_size(&tx)?;
@@ -408,7 +580,7 @@ impl VmStore {
             tx.pragma_update(None, "user_version", VM_SCHEMA_VERSION)?;
         }
         tx.commit()?;
-        if replace {
+        if upgrade {
             db.pragma_update(None, "foreign_keys", true)?;
         }
         Ok(Self {
@@ -799,7 +971,8 @@ pub(crate) fn activity(
     db.execute(
         "INSERT INTO activity(principal,vm,action,started_ms,actor,vm_owner)
          VALUES(?1,?2,?3,?4,?5,CASE WHEN ?3 IN (7,10)
-         THEN (SELECT principal FROM vm_instances WHERE id=?2) END)",
+         THEN coalesce((SELECT principal FROM vm_instances WHERE id=?2),
+            (SELECT principal FROM vm_static_instances WHERE id=?2)) END)",
         params![
             principal,
             vm,
@@ -839,17 +1012,27 @@ pub(crate) fn refusal_for(
 ) -> Result<()> {
     if headroom(db)? {
         validate_principal(principal)?;
-        // The v6 audit has fixed refusal codes. Classify cleanup contention
-        // as busy in that audit while returning its specific refusal to callers.
-        let audit_reason = match reason {
-            Refusal::CleanupUnconfirmed => Refusal::Busy,
-            reason => reason,
+        let vm = match vm {
+            Some(id)
+                if count(
+                    db,
+                    "SELECT EXISTS(
+                SELECT 1 FROM vm_instances WHERE id=?1 AND principal=?2
+                UNION ALL SELECT 1 FROM vm_static_instances WHERE id=?1 AND principal=?2
+                UNION ALL SELECT 1 FROM vm_tombstones WHERE id=?1 AND principal=?2
+            )",
+                    params![id, principal],
+                )? != 0 =>
+            {
+                Some(id)
+            }
+            _ => None,
         };
         db.execute(
             "INSERT INTO activity(principal,vm,action,started_ms,status,reason,finished_ms,actor,terminal_order)
              VALUES(?1,?2,?3,?4,4,?5,?4,'agent',
                (SELECT coalesce(max(terminal_order),0)+1 FROM activity))",
-            params![principal, vm, action, now, audit_reason as i64],
+            params![principal, vm, action, now, reason as i64],
         )?;
         prune(db)?;
         require_headroom(db)?;
@@ -864,7 +1047,7 @@ pub(crate) fn finish(
     now: i64,
     cleanup: Option<bool>,
 ) -> Result<()> {
-    finish_with_script(db, id, status, now, cleanup, None)
+    finish_with_script(db, id, status, now, cleanup, None, None)
 }
 
 fn finish_with_script(
@@ -874,6 +1057,7 @@ fn finish_with_script(
     now: i64,
     cleanup: Option<bool>,
     script: Option<ScriptResult>,
+    failure: Option<FailureReason>,
 ) -> Result<()> {
     ensure!(
         db.execute(
@@ -896,9 +1080,18 @@ fn finish_with_script(
         "UPDATE vm_operations SET status=?2,script_result=CASE
             WHEN action=2 AND binding_kind='vm' AND ?2=3 THEN 'interrupted'
             ELSE coalesce(?3,script_result) END,script_exit_code=?4,
-            cleanup_confirmed=?5
+            cleanup_confirmed=?5,failure_reason=coalesce(?6,CASE
+                WHEN ?2=3 AND ?5=0 THEN 11
+                WHEN ?2=3 AND action=2 THEN 9 END)
          WHERE activity_id=?1",
-        params![id, status.code(), result, code, cleanup],
+        params![
+            id,
+            status.code(),
+            result,
+            code,
+            cleanup,
+            failure.map(|reason| reason as i64)
+        ],
     )?;
     prune(db)
 }
@@ -964,7 +1157,8 @@ impl Binding<'_> {
                             }
                             (Subject::Recipe(id, digest), "recipe") => {
                                 row.get::<_, Option<String>>(9)?.as_deref() == Some(id)
-                                    && row.get::<_, Option<[u8; 32]>>(10)? == Some(digest)
+                                    && (digest.is_none()
+                                        || row.get::<_, Option<[u8; 32]>>(10)? == digest)
                             }
                             _ => false,
                         };
@@ -1037,7 +1231,8 @@ impl Binding<'_> {
                 (kind, (kind == "vm").then_some(id), None, None, None)
             }
             Subject::Template(id, digest) => ("template", Some(id), Some(digest), None, None),
-            Subject::Recipe(id, digest) => ("recipe", None, None, Some(id), Some(digest)),
+            Subject::Recipe(id, Some(digest)) => ("recipe", None, None, Some(id), Some(digest)),
+            Subject::Recipe(_, None) => anyhow::bail!("missing recipe evidence for new operation"),
         };
         let id = db.query_row(
             "INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,valid_through_ms,
@@ -1071,11 +1266,11 @@ pub(crate) fn operation_status(
             // Only immutable ledger evidence names a template. A legacy clone
             // bound to a reusable VM ID has none, so its receipt omits it.
             "SELECT o.action,o.status,o.vm,o.recipe_id,
-                CASE WHEN o.action=1 AND o.binding_kind='template' THEN o.subject_id
+                CASE WHEN o.action IN (1,12) AND o.binding_kind='template' THEN o.subject_id
                     WHEN o.action=11 AND o.status=1 THEN (SELECT b.template_id FROM vm_build_intents b
                         WHERE b.state='sealed' AND b.recipe_id=o.recipe_id
                             AND b.recipe_digest=o.recipe_digest) END,
-                o.lease_end_ms,o.script_result,o.script_exit_code,o.cleanup_confirmed
+                o.lease_end_ms,o.script_result,o.script_exit_code,o.cleanup_confirmed,o.failure_reason
          FROM vm_operations o
          WHERE o.principal=?1 AND o.operation_id=?2 AND (o.status=0 OR o.valid_through_ms>=?3)",
             params![principal, operation, now],
@@ -1091,6 +1286,7 @@ pub(crate) fn operation_status(
                     6 => ("restore", Some("queued")),
                     8 => ("extend", None),
                     11 => ("template_build", Some("staging")),
+                    12 => ("static_create", Some("cloning")),
                     _ => return Err(rusqlite::Error::InvalidQuery),
                 };
                 let script = match row.get::<_, Option<String>>(6)?.as_deref() {
@@ -1113,13 +1309,14 @@ pub(crate) fn operation_status(
                     cleanup,
                     vm: row.get(2)?,
                     recipe: row.get(3)?,
-                    template: if matches!(action, "create" | "template_build") {
+                    template: if matches!(action, "create" | "template_build" | "static_create") {
                         row.get(4)?
                     } else {
                         None
                     },
                     expires_at_ms: row.get(5)?,
                     script,
+                    failure: row.get::<_, Option<i64>>(9)?.map(FailureReason::from_code).transpose()?,
                 })
             },
         )
@@ -1171,6 +1368,7 @@ pub(crate) fn vm_status_rows(
             expired_at_ms: None,
             cleanup,
             snapshots: [],
+            cleanup_activity: None,
         })
     })?;
     Ok(items.collect::<rusqlite::Result<_>>()?)
@@ -1181,7 +1379,9 @@ pub(crate) fn disk_bytes(db: &Connection) -> Result<Option<u64>> {
         "SELECT bytes FROM vm_templates
         UNION ALL SELECT persistent FROM vm_disk_claims
         UNION ALL SELECT staging FROM vm_disk_claims
-        UNION ALL SELECT staging_bytes FROM vm_build_intents",
+        UNION ALL SELECT staging_bytes FROM vm_build_intents
+        UNION ALL SELECT persistent FROM vm_static_instances
+        UNION ALL SELECT staging FROM vm_static_instances",
     )?;
     let mut rows = stmt.query([])?;
     let mut total = 0u64;
@@ -1473,10 +1673,29 @@ pub(crate) fn cancel_untouched_build(
         forget_generation(db, generation)?;
     }
     db.execute("DELETE FROM vm_build_intents WHERE id=?1", [slots.id])?;
-    finish(db, activity_id, Status::Failed, now, Some(true))
+    finish_with_script(
+        db,
+        activity_id,
+        Status::Failed,
+        now,
+        Some(true),
+        None,
+        Some(FailureReason::Cancelled),
+    )
 }
 
 pub(crate) fn abandon_build(db: &Connection, id: Id, activity_id: i64, now: i64) -> Result<()> {
+    abandon_build_with(db, id, activity_id, now, None)
+}
+
+/// As [`abandon_build`], recording the worker's proven cause.
+pub(crate) fn abandon_build_with(
+    db: &Connection,
+    id: Id,
+    activity_id: i64,
+    now: i64,
+    cause: Option<FailureReason>,
+) -> Result<()> {
     ensure!(count(db,
         "SELECT count(*) FROM vm_build_intents WHERE id=?1 AND state='pending'
          AND operation_id=(SELECT operation_id FROM vm_operations WHERE activity_id=?2 AND status=0)",
@@ -1487,9 +1706,19 @@ pub(crate) fn abandon_build(db: &Connection, id: Id, activity_id: i64, now: i64)
         abandon_inactive(db, Some(generation?))?;
     }
     classify_abandoned_builds(db, Some(id))?;
-    finish(db, activity_id, Status::Interrupted, now, Some(false))
+    finish_with_script(
+        db,
+        activity_id,
+        Status::Interrupted,
+        now,
+        Some(false),
+        None,
+        cause,
+    )
 }
 
+/// Settle a linked clone, recording the worker's proven cause when it
+/// supplies no publishable pair.
 pub(crate) fn settle_clone(
     db: &Connection,
     activity_id: i64,
@@ -1497,6 +1726,7 @@ pub(crate) fn settle_clone(
     proof: Option<[ArtifactEvidence; 2]>,
     before_worker_deadline: bool,
     now: i64,
+    cause: Option<FailureReason>,
 ) -> Result<Status> {
     ensure!(
         pair.disk.generation == pair.vars.generation
@@ -1553,7 +1783,15 @@ pub(crate) fn settle_clone(
     } else {
         abandon_inactive(db, Some(pair.disk.generation))?;
         if receipt == Status::Pending {
-            settle_operation(db, activity_id, now, Completion::CleanupUnconfirmed)?;
+            let cause = cause.filter(|_| proof.is_none());
+            settle_with_script(
+                db,
+                activity_id,
+                now,
+                Completion::CleanupUnconfirmed,
+                None,
+                cause,
+            )?;
         }
         Status::Interrupted
     };
@@ -1567,7 +1805,7 @@ fn abandon_inactive(db: &Connection, generation: Option<Id>) -> Result<()> {
     db.execute(
         "UPDATE vm_artifacts SET state=CASE WHEN state='identified' THEN 'pending_disposal' ELSE 'quarantined' END
          WHERE state IN ('planned','created','identified') AND generation_id IN
-            (SELECT id FROM vm_generations WHERE active=0 AND (?1 IS NULL OR id=?1))",
+            (SELECT id FROM vm_generations WHERE active=0 AND static_id IS NULL AND (?1 IS NULL OR id=?1))",
         [generation],
     )?;
     Ok(())
@@ -1578,6 +1816,7 @@ pub(crate) fn recover(db: &Connection, now: i64) -> Result<()> {
     purge_tombstones(db, now)?;
     abandon_inactive(db, None)?;
     classify_abandoned_builds(db, None)?;
+    static_vm::recover(db, now)?;
     db.execute("UPDATE vm_instances SET state=4 WHERE state=0", [])?;
     let mut stmt = db.prepare(
         "SELECT id FROM vm_instances WHERE state IN (1,2)
@@ -1590,7 +1829,7 @@ pub(crate) fn recover(db: &Connection, now: i64) -> Result<()> {
         begin_recovery(db, vm, now)?;
     }
     let mut stmt = db.prepare(
-        "SELECT id FROM activity WHERE status=0 AND (action<=6 OR action=11) ORDER BY id LIMIT ?1",
+        "SELECT id FROM activity WHERE status=0 AND (action<=6 OR action IN (11,12)) ORDER BY id LIMIT ?1",
     )?;
     let pending = stmt
         .query_map([MAX_CALLER_PENDING], |row| row.get(0))?
@@ -1628,16 +1867,22 @@ pub(crate) fn settle_operation(
     now: i64,
     completion: Completion,
 ) -> Result<Status> {
-    settle_with_script(db, id, now, completion, None)
+    settle_with_script(db, id, now, completion, None, None)
 }
 
+/// Settle a VM worker. `cause` is the worker's proven, closed failure cause;
+/// it is recorded independently of whether release is proven.
 pub(crate) fn settle_with_script(
     db: &Connection,
     id: i64,
     now: i64,
     completion: Completion,
     script: Option<ScriptResult>,
+    cause: Option<FailureReason>,
 ) -> Result<Status> {
+    if let Some(status) = static_vm::settle_operation(db, id, now, completion, script, cause)? {
+        return Ok(status);
+    }
     let (vm, action, state, expires_ms): (Id, i64, i64, i64) = db.query_row(
         "SELECT a.vm,a.action,v.state,v.expires_ms FROM activity a JOIN vm_instances v ON a.vm=v.id
          WHERE a.id=?1 AND a.status=0 AND a.action<=6",
@@ -1655,7 +1900,7 @@ pub(crate) fn settle_with_script(
         } else if state != 4 {
             begin_recovery(db, vm, now)?;
         }
-        finish(db, id, Status::Interrupted, now, Some(false))?;
+        finish_with_script(db, id, Status::Interrupted, now, Some(false), None, cause)?;
         return Ok(Status::Interrupted);
     }
 
@@ -1687,7 +1932,16 @@ pub(crate) fn settle_with_script(
         params![id, success],
     )?;
     release_staging(db, id)?;
-    finish_with_script(db, id, status, now, Some(true), script)?;
+    let failure = match (status, action) {
+        (Status::Failed, 1) => Some(cause.unwrap_or(FailureReason::CloneFailed)),
+        (Status::Failed, 3) => Some(cause.unwrap_or(FailureReason::BootFailed)),
+        (Status::Failed, 4) => Some(cause.unwrap_or(FailureReason::DirtyStop)),
+        (Status::Failed, _) => cause,
+        _ => None,
+    };
+    // A failed stop has not proven the boot released.
+    let cleanup = !(status == Status::Failed && action == Action::Stop as i64);
+    finish_with_script(db, id, status, now, Some(cleanup), script, failure)?;
     Ok(status)
 }
 
@@ -1775,6 +2029,25 @@ pub(crate) fn expired_status(
                     activity_id: row.get(1)?,
                 })
             },
+        )
+        .optional()?)
+}
+
+/// The tombstone's expiry receipt and its cleanup proof, only when the same
+/// join attributes that receipt to this VM, owner and daemon expiry. An
+/// attributed legacy receipt can still carry no proof.
+pub(crate) fn tombstone_proof(
+    db: &Connection,
+    principal: &str,
+    vm: Id,
+) -> Result<Option<(i64, Option<bool>)>> {
+    Ok(db
+        .query_row(
+            "SELECT a.id,a.cleanup_confirmed FROM vm_tombstones t JOIN activity a ON a.id=t.activity_id
+         WHERE t.id=?1 AND t.principal=?2 AND a.vm=t.id AND a.vm_owner=t.principal
+           AND a.actor='daemon' AND a.action=7",
+            params![vm, principal],
+            |row| Ok((row.get(0)?, row.get::<_, Option<bool>>(1)?)),
         )
         .optional()?)
 }
@@ -2117,6 +2390,7 @@ pub(crate) fn record_recovered(db: &Connection, claim: RecoveryClaim, now: i64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::{BUILD_ACTION, static_web::StaticState};
 
     fn legacy_binding(nonce: u64, vm: Id, action: Action) -> Binding<'static> {
         Binding {
@@ -2254,8 +2528,8 @@ mod tests {
                 transient: crate::vm::DiskClaim::default(),
             };
             for subject in [
-                Subject::Recipe("e03a3012c18d20b8691490b580ab41e9", request.digest),
-                Subject::Recipe(request.recipe, [8; 32]),
+                Subject::Recipe("e03a3012c18d20b8691490b580ab41e9", Some(request.digest)),
+                Subject::Recipe(request.recipe, Some([8; 32])),
             ] {
                 let binding = Binding {
                     principal: request.principal,
@@ -2446,14 +2720,18 @@ mod tests {
         let dir = private_temp();
         let db = v6_fixture(dir.path());
         db.execute_batch(
-            "CREATE TRIGGER fixture_error BEFORE UPDATE OF status ON activity
+            "INSERT INTO vm_tombstones(id,principal,activity_id,expired_at_ms)
+             VALUES(randomblob(16),'alice',20,1);
+             CREATE TRIGGER fixture_error BEFORE DELETE ON vm_tombstones
              BEGIN SELECT raise(ABORT,'fixture migration fault'); END;",
         )
         .unwrap();
         drop(db);
         let path = dir.path().join("activity.sqlite3");
         let before = fs::read(&path).unwrap();
-        let error = VmStore::open(dir.path(), NOW).err().unwrap();
+        let error = VmStore::open(dir.path(), NOW + TOMBSTONE_LIFETIME_MS)
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("fixture migration fault"));
         assert_eq!(fs::read(&path).unwrap(), before);
         let db = open_sqlite(&path).unwrap();
@@ -2461,7 +2739,7 @@ mod tests {
         assert_eq!(proof_column(&db), 0);
         db.execute_batch("DROP TRIGGER fixture_error").unwrap();
         drop(db);
-        VmStore::open(dir.path(), NOW)
+        VmStore::open(dir.path(), NOW + TOMBSTONE_LIFETIME_MS)
             .unwrap()
             .transact(|db| {
                 assert_eq!(proof_column(db), 1);
@@ -2573,20 +2851,149 @@ mod tests {
     }
 
     #[test]
+    fn v9_backfills_only_known_failure_and_scrubs_foreign_refusal() {
+        let dir = private_temp();
+        let db = v6_fixture(dir.path());
+        db.execute_batch(MIGRATE_V7).unwrap();
+        db.execute_batch(MIGRATE_V8).unwrap();
+        db.execute_batch(
+            "INSERT INTO activity(id,principal,actor,vm,action,started_ms,status,reason,finished_ms,terminal_order)
+             VALUES(400,'beta','agent',unhex(printf('%032x',2)),3,20,4,6,20,400);
+             UPDATE sqlite_sequence SET seq=900 WHERE name='activity';
+             PRAGMA user_version=8;"
+        ).unwrap();
+        let existing = ledger_state(&db).unwrap();
+        drop(db);
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store
+            .transact(|db| {
+                let actual = ledger_state(db)?;
+                assert_eq!(
+                    actual.iter().map(|row| row.1).collect::<Vec<_>>(),
+                    existing.iter().map(|row| row.1).collect::<Vec<_>>()
+                );
+                let projected = receipts(db, &actual)?;
+                assert_eq!(projected[0].failure, None);
+                assert_eq!(
+                    projected[1].failure,
+                    Some(FailureReason::CleanupUnconfirmed)
+                );
+                assert_eq!(projected[2].expires_at_ms, Some(400));
+                assert_eq!(projected[3].failure, None);
+                assert_eq!(
+                    projected[4].failure,
+                    Some(FailureReason::CleanupUnconfirmed)
+                );
+                assert_eq!(
+                    count(
+                        db,
+                        "SELECT count(*) FROM activity WHERE id=400 AND vm IS NULL",
+                        []
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    count(
+                        db,
+                        "SELECT seq FROM sqlite_sequence WHERE name='activity'",
+                        []
+                    )?,
+                    900
+                );
+                assert_eq!(
+                    count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn recipe_removed_replays_but_cannot_bind_fresh_build() {
+        let dir = private_temp();
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store
+            .transact(|db| {
+                let recipe = "e03a3012c18d20b8691490b580ab41e9";
+                let binding = Binding {
+                    principal: "alice",
+                    key: RequestId {
+                        key: [2; 16],
+                        issued_at_ms: NOW,
+                    },
+                    subject: Subject::Recipe(recipe, Some([4; 32])),
+                    action: BUILD_ACTION,
+                };
+                let operation = binding.record(db, NOW, None, None)?;
+                let removed = Binding {
+                    subject: Subject::Recipe(recipe, None),
+                    ..binding
+                };
+                assert_eq!(
+                    removed.replay(db, NOW, false)?.unwrap().unwrap().operation,
+                    operation
+                );
+                let changed = Binding {
+                    subject: Subject::Recipe(recipe, Some([5; 32])),
+                    ..binding
+                };
+                assert!(matches!(
+                    changed.replay(db, NOW, false)?,
+                    Err(Refusal::KeyCollision)
+                ));
+                let other = Binding {
+                    subject: Subject::Recipe("other", None),
+                    ..binding
+                };
+                assert!(matches!(
+                    other.replay(db, NOW, false)?,
+                    Err(Refusal::KeyCollision)
+                ));
+                Ok(())
+            })
+            .unwrap();
+        // Failed recording rolls back the audit insert as well as the receipt.
+        assert!(
+            store
+                .transact(|db| Binding {
+                    principal: "alice",
+                    key: RequestId {
+                        key: [3; 16],
+                        issued_at_ms: NOW
+                    },
+                    subject: Subject::Recipe("removed", None),
+                    action: BUILD_ACTION,
+                }
+                .record(db, NOW, None, None))
+                .is_err()
+        );
+        store
+            .transact(|db| {
+                assert_eq!(count(db, "SELECT count(*) FROM activity", [])?, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn v7_upgrade_preserves_rows_with_null_dashboard_columns() {
         let dir = private_temp();
-        drop(v5_fixture(dir.path()));
-        drop(VmStore::open(dir.path(), NOW).unwrap());
-        // Model a merged v7 catalog: the v7 schema is v8 without the
-        // dashboard columns, so drop them and roll the version back.
-        let db = Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+        let db = v5_fixture(dir.path());
+        db.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")
+            .unwrap();
+        db.execute_batch(MIGRATE_V6).unwrap();
+        db.execute_batch(MIGRATE_V7).unwrap();
+        // Keep the catalog and audit row counts after recovery stable. This
+        // case is about dashboard columns and uses a stopped v7 catalog.
         db.execute_batch(
-            "ALTER TABLE vm_instances DROP COLUMN dashboard_cpus;
-             ALTER TABLE vm_instances DROP COLUMN dashboard_memory;
-             ALTER TABLE vm_snapshots DROP COLUMN dashboard_created_ms;
-             PRAGMA user_version=7;",
+            "UPDATE vm_instances SET state=1 WHERE state=2;
+            UPDATE activity SET status=3,finished_ms=5000,terminal_order=id+100
+                WHERE status=0 AND action<=6;
+            UPDATE vm_operations SET status=3 WHERE status=0;",
         )
         .unwrap();
+        db.execute_batch("PRAGMA user_version=7; COMMIT;").unwrap();
         let rows = |db: &Connection| -> Result<[i64; 4]> {
             Ok([
                 count(db, "SELECT count(*) FROM vm_instances", [])?,
@@ -2769,6 +3176,439 @@ mod tests {
         db.execute_batch("DROP TABLE fixture_padding").unwrap();
         drop(db);
         assert!(VmStore::open(dir.path(), NOW).is_ok());
+    }
+
+    fn static_fixture(db: &Connection, vm: Id, name: &str) -> Result<PairSlots> {
+        use crate::vm::static_web::{StaticName, StaticProvenance};
+        static_vm::reserve(
+            db,
+            vm,
+            &StaticName::parse(name).unwrap(),
+            "alice",
+            [8; 16],
+            StaticProvenance {
+                source_generation: [9; 16],
+                recipe_digest: [1; 32],
+                disk_digest: [2; 32],
+                vars_digest: [3; 32],
+            },
+            crate::vm::DiskClaim {
+                images: 500,
+                staging: 100,
+                metadata: 0,
+            },
+        )
+    }
+
+    /// Commit a reserved static generation as if its copy had settled.
+    fn commit_static(db: &Connection, vm: Id, slots: PairSlots, state: i64) -> Result<()> {
+        db.execute(
+            "UPDATE vm_artifacts SET state='active',volume_id=zeroblob(8),directory_id=zeroblob(8),
+                file_id=randomblob(16),content_digest=zeroblob(32),bytes=4 WHERE generation_id=?1",
+            [slots.disk.generation],
+        )?;
+        db.execute(
+            "UPDATE vm_generations SET active=1 WHERE id=?1",
+            [slots.disk.generation],
+        )?;
+        db.execute(
+            "UPDATE vm_static_instances SET state=?2,staging=0 WHERE id=?1",
+            params![vm, state],
+        )?;
+        Ok(())
+    }
+
+    fn evidence(byte: u8) -> ArtifactEvidence {
+        ArtifactEvidence {
+            identity: FileIdentity {
+                volume: 0,
+                file: [byte; 16],
+            },
+            directory: [0xdd; 16],
+            pin: crate::vm::paths::ArtifactPin {
+                size: 4,
+                sha256: [byte; 32],
+            },
+        }
+    }
+
+    #[test]
+    fn known_failure_causes_survive_without_release_proof() {
+        let dir = private_temp();
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store
+            .transact(|db| {
+                let status = |id| -> Result<OperationStatus> {
+                    Ok(operation_status(db, "alice", id, NOW)?.unwrap())
+                };
+                db.execute(
+                    "INSERT INTO vm_templates VALUES(?1,1,zeroblob(32),zeroblob(32),zeroblob(32),40)",
+                    [[2u8; 16]],
+                )?;
+                let vm = |byte: u8, state: i64| -> Result<Id> {
+                    let id = [byte; 16];
+                    db.execute(
+                        "INSERT INTO vm_instances(id,template,principal,expires_ms,state)
+                         VALUES(?1,?2,'alice',?3,?4)",
+                        params![id, [2u8; 16], NOW + 60_000, state],
+                    )?;
+                    Ok(id)
+                };
+                // A boot whose release is unproven keeps its known cause.
+                let boot = vm(1, 1)?;
+                let start = legacy_binding(1, boot, Action::Start).record(db, NOW, Some(boot), None)?;
+                let cause = Some(FailureReason::BootFailed);
+                settle_with_script(db, start.receipt.activity_id, NOW, Completion::CleanupUnconfirmed, None, cause)?;
+                let start = status(start.id)?;
+                assert_eq!(start.state, Status::Interrupted);
+                assert_eq!((start.failure, start.cleanup), (cause, Some("unconfirmed")));
+                // A failed stop is a known dirty stop without release proof.
+                let dirty = vm(2, 2)?;
+                let stop = legacy_binding(2, dirty, Action::Stop).record(db, NOW, Some(dirty), None)?;
+                settle_with_script(db, stop.receipt.activity_id, NOW, Completion::Failed, None, None)?;
+                let stop = status(stop.id)?;
+                assert_eq!(
+                    (stop.state, stop.failure, stop.cleanup),
+                    (Status::Failed, Some(FailureReason::DirtyStop), Some("unconfirmed"))
+                );
+                // A lost guest result: execution unknown, no script status.
+                let lost = vm(3, 2)?;
+                let script = legacy_binding(3, lost, Action::Script).record(db, NOW, Some(lost), None)?;
+                let cause = Some(FailureReason::ExecutionUnknown);
+                settle_with_script(db, script.receipt.activity_id, NOW, Completion::CleanupUnconfirmed, None, cause)?;
+                let script = status(script.id)?;
+                assert_eq!((script.failure, script.script), (cause, None));
+                // A trustworthy guest response keeps its script status.
+                let guest = vm(4, 2)?;
+                let exited = legacy_binding(4, guest, Action::Script).record(db, NOW, Some(guest), None)?;
+                settle_with_script(db, exited.receipt.activity_id, NOW, Completion::Failed,
+                    Some(ScriptResult::Exited(7)), None)?;
+                let exited = status(exited.id)?;
+                assert_eq!((exited.state, exited.script, exited.failure, exited.cleanup),
+                    (Status::Failed, Some(ScriptResult::Exited(7)), None, Some("confirmed")));
+                // Without a known cause the unproven release stays the reason.
+                let unknown = vm(5, 2)?;
+                let stop = legacy_binding(5, unknown, Action::Stop).record(db, NOW, Some(unknown), None)?;
+                settle_with_script(db, stop.receipt.activity_id, NOW, Completion::CleanupUnconfirmed, None, None)?;
+                assert_eq!(status(stop.id)?.failure, Some(FailureReason::CleanupUnconfirmed));
+                // A clone worker with no publishable pair reports its cause.
+                let clone_vm = [6; 16];
+                let clone = Binding {
+                    principal: "alice",
+                    key: RequestId::parse("00000000000000000000000000000006").unwrap(),
+                    subject: Subject::Template([2; 16], [6; 32]),
+                    action: 1,
+                }
+                .record(db, NOW, Some(clone_vm), None)?;
+                db.execute(
+                    "INSERT INTO vm_instances(id,template,principal,expires_ms) VALUES(?1,?2,'alice',?3)",
+                    params![clone_vm, [2u8; 16], NOW + 60_000],
+                )?;
+                let pair = plan_clone(db, clone_vm)?;
+                let settled = settle_clone(db, clone.receipt.activity_id, pair, None, true, NOW,
+                    Some(FailureReason::CloneFailed))?;
+                assert_eq!(settled, Status::Interrupted);
+                assert_eq!(status(clone.id)?.failure, Some(FailureReason::CloneFailed));
+                // A staged build failure records the stage's cause.
+                let request = BuildRequest {
+                    principal: "alice",
+                    key: RequestId::parse("00000000000000000000000000000007").unwrap(),
+                    recipe: "fece98c2030f405fb6402fc92a79935d",
+                    digest: [9; 32],
+                    retained: crate::vm::DiskClaim::default(),
+                    transient: crate::vm::DiskClaim::default(),
+                };
+                let build = Binding {
+                    principal: request.principal,
+                    key: request.key,
+                    subject: Subject::Recipe(request.recipe, Some(request.digest)),
+                    action: 11,
+                }
+                .record(db, NOW, None, None)?;
+                let slots = reserve_build(db, request, build, 8)?;
+                abandon_build_with(db, slots.id, build.receipt.activity_id, NOW,
+                    Some(FailureReason::InstallTimedOut))?;
+                let build = status(build.id)?;
+                assert_eq!((build.state, build.failure), (Status::Interrupted, Some(FailureReason::InstallTimedOut)));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn static_recovery_settles_only_the_same_generation_after_release_proof() {
+        let dir = private_temp();
+        let vm = [7; 16];
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        let claim = store
+            .transact(|db| {
+                let slots = static_fixture(db, vm, "recovering-site")?;
+                commit_static(db, vm, slots, 2)?;
+                // A stop that failed to prove release keeps its cause and
+                // fences the slot behind one daemon recovery receipt.
+                let stop = legacy_binding(1, vm, Action::Stop).record(db, NOW, Some(vm), None)?;
+                settle_with_script(
+                    db,
+                    stop.receipt.activity_id,
+                    NOW,
+                    Completion::CleanupUnconfirmed,
+                    None,
+                    Some(FailureReason::DirtyStop),
+                )?;
+                assert_eq!(
+                    operation_status(db, "alice", stop.id, NOW)?
+                        .unwrap()
+                        .failure,
+                    Some(FailureReason::DirtyStop)
+                );
+                assert_eq!(
+                    static_vm::owned_state(db, "alice", vm)?,
+                    Some(StaticState::Recovering)
+                );
+                assert!(static_vm::launch_busy(db)?);
+                let [claim] = static_vm::recovery_claims(db)?.try_into().unwrap();
+                assert_eq!((claim.vm, claim.generation), (vm, slots.disk.generation));
+                assert_eq!(
+                    db.query_row(
+                        "SELECT vm_owner,actor FROM activity WHERE id=?1",
+                        [claim.activity_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    )?,
+                    ("alice".into(), "daemon".into())
+                );
+                // Ambiguous release keeps it recovering and records no proof.
+                assert!(!static_vm::settle_recovery(db, claim, false, NOW)?);
+                assert!(static_vm::recovering(db)?);
+                assert_eq!(
+                    db.query_row(
+                        "SELECT status,cleanup_confirmed FROM activity WHERE id=?1",
+                        [claim.activity_id],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<bool>>(1)?))
+                    )?,
+                    (0, Some(false))
+                );
+                Ok(claim)
+            })
+            .unwrap();
+        // Reopen: the pending receipt is reused, not duplicated.
+        drop(store);
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store
+            .transact(|db| {
+                assert_eq!(static_vm::recovery_claims(db)?, [claim]);
+                let stale = static_vm::StaticRecovery { generation: [0x55; 16], ..claim };
+                assert!(!static_vm::settle_recovery(db, stale, true, NOW)?);
+                assert!(static_vm::recovering(db)?);
+                assert!(static_vm::settle_recovery(db, claim, true, NOW)?);
+                assert_eq!(static_vm::owned_state(db, "alice", vm)?, Some(StaticState::Stopped));
+                assert!(!static_vm::launch_busy(db)?);
+                assert_eq!(
+                    db.query_row("SELECT status,cleanup_confirmed FROM activity WHERE id=?1",
+                        [claim.activity_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<bool>>(1)?)))?,
+                    (Status::Succeeded.code(), Some(true))
+                );
+                // Settlement never touched the committed generation.
+                assert_eq!(
+                    count(db, "SELECT count(*) FROM vm_artifacts WHERE generation_id=?1 AND state='active'",
+                        [claim.generation])?,
+                    2
+                );
+                assert!(static_vm::active_pair(db, "alice", vm)?.is_some());
+                assert!(static_vm::active_pair(db, "bob", vm)?.is_none());
+                Ok(())
+            })
+            .unwrap();
+        // A running static VM found at open enters recovery once.
+        drop(store);
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store
+            .transact(|db| {
+                db.execute("UPDATE vm_static_instances SET state=2 WHERE id=?1", [vm])?;
+                recover(db, NOW)?;
+                recover(db, NOW)?;
+                assert_eq!(
+                    static_vm::owned_state(db, "alice", vm)?,
+                    Some(StaticState::Recovering)
+                );
+                assert_eq!(
+                    count(
+                        db,
+                        "SELECT count(*) FROM activity WHERE vm=?1 AND action=10 AND status=0",
+                        [vm]
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_static_copy_releases_only_a_proven_untouched_candidate() {
+        use crate::vm::{CandidateSlot, CopyFailure};
+        let dir = private_temp();
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store
+            .transact(|db| {
+                let create = |byte: u8, name: &str| -> Result<(Id, PairSlots, OperationRef)> {
+                    let vm = [byte; 16];
+                    let operation = Binding {
+                        principal: "alice",
+                        key: RequestId::parse(&format!("{:032x}", byte)).unwrap(),
+                        subject: Subject::Template([8; 16], [byte; 32]),
+                        action: 12,
+                    }
+                    .record(db, NOW, Some(vm), None)?;
+                    Ok((vm, static_fixture(db, vm, name)?, operation))
+                };
+                let settle = |(_, slots, operation): (Id, PairSlots, OperationRef), failure| {
+                    static_vm::settle_create(db, operation.receipt.activity_id, slots, Err(failure), NOW)
+                };
+                let base = disk_bytes(db)?;
+                // Proven untouched: the name, the slot and both charges are free.
+                let untouched = create(1, "reused-name")?;
+                assert_eq!(disk_bytes(db)?, base.map(|bytes| bytes + 600));
+                assert_eq!(settle(untouched, CopyFailure::untouched(FailureReason::Cancelled))?, Status::Failed);
+                assert_eq!(disk_bytes(db)?, base);
+                assert_eq!(static_vm::instance_count(db)?, 0);
+                assert_eq!(count(db, "SELECT count(*) FROM vm_generations WHERE static_id IS NOT NULL", [])?, 0);
+                let receipt = operation_status(db, "alice", untouched.2.id, NOW)?.unwrap();
+                assert_eq!((receipt.failure, receipt.cleanup), (Some(FailureReason::Cancelled), Some("confirmed")));
+                // The released name is reusable.
+                let identified = create(2, "reused-name")?;
+                // One identified leaf: retained, quarantined and charged.
+                let failure = CopyFailure {
+                    reason: FailureReason::CloneFailed,
+                    slots: [CandidateSlot::Retained(evidence(0x21)), CandidateSlot::Absent],
+                };
+                assert_eq!(settle(identified, failure)?, Status::Failed);
+                assert_eq!(disk_bytes(db)?, base.map(|bytes| bytes + 600));
+                let mut stmt = db.prepare(
+                    "SELECT role,state,file_id IS NOT NULL FROM vm_artifacts WHERE generation_id=?1 ORDER BY role",
+                )?;
+                let rows = stmt
+                    .query_map([identified.1.disk.generation], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert_eq!(rows, [
+                    ("static_disk".into(), "quarantined".into(), true),
+                    ("static_vars".into(), "quarantined".into(), false),
+                ]);
+                assert_eq!(static_vm::owned_state(db, "alice", identified.0)?, Some(StaticState::Failed));
+                // Unknown effects, including a late worker, are never released.
+                let unknown = create(3, "unknown-site")?;
+                assert_eq!(settle(unknown, CopyFailure::unknown(FailureReason::CleanupUnconfirmed))?, Status::Failed);
+                assert_eq!(static_vm::instance_count(db)?, 2);
+                assert_eq!(
+                    operation_status(db, "alice", unknown.2.id, NOW)?.unwrap().cleanup,
+                    Some("unconfirmed")
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn tombstone_correlation_requires_the_attributed_expiry_receipt() {
+        let dir = private_temp();
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store
+            .transact(|db| {
+                let receipt = |vm: Id, owner: &str, action: i64, actor: &str, proof: Option<bool>| -> Result<i64> {
+                    db.execute(
+                        "INSERT INTO activity(principal,vm,action,started_ms,status,finished_ms,terminal_order,
+                            cleanup_confirmed,actor,vm_owner)
+                         VALUES(?1,?2,?3,?4,1,?4,(SELECT coalesce(max(terminal_order),0)+1 FROM activity),?5,?6,
+                            CASE WHEN ?3 IN (7,10) THEN ?7 END)",
+                        params![if actor == "daemon" { "arxd" } else { owner }, vm, action, NOW, proof, actor, owner],
+                    )?;
+                    Ok(db.last_insert_rowid())
+                };
+                let tombstone = |vm: Id, activity: i64| -> Result<()> {
+                    db.execute(
+                        "INSERT INTO vm_tombstones VALUES(?1,'alice',?2,?3)",
+                        params![vm, activity, NOW],
+                    )?;
+                    Ok(())
+                };
+                type Case<'a> = (u8, Id, &'a str, i64, &'a str, Option<bool>);
+                // Attributed receipts keep their correlation, including a
+                // legacy receipt without proof. Mismatched VM, owner or
+                // action yields no correlation and no label.
+                let cases: [(Case, Option<Option<bool>>); 6] = [
+                    ((1, [1; 16], "alice", 7, "daemon", Some(true)), Some(Some(true))),
+                    ((2, [2; 16], "alice", 7, "daemon", Some(false)), Some(Some(false))),
+                    ((3, [3; 16], "alice", 7, "daemon", None), Some(None)),
+                    ((4, [0x44; 16], "alice", 7, "daemon", Some(true)), None),
+                    ((5, [5; 16], "bob", 7, "daemon", Some(true)), None),
+                    ((6, [6; 16], "alice", 3, "agent", Some(true)), None),
+                ];
+                for ((byte, receipt_vm, owner, action, actor, proof), expected) in cases {
+                    let vm = [byte; 16];
+                    let id = receipt(receipt_vm, owner, action, actor, proof)?;
+                    tombstone(vm, id)?;
+                    assert_eq!(
+                        tombstone_proof(db, "alice", vm)?,
+                        expected.map(|confirmed| (id, confirmed)),
+                        "case {byte}"
+                    );
+                    assert!(tombstone_proof(db, "bob", vm)?.is_none());
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_authority_cannot_resolve_a_static_generation() {
+        use crate::vm::static_web::{StaticName, StaticProvenance};
+        let dir = private_temp();
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store
+            .transact(|db| {
+                let vm = [7; 16];
+                let template = [8; 16];
+                let slots = static_vm::reserve(
+                    db,
+                    vm,
+                    &StaticName::parse("private-site").unwrap(),
+                    "alice",
+                    template,
+                    StaticProvenance {
+                        source_generation: [9; 16],
+                        recipe_digest: [1; 32],
+                        disk_digest: [2; 32],
+                        vars_digest: [3; 32],
+                    },
+                    crate::vm::DiskClaim {
+                        images: 500,
+                        staging: 100,
+                        metadata: 0,
+                    },
+                )?;
+                for kind in [
+                    CleanupKind::Build(vm),
+                    CleanupKind::Expiry { vm, activity_id: 1 },
+                    CleanupKind::Staging { vm, activity_id: 1 },
+                    CleanupKind::Recovery { vm, activity_id: 1 },
+                ] {
+                    assert!(cleanup_work(db, kind)?.is_none());
+                }
+                assert!(cleanup_kinds(db)?.is_empty());
+                assert_eq!(disk_bytes(db)?, Some(600));
+                assert_eq!(
+                    count(
+                        db,
+                        "SELECT count(*) FROM vm_artifacts WHERE generation_id=?1
+                AND role IN ('static_disk','static_vars')",
+                        [slots.disk.generation]
+                    )?,
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

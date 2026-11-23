@@ -13,7 +13,7 @@ const VM: Id = [2; 16];
 const MIB: u64 = 1024 * 1024;
 /// The VM store's `user_version`. `store::vm::VM_SCHEMA_VERSION` is
 /// crate-private, so this integration test mirrors it; update both together.
-const VM_SCHEMA_VERSION: i64 = 8;
+const VM_SCHEMA_VERSION: i64 = 9;
 
 #[derive(Clone)]
 struct TestClock {

@@ -3,7 +3,11 @@ use crate::{
     config::{TestVms, VmRuntimeProfile},
     service::Shutdown,
     store::ListActivity,
-    vm::{runtime::NativeRefusal, *},
+    vm::{
+        runtime::NativeRefusal,
+        static_web::{StaticName, StaticState},
+        *,
+    },
 };
 use ring::hmac;
 use rmcp::{
@@ -94,6 +98,31 @@ fn refusal_wire(reason: Refusal) -> &'static str {
         Refusal::Ram => "ram",
         Refusal::Shutdown => "shutdown",
         Refusal::CleanupUnconfirmed => "cleanup_unconfirmed",
+        Refusal::Disabled => "disabled",
+        Refusal::UnsupportedPlatform => "unsupported_platform",
+        Refusal::QualificationMissing => "qualification_missing",
+        Refusal::IdentityUnverified => "identity_unverified",
+        Refusal::DistributionUnverified => "distribution_unverified",
+        Refusal::PathCustodyUnverified => "path_custody_unverified",
+        Refusal::JobUnverified => "job_unverified",
+        Refusal::WhpxUnverified => "whpx_unverified",
+        Refusal::QmpUnverified => "qmp_unverified",
+        Refusal::GuestEndpointUnverified => "guest_endpoint_unverified",
+        Refusal::DiskCeilingUnverified => "disk_ceiling_unverified",
+        Refusal::OwnerActivityUnverified => "owner_activity_unverified",
+        Refusal::ReservesUnverified => "reserves_unverified",
+        Refusal::NetworkFenceUnverified => "network_fence_unverified",
+        Refusal::InstallerPhaseUnavailable => "installer_phase_unavailable",
+        Refusal::InstallerPhaseMismatch => "installer_phase_mismatch",
+        Refusal::InstallerDeadlineExpired => "installer_deadline_expired",
+        Refusal::NotReady => "not_ready",
+        Refusal::RecipeUnqualified => "recipe_unqualified",
+        Refusal::HostExecutionDisabled => "host_execution_disabled",
+        Refusal::InvalidCursor => "invalid_cursor",
+        Refusal::StateUnavailable => "state_unavailable",
+        Refusal::NameUnavailable => "name_unavailable",
+        Refusal::StaticDeleteForbidden => "static_delete_forbidden",
+        Refusal::UnknownTool => "unknown_tool",
     }
 }
 
@@ -111,9 +140,7 @@ fn refusal_from_wire(reason: &str) -> Option<Refusal> {
         .find(|code| refusal_wire(*code) == reason)
 }
 
-/// The codes the v7 audit stores exactly (1..=18). `cleanup_unconfirmed` has
-/// no stored code yet, so the foreground never files it as another reason.
-const REFUSAL_CODES: [Refusal; 18] = {
+const REFUSAL_CODES: [Refusal; 44] = {
     use Refusal::*;
     [
         Invalid,
@@ -134,6 +161,32 @@ const REFUSAL_CODES: [Refusal; 18] = {
         Cpu,
         Ram,
         Shutdown,
+        CleanupUnconfirmed,
+        Disabled,
+        UnsupportedPlatform,
+        QualificationMissing,
+        IdentityUnverified,
+        DistributionUnverified,
+        PathCustodyUnverified,
+        JobUnverified,
+        WhpxUnverified,
+        QmpUnverified,
+        GuestEndpointUnverified,
+        DiskCeilingUnverified,
+        OwnerActivityUnverified,
+        ReservesUnverified,
+        NetworkFenceUnverified,
+        InstallerPhaseUnavailable,
+        InstallerPhaseMismatch,
+        InstallerDeadlineExpired,
+        NotReady,
+        RecipeUnqualified,
+        HostExecutionDisabled,
+        InvalidCursor,
+        StateUnavailable,
+        NameUnavailable,
+        StaticDeleteForbidden,
+        UnknownTool,
     ]
 };
 
@@ -166,6 +219,10 @@ fn native_reason(reason: NativeRefusal) -> &'static str {
     }
 }
 
+// Stable catalog identity while native qualification is unavailable.
+const WEB_RECIPE_ID: Id = [0xff; 16];
+type Recipe = (Id, Option<[u8; 32]>);
+
 struct Gate {
     closed: bool,
     #[cfg(test)]
@@ -182,7 +239,7 @@ pub(crate) struct Supervisor {
     cancel: Shutdown,
     cursor_key: hmac::Key,
     host_id: Id,
-    recipe: Option<(Id, [u8; 32])>,
+    recipes: [Option<Recipe>; 2],
     native_refusal: NativeRefusal,
     /// The validated native runtime profile, if configured. It only selects
     /// the closed candidate runtime; it never authorizes a launch here.
@@ -240,9 +297,10 @@ impl Supervisor {
             reason,
             profile.runtime.take(),
         )?;
-        Arc::get_mut(&mut supervisor)
-            .ok_or_else(|| anyhow::anyhow!("VM supervisor shared before open"))?
-            .root_pin = Some(pin);
+        let state = Arc::get_mut(&mut supervisor)
+            .ok_or_else(|| anyhow::anyhow!("VM supervisor shared before open"))?;
+        state.root_pin = Some(pin);
+        state.recipes[1] = Some((WEB_RECIPE_ID, None));
         Ok(supervisor)
     }
 
@@ -255,11 +313,11 @@ impl Supervisor {
         runtime: Option<VmRuntimeProfile>,
     ) -> anyhow::Result<Arc<Self>> {
         let mut secret = [0; 32];
-        let mut host_id = [0; 16];
         getrandom::fill(&mut secret).map_err(|_| anyhow::anyhow!("cursor key unavailable"))?;
-        getrandom::fill(&mut host_id).map_err(|_| anyhow::anyhow!("host ID unavailable"))?;
+        let controller = Arc::new(VmController::open(root, policy, clock)?);
+        let host_id = controller.foreground_host_id()?;
         Ok(Arc::new(Self {
-            controller: Arc::new(VmController::open(root, policy, clock)?),
+            controller,
             gate: Mutex::new(Gate {
                 closed: false,
                 #[cfg(test)]
@@ -271,7 +329,7 @@ impl Supervisor {
             cancel: Shutdown::default(),
             cursor_key: hmac::Key::new(hmac::HMAC_SHA256, &secret),
             host_id,
-            recipe,
+            recipes: [recipe.map(|(id, digest)| (id, Some(digest))), None],
             native_refusal,
             runtime,
             #[cfg(test)]
@@ -558,10 +616,13 @@ enum ToolName {
     Stop,
     Script,
     Extend,
+    StaticCreate,
+    StaticGet,
+    StaticList,
 }
 
 impl ToolName {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 15] = [
         Self::Hosts,
         Self::Activity,
         Self::Catalog,
@@ -574,6 +635,9 @@ impl ToolName {
         Self::Stop,
         Self::Script,
         Self::Extend,
+        Self::StaticCreate,
+        Self::StaticGet,
+        Self::StaticList,
     ];
 
     fn name(self) -> &'static str {
@@ -590,12 +654,16 @@ impl ToolName {
             Self::Stop => "vm_stop",
             Self::Script => "vm_run_script",
             Self::Extend => "vm_extend",
+            Self::StaticCreate => "static_vm_create",
+            Self::StaticGet => "static_vm_get",
+            Self::StaticList => "static_vm_list",
         }
     }
 
     fn action(self) -> Option<i64> {
         Some(match self {
             Self::Build => BUILD_ACTION,
+            Self::StaticCreate => STATIC_CREATE_ACTION,
             Self::Create => Action::Clone as i64,
             Self::Start => Action::Start as i64,
             Self::Stop => Action::Stop as i64,
@@ -620,9 +688,11 @@ impl ToolName {
                 }),
                 &[],
             ),
-            Self::Catalog | Self::List => (
+            Self::Catalog | Self::List | Self::StaticList => (
                 if self == Self::Catalog {
                     "List VM recipes, templates and caller builds"
+                } else if self == Self::StaticList {
+                    "List caller-owned static web VMs"
                 } else {
                     "List caller-owned VMs"
                 },
@@ -640,7 +710,16 @@ impl ToolName {
                 json!({"template_id":id,"request_id":id,"ttl_s":ttl}),
                 &["template_id", "request_id"],
             ),
-            Self::Get => ("Read a caller-owned VM", json!({"vm_id":id}), &["vm_id"]),
+            Self::StaticCreate => (
+                "Create a stopped static Ubuntu web VM",
+                json!({"template_id":id,"request_id":id,
+                    "name":{"type":"string","minLength":1,"maxLength":63,
+                    "pattern":"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$"}}),
+                &["template_id", "request_id", "name"],
+            ),
+            Self::Get | Self::StaticGet => {
+                ("Read a caller-owned VM", json!({"vm_id":id}), &["vm_id"])
+            }
             Self::Operation => (
                 "Read a caller-owned operation",
                 json!({"operation_id":id}),
@@ -799,6 +878,7 @@ fn parse_id(value: &str) -> Outcome<Id> {
 enum Work {
     Build,
     Create(u64),
+    StaticCreate(StaticName),
     Start,
     Stop,
     Script(
@@ -832,12 +912,15 @@ impl Mutation {
     fn parse(tool: ToolName, args: &mut Args) -> Outcome<Self> {
         let id = args.id(match tool {
             ToolName::Build => "recipe_id",
-            ToolName::Create => "template_id",
+            ToolName::Create | ToolName::StaticCreate => "template_id",
             _ => "vm_id",
         })?;
         let key = RequestId::parse(&args.get::<String>("request_id")?)?;
         let work = match tool {
             ToolName::Build => Work::Build,
+            ToolName::StaticCreate => Work::StaticCreate(
+                StaticName::parse(&args.get::<String>("name")?).map_err(|_| INVALID)?,
+            ),
             ToolName::Create | ToolName::Extend => {
                 let ttl = args
                     .optional("ttl_s")?
@@ -871,7 +954,11 @@ impl Mutation {
     }
 
     fn vm(&self) -> Option<Id> {
-        (!matches!(self.work, Work::Build | Work::Create(_))).then_some(self.id)
+        (!matches!(
+            self.work,
+            Work::Build | Work::Create(_) | Work::StaticCreate(_)
+        ))
+        .then_some(self.id)
     }
 }
 
@@ -899,18 +986,26 @@ impl VmInventory {
         }
         let name = request.name.as_ref();
         if matches!(name, "run_command" | "discover_tools") {
-            return Err(HOST_EXECUTION_DISABLED);
+            return self.refuse(HOST_REFUSAL_ACTION, None, HOST_EXECUTION_DISABLED);
         }
-        let tool = ToolName::ALL
-            .into_iter()
-            .find(|tool| tool.name() == name)
-            .ok_or(Fault("unknown_tool"))?;
+        if matches!(
+            name,
+            "static_vm_delete" | "vm_delete" | "backup_delete" | "vm_backup_delete"
+        ) {
+            return self.refuse(
+                HOST_REFUSAL_ACTION,
+                None,
+                Refusal::StaticDeleteForbidden.into(),
+            );
+        }
+        let Some(tool) = ToolName::ALL.into_iter().find(|tool| tool.name() == name) else {
+            // One uncorrelated refusal under the fixed non-VM action. The
+            // caller-supplied name is never stored.
+            return self.refuse(HOST_REFUSAL_ACTION, None, Refusal::UnknownTool.into());
+        };
         let mut args = Args::new(request.arguments.unwrap_or_default());
         if args.malformed() {
-            return match tool.action() {
-                Some(action) => self.refuse(action, None, INVALID),
-                None => Err(INVALID),
-            };
+            return self.refuse(tool.action().unwrap_or(READ_REFUSAL_ACTION), None, INVALID);
         }
         if let Some(action) = tool.action() {
             // The attempted VM ID is only a candidate correlation. The audit
@@ -926,13 +1021,21 @@ impl VmInventory {
             };
             return self.mutate(&mut gate, action, request);
         }
-        self.read(&gate, tool, args)
+        let vm = if matches!(tool, ToolName::Get | ToolName::StaticGet) {
+            args.0
+                .get("vm_id")
+                .and_then(Value::as_str)
+                .and_then(|id| parse_id(id).ok())
+        } else {
+            None
+        };
+        match self.read(&gate, tool, args) {
+            Ok(value) => Ok(value),
+            Err(reason) => self.refuse(READ_REFUSAL_ACTION, vm, reason),
+        }
     }
 
-    /// The one bounded refusal policy for trusted mutation attempts. A
-    /// refusal is filed only under its exact stored code; reasons the v6
-    /// vocabulary cannot express are not misfiled as another code. When the
-    /// audit write cannot commit the caller gets the headroom refusal instead.
+    /// File an exact, closed reason under the authenticated principal.
     fn refuse(&self, action: i64, vm: Option<Id>, reason: Fault) -> Outcome<Value> {
         if let Some(code) = refusal_from_wire(reason.0) {
             self.supervisor
@@ -945,13 +1048,23 @@ impl VmInventory {
     fn mutate(&self, gate: &mut Gate, action: i64, request: Mutation) -> Outcome<Value> {
         let controller = &self.supervisor.controller;
         let recipe = hex::encode(request.id);
-        let digest = self
+        let configured = self
             .supervisor
-            .recipe
-            .filter(|(id, _)| *id == request.id)
-            .map(|(_, digest)| digest);
-        let subject = match request.work {
-            Work::Build => Subject::Recipe(&recipe, digest.unwrap_or([0; 32])),
+            .recipes
+            .iter()
+            .flatten()
+            .find(|(id, _)| *id == request.id);
+        let digest = configured.and_then(|(_, digest)| *digest);
+        let web_digest = self
+            .supervisor
+            .recipes
+            .iter()
+            .flatten()
+            .find(|(id, _)| *id == WEB_RECIPE_ID)
+            .and_then(|(_, digest)| *digest);
+        let subject = match &request.work {
+            Work::Build => Subject::Recipe(&recipe, digest),
+            Work::StaticCreate(name) => static_subject(request.id, name),
             Work::Create(ttl) => Subject::Template(
                 request.id,
                 Sha256::new()
@@ -968,9 +1081,25 @@ impl VmInventory {
             Err(reason) => return self.refuse(action, request.vm(), reason.into()),
         }
         // Scope and subject state precede native or fixture eligibility.
-        let subject = match request.work {
+        let subject = match &request.work {
             Work::Build if digest.is_none() => {
-                return self.refuse(action, None, NOT_FOUND);
+                return self.refuse(
+                    action,
+                    None,
+                    if configured.is_some() {
+                        Refusal::RecipeUnqualified.into()
+                    } else {
+                        NOT_FOUND
+                    },
+                );
+            }
+            Work::StaticCreate(_) => {
+                if let Err(reason) =
+                    controller.foreground_static_template(request.id, web_digest)?
+                {
+                    return self.refuse(action, None, reason.into());
+                }
+                None
             }
             Work::Build => None,
             Work::Create(_) => Some(ForegroundSubject::Template(request.id)),
@@ -1018,7 +1147,18 @@ impl VmInventory {
                 )
             }
             ToolName::Activity => self.activity(args),
-            ToolName::Catalog | ToolName::List => self.page(gate, tool, args),
+            ToolName::Catalog | ToolName::List | ToolName::StaticList => {
+                self.page(gate, tool, args)
+            }
+            ToolName::StaticGet => {
+                let id = args.id("vm_id")?;
+                args.end()?;
+                let row = controller
+                    .foreground_static_rows(&self.principal, Some(id), None, 1)?
+                    .pop()
+                    .ok_or(NOT_FOUND)?;
+                Ok(static_row(row, gate))
+            }
             ToolName::Get => {
                 let id = args.id("vm_id")?;
                 args.end()?;
@@ -1076,20 +1216,34 @@ impl VmInventory {
             .transpose()?;
         let capability = self.supervisor.capability(gate);
         let controller = &self.supervisor.controller;
-        let buildable = capability["available"] == true;
-        // Both pages read `limit + 1` rows from one controller snapshot; the
-        // extra row only decides whether a cursor is returned.
+        let available = capability["available"] == true;
+        let recipes = self.supervisor.recipes.map(|entry| entry.map(|(id, _)| id));
         let mut rows: Vec<((u8, Id), Value)> = if tool == ToolName::Catalog {
             controller
                 .foreground_catalog(
                     &self.principal,
-                    self.supervisor.recipe.map(|(id, _)| id),
+                    recipes,
                     after.unwrap_or((0, [0; 16])),
                     limit + 1,
                 )?
                 .into_iter()
-                .map(|entry| Ok(((entry.kind, entry.id), catalog_row(&entry, buildable)?)))
+                .map(|entry| {
+                    let buildable = available
+                        && self
+                            .supervisor
+                            .recipes
+                            .iter()
+                            .flatten()
+                            .any(|(id, digest)| *id == entry.id && digest.is_some());
+                    Ok(((entry.kind, entry.id), catalog_row(&entry, buildable)?))
+                })
                 .collect::<Outcome<_>>()?
+        } else if tool == ToolName::StaticList {
+            controller
+                .foreground_static_rows(&self.principal, None, after.map(|(_, id)| id), limit + 1)?
+                .into_iter()
+                .map(|row| ((0, row.id), static_row(row, gate)))
+                .collect()
         } else {
             controller
                 .foreground_list(&self.principal, after.map(|(_, id)| id), limit + 1)??
@@ -1193,6 +1347,44 @@ fn decode_cursor(value: &str) -> Outcome<[u8; 51]> {
 /// Catalog kinds are the keyset's first ordering column. Optional recipe
 /// correlations are omitted; a sealed or building row always has one in v6,
 /// so an absent value is a store invariant failure, not a wire `null`.
+fn static_subject(template: Id, name: &StaticName) -> Subject<'static> {
+    Subject::Template(
+        template,
+        Sha256::new()
+            .chain_update(b"arxcovo.static.name.v1\0")
+            .chain_update(name.as_str().as_bytes())
+            .finalize()
+            .into(),
+    )
+}
+
+fn static_row(row: crate::store::vm::static_vm::StaticRow, gate: &Gate) -> Value {
+    let state = match row.state {
+        StaticState::Creating => "creating",
+        StaticState::Stopped => "stopped",
+        StaticState::Running => "running",
+        StaticState::Recovering => "recovering",
+        StaticState::Failed => "failed",
+    };
+    let ready = false;
+    #[cfg(test)]
+    let ready = ready
+        || (state == "running"
+            && gate
+                .fixture
+                .as_ref()
+                .is_some_and(|fixture| fixture.web_ready(row.id)));
+    let _ = gate;
+    json!({"vm_id":hex::encode(row.id),"name":row.name.as_str(),"kind":"static",
+        "guest":"ubuntu","arch":"x86_64","state":state,"ready":ready,
+        "web_health":if ready { "healthy" } else { "unavailable" },
+        "provenance":{"template_id":hex::encode(row.template),
+            "source_generation":hex::encode(row.provenance.source_generation),
+            "recipe_digest":hex::encode(row.provenance.recipe_digest),
+            "disk_digest":hex::encode(row.provenance.disk_digest),
+            "vars_digest":hex::encode(row.provenance.vars_digest)}})
+}
+
 fn catalog_row(entry: &crate::vm::CatalogEntry, buildable: bool) -> Outcome<Value> {
     let id = hex::encode(entry.id);
     Ok(match (entry.kind, entry.recipe.as_deref()) {
@@ -1240,6 +1432,9 @@ fn vm_row(status: VmStatus, gate: &Gate, get: bool) -> Value {
     }
     if get {
         value["snapshots"] = json!([]);
+        if let Some(activity) = status.cleanup_activity {
+            value["cleanup_activity_id"] = json!(activity);
+        }
         if let Some(cleanup) = status.cleanup.and_then(cleanup_wire) {
             value["cleanup"] = json!(cleanup);
         }
@@ -1286,17 +1481,9 @@ fn operation_row(operation: OperationStatus) -> Value {
             ScriptResult::LaunchFailed => "launch_failed",
             ScriptResult::Terminated => "terminated",
         });
-    } else if operation.state == Status::Interrupted {
-        // Only evidence-backed reasons are projected. The v6 ledger has no
-        // typed failure reason, so other failed or interrupted rows omit it.
-        let reason = match (operation.cleanup, operation.action) {
-            (Some("unconfirmed"), _) => Some("cleanup_unconfirmed"),
-            (_, "run_script") => Some("execution_unknown"),
-            _ => None,
-        };
-        if let Some(reason) = reason {
-            value["reason"] = json!(reason);
-        }
+    }
+    if let Some(reason) = operation.failure {
+        value["reason"] = json!(reason.wire());
     }
     value
 }
@@ -1314,6 +1501,9 @@ fn action_wire(code: i64) -> Option<&'static str> {
         9 => "seal_template",
         10 => "recover",
         BUILD_ACTION => "template_build",
+        STATIC_CREATE_ACTION => "static_create",
+        READ_REFUSAL_ACTION => "read",
+        HOST_REFUSAL_ACTION => "host_execution",
         _ => return None,
     })
 }
@@ -1429,6 +1619,15 @@ mod tests {
     };
     const UTC: i64 = 1_800_000_000_000;
     const RECIPE: (Id, [u8; 32]) = ([3; 16], [4; 32]);
+    const WEB_DIGEST: [u8; 32] = [17; 32];
+    const WEB_RETAINED: DiskClaim = DiskClaim {
+        images: 131_072,
+        ..RETAINED
+    };
+    const WEB_TRANSIENT: DiskClaim = DiskClaim {
+        images: 131_072,
+        ..TRANSIENT
+    };
 
     /// Staged fixture files with real file identities, written through the
     /// reaper's own test custody so expiry and recovery proofs are the 4c2b
@@ -1438,14 +1637,21 @@ mod tests {
 
     impl Artifacts {
         fn write(&self, slot: ArtifactSlot) -> Result<ArtifactEvidence> {
-            self.0.stage(slot, slot.role.as_bytes())
+            self.stage(slot, slot.role.as_bytes())
+        }
+
+        fn stage(&self, slot: ArtifactSlot, bytes: &[u8]) -> Result<ArtifactEvidence> {
+            let evidence = self.0.stage(slot, bytes)?;
+            protect_fixture(&self.0.path(slot.role, slot.key), false)?;
+            Ok(evidence)
         }
 
         fn verify(&self, slot: ArtifactSlot, proof: ArtifactEvidence) -> Result<()> {
             let path = self.0.path(slot.role, slot.key);
             let metadata = fs::symlink_metadata(&path)?;
             ensure!(
-                metadata.file_type().is_file() && proof.pin.verify(fs::File::open(path)?, 128)?,
+                metadata.file_type().is_file()
+                    && proof.pin.verify(fs::File::open(path)?, 131_072)?,
                 "fixture artifact changed"
             );
             Ok(())
@@ -1455,6 +1661,109 @@ mod tests {
             self.verify(slot, proof)?;
             Ok(fs::remove_file(self.0.path(slot.role, slot.key))?)
         }
+    }
+
+    #[cfg(unix)]
+    fn protect_fixture(path: &Path, directory: bool) -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = if directory { 0o700 } else { 0o600 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        let metadata = fs::symlink_metadata(path)?;
+        ensure!(
+            metadata.is_dir() == directory
+                && metadata.mode() & 0o7777 == mode
+                && metadata.uid() == unsafe { libc::geteuid() },
+            "static fixture permissions"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn protect_fixture(path: &Path, directory: bool) -> Result<()> {
+        use std::{os::windows::ffi::OsStrExt, ptr};
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::{Authorization::*, *},
+        };
+        let identity = crate::local::vm_supervisor_identity()?;
+        let inheritance = if directory { "OICI" } else { "" };
+        let sddl: Vec<u16> = format!("O:{identity}D:P(A;{inheritance};FA;;;{identity})")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // The converted descriptor owns its SID and ACL pointers through SetNamedSecurityInfoW.
+        unsafe {
+            let mut sd = ptr::null_mut();
+            ensure!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut sd,
+                    ptr::null_mut()
+                ) != 0,
+                "static fixture descriptor"
+            );
+            let (mut present, mut defaulted) = (0, 0);
+            let (mut owner, mut dacl) = (ptr::null_mut(), ptr::null_mut());
+            let read = GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) != 0
+                && GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) != 0;
+            let set = read
+                && SetNamedSecurityInfoW(
+                    path_wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION
+                        | PROTECTED_DACL_SECURITY_INFORMATION,
+                    owner,
+                    ptr::null_mut(),
+                    dacl,
+                    ptr::null_mut(),
+                ) == 0;
+            let mut checked = ptr::null_mut();
+            let (mut checked_owner, mut checked_dacl) = (ptr::null_mut(), ptr::null_mut());
+            let fetched = set
+                && GetNamedSecurityInfoW(
+                    path_wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut checked_owner,
+                    ptr::null_mut(),
+                    &mut checked_dacl,
+                    ptr::null_mut(),
+                    &mut checked,
+                ) == 0;
+            let (mut control, mut revision) = (0, 0);
+            let exact = fetched
+                && !checked_owner.is_null()
+                && !checked_dacl.is_null()
+                && EqualSid(owner, checked_owner) != 0
+                && GetSecurityDescriptorControl(checked, &mut control, &mut revision) != 0
+                && control & SE_DACL_PROTECTED != 0
+                && (*checked_dacl).AceCount == 1;
+            if !checked.is_null() {
+                LocalFree(checked);
+            }
+            LocalFree(sd);
+            ensure!(exact, "static fixture owner/DACL");
+        }
+        crate::security::private(path)?;
+        Ok(())
+    }
+
+    fn fixture_qcow2() -> Vec<u8> {
+        let mut header = vec![0; 65_536];
+        header[..4].copy_from_slice(b"QFI\xfb");
+        header[4..8].copy_from_slice(&3u32.to_be_bytes());
+        header[20..24].copy_from_slice(&16u32.to_be_bytes());
+        header[24..32].copy_from_slice(&(1u64 << 20).to_be_bytes());
+        header[36..40].copy_from_slice(&1u32.to_be_bytes());
+        header[40..48].copy_from_slice(&0x3_0000u64.to_be_bytes());
+        header[48..56].copy_from_slice(&0x1_0000u64.to_be_bytes());
+        header[56..60].copy_from_slice(&1u32.to_be_bytes());
+        header[96..100].copy_from_slice(&4u32.to_be_bytes());
+        header[100..104].copy_from_slice(&112u32.to_be_bytes());
+        header
     }
 
     /// The fixture's teardown authority for the 4c2b reaper. Release is
@@ -1483,6 +1792,13 @@ mod tests {
         fn force_reap(&self, _: &CleanupWork, _: Instant) -> runtime::StopDisposition {
             runtime::StopDisposition::ChargedQuarantine
         }
+
+        fn static_released(&self, vm: Id, _: Id, _: Instant) -> bool {
+            let live = self.live.lock().unwrap();
+            !live.boots.contains_key(&vm)
+                && !live.working.contains(&vm)
+                && !live.stuck.contains(&vm)
+        }
     }
 
     /// Injected reaper turns for the supervised runner.
@@ -1507,9 +1823,23 @@ mod tests {
     struct Live {
         templates: HashMap<Id, Pair>,
         instances: HashMap<Id, Pair>,
+        static_instances: HashMap<Id, (Pair, Arc<FixtureOrigin>)>,
         boots: HashMap<Id, Slot>,
         /// VMs with a registered, not yet joined fixture worker.
         working: HashSet<Id>,
+        /// Static VMs whose boot release this fixture refuses to prove.
+        stuck: HashSet<Id>,
+    }
+
+    /// Injected static copy faults, consumed by the next static create.
+    #[derive(Clone, Copy)]
+    pub(super) enum StaticFault {
+        /// The disk leaf is written, then the VARS copy fails. The worker
+        /// disposes of its own identified disk only when `dispose` is set.
+        AfterDisk { dispose: bool },
+        /// The disk leaf is written and the VARS write is interrupted after
+        /// creating a partial file whose identity is not captured.
+        Interrupted,
     }
 
     pub(super) struct Fixture {
@@ -1518,6 +1848,9 @@ mod tests {
         artifacts: Artifacts,
         build_hold: Option<Arc<Notify>>,
         script_hold: Option<Arc<Notify>>,
+        static_hold: Option<Arc<Notify>>,
+        static_fault: Option<StaticFault>,
+        host: HostObservation,
         /// A cancelled build worker reports failure, to witness drain errors.
         fail_cancelled: bool,
         failed: bool,
@@ -1558,6 +1891,9 @@ mod tests {
                 artifacts: Artifacts(Arc::new(FixtureCustody::open(root).unwrap())),
                 build_hold: None,
                 script_hold: None,
+                static_hold: None,
+                static_fault: None,
+                host: HOST,
                 fail_cancelled: false,
                 failed: false,
             }
@@ -1565,6 +1901,15 @@ mod tests {
 
         pub(super) fn ready(&self, vm: Id) -> bool {
             self.live.lock().unwrap().boots.contains_key(&vm)
+        }
+
+        pub(super) fn web_ready(&self, vm: Id) -> bool {
+            let live = self.live.lock().unwrap();
+            match live.boots.get(&vm) {
+                Some(Slot::Idle(boot)) => boot.origin.as_ref().is_some_and(|claim| claim.verify()),
+                Some(Slot::Exchanging) => live.static_instances.contains_key(&vm),
+                None => false,
+            }
         }
 
         pub(super) fn reaper(&self) -> FixtureReaper {
@@ -1623,13 +1968,19 @@ mod tests {
             let (operation, vm) = match work {
                 Work::Build => {
                     let recipe = hex::encode(id);
+                    let web = id == WEB_RECIPE_ID;
+                    let (retained, transient) = if web {
+                        (WEB_RETAINED, WEB_TRANSIENT)
+                    } else {
+                        (RETAINED, TRANSIENT)
+                    };
                     let spec = BuildRequest {
                         principal,
                         key,
                         recipe: &recipe,
                         digest: digest.ok_or(NOT_FOUND)?,
-                        retained: RETAINED,
-                        transient: TRANSIENT,
+                        retained,
+                        transient,
                     };
                     let (slots, worker, reference) = match controller.admit_build(
                         spec,
@@ -1667,8 +2018,8 @@ mod tests {
                             key,
                             recipe: &recipe,
                             digest,
-                            retained: RETAINED,
-                            transient: TRANSIENT,
+                            retained,
+                            transient,
                         };
                         let [disk, vars, seed, overlay, verify_vars] = [
                             slots.pair.disk,
@@ -1679,7 +2030,11 @@ mod tests {
                         ];
                         let mut proof = Vec::new();
                         for slot in [disk, vars, seed, overlay, verify_vars] {
-                            let file = artifacts.write(slot)?;
+                            let file = if web && slot == disk {
+                                artifacts.stage(slot, &fixture_qcow2())?
+                            } else {
+                                artifacts.write(slot)?
+                            };
                             controller.build_evidence(
                                 &worker,
                                 slots.id,
@@ -1700,6 +2055,68 @@ mod tests {
                             "fixture build interrupted"
                         );
                         registry.templates.insert(slots.id, (slots.pair, pair));
+                        Ok(())
+                    });
+                    return Ok(receipt(reference.id, None));
+                }
+                Work::StaticCreate(ref name) => {
+                    use crate::vm::static_web::FullCopyReservation;
+                    let (golden, proof) = registry
+                        .templates
+                        .get(&id)
+                        .copied()
+                        .ok_or(STATE_UNAVAILABLE)?;
+                    let disk = FullCopyReservation {
+                        qcow2_bytes: proof[0].pin.size,
+                        qcow2_growth_bytes: 1 << 20,
+                        vars_bytes: proof[1].pin.size,
+                        staging_bytes: 65_536,
+                        metadata_bytes: 4096,
+                    }
+                    .checked_claim()
+                    .ok_or(Fault("disk"))?;
+                    let binding = crate::store::vm::Binding {
+                        principal,
+                        key,
+                        subject: static_subject(id, name),
+                        action,
+                    };
+                    let (vm, slots, worker, reference) = match controller.admit_static(
+                        binding,
+                        name,
+                        id,
+                        (golden, proof),
+                        WEB_DIGEST,
+                        disk,
+                        self.host,
+                        RESOURCES,
+                    )? {
+                        Ok(admitted) => admitted,
+                        Err(reason) => return inventory.refuse(action, None, reason.into()),
+                    };
+                    let hold = self.static_hold.take();
+                    let fault = self.static_fault.take();
+                    self.jobs.spawn(async move {
+                        let copied = if released(hold, &cancel).await {
+                            copy_and_provision(&artifacts, (golden, proof), slots, fault, &cancel)
+                                .await
+                        } else {
+                            // Cancelled before any effect on the candidate.
+                            Err(CopyFailure::untouched(FailureReason::Cancelled))
+                        };
+                        let outcome = copied
+                            .as_ref()
+                            .map(|(pair, _)| *pair)
+                            .map_err(|failure| *failure);
+                        let mut registry = live.lock().unwrap();
+                        let status = controller.finish_static(&worker, slots, outcome)?;
+                        if status == Status::Succeeded
+                            && let Ok((pair, origin)) = copied
+                        {
+                            registry
+                                .static_instances
+                                .insert(vm, ((slots, pair), Arc::new(origin)));
+                        }
                         Ok(())
                     });
                     return Ok(receipt(reference.id, None));
@@ -1730,9 +2147,17 @@ mod tests {
                             (vm, slots, worker, reference)
                         }
                         CloneAdmission::Existing(reference) => {
-                            return Ok(receipt(reference.id, None));
+                            return Ok(receipt(
+                                reference.id,
+                                controller
+                                    .operation_status(principal, reference.id)??
+                                    .expires_at_ms,
+                            ));
                         }
                     };
+                    let expires = controller
+                        .operation_status(principal, reference.id)??
+                        .expires_at_ms;
                     self.jobs.spawn(async move {
                         let pair = [artifacts.write(slots.disk)?, artifacts.write(slots.vars)?];
                         let mut registry = live.lock().unwrap();
@@ -1744,7 +2169,7 @@ mod tests {
                         registry.instances.insert(vm, (slots, pair));
                         Ok(())
                     });
-                    return Ok(receipt(reference.id, None));
+                    return Ok(receipt(reference.id, expires));
                 }
                 Work::Extend(ttl) => {
                     let end = controller.extend_lease(principal, id, key, ttl)??;
@@ -1770,7 +2195,28 @@ mod tests {
                 operation,
                 disk: DiskClaim::default(),
             };
-            let mut worker = match controller.admit(request, HOST, RESOURCES)? {
+            if matches!(work, Work::Start)
+                && !registry.static_instances.contains_key(&vm)
+                && !controller
+                    .foreground_static_rows(principal, Some(vm), None, 1)?
+                    .is_empty()
+            {
+                // Rehydrate the committed pair from durable custody records;
+                // the boot re-verifies both files before launch. The fixture
+                // origin key is in memory only, so a fresh one is issued
+                // for the same generation name.
+                match controller.static_custody(principal, vm)? {
+                    Some(pair) => {
+                        let origin = FixtureOrigin::new(pair.0.disk.generation)
+                            .map_err(|_| STATE_UNAVAILABLE)?;
+                        registry
+                            .static_instances
+                            .insert(vm, (pair, Arc::new(origin)));
+                    }
+                    None => return inventory.refuse(action, Some(vm), Refusal::NotReady.into()),
+                }
+            }
+            let mut worker = match controller.admit(request, self.host, RESOURCES)? {
                 Admission::Admitted(worker) => worker,
                 Admission::Existing(prior) => {
                     return Ok(receipt(
@@ -1788,9 +2234,15 @@ mod tests {
             match work {
                 Work::Start => {
                     let controller = controller.clone();
+                    let static_pair = registry.static_instances.get(&vm).cloned();
                     self.jobs.spawn(async move {
                         let _working = working;
-                        let boot = Boot::start(&cancel).await;
+                        let boot = match static_pair {
+                            Some((pair, identity)) => {
+                                Boot::start_static(&artifacts, pair, &identity, &cancel).await
+                            }
+                            None => Boot::start(&cancel).await,
+                        };
                         match boot {
                             Ok(boot) => {
                                 // Publish ready only if this worker's settlement
@@ -1812,7 +2264,11 @@ mod tests {
                                 }
                             }
                             Err(_) => {
-                                controller.finish(&worker, Completion::CleanupUnconfirmed)?;
+                                controller.finish_with_cause(
+                                    &worker,
+                                    Completion::CleanupUnconfirmed,
+                                    Some(FailureReason::BootFailed),
+                                )?;
                             }
                         }
                         Ok(())
@@ -1826,18 +2282,19 @@ mod tests {
                     let controller = controller.clone();
                     self.jobs.spawn(async move {
                         let _working = working;
-                        let complete = match boot {
-                            Some(boot) => boot.stop().await.is_ok(),
-                            None => false,
-                        };
-                        controller.finish(
-                            &worker,
-                            if complete {
-                                Completion::Succeeded
-                            } else {
-                                Completion::CleanupUnconfirmed
+                        // A failed powerdown is a known dirty stop; a missing
+                        // boot leaves the cause unknown.
+                        let (completion, cause) = match boot {
+                            Some(boot) => match boot.stop().await {
+                                Ok(()) => (Completion::Succeeded, None),
+                                Err(_) => (
+                                    Completion::CleanupUnconfirmed,
+                                    Some(FailureReason::DirtyStop),
+                                ),
                             },
-                        )?;
+                            None => (Completion::CleanupUnconfirmed, None),
+                        };
+                        controller.finish_with_cause(&worker, completion, cause)?;
                         Ok(())
                     });
                 }
@@ -1872,8 +2329,13 @@ mod tests {
                                 }
                             }
                             None => {
+                                // The guest result was lost: execution unknown.
                                 live.lock().unwrap().boots.remove(&vm);
-                                controller.finish(&worker, Completion::CleanupUnconfirmed)?;
+                                controller.finish_with_cause(
+                                    &worker,
+                                    Completion::CleanupUnconfirmed,
+                                    Some(FailureReason::ExecutionUnknown),
+                                )?;
                                 Some(boot)
                             }
                         };
@@ -1890,6 +2352,100 @@ mod tests {
                 None,
             ))
         }
+    }
+
+    /// Copy the sealed fixture pair into the candidate's exclusive leaves and
+    /// run its private first boot. A failure reports what each candidate
+    /// slot is proven to hold; this worker may dispose only of an object it
+    /// created and identified itself.
+    async fn copy_and_provision(
+        artifacts: &Artifacts,
+        (golden, proofs): Pair,
+        slots: PairSlots,
+        fault: Option<StaticFault>,
+        cancel: &Shutdown,
+    ) -> Result<([ArtifactEvidence; 2], FixtureOrigin), CopyFailure> {
+        use crate::vm::CandidateSlot::{Absent, Retained, Unknown};
+        let failed = |slots| CopyFailure {
+            reason: FailureReason::CloneFailed,
+            slots,
+        };
+        let bytes = |slot: ArtifactSlot, proof: ArtifactEvidence| -> Result<Vec<u8>> {
+            use std::io::{Read, Seek};
+            let path = artifacts.0.path(slot.role, slot.key);
+            ensure!(
+                fs::symlink_metadata(&path)?.is_file(),
+                "invalid static fixture source"
+            );
+            let mut file = fs::File::open(&path)?;
+            ensure!(
+                proof.pin.verify(&mut file, 131_072)?,
+                "static fixture source changed"
+            );
+            file.rewind()?;
+            let mut content = Vec::new();
+            file.take(131_073).read_to_end(&mut content)?;
+            ensure!(
+                content.len() as u64 == proof.pin.size
+                    && Sha256::digest(&content)[..] == proof.pin.sha256,
+                "invalid static fixture length or digest"
+            );
+            Ok(content)
+        };
+        // Source reads and header checks precede every destination effect.
+        let source = (|| {
+            let disk = bytes(golden.disk, proofs[0])?;
+            let vars = bytes(golden.vars, proofs[1])?;
+            crate::vm::qemu_img::inspect_header(&disk, None)
+                .map_err(|_| anyhow::anyhow!("invalid static fixture image"))?;
+            Ok::<_, anyhow::Error>((disk, vars))
+        })();
+        let Ok((disk, vars)) = source else {
+            return Err(CopyFailure::untouched(FailureReason::CloneFailed));
+        };
+        // An exclusive create that fails may still have left an object.
+        let Ok(disk_file) = artifacts.stage(slots.disk, &disk) else {
+            return Err(failed([Unknown, Absent]));
+        };
+        match fault {
+            Some(StaticFault::AfterDisk { dispose }) => {
+                let disk_slot = if dispose && artifacts.remove(slots.disk, disk_file).is_ok() {
+                    Absent
+                } else {
+                    Retained(disk_file)
+                };
+                return Err(failed([disk_slot, Absent]));
+            }
+            Some(StaticFault::Interrupted) => {
+                use std::io::Write;
+                let path = artifacts.0.path(slots.vars.role, slots.vars.key);
+                if let Ok(mut file) = fs::File::create_new(path) {
+                    let _ = file.write_all(&vars[..vars.len() / 2]);
+                }
+                return Err(failed([Retained(disk_file), Unknown]));
+            }
+            None => {}
+        }
+        let Ok(vars_file) = artifacts.stage(slots.vars, &vars) else {
+            return Err(failed([Retained(disk_file), Unknown]));
+        };
+        let files = [disk_file, vars_file];
+        let committed = [Retained(disk_file), Retained(vars_file)];
+        let boot = Boot::start(cancel).await.map_err(|_| CopyFailure {
+            reason: FailureReason::BootFailed,
+            slots: committed,
+        })?;
+        let origin = FixtureOrigin::new(slots.disk.generation);
+        // Finish the private boot even when the synthetic provisioning fails.
+        boot.stop().await.map_err(|_| CopyFailure {
+            reason: FailureReason::DirtyStop,
+            slots: committed,
+        })?;
+        let origin = origin.map_err(|_| CopyFailure {
+            reason: FailureReason::HealthFailed,
+            slots: committed,
+        })?;
+        Ok((files, origin))
     }
 
     /// Marks a VM as held by a fixture worker until the worker finishes.
@@ -1931,9 +2487,131 @@ mod tests {
         qmp: Monitor,
         peer: JoinHandle<Result<()>>,
         guest: JoinHandle<Result<()>>,
+        origin: Option<crate::vm::static_web::OriginPortLease>,
+    }
+
+    /// Synthetic guest endpoint and independently configured host trust.
+    /// This fixture has no production serial encoder, and never logs key bytes.
+    struct FixtureOrigin {
+        name: String,
+        guest: Arc<rustls::ServerConfig>,
+        client: Arc<rustls::ClientConfig>,
+    }
+
+    impl FixtureOrigin {
+        fn new(generation: Id) -> Result<Self> {
+            use crate::vm::static_web::StaticOriginIdentity;
+            use rcgen::{
+                BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer,
+                KeyPair, KeyUsagePurpose,
+            };
+            use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+            let plan = StaticOriginIdentity::for_generation(generation).provisioning();
+            let name = plan.server_name().to_owned();
+            let now = time::OffsetDateTime::now_utc();
+            let mut ca = CertificateParams::default();
+            ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+            ca.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+            ca.not_before = now - time::Duration::minutes(1);
+            ca.not_after = now + time::Duration::days(1);
+            let ca_key = KeyPair::generate()?;
+            let certificate = ca.self_signed(&ca_key)?;
+            let issuer = Issuer::new(ca, ca_key);
+            let mut leaf = CertificateParams::new(vec![name.clone()])?;
+            leaf.not_before = now - time::Duration::minutes(1);
+            leaf.not_after = now + time::Duration::days(1);
+            leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+            let key = KeyPair::generate()?;
+            let cert = leaf.signed_by(&key, &issuer)?;
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let guest = rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()?
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+                )?;
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(certificate.der().clone())?;
+            let client = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            Ok(Self {
+                name,
+                guest: Arc::new(guest),
+                client: Arc::new(client),
+            })
+        }
+
+        async fn probe(
+            &self,
+            lease: &crate::vm::static_web::OriginPortLease,
+            expected: String,
+        ) -> Result<()> {
+            let listener = tokio::net::TcpListener::from_std(lease.fixture_listener()?)?;
+            let address = listener.local_addr()?;
+            let tls = tokio_rustls::TlsAcceptor::from(self.guest.clone());
+            let connector = tokio_rustls::TlsConnector::from(self.client.clone());
+            const REQUEST: &[u8] =
+                b"GET /arx-health HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n";
+            const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nok\n";
+            let guest = async {
+                let (socket, _) = listener.accept().await?;
+                let mut stream = tls.accept(socket).await?;
+                let mut request = [0; REQUEST.len()];
+                stream.read_exact(&mut request).await?;
+                ensure!(request == REQUEST, "invalid fixture health request");
+                stream.write_all(RESPONSE).await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            let host = async {
+                let socket = tokio::net::TcpStream::connect(address).await?;
+                let mut stream = connector.connect(expected.try_into()?, socket).await?;
+                stream.write_all(REQUEST).await?;
+                let mut response = [0; RESPONSE.len()];
+                stream.read_exact(&mut response).await?;
+                ensure!(response == RESPONSE, "invalid fixture health response");
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::try_join!(host, guest)
+            })
+            .await??;
+            Ok(())
+        }
     }
 
     impl Boot {
+        async fn start_static(
+            artifacts: &Artifacts,
+            (slots, [disk, vars]): Pair,
+            identity: &FixtureOrigin,
+            cancel: &Shutdown,
+        ) -> Result<Self> {
+            for (slot, proof) in [(slots.disk, disk), (slots.vars, vars)] {
+                let path = artifacts.0.path(slot.role, slot.key);
+                ensure!(
+                    fs::symlink_metadata(&path)?.is_file()
+                        && proof.pin.verify(fs::File::open(path)?, 131_072)?,
+                    "static fixture changed"
+                );
+            }
+            let origin = crate::vm::static_web::OriginPortLease::acquire()?;
+            ensure!(origin.verify(), "static origin listener mismatch");
+            let mut boot = Self::start(cancel).await?;
+            if identity
+                .probe(&origin, identity.name.clone())
+                .await
+                .is_err()
+            {
+                boot.release().await?;
+                anyhow::bail!("static fixture TLS proof failed");
+            }
+            boot.origin = Some(origin);
+            Ok(boot)
+        }
+
         async fn start(cancel: &Shutdown) -> Result<Self> {
             let (host, mut peer) = tokio::io::duplex(4096);
             let (serial, guest) = tokio::io::duplex(8192);
@@ -1992,6 +2670,7 @@ mod tests {
                     qmp,
                     peer,
                     guest,
+                    origin: None,
                 }),
                 Err(_) => {
                     peer.await??;
@@ -2160,11 +2839,39 @@ mod tests {
 
     impl Harness {
         async fn start(fail_cancelled: bool, interrupt_on_fatal_accept: bool) -> Self {
+            Self::start_with_web(fail_cancelled, interrupt_on_fatal_accept, false).await
+        }
+
+        async fn start_with_web(
+            fail_cancelled: bool,
+            interrupt_on_fatal_accept: bool,
+            web: bool,
+        ) -> Self {
             let temp = crate::service::application::tests::private_temp();
             let media = temp.path().join("fixture-media");
             fs::create_dir(&media).unwrap();
+            protect_fixture(&media, true).unwrap();
             let now = Arc::new(AtomicI64::new(UTC));
-            let supervisor = Supervisor::new(
+            Self::launch(
+                (temp, media, now),
+                fail_cancelled,
+                interrupt_on_fatal_accept,
+                web,
+                |_| {},
+            )
+            .await
+        }
+
+        /// Open a supervisor, fixture and server over existing state and
+        /// fixture media, as a fresh foreground process would.
+        async fn launch(
+            (temp, media, now): (tempfile::TempDir, std::path::PathBuf, Arc<AtomicI64>),
+            fail_cancelled: bool,
+            interrupt_on_fatal_accept: bool,
+            web: bool,
+            configure: impl FnOnce(&mut Fixture),
+        ) -> Self {
+            let mut supervisor = Supervisor::new(
                 temp.path(),
                 VmPolicy::default(),
                 ForegroundClock {
@@ -2175,12 +2882,17 @@ mod tests {
                 None,
             )
             .unwrap();
+            if web {
+                Arc::get_mut(&mut supervisor).unwrap().recipes[1] =
+                    Some((WEB_RECIPE_ID, Some(WEB_DIGEST)));
+            }
             let hold_build = Arc::new(Notify::new());
             let hold_script = Arc::new(Notify::new());
             let mut fixture = Fixture::new(&media);
             fixture.build_hold = Some(hold_build.clone());
             fixture.script_hold = Some(hold_script.clone());
             fixture.fail_cancelled = fail_cancelled;
+            configure(&mut fixture);
             supervisor.gate.lock().unwrap().fixture = Some(fixture);
             let (ticks, receiver) = tokio::sync::mpsc::unbounded_channel();
             *supervisor.ticks.lock().unwrap() = Some(TestTicks(receiver));
@@ -2249,6 +2961,39 @@ mod tests {
 
         fn supervisor(&self) -> &Arc<Supervisor> {
             self.supervisor.as_ref().unwrap()
+        }
+
+        /// Interrupt the server and return its drain and recovery result.
+        /// Callers drop their clients first.
+        async fn shutdown(&mut self) -> Result<()> {
+            self.interrupt.take().unwrap().send(()).unwrap();
+            let result = self.server.take().unwrap().await.unwrap();
+            self.supervisor = None;
+            result
+        }
+
+        /// A new foreground process over the same state and fixture media.
+        async fn reopen(self, configure: impl FnOnce(&mut Fixture)) -> Self {
+            assert!(self.server.is_none(), "shut down before reopening");
+            Self::launch(
+                (self.temp, self.media, self.now),
+                false,
+                false,
+                true,
+                configure,
+            )
+            .await
+        }
+
+        fn fixture<T>(&self, run: impl FnOnce(&mut Fixture) -> T) -> T {
+            run(self
+                .supervisor()
+                .gate
+                .lock()
+                .unwrap()
+                .fixture
+                .as_mut()
+                .unwrap())
         }
 
         async fn connect(&self, token: &str) -> Result<Box<dyn Stream>> {
@@ -2325,6 +3070,615 @@ mod tests {
             }
         }
         files
+    }
+
+    #[tokio::test]
+    async fn static_web_vm_local_sdk_keeps_independent_storage_through_expiry_and_restart() {
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let b = h.client(1).await;
+        let web = call(
+            &a,
+            "vm_template_build",
+            json!({
+                "recipe_id":hex::encode(WEB_RECIPE_ID),"request_id":key(101)
+            }),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(&a, &web).await["template_id"].clone();
+        assert!(template.is_string());
+        let clone = call(
+            &a,
+            "vm_create",
+            json!({
+                "template_id":template,"request_id":key(102),"ttl_s":60
+            }),
+        )
+        .await;
+        assert_eq!(clone["expires_at_ms"], UTC + 60_000);
+        let test = terminal(&a, &clone).await["vm_id"].clone();
+
+        {
+            let mut gate = h.supervisor().gate.lock().unwrap();
+            gate.fixture.as_mut().unwrap().host.capacity = Some(Capacity {
+                free_bytes: 0,
+                managed_bytes: 0,
+            });
+        }
+        assert_eq!(
+            call(
+                &a,
+                "static_vm_create",
+                json!({
+                    "name":"no-capacity","template_id":template,"request_id":key(110)
+                })
+            )
+            .await["reason"],
+            "disk"
+        );
+        assert_eq!(
+            call(&a, "static_vm_list", json!({})).await["entries"],
+            json!([])
+        );
+        let hold = Arc::new(Notify::new());
+        {
+            let mut gate = h.supervisor().gate.lock().unwrap();
+            let fixture = gate.fixture.as_mut().unwrap();
+            fixture.host = HOST;
+            fixture.static_hold = Some(hold.clone());
+        }
+        let args = json!({"name":"First-Site","template_id":template,"request_id":key(103)});
+        let create = call(&a, "static_vm_create", args.clone()).await;
+        let pending = call(&a, "static_vm_list", json!({})).await;
+        assert_eq!(pending["entries"][0]["state"], "creating");
+        let charges = || {
+            let db = rusqlite::Connection::open_with_flags(
+                h.temp.path().join("activity.sqlite3"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            db.query_row(
+                "SELECT persistent,staging FROM vm_static_instances WHERE name='first-site'",
+                [],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .unwrap()
+        };
+        let (persistent, staging) = charges();
+        assert_eq!(
+            (persistent, staging),
+            (65_536 + b"vars".len() as u64 + (1 << 20) + 4096, 65_536)
+        );
+        assert_eq!(
+            call(
+                &b,
+                "static_vm_create",
+                json!({"name":"first-site","template_id":template,
+            "request_id":key(104)})
+            )
+            .await["reason"],
+            "name_unavailable"
+        );
+        hold.notify_one();
+        let settled = terminal(&a, &create).await;
+        assert_eq!(settled["state"], "succeeded", "{settled}");
+        assert_eq!(charges(), (persistent, 0));
+        let vm = settled["vm_id"].clone();
+        let get = json!({"vm_id":vm});
+        let stopped = call(&a, "static_vm_get", get.clone()).await;
+        assert_eq!(stopped["name"], "first-site");
+        assert_eq!(stopped["state"], "stopped");
+        assert!(stopped.get("expires_at_ms").is_none());
+        assert_eq!(
+            call(
+                &a,
+                "static_vm_create",
+                json!({"name":"first-site","template_id":template,
+            "request_id":key(103)})
+            )
+            .await,
+            create
+        );
+        assert_eq!(
+            call(
+                &a,
+                "static_vm_create",
+                json!({"name":"second-site","template_id":template,
+            "request_id":key(103)})
+            )
+            .await["reason"],
+            "key_collision"
+        );
+        assert_eq!(
+            call(&b, "static_vm_get", get.clone()).await["reason"],
+            "not_found"
+        );
+        assert_eq!(
+            call(&b, "static_vm_list", json!({})).await["entries"],
+            json!([])
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_extend",
+                json!({"vm_id":vm,"request_id":key(105),"ttl_s":600})
+            )
+            .await["reason"],
+            "not_found"
+        );
+        for tool in ["static_vm_delete", "backup_delete"] {
+            assert_eq!(
+                call(&a, tool, get.clone()).await["reason"],
+                "static_delete_forbidden"
+            );
+        }
+        let static_files = || {
+            state_bytes(&h.media)
+                .into_iter()
+                .filter(|(path, _)| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("static_")
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let files = static_files();
+        assert_eq!(files.len(), 2);
+        let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(106)})).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let running = call(&a, "static_vm_get", get.clone()).await;
+        assert_eq!(running["state"], "running");
+        assert_eq!(running["web_health"], "healthy");
+        assert_eq!(running["ready"], true);
+        let script = call(
+            &a,
+            "vm_run_script",
+            json!({"vm_id":vm,"request_id":key(107),"script":"exit 7"}),
+        )
+        .await;
+        h.hold_script.notify_one();
+        assert_eq!(terminal(&a, &script).await["exit_code"], 7);
+        h.supervisor()
+            .gate
+            .lock()
+            .unwrap()
+            .fixture
+            .as_mut()
+            .unwrap()
+            .host = HostObservation {
+            owner_idle: Some(false),
+            logical_cpus: Some(1),
+            available_ram: Some(0),
+            capacity: None,
+        };
+        let stop = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(108)})).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+
+        h.now.store(UTC + 60_000, Ordering::Relaxed);
+        h.tick().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if call(&a, "vm_get", json!({"vm_id":test})).await["state"] == "expired" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let tombstone = call(&a, "vm_get", json!({"vm_id":test})).await;
+        assert_eq!(tombstone["cleanup"], "confirmed");
+        let cleanup_id = tombstone["cleanup_activity_id"].as_i64().unwrap();
+        let db = rusqlite::Connection::open(h.temp.path().join("activity.sqlite3")).unwrap();
+        db.execute(
+            "UPDATE activity SET cleanup_confirmed=0 WHERE id=?1",
+            [cleanup_id],
+        )
+        .unwrap();
+        drop(db);
+        let tombstone = call(&a, "vm_get", json!({"vm_id":test})).await;
+        assert_eq!(tombstone["cleanup"], "cleanup_unconfirmed");
+        assert_eq!(tombstone["cleanup_activity_id"], cleanup_id);
+        assert_eq!(
+            call(&a, "list_activity", json!({"activity_id":cleanup_id})).await["activities"],
+            json!([])
+        );
+        assert_eq!(call(&a, "static_vm_get", get.clone()).await, stopped);
+        assert_eq!(static_files(), files);
+        assert_eq!(charges(), (persistent, 0));
+
+        h.supervisor()
+            .gate
+            .lock()
+            .unwrap()
+            .fixture
+            .as_mut()
+            .unwrap()
+            .host = HOST;
+        // Change the original fixture through its known private object. A
+        // fresh copy now fails before any destination effect, so the
+        // untouched candidate releases its name, slot and charges. The
+        // committed pair is independent.
+        let golden = {
+            let gate = h.supervisor().gate.lock().unwrap();
+            let fixture = gate.fixture.as_ref().unwrap();
+            let live = fixture.live.lock().unwrap();
+            let (slots, _) = live.templates[&parse_id(template.as_str().unwrap()).unwrap()];
+            fixture.artifacts.0.path(slots.disk.role, slots.disk.key)
+        };
+        fs::write(golden, b"changed fixture source").unwrap();
+        let failed = call(
+            &a,
+            "static_vm_create",
+            json!({
+                "name":"failed-copy","template_id":template,"request_id":key(109)
+            }),
+        )
+        .await;
+        let failed = terminal(&a, &failed).await;
+        assert_eq!(failed["reason"], "clone_failed");
+        assert_eq!(failed["cleanup"], "confirmed");
+        assert_eq!(static_files(), files);
+        let db = rusqlite::Connection::open(h.temp.path().join("activity.sqlite3")).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM vm_static_instances WHERE name='failed-copy'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        drop(db);
+        assert_eq!(charges(), (persistent, 0));
+
+        let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(111)})).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let stop = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(112)})).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        assert_eq!(static_files(), files);
+        drop((a, b));
+        h.interrupt.take().unwrap().send(()).unwrap();
+        h.server.take().unwrap().await.unwrap().unwrap();
+        let host = h.supervisor().host_id;
+        h.supervisor = None;
+        let reopened = Supervisor::new(
+            h.temp.path(),
+            VmPolicy::default(),
+            ForegroundClock {
+                utc: Some(h.now.clone()),
+            },
+            None,
+            NativeRefusal::QualificationMissing,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened.host_id, host);
+        let connection = reopened.connection("alpha".into());
+        let inventory = connection.inventory();
+        let mut expected = stopped;
+        expected.as_object_mut().unwrap().remove("ok");
+        // The SDK adds the success flag after dispatch.
+        assert_eq!(
+            inventory
+                .dispatch(request("static_vm_get", get), || false)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(static_files(), files);
+    }
+
+    async fn web_template(h: &Harness, client: &Client, number: u64) -> Value {
+        let web = call(
+            client,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(WEB_RECIPE_ID),"request_id":key(number)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(client, &web).await["template_id"].clone();
+        assert!(template.is_string());
+        template
+    }
+
+    fn static_paths(media: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+        state_bytes(media)
+            .into_iter()
+            .map(|(path, _)| path)
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("static_")
+            })
+            .collect()
+    }
+
+    fn read_state(h: &Harness) -> rusqlite::Connection {
+        rusqlite::Connection::open_with_flags(
+            h.temp.path().join("activity.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+    }
+
+    /// (state, persistent, staging) for a named static row, if present.
+    fn static_charge(h: &Harness, name: &str) -> Option<(i64, u64, u64)> {
+        use rusqlite::OptionalExtension;
+        read_state(h)
+            .query_row(
+                "SELECT state,persistent,staging FROM vm_static_instances WHERE name=?1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn static_failed_copies_release_only_proven_untouched_candidates() {
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let template = web_template(&h, &a, 201).await;
+        let create = |name: &str, number| json!({"name":name,"template_id":template,"request_id":key(number)});
+
+        // The disk leaf is written, the VARS copy fails, and the worker
+        // disposes of the exact disk it identified: nothing stays charged.
+        h.fixture(|f| f.static_fault = Some(StaticFault::AfterDisk { dispose: true }));
+        let failed = call(&a, "static_vm_create", create("site-one", 202)).await;
+        let failed = terminal(&a, &failed).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (
+                &json!("failed"),
+                &json!("clone_failed"),
+                &json!("confirmed")
+            )
+        );
+        assert_eq!(static_charge(&h, "site-one"), None);
+        assert!(static_paths(&h.media).is_empty());
+
+        // Disposal unproven: the identified leaf is quarantined and charged
+        // and the candidate keeps its name.
+        h.fixture(|f| f.static_fault = Some(StaticFault::AfterDisk { dispose: false }));
+        let failed = call(&a, "static_vm_create", create("site-two", 203)).await;
+        let failed = terminal(&a, &failed).await;
+        assert_eq!(
+            (&failed["reason"], &failed["cleanup"]),
+            (&json!("clone_failed"), &json!("cleanup_unconfirmed"))
+        );
+        let (state, persistent, staging) = static_charge(&h, "site-two").unwrap();
+        assert_eq!((state, staging), (4, 65_536));
+        assert!(persistent > 0);
+        assert_eq!(static_paths(&h.media).len(), 1);
+        {
+            let db = read_state(&h);
+            let mut stmt = db
+                .prepare(
+                    "SELECT a.role,a.state,a.file_id IS NOT NULL FROM vm_artifacts a
+                     JOIN vm_generations g ON g.id=a.generation_id
+                     JOIN vm_static_instances s ON s.id=g.static_id
+                     WHERE s.name='site-two' ORDER BY a.role",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                [
+                    ("static_disk".into(), "quarantined".into(), true),
+                    ("static_vars".into(), "quarantined".into(), false)
+                ]
+            );
+        }
+        assert_eq!(
+            call(&a, "static_vm_create", create("site-two", 204)).await["reason"],
+            "name_unavailable"
+        );
+
+        // An interrupted VARS write has unknown effects: quarantined too.
+        h.fixture(|f| f.static_fault = Some(StaticFault::Interrupted));
+        let failed = call(&a, "static_vm_create", create("site-three", 205)).await;
+        assert_eq!(
+            terminal(&a, &failed).await["cleanup"],
+            "cleanup_unconfirmed"
+        );
+        assert_eq!(static_charge(&h, "site-three").unwrap().0, 4);
+        assert_eq!(static_paths(&h.media).len(), 3);
+
+        // The released name and instance slot are reusable.
+        let created = call(&a, "static_vm_create", create("site-one", 206)).await;
+        assert_eq!(terminal(&a, &created).await["state"], "succeeded");
+        assert_eq!(static_charge(&h, "site-one").unwrap().0, 1);
+        let states = call(&a, "static_vm_list", json!({})).await["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["name"].as_str().unwrap().to_owned(),
+                    row["state"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            states,
+            [
+                ("site-one".to_owned(), "stopped".to_owned()),
+                ("site-three".to_owned(), "failed".to_owned()),
+                ("site-two".to_owned(), "failed".to_owned()),
+            ]
+            .into()
+        );
+
+        // Cancellation before any copy effect releases the candidate too.
+        let hold = Arc::new(Notify::new());
+        h.fixture(|f| f.static_hold = Some(hold.clone()));
+        let cancelled = call(&a, "static_vm_create", create("site-four", 207)).await;
+        assert_eq!(cancelled["ok"], true);
+        drop(a);
+        h.shutdown().await.unwrap();
+        assert_eq!(static_charge(&h, "site-four"), None);
+        let h = h.reopen(|_| {}).await;
+        let a = h.client(0).await;
+        let cancelled = call(
+            &a,
+            "vm_operation",
+            json!({"operation_id":cancelled["operation_id"]}),
+        )
+        .await;
+        assert_eq!(
+            (&cancelled["reason"], &cancelled["cleanup"]),
+            (&json!("cancelled"), &json!("confirmed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn static_vm_recovers_after_clean_and_dirty_shutdown() {
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let template = web_template(&h, &a, 301).await;
+        let mut ids = vec![];
+        for (name, number) in [("site-a", 302), ("site-b", 303)] {
+            let created = call(
+                &a,
+                "static_vm_create",
+                json!({"name":name,"template_id":template,"request_id":key(number)}),
+            )
+            .await;
+            let created = terminal(&a, &created).await;
+            assert_eq!(created["state"], "succeeded");
+            ids.push(created["vm_id"].clone());
+        }
+        let [site_a, site_b] = [ids[0].clone(), ids[1].clone()];
+        let vm_b = parse_id(site_b.as_str().unwrap()).unwrap();
+        let lifecycle = |tool: &'static str, vm: &Value, number| {
+            (tool, json!({"vm_id":vm,"request_id":key(number)}))
+        };
+        let start = lifecycle("vm_start", &site_a, 304);
+        let started = call(&a, start.0, start.1).await;
+        assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+        let recovery = |h: &Harness, name: &str| -> (i64, i64, Option<bool>) {
+            read_state(h)
+                .query_row(
+                    "SELECT s.state,a.status,a.cleanup_confirmed FROM vm_static_instances s
+                     JOIN activity a ON a.vm=s.id AND a.action=10
+                     WHERE s.name=?1 ORDER BY a.id DESC LIMIT 1",
+                    [name],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+
+        // A clean drain while running releases the boot, then settles the
+        // same generation as stopped without touching its files.
+        let files = static_paths(&h.media);
+        drop(a);
+        h.shutdown().await.unwrap();
+        assert_eq!(recovery(&h, "site-a"), (1, 1, Some(true)));
+        assert_eq!(static_paths(&h.media), files);
+
+        // The reopened process rehydrates committed custody, restarts the
+        // same VM and admits a later unrelated launch.
+        let mut h = h.reopen(|_| {}).await;
+        let a = h.client(0).await;
+        let get = |vm: &Value| json!({"vm_id":vm});
+        assert_eq!(
+            call(&a, "static_vm_get", get(&site_a)).await["state"],
+            "stopped"
+        );
+        for (tool, vm, number) in [
+            ("vm_start", &site_a, 305),
+            ("vm_stop", &site_a, 306),
+            ("vm_start", &site_b, 307),
+        ] {
+            let (tool, args) = lifecycle(tool, vm, number);
+            let operation = call(&a, tool, args).await;
+            assert_eq!(
+                terminal(&a, &operation).await["state"],
+                "succeeded",
+                "{tool}"
+            );
+        }
+        let running = call(&a, "static_vm_get", get(&site_b)).await;
+        assert_eq!(
+            (&running["state"], &running["ready"]),
+            (&json!("running"), &json!(true))
+        );
+
+        // Dirty: the runtime cannot prove release, so the drain is
+        // unconfirmed and the VM stays fenced in recovery across reopen.
+        h.fixture(|f| f.live.lock().unwrap().stuck.insert(vm_b));
+        drop(a);
+        assert!(h.shutdown().await.is_err());
+        assert_eq!(recovery(&h, "site-b"), (3, 0, Some(false)));
+        let h = h
+            .reopen(|f| {
+                f.live.lock().unwrap().stuck.insert(vm_b);
+            })
+            .await;
+        let a = h.client(0).await;
+        assert_eq!(
+            call(&a, "static_vm_get", get(&site_b)).await["state"],
+            "recovering"
+        );
+        let (tool, args) = lifecycle("vm_start", &site_a, 308);
+        assert_eq!(call(&a, tool, args).await["reason"], "busy");
+        let (tool, args) = lifecycle("vm_start", &site_b, 309);
+        assert_eq!(call(&a, tool, args).await["reason"], "busy");
+
+        // Once release is proven the same generation returns to stopped.
+        h.fixture(|f| f.live.lock().unwrap().stuck.clear());
+        h.tick().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while call(&a, "static_vm_get", get(&site_b)).await["state"] != "stopped" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovery(&h, "site-b"), (1, 1, Some(true)));
+        for (tool, vm, number) in [
+            ("vm_start", &site_b, 310),
+            ("vm_stop", &site_b, 311),
+            ("vm_start", &site_a, 312),
+            ("vm_stop", &site_a, 313),
+        ] {
+            let (tool, args) = lifecycle(tool, vm, number);
+            let operation = call(&a, tool, args).await;
+            assert_eq!(
+                terminal(&a, &operation).await["state"],
+                "succeeded",
+                "{tool}"
+            );
+        }
+        assert_eq!(static_paths(&h.media), files);
+    }
+
+    #[tokio::test]
+    async fn static_origin_probe_refuses_a_different_generation_name() {
+        use crate::vm::static_web::{OriginPortLease, StaticOriginIdentity};
+        let identity = FixtureOrigin::new([0x33; 16]).unwrap();
+        let lease = OriginPortLease::acquire().unwrap();
+        let other = StaticOriginIdentity::for_generation([0x44; 16]).provisioning();
+        assert!(
+            identity
+                .probe(&lease, other.server_name().into())
+                .await
+                .is_err()
+        );
+        identity.probe(&lease, identity.name.clone()).await.unwrap();
     }
 
     #[tokio::test]
@@ -2414,7 +3768,22 @@ mod tests {
         .unwrap();
         release.notify_one();
         done.await.unwrap();
-        assert!(h.audit().is_empty(), "cancelled calls opened work");
+        let refusals = h.audit();
+        assert_eq!(refusals.len(), 3, "cancelled calls opened work");
+        // Two host-execution refusals and one unknown tool name, each a
+        // bounded uncorrelated row that stores no caller-supplied label.
+        assert!(refusals.iter().all(|row| row.action == HOST_REFUSAL_ACTION
+            && row.vm.is_none()
+            && row.operation.is_none()));
+        let mut reasons = refusals.iter().map(|row| row.reason).collect::<Vec<_>>();
+        let mut expected = vec![
+            Some(Refusal::HostExecutionDisabled as i64),
+            Some(Refusal::HostExecutionDisabled as i64),
+            Some(Refusal::UnknownTool as i64),
+        ];
+        reasons.sort();
+        expected.sort();
+        assert_eq!(reasons, expected);
         // Direct detached handlers obey the same closed flags.
         let closed = h.supervisor().connection("alpha".into());
         let detached = closed.inventory();
@@ -2498,7 +3867,7 @@ mod tests {
         assert_eq!(
             clone_result,
             json!({"ok":true,"operation_id":clone["operation_id"],"action":"create",
-                "state":"succeeded","cleanup":"confirmed","vm_id":vm,"template_id":template})
+                "state":"succeeded","cleanup":"confirmed","vm_id":vm,"template_id":template,"expires_at_ms":UTC+60_000})
         );
         assert_eq!(call(&a, "vm_create", create).await, clone);
         assert_eq!(
@@ -2623,12 +3992,13 @@ mod tests {
         // Trusted invalid calls are audited once each, correlated only to
         // the caller-owned VM; the foreign-shaped ID stays uncorrelated.
         let rows = h.audit();
-        assert_eq!(rows.len(), audit + 8, "one refusal per correlatable call");
-        assert!(rows[..8].iter().all(|row| {
-            row.state == 4 && row.reason == Some(Refusal::Invalid as i64) && row.vm.is_some()
-        }));
-        // A trusted call with non-object arguments is refused, not dropped;
-        // a read refusal spends no audit row.
+        assert_eq!(rows.len(), audit + 9, "one refusal per trusted call");
+        assert_eq!(rows[..9].iter().filter(|row| row.vm.is_none()).count(), 1);
+        assert!(
+            rows[..9]
+                .iter()
+                .all(|row| { row.state == 4 && row.reason == Some(Refusal::Invalid as i64) })
+        );
         let mut raw = h.raw().await;
         for (id, name, arguments) in [
             (2, "vm_template_build", Value::Null),
@@ -2650,11 +4020,16 @@ mod tests {
         }
         drop(raw);
         let rows = h.audit();
-        assert_eq!(rows.len(), audit + 9);
-        assert_eq!(
-            (rows[0].action, rows[0].state, rows[0].reason, rows[0].vm),
-            (BUILD_ACTION, 4, Some(Refusal::Invalid as i64), None)
-        );
+        assert_eq!(rows.len(), audit + 12);
+        for (row, action) in
+            rows.iter()
+                .zip([READ_REFUSAL_ACTION, READ_REFUSAL_ACTION, BUILD_ACTION])
+        {
+            assert_eq!(
+                (row.action, row.state, row.reason, row.vm),
+                (action, 4, Some(Refusal::Invalid as i64), None)
+            );
+        }
 
         h.hold_script.notify_one();
         let done = terminal(&a, &script).await;
@@ -2708,7 +4083,20 @@ mod tests {
         let tombstone = json!({"ok":true,"vm_id":vm,"state":"expired","ready":false,
             "expired_at_ms":UTC+120_000,"cleanup":"confirmed","snapshots":[]});
         tokio::time::timeout(Duration::from_secs(2), async {
-            while call(&a, "vm_get", get.clone()).await != tombstone {
+            loop {
+                let mut current = call(&a, "vm_get", get.clone()).await;
+                if current["state"] == "expired" {
+                    assert!(
+                        current
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("cleanup_activity_id")
+                            .and_then(|value| value.as_i64())
+                            .is_some_and(|id| id > 0)
+                    );
+                    assert_eq!(current, tombstone);
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         })

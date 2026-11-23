@@ -157,6 +157,31 @@ pub enum Refusal {
     Ram,
     Shutdown,
     CleanupUnconfirmed,
+    Disabled,
+    UnsupportedPlatform,
+    QualificationMissing,
+    IdentityUnverified,
+    DistributionUnverified,
+    PathCustodyUnverified,
+    JobUnverified,
+    WhpxUnverified,
+    QmpUnverified,
+    GuestEndpointUnverified,
+    DiskCeilingUnverified,
+    OwnerActivityUnverified,
+    ReservesUnverified,
+    NetworkFenceUnverified,
+    InstallerPhaseUnavailable,
+    InstallerPhaseMismatch,
+    InstallerDeadlineExpired,
+    NotReady,
+    RecipeUnqualified,
+    HostExecutionDisabled,
+    InvalidCursor,
+    StateUnavailable,
+    NameUnavailable,
+    StaticDeleteForbidden,
+    UnknownTool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,10 +283,71 @@ pub struct RecoveryClaim {
 pub(crate) enum Subject<'a> {
     Vm(Id),
     Template(Id, [u8; 32]),
-    Recipe(&'a str, [u8; 32]),
+    Recipe(&'a str, Option<[u8; 32]>),
 }
 
 pub(crate) const BUILD_ACTION: i64 = 11;
+pub(crate) const STATIC_CREATE_ACTION: i64 = 12;
+pub(crate) const READ_REFUSAL_ACTION: i64 = 13;
+pub(crate) const HOST_REFUSAL_ACTION: i64 = 14;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i64)]
+pub(crate) enum FailureReason {
+    StagingFailed = 1,
+    InstallFailed,
+    InstallTimedOut,
+    BootFailed,
+    HealthFailed,
+    SealFailed,
+    CloneFailed,
+    DirtyStop,
+    ExecutionUnknown,
+    Cancelled,
+    CleanupUnconfirmed,
+}
+
+impl FailureReason {
+    const ALL: [Self; 11] = {
+        use FailureReason::*;
+        [
+            StagingFailed,
+            InstallFailed,
+            InstallTimedOut,
+            BootFailed,
+            HealthFailed,
+            SealFailed,
+            CloneFailed,
+            DirtyStop,
+            ExecutionUnknown,
+            Cancelled,
+            CleanupUnconfirmed,
+        ]
+    };
+
+    pub(crate) fn from_code(code: i64) -> rusqlite::Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|reason| *reason as i64 == code)
+            .ok_or(rusqlite::Error::InvalidQuery)
+    }
+
+    pub(crate) fn wire(self) -> &'static str {
+        match self {
+            Self::StagingFailed => "staging_failed",
+            Self::InstallFailed => "install_failed",
+            Self::InstallTimedOut => "install_timed_out",
+            Self::BootFailed => "boot_failed",
+            Self::HealthFailed => "health_failed",
+            Self::SealFailed => "seal_failed",
+            Self::CloneFailed => "clone_failed",
+            Self::DirtyStop => "dirty_stop",
+            Self::ExecutionUnknown => "execution_unknown",
+            Self::Cancelled => "cancelled",
+            Self::CleanupUnconfirmed => "cleanup_unconfirmed",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OperationRef {
@@ -307,6 +393,47 @@ pub(crate) struct ArtifactEvidence {
     pub pin: super::paths::ArtifactPin,
 }
 
+/// What one slot of a never-activated static candidate is proven to hold
+/// after a failed copy. Only the candidate's own worker reports this; it is
+/// never authority over committed static or backup storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code, reason = "native static copy is an activation gate")]
+pub(crate) enum CandidateSlot {
+    /// Never created, or created and disposed by its worker after an
+    /// identity check of the exact object it created.
+    Absent,
+    /// Created with this identity and not disposed. Quarantined and charged.
+    Retained(ArtifactEvidence),
+    /// Effects unknown. Quarantined and charged.
+    Unknown,
+}
+
+/// A failed static copy: the proven terminal cause plus per-slot custody.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code, reason = "native static copy is an activation gate")]
+pub(crate) struct CopyFailure {
+    pub reason: FailureReason,
+    pub slots: [CandidateSlot; 2],
+}
+
+#[allow(dead_code, reason = "native static copy is an activation gate")]
+impl CopyFailure {
+    /// No slot effect is known; nothing may be released.
+    pub(crate) fn unknown(reason: FailureReason) -> Self {
+        Self {
+            reason,
+            slots: [CandidateSlot::Unknown; 2],
+        }
+    }
+
+    pub(crate) fn untouched(reason: FailureReason) -> Self {
+        Self {
+            reason,
+            slots: [CandidateSlot::Absent; 2],
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum BuildAdmission {
     Fresh(Box<BuildSlots>, PendingOperation, OperationRef),
@@ -340,6 +467,7 @@ pub(crate) struct OperationStatus {
     pub template: Option<Id>,
     pub expires_at_ms: Option<i64>,
     pub script: Option<ScriptResult>,
+    pub failure: Option<FailureReason>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -353,4 +481,5 @@ pub(crate) struct VmStatus {
     pub expired_at_ms: Option<i64>,
     pub cleanup: Option<&'static str>,
     pub snapshots: [Id; 0],
+    pub cleanup_activity: Option<i64>,
 }

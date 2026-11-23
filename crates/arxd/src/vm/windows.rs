@@ -1878,6 +1878,9 @@ impl<'a> NativeLaunch<'a> {
         inputs: LaunchInputs<'a>,
     ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
         let kind = inputs.plan.kind();
+        if kind == PlanKind::StaticWebBoot {
+            return Err(NativeRefusal::NetworkFenceUnverified);
+        }
         match (kind, inputs.installer) {
             (PlanKind::InstallerBoot(phase), Some(stage))
                 if phase == stage.phase() && tokio::time::Instant::now() >= stage.deadline() =>
