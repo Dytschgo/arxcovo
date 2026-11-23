@@ -311,9 +311,9 @@ impl ForegroundConfig {
         crate::local::require_owner(path)?;
         let file: VmFile = serde_json::from_value(value)
             .map_err(|_| anyhow::anyhow!("invalid VM configuration"))?;
-        file.test_vms.validate(&file.state_dir, &file.local)?;
+        let state_dir = file.test_vms.validate(&file.state_dir, &file.local)?;
         let config = Config {
-            state_dir: file.state_dir,
+            state_dir,
             agents: file.agents,
             local: Some(file.local),
             ..Config::default()
@@ -334,7 +334,9 @@ impl ForegroundConfig {
 }
 
 impl TestVms {
-    fn validate(&self, root: &Path, local: &crate::local::Endpoint) -> Result<()> {
+    /// Returns the canonical exclusive root that composition must open; the
+    /// raw configured string is never reopened after validation.
+    fn validate(&self, root: &Path, local: &crate::local::Endpoint) -> Result<PathBuf> {
         use crate::vm::paths::LocalPath;
 
         let layout = crate::service::layout::Layout::system()?;
@@ -404,7 +406,7 @@ impl TestVms {
                 recipe.digest(&root)?;
             }
         }
-        Ok(())
+        Ok(root)
     }
 
     pub(crate) fn recipe(&self) -> Result<Option<([u8; 16], [u8; 32])>> {

@@ -200,31 +200,86 @@ pub async fn run_vm_profile(profile: crate::config::VmForeground) -> Result<()> 
     let crate::config::VmForeground { config, profile } = profile;
     let endpoint = config.local.as_ref().context("server-config")?;
     let supervisor = Supervisor::open(&config.state_dir, &profile).context("server-state")?;
-    supervisor.sweep().context("server-state")?;
+    // One bounded sweep before any tool is published.
+    supervisor.startup_sweep().context("server-state")?;
     let listener = Listener::bind(endpoint).context("server-bind")?;
+    serve_vm_profile(listener, Arc::new(config), supervisor, async {
+        tokio::signal::ctrl_c().await.context("server-listener")
+    })
+    .await
+}
+
+/// Bound for each independent teardown stage after admission closes.
+const VM_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Serve until the listener fails, the reaper fails or `interrupt` resolves.
+/// Teardown then closes foreground and controller admission, stops and joins
+/// the listener and the reaper, drains admitted workers and their terminal
+/// audit, and only then runs final recovery. An unresolved drain stage takes
+/// precedence over the initiating result as `server-drain-unconfirmed`.
+pub(crate) async fn serve_vm_profile(
+    listener: Listener,
+    config: Arc<crate::config::Config>,
+    supervisor: Arc<crate::mcp::vm::Supervisor>,
+    interrupt: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
     let stop = crate::service::Shutdown::default();
-    let run = run_vm_listener(listener, Arc::new(config), supervisor.clone(), stop.clone());
-    tokio::pin!(run);
-    let (result, listener_done) = tokio::select! {
-        result = &mut run => (result.context("server-listener"), true),
-        result = supervisor.tick() => (result.context("server-state"), false),
-        result = tokio::signal::ctrl_c() => (result.context("server-listener"), false),
+    let reaper_stop = crate::service::Shutdown::default();
+    let mut listener_task = tokio::spawn(run_vm_listener(
+        listener,
+        config,
+        supervisor.clone(),
+        stop.clone(),
+    ));
+    let mut reaper = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let reaper_stop = reaper_stop.clone();
+        async move { supervisor.run_reaper(&reaper_stop).await }
+    });
+    let joined = |result: std::result::Result<Result<()>, tokio::task::JoinError>| {
+        result.unwrap_or_else(|_| Err(anyhow::anyhow!("task failed")))
+    };
+    let (origin, listener_done, reaper_done) = tokio::select! {
+        result = &mut listener_task => (joined(result).context("server-listener"), true, false),
+        result = &mut reaper => (joined(result).context("server-state"), false, true),
+        result = interrupt => (result, false, false),
     };
     supervisor.close();
     stop.cancel();
-    let listener_drain = if listener_done {
-        Ok(())
-    } else {
-        tokio::time::timeout(Duration::from_secs(5), run)
-            .await
-            .context("server-drain-unconfirmed")
-            .and_then(|result| result.context("server-listener"))
-    };
-    supervisor
-        .drain()
-        .await
-        .context("server-drain-unconfirmed")?;
-    result.and(listener_drain)
+    reaper_stop.cancel();
+    let mut drained = true;
+    if !listener_done {
+        match tokio::time::timeout(VM_DRAIN_TIMEOUT, &mut listener_task).await {
+            // The listener's own error after close is subordinate to origin.
+            Ok(_) => {}
+            Err(_) => {
+                listener_task.abort();
+                drained = false;
+            }
+        }
+    }
+    if !reaper_done {
+        match tokio::time::timeout(VM_DRAIN_TIMEOUT, &mut reaper).await {
+            Ok(_) => {}
+            Err(_) => {
+                reaper.abort();
+                drained = false;
+            }
+        }
+    }
+    drained &= supervisor.drain_workers(VM_DRAIN_TIMEOUT).await.is_ok();
+    // Recovery runs only after every worker and the reaper are joined.
+    if drained {
+        drained = supervisor.recover(VM_DRAIN_TIMEOUT).await.is_ok();
+    }
+    if !drained {
+        // The originating failure stays below the fixed drain category.
+        return Err(match origin {
+            Err(error) => error.context("server-drain-unconfirmed"),
+            Ok(()) => anyhow::anyhow!("server-drain-unconfirmed"),
+        });
+    }
+    origin
 }
 
 pub(crate) async fn run_vm_listener(
@@ -440,7 +495,12 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
     tokio::select! {
         result = protocol => result?,
-        result = forward_checked(read, pump_write, FRAME_LIMIT, vm.is_some()) => result?,
+        result = forward_checked(
+            read,
+            pump_write,
+            FRAME_LIMIT,
+            if vm.is_some() { FramePolicy::StrictTools } else { FramePolicy::Opaque },
+        ) => result?,
         result = forward_bounded(pump_read, write, RESPONSE_LIMIT) => result?,
     }
     Ok(())
@@ -543,14 +603,52 @@ async fn forward_bounded<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     write: W,
     limit: usize,
 ) -> Result<()> {
-    forward_checked(read, write, limit, false).await
+    forward_checked(read, write, limit, FramePolicy::Opaque).await
+}
+
+/// How the authenticated pump treats a complete request frame before the SDK.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FramePolicy {
+    /// Forward bounded frames unchanged (legacy, delegated and bridge paths).
+    Opaque,
+    /// Closed tool profiles: see [`strict_tool_frame`].
+    StrictTools,
+}
+
+/// Reserved argument key carrying the pump's classification of a present
+/// non-object `tools/call` argument value. A client may send it too; either
+/// way the closed handler can only answer `invalid`.
+pub(crate) const INVALID_TOOL_ARGUMENTS: &str = "\u{0}invalid_arguments";
+
+/// Validate one framed request for a closed tool profile before rmcp parses
+/// it. Duplicate (including escape-equivalent) keys, excess depth, invalid
+/// UTF-8 and trailing data are untrusted malformed frames and close the
+/// session. A structurally valid `tools/call` whose `params.arguments` is
+/// present but not an object stays a trusted call: its arguments are replaced
+/// with [`INVALID_TOOL_ARGUMENTS`] so the handler refuses and audits it. The
+/// original bytes are forwarded whenever no replacement is needed.
+pub(crate) fn strict_tool_frame(line: Vec<u8>, limit: usize) -> Result<Vec<u8>> {
+    let mut value = check_json(&line)?;
+    let tool_call = value.get("method").and_then(serde_json::Value::as_str) == Some("tools/call");
+    let replace = tool_call
+        && value
+            .pointer("/params/arguments")
+            .is_some_and(|arguments| !arguments.is_object());
+    if !replace {
+        return Ok(line);
+    }
+    value["params"]["arguments"] = serde_json::json!({ INVALID_TOOL_ARGUMENTS: true });
+    let mut frame = serde_json::to_vec(&value)?;
+    frame.push(b'\n');
+    anyhow::ensure!(frame.len() <= limit, "frame too large");
+    Ok(frame)
 }
 
 async fn forward_checked<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     read: R,
     mut write: W,
     limit: usize,
-    vm: bool,
+    policy: FramePolicy,
 ) -> Result<()> {
     let mut read = BufReader::with_capacity(limit, read);
     loop {
@@ -584,11 +682,8 @@ async fn forward_checked<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if !present {
             return Ok(());
         }
-        if vm {
-            let value = check_json(&line)?;
-            if let Some(arguments) = value.pointer("/params/arguments") {
-                anyhow::ensure!(arguments.is_object(), "invalid tool envelope");
-            }
+        if policy == FramePolicy::StrictTools {
+            line = strict_tool_frame(line, limit)?;
         }
         tokio::time::timeout(AUTH_TIMEOUT, async {
             write.write_all(&line).await?;

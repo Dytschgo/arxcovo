@@ -1315,4 +1315,151 @@ impl<C: Clock> VmController<C> {
             Ok(Ok(()))
         }))
     }
+
+    /// Read-only scope and subject-state check in the same order as fresh
+    /// admission, so a foreground refusal never reports native eligibility
+    /// before an unknown, foreign, expired or busy subject.
+    pub(crate) fn foreground_precheck(
+        &self,
+        principal: &str,
+        subject: ForegroundSubject,
+    ) -> Result<Result<(), Precheck>> {
+        if validate_principal(principal).is_err() {
+            return Ok(Err(Precheck::Refused(Refusal::NotFound)));
+        }
+        Ok(self
+            .precheck_inner(principal, subject)?
+            .map_err(|reason| match reason {
+                PrecheckInner::Offline => Precheck::NotReady,
+                PrecheckInner::Refused(reason) => Precheck::Refused(reason),
+            }))
+    }
+
+    fn precheck_inner(
+        &self,
+        principal: &str,
+        subject: ForegroundSubject,
+    ) -> Result<Result<(), PrecheckInner>> {
+        let refused = |result: Result<(), Refusal>| result.map_err(PrecheckInner::Refused);
+        self.store.transact(|db| {
+            let now = utc(self.clock.now())?;
+            let operation = match subject {
+                ForegroundSubject::Template(template) => {
+                    let sealed = store::count(
+                        db,
+                        "SELECT EXISTS(SELECT 1 FROM vm_templates WHERE id=?1)",
+                        [template],
+                    )? != 0;
+                    return Ok(refused(if sealed {
+                        Ok(())
+                    } else {
+                        Err(Refusal::NotFound)
+                    }));
+                }
+                ForegroundSubject::Extend(vm) => {
+                    return Ok(refused(match owned_vm(db, principal, vm)? {
+                        None if store::expired_status(db, principal, vm)?.is_some() => {
+                            Err(Refusal::Expired)
+                        }
+                        None => Err(Refusal::NotFound),
+                        Some((state, expires)) if state == 4 || expires <= now => {
+                            Err(Refusal::Expired)
+                        }
+                        Some(_) => Ok(()),
+                    }));
+                }
+                ForegroundSubject::Start(_) => Operation::Start,
+                ForegroundSubject::Stop(_) => Operation::Stop,
+                ForegroundSubject::Script(_) => Operation::Script {
+                    script: "",
+                    timeout_seconds: 0,
+                },
+            };
+            let vm = subject.vm();
+            match owned_vm(db, principal, vm)? {
+                None if store::expired_status(db, principal, vm)?.is_some() => {
+                    return Ok(Err(PrecheckInner::Refused(Refusal::Expired)));
+                }
+                // A live, owned generation that is not running has no channel.
+                Some((state, expires))
+                    if state != 4
+                        && expires > now
+                        && state != 2
+                        && matches!(subject, ForegroundSubject::Script(_)) =>
+                {
+                    return Ok(Err(PrecheckInner::Offline));
+                }
+                _ => {}
+            }
+            let request = Request {
+                principal,
+                request_id: RequestId {
+                    key: [0; 16],
+                    issued_at_ms: 0,
+                },
+                vm,
+                disk: DiskClaim::default(),
+                operation,
+            };
+            Ok(refused(target(db, &request, now)?.map(|_| ())))
+        })
+    }
+
+    /// One snapshot of up to `limit` caller-owned rows, so the foreground can
+    /// ask for a look-ahead row without a second transaction.
+    pub(crate) fn foreground_list(
+        &self,
+        principal: &str,
+        after: Option<Id>,
+        limit: u32,
+    ) -> Result<Result<Vec<VmStatus>, Refusal>> {
+        if validate_principal(principal).is_err() || !(1..=21).contains(&limit) {
+            return Ok(Err(Refusal::Invalid));
+        }
+        self.store.transact(|db| {
+            Ok(Ok(store::vm_status_rows(
+                db,
+                principal,
+                None,
+                after,
+                limit,
+                utc(self.clock.now())?,
+            )?))
+        })
+    }
+}
+
+/// Why a foreground mutation cannot proceed before eligibility is checked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Precheck {
+    Refused(Refusal),
+    /// A script names an owned live VM that has no running boot.
+    NotReady,
+}
+
+enum PrecheckInner {
+    Refused(Refusal),
+    Offline,
+}
+
+/// The subject a foreground mutation names, for [`VmController::foreground_precheck`].
+#[derive(Clone, Copy)]
+pub(crate) enum ForegroundSubject {
+    Template(Id),
+    Start(Id),
+    Stop(Id),
+    Script(Id),
+    Extend(Id),
+}
+
+impl ForegroundSubject {
+    fn vm(self) -> Id {
+        match self {
+            Self::Template(id)
+            | Self::Start(id)
+            | Self::Stop(id)
+            | Self::Script(id)
+            | Self::Extend(id) => id,
+        }
+    }
 }

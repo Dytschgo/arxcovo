@@ -62,37 +62,81 @@ const INVALID: Fault = Fault("invalid");
 const INVALID_CURSOR: Fault = Fault("invalid_cursor");
 const SHUTDOWN: Fault = Fault("shutdown");
 const NOT_FOUND: Fault = Fault("not_found");
+const STATE_UNAVAILABLE: Fault = Fault("state_unavailable");
+const NOT_READY: Fault = Fault("not_ready");
+const HOST_EXECUTION_DISABLED: Fault = Fault("host_execution_disabled");
 
 impl From<anyhow::Error> for Fault {
     fn from(_: anyhow::Error) -> Self {
-        Self("state_unavailable")
+        STATE_UNAVAILABLE
     }
 }
 
-const REFUSALS: [&str; 18] = [
-    "invalid",
-    "stale_key",
-    "key_collision",
-    "replay_full",
-    "pending_full",
-    "not_found",
-    "busy",
-    "expired",
-    "template_limit",
-    "instance_limit",
-    "snapshot_limit",
-    "disk",
-    "state_headroom",
-    "unknown_host",
-    "owner_active",
-    "cpu",
-    "ram",
-    "shutdown",
-];
+/// The single checked controller-to-wire refusal projection.
+fn refusal_wire(reason: Refusal) -> &'static str {
+    match reason {
+        Refusal::Invalid => "invalid",
+        Refusal::StaleKey => "stale_key",
+        Refusal::KeyCollision => "key_collision",
+        Refusal::ReplayFull => "replay_full",
+        Refusal::PendingFull => "pending_full",
+        Refusal::NotFound => "not_found",
+        Refusal::Busy => "busy",
+        Refusal::Expired => "expired",
+        Refusal::TemplateLimit => "template_limit",
+        Refusal::InstanceLimit => "instance_limit",
+        Refusal::SnapshotLimit => "snapshot_limit",
+        Refusal::Disk => "disk",
+        Refusal::StateHeadroom => "state_headroom",
+        Refusal::UnknownHost => "unknown_host",
+        Refusal::OwnerActive => "owner_active",
+        Refusal::Cpu => "cpu",
+        Refusal::Ram => "ram",
+        Refusal::Shutdown => "shutdown",
+    }
+}
+
+/// Stored audit reason codes; an unknown future code is never guessed.
+fn refusal_code(code: i64) -> Option<Refusal> {
+    REFUSAL_CODES
+        .into_iter()
+        .find(|reason| *reason as i64 == code)
+}
+
+/// The stored code for a wire reason, only where the codes match exactly.
+fn refusal_from_wire(reason: &str) -> Option<Refusal> {
+    REFUSAL_CODES
+        .into_iter()
+        .find(|code| refusal_wire(*code) == reason)
+}
+
+const REFUSAL_CODES: [Refusal; 18] = {
+    use Refusal::*;
+    [
+        Invalid,
+        StaleKey,
+        KeyCollision,
+        ReplayFull,
+        PendingFull,
+        NotFound,
+        Busy,
+        Expired,
+        TemplateLimit,
+        InstanceLimit,
+        SnapshotLimit,
+        Disk,
+        StateHeadroom,
+        UnknownHost,
+        OwnerActive,
+        Cpu,
+        Ram,
+        Shutdown,
+    ]
+};
 
 impl From<Refusal> for Fault {
     fn from(reason: Refusal) -> Self {
-        Self(REFUSALS[reason as usize - 1])
+        Self(refusal_wire(reason))
     }
 }
 
@@ -121,6 +165,8 @@ struct Gate {
     closed: bool,
     #[cfg(test)]
     fixture: Option<tests::Fixture>,
+    #[cfg(test)]
+    drained: Option<tests::FixtureDrain>,
 }
 
 pub(crate) struct Supervisor {
@@ -171,6 +217,8 @@ impl Supervisor {
                 closed: false,
                 #[cfg(test)]
                 fixture: None,
+                #[cfg(test)]
+                drained: None,
             }),
             cancel: Shutdown::default(),
             cursor_key: hmac::Key::new(hmac::HMAC_SHA256, &secret),
@@ -203,14 +251,22 @@ impl Supervisor {
         self.cancel.cancel();
     }
 
-    pub(crate) async fn tick(&self) -> anyhow::Result<()> {
-        let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    /// The startup sweep before the listener is published.
+    // Phase 2: `VmController::sweep_once(&CandidateRuntime)` from 4c2b.
+    pub(crate) fn startup_sweep(&self) -> anyhow::Result<()> {
+        self.sweep()
+    }
+
+    /// The supervised periodic reaper, cancelled and joined by the caller.
+    // Phase 2: `run_reaper(&runtime, &mut MonotonicReaperTicks::default(), stop)`.
+    pub(crate) async fn run_reaper(&self, stop: &Shutdown) -> anyhow::Result<()> {
+        let mut ticks = tokio::time::interval(Duration::from_secs(5));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticks.tick().await;
         loop {
             tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => return Ok(()),
+                _ = stop.cancelled() => return Ok(()),
                 _ = ticks.tick() => self.sweep()?,
             }
         }
@@ -218,7 +274,7 @@ impl Supervisor {
 
     // Adapter for the pre-4c2b controller: mark due rows, but retain all
     // production custody claims until the reaper can positively prove release.
-    pub(crate) fn sweep(&self) -> anyhow::Result<()> {
+    fn sweep(&self) -> anyhow::Result<()> {
         let gate = self.lock()?;
         if gate.closed {
             return Ok(());
@@ -235,38 +291,50 @@ impl Supervisor {
         Ok(())
     }
 
-    pub(crate) async fn drain(&self) -> anyhow::Result<()> {
+    /// Cancel and join every admitted worker and its terminal audit write.
+    /// Admission is closed first, so no new worker can be registered.
+    pub(crate) async fn drain_workers(&self, bound: Duration) -> anyhow::Result<()> {
         self.close();
         #[cfg(test)]
-        let fixture_cleanup = {
+        {
             let jobs = self.lock()?.fixture.as_mut().map(tests::Fixture::take_jobs);
-            match jobs {
-                Some(jobs) => {
-                    Some(tokio::time::timeout(Duration::from_secs(5), jobs.join()).await??)
-                }
-                None => None,
+            if let Some(jobs) = jobs {
+                let drained = tokio::time::timeout(bound, jobs.join()).await??;
+                self.lock()?.drained = Some(drained);
             }
-        };
-        // The pre-4c2b entry closes the controller and performs final recovery
-        // together. The supervisor already closed the external admission gate.
+        }
+        let _ = bound;
+        Ok(())
+    }
+
+    /// Final controller recovery, after the reaper and workers are joined.
+    /// The blocking task stays owned until it returns, even past `bound`, so
+    /// it never writes after this call reports.
+    // Phase 2: `VmController::recover_after_drain()` from 4c2b.
+    pub(crate) async fn recover(&self, bound: Duration) -> anyhow::Result<()> {
+        #[cfg(test)]
+        let fixture = self.lock()?.drained.take();
         let controller = self.controller.clone();
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                controller.shutdown()?;
-                #[cfg(test)]
-                if let Some(fixture) = fixture_cleanup {
-                    fixture.recover(&controller)?;
-                }
-                anyhow::ensure!(
-                    controller.recovery_intents()?.is_empty()
-                        && controller.expiry_intents()?.is_empty(),
-                    "VM release unconfirmed"
-                );
-                Ok(())
-            }),
-        )
-        .await??
+        let mut task = tokio::task::spawn_blocking(move || {
+            controller.shutdown()?;
+            #[cfg(test)]
+            if let Some(fixture) = fixture {
+                fixture.recover(&controller)?;
+            }
+            anyhow::ensure!(
+                controller.recovery_intents()?.is_empty()
+                    && controller.expiry_intents()?.is_empty(),
+                "VM release unconfirmed"
+            );
+            Ok(())
+        });
+        match tokio::time::timeout(bound, &mut task).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = task.await;
+                anyhow::bail!("VM recovery unconfirmed")
+            }
+        }
     }
 
     fn capability(&self, gate: &Gate) -> Value {
@@ -477,6 +545,17 @@ impl ServerHandler for VmInventory {
 struct Args(Map<String, Value>);
 
 impl Args {
+    /// The authenticated frame pump replaces a present non-object argument
+    /// value with this reserved key, so it fails as `invalid` here instead of
+    /// the SDK erasing `null` into an empty object.
+    fn new(arguments: Map<String, Value>) -> Self {
+        Self(arguments)
+    }
+
+    fn malformed(&self) -> bool {
+        self.0.contains_key(crate::local::INVALID_TOOL_ARGUMENTS)
+    }
+
     fn optional<T: DeserializeOwned>(&mut self, name: &str) -> Outcome<Option<T>> {
         self.0
             .remove(name)
@@ -610,14 +689,22 @@ impl VmInventory {
         }
         let name = request.name.as_ref();
         if matches!(name, "run_command" | "discover_tools") {
-            return Err(Fault("host_execution_disabled"));
+            return Err(HOST_EXECUTION_DISABLED);
         }
         let tool = ToolName::ALL
             .into_iter()
             .find(|tool| tool.name() == name)
             .ok_or(Fault("unknown_tool"))?;
-        let mut args = Args(request.arguments.unwrap_or_default());
+        let mut args = Args::new(request.arguments.unwrap_or_default());
+        if args.malformed() {
+            return match tool.action() {
+                Some(action) => self.refuse(action, None, INVALID),
+                None => Err(INVALID),
+            };
+        }
         if let Some(action) = tool.action() {
+            // The attempted VM ID is only a candidate correlation. The audit
+            // transaction keeps it only when it is owned by this caller.
             let vm = args
                 .0
                 .get("vm_id")
@@ -625,17 +712,23 @@ impl VmInventory {
                 .and_then(|id| parse_id(id).ok());
             let request = match Mutation::parse(tool, &mut args) {
                 Ok(request) => request,
-                Err(reason) => return self.refuse(action, vm, Refusal::Invalid, reason),
+                Err(reason) => return self.refuse(action, vm, reason),
             };
             return self.mutate(&mut gate, action, request);
         }
         self.read(&gate, tool, args)
     }
 
-    fn refuse(&self, action: i64, vm: Option<Id>, audit: Refusal, reason: Fault) -> Outcome<Value> {
-        self.supervisor
-            .controller
-            .foreground_refusal(&self.principal, action, vm, audit)??;
+    /// The one bounded refusal policy for trusted mutation attempts. A
+    /// refusal is filed only under its exact stored code; reasons the v6
+    /// vocabulary cannot express are not misfiled as another code. When the
+    /// audit write cannot commit the caller gets the headroom refusal instead.
+    fn refuse(&self, action: i64, vm: Option<Id>, reason: Fault) -> Outcome<Value> {
+        if let Some(code) = refusal_from_wire(reason.0) {
+            self.supervisor
+                .controller
+                .foreground_refusal(&self.principal, action, vm, code)??;
+        }
         Err(reason)
     }
 
@@ -662,34 +755,37 @@ impl VmInventory {
         match controller.foreground_replay(&self.principal, request.key, subject, action)? {
             Ok(Some(replay)) => return Ok(receipt(replay.operation.id, replay.lease_end)),
             Ok(None) => {}
-            Err(reason) => return self.refuse(action, request.vm(), reason, reason.into()),
+            Err(reason) => return self.refuse(action, request.vm(), reason.into()),
         }
-        if let Some(vm) = request.vm() {
-            match controller.get_status(&self.principal, vm)? {
-                Err(reason) => return self.refuse(action, None, reason, reason.into()),
-                Ok(status) if status.state == "expired" || status.state == "teardown" => {
-                    return self.refuse(
-                        action,
-                        Some(vm),
-                        Refusal::Expired,
-                        Refusal::Expired.into(),
-                    );
-                }
-                Ok(_) => {}
+        // Scope and subject state precede native or fixture eligibility.
+        let subject = match request.work {
+            Work::Build if digest.is_none() => {
+                return self.refuse(action, None, NOT_FOUND);
             }
-        }
-        if matches!(request.work, Work::Build) && digest.is_none() {
-            return self.refuse(action, None, Refusal::NotFound, NOT_FOUND);
+            Work::Build => None,
+            Work::Create(_) => Some(ForegroundSubject::Template(request.id)),
+            Work::Start => Some(ForegroundSubject::Start(request.id)),
+            Work::Stop => Some(ForegroundSubject::Stop(request.id)),
+            Work::Script(..) => Some(ForegroundSubject::Script(request.id)),
+            Work::Extend(_) => Some(ForegroundSubject::Extend(request.id)),
+        };
+        if let Some(subject) = subject
+            && let Err(reason) = controller.foreground_precheck(&self.principal, subject)?
+        {
+            let reason = match reason {
+                Precheck::Refused(reason) => reason.into(),
+                Precheck::NotReady => NOT_READY,
+            };
+            return self.refuse(action, request.vm(), reason);
         }
         #[cfg(test)]
         if let Some(fixture) = &mut gate.fixture {
-            return fixture.admit(self, request, digest);
+            return fixture.admit(self, action, request, digest);
         }
         let _ = gate;
         self.refuse(
             action,
             request.vm(),
-            Refusal::UnknownHost,
             Fault(native_reason(self.supervisor.native_refusal)),
         )
     }
@@ -752,7 +848,8 @@ impl VmInventory {
             rows.pop();
             value["next_before_id"] = json!(rows.last().expect("positive limit").id);
         }
-        value["activities"] = Value::Array(rows.into_iter().map(activity_row).collect());
+        value["activities"] =
+            Value::Array(rows.into_iter().map(activity_row).collect::<Outcome<_>>()?);
         Ok(value)
     }
 
@@ -769,30 +866,23 @@ impl VmInventory {
             .transpose()?;
         let capability = self.supervisor.capability(gate);
         let controller = &self.supervisor.controller;
+        let buildable = capability["available"] == true;
+        // Both pages read `limit + 1` rows from one controller snapshot; the
+        // extra row only decides whether a cursor is returned.
         let mut rows: Vec<((u8, Id), Value)> = if tool == ToolName::Catalog {
-            controller.foreground_catalog(&self.principal, self.supervisor.recipe.map(|(id, _)| id),
-                after.unwrap_or((0, [0; 16])), limit + 1)?
-                .into_iter().map(|entry| {
-                    let id = hex::encode(entry.id);
-                    let row = match entry.kind {
-                        1 if capability["available"] == true => json!({"recipe_id":id,"guest":"ubuntu","state":"buildable"}),
-                        1 => json!({"recipe_id":id,"guest":"ubuntu","state":"unqualified","reason":"recipe_unqualified"}),
-                        2 => json!({"template_id":id,"recipe_id":entry.recipe,"guest":"ubuntu","state":"sealed"}),
-                        _ => json!({"operation_id":id,"recipe_id":entry.recipe,"state":"building"}),
-                    };
-                    ((entry.kind, entry.id), row)
-                }).collect()
-        } else {
-            let mut items =
-                controller.list_status(&self.principal, after.map(|(_, id)| id), limit)??;
-            if items.len() == limit as usize {
-                items.extend(controller.list_status(
+            controller
+                .foreground_catalog(
                     &self.principal,
-                    items.last().map(|item| item.id),
-                    1,
-                )??);
-            }
-            items
+                    self.supervisor.recipe.map(|(id, _)| id),
+                    after.unwrap_or((0, [0; 16])),
+                    limit + 1,
+                )?
+                .into_iter()
+                .map(|entry| Ok(((entry.kind, entry.id), catalog_row(&entry, buildable)?)))
+                .collect::<Outcome<_>>()?
+        } else {
+            controller
+                .foreground_list(&self.principal, after.map(|(_, id)| id), limit + 1)??
                 .into_iter()
                 .map(|item| ((0, item.id), vm_row(item, gate, false)))
                 .collect()
@@ -890,6 +980,24 @@ fn decode_cursor(value: &str) -> Outcome<[u8; 51]> {
     Ok(output)
 }
 
+/// Catalog kinds are the keyset's first ordering column. Optional recipe
+/// correlations are omitted; a sealed or building row always has one in v6,
+/// so an absent value is a store invariant failure, not a wire `null`.
+fn catalog_row(entry: &crate::vm::CatalogEntry, buildable: bool) -> Outcome<Value> {
+    let id = hex::encode(entry.id);
+    Ok(match (entry.kind, entry.recipe.as_deref()) {
+        (1, _) if buildable => json!({"recipe_id":id,"guest":"ubuntu","state":"buildable"}),
+        (1, _) => {
+            json!({"recipe_id":id,"guest":"ubuntu","state":"unqualified","reason":"recipe_unqualified"})
+        }
+        (2, Some(recipe)) => {
+            json!({"template_id":id,"recipe_id":recipe,"guest":"ubuntu","state":"sealed"})
+        }
+        (3, Some(recipe)) => json!({"operation_id":id,"recipe_id":recipe,"state":"building"}),
+        _ => return Err(STATE_UNAVAILABLE),
+    })
+}
+
 fn receipt(id: Id, expires: Option<i64>) -> Value {
     let mut value = json!({"operation_id":hex::encode(id)});
     if let Some(expires) = expires {
@@ -969,38 +1077,51 @@ fn operation_row(operation: OperationStatus) -> Value {
             ScriptResult::Terminated => "terminated",
         });
     } else if operation.state == Status::Interrupted {
-        value["reason"] = json!(match (operation.cleanup, operation.action) {
-            (Some("unconfirmed"), _) => "cleanup_unconfirmed",
-            (_, "run_script") => "execution_unknown",
-            _ => "cancelled",
-        });
-    } else if operation.state == Status::Failed {
-        value["reason"] = json!(match operation.action {
-            "template_build" => "staging_failed",
-            "create" => "clone_failed",
-            "start" => "boot_failed",
-            "stop" => "dirty_stop",
-            _ => "execution_unknown",
-        });
+        // Only evidence-backed reasons are projected. The v6 ledger has no
+        // typed failure reason, so other failed or interrupted rows omit it.
+        let reason = match (operation.cleanup, operation.action) {
+            (Some("unconfirmed"), _) => Some("cleanup_unconfirmed"),
+            (_, "run_script") => Some("execution_unknown"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            value["reason"] = json!(reason);
+        }
     }
     value
 }
 
-fn activity_row(row: crate::vm::ActivityReceipt) -> Value {
-    let action = [
-        "create",
-        "run_script",
-        "start",
-        "stop",
-        "snapshot",
-        "restore",
-        "expire",
-        "extend",
-        "seal_template",
-        "recover",
-        "template_build",
-    ][row.action as usize - 1];
-    let state = ["pending", "succeeded", "failed", "interrupted", "refused"][row.state as usize];
+fn action_wire(code: i64) -> Option<&'static str> {
+    Some(match code {
+        1 => "create",
+        2 => "run_script",
+        3 => "start",
+        4 => "stop",
+        5 => "snapshot",
+        6 => "restore",
+        7 => "expire",
+        8 => "extend",
+        9 => "seal_template",
+        10 => "recover",
+        BUILD_ACTION => "template_build",
+        _ => return None,
+    })
+}
+
+fn activity_state_wire(code: i64) -> Option<&'static str> {
+    Some(match code {
+        0 => "pending",
+        1 => "succeeded",
+        2 => "failed",
+        3 => "interrupted",
+        4 => "refused",
+        _ => return None,
+    })
+}
+
+fn activity_row(row: crate::vm::ActivityReceipt) -> Outcome<Value> {
+    let action = action_wire(row.action).ok_or(STATE_UNAVAILABLE)?;
+    let state = activity_state_wire(row.state).ok_or(STATE_UNAVAILABLE)?;
     let mut value = json!({"activity_id":row.id,"action":action,"state":state,
         "identity_mode":"local_vm_principal","actor":"agent","started_at_ms":row.started_ms});
     if let Some(finished) = row.finished_ms {
@@ -1013,12 +1134,12 @@ fn activity_row(row: crate::vm::ActivityReceipt) -> Value {
         value["operation_id"] = json!(hex::encode(id));
     }
     if let Some(reason) = row.reason {
-        value["reason"] = json!(REFUSALS[reason as usize - 1]);
+        value["reason"] = json!(refusal_wire(refusal_code(reason).ok_or(STATE_UNAVAILABLE)?));
     }
     if let Some(cleanup) = row.cleanup {
         value["cleanup"] = json!(proof_wire(cleanup));
     }
-    value
+    Ok(value)
 }
 
 /// Coordinator steering (2026-11-23): explicit proof maps `true` to
@@ -1151,11 +1272,18 @@ mod tests {
 
     type Pair = (PairSlots, [ArtifactEvidence; 2]);
 
+    /// A published healthy boot. Channel health (the slot exists) is distinct
+    /// from its one exchange slot (idle, or held by a script worker).
+    enum Slot {
+        Idle(Box<Boot>),
+        Exchanging,
+    }
+
     #[derive(Default)]
     struct Live {
         templates: HashMap<Id, Pair>,
         instances: HashMap<Id, Pair>,
-        boots: HashMap<Id, Option<Boot>>,
+        boots: HashMap<Id, Slot>,
     }
 
     pub(super) struct Fixture {
@@ -1179,9 +1307,12 @@ mod tests {
             while let Some(result) = self.jobs.join_next().await {
                 self.failed |= !matches!(result, Ok(Ok(())));
             }
+            // Workers holding an exchange slot were joined above.
             let boots = std::mem::take(&mut self.live.lock().unwrap().boots);
-            for boot in boots.into_values().flatten() {
-                boot.release().await?;
+            for slot in boots.into_values() {
+                if let Slot::Idle(boot) = slot {
+                    (*boot).release().await?;
+                }
             }
             ensure!(!self.failed, "fixture job failed");
             Ok(self)
@@ -1213,12 +1344,7 @@ mod tests {
         }
 
         pub(super) fn ready(&self, vm: Id) -> bool {
-            self.live
-                .lock()
-                .unwrap()
-                .boots
-                .get(&vm)
-                .is_some_and(Option::is_some)
+            self.live.lock().unwrap().boots.contains_key(&vm)
         }
 
         fn reap(&mut self) {
@@ -1257,15 +1383,27 @@ mod tests {
         pub(super) fn admit(
             &mut self,
             inventory: &VmInventory,
+            action: i64,
             mutation: Mutation,
             digest: Option<[u8; 32]>,
         ) -> Outcome<Value> {
             self.reap();
             if self.failed {
-                return Err(Fault("state_unavailable"));
+                return Err(STATE_UNAVAILABLE);
             }
             if self.jobs.len() >= 8 {
-                return Err(Refusal::PendingFull.into());
+                return inventory.refuse(action, mutation.vm(), Refusal::PendingFull.into());
+            }
+            if let Work::Script(..) = mutation.work {
+                // The controller already proved a running owned generation
+                // with no pending operation; this checks the live channel.
+                match self.live.lock().unwrap().boots.get(&mutation.id) {
+                    Some(Slot::Idle(_)) => {}
+                    Some(Slot::Exchanging) => {
+                        return inventory.refuse(action, mutation.vm(), Refusal::Busy.into());
+                    }
+                    None => return inventory.refuse(action, mutation.vm(), NOT_READY),
+                }
             }
             let controller = inventory.supervisor.controller.clone();
             let cancel = inventory.supervisor.cancel.clone();
@@ -1356,7 +1494,12 @@ mod tests {
                     return Ok(receipt(reference.id, None));
                 }
                 Work::Create(ttl) => {
-                    let (golden, proof) = registry.templates.get(&id).copied().ok_or(NOT_FOUND)?;
+                    // The controller precheck proved the sealed template.
+                    let (golden, proof) = registry
+                        .templates
+                        .get(&id)
+                        .copied()
+                        .ok_or(STATE_UNAVAILABLE)?;
                     artifacts.verify(golden.disk, proof[0])?;
                     artifacts.verify(golden.vars, proof[1])?;
                     let request = Request {
@@ -1396,25 +1539,18 @@ mod tests {
                     let end = controller.extend_lease(principal, id, key, ttl)??;
                     let replay = controller
                         .foreground_replay(principal, key, Subject::Vm(id), Action::Extend as i64)??
-                        .ok_or(Fault("state_unavailable"))?;
+                        .ok_or(STATE_UNAVAILABLE)?;
                     return Ok(receipt(replay.operation.id, Some(end)));
                 }
                 Work::Start => (Operation::Start, id),
                 Work::Stop => (Operation::Stop, id),
-                Work::Script(ref script, seconds) => {
-                    match registry.boots.get(&id) {
-                        Some(Some(_)) => {}
-                        Some(None) => return Err(Refusal::Busy.into()),
-                        None => return Err(Fault("not_ready")),
-                    }
-                    (
-                        Operation::Script {
-                            script,
-                            timeout_seconds: u64::from(seconds),
-                        },
-                        id,
-                    )
-                }
+                Work::Script(ref script, seconds) => (
+                    Operation::Script {
+                        script,
+                        timeout_seconds: u64::from(seconds),
+                    },
+                    id,
+                ),
             };
             let request = Request {
                 principal,
@@ -1441,9 +1577,23 @@ mod tests {
                         let boot = Boot::start(&cancel).await;
                         match boot {
                             Ok(boot) => {
-                                let mut registry = live.lock().unwrap();
-                                controller.finish(&worker, Completion::Succeeded)?;
-                                registry.boots.insert(vm, Some(boot));
+                                // Publish ready only if this worker's settlement
+                                // won; a worker that lost to expiry or shutdown
+                                // is reaped without a ready boot.
+                                let settled = {
+                                    let mut registry = live.lock().unwrap();
+                                    let status =
+                                        controller.finish(&worker, Completion::Succeeded)?;
+                                    if status == Status::Succeeded {
+                                        registry.boots.insert(vm, Slot::Idle(Box::new(boot)));
+                                        None
+                                    } else {
+                                        Some(boot)
+                                    }
+                                };
+                                if let Some(boot) = settled {
+                                    boot.release().await?;
+                                }
                             }
                             Err(_) => {
                                 controller.finish(&worker, Completion::CleanupUnconfirmed)?;
@@ -1453,7 +1603,10 @@ mod tests {
                     });
                 }
                 Work::Stop => {
-                    let boot = registry.boots.remove(&vm).flatten();
+                    let boot = match registry.boots.remove(&vm) {
+                        Some(Slot::Idle(boot)) => Some(*boot),
+                        Some(Slot::Exchanging) | None => None,
+                    };
                     let controller = controller.clone();
                     self.jobs.spawn(async move {
                         let complete = match boot {
@@ -1472,11 +1625,10 @@ mod tests {
                     });
                 }
                 Work::Script(script, seconds) => {
-                    let mut boot = registry
-                        .boots
-                        .get_mut(&vm)
-                        .and_then(Option::take)
-                        .expect("ready under fixture gate");
+                    let Some(Slot::Idle(boot)) = registry.boots.insert(vm, Slot::Exchanging) else {
+                        unreachable!("idle channel checked under the fixture gate");
+                    };
+                    let mut boot = *boot;
                     let hold = self.script_hold.take();
                     worker.deadline += Duration::from_secs(6);
                     let controller = controller.clone();
@@ -1487,14 +1639,28 @@ mod tests {
                             None
                         };
                         let result = result.and_then(|(status, code)| guest_result(status, code));
-                        if let Some(result) = result {
-                            let mut registry = live.lock().unwrap();
-                            controller.finish_script(&worker, result)?;
-                            registry.boots.insert(vm, Some(boot));
-                        } else {
+                        // A trustworthy result that won settlement returns the
+                        // exchange slot; anything else retires the boot.
+                        let retired = match result {
+                            Some(result) => {
+                                let mut registry = live.lock().unwrap();
+                                let status = controller.finish_script(&worker, result)?;
+                                if matches!(status, Status::Succeeded | Status::Failed) {
+                                    registry.boots.insert(vm, Slot::Idle(Box::new(boot)));
+                                    None
+                                } else {
+                                    registry.boots.remove(&vm);
+                                    Some(boot)
+                                }
+                            }
+                            None => {
+                                live.lock().unwrap().boots.remove(&vm);
+                                controller.finish(&worker, Completion::CleanupUnconfirmed)?;
+                                Some(boot)
+                            }
+                        };
+                        if let Some(boot) = retired {
                             boot.release().await?;
-                            controller.finish(&worker, Completion::CleanupUnconfirmed)?;
-                            live.lock().unwrap().boots.remove(&vm);
                         }
                         Ok(())
                     });
@@ -2058,7 +2224,11 @@ mod tests {
         supervisor.close();
         stop.cancel();
         server.await.unwrap().unwrap();
-        supervisor.drain().await.unwrap();
+        supervisor
+            .drain_workers(Duration::from_secs(5))
+            .await
+            .unwrap();
+        supervisor.recover(Duration::from_secs(5)).await.unwrap();
         assert_eq!(
             active
                 .inventory()
