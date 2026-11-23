@@ -17,14 +17,14 @@ Relayed by the babysitter on the owner's behalf.
   | --- | --- |
   | Login | `azuread\<owner>`. UAC-filtered: medium integrity, `BUILTIN\Administrators` deny-only, not elevated. Compatible with `current_user` execution. |
   | Hypervisor | `HypervisorPresent=True`. `WinHvPlatform.dll` and `WinHvEmulation.dll` are present. `WHvGetCapability(HypervisorPresent)` returns 1, and the feature mask is `0x2FF`. **WHPX is usable from this login.** The optional-feature state query needs elevation and was not run. |
-  | QEMU | **Not found** on PATH or in the common install directories checked. The only `qemu-img.exe` on PATH belongs to the Android SDK emulator and is unrelated. A QEMU/WHPX boot is **unverified on real hardware**. The pinned QEMU 11.1.3 Windows x64 build with a binary receipt (ADR 0054) is still to be installed, by an agent under the scoped permission above. |
+  | QEMU | **Not found** on PATH or in the common install directories checked. The only `qemu-img.exe` on PATH belongs to the Android SDK emulator and is unrelated. A QEMU/WHPX boot is **unverified on real hardware**. That was the state at the time of the read-only check; see the QEMU install below. |
   | Data folder | `D:\ArxcovoData` exists. Free space: C: 600.9 GB, D: 1569.3 GB. |
   | CPU and RAM | 16 logical CPUs, 61.6 GB RAM. |
 
   The disk cap and owner reserve are not yet configured.
 
 - **QEMU install, 2026-11-23, by an agent under the scoped exception.**
-  - Official Windows builds stop at 11.1.0; 11.1.3 is source-only. The coordinator re-pinned the Windows binary to the official Weil 11.1.0 x64 build.
+  - The Weil Windows installers linked from qemu.org stop at 11.1.0; no Weil 11.1.3 installer exists. The coordinator re-pinned the Windows binary to the official Weil 11.1.0 x64 build. That pin supersedes the earlier 11.1.3 candidate in ADR 0054, and the code and ADR are updated in a separate PR. MSYS2 publishes a Windows x64 `mingw-w64-ucrt-x86_64-qemu` package, which is the candidate patched build to evaluate, with package signatures and a receipt, before the patched-build gate below.
   - It was extracted portably to `D:\ArxcovoData\qemu\11.1.0` without running the installer, so no UAC prompt was needed.
   - The installer SHA-512 matches the publisher's checksum. The Authenticode certificate (Universität Mannheim) expired before the signing timestamp; the owner approved the install anyway.
   - Receipt: `D:\ArxcovoData\qemu\11.1.0\RECEIPT.txt` (SHA-256 `5b8a9e63…6ab1`).
