@@ -301,7 +301,7 @@ impl<C: Clock> VmController<C> {
                 request,
                 &binding,
                 clock,
-                closed.rejects_fresh(),
+                closed.rejects_fresh() || store::has_failed_clone_cleanup(db)?,
                 host,
                 resources,
                 verify_sealed,

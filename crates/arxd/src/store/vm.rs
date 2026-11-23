@@ -1501,17 +1501,18 @@ pub(crate) fn settle_with_script(
     completion: Completion,
     script: Option<ScriptResult>,
 ) -> Result<Status> {
-    let (vm, action, state): (Id, i64, i64) = db.query_row(
-        "SELECT a.vm,a.action,v.state FROM activity a JOIN vm_instances v ON a.vm=v.id
+    let (vm, action, state, expires_ms): (Id, i64, i64, i64) = db.query_row(
+        "SELECT a.vm,a.action,v.state,v.expires_ms FROM activity a JOIN vm_instances v ON a.vm=v.id
          WHERE a.id=?1 AND a.status=0 AND a.action<=6",
         [id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     ensure!(
         script.is_none() || action == Action::Script as i64,
         "invalid script worker"
     );
-    if completion == Completion::CleanupUnconfirmed || state == 4 {
+    let clone_due = action == Action::Clone as i64 && now >= expires_ms;
+    if completion == Completion::CleanupUnconfirmed || state == 4 || clone_due {
         if state == 0 {
             db.execute("UPDATE vm_instances SET state=4 WHERE id=?1", [vm])?;
         } else if state != 4 {
@@ -2003,37 +2004,49 @@ mod tests {
                     params![template, [template[0]; 32]],
                 )?;
             }
-            let create = |nonce, template| -> Result<OperationRef> {
-                let operation = legacy_binding(nonce, vm, Action::Clone).record(db, NOW, Some(vm), None)?;
+            // Publish strictly before expiry; settlement at the deadline is
+            // refused, matching the reaper's inclusive `expires_ms <= now`.
+            let create = |nonce, template, published_at: i64| -> Result<OperationRef> {
+                let operation = legacy_binding(nonce, vm, Action::Clone)
+                    .record(db, published_at, Some(vm), None)?;
                 db.execute(
                     "INSERT INTO vm_instances(id,template,principal,expires_ms) VALUES(?1,?2,'alice',?3)",
-                    params![vm, template, NOW],
+                    params![vm, template, published_at + 60_000],
                 )?;
-                settle_operation(db, operation.receipt.activity_id, NOW, Completion::Succeeded)?;
+                let settled = settle_operation(
+                    db,
+                    operation.receipt.activity_id,
+                    published_at,
+                    Completion::Succeeded,
+                )?;
+                assert_eq!(settled, Status::Succeeded);
                 Ok(operation)
             };
-            let original = create(1, original_template)?;
-            let status = |id| -> Result<OperationStatus> {
-                Ok(operation_status(db, "alice", id, NOW)?.unwrap())
+            let original = create(1, original_template, NOW)?;
+            let status = |id, now| -> Result<OperationStatus> {
+                Ok(operation_status(db, "alice", id, now)?.unwrap())
             };
-            let before = status(original.id)?;
+            let before = status(original.id, NOW)?;
+            // The original is claimed at equality with its expiry.
+            let expiry = NOW + 60_000;
             for id in 1..=MAX_TOMBSTONES + 1 {
                 let instance = [id as u8; 16];
                 if instance != vm {
                     db.execute(
                         "INSERT INTO vm_instances(id,template,principal,expires_ms,state) VALUES(?1,?2,'alice',?3,1)",
-                        params![instance, original_template, NOW],
+                        params![instance, original_template, expiry],
                     )?;
                 }
-                let [claim] = expiry_claims(db, NOW)?.try_into().unwrap();
+                let [claim] = expiry_claims(db, expiry)?.try_into().unwrap();
                 assert_eq!(claim.vm, instance);
-                record_expired(db, claim, NOW)?;
+                record_expired(db, claim, expiry)?;
             }
             assert!(expired_status(db, "alice", vm)?.is_none());
-            let replacement = create(2, replacement_template)?;
-            assert_eq!(status(original.id)?, before);
+            let reused_at = expiry + 1;
+            let replacement = create(2, replacement_template, reused_at)?;
+            assert_eq!(status(original.id, reused_at)?, before);
             assert_eq!(before.template, None);
-            let replacement = status(replacement.id)?;
+            let replacement = status(replacement.id, reused_at)?;
             assert_ne!(replacement.id, original.id);
             assert_eq!(replacement.vm, Some(vm));
             assert_eq!(replacement.template, None);
