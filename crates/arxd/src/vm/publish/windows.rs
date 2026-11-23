@@ -135,7 +135,8 @@ fn open_object(path: &Path, directory: bool) -> io::Result<File> {
     Ok(file)
 }
 
-fn require_owner(file: &File) -> io::Result<()> {
+/// A word-aligned TOKEN_USER buffer for the current process token.
+fn token_user() -> io::Result<Vec<usize>> {
     let mut token = null_mut();
     ok(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) })?;
     let token = owned(token)?;
@@ -154,6 +155,57 @@ fn require_owner(file: &File) -> io::Result<()> {
             &mut size,
         )
     })?;
+    Ok(user)
+}
+
+/// Creates `path` exclusively and, before any content is written, makes the
+/// current TokenUser its owner with a protected DACL granting only that user.
+/// The result does not depend on the token's default owner or on inheritance.
+pub(super) fn create_private(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .access_mode(FILE_GENERIC_WRITE | WRITE_DAC | WRITE_OWNER | READ_CONTROL)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let protected = (|| {
+        let user = token_user()?;
+        // The SID lives in `user`, which outlives every use below.
+        let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        if unsafe { IsValidSid(sid) } == 0 {
+            return Err(refuse());
+        }
+        let length = size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>()
+            + unsafe { GetLengthSid(sid) } as usize;
+        let mut acl = vec![0usize; length.div_ceil(size_of::<usize>())];
+        let acl = acl.as_mut_ptr().cast::<ACL>();
+        ok(unsafe { InitializeAcl(acl, length as u32, ACL_REVISION) })?;
+        ok(unsafe { AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS, sid) })?;
+        let status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                sid,
+                null_mut(),
+                acl,
+                null(),
+            )
+        };
+        if status == 0 { Ok(()) } else { Err(refuse()) }
+    })();
+    if let Err(error) = protected {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+fn require_owner(file: &File) -> io::Result<()> {
+    let user = token_user()?;
     let mut owner = null_mut();
     let mut descriptor = null_mut();
     let status = unsafe {

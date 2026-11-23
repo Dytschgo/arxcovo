@@ -1,7 +1,6 @@
 //! One supervised connector, tied to an immutable image and authenticated loopback origin.
 use std::{
-    fmt,
-    fs::{self, OpenOptions},
+    fmt, fs,
     io::{Read, Write},
     net::{Ipv4Addr, TcpListener},
     num::NonZeroU16,
@@ -391,11 +390,8 @@ impl Config {
             plan.origin_name,
             ca,
         );
-        let mut output = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .map_err(|_| refusal)?;
+        // Owned by TokenUser with a protected DACL before any content exists.
+        let mut output = super::windows::create_private(&path).map_err(|_| refusal)?;
         let mut config = Self { path, held: None };
         output.write_all(text.as_bytes()).map_err(|_| refusal)?;
         drop(output);

@@ -715,7 +715,15 @@ pub(crate) mod publication {
                 Self::Native(ref mut connector) => connector.stop().await.is_ok(),
                 #[cfg(test)]
                 Self::Fixture(ref fake) => {
-                    fake.local.store(false, std::sync::atomic::Ordering::SeqCst);
+                    use std::sync::atomic::Ordering::SeqCst;
+                    if fake
+                        .stop_failures
+                        .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+                        .is_ok()
+                    {
+                        return false;
+                    }
+                    fake.local.store(false, SeqCst);
                     true
                 }
             }
@@ -824,6 +832,15 @@ pub(crate) mod publication {
         pending: Option<Activation>,
         /// The last generation issued. Generations only increase.
         issued: u64,
+        /// The generation whose live connector failed its last stop attempt.
+        /// Cleared once that connector is confirmed stopped. This alone closes
+        /// publish admission.
+        unconfirmed: Option<u64>,
+        /// The intent nonce of a publication whose worker exited before
+        /// submitting its marked POST. Kept until the intent is released, so
+        /// a failed withdrawal and a failed release in one outage still leave
+        /// the proof to a later cleanup.
+        unsubmitted: Option<String>,
     }
 
     impl Activations {
@@ -973,6 +990,47 @@ pub(crate) mod publication {
             }
         }
 
+        /// The publication of `vm` ended with its connector confirmed stopped.
+        /// Called under the effects slot, where only the durable intent's
+        /// activation can be current for `vm`.
+        fn retire(&self, vm: Id) {
+            let mut activations = self.activations();
+            if activations
+                .current
+                .as_ref()
+                .is_some_and(|current| current.vm == vm)
+            {
+                activations.current = None;
+            }
+        }
+
+        /// Daemon shutdown after every connector was confirmed stopped.
+        fn retire_all(&self) {
+            let mut activations = self.activations();
+            activations.current = None;
+            activations.pending = None;
+        }
+
+        /// A live connector failed its last stop attempt. Only this closes
+        /// publish admission.
+        pub(crate) fn stop_unconfirmed(&self) -> bool {
+            self.activations().unconfirmed.is_some()
+        }
+
+        #[cfg(test)]
+        pub(crate) fn registry_len(&self) -> usize {
+            let activations = self.activations();
+            usize::from(activations.current.is_some()) + usize::from(activations.pending.is_some())
+        }
+
+        fn unsubmitted(&self, nonce: &str) -> bool {
+            self.activations().unsubmitted.as_deref() == Some(nonce)
+        }
+
+        fn set_unsubmitted(&self, nonce: Option<&str>) {
+            self.activations().unsubmitted = nonce.map(str::to_owned);
+        }
+
         /// The registered activation was refused and never ran.
         pub(crate) fn abandon(&self, generation: u64) {
             let mut activations = self.activations();
@@ -1038,13 +1096,33 @@ pub(crate) mod publication {
         async fn stop_where(&self, matches: impl Fn(&Live) -> bool) -> bool {
             let mut local = self.local.lock().await;
             let Some(live) = local.as_mut().filter(|live| matches(live)) else {
+                if local.is_none() {
+                    // No connector is live, so no stop can be outstanding.
+                    self.activations().unconfirmed = None;
+                }
                 return true;
             };
+            let generation = live.generation;
             if !live.connector.stop().await {
+                self.activations().unconfirmed = Some(generation);
                 return false;
             }
             *local = None;
+            let mut activations = self.activations();
+            if activations.unconfirmed == Some(generation) {
+                activations.unconfirmed = None;
+            }
             true
+        }
+
+        /// Daemon shutdown: stops every connector and, once confirmed, retires
+        /// every activation.
+        pub(crate) async fn stop_all(&self) -> bool {
+            let stopped = self.stop_local(None).await;
+            if stopped {
+                self.retire_all();
+            }
+            stopped
         }
 
         async fn ready(&self, intent: &Intent, shutdown: &Shutdown) -> Result<(), Failure> {
@@ -1226,6 +1304,7 @@ pub(crate) mod publication {
             // no-submission evidence still lets its cleanup release the
             // intent with its marker, without consulting DNS.
             if !origin.current() || shutdown.is_cancelled() || revoked.is_cancelled() {
+                self.set_unsubmitted(Some(&intent.nonce));
                 let failure = if origin.current() {
                     Failure::Cancelled
                 } else {
@@ -1297,7 +1376,11 @@ pub(crate) mod publication {
             let Some(_slot) = self.claim() else {
                 return Ok(());
             };
-            if let Some(intent) = controller.publication_intent()? {
+            let intent = controller.publication_intent()?;
+            if intent.is_none() {
+                self.set_unsubmitted(None);
+            }
+            if let Some(intent) = intent {
                 let stale = if intent.phase == Phase::Published {
                     self.ready(&intent, shutdown).await.err().map(Some)
                 } else {
@@ -1326,6 +1409,9 @@ pub(crate) mod publication {
             // Under the effects slot only this VM's current or leftover
             // connector can be live, so a VM-scoped stop is exact here.
             let local = self.stop_local(Some(vm)).await;
+            if local {
+                self.retire(vm);
+            }
             let Some(intent) = controller
                 .publication_intent()?
                 .filter(|intent| intent.vm == vm)
@@ -1333,7 +1419,13 @@ pub(crate) mod publication {
                 return Ok(local);
             };
             controller.update_publication(&intent.nonce, Update::Phase(Phase::Revoking, reason))?;
-            let dns = if let Some(shutdown) = shutdown {
+            // A proven unsubmitted POST needs no remote work, so it is decided
+            // before DNS and before cancellation can win.
+            let unsubmitted = intent.record.is_none()
+                && (matches!(evidence, Evidence::NotSubmitted) || self.unsubmitted(&intent.nonce));
+            let dns = if !intent.post_possible || unsubmitted {
+                Ok(())
+            } else if let Some(shutdown) = shutdown {
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => Err(Failure::Cancelled),
@@ -1357,6 +1449,9 @@ pub(crate) mod publication {
             } else {
                 controller.update_publication(&intent.nonce, update)?;
             }
+            if released && self.unsubmitted(&intent.nonce) {
+                self.set_unsubmitted(None);
+            }
             Ok(released)
         }
 
@@ -1367,12 +1462,6 @@ pub(crate) mod publication {
             evidence: Evidence,
         ) -> Result<(), Failure> {
             if !intent.post_possible {
-                return Ok(());
-            }
-            // This worker never submitted its marked POST, so there is nothing
-            // to remove. The release that follows deletes the intent and its
-            // marker even if withdrawing the marker failed.
-            if intent.record.is_none() && matches!(evidence, Evidence::NotSubmitted) {
                 return Ok(());
             }
             let dns = self.cleanup_dns(intent).ok_or(Failure::DnsUnavailable)?;
@@ -1435,6 +1524,8 @@ pub(crate) mod publication {
         pub(crate) local: std::sync::atomic::AtomicBool,
         /// Connector starts, including failed ones.
         pub(crate) starts: std::sync::atomic::AtomicUsize,
+        /// The next N connector stops fail and leave the connector live.
+        pub(crate) stop_failures: std::sync::atomic::AtomicUsize,
         pub(crate) posts: std::sync::atomic::AtomicUsize,
         pub(crate) deletes: std::sync::atomic::AtomicUsize,
         pub(crate) ingress: std::sync::Mutex<Option<String>>,

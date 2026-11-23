@@ -239,7 +239,6 @@ struct Gate {
     allow_agent_public_sites: bool,
     publish_profile: Option<Arc<Profile>>,
     publish_jobs: tokio::task::JoinSet<anyhow::Result<()>>,
-    publish_failed: bool,
     #[cfg(test)]
     fixture: Option<tests::Fixture>,
     #[cfg(test)]
@@ -261,10 +260,13 @@ pub(crate) struct Supervisor {
     /// the closed candidate runtime; it never authorizes a launch here.
     runtime: Option<VmRuntimeProfile>,
     publisher: Publication,
-    /// Deferred local stops queued by owner revocation. Kept outside the
-    /// dispatch gate: revocation runs before the gate, the replay ledger and
-    /// every store write.
-    revocations: Mutex<tokio::task::JoinSet<anyhow::Result<()>>>,
+    /// Deferred local stops queued by owner revocation, at most one in flight
+    /// per activation generation. Kept outside the dispatch gate: revocation
+    /// runs before the gate, the replay ledger and every store write.
+    stops: Mutex<StopJobs>,
+    /// Deferred stops ever spawned, for witnesses.
+    #[cfg(test)]
+    stops_spawned: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     ticks: Mutex<Option<tests::TestTicks>>,
     /// Parks the next tool call before admission.
@@ -359,7 +361,6 @@ impl Supervisor {
                 allow_agent_public_sites: false,
                 publish_profile: None,
                 publish_jobs: Default::default(),
-                publish_failed: false,
                 #[cfg(test)]
                 fixture: None,
                 #[cfg(test)]
@@ -373,7 +374,9 @@ impl Supervisor {
             native_refusal,
             runtime,
             publisher: Publication::default(),
-            revocations: Mutex::default(),
+            stops: Mutex::default(),
+            #[cfg(test)]
+            stops_spawned: Default::default(),
             #[cfg(test)]
             ticks: Mutex::new(None),
             #[cfg(test)]
@@ -542,35 +545,38 @@ impl Supervisor {
     /// audit failure here is retried on the next tick instead of ending the
     /// reaper.
     async fn publication_turn(&self) -> bool {
+        self.reap_stops();
         self.publisher
             .turn(&self.controller, &self.cancel)
             .await
             .is_ok()
     }
 
-    /// Queues the local stop of one revoked activation generation.
+    /// Queues the local stop of one revoked activation generation, unless a
+    /// stop for it is already in flight. Completed jobs are dropped first, so
+    /// the set holds at most one job per generation still being stopped. The
+    /// outcome is recorded in the publisher's unconfirmed-stop state.
     fn stop_revoked(self: &Arc<Self>, generation: u64) {
-        let supervisor = self.clone();
-        let Ok(mut revocations) = self.revocations.lock() else {
+        let Ok(mut stops) = self.stops.lock() else {
             return;
         };
-        revocations.spawn(async move {
-            anyhow::ensure!(
-                supervisor.publisher.stop_activation(generation).await,
-                "publication stop unconfirmed"
-            );
-            Ok(())
+        stops.reap();
+        if stops.running.values().any(|running| *running == generation) {
+            return;
+        }
+        let supervisor = self.clone();
+        let job = stops.set.spawn(async move {
+            supervisor.publisher.stop_activation(generation).await;
         });
+        stops.running.insert(job.id(), generation);
+        #[cfg(test)]
+        self.stops_spawned.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Settled revocation stops. Any failure is sticky in `publish_failed`.
-    fn harvest_revocations(&self, gate: &mut Gate) {
-        let Ok(mut revocations) = self.revocations.lock() else {
-            gate.publish_failed = true;
-            return;
-        };
-        while let Some(job) = revocations.try_join_next() {
-            gate.publish_failed |= !matches!(job, Ok(Ok(())));
+    /// Drops completed deferred stops.
+    fn reap_stops(&self) {
+        if let Ok(mut stops) = self.stops.lock() {
+            stops.reap();
         }
     }
 
@@ -579,24 +585,22 @@ impl Supervisor {
     /// registered.
     pub(crate) async fn drain_workers(&self, bound: Duration) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + bound;
-        let (mut publish_jobs, failed) = {
-            let mut gate = self.lock()?;
-            (std::mem::take(&mut gate.publish_jobs), gate.publish_failed)
-        };
-        let mut revocations = self
-            .revocations
+        let mut publish_jobs = std::mem::take(&mut self.lock()?.publish_jobs);
+        let mut stops = self
+            .stops
             .lock()
             .map(|mut jobs| std::mem::take(&mut *jobs))
             .map_err(|_| anyhow::anyhow!("publication settlement unconfirmed"))?;
         tokio::time::timeout_at(deadline, async {
-            let local = self.publisher.stop_local(None).await;
-            let mut failed = failed || !local;
+            let local = self.publisher.stop_all().await;
+            let mut failed = !local;
             while let Some(job) = publish_jobs.join_next().await {
                 failed |= !matches!(job, Ok(Ok(())));
             }
-            while let Some(job) = revocations.join_next().await {
-                failed |= !matches!(job, Ok(Ok(())));
+            while let Some(job) = stops.set.join_next().await {
+                failed |= job.is_err();
             }
+            failed |= self.publisher.stop_unconfirmed();
             anyhow::ensure!(!failed, "publication settlement unconfirmed");
             Ok::<_, anyhow::Error>(())
         })
@@ -715,6 +719,25 @@ impl Drop for Connection {
             .supervisor
             .closed_connections
             .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Deferred revocation stops and the generation each one stops.
+#[derive(Default)]
+struct StopJobs {
+    set: tokio::task::JoinSet<()>,
+    running: std::collections::HashMap<tokio::task::Id, u64>,
+}
+
+impl StopJobs {
+    fn reap(&mut self) {
+        while let Some(done) = self.set.try_join_next_with_id() {
+            let id = match done {
+                Ok((id, ())) => id,
+                Err(error) => error.id(),
+            };
+            self.running.remove(&id);
+        }
     }
 }
 
@@ -1342,10 +1365,12 @@ impl VmInventory {
             return refuse(Refusal::NotFound);
         };
         // A failed worker leaves its durable intent and receipt to the reaper,
-        // which reconciles both. Only an unconfirmed local stop is sticky.
+        // which reconciles both. Only a live connector whose stop is still
+        // unconfirmed closes publish admission, and a later confirmed stop
+        // reopens it.
         while gate.publish_jobs.try_join_next().is_some() {}
-        supervisor.harvest_revocations(gate);
-        if publish && gate.publish_failed {
+        supervisor.reap_stops();
+        if publish && supervisor.publisher.stop_unconfirmed() {
             return refuse(Refusal::StateUnavailable);
         }
         // Publish needs the free effects slot. Unpublish never waits here: its
@@ -4402,11 +4427,13 @@ mod tests {
 
     /// Joins every settled deferred revocation stop; true once none remain.
     fn revocations_settled(supervisor: &Supervisor) -> bool {
-        let mut revocations = supervisor.revocations.lock().unwrap();
-        while let Some(job) = revocations.try_join_next() {
-            assert!(matches!(job, Ok(Ok(()))), "revocation stop failed");
-        }
-        revocations.is_empty()
+        let mut stops = supervisor.stops.lock().unwrap();
+        stops.reap();
+        stops.set.is_empty() && stops.running.is_empty()
+    }
+
+    fn stops_spawned(supervisor: &Supervisor) -> usize {
+        supervisor.stops_spawned.load(Ordering::SeqCst)
     }
 
     fn gate() -> (
@@ -4862,12 +4889,13 @@ mod tests {
         // own durable admission then fails: the registered activation is
         // revoked before its worker can start the connector.
         let starts = fake.starts.load(SeqCst);
+        let spawned = stops_spawned(h.supervisor());
         let (caller, revoker) = (h.client(0).await, h.client(0).await);
         let mut stall = Stall::install(&h.supervisor().stall_admission);
         let pending = spawn_call(caller, "publish_site", args(1013));
         stall.entered().await;
         let revoke = spawn_call(revoker, "unpublish_site", args(1014));
-        until(|| !h.supervisor().revocations.lock().unwrap().is_empty()).await;
+        until(|| stops_spawned(h.supervisor()) > spawned).await;
         trigger(
             &h,
             "CREATE TRIGGER refuse_unpublish BEFORE INSERT ON activity WHEN NEW.action=16
@@ -5031,6 +5059,176 @@ mod tests {
         // Only the two completed publications ever posted.
         assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (2, 1));
         let revoke = call(&a, "unpublish_site", args(1060)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+
+        // The withdrawal and every release fail in one outage. The proof
+        // stays in memory for the reaper, which releases the intent without
+        // DNS once writes resume.
+        trigger(
+            &h,
+            "CREATE TRIGGER withdrawal_failure BEFORE UPDATE OF post_possible ON vm_publication
+             WHEN OLD.post_possible=1 AND NEW.post_possible=0
+             BEGIN SELECT RAISE(ABORT, 'synthetic withdrawal failure'); END;
+             CREATE TRIGGER release_failure BEFORE DELETE ON vm_publication
+             BEGIN SELECT RAISE(ABORT, 'synthetic release failure'); END;",
+        );
+        let (in_gate, release) = pause(&h);
+        let pending = call(&a, "publish_site", args(1061)).await;
+        entered(in_gate).await;
+        let revoke = call(&a, "unpublish_site", args(1062)).await;
+        release.send(()).unwrap();
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert_eq!(operation(&a, &pending).await["state"], "pending");
+        assert_eq!(phase(&a, &vm).await["phase"], "revoking");
+        trigger(
+            &h,
+            "DROP TRIGGER withdrawal_failure; DROP TRIGGER release_failure;",
+        );
+        fake.routes.lock().unwrap().clear();
+        settle(&h, &a, &vm).await;
+        assert!(fake.routes.lock().unwrap().is_empty(), "DNS consulted");
+        assert_eq!(terminal(&a, &pending).await["state"], "failed");
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        let published = call(&a, "publish_site", args(1063)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (3, 2));
+        let revoke = call(&a, "unpublish_site", args(1064)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_registry_and_stop_jobs_drain_on_every_terminal_path() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1100).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let empty = |h: &Harness| {
+            h.supervisor().publisher.registry_len() == 0 && revocations_settled(h.supervisor())
+        };
+        assert!(empty(&h));
+
+        // Refused in the admission transaction after registration.
+        trigger(
+            &h,
+            "CREATE TRIGGER refuse_publish BEFORE INSERT ON activity WHEN NEW.action=15
+             BEGIN SELECT RAISE(ABORT, 'synthetic publish admission failure'); END;",
+        );
+        assert_eq!(call(&a, "publish_site", args(1110)).await["ok"], false);
+        trigger(&h, "DROP TRIGGER refuse_publish");
+        assert!(empty(&h));
+
+        // A failed publish releases its publication.
+        fake.foreign.store(true, SeqCst);
+        let failed = call(&a, "publish_site", args(1111)).await;
+        assert_eq!(terminal(&a, &failed).await["reason"], "dns_conflict");
+        fake.foreign.store(false, SeqCst);
+        assert!(empty(&h));
+
+        // Confirmed cleanup by an owner unpublish. The ended publication no
+        // longer matches a later owner unpublish.
+        let published = call(&a, "publish_site", args(1112)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert_eq!(h.supervisor().publisher.registry_len(), 1);
+        let revoke = call(&a, "unpublish_site", args(1113)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        until(|| empty(&h)).await;
+        let spawned = stops_spawned(h.supervisor());
+        let repeated = call(&a, "unpublish_site", args(1114)).await;
+        assert_eq!(terminal(&a, &repeated).await["state"], "succeeded");
+        assert_eq!(stops_spawned(h.supervisor()), spawned);
+
+        // DNS cleanup stays pending, but ingress is confirmed down.
+        let published = call(&a, "publish_site", args(1115)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        fake.credential.store(false, SeqCst);
+        let revoke = call(&a, "unpublish_site", args(1116)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "failed");
+        assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
+        until(|| empty(&h)).await;
+        fake.credential.store(true, SeqCst);
+        settle(&h, &a, &vm).await;
+
+        // Reconciliation of a lost connector.
+        let published = call(&a, "publish_site", args(1117)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        fake.health.store(1, SeqCst);
+        settle(&h, &a, &vm).await;
+        fake.health.store(0, SeqCst);
+        until(|| empty(&h)).await;
+
+        // Bound: twenty owner unpublishes while the first stop is held queue
+        // one job, and the job set drains once it completes.
+        let published = call(&a, "publish_site", args(1118)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let (stop, in_gate, release) = gate();
+        *h.supervisor().publisher.stop_gate.lock().unwrap() = Some(stop);
+        let spawned = stops_spawned(h.supervisor());
+        for _ in 0..20 {
+            // The publish key collides, so no durable unpublish is admitted.
+            assert_eq!(
+                call(&a, "unpublish_site", args(1118)).await["reason"],
+                "key_collision"
+            );
+        }
+        entered(in_gate).await;
+        assert_eq!(stops_spawned(h.supervisor()), spawned + 1);
+        assert_eq!(h.supervisor().stops.lock().unwrap().running.len(), 1);
+        release.send(()).unwrap();
+        until(|| revocations_settled(h.supervisor())).await;
+        assert!(!fake.local.load(SeqCst));
+        settle(&h, &a, &vm).await;
+        until(|| empty(&h)).await;
+
+        // Daemon shutdown with a live publication.
+        let published = call(&a, "publish_site", args(1119)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert_eq!(h.supervisor().publisher.registry_len(), 1);
+        let supervisor = h.supervisor().clone();
+        drop(a);
+        h.shutdown().await.unwrap();
+        assert_eq!(supervisor.publisher.registry_len(), 0);
+        assert!(revocations_settled(&supervisor));
+        assert!(!fake.local.load(SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_failed_deferred_stop_blocks_publish_only_until_a_confirmed_stop() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1120).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let published = call(&a, "publish_site", args(1130)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+
+        let (stop, stop_entered, release_stop) = gate();
+        let (worker, worker_entered, release_worker) = gate();
+        *h.supervisor().publisher.stop_gate.lock().unwrap() = Some(stop);
+        *h.supervisor().publisher.unpublish_gate.lock().unwrap() = Some(worker);
+        fake.stop_failures.store(1, SeqCst);
+        let revoke = call(&a, "unpublish_site", args(1131)).await;
+        assert_eq!(revoke["ok"], true, "{revoke}");
+        entered(stop_entered).await;
+        entered(worker_entered).await;
+        // The deferred stop fails and leaves the connector live.
+        release_stop.send(()).unwrap();
+        until(|| h.supervisor().publisher.stop_unconfirmed()).await;
+        assert!(fake.local.load(SeqCst));
+        assert_eq!(
+            call(&a, "publish_site", args(1132)).await["reason"],
+            "state_unavailable"
+        );
+        // The unpublish worker's stop is confirmed, which reopens admission.
+        release_worker.send(()).unwrap();
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        assert!(!h.supervisor().publisher.stop_unconfirmed());
+        assert!(!fake.local.load(SeqCst));
+        let published = call(&a, "publish_site", args(1133)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let revoke = call(&a, "unpublish_site", args(1134)).await;
         assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
         drop(a);
         h.shutdown().await.unwrap();

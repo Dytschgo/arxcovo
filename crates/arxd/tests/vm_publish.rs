@@ -557,8 +557,32 @@ mod vm {
             #[link(name = "kernel32")]
             unsafe extern "system" {
                 fn SetConsoleCtrlHandler(handler: unsafe extern "system" fn(u32) -> i32, add: i32) -> i32;
+                fn LocalFree(memory: *mut u8) -> *mut u8;
+            }
+            #[link(name = "advapi32")]
+            unsafe extern "system" {
+                fn GetNamedSecurityInfoW(name: *const u16, kind: i32, info: u32, owner: *mut *mut u8,
+                    group: *mut *mut u8, dacl: *mut *mut u8, sacl: *mut *mut u8, descriptor: *mut *mut u8) -> u32;
+                fn GetSecurityDescriptorControl(descriptor: *mut u8, control: *mut u16, revision: *mut u32) -> i32;
             }
             unsafe extern "system" fn ignore_interrupt(_: u32) -> i32 { 1 }
+            // Whether this launch's generated config has a present, protected DACL
+            // (SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED).
+            fn protected(path: &str) -> bool {
+                use std::os::windows::ffi::OsStrExt;
+                let wide: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().chain(Some(0)).collect();
+                let (mut dacl, mut descriptor) = (std::ptr::null_mut(), std::ptr::null_mut());
+                let null = std::ptr::null_mut();
+                if unsafe { GetNamedSecurityInfoW(wide.as_ptr(), 1, 4, null, null, &mut dacl, null, &mut descriptor) } != 0 {
+                    return false;
+                }
+                let (mut control, mut revision) = (0u16, 0u32);
+                let protected = !dacl.is_null()
+                    && unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } != 0
+                    && control & 0x1000 != 0;
+                unsafe { LocalFree(descriptor) };
+                protected
+            }
             fn main() {
                 unsafe { SetConsoleCtrlHandler(ignore_interrupt, 1); }
                 let args: Vec<_> = env::args().skip(1).collect();
@@ -569,8 +593,9 @@ mod vm {
                 assert!(env::var_os("PATH").is_none());
                 let mut witness = fs::OpenOptions::new().append(true).create(true)
                     .open("fake-witness.txt").unwrap();
-                writeln!(witness, "{}|{}|{}", std::process::id(), args.join("|"),
-                    credential.contains("SyntheticDontPrint")).unwrap();
+                let config = &args[args.iter().position(|arg| arg == "--config").unwrap() + 1];
+                writeln!(witness, "{}|{}|{}|{}", std::process::id(), args.join("|"),
+                    credential.contains("SyntheticDontPrint"), protected(config)).unwrap();
                 println!("{}", credential);
                 eprintln!("{}", credential);
                 if std::path::Path::new("crash.flag").exists() {
@@ -1131,18 +1156,19 @@ mod vm {
             let witness = fs::read_to_string(&witness_path).unwrap();
             assert!(!witness.contains(FAKE_SECRET));
             let fields: Vec<_> = witness.trim_end().split('|').collect();
-            assert_eq!(fields.len(), 11);
+            assert_eq!(fields.len(), 12);
             assert_eq!(fields[1], "--config");
             assert_eq!(&fields[3..6], &["tunnel", "--no-autoupdate", "--metrics"]);
             assert!(fields[6].starts_with("127.0.0.1:"));
-            assert_eq!(&fields[7..], &["--grace-period", "100ms", "run", "true"]);
+            assert_eq!(
+                &fields[7..],
+                &["--grace-period", "100ms", "run", "true", "true"]
+            );
             let pid = fields[0].parse().unwrap();
-            // The connector's own custody: TokenUser owner and a private DACL.
+            // The connector creates its config with TokenUser as owner and a
+            // protected DACL. Every later launch reports the same for its own
+            // config in the witness, checked after the last leg.
             let generated = Path::new(fields[2]);
-            assert_owned("generated ingress config", generated);
-            assert!(crate::security::private(generated).is_ok());
-            // Every artifact under the fixture root also gets a protected DACL.
-            secure(generated);
             assert_secured("generated ingress config", generated);
             let config = fs::read_to_string(fields[2]).unwrap();
             assert!(!config.contains(FAKE_SECRET));
@@ -1246,6 +1272,13 @@ mod vm {
             assert_eq!(error, ConnectorError::Origin);
             assert!(held.is_none(), "revoked start left an unsettled child");
             assert_gone(&witness_path, 5);
+            // Each launch, including the crash/retry, hang and revoked-start
+            // legs, saw a protected config created for it.
+            let witness = fs::read_to_string(&witness_path).unwrap();
+            assert!(
+                witness.lines().all(|line| line.ends_with("|true|true")),
+                "a generated config lacked a protected DACL"
+            );
             assert_eq!(fake.state.lock().unwrap().post_count, 1);
             eprintln!(
                 "Publication hang timing: refused {:?}, revoked {:?}",
