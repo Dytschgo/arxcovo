@@ -65,8 +65,15 @@ Playwright's web server. The launcher:
 runs before the web server is stopped. It writes `stop-<run token>` into
 `ARX_LIVE_ROOT`, where the token is a random per-run value from the config.
 The launcher then kills and reaps arxd, removes exactly its own run directory
-and deletes the stop file to confirm; the teardown fails if no confirmation
-arrives within 20 s. A failing launcher removes its run directory the same
+and deletes the stop file to confirm. The teardown accepts only positive
+evidence: an inspection (`lstat`) that fails with `ENOENT`. A stop file that
+is still present means the launcher has not confirmed yet, and the teardown
+fails after 20 s. Any other inspection error fails the teardown at once with
+a fixed message. `ui/tests/live/stop-launcher.spec.ts` covers ENOENT, a
+present file followed by ENOENT, inspection errors (`EACCES`, `EPERM`,
+`EBUSY`, `EIO`, `ENOTDIR`, errors without a code) before and after a wait,
+the deadline, and a real file removed late. It runs in the default smoke
+config. A failing launcher removes its run directory the same
 way while it unwinds. Nothing else under `ARX_LIVE_ROOT` is ever touched. A
 run killed from outside (for example by an interrupted Playwright process)
 can leave its `run-*` directory behind; remove that one by hand.
@@ -155,9 +162,11 @@ Non-ignored tests in the same file run in the normal nextest job:
     created by the call that are still present, after removing the entries
     the test itself injected (the `blocker` file that makes a root removal
     fail), must equal the reported set exactly. So an unreported run
-    directory under a reported root fails the test. A reported path may be
-    absent only where the injected inspector could not confirm it gone.
-    Every entry that existed before must be unchanged. The rows inject:
+    directory under a reported root fails the test. The only reported path
+    allowed to be absent is the exact run directory that the row's
+    recording close removed, at most one, confirmed absent by the
+    independent snapshot. Every entry that existed before must be
+    unchanged. The rows inject:
     - a root removal that fails after the new root fails verification, and
       after the run directory fails verification;
     - a run-directory close that fails and keeps the directory, under a new
@@ -168,6 +177,17 @@ Non-ignored tests in the same file run in the normal nextest job:
       its removal cannot be confirmed, so it is still reported.
 
   A positive control is accepted.
+- `leftover_check_refuses_unrelated_or_unconfirmed_paths` drives that
+  check with fabricated reports. It must fail for:
+  - an unrelated absent path, even one with a `run-` prefix;
+  - a different run path than the one closed;
+  - an absent path without an allowance;
+  - a missing unconfirmed report, or an unconfirmed path that is still
+    present;
+  - duplicates;
+  - an unreported child of a reported root;
+  - a missing injected entry;
+  - a changed pre-existing entry.
 - `run_cleanup_removes_only_its_own_directory` proves that another run's
   directory and a look-alike sibling survive cleanup.
 - `live_fixture_seeds_activity_and_vm_catalog` fails if the seeding drifts

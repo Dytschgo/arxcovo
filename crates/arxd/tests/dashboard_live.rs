@@ -838,16 +838,78 @@ enum Expect {
     /// Refused after a write and fully rolled back: identical contents; only
     /// the timestamps of "." and "live-root" may differ.
     Restored,
-    /// Cleanup failed. The entries this call created that are still present
-    /// (after removing the test-injected entries listed in `injected`) must
-    /// equal the reported set exactly. A reported path that is absent is
-    /// allowed only when it matches an `unverifiable` prefix, meaning a path
-    /// the injected inspector could not confirm gone. Everything that
-    /// existed before is restored.
+    /// Cleanup failed; see `check_leftovers`. `injected` lists the entries
+    /// the test itself added. With `unconfirmed_close`, the row's recording
+    /// close removed exactly one run directory that the injected inspector
+    /// cannot confirm gone, and that exact path must also be reported.
     Leftovers {
         injected: &'static [&'static str],
-        unverifiable: &'static [&'static str],
+        unconfirmed_close: bool,
     },
+}
+
+/// Checks a `CleanupFailed` report against independent before and after
+/// snapshots (all paths relative, with `/`):
+/// - no path is reported twice;
+/// - each `injected` entry is present after the call and is set aside;
+/// - `unconfirmed`, when given, is absent after the call;
+/// - the reported set equals exactly the entries the call created that are
+///   still present, plus `unconfirmed`. Any other reported path, present or
+///   absent, and any unreported created entry, fails;
+/// - every entry that existed before is unchanged (apart from the masked
+///   parent timestamps).
+fn check_leftovers(
+    before: &[Entry],
+    after: &[Entry],
+    reported: &[String],
+    injected: &[&str],
+    unconfirmed: Option<&str>,
+) -> Result<(), String> {
+    use std::collections::BTreeSet;
+    let reported_set: BTreeSet<&str> = reported.iter().map(String::as_str).collect();
+    if reported_set.len() != reported.len() {
+        return Err(format!("duplicate leftovers {reported:?}"));
+    }
+    let known: BTreeSet<&str> = before.iter().map(|entry| entry.path.as_str()).collect();
+    let mut expected: BTreeSet<&str> = after
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .filter(|path| !known.contains(path))
+        .collect();
+    for extra in injected {
+        if !expected.remove(extra) {
+            return Err(format!("injected entry {extra} is missing"));
+        }
+    }
+    if let Some(path) = unconfirmed {
+        let nested = format!("{path}/");
+        if after
+            .iter()
+            .any(|entry| entry.path == path || entry.path.starts_with(&nested))
+        {
+            return Err(format!("unconfirmed path {path} is still present"));
+        }
+        expected.insert(path);
+    }
+    if reported_set != expected {
+        return Err(format!(
+            "reported {reported_set:?} but expected exactly {expected:?}"
+        ));
+    }
+    let previously: Vec<Entry> = after
+        .iter()
+        .filter(|entry| known.contains(entry.path.as_str()))
+        .cloned()
+        .collect();
+    if without_parent_times(&previously) != without_parent_times(before) {
+        return Err("pre-existing entries changed".into());
+    }
+    Ok(())
+}
+
+thread_local! {
+    /// Run directories that `close_and_record` removed in the current row.
+    static CLOSED_RUNS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Inspection that fails as if access were denied.
@@ -897,6 +959,14 @@ fn close_and_keep(dir: tempfile::TempDir) -> std::io::Result<()> {
     Err(std::io::Error::other("injected close failure"))
 }
 
+/// A real close that records the exact path it removed.
+fn close_and_record(dir: tempfile::TempDir) -> std::io::Result<()> {
+    let path = dir.path().to_owned();
+    dir.close()?;
+    CLOSED_RUNS.with_borrow_mut(|closed| closed.push(path));
+    Ok(())
+}
+
 /// A close that reports failure although the directory was removed.
 fn close_then_fail(dir: tempfile::TempDir) -> std::io::Result<()> {
     dir.close()?;
@@ -919,11 +989,11 @@ fn every_refused_root_leaves_the_disk_unchanged() {
     use Expect::*;
     const BLOCKED: Expect = Leftovers {
         injected: &["live-root/blocker"],
-        unverifiable: &[],
+        unconfirmed_close: false,
     };
     const KEPT: Expect = Leftovers {
         injected: &[],
-        unverifiable: &[],
+        unconfirmed_close: false,
     };
     let s = std::path::MAIN_SEPARATOR;
     let root = move |b: &Path| at(b, &format!("{s}live-root"));
@@ -1136,12 +1206,13 @@ fn every_refused_root_leaves_the_disk_unchanged() {
             existing_root,
             Hooks {
                 verify: fail_run,
+                close_run: close_and_record,
                 inspect: deny_inspect,
                 ..LIVE
             },
             Leftovers {
                 injected: &[],
-                unverifiable: &["live-root/run-"],
+                unconfirmed_close: true,
             },
         ),
     ];
@@ -1236,7 +1307,9 @@ fn every_refused_root_leaves_the_disk_unchanged() {
         std::fs::create_dir(base.join("sub")).unwrap();
         let raw = setup(&base);
         let before = snapshot(&base);
+        CLOSED_RUNS.with_borrow_mut(Vec::clear);
         let result = prepare_run_with(raw.as_deref(), &hooks);
+        let closed = CLOSED_RUNS.take();
         #[cfg(windows)]
         win::IDENTITY_FAULT.set(false);
         let after = snapshot(&base);
@@ -1253,58 +1326,28 @@ fn every_refused_root_leaves_the_disk_unchanged() {
             (
                 Leftovers {
                     injected,
-                    unverifiable,
+                    unconfirmed_close,
                 },
                 Err(PrepareError::CleanupFailed { leftovers, .. }),
             ) => {
-                use std::collections::BTreeSet;
                 let relative = |path: &Path| {
                     path.strip_prefix(&base)
                         .unwrap()
                         .to_string_lossy()
                         .replace('\\', "/")
                 };
-                let reported: BTreeSet<String> =
-                    leftovers.iter().map(|path| relative(path)).collect();
-                assert_eq!(
-                    reported.len(),
-                    leftovers.len(),
-                    "{name}: duplicate leftovers"
-                );
-                let known: BTreeSet<&str> =
-                    before.iter().map(|entry| entry.path.as_str()).collect();
-                let mut present: BTreeSet<String> = after
-                    .iter()
-                    .filter(|entry| !known.contains(entry.path.as_str()))
-                    .map(|entry| entry.path.clone())
-                    .collect();
-                for extra in injected {
-                    assert!(present.remove(*extra), "{name}: injected {extra} missing");
-                }
-                // Every created entry still present is reported, and every
-                // reported path is present unless it could not be inspected.
-                let missing: Vec<&String> = present.difference(&reported).collect();
-                assert!(
-                    missing.is_empty(),
-                    "{name}: unreported leftovers {missing:?}"
-                );
-                for path in reported.difference(&present) {
-                    assert!(
-                        unverifiable.iter().any(|prefix| path.starts_with(prefix)),
-                        "{name}: reported {path} is neither present nor unverifiable"
+                let reported: Vec<String> = leftovers.iter().map(|path| relative(path)).collect();
+                // The one run directory this row's recording close removed.
+                let unconfirmed = unconfirmed_close.then(|| {
+                    assert_eq!(
+                        closed.len(),
+                        1,
+                        "{name}: expected exactly one recorded close"
                     );
-                }
-                // Everything that existed before is restored.
-                let previously: Vec<Entry> = after
-                    .iter()
-                    .filter(|entry| known.contains(entry.path.as_str()))
-                    .cloned()
-                    .collect();
-                assert_eq!(
-                    without_parent_times(&previously),
-                    without_parent_times(&before),
-                    "{name}: pre-existing entries changed"
-                );
+                    relative(&closed[0])
+                });
+                check_leftovers(&before, &after, &reported, injected, unconfirmed.as_deref())
+                    .unwrap_or_else(|problem| panic!("{name}: {problem}"));
             }
             (_, Err(error)) => panic!("{name}: unexpected outcome {error}"),
         }
@@ -1315,6 +1358,126 @@ fn every_refused_root_leaves_the_disk_unchanged() {
     let run = prepare_run(Some(root.as_os_str())).unwrap();
     assert!(is_private(&root) && is_private(run.path()));
     run.close().unwrap();
+}
+
+fn entry(path: &str) -> Entry {
+    Entry {
+        path: path.to_owned(),
+        stable: "d".to_owned(),
+        times: "t".to_owned(),
+    }
+}
+
+/// The leftover check accepts only the exact report: created entries still
+/// present plus, at most, the one unconfirmed path the row closed.
+#[test]
+fn leftover_check_refuses_unrelated_or_unconfirmed_paths() {
+    let strings = |paths: &[&str]| {
+        paths
+            .iter()
+            .map(|path| path.to_string())
+            .collect::<Vec<_>>()
+    };
+    let before = vec![entry("."), entry("live-root")];
+    let after = before.clone();
+    let run = "live-root/run-a";
+    // Accepted: exactly the unconfirmed run directory.
+    assert!(check_leftovers(&before, &after, &strings(&[run]), &[], Some(run)).is_ok());
+    // An unrelated absent path in the report fails, even with a run- prefix.
+    assert!(
+        check_leftovers(
+            &before,
+            &after,
+            &strings(&[run, "live-root/run-b"]),
+            &[],
+            Some(run)
+        )
+        .is_err()
+    );
+    assert!(
+        check_leftovers(
+            &before,
+            &after,
+            &strings(&[run, "elsewhere"]),
+            &[],
+            Some(run)
+        )
+        .is_err()
+    );
+    // A different path than the one the row closed fails.
+    assert!(
+        check_leftovers(
+            &before,
+            &after,
+            &strings(&["live-root/run-b"]),
+            &[],
+            Some(run)
+        )
+        .is_err()
+    );
+    // An absent path without an unconfirmed allowance fails.
+    assert!(check_leftovers(&before, &after, &strings(&[run]), &[], None).is_err());
+    // The unconfirmed path must also be reported.
+    assert!(check_leftovers(&before, &after, &[], &[], Some(run)).is_err());
+    // The unconfirmed path must really be gone, by the independent snapshot.
+    let still_there = vec![entry("."), entry("live-root"), entry(run)];
+    assert!(check_leftovers(&before, &still_there, &strings(&[run]), &[], Some(run)).is_err());
+    // Duplicates fail.
+    assert!(check_leftovers(&before, &after, &strings(&[run, run]), &[], Some(run)).is_err());
+    // A created entry left unreported under a reported root fails.
+    let fresh_before = vec![entry(".")];
+    let fresh_after = vec![entry("."), entry("live-root"), entry(run)];
+    assert!(
+        check_leftovers(
+            &fresh_before,
+            &fresh_after,
+            &strings(&["live-root"]),
+            &[],
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        check_leftovers(
+            &fresh_before,
+            &fresh_after,
+            &strings(&[run, "live-root"]),
+            &[],
+            None
+        )
+        .is_ok()
+    );
+    // Injected entries are set aside only when actually present.
+    let blocked = vec![entry("."), entry("live-root"), entry("live-root/blocker")];
+    assert!(
+        check_leftovers(
+            &fresh_before,
+            &blocked,
+            &strings(&["live-root"]),
+            &["live-root/blocker"],
+            None
+        )
+        .is_ok()
+    );
+    assert!(
+        check_leftovers(
+            &fresh_before,
+            &fresh_after,
+            &strings(&[run, "live-root"]),
+            &["live-root/blocker"],
+            None
+        )
+        .is_err()
+    );
+    // A changed pre-existing entry fails.
+    let changed = vec![
+        entry("."),
+        Entry {
+            stable: "f".to_owned(),
+            ..entry("live-root")
+        },
+    ];
+    assert!(check_leftovers(&before, &changed, &strings(&[run]), &[], Some(run)).is_err());
 }
 
 #[test]
