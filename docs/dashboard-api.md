@@ -8,7 +8,9 @@ document; any change to it must update those three files in the same PR.
 Dev and test builds use a deterministic stand-in
 adapter (`ui/src/api/standin.ts`) and show a "Demo data" banner. Production
 builds always use HTTP: the stand-in branch is compiled out, and the desktop
-smoke test asserts that no fixture data reaches `ui/dist`.
+smoke test asserts that no fixture data reaches `ui/dist`. The live-backend
+acceptance suite runs the production build against a real `arxd`; see
+[m6-acceptance.md](m6-acceptance.md).
 
 ## Principles
 
