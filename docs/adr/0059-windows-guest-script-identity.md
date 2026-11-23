@@ -150,18 +150,19 @@ diagnostics re-run the failing script both with and without it.
 
 **Diagnostics.** These run only on an unexpected PowerShell outcome, are
 bounded, and use only children the test launches. The test re-runs the script
-with the child's stdout and stderr captured, so PowerShell's own "An error has
-occurred that was not properly handled" text, with the exception type and
-stack, is printed. It then reports:
-- only `.NET Runtime` and `Application Error` events whose process id is that
-  child, inside the re-run's time window;
+and reports the exit status and the byte count of redirected output. It also
+reports the following information.
+
+- The `.NET Runtime` event count and `Application Error` exception codes for
+  the exact child PID inside the rerun's time window.
 - for the restricted identity, the token owner, integrity and session, and
   the runner's elevation and UAC setting;
 - owner, a DACL summary and the AccessCheck result for the restricted token
   on the native-image directories, `System.Management.Automation.ni.dll`,
   `$PSHOME`, the GAC directory and three registry keys.
 
-Account, machine and user-SID text is removed from the output.
+The report uses fixed object labels, numeric event fields and well-known
+group names. Other SIDs appear as `<sid>`.
 
 ### Workspaces (D2)
 
@@ -241,18 +242,17 @@ directory, cannot create one in a Medium directory, and can read a seeded file.
 Development-host tests also check PowerShell `exit 7`, the self-test
 sentinel, and removal of the request directory.
 
-**Hosted CI quarantine.** On Windows with `CI=true` and
-`RUNNER_ENVIRONMENT=github-hosted` (or a `win`-prefixed `ImageOS` when
-`RUNNER_ENVIRONMENT` is absent), the tests
+**Hosted CI quarantine.** On Windows with `CI=true`,
+`RUNNER_ENVIRONMENT=github-hosted` and `ImageOS=win25`, the tests
 `production_identity_runs_powershell_and_removes_its_request_directory` and
-`self_test_admits_the_production_identity` report a restricted launch ladder
-in place of their PowerShell exit-value assertions. The runner's Windows
-PowerShell 5.1 has exited with `0x80131623` under the restricted identity.
-The ladder runs the native and Framework controls, bare PowerShell, and
-the wrapper in fresh request directories. It still requires verified token
-and Job setup, input handoff, and cleanup. Self-hosted and local tests
-continue to require the full PowerShell and admission results. Actual
-qualification requires an installed service run on the owner's pinned
+`self_test_admits_the_production_identity` allow the observed Windows
+PowerShell 5.1 exit `0x80131623` from their original scripts after verified
+token and Job setup, input handoff, and cleanup. The original scripts and
+assertions run for all other outcomes and environments. The exception
+triggers a diagnostic ladder with native and Framework controls, bare
+PowerShell, and the wrapper in fresh request directories. Nextest shows the
+`KNOWN-ISSUE` line on test failure and in local `--no-capture` runs.
+Qualification requires an installed service run on the owner's pinned
 Windows 11 guest and is **unverified on real hardware**.
 
 These remain owner-host items, **unverified on real hardware**: the LocalService

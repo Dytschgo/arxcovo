@@ -3257,16 +3257,70 @@ mod tests {
     /// image can be slow. Only a failure ever waits this long.
     const POWERSHELL_GUARD: Duration = Duration::from_secs(30);
 
-    fn hosted_windows_ci() -> bool {
-        if !std::env::var("CI").is_ok_and(|value| value.eq_ignore_ascii_case("true")) {
-            return false;
+    const HOSTED_POWERSHELL_CRASH: u32 = 0x8013_1623;
+
+    fn is_known_hosted_crash(
+        outcome: Result<ScriptOutcome, &'static str>,
+        ci: Option<&str>,
+        runner: Option<&str>,
+        image: Option<&str>,
+    ) -> bool {
+        ci.is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            && runner == Some("github-hosted")
+            && image == Some("win25")
+            && outcome
+                == Ok(ScriptOutcome::Exited {
+                    exit_code: HOSTED_POWERSHELL_CRASH,
+                })
+    }
+
+    fn quarantine_hosted_crash(
+        outcome: Result<ScriptOutcome, &'static str>,
+        profile: &Arc<Profile>,
+    ) -> bool {
+        let known = is_known_hosted_crash(
+            outcome,
+            std::env::var("CI").ok().as_deref(),
+            std::env::var("RUNNER_ENVIRONMENT").ok().as_deref(),
+            std::env::var("ImageOS").ok().as_deref(),
+        );
+        if known {
+            hosted_restricted_powershell_ladder(profile);
         }
-        match std::env::var("RUNNER_ENVIRONMENT").as_deref() {
-            Ok("github-hosted") => true,
-            Err(std::env::VarError::NotPresent) => {
-                std::env::var("ImageOS").is_ok_and(|value| value.starts_with("win"))
-            }
-            _ => false,
+        known
+    }
+
+    #[test]
+    fn hosted_exception_requires_the_exact_image_and_crash_exit() {
+        let ci = Some("true");
+        let hosted = Some("github-hosted");
+        let affected = Some("win25");
+        let crash = Ok(ScriptOutcome::Exited {
+            exit_code: HOSTED_POWERSHELL_CRASH,
+        });
+        assert!(is_known_hosted_crash(crash, ci, hosted, affected));
+        for (ci, runner, image) in [
+            (None, hosted, affected),
+            (ci, None, affected),
+            (ci, Some("self-hosted"), affected),
+            (ci, hosted, Some("win22")),
+            (ci, hosted, None),
+        ] {
+            assert!(!is_known_hosted_crash(crash, ci, runner, image));
+        }
+        for outcome in [
+            Ok(ScriptOutcome::Exited { exit_code: 7 }),
+            Ok(ScriptOutcome::Exited { exit_code: 3 }),
+            Ok(ScriptOutcome::Exited {
+                exit_code: 0xc000_0142,
+            }),
+            Ok(ScriptOutcome::Unavailable),
+            Ok(ScriptOutcome::LaunchFailed),
+            Ok(ScriptOutcome::TimedOut),
+            Err(CLEANUP_UNKNOWN),
+            Err(WORKSPACE_UNKNOWN),
+        ] {
+            assert!(!is_known_hosted_crash(outcome, ci, hosted, affected));
         }
     }
 
@@ -3355,7 +3409,8 @@ mod tests {
             |code| format!("{code:#010x}"),
         );
         eprintln!(
-            "KNOWN-ISSUE hosted-restricted-powershell: cmd={native:#010x}, CLR={clr_summary}, \
+            "KNOWN-ISSUE hosted-restricted-powershell: original={HOSTED_POWERSHELL_CRASH:#010x}, \
+             cmd={native:#010x}, CLR={clr_summary}, \
              bare PowerShell={bare:#010x}, wrapper={wrapper:#010x}, first divergence={divergence}"
         );
         assert_eq!(native, 7, "native restricted control exit");
@@ -3367,78 +3422,136 @@ mod tests {
     // Failure-only diagnostics. Nothing below runs on a passing test. Every read
     // is bounded and correlated with a child this test launched itself.
 
-    const DIAGNOSTIC_TEXT: usize = 3000;
-    const DIAGNOSTIC_EVENT: usize = 1500;
-
-    /// Clips text and drops event lines that identify the account or machine.
-    fn clipped(text: &str, limit: usize) -> String {
-        text.lines()
-            .filter(|line| {
-                let line = line.trim_start();
-                !(line.starts_with("User:")
-                    || line.starts_with("User Name:")
-                    || line.starts_with("Computer:"))
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .chars()
-            .filter(|c| !c.is_control() || *c == '\n')
-            .take(limit)
-            .collect()
-    }
-
-    fn wevtutil(query: &str, count: u32) -> String {
-        match std::process::Command::new("wevtutil.exe")
+    fn wevtutil(system: &Path, query: &str, count: u32) -> io::Result<String> {
+        use std::process::{Command, Stdio};
+        const MAX_EVENT_OUTPUT: u64 = 64 * 1024;
+        let mut child = Command::new(system.join("wevtutil.exe"))
             .args([
                 "qe",
                 "Application",
                 &format!("/q:{query}"),
                 &format!("/c:{count}"),
                 "/rd:true",
-                "/f:text",
+                "/f:xml",
             ])
-            .output()
-        {
-            Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
-            Err(error) => format!("wevtutil unavailable: {error}"),
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut output = Vec::new();
+        let read = child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .take(MAX_EVENT_OUTPUT)
+            .read_to_end(&mut output);
+        let capped = output.len() as u64 == MAX_EVENT_OUTPUT;
+        if read.is_err() || capped {
+            let _ = child.kill();
         }
+        let status = child.wait()?;
+        read?;
+        if !status.success() && !capped {
+            return Err(io::Error::other("event query failed"));
+        }
+        Ok(String::from_utf8_lossy(&output).into_owned())
     }
 
-    /// `.NET Runtime` and `Application Error` events raised by exactly this
-    /// process id since `since`, at most two of each, each clipped.
-    fn child_events(pid: u32, since: Instant) -> String {
-        let window = since.elapsed().as_millis() + 2000;
-        let mut found = Vec::new();
+    // Read just a named field in wevtutil's XML EventData. An incomplete
+    // record at the capture limit cannot be matched by this parser.
+    fn event_data<'a>(event: &'a str, name: &str) -> Option<&'a str> {
+        let (_, data) = event.split_once("<EventData>")?;
+        let (data, _) = data.split_once("</EventData>")?;
+        for quote in ['\'', '"'] {
+            let field = format!("<Data Name={quote}{name}{quote}>");
+            if let Some((_, value)) = data.split_once(&field) {
+                return value.split_once("</Data>").map(|(value, _)| value.trim());
+            }
+        }
+        None
+    }
+
+    fn hex_digits(value: &str) -> Option<&str> {
+        value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+    }
+
+    fn crash_event_summary(events: &str, pid: u32) -> String {
+        let Some((events, _)) = events.rsplit_once("</Event>") else {
+            return String::new();
+        };
+        events
+            .split("</Event>")
+            .filter(|event| {
+                event_data(event, "ProcessId").and_then(|value| match hex_digits(value) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => value.parse().ok(),
+                }) == Some(pid)
+            })
+            .take(2)
+            .map(|event| {
+                let code = event_data(event, "ExceptionCode").and_then(|value| {
+                    u32::from_str_radix(hex_digits(value).unwrap_or(value), 16).ok()
+                });
+                code.map_or_else(|| "unknown".to_owned(), |code| format!("{code:#010x}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    #[test]
+    fn event_summary_matches_the_full_pid_and_only_prints_numeric_fields() {
+        let events = concat!(
+            "<Event><EventData><Data Name='ProcessId'>0x12a</Data>",
+            "<Data Name='ExceptionCode'>0x11111111</Data></EventData></Event>",
+            "<Event><System><Computer>private-host</Computer></System><EventData>",
+            "<Data Name=\"ProcessId\">0X0012</Data><Data Name='AppPath'>private-path</Data>",
+            "<Data Name='ExceptionCode'>c0000005</Data></EventData></Event>",
+            "<Event><EventData><Data Name='ProcessId'>18</Data>",
+            "<Data Name='ExceptionCode'>private-value</Data></EventData></Event>",
+            "<Event><EventData><Data Name='ProcessId'>0x12</Data>",
+        );
+        assert_eq!(crash_event_summary(events, 0x12), "0xc0000005, unknown");
+        assert_eq!(crash_event_summary(events, 0x12a), "0x11111111");
+        assert!(crash_event_summary(events, 0x1).is_empty());
+    }
+
+    /// Summarize only numeric facts from events inside the rerun's time window.
+    fn child_events(system: &Path, pid: u32, since: Instant) -> String {
+        let window = since.elapsed().as_millis();
+        let time = format!(
+            "TimeCreated[timediff(@SystemTime) >= 0 and timediff(@SystemTime) <= {window}]"
+        );
         let runtime = wevtutil(
+            system,
             &format!(
                 "*[System[Provider[@Name='.NET Runtime'] and Execution[@ProcessID='{pid}'] \
-                 and TimeCreated[timediff(@SystemTime) <= {window}]]]"
+                 and {time}]]"
             ),
             2,
+        )
+        .map_or_else(
+            |_| "unavailable".to_owned(),
+            |xml| xml.matches("</Event>").count().to_string(),
         );
-        if runtime.contains("Event[") {
-            found.push(clipped(&runtime, 2 * DIAGNOSTIC_EVENT));
-        }
         let crashes = wevtutil(
-            &format!(
-                "*[System[Provider[@Name='Application Error'] \
-                 and TimeCreated[timediff(@SystemTime) <= {window}]]]"
-            ),
+            system,
+            &format!("*[System[Provider[@Name='Application Error'] and {time}]]"),
             8,
+        )
+        .map_or_else(
+            |_| "unavailable".to_owned(),
+            |xml| {
+                let summary = crash_event_summary(&xml, pid);
+                if summary.is_empty() {
+                    "none".to_owned()
+                } else {
+                    summary
+                }
+            },
         );
-        let marker = format!("faulting process id: 0x{pid:x}");
-        found.extend(
-            crashes
-                .split("Event[")
-                .filter(|event| event.to_ascii_lowercase().contains(&marker))
-                .take(2)
-                .map(|event| clipped(event, DIAGNOSTIC_EVENT)),
-        );
-        if found.is_empty() {
-            format!("no runtime events for pid {pid}")
-        } else {
-            found.join("\n")
-        }
+        format!(".NET Runtime count={runtime}; Application Error exception codes={crashes}")
     }
 
     fn with_env(command: &mut CommandLine, entry: &str) {
@@ -3457,9 +3570,8 @@ mod tests {
             .collect();
     }
 
-    /// Re-runs `script` in `work` with the child's stdout and stderr captured
-    /// to a file there. PowerShell prints an unhandled exception ("An error has
-    /// occurred that was not properly handled...") before it fails fast.
+    /// Re-runs the script and reports whether the redirected streams had output.
+    /// Child text can contain host identifiers, so only its size is read.
     fn capture_powershell(
         identity: Identity<'_>,
         pipe_client: &[u32; 17],
@@ -3475,28 +3587,28 @@ mod tests {
         }
         let path = wide_path(&work.join("diagnostic-output.txt")).unwrap();
         // SAFETY: test-owned file in the request directory; inherited only through
-        // the explicit handle list.
+        // the explicit handle list. Windows removes it after the last handle closes.
         let output = match handle(unsafe {
             CreateFileW(
                 path.as_ptr(),
-                GENERIC_WRITE,
-                FILE_SHARE_READ,
+                GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_DELETE,
                 &inheritable(),
-                CREATE_ALWAYS,
-                0,
+                CREATE_NEW,
+                FILE_FLAG_DELETE_ON_CLOSE,
                 null_mut(),
             )
         }) {
             Ok(output) => output,
-            Err(error) => return format!("output file: {error}"),
+            Err(error) => return format!("output file OS error {:?}", error.raw_os_error()),
         };
         let job = Job::new().unwrap();
         let (reader, writer) = stdin_pipe(MAX_SCRIPT as u32, pipe_client).unwrap();
         let child = match create_suspended(&job, &reader, &output, &command, identity) {
             Ok(child) => child,
-            Err(error) => return format!("launch: {error:?}"),
+            Err(error) => return format!("launch: {:?}", error.outcome()),
         };
-        drop((reader, output));
+        drop(reader);
         let stop = event().unwrap();
         let input = pipe_write(&writer, &stop, Instant::now() + GUARD, script.to_vec());
         drop(writer);
@@ -3507,40 +3619,67 @@ mod tests {
             POWERSHELL_GUARD.as_millis() as u32,
         )
         .unwrap_or(false);
-        let code = exit_code(&child.process).unwrap_or(0);
+        let code = finished.then(|| exit_code(&child.process).ok()).flatten();
         // SAFETY: held Job handle; the child is waited on below.
         unsafe { TerminateJobObject(job.0.as_raw_handle(), 1) };
         let _ = signaled(child.process.as_raw_handle(), GUARD.as_millis() as u32);
         let pid = unsafe { GetProcessId(child.process.as_raw_handle()) };
-        let text = std::fs::read(work.join("diagnostic-output.txt"))
-            .map(|bytes| clipped(&String::from_utf8_lossy(&bytes), DIAGNOSTIC_TEXT))
-            .unwrap_or_else(|error| format!("unreadable: {error}"));
+        let output_bytes = File::from(output).metadata().ok().map(|file| file.len());
         format!(
-            "input {:?}; finished {finished}; exit {code:#x}; pid {pid}\noutput:\n{text}\nevents:\n{}",
-            input.map(|_| ()),
-            child_events(pid, started)
+            "input accepted {}; finished {finished}; exit {code:#x?}; pid {pid}; \
+             output bytes {output_bytes:?}\nevents: {}",
+            input.is_ok(),
+            child_events(&system, pid, started)
         )
     }
 
-    fn sid_or_error(sid: PSID) -> String {
-        if sid.is_null() {
-            return "none".to_owned();
+    fn diagnostic_sid_name(sid: &str) -> &'static str {
+        match sid {
+            "S-1-5-18" => "LocalSystem",
+            "S-1-5-32-544" => "Administrators",
+            "S-1-5-32-545" => "Users",
+            "S-1-15-2-1" => "All Application Packages",
+            "S-1-15-2-2" => "All Restricted Application Packages",
+            sid if sid.starts_with("S-1-15-2-") => "AppContainer package",
+            _ => "<sid>",
         }
-        sid_string(sid).unwrap_or_else(|error| format!("sid error {error}"))
+    }
+
+    fn diagnostic_sid(sid: PSID) -> &'static str {
+        if sid.is_null() {
+            return "none";
+        }
+        sid_string(sid).map_or("<sid>", |sid| diagnostic_sid_name(&sid))
+    }
+
+    #[test]
+    fn diagnostic_sids_name_well_known_groups_and_hide_individual_identifiers() {
+        assert_eq!(diagnostic_sid_name("S-1-5-18"), "LocalSystem");
+        assert_eq!(diagnostic_sid_name("S-1-5-32-544"), "Administrators");
+        assert_eq!(diagnostic_sid_name("S-1-5-32-545"), "Users");
+        assert_eq!(
+            diagnostic_sid_name("S-1-15-2-2"),
+            "All Restricted Application Packages"
+        );
+        assert_eq!(
+            diagnostic_sid_name("S-1-15-2-111-222-333"),
+            "AppContainer package"
+        );
+        assert_eq!(diagnostic_sid_name("S-1-5-21-111-222-333-1000"), "<sid>");
     }
 
     /// Owner, a short DACL summary and the access the restricted probe token
     /// would be granted, for one object, or the open error.
     fn object_access(
         name: &str,
-        open: io::Result<OwnedHandle>,
+        open: io::Result<impl AsRawHandle>,
         kind: SE_OBJECT_TYPE,
         probe: &OwnedHandle,
         mapping: GENERIC_MAPPING,
     ) -> String {
         let object = match open {
             Ok(object) => object,
-            Err(error) => return format!("{name}: open failed {error}\n"),
+            Err(error) => return format!("{name}: open OS error {:?}\n", error.raw_os_error()),
         };
         let descriptor = match Descriptor::object(
             object.as_raw_handle(),
@@ -3551,7 +3690,7 @@ mod tests {
                 | LABEL_SECURITY_INFORMATION,
         ) {
             Ok(descriptor) => descriptor,
-            Err(error) => return format!("{name}: security unreadable {error}\n"),
+            Err(error) => return format!("{name}: security OS error {:?}\n", error.raw_os_error()),
         };
         let mut owner = null_mut();
         let mut defaulted = 0;
@@ -3578,7 +3717,7 @@ mod tests {
                         } else {
                             "D"
                         },
-                        sid_or_error(sid),
+                        diagnostic_sid(sid),
                         ace.Mask
                     ));
                 } else {
@@ -3587,12 +3726,12 @@ mod tests {
             }
         }
         let granted = descriptor.allowed(probe, mapping).map_or_else(
-            |error| format!("check failed {error}"),
+            |error| format!("check OS error {:?}", error.raw_os_error()),
             |mask| format!("{mask:#x}"),
         );
         format!(
             "{name}: owner {} granted-to-restricted {granted} dacl [{}]\n",
-            sid_or_error(owner),
+            diagnostic_sid(owner),
             aces.join(" ")
         )
     }
@@ -3607,30 +3746,45 @@ mod tests {
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 null(),
                 OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
                 null_mut(),
             )
         })
     }
 
-    fn open_key_for_security(key: &str) -> io::Result<OwnedHandle> {
+    struct DiagnosticKey(windows_sys::Win32::System::Registry::HKEY);
+
+    impl Drop for DiagnosticKey {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Registry::RegCloseKey;
+            // SAFETY: this is the owned handle from a successful RegOpenKeyExW.
+            unsafe { RegCloseKey(self.0) };
+        }
+    }
+
+    impl AsRawHandle for DiagnosticKey {
+        fn as_raw_handle(&self) -> HANDLE {
+            self.0
+        }
+    }
+
+    fn open_key_for_security(key: &str) -> io::Result<DiagnosticKey> {
         use windows_sys::Win32::System::Registry::RegOpenKeyExW;
         let name = wide(key);
         let mut raw = null_mut();
-        // SAFETY: fixed HKLM subkey, READ_CONTROL only; RegCloseKey and CloseHandle
-        // are interchangeable for this test-scoped key handle.
+        // SAFETY: fixed HKLM subkey, READ_CONTROL only.
         let error =
             unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, name.as_ptr(), 0, READ_CONTROL, &mut raw) };
         if error != ERROR_SUCCESS {
             return Err(io::Error::from_raw_os_error(error as i32));
         }
-        // SAFETY: a successfully opened key handle owned by this wrapper.
-        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+        Ok(DiagnosticKey(raw))
     }
 
     /// Token facts and the access the restricted token has to the objects
     /// PowerShell start-up reads, including the faulting native image.
     fn restricted_access_report(profile: &Profile) -> String {
+        use std::os::windows::fs::MetadataExt;
         use windows_sys::Win32::System::Registry::{KEY_ALL_ACCESS, KEY_READ, KEY_WRITE};
         let mut report = String::new();
         let token = &profile.token;
@@ -3638,13 +3792,13 @@ mod tests {
         let owner = token_buffer(token, TokenOwner).unwrap();
         report.push_str(&format!(
             "restricted user {} owner {} il {:?} session {:?}; runner il {:?} elevation-type {:?} session {:?}; EnableLUA {:?}\n",
-            token_user_string(token).unwrap_or_default(),
-            sid_or_error(unsafe { (*owner.as_ptr().cast::<TOKEN_OWNER>()).Owner }),
-            integrity_rid(token).map(|rid| format!("{rid:#x}")),
-            token_dword(token, TokenSessionId),
-            integrity_rid(&source).map(|rid| format!("{rid:#x}")),
-            token_dword(&source, TokenElevationType),
-            token_dword(&source, TokenSessionId),
+            token_user_string(token).map_or("<sid>", |sid| diagnostic_sid_name(&sid)),
+            diagnostic_sid(unsafe { (*owner.as_ptr().cast::<TOKEN_OWNER>()).Owner }),
+            integrity_rid(token).ok().map(|rid| format!("{rid:#x}")),
+            token_dword(token, TokenSessionId).ok(),
+            integrity_rid(&source).ok().map(|rid| format!("{rid:#x}")),
+            token_dword(&source, TokenElevationType).ok(),
+            token_dword(&source, TokenSessionId).ok(),
             read_policy_value(
                 Hive::Machine,
                 r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
@@ -3654,12 +3808,22 @@ mod tests {
         let windows = &profile.launcher.windows;
         let native = windows.join(r"assembly\NativeImages_v4.0.30319_64");
         let mut paths = vec![
-            native.join("System.Management.Automation"),
-            profile.launcher.system.join(r"WindowsPowerShell\v1.0"),
-            windows.join(r"Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation"),
+            (
+                "SMA native image directory",
+                native.join("System.Management.Automation"),
+            ),
+            (
+                "PowerShell system directory",
+                profile.launcher.system.join(r"WindowsPowerShell\v1.0"),
+            ),
+            (
+                "SMA GAC directory",
+                windows.join(r"Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation"),
+            ),
         ];
         if let Ok(entries) = std::fs::read_dir(&native) {
             for entry in entries
+                .take(128)
                 .flatten()
                 .filter(|entry| {
                     entry
@@ -3667,20 +3831,34 @@ mod tests {
                         .to_string_lossy()
                         .starts_with("System.Mana")
                 })
+                .filter(|entry| {
+                    entry.metadata().is_ok_and(|metadata| {
+                        metadata.is_dir()
+                            && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                    })
+                })
                 .take(3)
             {
-                paths.push(entry.path());
+                paths.push(("native assembly directory", entry.path()));
                 if let Ok(images) = std::fs::read_dir(entry.path()) {
-                    for image in images.flatten().take(2) {
-                        paths.push(image.path());
-                        paths.push(image.path().join("System.Management.Automation.ni.dll"));
+                    for image in images.take(2).flatten() {
+                        paths.push(("native image entry", image.path()));
+                        if image.metadata().is_ok_and(|metadata| {
+                            metadata.is_dir()
+                                && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                        }) {
+                            paths.push((
+                                "SMA native image DLL",
+                                image.path().join("System.Management.Automation.ni.dll"),
+                            ));
+                        }
                     }
                 }
             }
         }
-        for path in paths.iter().take(16) {
+        for (label, path) in paths.iter().take(16) {
             report.push_str(&object_access(
-                &path.display().to_string(),
+                label,
                 open_for_security(path),
                 SE_FILE_OBJECT,
                 &profile.probe,
@@ -3706,11 +3884,7 @@ mod tests {
                 registry,
             ));
         }
-        // The runner's own SID adds nothing a reviewer needs; keep the shape.
-        match token_user_string(token) {
-            Ok(user) => clipped(&report.replace(&user, "<user>"), 4 * DIAGNOSTIC_TEXT),
-            Err(_) => clipped(&report, 4 * DIAGNOSTIC_TEXT),
-        }
+        report
     }
 
     /// Full failure evidence for the production identity: token and object
@@ -3804,11 +3978,6 @@ mod tests {
     fn production_identity_runs_powershell_and_removes_its_request_directory() {
         let root = TestRoot::new("ps");
         let profile = Arc::new(test_profile(&root.0));
-        if hosted_windows_ci() {
-            hosted_restricted_powershell_ladder(&profile);
-            assert_eq!(root.entries(), 0, "probe request directories removed");
-            return;
-        }
         let stop = Arc::new(event().unwrap());
         // Cmdlets autoload from $PSHOME\Modules only: the wrapper pins the
         // module path that Windows PowerShell would otherwise extend.
@@ -3825,6 +3994,10 @@ mod tests {
             script.as_bytes().to_vec(),
             Instant::now() + POWERSHELL_GUARD,
         );
+        if quarantine_hosted_crash(outcome, &profile) {
+            assert_eq!(root.entries(), 0, "request and probe directories removed");
+            return;
+        }
         assert_powershell(outcome, ScriptOutcome::Exited { exit_code: 7 }, || {
             restricted_failure_report(&profile, script.as_bytes())
         });
@@ -3848,17 +4021,16 @@ mod tests {
         let root = TestRoot::new("self");
         let stop = Arc::new(event().unwrap());
         let profile = Arc::new(test_profile(&root.0));
-        if hosted_windows_ci() {
-            hosted_restricted_powershell_ladder(&profile);
-            assert_eq!(root.entries(), 0, "probe request directories removed");
-            return;
-        }
         let outcome = run_profile(
             &profile,
             &stop,
             SELF_TEST.as_bytes().to_vec(),
             Instant::now() + POWERSHELL_GUARD,
         );
+        if quarantine_hosted_crash(outcome, &profile) {
+            assert_eq!(root.entries(), 0, "request and probe directories removed");
+            return;
+        }
         let sentinel = ScriptOutcome::Exited {
             exit_code: SELF_TEST_SENTINEL,
         };
