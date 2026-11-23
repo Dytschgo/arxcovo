@@ -760,6 +760,7 @@ fn serve_port(
         profile,
         stop,
         retire: &retire,
+        policy: read_policy,
     };
     let _ = serve(&port, &port, &mut executor);
     drop(port);
@@ -1042,6 +1043,18 @@ fn token_user_string(token: &OwnedHandle) -> io::Result<String> {
     sid_string(user.User.Sid)
 }
 
+fn token_owner_is_user(token: &OwnedHandle) -> io::Result<bool> {
+    let owner = token_buffer(token, TokenOwner)?;
+    let user = token_buffer(token, TokenUser)?;
+    // SAFETY: both classes embed one SID pointer into their live aligned buffers.
+    Ok(unsafe {
+        EqualSid(
+            (*owner.as_ptr().cast::<TOKEN_OWNER>()).Owner,
+            (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid,
+        ) != 0
+    })
+}
+
 /// The script token's default DACL: SYSTEM and the token user only. Without it
 /// a child can fail console start-up (0xC0000142) on objects it creates itself.
 fn default_dacl_sddl(user: &str) -> String {
@@ -1185,6 +1198,23 @@ fn restrict_token(source: &OwnedHandle, deny_only: &[PSID]) -> io::Result<OwnedH
             (size_of_val(&label) + size_of_val(&low)) as u32,
         )
     })?;
+    // An elevated administrator token defaults object ownership to
+    // BUILTIN\Administrators, which is deny-only here. The script would then
+    // create objects owned by a SID that grants it nothing. Own as the user.
+    let user = token_buffer(&token, TokenUser)?;
+    let owner = TOKEN_OWNER {
+        // SAFETY: TokenUser embeds a SID pointer into the live aligned buffer.
+        Owner: unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid },
+    };
+    // SAFETY: the owner SID lives in `user`, which outlives this copying call.
+    succeeded(unsafe {
+        SetTokenInformation(
+            token.as_raw_handle(),
+            TokenOwner,
+            (&owner as *const TOKEN_OWNER).cast(),
+            size_of_val(&owner) as u32,
+        )
+    })?;
     let dacl = Descriptor::from_sddl(&default_dacl_sddl(&token_user_string(&token)?))?;
     let default = TOKEN_DEFAULT_DACL {
         DefaultDacl: dacl.dacl()?,
@@ -1208,6 +1238,7 @@ fn verify_restrictions(token: &OwnedHandle) -> io::Result<()> {
     must(token_dword(token, TokenType)? == TokenPrimary as u32)?;
     must(integrity_rid(token)? == SECURITY_MANDATORY_LOW_RID as u32)?;
     only_privileges(token, &[])?;
+    must(token_owner_is_user(token)?)?;
     for kind in DENY_ONLY_GROUPS {
         let mut group = sid(kind)?;
         must(
@@ -1509,22 +1540,34 @@ fn workspace_sddl(child_user: &str) -> String {
     )
 }
 
+/// Why a request directory is not available.
+#[derive(Debug, PartialEq, Eq)]
+enum CreateError {
+    /// Nothing is left on disk.
+    Failed,
+    /// The directory was created, failed verification and could not be removed.
+    Leaked,
+}
+
 impl Workspace {
-    fn create(launcher: &Launcher) -> io::Result<Self> {
+    fn create(launcher: &Launcher) -> Result<Self, CreateError> {
         static SERIAL: AtomicU32 = AtomicU32::new(0);
         let path = launcher.work.join(format!(
             "r{}-{}",
             unsafe { GetCurrentProcessId() },
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
-        let descriptor = Descriptor::from_sddl(&workspace_sddl(&launcher.child_user))?;
+        let descriptor = Descriptor::from_sddl(&workspace_sddl(&launcher.child_user))
+            .map_err(|_| CreateError::Failed)?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.0,
             bInheritHandle: 0,
         };
+        let name = wide_path(&path).map_err(|_| CreateError::Failed)?;
         // SAFETY: fixed absolute path below the verified root and a valid descriptor.
-        succeeded(unsafe { CreateDirectoryW(wide_path(&path)?.as_ptr(), &attributes) })?;
+        succeeded(unsafe { CreateDirectoryW(name.as_ptr(), &attributes) })
+            .map_err(|_| CreateError::Failed)?;
         let verified = checked_file(&path, true).and_then(|directory| {
             Descriptor::object(
                 directory.as_raw_handle(),
@@ -1533,12 +1576,12 @@ impl Workspace {
             )?
             .low_label()
         });
-        if let Err(error) = verified {
-            // Nothing has run inside it yet.
-            let _ = std::fs::remove_dir(&path);
-            return Err(error);
+        match verified {
+            Ok(()) => Ok(Self(path)),
+            // Nothing has run inside it yet, so an empty-directory removal suffices.
+            Err(_) if std::fs::remove_dir(&path).is_ok() => Err(CreateError::Failed),
+            Err(_) => Err(CreateError::Leaked),
         }
-        Ok(Self(path))
     }
 
     fn path(&self) -> &Path {
@@ -2415,6 +2458,9 @@ struct Executor<'a> {
     profile: Option<Arc<Profile>>,
     stop: &'a Arc<OwnedHandle>,
     retire: &'a Cell<Option<&'static str>>,
+    /// Read before every request: a policy changed after admission (for
+    /// example script block logging turned on) closes that request.
+    policy: fn() -> [PolicyValue; POLICY_VALUES.len()],
 }
 
 fn record_outcome(
@@ -2444,6 +2490,11 @@ impl ScriptExecutor for Executor<'_> {
         let Some(profile) = self.profile.as_ref() else {
             return ScriptOutcome::Unavailable;
         };
+        // Each request starts a new interpreter, which reads the policy afresh.
+        // Re-check before caller text reaches it; unreadable counts as conflict.
+        if policy_conflict(&(self.policy)()) {
+            return ScriptOutcome::Unavailable;
+        }
         let result = run_profile(profile, self.stop, script.as_bytes().to_vec(), deadline);
         record_outcome(result, self.retire)
     }
@@ -2489,24 +2540,33 @@ enum Bounded<T> {
     Missed,
 }
 
+/// The latest instant a cancelled step is still awaited: `cancel_grace` after
+/// cancellation, but never past the absolute `limit`.
+fn cancel_deadline(cancelled_at: Instant, cancel_grace: Duration, limit: Instant) -> Instant {
+    cancelled_at
+        .checked_add(cancel_grace)
+        .map_or(limit, |grace| grace.min(limit))
+}
+
 /// Runs one filesystem step on a worker that holds no port handle and no
-/// child. Waits until `by`; after cancellation, at most `cancel_grace` more. A
-/// missed step keeps running detached, and the caller retires the session, so
-/// nothing waits on it or uses its result.
+/// child. Waits until `by`; after cancellation, at most `cancel_grace` more and
+/// never past `limit`. A missed step keeps running detached, and the caller
+/// retires the session, so nothing waits on it or uses its result.
 fn bounded<T: Send + 'static>(
     stop: &OwnedHandle,
     by: Instant,
     cancel_grace: Duration,
+    limit: Instant,
     step: impl FnOnce() -> T + Send + 'static,
 ) -> Bounded<T> {
     let Ok(worker) = thread::Builder::new().spawn(step) else {
         return Bounded::Unstarted;
     };
-    let finished = match wait_for(worker.as_raw_handle(), stop, by) {
+    let finished = match wait_for(worker.as_raw_handle(), stop, by.min(limit)) {
         Ok(Wait::Ready) => true,
         Ok(Wait::Cancelled) => signaled(
             worker.as_raw_handle(),
-            millis_left(Instant::now() + cancel_grace),
+            millis_left(cancel_deadline(Instant::now(), cancel_grace, limit)),
         )
         .unwrap_or(false),
         Ok(Wait::Deadline) | Err(_) => false,
@@ -2520,23 +2580,26 @@ fn bounded<T: Send + 'static>(
 enum Setup {
     Ready(Workspace, CommandLine),
     Failed,
-    /// Created, then could not be removed after the command failed.
+    /// Created, then could not be removed after a later setup step failed.
     Leaked,
 }
 
 /// Creates the request directory and command inside the request budget. A
-/// stalled setup retires the session; no child can exist yet.
+/// stalled setup, or a directory that cannot be rolled back, retires the
+/// session; no child can exist yet.
 fn prepare_workspace(
     profile: &Arc<Profile>,
     stop: &OwnedHandle,
     by: Instant,
-    create: impl FnOnce(&Launcher) -> io::Result<Workspace> + Send + 'static,
+    create: impl FnOnce(&Launcher) -> Result<Workspace, CreateError> + Send + 'static,
 ) -> Result<Option<(Workspace, CommandLine)>, &'static str> {
     let worker_profile = Arc::clone(profile);
     let step = move || {
         let launcher = &worker_profile.launcher;
-        let Ok(workspace) = create(launcher) else {
-            return Setup::Failed;
+        let workspace = match create(launcher) {
+            Ok(workspace) => workspace,
+            Err(CreateError::Failed) => return Setup::Failed,
+            Err(CreateError::Leaked) => return Setup::Leaked,
         };
         let Ok(command) =
             CommandLine::powershell(&launcher.windows, &launcher.system, workspace.path())
@@ -2549,22 +2612,22 @@ fn prepare_workspace(
         };
         Setup::Ready(workspace, command)
     };
-    match bounded(stop, by, CLEANUP_BUDGET, step) {
+    match bounded(stop, by, CLEANUP_BUDGET, by + CLEANUP_BUDGET, step) {
         Bounded::Done(Setup::Ready(workspace, command)) => Ok(Some((workspace, command))),
         Bounded::Done(Setup::Failed) | Bounded::Unstarted => Ok(None),
         Bounded::Done(Setup::Leaked) | Bounded::Missed => Err(WORKSPACE_UNKNOWN),
     }
 }
 
-/// Removes the request directory by `by`, or retires the session.
+/// Removes the request directory by the absolute instant `by`, whatever the
+/// cancellation timing, or retires the session.
 fn remove_workspace(
     stop: &OwnedHandle,
     workspace: Workspace,
     by: Instant,
     remove: impl FnOnce(Workspace) -> io::Result<()> + Send + 'static,
 ) -> Result<(), &'static str> {
-    let grace = by.saturating_duration_since(Instant::now());
-    match bounded(stop, by, grace, move || remove(workspace)) {
+    match bounded(stop, by, CLEANUP_BUDGET, by, move || remove(workspace)) {
         Bounded::Done(Ok(())) => Ok(()),
         _ => Err(WORKSPACE_UNKNOWN),
     }
@@ -2792,6 +2855,7 @@ mod tests {
     use super::*;
     use arx_guest::{Request, Response, ScriptStatus, read_frame, write_frame};
     use std::fs::File;
+    use windows_sys::Win32::System::SystemServices::ACCESS_DENIED_ACE_TYPE;
 
     const GUARD: Duration = Duration::from_secs(10);
 
@@ -2887,6 +2951,7 @@ mod tests {
             profile,
             stop: &stop,
             retire: &retire,
+            policy: clean_policy,
         };
         let mut wire = Vec::new();
         serve(request_bytes().as_slice(), &mut wire, &mut executor).unwrap();
@@ -2895,6 +2960,69 @@ mod tests {
             read_frame::<Response>(&mut wire).unwrap(),
             Some(Response::HelloAck {
                 script_execution: ScriptExecution::Unavailable,
+                ..
+            })
+        ));
+        assert!(matches!(
+            read_frame::<Response>(&mut wire).unwrap(),
+            Some(Response::ScriptResult {
+                status: ScriptStatus::Unavailable,
+                exit_code: None,
+                ..
+            })
+        ));
+        assert!(wire.is_empty());
+    }
+
+    static POLICY_READS: AtomicU32 = AtomicU32::new(0);
+
+    /// Admission passed, then script block logging was enabled.
+    fn logging_enabled_after_admission() -> [PolicyValue; POLICY_VALUES.len()] {
+        POLICY_READS.fetch_add(1, Ordering::SeqCst);
+        let mut policy = clean_policy();
+        let index = POLICY_VALUES
+            .iter()
+            .position(|(_, _, _, rule)| *rule == PolicyRule::ExplicitlyOff)
+            .unwrap();
+        policy[index] = PolicyValue::Dword(1);
+        policy
+    }
+
+    #[test]
+    fn policy_change_after_admission_closes_each_request() {
+        let stop = Arc::new(event().unwrap());
+        let retire = Cell::new(None);
+        let root = TestRoot::new("recheck");
+        // An admitted production-shaped profile: execution is advertised.
+        let profile = admit(test_profile(&root.0), &clean_policy(), |_| {
+            Ok(ScriptOutcome::Exited {
+                exit_code: SELF_TEST_SENTINEL,
+            })
+        })
+        .unwrap();
+        assert!(profile.is_some());
+        let mut executor = Executor {
+            profile,
+            stop: &stop,
+            retire: &retire,
+            policy: logging_enabled_after_admission,
+        };
+        let before = POLICY_READS.load(Ordering::SeqCst);
+        let mut wire = Vec::new();
+        serve(request_bytes().as_slice(), &mut wire, &mut executor).unwrap();
+        assert_eq!(executor.run_script("exit 7", 1), ScriptOutcome::Unavailable);
+        assert_eq!(
+            POLICY_READS.load(Ordering::SeqCst) - before,
+            2,
+            "read once per request"
+        );
+        assert_eq!(retire.get(), None);
+        assert_eq!(root.entries(), 0, "no request directory was created");
+        let mut wire = wire.as_slice();
+        assert!(matches!(
+            read_frame::<Response>(&mut wire).unwrap(),
+            Some(Response::HelloAck {
+                script_execution: ScriptExecution::Available,
                 ..
             })
         ));
@@ -3129,38 +3257,391 @@ mod tests {
     /// image can be slow. Only a failure ever waits this long.
     const POWERSHELL_GUARD: Duration = Duration::from_secs(30);
 
-    /// On an unexpected PowerShell outcome, the CLR's FailFast leaves no stderr
-    /// output, only an Application event (.NET Runtime 1025, or Application
-    /// Error 1000) with the exception and stack. Print the latest ones so a
-    /// hosted failure explains itself.
-    fn recent_runtime_events() -> String {
-        let query = "*[System[(Provider[@Name='.NET Runtime'] or Provider[@Name='Application Error']) \
-                     and TimeCreated[timediff(@SystemTime) <= 300000]]]";
+    // Failure-only diagnostics. Nothing below runs on a passing test. Every read
+    // is bounded and correlated with a child this test launched itself.
+
+    const DIAGNOSTIC_TEXT: usize = 3000;
+    const DIAGNOSTIC_EVENT: usize = 1500;
+
+    /// Clips text and drops event lines that identify the account or machine.
+    fn clipped(text: &str, limit: usize) -> String {
+        text.lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                !(line.starts_with("User:")
+                    || line.starts_with("User Name:")
+                    || line.starts_with("Computer:"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .take(limit)
+            .collect()
+    }
+
+    fn wevtutil(query: &str, count: u32) -> String {
         match std::process::Command::new("wevtutil.exe")
             .args([
                 "qe",
                 "Application",
                 &format!("/q:{query}"),
-                "/c:4",
+                &format!("/c:{count}"),
                 "/rd:true",
                 "/f:text",
             ])
             .output()
         {
-            Ok(output) => String::from_utf8_lossy(&output.stdout)
-                .chars()
-                .take(6000)
-                .collect(),
+            Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
             Err(error) => format!("wevtutil unavailable: {error}"),
         }
     }
 
-    fn assert_powershell(outcome: Result<ScriptOutcome, &'static str>, expected: ScriptOutcome) {
-        assert!(
-            outcome == Ok(expected),
-            "PowerShell returned {outcome:?}, expected {expected:?}\nrecent runtime events:\n{}",
-            recent_runtime_events()
+    /// `.NET Runtime` and `Application Error` events raised by exactly this
+    /// process id since `since`, at most two of each, each clipped.
+    fn child_events(pid: u32, since: Instant) -> String {
+        let window = since.elapsed().as_millis() + 2000;
+        let mut found = Vec::new();
+        let runtime = wevtutil(
+            &format!(
+                "*[System[Provider[@Name='.NET Runtime'] and Execution[@ProcessID='{pid}'] \
+                 and TimeCreated[timediff(@SystemTime) <= {window}]]]"
+            ),
+            2,
         );
+        if runtime.contains("Event[") {
+            found.push(clipped(&runtime, 2 * DIAGNOSTIC_EVENT));
+        }
+        let crashes = wevtutil(
+            &format!(
+                "*[System[Provider[@Name='Application Error'] \
+                 and TimeCreated[timediff(@SystemTime) <= {window}]]]"
+            ),
+            8,
+        );
+        let marker = format!("faulting process id: 0x{pid:x}");
+        found.extend(
+            crashes
+                .split("Event[")
+                .filter(|event| event.to_ascii_lowercase().contains(&marker))
+                .take(2)
+                .map(|event| clipped(event, DIAGNOSTIC_EVENT)),
+        );
+        if found.is_empty() {
+            format!("no runtime events for pid {pid}")
+        } else {
+            found.join("\n")
+        }
+    }
+
+    fn with_env(command: &mut CommandLine, entry: &str) {
+        let mut entries: Vec<String> = command
+            .env
+            .split(|&unit| unit == 0)
+            .filter(|value| !value.is_empty())
+            .map(|value| String::from_utf16(value).unwrap())
+            .chain([entry.to_owned()])
+            .collect();
+        entries.sort_by_key(|entry| entry.split('=').next().unwrap_or("").to_ascii_uppercase());
+        command.env = entries
+            .iter()
+            .flat_map(|entry| wide(entry))
+            .chain([0])
+            .collect();
+    }
+
+    /// Re-runs `script` in `work` with the child's stdout and stderr captured
+    /// to a file there. PowerShell prints an unhandled exception ("An error has
+    /// occurred that was not properly handled...") before it fails fast.
+    fn capture_powershell(
+        identity: Identity<'_>,
+        pipe_client: &[u32; 17],
+        work: &Path,
+        script: &[u8],
+        extra_env: Option<&str>,
+    ) -> String {
+        let started = Instant::now();
+        let (windows, system) = system_paths().unwrap();
+        let mut command = CommandLine::powershell(&windows, &system, work).unwrap();
+        if let Some(entry) = extra_env {
+            with_env(&mut command, entry);
+        }
+        let path = wide_path(&work.join("diagnostic-output.txt")).unwrap();
+        // SAFETY: test-owned file in the request directory; inherited only through
+        // the explicit handle list.
+        let output = match handle(unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ,
+                &inheritable(),
+                CREATE_ALWAYS,
+                0,
+                null_mut(),
+            )
+        }) {
+            Ok(output) => output,
+            Err(error) => return format!("output file: {error}"),
+        };
+        let job = Job::new().unwrap();
+        let (reader, writer) = stdin_pipe(MAX_SCRIPT as u32, pipe_client).unwrap();
+        let child = match create_suspended(&job, &reader, &output, &command, identity) {
+            Ok(child) => child,
+            Err(error) => return format!("launch: {error:?}"),
+        };
+        drop((reader, output));
+        let stop = event().unwrap();
+        let input = pipe_write(&writer, &stop, Instant::now() + GUARD, script.to_vec());
+        drop(writer);
+        // SAFETY: the suspended child is contained in the held Job.
+        unsafe { ResumeThread(child.thread.as_raw_handle()) };
+        let finished = signaled(
+            child.process.as_raw_handle(),
+            POWERSHELL_GUARD.as_millis() as u32,
+        )
+        .unwrap_or(false);
+        let code = exit_code(&child.process).unwrap_or(0);
+        // SAFETY: held Job handle; the child is waited on below.
+        unsafe { TerminateJobObject(job.0.as_raw_handle(), 1) };
+        let _ = signaled(child.process.as_raw_handle(), GUARD.as_millis() as u32);
+        let pid = unsafe { GetProcessId(child.process.as_raw_handle()) };
+        let text = std::fs::read(work.join("diagnostic-output.txt"))
+            .map(|bytes| clipped(&String::from_utf8_lossy(&bytes), DIAGNOSTIC_TEXT))
+            .unwrap_or_else(|error| format!("unreadable: {error}"));
+        format!(
+            "input {:?}; finished {finished}; exit {code:#x}; pid {pid}\noutput:\n{text}\nevents:\n{}",
+            input.map(|_| ()),
+            child_events(pid, started)
+        )
+    }
+
+    fn sid_or_error(sid: PSID) -> String {
+        if sid.is_null() {
+            return "none".to_owned();
+        }
+        sid_string(sid).unwrap_or_else(|error| format!("sid error {error}"))
+    }
+
+    /// Owner, a short DACL summary and the access the restricted probe token
+    /// would be granted, for one object, or the open error.
+    fn object_access(
+        name: &str,
+        open: io::Result<OwnedHandle>,
+        kind: SE_OBJECT_TYPE,
+        probe: &OwnedHandle,
+        mapping: GENERIC_MAPPING,
+    ) -> String {
+        let object = match open {
+            Ok(object) => object,
+            Err(error) => return format!("{name}: open failed {error}\n"),
+        };
+        let descriptor = match Descriptor::object(
+            object.as_raw_handle(),
+            kind,
+            OWNER_SECURITY_INFORMATION
+                | GROUP_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | LABEL_SECURITY_INFORMATION,
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return format!("{name}: security unreadable {error}\n"),
+        };
+        let mut owner = null_mut();
+        let mut defaulted = 0;
+        // SAFETY: the owner pointer refers into the retained descriptor.
+        unsafe { GetSecurityDescriptorOwner(descriptor.0, &mut owner, &mut defaulted) };
+        let mut aces = Vec::new();
+        if let Ok(acl) = descriptor.dacl() {
+            // SAFETY: the ACL is retained by `descriptor`; ACE index below AceCount.
+            let count = unsafe { (*acl).AceCount };
+            for index in 0..u32::from(count).min(8) {
+                let mut ace = null_mut();
+                if unsafe { GetAce(acl, index, &mut ace) } == 0 {
+                    break;
+                }
+                let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+                let kind = u32::from(header.AceType);
+                if kind == ACCESS_ALLOWED_ACE_TYPE || kind == ACCESS_DENIED_ACE_TYPE {
+                    let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+                    let sid = (&ace.SidStart as *const u32).cast_mut().cast();
+                    aces.push(format!(
+                        "{}:{}:{:#x}",
+                        if kind == ACCESS_ALLOWED_ACE_TYPE {
+                            "A"
+                        } else {
+                            "D"
+                        },
+                        sid_or_error(sid),
+                        ace.Mask
+                    ));
+                } else {
+                    aces.push(format!("type{kind}"));
+                }
+            }
+        }
+        let granted = descriptor.allowed(probe, mapping).map_or_else(
+            |error| format!("check failed {error}"),
+            |mask| format!("{mask:#x}"),
+        );
+        format!(
+            "{name}: owner {} granted-to-restricted {granted} dacl [{}]\n",
+            sid_or_error(owner),
+            aces.join(" ")
+        )
+    }
+
+    fn open_for_security(path: &Path) -> io::Result<OwnedHandle> {
+        let name = wide_path(path)?;
+        // SAFETY: fixed system path, metadata-only access.
+        handle(unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                READ_CONTROL | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            )
+        })
+    }
+
+    fn open_key_for_security(key: &str) -> io::Result<OwnedHandle> {
+        use windows_sys::Win32::System::Registry::RegOpenKeyExW;
+        let name = wide(key);
+        let mut raw = null_mut();
+        // SAFETY: fixed HKLM subkey, READ_CONTROL only; RegCloseKey and CloseHandle
+        // are interchangeable for this test-scoped key handle.
+        let error =
+            unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, name.as_ptr(), 0, READ_CONTROL, &mut raw) };
+        if error != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        // SAFETY: a successfully opened key handle owned by this wrapper.
+        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+
+    /// Token facts and the access the restricted token has to the objects
+    /// PowerShell start-up reads, including the faulting native image.
+    fn restricted_access_report(profile: &Profile) -> String {
+        use windows_sys::Win32::System::Registry::{KEY_ALL_ACCESS, KEY_READ, KEY_WRITE};
+        let mut report = String::new();
+        let token = &profile.token;
+        let source = open_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
+        let owner = token_buffer(token, TokenOwner).unwrap();
+        report.push_str(&format!(
+            "restricted user {} owner {} il {:?} session {:?}; runner il {:?} elevation-type {:?} session {:?}; EnableLUA {:?}\n",
+            token_user_string(token).unwrap_or_default(),
+            sid_or_error(unsafe { (*owner.as_ptr().cast::<TOKEN_OWNER>()).Owner }),
+            integrity_rid(token).map(|rid| format!("{rid:#x}")),
+            token_dword(token, TokenSessionId),
+            integrity_rid(&source).map(|rid| format!("{rid:#x}")),
+            token_dword(&source, TokenElevationType),
+            token_dword(&source, TokenSessionId),
+            read_policy_value(
+                Hive::Machine,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+                "EnableLUA"
+            ),
+        ));
+        let windows = &profile.launcher.windows;
+        let native = windows.join(r"assembly\NativeImages_v4.0.30319_64");
+        let mut paths = vec![
+            native.join("System.Management.Automation"),
+            profile.launcher.system.join(r"WindowsPowerShell\v1.0"),
+            windows.join(r"Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation"),
+        ];
+        if let Ok(entries) = std::fs::read_dir(&native) {
+            for entry in entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("System.Mana")
+                })
+                .take(3)
+            {
+                paths.push(entry.path());
+                if let Ok(images) = std::fs::read_dir(entry.path()) {
+                    for image in images.flatten().take(2) {
+                        paths.push(image.path());
+                        paths.push(image.path().join("System.Management.Automation.ni.dll"));
+                    }
+                }
+            }
+        }
+        for path in paths.iter().take(16) {
+            report.push_str(&object_access(
+                &path.display().to_string(),
+                open_for_security(path),
+                SE_FILE_OBJECT,
+                &profile.probe,
+                file_mapping(),
+            ));
+        }
+        let registry = GENERIC_MAPPING {
+            GenericRead: KEY_READ,
+            GenericWrite: KEY_WRITE,
+            GenericExecute: KEY_READ,
+            GenericAll: KEY_ALL_ACCESS,
+        };
+        for key in [
+            r"SOFTWARE\Microsoft\PowerShell\1\PowerShellEngine",
+            r"SOFTWARE\Microsoft\PowerShell\1\ShellIds\Microsoft.PowerShell",
+            r"SOFTWARE\Microsoft\.NETFramework",
+        ] {
+            report.push_str(&object_access(
+                &format!(r"HKLM\{key}"),
+                open_key_for_security(key),
+                SE_REGISTRY_KEY,
+                &profile.probe,
+                registry,
+            ));
+        }
+        // The runner's own SID adds nothing a reviewer needs; keep the shape.
+        match token_user_string(token) {
+            Ok(user) => clipped(&report.replace(&user, "<user>"), 4 * DIAGNOSTIC_TEXT),
+            Err(_) => clipped(&report, 4 * DIAGNOSTIC_TEXT),
+        }
+    }
+
+    /// Full failure evidence for the production identity: token and object
+    /// access, the script re-run with captured output, and the same re-run
+    /// with NGEN images disabled.
+    fn restricted_failure_report(profile: &Arc<Profile>, script: &[u8]) -> String {
+        let mut report = restricted_access_report(profile);
+        for extra in [None, Some("COMPlus_ZapDisable=1")] {
+            let capture = match Workspace::create(&profile.launcher) {
+                Ok(workspace) => {
+                    let text = capture_powershell(
+                        Identity::Restricted(&profile.token),
+                        &profile.launcher.pipe_client,
+                        workspace.path(),
+                        script,
+                        extra,
+                    );
+                    let _ = workspace.remove();
+                    text
+                }
+                Err(error) => format!("workspace: {error:?}"),
+            };
+            report.push_str(&format!("\n--- re-run with {extra:?}:\n{capture}\n"));
+        }
+        report
+    }
+
+    fn assert_powershell(
+        outcome: Result<ScriptOutcome, &'static str>,
+        expected: ScriptOutcome,
+        diagnose: impl FnOnce() -> String,
+    ) {
+        if outcome != Ok(expected) {
+            panic!(
+                "PowerShell returned {outcome:?}, expected {expected:?}\ndiagnostics:\n{}",
+                diagnose()
+            );
+        }
     }
 
     fn powershell(script: &[u8], expected: u32) {
@@ -3169,14 +3650,14 @@ mod tests {
         let command = CommandLine::powershell(&windows, &system, &root.0).unwrap();
         let stop = Arc::new(event().unwrap());
         let worker_stop = Arc::clone(&stop);
-        let script = script.to_vec();
+        let worker_script = script.to_vec();
         let deadline = Instant::now() + POWERSHELL_GUARD;
         let outcome = supervise(&stop, deadline, CLEANUP_BUDGET, move || {
             prepare(
                 &command,
                 Identity::TestCurrent,
                 &current_user_sid(),
-                script,
+                worker_script,
                 &worker_stop,
                 deadline,
                 |_| Ok(()),
@@ -3186,6 +3667,16 @@ mod tests {
             outcome,
             ScriptOutcome::Exited {
                 exit_code: expected,
+            },
+            || {
+                let rerun = TestRoot::new("wrapper-diagnostic");
+                capture_powershell(
+                    Identity::TestCurrent,
+                    &current_user_sid(),
+                    &rerun.0,
+                    script,
+                    None,
+                )
             },
         );
     }
@@ -3222,7 +3713,9 @@ mod tests {
             script.as_bytes().to_vec(),
             Instant::now() + POWERSHELL_GUARD,
         );
-        assert_powershell(outcome, ScriptOutcome::Exited { exit_code: 7 });
+        assert_powershell(outcome, ScriptOutcome::Exited { exit_code: 7 }, || {
+            restricted_failure_report(&profile, script.as_bytes())
+        });
         assert_eq!(root.entries(), 0, "request directory removed after cleanup");
     }
 
@@ -3242,22 +3735,22 @@ mod tests {
     fn self_test_admits_the_production_identity() {
         let root = TestRoot::new("self");
         let stop = Arc::new(event().unwrap());
-        let mut outcome = None;
-        let admitted = admit(test_profile(&root.0), &clean_policy(), |profile| {
-            let result = run_profile(
-                profile,
-                &stop,
-                SELF_TEST.as_bytes().to_vec(),
-                Instant::now() + POWERSHELL_GUARD,
-            );
-            outcome = Some(result);
-            result
-        });
-        assert!(
-            matches!(admitted, Ok(Some(_))),
-            "self-test returned {outcome:?}\nrecent runtime events:\n{}",
-            recent_runtime_events()
+        let profile = Arc::new(test_profile(&root.0));
+        let outcome = run_profile(
+            &profile,
+            &stop,
+            SELF_TEST.as_bytes().to_vec(),
+            Instant::now() + POWERSHELL_GUARD,
         );
+        let sentinel = ScriptOutcome::Exited {
+            exit_code: SELF_TEST_SENTINEL,
+        };
+        assert_powershell(outcome, sentinel, || {
+            restricted_failure_report(&profile, SELF_TEST.as_bytes())
+        });
+        // The same outcome admits a production-shaped profile.
+        let admitted = admit(test_profile(&root.0), &clean_policy(), |_| outcome);
+        assert!(matches!(admitted, Ok(Some(_))));
         assert_eq!(
             root.entries(),
             0,
@@ -3375,19 +3868,18 @@ mod tests {
     #[test]
     fn bounded_steps_never_outlive_their_budget() {
         let stop = event().unwrap();
+        let far = Instant::now() + GUARD;
         assert!(matches!(
-            bounded(&stop, Instant::now() + GUARD, Duration::ZERO, || 5),
+            bounded(&stop, far, Duration::ZERO, far, || 5),
             Bounded::Done(5)
         ));
         let latch = Arc::new(event().unwrap());
         let held = Arc::clone(&latch);
         let started = Instant::now();
-        let result = bounded(
-            &stop,
-            Instant::now() + Duration::from_millis(50),
-            Duration::ZERO,
-            move || signaled(held.as_raw_handle(), GUARD.as_millis() as u32),
-        );
+        let soon = Instant::now() + Duration::from_millis(50);
+        let result = bounded(&stop, soon, Duration::ZERO, soon, move || {
+            signaled(held.as_raw_handle(), GUARD.as_millis() as u32)
+        });
         assert!(matches!(result, Bounded::Missed));
         assert!(
             started.elapsed() < GUARD / 2,
@@ -3400,15 +3892,64 @@ mod tests {
         let latch = Arc::new(event().unwrap());
         let held = Arc::clone(&latch);
         let started = Instant::now();
-        let result = bounded(
-            &cancelled,
-            Instant::now() + GUARD,
-            Duration::from_millis(50),
-            move || signaled(held.as_raw_handle(), GUARD.as_millis() as u32),
-        );
+        let far = Instant::now() + GUARD;
+        let result = bounded(&cancelled, far, Duration::from_millis(50), far, move || {
+            signaled(held.as_raw_handle(), GUARD.as_millis() as u32)
+        });
         assert!(matches!(result, Bounded::Missed));
         assert!(started.elapsed() < GUARD / 2);
         signal(&latch);
+    }
+
+    #[test]
+    fn cancellation_grace_never_passes_the_absolute_limit() {
+        let now = Instant::now();
+        let limit = now + Duration::from_secs(3);
+        assert_eq!(
+            cancel_deadline(now, Duration::from_secs(1), limit),
+            now + Duration::from_secs(1)
+        );
+        assert_eq!(cancel_deadline(now, Duration::from_secs(5), limit), limit);
+        assert_eq!(cancel_deadline(limit, Duration::from_secs(1), limit), limit);
+        assert_eq!(cancel_deadline(now, Duration::MAX, limit), limit);
+    }
+
+    #[test]
+    fn late_cancellation_cannot_extend_workspace_removal() {
+        let root = TestRoot::new("late");
+        let profile = Arc::new(test_profile(&root.0));
+        let stop = Arc::new(event().unwrap());
+        let (workspace, _command) =
+            prepare_workspace(&profile, &stop, Instant::now() + GUARD, Workspace::create)
+                .unwrap()
+                .unwrap();
+        let latch = Arc::new(event().unwrap());
+        let held = Arc::clone(&latch);
+        let canceller_stop = Arc::clone(&stop);
+        // Stop arrives late: after 300 ms of a 500 ms removal allowance. A grace
+        // period restarted at that point (2 s) would end near 2.3 s.
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            signal(&canceller_stop);
+        });
+        let started = Instant::now();
+        let removal = remove_workspace(
+            &stop,
+            workspace,
+            started + Duration::from_millis(500),
+            move |workspace| {
+                signaled(held.as_raw_handle(), GUARD.as_millis() as u32).unwrap();
+                workspace.remove()
+            },
+        );
+        let elapsed = started.elapsed();
+        canceller.join().unwrap();
+        signal(&latch);
+        assert_eq!(removal, Err(WORKSPACE_UNKNOWN));
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "removal ended at {elapsed:?}, past its absolute deadline"
+        );
     }
 
     #[test]
@@ -3426,16 +3967,21 @@ mod tests {
             Instant::now() + Duration::from_millis(50),
             move |_| {
                 signaled(held.as_raw_handle(), GUARD.as_millis() as u32).unwrap();
-                Err(io::ErrorKind::TimedOut.into())
+                Err(CreateError::Failed)
             },
         );
         assert_eq!(setup.err(), Some(WORKSPACE_UNKNOWN));
         assert!(started.elapsed() < GUARD / 2);
 
         let failed = prepare_workspace(&profile, &stop, Instant::now() + GUARD, |_| {
-            Err(io::ErrorKind::PermissionDenied.into())
+            Err(CreateError::Failed)
         });
         assert!(matches!(failed, Ok(None)), "failed setup is LaunchFailed");
+        // A created directory whose rollback could not be proven retires.
+        let leaked = prepare_workspace(&profile, &stop, Instant::now() + GUARD, |_| {
+            Err(CreateError::Leaked)
+        });
+        assert_eq!(leaked.err(), Some(WORKSPACE_UNKNOWN));
 
         let (workspace, _command) =
             prepare_workspace(&profile, &stop, Instant::now() + GUARD, Workspace::create)
@@ -3591,6 +4137,21 @@ mod tests {
         let privileges = token_buffer(&token, TokenPrivileges).unwrap();
         assert!(privilege_entries(&privileges).unwrap().is_empty());
         verify_default_dacl(&token).unwrap();
+        // ADR 0059 group policy: broad groups keep their ordinary read grants.
+        // Only administrator-type and service groups become deny-only.
+        assert!(
+            token_owner_is_user(&token).unwrap(),
+            "objects are owned by the user"
+        );
+        for kind in [WinBuiltinUsersSid, WinAuthenticatedUserSid, WinWorldSid] {
+            assert!(!DENY_ONLY_GROUPS.contains(&kind));
+            let mut group = sid(kind).unwrap();
+            let before = group_attributes(&source, TokenGroups, group.as_mut_ptr().cast()).unwrap();
+            let after = group_attributes(&token, TokenGroups, group.as_mut_ptr().cast()).unwrap();
+            if let Some(flags) = before.filter(|flags| flags & GROUP_ENABLED != 0) {
+                assert_eq!(after, Some(flags), "group {kind} unchanged");
+            }
+        }
         assert_eq!(
             default_dacl_sddl("S-1-5-19"),
             "D:(A;;GA;;;SY)(A;;GA;;;S-1-5-19)"
