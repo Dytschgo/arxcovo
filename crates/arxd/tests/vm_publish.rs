@@ -1346,6 +1346,34 @@ mod vm {
                 hang_started.elapsed(),
                 revoke_started.elapsed()
             );
+            // A failed config write closes the share-exclusive writer before the
+            // guard deletes the file, so nothing is left behind.
+            let ingress_files = || {
+                fs::read_dir(root)
+                    .unwrap()
+                    .filter(|entry| {
+                        entry
+                            .as_ref()
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("ingress-")
+                    })
+                    .count()
+            };
+            assert_eq!(ingress_files(), 0);
+            super::publish::connector::FAIL_CONFIG_WRITE
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let error = match timeout(LEG, Connector::start(&plan))
+                .await
+                .expect("failed config write exceeded its deadline")
+            {
+                Err(error) => error,
+                Ok(_) => panic!("a failed config write reached the connector"),
+            };
+            assert_eq!(error, ConnectorError::Custody);
+            assert_eq!(ingress_files(), 0, "a failed config write left its file");
+            assert_gone(&witness_path, 5);
             origin_task.abort();
         }
 

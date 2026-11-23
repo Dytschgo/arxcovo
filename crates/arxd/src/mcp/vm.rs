@@ -267,6 +267,9 @@ pub(crate) struct Supervisor {
     /// Deferred stops ever spawned, for witnesses.
     #[cfg(test)]
     stops_spawned: std::sync::atomic::AtomicUsize,
+    /// Signalled after the drain's first stop pass, before it joins workers.
+    #[cfg(test)]
+    drain_first_pass: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
     ticks: Mutex<Option<tests::TestTicks>>,
     /// Parks the next tool call before admission.
@@ -377,6 +380,8 @@ impl Supervisor {
             stops: Mutex::default(),
             #[cfg(test)]
             stops_spawned: Default::default(),
+            #[cfg(test)]
+            drain_first_pass: Mutex::new(None),
             #[cfg(test)]
             ticks: Mutex::new(None),
             #[cfg(test)]
@@ -592,7 +597,18 @@ impl Supervisor {
             .map(|mut jobs| std::mem::take(&mut *jobs))
             .map_err(|_| anyhow::anyhow!("publication settlement unconfirmed"))?;
         tokio::time::timeout_at(deadline, async {
-            let first = self.publisher.stop_all().await;
+            // Local stop only: registrations without a connector belong to
+            // workers that have not joined yet. The outcome is decided below.
+            self.publisher.stop_local(None).await;
+            #[cfg(test)]
+            if let Some(passed) = self
+                .drain_first_pass
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+            {
+                let _ = passed.send(());
+            }
             let mut failed = false;
             while let Some(job) = publish_jobs.join_next().await {
                 failed |= !matches!(job, Ok(Ok(())));
@@ -602,7 +618,9 @@ impl Supervisor {
             }
             // A deferred stop may have confirmed what the first attempt could
             // not, so the final local state decides.
-            let local = first || self.publisher.stop_all().await;
+            // Every worker and deferred stop has joined: confirm the final local
+            // state and clear what remains of the registry.
+            let local = self.publisher.stop_all().await;
             failed |= !local || self.publisher.stop_unconfirmed();
             anyhow::ensure!(!failed, "publication settlement unconfirmed");
             Ok::<_, anyhow::Error>(())
@@ -5310,6 +5328,136 @@ mod tests {
         assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
         drop(a);
         h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_revocation_before_the_first_post_poll_never_starts_dns() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1300).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let (submit, in_gate, release) = gate();
+        *h.supervisor().publisher.submit_gate.lock().unwrap() = Some(submit);
+        let pending = call(&a, "publish_site", args(1310)).await;
+        // Past the pre-submission check, before the POST future is polled.
+        entered(in_gate).await;
+        // A colliding owner unpublish revokes; its deferred stop is joined and
+        // the connector is confirmed down before the worker resumes.
+        assert_eq!(
+            call(&a, "unpublish_site", args(1310)).await["reason"],
+            "key_collision"
+        );
+        until(|| !fake.local.load(SeqCst)).await;
+        until(|| revocations_settled(h.supervisor())).await;
+        assert_eq!(h.supervisor().publisher.registry_len(), 0);
+        release.send(()).unwrap();
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (&json!("failed"), &json!("cancelled"), &json!("confirmed")),
+            "{failed}"
+        );
+        // DNS start was never called, and the publication released.
+        assert_eq!(fake.posts.load(SeqCst), 0);
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        let published = call(&a, "publish_site", args(1311)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let revoke = call(&a, "unpublish_site", args(1312)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_publish_keeps_the_retired_revocation_cause() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1320).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let published = call(&a, "publish_site", args(1330)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        // A colliding owner unpublish stops the connector; no cleanup has run.
+        assert_eq!(
+            call(&a, "unpublish_site", args(1330)).await["reason"],
+            "key_collision"
+        );
+        until(|| !fake.local.load(SeqCst)).await;
+        until(|| revocations_settled(h.supervisor())).await;
+        assert_eq!(h.supervisor().publisher.registry_len(), 0);
+        // A refused republish registers and abandons a candidate.
+        assert_eq!(
+            call(&a, "publish_site", args(1331)).await["reason"],
+            "publish_cleanup_pending"
+        );
+        // The reaper's cleanup still reports the owner revocation as its cause.
+        fake.credential.store(false, SeqCst);
+        h.tick().await;
+        let pending = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row = phase(&a, &vm).await;
+                if row["phase"] == "cleanup_pending" {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("cleanup did not record its pending state");
+        assert_eq!(pending["reason"], "cancelled", "{pending}");
+        fake.credential.store(true, SeqCst);
+        assert_eq!(settle(&h, &a, &vm).await["reason"], "cancelled");
+        let published = call(&a, "publish_site", args(1332)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let revoke = call(&a, "unpublish_site", args(1333)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_leaves_an_unstarted_registration_to_its_worker() {
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, _fake) = enrolled(&h, &a, 1340).await;
+        // The worker parks uncancellably before any effect, so it can only
+        // settle once released, after the drain's first stop pass.
+        let (worker, in_gate, release) = gate();
+        *h.supervisor().publisher.activate_gate.lock().unwrap() = Some(worker);
+        let pending = call(
+            &a,
+            "publish_site",
+            json!({"vm_id":vm,"request_id":key(1350)}),
+        )
+        .await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        entered(in_gate).await;
+        // Registered and admitted, with no connector yet.
+        assert_eq!(h.supervisor().publisher.registry_len(), 1);
+        let supervisor = h.supervisor().clone();
+        supervisor
+            .publisher
+            .cleanup_registry
+            .lock()
+            .unwrap()
+            .clear();
+        let (passed, first_pass) = tokio::sync::oneshot::channel();
+        *supervisor.drain_first_pass.lock().unwrap() = Some(passed);
+        let releaser = tokio::spawn(async move {
+            first_pass.await.unwrap();
+            release.send(()).unwrap();
+        });
+        drop(a);
+        h.shutdown().await.unwrap();
+        releaser.await.unwrap();
+        // The worker settled with its registration still present; only then
+        // did the drain clear the registry.
+        assert_eq!(
+            *supervisor.publisher.cleanup_registry.lock().unwrap(),
+            vec![1]
+        );
+        assert_eq!(supervisor.publisher.registry_len(), 0);
     }
 
     #[tokio::test]

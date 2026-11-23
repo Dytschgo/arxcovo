@@ -937,6 +937,12 @@ pub(crate) mod publication {
         /// Parks the next unpublish worker before it waits for the slot.
         #[cfg(test)]
         pub(crate) unpublish_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// Parks the next publish worker, uncancellably, before any effect.
+        #[cfg(test)]
+        pub(crate) activate_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// The registry size each cleanup observed on entry.
+        #[cfg(test)]
+        pub(crate) cleanup_registry: std::sync::Mutex<Vec<usize>>,
         /// Parks a publish worker after its pre-submission cancellation check
         /// and before its DNS POST future is first polled.
         #[cfg(test)]
@@ -994,9 +1000,6 @@ pub(crate) mod publication {
             activations.issued += 1;
             let generation = activations.issued;
             let token = Shutdown::default();
-            if activations.revoked_retired == Some(vm) {
-                activations.revoked_retired = None;
-            }
             activations.pending = Some(Activation {
                 generation,
                 vm,
@@ -1009,12 +1012,16 @@ pub(crate) mod publication {
         /// The registered activation was admitted and is now current.
         pub(crate) fn admitted(&self, generation: u64) {
             let mut activations = self.activations();
-            if activations
+            if let Some(pending) = activations
                 .pending
-                .as_ref()
-                .is_some_and(|pending| pending.generation == generation)
+                .take_if(|pending| pending.generation == generation)
             {
-                activations.current = activations.pending.take();
+                // A successful replacement: the previous publication of this
+                // VM was released before admission, so its marker is spent.
+                if activations.revoked_retired == Some(pending.vm) {
+                    activations.revoked_retired = None;
+                }
+                activations.current = Some(pending);
             }
         }
 
@@ -1030,6 +1037,11 @@ pub(crate) mod publication {
             {
                 activations.current = None;
             }
+        }
+
+        /// The revocation cause for `vm` is durable, or its publication is gone.
+        fn clear_revoked(&self, vm: Id) {
+            let mut activations = self.activations();
             if activations.revoked_retired == Some(vm) {
                 activations.revoked_retired = None;
             }
@@ -1160,8 +1172,9 @@ pub(crate) mod publication {
             true
         }
 
-        /// Daemon shutdown: stops every connector and, once confirmed, retires
-        /// every activation.
+        /// Daemon shutdown, after every worker and deferred stop has joined:
+        /// stops any remaining connector and, once confirmed, clears every
+        /// remaining activation and marker.
         pub(crate) async fn stop_all(&self) -> bool {
             let stopped = self.stop_local(None).await;
             if stopped {
@@ -1290,6 +1303,8 @@ pub(crate) mod publication {
             revoked: &Shutdown,
             shutdown: &Shutdown,
         ) -> Result<(), (Failure, Evidence)> {
+            #[cfg(test)]
+            let _ = hold(&self.activate_gate).await;
             let route = route(intent).map_err(|failure| (failure, Evidence::Unknown))?;
             let map = |error| match error {
                 DnsError::Conflict => (Failure::DnsConflict, Evidence::Unknown),
@@ -1366,19 +1381,36 @@ pub(crate) mod publication {
             let _ = hold(&self.submit_gate).await;
             // An owner revocation does not abandon a submitted POST: it
             // completes or times out, and its acknowledged ID is then removed.
-            // A retirement or shutdown that wins before the POST future is
-            // first polled has positive no-submission evidence; once polled,
+            // Any cancellation (owner revocation, origin retirement or shutdown)
+            // that lands before the POST future is first polled has positive
+            // no-submission evidence. The first poll samples all three in the
+            // same step that claims submission and starts DNS; once claimed,
             // the POST stays possible.
+            let cause = || {
+                if origin.retired.is_cancelled() {
+                    Some(Failure::OriginUnavailable)
+                } else if revoked.is_cancelled() || shutdown.is_cancelled() {
+                    Some(Failure::Cancelled)
+                } else {
+                    None
+                }
+            };
             let polled = std::sync::atomic::AtomicBool::new(false);
             let create = async {
+                if let Some(cancelled) = cause() {
+                    return Err(cancelled);
+                }
                 polled.store(true, std::sync::atomic::Ordering::SeqCst);
-                prepared.dns.create(&route).await
+                Ok(prepared.dns.create(&route).await)
             };
             let id = tokio::select! {
                 biased;
                 _ = origin.retired.cancelled() => Err(Failure::OriginUnavailable),
                 _ = shutdown.cancelled() => Err(Failure::Cancelled),
-                result = create => Ok(result.map_err(map)?),
+                result = create => match result {
+                    Ok(created) => Ok(created.map_err(map)?),
+                    Err(cancelled) => Err(cancelled),
+                },
             };
             let id = match id {
                 Ok(id) => id,
@@ -1476,6 +1508,11 @@ pub(crate) mod publication {
             evidence: Evidence,
             shutdown: Option<&Shutdown>,
         ) -> Result<bool> {
+            #[cfg(test)]
+            self.cleanup_registry
+                .lock()
+                .unwrap()
+                .push(self.registry_len());
             // Under the effects slot only this VM's current or leftover
             // connector can be live, so a VM-scoped stop is exact here.
             let local = self.stop_local(Some(vm)).await;
@@ -1486,9 +1523,12 @@ pub(crate) mod publication {
                 .publication_intent()?
                 .filter(|intent| intent.vm == vm)
             else {
+                self.clear_revoked(vm);
                 return Ok(local);
             };
             controller.update_publication(&intent.nonce, Update::Phase(Phase::Revoking, reason))?;
+            // The cause is now durable on the intent.
+            self.clear_revoked(vm);
             // A proven unsubmitted POST needs no remote work, so it is decided
             // before DNS and before cancellation can win.
             let unsubmitted = intent.record.is_none()

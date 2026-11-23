@@ -367,6 +367,11 @@ async fn probe_origin(
     Ok(())
 }
 
+/// Fails the next config write after creation, for the cleanup witness.
+#[cfg(test)]
+pub(in crate::vm) static FAIL_CONFIG_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 struct Config {
     path: PathBuf,
     held: Option<HeldPath>,
@@ -393,8 +398,17 @@ impl Config {
         // Owned by TokenUser with a protected DACL before any content exists.
         let mut output = super::windows::create_private(&path).map_err(|_| refusal)?;
         let mut config = Self { path, held: None };
-        output.write_all(text.as_bytes()).map_err(|_| refusal)?;
+        let written = output.write_all(text.as_bytes());
+        #[cfg(test)]
+        let written = if FAIL_CONFIG_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            Err(std::io::Error::other("injected config write failure"))
+        } else {
+            written
+        };
+        // The share-exclusive writer must close before the guard can delete a
+        // failed output.
         drop(output);
+        written.map_err(|_| refusal)?;
         let held = HeldPath::open(&config.path, false, true).map_err(|_| refusal)?;
         let mut actual = Vec::new();
         (&held.file)
