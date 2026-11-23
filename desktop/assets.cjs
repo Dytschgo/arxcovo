@@ -25,7 +25,9 @@ const TYPES = Object.freeze({
   '.json': 'application/json',
 });
 
-const DEFAULT_LIMITS = Object.freeze({ maxFiles: 1000, maxFileBytes: 16 * 1024 * 1024, maxTotalBytes: 64 * 1024 * 1024, maxDepth: 16 });
+// maxEntries counts every directory entry enumerated (files, directories and
+// ignored entries alike), so enumeration itself is bounded, not only what is served.
+const DEFAULT_LIMITS = Object.freeze({ maxFiles: 1000, maxEntries: 4000, maxFileBytes: 16 * 1024 * 1024, maxTotalBytes: 64 * 1024 * 1024, maxDepth: 16 });
 // O_NOFOLLOW exists on POSIX; Windows has no such flag, so there the lstat
 // and handle-identity checks are what refuse links.
 const OPEN_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
@@ -73,9 +75,10 @@ function readBounded(fd, limit) {
 /**
  * Loads ui/dist into a frozen table. Throws (the app refuses to start) on a
  * link, a cap overrun, a file that changes identity or grows while being
- * read, or a root that changed during the walk. Test seams: `hooks.beforeOpen(file)`
+ * read, too many entries, or a root that changed during the walk. Test seams: `hooks.beforeOpen(file)`
  * runs after a file's lstat and before its open; `hooks.afterStat(file)` runs
- * after its size check and before its read.
+ * after its size check and before its read; `hooks.beforeFinalCheck()` runs
+ * after the walk and before the final root re-verification.
  */
 function loadAssetTable(dir, options = {}) {
   const limits = { ...DEFAULT_LIMITS, ...options.limits };
@@ -83,6 +86,7 @@ function loadAssetTable(dir, options = {}) {
   const assetRoot = createAssetRoot(dir);
   const entries = new Map();
   let files = 0;
+  let enumerated = 0;
   let totalBytes = 0;
 
   // `chain` holds the lstat of every directory from the root down to `dirPath`.
@@ -95,10 +99,28 @@ function loadAssetTable(dir, options = {}) {
 
   function walk(dirPath, rel, chain) {
     if (chain.length > limits.maxDepth) refuse(`tree deeper than ${limits.maxDepth}`);
-    for (const name of fs.readdirSync(dirPath).sort()) {
+    // Batched enumeration against the entry budget: refuses before an
+    // oversized directory is ever listed in full.
+    const names = [];
+    const dir = fs.opendirSync(dirPath, { bufferSize: 64 });
+    try {
+      for (let entry = dir.readSync(); entry !== null; entry = dir.readSync()) {
+        if (++enumerated > limits.maxEntries) refuse(`more than ${limits.maxEntries} directory entries`);
+        names.push(entry.name);
+      }
+    } finally {
+      dir.closeSync();
+    }
+    for (const name of names.sort()) {
       const full = path.join(dirPath, name);
       const key = rel ? `${rel}/${name}` : name;
       const stat = fs.lstatSync(full, { bigint: true });
+      // Known limitation (deferred, recorded as a known issue): Node classifies
+      // symlinks and junctions as links, but on Windows other reparse tags
+      // (for example cloud-file placeholders or dedup) can be reported as
+      // ordinary files or directories, because libuv retries them as a plain
+      // stat. Rejecting every FILE_ATTRIBUTE_REPARSE_POINT needs a native
+      // attribute query that Node does not expose.
       if (stat.isSymbolicLink()) refuse(`link in asset tree: ${key}`);
       if (stat.isDirectory()) {
         walk(full, key, [...chain, { at: full, stat }]);
@@ -129,6 +151,7 @@ function loadAssetTable(dir, options = {}) {
   }
 
   walk(assetRoot.root, '', [{ at: assetRoot.root, stat: fs.lstatSync(assetRoot.root, { bigint: true }) }]);
+  if (hooks.beforeFinalCheck) hooks.beforeFinalCheck();
   const end = fs.lstatSync(assetRoot.root, { bigint: true });
   if (end.isSymbolicLink() || end.dev !== assetRoot.dev || end.ino !== assetRoot.ino || !samePath(fs.realpathSync.native(assetRoot.root), assetRoot.root)) {
     refuse('asset root changed during load');

@@ -149,3 +149,49 @@ test('a root replaced during the walk refuses to start', async t => {
   };
   assert.throws(() => loadAssetTable(f.dist, { hooks }), /changed during load/);
 });
+
+// The next two fixtures keep every file's identity intact, so only the
+// directory-chain guard or the final root guard can refuse them.
+test('an ancestor swapped for a junction to itself during the walk is caught by the directory-chain guard', async t => {
+  const f = fixture();
+  t.after(f.cleanup);
+  const assets = path.join(f.dist, 'assets');
+  const hooks = {
+    beforeOpen: file => {
+      if (file !== path.join(assets, 'app.js')) return;
+      // Same directory object, now reached through a junction: the file
+      // opened next is the very file that was walked.
+      const moved = path.join(f.base, 'assets-moved');
+      fs.renameSync(assets, moved);
+      linkDir(moved, assets);
+    },
+  };
+  assert.throws(() => loadAssetTable(f.dist, { hooks }), /directory changed during load: .*assets/);
+});
+
+test('a root replaced after the last file is caught by the final root guard', async t => {
+  for (const replace of ['copy', 'junction']) {
+    const f = fixture();
+    t.after(f.cleanup);
+    const hooks = {
+      beforeFinalCheck: () => {
+        const moved = path.join(f.base, 'dist-moved');
+        fs.renameSync(f.dist, moved);
+        if (replace === 'copy') fs.cpSync(moved, f.dist, { recursive: true });
+        else linkDir(moved, f.dist);
+      },
+    };
+    assert.throws(() => loadAssetTable(f.dist, { hooks }), /asset root changed during load/, replace);
+  }
+});
+
+test('every enumerated entry counts against the entry cap, including ignored ones', async t => {
+  const f = fixture();
+  t.after(f.cleanup);
+  const ignored = path.join(f.dist, 'ignored');
+  fs.mkdirSync(ignored);
+  for (let i = 0; i < 10; i += 1) fs.writeFileSync(path.join(ignored, `note-${i}.txt`), 'x');
+  // 2 root entries + 1 directory + 2 in assets + 10 ignored files = 15.
+  assert.equal(loadAssetTable(f.dist, { limits: { maxEntries: 15 } }).size, 2);
+  assert.throws(() => loadAssetTable(f.dist, { limits: { maxEntries: 14 } }), /more than 14 directory entries/);
+});
