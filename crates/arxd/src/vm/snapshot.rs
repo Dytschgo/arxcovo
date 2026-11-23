@@ -6,6 +6,7 @@ use super::{
     qemu_args::{SnapshotDiskRole, SnapshotInfo},
     qemu_img::{self, CLUSTER, MAX_INFO},
     runtime::{StopDisposition, snapshot_deadline},
+    static_web::FullCopyReservation,
 };
 use sha2::{Digest, Sha256};
 use std::time::Instant;
@@ -278,17 +279,19 @@ impl CopyPlan {
         if !capture && limits.restore_growth_bytes == 0 {
             return Err(Refusal::Disk);
         }
-        let claim = DiskClaim {
-            images: copy_bytes
-                .checked_add(if capture {
-                    0
-                } else {
-                    limits.restore_growth_bytes
-                })
-                .ok_or(Refusal::Disk)?,
-            staging: limits.staging_bytes,
-            metadata: limits.metadata_bytes,
-        };
+        let claim = FullCopyReservation {
+            qcow2_bytes: source.disk.pin.size,
+            qcow2_growth_bytes: if capture {
+                0
+            } else {
+                limits.restore_growth_bytes
+            },
+            vars_bytes: source.vars.pin.size,
+            staging_bytes: limits.staging_bytes,
+            metadata_bytes: limits.metadata_bytes,
+        }
+        .checked_claim()
+        .ok_or(Refusal::Disk)?;
         let coexistence_bytes = claim
             .total()
             .and_then(|total| total.checked_add(active_bytes))
@@ -374,10 +377,36 @@ pub struct Observation {
     pub size: u64,
 }
 
+/// Shared cancellation and deadline for the copy and every custody call.
+/// Adapters check it before starting work and between bounded I/O chunks or
+/// wait polls. A blocked helper or I/O worker must support bounded interruption.
+pub struct CopyBudget<'a> {
+    deadline: Instant,
+    cancelled: &'a dyn Fn() -> bool,
+    now: &'a dyn Fn() -> Instant,
+}
+
+impl CopyBudget<'_> {
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub fn check(&self) -> Result<(), Refusal> {
+        if (self.cancelled)() {
+            return Err(Refusal::Cancelled);
+        }
+        if (self.now)() >= self.deadline {
+            return Err(Refusal::Deadline);
+        }
+        Ok(())
+    }
+}
+
 /// The adapter retains handles from exclusive creation/open through
 /// settlement or quarantine. Native implementations must reject reparse
 /// points and hard links and check the by-name open against the held handle.
-/// Calls must be deadline-bounded. A timeout is not proof of release.
+/// On cancellation or expiry, stop payload work and perform bounded teardown.
+/// Preserve custody and claims when release proof is uncertain.
 pub trait CopyCustody {
     /// Recheck exact live worker/lease ownership and pinned volume capacity
     /// (caller-available and total free space, claims, and reserve).
@@ -385,10 +414,11 @@ pub trait CopyCustody {
         &mut self,
         plan: &CopyPlan,
         worker: &PendingOperation,
-        deadline: Instant,
+        budget: &CopyBudget<'_>,
     ) -> Result<(), Refusal>;
 
-    fn observe(&mut self, side: Side, deadline: Instant) -> Result<[Observation; 2], Refusal>;
+    fn observe(&mut self, side: Side, budget: &CopyBudget<'_>)
+    -> Result<[Observation; 2], Refusal>;
 
     /// Read one exact range from the retained object or fail.
     fn read(
@@ -397,7 +427,7 @@ pub trait CopyCustody {
         file: FileRole,
         offset: u64,
         bytes: &mut [u8],
-        deadline: Instant,
+        budget: &CopyBudget<'_>,
     ) -> Result<(), Refusal>;
 
     /// Write one exact range to the never-activated object or fail.
@@ -406,7 +436,7 @@ pub trait CopyCustody {
         file: FileRole,
         offset: u64,
         bytes: &[u8],
-        deadline: Instant,
+        budget: &CopyBudget<'_>,
     ) -> Result<(), Refusal>;
 
     /// Verify retained, sealed golden identity and pin from immutable
@@ -415,7 +445,7 @@ pub trait CopyCustody {
         &mut self,
         golden: &Golden,
         header: &mut [u8],
-        deadline: Instant,
+        budget: &CopyBudget<'_>,
     ) -> Result<(), Refusal>;
 
     /// Execute only the sealed read-only helper. Enforce the output bound
@@ -425,37 +455,25 @@ pub trait CopyCustody {
         &mut self,
         info: &SnapshotInfo<'_>,
         output: &mut [u8],
-        deadline: Instant,
+        budget: &CopyBudget<'_>,
     ) -> Result<usize, Refusal>;
 
     /// Flush both files and prove durable creation of their directory and
     /// objects. On failure they remain charged under the existing intent.
-    fn flush_staging(&mut self, deadline: Instant) -> Result<(), Refusal>;
+    fn flush_staging(&mut self, budget: &CopyBudget<'_>) -> Result<(), Refusal>;
 }
 
 struct CopyRun<'a> {
     plan: &'a CopyPlan,
     worker: &'a PendingOperation,
-    deadline: Instant,
-    cancelled: &'a dyn Fn() -> bool,
-    now: &'a dyn Fn() -> Instant,
+    budget: CopyBudget<'a>,
 }
 
 impl CopyRun<'_> {
-    fn current(&self) -> Result<(), Refusal> {
-        if (self.cancelled)() {
-            return Err(Refusal::Cancelled);
-        }
-        if (self.now)() >= self.deadline {
-            return Err(Refusal::Deadline);
-        }
-        Ok(())
-    }
-
     fn checkpoint(&self, custody: &mut dyn CopyCustody) -> Result<(), Refusal> {
-        self.current()?;
-        custody.checkpoint(self.plan, self.worker, self.deadline)?;
-        self.current()
+        self.budget.check()?;
+        custody.checkpoint(self.plan, self.worker, &self.budget)?;
+        self.budget.check()
     }
 
     fn check_objects(
@@ -465,7 +483,7 @@ impl CopyRun<'_> {
         expected: [Observation; 2],
     ) -> Result<(), Refusal> {
         self.checkpoint(custody)?;
-        let observed = custody.observe(side, self.deadline)?;
+        let observed = custody.observe(side, &self.budget)?;
         if observed.map(|file| file.identity) != expected.map(|file| file.identity) {
             return Err(Refusal::Identity);
         }
@@ -475,7 +493,7 @@ impl CopyRun<'_> {
         if observed[1].size != expected[1].size {
             return Err(Refusal::VarsPair);
         }
-        self.current()
+        self.budget.check()
     }
 
     fn digest(
@@ -492,15 +510,15 @@ impl CopyRun<'_> {
             self.checkpoint(custody)?;
             let take = (pin.size - offset).min(buffer.len() as u64) as usize;
             let bytes = &mut buffer[..take];
-            custody.read(phase.side(), file, offset, bytes, self.deadline)?;
+            custody.read(phase.side(), file, offset, bytes, &self.budget)?;
             hash.update(&*bytes);
             if phase == Stream::Copy {
                 self.checkpoint(custody)?;
-                custody.write_staging(file, offset, bytes, self.deadline)?;
+                custody.write_staging(file, offset, bytes, &self.budget)?;
             }
             offset += take as u64;
         }
-        self.current()?;
+        self.budget.check()?;
         if hash.finalize()[..] != pin.sha256 {
             return Err(match file {
                 FileRole::Disk => Refusal::Pin,
@@ -523,7 +541,7 @@ impl CopyRun<'_> {
         let backing = golden
             .map(|golden| {
                 self.checkpoint(custody)?;
-                custody.golden_header(golden, &mut backing_header, self.deadline)?;
+                custody.golden_header(golden, &mut backing_header, &self.budget)?;
                 artifact(
                     ArtifactRole::Golden,
                     &golden.path,
@@ -533,7 +551,7 @@ impl CopyRun<'_> {
             })
             .transpose()?;
         self.checkpoint(custody)?;
-        custody.read(side, FileRole::Disk, 0, header, self.deadline)?;
+        custody.read(side, FileRole::Disk, 0, header, &self.budget)?;
         let size = self.plan.source().compatibility.virtual_disk_bytes;
         let info = SnapshotInfo::checked(
             disk,
@@ -545,8 +563,8 @@ impl CopyRun<'_> {
         .map_err(|_| Refusal::Header)?;
         self.checkpoint(custody)?;
         let mut output = vec![0; MAX_INFO];
-        let len = custody.inspect(&info, &mut output, self.deadline)?;
-        self.current()?;
+        let len = custody.inspect(&info, &mut output, &self.budget)?;
+        self.budget.check()?;
         qemu_img::parse_info(
             output.get(..len).ok_or(Refusal::Inspection)?,
             info.path(),
@@ -652,9 +670,11 @@ fn copy_with_clock<'a>(
     let run = CopyRun {
         plan,
         worker,
-        deadline: snapshot_deadline(worker, now()),
-        cancelled,
-        now,
+        budget: CopyBudget {
+            deadline: snapshot_deadline(worker, now()),
+            cancelled,
+            now,
+        },
     };
     let source = plan.source();
     let active = &plan.intent.active;
@@ -704,7 +724,7 @@ fn copy_with_clock<'a>(
         run.digest(custody, Stream::Copy, file, pin, &mut buffer)?;
     }
     run.checkpoint(custody)?;
-    custody.flush_staging(run.deadline)?;
+    custody.flush_staging(&run.budget)?;
     for phase in [Stream::VerifySource, Stream::VerifyStaging] {
         for (file, pin) in leaves {
             run.digest(custody, phase, file, pin, &mut buffer)?;
@@ -1031,7 +1051,8 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Fault {
         None,
-        Cancel,
+        CancelCopy,
+        CancelVerify,
         Expire,
         Capacity,
         SourceIdentity,
@@ -1065,6 +1086,7 @@ mod tests {
         bytes_read: usize,
         bytes_written: usize,
         flushed: bool,
+        helper_cancelled_and_drained: bool,
     }
 
     const STAGING_FILES: [FileIdentity; 2] = [
@@ -1083,10 +1105,11 @@ mod tests {
             &mut self,
             plan: &CopyPlan,
             worker: &PendingOperation,
-            deadline: Instant,
+            budget: &CopyBudget<'_>,
         ) -> Result<(), Refusal> {
+            budget.check()?;
             assert!(std::ptr::eq(plan, self.plan));
-            assert!(deadline <= worker.deadline());
+            assert!(budget.deadline() <= worker.deadline());
             if !Arc::ptr_eq(&self.binding, &worker.binding) {
                 return Err(Refusal::Custody);
             }
@@ -1096,7 +1119,12 @@ mod tests {
             Ok(())
         }
 
-        fn observe(&mut self, side: Side, _: Instant) -> Result<[Observation; 2], Refusal> {
+        fn observe(
+            &mut self,
+            side: Side,
+            budget: &CopyBudget<'_>,
+        ) -> Result<[Observation; 2], Refusal> {
+            budget.check()?;
             let mut objects = match side {
                 Side::Active => observations(&self.plan.intent.active),
                 Side::Source => observations(self.plan.source()),
@@ -1126,8 +1154,9 @@ mod tests {
             file: FileRole,
             offset: u64,
             buffer: &mut [u8],
-            _: Instant,
+            budget: &CopyBudget<'_>,
         ) -> Result<(), Refusal> {
+            budget.check()?;
             assert!(buffer.len() <= CLUSTER);
             let i = usize::from(file == FileRole::Vars);
             let bytes = match side {
@@ -1147,17 +1176,21 @@ mod tests {
             file: FileRole,
             offset: u64,
             bytes: &[u8],
-            deadline: Instant,
+            budget: &CopyBudget<'_>,
         ) -> Result<(), Refusal> {
             assert!(bytes.len() <= CLUSTER);
             let leaf = &mut self.staging[usize::from(file == FileRole::Vars)];
             assert_eq!(leaf.len() as u64, offset);
-            leaf.extend_from_slice(bytes);
-            self.bytes_written += bytes.len();
-            match self.fault {
-                Fault::Cancel => self.cancelled.set(true),
-                Fault::Expire => self.now.set(deadline),
-                _ => {}
+            for chunk in bytes.chunks(CLUSTER / 2) {
+                budget.check()?;
+                leaf.extend_from_slice(chunk);
+                self.bytes_written += chunk.len();
+                if self.fault == Fault::CancelCopy {
+                    self.cancelled.set(true);
+                }
+            }
+            if self.fault == Fault::Expire {
+                self.now.set(budget.deadline());
             }
             Ok(())
         }
@@ -1166,8 +1199,9 @@ mod tests {
             &mut self,
             golden: &Golden,
             buffer: &mut [u8],
-            _: Instant,
+            budget: &CopyBudget<'_>,
         ) -> Result<(), Refusal> {
+            budget.check()?;
             let mut bytes = header(None);
             if self.fault == Fault::GoldenPin {
                 return Err(Refusal::Pin);
@@ -1185,8 +1219,9 @@ mod tests {
             &mut self,
             info: &SnapshotInfo<'_>,
             output: &mut [u8],
-            _: Instant,
+            budget: &CopyBudget<'_>,
         ) -> Result<usize, Refusal> {
+            budget.check()?;
             assert_eq!(output.len(), MAX_INFO);
             let path = info.path();
             assert_eq!(
@@ -1202,6 +1237,15 @@ mod tests {
                 .map(|a| a.path_for(ArtifactRole::Golden).unwrap());
             assert_eq!(golden, self.plan.golden().map(|g| &g.path));
             self.inspected.push((disk_role, golden.is_some()));
+            if !source && self.fault == Fault::CancelVerify {
+                // Signal shutdown after helper start. Its next wait poll sees
+                // the shared signal and the fixture records bounded drain.
+                self.cancelled.set(true);
+                if let Err(reason) = budget.check() {
+                    self.helper_cancelled_and_drained = true;
+                    return Err(reason);
+                }
+            }
             let mut value = json!({
                 "filename": path.as_str(),
                 "format": "qcow2",
@@ -1229,7 +1273,8 @@ mod tests {
             Ok(bytes.len())
         }
 
-        fn flush_staging(&mut self, _: Instant) -> Result<(), Refusal> {
+        fn flush_staging(&mut self, budget: &CopyBudget<'_>) -> Result<(), Refusal> {
+            budget.check()?;
             if self.fault == Fault::Flush {
                 return Err(Refusal::Io);
             }
@@ -1271,6 +1316,7 @@ mod tests {
             bytes_read: 0,
             bytes_written: 0,
             flushed: false,
+            helper_cancelled_and_drained: false,
         };
         if fault == Fault::SourcePin {
             *fake.source[0].last_mut().unwrap() ^= 1;
@@ -1321,6 +1367,8 @@ mod tests {
 
     #[test]
     fn refuses_each_custody_pin_header_pair_and_helper_mismatch() {
+        let (request, disk) = intent(false, false);
+        let plan = build(request, limits()).unwrap_or_else(|e| panic!("{e:?}"));
         for (fault, expected, writes) in [
             (Fault::SourceIdentity, Refusal::Identity, false),
             (Fault::LateSourceIdentity, Refusal::Identity, true),
@@ -1338,12 +1386,10 @@ mod tests {
             (Fault::HelperRelease, Refusal::Custody, true),
             (Fault::Flush, Refusal::Io, true),
         ] {
-            let (request, disk) = intent(false, false);
-            let plan = build(request, limits()).unwrap_or_else(|e| panic!("{e:?}"));
             let now = Cell::new(Instant::now());
             let cancelled = Cell::new(false);
             let worker = worker(now.get(), Duration::from_secs(20));
-            let mut fake = fake(&plan, &worker, disk, fault, &now, &cancelled);
+            let mut fake = fake(&plan, &worker, disk.clone(), fault, &now, &cancelled);
             let result = copy_pair(&plan, &worker, &mut fake, STAGING_FILES, &|| false);
             assert_eq!(result.err(), Some(expected));
             assert_eq!(fake.bytes_written > 0, writes);
@@ -1373,7 +1419,6 @@ mod tests {
     #[test]
     fn interrupted_worker_leaves_partial_staging_and_cannot_seal() {
         for (fault, expected) in [
-            (Fault::Cancel, Refusal::Cancelled),
             (Fault::Expire, Refusal::Deadline),
             (Fault::Capacity, Refusal::Disk),
         ] {
@@ -1403,6 +1448,39 @@ mod tests {
             assert_eq!(fake.bytes_written, CLUSTER);
             assert!(fake.staging[1].is_empty());
             assert!(!fake.flushed);
+        }
+    }
+
+    #[test]
+    fn cancellation_inside_custody_preserves_staging_and_claim() {
+        let (request, disk) = intent(true, false);
+        let limits = limits();
+        let charged =
+            disk.len() as u64 + VARS.len() as u64 + limits.staging_bytes + limits.metadata_bytes;
+        let plan = build(request, limits).unwrap_or_else(|e| panic!("{e:?}"));
+        let now = Cell::new(Instant::now());
+        for fault in [Fault::CancelCopy, Fault::CancelVerify] {
+            let cancelled = Cell::new(false);
+            let worker = worker(now.get(), Duration::from_secs(20));
+            let mut fake = fake(&plan, &worker, disk.clone(), fault, &now, &cancelled);
+            assert_eq!(
+                copy_pair(&plan, &worker, &mut fake, STAGING_FILES, &|| cancelled
+                    .get())
+                .err(),
+                Some(Refusal::Cancelled)
+            );
+            if fault == Fault::CancelCopy {
+                assert_eq!(fake.staging[0], disk[..CLUSTER / 2]);
+                assert!(fake.staging[1].is_empty());
+                assert!(!fake.flushed);
+                assert_eq!(fake.inspected.len(), 1);
+            } else {
+                assert_eq!(fake.staging, [disk.clone(), VARS.to_vec()]);
+                assert!(fake.flushed);
+                assert_eq!(fake.inspected.len(), 2);
+                assert!(fake.helper_cancelled_and_drained);
+            }
+            assert_eq!(plan.additional_claim().total(), Some(charged));
         }
     }
 
