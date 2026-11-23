@@ -76,7 +76,7 @@ test('early-created nine-job gates are invalid and retain the original 900-secon
 });
 
 test('historical split timings retain exact-nine geometry when simulated with the pinned label', () => {
-  const data = structuredClone(historicalSplitFirstAttempt);
+  const data = globalThis.structuredClone(historicalSplitFirstAttempt);
   data.jobs.jobs.find(job => job.name === 'rust (ubuntu-latest)').labels = [RUST_UBUNTU_RUNNER];
   const result = measure(data, data.run, 'candidate', 1453422996);
   assert.deepEqual([result.seconds, result.queueCreditSeconds, result.chargedSeconds, result.longestJobSeconds, result.credit],
@@ -96,7 +96,7 @@ test('main run 45267529407 receives idle queue credit for its pinned Rust Ubuntu
 });
 
 test('the Rust Ubuntu job rejects the unpinned ubuntu-latest label', () => {
-  const data = structuredClone(pinnedRustFirstAttempt);
+  const data = globalThis.structuredClone(pinnedRustFirstAttempt);
   data.jobs.jobs.find(job => job.name === 'rust (ubuntu-latest)').labels = ['ubuntu-latest'];
   assertSplitInvalid(data, 'unpinned Rust Ubuntu runner');
 });
