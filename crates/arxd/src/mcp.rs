@@ -153,7 +153,7 @@ impl ServerHandler for Inventory {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult {
+        let mut result = ListToolsResult {
             tools: vec![
                 Tool::new(
                     "list_hosts",
@@ -189,7 +189,12 @@ impl ServerHandler for Inventory {
                 Tool::new("discover_tools", "Probe fixed tool names using the configured executor", Arc::new(json!({"type":"object","properties":{},"additionalProperties":false}).as_object().unwrap().clone())),
             ],
             ..Default::default()
-        })
+        };
+        if self.principal.is_some() && crate::vault::for_activity(&self.activity).is_some() {
+            crate::vault::mcp::extend_activity_schema(&mut result.tools[1]);
+            result.tools.extend(crate::vault::mcp::tools());
+        }
+        Ok(result)
     }
     async fn call_tool(
         &self,
@@ -232,6 +237,18 @@ impl ServerHandler for Inventory {
             })?),
             None => None,
         };
+        if self.principal.is_some()
+            && let Some(vault) = crate::vault::for_activity(&self.activity)
+            && crate::vault::mcp::handles(request.name.as_ref(), request.arguments.as_ref())
+        {
+            return Ok(crate::vault::mcp::call(
+                &vault,
+                &principal.0,
+                request.name.as_ref(),
+                request.arguments.unwrap_or_default(),
+            )
+            .into());
+        }
         let observation = if label == "discover_tools"
             && (self.activity.dedicated.is_some() || self.execution.is_some())
         {
