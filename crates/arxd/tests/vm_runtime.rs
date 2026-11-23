@@ -1264,3 +1264,66 @@ fn installer_boots_are_refused_before_any_native_launch() {
     assert_eq!(plan.kind(), PlanKind::Boot);
     assert!(plan.native_admission().is_ok_and(|lease| lease.is_none()));
 }
+
+#[tokio::test(start_paused = true)]
+async fn command_rejects_a_duplicate_late_ack() {
+    let (qmp, events, serial, mut guest) = started_vm().await;
+    let task = readiness(qmp, serial, Shutdown::default());
+    events.send(port(true)).unwrap();
+    let stale = guest_hello(&mut guest).await;
+    events.send(port(false)).unwrap();
+    events.send(port(true)).unwrap();
+    let fresh = guest_hello(&mut guest).await;
+    guest_ack(&mut guest, &fresh).await;
+    let (result, _qmp) = task.await.unwrap();
+    let mut channel = result.unwrap();
+
+    let peer = tokio::spawn(async move {
+        let Request::Ping { .. } = guest_request(&mut guest).await else {
+            panic!("expected ping")
+        };
+        let mut duplicate = ack_frame(&stale);
+        duplicate.extend(ack_frame(&stale));
+        guest.write_all(&duplicate).await.unwrap();
+        guest
+    });
+    assert_eq!(
+        channel.ping(&Shutdown::default()).await,
+        Err(ChannelError::Unexpected)
+    );
+    drop(peer.await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_script_rejects_a_mismatched_response_id() {
+    let (qmp, events, serial, mut guest) = started_vm().await;
+    let task = readiness(qmp, serial, Shutdown::default());
+    events.send(port(true)).unwrap();
+    let challenge = guest_hello(&mut guest).await;
+    guest_ack(&mut guest, &challenge).await;
+    let (result, _qmp) = task.await.unwrap();
+    let mut channel = result.unwrap();
+
+    let peer = tokio::spawn(async move {
+        let Request::RunScript { id, .. } = guest_request(&mut guest).await else {
+            panic!("expected script request")
+        };
+        guest_reply(
+            &mut guest,
+            Response::ScriptResult {
+                id: id + 1,
+                status: arx_guest::ScriptStatus::Exited,
+                exit_code: Some(0),
+            },
+        )
+        .await;
+        guest
+    });
+    assert_eq!(
+        channel
+            .run_script(&Shutdown::default(), "exit 0".into(), 1)
+            .await,
+        Err(ChannelError::Unexpected)
+    );
+    drop(peer.await.unwrap());
+}
