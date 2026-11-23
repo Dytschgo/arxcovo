@@ -1,0 +1,1080 @@
+//! Offline Windows 11 TEST recipe. Qualification inputs come from private
+//! owner configuration and inspection of already-held media. Native issuance
+//! and the durable lifecycle are outside this module.
+
+use super::{
+    AssetPin, RecipeError,
+    media::{Image, MAX_GUEST},
+};
+use sha2::{Digest, Sha256};
+use std::{
+    fmt::Write as _,
+    io::{Read, Write},
+    time::Duration,
+};
+
+pub(super) const ID: &str = "windows11-x64-test-v1";
+const MARKER: &[u8] = b"arxcovo-windows-test-seed-v1\n";
+const UNATTEND: &str = "urn:schemas-microsoft-com:unattend";
+const WCM: &str = "http://schemas.microsoft.com/WMIConfig/2002/State";
+const TOPOLOGY: &[u8] = b"q35/WHPX;uefi;virtio-blk-pci;virtio-serial:org.arxcovo.agent.0;\
+    virtio-net-pci:user,restrict=on,ipv6=off;os:builtin-ahci;seed+drivers:separate-fixed-ahci-ports";
+
+// Each directory contains one selected w11/amd64 package, not a whole tree.
+pub(super) const DRIVERS: [(&str, [&str; 3]); 3] = [
+    (
+        r"viostor\w11\amd64",
+        ["viostor.inf", "viostor.cat", "viostor.sys"],
+    ),
+    (
+        r"vioserial\w11\amd64",
+        ["vioser.inf", "vioser.cat", "vioser.sys"],
+    ),
+    (
+        r"NetKVM\w11\amd64",
+        ["netkvm.inf", "netkvm.cat", "netkvm.sys"],
+    ),
+];
+
+const MAX_ISO: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_DRIVERS: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_DRIVER_FILE: u64 = 32 * 1024 * 1024;
+const MAX_RECEIPT: u64 = 256 * 1024;
+const MAX_FIRMWARE: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum InstallImage {
+    Wim,
+    Esd,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Edition<'a> {
+    pub index: u32,
+    pub name: &'a str,
+    pub edition_id: &'a str,
+    pub build: &'a str,
+    pub language: &'a str,
+    pub architecture: &'a str,
+    pub container: InstallImage,
+}
+
+pub(super) struct WindowsPins<'a> {
+    pub iso: AssetPin,
+    pub edition: Edition<'a>,
+    pub driver_medium: AssetPin,
+    // INF, CAT, SYS in DRIVERS order. The owner receipt binds release,
+    // versions, catalog trust, hardware IDs and the vioserial port ABI.
+    pub driver_files: [[AssetPin; 3]; 3],
+    pub driver_receipt: AssetPin,
+    pub winpe_driver_letter: u8,
+    pub guest: AssetPin,
+    pub provisioner: AssetPin,
+    pub firmware_code: AssetPin,
+    pub firmware_vars: AssetPin,
+    pub qemu_receipt: AssetPin,
+}
+
+pub(super) struct WindowsAssets<'a> {
+    pub iso: &'a mut dyn Read,
+    pub edition: Edition<'a>,
+    pub driver_medium: &'a mut dyn Read,
+    // The caller extracts these exact, unique paths from the held medium.
+    pub driver_files: [[&'a mut dyn Read; 3]; 3],
+    pub driver_receipt: &'a [u8],
+    pub firmware_code: &'a mut dyn Read,
+    pub firmware_vars: &'a mut dyn Read,
+    pub qemu_receipt: &'a [u8],
+}
+
+#[derive(Default)]
+pub(super) struct WindowsRecipe<'a> {
+    // There are no built-in owner ISO, edition or driver pins.
+    pub pins: Option<WindowsPins<'a>>,
+}
+
+impl WindowsRecipe<'_> {
+    /// Validate every asset before writing. The digest binds the versioned
+    /// recipe and verified metadata, and is returned only after a full write.
+    pub(super) fn write_test_seed(
+        &self,
+        assets: WindowsAssets<'_>,
+        guest: &[u8],
+        out: impl Write,
+    ) -> Result<[u8; 32], RecipeError> {
+        let pins = self.pins.as_ref().ok_or(RecipeError::Unqualified)?;
+        if !valid_edition(pins.edition)
+            || pins.edition != assets.edition
+            || !matches!(pins.winpe_driver_letter, b'D'..=b'W' | b'Y'..=b'Z')
+        {
+            return Err(RecipeError::Unqualified);
+        }
+        verify(pins.guest, MAX_GUEST as u64, guest)?;
+        verify(pins.provisioner, 32 * 1024, PROVISIONER.as_bytes())?;
+        verify(pins.driver_receipt, MAX_RECEIPT, assets.driver_receipt)?;
+        verify(pins.qemu_receipt, MAX_RECEIPT, assets.qemu_receipt)?;
+        for (pins, files) in pins.driver_files.into_iter().zip(assets.driver_files) {
+            for (pin, file) in pins.into_iter().zip(files) {
+                verify(pin, MAX_DRIVER_FILE, file)?;
+            }
+        }
+        for (pin, limit, asset) in [
+            (pins.firmware_code, MAX_FIRMWARE, assets.firmware_code),
+            (pins.firmware_vars, MAX_FIRMWARE, assets.firmware_vars),
+            (pins.driver_medium, MAX_DRIVERS, assets.driver_medium),
+            (pins.iso, MAX_ISO, assets.iso),
+        ] {
+            verify(pin, limit, asset)?;
+        }
+        let (xml, manifest) = seed_files(pins)?;
+        let image = Image::windows([
+            guest,
+            manifest.as_bytes(),
+            MARKER,
+            PROVISIONER.as_bytes(),
+            xml.as_bytes(),
+        ])
+        .ok_or(RecipeError::MediaLimit)?;
+        image
+            .write(out)
+            .map_err(|err| RecipeError::Write(err.kind()))?;
+        Ok(recipe_digest(pins, &xml))
+    }
+}
+
+fn valid_edition(edition: Edition<'_>) -> bool {
+    edition.index != 0
+        && edition.architecture == "amd64"
+        && edition.language == "en-US"
+        && [edition.name, edition.edition_id, edition.build]
+            .into_iter()
+            .all(|value| !value.is_empty() && value.len() <= 128 && value.chars().all(xml_char))
+        && edition
+            .build
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn verify(pin: AssetPin, max: u64, input: impl Read) -> Result<(), RecipeError> {
+    if !(1..=max).contains(&pin.length) {
+        return Err(RecipeError::Unqualified);
+    }
+    let mut digest = Sha256::new();
+    // Sha256 implements Write. The extra byte detects surplus without
+    // draining an oversized stream. io::copy handles interrupted reads.
+    let count = std::io::copy(&mut input.take(pin.length + 1), &mut digest)
+        .map_err(|_| RecipeError::Unqualified)?;
+    if count != pin.length || digest.finalize()[..] != pin.sha256 {
+        return Err(RecipeError::Unqualified);
+    }
+    Ok(())
+}
+
+fn recipe_digest(pins: &WindowsPins<'_>, xml: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for text in [
+        ID.as_bytes(),
+        TOPOLOGY,
+        MARKER,
+        xml.as_bytes(),
+        pins.edition.name.as_bytes(),
+        pins.edition.edition_id.as_bytes(),
+        pins.edition.build.as_bytes(),
+        pins.edition.language.as_bytes(),
+        pins.edition.architecture.as_bytes(),
+    ] {
+        digest.update((text.len() as u64).to_le_bytes());
+        digest.update(text);
+    }
+    digest.update(match pins.edition.container {
+        InstallImage::Wim => [0],
+        InstallImage::Esd => [1],
+    });
+    digest.update(arx_guest::protocol::PROTOCOL_VERSION.to_le_bytes());
+    for pin in [
+        pins.iso,
+        pins.driver_medium,
+        pins.driver_receipt,
+        pins.guest,
+        pins.provisioner,
+        pins.firmware_code,
+        pins.firmware_vars,
+        pins.qemu_receipt,
+    ]
+    .into_iter()
+    .chain(pins.driver_files.into_iter().flatten())
+    {
+        digest.update(pin.length.to_le_bytes());
+        digest.update(pin.sha256);
+    }
+    digest.finalize().into()
+}
+
+fn xml_char(ch: char) -> bool {
+    matches!(ch, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+}
+
+// Markup, names and namespace prefixes are fixed recipe literals. Only
+// values pass through these two writer entry points.
+fn escape_xml(out: &mut String, value: &str, attribute: bool) -> Result<(), RecipeError> {
+    for ch in value.chars() {
+        let escaped = match ch {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' if attribute => "&quot;",
+            '\'' if attribute => "&apos;",
+            '\r' => "&#13;",
+            '\n' if attribute => "&#10;",
+            '\t' if attribute => "&#9;",
+            ch if xml_char(ch) => {
+                out.push(ch);
+                continue;
+            }
+            _ => return Err(RecipeError::Unqualified),
+        };
+        out.push_str(escaped);
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Xml(String);
+
+impl Xml {
+    fn attr(&mut self, key: &str, value: &str) -> Result<(), RecipeError> {
+        write!(self.0, " {key}=\"").unwrap();
+        escape_xml(&mut self.0, value, true)?;
+        self.0.push('"');
+        Ok(())
+    }
+
+    fn value(&mut self, key: &str, value: &str) -> Result<(), RecipeError> {
+        write!(self.0, "<{key}>").unwrap();
+        escape_xml(&mut self.0, value, false)?;
+        write!(self.0, "</{key}>").unwrap();
+        Ok(())
+    }
+
+    fn component(&mut self, name: &str) -> Result<(), RecipeError> {
+        self.0.push_str("<component");
+        self.attr("name", name)?;
+        self.0.push_str(r#" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">"#);
+        Ok(())
+    }
+
+    fn command(
+        &mut self,
+        order: usize,
+        command: &str,
+        specialize: bool,
+    ) -> Result<(), RecipeError> {
+        if specialize && command.len() > 259 {
+            return Err(RecipeError::MediaLimit);
+        }
+        self.0
+            .push_str(r#"<RunSynchronousCommand wcm:action="add">"#);
+        self.value("Order", &order.to_string())?;
+        self.value("Path", command)?;
+        if specialize {
+            self.0.push_str("<WillReboot>Never</WillReboot>");
+        }
+        self.0.push_str("</RunSynchronousCommand>");
+        Ok(())
+    }
+}
+
+fn seed_files(pins: &WindowsPins<'_>) -> Result<(String, String), RecipeError> {
+    let script_hash = hex::encode_upper(pins.provisioner.sha256);
+    let manifest = format!(
+        "arx-windows-seed-v1\n{}\n{}\n{script_hash}\n",
+        pins.guest.length,
+        hex::encode_upper(pins.guest.sha256),
+    );
+    let manifest_hash = hex::encode_upper(Sha256::digest(&manifest));
+    let mut xml = Xml::default();
+    xml.0
+        .push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<unattend");
+    xml.attr("xmlns", UNATTEND)?;
+    xml.attr("xmlns:wcm", WCM)?;
+    xml.0.push_str(r#"><settings pass="windowsPE">"#);
+    xml.component("Microsoft-Windows-International-Core-WinPE")?;
+    xml.0
+        .push_str("<SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>");
+    xml.0.push_str(LOCALE);
+    xml.0.push_str("</component>");
+    xml.component("Microsoft-Windows-PnpCustomizationsWinPE")?;
+    xml.0.push_str("<DriverPaths>");
+    let letter = char::from(pins.winpe_driver_letter);
+    for (index, (dir, _)) in DRIVERS.iter().enumerate() {
+        xml.0.push_str(r#"<PathAndCredentials wcm:action="add""#);
+        xml.attr("wcm:keyValue", &(index + 1).to_string())?;
+        xml.0.push('>');
+        xml.value("Path", &format!(r"{letter}:\{dir}"))?;
+        xml.0.push_str("</PathAndCredentials>");
+    }
+    xml.0.push_str("</DriverPaths></component>");
+    xml.component("Microsoft-Windows-Setup")?;
+    xml.0.push_str(DISK_LAYOUT);
+    xml.0.push_str(
+        "<ImageInstall><OSImage><InstallFrom><MetaData wcm:action=\"add\"><Key>/IMAGE/INDEX</Key>",
+    );
+    xml.value("Value", &pins.edition.index.to_string())?;
+    xml.0.push_str("</MetaData></InstallFrom><InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo><WillShowUI>Never</WillShowUI></OSImage></ImageInstall>");
+    xml.0.push_str("<UserData><AcceptEula>true</AcceptEula></UserData><DynamicUpdate><Enable>false</Enable><WillShowUI>Never</WillShowUI></DynamicUpdate><RunSynchronous>");
+    let mut guard = String::from(r"cmd.exe /d /c ");
+    for (dir, names) in DRIVERS {
+        for name in names {
+            write!(guard, r"if not exist {letter}:\{dir}\{name} exit /b 1 & ").unwrap();
+        }
+    }
+    guard.push_str("exit /b 0");
+    xml.command(1, &guard, false)?;
+    for (order, bypass) in ["BypassTPMCheck", "BypassSecureBootCheck"]
+        .into_iter()
+        .enumerate()
+    {
+        xml.command(
+            order + 2,
+            &format!(r"reg.exe add HKLM\SYSTEM\Setup\LabConfig /v {bypass} /t REG_DWORD /d 1 /f"),
+            false,
+        )?;
+    }
+    xml.0
+        .push_str(r#"</RunSynchronous></component></settings><settings pass="specialize">"#);
+    xml.component("Microsoft-Windows-Deployment")?;
+    xml.0.push_str("<RunSynchronous>");
+    for (order, body) in [
+        String::from(r"$d=@([IO.DriveInfo]::GetDrives()|?{$_.DriveType -eq 5 -and (Test-Path ($_.Name+'arxseed.id'))});if($d.Count-ne 1){exit 1};[IO.File]::WriteAllText($PSHOME+'\..\..\arxseed.loc',$d[0].Name)"),
+        format!(r"$p=[IO.File]::ReadAllText($PSHOME+'\..\..\arxseed.loc')+'arxsetup.ps1';if((gi $p).Length-ne {}){{exit 1}};cp $p ($PSHOME+'\..\..\arxsetup.ps1')", pins.provisioner.length),
+        format!(r"[IO.File]::WriteAllText($PSHOME+'\..\..\arxseed.pin','{manifest_hash}')"),
+        format!(r"$p=$PSHOME+'\..\..\arxsetup.ps1';if((Get-FileHash $p).Hash-ne '{script_hash}'){{exit 1}};& $p install"),
+    ].into_iter().enumerate() {
+        xml.command(order + 1, &format!(r#"powershell.exe -nop -noni -ep Bypass -c "$ErrorActionPreference='Stop';{body}""#), true)?;
+    }
+    xml.0
+        .push_str(r#"</RunSynchronous></component></settings><settings pass="oobeSystem">"#);
+    xml.component("Microsoft-Windows-International-Core")?;
+    xml.0.push_str(LOCALE);
+    xml.0.push_str("</component>");
+    xml.component("Microsoft-Windows-Shell-Setup")?;
+    xml.0.push_str(OOBE);
+    xml.0.push_str("</component></settings></unattend>\n");
+    Ok((xml.0, manifest))
+}
+
+const LOCALE: &str = "<InputLocale>en-US</InputLocale><SystemLocale>en-US</SystemLocale>\
+    <UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale>";
+
+const DISK_LAYOUT: &str = r#"<DiskConfiguration>
+<Disk wcm:action="add"><DiskID>0</DiskID><WillWipeDisk>true</WillWipeDisk>
+<CreatePartitions>
+<CreatePartition wcm:action="add"><Order>1</Order><Type>EFI</Type><Size>260</Size></CreatePartition>
+<CreatePartition wcm:action="add"><Order>2</Order><Type>MSR</Type><Size>16</Size></CreatePartition>
+<CreatePartition wcm:action="add"><Order>3</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition>
+</CreatePartitions><ModifyPartitions>
+<ModifyPartition wcm:action="add"><Order>1</Order><PartitionID>1</PartitionID><Format>FAT32</Format></ModifyPartition>
+<ModifyPartition wcm:action="add"><Order>2</Order><PartitionID>3</PartitionID><Format>NTFS</Format></ModifyPartition>
+</ModifyPartitions></Disk><WillShowUI>Never</WillShowUI>
+</DiskConfiguration>"#;
+
+const OOBE: &str = r#"<OOBE><HideEULAPage>true</HideEULAPage><HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+<HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE><ProtectYourPC>3</ProtectYourPC></OOBE>
+<UserAccounts><LocalAccounts><LocalAccount wcm:action="add"><Name>ArxBootstrap</Name><Group>Users</Group>
+</LocalAccount></LocalAccounts></UserAccounts>"#;
+
+pub(super) const PROVISIONER: &str = r###"param([Parameter(Mandatory=$true)][ValidateSet('install','finish')][string]$Phase)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$system = Join-Path $env:SystemRoot 'System32'
+$root = Join-Path $env:ProgramFiles 'Arxcovo'
+$guest = Join-Path $root 'arx-guest.exe'
+$work = Join-Path $root 'work'
+$state = Join-Path $root 'setup.phase'
+$script = Join-Path $system 'arxsetup.ps1'
+$location = Join-Path $system 'arxseed.loc'
+$manifestPin = Join-Path $system 'arxseed.pin'
+$task = 'ArxcovoTemplateFinalize'
+$bootstrap = 'ArxBootstrap'
+$setupKey = 'HKLM:\SYSTEM\Setup'
+$sc = Join-Path $system 'sc.exe'
+$shell = Join-Path $system 'WindowsPowerShell\v1.0\powershell.exe'
+
+function Invoke-FixedTool($Program, [string[]]$Arguments) {
+    & $Program @Arguments *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'tool' }
+}
+
+function Assert-PlainPath([string]$Path) {
+    $current = $Path
+    while ($current) {
+        $entry = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($entry -and ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'reparse'
+        }
+        $current = [IO.Path]::GetDirectoryName($current)
+    }
+}
+
+function Set-DirectorySecurity([string]$Path, [string]$Descriptor) {
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetSecurityDescriptorSddlForm($Descriptor)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Set-PortSecurity([string]$ServiceSid) {
+    # The same interface class as arx-guest serve-service. Only the one
+    # present interface in the fixed topology can receive this descriptor.
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class ArxPortSecurity {
+    [StructLayout(LayoutKind.Sequential)]
+    struct Interface {
+        public int Size;
+        public Guid Class;
+        public int Flags;
+        public IntPtr Reserved;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct Device {
+        public int Size;
+        public Guid Class;
+        public int Instance;
+        public IntPtr Reserved;
+    }
+    [DllImport("setupapi.dll", ExactSpelling=true, SetLastError=true)]
+    static extern IntPtr SetupDiGetClassDevsW(ref Guid type, IntPtr name, IntPtr window, int flags);
+    [DllImport("setupapi.dll", ExactSpelling=true, SetLastError=true)]
+    static extern bool SetupDiEnumDeviceInterfaces(IntPtr set, IntPtr device, ref Guid type, int index, ref Interface entry);
+    [DllImport("setupapi.dll", ExactSpelling=true, SetLastError=true)]
+    static extern bool SetupDiGetDeviceInterfaceDetailW(IntPtr set, ref Interface entry, IntPtr detail, int size, out int needed, ref Device device);
+    [DllImport("setupapi.dll", ExactSpelling=true, SetLastError=true)]
+    static extern bool SetupDiSetDeviceRegistryPropertyW(IntPtr set, ref Device device, int property, byte[] value, int size);
+    [DllImport("setupapi.dll", ExactSpelling=true, SetLastError=true)]
+    static extern bool SetupDiGetDeviceRegistryPropertyW(IntPtr set, ref Device device, int property, out int type, byte[] value, int size, out int needed);
+    [DllImport("setupapi.dll", ExactSpelling=true)]
+    static extern bool SetupDiDestroyDeviceInfoList(IntPtr set);
+
+    public static bool Apply(string sddl) {
+        var type = new Guid("6fde7521-1b65-48ae-b628-80be62016026");
+        var set = SetupDiGetClassDevsW(ref type, IntPtr.Zero, IntPtr.Zero, 0x12); // present interfaces
+        if (set == new IntPtr(-1)) return false;
+        try {
+            var first = new Interface { Size = Marshal.SizeOf(typeof(Interface)) };
+            var second = first;
+            if (!SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref type, 0, ref first)) return false;
+            if (SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref type, 1, ref second)
+                || Marshal.GetLastWin32Error() != 259) return false; // ERROR_NO_MORE_ITEMS
+            var device = new Device { Size = Marshal.SizeOf(typeof(Device)) };
+            int needed;
+            var detail = Marshal.AllocHGlobal(4096);
+            try {
+                Marshal.WriteInt32(detail, 8); // SP_DEVICE_INTERFACE_DETAIL_DATA_W, x64
+                if (!SetupDiGetDeviceInterfaceDetailW(set, ref first, detail, 4096, out needed, ref device))
+                    return false;
+            } finally { Marshal.FreeHGlobal(detail); }
+            const int securitySds = 0x18;
+            var bytes = Encoding.Unicode.GetBytes(sddl + "\0");
+            if (!SetupDiSetDeviceRegistryPropertyW(set, ref device, securitySds, bytes, bytes.Length))
+                return false;
+            var actual = new byte[1024];
+            int kind;
+            return SetupDiGetDeviceRegistryPropertyW(set, ref device, securitySds, out kind, actual, actual.Length, out needed)
+                && kind == 1 && needed >= 2 && needed <= actual.Length
+                && Encoding.Unicode.GetString(actual, 0, needed).TrimEnd('\0') == sddl;
+        } finally { SetupDiDestroyDeviceInfoList(set); }
+    }
+}
+'@
+    if (-not [ArxPortSecurity]::Apply("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;$ServiceSid)")) {
+        throw 'port'
+    }
+}
+
+function Install-ServiceFromSeed {
+    $source = [IO.File]::ReadAllText($location)
+    if ($source -cnotmatch '^[D-Z]:\\$' -or [IO.DriveInfo]::new($source).DriveType -ne 'CDRom') {
+        throw 'seed'
+    }
+    $marker = Join-Path $source 'arxseed.id'
+    $manifest = Join-Path $source 'arxpins.txt'
+    $binary = Join-Path $source 'arxguest.exe'
+    if ((Get-Item -LiteralPath $marker).Length -ne 29 -or
+        [IO.File]::ReadAllText($marker) -cne ("arxcovo-windows-test-seed-v1" + [char]10) -or
+        (Get-Item -LiteralPath $manifest).Length -notin (1..1024) -or
+        (Get-FileHash -LiteralPath $manifest).Hash -cne [IO.File]::ReadAllText($manifestPin)) {
+        throw 'seed'
+    }
+    $pins = [IO.File]::ReadAllLines($manifest)
+    if ($pins.Count -ne 4 -or $pins[0] -cne 'arx-windows-seed-v1' -or
+        $pins[1] -cnotmatch '^[1-9][0-9]{0,7}$' -or [long]$pins[1] -gt 32MB -or
+        (Get-Item -LiteralPath $binary).Length -ne [long]$pins[1] -or
+        $pins[2] -cnotmatch '^[A-F0-9]{64}$' -or
+        (Get-FileHash -LiteralPath $binary).Hash -cne $pins[2] -or
+        (Get-FileHash -LiteralPath $script).Hash -cne $pins[3]) {
+        throw 'pins'
+    }
+    Assert-PlainPath $root
+    New-Item -Path $root -ItemType Directory | Out-Null
+    Set-DirectorySecurity $root 'O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;LS)'
+    Copy-Item -LiteralPath $binary -Destination $guest
+    if ((Get-FileHash -LiteralPath $guest).Hash -cne $pins[2]) { throw 'copy' }
+    # sc.exe receives the escaped inner quotes as part of the SCM image path.
+    $image = '\"' + $guest + '\" serve-service'
+    Invoke-FixedTool $sc @('create','arx-guest','binPath=',$image,'type=','own','start=','demand',
+        'obj=','NT AUTHORITY\LocalService')
+    Invoke-FixedTool $sc @('sdset','arx-guest','O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;CCRC;;;LS)')
+    Invoke-FixedTool $sc @('sidtype','arx-guest','unrestricted')
+    Invoke-FixedTool $sc @('privs','arx-guest','SeChangeNotifyPrivilege/SeIncreaseQuotaPrivilege')
+    $sid = ([Security.Principal.NTAccount]::new('NT SERVICE','arx-guest')).Translate(
+        [Security.Principal.SecurityIdentifier]).Value
+    if ($sid -cnotmatch '^S-1-5-80(-[0-9]+){5}$') { throw 'service' }
+    New-Item -Path $work -ItemType Directory | Out-Null
+    Set-DirectorySecurity $work "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;FRFX;;;LS)(A;;0x44;;;$sid)"
+    Invoke-FixedTool (Join-Path $system 'icacls.exe') @($work,'/setintegritylevel','L')
+
+    Remove-Item -LiteralPath $location,$manifestPin -Force
+    $action = New-ScheduledTaskAction -Execute $shell -Argument (
+        '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $script + '" finish')
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 55) -MultipleInstances IgnoreNew
+    $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    Register-ScheduledTask -TaskName $task -Action $action -Settings $settings -Trigger $trigger -Principal $principal | Out-Null
+    Start-ScheduledTask -TaskName $task
+}
+
+function Clear-Bootstrap {
+    $account = Get-LocalUser -Name $bootstrap
+    Disable-LocalUser -InputObject $account
+    $profile = @(Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$($account.SID.Value)'")
+    if ($profile.Count -gt 1 -or ($profile.Count -eq 1 -and ($profile[0].Loaded -or $profile[0].Special))) {
+        throw 'profile'
+    }
+    foreach ($entry in $profile) {
+        Assert-PlainPath $entry.LocalPath
+        $entry | Remove-CimInstance
+        if (Test-Path -LiteralPath $entry.LocalPath) { throw 'profile' }
+    }
+    Remove-LocalUser -InputObject $account
+    if (Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$($account.SID.Value)'") {
+        throw 'profile'
+    }
+    Assert-NoBootstrap
+}
+
+function Assert-NoBootstrap {
+    if (Get-LocalUser -Name $bootstrap,'defaultuser0' -ErrorAction SilentlyContinue) { throw 'account' }
+    if (Test-Path -LiteralPath (Join-Path $env:SystemDrive "Users\$bootstrap")) { throw 'profile' }
+}
+
+function Clear-SetupCaches {
+    $panther = Join-Path $env:SystemRoot 'Panther'
+    $sysprep = Join-Path $system 'Sysprep'
+    $disk = $env:SystemDrive + '\'
+    $stageRoot = Join-Path $disk '$WINDOWS.~BT\Sources'
+    $staging = Join-Path $stageRoot 'Panther'
+    $directories = @($disk,$panther,(Join-Path $panther 'Unattend'),$sysprep,$stageRoot,$staging)
+    $answerFiles = @(
+        foreach ($dir in $directories) {
+            foreach ($name in 'unattend.xml','autounattend.xml') { Join-Path $dir $name }
+        }
+    )
+    $override = Get-ItemPropertyValue -LiteralPath $setupKey -Name UnattendFile -ErrorAction SilentlyContinue
+    if ($override) {
+        if ($override -notin $answerFiles) { throw 'override' }
+        Remove-ItemProperty -LiteralPath $setupKey -Name UnattendFile
+    }
+    foreach ($file in $answerFiles) {
+        Assert-PlainPath $file
+        if (Test-Path -LiteralPath $file) {
+            $entry = Get-Item -LiteralPath $file -Force
+            if ($entry.PSIsContainer -or $entry.Length -gt 256KB) { throw 'cache' }
+            # A known answer-file location can contain a foreign file.
+            if (-not ([IO.File]::ReadAllText($file).Contains('ArxBootstrap'))) { throw 'cache' }
+            Remove-Item -LiteralPath $file -Force
+            if (Test-Path -LiteralPath $file) { throw 'cache' }
+        }
+    }
+    if (Get-ItemPropertyValue -LiteralPath $setupKey -Name UnattendFile -ErrorAction SilentlyContinue) {
+        throw 'override'
+    }
+    $left = 4096
+    $pending = [Collections.Generic.Stack[string]]::new()
+    foreach ($dir in $panther,$sysprep,$staging) {
+        Assert-PlainPath $dir
+        if ([IO.Directory]::Exists($dir)) { $pending.Push($dir) }
+    }
+    while ($pending.Count) {
+        foreach ($item in [IO.Directory]::EnumerateFileSystemEntries($pending.Pop())) {
+            $left--
+            if ($left -lt 0) { throw 'inventory' }
+            $attributes = [IO.File]::GetAttributes($item)
+            if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'inventory' }
+            if ($attributes -band [IO.FileAttributes]::Directory) { $pending.Push($item) }
+            if ([IO.Path]::GetFileName($item) -match 'unattend.*\.xml') { throw 'cache' }
+        }
+    }
+    $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    if ((Get-ItemPropertyValue -LiteralPath $winlogon -Name AutoAdminLogon -ErrorAction SilentlyContinue) -eq '1' -or
+        $null -ne (Get-ItemPropertyValue -LiteralPath $winlogon -Name DefaultPassword -ErrorAction SilentlyContinue)) {
+        throw 'autologon'
+    }
+    foreach ($path in $location,$manifestPin) {
+        if (Test-Path -LiteralPath $path) { throw 'staging' }
+    }
+}
+
+function Finish-Setup {
+    $imageState = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State'
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $installing = Get-ItemPropertyValue -LiteralPath $setupKey -Name SystemSetupInProgress
+        $oobe = Get-ItemPropertyValue -LiteralPath $setupKey -Name OOBEInProgress -ErrorAction SilentlyContinue
+        if ((Get-ItemPropertyValue -LiteralPath $imageState -Name ImageState) -ceq 'IMAGE_STATE_COMPLETE' -and
+            $installing -eq 0 -and ($null -eq $oobe -or $oobe -eq 0)) { break }
+        if ($timer.Elapsed.TotalMinutes -ge 45) { throw 'setup timeout' }
+        Start-Sleep -Seconds 2
+    }
+    $boot = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks
+    Assert-PlainPath $state
+    if (-not (Test-Path -LiteralPath $state)) {
+        Clear-Bootstrap
+        Clear-SetupCaches
+        $sid = ([Security.Principal.NTAccount]::new('NT SERVICE','arx-guest')).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+        if ($sid -cnotmatch '^S-1-5-80(-[0-9]+){5}$') { throw 'service' }
+        Set-PortSecurity $sid
+        Invoke-FixedTool $sc @('config','arx-guest','start=','auto')
+        [IO.File]::WriteAllText($state, "1:$boot")
+        Invoke-FixedTool (Join-Path $system 'shutdown.exe') @('/s','/t','0')
+        return
+    }
+    if ([IO.DriveInfo]::GetDrives().DriveType -contains 'CDRom') { throw 'media attached' }
+    if ((Get-Item -LiteralPath $state).Length -gt 32) { throw 'stage' }
+    $previous = [regex]::Match([IO.File]::ReadAllText($state), '^([12]):([0-9]{1,19})$')
+    if (-not $previous.Success -or [long]$previous.Groups[2].Value -ge $boot) {
+        throw 'stage'
+    }
+    $stage = $previous.Groups[1].Value
+    Assert-NoBootstrap
+    Clear-SetupCaches
+    if ($stage -eq '1') {
+        [IO.File]::WriteAllText($state, "2:$boot")
+        return
+    }
+    Unregister-ScheduledTask -TaskName $task -Confirm:$false
+    if (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue) { throw 'task' }
+    Remove-Item -LiteralPath $state,$script -Force
+    if ((Test-Path -LiteralPath $state) -or (Test-Path -LiteralPath $script)) { throw 'staging' }
+    Invoke-FixedTool (Join-Path $system 'Sysprep\Sysprep.exe') @('/generalize','/oobe','/shutdown','/quiet')
+}
+
+try {
+    if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -cne 'S-1-5-18') { throw 'context' }
+    if ($Phase -eq 'install') { Install-ServiceFromSeed } else { Finish-Setup }
+    exit 0
+} catch {
+    # No raw command output, exception details, guest identity or paths.
+    exit 1
+}
+"###;
+
+// The caller supplies elapsed monotonic time from before the first launch.
+// Once a stage fails, the candidate cannot advance or be retried in place.
+pub(super) const BUILD_LIMIT: Duration = Duration::from_secs(3 * 60 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Stage {
+    Install,
+    DetachedReadiness,
+    Generalize,
+    DetachedVerification,
+    CloneIdentity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StageFailure {
+    Timeout,
+    UnexpectedStage,
+    Failed,
+    Residue,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum StageEvidence {
+    Clean,
+    Residue,
+    Failed,
+}
+
+pub(super) struct BuildStages(Result<Option<Stage>, StageFailure>);
+
+impl Default for BuildStages {
+    fn default() -> Self {
+        Self(Ok(Some(Stage::Install)))
+    }
+}
+
+impl BuildStages {
+    pub(super) fn observe(
+        &mut self,
+        elapsed: Duration,
+        stage: Stage,
+        evidence: StageEvidence,
+    ) -> Result<(), StageFailure> {
+        self.0 = (|| {
+            let expected = self.0?;
+            if elapsed >= BUILD_LIMIT {
+                return Err(StageFailure::Timeout);
+            }
+            if expected != Some(stage) {
+                return Err(StageFailure::UnexpectedStage);
+            }
+            match evidence {
+                StageEvidence::Residue => return Err(StageFailure::Residue),
+                StageEvidence::Failed => return Err(StageFailure::Failed),
+                StageEvidence::Clean => {}
+            }
+            Ok(match stage {
+                Stage::Install => Some(Stage::DetachedReadiness),
+                Stage::DetachedReadiness => Some(Stage::Generalize),
+                Stage::Generalize => Some(Stage::DetachedVerification),
+                Stage::DetachedVerification => Some(Stage::CloneIdentity),
+                Stage::CloneIdentity => None,
+            })
+        })();
+        self.0.map(|_| ())
+    }
+
+    pub(super) fn can_seal(&self) -> bool {
+        self.0 == Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::Cursor,
+        process::{Command, Stdio},
+    };
+
+    const GUEST: &[u8] = b"synthetic windows guest";
+    const ISO: &[u8] = b"synthetic windows iso";
+    const MEDIUM: &[u8] = b"synthetic virtio medium";
+    const DRIVER: &[u8] = b"synthetic driver member";
+    const CODE: &[u8] = b"synthetic firmware code";
+    const VARS: &[u8] = b"synthetic firmware vars";
+    const DRIVER_RECEIPT: &[u8] = b"synthetic vetted driver provenance";
+    const QEMU_RECEIPT: &[u8] = b"synthetic vetted qemu provenance";
+    const EDITION: Edition<'static> = Edition {
+        index: 6,
+        name: "Fixture Windows 11",
+        edition_id: "Fixture",
+        build: "10.0.26100",
+        language: "en-US",
+        architecture: "amd64",
+        container: InstallImage::Wim,
+    };
+
+    fn pin(bytes: &[u8]) -> AssetPin {
+        AssetPin {
+            length: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+        }
+    }
+
+    fn fixture() -> WindowsPins<'static> {
+        WindowsPins {
+            iso: pin(ISO),
+            edition: EDITION,
+            driver_medium: pin(MEDIUM),
+            driver_files: [[pin(DRIVER); 3]; 3],
+            driver_receipt: pin(DRIVER_RECEIPT),
+            winpe_driver_letter: b'F',
+            guest: pin(GUEST),
+            provisioner: pin(PROVISIONER.as_bytes()),
+            firmware_code: pin(CODE),
+            firmware_vars: pin(VARS),
+            qemu_receipt: pin(QEMU_RECEIPT),
+        }
+    }
+
+    fn write(
+        recipe: WindowsRecipe<'_>,
+        change: impl FnOnce(&mut WindowsAssets<'_>),
+        out: &mut Vec<u8>,
+    ) -> Result<[u8; 32], RecipeError> {
+        let mut files = [const { Cursor::new(DRIVER) }; 9];
+        let [a, b, c, d, e, f, g, h, i] = &mut files;
+        let mut assets = WindowsAssets {
+            iso: &mut Cursor::new(ISO),
+            edition: EDITION,
+            driver_medium: &mut Cursor::new(MEDIUM),
+            driver_files: [[a, b, c], [d, e, f], [g, h, i]],
+            driver_receipt: DRIVER_RECEIPT,
+            firmware_code: &mut Cursor::new(CODE),
+            firmware_vars: &mut Cursor::new(VARS),
+            qemu_receipt: QEMU_RECEIPT,
+        };
+        change(&mut assets);
+        recipe.write_test_seed(assets, GUEST, out)
+    }
+
+    #[test]
+    fn missing_or_wrong_windows_pins_refuse_before_seed_output() {
+        let mut out = Vec::new();
+        for (pins, update) in [
+            (
+                None,
+                (|_: &mut WindowsAssets<'_>| {}) as fn(&mut WindowsAssets<'_>),
+            ),
+            (Some(fixture()), |a| a.edition.index += 1),
+            (Some(fixture()), |a| a.edition.name = "unexpected edition"),
+            (Some(fixture()), |a| a.edition.container = InstallImage::Esd),
+            (Some(fixture()), |a| {
+                a.driver_receipt = b"wrong trust evidence"
+            }),
+        ] {
+            let error = write(WindowsRecipe { pins }, update, &mut out).unwrap_err();
+            assert_eq!(error.to_string(), "recipe_unqualified");
+            assert!(out.is_empty());
+        }
+        for alter in [
+            (|p: &mut WindowsPins<'_>| p.iso.sha256[0] ^= 1) as fn(&mut WindowsPins<'_>),
+            |p| p.iso.length -= 1,
+            |p| p.driver_medium.sha256[0] ^= 1,
+            |p| p.driver_files[2][1].sha256[0] ^= 1,
+            |p| p.driver_files[1][2].length = MAX_DRIVER_FILE + 1,
+            |p| p.firmware_vars.length = 0,
+            |p| p.provisioner.sha256[0] ^= 1,
+            |p| p.guest.sha256[0] ^= 1,
+            |p| p.winpe_driver_letter = b'X',
+        ] {
+            let mut pins = fixture();
+            alter(&mut pins);
+            let error = write(WindowsRecipe { pins: Some(pins) }, |_| {}, &mut out).unwrap_err();
+            assert_eq!(error.to_string(), "recipe_unqualified");
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn deadline_failure_residue_and_out_of_order_evidence_block_seal() {
+        use Stage::*;
+        let sequence = [
+            Install,
+            DetachedReadiness,
+            Generalize,
+            DetachedVerification,
+            CloneIdentity,
+        ];
+        for (broken, elapsed, stage, evidence, reason) in [
+            (
+                Install,
+                BUILD_LIMIT,
+                Install,
+                StageEvidence::Clean,
+                StageFailure::Timeout,
+            ),
+            (
+                Generalize,
+                Duration::ZERO,
+                Generalize,
+                StageEvidence::Failed,
+                StageFailure::Failed,
+            ),
+            (
+                DetachedVerification,
+                Duration::ZERO,
+                DetachedVerification,
+                StageEvidence::Residue,
+                StageFailure::Residue,
+            ),
+            (
+                DetachedReadiness,
+                Duration::ZERO,
+                Generalize,
+                StageEvidence::Clean,
+                StageFailure::UnexpectedStage,
+            ),
+            (
+                CloneIdentity,
+                BUILD_LIMIT,
+                CloneIdentity,
+                StageEvidence::Clean,
+                StageFailure::Timeout,
+            ),
+        ] {
+            let mut build = BuildStages::default();
+            for previous in sequence.into_iter().take_while(|stage| *stage != broken) {
+                build
+                    .observe(Duration::ZERO, previous, StageEvidence::Clean)
+                    .unwrap();
+            }
+            assert_eq!(build.observe(elapsed, stage, evidence), Err(reason));
+            assert!(!build.can_seal());
+            assert_eq!(
+                build.observe(Duration::ZERO, broken, StageEvidence::Clean),
+                Err(reason)
+            );
+        }
+        let mut build = BuildStages::default();
+        for stage in sequence {
+            assert!(!build.can_seal());
+            build
+                .observe(Duration::ZERO, stage, StageEvidence::Clean)
+                .unwrap();
+        }
+        assert!(build.can_seal());
+    }
+
+    #[test]
+    fn windows_seed_is_deterministic_and_independently_readable() {
+        let mut iso = Vec::new();
+        let mut again = Vec::new();
+        let recipe = || WindowsRecipe {
+            pins: Some(fixture()),
+        };
+        let digest = write(recipe(), |_| {}, &mut iso).unwrap();
+        assert_eq!(digest, write(recipe(), |_| {}, &mut again).unwrap());
+        assert_eq!(iso, again);
+        assert_eq!(
+            hex::encode(Sha256::digest(&iso)),
+            "0dc6bbeb953e8a0697581008699f06ec8fcfd95d037ce95baf2fd52aea359f11"
+        );
+
+        let adversarial = "&<>\"' é\t\u{1f642}\r\n";
+        let mut xml = Xml("<test".to_owned());
+        xml.attr("field", adversarial).unwrap();
+        xml.0.push('>');
+        xml.value("value", adversarial).unwrap();
+        xml.0.push_str("</test>");
+        for invalid in ["\u{1}", "\u{b}", "\u{fffe}"] {
+            assert!(Xml::default().value("value", invalid).is_err());
+            assert!(Xml::default().attr("field", invalid).is_err());
+        }
+
+        // CI already provides Python. ElementTree is independent of this
+        // writer and verifies expanded names and real ISO read-back bytes.
+        let mut check = Command::new("python")
+            .args(["-I", "-B", "-c", CHECK_SEED, &xml.0])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Python 3 is needed for independent seed verification");
+        check.stdin.take().unwrap().write_all(&iso).unwrap();
+        let result = check.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    const CHECK_SEED: &str = r#"
+import hashlib
+import sys
+import xml.etree.ElementTree as ET
+
+iso = sys.stdin.buffer.read()
+sector = 2048
+def both(raw):
+    half = len(raw)//2
+    little = int.from_bytes(raw[:half], 'little')
+    assert little == int.from_bytes(raw[half:], 'big')
+    return little
+
+def contents(kind):
+    desc = iso[(15+kind)*sector:(16+kind)*sector]
+    assert desc[:7] == bytes([kind])+b'CD001\x01'
+    assert both(desc[80:88])*sector == len(iso)
+    label = desc[40:72].decode('ascii' if kind == 1 else 'utf-16-be')
+    assert label.rstrip() == 'ARXSETUP'
+    if kind == 2:
+        assert desc[88:91] == b'%/E'
+    root = both(desc[158:166])
+    assert both(desc[166:174]) == sector
+    tree = iso[root*sector:(root+1)*sector]
+    files, intervals = {}, []
+    step = 0
+    while tree and tree[0]:
+        n = tree[0]
+        rec, tree = tree[:n], tree[n:]
+        assert len(rec) == n and n >= 34
+        raw = rec[33:33+rec[32]]
+        step += 1
+        if step <= 2:
+            assert raw == bytes([step-1]) and rec[25] == 2
+            continue
+        assert rec[25] == 0
+        key = raw.decode('ascii' if kind == 1 else 'utf-16-be')
+        assert key.endswith(';1') and key not in files
+        offset, size = both(rec[2:10])*sector, both(rec[10:18])
+        end = offset + (size+sector-1)//sector*sector
+        assert size > 0 and 25*sector <= offset < end <= len(iso)
+        assert all(end <= lo or offset >= hi for lo, hi in intervals)
+        assert not any(iso[offset+size:end])
+        intervals.append((offset,end))
+        files[key] = iso[offset:offset+size]
+    assert not any(tree)
+    return files
+
+primary, joliet = contents(1), contents(2)
+assert list(primary) == ['ARXGUEST.EXE;1','ARXPINS.TXT;1','ARXSEED.ID;1','ARXSETUP.PS1;1','AUTOUNAT.XML;1']
+assert list(joliet) == ['arxguest.exe;1','arxpins.txt;1','arxseed.id;1','arxsetup.ps1;1','Autounattend.xml;1']
+assert list(primary.values()) == list(joliet.values())
+guest, manifest, marker, script, answer = joliet.values()
+sha = lambda b: hashlib.sha256(b).hexdigest().upper()
+assert guest == b'synthetic windows guest'
+assert marker == b'arxcovo-windows-test-seed-v1\n'
+assert manifest.decode('ascii').splitlines() == ['arx-windows-seed-v1',str(len(guest)),sha(guest),sha(script)]
+n = '{urn:schemas-microsoft-com:unattend}'
+w = '{http://schemas.microsoft.com/WMIConfig/2002/State}'
+root = ET.fromstring(answer)
+assert root.tag == n+'unattend'
+assert [s.attrib['pass'] for s in root] == ['windowsPE','specialize','oobeSystem']
+pe, specialize, oobe = [list(s) for s in root]
+assert [[c.attrib['name'] for c in stage] for stage in [pe,specialize,oobe]] == [
+    ['Microsoft-Windows-International-Core-WinPE','Microsoft-Windows-PnpCustomizationsWinPE','Microsoft-Windows-Setup'],
+    ['Microsoft-Windows-Deployment'],
+    ['Microsoft-Windows-International-Core','Microsoft-Windows-Shell-Setup']]
+assert all(c.attrib['processorArchitecture'] == 'amd64' for c in pe+specialize+oobe)
+get = lambda e, name: e.findtext('.//'+n+name)
+drivers = pe[1].find(n+'DriverPaths')
+assert [d.attrib for d in drivers] == [{w+'action':'add',w+'keyValue':str(i)} for i in range(1,4)]
+assert [get(d,'Path') for d in drivers] == [r'F:\viostor\w11\amd64',r'F:\vioserial\w11\amd64',r'F:\NetKVM\w11\amd64']
+assert get(pe[2],'Key') == '/IMAGE/INDEX' and get(pe[2],'Value') == '6'
+assert [x.text for x in pe[2].iter(n+'Type')] == ['EFI','MSR','Primary']
+assert [x.text for x in pe[2].iter(n+'Format')] == ['FAT32','NTFS']
+assert get(pe[2],'DiskID') == '0' and get(pe[2],'Enable') == 'false'
+setup_paths = [get(c,'Path') for c in pe[2].find(n+'RunSynchronous')]
+assert setup_paths[1:] == [
+    r'reg.exe add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f',
+    r'reg.exe add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f']
+assert answer.count(b'LabConfig') == 2
+for name in ['viostor', 'vioser', 'netkvm']:
+    for suffix in ['.inf','.cat','.sys']:
+        assert name+suffix in setup_paths[0]
+hooks = [get(c,'Path') for c in specialize[0].find(n+'RunSynchronous')]
+assert len(hooks) == 4 and all(len(hook) <= 259 for hook in hooks)
+assert sha(manifest) in hooks[-2] and sha(script) in hooks[-1]
+assert get(oobe[1],'HideOnlineAccountScreens') == 'true'
+assert get(oobe[1],'HideWirelessSetupInOOBE') == 'true'
+assert get(oobe[1],'ProtectYourPC') == '3'
+assert get(oobe[1],'Name') == 'ArxBootstrap' and get(oobe[1],'Group') == 'Users'
+assert not {x.tag.split('}')[-1] for x in root.iter()} & {
+    'ProductKey','Password','Credentials','AutoLogon','FirstLogonCommands',
+    'JoinDomain','SkipMachineOOBE','SkipUserOOBE','HideLocalAccountScreen'}
+assert all(not v.startswith('\\\\') for v in root.itertext())
+assert b'FirstLogon' not in script and b'Write-Host' not in script
+assert script.index(b'Clear-Bootstrap\n        Clear-SetupCaches') < script.index(b"'/generalize','/oobe','/shutdown'")
+extra = ET.fromstring(sys.argv[1])
+assert extra.attrib == {'field':"&<>\"' é\t\U0001f642\r\n"}
+assert extra.findtext('value') == extra.attrib['field']
+"#;
+}

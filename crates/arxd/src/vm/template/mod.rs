@@ -1,5 +1,10 @@
 mod media;
 mod ubuntu;
+#[allow(
+    dead_code,
+    reason = "5c supplies the Windows lifecycle caller; native admission is closed"
+)]
+mod windows;
 
 pub use ubuntu::{AssetPin, RecipeError, UbuntuAssets, UbuntuRecipe};
 
