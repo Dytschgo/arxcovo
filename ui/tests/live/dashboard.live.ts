@@ -1,6 +1,6 @@
 import { expect, test, type BrowserContext, type Page, type Response } from '@playwright/test';
-import http from 'node:http';
 import path from 'node:path';
+import { replaySessionStatus } from './replay';
 
 // Runs against a real arxd serving the production ui/dist (see
 // playwright.live.config.ts). Nothing here uses the stand-in adapter: the
@@ -63,27 +63,12 @@ async function sessionValue(context: BrowserContext) {
 }
 
 /**
- * Status of GET /api/v1/session sent over plain loopback HTTP with an
- * explicit, possibly stale, session cookie and no cookie jar. Node's client
- * is used instead of Playwright's request API, whose call log records header
- * values; every failure here is rethrown with a fixed message and only the
- * status code is returned, so the cookie value can never reach test output.
+ * Status (200 or 401) of GET /api/v1/session replayed with an explicit,
+ * possibly stale, session cookie and no cookie jar. Every failure surfaces as
+ * a fixed, redacted ReplayError; see replay.ts and replay.spec.ts.
  */
-function replayStatus(value: string): Promise<number> {
-  const port = Number(process.env.ARX_LIVE_PORT);
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      { host: '127.0.0.1', port, path: '/api/v1/session', method: 'GET', timeout: 10_000, headers: { host: `localhost:${port}`, cookie: `${COOKIE}=${value}` } },
-      res => {
-        res.resume();
-        resolve(res.statusCode ?? 0);
-      },
-    );
-    req.on('timeout', () => req.destroy(new Error('timeout')));
-    req.on('error', () => reject(new Error('Session replay request failed.')));
-    req.end();
-  });
-}
+const replayStatus = (value: string) =>
+  replaySessionStatus({ port: process.env.ARX_LIVE_PORT, cookieName: COOKIE, value });
 
 const isApi = (method: string, pathname: string) => (r: Response) =>
   r.request().method() === method && new URL(r.url()).pathname === pathname;

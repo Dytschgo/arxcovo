@@ -71,39 +71,84 @@ way while it unwinds. Nothing else under `ARX_LIVE_ROOT` is ever touched. A
 run killed from outside (for example by an interrupted Playwright process)
 can leave its `run-*` directory behind; remove that one by hand.
 
-**Root checks.** Every check runs before anything is created, so a refused
-root leaves the filesystem unchanged:
+**Root checks (invariant: a refused root leaves the disk exactly as it
+was).** `prepare_run_with` has a read-only phase and a write phase. Every check
+that can refuse runs in the read-only phase, in this order:
 
-- the path is absolute and normalized, and its existing parent chain has no
-  links, junctions or other reparse points (arxd's `checked_path`, the same
-  rule arxd applies to private state paths);
-- the parent is not controlled by another account: owned by the current user
-  or the system (root; SYSTEM or Administrators on Windows), and on Linux not
-  writable by group or others unless sticky, as on `/tmp`. Like arxd's state
-  directory, the parent itself may be shared scratch;
-- an existing root must be a plain directory (not a link or reparse point)
-  that is owner-private: owned by the current user, mode 0700 on Linux, or
-  only TokenUser, SYSTEM and Administrators granted on Windows.
+1. the value is set and valid UTF-8;
+2. the raw spelling, judged from the string alone without touching the
+   filesystem: absolute, and spelled exactly as its normalized form, so no
+   `.` or `..` segments and no doubled or trailing separators. On Windows the
+   path must also use no `/` separators and be a plain drive path (no `\\?\`
+   prefix), and no segment may contain `:` or end in `.` or a space, which
+   Windows would silently alias. The Playwright config also refuses a root
+   for which `path.resolve(root) !== root`;
+3. the existing parent chain has no links, junctions or other reparse points
+   (arxd's `checked_path`, the rule arxd applies to private state paths); a
+   missing parent is refused, never created;
+4. the parent is not controlled by another account: owned by the current user
+   or the system (root; SYSTEM or Administrators on Windows), and on Linux not
+   writable by group or others unless sticky, as on `/tmp`. Like arxd's state
+   directory, the parent itself may be shared scratch;
+5. an existing root must be a plain directory (not a link, reparse point or
+   file) that is owner-private: owned by the current user, mode 0700 on
+   Linux, or only TokenUser, SYSTEM and Administrators granted on Windows.
 
-Only then is a missing root created, one level, owner-only from the moment it
-exists (mode 0700, or a creation-time owner and protected DACL on Windows),
-and verified again; a root that fails that verification is removed.
+The write phase creates at most two objects, in order: the root (only if it
+was absent, owner-only from the moment it exists: mode 0700, or a
+creation-time owner and protected DACL on Windows) and the run directory.
+Each is verified right after creation. Any failure after the first write,
+including a failed verification, removes what this call created, newest
+first, before the launcher reports the refusal. Every launcher input is read
+before the first write.
 
 Non-ignored tests in the same file run in the normal nextest job:
-`live_fixture_seeds_activity_and_vm_catalog` fails if the seeding drifts from
-the current schema, `run_cleanup_removes_only_its_own_directory` proves that
-another run's directory and a look-alike sibling survive cleanup,
-`run_dir_refuses_a_root_that_is_not_private` proves the privacy check, and
-`run_dir_refuses_links_without_creating_anything` proves that a missing root
-below a link (symlink, or junction on Windows), a linked root and a root with
-a missing parent are refused with nothing created.
+
+- `every_refused_root_leaves_the_disk_unchanged` is table-driven, with one
+  row per refusal path above. The rows cover: unset, empty and relative
+  values; `..`, trailing `..`, `.`, trailing `.`, trailing-separator and
+  doubled-separator spellings, plus `/`, all-`/`, trailing-dot, trailing-space,
+  `:stream` and `\\?\` spellings on Windows; a missing parent; a missing root
+  below a link (a symlink, or a junction on Windows); a link as the root; a
+  root that is a file; an existing non-private root; a parent writable by
+  others without the sticky bit (Linux); and injected verification failures
+  after creating a new root, after creating the run directory under a new
+  root, and after creating it under an existing root. Each row runs in a
+  fresh base, whose full recursive snapshot of paths, kinds and privacy must
+  be identical before and after. A positive control is accepted.
+- `run_cleanup_removes_only_its_own_directory` proves that another run's
+  directory and a look-alike sibling survive cleanup.
+- `live_fixture_seeds_activity_and_vm_catalog` fails if the seeding drifts
+  from the current schema.
+
+A parent owned by another Windows account cannot be created without
+privileges, so that form is covered on Linux through mode bits; the same
+`trusted_parent` check runs on every row's real parent on both systems.
 
 ## What it proves
 
-Session cookies never reach test output: the cookie flags are compared as a
-projection without the value, and the replay uses Node's HTTP client (not
-Playwright's request API, whose call log records header values), rethrows any
-failure with a fixed message and returns only the status code.
+Session cookies never reach test output (invariant: every failure in the
+replay path surfaces only as a fixed, redacted error carrying at most the
+status). The cookie flags are compared as a projection without the value.
+The replay (`ui/tests/live/replay.ts`) uses Node's HTTP client, not
+Playwright's request API, whose call log records header values. The whole
+operation sits inside one boundary that discards the original error and
+throws a `ReplayError` with one of two fixed messages: "request failed", or
+the HTTP status. That covers option building, a synchronous throw from
+`request()`, connect errors, timeouts, statuses other than 200 or 401,
+aborted or oversized bodies, a 200 that is not a session, and anything thrown
+by the callbacks. `ui/tests/live/replay.spec.ts` injects each of these
+against local loopback servers that echo the cookie into headers and bodies.
+It asserts that the error's message, string form, stack and serialized
+properties contain neither the cookie value, nor the cookie name, nor any
+header text. The spec needs no browser or live backend, and the default
+`npm run smoke` config collects it, so it runs in CI.
+
+The synthetic owner password is typed with `locator.fill`. Playwright can
+include a filled value in an action's step title and in the call log of a
+failed action, so a failing sign-in step can print it. It is a random per-run
+value for a loopback fixture that is deleted after the run, never an owner
+secret.
 
 Each row is asserted on the HTTP response the browser received and on the
 rendered UI.

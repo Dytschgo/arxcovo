@@ -16,7 +16,7 @@ use arxd::{
 };
 use std::{
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant, SystemTime},
 };
@@ -49,14 +49,22 @@ fn now_ms() -> i64 {
 
 /// Apply owner-only protection to an existing directory: 0700 on Linux; on
 /// Windows TokenUser owns it with a protected, inheritable TokenUser-only DACL.
-fn protect(path: &Path) {
+/// Returns whether every step succeeded; it never panics.
+fn try_protect(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).is_ok()
     }
     #[cfg(windows)]
-    win::protect(path, "");
+    {
+        win::protect(path, "")
+    }
+}
+
+/// Fixture setup: protection that must succeed.
+fn protect(path: &Path) {
+    assert!(try_protect(path), "protect {}", path.display());
 }
 
 fn private_dir(path: &Path) {
@@ -199,46 +207,44 @@ mod win {
         }
     }
 
-    pub(super) fn protect(path: &Path, extra: &str) {
+    /// Returns whether both the DACL and the owner were applied.
+    pub(super) fn protect(path: &Path, extra: &str) -> bool {
         let user = token_user();
         let sid = user_sid(&user);
         let sid_text = user_text(sid);
+        let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid_text}){extra}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let name = wide(path);
         // SAFETY: every string is NUL-terminated and every allocation is
-        // freed once; the SID outlives the calls.
+        // freed once; the SID and ACL outlive the calls that use them.
         unsafe {
-            let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid_text}){extra}")
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
             let mut descriptor = ptr::null_mut();
-            assert_ne!(
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    sddl.as_ptr(),
-                    1,
-                    &mut descriptor,
-                    ptr::null_mut()
-                ),
-                0
-            );
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                ptr::null_mut(),
+            ) == 0
+            {
+                return false;
+            }
             let (mut present, mut defaulted, mut acl) = (0, 0, ptr::null_mut());
-            assert_ne!(
-                GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted),
-                0
-            );
-            let name = wide(path);
             // DACL first: changing the owner needs the WRITE_OWNER it grants.
-            let dacl = SetNamedSecurityInfoW(
-                name.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                acl,
-                ptr::null_mut(),
-            );
+            let dacl =
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) != 0
+                    && SetNamedSecurityInfoW(
+                        name.as_ptr(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        acl,
+                        ptr::null_mut(),
+                    ) == 0;
             LocalFree(descriptor);
-            assert_eq!(dacl, 0, "protect DACL {}", path.display());
-            let owner = SetNamedSecurityInfoW(
+            dacl && SetNamedSecurityInfoW(
                 name.as_ptr(),
                 SE_FILE_OBJECT,
                 OWNER_SECURITY_INFORMATION,
@@ -246,8 +252,7 @@ mod win {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
-            );
-            assert_eq!(owner, 0, "protect owner {}", path.display());
+            ) == 0
         }
     }
 
@@ -338,18 +343,79 @@ fn trusted_parent(path: &Path) -> bool {
     }
 }
 
-/// Allocate this run's own directory: a fresh, randomly named child of an
-/// owner-private `root`. Every check runs before anything is created: the
-/// root must be absolute and normalized, its existing parent chain free of
-/// links and reparse points (arxd's `checked_path`), its parent not owned by
-/// another account, and an existing root a plain owner-private directory.
-/// Only then is a missing root created owner-only (one level) and verified.
-/// Any refusal leaves the filesystem unchanged. Dropping or closing the guard
-/// removes this run's directory only.
-fn run_dir(root: &Path) -> Result<tempfile::TempDir, String> {
-    let refused = |reason: &str| Err(format!("ARX_LIVE_ROOT refused: {reason}"));
-    if !root.is_absolute() || root.file_name().is_none() {
-        return refused("an absolute directory path is required");
+/// Whether `root` is spelled exactly as its normalized form, judged from
+/// the string alone (no filesystem access): rebuilding it from its parsed
+/// components must give the same string, which refuses `.` segments, doubled
+/// or trailing separators and, on Windows, `/` separators. `..` segments are
+/// refused outright. On Windows only a plain drive path (`C:\...`) is
+/// accepted, and no segment may contain `:` (alternate data streams) or end in
+/// `.` or a space, which Windows would silently strip and alias.
+fn normalized_spelling(root: &Path) -> bool {
+    let Some(raw) = root.to_str() else {
+        return false;
+    };
+    let mut rebuilt = PathBuf::new();
+    for component in root.components() {
+        match component {
+            Component::ParentDir | Component::CurDir => return false,
+            #[cfg(windows)]
+            Component::Prefix(prefix) if !matches!(prefix.kind(), std::path::Prefix::Disk(_)) => {
+                return false;
+            }
+            Component::Normal(segment) => {
+                let Some(segment) = segment.to_str() else {
+                    return false;
+                };
+                if cfg!(windows)
+                    && (segment.contains(':') || segment.ends_with('.') || segment.ends_with(' '))
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        rebuilt.push(component);
+    }
+    rebuilt.as_os_str() == raw
+}
+
+/// Post-creation verification. The launcher uses `is_private`; tests inject
+/// failures to exercise the rollback paths.
+type Verify<'a> = &'a dyn Fn(&Path) -> bool;
+
+fn refused<T>(reason: &str) -> Result<T, String> {
+    Err(format!("ARX_LIVE_ROOT refused: {reason}"))
+}
+
+/// Allocate this run's own directory, a fresh randomly named child of an
+/// owner-private root, from the raw `ARX_LIVE_ROOT` value.
+///
+/// Invariant: a refused root leaves the filesystem exactly as it was.
+/// 1. **Read-only phase.** Every check that can refuse runs before the first
+///    write: unset, non-UTF-8 or relative value; non-normalized spelling
+///    (string only, no filesystem access); parent chain missing or crossing a
+///    link or reparse point (arxd's `checked_path`); parent controlled by
+///    another account; an existing root that is a link, not a directory or
+///    not owner-private.
+/// 2. **Write phase.** At most two objects are created, in order: the root
+///    (only if it was absent, owner-only at creation) and the run directory.
+///    Every failure after the first write, including a failed verification,
+///    removes what this call created, newest first, before returning.
+fn prepare_run(raw: Option<&std::ffi::OsStr>) -> Result<tempfile::TempDir, String> {
+    prepare_run_with(raw, &is_private)
+}
+
+fn prepare_run_with(
+    raw: Option<&std::ffi::OsStr>,
+    verify: Verify,
+) -> Result<tempfile::TempDir, String> {
+    // ---- read-only phase -------------------------------------------------
+    let Some(raw) = raw else {
+        return refused("it is not set");
+    };
+    let root = Path::new(raw);
+    if !root.is_absolute() || root.file_name().is_none() || !normalized_spelling(root) {
+        return refused("an absolute, normalized directory path is required");
     }
     let parent = root.parent().expect("absolute path with a file name");
     if arxd::config::checked_path(parent).is_err() {
@@ -358,33 +424,49 @@ fn run_dir(root: &Path) -> Result<tempfile::TempDir, String> {
     if !trusted_parent(parent) {
         return refused("the parent directory is controlled by another account");
     }
-    match std::fs::symlink_metadata(root) {
-        Ok(_) => {
-            if arxd::config::checked_path(root).is_err() || !is_private(root) {
-                return refused("it must be a plain owner-private directory");
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            create_private_dir(root).map_err(|_| "cannot create ARX_LIVE_ROOT")?;
-            if arxd::config::checked_path(root).is_err() || !is_private(root) {
-                let _ = std::fs::remove_dir(root);
-                return refused("the new directory did not verify as owner-private");
-            }
-        }
+    let existed = match std::fs::symlink_metadata(root) {
+        Ok(_) if arxd::config::checked_path(root).is_ok() && is_private(root) => true,
+        Ok(_) => return refused("it must be a plain owner-private directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => return refused("cannot inspect the path"),
+    };
+    // ---- write phase: roll back everything this call creates ---------------
+    let rollback = |reason: &str| {
+        if !existed {
+            let _ = std::fs::remove_dir(root);
+        }
+        refused(reason)
+    };
+    if !existed {
+        if create_private_dir(root).is_err() {
+            // Nothing was created.
+            return refused("cannot create the directory");
+        }
+        if arxd::config::checked_path(root).is_err() || !verify(root) {
+            return rollback("the new directory did not verify as owner-private");
+        }
     }
-    let dir = tempfile::Builder::new()
+    let Ok(dir) = tempfile::Builder::new()
         .prefix(RUN_PREFIX)
         .rand_bytes(16)
         .tempdir_in(root)
-        .map_err(|_| "cannot create the run directory")?;
+    else {
+        return rollback("cannot create the run directory");
+    };
     // The root's inheritable owner-only DACL (or tempfile's 0700) already
-    // applies; re-apply and verify before anything is written inside.
-    protect(dir.path());
-    if !is_private(dir.path()) {
-        return Err("run directory is not private".into());
+    // applies; re-apply (owner included) and verify before any use.
+    if !try_protect(dir.path()) || !verify(dir.path()) {
+        if dir.close().is_err() {
+            return refused("the run directory did not verify and could not be removed");
+        }
+        return rollback("the run directory did not verify as owner-private");
     }
     Ok(dir)
+}
+
+/// Test convenience for an already-built path.
+fn run_dir(root: &Path) -> Result<tempfile::TempDir, String> {
+    prepare_run(Some(root.as_os_str()))
 }
 
 /// Kills and reaps the daemon when dropped, before the run directory goes.
@@ -445,11 +527,18 @@ fn required(name: &str) -> String {
         .unwrap_or_else(|_| panic!("{name} is required; run through playwright.live.config.ts"))
 }
 
-/// A private test parent standing in for `ARX_LIVE_ROOT`.
+/// A private test parent standing in for `ARX_LIVE_ROOT`'s parent.
 fn private_parent() -> tempfile::TempDir {
     let parent = tempfile::tempdir().unwrap();
     protect(parent.path());
     parent
+}
+
+/// The parent's normalized spelling (`TMP` may use `/` on Windows hosts).
+fn base(parent: &tempfile::TempDir) -> PathBuf {
+    let base = std::path::absolute(parent.path()).unwrap();
+    assert!(normalized_spelling(&base), "normalized test base");
+    base
 }
 
 #[test]
@@ -486,7 +575,7 @@ fn live_fixture_seeds_activity_and_vm_catalog() {
 #[test]
 fn run_cleanup_removes_only_its_own_directory() {
     let parent = private_parent();
-    let root = parent.path().join("live-root");
+    let root = base(&parent).join("live-root");
     // A missing root is created owner-private.
     let first = run_dir(&root).unwrap();
     assert!(is_private(&root));
@@ -503,24 +592,6 @@ fn run_cleanup_removes_only_its_own_directory() {
     assert!(!mine.exists());
     assert!(other_run.path().is_dir());
     assert_eq!(std::fs::read(lookalike.join("keep")).unwrap(), b"keep");
-}
-
-#[test]
-fn run_dir_refuses_a_root_that_is_not_private() {
-    let parent = private_parent();
-    let root = parent.path().join("shared-root");
-    std::fs::create_dir(&root).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    #[cfg(windows)]
-    win::protect(&root, "(A;OICI;FR;;;WD)");
-    assert!(!is_private(&root));
-    assert!(run_dir(&root).is_err());
-    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
-    assert!(run_dir(Path::new("relative-root")).is_err());
 }
 
 /// Link `link` to the existing directory `target`: a symlink on Linux, a
@@ -541,33 +612,238 @@ fn link_dir(target: &Path, link: &Path) {
     );
 }
 
-fn entries(path: &Path) -> usize {
-    std::fs::read_dir(path).unwrap().count()
+/// Every entry below `base`, recursively and without following links: the
+/// relative path, its kind and whether it is owner-private. Comparing two
+/// snapshots detects any creation, removal, retyping or permission change.
+fn snapshot(base: &Path) -> Vec<(PathBuf, char, bool)> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, char, bool)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let kind = if meta.file_type().is_symlink() {
+                'l'
+            } else if meta.is_dir() {
+                'd'
+            } else {
+                'f'
+            };
+            let relative = path.strip_prefix(base).unwrap().to_owned();
+            out.push((relative, kind, kind == 'd' && is_private(&path)));
+            if kind == 'd' {
+                walk(base, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(base, base, &mut out);
+    out.sort();
+    out
 }
 
+type Setup = Box<dyn Fn(&Path) -> Option<std::ffi::OsString>>;
+type Row = (&'static str, Setup, fn(&Path) -> bool);
+
+fn row(
+    name: &'static str,
+    setup: impl Fn(&Path) -> Option<std::ffi::OsString> + 'static,
+    verify: fn(&Path) -> bool,
+) -> Row {
+    (name, Box::new(setup), verify)
+}
+
+/// `base` followed by the raw, unnormalized text `tail`.
+fn at(base: &Path, tail: &str) -> Option<std::ffi::OsString> {
+    Some(format!("{}{tail}", base.display()).into())
+}
+
+fn named(path: &Path, name: &str) -> bool {
+    path.file_name()
+        .is_some_and(|file| file.to_string_lossy().starts_with(name))
+}
+
+/// Injected verifiers: fail for the new root, or for the run directory.
+fn fail_root(path: &Path) -> bool {
+    !named(path, "live-root") && is_private(path)
+}
+
+fn fail_run(path: &Path) -> bool {
+    !named(path, RUN_PREFIX) && is_private(path)
+}
+
+/// Invariant A: for every refused `ARX_LIVE_ROOT`, the disk is unchanged.
+/// The rows follow `prepare_run_with` in order: every read-only refusal, then
+/// each write-phase failure after a creation, which must roll back what it
+/// created. Each row runs in a fresh private base whose full recursive
+/// snapshot (paths, kinds, privacy) must be identical before and after.
 #[test]
-fn run_dir_refuses_links_without_creating_anything() {
+fn every_refused_root_leaves_the_disk_unchanged() {
+    let ok: fn(&Path) -> bool = is_private;
+    let s = std::path::MAIN_SEPARATOR;
+    let mut rows = vec![
+        // Value checks: no filesystem access at all.
+        row("unset", |_| None, ok),
+        row("empty", |_| Some("".into()), ok),
+        row("relative", |_| Some("relative-root".into()), ok),
+        row(
+            "parent segment",
+            move |b| at(b, &format!("{s}sub{s}..{s}live-root")),
+            ok,
+        ),
+        row(
+            "trailing parent segment",
+            move |b| at(b, &format!("{s}sub{s}..")),
+            ok,
+        ),
+        row(
+            "dot segment",
+            move |b| at(b, &format!("{s}.{s}live-root")),
+            ok,
+        ),
+        row(
+            "trailing dot segment",
+            move |b| at(b, &format!("{s}live-root{s}.")),
+            ok,
+        ),
+        row(
+            "trailing separator",
+            move |b| at(b, &format!("{s}live-root{s}")),
+            ok,
+        ),
+        row(
+            "doubled separator",
+            move |b| at(b, &format!("{s}{s}live-root")),
+            ok,
+        ),
+        // Parent chain and parent owner.
+        row(
+            "missing parent",
+            move |b| at(b, &format!("{s}absent{s}live-root")),
+            ok,
+        ),
+        row(
+            "missing root below a link",
+            move |b| {
+                link_dir(&b.join("sub"), &b.join("link"));
+                at(b, &format!("{s}link{s}live-root"))
+            },
+            ok,
+        ),
+        // Existing root.
+        row(
+            "link as the root",
+            move |b| {
+                link_dir(&b.join("sub"), &b.join("link"));
+                at(b, &format!("{s}link"))
+            },
+            ok,
+        ),
+        row(
+            "root is a file",
+            move |b| {
+                std::fs::write(b.join("live-root"), b"file").unwrap();
+                at(b, &format!("{s}live-root"))
+            },
+            ok,
+        ),
+        row(
+            "existing root that is not private",
+            move |b| {
+                let root = b.join("live-root");
+                std::fs::create_dir(&root).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+                #[cfg(windows)]
+                assert!(win::protect(&root, "(A;OICI;FR;;;WD)"));
+                at(b, &format!("{s}live-root"))
+            },
+            ok,
+        ),
+        // Write phase: injected verification failures after each creation.
+        row(
+            "new root fails verification",
+            move |b| at(b, &format!("{s}live-root")),
+            fail_root,
+        ),
+        row(
+            "run directory fails verification under a new root",
+            move |b| at(b, &format!("{s}live-root")),
+            fail_run,
+        ),
+        row(
+            "run directory fails verification under an existing root",
+            move |b| {
+                private_dir(&b.join("live-root"));
+                at(b, &format!("{s}live-root"))
+            },
+            fail_run,
+        ),
+    ];
+    // A parent owned by another account needs privileges to create, so the
+    // unsafe-parent row uses Linux mode bits; Windows owner trust is covered
+    // by the same `trusted_parent` call on the real parent of every row.
+    #[cfg(unix)]
+    rows.push(row(
+        "parent writable by others without the sticky bit",
+        move |b| {
+            use std::os::unix::fs::PermissionsExt;
+            let open = b.join("open");
+            std::fs::create_dir(&open).unwrap();
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+            at(b, &format!("{s}open{s}live-root"))
+        },
+        ok,
+    ));
+    #[cfg(windows)]
+    rows.extend([
+        row("forward slash", |b| at(b, "/live-root"), ok),
+        row(
+            "only forward slashes",
+            |b| {
+                Some(
+                    format!("{}/live-root", b.display())
+                        .replace('\\', "/")
+                        .into(),
+                )
+            },
+            ok,
+        ),
+        row("trailing dot alias", |b| at(b, r"\live-root."), ok),
+        row("trailing space alias", |b| at(b, r"\live-root "), ok),
+        row("alternate data stream", |b| at(b, r"\live-root:stream"), ok),
+        row(
+            "verbatim prefix",
+            |b| Some(format!(r"\\?\{}\live-root", b.display()).into()),
+            ok,
+        ),
+    ]);
+    for (name, setup, verify) in rows {
+        let parent = private_parent();
+        let base = base(&parent);
+        std::fs::create_dir(base.join("sub")).unwrap();
+        let raw = setup(&base);
+        let before = snapshot(&base);
+        let result = prepare_run_with(raw.as_deref(), &verify);
+        assert!(result.is_err(), "{name}: accepted");
+        drop(result);
+        assert_eq!(snapshot(&base), before, "{name}: disk changed");
+    }
+    // Positive control: the normalized spelling is accepted and created.
     let parent = private_parent();
-    let target = parent.path().join("target");
-    private_dir(&target);
-    let link = parent.path().join("link");
-    link_dir(&target, &link);
-    let before = entries(parent.path());
-    // A missing leaf below a link would otherwise be created in `target`.
-    assert!(run_dir(&link.join("live-root")).is_err());
-    // A link as the root itself, even to a private directory.
-    assert!(run_dir(&link).is_err());
-    // A missing parent is refused rather than created.
-    assert!(run_dir(&parent.path().join("absent").join("live-root")).is_err());
-    assert_eq!(entries(&target), 0, "nothing created through the link");
-    assert_eq!(entries(parent.path()), before, "nothing created beside it");
-    assert!(!parent.path().join("absent").exists());
+    let root = base(&parent).join("live-root");
+    let run = prepare_run(Some(root.as_os_str())).unwrap();
+    assert!(is_private(&root) && is_private(run.path()));
+    run.close().unwrap();
 }
 
 #[test]
 #[ignore = "launcher for the live Playwright suite; see docs/m6-acceptance.md"]
 fn live_dashboard_server() {
-    let root = PathBuf::from(required("ARX_LIVE_ROOT"));
+    // Read every input before the first filesystem write.
+    let raw_root = std::env::var_os("ARX_LIVE_ROOT");
     let dist = PathBuf::from(required("ARX_LIVE_DIST"));
     let port: u16 = required("ARX_LIVE_PORT").parse().unwrap();
     let token = required("ARX_LIVE_RUN");
@@ -577,7 +853,8 @@ fn live_dashboard_server() {
     );
     let password = zeroize::Zeroizing::new(required("ARX_LIVE_PASSWORD"));
     assert!(dist.join("index.html").is_file(), "build ui/dist first");
-    let run = run_dir(&root).unwrap_or_else(|reason| panic!("{reason}"));
+    let run = prepare_run(raw_root.as_deref()).unwrap_or_else(|reason| panic!("{reason}"));
+    let root = PathBuf::from(raw_root.expect("accepted root"));
     let state = run.path().join("state");
     private_dir(&state);
     let vm = seed(&state);

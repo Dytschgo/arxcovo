@@ -23,6 +23,11 @@ process.env.ARX_LIVE_PORT ??= '47613';
 process.env.ARX_LIVE_PASSWORD ??= `synthetic-${randomBytes(18).toString('base64url')}`;
 process.env.ARX_LIVE_RUN ??= randomBytes(16).toString('hex');
 process.env.ARX_LIVE_ROOT ??= path.join(tmpdir(), 'arx-live-dashboard');
+// Refuse a non-normalized root (`..`, `.` segments, trailing or mixed
+// separators) before anything starts; the launcher repeats a stricter check.
+if (path.resolve(process.env.ARX_LIVE_ROOT) !== process.env.ARX_LIVE_ROOT) {
+  throw new Error('ARX_LIVE_ROOT must be an absolute, normalized path.');
+}
 process.env.ARX_LIVE_SHOTS ??= path.join(repo, 'test-results', 'm6-live-screenshots');
 
 const origin = `http://localhost:${process.env.ARX_LIVE_PORT}`;
