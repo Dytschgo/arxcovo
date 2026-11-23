@@ -5,7 +5,7 @@
 // page, no permissions, no popups and navigation locked to that origin.
 const { app, BrowserWindow, protocol, session } = require('electron');
 const path = require('node:path');
-const { createAssetRoot, readAsset } = require('./assets.cjs');
+const { loadAssetTable } = require('./assets.cjs');
 
 const SCHEME = 'app';
 const HOST = 'arxcovo';
@@ -51,7 +51,7 @@ function respond(status, body, type) {
   return new Response(body, { status, headers: { ...BASE_HEADERS, 'Content-Type': type } });
 }
 
-async function handle(assetRoot, request) {
+function handle(assets, request) {
   if (!isAppUrl(request.url)) return respond(404, 'Not found', 'text/plain');
   const url = new URL(request.url);
   if (url.pathname.startsWith('/api/')) {
@@ -60,7 +60,8 @@ async function handle(assetRoot, request) {
     return respond(503, JSON.stringify({ error: { code: 'unavailable', message: 'This desktop build is not connected to an arxd host yet.' } }), 'application/json');
   }
   if (request.method !== 'GET' && request.method !== 'HEAD') return respond(405, 'Method not allowed', 'text/plain');
-  const asset = await readAsset(assetRoot, url.pathname);
+  // Served from the startup snapshot only: no filesystem access per request.
+  const asset = assets.get(url.pathname);
   if (!asset) return respond(404, 'Not found', 'text/plain');
   return respond(200, asset.body, asset.type);
 }
@@ -78,9 +79,9 @@ function lockDown(contents) {
 app.on('web-contents-created', (_event, contents) => lockDown(contents));
 
 app.whenReady().then(() => {
-  let assetRoot;
+  let assets;
   try {
-    assetRoot = createAssetRoot(DIST);
+    assets = loadAssetTable(DIST);
   } catch (error) {
     console.error(`Arxcovo cannot start: ${error.message}`);
     app.exit(1);
@@ -90,7 +91,7 @@ app.whenReady().then(() => {
   ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
   ses.setPermissionCheckHandler(() => false);
   ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] }, (_details, callback) => callback({ cancel: true }));
-  protocol.handle(SCHEME, request => handle(assetRoot, request));
+  protocol.handle(SCHEME, request => handle(assets, request));
 
   const window = new BrowserWindow({
     width: 1280,

@@ -1,11 +1,11 @@
 'use strict';
-// Unit tests for the app:// asset resolver with real junction/symlink fixtures.
+// Unit tests for the startup asset table, with real junction/symlink fixtures.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
-const { createAssetRoot, readAsset } = require('./assets.cjs');
+const { loadAssetTable } = require('./assets.cjs');
 
 // Directory junctions need no privilege on Windows; elsewhere this is a dir symlink.
 const linkDir = (target, at) => fs.symlinkSync(target, at, 'junction');
@@ -16,125 +16,59 @@ function fixture() {
   const dist = path.join(base, 'dist');
   const outside = path.join(base, 'outside');
   fs.mkdirSync(path.join(dist, 'assets'), { recursive: true });
-  fs.mkdirSync(path.join(outside, 'assets'), { recursive: true });
+  fs.mkdirSync(outside);
   fs.writeFileSync(path.join(dist, 'index.html'), '<!doctype html><title>Arxcovo</title>');
   fs.writeFileSync(path.join(dist, 'assets', 'app.js'), 'console.log(1)');
+  fs.writeFileSync(path.join(dist, 'assets', 'app.js.map'), '{}');
   fs.writeFileSync(path.join(outside, 'secret.js'), 'secret');
-  fs.writeFileSync(path.join(outside, 'assets', 'app.js'), 'attacker');
   return { base, dist, outside, cleanup: () => fs.rmSync(base, { recursive: true, force: true }) };
 }
 
-test('serves regular files under the root with their content type', async t => {
+test('serves the startup snapshot with content types; unserved types are left out', async t => {
   const f = fixture();
   t.after(f.cleanup);
-  const root = createAssetRoot(f.dist);
-  const index = await readAsset(root, '/');
+  const table = loadAssetTable(f.dist);
+  assert.equal(table.size, 2);
+  const index = table.get('/');
   assert.equal(index.type, 'text/html; charset=utf-8');
   assert.match(index.body.toString(), /Arxcovo/);
-  assert.equal((await readAsset(root, '/assets/app.js')).body.toString(), 'console.log(1)');
+  assert.equal(table.get('/assets/app.js').body.toString(), 'console.log(1)');
+  assert.equal(table.get('/assets/app.js.map'), null);
 });
 
-test('refuses traversal, encoded traversal, backslashes, NUL, unknown types and directories', async t => {
+test('lookups refuse traversal, dot segments, backslashes, NUL and bad encodings', async t => {
   const f = fixture();
   t.after(f.cleanup);
-  const root = createAssetRoot(f.dist);
-  for (const p of ['/../outside/secret.js', '/%2e%2e/outside/secret.js', '/..%2foutside%2fsecret.js', '/assets%5c..%5c..%5coutside%5csecret.js', '/index.html%00.js', '/index.html.map', '/assets', '/%E0%A4%A']) {
-    assert.equal(await readAsset(root, p), null, p);
+  const table = loadAssetTable(f.dist);
+  for (const p of ['/../outside/secret.js', '/%2e%2e/outside/secret.js', '/assets/../index.html', '//index.html', '/./index.html', '/assets%5capp.js', '/index.html%00', '/%E0%A4%A', 'index.html', '/assets', '/missing.js']) {
+    assert.equal(table.get(p), null, p);
   }
 });
 
-test('a root that is itself a junction or symlink, or a file, is rejected at startup', async t => {
+test('a file changed or swapped after startup is never served', async t => {
   const f = fixture();
   t.after(f.cleanup);
-  const redirected = path.join(f.base, 'redirected-dist');
-  linkDir(f.dist, redirected);
-  assert.throws(() => createAssetRoot(redirected), /redirected/);
-  fs.writeFileSync(path.join(f.base, 'file-root'), 'x');
-  assert.throws(() => createAssetRoot(path.join(f.base, 'file-root')), /not a plain directory/);
+  const table = loadAssetTable(f.dist);
+  const target = path.join(f.dist, 'assets', 'app.js');
+  fs.writeFileSync(target, 'changed after startup');
+  assert.equal(table.get('/assets/app.js').body.toString(), 'console.log(1)');
+  fs.rmSync(path.join(f.dist, 'assets'), { recursive: true });
+  linkDir(f.outside, path.join(f.dist, 'assets'));
+  assert.equal(table.get('/assets/app.js').body.toString(), 'console.log(1)');
+  assert.equal(table.get('/assets/secret.js'), null);
+  // Returned bytes are copies: mutating them does not change the table.
+  table.get('/index.html').body.fill(0);
+  assert.match(table.get('/index.html').body.toString(), /Arxcovo/);
 });
 
-test('a junction on an ancestor of the root is rejected at startup', async t => {
-  const f = fixture();
-  t.after(f.cleanup);
-  const parentLink = path.join(f.base, 'parent-link');
-  linkDir(f.base, parentLink);
-  assert.throws(() => createAssetRoot(path.join(parentLink, 'dist')), /redirected/);
-});
-
-test('an ancestor swapped for a junction after startup serves nothing', async t => {
-  const f = fixture();
-  t.after(f.cleanup);
-  const app = path.join(f.base, 'app');
-  fs.mkdirSync(app);
-  fs.renameSync(f.dist, path.join(app, 'dist'));
-  const root = createAssetRoot(path.join(app, 'dist'));
-  // Replace the ancestor with a junction to a look-alike tree.
-  const lookalike = path.join(f.base, 'lookalike');
-  fs.mkdirSync(path.join(lookalike, 'dist', 'assets'), { recursive: true });
-  fs.writeFileSync(path.join(lookalike, 'dist', 'index.html'), 'attacker');
-  fs.renameSync(app, path.join(f.base, 'app-moved'));
-  linkDir(lookalike, app);
-  assert.equal(await readAsset(root, '/index.html'), null);
-});
-
-test('a root replaced by a junction after startup serves nothing', async t => {
-  const f = fixture();
-  t.after(f.cleanup);
-  const root = createAssetRoot(f.dist);
-  fs.renameSync(f.dist, path.join(f.base, 'moved'));
-  fs.writeFileSync(path.join(f.outside, 'index.html'), 'attacker');
-  linkDir(f.outside, f.dist);
-  assert.equal(await readAsset(root, '/index.html'), null);
-});
-
-test('a junction inside the root cannot reach files outside it', async t => {
+test('a startup walk that hits a junction refuses to start', async t => {
   const f = fixture();
   t.after(f.cleanup);
   linkDir(f.outside, path.join(f.dist, 'escape'));
-  const root = createAssetRoot(f.dist);
-  assert.equal(await readAsset(root, '/escape/secret.js'), null);
+  assert.throws(() => loadAssetTable(f.dist), /link in asset tree: escape/);
 });
 
-test('a directory swapped for a junction just before the open is refused after it', async t => {
-  const f = fixture();
-  t.after(f.cleanup);
-  const root = createAssetRoot(f.dist);
-  const result = await readAsset(root, '/assets/app.js', {
-    beforeOpen: () => {
-      fs.renameSync(path.join(f.dist, 'assets'), path.join(f.base, 'assets-moved'));
-      linkDir(path.join(f.outside, 'assets'), path.join(f.dist, 'assets'));
-    },
-  });
-  assert.equal(result, null);
-});
-
-test('a file replaced between the open and the checks is refused (identity mismatch)', async t => {
-  const f = fixture();
-  t.after(f.cleanup);
-  const root = createAssetRoot(f.dist);
-  const target = path.join(f.dist, 'assets', 'app.js');
-  const result = await readAsset(root, '/assets/app.js', {
-    afterOpen: () => {
-      fs.renameSync(target, path.join(f.base, 'opened-file.js'));
-      fs.writeFileSync(target, 'replacement');
-    },
-  });
-  assert.equal(result, null);
-});
-
-test('the byte cap counts bytes read, so a file growing after the size check is refused', async t => {
-  const f = fixture();
-  t.after(f.cleanup);
-  const root = createAssetRoot(f.dist, { maxBytes: 1024 });
-  assert.ok(await readAsset(root, '/assets/app.js'));
-  const target = path.join(f.dist, 'assets', 'app.js');
-  const result = await readAsset(root, '/assets/app.js', { afterOpen: () => fs.appendFileSync(target, 'x'.repeat(4096)) });
-  assert.equal(result, null);
-  fs.writeFileSync(path.join(f.dist, 'big.js'), 'y'.repeat(2048));
-  assert.equal(await readAsset(root, '/big.js'), null);
-});
-
-test('a file symlink inside the root is refused', async t => {
+test('a startup walk that hits a file symlink refuses to start', async t => {
   const f = fixture();
   t.after(f.cleanup);
   try {
@@ -143,6 +77,75 @@ test('a file symlink inside the root is refused', async t => {
     if (error.code === 'EPERM') return t.skip('file symlinks need privilege on this Windows account');
     throw error;
   }
-  const root = createAssetRoot(f.dist);
-  assert.equal(await readAsset(root, '/assets/link.js'), null);
+  assert.throws(() => loadAssetTable(f.dist), /link in asset tree: assets\/link\.js/);
+});
+
+test('a root that is a junction, has a junction ancestor, or is a file refuses to start', async t => {
+  const f = fixture();
+  t.after(f.cleanup);
+  const redirected = path.join(f.base, 'redirected-dist');
+  linkDir(f.dist, redirected);
+  assert.throws(() => loadAssetTable(redirected), /redirected/);
+  const parentLink = path.join(f.base, 'parent-link');
+  linkDir(f.base, parentLink);
+  assert.throws(() => loadAssetTable(path.join(parentLink, 'dist')), /redirected/);
+  fs.writeFileSync(path.join(f.base, 'file-root'), 'x');
+  assert.throws(() => loadAssetTable(path.join(f.base, 'file-root')), /not a plain directory/);
+});
+
+test('a file larger than the per-file cap at startup refuses to start', async t => {
+  const f = fixture();
+  t.after(f.cleanup);
+  fs.writeFileSync(path.join(f.dist, 'big.js'), 'y'.repeat(2048));
+  assert.throws(() => loadAssetTable(f.dist, { limits: { maxFileBytes: 1024 } }), /larger than 1024 bytes: big\.js/);
+});
+
+test('a file growing during the startup read is refused by the bounded reader', async t => {
+  const f = fixture();
+  t.after(f.cleanup);
+  const target = path.join(f.dist, 'assets', 'app.js');
+  // The hook runs after the size check passed, so only the read loop can refuse.
+  const hooks = { afterStat: file => { if (file === target) fs.appendFileSync(target, 'x'.repeat(4096)); } };
+  assert.throws(() => loadAssetTable(f.dist, { limits: { maxFileBytes: 1024 }, hooks }), /grew past 1024 bytes while being read: assets\/app\.js/);
+});
+
+test('file-count, total-byte and depth caps refuse to start', async t => {
+  const f = fixture();
+  t.after(f.cleanup);
+  assert.throws(() => loadAssetTable(f.dist, { limits: { maxFiles: 1 } }), /more than 1 files/);
+  assert.throws(() => loadAssetTable(f.dist, { limits: { maxTotalBytes: 20 } }), /assets exceed 20 bytes/);
+  fs.mkdirSync(path.join(f.dist, 'a', 'b', 'c'), { recursive: true });
+  fs.writeFileSync(path.join(f.dist, 'a', 'b', 'c', 'deep.js'), '1');
+  assert.throws(() => loadAssetTable(f.dist, { limits: { maxDepth: 2 } }), /deeper than 2/);
+});
+
+// Swaps happen at the beforeOpen seam, while no handle is open: Windows
+// refuses to rename a directory that has an open file inside it.
+test('a directory swapped for a junction during the walk refuses to start', async t => {
+  const f = fixture();
+  t.after(f.cleanup);
+  const assets = path.join(f.dist, 'assets');
+  fs.writeFileSync(path.join(f.outside, 'app.js'), 'attacker');
+  const hooks = {
+    beforeOpen: file => {
+      if (file !== path.join(assets, 'app.js')) return;
+      fs.renameSync(assets, path.join(f.base, 'assets-moved'));
+      linkDir(f.outside, assets);
+    },
+  };
+  assert.throws(() => loadAssetTable(f.dist, { hooks }), /changed during load/);
+});
+
+test('a root replaced during the walk refuses to start', async t => {
+  const f = fixture();
+  t.after(f.cleanup);
+  const hooks = {
+    beforeOpen: file => {
+      if (file !== path.join(f.dist, 'index.html')) return;
+      fs.renameSync(f.dist, path.join(f.base, 'dist-moved'));
+      fs.mkdirSync(f.dist);
+      fs.writeFileSync(path.join(f.dist, 'index.html'), 'attacker');
+    },
+  };
+  assert.throws(() => loadAssetTable(f.dist, { hooks }), /changed during load/);
 });
