@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 const GUEST: &str = env!("CARGO_BIN_EXE_arx-guest");
 #[cfg(target_os = "linux")]
 const USAGE: &[u8] = b"Usage: arx-guest --version | serve-stdio | serve-virtio\n";
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+const USAGE: &[u8] = b"Usage: arx-guest --version | serve-stdio | serve-service\n";
+#[cfg(not(any(target_os = "linux", windows)))]
 const USAGE: &[u8] = b"Usage: arx-guest --version | serve-stdio\n";
 
 fn run_guest(
@@ -77,6 +79,9 @@ fn bare_unknown_and_extra_arguments_fail_with_fixed_usage() {
         &["--version", "unexpected"],
         &["serve-stdio", "unexpected"],
         &["serve-virtio", "/dev/null"],
+        &["serve-service", "unexpected"],
+        #[cfg(not(windows))]
+        &["serve-service"],
         #[cfg(not(target_os = "linux"))]
         &["serve-virtio"],
     ] {
@@ -85,6 +90,18 @@ fn bare_unknown_and_extra_arguments_fail_with_fixed_usage() {
         assert!(output.stdout.is_empty());
         assert_eq!(output.stderr, USAGE);
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn service_dispatch_refuses_to_run_outside_scm() {
+    let output = run_guest(&["serve-service"], Stdio::piped(), |_, _| {});
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"arx-guest: service dispatcher unavailable\n"
+    );
 }
 
 #[test]
