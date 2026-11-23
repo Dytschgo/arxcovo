@@ -1263,10 +1263,13 @@ impl<C: Clock> VmController<C> {
         subject: Subject<'_>,
         action: i64,
     ) -> Result<Result<Option<store::Replay>, Refusal>> {
-        let closed = self
-            .closed
+        // Only closed admission preempts replay here. Custody uncertainty is
+        // decided by the eventual admission after scope and subject checks.
+        let gate = self
+            .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        let closed = gate.closed;
         let binding = store::Binding {
             principal,
             key,
@@ -1275,7 +1278,7 @@ impl<C: Clock> VmController<C> {
         };
         map_full(
             self.store
-                .transact(|db| binding.replay(db, utc(self.clock.now())?, *closed)),
+                .transact(|db| binding.replay(db, utc(self.clock.now())?, closed)),
         )
     }
 
@@ -1362,10 +1365,7 @@ impl<C: Clock> VmController<C> {
                             Err(Refusal::Expired)
                         }
                         None => Err(Refusal::NotFound),
-                        Some((state, expires)) if state == 4 || expires <= now => {
-                            Err(Refusal::Expired)
-                        }
-                        Some(_) => Ok(()),
+                        Some(lease) => lease.check(now),
                     }));
                 }
                 ForegroundSubject::Start(_) => Operation::Start,
@@ -1381,10 +1381,9 @@ impl<C: Clock> VmController<C> {
                     return Ok(Err(PrecheckInner::Refused(Refusal::Expired)));
                 }
                 // A live, owned generation that is not running has no channel.
-                Some((state, expires))
-                    if state != 4
-                        && expires > now
-                        && state != 2
+                Some(lease)
+                    if lease.check(now).is_ok()
+                        && lease.state != 2
                         && matches!(subject, ForegroundSubject::Script(_)) =>
                 {
                     return Ok(Err(PrecheckInner::Offline));
@@ -1426,6 +1425,18 @@ impl<C: Clock> VmController<C> {
                 utc(self.clock.now())?,
             )?))
         })
+    }
+}
+
+impl<C: Clock> VmController<C> {
+    /// Whether the last reaper turn left custody or accounting unresolved.
+    /// The foreground reports an unresolved final drain from this flag.
+    pub(crate) fn foreground_custody_uncertain(&self) -> Result<bool> {
+        Ok(self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?
+            .custody_uncertain)
     }
 }
 

@@ -267,7 +267,7 @@ struct VmFile {
 pub(crate) struct TestVms {
     pub(crate) enabled: bool,
     #[serde(default, deserialize_with = "present")]
-    runtime: Option<VmRuntimeProfile>,
+    pub(crate) runtime: Option<VmRuntimeProfile>,
     #[serde(default, deserialize_with = "present")]
     recipes: Option<Vec<RecipePins>>,
 }

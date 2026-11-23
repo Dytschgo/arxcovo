@@ -199,7 +199,7 @@ pub async fn run_vm_profile(profile: crate::config::VmForeground) -> Result<()> 
     use crate::mcp::vm::Supervisor;
     let crate::config::VmForeground { config, profile } = profile;
     let endpoint = config.local.as_ref().context("server-config")?;
-    let supervisor = Supervisor::open(&config.state_dir, &profile).context("server-state")?;
+    let supervisor = Supervisor::open(&config.state_dir, profile).context("server-state")?;
     // One bounded sweep before any tool is published.
     supervisor.startup_sweep().context("server-state")?;
     let listener = Listener::bind(endpoint).context("server-bind")?;

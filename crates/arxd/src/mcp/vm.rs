@@ -1,6 +1,6 @@
 //! Foreground-only VM tools. This module is selected after local authentication.
 use crate::{
-    config::TestVms,
+    config::{TestVms, VmRuntimeProfile},
     service::Shutdown,
     store::ListActivity,
     vm::{runtime::NativeRefusal, *},
@@ -93,6 +93,7 @@ fn refusal_wire(reason: Refusal) -> &'static str {
         Refusal::Cpu => "cpu",
         Refusal::Ram => "ram",
         Refusal::Shutdown => "shutdown",
+        Refusal::CleanupUnconfirmed => "cleanup_unconfirmed",
     }
 }
 
@@ -110,6 +111,8 @@ fn refusal_from_wire(reason: &str) -> Option<Refusal> {
         .find(|code| refusal_wire(*code) == reason)
 }
 
+/// The codes the v7 audit stores exactly (1..=18). `cleanup_unconfirmed` has
+/// no stored code yet, so the foreground never files it as another reason.
 const REFUSAL_CODES: [Refusal; 18] = {
     use Refusal::*;
     [
@@ -177,10 +180,15 @@ pub(crate) struct Supervisor {
     host_id: Id,
     recipe: Option<(Id, [u8; 32])>,
     native_refusal: NativeRefusal,
+    /// The validated native runtime profile, if configured. It only selects
+    /// the closed candidate runtime; it never authorizes a launch here.
+    runtime: Option<VmRuntimeProfile>,
+    #[cfg(test)]
+    ticks: Mutex<Option<tests::TestTicks>>,
 }
 
 impl Supervisor {
-    pub(crate) fn open(root: &Path, profile: &TestVms) -> anyhow::Result<Arc<Self>> {
+    pub(crate) fn open(root: &Path, mut profile: TestVms) -> anyhow::Result<Arc<Self>> {
         let reason = if !profile.enabled {
             NativeRefusal::Disabled
         } else if cfg!(all(windows, target_arch = "x86_64")) {
@@ -188,15 +196,18 @@ impl Supervisor {
         } else {
             NativeRefusal::UnsupportedPlatform
         };
+        let policy = profile.policy();
+        let recipe = profile.recipe()?;
         Self::new(
             root,
-            profile.policy(),
+            policy,
             ForegroundClock {
                 #[cfg(test)]
                 utc: None,
             },
-            profile.recipe()?,
+            recipe,
             reason,
+            profile.runtime.take(),
         )
     }
 
@@ -206,6 +217,7 @@ impl Supervisor {
         clock: ForegroundClock,
         recipe: Option<(Id, [u8; 32])>,
         native_refusal: NativeRefusal,
+        runtime: Option<VmRuntimeProfile>,
     ) -> anyhow::Result<Arc<Self>> {
         let mut secret = [0; 32];
         let mut host_id = [0; 16];
@@ -225,6 +237,9 @@ impl Supervisor {
             host_id,
             recipe,
             native_refusal,
+            runtime,
+            #[cfg(test)]
+            ticks: Mutex::new(None),
         }))
     }
 
@@ -242,53 +257,63 @@ impl Supervisor {
             .map_err(|_| anyhow::anyhow!("VM supervisor unavailable"))
     }
 
+    /// Close foreground admission, then controller admission. The same lock
+    /// covers connection close, request cancellation sampling and the
+    /// complete SQLite commit and worker registration.
     pub(crate) fn close(&self) {
-        // The same lock covers connection close, request cancellation sampling
-        // and the complete SQLite commit and worker registration.
         if let Ok(mut gate) = self.gate.lock() {
             gate.closed = true;
         }
+        // A failed close leaves the controller gate poisoned, which already
+        // refuses every admission; teardown continues either way.
+        let _ = self.controller.close_admission();
         self.cancel.cancel();
     }
 
-    /// The startup sweep before the listener is published.
-    // Phase 2: `VmController::sweep_once(&CandidateRuntime)` from 4c2b.
+    fn candidate(&self) -> runtime::CandidateRuntime<'_> {
+        runtime::CandidateRuntime::new(self.runtime.as_ref())
+    }
+
+    /// One bounded reaper turn before the listener is published.
     pub(crate) fn startup_sweep(&self) -> anyhow::Result<()> {
         self.sweep()
     }
 
-    /// The supervised periodic reaper, cancelled and joined by the caller.
-    // Phase 2: `run_reaper(&runtime, &mut MonotonicReaperTicks::default(), stop)`.
-    pub(crate) async fn run_reaper(&self, stop: &Shutdown) -> anyhow::Result<()> {
-        let mut ticks = tokio::time::interval(Duration::from_secs(5));
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticks.tick().await;
-        loop {
-            tokio::select! {
-                biased;
-                _ = stop.cancelled() => return Ok(()),
-                _ = ticks.tick() => self.sweep()?,
-            }
-        }
-    }
-
-    // Adapter for the pre-4c2b controller: mark due rows, but retain all
-    // production custody claims until the reaper can positively prove release.
     fn sweep(&self) -> anyhow::Result<()> {
-        let gate = self.lock()?;
-        if gate.closed {
+        #[cfg(test)]
+        if let Some(reaper) = self.lock()?.fixture.as_ref().map(tests::Fixture::reaper) {
+            self.controller.sweep_with(&reaper, &*reaper.custody)?;
             return Ok(());
         }
-        #[cfg(test)]
-        if let Some(fixture) = &gate.fixture {
-            return fixture.sweep(&self.controller);
-        }
-        self.controller.claim_expired()?;
-        for claim in self.controller.expiry_intents()? {
-            self.controller
-                .finish_expiry(claim, CleanupResult::Unconfirmed)?;
-        }
+        self.controller.sweep_once(&self.candidate())?;
         Ok(())
+    }
+
+    /// The supervised periodic reaper; the caller cancels and joins it.
+    pub(crate) async fn run_reaper(&self, stop: &Shutdown) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(mut ticks) = self.ticks.lock().ok().and_then(|mut ticks| ticks.take()) {
+            let reaper = self.lock()?.fixture.as_ref().map(tests::Fixture::reaper);
+            return match reaper {
+                Some(reaper) => {
+                    self.controller
+                        .run_reaper_with(&reaper, &*reaper.custody, &mut ticks, stop)
+                        .await
+                }
+                None => {
+                    self.controller
+                        .run_reaper(&self.candidate(), &mut ticks, stop)
+                        .await
+                }
+            };
+        }
+        self.controller
+            .run_reaper(
+                &self.candidate(),
+                &mut MonotonicReaperTicks::default(),
+                stop,
+            )
+            .await
     }
 
     /// Cancel and join every admitted worker and its terminal audit write.
@@ -307,23 +332,25 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Final controller recovery, after the reaper and workers are joined.
+    /// Final controller recovery, after the reaper and workers are joined,
+    /// then one more custody turn. Unresolved custody, including build or
+    /// staging quarantine and legacy uncertain rows, is an unconfirmed drain.
     /// The blocking task stays owned until it returns, even past `bound`, so
     /// it never writes after this call reports.
-    // Phase 2: `VmController::recover_after_drain()` from 4c2b.
-    pub(crate) async fn recover(&self, bound: Duration) -> anyhow::Result<()> {
+    pub(crate) async fn recover(self: &Arc<Self>, bound: Duration) -> anyhow::Result<()> {
         #[cfg(test)]
-        let fixture = self.lock()?.drained.take();
-        let controller = self.controller.clone();
-        let mut task = tokio::task::spawn_blocking(move || {
-            controller.shutdown()?;
-            #[cfg(test)]
-            if let Some(fixture) = fixture {
-                fixture.recover(&controller)?;
+        {
+            let drained = self.lock()?.drained.take();
+            if let Some(drained) = drained {
+                drained.release().await?;
             }
+        }
+        let supervisor = self.clone();
+        let mut task = tokio::task::spawn_blocking(move || {
+            supervisor.controller.recover_after_drain()?;
+            supervisor.sweep()?;
             anyhow::ensure!(
-                controller.recovery_intents()?.is_empty()
-                    && controller.expiry_intents()?.is_empty(),
+                !supervisor.controller.foreground_custody_uncertain()?,
                 "VM release unconfirmed"
             );
             Ok(())
@@ -1171,15 +1198,19 @@ mod tests {
         local::{self, Endpoint, Listener},
         vm::{
             guest::GuestChannel,
-            paths::{ArtifactPin, FileIdentity},
             qmp::Qmp,
+            reaper::{CleanupWork, fixture::FixtureCustody},
         },
     };
     use anyhow::{Result, ensure};
     use rmcp::{
         RoleClient, ServiceExt, service::RunningService, transport::async_rw::AsyncRwTransport,
     };
-    use std::{collections::HashMap, fs, io::Write, path::PathBuf, sync::atomic::AtomicI64};
+    use std::{
+        collections::{HashMap, HashSet},
+        fs,
+        sync::atomic::AtomicI64,
+    };
     use tokio::{
         io::{
             AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf,
@@ -1216,49 +1247,22 @@ mod tests {
     const UTC: i64 = 1_800_000_000_000;
     const RECIPE: (Id, [u8; 32]) = ([3; 16], [4; 32]);
 
+    /// Staged fixture files with real file identities, written through the
+    /// reaper's own test custody so expiry and recovery proofs are the 4c2b
+    /// reaper's, not this module's. Pathname custody never qualifies native.
     #[derive(Clone)]
-    struct Artifacts {
-        root: PathBuf,
-    }
+    struct Artifacts(Arc<FixtureCustody>);
 
     impl Artifacts {
-        fn path(&self, slot: ArtifactSlot) -> PathBuf {
-            self.root.join(hex::encode(slot.key))
-        }
-
         fn write(&self, slot: ArtifactSlot) -> Result<ArtifactEvidence> {
-            let content = slot.role.as_bytes();
-            let path = self.path(slot);
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?
-                .write_all(content)?;
-            let pin = ArtifactPin {
-                size: content.len() as u64,
-                sha256: Sha256::digest(content).into(),
-            };
-            ensure!(
-                pin.verify(fs::File::open(path)?, 128)?,
-                "fixture artifact changed"
-            );
-            Ok(ArtifactEvidence {
-                identity: FileIdentity {
-                    volume: 1,
-                    file: slot.key,
-                },
-                directory: slot.generation,
-                pin,
-            })
+            self.0.stage(slot, slot.role.as_bytes())
         }
 
         fn verify(&self, slot: ArtifactSlot, proof: ArtifactEvidence) -> Result<()> {
-            let path = self.path(slot);
+            let path = self.0.path(slot.role, slot.key);
             let metadata = fs::symlink_metadata(&path)?;
             ensure!(
-                metadata.file_type().is_file()
-                    && proof.identity.file == slot.key
-                    && proof.pin.verify(fs::File::open(path)?, 128)?,
+                metadata.file_type().is_file() && proof.pin.verify(fs::File::open(path)?, 128)?,
                 "fixture artifact changed"
             );
             Ok(())
@@ -1266,7 +1270,44 @@ mod tests {
 
         fn remove(&self, slot: ArtifactSlot, proof: ArtifactEvidence) -> Result<()> {
             self.verify(slot, proof)?;
-            Ok(fs::remove_file(self.path(slot))?)
+            Ok(fs::remove_file(self.0.path(slot.role, slot.key))?)
+        }
+    }
+
+    /// The fixture's teardown authority for the 4c2b reaper. Release is
+    /// offline only when no fixture boot or worker holds the subject.
+    #[derive(Clone)]
+    pub(super) struct FixtureReaper {
+        live: Arc<Mutex<Live>>,
+        pub(super) custody: Arc<FixtureCustody>,
+    }
+
+    impl runtime::ReaperRuntime for FixtureReaper {
+        fn quiesce(&self, work: &CleanupWork, _: Instant) -> runtime::Quiesced {
+            let live = self.live.lock().unwrap();
+            match work.kind.vm() {
+                Some(vm) if live.boots.contains_key(&vm) || live.working.contains(&vm) => {
+                    runtime::Quiesced::Unconfirmed
+                }
+                _ => runtime::Quiesced::Offline,
+            }
+        }
+
+        fn graceful_stop(&self, _: &CleanupWork, _: Instant) -> runtime::StopDisposition {
+            runtime::StopDisposition::ChargedQuarantine
+        }
+
+        fn force_reap(&self, _: &CleanupWork, _: Instant) -> runtime::StopDisposition {
+            runtime::StopDisposition::ChargedQuarantine
+        }
+    }
+
+    /// Injected reaper turns for the supervised runner.
+    pub(super) struct TestTicks(tokio::sync::mpsc::UnboundedReceiver<()>);
+
+    impl ReaperTick for TestTicks {
+        async fn next_tick(&mut self) -> bool {
+            self.0.recv().await.is_some()
         }
     }
 
@@ -1284,6 +1325,8 @@ mod tests {
         templates: HashMap<Id, Pair>,
         instances: HashMap<Id, Pair>,
         boots: HashMap<Id, Slot>,
+        /// VMs with a registered, not yet joined fixture worker.
+        working: HashSet<Id>,
     }
 
     pub(super) struct Fixture {
@@ -1292,13 +1335,14 @@ mod tests {
         artifacts: Artifacts,
         build_hold: Option<Arc<Notify>>,
         script_hold: Option<Arc<Notify>>,
+        /// A cancelled build worker reports failure, to witness drain errors.
+        fail_cancelled: bool,
         failed: bool,
     }
 
     pub(super) struct FixtureDrain {
         jobs: JoinSet<Result<()>>,
         live: Arc<Mutex<Live>>,
-        artifacts: Artifacts,
         failed: bool,
     }
 
@@ -1307,24 +1351,16 @@ mod tests {
             while let Some(result) = self.jobs.join_next().await {
                 self.failed |= !matches!(result, Ok(Ok(())));
             }
-            // Workers holding an exchange slot were joined above.
-            let boots = std::mem::take(&mut self.live.lock().unwrap().boots);
-            for slot in boots.into_values() {
-                if let Slot::Idle(boot) = slot {
-                    (*boot).release().await?;
-                }
-            }
             ensure!(!self.failed, "fixture job failed");
             Ok(self)
         }
 
-        pub(super) fn recover(self, controller: &Controller) -> Result<()> {
-            let live = self.live.lock().unwrap();
-            for claim in controller.recovery_intents()? {
-                if let Some((slots, [disk, vars])) = live.instances.get(&claim.vm).copied() {
-                    self.artifacts.verify(slots.disk, disk)?;
-                    self.artifacts.verify(slots.vars, vars)?;
-                    controller.finish_recovery(claim, CleanupResult::Confirmed)?;
+        /// Release idle boots once every worker holding a slot is joined.
+        pub(super) async fn release(self) -> Result<()> {
+            let boots = std::mem::take(&mut self.live.lock().unwrap().boots);
+            for slot in boots.into_values() {
+                if let Slot::Idle(boot) = slot {
+                    (*boot).release().await?;
                 }
             }
             Ok(())
@@ -1332,13 +1368,14 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(root: PathBuf) -> Self {
+        fn new(root: &Path) -> Self {
             Self {
                 jobs: JoinSet::new(),
                 live: Arc::new(Mutex::new(Live::default())),
-                artifacts: Artifacts { root },
+                artifacts: Artifacts(Arc::new(FixtureCustody::open(root).unwrap())),
                 build_hold: None,
                 script_hold: None,
+                fail_cancelled: false,
                 failed: false,
             }
         }
@@ -1347,35 +1384,23 @@ mod tests {
             self.live.lock().unwrap().boots.contains_key(&vm)
         }
 
+        pub(super) fn reaper(&self) -> FixtureReaper {
+            FixtureReaper {
+                live: self.live.clone(),
+                custody: self.artifacts.0.clone(),
+            }
+        }
+
         fn reap(&mut self) {
             while let Some(result) = self.jobs.try_join_next() {
                 self.failed |= !matches!(result, Ok(Ok(())));
             }
         }
 
-        pub(super) fn sweep(&self, controller: &Controller) -> Result<()> {
-            for claim in controller.claim_expired()? {
-                let mut live = self.live.lock().unwrap();
-                let result = if live.boots.contains_key(&claim.vm) {
-                    CleanupResult::Unconfirmed
-                } else if let Some((slots, [disk, vars])) = live.instances.get(&claim.vm).copied() {
-                    self.artifacts.remove(slots.disk, disk)?;
-                    self.artifacts.remove(slots.vars, vars)?;
-                    live.instances.remove(&claim.vm);
-                    CleanupResult::Confirmed
-                } else {
-                    CleanupResult::Unconfirmed
-                };
-                controller.finish_expiry(claim, result)?;
-            }
-            Ok(())
-        }
-
         pub(super) fn take_jobs(&mut self) -> FixtureDrain {
             FixtureDrain {
                 jobs: std::mem::take(&mut self.jobs),
                 live: self.live.clone(),
-                artifacts: self.artifacts.clone(),
                 failed: self.failed,
             }
         }
@@ -1447,9 +1472,12 @@ mod tests {
                     let principal = principal.clone();
                     let digest = spec.digest;
                     let hold = self.build_hold.take();
+                    let fail_cancelled = self.fail_cancelled;
                     self.jobs.spawn(async move {
                         if !released(hold, &cancel).await {
-                            return controller.fail_build(&worker, slots, true);
+                            controller.fail_build(&worker, slots, true)?;
+                            ensure!(!fail_cancelled, "fixture worker failed");
+                            return Ok(());
                         }
                         let spec = BuildRequest {
                             principal: &principal,
@@ -1570,10 +1598,15 @@ mod tests {
                 Admission::Refused(reason) => return Err(reason.into()),
             };
             let activity = worker.activity_id();
+            // Registered synchronously with the committed admission; the
+            // guard leaves the reaper's offline proof closed until joined.
+            registry.working.insert(vm);
+            let working = Working(live.clone(), vm);
             match work {
                 Work::Start => {
                     let controller = controller.clone();
                     self.jobs.spawn(async move {
+                        let _working = working;
                         let boot = Boot::start(&cancel).await;
                         match boot {
                             Ok(boot) => {
@@ -1609,6 +1642,7 @@ mod tests {
                     };
                     let controller = controller.clone();
                     self.jobs.spawn(async move {
+                        let _working = working;
                         let complete = match boot {
                             Some(boot) => boot.stop().await.is_ok(),
                             None => false,
@@ -1633,6 +1667,7 @@ mod tests {
                     worker.deadline += Duration::from_secs(6);
                     let controller = controller.clone();
                     self.jobs.spawn(async move {
+                        let _working = working;
                         let result = if released(hold, &cancel).await {
                             boot.channel.run_script(&cancel, script, seconds).await.ok()
                         } else {
@@ -1674,6 +1709,17 @@ mod tests {
         }
     }
 
+    /// Marks a VM as held by a fixture worker until the worker finishes.
+    struct Working(Arc<Mutex<Live>>, Id);
+
+    impl Drop for Working {
+        fn drop(&mut self) {
+            if let Ok(mut live) = self.0.lock() {
+                live.working.remove(&self.1);
+            }
+        }
+    }
+
     async fn released(hold: Option<Arc<Notify>>, cancel: &Shutdown) -> bool {
         if let Some(hold) = hold {
             tokio::select! {
@@ -1709,7 +1755,15 @@ mod tests {
             let (host, mut peer) = tokio::io::duplex(4096);
             let (serial, guest) = tokio::io::duplex(8192);
             let peer = tokio::spawn(async move {
-                peer.write_all(b"{\"QMP\":{\"version\":{\"qemu\":{\"major\":11,\"minor\":1,\"micro\":3},\"package\":\"\"},\"capabilities\":[]}}\n").await?;
+                let [major, minor, micro] = crate::vm::qemu_args::QEMU_VERSION
+                    .split('.')
+                    .map(|part| part.parse::<u32>().unwrap())
+                    .collect::<Vec<_>>()[..]
+                else {
+                    unreachable!("pinned QEMU version is major.minor.micro");
+                };
+                let greeting = json!({"QMP":{"version":{"qemu":{"major":major,"minor":minor,"micro":micro},"package":""},"capabilities":[]}});
+                peer.write_all(format!("{greeting}\n").as_bytes()).await?;
                 let mut peer = BufReader::new(peer);
                 for (id, command, result) in [
                     (1, "qmp_capabilities", json!({})),
@@ -1913,11 +1967,12 @@ mod tests {
             },
             Some(RECIPE),
             NativeRefusal::QualificationMissing,
+            None,
         )
         .unwrap();
         let hold_build = Arc::new(Notify::new());
         let hold_script = Arc::new(Notify::new());
-        let mut fixture = Fixture::new(media.clone());
+        let mut fixture = Fixture::new(&media);
         fixture.build_hold = Some(hold_build.clone());
         fixture.script_hold = Some(hold_script.clone());
         supervisor.gate.lock().unwrap().fixture = Some(fixture);
