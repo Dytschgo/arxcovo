@@ -28,7 +28,13 @@ mod vm {
         cloudflare::{CloudflareDns, DnsApi, DnsBearer, DnsError, Reconciled, Removal, Route},
     };
     use serde_json::{Value, json};
-    use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::oneshot,
+        task::JoinHandle,
+        time::timeout,
+    };
 
     const ZONE: &str = "1234567890abcdef1234567890abcdef";
     const TUNNEL: &str = "12345678-1234-4321-8234-123456789abc";
@@ -36,6 +42,7 @@ mod vm {
     const NONCE: &str = "11223344556677889900aabbccddeeff";
     const ID: &str = "aabbccddeeff00112233445566778899";
     const FOREIGN_ID: &str = "99aabbccddeeff001122334455667788";
+    const OTHER_ID: &str = "00112233445566778899aabbccddeeff";
     const CANARY: &str = "synthetic_dont_print_87e3";
     const LEG: Duration = Duration::from_millis(1500);
 
@@ -93,6 +100,11 @@ mod vm {
         post_count: usize,
         delete_count: usize,
         failed_create_reply: bool,
+        /// Committed beside the owned record by the next POST.
+        foreign_on_post: Option<Value>,
+        /// (release, committed): the next POST commits only after release, in a task that
+        /// outlives the client's abandoned request.
+        post_gate: Option<(oneshot::Receiver<()>, oneshot::Sender<()>)>,
         hostile: Option<Hostile>,
     }
 
@@ -170,6 +182,22 @@ mod vm {
                 Hostile::Stall => std::future::pending().await,
             };
         }
+        if parts.method == Method::POST {
+            let gate = state.lock().unwrap().post_gate.take();
+            if let Some((release, committed)) = gate {
+                let mut record: Value = serde_json::from_slice(&body).unwrap();
+                record["id"] = json!(ID);
+                state.lock().unwrap().post_count += 1;
+                let shared = state.clone();
+                tokio::spawn(async move {
+                    if release.await.is_ok() {
+                        shared.lock().unwrap().records.push(record);
+                        let _ = committed.send(());
+                    }
+                });
+                return std::future::pending().await;
+            }
+        }
         let prefix = format!("/client/v4/zones/{ZONE}/dns_records");
         let mut state = state.lock().unwrap();
         match (parts.method, parts.uri.path().strip_prefix(&prefix)) {
@@ -185,6 +213,9 @@ mod vm {
                 let mut record: Value = serde_json::from_slice(&body).unwrap();
                 record["id"] = json!(ID);
                 state.records.push(record.clone());
+                if let Some(foreign) = state.foreign_on_post.take() {
+                    state.records.push(foreign);
+                }
                 if state.failed_create_reply {
                     // The mutation happened but its acknowledgement did not arrive.
                     return (StatusCode::BAD_GATEWAY, CANARY).into_response();
@@ -256,6 +287,161 @@ mod vm {
             assert_eq!(state.records, [foreign]);
             assert_eq!(state.post_count, 1);
             assert_eq!(state.delete_count, 1);
+        })
+        .await
+        .unwrap();
+    }
+
+    fn owned_record(id: &str) -> Value {
+        json!({
+            "id": id, "name": NAME, "type": "CNAME", "proxied": true,
+            "content": format!("{TUNNEL}.cfargotunnel.com"), "comment": format!("arxcovo:{NONCE}")
+        })
+    }
+
+    #[tokio::test]
+    async fn dns_recovers_a_uniquely_owned_id_beside_foreign_records() {
+        timeout(LEG, async {
+            let foreign = json!({
+                "id": FOREIGN_ID, "name": NAME, "type": "TXT", "content": "foreign"
+            });
+            // A lost POST reply, then a valid POST reply, each racing a foreign record.
+            for lost_reply in [true, false] {
+                let fake = FakeDns::start().await;
+                let route = route();
+                fake.client.preflight(&route).await.unwrap();
+                {
+                    let mut state = fake.state.lock().unwrap();
+                    state.failed_create_reply = lost_reply;
+                    state.foreign_on_post = Some(foreign.clone());
+                }
+                let expected = if lost_reply {
+                    DnsError::Rejected
+                } else {
+                    DnsError::Conflict
+                };
+                assert_eq!(fake.client.create(&route).await, Err(expected));
+                let Reconciled::OwnedWithConflict(id) =
+                    fake.client.reconcile(&route).await.unwrap()
+                else {
+                    panic!("the uniquely owned record was not recovered");
+                };
+                assert_eq!(id.as_str(), ID);
+                assert_eq!(fake.client.preflight(&route).await, Err(DnsError::Conflict));
+                for _ in 0..2 {
+                    assert_eq!(
+                        fake.client.remove(&route, &id).await,
+                        Ok(Removal::ForeignOrAmbiguous)
+                    );
+                }
+                let state = fake.state.lock().unwrap();
+                assert_eq!(state.records, [foreign.clone()]);
+                assert_eq!((state.post_count, state.delete_count), (1, 1));
+            }
+
+            // Two marked records leave no attributable ID and nothing is deleted.
+            let fake = FakeDns::start().await;
+            let route = route();
+            fake.state.lock().unwrap().records = vec![owned_record(ID), owned_record(OTHER_ID)];
+            assert_eq!(
+                fake.client.reconcile(&route).await,
+                Ok(Reconciled::ForeignOrAmbiguous)
+            );
+            assert_eq!(fake.client.preflight(&route).await, Err(DnsError::Conflict));
+            assert_eq!(fake.state.lock().unwrap().delete_count, 0);
+
+            // The sole marked record is still plainly owned.
+            fake.state.lock().unwrap().records = vec![owned_record(ID)];
+            let Reconciled::Owned(id) = fake.client.reconcile(&route).await.unwrap() else {
+                panic!("the sole owned record was not attributed");
+            };
+            assert_eq!(id.as_str(), ID);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dns_settles_a_delayed_post_by_lookup_without_reposting() {
+        timeout(LEG, async {
+            let fake = FakeDns::start().await;
+            let route = route();
+            let (release, release_rx) = oneshot::channel();
+            let (committed_tx, committed) = oneshot::channel();
+            fake.state.lock().unwrap().post_gate = Some((release_rx, committed_tx));
+            // The single POST exceeds its bounded deadline before the fake commits it.
+            assert_eq!(fake.client.create(&route).await, Err(DnsError::Unavailable));
+            assert_eq!(fake.client.reconcile(&route).await, Ok(Reconciled::Absent));
+            release.send(()).unwrap();
+            committed.await.unwrap();
+            let Reconciled::Owned(id) = fake.client.reconcile(&route).await.unwrap() else {
+                panic!("the late commit was not attributed");
+            };
+            assert_eq!(id.as_str(), ID);
+            assert_eq!(fake.state.lock().unwrap().post_count, 1);
+        })
+        .await
+        .unwrap();
+    }
+
+    /// One raw HTTP/1.1 reply from an IPv4 loopback socket, decoded by the production transport.
+    async fn raw_preflight(wire: Vec<u8>) -> Result<(), DnsError> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let client = CloudflareDns::fixture(
+            DnsBearer::new(CANARY.to_owned()).unwrap(),
+            listener.local_addr().unwrap(),
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0, "request ended before its header");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            socket.write_all(&wire).await.unwrap();
+            socket.shutdown().await.unwrap();
+            request
+        });
+        let result = client.preflight(&route()).await;
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with(format!("GET /client/v4/zones/{ZONE}/dns_records?").as_bytes())
+        );
+        result
+    }
+
+    #[tokio::test]
+    async fn dns_chunked_framing_is_strict_through_the_transport() {
+        const LISTING: &str = r#"{"success":true,"result":[],"result_info":{"page":1,"total_pages":1,"total_count":0}}"#;
+        const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let chunks = |parts: &[&str]| -> String {
+            parts
+                .iter()
+                .map(|part| format!("{:x}\r\n{part}\r\n", part.len()))
+                .collect()
+        };
+        let (a, rest) = LISTING.split_at(7);
+        let (b, c) = rest.split_at(40);
+        let body = chunks(&[a, b, c]);
+        timeout(LEG, async {
+            let valid = format!("{HEAD}{body}0\r\n\r\n");
+            assert_eq!(raw_preflight(valid.clone().into_bytes()).await, Ok(()));
+            let truncated = format!("{HEAD}{:x}\r\n{}", LISTING.len(), &LISTING[..20]);
+            let bad_delimiter = format!("{HEAD}{:x}\r\n{LISTING}XX0\r\n\r\n", LISTING.len());
+            let missing_terminator = format!("{HEAD}{body}");
+            let trailing = format!("{valid}extra");
+            let both = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nTransfer-Encoding: chunked\r\n\r\n{body}0\r\n\r\n",
+                body.len() + 5
+            );
+            for wire in [truncated, bad_delimiter, missing_terminator, trailing, both] {
+                assert_eq!(
+                    raw_preflight(wire.into_bytes()).await,
+                    Err(DnsError::InvalidResponse)
+                );
+            }
         })
         .await
         .unwrap();

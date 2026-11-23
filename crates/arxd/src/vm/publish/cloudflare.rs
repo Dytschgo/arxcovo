@@ -51,7 +51,7 @@ pub(in crate::vm) enum DnsError {
     Conflict,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::vm) struct RecordId(String);
 
 impl RecordId {
@@ -156,10 +156,16 @@ struct Create<'a> {
     comment: &'a str,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub(in crate::vm) enum Reconciled {
     /// Absence is an observation. It cannot settle an earlier uncertain POST on its own.
     Absent,
+    /// The exact name holds only this marked record.
     Owned(RecordId),
+    /// Exactly one marked record shares the name with foreign records. The caller may
+    /// persist the ID for targeted cleanup but must treat the name as conflicted.
+    OwnedWithConflict(RecordId),
+    /// No marked record, or more than one, so no ID can be attributed.
     ForeignOrAmbiguous,
 }
 
@@ -275,9 +281,13 @@ impl DnsApi for CloudflareDns {
                 return Err(DnsError::InvalidResponse);
             }
         }
-        Ok(match listing.result.as_slice() {
-            [] => Reconciled::Absent,
-            [record] if route.owned(record) => Reconciled::Owned(RecordId(record.id.clone())),
+        let mut owned = listing.result.iter().filter(|record| route.owned(record));
+        Ok(match (owned.next(), owned.next()) {
+            _ if listing.result.is_empty() => Reconciled::Absent,
+            (Some(record), None) if listing.result.len() == 1 => {
+                Reconciled::Owned(RecordId(record.id.clone()))
+            }
+            (Some(record), None) => Reconciled::OwnedWithConflict(RecordId(record.id.clone())),
             _ => Reconciled::ForeignOrAmbiguous,
         })
     }
