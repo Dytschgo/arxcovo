@@ -4,16 +4,36 @@
 
 use super::{
     AssetPin, RecipeError,
+    lifecycle::{Boot, Failure, Pair, Readiness, TemplateRuntime, clean},
     media::{Image, MAX_GUEST},
 };
+use crate::vm::{
+    BuildSlots, Id, PairSlots,
+    guest::GUEST_READY_BUDGET,
+    runtime::{
+        InstallerBudget, InstallerFailureReason, InstallerPhase, InstallerRecipe, NativeRefusal,
+    },
+};
+use arx_guest::protocol::ScriptStatus;
 use sha2::{Digest, Sha256};
 use std::{
     fmt::Write as _,
     io::{Read, Write},
     time::Duration,
 };
+use tokio::time::Instant;
 
 pub(super) const ID: &str = "windows11-x64-test-v1";
+
+/// Catalog identity stays fixed as exact media observations change the digest.
+/// Use a domain separate from owner-configured Ubuntu digest-derived IDs.
+pub(super) fn catalog_id() -> Id {
+    let digest = Sha256::new()
+        .chain_update(b"arxcovo.recipe.catalog.v1\0")
+        .chain_update(ID.as_bytes())
+        .finalize();
+    digest[..16].try_into().expect("SHA-256 prefix")
+}
 const MARKER: &[u8] = b"arxcovo-windows-test-seed-v1\n";
 const UNATTEND: &str = "urn:schemas-microsoft-com:unattend";
 const WCM: &str = "http://schemas.microsoft.com/WMIConfig/2002/State";
@@ -43,6 +63,13 @@ const MAX_RECEIPT: u64 = 256 * 1024;
 const MAX_FIRMWARE: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "owner Windows image inspection is qualification work"
+    )
+)]
 pub(super) enum InstallImage {
     Wim,
     Esd,
@@ -93,6 +120,36 @@ pub(super) struct WindowsRecipe<'a> {
     pub pins: Option<WindowsPins<'a>>,
 }
 
+pub(super) struct PreparedWindows {
+    pub digest: [u8; 32],
+    pub image: InstalledImage,
+}
+
+pub(super) struct InstalledImage {
+    version: String,
+    revision: Option<u32>,
+    edition: String,
+}
+
+impl InstalledImage {
+    fn from_edition(edition: Edition<'_>) -> Option<Self> {
+        let mut parts = edition.build.split('.').map(|part| {
+            let number = part.parse::<u32>().ok()?;
+            (number.to_string() == part).then_some(number)
+        });
+        let (major, minor, build) = (parts.next()??, parts.next()??, parts.next()??);
+        let revision = parts.next().map_or(Some(None), |part| part.map(Some))?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            version: format!("{major}.{minor}.{build}"),
+            revision,
+            edition: edition.edition_id.to_owned(),
+        })
+    }
+}
+
 impl WindowsRecipe<'_> {
     /// Validate every asset before writing. The digest binds the versioned
     /// recipe and verified metadata, and is returned only after a full write.
@@ -101,7 +158,7 @@ impl WindowsRecipe<'_> {
         assets: WindowsAssets<'_>,
         guest: &[u8],
         out: impl Write,
-    ) -> Result<[u8; 32], RecipeError> {
+    ) -> Result<PreparedWindows, RecipeError> {
         let pins = self.pins.as_ref().ok_or(RecipeError::Unqualified)?;
         if !valid_edition(pins.edition)
             || pins.edition != assets.edition
@@ -109,6 +166,8 @@ impl WindowsRecipe<'_> {
         {
             return Err(RecipeError::Unqualified);
         }
+        let installed =
+            InstalledImage::from_edition(pins.edition).ok_or(RecipeError::Unqualified)?;
         verify(pins.guest, MAX_GUEST as u64, guest)?;
         verify(pins.provisioner, 32 * 1024, PROVISIONER.as_bytes())?;
         verify(pins.driver_receipt, MAX_RECEIPT, assets.driver_receipt)?;
@@ -138,7 +197,10 @@ impl WindowsRecipe<'_> {
         image
             .write(out)
             .map_err(|err| RecipeError::Write(err.kind()))?;
-        Ok(recipe_digest(pins, &xml))
+        Ok(PreparedWindows {
+            digest: recipe_digest(pins, &xml),
+            image: installed,
+        })
     }
 }
 
@@ -146,13 +208,13 @@ fn valid_edition(edition: Edition<'_>) -> bool {
     edition.index != 0
         && edition.architecture == "amd64"
         && edition.language == "en-US"
+        && edition
+            .edition_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric())
         && [edition.name, edition.edition_id, edition.build]
             .into_iter()
             .all(|value| !value.is_empty() && value.len() <= 128 && value.chars().all(xml_char))
-        && edition
-            .build
-            .split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn verify(pin: AssetPin, max: u64, input: impl Read) -> Result<(), RecipeError> {
@@ -176,6 +238,8 @@ fn recipe_digest(pins: &WindowsPins<'_>, xml: &str) -> [u8; 32] {
         ID.as_bytes(),
         TOPOLOGY,
         MARKER,
+        DETACHED_HEALTH.as_bytes(),
+        GENERALIZED_OOBE.as_bytes(),
         xml.as_bytes(),
         pins.edition.name.as_bytes(),
         pins.edition.edition_id.as_bytes(),
@@ -677,8 +741,8 @@ pub(super) enum Stage {
     Install,
     DetachedReadiness,
     Generalize,
+    AttestGeneralization,
     DetachedVerification,
-    CloneIdentity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -686,12 +750,14 @@ pub(super) enum StageFailure {
     Timeout,
     UnexpectedStage,
     Failed,
+    #[cfg(test)]
     Residue,
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum StageEvidence {
     Clean,
+    #[cfg(test)]
     Residue,
     Failed,
 }
@@ -720,6 +786,7 @@ impl BuildStages {
                 return Err(StageFailure::UnexpectedStage);
             }
             match evidence {
+                #[cfg(test)]
                 StageEvidence::Residue => return Err(StageFailure::Residue),
                 StageEvidence::Failed => return Err(StageFailure::Failed),
                 StageEvidence::Clean => {}
@@ -727,9 +794,9 @@ impl BuildStages {
             Ok(match stage {
                 Stage::Install => Some(Stage::DetachedReadiness),
                 Stage::DetachedReadiness => Some(Stage::Generalize),
-                Stage::Generalize => Some(Stage::DetachedVerification),
-                Stage::DetachedVerification => Some(Stage::CloneIdentity),
-                Stage::CloneIdentity => None,
+                Stage::Generalize => Some(Stage::AttestGeneralization),
+                Stage::AttestGeneralization => Some(Stage::DetachedVerification),
+                Stage::DetachedVerification => None,
             })
         })();
         self.0.map(|_| ())
@@ -740,8 +807,300 @@ impl BuildStages {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InstalledTarget {
+    Readiness(PairSlots),
+    Verification(PairSlots),
+}
+
+impl InstalledTarget {
+    fn probe(self, image: &InstalledImage) -> String {
+        image.probe(matches!(self, Self::Readiness(_)))
+    }
+}
+
+impl InstalledImage {
+    fn probe(&self, validation: bool) -> String {
+        let validation = if validation { "$true" } else { "$false" };
+        let revision = self
+            .revision
+            .map_or_else(|| "$null".to_owned(), |number| number.to_string());
+        // These substitutions are validated ASCII numeric fields and a SKU ID.
+        format!(
+            "$validation = {validation}\n$expectedVersion = '{}'\n$expectedEdition = '{}'\n$expectedRevision = {revision}\n{DETACHED_HEALTH}",
+            self.version, self.edition,
+        )
+    }
+}
+
+const GENERALIZED_OOBE: &str = "IMAGE_STATE_GENERALIZE_RESEAL_TO_OOBE";
+
+pub(super) struct OfflineSetupState {
+    pub registry: String,
+    pub state_ini: String,
+}
+
+impl OfflineSetupState {
+    fn is_generalized(&self) -> bool {
+        // A clean QMP stop proves the release, while the two Setup witnesses
+        // establish successful generalization on the released disk itself.
+        self.registry == GENERALIZED_OOBE && self.state_ini == GENERALIZED_OOBE
+    }
+}
+
+// The restricted guest returns only exit status. The same probe checks both
+// detached boots, with a fixed phase-specific expectation for finalizer state.
+const DETACHED_HEALTH: &str = r#"$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+try {
+    $setup = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup'
+    $image = Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State' -Name ImageState
+    if ($image -cne 'IMAGE_STATE_COMPLETE' -or $setup.SystemSetupInProgress -ne 0 -or
+        ($setup.PSObject.Properties['OOBEInProgress'] -and $setup.OOBEInProgress -ne 0) -or
+        $setup.PSObject.Properties['UnattendFile']) { exit 1 }
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem
+    $sku = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    if ($os.Version -cne $expectedVersion -or $sku.EditionID -cne $expectedEdition -or
+        ($null -ne $expectedRevision -and [uint32]$sku.UBR -ne $expectedRevision)) { exit 1 }
+    if (@(Get-CimInstance -ClassName Win32_CDROMDrive).Count -ne 0) { exit 1 }
+    $service = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\arx-guest'
+    if ($service.Start -ne 2 -or $service.ObjectName -ine 'NT AUTHORITY\LocalService') { exit 1 }
+    foreach ($name in @('viostor','vioser','netkvm')) {
+        $devices = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter "Service = '$name'")
+        if ($devices.Count -ne 1 -or $devices[0].ConfigManagerErrorCode -ne 0) { exit 1 }
+    }
+    if (@(Get-LocalUser | Where-Object { $_.Name -in @('ArxBootstrap','defaultuser0') }).Count -ne 0) { exit 1 }
+    $programs = Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion' -Name ProgramFilesDir
+    if (-not [IO.Path]::IsPathRooted($programs)) { exit 1 }
+    $phase = Join-Path $programs 'Arxcovo\setup.phase'
+    $system = Join-Path $env:SystemRoot 'System32'
+    $disk = [IO.Path]::GetPathRoot($env:SystemRoot)
+    if ((Test-Path -LiteralPath (Join-Path $system 'arxseed.loc')) -or
+        (Test-Path -LiteralPath (Join-Path $system 'arxseed.pin')) -or
+        (Test-Path -LiteralPath (Join-Path $disk 'Users\ArxBootstrap')) -or
+        (Test-Path -LiteralPath (Join-Path $disk 'Users\defaultuser0'))) { exit 1 }
+    $panther = Join-Path $env:SystemRoot 'Panther'
+    $sysprep = Join-Path $system 'Sysprep'
+    $sources = Join-Path $disk '$WINDOWS.~BT\Sources'
+    $staging = Join-Path $sources 'Panther'
+    foreach ($dir in $disk,$panther,(Join-Path $panther 'Unattend'),$sysprep,$sources,$staging) {
+        foreach ($name in 'unattend.xml','autounattend.xml') {
+            if (Test-Path -LiteralPath (Join-Path $dir $name)) { exit 1 }
+        }
+    }
+    $winlogon = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    if (($winlogon.PSObject.Properties['AutoAdminLogon'] -and $winlogon.AutoAdminLogon -eq '1') -or
+        $winlogon.PSObject.Properties['DefaultPassword']) { exit 1 }
+    $remaining = 4096
+    $pending = [Collections.Generic.Stack[string]]::new()
+    foreach ($dir in $panther,$sysprep,$staging) {
+        if (Test-Path -LiteralPath $dir) { $pending.Push($dir) }
+    }
+    while ($pending.Count) {
+        $dir = $pending.Pop()
+        if ((Get-Item -LiteralPath $dir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 }
+        Get-ChildItem -LiteralPath $dir -Force | ForEach-Object {
+            if (--$remaining -lt 0 -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                $_.Name -match 'unattend.*\.xml') { throw 'setup inventory' }
+            if ($_.PSIsContainer) { $pending.Push($_.FullName) }
+        }
+    }
+    if ($validation) {
+        $boot = $os.LastBootUpTime.ToUniversalTime().Ticks
+        $marker = Get-Item -LiteralPath $phase -Force
+        if ($marker.Length -notin (3..32) -or ($marker.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+            (Get-Content -LiteralPath $phase -Raw) -cne "2:$boot") { exit 1 }
+    } elseif ((Test-Path -LiteralPath $phase) -or
+              (Test-Path -LiteralPath (Join-Path $system 'arxsetup.ps1')) -or
+              @(Get-ScheduledTask | Where-Object { $_.TaskName -eq 'ArxcovoTemplateFinalize' }).Count -ne 0) {
+        exit 1
+    }
+    exit 0
+} catch { exit 1 }
+"#;
+
+pub(super) struct WindowsBuild<'a> {
+    started_at: Instant,
+    budget: InstallerBudget,
+    stages: BuildStages,
+    boots: Vec<Boot>,
+    image: &'a InstalledImage,
+}
+
+impl<'a> WindowsBuild<'a> {
+    pub(super) fn install(
+        runtime: &mut dyn TemplateRuntime,
+        slots: BuildSlots,
+        image: &'a InstalledImage,
+    ) -> Result<Self, Failure> {
+        let budget = InstallerBudget::start(InstallerRecipe::Windows);
+        let mut build = Self {
+            started_at: budget.clip(BUILD_LIMIT) - BUILD_LIMIT,
+            budget,
+            stages: BuildStages::default(),
+            boots: Vec::with_capacity(4),
+            image,
+        };
+        build.qmp(runtime, slots, InstallerPhase::WindowsSetup, Stage::Install)?;
+        build.installed(
+            runtime,
+            InstalledTarget::Readiness(slots.pair),
+            Stage::DetachedReadiness,
+        )?;
+        build.qmp(
+            runtime,
+            slots,
+            InstallerPhase::WindowsFinalize,
+            Stage::Generalize,
+        )?;
+        Ok(build)
+    }
+
+    pub(super) fn attest_generalization(
+        &mut self,
+        runtime: &mut dyn TemplateRuntime,
+        slots: PairSlots,
+        files: Pair,
+    ) -> Result<(), Failure> {
+        let deadline = self.deadline(BUILD_LIMIT)?;
+        let observed = runtime
+            .windows_offline_setup_state(slots, files, deadline)
+            .and_then(|state| {
+                if state.is_generalized() {
+                    Ok(())
+                } else {
+                    Err(Failure::GeneralizationUnverified)
+                }
+            });
+        self.advance(Stage::AttestGeneralization, observed)
+    }
+
+    pub(super) fn verify(
+        &mut self,
+        runtime: &mut dyn TemplateRuntime,
+        slots: PairSlots,
+    ) -> Result<(), Failure> {
+        self.installed(
+            runtime,
+            InstalledTarget::Verification(slots),
+            Stage::DetachedVerification,
+        )
+    }
+
+    pub(super) fn check_seal(&self) -> Result<(), Failure> {
+        self.deadline(BUILD_LIMIT)?;
+        if self.stages.can_seal() {
+            Ok(())
+        } else {
+            Err(Failure::Native(NativeRefusal::InstallerPhaseMismatch))
+        }
+    }
+
+    fn qmp(
+        &mut self,
+        runtime: &mut dyn TemplateRuntime,
+        slots: BuildSlots,
+        phase: InstallerPhase,
+        stage: Stage,
+    ) -> Result<(), Failure> {
+        let plan = self
+            .budget
+            .stage(phase, BUILD_LIMIT)
+            .ok_or(Failure::Native(NativeRefusal::InstallerPhaseMismatch))?;
+        if Instant::now() >= plan.deadline() {
+            return Err(Failure::Native(NativeRefusal::InstallerDeadlineExpired));
+        }
+        let observed = runtime
+            .windows_installer(slots, plan)
+            .and_then(|(boot, observed)| {
+                if observed != phase {
+                    return Err(Failure::Native(NativeRefusal::InstallerPhaseMismatch));
+                }
+                self.fresh(boot)
+            })
+            .map_err(|error| match error {
+                Failure::Installer {
+                    report,
+                    observed_at,
+                } if report.reason
+                    == InstallerFailureReason::Native(NativeRefusal::InstallerDeadlineExpired)
+                    || (report.reason == InstallerFailureReason::Timeout
+                        && observed_at >= plan.deadline()) =>
+                {
+                    Failure::InstallerDeadline(report)
+                }
+                error => error,
+            });
+        self.advance(stage, observed)
+    }
+
+    fn installed(
+        &mut self,
+        runtime: &mut dyn TemplateRuntime,
+        target: InstalledTarget,
+        stage: Stage,
+    ) -> Result<(), Failure> {
+        let ready_by = self.deadline(GUEST_READY_BUDGET)?;
+        let (boot, ready) = runtime.windows_installed(target, ready_by)?;
+        let checked = (|| {
+            if Instant::now() >= ready_by {
+                return Err(Failure::Native(NativeRefusal::InstallerDeadlineExpired));
+            }
+            self.fresh(boot)?;
+            if ready != Readiness::ScriptChannel {
+                return Err(Failure::Readiness(ready));
+            }
+            let deadline = self.deadline(Duration::from_secs(30))?;
+            let health = runtime.windows_health(boot, &target.probe(self.image), deadline);
+            if Instant::now() >= deadline {
+                return Err(Failure::Native(NativeRefusal::InstallerDeadlineExpired));
+            }
+            if health? != (ScriptStatus::Exited, Some(0)) {
+                return Err(Failure::Health);
+            }
+            Ok(())
+        })();
+        let stopped = clean(runtime.windows_stop(boot, self.budget.clip(BUILD_LIMIT)));
+        self.advance(stage, stopped.and(checked))
+    }
+
+    fn advance(&mut self, stage: Stage, observed: Result<(), Failure>) -> Result<(), Failure> {
+        let evidence = if observed.is_ok() {
+            StageEvidence::Clean
+        } else {
+            StageEvidence::Failed
+        };
+        let advanced = self
+            .stages
+            .observe(self.started_at.elapsed(), stage, evidence);
+        observed?;
+        advanced.map_err(|reason| {
+            Failure::Native(match reason {
+                StageFailure::Timeout => NativeRefusal::InstallerDeadlineExpired,
+                _ => NativeRefusal::InstallerPhaseMismatch,
+            })
+        })
+    }
+
+    fn fresh(&mut self, boot: Boot) -> Result<(), Failure> {
+        if self.boots.contains(&boot) {
+            return Err(Failure::ReusedBoot);
+        }
+        self.boots.push(boot);
+        Ok(())
+    }
+
+    fn deadline(&self, limit: Duration) -> Result<Instant, Failure> {
+        let deadline = self.budget.clip(limit);
+        if Instant::now() >= deadline {
+            return Err(Failure::Native(NativeRefusal::InstallerDeadlineExpired));
+        }
+        Ok(deadline)
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::{
         io::Cursor,
@@ -773,7 +1132,7 @@ mod tests {
         }
     }
 
-    fn fixture() -> WindowsPins<'static> {
+    pub(in crate::vm::template) fn fixture() -> WindowsPins<'static> {
         WindowsPins {
             iso: pin(ISO),
             edition: EDITION,
@@ -794,9 +1153,20 @@ mod tests {
         change: impl FnOnce(&mut WindowsAssets<'_>),
         out: &mut Vec<u8>,
     ) -> Result<[u8; 32], RecipeError> {
+        with_assets(|mut assets, guest| {
+            change(&mut assets);
+            recipe
+                .write_test_seed(assets, guest, out)
+                .map(|prepared| prepared.digest)
+        })
+    }
+
+    pub(in crate::vm::template) fn with_assets<T>(
+        use_assets: impl FnOnce(WindowsAssets<'_>, &[u8]) -> T,
+    ) -> T {
         let mut files = [const { Cursor::new(DRIVER) }; 9];
         let [a, b, c, d, e, f, g, h, i] = &mut files;
-        let mut assets = WindowsAssets {
+        let assets = WindowsAssets {
             iso: &mut Cursor::new(ISO),
             edition: EDITION,
             driver_medium: &mut Cursor::new(MEDIUM),
@@ -806,8 +1176,7 @@ mod tests {
             firmware_vars: &mut Cursor::new(VARS),
             qemu_receipt: QEMU_RECEIPT,
         };
-        change(&mut assets);
-        recipe.write_test_seed(assets, GUEST, out)
+        use_assets(assets, GUEST)
     }
 
     #[test]
@@ -855,8 +1224,8 @@ mod tests {
             Install,
             DetachedReadiness,
             Generalize,
+            AttestGeneralization,
             DetachedVerification,
-            CloneIdentity,
         ];
         for (broken, elapsed, stage, evidence, reason) in [
             (
@@ -888,9 +1257,9 @@ mod tests {
                 StageFailure::UnexpectedStage,
             ),
             (
-                CloneIdentity,
+                DetachedVerification,
                 BUILD_LIMIT,
-                CloneIdentity,
+                DetachedVerification,
                 StageEvidence::Clean,
                 StageFailure::Timeout,
             ),
@@ -916,6 +1285,57 @@ mod tests {
                 .unwrap();
         }
         assert!(build.can_seal());
+    }
+
+    #[test]
+    fn offline_setup_state_requires_both_generalization_witnesses() {
+        for (registry, state_ini, verified) in [
+            (GENERALIZED_OOBE, GENERALIZED_OOBE, true),
+            (GENERALIZED_OOBE, "IMAGE_STATE_COMPLETE", false),
+            ("IMAGE_STATE_COMPLETE", GENERALIZED_OOBE, false),
+            ("IMAGE_STATE_UNDEPLOYABLE", "", false),
+        ] {
+            let state = OfflineSetupState {
+                registry: registry.to_owned(),
+                state_ini: state_ini.to_owned(),
+            };
+            assert_eq!(state.is_generalized(), verified);
+        }
+    }
+
+    #[test]
+    fn unrenderable_installed_image_pins_refuse_before_seed_output() {
+        for edition in [
+            Edition {
+                build: "26100",
+                ..EDITION
+            },
+            Edition {
+                build: "10.0.26100.1.1",
+                ..EDITION
+            },
+            Edition {
+                build: "10.0.026100",
+                ..EDITION
+            },
+            Edition {
+                edition_id: "Fixture';exit 0",
+                ..EDITION
+            },
+        ] {
+            let mut output = Vec::new();
+            let recipe = WindowsRecipe {
+                pins: Some(WindowsPins {
+                    edition,
+                    ..fixture()
+                }),
+            };
+            assert!(matches!(
+                write(recipe, |assets| assets.edition = edition, &mut output),
+                Err(RecipeError::Unqualified)
+            ));
+            assert!(output.is_empty());
+        }
     }
 
     #[test]
@@ -963,14 +1383,35 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn windows_finalizer_gates_service_start_and_sysprep() {
-        let fixture = tempfile::tempdir().unwrap();
-        let mut check = Command::new("powershell.exe")
+    #[tokio::test]
+    async fn windows_finalizer_and_health_probes_gate_publication() {
+        use crate::{
+            service::application::tests::private_temp,
+            vm::template::lifecycle::tests::protect_fixture,
+        };
+        use tokio::io::AsyncWriteExt;
+
+        let fixture = private_temp();
+        protect_fixture(fixture.path(), true);
+        let image = InstalledImage::from_edition(Edition {
+            build: "10.0.26100.42",
+            ..EDITION
+        })
+        .unwrap();
+        // Only role names are changed by the pair slots. The probe can be
+        // rendered by stage without any runtime path or identity.
+        for (name, validation) in [("validation.ps1", true), ("verification.ps1", false)] {
+            let path = fixture.path().join(name);
+            std::fs::write(&path, image.probe(validation)).unwrap();
+            protect_fixture(&path, false);
+        }
+        let mut check = tokio::process::Command::new("powershell.exe")
             .args([
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
                 "-Command",
                 "& ([ScriptBlock]::Create([Console]::In.ReadToEnd()))",
             ])
@@ -978,16 +1419,19 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let mut input = check.stdin.take().unwrap();
-        write!(
-            input,
-            "$provisioner = @'\n{PROVISIONER}'@\n{CHECK_PROVISIONER}"
-        )
-        .unwrap();
-        drop(input);
-        let result = check.wait_with_output().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), async move {
+            let mut input = check.stdin.take().unwrap();
+            let fixture =
+                format!("$provisioner = @'\n{PROVISIONER}'@\n{CHECK_PROVISIONER}\n{CHECK_HEALTH}");
+            input.write_all(fixture.as_bytes()).await.unwrap();
+            drop(input);
+            check.wait_with_output().await.unwrap()
+        })
+        .await
+        .expect("PowerShell fixture exceeded its test budget");
         assert!(
             result.status.success(),
             "{}",
@@ -1161,6 +1605,102 @@ Expect ($tools.Count -eq 3 -and $taskPresent -and [IO.File]::Exists($state)) 'cl
 $script:cleanupFails = $false
 Finish-Setup
 Expect ($tools.Count -eq 4 -and $tools[3] -ceq '/generalize /oobe /shutdown /quiet') 'Sysprep command missing'
+"#;
+
+    #[cfg(windows)]
+    const CHECK_HEALTH: &str = r#"
+# Invoke the exact rendered .ps1 files. Each invocation exits back here
+# with the status the guest would receive. All guest providers are mocked.
+& {
+    $env:SystemRoot = Join-Path $env:ARX_FIXTURE_ROOT 'guest-windows'
+    $programs = Join-Path $env:ARX_FIXTURE_ROOT 'guest-programs'
+    $phase = Join-Path $programs 'Arxcovo\setup.phase'
+    $panther = Join-Path $env:SystemRoot 'Panther'
+    $fixtureBoot = [DateTime]::new(2026, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+    $disk = [IO.Path]::GetPathRoot($env:SystemRoot)
+    $verification = Join-Path $env:ARX_FIXTURE_ROOT 'verification.ps1'
+    $validation = Join-Path $env:ARX_FIXTURE_ROOT 'validation.ps1'
+    function Get-ItemProperty([string]$LiteralPath) {
+        switch -Exact ($LiteralPath) {
+            'HKLM:\SYSTEM\Setup' {
+                $state = @{ SystemSetupInProgress = 0; OOBEInProgress = 0 }
+                if ($case -eq 'answer override') { $state.UnattendFile = '' }
+                return [pscustomobject]$state
+            }
+            'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' {
+                $edition = if ($case -eq 'wrong edition') { 'AnotherSku' } else { 'Fixture' }
+                $revision = if ($case -eq 'wrong revision') { 43 } else { 42 }
+                return [pscustomobject]@{ EditionID = $edition; UBR = $revision }
+            }
+            'HKLM:\SYSTEM\CurrentControlSet\Services\arx-guest' {
+                return [pscustomobject]@{ Start = 2; ObjectName = 'NT AUTHORITY\LocalService' }
+            }
+            'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' {
+                return [pscustomobject]@{}
+            }
+            default { throw 'unexpected registry read' }
+        }
+    }
+    function Get-ItemPropertyValue([string]$LiteralPath, [string]$Name) {
+        switch -Exact ("$LiteralPath|$Name") {
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State|ImageState' { 'IMAGE_STATE_COMPLETE' }
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion|ProgramFilesDir' { $programs }
+            default { throw 'unexpected registry value read' }
+        }
+    }
+    function Get-CimInstance([string]$ClassName, [string]$Filter) {
+        switch -Exact ($ClassName) {
+            'Win32_OperatingSystem' {
+                $version = if ($case -eq 'wrong build') { '10.0.27000' } else { '10.0.26100' }
+                return [pscustomobject]@{ Version = $version; LastBootUpTime = $fixtureBoot }
+            }
+            'Win32_CDROMDrive' {}
+            'Win32_PnPEntity' {
+                if ($Filter -cnotmatch "^Service = '(viostor|vioser|netkvm)'$") { throw 'unexpected driver' }
+                return [pscustomobject]@{ ConfigManagerErrorCode = 0 }
+            }
+            default { throw 'unexpected CIM query' }
+        }
+    }
+    function Get-LocalUser {
+        if ($case -eq 'setup account') { return [pscustomobject]@{ Name = 'defaultuser0' } }
+        if ($case -eq 'bootstrap account') { return [pscustomobject]@{ Name = 'ArxBootstrap' } }
+    }
+    function Test-Path([string]$LiteralPath) {
+        if ($LiteralPath -eq $phase) { return $case -eq 'finalizer marker' }
+        if ($LiteralPath -eq (Join-Path $disk 'autounattend.xml')) { return $case -eq 'root answer' }
+        if ($LiteralPath -eq (Join-Path $disk '$WINDOWS.~BT\Sources\Panther\unattend.xml')) { return $case -eq 'staging answer' }
+        if ($LiteralPath -eq (Join-Path $disk 'Users\defaultuser0')) { return $case -eq 'setup profile' }
+        if ($LiteralPath -eq $panther) { return $case -eq 'nested answer' }
+        return $false
+    }
+    function Get-Item([string]$LiteralPath, [switch]$Force) {
+        if ($LiteralPath -eq $phase) { return [pscustomobject]@{ Length = 20; Attributes = 0 } }
+        if ($LiteralPath -eq $panther) { return [pscustomobject]@{ Attributes = 0 } }
+        throw 'unexpected item read'
+    }
+    function Get-Content([string]$LiteralPath, [switch]$Raw) {
+        if ($LiteralPath -ne $phase -or -not $Raw) { throw 'unexpected marker read' }
+        if ($case -eq 'stale readiness') { return '2:0' }
+        return "2:$($fixtureBoot.Ticks)"
+    }
+    function Get-ChildItem([string]$LiteralPath, [switch]$Force) {
+        if ($LiteralPath -ne $panther -or -not $Force) { throw 'unexpected inventory' }
+        return [pscustomobject]@{ Name = 'Unattend-copy.xml'; Attributes = 0; PSIsContainer = $false }
+    }
+    function Get-ScheduledTask {}
+    function Check-Probe([string]$case, [string]$file, [int]$expected) {
+        & $file
+        if ($LASTEXITCODE -ne $expected) { throw "probe '$case' returned $LASTEXITCODE, expected $expected" }
+    }
+    Check-Probe 'clean readiness' $validation 0
+    Check-Probe 'clean verification' $verification 0
+    Check-Probe 'stale readiness' $validation 1
+    foreach ($scenario in 'wrong build','wrong edition','wrong revision','answer override','setup account',
+        'bootstrap account','root answer','staging answer','nested answer','setup profile','finalizer marker') {
+        Check-Probe $scenario $verification 1
+    }
+}
 exit 0
 "#;
 
