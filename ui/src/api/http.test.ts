@@ -353,6 +353,59 @@ describe('server-initiated stream close', () => {
     serverClose(FakeSocket.last!, 4401);
     expect(statuses).toEqual([['closed', 'Your session ended, so the server closed the console.', true]]);
   });
+
+  test('a 4401 after a "VM stopped" notice still ends the session and forgets the CSRF token', async () => {
+    const { api, calls } = await streamingApi('/api/v1/vms/web-static/console');
+    const stream = await api.openConsole('web-static');
+    const statuses: [string, string | undefined, boolean | undefined][] = [];
+    stream.onStatus((s, r, ended) => statuses.push([s, r, ended]));
+    const ws = FakeSocket.last!;
+    ws.receive(JSON.stringify({ type: 'closed', reason: 'VM stopped' }));
+    serverClose(ws, 4401);
+    expect(statuses).toEqual([
+      ['closed', 'VM stopped', false],
+      ['closed', 'Your session ended, so the server closed the console.', true],
+    ]);
+    expect(stream.status).toBe('closed');
+    const tickets = calls.length;
+    await expect(api.openConsole('web-static')).rejects.toMatchObject({ code: 'unauthorized' });
+    expect(calls).toHaveLength(tickets);
+  });
+
+  test('an ordinary close after a "VM stopped" notice keeps the notice and the session', async () => {
+    const { api, calls } = await streamingApi('/api/v1/vms/web-static/console');
+    const stream = await api.openConsole('web-static');
+    const statuses: [string, string | undefined, boolean | undefined][] = [];
+    stream.onStatus((s, r, ended) => statuses.push([s, r, ended]));
+    const ws = FakeSocket.last!;
+    ws.receive(JSON.stringify({ type: 'closed', reason: 'VM stopped' }));
+    serverClose(ws, 1000, 'VM stopped');
+    expect(statuses).toEqual([['closed', 'VM stopped', false]]);
+    const tickets = calls.length;
+    await api.openConsole('web-static');
+    expect(calls).toHaveLength(tickets + 1);
+  });
+
+  test('a 4401 after a client-side terminal failure still ends the session', async () => {
+    const { api, calls } = await streamingApi('/api/v1/hosts/atlas/terminal');
+    const session = await api.openTerminal('atlas');
+    const events: TerminalEvent[] = [];
+    session.onEvent(e => events.push(e));
+    const ws = FakeSocket.last!;
+    // A browser fires one close event; when the server's 4401 crossed the
+    // client's own close, that event carries 4401.
+    ws.close = () => {
+      ws.closed = true;
+    };
+    ws.receive('not json');
+    expect(session.status).toBe('error');
+    expect(ws.closed).toBe(true);
+    serverClose(ws, 4401);
+    expect(events.filter(e => e.type === 'closed')).toEqual([{ type: 'closed', reason: 'session_ended', message: 'Your session ended, so the server closed the terminal.' }]);
+    const tickets = calls.length;
+    await expect(api.openTerminal('atlas')).rejects.toMatchObject({ code: 'unauthorized' });
+    expect(calls).toHaveLength(tickets);
+  });
 });
 
 describe('console frame validation', () => {

@@ -21,7 +21,11 @@ use axum::{
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{future::pending, sync::Arc, time::Duration};
+use std::{
+    future::{pending, poll_fn},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_tungstenite::tungstenite::Error as WireError;
 use zeroize::Zeroizing;
@@ -348,15 +352,24 @@ where
                     return;
                 }
             }
-            Some(Write::Close(close, deadline)) => {
-                let frame = CloseFrame {
-                    code: close.code,
-                    reason: close.reason.into(),
-                };
-                let _ = timeout_at(
-                    Instant::from_std(deadline),
-                    sink.send(Message::Close(Some(frame))),
-                )
+            Some(Write::Close(committed, deadline)) => {
+                // The close frame becomes irreversible only when the sink
+                // accepts it (`start_send`). Wait for the sink first, then
+                // pick the code from the slot and hand it over in the same
+                // session-locked step, so a revocation that lands while the
+                // sink is not ready still turns the frame into 4401.
+                let _ = timeout_at(Instant::from_std(deadline), async {
+                    poll_fn(|cx| sink.poll_ready_unpin(cx)).await.ok()?;
+                    stream
+                        .submit_close(committed, |close| {
+                            sink.start_send_unpin(Message::Close(Some(CloseFrame {
+                                code: close.code,
+                                reason: close.reason.into(),
+                            })))
+                        })?
+                        .ok()?;
+                    sink.flush().await.ok()
+                })
                 .await;
                 return;
             }

@@ -612,6 +612,30 @@ impl Stream {
         })
     }
 
+    /// Hands the socket's final close frame to the transport.
+    ///
+    /// The code is read from the slot under the session lock, and `submit`
+    /// runs inside that same critical section. A revocation therefore either
+    /// lands first, and the frame is 4401, or lands after the transport
+    /// accepted the frame, which is the point after which a close cannot be
+    /// changed. `submit` must only hand the frame to the sink's buffer
+    /// (`Sink::start_send` on a ready split sink stores it in a one-item
+    /// slot); the socket write happens on flush, after the lock is released.
+    ///
+    /// `committed` is the close `commit` returned; the slot's current close
+    /// supersedes it (a slot's close is never cleared once set).
+    pub fn submit_close<E>(
+        &self,
+        committed: Close,
+        submit: impl FnOnce(Close) -> Result<(), E>,
+    ) -> Option<Result<(), E>> {
+        self.with_slot(|slot, _, _| {
+            let close = slot.close.map_or(committed, |(close, _)| close);
+            slot.close_committed = true;
+            submit(close)
+        })
+    }
+
     pub fn admit_terminal<T>(
         &self,
         try_admit: impl FnOnce() -> Option<T>,

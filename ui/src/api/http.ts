@@ -354,10 +354,12 @@ class WsTerminalSession implements TerminalSession {
     });
     ws.addEventListener('error', () => this.fail('network', 'The terminal connection failed.'));
     ws.addEventListener('close', (e: Event) => {
-      if (this.closedByClient || this.current === 'error' || this.current === 'closed') return;
       // Server-initiated close: say why, and let the view end a dead session.
+      // A received 4401 always ends the local session, even after a
+      // client-side failure already closed the view.
       const closed = closeMessage('terminal', e as CloseEvent);
       if (closed.reason === 'session_ended') this.onSessionEnded();
+      else if (this.closedByClient || this.current === 'error' || this.current === 'closed') return;
       this.events.emit({ type: 'closed', ...closed });
       this.setStatus('closed');
     });
@@ -449,10 +451,18 @@ class WsConsoleStream implements ConsoleStream {
     });
     ws.addEventListener('error', () => this.fail('The console connection failed.'));
     ws.addEventListener('close', (e: Event) => {
-      if (this.closedByClient || this.current === 'error' || this.current === 'closed') return;
       const { reason, message } = closeMessage('console', e as CloseEvent);
-      if (reason === 'session_ended') this.onSessionEnded();
-      this.setStatus('closed', message, reason === 'session_ended');
+      if (reason === 'session_ended') {
+        // A received 4401 always ends the local session, even after a server
+        // notice (such as "VM stopped") or a client-side failure already
+        // closed the view, so report it even when the status is unchanged.
+        this.onSessionEnded();
+        this.current = 'closed';
+        this.statuses.emit('closed', message, true);
+        return;
+      }
+      if (this.closedByClient || this.current === 'error' || this.current === 'closed') return;
+      this.setStatus('closed', message);
     });
   }
 

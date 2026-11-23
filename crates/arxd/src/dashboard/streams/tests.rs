@@ -1125,6 +1125,123 @@ async fn close_precedence_is_session_then_shutdown_then_target_then_ordinary() {
     assert!(stop.await.unwrap().is_ok());
 }
 
+/// Passes `open` frames, then holds `poll_ready` until released, like a
+/// transport whose buffer is full when the close frame is due.
+struct GatedSink {
+    open: usize,
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    frames: tokio::sync::mpsc::UnboundedSender<Message>,
+}
+
+impl Sink<Message> for GatedSink {
+    type Error = ();
+
+    fn poll_ready(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ()>> {
+        use std::future::Future;
+        if self.open > 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        if let Some(entered) = self.entered.take() {
+            entered.send(()).unwrap();
+        }
+        std::pin::Pin::new(&mut self.release)
+            .poll(cx)
+            .map(|released| released.map_err(|_| ()))
+    }
+
+    fn start_send(mut self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), ()> {
+        self.open = self.open.saturating_sub(1);
+        self.frames.send(item).map_err(|_| ())
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// The close-frame half of the precedence matrix, through the real writer.
+/// The writer has taken the close (`close_committed`) and waits in
+/// `poll_ready`; the frame becomes irreversible only when the sink accepts it.
+#[tokio::test(start_paused = true)]
+async fn session_end_reaches_a_close_the_sink_has_not_accepted() {
+    let f = Fixture::with_streams(false, Backends::new(None));
+    let target = Target::Console {
+        vm: [1; 16],
+        generation: 1,
+    };
+    let stopped = Close {
+        code: 1000,
+        reason: "VM stopped",
+    };
+    let notice = || Some(message(json!({"type":"closed","reason":"VM stopped"})));
+    // (pending close, later close, expected frames before the close, close)
+    let cases = [
+        // The reviewer's probe: shutdown taken, logout while the sink waits.
+        (Close::STOP, Close::SESSION, 0, 4401),
+        (Close::TARGET, Close::SESSION, 0, 4401),
+        // The ordinary notice went out; its close frame still waits.
+        (stopped, Close::SESSION, 1, 4401),
+        // Once taken, only a session end replaces the close.
+        (Close::TARGET, Close::STOP, 0, 4403),
+        (stopped, Close::TARGET, 1, 1000),
+    ];
+    for (index, (pending, later, open, expected)) in cases.into_iter().enumerate() {
+        f.clock.advance(Duration::from_secs(1));
+        let (socket, cookie, csrf, id, proof) = registered(&f, target.clone()).await;
+        assert!(socket.redeem(&id, &proof, ORIGIN).is_ok());
+        let stream = socket.stream();
+        stream.close(pending, (pending.code == 1000).then(notice).flatten());
+        let (entered, held) = tokio::sync::oneshot::channel();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let (frames, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let sink = GatedSink {
+            open,
+            entered: Some(entered),
+            release: gate,
+            frames,
+        };
+        let copy = stream.clone();
+        let task = tokio::spawn(async move { writer(&copy, sink).await });
+        held.await.unwrap();
+        for _ in 0..open {
+            assert!(
+                matches!(sent.try_recv(), Ok(Message::Text(_))),
+                "case {index}: the notice goes out first"
+            );
+        }
+        assert!(
+            sent.try_recv().is_err(),
+            "case {index}: nothing accepted yet"
+        );
+        if later.code == Close::SESSION.code {
+            logout(&f, &cookie, &csrf).await;
+        } else {
+            stream.close(later, None);
+        }
+        release.send(()).unwrap();
+        let Message::Close(Some(close)) = sent.recv().await.unwrap() else {
+            panic!("case {index}: expected the writer to send a close");
+        };
+        task.await.unwrap();
+        assert_eq!(close.code, expected, "case {index}");
+        assert!(sent.try_recv().is_err(), "case {index}: one close only");
+    }
+}
+
 /// Ignores transport keepalive frames while waiting for the server's close.
 async fn close_skipping_keepalive<S>(peer: &mut WebSocketStream<S>) -> u16
 where

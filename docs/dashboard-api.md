@@ -278,6 +278,12 @@ per-session lock:
      as the transport accepts it. The 5 s deadline starts at revocation: if
      the connection cannot drain its buffer and send the close by then (a
      stalled peer), the server aborts the TCP connection.
+   - The close frame is fixed only when the transport accepts it. A writer
+     that already took another close (for example 1001) and is waiting for
+     the transport reads the pending close again under the session lock in
+     the same step that hands the frame over. So a revocation that completes
+     before the hand-over always produces 4401, and logout is never followed
+     by a different close code on that socket.
 4. **Expiry wake-up.** At redemption the server arms a timer per stream for
    the session's absolute expiry, and re-arms an idle-expiry timer whenever
    the session's idle deadline moves. When a timer fires, its callback takes
@@ -317,7 +323,9 @@ so data the transport accepted before a 4401 is harmless to the UI.
 The client treats any close it did not start as server-initiated: it shows
 the reason in the terminal or console view and offers Reconnect, and it
 ignores any message that arrives after the close. On 4401 it also forgets the
-in-memory CSRF token, ends the local session and returns to the login form.
+in-memory CSRF token, ends the local session and returns to the login form,
+even when an earlier closing notice (such as `VM stopped`) already closed the
+view.
 On 4408 it reports a ticket or handshake failure and offers Reconnect,
 without ending the session.
 
