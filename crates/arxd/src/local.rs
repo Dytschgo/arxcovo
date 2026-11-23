@@ -15,6 +15,15 @@ mod platform;
 #[cfg(windows)]
 pub(crate) use platform::current_identity;
 
+pub(crate) use platform::owned as require_owner;
+
+pub(crate) fn vm_supervisor_identity() -> Result<String> {
+    #[cfg(windows)]
+    return current_identity();
+    #[cfg(unix)]
+    Ok(unsafe { libc::geteuid() }.to_string())
+}
+
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const FRAME_TIMEOUT: Duration = Duration::from_secs(300);
 pub const FRAME_LIMIT: usize = 8192;
@@ -184,6 +193,58 @@ impl Listener {
         run_listener_until(self.0, config, activity, stop).await
     }
 }
+
+/// The foreground candidate has its own store, listener and shutdown path.
+pub async fn run_vm_profile(profile: crate::config::VmForeground) -> Result<()> {
+    use crate::mcp::vm::Supervisor;
+    let crate::config::VmForeground { config, profile } = profile;
+    let endpoint = config.local.as_ref().context("server-config")?;
+    let supervisor = Supervisor::open(&config.state_dir, &profile).context("server-state")?;
+    supervisor.sweep().context("server-state")?;
+    let listener = Listener::bind(endpoint).context("server-bind")?;
+    let stop = crate::service::Shutdown::default();
+    let run = run_vm_listener(listener, Arc::new(config), supervisor.clone(), stop.clone());
+    tokio::pin!(run);
+    let (result, listener_done) = tokio::select! {
+        result = &mut run => (result.context("server-listener"), true),
+        result = supervisor.tick() => (result.context("server-state"), false),
+        result = tokio::signal::ctrl_c() => (result.context("server-listener"), false),
+    };
+    supervisor.close();
+    stop.cancel();
+    let listener_drain = if listener_done {
+        Ok(())
+    } else {
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .context("server-drain-unconfirmed")
+            .and_then(|result| result.context("server-listener"))
+    };
+    supervisor
+        .drain()
+        .await
+        .context("server-drain-unconfirmed")?;
+    result.and(listener_drain)
+}
+
+pub(crate) async fn run_vm_listener(
+    listener: Listener,
+    config: Arc<crate::config::Config>,
+    supervisor: Arc<crate::mcp::vm::Supervisor>,
+    stop: crate::service::Shutdown,
+) -> Result<()> {
+    run_listener_with(
+        listener.0,
+        config,
+        None,
+        stop,
+        ConnectionProfile {
+            vm: Some(supervisor),
+            ..ConnectionProfile::default()
+        },
+    )
+    .await
+}
 async fn run_listener(
     listener: impl Acceptor,
     config: Arc<crate::config::Config>,
@@ -201,6 +262,7 @@ async fn run_listener(
 struct ConnectionProfile {
     #[cfg(target_os = "linux")]
     build: Option<Arc<crate::service::cluster_build::BuildService>>,
+    vm: Option<Arc<crate::mcp::vm::Supervisor>>,
 }
 
 async fn run_listener_until(
@@ -212,7 +274,7 @@ async fn run_listener_until(
     run_listener_with(
         listener,
         config,
-        activity,
+        Some(activity),
         stop,
         ConnectionProfile::default(),
     )
@@ -230,9 +292,12 @@ pub(crate) async fn run_delegated(
     run_listener_with(
         listener,
         config,
-        activity,
+        Some(activity),
         stop,
-        ConnectionProfile { build: Some(build) },
+        ConnectionProfile {
+            build: Some(build),
+            vm: None,
+        },
     )
     .await
 }
@@ -240,20 +305,29 @@ pub(crate) async fn run_delegated(
 async fn run_listener_with(
     mut listener: impl Acceptor,
     config: Arc<crate::config::Config>,
-    activity: Arc<crate::store::Activity>,
+    activity: Option<Arc<crate::store::Activity>>,
     stop: crate::service::Shutdown,
     profile: ConnectionProfile,
 ) -> Result<()> {
     let capacity = Arc::new(tokio::sync::Semaphore::new(8));
     let mut tasks = tokio::task::JoinSet::new();
     let mut reported_rejection = false;
-    loop {
+    let result = loop {
         while tasks.try_join_next().is_some() {}
         tokio::select! {
             biased;
-            _ = stop.cancelled() => break,
+            _ = stop.cancelled() => break Ok(()),
             stream = listener.accept() => {
-                let Some(stream) = stream? else {
+                let stream = match stream {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        if let Some(vm) = &profile.vm {
+                            vm.close();
+                        }
+                        break Err(error);
+                    }
+                };
+                let Some(stream) = stream else {
                     if !reported_rejection {
                         eprintln!("arxd: server-peer-rejected");
                         reported_rejection = true;
@@ -277,11 +351,11 @@ async fn run_listener_with(
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {}
         }
-    }
+    };
     drop(listener);
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    Ok(())
+    result
     // ServiceApplication cancels and joins dedicated workers after connections stop.
 }
 #[cfg(target_os = "linux")]
@@ -297,7 +371,7 @@ impl Drop for CloseDelegated {
 async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     config: Arc<crate::config::Config>,
-    activity: Arc<crate::store::Activity>,
+    activity: Option<Arc<crate::store::Activity>>,
     profile: ConnectionProfile,
 ) -> Result<()> {
     let principal = tokio::time::timeout(AUTH_TIMEOUT, async {
@@ -314,11 +388,10 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     .await??;
     tokio::time::timeout(AUTH_TIMEOUT, stream.write_all(b"OK\n")).await??;
     let (read, write) = tokio::io::split(stream);
-    let handler = crate::mcp::Inventory {
-        execution: config.execution.clone(),
-        activity,
-        principal: Some(crate::mcp::Principal(principal)),
-    };
+    let vm = profile
+        .vm
+        .as_ref()
+        .map(|vm| vm.connection(principal.clone()));
     // Bound SDK requests at 8 KiB and response frames at 64 KiB. Idle authenticated
     // sessions may retain one of eight slots; partial frames and writes time out.
     let (sdk, pump) = tokio::io::duplex(FRAME_LIMIT);
@@ -332,6 +405,18 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let protocol = async {
         let transport =
             AsyncRwTransport::new_server(sdk_read, sdk_write).with_max_line_length(FRAME_LIMIT);
+        if let Some(connection) = &vm {
+            let service =
+                tokio::time::timeout(AUTH_TIMEOUT, connection.inventory().serve(transport))
+                    .await??;
+            service.waiting().await?;
+            return Ok::<_, anyhow::Error>(());
+        }
+        let handler = crate::mcp::Inventory {
+            execution: config.execution.clone(),
+            activity: activity.context("missing inventory")?,
+            principal: Some(crate::mcp::Principal(principal)),
+        };
         #[cfg(target_os = "linux")]
         if let (Some(build), Some(close)) = (profile.build, &close) {
             let service = tokio::time::timeout(
@@ -354,7 +439,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
     tokio::select! {
         result = protocol => result?,
-        result = forward(read, pump_write) => result?,
+        result = forward_checked(read, pump_write, FRAME_LIMIT, vm.is_some()) => result?,
         result = forward_bounded(pump_read, write, RESPONSE_LIMIT) => result?,
     }
     Ok(())
@@ -400,9 +485,24 @@ async fn bridge_connected(
     input: impl AsyncRead + Unpin,
     output: impl AsyncWrite + Unpin,
 ) -> Result<()> {
+    authenticate_bridge(&mut stream, &config.token).await?;
+    drop(config);
+    let (read, write) = tokio::io::split(stream);
+    // MCP's official newline-delimited stdio wire format, unchanged end to end.
+    // The SDK owns initialize/tool dispatch on the daemon; the bridge owns no state.
+    tokio::select! {
+        result = forward(input, write) => result,
+        result = forward_bounded(read, output, RESPONSE_LIMIT) => result,
+    }
+}
+
+async fn authenticate_bridge(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    token: &str,
+) -> Result<()> {
     tokio::time::timeout(AUTH_TIMEOUT, async {
         stream.write_all(b"ARX1 ").await?;
-        stream.write_all(config.token.as_bytes()).await?;
+        stream.write_all(token.as_bytes()).await?;
         stream.write_all(b"\n").await?;
         let mut ack = [0; 3];
         stream.read_exact(&mut ack).await?;
@@ -413,23 +513,43 @@ async fn bridge_connected(
     })
     .await
     .context("peer-auth-timeout")?
-    .context("peer-auth-rejected")?;
-    drop(config);
-    let (read, write) = tokio::io::split(stream);
-    // MCP's official newline-delimited stdio wire format, unchanged end to end.
-    // The SDK owns initialize/tool dispatch on the daemon; the bridge owns no state.
-    tokio::select! {
-        result = forward(input, write) => result,
-        result = forward_bounded(read, output, RESPONSE_LIMIT) => result,
-    }
+    .context("peer-auth-rejected")
+}
+
+#[cfg(test)]
+pub(crate) async fn connect_vm_fixture(
+    address: &str,
+    identity: &str,
+    token: &str,
+) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send + use<>> {
+    let config = ClientConfig {
+        address: address.to_owned(),
+        expected_server_identity: identity.to_owned(),
+        token: token.to_owned(),
+    };
+    let mut stream = tokio::time::timeout(AUTH_TIMEOUT, platform::connect(&config))
+        .await
+        .context("peer-connect-timeout")?
+        .context("peer-connect-or-identity")?;
+    authenticate_bridge(&mut stream, &config.token).await?;
+    Ok(stream)
 }
 async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(read: R, write: W) -> Result<()> {
     forward_bounded(read, write, FRAME_LIMIT).await
 }
 async fn forward_bounded<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     read: R,
+    write: W,
+    limit: usize,
+) -> Result<()> {
+    forward_checked(read, write, limit, false).await
+}
+
+async fn forward_checked<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    read: R,
     mut write: W,
     limit: usize,
+    vm: bool,
 ) -> Result<()> {
     let mut read = BufReader::with_capacity(limit, read);
     loop {
@@ -463,12 +583,81 @@ async fn forward_bounded<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if !present {
             return Ok(());
         }
+        if vm {
+            let value = check_json(&line)?;
+            if let Some(arguments) = value.pointer("/params/arguments") {
+                anyhow::ensure!(arguments.is_object(), "invalid tool envelope");
+            }
+        }
         tokio::time::timeout(AUTH_TIMEOUT, async {
             write.write_all(&line).await?;
             write.flush().await
         })
         .await??;
     }
+}
+
+/// Reject duplicate (including escape-equivalent) object keys before rmcp
+/// materializes a map. Limits apply to arrays and objects alike.
+pub(crate) fn check_json(bytes: &[u8]) -> Result<serde_json::Value> {
+    use serde::de::{DeserializeSeed, Error, MapAccess, SeqAccess, Visitor};
+    use serde_json::{Map, Value};
+
+    struct Bounded(u8);
+    impl<'de> DeserializeSeed<'de> for Bounded {
+        type Value = Value;
+        fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<Value, D::Error> {
+            if self.0 >= 16 {
+                return Err(D::Error::custom("JSON nesting limit"));
+            }
+            de.deserialize_any(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Bounded {
+        type Value = Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("bounded JSON")
+        }
+        fn visit_unit<E: Error>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_bool<E: Error>(self, v: bool) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_i64<E: Error>(self, v: i64) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_u64<E: Error>(self, v: u64) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_f64<E: Error>(self, v: f64) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_str<E: Error>(self, v: &str) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+            let mut values = Vec::new();
+            while let Some(value) = seq.next_element_seed(Bounded(self.0 + 1))? {
+                values.push(value);
+            }
+            Ok(Value::Array(values))
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let mut values = Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if values.contains_key(&key) {
+                    return Err(A::Error::custom("duplicate JSON key"));
+                }
+                values.insert(key, map.next_value_seed(Bounded(self.0 + 1))?);
+            }
+            Ok(Value::Object(values))
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let result = Bounded(0).deserialize(&mut de)?;
+    de.end()?;
+    Ok(result)
 }
 
 #[cfg(test)]

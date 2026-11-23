@@ -81,8 +81,14 @@ async fn run() -> anyhow::Result<()> {
     if args.len() != 2 || args[0] != "--config" {
         anyhow::bail!("invalid arguments");
     }
-    let config =
-        Arc::new(arxd::config::Config::load(&PathBuf::from(&args[1])).context("server-config")?);
+    let config = match arxd::config::ForegroundConfig::load(&PathBuf::from(&args[1]))
+        .context("server-config")?
+    {
+        arxd::config::ForegroundConfig::Inventory(config) => Arc::new(config),
+        arxd::config::ForegroundConfig::TestVms(profile) => {
+            return arxd::local::run_vm_profile(profile).await;
+        }
+    };
     let activity =
         Arc::new(arxd::store::Activity::open(&config.state_dir).context("server-state")?);
     let local = config

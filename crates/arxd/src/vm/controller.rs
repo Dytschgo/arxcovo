@@ -1168,3 +1168,148 @@ fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Tar
         _ => Ok(Err(Refusal::Busy)),
     }
 }
+
+pub(crate) struct CatalogEntry {
+    pub kind: u8,
+    pub id: Id,
+    pub recipe: Option<String>,
+}
+
+pub(crate) struct ActivityReceipt {
+    pub id: i64,
+    pub action: i64,
+    pub state: i64,
+    pub reason: Option<i64>,
+    pub vm: Option<Id>,
+    pub operation: Option<Id>,
+    pub started_ms: i64,
+    pub finished_ms: Option<i64>,
+    pub cleanup: Option<bool>,
+}
+
+impl<C: Clock> VmController<C> {
+    pub(crate) fn foreground_catalog(
+        &self,
+        principal: &str,
+        recipe: Option<Id>,
+        after: (u8, Id),
+        limit: u32,
+    ) -> Result<Vec<CatalogEntry>> {
+        self.store.transact(|db| {
+            let mut query = db.prepare(
+                "SELECT kind,id,recipe FROM (
+                   SELECT 1 AS kind, ?1 AS id, NULL AS recipe WHERE ?1 IS NOT NULL
+                   UNION ALL
+                   SELECT 2, b.template_id, b.recipe_id FROM vm_build_intents b
+                     WHERE b.state='sealed'
+                   UNION ALL
+                   SELECT 3, b.operation_id, b.recipe_id FROM vm_build_intents b
+                     JOIN vm_operations o USING(operation_id)
+                     WHERE o.principal=?2 AND b.state='pending' AND o.status=0
+                 ) WHERE (kind,id)>(?3,?4) ORDER BY kind,id LIMIT ?5",
+            )?;
+            let rows =
+                query.query_map(params![recipe, principal, after.0, after.1, limit], |row| {
+                    Ok(CatalogEntry {
+                        kind: row.get(0)?,
+                        id: row.get(1)?,
+                        recipe: row.get(2)?,
+                    })
+                })?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    pub(crate) fn foreground_activity(
+        &self,
+        principal: &str,
+        before: Option<i64>,
+        exact: Option<i64>,
+        limit: u8,
+    ) -> Result<Vec<ActivityReceipt>> {
+        self.store.transact(|db| {
+            let mut query = db.prepare(
+                "SELECT a.id,a.action,a.status,a.reason,a.vm,o.operation_id,
+                        a.started_ms,a.finished_ms,a.cleanup_confirmed
+                   FROM activity a LEFT JOIN vm_operations o ON o.activity_id=a.id
+                   WHERE a.principal=?1 AND a.actor='agent'
+                     AND (?2 IS NULL OR a.id<?2) AND (?3 IS NULL OR a.id=?3)
+                   ORDER BY a.id DESC LIMIT ?4",
+            )?;
+            let rows = query.query_map(params![principal, before, exact, limit], |row| {
+                Ok(ActivityReceipt {
+                    id: row.get(0)?,
+                    action: row.get(1)?,
+                    state: row.get(2)?,
+                    reason: row.get(3)?,
+                    vm: row.get(4)?,
+                    operation: row.get(5)?,
+                    started_ms: row.get(6)?,
+                    finished_ms: row.get(7)?,
+                    cleanup: row.get(8)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// Check a validated replay before any native decision or fixture lookup.
+    /// All callers serialize fresh admission, cancellation and this check in
+    /// the foreground supervisor gate. The eventual admission checks it again.
+    pub(crate) fn foreground_replay(
+        &self,
+        principal: &str,
+        key: RequestId,
+        subject: Subject<'_>,
+        action: i64,
+    ) -> Result<Result<Option<store::Replay>, Refusal>> {
+        let closed = self
+            .closed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        let binding = store::Binding {
+            principal,
+            key,
+            subject,
+            action,
+        };
+        map_full(self.store.transact(|db| binding.replay(db, utc(self.clock.now())?, *closed)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn foreground_operation_ref(&self, principal: &str, receipt: i64) -> Result<Id> {
+        self.store.transact(|db| {
+            Ok(db.query_row(
+                "SELECT operation_id FROM vm_operations WHERE activity_id=?1 AND principal=?2",
+                params![receipt, principal],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    /// Use the existing bounded v6 audit vocabulary and only correlate an ID
+    /// after the same transaction proves caller ownership.
+    pub(crate) fn foreground_refusal(
+        &self,
+        principal: &str,
+        action: i64,
+        vm: Option<Id>,
+        reason: Refusal,
+    ) -> Result<Result<(), Refusal>> {
+        map_full(self.store.transact(|db| {
+            store::require_headroom(db)?;
+            let now = utc(self.clock.now())?;
+            let vm = if let Some(vm) = vm {
+                (owned_vm(db, principal, vm)?.is_some()
+                    || store::expired_status(db, principal, vm)?.is_some())
+                .then_some(vm)
+            } else {
+                None
+            };
+            if action == BUILD_ACTION || vm.is_some() {
+                store::refusal_for(db, principal, vm, action, now, reason)?;
+            }
+            Ok(Ok(()))
+        }))
+    }
+}

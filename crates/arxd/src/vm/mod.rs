@@ -13,6 +13,7 @@ mod template;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
+pub(crate) use controller::ActivityReceipt;
 pub use controller::VmController;
 pub use model::*;
 pub use policy::{Capacity, HostObservation, Resources, VmPolicy};

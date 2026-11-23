@@ -6,6 +6,7 @@ use std::sync::Arc;
 mod activity_tests;
 #[cfg(test)]
 mod discovery_tests;
+pub(crate) mod vm;
 #[derive(Clone)]
 pub struct Inventory {
     pub execution: Option<Arc<crate::development::Execution>>,
