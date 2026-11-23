@@ -1,0 +1,274 @@
+use super::*;
+use serde_json::json;
+use std::sync::Mutex;
+
+#[path = "private.rs"]
+mod private;
+
+const NOW: i64 = 1_800_000_000_000;
+const OWNER: &str = "agent-one";
+const SENTINEL: &str = "exit 7 # vault-script-sentinel-cadcf8bd";
+
+#[derive(Default)]
+struct Fixture(Mutex<Option<TestJob>>);
+
+impl VaultTester for Fixture {
+    fn enqueue(&self, job: TestJob) {
+        assert!(self.0.lock().unwrap().replace(job).is_none());
+    }
+}
+
+impl Fixture {
+    fn take(&self) -> TestJob {
+        self.0.lock().unwrap().take().unwrap()
+    }
+}
+
+fn key(nonce: u64) -> RequestId {
+    RequestId::parse(&format!("{NOW:016x}{nonce:016x}")).unwrap()
+}
+
+fn add(vault: &Arc<Vault>, nonce: u64, name: &str, body: &str) -> Reply {
+    vault.mutate(
+        OWNER,
+        Action::Add,
+        Ok(Write::Add {
+            request_id: key(nonce),
+            os: ScriptOs::Ubuntu,
+            name: name.into(),
+            script: body.into(),
+        }),
+        NOW,
+    )
+}
+
+fn version_id(result: Value) -> Id {
+    parse_id(result["version_id"].as_str().unwrap()).unwrap()
+}
+
+fn test(vault: &Arc<Vault>, nonce: u64, version_id: Id) -> Reply {
+    vault.mutate(
+        OWNER,
+        Action::Test,
+        Ok(Write::Test {
+            request_id: key(nonce),
+            version_id,
+        }),
+        NOW,
+    )
+}
+
+fn activate(vault: &Arc<Vault>, nonce: u64, version_id: Id) -> Reply {
+    vault.mutate(
+        OWNER,
+        Action::Activate,
+        Ok(Write::Activate {
+            request_id: key(nonce),
+            version_id,
+        }),
+        NOW,
+    )
+}
+
+#[test]
+fn vault_failed_replacement_keeps_predecessor_active_and_redacts_audit() {
+    let dir = private::private_dir();
+    let tester = Arc::new(Fixture::default());
+    let vault = Vault::open(dir.path(), Some(tester.clone()), NOW).unwrap();
+    let first = version_id(add(&vault, 1, "build", "exit 0").unwrap());
+    assert_eq!(activate(&vault, 2, first), Err(Refusal::PassRequired));
+    let test_receipt = test(&vault, 3, first).unwrap();
+    assert_eq!(vault.get(OWNER, first, false).unwrap()["state"], "testing");
+    assert_eq!(activate(&vault, 4, first), Err(Refusal::PassRequired));
+    assert_eq!(test(&vault, 3, first).unwrap(), test_receipt);
+    let job = tester.take();
+    assert_eq!(job.os().as_str(), "ubuntu");
+    assert_eq!(job.content(), "exit 0");
+    assert_eq!(job.sha256(), <[u8; 32]>::from(Sha256::digest(b"exit 0")));
+    job.complete(ScriptOutcome::Exited { exit_code: 0 }, true)
+        .unwrap();
+    let activation = activate(&vault, 5, first).unwrap();
+    assert_eq!(activate(&vault, 5, first).unwrap(), activation);
+
+    let broken = version_id(add(&vault, 6, "build", SENTINEL).unwrap());
+    test(&vault, 7, broken).unwrap();
+    tester
+        .take()
+        .complete(ScriptOutcome::Exited { exit_code: 7 }, true)
+        .unwrap();
+    let rejected = vault.get(OWNER, broken, true).unwrap();
+    assert_eq!(rejected["state"], "rejected");
+    assert_eq!(rejected["content"], SENTINEL);
+    assert_eq!(rejected["test"]["exit_code"], 7);
+    assert_eq!(activate(&vault, 8, broken), Err(Refusal::PassRequired));
+    assert_eq!(vault.get(OWNER, first, false).unwrap()["state"], "active");
+
+    let unclean = version_id(add(&vault, 9, "build", "exit 0").unwrap());
+    test(&vault, 10, unclean).unwrap();
+    tester
+        .take()
+        .complete(ScriptOutcome::Exited { exit_code: 0 }, false)
+        .unwrap();
+    assert_eq!(
+        vault.get(OWNER, unclean, false).unwrap()["state"],
+        "rejected"
+    );
+    assert_eq!(activate(&vault, 11, unclean), Err(Refusal::PassRequired));
+    let replacement = version_id(add(&vault, 12, "build", "exit 0").unwrap());
+    test(&vault, 13, replacement).unwrap();
+    tester
+        .take()
+        .complete(ScriptOutcome::Exited { exit_code: 0 }, true)
+        .unwrap();
+    activate(&vault, 14, replacement).unwrap();
+    assert_eq!(
+        vault.get(OWNER, first, false).unwrap()["state"],
+        "superseded"
+    );
+    assert_eq!(
+        vault.get(OWNER, replacement, false).unwrap()["state"],
+        "active"
+    );
+    assert_eq!(vault.get("another", broken, true), Err(Refusal::NotFound));
+
+    let page = vault
+        .page(
+            OWNER,
+            read::List::Audit,
+            serde_json::from_value(json!({})).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        page["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["version_id"] == hex::encode(broken) && row["outcome"] == "failed")
+    );
+    assert!(!page.to_string().contains(SENTINEL));
+    vault
+        .store
+        .read(|db| {
+            let audit = db
+                .prepare("SELECT * FROM audit")?
+                .query_map([], |row| {
+                    let mut bytes = Vec::new();
+                    for col in 0..row.as_ref().column_count() {
+                        match row.get_ref(col)? {
+                            types::ValueRef::Blob(data) | types::ValueRef::Text(data) => {
+                                bytes.extend_from_slice(data)
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(bytes)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert!(
+                !audit
+                    .concat()
+                    .windows(SENTINEL.len())
+                    .any(|bytes| bytes == SENTINEL.as_bytes())
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn vault_replay_lock_recovery_and_clock_rollback() {
+    let dir = private::private_dir();
+    let vault = Vault::open(dir.path(), None, NOW).unwrap();
+    assert!(Vault::open(dir.path(), None, NOW).is_err());
+    let receipt = add(&vault, 1, "one", "exit 0").unwrap();
+    let version = version_id(receipt.clone());
+    assert_eq!(add(&vault, 1, "one", "exit 0").unwrap(), receipt);
+    assert_eq!(add(&vault, 1, "one", "exit 1"), Err(Refusal::KeyCollision));
+    assert_eq!(test(&vault, 2, version), Err(Refusal::TesterUnavailable));
+    assert_eq!(vault.get(OWNER, version, false).unwrap()["state"], "draft");
+    let visible = vault.get(OWNER, version, false).unwrap();
+    let subject = parse_id(visible["script_id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        vault.page(
+            "other",
+            read::List::Versions(subject),
+            serde_json::from_value(json!({})).unwrap()
+        ),
+        Err(Refusal::NotFound)
+    );
+    // Leave a committed intent without delivering it, simulating process loss.
+    vault
+        .store
+        .write(|db| {
+            let scope = store::WriteScope {
+                owner: OWNER,
+                action: Action::Test,
+                at_ms: NOW,
+            };
+            let (_, job) = scope.execute(
+                db,
+                Write::Test {
+                    request_id: key(2),
+                    version_id: version,
+                },
+                true,
+            )?;
+            assert!(job.is_some());
+            Ok(())
+        })
+        .unwrap();
+    drop(vault);
+    let vault = Vault::open(dir.path(), None, NOW).unwrap();
+    let recovered = vault.get(OWNER, version, false).unwrap();
+    assert_eq!(recovered["state"], "rejected");
+    assert_eq!(recovered["test"]["status"], "interrupted");
+    assert_eq!(add(&vault, 1, "one", "exit 0").unwrap(), receipt);
+    assert!(test(&vault, 2, version).is_ok());
+    assert_eq!(
+        vault.mutate(
+            OWNER,
+            Action::Activate,
+            Ok(Write::Activate {
+                request_id: key(3),
+                version_id: version,
+            }),
+            NOW + crate::vm::RETRY_WINDOW_MS + 1
+        ),
+        Err(Refusal::StaleKey)
+    );
+    assert_eq!(add(&vault, 1, "one", "exit 0"), Err(Refusal::StaleKey));
+}
+
+#[test]
+fn vault_script_version_and_byte_caps_refuse_without_partial_rows() {
+    let dir = private::private_dir();
+    let vault = Vault::open(dir.path(), None, NOW).unwrap();
+    vault.store.write(|db| {
+        db.execute_batch("
+            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<128)
+            INSERT INTO scripts(seq,id,owner,os,name)
+                SELECT i,randomblob(16),'agent-one','ubuntu','script-'||i FROM n;
+            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<256)
+            INSERT INTO versions(id,script,body,hash,created_ms)
+                SELECT randomblob(16),1+(i-1)/64,CAST(printf('%04096d',i) AS BLOB),randomblob(32),1 FROM n;
+        ")?;
+        Ok(())
+    }).unwrap();
+    assert_eq!(add(&vault, 1, "new", "x"), Err(Refusal::ScriptLimit));
+    assert_eq!(add(&vault, 2, "script-1", "x"), Err(Refusal::VersionLimit));
+    assert_eq!(add(&vault, 3, "script-5", "x"), Err(Refusal::ByteLimit));
+    vault
+        .store
+        .read(|db| {
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM versions", [], |r| r.get::<_, i64>(0))?,
+                256
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM replay", [], |r| r.get::<_, i64>(0))?,
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+}
