@@ -1382,6 +1382,10 @@ pub(super) mod tests {
         );
     }
 
+    // Hang guard for a spawned PowerShell process, not a speed budget.
+    #[cfg(windows)]
+    const POWERSHELL_FIXTURE_HANG_GUARD: Duration = Duration::from_secs(120);
+
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_finalizer_and_health_probes_gate_publication() {
@@ -1422,7 +1426,7 @@ pub(super) mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(10), async move {
+        let result = tokio::time::timeout(POWERSHELL_FIXTURE_HANG_GUARD, async move {
             let mut input = check.stdin.take().unwrap();
             let fixture =
                 format!("$provisioner = @'\n{PROVISIONER}'@\n{CHECK_PROVISIONER}\n{CHECK_HEALTH}");
