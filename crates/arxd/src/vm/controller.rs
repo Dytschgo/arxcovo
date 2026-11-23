@@ -2004,6 +2004,18 @@ impl<C: Clock> VmController<C> {
         })
     }
 
+    /// Settles publication receipts that lost their terminal write; see
+    /// [`store::publish::settle_orphans`].
+    pub(crate) fn settle_orphaned_publications(
+        &self,
+        live: &std::collections::HashSet<i64>,
+    ) -> Result<()> {
+        let now = utc(self.clock.now())?;
+        self.store
+            .transact(|db| store::publish::settle_orphans(db, live, now))
+            .map(drop)
+    }
+
     pub(crate) fn finish_publication(
         &self,
         operation: OperationRef,

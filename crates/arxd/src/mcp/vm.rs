@@ -283,6 +283,10 @@ pub(crate) struct Supervisor {
     /// Blocks the next dispatch while it holds the gate.
     #[cfg(test)]
     stall_dispatch: Mutex<Option<tests::StallHook>>,
+    /// Blocks the next publish after its activation is registered and before
+    /// its admission transaction.
+    #[cfg(test)]
+    stall_admission: Mutex<Option<tests::StallHook>>,
     /// Blocks the next sweep.
     #[cfg(test)]
     stall_sweep: Mutex<Option<tests::StallHook>>,
@@ -381,6 +385,8 @@ impl Supervisor {
             stall_recovery: Mutex::new(None),
             #[cfg(test)]
             stall_dispatch: Mutex::new(None),
+            #[cfg(test)]
+            stall_admission: Mutex::new(None),
             #[cfg(test)]
             stall_sweep: Mutex::new(None),
             #[cfg(test)]
@@ -709,6 +715,16 @@ impl Drop for Connection {
             .supervisor
             .closed_connections
             .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Keeps a publication receipt in the live-worker set until its worker
+/// exits, however it exits.
+struct Tracked(Arc<Supervisor>, i64);
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.0.publisher.untrack(self.1);
     }
 }
 
@@ -1286,31 +1302,29 @@ impl VmInventory {
     }
 
     /// Owner revocation for an authenticated `unpublish_site`, with no lock
-    /// beyond the activation registry's. Only a well-formed request from the
-    /// principal that admitted the current activation of that VM revokes it,
-    /// and the in-memory replay and collision fences exclude request faults;
-    /// see [`Publication::revoke_owned`]. A failed stop stays retryable: every
-    /// later owner unpublish and reaper turn retries it.
+    /// beyond the activation registry's. Any such call from the principal
+    /// that started an active or registered publication of the named VM
+    /// cancels it and queues its connector stop at once, whatever its request
+    /// key, timestamp or later ledger, pressure or audit outcome. Those decide
+    /// only the response and the durable bookkeeping. Another principal never
+    /// matches. A failed stop stays retryable: every later owner unpublish and
+    /// reaper turn retries it.
     fn revoke_early(&self, request: &CallToolRequestParams) {
         if request.name.as_ref() != ToolName::Unpublish.name() {
             return;
         }
-        let Some(arguments) = request.arguments.as_ref() else {
+        let Some(vm) = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("vm_id"))
+            .and_then(Value::as_str)
+            .and_then(|id| parse_id(id).ok())
+        else {
             return;
         };
-        let mut args = Args::new(arguments.clone());
-        if args.malformed() {
-            return;
-        }
-        let Ok(mutation) = Mutation::parse(ToolName::Unpublish, &mut args) else {
-            return;
-        };
-        if let Some(generation) =
-            self.supervisor
-                .publisher
-                .revoke_owned(&self.principal, mutation.id, mutation.key)
-        {
-            self.supervisor.stop_revoked(generation);
+        let supervisor = &self.supervisor;
+        for generation in supervisor.publisher.revoke_owned(&self.principal, vm) {
+            supervisor.stop_revoked(generation);
         }
     }
 
@@ -1327,9 +1341,9 @@ impl VmInventory {
         let Some(row) = owned.pop() else {
             return refuse(Refusal::NotFound);
         };
-        while let Some(job) = gate.publish_jobs.try_join_next() {
-            gate.publish_failed |= !matches!(job, Ok(Ok(())));
-        }
+        // A failed worker leaves its durable intent and receipt to the reaper,
+        // which reconciles both. Only an unconfirmed local stop is sticky.
+        while gate.publish_jobs.try_join_next().is_some() {}
         supervisor.harvest_revocations(gate);
         if publish && gate.publish_failed {
             return refuse(Refusal::StateUnavailable);
@@ -1374,31 +1388,55 @@ impl VmInventory {
         } else {
             None
         };
-        let operation = match controller.admit_publication(
+        let publisher = &supervisor.publisher;
+        // Registered before the admission transaction, so an owner unpublish
+        // that races it still revokes this activation.
+        let activation = prepared
+            .is_some()
+            .then(|| publisher.register(vm, &self.principal));
+        #[cfg(test)]
+        let _registered = supervisor
+            .stall_admission
+            .lock()
+            .ok()
+            .and_then(|mut stall| stall.take())
+            .map(tests::StallHook::enter);
+        let mut workers = publisher.workers();
+        let admitted = controller.admit_publication(
             &self.principal,
             request.key,
             vm,
             prepared.as_ref().map(|(intent, _, _)| (intent, &row.name)),
-        ) {
+        );
+        let operation = match admitted {
             Ok(Ok(operation)) => operation,
-            Ok(Err(reason)) => return refuse(reason),
-            Err(error) => return Err(error.into()),
+            refused => {
+                drop(workers);
+                if let Some((generation, _)) = activation {
+                    publisher.abandon(generation);
+                }
+                return match refused {
+                    Ok(Err(reason)) => refuse(reason),
+                    Err(error) => Err(error.into()),
+                    Ok(Ok(_)) => unreachable!("admitted above"),
+                };
+            }
         };
-        let publisher = &supervisor.publisher;
-        let activation = if prepared.is_some() {
-            Some(publisher.activation(vm, &self.principal, request.key))
+        workers.insert(operation.receipt.activity_id);
+        drop(workers);
+        let tracked = Tracked(supervisor.clone(), operation.receipt.activity_id);
+        if let Some((generation, _)) = activation {
+            publisher.admitted(generation);
         } else {
-            // The admitted unpublish committed `revoking`. Revoke again in
-            // case the in-memory fence above declined, for example for a key
-            // minted before the activation's publish.
-            publisher.admitted(&self.principal, request.key);
-            if let Some(generation) = publisher.revoke(vm) {
+            // The admitted unpublish committed `revoking`: revoke again for an
+            // activation admitted between the early check and this point.
+            for generation in publisher.revoke(vm) {
                 supervisor.stop_revoked(generation);
             }
-            None
-        };
+        }
         let supervisor = supervisor.clone();
         gate.publish_jobs.spawn(async move {
+            let _tracked = tracked;
             match (prepared, activation) {
                 (Some((intent, credentials, origin)), Some((generation, revoked))) => {
                     let _slot = slot;
@@ -3891,8 +3929,10 @@ mod tests {
             call(&a, "unpublish_site", args(612)).await["reason"],
             "key_collision"
         );
+        // The ledger decides only the response: an owner unpublish, even with
+        // a colliding key, closes ingress at once.
         assert_eq!(fake.posts.load(SeqCst), 1);
-        assert!(fake.local.load(SeqCst));
+        until(|| !fake.local.load(SeqCst)).await;
         let ingress = fake.ingress.lock().unwrap().clone().unwrap();
         assert!(ingress.contains("hostname: 'publish.example.invalid'"));
         assert!(ingress.contains("noTLSVerify: false"));
@@ -4712,6 +4752,286 @@ mod tests {
         assert_eq!(settle(&h, &a, &vm).await["reason"], "connector_exited");
         assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (2, 2));
         assert_eq!(releases(), 2);
+
+        // The admitted unpublish's terminal receipt write fails after it
+        // released the intent. The reaper settles the receipt once writes
+        // resume, which reopens publish admission.
+        fake.health.store(0, SeqCst);
+        let published = call(&a, "publish_site", args(973)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        store
+            .transact(|db| {
+                Ok(db.execute_batch(
+                    "CREATE TRIGGER terminal_failure BEFORE UPDATE OF status ON activity
+                     WHEN OLD.action=16 AND OLD.status=0 AND NEW.status<>0
+                     BEGIN SELECT RAISE(ABORT, 'synthetic terminal write failure'); END;",
+                )?)
+            })
+            .unwrap();
+        let revoke = call(&a, "unpublish_site", args(974)).await;
+        assert_eq!(revoke["ok"], true, "{revoke}");
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert!(!fake.local.load(SeqCst));
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert_eq!(operation(&a, &revoke).await["state"], "pending");
+        assert_eq!(
+            call(&a, "publish_site", args(975)).await["reason"],
+            "not_ready"
+        );
+        store
+            .transact(|db| Ok(db.execute_batch("DROP TRIGGER terminal_failure")?))
+            .unwrap();
+        h.tick().await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        let published = call(&a, "publish_site", args(976)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (4, 3));
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    async fn operation(a: &Client, reference: &Value) -> Value {
+        call(
+            a,
+            "vm_operation",
+            json!({"operation_id":reference["operation_id"]}),
+        )
+        .await
+    }
+
+    /// Waits for `unpublished` without driving a reaper turn.
+    async fn converged(a: &Client, vm: &Value) -> Value {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row = phase(a, vm).await;
+                if row["phase"] == "unpublished" {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("publication did not converge without the reaper")
+    }
+
+    fn trigger(h: &Harness, sql: &str) {
+        h.supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| Ok(db.execute_batch(sql)?))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_owner_unpublish_revokes_at_once_whatever_its_key() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let b = h.client(1).await;
+        let (vm, fake) = enrolled(&h, &a, 1000).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+
+        // A foreign principal never revokes.
+        let published = call(&a, "publish_site", args(1010)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert_eq!(
+            call(&b, "unpublish_site", args(1011)).await["reason"],
+            "not_found"
+        );
+        assert!(revocations_settled(h.supervisor()));
+        assert!(fake.local.load(SeqCst));
+
+        // A distinct owner key minted before the publish key, with the
+        // dispatch gate held by another call.
+        let early = json!({"vm_id":vm,"request_id":format!("{:016x}{:016x}", UTC - 1_000, 1012)});
+        let (reader, revoker) = (h.client(0).await, h.client(0).await);
+        let mut stall = Stall::install(&h.supervisor().stall_dispatch);
+        let blocked = spawn_call(reader, "publish_status", json!({"vm_id":vm}));
+        stall.entered().await;
+        let revoke = spawn_call(revoker, "unpublish_site", early);
+        until(|| !fake.local.load(SeqCst)).await;
+        assert!(!revoke.is_finished(), "unpublish passed a held gate");
+        stall.release_and_join().await;
+        assert_eq!(blocked.await.unwrap()["ok"], true);
+        let revoke = revoke.await.unwrap();
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        until(|| revocations_settled(h.supervisor())).await;
+
+        // An owner unpublish racing the publish admission transaction, whose
+        // own durable admission then fails: the registered activation is
+        // revoked before its worker can start the connector.
+        let starts = fake.starts.load(SeqCst);
+        let (caller, revoker) = (h.client(0).await, h.client(0).await);
+        let mut stall = Stall::install(&h.supervisor().stall_admission);
+        let pending = spawn_call(caller, "publish_site", args(1013));
+        stall.entered().await;
+        let revoke = spawn_call(revoker, "unpublish_site", args(1014));
+        until(|| !h.supervisor().revocations.lock().unwrap().is_empty()).await;
+        trigger(
+            &h,
+            "CREATE TRIGGER refuse_unpublish BEFORE INSERT ON activity WHEN NEW.action=16
+             BEGIN SELECT RAISE(ABORT, 'synthetic unpublish admission failure'); END;",
+        );
+        stall.release_and_join().await;
+        let pending = pending.await.unwrap();
+        assert_eq!(revoke.await.unwrap()["ok"], false);
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"]),
+            (&json!("failed"), &json!("cancelled")),
+            "{failed}"
+        );
+        trigger(&h, "DROP TRIGGER refuse_unpublish");
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert_eq!(fake.starts.load(SeqCst), starts);
+        assert!(!fake.local.load(SeqCst));
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (1, 1));
+        until(|| revocations_settled(h.supervisor())).await;
+        drop((a, b));
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn owner_cancel_inside_the_publish_commit_converges_to_unpublished() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1020).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        // The owner's durable unpublish is refused, so only the publish
+        // worker itself can converge, with no reaper turn.
+        trigger(
+            &h,
+            "CREATE TRIGGER refuse_unpublish BEFORE INSERT ON activity WHEN NEW.action=16
+             BEGIN SELECT RAISE(ABORT, 'synthetic unpublish admission failure'); END;",
+        );
+        let (entered, in_commit) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        *h.supervisor().publisher.commit_hook.lock().unwrap() = Some((entered, held));
+        let revoker = h.client(0).await;
+        let pending = call(&a, "publish_site", args(1030)).await;
+        // Inside the commit transaction, after its authorization.
+        tokio::time::timeout(Duration::from_secs(2), in_commit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fake.local.load(SeqCst));
+        let revoke = spawn_call(revoker, "unpublish_site", args(1031));
+        until(|| !fake.local.load(SeqCst)).await;
+        release.send(()).unwrap();
+        assert_eq!(revoke.await.unwrap()["ok"], false);
+        // The commit stands, and the worker drives the activation back.
+        assert_eq!(terminal(&a, &pending).await["state"], "succeeded");
+        assert_eq!(converged(&a, &vm).await["reason"], "cancelled");
+        assert!(!fake.local.load(SeqCst));
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (1, 1));
+        trigger(&h, "DROP TRIGGER refuse_unpublish");
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_publish_never_pins_a_post_it_did_not_submit() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1040).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let pause = |h: &Harness| {
+            let (marker, in_gate, release) = gate();
+            *h.supervisor().publisher.marker_gate.lock().unwrap() = Some(marker);
+            (in_gate, release)
+        };
+
+        // An owner unpublish commits `revoking` between the durable marker
+        // and the pre-submission check.
+        let (in_gate, release) = pause(&h);
+        let pending = call(&a, "publish_site", args(1050)).await;
+        entered(in_gate).await;
+        let revoke = call(&a, "unpublish_site", args(1051)).await;
+        assert_eq!(revoke["ok"], true, "{revoke}");
+        assert_eq!(phase(&a, &vm).await["phase"], "revoking");
+        release.send(()).unwrap();
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (&json!("failed"), &json!("cancelled"), &json!("confirmed")),
+            "{failed}"
+        );
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (0, 0));
+        let published = call(&a, "publish_site", args(1052)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let revoke = call(&a, "unpublish_site", args(1053)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+
+        // The withdrawal write itself fails: the worker's no-submission
+        // evidence still releases the intent without consulting DNS.
+        trigger(
+            &h,
+            "CREATE TRIGGER withdrawal_failure BEFORE UPDATE OF post_possible ON vm_publication
+             WHEN OLD.post_possible=1 AND NEW.post_possible=0
+             BEGIN SELECT RAISE(ABORT, 'synthetic withdrawal failure'); END;",
+        );
+        let (in_gate, release) = pause(&h);
+        let pending = call(&a, "publish_site", args(1054)).await;
+        entered(in_gate).await;
+        let revoke = call(&a, "unpublish_site", args(1055)).await;
+        release.send(()).unwrap();
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (
+                &json!("failed"),
+                &json!("cleanup_unconfirmed"),
+                &json!("confirmed")
+            ),
+            "{failed}"
+        );
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        trigger(&h, "DROP TRIGGER withdrawal_failure");
+
+        // The withdrawal commits in `revoking`, then every release fails
+        // until writes resume. Both workers exit with pending receipts; the
+        // reaper releases the intent from its withdrawn marker and settles
+        // both receipts, and publication reopens.
+        trigger(
+            &h,
+            "CREATE TRIGGER release_failure BEFORE DELETE ON vm_publication
+             BEGIN SELECT RAISE(ABORT, 'synthetic release failure'); END;",
+        );
+        let (in_gate, release) = pause(&h);
+        let pending = call(&a, "publish_site", args(1056)).await;
+        entered(in_gate).await;
+        let revoke = call(&a, "unpublish_site", args(1057)).await;
+        release.send(()).unwrap();
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert_eq!(operation(&a, &pending).await["state"], "pending");
+        assert_eq!(operation(&a, &revoke).await["state"], "pending");
+        assert_eq!(phase(&a, &vm).await["phase"], "revoking");
+        assert_eq!(
+            call(&a, "publish_site", args(1058)).await["reason"],
+            "publish_cleanup_pending"
+        );
+        trigger(&h, "DROP TRIGGER release_failure");
+        settle(&h, &a, &vm).await;
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"]),
+            (&json!("failed"), &json!("cancelled")),
+            "{failed}"
+        );
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        let published = call(&a, "publish_site", args(1059)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert!(fake.local.load(SeqCst));
+        // Only the two completed publications ever posted.
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (2, 1));
+        let revoke = call(&a, "unpublish_site", args(1060)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
         drop(a);
         h.shutdown().await.unwrap();
     }

@@ -1125,6 +1125,9 @@ mod vm {
             .expect("publish exceeded its deadline");
             let publish_elapsed = publish_started.elapsed();
 
+            // The child created the witness inside the fixture root.
+            secure(&witness_path);
+            assert_secured("connector witness", &witness_path);
             let witness = fs::read_to_string(&witness_path).unwrap();
             assert!(!witness.contains(FAKE_SECRET));
             let fields: Vec<_> = witness.trim_end().split('|').collect();
@@ -1134,7 +1137,13 @@ mod vm {
             assert!(fields[6].starts_with("127.0.0.1:"));
             assert_eq!(&fields[7..], &["--grace-period", "100ms", "run", "true"]);
             let pid = fields[0].parse().unwrap();
-            assert_owned("generated ingress config", Path::new(fields[2]));
+            // The connector's own custody: TokenUser owner and a private DACL.
+            let generated = Path::new(fields[2]);
+            assert_owned("generated ingress config", generated);
+            assert!(crate::security::private(generated).is_ok());
+            // Every artifact under the fixture root also gets a protected DACL.
+            secure(generated);
+            assert_secured("generated ingress config", generated);
             let config = fs::read_to_string(fields[2]).unwrap();
             assert!(!config.contains(FAKE_SECRET));
             assert_eq!(
@@ -1169,6 +1178,8 @@ mod vm {
             );
 
             fs::write(root.join("crash.flag"), "").unwrap();
+            secure(&root.join("crash.flag"));
+            assert_secured("crash flag", &root.join("crash.flag"));
             let restart_started = std::time::Instant::now();
             let error = match timeout(LEG, Connector::start(&plan))
                 .await
@@ -1194,6 +1205,8 @@ mod vm {
             // readiness bound, without a crash retry, and its Job is emptied.
             fs::remove_file(root.join("crash.flag")).unwrap();
             fs::write(root.join("hang.flag"), "").unwrap();
+            secure(&root.join("hang.flag"));
+            assert_secured("hang flag", &root.join("hang.flag"));
             // Readiness bound, grace and Job kill, plus spawn slack.
             const HANG_LEG: Duration = Duration::from_secs(3);
             let hang_started = std::time::Instant::now();

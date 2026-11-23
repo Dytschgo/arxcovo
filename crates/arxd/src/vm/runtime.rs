@@ -414,7 +414,7 @@ pub(crate) mod publication {
         service::Shutdown,
         store::vm::publish::{Intent, Phase, Update},
         vm::{
-            Clock, FailureReason as Failure, Id, OperationRef, Refusal, RequestId, VmController,
+            Clock, FailureReason as Failure, Id, OperationRef, Refusal, VmController,
             paths::{ArtifactPin, LocalPath},
             publish::{
                 Hostname, TunnelId,
@@ -805,44 +805,50 @@ pub(crate) mod publication {
         connector: LocalProcess,
     }
 
-    /// The current activation's owner and revocation token. Kept in memory so
-    /// an authenticated owner unpublish revokes it without SQLite, the
-    /// dispatch gate or the effects slot.
+    /// An activation's owner and revocation token. Kept in memory so an
+    /// authenticated owner unpublish revokes it without SQLite, the dispatch
+    /// gate or the effects slot.
     struct Activation {
         generation: u64,
         vm: Id,
         owner: String,
-        key: RequestId,
         token: Shutdown,
     }
 
-    /// Bound for the in-process record of admitted publication request keys.
-    const ADMITTED_KEYS: usize = 64;
-
     #[derive(Default)]
     struct Activations {
+        /// The latest admitted activation.
         current: Option<Activation>,
+        /// An activation registered before its admission transaction, so an
+        /// owner unpublish racing that transaction still revokes it.
+        pending: Option<Activation>,
         /// The last generation issued. Generations only increase.
         issued: u64,
-        /// Publication keys admitted in this process. A same-key replay is
-        /// status-only, so it never revokes a later activation.
-        admitted: std::collections::VecDeque<(String, Id)>,
     }
 
     impl Activations {
-        fn admit(&mut self, owner: &str, key: RequestId) {
-            if self
-                .admitted
-                .iter()
-                .any(|(principal, id)| principal == owner && *id == key.key)
-            {
-                return;
-            }
-            if self.admitted.len() == ADMITTED_KEYS {
-                self.admitted.pop_front();
-            }
-            self.admitted.push_back((owner.to_owned(), key.key));
+        fn matching(&self, vm: Id, owner: Option<&str>) -> Vec<u64> {
+            [self.current.as_ref(), self.pending.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter(|activation| {
+                    activation.vm == vm && owner.is_none_or(|owner| activation.owner == owner)
+                })
+                .map(|activation| {
+                    activation.token.cancel();
+                    activation.generation
+                })
+                .collect()
         }
+    }
+
+    /// What a publish worker knows about its own DNS POST.
+    enum Evidence {
+        Unknown,
+        /// A validated, owned create response whose ID may not be durable.
+        Acknowledged(RecordId),
+        /// The worker exited before submitting the POST it had marked.
+        NotSubmitted,
     }
 
     /// A token cancelled by either input, for one bounded await.
@@ -893,6 +899,18 @@ pub(crate) mod publication {
         /// Parks the next unpublish worker before it waits for the slot.
         #[cfg(test)]
         pub(crate) unpublish_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// Parks a publish worker after its durable possible-POST marker and
+        /// before its pre-submission cancellation check.
+        #[cfg(test)]
+        pub(crate) marker_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// Parks a publish worker inside its commit transaction, after the
+        /// final authorization and before COMMIT. The transaction holds the
+        /// store, so the release side is synchronous.
+        #[cfg(test)]
+        pub(crate) commit_hook: std::sync::Mutex<Option<CommitHook>>,
+        /// Receipts whose worker is alive. A pending publication receipt
+        /// outside this set lost its terminal write, and the reaper settles it.
+        workers: std::sync::Mutex<std::collections::HashSet<i64>>,
     }
 
     impl Publication {
@@ -926,65 +944,74 @@ pub(crate) mod publication {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
 
-        /// Issues the generation and revocation token for the activation
-        /// admitted next. The caller holds the effects slot.
-        pub(crate) fn activation(&self, vm: Id, owner: &str, key: RequestId) -> (u64, Shutdown) {
+        /// Registers the activation about to be admitted, before its admission
+        /// transaction. The caller holds the dispatch gate and the effects slot,
+        /// and then calls [`Self::admitted`] or [`Self::abandon`].
+        pub(crate) fn register(&self, vm: Id, owner: &str) -> (u64, Shutdown) {
             let mut activations = self.activations();
             activations.issued += 1;
             let generation = activations.issued;
             let token = Shutdown::default();
-            activations.admit(owner, key);
-            activations.current = Some(Activation {
+            activations.pending = Some(Activation {
                 generation,
                 vm,
                 owner: owner.to_owned(),
-                key,
                 token: token.clone(),
             });
             (generation, token)
         }
 
-        /// Records an admitted unpublish key for the in-memory replay fence.
-        pub(crate) fn admitted(&self, owner: &str, key: RequestId) {
-            self.activations().admit(owner, key);
+        /// The registered activation was admitted and is now current.
+        pub(crate) fn admitted(&self, generation: u64) {
+            let mut activations = self.activations();
+            if activations
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.generation == generation)
+            {
+                activations.current = activations.pending.take();
+            }
+        }
+
+        /// The registered activation was refused and never ran.
+        pub(crate) fn abandon(&self, generation: u64) {
+            let mut activations = self.activations();
+            if activations
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.generation == generation)
+            {
+                activations.pending = None;
+            }
         }
 
         /// Owner revocation before any store, gate, slot or DNS dependency.
-        /// Revokes the current activation of `vm` when `owner` admitted it and
-        /// `key` is not a request fault the replay ledger would refuse or
-        /// replay: the activation's own publish key (a collision), a key this
-        /// process already admitted for publication (a replay), or a key minted
-        /// before the activation's publish. Returns the generation whose
-        /// connector the caller stops, also when it was already revoked, so a
+        /// Cancels every current or registered activation of `vm` that `owner`
+        /// started, whatever the request key: the replay ledger decides only
+        /// the response and the durable bookkeeping. Returns the generations
+        /// whose connectors the caller stops, also when already revoked, so a
         /// failed stop stays retryable.
-        pub(crate) fn revoke_owned(&self, owner: &str, vm: Id, key: RequestId) -> Option<u64> {
-            let activations = self.activations();
-            let current = activations.current.as_ref()?;
-            let fresh = current.vm == vm
-                && current.owner == owner
-                && current.key.key != key.key
-                && key.issued_at_ms >= current.key.issued_at_ms
-                && !activations
-                    .admitted
-                    .iter()
-                    .any(|(principal, id)| principal == owner && *id == key.key);
-            if !fresh {
-                return None;
-            }
-            current.token.cancel();
-            Some(current.generation)
+        pub(crate) fn revoke_owned(&self, owner: &str, vm: Id) -> Vec<u64> {
+            self.activations().matching(vm, Some(owner))
         }
 
-        /// Revokes the current activation of `vm` after an admitted owner
-        /// unpublish committed `revoking`.
-        pub(crate) fn revoke(&self, vm: Id) -> Option<u64> {
-            let activations = self.activations();
-            let current = activations
-                .current
-                .as_ref()
-                .filter(|current| current.vm == vm)?;
-            current.token.cancel();
-            Some(current.generation)
+        /// Revokes every activation of `vm` after an admitted owner unpublish
+        /// committed `revoking`.
+        pub(crate) fn revoke(&self, vm: Id) -> Vec<u64> {
+            self.activations().matching(vm, None)
+        }
+
+        /// Held across a publication admission transaction, then records its
+        /// receipt, so the reaper never treats a just-admitted receipt as lost.
+        pub(crate) fn workers(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<i64>> {
+            self.workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// The worker for `receipt` exited.
+        pub(crate) fn untrack(&self, receipt: i64) {
+            self.workers().remove(&receipt);
         }
 
         fn revoked(&self, vm: Id) -> bool {
@@ -1056,6 +1083,15 @@ pub(crate) mod publication {
                 .await;
             let authorized =
                 || origin.current() && !shutdown.is_cancelled() && !revoked.is_cancelled();
+            let commit_authorized = || {
+                let authorized = authorized();
+                #[cfg(test)]
+                if let Some((entered, release)) = self.commit_hook.lock().unwrap().take() {
+                    let _ = entered.send(());
+                    let _ = release.recv();
+                }
+                authorized
+            };
             let live = self
                 .local
                 .lock()
@@ -1070,8 +1106,29 @@ pub(crate) mod publication {
                 // intent. An owner revocation, an origin retirement or a
                 // committed `revoking` before it always wins. The local slot is
                 // not held here, so a revocation stop never waits on SQLite.
-                match controller.commit_publication(operation, &intent.nonce, authorized) {
-                    Ok(true) => return Ok(()),
+                match controller.commit_publication(operation, &intent.nonce, commit_authorized) {
+                    Ok(true) if authorized() => return Ok(()),
+                    Ok(true) => {
+                        // A revocation, origin retirement or shutdown landed
+                        // inside the transaction, after its authorization and
+                        // before COMMIT. The receipt stands, and this worker
+                        // drives the activation back to unpublished itself.
+                        let reason = if origin.current() {
+                            Failure::Cancelled
+                        } else {
+                            Failure::OriginUnavailable
+                        };
+                        let bound = shutdown.is_cancelled().then_some(shutdown);
+                        self.cleanup(
+                            controller,
+                            intent.vm,
+                            Some(reason),
+                            Evidence::Unknown,
+                            bound,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                     Ok(false) => {}
                     Err(error) => {
                         self.stop_activation(generation).await;
@@ -1080,25 +1137,25 @@ pub(crate) mod publication {
                 }
             }
 
-            let (failure, acknowledged) = match result {
-                Err((failure, acknowledged)) => (failure, acknowledged),
-                Ok(()) if !origin.current() => (Failure::OriginUnavailable, None),
-                Ok(()) => (Failure::Cancelled, None),
+            let (failure, evidence) = match result {
+                Err((failure, evidence)) => (failure, evidence),
+                Ok(()) if !origin.current() => (Failure::OriginUnavailable, Evidence::Unknown),
+                Ok(()) => (Failure::Cancelled, Evidence::Unknown),
             };
             let clean = self
                 .cleanup(
                     controller,
                     intent.vm,
                     Some(failure),
-                    acknowledged,
+                    evidence,
                     Some(shutdown),
                 )
                 .await?;
             controller.finish_publication(operation, None, Some(failure), Some(clean))
         }
 
-        /// Errors carry any acknowledged record ID that could not be made
-        /// durable, so this worker's cleanup can still target it.
+        /// Errors carry this worker's POST evidence: an acknowledged record ID
+        /// that could not be made durable, or proof that it never submitted.
         #[allow(clippy::too_many_arguments)] // The activation identity and both cancellations.
         async fn activate<C: Clock>(
             &self,
@@ -1109,26 +1166,26 @@ pub(crate) mod publication {
             generation: u64,
             revoked: &Shutdown,
             shutdown: &Shutdown,
-        ) -> Result<(), (Failure, Option<RecordId>)> {
-            let route = route(intent).map_err(|failure| (failure, None))?;
+        ) -> Result<(), (Failure, Evidence)> {
+            let route = route(intent).map_err(|failure| (failure, Evidence::Unknown))?;
             let map = |error| match error {
-                DnsError::Conflict => (Failure::DnsConflict, None),
-                _ => (Failure::DnsUnavailable, None),
+                DnsError::Conflict => (Failure::DnsConflict, Evidence::Unknown),
+                _ => (Failure::DnsUnavailable, Evidence::Unknown),
             };
             if !origin.current() || shutdown.is_cancelled() {
-                return Err((Failure::OriginUnavailable, None));
+                return Err((Failure::OriginUnavailable, Evidence::Unknown));
             }
             tokio::select! {
                 biased;
-                _ = revoked.cancelled() => return Err((Failure::Cancelled, None)),
-                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, None)),
-                _ = shutdown.cancelled() => return Err((Failure::Cancelled, None)),
+                _ = revoked.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
+                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
+                _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
                 result = prepared.dns.preflight(&route) => result.map_err(map)?,
             }
             {
                 let mut local = self.local.lock().await;
                 if local.is_some() {
-                    return Err((Failure::CleanupUnconfirmed, None));
+                    return Err((Failure::CleanupUnconfirmed, Evidence::Unknown));
                 }
                 // Revocation aborts a connector start that holds the local slot.
                 let stop = Linked::new(revoked, shutdown);
@@ -1145,7 +1202,7 @@ pub(crate) mod publication {
                         connector,
                     });
                 }
-                let connector = started.map_err(|failure| (failure, None))?;
+                let connector = started.map_err(|failure| (failure, Evidence::Unknown))?;
                 *local = Some(Live {
                     vm: intent.vm,
                     generation,
@@ -1155,28 +1212,38 @@ pub(crate) mod publication {
             }
             self.ready(intent, shutdown)
                 .await
-                .map_err(|failure| (failure, None))?;
+                .map_err(|failure| (failure, Evidence::Unknown))?;
             controller
                 .update_publication(&intent.nonce, Update::PostPossible)
-                .map_err(|_| (Failure::CleanupUnconfirmed, None))?;
+                .map_err(|_| (Failure::CleanupUnconfirmed, Evidence::Unknown))?;
+            #[cfg(test)]
+            let _ = hold(&self.marker_gate).await;
             // Check cancellation before submitting DNS. From the durable
             // marker onwards an interrupted POST remains possible, so only this
-            // pre-submission exit may withdraw the marker.
+            // pre-submission exit may withdraw the marker. The withdrawal also
+            // applies to an intent an owner unpublish already moved to
+            // `revoking`. If it fails, the receipt says so, and this worker's
+            // no-submission evidence still lets its cleanup release the
+            // intent with its marker, without consulting DNS.
             if !origin.current() || shutdown.is_cancelled() || revoked.is_cancelled() {
-                let _ = controller.update_publication(&intent.nonce, Update::PostWithdrawn);
                 let failure = if origin.current() {
                     Failure::Cancelled
                 } else {
                     Failure::OriginUnavailable
                 };
-                return Err((failure, None));
+                let failure =
+                    match controller.update_publication(&intent.nonce, Update::PostWithdrawn) {
+                        Ok(()) => failure,
+                        Err(_) => Failure::CleanupUnconfirmed,
+                    };
+                return Err((failure, Evidence::NotSubmitted));
             }
             // An owner revocation does not abandon a submitted POST: it
             // completes or times out, and its acknowledged ID is then removed.
             let id = tokio::select! {
                 biased;
-                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, None)),
-                _ = shutdown.cancelled() => return Err((Failure::Cancelled, None)),
+                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
+                _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
                 result = prepared.dns.create(&route) => result.map_err(map)?,
             };
             // The acknowledged ID is durable before verification, so a failed
@@ -1185,17 +1252,17 @@ pub(crate) mod publication {
                 .update_publication(&intent.nonce, Update::Record(id.as_str()))
                 .is_err()
             {
-                return Err((Failure::CleanupUnconfirmed, Some(id)));
+                return Err((Failure::CleanupUnconfirmed, Evidence::Acknowledged(id)));
             }
             tokio::select! {
                 biased;
-                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, None)),
-                _ = shutdown.cancelled() => return Err((Failure::Cancelled, None)),
+                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
+                _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
                 result = prepared.dns.verify(&route, &id) => result.map_err(map)?,
             }
             self.ready(intent, shutdown)
                 .await
-                .map_err(|failure| (failure, None))
+                .map_err(|failure| (failure, Evidence::Unknown))
         }
 
         /// Waits for the effects slot. Its pending receipt keeps publish
@@ -1212,7 +1279,7 @@ pub(crate) mod publication {
             let _ = hold(&self.unpublish_gate).await;
             let _slot = self.slot().await;
             let clean = self
-                .cleanup(controller, vm, None, None, Some(shutdown))
+                .cleanup(controller, vm, None, Evidence::Unknown, Some(shutdown))
                 .await?;
             controller.finish_publication(
                 operation,
@@ -1230,20 +1297,22 @@ pub(crate) mod publication {
             let Some(_slot) = self.claim() else {
                 return Ok(());
             };
-            let Some(intent) = controller.publication_intent()? else {
-                return Ok(());
-            };
-            let reason = if intent.phase == Phase::Published {
-                match self.ready(&intent, shutdown).await {
-                    Ok(()) => return Ok(()),
-                    Err(reason) => Some(reason),
+            if let Some(intent) = controller.publication_intent()? {
+                let stale = if intent.phase == Phase::Published {
+                    self.ready(&intent, shutdown).await.err().map(Some)
+                } else {
+                    Some(intent.reason)
+                };
+                if let Some(reason) = stale {
+                    self.cleanup(controller, intent.vm, reason, Evidence::Unknown, None)
+                        .await?;
                 }
-            } else {
-                intent.reason
-            };
-            self.cleanup(controller, intent.vm, reason, None, None)
-                .await?;
-            Ok(())
+            }
+            // Under the slot no worker settles concurrently. A receipt whose
+            // worker exited without its terminal write is settled here once
+            // its VM has no publication intent left.
+            let workers = self.workers();
+            controller.settle_orphaned_publications(&workers)
         }
 
         async fn cleanup<C: Clock>(
@@ -1251,7 +1320,7 @@ pub(crate) mod publication {
             controller: &VmController<C>,
             vm: Id,
             reason: Option<Failure>,
-            acknowledged: Option<RecordId>,
+            evidence: Evidence,
             shutdown: Option<&Shutdown>,
         ) -> Result<bool> {
             // Under the effects slot only this VM's current or leftover
@@ -1268,10 +1337,10 @@ pub(crate) mod publication {
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => Err(Failure::Cancelled),
-                    result = self.remove_dns(controller, &intent, acknowledged) => result,
+                    result = self.remove_dns(controller, &intent, evidence) => result,
                 }
             } else {
-                self.remove_dns(controller, &intent, acknowledged).await
+                self.remove_dns(controller, &intent, evidence).await
             };
             let update = match (&dns, local) {
                 (Ok(()), true) => Update::Released(reason),
@@ -1295,26 +1364,32 @@ pub(crate) mod publication {
             &self,
             controller: &VmController<C>,
             intent: &Intent,
-            acknowledged: Option<RecordId>,
+            evidence: Evidence,
         ) -> Result<(), Failure> {
             if !intent.post_possible {
+                return Ok(());
+            }
+            // This worker never submitted its marked POST, so there is nothing
+            // to remove. The release that follows deletes the intent and its
+            // marker even if withdrawing the marker failed.
+            if intent.record.is_none() && matches!(evidence, Evidence::NotSubmitted) {
                 return Ok(());
             }
             let dns = self.cleanup_dns(intent).ok_or(Failure::DnsUnavailable)?;
             let route = route(intent)?;
             let unavailable = |_| Failure::DnsUnavailable;
-            let id = match (&intent.record, acknowledged) {
+            let id = match (&intent.record, evidence) {
                 (Some(id), _) => {
                     RecordId::parse(id.clone()).map_err(|_| Failure::DnsUnavailable)?
                 }
                 // An acknowledged ID whose custody write failed: retry custody
                 // and target it either way.
-                (None, Some(id)) => {
+                (None, Evidence::Acknowledged(id)) => {
                     let _ =
                         controller.update_publication(&intent.nonce, Update::Record(id.as_str()));
                     id
                 }
-                (None, None) => match dns.reconcile(&route).await.map_err(unavailable)? {
+                (None, _) => match dns.reconcile(&route).await.map_err(unavailable)? {
                     Reconciled::Owned(id) | Reconciled::OwnedWithConflict(id) => {
                         controller
                             .update_publication(&intent.nonce, Update::Record(id.as_str()))
@@ -1374,6 +1449,12 @@ pub(crate) mod publication {
         /// Every route tuple used for lookup or removal.
         pub(crate) routes: std::sync::Mutex<Vec<String>>,
     }
+
+    #[cfg(test)]
+    pub(crate) type CommitHook = (
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
 
     #[cfg(test)]
     pub(crate) type FakeGate = (

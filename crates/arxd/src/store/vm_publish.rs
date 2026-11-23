@@ -213,7 +213,8 @@ pub(crate) fn reserve(db: &Connection, intent: &Intent) -> Result<()> {
 
 pub(crate) enum Update<'a> {
     PostPossible,
-    /// The worker exited before submitting the POST it had marked.
+    /// The worker exited before submitting the POST it had marked. An owner
+    /// unpublish may already have moved the intent to `revoking`.
     PostWithdrawn,
     Record(&'a str),
     Phase(Phase, Option<FailureReason>),
@@ -227,7 +228,8 @@ pub(crate) fn update(db: &Connection, nonce: &str, change: Update<'_>) -> Result
             [nonce],
         )?,
         Update::PostWithdrawn => db.execute(
-            "UPDATE vm_publication SET post_possible=0 WHERE nonce=?1 AND phase='publishing' AND post_possible=1 AND record IS NULL",
+            "UPDATE vm_publication SET post_possible=0
+             WHERE nonce=?1 AND phase IN ('publishing','revoking') AND post_possible=1 AND record IS NULL",
             [nonce],
         )?,
         Update::Record(id) => db.execute(
@@ -288,6 +290,52 @@ pub(crate) fn finish(
         params![operation, failure.map(|value| value as i64)],
     )?;
     Ok(())
+}
+
+/// Settles publication receipts whose worker exited without its terminal
+/// write, once their VM has no publication intent left. `live` holds the
+/// receipts whose worker is still running. A lost publish failed: its intent
+/// was released without committing `published`. A lost unpublish succeeded:
+/// the released intent was its effect. Returns how many were settled.
+pub(crate) fn settle_orphans(
+    db: &Connection,
+    live: &std::collections::HashSet<i64>,
+    now: i64,
+) -> Result<usize> {
+    let pending = db
+        .prepare(
+            "SELECT a.id,a.action,s.publication_failure FROM activity a
+             JOIN vm_static_instances s ON s.id=a.vm
+             WHERE a.status=0 AND a.action IN (15,16)
+               AND NOT EXISTS(SELECT 1 FROM vm_publication p WHERE p.vm=a.vm)",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut settled = 0;
+    for (operation, action, failure) in pending {
+        if live.contains(&operation) {
+            continue;
+        }
+        let failure = if action == 15 {
+            Some(
+                failure
+                    .map(FailureReason::from_code)
+                    .transpose()?
+                    .unwrap_or(FailureReason::Cancelled),
+            )
+        } else {
+            None
+        };
+        finish(db, operation, now, failure, Some(true))?;
+        settled += 1;
+    }
+    Ok(settled)
 }
 
 pub(super) fn recover(db: &Connection, now: i64) -> Result<()> {
