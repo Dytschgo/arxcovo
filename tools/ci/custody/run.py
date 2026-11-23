@@ -360,7 +360,7 @@ class BuildInput:
             self.record('input-object', subject=self.subject, uid=m.st_uid, gid=m.st_gid,
                         mode=stat.S_IMODE(m.st_mode), device=m.st_dev, inode=m.st_ino,
                         nlink=m.st_nlink, file_type=stat.S_IFMT(m.st_mode), size=m.st_size)
-            require(m.st_size <= 128*MIB, 'CandidateBounds', self.subject, 'size_128_mib')
+            require(m.st_size <= 256*MIB, 'CandidateBounds', self.subject, 'size_256_mib')
             self.fd = os.open(self.path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) |
                               getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_BINARY', 0))
             self.metadata = identity(m), m.st_size, m.st_mtime_ns, m.st_ctime_ns
@@ -390,7 +390,7 @@ class BuildInput:
         while data := os.read(self.fd, MIB):
             self.checkpoint()
             size += len(data)
-            require(size <= 128*MIB, 'CandidateBounds', self.subject, 'bounded_read')
+            require(size <= 256*MIB, 'CandidateBounds', self.subject, 'bounded_read')
             h.update(data)
             if output is not None:
                 output.write(data)
@@ -1126,7 +1126,7 @@ class Harness:
                     obj.verify()
                     inputs[relative] = obj.sha
             selected.verify()
-            require(sum(p.stat().st_size for p in context.iterdir()) <= 129*MIB, 'ContextCapacity', 'discover_and_stage', 'sum((p.stat().st_size for p in context.iterdir())) <= 129 * MIB')
+            require(sum(p.stat().st_size for p in context.iterdir()) <= 257*MIB, 'ContextCapacity', 'discover_and_stage', 'sum((p.stat().st_size for p in context.iterdir())) <= 257 * MIB')
             elf = self.command(['readelf', '--program-headers', '--dynamic', '--version-info', str(context / 'arxd-tests')], 'preflight')
             require(b'/lib64/ld-linux-x86-64.so.2' in elf and b'NEEDED' in elf, 'ElfABI', 'discover_and_stage', "b'/lib64/ld-linux-x86-64.so.2' in elf and b'NEEDED' in elf")
             versions = sorted(set(v.decode('ascii') for v in re.findall(rb'GLIBC_[0-9]+\.[0-9]+', elf)))

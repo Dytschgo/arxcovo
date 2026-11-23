@@ -1137,6 +1137,37 @@ class DiscoveryIntegrationTests(unittest.TestCase):
                 self.assertFalse(any(c[0] in ('docker', 'readelf') for c in self.last_calls))
                 self.assertEqual(list(context.iterdir()), [])
 
+    def test_candidate_just_over_128_mib_passes_size_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            path = root / 'arxd-sparse'
+            with path.open('wb') as handle:
+                handle.truncate(128 * run.MIB + 1)
+            recorded = []
+            with run.BuildInput(path, root, 'candidate-0', lambda event, **facts: recorded.append((event, facts))) as obj:
+                self.assertEqual(obj.metadata[1], 128 * run.MIB + 1)
+            self.assertEqual(recorded[0][0], 'input-object')
+            self.assertEqual(recorded[0][1]['size'], 128 * run.MIB + 1)
+            self.assertEqual(len(obj.sha), 64)
+
+    def test_candidate_just_over_256_mib_refuses_size_bound(self):
+        records = []
+        token = run.DIAGNOSTIC.set(lambda event, **facts: records.append(dict(event=event, **facts)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                path = root / 'arxd-sparse'
+                with path.open('wb') as handle:
+                    handle.truncate(256 * run.MIB + 1)
+                with self.assertRaisesRegex(run.Refusal, 'CandidateBounds'):
+                    with run.BuildInput(path, root, 'candidate-1', lambda *args, **kwargs: None):
+                        pass
+                self.assertEqual(records[-1]['code'], 'CandidateBounds')
+                self.assertEqual(records[-1]['predicate'], 'size_256_mib')
+                self.assertEqual(records[-1]['subject'], 'candidate-1')
+        finally:
+            run.DIAGNOSTIC.reset(token)
+
     def test_staging_copy_drift_and_staged_alias_refuse(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
