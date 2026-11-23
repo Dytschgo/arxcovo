@@ -1,6 +1,7 @@
 //! The VM profile has its own activity schema and database version. The
 //! shared and service openers have no route into this module.
-//! A v5 VM opener rejects v6. Upgraded state must be opened with v6-capable code.
+//! Each VM opener rejects later versions: v5 rejects v6 and v6 rejects v7.
+//! Upgrades are forward-only. Upgraded state needs a matching or newer opener.
 use super::{check_size, validate_principal};
 use crate::vm::{
     Action, ArtifactEvidence, ArtifactSlot, BuildRequest, BuildSlots, Completion, ExpiredVm,
@@ -105,7 +106,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 6;
+const VM_SCHEMA_VERSION: u32 = 7;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -271,6 +272,20 @@ CREATE TRIGGER vm_cleanup_route AFTER UPDATE OF state ON vm_instances
     END;
 ";
 
+// Caller receipts keep their own cleanup proof because audit rows are pruned.
+// Copy still-retained terminal agent proof before recovery can prune more.
+// NULL means the proof is unavailable, and the receipt omits cleanup.
+const MIGRATE_V7: &str = "
+ALTER TABLE vm_operations ADD COLUMN cleanup_confirmed INTEGER
+    CHECK(cleanup_confirmed IN (0,1))
+    CHECK(cleanup_confirmed IS NULL OR status BETWEEN 1 AND 3);
+UPDATE vm_operations AS o SET cleanup_confirmed=a.cleanup_confirmed
+    FROM activity AS a
+    WHERE a.id=o.activity_id AND a.actor='agent' AND a.principal=o.principal
+        AND a.vm IS o.vm AND a.action=o.action AND a.status=o.status
+        AND o.status BETWEEN 1 AND 3 AND a.cleanup_confirmed IS NOT NULL;
+";
+
 pub(crate) const MAX_CALLER_PENDING: i64 = 8;
 // One cleanup slot per live instance, shared by expiry and recovery. Cleanup
 // stays available at caller saturation. At most 16 pending rows are visible.
@@ -332,9 +347,10 @@ impl VmStore {
         check_size(&db)?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
-            matches!(version, 0 | 5 | VM_SCHEMA_VERSION),
+            matches!(version, 0 | 5 | 6 | VM_SCHEMA_VERSION),
             "unsupported VM state version"
         );
+        let replace = matches!(version, 0 | 5);
         let upgrade = version != VM_SCHEMA_VERSION;
         db.execute_batch(
             "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY;
@@ -343,8 +359,9 @@ impl VmStore {
         // SQLite's table replacement procedure suspends FK enforcement on this
         // connection so the original activity name can retain its dependents.
         // Validate every FK before publishing the replacement and restore
-        // enforcement before handing the connection to any caller.
-        if upgrade {
+        // enforcement before handing the connection to any caller. The v7
+        // column addition replaces no table and keeps enforcement on.
+        if replace {
             db.pragma_update(None, "foreign_keys", false)?;
         }
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -359,8 +376,11 @@ impl VmStore {
             );
             tx.execute_batch(SCHEMA_V5)?;
         }
-        if upgrade {
+        if replace {
             tx.execute_batch(MIGRATE_V6)?;
+        }
+        if upgrade {
+            tx.execute_batch(MIGRATE_V7)?;
         }
         recover(&tx, now)?;
         check_size(&tx)?;
@@ -377,7 +397,7 @@ impl VmStore {
             tx.pragma_update(None, "user_version", VM_SCHEMA_VERSION)?;
         }
         tx.commit()?;
-        if upgrade {
+        if replace {
             db.pragma_update(None, "foreign_keys", true)?;
         }
         Ok(Self {
@@ -728,9 +748,10 @@ fn finish_with_script(
         None => (None, None),
     };
     db.execute(
-        "UPDATE vm_operations SET status=?2,script_result=coalesce(?3,script_result),script_exit_code=?4
+        "UPDATE vm_operations SET status=?2,script_result=coalesce(?3,script_result),script_exit_code=?4,
+            cleanup_confirmed=?5
          WHERE activity_id=?1",
-        params![id, status.code(), result, code],
+        params![id, status.code(), result, code, cleanup],
     )?;
     prune(db)
 }
@@ -900,13 +921,15 @@ pub(crate) fn operation_status(
     let now = retry_time(db, now)?;
     Ok(db
         .query_row(
+            // Only immutable ledger evidence names a template. A legacy clone
+            // bound to a reusable VM ID has none, so its receipt omits it.
             "SELECT o.action,o.status,o.vm,o.recipe_id,
-                coalesce(o.subject_id, v.template, (SELECT b.template_id FROM vm_build_intents b
-                    WHERE o.action=11 AND o.status=1 AND b.state='sealed'
-                       AND b.recipe_id=o.recipe_id AND b.recipe_digest=o.recipe_digest)),
-                o.lease_end_ms,o.script_result,o.script_exit_code,a.cleanup_confirmed
-         FROM vm_operations o LEFT JOIN activity a ON a.id=o.activity_id
-         LEFT JOIN vm_instances v ON v.id=o.vm AND v.principal=o.principal
+                CASE WHEN o.action=1 AND o.binding_kind='template' THEN o.subject_id
+                    WHEN o.action=11 AND o.status=1 THEN (SELECT b.template_id FROM vm_build_intents b
+                        WHERE b.state='sealed' AND b.recipe_id=o.recipe_id
+                            AND b.recipe_digest=o.recipe_digest) END,
+                o.lease_end_ms,o.script_result,o.script_exit_code,o.cleanup_confirmed
+         FROM vm_operations o
          WHERE o.principal=?1 AND o.operation_id=?2 AND (o.status=0 OR o.valid_through_ms>=?3)",
             params![principal, operation, now],
             |row| {
@@ -931,14 +954,10 @@ pub(crate) fn operation_status(
                     Some("terminated") => Some(ScriptResult::Terminated),
                     _ => None,
                 };
-                let cleanup = match (row.get::<_, Option<bool>>(8)?, state) {
-                    (Some(true), _) => Some("confirmed"),
-                    (Some(false), _) | (_, Status::Interrupted) => Some("unconfirmed"),
-                    (None, Status::Succeeded | Status::Failed) if action != "extend" => {
-                        Some("confirmed")
-                    }
-                    _ => None,
-                };
+                // Only the proof persisted with the terminal ledger update counts.
+                let cleanup = row
+                    .get::<_, Option<bool>>(8)?
+                    .map(|confirmed| if confirmed { "confirmed" } else { "unconfirmed" });
                 Ok(OperationStatus {
                     id: operation,
                     action,
@@ -1610,6 +1629,116 @@ pub(crate) fn recovery_intents(db: &Connection) -> Result<Vec<RecoveryClaim>> {
 mod tests {
     use super::*;
 
+    fn legacy_binding(nonce: u64, vm: Id, action: Action) -> Binding<'static> {
+        Binding {
+            principal: "alice",
+            key: RequestId::parse(&format!("{:016x}{nonce:016x}", 0_u64)).unwrap(),
+            subject: Subject::Vm(vm),
+            action: action as i64,
+        }
+    }
+
+    #[test]
+    fn legacy_clone_receipt_survives_vm_id_reuse() {
+        let dir = private_temp();
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store.transact(|db| {
+            assert_eq!(count(db, "PRAGMA user_version", [])?, i64::from(VM_SCHEMA_VERSION));
+            let vm = [1; 16];
+            let [original_template, replacement_template]: [Id; 2] = [[2; 16], [3; 16]];
+            for template in [original_template, replacement_template] {
+                db.execute(
+                    "INSERT INTO vm_templates VALUES(?1,1,?2,zeroblob(32),zeroblob(32),40)",
+                    params![template, [template[0]; 32]],
+                )?;
+            }
+            let create = |nonce, template| -> Result<OperationRef> {
+                let operation = legacy_binding(nonce, vm, Action::Clone).record(db, NOW, Some(vm), None)?;
+                db.execute(
+                    "INSERT INTO vm_instances(id,template,principal,expires_ms) VALUES(?1,?2,'alice',?3)",
+                    params![vm, template, NOW],
+                )?;
+                settle_operation(db, operation.receipt.activity_id, NOW, Completion::Succeeded)?;
+                Ok(operation)
+            };
+            let original = create(1, original_template)?;
+            let status = |id| -> Result<OperationStatus> {
+                Ok(operation_status(db, "alice", id, NOW)?.unwrap())
+            };
+            let before = status(original.id)?;
+            for id in 1..=MAX_TOMBSTONES + 1 {
+                let instance = [id as u8; 16];
+                if instance != vm {
+                    db.execute(
+                        "INSERT INTO vm_instances(id,template,principal,expires_ms,state) VALUES(?1,?2,'alice',?3,1)",
+                        params![instance, original_template, NOW],
+                    )?;
+                }
+                let [claim] = expiry_claims(db, NOW)?.try_into().unwrap();
+                assert_eq!(claim.vm, instance);
+                record_expired(db, claim, NOW)?;
+            }
+            assert!(expired_status(db, "alice", vm)?.is_none());
+            let replacement = create(2, replacement_template)?;
+            assert_eq!(status(original.id)?, before);
+            assert_eq!(before.template, None);
+            let replacement = status(replacement.id)?;
+            assert_ne!(replacement.id, original.id);
+            assert_eq!(replacement.vm, Some(vm));
+            assert_eq!(replacement.template, None);
+            assert_eq!(replacement.state, Status::Succeeded);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn interrupted_operation_keeps_cleanup_proof_after_audit_pruning() {
+        let dir = private_temp();
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        let settled = store
+            .transact(|db| {
+                let vm = [1; 16];
+                let operation =
+                    legacy_binding(1, vm, Action::Start).record(db, NOW, Some(vm), None)?;
+                finish(
+                    db,
+                    operation.receipt.activity_id,
+                    Status::Interrupted,
+                    NOW,
+                    Some(true),
+                )?;
+                let before = operation_status(db, "alice", operation.id, NOW)?.unwrap();
+                assert_eq!(before.cleanup, Some("confirmed"));
+                for _ in 0..MAX_RECEIPTS {
+                    refusal(db, "alice", vm, Action::Start, NOW, Refusal::Busy)?;
+                }
+                assert_eq!(
+                    count(
+                        db,
+                        "SELECT count(*) FROM activity WHERE id=?1",
+                        [operation.receipt.activity_id]
+                    )?,
+                    0
+                );
+                assert_eq!(
+                    operation_status(db, "alice", operation.id, NOW)?,
+                    Some(before)
+                );
+                Ok(operation)
+            })
+            .unwrap();
+        drop(store);
+        VmStore::open(dir.path(), NOW)
+            .unwrap()
+            .transact(|db| {
+                let after = operation_status(db, "alice", settled.id, NOW)?.unwrap();
+                assert_eq!(after.state, Status::Interrupted);
+                assert_eq!(after.cleanup, Some("confirmed"));
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[test]
     fn reservation_refuses_an_operation_bound_to_another_recipe() {
         let dir = crate::service::application::tests::private_temp();
@@ -1646,7 +1775,7 @@ mod tests {
 
     const NOW: i64 = 100;
 
-    fn v5_fixture(dir: &Path) -> Connection {
+    fn fixture_db(dir: &Path) -> Connection {
         let db = Connection::open(dir.join("activity.sqlite3")).unwrap();
         #[cfg(unix)]
         {
@@ -1657,6 +1786,238 @@ mod tests {
             )
             .unwrap();
         }
+        db
+    }
+
+    /// Exact v6 state as the merged v6 opener wrote it. Proof for 20 and 21
+    /// is retained, 22 has none and 23 was already pruned. Twenty is the oldest
+    /// of a full audit window, so settling the pending 300 at startup prunes it.
+    fn v6_fixture(dir: &Path) -> Connection {
+        let db = fixture_db(dir);
+        db.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")
+            .unwrap();
+        db.execute_batch(SCHEMA_V5).unwrap();
+        db.execute_batch(MIGRATE_V6).unwrap();
+        db.execute_batch(
+            "PRAGMA user_version=6; COMMIT; PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;
+             INSERT INTO activity(id,principal,actor,vm,action,started_ms,status,reason,
+                 finished_ms,terminal_order,cleanup_confirmed) VALUES
+                 (20,'alice','agent',unhex(printf('%032x',1)),3,10,3,NULL,11,1,1),
+                 (21,'alice','agent',unhex(printf('%032x',2)),3,12,3,NULL,13,2,0),
+                 (22,'alice','agent',unhex(printf('%032x',1)),8,14,1,NULL,15,3,NULL),
+                 (300,'alice','agent',unhex(printf('%032x',4)),3,20,0,NULL,NULL,NULL,NULL);
+             WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<124)
+             INSERT INTO activity(id,principal,actor,vm,action,started_ms,status,reason,
+                 finished_ms,terminal_order)
+                 SELECT 100+i,'alice','agent',unhex(printf('%032x',5)),3,16,4,1,16,4+i FROM n;
+             INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,
+                 valid_through_ms,status,lease_end_ms) VALUES
+                 ('alice',unhex(printf('%032x',20)),unhex(printf('%032x',1)),3,20,86400000,3,NULL),
+                 ('alice',unhex(printf('%032x',21)),unhex(printf('%032x',2)),3,21,86400000,3,NULL),
+                 ('alice',unhex(printf('%032x',22)),unhex(printf('%032x',1)),8,22,86400000,1,400),
+                 ('alice',unhex(printf('%032x',23)),unhex(printf('%032x',3)),3,23,86400000,1,NULL),
+                 ('alice',unhex(printf('%032x',300)),unhex(printf('%032x',4)),3,300,86400000,0,NULL);
+             COMMIT;",
+        )
+        .unwrap();
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM activity WHERE status<>0", []).unwrap(),
+            MAX_RECEIPTS
+        );
+        db
+    }
+
+    fn ledger_state(db: &Connection) -> Result<Vec<(i64, Id, i64)>> {
+        let mut stmt = db.prepare(
+            "SELECT activity_id,operation_id,status FROM vm_operations ORDER BY activity_id",
+        )?;
+        Ok(stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn receipts(db: &Connection, ids: &[(i64, Id, i64)]) -> Result<Vec<OperationStatus>> {
+        ids.iter()
+            .map(|(_, id, _)| Ok(operation_status(db, "alice", *id, NOW)?.unwrap()))
+            .collect()
+    }
+
+    fn proof_column(db: &Connection) -> i64 {
+        count(
+            db,
+            "SELECT count(*) FROM pragma_table_info('vm_operations') WHERE name='cleanup_confirmed'",
+            [],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn v6_upgrade_backfills_cleanup_proof_before_recovery_prunes_it() {
+        let dir = private_temp();
+        let before = ledger_state(&v6_fixture(dir.path())).unwrap();
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        let settled = store
+            .transact(|db| {
+                assert_eq!(
+                    count(db, "PRAGMA user_version", [])?,
+                    i64::from(VM_SCHEMA_VERSION)
+                );
+                assert_eq!(count(db, "PRAGMA foreign_keys", [])?, 1);
+                assert_eq!(
+                    count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?,
+                    0
+                );
+                // Startup recovery settled 300 and pruned the oldest proof row.
+                assert_eq!(
+                    count(db, "SELECT count(*) FROM activity WHERE id=20", [])?,
+                    0
+                );
+                assert_eq!(
+                    count(db, "SELECT count(*) FROM activity WHERE id IN (21,22)", [])?,
+                    2
+                );
+                let after = ledger_state(db)?;
+                let expected: Vec<_> = before
+                    .iter()
+                    .map(|&(activity, id, status)| {
+                        (activity, id, if activity == 300 { 3 } else { status })
+                    })
+                    .collect();
+                assert_eq!(after, expected);
+                let receipts = receipts(db, &after)?;
+                let summary: Vec<_> = receipts
+                    .iter()
+                    .map(|r| (r.action, r.state, r.cleanup))
+                    .collect();
+                assert_eq!(
+                    summary,
+                    [
+                        ("start", Status::Interrupted, Some("confirmed")),
+                        ("start", Status::Interrupted, Some("unconfirmed")),
+                        ("extend", Status::Succeeded, None),
+                        ("start", Status::Succeeded, None),
+                        ("start", Status::Interrupted, Some("unconfirmed")),
+                    ]
+                );
+                assert_eq!(receipts[2].expires_at_ms, Some(400));
+                Ok(receipts)
+            })
+            .unwrap();
+        drop(store);
+
+        let reopened = VmStore::open(dir.path(), NOW).unwrap();
+        reopened
+            .transact(|db| {
+                assert_eq!(
+                    count(db, "PRAGMA user_version", [])?,
+                    i64::from(VM_SCHEMA_VERSION)
+                );
+                let state = ledger_state(db)?;
+                assert_eq!(receipts(db, &state)?, settled);
+                // Proof is limited to 0 and 1 on terminal ledger rows.
+                assert!(
+                    db.execute(
+                        "UPDATE vm_operations SET cleanup_confirmed=2 WHERE activity_id=23",
+                        []
+                    )
+                    .is_err()
+                );
+                let pending = legacy_binding(9, [9; 16], Action::Start).record(
+                    db,
+                    NOW,
+                    Some([9; 16]),
+                    None,
+                )?;
+                assert!(
+                    db.execute(
+                        "UPDATE vm_operations SET cleanup_confirmed=1 WHERE activity_id=?1",
+                        [pending.receipt.activity_id]
+                    )
+                    .is_err()
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn v6_upgrade_rolls_back_proof_column_on_recovery_error_and_can_retry() {
+        let dir = private_temp();
+        let db = v6_fixture(dir.path());
+        db.execute_batch(
+            "CREATE TRIGGER fixture_error BEFORE UPDATE OF status ON activity
+             BEGIN SELECT raise(ABORT,'fixture migration fault'); END;",
+        )
+        .unwrap();
+        drop(db);
+        let path = dir.path().join("activity.sqlite3");
+        let before = fs::read(&path).unwrap();
+        let error = VmStore::open(dir.path(), NOW).err().unwrap();
+        assert!(error.to_string().contains("fixture migration fault"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let db = open_sqlite(&path).unwrap();
+        assert_eq!(count(&db, "PRAGMA user_version", []).unwrap(), 6);
+        assert_eq!(proof_column(&db), 0);
+        db.execute_batch("DROP TRIGGER fixture_error").unwrap();
+        drop(db);
+        VmStore::open(dir.path(), NOW)
+            .unwrap()
+            .transact(|db| {
+                assert_eq!(proof_column(db), 1);
+                assert_eq!(
+                    count(
+                        db,
+                        "SELECT cleanup_confirmed FROM vm_operations WHERE activity_id=20",
+                        []
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn template_clone_receipt_keeps_its_bound_template_after_vm_id_reuse() {
+        let dir = private_temp();
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store.transact(|db| {
+            let vm = [1; 16];
+            let [bound, other]: [Id; 2] = [[2; 16], [3; 16]];
+            for template in [bound, other] {
+                db.execute(
+                    "INSERT INTO vm_templates VALUES(?1,1,?2,zeroblob(32),zeroblob(32),40)",
+                    params![template, [template[0]; 32]],
+                )?;
+            }
+            let operation = Binding {
+                principal: "alice",
+                key: RequestId::parse("00000000000000000000000000000001").unwrap(),
+                subject: Subject::Template(bound, [7; 32]),
+                action: Action::Clone as i64,
+            }
+            .record(db, NOW, Some(vm), None)?;
+            db.execute(
+                "INSERT INTO vm_instances(id,template,principal,expires_ms) VALUES(?1,?2,'alice',?3)",
+                params![vm, bound, NOW + 1],
+            )?;
+            settle_operation(db, operation.receipt.activity_id, NOW, Completion::Succeeded)?;
+            let receipt = operation_status(db, "alice", operation.id, NOW)?.unwrap();
+            assert_eq!(receipt.template, Some(bound));
+            assert_eq!(receipt.cleanup, Some("confirmed"));
+            db.execute("DELETE FROM vm_disk_claims", [])?;
+            db.execute("DELETE FROM vm_instances", [])?;
+            db.execute(
+                "INSERT INTO vm_instances(id,template,principal,expires_ms) VALUES(?1,?2,'alice',?3)",
+                params![vm, other, NOW + 1],
+            )?;
+            assert_eq!(operation_status(db, "alice", operation.id, NOW)?, Some(receipt));
+            Ok(())
+        }).unwrap();
+    }
+
+    fn v5_fixture(dir: &Path) -> Connection {
+        let db = fixture_db(dir);
         db.execute_batch("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;")
             .unwrap();
         db.execute_batch(SCHEMA_V5).unwrap();
@@ -1716,9 +2077,9 @@ mod tests {
         drop(v5_fixture(dir.path()));
         let store = VmStore::open(dir.path(), NOW).unwrap();
         let ids = store.transact(|db| {
-            assert_eq!(count(db, "PRAGMA user_version", [])?, 6);
-            // The previous VM opener's gate was exactly 0 | 5.
-            assert!(!matches!(count(db, "PRAGMA user_version", [])?, 0 | 5));
+            assert_eq!(count(db, "PRAGMA user_version", [])?, i64::from(VM_SCHEMA_VERSION));
+            // The v5 and v6 VM openers' gates were exactly 0 | 5 and 0 | 5 | 6.
+            assert!(!matches!(count(db, "PRAGMA user_version", [])?, 0 | 5 | 6));
             assert_eq!(count(db, "PRAGMA foreign_keys", [])?, 1);
             assert_eq!(count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?, 0);
             assert_eq!(count(db, "SELECT seq FROM sqlite_sequence WHERE name='activity'", [])?, 81);
@@ -1739,6 +2100,10 @@ mod tests {
                  script_result='legacy' AND script_exit_code IS NULL AND status=3", [])?, 2);
             assert_eq!(count(db, "SELECT count(*) FROM vm_operations WHERE binding_kind='legacy_vm'
                  AND subject_id IS NULL AND request_digest IS NULL", [])?, 7);
+            assert_eq!(count(db, "SELECT count(*) FROM vm_operations WHERE
+                 (activity_id IN (10,12,17) AND cleanup_confirmed=1)
+                 OR (activity_id IN (11,16) AND cleanup_confirmed=0)
+                 OR (activity_id IN (9,15) AND cleanup_confirmed IS NULL)", [])?, 7);
 
             let key = RequestId::parse("0000000000000000000000000000000b").unwrap();
             for (principal, vm, id) in [("alice", 1, 11), ("bob", 3, 9)] {
@@ -1839,7 +2204,8 @@ mod tests {
     fn future_vm_version_leaves_state_unchanged() {
         let dir = private_temp();
         let db = v5_fixture(dir.path());
-        db.pragma_update(None, "user_version", 7).unwrap();
+        db.pragma_update(None, "user_version", VM_SCHEMA_VERSION + 1)
+            .unwrap();
         drop(db);
         let path = dir.path().join("activity.sqlite3");
         let before = fs::read(&path).unwrap();
