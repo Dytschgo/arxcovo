@@ -10,9 +10,21 @@ use std::{
 use subtle::ConstantTimeEq;
 
 /// Candidate-only VM profile. The installed and foreground schemas stay closed.
+///
+/// Every value of this type went through [`VmRuntimeProfile::parse`], with
+/// its size limit and semantic validation; public-egress admission relies on
+/// that provenance for its pins. The type therefore implements no
+/// `Deserialize` (so `serde_json::from_*::<VmRuntimeProfile>` does not
+/// compile) and its only field is private (so no struct literal compiles
+/// outside this module). The foreground file's `runtime` section also takes
+/// `parse`, through `validated_runtime`.
+pub struct VmRuntimeProfile(RawVmRuntimeProfile);
+
+/// The serde shape of a profile. Private: only `parse` may lift it into a
+/// [`VmRuntimeProfile`], after validation.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct VmRuntimeProfile {
+struct RawVmRuntimeProfile {
     enabled: bool,
     owner_sid: String,
     supervisor_sid: String,
@@ -21,12 +33,73 @@ pub struct VmRuntimeProfile {
     state: String,
     disk_ceiling_bytes: u64,
     manifest: VmManifest,
+    #[serde(default, deserialize_with = "present")]
+    public_egress: Option<Box<PublicEgressProfile>>,
 }
 
 #[derive(Deserialize)]
 enum VmManifest {
     #[serde(rename = "qemu-11.1.3-windows-x64")]
     Qemu1113WindowsX64,
+}
+
+/// ADR 0064: the separately pinned patched QEMU/libslirp manifest for a
+/// public-egress static boot, plus the enrolled policy artifact's pin. It
+/// never replaces the stock `manifest`, which TEST VMs keep. Admission still
+/// refuses these pins until a reviewed receipt qualifies them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicEgressProfile {
+    manifest: EgressManifest,
+    /// The console executable, which statically links patched libslirp.
+    qemu: PinSpec,
+    receipt: PinSpec,
+    policy: PinSpec,
+}
+
+#[derive(Deserialize)]
+enum EgressManifest {
+    #[serde(rename = "qemu-11.1.3-arx-public-egress-windows-x64")]
+    Qemu1113PublicEgressWindowsX64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinSpec {
+    length: u64,
+    sha256: String,
+}
+
+impl PinSpec {
+    fn pin(&self, limit: u64) -> Option<crate::vm::paths::ArtifactPin> {
+        let mut sha256 = [0; 32];
+        (self.sha256.len() == 64
+            && self
+                .sha256
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            && (1..=limit).contains(&self.length)
+            && hex::decode_to_slice(&self.sha256, &mut sha256).is_ok())
+        .then_some(crate::vm::paths::ArtifactPin {
+            size: self.length,
+            sha256,
+        })
+    }
+}
+
+impl PublicEgressProfile {
+    fn binary(&self) -> Option<crate::vm::public_egress::EgressBinaryPin> {
+        const EXECUTABLE_LIMIT: u64 = 512 * 1024 * 1024;
+        const RECEIPT_LIMIT: u64 = 1024 * 1024;
+        Some(crate::vm::public_egress::EgressBinaryPin {
+            qemu: self.qemu.pin(EXECUTABLE_LIMIT)?,
+            receipt: self.receipt.pin(RECEIPT_LIMIT)?,
+        })
+    }
+
+    fn policy(&self) -> Option<crate::vm::paths::ArtifactPin> {
+        self.policy.pin(crate::vm::public_egress::MAX_POLICY_BYTES)
+    }
 }
 
 #[derive(Debug)]
@@ -45,11 +118,58 @@ impl VmRuntimeProfile {
         if bytes.len() > 16_384 {
             bail!("VM profile too large");
         }
-        let profile: Self = serde_json::from_slice(bytes).map_err(|_| InvalidVmProfile)?;
-        profile.validate_paths()?;
-        Ok(profile)
+        let raw: RawVmRuntimeProfile =
+            serde_json::from_slice(bytes).map_err(|_| InvalidVmProfile)?;
+        if raw
+            .public_egress
+            .as_ref()
+            .is_some_and(|egress| egress.binary().is_none() || egress.policy().is_none())
+        {
+            bail!(InvalidVmProfile);
+        }
+        raw.validate_paths()?;
+        Ok(Self(raw))
     }
 
+    fn validate_paths(&self) -> Result<crate::vm::paths::LocalPath> {
+        self.0.validate_paths()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.0.enabled
+    }
+
+    pub fn manifest_id(&self) -> &'static str {
+        match self.0.manifest {
+            VmManifest::Qemu1113WindowsX64 => "qemu-11.1.3-windows-x64",
+        }
+    }
+
+    /// The patched build's manifest identifier, when one is configured.
+    pub fn public_egress_manifest_id(&self) -> Option<&'static str> {
+        self.0
+            .public_egress
+            .as_ref()
+            .map(|egress| match egress.manifest {
+                EgressManifest::Qemu1113PublicEgressWindowsX64 => {
+                    crate::vm::public_egress::EGRESS_MANIFEST
+                }
+            })
+    }
+
+    /// The configured patched-binary pin. Present is not qualified: admission
+    /// still requires a reviewed receipt.
+    pub fn public_egress_binary(&self) -> Option<crate::vm::public_egress::EgressBinaryPin> {
+        self.0.public_egress.as_ref()?.binary()
+    }
+
+    /// The enrolled policy artifact's pin.
+    pub fn public_egress_policy_pin(&self) -> Option<crate::vm::paths::ArtifactPin> {
+        self.0.public_egress.as_ref()?.policy()
+    }
+}
+
+impl RawVmRuntimeProfile {
     fn validate_paths(&self) -> Result<crate::vm::paths::LocalPath> {
         use crate::vm::paths::LocalPath;
 
@@ -70,16 +190,6 @@ impl VmRuntimeProfile {
             bail!(InvalidVmProfile);
         }
         Ok(state)
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    pub fn manifest_id(&self) -> &'static str {
-        match self.manifest {
-            VmManifest::Qemu1113WindowsX64 => "qemu-11.1.3-windows-x64",
-        }
     }
 }
 
@@ -456,7 +566,7 @@ pub(crate) struct TestVms {
     pub(crate) allow_agent_public_sites: bool,
     #[serde(default, deserialize_with = "present")]
     pub(crate) publication: Option<Box<crate::vm::runtime::publication::Profile>>,
-    #[serde(default, deserialize_with = "present")]
+    #[serde(default, deserialize_with = "validated_runtime")]
     pub(crate) runtime: Option<VmRuntimeProfile>,
     #[serde(default, deserialize_with = "present")]
     recipes: Option<Vec<RecipePins>>,
@@ -480,6 +590,19 @@ struct RecipeAsset {
     path: PathBuf,
     length: u64,
     sha256: String,
+}
+
+/// The foreground file's runtime section goes through
+/// [`VmRuntimeProfile::parse`], with its size limit and semantic validation,
+/// like every other profile. JSON `null` is refused.
+fn validated_runtime<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<VmRuntimeProfile>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let bytes = serde_json::to_vec(&value).map_err(serde::de::Error::custom)?;
+    VmRuntimeProfile::parse(&bytes)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("invalid VM profile"))
 }
 
 fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
@@ -598,9 +721,9 @@ impl TestVms {
             let configured = LocalPath::parse(root.to_str().unwrap_or_default())
                 .map_err(|_| anyhow::anyhow!("invalid VM state"))?;
             anyhow::ensure!(
-                runtime.enabled == self.enabled
-                    && runtime.supervisor_sid == actual
-                    && local.client_identity != runtime.owner_sid
+                runtime.0.enabled == self.enabled
+                    && runtime.0.supervisor_sid == actual
+                    && local.client_identity != runtime.0.owner_sid
                     && state.as_str().eq_ignore_ascii_case(configured.as_str()),
                 "invalid VM identity or state pairing"
             );
@@ -634,7 +757,7 @@ impl TestVms {
     pub(crate) fn policy(&self) -> crate::vm::VmPolicy {
         let mut policy = crate::vm::VmPolicy::default();
         if let Some(runtime) = &self.runtime {
-            policy.disk_cap = runtime.disk_ceiling_bytes;
+            policy.disk_cap = runtime.0.disk_ceiling_bytes;
         }
         policy
     }
@@ -778,6 +901,57 @@ pub fn checked_path(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// The foreground file's runtime section reaches `VmRuntimeProfile` only
+/// through `VmRuntimeProfile::parse`.
+#[cfg(test)]
+mod runtime_provenance_tests {
+    use super::TestVms;
+    use serde_json::json;
+
+    fn runtime() -> serde_json::Value {
+        json!({
+            "enabled": true, "owner_sid": "S-1-5-21-1-2-3-1001",
+            "supervisor_sid": "S-1-5-21-1-2-3-1002", "bundle": "E:/pinned bundle",
+            "volume": "D:/", "state": "D:/test_vms/state",
+            "disk_ceiling_bytes": 10_737_418_240_u64, "manifest": "qemu-11.1.3-windows-x64",
+            "public_egress": {
+                "manifest": "qemu-11.1.3-arx-public-egress-windows-x64",
+                "qemu": {"length": 30_000_000, "sha256": "a1".repeat(32)},
+                "receipt": {"length": 4096, "sha256": "a2".repeat(32)},
+                "policy": {"length": 512, "sha256": "a3".repeat(32)},
+            },
+        })
+    }
+
+    #[test]
+    fn foreground_runtime_section_is_parsed_and_validated() {
+        let vms: TestVms =
+            serde_json::from_value(json!({"enabled": true, "runtime": runtime()})).unwrap();
+        let profile = vms.runtime.unwrap();
+        assert!(profile.public_egress_binary().is_some());
+        assert!(profile.public_egress_policy_pin().is_some());
+        for (field, value) in [
+            ("state", json!("test_vms/state")),
+            ("bundle", json!("D:/")),
+            ("owner_sid", json!("S-1-5-21-1-2-3-1002")),
+        ] {
+            let mut bad = runtime();
+            bad[field] = value;
+            let refused =
+                serde_json::from_value::<TestVms>(json!({"enabled": true, "runtime": bad}));
+            assert!(refused.is_err(), "{field}");
+        }
+        let mut bad = runtime();
+        bad["public_egress"]["qemu"]["length"] = json!(0);
+        assert!(
+            serde_json::from_value::<TestVms>(json!({"enabled": true, "runtime": bad})).is_err()
+        );
+        assert!(
+            serde_json::from_value::<TestVms>(json!({"enabled": true, "runtime": null})).is_err()
+        );
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     /// Mirrors PR16 8c3856a: a disk prefix is skipped only once a physical

@@ -1878,7 +1878,9 @@ impl<'a> NativeLaunch<'a> {
         inputs: LaunchInputs<'a>,
     ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
         let kind = inputs.plan.kind();
-        if kind == PlanKind::StaticWebBoot {
+        // ADR 0064: a public-egress plan also stays closed until its patched
+        // build, policy custody and route evidence have native qualification.
+        if matches!(kind, PlanKind::StaticWebBoot | PlanKind::PublicEgressBoot) {
             return Err(NativeRefusal::NetworkFenceUnverified);
         }
         match (kind, inputs.installer) {

@@ -71,6 +71,11 @@ fn safe_component(name: &str) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArtifactRole {
     Qemu,
+    /// The separately pinned patched QEMU/libslirp build for a public-egress
+    /// static boot (ADR 0064). Never interchangeable with the stock `Qemu`.
+    PublicEgressQemu,
+    /// The read-only custodied public-egress policy artifact (ADR 0064).
+    PublicEgressPolicy,
     QemuImg,
     FirmwareCode,
     VarsSeed,
