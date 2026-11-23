@@ -393,11 +393,23 @@ async fn foreground_profile_boundaries() {
             }
         }
         server.kill().await.unwrap();
-        assert_eq!(
-            std::fs::read_dir(&state).unwrap().count(),
-            2,
-            "candidate created non-state artifacts"
-        );
+        let mut entries = std::fs::read_dir(&state)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        entries.sort();
+        // The legacy Inventory also opens the M5 vault store. The VM candidate
+        // returns before the vault opens, so it creates only its own store.
+        let expected: &[&str] = match enabled {
+            None => &[
+                "activity.lock",
+                "activity.sqlite3",
+                "vault.lock",
+                "vault.sqlite3",
+            ],
+            Some(_) => &["activity.lock", "activity.sqlite3"],
+        };
+        assert_eq!(entries, expected, "{label}: unexpected state entries");
     }
 }
 
