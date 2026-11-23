@@ -78,6 +78,10 @@ pub enum ArtifactRole {
     GuestDisk,
     StaticDisk,
     StaticVars,
+    SnapshotDisk,
+    SnapshotVars,
+    SnapshotStagingDisk,
+    SnapshotStagingVars,
     Golden,
     TestInstallDisk,
     WindowsSetupVars,
@@ -103,6 +107,8 @@ impl ArtifactRole {
                 | Self::GuestDisk
                 | Self::StaticDisk
                 | Self::StaticVars
+                | Self::SnapshotStagingDisk
+                | Self::SnapshotStagingVars
                 | Self::TestInstallDisk
                 | Self::Staging
                 | Self::Scratch

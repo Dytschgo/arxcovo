@@ -11,6 +11,7 @@ pub mod qemu_img;
 pub mod qmp;
 pub(crate) mod reaper;
 pub mod runtime;
+pub mod snapshot;
 pub mod static_web;
 mod template;
 #[cfg(all(windows, target_arch = "x86_64"))]
