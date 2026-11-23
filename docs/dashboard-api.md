@@ -231,8 +231,17 @@ per-session lock:
      server stops producing for the session's streams: every later enqueue
      fails the generation check and is refused, and data still waiting in the
      outbound buffer is discarded.
+   - **Commit point.** A message is *committed for sending* only when the
+     writer, holding the session lock, re-checks that the generation is
+     unchanged and moves the message out of the outbound buffer into its
+     single in-flight slot. The writer releases the lock and only then calls
+     the transport. Revocation takes the same lock, so every message is
+     either committed before the revocation linearization point (it may be
+     written) or still in the buffer at that point (it is discarded and
+     never written). A writer that dequeued nothing under the lock cannot
+     start a write afterwards; there is no lock-free dequeue path.
    - Data the transport accepted before that point, meaning the socket send
-     buffer plus at most one message whose write was already in progress,
+     buffer plus the at most one message committed to the in-flight slot,
      may still be delivered. A WebSocket close cannot recall it
      ([RFC 6455 §5.5.1](https://www.rfc-editor.org/rfc/rfc6455.html#section-5.5.1)),
      and the contract makes no stronger delivery claim.
@@ -254,7 +263,11 @@ Server integration tests (backend PR) must cover: revocation during command
 admission; expiry during a running command; no code path holding the session
 lock across a socket send (revocation completes while a send is
 backpressured); an enqueue refused after revocation, and buffered but
-unwritten data discarded; a stalled drain aborted within 5 s of revocation;
+unwritten data discarded; revocation on both sides of the commit point (a
+message committed just before revocation may be written and is followed by
+the 4401 close; a message still buffered at revocation is never written, and
+4401 is the next frame the peer sees after any committed message); a stalled
+drain aborted within 5 s of revocation;
 ticket redemption racing revocation; and a session renewal racing a callback
 for the old idle deadline (the session stays live).
 
