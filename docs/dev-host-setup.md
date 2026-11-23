@@ -32,6 +32,14 @@ Relayed by the babysitter on the owner's behalf.
   - A security review of 11.1.0→11.1.3 found an ATAPI hang, a virtio-net heap bounds fix (CVE-2026-66900) and a block I/O corruption fix. A patched build is required before untrusted guests or persistent VM disks.
   - A full guest boot is **unverified on real hardware**.
 
+## Foreground VM profile: state root custody
+
+`arxd --config FILE` with a `test_vms` section serves the foreground VM tools from the configured `state_dir`. That directory must be an existing, owner-private, ordinary local directory: no link or reparse point, and not inside the protected service workspace or the executable's folder.
+
+- **Windows.** From validation until the process exits, the foreground holds the state directory **and every ancestor up to the drive root** open without delete sharing. While it runs, nobody can rename, move or delete the state directory or any parent folder; Explorer and `Move-Item` fail with a sharing violation. Stop the foreground (Ctrl+C, or end the process) before you rename or move `state_dir` or a folder above it.
+- **macOS.** The state directory and every ancestor must have no extended ACL, because an ACL can grant another account rename or delete rights that the mode bits do not show. Check with `ls -lde PATH` and remove entries with `chmod -N PATH`, or pick a location without ACLs. Unreadable ACLs are refused too.
+- **Linux and macOS.** Every ancestor must be owned by you or root and must not be group- or other-writable, unless it is sticky (like `/tmp`) and the next entry is yours. Only your own account can then rename a component. POSIX is diagnostic-only; native VMs stay unavailable there.
+
 ## Owner actions (historical; superseded on this PC by the 2026-11-23 update above)
 
 Kept for reference only. On this PC the execution account is the owner's current login, and agents perform the WHPX, QEMU and disk-cap steps under the scoped exception above. Do not follow the dedicated-account or owner-install steps below here.

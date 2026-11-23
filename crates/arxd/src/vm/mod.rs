@@ -18,6 +18,7 @@ mod windows;
 
 pub(crate) use crate::store::vm::{DashboardCatalog, DashboardVm};
 pub use controller::VmController;
+pub(crate) use controller::{ActivityReceipt, CatalogEntry, ForegroundSubject, Precheck};
 pub use model::*;
 pub use policy::{Capacity, HostObservation, Resources, VmPolicy};
 pub use reaper::{MonotonicReaperTicks, ReaperTick};

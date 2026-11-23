@@ -20,6 +20,14 @@ mod macos;
 #[path = "native_macos_policy.rs"]
 mod macos_policy;
 
+/// The service's macOS extended-ACL check for an opened object: Ok only when
+/// no ACL is present or it has no entries; retrieval failure is an error.
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_empty_acl(file: &File) -> Result<(), Error> {
+    use std::os::fd::AsRawFd;
+    macos::empty_acl(file.as_raw_fd())
+}
+
 pub struct NativeResolver;
 #[cfg(all(windows, test))]
 pub(crate) use os::descriptor_protection as windows_descriptor_protection;

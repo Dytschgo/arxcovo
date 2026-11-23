@@ -988,8 +988,7 @@ class DiscoveryIntegrationTests(unittest.TestCase):
         context = root / 'context'
         context.mkdir()
         blobs = {}
-        for relative in ('tools/ci/custody/Containerfile', 'tools/ci/custody/run.py',
-                         'crates/arxd/src/cluster/pki/custody/hosted_probe.rs', '.github/workflows/ci.yml'):
+        for relative in run.PINNED_SOURCES:
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             blobs[relative] = ('public-source-' + relative).encode()
@@ -1031,6 +1030,9 @@ class DiscoveryIntegrationTests(unittest.TestCase):
             records = self.exercise(root, context, blobs)
             self.assertEqual((context / 'arxd-tests').read_bytes(), binary.read_bytes())
             self.assertEqual(records[-1]['event'], 'inputs')
+            self.assertEqual(records[-1]['pins'], run.PINS)
+            self.assertEqual(records[-1]['adopted_pins'], run.ADOPTED_PINS)
+            self.assertNotEqual(records[-1]['pins'], records[-1]['adopted_pins'])
             self.assertEqual(set(records[-1]['hashes']), set(blobs))
             self.assertEqual(records[-2]['required_glibc'], ['GLIBC_2.38'])
             run.safe(context / 'arxd-tests', directory=False)
@@ -1136,6 +1138,37 @@ class DiscoveryIntegrationTests(unittest.TestCase):
                     self.exercise(root, context, blobs)
                 self.assertFalse(any(c[0] in ('docker', 'readelf') for c in self.last_calls))
                 self.assertEqual(list(context.iterdir()), [])
+
+    def test_candidate_just_over_128_mib_passes_size_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            path = root / 'arxd-sparse'
+            with path.open('wb') as handle:
+                handle.truncate(128 * run.MIB + 1)
+            recorded = []
+            with run.BuildInput(path, root, 'candidate-0', lambda event, **facts: recorded.append((event, facts))) as obj:
+                self.assertEqual(obj.metadata[1], 128 * run.MIB + 1)
+            self.assertEqual(recorded[0][0], 'input-object')
+            self.assertEqual(recorded[0][1]['size'], 128 * run.MIB + 1)
+            self.assertEqual(len(obj.sha), 64)
+
+    def test_candidate_just_over_256_mib_refuses_size_bound(self):
+        records = []
+        token = run.DIAGNOSTIC.set(lambda event, **facts: records.append(dict(event=event, **facts)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                path = root / 'arxd-sparse'
+                with path.open('wb') as handle:
+                    handle.truncate(256 * run.MIB + 1)
+                with self.assertRaisesRegex(run.Refusal, 'CandidateBounds'):
+                    with run.BuildInput(path, root, 'candidate-1', lambda *args, **kwargs: None):
+                        pass
+                self.assertEqual(records[-1]['code'], 'CandidateBounds')
+                self.assertEqual(records[-1]['predicate'], 'size_256_mib')
+                self.assertEqual(records[-1]['subject'], 'candidate-1')
+        finally:
+            run.DIAGNOSTIC.reset(token)
 
     def test_staging_copy_drift_and_staged_alias_refuse(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1253,6 +1286,111 @@ class A3ProcessTests(unittest.TestCase):
         self.assertEqual(waits, [0])
         self.assertTrue(child.reaped)
         self.assertIsNone(h.first)
+
+    def test_git_source_pipe_accepts_over_64_kib_and_refuses_over_256_kib(self):
+        sha = 'a' * 40
+        pinned = run.PINNED_SOURCES[1]
+        exact = ['git', 'show', sha + ':' + pinned]
+        cases = (
+            ('exact-just-over-64-kib', exact, sha, run.PIPE_CAP + 1, None, run.GIT_SOURCE_CAP),
+            ('exact-just-over-256-kib', exact, sha, run.GIT_SOURCE_CAP + 1, 'PipeOverflow', run.GIT_SOURCE_CAP),
+            ('other-command-just-over-64-kib', ['git', 'rev-parse', 'HEAD'], sha, run.PIPE_CAP + 1, 'PipeOverflow', run.PIPE_CAP),
+            ('unpinned-path', ['git', 'show', sha + ':tools/ci/custody/test_run.py'], sha, run.PIPE_CAP + 1, 'PipeOverflow', run.PIPE_CAP),
+            ('extra-option', ['git', 'show', '--textconv', sha + ':' + pinned], sha, run.PIPE_CAP + 1, 'PipeOverflow', run.PIPE_CAP),
+            ('other-revision', ['git', 'show', 'b' * 40 + ':' + pinned], sha, run.PIPE_CAP + 1, 'PipeOverflow', run.PIPE_CAP),
+            ('unverified-source', exact, None, run.PIPE_CAP + 1, 'PipeOverflow', run.PIPE_CAP),
+        )
+        for label, argv, verified, size, expected, limit in cases:
+            with self.subTest(label=label):
+                clock = Clock()
+                payload = b'x' * size
+                streams = {}
+
+                class Stream:
+                    def __init__(self, data, fd):
+                        self.chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
+                        self.chunks.append(b'')
+                        self.closed = False
+                        self.fd = fd
+                        streams[fd] = self
+
+                    def fileno(self):
+                        return self.fd
+
+                    def close(self):
+                        self.closed = True
+
+                class Selector:
+                    def __init__(self, open_streams):
+                        self.open_streams = open_streams
+
+                    def select(self, _timeout):
+                        ready = [s for s in self.open_streams if not s.closed and s.chunks]
+                        return [(SimpleNamespace(fileobj=s), None) for s in ready]
+
+                    def unregister(self, _fileobj):
+                        return None
+
+                    def get_map(self):
+                        return {s.fd: s for s in self.open_streams if not s.closed}
+
+                    def close(self):
+                        return None
+
+                stdout, stderr = Stream(payload, 3), Stream(b'', 4)
+                child = run.Child.__new__(run.Child)
+                child.clock, child.deadline = clock, 10
+                child.out, child.reaped, child.killed = bytearray(), False, False
+                child.selector = Selector([stdout, stderr])
+
+                def poll():
+                    return 0 if stdout.closed and stderr.closed else None
+
+                def wait(timeout):
+                    child.p.returncode = 0
+                    return 0
+
+                child.p = SimpleNamespace(poll=poll, wait=wait, returncode=None, pid=1)
+
+                def kill():
+                    child.killed = child.reaped = True
+
+                child.kill = kill
+
+                seen = {}
+
+                def spawn(bound, _deadline, _clock):
+                    seen['argv'] = bound
+                    return child
+
+                def fake_read(fd, _n):
+                    return streams[fd].chunks.pop(0)
+
+                h = run.Harness(clock, spawn)
+                h.source = verified
+                h.tools = {'git': SimpleNamespace(recheck=lambda: '/usr/bin/git')}
+                output = io.StringIO()
+                with redirect_stdout(output), patch.object(run.os, 'read', fake_read), patch.object(run.time, 'sleep', clock.sleep):
+                    if expected is None:
+                        self.assertEqual(h.command(argv, 'preflight'), payload)
+                    else:
+                        with self.assertRaisesRegex(run.Refusal, expected):
+                            h.command(argv, 'preflight')
+                self.assertEqual(seen['argv'][0], '/usr/bin/git')
+                self.assertEqual(seen['argv'][1:], argv[1:])
+                self.assertEqual(child.limit, limit)
+                if expected is None:
+                    self.assertIsNone(h.first)
+                    self.assertFalse(child.killed)
+                    self.assertTrue(child.reaped)
+                else:
+                    self.assertEqual(h.first, expected)
+                    self.assertEqual(len(child.out), limit)
+                    self.assertTrue(child.killed)
+                    records = [json.loads(line) for line in output.getvalue().splitlines()]
+                    refusal = next(r for r in records if r['event'] == 'command-refusal')
+                    self.assertEqual(refusal['predicate'], 'PipeOverflow')
+                    self.assertEqual(refusal['operation'], 'git-source' if argv[1] == 'show' else 'git-head')
 
     def test_a3_signal_timeout_overflow_io_reap_and_spawn_are_fatal(self):
         cases = (

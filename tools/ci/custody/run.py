@@ -19,8 +19,19 @@ from contextlib import ExitStack
 
 PROBE = 'cluster::pki::custody::hosted_probe::hosted_custody_probe'
 BASE = 'docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a'
-PINS = '28f882cb018eb956c60c190f8718fb982923cd096adb608e15e194c51fa2e167'
+ADOPTED_PINS = '28f882cb018eb956c60c190f8718fb982923cd096adb608e15e194c51fa2e167'
+# SHA256 of docs/briefs/m3-custody-hosted-pins.md after amendment A4 (2026-11-23).
+# Recorded evidence uses this digest. ADR 0037 must quote it and ADOPTED_PINS.
+PINS = '65e3a466c1a118beba6243b37c90743a187858a91c6b16d246154aa1cb5e7d36'
 MIB = 1024 * 1024
+PIPE_CAP = 64 * 1024
+GIT_SOURCE_CAP = 256 * 1024
+PINNED_SOURCES = (
+    'tools/ci/custody/Containerfile',
+    'tools/ci/custody/run.py',
+    'crates/arxd/src/cluster/pki/custody/hosted_probe.rs',
+    '.github/workflows/ci.yml',
+)
 MODES = {'create-founder', 'create-learner', 'deny-build', 'same-uid-control', 'release', 'restart-founder', 'restart-learner'}
 LIMIT = 1024 * 1024
 
@@ -360,7 +371,7 @@ class BuildInput:
             self.record('input-object', subject=self.subject, uid=m.st_uid, gid=m.st_gid,
                         mode=stat.S_IMODE(m.st_mode), device=m.st_dev, inode=m.st_ino,
                         nlink=m.st_nlink, file_type=stat.S_IFMT(m.st_mode), size=m.st_size)
-            require(m.st_size <= 128*MIB, 'CandidateBounds', self.subject, 'size_128_mib')
+            require(m.st_size <= 256*MIB, 'CandidateBounds', self.subject, 'size_256_mib')
             self.fd = os.open(self.path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) |
                               getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_BINARY', 0))
             self.metadata = identity(m), m.st_size, m.st_mtime_ns, m.st_ctime_ns
@@ -390,7 +401,7 @@ class BuildInput:
         while data := os.read(self.fd, MIB):
             self.checkpoint()
             size += len(data)
-            require(size <= 128*MIB, 'CandidateBounds', self.subject, 'bounded_read')
+            require(size <= 256*MIB, 'CandidateBounds', self.subject, 'bounded_read')
             h.update(data)
             if output is not None:
                 output.write(data)
@@ -477,6 +488,12 @@ def command_role(argv):
     return argv[0] if argv[0] in TOOLS else 'candidate-list'
 
 
+def pinned_git_show(argv, source):
+    """256 KiB only for git show of one verified HEAD blob of a pinned input."""
+    return (len(argv) == 3 and argv[0] == 'git' and argv[1] == 'show' and isinstance(source, str)
+            and any(argv[2] == source + ':' + path for path in PINNED_SOURCES))
+
+
 def choose(candidates):
     matches = [p for p, listing, before, after in candidates if exact_listing(listing) and before == after]
     require(len(matches) == 1 and all(before == after for _, _, before, after in candidates), 'ProbeSelection', 'choose', 'len(matches) == 1 and all((before == after for _, _, before, after in candidates))')
@@ -556,12 +573,13 @@ class Child:
             self.selector.register(stream, selectors.EVENT_READ)
         self.out = bytearray()
         self.reaped = False
+        self.limit = PIPE_CAP
 
     def pump(self):
         for key, _ in self.selector.select(0):
             data = os.read(key.fileobj.fileno(), 4096)
             if data:
-                require(len(self.out) + len(data) <= 65536, 'PipeOverflow', 'pump', 'len(self.out) + len(data) <= 65536')
+                require(len(self.out) + len(data) <= self.limit, 'PipeOverflow', 'pump', f'len(self.out) + len(data) <= {self.limit}')
                 self.out.extend(data)
             else:
                 self.selector.unregister(key.fileobj)
@@ -626,6 +644,7 @@ class Harness:
         self.evidence = 0
         self.evidence_exhausted = False
         self.tools = None
+        self.source = None
         self.case_results = set()
         self.scratch = None
 
@@ -707,6 +726,8 @@ class Harness:
         failure = None
         try:
             child = self.spawn(self.bound_argv(argv), deadline, self.clock)
+            # Caller's argv. bound_argv may replace the git path before spawn.
+            child.limit = GIT_SOURCE_CAP if pinned_git_show(argv, self.source) else PIPE_CAP
             self.children.append(child)
             while True:
                 if not cleanup and self.holder:
@@ -1034,6 +1055,10 @@ class Harness:
         self.command(['python3', '-I', '-B', '-m', 'unittest', 'discover', '-s', str(Path(__file__).parent), '-p', 'test_run.py'], 'preflight', 20)
         tmp = Path(os.environ['RUNNER_TEMP'])
         safe(tmp)
+        # RUNNER_TEMP only. Staged context is at most 257 MiB and the ext4 fixture
+        # is 64 MiB, 321 MiB together. 1 GiB free covers that scratch. Docker stores
+        # the image on its data root, which this check does not measure; image Size
+        # is capped separately at 768 MiB and is not added into this 1 GiB figure.
         require(shutil.disk_usage(tmp).free >= 1024*MIB, 'DiskCapacity', 'qualify', 'shutil.disk_usage(tmp).free >= 1024 * MIB')
         self.root = Path(tempfile.mkdtemp(prefix='arx-custody-', dir=tmp))
         os.chmod(self.root, 0o700)
@@ -1044,16 +1069,21 @@ class Harness:
         self.record_scratch('root')
         source = self.command(['git', 'rev-parse', 'HEAD'], 'preflight').decode().strip()
         require(re.fullmatch(r'[a-f0-9]{40}', source), 'SourcePin', 'qualify', "re.fullmatch('[a-f0-9]{40}', source)")
+        self.source = source
         # Coordinator must persist adoption before hosted execution.
+        # PINS is amendment A4, the applicable revision. ADOPTED_PINS is the
+        # 2026-11-20 brief digest and stays in the ADR as the historical pin.
         note = Path('docs/adr/0037-acceptance-custody.md').read_text()
-        require(PINS in note, 'MissingAdoptedPins', 'qualify', 'PINS in note')
+        require(ADOPTED_PINS in note and PINS in note, 'MissingAdoptedPins', 'qualify', 'ADOPTED_PINS in note and PINS in note')
         self.discover_and_stage(source, context)
         self.record_scratch('staged')
         self.command(['docker', 'build', '--platform', 'linux/amd64', '--network', 'none', '--target', 'custody-runtime', '--file', str(context / 'Containerfile'), '--iidfile', str(self.root / 'image.id'), str(context)], 'image', 40)
         self.image = (self.root / 'image.id').read_text().strip()
         require(re.fullmatch(r'sha256:[a-f0-9]{64}', self.image), 'ImageIdentity', 'qualify', "re.fullmatch('sha256:[a-f0-9]{64}', self.image)")
         image = json.loads(self.command(['docker', 'image', 'inspect', self.image], 'image'))[0]
-        require(image['Id'] == self.image and image['Architecture'] == 'amd64' and image['Os'] == 'linux' and image['Size'] <= 256*MIB, 'ImageIdentity', 'qualify', "image['Id'] == self.image and image['Architecture'] == 'amd64' and (image['Os'] == 'linux') and (image['Size'] <= 256 * MIB)")
+        # image['Size'] worst case and the 768 MiB cap are amendment A4 in
+        # docs/adr/0037-acceptance-custody.md.
+        require(image['Id'] == self.image and image['Architecture'] == 'amd64' and image['Os'] == 'linux' and image['Size'] <= 768*MIB, 'ImageIdentity', 'qualify', "image['Id'] == self.image and image['Architecture'] == 'amd64' and (image['Os'] == 'linux') and (image['Size'] <= 768 * MIB)")
         self.record('image', identity=self.image, bytes=image['Size'])
         self.record_scratch('image')
         self.run_nodes()
@@ -1116,8 +1146,7 @@ class Harness:
             selected = objects[choose(candidates)]
             selected.stage(context / 'arxd-tests')
             inputs = {}
-            for relative in ('tools/ci/custody/Containerfile', 'tools/ci/custody/run.py',
-                             'crates/arxd/src/cluster/pki/custody/hosted_probe.rs', '.github/workflows/ci.yml'):
+            for relative in PINNED_SOURCES:
                 with BuildInput(checkout / relative, checkout, relative, self.record, checkpoint) as obj:
                     blob = self.command(['git', 'show', source + ':' + relative], 'preflight')
                     require(hashlib.sha256(blob).hexdigest() == obj.sha, 'SourcePin', relative, 'immutable_git_blob')
@@ -1126,12 +1155,12 @@ class Harness:
                     obj.verify()
                     inputs[relative] = obj.sha
             selected.verify()
-            require(sum(p.stat().st_size for p in context.iterdir()) <= 129*MIB, 'ContextCapacity', 'discover_and_stage', 'sum((p.stat().st_size for p in context.iterdir())) <= 129 * MIB')
+            require(sum(p.stat().st_size for p in context.iterdir()) <= 257*MIB, 'ContextCapacity', 'discover_and_stage', 'sum((p.stat().st_size for p in context.iterdir())) <= 257 * MIB')
             elf = self.command(['readelf', '--program-headers', '--dynamic', '--version-info', str(context / 'arxd-tests')], 'preflight')
             require(b'/lib64/ld-linux-x86-64.so.2' in elf and b'NEEDED' in elf, 'ElfABI', 'discover_and_stage', "b'/lib64/ld-linux-x86-64.so.2' in elf and b'NEEDED' in elf")
             versions = sorted(set(v.decode('ascii') for v in re.findall(rb'GLIBC_[0-9]+\.[0-9]+', elf)))
             self.record('elf-abi', required_glibc=versions)
-            self.record('inputs', source=source, hashes=inputs, executable=selected.sha, pins=PINS)
+            self.record('inputs', source=source, hashes=inputs, executable=selected.sha, pins=PINS, adopted_pins=ADOPTED_PINS)
 
     def run_nodes(self):
         self.prepare_fixture()

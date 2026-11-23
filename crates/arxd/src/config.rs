@@ -42,29 +42,34 @@ impl std::error::Error for InvalidVmProfile {}
 
 impl VmRuntimeProfile {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        use crate::vm::paths::LocalPath;
-
         if bytes.len() > 16_384 {
             bail!("VM profile too large");
         }
         let profile: Self = serde_json::from_slice(bytes).map_err(|_| InvalidVmProfile)?;
+        profile.validate_paths()?;
+        Ok(profile)
+    }
+
+    fn validate_paths(&self) -> Result<crate::vm::paths::LocalPath> {
+        use crate::vm::paths::LocalPath;
+
         let invalid_path = |_| anyhow::anyhow!("invalid VM profile path");
-        let bundle = LocalPath::parse(&profile.bundle).map_err(invalid_path)?;
-        let volume = LocalPath::parse(&profile.volume).map_err(invalid_path)?;
-        let state = LocalPath::parse(&profile.state).map_err(invalid_path)?;
-        if !local_account_sid(&profile.owner_sid)
-            || !local_account_sid(&profile.supervisor_sid)
-            || profile.owner_sid == profile.supervisor_sid
+        let bundle = LocalPath::parse(&self.bundle).map_err(invalid_path)?;
+        let volume = LocalPath::parse(&self.volume).map_err(invalid_path)?;
+        let state = LocalPath::parse(&self.state).map_err(invalid_path)?;
+        if !local_account_sid(&self.owner_sid)
+            || !local_account_sid(&self.supervisor_sid)
+            || self.owner_sid == self.supervisor_sid
             || !volume.is_drive_root()
             || state.is_drive_root()
             || bundle.is_drive_root()
             || !volume.contains(&state)
             || volume.overlaps(&bundle)
-            || !(1..=crate::vm::VmPolicy::default().disk_cap).contains(&profile.disk_ceiling_bytes)
+            || !(1..=crate::vm::VmPolicy::default().disk_cap).contains(&self.disk_ceiling_bytes)
         {
             bail!(InvalidVmProfile);
         }
-        Ok(profile)
+        Ok(state)
     }
 
     pub fn enabled(&self) -> bool {
@@ -115,17 +120,12 @@ pub struct Agent {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        checked_path(path)?;
-        crate::security::private(path)?;
-        let mut bytes = Vec::new();
-        std::fs::File::open(path)?
-            .take(16385)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > 16384 {
-            bail!("configuration too large");
-        }
-        let mut value: Self =
-            serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid configuration"))?;
+        let value = serde_json::from_slice(&config_bytes(path)?)
+            .map_err(|_| anyhow::anyhow!("invalid configuration"))?;
+        Self::initialize(path, value)
+    }
+
+    fn initialize(path: &Path, mut value: Self) -> Result<Self> {
         value.validate()?;
         if let Some(execution) = &value.execution_settings {
             execution.disjoint(
@@ -236,6 +236,491 @@ impl Config {
         principal
     }
 }
+
+fn config_bytes(path: &Path) -> Result<Vec<u8>> {
+    checked_path(path)?;
+    crate::security::private(path)?;
+    anyhow::ensure!(path.is_file(), "configuration file required");
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(16385)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= 16384, "configuration too large");
+    Ok(bytes)
+}
+
+pub enum ForegroundConfig {
+    Inventory(Config),
+    TestVms(VmForeground),
+}
+
+pub struct VmForeground {
+    pub(crate) config: Config,
+    pub(crate) profile: TestVms,
+    /// The validated state root, held from validation through composition
+    /// and serving. `config.state_dir` is its canonical name.
+    pub(crate) root: Box<RootPin>,
+}
+
+/// The identity of the validated VM state root, bound to its canonical name.
+///
+/// Windows holds the root and every ancestor directory open without delete
+/// sharing, so no component of the name can be renamed, deleted or replaced
+/// while the pin lives; [`RootPin::verify`] then also compares volume and
+/// file ID from the handle with a fresh open of the name. Operators must stop
+/// the foreground before renaming or moving the root or any parent folder
+/// (docs/dev-host-setup.md, "Foreground VM profile: state root custody").
+///
+/// POSIX holds a non-following descriptor, which keeps the object alive but
+/// does not lock the name. Validation requires every ancestor to be
+/// non-replaceable by any other principal (owned by the effective UID or
+/// root, and not group/other writable unless sticky with the child owned by
+/// the effective UID or root), so only the same effective UID, which can
+/// already control this process, could rename a component. That is the
+/// stated POSIX trust boundary for this diagnostic-only profile. On macOS
+/// the walk also refuses any extended ACL on the root or an ancestor. `verify`
+/// compares device and inode against a fresh non-following lookup and so
+/// refuses a persistent replacement made before composition or bind.
+pub(crate) struct RootPin {
+    #[cfg(windows)]
+    _ancestors: Vec<std::fs::File>,
+    leaf: std::fs::File,
+    identity: (u64, u64),
+}
+
+impl RootPin {
+    fn acquire(root: &Path) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            let mut ancestors = Vec::new();
+            let mut prefix = PathBuf::new();
+            let mut components = root.components().peekable();
+            while let Some(part) = components.next() {
+                prefix.push(part);
+                if matches!(part, Component::Prefix(_)) {
+                    continue;
+                }
+                let handle = pin_directory(&prefix)?;
+                if components.peek().is_none() {
+                    let identity = directory_identity(&handle)?;
+                    return Ok(Self {
+                        _ancestors: ancestors,
+                        leaf: handle,
+                        identity,
+                    });
+                }
+                directory_identity(&handle)?;
+                ancestors.push(handle);
+            }
+            bail!("invalid VM state")
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            stable_ancestry(root)?;
+            let leaf = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(root)?;
+            let identity = directory_identity(&leaf)?;
+            let pin = Self { leaf, identity };
+            pin.verify(root)?;
+            Ok(pin)
+        }
+    }
+
+    /// The canonical name still denotes the pinned directory.
+    pub(crate) fn verify(&self, root: &Path) -> Result<()> {
+        #[cfg(windows)]
+        let current = directory_identity(&pin_directory(root)?)?;
+        #[cfg(unix)]
+        let current = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::symlink_metadata(root)?;
+            anyhow::ensure!(metadata.is_dir(), "VM state directory required");
+            (metadata.dev(), metadata.ino())
+        };
+        anyhow::ensure!(
+            current == self.identity && directory_identity(&self.leaf)? == self.identity,
+            "VM state root replaced"
+        );
+        Ok(())
+    }
+}
+
+/// An ordinary local directory opened without following a reparse point and
+/// without delete sharing.
+#[cfg(windows)]
+fn pin_directory(path: &Path) -> Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?)
+}
+
+#[cfg(windows)]
+fn directory_identity(file: &std::fs::File) -> Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // The handle is owned by `file` for the duration of both queries.
+    anyhow::ensure!(
+        unsafe {
+            GetFileType(file.as_raw_handle()) == FILE_TYPE_DISK
+                && GetFileInformationByHandle(file.as_raw_handle(), &mut info) != 0
+        },
+        "VM state identity unavailable"
+    );
+    anyhow::ensure!(
+        info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+            == FILE_ATTRIBUTE_DIRECTORY,
+        "ordinary VM state directory required"
+    );
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+#[cfg(unix)]
+fn directory_identity(file: &std::fs::File) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_dir(), "VM state directory required");
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// No principal other than the effective UID (or root) can rename or replace
+/// any ancestor entry of `root`: each parent is owned by the effective UID or
+/// root and is not group/other writable, unless it is sticky and the child is
+/// owned by the effective UID or root. Mode bits include the Linux ACL mask.
+/// macOS ACLs are independent of the mode and can grant another principal
+/// add-file or delete-child rights, so on macOS the root and every ancestor
+/// must also carry no extended ACL entry; an unreadable ACL is refused too.
+#[cfg(unix)]
+fn stable_ancestry(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(target_os = "macos")]
+    for path in root.ancestors() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path);
+        anyhow::ensure!(
+            directory.is_ok_and(|directory| {
+                crate::service::native::macos_empty_acl(&directory).is_ok()
+            }),
+            "extended ACL on VM state path"
+        );
+    }
+    let euid = unsafe { libc::geteuid() };
+    let trusted = |uid: u32| uid == euid || uid == 0;
+    let mut child = std::fs::symlink_metadata(root)?;
+    for parent in root.ancestors().skip(1) {
+        let metadata = std::fs::symlink_metadata(parent)?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && trusted(metadata.uid())
+                && (metadata.mode() & 0o022 == 0
+                    || (metadata.mode() & 0o1000 != 0 && trusted(child.uid()))),
+            "replaceable VM state ancestor"
+        );
+        child = metadata;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VmFile {
+    state_dir: PathBuf,
+    agents: Vec<Agent>,
+    local: crate::local::Endpoint,
+    test_vms: TestVms,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TestVms {
+    pub(crate) enabled: bool,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) runtime: Option<VmRuntimeProfile>,
+    #[serde(default, deserialize_with = "present")]
+    recipes: Option<Vec<RecipePins>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecipePins {
+    iso: RecipeAsset,
+    kernel: RecipeAsset,
+    initrd: RecipeAsset,
+    guest: RecipeAsset,
+    firmware_code: RecipeAsset,
+    firmware_vars: RecipeAsset,
+    qemu_receipt: RecipeAsset,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeAsset {
+    path: PathBuf,
+    length: u64,
+    sha256: String,
+}
+
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+impl ForegroundConfig {
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes = config_bytes(path)?;
+        let value = crate::local::check_json(&bytes)
+            .map_err(|_| anyhow::anyhow!("invalid configuration"))?;
+        if value.get("test_vms").is_none() {
+            let config = serde_json::from_value(value)
+                .map_err(|_| anyhow::anyhow!("invalid configuration"))?;
+            return Config::initialize(path, config).map(Self::Inventory);
+        }
+        crate::local::require_owner(path)?;
+        let file: VmFile = serde_json::from_value(value)
+            .map_err(|_| anyhow::anyhow!("invalid VM configuration"))?;
+        let (state_dir, root) = file.test_vms.validate(&file.state_dir, &file.local)?;
+        let config = Config {
+            state_dir,
+            agents: file.agents,
+            local: Some(file.local),
+            ..Config::default()
+        };
+        anyhow::ensure!(
+            config
+                .agents
+                .iter()
+                .all(|agent| !agent.principal.eq_ignore_ascii_case("arxd")),
+            "reserved VM principal"
+        );
+        config.validate()?;
+        root.verify(&config.state_dir)?;
+        Ok(Self::TestVms(VmForeground {
+            config,
+            profile: file.test_vms,
+            root: Box::new(root),
+        }))
+    }
+}
+
+impl TestVms {
+    /// Returns the canonical exclusive root that composition must open and
+    /// its pin; the raw configured string is never reopened after
+    /// validation. The pin is taken before the path-based owner, privacy and
+    /// overlap checks, so on Windows they inspect the pinned objects.
+    fn validate(&self, root: &Path, local: &crate::local::Endpoint) -> Result<(PathBuf, RootPin)> {
+        use crate::vm::paths::LocalPath;
+
+        let layout = crate::service::layout::Layout::system()?;
+        let reserved = layout.endpoint().to_string_lossy();
+        anyhow::ensure!(
+            if cfg!(windows) {
+                !reserved.eq_ignore_ascii_case(&local.address)
+            } else {
+                layout.endpoint() != Path::new(&local.address)
+            },
+            "reserved local endpoint"
+        );
+        let root = vm_path(root)?;
+        let pin = RootPin::acquire(&root)?;
+        anyhow::ensure!(root.is_dir(), "VM state directory required");
+        crate::security::private(&root)?;
+        crate::local::require_owner(&root)?;
+        anyhow::ensure!(
+            layout.workspace_disjoint(
+                root.to_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid VM state"))?
+            ),
+            "protected VM state overlap"
+        );
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let executable_dir = executable
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("executable root missing"))?;
+        anyhow::ensure!(
+            !overlaps(&root, executable_dir),
+            "executable VM state overlap"
+        );
+        #[cfg(unix)]
+        anyhow::ensure!(
+            !overlaps(&root, Path::new(&local.address)),
+            "socket inside VM state"
+        );
+        let actual = crate::local::vm_supervisor_identity()?;
+        // Windows serves a distinct local account through the pipe DACL.
+        // POSIX is diagnostic-only: its socket and parent are private to the
+        // supervisor UID, so that UID is the only client that can connect.
+        #[cfg(windows)]
+        {
+            anyhow::ensure!(
+                local.client_identity != actual,
+                "VM client and supervisor must differ"
+            );
+            anyhow::ensure!(
+                local_account_sid(&local.client_identity),
+                "invalid VM client identity"
+            );
+        }
+        #[cfg(unix)]
+        anyhow::ensure!(
+            local.client_identity == actual,
+            "VM client must be the supervisor"
+        );
+
+        if let Some(runtime) = &self.runtime {
+            anyhow::ensure!(
+                cfg!(all(windows, target_arch = "x86_64")),
+                "native VM platform required"
+            );
+            let state = runtime.validate_paths()?;
+            let configured = LocalPath::parse(root.to_str().unwrap_or_default())
+                .map_err(|_| anyhow::anyhow!("invalid VM state"))?;
+            anyhow::ensure!(
+                runtime.enabled == self.enabled
+                    && runtime.supervisor_sid == actual
+                    && local.client_identity != runtime.owner_sid
+                    && state.as_str().eq_ignore_ascii_case(configured.as_str()),
+                "invalid VM identity or state pairing"
+            );
+        }
+        if let Some(recipes) = &self.recipes {
+            anyhow::ensure!(recipes.len() <= 1, "unsupported VM recipe count");
+            for recipe in recipes {
+                recipe.digest(&root)?;
+            }
+        }
+        pin.verify(&root)?;
+        Ok((root, pin))
+    }
+
+    pub(crate) fn recipe(&self) -> Result<Option<([u8; 16], [u8; 32])>> {
+        self.recipes
+            .as_ref()
+            .and_then(|recipes| recipes.first())
+            .map(|recipe| {
+                let digest = recipe.pins()?;
+                Ok((digest[..16].try_into()?, digest))
+            })
+            .transpose()
+    }
+
+    pub(crate) fn policy(&self) -> crate::vm::VmPolicy {
+        let mut policy = crate::vm::VmPolicy::default();
+        if let Some(runtime) = &self.runtime {
+            policy.disk_cap = runtime.disk_ceiling_bytes;
+        }
+        policy
+    }
+}
+
+impl RecipePins {
+    fn assets(&self) -> [&RecipeAsset; 7] {
+        [
+            &self.iso,
+            &self.kernel,
+            &self.initrd,
+            &self.guest,
+            &self.firmware_code,
+            &self.firmware_vars,
+            &self.qemu_receipt,
+        ]
+    }
+
+    fn pins(&self) -> Result<[u8; 32]> {
+        let mut hash = Sha256::new();
+        hash.update(b"arxcovo.recipe\0");
+        hash.update(crate::vm::UbuntuRecipe::ID.as_bytes());
+        for asset in self.assets() {
+            let mut digest = [0; 32];
+            hex::decode_to_slice(&asset.sha256, &mut digest)?;
+            anyhow::ensure!(asset.length > 0, "invalid VM asset length");
+            hash.update(asset.length.to_be_bytes());
+            hash.update(digest);
+        }
+        Ok(hash.finalize().into())
+    }
+
+    fn digest(&self, root: &Path) -> Result<()> {
+        self.pins()?;
+        for asset in self.assets() {
+            let path = vm_path(&asset.path)?;
+            anyhow::ensure!(
+                path.is_file() && !overlaps(root, &path),
+                "invalid VM asset path"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn vm_path(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid VM path"))?;
+    #[cfg(windows)]
+    crate::vm::paths::LocalPath::parse(name).map_err(|_| anyhow::anyhow!("invalid VM path"))?;
+    #[cfg(unix)]
+    anyhow::ensure!(
+        name.starts_with('/')
+            && name[1..]
+                .split('/')
+                .all(|part| !matches!(part, "" | "." | "..")),
+        "invalid VM path"
+    );
+    checked_path(path)?;
+    let canonical = path.canonicalize()?;
+    #[cfg(windows)]
+    let canonical = PathBuf::from(
+        canonical
+            .to_str()
+            .and_then(|path| path.strip_prefix(r"\\?\"))
+            .ok_or_else(|| anyhow::anyhow!("invalid canonical VM path"))?,
+    );
+    anyhow::ensure!(
+        if cfg!(windows) {
+            name.replace('/', "\\")
+                .eq_ignore_ascii_case(&canonical.to_string_lossy())
+        } else {
+            path.as_os_str() == canonical.as_os_str()
+        },
+        "aliased VM path"
+    );
+    Ok(canonical)
+}
+
+fn overlaps(first: &Path, second: &Path) -> bool {
+    let normalize = |path: &Path| {
+        let value = path.to_string_lossy().replace('\\', "/");
+        let value = value.strip_prefix("//?/").unwrap_or(&value);
+        if cfg!(any(windows, target_os = "macos")) {
+            value.to_lowercase()
+        } else {
+            value.to_owned()
+        }
+    };
+    let first = normalize(first);
+    let second = normalize(second);
+    Path::new(&first).starts_with(&second) || Path::new(&second).starts_with(&first)
+}
+
 pub fn checked_path(path: &Path) -> Result<()> {
     if !path.is_absolute()
         || !path.components().any(|c| matches!(c, Component::RootDir))
