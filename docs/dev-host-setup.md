@@ -51,9 +51,10 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    selector, edition, architecture, build and language against the entitled
    media. The owner also supplies the official Ubuntu 24.04.3 live-server
    amd64 ISO, the prepared capped-volume identity and provisioning evidence,
-   a separate small disposable fixed-size NTFS trial volume on D: backing and
-   its identity and provisioning evidence, the driver qualification receipt
-   and controlled witness enrollment. Use step 3 if the trial volume is absent.
+   a separate small disposable fixed-size NTFS trial volume backed by a file
+   on D: with its identity and provisioning evidence, the driver qualification
+   receipt and controlled witness enrollment. Use step 3 if the trial volume
+   is unavailable.
    Validate the Windows answer file in Windows SIM against the exact image.
    Pin sizes and hashes, the viostor, vioserial and NetKVM INF/CAT/SYS files,
    catalog signer and offline trust decision, PCI IDs and port ABI. Extract
@@ -82,15 +83,16 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
 
 3. **Resolve prerequisites identified by read-only preflight.** Collect all
    necessary elevated commands (WHPX, cap correction and trial-volume setup,
-   including its deferred rollback) in **one reviewed owner request**. Record
-   the exact commands in the local evidence and separate docs-only
-   [PROGRESS](PROGRESS.md) batch, and ask the owner once to run the applicable
-   setup commands from elevated PowerShell. If cap correction needs elevation,
-   derive and review its exact command from verified unused target geometry
-   before including it in the batch. Keep private target identity data local.
+   including reattachment after a reboot and deferred rollback) in **one
+   reviewed owner request**. Record the exact commands in the local evidence
+   and separate docs-only [PROGRESS](PROGRESS.md) batch. Ask the owner once to
+   run the applicable setup commands from elevated PowerShell. If cap
+   correction needs elevation, derive and review its exact command from
+   verified unused target geometry before including it in the batch. Keep
+   private target identity data local.
    If the Medium-token check shows WHPX is missing and review confirms the
    remedy, include the DISM line below. Use the D: environment assignments
-   for every block in the batch. The owner handles any required reboot.
+   for every block in the batch.
 
    ```powershell
    $env:TMP = 'D:/Temp/arx-m4-activation/tmp'
@@ -101,8 +103,11 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    dism.exe /Online /Enable-Feature /FeatureName:HypervisorPlatform /All /NoRestart
    ```
 
-   If the trial volume is missing, use the following DiskPart command for a
-   new 1 GiB fixed VHDX on D:. A verified unused `T:` provides the real volume
+   The DiskPart attachment does not survive a reboot. The owner completes
+   any required reboot before setting up the trial volume. After reboot,
+   recheck WHPX from the Medium console and confirm the setup preconditions.
+   Create a new 1 GiB fixed VHDX on D: only if the trial volume and backing
+   file are both absent. A verified unused `T:` provides the real volume
    root required by ADR 0054. Before review and again before running, verify
    that the exact backing file and script paths are unused, their parent
    directories are owned and free of reparse points, and D: will retain the
@@ -125,10 +130,30 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    if ($LASTEXITCODE -ne 0) { throw 'Trial volume provisioning failed' }
    ```
 
+   If the host reboots during qualification, keep trial writes closed. Use
+   the reattachment block from the same owner request only after verifying
+   that the existing VHDX matches the recorded file identity and size at the
+   checked path, the read-only `Get-DiskImage` query from step 7 reports it
+   detached, and `T:` is unused. Verify the task-owned temporary directory
+   before running the block. [DiskPart attachment](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/attach-vdisk)
+
+   ```powershell
+   $trialAttachScript = New-TemporaryFile -ErrorAction Stop
+   @'
+   select vdisk file=D:\ArxcovoData\qualify\trial.vhdx
+   attach vdisk
+   '@ | Set-Content -LiteralPath $trialAttachScript.FullName -Encoding ascii -ErrorAction Stop
+   diskpart.exe /s $trialAttachScript.FullName
+   if ($LASTEXITCODE -ne 0) { throw 'Trial volume reattachment failed' }
+   ```
+
    Repeat preflight from the Medium console after any setup. Recheck WHPX,
-   physical capacity and the free-space floor. Verify and pin the trial
-   volume and backing identity, full allocation, and NTFS geometry before
-   allowing writes. If the QEMU package is missing, install
+   physical capacity and the free-space floor. Before allowing trial writes,
+   verify the backing file identity, size and full allocation, and prove
+   that the mounted `T:` root is the trial volume with the pinned identity
+   and NTFS geometry. After reattachment, compare these checks with the
+   original evidence. If `T:` is absent or any check fails, stop and retain
+   the file. If the QEMU package is missing, install
    only the exact reviewed portable payload under the owned package root and
    rerun the receipt, manifest and payload checks. The scoped prerequisite
    exception covers WHPX, the reviewed QEMU package and the disk cap and
@@ -233,17 +258,28 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    After the trial or during rollback, the owner runs the deferred command
    from the step 3 batch only for the VHDX created by that batch. First prove
    all trial handles are released, the backing file matches the recorded
-   identity under the same checked path, and the detach script path is fresh
-   under the task-owned scratch root. If release, identity or detach is
-   uncertain, retain the file and its charge.
+   identity under the same checked path. If detaching, verify the script path
+   is fresh under the task-owned scratch root. Query the exact image path and
+   skip detach only when it reports `Attached = False`. A reboot or missing drive
+   letter alone is insufficient. If release, identity, attachment state or
+   detach is uncertain, retain the file and its charge.
+   [Get-DiskImage](https://learn.microsoft.com/en-us/powershell/module/storage/get-diskimage?view=windowsserver2025-ps)
 
    ```powershell
+   $trialImage = @(Get-DiskImage -ImagePath 'D:\ArxcovoData\qualify\trial.vhdx' -ErrorAction Stop)
+   if ($trialImage.Count -ne 1 -or
+       $trialImage[0].ImagePath -ne 'D:\ArxcovoData\qualify\trial.vhdx' -or
+       $trialImage[0].Attached -isnot [bool]) {
+       throw 'Trial volume attachment state is uncertain'
+   }
+   if ($trialImage[0].Attached) {
    @'
    select vdisk file=D:\ArxcovoData\qualify\trial.vhdx
    detach vdisk
    '@ | Set-Content -LiteralPath 'D:\Temp\arx-m4-activation\trial-detach.txt' -Encoding ascii -ErrorAction Stop
-   diskpart.exe /s 'D:\Temp\arx-m4-activation\trial-detach.txt'
-   if ($LASTEXITCODE -ne 0) { throw 'Trial volume detach failed' }
+       diskpart.exe /s 'D:\Temp\arx-m4-activation\trial-detach.txt'
+       if ($LASTEXITCODE -ne 0) { throw 'Trial volume detach failed' }
+   }
    Remove-Item -LiteralPath 'D:\ArxcovoData\qualify\trial.vhdx' -ErrorAction Stop
    ```
 
