@@ -24,7 +24,8 @@ use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows_sys::Win32::System::Pipes::*;
 use windows_sys::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, REG_DWORD, RRF_NOEXPAND, RRF_RT_ANY, RRF_RT_REG_DWORD, RegGetValueW,
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_DWORD, RRF_NOEXPAND, RRF_RT_ANY, RRF_RT_REG_DWORD,
+    RegGetValueW,
 };
 use windows_sys::Win32::System::Services::*;
 use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
@@ -546,10 +547,37 @@ enum TransferError {
     Undrained,
 }
 
-struct PendingIo {
-    event: OwnedHandle,
-    overlapped: OVERLAPPED,
-    bytes: Vec<u8>,
+/// The two allocations Windows may write while an operation is in flight. They
+/// are held only as raw pointers from `Box::into_raw`. No `&` or `&mut` to them
+/// exists between submission and confirmed completion.
+struct InFlight {
+    overlapped: *mut OVERLAPPED,
+    buffer: *mut [u8],
+}
+
+impl InFlight {
+    fn new(event: HANDLE, bytes: Vec<u8>) -> Self {
+        Self {
+            overlapped: Box::into_raw(Box::new(OVERLAPPED {
+                hEvent: event,
+                ..Default::default()
+            })),
+            buffer: Box::into_raw(bytes.into_boxed_slice()),
+        }
+    }
+
+    /// Takes back both allocations.
+    ///
+    /// # Safety
+    /// The operation never started, or its completion has been observed through
+    /// the private event, so the kernel no longer references either allocation.
+    unsafe fn reclaim(self) -> Vec<u8> {
+        // SAFETY: both pointers came from Box::into_raw and are reclaimed exactly once.
+        unsafe {
+            drop(Box::from_raw(self.overlapped));
+            Box::from_raw(self.buffer).into_vec()
+        }
+    }
 }
 
 /// Starts one overlapped operation and waits for it. `None` waits without a
@@ -570,56 +598,63 @@ fn transfer(
         return Err(TransferError::Deadline);
     }
     let event = event().map_err(TransferError::Os)?;
-    let mut io = Box::new(PendingIo {
-        overlapped: OVERLAPPED {
-            hEvent: event.as_raw_handle(),
-            ..Default::default()
-        },
-        event,
-        bytes,
-    });
+    let io = InFlight::new(event.as_raw_handle(), bytes);
+    let capacity = io.buffer.len();
     let device = device.as_raw_handle();
     if start(
         device,
-        io.bytes.as_mut_ptr(),
-        io.bytes.len() as u32,
-        &mut io.overlapped,
+        io.buffer.cast::<u8>(),
+        capacity as u32,
+        io.overlapped,
     ) == 0
     {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+            // SAFETY: the operation did not start, so nothing references the allocations.
+            drop(unsafe { io.reclaim() });
             return Err(TransferError::Os(error));
         }
-        let wait = wait_until(io.event.as_raw_handle(), cancel, deadline);
+        let wait = wait_until(event.as_raw_handle(), cancel, deadline);
         if !matches!(wait, Ok(Wait::Ready)) {
-            // SAFETY: only cancel this operation. A normal completion can race cancellation.
-            unsafe { CancelIoEx(device, &io.overlapped) };
-            if !signaled(io.event.as_raw_handle(), CLEANUP_BUDGET.as_millis() as u32)
-                .unwrap_or(false)
+            // SAFETY: the raw pointer used at submission names only this
+            // operation. A normal completion can race the cancellation.
+            unsafe { CancelIoEx(device, io.overlapped) };
+            if !signaled(event.as_raw_handle(), CLEANUP_BUDGET.as_millis() as u32).unwrap_or(false)
             {
-                // The kernel may still reference all three allocations. The service
-                // exits on Undrained; retain them until the OS destroys the process.
-                Box::leak(io);
+                // The kernel may still write both allocations and signal the
+                // event. Relinquish all three without forming a reference:
+                // `InFlight` has no Drop, so returning leaks its allocations. The
+                // service exits on Undrained and the OS reclaims them.
+                std::mem::forget(event);
                 return Err(TransferError::Undrained);
             }
         }
-        // The private event signaled, so the kernel no longer owns the buffers.
         match wait {
             Ok(Wait::Ready) => {}
-            Ok(Wait::Cancelled) => return Err(TransferError::Cancelled),
-            Ok(Wait::Deadline) => return Err(TransferError::Deadline),
-            Err(error) => return Err(TransferError::Os(error)),
+            other => {
+                // SAFETY: the private event signaled after CancelIoEx: completed.
+                drop(unsafe { io.reclaim() });
+                return Err(match other {
+                    Ok(Wait::Cancelled) => TransferError::Cancelled,
+                    Ok(Wait::Deadline) => TransferError::Deadline,
+                    Err(error) => TransferError::Os(error),
+                    Ok(Wait::Ready) => unreachable!(),
+                });
+            }
         }
     }
     let mut count = 0;
-    // SAFETY: the operation completed synchronously or its private event signaled.
-    succeeded(unsafe { GetOverlappedResult(device, &io.overlapped, &mut count, 0) })
-        .map_err(TransferError::Os)?;
-    if count as usize > io.bytes.len() {
+    // SAFETY: the operation completed synchronously or its private event
+    // signaled; the raw OVERLAPPED pointer is still the submitted one.
+    let result = succeeded(unsafe { GetOverlappedResult(device, io.overlapped, &mut count, 0) });
+    // SAFETY: completion was observed above, so the kernel is done with both.
+    let mut bytes = unsafe { io.reclaim() };
+    result.map_err(TransferError::Os)?;
+    if count as usize > bytes.len() {
         return Err(TransferError::Os(io::ErrorKind::InvalidData.into()));
     }
-    io.bytes.truncate(count as usize);
-    Ok(io.bytes)
+    bytes.truncate(count as usize);
+    Ok(bytes)
 }
 
 struct Port<'a> {
@@ -763,9 +798,14 @@ const JOB_FLAGS: u32 = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
     | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
     | JOB_OBJECT_LIMIT_PROCESS_MEMORY
     | JOB_OBJECT_LIMIT_JOB_MEMORY;
+// The wrapper uses no cmdlets, so it never triggers module discovery. Windows
+// PowerShell 5.1 appends Program Files and Documents to any inherited
+// PSModulePath. Resetting it here keeps the caller's command discovery
+// system-only ($PSHOME\Modules).
 const WRAPPER: &str = "$ErrorActionPreference='Stop'; try { \
+    $env:PSModulePath=[IO.Path]::Combine($PSHOME,'Modules'); \
     $inputStream=[Console]::OpenStandardInput(); \
-    $bytes=New-Object byte[] 4097; $length=0; \
+    $bytes=[byte[]]::new(4097); $length=0; \
     while ($length -lt $bytes.Length) { \
         $read=$inputStream.Read($bytes,$length,$bytes.Length-$length); \
         if ($read -eq 0) { break }; $length+=$read \
@@ -1657,9 +1697,19 @@ impl CommandLine {
             shell.display()
         ));
         must(!command[..command.len() - 1].contains(&0))?;
+        // Fixed values only, sorted case-insensitively. Every per-user location
+        // (profile, application data and the module analysis cache) points into
+        // the private Low-labelled request directory, so a fresh or unwritable
+        // account profile is never touched and everything is removed afterwards.
         let mut env = Vec::new();
         for entry in [
+            format!(r"APPDATA={}\AppData\Roaming", work.display()),
+            format!(r"LOCALAPPDATA={}\AppData\Local", work.display()),
             format!("PATH={}", system.display()),
+            format!(
+                r"PSModuleAnalysisCachePath={}\ModuleAnalysisCache",
+                work.display()
+            ),
             format!(
                 r"PSModulePath={}\WindowsPowerShell\v1.0\Modules",
                 system.display()
@@ -1667,6 +1717,7 @@ impl CommandLine {
             format!("SystemRoot={}", windows.display()),
             format!("TEMP={}", work.display()),
             format!("TMP={}", work.display()),
+            format!("USERPROFILE={}", work.display()),
             format!("windir={}", windows.display()),
         ] {
             env.extend(wide(&entry));
@@ -2407,14 +2458,8 @@ fn run_profile(
     script: Vec<u8>,
     deadline: Instant,
 ) -> Result<ScriptOutcome, &'static str> {
-    let launcher = &profile.launcher;
-    let Ok(workspace) = Workspace::create(launcher) else {
-        return Ok(ScriptOutcome::LaunchFailed);
-    };
-    let Ok(command) =
-        CommandLine::powershell(&launcher.windows, &launcher.system, workspace.path())
+    let Some((workspace, command)) = prepare_workspace(profile, stop, deadline, Workspace::create)?
     else {
-        workspace.remove().map_err(|_| WORKSPACE_UNKNOWN)?;
         return Ok(ScriptOutcome::LaunchFailed);
     };
     let worker_profile = Arc::clone(profile);
@@ -2431,18 +2476,108 @@ fn run_profile(
             |child| profile.verify_child(child),
         )
     })?;
-    workspace.remove().map_err(|_| WORKSPACE_UNKNOWN)?;
+    // Removal gets its own cleanup allowance, never beyond the request's
+    // overall cleanup bound. The host allows the budget plus 5 s.
+    let removal_by = (Instant::now() + CLEANUP_BUDGET).min(deadline + 2 * CLEANUP_BUDGET);
+    remove_workspace(stop, workspace, removal_by, Workspace::remove)?;
     Ok(outcome)
 }
 
+enum Bounded<T> {
+    Done(T),
+    Unstarted,
+    Missed,
+}
+
+/// Runs one filesystem step on a worker that holds no port handle and no
+/// child. Waits until `by`; after cancellation, at most `cancel_grace` more. A
+/// missed step keeps running detached, and the caller retires the session, so
+/// nothing waits on it or uses its result.
+fn bounded<T: Send + 'static>(
+    stop: &OwnedHandle,
+    by: Instant,
+    cancel_grace: Duration,
+    step: impl FnOnce() -> T + Send + 'static,
+) -> Bounded<T> {
+    let Ok(worker) = thread::Builder::new().spawn(step) else {
+        return Bounded::Unstarted;
+    };
+    let finished = match wait_for(worker.as_raw_handle(), stop, by) {
+        Ok(Wait::Ready) => true,
+        Ok(Wait::Cancelled) => signaled(
+            worker.as_raw_handle(),
+            millis_left(Instant::now() + cancel_grace),
+        )
+        .unwrap_or(false),
+        Ok(Wait::Deadline) | Err(_) => false,
+    };
+    if !finished {
+        return Bounded::Missed;
+    }
+    join_ready(worker).map_or(Bounded::Missed, Bounded::Done)
+}
+
+enum Setup {
+    Ready(Workspace, CommandLine),
+    Failed,
+    /// Created, then could not be removed after the command failed.
+    Leaked,
+}
+
+/// Creates the request directory and command inside the request budget. A
+/// stalled setup retires the session; no child can exist yet.
+fn prepare_workspace(
+    profile: &Arc<Profile>,
+    stop: &OwnedHandle,
+    by: Instant,
+    create: impl FnOnce(&Launcher) -> io::Result<Workspace> + Send + 'static,
+) -> Result<Option<(Workspace, CommandLine)>, &'static str> {
+    let worker_profile = Arc::clone(profile);
+    let step = move || {
+        let launcher = &worker_profile.launcher;
+        let Ok(workspace) = create(launcher) else {
+            return Setup::Failed;
+        };
+        let Ok(command) =
+            CommandLine::powershell(&launcher.windows, &launcher.system, workspace.path())
+        else {
+            return if workspace.remove().is_ok() {
+                Setup::Failed
+            } else {
+                Setup::Leaked
+            };
+        };
+        Setup::Ready(workspace, command)
+    };
+    match bounded(stop, by, CLEANUP_BUDGET, step) {
+        Bounded::Done(Setup::Ready(workspace, command)) => Ok(Some((workspace, command))),
+        Bounded::Done(Setup::Failed) | Bounded::Unstarted => Ok(None),
+        Bounded::Done(Setup::Leaked) | Bounded::Missed => Err(WORKSPACE_UNKNOWN),
+    }
+}
+
+/// Removes the request directory by `by`, or retires the session.
+fn remove_workspace(
+    stop: &OwnedHandle,
+    workspace: Workspace,
+    by: Instant,
+    remove: impl FnOnce(Workspace) -> io::Result<()> + Send + 'static,
+) -> Result<(), &'static str> {
+    let grace = by.saturating_duration_since(Instant::now());
+    match bounded(stop, by, grace, move || remove(workspace)) {
+        Bounded::Done(Ok(())) => Ok(()),
+        _ => Err(WORKSPACE_UNKNOWN),
+    }
+}
+
 /// Fixed start-up probe. It proves the production identity can start the CLR
-/// in full language mode under no machine or user policy, and can write its
-/// request directory, which the cleanup must then remove.
+/// in full language mode with system-only module discovery, and can write its
+/// request directory, which the cleanup must then remove. It uses no cmdlets,
+/// so it needs no module discovery. Machine and user execution policies are
+/// the registry values `read_policy` already requires to be absent.
 const SELF_TEST: &str = "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { exit 3 }\n\
-    if ((Get-ExecutionPolicy -Scope MachinePolicy) -ne 'Undefined') { exit 4 }\n\
-    if ((Get-ExecutionPolicy -Scope UserPolicy) -ne 'Undefined') { exit 5 }\n\
-    if ((Get-ExecutionPolicy) -ne 'Bypass') { exit 6 }\n\
-    [IO.File]::WriteAllText((Join-Path $env:TEMP 'self-test'), 'arx')\n\
+    if ($env:PSModulePath -ne [IO.Path]::Combine($PSHOME, 'Modules')) { exit 4 }\n\
+    [IO.File]::WriteAllText([IO.Path]::Combine($env:TEMP, 'self-test'), 'arx')\n\
     exit 23131";
 const SELF_TEST_SENTINEL: u32 = 23131;
 
@@ -2475,68 +2610,148 @@ enum PolicyValue {
     Unreadable,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PolicyRule {
     /// Any configured value overrides `-ExecutionPolicy Bypass` or the language mode.
-    MustBeAbsent,
+    Unset,
     /// Logging that could copy payloads must be absent or explicitly zero.
-    MustBeOff,
+    OffOrUnset,
+    /// Must be present and zero. Windows PowerShell logs "suspicious" script
+    /// blocks, including caller text, whenever script block logging is not
+    /// configured. Only an explicit `EnableScriptBlockLogging = 0` turns that off.
+    ExplicitlyOff,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hive {
+    /// Machine policy. It takes precedence for PowerShell's group policy lookup.
+    Machine,
+    /// The service account's own user policy, which scripts inherit (same user).
+    User,
 }
 
 const POWERSHELL_POLICY: &str = r"SOFTWARE\Policies\Microsoft\Windows\PowerShell";
-const POLICY_VALUES: [(&str, &str, PolicyRule); 6] = [
+const SCRIPT_BLOCK_POLICY: &str =
+    r"SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging";
+const MODULE_LOGGING_POLICY: &str = r"SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging";
+const TRANSCRIPTION_POLICY: &str = r"SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription";
+const POLICY_VALUES: [(Hive, &str, &str, PolicyRule); 13] = [
     (
+        Hive::Machine,
         POWERSHELL_POLICY,
         "ExecutionPolicy",
-        PolicyRule::MustBeAbsent,
-    ),
-    (POWERSHELL_POLICY, "EnableScripts", PolicyRule::MustBeAbsent),
-    (
-        r"SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription",
-        "EnableTranscripting",
-        PolicyRule::MustBeOff,
+        PolicyRule::Unset,
     ),
     (
-        r"SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging",
+        Hive::Machine,
+        POWERSHELL_POLICY,
+        "EnableScripts",
+        PolicyRule::Unset,
+    ),
+    (
+        Hive::User,
+        POWERSHELL_POLICY,
+        "ExecutionPolicy",
+        PolicyRule::Unset,
+    ),
+    (
+        Hive::User,
+        POWERSHELL_POLICY,
+        "EnableScripts",
+        PolicyRule::Unset,
+    ),
+    (
+        Hive::Machine,
+        SCRIPT_BLOCK_POLICY,
         "EnableScriptBlockLogging",
-        PolicyRule::MustBeOff,
+        PolicyRule::ExplicitlyOff,
     ),
     (
-        r"SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging",
+        Hive::User,
+        SCRIPT_BLOCK_POLICY,
+        "EnableScriptBlockLogging",
+        PolicyRule::OffOrUnset,
+    ),
+    (
+        Hive::Machine,
+        SCRIPT_BLOCK_POLICY,
+        "EnableScriptBlockInvocationLogging",
+        PolicyRule::OffOrUnset,
+    ),
+    (
+        Hive::User,
+        SCRIPT_BLOCK_POLICY,
+        "EnableScriptBlockInvocationLogging",
+        PolicyRule::OffOrUnset,
+    ),
+    (
+        Hive::Machine,
+        MODULE_LOGGING_POLICY,
         "EnableModuleLogging",
-        PolicyRule::MustBeOff,
+        PolicyRule::OffOrUnset,
     ),
     (
+        Hive::User,
+        MODULE_LOGGING_POLICY,
+        "EnableModuleLogging",
+        PolicyRule::OffOrUnset,
+    ),
+    (
+        Hive::Machine,
+        TRANSCRIPTION_POLICY,
+        "EnableTranscripting",
+        PolicyRule::OffOrUnset,
+    ),
+    (
+        Hive::User,
+        TRANSCRIPTION_POLICY,
+        "EnableTranscripting",
+        PolicyRule::OffOrUnset,
+    ),
+    (
+        Hive::Machine,
         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
         "__PSLockdownPolicy",
-        PolicyRule::MustBeAbsent,
+        PolicyRule::Unset,
     ),
 ];
+
+fn rule_allows(rule: PolicyRule, value: PolicyValue) -> bool {
+    matches!(
+        (rule, value),
+        (
+            PolicyRule::Unset | PolicyRule::OffOrUnset,
+            PolicyValue::Absent
+        ) | (
+            PolicyRule::OffOrUnset | PolicyRule::ExplicitlyOff,
+            PolicyValue::Dword(0)
+        )
+    )
+}
 
 fn policy_conflict(snapshot: &[PolicyValue; POLICY_VALUES.len()]) -> bool {
     POLICY_VALUES
         .iter()
         .zip(snapshot)
-        .any(|((_, _, rule), value)| {
-            !matches!(
-                (rule, value),
-                (_, PolicyValue::Absent) | (PolicyRule::MustBeOff, PolicyValue::Dword(0))
-            )
-        })
+        .any(|((_, _, _, rule), value)| !rule_allows(*rule, *value))
 }
 
 fn read_policy() -> [PolicyValue; POLICY_VALUES.len()] {
-    POLICY_VALUES.map(|(key, value, _)| read_policy_value(key, value))
+    POLICY_VALUES.map(|(hive, key, value, _)| read_policy_value(hive, key, value))
 }
 
-fn read_policy_value(key: &str, value: &str) -> PolicyValue {
+fn read_policy_value(hive: Hive, key: &str, value: &str) -> PolicyValue {
+    let root = match hive {
+        Hive::Machine => HKEY_LOCAL_MACHINE,
+        Hive::User => HKEY_CURRENT_USER,
+    };
     let (key, value) = (wide(key), wide(value));
     let mut kind = 0;
     let mut size = 0;
-    // SAFETY: fixed terminated HKLM subkey and value names; size query only.
+    // SAFETY: fixed terminated subkey and value names; size query only.
     let found = unsafe {
         RegGetValueW(
-            HKEY_LOCAL_MACHINE,
+            root,
             key.as_ptr(),
             value.as_ptr(),
             RRF_RT_ANY | RRF_NOEXPAND,
@@ -2556,7 +2771,7 @@ fn read_policy_value(key: &str, value: &str) -> PolicyValue {
     // SAFETY: DWORD-typed read into initialized DWORD storage of the stated size.
     let read = unsafe {
         RegGetValueW(
-            HKEY_LOCAL_MACHINE,
+            root,
             key.as_ptr(),
             value.as_ptr(),
             RRF_RT_REG_DWORD,
@@ -2659,7 +2874,7 @@ mod tests {
         // An otherwise valid production-shaped profile under a conflicting
         // machine policy is never advertised or used.
         let root = TestRoot::new("policy");
-        let mut policy = [PolicyValue::Absent; POLICY_VALUES.len()];
+        let mut policy = clean_policy();
         policy[0] = PolicyValue::Other;
         let profile = admit(test_profile(&root.0), &policy, |_| {
             Ok(ScriptOutcome::Exited {
@@ -2795,12 +3010,15 @@ mod tests {
             let (_reader, writer) = stdin_pipe(1, &current_user_sid()).unwrap();
             let stop = event().unwrap();
             // The unconsumed pipe cannot admit a single write of this size.
-            // Inject expiry/cancel only once WriteFile has returned IO_PENDING.
+            // Expiry or cancellation is injected only after WriteFile has
+            // returned IO_PENDING, and the test asserts that it did. A preflight
+            // Deadline without started I/O cannot pass.
             let deadline = if cancel {
                 Instant::now() + GUARD
             } else {
-                Instant::now() + Duration::from_millis(100)
+                Instant::now() + Duration::from_millis(250)
             };
+            let started = Cell::new(false);
             let result = transfer(
                 &writer,
                 &stop,
@@ -2811,13 +3029,20 @@ mod tests {
                     let pending = unsafe { WriteFile(h, buf, len, null_mut(), ov) };
                     assert_eq!(pending, 0);
                     assert_eq!(unsafe { GetLastError() }, ERROR_IO_PENDING);
+                    started.set(true);
                     if cancel {
                         signal(&stop);
-                        unsafe { SetLastError(ERROR_IO_PENDING) };
+                    } else {
+                        // Let the deadline pass while the write is pending.
+                        while Instant::now() < deadline {
+                            thread::sleep(Duration::from_millis(5));
+                        }
                     }
+                    unsafe { SetLastError(ERROR_IO_PENDING) };
                     pending
                 },
             );
+            assert!(started.get(), "overlapped I/O started before expiry");
             if cancel {
                 assert!(
                     matches!(result, Err(TransferError::Cancelled)),
@@ -2900,13 +3125,52 @@ mod tests {
         }
     }
 
+    /// PowerShell start-up gets more room than native fixtures: a cold hosted
+    /// image can be slow. Only a failure ever waits this long.
+    const POWERSHELL_GUARD: Duration = Duration::from_secs(30);
+
+    /// On an unexpected PowerShell outcome, the CLR's FailFast leaves no stderr
+    /// output, only an Application event (.NET Runtime 1025, or Application
+    /// Error 1000) with the exception and stack. Print the latest ones so a
+    /// hosted failure explains itself.
+    fn recent_runtime_events() -> String {
+        let query = "*[System[(Provider[@Name='.NET Runtime'] or Provider[@Name='Application Error']) \
+                     and TimeCreated[timediff(@SystemTime) <= 300000]]]";
+        match std::process::Command::new("wevtutil.exe")
+            .args([
+                "qe",
+                "Application",
+                &format!("/q:{query}"),
+                "/c:4",
+                "/rd:true",
+                "/f:text",
+            ])
+            .output()
+        {
+            Ok(output) => String::from_utf8_lossy(&output.stdout)
+                .chars()
+                .take(6000)
+                .collect(),
+            Err(error) => format!("wevtutil unavailable: {error}"),
+        }
+    }
+
+    fn assert_powershell(outcome: Result<ScriptOutcome, &'static str>, expected: ScriptOutcome) {
+        assert!(
+            outcome == Ok(expected),
+            "PowerShell returned {outcome:?}, expected {expected:?}\nrecent runtime events:\n{}",
+            recent_runtime_events()
+        );
+    }
+
     fn powershell(script: &[u8], expected: u32) {
+        let root = TestRoot::new("wrapper");
         let (windows, system) = system_paths().unwrap();
-        let command = CommandLine::powershell(&windows, &system, &system).unwrap();
+        let command = CommandLine::powershell(&windows, &system, &root.0).unwrap();
         let stop = Arc::new(event().unwrap());
         let worker_stop = Arc::clone(&stop);
         let script = script.to_vec();
-        let deadline = Instant::now() + GUARD;
+        let deadline = Instant::now() + POWERSHELL_GUARD;
         let outcome = supervise(&stop, deadline, CLEANUP_BUDGET, move || {
             prepare(
                 &command,
@@ -2918,11 +3182,11 @@ mod tests {
                 |_| Ok(()),
             )
         });
-        assert_eq!(
+        assert_powershell(
             outcome,
-            Ok(ScriptOutcome::Exited {
-                exit_code: expected
-            })
+            ScriptOutcome::Exited {
+                exit_code: expected,
+            },
         );
     }
 
@@ -2943,7 +3207,11 @@ mod tests {
         let root = TestRoot::new("ps");
         let profile = Arc::new(test_profile(&root.0));
         let stop = Arc::new(event().unwrap());
-        let script = "$d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP 'nested')\n\
+        // Cmdlets autoload from $PSHOME\Modules only: the wrapper pins the
+        // module path that Windows PowerShell would otherwise extend.
+        let script = "if ($env:PSModulePath -ne [IO.Path]::Combine($PSHOME, 'Modules')) { exit 3 }\n\
+            if ($env:LOCALAPPDATA -ne [IO.Path]::Combine($env:TEMP, 'AppData\\Local')) { exit 4 }\n\
+            $d = New-Item -ItemType Directory -Path (Join-Path $env:TEMP 'nested')\n\
             $f = Join-Path $d.FullName 'locked.txt'\n\
             [IO.File]::WriteAllText($f, 'arx')\n\
             (Get-Item -LiteralPath $f).IsReadOnly = $true\n\
@@ -2952,29 +3220,44 @@ mod tests {
             &profile,
             &stop,
             script.as_bytes().to_vec(),
-            Instant::now() + GUARD,
+            Instant::now() + POWERSHELL_GUARD,
         );
-        assert_eq!(outcome, Ok(ScriptOutcome::Exited { exit_code: 7 }));
+        assert_powershell(outcome, ScriptOutcome::Exited { exit_code: 7 });
         assert_eq!(root.entries(), 0, "request directory removed after cleanup");
+    }
+
+    /// The no-conflict snapshot: everything absent except the script block
+    /// logging value that must be explicitly zero.
+    fn clean_policy() -> [PolicyValue; POLICY_VALUES.len()] {
+        POLICY_VALUES.map(|(_, _, _, rule)| {
+            if rule == PolicyRule::ExplicitlyOff {
+                PolicyValue::Dword(0)
+            } else {
+                PolicyValue::Absent
+            }
+        })
     }
 
     #[test]
     fn self_test_admits_the_production_identity() {
         let root = TestRoot::new("self");
         let stop = Arc::new(event().unwrap());
-        let admitted = admit(
-            test_profile(&root.0),
-            &[PolicyValue::Absent; POLICY_VALUES.len()],
-            |profile| {
-                run_profile(
-                    profile,
-                    &stop,
-                    SELF_TEST.as_bytes().to_vec(),
-                    Instant::now() + GUARD,
-                )
-            },
+        let mut outcome = None;
+        let admitted = admit(test_profile(&root.0), &clean_policy(), |profile| {
+            let result = run_profile(
+                profile,
+                &stop,
+                SELF_TEST.as_bytes().to_vec(),
+                Instant::now() + POWERSHELL_GUARD,
+            );
+            outcome = Some(result);
+            result
+        });
+        assert!(
+            matches!(admitted, Ok(Some(_))),
+            "self-test returned {outcome:?}\nrecent runtime events:\n{}",
+            recent_runtime_events()
         );
-        assert!(matches!(admitted, Ok(Some(_))));
         assert_eq!(
             root.entries(),
             0,
@@ -2985,7 +3268,7 @@ mod tests {
     #[test]
     fn admission_requires_the_exact_sentinel_and_no_policy_conflict() {
         let root = TestRoot::new("admit");
-        let clean = [PolicyValue::Absent; POLICY_VALUES.len()];
+        let clean = clean_policy();
         for (result, expected) in [
             (
                 Ok(ScriptOutcome::Exited {
@@ -2993,10 +3276,16 @@ mod tests {
                 }),
                 Ok(true),
             ),
-            // CLR start failure and console DLL-init failure under a broken profile.
+            // CLR start failure, CLR FailFast and console DLL-init failure.
             (
                 Ok(ScriptOutcome::Exited {
                     exit_code: 0xFFFF_0000,
+                }),
+                Ok(false),
+            ),
+            (
+                Ok(ScriptOutcome::Exited {
+                    exit_code: 0x8013_1623,
                 }),
                 Ok(false),
             ),
@@ -3019,45 +3308,162 @@ mod tests {
                 "{result:?}"
             );
         }
-        let mut conflict = clean;
-        conflict[2] = PolicyValue::Dword(1);
-        let ran = Cell::new(false);
-        let admitted = admit(test_profile(&root.0), &conflict, |_| {
-            ran.set(true);
-            Ok(ScriptOutcome::Exited {
-                exit_code: SELF_TEST_SENTINEL,
-            })
-        });
-        assert!(matches!(admitted, Ok(None)));
-        assert!(
-            !ran.get(),
-            "a policy conflict closes execution before the self-test"
-        );
+        for conflict in [PolicyValue::Absent, PolicyValue::Dword(1)] {
+            // Unconfigured script block logging still logs suspicious blocks.
+            let mut snapshot = clean;
+            let index = POLICY_VALUES
+                .iter()
+                .position(|(_, _, _, rule)| *rule == PolicyRule::ExplicitlyOff)
+                .unwrap();
+            snapshot[index] = conflict;
+            let ran = Cell::new(false);
+            let admitted = admit(test_profile(&root.0), &snapshot, |_| {
+                ran.set(true);
+                Ok(ScriptOutcome::Exited {
+                    exit_code: SELF_TEST_SENTINEL,
+                })
+            });
+            assert!(matches!(admitted, Ok(None)), "{conflict:?}");
+            assert!(
+                !ran.get(),
+                "a policy conflict closes execution before the self-test"
+            );
+        }
     }
 
     #[test]
     fn policy_conflicts_close_execution() {
         use PolicyValue::*;
-        let clean = [Absent; POLICY_VALUES.len()];
+        let clean = clean_policy();
         assert!(!policy_conflict(&clean));
-        let mut off = clean;
-        for index in [2, 3, 4] {
-            off[index] = Dword(0);
-        }
-        assert!(!policy_conflict(&off), "logging explicitly off is allowed");
-        for index in 0..POLICY_VALUES.len() {
-            for value in [Dword(1), Other, Unreadable] {
+        // Both hives are read, and only the machine script block value is required.
+        assert_eq!(
+            POLICY_VALUES
+                .iter()
+                .filter(|(hive, _, _, _)| *hive == Hive::User)
+                .count(),
+            6
+        );
+        assert_eq!(
+            POLICY_VALUES
+                .iter()
+                .filter(|(hive, _, value, rule)| *hive == Hive::Machine
+                    && *value == "EnableScriptBlockLogging"
+                    && *rule == PolicyRule::ExplicitlyOff)
+                .count(),
+            1
+        );
+        for (index, (_, _, value, rule)) in POLICY_VALUES.iter().enumerate() {
+            for candidate in [Absent, Dword(0), Dword(1), Other, Unreadable] {
                 let mut snapshot = clean;
-                snapshot[index] = value;
-                assert!(policy_conflict(&snapshot), "{index} {value:?}");
+                snapshot[index] = candidate;
+                let allowed = match rule {
+                    PolicyRule::Unset => candidate == Absent,
+                    PolicyRule::OffOrUnset => matches!(candidate, Absent | Dword(0)),
+                    PolicyRule::ExplicitlyOff => candidate == Dword(0),
+                };
+                assert_eq!(
+                    policy_conflict(&snapshot),
+                    !allowed,
+                    "{value} {rule:?} {candidate:?}"
+                );
             }
         }
-        for index in [0, 1, 5] {
-            let mut snapshot = clean;
-            snapshot[index] = Dword(0);
-            assert!(policy_conflict(&snapshot), "{index} must be absent");
-        }
         assert!(!read_policy().contains(&Unreadable));
+    }
+
+    #[test]
+    fn bounded_steps_never_outlive_their_budget() {
+        let stop = event().unwrap();
+        assert!(matches!(
+            bounded(&stop, Instant::now() + GUARD, Duration::ZERO, || 5),
+            Bounded::Done(5)
+        ));
+        let latch = Arc::new(event().unwrap());
+        let held = Arc::clone(&latch);
+        let started = Instant::now();
+        let result = bounded(
+            &stop,
+            Instant::now() + Duration::from_millis(50),
+            Duration::ZERO,
+            move || signaled(held.as_raw_handle(), GUARD.as_millis() as u32),
+        );
+        assert!(matches!(result, Bounded::Missed));
+        assert!(
+            started.elapsed() < GUARD / 2,
+            "a missed step is not awaited"
+        );
+        signal(&latch);
+        // Cancellation waits only for the grace period, not until `by`.
+        let cancelled = event().unwrap();
+        signal(&cancelled);
+        let latch = Arc::new(event().unwrap());
+        let held = Arc::clone(&latch);
+        let started = Instant::now();
+        let result = bounded(
+            &cancelled,
+            Instant::now() + GUARD,
+            Duration::from_millis(50),
+            move || signaled(held.as_raw_handle(), GUARD.as_millis() as u32),
+        );
+        assert!(matches!(result, Bounded::Missed));
+        assert!(started.elapsed() < GUARD / 2);
+        signal(&latch);
+    }
+
+    #[test]
+    fn stalled_workspace_setup_and_removal_retire_within_budget() {
+        let root = TestRoot::new("stall");
+        let profile = Arc::new(test_profile(&root.0));
+        let stop = event().unwrap();
+        let latch = Arc::new(event().unwrap());
+
+        let held = Arc::clone(&latch);
+        let started = Instant::now();
+        let setup = prepare_workspace(
+            &profile,
+            &stop,
+            Instant::now() + Duration::from_millis(50),
+            move |_| {
+                signaled(held.as_raw_handle(), GUARD.as_millis() as u32).unwrap();
+                Err(io::ErrorKind::TimedOut.into())
+            },
+        );
+        assert_eq!(setup.err(), Some(WORKSPACE_UNKNOWN));
+        assert!(started.elapsed() < GUARD / 2);
+
+        let failed = prepare_workspace(&profile, &stop, Instant::now() + GUARD, |_| {
+            Err(io::ErrorKind::PermissionDenied.into())
+        });
+        assert!(matches!(failed, Ok(None)), "failed setup is LaunchFailed");
+
+        let (workspace, _command) =
+            prepare_workspace(&profile, &stop, Instant::now() + GUARD, Workspace::create)
+                .unwrap()
+                .unwrap();
+        let held = Arc::clone(&latch);
+        let started = Instant::now();
+        let removal = remove_workspace(
+            &stop,
+            workspace,
+            Instant::now() + Duration::from_millis(50),
+            move |workspace| {
+                signaled(held.as_raw_handle(), GUARD.as_millis() as u32).unwrap();
+                workspace.remove()
+            },
+        );
+        assert_eq!(removal, Err(WORKSPACE_UNKNOWN));
+        assert!(started.elapsed() < GUARD / 2);
+        signal(&latch);
+
+        let (workspace, _command) =
+            prepare_workspace(&profile, &stop, Instant::now() + GUARD, Workspace::create)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            remove_workspace(&stop, workspace, Instant::now() + GUARD, Workspace::remove),
+            Ok(())
+        );
     }
 
     #[test]
@@ -3592,35 +3998,62 @@ mod tests {
 
     #[test]
     fn wrapper_environment_contains_only_fixed_paths() {
+        let root = TestRoot::new("env");
         let (windows, system) = system_paths().unwrap();
-        let command = CommandLine::powershell(&windows, &system, &system).unwrap();
+        let command = CommandLine::powershell(&windows, &system, &root.0).unwrap();
         let values = command.env.split(|&unit| unit == 0);
-        let keys: Vec<_> = values
+        let entries: Vec<(String, String)> = values
             .filter(|value| !value.is_empty())
             .map(|value| {
-                String::from_utf16(value)
-                    .unwrap()
-                    .split_once('=')
-                    .unwrap()
-                    .0
-                    .to_owned()
+                let entry = String::from_utf16(value).unwrap();
+                let (key, value) = entry.split_once('=').unwrap();
+                (key.to_owned(), value.to_owned())
             })
             .collect();
+        let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
         assert_eq!(
             keys,
             [
+                "APPDATA",
+                "LOCALAPPDATA",
                 "PATH",
+                "PSModuleAnalysisCachePath",
                 "PSModulePath",
                 "SystemRoot",
                 "TEMP",
                 "TMP",
+                "USERPROFILE",
                 "windir"
             ]
         );
+        let mut sorted = keys.clone();
+        sorted.sort_by_key(|key| key.to_ascii_uppercase());
+        assert_eq!(
+            keys, sorted,
+            "environment blocks are sorted case-insensitively"
+        );
+        let work = root.0.display().to_string();
+        for (key, value) in &entries {
+            if matches!(
+                key.as_str(),
+                "APPDATA"
+                    | "LOCALAPPDATA"
+                    | "PSModuleAnalysisCachePath"
+                    | "TEMP"
+                    | "TMP"
+                    | "USERPROFILE"
+            ) {
+                assert!(
+                    value.starts_with(&work),
+                    "{key} stays in the request directory"
+                );
+            }
+        }
         assert!(command.env.ends_with(&[0, 0]));
         let script = String::from_utf16(&command.command).unwrap();
         assert!(
             script.contains("-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command")
         );
+        assert!(!WRAPPER.contains("New-Object") && WRAPPER.contains("$env:PSModulePath="));
     }
 }
