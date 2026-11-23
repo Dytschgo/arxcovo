@@ -4,15 +4,16 @@ use arxd::{
     service::Shutdown,
     vm::{
         guest::{FRAME_BOUND, GUEST_READY_BUDGET, GuestChannel, MAX_CHALLENGES, RETRY_FIRST},
-        paths::{Artifact, ArtifactRole, LocalPath},
+        paths::{Artifact, ArtifactPin, ArtifactRole, FileIdentity, LocalPath},
         qemu_args::{
             BootPurpose, BootRecipe, GUEST_PORT_ID, NETWORK, PlanKind, QEMU_VERSION, SerialName,
         },
         qemu_img,
         qmp::{ChannelError, Qmp, RunStatus},
         runtime::{
-            CandidateRuntime, NativeMutation, NativeRefusal, QualificationEvidence,
-            StopDisposition, StopEvidence, capacity, fresh_observation,
+            CandidateRuntime, InstallerBudget, InstallerFailure, InstallerFailureReason,
+            InstallerPhase, InstallerRecipe, InstallerStage, NativeMutation, NativeRefusal,
+            QualificationEvidence, StopDisposition, StopEvidence, capacity, fresh_observation,
         },
     },
 };
@@ -423,7 +424,6 @@ fn qemu_has_one_restricted_network_and_explicit_block_and_monitor_roles() {
     let vars = artifact(Vars, "D:/vms/vars.fd");
     let disk = artifact(GuestDisk, "D:/vms/current.qcow2");
     let backing = artifact(Golden, "E:/golden/base.qcow2");
-    let iso = artifact(InstallMedia, "E:/iso/installer.iso");
     let serial = SerialName::generate().unwrap();
     let golden_header = qcow2_11_1(None);
     let disk_header = qcow2_11_1(Some(r"E:\golden\base.qcow2"));
@@ -437,12 +437,12 @@ fn qemu_has_one_restricted_network_and_explicit_block_and_monitor_roles() {
         backing: Some(&backing),
         backing_header: Some(&golden_header),
         serial: &serial,
-        boot: BootPurpose::Installer(&iso),
+        boot: BootPurpose::Installed,
         ram_mib: 4096,
         vcpus: 2,
     };
     let plan = recipe.plan().unwrap();
-    assert_eq!(plan.kind(), PlanKind::InstallerBoot);
+    assert_eq!(plan.kind(), PlanKind::Boot);
     assert!(plan.offline_lease().is_none());
     let args = plan.args();
     let values = |key: &str| {
@@ -468,12 +468,11 @@ fn qemu_has_one_restricted_network_and_explicit_block_and_monitor_roles() {
         .iter()
         .map(|arg| serde_json::from_str(arg).unwrap())
         .collect();
-    assert_eq!(blocks.len(), 5);
+    assert_eq!(blocks.len(), 4);
     assert_eq!(blocks[0]["read-only"], true);
     assert_eq!(blocks[1]["read-only"], false);
     assert_eq!(blocks[2]["backing"], Value::Null);
     assert_eq!(blocks[3]["backing"], "golden");
-    assert_eq!(blocks[4]["node-name"], "installer");
     for forbidden in [
         "hostfwd", "guestfwd", "smb", "tftp", "socket", "-qmp", "-vnc",
     ] {
@@ -795,6 +794,343 @@ async fn started_vm() -> (
     qmp.release_startup_hold(&cancel, || true).await.unwrap();
     let (serial, guest) = duplex(8192);
     (qmp, events, serial, guest)
+}
+
+async fn installer_qmp(
+    stage: InstallerStage,
+    cancel: &Shutdown,
+    before_ack: Vec<Value>,
+) -> (HostQmp, BufReader<DuplexStream>) {
+    let (host, peer) = duplex(8192);
+    let (read, write) = split(host);
+    let fixture = async move {
+        let mut peer = BufReader::new(peer);
+        peer.get_mut().write_all(GREETING).await.unwrap();
+        command(&mut peer, "qmp_capabilities", 1).await;
+        record(&mut peer, json!({"return": {}, "id": 1})).await;
+        command(&mut peer, "query-status", 2).await;
+        record(
+            &mut peer,
+            json!({"return": {"status": "prelaunch", "running": false}, "id": 2}),
+        )
+        .await;
+        command(&mut peer, "cont", 3).await;
+        for event in before_ack {
+            record(&mut peer, event).await;
+        }
+        record(&mut peer, json!({"return": {}, "id": 3})).await;
+        peer
+    };
+    let launch = async {
+        let mut qmp = Qmp::installer_handshake(read, write, cancel, stage)
+            .await
+            .unwrap();
+        let did_revalidate = Cell::new(false);
+        qmp.release_startup_hold(cancel, || {
+            did_revalidate.set(true);
+            true
+        })
+        .await
+        .unwrap();
+        assert!(did_revalidate.get());
+        qmp
+    };
+    tokio::join!(launch, fixture)
+}
+
+fn installer_shutdown() -> Value {
+    json!({"event": "SHUTDOWN", "data": {"guest": true, "reason": "guest-shutdown"}})
+}
+
+fn installer_reset() -> Value {
+    json!({"event": "RESET", "data": {"guest": true, "reason": "guest-reset"}})
+}
+
+#[tokio::test(start_paused = true)]
+async fn installer_observes_reset_stop_and_guest_poweroff_without_sending_another_command() {
+    let phase = InstallerPhase::WindowsSetup;
+    let budget = InstallerBudget::start(phase.recipe());
+    let stage = budget.stage(phase, Duration::MAX).unwrap();
+    let cancel = Shutdown::default();
+    let (mut qmp, mut peer) = installer_qmp(stage, &cancel, vec![installer_reset()]).await;
+    record(&mut peer, installer_reset()).await;
+    record(&mut peer, json!({"event": "STOP"})).await;
+    record(&mut peer, installer_shutdown()).await;
+    assert_eq!(qmp.observe_installer_shutdown(&cancel).await, Ok(()));
+    let mut extra = [0];
+    assert!(polled_pending(Box::pin(peer.read(&mut extra)).as_mut()));
+
+    let (mut qmp, _peer) = installer_qmp(stage, &cancel, vec![installer_shutdown()]).await;
+    assert_eq!(qmp.observe_installer_shutdown(&cancel).await, Ok(()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn installer_deadline_clips_startup_progress_and_later_stages() {
+    use tokio::time::{Instant, advance};
+    let zero = Instant::now();
+    let ubuntu = InstallerBudget::start(InstallerRecipe::Ubuntu);
+    let windows = InstallerBudget::start(InstallerRecipe::Windows);
+    let hour = Duration::from_secs(3600);
+    let setup = InstallerPhase::WindowsSetup;
+    assert_eq!(ubuntu.clip(Duration::MAX), zero + hour);
+    assert!(ubuntu.stage(setup, hour).is_none());
+    assert_eq!(windows.clip(Duration::MAX), zero + 3 * hour);
+
+    let cancel = Shutdown::default();
+    let short = Duration::from_secs(2);
+    let stage = windows.stage(setup, short).unwrap();
+    let (host, _silent_peer) = duplex(1024);
+    let (read, write) = split(host);
+    assert_eq!(
+        Qmp::installer_handshake(read, write, &cancel, stage)
+            .await
+            .err(),
+        Some(ChannelError::Timeout)
+    );
+    assert_eq!(Instant::now(), zero + short);
+    let stage = windows.stage(setup, Duration::MAX).unwrap();
+    let (mut qmp, mut peer) = installer_qmp(stage, &cancel, vec![]).await;
+    let mut observe = Box::pin(qmp.observe_installer_shutdown(&cancel));
+    for leap in [hour - short * 2, hour - short, hour - short] {
+        assert!(polled_pending(observe.as_mut()));
+        advance(leap).await;
+        record(&mut peer, installer_reset()).await;
+    }
+    assert!(polled_pending(observe.as_mut()));
+    let finalize = windows
+        .stage(InstallerPhase::WindowsFinalize, hour)
+        .unwrap();
+    assert_eq!(finalize.deadline(), zero + 3 * hour);
+    advance(zero + 3 * hour - Instant::now()).await;
+    record(&mut peer, installer_shutdown()).await;
+    assert_eq!(observe.await, Err(ChannelError::Timeout));
+    assert_eq!(windows.clip(hour), zero + 3 * hour);
+}
+
+#[tokio::test(start_paused = true)]
+async fn installer_refuses_early_exit_unsafe_events_and_exhausted_reset_or_event_budget() {
+    let phase = InstallerPhase::WindowsSetup;
+    let budget = InstallerBudget::start(phase.recipe());
+    let stage = budget.stage(phase, Duration::MAX).unwrap();
+    let cancel = Shutdown::default();
+    for (events, expected) in [
+        (vec![], ChannelError::Eof),
+        (
+            vec![json!({"event": "GUEST_PANICKED"})],
+            ChannelError::Unexpected,
+        ),
+        (
+            vec![
+                json!({"event": "RESET", "data": {"guest": false, "reason": "host-qmp-system-reset"}}),
+            ],
+            ChannelError::Unexpected,
+        ),
+        (
+            vec![json!({"event": "SHUTDOWN", "data": {"guest": true, "reason": "guest-reset"}})],
+            ChannelError::Unexpected,
+        ),
+        (
+            vec![json!({"event": "SHUTDOWN", "data": {"guest": false, "reason": "host-qmp-quit"}})],
+            ChannelError::Unexpected,
+        ),
+        (
+            vec![json!({"event": "SHUTDOWN", "data": {"guest": true}})],
+            ChannelError::Invalid,
+        ),
+        (vec![installer_reset(); 17], ChannelError::Unexpected),
+        (vec![json!({"event": "RESUME"}); 65], ChannelError::Oversize),
+    ] {
+        let (mut qmp, mut peer) = installer_qmp(stage, &cancel, vec![]).await;
+        for event in events {
+            record(&mut peer, event).await;
+        }
+        drop(peer);
+        assert_eq!(qmp.observe_installer_shutdown(&cancel).await, Err(expected));
+    }
+    for phase in [
+        InstallerPhase::UbuntuInstall,
+        InstallerPhase::WindowsFinalize,
+    ] {
+        let budget = InstallerBudget::start(phase.recipe());
+        let stage = budget.stage(phase, Duration::MAX).unwrap();
+        let (mut qmp, mut peer) = installer_qmp(stage, &cancel, vec![]).await;
+        record(&mut peer, installer_reset()).await;
+        assert_eq!(
+            qmp.observe_installer_shutdown(&cancel).await,
+            Err(ChannelError::Unexpected)
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn installer_stop_without_shutdown_and_windows_idle_are_bounded_and_cancel_is_immediate() {
+    let phase = InstallerPhase::WindowsSetup;
+    let budget = InstallerBudget::start(phase.recipe());
+    let stage = budget.stage(phase, Duration::MAX).unwrap();
+    let cancel = Shutdown::default();
+    let (mut qmp, mut peer) = installer_qmp(stage, &cancel, vec![]).await;
+    let start = tokio::time::Instant::now();
+    record(&mut peer, json!({"event": "STOP"})).await;
+    assert_eq!(
+        qmp.observe_installer_shutdown(&cancel).await,
+        Err(ChannelError::Timeout)
+    );
+    assert_eq!(start.elapsed(), Duration::from_secs(2));
+
+    let (mut qmp, _peer) = installer_qmp(stage, &cancel, vec![]).await;
+    let start = tokio::time::Instant::now();
+    assert_eq!(
+        qmp.observe_installer_shutdown(&cancel).await,
+        Err(ChannelError::Timeout)
+    );
+    assert_eq!(start.elapsed(), Duration::from_secs(3600));
+
+    let (mut qmp, _peer) = installer_qmp(stage, &cancel, vec![]).await;
+    let mut observe = Box::pin(qmp.observe_installer_shutdown(&cancel));
+    assert!(polled_pending(observe.as_mut()));
+    let start = tokio::time::Instant::now();
+    cancel.cancel();
+    assert_eq!(observe.await, Err(ChannelError::Cancelled));
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+#[test]
+fn installer_release_requires_process_job_workers_and_reopen_before_detach() {
+    for (exited, empty, joined, reopen, shutdown, code_zero, expected) in [
+        (
+            false,
+            true,
+            true,
+            true,
+            true,
+            true,
+            StopDisposition::ChargedQuarantine,
+        ),
+        (
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            StopDisposition::ChargedQuarantine,
+        ),
+        (
+            true,
+            true,
+            false,
+            true,
+            true,
+            true,
+            StopDisposition::ChargedQuarantine,
+        ),
+        (
+            true,
+            true,
+            true,
+            false,
+            true,
+            true,
+            StopDisposition::ChargedQuarantine,
+        ),
+        (
+            true,
+            true,
+            true,
+            true,
+            false,
+            true,
+            StopDisposition::DirtyRelease,
+        ),
+        (
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            StopDisposition::DirtyRelease,
+        ),
+        (
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            StopDisposition::CleanRelease,
+        ),
+    ] {
+        let mut evidence = StopEvidence {
+            guest_shutdown: shutdown,
+            clean_process_exit: code_zero,
+            process_exited: exited,
+            job_empty: empty,
+            workers_joined: joined,
+            artifacts_reopened: false,
+        };
+        let mut reopened = false;
+        evidence.verify_release(|| {
+            reopened = true;
+            reopen
+        });
+        assert_eq!(reopened, exited && empty && joined);
+        assert_eq!(evidence.disposition(), expected);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn installer_failure_keeps_its_phase_and_charges_uncertain_recovery() {
+    use InstallerFailureReason::*;
+    use StopDisposition::*;
+    let phase = InstallerPhase::UbuntuInstall;
+    let budget = InstallerBudget::start(phase.recipe());
+    let limit = Duration::from_secs(2);
+    let stage = budget.stage(phase, limit).unwrap();
+    assert_eq!(stage.complete(Ok(()), CleanRelease, false), Ok(()));
+    for (result, observed, cancelled, reason, recovery) in [
+        (Err(Timeout), DirtyRelease, false, Timeout, DirtyRelease),
+        (
+            Err(Timeout),
+            ChargedQuarantine,
+            false,
+            Timeout,
+            ChargedQuarantine,
+        ),
+        (
+            Ok(()),
+            ChargedQuarantine,
+            false,
+            ReleaseUnverified,
+            ChargedQuarantine,
+        ),
+        (Ok(()), CleanRelease, true, Cancelled, DirtyRelease),
+        (
+            Err(ProcessFailed),
+            DirtyRelease,
+            false,
+            ProcessFailed,
+            DirtyRelease,
+        ),
+    ] {
+        assert_eq!(
+            stage.complete(result, observed, cancelled),
+            Err(InstallerFailure {
+                phase,
+                reason,
+                recovery
+            })
+        );
+    }
+    tokio::time::advance(limit).await;
+    assert_eq!(
+        stage.complete(Ok(()), CleanRelease, false),
+        Err(InstallerFailure {
+            phase,
+            reason: Timeout,
+            recovery: DirtyRelease
+        })
+    );
 }
 
 fn readiness(mut qmp: HostQmp, serial: DuplexStream, cancel: Shutdown) -> Readiness {
@@ -1226,23 +1562,55 @@ async fn a_reply_ready_together_with_the_expired_deadline_is_refused() {
     assert_eq!(ready.await.err(), Some(ChannelError::Timeout));
 }
 
+fn identified(role: ArtifactRole, path: &str, file: u8) -> Artifact {
+    artifact(role, path).with_identity(FileIdentity {
+        volume: 1,
+        file: [file; 16],
+    })
+}
+
+fn pinned(role: ArtifactRole, path: &str, file: u8) -> Artifact {
+    identified(role, path, file).with_pin(ArtifactPin {
+        size: 1,
+        sha256: [file; 32],
+    })
+}
+
+fn block_arg(driver: &str, node: &str, path: &str, read_only: bool) -> Value {
+    json!({
+        "driver": driver, "node-name": node, "read-only": read_only,
+        "file": {"driver": "file", "filename": path, "read-only": read_only}
+    })
+}
+
 #[test]
-fn installer_boots_are_refused_before_any_native_launch() {
+fn exact_argv_for_each_boot_purpose() {
     use ArtifactRole::*;
-    let image = artifact(Qemu, "E:/bundle/qemu-system-x86_64.exe");
-    let data = artifact(Data, "E:/bundle/pc-bios");
-    let code = artifact(FirmwareCode, "E:/bundle/edk2-x86_64-code.fd");
-    let vars = artifact(Vars, "D:/vms/vars.fd");
-    let disk = artifact(GuestDisk, "D:/vms/current.qcow2");
-    let iso = artifact(InstallMedia, "E:/iso/installer.iso");
+    use InstallerPhase::*;
+    let image = identified(Qemu, "E:/bundle/qemu-system-x86_64.exe", 1);
+    let data = identified(Data, "E:/bundle/pc-bios", 2);
+    let code = identified(FirmwareCode, "E:/bundle/code.fd", 3);
+    let vars = identified(Vars, "D:/vms/vars.fd", 4);
+    let setup_vars = pinned(WindowsSetupVars, "D:/vms/vars.fd", 4);
+    let disk = identified(GuestDisk, "D:/vms/current.qcow2", 5);
+    let test_disk = identified(TestInstallDisk, "D:/vms/current.qcow2", 5);
+    let ubuntu_iso = pinned(UbuntuInstallIso, "E:/iso/ubuntu.iso", 6);
+    let cidata = pinned(UbuntuCidata, "D:/vms/cidata.iso", 7);
+    let kernel = pinned(UbuntuKernel, "E:/iso/vmlinuz", 8);
+    let initrd = pinned(UbuntuInitrd, "E:/iso/initrd", 9);
+    let windows_iso = pinned(WindowsInstallIso, "E:/iso/windows.iso", 10);
+    let answer = pinned(WindowsAnswerSeed, "D:/vms/answer.iso", 11);
+    let drivers = pinned(WindowsDriverMedium, "E:/iso/drivers.iso", 12);
+    let golden = artifact(Golden, "D:/vms/golden.qcow2");
     let serial = SerialName::generate().unwrap();
     let header = qcow2_11_1(None);
-    let recipe = |boot| BootRecipe {
+    let backed = qcow2_11_1(Some(r"D:\vms\golden.qcow2"));
+    let recipe = |boot, disk, vars| BootRecipe {
         image: &image,
         data: &data,
         firmware: &code,
-        vars: &vars,
-        disk: &disk,
+        vars,
+        disk,
         disk_header: &header,
         backing: None,
         backing_header: None,
@@ -1251,18 +1619,215 @@ fn installer_boots_are_refused_before_any_native_launch() {
         ram_mib: 2048,
         vcpus: 2,
     };
-    let installer = recipe(BootPurpose::Installer(&iso));
-    let plan = installer.plan().unwrap();
-    assert_eq!(plan.kind(), PlanKind::InstallerBoot);
-    // The launcher's first check refuses before any handle, Job or process.
-    assert_eq!(
-        plan.native_admission().err(),
-        Some(NativeRefusal::InstallerPhaseUnavailable)
-    );
-    let installed = recipe(BootPurpose::Installed);
-    let plan = installed.plan().unwrap();
-    assert_eq!(plan.kind(), PlanKind::Boot);
-    assert!(plan.native_admission().is_ok_and(|lease| lease.is_none()));
+    let installed = recipe(BootPurpose::Installed, &disk, &vars);
+    let ubuntu = BootPurpose::UbuntuInstall {
+        iso: &ubuntu_iso,
+        cidata: &cidata,
+        kernel: &kernel,
+        initrd: &initrd,
+    };
+    let windows = BootPurpose::WindowsSetup {
+        iso: &windows_iso,
+        answer: &answer,
+        drivers: &drivers,
+    };
+    for (mut recipe, phase, linked) in [
+        (installed, None, false),
+        (recipe(BootPurpose::Installed, &disk, &vars), None, true),
+        (
+            recipe(ubuntu, &test_disk, &vars),
+            Some(UbuntuInstall),
+            false,
+        ),
+        (
+            recipe(windows, &test_disk, &setup_vars),
+            Some(WindowsSetup),
+            false,
+        ),
+        (
+            recipe(BootPurpose::WindowsFinalize, &test_disk, &vars),
+            Some(WindowsFinalize),
+            false,
+        ),
+    ] {
+        if linked {
+            recipe.disk_header = &backed;
+            recipe.backing = Some(&golden);
+            recipe.backing_header = Some(&header);
+        }
+        let pipe = format!("pipe,id=arxguest,path={}", serial.basename());
+        let mut expected = [
+            "-no-user-config", "-nodefaults", "-display", "none", "-serial", "none",
+            "-monitor", "none", "-accel", "whpx", "-S", "-chardev",
+            "stdio,id=arxqmp,signal=off", "-mon", "chardev=arxqmp,mode=control",
+            "-netdev", "user,id=arxnet0,restrict=on,ipv6=off",
+            "-device", "virtio-net-pci,netdev=arxnet0",
+            "-device", "virtio-serial-pci,id=arxserial",
+            "-device", if phase == Some(WindowsSetup) {
+                "virtio-blk-pci,drive=guestdisk"
+            } else {
+                "virtio-blk-pci,drive=guestdisk,bootindex=2"
+            },
+            "-L", r"E:\bundle\pc-bios", "-machine", "pc-q35-11.1,pflash0=code,pflash1=vars",
+            "-smp", "2", "-m", "2048", "-chardev",
+            if phase.is_none() { &pipe } else { "null,id=arxguest" },
+            "-device", "virtserialport,bus=arxserial.0,chardev=arxguest,id=arxguestport,name=org.arxcovo.agent.0",
+        ].map(str::to_owned).to_vec();
+        for spec in [
+            block_arg("raw", "code", r"E:\bundle\code.fd", true),
+            block_arg("raw", "vars", r"D:\vms\vars.fd", false),
+        ] {
+            expected.extend(["-blockdev".into(), spec.to_string()]);
+        }
+        if linked {
+            let mut spec = block_arg("qcow2", "golden", r"D:\vms\golden.qcow2", true);
+            spec["backing"] = Value::Null;
+            expected.extend(["-blockdev".into(), spec.to_string()]);
+        }
+        let mut spec = block_arg("qcow2", "guestdisk", r"D:\vms\current.qcow2", false);
+        spec["backing"] = if linked { json!("golden") } else { Value::Null };
+        expected.extend(["-blockdev".into(), spec.to_string()]);
+        let mut optical = |node, path, device: &str| {
+            expected.extend([
+                "-blockdev".into(),
+                block_arg("raw", node, path, true).to_string(),
+                "-device".into(),
+                device.into(),
+            ]);
+        };
+        match phase {
+            Some(UbuntuInstall) => {
+                optical(
+                    "osiso",
+                    r"E:\iso\ubuntu.iso",
+                    "ide-cd,drive=osiso,bus=ide.0",
+                );
+                optical(
+                    "cidata",
+                    r"D:\vms\cidata.iso",
+                    "ide-cd,drive=cidata,bus=ide.1",
+                );
+                expected.extend(
+                    [
+                        "-kernel",
+                        r"E:\iso\vmlinuz",
+                        "-initrd",
+                        r"E:\iso\initrd",
+                        "-append",
+                        "autoinstall ds=nocloud ---",
+                    ]
+                    .map(str::to_owned),
+                );
+            }
+            Some(WindowsSetup) => {
+                optical(
+                    "osiso",
+                    r"E:\iso\windows.iso",
+                    "ide-cd,drive=osiso,bus=ide.0",
+                );
+                expected.extend(
+                    ["-device", "ich9-ahci,id=arxmedia,bus=pcie.0,addr=0x1e"].map(str::to_owned),
+                );
+                for (node, path, device) in [
+                    (
+                        "answer",
+                        r"D:\vms\answer.iso",
+                        "ide-cd,drive=answer,bus=arxmedia.0",
+                    ),
+                    (
+                        "drivers",
+                        r"E:\iso\drivers.iso",
+                        "ide-cd,drive=drivers,bus=arxmedia.1",
+                    ),
+                ] {
+                    expected.extend([
+                        "-blockdev".into(),
+                        block_arg("raw", node, path, true).to_string(),
+                        "-device".into(),
+                        device.into(),
+                    ]);
+                }
+            }
+            None | Some(WindowsFinalize) => {}
+        }
+        let plan = recipe.plan().unwrap();
+        assert_eq!(
+            plan.kind(),
+            phase.map_or(PlanKind::Boot, PlanKind::InstallerBoot)
+        );
+        assert_eq!(plan.args(), expected);
+        assert!(plan.offline_lease().is_none());
+    }
+
+    let unpinned = identified(UbuntuKernel, "E:/iso/vmlinuz", 8);
+    let aliased = pinned(UbuntuCidata, "E:/iso/alias.iso", 6);
+    let same_path = pinned(UbuntuCidata, "e:/ISO/UBUNTU.ISO", 13);
+    let missing_identity = artifact(WindowsAnswerSeed, "D:/vms/answer.iso").with_pin(ArtifactPin {
+        size: 1,
+        sha256: [11; 32],
+    });
+    for invalid in [
+        recipe(ubuntu, &disk, &vars),
+        recipe(windows, &test_disk, &vars),
+        recipe(BootPurpose::WindowsFinalize, &test_disk, &setup_vars),
+        recipe(BootPurpose::Installed, &test_disk, &vars),
+        recipe(
+            BootPurpose::UbuntuInstall {
+                iso: &windows_iso,
+                cidata: &cidata,
+                kernel: &kernel,
+                initrd: &initrd,
+            },
+            &test_disk,
+            &vars,
+        ),
+        recipe(
+            BootPurpose::UbuntuInstall {
+                iso: &ubuntu_iso,
+                cidata: &cidata,
+                kernel: &unpinned,
+                initrd: &initrd,
+            },
+            &test_disk,
+            &vars,
+        ),
+        recipe(
+            BootPurpose::UbuntuInstall {
+                iso: &ubuntu_iso,
+                cidata: &aliased,
+                kernel: &kernel,
+                initrd: &initrd,
+            },
+            &test_disk,
+            &vars,
+        ),
+        recipe(
+            BootPurpose::UbuntuInstall {
+                iso: &ubuntu_iso,
+                cidata: &same_path,
+                kernel: &kernel,
+                initrd: &initrd,
+            },
+            &test_disk,
+            &vars,
+        ),
+        recipe(
+            BootPurpose::WindowsSetup {
+                iso: &windows_iso,
+                answer: &missing_identity,
+                drivers: &drivers,
+            },
+            &test_disk,
+            &setup_vars,
+        ),
+    ] {
+        assert!(invalid.plan().is_err());
+    }
+    let mut overlay = recipe(ubuntu, &test_disk, &vars);
+    overlay.backing = Some(&golden);
+    overlay.backing_header = Some(&header);
+    overlay.disk_header = &backed;
+    assert!(overlay.plan().is_err());
 }
 
 #[tokio::test(start_paused = true)]

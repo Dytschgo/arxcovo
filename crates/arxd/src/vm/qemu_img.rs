@@ -26,7 +26,7 @@ const COMPRESSION_ZSTD: u8 = 1;
 /// QEMU limits a backing file name to 1023 bytes.
 const MAX_BACKING_NAME: usize = 1023;
 
-/// Only the runtime recipe's qcow2 subset, parsed against the pinned v11.1.3
+/// Only the runtime recipe's qcow2 subset, parsed against the pinned header
 /// layout. Inspect the first cluster before allowing qemu-img or QEMU to
 /// resolve any embedded reference. `expected` is the one approved backing
 /// file; `None` requires an unbacked image.

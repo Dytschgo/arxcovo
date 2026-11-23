@@ -77,7 +77,15 @@ pub enum ArtifactRole {
     Vars,
     GuestDisk,
     Golden,
-    InstallMedia,
+    TestInstallDisk,
+    WindowsSetupVars,
+    UbuntuInstallIso,
+    UbuntuCidata,
+    UbuntuKernel,
+    UbuntuInitrd,
+    WindowsInstallIso,
+    WindowsAnswerSeed,
+    WindowsDriverMedium,
     Staging,
     Scratch,
     Dll,
@@ -88,7 +96,12 @@ impl ArtifactRole {
     pub fn writable(self) -> bool {
         matches!(
             self,
-            Self::Vars | Self::GuestDisk | Self::Staging | Self::Scratch
+            Self::Vars
+                | Self::WindowsSetupVars
+                | Self::GuestDisk
+                | Self::TestInstallDisk
+                | Self::Staging
+                | Self::Scratch
         )
     }
 }
@@ -97,6 +110,8 @@ impl ArtifactRole {
 pub struct Artifact {
     role: ArtifactRole,
     path: LocalPath,
+    identity: Option<FileIdentity>,
+    pin: Option<ArtifactPin>,
 }
 
 impl Artifact {
@@ -105,11 +120,36 @@ impl Artifact {
         if path.is_drive_root() {
             return Err(InvalidPath);
         }
-        Ok(Self { role, path })
+        Ok(Self {
+            role,
+            path,
+            identity: None,
+            pin: None,
+        })
     }
 
     pub fn path_for(&self, role: ArtifactRole) -> Result<&LocalPath, InvalidPath> {
         (self.role == role).then_some(&self.path).ok_or(InvalidPath)
+    }
+
+    /// Expected object from staging or a recipe receipt. Only the native
+    /// launcher can compare it with a retained filesystem object.
+    pub fn with_identity(mut self, identity: FileIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    pub fn with_pin(mut self, pin: ArtifactPin) -> Self {
+        self.pin = Some(pin);
+        self
+    }
+
+    pub(super) fn identity(&self) -> Option<FileIdentity> {
+        self.identity
+    }
+
+    pub(super) fn pin(&self) -> Option<ArtifactPin> {
+        self.pin
     }
 }
 
