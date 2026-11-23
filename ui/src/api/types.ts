@@ -3,7 +3,8 @@
 // after decoding, never a raw server payload.
 
 export type Arch = 'x86_64' | 'arm64';
-export type OsFamily = 'windows' | 'macos' | 'linux';
+/** v1 platforms. macOS hosts and guests are roadmap items and join the enum when they ship. */
+export type OsFamily = 'windows' | 'linux';
 
 export interface User {
   /** Display name of the single cluster owner. */
@@ -137,7 +138,7 @@ export type TerminalEvent =
 export type StreamCloseReason = 'session_ended' | 'server';
 
 /** WebSocket close codes the server uses (docs/dashboard-api.md). */
-export const STREAM_CLOSE_CODES = { sessionEnded: 4401, forbidden: 4403 } as const;
+export const STREAM_CLOSE_CODES = { sessionEnded: 4401, forbidden: 4403, ticketRejected: 4408 } as const;
 
 export interface TerminalSession {
   readonly status: TerminalStatus;

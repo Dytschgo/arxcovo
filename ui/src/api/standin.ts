@@ -297,9 +297,7 @@ const escapeXml = (s: string) => s.replace(/[<>&'"]/g, c => ({ '<': '&lt;', '>':
 export function consoleSvg(vm: Vm, seq: number): string {
   const lines = vm.guestOs === 'windows'
     ? ['Windows Boot Manager', `Starting ${vm.guestOsVersion}...`, '', `${vm.name} login screen ready`]
-    : vm.guestOs === 'macos'
-      ? [`${vm.guestOsVersion} (Virtualization.framework)`, 'Screen Sharing stand-in', '', `${vm.name}: ready`]
-      : [`${vm.guestOsVersion} ${vm.name} ttyS0`, '', `${vm.name} login: _`, `[  ${(seq * 0.98 + 3.2).toFixed(2)}] arx-guest: ready`];
+    : [`${vm.guestOsVersion} ${vm.name} ttyS0`, '', `${vm.name} login: _`, `[  ${(seq * 0.98 + 3.2).toFixed(2)}] arx-guest: ready`];
   const text = lines.map((l, i) => `<text x="16" y="${32 + i * 22}">${escapeXml(l)}</text>`).join('');
   return `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400"><rect width="640" height="400" fill="#0b0f14"/><g fill="#c8d3df" font-family="monospace" font-size="16">${text}</g><text x="624" y="388" fill="#5b6b7c" font-family="monospace" font-size="12" text-anchor="end">stand-in frame ${seq}</text></svg>`;
 }

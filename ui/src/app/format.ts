@@ -21,7 +21,7 @@ export function formatDate(iso: string | null): string {
   return Number.isNaN(date.getTime()) ? '—' : dateFormat.format(date);
 }
 
-export const OS_LABEL: Record<OsFamily, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
+export const OS_LABEL: Record<OsFamily, string> = { windows: 'Windows', linux: 'Linux' };
 
 export function percent(used: number | null, total: number): number | null {
   if (used === null || total <= 0) return null;
@@ -30,9 +30,7 @@ export function percent(used: number | null, total: number): number | null {
 
 /** Why a guest cannot run on a host, or null when it can. */
 export function incompatibility(guest: { arch: Arch; guestOs: OsFamily }, host: { arch: Arch; os: OsFamily; reachability: string; name: string }): string | null {
-  if (guest.guestOs === 'macos' && host.os !== 'macos') return 'macOS guests need a Mac host';
   if (guest.arch !== host.arch) return `${host.arch} host cannot run ${guest.arch} guests`;
-  if (guest.guestOs === 'windows' && host.os === 'macos') return 'Windows guests are not supported on Mac hosts';
   if (host.reachability === 'offline') return `${host.name} is offline`;
   return null;
 }

@@ -58,10 +58,10 @@ describe('formatting and compatibility', () => {
 
   test('architecture and OS mismatches explain why a host is greyed out', () => {
     const linuxArm = { arch: 'arm64' as const, os: 'linux' as const, reachability: 'online', name: 'pebble' };
-    const mac = { arch: 'arm64' as const, os: 'macos' as const, reachability: 'online', name: 'studio' };
+    const linuxX86 = { arch: 'x86_64' as const, os: 'linux' as const, reachability: 'online', name: 'atlas' };
     expect(incompatibility({ arch: 'x86_64', guestOs: 'linux' }, linuxArm)).toBe('arm64 host cannot run x86_64 guests');
-    expect(incompatibility({ arch: 'arm64', guestOs: 'macos' }, linuxArm)).toBe('macOS guests need a Mac host');
-    expect(incompatibility({ arch: 'arm64', guestOs: 'linux' }, mac)).toBeNull();
+    expect(incompatibility({ arch: 'x86_64', guestOs: 'windows' }, linuxX86)).toBeNull();
+    expect(incompatibility({ arch: 'arm64', guestOs: 'linux' }, linuxArm)).toBeNull();
     expect(incompatibility({ arch: 'arm64', guestOs: 'linux' }, { ...linuxArm, reachability: 'offline' })).toBe('pebble is offline');
   });
 });

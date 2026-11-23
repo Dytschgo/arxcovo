@@ -20,7 +20,23 @@ type Obj = Record<string, unknown>;
 export const LIMITS = { hosts: 256, vms: 1024, tools: 128, snapshots: 256, activity: 50, text: 512, id: 128 } as const;
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/;
+// RFC 3339 date-time: seconds are required, fractions optional, offset Z or ±hh:mm.
+const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,9})?(Z|[+-](\d{2}):(\d{2}))$/;
+
+function daysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+/** Calendar-checked RFC 3339 instant (no Feb 30, hour 24 or missing seconds; leap seconds refused). */
+function isRfc3339(value: string): boolean {
+  const m = RFC3339.exec(value);
+  if (!m) return false;
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number);
+  if (year < 1 || month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) return false;
+  if (hour > 23 || minute > 59 || second > 59) return false;
+  if (m[9] !== undefined && (Number(m[9]) > 23 || Number(m[10]) > 59)) return false;
+  return !Number.isNaN(Date.parse(value));
+}
 
 function fail(path: string): never {
   throw new ApiError('bad_response', `Unexpected server response at ${path}`);
@@ -44,7 +60,7 @@ function id(v: unknown, path: string): string {
 
 function iso(v: unknown, path: string): string {
   const s = str(v, path, 40);
-  if (!ISO.test(s) || Number.isNaN(Date.parse(s))) fail(path);
+  if (!isRfc3339(s)) fail(path);
   return s;
 }
 
@@ -79,7 +95,7 @@ function arr<T>(v: unknown, path: string, max: number, decode: (v: unknown, path
 }
 
 const ARCHES: readonly Arch[] = ['x86_64', 'arm64'];
-const OSES: readonly OsFamily[] = ['windows', 'macos', 'linux'];
+const OSES: readonly OsFamily[] = ['windows', 'linux'];
 
 export function decodeSession(v: unknown): Session {
   const o = obj(v, 'session');
@@ -196,7 +212,7 @@ export function decodeVms(v: unknown): Vm[] {
 
 /** Strict RFC 3339 instant check, as used for every timestamp the server sends. */
 export function isIsoInstant(value: unknown): value is string {
-  return typeof value === 'string' && value.length <= 40 && ISO.test(value) && !Number.isNaN(Date.parse(value));
+  return typeof value === 'string' && value.length <= 40 && isRfc3339(value);
 }
 
 export function isValidId(value: string): boolean {

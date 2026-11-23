@@ -145,7 +145,11 @@ export class HttpApi implements ArxApi {
     this.pageUrl = options.pageUrl ?? (typeof window === 'undefined' ? 'http://127.0.0.1/' : window.location.href);
   }
 
-  private async request(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown): Promise<unknown> {
+  /**
+   * `expectStatus` pins the exact success status; any other 2xx is treated as
+   * unconfirmed and rejects, so callers never mistake 200/202 for 204.
+   */
+  private async request(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown, expectStatus?: number): Promise<unknown> {
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (method !== 'GET') {
       if (path !== `${API_PREFIX}/session` || method !== 'POST') {
@@ -187,6 +191,9 @@ export class HttpApi implements ArxApi {
       if (response.status === 401) this.csrfToken = null;
       throw errorFor(response.status, parsed);
     }
+    if (expectStatus !== undefined && response.status !== expectStatus) {
+      throw new ApiError('unavailable', `The server did not confirm the request (HTTP ${response.status}).`, response.status);
+    }
     return parsed;
   }
 
@@ -208,20 +215,25 @@ export class HttpApi implements ArxApi {
   }
 
   /**
-   * Revokes the session. Resolves only once the server confirms the
-   * revocation (204) or reports the session already gone (401). Any other
-   * failure rejects and keeps the CSRF token so the caller can retry.
+   * Revokes the session. Resolves only on exactly 204 (revoked) or 401
+   * (already gone). Every other answer, including 200 and 202, rejects and
+   * keeps the CSRF token so a retry sends DELETE again.
    */
   async logout(): Promise<void> {
-    if (!this.csrfToken) return;
+    if (!this.csrfToken) return; // only after a confirmed sign-out or a 401
     try {
-      await this.request('DELETE', `${API_PREFIX}/session`);
+      await this.request('DELETE', `${API_PREFIX}/session`, undefined, 204);
     } catch (error) {
       if (error instanceof ApiError && error.code === 'unauthorized') return;
       throw error;
     }
     this.csrfToken = null;
   }
+
+  /** A stream reported that the server ended the session: forget the token. */
+  private sessionEnded = (): void => {
+    this.csrfToken = null;
+  };
 
   async listHosts(): Promise<Host[]> {
     return decodeHosts(await this.request('GET', `${API_PREFIX}/hosts`));
@@ -267,12 +279,12 @@ export class HttpApi implements ArxApi {
 
   async openTerminal(hostId: string): Promise<TerminalSession> {
     const { url, ticket } = await this.ticket(`${API_PREFIX}/hosts/${pathId(hostId)}/terminal`);
-    return new WsTerminalSession(this.socket(url), ticket);
+    return new WsTerminalSession(this.socket(url), ticket, this.sessionEnded);
   }
 
   async openConsole(vmId: string): Promise<ConsoleStream> {
     const { url, ticket } = await this.ticket(`${API_PREFIX}/vms/${pathId(vmId)}/console`);
-    return new WsConsoleStream(this.socket(url), ticket);
+    return new WsConsoleStream(this.socket(url), ticket, this.sessionEnded);
   }
 }
 
@@ -316,6 +328,7 @@ const MAX_CLOSE_REASON = 123;
 function closeMessage(what: string, event: CloseEvent): { reason: StreamCloseReason; message: string } {
   if (event.code === STREAM_CLOSE_CODES.sessionEnded) return { reason: 'session_ended', message: `Your session ended, so the server closed the ${what}.` };
   const why = typeof event.reason === 'string' ? event.reason.slice(0, MAX_CLOSE_REASON).trim() : '';
+  if (event.code === STREAM_CLOSE_CODES.ticketRejected) return { reason: 'server', message: `The ${what} could not be authorized (expired ticket or slow handshake). Reconnect to try again.` };
   if (event.code === STREAM_CLOSE_CODES.forbidden) return { reason: 'server', message: `The server revoked access to this ${what}${why ? `: ${why}` : '.'}` };
   return { reason: 'server', message: `The server closed the ${what}${why ? `: ${why}` : '.'}` };
 }
@@ -325,7 +338,7 @@ class WsTerminalSession implements TerminalSession {
   private readonly events = new Emitter<[TerminalEvent]>();
   private closedByClient = false;
 
-  constructor(private readonly ws: WebSocket, ticket: string) {
+  constructor(private readonly ws: WebSocket, ticket: string, private readonly onSessionEnded: () => void = () => undefined) {
     ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'auth', ticket })));
     ws.addEventListener('message', (e: MessageEvent) => {
       if (this.current === 'closed' || this.current === 'error') return;
@@ -342,7 +355,9 @@ class WsTerminalSession implements TerminalSession {
     ws.addEventListener('close', (e: Event) => {
       if (this.closedByClient || this.current === 'error' || this.current === 'closed') return;
       // Server-initiated close: say why, and let the view end a dead session.
-      this.events.emit({ type: 'closed', ...closeMessage('terminal', e as CloseEvent) });
+      const closed = closeMessage('terminal', e as CloseEvent);
+      if (closed.reason === 'session_ended') this.onSessionEnded();
+      this.events.emit({ type: 'closed', ...closed });
       this.setStatus('closed');
     });
   }
@@ -406,7 +421,7 @@ class WsConsoleStream implements ConsoleStream {
   private lastSeq = 0;
   private closedByClient = false;
 
-  constructor(private readonly ws: WebSocket, ticket: string) {
+  constructor(private readonly ws: WebSocket, ticket: string, private readonly onSessionEnded: () => void = () => undefined) {
     ws.binaryType = 'blob';
     ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'auth', ticket })));
     ws.addEventListener('message', (e: MessageEvent) => {
@@ -435,6 +450,7 @@ class WsConsoleStream implements ConsoleStream {
     ws.addEventListener('close', (e: Event) => {
       if (this.closedByClient || this.current === 'error' || this.current === 'closed') return;
       const { reason, message } = closeMessage('console', e as CloseEvent);
+      if (reason === 'session_ended') this.onSessionEnded();
       this.setStatus('closed', message, reason === 'session_ended');
     });
   }

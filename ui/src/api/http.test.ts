@@ -316,6 +316,8 @@ describe('server-initiated stream close', () => {
     expect(events.find(e => e.type === 'closed')).toEqual({ type: 'closed', reason: 'session_ended', message: 'Your session ended, so the server closed the terminal.' });
     expect(session.status).toBe('closed');
 
+    // 4401 forgets the CSRF token, so a new stream needs a new session.
+    await api.login({ username: 'owner', password: 'pw' });
     const second = await api.openTerminal('atlas');
     const more: TerminalEvent[] = [];
     second.onEvent(e => more.push(e));
@@ -381,5 +383,84 @@ describe('console frame validation', () => {
     const stream = await api.openConsole('web-static');
     FakeSocket.last!.receive(new Blob([new Uint8Array([1])]));
     expect(stream.status).toBe('error');
+  });
+});
+
+describe('round 3: exact sign-out confirmation', () => {
+  test.each([200, 202])('a DELETE answered %i is unconfirmed: it rejects, keeps the token and the retry sends DELETE again', async status => {
+    let attempts = 0;
+    const { fetchImpl, calls } = fakeFetch({
+      'POST /api/v1/session': () => json(200, SESSION),
+      'DELETE /api/v1/session': () => (++attempts === 1 ? new Response(status === 200 ? '{}' : null, { status }) : new Response(null, { status: 204 })),
+    });
+    const api = new HttpApi({ fetch: fetchImpl });
+    await api.login({ username: 'owner', password: 'pw' });
+    await expect(api.logout()).rejects.toMatchObject({ code: 'unavailable', status });
+    await api.logout();
+    const deletes = calls.filter(c => c.init.method === 'DELETE');
+    expect(deletes).toHaveLength(2);
+    expect(header(deletes[1].init, CSRF_HEADER)).toBe(SESSION.csrfToken);
+  });
+});
+
+describe('round 3: revocation while a stream is busy', () => {
+  test('a 4401 mid-command drops every later message and forgets the CSRF token', async () => {
+    const { api, calls } = await streamingApi('/api/v1/hosts/atlas/terminal');
+    const session = await api.openTerminal('atlas');
+    const events: TerminalEvent[] = [];
+    session.onEvent(e => events.push(e));
+    const ws = FakeSocket.last!;
+    ws.receive(JSON.stringify({ type: 'ready' }));
+    session.run({ tool: 'cargo', args: ['build'] });
+    ws.receive(JSON.stringify({ type: 'started', commandId: 'c1', tool: 'cargo', args: ['build'] }));
+    ws.receive(JSON.stringify({ type: 'output', commandId: 'c1', stream: 'stdout', data: 'before close' }));
+    serverClose(ws, 4401);
+    ws.receive(JSON.stringify({ type: 'output', commandId: 'c1', stream: 'stdout', data: 'after close' }));
+    ws.receive(JSON.stringify({ type: 'exit', commandId: 'c1', exitCode: 0, outcome: 'succeeded', truncated: false }));
+    const data = events.flatMap(e => (e.type === 'output' ? [e.data] : []));
+    expect(data).toEqual(['before close']);
+    expect(events.some(e => e.type === 'exit')).toBe(false);
+    expect(events.at(-1)).toEqual({ type: 'status', status: 'closed' });
+    const before = calls.length;
+    await expect(api.openTerminal('atlas')).rejects.toMatchObject({ code: 'unauthorized' });
+    expect(calls).toHaveLength(before);
+  });
+
+  test('a 4401 on the console drops frames that arrive after it', async () => {
+    const { api } = await streamingApi('/api/v1/vms/web-static/console');
+    const stream = await api.openConsole('web-static');
+    const frames: ConsoleFrame[] = [];
+    stream.onFrame(f => frames.push(f));
+    const ws = FakeSocket.last!;
+    ws.receive(JSON.stringify({ type: 'frame', seq: 1, width: 640, height: 400, mime: 'image/png', capturedAt: '2026-11-23T12:00:01Z' }));
+    serverClose(ws, 4401);
+    ws.receive(new Blob([new Uint8Array([1])]));
+    ws.receive(JSON.stringify({ type: 'frame', seq: 2, width: 640, height: 400, mime: 'image/png', capturedAt: '2026-11-23T12:00:02Z' }));
+    ws.receive(new Blob([new Uint8Array([2])]));
+    expect(frames).toHaveLength(0);
+    expect(stream.status).toBe('closed');
+  });
+
+  test('a 4408 ticket rejection is reconnectable and keeps the session', async () => {
+    const { api } = await streamingApi('/api/v1/hosts/atlas/terminal');
+    const session = await api.openTerminal('atlas');
+    const events: TerminalEvent[] = [];
+    session.onEvent(e => events.push(e));
+    serverClose(FakeSocket.last!, 4408);
+    expect(events.find(e => e.type === 'closed')).toEqual({ type: 'closed', reason: 'server', message: 'The terminal could not be authorized (expired ticket or slow handshake). Reconnect to try again.' });
+    await expect(api.openTerminal('atlas')).resolves.toBeTruthy();
+  });
+});
+
+describe('round 3: strict console timestamps', () => {
+  test.each(['2026-02-30T12:00:00Z', '2026-11-23T12:00Z', '2026-11-23T24:00:00Z', '2026-11-23T12:60:00Z', '2026-11-23T12:00:60Z', '2026-11-23T12:00:00+24:00', '2026-11-23 12:00:00Z', '2026-11-23T12:00:00'])('%s is refused', capturedAt => {
+    expect(decodeFrameMeta({ seq: 1, width: 1, height: 1, mime: 'image/png', capturedAt }, 0)).toBeNull();
+  });
+
+  test('valid instants, including leap days, fractions and offsets, are accepted', () => {
+    for (const capturedAt of ['2028-02-29T23:59:59Z', '2026-11-23T12:00:00.123456789Z', '2026-11-23T12:00:00-05:30']) {
+      expect(decodeFrameMeta({ seq: 1, width: 1, height: 1, mime: 'image/png', capturedAt }, 0)).not.toBeNull();
+    }
+    expect(decodeFrameMeta({ seq: 1, width: 1, height: 1, mime: 'image/png', capturedAt: '2027-02-29T00:00:00Z' }, 0)).toBeNull();
   });
 });
