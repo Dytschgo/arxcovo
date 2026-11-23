@@ -190,7 +190,18 @@ async fn bridge(path: &Path) -> (Child, rmcp::service::RunningService<rmcp::Role
     (bridge, client)
 }
 
-#[cfg(windows)]
+/// The VM profile's configured client and the identity it must not be.
+/// Windows requires a client SID distinct from the supervisor. POSIX is a
+/// diagnostic-only profile whose socket is private to the supervisor UID,
+/// so its client must be that same UID.
+fn vm_clients(owner: &str, alternate: &str) -> (String, String) {
+    if cfg!(windows) {
+        (alternate.to_owned(), owner.to_owned())
+    } else {
+        (owner.to_owned(), alternate.to_owned())
+    }
+}
+
 async fn inspect_vm(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>, reason: &str) {
     let tools = client.list_tools(None).await.unwrap();
     let names = tools
@@ -263,10 +274,11 @@ async fn foreground_profile_boundaries() {
         "firmware_vars":asset,"qemu_receipt":asset}]);
     let agents = json!([{"principal":"fixture","token_sha256":hex::encode(Sha256::digest(token.as_bytes()))}]);
 
+    let (vm_client, wrong_client) = vm_clients(&owner, &client_identity);
     let rejected_state = root.join("rejected");
     std::fs::create_dir(&rejected_state).unwrap();
     let good = json!({"state_dir":rejected_state,"agents":agents,"local":{"address":address,
-        "client_identity":client_identity},"test_vms":{"enabled":false,"recipes":recipes}});
+        "client_identity":vm_client},"test_vms":{"enabled":false,"recipes":recipes}});
     save(&config_path, good.to_string());
     assert!(matches!(
         ForegroundConfig::load(&config_path).unwrap(),
@@ -283,9 +295,9 @@ async fn foreground_profile_boundaries() {
         config[field] = value;
         candidates.push(config.to_string());
     }
-    let mut same = good.clone();
-    same["local"]["client_identity"] = json!(owner);
-    candidates.push(same.to_string());
+    let mut wrong = good.clone();
+    wrong["local"]["client_identity"] = json!(wrong_client);
+    candidates.push(wrong.to_string());
     let mut reserved = good.clone();
     let service = arxd::service::layout::Layout::system().unwrap();
     let service = service.endpoint().to_str().unwrap();
@@ -331,7 +343,7 @@ async fn foreground_profile_boundaries() {
         });
         if let Some(enabled) = enabled {
             config["test_vms"] = json!({"enabled":enabled,"recipes":recipes});
-            config["local"]["client_identity"] = json!(client_identity);
+            config["local"]["client_identity"] = json!(vm_client);
         }
         // Each process gets its own socket on Unix, where deliberate hard
         // termination leaves the socket pathname behind.
@@ -359,14 +371,15 @@ async fn foreground_profile_boundaries() {
                 let _ = process.kill().await;
                 http_has_no_vm_routes(http.unwrap(), &token).await;
             }
-            #[cfg(windows)]
+            // The configured client reaches the diagnostics through the
+            // production bridge on every platform; POSIX is diagnostic-only.
             Some(enabled) => {
                 let (mut process, client) = bridge(&client_path).await;
                 inspect_vm(
                     &client,
                     if !enabled {
                         "disabled"
-                    } else if cfg!(target_arch = "x86_64") {
+                    } else if cfg!(all(windows, target_arch = "x86_64")) {
                         "qualification_missing"
                     } else {
                         "unsupported_platform"
@@ -375,21 +388,6 @@ async fn foreground_profile_boundaries() {
                 .await;
                 client.cancel().await.unwrap();
                 let _ = process.kill().await;
-            }
-            #[cfg(unix)]
-            Some(_) => {
-                let result = binary()
-                    .arg("mcp-stdio")
-                    .arg("--client-config")
-                    .arg(&client_path)
-                    .stdin(Stdio::null())
-                    .output()
-                    .await
-                    .unwrap();
-                assert!(
-                    !result.status.success(),
-                    "strict UID fence admitted the supervisor as a client"
-                );
             }
         }
         server.kill().await.unwrap();
@@ -440,4 +438,48 @@ async fn http_has_no_vm_routes(port: u16, token: &str) {
             .is_err()
     );
     client.cancel().await.unwrap();
+}
+
+/// The validated VM root is pinned until the store opens: a replacement
+/// under the same canonical name is impossible (Windows holds the
+/// directory without delete sharing) or refused before any state is
+/// created in it (POSIX compares the pinned directory identity).
+#[tokio::test]
+async fn validated_root_replacement_is_refused() {
+    let (temp, owner, alternate) = private_temp();
+    let root = temp.path();
+    let state = root.join("state");
+    std::fs::create_dir(&state).unwrap();
+    let token = "a".repeat(64);
+    let agents = json!([{"principal":"fixture","token_sha256":hex::encode(Sha256::digest(token.as_bytes()))}]);
+    let (vm_client, _) = vm_clients(&owner, &alternate);
+    let config_path = root.join("server.json");
+    save(
+        &config_path,
+        json!({"state_dir":state,"agents":agents,"local":{"address":endpoint(root),
+            "client_identity":vm_client},"test_vms":{"enabled":false}})
+        .to_string(),
+    );
+    let ForegroundConfig::TestVms(profile) = ForegroundConfig::load(&config_path).unwrap() else {
+        panic!("candidate profile expected");
+    };
+    let swap = std::fs::rename(&state, root.join("moved"));
+    #[cfg(windows)]
+    {
+        assert!(swap.is_err(), "the pinned VM root was replaced");
+        drop(profile);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        swap.unwrap();
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), arxd::local::run_vm_profile(profile))
+                .await
+                .expect("the replacement root was served");
+        assert_eq!(result.unwrap_err().to_string(), "server-state");
+        assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+    }
 }

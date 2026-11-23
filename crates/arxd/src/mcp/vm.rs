@@ -190,6 +190,9 @@ pub(crate) struct Supervisor {
     hold: Mutex<Option<tests::Hold>>,
     #[cfg(test)]
     closed_connections: std::sync::atomic::AtomicUsize,
+    /// Blocks final recovery until the sender sends or drops.
+    #[cfg(test)]
+    stall_recovery: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl Supervisor {
@@ -249,6 +252,8 @@ impl Supervisor {
             hold: Mutex::new(None),
             #[cfg(test)]
             closed_connections: Default::default(),
+            #[cfg(test)]
+            stall_recovery: Mutex::new(None),
         }))
     }
 
@@ -354,8 +359,18 @@ impl Supervisor {
                 drained.release().await?;
             }
         }
+        #[cfg(test)]
+        let stall = self
+            .stall_recovery
+            .lock()
+            .ok()
+            .and_then(|mut stall| stall.take());
         let supervisor = self.clone();
         let mut task = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(stall) = stall {
+                let _ = stall.recv();
+            }
             supervisor.controller.recover_after_drain()?;
             supervisor.sweep()?;
             anyhow::ensure!(
@@ -2003,7 +2018,7 @@ mod tests {
     }
 
     impl Harness {
-        async fn start(fail_cancelled: bool) -> Self {
+        async fn start(fail_cancelled: bool, interrupt_on_close: bool) -> Self {
             let temp = crate::service::application::tests::private_temp();
             let media = temp.path().join("fixture-media");
             fs::create_dir(&media).unwrap();
@@ -2053,12 +2068,24 @@ mod tests {
             });
             let trip = Arc::new(Notify::new());
             let (interrupt, interrupted) = tokio::sync::oneshot::channel::<()>();
+            // Optionally race an interrupt that fires as soon as a failed
+            // listener has closed admission, before its task is joined.
+            let watch = interrupt_on_close.then(|| supervisor.clone());
             let server = tokio::spawn(local::serve_vm_profile(
                 local::TripAcceptor::new(Listener::bind(&endpoint).unwrap(), trip.clone()),
                 config,
                 supervisor.clone(),
                 async move {
-                    let _ = interrupted.await;
+                    match watch {
+                        Some(supervisor) => {
+                            while !supervisor.gate.lock().unwrap().closed {
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                        None => {
+                            let _ = interrupted.await;
+                        }
+                    }
                     Ok(())
                 },
             ));
@@ -2166,7 +2193,7 @@ mod tests {
     }
 
     async fn journey() {
-        let mut h = Harness::start(false).await;
+        let mut h = Harness::start(false, false).await;
         let a = h.client(0).await;
         let b = h.client(1).await;
         let tools = a.list_tools(None).await.unwrap();
@@ -2602,6 +2629,30 @@ mod tests {
         let audit = h.audit().len();
         frame_cases(&h).await;
         assert_eq!(h.audit().len(), audit, "untrusted frames were audited");
+        // A trusted call with non-object arguments at the exact frame limit
+        // keeps its classification through the pump's rewrite.
+        let mut raw = h.raw().await;
+        let fixed = r#"{"jsonrpc":"2.0","id":"","method":"tools/call","params":{"name":"vm_template_build","arguments":null}}"#;
+        let long_id = "x".repeat(local::FRAME_LIMIT - fixed.len() - 1);
+        let frame = fixed.replacen(r#""id":"""#, &format!(r#""id":"{long_id}""#), 1);
+        assert_eq!(frame.len() + 1, local::FRAME_LIMIT);
+        raw.get_mut()
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        assert!(
+            raw.read_line(&mut line).await.unwrap() > 0,
+            "the exact-limit trusted call was dropped"
+        );
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], long_id);
+        assert_eq!(
+            response["result"]["structuredContent"],
+            json!({"ok":false,"reason":"invalid"})
+        );
+        assert_eq!(h.audit().len(), audit + 1);
+        drop(raw);
 
         // Ctrl+C equivalent: drain, join and recover, then refuse detached work.
         h.interrupt.take().unwrap().send(()).unwrap();
@@ -2678,11 +2729,16 @@ mod tests {
 
     #[tokio::test]
     async fn fatal_listener_failure_drains_and_drain_failure_takes_precedence() {
-        for (fail_cancelled, category) in [
-            (false, "server-listener"),
-            (true, "server-drain-unconfirmed"),
+        // Both orderings: the listener failure wins the select, or an
+        // interrupt wins after the listener failed. The fatal category is
+        // kept either way; an unresolved drain still takes precedence.
+        for (fail_cancelled, interrupt_on_close, category) in [
+            (false, false, "server-listener"),
+            (true, false, "server-drain-unconfirmed"),
+            (false, true, "server-listener"),
+            (true, true, "server-drain-unconfirmed"),
         ] {
-            let mut h = Harness::start(fail_cancelled).await;
+            let mut h = Harness::start(fail_cancelled, interrupt_on_close).await;
             let a = h.client(0).await;
             let build = call(
                 &a,
@@ -2712,6 +2768,32 @@ mod tests {
             );
             assert!(call_after_close(&a).await, "admission survived the failure");
         }
+    }
+
+    #[tokio::test]
+    async fn stalled_final_recovery_is_bounded() {
+        let temp = crate::service::application::tests::private_temp();
+        let supervisor = Supervisor::new(
+            temp.path(),
+            VmPolicy::default(),
+            ForegroundClock { utc: None },
+            None,
+            NativeRefusal::Disabled,
+            None,
+        )
+        .unwrap();
+        let (release, stall) = std::sync::mpsc::channel::<()>();
+        *supervisor.stall_recovery.lock().unwrap() = Some(stall);
+        supervisor.close();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.recover(Duration::from_millis(50)),
+        )
+        .await
+        .expect("final recovery outlived its bound");
+        assert_eq!(result.unwrap_err().to_string(), "VM recovery unconfirmed");
+        // Let the detached blocking task finish before the runtime stops.
+        release.send(()).unwrap();
     }
 
     /// After teardown the client's session is gone or refuses fresh work.
