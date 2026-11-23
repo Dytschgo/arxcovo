@@ -539,6 +539,60 @@ describe('round 5: an HTTP 401 is bound to the session it was sent under', () =>
     expect(f.trace.slice(-2)).toEqual(['GET', 'DELETE csrf-token-session-1-0123']);
     expect(f.live()).toBe(0);
   });
+
+  test.each(kinds)('an earlier-session 401 with no session held still reports unauthorized (%s)', async (_kind, open) => {
+    const f = racingApi();
+    await f.api.login(creds);
+    f.hold(1);
+    const old = open(f.api).then(() => null, (error: unknown) => error);
+    await f.api.logout();
+    expect(f.live()).toBe(0);
+    // No replacement session: the late 401 is authoritative, so the view is
+    // told the session ended (a no-op for the already-anonymous shell).
+    f.held[0](json(401, {}));
+    expect(await old).toMatchObject({ code: 'unauthorized', status: 401 });
+    // Nothing is held, so the next unsafe request is refused locally.
+    await expect(open(f.api)).rejects.toMatchObject({ code: 'unauthorized', status: null });
+  });
+
+  test('a delayed sign-out 204 does not clear a session that signed in meanwhile', async () => {
+    let heldDelete: ((response: Response) => void) | undefined;
+    let logins = 0;
+    const trace: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const method = init.method ?? 'GET';
+      const csrf = (init.headers as Record<string, string>)[CSRF_HEADER];
+      if (String(input) === '/api/v1/session') {
+        if (method === 'POST') return json(200, { ...SESSION, csrfToken: `csrf-token-session-${++logins}-0123` });
+        trace.push(`${method} ${csrf}`);
+        return new Promise<Response>(resolve => {
+          heldDelete = resolve;
+        });
+      }
+      trace.push(`TICKET ${csrf}`);
+      return json(200, { streamPath: '/api/v1/streams/s-1', ticket: 'ticket-0123456789abcdef' });
+    }) as typeof fetch;
+    const api = new HttpApi({ fetch: fetchImpl, WebSocket: FakeSocket as unknown as new (url: string) => WebSocket, pageUrl: 'https://atlas.tail.ts.net:7443/' });
+    await api.login(creds);
+    const signOut = api.logout();
+    expect(trace).toEqual(['DELETE csrf-token-session-1-0123']);
+    // Session B signs in while A's DELETE is still in flight, then A's 204 lands.
+    const second = await api.login(creds);
+    expect(second.csrfToken).toBe('csrf-token-session-2-0123');
+    heldDelete!(new Response(null, { status: 204 }));
+    await signOut;
+    // B's token survived: an unsafe request is still sent under it.
+    await api.openConsole('web-static');
+    expect(trace.at(-1)).toBe(`TICKET ${second.csrfToken}`);
+  });
+
+  test('a sign-out 204 with no newer session still clears the token', async () => {
+    const f = racingApi();
+    await f.api.login(creds);
+    await f.api.logout();
+    await expect(f.api.openConsole('web-static')).rejects.toMatchObject({ code: 'unauthorized', status: null });
+    expect(f.trace.filter(t => t.startsWith('TICKET'))).toEqual([]);
+  });
 });
 
 describe('bounded response bodies', () => {
