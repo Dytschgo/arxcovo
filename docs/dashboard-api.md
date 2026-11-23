@@ -219,28 +219,27 @@ per-session lock:
    refuses a command whose cancellation fired in between. Result: a command
    admitted before the bump may run to its executor cleanup, but its output
    stops at the close; a command not yet admitted is refused and never spawns.
-3. **Frame delivery: one serialized writer per stream.** Producers (the
-   executor's output, the console capturer) only enqueue application
-   messages; a single writer task owns the socket and is the only code that
-   hands data to the transport. For each message the writer takes the session
-   lock, checks the session is live and the generation unchanged, and, still
-   holding the lock, hands that one message to the transport (the WebSocket
-   send call). Taking the lock for that handoff is the last cancellable
-   point. A transport write is therefore either completed before the
-   revocation linearization point (step 1) or never started.
-   - On revocation, all pending application data is discarded: the queue is
-     cleared and the writer stops taking from it. Messages the writer had
-     dequeued but not yet handed off are dropped.
-   - Bytes already handed to the transport before the linearization point may
-     still be delivered: a WebSocket close cannot recall data written ahead
-     of it ([RFC 6455 §5.5.1](https://www.rfc-editor.org/rfc/rfc6455.html#section-5.5.1)).
-     Because the writer hands off one message at a time under the lock, this
-     is bounded to **at most one frame or message** already in flight.
-   - The 4401 close frame follows immediately as the writer's next and last
-     transport write.
-   - Bounded termination: if the close frame cannot be written within 5 s
-     (for example a stalled peer with a full send buffer), the server drops
-     the TCP connection.
+3. **Frame delivery.** Producers (the executor's output, the console
+   capturer) never write to the socket. They enqueue into a bounded
+   per-connection outbound buffer, and only after taking the session lock
+   and re-checking that the session is live and the generation unchanged;
+   the lock is released before any I/O. **The server never holds the session
+   lock across a blocking send.** The socket is drained by non-blocking or
+   async writes outside the lock. A full buffer applies backpressure to the
+   producer (for example pausing output reads), never to the lock.
+   - At the revocation linearization point (step 1, under the lock) the
+     server stops producing for the session's streams: every later enqueue
+     fails the generation check and is refused, and data still waiting in the
+     outbound buffer is discarded.
+   - Data the transport accepted before that point, meaning the socket send
+     buffer plus at most one message whose write was already in progress,
+     may still be delivered. A WebSocket close cannot recall it
+     ([RFC 6455 §5.5.1](https://www.rfc-editor.org/rfc/rfc6455.html#section-5.5.1)),
+     and the contract makes no stronger delivery claim.
+   - After revocation the server queues the 4401 close and sends it as soon
+     as the transport accepts it. The 5 s deadline starts at revocation: if
+     the connection cannot drain its buffer and send the close by then (a
+     stalled peer), the server aborts the TCP connection.
 4. **Expiry wake-up.** At redemption the server arms a timer per stream for
    the session's absolute expiry, and re-arms an idle-expiry timer whenever
    the session's idle deadline moves. When a timer fires, its callback takes
@@ -252,18 +251,19 @@ per-session lock:
    traffic) or busy (a command running or frames flowing).
 
 Server integration tests (backend PR) must cover: revocation during command
-admission; expiry during a running command; revocation while console frames
-are queued (all discarded) versus a frame already handed to the transport (at
-most one delivered, then 4401); a stalled peer (connection dropped within the
-bound); ticket redemption racing revocation; and a session renewal racing a
-callback for the old idle deadline (the session stays live).
+admission; expiry during a running command; no code path holding the session
+lock across a socket send (revocation completes while a send is
+backpressured); an enqueue refused after revocation, and buffered but
+unwritten data discarded; a stalled drain aborted within 5 s of revocation;
+ticket redemption racing revocation; and a session renewal racing a callback
+for the old idle deadline (the session stays live).
 
 The client already ignores everything that arrives after it observes a close,
-so the possible single in-flight message before a 4401 is harmless.
+so data the transport accepted before a 4401 is harmless to the UI.
 
 - Re-validate the session (live, unexpired, same generation) before every
-  terminal `run` and before sending every console frame or output chunk, as
-  above. A failed check closes the socket with 4401 and runs nothing.
+  terminal `run` and before enqueueing every console frame or output chunk,
+  as above. A failed check closes the socket with 4401 and runs nothing.
 - Close with **4403** when the target stops being allowed (for example the
   host is removed or the VM is deleted), and **1001** on shutdown. Close
   reasons are short (≤ 123 bytes) and contain no secrets.
@@ -352,8 +352,10 @@ Assets are served from an immutable in-memory table built once at startup,
 never from the filesystem per request. Startup validates `ui/dist` (its real
 path equals the requested path, every ancestor is a plain directory, device
 and inode pinned), then walks the tree once with caps on file count, depth,
-per-file bytes and total bytes. It refuses any symlink, junction or other
-reparse point, reads each served file through a handle whose identity must
+per-file bytes, total bytes and every enumerated directory entry. It refuses
+symlinks and junctions (other Windows reparse tags, which Node reports as
+plain files or directories, are a known limitation), reads each served file
+through a handle whose identity must
 match the walked file using a byte-bounded read, re-checks the directories
 leading to it, and finally re-verifies the root identity. Any failure stops
 the app from starting. Files changed on disk after startup are never served.
