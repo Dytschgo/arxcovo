@@ -324,6 +324,25 @@ impl Execution {
     pub(crate) fn policy_fixture(settings: Settings) -> Self {
         Self::build(settings, true)
     }
+
+    #[cfg(test)]
+    pub(crate) fn owner_fixture(
+        probe: impl Fn(&Request, &Cancellation) -> Result<ResultData, Reason> + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        let mut executor = Self::policy_fixture(Settings {
+            mode: Mode::CurrentUser,
+            acknowledge: Acknowledge::Shared,
+            workspace: PathBuf::new(),
+            environment: BTreeMap::new(),
+            limits: Limits {
+                memory_bytes: 16 * 1024 * 1024,
+                pids: 8,
+            },
+        });
+        executor.identity_mode = IdentityMode::CurrentUser;
+        executor.probe = Some(Arc::new(probe));
+        Arc::new(executor)
+    }
     #[cfg(all(test, windows))]
     pub(crate) fn is_busy(&self) -> bool {
         self.busy.load(Ordering::Acquire)
@@ -334,6 +353,11 @@ impl Execution {
     }
     pub fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+    /// Daemon shutdown has begun; owner surfaces report it as shutdown, not
+    /// as a lost target.
+    pub(crate) fn shutting_down(&self) -> bool {
+        self.shutdown.is_cancelled()
     }
     pub fn capability(&self) -> serde_json::Value {
         if self.identity_mode == IdentityMode::DedicatedAccount {
@@ -352,6 +376,43 @@ impl Execution {
             serde_json::json!("none_shares_owner_user")
         };
         serde_json::json!({"available":reason.is_none(),"reason":reason,"mode":self.identity_mode.as_str(),"claim":self.claim(),"dedicated":false,"isolation":isolation,"rights":null,"matches_current_user":true,"integrity":"medium","elevated":false})
+    }
+
+    pub(crate) fn owner_available(&self) -> bool {
+        self.identity_mode == IdentityMode::CurrentUser
+            && !self.quarantined.load(Ordering::Acquire)
+            && !self.shutdown.is_cancelled()
+    }
+
+    pub(crate) fn run_owner_command(
+        &self,
+        request: &Request,
+        cancel: &Cancellation,
+        started: impl FnOnce(),
+    ) -> Result<ResultData, Reason> {
+        if !self.owner_available() {
+            return Err(Reason::Unavailable);
+        }
+        if !request.validate() || !request.cwd.is_empty() {
+            return Err(Reason::InvalidArguments);
+        }
+        let _busy = self.claim_busy()?;
+        if cancel.is_cancelled() {
+            return Err(Reason::Shutdown);
+        }
+        started();
+        if cancel.is_cancelled() {
+            return Err(Reason::Shutdown);
+        }
+        self.run(request, cancel)
+    }
+
+    fn claim_busy(&self) -> Result<Busy<'_>, Reason> {
+        if self.busy.swap(true, Ordering::AcqRel) {
+            Err(Reason::Busy)
+        } else {
+            Ok(Busy(&self.busy))
+        }
     }
 
     /// Unit-test-only direct dispatch of an already started row.
@@ -424,10 +485,7 @@ impl Execution {
         if self.shutdown.is_cancelled() {
             return Err(Reason::Shutdown);
         }
-        if self.busy.swap(true, Ordering::AcqRel) {
-            return Err(Reason::Busy);
-        }
-        let _busy = Busy(&self.busy);
+        let _busy = self.claim_busy()?;
         let cancelled = || {
             let mut m = self.metadata(request, None, None);
             m.stop_reason = Some(StopReason::Cancelled);

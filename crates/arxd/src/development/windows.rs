@@ -1310,6 +1310,12 @@ fn drain_io(
     }
     Ok(c.total > limit as u64)
 }
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static BEFORE_RESUME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
 pub(super) fn run(
     execution: &Execution,
     r: &Request,
@@ -1432,6 +1438,27 @@ fn run_inner(
         let mut pi: PROCESS_INFORMATION = zeroed();
         let env = environment(settings);
         stage!(diag::Stage::CreateProcess);
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_CREATE.with(|hook| hook.take()) {
+            hook();
+        }
+        if cancel.is_cancelled() {
+            // Nothing was created, so there is nothing to clean up. Keep the
+            // shared cancelled-with-cleanup-facts classification.
+            return Ok(ResultData {
+                execution_mode: execution.identity_mode.as_str(),
+                claim: execution.claim(),
+                dedicated: false,
+                stop_reason: StopReason::Cancelled,
+                exit_code: None,
+                cleanup_confirmed: true,
+                matches_current_user: true,
+                stdout: String::new(),
+                stderr: String::new(),
+                stdout_dropped_bytes: 0,
+                stderr_dropped_bytes: 0,
+            });
+        }
         diagnostic!(diag::create_call());
         ok(CreateProcessW(
             wide(exe.as_os_str()).as_ptr(),
@@ -1468,16 +1495,24 @@ fn run_inner(
                 return Err(Reason::IdentityMismatch);
             }
             stage!(diag::Stage::Resume);
-            diagnostic!(diag::resume_call());
-            if ResumeThread(thread.0) == u32::MAX {
-                diagnostic!(diagnostic_failure(true, None));
-                return Err(Reason::ExecutionFailed);
+            #[cfg(test)]
+            if let Some(release) = BEFORE_RESUME.with(|hook| hook.take()) {
+                release();
             }
+            let mut reason = if cancel.is_cancelled() {
+                StopReason::Cancelled
+            } else {
+                diagnostic!(diag::resume_call());
+                if ResumeThread(thread.0) == u32::MAX {
+                    diagnostic!(diagnostic_failure(true, None));
+                    return Err(Reason::ExecutionFailed);
+                }
+                StopReason::Exited
+            };
             let start = Instant::now();
             let mut stdout = Captured::default();
             let mut stderr = Captured::default();
-            let mut reason = StopReason::Exited;
-            loop {
+            while reason == StopReason::Exited {
                 diagnostic!(native_replay::prefill(
                     &mut replay_writers,
                     native_replay::Fill::Loop
@@ -2995,6 +3030,97 @@ pub(crate) mod tests {
             output_bytes: 8192,
         };
         (dir, fixture_execution(settings), r)
+    }
+
+    #[test]
+    fn dashboard_cancellation_before_create_never_starts_a_process() {
+        let (_dir, execution, request) = fixture("handles");
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        let (result, native) = diag::observe(|| run_inner(&execution, &request, &cancel, true));
+        let output = result.expect("pre-create cancellation keeps cleanup facts");
+        assert_eq!(output.stop_reason, StopReason::Cancelled);
+        assert!(output.cleanup_confirmed && output.matches_current_user);
+        assert_eq!(output.exit_code, None);
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        assert_eq!(native.create_calls, 0);
+        assert_eq!(native.resume_calls, 0);
+        assert!(!execution.quarantined.load(Ordering::Acquire));
+    }
+
+    /// A cancellation that lands after the shared worker's own check but
+    /// before `CreateProcessW` keeps the MCP audit classification: a failed
+    /// row with cancelled stop reason and cleanup facts, never a refusal.
+    #[test]
+    fn mcp_cancellation_racing_create_records_cancelled_with_cleanup_facts() {
+        let (_dir, execution, request) = fixture("handles");
+        let cancel = Cancellation::default();
+        let copy = cancel.clone();
+        BEFORE_CREATE.with(|hook| hook.replace(Some(Box::new(move || copy.cancel()))));
+        let (work, native) = diag::observe(|| execution.work(Some(&request), &cancel));
+        let (_, outcome, metadata) = work.expect("cancelled work is not a refusal");
+        assert_eq!(native.create_calls, 0);
+        assert_eq!(native.resume_calls, 0);
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(metadata.reason, None);
+        assert_eq!(metadata.stop_reason, Some(StopReason::Cancelled));
+        assert_eq!(metadata.cleanup_confirmed, Some(true));
+        assert_eq!(metadata.exit_code, None);
+        // The public MCP audit row reads exactly as the shared dispatch commits it.
+        let state = crate::service::application::tests::private_temp();
+        let activity = crate::store::Activity::open(state.path()).unwrap();
+        let id = activity
+            .start_development("fixture-agent", "run_command")
+            .unwrap();
+        activity.finish_typed(id, outcome, &metadata).unwrap();
+        let read = activity.start("fixture-agent", "list_activity").unwrap();
+        let page = activity
+            .list(
+                "fixture-agent",
+                read,
+                &crate::store::ListActivity {
+                    limit: 50,
+                    before_id: None,
+                    include_reads: false,
+                },
+            )
+            .unwrap();
+        let row = page.activities.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.outcome, Outcome::Failed);
+        assert_eq!(row.metadata.reason, None);
+        assert_eq!(row.metadata.stop_reason, Some(StopReason::Cancelled));
+        assert_eq!(row.metadata.cleanup_confirmed, Some(true));
+        assert!(!execution.quarantined.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dashboard_cancellation_after_create_never_resumes_and_drains_the_job() {
+        let (_dir, execution, request) = fixture("handles");
+        let cancel = Cancellation::default();
+        std::thread::scope(|scope| {
+            let (reached, suspended) = std::sync::mpsc::channel();
+            let (release, proceed) = std::sync::mpsc::channel();
+            let copy = cancel.clone();
+            let runner = scope.spawn(move || {
+                BEFORE_RESUME.with(|hook| {
+                    hook.replace(Some(Box::new(move || {
+                        reached.send(()).unwrap();
+                        proceed.recv_timeout(Duration::from_secs(5)).unwrap();
+                    })))
+                });
+                diag::observe(|| run_inner(&execution, &request, &copy, true))
+            });
+            suspended.recv_timeout(Duration::from_secs(5)).unwrap();
+            cancel.cancel();
+            release.send(()).unwrap();
+            let (result, native) = runner.join().unwrap();
+            let output = result.expect("interrupted command has cleanup facts");
+            assert_eq!(native.create_calls, 1);
+            assert_eq!(native.resume_calls, 0);
+            assert_eq!(output.stop_reason, StopReason::Cancelled);
+            assert!(output.cleanup_confirmed);
+            assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        });
     }
     #[test]
     fn handle_slot_reuse_is_not_inheritance() {

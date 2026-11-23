@@ -1,4 +1,4 @@
-use super::{Boundary, DashboardConfig};
+use super::{Boundary, DashboardConfig, SystemClock, session::Sessions};
 use anyhow::{Result, ensure};
 use axum::{Extension, Router, http::uri::Authority};
 use hyper_util::{
@@ -23,6 +23,7 @@ pub struct Listener {
     socket: TcpListener,
     tls: Option<TlsAcceptor>,
     pub(super) boundary: Boundary,
+    pub(super) sessions: Arc<Sessions>,
 }
 
 impl Listener {
@@ -59,12 +60,18 @@ impl Listener {
             socket,
             tls,
             boundary: Boundary::new(authority, config.tls.is_some()),
+            sessions: Arc::new(Sessions::new()),
         })
     }
 
     pub async fn run(self, router: Router, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut tasks = JoinSet::new();
-        let Listener { socket, tls, .. } = self;
+        let Listener {
+            socket,
+            tls,
+            sessions,
+            ..
+        } = self;
         let result = loop {
             tokio::select! {
                 biased;
@@ -92,21 +99,24 @@ impl Listener {
                 }
             }
         };
-        tasks.shutdown().await;
-        result
+        let (_, streams) = tokio::join!(tasks.shutdown(), sessions.stop_streams(&SystemClock));
+        result.and(streams)
     }
 }
 
-async fn serve(io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, router: Router) {
+pub(super) async fn serve(
+    io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    router: Router,
+) {
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(TokioTimer::new())
         .header_read_timeout(HANDSHAKE_TIMEOUT)
         .max_headers(48)
-        .max_buf_size(16 * 1024)
-        .keep_alive(false);
+        .max_buf_size(16 * 1024);
     let _ = tokio::time::timeout(
         CONNECTION_TIMEOUT,
-        http.serve_connection(TokioIo::new(io), TowerToHyperService::new(router)),
+        http.serve_connection(TokioIo::new(io), TowerToHyperService::new(router))
+            .with_upgrades(),
     )
     .await;
 }

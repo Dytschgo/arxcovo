@@ -128,7 +128,12 @@ async fn run() -> anyhow::Result<()> {
             .await
             .context("server-bind")?;
         let router = listener
-            .router(settings, activity.clone(), &config.state_dir)
+            .router(
+                settings,
+                activity.clone(),
+                &config.state_dir,
+                config.execution.clone(),
+            )
             .context("server-state")?;
         Some((listener, router))
     } else {

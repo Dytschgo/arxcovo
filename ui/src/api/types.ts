@@ -165,7 +165,10 @@ export interface ConsoleFrame {
 export interface ConsoleStream {
   readonly status: ConsoleStatus;
   onFrame(listener: (frame: ConsoleFrame) => void): () => void;
-  /** `sessionEnded` is true when the server closed the stream because the session ended. */
+  /**
+   * `sessionEnded` is true when the server closed the stream because the session ended.
+   * That report can follow an earlier `closed` status from a server notice.
+   */
   onStatus(listener: (status: ConsoleStatus, reason?: string, sessionEnded?: boolean) => void): () => void;
   close(): void;
 }
