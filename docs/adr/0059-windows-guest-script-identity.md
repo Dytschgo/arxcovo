@@ -243,7 +243,8 @@ Development-host tests also check PowerShell `exit 7`, the self-test
 sentinel, and removal of the request directory.
 
 **Hosted CI quarantine.** On Windows with `CI=true`,
-`RUNNER_ENVIRONMENT=github-hosted` and `ImageOS=win25`, the tests
+`RUNNER_ENVIRONMENT=github-hosted` and an `ImageOS` starting with `win25`
+(including `win25-vs2026`), the tests
 `production_identity_runs_powershell_and_removes_its_request_directory` and
 `self_test_admits_the_production_identity` allow the observed Windows
 PowerShell 5.1 exit `0x80131623` from their original scripts after verified
@@ -252,6 +253,8 @@ assertions run for all other outcomes and environments. The exception
 triggers a diagnostic ladder with native and Framework controls, bare
 PowerShell, and the wrapper in fresh request directories. Nextest shows the
 `KNOWN-ISSUE` line on test failure and in local `--no-capture` runs.
+Unexpected outcomes also print `CI`, `RUNNER_ENVIRONMENT`, `ImageOS` and
+`RUNNER_OS` to explain how the test classified the runner.
 Qualification requires an installed service run on the owner's pinned
 Windows 11 guest and is **unverified on real hardware**.
 

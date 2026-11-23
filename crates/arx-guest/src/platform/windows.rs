@@ -3267,7 +3267,7 @@ mod tests {
     ) -> bool {
         ci.is_some_and(|value| value.eq_ignore_ascii_case("true"))
             && runner == Some("github-hosted")
-            && image == Some("win25")
+            && image.is_some_and(|value| value.starts_with("win25"))
             && outcome
                 == Ok(ScriptOutcome::Exited {
                     exit_code: HOSTED_POWERSHELL_CRASH,
@@ -3276,14 +3276,22 @@ mod tests {
 
     fn quarantine_hosted_crash(
         outcome: Result<ScriptOutcome, &'static str>,
+        expected: ScriptOutcome,
         profile: &Arc<Profile>,
     ) -> bool {
-        let known = is_known_hosted_crash(
-            outcome,
-            std::env::var("CI").ok().as_deref(),
-            std::env::var("RUNNER_ENVIRONMENT").ok().as_deref(),
-            std::env::var("ImageOS").ok().as_deref(),
+        if outcome == Ok(expected) {
+            return false;
+        }
+        let ci = std::env::var("CI").ok();
+        let runner = std::env::var("RUNNER_ENVIRONMENT").ok();
+        let image = std::env::var("ImageOS").ok();
+        let os = std::env::var("RUNNER_OS").ok();
+        eprintln!(
+            "restricted PowerShell runner: CI={ci:?} RUNNER_ENVIRONMENT={runner:?} \
+             ImageOS={image:?} RUNNER_OS={os:?}"
         );
+        let known =
+            is_known_hosted_crash(outcome, ci.as_deref(), runner.as_deref(), image.as_deref());
         if known {
             hosted_restricted_powershell_ladder(profile);
         }
@@ -3291,7 +3299,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_exception_requires_the_exact_image_and_crash_exit() {
+    fn hosted_exception_requires_a_win25_image_and_the_exact_crash_exit() {
         let ci = Some("true");
         let hosted = Some("github-hosted");
         let affected = Some("win25");
@@ -3299,11 +3307,18 @@ mod tests {
             exit_code: HOSTED_POWERSHELL_CRASH,
         });
         assert!(is_known_hosted_crash(crash, ci, hosted, affected));
+        assert!(is_known_hosted_crash(
+            crash,
+            ci,
+            hosted,
+            Some("win25-vs2026")
+        ));
         for (ci, runner, image) in [
             (None, hosted, affected),
             (ci, None, affected),
             (ci, Some("self-hosted"), affected),
             (ci, hosted, Some("win22")),
+            (ci, hosted, Some("win22-vs2026")),
             (ci, hosted, None),
         ] {
             assert!(!is_known_hosted_crash(crash, ci, runner, image));
@@ -3994,11 +4009,12 @@ mod tests {
             script.as_bytes().to_vec(),
             Instant::now() + POWERSHELL_GUARD,
         );
-        if quarantine_hosted_crash(outcome, &profile) {
+        let expected = ScriptOutcome::Exited { exit_code: 7 };
+        if quarantine_hosted_crash(outcome, expected, &profile) {
             assert_eq!(root.entries(), 0, "request and probe directories removed");
             return;
         }
-        assert_powershell(outcome, ScriptOutcome::Exited { exit_code: 7 }, || {
+        assert_powershell(outcome, expected, || {
             restricted_failure_report(&profile, script.as_bytes())
         });
         assert_eq!(root.entries(), 0, "request directory removed after cleanup");
@@ -4027,13 +4043,13 @@ mod tests {
             SELF_TEST.as_bytes().to_vec(),
             Instant::now() + POWERSHELL_GUARD,
         );
-        if quarantine_hosted_crash(outcome, &profile) {
-            assert_eq!(root.entries(), 0, "request and probe directories removed");
-            return;
-        }
         let sentinel = ScriptOutcome::Exited {
             exit_code: SELF_TEST_SENTINEL,
         };
+        if quarantine_hosted_crash(outcome, sentinel, &profile) {
+            assert_eq!(root.entries(), 0, "request and probe directories removed");
+            return;
+        }
         assert_powershell(outcome, sentinel, || {
             restricted_failure_report(&profile, SELF_TEST.as_bytes())
         });
