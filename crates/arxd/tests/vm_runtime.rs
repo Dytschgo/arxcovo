@@ -41,6 +41,16 @@ fn parse(value: &Value) -> anyhow::Result<VmRuntimeProfile> {
 }
 
 #[test]
+fn offline_snapshot_lease_is_closed_even_with_enabled_profile() {
+    let profile = parse(&profile()).unwrap();
+    assert!(profile.enabled());
+    assert!(matches!(
+        CandidateRuntime::new(Some(&profile)).snapshot_lease(),
+        Err(NativeRefusal::QualificationMissing)
+    ));
+}
+
+#[test]
 fn candidate_profile_is_closed_and_separate_from_foreground() {
     let original = profile();
     assert_eq!(

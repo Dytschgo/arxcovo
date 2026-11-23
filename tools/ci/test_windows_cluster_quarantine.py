@@ -1,4 +1,4 @@
-"""Pin the narrow platform quarantine; keep test bodies compiled everywhere."""
+"""Pin the fixture quarantines and keep test bodies compiled everywhere."""
 from pathlib import Path
 import re
 import unittest
@@ -12,7 +12,13 @@ ISSUANCE = ['i1_happy_retry', 'i2_follower_no_append', 'i3_single_consumption_ra
 ISSUANCE_REQUIRED = ['anchored_single_voter_receipt_replay_and_revocation']
 REASON_FIXTURE = 'Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md'
 PURE = 'read_failure_attribution_covers_all_errors'
-TLS_FIXTURE = ['enrolled_target_binding_revocation_and_stale_acceptance', 'authenticated_sender_mismatch_and_assumed_founder_control', 'store_lock_wait_does_not_block_runtime']
+TLS_SENDER_MISMATCH = 'authenticated_sender_mismatch_and_assumed_founder_control'
+TLS_NON_WINDOWS_REASON = 'intermittent NotLeader quarantine: docs/ROADMAP.md Known issues (Engine fix hold)'
+TLS_NON_WINDOWS_GATE = (
+    '#[cfg_attr(\n    not(target_os = "windows"),\n    ignore = "'
+    + TLS_NON_WINDOWS_REASON + '"\n)]\n'
+)
+TLS_FIXTURE = ['enrolled_target_binding_revocation_and_stale_acceptance', TLS_SENDER_MISMATCH, 'store_lock_wait_does_not_block_runtime']
 TLS_REQUIRED = ['live_verifier_does_not_retain_store_and_poison_refuses', 'founder_joiner_mutual_tls_real_identities', 'learner_catch_up_gives_joiner_own_registry']
 TLS_PURE = ['tls_single_node_directory_precondition']
 MEMBERSHIP_UNSAMPLED = ['interrupted_joint_exact_guarded_flatten']
@@ -148,8 +154,13 @@ def assert_real_identity_body(source):
 
 def assert_tls_engine_quarantine(source):
     assert_real_identity_body(source)
-    assert_fixture_quarantine(source, ((TLS_FIXTURE, REASON_FIXTURE),),
-                              TLS_PURE, required=TLS_REQUIRED)
+    # Strip only the pinned exception, then apply the unchanged Windows fixture rules.
+    windows_gate = '#[cfg_attr(\n    target_os = "windows",\n    ignore = "' + REASON_FIXTURE + '"\n)]\n'
+    windows_binding = windows_gate + 'async fn ' + TLS_SENDER_MISMATCH + '('
+    binding = TLS_NON_WINDOWS_GATE + windows_binding
+    assert source.count(binding) == 1
+    assert_fixture_quarantine(source.replace(binding, windows_binding, 1),
+                              ((TLS_FIXTURE, REASON_FIXTURE),), TLS_PURE, required=TLS_REQUIRED)
     segments = re.split(r'(?m)^((?:async )?fn [a-z0-9_]+\()', source)
     constructors = []
     for signature, body in zip(segments[1::2], segments[2::2]):
@@ -314,6 +325,27 @@ class QuarantineTests(unittest.TestCase):
         with patch(__name__ + '.ISSUANCE_REQUIRED', []):
             with self.assertRaises(AssertionError):
                 assert_issuance_quarantine(source)
+
+    def test_exact_non_windows_sender_mismatch_quarantine(self):
+        source = (ROOT / 'crates/arxd/src/cluster/consensus/tls_engine_tests.rs').read_text(encoding='utf-8')
+        assert_tls_engine_quarantine(source)
+        gate = TLS_NON_WINDOWS_GATE
+        other = 'async fn store_lock_wait_does_not_block_runtime('
+        with_extra_gate = source.replace(other, gate + other)
+        mutations = {
+            'removed': source.replace(gate, ''),
+            'moved to another test': with_extra_gate.replace(gate, '', 1),
+            'added to another test': with_extra_gate,
+            'broader predicate': source.replace(gate, gate.replace('not(target_os = "windows")', 'all()')),
+            'narrower predicate': source.replace(gate, gate.replace('not(target_os = "windows")', 'target_os = "linux"')),
+            'missing reason': source.replace(gate, gate.replace(' = "' + TLS_NON_WINDOWS_REASON + '"', '')),
+            'wrong reason': source.replace(TLS_NON_WINDOWS_REASON, 'unapproved reason'),
+        }
+        for label, mutant in mutations.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(mutant, source)
+                with self.assertRaises(AssertionError):
+                    assert_tls_engine_quarantine(mutant)
 
     def test_exact_windows_only_quarantine(self):
         base = ROOT / "crates/arxd/src/cluster/consensus"
