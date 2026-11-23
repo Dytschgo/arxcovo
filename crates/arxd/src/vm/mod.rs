@@ -4,11 +4,13 @@ pub mod guest;
 mod model;
 pub mod paths;
 mod policy;
+mod publish;
 pub mod qemu_args;
 pub mod qemu_img;
 pub mod qmp;
 pub(crate) mod reaper;
 pub mod runtime;
+pub mod static_web;
 mod template;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
@@ -18,4 +20,5 @@ pub(crate) use controller::{ActivityReceipt, CatalogEntry, ForegroundSubject, Pr
 pub use model::*;
 pub use policy::{Capacity, HostObservation, Resources, VmPolicy};
 pub use reaper::{MonotonicReaperTicks, ReaperTick};
+pub use template::ubuntu_web;
 pub use template::{AssetPin, RecipeError, UbuntuAssets, UbuntuRecipe};

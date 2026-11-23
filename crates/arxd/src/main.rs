@@ -91,6 +91,12 @@ async fn run() -> anyhow::Result<()> {
     };
     let activity =
         Arc::new(arxd::store::Activity::open(&config.state_dir).context("server-state")?);
+    let _vault = config
+        .local
+        .as_ref()
+        .map(|_| arxd::vault::initialize_foreground(&activity, &config.state_dir))
+        .transpose()
+        .context("server-state")?;
     let local = config
         .local
         .as_ref()

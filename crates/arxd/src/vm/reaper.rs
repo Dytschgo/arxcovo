@@ -899,6 +899,49 @@ mod reaper_tests {
     }
 
     #[test]
+    fn review_sealed_build_reuse_checks_staging_fence_before_verifying() {
+        let f = Fixture::new();
+        let golden = f.build(1, true);
+        let (_, slots, worker) = f.reserve_clone(golden, 2);
+        assert_eq!(
+            f.ctl.finish_linked_clone(&worker, slots, None).unwrap(),
+            Status::Interrupted
+        );
+        let verifications = std::cell::Cell::new(0);
+        let admit = |number| {
+            f.ctl
+                .admit_build(
+                    BuildRequest {
+                        principal: OWNER,
+                        key: key(NOW, number),
+                        recipe: "e03a3012c18d20b8691490b580ab41e9",
+                        digest: [1; 32],
+                        retained: disk(),
+                        transient: disk(),
+                    },
+                    host(),
+                    resources(),
+                    |_, _| {
+                        verifications.set(verifications.get() + 1);
+                        Some(golden.2)
+                    },
+                )
+                .unwrap()
+        };
+        assert!(matches!(
+            admit(1),
+            Ok(BuildAdmission::Existing(receipt)) if receipt.receipt.status == Status::Succeeded
+        ));
+        let fresh = admit(3);
+        assert!(matches!(fresh, Err(Refusal::Shutdown)), "{fresh:?}");
+        assert_eq!(verifications.get(), 0);
+        assert_eq!(
+            f.count("SELECT count(*) FROM vm_operations WHERE action=11"),
+            1
+        );
+    }
+
+    #[test]
     fn review_failed_staging_refusals_distinguish_the_live_lease() {
         let f = Fixture::new();
         let (vm, slots, worker) = f.reserve_clone(f.build(1, true), 2);
