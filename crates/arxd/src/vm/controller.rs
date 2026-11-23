@@ -1273,7 +1273,10 @@ impl<C: Clock> VmController<C> {
             subject,
             action,
         };
-        map_full(self.store.transact(|db| binding.replay(db, utc(self.clock.now())?, *closed)))
+        map_full(
+            self.store
+                .transact(|db| binding.replay(db, utc(self.clock.now())?, *closed)),
+        )
     }
 
     #[cfg(test)]

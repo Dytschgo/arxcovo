@@ -239,8 +239,9 @@ pub(crate) async fn run_vm_listener(
         None,
         stop,
         ConnectionProfile {
+            #[cfg(target_os = "linux")]
+            build: None,
             vm: Some(supervisor),
-            ..ConnectionProfile::default()
         },
     )
     .await

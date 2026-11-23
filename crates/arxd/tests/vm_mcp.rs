@@ -9,11 +9,7 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    path::Path,
-    process::Stdio,
-    time::Duration,
-};
+use std::{path::Path, process::Stdio, time::Duration};
 use tokio::process::{Child, Command};
 
 fn binary() -> Command {

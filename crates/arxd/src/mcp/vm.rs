@@ -668,7 +668,12 @@ impl VmInventory {
             match controller.get_status(&self.principal, vm)? {
                 Err(reason) => return self.refuse(action, None, reason, reason.into()),
                 Ok(status) if status.state == "expired" || status.state == "teardown" => {
-                    return self.refuse(action, Some(vm), Refusal::Expired, Refusal::Expired.into());
+                    return self.refuse(
+                        action,
+                        Some(vm),
+                        Refusal::Expired,
+                        Refusal::Expired.into(),
+                    );
                 }
                 Ok(_) => {}
             }
@@ -917,7 +922,7 @@ fn vm_row(status: VmStatus, gate: &Gate, get: bool) -> Value {
     }
     if get {
         value["snapshots"] = json!([]);
-        if let Some(cleanup) = status.cleanup {
+        if let Some(cleanup) = status.cleanup.and_then(cleanup_wire) {
             value["cleanup"] = json!(cleanup);
         }
     }
@@ -940,7 +945,7 @@ fn operation_row(operation: OperationStatus) -> Value {
     if let Some(stage) = operation.stage {
         value["stage"] = json!(stage);
     }
-    if let Some(cleanup) = operation.cleanup {
+    if let Some(cleanup) = operation.cleanup.and_then(cleanup_wire) {
         value["cleanup"] = json!(cleanup);
     }
     if let Some(vm) = operation.vm {
@@ -1011,9 +1016,30 @@ fn activity_row(row: crate::vm::ActivityReceipt) -> Value {
         value["reason"] = json!(REFUSALS[reason as usize - 1]);
     }
     if let Some(cleanup) = row.cleanup {
-        value["cleanup"] = json!(if cleanup { "confirmed" } else { "unconfirmed" });
+        value["cleanup"] = json!(proof_wire(cleanup));
     }
     value
+}
+
+/// Coordinator steering (2026-11-23): explicit proof maps `true` to
+/// `confirmed` and `false` to `cleanup_unconfirmed`; absent proof is omitted.
+fn proof_wire(confirmed: bool) -> &'static str {
+    if confirmed {
+        "confirmed"
+    } else {
+        "cleanup_unconfirmed"
+    }
+}
+
+/// Closed projection of a store cleanup label. `pending` is the current VM
+/// teardown state, never operation proof; any other label is omitted.
+fn cleanup_wire(label: &str) -> Option<&'static str> {
+    match label {
+        "confirmed" => Some(proof_wire(true)),
+        "unconfirmed" => Some(proof_wire(false)),
+        "pending" => Some("pending"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1410,6 +1436,7 @@ mod tests {
             let activity = worker.activity_id();
             match work {
                 Work::Start => {
+                    let controller = controller.clone();
                     self.jobs.spawn(async move {
                         let boot = Boot::start(&cancel).await;
                         match boot {
@@ -1427,6 +1454,7 @@ mod tests {
                 }
                 Work::Stop => {
                     let boot = registry.boots.remove(&vm).flatten();
+                    let controller = controller.clone();
                     self.jobs.spawn(async move {
                         let complete = match boot {
                             Some(boot) => boot.stop().await.is_ok(),
@@ -1451,6 +1479,7 @@ mod tests {
                         .expect("ready under fixture gate");
                     let hold = self.script_hold.take();
                     worker.deadline += Duration::from_secs(6);
+                    let controller = controller.clone();
                     self.jobs.spawn(async move {
                         let result = if released(hold, &cancel).await {
                             boot.channel.run_script(&cancel, script, seconds).await.ok()
@@ -1596,7 +1625,7 @@ mod tests {
 
     async fn guest_peer(mut stream: DuplexStream) -> Result<()> {
         use arx_guest::{Request, Response, ScriptExecution, ScriptStatus};
-        while let Some(length) = stream.read_u32().await.ok() {
+        while let Ok(length) = stream.read_u32().await {
             ensure!(
                 length as usize <= arx_guest::MAX_FRAME,
                 "fixture frame length"
@@ -1783,10 +1812,10 @@ mod tests {
         .await;
         assert_eq!(rejected.err().unwrap().to_string(), "peer-auth-rejected");
         #[cfg(windows)]
-        let wrong = "S-1-5-18";
+        let wrong = String::from("S-1-5-18");
         #[cfg(unix)]
         let wrong = (unsafe { libc::geteuid() } ^ 1).to_string();
-        let rejected = local::connect_vm_fixture(&endpoint.address, wrong.as_ref(), &token_a).await;
+        let rejected = local::connect_vm_fixture(&endpoint.address, &wrong, &token_a).await;
         assert_eq!(
             rejected.err().unwrap().to_string(),
             "peer-connect-or-identity"
