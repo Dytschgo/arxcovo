@@ -58,20 +58,69 @@ error codes are not interpreted.
 
 The service advertises script execution only after both of these pass:
 
-1. **Policy gate.** These HKLM values must be absent:
-   `SOFTWARE\Policies\Microsoft\Windows\PowerShell\{ExecutionPolicy,EnableScripts}`
-   and `__PSLockdownPolicy` under
-   `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`. These must be
-   absent or `0`: `EnableTranscripting`, `EnableScriptBlockLogging` and
-   `EnableModuleLogging` under the matching `...\PowerShell\*` policy keys. An
-   unreadable value counts as a conflict.
+1. **Policy gate.** The service reads both HKLM and its own HKCU. Scripts run
+   as the same user, so HKCU holds their user policy. Under
+   `SOFTWARE\Policies\Microsoft\Windows\PowerShell`:
+   - `ExecutionPolicy` and `EnableScripts` must be absent in both hives. These
+     are the MachinePolicy and UserPolicy scopes, which would override
+     `-ExecutionPolicy Bypass`.
+   - HKLM `ScriptBlockLogging\EnableScriptBlockLogging` must be present and `0`.
+     The HKCU value must be absent or `0`.
+   - `EnableScriptBlockInvocationLogging`, `ModuleLogging\EnableModuleLogging`
+     and `Transcription\EnableTranscripting` must be absent or `0` in both hives.
+
+   `__PSLockdownPolicy` under
+   `SYSTEM\CurrentControlSet\Control\Session Manager\Environment` must be
+   absent. An unreadable or non-DWORD value counts as a conflict.
 2. **Self-test.** A fixed probe script runs through the production path: the
-   production identity, Job and request directory. It requires FullLanguage,
-   MachinePolicy and UserPolicy `Undefined`, and an effective `Bypass`. It
-   writes one file to its request directory and must exit with the exact
-   sentinel `23131`. Any other outcome, including a start-up failure such as
-   `0xC0000142` or the CLR's `0xFFFF0000`, leaves execution `Unavailable`. An
-   unverified self-test cleanup fails the service.
+   production identity, Job and request directory. It uses no cmdlets. It
+   requires FullLanguage and the pinned module path, writes one file to its
+   request directory, and must exit with the exact sentinel `23131`. Any other
+   outcome leaves execution `Unavailable`. That includes a start-up failure such
+   as `0xC0000142`, the CLR's `0xFFFF0000`, or the FailFast exit `0x80131623`
+   that Windows PowerShell uses for any unhandled exception. An unverified
+   self-test cleanup fails the service.
+
+### Script content logging (decision)
+
+Windows PowerShell 5.1 logs script blocks it classes as "suspicious" to the
+PowerShell Operational event log (event 4104) whenever script block logging
+is **not configured**. The wrapper passes caller text to
+`ScriptBlock::Create`, so an unconfigured policy can copy caller scripts into
+host telemetry. That conflicts with design §3, which says no payload may
+reach managed evidence. Scripts can carry caller data, so treating them as
+non-secret is not acceptable. No supported per-process switch disables the
+automatic logging. The adapter does not tamper with PowerShell internals.
+
+**Decision:** execution is available only when machine policy explicitly
+disables script block logging (`EnableScriptBlockLogging = 0`). Explicit
+disablement also turns off the automatic suspicious-block logging. Module
+logging and transcription must be off as well. Owner-managed policy is read,
+never changed. The 5b image provisioning must set the HKLM value. Hosts
+without it, including hosted CI runners and development hosts, leave
+production admission closed. Tests inject the policy snapshot. Scripts that
+start their own transcript or enable module logging choose to do so
+themselves.
+
+### Fixed environment and module discovery
+
+The interpreter environment is fixed, sorted and free of caller bytes:
+`APPDATA`, `LOCALAPPDATA`, `PATH`, `PSModuleAnalysisCachePath`, `PSModulePath`,
+`SystemRoot`, `TEMP`, `TMP`, `USERPROFILE` and `windir`. Every per-user
+location (profile, application data and the module analysis cache) is inside
+the request directory. A fresh or Medium-integrity account profile is never
+written, and everything is removed with the directory.
+
+Windows PowerShell 5.1 prepends `Program Files\WindowsPowerShell\Modules` to any
+inherited `PSModulePath`. This host showed it. The wrapper therefore resets
+`$env:PSModulePath` to `$PSHOME\Modules` before reading stdin, so command
+discovery is system-only, as design §3 requires. The wrapper and self-test use
+no cmdlets, so starting them never triggers module discovery. Hosted
+`windows-2025` CI failed admission (`0x80131623`) and timed out under the
+earlier environment, which extended discovery into the image's large Program
+Files module tree. That cause was inferred, not reproduced. The development
+host could not reproduce the failure. The tests print the `.NET Runtime`
+event (1025) on any unexpected PowerShell outcome.
 
 ### Workspaces (D2)
 
@@ -83,6 +132,13 @@ directory itself. After Job cleanup is verified, a bounded walk removes the
 directory: at most 4096 entries and depth 32. The walk never follows a reparse
 point and clears read-only attributes. A failed removal retires the session
 with no result frame.
+
+Setup and removal run on worker threads that hold no port handle and no
+child. Setup must finish within the request deadline, plus a 2 s grace on
+cancellation. Removal must finish within 2 s, and never later than the
+request deadline plus 4 s, inside the host's budget-plus-5 s allowance. A
+missed step is left detached and the session retires. Nothing waits on it or
+uses its result.
 
 **Workspace size is `unqualified`.** It is not enforced in v1. Possible
 mechanisms are a fixed-size dedicated volume or an NTFS quota. A quota is per
@@ -144,5 +200,8 @@ These remain owner-host items, **unverified on real hardware**: the LocalService
 token shape at System integrity, the session 0 window station, PowerShell
 under this profile as LocalService, the service-SID ACLs on the work root and
 the vioserial device, `check_scm` and `protect_parent` against the installed
-service, the effective policy values on the pinned image, and broker denials
-through Task Scheduler, SCM, WMI and COM.
+service, the effective policy values on the pinned image (including the
+required `EnableScriptBlockLogging = 0` and the absence of 4104 events for a
+probe script), and broker denials through Task Scheduler, SCM, WMI and COM.
+Separately, hosted CI has not yet run the revised environment on the
+`windows-2025` image.
