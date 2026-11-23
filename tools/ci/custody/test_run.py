@@ -1288,6 +1288,99 @@ class A3ProcessTests(unittest.TestCase):
         self.assertTrue(child.reaped)
         self.assertIsNone(h.first)
 
+    def test_git_source_pipe_accepts_over_64_kib_and_refuses_over_256_kib(self):
+        source = 'a' * 40 + ':tools/ci/custody/run.py'
+        cases = (
+            ('git-source-just-over-64-kib', ['git', 'show', source], run.PIPE_CAP + 1, None),
+            ('git-source-just-over-256-kib', ['git', 'show', source], run.GIT_SOURCE_CAP + 1, 'PipeOverflow'),
+            ('other-command-just-over-64-kib', ['git', 'rev-parse', 'HEAD'], run.PIPE_CAP + 1, 'PipeOverflow'),
+        )
+        for label, argv, size, expected in cases:
+            with self.subTest(label=label):
+                clock = Clock()
+                payload = b'x' * size
+                streams = {}
+
+                class Stream:
+                    def __init__(self, data, fd):
+                        self.chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
+                        self.chunks.append(b'')
+                        self.closed = False
+                        self.fd = fd
+                        streams[fd] = self
+
+                    def fileno(self):
+                        return self.fd
+
+                    def close(self):
+                        self.closed = True
+
+                class Selector:
+                    def __init__(self, open_streams):
+                        self.open_streams = open_streams
+
+                    def select(self, _timeout):
+                        ready = [s for s in self.open_streams if not s.closed and s.chunks]
+                        return [(SimpleNamespace(fileobj=s), None) for s in ready]
+
+                    def unregister(self, _fileobj):
+                        return None
+
+                    def get_map(self):
+                        return {s.fd: s for s in self.open_streams if not s.closed}
+
+                    def close(self):
+                        return None
+
+                stdout, stderr = Stream(payload, 3), Stream(b'', 4)
+                child = run.Child.__new__(run.Child)
+                child.clock, child.deadline = clock, 10
+                child.out, child.reaped, child.killed = bytearray(), False, False
+                child.selector = Selector([stdout, stderr])
+
+                def poll():
+                    return 0 if stdout.closed and stderr.closed else None
+
+                def wait(timeout):
+                    child.p.returncode = 0
+                    return 0
+
+                child.p = SimpleNamespace(poll=poll, wait=wait, returncode=None, pid=1)
+
+                def kill():
+                    child.killed = child.reaped = True
+
+                child.kill = kill
+
+                def spawn(_argv, _deadline, _clock):
+                    return child
+
+                def fake_read(fd, _n):
+                    return streams[fd].chunks.pop(0)
+
+                h = run.Harness(clock, spawn)
+                output = io.StringIO()
+                with redirect_stdout(output), patch.object(run.os, 'read', fake_read), patch.object(run.time, 'sleep', clock.sleep):
+                    if expected is None:
+                        self.assertEqual(h.command(argv, 'preflight'), payload)
+                    else:
+                        with self.assertRaisesRegex(run.Refusal, expected):
+                            h.command(argv, 'preflight')
+                expected_limit = run.GIT_SOURCE_CAP if argv[1] == 'show' else run.PIPE_CAP
+                self.assertEqual(child.limit, expected_limit)
+                if expected is None:
+                    self.assertIsNone(h.first)
+                    self.assertFalse(child.killed)
+                    self.assertTrue(child.reaped)
+                else:
+                    self.assertEqual(h.first, expected)
+                    self.assertEqual(len(child.out), expected_limit)
+                    self.assertTrue(child.killed)
+                    records = [json.loads(line) for line in output.getvalue().splitlines()]
+                    refusal = next(r for r in records if r['event'] == 'command-refusal')
+                    self.assertEqual(refusal['predicate'], 'PipeOverflow')
+                    self.assertEqual(refusal['operation'], 'git-source' if argv[1] == 'show' else 'git-head')
+
     def test_a3_signal_timeout_overflow_io_reap_and_spawn_are_fatal(self):
         cases = (
             ('signal', dict(code=-9), 'CommandExit'),

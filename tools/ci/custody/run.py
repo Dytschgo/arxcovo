@@ -22,8 +22,10 @@ BASE = 'docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe
 ADOPTED_PINS = '28f882cb018eb956c60c190f8718fb982923cd096adb608e15e194c51fa2e167'
 # SHA256 of docs/briefs/m3-custody-hosted-pins.md after amendment A4 (2026-11-23).
 # Recorded evidence uses this digest. ADR 0037 must quote it and ADOPTED_PINS.
-PINS = '394a6d37c538c81cf3dc5d114ede5d8865f445edba80a5ca80300b1a70dcdf22'
+PINS = '65e3a466c1a118beba6243b37c90743a187858a91c6b16d246154aa1cb5e7d36'
 MIB = 1024 * 1024
+PIPE_CAP = 64 * 1024
+GIT_SOURCE_CAP = 256 * 1024
 MODES = {'create-founder', 'create-learner', 'deny-build', 'same-uid-control', 'release', 'restart-founder', 'restart-learner'}
 LIMIT = 1024 * 1024
 
@@ -559,12 +561,13 @@ class Child:
             self.selector.register(stream, selectors.EVENT_READ)
         self.out = bytearray()
         self.reaped = False
+        self.limit = PIPE_CAP
 
     def pump(self):
         for key, _ in self.selector.select(0):
             data = os.read(key.fileobj.fileno(), 4096)
             if data:
-                require(len(self.out) + len(data) <= 65536, 'PipeOverflow', 'pump', 'len(self.out) + len(data) <= 65536')
+                require(len(self.out) + len(data) <= self.limit, 'PipeOverflow', 'pump', f'len(self.out) + len(data) <= {self.limit}')
                 self.out.extend(data)
             else:
                 self.selector.unregister(key.fileobj)
@@ -710,6 +713,8 @@ class Harness:
         failure = None
         try:
             child = self.spawn(self.bound_argv(argv), deadline, self.clock)
+            # git-source is git show of the four pinned inputs. Every other command stays at 64 KiB.
+            child.limit = GIT_SOURCE_CAP if command_role(argv) == 'git-source' else PIPE_CAP
             self.children.append(child)
             while True:
                 if not cleanup and self.holder:
@@ -1062,15 +1067,8 @@ class Harness:
         self.image = (self.root / 'image.id').read_text().strip()
         require(re.fullmatch(r'sha256:[a-f0-9]{64}', self.image), 'ImageIdentity', 'qualify', "re.fullmatch('sha256:[a-f0-9]{64}', self.image)")
         image = json.loads(self.command(['docker', 'image', 'inspect', self.image], 'image'))[0]
-        # image['Size'] is Docker's inspect-reported image size. Packed-only
-        # accounting can report less than the candidate (hosted evidence:
-        # context 84,499,396 bytes, Size 50,089,568). A driver that sums packed
-        # content and unpacked snapshot usage counts the candidate twice and the
-        # pinned Ubuntu base twice. Review figures: 256 MiB candidate gzip
-        # 268,517,359 plus unpacked 268,435,456, and the pinned layer packed
-        # 29,793,297 plus decompressed tar 80,715,776. That sum is 647,461,888
-        # bytes, about 617.5 MiB. 768 MiB leaves 157,844,480 bytes, about
-        # 150.5 MiB, of headroom.
+        # image['Size'] worst case and the 768 MiB cap are amendment A4 in
+        # docs/adr/0037-acceptance-custody.md.
         require(image['Id'] == self.image and image['Architecture'] == 'amd64' and image['Os'] == 'linux' and image['Size'] <= 768*MIB, 'ImageIdentity', 'qualify', "image['Id'] == self.image and image['Architecture'] == 'amd64' and (image['Os'] == 'linux') and (image['Size'] <= 768 * MIB)")
         self.record('image', identity=self.image, bytes=image['Size'])
         self.record_scratch('image')
