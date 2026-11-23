@@ -35,7 +35,7 @@ Optional variables:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ARX_LIVE_PORT` | `47613` | Loopback port of the dashboard |
-| `ARX_LIVE_ROOT` | `$TMP/arx-live-dashboard` | Absolute parent of the run directory. It must be an owner-private directory (0700, or TokenUser-owned with only TokenUser, SYSTEM and Administrators granted on Windows). If it does not exist yet, the launcher creates it with those permissions; an existing directory that is not private is refused. |
+| `ARX_LIVE_ROOT` | `$TMP/arx-live-dashboard` | Absolute parent of the run directory; see "Root checks" below. |
 | `ARX_LIVE_SHOTS` | `test-results/m6-live-screenshots` | Screenshot folder |
 
 To refresh the committed evidence, run once with
@@ -47,9 +47,8 @@ To refresh the committed evidence, run once with
 `live_dashboard_server` in `crates/arxd/tests/dashboard_live.rs` as
 Playwright's web server. The launcher:
 
-1. checks `ARX_LIVE_ROOT` (absolute, the product's path checks, owner-private)
-   and creates one fresh run directory inside it with a random 16-byte name,
-   protected owner-only;
+1. checks `ARX_LIVE_ROOT` (see "Root checks") and creates one fresh run
+   directory inside it with a random 16-byte name, verified owner-only;
 2. seeds 27 `run_command` activity rows through the public `Activity` store,
    and a VM catalog opened by the real `VmController` with two test VMs
    (one running Ubuntu with a ready snapshot, one stopped Windows);
@@ -72,13 +71,39 @@ way while it unwinds. Nothing else under `ARX_LIVE_ROOT` is ever touched. A
 run killed from outside (for example by an interrupted Playwright process)
 can leave its `run-*` directory behind; remove that one by hand.
 
+**Root checks.** Every check runs before anything is created, so a refused
+root leaves the filesystem unchanged:
+
+- the path is absolute and normalized, and its existing parent chain has no
+  links, junctions or other reparse points (arxd's `checked_path`, the same
+  rule arxd applies to private state paths);
+- the parent is not controlled by another account: owned by the current user
+  or the system (root; SYSTEM or Administrators on Windows), and on Linux not
+  writable by group or others unless sticky, as on `/tmp`. Like arxd's state
+  directory, the parent itself may be shared scratch;
+- an existing root must be a plain directory (not a link or reparse point)
+  that is owner-private: owned by the current user, mode 0700 on Linux, or
+  only TokenUser, SYSTEM and Administrators granted on Windows.
+
+Only then is a missing root created, one level, owner-only from the moment it
+exists (mode 0700, or a creation-time owner and protected DACL on Windows),
+and verified again; a root that fails that verification is removed.
+
 Non-ignored tests in the same file run in the normal nextest job:
 `live_fixture_seeds_activity_and_vm_catalog` fails if the seeding drifts from
 the current schema, `run_cleanup_removes_only_its_own_directory` proves that
-another run's directory and a look-alike sibling survive cleanup, and
-`run_dir_refuses_a_root_that_is_not_private` proves the root check.
+another run's directory and a look-alike sibling survive cleanup,
+`run_dir_refuses_a_root_that_is_not_private` proves the privacy check, and
+`run_dir_refuses_links_without_creating_anything` proves that a missing root
+below a link (symlink, or junction on Windows), a linked root and a root with
+a missing parent are refused with nothing created.
 
 ## What it proves
+
+Session cookies never reach test output: the cookie flags are compared as a
+projection without the value, and the replay uses Node's HTTP client (not
+Playwright's request API, whose call log records header values), rethrows any
+failure with a fixed message and returns only the status code.
 
 Each row is asserted on the HTTP response the browser received and on the
 rendered UI.
@@ -87,11 +112,11 @@ rendered UI.
 | --- | --- |
 | Login | Production bundle (no demo banner); `GET /api/v1/session` is 401 before sign-in; a wrong password gets 401 and the server's message; sign-in gets 200 and sets `__Host-arx_session` with `HttpOnly`, `Secure`, `SameSite=Strict` and `Path=/` (only these fields are compared, never the value) |
 | Hosts | `GET /api/v1/hosts` returns one online, always-on host; the card shows it with its architecture badge; `GET /api/v1/hosts/{id}` is 200 and the detail lists the two catalog VMs and recent activity |
-| VMs | `GET /api/v1/vms` returns both seeded VMs with their states; the table shows two x86_64 badges; `GET /api/v1/vms/{id}` returns kind, guest, arch, state, 4 vCPUs, 8 GiB memory, 20 GiB disk and the 1 GiB snapshot, and the detail renders those values and the architecture badge |
-| Activity | Page 1: 20 distinct ids, strictly descending, `nextBeforeId` equal to the last id; page 2 is requested with exactly that `before_id` and returns the remaining 7 older rows, newest first, with `nextBeforeId: null`; the UI shows 20, then 7, then 20 again |
+| VMs | `GET /api/v1/vms` returns both seeded VMs with their states; the table shows two x86_64 badges; `GET /api/v1/vms/{id}` returns kind, guest, arch, state, 4 vCPUs, 8 GiB memory, 20 GiB disk and the 1 GiB snapshot, and the detail renders the vCPU, memory and disk values, the architecture badge and one snapshot row showing `1.0 GiB` |
+| Activity | Page 1: 20 distinct ids, strictly descending, `nextBeforeId` equal to the last id; page 2 is requested with exactly that `before_id` and returns the remaining 7 rows, distinct, all older than the cursor and absent from page 1, newest first, with `nextBeforeId: null`; the UI shows 20, then 7, then 20 again |
 | Terminal | `POST /api/v1/hosts/{id}/terminal` answers 503 with `{"error":{"code":"unavailable",…}}` because the fixture configures no owner executor (the host itself is reachable); the UI shows the error, Reconnect and a disabled input |
 | Console | `POST /api/v1/vms/{id}/console` answers 503 with the same envelope because production capture is unwired; the UI shows the error and no frame |
-| Sign-out | The old cookie, replayed from a separate cookie-less client, is accepted (200) while the session is live; `DELETE /api/v1/session` answers 204; the same replay then gets 401 |
+| Sign-out | The old cookie, replayed over plain loopback HTTP from Node with no cookie jar, is accepted (200) while the session is live; `DELETE /api/v1/session` answers 204; the same replay then gets 401 |
 | Session ended elsewhere | A second tab's sign-out gets 204; the old cookie replay gets 401; the first tab's next `GET /api/v1/activity` gets 401 and the UI returns to login with "Your session has ended." |
 
 Measured on the Windows dev host (2026-11-23): 8 tests in about 25 s with a

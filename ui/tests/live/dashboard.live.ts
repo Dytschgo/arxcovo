@@ -1,4 +1,5 @@
-import { expect, request, test, type BrowserContext, type Page, type Response } from '@playwright/test';
+import { expect, test, type BrowserContext, type Page, type Response } from '@playwright/test';
+import http from 'node:http';
 import path from 'node:path';
 
 // Runs against a real arxd serving the production ui/dist (see
@@ -62,19 +63,26 @@ async function sessionValue(context: BrowserContext) {
 }
 
 /**
- * Status of GET /api/v1/session sent from a fresh request context (no cookie
- * jar) with an explicit, possibly stale, session cookie.
+ * Status of GET /api/v1/session sent over plain loopback HTTP with an
+ * explicit, possibly stale, session cookie and no cookie jar. Node's client
+ * is used instead of Playwright's request API, whose call log records header
+ * values; every failure here is rethrown with a fixed message and only the
+ * status code is returned, so the cookie value can never reach test output.
  */
-async function replayStatus(value: string) {
-  const client = await request.newContext({
-    baseURL: `http://localhost:${process.env.ARX_LIVE_PORT}`,
-    extraHTTPHeaders: { cookie: `${COOKIE}=${value}` },
+function replayStatus(value: string): Promise<number> {
+  const port = Number(process.env.ARX_LIVE_PORT);
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: '127.0.0.1', port, path: '/api/v1/session', method: 'GET', timeout: 10_000, headers: { host: `localhost:${port}`, cookie: `${COOKIE}=${value}` } },
+      res => {
+        res.resume();
+        resolve(res.statusCode ?? 0);
+      },
+    );
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', () => reject(new Error('Session replay request failed.')));
+    req.end();
   });
-  try {
-    return (await client.get('/api/v1/session')).status();
-  } finally {
-    await client.dispose();
-  }
 }
 
 const isApi = (method: string, pathname: string) => (r: Response) =>
@@ -160,7 +168,9 @@ test('VMs: catalog rows, architecture badges and detail with size and snapshot',
   await expect(size.locator('.facts > div', { hasText: 'Disk' }).locator('dd')).toHaveText('20 GiB');
   await expect(page.locator('section[aria-labelledby="vm-facts"]').getByTitle('Machine architecture: x86_64')).toBeVisible();
   await expect(page.getByRole('heading', { level: 2, name: /Snapshots/ })).toContainText('1');
-  await expect(page.getByText(SNAPSHOT)).toBeVisible();
+  const snapshot = page.locator('section[aria-labelledby="vm-snapshots"] li', { hasText: SNAPSHOT });
+  await expect(snapshot).toHaveCount(1);
+  await expect(snapshot.locator('span').last()).toHaveText('1.0 GiB');
   await shot(page, '05-vm-detail', host);
 });
 
@@ -186,7 +196,8 @@ test('activity: newest first with server cursor paging', async ({ page }) => {
   const ids2: number[] = two.entries.map((e: { id: number }) => e.id);
   expect(ids2).toHaveLength(ACTIVITY_ROWS - 20);
   expect(ids2).toEqual([...ids2].sort((a, b) => b - a));
-  expect(ids2.every(id => id < one.nextBeforeId)).toBe(true);
+  expect(new Set(ids2).size).toBe(ids2.length);
+  expect(ids2.every(id => id < one.nextBeforeId && !ids1.includes(id))).toBe(true);
   expect(two.nextBeforeId).toBeNull();
   await expect(page.getByRole('list', { name: 'Activity, page 2' }).getByRole('listitem')).toHaveCount(ACTIVITY_ROWS - 20);
   await expect(page.getByRole('button', { name: 'Older' })).toBeDisabled();

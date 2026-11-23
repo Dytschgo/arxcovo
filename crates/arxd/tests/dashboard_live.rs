@@ -60,8 +60,8 @@ fn protect(path: &Path) {
 }
 
 fn private_dir(path: &Path) {
-    std::fs::create_dir(path).unwrap();
-    protect(path);
+    create_private_dir(path).unwrap();
+    assert!(is_private(path), "private fixture directory");
 }
 
 /// The same owner and permission rule the product applies to private state:
@@ -121,17 +121,91 @@ mod win {
 
     /// Owner TokenUser and a protected DACL granting TokenUser full control,
     /// followed by `extra` SDDL ACEs (tests use it to widen access).
-    pub(super) fn protect(path: &Path, extra: &str) {
-        let user = token_user();
-        let sid = user_sid(&user);
-        // SAFETY: every string is NUL-terminated and every allocation is
-        // freed once; the SID outlives the calls.
+    fn user_text(sid: PSID) -> String {
+        // SAFETY: the converted string is NUL-terminated and freed once.
         unsafe {
             let mut text = ptr::null_mut();
             assert_ne!(ConvertSidToStringSidW(sid, &mut text), 0);
             let len = (0..184).find(|i| *text.add(*i) == 0).unwrap();
             let sid_text = String::from_utf16(std::slice::from_raw_parts(text, len)).unwrap();
             LocalFree(text.cast());
+            sid_text
+        }
+    }
+
+    /// Create a new directory whose owner and protected TokenUser-only DACL
+    /// are part of its creation, so it never exists with inherited access.
+    pub(super) fn create_private(path: &Path) -> std::io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+        let user = token_user();
+        let sid_text = user_text(user_sid(&user));
+        let sddl: Vec<u16> = format!("O:{sid_text}D:P(A;OICI;FA;;;{sid_text})")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let name = wide(path);
+        // SAFETY: both strings are NUL-terminated; the descriptor is used
+        // only while live and freed once.
+        unsafe {
+            let mut descriptor = ptr::null_mut();
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                ptr::null_mut(),
+            ) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            };
+            let created = CreateDirectoryW(name.as_ptr(), &attributes);
+            let error = std::io::Error::last_os_error();
+            LocalFree(descriptor);
+            if created == 0 { Err(error) } else { Ok(()) }
+        }
+    }
+
+    /// The owner is TokenUser, SYSTEM or Builtin Administrators.
+    pub(super) fn trusted_owner(path: &Path) -> bool {
+        let user = token_user();
+        let me = user_sid(&user);
+        let name = wide(path);
+        // SAFETY: the descriptor owns the owner pointer and is freed once.
+        unsafe {
+            let (mut owner, mut descriptor) = (ptr::null_mut(), ptr::null_mut());
+            if GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut descriptor,
+            ) != 0
+            {
+                return false;
+            }
+            let trusted = !owner.is_null()
+                && (EqualSid(owner, me) != 0
+                    || IsWellKnownSid(owner, WinLocalSystemSid) != 0
+                    || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0);
+            LocalFree(descriptor);
+            trusted
+        }
+    }
+
+    pub(super) fn protect(path: &Path, extra: &str) {
+        let user = token_user();
+        let sid = user_sid(&user);
+        let sid_text = user_text(sid);
+        // SAFETY: every string is NUL-terminated and every allocation is
+        // freed once; the SID outlives the calls.
+        unsafe {
             let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid_text}){extra}")
                 .encode_utf16()
                 .chain(Some(0))
@@ -231,27 +305,81 @@ mod win {
     }
 }
 
+/// Create a directory that is owner-only from the moment it exists: mode
+/// 0700 on Linux (the umask can only remove bits), or a creation-time owner
+/// and protected DACL on Windows. Never opens or follows an existing entry.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(windows)]
+    win::create_private(path)
+}
+
+/// The parent of `ARX_LIVE_ROOT` may be shared scratch, but it must not be
+/// controlled by another account: owned by the current user or the system
+/// (root; SYSTEM or Administrators on Windows), and on Linux not writable by
+/// group or others unless the sticky bit protects its entries (as on /tmp).
+fn trusted_parent(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).is_ok_and(|m| {
+            m.is_dir()
+                && (m.uid() == unsafe { libc::geteuid() } || m.uid() == 0)
+                && (m.mode() & 0o022 == 0 || m.mode() & 0o1000 != 0)
+        })
+    }
+    #[cfg(windows)]
+    {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) && win::trusted_owner(path)
+    }
+}
+
 /// Allocate this run's own directory: a fresh, randomly named child of an
-/// owner-private `root`. Creates `root` (one level, owner-only) only when it
-/// does not exist yet; refuses an existing root that is not a private, plain
-/// directory. Dropping or closing the guard removes this directory only.
+/// owner-private `root`. Every check runs before anything is created: the
+/// root must be absolute and normalized, its existing parent chain free of
+/// links and reparse points (arxd's `checked_path`), its parent not owned by
+/// another account, and an existing root a plain owner-private directory.
+/// Only then is a missing root created owner-only (one level) and verified.
+/// Any refusal leaves the filesystem unchanged. Dropping or closing the guard
+/// removes this run's directory only.
 fn run_dir(root: &Path) -> Result<tempfile::TempDir, String> {
-    if !root.is_absolute() {
-        return Err("ARX_LIVE_ROOT must be absolute".into());
+    let refused = |reason: &str| Err(format!("ARX_LIVE_ROOT refused: {reason}"));
+    if !root.is_absolute() || root.file_name().is_none() {
+        return refused("an absolute directory path is required");
     }
-    if std::fs::symlink_metadata(root).is_err() {
-        std::fs::create_dir(root).map_err(|_| "cannot create ARX_LIVE_ROOT")?;
-        protect(root);
+    let parent = root.parent().expect("absolute path with a file name");
+    if arxd::config::checked_path(parent).is_err() {
+        return refused("the parent path is missing, aliased or crosses a link or reparse point");
     }
-    arxd::config::checked_path(root).map_err(|_| "ARX_LIVE_ROOT path refused")?;
-    if !is_private(root) {
-        return Err("ARX_LIVE_ROOT must be an owner-private directory".into());
+    if !trusted_parent(parent) {
+        return refused("the parent directory is controlled by another account");
+    }
+    match std::fs::symlink_metadata(root) {
+        Ok(_) => {
+            if arxd::config::checked_path(root).is_err() || !is_private(root) {
+                return refused("it must be a plain owner-private directory");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_private_dir(root).map_err(|_| "cannot create ARX_LIVE_ROOT")?;
+            if arxd::config::checked_path(root).is_err() || !is_private(root) {
+                let _ = std::fs::remove_dir(root);
+                return refused("the new directory did not verify as owner-private");
+            }
+        }
+        Err(_) => return refused("cannot inspect the path"),
     }
     let dir = tempfile::Builder::new()
         .prefix(RUN_PREFIX)
         .rand_bytes(16)
         .tempdir_in(root)
         .map_err(|_| "cannot create the run directory")?;
+    // The root's inheritable owner-only DACL (or tempfile's 0700) already
+    // applies; re-apply and verify before anything is written inside.
     protect(dir.path());
     if !is_private(dir.path()) {
         return Err("run directory is not private".into());
@@ -393,6 +521,47 @@ fn run_dir_refuses_a_root_that_is_not_private() {
     assert!(run_dir(&root).is_err());
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     assert!(run_dir(Path::new("relative-root")).is_err());
+}
+
+/// Link `link` to the existing directory `target`: a symlink on Linux, a
+/// junction (no privilege needed) on Windows.
+fn link_dir(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    assert!(
+        Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+fn entries(path: &Path) -> usize {
+    std::fs::read_dir(path).unwrap().count()
+}
+
+#[test]
+fn run_dir_refuses_links_without_creating_anything() {
+    let parent = private_parent();
+    let target = parent.path().join("target");
+    private_dir(&target);
+    let link = parent.path().join("link");
+    link_dir(&target, &link);
+    let before = entries(parent.path());
+    // A missing leaf below a link would otherwise be created in `target`.
+    assert!(run_dir(&link.join("live-root")).is_err());
+    // A link as the root itself, even to a private directory.
+    assert!(run_dir(&link).is_err());
+    // A missing parent is refused rather than created.
+    assert!(run_dir(&parent.path().join("absent").join("live-root")).is_err());
+    assert_eq!(entries(&target), 0, "nothing created through the link");
+    assert_eq!(entries(parent.path()), before, "nothing created beside it");
+    assert!(!parent.path().join("absent").exists());
 }
 
 #[test]
