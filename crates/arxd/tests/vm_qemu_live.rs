@@ -37,7 +37,7 @@ fn pinned(path: &str, size: u64, digest: &str, bound: u64) {
 }
 
 #[tokio::test]
-#[ignore = "manual TCG smoke with an explicitly supplied owner-staged QEMU 11.1.0 manifest"]
+#[ignore = "manual TCG smoke with an explicitly supplied owner-staged QEMU 11.1.3 manifest"]
 async fn optional_tcg_qmp_startup_hold() {
     let manifest =
         std::env::var_os("ARX_M4_TCG_MANIFEST").expect("explicit TCG fixture manifest is required");

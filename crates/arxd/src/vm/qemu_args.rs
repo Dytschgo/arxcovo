@@ -5,7 +5,7 @@ use super::{
 };
 use serde_json::{Value, json};
 
-pub const QEMU_VERSION: &str = "11.1.0";
+pub const QEMU_VERSION: &str = "11.1.3";
 pub const MACHINE: &str = "pc-q35-11.1";
 pub const GUEST_PORT: &str = "org.arxcovo.agent.0";
 /// The fixed QEMU device id of the guest port; `VSERPORT_CHANGE` names it.

@@ -25,8 +25,8 @@ pub struct VmRuntimeProfile {
 
 #[derive(Deserialize)]
 enum VmManifest {
-    #[serde(rename = "qemu-11.1.0-windows-x64")]
-    Qemu1110WindowsX64,
+    #[serde(rename = "qemu-11.1.3-windows-x64")]
+    Qemu1113WindowsX64,
 }
 
 #[derive(Debug)]
@@ -78,7 +78,7 @@ impl VmRuntimeProfile {
 
     pub fn manifest_id(&self) -> &'static str {
         match self.manifest {
-            VmManifest::Qemu1110WindowsX64 => "qemu-11.1.0-windows-x64",
+            VmManifest::Qemu1113WindowsX64 => "qemu-11.1.3-windows-x64",
         }
     }
 }
