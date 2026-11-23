@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import { FIXTURE_HOSTS, FIXTURE_VMS } from './fixtures';
 import { activitySearch, CSRF_HEADER, decodeFrameMeta, decodeTerminalMessage, HttpApi, readBounded } from './http';
+import { isApiError } from './types';
 import type { ConsoleFrame, ConsoleStream, TerminalEvent, TerminalSession } from './types';
 
 const SESSION = { user: { name: 'owner' }, csrfToken: 'csrf-token-0123456789', expiresAt: '2026-11-23T20:00:00Z' };
@@ -392,6 +393,151 @@ describe('round 4: a stream 4401 is bound to the session it was opened under', (
   test('sign-out without a token rejects when the session cannot be re-read', async () => {
     const { fetchImpl } = fakeFetch({ 'GET /api/v1/session': () => json(503, { error: { code: 'unavailable', message: 'arxd is restarting' } }) });
     await expect(new HttpApi({ fetch: fetchImpl }).logout()).rejects.toMatchObject({ code: 'unavailable' });
+  });
+});
+
+describe('round 5: an HTTP 401 is bound to the session it was sent under', () => {
+  /**
+   * A fake arxd with one live session at a time. Ticket requests can be held
+   * and answered later.
+   */
+  function racingApi() {
+    let live = 0;
+    let logins = 0;
+    let hold = 0;
+    const held: ((response: Response) => void)[] = [];
+    const trace: string[] = [];
+    const token = () => `csrf-token-session-${live}-0123`;
+    const fetchImpl = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = String(input);
+      const method = init.method ?? 'GET';
+      const csrf = (init.headers as Record<string, string>)[CSRF_HEADER];
+      if (url === '/api/v1/session') {
+        trace.push(method === 'DELETE' ? `DELETE ${csrf}` : method);
+        if (method === 'POST') {
+          live = ++logins;
+          return json(200, { ...SESSION, csrfToken: token() });
+        }
+        if (method === 'DELETE') {
+          if (!live) return json(401, {});
+          if (csrf !== token()) return json(403, {});
+          live = 0;
+          return new Response(null, { status: 204 });
+        }
+        if (!live) return json(401, {});
+        return json(200, { ...SESSION, csrfToken: token() });
+      }
+      trace.push(`TICKET ${csrf}`);
+      if (hold > 0) {
+        hold -= 1;
+        return new Promise<Response>(resolve => held.push(resolve));
+      }
+      if (!live) return json(401, {});
+      if (csrf !== token()) return json(403, {});
+      return json(200, { streamPath: '/api/v1/streams/s-1', ticket: 'ticket-0123456789abcdef' });
+    }) as typeof fetch;
+    const api = new HttpApi({ fetch: fetchImpl, WebSocket: FakeSocket as unknown as new (url: string) => WebSocket, pageUrl: 'https://atlas.tail.ts.net:7443/' });
+    return {
+      api,
+      trace,
+      held,
+      live: () => live,
+      hold: (n: number) => {
+        hold = n;
+      },
+    };
+  }
+
+  const creds = { username: 'owner', password: 'pw' };
+  const failure = (p: Promise<unknown>) => p.then(() => 'resolved', (e: unknown) => (isApiError(e) ? e.code : 'thrown'));
+  const kinds = [
+    ['console', (api: HttpApi) => api.openConsole('web-static')],
+    ['terminal', (api: HttpApi) => api.openTerminal('atlas')],
+  ] as const;
+
+  test.each(kinds)('a delayed %s ticket 401 from session A leaves session B usable', async (_kind, open) => {
+    const f = racingApi();
+    await f.api.login(creds);
+    f.hold(1);
+    const old = failure(open(f.api));
+    await f.api.logout();
+    await f.api.login(creds);
+    await open(f.api);
+    f.held[0](json(401, {}));
+    // The old open fails without telling the view to end session B.
+    expect(await old).toBe('unavailable');
+    await open(f.api);
+    expect(f.trace.filter(t => t.startsWith('TICKET')).slice(-2)).toEqual(['TICKET csrf-token-session-2-0123', 'TICKET csrf-token-session-2-0123']);
+    await f.api.logout();
+    expect(f.live()).toBe(0);
+    expect(f.trace.at(-1)).toBe('DELETE csrf-token-session-2-0123');
+  });
+
+  test.each(kinds)('the stale-401 sign-out interleaving still revokes session B (%s)', async (_kind, open) => {
+    const f = racingApi();
+    await f.api.login(creds);
+    f.hold(2);
+    const old1 = failure(open(f.api));
+    const old2 = failure(open(f.api));
+    await f.api.logout();
+    await f.api.login(creds);
+    f.held[0](json(401, {}));
+    expect(await old1).toBe('unavailable');
+    // Neither stale 401 cleared B's token, so sign-out needs no recovery GET
+    // and revokes B. (A stale 401 during recovery is the next test.)
+    f.held[1](json(401, {}));
+    expect(await old2).toBe('unavailable');
+    await f.api.logout();
+    expect(f.trace).not.toContain('GET');
+    expect(f.live()).toBe(0);
+    expect(f.trace.at(-1)).toBe('DELETE csrf-token-session-2-0123');
+  });
+
+  test.each(kinds)('recovery GET finds B, a stale 401 lands before the DELETE, and the DELETE still revokes B (%s)', async (_kind, open) => {
+    const f = racingApi();
+    await f.api.login(creds);
+    f.hold(1);
+    const old = failure(open(f.api));
+    await f.api.logout();
+    await f.api.login(creds);
+    await open(f.api);
+    // B's stream reports 4401 although the fake server still holds B, so
+    // sign-out starts without a token and must recover it.
+    serverClose(FakeSocket.last!, 4401);
+    // The reviewer's interleaving: the stale 401 is handled after the recovery
+    // GET restored B's token and before the DELETE is dispatched.
+    const recover = f.api.getSession.bind(f.api);
+    f.api.getSession = async () => {
+      const session = await recover();
+      f.held[0](json(401, {}));
+      expect(await old).toBe('unavailable');
+      return session;
+    };
+    await f.api.logout();
+    expect(f.trace.slice(-2)).toEqual(['GET', 'DELETE csrf-token-session-2-0123']);
+    expect(f.live()).toBe(0);
+  });
+
+  test('a DELETE that cannot be dispatched rejects for the retry instead of confirming', async () => {
+    const f = racingApi();
+    await f.api.login(creds);
+    await f.api.openConsole('web-static');
+    serverClose(FakeSocket.last!, 4401);
+    // Simulate the token vanishing between the recovery GET and the DELETE.
+    const recover = f.api.getSession.bind(f.api);
+    f.api.getSession = async () => {
+      const session = await recover();
+      (f.api as unknown as { csrfToken: string | null }).csrfToken = null;
+      return session;
+    };
+    await expect(f.api.logout()).rejects.toMatchObject({ code: 'unavailable', status: null });
+    expect(f.trace.at(-1)).toBe('GET');
+    expect(f.live()).toBe(1);
+    // The retry recovers the session and revokes it.
+    f.api.getSession = recover;
+    await f.api.logout();
+    expect(f.trace.slice(-2)).toEqual(['GET', 'DELETE csrf-token-session-1-0123']);
+    expect(f.live()).toBe(0);
   });
 });
 

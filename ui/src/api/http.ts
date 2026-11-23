@@ -153,6 +153,8 @@ export class HttpApi implements ArxApi {
    * unconfirmed and rejects, so callers never mistake 200/202 for 204.
    */
   private async request(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown, expectStatus?: number): Promise<unknown> {
+    // The session this request is sent under, read with its CSRF token.
+    const dispatched = this.generation;
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (method !== 'GET') {
       if (path !== `${API_PREFIX}/session` || method !== 'POST') {
@@ -191,7 +193,15 @@ export class HttpApi implements ArxApi {
       }
     }
     if (!response.ok) {
-      if (response.status === 401) this.setToken(null);
+      if (response.status === 401) {
+        // A 401 ends only the session the request was sent under. When a
+        // newer sign-in has replaced it, the newer session is untouched and
+        // the request fails without telling the view to end that session.
+        if (dispatched !== this.generation && this.csrfToken !== null) {
+          throw new ApiError('unavailable', 'The request was sent under an earlier session. Try again.', 401);
+        }
+        this.setToken(null);
+      }
       throw errorFor(response.status, parsed);
     }
     if (expectStatus !== undefined && response.status !== expectStatus) {
@@ -206,7 +216,7 @@ export class HttpApi implements ArxApi {
       this.setToken(session.csrfToken);
       return session;
     } catch (error) {
-      if (error instanceof ApiError && error.code === 'unauthorized') return null;
+      if (error instanceof ApiError && error.code === 'unauthorized' && error.status === 401) return null;
       throw error;
     }
   }
@@ -226,13 +236,20 @@ export class HttpApi implements ArxApi {
    * sign-out) it never assumes the cookie is gone: it re-reads the session
    * first. A 401 there confirms there is nothing to revoke; a live session is
    * revoked with DELETE as above, and a failure rejects.
+   *
+   * Only an actual HTTP 401 response confirms. A DELETE that could not be
+   * sent (no token by the time it is dispatched) rejects, so the shell keeps
+   * the session visible and offers the retry.
    */
   async logout(): Promise<void> {
     if (!this.csrfToken && (await this.getSession()) === null) return;
     try {
       await this.request('DELETE', `${API_PREFIX}/session`, undefined, 204);
     } catch (error) {
-      if (error instanceof ApiError && error.code === 'unauthorized') return;
+      if (error instanceof ApiError && error.code === 'unauthorized') {
+        if (error.status === 401) return;
+        throw new ApiError('unavailable', 'The sign-out request could not be sent. Try again.');
+      }
       throw error;
     }
     this.setToken(null);

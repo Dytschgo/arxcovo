@@ -35,6 +35,11 @@ smoke test asserts that no fixture data reaches `ui/dist`.
 | 429 | `rate_limited` | Login throttled |
 | 5xx | `unavailable` | arxd cannot serve this now |
 
+A 401 ends only the session the request was sent under. If the client has
+signed in again before a 401 for an earlier session arrives, it keeps the
+newer session and token and reports that one request as failed
+(`unavailable`) instead of returning to login.
+
 ## Authentication: local owner password
 
 Chosen over a one-time pairing token because the dashboard is used daily from
@@ -117,7 +122,8 @@ offers a retry that sends `DELETE` again. A client that holds no CSRF token
 (after a 401, a stream's 4401 or an earlier sign-out) never assumes the cookie
 is gone: it first sends `GET /api/v1/session`. A `401` there confirms there is
 nothing to revoke; a returned session is revoked with `DELETE` as above; any
-other failure is reported as a failed sign-out.
+other failure is reported as a failed sign-out. Only an actual `401` response
+confirms: a `DELETE` the client could not send is a failed sign-out too.
 
 ## Hosts
 
