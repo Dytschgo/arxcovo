@@ -115,7 +115,7 @@ enum Record {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Reply {
-    id: u16,
+    id: u64,
     #[serde(rename = "return")]
     result: Value,
 }
@@ -123,7 +123,7 @@ struct Reply {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemoteError {
-    id: u16,
+    id: u64,
     error: ErrorBody,
 }
 
@@ -186,7 +186,7 @@ impl Event {
 struct Stream<R, W> {
     reader: BufReader<R>,
     writer: W,
-    next_id: u16,
+    next_id: u64,
     /// The record read so far. Persisting it makes `record` cancel-safe.
     pending: Vec<u8>,
 }
@@ -211,18 +211,29 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
 
     async fn command(
         &mut self,
-        command: Command,
+        command: Command<'_>,
         events: &mut Events,
     ) -> Result<Value, ChannelError> {
         let id = self.next_id;
         self.next_id = id.checked_add(1).ok_or(ChannelError::Closed)?;
-        let name = match command {
-            Command::Capabilities => "qmp_capabilities",
-            Command::Status => "query-status",
-            Command::Continue => "cont",
-            Command::Powerdown => "system_powerdown",
+        let (name, arguments) = match command {
+            Command::Capabilities => ("qmp_capabilities", None),
+            Command::Status => ("query-status", None),
+            Command::Continue => ("cont", None),
+            Command::Powerdown => ("system_powerdown", None),
+            Command::Screendump(filename) => (
+                "screendump",
+                Some(serde_json::json!({
+                    "filename": filename, "format": "png", "device": "arxdisplay0", "head": 0
+                })),
+            ),
         };
-        let request = format!("{{\"execute\":\"{name}\",\"id\":{id}}}\r\n");
+        let request = match arguments {
+            Some(arguments) => {
+                format!("{{\"execute\":\"{name}\",\"id\":{id},\"arguments\":{arguments}}}\r\n")
+            }
+            None => format!("{{\"execute\":\"{name}\",\"id\":{id}}}\r\n"),
+        };
         self.writer
             .write_all(request.as_bytes())
             .await
@@ -256,11 +267,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
     }
 }
 
-enum Command {
+enum Command<'a> {
     Capabilities,
     Status,
     Continue,
     Powerdown,
+    Screendump(&'a str),
 }
 
 #[derive(Default)]
@@ -345,6 +357,29 @@ pub struct Qmp<R, W> {
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
+    pub(super) async fn screendump(&mut self, filename: &str) -> Result<(), ChannelError> {
+        if self.installer.is_some() {
+            return Err(ChannelError::Unexpected);
+        }
+        let mut stream = self.stream.take().ok_or(ChannelError::Closed)?;
+        let result = bounded(
+            &Shutdown::default(),
+            Instant::now() + Duration::from_secs(2),
+            async {
+                empty(
+                    stream
+                        .command(Command::Screendump(filename), &mut Events::default())
+                        .await?,
+                )
+            },
+        )
+        .await;
+        if result.is_ok() || result == Err(ChannelError::Remote) {
+            self.stream = Some(stream);
+        }
+        result
+    }
+
     pub async fn handshake(reader: R, writer: W, cancel: &Shutdown) -> Result<Self, ChannelError> {
         Self::handshake_for(reader, writer, cancel, None).await
     }

@@ -156,7 +156,7 @@ fn pinned_service_recovers_actual_hot_journal() {
         assert_eq!(
             db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            4
+            5
         );
         assert_eq!(
             db.pragma_query_value::<String, _>(None, "journal_mode", |r| r.get(0))

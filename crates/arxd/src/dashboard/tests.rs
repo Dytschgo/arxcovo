@@ -6,28 +6,30 @@ use std::{fs, net::IpAddr, sync::Mutex};
 use tower::ServiceExt;
 
 const PASSWORD: &str = "fake-password-sentinel-for-test";
-const ORIGIN: &str = "http://localhost:4444";
+pub(super) const ORIGIN: &str = "http://localhost:4444";
 const NOW: i64 = 1_795_435_200_000;
 
-struct TestClock(Mutex<ClockReading>);
+pub(super) struct TestClock(Mutex<ClockReading>);
 impl Clock for TestClock {
     fn now(&self) -> ClockReading {
         *self.0.lock().unwrap()
     }
 }
 impl TestClock {
-    fn advance(&self, duration: Duration) {
+    pub(super) fn advance(&self, duration: Duration) {
         let mut time = self.0.lock().unwrap();
         time.monotonic += duration;
         time.utc_ms += duration.as_millis() as i64;
     }
 }
 
-struct Fixture {
-    _dir: tempfile::TempDir,
-    app: Router,
-    activity: Arc<Activity>,
-    clock: Arc<TestClock>,
+pub(super) struct Fixture {
+    pub(super) _dir: tempfile::TempDir,
+    pub(super) app: Router,
+    pub(super) state: Dashboard,
+    pub(super) activity: Arc<Activity>,
+    pub(super) clock: Arc<TestClock>,
+    pub(super) sessions: Arc<Sessions>,
 }
 
 fn directory() -> tempfile::TempDir {
@@ -36,7 +38,7 @@ fn directory() -> tempfile::TempDir {
 
 /// Creates an owner-only child directory regardless of the process umask,
 /// then verifies it with the production privacy check.
-fn private_dir(path: &std::path::Path) {
+pub(crate) fn private_dir(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -45,6 +47,8 @@ fn private_dir(path: &std::path::Path) {
     }
     #[cfg(not(unix))]
     fs::create_dir(path).unwrap();
+    #[cfg(windows)]
+    set_owner_private(path);
     crate::security::private(path).unwrap();
 }
 
@@ -52,7 +56,7 @@ fn private_dir(path: &std::path::Path) {
 /// with a protected owner-only DACL. Elevated runners otherwise default new
 /// objects to an Administrators owner, which the private-file check refuses.
 #[cfg(windows)]
-fn set_owner_private(path: &std::path::Path) {
+pub(crate) fn set_owner_private(path: &std::path::Path) {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
     use windows_sys::Win32::{
@@ -110,6 +114,10 @@ impl Fixture {
     }
 
     fn with_catalog(catalog: bool) -> Self {
+        Self::with_streams(catalog, streams::Backends::new(None))
+    }
+
+    pub(super) fn with_streams(catalog: bool, streams: streams::Backends) -> Self {
         let dir = directory();
         let assets = dir.path().join("dist");
         fs::create_dir(&assets).unwrap();
@@ -117,7 +125,7 @@ impl Fixture {
         fs::write(assets.join("script.js"), "export {};").unwrap();
         let activity = Arc::new(Activity::open(dir.path()).unwrap());
         let clock = Arc::new(TestClock(Mutex::new(ClockReading {
-            monotonic: Instant::now(),
+            monotonic: tokio::time::Instant::now().into_std(),
             utc_ms: NOW,
         })));
         let vm_catalog = catalog.then(|| {
@@ -136,27 +144,31 @@ impl Fixture {
             ).unwrap();
             Arc::new(crate::vm::DashboardCatalog::open(&root).unwrap())
         });
-        let app = Dashboard {
+        let sessions = Arc::new(Sessions::new());
+        let state = Dashboard {
             boundary: Boundary::new("localhost:4444".into(), false),
             assets: Arc::new(Assets::load(&assets).unwrap()),
             activity: activity.clone(),
             vm_catalog,
             verifier: Arc::new(Verifier::cheap(PASSWORD)),
-            sessions: Arc::new(Sessions::new()),
+            sessions: sessions.clone(),
             clock: clock.clone(),
             capacity: Arc::new(tokio::sync::Semaphore::new(8)),
+            streams,
             _password_lock: None,
-        }
-        .router();
+        };
+        let app = state.clone().router();
         Self {
             _dir: dir,
             app,
+            state,
             activity,
             clock,
+            sessions,
         }
     }
 
-    fn request(
+    pub(super) fn request(
         &self,
         method: Method,
         path: &str,
@@ -174,7 +186,7 @@ impl Fixture {
         }
     }
 
-    async fn send(&self, req: axum::http::request::Builder, body: Body) -> Response {
+    pub(super) async fn send(&self, req: axum::http::request::Builder, body: Body) -> Response {
         self.app
             .clone()
             .oneshot(req.body(body).unwrap())
@@ -203,7 +215,7 @@ impl Fixture {
         .await
     }
 
-    async fn login(&self, old: Option<&str>) -> (String, String) {
+    pub(super) async fn login(&self, old: Option<&str>) -> (String, String) {
         let response = self
             .login_at(IpAddr::from([127, 0, 0, 1]), "owner", PASSWORD, old)
             .await;
@@ -232,7 +244,7 @@ impl Fixture {
     }
 }
 
-async fn body(response: Response) -> serde_json::Value {
+pub(super) async fn body(response: Response) -> serde_json::Value {
     let bytes = to_bytes(response.into_body(), RESPONSE_LIMIT)
         .await
         .unwrap();
@@ -416,7 +428,7 @@ async fn origin_and_csrf_are_enforced() {
             Body::empty(),
         )
         .await;
-    error(stream, StatusCode::SERVICE_UNAVAILABLE, "unavailable").await;
+    error(stream, StatusCode::NOT_FOUND, "not_found").await;
     assert_eq!(f.get("/api/v1/session", &session).await.status(), 200);
 }
 

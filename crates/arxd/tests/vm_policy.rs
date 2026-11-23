@@ -13,7 +13,10 @@ const VM: Id = [2; 16];
 const MIB: u64 = 1024 * 1024;
 /// The VM store's `user_version`. `store::vm::VM_SCHEMA_VERSION` is
 /// crate-private, so this integration test mirrors it; update both together.
-const VM_SCHEMA_VERSION: i64 = 8;
+const VM_SCHEMA_VERSION: i64 = 9;
+/// The shared activity store's `user_version` (crate-private in `store`),
+/// which must stay distinct from the VM store's.
+const ACTIVITY_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Clone)]
 struct TestClock {
@@ -320,7 +323,10 @@ fn shared_and_vm_openers_keep_distinct_versions_and_locks() {
     let original = std::fs::read(&path).unwrap();
     drop(Activity::open(dir.path()).unwrap());
     assert_eq!(std::fs::read(&path).unwrap(), original);
-    assert_eq!(scalar(dir.path(), "PRAGMA user_version"), 4);
+    assert_eq!(
+        scalar(dir.path(), "PRAGMA user_version"),
+        ACTIVITY_SCHEMA_VERSION
+    );
     assert!(VmController::open(dir.path(), VmPolicy::default(), TestClock::new()).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), original);
     assert_eq!(
@@ -394,7 +400,10 @@ fn shared_v1_v2_v3_migrations_preserve_rows_sequence_and_delegated_references() 
         db.pragma_update(None, "user_version", version).unwrap();
         drop(db);
         let shared = Activity::open(dir.path()).unwrap();
-        assert_eq!(scalar(dir.path(), "PRAGMA user_version"), 4);
+        assert_eq!(
+            scalar(dir.path(), "PRAGMA user_version"),
+            ACTIVITY_SCHEMA_VERSION
+        );
         assert_eq!(
             scalar(
                 dir.path(),

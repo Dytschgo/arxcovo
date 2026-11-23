@@ -11,6 +11,9 @@ use std::{
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+mod streams;
+pub(super) use streams::{Bucket, Capture, Close, Connection, Stream, Target, Write};
+
 const IDLE: Duration = Duration::from_secs(12 * 60 * 60);
 const ABSOLUTE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const FORGET_AFTER: Duration = Duration::from_secs(15 * 60);
@@ -28,11 +31,6 @@ pub(super) fn cookie_key(text: &str) -> Option<Key> {
 
 /// One registry keyed by the session ID's SHA-256 digest. A single lock
 /// linearizes lookup, renewal, rotation and removal.
-///
-/// B2 seam: streams add a per-session generation and registered
-/// cancellation (plus expiry wakeups) under this same lock, so logout,
-/// rotation and expiry close upgraded connections; stream checks must not
-/// renew `touched`.
 pub(super) struct Sessions {
     active: Mutex<Data>,
     hash_slot: Arc<tokio::sync::Semaphore>,
@@ -43,12 +41,17 @@ struct Data {
     sessions: HashMap<Key, Session>,
     clients: HashMap<IpAddr, Failures>,
     global: Failures,
+    streams: streams::Registry,
+    generation: u64,
 }
 
 struct Session {
     created: Instant,
     touched: Instant,
     csrf: String,
+    generation: u64,
+    tickets: HashMap<String, streams::Ticket>,
+    mint_rate: streams::Bucket,
 }
 
 #[derive(Serialize)]
@@ -162,8 +165,7 @@ impl Sessions {
                 return Err(ApiError::BAD_CREDENTIALS);
             }
             data.clients.remove(&client);
-            data.sessions
-                .retain(|_, session| !session.remaining(now.monotonic).is_zero());
+            data.expire(now.monotonic);
             let token = random_token().map_err(|_| ApiError::UNAVAILABLE)?;
             let key = cookie_key(&token).expect("generated cookie format");
             if data.sessions.contains_key(&key)
@@ -172,14 +174,21 @@ impl Sessions {
             {
                 return Err(ApiError::UNAVAILABLE);
             }
+            data.generation = data
+                .generation
+                .checked_add(1)
+                .ok_or(ApiError::UNAVAILABLE)?;
             let session = Session {
                 created: now.monotonic,
                 touched: now.monotonic,
                 csrf: random_token().map_err(|_| ApiError::UNAVAILABLE)?,
+                generation: data.generation,
+                tickets: HashMap::new(),
+                mint_rate: streams::Bucket::new(4, 1),
             };
             let view = session.view(now)?;
             if let Some(old) = old {
-                data.sessions.remove(&old);
+                data.revoke(old, now.monotonic);
             }
             data.sessions.insert(key, session);
             Ok((token, view))
@@ -197,23 +206,22 @@ impl Sessions {
     ) -> Result<SessionView, ApiError> {
         let key = key.ok_or(ApiError::UNAUTHORIZED)?;
         let mut data = self.active.lock().map_err(|_| ApiError::UNAVAILABLE)?;
-        let session = data.sessions.get_mut(&key).ok_or(ApiError::UNAUTHORIZED)?;
-        if session.remaining(now.monotonic).is_zero() {
-            data.sessions.remove(&key);
-            return Err(ApiError::UNAUTHORIZED);
-        }
+        let session = data.live(key, now.monotonic)?;
         if let Some(token) = csrf
             && !token
                 .is_some_and(|value| bool::from(value.as_bytes().ct_eq(session.csrf.as_bytes())))
         {
             return Err(ApiError::FORBIDDEN);
         }
+        let renewed = now.monotonic > session.touched;
         session.touched = session.touched.max(now.monotonic);
         let view = session.view(now)?;
         if revoke {
             // This store has no durable backing. A revoked id cannot be
             // recovered from disk, including after a crash or restart.
-            data.sessions.remove(&key);
+            data.revoke(key, now.monotonic);
+        } else if renewed {
+            data.streams.wake(key);
         }
         Ok(view)
     }

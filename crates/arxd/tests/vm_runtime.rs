@@ -7,6 +7,7 @@ use arxd::{
         paths::{Artifact, ArtifactPin, ArtifactRole, FileIdentity, LocalPath},
         qemu_args::{
             BootPurpose, BootRecipe, GUEST_PORT_ID, NETWORK, PlanKind, QEMU_VERSION, SerialName,
+            StaticNetwork,
         },
         qemu_img,
         qmp::{ChannelError, Qmp, RunStatus},
@@ -1909,4 +1910,59 @@ async fn run_script_rejects_a_mismatched_response_id() {
         Err(ChannelError::Unexpected)
     );
     drop(peer.await.unwrap());
+}
+
+#[test]
+fn static_web_plan_is_unbacked_and_forwards_exactly_one_loopback_port() {
+    use ArtifactRole::*;
+    use arxd::vm::static_web::{ORIGIN_PORT_FIRST, ORIGIN_PORT_LAST, OriginPortLease};
+    let lease = OriginPortLease::acquire().unwrap();
+    assert!((ORIGIN_PORT_FIRST..=ORIGIN_PORT_LAST).contains(&lease.port()));
+    let image = artifact(Qemu, "D:/qemu/qemu-system-x86_64.exe");
+    let data = artifact(Data, "D:/qemu/share");
+    let firmware = artifact(FirmwareCode, "D:/firmware/code.fd");
+    let vars = artifact(StaticVars, "D:/vm/vars.fd");
+    let disk = artifact(StaticDisk, "D:/vm/disk.qcow2");
+    let golden = artifact(Golden, "D:/vm/golden.qcow2");
+    let header = qcow2_11_1(None);
+    let serial = SerialName::generate().unwrap();
+    let mut recipe = BootRecipe {
+        image: &image,
+        data: &data,
+        firmware: &firmware,
+        vars: &vars,
+        disk: &disk,
+        disk_header: &header,
+        backing: None,
+        backing_header: None,
+        serial: &serial,
+        boot: BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::RestrictedOrigin),
+        ram_mib: 256,
+        vcpus: 1,
+    };
+    let plan = recipe.plan().unwrap();
+    assert_eq!(plan.kind(), PlanKind::StaticWebBoot);
+    assert_eq!(plan.static_origin_lease().unwrap().port(), lease.port());
+    assert_eq!(
+        plan.args()
+            .windows(2)
+            .filter(|pair| pair[0] == "-netdev")
+            .map(|pair| &pair[1])
+            .collect::<Vec<_>>(),
+        vec![&format!(
+            "user,id=arxnet0,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:{}-10.0.2.15:443",
+            lease.port()
+        )]
+    );
+    recipe.backing = Some(&golden);
+    recipe.backing_header = Some(&header);
+    recipe.disk_header = &header;
+    assert!(recipe.plan().is_err());
+    recipe.backing = None;
+    recipe.backing_header = None;
+    recipe.boot = BootPurpose::Installed;
+    assert!(
+        recipe.plan().is_err(),
+        "TEST plan acquired static custody roles"
+    );
 }
