@@ -135,7 +135,9 @@ async fn capture(state: Dashboard, job: Capture, vm: [u8; 16], generation: u64) 
             }
             Ok(None) => {}
             Err(error) => {
-                for viewer in viewers {
+                // Include viewers whose ordinary close is still pending, so
+                // a detected replacement can outrank it.
+                for viewer in job.registered() {
                     close(&viewer, error);
                 }
                 return;

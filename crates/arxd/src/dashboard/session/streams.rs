@@ -90,6 +90,28 @@ impl Close {
         code: 1008,
         reason: "stream backpressure",
     };
+
+    /// The one close-precedence order shared by terminal and console streams:
+    ///
+    /// 1. session revoked or expired (4401)
+    /// 2. server shutdown (1001)
+    /// 3. target unavailable or replaced (4403)
+    /// 4. every ordinary close: VM stopped or capture fault, terminal expiry,
+    ///    audit failure, protocol, size, rate, capacity and backpressure.
+    ///
+    /// A later close replaces a pending one only when it ranks strictly
+    /// higher and the writer has not yet taken the pending closing notice or
+    /// close frame. A session end replaces any pending close regardless,
+    /// because nothing may be delivered after revocation. Equal or lower
+    /// ranks never replace.
+    fn rank(self) -> u8 {
+        match self.code {
+            4401 => 3,
+            1001 => 2,
+            4403 => 1,
+            _ => 0,
+        }
+    }
 }
 
 pub(super) struct Registry {
@@ -163,12 +185,9 @@ impl Slot {
 
     fn close(&mut self, close: Close, now: Instant, message: Option<Message>) {
         if let Some((current, _)) = self.close {
-            // Session end always wins. A detected target replacement wins
-            // over an ordinary stop or fault close the writer has not taken.
-            let replaces = close.code == Close::SESSION.code
-                || (close.code == Close::TARGET.code
-                    && !self.close_committed
-                    && matches!(current.code, 1000 | 1011));
+            // See `Close::rank` for the shared precedence order.
+            let replaces = close.rank() > current.rank()
+                && (close.code == Close::SESSION.code || !self.close_committed);
             if !replaces {
                 return;
             }
@@ -663,7 +682,20 @@ impl Sessions {
 }
 
 impl Capture {
+    /// Open viewers of this generation, which may receive frames.
     pub fn viewers(&self) -> Vec<Stream> {
+        self.select(true)
+    }
+
+    /// Every still-registered viewer of this generation, including those
+    /// with a pending close. A capture-ending close goes to all of them so
+    /// the shared precedence in `Slot::close` arbitrates against a close
+    /// the writer has not yet taken.
+    pub fn registered(&self) -> Vec<Stream> {
+        self.select(false)
+    }
+
+    fn select(&self, open_only: bool) -> Vec<Stream> {
         let Ok(mut data) = self.sessions.active.lock() else {
             return Vec::new();
         };
@@ -671,7 +703,9 @@ impl Capture {
         data.streams
             .slots
             .iter()
-            .filter(|(_, slot)| slot.close.is_none() && slot.target.as_ref() == Some(&self.target))
+            .filter(|(_, slot)| {
+                (!open_only || slot.close.is_none()) && slot.target.as_ref() == Some(&self.target)
+            })
             .map(|(&id, _)| Stream {
                 id,
                 sessions: self.sessions.clone(),

@@ -65,7 +65,7 @@ pub(super) async fn receive(state: &Dashboard, stream: &Stream, text: &str) -> b
         .as_ref()
         .filter(|e| e.owner_available())
     else {
-        stream.close(super::Close::TARGET, None);
+        stream.close(super::terminal_unavailable(state), None);
         return true;
     };
     if let Some((admission, cancel)) = stream.admit_terminal(|| execution.admit()) {

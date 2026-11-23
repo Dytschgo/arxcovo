@@ -291,10 +291,25 @@ async fn revalidate(state: &Dashboard, stream: &Stream, target: &Target) -> bool
             true
         }
         Target::Terminal(_) => {
-            stream.close(Close::TARGET, None);
+            stream.close(terminal_unavailable(state), None);
             false
         }
         Target::Console { vm, generation } => console::check(state, stream, *vm, *generation),
+    }
+}
+
+/// A terminal whose executor stopped because the daemon is shutting down
+/// closes with 1001, not as a lost target.
+fn terminal_unavailable(state: &Dashboard) -> Close {
+    if state
+        .streams
+        .terminal
+        .as_ref()
+        .is_some_and(|e| e.shutting_down())
+    {
+        Close::STOP
+    } else {
+        Close::TARGET
     }
 }
 

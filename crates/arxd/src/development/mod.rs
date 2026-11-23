@@ -354,6 +354,11 @@ impl Execution {
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
+    /// Daemon shutdown has begun; owner surfaces report it as shutdown, not
+    /// as a lost target.
+    pub(crate) fn shutting_down(&self) -> bool {
+        self.shutdown.is_cancelled()
+    }
     pub fn capability(&self) -> serde_json::Value {
         if self.identity_mode == IdentityMode::DedicatedAccount {
             return serde_json::json!({"available":false,"reason":"dedicated_account_setup_required","mode":"dedicated_account","claim":self.claim(),"dedicated":false,"isolation":false,"rights":null,"matches_current_user":null,"integrity":null,"elevated":null});

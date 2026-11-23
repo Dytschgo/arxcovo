@@ -967,6 +967,7 @@ async fn audit_failure_after_started_ends_the_command_without_output() {
 /// as an old generation's display does once its VM was replaced.
 struct HeldDisplay {
     generation: std::sync::atomic::AtomicU64,
+    stopped: std::sync::atomic::AtomicBool,
     entered: tokio::sync::mpsc::UnboundedSender<()>,
     gate: tokio::sync::Semaphore,
 }
@@ -985,6 +986,9 @@ impl console::Lease for HeldDisplay {
     }
 
     fn state(&self) -> Result<(), crate::vm::console::CaptureError> {
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(crate::vm::console::CaptureError::Stopped);
+        }
         Ok(())
     }
 
@@ -1016,6 +1020,7 @@ async fn replacement_during_a_held_capture_wins_over_its_stale_stop() {
     let (entered, mut capturing) = tokio::sync::mpsc::unbounded_channel();
     let display = Arc::new(HeldDisplay {
         generation: 1.into(),
+        stopped: false.into(),
         entered,
         gate: tokio::sync::Semaphore::new(0),
     });
@@ -1048,7 +1053,7 @@ async fn replacement_during_a_held_capture_wins_over_its_stale_stop() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn detected_replacement_overrides_only_an_untaken_ordinary_close() {
+async fn close_precedence_is_session_then_shutdown_then_target_then_ordinary() {
     let f = Fixture::with_streams(false, Backends::new(None));
     let target = Target::Console {
         vm: [1; 16],
@@ -1059,25 +1064,65 @@ async fn detected_replacement_overrides_only_an_untaken_ordinary_close() {
         reason: "VM stopped",
     };
     let notice = || Some(message(json!({"type":"closed","reason":"VM stopped"})));
-    // Not yet taken by the writer: the replacement wins and the notice is dropped.
-    let (first, _, _, id, proof) = registered(&f, target.clone()).await;
-    assert!(first.redeem(&id, &proof, ORIGIN).is_ok());
-    let stream = first.stream();
-    stream.close(stopped, notice());
+    // (pending close, take its notice first, later close, expected frame)
+    let cases = [
+        (stopped, false, Close::TARGET, 4403),
+        (stopped, false, Close::STOP, 1001),
+        (Close::TARGET, false, Close::STOP, 1001),
+        (Close::STOP, false, Close::TARGET, 1001),
+        (Close::TARGET, false, stopped, 4403),
+        (Close::STOP, false, Close::SESSION, 4401),
+        (Close::SESSION, false, Close::STOP, 4401),
+        (Close::SESSION, false, Close::TARGET, 4401),
+        // Once the writer took the notice, only a session end may replace.
+        (stopped, true, Close::TARGET, 1000),
+        (stopped, true, Close::STOP, 1000),
+        (stopped, true, Close::SESSION, 4401),
+    ];
+    for (index, (pending, taken, later, expected)) in cases.into_iter().enumerate() {
+        // Refill the global ticket-mint budget between cases.
+        f.clock.advance(Duration::from_secs(1));
+        let (socket, cookie, csrf, id, proof) = registered(&f, target.clone()).await;
+        assert!(socket.redeem(&id, &proof, ORIGIN).is_ok());
+        let stream = socket.stream();
+        stream.close(pending, (pending.code == 1000).then(notice).flatten());
+        if taken {
+            assert!(matches!(
+                stream.commit(),
+                Some(Write::Message(Message::Text(_), _))
+            ));
+        }
+        if later.code == Close::SESSION.code {
+            logout(&f, &cookie, &csrf).await;
+        } else {
+            stream.close(later, None);
+        }
+        let Some(Write::Close(close, _)) = stream.commit() else {
+            panic!("case {index}: expected a close frame")
+        };
+        let frame = close.code;
+        assert_eq!(frame, expected, "case {index}");
+    }
+    // A pending, untaken 4403 does not survive dashboard shutdown.
+    f.clock.advance(Duration::from_secs(1));
+    let (socket, cookie, _, id, proof) = registered(&f, target).await;
+    assert!(socket.redeem(&id, &proof, ORIGIN).is_ok());
+    let stream = socket.stream();
     stream.close(Close::TARGET, None);
-    assert!(matches!(stream.commit(), Some(Write::Close(close, _)) if close.code == 4403));
-    // Already taken: the ordinary close stands.
-    let (second, _, _, id, proof) = registered(&f, target).await;
-    assert!(second.redeem(&id, &proof, ORIGIN).is_ok());
-    let stream = second.stream();
-    stream.close(stopped, notice());
-    assert!(matches!(
-        stream.commit(),
-        Some(Write::Message(Message::Text(_), _))
-    ));
-    stream.close(Close::TARGET, None);
-    assert!(matches!(stream.commit(), Some(Write::Close(close, _)) if close.code == 1000));
-    drop((first, second));
+    let sessions = f.sessions.clone();
+    let clock = f.clock.clone();
+    let stop = tokio::spawn(async move { sessions.stop_streams(clock.as_ref()).await });
+    // Latch: registration is refused once shutdown has closed every slot.
+    while f
+        .sessions
+        .register_stream(key(&cookie), f.clock.clone())
+        .is_ok()
+    {
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(stream.commit(), Some(Write::Close(close, _)) if close.code == 1001));
+    drop(socket);
+    assert!(stop.await.unwrap().is_ok());
 }
 
 /// Ignores transport keepalive frames while waiting for the server's close.
@@ -1221,4 +1266,145 @@ async fn pre_authentication_control_frames_share_the_socket_budget() {
     }
     assert_eq!(close_skipping_keepalive(&mut peer).await, 1008);
     server.await.unwrap();
+}
+
+/// Mirrors the foreground daemon order: the executor shuts down before the
+/// dashboard listener stops its streams. A terminal whose executor became
+/// unavailable this way must close with 1001, never 4403.
+#[tokio::test]
+async fn foreground_shutdown_order_closes_a_running_terminal_with_1001() {
+    let (entered, mut running) = tokio::sync::mpsc::unbounded_channel();
+    let executor = Execution::owner_fixture(move |_, cancel| {
+        entered.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while !cancel.is_cancelled() {
+            assert!(start.elapsed() < Duration::from_secs(5), "never cancelled");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(output(StopReason::Shutdown, String::new(), String::new()))
+    });
+    let (f, route) = terminal_fixture(executor.clone());
+    let (cookie, csrf) = f.login(None).await;
+    let (path, proof) = ticket(&f, &route, &cookie, &csrf).await;
+    let wire = Wire::new(&f).await;
+    let mut peer = wire
+        .connect(&path, Some(&cookie), Some(ORIGIN))
+        .await
+        .unwrap();
+    send(&mut peer, json!({"type":"auth","ticket":proof})).await;
+    assert_eq!(receive_json(&mut peer).await["type"], "ready");
+    send(&mut peer, json!({"type":"run","tool":"git","args":[]})).await;
+    assert_eq!(receive_json(&mut peer).await["type"], "started");
+    timeout(Duration::from_secs(2), running.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // Latch: the running command is held. The executor shuts down first,
+    // and the socket's own one-second target check then closes it. The
+    // client sends nothing further, so the server has read everything.
+    executor.shutdown();
+    assert_eq!(close_skipping_keepalive(&mut peer).await, 1001);
+    assert!(executor.drain().await);
+    let entries = f
+        .activity
+        .dashboard_list(
+            &crate::store::ListActivity {
+                limit: 20,
+                before_id: None,
+                include_reads: false,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].outcome, Outcome::Interrupted);
+
+    // Both unavailable-executor branches, driven directly while the
+    // listener has not yet stopped streams: the target check and a request.
+    let target = Target::Terminal(f.activity.host_id().unwrap());
+    for request in [false, true] {
+        let key = key(&cookie);
+        let (id, proof) = f
+            .sessions
+            .mint(key, Some(&csrf), ORIGIN, target.clone(), f.clock.as_ref())
+            .ok()
+            .unwrap();
+        let socket = f
+            .sessions
+            .register_stream(key, f.clock.clone())
+            .ok()
+            .unwrap();
+        assert_eq!(
+            socket.redeem(&id, &proof, ORIGIN).ok(),
+            Some(target.clone())
+        );
+        let stream = socket.stream();
+        if request {
+            let run = json!({"type":"run","tool":"git","args":[]}).to_string();
+            assert!(terminal::receive(&f.state, &stream, &run).await);
+        } else {
+            assert!(!revalidate(&f.state, &stream, &target).await);
+        }
+        assert!(
+            matches!(stream.commit(), Some(Write::Close(close, _)) if close.code == 1001),
+            "request={request}"
+        );
+    }
+    assert!(f.sessions.stop_streams(f.clock.as_ref()).await.is_ok());
+}
+
+/// The viewer's own target check queues an ordinary stop while its writer
+/// is gated; then the VM is replaced and the held capture from the old
+/// generation completes. The replacement must still reach that viewer.
+#[tokio::test(start_paused = true)]
+async fn replacement_reaches_a_viewer_whose_ordinary_stop_is_still_queued() {
+    let vm = [1; 16];
+    let target = Target::Console { vm, generation: 1 };
+    let (entered, mut capturing) = tokio::sync::mpsc::unbounded_channel();
+    let display = Arc::new(HeldDisplay {
+        generation: 1.into(),
+        stopped: false.into(),
+        entered,
+        gate: tokio::sync::Semaphore::new(0),
+    });
+    let mut backends = Backends::new(None);
+    backends.console = Some(Arc::new(HeldSources(display.clone())));
+    let f = Fixture::with_streams(false, backends);
+    let (viewer, _, _, id, proof) = registered(&f, target.clone()).await;
+    assert!(viewer.redeem(&id, &proof, ORIGIN).is_ok());
+    let stream = viewer.stream();
+    assert!(console::check(&f.state, &stream, vm, 1));
+    timeout(Duration::from_secs(2), capturing.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // The VM stops: the viewer's target check queues 1000 with its notice.
+    // Nothing commits it, so the writer is effectively gated.
+    display
+        .stopped
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(!console::check(&f.state, &stream, vm, 1));
+    // Then it is replaced, and the old generation's held capture completes.
+    display
+        .generation
+        .store(2, std::sync::atomic::Ordering::Release);
+    display
+        .stopped
+        .store(false, std::sync::atomic::Ordering::Release);
+    display.gate.add_permits(1);
+    // Latch: the capture job releases its slot only after it delivered its close.
+    loop {
+        if let Some(next) = f.sessions.capture(target.clone(), f.clock.clone()) {
+            drop(next);
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    match stream.commit() {
+        Some(Write::Close(close, _)) => assert_eq!(close.code, 4403),
+        Some(Write::Message(message, _)) => panic!("stale stop notice survived: {message:?}"),
+        _ => panic!("expected a close"),
+    }
+    drop(viewer);
 }
