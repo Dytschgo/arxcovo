@@ -134,6 +134,8 @@ export function activitySearch(query: ActivityQuery = {}): string {
 export class HttpApi implements ArxApi {
   readonly kind = 'http' as const;
   private csrfToken: string | null = null;
+  /** Bumps whenever the CSRF token changes, so a stream knows its session. */
+  private generation = 0;
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly WebSocketImpl: WebSocketCtor | undefined;
@@ -189,7 +191,7 @@ export class HttpApi implements ArxApi {
       }
     }
     if (!response.ok) {
-      if (response.status === 401) this.csrfToken = null;
+      if (response.status === 401) this.setToken(null);
       throw errorFor(response.status, parsed);
     }
     if (expectStatus !== undefined && response.status !== expectStatus) {
@@ -201,7 +203,7 @@ export class HttpApi implements ArxApi {
   async getSession(): Promise<Session | null> {
     try {
       const session = decodeSession(await this.request('GET', `${API_PREFIX}/session`));
-      this.csrfToken = session.csrfToken;
+      this.setToken(session.csrfToken);
       return session;
     } catch (error) {
       if (error instanceof ApiError && error.code === 'unauthorized') return null;
@@ -211,7 +213,7 @@ export class HttpApi implements ArxApi {
 
   async login(credentials: Credentials): Promise<Session> {
     const session = decodeSession(await this.request('POST', `${API_PREFIX}/session`, { username: credentials.username, password: credentials.password }));
-    this.csrfToken = session.csrfToken;
+    this.setToken(session.csrfToken);
     return session;
   }
 
@@ -219,22 +221,44 @@ export class HttpApi implements ArxApi {
    * Revokes the session. Resolves only on exactly 204 (revoked) or 401
    * (already gone). Every other answer, including 200 and 202, rejects and
    * keeps the CSRF token so a retry sends DELETE again.
+   *
+   * Without a CSRF token (after a 401, a session-ended stream or an earlier
+   * sign-out) it never assumes the cookie is gone: it re-reads the session
+   * first. A 401 there confirms there is nothing to revoke; a live session is
+   * revoked with DELETE as above, and a failure rejects.
    */
   async logout(): Promise<void> {
-    if (!this.csrfToken) return; // only after a confirmed sign-out or a 401
+    if (!this.csrfToken && (await this.getSession()) === null) return;
     try {
       await this.request('DELETE', `${API_PREFIX}/session`, undefined, 204);
     } catch (error) {
       if (error instanceof ApiError && error.code === 'unauthorized') return;
       throw error;
     }
-    this.csrfToken = null;
+    this.setToken(null);
   }
 
-  /** A stream reported that the server ended the session: forget the token. */
-  private sessionEnded = (): void => {
-    this.csrfToken = null;
-  };
+  private setToken(token: string | null): void {
+    if (token === this.csrfToken) return;
+    this.csrfToken = token;
+    this.generation += 1;
+  }
+
+  /**
+   * Binds a stream's 4401 to the session it is opened under. The returned
+   * callback ends the local session (forgets the token) and returns true only
+   * if that session is still the current one, or no session is held. A late
+   * 4401 from a stream of an earlier session returns false and leaves a newer
+   * session untouched.
+   */
+  private sessionEnder(): () => boolean {
+    const opened = this.generation;
+    return () => {
+      if (opened !== this.generation && this.csrfToken !== null) return false;
+      this.setToken(null);
+      return true;
+    };
+  }
 
   async listHosts(): Promise<Host[]> {
     return decodeHosts(await this.request('GET', `${API_PREFIX}/hosts`));
@@ -278,14 +302,17 @@ export class HttpApi implements ArxApi {
     return new this.WebSocketImpl(url);
   }
 
+  // The session is captured before the ticket request, which carries its token.
   async openTerminal(hostId: string): Promise<TerminalSession> {
+    const ended = this.sessionEnder();
     const { url, ticket } = await this.ticket(`${API_PREFIX}/hosts/${pathId(hostId)}/terminal`);
-    return new WsTerminalSession(this.socket(url), ticket, this.sessionEnded);
+    return new WsTerminalSession(this.socket(url), ticket, ended);
   }
 
   async openConsole(vmId: string): Promise<ConsoleStream> {
+    const ended = this.sessionEnder();
     const { url, ticket } = await this.ticket(`${API_PREFIX}/vms/${pathId(vmId)}/console`);
-    return new WsConsoleStream(this.socket(url), ticket, this.sessionEnded);
+    return new WsConsoleStream(this.socket(url), ticket, ended);
   }
 }
 
@@ -326,6 +353,11 @@ export function decodeTerminalMessage(data: unknown): TerminalEvent | null {
 
 const MAX_CLOSE_REASON = 123;
 
+/** A 4401 for the session a stream was opened under, after a newer sign-in. */
+function earlierSessionClosed(what: string): { reason: StreamCloseReason; message: string } {
+  return { reason: 'server', message: `The ${what} closed because the session it was opened under ended.` };
+}
+
 function closeMessage(what: string, event: CloseEvent): { reason: StreamCloseReason; message: string } {
   if (event.code === STREAM_CLOSE_CODES.sessionEnded) return { reason: 'session_ended', message: `Your session ended, so the server closed the ${what}.` };
   const why = typeof event.reason === 'string' ? event.reason.slice(0, MAX_CLOSE_REASON).trim() : '';
@@ -339,7 +371,7 @@ class WsTerminalSession implements TerminalSession {
   private readonly events = new Emitter<[TerminalEvent]>();
   private closedByClient = false;
 
-  constructor(private readonly ws: WebSocket, ticket: string, private readonly onSessionEnded: () => void = () => undefined) {
+  constructor(private readonly ws: WebSocket, ticket: string, private readonly onSessionEnded: () => boolean = () => true) {
     ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'auth', ticket })));
     ws.addEventListener('message', (e: MessageEvent) => {
       if (this.current === 'closed' || this.current === 'error') return;
@@ -355,11 +387,12 @@ class WsTerminalSession implements TerminalSession {
     ws.addEventListener('error', () => this.fail('network', 'The terminal connection failed.'));
     ws.addEventListener('close', (e: Event) => {
       // Server-initiated close: say why, and let the view end a dead session.
-      // A received 4401 always ends the local session, even after a
-      // client-side failure already closed the view.
-      const closed = closeMessage('terminal', e as CloseEvent);
-      if (closed.reason === 'session_ended') this.onSessionEnded();
-      else if (this.closedByClient || this.current === 'error' || this.current === 'closed') return;
+      // A 4401 for the current session always ends it, even after a
+      // client-side failure already closed the view. A 4401 for an earlier
+      // session only closes this stream.
+      let closed = closeMessage('terminal', e as CloseEvent);
+      if (closed.reason === 'session_ended' && !this.onSessionEnded()) closed = earlierSessionClosed('terminal');
+      if (closed.reason !== 'session_ended' && (this.closedByClient || this.current === 'error' || this.current === 'closed')) return;
       this.events.emit({ type: 'closed', ...closed });
       this.setStatus('closed');
     });
@@ -424,7 +457,7 @@ class WsConsoleStream implements ConsoleStream {
   private lastSeq = 0;
   private closedByClient = false;
 
-  constructor(private readonly ws: WebSocket, ticket: string, private readonly onSessionEnded: () => void = () => undefined) {
+  constructor(private readonly ws: WebSocket, ticket: string, private readonly onSessionEnded: () => boolean = () => true) {
     ws.binaryType = 'blob';
     ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'auth', ticket })));
     ws.addEventListener('message', (e: MessageEvent) => {
@@ -451,12 +484,12 @@ class WsConsoleStream implements ConsoleStream {
     });
     ws.addEventListener('error', () => this.fail('The console connection failed.'));
     ws.addEventListener('close', (e: Event) => {
-      const { reason, message } = closeMessage('console', e as CloseEvent);
+      let { reason, message } = closeMessage('console', e as CloseEvent);
+      if (reason === 'session_ended' && !this.onSessionEnded()) ({ reason, message } = earlierSessionClosed('console'));
       if (reason === 'session_ended') {
-        // A received 4401 always ends the local session, even after a server
+        // A 4401 for the current session always ends it, even after a server
         // notice (such as "VM stopped") or a client-side failure already
         // closed the view, so report it even when the status is unchanged.
-        this.onSessionEnded();
         this.current = 'closed';
         this.statuses.emit('closed', message, true);
         return;

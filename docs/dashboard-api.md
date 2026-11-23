@@ -113,7 +113,11 @@ only after the revocation is durable; `401` if the session was already gone.
 The client reports "signed out" only after `204` or `401`. On any other
 answer or a network failure it keeps the session and its CSRF token, tells the
 owner that sign-out failed and that the session may still be active, and
-offers a retry that sends `DELETE` again.
+offers a retry that sends `DELETE` again. A client that holds no CSRF token
+(after a 401, a stream's 4401 or an earlier sign-out) never assumes the cookie
+is gone: it first sends `GET /api/v1/session`. A `401` there confirms there is
+nothing to revoke; a returned session is revoked with `DELETE` as above; any
+other failure is reported as a failed sign-out.
 
 ## Hosts
 
@@ -278,12 +282,14 @@ per-session lock:
      as the transport accepts it. The 5 s deadline starts at revocation: if
      the connection cannot drain its buffer and send the close by then (a
      stalled peer), the server aborts the TCP connection.
-   - The close frame is fixed only when the transport accepts it. A writer
-     that already took another close (for example 1001) and is waiting for
-     the transport reads the pending close again under the session lock in
-     the same step that hands the frame over. So a revocation that completes
-     before the hand-over always produces 4401, and logout is never followed
-     by a different close code on that socket.
+   - A close frame's code is fixed when the server hands the frame to the
+     transport. A writer that already took another close (for example 1001)
+     and is waiting for the transport reads the pending close again under the
+     session lock in the same step that hands the frame over. So a close
+     handed over after revocation carries 4401. A close the transport had
+     already accepted before revocation keeps its code and may still reach
+     the peer after sign-out completes; a stalled connection may instead be
+     aborted at the deadline above.
 4. **Expiry wake-up.** At redemption the server arms a timer per stream for
    the session's absolute expiry, and re-arms an idle-expiry timer whenever
    the session's idle deadline moves. When a timer fires, its callback takes
@@ -325,7 +331,9 @@ the reason in the terminal or console view and offers Reconnect, and it
 ignores any message that arrives after the close. On 4401 it also forgets the
 in-memory CSRF token, ends the local session and returns to the login form,
 even when an earlier closing notice (such as `VM stopped`) already closed the
-view.
+view. A 4401 applies only to the session the stream was opened under: when a
+newer sign-in has replaced that session, the client just marks that stream
+closed and keeps the newer session and its token.
 On 4408 it reports a ticket or handshake failure and offers Reconnect,
 without ending the session.
 

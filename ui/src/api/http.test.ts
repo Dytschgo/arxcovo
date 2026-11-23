@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import { FIXTURE_HOSTS, FIXTURE_VMS } from './fixtures';
 import { activitySearch, CSRF_HEADER, decodeFrameMeta, decodeTerminalMessage, HttpApi, readBounded } from './http';
-import type { ConsoleFrame, TerminalEvent } from './types';
+import type { ConsoleFrame, ConsoleStream, TerminalEvent, TerminalSession } from './types';
 
 const SESSION = { user: { name: 'owner' }, csrfToken: 'csrf-token-0123456789', expiresAt: '2026-11-23T20:00:00Z' };
 
@@ -259,6 +259,7 @@ describe('sign-out confirmation', () => {
     const { fetchImpl, calls } = fakeFetch({
       'POST /api/v1/session': () => json(200, SESSION),
       'DELETE /api/v1/session': () => (++attempts === 1 ? json(503, { error: { code: 'unavailable', message: 'arxd is restarting' } }) : new Response(null, { status: 204 })),
+      'GET /api/v1/session': () => json(401, {}),
     });
     const api = new HttpApi({ fetch: fetchImpl });
     await api.login({ username: 'owner', password: 'pw' });
@@ -267,8 +268,10 @@ describe('sign-out confirmation', () => {
     const deletes = calls.filter(c => c.init.method === 'DELETE');
     expect(deletes).toHaveLength(2);
     expect(deletes.every(c => header(c.init, CSRF_HEADER) === SESSION.csrfToken)).toBe(true);
+    // Without a token, sign-out asks the server; its 401 confirms nothing is left.
     await api.logout();
     expect(calls.filter(c => c.init.method === 'DELETE')).toHaveLength(2);
+    expect(calls.at(-1)).toMatchObject({ url: '/api/v1/session', init: { method: 'GET' } });
   });
 
   test('a DELETE answered 401 counts as signed out: the session was already gone', async () => {
@@ -279,6 +282,116 @@ describe('sign-out confirmation', () => {
     const api = new HttpApi({ fetch: fetchImpl });
     await api.login({ username: 'owner', password: 'pw' });
     await expect(api.logout()).resolves.toBeUndefined();
+  });
+});
+
+describe('round 4: a stream 4401 is bound to the session it was opened under', () => {
+  const TOKENS = ['csrf-token-session-a-0123', 'csrf-token-session-b-4567'];
+
+  function twoSessionApi(path: string, live: () => boolean = () => false) {
+    let logins = 0;
+    const { fetchImpl, calls } = fakeFetch({
+      'POST /api/v1/session': () => json(200, { ...SESSION, csrfToken: TOKENS[logins++] }),
+      'GET /api/v1/session': () => (live() ? json(200, { ...SESSION, csrfToken: TOKENS[logins - 1] }) : json(401, {})),
+      'DELETE /api/v1/session': () => new Response(null, { status: 204 }),
+      [`POST ${path}`]: () => json(200, { streamPath: '/api/v1/streams/s-1', ticket: 'ticket-0123456789abcdef' }),
+    });
+    const api = new HttpApi({ fetch: fetchImpl, WebSocket: FakeSocket as unknown as new (url: string) => WebSocket, pageUrl: 'https://atlas.tail.ts.net:7443/' });
+    return { api, calls };
+  }
+
+  /** A browser fires one close event; a disposed socket's may arrive late. */
+  function quietClose(ws: FakeSocket) {
+    ws.close = () => {
+      ws.closed = true;
+    };
+  }
+
+  const kinds = [
+    ['console', '/api/v1/vms/web-static/console', (api: HttpApi) => api.openConsole('web-static')],
+    ['terminal', '/api/v1/hosts/atlas/terminal', (api: HttpApi) => api.openTerminal('atlas')],
+  ] as const;
+
+  test.each(kinds)('a late 4401 from a disposed %s of session A keeps session B', async (_kind, path, open) => {
+    const { api, calls } = twoSessionApi(path);
+    await api.login({ username: 'owner', password: 'pw' });
+    const stream = await open(api);
+    const old = FakeSocket.last!;
+    quietClose(old);
+    await api.logout();
+    stream.close();
+    await api.login({ username: 'owner', password: 'pw' });
+    serverClose(old, 4401);
+    await open(api);
+    await api.logout();
+    const tickets = calls.filter(c => c.url === path);
+    expect(tickets.map(c => header(c.init, CSRF_HEADER))).toEqual(TOKENS);
+    const deletes = calls.filter(c => c.init.method === 'DELETE');
+    expect(deletes.map(c => header(c.init, CSRF_HEADER))).toEqual(TOKENS);
+  });
+
+  test('a still-open console of session A only closes on its late 4401', async () => {
+    const { api, calls } = twoSessionApi('/api/v1/vms/web-static/console');
+    await api.login({ username: 'owner', password: 'pw' });
+    const stream = await api.openConsole('web-static');
+    const statuses: [string, string | undefined, boolean | undefined][] = [];
+    stream.onStatus((s, r, ended) => statuses.push([s, r, ended]));
+    await api.logout();
+    await api.login({ username: 'owner', password: 'pw' });
+    serverClose(FakeSocket.last!, 4401);
+    expect(statuses).toEqual([['closed', 'The console closed because the session it was opened under ended.', false]]);
+    await api.logout();
+    expect(header(calls.at(-1)!.init, CSRF_HEADER)).toBe(TOKENS[1]);
+  });
+
+  test('a still-open terminal of session A only closes on its late 4401', async () => {
+    const { api } = twoSessionApi('/api/v1/hosts/atlas/terminal');
+    await api.login({ username: 'owner', password: 'pw' });
+    const session = await api.openTerminal('atlas');
+    const events: TerminalEvent[] = [];
+    session.onEvent(e => events.push(e));
+    await api.logout();
+    await api.login({ username: 'owner', password: 'pw' });
+    serverClose(FakeSocket.last!, 4401);
+    expect(events.filter(e => e.type === 'closed')).toEqual([{ type: 'closed', reason: 'server', message: 'The terminal closed because the session it was opened under ended.' }]);
+    await expect(api.openTerminal('atlas')).resolves.toBeDefined();
+  });
+
+  test.each(kinds)('a 4401 for the current session still ends it (%s)', async (kind, path, open) => {
+    const { api, calls } = twoSessionApi(path);
+    await api.login({ username: 'owner', password: 'pw' });
+    const stream = await open(api);
+    const ended: boolean[] = [];
+    if (kind === 'console') (stream as ConsoleStream).onStatus((_s, _r, e) => ended.push(e === true));
+    else (stream as TerminalSession).onEvent(e => {
+      if (e.type === 'closed') ended.push(e.reason === 'session_ended');
+    });
+    serverClose(FakeSocket.last!, 4401);
+    expect(ended).toEqual([true]);
+    const before = calls.length;
+    await expect(open(api)).rejects.toMatchObject({ code: 'unauthorized' });
+    expect(calls).toHaveLength(before);
+  });
+
+  test('sign-out without a token re-reads the session and revokes one that is still live', async () => {
+    let live = true;
+    const { api, calls } = twoSessionApi('/api/v1/vms/web-static/console', () => live);
+    await api.login({ username: 'owner', password: 'pw' });
+    await api.openConsole('web-static');
+    serverClose(FakeSocket.last!, 4401);
+    await api.logout();
+    expect(calls.slice(-2).map(c => `${c.init.method} ${c.url}`)).toEqual(['GET /api/v1/session', 'DELETE /api/v1/session']);
+    expect(header(calls.at(-1)!.init, CSRF_HEADER)).toBe(TOKENS[0]);
+    // Once the server reports no session, sign-out resolves without DELETE.
+    live = false;
+    await api.logout();
+    expect(calls.at(-1)).toMatchObject({ url: '/api/v1/session', init: { method: 'GET' } });
+    expect(calls.filter(c => c.init.method === 'DELETE')).toHaveLength(1);
+  });
+
+  test('sign-out without a token rejects when the session cannot be re-read', async () => {
+    const { fetchImpl } = fakeFetch({ 'GET /api/v1/session': () => json(503, { error: { code: 'unavailable', message: 'arxd is restarting' } }) });
+    await expect(new HttpApi({ fetch: fetchImpl }).logout()).rejects.toMatchObject({ code: 'unavailable' });
   });
 });
 
