@@ -161,6 +161,8 @@ fn native_reason(reason: NativeRefusal) -> &'static str {
         ReservesUnverified => "reserves_unverified",
         NetworkFenceUnverified => "network_fence_unverified",
         InstallerPhaseUnavailable => "installer_phase_unavailable",
+        InstallerPhaseMismatch => "installer_phase_mismatch",
+        InstallerDeadlineExpired => "installer_deadline_expired",
     }
 }
 
