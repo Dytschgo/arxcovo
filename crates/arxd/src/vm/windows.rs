@@ -6,8 +6,8 @@
 
 use super::{
     guest::GuestChannel,
-    paths::{ArtifactPin, FileIdentity, LocalPath},
-    qemu_args::{CommandPlan, PlanKind, SerialName},
+    paths::{ArtifactPin, ArtifactRole, FileIdentity, LocalPath},
+    qemu_args::{CommandPlan, InstallerArtifact, PlanKind, SerialName},
     qmp::{ChannelError, Qmp},
     runtime::{
         FRESHNESS, InstallerFailure, InstallerFailureReason, InstallerStage, LaunchAuthority,
@@ -80,6 +80,8 @@ struct PathPin {
     mutable: bool,
     verified_content: Option<ArtifactPin>,
 }
+
+const MAX_SETUP_VARS_BYTES: u64 = 16 * 1024 * 1024;
 
 impl PathPin {
     fn open(path: &LocalPath, directory: bool, mutable: bool) -> Result<Self, NativeRefusal> {
@@ -193,10 +195,49 @@ impl PathPin {
         let name = self.path.as_str().rsplit('\\').next().unwrap_or_default();
         let file = open_relative(parent, name, Node::File, false, false)?;
         if file_identity(&file, false)?.0 != self.identity {
-            return Err(io::Error::other("release identity changed"));
+            return Err(io::Error::other("pinned identity changed"));
         }
         Ok(file)
     }
+}
+
+fn bind_installer_pin(
+    expected: &InstallerArtifact<'_>,
+    pins: &[PathPin],
+) -> Result<(usize, Option<ArtifactPin>), NativeRefusal> {
+    let index = pins
+        .iter()
+        .position(|pin| {
+            pin.path
+                .as_str()
+                .eq_ignore_ascii_case(expected.path.as_str())
+                && pin.identity == expected.identity
+                && pin.mutable == expected.role.writable()
+        })
+        .ok_or(NativeRefusal::PathCustodyUnverified)?;
+    if expected.role == ArtifactRole::WindowsSetupVars {
+        let digest = expected.pin.ok_or(NativeRefusal::PathCustodyUnverified)?;
+        return Ok((index, Some(digest)));
+    }
+    if expected
+        .pin
+        .is_some_and(|digest| pins[index].verified_content != Some(digest))
+    {
+        return Err(NativeRefusal::PathCustodyUnverified);
+    }
+    Ok((index, None))
+}
+
+/// The ordinary pin retains the object and ancestors while this additional
+/// handle excludes writers during verification and suspended creation.
+fn guard_setup_vars(pin: &PathPin, digest: ArtifactPin) -> Result<File, NativeRefusal> {
+    let guard = pin
+        .reopen_without_writer()
+        .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
+    if !matches!(digest.verify(&guard, MAX_SETUP_VARS_BYTES), Ok(true)) {
+        return Err(NativeRefusal::PathCustodyUnverified);
+    }
+    Ok(guard)
 }
 
 /// No-follow read open of a directory by absolute name. Only volume roots
@@ -1794,7 +1835,8 @@ struct NativeLaunch<'a> {
     child: Child,
     workers: Option<WorkerSet>,
     gate: std::sync::Arc<DispatchGate>,
-    _pins: Vec<PathPin>,
+    pins: std::sync::Arc<[PathPin]>,
+    setup_vars_handoff: Option<File>,
     installer_writers: Vec<usize>,
     kind: PlanKind,
     installer: Option<InstallerStage>,
@@ -1849,20 +1891,12 @@ impl<'a> NativeLaunch<'a> {
             _ => {}
         }
         let mut installer_writers = Vec::new();
+        let mut setup_vars = None;
         for expected in inputs.plan.installer_artifacts() {
-            let index = inputs
-                .pins
-                .iter()
-                .position(|pin| {
-                    pin.path.contains(expected.path)
-                        && expected.path.contains(&pin.path)
-                        && pin.identity == expected.identity
-                        && pin.mutable == expected.role.writable()
-                        && expected
-                            .pin
-                            .is_none_or(|digest| pin.verified_content == Some(digest))
-                })
-                .ok_or(NativeRefusal::PathCustodyUnverified)?;
+            let (index, setup_digest) = bind_installer_pin(expected, &inputs.pins)?;
+            if let Some(digest) = setup_digest {
+                setup_vars = Some((index, digest));
+            }
             if expected.role.writable() {
                 installer_writers.push(index);
             }
@@ -1874,6 +1908,15 @@ impl<'a> NativeLaunch<'a> {
             .map_err(|_| NativeRefusal::JobUnverified)?;
         let environment = launch_environment(inputs.loader_root, inputs.scratch)
             .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
+        let setup_vars_handoff = setup_vars
+            .map(|(index, digest)| guard_setup_vars(&inputs.pins[index], digest))
+            .transpose()?;
+        if inputs
+            .installer
+            .is_some_and(|stage| tokio::time::Instant::now() >= stage.deadline())
+        {
+            return Err(NativeRefusal::InstallerDeadlineExpired);
+        }
         let child = spawn(
             Launch::Restricted {
                 token: &token.token,
@@ -1897,7 +1940,8 @@ impl<'a> NativeLaunch<'a> {
                 child,
                 workers: Some(workers),
                 gate,
-                _pins: inputs.pins,
+                pins: inputs.pins.into(),
+                setup_vars_handoff,
                 installer_writers,
                 kind,
                 installer: inputs.installer,
@@ -1916,7 +1960,7 @@ impl<'a> NativeLaunch<'a> {
         cancel: &Shutdown,
         // Returns the monotonic capture time of a fresh resource sample.
         mut revalidate: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
-        verify_release: impl FnOnce() -> bool,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<BootOutcome, BootFailure> {
         if let Some(stage) = self.installer {
             return self
@@ -2011,7 +2055,7 @@ impl<'a> NativeLaunch<'a> {
         io: BootIo,
         cancel: &Shutdown,
         revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
-        verify_release: impl FnOnce() -> bool,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<BootOutcome, InstallerFailure> {
         use InstallerFailureReason as Failure;
         use tokio::time::{Instant, sleep_until};
@@ -2024,7 +2068,11 @@ impl<'a> NativeLaunch<'a> {
             if Instant::now() >= deadline {
                 return Err(Failure::Timeout);
             }
-            self.child.resume_checked(cancel, revalidate).map_err(Failure::Native)?;
+            self.child.resume_checked_with_handoff(cancel, revalidate, || {
+                // QEMU opens writable pflash by name after resume. The
+                // original object and ancestry pin stays held across it.
+                drop(self.setup_vars_handoff.take());
+            }).map_err(Failure::Native)?;
             let (read, write) = io;
             let mut qmp = Qmp::installer_handshake(read, write, cancel, stage).await?;
             self.dispatch_cont(&mut qmp, cancel, revalidate, Some(stage)).await?;
@@ -2084,7 +2132,7 @@ impl<'a> NativeLaunch<'a> {
         &mut self,
         qmp: Option<PipeQmp>,
         cancel: &Shutdown,
-        verify_release: impl FnOnce() -> bool,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> StopDisposition {
         let mut observed = StopEvidence::default();
         if let Some(qmp) = qmp {
@@ -2110,7 +2158,7 @@ impl<'a> NativeLaunch<'a> {
         guest_shutdown: bool,
         clean_process_exit: bool,
         deadline: tokio::time::Instant,
-        verify_release: impl FnOnce() -> bool,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> StopDisposition {
         let mut observed = StopEvidence {
             guest_shutdown,
@@ -2124,22 +2172,63 @@ impl<'a> NativeLaunch<'a> {
         } else {
             false
         };
-        observed.verify_release(|| {
-            let in_time = || self.installer.is_none() || tokio::time::Instant::now() < deadline;
-            if !in_time() {
-                return false;
-            }
-            let guards = self
-                .installer_writers
-                .iter()
-                .map(|&index| self._pins[index].reopen_without_writer())
-                .collect::<io::Result<Vec<_>>>();
-            // These guards deny new writers while the bounded generation
-            // identity check runs. A late proof cannot release the slot.
-            guards.is_ok_and(|_guards| in_time() && verify_release() && in_time())
-        });
-        observed.disposition()
+        let pins = self.pins.clone();
+        let writers = self.installer_writers.clone();
+        finish_release(
+            observed,
+            deadline,
+            move || {
+                let guards = writers
+                    .iter()
+                    .map(|&index| pins[index].reopen_without_writer())
+                    .collect::<io::Result<Vec<_>>>()?;
+                // Keep every pin and the additional writer exclusions
+                // through the read-only generation check.
+                Ok((pins, guards))
+            },
+            verify_release,
+        )
+        .await
     }
+}
+
+/// The worker owns custody and can only report evidence. The async caller
+/// alone accepts it and decides release. A detached worker may finish I/O,
+/// but a closed receiver suppresses any new callback or accepted proof.
+async fn finish_release<T: 'static>(
+    mut observed: StopEvidence,
+    deadline: tokio::time::Instant,
+    reopen: impl FnOnce() -> io::Result<T> + Send + 'static,
+    verify_release: impl FnOnce() -> bool + Send + 'static,
+) -> StopDisposition {
+    use tokio::time::{Instant, sleep_until};
+    if !observed.ready_to_verify_release() || Instant::now() >= deadline {
+        return StopDisposition::ChargedQuarantine;
+    }
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let Ok(worker) = Worker::start("arx-vm-release", move || {
+        if tx.is_closed() {
+            return Ok(());
+        }
+        let guard = reopen()?;
+        let verified = !tx.is_closed() && verify_release();
+        drop(guard);
+        let _ = tx.send(verified);
+        Ok(())
+    }) else {
+        return StopDisposition::ChargedQuarantine;
+    };
+    let verified = tokio::select! {
+        biased;
+        _ = sleep_until(deadline) => {
+            rx.close();
+            worker.cancel_io();
+            false
+        }
+        evidence = &mut rx => matches!(evidence, Ok(true)) && Instant::now() < deadline,
+    };
+    observed.verify_release(|| verified);
+    observed.disposition()
 }
 
 impl Child {
@@ -2161,6 +2250,15 @@ impl Child {
         cancel: &Shutdown,
         revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
+        self.resume_checked_with_handoff(cancel, revalidate, || {})
+    }
+
+    fn resume_checked_with_handoff(
+        &mut self,
+        cancel: &Shutdown,
+        revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
+        handoff: impl FnOnce(),
+    ) -> Result<(), NativeRefusal> {
         if cancel.is_cancelled() {
             return Err(NativeRefusal::JobUnverified);
         }
@@ -2172,6 +2270,7 @@ impl Child {
             std::time::Instant::now(),
             NativeRefusal::ReservesUnverified,
         )?;
+        handoff();
         self.resume().map_err(|_| NativeRefusal::JobUnverified)
     }
 }
@@ -3357,8 +3456,8 @@ mod tests {
         std::fs::rename(&disk, &moved).unwrap();
     }
 
-    #[test]
-    fn installer_release_reopen_excludes_live_and_new_writers() {
+    #[tokio::test]
+    async fn installer_release_reopen_excludes_live_and_new_writers() {
         let (_dir, root) = fixture_root();
         let disk = format!(r"{root}\disk.qcow2");
         std::fs::write(&disk, b"candidate").unwrap();
@@ -3371,6 +3470,140 @@ mod tests {
         assert!(writer().is_err());
         drop(guard);
         assert!(writer().is_ok());
+
+        let observed = StopEvidence {
+            guest_shutdown: true,
+            clean_process_exit: true,
+            process_exited: true,
+            job_empty: true,
+            workers_joined: true,
+            ..StopEvidence::default()
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            finish_release(
+                observed,
+                deadline,
+                move || pin.reopen_without_writer(),
+                move || OpenOptions::new().write(true).open(&disk).is_err(),
+            )
+            .await,
+            StopDisposition::CleanRelease
+        );
+    }
+
+    #[test]
+    fn installer_setup_refuses_stale_vars_and_requires_writer_exclusion() {
+        use sha2::Digest;
+        let (_dir, root) = fixture_root();
+        let path = LocalPath::parse(&format!(r"{root}\setup-vars.fd")).unwrap();
+        let original = b"one-shot";
+        let digest = ArtifactPin {
+            size: original.len() as u64,
+            sha256: sha2::Sha256::digest(original).into(),
+        };
+        std::fs::write(path.as_str(), original).unwrap();
+        let mut pin = PathPin::open(&path, false, true).unwrap();
+        pin.verify_content(digest, MAX_SETUP_VARS_BYTES).unwrap();
+        let expected = InstallerArtifact {
+            path: &path,
+            identity: pin.identity,
+            pin: Some(digest),
+            role: ArtifactRole::WindowsSetupVars,
+        };
+        let pins = [pin];
+        let writer = || OpenOptions::new().write(true).open(path.as_str());
+
+        let mut active = writer().unwrap();
+        assert!(matches!(
+            guard_setup_vars(&pins[0], digest),
+            Err(NativeRefusal::PathCustodyUnverified)
+        ));
+        std::io::Write::write_all(&mut active, b"modified").unwrap();
+        drop(active);
+        assert_eq!(pins[0].verified_content, Some(digest));
+        let (index, expected_digest) = bind_installer_pin(&expected, &pins).unwrap();
+        assert!(matches!(
+            guard_setup_vars(&pins[index], expected_digest.unwrap()),
+            Err(NativeRefusal::PathCustodyUnverified)
+        ));
+
+        std::fs::write(path.as_str(), original).unwrap();
+        let guard = guard_setup_vars(&pins[0], digest).unwrap();
+        assert!(writer().is_err());
+        drop(guard); // The same bound object can be opened writable at handoff.
+        assert!(writer().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn installer_release_quarantines_stalled_reopen_and_callback_at_the_deadline() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use tokio::time::{Instant, advance};
+
+        struct Finished(mpsc::Sender<()>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        for stall_reopen in [true, false] {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (unblock_tx, unblock_rx) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let guard = Finished(finished_tx);
+            let wall_bound = Duration::from_secs(3);
+            let latch = move || {
+                entered_tx.send(()).unwrap();
+                unblock_rx.recv_timeout(wall_bound).unwrap();
+            };
+            let (reopen_latch, callback_latch) = if stall_reopen {
+                (Some(latch), None)
+            } else {
+                (None, Some(latch))
+            };
+            let callback_started = Arc::new(AtomicBool::new(false));
+            let started = callback_started.clone();
+            let duration = Duration::from_secs(2);
+            let deadline = Instant::now() + duration;
+            let mut release = Box::pin(finish_release(
+                StopEvidence {
+                    guest_shutdown: true,
+                    clean_process_exit: true,
+                    process_exited: true,
+                    job_empty: true,
+                    workers_joined: true,
+                    ..StopEvidence::default()
+                },
+                deadline,
+                move || {
+                    if let Some(latch) = reopen_latch {
+                        latch();
+                    }
+                    Ok(guard)
+                },
+                move || {
+                    started.store(true, Ordering::Release);
+                    if let Some(latch) = callback_latch {
+                        latch();
+                    }
+                    true
+                },
+            ));
+            assert!(parks(release.as_mut()));
+            entered_rx.recv_timeout(wall_bound).unwrap();
+            advance(duration).await;
+            assert_eq!(release.await, StopDisposition::ChargedQuarantine);
+            assert_eq!(Instant::now(), deadline);
+            assert!(finished_rx.try_recv().is_err());
+            unblock_tx.send(()).unwrap();
+            finished_rx.recv_timeout(wall_bound).unwrap();
+            assert_eq!(callback_started.load(Ordering::Acquire), !stall_reopen);
+        }
     }
 
     /// The parent of an exclusive create can be empty, so the nonempty-directory

@@ -301,8 +301,11 @@ impl StopEvidence {
     /// The release check may acquire exclusive writer custody. It may only
     /// run once the child, its whole Job and its workers have stopped.
     pub fn verify_release(&mut self, verify: impl FnOnce() -> bool) {
-        self.artifacts_reopened =
-            self.process_exited && self.job_empty && self.workers_joined && verify();
+        self.artifacts_reopened = self.ready_to_verify_release() && verify();
+    }
+
+    pub(super) fn ready_to_verify_release(&self) -> bool {
+        self.process_exited && self.job_empty && self.workers_joined
     }
 
     pub fn disposition(&self) -> StopDisposition {

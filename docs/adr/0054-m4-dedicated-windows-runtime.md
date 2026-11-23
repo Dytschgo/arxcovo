@@ -406,9 +406,16 @@ boot order nor boot indexes. The firmware and installer pin must prove the
 initial CD handoff, its consumption, and disk boot through Setup resets.
 Later boots reuse the resulting candidate VARS as the ordinary writable
 role. The runtime matches the expected role, object identity and recipe
-pin against retained custody. The authority issuer must bind those inputs
-to the qualified recipe, operation and generation. There is no issuer.
-[QEMU boot selection](https://www.qemu.org/docs/master/system/bootindex.html)
+pin against retained custody. For initial Windows Setup, the launcher
+reopens the same VARS under its held parent with deny-write sharing and
+rechecks the content pin through that handle before suspended creation.
+It retains the write exclusion until the handoff immediately before
+resuming QEMU, whose writable pflash open requires it. The ordinary
+object and ancestor pins stay held throughout. The remaining interval
+before QEMU's by-name open falls under the activation custody gate. The
+authority issuer must bind those inputs to the qualified recipe,
+operation and generation. There is no issuer.
+[QEMU boot selection](https://www.qemu.org/docs/master/system/bootindex.html) · [Windows file sharing](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
 
 Installer startup shares the creation-time Job, QMP greeting,
 capabilities, prelaunch status, and resource-gated dispatch of cont. Its
@@ -429,13 +436,21 @@ detached installed-mode health, disk-only finalization and later detached
 verification. Reset and retry do not extend the absolute deadline.
 Terminal observation is followed by a clean held-process exit, empty Job,
 joined workers, exclusive reopen of disk and VARS, and the caller's bound
-generation release check before media custody can end. Teardown following
-a failed phase has an independent two-second recovery budget. A proved
-release after a phase failure is dirty, and uncertainty keeps the
-generation charged and quarantined. A clean installer release permits the
-next lifecycle step. Detached recipe health still gates capture and seal.
+generation release check before media custody can end. The reopen and
+read-only generation check run in a dedicated worker that owns custody
+for as long as it runs. Only the async caller can accept its evidence
+before the absolute release deadline. On expiry the caller closes the
+result channel, requests cancellation of pending worker I/O, and returns
+charged quarantine without waiting for that worker. The worker may finish
+an in-flight read, and has no authority to publish, detach, or release the
+generation. Teardown following a failed phase has an independent two-second
+recovery budget. A proved release after a phase failure is dirty. A clean
+installer release permits the next lifecycle step. Detached recipe health
+still gates capture and seal.
 
 The paused-clock and in-memory QMP fixtures cover the startup and poweroff
-contract. The native filesystem fixture covers the exclusive reopen check.
+contract. Native filesystem fixtures cover exclusive reopen and stale
+Windows Setup VARS. Paused-clock worker fixtures cover the deadline for a
+stalled reopen or generation check and discard evidence after expiry.
 Real Windows Setup, Subiquity, optical topology, one-shot firmware boot
 order and guest reset behavior are **unverified on real hardware**.
