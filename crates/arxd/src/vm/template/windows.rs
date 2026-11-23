@@ -422,76 +422,50 @@ function Set-DirectorySecurity([string]$Path, [string]$Descriptor) {
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
-function Set-PortSecurity([string]$ServiceSid) {
-    # The same interface class as arx-guest serve-service. Only the one
-    # present interface in the fixed topology can receive this descriptor.
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public static class ArxPortSecurity {
-    [StructLayout(LayoutKind.Sequential)]
-    struct Interface {
-        public int Size;
-        public Guid Class;
-        public int Flags;
-        public IntPtr Reserved;
-    }
-    [StructLayout(LayoutKind.Sequential)]
-    struct Device {
-        public int Size;
-        public Guid Class;
-        public int Instance;
-        public IntPtr Reserved;
-    }
-    [DllImport("setupapi.dll", ExactSpelling=true, SetLastError=true)]
-    static extern IntPtr SetupDiGetClassDevsW(ref Guid type, IntPtr name, IntPtr window, int flags);
-    [DllImport("setupapi.dll", ExactSpelling=true, SetLastError=true)]
-    static extern bool SetupDiEnumDeviceInterfaces(IntPtr set, IntPtr device, ref Guid type, int index, ref Interface entry);
-    [DllImport("setupapi.dll", ExactSpelling=true, SetLastError=true)]
-    static extern bool SetupDiGetDeviceInterfaceDetailW(IntPtr set, ref Interface entry, IntPtr detail, int size, out int needed, ref Device device);
-    [DllImport("setupapi.dll", ExactSpelling=true, SetLastError=true)]
-    static extern bool SetupDiSetDeviceRegistryPropertyW(IntPtr set, ref Device device, int property, byte[] value, int size);
-    [DllImport("setupapi.dll", ExactSpelling=true, SetLastError=true)]
-    static extern bool SetupDiGetDeviceRegistryPropertyW(IntPtr set, ref Device device, int property, out int type, byte[] value, int size, out int needed);
-    [DllImport("setupapi.dll", ExactSpelling=true)]
-    static extern bool SetupDiDestroyDeviceInfoList(IntPtr set);
-
-    public static bool Apply(string sddl) {
-        var type = new Guid("6fde7521-1b65-48ae-b628-80be62016026");
-        var set = SetupDiGetClassDevsW(ref type, IntPtr.Zero, IntPtr.Zero, 0x12); // present interfaces
-        if (set == new IntPtr(-1)) return false;
-        try {
-            var first = new Interface { Size = Marshal.SizeOf(typeof(Interface)) };
-            var second = first;
-            if (!SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref type, 0, ref first)) return false;
-            if (SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref type, 1, ref second)
-                || Marshal.GetLastWin32Error() != 259) return false; // ERROR_NO_MORE_ITEMS
-            var device = new Device { Size = Marshal.SizeOf(typeof(Device)) };
-            int needed;
-            var detail = Marshal.AllocHGlobal(4096);
-            try {
-                Marshal.WriteInt32(detail, 8); // SP_DEVICE_INTERFACE_DETAIL_DATA_W, x64
-                if (!SetupDiGetDeviceInterfaceDetailW(set, ref first, detail, 4096, out needed, ref device))
-                    return false;
-            } finally { Marshal.FreeHGlobal(detail); }
-            const int securitySds = 0x18;
-            var bytes = Encoding.Unicode.GetBytes(sddl + "\0");
-            if (!SetupDiSetDeviceRegistryPropertyW(set, ref device, securitySds, bytes, bytes.Length))
-                return false;
-            var actual = new byte[1024];
-            int kind;
-            return SetupDiGetDeviceRegistryPropertyW(set, ref device, securitySds, out kind, actual, actual.Length, out needed)
-                && kind == 1 && needed >= 2 && needed <= actual.Length
-                && Encoding.Unicode.GetString(actual, 0, needed).TrimEnd('\0') == sddl;
-        } finally { SetupDiDestroyDeviceInfoList(set); }
-    }
+function Open-GuestRegistryKey([string]$Path) {
+    [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey($Path)
 }
-'@
-    if (-not [ArxPortSecurity]::Apply("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;$ServiceSid)")) {
-        throw 'port'
-    }
+
+function Set-VerifiedRegistryValue([string]$Path, [string]$Name, [Microsoft.Win32.RegistryValueKind]$Kind, $Value) {
+    $key = Open-GuestRegistryKey $Path
+    try {
+        $key.SetValue($Name, $Value, $Kind)
+        $key.Flush()
+        if ($key.GetValueKind($Name) -ne $Kind) { throw 'registry kind' }
+        $actual = $key.GetValue($Name)
+        if ($Kind -eq 'Binary') {
+            if ([Convert]::ToBase64String($actual) -cne [Convert]::ToBase64String($Value)) {
+                throw 'registry value'
+            }
+        } elseif ($actual -cne $Value) {
+            throw 'registry value'
+        }
+    } finally { $key.Close() }
+}
+
+function Set-GuestPowerShellLogging {
+    $policy = 'SOFTWARE\Policies\Microsoft\Windows\PowerShell'
+    Set-VerifiedRegistryValue "$policy\ScriptBlockLogging" EnableScriptBlockLogging DWord 0
+    Set-VerifiedRegistryValue "$policy\ScriptBlockLogging" EnableScriptBlockInvocationLogging DWord 0
+    Set-VerifiedRegistryValue "$policy\ModuleLogging" EnableModuleLogging DWord 0
+    Set-VerifiedRegistryValue "$policy\Transcription" EnableTranscripting DWord 0
+}
+
+function Get-GuestServiceSid {
+    $sid = ([Security.Principal.NTAccount]::new('NT SERVICE','arx-guest')).Translate(
+        [Security.Principal.SecurityIdentifier]).Value
+    if ($sid -cnotmatch '^S-1-5-80(-[0-9]+){5}$') { throw 'service' }
+    $sid
+}
+
+function Set-PortSecurity([string]$ServiceSid) {
+    # This is the dedicated raw PDO class from WdfPdoInitAssignRawDevice,
+    # distinct from the enumerated port interface class used by arx-guest.
+    $class = 'SYSTEM\CurrentControlSet\Control\Class\{6FDE7547-1B65-48AE-B628-80BE62016026}\Properties'
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;$ServiceSid)")
+    $bytes = [byte[]]::new($descriptor.BinaryLength)
+    $descriptor.GetBinaryForm($bytes, 0)
+    Set-VerifiedRegistryValue $class Security Binary $bytes
 }
 
 function Install-ServiceFromSeed {
@@ -529,9 +503,7 @@ function Install-ServiceFromSeed {
     Invoke-FixedTool $sc @('sdset','arx-guest','O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;CCRC;;;LS)')
     Invoke-FixedTool $sc @('sidtype','arx-guest','unrestricted')
     Invoke-FixedTool $sc @('privs','arx-guest','SeChangeNotifyPrivilege/SeIncreaseQuotaPrivilege')
-    $sid = ([Security.Principal.NTAccount]::new('NT SERVICE','arx-guest')).Translate(
-        [Security.Principal.SecurityIdentifier]).Value
-    if ($sid -cnotmatch '^S-1-5-80(-[0-9]+){5}$') { throw 'service' }
+    $sid = Get-GuestServiceSid
     New-Item -Path $work -ItemType Directory | Out-Null
     Set-DirectorySecurity $work "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;FRFX;;;LS)(A;;0x44;;;$sid)"
     Invoke-FixedTool (Join-Path $system 'icacls.exe') @($work,'/setintegritylevel','L')
@@ -627,6 +599,19 @@ function Clear-SetupCaches {
     }
 }
 
+function Test-InstallerMediaAttached {
+    [IO.DriveInfo]::GetDrives().DriveType -contains 'CDRom'
+}
+
+function Write-SetupPhase([string]$Value) {
+    $bytes = [Text.Encoding]::ASCII.GetBytes($Value)
+    $file = [IO.File]::Open($state, 'Create', 'Write', 'None')
+    try {
+        $file.Write($bytes, 0, $bytes.Length)
+        $file.Flush($true)
+    } finally { $file.Dispose() }
+}
+
 function Finish-Setup {
     $imageState = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State'
     $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -643,16 +628,12 @@ function Finish-Setup {
     if (-not (Test-Path -LiteralPath $state)) {
         Clear-Bootstrap
         Clear-SetupCaches
-        $sid = ([Security.Principal.NTAccount]::new('NT SERVICE','arx-guest')).Translate(
-            [Security.Principal.SecurityIdentifier]).Value
-        if ($sid -cnotmatch '^S-1-5-80(-[0-9]+){5}$') { throw 'service' }
-        Set-PortSecurity $sid
-        Invoke-FixedTool $sc @('config','arx-guest','start=','auto')
-        [IO.File]::WriteAllText($state, "1:$boot")
+        Set-PortSecurity (Get-GuestServiceSid)
+        Write-SetupPhase "1:$boot"
         Invoke-FixedTool (Join-Path $system 'shutdown.exe') @('/s','/t','0')
         return
     }
-    if ([IO.DriveInfo]::GetDrives().DriveType -contains 'CDRom') { throw 'media attached' }
+    if (Test-InstallerMediaAttached) { throw 'media attached' }
     if ((Get-Item -LiteralPath $state).Length -gt 32) { throw 'stage' }
     $previous = [regex]::Match([IO.File]::ReadAllText($state), '^([12]):([0-9]{1,19})$')
     if (-not $previous.Success -or [long]$previous.Groups[2].Value -ge $boot) {
@@ -662,7 +643,12 @@ function Finish-Setup {
     Assert-NoBootstrap
     Clear-SetupCaches
     if ($stage -eq '1') {
-        [IO.File]::WriteAllText($state, "2:$boot")
+        Set-GuestPowerShellLogging
+        Write-SetupPhase "2:$boot"
+        # SCM checks the auto-start configuration. Start explicitly on this
+        # boot after persisting the phase and verifying every policy value.
+        Invoke-FixedTool $sc @('config','arx-guest','start=','auto')
+        Invoke-FixedTool $sc @('start','arx-guest')
         return
     }
     Unregister-ScheduledTask -TaskName $task -Confirm:$false
@@ -944,7 +930,7 @@ mod tests {
         assert_eq!(iso, again);
         assert_eq!(
             hex::encode(Sha256::digest(&iso)),
-            "0dc6bbeb953e8a0697581008699f06ec8fcfd95d037ce95baf2fd52aea359f11"
+            "fc3316a810db21082763213be3d86a1bb3a61369e4cb6fe143e738b6c546f044"
         );
 
         let adversarial = "&<>\"' é\t\u{1f642}\r\n";
@@ -975,6 +961,208 @@ mod tests {
             String::from_utf8_lossy(&result.stderr)
         );
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_finalizer_gates_service_start_and_sysprep() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut check = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "& ([ScriptBlock]::Create([Console]::In.ReadToEnd()))",
+            ])
+            .env("ARX_FIXTURE_ROOT", fixture.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = check.stdin.take().unwrap();
+        write!(
+            input,
+            "$provisioner = @'\n{PROVISIONER}'@\n{CHECK_PROVISIONER}"
+        )
+        .unwrap();
+        drop(input);
+        let result = check.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    const CHECK_PROVISIONER: &str = r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseInput($provisioner, [ref]$tokens, [ref]$errors)
+if ($errors) { throw 'invalid provisioner syntax' }
+# Load only the tested function definitions. All guest operations callable
+# from these functions are stubbed or restricted to the test temp directory.
+foreach ($name in 'Set-VerifiedRegistryValue','Set-GuestPowerShellLogging','Set-PortSecurity',
+                  'Write-SetupPhase','Finish-Setup') {
+    $definition = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+    }, $false)
+    if (-not $definition) { throw 'missing provisioner function' }
+    . ([ScriptBlock]::Create($definition.Extent.Text))
+}
+
+$script:system = $env:ARX_FIXTURE_ROOT
+$script:sc = Join-Path $system 'sc.exe'
+$script:state = Join-Path $system 'setup.phase'
+$script:script = Join-Path $system 'arxsetup.ps1'
+$script:setupKey = 'HKLM:\SYSTEM\Setup'
+$script:task = 'ArxcovoTemplateFinalize'
+$script:taskPresent = $true
+$script:mediaAttached = $false
+$script:cleanupFails = $false
+$script:registryFault = ''
+$script:boot = [DateTime]::new(2026, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+$script:registry = @{}
+$script:tools = [Collections.Generic.List[string]]::new()
+$script:expectedPolicy = @(
+    'SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging\EnableScriptBlockLogging',
+    'SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging\EnableScriptBlockInvocationLogging',
+    'SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging\EnableModuleLogging',
+    'SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription\EnableTranscripting'
+)
+$script:serviceSid = 'S-1-5-80-1-2-3-4-5'
+[IO.File]::WriteAllText($script, 'fixture')
+
+function Expect($Condition, $Description) {
+    if (-not $Condition) { throw $Description }
+}
+function Expect-Failure([string]$Message) {
+    try { Finish-Setup } catch {
+        Expect ($_.Exception.Message -ceq $Message) "unexpected failure: $($_.Exception.Message)"
+        return
+    }
+    throw 'expected a failure'
+}
+function Open-GuestRegistryKey($Path) {
+    $key = [pscustomobject]@{ Path = $Path }
+    $key | Add-Member ScriptMethod SetValue {
+        param($Name, $Value, $Kind)
+        $script:registry["$($this.Path)\$Name"] = @{ Value = $Value; Kind = $Kind }
+    }
+    $key | Add-Member ScriptMethod GetValueKind {
+        param($Name)
+        if ($Name -ceq 'EnableTranscripting' -and $script:registryFault -ceq 'kind') { return 'String' }
+        $script:registry["$($this.Path)\$Name"].Kind
+    }
+    $key | Add-Member ScriptMethod GetValue {
+        param($Name)
+        if ($Name -ceq 'EnableTranscripting' -and $script:registryFault -ceq 'value') { return 1 }
+        ,$script:registry["$($this.Path)\$Name"].Value
+    }
+    $key | Add-Member ScriptMethod Flush {}
+    $key | Add-Member ScriptMethod Close {}
+    $key
+}
+function Get-GuestServiceSid { $script:serviceSid }
+function Get-ItemPropertyValue {
+    param($LiteralPath, $Name, $ErrorAction)
+    if ($LiteralPath -ceq $script:setupKey -and $Name -cin 'SystemSetupInProgress','OOBEInProgress') {
+        return 0
+    }
+    if ($LiteralPath -ceq 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State' -and
+        $Name -ceq 'ImageState') { return 'IMAGE_STATE_COMPLETE' }
+    throw 'unexpected Setup read'
+}
+function Get-CimInstance($ClassName) {
+    Expect ($ClassName -ceq 'Win32_OperatingSystem') 'wrong boot witness'
+    @{ LastBootUpTime = $script:boot }
+}
+function Assert-PlainPath($Path) { Expect ($Path -ceq $script:state) 'unexpected phase path' }
+function Clear-Bootstrap {}
+function Assert-NoBootstrap {}
+function Clear-SetupCaches {
+    if ($script:cleanupFails) { throw 'cache fixture' }
+}
+function Test-InstallerMediaAttached { $script:mediaAttached }
+function Unregister-ScheduledTask {
+    param($TaskName, [switch]$Confirm)
+    Expect ($TaskName -ceq $script:task -and -not $Confirm) 'unexpected task removal'
+    $script:taskPresent = $false
+}
+function Get-ScheduledTask($TaskName, $ErrorAction) {
+    Expect ($TaskName -ceq $script:task) 'unexpected task read'
+    if ($script:taskPresent) { $TaskName }
+}
+function Invoke-FixedTool($Program, [string[]]$Arguments) {
+    $step = $Arguments -join ' '
+    switch -CaseSensitive ($step) {
+        '/s /t 0' {
+            Expect ($Program -ceq (Join-Path $script:system 'shutdown.exe')) 'wrong shutdown executable'
+            Expect ([IO.File]::ReadAllText($script:state) -ceq "1:$($script:boot.Ticks)") 'shutdown before phase 1'
+        }
+        { $_ -cin 'config arx-guest start= auto','start arx-guest' } {
+            Expect ($Program -ceq $script:sc) 'wrong SCM executable'
+            Expect ([IO.File]::ReadAllText($script:state) -ceq "2:$($script:boot.Ticks)") 'SCM before phase 2'
+            foreach ($policy in $script:expectedPolicy) {
+                $entry = $script:registry[$policy]
+                Expect ($entry -and $entry.Kind -eq 'DWord' -and $entry.Value -ceq 0) 'SCM before policy'
+            }
+        }
+        '/generalize /oobe /shutdown /quiet' {
+            Expect ($Program -ceq (Join-Path $script:system 'Sysprep\Sysprep.exe')) 'wrong Sysprep executable'
+            Expect (-not $script:taskPresent) 'Sysprep before task removal'
+            Expect (-not ([IO.File]::Exists($script:state) -or [IO.File]::Exists($script:script))) 'Sysprep before file cleanup'
+        }
+        default { throw 'unexpected native command' }
+    }
+    $script:tools.Add($step)
+}
+
+$script:cleanupFails = $true
+Expect-Failure 'cache fixture'
+Expect ($tools.Count -eq 0 -and -not [IO.File]::Exists($state)) 'initial cleanup failure advanced phase'
+$script:cleanupFails = $false
+Finish-Setup
+Expect ($tools.Count -eq 1 -and $registry.Count -eq 1) 'initial phase touched SCM or unexpected registry keys'
+$entry = $registry['SYSTEM\CurrentControlSet\Control\Class\{6FDE7547-1B65-48AE-B628-80BE62016026}\Properties\Security']
+Expect ($entry.Kind -eq 'Binary') 'raw port class security is not binary'
+$descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($entry.Value, 0)
+$acl = $descriptor.DiscretionaryAcl
+Expect ($descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) 'port ACL inherits'
+Expect ($acl.Count -eq 3 -and @($acl | Where-Object AceType -ne AccessAllowed).Count -eq 0) 'unexpected port ACL'
+Expect ($acl[0].SecurityIdentifier.Value -ceq 'S-1-5-18' -and $acl[0].AccessMask -eq 0x10000000) 'missing SYSTEM grant'
+Expect ($acl[1].SecurityIdentifier.Value -ceq 'S-1-5-32-544' -and $acl[1].AccessMask -eq 0x10000000) 'missing Administrators grant'
+Expect ($acl[2].SecurityIdentifier.Value -ceq $serviceSid -and $acl[2].AccessMask -eq (-1073741824)) 'wrong service SID grant'
+Expect-Failure 'stage'
+
+$script:boot = $boot.AddSeconds(1)
+$script:mediaAttached = $true
+Expect-Failure 'media attached'
+$script:mediaAttached = $false
+foreach ($fault in 'kind','value') {
+    $script:registryFault = $fault
+    Expect-Failure "registry $fault"
+    Expect ($tools.Count -eq 1 -and [IO.File]::ReadAllText($state).StartsWith('1:')) 'unverified policy advanced phase'
+}
+$script:registryFault = ''
+Finish-Setup
+Expect (($tools -join '|') -ceq '/s /t 0|config arx-guest start= auto|start arx-guest') 'unexpected startup sequence'
+Expect ($registry.Count -eq 5) 'unexpected registry keys'
+Expect-Failure 'stage'
+
+$script:boot = $boot.AddSeconds(1)
+$script:cleanupFails = $true
+Expect-Failure 'cache fixture'
+Expect ($tools.Count -eq 3 -and $taskPresent -and [IO.File]::Exists($state)) 'cleanup failure advanced to Sysprep'
+$script:cleanupFails = $false
+Finish-Setup
+Expect ($tools.Count -eq 4 -and $tools[3] -ceq '/generalize /oobe /shutdown /quiet') 'Sysprep command missing'
+exit 0
+"#;
 
     const CHECK_SEED: &str = r#"
 import hashlib
@@ -1063,6 +1251,16 @@ for name in ['viostor', 'vioser', 'netkvm']:
 hooks = [get(c,'Path') for c in specialize[0].find(n+'RunSynchronous')]
 assert len(hooks) == 4 and all(len(hook) <= 259 for hook in hooks)
 assert sha(manifest) in hooks[-2] and sha(script) in hooks[-1]
+assert hooks[-1].endswith(';& $p install"')
+assert b'[Microsoft.Win32.Registry]::LocalMachine.CreateSubKey($Path)' in script
+assert rb"$policy = 'SOFTWARE\Policies\Microsoft\Windows\PowerShell'" in script
+assert [line.strip() for line in script.splitlines() if b'Set-VerifiedRegistryValue "$policy' in line] == [
+    rb'Set-VerifiedRegistryValue "$policy\ScriptBlockLogging" EnableScriptBlockLogging DWord 0',
+    rb'Set-VerifiedRegistryValue "$policy\ScriptBlockLogging" EnableScriptBlockInvocationLogging DWord 0',
+    rb'Set-VerifiedRegistryValue "$policy\ModuleLogging" EnableModuleLogging DWord 0',
+    rb'Set-VerifiedRegistryValue "$policy\Transcription" EnableTranscripting DWord 0']
+assert rb"SYSTEM\CurrentControlSet\Control\Class\{6FDE7547-1B65-48AE-B628-80BE62016026}\Properties" in script
+assert b'Set-VerifiedRegistryValue $class Security Binary $bytes' in script
 assert get(oobe[1],'HideOnlineAccountScreens') == 'true'
 assert get(oobe[1],'HideWirelessSetupInOOBE') == 'true'
 assert get(oobe[1],'ProtectYourPC') == '3'
