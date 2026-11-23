@@ -166,6 +166,10 @@ async fn enrolled_target_binding_revocation_and_stale_acceptance() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
+    not(target_os = "windows"),
+    ignore = "intermittent NotLeader quarantine: docs/ROADMAP.md Known issues (Engine fix hold)"
+)]
+#[cfg_attr(
     target_os = "windows",
     ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
 )]

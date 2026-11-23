@@ -342,3 +342,15 @@ Windows/Ubuntu guest media are later M4 requirements, unnecessary for M2 alone.
 Linux-specific A7/A11 sudo/NNP and A12 need a qualifying Linux host and remain
 hardware-pending. Existing Lab Manager paths/state and agent-windows-test stay
 untouched. No admin or native acceptance action has been performed here.
+
+## Static VM public-egress build
+
+ADR 0064 uses the separate Windows x64 build at
+`D:\ArxcovoData\qemu\11.1.3-arx-egress-2`. Its executable contains the
+patched libslirp. Verify its receipt and full payload manifest against the
+checked-in pin before using it for owner qualification. The paused WHPX
+smoke covered startup and the loopback listener. Guest boot, egress under
+traffic and route drift are **unverified on real hardware**. The public
+profile remains gated on owner-host qualification.
+[Build and policy contract](../tools/qemu/README.md) ·
+[Build receipt pin](../tools/qemu/public-egress-receipt.json)

@@ -62,6 +62,11 @@ impl<'a> CandidateRuntime<'a> {
         NativeCapability::Unavailable(reason)
     }
 
+    /// A fixture copy receipt has no offline launch or native file authority.
+    pub fn snapshot_lease(&self) -> Result<OfflineLease, NativeRefusal> {
+        Err(NativeRefusal::QualificationMissing)
+    }
+
     /// Refuse before the private lifecycle can stage anything. Native launch
     /// independently requires an operation-bound LaunchAuthority.
     #[allow(
@@ -329,6 +334,17 @@ impl StopEvidence {
 /// An observed process exit or fixture receipt cannot produce this lease.
 pub struct OfflineLease {
     _closed: std::convert::Infallible,
+}
+
+pub const SNAPSHOT_COPY_MAXIMUM: Duration = Duration::from_secs(15 * 60);
+
+/// A copy may shorten the controller's admission deadline. Each blocking
+/// custody call receives this same deadline, including during inspection.
+pub(super) fn snapshot_deadline(worker: &super::PendingOperation, start: Instant) -> Instant {
+    start
+        .checked_add(SNAPSHOT_COPY_MAXIMUM)
+        .unwrap_or(worker.deadline())
+        .min(worker.deadline())
 }
 
 /// One teardown authority per work item. Implementations must bind it to the

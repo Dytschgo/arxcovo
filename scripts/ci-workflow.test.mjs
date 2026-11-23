@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, rmdirSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { RUST_UBUNTU_RUNNER } from './policy.mjs';
 
 const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
 const playwrightConfig = readFileSync(new URL('../playwright.config.ts', import.meta.url), 'utf8');
@@ -19,7 +20,7 @@ test('CI runs unconditional Rust and UI matrices in parallel behind the existing
   for (const id of ['rust', 'ui']) {
     const env = id === 'rust' ? "    env:\n      CARGO_PROFILE_DEV_DEBUG: '0'\n" : '';
     const runner = id === 'rust'
-      ? "${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}"
+      ? `\${{ matrix.os == 'ubuntu-latest' && '${RUST_UBUNTU_RUNNER}' || matrix.os }}`
       : '${{ matrix.os }}';
     assert.equal(jobs[id].split('    steps:\n')[0], `    name: ${id} (\${{ matrix.os }})\n${matrix}    runs-on: ${runner}\n    timeout-minutes: 12\n${env}`);
     assert.doesNotMatch(jobs[id], /^ {4}(?:needs|if|environment|services|concurrency):/m);
