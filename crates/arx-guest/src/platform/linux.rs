@@ -275,6 +275,8 @@ impl<'port> ScriptRunner<'port> {
                             stdout: None,
                             #[cfg(test)]
                             stall: self.stall.map(|stall| stall.child),
+                            #[cfg(test)]
+                            gate: None,
                         },
                     )
                 })
@@ -489,6 +491,10 @@ struct ChildSetup {
     stdout: Option<RawFd>,
     #[cfg(test)]
     stall: Option<StallBeforeExec>,
+    /// Inherited read end. Tests allocate it at fd 10 or above; the child
+    /// maps it to fd 3 before exec because dash rejects higher redirections.
+    #[cfg(test)]
+    gate: Option<RawFd>,
 }
 
 #[cfg(test)]
@@ -500,6 +506,10 @@ struct StallBeforeExec {
 
 #[cfg(test)]
 const TEST_HANG_GUARD: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const HELD_GATE_FD: RawFd = 3;
+#[cfg(test)]
+const HELD_GATE_FLOOR: RawFd = 10;
 
 #[cfg(test)]
 struct StallWatchdog {
@@ -588,6 +598,8 @@ impl PreparedScript {
 unsafe fn exec_child(setup: ChildSetup, input: RawFd, null: RawFd, report: RawFd) -> ! {
     unsafe {
         #[cfg(test)]
+        let (setup, input, null, report) = pin_held_gate(setup, input, null, report);
+        #[cfg(test)]
         if let Some(stall) = setup.stall {
             let [a, b, c, d] = libc::getpid().to_ne_bytes();
             let inherited = u8::from(
@@ -647,6 +659,71 @@ unsafe fn exec_child(setup: ChildSetup, input: RawFd, null: RawFd, report: RawFd
     }
 }
 
+/// Put the test gate on fd 3 without dropping a descriptor the child still
+/// needs. Dash accepts redirections only for fds 0-9, so a fixture that
+/// inherits fd 10 or above would lose the gate at the shell.
+#[cfg(test)]
+unsafe fn pin_held_gate(
+    mut setup: ChildSetup,
+    mut input: RawFd,
+    mut null: RawFd,
+    mut report: RawFd,
+) -> (ChildSetup, RawFd, RawFd, RawFd) {
+    unsafe {
+        let Some(gate) = setup.gate else {
+            return (setup, input, null, report);
+        };
+        if gate != HELD_GATE_FD {
+            let flags = libc::fcntl(HELD_GATE_FD, libc::F_GETFD);
+            if flags != -1 {
+                let moved = libc::fcntl(HELD_GATE_FD, libc::F_DUPFD, HELD_GATE_FLOOR);
+                if moved < HELD_GATE_FLOOR {
+                    launch_failed(report);
+                }
+                if (flags & libc::FD_CLOEXEC) != 0
+                    && libc::fcntl(moved, libc::F_SETFD, libc::FD_CLOEXEC) != 0
+                {
+                    launch_failed(report);
+                }
+                if input == HELD_GATE_FD {
+                    input = moved;
+                }
+                if null == HELD_GATE_FD {
+                    null = moved;
+                }
+                if report == HELD_GATE_FD {
+                    report = moved;
+                }
+                if let Some(fd) = setup.stdout.as_mut()
+                    && *fd == HELD_GATE_FD
+                {
+                    *fd = moved;
+                }
+                if let Some(fd) = setup.procs.as_mut()
+                    && *fd == HELD_GATE_FD
+                {
+                    *fd = moved;
+                }
+                if let Some(stall) = setup.stall.as_mut() {
+                    if stall.ready == HELD_GATE_FD {
+                        stall.ready = moved;
+                    }
+                    if stall.gate == HELD_GATE_FD {
+                        stall.gate = moved;
+                    }
+                }
+                if libc::close(HELD_GATE_FD) != 0 {
+                    launch_failed(report);
+                }
+            }
+            if libc::dup2(gate, HELD_GATE_FD) < 0 || libc::close(gate) != 0 {
+                launch_failed(report);
+            }
+        }
+        (setup, input, null, report)
+    }
+}
+
 // SAFETY: the reporting pipe is private, empty and has a live reader during
 // launch (or returns EPIPE after retirement). The child must never unwind.
 unsafe fn launch_failed(report: RawFd) -> ! {
@@ -666,6 +743,9 @@ struct ScriptChild {
     // always uses the clock. None keeps that path.
     #[cfg(test)]
     exec_now: Option<Instant>,
+    // Set only by the comparison below, after wait_readable has returned.
+    #[cfg(test)]
+    deadline_boundary_reached: bool,
 }
 
 impl ScriptChild {
@@ -682,6 +762,8 @@ impl ScriptChild {
             status: None,
             #[cfg(test)]
             exec_now: None,
+            #[cfg(test)]
+            deadline_boundary_reached: false,
         }
     }
 
@@ -698,6 +780,10 @@ impl ScriptChild {
         #[cfg(not(test))]
         let now = Instant::now();
         if now >= deadline {
+            #[cfg(test)]
+            {
+                self.deadline_boundary_reached = true;
+            }
             return Err(io::ErrorKind::TimedOut.into());
         }
         // The child writes one byte on failure. Exec closes the writer.
@@ -1068,21 +1154,25 @@ mod tests {
 
     #[test]
     fn short_deadline_kills_process_group_and_reaps_owned_child() {
-        let gate = HeldGate::open();
+        let mut gate = HeldGate::open();
         let (mut pipe, output) = io::pipe().unwrap();
         let mut child = launched(
-            &format!(
-                "/bin/sh -c 'read _ <&{gate}' & printf '%s\\n' \"$!\"; wait",
-                gate = gate.fd()
+            concat!(
+                "/bin/sh -c 'read _ <&3 || { printf '\\''%s\\n'\\'' failed; exit 1; }; ",
+                "printf '\\''%s\\n'\\'' held; read _ <&3' & printf '%s\\n' \"$!\"; wait"
             ),
             ChildSetup {
                 stdout: Some(output.as_raw_fd()),
+                gate: Some(gate.fd()),
                 ..ChildSetup::default()
             },
         );
         drop(output);
         let descendant = read_pid(&mut pipe);
         // SAFETY: getpgid reads kernel state and has no pointer parameters.
+        assert_eq!(unsafe { libc::getpgid(descendant) }, child.pid);
+        assert_blocked_until_release(&mut pipe, &mut gate);
+        // The second read is still blocked, so the descendant is still in the group.
         assert_eq!(unsafe { libc::getpgid(descendant) }, child.pid);
         // The descendant is held on the gate, so this deadline is already due
         // and observe classifies it without sleeping.
@@ -1239,21 +1329,35 @@ mod tests {
         );
         let error = held.wait_exec(expired).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            !held.deadline_boundary_reached,
+            "already-due deadline must time out inside wait_readable"
+        );
         held.kill().unwrap();
         reap(&mut held, Instant::now() + TEST_HANG_GUARD).unwrap();
         drop((started, ready, gate));
 
-        // Exec closes the writer, so the pipe is readable before the hang
-        // guard. The injected clock is exactly the deadline, which must still
-        // lose to the budget instead of counting as a successful exec.
+        // Exec closes the writer. Wait for that close under the hang guard:
+        // expiry fails the test and is not the timeout under assertion.
+        // The injected clock is then equal to a still-future deadline, so
+        // only the production comparison can return TimedOut.
         let mut child = PreparedScript::new("exit 0")
             .unwrap()
             .fork(&ReapOwner::verify().unwrap(), ChildSetup::default())
             .unwrap();
-        let deadline = Instant::now() + TEST_HANG_GUARD;
+        wait_readable(
+            child.exec_reader.as_raw_fd(),
+            Instant::now() + TEST_HANG_GUARD,
+        )
+        .expect("hang guard expired before the exec pipe was readable");
+        let deadline = Instant::now() + Duration::from_secs(60);
         child.exec_now = Some(deadline);
         let error = child.wait_exec(deadline).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            child.deadline_boundary_reached,
+            "timeout was not produced by the production deadline comparison"
+        );
         reap(&mut child, Instant::now() + TEST_HANG_GUARD).unwrap();
     }
 
@@ -1336,23 +1440,27 @@ mod tests {
             }
         };
         let mut group = root.new_command().unwrap();
-        let gate = HeldGate::open();
+        let mut gate = HeldGate::open();
         let (mut pipe, output) = io::pipe().unwrap();
         let mut child = launched(
-            &format!(
-                "setsid /bin/sh -c 'printf \"%s\\n\" \"$$\"; read _ <&{gate}' & exit 0",
-                gate = gate.fd()
+            concat!(
+                "setsid /bin/sh -c 'printf \"%s\\n\" \"$$\"; ",
+                "read _ <&3 || { printf '\\''%s\\n'\\'' failed; exit 1; }; ",
+                "printf '\\''%s\\n'\\'' held; read _ <&3' & exit 0"
             ),
             ChildSetup {
                 procs: Some(group.procs.as_raw_fd()),
                 drop_privileges: owner == 0,
                 stdout: Some(output.as_raw_fd()),
+                gate: Some(gate.fd()),
                 ..ChildSetup::default()
             },
         );
         drop(output);
         let descendant = read_pid(&mut pipe);
         // SAFETY: getsid reads kernel state and has no pointer parameters.
+        assert_eq!(unsafe { libc::getsid(descendant) }, descendant);
+        assert_blocked_until_release(&mut pipe, &mut gate);
         assert_eq!(unsafe { libc::getsid(descendant) }, descendant);
         assert_eq!(
             observe(&mut child, Instant::now() + TEST_HANG_GUARD)
@@ -1533,44 +1641,94 @@ mod tests {
     }
 
     fn read_pid(pipe: &mut PipeReader) -> libc::pid_t {
-        ready(pipe);
-        let mut line = [0; 32];
-        let len = pipe.read(&mut line).unwrap();
-        std::str::from_utf8(&line[..len])
-            .unwrap()
-            .trim_end()
-            .parse()
-            .unwrap()
+        read_line(pipe).trim_end().parse().unwrap()
+    }
+
+    fn read_line(pipe: &mut PipeReader) -> String {
+        let mut line = Vec::new();
+        let deadline = Instant::now() + TEST_HANG_GUARD;
+        loop {
+            wait_readable(pipe.as_raw_fd(), deadline)
+                .expect("hang guard expired before the fixture line");
+            let mut byte = [0];
+            assert_eq!(
+                pipe.read(&mut byte).unwrap(),
+                1,
+                "stdout closed before the fixture line finished"
+            );
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+            assert!(line.len() <= 32, "fixture line is too long");
+        }
+        String::from_utf8(line).unwrap()
+    }
+
+    /// The descendant must stay blocked until this test writes a line. A shell
+    /// that rejected the redirection prints `failed` and never prints `held`.
+    fn assert_blocked_until_release(output: &mut PipeReader, gate: &mut HeldGate) {
+        let mut poll = libc::pollfd {
+            fd: output.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = loop {
+            // SAFETY: one initialized pollfd. A zero timeout does not sleep.
+            match unsafe { libc::poll(&mut poll, 1, 0) } {
+                -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
+                ready => break ready,
+            }
+        };
+        assert_eq!(
+            ready, 0,
+            "descendant wrote or closed stdout before the gate was released"
+        );
+        gate.release_line();
+        assert_eq!(
+            read_line(output).trim_end(),
+            "held",
+            "descendant must block on the gate until this test releases it"
+        );
     }
 
     fn ready(pipe: &impl AsRawFd) {
         wait_readable(pipe.as_raw_fd(), Instant::now() + TEST_HANG_GUARD).unwrap();
     }
 
-    /// Read end inherited by the shell. The write end stays open so a blocked
-    /// `read` cannot exit on its own timer.
+    /// Read end inherited above the descriptors dash can redirect. The child
+    /// maps it to fd 3 before exec. The write end stays open so `read` blocks
+    /// until `release_line`.
     struct HeldGate {
         read: OwnedFd,
-        _write: PipeWriter,
+        write: PipeWriter,
     }
 
     impl HeldGate {
         fn open() -> Self {
             let (reader, write) = io::pipe().unwrap();
-            // SAFETY: F_DUPFD duplicates an open pipe to an fd at or above 3
-            // and leaves close-on-exec clear, so the shell inherits it.
-            let dup = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_DUPFD, 3) };
-            assert!(dup >= 3, "gate descriptor was not allocated");
+            // SAFETY: F_DUPFD duplicates an open pipe at or above fd 10 and
+            // leaves close-on-exec clear. The pre-exec setup maps that
+            // descriptor to fd 3; the shell script never names this number.
+            let dup = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_DUPFD, HELD_GATE_FLOOR) };
+            assert!(
+                dup >= HELD_GATE_FLOOR,
+                "gate descriptor was not allocated above the shell limit"
+            );
             drop(reader);
             Self {
                 // SAFETY: F_DUPFD returned a fresh descriptor owned by this process.
                 read: unsafe { OwnedFd::from_raw_fd(dup) },
-                _write: write,
+                write,
             }
         }
 
         fn fd(&self) -> RawFd {
             self.read.as_raw_fd()
+        }
+
+        fn release_line(&mut self) {
+            self.write.write_all(b"x\n").unwrap();
         }
     }
 }
