@@ -6,7 +6,7 @@ use super::{
 use serde::Deserialize;
 
 pub(super) const CLUSTER: usize = 65_536;
-const MAX_INFO: usize = 16_384;
+pub(super) const MAX_INFO: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidImage;
@@ -119,6 +119,17 @@ pub fn offline_info<'a>(
     backing: Option<&Artifact>,
 ) -> Result<CommandPlan<'a>, InvalidImage> {
     qemu_args::offline_info(lease, image, disk, header, backing)
+}
+
+/// Sealed read-only inspection for snapshot source, staging and backup disks.
+/// The native launcher must keep the lease and all bound artifact handles
+/// through helper exit, Job-empty, worker join and by-name release proof.
+pub fn offline_snapshot_info<'a>(
+    lease: &'a OfflineLease,
+    image: &'a Artifact,
+    info: &qemu_args::SnapshotInfo<'a>,
+) -> Result<CommandPlan<'a>, InvalidImage> {
+    qemu_args::offline_snapshot_info(lease, image, info)
 }
 
 /// Exclusive qcow2 creation of a staging image under the offline lease. A

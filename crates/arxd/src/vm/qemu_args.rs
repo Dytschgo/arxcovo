@@ -249,6 +249,90 @@ fn offline_info_args<'a>(
     ))
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum SnapshotDiskRole {
+    Active,
+    Backup,
+    Staging,
+}
+
+/// Fixed inspection request shared by the fixture inspector and the closed
+/// native constructor. This alone has no execution authority.
+pub struct SnapshotInfo<'a> {
+    disk: &'a Artifact,
+    golden: Option<&'a Artifact>,
+    path: &'a LocalPath,
+    args: Vec<String>,
+}
+
+impl<'a> SnapshotInfo<'a> {
+    pub(super) fn checked(
+        disk: &'a Artifact,
+        position: SnapshotDiskRole,
+        header: &[u8],
+        golden: Option<(&'a Artifact, &[u8])>,
+        size: u64,
+    ) -> Result<Self, InvalidImage> {
+        let backing = if let Some((artifact, header)) = golden {
+            if inspect_header(header, None)? != size {
+                return Err(InvalidImage);
+            }
+            Some(role(artifact, ArtifactRole::Golden)?)
+        } else {
+            None
+        };
+        let expected_role = match position {
+            SnapshotDiskRole::Active if backing.is_some() => ArtifactRole::GuestDisk,
+            SnapshotDiskRole::Active => ArtifactRole::StaticDisk,
+            SnapshotDiskRole::Backup => ArtifactRole::SnapshotDisk,
+            SnapshotDiskRole::Staging => ArtifactRole::SnapshotStagingDisk,
+        };
+        let path = role(disk, expected_role)?;
+        if inspect_header(header, backing)? != size
+            || backing.is_some_and(|backing| path.overlaps(backing))
+        {
+            return Err(InvalidImage);
+        }
+        Ok(Self {
+            disk,
+            golden: golden.map(|(artifact, _)| artifact),
+            path,
+            args: info_args(path),
+        })
+    }
+
+    pub fn disk(&self) -> &'a Artifact {
+        self.disk
+    }
+
+    pub fn path(&self) -> &'a LocalPath {
+        self.path
+    }
+
+    pub fn golden(&self) -> Option<&'a Artifact> {
+        self.golden
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+}
+
+pub(super) fn offline_snapshot_info<'a>(
+    lease: &'a OfflineLease,
+    image: &'a Artifact,
+    info: &SnapshotInfo<'a>,
+) -> Result<CommandPlan<'a>, InvalidImage> {
+    Ok(CommandPlan {
+        image: role(image, ArtifactRole::QemuImg)?,
+        args: info.args.clone(),
+        binding: Binding::Offline {
+            lease,
+            mutate: false,
+        },
+    })
+}
+
 /// Validated `qemu-img create` of a staging image. Holds the lease. A backed
 /// create checks the golden's first cluster: qemu-img opens the declared
 /// backing with traversal enabled, so it must itself be unbacked.
