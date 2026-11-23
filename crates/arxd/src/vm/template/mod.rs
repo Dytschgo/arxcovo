@@ -1,5 +1,6 @@
 mod media;
 mod ubuntu;
+pub mod ubuntu_web;
 
 pub use ubuntu::{AssetPin, RecipeError, UbuntuAssets, UbuntuRecipe};
 
