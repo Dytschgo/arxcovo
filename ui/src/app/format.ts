@@ -14,9 +14,11 @@ export function formatBytes(bytes: number): string {
 
 const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 
+/** Never throws: an unparseable timestamp renders as a dash. */
 export function formatDate(iso: string | null): string {
   if (!iso) return '—';
-  return dateFormat.format(new Date(iso));
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? '—' : dateFormat.format(date);
 }
 
 export const OS_LABEL: Record<OsFamily, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };

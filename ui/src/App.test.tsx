@@ -1,9 +1,11 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, test } from 'vitest';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { describe, expect, test, vi } from 'vitest';
 import { App } from './App';
 import { DEMO_CREDENTIALS, FIXTURE_HOSTS } from './api/fixtures';
 import { StandinApi, type StandinOptions } from './api/standin';
 import { ApiError, type ArxApi } from './api/types';
+import { formatDate } from './app/format';
+import { ViewBoundary } from './app/ui';
 
 async function signIn(options: StandinOptions = {}, hash = '#/hosts') {
   window.location.hash = hash;
@@ -60,9 +62,9 @@ describe('hosts', () => {
     const list = await screen.findByRole('list', { name: 'Hosts' });
     const cards = within(list).getAllByRole('listitem');
     expect(cards).toHaveLength(FIXTURE_HOSTS.length);
-    const studio = cards[1];
-    expect(within(studio).getByText('arm64')).toBeTruthy();
-    expect(within(studio).getByText('online')).toBeTruthy();
+    const harbor = cards[1];
+    expect(within(harbor).getByText('arm64')).toBeTruthy();
+    expect(within(harbor).getByText('online')).toBeTruthy();
     expect(within(cards[3]).getByText('No heartbeat for 2 hours')).toBeTruthy();
     expect(screen.getByText('2 of 4 hosts online')).toBeTruthy();
   });
@@ -97,23 +99,23 @@ describe('virtual machines', () => {
     await signIn({}, '#/vms');
     const table = await screen.findByRole('table');
     expect(within(table).getAllByRole('row')).toHaveLength(6);
-    expect(within(table).getAllByTitle('Machine architecture: arm64')).toHaveLength(2);
+    expect(within(table).getAllByTitle('Machine architecture: arm64')).toHaveLength(1);
     fireEvent.change(screen.getByLabelText('Architecture'), { target: { value: 'arm64' } });
-    expect(within(screen.getByRole('table')).getAllByRole('row')).toHaveLength(3);
-    expect(screen.getByText('2 of 5 VMs')).toBeTruthy();
+    expect(within(screen.getByRole('table')).getAllByRole('row')).toHaveLength(2);
+    expect(screen.getByText('1 of 5 VMs')).toBeTruthy();
   });
 
   test('VM detail shows snapshots, expiry and greys out incompatible hosts with a reason', async () => {
-    await signIn({}, '#/vms/macos-dev');
+    await signIn({}, '#/vms/web-static');
     expect(await screen.findByText('Never (static)')).toBeTruthy();
-    expect(screen.getByRole('heading', { level: 1, name: 'macos-dev' })).toBeTruthy();
+    expect(screen.getByRole('heading', { level: 1, name: 'web-static' })).toBeTruthy();
     expect(screen.getByText('nightly 2026-11-22')).toBeTruthy();
     const hosts = screen.getByRole('list', { name: 'Compatible hosts' });
-    const atlas = within(hosts).getByText('atlas').closest('li')!;
-    expect(atlas.getAttribute('aria-disabled')).toBe('true');
-    expect(within(atlas).getByText('macOS guests need a Mac host')).toBeTruthy();
-    const studio = within(hosts).getByText('studio').closest('li')!;
-    expect(within(studio).getByText('Compatible')).toBeTruthy();
+    const harbor = within(hosts).getByText('harbor').closest('li')!;
+    expect(harbor.getAttribute('aria-disabled')).toBe('true');
+    expect(within(harbor).getByText('arm64 host cannot run x86_64 guests')).toBeTruthy();
+    const forge = within(hosts).getByText('forge').closest('li')!;
+    expect(within(forge).getByText('Compatible')).toBeTruthy();
   });
 
   test('a VM without snapshots says so', async () => {
@@ -217,5 +219,60 @@ describe('shell', () => {
     expect(document.documentElement.dataset.theme).toBe('dark');
     fireEvent.click(screen.getByRole('button', { name: /^Theme: dark/ }));
     expect(document.documentElement.dataset.theme).toBeUndefined();
+  });
+});
+
+describe('round 2: sign-out, stream close and render errors', () => {
+  test('a failed sign-out keeps you signed in, says so, and a retry signs out', async () => {
+    await signIn({ failures: { logout: new ApiError('unavailable', 'arxd is restarting.', 503) } });
+    await screen.findByRole('list', { name: 'Hosts' });
+    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Sign-out failed.');
+    expect(alert.textContent).toContain('arxd is restarting.');
+    expect(screen.getByRole('navigation', { name: 'Main' })).toBeTruthy();
+    expect(screen.queryByText('You are signed out.')).toBeNull();
+    fireEvent.click(within(alert).getByRole('button', { name: 'Try sign-out again' }));
+    expect(await screen.findByText('You are signed out.')).toBeTruthy();
+  });
+
+  test('when the server ends the session, an open terminal closes and the login form explains why', async () => {
+    const api = await signIn({}, '#/terminal/atlas');
+    const input = await screen.findByLabelText('Command');
+    await waitFor(() => expect(input).toHaveProperty('disabled', false));
+    act(() => api.endSession());
+    expect(await screen.findByText('Your session has ended. Sign in again.')).toBeTruthy();
+    expect(screen.getByLabelText('Password')).toBeTruthy();
+  });
+
+  test('when the server ends the session, an open console closes and the login form explains why', async () => {
+    const api = await signIn({}, '#/vms/ubuntu-build-02/console');
+    await screen.findByRole('img', { name: /Console of ubuntu-build-02/ });
+    act(() => api.endSession());
+    expect(await screen.findByText('Your session has ended. Sign in again.')).toBeTruthy();
+  });
+
+  test('a render error is contained to the view and can be retried', () => {
+    let explode = true;
+    function Fragile() {
+      if (explode) throw new Error('bad payload');
+      return <p>recovered</p>;
+    }
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      render(<ViewBoundary resetKey="#/vms/x/console"><Fragile /></ViewBoundary>);
+      const alert = screen.getByRole('alert');
+      expect(alert.textContent).toContain('Something unexpected happened');
+      explode = false;
+      fireEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+      expect(screen.getByText('recovered')).toBeTruthy();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('an unparseable timestamp formats as a dash instead of throwing', () => {
+    expect(formatDate('not a date')).toBe('—');
+    expect(formatDate('2026-11-23T12:00:00Z')).not.toBe('—');
   });
 });

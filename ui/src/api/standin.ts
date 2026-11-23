@@ -49,7 +49,7 @@ export interface StandinOptions {
   vms?: Vm[];
   activity?: ActivityEntry[];
   /** Force a method to reject, for error-state tests. */
-  failures?: Partial<Record<'listHosts' | 'getHost' | 'listActivity' | 'listVms' | 'getVm' | 'openTerminal' | 'openConsole', ApiError>>;
+  failures?: Partial<Record<'logout' | 'listHosts' | 'getHost' | 'listActivity' | 'listVms' | 'getVm' | 'openTerminal' | 'openConsole', ApiError>>;
 }
 
 const clone = <T,>(v: T): T => structuredClone(v);
@@ -58,6 +58,8 @@ export class StandinApi implements ArxApi {
   readonly kind = 'standin' as const;
   readonly marker = STANDIN_MARKER;
   private session: Session | null = null;
+  /** Open streams, closed by the "server" when the session ends. */
+  private readonly streams = new Set<{ serverClose(sessionEnded: boolean, message: string): void }>();
   private readonly opts: Required<Omit<StandinOptions, 'failures'>> & Pick<StandinOptions, 'failures'>;
 
   constructor(options: StandinOptions = {}) {
@@ -84,6 +86,23 @@ export class StandinApi implements ArxApi {
     });
   }
 
+  /**
+   * Simulates the server revoking the session (logout, expiry, revocation):
+   * the session is gone and every open stream is closed with the
+   * session-ended code, as docs/dashboard-api.md requires of arxd.
+   */
+  endSession(message = 'Your session ended.'): void {
+    this.session = null;
+    for (const stream of [...this.streams]) stream.serverClose(true, message);
+    this.streams.clear();
+  }
+
+  private track<T extends { serverClose(sessionEnded: boolean, message: string): void; onClosed(fn: () => void): void }>(stream: T): T {
+    this.streams.add(stream);
+    stream.onClosed(() => this.streams.delete(stream));
+    return stream;
+  }
+
   private guard(method: keyof NonNullable<StandinOptions['failures']>): void {
     if (!this.session) throw new ApiError('unauthorized', 'Your session has ended. Sign in again.', 401);
     const failure = this.opts.failures?.[method];
@@ -106,7 +125,12 @@ export class StandinApi implements ArxApi {
 
   logout(): Promise<void> {
     return this.delay(() => {
-      this.session = null;
+      const failure = this.opts.failures?.logout;
+      if (failure) {
+        this.opts.failures = { ...this.opts.failures, logout: undefined };
+        throw failure; // fails once, so a retry can succeed
+      }
+      this.endSession('Signed out.');
     });
   }
 
@@ -164,7 +188,7 @@ export class StandinApi implements ArxApi {
       const host = this.opts.hosts.find(h => h.id === hostId);
       if (!host) throw new ApiError('not_found', `No host named ${hostId}.`, 404);
       if (host.reachability === 'offline') throw new ApiError('unavailable', `${host.name} is offline.`, 503);
-      return new StandinTerminal(host, this.opts.schedule, this.opts.streamMs);
+      return this.track(new StandinTerminal(host, this.opts.schedule, this.opts.streamMs));
     });
   }
 
@@ -173,7 +197,7 @@ export class StandinApi implements ArxApi {
       this.guard('openConsole');
       const vm = this.opts.vms.find(v => v.id === vmId);
       if (!vm) throw new ApiError('not_found', `No VM named ${vmId}.`, 404);
-      return new StandinConsole(vm, this.opts.schedule, Math.max(this.opts.streamMs, 1) * 20);
+      return this.track(new StandinConsole(vm, this.opts.schedule, Math.max(this.opts.streamMs, 1) * 20));
     });
   }
 }
@@ -184,6 +208,7 @@ class StandinTerminal implements TerminalSession {
   private seq = 0;
   private cancelTimers: (() => void)[] = [];
   private activeId: string | null = null;
+  private closedHook: (() => void) | null = null;
 
   constructor(private readonly host: Host, private readonly schedule: Schedule, private readonly streamMs: number) {
     // A 1 ms handshake: callers subscribe before the first event, as with a socket.
@@ -242,12 +267,28 @@ class StandinTerminal implements TerminalSession {
     this.finish(id, 130, 'interrupted');
   }
 
+  onClosed(fn: () => void): void {
+    this.closedHook = fn;
+  }
+
+  /** Server-initiated close; a running command is cancelled first. */
+  serverClose(sessionEnded: boolean, message: string): void {
+    if (this.current === 'closed') return;
+    this.cancelTimers.forEach(c => c());
+    this.cancelTimers = [];
+    this.activeId = null;
+    this.events.emit({ type: 'closed', reason: sessionEnded ? 'session_ended' : 'server', message: sessionEnded ? 'Your session ended, so the server closed the terminal.' : message });
+    this.setStatus('closed');
+    this.closedHook?.();
+  }
+
   close(): void {
     this.cancelTimers.forEach(c => c());
     this.cancelTimers = [];
     this.activeId = null;
     this.setStatus('closed');
     this.events.clear();
+    this.closedHook?.();
   }
 }
 
@@ -266,9 +307,10 @@ export function consoleSvg(vm: Vm, seq: number): string {
 class StandinConsole implements ConsoleStream {
   private current: ConsoleStatus = 'connecting';
   private readonly frames = new Emitter<[ConsoleFrame]>();
-  private readonly statuses = new Emitter<[ConsoleStatus, string | undefined]>();
+  private readonly statuses = new Emitter<[ConsoleStatus, string | undefined, boolean]>();
   private seq = 0;
   private stop: (() => void) | null = null;
+  private closedHook: (() => void) | null = null;
 
   constructor(private readonly vm: Vm, private readonly schedule: Schedule, private readonly intervalMs: number) {
     this.stop = schedule(() => this.start(), 1);
@@ -278,15 +320,16 @@ class StandinConsole implements ConsoleStream {
     return this.current;
   }
 
-  private setStatus(status: ConsoleStatus, reason?: string): void {
+  private setStatus(status: ConsoleStatus, reason?: string, sessionEnded = false): void {
     if (this.current === status) return;
     this.current = status;
-    this.statuses.emit(status, reason);
+    this.statuses.emit(status, reason, sessionEnded);
   }
 
   private start(): void {
     if (this.vm.state !== 'running' && this.vm.state !== 'creating') {
       this.setStatus('closed', `${this.vm.name} is ${this.vm.state}; start it to see its console.`);
+      this.closedHook?.();
       return;
     }
     this.setStatus('streaming');
@@ -304,8 +347,20 @@ class StandinConsole implements ConsoleStream {
     return this.frames.on(listener);
   }
 
-  onStatus(listener: (status: ConsoleStatus, reason?: string) => void): () => void {
+  onStatus(listener: (status: ConsoleStatus, reason?: string, sessionEnded?: boolean) => void): () => void {
     return this.statuses.on(listener);
+  }
+
+  onClosed(fn: () => void): void {
+    this.closedHook = fn;
+  }
+
+  serverClose(sessionEnded: boolean, message: string): void {
+    if (this.current === 'closed') return;
+    this.stop?.();
+    this.stop = null;
+    this.setStatus('closed', sessionEnded ? 'Your session ended, so the server closed the console.' : message, sessionEnded);
+    this.closedHook?.();
   }
 
   close(): void {
@@ -314,5 +369,6 @@ class StandinConsole implements ConsoleStream {
     this.setStatus('closed');
     this.frames.clear();
     this.statuses.clear();
+    this.closedHook?.();
   }
 }

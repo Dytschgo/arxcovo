@@ -58,6 +58,11 @@ function Terminal({ host }: { host: Host }) {
             case 'error':
               append('error', event.message);
               break;
+            case 'closed':
+              append('error', event.message);
+              setConnectError(event.message);
+              if (event.reason === 'session_ended') expire();
+              break;
           }
         });
       },

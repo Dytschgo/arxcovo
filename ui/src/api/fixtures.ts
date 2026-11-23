@@ -27,11 +27,11 @@ export const FIXTURE_HOSTS: Host[] = ([
     reachability: 'online', reachabilityReason: null, lastSeenAt: at(0), mode: 'always_on', agentRights: 'standard',
   },
   {
-    id: 'studio', name: 'studio', os: 'macos', osVersion: 'macOS 26.1', arch: 'arm64',
-    cpu: { model: 'Apple M4 Pro', cores: 14, usedPercent: 21 },
-    memory: { totalBytes: 48 * GiB, usedBytes: 30 * GiB },
+    id: 'harbor', name: 'harbor', os: 'linux', osVersion: 'Ubuntu 24.04.3 LTS', arch: 'arm64',
+    cpu: { model: 'Ampere Altra Q32-17', cores: 32, usedPercent: 21 },
+    memory: { totalBytes: 64 * GiB, usedBytes: 30 * GiB },
     disk: { totalBytes: 2 * TiB, freeBytes: 0.9 * TiB, capBytes: 0.5 * TiB },
-    tools: devTools(['git@2.50.1', 'cargo@1.91.0', 'node@24.18.0', 'swift@6.2', 'xcodebuild@26.1']),
+    tools: devTools(['git@2.43.0', 'cargo@1.91.0', 'node@24.18.0', 'python3@3.12.3', 'qemu-system-aarch64@8.2.2']),
     reachability: 'online', reachabilityReason: null, lastSeenAt: at(1), mode: 'opportunistic', agentRights: 'standard',
   },
   {
@@ -67,13 +67,13 @@ export const FIXTURE_VMS: Vm[] = [
     ],
   },
   {
-    id: 'macos-dev', name: 'macos-dev', kind: 'static', template: { id: 'macos-26-arm64', version: 1 }, guestOs: 'macos', guestOsVersion: 'macOS 26.1',
-    arch: 'arm64', hostId: 'studio', state: 'running', ready: true, expiresAt: null, cpus: 6, memoryBytes: 16 * GiB, diskBytes: 120 * GiB,
+    id: 'web-static', name: 'web-static', kind: 'static', template: { id: 'ubuntu-24-04-x64', version: 7 }, guestOs: 'linux', guestOsVersion: 'Ubuntu 24.04.3 LTS',
+    arch: 'x86_64', hostId: 'atlas', state: 'running', ready: true, expiresAt: null, cpus: 2, memoryBytes: 4 * GiB, diskBytes: 40 * GiB,
     snapshots: [{ id: 'nightly-1122', name: 'nightly 2026-11-22', createdAt: at(720), sizeBytes: 9 * GiB }],
   },
   {
     id: 'ubuntu-arm-03', name: 'ubuntu-arm-03', kind: 'test', template: { id: 'ubuntu-24-04-arm64', version: 2 }, guestOs: 'linux', guestOsVersion: 'Ubuntu 24.04.3 LTS',
-    arch: 'arm64', hostId: 'studio', state: 'creating', ready: false, expiresAt: inDays(7), cpus: 4, memoryBytes: 8 * GiB, diskBytes: 40 * GiB, snapshots: [],
+    arch: 'arm64', hostId: 'harbor', state: 'creating', ready: false, expiresAt: inDays(7), cpus: 4, memoryBytes: 8 * GiB, diskBytes: 40 * GiB, snapshots: [],
   },
   {
     id: 'win11-test-04', name: 'win11-test-04', kind: 'test', template: { id: 'windows-11-x64', version: 3 }, guestOs: 'windows', guestOsVersion: 'Windows 11 Pro 25H2',
@@ -93,9 +93,9 @@ const SCRIPT: { tool: string; outcome: ActivityOutcome; summary: string; host?: 
   { tool: 'list_hosts', outcome: 'succeeded', summary: 'Listed 4 hosts' },
   { tool: 'run_command', outcome: 'failed', summary: 'npm run build', host: 'forge', exit: 1 },
   { tool: 'snapshot_create', outcome: 'succeeded', summary: 'Snapshot before-integration-tests', host: 'atlas', vm: 'ubuntu-build-02' },
-  { tool: 'discover_tools', outcome: 'succeeded', summary: 'Found 5 tools', host: 'studio' },
+  { tool: 'discover_tools', outcome: 'succeeded', summary: 'Found 5 tools', host: 'harbor' },
   { tool: 'run_command', outcome: 'refused', summary: 'Tool not available on host: docker', host: 'pebble' },
-  { tool: 'vm_create', outcome: 'started', summary: 'Linked clone from ubuntu-24-04-arm64 v2', host: 'studio', vm: 'ubuntu-arm-03' },
+  { tool: 'vm_create', outcome: 'started', summary: 'Linked clone from ubuntu-24-04-arm64 v2', host: 'harbor', vm: 'ubuntu-arm-03' },
   { tool: 'list_activity', outcome: 'succeeded', summary: 'Read 20 activity entries' },
   { tool: 'run_command', outcome: 'interrupted', summary: 'cargo build --release (cancelled)', host: 'atlas', exit: 130 },
   { tool: 'vm_stop', outcome: 'succeeded', summary: 'Stopped win11-test-04', host: 'forge', vm: 'win11-test-04' },
@@ -134,5 +134,5 @@ export const TERMINAL_SCRIPTS: Record<string, { lines: string[]; exitCode: numbe
     exitCode: 0,
   },
   pwsh: { lines: ['PowerShell 7.5.4'], exitCode: 0 },
-  swift: { lines: ['Swift version 6.2'], exitCode: 0, stderr: ['warning: using the stand-in toolchain'] },
+  'qemu-system-aarch64': { lines: ['QEMU emulator version 8.2.2'], exitCode: 0, stderr: ['warning: stand-in output, no VM started'] },
 };

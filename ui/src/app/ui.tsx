@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, type ReactNode } from 'react';
+import { Component, useEffect, useId, useRef, type ReactNode } from 'react';
 import type { Arch } from '../api/types';
 import type { Resource } from './context';
 
@@ -122,4 +122,29 @@ export function SelectField({ label, value, onChange, disabled, children }: { la
       <select id={id} value={value} onChange={e => onChange(e.target.value)} disabled={disabled}>{children}</select>
     </div>
   );
+}
+
+/**
+ * Contains render errors to the current view so one bad payload cannot
+ * unmount the whole dashboard. Resets when the route changes.
+ */
+export class ViewBoundary extends Component<{ resetKey: string; children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+
+  static getDerivedStateFromError(): { failed: boolean } {
+    return { failed: true };
+  }
+
+  componentDidUpdate(previous: { resetKey: string }): void {
+    if (previous.resetKey !== this.props.resetKey && this.state.failed) this.setState({ failed: false });
+  }
+
+  render(): ReactNode {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <Page title="This view failed">
+        <ErrorState message="Something unexpected happened while showing this view. Other views and your session are unaffected." onRetry={() => this.setState({ failed: false })} />
+      </Page>
+    );
+  }
 }

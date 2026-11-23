@@ -95,7 +95,7 @@ describe('stand-in terminal', () => {
   });
 
   test('a tool the host lacks is refused, and cancel interrupts a running command', async () => {
-    const { session, events, clock } = await terminal('studio');
+    const { session, events, clock } = await terminal('harbor');
     session.run({ tool: 'pwsh', args: [] });
     clock.advance(100);
     expect(events.find(e => e.type === 'exit')).toMatchObject({ outcome: 'refused', exitCode: null });

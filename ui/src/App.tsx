@@ -3,7 +3,7 @@ import type { ArxApi } from './api/types';
 import { AppProviders, useApi, useSession } from './app/context';
 import { href, useRoute, type Route } from './app/router';
 import { NEXT_THEME, useTheme } from './app/theme';
-import { Empty, Loading, Page } from './app/ui';
+import { Empty, Loading, Page, ViewBoundary } from './app/ui';
 import { ActivityView } from './app/views/ActivityView';
 import { ConsoleView } from './app/views/ConsoleView';
 import { HostDetailView } from './app/views/HostDetailView';
@@ -49,7 +49,7 @@ function View({ route }: { route: Route }) {
 
 function Shell() {
   const api = useApi();
-  const { state, logout } = useSession();
+  const { state, logout, logoutError } = useSession();
   const route = useRoute();
   const [theme, setTheme] = useTheme();
   const main = useRef<HTMLElement>(null);
@@ -90,7 +90,15 @@ function Shell() {
           </div>
         </nav>
         <main id="main" ref={main} tabIndex={-1}>
-          <View route={route} />
+          {logoutError ? (
+            <div className="banner-error" role="alert">
+              <p><strong>Sign-out failed.</strong> {logoutError} You are still signed in on this host.</p>
+              <button type="button" className="button" onClick={() => void logout()}>Try sign-out again</button>
+            </div>
+          ) : null}
+          <ViewBoundary resetKey={href(route)}>
+            <View route={route} />
+          </ViewBoundary>
         </main>
       </div>
     );

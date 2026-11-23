@@ -36,9 +36,10 @@ function Viewer({ vm }: { vm: Vm }) {
         if (!live) return stream.close();
         close = () => stream.close();
         setStatus(stream.status);
-        stream.onStatus((s, why) => {
+        stream.onStatus((s, why, sessionEnded) => {
           setStatus(s);
           setReason(why ?? null);
+          if (sessionEnded) expire();
         });
         stream.onFrame(f => {
           const url = URL.createObjectURL(f.data);

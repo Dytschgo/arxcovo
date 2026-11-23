@@ -16,8 +16,11 @@ export type SessionState =
 
 interface SessionValue {
   state: SessionState;
+  /** Set when the last sign-out attempt failed; the session is still active. */
+  logoutError: string | null;
   login(credentials: Credentials): Promise<void>;
-  logout(): Promise<void>;
+  /** Resolves true once the server confirmed the sign-out. */
+  logout(): Promise<boolean>;
   /** Called when any request reports the session is gone. */
   expire(): void;
 }
@@ -32,6 +35,7 @@ export function useSession(): SessionValue {
 
 export function AppProviders({ api, children }: { api: ArxApi; children: ReactNode }) {
   const [state, setState] = useState<SessionState>({ status: 'checking' });
+  const [logoutError, setLogoutError] = useState<string | null>(null);
 
   useEffect(() => {
     let live = true;
@@ -46,22 +50,30 @@ export function AppProviders({ api, children }: { api: ArxApi; children: ReactNo
 
   const login = useCallback(async (credentials: Credentials) => {
     const session = await api.login(credentials);
+    setLogoutError(null);
     setState({ status: 'authenticated', session });
   }, [api]);
 
   const logout = useCallback(async () => {
     try {
       await api.logout();
-    } finally {
-      setState({ status: 'anonymous', notice: 'You are signed out.' });
+    } catch (error) {
+      // The server did not confirm the revocation: the cookie may still be
+      // valid, so keep the session visible and let the owner retry.
+      setLogoutError(isApiError(error) ? error.message : 'Sign-out failed.');
+      return false;
     }
+    setLogoutError(null);
+    setState({ status: 'anonymous', notice: 'You are signed out.' });
+    return true;
   }, [api]);
 
   const expire = useCallback(() => {
+    setLogoutError(null);
     setState(s => (s.status === 'authenticated' ? { status: 'anonymous', notice: 'Your session has ended. Sign in again.' } : s));
   }, []);
 
-  const value = useMemo(() => ({ state, login, logout, expire }), [state, login, logout, expire]);
+  const value = useMemo(() => ({ state, logoutError, login, logout, expire }), [state, logoutError, login, logout, expire]);
   return (
     <ApiContext.Provider value={api}>
       <SessionContext.Provider value={value}>{children}</SessionContext.Provider>

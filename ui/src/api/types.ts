@@ -130,7 +130,14 @@ export type TerminalEvent =
   | { type: 'started'; commandId: string; tool: string; args: string[] }
   | { type: 'output'; commandId: string; stream: 'stdout' | 'stderr'; data: string }
   | { type: 'exit'; commandId: string; exitCode: number | null; outcome: ActivityOutcome; truncated: boolean }
-  | { type: 'error'; code: string; message: string };
+  | { type: 'error'; code: string; message: string }
+  /** The server closed the stream; `session_ended` means sign in again. */
+  | { type: 'closed'; reason: StreamCloseReason; message: string };
+
+export type StreamCloseReason = 'session_ended' | 'server';
+
+/** WebSocket close codes the server uses (docs/dashboard-api.md). */
+export const STREAM_CLOSE_CODES = { sessionEnded: 4401, forbidden: 4403 } as const;
 
 export interface TerminalSession {
   readonly status: TerminalStatus;
@@ -157,7 +164,8 @@ export interface ConsoleFrame {
 export interface ConsoleStream {
   readonly status: ConsoleStatus;
   onFrame(listener: (frame: ConsoleFrame) => void): () => void;
-  onStatus(listener: (status: ConsoleStatus, reason?: string) => void): () => void;
+  /** `sessionEnded` is true when the server closed the stream because the session ended. */
+  onStatus(listener: (status: ConsoleStatus, reason?: string, sessionEnded?: boolean) => void): () => void;
   close(): void;
 }
 

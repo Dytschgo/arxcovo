@@ -194,6 +194,11 @@ export function decodeVms(v: unknown): Vm[] {
   return arr(obj(v, 'response').vms, 'vms', LIMITS.vms, decodeVm);
 }
 
+/** Strict RFC 3339 instant check, as used for every timestamp the server sends. */
+export function isIsoInstant(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 40 && ISO.test(value) && !Number.isNaN(Date.parse(value));
+}
+
 export function isValidId(value: string): boolean {
   return ID.test(value);
 }

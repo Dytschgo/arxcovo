@@ -1,7 +1,7 @@
 // HTTP + WebSocket adapter for the proposed dashboard API (docs/dashboard-api.md).
 // The session lives in an httpOnly cookie the page cannot read; the CSRF token
 // lives only in this object's memory and is sent on every unsafe request.
-import { decodeActivityPage, decodeHost, decodeHosts, decodeSession, decodeVm, decodeVms, isValidId } from './decode';
+import { decodeActivityPage, decodeHost, decodeHosts, decodeSession, decodeVm, decodeVms, isIsoInstant, isValidId } from './decode';
 import { Emitter } from './emitter';
 import {
   ACTIVITY_OUTCOMES,
@@ -17,6 +17,8 @@ import {
   type Credentials,
   type Host,
   type Session,
+  STREAM_CLOSE_CODES,
+  type StreamCloseReason,
   type TerminalCommand,
   type TerminalEvent,
   type TerminalSession,
@@ -26,7 +28,7 @@ import {
 
 export const API_PREFIX = '/api/v1';
 export const CSRF_HEADER = 'X-Arx-CSRF';
-const MAX_BODY_CHARS = 2 * 1024 * 1024;
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_WS_TEXT = 128 * 1024;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
@@ -65,6 +67,40 @@ function errorFor(status: number, body: unknown): ApiError {
     }
   }
   return new ApiError(code, message, status);
+}
+
+/**
+ * Reads a response body as UTF-8, counting bytes as they stream in and
+ * cancelling the stream as soon as it exceeds `limit`, whether or not a
+ * Content-Length header is present.
+ */
+export async function readBounded(response: Response, limit: number): Promise<string> {
+  const declared = Number(response.headers.get('Content-Length'));
+  if (Number.isFinite(declared) && declared > limit) {
+    void response.body?.cancel().catch(() => undefined);
+    throw new ApiError('bad_response', DEFAULT_MESSAGES.bad_response, response.status);
+  }
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let total = 0;
+  let text = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        void reader.cancel().catch(() => undefined);
+        throw new ApiError('bad_response', DEFAULT_MESSAGES.bad_response, response.status);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError('bad_response', DEFAULT_MESSAGES.bad_response, response.status);
+  }
 }
 
 function pathId(id: string): string {
@@ -131,8 +167,14 @@ export class HttpApi implements ArxApi {
     } catch {
       throw new ApiError('network', DEFAULT_MESSAGES.network);
     }
-    const text = await response.text().catch(() => '');
-    if (text.length > MAX_BODY_CHARS) throw new ApiError('bad_response', DEFAULT_MESSAGES.bad_response, response.status);
+    let text: string;
+    try {
+      text = await readBounded(response, MAX_BODY_BYTES);
+    } catch (error) {
+      // An unreadable error body still yields the status-based error below.
+      if (response.ok) throw error;
+      text = '';
+    }
     let parsed: unknown = null;
     if (text.length > 0) {
       try {
@@ -165,12 +207,20 @@ export class HttpApi implements ArxApi {
     return session;
   }
 
+  /**
+   * Revokes the session. Resolves only once the server confirms the
+   * revocation (204) or reports the session already gone (401). Any other
+   * failure rejects and keeps the CSRF token so the caller can retry.
+   */
   async logout(): Promise<void> {
+    if (!this.csrfToken) return;
     try {
-      if (this.csrfToken) await this.request('DELETE', `${API_PREFIX}/session`);
-    } finally {
-      this.csrfToken = null;
+      await this.request('DELETE', `${API_PREFIX}/session`);
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'unauthorized') return;
+      throw error;
     }
+    this.csrfToken = null;
   }
 
   async listHosts(): Promise<Host[]> {
@@ -261,13 +311,24 @@ export function decodeTerminalMessage(data: unknown): TerminalEvent | null {
   }
 }
 
+const MAX_CLOSE_REASON = 123;
+
+function closeMessage(what: string, event: CloseEvent): { reason: StreamCloseReason; message: string } {
+  if (event.code === STREAM_CLOSE_CODES.sessionEnded) return { reason: 'session_ended', message: `Your session ended, so the server closed the ${what}.` };
+  const why = typeof event.reason === 'string' ? event.reason.slice(0, MAX_CLOSE_REASON).trim() : '';
+  if (event.code === STREAM_CLOSE_CODES.forbidden) return { reason: 'server', message: `The server revoked access to this ${what}${why ? `: ${why}` : '.'}` };
+  return { reason: 'server', message: `The server closed the ${what}${why ? `: ${why}` : '.'}` };
+}
+
 class WsTerminalSession implements TerminalSession {
   private current: TerminalStatus = 'connecting';
   private readonly events = new Emitter<[TerminalEvent]>();
+  private closedByClient = false;
 
   constructor(private readonly ws: WebSocket, ticket: string) {
     ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'auth', ticket })));
     ws.addEventListener('message', (e: MessageEvent) => {
+      if (this.current === 'closed' || this.current === 'error') return;
       const event = decodeTerminalMessage(e.data);
       if (!event) return this.fail('bad_message', 'The terminal stream sent an unreadable message.');
       if (event.type === 'status') this.setStatus(event.status);
@@ -278,8 +339,11 @@ class WsTerminalSession implements TerminalSession {
       }
     });
     ws.addEventListener('error', () => this.fail('network', 'The terminal connection failed.'));
-    ws.addEventListener('close', () => {
-      if (this.current !== 'error') this.setStatus('closed');
+    ws.addEventListener('close', (e: Event) => {
+      if (this.closedByClient || this.current === 'error' || this.current === 'closed') return;
+      // Server-initiated close: say why, and let the view end a dead session.
+      this.events.emit({ type: 'closed', ...closeMessage('terminal', e as CloseEvent) });
+      this.setStatus('closed');
     });
   }
 
@@ -294,8 +358,10 @@ class WsTerminalSession implements TerminalSession {
   }
 
   private fail(code: string, message: string): void {
+    if (this.current === 'error' || this.current === 'closed') return;
     this.events.emit({ type: 'error', code, message });
     this.setStatus('error');
+    this.closedByClient = true;
     this.ws.close();
   }
 
@@ -313,43 +379,63 @@ class WsTerminalSession implements TerminalSession {
   }
 
   close(): void {
+    this.closedByClient = true;
     this.ws.close();
     this.setStatus('closed');
     this.events.clear();
   }
 }
 
+const MAX_FRAME_SIDE = 8192;
+
+/** Validates console frame metadata; sequence numbers must strictly increase. */
+export function decodeFrameMeta(m: Record<string, unknown>, lastSeq: number): Omit<ConsoleFrame, 'data'> | null {
+  const side = (v: unknown) => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= MAX_FRAME_SIDE;
+  if (!Number.isSafeInteger(m.seq) || (m.seq as number) <= lastSeq) return null;
+  if (!side(m.width) || !side(m.height)) return null;
+  if (m.mime !== 'image/png' && m.mime !== 'image/jpeg') return null;
+  if (!isIsoInstant(m.capturedAt)) return null;
+  return { seq: m.seq as number, width: m.width as number, height: m.height as number, mime: m.mime, capturedAt: m.capturedAt };
+}
+
 class WsConsoleStream implements ConsoleStream {
   private current: ConsoleStatus = 'connecting';
   private readonly frames = new Emitter<[ConsoleFrame]>();
-  private readonly statuses = new Emitter<[ConsoleStatus, string | undefined]>();
+  private readonly statuses = new Emitter<[ConsoleStatus, string | undefined, boolean]>();
   private pending: Omit<ConsoleFrame, 'data'> | null = null;
+  private lastSeq = 0;
+  private closedByClient = false;
 
   constructor(private readonly ws: WebSocket, ticket: string) {
     ws.binaryType = 'blob';
     ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'auth', ticket })));
     ws.addEventListener('message', (e: MessageEvent) => {
+      if (this.current === 'closed' || this.current === 'error') return;
       if (typeof e.data === 'string') {
         const m = parseText(e.data);
-        if (m?.type === 'frame' && Number.isInteger(m.seq) && Number.isInteger(m.width) && Number.isInteger(m.height) && (m.mime === 'image/png' || m.mime === 'image/jpeg') && typeof m.capturedAt === 'string') {
-          this.pending = { seq: m.seq as number, width: m.width as number, height: m.height as number, mime: m.mime, capturedAt: m.capturedAt };
+        if (m?.type === 'frame') {
+          const meta = decodeFrameMeta(m, this.lastSeq);
+          if (!meta || this.pending) return this.fail('The console stream sent an invalid frame.');
+          this.pending = meta;
+          this.lastSeq = meta.seq;
           this.setStatus('streaming');
         } else if (m?.type === 'closed') {
           this.setStatus('closed', typeof m.reason === 'string' ? m.reason.slice(0, 200) : undefined);
         } else {
-          this.setStatus('error', 'The console stream sent an unreadable message.');
-          ws.close();
+          this.fail('The console stream sent an unreadable message.');
         }
         return;
       }
       const blob = e.data instanceof Blob ? e.data : null;
-      if (!blob || !this.pending || blob.size > MAX_FRAME_BYTES) return;
+      if (!blob || !this.pending || blob.size > MAX_FRAME_BYTES) return this.fail('The console stream sent an invalid frame.');
       this.frames.emit({ ...this.pending, data: new Blob([blob], { type: this.pending.mime }) });
       this.pending = null;
     });
-    ws.addEventListener('error', () => this.setStatus('error', 'The console connection failed.'));
-    ws.addEventListener('close', () => {
-      if (this.current !== 'error') this.setStatus('closed');
+    ws.addEventListener('error', () => this.fail('The console connection failed.'));
+    ws.addEventListener('close', (e: Event) => {
+      if (this.closedByClient || this.current === 'error' || this.current === 'closed') return;
+      const { reason, message } = closeMessage('console', e as CloseEvent);
+      this.setStatus('closed', message, reason === 'session_ended');
     });
   }
 
@@ -357,21 +443,29 @@ class WsConsoleStream implements ConsoleStream {
     return this.current;
   }
 
-  private setStatus(status: ConsoleStatus, reason?: string): void {
+  private fail(reason: string): void {
+    if (this.current === 'error' || this.current === 'closed') return;
+    this.setStatus('error', reason);
+    this.closedByClient = true;
+    this.ws.close();
+  }
+
+  private setStatus(status: ConsoleStatus, reason?: string, sessionEnded = false): void {
     if (this.current === status) return;
     this.current = status;
-    this.statuses.emit(status, reason);
+    this.statuses.emit(status, reason, sessionEnded);
   }
 
   onFrame(listener: (frame: ConsoleFrame) => void): () => void {
     return this.frames.on(listener);
   }
 
-  onStatus(listener: (status: ConsoleStatus, reason?: string) => void): () => void {
+  onStatus(listener: (status: ConsoleStatus, reason?: string, sessionEnded?: boolean) => void): () => void {
     return this.statuses.on(listener);
   }
 
   close(): void {
+    this.closedByClient = true;
     this.ws.close();
     this.setStatus('closed');
     this.frames.clear();

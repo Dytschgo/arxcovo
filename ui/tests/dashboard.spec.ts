@@ -33,7 +33,7 @@ test('hosts: cards with arch badges and reachability', async ({ page }) => {
   await signIn(page);
   const cards = page.getByRole('list', { name: 'Hosts' }).getByRole('listitem');
   await expect(cards).toHaveCount(4);
-  await expect(cards.filter({ hasText: 'studio' }).getByTitle('Machine architecture: arm64')).toBeVisible();
+  await expect(cards.filter({ hasText: 'harbor' }).getByTitle('Machine architecture: arm64')).toBeVisible();
   await expect(cards.filter({ hasText: 'pebble' })).toContainText('No heartbeat for 2 hours');
   await expect(page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Hosts' })).toHaveAttribute('aria-current', 'page');
   await shot(page, '02-hosts');
@@ -54,11 +54,11 @@ test('VMs: table with arch badges and an architecture filter', async ({ page }) 
   await signIn(page, '#/vms');
   const rows = page.getByRole('table').getByRole('row');
   await expect(rows).toHaveCount(6);
-  await expect(page.getByRole('table').getByTitle('Machine architecture: x86_64')).toHaveCount(3);
+  await expect(page.getByRole('table').getByTitle('Machine architecture: x86_64')).toHaveCount(4);
   await shot(page, '04-vms');
   await page.getByLabel('Architecture').selectOption('arm64');
-  await expect(rows).toHaveCount(3);
-  await expect(page.getByText('2 of 5 VMs')).toBeVisible();
+  await expect(rows).toHaveCount(2);
+  await expect(page.getByText('1 of 5 VMs')).toBeVisible();
 });
 
 test('VM detail: snapshots, expiry and greyed-out incompatible hosts', async ({ page }) => {

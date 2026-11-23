@@ -21,7 +21,8 @@ smoke test asserts that no fixture data reaches `ui/dist`.
 - Identifiers match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. The client refuses
   anything else before sending, and the server must too.
 - Every list is bounded (see each endpoint). The client rejects oversized
-  responses (2 MiB JSON body, per-field limits in `decode.ts`).
+  responses: it counts body bytes as they stream in and aborts above 2 MiB,
+  with or without `Content-Length`; per-field limits are in `decode.ts`.
 - Errors use the HTTP status plus `{"error":{"code":"...","message":"..."}}`.
   `message` is short (≤ 200 chars), human readable and contains no secrets,
   paths or stack traces; the UI may show it.
@@ -79,8 +80,14 @@ must still check `Origin`.
 
 ### `DELETE /api/v1/session`
 
-Requires `X-Arx-CSRF`. Revokes the session server-side and clears the cookie.
-`204`.
+Requires `X-Arx-CSRF`. Revokes the session server-side, clears the cookie,
+and closes every open stream of that session (see "Stream lifetime"). `204`
+only after the revocation is durable; `401` if the session was already gone.
+
+The client reports "signed out" only after `204` or `401`. On any other
+answer or a network failure it keeps the session and its CSRF token, tells the
+owner that sign-out failed and that the session may still be active, and
+offers a retry that sends `DELETE` again.
 
 ## Hosts
 
@@ -170,13 +177,44 @@ Both use a short-lived ticket so no credential appears in a URL:
 
 1. `POST` the stream endpoint with `X-Arx-CSRF`. Response
    `{"streamPath":"/api/v1/streams/<id>","ticket":"<16..256 chars>"}`.
-   The ticket is single use, bound to the session, valid for 30 s.
+   The stream id and the ticket are independent CSPRNG values of at least
+   128 bits. The server stores only a hash of the ticket, bound to the
+   session, the stream id, the action (`terminal` or `console`) and the
+   target (host or VM id). It is valid for 30 s.
 2. Open `wss://<same origin><streamPath>`. The server checks the session
    cookie and `Origin` on upgrade.
-3. The first client message is `{"type":"auth","ticket":"..."}`. Anything
-   else, a reused or expired ticket, or no auth within 5 s closes the socket.
+3. The first client message is `{"type":"auth","ticket":"..."}`. Redemption
+   is atomic (compare-and-delete): the ticket must match this stream id,
+   action, target and the cookie's live session. Anything else, a reused or
+   expired ticket, or no auth within 5 s closes the socket with 4401.
 
 The client rejects a `streamPath` outside `/api/v1/streams/`.
+
+### Stream lifetime
+
+Authorization is not only checked at the upgrade. The server must:
+
+- Close every stream of a session when that session is signed out, expires
+  (idle or absolute) or is revoked, with WebSocket close code **4401**
+  ("session ended"). Implement this with a per-session generation counter
+  (or revocation flag) checked by the stream task: the stream records the
+  generation at redemption and stops as soon as it changes, and a session
+  registry wakes open streams on sign-out so the close is immediate rather
+  than waiting for the next message.
+- Re-validate the session (live, unexpired, same generation) before every
+  terminal `run` and before sending every console frame. A failed check
+  closes the socket with 4401 and runs nothing.
+- Close with **4403** when the target stops being allowed (for example the
+  host is removed or the VM is deleted), and **1001** on shutdown. Close
+  reasons are short (≤ 123 bytes) and contain no secrets.
+- Bound cleanup: on any close, cancel the running terminal command through
+  the executor's normal cancellation (same path as `{"type":"cancel"}`),
+  record its activity entry as `interrupted`, and release the stream within
+  the executor's kill timeout. A console stream stops capturing at once.
+
+The client treats any close it did not start as server-initiated: it shows
+the reason in the terminal or console view and offers Reconnect; on 4401 it
+also ends the local session and returns to the login form.
 
 ### Terminal: `POST /api/v1/hosts/{id}/terminal`
 
@@ -202,7 +240,9 @@ Server → client:
   `exitCode` may be `null` (refused, killed).
 - `{"type":"error","code":"...","message":"..."}`
 
-Any malformed server message makes the client close the session.
+Any malformed server message makes the client close the session. Before
+each `run` the server re-validates the session as described under "Stream
+lifetime".
 
 ### Console: `POST /api/v1/vms/{id}/console`
 
@@ -212,10 +252,15 @@ replace it later without changing the ticket flow.
 
 Server → client, repeating pairs:
 
-1. Text `{"type":"frame","seq":7,"width":1024,"height":768,"mime":"image/png","capturedAt":"..."}`
-   (`mime` is `image/png` or `image/jpeg`; the client refuses others,
-   including SVG).
+1. Text `{"type":"frame","seq":7,"width":1024,"height":768,"mime":"image/png","capturedAt":"..."}`.
+   `seq` is a safe integer that strictly increases per stream; `width` and
+   `height` are 1–8192; `mime` is `image/png` or `image/jpeg` (the client
+   refuses others, including SVG); `capturedAt` is an RFC 3339 instant.
 2. One binary message with the image bytes (≤ 8 MiB).
+
+The client treats any invalid metadata, binary data without metadata, or
+metadata twice in a row as a protocol error: it shows an error state, emits
+no frame and closes the stream.
 
 `{"type":"closed","reason":"..."}` ends the stream (for example the VM
 stopped). Suggested rate: 1–2 frames per second while the socket is open.
@@ -236,6 +281,10 @@ arxd's `connect-src` may be `'self'` only: modern browsers match same-origin
 ## Desktop
 
 The Electron shell serves `ui/dist` from `app://arxcovo` and answers
-`/api/*` with 503 `unavailable` until host connection is designed (proposal:
-a host picker that loads the chosen host's served dashboard, with navigation
-locked to that host's origin).
+`/api/*` with 503 `unavailable`, for every method including the sign-in
+`POST`, until host connection is designed (proposal: a host picker that loads
+the chosen host's served dashboard, with navigation locked to that host's
+origin). Asset reads require `ui/dist` itself to be a plain directory (not a
+symlink or junction), refuse links in every component below it, confine the
+real path under the validated root, and read through a handle whose file
+identity matches the validated file.

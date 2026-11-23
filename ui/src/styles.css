@@ -490,3 +490,16 @@ main:focus-visible { outline-offset: -4px; }
 @media (forced-colors: active) {
   .pill, .arch { border: 1px solid; }
 }
+
+.banner-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem 1rem;
+  margin-block-end: 1rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid color-mix(in oklch, var(--bad) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in oklch, var(--bad) 9%, var(--surface));
+}

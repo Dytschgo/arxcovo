@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import { FIXTURE_HOSTS, FIXTURE_VMS } from './fixtures';
-import { activitySearch, CSRF_HEADER, decodeTerminalMessage, HttpApi } from './http';
+import { activitySearch, CSRF_HEADER, decodeFrameMeta, decodeTerminalMessage, HttpApi, readBounded } from './http';
 import type { ConsoleFrame, TerminalEvent } from './types';
 
 const SESSION = { user: { name: 'owner' }, csrfToken: 'csrf-token-0123456789', expiresAt: '2026-11-23T20:00:00Z' };
@@ -105,13 +105,13 @@ describe('data endpoints', () => {
       'GET /api/v1/hosts': () => json(200, { hosts: FIXTURE_HOSTS }),
       'GET /api/v1/hosts/atlas': () => json(200, FIXTURE_HOSTS[0]),
       'GET /api/v1/vms': () => json(200, { vms: FIXTURE_VMS }),
-      'GET /api/v1/vms/macos-dev': () => json(200, FIXTURE_VMS[2]),
+      'GET /api/v1/vms/ubuntu-arm-03': () => json(200, FIXTURE_VMS[3]),
     });
     const api = new HttpApi({ fetch: fetchImpl });
     expect(await api.listHosts()).toHaveLength(FIXTURE_HOSTS.length);
     expect((await api.getHost('atlas')).arch).toBe('x86_64');
     expect(await api.listVms()).toHaveLength(FIXTURE_VMS.length);
-    expect((await api.getVm('macos-dev')).arch).toBe('arm64');
+    expect((await api.getVm('ubuntu-arm-03')).arch).toBe('arm64');
   });
 
   test('activity query parameters are validated and encoded', () => {
@@ -215,8 +215,8 @@ describe('terminal stream', () => {
 
 describe('console stream', () => {
   test('frame metadata followed by binary image data yields one frame', async () => {
-    const { api } = await streamingApi('/api/v1/vms/macos-dev/console');
-    const stream = await api.openConsole('macos-dev');
+    const { api } = await streamingApi('/api/v1/vms/web-static/console');
+    const stream = await api.openConsole('web-static');
     const frames: ConsoleFrame[] = [];
     stream.onFrame(f => frames.push(f));
     const ws = FakeSocket.last!;
@@ -231,9 +231,155 @@ describe('console stream', () => {
   });
 
   test('a server-sent SVG frame is refused', async () => {
-    const { api } = await streamingApi('/api/v1/vms/macos-dev/console');
-    const stream = await api.openConsole('macos-dev');
+    const { api } = await streamingApi('/api/v1/vms/web-static/console');
+    const stream = await api.openConsole('web-static');
     FakeSocket.last!.receive(JSON.stringify({ type: 'frame', seq: 1, width: 1, height: 1, mime: 'image/svg+xml', capturedAt: '2026-11-23T12:00:07Z' }));
+    expect(stream.status).toBe('error');
+  });
+});
+
+function serverClose(ws: FakeSocket, code: number, reason = '') {
+  ws.dispatchEvent(Object.assign(new Event('close'), { code, reason }));
+}
+
+describe('sign-out confirmation', () => {
+  test('a failed DELETE rejects, keeps the CSRF token, and a retry sends DELETE again', async () => {
+    let attempts = 0;
+    const { fetchImpl, calls } = fakeFetch({
+      'POST /api/v1/session': () => json(200, SESSION),
+      'DELETE /api/v1/session': () => (++attempts === 1 ? json(503, { error: { code: 'unavailable', message: 'arxd is restarting' } }) : new Response(null, { status: 204 })),
+    });
+    const api = new HttpApi({ fetch: fetchImpl });
+    await api.login({ username: 'owner', password: 'pw' });
+    await expect(api.logout()).rejects.toMatchObject({ code: 'unavailable', message: 'arxd is restarting' });
+    await api.logout();
+    const deletes = calls.filter(c => c.init.method === 'DELETE');
+    expect(deletes).toHaveLength(2);
+    expect(deletes.every(c => header(c.init, CSRF_HEADER) === SESSION.csrfToken)).toBe(true);
+    await api.logout();
+    expect(calls.filter(c => c.init.method === 'DELETE')).toHaveLength(2);
+  });
+
+  test('a DELETE answered 401 counts as signed out: the session was already gone', async () => {
+    const { fetchImpl } = fakeFetch({
+      'POST /api/v1/session': () => json(200, SESSION),
+      'DELETE /api/v1/session': () => json(401, {}),
+    });
+    const api = new HttpApi({ fetch: fetchImpl });
+    await api.login({ username: 'owner', password: 'pw' });
+    await expect(api.logout()).resolves.toBeUndefined();
+  });
+});
+
+describe('bounded response bodies', () => {
+  test('a body without Content-Length is cut off once it exceeds 2 MiB', async () => {
+    let pulled = 0;
+    let cancelled = false;
+    const chunk = new Uint8Array(256 * 1024).fill(0x20);
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1;
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const { fetchImpl } = fakeFetch({ 'GET /api/v1/hosts': () => new Response(body, { status: 200 }) });
+    await expect(new HttpApi({ fetch: fetchImpl }).listHosts()).rejects.toMatchObject({ code: 'bad_response' });
+    expect(cancelled).toBe(true);
+    expect(pulled).toBeLessThanOrEqual(10);
+  });
+
+  test('a declared oversized Content-Length is refused before reading, and bytes, not characters, count', async () => {
+    const big = fakeFetch({ 'GET /api/v1/hosts': () => new Response('{}', { status: 200, headers: { 'Content-Length': String(3 * 1024 * 1024) } }) });
+    await expect(new HttpApi({ fetch: big.fetchImpl }).listHosts()).rejects.toMatchObject({ code: 'bad_response' });
+    expect(await readBounded(new Response('é'.repeat(10)), 20)).toBe('é'.repeat(10));
+    await expect(readBounded(new Response('é'.repeat(11)), 20)).rejects.toMatchObject({ code: 'bad_response' });
+  });
+
+  test('an oversized error body still yields the status-based error', async () => {
+    const { fetchImpl } = fakeFetch({ 'GET /api/v1/hosts': () => new Response('x', { status: 503, headers: { 'Content-Length': String(9 * 1024 * 1024) } }) });
+    await expect(new HttpApi({ fetch: fetchImpl }).listHosts()).rejects.toMatchObject({ code: 'unavailable', status: 503 });
+  });
+});
+
+describe('server-initiated stream close', () => {
+  test('the terminal reports a session-ended close (4401) and a plain server close with its reason', async () => {
+    const { api } = await streamingApi('/api/v1/hosts/atlas/terminal');
+    const session = await api.openTerminal('atlas');
+    const events: TerminalEvent[] = [];
+    session.onEvent(e => events.push(e));
+    const ws = FakeSocket.last!;
+    ws.receive(JSON.stringify({ type: 'ready' }));
+    serverClose(ws, 4401);
+    expect(events.find(e => e.type === 'closed')).toEqual({ type: 'closed', reason: 'session_ended', message: 'Your session ended, so the server closed the terminal.' });
+    expect(session.status).toBe('closed');
+
+    const second = await api.openTerminal('atlas');
+    const more: TerminalEvent[] = [];
+    second.onEvent(e => more.push(e));
+    serverClose(FakeSocket.last!, 1001, 'arxd is shutting down');
+    expect(more.find(e => e.type === 'closed')).toEqual({ type: 'closed', reason: 'server', message: 'The server closed the terminal: arxd is shutting down' });
+  });
+
+  test('closing from the client side does not report a server close', async () => {
+    const { api } = await streamingApi('/api/v1/hosts/atlas/terminal');
+    const session = await api.openTerminal('atlas');
+    const events: TerminalEvent[] = [];
+    session.onEvent(e => events.push(e));
+    session.close();
+    expect(events.some(e => e.type === 'closed')).toBe(false);
+  });
+
+  test('the console marks a 4401 close as session-ended', async () => {
+    const { api } = await streamingApi('/api/v1/vms/web-static/console');
+    const stream = await api.openConsole('web-static');
+    const statuses: [string, string | undefined, boolean | undefined][] = [];
+    stream.onStatus((s, r, ended) => statuses.push([s, r, ended]));
+    serverClose(FakeSocket.last!, 4401);
+    expect(statuses).toEqual([['closed', 'Your session ended, so the server closed the console.', true]]);
+  });
+});
+
+describe('console frame validation', () => {
+  const frame = (over: Record<string, unknown>) => JSON.stringify({ type: 'frame', seq: 1, width: 640, height: 400, mime: 'image/png', capturedAt: '2026-11-23T12:00:01Z', ...over });
+
+  test.each([
+    ['a malformed timestamp', { capturedAt: 'not a date' }],
+    ['an impossible date', { capturedAt: '2026-13-45T99:00:00Z' }],
+    ['a zero width', { width: 0 }],
+    ['a huge height', { height: 100_000 }],
+    ['a fractional sequence', { seq: 1.5 }],
+  ])('%s puts the stream in an error state without emitting a frame', async (_name, over) => {
+    const { api } = await streamingApi('/api/v1/vms/web-static/console');
+    const stream = await api.openConsole('web-static');
+    const frames: ConsoleFrame[] = [];
+    stream.onFrame(f => frames.push(f));
+    FakeSocket.last!.receive(frame(over));
+    FakeSocket.last!.receive(new Blob([new Uint8Array([1])]));
+    expect(stream.status).toBe('error');
+    expect(frames).toHaveLength(0);
+  });
+
+  test('sequence numbers must strictly increase', async () => {
+    const { api } = await streamingApi('/api/v1/vms/web-static/console');
+    const stream = await api.openConsole('web-static');
+    const frames: ConsoleFrame[] = [];
+    stream.onFrame(f => frames.push(f));
+    const ws = FakeSocket.last!;
+    ws.receive(frame({ seq: 5 }));
+    ws.receive(new Blob([new Uint8Array([1])]));
+    ws.receive(frame({ seq: 5 }));
+    expect(frames.map(f => f.seq)).toEqual([5]);
+    expect(stream.status).toBe('error');
+    expect(decodeFrameMeta({ seq: 6, width: 1, height: 1, mime: 'image/jpeg', capturedAt: '2026-11-23T12:00:01.5+01:00' }, 5)).not.toBeNull();
+  });
+
+  test('image data without preceding metadata is a protocol error', async () => {
+    const { api } = await streamingApi('/api/v1/vms/web-static/console');
+    const stream = await api.openConsole('web-static');
+    FakeSocket.last!.receive(new Blob([new Uint8Array([1])]));
     expect(stream.status).toBe('error');
   });
 });

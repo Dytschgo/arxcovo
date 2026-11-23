@@ -5,15 +5,14 @@ import { parseCommandLine } from './command';
 import { chooseAdapter } from './select';
 
 describe('adapter selection', () => {
-  test('production builds always use HTTP, even when the stand-in is requested', () => {
-    expect(chooseAdapter({ DEV: false, MODE: 'production' })).toBe('http');
-    expect(chooseAdapter({ DEV: false, MODE: 'production', VITE_ARX_API: 'standin' })).toBe('http');
+  test('built bundles always use HTTP, even when the stand-in is requested', () => {
+    expect(chooseAdapter({ standinAllowed: false })).toBe('http');
+    expect(chooseAdapter({ standinAllowed: false, VITE_ARX_API: 'standin' })).toBe('http');
   });
 
-  test('dev and test builds default to the stand-in and can opt into HTTP', () => {
-    expect(chooseAdapter({ DEV: true, MODE: 'development' })).toBe('standin');
-    expect(chooseAdapter({ DEV: false, MODE: 'test' })).toBe('standin');
-    expect(chooseAdapter({ DEV: true, MODE: 'development', VITE_ARX_API: 'http' })).toBe('http');
+  test('the dev server and tests default to the stand-in and can opt into HTTP', () => {
+    expect(chooseAdapter({ standinAllowed: true })).toBe('standin');
+    expect(chooseAdapter({ standinAllowed: true, VITE_ARX_API: 'http' })).toBe('http');
   });
 });
 
@@ -36,7 +35,7 @@ describe('routing', () => {
   test('every route round-trips through its hash', () => {
     const routes: Route[] = [
       { name: 'login' }, { name: 'hosts' }, { name: 'host', id: 'atlas' }, { name: 'vms' }, { name: 'vm', id: 'win11-ci-01' },
-      { name: 'console', id: 'macos-dev' }, { name: 'activity' }, { name: 'terminal', hostId: null }, { name: 'terminal', hostId: 'studio' },
+      { name: 'console', id: 'web-static' }, { name: 'activity' }, { name: 'terminal', hostId: null }, { name: 'terminal', hostId: 'harbor' },
     ];
     for (const route of routes) expect(parseRoute(href(route))).toEqual(route);
     expect(parseRoute('')).toEqual({ name: 'hosts' });
