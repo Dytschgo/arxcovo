@@ -2,6 +2,7 @@ mod assets;
 mod password;
 mod read;
 mod session;
+mod streams;
 mod transport;
 
 pub use password::set_password;
@@ -27,7 +28,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 use time::format_description::well_known::Rfc3339;
 use zeroize::Zeroizing;
@@ -110,6 +111,7 @@ struct Dashboard {
     sessions: Arc<Sessions>,
     clock: Arc<dyn Clock>,
     capacity: Arc<tokio::sync::Semaphore>,
+    streams: streams::Backends,
     _password_lock: Option<Arc<File>>,
 }
 
@@ -125,6 +127,7 @@ impl Listener {
         config: &DashboardConfig,
         activity: Arc<Activity>,
         state_dir: &std::path::Path,
+        owner_executor: Option<Arc<crate::development::Execution>>,
     ) -> anyhow::Result<Router> {
         let (verifier, lock) = Verifier::load(state_dir)?;
         let vm_catalog = config
@@ -138,9 +141,10 @@ impl Listener {
             activity,
             vm_catalog: vm_catalog.map(Arc::new),
             verifier: Arc::new(verifier),
-            sessions: Arc::new(Sessions::new()),
+            sessions: self.sessions.clone(),
             clock: Arc::new(SystemClock),
             capacity: Arc::new(tokio::sync::Semaphore::new(8)),
+            streams: streams::Backends::new(owner_executor),
             _password_lock: Some(Arc::new(lock)),
         }
         .router())
@@ -152,7 +156,7 @@ struct SystemClock;
 impl Clock for SystemClock {
     fn now(&self) -> ClockReading {
         ClockReading {
-            monotonic: Instant::now(),
+            monotonic: tokio::time::Instant::now().into_std(),
             utc_ms: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .ok()
@@ -291,7 +295,13 @@ async fn dispatch(State(state): State<Dashboard>, request: Request) -> Response 
     if head {
         *response.body_mut() = Body::empty();
     }
+    // Keep B1's one request per connection without having Hyper append
+    // "close" to a WebSocket's Connection: upgrade handshake.
+    let upgrading = response.status() == StatusCode::SWITCHING_PROTOCOLS;
     let headers = response.headers_mut();
+    if !upgrading {
+        headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
         "x-content-type-options",
@@ -331,20 +341,10 @@ async fn route(state: Dashboard, request: Request) -> Result<Response, ApiError>
             Some(one(request.headers(), "x-arx-csrf")),
             false,
         )?;
-        // B2 supplies stream ticket issuance and the WebSocket transport.
-        return if (method == Method::POST
-            && matches!(
-                path.split('/').collect::<Vec<_>>().as_slice(),
-                ["", "api", "v1", "hosts", _, "terminal"] | ["", "api", "v1", "vms", _, "console"]
-            ))
-            || path.starts_with("/api/v1/streams/")
-        {
-            let id = path.split('/').nth(4).ok_or(ApiError::INVALID)?;
-            read::validate_id(id)?;
-            Err(ApiError::UNAVAILABLE)
-        } else {
-            Err(ApiError::NOT_FOUND)
-        };
+        if method == Method::POST {
+            return streams::mint(&state, request, key).await;
+        }
+        return Err(ApiError::NOT_FOUND);
     }
     if logout {
         if request.headers().contains_key(header::TRANSFER_ENCODING)
@@ -368,14 +368,18 @@ async fn route(state: Dashboard, request: Request) -> Result<Response, ApiError>
         return Ok(response);
     }
     if path == "/api" || path.starts_with("/api/") {
+        if let Some(id) = path.strip_prefix("/api/v1/streams/") {
+            if method != Method::GET {
+                return Err(ApiError::NOT_FOUND);
+            }
+            let id = id.to_owned();
+            return streams::upgrade(state.clone(), request, key, id).await;
+        }
         let session = state
             .sessions
             .authenticate(key, state.clock.now(), None, false)?;
         if path == "/api/v1/session" {
             return json_response(session);
-        }
-        if path.starts_with("/api/v1/streams/") {
-            return Err(ApiError::UNAVAILABLE);
         }
         return read::route(&state, request.uri()).await;
     }
@@ -437,4 +441,4 @@ async fn login_request(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -1,4 +1,5 @@
 //! VM admission and confined runtime components. Native issuance is closed.
+pub mod console;
 mod controller;
 pub mod guest;
 mod model;

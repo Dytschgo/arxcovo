@@ -200,6 +200,6 @@ fn empty_v1_deleted_row_sequence_survives_all_upgrades() {
     assert_eq!(
         db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        4
+        5
     );
 }
