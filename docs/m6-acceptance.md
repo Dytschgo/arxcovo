@@ -71,9 +71,21 @@ way while it unwinds. Nothing else under `ARX_LIVE_ROOT` is ever touched. A
 run killed from outside (for example by an interrupted Playwright process)
 can leave its `run-*` directory behind; remove that one by hand.
 
-**Root checks (invariant: a refused root leaves the disk exactly as it
-was).** `prepare_run_with` has a read-only phase and a write phase. Every check
-that can refuse runs in the read-only phase, in this order:
+**Root checks.** The invariant has two parts:
+
+- **(a)** A refusal before the first write touches nothing, timestamps
+  included.
+- **(b)** After a write, every failure removes what the call created, so the
+  directory contents are exactly as they were. Only the modification time
+  (and, on Linux, the status-change time) of a directory that held a created
+  and then removed entry may change: the root's parent, or the root itself.
+  Creating and removing an entry always updates its parent's timestamps, so
+  this is unavoidable. If a removal fails, the launcher reports a distinct
+  "cleanup failed" error that names every path still present, never a
+  refusal.
+
+`prepare_run_with` has a read-only phase and a write phase. Every check that
+can refuse runs in the read-only phase, in this order:
 
 1. the value is set and valid UTF-8;
 2. the raw spelling, judged from the string alone without touching the
@@ -97,25 +109,53 @@ that can refuse runs in the read-only phase, in this order:
 The write phase creates at most two objects, in order: the root (only if it
 was absent, owner-only from the moment it exists: mode 0700, or a
 creation-time owner and protected DACL on Windows) and the run directory.
-Each is verified right after creation. Any failure after the first write,
-including a failed verification, removes what this call created, newest
-first, before the launcher reports the refusal. Every launcher input is read
-before the first write.
+Each is verified right after creation. Every helper on this path returns an
+error instead of panicking, including the Windows token and SID lookups, so
+a failure always reaches the rollback. Any failure after the first write
+removes what this call created, newest first. Each removal result is
+checked: if the run directory or a newly created root still exists
+afterwards, the result is `CleanupFailed` with those paths, and the launcher
+prints them for manual removal. Every launcher input is read before the
+first write.
 
 Non-ignored tests in the same file run in the normal nextest job:
 
 - `every_refused_root_leaves_the_disk_unchanged` is table-driven, with one
-  row per refusal path above. The rows cover: unset, empty and relative
-  values; `..`, trailing `..`, `.`, trailing `.`, trailing-separator and
-  doubled-separator spellings, plus `/`, all-`/`, trailing-dot, trailing-space,
-  `:stream` and `\\?\` spellings on Windows; a missing parent; a missing root
-  below a link (a symlink, or a junction on Windows); a link as the root; a
-  root that is a file; an existing non-private root; a parent writable by
-  others without the sticky bit (Linux); and injected verification failures
-  after creating a new root, after creating the run directory under a new
-  root, and after creating it under an existing root. Each row runs in a
-  fresh base, whose full recursive snapshot of paths, kinds and privacy must
-  be identical before and after. A positive control is accepted.
+  row per refusal path. Each row runs in a fresh base. The test compares a
+  recursive snapshot of the base and every entry below it, taken before and
+  after: kind, length, permissions or attributes, owner-private flag and
+  timestamps.
+  - **Untouched rows** (refused before the first write) must match
+    exactly, timestamps included. They cover:
+    - unset, empty and relative values;
+    - `..`, trailing `..`, `.`, trailing `.`, trailing-separator and
+      doubled-separator spellings, plus `/`, all-`/`, trailing-dot,
+      trailing-space, `:stream` and `\\?\` spellings on Windows;
+    - a missing parent, and a missing root below a link (a symlink, or a
+      junction on Windows);
+    - a link as the root, a root that is a file, and an existing non-private
+      root;
+    - a parent writable by others without the sticky bit (Linux);
+    - an identity lookup failing when the root is created (Windows).
+  - **Restored rows** (refused after a write and rolled back) must match
+    except for the timestamps of the root's parent and the root. They
+    inject:
+    - a new root that fails verification;
+    - a run directory that fails verification under a new root, and under
+      an existing root;
+    - a run-directory close that reports failure after removing the
+      directory;
+    - an identity lookup lost after a new root, or an existing root, is
+      ready (Windows).
+  - **Leftover rows** must return `CleanupFailed` naming exactly the paths
+    that remain, which must exist, with everything else restored. They
+    inject:
+    - a root removal that fails after the new root fails verification, and
+      after the run directory fails verification;
+    - a run-directory close that fails and keeps the directory, under a new
+      root (both paths reported) and under an existing root.
+
+  A positive control is accepted.
 - `run_cleanup_removes_only_its_own_directory` proves that another run's
   directory and a look-alike sibling survive cleanup.
 - `live_fixture_seeds_activity_and_vm_catalog` fails if the seeding drifts
@@ -127,22 +167,42 @@ privileges, so that form is covered on Linux through mode bits; the same
 
 ## What it proves
 
-Session cookies never reach test output (invariant: every failure in the
-replay path surfaces only as a fixed, redacted error carrying at most the
-status). The cookie flags are compared as a projection without the value.
-The replay (`ui/tests/live/replay.ts`) uses Node's HTTP client, not
-Playwright's request API, whose call log records header values. The whole
-operation sits inside one boundary that discards the original error and
-throws a `ReplayError` with one of two fixed messages: "request failed", or
-the HTTP status. That covers option building, a synchronous throw from
-`request()`, connect errors, timeouts, statuses other than 200 or 401,
-aborted or oversized bodies, a 200 that is not a session, and anything thrown
-by the callbacks. `ui/tests/live/replay.spec.ts` injects each of these
-against local loopback servers that echo the cookie into headers and bodies.
-It asserts that the error's message, string form, stack and serialized
-properties contain neither the cookie value, nor the cookie name, nor any
-header text. The spec needs no browser or live backend, and the default
-`npm run smoke` config collects it, so it runs in CI.
+Session cookies never reach test output. The invariant: every failure in
+the replay path surfaces only as a fixed, redacted error carrying at most
+the status.
+
+- The cookie flags are compared as a projection without the value.
+- The replay (`ui/tests/live/replay.ts`) uses Node's HTTP client, not
+  Playwright's request API, whose call log records header values.
+- Option building, construction and listener wiring run inside the Promise
+  executor.
+- Every later callback runs through one guard that turns a throw into a
+  rejection of the same Promise. That covers the response, data, end, error,
+  aborted and timeout callbacks, including a timeout whose `destroy()`
+  throws. Nothing can escape as an uncaught exception.
+- A single try/catch discards the original error and throws a `ReplayError`
+  with one of two fixed messages: "request failed", or the HTTP status.
+- Stopping the exchange after a failure is best effort, and its own errors
+  are dropped.
+
+`ui/tests/live/replay.spec.ts` injects each failure:
+
+- options, construction, connect, timeout, statuses other than 200 or 401,
+  aborted or oversized bodies, and a 200 that is not a session, using
+  loopback servers that echo the cookie into headers and bodies;
+- through a scripted request seam, asynchronous throws from a timeout whose
+  `destroy()` throws, from the response callback, from the data listener
+  with a throwing `destroy()`, and from an oversized body;
+- late events after the result.
+
+Each case traps uncaught exceptions and unhandled rejections and requires
+none. It asserts that the error's own keys are exactly `message`, `name`,
+`stack` and `status`. It also deep-scans every key and value reachable from
+the error, enumerable or not and at any depth, for the cookie value, the
+cookie name and header text. A probe proves the scan catches a marker under
+`details.headers.cookie`, under a hidden symbol, and in a `cause`. The spec
+needs no browser or live backend, and the default `npm run smoke` config
+collects it, so it runs in CI.
 
 The synthetic owner password is typed with `locator.fill`. Playwright can
 include a filled value in an action's step title and in the call log of a

@@ -98,23 +98,31 @@ mod win {
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
 
-    fn token_user() -> Vec<usize> {
+    thread_local! {
+        /// Test fault injection: makes every identity lookup fail.
+        pub(super) static IDENTITY_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The current token's TOKEN_USER buffer, or None when it cannot be read.
+    /// Never panics, so callers on the launcher's write path can roll back.
+    fn token_user() -> Option<Vec<usize>> {
+        if IDENTITY_FAULT.get() {
+            return None;
+        }
         // SAFETY: the token handle is closed once; the buffer is sized by the
         // first query and outlives every use of the SID inside it.
         unsafe {
             let mut handle = ptr::null_mut();
-            assert_ne!(
-                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle),
-                0
-            );
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle) == 0 {
+                return None;
+            }
             let mut len = 0;
             GetTokenInformation(handle, TokenUser, ptr::null_mut(), 0, &mut len);
             let mut buffer = vec![0usize; (len as usize).div_ceil(size_of::<usize>())];
             let ok =
                 GetTokenInformation(handle, TokenUser, buffer.as_mut_ptr().cast(), len, &mut len);
             CloseHandle(handle);
-            assert_ne!(ok, 0);
-            buffer
+            (ok != 0 && len != 0).then_some(buffer)
         }
     }
 
@@ -127,15 +135,18 @@ mod win {
         path.as_os_str().encode_wide().chain(Some(0)).collect()
     }
 
-    /// Owner TokenUser and a protected DACL granting TokenUser full control,
-    /// followed by `extra` SDDL ACEs (tests use it to widen access).
-    fn user_text(sid: PSID) -> String {
-        // SAFETY: the converted string is NUL-terminated and freed once.
+    /// The SID's string form, or None when it cannot be converted.
+    fn user_text(sid: PSID) -> Option<String> {
+        // SAFETY: a successful conversion returns a NUL-terminated string
+        // that is read within its bound and freed once.
         unsafe {
             let mut text = ptr::null_mut();
-            assert_ne!(ConvertSidToStringSidW(sid, &mut text), 0);
-            let len = (0..184).find(|i| *text.add(*i) == 0).unwrap();
-            let sid_text = String::from_utf16(std::slice::from_raw_parts(text, len)).unwrap();
+            if ConvertSidToStringSidW(sid, &mut text) == 0 {
+                return None;
+            }
+            let sid_text = (0..184)
+                .find(|i| *text.add(*i) == 0)
+                .and_then(|len| String::from_utf16(std::slice::from_raw_parts(text, len)).ok());
             LocalFree(text.cast());
             sid_text
         }
@@ -145,8 +156,9 @@ mod win {
     /// are part of its creation, so it never exists with inherited access.
     pub(super) fn create_private(path: &Path) -> std::io::Result<()> {
         use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-        let user = token_user();
-        let sid_text = user_text(user_sid(&user));
+        let identity = || std::io::Error::other("identity unavailable");
+        let user = token_user().ok_or_else(identity)?;
+        let sid_text = user_text(user_sid(&user)).ok_or_else(identity)?;
         let sddl: Vec<u16> = format!("O:{sid_text}D:P(A;OICI;FA;;;{sid_text})")
             .encode_utf16()
             .chain(Some(0))
@@ -179,7 +191,9 @@ mod win {
 
     /// The owner is TokenUser, SYSTEM or Builtin Administrators.
     pub(super) fn trusted_owner(path: &Path) -> bool {
-        let user = token_user();
+        let Some(user) = token_user() else {
+            return false;
+        };
         let me = user_sid(&user);
         let name = wide(path);
         // SAFETY: the descriptor owns the owner pointer and is freed once.
@@ -207,11 +221,17 @@ mod win {
         }
     }
 
-    /// Returns whether both the DACL and the owner were applied.
+    /// Owner TokenUser and a protected DACL granting TokenUser full control,
+    /// followed by `extra` SDDL ACEs (tests use it to widen access). Returns
+    /// whether both the DACL and the owner were applied; never panics.
     pub(super) fn protect(path: &Path, extra: &str) -> bool {
-        let user = token_user();
+        let Some(user) = token_user() else {
+            return false;
+        };
         let sid = user_sid(&user);
-        let sid_text = user_text(sid);
+        let Some(sid_text) = user_text(sid) else {
+            return false;
+        };
         let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid_text}){extra}")
             .encode_utf16()
             .chain(Some(0))
@@ -259,7 +279,9 @@ mod win {
     /// Mirrors arxd's private-state rule: owner is TokenUser and every allow
     /// ACE names TokenUser, SYSTEM or Builtin Administrators.
     pub(super) fn is_private(path: &Path) -> bool {
-        let user = token_user();
+        let Some(user) = token_user() else {
+            return false;
+        };
         let me = user_sid(&user);
         let name = wide(path);
         // SAFETY: the descriptor owns the returned owner and DACL pointers
@@ -379,18 +401,76 @@ fn normalized_spelling(root: &Path) -> bool {
     rebuilt.as_os_str() == raw
 }
 
-/// Post-creation verification. The launcher uses `is_private`; tests inject
-/// failures to exercise the rollback paths.
-type Verify<'a> = &'a dyn Fn(&Path) -> bool;
-
-fn refused<T>(reason: &str) -> Result<T, String> {
-    Err(format!("ARX_LIVE_ROOT refused: {reason}"))
+/// Why `prepare_run` did not return a run directory.
+#[derive(Debug)]
+enum PrepareError {
+    /// The root was refused. The directory contents are exactly as they
+    /// were; when refused before the first write, nothing was touched at all.
+    Refused(String),
+    /// A step after the first write failed and cleanup could not remove
+    /// everything this call created. These paths still exist.
+    CleanupFailed {
+        reason: String,
+        leftovers: Vec<PathBuf>,
+    },
 }
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(reason) => write!(f, "ARX_LIVE_ROOT refused: {reason}"),
+            Self::CleanupFailed { reason, leftovers } => write!(
+                f,
+                "ARX_LIVE_ROOT cleanup failed after: {reason}; remove by hand: {}",
+                leftovers
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+/// Seams on the write phase. The launcher uses `LIVE`; tests inject failures
+/// to drive every rollback and cleanup-failure path.
+#[derive(Clone, Copy)]
+struct Hooks {
+    /// Verification of each created object.
+    verify: fn(&Path) -> bool,
+    /// Runs just before the root is created.
+    before_create_root: fn(),
+    /// Runs once the root exists and has verified (or already existed).
+    after_root_ready: fn(),
+    /// Runs just before a root created by this call is removed.
+    before_remove_root: fn(&Path),
+    /// Removes the run directory.
+    close_run: fn(tempfile::TempDir) -> std::io::Result<()>,
+}
+
+fn noop() {}
+fn noop_path(_: &Path) {}
+
+const LIVE: Hooks = Hooks {
+    verify: is_private,
+    before_create_root: noop,
+    after_root_ready: noop,
+    before_remove_root: noop_path,
+    close_run: tempfile::TempDir::close,
+};
 
 /// Allocate this run's own directory, a fresh randomly named child of an
 /// owner-private root, from the raw `ARX_LIVE_ROOT` value.
 ///
-/// Invariant: a refused root leaves the filesystem exactly as it was.
+/// Invariant:
+/// (a) a refusal before the first write touches nothing, parent timestamps
+///     included;
+/// (b) after a write, every failure removes what this call created, newest
+///     first, so the directory contents are exactly as they were (only the
+///     timestamps of the directories that held a created-then-removed entry
+///     may change). If a removal fails, the result is `CleanupFailed` naming
+///     every path that remains, never a refusal.
+///
 /// 1. **Read-only phase.** Every check that can refuse runs before the first
 ///    write: unset, non-UTF-8 or relative value; non-normalized spelling
 ///    (string only, no filesystem access); parent chain missing or crossing a
@@ -399,73 +479,107 @@ fn refused<T>(reason: &str) -> Result<T, String> {
 ///    not owner-private.
 /// 2. **Write phase.** At most two objects are created, in order: the root
 ///    (only if it was absent, owner-only at creation) and the run directory.
-///    Every failure after the first write, including a failed verification,
-///    removes what this call created, newest first, before returning.
-fn prepare_run(raw: Option<&std::ffi::OsStr>) -> Result<tempfile::TempDir, String> {
-    prepare_run_with(raw, &is_private)
+///    Every helper on this path returns errors instead of panicking.
+fn prepare_run(raw: Option<&std::ffi::OsStr>) -> Result<tempfile::TempDir, PrepareError> {
+    prepare_run_with(raw, &LIVE)
 }
 
 fn prepare_run_with(
     raw: Option<&std::ffi::OsStr>,
-    verify: Verify,
-) -> Result<tempfile::TempDir, String> {
+    hooks: &Hooks,
+) -> Result<tempfile::TempDir, PrepareError> {
+    let refused = |reason: &str| PrepareError::Refused(reason.to_owned());
     // ---- read-only phase -------------------------------------------------
     let Some(raw) = raw else {
-        return refused("it is not set");
+        return Err(refused("it is not set"));
     };
     let root = Path::new(raw);
     if !root.is_absolute() || root.file_name().is_none() || !normalized_spelling(root) {
-        return refused("an absolute, normalized directory path is required");
+        return Err(refused(
+            "an absolute, normalized directory path is required",
+        ));
     }
-    let parent = root.parent().expect("absolute path with a file name");
+    let Some(parent) = root.parent() else {
+        return Err(refused(
+            "an absolute, normalized directory path is required",
+        ));
+    };
     if arxd::config::checked_path(parent).is_err() {
-        return refused("the parent path is missing, aliased or crosses a link or reparse point");
+        return Err(refused(
+            "the parent path is missing, aliased or crosses a link or reparse point",
+        ));
     }
     if !trusted_parent(parent) {
-        return refused("the parent directory is controlled by another account");
+        return Err(refused(
+            "the parent directory is controlled by another account",
+        ));
     }
     let existed = match std::fs::symlink_metadata(root) {
         Ok(_) if arxd::config::checked_path(root).is_ok() && is_private(root) => true,
-        Ok(_) => return refused("it must be a plain owner-private directory"),
+        Ok(_) => return Err(refused("it must be a plain owner-private directory")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => return refused("cannot inspect the path"),
+        Err(_) => return Err(refused("cannot inspect the path")),
     };
-    // ---- write phase: roll back everything this call creates ---------------
-    let rollback = |reason: &str| {
+    // ---- write phase -------------------------------------------------------
+    let exists = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+    // Remove what this call created (newest first) and report exactly what
+    // could not be removed.
+    let undo = |reason: &str, run: Option<PathBuf>| {
+        let mut leftovers: Vec<PathBuf> = run.into_iter().filter(|path| exists(path)).collect();
         if !existed {
-            let _ = std::fs::remove_dir(root);
+            (hooks.before_remove_root)(root);
+            if std::fs::remove_dir(root).is_err() && exists(root) {
+                leftovers.push(root.to_owned());
+            }
         }
-        refused(reason)
+        if leftovers.is_empty() {
+            refused(reason)
+        } else {
+            PrepareError::CleanupFailed {
+                reason: reason.to_owned(),
+                leftovers,
+            }
+        }
     };
     if !existed {
+        (hooks.before_create_root)();
         if create_private_dir(root).is_err() {
-            // Nothing was created.
-            return refused("cannot create the directory");
+            // The creation failed, so nothing was written.
+            return Err(refused("cannot create the directory"));
         }
-        if arxd::config::checked_path(root).is_err() || !verify(root) {
-            return rollback("the new directory did not verify as owner-private");
+        if arxd::config::checked_path(root).is_err() || !(hooks.verify)(root) {
+            return Err(undo(
+                "the new directory did not verify as owner-private",
+                None,
+            ));
         }
     }
-    let Ok(dir) = tempfile::Builder::new()
+    (hooks.after_root_ready)();
+    let dir = match tempfile::Builder::new()
         .prefix(RUN_PREFIX)
         .rand_bytes(16)
         .tempdir_in(root)
-    else {
-        return rollback("cannot create the run directory");
+    {
+        Ok(dir) => dir,
+        Err(_) => return Err(undo("cannot create the run directory", None)),
     };
     // The root's inheritable owner-only DACL (or tempfile's 0700) already
     // applies; re-apply (owner included) and verify before any use.
-    if !try_protect(dir.path()) || !verify(dir.path()) {
-        if dir.close().is_err() {
-            return refused("the run directory did not verify and could not be removed");
-        }
-        return rollback("the run directory did not verify as owner-private");
+    if !try_protect(dir.path()) || !(hooks.verify)(dir.path()) {
+        let run = dir.path().to_owned();
+        // A failed close may or may not have removed the entry; `undo`
+        // reports it if it still exists.
+        let _ = (hooks.close_run)(dir);
+        return Err(undo(
+            "the run directory did not verify as owner-private",
+            Some(run),
+        ));
     }
     Ok(dir)
 }
 
 /// Test convenience for an already-built path.
-fn run_dir(root: &Path) -> Result<tempfile::TempDir, String> {
+fn run_dir(root: &Path) -> Result<tempfile::TempDir, PrepareError> {
     prepare_run(Some(root.as_os_str()))
 }
 
@@ -612,43 +726,121 @@ fn link_dir(target: &Path, link: &Path) {
     );
 }
 
-/// Every entry below `base`, recursively and without following links: the
-/// relative path, its kind and whether it is owner-private. Comparing two
-/// snapshots detects any creation, removal, retyping or permission change.
-fn snapshot(base: &Path) -> Vec<(PathBuf, char, bool)> {
-    fn walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, char, bool)>) {
+/// One entry of a snapshot: its relative path (with `/`), the metadata that
+/// must never change, and its timestamps.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Entry {
+    path: String,
+    stable: String,
+    times: String,
+}
+
+/// `base` itself (as ".") and every entry below it, recursively and without
+/// following links. `stable` holds the kind, length, permissions or
+/// attributes and the owner-private flag; `times` holds the modification time
+/// (and the status-change time on Linux).
+fn snapshot(base: &Path) -> Vec<Entry> {
+    fn describe(base: &Path, path: &Path) -> Entry {
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        let kind = if meta.file_type().is_symlink() {
+            'l'
+        } else if meta.is_dir() {
+            'd'
+        } else {
+            'f'
+        };
+        #[cfg(unix)]
+        let (bits, times) = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                format!("mode={:o} uid={}", meta.mode(), meta.uid()),
+                format!(
+                    "mtime={}.{} ctime={}.{}",
+                    meta.mtime(),
+                    meta.mtime_nsec(),
+                    meta.ctime(),
+                    meta.ctime_nsec()
+                ),
+            )
+        };
+        #[cfg(windows)]
+        let (bits, times) = {
+            use std::os::windows::fs::MetadataExt;
+            (
+                format!("attributes={:x}", meta.file_attributes()),
+                format!("mtime={}", meta.last_write_time()),
+            )
+        };
+        let relative = path.strip_prefix(base).unwrap().to_string_lossy();
+        Entry {
+            path: if relative.is_empty() {
+                ".".to_owned()
+            } else {
+                relative.replace('\\', "/")
+            },
+            stable: format!(
+                "{kind} len={} {bits} private={}",
+                if kind == 'f' { meta.len() } else { 0 },
+                kind == 'd' && is_private(path)
+            ),
+            times,
+        }
+    }
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<Entry>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
-            let meta = std::fs::symlink_metadata(&path).unwrap();
-            let kind = if meta.file_type().is_symlink() {
-                'l'
-            } else if meta.is_dir() {
-                'd'
-            } else {
-                'f'
-            };
-            let relative = path.strip_prefix(base).unwrap().to_owned();
-            out.push((relative, kind, kind == 'd' && is_private(&path)));
-            if kind == 'd' {
+            let described = describe(base, &path);
+            let descend = described.stable.starts_with('d');
+            out.push(described);
+            if descend {
                 walk(base, &path, out);
             }
         }
     }
-    let mut out = Vec::new();
+    let mut out = vec![describe(base, base)];
     walk(base, base, &mut out);
     out.sort();
     out
 }
 
+/// Clear the timestamps of the directories that may hold a created and
+/// then removed entry: the root's parent (".") and the root.
+fn without_parent_times(entries: &[Entry]) -> Vec<Entry> {
+    entries
+        .iter()
+        .map(|entry| Entry {
+            times: if entry.path == "." || entry.path == "live-root" {
+                String::new()
+            } else {
+                entry.times.clone()
+            },
+            ..entry.clone()
+        })
+        .collect()
+}
+
+/// What a refused row must leave behind.
+enum Expect {
+    /// Refused before the first write: identical, timestamps included.
+    Untouched,
+    /// Refused after a write and fully rolled back: identical contents; only
+    /// the timestamps of "." and "live-root" may differ.
+    Restored,
+    /// Cleanup failed: `CleanupFailed` names exactly these paths (relative,
+    /// matched by prefix), they exist, and everything else is restored.
+    Leftovers(&'static [&'static str]),
+}
+
 type Setup = Box<dyn Fn(&Path) -> Option<std::ffi::OsString>>;
-type Row = (&'static str, Setup, fn(&Path) -> bool);
+type Row = (&'static str, Setup, Hooks, Expect);
 
 fn row(
     name: &'static str,
     setup: impl Fn(&Path) -> Option<std::ffi::OsString> + 'static,
-    verify: fn(&Path) -> bool,
+    hooks: Hooks,
+    expect: Expect,
 ) -> Row {
-    (name, Box::new(setup), verify)
+    (name, Box::new(setup), hooks, expect)
 }
 
 /// `base` followed by the raw, unnormalized text `tail`.
@@ -661,7 +853,7 @@ fn named(path: &Path, name: &str) -> bool {
         .is_some_and(|file| file.to_string_lossy().starts_with(name))
 }
 
-/// Injected verifiers: fail for the new root, or for the run directory.
+// Injected faults for the write phase.
 fn fail_root(path: &Path) -> bool {
     !named(path, "live-root") && is_private(path)
 }
@@ -670,55 +862,95 @@ fn fail_run(path: &Path) -> bool {
     !named(path, RUN_PREFIX) && is_private(path)
 }
 
-/// Invariant A: for every refused `ARX_LIVE_ROOT`, the disk is unchanged.
-/// The rows follow `prepare_run_with` in order: every read-only refusal, then
-/// each write-phase failure after a creation, which must roll back what it
-/// created. Each row runs in a fresh private base whose full recursive
-/// snapshot (paths, kinds, privacy) must be identical before and after.
+/// A real removal failure: the root is no longer empty.
+fn block_removal(root: &Path) {
+    std::fs::write(root.join("blocker"), b"blocker").unwrap();
+}
+
+/// A close that fails and leaves the run directory in place.
+fn close_and_keep(dir: tempfile::TempDir) -> std::io::Result<()> {
+    let _ = dir.keep();
+    Err(std::io::Error::other("injected close failure"))
+}
+
+/// A close that reports failure although the directory was removed.
+fn close_then_fail(dir: tempfile::TempDir) -> std::io::Result<()> {
+    dir.close()?;
+    Err(std::io::Error::other("injected close failure"))
+}
+
+#[cfg(windows)]
+fn lose_identity() {
+    win::IDENTITY_FAULT.set(true);
+}
+
+/// Invariant A: for every refused `ARX_LIVE_ROOT`, (a) a refusal before the
+/// first write touches nothing, parent timestamps included, and (b) after a
+/// write every failure restores the directory contents exactly, or reports
+/// `CleanupFailed` naming precisely what remains. The rows follow
+/// `prepare_run_with` in order. Each runs in a fresh private base whose full
+/// recursive snapshot is compared before and after.
 #[test]
 fn every_refused_root_leaves_the_disk_unchanged() {
-    let ok: fn(&Path) -> bool = is_private;
+    use Expect::*;
     let s = std::path::MAIN_SEPARATOR;
+    let root = move |b: &Path| at(b, &format!("{s}live-root"));
+    let existing_root = move |b: &Path| {
+        private_dir(&b.join("live-root"));
+        at(b, &format!("{s}live-root"))
+    };
     let mut rows = vec![
-        // Value checks: no filesystem access at all.
-        row("unset", |_| None, ok),
-        row("empty", |_| Some("".into()), ok),
-        row("relative", |_| Some("relative-root".into()), ok),
+        // (a) Read-only refusals. Value checks: no filesystem access at all.
+        row("unset", |_| None, LIVE, Untouched),
+        row("empty", |_| Some("".into()), LIVE, Untouched),
+        row(
+            "relative",
+            |_| Some("relative-root".into()),
+            LIVE,
+            Untouched,
+        ),
         row(
             "parent segment",
             move |b| at(b, &format!("{s}sub{s}..{s}live-root")),
-            ok,
+            LIVE,
+            Untouched,
         ),
         row(
             "trailing parent segment",
             move |b| at(b, &format!("{s}sub{s}..")),
-            ok,
+            LIVE,
+            Untouched,
         ),
         row(
             "dot segment",
             move |b| at(b, &format!("{s}.{s}live-root")),
-            ok,
+            LIVE,
+            Untouched,
         ),
         row(
             "trailing dot segment",
             move |b| at(b, &format!("{s}live-root{s}.")),
-            ok,
+            LIVE,
+            Untouched,
         ),
         row(
             "trailing separator",
             move |b| at(b, &format!("{s}live-root{s}")),
-            ok,
+            LIVE,
+            Untouched,
         ),
         row(
             "doubled separator",
             move |b| at(b, &format!("{s}{s}live-root")),
-            ok,
+            LIVE,
+            Untouched,
         ),
         // Parent chain and parent owner.
         row(
             "missing parent",
             move |b| at(b, &format!("{s}absent{s}live-root")),
-            ok,
+            LIVE,
+            Untouched,
         ),
         row(
             "missing root below a link",
@@ -726,7 +958,8 @@ fn every_refused_root_leaves_the_disk_unchanged() {
                 link_dir(&b.join("sub"), &b.join("link"));
                 at(b, &format!("{s}link{s}live-root"))
             },
-            ok,
+            LIVE,
+            Untouched,
         ),
         // Existing root.
         row(
@@ -735,7 +968,8 @@ fn every_refused_root_leaves_the_disk_unchanged() {
                 link_dir(&b.join("sub"), &b.join("link"));
                 at(b, &format!("{s}link"))
             },
-            ok,
+            LIVE,
+            Untouched,
         ),
         row(
             "root is a file",
@@ -743,7 +977,8 @@ fn every_refused_root_leaves_the_disk_unchanged() {
                 std::fs::write(b.join("live-root"), b"file").unwrap();
                 at(b, &format!("{s}live-root"))
             },
-            ok,
+            LIVE,
+            Untouched,
         ),
         row(
             "existing root that is not private",
@@ -760,26 +995,87 @@ fn every_refused_root_leaves_the_disk_unchanged() {
                 assert!(win::protect(&root, "(A;OICI;FR;;;WD)"));
                 at(b, &format!("{s}live-root"))
             },
-            ok,
+            LIVE,
+            Untouched,
         ),
-        // Write phase: injected verification failures after each creation.
+        // (b) Write phase, fully rolled back.
         row(
             "new root fails verification",
-            move |b| at(b, &format!("{s}live-root")),
-            fail_root,
+            root,
+            Hooks {
+                verify: fail_root,
+                ..LIVE
+            },
+            Restored,
         ),
         row(
             "run directory fails verification under a new root",
-            move |b| at(b, &format!("{s}live-root")),
-            fail_run,
+            root,
+            Hooks {
+                verify: fail_run,
+                ..LIVE
+            },
+            Restored,
         ),
         row(
             "run directory fails verification under an existing root",
-            move |b| {
-                private_dir(&b.join("live-root"));
-                at(b, &format!("{s}live-root"))
+            existing_root,
+            Hooks {
+                verify: fail_run,
+                ..LIVE
             },
-            fail_run,
+            Restored,
+        ),
+        row(
+            "run directory close reports failure after removing it",
+            root,
+            Hooks {
+                verify: fail_run,
+                close_run: close_then_fail,
+                ..LIVE
+            },
+            Restored,
+        ),
+        // (b) Write phase, cleanup failures reported with their leftovers.
+        row(
+            "root removal fails after the new root fails verification",
+            root,
+            Hooks {
+                verify: fail_root,
+                before_remove_root: block_removal,
+                ..LIVE
+            },
+            Leftovers(&["live-root"]),
+        ),
+        row(
+            "root removal fails after the run directory fails verification",
+            root,
+            Hooks {
+                verify: fail_run,
+                before_remove_root: block_removal,
+                ..LIVE
+            },
+            Leftovers(&["live-root"]),
+        ),
+        row(
+            "run directory close fails under a new root",
+            root,
+            Hooks {
+                verify: fail_run,
+                close_run: close_and_keep,
+                ..LIVE
+            },
+            Leftovers(&["live-root/run-", "live-root"]),
+        ),
+        row(
+            "run directory close fails under an existing root",
+            existing_root,
+            Hooks {
+                verify: fail_run,
+                close_run: close_and_keep,
+                ..LIVE
+            },
+            Leftovers(&["live-root/run-"]),
         ),
     ];
     // A parent owned by another account needs privileges to create, so the
@@ -795,11 +1091,14 @@ fn every_refused_root_leaves_the_disk_unchanged() {
             std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
             at(b, &format!("{s}open{s}live-root"))
         },
-        ok,
+        LIVE,
+        Untouched,
     ));
+    // Windows-only spellings, and identity lookups (which Linux does not
+    // need) failing on the write path instead of panicking.
     #[cfg(windows)]
     rows.extend([
-        row("forward slash", |b| at(b, "/live-root"), ok),
+        row("forward slash", |b| at(b, "/live-root"), LIVE, Untouched),
         row(
             "only forward slashes",
             |b| {
@@ -809,27 +1108,118 @@ fn every_refused_root_leaves_the_disk_unchanged() {
                         .into(),
                 )
             },
-            ok,
+            LIVE,
+            Untouched,
         ),
-        row("trailing dot alias", |b| at(b, r"\live-root."), ok),
-        row("trailing space alias", |b| at(b, r"\live-root "), ok),
-        row("alternate data stream", |b| at(b, r"\live-root:stream"), ok),
+        row(
+            "trailing dot alias",
+            |b| at(b, r"\live-root."),
+            LIVE,
+            Untouched,
+        ),
+        row(
+            "trailing space alias",
+            |b| at(b, r"\live-root "),
+            LIVE,
+            Untouched,
+        ),
+        row(
+            "alternate data stream",
+            |b| at(b, r"\live-root:stream"),
+            LIVE,
+            Untouched,
+        ),
         row(
             "verbatim prefix",
             |b| Some(format!(r"\\?\{}\live-root", b.display()).into()),
-            ok,
+            LIVE,
+            Untouched,
+        ),
+        row(
+            "identity unavailable when creating the root",
+            root,
+            Hooks {
+                before_create_root: lose_identity,
+                ..LIVE
+            },
+            Untouched,
+        ),
+        row(
+            "identity lost after a new root is ready",
+            root,
+            Hooks {
+                after_root_ready: lose_identity,
+                ..LIVE
+            },
+            Restored,
+        ),
+        row(
+            "identity lost under an existing root",
+            existing_root,
+            Hooks {
+                after_root_ready: lose_identity,
+                ..LIVE
+            },
+            Restored,
         ),
     ]);
-    for (name, setup, verify) in rows {
+    for (name, setup, hooks, expect) in rows {
         let parent = private_parent();
         let base = base(&parent);
         std::fs::create_dir(base.join("sub")).unwrap();
         let raw = setup(&base);
         let before = snapshot(&base);
-        let result = prepare_run_with(raw.as_deref(), &verify);
-        assert!(result.is_err(), "{name}: accepted");
-        drop(result);
-        assert_eq!(snapshot(&base), before, "{name}: disk changed");
+        let result = prepare_run_with(raw.as_deref(), &hooks);
+        #[cfg(windows)]
+        win::IDENTITY_FAULT.set(false);
+        let after = snapshot(&base);
+        match (expect, result) {
+            (_, Ok(_)) => panic!("{name}: accepted"),
+            (Untouched, Err(PrepareError::Refused(_))) => {
+                assert_eq!(after, before, "{name}: touched before the first write");
+            }
+            (Restored, Err(PrepareError::Refused(_))) => assert_eq!(
+                without_parent_times(&after),
+                without_parent_times(&before),
+                "{name}: contents not restored"
+            ),
+            (Leftovers(expected), Err(PrepareError::CleanupFailed { leftovers, .. })) => {
+                let reported: Vec<String> = leftovers
+                    .iter()
+                    .map(|path| {
+                        assert!(path.exists(), "{name}: reported leftover does not exist");
+                        path.strip_prefix(&base)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    })
+                    .collect();
+                assert_eq!(reported.len(), expected.len(), "{name}: leftovers");
+                for (path, prefix) in reported.iter().zip(expected) {
+                    assert!(
+                        path.starts_with(prefix),
+                        "{name}: leftover {path} vs {prefix}"
+                    );
+                }
+                // Everything outside the reported leftovers is restored.
+                let outside = |entries: &[Entry]| {
+                    without_parent_times(entries)
+                        .into_iter()
+                        .filter(|entry| {
+                            !reported.iter().any(|left| {
+                                entry.path == *left || entry.path.starts_with(&format!("{left}/"))
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    outside(&after),
+                    outside(&before),
+                    "{name}: more than the leftovers"
+                );
+            }
+            (_, Err(error)) => panic!("{name}: unexpected outcome {error}"),
+        }
     }
     // Positive control: the normalized spelling is accepted and created.
     let parent = private_parent();
@@ -853,7 +1243,7 @@ fn live_dashboard_server() {
     );
     let password = zeroize::Zeroizing::new(required("ARX_LIVE_PASSWORD"));
     assert!(dist.join("index.html").is_file(), "build ui/dist first");
-    let run = prepare_run(raw_root.as_deref()).unwrap_or_else(|reason| panic!("{reason}"));
+    let run = prepare_run(raw_root.as_deref()).unwrap_or_else(|error| panic!("{error}"));
     let root = PathBuf::from(raw_root.expect("accepted root"));
     let state = run.path().join("state");
     private_dir(&state);

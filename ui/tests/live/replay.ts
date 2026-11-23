@@ -4,20 +4,26 @@ import http from 'node:http';
 // HTTP, with no cookie jar. Node's client is used instead of Playwright's
 // request API, whose call log records header values.
 //
-// Invariant: every failure, wherever it happens, surfaces only as a
-// ReplayError whose message is one of two fixed strings and carries at most
-// the HTTP status. Failure paths, all inside the single boundary below:
+// Invariant: every failure, wherever and whenever it happens, surfaces only
+// as a ReplayError whose message is one of two fixed strings and carries at
+// most the HTTP status. Failure paths:
 //   1. options: missing or invalid port;
 //   2. construction: `request()` throwing synchronously (for example an
 //      invalid header character);
-//   3. connect: the request emitting `error` (refused, reset);
-//   4. timeout: no response within `timeoutMs`;
-//   5. status: any status other than 200 or 401;
-//   6. body: a response that errors, aborts or exceeds the size limit;
-//   7. parse: a 200 whose body is not JSON or not a session;
-//   8. anything thrown by the callbacks themselves.
-// The original error is always discarded because it may describe the
-// request, including its headers.
+//   3. wiring: the request object throwing while listeners are attached;
+//   4. connect: the request emitting `error` (refused, reset);
+//   5. timeout: no response within `timeoutMs`, including a `destroy()`
+//      that throws;
+//   6. status: any status other than 200 or 401;
+//   7. body: a response that errors, aborts or exceeds the size limit;
+//   8. parse: a 200 whose body is not JSON or not a session;
+//   9. any callback (response, data, end, error, timeout) throwing later,
+//      asynchronously.
+// Paths 1–3 throw inside the Promise executor; every later callback runs
+// through `guard`, which turns a throw into a rejection of the same Promise
+// instead of letting it escape as an uncaught exception. The single
+// try/catch then discards the original error, which may describe the
+// request and its headers.
 
 export const REPLAY_REQUEST_FAILED = 'Session replay failed: request failed.';
 export const replayStatusFailed = (status: number) => `Session replay failed: HTTP ${status}.`;
@@ -50,6 +56,32 @@ export async function replaySessionStatus(options: ReplayOptions): Promise<200 |
   const seen: { status: number | null } = { status: null };
   try {
     return await new Promise<200 | 401>((resolve, reject) => {
+      // A holder rather than `let`s, so `fail` is safe at any moment.
+      const exchange: { req?: http.ClientRequest; res?: http.IncomingMessage } = {};
+      // Settle as failed, then stop the exchange. Stopping is best effort:
+      // its own errors are dropped because the outcome is already decided.
+      const fail = () => {
+        reject(new Error('replay'));
+        try {
+          exchange.res?.destroy();
+        } catch {
+          // dropped: may describe the request
+        }
+        try {
+          exchange.req?.destroy();
+        } catch {
+          // dropped: may describe the request
+        }
+      };
+      // Every callback goes through this, so nothing can throw out of band.
+      const guard = <A extends unknown[]>(callback: (...args: A) => void) => (...args: A): void => {
+        try {
+          callback(...args);
+        } catch {
+          fail();
+        }
+      };
+
       const port = Number(options.port);
       if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('port');
       const send = options.request ?? http.request;
@@ -62,33 +94,31 @@ export async function replaySessionStatus(options: ReplayOptions): Promise<200 |
           timeout: options.timeoutMs ?? 10_000,
           headers: { host: `localhost:${port}`, cookie: `${options.cookieName}=${options.value}` },
         },
-        res => {
-          seen.status = res.statusCode ?? null;
+        guard((response: http.IncomingMessage) => {
+          exchange.res = response;
+          seen.status = response.statusCode ?? null;
           const chunks: Buffer[] = [];
           let size = 0;
-          res.on('data', (chunk: Buffer) => {
+          response.on('data', guard((chunk: Buffer) => {
             size += chunk.length;
-            if (size > BODY_LIMIT) res.destroy(new Error('size'));
+            if (size > BODY_LIMIT) fail();
             else chunks.push(chunk);
-          });
-          res.on('error', () => reject(new Error('body')));
-          res.on('aborted', () => reject(new Error('aborted')));
-          res.on('end', () => {
-            try {
-              if (seen.status === 401) return resolve(401);
-              if (seen.status !== 200) throw new Error('status');
-              const body: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-              const user = (body as { user?: { name?: unknown } } | null)?.user;
-              if (typeof user?.name !== 'string') throw new Error('shape');
-              resolve(200);
-            } catch {
-              reject(new Error('parse'));
-            }
-          });
-        },
+          }));
+          response.on('error', guard(fail));
+          response.on('aborted', guard(fail));
+          response.on('end', guard(() => {
+            if (seen.status === 401) return resolve(401);
+            if (seen.status !== 200) return fail();
+            const body: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            const user = (body as { user?: { name?: unknown } } | null)?.user;
+            if (typeof user?.name !== 'string') return fail();
+            resolve(200);
+          }));
+        }),
       );
-      req.on('timeout', () => req.destroy(new Error('timeout')));
-      req.on('error', () => reject(new Error('request')));
+      exchange.req = req;
+      req.on('timeout', guard(fail));
+      req.on('error', guard(fail));
       req.end();
     });
   } catch {

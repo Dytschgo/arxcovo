@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { randomBytes } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { REPLAY_REQUEST_FAILED, ReplayError, replaySessionStatus, replayStatusFailed, type ReplayOptions } from './replay';
@@ -45,14 +46,112 @@ async function failure(promise: Promise<unknown>): Promise<unknown> {
   throw new Error('the replay unexpectedly succeeded');
 }
 
-/** Asserts with booleans and fixed strings only, so nothing secret prints. */
+/** The only own properties a ReplayError may carry. */
+const ALLOWED_KEYS = ['message', 'name', 'stack', 'status'];
+
+const ownKeys = (value: object) => Reflect.ownKeys(value).map(String).sort();
+
+/**
+ * Every key and primitive value reachable from `value` through own
+ * properties (enumerable or not, string or symbol keys), at any depth, plus
+ * its string form. No key whitelist is applied, so a marker nested under
+ * `details.headers.cookie` is found.
+ */
+function reachableText(value: unknown, seen = new Set<unknown>()): string[] {
+  if (value === null || value === undefined) return [];
+  if (typeof value !== 'object' && typeof value !== 'function') return [String(value)];
+  if (seen.has(value)) return [];
+  seen.add(value);
+  const out: string[] = [];
+  try {
+    out.push(String(value));
+  } catch {
+    out.push('<unprintable>');
+  }
+  for (const key of Reflect.ownKeys(value)) {
+    out.push(String(key));
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor && 'value' in descriptor) {
+      out.push(...reachableText(descriptor.value, seen));
+    } else {
+      // Accessors (V8 may expose `stack` this way) are read, not skipped.
+      try {
+        out.push(...reachableText(Reflect.get(value, key), seen));
+      } catch {
+        out.push('<throwing accessor>');
+      }
+    }
+  }
+  return out;
+}
+
+/** Indexes of the forbidden markers found anywhere in the error. */
+const forbiddenIn = (error: unknown) => {
+  const text = reachableText(error).join('\n');
+  return FORBIDDEN.flatMap((marker, index) => (text.includes(marker) ? [index] : []));
+};
+
+/** Asserts with key names, indexes and fixed strings only, so nothing secret prints. */
 function expectRedacted(error: unknown, status: number | null) {
   expect(error instanceof ReplayError).toBe(true);
   const replay = error as ReplayError;
-  const text = [replay.message, String(replay), replay.stack ?? '', JSON.stringify(replay, Object.getOwnPropertyNames(replay))].join('\n');
-  for (const secret of FORBIDDEN) expect(text.includes(secret), `error text contains a forbidden marker #${FORBIDDEN.indexOf(secret)}`).toBe(false);
+  expect(ownKeys(replay)).toEqual(ALLOWED_KEYS);
+  expect(forbiddenIn(replay)).toEqual([]);
   expect(replay.message).toBe(status === null ? REPLAY_REQUEST_FAILED : replayStatusFailed(status));
   expect(replay.status).toBe(status);
+}
+
+/**
+ * Runs `body` and then waits for late callbacks, failing if any exception
+ * or rejection escaped out of band. Only the count is asserted.
+ */
+async function withoutStrayErrors<T>(body: () => Promise<T>): Promise<T> {
+  const strays: unknown[] = [];
+  const trap = (error: unknown) => strays.push(error);
+  process.on('uncaughtException', trap);
+  process.on('unhandledRejection', trap);
+  try {
+    const result = await body();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    return result;
+  } finally {
+    process.off('uncaughtException', trap);
+    process.off('unhandledRejection', trap);
+    expect(strays.length, 'exceptions escaped the replay boundary').toBe(0);
+  }
+}
+
+/** A scripted stand-in for node:http's ClientRequest. */
+class FakeRequest extends EventEmitter {
+  constructor(readonly headers: http.OutgoingHttpHeaders | undefined) {
+    super();
+  }
+  destroy(): this {
+    throw new Error(`destroy failed ${JSON.stringify(this.headers)}`);
+  }
+  end(): this {
+    return this;
+  }
+}
+
+/** A fake response whose methods echo the request headers when they throw. */
+function fakeResponse(headers: http.OutgoingHttpHeaders | undefined, status: number | (() => number)) {
+  const response = new EventEmitter() as EventEmitter & { statusCode?: number; destroy: () => void };
+  if (typeof status === 'function') Object.defineProperty(response, 'statusCode', { get: status });
+  else response.statusCode = status;
+  response.destroy = () => {
+    throw new Error(`destroy failed ${JSON.stringify(headers)}`);
+  };
+  return response;
+}
+
+/** A request() seam that hands the script the fake request and the response callback. */
+function scripted(script: (req: FakeRequest, respond: (res: unknown) => void) => void): typeof http.request {
+  return ((opts: http.RequestOptions, callback: (res: unknown) => void) => {
+    const req = new FakeRequest(opts.headers);
+    setTimeout(() => script(req, callback), 5);
+    return req;
+  }) as unknown as typeof http.request;
 }
 
 test.describe('cookie replay redaction', () => {
@@ -165,5 +264,74 @@ test.describe('cookie replay redaction', () => {
         await bad.close();
       }
     }
+  });
+
+  test('assertion probe: a marker nested under details.headers.cookie is caught', async () => {
+    const probe = new ReplayError(null);
+    Object.assign(probe, { details: { headers: { cookie: `${COOKIE}=${VALUE}` } } });
+    // The previous top-level replacer missed it.
+    expect(JSON.stringify(probe, Object.getOwnPropertyNames(probe)).includes(VALUE)).toBe(false);
+    expect(forbiddenIn(probe)).toContain(0);
+    expect(ownKeys(probe)).not.toEqual(ALLOWED_KEYS);
+    const hidden = new ReplayError(500);
+    Object.defineProperty(hidden, Symbol('raw'), { value: { request: [VALUE] }, enumerable: false });
+    expect(forbiddenIn(hidden)).toContain(0);
+    const caused = new ReplayError(null);
+    Object.defineProperty(caused, 'cause', { value: new Error(`cookie ${VALUE}`), enumerable: false });
+    expect(forbiddenIn(caused)).toContain(0);
+  });
+
+  test('async: a timeout whose destroy() throws', async () => {
+    const request = scripted(req => req.emit('timeout'));
+    const error = await withoutStrayErrors(() => failure(replaySessionStatus(options(1, { request }))));
+    expectRedacted(error, null);
+  });
+
+  test('async: the response callback throws', async () => {
+    const request = scripted((req, respond) =>
+      respond(fakeResponse(req.headers, () => {
+        throw new Error(`status read ${JSON.stringify(req.headers)}`);
+      })));
+    const error = await withoutStrayErrors(() => failure(replaySessionStatus(options(1, { request }))));
+    expectRedacted(error, null);
+  });
+
+  test('async: the data listener throws and destroy() throws too', async () => {
+    const request = scripted((req, respond) => {
+      const res = fakeResponse(req.headers, 200);
+      respond(res);
+      const poisoned = Object.defineProperty({}, 'length', {
+        get: () => {
+          throw new Error(`chunk ${JSON.stringify(req.headers)}`);
+        },
+      });
+      setTimeout(() => res.emit('data', poisoned), 5);
+    });
+    const error = await withoutStrayErrors(() => failure(replaySessionStatus(options(1, { request }))));
+    expectRedacted(error, 200);
+  });
+
+  test('async: an oversized body whose destroy() throws', async () => {
+    const request = scripted((req, respond) => {
+      const res = fakeResponse(req.headers, 200);
+      respond(res);
+      setTimeout(() => res.emit('data', Buffer.alloc(70_000, 120)), 5);
+    });
+    const error = await withoutStrayErrors(() => failure(replaySessionStatus(options(1, { request }))));
+    expectRedacted(error, 200);
+  });
+
+  test('async: late events after the result are absorbed', async () => {
+    const request = scripted((req, respond) => {
+      const res = fakeResponse(req.headers, 401);
+      respond(res);
+      res.emit('end');
+      setTimeout(() => {
+        req.emit('error', new Error(`late ${JSON.stringify(req.headers)}`));
+        req.emit('timeout');
+        res.emit('error', new Error(`late ${JSON.stringify(req.headers)}`));
+      }, 10);
+    });
+    expect(await withoutStrayErrors(() => replaySessionStatus(options(1, { request })))).toBe(401);
   });
 });
