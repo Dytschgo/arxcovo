@@ -2,6 +2,17 @@ use anyhow::Context;
 use std::{path::PathBuf, sync::Arc};
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "dashboard-password") {
+        if args.len() != 3 || args[1] != "--state-dir" {
+            eprintln!("arxd: usage: arxd dashboard-password --state-dir DIRECTORY");
+            std::process::exit(2);
+        }
+        if arxd::dashboard::set_password(&PathBuf::from(&args[2])).is_err() {
+            eprintln!("arxd: dashboard-password-refused");
+            std::process::exit(1);
+        }
+        return;
+    }
     #[cfg(target_os = "linux")]
     if let Some(code) = arxd::service::cluster_broker_entry(&args) {
         std::process::exit(code);
@@ -112,7 +123,18 @@ async fn run() -> anyhow::Result<()> {
     } else {
         None
     };
-    if local.is_none() && http.is_none() {
+    let dashboard = if let Some(settings) = &config.dashboard {
+        let listener = arxd::dashboard::Listener::bind(settings)
+            .await
+            .context("server-bind")?;
+        let router = listener
+            .router(settings, activity.clone(), &config.state_dir)
+            .context("server-state")?;
+        Some((listener, router))
+    } else {
+        None
+    };
+    if local.is_none() && http.is_none() && dashboard.is_none() {
         anyhow::bail!("no configured listener");
     }
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -120,6 +142,7 @@ async fn run() -> anyhow::Result<()> {
     let local_stop = local_shutdown.clone();
     let has_local = local.is_some();
     let has_http = http.is_some();
+    let has_dashboard = dashboard.is_some();
     let local_config = config.clone();
     let local_activity = activity.clone();
     let local_run = async move {
@@ -132,6 +155,16 @@ async fn run() -> anyhow::Result<()> {
         }
     };
     let execution = config.execution.clone();
+    let dashboard_shutdown = shutdown_rx.clone();
+    let dashboard_run = async move {
+        match dashboard {
+            Some((listener, router)) => listener
+                .run(router, dashboard_shutdown)
+                .await
+                .context("server-listener"),
+            None => std::future::pending().await,
+        }
+    };
     let http_run = async move {
         match http {
             Some(listener) => {
@@ -142,17 +175,21 @@ async fn run() -> anyhow::Result<()> {
             None => std::future::pending().await,
         }
     };
-    tokio::pin!(local_run, http_run);
-    let (mut result, local_done, http_done) = tokio::select! {
-        result = &mut local_run => (result, true, false),
-        result = &mut http_run => (result, false, true),
-        _ = tokio::signal::ctrl_c() => (Ok(()), false, false),
+    tokio::pin!(local_run, http_run, dashboard_run);
+    let (mut result, local_done, http_done, dashboard_done) = tokio::select! {
+        result = &mut local_run => (result, true, false, false),
+        result = &mut http_run => (result, false, true, false),
+        result = &mut dashboard_run => (result, false, false, true),
+        _ = tokio::signal::ctrl_c() => (Ok(()), false, false, false),
     };
     if let Some(execution) = &execution {
         execution.shutdown();
     }
     local_shutdown.cancel();
     let _ = shutdown_tx.send(true);
+    if has_dashboard && !dashboard_done {
+        result = result.and(dashboard_run.await);
+    }
     // Stop the listener and join its connection tasks. SDK request handlers are
     // detached from those tasks; drain closes execution admission and waits for
     // every admitted handler's terminal audit.

@@ -15,6 +15,7 @@ mod template;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
+pub(crate) use crate::store::vm::{DashboardCatalog, DashboardVm};
 pub use controller::VmController;
 pub(crate) use controller::{ActivityReceipt, CatalogEntry, ForegroundSubject, Precheck};
 pub use model::*;

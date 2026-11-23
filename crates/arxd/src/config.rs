@@ -106,6 +106,7 @@ pub struct Config {
     pub execution_settings: Option<crate::development::WindowsSettings>,
     pub development_execution: Option<crate::development::Settings>,
     pub listen: Option<SocketAddr>,
+    pub dashboard: Option<crate::dashboard::DashboardConfig>,
     pub state_dir: PathBuf,
     pub agents: Vec<Agent>,
     pub local: Option<crate::local::Endpoint>,
@@ -180,7 +181,12 @@ impl Config {
         if self.listen.is_some_and(|a| !a.ip().is_loopback()) {
             bail!("listener must be loopback");
         }
-        if !(1..=32).contains(&self.agents.len()) {
+        if let Some(dashboard) = &self.dashboard {
+            dashboard.validate()?;
+        }
+        let dashboard_only =
+            self.dashboard.is_some() && self.listen.is_none() && self.local.is_none();
+        if self.agents.len() > 32 || (self.agents.is_empty() && !dashboard_only) {
             bail!("agent count out of bounds");
         }
         let mut names = HashSet::new();
