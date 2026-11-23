@@ -4,6 +4,7 @@ use super::{
     reaper::{self, ArtifactCustody, ClosedCustody, ReaperTick, Sweeps},
     runtime::{CandidateRuntime, ReaperRuntime},
     static_web::StaticState,
+    template,
 };
 use crate::{
     service::Shutdown,
@@ -45,6 +46,18 @@ impl AdmissionGate {
 }
 
 impl<C: Clock> VmController<C> {
+    pub(crate) fn windows_recipe_id() -> Id {
+        template::windows_recipe_id()
+    }
+
+    fn build_guest(recipe: &str) -> Guest {
+        if recipe == hex::encode(Self::windows_recipe_id()) {
+            Guest::WindowsX86_64
+        } else {
+            Guest::UbuntuX86_64
+        }
+    }
+
     pub fn open(vm_state_root: &Path, policy: VmPolicy, clock: C) -> Result<Self> {
         let store = VmStore::open(vm_state_root, utc(clock.now())?)?;
         Ok(Self {
@@ -447,8 +460,13 @@ impl<C: Clock> VmController<C> {
         )? {
             return Ok(Err(reason));
         }
-        // 60 minutes for install plus bounded detached verification and release.
-        let pending = self.worker(clock, 3_900)?;
+        // Windows measures its install deadline from first launch. Allow
+        // bounded preparation and settlement around that separate cutoff.
+        let seconds = match Self::build_guest(request.recipe) {
+            Guest::UbuntuX86_64 => 3_900,
+            Guest::WindowsX86_64 => template::WINDOWS_BUILD_LIMIT.as_secs() + 300,
+        };
+        let pending = self.worker(clock, seconds)?;
         let operation = binding.record(db, now, None, None)?;
         let slots = store::reserve_build(db, request, operation, peak)?;
         store::require_headroom(db)?;
@@ -614,7 +632,15 @@ impl<C: Clock> VmController<C> {
                 store::abandon_build(db, slots.id, worker.activity_id, now)?;
                 return Ok(Status::Interrupted);
             }
-            store::publish_build(db, worker.activity_id, slots, request, proof, now)?;
+            store::publish_build(
+                db,
+                worker.activity_id,
+                slots,
+                request,
+                Self::build_guest(request.recipe),
+                proof,
+                now,
+            )?;
             Ok(Status::Succeeded)
         })
     }
@@ -1287,6 +1313,7 @@ pub(crate) struct CatalogEntry {
     pub kind: u8,
     pub id: Id,
     pub recipe: Option<String>,
+    pub guest: Option<Guest>,
 }
 
 pub(crate) struct ActivityReceipt {
@@ -1306,32 +1333,47 @@ impl<C: Clock> VmController<C> {
     pub(crate) fn foreground_catalog(
         &self,
         principal: &str,
-        recipes: [Option<Id>; 2],
+        recipes: [Option<Id>; 3],
         after: (u8, Id),
         limit: u32,
     ) -> Result<Vec<CatalogEntry>> {
         self.store.transact(|db| {
             let mut query = db.prepare(
-                "SELECT kind,id,recipe FROM (
-                   SELECT 1 AS kind, ?1 AS id, NULL AS recipe WHERE ?1 IS NOT NULL
+                "SELECT kind,id,recipe,guest FROM (
+                   SELECT 1 AS kind, ?1 AS id, NULL AS recipe, NULL AS guest WHERE ?1 IS NOT NULL
                    UNION
-                   SELECT 1, ?6, NULL WHERE ?6 IS NOT NULL
+                   SELECT 1, ?6, NULL, NULL WHERE ?6 IS NOT NULL
+                   UNION
+                   SELECT 1, ?7, NULL, NULL WHERE ?7 IS NOT NULL
                    UNION ALL
-                   SELECT 2, b.template_id, b.recipe_id FROM vm_build_intents b
+                   SELECT 2, b.template_id, b.recipe_id, t.guest FROM vm_build_intents b
+                     JOIN vm_templates t ON t.id=b.template_id
                      WHERE b.state='sealed'
                    UNION ALL
-                   SELECT 3, b.operation_id, b.recipe_id FROM vm_build_intents b
+                   SELECT 3, b.operation_id, b.recipe_id, NULL FROM vm_build_intents b
                      JOIN vm_operations o USING(operation_id)
                      WHERE o.principal=?2 AND b.state='pending' AND o.status=0
                  ) WHERE (kind,id)>(?3,?4) ORDER BY kind,id LIMIT ?5",
             )?;
             let rows = query.query_map(
-                params![recipes[0], principal, after.0, after.1, limit, recipes[1]],
+                params![
+                    recipes[0], principal, after.0, after.1, limit, recipes[1], recipes[2]
+                ],
                 |row| {
+                    let kind = row.get(0)?;
+                    let id = row.get(1)?;
+                    let guest = match (kind, row.get::<_, Option<i64>>(3)?) {
+                        (1, None) if id == Self::windows_recipe_id() => Some(Guest::WindowsX86_64),
+                        (1, None) | (2, Some(1)) => Some(Guest::UbuntuX86_64),
+                        (2, Some(2)) => Some(Guest::WindowsX86_64),
+                        (3, None) => None,
+                        _ => return Err(rusqlite::Error::InvalidQuery),
+                    };
                     Ok(CatalogEntry {
-                        kind: row.get(0)?,
-                        id: row.get(1)?,
+                        kind,
+                        id,
                         recipe: row.get(2)?,
+                        guest,
                     })
                 },
             )?;

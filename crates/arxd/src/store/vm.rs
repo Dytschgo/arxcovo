@@ -1553,6 +1553,7 @@ pub(crate) fn publish_build(
     activity_id: i64,
     slots: BuildSlots,
     request: BuildRequest<'_>,
+    guest: Guest,
     proof: [ArtifactEvidence; 2],
     now: i64,
 ) -> Result<()> {
@@ -1593,7 +1594,7 @@ pub(crate) fn publish_build(
            AND o.activity_id=?8 AND o.action=11 AND o.status=0 AND b.recipe_id=?9 AND b.recipe_digest=?10
            AND o.recipe_id=b.recipe_id AND o.recipe_digest=b.recipe_digest
            AND o.principal=?11 AND o.request_key=?12",
-        params![template, Guest::UbuntuX86_64 as i64, disk.pin.sha256, vars.pin.sha256,
+        params![template, guest as i64, disk.pin.sha256, vars.pin.sha256,
             retained, slots.id, slots.pair.disk.generation, activity_id, request.recipe,
             request.digest, request.principal, request.key.key, peak],
     )? == 1, "invalid build publication binding");

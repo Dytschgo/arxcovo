@@ -400,24 +400,45 @@ async fn inspect_vm(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>
         result["capability"],
         json!({"available":false,"reason":reason})
     );
-    assert_eq!(result["entries"][0]["state"], "unqualified");
+    let entries = result["entries"].as_array().unwrap();
+    let ubuntu = entries
+        .iter()
+        .find(|entry| {
+            entry["guest"] == "ubuntu" && entry["recipe_id"] != "ffffffffffffffffffffffffffffffff"
+        })
+        .unwrap();
+    let windows = entries
+        .iter()
+        .find(|entry| entry["guest"] == "windows")
+        .unwrap();
+    assert_eq!(
+        windows,
+        &json!({
+            "recipe_id":"3c2fe2069942ce6c6cebe5c3e700e758",
+            "guest":"windows","state":"unqualified","reason":"recipe_unqualified"
+        })
+    );
+    assert_eq!(ubuntu["state"], "unqualified");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis();
-    let args = json!({"recipe_id":result["entries"][0]["recipe_id"],"request_id":format!("{now:016x}{:016x}", 1)});
-    let response = client
-        .call_tool(
-            CallToolRequestParams::new("vm_template_build")
-                .with_arguments(args.as_object().unwrap().clone()),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.is_error, Some(true));
-    assert_eq!(
-        response.structured_content.unwrap(),
-        json!({"ok":false,"reason":reason})
-    );
+    for (nonce, entry, refusal) in [(1, ubuntu, reason), (2, windows, "recipe_unqualified")] {
+        let args =
+            json!({"recipe_id":entry["recipe_id"],"request_id":format!("{now:016x}{nonce:016x}")});
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("vm_template_build")
+                    .with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.is_error, Some(true));
+        assert_eq!(
+            response.structured_content.unwrap(),
+            json!({"ok":false,"reason":refusal})
+        );
+    }
 }
 
 #[tokio::test]
