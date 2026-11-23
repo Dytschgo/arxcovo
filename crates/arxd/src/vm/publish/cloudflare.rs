@@ -20,10 +20,11 @@ const HTTP_LIMIT: usize = 128 * 1024;
 const HEADER_LIMIT: usize = 8 * 1024;
 const RECORD_LIMIT: usize = 100;
 
-pub(in crate::vm) struct DnsBearer(String);
+pub(in crate::vm) struct DnsBearer(zeroize::Zeroizing<String>);
 
 impl DnsBearer {
     pub(in crate::vm) fn new(value: String) -> Result<Self, InvalidInput> {
+        let value = zeroize::Zeroizing::new(value);
         if value.is_empty()
             || value.len() > 512
             || !value.bytes().all(|b| {
@@ -185,6 +186,7 @@ pub(in crate::vm) trait DnsApi {
 enum Transport {
     Cloudflare(TlsConnector),
     #[cfg(test)]
+    #[allow(dead_code, reason = "exercised by the DNS integration fixture")]
     Fixture(SocketAddr),
 }
 
@@ -218,6 +220,7 @@ impl CloudflareDns {
     }
 
     #[cfg(test)]
+    #[allow(dead_code, reason = "exercised by the DNS integration fixture")]
     pub(in crate::vm) fn fixture(bearer: DnsBearer, addr: SocketAddr) -> Self {
         assert!(addr.ip().is_loopback());
         Self {
@@ -317,12 +320,12 @@ impl DnsApi for CloudflareDns {
 
 impl CloudflareDns {
     async fn request(&self, method: Method, path: &str, body: &[u8]) -> Result<Response, DnsError> {
-        let headers = format!(
+        let headers = zeroize::Zeroizing::new(format!(
             "{} {path} HTTP/1.1\r\nHost: {API_HOST}\r\nAuthorization: Bearer {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             method.as_str(),
-            self.bearer.0,
+            self.bearer.0.as_str(),
             body.len()
-        );
+        ));
         let result = timeout(self.deadline, async {
             match &self.transport {
                 Transport::Cloudflare(tls) => {

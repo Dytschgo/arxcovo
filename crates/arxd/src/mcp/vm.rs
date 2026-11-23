@@ -4,7 +4,10 @@ use crate::{
     service::Shutdown,
     store::ListActivity,
     vm::{
-        runtime::NativeRefusal,
+        runtime::{
+            NativeRefusal,
+            publication::{Origin, Profile, Publication},
+        },
         static_web::{StaticName, StaticState},
         *,
     },
@@ -123,6 +126,10 @@ fn refusal_wire(reason: Refusal) -> &'static str {
         Refusal::NameUnavailable => "name_unavailable",
         Refusal::StaticDeleteForbidden => "static_delete_forbidden",
         Refusal::UnknownTool => "unknown_tool",
+        Refusal::PublicSitesDisabled => "public_sites_disabled",
+        Refusal::PublishCredentialMissing => "publish_credential_missing",
+        Refusal::PublishTargetMismatch => "publish_target_mismatch",
+        Refusal::PublishCleanupPending => "publish_cleanup_pending",
     }
 }
 
@@ -140,7 +147,7 @@ fn refusal_from_wire(reason: &str) -> Option<Refusal> {
         .find(|code| refusal_wire(*code) == reason)
 }
 
-const REFUSAL_CODES: [Refusal; 44] = {
+const REFUSAL_CODES: [Refusal; 48] = {
     use Refusal::*;
     [
         Invalid,
@@ -187,6 +194,10 @@ const REFUSAL_CODES: [Refusal; 44] = {
         NameUnavailable,
         StaticDeleteForbidden,
         UnknownTool,
+        PublicSitesDisabled,
+        PublishCredentialMissing,
+        PublishTargetMismatch,
+        PublishCleanupPending,
     ]
 };
 
@@ -225,6 +236,11 @@ type Recipe = (Id, Option<[u8; 32]>);
 
 struct Gate {
     closed: bool,
+    allow_agent_public_sites: bool,
+    publish_profile: Option<Arc<Profile>>,
+    publish_jobs: tokio::task::JoinSet<anyhow::Result<()>>,
+    publish_failed: bool,
+    publication_owner: Option<(Id, String, Shutdown)>,
     #[cfg(test)]
     fixture: Option<tests::Fixture>,
     #[cfg(test)]
@@ -244,6 +260,7 @@ pub(crate) struct Supervisor {
     /// The validated native runtime profile, if configured. It only selects
     /// the closed candidate runtime; it never authorizes a launch here.
     runtime: Option<VmRuntimeProfile>,
+    publisher: Publication,
     #[cfg(test)]
     ticks: Mutex<Option<tests::TestTicks>>,
     /// Parks the next tool call before admission.
@@ -300,6 +317,12 @@ impl Supervisor {
         let state = Arc::get_mut(&mut supervisor)
             .ok_or_else(|| anyhow::anyhow!("VM supervisor shared before open"))?;
         state.root_pin = Some(pin);
+        let gate = state
+            .gate
+            .get_mut()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        gate.allow_agent_public_sites = profile.allow_agent_public_sites;
+        gate.publish_profile = profile.publication.map(Arc::from);
         state.recipes[1] = Some((WEB_RECIPE_ID, None));
         Ok(supervisor)
     }
@@ -320,6 +343,11 @@ impl Supervisor {
             controller,
             gate: Mutex::new(Gate {
                 closed: false,
+                allow_agent_public_sites: false,
+                publish_profile: None,
+                publish_jobs: Default::default(),
+                publish_failed: false,
+                publication_owner: None,
                 #[cfg(test)]
                 fixture: None,
                 #[cfg(test)]
@@ -332,6 +360,7 @@ impl Supervisor {
             recipes: [recipe.map(|(id, digest)| (id, Some(digest))), None],
             native_refusal,
             runtime,
+            publisher: Publication::default(),
             #[cfg(test)]
             ticks: Mutex::new(None),
             #[cfg(test)]
@@ -455,6 +484,11 @@ impl Supervisor {
     /// awaited before this returns, so the caller's bounded join covers it;
     /// on expiry the drain is unconfirmed while the turn finishes detached.
     pub(crate) async fn run_reaper(self: &Arc<Self>, stop: &Shutdown) -> anyhow::Result<()> {
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Ok(()),
+            result = self.publisher.turn(&self.controller, &self.cancel) => result?,
+        }
         #[cfg(test)]
         if let Some(mut ticks) = self.ticks.lock().ok().and_then(|mut ticks| ticks.take()) {
             return self.reaper_turns(&mut ticks, stop).await;
@@ -476,6 +510,11 @@ impl Supervisor {
                     if !more {
                         return Ok(());
                     }
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => return Ok(()),
+                        result = self.publisher.turn(&self.controller, &self.cancel) => result?,
+                    }
                     let supervisor = self.clone();
                     tokio::task::spawn_blocking(move || supervisor.sweep()).await??;
                 }
@@ -487,15 +526,39 @@ impl Supervisor {
     /// The caller has passed the close barrier, so no new worker can be
     /// registered.
     pub(crate) async fn drain_workers(&self, bound: Duration) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + bound;
+        let (mut publish_jobs, failed) = {
+            let mut gate = self.lock()?;
+            (std::mem::take(&mut gate.publish_jobs), gate.publish_failed)
+        };
+        tokio::time::timeout_at(deadline, async {
+            let local = self.publisher.stop_local(None).await;
+            let mut failed = failed || !local;
+            while let Some(job) = publish_jobs.join_next().await {
+                failed |= !matches!(job, Ok(Ok(())));
+            }
+            anyhow::ensure!(!failed, "publication settlement unconfirmed");
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
         #[cfg(test)]
         {
             let jobs = self.lock()?.fixture.as_mut().map(tests::Fixture::take_jobs);
             if let Some(jobs) = jobs {
-                let drained = tokio::time::timeout(bound, jobs.join()).await??;
+                let drained = tokio::time::timeout_at(deadline, jobs.join()).await??;
                 self.lock()?.drained = Some(drained);
             }
         }
-        let _ = bound;
+        // Local containment and worker settlement have their own proof.
+        // A remote timeout leaves the intent intact for startup reconciliation.
+        if let Ok(result) = tokio::time::timeout_at(
+            deadline,
+            self.publisher.turn(&self.controller, &self.cancel),
+        )
+        .await
+        {
+            result?;
+        }
         Ok(())
     }
 
@@ -619,10 +682,13 @@ enum ToolName {
     StaticCreate,
     StaticGet,
     StaticList,
+    Publish,
+    Unpublish,
+    PublishStatus,
 }
 
 impl ToolName {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 18] = [
         Self::Hosts,
         Self::Activity,
         Self::Catalog,
@@ -638,6 +704,9 @@ impl ToolName {
         Self::StaticCreate,
         Self::StaticGet,
         Self::StaticList,
+        Self::Publish,
+        Self::Unpublish,
+        Self::PublishStatus,
     ];
 
     fn name(self) -> &'static str {
@@ -657,6 +726,9 @@ impl ToolName {
             Self::StaticCreate => "static_vm_create",
             Self::StaticGet => "static_vm_get",
             Self::StaticList => "static_vm_list",
+            Self::Publish => "publish_site",
+            Self::Unpublish => "unpublish_site",
+            Self::PublishStatus => "publish_status",
         }
     }
 
@@ -669,6 +741,8 @@ impl ToolName {
             Self::Stop => Action::Stop as i64,
             Self::Script => Action::Script as i64,
             Self::Extend => Action::Extend as i64,
+            Self::Publish => PUBLISH_ACTION,
+            Self::Unpublish => UNPUBLISH_ACTION,
             _ => return None,
         })
     }
@@ -716,6 +790,20 @@ impl ToolName {
                     "name":{"type":"string","minLength":1,"maxLength":63,
                     "pattern":"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$"}}),
                 &["template_id", "request_id", "name"],
+            ),
+            Self::Publish | Self::Unpublish => (
+                if self == Self::Publish {
+                    "Publish an enrolled static site"
+                } else {
+                    "Unpublish a static site"
+                },
+                json!({"vm_id":id,"request_id":id}),
+                &["vm_id", "request_id"],
+            ),
+            Self::PublishStatus => (
+                "Read a caller-owned static site status",
+                json!({"vm_id":id}),
+                &["vm_id"],
             ),
             Self::Get | Self::StaticGet => {
                 ("Read a caller-owned VM", json!({"vm_id":id}), &["vm_id"])
@@ -879,6 +967,8 @@ enum Work {
     Build,
     Create(u64),
     StaticCreate(StaticName),
+    Publish,
+    Unpublish,
     Start,
     Stop,
     Script(
@@ -934,6 +1024,8 @@ impl Mutation {
                 }
             }
             ToolName::Start => Work::Start,
+            ToolName::Publish => Work::Publish,
+            ToolName::Unpublish => Work::Unpublish,
             ToolName::Stop => Work::Stop,
             ToolName::Script => {
                 let script: String = args.get("script")?;
@@ -1021,7 +1113,10 @@ impl VmInventory {
             };
             return self.mutate(&mut gate, action, request);
         }
-        let vm = if matches!(tool, ToolName::Get | ToolName::StaticGet) {
+        let vm = if matches!(
+            tool,
+            ToolName::Get | ToolName::StaticGet | ToolName::PublishStatus
+        ) {
             args.0
                 .get("vm_id")
                 .and_then(Value::as_str)
@@ -1075,10 +1170,16 @@ impl VmInventory {
             ),
             _ => Subject::Vm(request.id),
         };
-        match controller.foreground_replay(&self.principal, request.key, subject, action)? {
-            Ok(Some(replay)) => return Ok(receipt(replay.operation.id, replay.lease_end)),
-            Ok(None) => {}
-            Err(reason) => return self.refuse(action, request.vm(), reason.into()),
+        match controller.foreground_replay(&self.principal, request.key, subject, action) {
+            Ok(Ok(Some(replay))) => return Ok(receipt(replay.operation.id, replay.lease_end)),
+            Ok(Ok(None)) => {}
+            Ok(Err(reason)) => return self.refuse(action, request.vm(), reason.into()),
+            Err(error) => {
+                if action == UNPUBLISH_ACTION {
+                    self.stop_unaudited_publication(gate, request.id);
+                }
+                return Err(error.into());
+            }
         }
         // Scope and subject state precede native or fixture eligibility.
         let subject = match &request.work {
@@ -1107,6 +1208,7 @@ impl VmInventory {
             Work::Stop => Some(ForegroundSubject::Stop(request.id)),
             Work::Script(..) => Some(ForegroundSubject::Script(request.id)),
             Work::Extend(_) => Some(ForegroundSubject::Extend(request.id)),
+            Work::Publish | Work::Unpublish => return self.publication(gate, action, request),
         };
         if let Some(subject) = subject
             && let Err(reason) = controller.foreground_precheck(&self.principal, subject)?
@@ -1129,6 +1231,136 @@ impl VmInventory {
         )
     }
 
+    /// A failed store must not keep a confirmed caller-owned Job reachable.
+    /// Retire the in-memory boot witness and leave the durable DNS intent for recovery.
+    fn stop_unaudited_publication(&self, gate: &mut Gate, vm: Id) {
+        let Some((_, _, retired)) = gate
+            .publication_owner
+            .as_ref()
+            .filter(|(id, owner, _)| *id == vm && *owner == self.principal)
+        else {
+            return;
+        };
+        if retired.is_cancelled() {
+            return;
+        }
+        retired.cancel();
+        let supervisor = self.supervisor.clone();
+        gate.publish_jobs.spawn(async move {
+            anyhow::ensure!(
+                supervisor.publisher.stop_local(Some(vm)).await,
+                "publication stop unconfirmed"
+            );
+            Ok(())
+        });
+    }
+
+    fn publication(&self, gate: &mut Gate, action: i64, request: Mutation) -> Outcome<Value> {
+        let vm = request.id;
+        let refuse = |reason: Refusal| self.refuse(action, Some(vm), reason.into());
+        let publish = action == PUBLISH_ACTION;
+        let supervisor = &self.supervisor;
+        let controller = &supervisor.controller;
+        if publish && !gate.allow_agent_public_sites {
+            return refuse(Refusal::PublicSitesDisabled);
+        }
+        let mut owned = match controller.foreground_static_rows(&self.principal, Some(vm), None, 1)
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                if !publish {
+                    self.stop_unaudited_publication(gate, vm);
+                }
+                return Err(error.into());
+            }
+        };
+        let Some(row) = owned.pop() else {
+            return refuse(Refusal::NotFound);
+        };
+        while let Some(job) = gate.publish_jobs.try_join_next() {
+            gate.publish_failed |= !matches!(job, Ok(Ok(())));
+        }
+        if publish && gate.publish_failed {
+            return refuse(Refusal::StateUnavailable);
+        }
+        let Some(slot) = supervisor.publisher.claim() else {
+            return refuse(Refusal::Busy);
+        };
+        let prepared = if publish {
+            let Some(profile) = gate.publish_profile.as_ref() else {
+                return refuse(Refusal::PublishCredentialMissing);
+            };
+            if !profile.target(supervisor.host_id, &row.name) {
+                return refuse(Refusal::PublishTargetMismatch);
+            }
+            if row.state != StaticState::Running {
+                return refuse(Refusal::NotReady);
+            }
+            let origin: Option<Origin> = supervisor.candidate().publication_origin(vm);
+            #[cfg(test)]
+            let origin = gate
+                .fixture
+                .as_ref()
+                .and_then(|fixture| fixture.publish_origin(vm))
+                .or(origin);
+            let Some(origin) = origin else {
+                return refuse(Refusal::NotReady);
+            };
+            let credentials = supervisor.publisher.prepare(profile);
+            let credentials = match credentials {
+                Ok(credentials) => credentials,
+                Err(reason) => return refuse(reason),
+            };
+            Some((profile.intent(vm, &origin)?, credentials, origin))
+        } else {
+            None
+        };
+        let operation = match controller.admit_publication(
+            &self.principal,
+            request.key,
+            vm,
+            prepared.as_ref().map(|(intent, _, _)| (intent, &row.name)),
+        ) {
+            Ok(Ok(operation)) => operation,
+            Ok(Err(reason)) => return refuse(reason),
+            Err(error) => {
+                if !publish {
+                    self.stop_unaudited_publication(gate, vm);
+                }
+                return Err(error.into());
+            }
+        };
+        if let Some((_, _, origin)) = &prepared {
+            gate.publication_owner = Some((vm, self.principal.clone(), origin.retired.clone()));
+        }
+        let supervisor = supervisor.clone();
+        gate.publish_jobs.spawn(async move {
+            let _slot = slot;
+            match prepared {
+                Some((intent, credentials, origin)) => {
+                    supervisor
+                        .publisher
+                        .publish(
+                            &supervisor.controller,
+                            operation,
+                            intent,
+                            credentials,
+                            origin,
+                            &supervisor.cancel,
+                        )
+                        .await
+                }
+                None => {
+                    supervisor
+                        .publisher
+                        .unpublish(&supervisor.controller, operation, vm, &supervisor.cancel)
+                        .await
+                }
+            }
+        });
+        Ok(receipt(operation.id, None))
+    }
+
     fn read(&self, gate: &Gate, tool: ToolName, mut args: Args) -> Outcome<Value> {
         let controller = &self.supervisor.controller;
         match tool {
@@ -1149,6 +1381,19 @@ impl VmInventory {
             ToolName::Activity => self.activity(args),
             ToolName::Catalog | ToolName::List | ToolName::StaticList => {
                 self.page(gate, tool, args)
+            }
+            ToolName::PublishStatus => {
+                let id = args.id("vm_id")?;
+                args.end()?;
+                let status = controller.publication_status(&self.principal, id)??;
+                let mut value = json!({
+                    "vm_id":hex::encode(id),
+                    "phase":status.phase.map_or("unpublished", |phase| phase.wire()),
+                });
+                if let Some(reason) = status.reason {
+                    value["reason"] = json!(reason.wire());
+                }
+                Ok(value)
             }
             ToolName::StaticGet => {
                 let id = args.id("vm_id")?;
@@ -1504,6 +1749,8 @@ fn action_wire(code: i64) -> Option<&'static str> {
         STATIC_CREATE_ACTION => "static_create",
         READ_REFUSAL_ACTION => "read",
         HOST_REFUSAL_ACTION => "host_execution",
+        PUBLISH_ACTION => "publish",
+        UNPUBLISH_ACTION => "unpublish",
         _ => return None,
     })
 }
@@ -1535,6 +1782,9 @@ fn activity_row(row: crate::vm::ActivityReceipt) -> Outcome<Value> {
     }
     if let Some(reason) = row.reason {
         value["reason"] = json!(refusal_wire(refusal_code(reason).ok_or(STATE_UNAVAILABLE)?));
+    }
+    if let Some(failure) = row.publication_failure {
+        value["failure_reason"] = json!(failure.wire());
     }
     if let Some(cleanup) = row.cleanup {
         value["cleanup"] = json!(proof_wire(cleanup));
@@ -2189,6 +2439,14 @@ mod tests {
             self.live.lock().unwrap().boots.contains_key(&vm)
         }
 
+        pub(super) fn publish_origin(&self, vm: Id) -> Option<Origin> {
+            let live = self.live.lock().unwrap();
+            match live.boots.get(&vm) {
+                Some(Slot::Idle(boot)) => boot.publish_origin.clone(),
+                _ => None,
+            }
+        }
+
         pub(super) fn web_ready(&self, vm: Id) -> bool {
             let live = self.live.lock().unwrap();
             match live.boots.get(&vm) {
@@ -2464,6 +2722,9 @@ mod tests {
                         .ok_or(STATE_UNAVAILABLE)?;
                     return Ok(receipt(replay.operation.id, Some(end)));
                 }
+                Work::Publish | Work::Unpublish => {
+                    unreachable!("publication has separate admission")
+                }
                 Work::Start => (Operation::Start, id),
                 Work::Stop => (Operation::Stop, id),
                 Work::Script(ref script, seconds) => (
@@ -2565,9 +2826,16 @@ mod tests {
                         Some(Slot::Idle(boot)) => Some(*boot),
                         Some(Slot::Exchanging) | None => None,
                     };
+                    if let Some(origin) =
+                        boot.as_ref().and_then(|boot| boot.publish_origin.as_ref())
+                    {
+                        origin.retired.cancel();
+                    }
+                    let supervisor = inventory.supervisor.clone();
                     let controller = controller.clone();
                     self.jobs.spawn(async move {
                         let _working = working;
+                        let local = supervisor.publisher.stop_local(Some(vm)).await;
                         // A failed powerdown is a known dirty stop; a missing
                         // boot leaves the cause unknown.
                         let (completion, cause) = match boot {
@@ -2581,7 +2849,11 @@ mod tests {
                             None => (Completion::CleanupUnconfirmed, None),
                         };
                         controller.finish_with_cause(&worker, completion, cause)?;
-                        Ok(())
+                        if local {
+                            Ok(())
+                        } else {
+                            anyhow::bail!("publication stop unconfirmed")
+                        }
                     });
                 }
                 Work::Script(script, seconds) => {
@@ -2590,6 +2862,7 @@ mod tests {
                     };
                     let mut boot = *boot;
                     let hold = self.script_hold.take();
+                    let supervisor = inventory.supervisor.clone();
                     worker.deadline += Duration::from_secs(6);
                     let controller = controller.clone();
                     self.jobs.spawn(async move {
@@ -2626,6 +2899,10 @@ mod tests {
                             }
                         };
                         if let Some(boot) = retired {
+                            if let Some(origin) = &boot.publish_origin {
+                                origin.retired.cancel();
+                            }
+                            supervisor.publisher.stop_local(Some(vm)).await;
                             boot.release().await?;
                         }
                         Ok(())
@@ -2786,6 +3063,7 @@ mod tests {
         peer: JoinHandle<Result<()>>,
         guest: JoinHandle<Result<()>>,
         origin: Option<crate::vm::static_web::OriginPortLease>,
+        publish_origin: Option<Origin>,
     }
 
     /// Synthetic guest endpoint and independently configured host trust.
@@ -2901,6 +3179,17 @@ mod tests {
                 boot.release().await?;
                 anyhow::bail!("static fixture TLS proof failed");
             }
+            boot.publish_origin = Some(Origin {
+                generation: slots.disk.generation,
+                boot: crate::store::vm::new_id()?,
+                port: origin.port().try_into()?,
+                ca_path: artifacts.0.path("origin_ca", slots.disk.generation),
+                ca_receipt: crate::vm::paths::ArtifactPin {
+                    size: 1,
+                    sha256: [1; 32],
+                },
+                retired: Shutdown::default(),
+            });
             boot.origin = Some(origin);
             Ok(boot)
         }
@@ -2964,6 +3253,7 @@ mod tests {
                     peer,
                     guest,
                     origin: None,
+                    publish_origin: None,
                 }),
                 Err(_) => {
                     peer.await??;
@@ -2974,6 +3264,9 @@ mod tests {
         }
 
         async fn release(self) -> Result<()> {
+            if let Some(origin) = &self.publish_origin {
+                origin.retired.cancel();
+            }
             drop(self.qmp);
             drop(self.channel);
             self.peer.await??;
@@ -3363,6 +3656,218 @@ mod tests {
             }
         }
         files
+    }
+
+    #[tokio::test]
+    async fn cloudflare_publication_follows_foreground_policy_origin_and_dns() {
+        use crate::vm::runtime::publication::Fake;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let b = h.client(1).await;
+        let build = call(
+            &a,
+            "vm_template_build",
+            json!({
+                "recipe_id":hex::encode(WEB_RECIPE_ID), "request_id":key(601)
+            }),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(&a, &build).await["template_id"].clone();
+        let site = call(
+            &a,
+            "static_vm_create",
+            json!({
+                "name":"tunnel-site","template_id":template,"request_id":key(602)
+            }),
+        )
+        .await;
+        let vm = terminal(&a, &site).await["vm_id"].clone();
+        let clone = call(
+            &a,
+            "vm_create",
+            json!({
+                "template_id":template,"request_id":key(603)
+            }),
+        )
+        .await;
+        let test = terminal(&a, &clone).await["vm_id"].clone();
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let status = json!({"vm_id":vm});
+        assert_eq!(
+            call(&a, "publish_site", args(604)).await["reason"],
+            "public_sites_disabled"
+        );
+        let fake = Arc::new(Fake::default());
+        {
+            let supervisor = h.supervisor();
+            *supervisor.publisher.fake.lock().unwrap() = Some(fake.clone());
+            let mut gate = supervisor.gate.lock().unwrap();
+            gate.allow_agent_public_sites = true;
+            gate.publish_profile = Some(Arc::new(Profile::synthetic(
+                supervisor.host_id,
+                "wrong-site",
+            )));
+        }
+        assert_eq!(
+            call(&a, "publish_site", args(605)).await["reason"],
+            "publish_target_mismatch"
+        );
+        assert_eq!(
+            call(&b, "publish_status", status.clone()).await["reason"],
+            "not_found"
+        );
+        assert_eq!(
+            call(
+                &a,
+                "publish_site",
+                json!({"vm_id":test,"request_id":key(606)})
+            )
+            .await["reason"],
+            "not_found"
+        );
+        assert_eq!(
+            call(
+                &a,
+                "publish_site",
+                json!({
+                    "vm_id":vm,"request_id":key(607),"hostname":"injection.invalid"
+                })
+            )
+            .await["reason"],
+            "invalid"
+        );
+        {
+            let supervisor = h.supervisor();
+            supervisor.gate.lock().unwrap().publish_profile = Some(Arc::new(Profile::synthetic(
+                supervisor.host_id,
+                "tunnel-site",
+            )));
+        }
+        assert_eq!(
+            call(&a, "publish_site", args(608)).await["reason"],
+            "not_ready"
+        );
+        let start = call(&a, "vm_start", args(609)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            call(&a, "publish_site", args(610)).await["reason"],
+            "publish_credential_missing"
+        );
+        fake.credential.store(true, SeqCst);
+        fake.foreign.store(true, SeqCst);
+        let conflict = call(&a, "publish_site", args(611)).await;
+        let result = terminal(&a, &conflict).await;
+        assert_eq!(result["reason"], "dns_conflict", "{result}");
+        assert_eq!(fake.posts.load(SeqCst), 0);
+        assert!(!fake.local.load(SeqCst));
+        fake.foreign.store(false, SeqCst);
+
+        let published = call(&a, "publish_site", args(612)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert_eq!(
+            call(&a, "publish_status", status.clone()).await["phase"],
+            "published"
+        );
+        assert_eq!(call(&a, "publish_site", args(612)).await, published);
+        assert_eq!(
+            call(&a, "unpublish_site", args(612)).await["reason"],
+            "key_collision"
+        );
+        assert_eq!(fake.posts.load(SeqCst), 1);
+        assert!(fake.local.load(SeqCst));
+        let ingress = fake.ingress.lock().unwrap().clone().unwrap();
+        assert!(ingress.contains("hostname: 'publish.example.invalid'"));
+        assert!(ingress.contains("noTLSVerify: false"));
+        assert!(ingress.ends_with("  - service: http_status:404\n"));
+
+        fake.credential.store(false, SeqCst);
+        let revoke = call(&a, "unpublish_site", args(613)).await;
+        let result = terminal(&a, &revoke).await;
+        assert_eq!(result["state"], "failed");
+        assert!(!fake.local.load(SeqCst));
+        assert!(fake.record.load(SeqCst));
+        assert_eq!(
+            call(&a, "publish_status", status.clone()).await["phase"],
+            "cleanup_pending"
+        );
+
+        fake.credential.store(true, SeqCst);
+        let revoke = call(&a, "unpublish_site", args(614)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        assert_eq!(fake.deletes.load(SeqCst), 1);
+        assert_eq!(
+            call(&a, "publish_status", status.clone()).await["phase"],
+            "unpublished"
+        );
+        let repeated = call(&a, "unpublish_site", args(615)).await;
+        assert_eq!(terminal(&a, &repeated).await["state"], "succeeded");
+        assert_eq!(fake.deletes.load(SeqCst), 1);
+
+        // Stop must terminate the local connector even if the Cloudflare
+        // POST cannot return. An observed owned record is reconciled once.
+        let (entered, in_post) = tokio::sync::oneshot::channel();
+        let (_release, hold) = tokio::sync::oneshot::channel();
+        *fake.post_gate.lock().unwrap() = Some((entered, hold));
+        let pending = call(&a, "publish_site", args(616)).await;
+        tokio::time::timeout(Duration::from_secs(2), in_post)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            call(&a, "publish_status", status.clone()).await["phase"],
+            "publishing"
+        );
+        let stop = call(&a, "vm_stop", args(617)).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        assert_eq!(terminal(&a, &pending).await["state"], "failed");
+        assert!(!fake.local.load(SeqCst));
+        assert_eq!(fake.deletes.load(SeqCst), 2);
+        assert_eq!(
+            call(&a, "publish_status", status.clone()).await["phase"],
+            "unpublished"
+        );
+
+        let start = call(&a, "vm_start", args(618)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let published = call(&a, "publish_site", args(619)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        fake.health.store(1, SeqCst);
+        h.tick().await;
+        let exited = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row = call(&a, "publish_status", status.clone()).await;
+                if row["phase"] == "unpublished" {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(exited["reason"], "connector_exited");
+        assert_eq!(fake.deletes.load(SeqCst), 3);
+        assert!(!fake.local.load(SeqCst));
+        let audit = call(&a, "list_activity", json!({"limit":50}))
+            .await
+            .to_string();
+        for secret in [
+            "publish.example.invalid",
+            "dns.dpapi",
+            &"b".repeat(32),
+            &"e".repeat(32),
+        ] {
+            assert!(!audit.contains(secret));
+        }
+        for tool in ["static_vm_delete", "backup_delete"] {
+            assert_eq!(
+                call(&a, tool, status.clone()).await["reason"],
+                "static_delete_forbidden"
+            );
+        }
+        h.shutdown().await.unwrap();
     }
 
     #[tokio::test]

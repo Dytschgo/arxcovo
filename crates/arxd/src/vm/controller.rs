@@ -1299,6 +1299,7 @@ pub(crate) struct ActivityReceipt {
     pub started_ms: i64,
     pub finished_ms: Option<i64>,
     pub cleanup: Option<bool>,
+    pub publication_failure: Option<FailureReason>,
 }
 
 impl<C: Clock> VmController<C> {
@@ -1348,7 +1349,8 @@ impl<C: Clock> VmController<C> {
         self.store.transact(|db| {
             let mut query = db.prepare(
                 "SELECT a.id,a.action,a.status,a.reason,a.vm,o.operation_id,
-                        a.started_ms,a.finished_ms,a.cleanup_confirmed
+                        a.started_ms,a.finished_ms,a.cleanup_confirmed,
+                        a.publication_failure
                    FROM activity a LEFT JOIN vm_operations o ON o.activity_id=a.id
                    WHERE a.principal=?1 AND a.actor='agent'
                      AND (?2 IS NULL OR a.id<?2) AND (?3 IS NULL OR a.id=?3)
@@ -1365,6 +1367,10 @@ impl<C: Clock> VmController<C> {
                     started_ms: row.get(6)?,
                     finished_ms: row.get(7)?,
                     cleanup: row.get(8)?,
+                    publication_failure: row
+                        .get::<_, Option<i64>>(9)?
+                        .map(FailureReason::from_code)
+                        .transpose()?,
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1781,3 +1787,175 @@ impl<C: Clock> VmController<C> {
 
 /// Bound for one static release proof inside a reaper turn.
 const STATIC_RELEASE_BUDGET: Duration = Duration::from_secs(1);
+
+impl<C: Clock> VmController<C> {
+    pub(crate) fn publication_intent(&self) -> Result<Option<store::publish::Intent>> {
+        self.store.transact(|db| store::publish::current(db))
+    }
+
+    pub(crate) fn publication_status(
+        &self,
+        principal: &str,
+        vm: Id,
+    ) -> Result<Result<store::publish::SiteStatus, Refusal>> {
+        self.store.transact(|db| {
+            if store::static_vm::rows(db, principal, Some(vm), None, 1)?.is_empty() {
+                return Ok(Err(Refusal::NotFound));
+            }
+            if let Some(intent) = store::publish::current(db)?.filter(|intent| intent.vm == vm) {
+                return Ok(Ok(store::publish::SiteStatus {
+                    phase: Some(intent.phase),
+                    reason: intent.reason,
+                }));
+            }
+            let reason = db
+                .query_row(
+                    "SELECT publication_failure FROM vm_static_instances WHERE id=?1",
+                    [vm],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?
+                .map(FailureReason::from_code)
+                .transpose()?;
+            Ok(Ok(store::publish::SiteStatus {
+                phase: None,
+                reason,
+            }))
+        })
+    }
+
+    pub(crate) fn admit_publication(
+        &self,
+        principal: &str,
+        key: RequestId,
+        vm: Id,
+        intent: Option<(&store::publish::Intent, &super::static_web::StaticName)>,
+    ) -> Result<Result<OperationRef, Refusal>> {
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        let now = utc(self.clock.now())?;
+        let action = if intent.is_some() {
+            PUBLISH_ACTION
+        } else {
+            UNPUBLISH_ACTION
+        };
+        let binding = store::Binding {
+            principal,
+            key,
+            subject: Subject::Vm(vm),
+            action,
+        };
+        map_full(self.store.transact(|db| {
+            match binding.replay(db, now, gate.closed)? {
+                Err(reason) => return Ok(Err(reason)),
+                Ok(Some(replay)) => return Ok(Ok(replay.operation)),
+                Ok(None) => {}
+            }
+            let mut rows = store::static_vm::rows(db, principal, Some(vm), None, 1)?;
+            let Some(row) = rows.pop() else {
+                return Ok(Err(Refusal::NotFound));
+            };
+            if store::count(
+                db,
+                "SELECT count(*) FROM activity WHERE status=0 AND actor='agent'",
+                [],
+            )? >= store::MAX_CALLER_PENDING
+            {
+                return Ok(Err(Refusal::PendingFull));
+            }
+            let current = store::publish::current(db)?;
+            if let Some((intent, name)) = intent {
+                if current.is_some() {
+                    return Ok(Err(Refusal::PublishCleanupPending));
+                }
+                if row.name != *name {
+                    return Ok(Err(Refusal::PublishTargetMismatch));
+                }
+                if row.state != StaticState::Running
+                    || store::count(
+                        db,
+                        "SELECT count(*) FROM activity WHERE vm=?1 AND status=0",
+                        [vm],
+                    )? != 0
+                {
+                    return Ok(Err(Refusal::NotReady));
+                }
+                store::publish::reserve(db, intent)?;
+            } else if let Some(current) = current.filter(|intent| intent.vm == vm) {
+                store::publish::update(
+                    db,
+                    &current.nonce,
+                    store::publish::Update::Phase(store::publish::Phase::Revoking, None),
+                )?;
+            }
+            if intent.is_none() {
+                db.execute(
+                    "UPDATE vm_static_instances SET publication_failure=NULL WHERE id=?1",
+                    [vm],
+                )?;
+            }
+            let operation = binding.record(db, now, Some(vm), None)?;
+            store::require_headroom(db)?;
+            Ok(Ok(operation))
+        }))
+    }
+
+    pub(crate) fn update_publication(
+        &self,
+        nonce: &str,
+        update: store::publish::Update<'_>,
+    ) -> Result<()> {
+        self.store
+            .transact(|db| store::publish::update(db, nonce, update))
+    }
+
+    pub(crate) fn reconcile_publication(
+        &self,
+        intent: &store::publish::Intent,
+        update: store::publish::Update<'_>,
+        reason: Option<FailureReason>,
+        released: bool,
+    ) -> Result<()> {
+        self.store.transact(|db| {
+            store::publish::update(db, &intent.nonce, update)?;
+            // One daemon receipt for loss or a completed reconciliation.
+            // Retry turns with unchanged pending cleanup cannot fill the audit.
+            if released || intent.phase == store::publish::Phase::Published {
+                let now = utc(self.clock.now())?;
+                db.execute(
+                    "INSERT INTO activity(principal,actor,vm_owner,vm,action,started_ms,
+                       status,finished_ms,terminal_order,cleanup_confirmed,publication_failure)
+                     SELECT 'arxd','daemon',principal,id,17,?2,?3,?2,
+                         (SELECT coalesce(max(terminal_order),0)+1 FROM activity),?4,?5
+                     FROM vm_static_instances WHERE id=?1",
+                    params![
+                        intent.vm,
+                        now,
+                        if released { 1 } else { 2 },
+                        released,
+                        reason.map(|value| value as i64)
+                    ],
+                )?;
+                store::prune(db)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn finish_publication(
+        &self,
+        operation: OperationRef,
+        update: Option<(&str, store::publish::Update<'_>)>,
+        failure: Option<FailureReason>,
+        cleanup: Option<bool>,
+    ) -> Result<()> {
+        let now = utc(self.clock.now())?;
+        self.store.transact(|db| {
+            if let Some((nonce, update)) = update {
+                store::publish::update(db, nonce, update)?;
+            }
+            store::publish::finish(db, operation.receipt.activity_id, now, failure, cleanup)
+        })
+    }
+}

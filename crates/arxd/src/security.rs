@@ -165,3 +165,51 @@ pub fn private(path: &Path) -> Result<()> {
         result
     }
 }
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn unprotect_current_user(
+    ciphertext: &mut [u8],
+    max: usize,
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::Cryptography::{
+            CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
+        },
+    };
+    use zeroize::Zeroize;
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(ciphertext.len())?,
+        pbData: ciphertext.as_mut_ptr(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    // DPAPI allocates the output and transfers ownership on success.
+    let ok = unsafe {
+        CryptUnprotectData(
+            &input,
+            null_mut(),
+            null(),
+            null(),
+            null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 || output.pbData.is_null() {
+        bail!("publication credential unavailable");
+    }
+    // Bound the copy and clear the DPAPI allocation on every successful decrypt.
+    unsafe {
+        let bytes = std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize);
+        let result = if !bytes.is_empty() && bytes.len() <= max {
+            Ok(zeroize::Zeroizing::new(bytes.to_vec()))
+        } else {
+            Err(anyhow::anyhow!("publication credential unavailable"))
+        };
+        bytes.zeroize();
+        LocalFree(output.pbData.cast());
+        result
+    }
+}

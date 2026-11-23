@@ -280,7 +280,7 @@ impl Process {
             .collect::<Vec<_>>()
             .join(" ");
         let mut command = wide(OsStr::new(&command));
-        let mut env = connector_environment(credential)?;
+        let env = zeroize::Zeroizing::new(connector_environment(credential)?);
         let image = wide(executable.as_os_str());
         let cwd = wide(cwd.as_os_str());
         let mut startup = STARTUPINFOEXW::default();
@@ -309,7 +309,6 @@ impl Process {
                 &mut info,
             )
         };
-        env.fill(0);
         ok(status)?;
         let process = owned(info.hProcess)?;
         let thread = owned(info.hThread)?;
@@ -396,4 +395,59 @@ unsafe extern "system" {
         class: i32,
         reserved: u32,
     ) -> u32;
+}
+
+/// Load one DPAPI ciphertext through retained, non-aliasing custody.
+pub(in crate::vm) fn read_secret(
+    path: &Path,
+    limit: usize,
+) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    use std::io::Read;
+    let _root = HeldPath::open(path.parent().ok_or_else(refuse)?, true, true)?;
+    let held = HeldPath::open(path, false, true)?;
+    let mut encrypted = Vec::new();
+    (&held.file).take(16_385).read_to_end(&mut encrypted)?;
+    if encrypted.len() > 16_384 {
+        return Err(refuse());
+    }
+    crate::security::unprotect_current_user(&mut encrypted, limit).map_err(|_| refuse())
+}
+
+/// Native DNS uses the Windows HTTPS trust store and never uses the origin CA.
+pub(in crate::vm) fn public_roots() -> io::Result<rustls::RootCertStore> {
+    use windows_sys::Win32::Security::Cryptography::*;
+    let store = unsafe { CertOpenSystemStoreW(0, windows_sys::w!("ROOT")) };
+    if store.is_null() {
+        return Err(refuse());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let mut previous = null();
+    let mut count = 0;
+    loop {
+        // Enumeration frees the previous context. The final store close
+        // releases the store even when its bounded admission check fails.
+        let cert = unsafe { CertEnumCertificatesInStore(store, previous) };
+        if cert.is_null() {
+            break;
+        }
+        count += 1;
+        if count > 1024 {
+            unsafe { CertFreeCertificateContext(cert) };
+            roots.roots.clear();
+            break;
+        }
+        let context = unsafe { &*cert };
+        if !context.pbCertEncoded.is_null() && (1..=16_384).contains(&context.cbCertEncoded) {
+            let der = unsafe {
+                std::slice::from_raw_parts(context.pbCertEncoded, context.cbCertEncoded as usize)
+            };
+            let _ = roots.add(rustls::pki_types::CertificateDer::from(der));
+        }
+        previous = cert;
+    }
+    let closed = unsafe { CertCloseStore(store, 0) };
+    if closed == 0 || roots.is_empty() {
+        return Err(refuse());
+    }
+    Ok(roots)
 }

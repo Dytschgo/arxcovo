@@ -1,44 +1,14 @@
-//! Internal publication primitives. Admission and durable effect tracking are wired in B2.
-#![allow(dead_code)] // B1 is intentionally unreachable from production entry points.
+//! Typed Cloudflare binding and connector primitives.
+#![cfg_attr(
+    not(all(windows, target_arch = "x86_64")),
+    allow(dead_code, reason = "native connector is Windows x64 only")
+)]
 
 pub(super) mod cloudflare;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(super) mod connector;
 #[cfg(all(windows, target_arch = "x86_64"))]
-mod windows;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) enum AgentPublishing {
-    #[default]
-    Disabled,
-    Enabled,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Refusal {
-    Disabled,
-    CredentialMissing,
-    StaticVmUnhealthy,
-    HostnameMissing,
-}
-
-pub(super) fn admit(
-    owner_policy: AgentPublishing,
-    credential_present: bool,
-    static_vm_healthy: bool,
-    hostname: Option<&Hostname>,
-) -> Result<(), Refusal> {
-    if owner_policy == AgentPublishing::Disabled {
-        return Err(Refusal::Disabled);
-    }
-    if !credential_present {
-        return Err(Refusal::CredentialMissing);
-    }
-    if !static_vm_healthy {
-        return Err(Refusal::StaticVmUnhealthy);
-    }
-    hostname.ok_or(Refusal::HostnameMissing).map(|_| ())
-}
+pub(super) mod windows;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct InvalidInput;
@@ -105,4 +75,23 @@ impl TunnelId {
     pub(super) fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Render the complete closed YAML grammar. Hostnames and tunnel identity
+/// have already passed their typed parsers, and the CA path has been pinned.
+pub(super) fn ingress(
+    tunnel: &TunnelId,
+    hostnames: &[Hostname; 1],
+    port: std::num::NonZeroU16,
+    origin: &Hostname,
+    ca: &str,
+) -> String {
+    format!(
+        "tunnel: '{}'\nwarp-routing:\n  enabled: false\ningress:\n  - hostname: '{}'\n    service: 'https://127.0.0.1:{}'\n    originRequest:\n      originServerName: '{}'\n      caPool: '{}'\n      noTLSVerify: false\n  - service: http_status:404\n",
+        tunnel.as_str(),
+        hostnames[0].as_str(),
+        port,
+        origin.as_str(),
+        ca,
+    )
 }

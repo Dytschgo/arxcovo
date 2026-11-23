@@ -109,7 +109,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 9;
+const VM_SCHEMA_VERSION: u32 = 10;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -473,6 +473,9 @@ CREATE TRIGGER vm_static_disjoint BEFORE INSERT ON vm_static_instances
       OR EXISTS(SELECT 1 FROM vm_tombstones WHERE id=NEW.id)
     BEGIN SELECT RAISE(ABORT,'occupied VM identity'); END;";
 
+#[path = "vm_publish.rs"]
+pub(crate) mod publish;
+
 #[path = "vm_static.rs"]
 pub(crate) mod static_vm;
 
@@ -525,7 +528,7 @@ impl VmStore {
         check_size(&db)?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
-            matches!(version, 0 | 5 | 6 | 7 | 8 | VM_SCHEMA_VERSION),
+            matches!(version, 0 | 5 | 6 | 7 | 8 | 9 | VM_SCHEMA_VERSION),
             "unsupported VM state version"
         );
         let replace = matches!(version, 0 | 5);
@@ -562,8 +565,11 @@ impl VmStore {
         if version < 8 {
             tx.execute_batch(MIGRATE_V8)?;
         }
-        if upgrade {
+        if version < 9 {
             tx.execute_batch(MIGRATE_V9)?;
+        }
+        if version < 10 {
+            tx.execute_batch(publish::MIGRATE_V10)?;
         }
         recover(&tx, now)?;
         check_size(&tx)?;
@@ -1096,7 +1102,7 @@ fn finish_with_script(
     prune(db)
 }
 
-fn prune(db: &Connection) -> Result<()> {
+pub(crate) fn prune(db: &Connection) -> Result<()> {
     db.execute(
         "DELETE FROM activity WHERE id IN
          (SELECT id FROM activity WHERE status<>0
@@ -1287,6 +1293,8 @@ pub(crate) fn operation_status(
                     8 => ("extend", None),
                     11 => ("template_build", Some("staging")),
                     12 => ("static_create", Some("cloning")),
+                    15 => ("publish", Some("publishing")),
+                    16 => ("unpublish", Some("revoking")),
                     _ => return Err(rusqlite::Error::InvalidQuery),
                 };
                 let script = match row.get::<_, Option<String>>(6)?.as_deref() {
@@ -1817,6 +1825,7 @@ pub(crate) fn recover(db: &Connection, now: i64) -> Result<()> {
     abandon_inactive(db, None)?;
     classify_abandoned_builds(db, None)?;
     static_vm::recover(db, now)?;
+    publish::recover(db, now)?;
     db.execute("UPDATE vm_instances SET state=4 WHERE state=0", [])?;
     let mut stmt = db.prepare(
         "SELECT id FROM vm_instances WHERE state IN (1,2)
@@ -2907,6 +2916,35 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn v10_keeps_v9_activity_replay_and_static_generation() {
+        let dir = private_temp();
+        let db = v6_fixture(dir.path());
+        db.execute_batch(MIGRATE_V7).unwrap();
+        db.execute_batch(MIGRATE_V8).unwrap();
+        db.execute_batch(MIGRATE_V9).unwrap();
+        let vm = [0x72; 16];
+        let slots = static_fixture(&db, vm, "upgrade-site").unwrap();
+        commit_static(&db, vm, slots, 1).unwrap();
+        db.execute_batch(
+            "UPDATE sqlite_sequence SET seq=900 WHERE name='activity'; PRAGMA user_version=9;",
+        )
+        .unwrap();
+        let ledger = ledger_ids(&db).unwrap();
+        drop(db);
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store.transact(|db| {
+            assert_eq!(count(db, "PRAGMA user_version", [])?, 10);
+            assert_eq!(ledger_ids(db)?, ledger);
+            assert_eq!(static_vm::owned_state(db, "alice", vm)?, Some(StaticState::Stopped));
+            assert_eq!(count(db, "SELECT count(*) FROM vm_publication", [])?, 0);
+            assert_eq!(count(db, "SELECT count(*) FROM vm_static_instances WHERE publication_failure IS NULL", [])?, 1);
+            assert_eq!(count(db, "SELECT seq FROM sqlite_sequence WHERE name='activity'", [])?, 900);
+            assert_eq!(count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?, 0);
+            Ok(())
+        }).unwrap();
     }
 
     #[test]

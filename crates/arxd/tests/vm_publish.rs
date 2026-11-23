@@ -1,6 +1,9 @@
 //! Fake-backed publication controls. All sockets are IPv4 loopback.
 
 #[cfg(all(windows, target_arch = "x86_64"))]
+use arxd::service;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
 #[allow(dead_code)]
 #[path = "../src/security.rs"]
 mod security;
@@ -8,6 +11,10 @@ mod security;
 mod vm {
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub use arxd::vm::paths;
+    #[allow(
+        dead_code,
+        reason = "compile the private B1 transport against loopback fixtures"
+    )]
     #[path = "publish/mod.rs"]
     mod publish;
 
@@ -24,7 +31,7 @@ mod vm {
         response::{IntoResponse, Response},
     };
     use publish::{
-        AgentPublishing, Hostname, Refusal, TunnelId, admit,
+        Hostname, TunnelId,
         cloudflare::{CloudflareDns, DnsApi, DnsBearer, DnsError, Reconciled, Removal, Route},
     };
     use serde_json::{Value, json};
@@ -47,27 +54,8 @@ mod vm {
     const LEG: Duration = Duration::from_millis(1500);
 
     #[test]
-    fn owner_policy_and_all_publish_preconditions_fail_closed() {
-        use AgentPublishing::{Disabled, Enabled};
-        let name = Hostname::parse(NAME).unwrap();
-        assert_eq!(AgentPublishing::default(), Disabled);
-        assert_eq!(
-            admit(Disabled, true, true, Some(&name)),
-            Err(Refusal::Disabled)
-        );
-        assert_eq!(
-            admit(Enabled, false, true, Some(&name)),
-            Err(Refusal::CredentialMissing)
-        );
-        assert_eq!(
-            admit(Enabled, true, false, Some(&name)),
-            Err(Refusal::StaticVmUnhealthy)
-        );
-        assert_eq!(
-            admit(Enabled, true, true, None),
-            Err(Refusal::HostnameMissing)
-        );
-        assert_eq!(admit(Enabled, true, true, Some(&name)), Ok(()));
+    fn hostname_binding_accepts_only_exact_dns_names() {
+        assert!(Hostname::parse(NAME).is_ok());
         for invalid in [
             "*.example.com",
             "127.0.0.1",
@@ -812,6 +800,41 @@ mod vm {
             json!({"AccountTag": ZONE, "TunnelID": TUNNEL, "TunnelSecret": FAKE_SECRET}).to_string()
         }
 
+        fn encrypt_fixture(value: String) -> Vec<u8> {
+            use std::ptr::{null, null_mut};
+            use windows_sys::Win32::{
+                Foundation::LocalFree,
+                Security::Cryptography::{
+                    CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
+                },
+            };
+            let mut value = value.into_bytes();
+            let input = CRYPT_INTEGER_BLOB {
+                cbData: value.len() as u32,
+                pbData: value.as_mut_ptr(),
+            };
+            let mut output = CRYPT_INTEGER_BLOB::default();
+            unsafe {
+                assert_ne!(
+                    CryptProtectData(
+                        &input,
+                        null(),
+                        null(),
+                        null(),
+                        null(),
+                        CRYPTPROTECT_UI_FORBIDDEN,
+                        &mut output,
+                    ),
+                    0,
+                    "synthetic DPAPI encryption failed"
+                );
+                let ciphertext =
+                    std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+                LocalFree(output.pbData.cast());
+                ciphertext
+            }
+        }
+
         /// The previous DACL-only setup under the creating token's default owner. Where that
         /// owner differs from TokenUser, as on an elevated hosted runner, this is the red leg:
         /// the DACL passes, the owner differs and the real loader refuses. Assigning the same
@@ -820,7 +843,7 @@ mod vm {
             let tunnel = TunnelId::parse(TUNNEL).unwrap();
             protect_fixture(root);
             let leaf = root.join("credential.json");
-            fs::write(&leaf, credential_json()).unwrap();
+            fs::write(&leaf, encrypt_fixture(credential_json())).unwrap();
             let token_owner_is_user = token_owner_is_user();
             let (owner_is_user, owner_is_admins) = owner_of(&leaf);
             let private = crate::security::private(&leaf).is_ok();
@@ -922,7 +945,7 @@ mod vm {
             let hostname = Hostname::parse(NAME).unwrap();
             let tunnel = TunnelId::parse(TUNNEL).unwrap();
             let credential_path = root.join("credential.json");
-            fs::write(&credential_path, credential_json()).unwrap();
+            fs::write(&credential_path, encrypt_fixture(credential_json())).unwrap();
             for (label, path) in [
                 ("fixture root", root),
                 ("fake executable", binary.as_path()),
@@ -998,12 +1021,13 @@ mod vm {
             assert_owned("generated ingress config", Path::new(fields[2]));
             let config = fs::read_to_string(fields[2]).unwrap();
             assert!(!config.contains(FAKE_SECRET));
-            // Verification is the connector default; the key is absent, never written as false.
-            assert!(!config.contains("noTLSVerify"));
-            assert!(config.contains(&format!("originServerName: '{ORIGIN_NAME}'")));
-            assert!(config.contains(&format!("caPool: '{}'", ca_path.display())));
-            assert!(config.contains(&format!("https://127.0.0.1:{origin_port}")));
-            assert!(config.ends_with("http_status:404\n"));
+            assert_eq!(
+                config,
+                format!(
+                    "tunnel: '{TUNNEL}'\nwarp-routing:\n  enabled: false\ningress:\n  - hostname: '{NAME}'\n    service: 'https://127.0.0.1:{origin_port}'\n    originRequest:\n      originServerName: '{ORIGIN_NAME}'\n      caPool: '{}'\n      noTLSVerify: false\n  - service: http_status:404\n",
+                    ca_path.display(),
+                )
+            );
 
             let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
             assert!(!process.is_null());
