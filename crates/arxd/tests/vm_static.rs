@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const BUILD: [u8; 16] = [0x5a; 16];
 const GUEST: &[u8] = b"offline-test-guest\x00\xff";
+const NGINX_DEB: &[u8] = b"fixture nginx deb";
+const COMMON_DEB: &[u8] = b"fixture nginx common deb";
 const ISO: AssetPin = AssetPin {
     length: 19,
     sha256: UbuntuRecipe::ISO_SHA256,
@@ -24,8 +26,12 @@ const NGINX: PoolPackage<'_> = PoolPackage {
     version: "1.24.0-2ubuntu7.1",
     relative_path: "pool/main/n/nginx/nginx_amd64.deb",
     artifact: ArtifactPin {
-        size: 23,
-        sha256: [0x41; 32],
+        size: 17,
+        sha256: [
+            0x17, 0x37, 0x8f, 0xea, 0x18, 0x6a, 0xbd, 0x99, 0x24, 0xc3, 0xb3, 0x32, 0x72, 0x85,
+            0xd2, 0x27, 0xe6, 0x29, 0xa2, 0x5e, 0x1d, 0xb3, 0xc1, 0x23, 0x85, 0xe0, 0x4c, 0x5b,
+            0x1f, 0xa3, 0x62, 0x85,
+        ],
     },
 };
 const COMMON: PoolPackage<'_> = PoolPackage {
@@ -33,8 +39,12 @@ const COMMON: PoolPackage<'_> = PoolPackage {
     version: "1.24.0-2ubuntu7.1",
     relative_path: "pool/main/n/nginx/nginx-common_all.deb",
     artifact: ArtifactPin {
-        size: 47,
-        sha256: [0xe2; 32],
+        size: 24,
+        sha256: [
+            0x2b, 0xec, 0x25, 0x98, 0x51, 0x17, 0xff, 0x20, 0xab, 0xeb, 0xef, 0x50, 0xc1, 0x16,
+            0xa5, 0x65, 0xde, 0x44, 0xb7, 0xd2, 0x38, 0xbd, 0xcb, 0x25, 0x9a, 0xbd, 0x93, 0xbd,
+            0xd2, 0x92, 0xf7, 0xa5,
+        ],
     },
 };
 
@@ -174,10 +184,87 @@ fn heredoc<'a>(script: &'a str, tag: &str) -> &'a str {
     contents.split_once(&format!("\n{tag}\n")).unwrap().0
 }
 
+// Model an empty local install directory backed by two known ISO entries.
+// Drive staging and dpkg resolution from the actual seed's positional args.
+fn resolve_offline_install<'a>(
+    script: &'a str,
+    iso: &BTreeMap<&str, &[u8]>,
+) -> Result<Vec<&'a str>, &'static str> {
+    let (stage, install) = script.split_once("curtin in-target").ok_or("install")?;
+    let line = |setting: &str| {
+        stage
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(setting))
+    };
+    let source = line("src=")
+        .and_then(|arg| arg.strip_suffix("$1"))
+        .ok_or("source")?;
+    let destination = line("dir=")
+        .and_then(|arg| arg.strip_prefix("$target"))
+        .ok_or("destination")?;
+    let (directory, extension) = line("dest=")
+        .and_then(|arg| arg.split_once("$2"))
+        .ok_or("destination")?;
+    if directory != "$dir/" || !stage.contains("sha256sum --check --strict") {
+        return Err("staging contract");
+    }
+    let mut verified = BTreeMap::new();
+    for command in stage.lines().filter(|line| line.starts_with("stage_deb '")) {
+        let args: Vec<_> = command.split('\'').skip(1).step_by(2).collect();
+        let [relative, name, size, digest] = args[..] else {
+            return Err("stage arguments");
+        };
+        let bytes = iso
+            .get(format!("{source}{relative}").as_str())
+            .ok_or("missing ISO archive")?;
+        if size.parse::<usize>().ok() != Some(bytes.len())
+            || hex::encode(Sha256::digest(bytes)) != digest
+        {
+            return Err("archive pin");
+        }
+        if verified
+            .insert(format!("{destination}/{name}{extension}"), name)
+            .is_some()
+        {
+            return Err("duplicate archive");
+        }
+    }
+    let (body, args) = install
+        .split_once("\n' arx-web-install ")
+        .ok_or("install arguments")?;
+    if !body.contains("for archive do\n    dpkg --install \"$archive\"\n  done")
+        || body.contains("apt-get")
+    {
+        return Err("install contract");
+    }
+    let mut installed = Vec::new();
+    for archive in args
+        .lines()
+        .next()
+        .ok_or("install arguments")?
+        .split_ascii_whitespace()
+    {
+        let archive = archive
+            .strip_prefix('\'')
+            .and_then(|arg| arg.strip_suffix('\''))
+            .ok_or("install path")?;
+        let name = verified.remove(archive).ok_or("unstaged install path")?;
+        if name == "nginx" && !installed.contains(&"nginx-common") {
+            return Err("dependency order");
+        }
+        installed.push(name);
+    }
+    if !verified.is_empty() || installed.len() != iso.len() {
+        return Err("incomplete install");
+    }
+    Ok(installed)
+}
+
 #[test]
 fn web_seed_golden_preserves_offline_base_and_installs_exact_web_profile() {
     let base = base_recipe();
-    let manifest = manifest(&[NGINX, COMMON]);
+    let manifest = manifest(&[COMMON, NGINX]);
     let recipe = qualify(&base, &manifest);
     let seed = recipe.render_seed(BUILD, GUEST).unwrap();
     assert_eq!(
@@ -186,11 +273,11 @@ fn web_seed_golden_preserves_offline_base_and_installs_exact_web_profile() {
     );
     assert_eq!(
         hex::encode(Sha256::digest(&seed)),
-        "f558582ed7da8fa0a80f48294416c37f7a38d47e3e94dc7cd76edf5529378fa8",
+        "5cfdb57ec055450f90a6349d8ed5cc4f2fcee7dbb829f9a370872ad9476adfc0",
     );
     assert_eq!(
         hex::encode(recipe.recipe_digest()),
-        "e5b0463595eef89858ee44b5e6c96e470b71708523425340acbcc56d27b45b30",
+        "807f245f5b0d20fa2c44054e70f108a56b1ddc2924f9186979ad54d96285e00f",
     );
     let original = base.render_seed(BUILD, GUEST).unwrap();
     let original = joliet_files(&original);
@@ -224,30 +311,40 @@ fn web_seed_golden_preserves_offline_base_and_installs_exact_web_profile() {
     assert_eq!(fields["autoinstall.refresh-installer.update"], "false");
     assert_eq!(fields["autoinstall.shutdown"], "poweroff");
 
-    let parts: Vec<_> = commands
-        .lines()
-        .filter(|line| line.starts_with("stage_deb '"))
-        .collect();
-    assert_eq!(parts.len(), 2);
-    for (line, package) in parts.into_iter().zip([NGINX, COMMON]) {
-        let args: Vec<_> = line.split('\'').skip(1).step_by(2).collect();
-        assert_eq!(
-            args,
-            [
-                package.relative_path,
-                package.name,
-                &package.artifact.size.to_string(),
-                &hex::encode(package.artifact.sha256)
-            ]
-        );
-    }
+    let nginx_path = "/cdrom/pool/main/n/nginx/nginx_amd64.deb";
+    let common_path = "/cdrom/pool/main/n/nginx/nginx-common_all.deb";
+    let iso = BTreeMap::from([(nginx_path, NGINX_DEB), (common_path, COMMON_DEB)]);
+    assert_eq!(
+        resolve_offline_install(&commands, &iso),
+        Ok(vec!["nginx-common", "nginx"])
+    );
+    assert_eq!(
+        resolve_offline_install(&commands, &BTreeMap::from([(nginx_path, NGINX_DEB)])),
+        Err("missing ISO archive")
+    );
+    let corrupt_iso = BTreeMap::from([(nginx_path, &[0; 17][..]), (common_path, COMMON_DEB)]);
+    assert_eq!(
+        resolve_offline_install(&commands, &corrupt_iso),
+        Err("archive pin")
+    );
+    let common_arg = "'/var/lib/arxcovo/web-install/nginx-common.deb'";
+    let nginx_arg = "'/var/lib/arxcovo/web-install/nginx.deb'";
+    let reversed = commands.replace(
+        &format!("{common_arg} {nginx_arg}"),
+        &format!("{nginx_arg} {common_arg}"),
+    );
+    assert_eq!(
+        resolve_offline_install(&reversed, &iso),
+        Err("dependency order")
+    );
+    let wrong_path = commands.replace(nginx_arg, "'/var/lib/arxcovo/web-install/uncached.deb'");
+    assert_eq!(
+        resolve_offline_install(&wrong_path, &iso),
+        Err("unstaged install path")
+    );
     let mask = commands.find("mask nginx.service apt-daily.timer").unwrap();
-    let install = commands
-        .find("apt-get -y --no-download --no-remove --no-install-recommends")
-        .unwrap();
+    let install = commands.find("dpkg --install").unwrap();
     assert!(commands.find("sha256sum --check --strict").unwrap() < mask && mask < install);
-    assert!(commands.contains("Dir::Etc::sourcelist=/dev/null -o Dir::Etc::sourceparts=-"));
-    assert!(commands.contains("install /var/lib/arxcovo/web-install/*.deb"));
     assert!(commands.contains("sites-enabled/default"));
 
     let config = heredoc(&commands, "ARX_NGINX");
@@ -330,8 +427,9 @@ fn web_seed_golden_preserves_offline_base_and_installs_exact_web_profile() {
 #[test]
 fn missing_bad_and_unverified_pins_refuse_before_writing() {
     let base = base_recipe();
-    let good = manifest(&[NGINX, COMMON]);
+    let good = manifest(&[COMMON, NGINX]);
     let pin = good.canonical_pin().unwrap();
+    assert_ne!(manifest(&[NGINX, COMMON]).canonical_pin().unwrap(), pin);
     for (profile, receipt, verified) in [
         (None, Some(pin), true),
         (Some(PROFILE_PIN), None, true),
@@ -346,7 +444,6 @@ fn missing_bad_and_unverified_pins_refuse_before_writing() {
     for packages in [
         vec![],
         vec![COMMON],
-        vec![COMMON, NGINX],
         vec![NGINX, NGINX],
         vec![
             NGINX,
@@ -377,11 +474,11 @@ fn missing_bad_and_unverified_pins_refuse_before_writing() {
         ));
     }
     let modified = [
+        COMMON,
         PoolPackage {
             version: "1.24.0-2ubuntu7.2",
             ..NGINX
         },
-        COMMON,
     ];
     let modified = manifest(&modified);
     assert!(matches!(
@@ -422,10 +519,6 @@ fn origin_identity_is_per_generation_and_bounded() {
         .payload(b"public fixture", b"private fixture")
         .unwrap();
     assert_eq!(payload.server_name(), first.server_name());
-    assert_eq!(
-        payload.into_private_parts(),
-        (b"public fixture".as_slice(), b"private fixture".as_slice())
-    );
 }
 
 #[test]

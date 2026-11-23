@@ -12,11 +12,11 @@ const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 
 pub const RECIPE_ID: &str = "ubuntu-noble-amd64-web-v1";
 pub const PROFILE_PIN: ArtifactPin = ArtifactPin {
-    size: 3595,
+    size: 3487,
     sha256: [
-        0x05, 0xe1, 0x3e, 0x47, 0x80, 0xab, 0x93, 0xd3, 0x6f, 0x0b, 0x1e, 0xb2, 0x4c, 0xd2, 0xd5,
-        0xc1, 0xa8, 0xec, 0x3b, 0x13, 0x92, 0xcc, 0xee, 0x6c, 0x3d, 0x57, 0xc2, 0x2b, 0xea, 0x25,
-        0xa5, 0x71,
+        0x80, 0x2b, 0x3a, 0x19, 0xb2, 0x0c, 0x88, 0x93, 0x06, 0x97, 0x47, 0xaf, 0xeb, 0xe5, 0xea,
+        0x3d, 0x5d, 0x3a, 0xc5, 0xd7, 0xf7, 0xeb, 0x2a, 0xc5, 0x4c, 0xd2, 0xd6, 0x4c, 0xb1, 0x8a,
+        0xc0, 0xb2,
     ],
 };
 
@@ -35,7 +35,7 @@ pub struct IsoPoolManifest<'a> {
     pub iso: AssetPin,
     /// Upstream signed archive metadata and package index evidence.
     pub signed_metadata: ArtifactPin,
-    /// Strictly ordered by package name. Include the `nginx` package.
+    /// Exact dependency order for one-at-a-time install, including `nginx`.
     pub packages: &'a [PoolPackage<'a>],
 }
 
@@ -53,13 +53,12 @@ impl IsoPoolManifest<'_> {
             return Err(RecipeError::Unqualified);
         }
         let mut text = format!(
-            "arxcovo-iso-pool-v1\niso {} {}\nmetadata {} {}\n",
+            "arxcovo-iso-pool-v2\niso {} {}\nmetadata {} {}\n",
             self.iso.length,
             hex::encode(self.iso.sha256),
             metadata.size,
             hex::encode(metadata.sha256),
         );
-        let mut previous = "";
         let mut total = 0_u64;
         let mut has_nginx = false;
         for (i, package) in self.packages.iter().enumerate() {
@@ -69,13 +68,11 @@ impl IsoPoolManifest<'_> {
                 relative_path,
                 artifact,
             } = *package;
-            if name <= previous
-                || !valid_token(
-                    name,
-                    64,
-                    |b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'+' | b'.' | b'-'),
-                )
-                || !name.as_bytes()[0].is_ascii_alphanumeric()
+            if !valid_token(
+                name,
+                64,
+                |b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'+' | b'.' | b'-'),
+            ) || !name.as_bytes()[0].is_ascii_alphanumeric()
                 || !valid_token(version, 128, |b| {
                     b.is_ascii_alphanumeric() || b".+-:~".contains(&b)
                 })
@@ -90,7 +87,7 @@ impl IsoPoolManifest<'_> {
                     .any(|part| matches!(part, "" | "." | ".."))
                 || self.packages[..i]
                     .iter()
-                    .any(|other| other.relative_path == relative_path)
+                    .any(|other| other.name == name || other.relative_path == relative_path)
                 || artifact.size == 0
                 || artifact.sha256 == [0; 32]
             {
@@ -101,7 +98,6 @@ impl IsoPoolManifest<'_> {
                 .filter(|&size| size <= MAX_PACKAGE_BYTES)
                 .ok_or(RecipeError::Unqualified)?;
             has_nginx |= name == "nginx";
-            previous = name;
             writeln!(
                 text,
                 "{name} {version} {relative_path} {} {}",
@@ -124,7 +120,9 @@ fn valid_token(value: &str, max: usize, allowed: impl Fn(u8) -> bool) -> bool {
 /// Implemented by the host's offline media inspector. A successful witness
 /// must establish upstream signatures, index-to-deb hashes, amd64/all package
 /// identity and the complete exact dependency closure against this base
-/// recipe, including installed base versions. Verify against the same pinned
+/// recipe, including installed base versions. Verify that the manifest order
+/// permits installing and configuring one package at a time, including all
+/// Depends and Pre-Depends. Verify against the same pinned
 /// ISO content later staged through protected handles. No guest or MCP input
 /// supplies this witness.
 pub trait IsoPoolVerifier {
@@ -223,6 +221,7 @@ impl<'a> UbuntuWebRecipe<'a> {
             return Err(RecipeError::Unqualified);
         }
         let mut stage = String::new();
+        let mut archives = String::new();
         for package in self.manifest.packages {
             stage.push_str(
                 &STAGE_LINE
@@ -231,12 +230,14 @@ impl<'a> UbuntuWebRecipe<'a> {
                     .replace("{size}", &package.artifact.size.to_string())
                     .replace("{sha256}", &hex::encode(package.artifact.sha256)),
             );
+            archives.push_str(&ARCHIVE_ARG.replace("{name}", package.name));
         }
         let command = INSTALL_PROFILE
             .replace("{nginx}", NGINX_CONFIG)
             .replace("{network}", GUEST_NETWORK)
             .replace("{sysctl}", GUEST_SYSCTL)
             .replace("{stage}", stage.trim_end())
+            .replace("{archives}", archives.trim_end())
             .replace("{verify}", self.package_checks("$target").trim_end());
         user.push_str("    - |\n");
         for line in command.lines() {
@@ -288,10 +289,10 @@ impl<'a> UbuntuWebRecipe<'a> {
     }
 }
 
-// This reads only CIDATA just emitted by UbuntuRecipe. Use its fixed primary
-// root records and rebuild both namespaces with the existing bounded writer.
+// Read only CIDATA emitted by UbuntuRecipe. File IDs follow the existing
+// bootstrap contract. Their extents and the directory layout come from ISO9660.
 fn cidata_files(base: &[u8]) -> Option<[&[u8]; 7]> {
-    const BLOCK: usize = 2048;
+    const DESCRIPTOR_SECTOR: usize = 2048;
     const NAMES: [&[u8]; 7] = [
         b"ARXAUDIT.;1",
         b"ARXAUDIT.SVC;1",
@@ -301,21 +302,59 @@ fn cidata_files(base: &[u8]) -> Option<[&[u8]; 7]> {
         b"METADATA.;1",
         b"USERDATA.;1",
     ];
-    let mut records = base.get(23 * BLOCK + 68..24 * BLOCK)?;
-    let mut files = [&[][..]; 7];
-    for (file, name) in files.iter_mut().zip(NAMES) {
-        let length = usize::from(*records.first()?);
-        let record = records.get(..length)?;
-        if record.get(33..33 + name.len())? != name {
-            return None;
-        }
-        let start =
-            (u32::from_le_bytes(record.get(2..6)?.try_into().ok()?) as usize).checked_mul(BLOCK)?;
-        let length_bytes = u32::from_le_bytes(record.get(10..14)?.try_into().ok()?) as usize;
-        *file = base.get(start..start.checked_add(length_bytes)?)?;
-        records = &records[length..];
+    let primary = base
+        .chunks_exact(DESCRIPTOR_SECTOR)
+        .skip(16)
+        .take_while(|descriptor| descriptor[0] != 255 && &descriptor[1..7] == b"CD001\x01")
+        .find(|descriptor| descriptor[0] == 1)?;
+    let block = usize::from(u16::from_le_bytes(primary[128..130].try_into().ok()?));
+    if !(512..=2048).contains(&block)
+        || !block.is_power_of_two()
+        || block != usize::from(u16::from_be_bytes(primary[130..132].try_into().ok()?))
+    {
+        return None;
     }
-    Some(files)
+    let root = primary.get(156..156 + usize::from(primary[156]))?;
+    if *root.get(25)? != 2 {
+        return None;
+    }
+    let directory = iso_extent(base, root, block)?;
+    let mut files = [None; 7];
+    for mut records in directory.chunks(block) {
+        while let Some(&length) = records.first().filter(|&&length| length != 0) {
+            let (record, remaining) = records.split_at_checked(usize::from(length))?;
+            records = remaining;
+            let name = record.get(33..33 + usize::from(*record.get(32)?))?;
+            if record[25] == 2 && matches!(name, b"\0" | b"\x01") {
+                continue;
+            }
+            let file = &mut files[NAMES.iter().position(|&expected| expected == name)?];
+            if record[25] != 0 || file.is_some() {
+                return None;
+            }
+            *file = Some(iso_extent(base, record, block)?);
+        }
+    }
+    let [audit, unit, guest, service, finalize, meta, user] = files;
+    Some([audit?, unit?, guest?, service?, finalize?, meta?, user?])
+}
+
+fn iso_extent<'a>(base: &'a [u8], record: &[u8], block: usize) -> Option<&'a [u8]> {
+    let number = |offset| {
+        let (little, big) = record.get(offset..offset + 8)?.split_at(4);
+        let value = u32::from_le_bytes(little.try_into().ok()?);
+        (value == u32::from_be_bytes(big.try_into().ok()?)).then_some(value as usize)
+    };
+    // The base writer emits neither extended attribute records nor interleave.
+    if *record.get(1)? != 0 || record.get(26..28)? != [0, 0] {
+        return None;
+    }
+    let start = number(2)?.checked_mul(block)?;
+    let length = number(10)?;
+    if length == 0 {
+        return None;
+    }
+    base.get(start..start.checked_add(length)?)
 }
 
 fn pin(bytes: &[u8]) -> ArtifactPin {
@@ -334,6 +373,7 @@ fn profile_pin_from_literals() -> ArtifactPin {
         INSTALL_PROFILE,
         DETACHED_PROFILE,
         STAGE_LINE,
+        ARCHIVE_ARG,
         VERIFY_LINE,
     ]
     .join("\0")
@@ -341,6 +381,7 @@ fn profile_pin_from_literals() -> ArtifactPin {
 }
 
 const STAGE_LINE: &str = "stage_deb '{path}' '{name}' '{size}' '{sha256}'\n";
+const ARCHIVE_ARG: &str = "'/var/lib/arxcovo/web-install/{name}.deb' ";
 const VERIFY_LINE: &str = "verify_package \"{root}\" '{name}' '{version}'\n";
 
 const INSTALL_PROFILE: &str = r#"set -eu
@@ -349,10 +390,11 @@ target=/target
 dir=$target/var/lib/arxcovo/web-install
 install -d -m 0755 "$target/var/lib/arxcovo"
 mkdir -m 0755 "$dir"
-mkdir -m 0755 "$dir/lists"
 stage_deb() {
   src=/cdrom/$1
   dest=$dir/$2.deb
+  test -f "$src"
+  test ! -L "$src"
   test "$(stat -c %s "$src")" = "$3"
   install -m 0644 "$src" "$dest"
   printf '%s  %s\n' "$4" "$dest" | sha256sum --check --strict
@@ -372,13 +414,12 @@ printf '#!/bin/sh\nexit 101\n' > "$policy"
 chmod 0755 "$policy"
 curtin in-target --target="$target" -- /bin/sh -ec '
   export DEBIAN_FRONTEND=noninteractive
-  apt-get -y --no-download --no-remove --no-install-recommends \
-    -o Dir::Etc::sourcelist=/dev/null -o Dir::Etc::sourceparts=- \
-    -o Dir::State::lists=/var/lib/arxcovo/web-install/lists \
-    install /var/lib/arxcovo/web-install/*.deb
+  for archive do
+    dpkg --install "$archive"
+  done
   audit=$(dpkg --audit)
   test -z "$audit"
-'
+' arx-web-install {archives}
 restore_policy
 trap - EXIT
 verify_package() {
@@ -465,66 +506,138 @@ const GUEST_NETWORK: &str = r#"network:
 const GUEST_SYSCTL: &str =
     "net.ipv6.conf.all.disable_ipv6=1\nnet.ipv6.conf.default.disable_ipv6=1\n";
 
-/// Private first-boot delivery plan. The supervisor supplies fresh ECDSA
-/// material for this DNS name and verifies its validity and key binding.
-pub struct OriginProvisioning {
-    server_name: String,
-}
+pub use origin::{OriginPayload, OriginProvisioning};
 
-impl OriginProvisioning {
-    pub const HEALTH_PATH: &str = "/arx-health";
-    pub const MAX_CERT_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
-    pub const NIC_MAC: &str = "52:54:00:12:34:56";
-    pub const CERT_PATH: &str = "/etc/arxcovo/origin.crt";
-    pub const KEY_PATH: &str = "/etc/arxcovo/origin.key";
-    pub const KEY_MODE: u32 = 0o600;
+mod origin {
+    use super::Id;
 
-    pub fn new(generation: Id) -> Self {
-        Self {
-            server_name: format!("arx-{}.invalid", hex::encode(generation)),
+    /// Private first-boot delivery plan. The supervisor supplies fresh ECDSA
+    /// material for this DNS name and verifies its validity and key binding.
+    pub struct OriginProvisioning {
+        server_name: String,
+    }
+
+    impl OriginProvisioning {
+        pub const HEALTH_PATH: &str = "/arx-health";
+        pub const MAX_CERT_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
+        pub const NIC_MAC: &str = "52:54:00:12:34:56";
+        pub const CERT_PATH: &str = "/etc/arxcovo/origin.crt";
+        pub const KEY_PATH: &str = "/etc/arxcovo/origin.key";
+        pub const KEY_MODE: u32 = 0o600;
+
+        pub fn new(generation: Id) -> Self {
+            Self {
+                server_name: format!("arx-{}.invalid", hex::encode(generation)),
+            }
+        }
+
+        pub fn server_name(&self) -> &str {
+            &self.server_name
+        }
+
+        /// Bind bounded, already validated PEM material to a private transfer. A2
+        /// keeps the CA certificate on the host and delivers only the leaf/key.
+        pub fn payload<'a>(
+            &'a self,
+            leaf_pem: &'a [u8],
+            key_pem: &'a [u8],
+        ) -> Option<OriginPayload<'a>> {
+            if !(1..=8 * 1024).contains(&leaf_pem.len()) || !(1..=4 * 1024).contains(&key_pem.len())
+            {
+                return None;
+            }
+            Some(OriginPayload {
+                plan: self,
+                leaf_pem,
+                key_pem,
+            })
         }
     }
 
-    pub fn server_name(&self) -> &str {
-        &self.server_name
-    }
-
-    /// Bind bounded, already validated PEM material to a private transfer. A2
-    /// keeps the CA certificate on the host and delivers only the leaf/key.
-    pub fn payload<'a>(
-        &'a self,
+    /// For an authenticated, bounded, unforwarded virtio-serial operation. No
+    /// Debug, serialization, command-line or guest-script interface is provided.
+    /// The receiver installs the fixed config and static NIC profile, validates
+    /// nginx and reports fixed status. The supervisor proves clean stop before
+    /// committing this generation.
+    ///
+    /// Raw bytes are visible only within the sealed origin module. A2 should
+    /// implement the authenticated serial encoder as a private child here.
+    ///
+    /// ```compile_fail,E0624
+    /// use arxd::vm::ubuntu_web::OriginProvisioning;
+    /// let plan = OriginProvisioning::new([1; 16]);
+    /// let payload = plan.payload(b"leaf fixture", b"key fixture").unwrap();
+    /// let _ = payload.into_private_parts();
+    /// ```
+    pub struct OriginPayload<'a> {
+        plan: &'a OriginProvisioning,
         leaf_pem: &'a [u8],
         key_pem: &'a [u8],
-    ) -> Option<OriginPayload<'a>> {
-        if !(1..=8 * 1024).contains(&leaf_pem.len()) || !(1..=4 * 1024).contains(&key_pem.len()) {
-            return None;
+    }
+
+    impl<'a> OriginPayload<'a> {
+        pub fn server_name(&self) -> &str {
+            self.plan.server_name()
         }
-        Some(OriginPayload {
-            plan: self,
-            leaf_pem,
-            key_pem,
-        })
+
+        #[allow(
+            dead_code,
+            reason = "A2 supplies the private authenticated serial encoder"
+        )]
+        fn into_private_parts(self) -> (&'a [u8], &'a [u8]) {
+            (self.leaf_pem, self.key_pem)
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn sealed_payload_preserves_exact_transport_bytes() {
+        let plan = OriginProvisioning::new([1; 16]);
+        let payload = plan.payload(b"leaf fixture", b"key fixture").unwrap();
+        assert_eq!(
+            payload.into_private_parts(),
+            (&b"leaf fixture"[..], &b"key fixture"[..])
+        );
     }
 }
 
-/// For an authenticated, bounded, unforwarded virtio-serial operation. No
-/// Debug, serialization, command-line or guest-script interface is provided.
-/// The receiver installs the fixed config and static NIC profile, validates
-/// nginx and reports fixed status. The supervisor proves clean stop before
-/// committing this generation.
-pub struct OriginPayload<'a> {
-    plan: &'a OriginProvisioning,
-    leaf_pem: &'a [u8],
-    key_pem: &'a [u8],
-}
-
-impl<'a> OriginPayload<'a> {
-    pub fn server_name(&self) -> &str {
-        self.plan.server_name()
+#[cfg(test)]
+#[test]
+fn cidata_reader_follows_relocated_root_and_rejects_differing_extent_copies() {
+    const BLOCK: usize = 2048;
+    let files = [b"a", b"b", b"c", b"d", b"e", b"f", b"g"].map(<[u8; 1]>::as_slice);
+    let mut seed = Vec::new();
+    Image::new(files).unwrap().write(&mut seed).unwrap();
+    let root_record = 16 * BLOCK + 156;
+    let mut old_root = iso_extent(&seed, &seed[root_record..], BLOCK)
+        .unwrap()
+        .to_vec();
+    // Relocate the primary directory, leaving the old extent unusable.
+    let old_offset = u32::from_le_bytes(seed[root_record + 2..root_record + 6].try_into().unwrap())
+        as usize
+        * BLOCK;
+    seed[old_offset..old_offset + old_root.len()].fill(0);
+    let new_lba = (seed.len() / BLOCK) as u32;
+    let parent_record = usize::from(old_root[0]);
+    for entry in [0, parent_record] {
+        old_root[entry + 2..entry + 6].copy_from_slice(&new_lba.to_le_bytes());
+        old_root[entry + 6..entry + 10].copy_from_slice(&new_lba.to_be_bytes());
     }
-
-    /// Called only by the private transport encoder.
-    pub fn into_private_parts(self) -> (&'a [u8], &'a [u8]) {
-        (self.leaf_pem, self.key_pem)
+    seed.extend_from_slice(&old_root);
+    let pvd = 16 * BLOCK;
+    let little_table =
+        u32::from_le_bytes(seed[pvd + 140..pvd + 144].try_into().unwrap()) as usize * BLOCK;
+    let big_table =
+        u32::from_be_bytes(seed[pvd + 148..pvd + 152].try_into().unwrap()) as usize * BLOCK;
+    seed[little_table + 2..little_table + 6].copy_from_slice(&new_lba.to_le_bytes());
+    seed[big_table + 2..big_table + 6].copy_from_slice(&new_lba.to_be_bytes());
+    for descriptor in [16 * BLOCK, 17 * BLOCK] {
+        seed[descriptor + 80..descriptor + 84].copy_from_slice(&(new_lba + 1).to_le_bytes());
+        seed[descriptor + 84..descriptor + 88].copy_from_slice(&(new_lba + 1).to_be_bytes());
     }
+    seed[root_record + 2..root_record + 6].copy_from_slice(&new_lba.to_le_bytes());
+    seed[root_record + 6..root_record + 10].copy_from_slice(&new_lba.to_be_bytes());
+    assert_eq!(cidata_files(&seed), Some(files));
+    seed[root_record + 6] ^= 1;
+    assert_eq!(cidata_files(&seed), None);
 }
