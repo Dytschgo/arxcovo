@@ -19,7 +19,10 @@ from contextlib import ExitStack
 
 PROBE = 'cluster::pki::custody::hosted_probe::hosted_custody_probe'
 BASE = 'docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a'
-PINS = '28f882cb018eb956c60c190f8718fb982923cd096adb608e15e194c51fa2e167'
+ADOPTED_PINS = '28f882cb018eb956c60c190f8718fb982923cd096adb608e15e194c51fa2e167'
+# SHA256 of docs/briefs/m3-custody-hosted-pins.md after amendment A4 (2026-11-23).
+# Recorded evidence uses this digest. ADR 0037 must quote it and ADOPTED_PINS.
+PINS = '32503a622d15ba8f786878ce4dfaeb4fd674db3a0b528b6ce2b450ce9c067c55'
 MIB = 1024 * 1024
 MODES = {'create-founder', 'create-learner', 'deny-build', 'same-uid-control', 'release', 'restart-founder', 'restart-learner'}
 LIMIT = 1024 * 1024
@@ -1034,6 +1037,10 @@ class Harness:
         self.command(['python3', '-I', '-B', '-m', 'unittest', 'discover', '-s', str(Path(__file__).parent), '-p', 'test_run.py'], 'preflight', 20)
         tmp = Path(os.environ['RUNNER_TEMP'])
         safe(tmp)
+        # RUNNER_TEMP only. Staged context is at most 257 MiB and the ext4 fixture
+        # is 64 MiB, 321 MiB together. 1 GiB free covers that scratch. Docker stores
+        # the image on its data root, which this check does not measure; image Size
+        # is capped separately at 512 MiB and is not added into this 1 GiB figure.
         require(shutil.disk_usage(tmp).free >= 1024*MIB, 'DiskCapacity', 'qualify', 'shutil.disk_usage(tmp).free >= 1024 * MIB')
         self.root = Path(tempfile.mkdtemp(prefix='arx-custody-', dir=tmp))
         os.chmod(self.root, 0o700)
@@ -1045,15 +1052,23 @@ class Harness:
         source = self.command(['git', 'rev-parse', 'HEAD'], 'preflight').decode().strip()
         require(re.fullmatch(r'[a-f0-9]{40}', source), 'SourcePin', 'qualify', "re.fullmatch('[a-f0-9]{40}', source)")
         # Coordinator must persist adoption before hosted execution.
+        # PINS is amendment A4, the applicable revision. ADOPTED_PINS is the
+        # 2026-11-20 brief digest and stays in the ADR as the historical pin.
         note = Path('docs/adr/0037-acceptance-custody.md').read_text()
-        require(PINS in note, 'MissingAdoptedPins', 'qualify', 'PINS in note')
+        require(ADOPTED_PINS in note and PINS in note, 'MissingAdoptedPins', 'qualify', 'ADOPTED_PINS in note and PINS in note')
         self.discover_and_stage(source, context)
         self.record_scratch('staged')
         self.command(['docker', 'build', '--platform', 'linux/amd64', '--network', 'none', '--target', 'custody-runtime', '--file', str(context / 'Containerfile'), '--iidfile', str(self.root / 'image.id'), str(context)], 'image', 40)
         self.image = (self.root / 'image.id').read_text().strip()
         require(re.fullmatch(r'sha256:[a-f0-9]{64}', self.image), 'ImageIdentity', 'qualify', "re.fullmatch('sha256:[a-f0-9]{64}', self.image)")
         image = json.loads(self.command(['docker', 'image', 'inspect', self.image], 'image'))[0]
-        require(image['Id'] == self.image and image['Architecture'] == 'amd64' and image['Os'] == 'linux' and image['Size'] <= 256*MIB, 'ImageIdentity', 'qualify', "image['Id'] == self.image and image['Architecture'] == 'amd64' and (image['Os'] == 'linux') and (image['Size'] <= 256 * MIB)")
+        # image['Size'] is Docker's inspect-reported image size. A packed driver can
+        # report less than the candidate (hosted evidence: context 84,499,396 bytes,
+        # Size 50,089,568). An unpacked driver adds the pinned Ubuntu base to the
+        # copied candidate. The candidate cap is 256 MiB; 512 MiB leaves 256 MiB
+        # for that base and either accounting. The pinned base layer is 29,793,297
+        # bytes compressed.
+        require(image['Id'] == self.image and image['Architecture'] == 'amd64' and image['Os'] == 'linux' and image['Size'] <= 512*MIB, 'ImageIdentity', 'qualify', "image['Id'] == self.image and image['Architecture'] == 'amd64' and (image['Os'] == 'linux') and (image['Size'] <= 512 * MIB)")
         self.record('image', identity=self.image, bytes=image['Size'])
         self.record_scratch('image')
         self.run_nodes()
@@ -1131,7 +1146,7 @@ class Harness:
             require(b'/lib64/ld-linux-x86-64.so.2' in elf and b'NEEDED' in elf, 'ElfABI', 'discover_and_stage', "b'/lib64/ld-linux-x86-64.so.2' in elf and b'NEEDED' in elf")
             versions = sorted(set(v.decode('ascii') for v in re.findall(rb'GLIBC_[0-9]+\.[0-9]+', elf)))
             self.record('elf-abi', required_glibc=versions)
-            self.record('inputs', source=source, hashes=inputs, executable=selected.sha, pins=PINS)
+            self.record('inputs', source=source, hashes=inputs, executable=selected.sha, pins=PINS, adopted_pins=ADOPTED_PINS)
 
     def run_nodes(self):
         self.prepare_fixture()
