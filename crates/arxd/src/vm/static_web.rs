@@ -234,7 +234,7 @@ impl OriginPortLease {
     }
 }
 
-/// Per-generation identity. The TLS name is derived from the sealed
+/// Stable provisioned identity. The TLS name is derived from the first active
 /// generation ID and is independent of an agent-supplied display name.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct StaticOriginIdentity(Id);

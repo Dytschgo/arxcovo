@@ -903,6 +903,41 @@ fn a_cancellation_after_cleanup_and_before_finish_never_seals() {
     );
 }
 
+#[test]
+fn a_complete_trial_rechecks_the_budget_at_the_seal_point() {
+    struct SealClock {
+        current: Cell<Instant2>,
+        at_seal: Instant2,
+    }
+
+    impl Clock for SealClock {
+        fn now(&self) -> Instant2 {
+            self.current.replace(self.at_seal)
+        }
+
+        fn cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    let at_ms = |mono_ms| Instant2 {
+        utc: T0.utc + mono_ms / 1000,
+        mono_ms,
+    };
+    for seal_ms in [MAX_TRIAL_MS - 1, MAX_TRIAL_MS, MAX_TRIAL_MS + 1] {
+        let clock = SealClock {
+            current: Cell::new(at_ms(MAX_TRIAL_MS - 1)),
+            at_seal: at_ms(seal_ms),
+        };
+        let result = complete(Class::Test).0.finish(&clock);
+        if seal_ms <= MAX_TRIAL_MS {
+            assert!(result.is_ok(), "seal point: {seal_ms} ms");
+        } else {
+            assert!(matches!(result, Err(RunError::Incomplete)));
+        }
+    }
+}
+
 fn fixture_after_late_cleanup() -> Trial<Fixture> {
     let tripped = Rc::new(Cell::new(false));
     let mut trial = fixture(Class::Test);
@@ -1682,7 +1717,37 @@ mod native_glue {
         Taken::Observed(timed(started_ms, result))
     }
 
+    fn capacity_facts() -> Limits {
+        Limits {
+            inner_caller_free_bytes: 80 * GIB,
+            inner_total_free_bytes: 81 * GIB,
+            inner_total_bytes: 98 * GIB,
+            inner_extent_bytes: 99 * GIB,
+            vhd_virtual_bytes: 100 * GIB,
+            outer_caller_free_bytes: 60 * GIB,
+            outer_total_free_bytes: 61 * GIB,
+            backing_allocated_bytes: 100 * GIB + 8192,
+            backing_length_bytes: 100 * GIB + 8192,
+            disk_ceiling_bytes: DISK_CEILING,
+            outer_floor_bytes: OUTER_FLOOR,
+            disk_budget_bytes: 99 * GIB,
+            empty_job_memory_limit_bytes: JOB_MEMORY_BYTES,
+            empty_job_cpu_rate: JOB_CPU_RATE,
+        }
+    }
+
     fn preflight(console_idle: bool, available_ram_bytes: u64, whpx: bool) -> Preflight {
+        collect_preflight(console_idle, available_ram_bytes, whpx, || {
+            taken(6, capacity_facts())
+        })
+    }
+
+    fn collect_preflight(
+        console_idle: bool,
+        available_ram_bytes: u64,
+        whpx: bool,
+        collect_limits: impl FnOnce() -> Taken<Limits>,
+    ) -> Preflight {
         Preflight {
             inputs: timed(
                 0,
@@ -1713,25 +1778,7 @@ mod native_glue {
                     payload_bytes: 300_000_000,
                 },
             ),
-            limits: taken(
-                6,
-                Limits {
-                    inner_caller_free_bytes: 80 * GIB,
-                    inner_total_free_bytes: 81 * GIB,
-                    inner_total_bytes: 98 * GIB,
-                    inner_extent_bytes: 99 * GIB,
-                    vhd_virtual_bytes: 100 * GIB,
-                    outer_caller_free_bytes: 60 * GIB,
-                    outer_total_free_bytes: 61 * GIB,
-                    backing_allocated_bytes: 100 * GIB + 8192,
-                    backing_length_bytes: 100 * GIB + 8192,
-                    disk_ceiling_bytes: DISK_CEILING,
-                    outer_floor_bytes: OUTER_FLOOR,
-                    disk_budget_bytes: 99 * GIB,
-                    empty_job_memory_limit_bytes: JOB_MEMORY_BYTES,
-                    empty_job_cpu_rate: JOB_CPU_RATE,
-                },
-            ),
+            limits: collect_limits(),
             activity: taken(
                 8,
                 Activity {
@@ -1772,7 +1819,7 @@ mod native_glue {
     }
 
     #[test]
-    fn the_native_glue_stops_at_the_unimplemented_store_and_writes_only_diagnostics() {
+    fn the_native_glue_refuses_stock_before_claiming_a_slot_or_dispatching() {
         let p = preflight(true, 32 * GIB, true);
         let (trial, sink) = run(&p);
         assert_eq!(trial.blocked_at(), Some(Stage::DisposableStore));
@@ -1785,7 +1832,10 @@ mod native_glue {
                 record.stage
             );
         }
-        assert_eq!(records[6].result, StageResult::Unimplemented);
+        assert_eq!(
+            records[6].result,
+            StageResult::Failed(Diagnostic::DistributionUnverified)
+        );
         assert_eq!(records[7].stage, Stage::Cleanup);
         let names: Vec<&str> = sink
             .writes
@@ -1815,6 +1865,46 @@ mod native_glue {
             trial.finish(&Script2::fixed(DONE)),
             Err(RunError::Incomplete)
         ));
+    }
+
+    #[test]
+    fn measured_stock_preflight_records_refusal_without_creating_any_job() {
+        // Use the same collector that orders the native read and Job probe.
+        // Supply raw capacity facts and a counting factory, then let the
+        // collector produce the observation that goes through the graph.
+        let reads = Cell::new(0);
+        let jobs = Cell::new(0);
+        let origin = std::time::Instant::now() - std::time::Duration::from_millis(6);
+        let p = collect_preflight(true, 32 * GIB, true, || {
+            arxd::vm::qualification::stock_capacity(
+                origin,
+                || {
+                    reads.set(reads.get() + 1);
+                    Ok((capacity_facts(), ()))
+                },
+                || {
+                    jobs.set(jobs.get() + 1);
+                    Ok(())
+                },
+            )
+            .0
+        });
+        let (trial, sink) = run(&p);
+        assert_eq!(reads.get(), 1);
+        assert_eq!(jobs.get(), 0);
+        assert_eq!(trial.incomplete().dispatched_effects, 0);
+        assert_eq!(trial.blocked_at(), Some(Stage::CustodyJobCapacityBaseline));
+        let (_, bytes) = sink
+            .writes
+            .iter()
+            .find(|(output, _)| *output == Output::Records(FileKind::CustodyJobCapacity))
+            .unwrap();
+        let records: Vec<Record> = decode(bytes).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].result,
+            StageResult::Failed(Diagnostic::DistributionUnverified)
+        );
     }
 
     #[test]

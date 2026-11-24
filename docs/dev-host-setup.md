@@ -191,9 +191,22 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
 4. **Run independently reviewed non-elevated native trials.** Review the
    amendment and exact runner and enforcement code first. Use its private
    trial authority with a disposable store and enrolled inputs. Start paused,
-   diskless and networkless. Require held consumer-open proof for the exact
-   binaries, modules, helper inputs, firmware, disks and media, then prove
-   `pc-q35-11.1` WHPX boot without fallback. On the held child, verify the
+   diskless and networkless. Select the reviewed witnessed distribution and
+   exact sealed recipe after the native adapter has landed. Verify the
+   protected bundle and search directories. Verify single-process Job
+   and child-creation restrictions for QEMU and each helper. Collect the
+   creation-to-exit image verdict and stage coverage for file opens, data
+   mappings and named objects, including transient firmware and helper
+   inputs. Prove a fresh helper output against its held created object.
+   On refusal, stop the owned Job while preserving debugger containment.
+   Drain terminal events before waiting for held process exit. Verify
+   the Job is empty, workers have joined and file custody is intact
+   before releasing the slot.
+   Seal successful qualification only after clean settlement and complete
+   witness evidence. Record dirty release or quarantine on failure.
+   [ADR 0054 qualification witness](adr/0054-m4-dedicated-windows-runtime.md#amendment-2026-11-24--actual-image-and-file-open-witness-for-m4-qualification)
+
+   Prove `pc-q35-11.1` WHPX boot without fallback. On the held child, verify the
    11.1.3 QMP greeting, negotiation, paused prelaunch, typed responses and
    clean release. Prove the installed boot's private pipe ACL, server PID and
    Job membership before exchanging a nonce. Verify disconnect handling and
@@ -267,9 +280,12 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    Its manifest digest is
    `f1cf73c8ecae163e31467a3985fc13749aee1f12a8747756eb136108a1015759`.
    Use ADR 0054 and the manifest for the executable and remaining payload
-   pins. These are distribution hashes. No native trial or acceptance hashes
-   exist yet. After the issuer (7c), fresh qualification and the required
-   acceptance dependencies are in place, run the one unattended live test
+   pins. These hashes identify the stock build. For a witnessed trial, bind
+   the separate reviewed distribution receipt and manifest, contract
+   version, and sanitized per-stage coverage and release verdicts to the
+   qualification record. No native trial or acceptance hashes exist yet.
+   After the issuer (7c), fresh qualification and the required acceptance
+   dependencies are in place, run the one unattended live test
    in the chosen console-idle window. Seal `acceptance.json` and its manifest
    with the acceptance client, qualification and deployed release digests.
 

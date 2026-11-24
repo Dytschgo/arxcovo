@@ -186,6 +186,9 @@ pub enum Refusal {
     PublishCredentialMissing,
     PublishTargetMismatch,
     PublishCleanupPending,
+    SnapshotPublishNotQuiesced,
+    StaticBackupDeleteForbidden,
+    SnapshotOfflineRequired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,6 +290,7 @@ pub struct RecoveryClaim {
 pub(crate) enum Subject<'a> {
     Vm(Id),
     Template(Id, [u8; 32]),
+    Snapshot(Id, [u8; 32]),
     Recipe(&'a str, Option<[u8; 32]>),
 }
 
@@ -296,6 +300,7 @@ pub(crate) const READ_REFUSAL_ACTION: i64 = 13;
 pub(crate) const HOST_REFUSAL_ACTION: i64 = 14;
 pub(crate) const PUBLISH_ACTION: i64 = 15;
 pub(crate) const UNPUBLISH_ACTION: i64 = 16;
+pub(crate) const SNAPSHOT_DELETE_ACTION: i64 = 18;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]
@@ -490,6 +495,7 @@ pub(crate) struct OperationStatus {
     pub recipe: Option<String>,
     pub template: Option<Id>,
     pub expires_at_ms: Option<i64>,
+    pub snapshot: Option<Id>,
     pub script: Option<ScriptResult>,
     pub failure: Option<FailureReason>,
 }
