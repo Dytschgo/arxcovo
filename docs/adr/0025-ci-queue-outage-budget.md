@@ -250,7 +250,10 @@ On 2026-11-23 the owner authorized a one-use bypass, only for the label-fix
 PR, after an independent PASS and green platform jobs. The route was:
 snapshot the protection document and check it for drift, pin the PR head and
 main, remove only `ci-time-budget`, squash-merge that pinned head, and
-restore the protection document in `finally`. There was no armed auto-merge.
+restore the protection document in `finally`. The owner also required that
+no other PR merge until a new first-attempt main run on the #296 merge passed
+the normal gates; all other merges stayed paused until that happened. There
+was no armed auto-merge.
 The snapshot matched the documented five checks, strict mode, and
 `enforce_admins`.
 

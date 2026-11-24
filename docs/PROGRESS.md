@@ -442,17 +442,18 @@
   - **Static VM and Docker (v1, ADR 0058 and ADR 0064).** Acceptance is the Calm Life qualification in ADR 0064: two approved names, a correct byte-range response, a SQLite event that survives restart and restores from the protected host backup, deletion refused, and public-only egress. **Blocker:** Cloudflare B2 has not merged. E2 shares files with E1 and stays sequential. E3 needs B2. E4 follows E3. Guest Docker, the patched egress fence, Windows custody and the live tunnel are **unverified on real hardware**.
     - #286, recorded above, merged the static Ubuntu web VM lifecycle before this batch's first note. Real nginx, loopback forwarding and TLS stay **unverified on real hardware**.
     - #292 merged the patched QEMU/libslirp public-only egress build. Sol 1/3. HOLD `f4289dfe…ce2d73` (unbounded UDP host sockets, including a failed first send; socket-boundary tests; the async TCP connect probe skipped the send guard), re-review 2 PASS `94835d03…305b` on `cba7c2c4`. Install `qemu/11.1.3-arx-egress-2`, receipt `68cbd5c3…5402` (the earlier `-1` receipt was `2d4ab2eb…47ef`). A guest denied the host and the LAN is **unverified on real hardware**.
+    - #299 (open) qualifies the reviewed `-2` patched build in E1b's `REVIEWED_EGRESS_BUILDS`, which was empty by design at #293. Sol 6.2 high, 0/3; independent security review pending.
     - #293 merged the Rust `PublicEgress` variant, policy and admission refusal. Opus 0/3. HOLD `6e394cee…c44259`, HOLD `fcab4caa…0bed`, HOLD `535fa13f…48e6ae`, re-review 4 PASS `cc0c5d64…75f0` on `1db4985f` (1234 tests). Admission of a real static VM is **unverified on real hardware**.
   - **Cloudflare B2 (#290).** Acceptance of the real tunnel (off by default, owner credential, fakes in CI) has not passed. **Blocker:** re-review 6 was HOLD `8533fcec…d124` with four findings; round 6 (`b6221f43`) addressed them and re-review 7 is in progress. The PR is not merged. Opus builder #2 is at 2/3. The four findings are: I3 P2, a POST still writable after revocation during TLS, and a stop during TLS, so `Unknown` pins the slot; I1a P3, the cause is lost on a failed revoking write; I1b P3, a late queued stop is missed by the drain; S1 P3, a by-path delete race. The live tunnel is **unverified on real hardware**. The process-restart gap is already recorded in ADR 0065 (`docs/adr/0065-vm-store-v10-publish.md`, on the unmerged #290 branch) as a native release blocker.
   - **Owner decisions (2026-11-23, direct).**
     - Docker Compose on the static VM is in v1, with public-only egress via the patched QEMU/libslirp build. The owner accepted the design defaults already recorded under Since #280 and in [ADR 0064](adr/0064-v1-scope-docker-static-vm.md): IPv4 only, digest-pinned registry images, 2 vCPU / 4 GB / 32 GB, DPAPI secrets delivered to a guest tmpfs, typed bounded diagnostics, and no agent deletion of volumes or backups. The guest path is **unverified on real hardware**.
     - M4 activation. Windows 11 Pro official media, with the path asked once at qualification. `current_user` is accepted on this PC only, console logon only, with shared-SID trust. The disk cap is 200 GiB with a 50 GiB free floor. The reserve is 16 GiB of RAM plus half the CPUs. Qualification validity is 7 days. There is one idle-window live test. That test has not run. The live path is **unverified on real hardware**.
     - A per-case new Opus builder was authorized for #279, for #283, and for #290. Each authorization was for that PR only. The owner declined a standing rule each time. For #290 this was the third decline. #290's new builder is the Opus #2 now at 2/3.
-    - Slow GitHub runners are not a problem. Wait. Rerun only a job that was cancelled or that never started.
+    - Slow GitHub runners are not a problem; wait for runs to finish rather than diagnosing runner speed. Actual reruns are recorded as evidence under CI and provider interruptions.
   - **Counted builder failures.** This list is the attempt counters.
     - Cloudflare B2, Sol, stop at 3/3. Failure 3: the Windows connector test called the removed B1 admit at `tests/vm_publish.rs:995`. WIP was pinned at `865457c4` (19 files, +2172/−136). Diagnosis `C0A0BB89…C3A4`.
     - Cloudflare B2, first Opus builder, stop at 3/3. Hosted Windows CI `45227367252`: `vm_publish` connector fixture, credential leaf owner `BUILTIN\Administrators` on the elevated runner, `load=Err(Credential)`. The fixture did not set the TokenUser owner. The notes count this failure.
-    - Cloudflare B2, owner-authorized Opus #2, now 1/3. The counted failure was the first VM MCP run: retiring the registry erased the revocation, which led to a per-VM revoked marker. A vacuous I1b test that was found and fixed was not counted. Round 6 added the second counted failure: the first run of the new I1a test hit `server-drain-unconfirmed` at shutdown (2/3).
+    - Cloudflare B2, owner-authorized Opus #2, now 2/3. Failure 1 (round 4): the first VM MCP run showed that retiring the registry erased the revocation, which led to a per-VM revoked marker. Failure 2 (round 6): the first run of the new I1a test hit `server-drain-unconfirmed` at shutdown. A vacuous I1b test that was found and fixed in round 5 was not counted.
     - #285 Sol 1/3 at merge. #291 Sol 2/3 at merge. #292 Sol 1/3 at merge (the UDP-cap round). #288 Claude Sonnet 0/3. #289 Claude Opus 0/3 through seven review rounds. #293 Opus 0/3 through four review rounds. #294 Sol 0/3 through three review rounds. #296 Sol 0/3; the `structuredClone` lint fix was not counted. #297 and #298 record no counted builder failure. M4 PR 7b is Sol 6.2 high, 0/3, just started.
   - **Review rounds.** Holds and passes, apart from the attempt counters.
     - #285: in-fence HOLD `286C1B1D`, in-fence PASS `F51C7654`, full HOLD (the fence was misread, plus timing) then PASS `0078E478…48DF`.
@@ -467,7 +468,7 @@
     - #296: PASS `880720ca…a57f`. Independent recompute of run `45267529407`: 843 s charged (841 s execution + 2 s idle), longest job 586 s.
     - #297: PASS `60e50517…30e9`.
     - #298: Opus PASS `2ba11668…ec5e`. Sol refresh check PASS `8bfd66b6…c3fc7`. This closes the follow-up that `scripts/ci-workflow.test.mjs` could skip the forbidden-Cargo-profile assertion when `existsSync` failed.
-  - **CI and provider interruptions.** Separate from the counted failures. On 2026-11-23 the owner decided that runner slowness is waited out, and that a rerun is only for a cancelled or unstarted job.
+  - **CI and provider interruptions.** Separate from the counted failures. On 2026-11-23 the owner decided that runner slowness is waited out. Reruns that happened are listed below.
     - #285 CI `45218594207`: ui macOS cancelled (runner capacity). Failed-jobs rerun.
     - #289 CI `45225685299`: rust macOS cancelled (runner capacity). Attempt 2 green. Later CI `45268409522`: macOS rust hit the 12 m limit before tests. Same image `macos-26-arm64` `20261117.0516`. The notes attribute this to runner slowness (no Rust cache; a dev build of 42 s earlier the same day against 3 m 27 s, and a test build of 5 m 09 s).
     - #292 CI `45246868970`: Ubuntu failed on `authenticated_sender_mismatch` `NotLeader` (third occurrence, with main `2bdcb657` and main `4a8e425f`). Attempt 2 green.
@@ -478,9 +479,9 @@
     - A T3 server restart dropped the CI watchers. They were reattached from the notes after the restart.
     - Main deadlock, above, until `45280408793`.
 
-Per-task provider, effort and outcome for this batch. Effort is the attempt tally the notes record. Where the notes name an effort level, it is in the provider column.
+Per-task provider, effort and outcome for this batch. Effort and the attempt tally are separate: Sol 6.2 and Opus 5.5 builders ran at high effort under the owner routing; Grok and Claude Sonnet effort is unspecified. The `n/3` figure is the counted-failure tally, not an effort level.
 
-| Task | Provider / effort | Outcome |
+| Task | Provider (effort) and attempt tally | Outcome |
 | --- | --- | --- |
 | #286 static A2 | Sol 3/3 stop; Opus 2/3 | Merged `971354a0` before #287. Status `59672075358`. Real nginx **unverified on real hardware**. |
 | #285 M4 5c | Sol 1/3 | Merged `226446f6`. Status `59676554501`. PASS `0078E478…48DF`. |
@@ -496,6 +497,7 @@ Per-task provider, effort and outcome for this batch. Effort is the attempt tall
 | #298 CI policy | Grok; Opus review; Sol refresh check | Merged `278886d8`. Status `59714988185`. PASS `2ba11668…ec5e` and `8bfd66b6…c3fc7`. |
 | #290 Cloudflare B2 | Sol 3/3 stop; Opus 3/3 stop; Opus #2 at 2/3 | Open. Re-review 6 HOLD `8533fcec…d124`; re-review 7 pending on `b6221f43`. Live tunnel **unverified on real hardware**. |
 | M4 PR 7b | Sol 6.2 high, 0/3 | Started. Native collectors and the closed qualification runner. The live test is **unverified on real hardware**. |
+| #299 Docker E1b follow-up | Sol 6.2 high, 0/3 | Open. Qualifies the reviewed `-2` patched egress build (receipt `68cbd5c3…5402`) in `REVIEWED_EGRESS_BUILDS`. Security review pending. Guest egress **unverified on real hardware**. |
 
 - **Process notes.** The coordinator now reads every failed job of each PR CI run before
   relying on a summary. Reviewers are asked to classify activation-gate residuals and
