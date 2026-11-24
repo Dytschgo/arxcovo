@@ -235,3 +235,35 @@ The budget policy rejected its job metadata because `rust (ubuntu-latest)`
 reported the workflow's pinned label `ubuntu-24.04`. Matching that exact
 label restores 762s of idle queue credit, yielding 843s charged against the
 900s budget.
+
+## One-use ci-time-budget bypass (2026-11-23)
+
+The label correction could not merge on the normal gate. The policy expected
+the `ubuntu-latest` label while `ci.yml` pins `ubuntu-24.04`, so every main
+run was `jobs-invalid` and charged-v1 credit never applied. Run
+`45267529407` (`881e0966`, attempt 1) is the verified case. An independent
+review of #296 recomputed that same run, once the label matches, as 843 s
+charged (841 s execution and 2 s idle). The ci-speed path needs a creditable
+main run, so it was unreachable while every main run stayed `jobs-invalid`.
+
+On 2026-11-23 the owner authorized a one-use bypass, only for the label-fix
+PR, after an independent PASS and green platform jobs. The route was:
+snapshot the protection document and check it for drift, pin the PR head and
+main, remove only `ci-time-budget`, squash-merge that pinned head, and
+restore the protection document in `finally`. The owner also required that
+no other PR merge until a new first-attempt main run on the #296 merge passed
+the normal gates; all other merges stayed paused until that happened. There
+was no armed auto-merge.
+The snapshot matched the documented five checks, strict mode, and
+`enforce_admins`.
+
+PR #296 merged as `7c2f211d` from pinned head `6b68133f`, with main pinned at
+`881e0966`. Agent-review status `59707665846` (Opus PASS `880720ca…a57f`,
+published through `a0b0a530`). `protection-before.json` and
+`protection-after.json` are byte-identical. The sha256 prefix is `4497eb1f`.
+
+Main recovered on the first attempt. Run `45280408793` on `7c2f211d`
+succeeded, and `ci-time-budget` reported wall 695 s, charged 690 s, budget
+satisfied. Credit applied. The authorization is consumed. It cannot be reused.
+
+Native paths remain **unverified on real hardware**.
