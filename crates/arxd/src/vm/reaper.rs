@@ -62,6 +62,7 @@ pub(crate) enum CleanupKind {
     Staging { vm: Id, activity_id: i64 },
     Expiry { vm: Id, activity_id: i64 },
     Recovery { vm: Id, activity_id: i64 },
+    Snapshot { vm: Id, generation: Id },
 }
 
 impl From<ExpiryClaim> for CleanupKind {
@@ -88,7 +89,8 @@ impl CleanupKind {
             Self::Build(id)
             | Self::Staging { vm: id, .. }
             | Self::Expiry { vm: id, .. }
-            | Self::Recovery { vm: id, .. } => id,
+            | Self::Recovery { vm: id, .. }
+            | Self::Snapshot { vm: id, .. } => id,
         }
     }
 
@@ -259,7 +261,12 @@ pub(crate) mod fixture {
             ensure!(
                 matches!(
                     slot.role.as_str(),
-                    "disk" | "vars" | "seed" | "verification_overlay"
+                    "disk"
+                        | "vars"
+                        | "seed"
+                        | "verification_overlay"
+                        | "static_disk"
+                        | "static_vars"
                 ),
                 "unknown fixture role"
             );

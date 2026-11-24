@@ -111,6 +111,9 @@ impl<C: Clock> VmController<C> {
     ) -> Result<Admission> {
         let now = clock.utc_ms;
         let action = request.operation.action();
+        if matches!(action, Action::Snapshot | Action::Restore) {
+            return Ok(Admission::Refused(Refusal::Invalid));
+        }
         let binding = store::Binding {
             principal: request.principal,
             key: request.request_id,
@@ -175,6 +178,14 @@ impl<C: Clock> VmController<C> {
             .receipt
             .activity_id;
         target.insert(db, request, id, resources)?;
+        if action == Action::Start {
+            let epoch = db.query_row(
+                "SELECT operation_id FROM vm_operations WHERE activity_id=?1",
+                [id],
+                |row| row.get::<_, Id>(0),
+            )?;
+            store::snapshot::invalidate_release(db, request.vm, epoch)?;
+        }
         store::require_headroom(db)?;
         Ok(Admission::Admitted(PendingOperation {
             activity_id: id,
@@ -201,7 +212,7 @@ impl<C: Clock> VmController<C> {
         );
         self.store.transact(|db| {
             ensure!(store::count(db,
-                "SELECT count(*) FROM vm_operations WHERE activity_id=?1 AND binding_kind IN ('recipe','template')",
+                "SELECT count(*) FROM vm_operations WHERE activity_id=?1 AND binding_kind IN ('recipe','template','snapshot')",
                 [operation.activity_id],
             )? == 0, "durable VM worker requires artifact settlement");
             let now = self.clock.now();
@@ -1151,7 +1162,6 @@ enum Target {
     Existing,
     Static,
     Clone { template: Id, expires: i64 },
-    Snapshot(Id),
 }
 
 impl Target {
@@ -1162,8 +1172,8 @@ impl Target {
         id: i64,
         resources: Resources,
     ) -> Result<()> {
-        let snapshot = match self {
-            Self::Existing => None,
+        match self {
+            Self::Existing => {}
             Self::Static => return Ok(()),
             Self::Clone { template, expires } => {
                 db.execute("INSERT INTO vm_instances(id,template,principal,expires_ms,dashboard_cpus,dashboard_memory)
@@ -1171,23 +1181,15 @@ impl Target {
                     params![request.vm, template, request.principal, expires,
                         (resources.vcpus <= 1024).then_some(resources.vcpus),
                         (resources.guest_ram <= 9_007_199_254_740_991).then_some(resources.guest_ram)])?;
-                None
             }
-            Self::Snapshot(snapshot) => {
-                db.execute(
-                    "INSERT INTO vm_snapshots(vm,id) VALUES(?1,?2)",
-                    params![request.vm, snapshot],
-                )?;
-                Some(snapshot)
-            }
-        };
+        }
         if request.disk.total().is_some_and(|n| n > 0) {
             db.execute(
                 "INSERT INTO vm_disk_claims VALUES(?1,?2,?3,?4,?5)",
                 params![
                     id,
                     request.vm,
-                    snapshot,
+                    Option::<Id>::None,
                     request.disk.persistent(),
                     request.disk.staging
                 ],
@@ -1251,44 +1253,13 @@ fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Tar
     {
         return Ok(Err(Refusal::Busy));
     }
-    if !matches!(request.operation, Operation::Snapshot { .. }) && request.disk.images != 0 {
+    if request.disk.images != 0 || request.disk.metadata != 0 {
         return Ok(Err(Refusal::Invalid));
     }
-    if !matches!(request.operation, Operation::Snapshot { .. }) && request.disk.metadata != 0 {
-        return Ok(Err(Refusal::Invalid));
+    if store::snapshot::unsettled(db, request.vm)? {
+        return Ok(Err(Refusal::CleanupUnconfirmed));
     }
     match request.operation {
-        Operation::Snapshot { snapshot } if state == 1 && request.disk.images > 0 => {
-            if store::count(
-                db,
-                "SELECT count(*) FROM vm_snapshots WHERE vm=?1",
-                [request.vm],
-            )? >= 4
-                || store::count(db, "SELECT count(*) FROM vm_snapshots", [])? >= 16
-            {
-                return Ok(Err(Refusal::SnapshotLimit));
-            }
-            if store::count(
-                db,
-                "SELECT EXISTS(SELECT 1 FROM vm_snapshots WHERE vm=?1 AND id=?2)",
-                params![request.vm, snapshot],
-            )? != 0
-            {
-                return Ok(Err(Refusal::Busy));
-            }
-            Ok(Ok(Target::Snapshot(snapshot)))
-        }
-        Operation::Restore { snapshot } if state == 1 && request.disk.staging > 0 => {
-            if store::count(
-                db,
-                "SELECT EXISTS(SELECT 1 FROM vm_snapshots WHERE vm=?1 AND id=?2 AND ready=1)",
-                params![request.vm, snapshot],
-            )? == 0
-            {
-                return Ok(Err(Refusal::NotFound));
-            }
-            Ok(Ok(Target::Existing))
-        }
         Operation::Start if state == 1 => {
             if store::count(
                 db,
@@ -1661,6 +1632,9 @@ fn static_target(
     {
         return Ok(Err(Refusal::Busy));
     }
+    if store::snapshot::unsettled(db, request.vm)? {
+        return Ok(Err(Refusal::CleanupUnconfirmed));
+    }
     match (&request.operation, state) {
         (Operation::Start, StaticState::Stopped) => {
             if store::static_vm::launch_busy(db)? {
@@ -1821,9 +1795,14 @@ impl<C: Clock> VmController<C> {
         &self,
         principal: &str,
         vm: Id,
-    ) -> Result<Option<(PairSlots, [ArtifactEvidence; 2])>> {
-        self.store
-            .transact(|db| store::static_vm::active_pair(db, principal, vm))
+    ) -> Result<Option<(PairSlots, [ArtifactEvidence; 2], Id)>> {
+        self.store.transact(|db| {
+            let Some((slots, evidence)) = store::static_vm::active_pair(db, principal, vm)? else {
+                return Ok(None);
+            };
+            let identity = store::static_vm::origin_generation(db, vm)?;
+            Ok(Some((slots, evidence, identity)))
+        })
     }
 }
 
@@ -1908,6 +1887,9 @@ impl<C: Clock> VmController<C> {
             }
             let current = store::publish::current(db)?;
             if let Some((intent, name)) = intent {
+                if store::snapshot::unsettled(db, vm)? {
+                    return Ok(Err(Refusal::Busy));
+                }
                 if current.is_some() {
                     return Ok(Err(Refusal::PublishCleanupPending));
                 }
@@ -1920,6 +1902,14 @@ impl<C: Clock> VmController<C> {
                         "SELECT count(*) FROM activity WHERE vm=?1 AND status=0",
                         [vm],
                     )? != 0
+                {
+                    return Ok(Err(Refusal::NotReady));
+                }
+                if store::count(
+                    db,
+                    "SELECT count(*) FROM vm_generations WHERE static_id=?1 AND id=?2 AND active=1",
+                    params![vm, intent.generation],
+                )? == 0
                 {
                     return Ok(Err(Refusal::NotReady));
                 }
@@ -2048,5 +2038,252 @@ impl<C: Clock> VmController<C> {
     /// Direct store access for pressure and ledger witnesses.
     pub(crate) fn store_for_test(&self) -> &VmStore {
         &self.store
+    }
+}
+
+impl<C: Clock> VmController<C> {
+    pub(crate) fn foreground_snapshot_list(
+        &self,
+        principal: &str,
+        vm: Id,
+        after: Option<Id>,
+        limit: u32,
+    ) -> Result<Result<Vec<store::snapshot::Point>, Refusal>> {
+        self.store
+            .transact(|db| store::snapshot::list(db, principal, vm, after, limit))
+    }
+
+    pub(crate) fn foreground_snapshot_precheck(
+        &self,
+        principal: &str,
+        vm: Id,
+        request: &super::snapshot::Request,
+    ) -> Result<Result<bool, Refusal>> {
+        self.store.transact(|db| {
+            store::snapshot::precheck(db, principal, vm, request, utc(self.clock.now())?)
+        })
+    }
+}
+
+#[cfg(test)]
+impl<C: Clock> VmController<C> {
+    pub(crate) fn finish_fixture_stop(
+        &self,
+        worker: &PendingOperation,
+        vm: Id,
+        pair: Option<store::snapshot::Pair>,
+    ) -> Result<Status> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let now = self.clock.now();
+            let completion = if now.monotonic < worker.deadline {
+                Completion::Succeeded
+            } else {
+                Completion::CleanupUnconfirmed
+            };
+            ensure!(store::count(db,
+                "SELECT count(*) FROM vm_operations WHERE activity_id=?1 AND vm=?2 AND action=4 AND status=0",
+                params![worker.activity_id, vm],
+            )? == 1, "invalid offline release worker");
+            let status = store::settle_operation(db, worker.activity_id, utc(now)?, completion)?;
+            if status == Status::Succeeded && let Some(pair) = pair {
+                store::snapshot::prove_stop(db, vm, pair)?;
+            }
+            Ok(status)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_snapshot(
+        &self,
+        principal: &str,
+        key: RequestId,
+        vm: Id,
+        action: i64,
+        request: &super::snapshot::Request,
+        route: Option<&super::runtime::publication::SnapshotRoute>,
+        host: HostObservation,
+        resources: Resources,
+    ) -> Result<Result<(store::snapshot::Work, PendingOperation, OperationRef), Refusal>> {
+        use super::snapshot::Request;
+        use store::snapshot;
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        map_full(self.store.transact(|db| {
+            let clock = self.clock.now();
+            let now = utc(clock)?;
+            let binding = store::Binding {
+                principal,
+                key,
+                subject: request.binding(vm),
+                action,
+            };
+            match binding.replay(db, now, gate.closed)? {
+                Ok(None) => {}
+                Ok(Some(_)) => return Ok(Err(Refusal::Busy)),
+                Err(reason) => return Ok(Err(reason)),
+            }
+            let is_static = match snapshot::precheck(db, principal, vm, request, now)? {
+                Ok(is_static) => is_static,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            if !snapshot::check_route(db, vm, is_static, route)? {
+                return Ok(Err(Refusal::SnapshotPublishNotQuiesced));
+            }
+            if gate.custody_uncertain || store::has_failed_clone_cleanup(db)? {
+                return Ok(Err(Refusal::Shutdown));
+            }
+            if store::count(db, "SELECT count(*) FROM vm_operations WHERE status=0", [])?
+                >= store::MAX_CALLER_PENDING
+            {
+                return Ok(Err(Refusal::PendingFull));
+            }
+            let Some(active) = snapshot::active(db, vm, is_static)? else {
+                return Ok(Err(Refusal::SnapshotOfflineRequired));
+            };
+            let source = match request {
+                Request::Create(_) if active.clean => active.pair,
+                Request::Create(_) => return Ok(Err(Refusal::SnapshotOfflineRequired)),
+                Request::Restore(id) | Request::Delete(id) => {
+                    let Some(source) =
+                        snapshot::selected(db, vm, *id, is_static, active.lineage, "ready")?
+                    else {
+                        return Ok(Err(Refusal::NotFound));
+                    };
+                    source
+                }
+            };
+            let claim = if matches!(request, Request::Delete(_)) {
+                DiskClaim::default()
+            } else {
+                use super::static_web::FullCopyReservation;
+                let Some(claim) = (FullCopyReservation {
+                    qcow2_bytes: source.1[0].pin.size,
+                    qcow2_growth_bytes: if matches!(request, Request::Restore(_)) {
+                        1 << 20
+                    } else {
+                        0
+                    },
+                    vars_bytes: source.1[1].pin.size,
+                    metadata_bytes: 4096,
+                    staging_bytes: 65536,
+                })
+                .checked_claim() else {
+                    return Ok(Err(Refusal::Disk));
+                };
+                let capacity = match self.policy.host(host, resources) {
+                    Ok(capacity) => capacity,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                if let Err(reason) = self.validate_disk(db, capacity, claim)? {
+                    return Ok(Err(reason));
+                }
+                claim
+            };
+            let worker = self.worker(clock, 15 * 60)?;
+            let (work, reference) = snapshot::reserve(
+                db, vm, is_static, binding, request, active, source, claim, now,
+            )?;
+            Ok(Ok((
+                work,
+                PendingOperation {
+                    activity_id: reference.receipt.activity_id,
+                    ..worker
+                },
+                reference,
+            )))
+        }))
+    }
+
+    fn check_snapshot_worker(
+        &self,
+        worker: &PendingOperation,
+        work: &store::snapshot::Work,
+    ) -> Result<()> {
+        self.check_worker(worker)?;
+        ensure!(
+            worker.activity_id == work.activity && self.clock.now().monotonic < worker.deadline,
+            "snapshot worker token expired"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn snapshot_checkpoint(
+        &self,
+        worker: &PendingOperation,
+        work: &store::snapshot::Work,
+        host: HostObservation,
+        resources: Resources,
+    ) -> Result<()> {
+        self.check_snapshot_worker(worker, work)?;
+        self.store.transact(|db| {
+            ensure!(
+                store::snapshot::can_copy(db, work, utc(self.clock.now())?)?,
+                "snapshot lease closed"
+            );
+            let capacity = self
+                .policy
+                .host(host, resources)
+                .map_err(|_| anyhow::anyhow!("snapshot owner reserve crossed"))?;
+            ensure!(
+                self.validate_disk(db, capacity, DiskClaim::default())?
+                    .is_ok(),
+                "snapshot disk reserve crossed"
+            );
+            Ok(())
+        })
+    }
+
+    pub(crate) fn snapshot_leaf_identity(
+        &self,
+        worker: &PendingOperation,
+        work: &store::snapshot::Work,
+        slot: ArtifactSlot,
+        identity: super::paths::FileIdentity,
+        directory: Id,
+    ) -> Result<()> {
+        self.check_snapshot_worker(worker, work)?;
+        self.store
+            .transact(|db| store::snapshot::record_identity(db, work, slot, identity, directory))
+    }
+
+    pub(crate) fn snapshot_leaf_complete(
+        &self,
+        worker: &PendingOperation,
+        work: &store::snapshot::Work,
+        slot: ArtifactSlot,
+        evidence: ArtifactEvidence,
+    ) -> Result<()> {
+        self.check_snapshot_worker(worker, work)?;
+        self.store
+            .transact(|db| store::snapshot::identify_leaf(db, work, slot, evidence))
+    }
+
+    pub(crate) fn finish_snapshot_copy(
+        &self,
+        worker: &PendingOperation,
+        work: &store::snapshot::Work,
+        pair: [ArtifactEvidence; 2],
+        route: Option<&super::runtime::publication::SnapshotRoute>,
+    ) -> Result<()> {
+        self.check_snapshot_worker(worker, work)?;
+        self.store
+            .transact(|db| store::snapshot::commit(db, work, pair, utc(self.clock.now())?, route))
+    }
+
+    pub(crate) fn fail_snapshot_copy(
+        &self,
+        worker: &PendingOperation,
+        work: &store::snapshot::Work,
+    ) -> Result<()> {
+        self.check_worker(worker)?;
+        ensure!(
+            worker.activity_id == work.activity,
+            "snapshot worker mismatch"
+        );
+        self.store
+            .transact(|db| store::snapshot::fail_copy(db, work, utc(self.clock.now())?))
     }
 }

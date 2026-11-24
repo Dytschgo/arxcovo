@@ -559,6 +559,7 @@ pub(crate) mod publication {
     #[derive(Clone)]
     pub(crate) struct Origin {
         pub(crate) generation: Id,
+        pub(crate) origin_generation: Id,
         pub(crate) boot: Id,
         pub(crate) port: NonZeroU16,
         pub(crate) ca_path: PathBuf,
@@ -609,7 +610,7 @@ pub(crate) mod publication {
 
     impl Origin {
         fn name(&self) -> Result<Hostname, Failure> {
-            let plan = StaticOriginIdentity::for_generation(self.generation).provisioning();
+            let plan = StaticOriginIdentity::for_generation(self.origin_generation).provisioning();
             Hostname::parse(plan.server_name()).map_err(|_| Failure::OriginUnavailable)
         }
 
@@ -1281,7 +1282,44 @@ pub(crate) mod publication {
         workers: std::sync::Mutex<std::collections::HashSet<i64>>,
     }
 
+    /// Held from the runtime route check through the snapshot commit or abort.
+    /// The dispatch gate precedes the effects slot, and registry/local guards
+    /// are released before any SQLite operation.
+    pub(crate) struct SnapshotRoute {
+        vm: Id,
+        _slot: OwnedMutexGuard<()>,
+    }
+
+    impl SnapshotRoute {
+        pub(crate) fn vm(&self) -> Id {
+            self.vm
+        }
+    }
+
     impl Publication {
+        pub(crate) fn snapshot_route(&self, vm: Id) -> Option<SnapshotRoute> {
+            let slot = self.claim()?;
+            let activations = self.activations();
+            let registered = [activations.current.as_ref(), activations.pending.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|activation| activation.vm == vm);
+            if registered || activations.lost {
+                return None;
+            }
+            drop(activations);
+            if self
+                .local
+                .try_lock()
+                .ok()?
+                .as_ref()
+                .is_some_and(|live| live.vm == vm)
+            {
+                return None;
+            }
+            Some(SnapshotRoute { vm, _slot: slot })
+        }
+
         pub(crate) fn prepare(&self, profile: &Arc<Profile>) -> Result<Prepared, Refusal> {
             #[cfg(test)]
             if let Some(fake) = self.fake.lock().unwrap().as_ref() {
@@ -2378,6 +2416,7 @@ pub(crate) mod publication {
 
         fn origin() -> Origin {
             Origin {
+                origin_generation: [1; 16],
                 generation: [1; 16],
                 boot: [2; 16],
                 port: NonZeroU16::new(ORIGIN_PORT_FIRST).unwrap(),

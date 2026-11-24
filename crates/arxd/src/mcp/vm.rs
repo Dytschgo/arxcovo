@@ -8,6 +8,7 @@ use crate::{
             NativeRefusal,
             publication::{Drained, Origin, Profile, Publication},
         },
+        snapshot::{Request as SnapshotRequest, SnapshotName},
         static_web::{StaticName, StaticState},
         *,
     },
@@ -130,6 +131,9 @@ fn refusal_wire(reason: Refusal) -> &'static str {
         Refusal::PublishCredentialMissing => "publish_credential_missing",
         Refusal::PublishTargetMismatch => "publish_target_mismatch",
         Refusal::PublishCleanupPending => "publish_cleanup_pending",
+        Refusal::SnapshotPublishNotQuiesced => "snapshot_publish_not_quiesced",
+        Refusal::StaticBackupDeleteForbidden => "static_backup_delete_forbidden",
+        Refusal::SnapshotOfflineRequired => "snapshot_offline_required",
     }
 }
 
@@ -147,7 +151,7 @@ fn refusal_from_wire(reason: &str) -> Option<Refusal> {
         .find(|code| refusal_wire(*code) == reason)
 }
 
-const REFUSAL_CODES: [Refusal; 48] = {
+const REFUSAL_CODES: [Refusal; 51] = {
     use Refusal::*;
     [
         Invalid,
@@ -198,6 +202,9 @@ const REFUSAL_CODES: [Refusal; 48] = {
         PublishCredentialMissing,
         PublishTargetMismatch,
         PublishCleanupPending,
+        SnapshotPublishNotQuiesced,
+        StaticBackupDeleteForbidden,
+        SnapshotOfflineRequired,
     ]
 };
 
@@ -813,10 +820,14 @@ enum ToolName {
     Publish,
     Unpublish,
     PublishStatus,
+    SnapshotCreate,
+    SnapshotList,
+    SnapshotRestore,
+    SnapshotDelete,
 }
 
 impl ToolName {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 22] = [
         Self::Hosts,
         Self::Activity,
         Self::Catalog,
@@ -835,6 +846,10 @@ impl ToolName {
         Self::Publish,
         Self::Unpublish,
         Self::PublishStatus,
+        Self::SnapshotCreate,
+        Self::SnapshotList,
+        Self::SnapshotRestore,
+        Self::SnapshotDelete,
     ];
 
     fn name(self) -> &'static str {
@@ -857,6 +872,10 @@ impl ToolName {
             Self::Publish => "publish_site",
             Self::Unpublish => "unpublish_site",
             Self::PublishStatus => "publish_status",
+            Self::SnapshotCreate => "vm_snapshot_create",
+            Self::SnapshotList => "vm_snapshot_list",
+            Self::SnapshotRestore => "vm_snapshot_restore",
+            Self::SnapshotDelete => "vm_snapshot_delete",
         }
     }
 
@@ -871,6 +890,9 @@ impl ToolName {
             Self::Extend => Action::Extend as i64,
             Self::Publish => PUBLISH_ACTION,
             Self::Unpublish => UNPUBLISH_ACTION,
+            Self::SnapshotCreate => Action::Snapshot as i64,
+            Self::SnapshotRestore => Action::Restore as i64,
+            Self::SnapshotDelete => SNAPSHOT_DELETE_ACTION,
             _ => return None,
         })
     }
@@ -927,6 +949,28 @@ impl ToolName {
                 },
                 json!({"vm_id":id,"request_id":id}),
                 &["vm_id", "request_id"],
+            ),
+            Self::SnapshotCreate => (
+                "Capture a stopped VM disk and firmware pair",
+                json!({"vm_id":id,"request_id":id,
+                    "name":{"type":"string","minLength":1,"maxLength":48,
+                    "pattern":"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$"}}),
+                &["vm_id", "request_id"],
+            ),
+            Self::SnapshotList => (
+                "List caller-owned VM restore points",
+                json!({"vm_id":id,"limit":{"type":"integer","minimum":1,"maximum":4,"default":4},
+                    "cursor":{"type":"string","maxLength":96,"pattern":"^[A-Za-z0-9_-]+$"}}),
+                &["vm_id"],
+            ),
+            Self::SnapshotRestore | Self::SnapshotDelete => (
+                if self == Self::SnapshotRestore {
+                    "Restore a stopped VM from a sealed pair"
+                } else {
+                    "Delete a stopped TEST VM restore point"
+                },
+                json!({"vm_id":id,"snapshot_id":id,"request_id":id}),
+                &["vm_id", "snapshot_id", "request_id"],
             ),
             Self::PublishStatus => (
                 "Read a caller-owned static site status",
@@ -1097,6 +1141,7 @@ enum Work {
     StaticCreate(StaticName),
     Publish,
     Unpublish,
+    Snapshot(SnapshotRequest),
     Start,
     Stop,
     Script(
@@ -1155,6 +1200,17 @@ impl Mutation {
             ToolName::Publish => Work::Publish,
             ToolName::Unpublish => Work::Unpublish,
             ToolName::Stop => Work::Stop,
+            ToolName::SnapshotCreate => Work::Snapshot(SnapshotRequest::Create(
+                args.optional::<String>("name")?
+                    .map(|name| SnapshotName::parse(&name).map_err(|_| INVALID))
+                    .transpose()?,
+            )),
+            ToolName::SnapshotRestore => {
+                Work::Snapshot(SnapshotRequest::Restore(args.id("snapshot_id")?))
+            }
+            ToolName::SnapshotDelete => {
+                Work::Snapshot(SnapshotRequest::Delete(args.id("snapshot_id")?))
+            }
             ToolName::Script => {
                 let script: String = args.get("script")?;
                 let timeout = args.optional("timeout_s")?.unwrap_or(30);
@@ -1247,7 +1303,7 @@ impl VmInventory {
         }
         let vm = if matches!(
             tool,
-            ToolName::Get | ToolName::StaticGet | ToolName::PublishStatus
+            ToolName::Get | ToolName::StaticGet | ToolName::PublishStatus | ToolName::SnapshotList
         ) {
             args.0
                 .get("vm_id")
@@ -1300,6 +1356,7 @@ impl VmInventory {
                     .finalize()
                     .into(),
             ),
+            Work::Snapshot(snapshot) => snapshot.binding(request.id),
             _ => Subject::Vm(request.id),
         };
         let replay = controller.foreground_replay(&self.principal, request.key, subject, action);
@@ -1337,6 +1394,44 @@ impl VmInventory {
             Work::Script(..) => Some(ForegroundSubject::Script(request.id)),
             Work::Extend(_) => Some(ForegroundSubject::Extend(request.id)),
             Work::Publish | Work::Unpublish => return self.publication(gate, action, request),
+            Work::Snapshot(snapshot) => {
+                let result = controller.foreground_snapshot_precheck(
+                    &self.principal,
+                    request.id,
+                    snapshot,
+                )?;
+                let is_static = match result {
+                    Ok(is_static) => is_static,
+                    Err(reason) => return self.refuse(action, request.vm(), reason.into()),
+                };
+                let route = if is_static {
+                    let Some(proof) = self
+                        .supervisor
+                        .publisher
+                        .snapshot_route(request.id)
+                        .filter(|proof| proof.vm() == request.id)
+                    else {
+                        return self.refuse(
+                            action,
+                            request.vm(),
+                            Refusal::SnapshotPublishNotQuiesced.into(),
+                        );
+                    };
+                    Some(proof)
+                } else {
+                    None
+                };
+                #[cfg(test)]
+                if let Some(fixture) = &mut gate.fixture {
+                    return fixture.snapshot(self, action, request, route);
+                }
+                let _route = route;
+                return self.refuse(
+                    action,
+                    request.vm(),
+                    Fault(native_reason(self.supervisor.native_refusal)),
+                );
+            }
         };
         if let Some(subject) = subject
             && let Err(reason) = controller.foreground_precheck(&self.principal, subject)?
@@ -1556,6 +1651,7 @@ impl VmInventory {
                 )
             }
             ToolName::Activity => self.activity(args),
+            ToolName::SnapshotList => self.snapshot_page(args),
             ToolName::Catalog | ToolName::List | ToolName::StaticList => {
                 self.page(gate, tool, args)
             }
@@ -1682,28 +1778,94 @@ impl VmInventory {
         Ok(value)
     }
 
-    fn cursor(&self, tool: ToolName, (kind, id): (u8, Id)) -> String {
+    fn snapshot_page(&self, mut args: Args) -> Outcome<Value> {
+        let vm = args.id("vm_id")?;
+        let limit: u32 = args.optional("limit")?.unwrap_or(snapshot::POINTS_PER_VM);
+        if !(1..=snapshot::POINTS_PER_VM).contains(&limit) {
+            return Err(INVALID);
+        }
+        let cursor: Option<String> = args.optional("cursor")?;
+        args.end()?;
+        let tool = ToolName::SnapshotList;
+        let after = cursor
+            .as_deref()
+            .map(|cursor| {
+                self.decode_scoped_cursor(tool, Some(vm), cursor)
+                    .map(|(_, id)| id)
+            })
+            .transpose()?;
+        let mut points = self.supervisor.controller.foreground_snapshot_list(
+            &self.principal,
+            vm,
+            after,
+            limit + 1,
+        )??;
+        let mut page = json!({"vm_id":hex::encode(vm)});
+        if points.len() > limit as usize {
+            points.pop();
+            let last = points.last().expect("positive limit");
+            page["next_cursor"] = json!(self.scoped_cursor(tool, Some(vm), (0, last.id)));
+        }
+        page["entries"] = Value::Array(
+            points
+                .into_iter()
+                .map(|point| {
+                    let mut row = json!({
+                        "snapshot_id":hex::encode(point.id),
+                        "captured_at_ms":point.captured_ms,
+                        "charged_bytes":point.charge,
+                        "protected":point.protected,
+                        "restore_eligible":point.restore_eligible,
+                    });
+                    if let Some(name) = point.name {
+                        row["name"] = json!(name);
+                    }
+                    row
+                })
+                .collect(),
+        );
+        Ok(page)
+    }
+
+    fn cursor(&self, tool: ToolName, key: (u8, Id)) -> String {
+        self.scoped_cursor(tool, None, key)
+    }
+
+    fn scoped_cursor(&self, tool: ToolName, vm: Option<Id>, (kind, id): (u8, Id)) -> String {
         let mut bytes = [0; 51];
         bytes[0] = 1;
         bytes[1] = kind;
         bytes[2..18].copy_from_slice(&id);
-        let tag = self.cursor_mac(tool, &bytes[..19]);
+        let tag = self.cursor_mac(tool, vm, &bytes[..19]);
         bytes[19..].copy_from_slice(tag.as_ref());
         encode_cursor(bytes)
     }
 
-    fn cursor_mac(&self, tool: ToolName, bytes: &[u8]) -> hmac::Tag {
+    fn cursor_mac(&self, tool: ToolName, vm: Option<Id>, bytes: &[u8]) -> hmac::Tag {
         let mut mac = hmac::Context::with_key(&self.supervisor.cursor_key);
         mac.update(b"arxcovo.vm.cursor.v1\0");
         mac.update(tool.name().as_bytes());
         mac.update(&[0]);
         mac.update(self.principal.as_bytes());
         mac.update(&[0]);
+        if let Some(vm) = vm {
+            mac.update(&self.supervisor.host_id);
+            mac.update(&vm);
+        }
         mac.update(bytes);
         mac.sign()
     }
 
     fn decode_cursor(&self, tool: ToolName, value: &str) -> Outcome<(u8, Id)> {
+        self.decode_scoped_cursor(tool, None, value)
+    }
+
+    fn decode_scoped_cursor(
+        &self,
+        tool: ToolName,
+        vm: Option<Id>,
+        value: &str,
+    ) -> Outcome<(u8, Id)> {
         use subtle::ConstantTimeEq;
         let bytes = decode_cursor(value)?;
         let valid_kind = if tool == ToolName::Catalog {
@@ -1711,7 +1873,7 @@ impl VmInventory {
         } else {
             bytes[1] == 0
         };
-        let expected = self.cursor_mac(tool, &bytes[..19]);
+        let expected = self.cursor_mac(tool, vm, &bytes[..19]);
         if bytes[0] != 1
             || !valid_kind
             || bytes[18] != 0
@@ -1900,6 +2062,9 @@ fn operation_row(operation: OperationStatus) -> Value {
     if let Some(vm) = operation.vm {
         value["vm_id"] = json!(hex::encode(vm));
     }
+    if let Some(snapshot) = operation.snapshot {
+        value["snapshot_id"] = json!(hex::encode(snapshot));
+    }
     if let Some(recipe) = operation.recipe {
         value["recipe_id"] = json!(recipe);
     }
@@ -1942,6 +2107,7 @@ fn action_wire(code: i64) -> Option<&'static str> {
         HOST_REFUSAL_ACTION => "host_execution",
         PUBLISH_ACTION => "publish",
         UNPUBLISH_ACTION => "unpublish",
+        SNAPSHOT_DELETE_ACTION => "snapshot_delete",
         _ => return None,
     })
 }
@@ -2101,6 +2267,20 @@ mod tests {
             proof: ArtifactEvidence,
             delete: bool,
         ) -> Result<custody::Held> {
+            let mut held = self.hold_identity(slot, proof, delete)?;
+            ensure!(
+                proof.pin.verify(&mut held.file, SNAPSHOT_FILE_LIMIT)?,
+                "fixture artifact changed"
+            );
+            Ok(held)
+        }
+
+        fn hold_identity(
+            &self,
+            slot: ArtifactSlot,
+            proof: ArtifactEvidence,
+            delete: bool,
+        ) -> Result<custody::Held> {
             let path = self.0.path(slot.role, slot.key);
             let (parent, name) = path
                 .parent()
@@ -2115,20 +2295,48 @@ mod tests {
                     },
                 "fixture directory changed"
             );
-            let mut file = custody::open_leaf(&directory, &path, name, delete)?;
+            let file = custody::open_leaf(&directory, &path, name, delete)?;
             ensure!(
                 custody::identity(&file, false)? == proof.identity,
                 "fixture artifact identity changed"
-            );
-            ensure!(
-                proof.pin.verify(&mut file, 131_072)?,
-                "fixture artifact changed"
             );
             Ok(custody::Held {
                 directory,
                 file,
                 name: name.to_owned(),
             })
+        }
+
+        /// Observe the stopped fixture writer's current bytes through the
+        /// recorded identities. The handles stay held through stop settlement.
+        fn released_pair(&self, (slots, [disk, vars]): Pair) -> Result<([custody::Held; 2], Pair)> {
+            let mut held = [
+                self.hold_identity(slots.disk, disk, false)?,
+                self.hold_identity(slots.vars, vars, false)?,
+            ];
+            let observe = |file: &mut fs::File, mut evidence: ArtifactEvidence| {
+                use std::io::Read;
+                let mut hash = Sha256::new();
+                let size = std::io::copy(&mut file.take(SNAPSHOT_FILE_LIMIT + 1), &mut hash)?;
+                ensure!(
+                    (1..=SNAPSHOT_FILE_LIMIT).contains(&size),
+                    "fixture pair exceeds bound"
+                );
+                evidence.pin = crate::vm::paths::ArtifactPin {
+                    size,
+                    sha256: hash.finalize().into(),
+                };
+                Ok::<_, anyhow::Error>(evidence)
+            };
+            let proof = [
+                observe(&mut held[0].file, disk)?,
+                observe(&mut held[1].file, vars)?,
+            ];
+            ensure!(
+                proof[1].pin.size == vars.pin.size,
+                "fixture firmware variables size changed"
+            );
+            Ok((held, (slots, proof)))
         }
 
         fn verify(&self, slot: ArtifactSlot, proof: ArtifactEvidence) -> Result<()> {
@@ -2494,6 +2702,357 @@ mod tests {
         header
     }
 
+    const SNAPSHOT_VM_BYTES: u64 = 1 << 20;
+    const SNAPSHOT_FILE_LIMIT: u64 = 131_072;
+
+    fn fixture_snapshot_path(slot: ArtifactSlot) -> crate::vm::paths::LocalPath {
+        crate::vm::paths::LocalPath::parse("D:/fixture-snapshot")
+            .unwrap()
+            .join(&hex::encode(slot.generation))
+            .unwrap()
+            .join(&format!("{}-{}", slot.role, hex::encode(slot.key)))
+            .unwrap()
+    }
+
+    fn fixture_snapshot_overlay(golden: ArtifactSlot) -> Vec<u8> {
+        let mut disk = fixture_qcow2();
+        let backing = fixture_snapshot_path(golden);
+        let backing = backing.as_str().as_bytes();
+        disk[8..16].copy_from_slice(&144u64.to_be_bytes());
+        disk[16..20].copy_from_slice(&(backing.len() as u32).to_be_bytes());
+        disk[112..116].copy_from_slice(&0xe279_2acau32.to_be_bytes());
+        disk[116..120].copy_from_slice(&5u32.to_be_bytes());
+        disk[120..125].copy_from_slice(b"qcow2");
+        disk[144..144 + backing.len()].copy_from_slice(backing);
+        disk
+    }
+
+    struct FixtureCopy<'a> {
+        controller: &'a Controller,
+        work: &'a crate::store::vm::snapshot::Work,
+        host: HostObservation,
+        active: [custody::Held; 2],
+        source: Option<[custody::Held; 2]>,
+        golden: Option<custody::Held>,
+        staging: [fs::File; 2],
+    }
+
+    impl FixtureCopy<'_> {
+        fn files(&mut self, side: snapshot::Side) -> [&mut fs::File; 2] {
+            match side {
+                snapshot::Side::Staging => self.staging.each_mut(),
+                snapshot::Side::Active => self.active.each_mut().map(|held| &mut held.file),
+                snapshot::Side::Source => self
+                    .source
+                    .as_mut()
+                    .unwrap_or(&mut self.active)
+                    .each_mut()
+                    .map(|held| &mut held.file),
+            }
+        }
+    }
+
+    impl snapshot::CopyCustody for FixtureCopy<'_> {
+        fn checkpoint(
+            &mut self,
+            _: &snapshot::CopyPlan,
+            worker: &PendingOperation,
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<(), snapshot::Refusal> {
+            self.controller
+                .snapshot_checkpoint(worker, self.work, self.host, RESOURCES)
+                .map_err(|_| snapshot::Refusal::Custody)
+        }
+
+        fn observe(
+            &mut self,
+            side: snapshot::Side,
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<[snapshot::Observation; 2], snapshot::Refusal> {
+            let [disk, vars] = self.files(side);
+            let inspect = |file: &fs::File| -> Result<snapshot::Observation, snapshot::Refusal> {
+                Ok(snapshot::Observation {
+                    identity: custody::identity(file, false)
+                        .map_err(|_| snapshot::Refusal::Identity)?,
+                    size: file.metadata().map_err(|_| snapshot::Refusal::Io)?.len(),
+                })
+            };
+            Ok([inspect(disk)?, inspect(vars)?])
+        }
+
+        fn read(
+            &mut self,
+            side: snapshot::Side,
+            role: snapshot::FileRole,
+            offset: u64,
+            bytes: &mut [u8],
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<(), snapshot::Refusal> {
+            use std::io::{Read, Seek, SeekFrom};
+            let index = usize::from(role == snapshot::FileRole::Vars);
+            let file = &mut self.files(side)[index];
+            file.seek(SeekFrom::Start(offset))
+                .and_then(|_| file.read_exact(bytes))
+                .map_err(|_| snapshot::Refusal::Io)
+        }
+
+        fn write_staging(
+            &mut self,
+            role: snapshot::FileRole,
+            offset: u64,
+            bytes: &[u8],
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<(), snapshot::Refusal> {
+            use std::io::{Seek, SeekFrom, Write};
+            let file = &mut self.staging[usize::from(role == snapshot::FileRole::Vars)];
+            file.seek(SeekFrom::Start(offset))
+                .and_then(|_| file.write_all(bytes))
+                .map_err(|_| snapshot::Refusal::Io)
+        }
+
+        fn golden_header(
+            &mut self,
+            golden: &snapshot::Golden,
+            header: &mut [u8],
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<(), snapshot::Refusal> {
+            use std::io::{Read, Seek};
+            let file = &mut self.golden.as_mut().ok_or(snapshot::Refusal::Custody)?.file;
+            file.rewind().map_err(|_| snapshot::Refusal::Io)?;
+            if custody::identity(file, false).map_err(|_| snapshot::Refusal::Identity)?
+                != golden.identity
+                || !golden
+                    .pin
+                    .verify(&mut *file, SNAPSHOT_FILE_LIMIT)
+                    .map_err(|_| snapshot::Refusal::Pin)?
+            {
+                return Err(snapshot::Refusal::Pin);
+            }
+            file.rewind()
+                .and_then(|_| file.read_exact(header))
+                .map_err(|_| snapshot::Refusal::Io)
+        }
+
+        fn inspect(
+            &mut self,
+            info: &crate::vm::qemu_args::SnapshotInfo<'_>,
+            output: &mut [u8],
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<usize, snapshot::Refusal> {
+            let path = info.path().as_str();
+            if info.args() != ["info", "--output=json", "-f", "qcow2", path] {
+                return Err(snapshot::Refusal::Inspection);
+            }
+            let mut body = json!({
+                "filename":path,
+                "format":"qcow2",
+                "virtual-size":SNAPSHOT_VM_BYTES,
+                "actual-size":self.work.source.1[0].pin.size,
+                "dirty-flag":false,
+            });
+            if let Some(golden) = info.golden() {
+                let golden = golden
+                    .path_for(crate::vm::paths::ArtifactRole::Golden)
+                    .map_err(|_| snapshot::Refusal::Inspection)?
+                    .as_str();
+                body["backing-filename"] = json!(golden);
+                body["full-backing-filename"] = json!(golden);
+                body["backing-filename-format"] = json!("qcow2");
+            }
+            let encoded = serde_json::to_vec(&body).map_err(|_| snapshot::Refusal::Inspection)?;
+            output
+                .get_mut(..encoded.len())
+                .ok_or(snapshot::Refusal::Inspection)?
+                .copy_from_slice(&encoded);
+            Ok(encoded.len())
+        }
+
+        fn flush_staging(&mut self, _: &snapshot::CopyBudget<'_>) -> Result<(), snapshot::Refusal> {
+            for leaf in &self.staging {
+                leaf.sync_all().map_err(|_| snapshot::Refusal::Io)?;
+            }
+            #[cfg(unix)]
+            self.active[0]
+                .directory
+                .sync_all()
+                .map_err(|_| snapshot::Refusal::Io)?;
+            Ok(())
+        }
+    }
+
+    fn copy_fixture_snapshot(
+        artifacts: &Artifacts,
+        controller: &Controller,
+        work: &crate::store::vm::snapshot::Work,
+        worker: &PendingOperation,
+        route: Option<&runtime::publication::SnapshotRoute>,
+        host: HostObservation,
+        cancel: &Shutdown,
+    ) -> Result<Pair> {
+        use snapshot::{
+            ActiveRelease, Compatibility, CopyPlan, Destination, Golden, Leaf, Limits, Lineage,
+            StoredPair,
+        };
+        let slots = work.candidate.expect("copy candidate");
+        let held_pair = |(slots, [disk, vars]): Pair| {
+            Ok::<_, anyhow::Error>([
+                artifacts.hold(slots.disk, disk, false)?,
+                artifacts.hold(slots.vars, vars, false)?,
+            ])
+        };
+        let active = held_pair(work.active.pair)?;
+        let source = (work.action == 6)
+            .then(|| held_pair(work.source))
+            .transpose()?;
+        let (lineage, golden) = if let Some((golden_slots, [golden, _])) = work.active.golden {
+            let slot = golden_slots.disk;
+            (
+                Lineage::Test {
+                    template: work.active.template,
+                    golden: Golden {
+                        object: slot.key,
+                        path: fixture_snapshot_path(slot),
+                        identity: golden.identity,
+                        pin: golden.pin,
+                    },
+                },
+                Some(artifacts.hold(slot, golden, false)?),
+            )
+        } else {
+            (
+                Lineage::Static {
+                    origin: work.active.origin,
+                },
+                None,
+            )
+        };
+        let compatibility = Compatibility {
+            host: work.active.host,
+            vm: work.vm,
+            lineage,
+            recipe: work.active.recipe,
+            firmware: crate::vm::paths::ArtifactPin {
+                size: b"fixture firmware".len() as u64,
+                sha256: Sha256::digest(b"fixture firmware").into(),
+            },
+            virtual_disk_bytes: SNAPSHOT_VM_BYTES,
+            vars_bytes: work.active.pair.1[1].pin.size,
+        };
+        let map_leaf = |slot: ArtifactSlot, proof: ArtifactEvidence| Leaf {
+            key: slot.key,
+            path: fixture_snapshot_path(slot),
+            identity: proof.identity,
+            pin: proof.pin,
+        };
+        let stored = |(slots, [disk, vars]): Pair| StoredPair {
+            compatibility: compatibility.clone(),
+            generation: slots.disk.generation,
+            disk: map_leaf(slots.disk, disk),
+            vars: map_leaf(slots.vars, vars),
+        };
+        let action = if work.action == 5 {
+            snapshot::Action::Capture {
+                snapshot: work.target,
+            }
+        } else {
+            snapshot::Action::Restore {
+                snapshot: work.target,
+            }
+        };
+        let [vm_points, host_points] = work.points;
+        let plan = CopyPlan::new(
+            snapshot::Intent {
+                activity_id: work.activity,
+                action,
+                active: stored(work.active.pair),
+                active_writer_epoch: work.active.epoch,
+                release: ActiveRelease {
+                    generation: work.active.pair.0.disk.generation,
+                    writer_epoch: work.active.epoch,
+                    disposition: if work.active.clean {
+                        runtime::StopDisposition::CleanRelease
+                    } else {
+                        runtime::StopDisposition::DirtyRelease
+                    },
+                    endpoints_released: true,
+                },
+                selected: (work.action == 6).then(|| (work.target, stored(work.source))),
+                destination: Destination {
+                    generation: slots.disk.generation,
+                    disk_key: slots.disk.key,
+                    vars_key: slots.vars.key,
+                },
+            },
+            &crate::vm::paths::LocalPath::parse("D:/fixture-snapshot").unwrap(),
+            work.active.pair.1[0].identity.volume,
+            Limits {
+                vm_points,
+                host_points,
+                max_file_bytes: SNAPSHOT_FILE_LIMIT,
+                max_virtual_bytes: SNAPSHOT_VM_BYTES,
+                restore_growth_bytes: if work.action == 6 {
+                    SNAPSHOT_VM_BYTES
+                } else {
+                    0
+                },
+                staging_bytes: work.claim.staging,
+                metadata_bytes: work.claim.metadata,
+            },
+        )
+        .map_err(|reason| anyhow::anyhow!("fixture snapshot plan: {reason:?}"))?;
+        ensure!(
+            plan.additional_claim().total() == work.claim.total(),
+            "fixture snapshot charge changed"
+        );
+        let create = |slot: ArtifactSlot, directory| {
+            let path = artifacts.0.path(slot.role, slot.key);
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            let identity = custody::identity(&file, false)?;
+            controller.snapshot_leaf_identity(worker, work, slot, identity, directory)?;
+            protect_fixture(&path, false)?;
+            Ok::<_, anyhow::Error>((file, identity))
+        };
+        controller.snapshot_checkpoint(worker, work, host, RESOURCES)?;
+        let directory = work.active.pair.1[0].directory;
+        let (disk, disk_identity) = create(slots.disk, directory)?;
+        let (vars, vars_identity) = create(slots.vars, directory)?;
+        let mut custody = FixtureCopy {
+            controller,
+            work,
+            host,
+            active,
+            source,
+            golden,
+            staging: [disk, vars],
+        };
+        let cancelled = || cancel.is_cancelled();
+        let mut copied = snapshot::copy_pair(
+            &plan,
+            worker,
+            &mut custody,
+            [disk_identity, vars_identity],
+            &cancelled,
+        )
+        .map_err(|reason| anyhow::anyhow!("fixture snapshot copy: {reason:?}"))?;
+        let [disk, vars] =
+            [&copied.pair().disk, &copied.pair().vars].map(|leaf| ArtifactEvidence {
+                identity: leaf.identity,
+                pin: leaf.pin,
+                directory,
+            });
+        controller.snapshot_leaf_complete(worker, work, slots.disk, disk)?;
+        controller.snapshot_leaf_complete(worker, work, slots.vars, vars)?;
+        copied
+            .recheck()
+            .map_err(|reason| anyhow::anyhow!("fixture snapshot recheck: {reason:?}"))?;
+        controller.finish_snapshot_copy(worker, work, [disk, vars], route)?;
+        Ok((slots, [disk, vars]))
+    }
+
     /// The fixture's teardown authority for the 4c2b reaper. Release is
     /// offline only when no fixture boot or worker holds the subject.
     #[derive(Clone)]
@@ -2582,6 +3141,7 @@ mod tests {
         static_hold: Option<Arc<Notify>>,
         static_fault: Option<StaticFault>,
         windows_recipe: bool,
+        pub(super) snapshot_test_media: bool,
         host: HostObservation,
         /// A cancelled build worker reports failure, to witness drain errors.
         fail_cancelled: bool,
@@ -2626,6 +3186,7 @@ mod tests {
                 static_hold: None,
                 static_fault: None,
                 windows_recipe: false,
+                snapshot_test_media: false,
                 host: HOST,
                 fail_cancelled: false,
                 failed: false,
@@ -2674,6 +3235,89 @@ mod tests {
             }
         }
 
+        pub(super) fn snapshot(
+            &mut self,
+            inventory: &VmInventory,
+            action: i64,
+            mutation: Mutation,
+            route: Option<runtime::publication::SnapshotRoute>,
+        ) -> Outcome<Value> {
+            self.reap();
+            let Mutation {
+                key,
+                id: vm,
+                work: Work::Snapshot(request),
+            } = mutation
+            else {
+                unreachable!("snapshot mutation");
+            };
+            if self.failed {
+                return Err(STATE_UNAVAILABLE);
+            }
+            let controller = &inventory.supervisor.controller;
+            let mut registry = self.live.lock().unwrap();
+            if registry.working.contains(&vm) || registry.boots.contains_key(&vm) {
+                return inventory.refuse(action, Some(vm), Refusal::SnapshotOfflineRequired.into());
+            }
+            let (work, worker, operation) = match controller.admit_snapshot(
+                &inventory.principal,
+                key,
+                vm,
+                action,
+                &request,
+                route.as_ref(),
+                self.host,
+                RESOURCES,
+            )? {
+                Ok(work) => work,
+                Err(reason) => return inventory.refuse(action, Some(vm), reason.into()),
+            };
+            if work.candidate.is_none() {
+                let reaper = self.reaper();
+                drop(registry);
+                let controller = controller.clone();
+                self.jobs.spawn(async move {
+                    controller.sweep_with(&reaper, &*reaper.custody)?;
+                    Ok(())
+                });
+            } else {
+                let artifacts = self.artifacts.clone();
+                let cancel = inventory.supervisor.cancel.clone();
+                let controller = controller.clone();
+                registry.working.insert(vm);
+                let working = Working(self.live.clone(), vm);
+                let host = self.host;
+                self.jobs.spawn(async move {
+                    let _working = working;
+                    let copied = copy_fixture_snapshot(
+                        &artifacts,
+                        &controller,
+                        &work,
+                        &worker,
+                        route.as_ref(),
+                        host,
+                        &cancel,
+                    );
+                    match copied {
+                        Ok(pair) if work.action == 6 => {
+                            let mut live = _working.0.lock().unwrap();
+                            if work.is_static {
+                                if let Some((current, _)) = live.static_instances.get_mut(&vm) {
+                                    *current = pair;
+                                }
+                            } else {
+                                live.instances.insert(vm, pair);
+                            }
+                        }
+                        Err(_) => controller.fail_snapshot_copy(&worker, &work)?,
+                        _ => {}
+                    }
+                    Ok(())
+                });
+            }
+            Ok(receipt(operation.id, None))
+        }
+
         pub(super) fn admit(
             &mut self,
             inventory: &VmInventory,
@@ -2711,7 +3355,8 @@ mod tests {
                     let recipe = hex::encode(id);
                     let web = id == WEB_RECIPE_ID;
                     let windows = id == Controller::windows_recipe_id();
-                    let (retained, transient) = if web {
+                    let snapshot_image = self.snapshot_test_media && !windows;
+                    let (retained, transient) = if web || snapshot_image {
                         (WEB_RETAINED, WEB_TRANSIENT)
                     } else if windows {
                         (RETAINED, WINDOWS_TRANSIENT)
@@ -2786,7 +3431,7 @@ mod tests {
                         ];
                         let mut proof = Vec::new();
                         for slot in [disk, vars, seed, overlay, verify_vars] {
-                            let file = if web && slot == disk {
+                            let file = if (web || snapshot_image) && slot == disk {
                                 artifacts.stage(slot, &fixture_qcow2())?
                             } else {
                                 artifacts.write(slot)?
@@ -2886,11 +3531,16 @@ mod tests {
                         .ok_or(STATE_UNAVAILABLE)?;
                     artifacts.verify(golden.disk, proof[0])?;
                     artifacts.verify(golden.vars, proof[1])?;
+                    let snapshot_image = self.snapshot_test_media;
                     let request = Request {
                         principal,
                         request_id: key,
                         vm: [0; 16],
-                        disk: RETAINED,
+                        disk: if snapshot_image {
+                            WEB_RETAINED
+                        } else {
+                            RETAINED
+                        },
                         operation: Operation::Clone {
                             template: id,
                             lease_seconds: Some(ttl),
@@ -2915,7 +3565,12 @@ mod tests {
                         .operation_status(principal, reference.id)??
                         .expires_at_ms;
                     self.jobs.spawn(async move {
-                        let pair = [artifacts.write(slots.disk)?, artifacts.write(slots.vars)?];
+                        let disk = if snapshot_image {
+                            artifacts.stage(slots.disk, &fixture_snapshot_overlay(golden.disk))?
+                        } else {
+                            artifacts.write(slots.disk)?
+                        };
+                        let pair = [disk, artifacts.write(slots.vars)?];
                         let mut registry = live.lock().unwrap();
                         ensure!(
                             controller.finish_linked_clone(&worker, slots, Some(pair))?
@@ -2934,8 +3589,8 @@ mod tests {
                         .ok_or(STATE_UNAVAILABLE)?;
                     return Ok(receipt(replay.operation.id, Some(end)));
                 }
-                Work::Publish | Work::Unpublish => {
-                    unreachable!("publication has separate admission")
+                Work::Publish | Work::Unpublish | Work::Snapshot(_) => {
+                    unreachable!("separate mutation admission")
                 }
                 Work::Start => (Operation::Start, id),
                 Work::Stop => (Operation::Stop, id),
@@ -2965,12 +3620,12 @@ mod tests {
                 // origin key is in memory only, so a fresh one is issued
                 // for the same generation name.
                 match controller.static_custody(principal, vm)? {
-                    Some(pair) => {
-                        let origin = FixtureOrigin::new(pair.0.disk.generation)
-                            .map_err(|_| STATE_UNAVAILABLE)?;
+                    Some((slots, evidence, origin_generation)) => {
+                        let origin =
+                            FixtureOrigin::new(origin_generation).map_err(|_| STATE_UNAVAILABLE)?;
                         registry
                             .static_instances
-                            .insert(vm, (pair, Arc::new(origin)));
+                            .insert(vm, ((slots, evidence), Arc::new(origin)));
                     }
                     None => return inventory.refuse(action, Some(vm), Refusal::NotReady.into()),
                 }
@@ -2994,13 +3649,28 @@ mod tests {
                 Work::Start => {
                     let controller = controller.clone();
                     let static_pair = registry.static_instances.get(&vm).cloned();
+                    let test_pair = self
+                        .snapshot_test_media
+                        .then(|| registry.instances.get(&vm).copied())
+                        .flatten();
                     self.jobs.spawn(async move {
                         let _working = working;
                         let boot = match static_pair {
                             Some((pair, identity)) => {
                                 Boot::start_static(&artifacts, pair, &identity, &cancel).await
                             }
-                            None => Boot::start(&cancel).await,
+                            None => {
+                                let verified = test_pair
+                                    .map(|(slots, [disk, vars])| {
+                                        artifacts.verify(slots.disk, disk)?;
+                                        artifacts.verify(slots.vars, vars)
+                                    })
+                                    .transpose();
+                                match verified {
+                                    Ok(_) => Boot::start(&cancel).await,
+                                    Err(error) => Err(error),
+                                }
+                            }
                         };
                         match boot {
                             Ok(boot) => {
@@ -3043,6 +3713,11 @@ mod tests {
                     {
                         origin.retired.retire();
                     }
+                    let pair = registry
+                        .static_instances
+                        .get(&vm)
+                        .map(|(pair, _)| *pair)
+                        .or_else(|| registry.instances.get(&vm).copied());
                     let supervisor = inventory.supervisor.clone();
                     let controller = controller.clone();
                     self.jobs.spawn(async move {
@@ -3060,7 +3735,37 @@ mod tests {
                             },
                             None => (Completion::CleanupUnconfirmed, None),
                         };
-                        controller.finish_with_cause(&worker, completion, cause)?;
+                        if local && completion == Completion::Succeeded {
+                            match pair.map(|pair| artifacts.released_pair(pair)).transpose() {
+                                Ok(Some((held, pair))) => {
+                                    let mut live = live.lock().unwrap();
+                                    if controller.finish_fixture_stop(&worker, vm, Some(pair))?
+                                        == Status::Succeeded
+                                    {
+                                        if let Some((current, _)) =
+                                            live.static_instances.get_mut(&vm)
+                                        {
+                                            *current = pair;
+                                        } else {
+                                            live.instances.insert(vm, pair);
+                                        }
+                                    }
+                                    drop(held);
+                                }
+                                Ok(None) => {
+                                    controller.finish_fixture_stop(&worker, vm, None)?;
+                                }
+                                Err(_) => {
+                                    controller.finish_with_cause(
+                                        &worker,
+                                        Completion::CleanupUnconfirmed,
+                                        Some(FailureReason::CleanupUnconfirmed),
+                                    )?;
+                                }
+                            }
+                        } else {
+                            controller.finish_with_cause(&worker, completion, cause)?;
+                        }
                         if local {
                             Ok(())
                         } else {
@@ -3281,6 +3986,7 @@ mod tests {
     /// Synthetic guest endpoint and independently configured host trust.
     /// This fixture has no production serial encoder, and never logs key bytes.
     struct FixtureOrigin {
+        generation: Id,
         name: String,
         guest: Arc<rustls::ServerConfig>,
         client: Arc<rustls::ClientConfig>,
@@ -3326,6 +4032,7 @@ mod tests {
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             Ok(Self {
+                generation,
                 name,
                 guest: Arc::new(guest),
                 client: Arc::new(client),
@@ -3393,6 +4100,7 @@ mod tests {
             }
             boot.publish_origin = Some(Origin {
                 generation: slots.disk.generation,
+                origin_generation: identity.generation,
                 boot: crate::store::vm::new_id()?,
                 port: origin.port().try_into()?,
                 ca_path: artifacts.0.path("origin_ca", slots.disk.generation),
@@ -4096,6 +4804,249 @@ mod tests {
                 "static_delete_forbidden"
             );
         }
+        h.shutdown().await.unwrap();
+    }
+
+    fn fixture_pair_paths(h: &Harness, vm: &Value, active: bool) -> [std::path::PathBuf; 2] {
+        let vm = parse_id(vm.as_str().unwrap()).unwrap();
+        h.supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                let mut query = db.prepare(
+                    "SELECT a.role,a.object_key FROM vm_generations g
+                 JOIN vm_artifacts a ON a.generation_id=g.id
+                 WHERE (g.vm_id=?1 OR g.static_id=?1) AND g.active=?2
+                    AND a.state=CASE WHEN ?2 THEN 'active' ELSE 'pending_disposal' END
+                 ORDER BY role LIMIT 3",
+                )?;
+                let files = query
+                    .query_map(rusqlite::params![vm, active], |row| {
+                        Ok(h.media.join(format!(
+                            "{}-{}",
+                            row.get::<_, String>(0)?,
+                            hex::encode(row.get::<_, Id>(1)?)
+                        )))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(files.try_into().expect("exact fixture pair"))
+            })
+            .unwrap()
+    }
+
+    fn simulate_pair_write(paths: &[std::path::PathBuf; 2]) -> [Vec<u8>; 2] {
+        use std::io::{Seek, SeekFrom, Write};
+        let saved = paths.each_ref().map(|path| fs::read(path).unwrap());
+        for (path, offset, marker) in [(&paths[0], 4096, b'D'), (&paths[1], 0, b'V')] {
+            let mut writer = fs::OpenOptions::new().write(true).open(path).unwrap();
+            writer.seek(SeekFrom::Start(offset)).unwrap();
+            writer.write_all(&[marker]).unwrap();
+            writer.sync_all().unwrap();
+        }
+        saved
+    }
+
+    #[tokio::test]
+    async fn static_snapshot_keeps_origin_and_refuses_a_durable_b2_route() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let b = h.client(1).await;
+        let (vm, fake) = enrolled(&h, &a, 1800).await;
+        let args = |nonce| json!({"vm_id":vm,"request_id":key(nonce)});
+        let published = call(&a, "publish_site", args(1803)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let capture = json!({"vm_id":vm,"request_id":key(1804),"name":"Before-Update"});
+        assert_eq!(
+            call(&a, "vm_snapshot_create", capture.clone()).await["reason"],
+            "snapshot_publish_not_quiesced"
+        );
+        let unpublished = call(&a, "unpublish_site", args(1805)).await;
+        assert_eq!(terminal(&a, &unpublished).await["state"], "succeeded");
+        let stop = call(&a, "vm_stop", args(1806)).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+
+        let store = h.supervisor().controller.store_for_test();
+        let vm_id = parse_id(vm.as_str().unwrap()).unwrap();
+        let generation = |column: &str| {
+            let sql = match column {
+                "origin" => "SELECT origin_generation FROM vm_static_instances WHERE id=?1",
+                _ => "SELECT id FROM vm_generations WHERE static_id=?1 AND active=1",
+            };
+            store
+                .transact(|db| Ok(db.query_row(sql, [vm_id], |row| row.get::<_, Id>(0))?))
+                .unwrap()
+        };
+        let original = generation("origin");
+        assert_eq!(original, generation("active"));
+
+        let created = call(&a, "vm_snapshot_create", capture.clone()).await;
+        let row = terminal(&a, &created).await;
+        assert_eq!(row["state"], "succeeded", "{row}");
+        let point = row["snapshot_id"].clone();
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm,"request_id":key(1804),"name":"before-update"})
+            )
+            .await,
+            created
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm,"request_id":key(1804),"name":"other"})
+            )
+            .await["reason"],
+            "key_collision"
+        );
+        let running = call(&a, "vm_start", args(1811)).await;
+        assert_eq!(terminal(&a, &running).await["state"], "succeeded");
+        let original_paths = fixture_pair_paths(&h, &vm, true);
+        let saved = simulate_pair_write(&original_paths);
+        let stopped = call(&a, "vm_stop", args(1812)).await;
+        assert_eq!(terminal(&a, &stopped).await["state"], "succeeded");
+        let restore = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1807)});
+        let restored = call(&a, "vm_snapshot_restore", restore.clone()).await;
+        let row = terminal(&a, &restored).await;
+        assert_eq!(row["state"], "succeeded", "{row}");
+        assert_eq!(row["snapshot_id"], point);
+        assert_eq!(
+            fixture_pair_paths(&h, &vm, true).map(|path| fs::read(path).unwrap()),
+            saved
+        );
+        assert_eq!(fs::read(&original_paths[0]).unwrap()[4096], b'D');
+        assert_eq!(fs::read(&original_paths[1]).unwrap()[0], b'V');
+        assert_ne!(generation("active"), original);
+        assert_eq!(generation("origin"), original);
+        store
+            .transact(|db| {
+                assert!(
+                    db.execute("DELETE FROM vm_restore_points WHERE static_vm=?1", [vm_id])
+                        .is_err()
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT count(*) FROM vm_restore_points WHERE static_vm=?1",
+                        [vm_id],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
+        let list_args = json!({"vm_id":vm,"limit":1});
+        let page = call(&a, "vm_snapshot_list", list_args.clone()).await;
+        assert_eq!(page["entries"][0]["protected"], true);
+        assert!(page["next_cursor"].is_string());
+        let next = json!({"vm_id":vm,"limit":1,"cursor":page["next_cursor"]});
+        assert_eq!(
+            call(&b, "vm_snapshot_list", next.clone()).await["reason"],
+            "invalid_cursor"
+        );
+        let page2 = call(&a, "vm_snapshot_list", next).await;
+        assert_eq!(page2["entries"][0]["protected"], true);
+        assert!(page2["next_cursor"].is_null());
+        let delete = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1808)});
+        assert_eq!(
+            call(&b, "vm_snapshot_delete", delete.clone()).await["reason"],
+            "not_found"
+        );
+        assert_eq!(
+            call(&a, "vm_snapshot_delete", delete).await["reason"],
+            "static_backup_delete_forbidden"
+        );
+        assert_eq!(call(&a, "vm_snapshot_restore", restore).await, restored);
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (1, 1));
+        let started = call(&a, "vm_start", args(1809)).await;
+        assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+        let republished = call(&a, "publish_site", args(1810)).await;
+        assert_eq!(terminal(&a, &republished).await["state"], "succeeded");
+        drop(a);
+        drop(b);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_replay_survives_delete_and_original_lease_expiry() {
+        let mut h = Harness::start(false, false).await;
+        h.fixture(|fixture| fixture.snapshot_test_media = true);
+        let a = h.client(0).await;
+        let build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(1850)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(&a, &build).await["template_id"].clone();
+        let clone = call(
+            &a,
+            "vm_create",
+            json!({"template_id":template,"request_id":key(1851),"ttl_s":60}),
+        )
+        .await;
+        let vm = terminal(&a, &clone).await["vm_id"].clone();
+        let capture = json!({"vm_id":vm,"request_id":key(1852)});
+        let created = call(&a, "vm_snapshot_create", capture.clone()).await;
+        let captured = terminal(&a, &created).await;
+        assert_eq!(captured["state"], "succeeded", "{captured}");
+        let point = captured["snapshot_id"].clone();
+        let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(1855)})).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let original_paths = fixture_pair_paths(&h, &vm, true);
+        let saved = simulate_pair_write(&original_paths);
+        let stop = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(1856)})).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        let restore_args = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1857)});
+        let restore = call(&a, "vm_snapshot_restore", restore_args.clone()).await;
+        let restored = terminal(&a, &restore).await;
+        assert_eq!(restored["state"], "succeeded", "{restored}");
+        assert_eq!(restored["cleanup"], "unconfirmed");
+        assert_eq!(
+            fixture_pair_paths(&h, &vm, true).map(|path| fs::read(path).unwrap()),
+            saved
+        );
+        assert_eq!(fixture_pair_paths(&h, &vm, false), original_paths);
+        h.supervisor().sweep().unwrap();
+        assert!(original_paths.iter().all(|path| !path.exists()));
+        let cold = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(1858)})).await;
+        assert_eq!(terminal(&a, &cold).await["state"], "succeeded");
+        assert_eq!(call(&a, "vm_snapshot_restore", restore_args).await, restore);
+        let stop = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(1859)})).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        let delete = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1853)});
+        let deleted = call(&a, "vm_snapshot_delete", delete.clone()).await;
+        assert_eq!(terminal(&a, &deleted).await["state"], "succeeded");
+        assert_eq!(
+            call(&a, "vm_snapshot_delete", delete.clone()).await,
+            deleted
+        );
+        let surviving = call(
+            &a,
+            "vm_snapshot_create",
+            json!({"vm_id":vm,"request_id":key(1854)}),
+        )
+        .await;
+        assert_eq!(terminal(&a, &surviving).await["state"], "succeeded");
+        let deadline = clone["expires_at_ms"].as_i64().unwrap();
+        h.now.store(deadline, Ordering::Relaxed);
+        // The reaper proves and records each pair separately. Drive the exact
+        // two turns synchronously so work can never be skipped by scheduling.
+        h.supervisor().sweep().unwrap();
+        h.supervisor().sweep().unwrap();
+        assert_eq!(
+            call(&a, "vm_get", json!({"vm_id":vm})).await["state"],
+            "expired"
+        );
+        assert_eq!(call(&a, "vm_snapshot_delete", delete).await, deleted);
+        assert_eq!(call(&a, "vm_snapshot_create", capture).await, created);
+        assert_eq!(operation(&a, &created).await["snapshot_id"], point);
+        drop(a);
         h.shutdown().await.unwrap();
     }
 
