@@ -5715,7 +5715,7 @@ mod tests {
         // Populated legacy action 5/6 keys collide with typed create/restore
         // without promoting legacy vm_snapshots or altering legacy charges.
         let vm1_id = parse_id(vm1.as_str().unwrap()).unwrap();
-        let legacy_snap = [0x91; 16];
+        let legacy_snap: Id = [0x91; 16];
         let legacy_create_key = key(2150);
         let legacy_restore_key = key(2151);
         let store = h.supervisor().controller.store_for_test();
@@ -5725,11 +5725,11 @@ mod tests {
                     "INSERT INTO vm_snapshots(vm,id,ready,dashboard_created_ms) VALUES(?1,?2,1,?3)",
                     rusqlite::params![vm1_id, legacy_snap, UTC],
                 )?;
-                let k5 = RequestId::parse(&legacy_create_key)?;
+                let k5 = RequestId::parse(&legacy_create_key).unwrap();
                 let op5 = crate::store::vm::Binding {
                     principal: "alpha",
                     key: k5,
-                    subject: crate::store::vm::Subject::Vm(vm1_id),
+                    subject: crate::vm::Subject::Vm(vm1_id),
                     action: Action::Snapshot as i64,
                 }
                 .record(db, UTC, Some(vm1_id), None)?;
@@ -5745,11 +5745,11 @@ mod tests {
                     UTC,
                     Some(true),
                 )?;
-                let k6 = RequestId::parse(&legacy_restore_key)?;
+                let k6 = RequestId::parse(&legacy_restore_key).unwrap();
                 let op6 = crate::store::vm::Binding {
                     principal: "alpha",
                     key: k6,
-                    subject: crate::store::vm::Subject::Vm(vm1_id),
+                    subject: crate::vm::Subject::Vm(vm1_id),
                     action: Action::Restore as i64,
                 }
                 .record(db, UTC, Some(vm1_id), None)?;
@@ -5789,7 +5789,9 @@ mod tests {
             "key_collision"
         );
         assert_eq!(
-            store.transact(crate::store::vm::disk_bytes).unwrap(),
+            store
+                .transact(|db| crate::store::vm::disk_bytes(db))
+                .unwrap(),
             charge_with_legacy
         );
 
@@ -6061,7 +6063,7 @@ mod tests {
                 .supervisor()
                 .controller
                 .store_for_test()
-                .transact(crate::store::vm::disk_bytes)
+                .transact(|db| crate::store::vm::disk_bytes(db))
                 .unwrap()
                 .unwrap();
             h.sweep().await;
@@ -6070,7 +6072,7 @@ mod tests {
                 .supervisor()
                 .controller
                 .store_for_test()
-                .transact(crate::store::vm::disk_bytes)
+                .transact(|db| crate::store::vm::disk_bytes(db))
                 .unwrap()
                 .unwrap();
             assert!(charge_after < charge_retired);
@@ -6297,19 +6299,19 @@ mod tests {
         h.hold_build.notify_one();
         let template = terminal(&a, &build).await["template_id"].clone();
         let mut nonce = 2301u64;
-        let make_vm = |client: &Client, ttl: u64, n: u64| {
-            let tpl = template.clone();
-            async move {
-                let c = call(
-                    client,
-                    "vm_create",
-                    json!({"template_id":tpl,"request_id":key(n),"ttl_s":ttl}),
-                )
-                .await;
-                let res = terminal(client, &c).await;
-                (res["vm_id"].clone(), c["expires_at_ms"].as_i64().unwrap())
-            }
+        let make_vm = async |client: &Client, ttl: u64, n: u64| {
+            let c = call(
+                client,
+                "vm_create",
+                json!({"template_id":template,"request_id":key(n),"ttl_s":ttl}),
+            )
+            .await;
+            let res = terminal(client, &c).await;
+            (res["vm_id"].clone(), c["expires_at_ms"].as_i64().unwrap())
         };
+        let (before_create_vm, before_deadline) = make_vm(&a, 60, 2370).await;
+        let (after_create_vm, after_deadline) = make_vm(&a, 120, 2371).await;
+        let (vm_o1, _) = make_vm(&a, 600, 2372).await;
         let (vm1, _) = make_vm(&a, 600, nonce).await;
         nonce += 1;
 
@@ -6451,15 +6453,15 @@ mod tests {
             .unwrap();
 
         // 4. Loss of host disk reserve during final recheck/settlement refuses commit.
-        let store_for_obs = h.supervisor().controller.store_for_test();
+        let controller = h.supervisor().controller.clone();
         h.fixture(|f| {
             f.host_observer = Some(Arc::new(move || {
-                let both_identified = store_for_obs
+                let both_identified = controller.store_for_test()
                     .transact(|db| {
                         crate::store::vm::count(
                             db,
-                            "SELECT count(*) FROM vm_artifacts WHERE state='identified'",
-                            [],
+                            "SELECT count(*) FROM vm_artifacts a JOIN vm_snapshot_work w ON w.candidate=a.generation_id WHERE w.vm=?1 AND w.phase='copy' AND a.state='identified'",
+                            [vm1_id],
                         )
                     })
                     .unwrap_or(0)
@@ -6557,9 +6559,10 @@ mod tests {
 
         // 6. Held copy + lease expiry cancellation and handoff:
         //    (a) held before create (untouched) and (b) held after both leaves identified.
-        for (hold_before_create, label) in [(true, "before-create"), (false, "after-identified")] {
-            let (vm_exp, exp_deadline) = make_vm(&a, 60, nonce).await;
-            nonce += 1;
+        for (vm_exp, exp_deadline, hold_before_create, label) in [
+            (before_create_vm, before_deadline, true, "before-create"),
+            (after_create_vm, after_deadline, false, "after-identified"),
+        ] {
             let vm_exp_id = parse_id(vm_exp.as_str().unwrap()).unwrap();
             let entered = Arc::new(Notify::new());
             let release = Arc::new(Notify::new());
@@ -6611,8 +6614,6 @@ mod tests {
 
         // 7. Orphan live copy worker panic reconciliation + same-process foreground SDK recovery
         //    + shutdown failure preservation.
-        let (vm_o1, _) = make_vm(&a, 600, nonce).await;
-        nonce += 1;
         let vm_o1_id = parse_id(vm_o1.as_str().unwrap()).unwrap();
         for fault in [
             SnapshotFault::OrphanPanicAfterDiskOnly,
