@@ -40,6 +40,7 @@ EXPECTED_TAGS = [
     "compile_fail,E0599",
     "compile_fail,E0560",
     "no_run",
+    "compile_fail,E0423",
 ]
 
 

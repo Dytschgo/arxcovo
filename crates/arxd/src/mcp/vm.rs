@@ -2579,7 +2579,7 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         fs,
-        sync::atomic::AtomicI64,
+        sync::atomic::{AtomicI64, AtomicU64},
     };
     use tokio::{
         io::{
@@ -2632,6 +2632,15 @@ mod tests {
         staging: 131_072,
         ..TRANSIENT
     };
+    /// Hang guard for the fixture loopback TLS proof. A valid exchange
+    /// returns when both sides finish; this bound only stops a stuck socket.
+    /// Real TLS and I/O errors still return immediately and fence the boot.
+    const FIXTURE_TLS_DEADLINE: Duration = Duration::from_secs(10);
+    /// Outer hang guard for an expected static fixture start and the standalone
+    /// origin probe. Longer than [`FIXTURE_TLS_DEADLINE`] so a slow valid
+    /// exchange can publish its receipt. A settled operation returns immediately.
+    /// Other fixture operations keep the two-second guard in [`terminal`].
+    const FIXTURE_START_GUARD: Duration = Duration::from_secs(15);
 
     /// Staged fixture files with real file identities, written through the
     /// reaper's own test custody so expiry and recovery proofs are the 4c2b
@@ -3744,6 +3753,9 @@ mod tests {
         release_pending: HashSet<Id>,
         /// TEST VMs whose expiry graceful stop fails so force-reap must run.
         force_reap_only: HashSet<Id>,
+        /// Last classified fixture boot failure for this VM. Cleared when a
+        /// later start settles successfully.
+        boot_failures: HashMap<Id, FixtureBootStage>,
     }
 
     /// Injected snapshot copy faults, consumed by the next snapshot copy.
@@ -3796,6 +3808,9 @@ mod tests {
         fail_cancelled: bool,
         failed: bool,
         snapshot_worker_failed: bool,
+        /// Shared with each [`FixtureOrigin`]. Tests store milliseconds here
+        /// to delay the TLS client before it connects. Zero does not wait.
+        probe_delay_ms: Arc<AtomicU64>,
     }
 
     pub(super) struct FixtureDrain {
@@ -3860,7 +3875,18 @@ mod tests {
                 fail_cancelled: false,
                 failed: false,
                 snapshot_worker_failed: false,
+                probe_delay_ms: Arc::new(AtomicU64::new(0)),
             }
+        }
+
+        fn boot_failure_stage(&self, vm: Id) -> Option<&'static str> {
+            self.live
+                .lock()
+                .unwrap()
+                .boot_failures
+                .get(&vm)
+                .copied()
+                .map(FixtureBootStage::label)
         }
 
         pub(super) fn ready(&self, vm: Id) -> bool {
@@ -4220,10 +4246,18 @@ mod tests {
                     let hold = self.static_hold.take();
                     let fault = self.static_fault.take();
                     let origins = self.origins.clone();
+                    let probe_delay_ms = self.probe_delay_ms.clone();
                     self.jobs.spawn(async move {
                         let copied = if released(hold, &cancel).await {
-                            copy_and_provision(&artifacts, (golden, proof), slots, fault, &cancel)
-                                .await
+                            copy_and_provision(
+                                &artifacts,
+                                (golden, proof),
+                                slots,
+                                fault,
+                                &cancel,
+                                probe_delay_ms,
+                            )
+                            .await
                         } else {
                             // Cancelled before any effect on the candidate.
                             Err(CopyFailure::untouched(FailureReason::Cancelled))
@@ -4361,7 +4395,10 @@ mod tests {
                                 })
                                 .map(Ok)
                                 .unwrap_or_else(|| {
-                                    let origin = Arc::new(FixtureOrigin::new(origin_generation)?);
+                                    let origin = Arc::new(FixtureOrigin::with_probe_delay(
+                                        origin_generation,
+                                        self.probe_delay_ms.clone(),
+                                    )?);
                                     self.origins
                                         .lock()
                                         .unwrap()
@@ -4427,8 +4464,12 @@ mod tests {
                                     })
                                     .transpose();
                                 match verified {
-                                    Ok(_) => Boot::start(&cancel).await,
-                                    Err(error) => Err(error),
+                                    Ok(_) => Boot::start(&cancel).await.map_err(|_| {
+                                        FixtureBootFault::at(FixtureBootStage::QmpGuestReadiness)
+                                    }),
+                                    Err(_) => {
+                                        Err(FixtureBootFault::at(FixtureBootStage::ArtifactHold))
+                                    }
                                 }
                             }
                         };
@@ -4443,6 +4484,7 @@ mod tests {
                                     let status =
                                         controller.finish(&worker, Completion::Succeeded)?;
                                     if status == Status::Succeeded {
+                                        registry.boot_failures.remove(&vm);
                                         registry.boots.insert(vm, Slot::Idle(Box::new(boot)));
                                         None
                                     } else {
@@ -4453,7 +4495,18 @@ mod tests {
                                     boot.release().await?;
                                 }
                             }
-                            Err(_) => {
+                            Err(fault) => {
+                                {
+                                    let mut registry = live.lock().unwrap();
+                                    match fault.stage {
+                                        Some(stage) => {
+                                            registry.boot_failures.insert(vm, stage);
+                                        }
+                                        None => {
+                                            registry.boot_failures.remove(&vm);
+                                        }
+                                    }
+                                }
                                 controller.finish_with_cause(
                                     &worker,
                                     Completion::CleanupUnconfirmed,
@@ -4666,6 +4719,7 @@ mod tests {
         slots: PairSlots,
         fault: Option<StaticFault>,
         cancel: &Shutdown,
+        probe_delay_ms: Arc<AtomicU64>,
     ) -> Result<([ArtifactEvidence; 2], FixtureOrigin), CopyFailure> {
         use crate::vm::CandidateSlot::{Absent, Retained, Unknown};
         let failed = |slots| CopyFailure {
@@ -4749,7 +4803,7 @@ mod tests {
             reason: FailureReason::BootFailed,
             slots: committed,
         })?;
-        let origin = FixtureOrigin::new(slots.disk.generation);
+        let origin = FixtureOrigin::with_probe_delay(slots.disk.generation, probe_delay_ms);
         // Finish the private boot even when the synthetic provisioning fails.
         boot.stop().await.map_err(|_| CopyFailure {
             reason: FailureReason::DirtyStop,
@@ -4808,6 +4862,44 @@ mod tests {
         writer_epoch: Id,
     }
 
+    /// Classified fixture boot failure. The receipt stays the sanitized
+    /// `boot_failed` / `cleanup_unconfirmed` pair; the stage is test-only.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FixtureBootStage {
+        ArtifactHold,
+        PortReservation,
+        QmpGuestReadiness,
+        TlsIo,
+        TlsTimeout,
+    }
+
+    impl FixtureBootStage {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::ArtifactHold => "artifact_hold",
+                Self::PortReservation => "port_reservation",
+                Self::QmpGuestReadiness => "qmp_guest_readiness",
+                Self::TlsIo => "tls_io",
+                Self::TlsTimeout => "tls_timeout",
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FixtureBootFault {
+        stage: Option<FixtureBootStage>,
+    }
+
+    impl FixtureBootFault {
+        const fn at(stage: FixtureBootStage) -> Self {
+            Self { stage: Some(stage) }
+        }
+
+        const fn unstaged() -> Self {
+            Self { stage: None }
+        }
+    }
+
     /// Synthetic guest endpoint and independently configured host trust.
     /// This fixture has no production serial encoder, and never logs key bytes.
     struct FixtureOrigin {
@@ -4817,10 +4909,15 @@ mod tests {
         expired_guest: Arc<rustls::ServerConfig>,
         untrusted_guest: Arc<rustls::ServerConfig>,
         client: Arc<rustls::ClientConfig>,
+        probe_delay_ms: Arc<AtomicU64>,
     }
 
     impl FixtureOrigin {
         fn new(generation: Id) -> Result<Self> {
+            Self::with_probe_delay(generation, Arc::new(AtomicU64::new(0)))
+        }
+
+        fn with_probe_delay(generation: Id, probe_delay_ms: Arc<AtomicU64>) -> Result<Self> {
             use crate::vm::static_web::StaticOriginIdentity;
             use rcgen::{
                 BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer,
@@ -4902,6 +4999,7 @@ mod tests {
                 expired_guest,
                 untrusted_guest,
                 client: Arc::new(client),
+                probe_delay_ms,
             })
         }
 
@@ -4909,23 +5007,39 @@ mod tests {
             &self,
             lease: &crate::vm::static_web::OriginPortLease,
             expected: String,
-        ) -> Result<()> {
-            self.probe_with(lease, expected, self.guest.clone()).await
+        ) -> std::result::Result<(), FixtureBootFault> {
+            self.probe_with(lease, expected, self.guest.clone(), &Shutdown::default())
+                .await
         }
 
+        /// Both sides of the health exchange, including an optional client
+        /// delay, run until they finish or the fixture shuts down.
+        /// [`FIXTURE_TLS_DEADLINE`] is only the hang guard.
         async fn probe_with(
             &self,
             lease: &crate::vm::static_web::OriginPortLease,
             expected: String,
             guest_config: Arc<rustls::ServerConfig>,
-        ) -> Result<()> {
-            let listener = tokio::net::TcpListener::from_std(lease.fixture_listener()?)?;
-            let address = listener.local_addr()?;
+            cancel: &Shutdown,
+        ) -> std::result::Result<(), FixtureBootFault> {
+            let listener = tokio::net::TcpListener::from_std(
+                lease
+                    .fixture_listener()
+                    .map_err(|_| FixtureBootFault::at(FixtureBootStage::PortReservation))?,
+            )
+            .map_err(|_| FixtureBootFault::at(FixtureBootStage::PortReservation))?;
+            let address = listener
+                .local_addr()
+                .map_err(|_| FixtureBootFault::at(FixtureBootStage::PortReservation))?;
             let tls = tokio_rustls::TlsAcceptor::from(guest_config);
             let connector = tokio_rustls::TlsConnector::from(self.client.clone());
             const REQUEST: &[u8] =
                 b"GET /arx-health HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n";
             const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nok\n";
+            let delay = Duration::from_millis(
+                self.probe_delay_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
             let guest = async {
                 let (socket, _) = listener.accept().await?;
                 let mut stream = tls.accept(socket).await?;
@@ -4936,6 +5050,9 @@ mod tests {
                 Ok::<_, anyhow::Error>(())
             };
             let host = async {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 let socket = tokio::net::TcpStream::connect(address).await?;
                 let mut stream = connector.connect(expected.try_into()?, socket).await?;
                 stream.write_all(REQUEST).await?;
@@ -4944,11 +5061,16 @@ mod tests {
                 ensure!(response == RESPONSE, "invalid fixture health response");
                 Ok::<_, anyhow::Error>(())
             };
-            tokio::time::timeout(Duration::from_secs(1), async {
-                tokio::try_join!(host, guest)
-            })
-            .await??;
-            Ok(())
+            let exchange = async { tokio::try_join!(host, guest).map(|_| ()) };
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(FixtureBootFault::unstaged()),
+                result = tokio::time::timeout(FIXTURE_TLS_DEADLINE, exchange) => match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) => Err(FixtureBootFault::at(FixtureBootStage::TlsIo)),
+                    Err(_) => Err(FixtureBootFault::at(FixtureBootStage::TlsTimeout)),
+                },
+            }
         }
     }
 
@@ -4960,16 +5082,26 @@ mod tests {
             (slots, [disk, vars]): Pair,
             identity: &FixtureOrigin,
             cancel: &Shutdown,
-        ) -> Result<Self> {
+        ) -> std::result::Result<Self, FixtureBootFault> {
             use std::io::{Read, Seek, SeekFrom};
-            let mut held_disk = artifacts.hold(slots.disk, disk, false)?;
-            let held_vars = artifacts.hold(slots.vars, vars, false)?;
+            let artifact = || FixtureBootFault::at(FixtureBootStage::ArtifactHold);
+            let port = || FixtureBootFault::at(FixtureBootStage::PortReservation);
+            let mut held_disk = artifacts
+                .hold(slots.disk, disk, false)
+                .map_err(|_| artifact())?;
+            let held_vars = artifacts
+                .hold(slots.vars, vars, false)
+                .map_err(|_| artifact())?;
             let cert_marker = if disk.pin.size > FIXTURE_CERT_MARKER_OFFSET {
                 held_disk
                     .file
-                    .seek(SeekFrom::Start(FIXTURE_CERT_MARKER_OFFSET))?;
+                    .seek(SeekFrom::Start(FIXTURE_CERT_MARKER_OFFSET))
+                    .map_err(|_| artifact())?;
                 let mut byte = [0u8; 1];
-                held_disk.file.read_exact(&mut byte)?;
+                held_disk
+                    .file
+                    .read_exact(&mut byte)
+                    .map_err(|_| artifact())?;
                 byte[0]
             } else {
                 0
@@ -4981,22 +5113,28 @@ mod tests {
                 b'U' => identity.untrusted_guest.clone(),
                 _ => identity.guest.clone(),
             };
-            let origin = crate::vm::static_web::OriginPortLease::acquire()?;
-            ensure!(origin.verify(), "static origin listener mismatch");
-            let mut boot = Self::start(cancel).await?;
-            if identity
-                .probe_with(&origin, identity.name.clone(), guest_config)
-                .await
-                .is_err()
-            {
-                boot.release().await?;
-                anyhow::bail!("static fixture TLS proof failed");
+            let origin = crate::vm::static_web::OriginPortLease::acquire().map_err(|_| port())?;
+            if !origin.verify() {
+                return Err(port());
             }
+            let mut boot = Self::start(cancel)
+                .await
+                .map_err(|_| FixtureBootFault::at(FixtureBootStage::QmpGuestReadiness))?;
+            if let Err(fault) = identity
+                .probe_with(&origin, identity.name.clone(), guest_config, cancel)
+                .await
+            {
+                // Keep the probe stage when release itself fails.
+                let _ = boot.release().await;
+                return Err(fault);
+            }
+            let port_number = origin.port().try_into().map_err(|_| port())?;
+            let boot_id = crate::store::vm::new_id().map_err(|_| FixtureBootFault::unstaged())?;
             boot.publish_origin = Some(Origin {
                 generation: slots.disk.generation,
                 origin_generation: identity.generation,
-                boot: crate::store::vm::new_id()?,
-                port: origin.port().try_into()?,
+                boot: boot_id,
+                port: port_number,
                 ca_path: artifacts.0.path("origin_ca", slots.disk.generation),
                 ca_receipt: crate::vm::paths::ArtifactPin {
                     size: 1,
@@ -5188,8 +5326,18 @@ mod tests {
     }
 
     async fn terminal(client: &Client, reference: &Value) -> Value {
+        // Hang guard only. A settled row returns at once. Expected static
+        // starts use [`terminal_static_start`] so a slow probe can finish.
+        await_operation(client, reference, Duration::from_secs(2)).await
+    }
+
+    async fn terminal_static_start(client: &Client, reference: &Value) -> Value {
+        await_operation(client, reference, FIXTURE_START_GUARD).await
+    }
+
+    async fn await_operation(client: &Client, reference: &Value, bound: Duration) -> Value {
         assert_eq!(reference["ok"], true, "{reference}");
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(bound, async {
             loop {
                 let result = call(
                     client,
@@ -5206,6 +5354,27 @@ mod tests {
         })
         .await
         .expect("operation did not settle")
+    }
+
+    fn fixture_boot_stage(h: &Harness, vm: &Value) -> Option<&'static str> {
+        let id = parse_id(vm.as_str().expect("vm id")).expect("vm id");
+        h.fixture(|fixture| fixture.boot_failure_stage(id))
+    }
+
+    /// Success prints no stage. A failure prints the sanitized receipt
+    /// `reason` and `cleanup` beside the retained fixture stage.
+    fn assert_settled_static_start(h: &Harness, vm: &Value, started: &Value) {
+        let stage = fixture_boot_stage(h, vm);
+        assert_eq!(
+            (
+                started.get("state").and_then(Value::as_str),
+                started.get("reason").and_then(Value::as_str),
+                started.get("cleanup").and_then(Value::as_str),
+                stage,
+            ),
+            (Some("succeeded"), None, Some("confirmed"), None),
+            "fixture boot stage {stage:?}: {started}"
+        );
     }
 
     /// Parks one tool call between SDK dispatch and admission. `done` fires
@@ -5627,7 +5796,10 @@ mod tests {
             "not_ready"
         );
         let start = call(&a, "vm_start", args(609)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         assert_eq!(
             call(&a, "publish_site", args(610)).await["reason"],
             "publish_credential_missing"
@@ -5709,7 +5881,10 @@ mod tests {
         );
 
         let start = call(&a, "vm_start", args(618)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(619)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         fake.health.store(1, SeqCst);
@@ -5844,7 +6019,10 @@ mod tests {
             "key_collision"
         );
         let running = call(&a, "vm_start", args(1811)).await;
-        assert_eq!(terminal(&a, &running).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &running).await["state"],
+            "succeeded"
+        );
         let original_paths = fixture_pair_paths(&h, &vm, true);
         let saved = simulate_pair_write(&original_paths);
         let stopped = call(&a, "vm_stop", args(1812)).await;
@@ -5904,7 +6082,10 @@ mod tests {
         assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
         assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (1, 1));
         let started = call(&a, "vm_start", args(1809)).await;
-        assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &started).await["state"],
+            "succeeded"
+        );
         let republished = call(&a, "publish_site", args(1810)).await;
         assert_eq!(terminal(&a, &republished).await["state"], "succeeded");
         drop(a);
@@ -7419,7 +7600,7 @@ mod tests {
             .clone();
         nonce += 1;
         assert_eq!(
-            terminal(
+            terminal_static_start(
                 &a,
                 &call(
                     &a,
@@ -7530,7 +7711,7 @@ mod tests {
 
         // 3. Same-process negative TLS trust (expired cert marker 'E') under unchanged host trust.
         assert_eq!(
-            terminal(
+            terminal_static_start(
                 &a,
                 &call(
                     &a,
@@ -7614,7 +7795,7 @@ mod tests {
         );
         nonce += 1;
         assert_eq!(
-            terminal(
+            terminal_static_start(
                 &a,
                 &call(
                     &a,
@@ -7778,10 +7959,8 @@ mod tests {
         let p1 =
             terminal(&a, &call(&a, "vm_snapshot_create", args(2506)).await).await["snapshot_id"]
                 .clone();
-        assert_eq!(
-            terminal(&a, &call(&a, "vm_start", args(2507)).await).await["state"],
-            "succeeded"
-        );
+        let started = terminal_static_start(&a, &call(&a, "vm_start", args(2507)).await).await;
+        assert_settled_static_start(&h, &vm, &started);
 
         // 1. Publish-first: held DNS POST blocks snapshot create and restore.
         let (entered, in_post) = tokio::sync::oneshot::channel();
@@ -7858,7 +8037,7 @@ mod tests {
 
         // 3. Pending DNS removal across restart still fences snapshots until settled.
         assert_eq!(
-            terminal(&a, &call(&a, "vm_start", args(2516)).await).await["state"],
+            terminal_static_start(&a, &call(&a, "vm_start", args(2516)).await).await["state"],
             "succeeded"
         );
         assert_eq!(
@@ -7927,7 +8106,7 @@ mod tests {
             "succeeded"
         );
         assert_eq!(
-            terminal(&a, &call(&a, "vm_start", args(2523)).await).await["state"],
+            terminal_static_start(&a, &call(&a, "vm_start", args(2523)).await).await["state"],
             "succeeded"
         );
 
@@ -9240,7 +9419,10 @@ mod tests {
         assert_eq!(retired["state"], "retired_boot");
         assert!(retired["receipt"].is_null());
         let restarted = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(200)})).await;
-        assert_eq!(terminal(&a, &restarted).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &restarted).await["state"],
+            "succeeded"
+        );
         store
             .transact(|tx| {
                 assert!(db::register_boot(tx, vm_id, generation, boot).is_err());
@@ -9515,7 +9697,10 @@ mod tests {
         let a = h.client(0).await;
         let store = h.supervisor().controller.compose_store();
         let started = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(3022)})).await;
-        assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &started).await["state"],
+            "succeeded"
+        );
         let (host, mut peer) = tokio::io::duplex(65536);
         let second = tokio::spawn(async move {
             fake_compose_hello(&mut peer, boot + 1).await;
@@ -9949,7 +10134,10 @@ mod tests {
             h = h.reopen(|_| {}).await;
             let a = h.client(0).await;
             let started = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(4012)})).await;
-            assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+            assert_eq!(
+                terminal_static_start(&a, &started).await["state"],
+                "succeeded"
+            );
             let (host, mut peer) = tokio::io::duplex(65536);
             let hello = tokio::spawn(async move {
                 fake_compose_hello(&mut peer, boot + 1).await;
@@ -10391,7 +10579,7 @@ mod tests {
             json!({"vm_id":vm,"request_id":key(base + 2)}),
         )
         .await;
-        assert_eq!(terminal(a, &start).await["state"], "succeeded");
+        assert_eq!(terminal_static_start(a, &start).await["state"], "succeeded");
         let fake = Arc::new(crate::vm::runtime::publication::Fake::default());
         fake.credential.store(true, SeqCst);
         enroll(
@@ -10590,7 +10778,10 @@ mod tests {
 
         // Restart after DNS acknowledgement while cleanup credentials are gone.
         let start = call(&a, "vm_start", args(811)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(812)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         let before = intent(&h).unwrap();
@@ -10648,7 +10839,10 @@ mod tests {
         assert_eq!(terminal(&a, &revoke).await["state"], "failed");
         assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
         let start = call(&a, "vm_start", args(814)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         fake.credential.store(true, SeqCst);
         h.supervisor().gate.lock().unwrap().allow_agent_public_sites = true;
         assert_eq!(
@@ -10716,7 +10910,10 @@ mod tests {
         };
         assert_eq!(pinned(&intent(&h).unwrap()), pinned(&before));
         let start = call(&a, "vm_start", args(817)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         assert_eq!(
             call(&a, "publish_site", args(818)).await["reason"],
             "publish_cleanup_pending"
@@ -11617,7 +11814,10 @@ mod tests {
         assert_eq!(fake.posts.load(SeqCst), 0);
         assert!(fake.routes.lock().unwrap().is_empty());
         let start = call(&a, "vm_start", args(1232)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(1233)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         let revoke = call(&a, "unpublish_site", args(1234)).await;
@@ -11819,7 +12019,10 @@ mod tests {
         assert!(fake.routes.lock().unwrap().is_empty());
         assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
         let start = call(&a, "vm_start", args(1432)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(1433)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         let revoke = call(&a, "unpublish_site", args(1434)).await;
@@ -12131,7 +12334,10 @@ mod tests {
         // shutdown runs before any reaper turn: the in-memory no-submission
         // proof releases the intent without DNS, with the owner cause.
         let start = call(&a, "vm_start", args(1812)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let (marker, in_marker, release_marker) = gate();
         *h.supervisor().publisher.marker_gate.lock().unwrap() = Some(marker);
         let posts = fake.posts.load(SeqCst);
@@ -12227,10 +12433,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "intermittent Windows drain-settlement quarantine: docs/ROADMAP.md Known issues"
-    )]
     async fn a_clean_foreground_drain_requires_full_publication_settlement() {
         use std::sync::atomic::Ordering::SeqCst;
         let mut h = Harness::start_with_web(false, false, true).await;
@@ -12266,7 +12468,10 @@ mod tests {
         enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
         let a = h.client(0).await;
         let start = call(&a, "vm_start", args(1911)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         trigger(&h, refuse_commit);
         let pending = call(&a, "publish_site", args(1912)).await;
         assert_eq!(pending["ok"], true, "{pending}");
@@ -12299,7 +12504,10 @@ mod tests {
         // A final reconciliation parked past the drain deadline is unconfirmed
         // and keeps the intent for restart cleanup.
         let start = call(&a, "vm_start", args(1913)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(1914)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         let (remove, _in_remove, _held) = gate();
@@ -12322,7 +12530,8 @@ mod tests {
         // call harvests the panic and its cleanup settles the publication,
         // yet the drain stays unconfirmed.
         let start = call(&a, "vm_start", args(1915)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let started = terminal_static_start(&a, &start).await;
+        assert_settled_static_start(&h, &vm, &started);
         let posts = fake.posts.load(SeqCst);
         fake.panic_after_post.store(true, SeqCst);
         let pending = call(&a, "publish_site", args(1916)).await;
@@ -12346,7 +12555,10 @@ mod tests {
         enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
         let a = h.client(0).await;
         let start = call(&a, "vm_start", args(1918)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(1919)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         fake.stop_panic.store(true, SeqCst);
@@ -12469,7 +12681,10 @@ mod tests {
 
         // Settled by a reaper turn.
         let start = call(&a, "vm_start", args(2211)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         fake.residue.store(true, SeqCst);
         trigger(&h, fail_terminal);
         let pending = call(&a, "publish_site", args(2212)).await;
@@ -12932,7 +13147,10 @@ mod tests {
         let files = static_files();
         assert_eq!(files.len(), 2);
         let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(106)})).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let running = call(&a, "static_vm_get", get.clone()).await;
         assert_eq!(running["state"], "running");
         assert_eq!(running["web_health"], "healthy");
@@ -13040,7 +13258,10 @@ mod tests {
         assert_eq!(charges(), (persistent, 0));
 
         let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(111)})).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let stop = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(112)})).await;
         assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
         assert_eq!(static_files(), files);
@@ -13273,7 +13494,10 @@ mod tests {
         };
         let start = lifecycle("vm_start", &site_a, 304);
         let started = call(&a, start.0, start.1).await;
-        assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &started).await["state"],
+            "succeeded"
+        );
         let recovery = |h: &Harness, name: &str| -> (i64, i64, Option<bool>) {
             read_state(h)
                 .query_row(
@@ -13310,11 +13534,12 @@ mod tests {
         ] {
             let (tool, args) = lifecycle(tool, vm, number);
             let operation = call(&a, tool, args).await;
-            assert_eq!(
-                terminal(&a, &operation).await["state"],
-                "succeeded",
-                "{tool}"
-            );
+            let settled = if tool == "vm_start" {
+                terminal_static_start(&a, &operation).await
+            } else {
+                terminal(&a, &operation).await
+            };
+            assert_eq!(settled["state"], "succeeded", "{tool}");
         }
         let running = call(&a, "static_vm_get", get(&site_b)).await;
         assert_eq!(
@@ -13362,11 +13587,12 @@ mod tests {
         ] {
             let (tool, args) = lifecycle(tool, vm, number);
             let operation = call(&a, tool, args).await;
-            assert_eq!(
-                terminal(&a, &operation).await["state"],
-                "succeeded",
-                "{tool}"
-            );
+            let settled = if tool == "vm_start" {
+                terminal_static_start(&a, &operation).await
+            } else {
+                terminal(&a, &operation).await
+            };
+            assert_eq!(settled["state"], "succeeded", "{tool}");
         }
         assert_eq!(static_paths(&h.media), files);
     }
@@ -13503,16 +13729,59 @@ mod tests {
     #[tokio::test]
     async fn static_origin_probe_refuses_a_different_generation_name() {
         use crate::vm::static_web::{OriginPortLease, StaticOriginIdentity};
-        let identity = FixtureOrigin::new([0x33; 16]).unwrap();
-        let lease = OriginPortLease::acquire().unwrap();
-        let other = StaticOriginIdentity::for_generation([0x44; 16]).provisioning();
+        tokio::time::timeout(FIXTURE_START_GUARD, async {
+            let identity = FixtureOrigin::new([0x33; 16]).unwrap();
+            let lease = OriginPortLease::acquire().unwrap();
+            let other = StaticOriginIdentity::for_generation([0x44; 16]).provisioning();
+            let refused = identity.probe(&lease, other.server_name().into()).await;
+            assert_eq!(
+                refused.err().and_then(|fault| fault.stage),
+                Some(FixtureBootStage::TlsIo)
+            );
+            identity.probe(&lease, identity.name.clone()).await.unwrap();
+        })
+        .await
+        .expect("origin probe exceeded its hang guard");
+    }
+
+    /// A valid exchange that outlasts the former one-second cutoff still
+    /// reaches a successful static start. The delay sits inside the probe.
+    #[tokio::test]
+    async fn static_fixture_start_accepts_a_tls_probe_past_the_former_one_second_cutoff() {
+        const FORMER_CUTOFF: Duration = Duration::from_secs(1);
+        const PROBE_DELAY: Duration = Duration::from_millis(1_100);
+        assert!(PROBE_DELAY > FORMER_CUTOFF);
+        assert!(FIXTURE_TLS_DEADLINE > PROBE_DELAY);
+        assert!(FIXTURE_START_GUARD > FIXTURE_TLS_DEADLINE);
+
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let template = web_template(&h, &a, 450).await;
+        let created = call(
+            &a,
+            "static_vm_create",
+            json!({"name":"slow-probe","template_id":template,"request_id":key(451)}),
+        )
+        .await;
+        let created = terminal(&a, &created).await;
+        assert_eq!(created["state"], "succeeded", "{created}");
+        let vm = created["vm_id"].clone();
+        h.fixture(|fixture| {
+            let delay_ms = u64::try_from(PROBE_DELAY.as_millis()).expect("probe delay fits u64");
+            fixture
+                .probe_delay_ms
+                .store(delay_ms, std::sync::atomic::Ordering::Relaxed);
+        });
+        let began = Instant::now();
+        let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(452)})).await;
+        let started = terminal_static_start(&a, &start).await;
         assert!(
-            identity
-                .probe(&lease, other.server_name().into())
-                .await
-                .is_err()
+            began.elapsed() >= PROBE_DELAY,
+            "the fixture probe did not apply its delay"
         );
-        identity.probe(&lease, identity.name.clone()).await.unwrap();
+        assert_settled_static_start(&h, &vm, &started);
+        drop(a);
+        h.shutdown().await.unwrap();
     }
 
     include!("vm/vault_test_cases.rs");

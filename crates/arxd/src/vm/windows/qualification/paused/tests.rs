@@ -458,7 +458,11 @@ impl Host for Fake {
         Ok(())
     }
 
-    async fn verify_whpx(&self, _: &FakeSlot) -> Result<(), NativeRefusal> {
+    async fn verify_whpx(
+        &self,
+        _: &FakeSlot,
+        _: impl Future<Output = Result<(), Failure>>,
+    ) -> Result<(), Failure> {
         self.step(Step::VerifyWhpx)?;
         self.checkpoint(Step::VerifyWhpx).await;
         Ok(())
@@ -494,9 +498,10 @@ impl Host for Fake {
         self.reopen
     }
 
-    fn settle(&mut self, _: FakeSlot, disposition: StopDisposition) {
+    fn settle(&mut self, _: FakeSlot, disposition: StopDisposition) -> StopDisposition {
         self.steps.borrow_mut().push(Step::Settle);
         self.charge_retained = disposition == StopDisposition::ChargedQuarantine;
+        disposition
     }
 }
 
@@ -569,12 +574,14 @@ async fn failed_creation_assignment_or_resume_stops_without_qmp() {
 }
 
 #[tokio::test]
-async fn qmp_status_is_no_substitute_for_actual_opens() {
+async fn prelaunch_status_still_requires_inventory_recheck() {
     let mut host = Fake {
         fail: Some((Step::VerifyOpens, OPENS)),
         ..Fake::default()
     };
-    assert_eq!(host.run().await.paused, Err(Failure::Refused(OPENS)));
+    let result = host.run().await;
+    assert_eq!(result.paused, Err(Failure::Refused(OPENS)));
+    assert_eq!(result.release, StopDisposition::DirtyRelease);
     assert!(
         host.steps()
             .ends_with(&[Step::VerifyOpens, Step::Stop, Step::Reopen, Step::Settle])
