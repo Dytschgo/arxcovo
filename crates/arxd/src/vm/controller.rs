@@ -1019,7 +1019,18 @@ impl<C: Clock> VmController<C> {
                 uncertain = true;
                 continue;
             }
-            let outcome = reaper::reconcile(&work, runtime, custody, || self.clock.now().monotonic);
+            let now = || self.clock.now().monotonic;
+            let (released, finish_by) = reaper::release(&work, runtime, now);
+            if released
+                && work.accounted
+                && !self
+                    .store
+                    .transact(|db| store::claim_disposal(db, &work, utc(self.clock.now())?))?
+            {
+                uncertain = true;
+                continue;
+            }
+            let outcome = reaper::dispose(&work, custody, released, finish_by, now);
             match self
                 .store
                 .transact(|db| store::settle_cleanup(db, &work, utc(self.clock.now())?, outcome))
@@ -2386,7 +2397,11 @@ impl<C: Clock> VmController<C> {
                     .is_ok(),
                 "snapshot disk reserve crossed"
             );
-            store::snapshot::commit(db, work, pair, utc(self.clock.now())?, route)
+            store::snapshot::commit(db, work, pair, utc(self.clock.now())?, route)?;
+            // The receipt, both leaves and any pointer/charge swap are still
+            // tentative. A deadline crossed during writer acquisition or SQL
+            // settlement rolls all of them back before transaction commit.
+            self.check_snapshot_worker(worker, work)
         })
     }
 

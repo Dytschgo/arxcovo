@@ -2239,6 +2239,7 @@ pub(crate) fn cleanup_work(db: &Connection, kind: CleanupKind) -> Result<Option<
         return Ok(Some(CleanupWork {
             kind,
             pending_worker,
+            snapshot_phase: None,
             artifacts: Vec::new(),
             accounted: false,
             release_only: true,
@@ -2334,10 +2335,43 @@ pub(crate) fn cleanup_work(db: &Connection, kind: CleanupKind) -> Result<Option<
     Ok(Some(CleanupWork {
         kind,
         pending_worker,
+        snapshot_phase: None,
         artifacts,
         accounted,
         release_only: false,
     }))
+}
+
+/// Claim exactly the selected objects after independent runtime quiescence.
+/// Terminal cleanup phases already exclude publication. A live-copy candidate
+/// additionally needs its pending receipt fenced durably before filesystem I/O:
+/// a failed disposal or settlement must never revive the publishing worker.
+pub(crate) fn claim_disposal(db: &Connection, work: &CleanupWork, now: i64) -> Result<bool> {
+    let Some(mut current) = cleanup_work(db, work.kind)? else {
+        return Ok(false);
+    };
+    // Sweeps retains the joined worker ID across receipt settlement. It is
+    // a runtime hint; an outstanding durable worker must still match exactly.
+    if current.pending_worker.is_none() {
+        current.pending_worker = work.pending_worker;
+    }
+    if &current != work {
+        return Ok(false);
+    }
+    if current.snapshot_phase.as_deref() == Some("copy") {
+        let activity = current
+            .pending_worker
+            .ok_or_else(|| anyhow::anyhow!("missing snapshot copy receipt"))?;
+        if count(
+            db,
+            "SELECT count(*) FROM activity WHERE id=?1 AND status=0",
+            [activity],
+        )? == 1
+        {
+            finish(db, activity, Status::Interrupted, now, Some(false))?;
+        }
+    }
+    Ok(true)
 }
 
 fn identity_bytes(bytes: Vec<u8>) -> Option<Id> {

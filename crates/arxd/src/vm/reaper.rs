@@ -113,6 +113,7 @@ pub(crate) struct CleanupArtifact {
 pub(crate) struct CleanupWork {
     pub kind: CleanupKind,
     pub pending_worker: Option<i64>,
+    pub snapshot_phase: Option<String>,
     pub artifacts: Vec<CleanupArtifact>,
     pub accounted: bool,
     pub release_only: bool,
@@ -187,22 +188,18 @@ impl Sweeps {
     }
 }
 
-pub(super) fn reconcile(
+pub(super) fn release(
     work: &CleanupWork,
     runtime: &impl ReaperRuntime,
-    custody: &impl ArtifactCustody,
     now: impl Fn() -> Instant,
-) -> ReconcileOutcome {
+) -> (bool, Instant) {
     let start = now();
     let (Some(join_by), Some(stop_by), Some(finish_by)) = (
         start.checked_add(WORKER_BUDGET),
         start.checked_add(STOP_BUDGET),
         start.checked_add(ITEM_BUDGET),
     ) else {
-        return ReconcileOutcome {
-            released: false,
-            disposed: false,
-        };
+        return (false, start);
     };
     let released = match runtime.quiesce(work, join_by) {
         Quiesced::Offline => true,
@@ -218,6 +215,16 @@ pub(super) fn reconcile(
         }
         Quiesced::OwnedTestJob => false,
     };
+    (released, finish_by)
+}
+
+pub(super) fn dispose(
+    work: &CleanupWork,
+    custody: &impl ArtifactCustody,
+    released: bool,
+    finish_by: Instant,
+    now: impl Fn() -> Instant,
+) -> ReconcileOutcome {
     let disposed = released
         && !work.release_only
         && work.accounted
@@ -503,11 +510,14 @@ mod reaper_tests {
     const OWNER: &str = "alice";
 
     #[derive(Clone)]
-    struct TestClock(Arc<Mutex<ClockReading>>);
+    struct TestClock {
+        reading: Arc<Mutex<ClockReading>>,
+        next_sample: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    }
 
     impl TestClock {
         fn set(&self, utc_ms: i64, seconds: u64) {
-            let mut clock = self.0.lock().unwrap();
+            let mut clock = self.reading.lock().unwrap();
             clock.utc_ms = utc_ms;
             clock.monotonic += Duration::from_secs(seconds);
         }
@@ -515,7 +525,11 @@ mod reaper_tests {
 
     impl Clock for TestClock {
         fn now(&self) -> ClockReading {
-            *self.0.lock().unwrap()
+            let reading = *self.reading.lock().unwrap();
+            if let Some(sampled) = self.next_sample.lock().unwrap().take() {
+                let _ = sampled.send(());
+            }
+            reading
         }
     }
 
@@ -529,10 +543,13 @@ mod reaper_tests {
     impl Fixture {
         fn new() -> Self {
             let root = private_temp();
-            let clock = TestClock(Arc::new(Mutex::new(ClockReading {
-                utc_ms: NOW,
-                monotonic: Instant::now(),
-            })));
+            let clock = TestClock {
+                reading: Arc::new(Mutex::new(ClockReading {
+                    utc_ms: NOW,
+                    monotonic: Instant::now(),
+                })),
+                next_sample: Default::default(),
+            };
             let ctl = VmController::open(root.path(), VmPolicy::default(), clock.clone()).unwrap();
             let custody = FixtureCustody::open(root.path()).unwrap();
             Self {
@@ -675,6 +692,31 @@ mod reaper_tests {
 
         fn stage_clone(&self, slots: PairSlots) -> [ArtifactEvidence; 2] {
             [slots.disk, slots.vars].map(|slot| self.custody.stage(slot, b"clone").unwrap())
+        }
+
+        fn stage_snapshot(
+            &self,
+            work: &store::snapshot::Work,
+            worker: &PendingOperation,
+        ) -> [ArtifactEvidence; 2] {
+            let slots = work.candidate.unwrap();
+            [slots.disk, slots.vars].map(|slot| {
+                self.ctl.snapshot_leaf_begin(worker, work, slot).unwrap();
+                let evidence = self.custody.stage(slot, b"clone").unwrap();
+                self.ctl
+                    .snapshot_leaf_identity(
+                        worker,
+                        work,
+                        slot,
+                        evidence.identity,
+                        evidence.directory,
+                    )
+                    .unwrap();
+                self.ctl
+                    .snapshot_leaf_complete(worker, work, slot, evidence)
+                    .unwrap();
+                evidence
+            })
         }
 
         fn sweep(&self, runtime: &impl ReaperRuntime) {
@@ -1337,13 +1379,150 @@ mod reaper_tests {
                 activity_id: 1,
             },
             pending_worker: None,
+            snapshot_phase: None,
             artifacts: Vec::new(),
             accounted: false,
             release_only: true,
         };
-        let outcome = reconcile(&work, &Runtime::new(offline), &Probe, Instant::now);
+        let (released, finish_by) = release(&work, &Runtime::new(offline), Instant::now);
+        let outcome = dispose(&work, &Probe, released, finish_by, Instant::now);
         assert!(outcome.released);
         assert!(!outcome.disposed);
+    }
+
+    #[test]
+    fn claimed_orphan_copy_cannot_publish_even_when_disposal_fails() {
+        struct RefuseDisposal<F>(F);
+        impl<F: Fn()> ArtifactCustody for RefuseDisposal<F> {
+            fn reconcile(&self, _: &CleanupWork, _: Instant) -> bool {
+                (self.0)();
+                false
+            }
+        }
+        let f = Fixture::new();
+        let (vm, _) = f.clone(f.build(1, true), 2, true);
+        let (work, worker, op) = f
+            .ctl
+            .admit_snapshot(
+                OWNER,
+                key(NOW, 10),
+                vm,
+                Action::Snapshot as i64,
+                &snapshot::Request::Create(None),
+                None,
+                host(),
+                resources(),
+            )
+            .unwrap()
+            .unwrap();
+        let proof = f.stage_snapshot(&work, &worker);
+        let attempted = std::cell::Cell::new(false);
+        let custody = RefuseDisposal(|| {
+            attempted.set(true);
+            let err = f
+                .ctl
+                .finish_snapshot_copy(&worker, &work, proof, None, host(), resources())
+                .unwrap_err();
+            assert_eq!(err.to_string(), "snapshot commit fenced");
+        });
+        assert!(f.ctl.sweep_with(&Runtime::new(offline), &custody).unwrap());
+        assert!(attempted.get());
+        assert_eq!(
+            f.ctl.operation_status(OWNER, op.id).unwrap().unwrap().state,
+            Status::Interrupted
+        );
+        assert_eq!(f.count("SELECT count(*) FROM vm_restore_points"), 0);
+        assert_eq!(
+            f.count("SELECT count(*) FROM vm_snapshot_work WHERE phase='abandoned'"),
+            1
+        );
+        f.assert_pair(work.candidate.unwrap(), true);
+    }
+
+    #[test]
+    fn snapshot_restore_waiting_for_sql_writer_cannot_publish_after_deadline() {
+        let f = Fixture::new();
+        let (vm, active) = f.clone(f.build(1, true), 2, true);
+        let admit = |nonce, request| {
+            f.ctl
+                .admit_snapshot(
+                    OWNER,
+                    key(NOW, nonce),
+                    vm,
+                    match request {
+                        snapshot::Request::Create(_) => Action::Snapshot,
+                        snapshot::Request::Restore(_) => Action::Restore,
+                        _ => unreachable!(),
+                    } as i64,
+                    &request,
+                    None,
+                    host(),
+                    resources(),
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let (create, worker, _) = admit(10, snapshot::Request::Create(None));
+        let proof = f.stage_snapshot(&create, &worker);
+        f.ctl
+            .finish_snapshot_copy(&worker, &create, proof, None, host(), resources())
+            .unwrap();
+        let (restore, worker, op) = admit(11, snapshot::Request::Restore(create.target));
+        let candidate = restore.candidate.unwrap();
+        let proof = f.stage_snapshot(&restore, &worker);
+        let store = f.ctl.reaper_test_store();
+        let charge = store.transact(|db| store::disk_bytes(db)).unwrap().unwrap();
+
+        let error = std::thread::scope(|scope| {
+            let task = store
+                .transact(|_| {
+                    // Own the SQLite writer. The settlement thread samples a valid
+                    // token outside the transaction and cannot acquire it yet.
+                    let (sampled, read) = std::sync::mpsc::channel();
+                    *f.clock.next_sample.lock().unwrap() = Some(sampled);
+                    let task = scope.spawn(|| {
+                        f.ctl.finish_snapshot_copy(
+                            &worker,
+                            &restore,
+                            proof,
+                            None,
+                            host(),
+                            resources(),
+                        )
+                    });
+                    read.recv_timeout(Duration::from_secs(5))?;
+                    f.clock.set(NOW, 15 * 60 + 1);
+                    Ok(task)
+                })
+                .unwrap();
+            task.join().unwrap().unwrap_err()
+        });
+        assert_eq!(error.to_string(), "snapshot worker token expired");
+        assert_eq!(
+            f.ctl.operation_status(OWNER, op.id).unwrap().unwrap().state,
+            Status::Pending
+        );
+        store.transact(|db| {
+            let generation: Id = db.query_row(
+                "SELECT id FROM vm_generations WHERE vm_id=?1 AND active=1",
+                [vm], |row| row.get(0),
+            )?;
+            let identified = store::count(
+                db, "SELECT count(*) FROM vm_artifacts WHERE generation_id=?1 AND state='identified'",
+                [candidate.disk.generation],
+            )?;
+            let copying = store::count(
+                db, "SELECT count(*) FROM vm_snapshot_work WHERE activity=?1 AND phase='copy'",
+                [worker.activity_id()],
+            )?;
+            assert_eq!(generation, active.disk.generation);
+            assert_eq!(identified, 2);
+            assert_eq!(copying, 1);
+            assert_eq!(store::disk_bytes(db)?, Some(charge));
+            Ok(())
+        }).unwrap();
+        f.assert_pair(active, true);
+        f.assert_pair(candidate, true);
     }
 
     #[test]
@@ -1352,28 +1531,9 @@ mod reaper_tests {
         let golden = f.build(1, true);
         let (vm, active_slots) = f.clone(golden, 2, true);
         let stage_copy = |work: &store::snapshot::Work, worker: &PendingOperation| {
-            let slots = work.candidate.unwrap();
-            let mut proof = Vec::new();
-            for slot in [slots.disk, slots.vars] {
-                f.ctl.snapshot_leaf_begin(worker, work, slot).unwrap();
-                let ev = f.custody.stage(slot, b"clone").unwrap();
-                f.ctl
-                    .snapshot_leaf_identity(worker, work, slot, ev.identity, ev.directory)
-                    .unwrap();
-                f.ctl
-                    .snapshot_leaf_complete(worker, work, slot, ev)
-                    .unwrap();
-                proof.push(ev);
-            }
+            let proof = f.stage_snapshot(work, worker);
             f.ctl
-                .finish_snapshot_copy(
-                    worker,
-                    work,
-                    [proof[0], proof[1]],
-                    None,
-                    host(),
-                    resources(),
-                )
+                .finish_snapshot_copy(worker, work, proof, None, host(), resources())
                 .unwrap();
         };
 

@@ -584,6 +584,7 @@ pub(super) fn cleanup_work(
     Ok(Some(CleanupWork {
         kind,
         pending_worker: authority.activity,
+        snapshot_phase: Some(authority.phase),
         artifacts,
         accounted,
         release_only: false,

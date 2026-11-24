@@ -3175,6 +3175,7 @@ mod tests {
     /// offline only when no fixture boot or worker holds the subject.
     #[derive(Clone)]
     pub(super) struct FixtureReaper {
+        after_selection: Arc<Mutex<Option<StallHook>>>,
         live: Arc<Mutex<Live>>,
         live_changed: Arc<std::sync::Condvar>,
         handle: tokio::runtime::Handle,
@@ -3183,6 +3184,8 @@ mod tests {
 
     impl runtime::ReaperRuntime for FixtureReaper {
         fn quiesce(&self, work: &CleanupWork, deadline: Instant) -> runtime::Quiesced {
+            let stall = self.after_selection.lock().unwrap().take();
+            let _completed = stall.map(StallHook::enter);
             let mut live = self.live.lock().unwrap();
             let Some(vm) = work.kind.vm() else {
                 return runtime::Quiesced::Offline;
@@ -3490,6 +3493,7 @@ mod tests {
 
         pub(super) fn reaper(&self) -> FixtureReaper {
             FixtureReaper {
+                after_selection: Default::default(),
                 live: self.live.clone(),
                 live_changed: self.live_changed.clone(),
                 handle: self.handle.clone(),
@@ -7541,6 +7545,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_copy_cleanup_preserves_committed_static_point_and_active_media() {
+        let mut h =
+            Harness::start_configured(false, false, true, |f| f.snapshot_test_media = true).await;
+        let a = h.client(0).await;
+        let build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(WEB_RECIPE_ID),"request_id":key(2700)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(&a, &build).await["template_id"].clone();
+        let vm = terminal(
+            &a,
+            &call(
+                &a,
+                "static_vm_create",
+                json!({
+                    "template_id":template,"name":"stale-cleanup","request_id":key(2701)
+                }),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+        let vm_id = parse_id(vm.as_str().unwrap()).unwrap();
+        let mut point = Value::Null;
+        for restore in [false, true] {
+            let entered = Arc::new(Notify::new());
+            let resume = Arc::new(Notify::new());
+            h.fixture(|f| f.snapshot_hold = Some((entered.clone(), resume.clone())));
+            let op = if restore {
+                call(
+                    &a,
+                    "vm_snapshot_restore",
+                    json!({"vm_id":vm,"snapshot_id":point,"request_id":key(2703)}),
+                )
+                .await
+            } else {
+                call(
+                    &a,
+                    "vm_snapshot_create",
+                    json!({"vm_id":vm,"request_id":key(2702)}),
+                )
+                .await
+            };
+            assert_eq!(op["ok"], true, "{op}");
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .unwrap();
+
+            // Both candidate identities exist. Suspend quiescence after this
+            // sweep collected them, then publish those exact objects.
+            let reaper = h.fixture(|f| f.reaper());
+            let mut stall = Stall::install(&reaper.after_selection);
+            let ctl = h.supervisor().controller.clone();
+            let sweep =
+                tokio::task::spawn_blocking(move || ctl.sweep_with(&reaper, &*reaper.custody));
+            stall.entered().await;
+            let candidate: Id = h
+                .supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| {
+                    Ok(db.query_row(
+                        "SELECT candidate FROM vm_snapshot_work WHERE static_vm=?1",
+                        [vm_id],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            resume.notify_one();
+            let result = terminal(&a, &op).await;
+            assert_eq!(result["state"], "succeeded", "{result}");
+            if !restore {
+                point = result["snapshot_id"].clone();
+            }
+            let paths = h
+                .supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| {
+                    let published: bool = db.query_row(
+                        "SELECT active FROM vm_generations WHERE id=?1 AND static_id=?2",
+                        rusqlite::params![candidate, vm_id],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(published, restore);
+                    if !restore {
+                        let ready = crate::store::vm::count(
+                            db,
+                            "SELECT count(*) FROM vm_restore_points
+                             WHERE static_vm=?1 AND generation=?2 AND state='ready'",
+                            rusqlite::params![vm_id, candidate],
+                        )?;
+                        assert_eq!(ready, 1);
+                    }
+                    let mut stmt = db.prepare(
+                    "SELECT role,object_key FROM vm_artifacts WHERE generation_id=?1 ORDER BY role",
+                )?;
+                    let paths = stmt.query_map([candidate], |row| {
+                        let role: String = row.get(0)?;
+                        let key: Id = row.get(1)?;
+                        Ok(h.media.join(format!("{role}-{}", hex::encode(key))))
+                    })?;
+                    Ok(paths.collect::<rusqlite::Result<Vec<_>>>()?)
+                })
+                .unwrap();
+            assert_eq!(paths.len(), 2);
+            let bytes = paths
+                .iter()
+                .map(fs::read)
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap();
+            stall.release_and_join().await;
+            assert!(sweep.await.unwrap().unwrap());
+            for (path, original) in paths.iter().zip(bytes) {
+                assert!(
+                    fs::read(path).is_ok_and(|bytes| bytes == original),
+                    "stale reaper removed committed media"
+                );
+            }
+            h.sweep().await;
+        }
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn stalled_boot_join_keeps_later_expiry_turns_unconfirmed() {
         use crate::vm::{reaper::CleanupKind, runtime::ReaperRuntime};
         for force in [false, true] {
@@ -7574,6 +7707,7 @@ mod tests {
                 let work = CleanupWork {
                     kind: CleanupKind::Expiry { vm, activity_id: 1 },
                     pending_worker: None,
+                    snapshot_phase: None,
                     artifacts: Vec::new(),
                     accounted: false,
                     release_only: true,
