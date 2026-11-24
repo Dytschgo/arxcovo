@@ -11441,7 +11441,7 @@ mod tests {
         for args in [
             json!({"vm_id":vm,"request_id":key(6),"script":null}),
             json!({"vm_id":vm,"request_id":key(6),"script":"\0"}),
-            json!({"vm_id":vm,"request_id":key(6),"script":"ÃƒÆ’Ã‚Â©".repeat(2049)}),
+            json!({"vm_id":vm,"request_id":key(6),"script":"é".repeat(2049)}),
             json!({"vm_id":vm,"request_id":key(6),"script":"exit 0","timeout_s":1.5}),
             json!({"vm_id":vm,"request_id":key(6),"script":"exit 0","timeout_s":"30"}),
             json!({"vm_id":vm,"request_id":key(6),"script":"exit 0","timeout_s":121}),
