@@ -295,6 +295,14 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
 
    [Windows ACL inheritance](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setnamedsecurityinfow#remarks)
 
+   **Owner rollback.** After the trial settles and all holds are released,
+   use the same elevated console and recheck the bundle and working
+   directory paths with the reparse-point and empty-directory checks above.
+   Run `icacls.exe $bundle /reset /T /L` to replace the protected bundle
+   DACLs with the current parent inheritance. Proceed only if it exits 0.
+   Remove the checked empty working directory with
+   `Remove-Item -LiteralPath $cwd`. Administrators remains the bundle owner.
+
    From the non-elevated owner console, invoke the qualification runner
    with `--paused-trial` before the existing enrollment and evidence
    arguments. The trial selects a diskless and networkless

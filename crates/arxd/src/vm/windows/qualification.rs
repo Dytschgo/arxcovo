@@ -271,7 +271,7 @@ impl Baseline {
     ///
     /// The permit cannot be constructed by a caller:
     ///
-    /// ```compile_fail,E0603
+    /// ```compile_fail,E0423
     /// let permit = arxd::vm::qualification::PausedTrialPermit(());
     /// ```
     pub fn prepare_paused_trial(&self) -> Result<PausedTrialPermit<'_>, NativeRefusal> {
