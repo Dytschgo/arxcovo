@@ -135,7 +135,9 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    that the existing VHDX matches the recorded file identity and size at the
    checked path, the read-only `Get-DiskImage` query from step 7 reports it
    detached, and `T:` is unused. Verify the task-owned temporary directory
-   before running the block. The elevated owner session runs the
+   before running the block. The block itself refuses a scratch root that is a
+   reparse point and a script path that already exists, creates the script
+   fresh, and removes it whether or not DiskPart succeeds. The elevated owner session runs the
    `Get-DiskImage` guard, the same as the rest of the block. Whether
    Storage-module queries need elevation is **unverified on real hardware**.
    [DiskPart attachment](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/attach-vdisk)
@@ -150,13 +152,26 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    if (-not ($trialImage[0].Attached -eq $false)) {
        throw 'Trial volume attachment state is uncertain'
    }
-   @'
+   $trialAttachScript = 'D:\Temp\arx-m4-activation\trial-attach.txt'
+   $scratchRoot = Get-Item -LiteralPath 'D:\Temp\arx-m4-activation' -Force -ErrorAction Stop
+   if (-not $scratchRoot.PSIsContainer -or
+       ($scratchRoot.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+       throw 'Re-attach scratch root is not an ordinary directory'
+   }
+   if (Test-Path -LiteralPath $trialAttachScript) { throw 'Re-attach script path is not fresh' }
+   # New-Item without -Force fails if any entry, including a link, already has this name.
+   $null = New-Item -ItemType File -Path $trialAttachScript -ErrorAction Stop
+   try {
+       @'
    select vdisk file=D:\ArxcovoData\qualify\trial.vhdx
    attach vdisk
-   '@ | Set-Content -LiteralPath 'D:\Temp\arx-m4-activation\trial-attach.txt' -Encoding ascii -ErrorAction Stop
-   diskpart.exe /s 'D:\Temp\arx-m4-activation\trial-attach.txt'
-   if ($LASTEXITCODE -ne 0) { throw 'Trial volume reattachment failed' }
-   Remove-Item -LiteralPath 'D:\Temp\arx-m4-activation\trial-attach.txt' -ErrorAction Stop
+   '@ | Set-Content -LiteralPath $trialAttachScript -Encoding ascii -ErrorAction Stop
+       diskpart.exe /s $trialAttachScript
+       if ($LASTEXITCODE -ne 0) { throw 'Trial volume reattachment failed' }
+   } finally {
+       # Non-terminating, so a cleanup problem never hides the reattachment error.
+       Remove-Item -LiteralPath $trialAttachScript -Force -ErrorAction Continue
+   }
    ```
 
    Repeat preflight from the Medium console after any setup. Recheck WHPX,
