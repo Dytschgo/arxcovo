@@ -775,7 +775,9 @@ type StoredSecret = (Vec<u8>, SecretFileWitness);
 #[derive(Default)]
 struct Disk {
     state: Option<Vec<u8>>,
+    // Only snapshots that completed the directory sync survive a simulated crash.
     save_snapshots: Vec<Vec<u8>>,
+    load_overrides: VecDeque<Option<Vec<u8>>>,
     revisions: BTreeMap<(String, u64), String>,
     rotations: BTreeMap<(String, u64, String), String>,
     secrets: BTreeMap<(String, String), StoredSecret>,
@@ -806,7 +808,11 @@ struct MemoryStore(Arc<Mutex<Disk>>);
 
 impl ComposeStore for MemoryStore {
     fn load_state(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
-        Ok(self.0.lock().unwrap().state.clone())
+        let mut disk = self.0.lock().unwrap();
+        Ok(disk
+            .load_overrides
+            .pop_front()
+            .unwrap_or_else(|| disk.state.clone()))
     }
 
     fn save_state(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
@@ -816,7 +822,6 @@ impl ComposeStore for MemoryStore {
         {
             if fault == StoreFault::AfterRename {
                 disk.state = Some(bytes.to_vec());
-                disk.save_snapshots.push(bytes.to_vec());
             }
             return Err(StoreError);
         }
@@ -4236,4 +4241,144 @@ fn contract_g_uncertain_receipt_cannot_rebind_operation_id() {
             "live broker re-accepted the same ID for B, rebound its durable digest, and wrote a file"
         );
     }
+}
+
+#[test]
+fn contract_g_reconcile_must_checkpoint_visible_rename_before_success() {
+    let h = Harness::new();
+    h.hello();
+    let digest_a = h.stage(&bytes(&manifest()));
+    let mut other = manifest();
+    other["services"][0]["environment"][0]["value"] = json!("8099");
+    let other_input = bytes(&other);
+    let digest_b = h.stage(&other_input);
+    assert!(matches!(
+        h.put_secret(90, &digest_a, 1, b"synthetic A"),
+        ComposeResponse::ComposeSecretAccepted { .. }
+    ));
+
+    let stable = h.disk.lock().unwrap().save_snapshots.last().cloned();
+    h.disk
+        .lock()
+        .unwrap()
+        .save_faults
+        .push_back(Some(StoreFault::AfterRename));
+    assert_eq!(
+        rejected(&h.put_secret(91, &digest_a, 1, b"synthetic A")),
+        Some(RejectCode::StoreFailure)
+    );
+    assert_ne!(
+        h.disk.lock().unwrap().state,
+        stable,
+        "renamed state must be visible"
+    );
+    {
+        let mut disk = h.disk.lock().unwrap();
+        // Model a rename visible to readers with the directory sync still failing.
+        disk.fail_save_state = true;
+    }
+    let probe = || rejected(&h.put_secret(92, &"0".repeat(64), 1, b"probe"));
+    let before = probe();
+    assert_eq!(before, Some(RejectCode::StoreFailure));
+    let saves_before = h.disk.lock().unwrap().save_snapshots.len();
+    let premature_success = matches!(
+        h.reconcile(91),
+        ComposeResponse::ComposeOperationState {
+            operation: OperationView {
+                state: OperationState::Succeeded,
+                ..
+            },
+            ..
+        }
+    );
+    let new_saves = h.disk.lock().unwrap().save_snapshots.len() - saves_before;
+
+    let after = probe();
+    // A crash before directory sync may leave the previously durable name.
+    let crashed = Harness::on(Arc::new(Mutex::new(Disk {
+        state: stable.clone(),
+        ..Disk::default()
+    })));
+    crashed.hello_gen(GENERATION + 1);
+    assert_eq!(crashed.stage(&other_input), digest_b);
+    assert_eq!(
+        rejected(&crashed.put_secret_as(
+            90,
+            GENERATION + 1,
+            PROJECT,
+            &digest_b,
+            SLOT,
+            1,
+            b"synthetic B"
+        )),
+        Some(RejectCode::OperationConflict)
+    );
+    let accepted_for_b_after_crash = matches!(
+        crashed.put_secret_as(91, GENERATION + 1, PROJECT, &digest_b, SLOT, 1, b"synthetic B"),
+        ComposeResponse::ComposeSecretAccepted { digest, .. } if digest == digest_b
+    );
+    assert!(
+        !(premature_success && accepted_for_b_after_crash),
+        "gate probe before={before:?} after={after:?}; reconcile reported success after {new_saves} successful saves, then a crash losing the unsynced rename let the same ID settle for another digest"
+    );
+
+    assert!(!premature_success);
+    assert_eq!(after, Some(RejectCode::StoreFailure));
+    assert_eq!(new_saves, 0);
+
+    // A process-only restart sees the unsynced rename too. It must stay frozen.
+    let restarted = Harness::on(Arc::clone(&h.disk));
+    restarted.hello();
+    assert_eq!(
+        rejected(&restarted.reconcile(91)),
+        Some(RejectCode::StoreFailure)
+    );
+    assert_eq!(
+        rejected(&restarted.put_secret(91, &digest_b, 1, b"synthetic B")),
+        Some(RejectCode::StoreFailure)
+    );
+
+    // Allow the recovery save. A stale, valid read-back still cannot release the gate.
+    {
+        let mut disk = h.disk.lock().unwrap();
+        disk.fail_save_state = false;
+        let visible = disk.state.clone();
+        disk.load_overrides.extend([visible, stable]);
+    }
+    assert_eq!(rejected(&h.reconcile(91)), Some(RejectCode::StoreFailure));
+    assert_eq!(probe(), Some(RejectCode::StoreFailure));
+    assert!(h.disk.lock().unwrap().load_overrides.is_empty());
+
+    // This time the re-read matches. A crash after the success reply must keep ID 91.
+    assert!(matches!(
+        h.reconcile(91),
+        ComposeResponse::ComposeOperationState {
+            operation: OperationView {
+                state: OperationState::Succeeded,
+                ..
+            },
+            ..
+        }
+    ));
+    assert_eq!(probe(), Some(RejectCode::UnknownRelease));
+    let durable = h.disk.lock().unwrap().save_snapshots.last().cloned();
+    let crashed = Harness::on(Arc::new(Mutex::new(Disk {
+        state: durable,
+        ..Disk::default()
+    })));
+    crashed.hello_gen(GENERATION + 1);
+    assert_eq!(crashed.stage(&other_input), digest_b);
+    assert_eq!(crashed.operation(91).state, OperationState::Succeeded);
+    assert_eq!(
+        rejected(&crashed.put_secret_as(
+            91,
+            GENERATION + 1,
+            PROJECT,
+            &digest_b,
+            SLOT,
+            1,
+            b"synthetic B"
+        )),
+        Some(RejectCode::OperationConflict)
+    );
 }

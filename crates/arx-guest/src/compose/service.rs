@@ -252,6 +252,20 @@ impl State {
         }
     }
 
+    /// A successful save includes the directory sync. Verify the complete
+    /// checkpoint, including tombstones, before making recovered state visible.
+    fn confirm_checkpoint(&self, store: &mut dyn ComposeStore) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(self).map_err(|_| StoreError)?;
+        if bytes.len() > MAX_STATE_BYTES {
+            return Err(StoreError);
+        }
+        store.save_state(&bytes)?;
+        if store.load_state()?.as_deref() != Some(bytes.as_slice()) {
+            return Err(StoreError);
+        }
+        Ok(())
+    }
+
     fn load(bytes: &[u8]) -> Result<Self, StoreError> {
         if bytes.len() > MAX_STATE_BYTES {
             return Err(StoreError);
@@ -573,9 +587,18 @@ impl ComposeService {
         mut store: Box<dyn ComposeStore>,
         clock: Box<dyn Clock>,
     ) -> Result<Self, StoreError> {
-        let state = match store.load_state()? {
-            Some(bytes) => State::load(&bytes)?,
-            None => State::new(),
+        // A process restart can still see a rename whose directory sync failed.
+        // Keep Compose available for recovery, but expose no receipts from that
+        // snapshot until its checkpoint has been confirmed.
+        let (state, store_uncertain) = match store.load_state()? {
+            Some(bytes) => {
+                let candidate = State::load(&bytes)?;
+                match candidate.confirm_checkpoint(store.as_mut()) {
+                    Ok(()) => (candidate, false),
+                    Err(StoreError) => (State::new(), true),
+                }
+            }
+            None => (State::new(), false),
         };
         Ok(Self {
             shared: Arc::new(Shared {
@@ -585,7 +608,7 @@ impl ComposeService {
                     staged: VecDeque::new(),
                     running: None,
                     generation: None,
-                    store_uncertain: false,
+                    store_uncertain,
                 }),
                 idle: Condvar::new(),
                 store: Mutex::new(store),
@@ -2464,13 +2487,17 @@ impl From<Settlement> for SettlementCommit {
 /// Recover the actual side of a failed rename before computing another transition.
 fn reload_uncertain(shared: &Shared, inner: &mut Inner) -> Result<(), RejectCode> {
     if inner.store_uncertain {
-        let snapshot = lock(&shared.store)
-            .load_state()
-            .map_err(|_| RejectCode::StoreFailure)?;
-        inner.state = match snapshot {
+        let mut store = lock(&shared.store);
+        let candidate = match store.load_state().map_err(|_| RejectCode::StoreFailure)? {
             Some(bytes) => State::load(&bytes).map_err(|_| RejectCode::StoreFailure)?,
-            None => State::new(),
+            // A first admission can fail before creating state.json. Preserve
+            // any known receipts and tombstones if the file is missing.
+            None => inner.state.clone(),
         };
+        candidate
+            .confirm_checkpoint(store.as_mut())
+            .map_err(|_| RejectCode::StoreFailure)?;
+        inner.state = candidate;
         inner.store_uncertain = false;
     }
     Ok(())
@@ -2506,7 +2533,6 @@ fn commit_settlement(
         return Err(RejectCode::StoreFailure);
     }
     inner.state = candidate;
-    inner.store_uncertain = false;
     Ok(())
 }
 
