@@ -6217,6 +6217,68 @@ mod tests {
         assert!(h.shutdown().await.is_err());
     }
 
+    /// A residue publish whose worker cleanup fails before its terminal
+    /// receipt write (here the `revoking` checkpoint). Once SQLite recovers,
+    /// the reaper or the final drain releases the intent and settles the
+    /// orphaned receipt, which stays unconfirmed on both paths.
+    #[tokio::test]
+    async fn a_residue_receipt_stays_unconfirmed_when_worker_cleanup_fails() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 2300).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let host = h.supervisor().host_id;
+        let refuse_revoking =
+            "CREATE TRIGGER refuse_revoking BEFORE UPDATE OF phase ON vm_publication
+             WHEN NEW.phase='revoking'
+             BEGIN SELECT RAISE(ABORT, 'synthetic checkpoint failure'); END;";
+        let unconfirmed = |row: &Value| {
+            assert_eq!(
+                (&row["state"], &row["cleanup"]),
+                (&json!("failed"), &json!(proof_wire(false))),
+                "an orphaned residue receipt claims confirmed cleanup: {row}"
+            );
+        };
+
+        // Settled by a reaper turn.
+        fake.residue.store(true, SeqCst);
+        trigger(&h, refuse_revoking);
+        let pending = call(&a, "publish_site", args(2310)).await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert_eq!(operation(&a, &pending).await["state"], "pending");
+        assert_eq!(phase(&a, &vm).await["phase"], "publishing");
+        trigger(&h, "DROP TRIGGER refuse_revoking");
+        h.tick().await;
+        unconfirmed(&terminal(&a, &pending).await);
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+
+        // Settled by foreground shutdown before any reaper turn, checked
+        // after restart.
+        fake.residue.store(true, SeqCst);
+        trigger(&h, refuse_revoking);
+        let pending = call(&a, "publish_site", args(2311)).await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert_eq!(operation(&a, &pending).await["state"], "pending");
+        trigger(&h, "DROP TRIGGER refuse_revoking");
+        drop(a);
+        assert!(
+            h.shutdown().await.is_err(),
+            "a residue drain reported clean"
+        );
+        let mut h = h.reopen(|_| {}).await;
+        enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
+        let a = h.client(0).await;
+        unconfirmed(&terminal(&a, &pending).await);
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (0, 0));
+        assert!(!fake.local.load(SeqCst));
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_failed_revoking_checkpoint_keeps_the_owner_cause() {
         let mut h = Harness::start_with_web(false, false, true).await;

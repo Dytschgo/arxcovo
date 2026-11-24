@@ -1643,6 +1643,17 @@ pub(crate) mod publication {
             let result = self
                 .activate(controller, &intent, prepared, &origin, ticket, shutdown)
                 .await;
+            // An unremoved ingress residue is never confirmed cleanup, even
+            // though no process or DNS effect remains. The receipt is recorded
+            // as unconfirmed before any later step can fail, so whichever path
+            // settles it (this worker, the reaper or the final drain as an
+            // orphan) records it as unconfirmed. It is dropped only once this
+            // worker's own terminal write is durable.
+            let residue = self.activations().residue == Some(generation);
+            let receipt = operation.receipt.activity_id;
+            if residue {
+                self.activations().unconfirmed_receipts.insert(receipt);
+            }
             let authorized =
                 || origin.current() && !shutdown.is_cancelled() && !revoked.is_cancelled();
             let commit_authorized = || {
@@ -1713,15 +1724,6 @@ pub(crate) mod publication {
                     Some(shutdown),
                 )
                 .await?;
-            // An unremoved ingress residue is never confirmed cleanup, even
-            // though no process or DNS effect remains. Until this receipt's
-            // terminal write is durable, the reaper and the final drain settle
-            // it as unconfirmed too.
-            let residue = self.activations().residue == Some(generation);
-            let receipt = operation.receipt.activity_id;
-            if residue {
-                self.activations().unconfirmed_receipts.insert(receipt);
-            }
             let clean = cleanup == Cleanup::Released && !residue;
             // A latched owner cause wins over this worker's local failure.
             let failure = self.cause(&intent.nonce, Some(failure));
