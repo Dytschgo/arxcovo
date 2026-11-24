@@ -142,7 +142,12 @@ test('Rust retains every native, Python and package validation with exact comman
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -I -B scripts/check-bound-sqlite.py --check-loader-env
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo check --workspace --all-targets --locked --message-format=json > $messages
+          if ($IsWindows) {
+            # Clippy checks the same targets and emits the SQLite build-script proof.
+            cargo clippy --workspace --all-targets --locked --message-format=json-render-diagnostics -- -D warnings > $messages
+          } else {
+            cargo check --workspace --all-targets --locked --message-format=json > $messages
+          }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -I -B scripts/check-bound-sqlite.py --metadata $metadata --build-messages $messages --self-test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -154,6 +159,7 @@ test('Rust retains every native, Python and package validation with exact comman
           cargo --version --verbose
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
     `name: Preflight loader environment and lint Rust
+        if: runner.os != 'Windows'
         shell: pwsh
         run: |
           python -I -B scripts/check-bound-sqlite.py --check-loader-env
@@ -212,8 +218,6 @@ test('Rust retains every native, Python and package validation with exact comman
           python -I -B -m unittest discover -s tools/ci/authority-fence -p 'test_*.py'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -I -B tools/ci/authority-fence/check.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p arxd --doc --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
     `name: Hosted distinct-UID custody qualification
         if: runner.os == 'Linux'

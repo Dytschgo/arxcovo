@@ -1,5 +1,7 @@
 """Pure tests for the authority fence gate's parsing and verdicts."""
+from contextlib import redirect_stdout
 import importlib.util
+from io import StringIO
 import json
 from pathlib import Path
 import unittest
@@ -20,6 +22,40 @@ def diagnostic(code, message, level="error"):
             "message": message,
         }
     )
+
+
+class DoctestLibraryTests(unittest.TestCase):
+    def artifact(self, path, manifest=CHECK.MANIFEST, test=False):
+        return json.dumps({
+            "reason": "compiler-artifact",
+            "manifest_path": str(manifest),
+            "target": {"name": "arxd", "kind": ["lib"]},
+            "profile": {"test": test},
+            "filenames": [str(path), str(path.with_suffix(".rmeta"))],
+            "fresh": True,
+        })
+
+    def test_reuses_the_doctest_library_and_prints_the_doctest_output(self):
+        rlib = Path("target/debug/deps/libarxd-abc.rlib")
+        output = "\n".join([
+            self.artifact(rlib, manifest=Path("other/Cargo.toml")),
+            self.artifact(rlib, test=True),
+            self.artifact(rlib),
+            '{"reason":"build-finished","success":true}',
+            '{"doctests":"passed"}',
+        ])
+        printed = StringIO()
+        with redirect_stdout(printed):
+            self.assertEqual(CHECK.doctest_library(output), rlib)
+        self.assertEqual(printed.getvalue(), '{"doctests":"passed"}\n')
+
+    def test_missing_or_ambiguous_dependency_artifacts_fail(self):
+        for artifacts in [
+            [Path("target/debug/libarxd.rlib")],
+            [Path("target/debug/deps/libarxd-a.rlib"), Path("target/debug/deps/libarxd-b.rlib")],
+        ]:
+            with self.assertRaisesRegex(RuntimeError, "expected one arxd doctest rlib"):
+                CHECK.doctest_library("\n".join(self.artifact(path) for path in artifacts))
 
 
 class BlockTests(unittest.TestCase):
