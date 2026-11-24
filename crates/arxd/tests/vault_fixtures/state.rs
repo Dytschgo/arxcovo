@@ -40,6 +40,7 @@ fn add(vault: &Arc<Vault>, nonce: u64, name: &str, body: &str) -> Reply {
             script: body.into(),
         }),
         NOW,
+        None,
     )
 }
 
@@ -56,6 +57,7 @@ fn test(vault: &Arc<Vault>, nonce: u64, version_id: Id) -> Reply {
             version_id,
         }),
         NOW,
+        None,
     )
 }
 
@@ -68,6 +70,7 @@ fn activate(vault: &Arc<Vault>, nonce: u64, version_id: Id) -> Reply {
             version_id,
         }),
         NOW,
+        None,
     )
 }
 
@@ -177,6 +180,39 @@ fn vault_failed_replacement_keeps_predecessor_active_and_redacts_audit() {
 }
 
 #[test]
+fn vault_completion_refuses_a_changed_digest() {
+    let dir = private::private_dir();
+    let tester = Arc::new(Fixture::default());
+    let vault = Vault::open(dir.path(), Some(tester.clone()), NOW).unwrap();
+    let version = version_id(add(&vault, 1, "build", "exit 0").unwrap());
+    test(&vault, 2, version).unwrap();
+    let job = tester.take();
+    let changed_body = b"exit 7";
+    let changed_digest: [u8; 32] = Sha256::digest(changed_body).into();
+    assert_ne!(job.sha256(), changed_digest);
+    vault
+        .store
+        .write(|db| {
+            assert_eq!(
+                db.execute(
+                    "UPDATE versions SET body=?1,hash=?2 WHERE id=?3",
+                    params![changed_body.as_slice(), changed_digest, version],
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    job.complete(ScriptOutcome::Exited { exit_code: 0 }, true)
+        .unwrap();
+    let row = vault.get(OWNER, version, false).unwrap();
+    assert_eq!(row["state"], "rejected");
+    assert_eq!(row["test"]["cleanup_confirmed"], false);
+    assert_eq!(activate(&vault, 3, version), Err(Refusal::PassRequired));
+}
+
+#[test]
 fn vault_replay_lock_recovery_and_clock_rollback() {
     let dir = private::private_dir();
     let vault = Vault::open(dir.path(), None, NOW).unwrap();
@@ -213,6 +249,7 @@ fn vault_replay_lock_recovery_and_clock_rollback() {
                     version_id: version,
                 },
                 true,
+                None,
             )?;
             assert!(job.is_some());
             Ok(())
@@ -221,8 +258,24 @@ fn vault_replay_lock_recovery_and_clock_rollback() {
     drop(vault);
     let vault = Vault::open(dir.path(), None, NOW).unwrap();
     let recovered = vault.get(OWNER, version, false).unwrap();
-    assert_eq!(recovered["state"], "rejected");
-    assert_eq!(recovered["test"]["status"], "interrupted");
+    assert_eq!(recovered["state"], "test_inconclusive");
+    assert_eq!(
+        recovered["test"],
+        json!({"status":"test_inconclusive","cleanup_confirmed":false})
+    );
+    vault
+        .store
+        .read(|db| {
+            let count: i64 = db.query_row(
+                "SELECT count(*) FROM audit WHERE version=?1 AND action='vault_test_version'
+             AND outcome='failed' AND reason='test_inconclusive'",
+                [version],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 1);
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(add(&vault, 1, "one", "exit 0").unwrap(), receipt);
     assert!(test(&vault, 2, version).is_ok());
     assert_eq!(
@@ -233,7 +286,8 @@ fn vault_replay_lock_recovery_and_clock_rollback() {
                 request_id: key(3),
                 version_id: version,
             }),
-            NOW + crate::vm::RETRY_WINDOW_MS + 1
+            NOW + crate::vm::RETRY_WINDOW_MS + 1,
+            None,
         ),
         Err(Refusal::StaleKey)
     );
@@ -315,6 +369,7 @@ fn vault_owner_caps_keep_capacity_available_to_other_principals() {
                 script: content.into(),
             }),
             NOW,
+            None,
         )
     };
     assert!(add_as("byte-owner", 1, "bytes", &"x".repeat(MAX_SCRIPT)).is_ok());
@@ -393,4 +448,43 @@ fn vault_state_binding_rejects_substituted_main_and_linked_files() {
         assert_eq!(fs::read(path).unwrap(), expected);
     }
     assert!(Vault::open(dir.path(), None, NOW).is_ok());
+}
+
+#[test]
+fn vault_retry_and_receipt_survive_v1_migration_and_v2_reopen() {
+    let dir = private::private_dir();
+    let tester = Arc::new(Fixture::default());
+    let vault = Vault::open(dir.path(), Some(tester.clone()), NOW).unwrap();
+    let added = add(&vault, 1, "build", "exit 0").unwrap();
+    let version = version_id(added.clone());
+    vault
+        .store
+        .write(|db| {
+            db.execute_batch(
+                "ALTER TABLE versions DROP COLUMN inconclusive; PRAGMA user_version=1",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    drop(vault);
+    let vault = Vault::open(dir.path(), Some(tester.clone()), NOW).unwrap();
+    assert_eq!(add(&vault, 1, "build", "exit 0").unwrap(), added);
+    let receipt = test(&vault, 2, version).unwrap();
+    tester.take().inconclusive().unwrap();
+    drop(vault);
+    let vault = Vault::open(dir.path(), Some(tester.clone()), NOW).unwrap();
+    assert_eq!(
+        vault.get(OWNER, version, false).unwrap()["state"],
+        "test_inconclusive"
+    );
+    assert_eq!(test(&vault, 2, version).unwrap(), receipt);
+    assert_ne!(
+        test(&vault, 3, version).unwrap()["operation_id"],
+        receipt["operation_id"]
+    );
+    tester
+        .take()
+        .complete(ScriptOutcome::Exited { exit_code: 0 }, true)
+        .unwrap();
+    activate(&vault, 4, version).unwrap();
 }

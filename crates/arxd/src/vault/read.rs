@@ -5,7 +5,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 
-pub(super) const VERSION_FIELDS: &str = "v.id,s.id,s.owner,s.os,s.name,v.hash,v.created_ms,v.state,v.test_status,v.exit_code,v.cleanup_confirmed";
+pub(super) const VERSION_FIELDS: &str = "v.id,s.id,s.owner,s.os,s.name,v.hash,v.created_ms,
+    CASE WHEN v.inconclusive=1 THEN 'test_inconclusive' ELSE v.state END,
+    CASE WHEN v.inconclusive=1 THEN 'test_inconclusive' ELSE v.test_status END,
+    v.exit_code,v.cleanup_confirmed";
 
 pub(super) fn version(row: &Row<'_>) -> rusqlite::Result<Value> {
     let mut value = json!({

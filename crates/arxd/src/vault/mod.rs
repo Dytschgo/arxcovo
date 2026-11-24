@@ -63,7 +63,7 @@ pub(crate) fn for_activity(activity: &Arc<Activity>) -> Option<Arc<Vault>> {
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ScriptOs {
+pub(crate) enum ScriptOs {
     Windows,
     Ubuntu,
 }
@@ -105,7 +105,7 @@ impl Action {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Refusal {
+pub(crate) enum Refusal {
     Invalid,
     InvalidCursor,
     StaleKey,
@@ -114,6 +114,7 @@ enum Refusal {
     NotFound,
     NotDraft,
     TesterUnavailable,
+    VmAdmissionClosed,
     PassRequired,
     VersionSuperseded,
     Busy,
@@ -126,7 +127,7 @@ enum Refusal {
 }
 
 impl Refusal {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Invalid => "invalid",
             Self::InvalidCursor => "invalid_cursor",
@@ -136,6 +137,7 @@ impl Refusal {
             Self::NotFound => "not_found",
             Self::NotDraft => "not_draft",
             Self::TesterUnavailable => "tester_unavailable",
+            Self::VmAdmissionClosed => "vm_admission_closed",
             Self::PassRequired => "pass_required",
             Self::VersionSuperseded => "version_superseded",
             Self::Busy => "busy",
@@ -205,35 +207,36 @@ impl Write {
 /// Trusted daemon adapter. Enqueue is a prompt handoff after commit. The adapter
 /// must reserve a throwaway generation and qualify its teardown before reporting
 /// a pass. It must never log the job's body or expose it as guest output.
-trait VaultTester: Send + Sync {
+pub(crate) trait VaultTester: Send + Sync {
     fn enqueue(&self, job: TestJob);
 }
 
-// No production composition supplies a tester pending the M4 throwaway journey.
-// These adapter methods are exercised by the internal fake until that wiring lands.
-#[cfg_attr(not(test), allow(dead_code))]
-struct TestJob {
+pub(crate) struct TestJob {
     store: Arc<store::Store>,
     owner: String,
     data: store::JobData,
     settled: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl TestJob {
-    fn os(&self) -> ScriptOs {
+    pub(crate) fn os(&self) -> ScriptOs {
         self.data.os
     }
 
-    fn content(&self) -> &str {
+    pub(crate) fn content(&self) -> &str {
         &self.data.content
     }
 
+    #[cfg(test)]
     fn sha256(&self) -> [u8; 32] {
         self.data.hash
     }
 
-    fn complete(mut self, outcome: ScriptOutcome, cleanup_confirmed: bool) -> anyhow::Result<()> {
+    pub(crate) fn complete(
+        mut self,
+        outcome: ScriptOutcome,
+        cleanup_confirmed: bool,
+    ) -> anyhow::Result<()> {
         let (status, exit_code) = match outcome {
             ScriptOutcome::Exited { exit_code } => ("exited", Some(exit_code)),
             ScriptOutcome::Unavailable => ("unavailable", None),
@@ -241,7 +244,13 @@ impl TestJob {
             ScriptOutcome::LaunchFailed => ("launch_failed", None),
             ScriptOutcome::Terminated => ("terminated", None),
         };
-        self.finish(status, exit_code, cleanup_confirmed)?;
+        self.finish(status, exit_code, cleanup_confirmed, false)?;
+        self.settled = true;
+        Ok(())
+    }
+
+    pub(crate) fn inconclusive(mut self) -> anyhow::Result<()> {
+        self.finish("interrupted", None, false, true)?;
         self.settled = true;
         Ok(())
     }
@@ -251,6 +260,7 @@ impl TestJob {
         status: &str,
         exit_code: Option<u32>,
         cleanup_confirmed: bool,
+        inconclusive: bool,
     ) -> anyhow::Result<()> {
         let passed = status == "exited" && exit_code == Some(0) && cleanup_confirmed;
         let scope = store::WriteScope {
@@ -260,14 +270,24 @@ impl TestJob {
         };
         self.store.write(|db| {
             let changed = db.execute(
-                "UPDATE versions SET state=?1,test_status=?2,exit_code=?3,cleanup_confirmed=?4
+                "UPDATE versions SET state=?1,test_status=?2,exit_code=?3,cleanup_confirmed=?4,inconclusive=?8
                  WHERE id=?5 AND test_op=?6 AND hash=?7 AND state='testing' AND test_status IS NULL",
                 params![if passed { "testing" } else { "rejected" }, status, exit_code,
-                    cleanup_confirmed, self.data.version, self.data.operation, self.data.hash],
+                    cleanup_confirmed, self.data.version, self.data.operation, self.data.hash, inconclusive],
             )?;
-            anyhow::ensure!(changed == 1, "vault test claim no longer pending");
+            if changed == 0 {
+                let rejected = db.execute(
+                    "UPDATE versions SET state='rejected',test_status='interrupted',cleanup_confirmed=0
+                     WHERE id=?1 AND test_op=?2 AND hash<>?3 AND state='testing' AND test_status IS NULL",
+                    params![self.data.version, self.data.operation, self.data.hash],
+                )?;
+                anyhow::ensure!(rejected == 1, "vault test claim no longer pending");
+                return scope.audit(db, "failed", Some("digest_mismatch"), Some(self.data.version), Some(self.data.operation));
+            }
             scope.audit(db, if passed { "succeeded" } else { "failed" },
-                if passed { None } else if status == "exited" && exit_code == Some(0) {
+                if passed { None } else if inconclusive {
+                    Some("test_inconclusive")
+                } else if status == "exited" && exit_code == Some(0) {
                     Some("cleanup_unconfirmed")
                 } else { Some(status) }, Some(self.data.version), Some(self.data.operation))
         })
@@ -277,7 +297,7 @@ impl TestJob {
 impl Drop for TestJob {
     fn drop(&mut self) {
         if !self.settled {
-            let _ = self.finish("interrupted", None, false);
+            let _ = self.finish("interrupted", None, false, false);
         }
     }
 }
@@ -289,7 +309,7 @@ pub(crate) struct Vault {
 }
 
 impl Vault {
-    fn open(
+    pub(crate) fn open(
         dir: &Path,
         tester: Option<Arc<dyn VaultTester>>,
         now: i64,
@@ -310,6 +330,7 @@ impl Vault {
         action: Action,
         write: Result<Write, Refusal>,
         now: i64,
+        test_refusal: Option<Refusal>,
     ) -> Reply {
         let scope = store::WriteScope {
             owner,
@@ -319,7 +340,7 @@ impl Vault {
         let (reply, job) = self
             .store
             .write(|db| match write {
-                Ok(write) => scope.execute(db, write, self.tester.is_some()),
+                Ok(write) => scope.execute(db, write, self.tester.is_some(), test_refusal),
                 Err(reason) => {
                     scope.audit(db, "refused", Some(reason.as_str()), None, None)?;
                     Ok((Err(reason), None))
@@ -366,7 +387,7 @@ impl Vault {
     }
 }
 
-fn utc_ms() -> anyhow::Result<i64> {
+pub(crate) fn utc_ms() -> anyhow::Result<i64> {
     let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
     anyhow::ensure!(now <= MAX_UTC_MS, "invalid vault clock");
     Ok(now)

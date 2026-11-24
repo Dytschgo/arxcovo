@@ -18,8 +18,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::{
     path::Path,
-    sync::{Arc, Mutex, TryLockError},
-    time::Duration,
+    sync::{
+        Arc, Mutex, TryLockError,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 /// Foreground VM-profile metadata. A successful admission commits intent;
@@ -30,7 +33,72 @@ pub struct VmController<C> {
     clock: C,
     gate: Mutex<AdmissionGate>,
     sweeps: Mutex<Sweeps>,
+    schedule: Mutex<SweepSchedule>,
     worker_binding: Arc<()>,
+}
+
+// Held only while choosing a turn. The sweep lock owns runtime and store work.
+#[derive(Default)]
+struct SweepSchedule {
+    vault_ready: bool,
+    target: Option<Id>,
+    ordinary_owed: bool,
+    handoff: bool,
+}
+
+impl SweepSchedule {
+    fn yield_between_items(&mut self) -> bool {
+        self.handoff || self.yield_to_vault()
+    }
+
+    fn yield_to_vault(&mut self) -> bool {
+        if self.vault_ready && !self.ordinary_owed {
+            self.ordinary_owed = true;
+            self.handoff = true;
+            return true;
+        }
+        false
+    }
+}
+
+pub(crate) struct VaultSweepPriority<'a> {
+    schedule: &'a Mutex<SweepSchedule>,
+    acquisition_deadline: Instant,
+    custody_budget: Duration,
+    custody_deadline: Option<Instant>,
+    retry_at: Option<Instant>,
+}
+
+impl VaultSweepPriority<'_> {
+    fn defer_until(
+        &mut self,
+        retry: Option<Instant>,
+        deadline: Instant,
+    ) -> Option<VaultTestCleanup> {
+        let mut schedule = self.schedule.lock().unwrap();
+        schedule.vault_ready = false;
+        schedule.handoff = false;
+        self.retry_at = retry;
+        retry
+            .filter(|next| *next >= deadline)
+            .map(|_| VaultTestCleanup::Inconclusive)
+    }
+}
+
+impl Drop for VaultSweepPriority<'_> {
+    fn drop(&mut self) {
+        let mut schedule = self.schedule.lock().unwrap();
+        schedule.vault_ready = false;
+        schedule.target = None;
+        schedule.handoff = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VaultTestCleanup {
+    Confirmed,
+    Unconfirmed,
+    Inconclusive,
 }
 
 #[derive(Default)]
@@ -74,6 +142,7 @@ impl<C: Clock> VmController<C> {
             clock,
             gate: Mutex::default(),
             sweeps: Mutex::default(),
+            schedule: Mutex::default(),
             worker_binding: Arc::new(()),
         })
     }
@@ -948,7 +1017,7 @@ impl<C: Clock> VmController<C> {
     }
 
     /// Run once after open, under the store's supervisor lock, before the
-    /// foreground exposes tools. Returns false if another sweep is in flight.
+    /// foreground exposes tools. Returns false if the turn could not start.
     pub fn sweep_once(&self, runtime: &CandidateRuntime<'_>) -> Result<bool> {
         self.sweep_with(runtime, &ClosedCustody)
     }
@@ -997,8 +1066,24 @@ impl<C: Clock> VmController<C> {
         runtime: &impl ReaperRuntime,
         custody: &impl ArtifactCustody,
     ) -> Result<bool> {
-        let mut sweeps = match self.sweeps.try_lock() {
+        let mut schedule = self.schedule.lock().unwrap();
+        if schedule.yield_to_vault() {
+            return Ok(false);
+        }
+        let mut reserved = schedule.ordinary_owed;
+        let target = schedule.target;
+        let lock = self.sweeps.try_lock();
+        if reserved {
+            // An owed tick arriving during a vault item owns the next grant.
+            schedule.handoff = false;
+        }
+        drop(schedule);
+        let mut sweeps = match lock {
             Ok(sweeps) => sweeps,
+            Err(TryLockError::WouldBlock) if reserved => self
+                .sweeps
+                .lock()
+                .map_err(|_| anyhow::anyhow!("VM reaper unavailable"))?,
             Err(TryLockError::WouldBlock) => return Ok(false),
             Err(TryLockError::Poisoned(_)) => anyhow::bail!("VM reaper unavailable"),
         };
@@ -1011,50 +1096,34 @@ impl<C: Clock> VmController<C> {
             self.store.transact(|db| {
                 let now = utc(self.clock.now())?;
                 store::expiry_claims(db, now)?;
-                let items = store::cleanup_kinds(db)?
+                let mut items = store::cleanup_kinds(db)?
                     .into_iter()
                     .map(|kind| store::cleanup_work(db, kind))
                     .collect::<Result<Vec<_>>>()?
                     .into_iter()
                     .flatten()
                     .collect::<Vec<_>>();
+                sweeps.prepare(db, &mut items)?;
                 Ok((items, store::legacy_cleanup_uncertain(db)?))
             })?
         };
-        sweeps.prepare(&mut items);
+        if reserved && target.is_some() {
+            items.sort_by_key(|work| work.kind.vm() == target);
+        }
         for work in items {
+            if !reserved && self.schedule.lock().unwrap().yield_between_items() {
+                // Keep custody uncertain until a complete ordinary turn.
+                // The unprocessed claims are already durable.
+                return Ok(true);
+            }
             if !sweeps.due(work.kind, self.clock.now().monotonic) {
                 uncertain = true;
                 continue;
             }
-            let now = || self.clock.now().monotonic;
-            let (released, finish_by) = reaper::release(&work, runtime, now);
-            if released
-                && work.accounted
-                && !self
-                    .store
-                    .transact(|db| store::claim_disposal(db, &work, utc(self.clock.now())?))?
-            {
-                uncertain = true;
-                continue;
-            }
-            let outcome = reaper::dispose(&work, custody, released, finish_by, now);
-            match self
-                .store
-                .transact(|db| store::settle_cleanup(db, &work, utc(self.clock.now())?, outcome))
-            {
-                Ok(confirmed) => {
-                    uncertain |= !confirmed;
-                    if work.release_only && outcome.released {
-                        sweeps.clear_retry(work.kind);
-                    } else {
-                        sweeps.settle(&work, self.clock.now().monotonic, confirmed);
-                    }
-                }
-                Err(_) => {
-                    uncertain = true;
-                    sweeps.settle(&work, self.clock.now().monotonic, false);
-                }
+            uncertain |= !self.reconcile_cleanup(&mut sweeps, &work, runtime, custody, None)?;
+            if reserved {
+                self.schedule.lock().unwrap().ordinary_owed = false;
+                reserved = false;
             }
         }
         // Committed static generations settle without any deletion route.
@@ -1063,6 +1132,9 @@ impl<C: Clock> VmController<C> {
             .store
             .transact(|db| store::static_vm::recovery_claims(db))?;
         for claim in claims {
+            if !reserved && self.schedule.lock().unwrap().yield_between_items() {
+                return Ok(true);
+            }
             let start = self.clock.now().monotonic;
             let released = start
                 .checked_add(STATIC_RELEASE_BUDGET)
@@ -1079,6 +1151,13 @@ impl<C: Clock> VmController<C> {
             {
                 uncertain = true;
             }
+            if reserved {
+                self.schedule.lock().unwrap().ordinary_owed = false;
+                reserved = false;
+            }
+        }
+        if reserved {
+            self.schedule.lock().unwrap().ordinary_owed = false;
         }
         uncertain |= self.store.transact(|db| store::static_vm::recovering(db))?;
         self.gate
@@ -1086,6 +1165,156 @@ impl<C: Clock> VmController<C> {
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?
             .custody_uncertain = uncertain;
         Ok(true)
+    }
+
+    /// The waiter that prompted a yield can finish its handoff. A new vault
+    /// job waits behind the reserved ordinary turn.
+    pub(crate) fn prioritize_vault_sweep(
+        &self,
+        vm: Id,
+        acquisition_budget: Duration,
+        custody_budget: Duration,
+    ) -> VaultSweepPriority<'_> {
+        let mut schedule = self.schedule.lock().unwrap();
+        schedule.vault_ready = true;
+        schedule.target = Some(vm);
+        VaultSweepPriority {
+            schedule: &self.schedule,
+            acquisition_deadline: self.clock.now().monotonic + acquisition_budget,
+            custody_budget,
+            custody_deadline: None,
+            retry_at: None,
+        }
+    }
+
+    pub(crate) fn sweep_vault_test(
+        &self,
+        vm: Id,
+        runtime: &CandidateRuntime<'_>,
+        turn: &mut VaultSweepPriority<'_>,
+        fenced: &AtomicBool,
+    ) -> Result<Option<VaultTestCleanup>> {
+        self.sweep_vault_test_with(vm, runtime, &ClosedCustody, turn, fenced)
+    }
+
+    pub(crate) fn sweep_vault_test_with(
+        &self,
+        vm: Id,
+        runtime: &impl ReaperRuntime,
+        custody: &impl ArtifactCustody,
+        turn: &mut VaultSweepPriority<'_>,
+        fenced: &AtomicBool,
+    ) -> Result<Option<VaultTestCleanup>> {
+        use VaultTestCleanup::{Confirmed, Inconclusive, Unconfirmed};
+
+        let waiting_until = turn.custody_deadline.unwrap_or(turn.acquisition_deadline);
+        let now = self.clock.now().monotonic;
+        if fenced.load(Ordering::SeqCst) || now >= waiting_until {
+            return Ok(Some(Inconclusive));
+        }
+        if turn.retry_at.is_some_and(|retry| now < retry) {
+            return Ok(None);
+        }
+        let mut schedule = self.schedule.lock().unwrap();
+        schedule.vault_ready = true;
+        if schedule.ordinary_owed && !schedule.handoff {
+            return Ok(None);
+        }
+        let mut sweeps = match self.sweeps.try_lock() {
+            Ok(sweeps) => sweeps,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => anyhow::bail!("VM reaper unavailable"),
+        };
+        let now = self.clock.now().monotonic;
+        if fenced.load(Ordering::SeqCst) || now >= waiting_until {
+            return Ok(Some(Inconclusive));
+        }
+        schedule.handoff = false;
+        drop(schedule);
+        let deadline = *turn
+            .custody_deadline
+            .get_or_insert(now + turn.custody_budget);
+        let work = self.store.transact(|db| {
+            let now = utc(self.clock.now())?;
+            match store::vault_test_expiry(db, vm, now)? {
+                Some(claim) => store::cleanup_work(db, claim.into()),
+                None => Ok(None),
+            }
+        })?;
+        let Some(mut work) = work else {
+            let confirmed = self.vault_test_released(vm)? && self.clock.now().monotonic < deadline;
+            return Ok(Some(if confirmed { Confirmed } else { Inconclusive }));
+        };
+        let now = self.clock.now().monotonic;
+        if now >= deadline {
+            return Ok(Some(Inconclusive));
+        }
+        if let Some(retry) = sweeps.retry_at(work.kind).filter(|retry| now < *retry) {
+            return Ok(turn.defer_until(Some(retry), deadline));
+        }
+        sweeps.observe_worker(&mut work);
+        let confirmed =
+            self.reconcile_cleanup(&mut sweeps, &work, runtime, custody, Some(deadline))?;
+        if !confirmed {
+            self.gate
+                .lock()
+                .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?
+                .custody_uncertain = true;
+        }
+        if confirmed && self.vault_test_released(vm)? {
+            return Ok(Some(if self.clock.now().monotonic < deadline {
+                Confirmed
+            } else {
+                Unconfirmed
+            }));
+        }
+        if self.clock.now().monotonic >= deadline {
+            return Ok(Some(Unconfirmed));
+        }
+        Ok(turn.defer_until(sweeps.retry_at(work.kind), deadline))
+    }
+
+    fn reconcile_cleanup(
+        &self,
+        sweeps: &mut Sweeps,
+        work: &reaper::CleanupWork,
+        runtime: &impl ReaperRuntime,
+        custody: &impl ArtifactCustody,
+        deadline: Option<Instant>,
+    ) -> Result<bool> {
+        let now = || self.clock.now().monotonic;
+        let (released, finish_by) = reaper::release(work, runtime, deadline, now);
+        if released
+            && work.accounted
+            && !self
+                .store
+                .transact(|db| store::claim_disposal(db, work, utc(self.clock.now())?))?
+        {
+            return Ok(false);
+        }
+        let outcome = reaper::dispose(work, custody, released, finish_by, now);
+        let confirmed = match self
+            .store
+            .transact(|db| store::settle_cleanup(db, work, utc(self.clock.now())?, outcome))
+        {
+            Ok(confirmed) => confirmed,
+            Err(_) => {
+                sweeps.settle(work, self.clock.now().monotonic, false);
+                return Ok(false);
+            }
+        };
+        if work.release_only && outcome.released {
+            sweeps.clear_retry(work.kind);
+        } else {
+            sweeps.settle(work, self.clock.now().monotonic, confirmed);
+        }
+        Ok(confirmed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_sweeps_for_test(&self, wait: impl FnOnce()) {
+        let _lock = self.sweeps.lock().unwrap();
+        wait();
     }
 
     #[cfg(test)]
@@ -1337,6 +1566,54 @@ pub(crate) struct ActivityReceipt {
 }
 
 impl<C: Clock> VmController<C> {
+    pub(crate) fn vault_test_template(
+        &self,
+        recipe: Id,
+        digest: [u8; 32],
+        guest: Guest,
+    ) -> Result<Option<Id>> {
+        self.store.transact(|db| {
+            let Some((template, _)) = store::sealed_pair(db, &hex::encode(recipe), digest)? else {
+                return Ok(None);
+            };
+            let compatible = store::count(
+                db,
+                "SELECT count(*) FROM vm_templates WHERE id=?1 AND guest=?2",
+                params![template, guest as i64],
+            )? == 1;
+            Ok(compatible.then_some(template))
+        })
+    }
+
+    pub(crate) fn vault_test_key(&self) -> Result<RequestId> {
+        let issued_at_ms = utc(self.clock.now())?;
+        let mut key = store::new_id()?;
+        key[..8].copy_from_slice(&issued_at_ms.to_be_bytes());
+        Ok(RequestId { key, issued_at_ms })
+    }
+
+    /// Accelerate the existing TEST lease cleanup. The reserved daemon
+    /// principal cannot be authenticated by a foreground client.
+    pub(crate) fn expire_vault_test(&self, vm: Id) -> Result<()> {
+        self.store.transact(|db| {
+            db.execute(
+                "UPDATE vm_instances SET expires_ms=min(expires_ms,?2)
+                 WHERE id=?1 AND principal='arxd'",
+                params![vm, utc(self.clock.now())?],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn vault_test_released(&self, vm: Id) -> Result<bool> {
+        self.store.transact(|db| {
+            let retired = store::tombstone_proof(db, "arxd", vm)?
+                .is_some_and(|(_, confirmed)| confirmed == Some(true));
+            let charge = store::count(db, "SELECT count(*) FROM vm_disk_claims WHERE vm=?1", [vm])?;
+            Ok(retired && charge == 0)
+        })
+    }
+
     pub(crate) fn foreground_catalog(
         &self,
         principal: &str,

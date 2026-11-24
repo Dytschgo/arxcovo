@@ -133,12 +133,9 @@ pub(crate) fn call(
     principal: &str,
     name: &str,
     arguments: Map<String, Value>,
+    test_refusal: Option<Refusal>,
 ) -> CallToolResult {
-    let reply = match crate::store::validate_principal(principal) {
-        Ok(()) => dispatch(vault, principal, name, arguments),
-        Err(_) => Err(Refusal::Invalid),
-    };
-    match reply {
+    match invoke(vault, principal, name, arguments, test_refusal) {
         Ok(Value::Object(mut fields)) => {
             fields.insert("ok".into(), json!(true));
             CallToolResult::structured(Value::Object(fields))
@@ -150,7 +147,14 @@ pub(crate) fn call(
     }
 }
 
-fn dispatch(vault: &Arc<Vault>, owner: &str, name: &str, mut args: Map<String, Value>) -> Reply {
+pub(crate) fn invoke(
+    vault: &Vault,
+    owner: &str,
+    name: &str,
+    mut args: Map<String, Value>,
+    test_refusal: Option<Refusal>,
+) -> Reply {
+    crate::store::validate_principal(owner).map_err(|_| Refusal::Invalid)?;
     let action = match name {
         "vault_add_version" => Some(Action::Add),
         "vault_test_version" => Some(Action::Test),
@@ -159,7 +163,7 @@ fn dispatch(vault: &Arc<Vault>, owner: &str, name: &str, mut args: Map<String, V
     };
     if let Some(action) = action {
         let now = utc_ms().map_err(|_| Refusal::StateUnavailable)?;
-        return vault.mutate(owner, action, parse_write(action, args), now);
+        return vault.mutate(owner, action, parse_write(action, args), now, test_refusal);
     }
     match name {
         "vault_list" => vault.page(owner, read::List::Scripts, parse(args)?),
