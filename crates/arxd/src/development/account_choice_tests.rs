@@ -492,8 +492,11 @@ async fn dedicated_selection_is_setup_required_and_never_invokes_current_user_ba
 
 #[test]
 fn drain_waits_for_a_queued_worker_even_before_it_acquires_busy() {
+    use std::{task::Poll, time::Duration};
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .start_paused(true)
         .max_blocking_threads(1)
         .build()
         .unwrap();
@@ -513,8 +516,18 @@ fn drain_waits_for_a_queued_worker_even_before_it_acquires_busy() {
         let work = execution.dispatch(None, activity.clone(), id);
         assert!(!execution.busy.load(Ordering::Acquire));
         let started = tokio::time::Instant::now();
-        assert!(!execution.drain().await);
-        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        // The occupied blocking worker prevents Tokio's paused clock from
+        // advancing automatically. Step the clock while the worker stays queued.
+        let mut drain = std::pin::pin!(execution.drain());
+        loop {
+            if let Poll::Ready(drained) = futures_util::poll!(drain.as_mut()) {
+                assert!(!drained);
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(6), "drain stalled");
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert!(started.elapsed() >= Duration::from_secs(5));
         drop(release);
         blocker.await.unwrap();
         assert!(matches!(work.await, Err(Reason::Shutdown)));
