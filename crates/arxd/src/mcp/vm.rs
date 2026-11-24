@@ -5673,7 +5673,14 @@ mod tests {
             call(&b, "unpublish_site", args(1711)).await["reason"],
             "not_found"
         );
-        assert_eq!(h.supervisor().publisher.stop_obligations(), 0);
+        // Recorded synchronously before the reply, so a revocation by another
+        // principal would be visible here whatever its stop runner did.
+        let publisher = &h.supervisor().publisher;
+        assert_eq!(
+            (publisher.owner_causes(), publisher.stop_obligations()),
+            (0, 0),
+            "another principal revoked the publication"
+        );
         assert_eq!(
             call(&a, "unpublish_site", args(1710)).await["reason"],
             "key_collision"

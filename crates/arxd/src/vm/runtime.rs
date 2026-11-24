@@ -799,6 +799,10 @@ pub(crate) mod publication {
         #[default]
         Nothing,
         /// A process whose termination is not yet confirmed.
+        #[cfg_attr(
+            not(all(windows, target_arch = "x86_64")),
+            allow(dead_code, reason = "held only by the Windows connector")
+        )]
         Process(LocalProcess),
         /// A failed ingress-file write whose removal could not be confirmed.
         /// The residue keeps its private custody and is never handed to a
@@ -1382,6 +1386,12 @@ pub(crate) mod publication {
         #[cfg(test)]
         pub(crate) fn stop_obligations(&self) -> usize {
             self.activations().stops.len()
+        }
+
+        /// Latched owner causes.
+        #[cfg(test)]
+        pub(crate) fn owner_causes(&self) -> usize {
+            self.activations().cancelled.len()
         }
 
         fn unsubmitted(&self, nonce: &str) -> bool {
