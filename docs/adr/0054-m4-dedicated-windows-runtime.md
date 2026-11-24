@@ -725,3 +725,242 @@ defaults off. Agents have no authority to delete static VMs or backups.
 The current-user activation gates and production native launches are
 **unverified on real hardware**. Follow the
 [native qualification runbook](../dev-host-setup.md#native-qualification-runbook).
+
+
+## Amendment 2026-11-24 — Actual image and file-open witness for M4 qualification
+
+A non-elevated, diskless and networkless WHPX investigation of the reviewed
+QEMU 11.1.3 build reached QMP `prelaunch` and observed 16 manifest-matching
+bundle DLLs and Windows system modules. Some system DLLs mapped after
+`prelaunch`. The experiment also showed that read-share holds on existing
+bundle files leave directory entry creation possible, and that app-local
+copies of system DLLs could displace the expected System32 objects.
+A QEMU `load_file` trace included a transient `kvmvapic.bin` read that the
+recipe's argv does not name. These are investigation observations from one
+host. The witness specified here is **unverified on real hardware**.
+
+### Loader witness
+
+Keep the existing `current_user` token, resource, Job and launch-plan gates.
+The native launcher creates the restricted child with `CREATE_SUSPENDED`,
+`DEBUG_ONLY_THIS_PROCESS` and creation-time Job and handle lists. A single
+supervisor-owned thread creates the debuggee and pumps its debug events.
+Before resume it binds the held process and primary thread to the occupied
+slot, operation and generation, the unnamed kill-on-close Job and the
+sealed plan's role table. The creation event must match the held process
+and thread identities. Event PIDs are checked against the live held
+process and Job, with no PID-based reattachment. The initial image must
+be the plan's exact QEMU or qemu-img executable, as applicable.
+
+Use the file handle delivered by `CREATE_PROCESS_DEBUG_EVENT` and by each
+`LOAD_DLL_DEBUG_EVENT` to verify the mapped object while the event is
+pending. Close the event's file handle after inspection, following Windows'
+ownership rules for process and thread handles. Continue a load event only
+after checking a bounded, readable regular file by one of these rules:
+
+- **Bundle image.** Its volume and file ID and canonical path match the
+  held root-relative executable or DLL role in the reviewed manifest.
+  Its exact size and SHA-256, measured through the event file handle,
+  match the manifest. Hold the manifest, ancestor directories and leaf
+  through release. A same-named or byte-identical copy at another
+  identity fails.
+- **System32 module.** Open and hold the native x64 system directory from
+  `GetSystemDirectoryW`. Require a reviewed Windows dependency for the
+  pinned OS build, with a verified final path directly in that directory.
+  Resolve the expected leaf relative to the held directory with no
+  reparse traversal and compare its canonical path, volume and file ID
+  to the event file handle. Keep the reference handle through release.
+  Prefix, basename, signature or version checks alone cannot establish
+  that identity. Any other source is refused.
+
+Use an exhaustive bundle inventory with no unlisted files. The effective
+ACLs must deny file and subdirectory creation in the bundle and executable
+directories and any enrolled search directory. Verify effective add-file
+and add-subdirectory denial for both the foreground and restricted child
+tokens, and keep directory and file custody intact through use. File share
+modes guard existing objects. The directory policy closes the gap for new
+names under the verified ACLs. The shared-account trust boundary above
+still applies to the supervisor and local policy.
+
+Use the absolute executable, an explicit empty, protected working
+directory, a minimal Unicode environment without PATH search directories
+and the exact handle allowlist. Require Windows safe DLL search mode and
+creation-time System32 preference for OS dependencies. In the witnessed
+build restrict dynamic loads to explicit trusted directories with
+`SetDefaultDllDirectories` or `LoadLibraryExW` search flags. A setting made
+by the child cannot govern its initial imports. Qualify startup and
+delay-load behavior with the directory policy, creation-time mitigation
+and actual mapped-object witness together. No user-selected search
+directories, current-directory or PATH loads are admissible.
+[Microsoft DLL search order](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order) ·
+[Microsoft process creation attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
+
+Keep the debugger and its kill-on-exit policy active from creation to
+observed process exit, including late loads and reloads during QMP,
+guest execution and shutdown. Process each mapping separately even if
+the same path was seen earlier. Bind the ordered load stream to the
+same launch, use bounded counts, bytes and waits, and monitor it
+independently of QMP and the open channel. Require the exact Windows
+build and native tests to demonstrate complete initial and delayed
+loader-event coverage with usable file handles. An unavailable debugger,
+null or unreadable image handle, unexpected process, or incomplete
+stream fails the image proof. A rejected mapping is never continued into
+execution. Terminate only the attributed Job and prove release through
+the existing bounded stop and settlement path.
+[Microsoft debugging event handle rules](https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-waitfordebugevent)
+
+### Consumer file opens
+
+Use a reviewed in-process handle-adoption witness in both QEMU and
+qemu-img. The launcher and the pinned binaries use a private, versioned,
+bounded request/acknowledgement channel. Enroll only its exact child
+endpoints alongside stdio in the creation-time inheritance allowlist.
+Bind the channel to the held child, slot and Job at creation. Each request
+and acknowledgement is bound to the launch nonce, a monotonic sequence
+and the sealed plan's stage and role. Callers cannot supply channel
+handles, paths, roles, access modes or protocol records.
+
+Derive an open table from the sealed plan and reviewed distribution
+contract before claiming the slot. Each row fixes the root and relative
+leaf, artifact role, access and disposition, expected file identity
+and immutable content pin or writable initial state. It also fixes the
+consumer call site, stage, required or conditional status and allowed
+reopen count. The supervisor opens each approved role relative to held
+parents, without reparse traversal. For a writable role, reserve and
+verify an existing leaf, or exclusively create the reserved staging
+leaf under held parents and the offline lease before handoff. Verify
+identity and permitted rights before any write or truncation. Hold the
+parent's custody handles through settlement and transfer only the
+necessary access on the verified file object to the held child. Stock
+Windows `-add-fd` cannot provide this handoff.
+
+At each enrolled consumption site, the pinned binary adopts the granted
+handle in the actual reader or writer and blocks before the first read,
+mapping, write or truncation. While the handle is still live, the
+supervisor duplicates it back from the held child and verifies its
+identity and assigned role against the corresponding grant and held pin.
+Only a matching, in-window acknowledgement releases that operation.
+The reviewed hook must use that exact handle for I/O and deny an
+unlisted request or a by-name fallback. There is no permit based on a
+path string, a handle value alone, or a separately reopened path. Keep
+the channel active through the last reopen or helper exit. Exclusively
+reopen and verify writable outputs, headers and allowed mutations at
+settlement as applicable.
+
+Demonstrate coverage per exact binary and sealed recipe. The review
+must enumerate the regular-file input and output sites reachable in
+each enabled stage and map each to an open-table row and a native
+positive and omission case. In-tree and dependency paths, including
+fallback path resolution, belong in that review. The table and tests
+must cover at least these rows when the stage includes them:
+
+| Stage | Opens that must be accounted for |
+| --- | --- |
+| Paused WHPX trial | The actual firmware and data inputs of the diskless, networkless plan, including pflash CODE and private VARS where configured and transient machine data opens. |
+| Installed boot or detached verification | Pflash CODE and private VARS, approved ROM and machine data, the active disk and its one authorized golden backing if present. |
+| Ubuntu install | The unbacked disk, CODE, private VARS and machine data, ISO, CIDATA, kernel and initrd. |
+| Windows Setup and Finalize | The unbacked disk, CODE, phase-specific VARS and machine data. Setup also requires the ordered OS ISO, answer and driver media. Finalize refuses those media. |
+| qemu-img golden or offline info and create | The exact plan's inspected image, any backing the command actually traverses, and the exclusively reserved create output. Prove short-lived opens even when all consumer handles close before helper exit. |
+
+Pin `kvmvapic.bin` to the reviewed root-relative distribution role for
+any recipe that can load it. Require the observed open where the
+machine configuration calls for it. A recipe that excludes it must
+account for that exclusion in the source review and the exact native
+recipe trace, and refuse an unexpected open. Apply the same rule to
+other implicit ROMs and data files. A trace can discover names and call
+order, including successful short-lived reads. Only the handle-adoption
+protocol proves which objects supplied those bytes. Retain a sanitized
+trace-to-role coverage matrix and the witness verdict for each supported
+stage. Unexplained successful opens and unexplained omissions leave that
+stage closed.
+
+### Checkpoints, refusals and evidence
+
+Process Snapshotting can corroborate the set of handles or mappings
+visible at a checkpoint if the observed entries can be tied to the held
+child and verified objects. It cannot prove opens that already closed,
+mappings that were unloaded, later loads, or which handle served an I/O
+operation. A QMP version, a manifest rehash, a pathname trace and passing
+prelaunch each supply separate evidence. None substitutes for a complete
+loader and user-file witness.
+[Microsoft Process Snapshotting](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/proc_snap/overview-of-process-snapshotting)
+
+After QMP prelaunch, consume an explicit startup-open completion record
+from the bound child and verify that all required pre-dispatch rows have
+been observed. Where a plan would otherwise open a required input lazily,
+adopt it before dispatch or leave that plan closed. Keep both witnesses
+armed across the actual dispatch fence and through exit. Later mapped
+images and allowed post-dispatch opens remain checked before their use.
+Do not accept an exit, release verdict or qualification seal while any
+event or acknowledgement is pending or while the witness is incomplete.
+Owner activity, cancellation, reserve sampling and the stage deadline
+continue to govern all waits and dispatches.
+
+An unsupported distribution or missing, mismatched or inconclusive
+image proof returns `DistributionUnverified`. A missing, late,
+ambiguous, substituted or wrong-role consumer-open observation returns
+`PathCustodyUnverified`. Loss of either witness closes dispatch and
+takes the normal owned-Job stop path, retaining the slot charge and
+quarantine when release is uncertain. There is no fallback to elevated
+ETW, `SeDebugPrivilege`, snapshots or the stock build. Store the contract
+version, recipe and distribution digests, scoped role and image verdicts, completion
+checkpoints and release result in the bounded qualification evidence.
+Raw paths, machine or file identifiers, handles, and peer text stay
+out of published evidence.
+
+### Distribution and implementation split
+
+1. **Witnessed distribution PR.** Keep the current stock 11.1.3 pin
+   and `stock_open_contract` refusal. The stock build supplies no
+   complete proof for transient opens, so first review a distinct
+   witnessed 11.1.3 Windows x64 distribution based on the signed source
+   and pinned toolchain above. Review the minimal source changes for
+   constrained loading and exact open coverage in both executables,
+   including the channel protocol. Issue a new distribution ID, source
+   archive/signature and patch digests, reproducible build inputs and
+   configuration, executable and complete payload size/SHA-256 pins,
+   and a reviewed receipt binding those artifacts to the protocol and
+   open-table version. Pin the new distribution explicitly. QMP still
+   reports the upstream version. The Docker public-egress distribution
+   and qualification remain separate.
+2. **7b3 native qualification adapter, after #304 and the distribution
+   review.** Preserve #304's stock refusal before effectful probing.
+   The witnessed counterpart of `stock_open_contract` returns a
+   private, held contract from the reviewed pin, sealed recipe and
+   live root-relative role bindings. It cannot certify observations
+   that have yet to occur. Wire the restricted suspended launch, Job,
+   stdio and witness workers, live WTS/WHPX and volume observations,
+   and durable charged slot. Implement `verify_opens` on the same
+   `Host::Opens` and `Host::Slot` after the paused exchange and before
+   any guest dispatch. It checks the startup barrier and returns
+   success only while the two live witnesses still own the launch.
+   Keep them active through stop and settlement. Extend from the
+   paused trial to each helper and recipe only with its own proven
+   rows. The private trial authority stays separate from 7c's daemon
+   issuer and production admission remains closed until its existing
+   gates pass.
+
+### Verification for the implementation
+
+Use deterministic fixtures for manifest and System32 identity, wrong
+initial image, unlisted or byte-identical wrong-file images, case and
+reparse ambiguity, delayed load and unload/reload, null handle,
+missing/wrong/duplicate/late/replayed open proofs, cross-slot or
+cross-Job events, transient reads and short-lived helper exits. Drive
+all required rows and mutations for omitted or bypassed hooks. Exercise
+event and message bounds, completion racing cancellation or owner
+activity, witness loss before and after prelaunch, no guest dispatch
+on failed proof, and release versus durable quarantine on uncertain
+teardown. Fixtures cannot mint a native qualification record.
+
+Native-only acceptance uses reviewed binaries on disposable enrolled
+roots under the non-elevated token. Prove creation-time Job and debug
+event delivery, creation denial on the protected directories, refusal
+for an unlisted benign fixture mapping, approved startup and late
+System32 mappings, exact sealed-recipe traces and handle proofs for
+every enabled row, including transient firmware and short-lived
+qemu-img operations. Exercise missing and substituted input proof,
+witness and supervisor loss, and clean release or durable quarantine.
+Run the full enabled recipe and helper matrix, including real WHPX cold
+boots and observed coverage through teardown. These witness,
+adapter and full-recipe cases are **unverified on real hardware**.
