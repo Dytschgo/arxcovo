@@ -2,9 +2,9 @@
 //!
 //! This binary crate owns the private `TrialAuthority`; the arxd library and
 //! the daemon cannot name it, and it never converts into `LaunchAuthority`.
-//! The arxd library supplies only an authority-free, read-only preflight
-//! and a diagnostic-only evidence sink. In this contract version the
-//! executable can write only an incomplete baseline diagnostic.
+//! The library provides held preflight, a fixed paused-trial adapter, and
+//! a diagnostic-only evidence sink. The executable publishes incomplete
+//! qualification diagnostics.
 //!
 //! An evidence directory serves exactly one run. Before the runner's claim
 //! exists, the sink removes only its own temporary entries left by an
@@ -30,16 +30,15 @@ mod tests;
 fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
 
-    let args: Vec<_> = std::env::args_os().skip(1).take(3).collect();
-    let [enrollment, evidence] = args.as_slice() else {
-        eprintln!("usage: arx-vm-qualify ENROLLMENT_JSON EMPTY_EVIDENCE_DIRECTORY");
+    let args: Vec<_> = std::env::args_os().skip(1).take(4).collect();
+    let Some((enrollment, evidence, paused)) = parse_args(&args) else {
+        eprintln!(
+            "usage: arx-vm-qualify [--paused-trial] ENROLLMENT_JSON EMPTY_EVIDENCE_DIRECTORY"
+        );
+        eprintln!("{}", failure_line(&frame::RunError::Input));
         return ExitCode::FAILURE;
     };
-    let result = enrollment
-        .to_str()
-        .zip(evidence.to_str())
-        .ok_or(frame::RunError::Input)
-        .and_then(|(enrollment, evidence)| native::run(enrollment, evidence));
+    let result = native::run(enrollment, evidence, paused);
     // Only typed, path-free outcomes reach the console.
     match result {
         Ok(native::Outcome::Incomplete) => {
@@ -50,6 +49,46 @@ fn main() -> std::process::ExitCode {
             eprintln!("{}", failure_line(&reason));
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn parse_args(args: &[std::ffi::OsString]) -> Option<(&str, &str, bool)> {
+    match args {
+        [enrollment, evidence] if !enrollment.to_str()?.starts_with("--") => {
+            Some((enrollment.to_str()?, evidence.to_str()?, false))
+        }
+        [flag, enrollment, evidence] if flag == "--paused-trial" => {
+            Some((enrollment.to_str()?, evidence.to_str()?, true))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn paused_cli_requires_the_exact_opt_in_and_both_paths() {
+    for (raw, expected) in [
+        (
+            vec!["enrollment", "evidence"],
+            Some(("enrollment", "evidence", false)),
+        ),
+        (
+            vec!["--paused-trial", "enrollment", "evidence"],
+            Some(("enrollment", "evidence", true)),
+        ),
+        (vec!["--paused-trial", "enrollment"], None),
+        (vec!["--unknown", "enrollment", "evidence"], None),
+        (
+            vec!["--paused-trial", "enrollment", "evidence", "extra"],
+            None,
+        ),
+    ] {
+        let args = raw
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(parse_args(&args), expected);
     }
 }
 
