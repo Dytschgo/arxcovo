@@ -49,6 +49,8 @@ CREATE TABLE vm_compose_projects (
     project TEXT NOT NULL,
     desired TEXT NOT NULL DEFAULT 'none' CHECK(desired IN ('none','started','stopped','down')),
     recovery_id BLOB CHECK(length(recovery_id)=16),
+    rendered_revision INTEGER CHECK(rendered_revision>0),
+    rendered_release BLOB CHECK(length(rendered_release)=16),
     last_revision INTEGER NOT NULL DEFAULT 0 CHECK(last_revision>=0),
     committed INTEGER,
     committed_release BLOB,
@@ -58,6 +60,8 @@ CREATE TABLE vm_compose_projects (
     last_receipt TEXT,
     PRIMARY KEY(vm,project),
     FOREIGN KEY(vm,project,committed_release) REFERENCES vm_compose_releases(vm,project,id),
+    FOREIGN KEY(vm,project,rendered_release) REFERENCES vm_compose_releases(vm,project,id),
+    CHECK((rendered_revision IS NULL)=(rendered_release IS NULL)),
     CHECK((committed IS NULL)=(committed_release IS NULL))
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE vm_compose_releases (
@@ -287,6 +291,21 @@ pub(crate) fn replay(db: &Connection, principal: &str, request: Id) -> Result<Op
     ).optional()?)
 }
 
+// The receipt identified by recovery_id is pinned across retry-window collection.
+pub(crate) fn cleanup_binding(
+    db: &Connection,
+    target: &Target,
+    generation: Id,
+) -> Result<Option<(Id, u64)>> {
+    Ok(db.query_row(
+        "SELECT coalesce(p.committed_release,o.release,CASE WHEN p.settled_generation=?3 THEN p.rendered_release END),
+                coalesce(p.committed,o.revision,CASE WHEN p.settled_generation=?3 THEN p.rendered_revision END)
+         FROM vm_compose_projects p LEFT JOIN vm_compose_operations o ON o.id=p.recovery_id AND o.generation=?3
+         WHERE p.vm=?1 AND p.project=?2 AND coalesce(p.committed,o.revision,CASE WHEN p.settled_generation=?3 THEN p.rendered_revision END) IS NOT NULL",
+        params![target.vm,target.project,generation], |r|Ok((r.get(0)?,r.get(1)?)),
+    ).optional()?)
+}
+
 pub(crate) fn admit(
     db: &Connection,
     principal: &str,
@@ -347,14 +366,11 @@ pub(crate) fn admit(
             |r| r.get(0),
         )?;
         (release, next)
-    } else if status.revision.is_none()
-        && let Some(id) = status.recovery_id
-    {
-        db.query_row(
-            "SELECT release, revision FROM vm_compose_operations WHERE id=?1",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?
+    } else if cleanup {
+        let Some(binding) = cleanup_binding(db, target, generation)? else {
+            return Ok(Err(Fault::NotReady));
+        };
+        binding
     } else {
         let Some(revision) = status.revision else {
             return Ok(Err(Fault::NotReady));
@@ -477,6 +493,20 @@ pub(crate) fn close(db: &Connection, intent: &Intent, reason: &str, now: i64) ->
     finish_audit(db, intent.id, crate::vm::Status::Failed, now)
 }
 
+pub(crate) fn bind_previous_render(db: &Connection, intent: &Intent, revision: u64) -> Result<()> {
+    ensure!(
+        live_boot(db, intent.target.vm, intent.generation, intent.boot)?,
+        "Compose cleanup boot changed"
+    );
+    let changed=db.execute("UPDATE vm_compose_operations AS o SET release=p.rendered_release,revision=p.rendered_revision
+        FROM vm_compose_projects p WHERE o.id=?1 AND o.vm=p.vm AND o.project=p.project AND o.sent=1
+        AND o.receipt IS NULL AND o.closed IS NULL AND o.kind IN ('stop','down') AND p.committed IS NULL
+        AND p.settled_generation=?2 AND p.rendered_revision=?3",
+        params![intent.id,intent.generation,revision])?;
+    ensure!(changed == 1, "Compose cleanup revision not attributed");
+    Ok(())
+}
+
 pub(crate) fn mark_sent(db: &Connection, intent: &Intent) -> Result<()> {
     ensure!(
         db.execute(
@@ -508,11 +538,19 @@ pub(crate) fn settle(
             serde_json::to_string(receipt)?
         ],
     )?;
+    if intent.kind == Kind::Deploy && receipt.state == OperationState::Failed {
+        db.execute("UPDATE vm_compose_projects SET recovery_id=?3 WHERE vm=?1 AND project=?2 AND committed IS NULL",
+                params![intent.target.vm,intent.target.project,intent.id])?;
+    }
     if receipt.state == OperationState::Succeeded {
         let project = observed.ok_or_else(|| anyhow::anyhow!("Compose observation missing"))?;
-        db.execute(
-            "UPDATE vm_compose_projects SET desired=?3,committed=?4,committed_release=?5,
-                observed=?6,settled_generation=?7,settled_boot=?8 WHERE vm=?1 AND project=?2",
+        let cleanup = matches!(intent.kind, Kind::Stop | Kind::Down);
+        let changed=db.execute(
+            "UPDATE vm_compose_projects SET desired=?3,
+                committed=CASE WHEN ?9 THEN committed ELSE ?4 END,
+                committed_release=CASE WHEN ?9 THEN committed_release ELSE ?5 END,
+                rendered_revision=?4,rendered_release=?5,recovery_id=NULL,
+                observed=?6,settled_generation=?7,settled_boot=?8 WHERE vm=?1 AND project=?2 AND (NOT ?9 OR committed IS ?10)",
             params![
                 intent.target.vm,
                 intent.target.project,
@@ -521,9 +559,10 @@ pub(crate) fn settle(
                 intent.release,
                 serde_json::to_string(project)?,
                 intent.generation,
-                intent.boot
+                intent.boot, cleanup, project.committed_revision
             ],
         )?;
+        ensure!(changed == 1, "Compose committed revision changed");
     }
     finish_audit(
         db,

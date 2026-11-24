@@ -2417,7 +2417,7 @@ impl VmInventory {
         }
         if let Some(session) = session
             .filter(|s| s.generation == intent.generation && (repair || s.wire_boot == intent.boot))
-            && intent.receipt.is_none()
+            && (repair || intent.receipt.is_none())
             && (repair || intent.closed.is_none())
         {
             let active = gate.compose_active.clone();
@@ -9661,6 +9661,427 @@ mod tests {
                 .unwrap()
                 .revision
         }
+    }
+
+    #[tokio::test]
+    async fn compose_first_deploy_residue_cleanup() {
+        for restart in [None, Some(false), Some(true)] {
+            for down in [false, true] {
+                first_deploy_residue(restart, down).await;
+            }
+        }
+    }
+
+    // None is a same-boot terminal failure. After restart a journal may be
+    // trimmed (false) or ambiguous (true). Each cleanup is a fresh SDK call.
+    async fn first_deploy_residue(restart: Option<bool>, down: bool) {
+        use crate::store::vm::compose as db;
+        use arx_guest::compose::{self as g, ComposeRequest as Req, ComposeResponse as Resp};
+        use tokio::io::DuplexStream;
+        const PROJECT: &str = "first-same-boot";
+        async fn idle(h: &Harness) {
+            until(|| {
+                h.supervisor()
+                    .gate
+                    .lock()
+                    .unwrap()
+                    .compose_active
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            })
+            .await;
+        }
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, _) = enrolled(&h, &a, 4000).await;
+        let vm_id = parse_id(vm.as_str().unwrap()).unwrap();
+        let store = h.supervisor().controller.compose_store();
+        let rel_id = [0x61_u8; 16];
+        let release: compose::ReleaseInput = serde_json::from_value(json!({
+            "vm_id": vm,
+            "release_id": hex::encode(rel_id),
+            "manifest": {
+                "schema": g::MANIFEST_SCHEMA,
+                "project_id": PROJECT,
+                "volumes": [],
+                "secrets": [],
+                "services": [{
+                    "name": "api",
+                    "image": format!("example.invalid/api@sha256:{}", hex::encode([0x61_u8; 32])),
+                    "platform": g::PLATFORM,
+                    "uid": 10001,
+                    "gid": 10001,
+                    "read_only_rootfs": true,
+                    "environment": [],
+                    "mounts": [],
+                    "secrets": [],
+                    "limits": {"cpu_millis": 500, "memory_mib": 512, "pids": 32}
+                }]
+            }
+        }))
+        .unwrap();
+        let enrolled_rel = release.enroll().unwrap();
+        let target = enrolled_rel.target.clone();
+        db::enroll(store, &[enrolled_rel]).unwrap();
+        let generation = store
+            .transact(|tx| db::boot(tx, "alpha", &target))
+            .unwrap()
+            .unwrap();
+        let boot = 11_u64;
+        let (host, mut peer) = tokio::io::duplex(65536);
+
+        fn project(desired: g::Desired, residue: bool, revision: Option<u64>) -> g::ProjectView {
+            g::ProjectView {
+                project_id: PROJECT.into(),
+                desired,
+                committed_revision: revision,
+                previous_revision: None,
+                observation: g::Observation::Live,
+                recovery_required: residue,
+                running_operation: None,
+                services: if residue || revision.is_some() {
+                    vec![g::ServiceView {
+                        name: "api".into(),
+                        revision: revision.or(Some(1)),
+                        state: g::ServiceState::Running,
+                        health: g::HealthState::None,
+                    }]
+                } else {
+                    vec![]
+                },
+            }
+        }
+        async fn status(peer: &mut DuplexStream, view: Option<g::ProjectView>) {
+            let Req::ComposeStatus { id, project_id } = fake_compose_read(peer).await else {
+                panic!("status")
+            };
+            assert_eq!(project_id, PROJECT);
+            fake_compose_reply(
+                peer,
+                match view {
+                    Some(project) => Resp::ComposeProjectStatus { id, project },
+                    None => Resp::ComposeRejected {
+                        id,
+                        code: g::RejectCode::UnknownProject,
+                        rule: None,
+                    },
+                },
+            )
+            .await;
+        }
+        async fn unknown(peer: &mut DuplexStream) -> String {
+            let Req::ComposeOperation { id, operation_id } = fake_compose_read(peer).await else {
+                panic!("operation lookup")
+            };
+            fake_compose_reply(
+                peer,
+                Resp::ComposeRejected {
+                    id,
+                    code: g::RejectCode::UnknownOperation,
+                    rule: None,
+                },
+            )
+            .await;
+            operation_id
+        }
+        async fn deploy(peer: &mut DuplexStream) -> (u32, g::OperationView) {
+            let Req::ComposeStageBegin {
+                id,
+                digest,
+                total_bytes,
+                chunks,
+            } = fake_compose_read(peer).await
+            else {
+                panic!("stage begin")
+            };
+            fake_compose_reply(
+                peer,
+                Resp::ComposeStageProgress {
+                    id,
+                    digest: digest.clone(),
+                    received_bytes: total_bytes,
+                    next_index: chunks,
+                },
+            )
+            .await;
+            let Req::ComposeStageCommit { id, digest } = fake_compose_read(peer).await else {
+                panic!("stage commit")
+            };
+            fake_compose_reply(
+                peer,
+                Resp::ComposeReleaseStaged {
+                    id,
+                    digest,
+                    project_id: PROJECT.into(),
+                },
+            )
+            .await;
+            let Req::ComposeDeploy {
+                id,
+                operation_id,
+                revision,
+                ..
+            } = fake_compose_read(peer).await
+            else {
+                panic!("deploy")
+            };
+
+            (
+                id,
+                g::OperationView {
+                    operation_id,
+                    kind: g::OperationKind::Deploy,
+                    project_id: PROJECT.into(),
+                    revision,
+                    state: g::OperationState::Succeeded,
+                    stage: g::OperationStage::Settled,
+                    failure: None,
+                    restored_previous: false,
+                },
+            )
+        }
+        let first = tokio::spawn(async move {
+            fake_compose_hello(&mut peer, boot).await;
+            let key = unknown(&mut peer).await;
+            status(&mut peer, None).await;
+            let (id, mut op) = deploy(&mut peer).await;
+            assert_eq!(op.operation_id, key);
+            assert_eq!(op.revision, 1);
+            op.state = g::OperationState::Failed;
+            op.failure = Some(g::FailureCode::UpFailed);
+            if restart.is_some() {
+                return (None, op);
+            }
+            fake_compose_reply(
+                &mut peer,
+                Resp::ComposeOperationState {
+                    id,
+                    operation: op.clone(),
+                },
+            )
+            .await;
+            (Some(peer), op)
+        });
+        let channel =
+            crate::vm::guest::ComposeChannel::negotiate(host, boot, &h.supervisor().cancel)
+                .await
+                .unwrap();
+        h.supervisor()
+            .compose
+            .attach(store, vm_id, compose::Session::new(generation, channel))
+            .unwrap();
+        let deploy_args = |n| json!({"vm_id":vm,"project_id":PROJECT,"release_id":hex::encode(rel_id),"request_id":key(n)});
+        assert_eq!(
+            call(&a, "compose_deploy", deploy_args(4010)).await["state"],
+            "pending"
+        );
+        let (peer, op) = first.await.unwrap();
+        idle(&h).await;
+        let (a, mut peer) = if let Some(ambiguous) = restart {
+            let stopped = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(4011)})).await;
+            assert_eq!(terminal(&a, &stopped).await["state"], "succeeded");
+            drop(a);
+            h.shutdown().await.unwrap();
+            h = h.reopen(|_| {}).await;
+            let a = h.client(0).await;
+            let started = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(4012)})).await;
+            assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+            let (host, mut peer) = tokio::io::duplex(65536);
+            let hello = tokio::spawn(async move {
+                fake_compose_hello(&mut peer, boot + 1).await;
+                peer
+            });
+            let channel =
+                crate::vm::guest::ComposeChannel::negotiate(host, boot + 1, &h.supervisor().cancel)
+                    .await
+                    .unwrap();
+            h.supervisor()
+                .compose
+                .attach(
+                    h.supervisor().controller.compose_store(),
+                    vm_id,
+                    compose::Session::new(generation, channel),
+                )
+                .unwrap();
+            let mut peer = hello.await.unwrap();
+            let recovery = tokio::spawn(async move {
+                if ambiguous {
+                    let Req::ComposeOperation { id, operation_id } =
+                        fake_compose_read(&mut peer).await
+                    else {
+                        panic!("retired lookup")
+                    };
+                    assert_eq!(operation_id, op.operation_id);
+                    let queued = g::OperationView {
+                        state: g::OperationState::Ambiguous,
+                        stage: g::OperationStage::Queued,
+                        failure: None,
+                        ..op.clone()
+                    };
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeOperationState {
+                            id,
+                            operation: queued,
+                        },
+                    )
+                    .await;
+                    let Req::ComposeReconcile { id, operation_id } =
+                        fake_compose_read(&mut peer).await
+                    else {
+                        panic!("retired reconcile")
+                    };
+                    assert_eq!(operation_id, op.operation_id);
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeOperationState {
+                            id,
+                            operation: g::OperationView {
+                                failure: Some(g::FailureCode::NotApplied),
+                                ..op
+                            },
+                        },
+                    )
+                    .await;
+                } else {
+                    assert_eq!(unknown(&mut peer).await, op.operation_id);
+                }
+                status(&mut peer, Some(project(g::Desired::None, true, None))).await;
+                peer
+            });
+            (a, recovery)
+        } else {
+            (a, tokio::spawn(async move { peer.unwrap() }))
+        };
+        let cleanup = if down { "compose_down" } else { "compose_stop" };
+        let args = json!({"vm_id":vm,"project_id":PROJECT,"request_id":key(4013)});
+        assert_eq!(call(&a, cleanup, args.clone()).await["state"], "pending");
+        let mut peer = (&mut peer).await.unwrap();
+        let cleanup_id =
+            tokio::time::timeout(std::time::Duration::from_secs(8), unknown(&mut peer))
+                .await
+                .expect("cleanup lookup");
+        status(&mut peer, Some(project(g::Desired::None, true, None))).await;
+        let (id, operation_id, kind, desired) = match fake_compose_read(&mut peer).await {
+            Req::ComposeDown {
+                id, operation_id, ..
+            } if down => (id, operation_id, g::OperationKind::Down, g::Desired::Down),
+            Req::ComposeStop {
+                id, operation_id, ..
+            } if !down => (
+                id,
+                operation_id,
+                g::OperationKind::Stop,
+                g::Desired::Stopped,
+            ),
+            _ => panic!("uncommitted cleanup"),
+        };
+        assert_eq!(operation_id, cleanup_id);
+        let projection = json!({"vm_id":vm,"project_id":PROJECT});
+        let pending = call(&a, "compose_status", projection.clone()).await;
+        assert!(pending["recovery"]["operation_id"].is_string());
+        fake_compose_reply(
+            &mut peer,
+            Resp::ComposeOperationState {
+                id,
+                operation: g::OperationView {
+                    operation_id,
+                    kind,
+                    project_id: PROJECT.into(),
+                    revision: 1,
+                    state: g::OperationState::Succeeded,
+                    stage: g::OperationStage::Settled,
+                    failure: None,
+                    restored_previous: false,
+                },
+            },
+        )
+        .await;
+        status(&mut peer, Some(project(desired, false, None))).await;
+        idle(&h).await;
+        assert_eq!(call(&a, cleanup, args).await["state"], "succeeded");
+        let clean = call(&a, "compose_status", projection).await;
+        assert!(clean["revision"].is_null() && clean["recovery"].is_null());
+        // Exercise admission after the failed Deploy and its cleanup have both
+        // aged out. The project retains the rendered binding independently.
+        h.supervisor()
+            .controller
+            .compose_store()
+            .transact(|tx| {
+                tx.execute_batch("SAVEPOINT after_expiry")?;
+                let later = UTC + crate::vm::RETRY_WINDOW_MS + 1;
+                let request = compose::Mutation {
+                    kind: compose::Kind::Down,
+                    release: None,
+                    target: target.clone(),
+                    key: RequestId::parse(&format!("{later:016x}{:016x}", 4020)).unwrap(),
+                };
+                let cleanup = db::admit(
+                    tx,
+                    "alpha",
+                    &request,
+                    generation,
+                    if restart.is_some() { boot + 1 } else { boot },
+                    later,
+                )?
+                .unwrap();
+                assert_eq!((cleanup.release, cleanup.revision), (rel_id, 1));
+                assert!(
+                    db::replay(tx, "alpha", RequestId::parse(&key(4010)).unwrap().key)?.is_none()
+                );
+                db::mark_sent(tx, &cleanup)?;
+                tx.execute(
+                    "UPDATE vm_compose_operations SET revision=revision+1 WHERE id=?1",
+                    [cleanup.id],
+                )?;
+                assert!(db::bind_previous_render(tx, &cleanup, cleanup.revision + 1).is_err());
+                db::bind_previous_render(tx, &cleanup, cleanup.revision)?;
+                assert_eq!(
+                    db::replay(tx, "alpha", request.key.key)?.unwrap().revision,
+                    cleanup.revision
+                );
+                tx.execute_batch("ROLLBACK TO after_expiry; RELEASE after_expiry")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            call(&a, "compose_deploy", deploy_args(4010)).await["state"],
+            if restart.is_some() {
+                "retired_boot"
+            } else {
+                "failed"
+            }
+        );
+        assert_eq!(
+            call(&a, "compose_deploy", deploy_args(4014)).await["state"],
+            "pending"
+        );
+        let fresh = unknown(&mut peer).await;
+        status(&mut peer, Some(project(desired, false, None))).await;
+        let (id, receipt) = deploy(&mut peer).await;
+        assert_eq!(receipt.operation_id, fresh);
+        assert_eq!(receipt.revision, 2);
+        fake_compose_reply(
+            &mut peer,
+            Resp::ComposeOperationState {
+                id,
+                operation: receipt,
+            },
+        )
+        .await;
+        status(
+            &mut peer,
+            Some(project(g::Desired::Started, false, Some(2))),
+        )
+        .await;
+        idle(&h).await;
+        assert_eq!(
+            call(&a, "compose_deploy", deploy_args(4014)).await["state"],
+            "succeeded"
+        );
+        drop(a);
+        h.shutdown().await.unwrap();
     }
 
     #[tokio::test]

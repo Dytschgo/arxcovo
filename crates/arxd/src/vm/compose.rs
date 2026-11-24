@@ -421,10 +421,13 @@ impl Host {
         let Some(mut intent) = db.transact(|db| store::replay(db, principal, key))? else {
             return Ok(());
         };
-        if intent.closed.as_deref() == Some("retired_boot")
+        if ((intent.closed.as_deref() == Some("retired_boot") && intent.boot != session.wire_boot)
+            || intent
+                .receipt
+                .as_ref()
+                .is_some_and(|r| r.state == OperationState::Failed))
             && intent.target == *target
             && intent.generation == session.generation
-            && intent.boot != session.wire_boot
             && intent.kind == Kind::Deploy
             && intent.sent
         {
@@ -456,24 +459,39 @@ impl Host {
             // Repair may have selected the newer release. Bind the unsent cleanup
             // atomically before querying or submitting its own operation ID.
             let rebound = db.transact(|tx| {
-                ensure!(store::live_boot(tx,target.vm,intent.generation,intent.boot)?, "Compose cleanup boot changed");
-                let state=store::status(tx,principal,target)?.ok_or_else(||anyhow::anyhow!("Compose project unavailable"))?;
-                if state.revision.is_none() {
-                    store::close(tx,&intent,"compose_recovery_required",controller.compose_now()?)?;
+                ensure!(
+                    store::live_boot(tx, target.vm, intent.generation, intent.boot)?,
+                    "Compose cleanup boot changed"
+                );
+                let Some((release, revision)) =
+                    store::cleanup_binding(tx, target, intent.generation)?
+                else {
+                    store::close(
+                        tx,
+                        &intent,
+                        "compose_recovery_required",
+                        controller.compose_now()?,
+                    )?;
                     return Ok(None);
+                };
+                if (release, revision) != (intent.release, intent.revision) {
+                    ensure!(
+                        tx.execute(
+                            "UPDATE vm_compose_operations SET release=?1,revision=?2
+                       WHERE id=?3 AND sent=0 AND closed IS NULL",
+                            rusqlite::params![release, revision, intent.id]
+                        )? == 1,
+                        "Compose cleanup changed"
+                    );
                 }
-                if state.revision != Some(intent.revision) {
-                    ensure!(tx.execute("UPDATE vm_compose_operations SET (release,revision)=(SELECT committed_release,committed FROM vm_compose_projects WHERE vm=?1 AND project=?2)
-                       WHERE id=?3 AND sent=0 AND closed IS NULL",rusqlite::params![target.vm,target.project,intent.id])?==1,"Compose cleanup changed");
-                }
-                store::replay(tx,principal,key)
+                store::replay(tx, principal, key)
             })?;
             let Some(current) = rebound else {
                 return Ok(());
             };
             intent = current;
         }
-        let manifest = Project::parse(&intent.bytes)
+        let mut manifest = Project::parse(&intent.bytes)
             .map_err(|_| anyhow::anyhow!("invalid enrolled Compose manifest"))?;
         ensure!(
             manifest.id() == target.project && sha256_hex(&intent.bytes) == intent.digest,
@@ -514,7 +532,9 @@ impl Host {
                 }
                 let guest_revision = current.as_ref().and_then(|view| view.committed_revision);
                 if guest_revision != expected.revision
-                    || (intent.kind != Kind::Deploy && expected.revision != Some(intent.revision))
+                    || (intent.kind != Kind::Deploy
+                        && expected.revision.is_some()
+                        && expected.revision != Some(intent.revision))
                 {
                     // Never discard a possibly submitted private effect.
                     ensure!(
@@ -584,6 +604,24 @@ impl Host {
                 match channel.exchange(cancel, |id| intent.request(id)).await? {
                     Resp::ComposeOperationState { operation, .. } => operation,
                     Resp::ComposeRejected {
+                        code: RejectCode::UnknownProject | RejectCode::NotCommitted,
+                        ..
+                    } if matches!(intent.kind, Kind::Stop | Kind::Down)
+                        && expected.revision.is_none()
+                        && current
+                            .as_ref()
+                            .is_none_or(|p| !p.recovery_required && p.services.is_empty()) =>
+                    {
+                        // The guest has neither a commit nor a rendered target to clean.
+                        return db.transact(|tx| {
+                            ensure!(store::live_boot(tx,target.vm,intent.generation,intent.boot)?,"Compose cleanup boot changed");
+                            tx.execute("UPDATE vm_compose_projects SET recovery_id=NULL,rendered_revision=NULL,rendered_release=NULL
+                                WHERE vm=?1 AND project=?2 AND committed IS NULL AND recovery_id IS ?3",
+                                rusqlite::params![target.vm,target.project,expected.recovery_id])?;
+                            store::close(tx,&intent,"refused",controller.compose_now()?)
+                        });
+                    }
+                    Resp::ComposeRejected {
                         code: RejectCode::ReconcileRequired,
                         ..
                     } if expected.recovery_id.is_some() => {
@@ -622,6 +660,21 @@ impl Host {
             }
             _ => return Ok(()),
         };
+        if matches!(intent.kind, Kind::Stop | Kind::Down) && view.revision != intent.revision {
+            intent = db.transact(|tx| {
+                store::bind_previous_render(tx, &intent, view.revision)?;
+                let rebound = store::replay(tx, principal, key)?
+                    .ok_or_else(|| anyhow::anyhow!("Compose cleanup missing"))?;
+                ensure!(rebound.accepts(&view), "Compose cleanup receipt mismatch");
+                Ok(rebound)
+            })?;
+            manifest = Project::parse(&intent.bytes)
+                .map_err(|_| anyhow::anyhow!("invalid rendered manifest"))?;
+            ensure!(
+                manifest.id() == target.project && sha256_hex(&intent.bytes) == intent.digest,
+                "Compose rendered release changed"
+            );
+        }
         let until = Instant::now() + Duration::from_secs(120);
         let mut reconciled = false;
         loop {
@@ -773,11 +826,30 @@ async fn recover_deploy(
     let revision = observed.as_ref().and_then(|p| p.committed_revision);
     db.transact(|tx| {
         let state = current(tx)?;
+        // A terminal failure (or trimmed journal) says nothing about first-Deploy
+        // residue. Keep its candidate binding until the guest proves cleanup.
+        if revision != Some(intent.revision)
+            && observed.as_ref().is_some_and(|view| {
+                view.recovery_required
+                    || view
+                        .services
+                        .iter()
+                        .any(|service| service.revision == Some(intent.revision))
+                    || (revision.is_none()
+                        && (!view.services.is_empty() || view.observation != Observation::Live))
+            })
+        {
+            return Ok(());
+        }
         let Some(operation) = operation else {
             // Unknown can mean never journaled or trimmed after promotion. Verify
             // the committed revision on the same disk before classifying it.
             if revision == state.revision {
-                store::retire_unapplied(tx, intent)?;
+                if intent.receipt.is_some() {
+                    store::clear_recovery(tx, intent)?;
+                } else {
+                    store::retire_unapplied(tx, intent)?;
+                }
             } else if let Some(observed) = observed
                 .as_ref()
                 .filter(|_| revision == Some(intent.revision))
@@ -810,7 +882,8 @@ async fn recover_deploy(
 
 fn success_witness(intent: &Intent, manifest: &Project, result: &ProjectView) -> bool {
     use arx_guest::compose::{HealthState, ServiceState};
-    result.committed_revision == Some(intent.revision)
+    (result.committed_revision == Some(intent.revision)
+        || (matches!(intent.kind, Kind::Stop | Kind::Down) && result.committed_revision.is_none()))
         && result.desired == intent.kind.desired()
         && result.observation == Observation::Live
         && !result.recovery_required
