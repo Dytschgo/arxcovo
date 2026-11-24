@@ -435,8 +435,8 @@ pub(crate) mod publication {
             publish::{
                 Hostname, TunnelId,
                 cloudflare::{
-                    DnsApi, DnsError, Reconciled, RecordId, Removal, Route, SendGate, Sent,
-                    Submission,
+                    DnsApi, DnsError, Reconciled, RecordId, Removal, Route, SendAuthority, Sent,
+                    Submission, arbitrate,
                 },
                 hex_id,
             },
@@ -567,7 +567,44 @@ pub(crate) mod publication {
             allow(dead_code, reason = "read by the Windows connector plan")
         )]
         pub(crate) ca_receipt: ArtifactPin,
-        pub(crate) retired: Shutdown,
+        pub(crate) retired: Retirement,
+    }
+
+    /// A custodied origin's retirement. Retiring takes the fence a first DNS
+    /// transport write holds, so a retirement either precedes that write and
+    /// withholds it, or follows it and finds the POST possibly sent.
+    #[derive(Clone, Default)]
+    pub(crate) struct Retirement {
+        token: Shutdown,
+        fence: Arc<std::sync::Mutex<()>>,
+    }
+
+    impl Retirement {
+        #[cfg_attr(
+            not(test),
+            allow(
+                dead_code,
+                reason = "the closed native origin seam retires through this"
+            )
+        )]
+        pub(crate) fn retire(&self) {
+            let _fence = self.fence();
+            self.token.cancel();
+        }
+
+        pub(crate) fn is_retired(&self) -> bool {
+            self.token.is_cancelled()
+        }
+
+        pub(crate) fn token(&self) -> &Shutdown {
+            &self.token
+        }
+
+        fn fence(&self) -> std::sync::MutexGuard<'_, ()> {
+            self.fence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
     }
 
     impl Origin {
@@ -577,7 +614,7 @@ pub(crate) mod publication {
         }
 
         fn current(&self) -> bool {
-            !self.retired.is_cancelled()
+            !self.retired.is_retired()
                 && (ORIGIN_PORT_FIRST..=ORIGIN_PORT_LAST).contains(&self.port.get())
         }
     }
@@ -804,9 +841,13 @@ pub(crate) mod publication {
                         ca_receipt: origin.ca_receipt,
                     };
                     let mut held = None;
-                    let result =
-                        Connector::start_cancellable(&plan, &origin.retired, shutdown, &mut held)
-                            .await;
+                    let result = Connector::start_cancellable(
+                        &plan,
+                        origin.retired.token(),
+                        shutdown,
+                        &mut held,
+                    )
+                    .await;
                     if let Some(held) = held {
                         *unsettled = Unsettled::Process(LocalProcess::Native(Box::new(held)));
                     }
@@ -842,6 +883,12 @@ pub(crate) mod publication {
                         &origin_name,
                         origin.ca_path.to_str().unwrap(),
                     ));
+                    // As the native start, revocation or shutdown aborts it.
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return Err(Failure::OriginUnavailable),
+                        held = hold(&fake.start_gate) => held.map_err(|_| Failure::ConnectorFailed)?,
+                    }
                     fake.ready()?;
                     fake.local.store(true, SeqCst);
                     Ok(LocalProcess::Fixture(fake))
@@ -859,26 +906,44 @@ pub(crate) mod publication {
         connector: LocalProcess,
     }
 
-    /// An activation's owner and revocation token. Kept in memory so an
-    /// authenticated owner unpublish revokes it without SQLite, the dispatch
-    /// gate or the effects slot.
+    /// An activation's owner, intent and revocation latch. Kept in memory so
+    /// an authenticated owner unpublish revokes it without SQLite, the
+    /// dispatch gate or the effects slot.
     struct Activation {
         generation: u64,
         vm: Id,
         owner: String,
+        /// The intent this activation admits; owner causes are bound to it.
+        nonce: String,
+        /// Notified only after `revoked`, the owner cause and the stop
+        /// obligation are recorded under the registry lock.
         token: Shutdown,
-        /// The first-write authority for this activation's POST. Revocation
-        /// is arbitrated against the first transport write under its lock.
-        send: Arc<SendGate>,
+        /// Latched by owner revocation under the registry lock. The first DNS
+        /// transport write checks it under the same lock.
+        revoked: bool,
     }
 
     /// What admission hands a publish worker for its activation.
     pub(crate) struct Ticket {
         pub(crate) generation: u64,
         pub(crate) revoked: Shutdown,
-        send: Arc<SendGate>,
     }
 
+    /// One activation generation's local stop obligation.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Stop {
+        /// Recorded by a revocation; no runner has claimed it yet.
+        Requested,
+        /// Claimed by exactly one runner. Further requests coalesce.
+        Running,
+        /// The last attempt left the connector live. A later revocation
+        /// requests it again; a confirmed stop of that connector settles it.
+        Failed,
+    }
+
+    /// The publication transition authority. Synchronous and short, never held
+    /// across an await or SQLite, so an authenticated unpublish wins without
+    /// the effects slot, SQLite or DNS.
     #[derive(Default)]
     struct Activations {
         /// The latest admitted activation.
@@ -897,30 +962,162 @@ pub(crate) mod publication {
         /// a failed withdrawal and a failed release in one outage still leave
         /// the proof to a later cleanup.
         unsubmitted: Option<String>,
-        /// The VM whose revoked activation was retired by a confirmed stop
-        /// before its publication's cleanup ran, so that cleanup still reports
-        /// the revocation as its cause. Not an activation: it matches no
-        /// unpublish, and that cleanup or the VM's next activation clears it.
-        revoked_retired: Option<Id>,
+        /// Intent nonces an owner revocation cancelled. The owner cause wins
+        /// over every other reason in the phase, release, audit and receipt
+        /// writes of that intent, and is kept until the intent is gone.
+        cancelled: Vec<String>,
+        /// Local stop obligations, at most one per activation generation.
+        stops: std::collections::BTreeMap<u64, Stop>,
+        /// Shutdown containment has begun. No activation registers and no
+        /// revocation records a stop obligation afterwards, and no first DNS
+        /// transport write passes.
+        sealed: bool,
+        /// A worker or stop completion was lost to a panic or cancellation.
+        /// Sticky: the final drain stays unconfirmed.
+        lost: bool,
         /// The last activation whose failed ingress-file write left a residue
         /// it could not remove. Sticky: the final drain stays unconfirmed.
         residue: Option<u64>,
     }
 
     impl Activations {
-        fn matching(&self, vm: Id, owner: Option<&str>) -> Vec<u64> {
+        fn find(&self, generation: u64) -> Option<&Activation> {
             [self.current.as_ref(), self.pending.as_ref()]
                 .into_iter()
                 .flatten()
-                .filter(|activation| {
-                    activation.vm == vm && owner.is_none_or(|owner| activation.owner == owner)
-                })
-                .map(|activation| {
-                    activation.token.cancel();
-                    activation.send.revoke();
-                    activation.generation
-                })
-                .collect()
+                .find(|activation| activation.generation == generation)
+        }
+
+        /// The owner revocation transition. For every current or registered
+        /// activation of `vm` that `owner` started (any owner for an admitted
+        /// unpublish), latches the revocation and its owner cause and records
+        /// one generation-scoped stop obligation, then notifies the token.
+        /// Returns the obligations it newly requested. A request for one that
+        /// is already requested or running coalesces; a failed one is
+        /// requested again. After the shutdown seal it has no authority.
+        fn revoke(&mut self, vm: Id, owner: Option<&str>) -> Vec<u64> {
+            if self.sealed {
+                return Vec::new();
+            }
+            let Self {
+                current,
+                pending,
+                cancelled,
+                stops,
+                ..
+            } = self;
+            let mut requested = Vec::new();
+            for activation in [current.as_mut(), pending.as_mut()].into_iter().flatten() {
+                if activation.vm != vm || owner.is_some_and(|owner| activation.owner != owner) {
+                    continue;
+                }
+                activation.revoked = true;
+                if !cancelled.contains(&activation.nonce) {
+                    cancelled.push(activation.nonce.clone());
+                }
+                if !matches!(
+                    stops.get(&activation.generation),
+                    Some(Stop::Requested | Stop::Running)
+                ) {
+                    stops.insert(activation.generation, Stop::Requested);
+                    requested.push(activation.generation);
+                }
+                activation.token.cancel();
+            }
+            requested
+        }
+
+        /// Keeps owner causes only for `keep` and for live activations.
+        fn prune_causes(&mut self, keep: Option<&str>) {
+            let Self {
+                current,
+                pending,
+                cancelled,
+                ..
+            } = self;
+            cancelled.retain(|nonce| {
+                keep == Some(nonce.as_str())
+                    || [current.as_ref(), pending.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|activation| activation.nonce == *nonce)
+            });
+        }
+    }
+
+    /// One publish worker's first-write authority. Owner revocation and the
+    /// shutdown seal take the registry lock, and origin retirement takes the
+    /// origin's retirement fence; the first write holds both. Each of them
+    /// therefore either precedes the first write and withholds it, or follows
+    /// it and finds the POST possibly sent.
+    struct Permit<'a> {
+        publication: &'a Publication,
+        generation: u64,
+        origin: &'a Origin,
+        shutdown: &'a Shutdown,
+        /// Written only under the registry lock.
+        possibly: std::sync::atomic::AtomicBool,
+    }
+
+    impl SendAuthority for Permit<'_> {
+        fn first_write(
+            &self,
+            write: &mut dyn FnMut() -> std::task::Poll<std::io::Result<usize>>,
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let activations = self.publication.activations();
+            let _retirement = self.origin.retired.fence();
+            let mut possibly = self.possibly.load(SeqCst);
+            let result = arbitrate(
+                &mut possibly,
+                || {
+                    !activations.sealed
+                        && !self.shutdown.is_cancelled()
+                        && !self.origin.retired.is_retired()
+                        && activations
+                            .find(self.generation)
+                            .is_some_and(|activation| !activation.revoked)
+                },
+                write,
+            );
+            self.possibly.store(possibly, SeqCst);
+            result
+        }
+
+        fn sent(&self) -> Sent {
+            if self.possibly.load(std::sync::atomic::Ordering::SeqCst) {
+                Sent::Possibly
+            } else {
+                Sent::Never
+            }
+        }
+    }
+
+    /// A claimed stop obligation. Dropping it records the outcome: settled,
+    /// failed and retryable, or lost when the runner never finished.
+    struct StopClaim<'a> {
+        publication: &'a Publication,
+        generation: u64,
+        stopped: Option<bool>,
+    }
+
+    impl Drop for StopClaim<'_> {
+        fn drop(&mut self) {
+            let mut activations = self.publication.activations();
+            match self.stopped {
+                Some(true) => {
+                    activations.stops.remove(&self.generation);
+                }
+                Some(false) => {
+                    activations.stops.insert(self.generation, Stop::Failed);
+                }
+                None => {
+                    activations.stops.insert(self.generation, Stop::Failed);
+                    activations.lost = true;
+                }
+            }
+            drop(activations);
+            self.publication.stops_changed.notify_waiters();
         }
     }
 
@@ -966,9 +1163,10 @@ pub(crate) mod publication {
         /// Never held across a SQLite call, so a local stop never waits on
         /// the store.
         local: Mutex<Option<Live>>,
-        /// Synchronous and short, so an authenticated unpublish wins without
-        /// the effects slot, SQLite or DNS.
+        /// The transition authority; see [`Activations`].
         activations: std::sync::Mutex<Activations>,
+        /// Signalled whenever a stop obligation settles or fails.
+        stops_changed: tokio::sync::Notify,
         #[cfg(test)]
         pub(crate) fake: std::sync::Mutex<Option<Arc<Fake>>>,
         /// Parks a publish worker after its final token check, before its
@@ -1041,40 +1239,41 @@ pub(crate) mod publication {
 
         /// Registers the activation about to be admitted, before its admission
         /// transaction. The caller holds the dispatch gate and the effects slot,
-        /// and then calls [`Self::admitted`] or [`Self::abandon`].
-        pub(crate) fn register(&self, vm: Id, owner: &str) -> Ticket {
+        /// and then calls [`Self::admitted`] or [`Self::abandon`]. After the
+        /// shutdown seal nothing registers.
+        pub(crate) fn register(&self, vm: Id, owner: &str, nonce: &str) -> Option<Ticket> {
             let mut activations = self.activations();
+            if activations.sealed {
+                return None;
+            }
             activations.issued += 1;
             let generation = activations.issued;
             let token = Shutdown::default();
-            let send = Arc::<SendGate>::default();
             activations.pending = Some(Activation {
                 generation,
                 vm,
                 owner: owner.to_owned(),
+                nonce: nonce.to_owned(),
                 token: token.clone(),
-                send: send.clone(),
+                revoked: false,
             });
-            Ticket {
+            Some(Ticket {
                 generation,
                 revoked: token,
-                send,
-            }
+            })
         }
 
-        /// The registered activation was admitted and is now current.
+        /// The registered activation was admitted and is now current. The
+        /// previous intent was released before admission, so its owner cause
+        /// is spent.
         pub(crate) fn admitted(&self, generation: u64) {
             let mut activations = self.activations();
             if let Some(pending) = activations
                 .pending
                 .take_if(|pending| pending.generation == generation)
             {
-                // A successful replacement: the previous publication of this
-                // VM was released before admission, so its marker is spent.
-                if activations.revoked_retired == Some(pending.vm) {
-                    activations.revoked_retired = None;
-                }
                 activations.current = Some(pending);
+                activations.prune_causes(None);
             }
         }
 
@@ -1082,31 +1281,35 @@ pub(crate) mod publication {
         /// Called under the effects slot, where only the durable intent's
         /// activation can be current for `vm`.
         fn retire(&self, vm: Id) {
-            let mut activations = self.activations();
-            if let Some(current) = activations.current.take_if(|current| current.vm == vm)
-                && current.token.is_cancelled()
-            {
-                // Kept until the cause is durable on the intent.
-                activations.revoked_retired = Some(vm);
-            }
+            self.activations()
+                .current
+                .take_if(|current| current.vm == vm);
         }
 
-        /// The revocation cause for `vm` is durable, or its publication is gone.
-        fn clear_revoked(&self, vm: Id) {
+        /// The shutdown seal, in the transition that requests shutdown
+        /// containment: no activation registers, no revocation records a stop
+        /// obligation and no first DNS transport write passes afterwards.
+        /// `shutdown` is notified after the seal is recorded.
+        pub(crate) fn seal(&self, shutdown: &Shutdown) {
             let mut activations = self.activations();
-            if activations.revoked_retired == Some(vm) {
-                activations.revoked_retired = None;
-            }
+            activations.sealed = true;
+            shutdown.cancel();
         }
 
-        /// Daemon shutdown after every connector was confirmed stopped.
-        fn retire_all(&self) {
+        /// Daemon shutdown after every worker and stop joined and local
+        /// ingress is confirmed down. Owner causes and no-submission proof are
+        /// cleared only once the publication settled.
+        pub(crate) fn clear(&self, settled: bool) {
             #[cfg(test)]
             self.events.lock().unwrap().push("cleared");
             let mut activations = self.activations();
             activations.current = None;
             activations.pending = None;
-            activations.revoked_retired = None;
+            activations.stops.clear();
+            if settled {
+                activations.cancelled.clear();
+                activations.unsubmitted = None;
+            }
         }
 
         /// A live connector failed its last stop attempt. Only this closes
@@ -1121,10 +1324,21 @@ pub(crate) mod publication {
             self.activations().residue.is_some()
         }
 
+        /// A worker or stop completion was lost to a panic or cancellation.
+        pub(crate) fn lost(&self) -> bool {
+            self.activations().lost
+        }
+
         #[cfg(test)]
         pub(crate) fn registry_len(&self) -> usize {
             let activations = self.activations();
             usize::from(activations.current.is_some()) + usize::from(activations.pending.is_some())
+        }
+
+        /// Recorded stop obligations, in any state.
+        #[cfg(test)]
+        pub(crate) fn stop_obligations(&self) -> usize {
+            self.activations().stops.len()
         }
 
         fn unsubmitted(&self, nonce: &str) -> bool {
@@ -1135,32 +1349,59 @@ pub(crate) mod publication {
             self.activations().unsubmitted = nonce.map(str::to_owned);
         }
 
-        /// The registered activation was refused and never ran.
-        pub(crate) fn abandon(&self, generation: u64) {
-            let mut activations = self.activations();
-            if activations
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.generation == generation)
-            {
-                activations.pending = None;
+        /// An owner revocation cancelled the publication of this intent.
+        fn owner_cancelled(&self, nonce: &str) -> bool {
+            self.activations()
+                .cancelled
+                .iter()
+                .any(|cancelled| cancelled == nonce)
+        }
+
+        /// `reason` after owner-cause precedence for this intent.
+        fn cause(&self, nonce: &str, reason: Option<Failure>) -> Option<Failure> {
+            if self.owner_cancelled(nonce) {
+                Some(Failure::Cancelled)
+            } else {
+                reason
             }
         }
 
-        /// Owner revocation before any store, gate, slot or DNS dependency.
-        /// Cancels every current or registered activation of `vm` that `owner`
-        /// started, whatever the request key: the replay ledger decides only
-        /// the response and the durable bookkeeping. Returns the generations
-        /// whose connectors the caller stops, also when already revoked, so a
-        /// failed stop stays retryable.
+        /// The registered activation was refused and never ran.
+        pub(crate) fn abandon(&self, generation: u64) {
+            let mut activations = self.activations();
+            if let Some(pending) = activations
+                .pending
+                .take_if(|pending| pending.generation == generation)
+            {
+                activations
+                    .cancelled
+                    .retain(|nonce| *nonce != pending.nonce);
+            }
+        }
+
+        /// Owner revocation before any store, gate, slot or DNS dependency;
+        /// see [`Activations::revoke`]. Whatever the request key: the replay
+        /// ledger decides only the response and the durable bookkeeping. The
+        /// returned obligations are already recorded; a runner only executes
+        /// them, and the final drain services any whose runner never started.
+        #[must_use]
         pub(crate) fn revoke_owned(&self, owner: &str, vm: Id) -> Vec<u64> {
-            self.activations().matching(vm, Some(owner))
+            self.activations().revoke(vm, Some(owner))
         }
 
         /// Revokes every activation of `vm` after an admitted owner unpublish
         /// committed `revoking`.
+        #[must_use]
         pub(crate) fn revoke(&self, vm: Id) -> Vec<u64> {
-            self.activations().matching(vm, None)
+            self.activations().revoke(vm, None)
+        }
+
+        /// Records a joined worker or stop task. A panic or cancellation is a
+        /// lost completion, whoever harvests it.
+        pub(crate) fn record_join<T>(&self, joined: &Result<T, tokio::task::JoinError>) {
+            if joined.is_err() {
+                self.activations().lost = true;
+            }
         }
 
         /// Held across a publication admission transaction, then records its
@@ -1176,17 +1417,73 @@ pub(crate) mod publication {
             self.workers().remove(&receipt);
         }
 
-        fn revoked(&self, vm: Id) -> bool {
-            let activations = self.activations();
-            activations.revoked_retired == Some(vm)
-                || activations
-                    .current
-                    .as_ref()
-                    .is_some_and(|current| current.vm == vm && current.token.is_cancelled())
+        /// Runs one recorded stop obligation if it is still requested. A
+        /// coalesced or stale runner finds it claimed or settled and returns.
+        pub(crate) async fn run_stop(&self, generation: u64) {
+            let claimed = {
+                let mut activations = self.activations();
+                match activations.stops.get_mut(&generation) {
+                    Some(stop @ Stop::Requested) => {
+                        *stop = Stop::Running;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if claimed {
+                self.service_stop(generation).await;
+            }
+        }
+
+        async fn service_stop(&self, generation: u64) {
+            let mut claim = StopClaim {
+                publication: self,
+                generation,
+                stopped: None,
+            };
+            claim.stopped = Some(self.stop_activation(generation).await);
+        }
+
+        /// The drain's stop settlement, after the seal: runs every requested
+        /// obligation whose runner never started and waits for every running
+        /// one. No obligation can be recorded meanwhile.
+        pub(crate) async fn settle_stops(&self) {
+            loop {
+                let changed = self.stops_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let (claimed, running) = {
+                    let mut activations = self.activations();
+                    let claimed: Vec<u64> = activations
+                        .stops
+                        .iter_mut()
+                        .filter(|(_, stop)| **stop == Stop::Requested)
+                        .map(|(generation, stop)| {
+                            *stop = Stop::Running;
+                            *generation
+                        })
+                        .collect();
+                    let running = activations
+                        .stops
+                        .values()
+                        .any(|stop| *stop == Stop::Running);
+                    (claimed, running)
+                };
+                if !claimed.is_empty() {
+                    for generation in claimed {
+                        self.service_stop(generation).await;
+                    }
+                    continue;
+                }
+                if !running {
+                    return;
+                }
+                changed.await;
+            }
         }
 
         /// A deferred revocation stop, bound to one activation generation.
-        pub(crate) async fn stop_activation(&self, generation: u64) -> bool {
+        async fn stop_activation(&self, generation: u64) -> bool {
             #[cfg(test)]
             let _ = hold(&self.stop_gate).await;
             let stopped = self.stop_where(|live| live.generation == generation).await;
@@ -1206,8 +1503,11 @@ pub(crate) mod publication {
             let mut local = self.local.lock().await;
             let Some(live) = local.as_mut().filter(|live| matches(live)) else {
                 if local.is_none() {
-                    // No connector is live, so no stop can be outstanding.
-                    self.activations().unconfirmed = None;
+                    // No connector is live, so no stop can be outstanding and
+                    // no failed stop obligation has anything left to stop.
+                    let mut activations = self.activations();
+                    activations.unconfirmed = None;
+                    activations.stops.retain(|_, stop| *stop != Stop::Failed);
                 }
                 return true;
             };
@@ -1221,33 +1521,21 @@ pub(crate) mod publication {
             if activations.unconfirmed == Some(generation) {
                 activations.unconfirmed = None;
             }
+            if activations.stops.get(&generation) == Some(&Stop::Failed) {
+                activations.stops.remove(&generation);
+            }
             // That activation's connector is confirmed stopped and a worker
             // never restarts it, so its publication's ingress has ended. A
             // registered generation with no connector yet is kept: its
             // cancelled worker still settles it.
-            if let Some(current) = activations
+            activations
                 .current
-                .take_if(|current| current.generation == generation)
-                && current.token.is_cancelled()
-            {
-                activations.revoked_retired = Some(current.vm);
-            }
+                .take_if(|current| current.generation == generation);
             true
         }
 
-        /// Daemon shutdown, after every worker and deferred stop has joined:
-        /// stops any remaining connector and, once confirmed, clears every
-        /// remaining activation and marker.
-        pub(crate) async fn stop_all(&self) -> bool {
-            let stopped = self.stop_local(None).await;
-            if stopped {
-                self.retire_all();
-            }
-            stopped
-        }
-
         async fn ready(&self, intent: &Intent, shutdown: &Shutdown) -> Result<(), Failure> {
-            if self.revoked(intent.vm) {
+            if self.owner_cancelled(&intent.nonce) {
                 return Err(Failure::Cancelled);
             }
             let local = self.local.lock().await;
@@ -1352,7 +1640,9 @@ pub(crate) mod publication {
             // An unremoved ingress residue is never confirmed cleanup, even
             // though no process or DNS effect remains.
             let clean = clean && self.activations().residue != Some(generation);
-            controller.finish_publication(operation, None, Some(failure), Some(clean))
+            // A latched owner cause wins over this worker's local failure.
+            let failure = self.cause(&intent.nonce, Some(failure));
+            controller.finish_publication(operation, None, failure, Some(clean))
         }
 
         /// Errors carry this worker's POST evidence: an acknowledged record ID
@@ -1381,7 +1671,7 @@ pub(crate) mod publication {
             tokio::select! {
                 biased;
                 _ = revoked.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
-                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
+                _ = origin.retired.token().cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
                 _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
                 result = prepared.dns.preflight(&route) => result.map_err(map)?,
             }
@@ -1453,16 +1743,17 @@ pub(crate) mod publication {
             let _ = hold(&self.submit_gate).await;
             // The POST may reach Cloudflare only once the underlying transport
             // accepts its first byte, below TLS and after connection setup.
-            // That first write is arbitrated against owner revocation under the
-            // activation's send gate and re-samples origin retirement and
-            // shutdown on every attempt. Anything that ends the request before
-            // a byte is accepted (any cancellation, a pending write, or a
+            // That first write runs under this activation's permit: owner
+            // revocation, the shutdown seal and origin retirement each either
+            // precede it and withhold it or follow it, and every attempt
+            // re-checks all three. Anything that ends the request before a
+            // byte is accepted (any cancellation, a pending write, or a
             // zero-progress failure) is provably unsent. After it, an owner
             // revocation lets the POST complete or time out and its
             // acknowledged ID is then removed, while retirement or shutdown
             // leaves it possible.
             let cause = || {
-                if origin.retired.is_cancelled() {
+                if origin.retired.is_retired() {
                     Some(Failure::OriginUnavailable)
                 } else if revoked.is_cancelled() || shutdown.is_cancelled() {
                     Some(Failure::Cancelled)
@@ -1470,11 +1761,17 @@ pub(crate) mod publication {
                     None
                 }
             };
-            let cancelled = || cause().is_some();
-            let submission = Submission::new(ticket.send.clone(), &cancelled);
+            let permit = Permit {
+                publication: self,
+                generation,
+                origin,
+                shutdown,
+                possibly: Default::default(),
+            };
+            let submission = Submission::with(&permit);
             let id = tokio::select! {
                 biased;
-                _ = origin.retired.cancelled() => Err(None),
+                _ = origin.retired.token().cancelled() => Err(None),
                 _ = shutdown.cancelled() => Err(None),
                 // Owner revocation abandons the POST only while it is unsent.
                 _ = async {
@@ -1515,7 +1812,7 @@ pub(crate) mod publication {
             }
             tokio::select! {
                 biased;
-                _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
+                _ = origin.retired.token().cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
                 _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
                 result = prepared.dns.verify(&route, &id) => result.map_err(map)?,
             }
@@ -1557,20 +1854,22 @@ pub(crate) mod publication {
                 return Ok(());
             };
             let intent = controller.publication_intent()?;
-            if intent.is_none() {
-                self.set_unsubmitted(None);
+            {
+                // No-submission proof and owner causes are kept only for the
+                // durable intent and live activations.
+                let mut activations = self.activations();
+                if intent.is_none() {
+                    activations.unsubmitted = None;
+                }
+                activations.prune_causes(intent.as_ref().map(|intent| intent.nonce.as_str()));
             }
             if let Some(intent) = intent {
                 let stale = if intent.phase == Phase::Published {
                     self.ready(&intent, shutdown).await.err().map(Some)
                 } else {
-                    // An owner revocation whose checkpoint never became durable
-                    // is still the cause.
-                    Some(
-                        intent
-                            .reason
-                            .or_else(|| self.revoked(intent.vm).then_some(Failure::Cancelled)),
-                    )
+                    // A latched owner cause wins over a durable generic reason,
+                    // including when its own checkpoint never became durable.
+                    Some(self.cause(&intent.nonce, intent.reason))
                 };
                 if let Some(reason) = stale {
                     self.cleanup(controller, intent.vm, reason, Evidence::Unknown, None)
@@ -1607,12 +1906,11 @@ pub(crate) mod publication {
                 .publication_intent()?
                 .filter(|intent| intent.vm == vm)
             else {
-                self.clear_revoked(vm);
                 return Ok(local);
             };
+            // A latched owner cause wins over the reason this cleanup supplies.
+            let reason = self.cause(&intent.nonce, reason);
             controller.update_publication(&intent.nonce, Update::Phase(Phase::Revoking, reason))?;
-            // The cause is now durable on the intent.
-            self.clear_revoked(vm);
             // A proven unsubmitted POST needs no remote work, so it is decided
             // before DNS and before cancellation can win.
             let unsubmitted = intent.record.is_none()
@@ -1722,6 +2020,8 @@ pub(crate) mod publication {
         pub(crate) stop_failures: std::sync::atomic::AtomicUsize,
         /// The next connector start fails with an unremoved ingress residue.
         pub(crate) residue: std::sync::atomic::AtomicBool,
+        /// Parks the next connector start before readiness, abortably.
+        pub(crate) start_gate: std::sync::Mutex<Option<FakeGate>>,
         pub(crate) posts: std::sync::atomic::AtomicUsize,
         pub(crate) deletes: std::sync::atomic::AtomicUsize,
         pub(crate) ingress: std::sync::Mutex<Option<String>>,
@@ -1889,6 +2189,165 @@ pub(crate) mod publication {
             } else {
                 Ok(Removal::Absent)
             }
+        }
+    }
+
+    /// The first DNS transport write runs under one activation's permit. Each
+    /// cancellation source either precedes it and withholds it, or waits for
+    /// an in-flight first write and then finds the POST possibly sent.
+    #[cfg(test)]
+    mod authority {
+        use super::*;
+        use std::{sync::mpsc::RecvTimeoutError, task::Poll, time::Duration};
+
+        const VM: Id = [7; 16];
+
+        fn origin() -> Origin {
+            Origin {
+                generation: [1; 16],
+                boot: [2; 16],
+                port: NonZeroU16::new(ORIGIN_PORT_FIRST).unwrap(),
+                ca_path: PathBuf::new(),
+                ca_receipt: ArtifactPin {
+                    size: 1,
+                    sha256: [1; 32],
+                },
+                retired: Retirement::default(),
+            }
+        }
+
+        fn admitted(publication: &Publication) -> u64 {
+            let ticket = publication.register(VM, "alpha", "nonce").unwrap();
+            publication.admitted(ticket.generation);
+            ticket.generation
+        }
+
+        fn permit<'a>(
+            publication: &'a Publication,
+            generation: u64,
+            origin: &'a Origin,
+            shutdown: &'a Shutdown,
+        ) -> Permit<'a> {
+            Permit {
+                publication,
+                generation,
+                origin,
+                shutdown,
+                possibly: Default::default(),
+            }
+        }
+
+        type Transition = fn(&Publication, &Origin, &Shutdown);
+
+        fn owner_revocation(publication: &Publication, _: &Origin, _: &Shutdown) {
+            let _ = publication.revoke_owned("alpha", VM);
+        }
+
+        fn shutdown_seal(publication: &Publication, _: &Origin, shutdown: &Shutdown) {
+            publication.seal(shutdown);
+        }
+
+        fn origin_retirement(_: &Publication, origin: &Origin, _: &Shutdown) {
+            origin.retired.retire();
+        }
+
+        const TRANSITIONS: [(&str, Transition); 3] = [
+            ("owner revocation", owner_revocation),
+            ("shutdown seal", shutdown_seal),
+            ("origin retirement", origin_retirement),
+        ];
+
+        #[test]
+        fn a_preceding_transition_withholds_the_first_write() {
+            for (name, transition) in TRANSITIONS {
+                let (publication, origin, shutdown) =
+                    (Publication::default(), origin(), Shutdown::default());
+                let generation = admitted(&publication);
+                transition(&publication, &origin, &shutdown);
+                let permit = permit(&publication, generation, &origin, &shutdown);
+                let mut written = false;
+                let result = Submission::with(&permit).first_write(|| {
+                    written = true;
+                    Poll::Ready(Ok(1))
+                });
+                assert!(
+                    matches!(result, Poll::Ready(Err(_))),
+                    "{name}: a first write passed"
+                );
+                assert!(!written, "{name}: the transport was written");
+                assert_eq!(permit.sent(), Sent::Never, "{name}");
+            }
+        }
+
+        #[test]
+        fn a_transition_waits_for_an_in_flight_first_write_and_finds_it_sent() {
+            for (name, transition) in TRANSITIONS {
+                let (publication, origin, shutdown) =
+                    (Publication::default(), origin(), Shutdown::default());
+                let generation = admitted(&publication);
+                let permit = permit(&publication, generation, &origin, &shutdown);
+                std::thread::scope(|scope| {
+                    let (done, finished) = std::sync::mpsc::channel();
+                    let mut transitioning = None;
+                    let result = Submission::with(&permit).first_write(|| {
+                        let (publication, origin, shutdown) = (&publication, &origin, &shutdown);
+                        transitioning = Some(scope.spawn(move || {
+                            transition(publication, origin, shutdown);
+                            done.send(()).unwrap();
+                        }));
+                        // The write is in flight: the transition must wait.
+                        assert!(
+                            matches!(
+                                finished.recv_timeout(Duration::from_millis(100)),
+                                Err(RecvTimeoutError::Timeout)
+                            ),
+                            "{name} passed an in-flight first write"
+                        );
+                        Poll::Ready(Ok(1))
+                    });
+                    assert!(matches!(result, Poll::Ready(Ok(1))), "{name}");
+                    finished
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("the transition never completed");
+                    transitioning.unwrap().join().unwrap();
+                });
+                // The accepted byte is never reclassified, and nothing new passes.
+                assert_eq!(permit.sent(), Sent::Possibly, "{name}");
+                let later = self::permit(&publication, generation, &origin, &shutdown);
+                let result = Submission::with(&later).first_write(|| Poll::Ready(Ok(1)));
+                assert!(
+                    matches!(result, Poll::Ready(Err(_))),
+                    "{name}: a later first write passed"
+                );
+            }
+        }
+
+        #[test]
+        fn revocation_records_one_coalesced_stop_obligation_per_generation() {
+            let publication = Publication::default();
+            let generation = admitted(&publication);
+            // Another principal never matches.
+            assert!(publication.revoke_owned("beta", VM).is_empty());
+            assert_eq!(publication.revoke_owned("alpha", VM), vec![generation]);
+            assert!(publication.owner_cancelled("nonce"));
+            // Repeated requests coalesce while it is requested.
+            assert!(publication.revoke_owned("alpha", VM).is_empty());
+            assert!(publication.revoke(VM).is_empty());
+            assert_eq!(publication.stop_obligations(), 1);
+            // A failed attempt is requested again by the next revocation.
+            publication
+                .activations()
+                .stops
+                .insert(generation, Stop::Failed);
+            assert_eq!(publication.revoke_owned("alpha", VM), vec![generation]);
+            assert_eq!(publication.stop_obligations(), 1);
+            // After the seal no revocation records an obligation and nothing
+            // registers.
+            publication.activations().stops.clear();
+            publication.seal(&Shutdown::default());
+            assert!(publication.revoke_owned("alpha", VM).is_empty());
+            assert_eq!(publication.stop_obligations(), 0);
+            assert!(publication.register(VM, "alpha", "later").is_none());
         }
     }
 }

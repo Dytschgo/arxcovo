@@ -203,10 +203,45 @@ struct GateState {
     possibly: bool,
 }
 
-/// The first-write authority for one activation's POST. Owner revocation and
-/// the first underlying transport write are arbitrated under this one lock, so
-/// no request byte can follow an observed revocation, and a revocation that
-/// lands after a byte was accepted knows the POST may have been sent.
+/// The first-write rule, applied while the caller holds its send authority.
+/// Once `possibly` is set, writes pass straight through. Otherwise the write
+/// runs only while `open` holds: `Pending` and any zero-progress result leave
+/// the request unsent and revocable, and only an accepted byte sets
+/// `possibly`, which is never cleared.
+pub(in crate::vm) fn arbitrate(
+    possibly: &mut bool,
+    open: impl FnOnce() -> bool,
+    write: &mut dyn FnMut() -> std::task::Poll<io::Result<usize>>,
+) -> std::task::Poll<io::Result<usize>> {
+    if *possibly {
+        return write();
+    }
+    if !open() {
+        return std::task::Poll::Ready(Err(io::Error::other("submission withheld")));
+    }
+    let result = write();
+    if matches!(result, std::task::Poll::Ready(Ok(accepted)) if accepted > 0) {
+        *possibly = true;
+    }
+    result
+}
+
+/// The authority that decides one mutation's first underlying write. Every
+/// cancellation source it honors must take the same lock as
+/// [`SendAuthority::first_write`], so each one either precedes a first write
+/// (and withholds it) or follows it (and finds the request possibly sent).
+pub(in crate::vm) trait SendAuthority: Sync {
+    /// One attempt of the underlying write, under the authority, by
+    /// [`arbitrate`].
+    fn first_write(
+        &self,
+        write: &mut dyn FnMut() -> std::task::Poll<io::Result<usize>>,
+    ) -> std::task::Poll<io::Result<usize>>;
+    fn sent(&self) -> Sent;
+}
+
+/// A standalone first-write authority with its own lock, for transport
+/// fixtures and requests outside an activation.
 #[derive(Default)]
 pub(in crate::vm) struct SendGate(std::sync::Mutex<GateState>);
 
@@ -217,8 +252,9 @@ impl SendGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Owner revocation. Returns `true` when no byte was accepted, in which
-    /// case none can be.
+    /// Revocation. Returns `true` when no byte was accepted, in which case
+    /// none can be.
+    #[allow(dead_code, reason = "used by transport fixtures")]
     pub(in crate::vm) fn revoke(&self) -> bool {
         let mut state = self.state();
         state.revoked = true;
@@ -234,12 +270,15 @@ impl SendGate {
     }
 }
 
-/// One DNS mutation's send authority: its activation's [`SendGate`] plus the
-/// other cancellation sources (origin retirement and shutdown), sampled at
-/// every attempt of the first underlying write.
-pub(in crate::vm) struct Submission<'a> {
-    gate: Arc<SendGate>,
-    cancelled: &'a (dyn Fn() -> bool + Sync),
+/// One DNS mutation's send authority.
+pub(in crate::vm) struct Submission<'a>(Authority<'a>);
+
+enum Authority<'a> {
+    /// A standalone gate plus other cancellation sampled under its lock.
+    Gate(Arc<SendGate>, &'a (dyn Fn() -> bool + Sync)),
+    /// An activation's authority, shared with its revocation, shutdown seal
+    /// and origin retirement.
+    Shared(&'a dyn SendAuthority),
 }
 
 impl<'a> Submission<'a> {
@@ -247,7 +286,11 @@ impl<'a> Submission<'a> {
         gate: Arc<SendGate>,
         cancelled: &'a (dyn Fn() -> bool + Sync),
     ) -> Self {
-        Self { gate, cancelled }
+        Self(Authority::Gate(gate, cancelled))
+    }
+
+    pub(in crate::vm) fn with(authority: &'a dyn SendAuthority) -> Self {
+        Self(Authority::Shared(authority))
     }
 
     /// A submission no cancellation can withhold.
@@ -260,30 +303,33 @@ impl<'a> Submission<'a> {
     }
 
     pub(in crate::vm) fn sent(&self) -> Sent {
-        self.gate.sent()
+        match &self.0 {
+            Authority::Gate(gate, _) => gate.sent(),
+            Authority::Shared(authority) => authority.sent(),
+        }
     }
 
-    /// Arbitrates one attempt of the first underlying write. Cancellation is
-    /// re-sampled on every attempt; `Pending` and any zero-progress result
-    /// leave the request unsent and revocable. Only an accepted byte moves it
-    /// to [`Sent::Possibly`], after which writes pass straight through.
+    /// Arbitrates one attempt of the first underlying write under the
+    /// authority. Cancellation is re-sampled on every attempt; see
+    /// [`arbitrate`].
     pub(in crate::vm) fn first_write(
         &self,
         write: impl FnOnce() -> std::task::Poll<io::Result<usize>>,
     ) -> std::task::Poll<io::Result<usize>> {
-        let mut state = self.gate.state();
-        if state.possibly {
-            drop(state);
-            return write();
+        let mut write = Some(write);
+        let mut once = || {
+            write
+                .take()
+                .map_or(std::task::Poll::Pending, |write| write())
+        };
+        match &self.0 {
+            Authority::Gate(gate, cancelled) => {
+                let mut state = gate.state();
+                let revoked = state.revoked;
+                arbitrate(&mut state.possibly, || !revoked && !cancelled(), &mut once)
+            }
+            Authority::Shared(authority) => authority.first_write(&mut once),
         }
-        if state.revoked || (self.cancelled)() {
-            return std::task::Poll::Ready(Err(io::Error::other("submission withheld")));
-        }
-        let result = write();
-        if matches!(result, std::task::Poll::Ready(Ok(accepted)) if accepted > 0) {
-            state.possibly = true;
-        }
-        result
     }
 }
 

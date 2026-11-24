@@ -295,6 +295,10 @@ pub(crate) struct Supervisor {
     /// Blocks the next sweep.
     #[cfg(test)]
     stall_sweep: Mutex<Option<tests::StallHook>>,
+    /// Blocks the next early owner revocation after its transition recorded
+    /// the stop obligations and before their runners are spawned.
+    #[cfg(test)]
+    stall_revoked: Mutex<Option<tests::StallHook>>,
     /// Acknowledges a fatal accept after the fence, then holds the listener
     /// until its stop is issued.
     #[cfg(test)]
@@ -398,6 +402,8 @@ impl Supervisor {
             #[cfg(test)]
             stall_sweep: Mutex::new(None),
             #[cfg(test)]
+            stall_revoked: Mutex::new(None),
+            #[cfg(test)]
             fatal_accept: Mutex::new(None),
         }))
     }
@@ -429,7 +435,10 @@ impl Supervisor {
     /// admission that has not reached its commit refuses as `shutdown`.
     pub(crate) fn fence(&self) {
         self.fenced.store(true, Ordering::SeqCst);
-        self.cancel.cancel();
+        // The same transition seals publication producers: after it no
+        // activation registers, no revocation records a stop obligation and
+        // no first DNS transport write passes. It then signals cancellation.
+        self.publisher.seal(&self.cancel);
     }
 
     /// The close barrier: fence, then close foreground admission, then
@@ -557,31 +566,32 @@ impl Supervisor {
             .is_ok()
     }
 
-    /// Queues the local stop of one revoked activation generation, unless a
-    /// stop for it is already in flight. Completed jobs are dropped first, so
-    /// the set holds at most one job per generation still being stopped. The
-    /// outcome is recorded in the publisher's unconfirmed-stop state.
-    fn stop_revoked(self: &Arc<Self>, generation: u64) {
+    /// Spawns runners for stop obligations a revocation already recorded.
+    /// A runner only executes its obligation: a coalesced or stale runner
+    /// finds it claimed or settled, and the final drain services any
+    /// obligation whose runner never started.
+    fn spawn_stops(self: &Arc<Self>, generations: Vec<u64>) {
+        if generations.is_empty() {
+            return;
+        }
         let Ok(mut stops) = self.stops.lock() else {
             return;
         };
-        stops.reap();
-        if stops.running.values().any(|running| *running == generation) {
-            return;
+        stops.reap(&self.publisher);
+        for generation in generations {
+            let supervisor = self.clone();
+            stops.set.spawn(async move {
+                supervisor.publisher.run_stop(generation).await;
+            });
+            #[cfg(test)]
+            self.stops_spawned.fetch_add(1, Ordering::SeqCst);
         }
-        let supervisor = self.clone();
-        let job = stops.set.spawn(async move {
-            supervisor.publisher.stop_activation(generation).await;
-        });
-        stops.running.insert(job.id(), generation);
-        #[cfg(test)]
-        self.stops_spawned.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Drops completed deferred stops.
+    /// Records and drops completed stop runners.
     fn reap_stops(&self) {
         if let Ok(mut stops) = self.stops.lock() {
-            stops.reap();
+            stops.reap(&self.publisher);
         }
     }
 
@@ -591,11 +601,6 @@ impl Supervisor {
     pub(crate) async fn drain_workers(&self, bound: Duration) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + bound;
         let mut publish_jobs = std::mem::take(&mut self.lock()?.publish_jobs);
-        let mut stops = self
-            .stops
-            .lock()
-            .map(|mut jobs| std::mem::take(&mut *jobs))
-            .map_err(|_| anyhow::anyhow!("publication settlement unconfirmed"))?;
         tokio::time::timeout_at(deadline, async {
             // Local stop only: registrations without a connector belong to
             // workers that have not joined yet. The outcome is decided below.
@@ -609,36 +614,34 @@ impl Supervisor {
             {
                 let _ = passed.send(());
             }
-            let mut failed = false;
             // A worker that returned an error left its durable intent and
             // receipt for reconciliation, which the final turn below performs
-            // and reports. Only a worker that did not finish is unconfirmed.
+            // and reports. A worker that did not finish is a lost completion.
             while let Some(job) = publish_jobs.join_next().await {
-                failed |= job.is_err();
+                self.publisher.record_join(&job);
             }
-            // Early revocation runs outside the close barrier, so a dispatch that
-            // started before the fence can still queue a stop after the set was
-            // taken. Join until the shared set stays empty.
-            loop {
-                while let Some(job) = stops.set.join_next().await {
-                    failed |= job.is_err();
-                }
-                let Ok(mut shared) = self.stops.lock() else {
-                    failed = true;
-                    break;
-                };
-                stops = std::mem::take(&mut *shared);
-                if stops.set.is_empty() {
-                    break;
-                }
+            // The fence sealed every stop producer, so the recorded obligations
+            // are final: run those whose runner never started and wait for the
+            // running ones. Remaining runners then find nothing to do.
+            self.publisher.settle_stops().await;
+            let mut stops = self
+                .stops
+                .lock()
+                .map(|mut jobs| std::mem::take(&mut *jobs))
+                .map_err(|_| anyhow::anyhow!("publication settlement unconfirmed"))?;
+            while let Some(job) = stops.set.join_next().await {
+                self.publisher.record_join(&job);
             }
             // A deferred stop may have confirmed what the first attempt could
             // not, so the final local state decides.
-            // Every worker and deferred stop has joined: confirm the final local
-            // state and clear what remains of the registry.
-            let local = self.publisher.stop_all().await;
-            failed |= !local || self.publisher.stop_unconfirmed() || self.publisher.residue();
-            anyhow::ensure!(!failed, "publication settlement unconfirmed");
+            let local = self.publisher.stop_local(None).await;
+            anyhow::ensure!(
+                local
+                    && !self.publisher.stop_unconfirmed()
+                    && !self.publisher.residue()
+                    && !self.publisher.lost(),
+                "publication settlement unconfirmed"
+            );
             Ok::<_, anyhow::Error>(())
         })
         .await??;
@@ -652,12 +655,15 @@ impl Supervisor {
         }
         // Local containment and worker settlement have their own proof.
         // A remote timeout leaves the intent intact for startup reconciliation.
-        if let Ok(result) = tokio::time::timeout_at(
+        let turn = tokio::time::timeout_at(
             deadline,
             self.publisher.turn(&self.controller, &self.cancel),
         )
-        .await
-        {
+        .await;
+        // Every worker and stop has joined and local ingress is down: clear
+        // the registry.
+        self.publisher.clear(true);
+        if let Ok(result) = turn {
             result?;
         }
         Ok(())
@@ -759,21 +765,17 @@ impl Drop for Connection {
     }
 }
 
-/// Deferred revocation stops and the generation each one stops.
+/// Runners of recorded stop obligations. The obligations themselves live in
+/// the publication's transition authority.
 #[derive(Default)]
 struct StopJobs {
     set: tokio::task::JoinSet<()>,
-    running: std::collections::HashMap<tokio::task::Id, u64>,
 }
 
 impl StopJobs {
-    fn reap(&mut self) {
-        while let Some(done) = self.set.try_join_next_with_id() {
-            let id = match done {
-                Ok((id, ())) => id,
-                Err(error) => error.id(),
-            };
-            self.running.remove(&id);
+    fn reap(&mut self, publisher: &Publication) {
+        while let Some(done) = self.set.try_join_next() {
+            publisher.record_join(&done);
         }
     }
 }
@@ -1383,9 +1385,17 @@ impl VmInventory {
             return;
         };
         let supervisor = &self.supervisor;
-        for generation in supervisor.publisher.revoke_owned(&self.principal, vm) {
-            supervisor.stop_revoked(generation);
-        }
+        let obligations = supervisor.publisher.revoke_owned(&self.principal, vm);
+        // The old lookup-then-enqueue gap: the obligations are recorded, and
+        // only their runners are not yet spawned.
+        #[cfg(test)]
+        let _gap = supervisor
+            .stall_revoked
+            .lock()
+            .ok()
+            .and_then(|mut stall| stall.take())
+            .map(tests::StallHook::enter);
+        supervisor.spawn_stops(obligations);
     }
 
     fn publication(&self, gate: &mut Gate, action: i64, request: Mutation) -> Outcome<Value> {
@@ -1405,7 +1415,9 @@ impl VmInventory {
         // which reconciles both. Only a live connector whose stop is still
         // unconfirmed closes publish admission, and a later confirmed stop
         // reopens it.
-        while gate.publish_jobs.try_join_next().is_some() {}
+        while let Some(joined) = gate.publish_jobs.try_join_next() {
+            supervisor.publisher.record_join(&joined);
+        }
         supervisor.reap_stops();
         if publish && supervisor.publisher.stop_unconfirmed() {
             return refuse(Refusal::StateUnavailable);
@@ -1453,9 +1465,14 @@ impl VmInventory {
         let publisher = &supervisor.publisher;
         // Registered before the admission transaction, so an owner unpublish
         // that races it still revokes this activation.
-        let activation = prepared
-            .is_some()
-            .then(|| publisher.register(vm, &self.principal));
+        let activation = match prepared
+            .as_ref()
+            .map(|(intent, _, _)| publisher.register(vm, &self.principal, &intent.nonce))
+        {
+            // Sealed for shutdown after the fence check above.
+            Some(None) => return Err(SHUTDOWN),
+            registered => registered.flatten(),
+        };
         #[cfg(test)]
         let _registered = supervisor
             .stall_admission
@@ -1492,9 +1509,8 @@ impl VmInventory {
         } else {
             // The admitted unpublish committed `revoking`: revoke again for an
             // activation admitted between the early check and this point.
-            for generation in publisher.revoke(vm) {
-                supervisor.stop_revoked(generation);
-            }
+            let obligations = publisher.revoke(vm);
+            supervisor.spawn_stops(obligations);
         }
         let supervisor = supervisor.clone();
         gate.publish_jobs.spawn(async move {
@@ -3029,7 +3045,7 @@ mod tests {
                     if let Some(origin) =
                         boot.as_ref().and_then(|boot| boot.publish_origin.as_ref())
                     {
-                        origin.retired.cancel();
+                        origin.retired.retire();
                     }
                     let supervisor = inventory.supervisor.clone();
                     let controller = controller.clone();
@@ -3100,7 +3116,7 @@ mod tests {
                         };
                         if let Some(boot) = retired {
                             if let Some(origin) = &boot.publish_origin {
-                                origin.retired.cancel();
+                                origin.retired.retire();
                             }
                             supervisor.publisher.stop_local(Some(vm)).await;
                             boot.release().await?;
@@ -3388,7 +3404,7 @@ mod tests {
                     size: 1,
                     sha256: [1; 32],
                 },
-                retired: Shutdown::default(),
+                retired: Default::default(),
             });
             boot.origin = Some(origin);
             Ok(boot)
@@ -3465,7 +3481,7 @@ mod tests {
 
         async fn release(self) -> Result<()> {
             if let Some(origin) = &self.publish_origin {
-                origin.retired.cancel();
+                origin.retired.retire();
             }
             drop(self.qmp);
             drop(self.channel);
@@ -4465,8 +4481,8 @@ mod tests {
     /// Joins every settled deferred revocation stop; true once none remain.
     fn revocations_settled(supervisor: &Supervisor) -> bool {
         let mut stops = supervisor.stops.lock().unwrap();
-        stops.reap();
-        stops.set.is_empty() && stops.running.is_empty()
+        stops.reap(&supervisor.publisher);
+        stops.set.is_empty() && supervisor.publisher.stop_obligations() == 0
     }
 
     fn stops_spawned(supervisor: &Supervisor) -> usize {
@@ -5209,7 +5225,7 @@ mod tests {
         }
         entered(in_gate).await;
         assert_eq!(stops_spawned(h.supervisor()), spawned + 1);
-        assert_eq!(h.supervisor().stops.lock().unwrap().running.len(), 1);
+        assert_eq!(h.supervisor().publisher.stop_obligations(), 1);
         release.send(()).unwrap();
         until(|| revocations_settled(h.supervisor())).await;
         assert!(!fake.local.load(SeqCst));
@@ -5614,6 +5630,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_revocation_is_authorized_generation_scoped_and_never_replayed() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let b = h.client(1).await;
+        let (vm, fake) = enrolled(&h, &a, 1700).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let unpublishes = |h: &Harness| {
+            h.supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| {
+                    Ok(db.query_row(
+                        "SELECT count(*) FROM activity WHERE action=16",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        let runners_idle = |h: &Harness| {
+            let supervisor = h.supervisor();
+            let mut stops = supervisor.stops.lock().unwrap();
+            stops.reap(&supervisor.publisher);
+            stops.set.is_empty()
+        };
+
+        // A connector start parked before readiness holds the local slot.
+        // Another principal neither sees nor revokes it; the owner's colliding
+        // call aborts the start.
+        let (start, in_start, _release) = gate();
+        *fake.start_gate.lock().unwrap() = Some(start);
+        let starts = fake.starts.load(SeqCst);
+        let pending = call(&a, "publish_site", args(1710)).await;
+        entered(in_start).await;
+        assert_eq!(
+            call(&b, "unpublish_site", args(1711)).await["reason"],
+            "not_found"
+        );
+        assert_eq!(h.supervisor().publisher.stop_obligations(), 0);
+        assert_eq!(
+            call(&a, "unpublish_site", args(1710)).await["reason"],
+            "key_collision"
+        );
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (&json!("failed"), &json!("cancelled"), &json!("confirmed")),
+            "{failed}"
+        );
+        assert_eq!(fake.starts.load(SeqCst), starts + 1);
+        assert!(!fake.local.load(SeqCst));
+        assert_eq!(fake.posts.load(SeqCst), 0);
+        until(|| revocations_settled(h.supervisor())).await;
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+
+        // A failed stop stays retryable with one obligation per generation:
+        // a duplicate request coalesces while it runs, and the next request
+        // after the failure retries it.
+        let published = call(&a, "publish_site", args(1712)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        fake.stop_failures.store(1, SeqCst);
+        let (stop, stop_entered, release_stop) = gate();
+        *h.supervisor().publisher.stop_gate.lock().unwrap() = Some(stop);
+        let spawned = stops_spawned(h.supervisor());
+        assert_eq!(
+            call(&a, "unpublish_site", args(1712)).await["reason"],
+            "key_collision"
+        );
+        entered(stop_entered).await;
+        assert_eq!(
+            call(&a, "unpublish_site", args(1712)).await["reason"],
+            "key_collision"
+        );
+        assert_eq!(
+            (
+                stops_spawned(h.supervisor()),
+                h.supervisor().publisher.stop_obligations()
+            ),
+            (spawned + 1, 1)
+        );
+        release_stop.send(()).unwrap();
+        until(|| h.supervisor().publisher.stop_unconfirmed() && runners_idle(&h)).await;
+        assert!(fake.local.load(SeqCst));
+        assert_eq!(h.supervisor().publisher.stop_obligations(), 1);
+        assert_eq!(
+            call(&a, "unpublish_site", args(1712)).await["reason"],
+            "key_collision"
+        );
+        until(|| !fake.local.load(SeqCst)).await;
+        until(|| revocations_settled(h.supervisor())).await;
+        assert_eq!(stops_spawned(h.supervisor()), spawned + 2);
+        assert!(!h.supervisor().publisher.stop_unconfirmed());
+        assert_eq!(settle(&h, &a, &vm).await["reason"], "cancelled");
+
+        // Generation n ends through an admitted owner unpublish.
+        let old = call(&a, "publish_site", args(1713)).await;
+        assert_eq!(terminal(&a, &old).await["state"], "succeeded");
+        let first = call(&a, "unpublish_site", args(1714)).await;
+        assert_eq!(terminal(&a, &first).await["state"], "succeeded");
+        // Generation n+1 is live.
+        let published = call(&a, "publish_site", args(1715)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert!(fake.local.load(SeqCst));
+        let (starts, receipts) = (fake.starts.load(SeqCst), unpublishes(&h));
+        // Replaying the old unpublish returns its receipt and admits nothing.
+        // The newly delivered authenticated owner call still revokes the live
+        // generation as a safety revoke.
+        let replayed = call(&a, "unpublish_site", args(1714)).await;
+        assert_eq!(
+            replayed["operation_id"], first["operation_id"],
+            "{replayed}"
+        );
+        until(|| !fake.local.load(SeqCst)).await;
+        assert_eq!(unpublishes(&h), receipts);
+        assert_eq!(phase(&a, &vm).await["phase"], "published");
+        assert_eq!(settle(&h, &a, &vm).await["reason"], "cancelled");
+        // Replaying the old publish recreates no effect.
+        let replayed = call(&a, "publish_site", args(1713)).await;
+        assert_eq!(replayed["operation_id"], old["operation_id"], "{replayed}");
+        assert_eq!(fake.starts.load(SeqCst), starts);
+        assert!(!fake.local.load(SeqCst));
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        drop((a, b));
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_failed_revoking_checkpoint_keeps_the_owner_cause() {
         let mut h = Harness::start_with_web(false, false, true).await;
         let a = h.client(0).await;
@@ -5647,58 +5791,90 @@ mod tests {
         h.shutdown().await.unwrap();
     }
 
+    /// A revocation linearized before the seal recorded its stop obligation;
+    /// its dispatch is parked at the old lookup-then-enqueue gap, so no runner
+    /// exists. The drain runs that obligation before it clears the registry,
+    /// and the runner spawned after the drain finds nothing to stop.
     #[tokio::test]
-    async fn shutdown_joins_a_stop_queued_after_its_snapshot() {
+    async fn a_stop_recorded_before_the_seal_settles_before_the_registry_clears() {
+        use std::sync::atomic::Ordering::SeqCst;
         let mut h = Harness::start_with_web(false, false, true).await;
         let a = h.client(0).await;
-        let (vm, _fake) = enrolled(&h, &a, 1460).await;
-        // A registration with no connector, held by its worker.
-        let (worker, worker_entered, release_worker) = gate();
-        *h.supervisor().publisher.activate_gate.lock().unwrap() = Some(worker);
-        let pending = call(
+        let (vm, fake) = enrolled(&h, &a, 1460).await;
+        let published = call(
             &a,
             "publish_site",
             json!({"vm_id":vm,"request_id":key(1470)}),
         )
         .await;
-        assert_eq!(pending["ok"], true, "{pending}");
-        entered(worker_entered).await;
-        let (stop, stop_entered, release_stop) = gate();
-        *h.supervisor().publisher.stop_gate.lock().unwrap() = Some(stop);
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         let supervisor = h.supervisor().clone();
+        let mut parked = Stall::install(&supervisor.stall_revoked);
+        let inventory = supervisor.connection("alpha".into()).inventory();
+        let late_vm = vm.clone();
+        let dispatch = tokio::task::spawn_blocking(move || {
+            inventory.dispatch(
+                request(
+                    "unpublish_site",
+                    json!({"vm_id":late_vm,"request_id":key(1471)}),
+                ),
+                || false,
+            )
+        });
+        parked.entered().await;
+        assert_eq!(supervisor.publisher.stop_obligations(), 1);
+        let spawned = stops_spawned(&supervisor);
+        supervisor.publisher.events.lock().unwrap().clear();
+        drop(a);
+        h.shutdown().await.unwrap();
+        assert_eq!(
+            *supervisor.publisher.events.lock().unwrap(),
+            vec!["stopped", "cleared"],
+            "the registry was cleared before the recorded stop ran"
+        );
+        assert_eq!(supervisor.publisher.stop_obligations(), 0);
+        assert_eq!(stops_spawned(&supervisor), spawned);
+        assert!(!fake.local.load(SeqCst));
+        // The parked dispatch resumes after the drain and spawns its runner,
+        // which finds no obligation and changes nothing.
+        parked.release_and_join().await;
+        assert!(dispatch.await.unwrap().is_err());
+        assert_eq!(stops_spawned(&supervisor), spawned + 1);
+        until(|| revocations_settled(&supervisor)).await;
+        assert_eq!(
+            *supervisor.publisher.events.lock().unwrap(),
+            vec!["stopped", "cleared"]
+        );
+        assert_eq!(supervisor.publisher.registry_len(), 0);
+    }
+
+    /// An accepted stop is running, held across drain entry. The drain waits
+    /// for it before it clears the registry.
+    #[tokio::test]
+    async fn an_accepted_stop_held_across_drain_entry_settles_before_the_registry_clears() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1560).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let published = call(&a, "publish_site", args(1570)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let supervisor = h.supervisor().clone();
+        let (stop, stop_entered, release_stop) = gate();
+        *supervisor.publisher.stop_gate.lock().unwrap() = Some(stop);
+        assert_eq!(
+            call(&a, "unpublish_site", args(1570)).await["reason"],
+            "key_collision"
+        );
+        entered(stop_entered).await;
         supervisor.publisher.events.lock().unwrap().clear();
         let (passed, first_pass) = tokio::sync::oneshot::channel();
         *supervisor.drain_first_pass.lock().unwrap() = Some(passed);
-        let late = supervisor.clone();
-        let late_vm = vm.clone();
         let releaser = tokio::spawn(async move {
             first_pass.await.unwrap();
-            // An authenticated dispatch whose closure began before the fence
-            // runs only now, after the drain took its stop set.
-            let inventory = late.connection("alpha".into()).inventory();
-            let reply = tokio::task::spawn_blocking(move || {
-                inventory.dispatch(
-                    request(
-                        "unpublish_site",
-                        json!({"vm_id":late_vm,"request_id":key(1471)}),
-                    ),
-                    || false,
-                )
-            })
-            .await
-            .unwrap();
-            assert!(reply.is_err());
-            entered(stop_entered).await;
-            release_worker.send(()).unwrap();
-            // A drain that missed the late stop would clear the registry now.
-            let _ = tokio::time::timeout(Duration::from_millis(300), async {
-                while !late.publisher.events.lock().unwrap().contains(&"cleared") {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-            })
-            .await;
-            // A drain that dropped the late stop unjoined also dropped its gate.
-            let _ = release_stop.send(());
+            // Long enough for a drain that skipped the running stop to clear.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            release_stop.send(()).unwrap();
         });
         drop(a);
         h.shutdown().await.unwrap();
@@ -5706,7 +5882,68 @@ mod tests {
         assert_eq!(
             *supervisor.publisher.events.lock().unwrap(),
             vec!["stopped", "cleared"],
-            "the registry was cleared before the late stop joined"
+            "the registry was cleared before the accepted stop completed"
+        );
+        assert_eq!(supervisor.publisher.stop_obligations(), 0);
+        assert!(!fake.local.load(SeqCst));
+    }
+
+    /// A dispatch whose revocation runs only after the seal has no authority:
+    /// it records no stop obligation, spawns no runner and changes no
+    /// connector. The registered worker settles and only then is the registry
+    /// cleared.
+    #[tokio::test]
+    async fn a_revocation_after_the_seal_records_no_stop() {
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, _fake) = enrolled(&h, &a, 1660).await;
+        let (worker, worker_entered, release_worker) = gate();
+        *h.supervisor().publisher.activate_gate.lock().unwrap() = Some(worker);
+        let pending = call(
+            &a,
+            "publish_site",
+            json!({"vm_id":vm,"request_id":key(1670)}),
+        )
+        .await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        entered(worker_entered).await;
+        let supervisor = h.supervisor().clone();
+        supervisor.publisher.events.lock().unwrap().clear();
+        let spawned = stops_spawned(&supervisor);
+        let (passed, first_pass) = tokio::sync::oneshot::channel();
+        *supervisor.drain_first_pass.lock().unwrap() = Some(passed);
+        let late = supervisor.clone();
+        let late_vm = vm.clone();
+        let releaser = tokio::spawn(async move {
+            first_pass.await.unwrap();
+            let inventory = late.connection("alpha".into()).inventory();
+            let reply = tokio::task::spawn_blocking(move || {
+                inventory.dispatch(
+                    request(
+                        "unpublish_site",
+                        json!({"vm_id":late_vm,"request_id":key(1671)}),
+                    ),
+                    || false,
+                )
+            })
+            .await
+            .unwrap();
+            let recorded = (late.publisher.stop_obligations(), stops_spawned(&late));
+            release_worker.send(()).unwrap();
+            (reply.is_err(), recorded)
+        });
+        drop(a);
+        h.shutdown().await.unwrap();
+        let (refused, recorded) = releaser.await.unwrap();
+        assert!(refused);
+        assert_eq!(
+            recorded,
+            (0, spawned),
+            "a revocation after the seal recorded a stop"
+        );
+        assert_eq!(
+            *supervisor.publisher.events.lock().unwrap(),
+            vec!["cleared"]
         );
         assert_eq!(supervisor.publisher.registry_len(), 0);
     }
