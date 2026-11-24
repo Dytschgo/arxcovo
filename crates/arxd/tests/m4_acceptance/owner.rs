@@ -1,27 +1,47 @@
 use super::*;
-use arxd::vm::paths::LocalPath;
-use ledger::{Claim, Id, Ledger, Pair, PairProof, config, digest, id, open, pin_root, safe};
-use rmcp::{RoleClient, model::CallToolRequestParams, service::RunningService};
+use arxd::{
+    config::{ExpectedVmStore, pinned_vm_config, with_enrolled_vm_store},
+    local::{
+        ClientConfig, ForegroundBridgeError, LoadedClient, RESPONSE_LIMIT, bind_foreground_bridge,
+    },
+    vm::paths::{FileIdentity, LocalPath},
+};
+use ledger::{
+    Claim, Id, Ledger, LiveLedger, Pair, PairProof, config, digest, id, open, pin_root, safe,
+};
+use rmcp::{
+    RoleClient, ServiceExt, model::CallToolRequestParams, service::RunningService,
+    transport::async_rw::AsyncRwTransport,
+};
 use serde::Deserialize;
 use std::{
     env,
     fs::{self, File, OpenOptions},
     io::Write,
+    os::windows::io::AsRawHandle,
     path::{Path, PathBuf},
     process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     process::{Child, Command},
+    task::JoinSet,
     time::timeout,
 };
 use windows_sys::Win32::{
     Foundation::{ERROR_FILE_NOT_FOUND, GetLastError},
-    Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE},
+    Storage::FileSystem::{
+        FILE_ID_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx,
+        GetFinalPathNameByHandleW, GetVolumeNameForVolumeMountPointW, VOLUME_NAME_GUID,
+    },
     System::{Console::*, Pipes::WaitNamedPipeW},
 };
 
 mod ledger;
+
+#[cfg(test)]
+#[path = "../vault_fixtures/private.rs"]
+mod private_fixture;
 
 const RPC: Duration = Duration::from_secs(15);
 const TICK: Duration = Duration::from_secs(2);
@@ -38,6 +58,7 @@ struct Plan {
     daemon_sha256: String,
     daemon_config: PathBuf,
     client_config: PathBuf,
+    store: ExpectedVmStore,
     qualification_sha256: Option<String>,
     evidence_dir: PathBuf,
     ubuntu: Recipe,
@@ -62,11 +83,6 @@ struct Foreground {
 }
 
 #[derive(Deserialize)]
-struct BridgeConfig {
-    address: String,
-}
-
-#[derive(Deserialize)]
 struct VmProfile {
     #[serde(default)]
     allow_agent_public_sites: bool,
@@ -77,6 +93,7 @@ struct VmProfile {
 #[derive(Deserialize)]
 struct RuntimeRoot {
     state: PathBuf,
+    volume: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -185,7 +202,7 @@ async fn terminal(client: &Client, operation: Id, budget: Duration) -> Result<Va
 
 struct Acceptance<'a> {
     client: &'a Client,
-    ledger: Ledger,
+    ledger: LiveLedger,
     evidence: &'a mut Evidence,
     principal: &'a str,
     operations: Vec<Operation>,
@@ -286,7 +303,7 @@ impl Acceptance<'_> {
             let (_, label, action) = op.action.wire();
             let activity = self
                 .ledger
-                .activity(operation, op.request, self.principal, action)?;
+                .read(|ledger| ledger.activity(operation, op.request, self.principal, action))?;
             let row = self.activity(activity).await?;
             check(
                 row["identity_mode"] == "local_vm_principal"
@@ -332,13 +349,16 @@ impl Acceptance<'_> {
             check(built["recipe_id"] == recipe.recipe_id, "build_recipe")?;
             id(&built, "template_id")?
         };
-        let (pair, charge) = self.ledger.golden(
-            template,
-            &recipe.recipe_id,
-            &recipe.recipe_sha256,
-            guest.code(),
-        )?;
-        let proof = self.ledger.inspect(&pair, None, true)?;
+        let (pair, charge, proof) = self.ledger.read(|ledger| {
+            let (pair, charge) = ledger.golden(
+                template,
+                &recipe.recipe_id,
+                &recipe.recipe_sha256,
+                guest.code(),
+            )?;
+            let proof = ledger.inspect(&pair, None, true)?;
+            Ok((pair, charge, proof))
+        })?;
         self.evidence.record("sealed_template", json!({"guest":guest.label(),"template_id":hex::encode(template),
             "recipe_id":recipe.recipe_id,"recipe_sha256":recipe.recipe_sha256,
             "generation":hex::encode(Ledger::generation(&pair)),"charge":charge,"pair":proof.evidence()}));
@@ -378,14 +398,16 @@ impl Acceptance<'_> {
         )?;
         let lease = LeaseClock::new(issued_at, deadline, ttl_duration, RPC)?;
         lease.check_clock(clock_sample()?)?;
-        let pair = self.ledger.vm_pair(vm)?;
-        self.ledger.distinct(&golden.pair, &pair)?;
-        let proof = self.ledger.inspect(&pair, Some(&golden.pair), false)?;
+        let (pair, proof, claim) = self.ledger.read(|ledger| {
+            let pair = ledger.vm_pair(vm)?;
+            ledger.distinct(&golden.pair, &pair)?;
+            let proof = ledger.inspect(&pair, Some(&golden.pair), false)?;
+            Ok((pair, proof, ledger.charge(vm)?))
+        })?;
         check(
             proof.contents[1] == golden.proof.contents[1],
             "clone_vars_initial_pin",
         )?;
-        let claim = self.ledger.charge(vm)?;
         check(
             claim.active > 0 && claim.snapshot == 0 && claim.staged == 0 && claim.generations == 1,
             "clone_charge",
@@ -396,19 +418,19 @@ impl Acceptance<'_> {
             "deadline_ms":deadline,"pair":proof.evidence(),"charges":claim.evidence()}),
         );
         if replay {
-            let before = self.ledger.effect(vm)?;
+            let before = self.ledger.read(|ledger| ledger.effect(vm))?;
             let second = rpc(self.client, "vm_create", args).await?;
             let second_row = terminal(self.client, id(&second, "operation_id")?, VM_WORK).await?;
-            retry_unchanged(&receipt, &second, &before, &self.ledger.effect(vm)?)?;
+            let after = self.ledger.read(|ledger| ledger.effect(vm))?;
+            retry_unchanged(&receipt, &second, &before, &after)?;
             check(
                 second_row == completed
                     && self.vm(vm).await? == status
-                    && self.ledger.vm_pair(vm)? == pair
-                    && self
-                        .ledger
-                        .inspect(&pair, Some(&golden.pair), false)?
-                        .contents
-                        == proof.contents,
+                    && self.ledger.read(|ledger| {
+                        Ok(ledger.vm_pair(vm)? == pair
+                            && ledger.inspect(&pair, Some(&golden.pair), false)?.contents
+                                == proof.contents)
+                    })?,
                 "retry_clone_unchanged",
             )?;
             self.evidence.record(
@@ -436,7 +458,8 @@ impl Acceptance<'_> {
             "fresh_ready_boot",
         )?;
         let epoch = id(&started, "operation_id")?;
-        self.ledger.release(&vm.pair, epoch, false)?;
+        self.ledger
+            .read(|ledger| ledger.release(&vm.pair, epoch, false))?;
         if matches!(guest, Guest::Windows) {
             let witness = windows_boot_witness(
                 &state,
@@ -464,7 +487,8 @@ impl Acceptance<'_> {
             .await?;
         succeeded(&stopped)?;
         self.stopped(vm).await?;
-        self.ledger.release(&vm.pair, epoch, true)?;
+        self.ledger
+            .read(|ledger| ledger.release(&vm.pair, epoch, true))?;
         self.evidence.record(
             "clean_release",
             json!({"vm_id":hex::encode(vm.id),"epoch":hex::encode(epoch),
@@ -562,13 +586,14 @@ impl Acceptance<'_> {
                 && tombstone["ready"] == false,
             "expiry_proof",
         )?;
-        self.ledger
-            .expiry(vm.id, self.principal, activity, vm.deadline, expired)?;
-        check(self.ledger.gone(&vm.pair)?, "expired_pair_gone")?;
-        if let Some(pair) = extra {
-            check(self.ledger.gone(pair)?, "expired_snapshot_gone")?;
-        }
-        let charge = self.ledger.charge(vm.id)?;
+        let charge = self.ledger.read(|ledger| {
+            ledger.expiry(vm.id, self.principal, activity, vm.deadline, expired)?;
+            check(ledger.gone(&vm.pair)?, "expired_pair_gone")?;
+            if let Some(pair) = extra {
+                check(ledger.gone(pair)?, "expired_snapshot_gone")?;
+            }
+            ledger.charge(vm.id)
+        })?;
         check(
             charge
                 == (Claim {
@@ -699,38 +724,39 @@ async fn catalog(client: &Client, plan: &Plan) -> Result<(Vec<Value>, String)> {
 }
 
 async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) -> Result<()> {
-    accept.ledger.quiet()?;
-    let initial = accept.ledger.goldens()?;
-    let mut initial_goldens = Vec::new();
-    for (recipe, guest) in [
-        (&plan.ubuntu, Guest::Ubuntu),
-        (&plan.windows, Guest::Windows),
-    ] {
-        for entry in entries.iter().filter(|entry| {
-            entry["state"] == "sealed"
-                && entry["recipe_id"] == recipe.recipe_id
-                && entry["guest"] == guest.label()
-        }) {
-            let (pair, _) = accept.ledger.golden(
-                id(entry, "template_id")?,
-                &recipe.recipe_id,
-                &recipe.recipe_sha256,
-                guest.code(),
-            )?;
-            initial_goldens.push(pair);
+    let (initial, charged_bytes, ledger_bytes) = accept.ledger.read(|ledger| {
+        ledger.quiet()?;
+        let initial = ledger.goldens()?;
+        let mut initial_goldens = Vec::new();
+        for (recipe, guest) in [
+            (&plan.ubuntu, Guest::Ubuntu),
+            (&plan.windows, Guest::Windows),
+        ] {
+            for entry in entries.iter().filter(|entry| {
+                entry["state"] == "sealed"
+                    && entry["recipe_id"] == recipe.recipe_id
+                    && entry["guest"] == guest.label()
+            }) {
+                let (pair, _) = ledger.golden(
+                    id(entry, "template_id")?,
+                    &recipe.recipe_id,
+                    &recipe.recipe_sha256,
+                    guest.code(),
+                )?;
+                initial_goldens.push(pair);
+            }
         }
-    }
-    check(
-        initial.len() == initial_goldens.len() && initial.len() <= 2,
-        "isolated_golden_inventory",
-    )?;
-    accept
-        .ledger
-        .inventory(&initial_goldens.iter().collect::<Vec<_>>())?;
+        check(
+            initial.len() == initial_goldens.len() && initial.len() <= 2,
+            "isolated_golden_inventory",
+        )?;
+        ledger.inventory(&initial_goldens.iter().collect::<Vec<_>>())?;
+        Ok((initial, ledger.aggregate()?, ledger.metadata_bytes()?))
+    })?;
     accept.evidence.record(
         "initial_ledger",
         json!({"golden_templates":initial.iter().map(hex::encode).collect::<Vec<_>>(),
-        "charged_bytes":accept.ledger.aggregate()?,"ledger_bytes":accept.ledger.metadata_bytes()?}),
+        "charged_bytes":charged_bytes,"ledger_bytes":ledger_bytes}),
     );
     let ubuntu = accept
         .template(entries, &plan.ubuntu, Guest::Ubuntu)
@@ -738,7 +764,9 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
     let windows = accept
         .template(entries, &plan.windows, Guest::Windows)
         .await?;
-    accept.ledger.distinct(&ubuntu.pair, &windows.pair)?;
+    accept
+        .ledger
+        .read(|ledger| ledger.distinct(&ubuntu.pair, &windows.pair))?;
     let mut u = accept
         .clone(&ubuntu, Guest::Ubuntu, UBUNTU_TTL, true)
         .await?;
@@ -746,8 +774,10 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
         .clone(&windows, Guest::Windows, WINDOWS_TTL, false)
         .await?;
     check(u.deadline < w.deadline, "lease_order")?;
-    accept.ledger.distinct(&u.pair, &w.pair)?;
-    let windows_charge = accept.ledger.charge(w.id)?;
+    let windows_charge = accept.ledger.read(|ledger| {
+        ledger.distinct(&u.pair, &w.pair)?;
+        ledger.charge(w.id)
+    })?;
 
     let u_marker = hex::encode(fresh()?);
     let changed = hex::encode(fresh()?);
@@ -758,7 +788,9 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
         "set -euC\numask 077\nprintf '%s' '{u_marker}' > '{path}'\ncat /proc/sys/kernel/random/boot_id > '{path}.boot'\ntest \"$(cat '{path}')\" = '{u_marker}'"
     ), 0).await?;
     accept.stop(&u, u_first).await?;
-    let baseline = accept.ledger.inspect(&u.pair, Some(&ubuntu.pair), false)?;
+    let baseline = accept
+        .ledger
+        .read(|ledger| ledger.inspect(&u.pair, Some(&ubuntu.pair), false))?;
 
     let w_marker = hex::encode(fresh()?);
     let w_boot = accept.start(&w, Guest::Windows).await?;
@@ -773,10 +805,9 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
         .await?;
     succeeded(&captured)?;
     let point = id(&captured, "snapshot_id")?;
-    let (snapshot, charge) =
-        accept
-            .ledger
-            .point(u.id, point, ubuntu.template, Ledger::generation(&u.pair))?;
+    let (snapshot, charge) = accept
+        .ledger
+        .read(|ledger| ledger.point(u.id, point, ubuntu.template, Ledger::generation(&u.pair)))?;
     let point_list = rpc(accept.client, "vm_snapshot_list", json!({"vm_id":vm})).await?;
     check(
         point_list["vm_id"] == vm
@@ -789,8 +820,10 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
             }),
         "snapshot_list",
     )?;
-    accept.ledger.distinct(&u.pair, &snapshot)?;
-    let saved = accept.ledger.inspect(&snapshot, Some(&ubuntu.pair), true)?;
+    let saved = accept.ledger.read(|ledger| {
+        ledger.distinct(&u.pair, &snapshot)?;
+        ledger.inspect(&snapshot, Some(&ubuntu.pair), true)
+    })?;
     check(
         saved.contents == baseline.contents && charge > 0,
         "snapshot_pair_copied",
@@ -821,34 +854,40 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
         "restore_commit",
     )?;
     accept.stopped(&u).await?;
-    let old = std::mem::replace(&mut u.pair, accept.ledger.vm_pair(u.id)?);
-    accept.ledger.distinct(&old, &u.pair)?;
-    accept.ledger.distinct(&snapshot, &u.pair)?;
-    let current = accept.ledger.inspect(&u.pair, Some(&ubuntu.pair), false)?;
+    let (pair, current) = accept.ledger.read(|ledger| {
+        let pair = ledger.vm_pair(u.id)?;
+        ledger.distinct(&u.pair, &pair)?;
+        ledger.distinct(&snapshot, &pair)?;
+        let proof = ledger.inspect(&pair, Some(&ubuntu.pair), false)?;
+        Ok((pair, proof))
+    })?;
+    let old = std::mem::replace(&mut u.pair, pair);
     check(
         current.contents == saved.contents,
         "restored_pair_matches_snapshot",
     )?;
     let restore_op = id(&restored, "operation_id")?;
     let retired = poll("retired_generation_sweep", EXPIRY_GRACE, TICK, || async {
-        if !accept.ledger.gone(&old)? {
-            return Ok(None);
-        }
-        let claim = accept.ledger.charge(u.id)?;
-        check(
-            claim.active > 0
-                && claim.snapshot == charge
-                && claim.staged == 0
-                && claim.generations == 2,
-            "retired_charge_released",
-        )?;
-        Ok(Some(accept.ledger.reconciled(
-            u.id,
-            Ledger::generation(&old),
-            "retired",
-            Some(restore_op),
-            None,
-        )?))
+        accept.ledger.read(|ledger| {
+            if !ledger.gone(&old)? {
+                return Ok(None);
+            }
+            let claim = ledger.charge(u.id)?;
+            check(
+                claim.active > 0
+                    && claim.snapshot == charge
+                    && claim.staged == 0
+                    && claim.generations == 2,
+                "retired_charge_released",
+            )?;
+            Ok(Some(ledger.reconciled(
+                u.id,
+                Ledger::generation(&old),
+                "retired",
+                Some(restore_op),
+                None,
+            )?))
+        })
     })
     .await?;
     accept.evidence.record(
@@ -870,56 +909,62 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
 
     accept.stopped(&w).await?;
     let u_expiry = accept.expiry(&u, Some(&snapshot), Some(&w)).await?;
-    let snapshot_cleanup = accept.ledger.reconciled(
-        u.id,
-        Ledger::generation(&snapshot),
-        "expiry_point",
-        None,
-        Some(u_expiry),
-    )?;
+    let snapshot_cleanup = accept.ledger.read(|ledger| {
+        ledger.reconciled(
+            u.id,
+            Ledger::generation(&snapshot),
+            "expiry_point",
+            None,
+            Some(u_expiry),
+        )
+    })?;
     accept.evidence.record(
         "snapshot_expired",
         json!({"snapshot_id":hex::encode(point),
         "reconciliation_activity_id":snapshot_cleanup,"expiry_activity_id":u_expiry}),
     );
     accept.stopped(&w).await?;
-    check(
-        windows_charge == accept.ledger.charge(w.id)? && windows_charge.active > 0,
-        "windows_separately_charged",
-    )?;
-    accept.ledger.inspect(&w.pair, Some(&windows.pair), false)?;
+    accept.ledger.read(|ledger| {
+        check(
+            windows_charge == ledger.charge(w.id)? && windows_charge.active > 0,
+            "windows_separately_charged",
+        )?;
+        ledger.inspect(&w.pair, Some(&windows.pair), false)
+    })?;
     accept
         .evidence
         .record("windows_still_charged", windows_charge.evidence());
     accept.expiry(&w, None, None).await?;
 
-    for (golden, recipe, guest) in [
-        (&ubuntu, &plan.ubuntu, Guest::Ubuntu),
-        (&windows, &plan.windows, Guest::Windows),
-    ] {
-        let (after, charge) = accept.ledger.golden(
-            golden.template,
-            &recipe.recipe_id,
-            &recipe.recipe_sha256,
-            guest.code(),
-        )?;
-        check(
-            after == golden.pair
-                && charge == golden.charge
-                && accept.ledger.inspect(&after, None, true)? == golden.proof,
-            "golden_unchanged",
-        )?;
-    }
-    accept.ledger.quiet()?;
-    accept.ledger.inventory(&[&ubuntu.pair, &windows.pair])?;
-    let remaining = accept.ledger.aggregate()?;
+    let (remaining, ledger_bytes) = accept.ledger.read(|ledger| {
+        for (golden, recipe, guest) in [
+            (&ubuntu, &plan.ubuntu, Guest::Ubuntu),
+            (&windows, &plan.windows, Guest::Windows),
+        ] {
+            let (after, charge) = ledger.golden(
+                golden.template,
+                &recipe.recipe_id,
+                &recipe.recipe_sha256,
+                guest.code(),
+            )?;
+            check(
+                after == golden.pair
+                    && charge == golden.charge
+                    && ledger.inspect(&after, None, true)? == golden.proof,
+                "golden_unchanged",
+            )?;
+        }
+        ledger.quiet()?;
+        ledger.inventory(&[&ubuntu.pair, &windows.pair])?;
+        Ok((ledger.aggregate()?, ledger.metadata_bytes()?))
+    })?;
     check(
         remaining == ubuntu.charge + windows.charge,
         "remaining_charges",
     )?;
     accept.evidence.record("final_ledger",json!({"goldens_unchanged":true,"golden_charged_bytes":remaining,
         "golden_allocated_bytes":ubuntu.proof.allocated.iter().chain(windows.proof.allocated.iter()).sum::<u64>(),
-        "non_golden_charged_bytes":0,"unattributed_media":0,"ledger_bytes":accept.ledger.metadata_bytes()?}));
+        "non_golden_charged_bytes":0,"unattributed_media":0,"ledger_bytes":ledger_bytes}));
     accept.correlate().await
 }
 
@@ -978,17 +1023,307 @@ impl Drop for Console {
     }
 }
 
-fn spawn_daemon(plan: &Plan) -> Result<Child> {
+fn spawn_daemon(plan: &Plan, pinned_config: &Path) -> Result<Child> {
     safe(
         Command::new(&plan.daemon)
             .arg("--config")
-            .arg(&plan.daemon_config)
+            .arg(pinned_config)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn(),
         "foreground_spawn",
     )
+}
+
+fn prepare_pinned_config(source: &Path, expected: &ExpectedVmStore) -> Result<tempfile::TempPath> {
+    let bytes = safe(pinned_vm_config(source, expected), "foreground_config_pin")?;
+    let parent = source.parent().ok_or(Failure::Check("input_parent"))?;
+    let mut config = safe(
+        tempfile::NamedTempFile::new_in(parent),
+        "foreground_config_copy",
+    )?;
+    safe(config.write_all(&bytes), "foreground_config_copy")?;
+    safe(config.as_file().sync_all(), "foreground_config_copy")?;
+    Ok(config.into_temp_path())
+}
+
+#[cfg(test)]
+fn fixture_foreground(state: &Path) -> (Value, String) {
+    let address = format!(
+        r"\\.\pipe\arxcovo-m4-startup-{}",
+        hex::encode(fresh().unwrap())
+    );
+    let profile = json!({
+        "state_dir": state,
+        "agents": [{"principal": "fixture", "token_sha256": "a".repeat(64)}],
+        "local": {"address": address, "client_identity": "S-1-5-21-100-200-300-1001"},
+        "test_vms": {"enabled": false}
+    });
+    (profile, address)
+}
+
+#[cfg(test)]
+fn fixture_command(config: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_arxd"));
+    command.arg("--config").arg(config).kill_on_drop(true);
+    command
+}
+
+#[cfg(test)]
+fn fixture_expected_store(state: &Path) -> ExpectedVmStore {
+    let folder = open(state, true, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap();
+    let measured = store_identity(&folder).unwrap();
+    let local = local_path(state).unwrap();
+    ExpectedVmStore {
+        volume_guid: mounted_volume(&local.as_str()[..3])
+            .unwrap()
+            .to_ascii_lowercase()
+            .replacen("volume", "Volume", 1),
+        volume_serial: format!("{:016x}", measured.volume),
+        directory_file_id: hex::encode(measured.file),
+    }
+}
+
+#[cfg(test)]
+fn fixture_drive_path(path: &Path) -> &Path {
+    Path::new(path.to_str().unwrap().trim_start_matches(r"\\?\"))
+}
+
+#[cfg(test)]
+fn fixture_set_owner(paths: &[&Path]) {
+    // An elevated test runner can create objects owned by Administrators
+    // instead of TokenUser. The foreground requires the latter.
+    let owner = format!("*{}", private_fixture::identity());
+    for path in paths {
+        assert!(
+            std::process::Command::new("icacls")
+                .arg(path)
+                .arg("/setowner")
+                .arg(&owner)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+#[tokio::test]
+async fn foreground_store_replacement_cannot_open_state_or_startup_sweep() {
+    use arxd::config::{ForegroundConfig, VmStoreIdentityRefusal};
+
+    let fixture = private_fixture::private_dir();
+    let state = fixture_drive_path(fixture.path()).join("state");
+    fs::create_dir(&state).unwrap();
+    let original = fixture_expected_store(&state);
+    let config = fixture.path().join("original.json");
+    let (profile, address) = fixture_foreground(&state);
+    fs::write(&config, profile.to_string()).unwrap();
+    fixture_set_owner(&[fixture.path(), &state, &config]);
+    let launch = fixture.path().join("launch.json");
+    fs::write(&launch, pinned_vm_config(&config, &original).unwrap()).unwrap();
+    fixture_set_owner(&[&launch]);
+    assert!(ForegroundConfig::load(&launch).is_ok());
+
+    let moved = fixture_drive_path(fixture.path()).join("enrolled");
+    fs::rename(&state, &moved).unwrap();
+    fs::create_dir(&state).unwrap();
+    fixture_set_owner(&[&state]);
+    let replacement = fixture_expected_store(&state);
+    assert_ne!(replacement.directory_file_id, original.directory_file_id);
+
+    let exit = timeout(Duration::from_secs(5), fixture_command(&launch).output()).await;
+    assert_eq!(
+        fs::read_dir(&state).unwrap().count(),
+        0,
+        "replacement received state writes"
+    );
+    assert!(
+        require_unused(&address).is_ok(),
+        "replacement bound the listener"
+    );
+    let exit = exit.unwrap().unwrap();
+    assert!(!exit.status.success());
+    assert_eq!(exit.stderr, b"arxd: server-config\n");
+    let refused = ForegroundConfig::load(&launch).err().unwrap();
+    assert!(refused.is::<VmStoreIdentityRefusal>());
+
+    let ledger = with_enrolled_vm_store::<()>(&state, &original, |_| {
+        panic!("replacement reached ledger preflight");
+    });
+    assert!(ledger.unwrap_err().is::<VmStoreIdentityRefusal>());
+
+    fs::remove_dir(&state).unwrap();
+    assert!(
+        std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&state)
+            .arg(&moved)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let refused = ForegroundConfig::load(&launch).err().unwrap();
+    assert!(refused.is::<VmStoreIdentityRefusal>());
+}
+
+#[tokio::test]
+async fn foreground_store_wrong_guid_refuses_before_state_open() {
+    use arxd::config::{ForegroundConfig, VmStoreIdentityRefusal};
+
+    let fixture = private_fixture::private_dir();
+    let state = fixture_drive_path(fixture.path()).join("state");
+    fs::create_dir(&state).unwrap();
+    let mut expected = fixture_expected_store(&state);
+    let (profile, address) = fixture_foreground(&state);
+    let config = fixture.path().join("original.json");
+    fs::write(&config, profile.to_string()).unwrap();
+    fixture_set_owner(&[fixture.path(), &state, &config]);
+    let correct = prepare_pinned_config(&config, &expected).unwrap();
+    fixture_set_owner(&[&correct]);
+    assert!(ForegroundConfig::load(&correct).is_ok());
+
+    let wrong_guid = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\";
+    assert_ne!(expected.volume_guid, wrong_guid);
+    // Keep the actual filesystem serial and 128-bit directory ID.
+    expected.volume_guid = wrong_guid.into();
+    let launch = prepare_pinned_config(&config, &expected).unwrap();
+    fixture_set_owner(&[&launch]);
+    let exit = timeout(Duration::from_secs(5), fixture_command(&launch).output()).await;
+    assert_eq!(
+        fs::read_dir(&state).unwrap().count(),
+        0,
+        "unexpected state writes"
+    );
+    assert!(require_unused(&address).is_ok());
+    let exit = exit.unwrap().unwrap();
+    assert!(!exit.status.success());
+    assert_eq!(exit.stderr, b"arxd: server-config\n");
+    let refused = ForegroundConfig::load(&launch).err().unwrap();
+    assert!(refused.is::<VmStoreIdentityRefusal>());
+}
+
+#[tokio::test]
+async fn foreground_opens_enrolled_state_through_the_stable_volume_path() {
+    let fixture = private_fixture::private_dir();
+    let state = fixture_drive_path(fixture.path()).join("state");
+    fs::create_dir(&state).unwrap();
+    let expected = fixture_expected_store(&state);
+    let (profile, address) = fixture_foreground(&state);
+    let config = fixture.path().join("original.json");
+    fs::write(&config, profile.to_string()).unwrap();
+    fixture_set_owner(&[fixture.path(), &state, &config]);
+    let launch = prepare_pinned_config(&config, &expected).unwrap();
+    fixture_set_owner(&[&launch]);
+    let _launch_pin = open(&launch, false, FILE_SHARE_READ).unwrap();
+    let recipes = [("ubuntu", "unused"), ("windows", "unused")];
+    assert_eq!(
+        with_enrolled_vm_store(&state, &expected, |path| Ledger::preflight(path, recipes)).unwrap(),
+        Ok(())
+    );
+    let volume_path = with_enrolled_vm_store(&state, &expected, Path::to_path_buf).unwrap();
+    assert!(volume_path.to_str().unwrap().starts_with(r"\\?\Volume{"));
+    assert!(arxd::config::checked_path(&volume_path).is_err());
+
+    let mut child = fixture_command(&launch).spawn().unwrap();
+    assert_eq!(ready(&mut child, &address).await, Ok(()));
+    assert!(state.join("activity.sqlite3").is_file());
+    assert!(state.join("vault.sqlite3").is_file());
+    child.kill().await.unwrap();
+    assert_eq!(
+        with_enrolled_vm_store(&state, &expected, |path| Ledger::preflight(path, recipes)).unwrap(),
+        Ok(())
+    );
+    let live = LiveLedger::open(&state, &expected).unwrap();
+    assert_eq!(live.read(|ledger| ledger.inventory(&[])), Ok(()));
+}
+
+#[tokio::test]
+async fn enrolled_store_with_compose_secret_root_refuses_at_config_load() {
+    use arxd::config::{ForegroundConfig, VmStoreComposeConflict};
+
+    let fixture = private_fixture::private_dir();
+    let root = fixture_drive_path(fixture.path());
+    let state = root.join("state");
+    let secrets = root.join("secrets");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&secrets).unwrap();
+    let expected = fixture_expected_store(&state);
+    let (mut profile, address) = fixture_foreground(&state);
+    profile["test_vms"]["compose_secret_root"] = json!(secrets);
+    let config = fixture.path().join("original.json");
+    fs::write(&config, profile.to_string()).unwrap();
+    fixture_set_owner(&[fixture.path(), &state, &secrets, &config]);
+    assert!(ForegroundConfig::load(&config).is_ok());
+    let launch = prepare_pinned_config(&config, &expected).unwrap();
+    fixture_set_owner(&[&launch]);
+
+    let exit = timeout(Duration::from_secs(5), fixture_command(&launch).output()).await;
+    assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+    assert!(require_unused(&address).is_ok());
+    let exit = exit.unwrap().unwrap();
+    assert!(!exit.status.success());
+    assert_eq!(exit.stderr, b"arxd: server-config\n");
+    let refused = ForegroundConfig::load(&launch).err().unwrap();
+    assert!(refused.is::<VmStoreComposeConflict>());
+}
+
+#[tokio::test]
+async fn mismatched_endpoint_refuses_foreground_inputs_before_startup() {
+    let fixture = private_fixture::private_dir();
+    let state = fixture_drive_path(fixture.path()).join("state");
+    fs::create_dir(&state).unwrap();
+    let config = fixture.path().join("server.json");
+    let client = fixture.path().join("client.json");
+    let (profile, address) = fixture_foreground(&state);
+    fs::write(&config, profile.to_string()).unwrap();
+    let source = open(&config, false, FILE_SHARE_READ).unwrap();
+    let mut settings = json!({
+        "address": r"\\.\pipe\arxcovo-m4-unrelated",
+        "expected_server_identity": private_fixture::identity(),
+        "token": "a".repeat(64)
+    });
+    fs::write(&client, settings.to_string()).unwrap();
+    fixture_set_owner(&[fixture.path(), &client]);
+    let fixture_recipe = || Recipe {
+        recipe_id: String::new(),
+        recipe_sha256: String::new(),
+    };
+    // A bad store pin acts as a second gate. A mismatched endpoint must stop
+    // the production startup path before it even attempts that gate.
+    let plan = Plan {
+        daemon: fixture.path().join("must-not-launch.exe"),
+        daemon_sha256: String::new(),
+        daemon_config: config,
+        client_config: client.clone(),
+        store: ExpectedVmStore {
+            volume_guid: String::new(),
+            volume_serial: String::new(),
+            directory_file_id: String::new(),
+        },
+        qualification_sha256: None,
+        evidence_dir: fixture.path().join("evidence"),
+        ubuntu: fixture_recipe(),
+        windows: fixture_recipe(),
+        idle_delay_s: 0,
+    };
+    assert_eq!(
+        run_with_inputs(&plan, &source, &[]).await,
+        Err(Failure::Check("bridge_endpoint_binding"))
+    );
+    assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+    assert!(require_unused(&address).is_ok());
+
+    settings["address"] = json!(address);
+    fs::write(&client, settings.to_string()).unwrap();
+    let source = open(&plan.daemon_config, false, FILE_SHARE_READ).unwrap();
+    assert_eq!(
+        run_with_inputs(&plan, &source, &[]).await,
+        Err(Failure::Check("store_volume_pin"))
+    );
 }
 
 fn pipe_name(endpoint: &str) -> Vec<u16> {
@@ -1020,61 +1355,87 @@ async fn ready(daemon: &mut Child, endpoint: &str) -> Result<()> {
     .map_err(|_| Failure::Timeout("foreground_listener"))?
 }
 
-async fn open_bound_bridge(_plan: &Plan, expected_pid: u32) -> Result<(Child, Client)> {
-    // The stdio bridge exposes no kernel peer PID from its own pipe handle.
-    // A future adapter must check that handle BEFORE sending the credential
-    // and retain the same connection through MCP initialization and calls.
-    bind_session_process(expected_pid, None)?;
-    Err(Failure::SessionProcessEvidenceUnavailable)
+fn bridge_failure(error: ForegroundBridgeError) -> Failure {
+    match error {
+        ForegroundBridgeError::EndpointMismatch => Failure::Check("bridge_endpoint_binding"),
+        ForegroundBridgeError::ConnectTimeout => Failure::Timeout("bridge_connect"),
+        ForegroundBridgeError::ConnectRejected => Failure::Check("bridge_connect"),
+        ForegroundBridgeError::ProcessUnavailable => Failure::SessionProcessEvidenceUnavailable,
+        ForegroundBridgeError::ProcessMismatch => Failure::SessionProcessMismatch,
+    }
 }
 
 async fn with_client(
     plan: &Plan,
     foreground: &Foreground,
-    expected_pid: u32,
+    store: &LocalPath,
+    daemon: &Child,
+    config: LoadedClient,
     evidence: &mut Evidence,
 ) -> Result<()> {
-    let (mut bridge, client) = open_bound_bridge(plan, expected_pid).await?;
+    let expected_pid = daemon
+        .id()
+        .ok_or(Failure::SessionProcessEvidenceUnavailable)?;
+    let bound = bind_foreground_bridge(config, &foreground.local.address, expected_pid)
+        .await
+        .map_err(bridge_failure)?;
+    let (sdk, io) = tokio::io::duplex(RESPONSE_LIMIT);
+    let mut bridge = JoinSet::new();
+    bridge.spawn(bound.forward(io));
+
     let observed = async {
-        let discovered = timeout(RPC, client.list_tools(None))
+        let (read, write) = tokio::io::split(sdk);
+        let transport =
+            AsyncRwTransport::new_client(read, write).with_max_line_length(RESPONSE_LIMIT);
+        let initialized = timeout(RPC, ().serve(transport))
             .await
-            .map_err(|_| Failure::Discovery)?
-            .map_err(|_| Failure::Discovery)
-            .and_then(|reply| serde_json::to_value(reply).map_err(|_| Failure::Discovery));
-        discover(discovered)?;
-        // Preflight while idle delay is still running. Closed admission returns
-        // its own reason immediately without touching media or waiting for WTS.
-        let first = rpc(&client, "vm_catalog", json!({})).await?;
-        selected_digest(&first, plan)?;
-        sleep(Duration::from_secs(plan.idle_delay_s)).await;
-        let (entries, selected) = catalog(&client, plan).await?;
-        evidence.qualification_sha256 = Some(selected);
-        let ledger = Ledger::open(&foreground.state_dir)?;
-        let mut acceptance = Acceptance {
-            client: &client,
-            ledger,
-            evidence,
-            principal: &foreground.agents[0].principal,
-            operations: Vec::new(),
-        };
-        journey(&mut acceptance, plan, &entries).await
+            .map_err(|_| Failure::Timeout("bridge_initialize"))?;
+        let client = safe(initialized, "bridge_initialize")?;
+        let journey_result = async {
+            let discovered = timeout(RPC, client.list_tools(None))
+                .await
+                .map_err(|_| Failure::Discovery)?
+                .map_err(|_| Failure::Discovery)
+                .and_then(|reply| serde_json::to_value(reply).map_err(|_| Failure::Discovery));
+            discover(discovered)?;
+            // Closed admission returns its reason before the idle delay.
+            let first = rpc(&client, "vm_catalog", json!({})).await?;
+            selected_digest(&first, plan)?;
+            sleep(Duration::from_secs(plan.idle_delay_s)).await;
+            let (entries, selected) = catalog(&client, plan).await?;
+            evidence.qualification_sha256 = Some(selected);
+            let _store = pin_store(store, &plan.store, mounted_volume)?;
+            let ledger = LiveLedger::open(&foreground.state_dir, &plan.store)?;
+            let mut acceptance = Acceptance {
+                client: &client,
+                ledger,
+                evidence,
+                principal: &foreground.agents[0].principal,
+                operations: Vec::new(),
+            };
+            journey(&mut acceptance, plan, &entries).await
+        }
+        .await;
+        let cancelled = timeout(RPC, client.cancel())
+            .await
+            .map_err(|_| Failure::Timeout("bridge_cancel"))
+            .and_then(|result| safe(result, "bridge_cancel"));
+        journey_result.and(cancelled.map(|_| ()))
     }
     .await;
-    let cancelled = timeout(RPC, client.cancel())
-        .await
-        .map_err(|_| Failure::Timeout("bridge_cancel"))
-        .and_then(|result| safe(result, "bridge_cancel"));
-    // End any remaining bridge process before sending Ctrl+C to the console.
-    // This process holds the client transport only.
-    let joined = timeout(RPC, bridge.wait())
-        .await
-        .map_err(|_| Failure::Timeout("bridge_exit"))
-        .and_then(|result| safe(result, "bridge_exit"))
-        .and_then(|status| check(status.success(), "bridge_exit"));
-    if joined.is_err() {
-        let _ = timeout(RPC, bridge.kill()).await;
-    }
-    observed.and(cancelled.map(|_| ())).and(joined)
+    // Finish the task holding the pipe before interrupting the foreground.
+    let joined = match timeout(RPC, bridge.join_next()).await {
+        Ok(Some(result)) => {
+            safe(result, "bridge_exit").and_then(|result| safe(result, "bridge_exit"))
+        }
+        Ok(None) => Err(Failure::Check("bridge_exit")),
+        Err(_) => {
+            bridge.abort_all();
+            let _ = timeout(RPC, bridge.join_next()).await;
+            Err(Failure::Timeout("bridge_exit"))
+        }
+    };
+    observed.and(joined)
 }
 
 fn verify_hex(value: &str, length: usize, name: &'static str) -> Result<()> {
@@ -1094,13 +1455,17 @@ fn d_path(path: &Path) -> Result<()> {
     )
 }
 
-fn custody_root(state: &Path, runtime: Option<&Path>) -> Result<LocalPath> {
+fn custody_root(state: &Path, runtime: Option<&RuntimeRoot>) -> Result<LocalPath> {
     let state = local_path(state)?;
-    if let Some(root) = runtime {
+    check(!state.is_drive_root(), "foreground_custody_root")?;
+    if let Some(runtime) = runtime {
+        let volume = local_path(&runtime.volume)?;
         check(
-            local_path(root)?
+            local_path(&runtime.state)?
                 .as_str()
-                .eq_ignore_ascii_case(state.as_str()),
+                .eq_ignore_ascii_case(state.as_str())
+                && volume.is_drive_root()
+                && volume.contains(&state),
             "foreground_custody_root",
         )?;
     }
@@ -1109,14 +1474,233 @@ fn custody_root(state: &Path, runtime: Option<&Path>) -> Result<LocalPath> {
 
 #[test]
 fn refuses_runtime_custody_root_outside_foreground_store() {
-    let state = Path::new("D:/acceptance/state");
-    let same = Path::new("d:/acceptance/STATE");
-    let other = Path::new("D:/acceptance/other");
-    assert_eq!(custody_root(state, Some(same)), custody_root(state, None));
+    let state = Path::new("V:/acceptance/state");
+    let mut runtime = RuntimeRoot {
+        state: "v:/acceptance/STATE".into(),
+        volume: "V:/".into(),
+    };
     assert_eq!(
-        custody_root(state, Some(other)),
+        custody_root(state, Some(&runtime)),
+        custody_root(state, None)
+    );
+    runtime.volume = "D:/".into();
+    assert_eq!(
+        custody_root(state, Some(&runtime)),
         Err(Failure::Check("foreground_custody_root"))
     );
+    runtime.volume = "V:/".into();
+    runtime.state = "V:/acceptance/other".into();
+    assert_eq!(
+        custody_root(state, Some(&runtime)),
+        Err(Failure::Check("foreground_custody_root"))
+    );
+}
+
+fn mounted_volume(root: &str) -> Result<String> {
+    let wide: Vec<_> = root.encode_utf16().chain(Some(0)).collect();
+    let mut output = [0; 64];
+    check(
+        unsafe {
+            GetVolumeNameForVolumeMountPointW(
+                wide.as_ptr(),
+                output.as_mut_ptr(),
+                output.len() as u32,
+            )
+        } != 0,
+        "store_volume_mount",
+    )?;
+    let end = output
+        .iter()
+        .position(|&unit| unit == 0)
+        .ok_or(Failure::Check("store_volume_mount"))?;
+    safe(String::from_utf16(&output[..end]), "store_volume_mount")
+}
+
+fn store_identity(file: &File) -> Result<FileIdentity> {
+    let mut id = FILE_ID_INFO::default();
+    check(
+        unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                std::ptr::from_mut(&mut id).cast(),
+                size_of_val(&id) as u32,
+            )
+        } != 0,
+        "store_file_identity",
+    )?;
+    Ok(FileIdentity {
+        volume: id.VolumeSerialNumber,
+        file: id.FileId.Identifier,
+    })
+}
+
+fn held_volume_path(file: &File) -> Result<String> {
+    let mut output = [0; 512];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            output.as_mut_ptr(),
+            output.len() as u32,
+            VOLUME_NAME_GUID,
+        )
+    } as usize;
+    check(length > 0 && length < output.len(), "store_volume_path")?;
+    safe(String::from_utf16(&output[..length]), "store_volume_path")
+}
+
+fn pin_store(
+    state: &LocalPath,
+    enrolled: &ExpectedVmStore,
+    mount_name: impl Fn(&str) -> Result<String>,
+) -> Result<Vec<File>> {
+    let drive = &state.as_str()[..3];
+    let guid = enrolled
+        .volume_guid
+        .strip_prefix(r"\\?\Volume{")
+        .and_then(|value| value.strip_suffix(r"}\"))
+        .ok_or(Failure::Check("store_volume_pin"))?;
+    let mut parts = guid.split('-');
+    for length in [8, 4, 4, 4, 12] {
+        verify_hex(parts.next().unwrap_or_default(), length, "store_volume_pin")?;
+    }
+    check(parts.next().is_none(), "store_volume_pin")?;
+    verify_hex(&enrolled.volume_serial, 16, "store_volume_pin")?;
+    verify_hex(&enrolled.directory_file_id, 32, "store_directory_pin")?;
+    let verify_mount = || {
+        check(
+            mount_name(drive)?.eq_ignore_ascii_case(&enrolled.volume_guid),
+            "store_volume_mount",
+        )
+    };
+    verify_mount()?;
+    // Ledger's no-follow opens hold the chain without delete sharing. Check
+    // each live handle against its expected GUID path, including the root,
+    // so an alias, mount transition or mixed chain cannot supply the pin.
+    let path = Path::new(state.as_str());
+    let pins = pin_root(path)?;
+    for (part, file) in path.ancestors().zip(pins.iter().rev()) {
+        let suffix = &part.to_str().ok_or(Failure::Check("store_volume_path"))?[3..];
+        let expected = format!("{}{suffix}", enrolled.volume_guid);
+        check(
+            held_volume_path(file)?
+                .trim_end_matches('\\')
+                .eq_ignore_ascii_case(expected.trim_end_matches('\\')),
+            "store_volume_path",
+        )?;
+    }
+    let store = pins.last().ok_or(Failure::Check("store_directory_pin"))?;
+    let actual = store_identity(store)?;
+    check(
+        format!("{:016x}", actual.volume) == enrolled.volume_serial
+            && hex::encode(actual.file) == enrolled.directory_file_id,
+        "store_directory_pin",
+    )?;
+    verify_mount()?;
+    Ok(pins)
+}
+
+#[test]
+fn store_requires_exact_enrolled_volume_and_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = local_path(directory.path()).unwrap();
+    let drive = &state.as_str()[..3];
+    let volume_guid = mounted_volume(drive).unwrap();
+    let directory_file = open(directory.path(), true, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap();
+    let identity = store_identity(&directory_file).unwrap();
+    let enrolled = ExpectedVmStore {
+        volume_guid: volume_guid
+            .to_ascii_lowercase()
+            .replacen("volume", "Volume", 1),
+        volume_serial: format!("{:016x}", identity.volume),
+        directory_file_id: hex::encode(identity.file),
+    };
+    assert!(pin_store(&state, &enrolled, mounted_volume).is_ok());
+
+    let rebind = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\";
+    assert_eq!(
+        pin_store(&state, &enrolled, |_| Ok(rebind.into())).err(),
+        Some(Failure::Check("store_volume_mount"))
+    );
+    let calls = std::cell::Cell::new(0);
+    let changed_during_open = pin_store(&state, &enrolled, |_| {
+        calls.set(calls.get() + 1);
+        Ok(if calls.get() == 1 {
+            &volume_guid
+        } else {
+            rebind
+        }
+        .to_owned())
+    });
+    assert_eq!(calls.get(), 2);
+    assert_eq!(
+        changed_during_open.err(),
+        Some(Failure::Check("store_volume_mount"))
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    let wrong_directory = local_path(other.path()).unwrap();
+    assert_eq!(
+        pin_store(&wrong_directory, &enrolled, mounted_volume).err(),
+        Some(Failure::Check("store_directory_pin"))
+    );
+    let wrong_serial = ExpectedVmStore {
+        volume_serial: format!("{:016x}", identity.volume ^ 1),
+        ..enrolled
+    };
+    assert_eq!(
+        pin_store(&state, &wrong_serial, mounted_volume).err(),
+        Some(Failure::Check("store_directory_pin"))
+    );
+}
+
+#[test]
+fn store_refuses_reparse_path_to_the_enrolled_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("enrolled");
+    let alias = root.path().join("junction");
+    fs::create_dir(&target).unwrap();
+    let state = local_path(&target).unwrap();
+    let identity =
+        store_identity(&open(&target, true, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap()).unwrap();
+    let enrolled = ExpectedVmStore {
+        volume_guid: mounted_volume(&state.as_str()[..3])
+            .unwrap()
+            .to_ascii_lowercase()
+            .replacen("volume", "Volume", 1),
+        volume_serial: format!("{:016x}", identity.volume),
+        directory_file_id: hex::encode(identity.file),
+    };
+    assert!(
+        std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&target)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        pin_store(&local_path(&alias).unwrap(), &enrolled, mounted_volume).err(),
+        Some(Failure::Check("unsafe_local_path"))
+    );
+}
+
+fn require_distinct_evidence(store: &[File], evidence: &[File]) -> Result<()> {
+    let identities = |pins: &[File]| pins.iter().map(store_identity).collect::<Result<Vec<_>>>();
+    let store = identities(store)?;
+    let evidence = identities(evidence)?;
+    let store_leaf = store
+        .last()
+        .ok_or(Failure::Check("foreground_custody_root"))?;
+    let evidence_leaf = evidence
+        .last()
+        .ok_or(Failure::Check("isolated_evidence_root"))?;
+    check(
+        !store.contains(evidence_leaf) && !evidence.contains(store_leaf),
+        "isolated_evidence_root",
+    )
 }
 
 fn pin_digest(path: &Path, expected: &str, max: u64) -> Result<File> {
@@ -1152,17 +1736,21 @@ async fn run() -> Result<()> {
         )?);
     }
     d_path(&plan.evidence_dir)?;
-    pins.extend(pin_root(&plan.evidence_dir)?);
+    let evidence_pins = pin_root(&plan.evidence_dir)?;
     let _daemon = pin_digest(&plan.daemon, &plan.daemon_sha256, 512 * 1024 * 1024)?;
     if let Some(pin) = &plan.qualification_sha256 {
         verify_hex(pin, 64, "qualification_pin")?;
     }
     let daemon_config = open(&plan.daemon_config, false, FILE_SHARE_READ)?;
-    let client_config = open(&plan.client_config, false, FILE_SHARE_READ)?;
-    let foreground: Foreground = config(&daemon_config)?;
-    let bridge: BridgeConfig = config(&client_config)?;
+    let _client_config = open(&plan.client_config, false, FILE_SHARE_READ)?;
+    run_with_inputs(&plan, &daemon_config, &evidence_pins).await
+}
+
+async fn run_with_inputs(plan: &Plan, daemon_config: &File, evidence_pins: &[File]) -> Result<()> {
+    let foreground: Foreground = config(daemon_config)?;
+    let client = safe(ClientConfig::load(&plan.client_config), "bridge_config")?;
     check(
-        bridge.address == foreground.local.address,
+        client.address() == foreground.local.address,
         "bridge_endpoint_binding",
     )?;
     check(
@@ -1171,18 +1759,11 @@ async fn run() -> Result<()> {
             && foreground.test_vms.publication.is_none(),
         "isolated_foreground_profile",
     )?;
-    d_path(&foreground.state_dir)?;
-    pins.extend(pin_root(&foreground.state_dir)?);
-    let state = custody_root(
-        &foreground.state_dir,
-        foreground
-            .test_vms
-            .runtime
-            .as_ref()
-            .map(|runtime| runtime.state.as_path()),
-    )?;
+    let state = custody_root(&foreground.state_dir, foreground.test_vms.runtime.as_ref())?;
+    let store_pins = pin_store(&state, &plan.store, mounted_volume)?;
     let evidence_root = local_path(&plan.evidence_dir)?;
     check(!evidence_root.overlaps(&state), "isolated_evidence_root")?;
+    require_distinct_evidence(&store_pins, evidence_pins)?;
     safe(foreground.local.validate(), "foreground_endpoint")?;
     let executable = safe(env::current_exe(), "client_executable")?;
     let client_file = open(&executable, false, FILE_SHARE_READ)?;
@@ -1203,27 +1784,35 @@ async fn run() -> Result<()> {
 
     let result = async {
         require_unused(&foreground.local.address)?;
-        Ledger::preflight(
-            &foreground.state_dir,
-            [
-                (&plan.ubuntu.recipe_id, &plan.ubuntu.recipe_sha256),
-                (&plan.windows.recipe_id, &plan.windows.recipe_sha256),
-            ],
-        )?;
+        safe(
+            with_enrolled_vm_store(&foreground.state_dir, &plan.store, |root| {
+                Ledger::preflight(
+                    root,
+                    [
+                        (&plan.ubuntu.recipe_id, &plan.ubuntu.recipe_sha256),
+                        (&plan.windows.recipe_id, &plan.windows.recipe_sha256),
+                    ],
+                )
+            }),
+            "foreground_store_binding",
+        )??;
+        let launch_config = prepare_pinned_config(&plan.daemon_config, &plan.store)?;
+        let _launch_config = open(&launch_config, false, FILE_SHARE_READ)?;
         let console = Console::allocate()?;
-        let mut daemon = spawn_daemon(&plan)?;
+        let _startup_store = pin_store(&state, &plan.store, mounted_volume)?;
+        let mut daemon = spawn_daemon(plan, &launch_config)?;
         let observed = async {
             ready(&mut daemon, &foreground.local.address).await?;
-            let expected_pid = daemon
-                .id()
-                .ok_or(Failure::SessionProcessEvidenceUnavailable)?;
-            with_client(&plan, &foreground, expected_pid, &mut evidence).await
+            let _live_store = pin_store(&state, &plan.store, mounted_volume)?;
+            with_client(plan, &foreground, &state, &daemon, client, &mut evidence).await
         }
         .await;
         let drained = console.drain(&mut daemon).await;
         evidence.drain = drained.is_ok();
         evidence.drain_failure = drained.clone().err();
-        observed.and(drained)
+        observed
+            .and(drained)
+            .and_then(|()| pin_store(&state, &plan.store, mounted_volume).map(|_| ()))
     }
     .await;
 

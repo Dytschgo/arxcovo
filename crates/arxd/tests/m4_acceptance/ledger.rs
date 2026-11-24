@@ -1,5 +1,8 @@
 use super::*;
-use arxd::vm::{paths::LocalPath, qemu_img::inspect_header};
+use arxd::{
+    config::EnrolledVmStore,
+    vm::{paths::LocalPath, qemu_img::inspect_header},
+};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -12,9 +15,6 @@ use std::{
 use windows_sys::Win32::Storage::FileSystem::*;
 
 pub(super) type Id = [u8; 16];
-
-#[path = "../vault_fixtures/private.rs"]
-mod private_fixture;
 
 const MAX_ARTIFACT: u64 = 200 * 1024 * 1024 * 1024;
 type Hash = [u8; 32];
@@ -126,8 +126,35 @@ pub(super) fn pin_root(root: &Path) -> Result<Vec<File>> {
 pub(super) struct Ledger {
     db: Connection,
     root: PathBuf,
+    backing_root: PathBuf,
     _pins: Vec<File>,
     database: File,
+}
+
+pub(super) struct LiveLedger {
+    ledger: Ledger,
+    store: EnrolledVmStore,
+}
+
+impl LiveLedger {
+    pub fn open(configured: &Path, expected: &ExpectedVmStore) -> Result<Self> {
+        let store = safe(
+            EnrolledVmStore::open(configured, expected),
+            "foreground_store_binding",
+        )?;
+        let ledger = safe(
+            store.read(|root| Ledger::open_at(root, configured)),
+            "foreground_store_binding",
+        )??;
+        Ok(Self { ledger, store })
+    }
+
+    pub fn read<T>(&self, batch: impl FnOnce(&Ledger) -> Result<T>) -> Result<T> {
+        safe(
+            self.store.read(|_| batch(&self.ledger)),
+            "foreground_store_binding",
+        )?
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -247,6 +274,10 @@ impl Ledger {
     }
 
     pub fn open(state: &Path) -> Result<Self> {
+        Self::open_at(state, state)
+    }
+
+    fn open_at(state: &Path, backing_root: &Path) -> Result<Self> {
         let pins = pin_root(state)?;
         let path = state.join("activity.sqlite3");
         let database = open(&path, false, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
@@ -303,6 +334,7 @@ impl Ledger {
         Ok(Self {
             db,
             root: state.to_path_buf(),
+            backing_root: backing_root.to_path_buf(),
             _pins: pins,
             database,
         })
@@ -419,7 +451,8 @@ impl Ledger {
     }
 
     pub fn inspect(&self, pair: &Pair, backing: Option<&Pair>, sealed: bool) -> Result<PairProof> {
-        let backup = backing.map(|pair| pair[0].path(&self.root));
+        // The configured spelling is an expected header value only.
+        let backup = backing.map(|pair| pair[0].path(&self.backing_root));
         let backup = backup
             .as_ref()
             .map(|path| {
@@ -672,7 +705,18 @@ impl Ledger {
             check(number < 256, "media_inventory_bound")?;
             let dir = safe(entry, "media_inventory")?.path();
             let name = dir.file_name().and_then(|name| name.to_str());
-            if matches!(name, Some("activity.sqlite3" | "activity.lock")) {
+            // The TEST foreground opens the vault on this same root. Its
+            // DELETE-mode rollback journal is supported; WAL/SHM are refused.
+            if matches!(
+                name,
+                Some(
+                    "activity.sqlite3"
+                        | "activity.lock"
+                        | "vault.sqlite3"
+                        | "vault.lock"
+                        | "vault.sqlite3-journal"
+                )
+            ) {
                 open(&dir, false, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
                 continue;
             }
@@ -790,6 +834,29 @@ fn ledger_accepts_the_store_version_written_by_the_built_crate() {
     assert!(Ledger::open(state).is_ok());
     drop(controller);
     assert_eq!(Ledger::preflight(state, recipes), Ok(()));
+
+    for name in ["vault.sqlite3", "vault.lock", "vault.sqlite3-journal"] {
+        std::fs::write(state.join(name), b"vault fixture").unwrap();
+    }
+    assert_eq!(Ledger::preflight(state, recipes), Ok(()));
+    for name in [
+        "vault.sqlite3-backup",
+        "vault.sqlite3-wal",
+        "vault.sqlite3-shm",
+    ] {
+        let unknown = state.join(name);
+        std::fs::write(&unknown, b"foreign fixture").unwrap();
+        assert_eq!(
+            Ledger::preflight(state, recipes),
+            Err(Failure::Check("unattributed_media"))
+        );
+        std::fs::remove_file(unknown).unwrap();
+    }
+    let vault_lock = state.join("vault.lock");
+    std::fs::remove_file(&vault_lock).unwrap();
+    std::fs::create_dir(&vault_lock).unwrap();
+    assert!(Ledger::preflight(state, recipes).is_err());
+    std::fs::remove_dir(vault_lock).unwrap();
 
     for unsupported in [0, version - 1, version + 1] {
         let database = Connection::open(&path).unwrap();

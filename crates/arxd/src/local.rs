@@ -14,6 +14,8 @@ mod platform;
 
 #[cfg(windows)]
 pub(crate) use platform::current_identity;
+#[cfg(windows)]
+pub use platform::{ForegroundBridge, ForegroundBridgeError, bind_foreground_bridge};
 
 pub(crate) use platform::owned as require_owner;
 
@@ -65,6 +67,13 @@ pub struct LoadedClient {
     ordinary: ClientConfig,
     #[cfg(target_os = "linux")]
     delegated: Option<platform::delegated::Profile>,
+}
+
+impl LoadedClient {
+    #[cfg(windows)]
+    pub fn address(&self) -> &str {
+        &self.ordinary.address
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -234,6 +243,8 @@ impl Listener {
 /// The validated root pin is checked again immediately before the store
 /// opens, before the startup sweep and before bind. The supervisor then owns
 /// it for as long as any store user lives. A mismatch is `server-state`.
+/// For an enrolled store, the ledger and vault open through the held volume
+/// path so startup cannot follow a reassigned drive letter.
 pub async fn run_vm_profile(profile: crate::config::VmForeground) -> Result<()> {
     use crate::mcp::vm::Supervisor;
     let crate::config::VmForeground {
@@ -245,7 +256,10 @@ pub async fn run_vm_profile(profile: crate::config::VmForeground) -> Result<()> 
     root.verify(&config.state_dir).context("server-state")?;
     // The supervisor owns the pin from here, so every store user, including
     // a detached close or recovery after an unconfirmed result, keeps it.
-    let supervisor = Supervisor::open(&config.state_dir, profile, root).context("server-state")?;
+    let state = root.state_path(&config.state_dir);
+    let supervisor = state
+        .access(|path| Supervisor::open(path, profile, root))
+        .context("server-state")?;
     supervisor
         .verify_root(&config.state_dir)
         .context("server-state")?;
@@ -254,8 +268,8 @@ pub async fn run_vm_profile(profile: crate::config::VmForeground) -> Result<()> 
     supervisor
         .verify_root(&config.state_dir)
         .context("server-state")?;
-    supervisor
-        .open_vault(&config.state_dir)
+    state
+        .access(|path| supervisor.open_vault(path))
         .context("server-state")?;
     supervisor
         .verify_root(&config.state_dir)
