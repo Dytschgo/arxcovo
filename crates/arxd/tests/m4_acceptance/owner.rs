@@ -1,5 +1,6 @@
 use super::*;
 use arxd::{
+    config::{ExpectedVmStore, pinned_vm_config, with_enrolled_vm_store},
     local::{
         ClientConfig, ForegroundBridgeError, LoadedClient, RESPONSE_LIMIT, bind_foreground_bridge,
     },
@@ -35,6 +36,10 @@ use windows_sys::Win32::{
 };
 
 mod ledger;
+
+#[cfg(test)]
+#[path = "../vault_fixtures/private.rs"]
+mod private_fixture;
 
 const RPC: Duration = Duration::from_secs(15);
 const TICK: Duration = Duration::from_secs(2);
@@ -95,6 +100,15 @@ struct StorePin {
     volume_guid: String,
     volume_serial: String,
     directory_file_id: String,
+}
+
+impl StorePin {
+    fn expected(&self) -> ExpectedVmStore {
+        ExpectedVmStore {
+            volume_serial: self.volume_serial.clone(),
+            directory_file_id: self.directory_file_id.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -996,17 +1010,264 @@ impl Drop for Console {
     }
 }
 
-fn spawn_daemon(plan: &Plan) -> Result<Child> {
+fn spawn_daemon(plan: &Plan, pinned_config: &Path) -> Result<Child> {
     safe(
         Command::new(&plan.daemon)
             .arg("--config")
-            .arg(&plan.daemon_config)
+            .arg(pinned_config)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn(),
         "foreground_spawn",
     )
+}
+
+fn prepare_pinned_config(source: &Path, expected: &ExpectedVmStore) -> Result<tempfile::TempPath> {
+    let bytes = safe(pinned_vm_config(source, expected), "foreground_config_pin")?;
+    let parent = source.parent().ok_or(Failure::Check("input_parent"))?;
+    let mut config = safe(
+        tempfile::NamedTempFile::new_in(parent),
+        "foreground_config_copy",
+    )?;
+    safe(config.write_all(&bytes), "foreground_config_copy")?;
+    safe(config.as_file().sync_all(), "foreground_config_copy")?;
+    Ok(config.into_temp_path())
+}
+
+#[cfg(test)]
+fn fixture_foreground(state: &Path) -> (Value, String) {
+    let address = format!(
+        r"\\.\pipe\arxcovo-m4-startup-{}",
+        hex::encode(fresh().unwrap())
+    );
+    let profile = json!({
+        "state_dir": state,
+        "agents": [{"principal": "fixture", "token_sha256": "a".repeat(64)}],
+        "local": {"address": address, "client_identity": "S-1-5-21-100-200-300-1001"},
+        "test_vms": {"enabled": false}
+    });
+    (profile, address)
+}
+
+#[cfg(test)]
+fn fixture_command(config: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_arxd"));
+    command.arg("--config").arg(config).kill_on_drop(true);
+    command
+}
+
+#[cfg(test)]
+fn fixture_expected_store(state: &Path) -> ExpectedVmStore {
+    let folder = open(state, true, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap();
+    let measured = store_identity(&folder).unwrap();
+    ExpectedVmStore {
+        volume_serial: format!("{:016x}", measured.volume),
+        directory_file_id: hex::encode(measured.file),
+    }
+}
+
+#[cfg(test)]
+fn fixture_drive_path(path: &Path) -> &Path {
+    Path::new(path.to_str().unwrap().trim_start_matches(r"\\?\"))
+}
+
+#[cfg(test)]
+fn fixture_set_owner(paths: &[&Path]) {
+    // An elevated test runner can create objects owned by Administrators
+    // instead of TokenUser. The foreground requires the latter.
+    let owner = format!("*{}", private_fixture::identity());
+    for path in paths {
+        assert!(
+            std::process::Command::new("icacls")
+                .arg(path)
+                .arg("/setowner")
+                .arg(&owner)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+#[tokio::test]
+async fn foreground_store_replacement_cannot_open_state_or_startup_sweep() {
+    use arxd::config::{ForegroundConfig, VmStoreIdentityRefusal};
+
+    let fixture = private_fixture::private_dir();
+    let state = fixture_drive_path(fixture.path()).join("state");
+    fs::create_dir(&state).unwrap();
+    let original = fixture_expected_store(&state);
+    let config = fixture.path().join("original.json");
+    let (profile, address) = fixture_foreground(&state);
+    fs::write(&config, profile.to_string()).unwrap();
+    fixture_set_owner(&[fixture.path(), &state, &config]);
+    let launch = fixture.path().join("launch.json");
+    fs::write(&launch, pinned_vm_config(&config, &original).unwrap()).unwrap();
+    fixture_set_owner(&[&launch]);
+    assert!(ForegroundConfig::load(&launch).is_ok());
+
+    let moved = fixture_drive_path(fixture.path()).join("enrolled");
+    fs::rename(&state, &moved).unwrap();
+    fs::create_dir(&state).unwrap();
+    fixture_set_owner(&[&state]);
+    let replacement = fixture_expected_store(&state);
+    assert_ne!(replacement.directory_file_id, original.directory_file_id);
+
+    let exit = timeout(Duration::from_secs(5), fixture_command(&launch).output()).await;
+    assert_eq!(
+        fs::read_dir(&state).unwrap().count(),
+        0,
+        "replacement received state writes"
+    );
+    assert!(
+        require_unused(&address).is_ok(),
+        "replacement bound the listener"
+    );
+    let exit = exit.unwrap().unwrap();
+    assert!(!exit.status.success());
+    assert_eq!(exit.stderr, b"arxd: server-config\n");
+    let refused = ForegroundConfig::load(&launch).err().unwrap();
+    assert!(refused.is::<VmStoreIdentityRefusal>());
+
+    let ledger = with_enrolled_vm_store::<()>(&state, &original, |_| {
+        panic!("replacement reached ledger preflight");
+    });
+    assert!(ledger.unwrap_err().is::<VmStoreIdentityRefusal>());
+
+    fs::remove_dir(&state).unwrap();
+    assert!(
+        std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&state)
+            .arg(&moved)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let refused = ForegroundConfig::load(&launch).err().unwrap();
+    assert!(refused.is::<VmStoreIdentityRefusal>());
+}
+
+#[tokio::test]
+async fn foreground_opens_enrolled_state_through_the_stable_volume_path() {
+    let fixture = private_fixture::private_dir();
+    let state = fixture_drive_path(fixture.path()).join("state");
+    fs::create_dir(&state).unwrap();
+    let expected = fixture_expected_store(&state);
+    let (profile, address) = fixture_foreground(&state);
+    let config = fixture.path().join("original.json");
+    fs::write(&config, profile.to_string()).unwrap();
+    fixture_set_owner(&[fixture.path(), &state, &config]);
+    let launch = prepare_pinned_config(&config, &expected).unwrap();
+    fixture_set_owner(&[&launch]);
+    let _launch_pin = open(&launch, false, FILE_SHARE_READ).unwrap();
+    let recipes = [("ubuntu", "unused"), ("windows", "unused")];
+    assert_eq!(
+        with_enrolled_vm_store(&state, &expected, |path| Ledger::preflight(path, recipes)).unwrap(),
+        Ok(())
+    );
+    let volume_path = with_enrolled_vm_store(&state, &expected, Path::to_path_buf).unwrap();
+    assert!(volume_path.to_str().unwrap().starts_with(r"\\?\Volume{"));
+    assert!(arxd::config::checked_path(&volume_path).is_err());
+
+    let mut child = fixture_command(&launch).spawn().unwrap();
+    assert_eq!(ready(&mut child, &address).await, Ok(()));
+    assert!(state.join("activity.sqlite3").is_file());
+    assert!(state.join("vault.sqlite3").is_file());
+    child.kill().await.unwrap();
+    assert_eq!(
+        with_enrolled_vm_store(&state, &expected, |path| Ledger::preflight(path, recipes)).unwrap(),
+        Ok(())
+    );
+}
+
+#[tokio::test]
+async fn enrolled_store_with_compose_secret_root_refuses_at_config_load() {
+    use arxd::config::{ForegroundConfig, VmStoreComposeConflict};
+
+    let fixture = private_fixture::private_dir();
+    let root = fixture_drive_path(fixture.path());
+    let state = root.join("state");
+    let secrets = root.join("secrets");
+    fs::create_dir(&state).unwrap();
+    fs::create_dir(&secrets).unwrap();
+    let expected = fixture_expected_store(&state);
+    let (mut profile, address) = fixture_foreground(&state);
+    profile["test_vms"]["compose_secret_root"] = json!(secrets);
+    let config = fixture.path().join("original.json");
+    fs::write(&config, profile.to_string()).unwrap();
+    fixture_set_owner(&[fixture.path(), &state, &secrets, &config]);
+    assert!(ForegroundConfig::load(&config).is_ok());
+    let launch = prepare_pinned_config(&config, &expected).unwrap();
+    fixture_set_owner(&[&launch]);
+
+    let exit = timeout(Duration::from_secs(5), fixture_command(&launch).output()).await;
+    assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+    assert!(require_unused(&address).is_ok());
+    let exit = exit.unwrap().unwrap();
+    assert!(!exit.status.success());
+    assert_eq!(exit.stderr, b"arxd: server-config\n");
+    let refused = ForegroundConfig::load(&launch).err().unwrap();
+    assert!(refused.is::<VmStoreComposeConflict>());
+}
+
+#[tokio::test]
+async fn mismatched_endpoint_refuses_foreground_inputs_before_startup() {
+    let fixture = private_fixture::private_dir();
+    let state = fixture_drive_path(fixture.path()).join("state");
+    fs::create_dir(&state).unwrap();
+    let config = fixture.path().join("server.json");
+    let client = fixture.path().join("client.json");
+    let (profile, address) = fixture_foreground(&state);
+    fs::write(&config, profile.to_string()).unwrap();
+    let source = open(&config, false, FILE_SHARE_READ).unwrap();
+    let mut settings = json!({
+        "address": r"\\.\pipe\arxcovo-m4-unrelated",
+        "expected_server_identity": private_fixture::identity(),
+        "token": "a".repeat(64)
+    });
+    fs::write(&client, settings.to_string()).unwrap();
+    fixture_set_owner(&[fixture.path(), &client]);
+    let fixture_recipe = || Recipe {
+        recipe_id: String::new(),
+        recipe_sha256: String::new(),
+    };
+    // A bad store pin acts as a second gate. A mismatched endpoint must stop
+    // the production startup path before it even attempts that gate.
+    let plan = Plan {
+        daemon: fixture.path().join("must-not-launch.exe"),
+        daemon_sha256: String::new(),
+        daemon_config: config,
+        client_config: client.clone(),
+        store: StorePin {
+            volume_guid: String::new(),
+            volume_serial: String::new(),
+            directory_file_id: String::new(),
+        },
+        qualification_sha256: None,
+        evidence_dir: fixture.path().join("evidence"),
+        ubuntu: fixture_recipe(),
+        windows: fixture_recipe(),
+        idle_delay_s: 0,
+    };
+    assert_eq!(
+        run_with_inputs(&plan, &source, &[]).await,
+        Err(Failure::Check("bridge_endpoint_binding"))
+    );
+    assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+    assert!(require_unused(&address).is_ok());
+
+    settings["address"] = json!(address);
+    fs::write(&client, settings.to_string()).unwrap();
+    let source = open(&plan.daemon_config, false, FILE_SHARE_READ).unwrap();
+    assert_eq!(
+        run_with_inputs(&plan, &source, &[]).await,
+        Err(Failure::Check("store_volume_pin"))
+    );
 }
 
 fn pipe_name(endpoint: &str) -> Vec<u16> {
@@ -1426,8 +1687,16 @@ async fn run() -> Result<()> {
     }
     let daemon_config = open(&plan.daemon_config, false, FILE_SHARE_READ)?;
     let _client_config = open(&plan.client_config, false, FILE_SHARE_READ)?;
-    let foreground: Foreground = config(&daemon_config)?;
+    run_with_inputs(&plan, &daemon_config, &evidence_pins).await
+}
+
+async fn run_with_inputs(plan: &Plan, daemon_config: &File, evidence_pins: &[File]) -> Result<()> {
+    let foreground: Foreground = config(daemon_config)?;
     let client = safe(ClientConfig::load(&plan.client_config), "bridge_config")?;
+    check(
+        client.address() == foreground.local.address,
+        "bridge_endpoint_binding",
+    )?;
     check(
         foreground.agents.len() == 1
             && !foreground.test_vms.allow_agent_public_sites
@@ -1438,7 +1707,7 @@ async fn run() -> Result<()> {
     let store_pins = pin_store(&state, &plan.store, mounted_volume)?;
     let evidence_root = local_path(&plan.evidence_dir)?;
     check(!evidence_root.overlaps(&state), "isolated_evidence_root")?;
-    require_distinct_evidence(&store_pins, &evidence_pins)?;
+    require_distinct_evidence(&store_pins, evidence_pins)?;
     safe(foreground.local.validate(), "foreground_endpoint")?;
     let executable = safe(env::current_exe(), "client_executable")?;
     let client_file = open(&executable, false, FILE_SHARE_READ)?;
@@ -1459,20 +1728,27 @@ async fn run() -> Result<()> {
 
     let result = async {
         require_unused(&foreground.local.address)?;
-        Ledger::preflight(
-            &foreground.state_dir,
-            [
-                (&plan.ubuntu.recipe_id, &plan.ubuntu.recipe_sha256),
-                (&plan.windows.recipe_id, &plan.windows.recipe_sha256),
-            ],
-        )?;
+        safe(
+            with_enrolled_vm_store(&foreground.state_dir, &plan.store.expected(), |root| {
+                Ledger::preflight(
+                    root,
+                    [
+                        (&plan.ubuntu.recipe_id, &plan.ubuntu.recipe_sha256),
+                        (&plan.windows.recipe_id, &plan.windows.recipe_sha256),
+                    ],
+                )
+            }),
+            "foreground_store_binding",
+        )??;
+        let launch_config = prepare_pinned_config(&plan.daemon_config, &plan.store.expected())?;
+        let _launch_config = open(&launch_config, false, FILE_SHARE_READ)?;
         let console = Console::allocate()?;
         let _startup_store = pin_store(&state, &plan.store, mounted_volume)?;
-        let mut daemon = spawn_daemon(&plan)?;
+        let mut daemon = spawn_daemon(plan, &launch_config)?;
         let observed = async {
             ready(&mut daemon, &foreground.local.address).await?;
             let _live_store = pin_store(&state, &plan.store, mounted_volume)?;
-            with_client(&plan, &foreground, &state, &daemon, client, &mut evidence).await
+            with_client(plan, &foreground, &state, &daemon, client, &mut evidence).await
         }
         .await;
         let drained = console.drain(&mut daemon).await;

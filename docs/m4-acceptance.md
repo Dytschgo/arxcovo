@@ -16,6 +16,8 @@ at the VM store schema version compiled into the client. The reader refuses
 older, newer, or unknown versions. The only media allowed are the selected TEST
 goldens. The scan includes generation
 directories, `disk-<key>` and `vars-<key>` leaves, and the ledger metadata.
+The root may also contain the foreground vault database, lock and DELETE-mode
+rollback journal as regular files.
 
 Prepare an owner-private JSON plan on D:. The qualification digest is an expected
 pin. The client records a digest only after an authenticated daemon receipt
@@ -48,6 +50,12 @@ the same directory under the configured runtime drive root. The production
 store can use another mounted drive letter when the enrollment verifies its
 backing on D:. The client compares the live mount and the held directory
 identity with the plan and refuses changed mounts, aliases and reparse points.
+It checks the ledger through the enrolled volume path and creates a temporary
+configuration alongside the private daemon configuration. The daemon checks
+the enrolled identity again before opening state, then opens the ledger and
+vault through the held volume path. Use a TEST-only profile without a Compose
+secret root. Config load refuses the combination of an expected store identity
+and a Compose secret root before any state opens.
 Keep the build scratch, binary, configuration, plan and evidence on D:.
 
 Use an existing evidence directory outside the state and media roots. Set
@@ -112,9 +120,6 @@ hardware**.
 
 ## M5 journey
 
-The M5 mode follows once the production vault tester wiring merges. The TEST VM
-foreground returns before inventory initializes the vault, and the inventory
-vault currently opens without its trusted throwaway-VM tester.
-[Foreground dispatch](../crates/arxd/src/main.rs#L99-L108) ·
-[Vault initialization](../crates/arxd/src/vault/mod.rs#L46) ·
-[Tester contract](../crates/arxd/src/vault/mod.rs#L205-L212)
+The TEST VM foreground opens the vault with its throwaway-VM tester after the
+startup sweep. M5 acceptance requires a qualified TEST golden and its own
+vault journey. [Foreground vault wiring](../crates/arxd/src/local.rs#L271-L273)

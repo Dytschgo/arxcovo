@@ -13,9 +13,6 @@ use windows_sys::Win32::Storage::FileSystem::*;
 
 pub(super) type Id = [u8; 16];
 
-#[path = "../vault_fixtures/private.rs"]
-mod private_fixture;
-
 const MAX_ARTIFACT: u64 = 200 * 1024 * 1024 * 1024;
 type Hash = [u8; 32];
 
@@ -672,7 +669,18 @@ impl Ledger {
             check(number < 256, "media_inventory_bound")?;
             let dir = safe(entry, "media_inventory")?.path();
             let name = dir.file_name().and_then(|name| name.to_str());
-            if matches!(name, Some("activity.sqlite3" | "activity.lock")) {
+            // The TEST foreground opens the vault on this same root. Its
+            // DELETE-mode rollback journal is supported; WAL/SHM are refused.
+            if matches!(
+                name,
+                Some(
+                    "activity.sqlite3"
+                        | "activity.lock"
+                        | "vault.sqlite3"
+                        | "vault.lock"
+                        | "vault.sqlite3-journal"
+                )
+            ) {
                 open(&dir, false, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
                 continue;
             }
@@ -790,6 +798,29 @@ fn ledger_accepts_the_store_version_written_by_the_built_crate() {
     assert!(Ledger::open(state).is_ok());
     drop(controller);
     assert_eq!(Ledger::preflight(state, recipes), Ok(()));
+
+    for name in ["vault.sqlite3", "vault.lock", "vault.sqlite3-journal"] {
+        std::fs::write(state.join(name), b"vault fixture").unwrap();
+    }
+    assert_eq!(Ledger::preflight(state, recipes), Ok(()));
+    for name in [
+        "vault.sqlite3-backup",
+        "vault.sqlite3-wal",
+        "vault.sqlite3-shm",
+    ] {
+        let unknown = state.join(name);
+        std::fs::write(&unknown, b"foreign fixture").unwrap();
+        assert_eq!(
+            Ledger::preflight(state, recipes),
+            Err(Failure::Check("unattributed_media"))
+        );
+        std::fs::remove_file(unknown).unwrap();
+    }
+    let vault_lock = state.join("vault.lock");
+    std::fs::remove_file(&vault_lock).unwrap();
+    std::fs::create_dir(&vault_lock).unwrap();
+    assert!(Ledger::preflight(state, recipes).is_err());
+    std::fs::remove_dir(vault_lock).unwrap();
 
     for unsupported in [0, version - 1, version + 1] {
         let database = Connection::open(&path).unwrap();

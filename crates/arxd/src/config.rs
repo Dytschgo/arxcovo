@@ -372,6 +372,80 @@ pub struct VmForeground {
     pub(crate) root: Box<RootPin>,
 }
 
+/// The enrollment's Windows FILE_ID_INFO, encoded as lowercase hex.
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedVmStore {
+    pub volume_serial: String,
+    pub directory_file_id: String,
+}
+
+#[derive(Debug)]
+pub struct VmStoreIdentityRefusal;
+
+impl std::fmt::Display for VmStoreIdentityRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VM store identity refused")
+    }
+}
+
+impl std::error::Error for VmStoreIdentityRefusal {}
+
+#[derive(Debug)]
+pub struct VmStoreComposeConflict;
+
+impl std::fmt::Display for VmStoreComposeConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("enrolled VM store requires a profile without Compose secret custody")
+    }
+}
+
+impl std::error::Error for VmStoreComposeConflict {}
+
+#[cfg(windows)]
+impl ExpectedVmStore {
+    fn identity(&self) -> Result<crate::vm::paths::FileIdentity> {
+        let mut file = [0; 16];
+        let volume =
+            u64::from_str_radix(&self.volume_serial, 16).map_err(|_| VmStoreIdentityRefusal)?;
+        hex::decode_to_slice(&self.directory_file_id, &mut file)
+            .map_err(|_| VmStoreIdentityRefusal)?;
+        anyhow::ensure!(
+            format!("{volume:016x}") == self.volume_serial
+                && hex::encode(file) == self.directory_file_id,
+            VmStoreIdentityRefusal
+        );
+        Ok(crate::vm::paths::FileIdentity { volume, file })
+    }
+}
+
+/// Prepare a private, bounded copy for the owner acceptance client. The
+/// caller holds the original config and its parent while writing the copy.
+#[cfg(windows)]
+pub fn pinned_vm_config(path: &Path, expected: &ExpectedVmStore) -> Result<Vec<u8>> {
+    let parent = path.parent().ok_or(VmStoreIdentityRefusal)?;
+    checked_path(parent)?;
+    crate::security::private(parent)?;
+    crate::local::require_owner(parent)?;
+    crate::local::require_owner(path)?;
+    expected.identity()?;
+    let bytes = config_bytes(path)?;
+    let mut config = crate::local::check_json(&bytes)
+        .map_err(|_| anyhow::anyhow!("invalid VM configuration"))?;
+    let profile = config
+        .get_mut("test_vms")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("VM configuration required"))?;
+    anyhow::ensure!(
+        !profile.contains_key("expected_store"),
+        "VM config already has a store pin"
+    );
+    profile.insert("expected_store".into(), serde_json::to_value(expected)?);
+    let bytes = serde_json::to_vec(&config)?;
+    anyhow::ensure!(bytes.len() <= 16384, "configuration too large");
+    Ok(bytes)
+}
+
 /// The identity of the validated VM state root, bound to its canonical name.
 ///
 /// Windows holds the root and every ancestor directory open without delete
@@ -396,6 +470,41 @@ pub(crate) struct RootPin {
     _ancestors: Vec<std::fs::File>,
     leaf: std::fs::File,
     identity: (u64, u64),
+    #[cfg(windows)]
+    enrolled: Option<(PathBuf, crate::vm::paths::FileIdentity)>,
+}
+
+#[cfg(windows)]
+thread_local! {
+    // Only synchronous calls through a held enrolled store can use its
+    // volume-GUID path in the shared local-path validator.
+    static ENROLLED_STATE_PATH: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(crate) struct VmStatePath {
+    path: PathBuf,
+    #[cfg(windows)]
+    enrolled: bool,
+}
+
+impl VmStatePath {
+    pub(crate) fn access<T>(&self, action: impl FnOnce(&Path) -> T) -> T {
+        #[cfg(windows)]
+        if self.enrolled {
+            struct Restore(Option<PathBuf>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    ENROLLED_STATE_PATH.with(|slot| slot.replace(self.0.take()));
+                }
+            }
+            let _restore =
+                Restore(ENROLLED_STATE_PATH.with(|slot| slot.replace(Some(self.path.clone()))));
+            return action(&self.path);
+        }
+        action(&self.path)
+    }
 }
 
 impl RootPin {
@@ -417,6 +526,7 @@ impl RootPin {
                         _ancestors: ancestors,
                         leaf: handle,
                         identity,
+                        enrolled: None,
                     });
                 }
                 directory_identity(&handle)?;
@@ -439,8 +549,60 @@ impl RootPin {
         }
     }
 
+    #[cfg(windows)]
+    fn acquire_enrolled(root: &Path, expected: &ExpectedVmStore) -> Result<Self> {
+        let acquire = || {
+            let expected = expected.identity()?;
+            let original = Self::acquire(root)?;
+            anyhow::ensure!(
+                full_directory_identity(&original.leaf)? == expected,
+                VmStoreIdentityRefusal
+            );
+            // The drive letter can be rebound independently of a directory
+            // handle. Resolve the GUID path from the verified handle, then
+            // hold that chain and use its stable name for state I/O.
+            let path = held_volume_path(&original.leaf)?;
+            let mut anchored = Self::acquire(&path)?;
+            anyhow::ensure!(
+                full_directory_identity(&anchored.leaf)? == expected,
+                VmStoreIdentityRefusal
+            );
+            anchored.enrolled = Some((path, expected));
+            anchored.verify(root)?;
+            Ok::<_, anyhow::Error>(anchored)
+        };
+        acquire().map_err(|_| VmStoreIdentityRefusal.into())
+    }
+
+    pub(crate) fn state_path(&self, configured: &Path) -> VmStatePath {
+        #[cfg(windows)]
+        if let Some((path, _)) = &self.enrolled {
+            return VmStatePath {
+                path: path.clone(),
+                enrolled: true,
+            };
+        }
+        VmStatePath {
+            path: configured.to_owned(),
+            #[cfg(windows)]
+            enrolled: false,
+        }
+    }
+
     /// The canonical name still denotes the pinned directory.
     pub(crate) fn verify(&self, root: &Path) -> Result<()> {
+        #[cfg(windows)]
+        if let Some((path, expected)) = &self.enrolled {
+            let matches =
+                |file: &std::fs::File| full_directory_identity(file).ok() == Some(*expected);
+            anyhow::ensure!(
+                matches(&self.leaf)
+                    && Self::acquire(root).is_ok_and(|current| matches(&current.leaf))
+                    && Self::acquire(path).is_ok_and(|current| matches(&current.leaf)),
+                VmStoreIdentityRefusal
+            );
+            return Ok(());
+        }
         #[cfg(windows)]
         let current = directory_identity(&pin_directory(root)?)?;
         #[cfg(unix)]
@@ -456,6 +618,62 @@ impl RootPin {
         );
         Ok(())
     }
+}
+
+/// Synchronous ledger access through the enrolled, held volume path.
+#[cfg(windows)]
+pub fn with_enrolled_vm_store<T>(
+    root: &Path,
+    expected: &ExpectedVmStore,
+    action: impl FnOnce(&Path) -> T,
+) -> Result<T> {
+    let root = vm_path(root).map_err(|_| VmStoreIdentityRefusal)?;
+    let pin = RootPin::acquire_enrolled(&root, expected)?;
+    Ok(pin.state_path(&root).access(action))
+}
+
+#[cfg(windows)]
+fn full_directory_identity(file: &std::fs::File) -> Result<crate::vm::paths::FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+    directory_identity(file)?;
+    let mut id = FILE_ID_INFO::default();
+    anyhow::ensure!(
+        unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                std::ptr::from_mut(&mut id).cast(),
+                size_of_val(&id) as u32,
+            )
+        } != 0,
+        VmStoreIdentityRefusal
+    );
+    Ok(crate::vm::paths::FileIdentity {
+        volume: id.VolumeSerialNumber,
+        file: id.FileId.Identifier,
+    })
+}
+
+#[cfg(windows)]
+fn held_volume_path(file: &std::fs::File) -> Result<PathBuf> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_GUID};
+    let mut output = [0; 512];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            output.as_mut_ptr(),
+            output.len() as u32,
+            VOLUME_NAME_GUID,
+        )
+    } as usize;
+    anyhow::ensure!(length > 0 && length < output.len(), VmStoreIdentityRefusal);
+    let path = String::from_utf16(&output[..length])?;
+    anyhow::ensure!(path.starts_with(r"\\?\Volume{"), VmStoreIdentityRefusal);
+    Ok(PathBuf::from(path))
 }
 
 /// An ordinary local directory opened without following a reparse point and
@@ -562,6 +780,8 @@ struct VmFile {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TestVms {
     pub(crate) enabled: bool,
+    #[serde(default, deserialize_with = "present")]
+    expected_store: Option<ExpectedVmStore>,
     #[serde(default)]
     pub(crate) allow_agent_public_sites: bool,
     #[serde(default, deserialize_with = "present")]
@@ -660,6 +880,10 @@ impl TestVms {
     fn validate(&self, root: &Path, local: &crate::local::Endpoint) -> Result<(PathBuf, RootPin)> {
         use crate::vm::paths::LocalPath;
 
+        anyhow::ensure!(
+            self.expected_store.is_none() || self.compose_secret_root.is_none(),
+            VmStoreComposeConflict
+        );
         let layout = crate::service::layout::Layout::system()?;
         let reserved = layout.endpoint().to_string_lossy();
         anyhow::ensure!(
@@ -670,8 +894,23 @@ impl TestVms {
             },
             "reserved local endpoint"
         );
-        let root = vm_path(root)?;
-        let pin = RootPin::acquire(&root)?;
+        let (root, pin) = if let Some(expected) = &self.expected_store {
+            #[cfg(windows)]
+            {
+                let root = vm_path(root).map_err(|_| VmStoreIdentityRefusal)?;
+                let pin = RootPin::acquire_enrolled(&root, expected)?;
+                (root, pin)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = expected;
+                bail!(VmStoreIdentityRefusal);
+            }
+        } else {
+            let root = vm_path(root)?;
+            let pin = RootPin::acquire(&root)?;
+            (root, pin)
+        };
         anyhow::ensure!(root.is_dir(), "VM state directory required");
         crate::security::private(&root)?;
         crate::local::require_owner(&root)?;
@@ -867,13 +1106,20 @@ pub fn checked_path(path: &Path) -> Result<()> {
         bail!("absolute normalized path required");
     }
     let mut prefix = PathBuf::new();
+    #[cfg(windows)]
+    let enrolled = ENROLLED_STATE_PATH.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|root| path.starts_with(root) || root.starts_with(path))
+    });
     for part in path.components() {
         #[cfg(windows)]
         {
             use std::path::Prefix;
             match part {
                 Component::Prefix(p)
-                    if !matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) =>
+                    if !(matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+                        || enrolled && matches!(p.kind(), Prefix::Verbatim(_))) =>
                 {
                     bail!("local disk paths required")
                 }
