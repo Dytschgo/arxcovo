@@ -9,7 +9,11 @@ use std::process::ExitStatus;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use arx_guest::{MAX_SCRIPT, ScriptExecution, ScriptExecutor, ScriptOutcome, serve};
+use arx_guest::compose::{
+    self, Clock, CommandRunner, ComposeService, ComposeStore, Invocation, MAX_SECRET, RunResult,
+    SecretFileWitness, SecretMatch, StoreError,
+};
+use arx_guest::{MAX_SCRIPT, ScriptExecution, ScriptExecutor, ScriptOutcome, serve_with_compose};
 
 const PORT: &str = "org.arxcovo.agent.0";
 const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
@@ -24,12 +28,27 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(1);
 
 pub(crate) fn serve_virtio() -> Result<(), &'static str> {
     let port = open_port().map_err(|_| "virtio setup failed")?;
-    let runner = ReapOwner::establish().ok().and_then(|owner| {
-        CgroupRoot::qualify()
-            .ok()
-            .map(|root| ScriptRunner::new(root, Some(port.as_fd()), owner))
-    });
-    serve_connection(&port, &port, runner)
+    // Compose is served only when the recipe's fixed roots and engine qualify.
+    let compose = qualify_compose();
+    // Design §3: the script runner shares the guest network namespace and has
+    // no ingress-isolation witness for UID/GID 65534, so legacy scripts stay
+    // disabled on a Compose-qualified guest.
+    let runner = if compose.is_some() {
+        None
+    } else {
+        ReapOwner::establish().ok().and_then(|owner| {
+            CgroupRoot::qualify()
+                .ok()
+                .map(|root| ScriptRunner::new(root, Some(port.as_fd()), owner))
+        })
+    };
+    let result = serve_connection_with(&port, &port, runner, compose.as_ref());
+    // Intent survives a disconnected host: let a running operation finish
+    // before the service exits. A later session queries it by operation ID.
+    if let Some(compose) = &compose {
+        compose.wait_idle(OPERATION_DRAIN);
+    }
+    result
 }
 
 fn open_port() -> io::Result<File> {
@@ -74,23 +93,35 @@ fn verify_port_name(device: libc::dev_t) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn serve_connection(
     reader: impl Read,
     writer: impl Write,
     runner: Option<ScriptRunner<'_>>,
 ) -> Result<(), &'static str> {
+    serve_connection_with(reader, writer, runner, None)
+}
+
+fn serve_connection_with(
+    reader: impl Read,
+    writer: impl Write,
+    runner: Option<ScriptRunner<'_>>,
+    compose: Option<&ComposeService>,
+) -> Result<(), &'static str> {
     let retired = Cell::new(false);
     let mut executor = LinuxExecutor {
-        runner,
+        // Defense in depth: never retain a script runner alongside Compose.
+        runner: if compose.is_some() { None } else { runner },
         retired: &retired,
     };
-    let result = serve(
+    let result = serve_with_compose(
         reader,
         SessionWriter {
             writer,
             retired: &retired,
         },
         &mut executor,
+        compose,
     );
     if retired.get() {
         return Err("script containment failed");
@@ -1015,6 +1046,578 @@ fn invalid() -> io::Error {
     io::ErrorKind::InvalidData.into()
 }
 
+// ---------------------------------------------------------------------------
+// Compose engine and storage. Everything below is **unverified on real
+// hardware**: hosted CI exercises the runner's environment clearing, deadline
+// kill and capture bound, and the store's fd-relative no-follow behavior in a
+// temporary directory, but never Docker, the recipe's roots or a guest tmpfs.
+
+/// Upper bound on finishing a running operation after the host disconnects.
+const OPERATION_DRAIN: Duration = Duration::from_secs(30 * 60);
+use std::os::unix::fs::PermissionsExt;
+const ROOT_UID: u32 = 0;
+
+fn qualify_compose() -> Option<ComposeService> {
+    if effective_uid() != ROOT_UID || verify_engine(compose::DOCKER).is_err() {
+        return None;
+    }
+    walk_owned_dirs(compose::ENGINE_CWD, ROOT_UID).ok()?;
+    let store = LinuxComposeStore::open(
+        compose::STATE_ROOT,
+        compose::SECRET_ROOT,
+        compose::DOCKER_VOLUME_ROOT,
+        ROOT_UID,
+        true,
+    )
+    .ok()?;
+    ComposeService::new(
+        Box::new(DockerRunner::new()),
+        Box::new(store),
+        Box::new(SystemClock),
+    )
+    .ok()
+}
+
+fn verify_engine(path: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.uid() != ROOT_UID || metadata.mode() & 0o022 != 0 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_unix(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs())
+    }
+}
+
+/// Starts the fixed engine with an empty ambient environment plus exactly
+/// `ENGINE_ENV`, in a fixed empty directory, stdin and stderr on the null
+/// device and its own process group, so a deadline kill reaches the Compose
+/// plugin as well.
+struct DockerRunner {
+    program: &'static str,
+    cwd: &'static str,
+}
+
+impl DockerRunner {
+    fn new() -> Self {
+        Self {
+            program: compose::DOCKER,
+            cwd: compose::ENGINE_CWD,
+        }
+    }
+}
+
+impl CommandRunner for DockerRunner {
+    fn run(&mut self, invocation: &Invocation) -> RunResult {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new(self.program);
+        command
+            .args(&invocation.argv)
+            .env_clear()
+            .envs(compose::ENGINE_ENV)
+            .current_dir(self.cwd)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .stdout(if invocation.capture {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .process_group(0);
+        let Ok(mut child) = command.spawn() else {
+            return RunResult::LaunchFailed;
+        };
+        let reader = child.stdout.take().map(|mut stdout| {
+            thread::spawn(move || -> Result<(Vec<u8>, bool), ()> {
+                let mut bytes = Vec::new();
+                // Read up to MAX_CAPTURE + 1 bytes so exact-bound output is
+                // distinguished from truncated output.
+                (&mut stdout)
+                    .take(compose::MAX_CAPTURE as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| ())?;
+                let truncated = bytes.len() > compose::MAX_CAPTURE;
+                if truncated {
+                    bytes.clear();
+                    // Drain the rest so the child never blocks on a full pipe.
+                    let _ = io::copy(&mut stdout, &mut io::sink());
+                }
+                Ok((bytes, truncated))
+            })
+        });
+        let deadline = Instant::now() + invocation.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                _ => break None,
+            }
+        };
+        let Some(status) = status else {
+            if let Ok(group) = libc::pid_t::try_from(child.id()) {
+                // SAFETY: the unreaped child leads this process group.
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            // The reader is left to finish on its own; a descendant could
+            // still hold the pipe.
+            return RunResult::TimedOut;
+        };
+        let capture_result = match reader {
+            Some(reader) => reader.join().ok().and_then(Result::ok),
+            None => Some((Vec::new(), false)),
+        };
+        match (status.code(), capture_result) {
+            (Some(code), Some((stdout, false))) => RunResult::Exited { code, stdout },
+            (Some(code), _) => RunResult::OutputIncomplete { code },
+            (None, _) => RunResult::Signaled,
+        }
+    }
+
+    fn probe_http(&mut self, port: u16, path: &str) -> bool {
+        use std::net::{SocketAddr, TcpStream};
+
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_secs(2)) else {
+            return false;
+        };
+        if stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(5))))
+            .is_err()
+        {
+            return false;
+        }
+        let request =
+            format!("GET {path} HTTP/1.0\r\nHost: arx-health\r\nConnection: close\r\n\r\n");
+        let mut head = [0u8; 12];
+        stream.write_all(request.as_bytes()).is_ok()
+            && stream.read_exact(&mut head).is_ok()
+            && head.starts_with(b"HTTP/1.")
+            && head[8] == b' '
+            && head[9] == b'2'
+    }
+
+    fn pause(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+/// Root-owned storage reached only through directory descriptors. Every
+/// component is opened with O_NOFOLLOW and checked for its owner and mode,
+/// files are replaced through an O_EXCL temporary and renameat, and secret
+/// files are chowned and chmodded on the descriptor before any byte lands.
+struct LinuxComposeStore {
+    state: OwnedFd,
+    secrets: OwnedFd,
+    volume_root: &'static str,
+    owner: u32,
+}
+
+impl LinuxComposeStore {
+    fn open(
+        state: &str,
+        secrets: &str,
+        volume_root: &'static str,
+        owner: u32,
+        require_tmpfs: bool,
+    ) -> io::Result<Self> {
+        let state = walk_owned_dirs(state, owner)?;
+        verify_private_dir(state.as_fd(), owner)?;
+        let secrets = walk_owned_dirs(secrets, owner)?;
+        verify_private_dir(secrets.as_fd(), owner)?;
+        if require_tmpfs && !is_tmpfs(secrets.as_fd())? {
+            return Err(invalid());
+        }
+        Ok(Self {
+            state,
+            secrets,
+            volume_root,
+            owner,
+        })
+    }
+
+    fn version_dir(&self) -> io::Result<OwnedFd> {
+        private_subdir(
+            self.state.as_fd(),
+            compose::LAYOUT_VERSION,
+            self.owner,
+            true,
+        )
+    }
+}
+
+impl ComposeStore for LinuxComposeStore {
+    fn load_state(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
+        let dir = self.version_dir().map_err(|_| StoreError)?;
+        let file = match open_at(dir.as_fd(), "state.json", libc::O_RDONLY, 0) {
+            Ok(fd) => File::from(fd),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(StoreError),
+        };
+        let metadata = file.metadata().map_err(|_| StoreError)?;
+        if !metadata.is_file() || metadata.uid() != self.owner || metadata.mode() & 0o077 != 0 {
+            return Err(StoreError);
+        }
+        let mut bytes = Vec::new();
+        file.take(compose::MAX_STATE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| StoreError)?;
+        if bytes.len() > compose::MAX_STATE_BYTES {
+            return Err(StoreError);
+        }
+        Ok(Some(bytes))
+    }
+
+    fn save_state(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        let dir = self.version_dir().map_err(|_| StoreError)?;
+        replace_at(dir.as_fd(), "state.json", bytes, 0o600, None)
+            .map(|_| ())
+            .map_err(|_| StoreError)
+    }
+
+    fn write_revision(
+        &mut self,
+        project: &str,
+        revision: u64,
+        yaml: &str,
+    ) -> Result<(), StoreError> {
+        let mut dir = self.version_dir().map_err(|_| StoreError)?;
+        for name in ["projects", project, &format!("r{revision}")] {
+            dir = private_subdir(dir.as_fd(), name, self.owner, true).map_err(|_| StoreError)?;
+        }
+        replace_at(dir.as_fd(), "compose.yaml", yaml.as_bytes(), 0o600, None)
+            .map(|_| ())
+            .map_err(|_| StoreError)
+    }
+
+    fn write_rotation(
+        &mut self,
+        project: &str,
+        revision: u64,
+        operation_id: &str,
+        yaml: &str,
+    ) -> Result<(), StoreError> {
+        let mut dir = self.version_dir().map_err(|_| StoreError)?;
+        for name in ["projects", project, &format!("r{revision}")] {
+            dir = private_subdir(dir.as_fd(), name, self.owner, true).map_err(|_| StoreError)?;
+        }
+        replace_at(
+            dir.as_fd(),
+            &format!("rot-{operation_id}.yaml"),
+            yaml.as_bytes(),
+            0o600,
+            None,
+        )
+        .map(|_| ())
+        .map_err(|_| StoreError)
+    }
+
+    fn write_secret(
+        &mut self,
+        project: &str,
+        instance: &str,
+        owner: (u32, u32),
+        bytes: &[u8],
+    ) -> Result<SecretFileWitness, StoreError> {
+        let dir = private_subdir(self.secrets.as_fd(), project, self.owner, true)
+            .map_err(|_| StoreError)?;
+        replace_at(dir.as_fd(), instance, bytes, 0o400, Some(owner)).map_err(|_| StoreError)
+    }
+
+    fn stat_secret(
+        &mut self,
+        project: &str,
+        instance: &str,
+        owner: (u32, u32),
+    ) -> Option<SecretFileWitness> {
+        let dir = private_subdir(self.secrets.as_fd(), project, self.owner, false).ok()?;
+        let metadata = open_at(dir.as_fd(), instance, libc::O_RDONLY, 0)
+            .map(File::from)
+            .and_then(|file| file.metadata())
+            .ok()?;
+        if metadata.is_file()
+            && (metadata.uid(), metadata.gid()) == owner
+            && metadata.mode() & 0o7777 == 0o400
+            && metadata.nlink() == 1
+        {
+            Some(SecretFileWitness {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn compare_secret(
+        &mut self,
+        project: &str,
+        instance: &str,
+        owner: (u32, u32),
+        bytes: &[u8],
+    ) -> SecretMatch {
+        struct Wiped(Vec<u8>);
+        impl Drop for Wiped {
+            fn drop(&mut self) {
+                compose::wipe_bytes(&mut self.0);
+            }
+        }
+
+        let dir = match private_subdir(self.secrets.as_fd(), project, self.owner, false) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return SecretMatch::Missing,
+            Err(_) => return SecretMatch::Error,
+        };
+        let file = match open_at(dir.as_fd(), instance, libc::O_RDONLY, 0) {
+            Ok(fd) => File::from(fd),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return SecretMatch::Missing,
+            Err(_) => return SecretMatch::Error,
+        };
+        let Ok(metadata) = file.metadata() else {
+            return SecretMatch::Error;
+        };
+        if !metadata.is_file()
+            || (metadata.uid(), metadata.gid()) != owner
+            || metadata.mode() & 0o7777 != 0o400
+            || metadata.nlink() != 1
+        {
+            return SecretMatch::Mismatch;
+        }
+        let mut stored = Wiped(Vec::with_capacity(bytes.len().min(MAX_SECRET) + 1));
+        if file
+            .take(MAX_SECRET as u64 + 1)
+            .read_to_end(&mut stored.0)
+            .is_err()
+        {
+            return SecretMatch::Error;
+        }
+        if stored.0.as_slice() == bytes {
+            SecretMatch::Match(SecretFileWitness {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+            })
+        } else {
+            SecretMatch::Mismatch
+        }
+    }
+
+    fn prepare_volume(&mut self, name: &str, owner: (u32, u32)) -> Result<(), StoreError> {
+        let parent = walk_owned_dirs(&format!("{}/{name}", self.volume_root), self.owner)
+            .map_err(|_| StoreError)?;
+        let data = File::from(
+            open_at(
+                parent.as_fd(),
+                "_data",
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )
+            .map_err(|_| StoreError)?,
+        );
+        let metadata = data.metadata().map_err(|_| StoreError)?;
+        if !metadata.is_dir() {
+            return Err(StoreError);
+        }
+        if (metadata.uid(), metadata.gid()) == owner {
+            return Ok(());
+        }
+        // Only a fresh, empty, broker-owned data root is handed over.
+        let empty = fs::read_dir(format!("/proc/self/fd/{}", data.as_raw_fd()))
+            .map_err(|_| StoreError)?
+            .next()
+            .is_none();
+        if metadata.uid() != self.owner || !empty {
+            return Err(StoreError);
+        }
+        std::os::unix::fs::fchown(&data, Some(owner.0), Some(owner.1)).map_err(|_| StoreError)?;
+        data.set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|_| StoreError)
+    }
+}
+
+fn component(name: &str) -> io::Result<std::ffi::CString> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(invalid());
+    }
+    std::ffi::CString::new(name).map_err(|_| invalid())
+}
+
+fn open_at(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> io::Result<OwnedFd> {
+    let name = component(name)?;
+    // SAFETY: dir is a live descriptor and name a NUL-terminated component.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::c_uint::from(mode),
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh descriptor owned by the caller.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Opens an absolute path one component at a time from `/`. Every directory
+/// on the way must be owned by `owner` or root and not group/other writable.
+fn walk_owned_dirs(path: &str, owner: u32) -> io::Result<OwnedFd> {
+    let rest = path.strip_prefix('/').ok_or_else(invalid)?;
+    let mut dir: OwnedFd = File::open("/")?.into();
+    for name in rest.split('/') {
+        let next = open_at(dir.as_fd(), name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        let metadata = File::from(next.try_clone()?).metadata()?;
+        if !metadata.is_dir()
+            || (metadata.uid() != owner && metadata.uid() != ROOT_UID)
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(invalid());
+        }
+        dir = next;
+    }
+    Ok(dir)
+}
+
+fn verify_private_dir(dir: BorrowedFd<'_>, owner: u32) -> io::Result<()> {
+    let metadata = File::from(dir.try_clone_to_owned()?).metadata()?;
+    if !metadata.is_dir() || metadata.uid() != owner || metadata.mode() & 0o077 != 0 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Opens, and optionally creates, a 0700 child directory owned by `owner`.
+fn private_subdir(
+    parent: BorrowedFd<'_>,
+    name: &str,
+    owner: u32,
+    create: bool,
+) -> io::Result<OwnedFd> {
+    if create {
+        let cname = component(name)?;
+        // SAFETY: parent is a live descriptor and cname a NUL-terminated component.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), cname.as_ptr(), 0o700) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+    }
+    let dir = open_at(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    verify_private_dir(dir.as_fd(), owner)?;
+    Ok(dir)
+}
+
+/// Replaces `name` in `dir` atomically. The temporary is created O_EXCL and
+/// no-follow, receives its owner and mode on the descriptor, is written and
+/// synced, then renamed. Owner-bound secret instances require an unused target
+/// name. State and revision files use replacing rename. Neither follows links.
+fn replace_at(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    bytes: &[u8],
+    mode: libc::mode_t,
+    owner: Option<(u32, u32)>,
+) -> io::Result<SecretFileWitness> {
+    let target = component(name)?;
+    let temporary_name = format!(".{name}.tmp");
+    let temporary = component(&temporary_name)?;
+    // SAFETY: dir is live and temporary a NUL-terminated component.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), temporary.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    let mut file = File::from(open_at(
+        dir,
+        &temporary_name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        mode,
+    )?);
+    let written = (|| -> io::Result<SecretFileWitness> {
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
+        }
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let metadata = file.metadata()?;
+        Ok(SecretFileWitness {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        })
+    })();
+    drop(file);
+    // SAFETY: both names are NUL-terminated components of the live dir.
+    let renamed = written.and_then(|witness| {
+        if unsafe {
+            libc::renameat2(
+                dir.as_raw_fd(),
+                temporary.as_ptr(),
+                dir.as_raw_fd(),
+                target.as_ptr(),
+                if owner.is_some() {
+                    libc::RENAME_NOREPLACE
+                } else {
+                    0
+                },
+            )
+        } != 0
+        {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(witness)
+        }
+    });
+    let witness = match renamed {
+        Ok(witness) => witness,
+        Err(error) => {
+            // SAFETY: as above.
+            unsafe { libc::unlinkat(dir.as_raw_fd(), temporary.as_ptr(), 0) };
+            return Err(error);
+        }
+    };
+    // SAFETY: dir is a live descriptor.
+    if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(witness)
+}
+
+fn is_tmpfs(dir: BorrowedFd<'_>) -> io::Result<bool> {
+    // SAFETY: fstatfs initializes the storage on success; dir stays open.
+    unsafe {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        if libc::fstatfs(dir.as_raw_fd(), stat.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(stat.assume_init().f_type == libc::TMPFS_MAGIC)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{DirBuilderExt, FileExt};
@@ -1739,5 +2342,309 @@ mod tests {
         fn release_line(&mut self) {
             self.write.write_all(b"x\n").unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod compose_tests {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, symlink};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    fn run(program: &'static str, argv: &[&str], timeout: Duration) -> RunResult {
+        DockerRunner { program, cwd: "/" }.run(&Invocation {
+            argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+            timeout,
+            capture: true,
+        })
+    }
+
+    #[test]
+    fn docker_runner_starts_with_only_the_fixed_environment() {
+        let result = run("/usr/bin/env", &[], TEST_HANG_GUARD);
+        let RunResult::Exited { code: 0, stdout } = result else {
+            panic!("{result:?}");
+        };
+        let mut lines: Vec<String> = String::from_utf8(stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        let mut expected: Vec<String> = compose::ENGINE_ENV
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        expected.sort();
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn docker_runner_bounds_output_and_classifies_ends() {
+        let exact_cmd = format!("yes | head -c {}", compose::MAX_CAPTURE);
+        let exact = run("/bin/sh", &["-c", &exact_cmd], TEST_HANG_GUARD);
+        let RunResult::Exited { code: 0, stdout } = exact else {
+            panic!("{exact:?}");
+        };
+        assert_eq!(stdout.len(), compose::MAX_CAPTURE);
+
+        // Output exceeding MAX_CAPTURE is explicitly reported as incomplete so
+        // a truncated prefix can never be mistaken for a complete inventory.
+        assert_eq!(
+            run("/bin/sh", &["-c", "yes | head -c 40000"], TEST_HANG_GUARD),
+            RunResult::OutputIncomplete { code: 0 }
+        );
+
+        let started = Instant::now();
+        assert_eq!(
+            run("/bin/sh", &["-c", "sleep 30"], Duration::from_millis(100)),
+            RunResult::TimedOut
+        );
+        assert!(started.elapsed() < TEST_HANG_GUARD, "deadline kill hung");
+        assert_eq!(
+            run("/bin/sh", &["-c", "kill -TERM $$"], TEST_HANG_GUARD),
+            RunResult::Signaled
+        );
+        assert_eq!(
+            run("/nonexistent/arx-docker", &[], TEST_HANG_GUARD),
+            RunResult::LaunchFailed
+        );
+    }
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "arx-compose-store-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            for dir in [path.clone(), path.join("state"), path.join("secrets")] {
+                fs::DirBuilder::new().mode(0o700).create(dir).unwrap();
+            }
+            Self(path)
+        }
+
+        fn store(&self) -> LinuxComposeStore {
+            LinuxComposeStore {
+                state: File::open(self.0.join("state")).unwrap().into(),
+                secrets: File::open(self.0.join("secrets")).unwrap().into(),
+                volume_root: "/nonexistent",
+                owner: effective_uid(),
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn store_replaces_files_fd_relative_and_never_follows_links() {
+        let scratch = Scratch::new();
+        let mut store = scratch.store();
+        // SAFETY: getegid has no arguments and no failure mode.
+        let owner = (effective_uid(), unsafe { libc::getegid() });
+
+        assert_eq!(store.load_state(), Ok(None));
+        store.save_state(b"{\"saved\":1}").unwrap();
+        assert_eq!(store.load_state(), Ok(Some(b"{\"saved\":1}".to_vec())));
+
+        store.write_revision("calm-life", 1, "name: x\n").unwrap();
+        let yaml = scratch
+            .0
+            .join("state/v1/projects/calm-life/r1/compose.yaml");
+        assert_eq!(fs::read(&yaml).unwrap(), b"name: x\n");
+        assert_eq!(fs::metadata(&yaml).unwrap().mode() & 0o777, 0o600);
+
+        assert!(
+            store
+                .stat_secret("calm-life", "admin_password", owner)
+                .is_none()
+        );
+        assert_eq!(
+            store.compare_secret("calm-life", "admin_password", owner, b"first"),
+            SecretMatch::Missing
+        );
+        let first_witness = store
+            .write_secret("calm-life", "admin_password", owner, b"first")
+            .unwrap();
+        let secret = scratch.0.join("secrets/calm-life/admin_password");
+        assert_eq!(fs::metadata(&secret).unwrap().mode() & 0o7777, 0o400);
+        assert_eq!(
+            store.stat_secret("calm-life", "admin_password", owner),
+            Some(first_witness)
+        );
+        assert_eq!(
+            store.compare_secret("calm-life", "admin_password", owner, b"first"),
+            SecretMatch::Match(first_witness)
+        );
+        assert_eq!(
+            store.compare_secret("calm-life", "admin_password", owner, b"other"),
+            SecretMatch::Mismatch
+        );
+        assert!(
+            store
+                .stat_secret("calm-life", "admin_password", (owner.0 + 1, owner.1))
+                .is_none()
+        );
+
+        // Immutable publication refuses both an existing inode and a planted link.
+        assert_eq!(
+            store.write_secret("calm-life", "admin_password", owner, b"second"),
+            Err(StoreError)
+        );
+        assert_eq!(
+            store.stat_secret("calm-life", "admin_password", owner),
+            Some(first_witness)
+        );
+        let outside = scratch.0.join("outside");
+        fs::write(&outside, b"untouched").unwrap();
+        fs::remove_file(&secret).unwrap();
+        symlink(&outside, &secret).unwrap();
+        assert!(
+            store
+                .stat_secret("calm-life", "admin_password", owner)
+                .is_none()
+        );
+        assert_eq!(
+            store.compare_secret("calm-life", "admin_password", owner, b"untouched"),
+            SecretMatch::Error
+        );
+        symlink(
+            &outside,
+            scratch.0.join("secrets/calm-life/.admin_password.tmp"),
+        )
+        .unwrap();
+        assert_eq!(
+            store.write_secret("calm-life", "admin_password", owner, b"second"),
+            Err(StoreError)
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+        assert!(fs::symlink_metadata(&secret).unwrap().is_symlink());
+
+        // A linked project directory is refused.
+        let elsewhere = scratch.0.join("elsewhere");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&elsewhere)
+            .unwrap();
+        symlink(&elsewhere, scratch.0.join("secrets/evil")).unwrap();
+        assert_eq!(
+            store.write_secret("evil", "admin_password", owner, b"value"),
+            Err(StoreError)
+        );
+        assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
+
+        assert!(walk_owned_dirs("relative/path", owner.0).is_err());
+        assert!(
+            walk_owned_dirs("/proc/self", owner.0).is_err(),
+            "followed a link"
+        );
+    }
+
+    #[test]
+    fn docker_runner_discards_stderr_and_non_capturing_stdout_canary() {
+        let canary = format!("arx-proc-canary-{:016x}", 0x1234_5678_9abc_def0_u64);
+        let script = format!("printf '%s\\n' '{canary}'; printf '%s\\n' '{canary}' >&2; exit 1");
+        let non_capturing = DockerRunner {
+            program: "/bin/sh",
+            cwd: "/",
+        }
+        .run(&Invocation {
+            argv: vec!["-c".to_owned(), script],
+            timeout: TEST_HANG_GUARD,
+            capture: false,
+        });
+        assert_eq!(
+            non_capturing,
+            RunResult::Exited {
+                code: 1,
+                stdout: Vec::new(),
+            },
+            "non-capturing invocation leaked subprocess output"
+        );
+
+        let stderr_script = format!("printf 'ok\\n'; printf '%s\\n' '{canary}' >&2");
+        let capturing = run("/bin/sh", &["-c", &stderr_script], TEST_HANG_GUARD);
+        let RunResult::Exited { code: 0, stdout } = capturing else {
+            panic!("{capturing:?}");
+        };
+        assert_eq!(stdout, b"ok\n");
+        assert!(
+            !String::from_utf8_lossy(&stdout).contains(&canary),
+            "stderr canary reached captured stdout"
+        );
+    }
+
+    #[test]
+    fn compose_qualified_guest_disables_legacy_scripts() {
+        use arx_guest::{Request, Response, ScriptStatus, read_frame, write_frame};
+
+        let scratch = Scratch::new();
+        let compose = ComposeService::new(
+            Box::new(DockerRunner {
+                program: "/bin/false",
+                cwd: "/",
+            }),
+            Box::new(scratch.store()),
+            Box::new(SystemClock),
+        )
+        .unwrap();
+        let mut requests = Vec::new();
+        write_frame(
+            &mut requests,
+            &Request::Hello {
+                version: 1,
+                challenge: "0123456789abcdef0123456789abcdef".to_owned(),
+            },
+        )
+        .unwrap();
+        write_frame(
+            &mut requests,
+            &Request::RunScript {
+                id: 1,
+                script: "exit 7".to_owned(),
+                timeout_s: 5,
+            },
+        )
+        .unwrap();
+        let mut responses = Vec::new();
+        let root = CgroupRoot {
+            path: PathBuf::from("/proc/self/cgroup"),
+            owner: effective_uid(),
+        };
+        let runner = ScriptRunner::new(root, None, ReapOwner::verify().unwrap());
+        assert_eq!(
+            serve_connection_with(
+                requests.as_slice(),
+                &mut responses,
+                Some(runner),
+                Some(&compose),
+            ),
+            Ok(())
+        );
+        let mut reader = responses.as_slice();
+        assert!(matches!(
+            read_frame::<Response>(&mut reader).unwrap(),
+            Some(Response::HelloAck {
+                script_execution: ScriptExecution::Unavailable,
+                ..
+            })
+        ));
+        assert!(matches!(
+            read_frame::<Response>(&mut reader).unwrap(),
+            Some(Response::ScriptResult {
+                id: 1,
+                status: ScriptStatus::Unavailable,
+                exit_code: None,
+            })
+        ));
+        assert!(reader.is_empty());
     }
 }
