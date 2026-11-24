@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "distribution": "qemu-11.1.3-arx-witness-1-windows-x64",
+  "build": "11.1.3-arx-witness-1",
+  "architecture": "windows-x86_64",
+  "upstream_version": "11.1.3",
+  "wire_version": 1,
+  "open_table_version": 1,
+  "qemu_source": {
+    "url": "https://download.qemu.org/qemu-11.1.3.tar.xz",
+    "signature_url": "https://download.qemu.org/qemu-11.1.3.tar.xz.sig",
+    "archive": {
+      "size": 141819712,
+      "sha256": "5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22"
+    },
+    "signature": {
+      "size": 310,
+      "sha256": "362dc9aacb38575aea217380b55065416843dc84cbaf0dd58aab5a5e44d41c8f"
+    },
+    "signing_fingerprint": "CEACC9E15534EBABB82D3FA03353C9CEF108B584"
+  },
+  "patch": {
+    "file": "arxcovo-witness.patch",
+    "size": 31970,
+    "sha256": "5f4518bd1385e568284da0193045061a19386b09b777cc1e1a274383b595f33b"
+  },
+  "toolchain": {
+    "name": "MSYS2 UCRT64",
+    "base": "msys2-base-x86_64-20261120.tar.zst",
+    "base_fingerprint": "0EBF782C5D53F7E5FB02A66746BD761F7A49B0EC",
+    "base_signing_fingerprint": "E0AA0F031DBD80FFBA57B06D5A62D0CAB6264964",
+    "input_lock": {
+      "file": "witness-toolchain.sha256",
+      "size": 11998,
+      "sha256": "9eb4573fb6c8ef4580c1c362d773c758c5510ddf865de3621505101d1ed96388"
+    },
+    "gcc": "16.2.0-7",
+    "meson": "1.12.1-2",
+    "ninja": "1.13.2-1",
+    "python": "3.14.10-4"
+  },
+  "configure": [
+    "--target-list=x86_64-softmmu",
+    "--enable-whpx",
+    "--enable-tools",
+    "--disable-tcg",
+    "--disable-slirp",
+    "--enable-zstd",
+    "--disable-gtk",
+    "--disable-sdl",
+    "--disable-opengl",
+    "--disable-vnc",
+    "--disable-spice",
+    "--disable-guest-agent",
+    "--disable-docs",
+    "--disable-werror",
+    "--disable-download",
+    "--enable-strip",
+    "--prefix=/arxcovo-witness",
+    "--bindir=.",
+    "--datadir=.",
+    "--with-suffix=share"
+  ],
+  "build_environment": {
+    "SOURCE_DATE_EPOCH": "0",
+    "MSYSTEM": "UCRT64"
+  },
+  "packaging": {
+    "file": "package-witness.ps1",
+    "size": 4404,
+    "sha256": "2f173a03f25ae1462dbd791e3cf842532016e4213f4317311ae5dc677b0e5def"
+  },
+  "receipt_name": "RECEIPT.txt",
+  "payload_manifest": {
+    "file": "MANIFEST.sha256",
+    "size": 12688,
+    "sha256": "e92ea4db73882d24012b78738d92e1ba3322dcdd990b26bdc7724fbe22e7e2a5"
+  },
+  "payload_file_count": 135,
+  "executables": {
+    "qemu-system-x86_64.exe": {
+      "size": 26738700,
+      "sha256": "d8f79194626a610a463eb41ca4615b570d00fb56f46ba5904bb6eab818aa5b4d"
+    },
+    "qemu-img.exe": {
+      "size": 2522341,
+      "sha256": "69311654a4c66ce4e2c8cc6cec71e7a84b63d15b738b2bfc4a19c85193224fe1"
+    }
+  }
+}

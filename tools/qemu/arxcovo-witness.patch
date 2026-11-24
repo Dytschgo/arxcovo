@@ -1,0 +1,1143 @@
+diff --git a/accel/whpx/whpx-common.c b/accel/whpx/whpx-common.c
+--- a/accel/whpx/whpx-common.c
++++ b/accel/whpx/whpx-common.c
+@@ -404,7 +404,7 @@
+ 
+     #define WHP_LOAD_LIB(lib_name, handle_lib) \
+     if (!handle_lib) { \
+-        handle_lib = LoadLibrary(lib_name); \
++        handle_lib = LoadLibraryExA(lib_name, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32); \
+         if (!handle_lib) { \
+             error_report("Could not load library %s.", lib_name); \
+             goto error; \
+diff --git a/block/file-win32.c b/block/file-win32.c
+--- a/block/file-win32.c
++++ b/block/file-win32.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/arx-witness.h"
+ #include "qapi/error.h"
+ #include "qemu/cutils.h"
+ #include "block/block-io.h"
+@@ -170,13 +171,6 @@
+     return thread_pool_submit_aio(aio_worker, acb, cb, opaque);
+ }
+ 
+-static int set_sparse(int fd)
+-{
+-    DWORD returned;
+-    return (int) DeviceIoControl((HANDLE)_get_osfhandle(fd), FSCTL_SET_SPARSE,
+-                                 NULL, 0, NULL, 0, &returned, NULL);
+-}
+-
+ static void raw_detach_aio_context(BlockDriverState *bs)
+ {
+     BDRVRawState *s = bs->opaque;
+@@ -227,27 +221,6 @@
+ 
+     /* XXX Does Windows support AIO on less than 512-byte alignment? */
+     bs->bl.request_alignment = 512;
+-}
+-
+-static void raw_parse_flags(int flags, bool use_aio, int *access_flags,
+-                            DWORD *overlapped)
+-{
+-    assert(access_flags != NULL);
+-    assert(overlapped != NULL);
+-
+-    if (flags & BDRV_O_RDWR) {
+-        *access_flags = GENERIC_READ | GENERIC_WRITE;
+-    } else {
+-        *access_flags = GENERIC_READ;
+-    }
+-
+-    *overlapped = FILE_ATTRIBUTE_NORMAL;
+-    if (use_aio) {
+-        *overlapped |= FILE_FLAG_OVERLAPPED;
+-    }
+-    if (flags & BDRV_O_NOCACHE) {
+-        *overlapped |= FILE_FLAG_NO_BUFFERING;
+-    }
+ }
+ 
+ static void raw_parse_filename(const char *filename, QDict *options,
+@@ -303,8 +276,6 @@
+                     Error **errp)
+ {
+     BDRVRawState *s = bs->opaque;
+-    int access_flags;
+-    DWORD overlapped;
+     QemuOpts *opts;
+     Error *local_err = NULL;
+     const char *filename;
+@@ -348,8 +319,6 @@
+         ret = -EINVAL;
+         goto fail;
+     }
+-
+-    raw_parse_flags(flags, use_aio, &access_flags, &overlapped);
+ 
+     if (filename[0] && filename[1] == ':') {
+         snprintf(s->drive_path, sizeof(s->drive_path), "%c:\\", filename[0]);
+@@ -362,9 +331,15 @@
+         snprintf(s->drive_path, sizeof(s->drive_path), "%c:\\", buf[0]);
+     }
+ 
+-    s->hfile = CreateFile(filename, access_flags,
+-                          FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+-                          OPEN_EXISTING, overlapped, NULL);
++    /* The grant is a synchronous regular-file handle. No device or
++     * by-name fallback, and no delete-on-close or unbuffered open. */
++    if (use_aio || (flags & (BDRV_O_NOCACHE | BDRV_O_TEMPORARY))) {
++        error_setg(errp, "Unsupported witnessed file mode");
++        ret = -EINVAL;
++        goto fail;
++    }
++    s->hfile = arx_witness_block(filename, (flags & BDRV_O_RDWR) != 0);
++    s->drive_path[0] = 0;
+     if (s->hfile == INVALID_HANDLE_VALUE) {
+         int err = GetLastError();
+ 
+@@ -453,9 +428,11 @@
+         s->aio = NULL;
+     }
+ 
+-    CloseHandle(s->hfile);
+-    if (bs->open_flags & BDRV_O_TEMPORARY) {
+-        unlink(bs->filename);
++    if ((bs->open_flags & BDRV_O_RDWR) && !FlushFileBuffers(s->hfile)) {
++        ExitProcess(125);
++    }
++    if (!CloseHandle(s->hfile)) {
++        ExitProcess(125);
+     }
+ }
+ 
+@@ -527,56 +504,19 @@
+ 
+ static int64_t coroutine_fn raw_co_get_allocated_file_size(BlockDriverState *bs)
+ {
+-    typedef DWORD (WINAPI * get_compressed_t)(const char *filename,
+-                                              DWORD * high);
+-    get_compressed_t get_compressed;
+-    struct _stati64 st;
+-    const char *filename = bs->filename;
+-    /* WinNT support GetCompressedFileSize to determine allocate size */
+-    get_compressed =
+-        (get_compressed_t) GetProcAddress(GetModuleHandle("kernel32"),
+-                                            "GetCompressedFileSizeA");
+-    if (get_compressed) {
+-        DWORD high, low;
+-        low = get_compressed(filename, &high);
+-        if (low != 0xFFFFFFFFlu || GetLastError() == NO_ERROR) {
+-            return (((int64_t) high) << 32) + low;
+-        }
+-    }
+-
+-    if (_stati64(filename, &st) < 0) {
+-        return -1;
+-    }
+-    return st.st_size;
++    BDRVRawState *s = bs->opaque;
++    FILE_STANDARD_INFO info;
++    if (!GetFileInformationByHandleEx(s->hfile, FileStandardInfo, &info,
++                                     sizeof(info))) {
++        return -EIO;
++    }
++    return info.AllocationSize.QuadPart;
+ }
+ 
+ static int raw_co_create(BlockdevCreateOptions *options, Error **errp)
+ {
+-    BlockdevCreateOptionsFile *file_opts;
+-    int fd;
+-
+-    assert(options->driver == BLOCKDEV_DRIVER_FILE);
+-    file_opts = &options->u.file;
+-
+-    if (file_opts->has_preallocation) {
+-        error_setg(errp, "Preallocation is not supported on Windows");
+-        return -EINVAL;
+-    }
+-    if (file_opts->has_nocow) {
+-        error_setg(errp, "nocow is not supported on Windows");
+-        return -EINVAL;
+-    }
+-
+-    fd = qemu_create(file_opts->filename, O_WRONLY | O_TRUNC | O_BINARY,
+-                     0644, errp);
+-    if (fd < 0) {
+-        return -EIO;
+-    }
+-    set_sparse(fd);
+-    ftruncate(fd, file_opts->size);
+-    qemu_close(fd);
+-
+-    return 0;
++    error_setg(errp, "Witnessed file creation requires the reserved qcow2 grant");
++    return -ENOTSUP;
+ }
+ 
+ static int coroutine_fn GRAPH_RDLOCK
+@@ -607,62 +547,8 @@
+ static int raw_reopen_prepare(BDRVReopenState *state,
+                               BlockReopenQueue *queue, Error **errp)
+ {
+-    BDRVRawState *s = state->bs->opaque;
+-    BDRVRawReopenState *rs;
+-    int access_flags;
+-    DWORD overlapped;
+-    int ret = 0;
+-
+-    if (s->type != FTYPE_FILE) {
+-        error_setg(errp, "Can only reopen files");
+-        return -EINVAL;
+-    }
+-
+-    rs = g_new0(BDRVRawReopenState, 1);
+-
+-    /*
+-     * We do not support changing any options (only flags). By leaving
+-     * all options in state->options, we tell the generic reopen code
+-     * that we do not support changing any of them, so it will verify
+-     * that their values did not change.
+-     */
+-
+-    raw_parse_flags(state->flags, s->aio != NULL, &access_flags, &overlapped);
+-    rs->hfile = CreateFile(state->bs->filename, access_flags,
+-                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+-                           OPEN_EXISTING, overlapped, NULL);
+-
+-    if (rs->hfile == INVALID_HANDLE_VALUE) {
+-        int err = GetLastError();
+-
+-        error_setg_win32(errp, err, "Could not reopen '%s'",
+-                         state->bs->filename);
+-        if (err == ERROR_ACCESS_DENIED) {
+-            ret = -EACCES;
+-        } else {
+-            ret = -EINVAL;
+-        }
+-        goto fail;
+-    }
+-
+-    if (s->aio) {
+-        ret = win32_aio_attach(s->aio, rs->hfile);
+-        if (ret < 0) {
+-            error_setg_errno(errp, -ret, "Could not enable AIO");
+-            CloseHandle(rs->hfile);
+-            goto fail;
+-        }
+-    }
+-
+-    state->opaque = rs;
+-
+-    return 0;
+-
+-fail:
+-    g_free(rs);
+-    state->opaque = NULL;
+-
+-    return ret;
++    error_setg(errp, "Witnessed block files cannot be reopened");
++    return -ENOTSUP;
+ }
+ 
+ static void raw_reopen_commit(BDRVReopenState *state)
+@@ -736,177 +622,9 @@
+     .create_opts        = &raw_create_opts,
+ };
+ 
+-/***********************************************/
+-/* host device */
+-
+-static int find_cdrom(char *cdrom_name, int cdrom_name_size)
+-{
+-    char drives[256], *pdrv = drives;
+-    UINT type;
+-
+-    memset(drives, 0, sizeof(drives));
+-    GetLogicalDriveStrings(sizeof(drives), drives);
+-    while(pdrv[0] != '\0') {
+-        type = GetDriveType(pdrv);
+-        switch(type) {
+-        case DRIVE_CDROM:
+-            snprintf(cdrom_name, cdrom_name_size, "\\\\.\\%c:", pdrv[0]);
+-            return 0;
+-            break;
+-        }
+-        pdrv += lstrlen(pdrv) + 1;
+-    }
+-    return -1;
+-}
+-
+-static int find_device_type(BlockDriverState *bs, const char *filename)
+-{
+-    BDRVRawState *s = bs->opaque;
+-    UINT type;
+-    const char *p;
+-
+-    if (strstart(filename, "\\\\.\\", &p) ||
+-        strstart(filename, "//./", &p)) {
+-        if (stristart(p, "PhysicalDrive", NULL))
+-            return FTYPE_HARDDISK;
+-        snprintf(s->drive_path, sizeof(s->drive_path), "%c:\\", p[0]);
+-        type = GetDriveType(s->drive_path);
+-        switch (type) {
+-        case DRIVE_REMOVABLE:
+-        case DRIVE_FIXED:
+-            return FTYPE_HARDDISK;
+-        case DRIVE_CDROM:
+-            return FTYPE_CD;
+-        default:
+-            return FTYPE_FILE;
+-        }
+-    } else {
+-        return FTYPE_FILE;
+-    }
+-}
+-
+-static int hdev_probe_device(const char *filename)
+-{
+-    if (strstart(filename, "/dev/cdrom", NULL))
+-        return 100;
+-    if (is_windows_drive(filename))
+-        return 100;
+-    return 0;
+-}
+-
+-static void hdev_parse_filename(const char *filename, QDict *options,
+-                                Error **errp)
+-{
+-    bdrv_parse_filename_strip_prefix(filename, "host_device:", options);
+-}
+-
+-static void hdev_refresh_limits(BlockDriverState *bs, Error **errp)
+-{
+-    /* XXX Does Windows support AIO on less than 512-byte alignment? */
+-    bs->bl.request_alignment = 512;
+-    bs->bl.has_variable_length = true;
+-}
+-
+-static int hdev_open(BlockDriverState *bs, QDict *options, int flags,
+-                     Error **errp)
+-{
+-    BDRVRawState *s = bs->opaque;
+-    int access_flags, create_flags;
+-    int ret = 0;
+-    DWORD overlapped;
+-    char device_name[64];
+-
+-    Error *local_err = NULL;
+-    const char *filename;
+-    bool use_aio;
+-
+-    QemuOpts *opts = qemu_opts_create(&raw_runtime_opts, NULL, 0,
+-                                      &error_abort);
+-    if (!qemu_opts_absorb_qdict(opts, options, errp)) {
+-        ret = -EINVAL;
+-        goto done;
+-    }
+-
+-    filename = qemu_opt_get(opts, "filename");
+-
+-    use_aio = get_aio_option(opts, flags, &local_err);
+-    if (!local_err && use_aio) {
+-        error_setg(&local_err, "AIO is not supported on Windows host devices");
+-    }
+-    if (local_err) {
+-        error_propagate(errp, local_err);
+-        ret = -EINVAL;
+-        goto done;
+-    }
+-
+-    if (strstart(filename, "/dev/cdrom", NULL)) {
+-        if (find_cdrom(device_name, sizeof(device_name)) < 0) {
+-            error_setg(errp, "Could not open CD-ROM drive");
+-            ret = -ENOENT;
+-            goto done;
+-        }
+-        filename = device_name;
+-    } else {
+-        /* transform drive letters into device name */
+-        if (((filename[0] >= 'a' && filename[0] <= 'z') ||
+-             (filename[0] >= 'A' && filename[0] <= 'Z')) &&
+-            filename[1] == ':' && filename[2] == '\0') {
+-            snprintf(device_name, sizeof(device_name), "\\\\.\\%c:", filename[0]);
+-            filename = device_name;
+-        }
+-    }
+-    s->type = find_device_type(bs, filename);
+-
+-    raw_parse_flags(flags, use_aio, &access_flags, &overlapped);
+-
+-    create_flags = OPEN_EXISTING;
+-
+-    s->hfile = CreateFile(filename, access_flags,
+-                          FILE_SHARE_READ, NULL,
+-                          create_flags, overlapped, NULL);
+-    if (s->hfile == INVALID_HANDLE_VALUE) {
+-        int err = GetLastError();
+-
+-        if (err == ERROR_ACCESS_DENIED) {
+-            ret = -EACCES;
+-        } else {
+-            ret = -EINVAL;
+-        }
+-        error_setg_win32(errp, err, "Could not open device");
+-        goto done;
+-    }
+-
+-done:
+-    qemu_opts_del(opts);
+-    return ret;
+-}
+-
+-static BlockDriver bdrv_host_device = {
+-    .format_name            = "host_device",
+-    .protocol_name          = "host_device",
+-    .instance_size          = sizeof(BDRVRawState),
+-    .bdrv_needs_filename    = true,
+-    .bdrv_parse_filename    = hdev_parse_filename,
+-    .bdrv_probe_device      = hdev_probe_device,
+-    .bdrv_open              = hdev_open,
+-    .bdrv_close             = raw_close,
+-    .bdrv_refresh_limits    = hdev_refresh_limits,
+-
+-    .bdrv_aio_preadv    = raw_aio_preadv,
+-    .bdrv_aio_pwritev   = raw_aio_pwritev,
+-    .bdrv_aio_flush     = raw_aio_flush,
+-
+-    .bdrv_detach_aio_context = raw_detach_aio_context,
+-    .bdrv_attach_aio_context = raw_attach_aio_context,
+-
+-    .bdrv_co_getlength                = raw_co_getlength,
+-    .bdrv_co_get_allocated_file_size  = raw_co_get_allocated_file_size,
+-};
+-
+ static void bdrv_file_init(void)
+ {
+     bdrv_register(&bdrv_file);
+-    bdrv_register(&bdrv_host_device);
+ }
+ 
+ block_init(bdrv_file_init);
+diff --git a/block/qcow2.c b/block/qcow2.c
+--- a/block/qcow2.c
++++ b/block/qcow2.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/arx-witness.h"
+ 
+ #include "block/qdict.h"
+ #include "system/block-backend.h"
+@@ -4066,9 +4067,11 @@
+         goto finish;
+     }
+ 
+-    /* Create and open the file (protocol layer) */
+-    ret = bdrv_co_create_file(filename, opts, true, errp);
+-    if (ret < 0) {
++    /* The supervisor already created the exclusive, empty output.
++     * Open the one granted object directly as the protocol node. */
++    if (!arx_witness_output(filename)) {
++        error_setg(errp, "No witnessed qcow2 output reservation");
++        ret = -EACCES;
+         goto finish;
+     }
+ 
+@@ -4161,16 +4164,8 @@
+     /* Create the qcow2 image (format layer) */
+     ret = qcow2_co_create(create_options, errp);
+ finish:
+-    if (ret < 0) {
+-        bdrv_graph_co_rdlock();
+-        bdrv_co_delete_file_noerr(bs);
+-        if (!keep_data_file) {
+-            bdrv_co_delete_file_noerr(data_bs);
+-        }
+-        bdrv_graph_co_rdunlock();
+-    } else {
+-        ret = 0;
+-    }
++    /* The reserved name and its settlement belong to the supervisor.
++     * The helper exclusively owns I/O to the one granted handle. */
+ 
+     qobject_unref(qdict);
+     bdrv_co_unref(bs);
+diff --git a/hw/core/loader.c b/hw/core/loader.c
+--- a/hw/core/loader.c
++++ b/hw/core/loader.c
+@@ -43,6 +43,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/arx-witness.h"
+ #include "qemu/datadir.h"
+ #include "qemu/error-report.h"
+ #include "qapi/error.h"
+@@ -81,7 +82,7 @@
+     int fd;
+     int64_t size;
+ 
+-    fd = qemu_open(filename, O_RDONLY | O_BINARY, errp);
++    fd = arx_witness_rom_fd(filename, ARX_ROM_SIZE);
+ 
+     if (fd < 0) {
+         return -1;
+@@ -105,7 +106,7 @@
+     int fd;
+     ssize_t actsize, l = 0;
+ 
+-    fd = open(filename, O_RDONLY | O_BINARY);
++    fd = arx_witness_rom_fd(filename, ARX_ROM_READ);
+     if (fd < 0) {
+         return -1;
+     }
+@@ -1086,7 +1087,6 @@
+     MachineClass *mc = MACHINE_GET_CLASS(qdev_get_machine());
+     Rom *rom;
+     gsize size;
+-    g_autoptr(GError) gerr = NULL;
+     char devpath[100];
+ 
+     if (as && mr) {
+@@ -1104,10 +1104,8 @@
+         rom->path = g_strdup(file);
+     }
+ 
+-    if (!g_file_get_contents(rom->path, (gchar **) &rom->data,
+-                             &size, &gerr)) {
+-        fprintf(stderr, "rom: file %-20s: error %s\n",
+-                rom->name, gerr->message);
++    if (!arx_witness_rom_read(rom->path, &rom->data, &size)) {
++        fprintf(stderr, "rom: witnessed read failed\n");
+         goto err;
+     }
+ 
+diff --git a/include/qemu/arx-witness.h b/include/qemu/arx-witness.h
+new file mode 100644
+--- /dev/null
++++ b/include/qemu/arx-witness.h
+@@ -0,0 +1,25 @@
++/*
++ * Arxcovo qualification consumer-open witness, protocol v1.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef QEMU_ARX_WITNESS_H
++#define QEMU_ARX_WITNESS_H
++
++enum {
++    ARX_ROM_SIZE = 1,
++    ARX_ROM_READ = 2,
++    ARX_BLOCK_OPEN = 3,
++};
++
++void arx_witness_system(int argc, char **argv);
++void arx_witness_img(int argc, char **argv);
++char *arx_witness_find_rom(const char *name);
++int arx_witness_rom_fd(const char *name, unsigned site);
++bool arx_witness_rom_read(const char *name, uint8_t **data, gsize *size);
++HANDLE arx_witness_block(const char *name, bool write);
++bool arx_witness_output(const char *name);
++bool arx_witness_qmp(const char *command);
++void arx_witness_startup(void);
++void arx_witness_finish(void);
++
++#endif
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -15,7 +15,7 @@
+ add_test_setup('thorough',
+                env: ['G_TEST_SLOW=1', 'SPEED=thorough', 'RUST_BACKTRACE=1'])
+ 
+-meson.add_postconf_script(find_program('scripts/symlink-install-tree.py'))
++# Skip developer bundle symlinks for the unprivileged Windows build.
+ 
+ ####################
+ # Global variables #
+diff --git a/monitor/qmp.c b/monitor/qmp.c
+--- a/monitor/qmp.c
++++ b/monitor/qmp.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/arx-witness.h"
+ 
+ #include "chardev/char-io.h"
+ #include "monitor-internal.h"
+@@ -276,7 +277,12 @@
+ {
+     QDict *rsp;
+     QDict *error;
+-
++    QDict *request = qobject_to(QDict, req);
++    const char *command = request ? qdict_get_try_str(request, "execute") : NULL;
++
++    if (!arx_witness_qmp(command) || qdict_haskey(request, "exec-oob")) {
++        ExitProcess(125);
++    }
+     rsp = qmp_dispatch(mon->commands, req, qmp_oob_enabled(mon),
+                        &mon->parent_obj);
+ 
+@@ -293,6 +299,12 @@
+     }
+ 
+     monitor_qmp_respond(mon, rsp);
++    if (!strcmp(command, "query-status") && rsp) {
++        QDict *result = qdict_get_qdict(rsp, "return");
++        if (result && !g_strcmp0(qdict_get_try_str(result, "status"), "prelaunch")) {
++            arx_witness_startup();
++        }
++    }
+     qobject_unref(rsp);
+ }
+ 
+diff --git a/qemu-img.c b/qemu-img.c
+--- a/qemu-img.c
++++ b/qemu-img.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/arx-witness.h"
+ #include <getopt.h>
+ 
+ #include "qemu/help-texts.h"
+@@ -5969,6 +5970,7 @@
+     signal(SIGPIPE, SIG_IGN);
+ #endif
+ 
++    arx_witness_img(argc, argv);
+     socket_init();
+     error_init(argv[0]);
+     module_call_init(MODULE_INIT_TRACE);
+@@ -6046,7 +6048,11 @@
+             argc -= optind;
+             qemu_reset_optind();
+             argv[0] = argv0;
+-            return cmd->handler(cmd, argc, argv);
++            int result = cmd->handler(cmd, argc, argv);
++            if (result == 0) {
++                arx_witness_finish();
++            }
++            return result;
+         }
+     }
+ 
+diff --git a/system/main.c b/system/main.c
+--- a/system/main.c
++++ b/system/main.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/arx-witness.h"
+ #include "qemu-main.h"
+ #include "qemu/main-loop.h"
+ #include "system/replay.h"
+@@ -52,6 +53,9 @@
+     bql_unlock();
+     replay_mutex_unlock();
+ 
++    if (status == 0) {
++        arx_witness_finish();
++    }
+     exit(status);
+ }
+ 
+@@ -68,6 +72,7 @@
+ 
+ int main(int argc, char **argv)
+ {
++    arx_witness_system(argc, argv);
+     qemu_init(argc, argv);
+ 
+     /*
+diff --git a/util/arx-witness.c b/util/arx-witness.c
+new file mode 100644
+--- /dev/null
++++ b/util/arx-witness.c
+@@ -0,0 +1,398 @@
++/*
++ * Arxcovo qualification consumer-open witness, protocol v1.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/bswap.h"
++#include "qemu/units.h"
++#include "qemu/arx-witness.h"
++
++enum {
++    FRAME_BYTES = 48,
++    NONCE_BYTES = 16,
++    MAX_SEQUENCE = 64,
++    MAX_ROM_BYTES = 16 * MiB,
++};
++
++enum {
++    INIT = 1,
++    REQUEST = 2,
++    GRANT = 3,
++    ADOPT = 4,
++    ACK = 5,
++    STARTUP = 6,
++    TERMINAL = 7,
++};
++
++enum {
++    PAUSED = 1,
++    INFO = 2,
++    CREATE = 3,
++};
++
++enum {
++    BIOS = 1,
++    VAPIC = 2,
++    IMAGE = 3,
++    GOLDEN = 4,
++    OUTPUT = 5,
++};
++
++static HANDLE rx, tx;
++static uint8_t nonce[NONCE_BYTES];
++static unsigned stage, sequence;
++static SRWLOCK wire_lock = SRWLOCK_INIT;
++static const char *bios, *image, *golden;
++static char *vapic;
++static bool output_taken, startup;
++
++static G_NORETURN void refuse(void)
++{
++    /* No path, peer text, nonce or handle is part of an error report. */
++    ExitProcess(125);
++}
++
++static void transfer(HANDLE pipe, uint8_t *p, DWORD size, bool write)
++{
++    while (size) {
++        DWORD count = 0;
++        BOOL ok = write ? WriteFile(pipe, p, size, &count, NULL)
++                        : ReadFile(pipe, p, size, &count, NULL);
++        if (!ok || !count || count > size) {
++            refuse();
++        }
++        size -= count;
++        p += count;
++    }
++}
++
++static void frame(uint8_t *p, unsigned kind, unsigned role, unsigned site,
++                  bool write, uint64_t handle)
++{
++    memset(p, 0, FRAME_BYTES);
++    memcpy(p, "ARXW", 4);
++    p[4] = 1; /* wire version */
++    p[5] = 1; /* open-table version */
++    p[6] = kind;
++    p[7] = stage;
++    memcpy(p + 8, nonce, NONCE_BYTES);
++    stl_le_p(p + 24, sequence);
++    p[28] = role;
++    p[29] = site;
++    p[30] = write;
++    stq_le_p(p + 32, handle);
++}
++
++static void send_frame(unsigned kind, unsigned role, unsigned site, bool write,
++                       uint64_t handle)
++{
++    uint8_t p[FRAME_BYTES];
++
++    frame(p, kind, role, site, write, handle);
++    transfer(tx, p, sizeof(p), true);
++}
++
++static uint64_t recv_frame(unsigned kind, unsigned role, unsigned site,
++                           bool write)
++{
++    uint8_t p[FRAME_BYTES], expected[FRAME_BYTES];
++    uint64_t handle;
++
++    transfer(rx, p, sizeof(p), false);
++    handle = ldq_le_p(p + 32);
++    if ((kind == GRANT) != (handle != 0)) {
++        refuse();
++    }
++    frame(expected, kind, role, site, write, handle);
++    if (memcmp(p, expected, sizeof(p))) {
++        refuse();
++    }
++    return handle;
++}
++
++static HANDLE endpoint(const wchar_t *name)
++{
++    wchar_t text[17];
++    DWORD count = GetEnvironmentVariableW(name, text, ARRAY_SIZE(text));
++    uintptr_t value = 0;
++    DWORD i;
++    HANDLE handle;
++
++    if (!count || count >= ARRAY_SIZE(text) || text[0] == L'0') {
++        refuse();
++    }
++    for (i = 0; i < count; i++) {
++        unsigned digit;
++        if (text[i] >= L'0' && text[i] <= L'9') {
++            digit = text[i] - L'0';
++        } else if (text[i] >= L'a' && text[i] <= L'f') {
++            digit = text[i] - L'a' + 10;
++        } else {
++            refuse();
++        }
++        value = (value << 4) | digit;
++    }
++    handle = (HANDLE)value;
++    if (handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_PIPE
++        || handle == GetStdHandle(STD_INPUT_HANDLE)
++        || handle == GetStdHandle(STD_OUTPUT_HANDLE)
++        || handle == GetStdHandle(STD_ERROR_HANDLE)
++        || !SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)
++        || !SetEnvironmentVariableW(name, NULL)) {
++        refuse();
++    }
++    return handle;
++}
++
++static void constrain_loader(void)
++{
++    /* The launcher separately constrains and witnesses initial imports. */
++    if (!SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)) {
++        refuse();
++    }
++}
++
++static void init(unsigned expected_stage)
++{
++    uint8_t p[FRAME_BYTES], expected[FRAME_BYTES];
++    const uint8_t zero_nonce[NONCE_BYTES] = {0};
++
++    stage = expected_stage;
++    rx = endpoint(L"ARX_WITNESS_RX");
++    tx = endpoint(L"ARX_WITNESS_TX");
++    if (rx == tx) {
++        refuse();
++    }
++    transfer(rx, p, sizeof(p), false);
++    memcpy(nonce, p + 8, sizeof(nonce));
++    frame(expected, INIT, 0, 0, false, 0);
++    if (!memcmp(nonce, zero_nonce, sizeof(nonce))
++        || memcmp(p, expected, sizeof(p))) {
++        refuse();
++    }
++}
++
++static bool exact(const char *a, const char *b)
++{
++    return a && b && !strcmp(a, b);
++}
++
++/* Paths are selectors from the sealed argv. The grant has no pathname. */
++static bool drive_path(const char *s)
++{
++    return strlen(s) >= 4 && strlen(s) < MAX_PATH &&
++        g_ascii_isalpha(s[0]) && s[1] == ':' &&
++        (s[2] == '/' || s[2] == '\\') &&
++        !strpbrk(s + 2, ":*?<>|\"\r\n");
++}
++
++void arx_witness_system(int argc, char **argv)
++{
++    static const char *fixed[] = {
++        "-no-user-config", "-nodefaults", "-display", "none",
++        "-serial", "none", "-monitor", "none", "-nic", "none",
++        "-accel", "whpx", "-machine", "pc-q35-11.1", "-smp", "1",
++        "-m", "256M", "-L", NULL, "-bios", NULL, "-S",
++        "-chardev", "stdio,id=arxqmp,signal=off",
++        "-mon", "chardev=arxqmp,mode=control",
++    };
++    size_t i;
++
++    constrain_loader();
++    if (argc != (int)ARRAY_SIZE(fixed) + 1) {
++        refuse();
++    }
++    for (i = 0; i < ARRAY_SIZE(fixed); i++) {
++        if (fixed[i] ? !exact(argv[i + 1], fixed[i])
++                     : !drive_path(argv[i + 1])) {
++            refuse();
++        }
++    }
++    bios = argv[22];
++    if (!g_str_has_suffix(bios, "/bios-256k.bin") &&
++        !g_str_has_suffix(bios, "\\bios-256k.bin")) {
++        refuse();
++    }
++    vapic = g_strdup_printf("%s/kvmvapic.bin", argv[20]);
++    init(PAUSED);
++}
++
++void arx_witness_img(int argc, char **argv)
++{
++    const char *size;
++
++    constrain_loader();
++    if (argc == 6 && exact(argv[1], "info") &&
++        exact(argv[2], "--output=json") && exact(argv[3], "-f") &&
++        exact(argv[4], "qcow2") && drive_path(argv[5])) {
++        image = argv[5];
++        init(INFO);
++        return;
++    }
++    if ((argc != 8 && argc != 12) || !exact(argv[1], "create") ||
++        !exact(argv[2], "-f") || !exact(argv[3], "qcow2") ||
++        !exact(argv[4], "-o") ||
++        !exact(argv[5], "compat=1.1,cluster_size=65536,lazy_refcounts=off") ||
++        !drive_path(argv[argc - 2])) {
++        refuse();
++    }
++    image = argv[argc - 2];
++    size = argv[argc - 1];
++    if (!*size || *size == '0' || strlen(size) > 19 ||
++        strspn(size, "0123456789") != strlen(size)) {
++        refuse();
++    }
++    if (argc == 12) {
++        if (!exact(argv[6], "-F") || !exact(argv[7], "qcow2") ||
++            !exact(argv[8], "-b") || !drive_path(argv[9]) ||
++            !g_ascii_strcasecmp(image, argv[9])) {
++            refuse();
++        }
++        golden = argv[9];
++    }
++    init(CREATE);
++}
++
++static void next_sequence(void)
++{
++    if (++sequence > MAX_SEQUENCE) {
++        refuse();
++    }
++}
++
++static HANDLE adopt(unsigned role, unsigned site, bool write)
++{
++    HANDLE file;
++    DWORD flags;
++    uint64_t value;
++
++    AcquireSRWLockExclusive(&wire_lock);
++    if (!role || (role == OUTPUT && output_taken)) {
++        refuse();
++    }
++    next_sequence();
++    send_frame(REQUEST, role, site, write, 0);
++    value = recv_frame(GRANT, role, site, write);
++    file = (HANDLE)(uintptr_t)value;
++    if (file == INVALID_HANDLE_VALUE || GetFileType(file) != FILE_TYPE_DISK ||
++        !GetHandleInformation(file, &flags) || (flags & HANDLE_FLAG_INHERIT)) {
++        refuse();
++    }
++    send_frame(ADOPT, role, site, write, value);
++    recv_frame(ACK, role, site, write);
++    if (role == OUTPUT) {
++        output_taken = true;
++    }
++    ReleaseSRWLockExclusive(&wire_lock);
++    return file;
++}
++
++char *arx_witness_find_rom(const char *name)
++{
++    if (stage == PAUSED && exact(name, bios)) {
++        return g_strdup(bios);
++    }
++    if (stage == PAUSED && exact(name, "kvmvapic.bin")) {
++        return g_strdup(vapic);
++    }
++    refuse();
++}
++
++int arx_witness_rom_fd(const char *name, unsigned site)
++{
++    unsigned role = 0;
++    HANDLE file;
++    int fd;
++
++    if (stage == PAUSED && exact(name, bios)) {
++        role = BIOS;
++    } else if (stage == PAUSED && site == ARX_ROM_READ && exact(name, vapic)) {
++        role = VAPIC;
++    }
++    file = adopt(role, site, false);
++    fd = _open_osfhandle((intptr_t)file, O_RDONLY | O_BINARY);
++    if (fd < 0) {
++        CloseHandle(file);
++        refuse();
++    }
++    return fd;
++}
++
++bool arx_witness_rom_read(const char *name, uint8_t **data, gsize *size)
++{
++    int fd = arx_witness_rom_fd(name, ARX_ROM_READ);
++    int64_t length = lseek(fd, 0, SEEK_END);
++    g_autofree uint8_t *buffer = NULL;
++    size_t offset = 0;
++
++    if (length <= 0 || length > MAX_ROM_BYTES || lseek(fd, 0, SEEK_SET) != 0) {
++        close(fd);
++        return false;
++    }
++    buffer = g_malloc(length);
++    while (offset < length) {
++        int n = read(fd, buffer + offset, length - offset);
++        if (n <= 0) {
++            close(fd);
++            return false;
++        }
++        offset += n;
++    }
++    if (close(fd) != 0) {
++        return false;
++    }
++    *data = g_steal_pointer(&buffer);
++    *size = length;
++    return true;
++}
++
++bool arx_witness_output(const char *name)
++{
++    return stage == CREATE && exact(name, image);
++}
++
++HANDLE arx_witness_block(const char *name, bool write)
++{
++    unsigned role = 0;
++
++    if (write && arx_witness_output(name)) {
++        role = OUTPUT;
++    } else if (!write && stage == INFO && exact(name, image)) {
++        role = IMAGE;
++    } else if (!write && stage == CREATE && exact(name, golden)) {
++        role = GOLDEN;
++    }
++    return adopt(role, ARX_BLOCK_OPEN, write);
++}
++
++bool arx_witness_qmp(const char *command)
++{
++    return exact(command, "qmp_capabilities") || exact(command, "query-status")
++        || exact(command, "quit") || (startup && exact(command, "cont"));
++}
++
++void arx_witness_startup(void)
++{
++    AcquireSRWLockExclusive(&wire_lock);
++    if (!startup) {
++        next_sequence();
++        send_frame(STARTUP, 0, 0, false, 0);
++        recv_frame(ACK, 0, 0, false);
++        startup = true;
++    }
++    ReleaseSRWLockExclusive(&wire_lock);
++}
++
++void arx_witness_finish(void)
++{
++    AcquireSRWLockExclusive(&wire_lock);
++    if ((stage == PAUSED && !startup) || (stage == CREATE && !output_taken)) {
++        refuse();
++    }
++    next_sequence();
++    send_frame(TERMINAL, 0, 0, false, 0);
++    recv_frame(ACK, 0, 0, false);
++    CloseHandle(tx);
++    CloseHandle(rx);
++    ReleaseSRWLockExclusive(&wire_lock);
++}
+diff --git a/util/datadir.c b/util/datadir.c
+--- a/util/datadir.c
++++ b/util/datadir.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/arx-witness.h"
+ #include "qemu/datadir.h"
+ #include "qemu/cutils.h"
+ #include "trace.h"
+@@ -32,39 +33,10 @@
+ 
+ char *qemu_find_file(QemuFileType type, const char *name)
+ {
+-    int i;
+-    const char *subdir;
+-    char *buf;
+-
+-    /* Try the name as a straight path first */
+-    if (access(name, R_OK) == 0) {
+-        trace_load_file(name, name);
+-        return g_strdup(name);
++    if (type != QEMU_FILE_TYPE_BIOS) {
++        ExitProcess(125);
+     }
+-
+-    switch (type) {
+-    case QEMU_FILE_TYPE_BIOS:
+-        subdir = "";
+-        break;
+-    case QEMU_FILE_TYPE_DTB:
+-        subdir = "dtb/";
+-        break;
+-    case QEMU_FILE_TYPE_KEYMAP:
+-        subdir = "keymaps/";
+-        break;
+-    default:
+-        abort();
+-    }
+-
+-    for (i = 0; i < data_dir_idx; i++) {
+-        buf = g_strdup_printf("%s/%s%s", data_dir[i], subdir, name);
+-        if (access(buf, R_OK) == 0) {
+-            trace_load_file(name, buf);
+-            return buf;
+-        }
+-        g_free(buf);
+-    }
+-    return NULL;
++    return arx_witness_find_rom(name);
+ }
+ 
+ void qemu_add_data_dir(char *path)
+diff --git a/util/meson.build b/util/meson.build
+--- a/util/meson.build
++++ b/util/meson.build
+@@ -22,7 +22,7 @@
+ else
+   util_ss.add(files('aio-win32.c'))
+   util_ss.add(files('event_notifier-win32.c'))
+-  util_ss.add(files('oslib-win32.c'))
++  util_ss.add(files('oslib-win32.c', 'arx-witness.c'))
+   util_ss.add(files('qemu-thread-win32.c'))
+   util_ss.add(winmm, pathcch, synchronization)
+ endif
+diff --git a/util/qemu-thread-win32.c b/util/qemu-thread-win32.c
+--- a/util/qemu-thread-win32.c
++++ b/util/qemu-thread-win32.c
+@@ -36,7 +36,7 @@
+     static gsize _init_once = 0;
+ 
+     if (g_once_init_enter(&_init_once)) {
+-        kernel32_module = LoadLibrary("kernel32.dll");
++        kernel32_module = LoadLibraryExW(L"kernel32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+         if (kernel32_module) {
+             SetThreadDescriptionFunc =
+                 (pSetThreadDescription)GetProcAddress(kernel32_module,

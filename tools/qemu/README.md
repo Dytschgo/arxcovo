@@ -111,3 +111,130 @@ QEMU executable and package. The unselected backend follows the stock network
 paths. The paused WHPX checks cover startup and loopback listen, with guest
 boot, socket binding under traffic, route transitions and actual egress
 **unverified on real hardware**.
+
+## M4 qualification witness distribution
+
+The Windows x64 candidate ID is `qemu-11.1.3-arx-witness-1-windows-x64`.
+The [build receipt](witness-receipt.json) binds the signed QEMU source,
+patch, toolchain inputs, wire version 1, open table version 1, and the
+[complete payload inventory](witness-payload.sha256). The inventory
+includes the byte count and SHA-256 of each file, including firmware
+names containing commas. Its installed name is `MANIFEST.sha256`.
+Install the byte-identical receipt beside it as `RECEIPT.txt`.
+Independent distribution review is pending. QMP retains upstream version
+11.1.3.
+
+The system executable accepts the paused WHPX recipe from 7b2 with its
+sealed BIOS and bundle data locations. The image tool accepts the sealed
+qcow2 JSON info and qcow2 create recipes, including create with one
+approved backing golden. These are the only entry points in this
+candidate. Guest install, installed boot and detached verification
+recipes require their own reviewed coverage. The stock qualification
+runner still refuses the open contract. The public-egress distribution
+has a separate pin and build.
+
+The binaries constrain dynamic loads to System32, including the
+explicit WHPX and kernel32 requests. TCG is compiled out. Initial
+imports, activation context, actual System32 resolution, late events,
+and the Job and dynamic-code policies require the native launcher and
+debugger proof specified by ADR 0054. At build time the packager checks
+the x64 PE format and resolves the static import closure against pinned
+UCRT64 payload files, Windows System32 names and API sets. That inventory
+does not establish which objects actually map.
+
+### Consumer channel
+
+Use two private byte pipes with child endpoints in the launch handle
+allowlist. The launcher sets `ARX_WITNESS_RX` and `ARX_WITNESS_TX` to the
+respective positive child handle values in lowercase hexadecimal without
+prefix or leading zero. The child checks pipe type, excludes the stdio
+handles, clears inheritance and removes both environment entries.
+The launcher's deadline bounds channel waits. Incomplete or mismatched
+frames and refused operations cause process exit with status 125.
+Callers of the qualification runner cannot select the endpoints or
+construct channel messages.
+
+Records are exactly 48 bytes. Multibyte fields are little-endian.
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | 4 | ASCII magic `ARXW` |
+| 4 | 1 | Wire version 1 |
+| 5 | 1 | Open-table version 1 |
+| 6 | 1 | Kind |
+| 7 | 1 | Stage (1 paused, 2 info, 3 create) |
+| 8 | 16 | Nonzero launcher-generated launch nonce |
+| 24 | 4 | Sequence |
+| 28 | 1 | Role |
+| 29 | 1 | Site |
+| 30 | 1 | Write bit (0 or 1) |
+| 31 | 1 | Zero |
+| 32 | 8 | Child handle value, or zero when absent |
+| 40 | 8 | Zero |
+
+The supervisor sends INIT (1) with sequence zero to bind the selected
+stage and the nonce. After init, the child increments the sequence once
+for each open or barrier, up to 64. For an open the child sends REQUEST
+(2) and the supervisor sends GRANT (3) with the child-local handle. The
+child responds with ADOPT (4) carrying the same live handle. The
+supervisor duplicates it back from the held child and checks its
+identity, rights and role against the grant before sending ACK (5).
+Each exchange repeats the nonce, stage, sequence, role, site and write
+bit. ACK has a zero handle field. A pathname never travels on the wire.
+The supervisor selects the handle from its sealed plan and role
+bindings.
+
+The child sends STARTUP (6) once, after responding to `query-status`
+with QMP `prelaunch`. It gates `cont` on the matching ACK. The child
+sends TERMINAL (7) following successful cleanup or helper return and
+waits for ACK before exit. INIT, STARTUP, TERMINAL and their applicable
+ACK records have zero role, site, write and handle fields. A refused
+launch can exit without a terminal record.
+
+| Stage | Role and site values | File consumption |
+| --- | --- | --- |
+| Paused | BIOS (1), ROM size (1) | Firmware size from the granted `share/bios-256k.bin` handle |
+| Paused | BIOS (1), ROM read (2) | ROM bytes from the granted `share/bios-256k.bin` handle |
+| Paused | VAPIC (2), ROM read (2) | ROM bytes from the granted `share/kvmvapic.bin` handle |
+| Info | Image (3), block open (3) | One read handle to the enrolled golden or offline qcow2. The sealed info command leaves backing traversal off. |
+| Create | Golden (4), block open (3) | One read handle when the sealed command names the approved backing golden |
+| Create | Output (5), block open (3) | The single write-capable grant for the already reserved, empty output |
+
+Firmware resolution in the paused recipe uses exact selectors. The
+ROM reader consumes the granted handle through the CRT descriptor.
+The helper's Windows file protocol uses its granted handle for
+metadata, data I/O, and the output flush. The qcow2 create path skips
+its ordinary by-name file creation step and reuses one protocol node
+until its output handle closes. This build refuses the Windows
+host-device driver and generic file create and block reopen paths.
+
+### Rebuild and evidence
+
+Verify the upstream detached signature with the fingerprint in the
+receipt. Verify the MSYS2 base signature and all archive and detached
+signature digests in [the input lock](witness-toolchain.sha256).
+Use the pinned base and the package set from the lock. Extract the
+upstream archive in D: scratch. The source archive's unavailable
+symlinks in unused firmware source and test trees are unnecessary
+for these build targets. Apply the patch from the source root with
+`git -c core.autocrlf=false apply arxcovo-witness.patch` after checking
+its digest. Use an out-of-tree UCRT64 build. Invoke configure with
+the ordered receipt arguments, then build `qemu-system-x86_64.exe`,
+`qemu-img.exe`, `trace/trace-events-all`, and the EDK2 targets named in
+the Meson install inventory. Use `SOURCE_DATE_EPOCH=0` for compilation
+and set the repository's D: scratch and resource limits.
+
+Run `package-witness.ps1 -Build <build> -Source <source> -UcrtBin <bin>
+-Stage <new-directory>` with the pinned toolchain on PATH. Compare the
+complete staged manifest and both executables to the receipt, then add
+the receipt. Package scripts use new output directories.
+
+On Windows, `python -I -B tools/qemu/test-witness.py <staged-directory>`
+exercises synthetic, unbacked and backed create and short-lived info
+reads. It checks the retained output object and rejected writer opens,
+stale sequences, wrong role and nonce, and missing grants. It exercises
+system executable refusal before WHPX initialization. The fixture
+demonstrates child framing and handle use. It uses neither a qualifying
+debugger nor VM dispatch. The real witness, the closed native resource
+inventory required by ADR 0054, and full recipe coverage are
+**unverified on real hardware**.
