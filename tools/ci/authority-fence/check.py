@@ -10,7 +10,9 @@ block from the ``Baseline`` documentation against the built arxd library.
   the struct's own fields.
 - The ``no_run`` positive control passes only if rustc exits 0 with no
   error, so each refusal is the fence and not a missing path.
-- Output that cannot be parsed fails the block.
+- With ``--error-format=json`` every nonempty stderr line is a JSON
+  diagnostic. Any other nonempty line, or one that does not parse, fails
+  the block, whatever its tag and exit status.
 
 Everything is read-only. Scratch output goes to a temporary directory.
 """
@@ -80,11 +82,14 @@ def program(body):
 
 def errors(stderr):
     """The error diagnostics in rustc's JSON output, without the summary.
-    A line that looks like JSON but does not parse raises ValueError."""
+    Every nonempty line must be a JSON object; a plain-text line or one that
+    does not parse raises ValueError."""
     found = []
     for line in stderr.splitlines():
-        if not line.startswith("{"):
+        if not line.strip():
             continue
+        if not line.startswith("{"):
+            raise ValueError(f"non-JSON compiler output: {line[:120]!r}")
         diagnostic = json.loads(line)
         if not isinstance(diagnostic, dict):
             raise ValueError("diagnostic is not an object")
@@ -122,6 +127,14 @@ def verdict(tag, status, found):
     if stray:
         return f"failed for another reason: {stray}"
     return None
+
+
+def judge(tag, status, stderr):
+    """The block's verdict from rustc's exit status and its complete stderr."""
+    try:
+        return verdict(tag, status, errors(stderr))
+    except ValueError as error:
+        return f"unparseable compiler output: {error}"
 
 
 def library():
@@ -199,10 +212,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="arx-fence-") as directory:
         for index, (tag, body) in enumerate(found):
             status, stderr = compile_block(body, rlib, deps, Path(directory), index)
-            try:
-                reason = verdict(tag, status, errors(stderr))
-            except ValueError as error:
-                reason = f"unparseable compiler output: {error}"
+            reason = judge(tag, status, stderr)
             outcome = "ok" if reason is None else f"FAILED: {reason}"
             print(f"block {index} ({tag}): {outcome}")
             failures += reason is not None

@@ -1556,6 +1556,15 @@ fn assert_path_free(bytes: &[u8]) {
 }
 
 #[test]
+fn a_failed_publication_reports_a_typed_path_free_retry_rule() {
+    let line = crate::failure_line(&RunError::Output);
+    assert!(line.starts_with("Output:"), "{line}");
+    assert!(line.contains("fresh empty directory"), "{line}");
+    assert_path_free(line.as_bytes());
+    assert_eq!(crate::failure_line(&RunError::Incomplete), "Incomplete");
+}
+
+#[test]
 fn a_blocked_native_run_publishes_only_incomplete_diagnostics_with_the_summary_last() {
     let mut unmeasured = deps();
     unmeasured.owner_profile = Measured::Unmeasured;

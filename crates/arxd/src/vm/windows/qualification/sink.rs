@@ -11,6 +11,12 @@
 //! Every file is committed through a hidden temporary entry that is
 //! written, flushed and renamed relative to the held directory, so an
 //! interrupted write never leaves an entry under a final name.
+//!
+//! An evidence directory serves one run. Before a claim exists, a directory
+//! holding only the sink's own temporary entries is debris of an interrupted
+//! commit, and the claim removes those entries through the held handle.
+//! Once a claim exists the directory belongs to that run whatever its
+//! outcome, and a retry uses a fresh empty directory.
 
 use super::*;
 use serde::Serialize;
@@ -96,9 +102,18 @@ enum Step {
 thread_local! {
     /// Test-only: fail one commit step of one file name on this thread.
     static FAULT: Cell<Option<(&'static str, Step)>> = const { Cell::new(None) };
+    /// Test-only: end the whole process at one commit step, as a kill would.
+    static EXIT: Cell<Option<(&'static str, Step)>> = const { Cell::new(None) };
 }
 
 fn fault(name: &str, step: Step) -> io::Result<()> {
+    #[cfg(test)]
+    if EXIT
+        .with(Cell::get)
+        .is_some_and(|(at, when)| at == name && when == step)
+    {
+        std::process::exit(3);
+    }
     #[cfg(test)]
     if FAULT
         .with(Cell::get)
@@ -134,7 +149,11 @@ impl EvidenceDir {
         private_values: &[&str],
     ) -> Result<Self, NativeRefusal> {
         let reason = NativeRefusal::PathCustodyUnverified;
-        if !held_private(&pin.leaf, owner) || !empty(&pin.leaf)? {
+        if !held_private(&pin.leaf, owner) {
+            return Err(reason);
+        }
+        clear_debris(&pin.leaf).map_err(|_| reason)?;
+        if !empty(&pin.leaf)? {
             return Err(reason);
         }
         let (mut scope, mut run) = ([0; 32], [0; 16]);
@@ -284,7 +303,7 @@ impl EvidenceDir {
     /// relative to the held directory. On any failure the temporary entry is
     /// deleted with its handle and no final name appears.
     fn commit(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        let temporary = create_hidden(&self.pin.leaf, &format!(".{name}.partial"))?;
+        let temporary = create_hidden(&self.pin.leaf, &temporary_name(name))?;
         let committed = finish_commit(&temporary, &self.pin.leaf, name, bytes);
         if committed.is_err() {
             let _ = discard(&temporary);
@@ -338,9 +357,64 @@ fn finish_commit(file: &File, dir: &File, name: &str, bytes: &[u8]) -> io::Resul
     rename_within(file, dir, name)
 }
 
+/// The sink's own temporary entry for a final name.
+fn temporary_name(name: &str) -> String {
+    format!(".{name}.partial")
+}
+
+/// Exactly one of the sink's fixed temporary names: the claim's or a
+/// diagnostic file's.
+fn is_temporary(name: &str) -> bool {
+    std::iter::once(CLAIM)
+        .chain(super::schema::RECORD_KINDS.iter().map(|file| file.name()))
+        .chain([DiagnosticFile::Incomplete.name()])
+        .any(|final_name| name == temporary_name(final_name))
+}
+
+/// Before a claim exists, a directory whose every entry is a regular file
+/// with one of the sink's fixed temporary names holds only the debris of an
+/// interrupted commit. Each entry is opened exclusively relative to the
+/// held handle and deleted through that handle. Anything else is left
+/// untouched, and the emptiness check then refuses the claim.
+fn clear_debris(dir: &File) -> io::Result<()> {
+    let entries = listing(dir)?;
+    let debris = entries.iter().all(|(name, attributes)| {
+        is_temporary(name)
+            && attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0
+    });
+    if !debris {
+        return Ok(());
+    }
+    for (name, _) in &entries {
+        // An entry another process still holds open refuses the exclusive
+        // open, so a live commit is never disturbed.
+        let entry = open_child(dir, name, DELETE | SYNCHRONIZE, 0, FILE_OPEN)?;
+        discard(&entry)?;
+    }
+    Ok(())
+}
+
 /// Exclusively create a hidden entry under the held directory, with the
 /// delete access its rename or disposal needs.
 fn create_hidden(dir: &File, name: &str) -> io::Result<File> {
+    open_child(
+        dir,
+        name,
+        FILE_GENERIC_WRITE | DELETE,
+        FILE_ATTRIBUTE_HIDDEN,
+        FILE_CREATE,
+    )
+}
+
+/// Open or create one regular, non-reparse entry relative to the held
+/// directory, with no sharing.
+fn open_child(
+    dir: &File,
+    name: &str,
+    access: u32,
+    attributes_on_create: u32,
+    disposition: u32,
+) -> io::Result<File> {
     let mut units: Vec<u16> = name.encode_utf16().collect();
     let bytes = u16::try_from(units.len() * 2).map_err(io::Error::other)?;
     let object = UNICODE_STRING {
@@ -363,13 +437,13 @@ fn create_hidden(dir: &File, name: &str) -> io::Result<File> {
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            FILE_GENERIC_WRITE | DELETE,
+            access,
             &attributes,
             &mut status_block,
             null(),
-            FILE_ATTRIBUTE_HIDDEN,
+            attributes_on_create,
             0,
-            FILE_CREATE,
+            disposition,
             FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
             null(),
             0,
@@ -837,6 +911,99 @@ mod tests {
         );
         assert_eq!(names(&held), ["stale.json"]);
         assert!(names(&named).is_empty());
+    }
+
+    /// Set by the parent test for the child process it spawns.
+    const CHILD: &str = "ARX_SINK_INTERRUPTED_CLAIM";
+
+    /// Runs only as a child process: claim the named directory and end the
+    /// process after the claim bytes are written, before the rename.
+    #[test]
+    #[ignore = "child process of an_interrupted_child_claim_leaves_debris_a_retry_clears"]
+    fn interrupted_claim_child() {
+        let Some(path) = std::env::var_os(CHILD) else {
+            return;
+        };
+        let path = LocalPath::parse(path.to_str().unwrap()).unwrap();
+        let (owner, _) = user();
+        EXIT.with(|exit| exit.set(Some((CLAIM, Step::Write))));
+        let _ = EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[]);
+        unreachable!("the claim ends the process before its rename");
+    }
+
+    #[test]
+    fn an_interrupted_child_claim_leaves_debris_a_retry_clears() {
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (owner, path) = private_dir(root.path(), "evidence");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "vm::windows::qualification::sink::tests::interrupted_claim_child",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(CHILD, path.as_str())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        // Exit code 3 comes only from the hook inside the claim's commit.
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(names(&path), [".claim.json.partial"]);
+        // The retry recognizes its own debris, deletes it through the held
+        // handle, and claims the same directory.
+        let dir = EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[])
+            .unwrap();
+        assert_eq!(names(&path), ["claim.json"]);
+        drop(dir);
+    }
+
+    #[test]
+    fn only_the_sinks_own_debris_is_removed_before_a_claim() {
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (owner, _) = user();
+        let put = |dir: &LocalPath, name: &str| {
+            std::fs::write(format!(r"{}\{name}", dir.as_str()), b"x").unwrap()
+        };
+        let claim = |dir: &LocalPath| {
+            EvidenceDir::claim(PathPin::open(dir, true, true).unwrap(), sid(&owner), &[])
+                .map(|_| ())
+        };
+        let refused = Err(NativeRefusal::PathCustodyUnverified);
+
+        // Record and summary temporaries alone are debris.
+        let (_, debris) = private_dir(root.path(), "debris");
+        put(&debris, ".inputs.json.partial");
+        put(&debris, ".incomplete.json.partial");
+        assert_eq!(claim(&debris), Ok(()));
+        assert_eq!(names(&debris), ["claim.json"]);
+
+        // A foreign entry beside debris refuses, and nothing is removed.
+        let (_, foreign) = private_dir(root.path(), "foreign");
+        put(&foreign, ".claim.json.partial");
+        put(&foreign, "notes.txt");
+        assert_eq!(claim(&foreign), refused);
+        assert_eq!(names(&foreign), [".claim.json.partial", "notes.txt"]);
+
+        // A look-alike outside the fixed names is not debris.
+        let (_, lookalike) = private_dir(root.path(), "lookalike");
+        put(&lookalike, ".notes.json.partial");
+        assert_eq!(claim(&lookalike), refused);
+        assert_eq!(names(&lookalike), [".notes.json.partial"]);
+
+        // A directory with a temporary name is not debris.
+        let (_, nested) = private_dir(root.path(), "nested");
+        std::fs::create_dir(format!(r"{}\.claim.json.partial", nested.as_str())).unwrap();
+        assert_eq!(claim(&nested), refused);
+        assert_eq!(names(&nested), [".claim.json.partial"]);
+
+        // Once a claim exists the directory is consumed: debris beside it
+        // still refuses, and the claim and debris both stay.
+        let (_, consumed) = private_dir(root.path(), "consumed");
+        put(&consumed, "claim.json");
+        put(&consumed, ".incomplete.json.partial");
+        assert_eq!(claim(&consumed), refused);
+        assert_eq!(names(&consumed), [".incomplete.json.partial", "claim.json"]);
     }
 
     #[test]

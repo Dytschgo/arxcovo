@@ -73,7 +73,7 @@ class VerdictTests(unittest.TestCase):
                 diagnostic(None, "unused variable", level="warning"),
                 diagnostic(None, "aborting due to 1 previous error"),
                 json.dumps({"$message_type": "artifact", "artifact": "x"}),
-                "plain text",
+                "",
             ]
         )
         self.assertEqual(
@@ -99,7 +99,7 @@ class VerdictTests(unittest.TestCase):
         self.assertIsNotNone(CHECK.verdict(tag, 0, [("E0451", "fields are private")]))
         # A failing exit without the structured code is not the fence.
         self.assertIsNotNone(CHECK.verdict(tag, 1, []))
-        self.assertIsNotNone(CHECK.verdict(tag, 101, CHECK.errors("error: rustc crashed\nplain text")))
+        self.assertIsNotNone(CHECK.judge(tag, 101, "error: rustc crashed\nplain text"))
         self.assertIsNotNone(CHECK.verdict(tag, 1, [("E0433", "failed to resolve")]))
 
     def test_the_positive_control_must_compile_cleanly(self):
@@ -109,12 +109,26 @@ class VerdictTests(unittest.TestCase):
 
     def test_a_positive_control_whose_compiler_fails_never_passes(self):
         # Exit 1 with plain text only and no structured diagnostic.
-        found = CHECK.errors("error: could not compile\nterminated before JSON output")
-        self.assertEqual(found, [])
-        self.assertIsNotNone(CHECK.verdict("no_run", 1, found))
+        self.assertIsNotNone(
+            CHECK.judge("no_run", 1, "error: could not compile\nterminated before JSON output")
+        )
+        self.assertIsNotNone(CHECK.verdict("no_run", 1, []))
+
+    def test_an_expected_code_followed_by_a_plain_fatal_line_fails(self):
+        tag = "compile_fail,E0451"
+        expected = diagnostic("E0451", "fields of struct `Baseline` are private")
+        fatal = "error: internal compiler error: unexpected panic"
+        self.assertIsNotNone(CHECK.judge(tag, 101, expected + "\n" + fatal))
+        # Control: the structured diagnostic alone, with blank lines, passes.
+        self.assertIsNone(CHECK.judge(tag, 101, "\n" + expected + "\n\n"))
+
+    def test_a_successful_positive_control_with_a_plain_error_line_fails(self):
+        self.assertIsNotNone(CHECK.judge("no_run", 0, "error: something went wrong"))
+        # Control: no output at all passes.
+        self.assertIsNone(CHECK.judge("no_run", 0, ""))
 
     def test_unparseable_json_output_is_an_error(self):
-        for stderr in ["{not json", '{"level": "error"', "plain text\n{1}", "{}x"]:
+        for stderr in ["{not json", '{"level": "error"', "plain text\n{1}", "{}x", "plain text"]:
             with self.assertRaises(ValueError, msg=stderr):
                 CHECK.errors(stderr)
 
