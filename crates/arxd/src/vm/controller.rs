@@ -46,6 +46,14 @@ impl AdmissionGate {
 }
 
 impl<C: Clock> VmController<C> {
+    pub(crate) fn compose_now(&self) -> Result<i64> {
+        utc(self.clock.now())
+    }
+
+    pub(crate) fn compose_store(&self) -> &VmStore {
+        &self.store
+    }
+
     pub(crate) fn windows_recipe_id() -> Id {
         template::windows_recipe_id()
     }
@@ -1389,10 +1397,11 @@ impl<C: Clock> VmController<C> {
     ) -> Result<Vec<ActivityReceipt>> {
         self.store.transact(|db| {
             let mut query = db.prepare(
-                "SELECT a.id,a.action,a.status,a.reason,a.vm,o.operation_id,
+                "SELECT a.id,a.action,a.status,a.reason,a.vm,coalesce(o.operation_id,c.id),
                         a.started_ms,a.finished_ms,a.cleanup_confirmed,
                         a.publication_failure
                    FROM activity a LEFT JOIN vm_operations o ON o.activity_id=a.id
+                   LEFT JOIN vm_compose_operations c ON c.activity_id=a.id
                    WHERE a.principal=?1 AND a.actor='agent'
                      AND (?2 IS NULL OR a.id<?2) AND (?3 IS NULL OR a.id=?3)
                    ORDER BY a.id DESC LIMIT ?4",
