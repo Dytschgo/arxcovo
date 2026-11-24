@@ -192,7 +192,7 @@ pub(in crate::vm) fn create_private(path: &Path) -> io::Result<File> {
     let handle = unsafe {
         CreateFileW(
             wide(path.as_os_str()).as_ptr(),
-            FILE_GENERIC_WRITE,
+            FILE_GENERIC_WRITE | DELETE,
             0,
             &attributes,
             CREATE_NEW,
@@ -206,6 +206,21 @@ pub(in crate::vm) fn create_private(path: &Path) -> io::Result<File> {
         return Err(created);
     }
     Ok(File::from(owned(handle)?))
+}
+
+/// Marks a file this process created for deletion through its own handle, so
+/// no by-path delete can race a concurrent reader. The file disappears when
+/// the last handle closes; other opens fail meanwhile.
+pub(in crate::vm) fn delete_on_close(file: &File) -> io::Result<()> {
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    ok(unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&info as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    })
 }
 
 fn require_owner(file: &File) -> io::Result<()> {

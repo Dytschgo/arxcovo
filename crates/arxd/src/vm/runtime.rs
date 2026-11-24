@@ -434,7 +434,7 @@ pub(crate) mod publication {
             paths::{ArtifactPin, LocalPath},
             publish::{
                 Hostname, TunnelId,
-                cloudflare::{DnsApi, DnsError, Reconciled, RecordId, Removal, Route},
+                cloudflare::{DnsApi, DnsError, Reconciled, RecordId, Removal, Route, Submission},
                 hex_id,
             },
             static_web::{ORIGIN_PORT_FIRST, ORIGIN_PORT_LAST, StaticName, StaticOriginIdentity},
@@ -657,14 +657,18 @@ pub(crate) mod publication {
             }
         }
 
-        async fn create(&self, route: &Route) -> Result<RecordId, DnsError> {
+        async fn create(
+            &self,
+            route: &Route,
+            submission: &Submission<'_>,
+        ) -> Result<RecordId, DnsError> {
             match *self {
                 #[cfg(not(any(test, all(windows, target_arch = "x86_64"))))]
                 Self::Closed(never) => match never {},
                 #[cfg(all(windows, target_arch = "x86_64"))]
-                Self::Native(ref dns) => dns.create(route).await,
+                Self::Native(ref dns) => dns.create(route, submission).await,
                 #[cfg(test)]
-                Self::Fixture(ref fake) => fake.create(route).await,
+                Self::Fixture(ref fake) => fake.create(route, submission).await,
             }
         }
 
@@ -940,6 +944,9 @@ pub(crate) mod publication {
         /// Parks the next publish worker, uncancellably, before any effect.
         #[cfg(test)]
         pub(crate) activate_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// Deferred stop completions and registry clears, in order.
+        #[cfg(test)]
+        pub(crate) events: std::sync::Mutex<Vec<&'static str>>,
         /// The registry size each cleanup observed on entry.
         #[cfg(test)]
         pub(crate) cleanup_registry: std::sync::Mutex<Vec<usize>>,
@@ -1030,12 +1037,11 @@ pub(crate) mod publication {
         /// activation can be current for `vm`.
         fn retire(&self, vm: Id) {
             let mut activations = self.activations();
-            if activations
-                .current
-                .as_ref()
-                .is_some_and(|current| current.vm == vm)
+            if let Some(current) = activations.current.take_if(|current| current.vm == vm)
+                && current.token.is_cancelled()
             {
-                activations.current = None;
+                // Kept until the cause is durable on the intent.
+                activations.revoked_retired = Some(vm);
             }
         }
 
@@ -1049,6 +1055,8 @@ pub(crate) mod publication {
 
         /// Daemon shutdown after every connector was confirmed stopped.
         fn retire_all(&self) {
+            #[cfg(test)]
+            self.events.lock().unwrap().push("cleared");
             let mut activations = self.activations();
             activations.current = None;
             activations.pending = None;
@@ -1129,7 +1137,10 @@ pub(crate) mod publication {
         pub(crate) async fn stop_activation(&self, generation: u64) -> bool {
             #[cfg(test)]
             let _ = hold(&self.stop_gate).await;
-            self.stop_where(|live| live.generation == generation).await
+            let stopped = self.stop_where(|live| live.generation == generation).await;
+            #[cfg(test)]
+            self.events.lock().unwrap().push("stopped");
+            stopped
         }
 
         /// Called before VM release. Local Job termination is independent of
@@ -1379,13 +1390,14 @@ pub(crate) mod publication {
             }
             #[cfg(test)]
             let _ = hold(&self.submit_gate).await;
-            // An owner revocation does not abandon a submitted POST: it
-            // completes or times out, and its acknowledged ID is then removed.
-            // Any cancellation (owner revocation, origin retirement or shutdown)
-            // that lands before the POST future is first polled has positive
-            // no-submission evidence. The first poll samples all three in the
-            // same step that claims submission and starts DNS; once claimed,
-            // the POST stays possible.
+            // The POST may reach Cloudflare only after its commit point, which
+            // the transport claims immediately before the first request byte,
+            // after connection and TLS setup. The commit re-samples owner
+            // revocation, origin retirement and shutdown. Anything that ends
+            // the request before that point (any cancellation, or a connection
+            // failure) is provably unsent. After it, an owner revocation lets
+            // the POST complete or time out and its acknowledged ID is then
+            // removed, while retirement or shutdown leaves it possible.
             let cause = || {
                 if origin.retired.is_cancelled() {
                     Some(Failure::OriginUnavailable)
@@ -1395,33 +1407,37 @@ pub(crate) mod publication {
                     None
                 }
             };
-            let polled = std::sync::atomic::AtomicBool::new(false);
-            let create = async {
-                if let Some(cancelled) = cause() {
-                    return Err(cancelled);
-                }
-                polled.store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok(prepared.dns.create(&route).await)
-            };
+            let cancelled = || cause().is_some();
+            let submission = Submission::new(&cancelled);
             let id = tokio::select! {
                 biased;
-                _ = origin.retired.cancelled() => Err(Failure::OriginUnavailable),
-                _ = shutdown.cancelled() => Err(Failure::Cancelled),
-                result = create => match result {
-                    Ok(created) => Ok(created.map_err(map)?),
-                    Err(cancelled) => Err(cancelled),
-                },
+                _ = origin.retired.cancelled() => Err(None),
+                _ = shutdown.cancelled() => Err(None),
+                // Owner revocation abandons the POST only before its commit.
+                _ = async {
+                    revoked.cancelled().await;
+                    if submission.committed() {
+                        std::future::pending::<()>().await;
+                    }
+                } => Err(None),
+                result = prepared.dns.create(&route, &submission) => result.map_err(Some),
             };
             let id = match id {
                 Ok(id) => id,
-                Err(cancelled) if polled.load(std::sync::atomic::Ordering::SeqCst) => {
-                    return Err((cancelled, Evidence::Unknown));
+                Err(error) if submission.committed() => {
+                    return Err(match error {
+                        Some(error) => map(error),
+                        None => (cause().unwrap_or(Failure::Cancelled), Evidence::Unknown),
+                    });
                 }
-                Err(cancelled) => {
+                Err(error) => {
+                    let cause = cause()
+                        .or(error.map(|error| map(error).0))
+                        .unwrap_or(Failure::Cancelled);
                     self.set_unsubmitted(Some(&intent.nonce));
                     let failure =
                         match controller.update_publication(&intent.nonce, Update::PostWithdrawn) {
-                            Ok(()) => cancelled,
+                            Ok(()) => cause,
                             Err(_) => Failure::CleanupUnconfirmed,
                         };
                     return Err((failure, Evidence::NotSubmitted));
@@ -1486,7 +1502,13 @@ pub(crate) mod publication {
                 let stale = if intent.phase == Phase::Published {
                     self.ready(&intent, shutdown).await.err().map(Some)
                 } else {
-                    Some(intent.reason)
+                    // An owner revocation whose checkpoint never became durable
+                    // is still the cause.
+                    Some(
+                        intent
+                            .reason
+                            .or_else(|| self.revoked(intent.vm).then_some(Failure::Cancelled)),
+                    )
                 };
                 if let Some(reason) = stale {
                     self.cleanup(controller, intent.vm, reason, Evidence::Unknown, None)
@@ -1641,6 +1663,9 @@ pub(crate) mod publication {
         pub(crate) ingress: std::sync::Mutex<Option<String>>,
         pub(crate) record: Arc<std::sync::atomic::AtomicBool>,
         pub(crate) post_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// Parks the next create during connection and TLS setup, before its
+        /// commit point.
+        pub(crate) tls_gate: std::sync::Mutex<Option<FakeGate>>,
         pub(crate) preflight_gate: std::sync::Mutex<Option<FakeGate>>,
         /// The next POST commits only after release, in a task that outlives
         /// the abandoned request, and never acknowledges.
@@ -1724,8 +1749,17 @@ pub(crate) mod publication {
             }
         }
 
-        async fn create(&self, _: &Route) -> Result<RecordId, DnsError> {
+        async fn create(
+            &self,
+            _: &Route,
+            submission: &Submission<'_>,
+        ) -> Result<RecordId, DnsError> {
             use std::sync::atomic::Ordering::SeqCst;
+            // Connection and TLS setup: nothing is written yet.
+            hold(&self.tls_gate).await?;
+            if !submission.commit() {
+                return Err(DnsError::Unavailable);
+            }
             assert!(
                 self.local.load(SeqCst),
                 "DNS activated before connector readiness"

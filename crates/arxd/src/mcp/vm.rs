@@ -610,11 +610,27 @@ impl Supervisor {
                 let _ = passed.send(());
             }
             let mut failed = false;
+            // A worker that returned an error left its durable intent and
+            // receipt for reconciliation, which the final turn below performs
+            // and reports. Only a worker that did not finish is unconfirmed.
             while let Some(job) = publish_jobs.join_next().await {
-                failed |= !matches!(job, Ok(Ok(())));
-            }
-            while let Some(job) = stops.set.join_next().await {
                 failed |= job.is_err();
+            }
+            // Early revocation runs outside the close barrier, so a dispatch that
+            // started before the fence can still queue a stop after the set was
+            // taken. Join until the shared set stays empty.
+            loop {
+                while let Some(job) = stops.set.join_next().await {
+                    failed |= job.is_err();
+                }
+                let Ok(mut shared) = self.stops.lock() else {
+                    failed = true;
+                    break;
+                };
+                stops = std::mem::take(&mut *shared);
+                if stops.set.is_empty() {
+                    break;
+                }
             }
             // A deferred stop may have confirmed what the first attempt could
             // not, so the final local state decides.
@@ -5456,6 +5472,176 @@ mod tests {
         assert_eq!(
             *supervisor.publisher.cleanup_registry.lock().unwrap(),
             vec![1]
+        );
+        assert_eq!(supervisor.publisher.registry_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn owner_revocation_during_tls_setup_never_writes_the_post() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1400).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let (tls, in_tls, _release) = gate();
+        *fake.tls_gate.lock().unwrap() = Some(tls);
+        let pending = call(&a, "publish_site", args(1410)).await;
+        // The POST transport is setting up its connection; nothing is written.
+        entered(in_tls).await;
+        assert_eq!(
+            call(&a, "unpublish_site", args(1410)).await["reason"],
+            "key_collision"
+        );
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (&json!("failed"), &json!("cancelled"), &json!("confirmed")),
+            "{failed}"
+        );
+        until(|| revocations_settled(h.supervisor())).await;
+        assert!(!fake.local.load(SeqCst));
+        assert_eq!(fake.posts.load(SeqCst), 0);
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        let published = call(&a, "publish_site", args(1411)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let revoke = call(&a, "unpublish_site", args(1412)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vm_stop_during_tls_setup_releases_as_never_sent() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1420).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let (tls, in_tls, _release) = gate();
+        *fake.tls_gate.lock().unwrap() = Some(tls);
+        let pending = call(&a, "publish_site", args(1430)).await;
+        entered(in_tls).await;
+        fake.routes.lock().unwrap().clear();
+        let stop = call(&a, "vm_stop", args(1431)).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (
+                &json!("failed"),
+                &json!("origin_unavailable"),
+                &json!("confirmed")
+            ),
+            "{failed}"
+        );
+        // Released as never sent: no POST and no lookup, and the slot is free.
+        assert_eq!(fake.posts.load(SeqCst), 0);
+        assert!(fake.routes.lock().unwrap().is_empty());
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        let start = call(&a, "vm_start", args(1432)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let published = call(&a, "publish_site", args(1433)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let revoke = call(&a, "unpublish_site", args(1434)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_revoking_checkpoint_keeps_the_owner_cause() {
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, _fake) = enrolled(&h, &a, 1440).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        // Parked before connector startup.
+        let (worker, in_gate, release) = gate();
+        *h.supervisor().publisher.activate_gate.lock().unwrap() = Some(worker);
+        let pending = call(&a, "publish_site", args(1450)).await;
+        entered(in_gate).await;
+        // The owner revokes; the deferred stop finds an empty local slot.
+        assert_eq!(
+            call(&a, "unpublish_site", args(1450)).await["reason"],
+            "key_collision"
+        );
+        until(|| revocations_settled(h.supervisor())).await;
+        trigger(
+            &h,
+            "CREATE TRIGGER refuse_revoking BEFORE UPDATE OF phase ON vm_publication
+             WHEN NEW.phase='revoking'
+             BEGIN SELECT RAISE(ABORT, 'synthetic checkpoint failure'); END;",
+        );
+        release.send(()).unwrap();
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert_eq!(phase(&a, &vm).await["phase"], "publishing");
+        trigger(&h, "DROP TRIGGER refuse_revoking");
+        // After SQLite recovers, the release records the owner cause.
+        assert_eq!(settle(&h, &a, &vm).await["reason"], "cancelled");
+        assert_eq!(terminal(&a, &pending).await["state"], "failed");
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_a_stop_queued_after_its_snapshot() {
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, _fake) = enrolled(&h, &a, 1460).await;
+        // A registration with no connector, held by its worker.
+        let (worker, worker_entered, release_worker) = gate();
+        *h.supervisor().publisher.activate_gate.lock().unwrap() = Some(worker);
+        let pending = call(
+            &a,
+            "publish_site",
+            json!({"vm_id":vm,"request_id":key(1470)}),
+        )
+        .await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        entered(worker_entered).await;
+        let (stop, stop_entered, release_stop) = gate();
+        *h.supervisor().publisher.stop_gate.lock().unwrap() = Some(stop);
+        let supervisor = h.supervisor().clone();
+        supervisor.publisher.events.lock().unwrap().clear();
+        let (passed, first_pass) = tokio::sync::oneshot::channel();
+        *supervisor.drain_first_pass.lock().unwrap() = Some(passed);
+        let late = supervisor.clone();
+        let late_vm = vm.clone();
+        let releaser = tokio::spawn(async move {
+            first_pass.await.unwrap();
+            // An authenticated dispatch whose closure began before the fence
+            // runs only now, after the drain took its stop set.
+            let inventory = late.connection("alpha".into()).inventory();
+            let reply = tokio::task::spawn_blocking(move || {
+                inventory.dispatch(
+                    request(
+                        "unpublish_site",
+                        json!({"vm_id":late_vm,"request_id":key(1471)}),
+                    ),
+                    || false,
+                )
+            })
+            .await
+            .unwrap();
+            assert!(reply.is_err());
+            entered(stop_entered).await;
+            release_worker.send(()).unwrap();
+            // A drain that missed the late stop would clear the registry now.
+            let _ = tokio::time::timeout(Duration::from_millis(300), async {
+                while !late.publisher.events.lock().unwrap().contains(&"cleared") {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            // A drain that dropped the late stop unjoined also dropped its gate.
+            let _ = release_stop.send(());
+        });
+        drop(a);
+        h.shutdown().await.unwrap();
+        releaser.await.unwrap();
+        assert_eq!(
+            *supervisor.publisher.events.lock().unwrap(),
+            vec!["stopped", "cleared"],
+            "the registry was cleared before the late stop joined"
         );
         assert_eq!(supervisor.publisher.registry_len(), 0);
     }

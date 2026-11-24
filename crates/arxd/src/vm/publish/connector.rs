@@ -367,6 +367,15 @@ async fn probe_origin(
     Ok(())
 }
 
+/// Observes a failed config's path, just before its writer closes.
+#[cfg(test)]
+pub(in crate::vm) type FailedWriteProbe = Box<dyn FnOnce(&Path) + Send>;
+
+/// Runs with the path of a failed config, just before its writer closes.
+#[cfg(test)]
+pub(in crate::vm) static FAILED_WRITE_PROBE: std::sync::Mutex<Option<FailedWriteProbe>> =
+    std::sync::Mutex::new(None);
+
 /// Fails the next config write after creation, for the cleanup witness.
 #[cfg(test)]
 pub(in crate::vm) static FAIL_CONFIG_WRITE: std::sync::atomic::AtomicBool =
@@ -397,7 +406,6 @@ impl Config {
         );
         // Owned by TokenUser with a protected DACL before any content exists.
         let mut output = super::windows::create_private(&path).map_err(|_| refusal)?;
-        let mut config = Self { path, held: None };
         let written = output.write_all(text.as_bytes());
         #[cfg(test)]
         let written = if FAIL_CONFIG_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -405,10 +413,22 @@ impl Config {
         } else {
             written
         };
-        // The share-exclusive writer must close before the guard can delete a
-        // failed output.
+        if written.is_err() {
+            // Delete through the share-exclusive writer itself: no other handle
+            // can open the failed file meanwhile, so no reader can keep it.
+            let marked = super::windows::delete_on_close(&output).is_ok();
+            #[cfg(test)]
+            if let Some(probe) = FAILED_WRITE_PROBE.lock().unwrap().take() {
+                probe(&path);
+            }
+            drop(output);
+            if !marked {
+                let _ = fs::remove_file(&path);
+            }
+            return Err(refusal);
+        }
         drop(output);
-        written.map_err(|_| refusal)?;
+        let mut config = Self { path, held: None };
         let held = HeldPath::open(&config.path, false, true).map_err(|_| refusal)?;
         let mut actual = Vec::new();
         (&held.file)

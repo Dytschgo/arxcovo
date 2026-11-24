@@ -188,12 +188,60 @@ pub(in crate::vm) enum Removal {
     ForeignOrAmbiguous,
 }
 
+/// The single commit point of a DNS mutation. Connection and TLS setup send
+/// nothing that could reach the record API. Immediately before the first
+/// request byte is written, [`Submission::commit`] re-samples cancellation:
+/// once it returns `true` the mutation may reach Cloudflare, and before that
+/// the request is provably unsent.
+pub(in crate::vm) struct Submission<'a> {
+    cancelled: &'a (dyn Fn() -> bool + Sync),
+    committed: std::sync::atomic::AtomicBool,
+}
+
+impl<'a> Submission<'a> {
+    pub(in crate::vm) fn new(cancelled: &'a (dyn Fn() -> bool + Sync)) -> Self {
+        Self {
+            cancelled,
+            committed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// A submission no cancellation can withhold.
+    #[allow(dead_code, reason = "used by transport fixtures")]
+    pub(in crate::vm) fn unconditional() -> Submission<'static> {
+        fn never() -> bool {
+            false
+        }
+        Submission::new(&never)
+    }
+
+    /// Claims the commit point unless cancellation has been observed.
+    pub(in crate::vm) fn commit(&self) -> bool {
+        if (self.cancelled)() {
+            return false;
+        }
+        self.committed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    /// Whether the request may have reached Cloudflare.
+    pub(in crate::vm) fn committed(&self) -> bool {
+        self.committed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 pub(in crate::vm) trait DnsApi {
     async fn preflight(&self, route: &Route) -> Result<(), DnsError>;
     /// Returns the validated, owned record ID acknowledged by the single POST.
     /// The caller persists it before [`DnsApi::verify`], so a failed
-    /// verification never discards an acknowledged ID.
-    async fn create(&self, route: &Route) -> Result<RecordId, DnsError>;
+    /// verification never discards an acknowledged ID. Nothing is written
+    /// unless `submission` commits immediately before the first request byte.
+    async fn create(
+        &self,
+        route: &Route,
+        submission: &Submission<'_>,
+    ) -> Result<RecordId, DnsError>;
     async fn reconcile(&self, route: &Route) -> Result<Reconciled, DnsError>;
     async fn remove(&self, route: &Route, id: &RecordId) -> Result<Removal, DnsError>;
 
@@ -265,7 +313,11 @@ impl DnsApi for CloudflareDns {
 
     /// One POST only. On error the caller retains the intent and reconciles.
     /// Success still requires [`DnsApi::verify`] after the ID is durable.
-    async fn create(&self, route: &Route) -> Result<RecordId, DnsError> {
+    async fn create(
+        &self,
+        route: &Route,
+        submission: &Submission<'_>,
+    ) -> Result<RecordId, DnsError> {
         let body = serde_json::to_vec(&Create {
             kind: "CNAME",
             name: route.name.as_str(),
@@ -275,7 +327,9 @@ impl DnsApi for CloudflareDns {
             ttl: 1,
         })
         .map_err(|_| DnsError::InvalidResponse)?;
-        let reply = self.request(Method::Post, &route.records(), &body).await?;
+        let reply = self
+            .request(Method::Post, &route.records(), &body, Some(submission))
+            .await?;
         let created: Record = reply.result()?;
         if !route.owned(&created) {
             return Err(DnsError::Conflict);
@@ -289,7 +343,7 @@ impl DnsApi for CloudflareDns {
             route.records(),
             route.name.as_str()
         );
-        let response = self.request(Method::Get, &path, &[]).await?;
+        let response = self.request(Method::Get, &path, &[], None).await?;
         let listing: Listing = response.json()?;
         if !listing.success
             || listing.result_info.page != 1
@@ -318,13 +372,16 @@ impl DnsApi for CloudflareDns {
     /// Call after initiating connector termination. Never delete by name or by marker alone.
     async fn remove(&self, route: &Route, id: &RecordId) -> Result<Removal, DnsError> {
         let path = format!("{}/{}", route.records(), id.as_str());
-        let reply = self.request(Method::Get, &path, &[]).await?;
+        let reply = self.request(Method::Get, &path, &[], None).await?;
         if (200..300).contains(&reply.status) {
             let record: Record = reply.result()?;
             if id.as_str() != record.id || !route.owned(&record) {
                 return Ok(Removal::ForeignOrAmbiguous);
             }
-            let deleted: Deleted = self.request(Method::Delete, &path, &[]).await?.result()?;
+            let deleted: Deleted = self
+                .request(Method::Delete, &path, &[], None)
+                .await?
+                .result()?;
             if deleted.id != id.as_str() {
                 return Err(DnsError::InvalidResponse);
             }
@@ -339,24 +396,42 @@ impl DnsApi for CloudflareDns {
 }
 
 impl CloudflareDns {
-    async fn request(&self, method: Method, path: &str, body: &[u8]) -> Result<Response, DnsError> {
+    /// A mutation's `submission` is committed after connection and TLS setup,
+    /// immediately before the first request byte.
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        body: &[u8],
+        submission: Option<&Submission<'_>>,
+    ) -> Result<Response, DnsError> {
         let headers = zeroize::Zeroizing::new(format!(
             "{} {path} HTTP/1.1\r\nHost: {API_HOST}\r\nAuthorization: Bearer {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             method.as_str(),
             self.bearer.0.as_str(),
             body.len()
         ));
+        let commit = || {
+            if submission.is_none_or(Submission::commit) {
+                Ok(())
+            } else {
+                Err(io::Error::other("submission withheld"))
+            }
+        };
         let result = timeout(self.deadline, async {
             match &self.transport {
                 Transport::Cloudflare(tls) => {
                     let stream = TcpStream::connect((API_HOST, 443)).await?;
                     let name = ServerName::try_from(API_HOST).expect("fixed TLS server name");
                     let stream = tls.connect(name, stream).await?;
+                    commit()?;
                     exchange(stream, &headers, body).await
                 }
                 #[cfg(test)]
                 Transport::Fixture(addr) => {
-                    exchange(TcpStream::connect(addr).await?, &headers, body).await
+                    let stream = TcpStream::connect(addr).await?;
+                    commit()?;
+                    exchange(stream, &headers, body).await
                 }
             }
         })

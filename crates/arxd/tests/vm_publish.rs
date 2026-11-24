@@ -36,7 +36,9 @@ mod vm {
     };
     use publish::{
         Hostname, TunnelId,
-        cloudflare::{CloudflareDns, DnsApi, DnsBearer, DnsError, Reconciled, Removal, Route},
+        cloudflare::{
+            CloudflareDns, DnsApi, DnsBearer, DnsError, Reconciled, Removal, Route, Submission,
+        },
     };
     use serde_json::{Value, json};
     use tokio::{
@@ -260,7 +262,12 @@ mod vm {
                 state.records.clear();
                 state.failed_create_reply = true;
             }
-            assert!(fake.client.create(&route).await.is_err());
+            assert!(
+                fake.client
+                    .create(&route, &Submission::unconditional())
+                    .await
+                    .is_err()
+            );
             let Reconciled::Owned(id) = fake.client.reconcile(&route).await.unwrap() else {
                 panic!("lost mutation failed ownership reconciliation");
             };
@@ -308,11 +315,20 @@ mod vm {
                     state.foreign_on_post = Some(foreign.clone());
                 }
                 if lost_reply {
-                    assert_eq!(fake.client.create(&route).await, Err(DnsError::Rejected));
+                    assert_eq!(
+                        fake.client
+                            .create(&route, &Submission::unconditional())
+                            .await,
+                        Err(DnsError::Rejected)
+                    );
                 } else {
                     // The acknowledged ID is returned for durable custody, and
                     // independent verification then refuses the shared name.
-                    let acknowledged = fake.client.create(&route).await.unwrap();
+                    let acknowledged = fake
+                        .client
+                        .create(&route, &Submission::unconditional())
+                        .await
+                        .unwrap();
                     assert_eq!(acknowledged.as_str(), ID);
                     assert_eq!(
                         fake.client.verify(&route, &acknowledged).await,
@@ -359,6 +375,37 @@ mod vm {
         .unwrap();
     }
 
+    /// The commit point follows connection setup: a cancellation observed there writes no
+    /// request byte at all.
+    #[tokio::test]
+    async fn dns_create_writes_nothing_once_cancelled_before_the_first_byte() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        timeout(Duration::from_secs(10), async {
+            let fake = FakeDns::start().await;
+            let route = route();
+            let cancelled = AtomicBool::new(true);
+            let observe = || cancelled.load(SeqCst);
+            let withheld = Submission::new(&observe);
+            assert_eq!(
+                fake.client.create(&route, &withheld).await,
+                Err(DnsError::Unavailable)
+            );
+            assert!(!withheld.committed());
+            {
+                let state = fake.state.lock().unwrap();
+                assert_eq!(state.post_count, 0);
+                assert!(state.records.is_empty());
+            }
+            cancelled.store(false, SeqCst);
+            let allowed = Submission::new(&observe);
+            fake.client.create(&route, &allowed).await.unwrap();
+            assert!(allowed.committed());
+            assert_eq!(fake.state.lock().unwrap().post_count, 1);
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn dns_settles_a_delayed_post_by_lookup_without_reposting() {
         timeout(LEG, async {
@@ -368,7 +415,12 @@ mod vm {
             let (committed_tx, committed) = oneshot::channel();
             fake.state.lock().unwrap().post_gate = Some((release_rx, committed_tx));
             // The single POST exceeds its bounded deadline before the fake commits it.
-            assert_eq!(fake.client.create(&route).await, Err(DnsError::Unavailable));
+            assert_eq!(
+                fake.client
+                    .create(&route, &Submission::unconditional())
+                    .await,
+                Err(DnsError::Unavailable)
+            );
             assert_eq!(fake.client.reconcile(&route).await, Ok(Reconciled::Absent));
             release.send(()).unwrap();
             committed.await.unwrap();
@@ -450,7 +502,11 @@ mod vm {
         timeout(LEG, async {
             let fake = FakeDns::start().await;
             let route = route();
-            let id = fake.client.create(&route).await.unwrap();
+            let id = fake
+                .client
+                .create(&route, &Submission::unconditional())
+                .await
+                .unwrap();
             assert_eq!(id.as_str(), ID);
             fake.state.lock().unwrap().hostile = Some(Hostile::Error);
             assert_eq!(
@@ -476,7 +532,11 @@ mod vm {
         timeout(LEG, async {
             let fake = FakeDns::start().await;
             let route = route();
-            let id = fake.client.create(&route).await.unwrap();
+            let id = fake
+                .client
+                .create(&route, &Submission::unconditional())
+                .await
+                .unwrap();
             fake.state.lock().unwrap().records[0]["comment"] = json!("replaced");
             assert_eq!(
                 fake.client.remove(&route, &id).await,
@@ -1199,7 +1259,11 @@ mod vm {
                 fake.client.preflight(&route).await.unwrap();
                 let connector = Connector::start(&plan).await.unwrap();
                 assert!(connector.ready().await);
-                let id = fake.client.create(&route).await.unwrap();
+                let id = fake
+                    .client
+                    .create(&route, &Submission::unconditional())
+                    .await
+                    .unwrap();
                 fake.client.verify(&route, &id).await.unwrap();
                 let record = &fake.state.lock().unwrap().records[0];
                 assert_eq!(record["comment"], format!("arxcovo:{NONCE}"));
@@ -1362,6 +1426,23 @@ mod vm {
                     .count()
             };
             assert_eq!(ingress_files(), 0);
+            // A same-login reader that tries to open the failed file, denying delete
+            // sharing, just before the writer closes.
+            let probed: Arc<std::sync::Mutex<Option<std::io::Result<fs::File>>>> = Arc::default();
+            {
+                let probed = probed.clone();
+                *super::publish::connector::FAILED_WRITE_PROBE
+                    .lock()
+                    .unwrap() = Some(Box::new(move |path: &Path| {
+                    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+                    *probed.lock().unwrap() = Some(
+                        fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(FILE_SHARE_READ)
+                            .open(path),
+                    );
+                }));
+            }
             super::publish::connector::FAIL_CONFIG_WRITE
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let error = match timeout(LEG, Connector::start(&plan))
@@ -1372,6 +1453,9 @@ mod vm {
                 Ok(_) => panic!("a failed config write reached the connector"),
             };
             assert_eq!(error, ConnectorError::Custody);
+            let reader = probed.lock().unwrap().take().expect("probe ran");
+            assert!(reader.is_err(), "a reader opened the failed config");
+            drop(reader);
             assert_eq!(ingress_files(), 0, "a failed config write left its file");
             assert_gone(&witness_path, 5);
             origin_task.abort();
