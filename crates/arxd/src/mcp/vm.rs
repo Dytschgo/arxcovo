@@ -1705,7 +1705,9 @@ impl VmInventory {
             let Some(origin) = origin else {
                 return refuse(Refusal::NotReady);
             };
-            let credentials = supervisor.publisher.prepare(profile);
+            let credentials = supervisor
+                .publisher
+                .prepare(profile, supervisor.compose.session(vm));
             let credentials = match credentials {
                 Ok(credentials) => credentials,
                 Err(reason) => return refuse(reason),
@@ -1820,9 +1822,35 @@ impl VmInventory {
                 let id = args.id("vm_id")?;
                 args.end()?;
                 let status = controller.publication_status(&self.principal, id)??;
+                let hosts: Vec<Value> = status
+                    .hosts
+                    .iter()
+                    .map(|host| {
+                        let mut item = json!({
+                            "position": host.position,
+                            "state": host.state.wire(),
+                            "ambiguous": host.ambiguous,
+                        });
+                        if let Some(slot) = host.route_slot {
+                            item["route_slot"] = json!(slot);
+                        }
+                        if let Some(project_id) = &host.project_id {
+                            item["project_id"] = json!(project_id);
+                        }
+                        if let Some(service) = &host.service {
+                            item["service"] = json!(service);
+                        }
+                        if let Some(reason) = host.reason {
+                            item["reason"] = json!(reason.wire());
+                        }
+                        item
+                    })
+                    .collect();
                 let mut value = json!({
                     "vm_id":hex::encode(id),
                     "phase":status.phase.map_or("unpublished", |phase| phase.wire()),
+                    "host_count": hosts.len(),
+                    "hosts": hosts,
                 });
                 if let Some(reason) = status.reason {
                     value["reason"] = json!(reason.wire());
@@ -2428,6 +2456,9 @@ impl VmInventory {
                 || !db::live_boot(tx, request.target.vm, session.generation, session.wire_boot)?
             {
                 return Ok(Err(compose::Fault::NotReady));
+            }
+            if !compose::deployment_preserves_routes(tx, &request)? {
+                return Ok(Err(compose::Fault::Busy));
             }
             db::admit(
                 tx,
@@ -10785,7 +10816,7 @@ mod tests {
         let published = call(&a, "publish_site", args(812)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         let before = intent(&h).unwrap();
-        assert!(before.record.is_some());
+        assert!(before.hosts[0].record.is_some());
         fake.credential.store(false, SeqCst);
         drop(a);
         // Local ingress is down, but the record stays: no clean drain.
@@ -10819,9 +10850,9 @@ mod tests {
                 after.boot,
                 after.revision,
                 &after.zone,
-                after.hostname.as_str(),
+                after.hosts[0].hostname.as_str(),
                 &after.credential_ref,
-                &after.record,
+                &after.hosts[0].record,
             ),
             (
                 &before.nonce,
@@ -10829,9 +10860,9 @@ mod tests {
                 before.boot,
                 before.revision,
                 &before.zone,
-                before.hostname.as_str(),
+                before.hosts[0].hostname.as_str(),
                 &before.credential_ref,
-                &before.record,
+                &before.hosts[0].record,
             )
         );
         assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
@@ -10868,7 +10899,7 @@ mod tests {
         let pending = call(&a, "publish_site", args(816)).await;
         until(|| fake.posts.load(SeqCst) == 2).await;
         let before = intent(&h).unwrap();
-        assert!(before.post_possible && before.record.is_none());
+        assert!(before.hosts[0].post_possible && before.hosts[0].record.is_none());
         let starts = fake.starts.load(SeqCst);
         drop(a);
         // The possible POST stays ambiguous: no clean drain.
@@ -10901,11 +10932,11 @@ mod tests {
                 intent.boot,
                 intent.revision,
                 intent.zone.clone(),
-                intent.hostname.as_str().to_owned(),
+                intent.hosts[0].hostname.as_str().to_owned(),
                 intent.tunnel.clone(),
                 intent.credential_ref.clone(),
-                intent.record.clone(),
-                intent.post_possible,
+                intent.hosts[0].record.clone(),
+                intent.hosts[0].post_possible,
             )
         };
         assert_eq!(pinned(&intent(&h).unwrap()), pinned(&before));
@@ -11516,7 +11547,7 @@ mod tests {
         // evidence still releases the intent without consulting DNS.
         trigger(
             &h,
-            "CREATE TRIGGER withdrawal_failure BEFORE UPDATE OF post_possible ON vm_publication
+            "CREATE TRIGGER withdrawal_failure BEFORE UPDATE OF post_possible ON vm_publication_hosts
              WHEN OLD.post_possible=1 AND NEW.post_possible=0
              BEGIN SELECT RAISE(ABORT, 'synthetic withdrawal failure'); END;",
         );
@@ -11580,7 +11611,7 @@ mod tests {
         // DNS once writes resume.
         trigger(
             &h,
-            "CREATE TRIGGER withdrawal_failure BEFORE UPDATE OF post_possible ON vm_publication
+            "CREATE TRIGGER withdrawal_failure BEFORE UPDATE OF post_possible ON vm_publication_hosts
              WHEN OLD.post_possible=1 AND NEW.post_possible=0
              BEGIN SELECT RAISE(ABORT, 'synthetic withdrawal failure'); END;
              CREATE TRIGGER release_failure BEFORE DELETE ON vm_publication
@@ -12349,7 +12380,7 @@ mod tests {
         );
         trigger(
             &h,
-            "CREATE TRIGGER withdrawal_failure BEFORE UPDATE OF post_possible ON vm_publication
+            "CREATE TRIGGER withdrawal_failure BEFORE UPDATE OF post_possible ON vm_publication_hosts
              WHEN OLD.post_possible=1 AND NEW.post_possible=0
              BEGIN SELECT RAISE(ABORT, 'synthetic withdrawal failure'); END;
              CREATE TRIGGER release_failure BEFORE DELETE ON vm_publication
@@ -12453,7 +12484,7 @@ mod tests {
         assert_eq!(pending["ok"], true, "{pending}");
         until(|| fake.posts.load(SeqCst) == 1).await;
         until(|| h.supervisor().publisher.workers().is_empty()).await;
-        assert!(intent(&h).unwrap().record.is_some());
+        assert!(intent(&h).unwrap().hosts[0].record.is_some());
         trigger(&h, "DROP TRIGGER refuse_commit");
         drop(a);
         h.shutdown().await.unwrap();
@@ -12479,7 +12510,7 @@ mod tests {
         until(|| h.supervisor().publisher.workers().is_empty()).await;
         trigger(&h, "DROP TRIGGER refuse_commit");
         let before = intent(&h).unwrap();
-        assert!(before.record.is_some());
+        assert!(before.hosts[0].record.is_some());
         fake.credential.store(false, SeqCst);
         drop(a);
         assert!(
@@ -12492,8 +12523,8 @@ mod tests {
         enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
         let after = intent(&h).unwrap();
         assert_eq!(
-            (&after.nonce, &after.record),
-            (&before.nonce, &before.record)
+            (&after.nonce, &after.hosts[0].record),
+            (&before.nonce, &before.hosts[0].record)
         );
         fake.credential.store(true, SeqCst);
         let a = h.client(0).await;
@@ -14896,5 +14927,668 @@ mod tests {
             Err(_) => true,
             Ok(result) => result.structured_content.unwrap()["reason"] == "shutdown",
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Docker E3 multi-hostname publication tests
+    // -------------------------------------------------------------------------
+
+    async fn enrolled_multi(
+        h: &Harness,
+        client: &Client,
+        key_base: u64,
+        policy: bool,
+        profile: Profile,
+    ) -> (Value, Arc<crate::vm::runtime::publication::Fake>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let fake = Arc::new(crate::vm::runtime::publication::Fake::default());
+        fake.credential.store(true, SeqCst);
+        fake.multi_host.store(true, SeqCst);
+        let build = call(
+            client,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(WEB_RECIPE_ID), "request_id":key(key_base)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(client, &build).await["template_id"].clone();
+        let created = call(client, "static_vm_create",
+            json!({"template_id":template,"name":profile.static_name(),"request_id":key(key_base + 2)})).await;
+        let vm_id = terminal(client, &created).await["vm_id"].clone();
+        let start = call(
+            client,
+            "vm_start",
+            json!({"vm_id":vm_id,"request_id":key(key_base + 1)}),
+        )
+        .await;
+        assert_eq!(terminal(client, &start).await["state"], "succeeded");
+        let id = parse_id(vm_id.as_str().unwrap()).unwrap();
+        let supervisor = h.supervisor();
+        let origin = supervisor
+            .gate
+            .lock()
+            .unwrap()
+            .fixture
+            .as_ref()
+            .unwrap()
+            .publish_origin(id)
+            .unwrap();
+        let (host, mut peer) = tokio::io::duplex(64 * 1024);
+        let boot = key_base;
+        let witness = fake.clone();
+        tokio::spawn(async move {
+            use arx_guest::compose::{ComposeRequest, ComposeResponse};
+            fake_compose_hello(&mut peer, boot).await;
+            loop {
+                use tokio::io::AsyncReadExt;
+                let Ok(len) = peer.read_u32().await else {
+                    break;
+                };
+                assert!(len as usize <= arx_guest::MAX_FRAME);
+                let mut payload = vec![0; len as usize];
+                peer.read_exact(&mut payload).await.unwrap();
+                let ComposeRequest::ComposeInstallRoutes {
+                    id,
+                    generation,
+                    readiness_host,
+                    zone,
+                    routes,
+                } = serde_json::from_slice(&payload).unwrap()
+                else {
+                    panic!("expected install")
+                };
+                assert_eq!(boot, generation);
+                assert!(!witness.local.load(SeqCst));
+                let names: Vec<_> = routes.iter().map(|route| route.hostname.clone()).collect();
+                assert!(witness.preflight_order.lock().unwrap().ends_with(&names));
+                witness
+                    .starts_at_route_install
+                    .lock()
+                    .unwrap()
+                    .push(witness.starts.load(SeqCst));
+                assert!(
+                    arx_guest::compose::routing::RoutingTable::new(
+                        readiness_host,
+                        Some(zone),
+                        arx_guest::compose::routing::SLIRP_FORWARD_PEER,
+                        routes
+                    )
+                    .is_ok()
+                );
+                fake_compose_reply(
+                    &mut peer,
+                    ComposeResponse::ComposeRoutesInstalled { id, generation },
+                )
+                .await;
+            }
+        });
+        let channel = crate::vm::guest::ComposeChannel::negotiate(host, boot, &supervisor.cancel)
+            .await
+            .unwrap();
+        supervisor
+            .compose
+            .attach(
+                supervisor.controller.compose_store(),
+                id,
+                compose::Session::for_origin(&origin, channel),
+            )
+            .unwrap();
+        enroll(h, &fake, policy, profile);
+        (vm_id, fake)
+    }
+
+    #[tokio::test]
+    async fn multihost_policy_off_and_happy_path_single_connector_with_per_host_status() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let host = h.supervisor().host_id;
+        let zone = "b".repeat(32);
+        let profile = Profile::synthetic_multi(
+            host,
+            "docker-multi",
+            &["api.example.invalid", "app.example.invalid"],
+            Some("example.invalid"),
+            &zone,
+        )
+        .with_routes(vec![
+            crate::vm::runtime::publication::RouteBinding {
+                hostname: crate::vm::publish::Hostname::parse("api.example.invalid").unwrap(),
+                project_id: "proj-a".into(),
+                service: "api".into(),
+                project_slot: 0,
+                service_index: 0,
+                route_slot: 0,
+            },
+            crate::vm::runtime::publication::RouteBinding {
+                hostname: crate::vm::publish::Hostname::parse("app.example.invalid").unwrap(),
+                project_id: "proj-a".into(),
+                service: "web".into(),
+                project_slot: 0,
+                service_index: 1,
+                route_slot: 1,
+            },
+        ]);
+        let (vm, fake) = enrolled_multi(&h, &a, 4100, false, profile.clone()).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+
+        // Policy off refuses with zero connector starts and zero DNS effects.
+        let refused = call(&a, "publish_site", args(4110)).await;
+        assert_eq!(refused["reason"], "public_sites_disabled", "{refused}");
+        assert_eq!(fake.starts.load(SeqCst), 0);
+        assert_eq!(fake.posts.load(SeqCst), 0);
+        assert!(fake.preflight_order.lock().unwrap().is_empty());
+
+        // Turn policy on and publish 2 hostnames on one connector Job.
+        h.supervisor().gate.lock().unwrap().allow_agent_public_sites = true;
+        let published = call(&a, "publish_site", args(4111)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert_eq!(
+            *fake.starts_at_route_install.lock().unwrap(),
+            [0],
+            "boot-bound peer must receive the route set"
+        );
+        assert_eq!(fake.starts.load(SeqCst), 1, "must use one connector Job");
+        assert_eq!(fake.posts.load(SeqCst), 2);
+        assert!(fake.local.load(SeqCst));
+        assert_eq!(
+            *fake.preflight_order.lock().unwrap(),
+            vec!["api.example.invalid", "app.example.invalid"]
+        );
+        assert_eq!(
+            *fake.create_order.lock().unwrap(),
+            vec!["api.example.invalid", "app.example.invalid"]
+        );
+        assert_eq!(
+            *fake.origin_probed.lock().unwrap(),
+            vec!["api.example.invalid", "app.example.invalid"]
+        );
+
+        // Generated ingress YAML contains both exact host rows, httpHostHeader,
+        // TLS verification, WARP off, and final http_status:404.
+        let ingress = fake.ingress.lock().unwrap().clone().expect("ingress yaml");
+        assert!(
+            ingress.contains("hostname: 'api.example.invalid'"),
+            "{ingress}"
+        );
+        assert!(
+            ingress.contains("httpHostHeader: 'api.example.invalid'"),
+            "{ingress}"
+        );
+        assert!(
+            ingress.contains("hostname: 'app.example.invalid'"),
+            "{ingress}"
+        );
+        assert!(
+            ingress.contains("httpHostHeader: 'app.example.invalid'"),
+            "{ingress}"
+        );
+        assert!(ingress.contains("noTLSVerify: false"), "{ingress}");
+        assert!(
+            ingress.contains("warp-routing:\n  enabled: false"),
+            "{ingress}"
+        );
+        assert!(ingress.contains("- service: http_status:404"), "{ingress}");
+
+        fake.upstream_unavailable.store(true, SeqCst);
+        let supervisor = h.supervisor();
+        drop(supervisor.publisher.slot().await);
+        assert_eq!(
+            supervisor
+                .publisher
+                .turn(&supervisor.controller, &supervisor.cancel)
+                .await
+                .unwrap(),
+            crate::vm::runtime::publication::Turn::Healthy,
+        );
+        assert!(fake.local.load(SeqCst));
+        assert_eq!(fake.host_records.lock().unwrap().len(), 2);
+        fake.upstream_unavailable.store(false, SeqCst);
+
+        // Publish status projects per-host non-secret state without leaking hostnames or record IDs.
+        let status = phase(&a, &vm).await;
+        let status_text = status.to_string();
+        assert_eq!(status["phase"], "published", "{status}");
+        assert_eq!(status["host_count"], 2, "{status}");
+        assert_eq!(status["hosts"][0]["position"], 0);
+        assert_eq!(status["hosts"][0]["state"], "verified");
+        assert_eq!(status["hosts"][0]["route_slot"], 0);
+        assert_eq!(status["hosts"][0]["project_id"], "proj-a");
+        assert_eq!(status["hosts"][0]["service"], "api");
+        assert_eq!(status["hosts"][1]["position"], 1);
+        assert_eq!(status["hosts"][1]["state"], "verified");
+        assert_eq!(status["hosts"][1]["route_slot"], 1);
+        assert!(
+            !status_text.contains("api.example.invalid"),
+            "leaked hostname: {status}"
+        );
+        assert!(
+            !status_text.contains("app.example.invalid"),
+            "leaked hostname: {status}"
+        );
+
+        // Each child row has a distinct ownership marker.
+        let active = h
+            .supervisor()
+            .controller
+            .publication_intent()
+            .unwrap()
+            .unwrap();
+        // A subsequent release may keep using both bound slots. Reordering the
+        // manifest would send the api hostname to the web service's loopback port.
+        let release = [0x33u8; 16];
+        h.supervisor().controller.compose_store().transact(|tx| {
+            tx.execute("INSERT INTO vm_compose_projects(vm,project) VALUES(?1,'proj-a')",[active.vm])?;
+            let request = compose::Mutation {
+                target:compose::Target {vm:active.vm,project:"proj-a".into()}, kind:compose::Kind::Deploy,
+                key:RequestId::parse(&key(4140)).unwrap(),release:Some(release),
+            };
+            for (names,allowed) in [(["api","web"],true),(["web","api"],false)] {
+                let manifest = serde_json::to_vec(&json!({"services":names.map(|name|json!({"name":name,"http_port":8080}))}))?;
+                tx.execute("INSERT INTO vm_compose_releases(vm,project,id,digest,manifest) VALUES(?1,'proj-a',?2,?3,?4)
+                            ON CONFLICT(vm,project,id) DO UPDATE SET manifest=excluded.manifest,digest=excluded.digest",
+                            rusqlite::params![active.vm,release,arx_guest::compose::sha256_hex(&manifest),manifest])?;
+                assert_eq!(compose::deployment_preserves_routes(tx,&request)?,allowed);
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(active.hosts.len(), 2);
+        assert_ne!(active.hosts[0].marker, active.hosts[1].marker);
+
+        // Unpublish stops ingress first (asserted inside Fake::remove) and removes both records.
+        let revoke = call(&a, "unpublish_site", args(4112)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert!(!fake.local.load(SeqCst));
+        assert_eq!(fake.deletes.load(SeqCst), 2);
+        assert!(fake.host_records.lock().unwrap().is_empty());
+
+        // Publish max bound (8 hostnames) on the same single connector Job.
+        let eight = [
+            "h0.example.invalid",
+            "h1.example.invalid",
+            "h2.example.invalid",
+            "h3.example.invalid",
+            "h4.example.invalid",
+            "h5.example.invalid",
+            "h6.example.invalid",
+            "h7.example.invalid",
+        ];
+        enroll(
+            &h,
+            &fake,
+            true,
+            Profile::synthetic_multi(host, "docker-multi", &eight, Some("example.invalid"), &zone),
+        );
+        let pub8 = call(&a, "publish_site", args(4113)).await;
+        assert_eq!(terminal(&a, &pub8).await["state"], "succeeded");
+        assert_eq!(
+            fake.starts.load(SeqCst),
+            2,
+            "one connector start for all 8 hosts"
+        );
+        assert_eq!(fake.posts.load(SeqCst), 10);
+        assert_eq!(phase(&a, &vm).await["host_count"], 8);
+        let rev8 = call(&a, "unpublish_site", args(4114)).await;
+        assert_eq!(terminal(&a, &rev8).await["state"], "succeeded");
+        assert_eq!(fake.deletes.load(SeqCst), 10);
+        assert!(fake.host_records.lock().unwrap().is_empty());
+
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multihost_origin_mismatch_blocks_before_dns_post() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let host = h.supervisor().host_id;
+        let zone = "b".repeat(32);
+        let profile = Profile::synthetic_multi(
+            host,
+            "docker-origin-mismatch",
+            &["a.example.invalid", "b.example.invalid"],
+            Some("example.invalid"),
+            &zone,
+        );
+        let (vm, fake) = enrolled_multi(&h, &a, 4200, true, profile).await;
+        fake.host_origin_mismatch
+            .lock()
+            .unwrap()
+            .insert("b.example.invalid".into());
+
+        let result = call(
+            &a,
+            "publish_site",
+            json!({"vm_id":vm,"request_id":key(4210)}),
+        )
+        .await;
+        let term = terminal(&a, &result).await;
+        assert_eq!(term["state"], "failed", "{term}");
+        assert_eq!(term["reason"], "origin_unavailable", "{term}");
+        assert_eq!(
+            fake.posts.load(SeqCst),
+            0,
+            "origin mismatch must prevent any DNS POST"
+        );
+        assert!(!fake.local.load(SeqCst), "connector must not remain live");
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multihost_ambiguous_middle_row_cleans_other_rows_and_preserves_binding_across_restart_and_drift()
+     {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let host = h.supervisor().host_id;
+        let zone = "b".repeat(32);
+        let original = Profile::synthetic_multi(
+            host,
+            "docker-ambiguous",
+            &[
+                "a.example.invalid",
+                "b.example.invalid",
+                "c.example.invalid",
+            ],
+            Some("example.invalid"),
+            &zone,
+        );
+        let (vm, fake) = enrolled_multi(&h, &a, 4300, true, original).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+
+        // Row 0 succeeds; row 1 parks in late_commit (post_possible=1, record=None);
+        // row 2 is never posted.
+        let (late_tx, late_rx) = tokio::sync::oneshot::channel();
+        fake.host_late_commit
+            .lock()
+            .unwrap()
+            .insert("b.example.invalid".into(), late_rx);
+        let pending = call(&a, "publish_site", args(4310)).await;
+        until(|| fake.posts.load(SeqCst) == 2).await;
+
+        let before = h
+            .supervisor()
+            .controller
+            .publication_intent()
+            .unwrap()
+            .unwrap();
+        assert!(before.hosts[0].record.is_some());
+        assert!(before.hosts[1].post_possible && before.hosts[1].record.is_none());
+        assert!(!before.hosts[2].post_possible && before.hosts[2].record.is_none());
+
+        // Shutdown stops ingress, cleans row 0's owned DNS and row 2 (zero DNS),
+        // and leaves row 1 ambiguous + cleanup_pending (unconfirmed drain).
+        drop(a);
+        assert!(
+            h.shutdown().await.is_err(),
+            "ambiguous middle row must make drain unconfirmed"
+        );
+        assert!(!fake.local.load(SeqCst));
+        assert!(
+            !fake
+                .host_records
+                .lock()
+                .unwrap()
+                .contains_key("a.example.invalid"),
+            "row 0 owned DNS must be cleaned even while row 1 is ambiguous"
+        );
+        assert_eq!(fake.deletes.load(SeqCst), 1);
+
+        // Reopen with drifted owner config: original middle-row binding and marker
+        // stay pinned, and replacement publish is refused.
+        let mut h = h.reopen(|_| {}).await;
+        let drifted = Profile::synthetic_multi(
+            host,
+            "docker-ambiguous",
+            &["x.other.invalid", "y.other.invalid"],
+            Some("other.invalid"),
+            &"d".repeat(32),
+        );
+        enroll(&h, &fake, true, drifted);
+        let a = h.client(0).await;
+        let start = call(&a, "vm_start", args(4311)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let after = h
+            .supervisor()
+            .controller
+            .publication_intent()
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.hosts.len(), 3);
+        assert_eq!(
+            after.hosts[0].state,
+            crate::store::vm::publish::HostState::Cleaned
+        );
+        assert_eq!(after.hosts[1].hostname.as_str(), "b.example.invalid");
+        assert_eq!(after.hosts[1].marker, before.hosts[1].marker);
+        assert!(after.hosts[1].ambiguous);
+        assert_eq!(
+            after.hosts[2].state,
+            crate::store::vm::publish::HostState::Cleaned
+        );
+        let status = phase(&a, &vm).await;
+        assert_eq!(status["phase"], "cleanup_pending", "{status}");
+        assert_eq!(status["hosts"][0]["state"], "cleaned");
+        assert_eq!(status["hosts"][1]["state"], "cleanup_pending");
+        assert_eq!(status["hosts"][1]["ambiguous"], true);
+        assert_eq!(status["hosts"][2]["state"], "cleaned");
+        assert_eq!(
+            call(&a, "publish_site", args(4312)).await["reason"],
+            "publish_cleanup_pending"
+        );
+
+        // Absence cannot discharge row 1.
+        fake.routes.lock().unwrap().clear();
+        h.tick().await;
+        until(|| !fake.routes.lock().unwrap().is_empty()).await;
+        assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
+
+        // Once the late commit materializes, reconciliation finds row 1 by its
+        // original pinned marker, deletes it, and releases the intent.
+        late_tx.send(()).unwrap();
+        until(|| {
+            fake.host_records
+                .lock()
+                .unwrap()
+                .contains_key("b.example.invalid")
+        })
+        .await;
+        settle(&h, &a, &vm).await;
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert_eq!(fake.deletes.load(SeqCst), 2);
+        assert!(fake.host_records.lock().unwrap().is_empty());
+        assert_ne!(terminal(&a, &pending).await["state"], "succeeded");
+
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multihost_partial_ownership_foreign_records_and_unpublish_under_failure() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let host = h.supervisor().host_id;
+        let zone = "b".repeat(32);
+        let profile = Profile::synthetic_multi(
+            host,
+            "docker-partial",
+            &["a.example.invalid", "b.example.invalid"],
+            Some("example.invalid"),
+            &zone,
+        );
+        let (vm, fake) = enrolled_multi(&h, &a, 4400, true, profile).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+
+        // Foreign record on 2nd host blocks preflight before any connector start or POST.
+        fake.host_foreign
+            .lock()
+            .unwrap()
+            .insert("b.example.invalid".into());
+        let conflict = call(&a, "publish_site", args(4410)).await;
+        let term = terminal(&a, &conflict).await;
+        assert_eq!(term["state"], "failed", "{term}");
+        assert_eq!(term["reason"], "dns_conflict", "{term}");
+        assert_eq!(fake.starts.load(SeqCst), 0);
+        assert_eq!(fake.posts.load(SeqCst), 0);
+
+        assert!(fake.starts_at_route_install.lock().unwrap().is_empty());
+
+        // Clear foreign record and publish both hosts.
+        fake.host_foreign.lock().unwrap().clear();
+        let published = call(&a, "publish_site", args(4411)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert_eq!(fake.posts.load(SeqCst), 2);
+
+        // During unpublish, row 0 encounters a transient delete failure AND row 1
+        // is healthy: ingress stops first, row 1 is STILL cleaned independently,
+        // and row 0 remains cleanup_pending.
+        fake.host_fail_remove
+            .lock()
+            .unwrap()
+            .insert("a.example.invalid".into());
+        let revoke = call(&a, "unpublish_site", args(4412)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "failed");
+        assert!(!fake.local.load(SeqCst), "ingress must stop first");
+        assert_eq!(
+            fake.deletes.load(SeqCst),
+            1,
+            "row 1 must be cleaned despite row 0 failure"
+        );
+        assert!(
+            !fake
+                .host_records
+                .lock()
+                .unwrap()
+                .contains_key("b.example.invalid"),
+            "row 1 DNS must already be removed"
+        );
+        assert!(
+            fake.host_records
+                .lock()
+                .unwrap()
+                .contains_key("a.example.invalid"),
+            "row 0 DNS still pending"
+        );
+        let status = phase(&a, &vm).await;
+        assert_eq!(status["phase"], "cleanup_pending", "{status}");
+        assert_eq!(status["hosts"][0]["state"], "cleanup_pending");
+        assert_eq!(status["hosts"][1]["state"], "cleaned");
+
+        // Now clear the transient failure on row 0, inject a foreign record on row 0:
+        // owned record on row 0 is deleted, but foreign record keeps it pending
+        // (preserving foreign ownership) until foreign record is cleared.
+        fake.host_fail_remove.lock().unwrap().clear();
+        fake.host_foreign
+            .lock()
+            .unwrap()
+            .insert("a.example.invalid".into());
+        let revoke2 = call(&a, "unpublish_site", args(4413)).await;
+        assert_eq!(terminal(&a, &revoke2).await["state"], "failed");
+        assert_eq!(
+            fake.deletes.load(SeqCst),
+            2,
+            "owned record removed while foreign stays"
+        );
+        assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
+
+        // Removing the foreign record lets final reconciliation release cleanly.
+        fake.host_foreign.lock().unwrap().clear();
+        settle(&h, &a, &vm).await;
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert!(fake.host_records.lock().unwrap().is_empty());
+
+        let republish = call(&a, "publish_site", args(4414)).await;
+        assert_eq!(terminal(&a, &republish).await["state"], "succeeded");
+        trigger(
+            &h,
+            "CREATE TRIGGER refuse_row BEFORE UPDATE OF state ON vm_publication_hosts
+                     WHEN NEW.position=0 AND NEW.state='cleaned'
+                     BEGIN SELECT RAISE(ABORT, 'synthetic row write'); END;",
+        );
+        let revoke = call(&a, "unpublish_site", args(4415)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "failed");
+        assert!(fake.host_records.lock().unwrap().is_empty());
+        let status = phase(&a, &vm).await;
+        assert_eq!(status["phase"], "cleanup_pending");
+        assert_eq!(status["hosts"][1]["state"], "cleaned");
+        trigger(&h, "DROP TRIGGER refuse_row");
+        settle(&h, &a, &vm).await;
+
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multihost_config_drift_requires_explicit_unpublish_before_new_set() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let host = h.supervisor().host_id;
+        let zone = "b".repeat(32);
+        let initial = Profile::synthetic_multi(
+            host,
+            "docker-drift",
+            &["a.example.invalid", "b.example.invalid"],
+            Some("example.invalid"),
+            &zone,
+        );
+        let (vm, fake) = enrolled_multi(&h, &a, 4500, true, initial).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+
+        let pub1 = call(&a, "publish_site", args(4510)).await;
+        assert_eq!(terminal(&a, &pub1).await["state"], "succeeded");
+        assert_eq!(fake.posts.load(SeqCst), 2);
+
+        // Drift the owner config to a 3-host set while published: no silent
+        // expansion occurs while the original intent holds the publication slot.
+        let expanded = Profile::synthetic_multi(
+            host,
+            "docker-drift",
+            &[
+                "a.example.invalid",
+                "b.example.invalid",
+                "c.example.invalid",
+            ],
+            Some("example.invalid"),
+            &zone,
+        );
+        enroll(&h, &fake, true, expanded);
+        let second = call(&a, "publish_site", args(4511)).await;
+        assert_eq!(second["reason"], "publish_cleanup_pending", "{second}");
+        assert_eq!(fake.posts.load(SeqCst), 2, "must not silently expand");
+        assert!(
+            !fake
+                .host_records
+                .lock()
+                .unwrap()
+                .contains_key("c.example.invalid"),
+            "new host must not be published without explicit unpublish"
+        );
+
+        // Explicit unpublish tears down the original 2 pinned hosts.
+        fake.remove_order.lock().unwrap().clear();
+        let rev = call(&a, "unpublish_site", args(4512)).await;
+        assert_eq!(terminal(&a, &rev).await["state"], "succeeded");
+        assert_eq!(
+            *fake.remove_order.lock().unwrap(),
+            vec!["a.example.invalid", "b.example.invalid"]
+        );
+
+        // Explicit publish now applies the new 3-host set.
+        let pub2 = call(&a, "publish_site", args(4513)).await;
+        assert_eq!(terminal(&a, &pub2).await["state"], "succeeded");
+        assert_eq!(fake.posts.load(SeqCst), 5);
+        assert_eq!(phase(&a, &vm).await["host_count"], 3);
+        let rev2 = call(&a, "unpublish_site", args(4514)).await;
+        assert_eq!(terminal(&a, &rev2).await["state"], "succeeded");
+
+        drop(a);
+        h.shutdown().await.unwrap();
     }
 }

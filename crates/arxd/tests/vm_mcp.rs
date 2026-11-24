@@ -971,3 +971,120 @@ async fn executable_directory_overlap_is_refused() {
     );
     assert_eq!(std::fs::read_dir(inside.path()).unwrap().count(), 0);
 }
+
+// TEST VM profile validation accepts only Windows drive-letter state roots
+// (`config.rs` `LocalPath::parse`), so this config check is Windows-only.
+#[cfg(windows)]
+#[test]
+fn multi_host_publication_config_validates_bounds_and_defaults_policy_off() {
+    let (temp, owner, alternate) = private_temp();
+    let root = temp.path();
+    let state = root.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    win::protect(&state, true);
+    let private_root = root.join("pub-private");
+    let dist_root = root.join("pub-dist");
+    std::fs::create_dir_all(&private_root).unwrap();
+    std::fs::create_dir_all(&dist_root).unwrap();
+    let token = "a".repeat(64);
+    let agents = json!([{"principal":"fixture","token_sha256":hex::encode(Sha256::digest(token.as_bytes()))}]);
+    let (vm_client, _) = vm_clients(&owner, &alternate);
+    let config_path = root.join("server-multihost.json");
+
+    let make_config = |hostnames: Value, zone_name: Option<&str>, routes: Value| {
+        let mut pub_obj = json!({
+            "hostnames": hostnames,
+            "static_name": "docker-static",
+            "host_id": "01".repeat(16),
+            "tunnel_id": "12345678-1234-4321-8234-123456789abc",
+            "account_id": "a".repeat(32),
+            "zone_id": "b".repeat(32),
+            "private_root": private_root,
+            "dns_ciphertext": private_root.join("dns.dpapi"),
+            "tunnel_ciphertext": private_root.join("tunnel.dpapi"),
+            "connector": dist_root.join("cloudflared.exe"),
+            "connector_length": 1,
+            "connector_sha256": "c".repeat(64),
+        });
+        if let Some(z) = zone_name {
+            pub_obj["zone_name"] = json!(z);
+        }
+        if !routes.is_null() {
+            pub_obj["routes"] = routes;
+        }
+        json!({
+            "state_dir": state,
+            "agents": agents,
+            "local": {"address": endpoint(root), "client_identity": vm_client},
+            "test_vms": {
+                "enabled": false,
+                "publication": pub_obj
+            }
+        })
+    };
+
+    // Valid multi-host config with route bindings; policy defaults to off.
+    save(
+        &config_path,
+        make_config(
+            json!(["api.example.invalid", "app.example.invalid"]),
+            Some("example.invalid"),
+            json!([
+                {"hostname": "api.example.invalid", "project_id": "proj-1", "service": "api", "project_slot": 0, "service_index": 0, "route_slot": 0},
+                {"hostname": "app.example.invalid", "project_id": "proj-1", "service": "web", "project_slot": 0, "service_index": 1, "route_slot": 1}
+            ]),
+        )
+        .to_string(),
+    );
+    ForegroundConfig::load(&config_path).expect("valid multi-host config");
+
+    // Invalid configs: empty, 9 hosts, unsorted, cross-zone, slot collision.
+    for bad in [
+        make_config(json!([]), Some("example.invalid"), json!(null)),
+        make_config(
+            json!([
+                "h0.example.invalid",
+                "h1.example.invalid",
+                "h2.example.invalid",
+                "h3.example.invalid",
+                "h4.example.invalid",
+                "h5.example.invalid",
+                "h6.example.invalid",
+                "h7.example.invalid",
+                "h8.example.invalid"
+            ]),
+            Some("example.invalid"),
+            json!(null),
+        ),
+        make_config(
+            json!(["b.example.invalid", "a.example.invalid"]),
+            Some("example.invalid"),
+            json!(null),
+        ),
+        make_config(
+            json!(["a.example.invalid", "b.other.invalid"]),
+            Some("example.invalid"),
+            json!(null),
+        ),
+        make_config(
+            json!(["a.example.invalid", "b.example.invalid"]),
+            Some("example.invalid"),
+            json!([
+                {"hostname": "a.example.invalid", "project_id": "p", "service": "s1", "project_slot": 0, "service_index": 0, "route_slot": 2},
+                {"hostname": "b.example.invalid", "project_id": "p", "service": "s2", "project_slot": 0, "service_index": 1, "route_slot": 2}
+            ]),
+        ),
+    ] {
+        save(&config_path, bad.to_string());
+        assert!(
+            ForegroundConfig::load(&config_path).is_err(),
+            "invalid multi-host publication config was accepted: {bad}"
+        );
+    }
+}

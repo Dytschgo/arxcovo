@@ -106,28 +106,137 @@ CREATE TABLE vm_publication (
 ) STRICT;
 ";
 
+pub(super) const MIGRATE_V13: &str = "CREATE TABLE vm_publication_v13 (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    vm BLOB NOT NULL REFERENCES vm_static_instances(id) CHECK(length(vm)=16),
+    generation BLOB NOT NULL REFERENCES vm_generations(id) CHECK(length(generation)=16),
+    boot BLOB NOT NULL CHECK(length(boot)=16),
+    revision BLOB NOT NULL CHECK(length(revision)=32),
+    tunnel TEXT NOT NULL CHECK(length(tunnel)=36),
+    zone TEXT NOT NULL CHECK(length(zone)=32),
+    credential_ref TEXT NOT NULL CHECK(length(credential_ref) BETWEEN 1 AND 240),
+    nonce TEXT NOT NULL CHECK(length(nonce)=32),
+    phase TEXT NOT NULL CHECK(phase IN ('publishing','published','revoking','cleanup_pending')),
+    cleanup_reason INTEGER CHECK(cleanup_reason BETWEEN 1 AND 17)
+) STRICT;
+INSERT INTO vm_publication_v13(singleton,vm,generation,boot,revision,tunnel,zone,
+    credential_ref,nonce,phase,cleanup_reason)
+    SELECT singleton,vm,generation,boot,revision,tunnel,zone,
+        credential_ref,nonce,phase,cleanup_reason
+    FROM vm_publication;
+CREATE TABLE vm_publication_hosts (
+    publication INTEGER NOT NULL DEFAULT 1 REFERENCES vm_publication_v13(singleton) ON DELETE CASCADE
+        CHECK(publication=1),
+    position INTEGER NOT NULL CHECK(position BETWEEN 0 AND 7),
+    hostname TEXT NOT NULL UNIQUE CHECK(length(hostname) BETWEEN 3 AND 253),
+    project_id TEXT CHECK(project_id IS NULL OR (length(project_id) BETWEEN 1 AND 24
+        AND project_id NOT GLOB '*[^a-z0-9-]*')),
+    service TEXT CHECK(service IS NULL OR (length(service) BETWEEN 1 AND 16
+        AND service NOT GLOB '*[^a-z0-9-]*')),
+    project_slot INTEGER CHECK(project_slot IS NULL OR project_slot BETWEEN 0 AND 7),
+    service_index INTEGER CHECK(service_index IS NULL OR service_index BETWEEN 0 AND 3),
+    route_slot INTEGER UNIQUE CHECK(route_slot IS NULL OR route_slot BETWEEN 0 AND 7),
+    marker TEXT NOT NULL UNIQUE CHECK(length(marker)=32),
+    post_possible INTEGER NOT NULL DEFAULT 0 CHECK(post_possible IN (0,1)),
+    record TEXT CHECK(record IS NULL OR (length(record)=32 AND post_possible=1)),
+    ambiguous INTEGER NOT NULL DEFAULT 0 CHECK(ambiguous IN (0,1)),
+    state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(state IN ('pending','verified','cleaned','cleanup_pending')),
+    failure_reason INTEGER CHECK(failure_reason BETWEEN 1 AND 17),
+    CHECK((project_id IS NULL)=(service IS NULL)
+        AND (project_id IS NULL)=(project_slot IS NULL)
+        AND (project_id IS NULL)=(service_index IS NULL)
+        AND (project_id IS NULL)=(route_slot IS NULL)),
+    CHECK(state<>'verified' OR (record IS NOT NULL AND ambiguous=0)),
+    CHECK(ambiguous=0 OR post_possible=1),
+    PRIMARY KEY(publication,position)
+) STRICT, WITHOUT ROWID;
+INSERT INTO vm_publication_hosts(publication,position,hostname,marker,post_possible,
+    record,ambiguous,state,failure_reason)
+    SELECT singleton,0,hostname,nonce,post_possible,record,
+        CASE WHEN post_possible=1 AND record IS NULL THEN 1 ELSE 0 END,
+        CASE WHEN phase='published' THEN 'verified'
+             WHEN phase='cleanup_pending' THEN 'cleanup_pending'
+             ELSE 'pending' END,
+        cleanup_reason
+    FROM vm_publication;
+DROP TABLE vm_publication;
+ALTER TABLE vm_publication_v13 RENAME TO vm_publication;
+";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostState {
+    Pending,
+    Verified,
+    Cleaned,
+    CleanupPending,
+}
+
+impl HostState {
+    pub(crate) fn wire(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Verified => "verified",
+            Self::Cleaned => "cleaned",
+            Self::CleanupPending => "cleanup_pending",
+        }
+    }
+
+    fn parse(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "verified" => Ok(Self::Verified),
+            "cleaned" => Ok(Self::Cleaned),
+            "cleanup_pending" => Ok(Self::CleanupPending),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostIntent {
+    pub position: u8,
+    pub hostname: crate::vm::publish::Hostname,
+    pub route: Option<crate::vm::publish::RouteSlot>,
+    pub marker: String,
+    pub post_possible: bool,
+    pub record: Option<String>,
+    pub ambiguous: bool,
+    pub state: HostState,
+    pub reason: Option<FailureReason>,
+}
+
 pub(crate) struct Intent {
     pub vm: Id,
     pub generation: Id,
     pub boot: Id,
     pub revision: [u8; 32],
-    pub hostname: crate::vm::publish::Hostname,
     pub tunnel: String,
     pub zone: String,
     pub credential_ref: String,
     pub nonce: String,
     pub phase: Phase,
-    pub post_possible: bool,
-    pub record: Option<String>,
+    pub reason: Option<FailureReason>,
+    pub hosts: Vec<HostIntent>,
+}
+
+pub(crate) struct HostStatusView {
+    pub position: u8,
+    pub state: HostState,
+    pub ambiguous: bool,
+    pub route_slot: Option<u8>,
+    pub project_id: Option<String>,
+    pub service: Option<String>,
     pub reason: Option<FailureReason>,
 }
 
 pub(crate) struct SiteStatus {
     pub phase: Option<Phase>,
     pub reason: Option<FailureReason>,
+    pub hosts: Vec<HostStatusView>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Phase {
     Publishing,
     Published,
@@ -179,10 +288,10 @@ pub(crate) fn effective_cause(
 }
 
 pub(crate) fn current(db: &Connection) -> Result<Option<Intent>> {
-    Ok(db
+    let Some(mut intent) = db
         .query_row(
-            "SELECT vm,generation,boot,revision,hostname,tunnel,zone,credential_ref,nonce,
-                phase,post_possible,record,cleanup_reason FROM vm_publication",
+            "SELECT vm,generation,boot,revision,tunnel,zone,credential_ref,nonce,
+                phase,cleanup_reason FROM vm_publication",
             [],
             |row| {
                 Ok(Intent {
@@ -190,38 +299,97 @@ pub(crate) fn current(db: &Connection) -> Result<Option<Intent>> {
                     generation: row.get(1)?,
                     boot: row.get(2)?,
                     revision: row.get(3)?,
-                    hostname: crate::vm::publish::Hostname::parse(&row.get::<_, String>(4)?)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    tunnel: row.get(5)?,
-                    zone: row.get(6)?,
-                    credential_ref: row.get(7)?,
-                    nonce: row.get(8)?,
-                    phase: Phase::parse(&row.get::<_, String>(9)?)?,
-                    post_possible: row.get(10)?,
-                    record: row.get(11)?,
+                    tunnel: row.get(4)?,
+                    zone: row.get(5)?,
+                    credential_ref: row.get(6)?,
+                    nonce: row.get(7)?,
+                    phase: Phase::parse(&row.get::<_, String>(8)?)?,
                     reason: row
-                        .get::<_, Option<i64>>(12)?
+                        .get::<_, Option<i64>>(9)?
                         .map(FailureReason::from_code)
                         .transpose()?,
+                    hosts: Vec::new(),
                 })
             },
         )
-        .optional()?)
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let mut stmt = db.prepare(
+        "SELECT position,hostname,project_id,service,project_slot,service_index,route_slot,
+            marker,post_possible,record,ambiguous,state,failure_reason
+         FROM vm_publication_hosts WHERE publication=1 ORDER BY position ASC",
+    )?;
+    let hosts = stmt
+        .query_map([], |row| {
+            let project_id: Option<String> = row.get(2)?;
+            let service: Option<String> = row.get(3)?;
+            let project_slot: Option<u8> = row.get(4)?;
+            let service_index: Option<u8> = row.get(5)?;
+            let route_slot: Option<u8> = row.get(6)?;
+            let route = match (project_id, service, project_slot, service_index, route_slot) {
+                (
+                    Some(project_id),
+                    Some(service),
+                    Some(project_slot),
+                    Some(service_index),
+                    Some(route_slot),
+                ) => {
+                    let slot = crate::vm::publish::RouteSlot {
+                        project_id,
+                        service,
+                        project_slot,
+                        service_index,
+                        route_slot,
+                    };
+                    slot.validate().map_err(|_| rusqlite::Error::InvalidQuery)?;
+                    Some(slot)
+                }
+                (None, None, None, None, None) => None,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            Ok(HostIntent {
+                position: row.get(0)?,
+                hostname: crate::vm::publish::Hostname::parse(&row.get::<_, String>(1)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                route,
+                marker: row.get(7)?,
+                post_possible: row.get(8)?,
+                record: row.get(9)?,
+                ambiguous: row.get(10)?,
+                state: HostState::parse(&row.get::<_, String>(11)?)?,
+                reason: row
+                    .get::<_, Option<i64>>(12)?
+                    .map(FailureReason::from_code)
+                    .transpose()?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        !hosts.is_empty() && hosts.len() <= crate::vm::publish::MAX_HOSTNAMES,
+        "publication hosts missing or out of bounds"
+    );
+    intent.hosts = hosts;
+    Ok(Some(intent))
 }
 
 pub(crate) fn reserve(db: &Connection, intent: &Intent) -> Result<()> {
     ensure!(
+        !intent.hosts.is_empty() && intent.hosts.len() <= crate::vm::publish::MAX_HOSTNAMES,
+        "publication hosts out of bounds"
+    );
+    ensure!(
         db.execute(
-            "INSERT INTO vm_publication(singleton,vm,generation,boot,revision,hostname,tunnel,zone,
+            "INSERT INTO vm_publication(singleton,vm,generation,boot,revision,tunnel,zone,
                 credential_ref,nonce,phase)
-             SELECT 1,?1,?2,?3,?4,?5,?6,?7,?8,?9,'publishing'
+             SELECT 1,?1,?2,?3,?4,?5,?6,?7,?8,'publishing'
              FROM vm_generations WHERE id=?2 AND static_id=?1 AND active=1",
             params![
                 intent.vm,
                 intent.generation,
                 intent.boot,
                 intent.revision,
-                intent.hostname.as_str(),
                 intent.tunnel,
                 intent.zone,
                 intent.credential_ref,
@@ -230,33 +398,122 @@ pub(crate) fn reserve(db: &Connection, intent: &Intent) -> Result<()> {
         )? == 1,
         "publication generation changed"
     );
+    for (index, host) in intent.hosts.iter().enumerate() {
+        ensure!(
+            usize::from(host.position) == index,
+            "publication host position mismatch"
+        );
+        let (project_id, service, project_slot, service_index, route_slot) = match &host.route {
+            Some(route) => (
+                Some(route.project_id.as_str()),
+                Some(route.service.as_str()),
+                Some(route.project_slot),
+                Some(route.service_index),
+                Some(route.route_slot),
+            ),
+            None => (None, None, None, None, None),
+        };
+        ensure!(
+            db.execute(
+                "INSERT INTO vm_publication_hosts(publication,position,hostname,project_id,
+                    service,project_slot,service_index,route_slot,marker,post_possible,
+                    record,ambiguous,state)
+                 VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,0,NULL,0,'pending')",
+                params![
+                    host.position,
+                    host.hostname.as_str(),
+                    project_id,
+                    service,
+                    project_slot,
+                    service_index,
+                    route_slot,
+                    host.marker,
+                ],
+            )? == 1,
+            "publication host insert failed"
+        );
+    }
     Ok(())
 }
 
 pub(crate) enum Update<'a> {
-    PostPossible,
-    /// The worker exited before submitting the POST it had marked. An owner
-    /// unpublish may already have moved the intent to `revoking`.
-    PostWithdrawn,
-    Record(&'a str),
+    HostPostPossible {
+        position: u8,
+    },
+    /// The worker exited before submitting the POST it had marked for this row.
+    /// An owner unpublish may already have moved the intent to `revoking`.
+    HostPostWithdrawn {
+        position: u8,
+    },
+    HostRecord {
+        position: u8,
+        record: &'a str,
+    },
+    HostVerified {
+        position: u8,
+    },
+    HostCleaned {
+        position: u8,
+    },
+    HostCleanupPending {
+        position: u8,
+        ambiguous: bool,
+        reason: Option<FailureReason>,
+    },
     Phase(Phase, Option<FailureReason>),
     Released(Option<FailureReason>),
 }
 
 pub(crate) fn update(db: &Connection, nonce: &str, change: Update<'_>) -> Result<()> {
     let changed = match change {
-        Update::PostPossible => db.execute(
-            "UPDATE vm_publication SET post_possible=1 WHERE nonce=?1 AND phase='publishing' AND post_possible=0",
-            [nonce],
+        Update::HostPostPossible { position } => db.execute(
+            "UPDATE vm_publication_hosts SET post_possible=1,ambiguous=1
+             WHERE publication=1 AND position=?2 AND post_possible=0
+               AND EXISTS(SELECT 1 FROM vm_publication WHERE singleton=1 AND nonce=?1 AND phase='publishing')",
+            params![nonce, position],
         )?,
-        Update::PostWithdrawn => db.execute(
-            "UPDATE vm_publication SET post_possible=0
-             WHERE nonce=?1 AND phase IN ('publishing','revoking') AND post_possible=1 AND record IS NULL",
-            [nonce],
+        Update::HostPostWithdrawn { position } => db.execute(
+            "UPDATE vm_publication_hosts SET post_possible=0,ambiguous=0
+             WHERE publication=1 AND position=?2 AND post_possible=1 AND record IS NULL
+               AND EXISTS(SELECT 1 FROM vm_publication WHERE singleton=1 AND nonce=?1 AND phase IN ('publishing','revoking'))",
+            params![nonce, position],
         )?,
-        Update::Record(id) => db.execute(
-            "UPDATE vm_publication SET record=?2 WHERE nonce=?1 AND post_possible=1 AND (record IS NULL OR record=?2)",
-            params![nonce,id],
+        Update::HostRecord { position, record } => db.execute(
+            "UPDATE vm_publication_hosts SET record=?3,ambiguous=0
+             WHERE publication=1 AND position=?2 AND post_possible=1 AND (record IS NULL OR record=?3)
+               AND EXISTS(SELECT 1 FROM vm_publication WHERE singleton=1 AND nonce=?1)",
+            params![nonce, position, record],
+        )?,
+        Update::HostVerified { position } => db.execute(
+            "UPDATE vm_publication_hosts SET state='verified',failure_reason=NULL
+             WHERE publication=1 AND position=?2 AND post_possible=1 AND record IS NOT NULL AND ambiguous=0
+               AND EXISTS(SELECT 1 FROM vm_publication WHERE singleton=1 AND nonce=?1 AND phase='publishing')",
+            params![nonce, position],
+        )?,
+        Update::HostCleaned { position } => db.execute(
+            "UPDATE vm_publication_hosts
+             SET state='cleaned',record=NULL,ambiguous=0,failure_reason=NULL
+             WHERE publication=1 AND position=?2
+               AND EXISTS(SELECT 1 FROM vm_publication WHERE singleton=1 AND nonce=?1)",
+            params![nonce, position],
+        )?,
+        Update::HostCleanupPending {
+            position,
+            ambiguous,
+            reason,
+        } => db.execute(
+            "UPDATE vm_publication_hosts
+             SET state='cleanup_pending',
+                 ambiguous=CASE WHEN ?3=1 THEN 1 ELSE ambiguous END,
+                 failure_reason=coalesce(?4,failure_reason)
+             WHERE publication=1 AND position=?2 AND state<>'cleaned'
+               AND EXISTS(SELECT 1 FROM vm_publication WHERE singleton=1 AND nonce=?1)",
+            params![
+                nonce,
+                position,
+                i64::from(ambiguous),
+                reason.map(|value| value as i64)
+            ],
         )?,
         // A recorded owner cause has precedence: a later null or generic
         // cleanup reason never erases it, and a null keeps any earlier reason.
@@ -291,13 +548,20 @@ pub(crate) fn update(db: &Connection, nonce: &str, change: Update<'_>) -> Result
 }
 
 /// The publish worker's final transition. It changes only a still
-/// `publishing` intent with durable record evidence, so a `revoking` or
-/// `cleanup_pending` intent committed by an owner unpublish, the reaper or
-/// recovery is never overwritten. Returns whether it committed.
+/// `publishing` intent where every child row has durable verified record
+/// evidence and no ambiguity, so a `revoking` or `cleanup_pending` intent
+/// committed by an owner unpublish, the reaper or recovery is never
+/// overwritten. Returns whether it committed.
 pub(crate) fn commit(db: &Connection, nonce: &str) -> Result<bool> {
     Ok(db.execute(
         "UPDATE vm_publication SET phase='published',cleanup_reason=NULL
-         WHERE nonce=?1 AND phase='publishing' AND post_possible=1 AND record IS NOT NULL",
+         WHERE nonce=?1 AND phase='publishing'
+           AND EXISTS(SELECT 1 FROM vm_publication_hosts WHERE publication=1)
+           AND NOT EXISTS(
+               SELECT 1 FROM vm_publication_hosts
+               WHERE publication=1
+                 AND (post_possible<>1 OR record IS NULL OR ambiguous<>0 OR state<>'verified')
+           )",
         [nonce],
     )? == 1)
 }
@@ -397,6 +661,14 @@ pub(crate) fn pending_receipts(db: &Connection) -> Result<usize> {
 pub(super) fn recover(db: &Connection, now: i64) -> Result<()> {
     db.execute(
         "UPDATE vm_publication SET phase='cleanup_pending',cleanup_reason=coalesce(cleanup_reason,11)",
+        [],
+    )?;
+    db.execute(
+        "UPDATE vm_publication_hosts
+         SET ambiguous=CASE WHEN post_possible=1 AND record IS NULL THEN 1 ELSE ambiguous END,
+             state='cleanup_pending',
+             failure_reason=coalesce(failure_reason,11)
+         WHERE publication=1 AND state<>'cleaned'",
         [],
     )?;
     // A publish and an owner unpublish may both be pending: the unpublish

@@ -79,6 +79,60 @@ mod vm {
         }
     }
 
+    #[test]
+    fn multihost_ingress_generation_and_bounds_match_spec() {
+        let tunnel = TunnelId::parse(TUNNEL).unwrap();
+        let origin_name = Hostname::parse("origin.arxcovo.invalid").unwrap();
+        let port = std::num::NonZeroU16::new(20443).unwrap();
+        let ca_path = "D:/synthetic/origin-ca.pem";
+        let zone = Hostname::parse("example.invalid").unwrap();
+
+        // 0 hosts, 9 hosts, unsorted, duplicate, and cross-zone are rejected.
+        assert!(publish::validate_hostname_set(&[], Some(&zone)).is_err());
+        assert!(publish::ingress(&tunnel, &[], port, &origin_name, ca_path).is_err());
+        let nine: Vec<Hostname> = (0..9)
+            .map(|i| Hostname::parse(&format!("h{i}.example.invalid")).unwrap())
+            .collect();
+        assert!(publish::validate_hostname_set(&nine, Some(&zone)).is_err());
+        assert!(publish::ingress(&tunnel, &nine, port, &origin_name, ca_path).is_err());
+        let unsorted = vec![
+            Hostname::parse("b.example.invalid").unwrap(),
+            Hostname::parse("a.example.invalid").unwrap(),
+        ];
+        assert!(publish::ingress(&tunnel, &unsorted, port, &origin_name, ca_path).is_err());
+        let duplicate = vec![
+            Hostname::parse("a.example.invalid").unwrap(),
+            Hostname::parse("a.example.invalid").unwrap(),
+        ];
+        assert!(publish::ingress(&tunnel, &duplicate, port, &origin_name, ca_path).is_err());
+        let cross_zone = vec![
+            Hostname::parse("a.example.invalid").unwrap(),
+            Hostname::parse("b.other.invalid").unwrap(),
+        ];
+        assert!(publish::validate_hostname_set(&cross_zone, Some(&zone)).is_err());
+
+        // 2 and 8 sorted unique in-zone hostnames generate exact per-row ingress.
+        let two = vec![
+            Hostname::parse("api.example.invalid").unwrap(),
+            Hostname::parse("app.example.invalid").unwrap(),
+        ];
+        assert!(publish::validate_hostname_set(&two, Some(&zone)).is_ok());
+        let yaml = publish::ingress(&tunnel, &two, port, &origin_name, ca_path).unwrap();
+        assert_eq!(
+            yaml,
+            format!(
+                "tunnel: '{TUNNEL}'\nwarp-routing:\n  enabled: false\ningress:\n  - hostname: 'api.example.invalid'\n    service: 'https://127.0.0.1:20443'\n    originRequest:\n      originServerName: 'origin.arxcovo.invalid'\n      httpHostHeader: 'api.example.invalid'\n      caPool: '{}'\n      noTLSVerify: false\n  - hostname: 'app.example.invalid'\n    service: 'https://127.0.0.1:20443'\n    originRequest:\n      originServerName: 'origin.arxcovo.invalid'\n      httpHostHeader: 'app.example.invalid'\n      caPool: '{}'\n      noTLSVerify: false\n  - service: http_status:404\n",
+                ca_path, ca_path,
+            )
+        );
+        let eight: Vec<Hostname> = (0..8)
+            .map(|i| Hostname::parse(&format!("h{i}.example.invalid")).unwrap())
+            .collect();
+        let yaml8 = publish::ingress(&tunnel, &eight, port, &origin_name, ca_path).unwrap();
+        assert_eq!(yaml8.matches("httpHostHeader:").count(), 8);
+        assert!(yaml8.ends_with("  - service: http_status:404\n"));
+    }
+
     fn route() -> Route {
         Route::new(
             ZONE,
@@ -1012,7 +1066,10 @@ mod vm {
             pem
         }
 
-        async fn origin(root: &Path) -> (NonZeroU16, PathBuf, ArtifactPin, JoinHandle<()>) {
+        async fn origin(
+            root: &Path,
+            app_status: Arc<std::sync::atomic::AtomicU16>,
+        ) -> (NonZeroU16, PathBuf, ArtifactPin, JoinHandle<()>) {
             let mut params = CertificateParams::default();
             params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
             let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
@@ -1040,7 +1097,59 @@ mod vm {
             let acceptor = TlsAcceptor::from(Arc::new(tls));
             let task = tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
-                    let _ = timeout(Duration::from_millis(200), acceptor.accept(socket)).await;
+                    let acceptor = acceptor.clone();
+                    let app_status = app_status.clone();
+                    tokio::spawn(async move {
+                        let Ok(Ok(mut tls)) =
+                            timeout(Duration::from_millis(500), acceptor.accept(socket)).await
+                        else {
+                            return;
+                        };
+                        let mut buf = [0u8; 4096];
+                        let Ok(Ok(n)) =
+                            timeout(Duration::from_millis(500), tls.read(&mut buf)).await
+                        else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let mut lines = req.lines();
+                        let path = lines
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let host = lines
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.eq_ignore_ascii_case("host").then(|| v.trim())
+                            })
+                            .unwrap_or("");
+                        let ok = (host == ORIGIN_NAME && path == "/arx-health") || host == NAME;
+                        if ok && path == "/.arxcovo/route/fixture" {
+                            tls.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                                .await
+                                .unwrap();
+                            let _ = tls.shutdown().await;
+                        } else if ok {
+                            let code = if path == "/" {
+                                app_status.load(std::sync::atomic::Ordering::SeqCst)
+                            } else {
+                                200
+                            };
+                            let body = format!("host={host};path={path}");
+                            let resp = format!(
+                                "HTTP/1.1 {code} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = tls.write_all(resp.as_bytes()).await;
+                            let _ = tls.shutdown().await;
+                        } else {
+                            // Exact-Host refusal (444 equivalent: close without response).
+                            let _ = tls.shutdown().await;
+                        }
+                    });
                 }
             });
             (port, ca_path, pin(pem.as_bytes()), task)
@@ -1189,7 +1298,10 @@ mod vm {
             secure(root);
             assert_secured("fixture root", root);
             let (binary, binary_receipt) = fixture_binary(root);
-            let (origin_port, ca_path, ca_receipt, origin_task) = origin(root).await;
+            use std::sync::atomic::{AtomicU16, Ordering::SeqCst};
+            let app_status = Arc::new(AtomicU16::new(401));
+            let (origin_port, ca_path, ca_receipt, origin_task) =
+                origin(root, app_status.clone()).await;
             let route = route();
             let fake = FakeDns::start().await;
             let hostname = Hostname::parse(NAME).unwrap();
@@ -1236,11 +1348,13 @@ mod vm {
                 sha256: [0; 32],
                 ..binary_receipt
             };
+            let hostnames = [hostname];
             let mut plan = Plan {
+                probes: &[],
                 executable: &binary,
                 binary_receipt: bad_receipt,
                 private_root: root,
-                hostname: &hostname,
+                hostnames: &hostnames,
                 tunnel: &tunnel,
                 credential: &credential,
                 origin_port,
@@ -1263,6 +1377,15 @@ mod vm {
             plan.origin_name = &origin_name;
             assert!(!witness_path.exists());
 
+            // A generic 200 response from another table cannot prove this binding.
+            let wrong_probe = [(hostnames[0].clone(), "/.arxcovo/route/wrong".into())];
+            plan.probes = &wrong_probe;
+            assert!(matches!(
+                Connector::start(&plan).await,
+                Err(ConnectorError::Origin)
+            ));
+            let probe = [(hostnames[0].clone(), "/.arxcovo/route/fixture".into())];
+            plan.probes = &probe;
             let publish_started = std::time::Instant::now();
             let (mut connector, id) = timeout(LEG, async {
                 fake.client.preflight(&route).await.unwrap();
@@ -1283,6 +1406,17 @@ mod vm {
             .await
             .expect("publish exceeded its deadline");
             let publish_elapsed = publish_started.elapsed();
+            app_status.store(503, SeqCst);
+            assert_eq!(
+                connector.origin_ready(true).await,
+                Err(ConnectorError::Origin)
+            );
+            connector
+                .origin_ready(false)
+                .await
+                .expect("an app outage preserves an active binding");
+            app_status.store(302, SeqCst);
+            connector.origin_ready(true).await.unwrap();
 
             // The child created the witness inside the fixture root.
             secure(&witness_path);
@@ -1309,7 +1443,7 @@ mod vm {
             assert_eq!(
                 config,
                 format!(
-                    "tunnel: '{TUNNEL}'\nwarp-routing:\n  enabled: false\ningress:\n  - hostname: '{NAME}'\n    service: 'https://127.0.0.1:{origin_port}'\n    originRequest:\n      originServerName: '{ORIGIN_NAME}'\n      caPool: '{}'\n      noTLSVerify: false\n  - service: http_status:404\n",
+                    "tunnel: '{TUNNEL}'\nwarp-routing:\n  enabled: false\ningress:\n  - hostname: '{NAME}'\n    service: 'https://127.0.0.1:{origin_port}'\n    originRequest:\n      originServerName: '{ORIGIN_NAME}'\n      httpHostHeader: '{NAME}'\n      caPool: '{}'\n      noTLSVerify: false\n  - service: http_status:404\n",
                     ca_path.display(),
                 )
             );
@@ -1551,6 +1685,253 @@ mod vm {
                 0
             );
             assert_ne!(code, 259, "fake connector child is still active");
+        }
+
+        /// Verifies controlled Host dispatch, forwarding header trust, and
+        /// deterministic HTTP 206/416 range responses over one verified TLS
+        /// loopback listener with custodied CA and pinned `originServerName`.
+        #[tokio::test]
+        async fn tls_origin_host_dispatch_headers_and_deterministic_206_416() {
+            const PAYLOAD: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+            const ETAG: &str = "\"arx-v1-alpha\"";
+
+            let temp = tempfile::Builder::new()
+                .prefix("publish-tls-range-")
+                .tempdir()
+                .unwrap();
+            let mut params = CertificateParams::default();
+            params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+            let key = KeyPair::generate().unwrap();
+            let cert = CertificateParams::new(vec![ORIGIN_NAME.to_owned()])
+                .unwrap()
+                .signed_by(&key, &ca)
+                .unwrap();
+            let ca_pem = encode_ca_pem(ca.der());
+            let ca_path = temp.path().join("origin-ca.pem");
+            fs::write(&ca_path, ca_pem.as_bytes()).unwrap();
+            let tls_server = ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let acceptor = TlsAcceptor::from(Arc::new(tls_server));
+            let server = tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        let Ok(Ok(mut stream)) =
+                            timeout(Duration::from_secs(2), acceptor.accept(socket)).await
+                        else {
+                            return;
+                        };
+                        let mut buf = [0u8; 4096];
+                        let Ok(Ok(n)) =
+                            timeout(Duration::from_secs(2), stream.read(&mut buf)).await
+                        else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        let raw = String::from_utf8_lossy(&buf[..n]);
+                        let mut lines = raw.lines();
+                        let path = lines
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let mut host = "";
+                        let mut range: Option<&str> = None;
+                        let mut if_range: Option<&str> = None;
+                        let mut cf_ip: Option<&str> = None;
+                        let mut xff: Option<&str> = None;
+                        for line in lines {
+                            if let Some((k, v)) = line.split_once(':') {
+                                let v = v.trim();
+                                if k.eq_ignore_ascii_case("host") {
+                                    host = v;
+                                } else if k.eq_ignore_ascii_case("range") {
+                                    range = Some(v);
+                                } else if k.eq_ignore_ascii_case("if-range") {
+                                    if_range = Some(v);
+                                } else if k.eq_ignore_ascii_case("cf-connecting-ip") {
+                                    cf_ip = Some(v);
+                                } else if k.eq_ignore_ascii_case("x-forwarded-for") {
+                                    xff = Some(v);
+                                }
+                            }
+                        }
+                        let resp = match (host, path) {
+                            (ORIGIN_NAME, "/arx-health") => {
+                                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                                    .into()
+                            }
+                            ("api.example.invalid", "/whoami") => {
+                                // Only canonical CF-Connecting-IP is forwarded; spoofed XFF is replaced.
+                                let ip = cf_ip.unwrap_or("127.0.0.1");
+                                let _ = xff;
+                                let body = format!("service=api;client={ip}");
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            }
+                            ("app.example.invalid", "/blob") => {
+                                let allow_range = if_range.is_none_or(|ir| ir == ETAG);
+                                if let Some(spec) = range.filter(|_| allow_range) {
+                                    let bytes_spec = spec.strip_prefix("bytes=").unwrap_or("");
+                                    let (s, e) = bytes_spec.split_once('-').unwrap_or(("999", "999"));
+                                    let start = s.parse::<usize>().unwrap_or(usize::MAX);
+                                    let end = e.parse::<usize>().unwrap_or(usize::MAX);
+                                    if start < PAYLOAD.len() && start <= end {
+                                        let end = end.min(PAYLOAD.len() - 1);
+                                        let slice = &PAYLOAD[start..=end];
+                                        let body = std::str::from_utf8(slice).unwrap();
+                                        format!(
+                                            "HTTP/1.1 206 Partial Content\r\nETag: {ETAG}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                            PAYLOAD.len(),
+                                            slice.len()
+                                        )
+                                    } else {
+                                        format!(
+                                            "HTTP/1.1 416 Range Not Satisfiable\r\nETag: {ETAG}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                            PAYLOAD.len()
+                                        )
+                                    }
+                                } else {
+                                    let body = std::str::from_utf8(PAYLOAD).unwrap();
+                                    format!(
+                                        "HTTP/1.1 200 OK\r\nETag: {ETAG}\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                        PAYLOAD.len()
+                                    )
+                                }
+                            }
+                            _ => {
+                                // Unknown Host -> nginx 444 behavior (close without HTTP response).
+                                let _ = stream.shutdown().await;
+                                return;
+                            }
+                        };
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            });
+
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.der().clone()).unwrap();
+            let client_cfg = Arc::new(
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+            );
+            let connector = tokio_rustls::TlsConnector::from(client_cfg);
+
+            let request = |raw_req: String| {
+                let connector = connector.clone();
+                async move {
+                    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                        .await
+                        .unwrap();
+                    let server_name =
+                        rustls::pki_types::ServerName::try_from(ORIGIN_NAME.to_owned()).unwrap();
+                    let mut tls = connector.connect(server_name, tcp).await.unwrap();
+                    tls.write_all(raw_req.as_bytes()).await.unwrap();
+                    let mut out = Vec::new();
+                    let _ = tls.read_to_end(&mut out).await;
+                    String::from_utf8(out).unwrap()
+                }
+            };
+
+            // 1. Reserved readiness Host returns 200 OK.
+            let health = request(format!(
+                "GET /arx-health HTTP/1.1\r\nHost: {ORIGIN_NAME}\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            assert!(health.starts_with("HTTP/1.1 200 OK\r\n"), "{health}");
+            assert!(health.ends_with("\r\n\r\nok"), "{health}");
+
+            // 2. Host 1 dispatches to api and ignores spoofed X-Forwarded-For.
+            let api = request(
+                "GET /whoami HTTP/1.1\r\nHost: api.example.invalid\r\nX-Forwarded-For: 1.2.3.4\r\nCF-Connecting-IP: 203.0.113.42\r\nConnection: close\r\n\r\n"
+                    .into(),
+            )
+            .await;
+            assert!(api.starts_with("HTTP/1.1 200 OK\r\n"), "{api}");
+            assert!(
+                api.ends_with("\r\n\r\nservice=api;client=203.0.113.42"),
+                "{api}"
+            );
+            assert!(!api.contains("1.2.3.4"), "{api}");
+
+            // 3. Unknown Host is rejected with connection close (444).
+            let unknown = request(
+                "GET / HTTP/1.1\r\nHost: evil.example.invalid\r\nConnection: close\r\n\r\n".into(),
+            )
+            .await;
+            assert!(unknown.is_empty(), "unknown Host must be closed: {unknown}");
+
+            // 4. Deterministic 206 Partial Content with matching If-Range and SHA-256 check.
+            let partial = request(format!(
+                "GET /blob HTTP/1.1\r\nHost: app.example.invalid\r\nRange: bytes=4-11\r\nIf-Range: {ETAG}\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            assert!(
+                partial.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+                "{partial}"
+            );
+            assert!(partial.contains("Accept-Ranges: bytes\r\n"), "{partial}");
+            assert!(
+                partial.contains("Content-Range: bytes 4-11/26\r\n"),
+                "{partial}"
+            );
+            assert!(partial.contains("Content-Length: 8\r\n"), "{partial}");
+            let body = partial.split_once("\r\n\r\n").unwrap().1;
+            assert_eq!(body.as_bytes(), b"efghijkl");
+            assert_eq!(
+                Sha256::digest(body.as_bytes()),
+                Sha256::digest(&PAYLOAD[4..=11])
+            );
+
+            // 5. If-Range mismatch returns 200 OK with full payload.
+            let mismatch = request(
+                "GET /blob HTTP/1.1\r\nHost: app.example.invalid\r\nRange: bytes=4-11\r\nIf-Range: \"stale\"\r\nConnection: close\r\n\r\n"
+                    .into(),
+            )
+            .await;
+            assert!(mismatch.starts_with("HTTP/1.1 200 OK\r\n"), "{mismatch}");
+            assert_eq!(
+                mismatch.split_once("\r\n\r\n").unwrap().1.as_bytes(),
+                PAYLOAD
+            );
+
+            // 6. Unsatisfiable range returns 416 with Content-Range: bytes */26 and empty body.
+            let oob = request(
+                "GET /blob HTTP/1.1\r\nHost: app.example.invalid\r\nRange: bytes=100-120\r\nConnection: close\r\n\r\n"
+                    .into(),
+            )
+            .await;
+            assert!(
+                oob.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
+                "{oob}"
+            );
+            assert!(oob.contains("Content-Range: bytes */26\r\n"), "{oob}");
+            assert!(oob.contains("Content-Length: 0\r\n"), "{oob}");
+            assert!(oob.split_once("\r\n\r\n").unwrap().1.is_empty());
+
+            server.abort();
         }
     }
 }

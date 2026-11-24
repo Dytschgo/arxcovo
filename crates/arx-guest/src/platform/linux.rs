@@ -1257,7 +1257,123 @@ impl LinuxComposeStore {
     }
 }
 
+/// The fixed nginx paths reside in a root-owned directory. Keep its descriptor
+/// across staging, validation, rename and rollback.
+struct LinuxNginx(OwnedFd);
+
+impl compose::routing::NginxController for LinuxNginx {
+    fn read_active(&self) -> Result<Option<String>, compose::routing::NginxError> {
+        use compose::routing::NginxError::ReadActiveFailed;
+        const MAX_CONFIG: u64 = 64 * 1024;
+        let fd = match open_at(
+            self.0.as_fd(),
+            "nginx.conf",
+            libc::O_RDONLY | libc::O_NONBLOCK,
+            0,
+        ) {
+            Ok(fd) => fd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(ReadActiveFailed),
+        };
+        let file = File::from(fd);
+        let meta = file.metadata().map_err(|_| ReadActiveFailed)?;
+        if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 || meta.len() > MAX_CONFIG
+        {
+            return Err(ReadActiveFailed);
+        }
+        let mut prior = String::new();
+        file.take(MAX_CONFIG + 1)
+            .read_to_string(&mut prior)
+            .map_err(|_| ReadActiveFailed)?;
+        if prior.len() as u64 > MAX_CONFIG {
+            return Err(ReadActiveFailed);
+        }
+        Ok(Some(prior))
+    }
+
+    fn write_staging(&mut self, config: &str) -> Result<(), compose::routing::NginxError> {
+        replace_at(
+            self.0.as_fd(),
+            "nginx.conf.next",
+            config.as_bytes(),
+            0o600,
+            None,
+        )
+        .map(|_| ())
+        .map_err(|_| compose::routing::NginxError::StageWriteFailed)
+    }
+
+    fn remove_staging(&mut self) {
+        // SAFETY: held directory and fixed NUL-terminated basename.
+        unsafe {
+            libc::unlinkat(self.0.as_raw_fd(), c"nginx.conf.next".as_ptr(), 0);
+        }
+    }
+
+    fn run_fixed(&mut self, argv: &[&str]) -> bool {
+        use compose::routing::{NGINX_BIN, nginx_reload_argv, nginx_validate_argv};
+        if argv != nginx_validate_argv() && argv != nginx_reload_argv() {
+            return false;
+        }
+        let mut runner = DockerRunner {
+            program: NGINX_BIN,
+            cwd: "/",
+        };
+        matches!(
+            runner.run(&Invocation {
+                argv: argv[1..].iter().map(|s| (*s).to_owned()).collect(),
+                timeout: Duration::from_secs(3),
+                capture: false,
+            }),
+            RunResult::Exited { code: 0, .. }
+        )
+    }
+
+    fn activate_staging(&mut self) -> Result<(), compose::routing::NginxError> {
+        let dir = self.0.as_raw_fd();
+        // SAFETY: both fixed basenames refer to entries of the held directory.
+        if unsafe {
+            libc::renameat(
+                dir,
+                c"nginx.conf.next".as_ptr(),
+                dir,
+                c"nginx.conf".as_ptr(),
+            )
+        } != 0
+        {
+            return Err(compose::routing::NginxError::ActivateFailed);
+        }
+        Ok(())
+    }
+
+    fn restore_active(
+        &mut self,
+        previous: Option<&str>,
+    ) -> Result<(), compose::routing::NginxError> {
+        let failed = compose::routing::NginxError::RollbackFailed;
+        if let Some(config) = previous {
+            replace_at(self.0.as_fd(), "nginx.conf", config.as_bytes(), 0o600, None)
+                .map(|_| ())
+                .map_err(|_| failed)
+        } else {
+            // SAFETY: fixed basename in the held directory.
+            if unsafe { libc::unlinkat(self.0.as_raw_fd(), c"nginx.conf".as_ptr(), 0) } == 0 {
+                Ok(())
+            } else {
+                Err(failed)
+            }
+        }
+    }
+}
+
 impl ComposeStore for LinuxComposeStore {
+    fn install_routes(&mut self, table: &compose::routing::RoutingTable) -> Result<(), StoreError> {
+        let dir = walk_owned_dirs("/etc/arxcovo", 0).map_err(|_| StoreError)?;
+        compose::routing::apply_nginx_config(table, &mut LinuxNginx(dir))
+            .map(|_| ())
+            .map_err(|_| StoreError)
+    }
+
     fn load_state(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
         let dir = self.version_dir().map_err(|_| StoreError)?;
         let file = match open_at(dir.as_fd(), "state.json", libc::O_RDONLY, 0) {
