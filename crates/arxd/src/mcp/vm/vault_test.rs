@@ -1,8 +1,8 @@
 //! The vault drives the same TEST VM admission and custody path as the local
 //! profile. Native operations remain fenced until the VM profile can issue them.
 use super::{
-    Action, Gate, Guest, Id, Mutation, OperationStatus, Status, Supervisor, VmInventory, Work,
-    parse_id,
+    Action, Gate, Guest, Id, Mutation, OperationStatus, Status, Supervisor, VaultSweepPriority,
+    VaultTestCleanup, VmInventory, Work, parse_id,
 };
 use crate::vault::{self, ScriptOs, TestJob, Vault, VaultTester};
 use arx_guest::ScriptOutcome;
@@ -17,6 +17,8 @@ const LEASE_SECONDS: u64 = 600;
 const SCRIPT_SECONDS: u32 = 30;
 const JOB_BUDGET: Duration = Duration::from_secs(480);
 const WORKER_SETTLE_BUDGET: Duration = Duration::from_secs(15);
+// One ordinary cleanup item is bounded to four seconds.
+const ACQUISITION_BUDGET: Duration = Duration::from_secs(6);
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -51,9 +53,15 @@ impl VaultTester for Tester {
                     last_operation: None,
                     vm: None,
                 };
-                let outcome = run.exercise(&job).unwrap_or(ScriptOutcome::Unavailable);
-                job.complete(outcome, run.teardown())
+                let outcome = run.exercise(&job);
+                match (outcome, run.teardown()) {
+                    (Some(outcome), VaultTestCleanup::Confirmed) => job.complete(outcome, true),
+                    (Some(outcome), VaultTestCleanup::Unconfirmed) => job.complete(outcome, false),
+                    _ => job.inconclusive(),
+                }
             });
+        } else {
+            let _ = job.inconclusive();
         }
     }
 }
@@ -82,7 +90,11 @@ impl Supervisor {
         )
     }
 
-    fn sweep_vault_test(&self, vm: Id) -> anyhow::Result<Option<bool>> {
+    fn sweep_vault_test(
+        &self,
+        vm: Id,
+        turn: &mut VaultSweepPriority<'_>,
+    ) -> anyhow::Result<Option<VaultTestCleanup>> {
         #[cfg(test)]
         let fixture = self
             .lock()?
@@ -95,11 +107,12 @@ impl Supervisor {
                 vm,
                 &reaper,
                 &*reaper.custody,
-                TEARDOWN_BUDGET,
+                turn,
+                &self.fenced,
             );
         }
         self.controller
-            .sweep_vault_test(vm, &self.candidate(), TEARDOWN_BUDGET)
+            .sweep_vault_test(vm, &self.candidate(), turn, &self.fenced)
     }
 
     pub(super) async fn drain_vault_jobs(
@@ -234,15 +247,16 @@ impl Run {
         None
     }
 
-    fn teardown(&self) -> bool {
+    fn teardown(&self) -> VaultTestCleanup {
+        use VaultTestCleanup::Inconclusive;
+
+        let supervisor = &self.inventory.supervisor;
         let Some(operation) = self.clone_operation else {
-            // No confirmed reservation and no result that could pass.
-            return false;
+            return Inconclusive;
         };
         let Some(id) = self.vm.or_else(|| self.status(operation)?.vm) else {
-            return false;
+            return Inconclusive;
         };
-        let supervisor = &self.inventory.supervisor;
         #[cfg(test)]
         let _completed = {
             let stall = supervisor.stall_vault_teardown.lock().unwrap().take();
@@ -255,15 +269,21 @@ impl Run {
             .last_operation
             .is_some_and(|operation| self.wait_for_worker(operation, deadline, false).is_some());
         if supervisor.controller.expire_vault_test(id).is_err() || !settled {
-            return false;
+            return Inconclusive;
         }
-        // The periodic batch yields at the next item boundary. Time waiting
-        // for its lock does not count as a failed cleanup of this clone.
-        let _priority = supervisor.controller.prioritize_vault_sweep();
+        let mut turn =
+            supervisor
+                .controller
+                .prioritize_vault_sweep(id, ACQUISITION_BUDGET, TEARDOWN_BUDGET);
+        #[cfg(test)]
+        {
+            let stall = supervisor.stall_vault_acquisition.lock().unwrap().take();
+            drop(stall.map(super::tests::StallHook::enter));
+        }
         loop {
-            match supervisor.sweep_vault_test(id) {
-                Ok(Some(confirmed)) => return confirmed,
-                Err(_) => return false,
+            match supervisor.sweep_vault_test(id, &mut turn) {
+                Ok(Some(result)) => return result,
+                Err(_) => return Inconclusive,
                 Ok(None) => {
                     #[cfg(test)]
                     if let Some(waiting) = supervisor.vault_cleanup_waiting.lock().unwrap().take() {

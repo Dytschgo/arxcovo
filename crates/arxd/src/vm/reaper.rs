@@ -146,14 +146,33 @@ pub(super) struct Sweeps {
 }
 
 impl Sweeps {
-    pub fn prepare(&mut self, items: &mut [CleanupWork]) {
-        self.retries
-            .retain(|key, _| items.iter().any(|work| work.kind == *key));
-        self.workers
-            .retain(|vm, _| items.iter().any(|work| work.kind.vm() == Some(*vm)));
+    pub fn prepare(
+        &mut self,
+        db: &rusqlite::Connection,
+        items: &mut [CleanupWork],
+    ) -> anyhow::Result<()> {
+        use crate::store::vm as store;
+
+        // Selection is capped. Remove only retired claims, including routes
+        // superseded since the last attempt.
+        for kind in self.retries.keys().copied().collect::<Vec<_>>() {
+            if !items.iter().any(|work| work.kind == kind)
+                && store::cleanup_work(db, kind)?.is_none()
+            {
+                self.clear_retry(kind);
+            }
+        }
+        for vm in self.workers.keys().copied().collect::<Vec<_>>() {
+            if !items.iter().any(|work| work.kind.vm() == Some(vm))
+                && store::count(db, "SELECT count(*) FROM vm_instances WHERE id=?1", [vm])? == 0
+            {
+                self.workers.remove(&vm);
+            }
+        }
         for work in items {
             self.observe_worker(work);
         }
+        Ok(())
     }
 
     pub fn observe_worker(&mut self, work: &mut CleanupWork) {
@@ -168,7 +187,11 @@ impl Sweeps {
     }
 
     pub fn due(&self, kind: CleanupKind, now: Instant) -> bool {
-        self.retries.get(&kind).is_none_or(|(_, next)| now >= *next)
+        self.retry_at(kind).is_none_or(|next| now >= next)
+    }
+
+    pub fn retry_at(&self, kind: CleanupKind) -> Option<Instant> {
+        self.retries.get(&kind).map(|(_, next)| *next)
     }
 
     pub fn clear_retry(&mut self, kind: CleanupKind) {
@@ -195,6 +218,7 @@ impl Sweeps {
 pub(super) fn release(
     work: &CleanupWork,
     runtime: &impl ReaperRuntime,
+    cutoff: Option<Instant>,
     now: impl Fn() -> Instant,
 ) -> (bool, Instant) {
     let start = now();
@@ -205,6 +229,9 @@ pub(super) fn release(
     ) else {
         return (false, start);
     };
+    let finish_by = cutoff.map_or(finish_by, |limit| limit.min(finish_by));
+    let join_by = join_by.min(finish_by);
+    let stop_by = stop_by.min(finish_by);
     let released = match runtime.quiesce(work, join_by) {
         Quiesced::Offline => true,
         Quiesced::Unconfirmed => false,
@@ -824,6 +851,328 @@ mod reaper_tests {
         Quiesced::Offline
     }
 
+    fn vault_clone(f: &Fixture) -> Id {
+        let (template, pair, proof) = f.build(51, true);
+        let request = Request {
+            principal: "arxd",
+            request_id: key(NOW, 52),
+            vm: [0; 16],
+            disk: disk(),
+            operation: Operation::Clone {
+                template,
+                lease_seconds: Some(60),
+            },
+        };
+        let CloneAdmission::Fresh(vm, slots, worker, _) = f
+            .ctl
+            .admit_linked_clone(request, host(), resources(), pair, proof)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("fresh vault clone required");
+        };
+        assert_eq!(
+            f.ctl
+                .finish_linked_clone(&worker, slots, Some(f.stage_clone(slots)))
+                .unwrap(),
+            Status::Succeeded,
+        );
+        f.ctl.expire_vault_test(vm).unwrap();
+        vm
+    }
+
+    #[test]
+    fn vault_custody_budget_starts_only_after_acquisition() {
+        let f = Fixture::new();
+        let vm = vault_clone(&f);
+        let runtime = Runtime::new(offline);
+        let fenced = std::sync::atomic::AtomicBool::new(false);
+        let mut turn =
+            f.ctl
+                .prioritize_vault_sweep(vm, Duration::from_secs(20), Duration::from_secs(15));
+        f.ctl.hold_sweeps_for_test(|| {
+            assert_eq!(
+                f.ctl
+                    .sweep_vault_test_with(vm, &runtime, &f.custody, &mut turn, &fenced)
+                    .unwrap(),
+                None
+            );
+            f.clock.set(NOW, 16);
+        });
+        assert_eq!(
+            f.ctl
+                .sweep_vault_test_with(vm, &runtime, &f.custody, &mut turn, &fenced)
+                .unwrap(),
+            Some(VaultTestCleanup::Confirmed)
+        );
+        assert!(f.ctl.vault_test_released(vm).unwrap());
+    }
+
+    #[test]
+    fn vault_proof_requires_both_attribution_and_zero_charge() {
+        let f = Fixture::new();
+        let vm = vault_clone(&f);
+        // A confirmed receipt beside a still-charged VM is insufficient.
+        f.ctl.reaper_test_store().transact(|db| {
+            db.execute("INSERT INTO activity(principal,vm,action,started_ms,status,finished_ms,terminal_order,
+                cleanup_confirmed,actor,vm_owner) VALUES('arxd',?1,7,?2,1,?2,
+                (SELECT coalesce(max(terminal_order),0)+1 FROM activity),1,'daemon','arxd')", rusqlite::params![vm,NOW])?;
+            db.execute("INSERT INTO vm_tombstones VALUES(?1,'arxd',last_insert_rowid(),?2)", rusqlite::params![vm,NOW])?;
+            Ok(())
+        }).unwrap();
+        assert!(!f.ctl.vault_test_released(vm).unwrap());
+        f.ctl
+            .reaper_test_store()
+            .transact(|db| {
+                db.execute("DELETE FROM vm_disk_claims WHERE vm=?1", [vm])?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(f.ctl.vault_test_released(vm).unwrap());
+        f.ctl
+            .reaper_test_store()
+            .transact(|db| {
+                db.execute(
+                    "UPDATE vm_tombstones SET principal='alice' WHERE id=?1",
+                    [vm],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!f.ctl.vault_test_released(vm).unwrap());
+    }
+
+    #[test]
+    fn vault_lock_timeout_does_not_claim_a_teardown_failure() {
+        let f = Fixture::new();
+        let vm = vault_clone(&f);
+        let runtime = Runtime::new(offline);
+        let fenced = std::sync::atomic::AtomicBool::new(false);
+        let mut turn =
+            f.ctl
+                .prioritize_vault_sweep(vm, Duration::from_secs(6), Duration::from_secs(15));
+        f.ctl.hold_sweeps_for_test(|| {
+            assert_eq!(
+                f.ctl
+                    .sweep_vault_test_with(vm, &runtime, &f.custody, &mut turn, &fenced)
+                    .unwrap(),
+                None
+            );
+            fenced.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                f.ctl
+                    .sweep_vault_test_with(vm, &runtime, &f.custody, &mut turn, &fenced)
+                    .unwrap(),
+                Some(VaultTestCleanup::Inconclusive)
+            );
+            fenced.store(false, std::sync::atomic::Ordering::SeqCst);
+            f.clock.set(NOW, 6);
+            assert_eq!(
+                f.ctl
+                    .sweep_vault_test_with(vm, &runtime, &f.custody, &mut turn, &fenced)
+                    .unwrap(),
+                Some(VaultTestCleanup::Inconclusive)
+            );
+        });
+        assert!(runtime.1.lock().unwrap().is_empty());
+        assert!(!f.ctl.vault_test_released(vm).unwrap());
+    }
+
+    #[test]
+    fn vault_backoff_retries_when_due_within_custody_budget() {
+        let f = Fixture::new();
+        let vm = vault_clone(&f);
+        f.sweep(&Runtime::new(|_| Quiesced::Unconfirmed));
+        let runtime = Runtime::new(offline);
+        let fenced = std::sync::atomic::AtomicBool::new(false);
+        {
+            let mut short =
+                f.ctl
+                    .prioritize_vault_sweep(vm, Duration::from_secs(6), Duration::from_secs(4));
+            assert_eq!(
+                f.ctl
+                    .sweep_vault_test_with(vm, &runtime, &f.custody, &mut short, &fenced)
+                    .unwrap(),
+                Some(VaultTestCleanup::Inconclusive)
+            );
+        }
+        let mut turn =
+            f.ctl
+                .prioritize_vault_sweep(vm, Duration::from_secs(6), Duration::from_secs(15));
+        assert_eq!(
+            f.ctl
+                .sweep_vault_test_with(vm, &runtime, &f.custody, &mut turn, &fenced)
+                .unwrap(),
+            None
+        );
+        assert!(runtime.1.lock().unwrap().is_empty());
+        f.clock.set(NOW, 5);
+        assert_eq!(
+            f.ctl
+                .sweep_vault_test_with(vm, &runtime, &f.custody, &mut turn, &fenced)
+                .unwrap(),
+            Some(VaultTestCleanup::Confirmed)
+        );
+    }
+
+    #[test]
+    fn vault_retries_its_own_unconfirmed_attempt_at_eligibility() {
+        let f = Fixture::new();
+        let vm = vault_clone(&f);
+        let fenced = std::sync::atomic::AtomicBool::new(false);
+        let mut turn =
+            f.ctl
+                .prioritize_vault_sweep(vm, Duration::from_secs(6), Duration::from_secs(15));
+        let failed = Runtime::new(|_| Quiesced::Unconfirmed);
+        let ready = Runtime::new(offline);
+        assert_eq!(
+            f.ctl
+                .sweep_vault_test_with(vm, &failed, &f.custody, &mut turn, &fenced)
+                .unwrap(),
+            None
+        );
+        f.clock.set(NOW, 4);
+        assert_eq!(
+            f.ctl
+                .sweep_vault_test_with(vm, &ready, &f.custody, &mut turn, &fenced)
+                .unwrap(),
+            None
+        );
+        assert!(ready.1.lock().unwrap().is_empty());
+        f.clock.set(NOW, 1);
+        assert_eq!(
+            f.ctl
+                .sweep_vault_test_with(vm, &ready, &f.custody, &mut turn, &fenced)
+                .unwrap(),
+            Some(VaultTestCleanup::Confirmed)
+        );
+    }
+
+    #[test]
+    fn vault_attempt_still_unconfirmed_at_cutoff_retains_charge() {
+        let f = Fixture::new();
+        let vm = vault_clone(&f);
+        let fenced = std::sync::atomic::AtomicBool::new(false);
+        let mut turn =
+            f.ctl
+                .prioritize_vault_sweep(vm, Duration::from_secs(6), Duration::from_secs(15));
+        let slow = Runtime::new(|_| {
+            f.clock.set(NOW, 15);
+            Quiesced::Unconfirmed
+        });
+        assert_eq!(
+            f.ctl
+                .sweep_vault_test_with(vm, &slow, &f.custody, &mut turn, &fenced)
+                .unwrap(),
+            Some(VaultTestCleanup::Unconfirmed)
+        );
+        assert!(!f.ctl.vault_test_released(vm).unwrap());
+        assert!(f.count("SELECT count(*) FROM vm_disk_claims") > 0);
+    }
+
+    #[test]
+    fn vault_proof_arriving_at_cutoff_cannot_pass() {
+        struct Late<'a>(&'a Fixture);
+        impl ArtifactCustody for Late<'_> {
+            fn reconcile(&self, work: &CleanupWork, deadline: Instant) -> bool {
+                let disposed = self.0.custody.reconcile(work, deadline);
+                self.0.clock.set(NOW, 15);
+                disposed
+            }
+        }
+
+        let f = Fixture::new();
+        let vm = vault_clone(&f);
+        let mut turn =
+            f.ctl
+                .prioritize_vault_sweep(vm, Duration::from_secs(6), Duration::from_secs(15));
+        let result = f
+            .ctl
+            .sweep_vault_test_with(
+                vm,
+                &Runtime::new(offline),
+                &Late(&f),
+                &mut turn,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(f.ctl.vault_test_released(vm).unwrap());
+        assert_eq!(result, Some(VaultTestCleanup::Unconfirmed));
+    }
+
+    #[test]
+    fn vault_owed_tick_arriving_during_custody_runs_after_release() {
+        let f = Fixture::new();
+        let vm = vault_clone(&f);
+        let mut turn =
+            f.ctl
+                .prioritize_vault_sweep(vm, Duration::from_secs(6), Duration::from_secs(15));
+        let ordinary = Runtime::new(offline);
+        assert!(!f.ctl.sweep_with(&ordinary, &f.custody).unwrap());
+        let (entered, in_custody) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let vault_runtime = Runtime::new(move |_: &CleanupWork| {
+            entered.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(3)).unwrap();
+            Quiesced::Offline
+        });
+        let fixture = &f;
+        std::thread::scope(|scope| {
+            let result = scope.spawn(move || {
+                fixture
+                    .ctl
+                    .sweep_vault_test_with(
+                        vm,
+                        &vault_runtime,
+                        &fixture.custody,
+                        &mut turn,
+                        &std::sync::atomic::AtomicBool::new(false),
+                    )
+                    .unwrap()
+            });
+            in_custody.recv_timeout(Duration::from_secs(3)).unwrap();
+            let (done, tick) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                done.send(fixture.ctl.sweep_with(&ordinary, &fixture.custody).unwrap())
+                    .unwrap();
+            });
+            // The owed tick must remain pending until the active item releases custody.
+            let early = tick.recv_timeout(Duration::from_millis(100));
+            release.send(()).unwrap();
+            assert!(matches!(
+                early,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(result.join().unwrap(), Some(VaultTestCleanup::Confirmed));
+            assert!(tick.recv_timeout(Duration::from_secs(3)).unwrap());
+        });
+    }
+
+    #[test]
+    fn vault_backoff_survives_omission_from_ordinary_batch() {
+        let f = Fixture::new();
+        let vm = vault_clone(&f);
+        let work = f
+            .ctl
+            .reaper_test_store()
+            .transact(|db| {
+                let claim = store::vault_test_expiry(db, vm, NOW)?.unwrap();
+                Ok(store::cleanup_work(db, claim.into())?.unwrap())
+            })
+            .unwrap();
+        let mut sweeps = Sweeps::default();
+        let now = f.clock.now().monotonic;
+        sweeps.settle(&work, now, false);
+        f.ctl
+            .reaper_test_store()
+            .transact(|db| sweeps.prepare(db, &mut []))
+            .unwrap();
+        assert_eq!(
+            sweeps.retry_at(work.kind),
+            Some(now + Duration::from_secs(5))
+        );
+    }
+
     #[test]
     fn review_unconfirmed_sweep_settles_the_losing_receipt_once() {
         let f = Fixture::new();
@@ -1388,7 +1737,7 @@ mod reaper_tests {
             accounted: false,
             release_only: true,
         };
-        let (released, finish_by) = release(&work, &Runtime::new(offline), Instant::now);
+        let (released, finish_by) = release(&work, &Runtime::new(offline), None, Instant::now);
         let outcome = dispose(&work, &Probe, released, finish_by, Instant::now);
         assert!(outcome.released);
         assert!(!outcome.disposed);

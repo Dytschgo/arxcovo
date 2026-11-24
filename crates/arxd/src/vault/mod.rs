@@ -244,7 +244,13 @@ impl TestJob {
             ScriptOutcome::LaunchFailed => ("launch_failed", None),
             ScriptOutcome::Terminated => ("terminated", None),
         };
-        self.finish(status, exit_code, cleanup_confirmed)?;
+        self.finish(status, exit_code, cleanup_confirmed, false)?;
+        self.settled = true;
+        Ok(())
+    }
+
+    pub(crate) fn inconclusive(mut self) -> anyhow::Result<()> {
+        self.finish("interrupted", None, false, true)?;
         self.settled = true;
         Ok(())
     }
@@ -254,6 +260,7 @@ impl TestJob {
         status: &str,
         exit_code: Option<u32>,
         cleanup_confirmed: bool,
+        inconclusive: bool,
     ) -> anyhow::Result<()> {
         let passed = status == "exited" && exit_code == Some(0) && cleanup_confirmed;
         let scope = store::WriteScope {
@@ -263,14 +270,24 @@ impl TestJob {
         };
         self.store.write(|db| {
             let changed = db.execute(
-                "UPDATE versions SET state=?1,test_status=?2,exit_code=?3,cleanup_confirmed=?4
+                "UPDATE versions SET state=?1,test_status=?2,exit_code=?3,cleanup_confirmed=?4,inconclusive=?8
                  WHERE id=?5 AND test_op=?6 AND hash=?7 AND state='testing' AND test_status IS NULL",
                 params![if passed { "testing" } else { "rejected" }, status, exit_code,
-                    cleanup_confirmed, self.data.version, self.data.operation, self.data.hash],
+                    cleanup_confirmed, self.data.version, self.data.operation, self.data.hash, inconclusive],
             )?;
-            anyhow::ensure!(changed == 1, "vault test claim no longer pending");
+            if changed == 0 {
+                let rejected = db.execute(
+                    "UPDATE versions SET state='rejected',test_status='interrupted',cleanup_confirmed=0
+                     WHERE id=?1 AND test_op=?2 AND hash<>?3 AND state='testing' AND test_status IS NULL",
+                    params![self.data.version, self.data.operation, self.data.hash],
+                )?;
+                anyhow::ensure!(rejected == 1, "vault test claim no longer pending");
+                return scope.audit(db, "failed", Some("digest_mismatch"), Some(self.data.version), Some(self.data.operation));
+            }
             scope.audit(db, if passed { "succeeded" } else { "failed" },
-                if passed { None } else if status == "exited" && exit_code == Some(0) {
+                if passed { None } else if inconclusive {
+                    Some("test_inconclusive")
+                } else if status == "exited" && exit_code == Some(0) {
                     Some("cleanup_unconfirmed")
                 } else { Some(status) }, Some(self.data.version), Some(self.data.operation))
         })
@@ -280,7 +297,7 @@ impl TestJob {
 impl Drop for TestJob {
     fn drop(&mut self) {
         if !self.settled {
-            let _ = self.finish("interrupted", None, false);
+            let _ = self.finish("interrupted", None, false, false);
         }
     }
 }

@@ -25,7 +25,7 @@ async fn vault_version(client: &Client, version: &Value) -> Value {
 }
 
 async fn vault_result(client: &Client, version: &Value) -> Value {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             let row = vault_version(client, version).await;
             if !row["test"].is_null() {
@@ -197,7 +197,7 @@ async fn vault_tester_requires_exit_and_reconciled_throwaway_custody() {
 }
 
 #[tokio::test]
-async fn vault_tester_quarantines_unconfirmed_disposal() {
+async fn vault_tester_retains_charge_when_next_retry_exceeds_cutoff() {
     let mut h = Harness::start(false, false).await;
     h.supervisor().open_vault(h.temp.path()).unwrap();
     let client = h.client(0).await;
@@ -216,10 +216,10 @@ async fn vault_tester_quarantines_unconfirmed_disposal() {
     });
     h.hold_script.notify_one();
     let row = vault_result(&client, &version).await;
-    assert_eq!(row["state"], "rejected");
+    assert_eq!(row["state"], "test_inconclusive");
     assert_eq!(
         row["test"],
-        json!({"status":"exited","exit_code":0,"cleanup_confirmed":false})
+        json!({"status":"test_inconclusive","cleanup_confirmed":false})
     );
     assert_eq!(vault_vm_counts(&h), (1, 1, 1));
     assert_eq!(
@@ -232,7 +232,7 @@ async fn vault_tester_quarantines_unconfirmed_disposal() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| row["reason"] == "cleanup_unconfirmed")
+            .any(|row| row["reason"] == "test_inconclusive")
     );
     assert!(!audit.to_string().contains(VAULT_CANARY));
     drop(client);
@@ -348,6 +348,8 @@ async fn vault_tester_drain_joins_pending_guest_and_vault_settlement() {
     wait_for_vault_script(&h).await;
     let mut teardown = Stall::install(&supervisor.stall_vault_teardown);
     let mut recovery = Stall::install(&supervisor.stall_recovery);
+    let (mut lock, holder) = hold_vault_custody_lock(&h);
+    lock.entered().await;
     let (waiting, observed) = tokio::sync::oneshot::channel();
     *supervisor.vault_drain_waiting.lock().unwrap() = Some(waiting);
     let mut server = h.server.take().unwrap();
@@ -363,8 +365,6 @@ async fn vault_tester_drain_joins_pending_guest_and_vault_settlement() {
 
     teardown.release_and_join().await;
     recovery.entered().await;
-    recovery.release_and_join().await;
-    server.await.unwrap().unwrap();
     let result = crate::vault::mcp::invoke(
         supervisor.vault.get().unwrap(),
         "alpha",
@@ -373,10 +373,192 @@ async fn vault_tester_drain_joins_pending_guest_and_vault_settlement() {
         None,
     )
     .unwrap();
-    assert_eq!(result["state"], "rejected");
+    assert_eq!(result["state"], "test_inconclusive");
     assert_eq!(
         result["test"],
-        json!({"status":"unavailable","cleanup_confirmed":true})
+        json!({"status":"test_inconclusive","cleanup_confirmed":false})
     );
+    // The vault has settled while the custody lock is still held. Recovery
+    // can only clear the charged clone after the holder is released.
+    assert_eq!(vault_vm_counts(&h), (1, 1, 1));
+    lock.release_and_join().await;
+    holder.await.unwrap();
+    recovery.release_and_join().await;
+    server.await.unwrap().unwrap();
     assert_eq!(vault_vm_counts(&h), (1, 0, 0));
+}
+
+fn hold_vault_custody_lock(harness: &Harness) -> (Stall, JoinHandle<()>) {
+    let slot = Mutex::default();
+    let stall = Stall::install(&slot);
+    let hook = slot.into_inner().unwrap().unwrap();
+    let controller = harness.supervisor().controller.clone();
+    let holder = tokio::task::spawn_blocking(move || {
+        controller.hold_sweeps_for_test(|| drop(hook.enter()));
+    });
+    (stall, holder)
+}
+
+#[tokio::test]
+async fn vault_tester_timeout_is_inconclusive_and_same_version_can_retry() {
+    let mut h = Harness::start(false, false).await;
+    let supervisor = h.supervisor().clone();
+    supervisor.open_vault(h.temp.path()).unwrap();
+    let client = h.client(0).await;
+    seal_vault_template(&h, &client, 606).await;
+
+    let first = add_vault_version(&client, 1, VAULT_EXIT_0).await;
+    assert_eq!(
+        call(&client, "vault_test_version", vault_write_args(&first, 2)).await["ok"],
+        true
+    );
+    h.hold_script.notify_one();
+    assert_eq!(
+        vault_result(&client, &first).await["test"]["cleanup_confirmed"],
+        true
+    );
+    assert_eq!(
+        call(&client, "vault_activate", vault_write_args(&first, 3)).await["ok"],
+        true
+    );
+
+    let replacement = add_vault_version(&client, 4, VAULT_EXIT_0).await;
+    let old_args = vault_write_args(&replacement, 5);
+    let (mut lock, holder) = hold_vault_custody_lock(&h);
+    lock.entered().await;
+    let receipt = call(&client, "vault_test_version", old_args.clone()).await;
+    assert_eq!(receipt["ok"], true, "{receipt}");
+    let inconclusive = vault_result(&client, &replacement).await;
+    assert_eq!(inconclusive["state"], "test_inconclusive");
+    assert_eq!(
+        inconclusive["test"],
+        json!({"status":"test_inconclusive","cleanup_confirmed":false})
+    );
+    assert_eq!(call(&client, "vault_test_version", old_args).await, receipt);
+    assert_eq!(
+        call(&client, "vault_activate", vault_write_args(&replacement, 6)).await["reason"],
+        "pass_required"
+    );
+    assert_eq!(vault_version(&client, &first).await["state"], "active");
+    assert_eq!(vault_vm_counts(&h), (2, 1, 1));
+
+    lock.release_and_join().await;
+    holder.await.unwrap();
+    h.sweep().await;
+    let retry = call(
+        &client,
+        "vault_test_version",
+        vault_write_args(&replacement, 7),
+    )
+    .await;
+    assert_eq!(retry["ok"], true, "{retry}");
+    assert_ne!(retry["operation_id"], receipt["operation_id"]);
+    assert_eq!(
+        vault_result(&client, &replacement).await["test"]["cleanup_confirmed"],
+        true
+    );
+    assert_eq!(
+        call(&client, "vault_activate", vault_write_args(&replacement, 8)).await["ok"],
+        true
+    );
+    assert_eq!(vault_vm_counts(&h), (3, 0, 0));
+    drop(client);
+    h.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn vault_tester_reserves_an_ordinary_turn_across_successive_submissions() {
+    let mut h = Harness::start(false, false).await;
+    let supervisor = h.supervisor().clone();
+    supervisor.open_vault(h.temp.path()).unwrap();
+    let client = h.client(0).await;
+    let template = seal_vault_template(&h, &client, 607).await;
+    let ordinary = call(
+        &client,
+        "vm_create",
+        json!({"template_id":template,"request_id":key(608),"ttl_s":60}),
+    )
+    .await;
+    assert_eq!(ordinary["ok"], true, "{ordinary}");
+    h.fixture(Fixture::take_jobs).join().await.unwrap();
+
+    let first = add_vault_version(&client, 1, VAULT_EXIT_0).await;
+    let mut first_queued = Stall::install(&supervisor.stall_vault_acquisition);
+    assert_eq!(
+        call(&client, "vault_test_version", vault_write_args(&first, 2)).await["ok"],
+        true
+    );
+    h.hold_script.notify_one();
+    first_queued.entered().await;
+    h.sweep().await;
+    assert_eq!(vault_vm_counts(&h), (1, 1, 1), "first ordinary turn yields");
+    first_queued.release_and_join().await;
+    assert_eq!(
+        vault_result(&client, &first).await["test"]["cleanup_confirmed"],
+        true
+    );
+
+    let second = add_vault_version(&client, 3, VAULT_EXIT_0).await;
+    let mut second_queued = Stall::install(&supervisor.stall_vault_acquisition);
+    let (waiting, observed) = tokio::sync::oneshot::channel();
+    *supervisor.vault_cleanup_waiting.lock().unwrap() = Some(waiting);
+    assert_eq!(
+        call(&client, "vault_test_version", vault_write_args(&second, 4)).await["ok"],
+        true
+    );
+    second_queued.entered().await;
+    h.now.store(UTC + 60_000, Ordering::SeqCst);
+    second_queued.release_and_join().await;
+    tokio::time::timeout(Duration::from_secs(4), observed)
+        .await
+        .expect("vault must defer to the reserved ordinary turn")
+        .unwrap();
+    assert_eq!(vault_vm_counts(&h), (2, 1, 1));
+    h.sweep().await;
+    assert_eq!(
+        read_state(&h)
+            .query_row(
+                "SELECT count(*) FROM vm_instances WHERE principal='alpha'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0,
+        "owed turn retired the unrelated lease"
+    );
+    assert_eq!(
+        vault_result(&client, &second).await["test"]["cleanup_confirmed"],
+        true
+    );
+    drop(client);
+    h.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn vault_missing_sealed_template_allows_same_version_retry() {
+    let mut h = Harness::start(false, false).await;
+    h.supervisor().open_vault(h.temp.path()).unwrap();
+    let client = h.client(0).await;
+    let version = add_vault_version(&client, 1, VAULT_EXIT_0).await;
+    assert_eq!(
+        call(&client, "vault_test_version", vault_write_args(&version, 2)).await["ok"],
+        true
+    );
+    assert_eq!(
+        vault_result(&client, &version).await["state"],
+        "test_inconclusive"
+    );
+    assert_eq!(vault_vm_counts(&h), (0, 0, 0));
+    seal_vault_template(&h, &client, 608).await;
+    assert_eq!(
+        call(&client, "vault_test_version", vault_write_args(&version, 3)).await["ok"],
+        true
+    );
+    h.hold_script.notify_one();
+    assert_eq!(
+        vault_result(&client, &version).await["test"]["cleanup_confirmed"],
+        true
+    );
+    drop(client);
+    h.shutdown().await.unwrap();
 }

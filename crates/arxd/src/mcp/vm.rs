@@ -280,6 +280,8 @@ pub(crate) struct Supervisor {
     #[cfg(test)]
     stall_vault_teardown: Mutex<Option<tests::StallHook>>,
     #[cfg(test)]
+    stall_vault_acquisition: Mutex<Option<tests::StallHook>>,
+    #[cfg(test)]
     vault_drain_waiting: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Deferred local stops queued by owner revocation, at most one in flight
     /// per activation generation. Kept outside the dispatch gate: revocation
@@ -437,6 +439,8 @@ impl Supervisor {
             #[cfg(test)]
             stall_vault_teardown: Default::default(),
             #[cfg(test)]
+            stall_vault_acquisition: Default::default(),
+            #[cfg(test)]
             vault_drain_waiting: Default::default(),
             stops: Mutex::default(),
             #[cfg(test)]
@@ -557,7 +561,9 @@ impl Supervisor {
             .and_then(|mut stall| stall.take())
             .map(tests::StallHook::enter);
         #[cfg(test)]
-        if let Some(reaper) = self.lock()?.fixture.as_ref().map(tests::Fixture::reaper) {
+        let fixture = self.lock()?.fixture.as_ref().map(tests::Fixture::reaper);
+        #[cfg(test)]
+        if let Some(reaper) = fixture {
             self.controller.sweep_with(&reaper, &*reaper.custody)?;
             return Ok(());
         }

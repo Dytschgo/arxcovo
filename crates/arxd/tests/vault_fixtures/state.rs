@@ -204,11 +204,11 @@ fn vault_completion_refuses_a_changed_digest() {
         })
         .unwrap();
 
-    let completion = job.complete(ScriptOutcome::Exited { exit_code: 0 }, true);
-    assert!(completion.is_err(), "stale digest recorded a completion");
+    job.complete(ScriptOutcome::Exited { exit_code: 0 }, true)
+        .unwrap();
     let row = vault.get(OWNER, version, false).unwrap();
-    assert_eq!(row["state"], "testing");
-    assert!(row["test"].is_null());
+    assert_eq!(row["state"], "rejected");
+    assert_eq!(row["test"]["cleanup_confirmed"], false);
     assert_eq!(activate(&vault, 3, version), Err(Refusal::PassRequired));
 }
 
@@ -432,4 +432,43 @@ fn vault_state_binding_rejects_substituted_main_and_linked_files() {
         assert_eq!(fs::read(path).unwrap(), expected);
     }
     assert!(Vault::open(dir.path(), None, NOW).is_ok());
+}
+
+#[test]
+fn vault_retry_and_receipt_survive_v1_migration_and_v2_reopen() {
+    let dir = private::private_dir();
+    let tester = Arc::new(Fixture::default());
+    let vault = Vault::open(dir.path(), Some(tester.clone()), NOW).unwrap();
+    let added = add(&vault, 1, "build", "exit 0").unwrap();
+    let version = version_id(added.clone());
+    vault
+        .store
+        .write(|db| {
+            db.execute_batch(
+                "ALTER TABLE versions DROP COLUMN inconclusive; PRAGMA user_version=1",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    drop(vault);
+    let vault = Vault::open(dir.path(), Some(tester.clone()), NOW).unwrap();
+    assert_eq!(add(&vault, 1, "build", "exit 0").unwrap(), added);
+    let receipt = test(&vault, 2, version).unwrap();
+    tester.take().inconclusive().unwrap();
+    drop(vault);
+    let vault = Vault::open(dir.path(), Some(tester.clone()), NOW).unwrap();
+    assert_eq!(
+        vault.get(OWNER, version, false).unwrap()["state"],
+        "test_inconclusive"
+    );
+    assert_eq!(test(&vault, 2, version).unwrap(), receipt);
+    assert_ne!(
+        test(&vault, 3, version).unwrap()["operation_id"],
+        receipt["operation_id"]
+    );
+    tester
+        .take()
+        .complete(ScriptOutcome::Exited { exit_code: 0 }, true)
+        .unwrap();
+    activate(&vault, 4, version).unwrap();
 }
