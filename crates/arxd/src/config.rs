@@ -18,7 +18,7 @@ use subtle::ConstantTimeEq;
 /// compile) and its only field is private (so no struct literal compiles
 /// outside this module). The foreground file's `runtime` section also takes
 /// `parse`, through `validated_runtime`.
-pub struct VmRuntimeProfile(RawVmRuntimeProfile);
+pub struct VmRuntimeProfile(Box<RawVmRuntimeProfile>);
 
 /// The serde shape of a profile. Private: only `parse` may lift it into a
 /// [`VmRuntimeProfile`], after validation.
@@ -128,7 +128,7 @@ impl VmRuntimeProfile {
             bail!(InvalidVmProfile);
         }
         raw.validate_paths()?;
-        Ok(Self(raw))
+        Ok(Self(Box::new(raw)))
     }
 
     fn validate_paths(&self) -> Result<crate::vm::paths::LocalPath> {
@@ -399,7 +399,7 @@ pub(crate) struct RootPin {
 }
 
 impl RootPin {
-    fn acquire(root: &Path) -> Result<Self> {
+    pub(crate) fn acquire(root: &Path) -> Result<Self> {
         #[cfg(windows)]
         {
             let mut ancestors = Vec::new();
@@ -570,6 +570,10 @@ pub(crate) struct TestVms {
     pub(crate) runtime: Option<VmRuntimeProfile>,
     #[serde(default, deserialize_with = "present")]
     recipes: Option<Vec<RecipePins>>,
+    #[serde(default)]
+    pub(crate) compose_releases: Vec<crate::vm::compose::ReleaseInput>,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) compose_secret_root: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
