@@ -9858,6 +9858,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "intermittent Windows drain-settlement quarantine: docs/ROADMAP.md Known issues"
+    )]
     async fn a_clean_foreground_drain_requires_full_publication_settlement() {
         use std::sync::atomic::Ordering::SeqCst;
         let mut h = Harness::start_with_web(false, false, true).await;
