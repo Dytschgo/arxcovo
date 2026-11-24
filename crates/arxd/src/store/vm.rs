@@ -1208,7 +1208,8 @@ impl Binding<'_> {
         if compose::uses_key(db, self.principal, self.key.key)? {
             return Ok(Err(Refusal::KeyCollision));
         }
-        if self.key.issued_at_ms > now {
+        if self.key.issued_at_ms > now || compose::compacted_key(db, self.principal, self.key.key)?
+        {
             return Ok(Err(Refusal::StaleKey));
         }
         if closed {
@@ -3461,7 +3462,7 @@ mod tests {
         let store = VmStore::open(dir.path(), NOW).unwrap();
         store.transact(|db| {
             assert_eq!(count(db, "PRAGMA user_version", [])?, i64::from(VM_SCHEMA_VERSION));
-            for table in ["projects","releases","volumes","secrets","release_epochs","boots","operations"] {
+            for table in ["projects","releases","volumes","secrets","release_epochs","boots","operations","recovery_floors"] {
                 assert_eq!(count(db,&format!("SELECT count(*) FROM vm_compose_{table}"),[])?,0);
             }
             if version==11 {

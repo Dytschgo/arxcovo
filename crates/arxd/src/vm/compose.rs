@@ -35,6 +35,15 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
+    pub const fn action(self) -> i64 {
+        match self {
+            Self::Deploy => 20,
+            Self::Start => 21,
+            Self::Stop => 22,
+            Self::Down => 23,
+        }
+    }
+
     pub fn wire(self) -> &'static str {
         match self {
             Self::Deploy => "deploy",
@@ -78,6 +87,7 @@ pub(crate) enum Fault {
     NotReady,
     Busy,
     ReplayFull,
+    RecoveryRequired(Id),
     StaleKey,
     KeyCollision,
 }
@@ -259,6 +269,7 @@ pub(crate) struct ProjectStatus {
     pub generation: Option<Id>,
     pub boot: Option<u64>,
     pub pending: Option<Id>,
+    pub recovery_id: Option<Id>,
     pub last_receipt: Option<OperationView>,
 }
 
@@ -410,6 +421,15 @@ impl Host {
         let Some(intent) = db.transact(|db| store::replay(db, principal, key))? else {
             return Ok(());
         };
+        if intent.closed.as_deref() == Some("retired_boot")
+            && intent.target == *target
+            && intent.generation == session.generation
+            && intent.boot != session.wire_boot
+            && intent.kind == Kind::Deploy
+            && intent.sent
+        {
+            return recover_deploy(db, principal, &intent, &session, &mut channel, cancel).await;
+        }
         if intent.receipt.is_some()
             || intent.closed.is_some()
             || intent.target != *target
@@ -441,11 +461,15 @@ impl Host {
             } if !intent.sent => {
                 let current = observe(&mut channel, target, cancel).await?;
                 if intent.secret_sent == 0
-                    && current
-                        .as_ref()
-                        .is_some_and(|v| v.recovery_required || v.running_operation.is_some())
+                    && current.as_ref().is_some_and(|v| {
+                        v.running_operation.is_some()
+                            || (v.recovery_required
+                                && matches!(intent.kind, Kind::Deploy | Kind::Start))
+                    })
                 {
-                    return db.transact(|db| store::close(db, &intent, "refused"));
+                    return db.transact(|db| {
+                        store::close(db, &intent, "refused", controller.compose_now()?)
+                    });
                 }
                 let expected = db
                     .transact(|db| store::status(db, principal, target))?
@@ -459,7 +483,9 @@ impl Host {
                         intent.secret_sent == 0,
                         "Compose revision changed during secret recovery"
                     );
-                    return db.transact(|db| store::close(db, &intent, "refused"));
+                    return db.transact(|db| {
+                        store::close(db, &intent, "refused", controller.compose_now()?)
+                    });
                 }
                 if intent.kind == Kind::Deploy {
                     stage(&mut channel, &intent, cancel).await?;
@@ -498,7 +524,14 @@ impl Host {
                             .err()
                             .is_some_and(|e| e.is::<super::compose_secrets::FailedDelivery>())
                         {
-                            return db.transact(|db| store::close(db, &intent, "secret_failed"));
+                            return db.transact(|db| {
+                                store::close(
+                                    db,
+                                    &intent,
+                                    "secret_failed",
+                                    controller.compose_now()?,
+                                )
+                            });
                         }
                         result?;
                     }
@@ -527,7 +560,11 @@ impl Host {
                             | RejectCode::VolumeCollision
                             | RejectCode::SecretMissing,
                         ..
-                    } => return db.transact(|db| store::close(db, &intent, "refused")),
+                    } => {
+                        return db.transact(|db| {
+                            store::close(db, &intent, "refused", controller.compose_now()?)
+                        });
+                    }
                     // An unproven rejection is ambiguous after crossing the submission boundary.
                     _ => return Ok(()),
                 }
@@ -608,9 +645,80 @@ impl Host {
                 store::boot(db, principal, target)? == Some(intent.generation),
                 "Compose boot changed"
             );
-            store::settle(db, &intent, &view, observed.as_ref())
+            store::settle(
+                db,
+                &intent,
+                &view,
+                observed.as_ref(),
+                controller.compose_now()?,
+            )
         })
     }
+}
+
+// Recover only the committed release pointer; the retired request remains historical.
+async fn recover_deploy(
+    db: &crate::store::vm::VmStore,
+    principal: &str,
+    intent: &Intent,
+    session: &Session,
+    channel: &mut ComposeChannel,
+    cancel: &Shutdown,
+) -> Result<()> {
+    let current = |tx: &rusqlite::Connection| -> Result<ProjectStatus> {
+        let state = store::status(tx, principal, &intent.target)?
+            .ok_or_else(|| anyhow::anyhow!("Compose project unavailable"))?;
+        ensure!(
+            state.recovery_id == Some(intent.id)
+                && store::boot(tx, principal, &intent.target)? == Some(intent.generation)
+                && store::live_boot(tx, intent.target.vm, intent.generation, session.wire_boot)?,
+            "Compose recovery boot changed"
+        );
+        Ok(state)
+    };
+    db.transact(|tx| current(tx))?;
+    let Resp::ComposeOperationState { operation, .. } = channel
+        .exchange(cancel, |id| Req::ComposeOperation {
+            id,
+            operation_id: hex::encode(intent.id),
+        })
+        .await?
+    else {
+        return Ok(());
+    };
+    if !intent.accepts(&operation) || operation.stage != OperationStage::Settled {
+        return Ok(());
+    }
+    let observed = observe(channel, &intent.target, cancel).await?;
+    if observed
+        .as_ref()
+        .is_some_and(|p| p.running_operation.is_some())
+    {
+        return Ok(());
+    }
+    let revision = observed.as_ref().and_then(|p| p.committed_revision);
+    db.transact(|tx| {
+        let state = current(tx)?;
+        match operation.state {
+            OperationState::Succeeded
+                if operation.failure.is_none()
+                    && !operation.restored_previous
+                    && revision == Some(intent.revision) =>
+            {
+                store::recover_committed(
+                    tx,
+                    intent,
+                    observed.as_ref().expect("committed revision observed"),
+                    &operation,
+                )?;
+            }
+            OperationState::Failed if operation.failure.is_some() && revision == state.revision => {
+                store::clear_recovery(tx, intent)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    })
 }
 
 fn success_witness(intent: &Intent, manifest: &Project, result: &ProjectView) -> bool {

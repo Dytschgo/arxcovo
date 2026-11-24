@@ -6,10 +6,49 @@ use arx_guest::compose::{Desired, MAX_PROJECTS, MAX_VOLUMES, OperationState, Ope
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub(super) const MIGRATE_V12: &str = "
+CREATE TABLE activity_v12 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    principal TEXT NOT NULL CHECK(length(CAST(principal AS BLOB)) BETWEEN 1 AND 64
+        AND principal NOT GLOB '*[^a-zA-Z0-9_-]*'),
+    actor TEXT NOT NULL CHECK(actor IN ('agent','daemon')),
+    vm_owner TEXT CHECK(length(CAST(vm_owner AS BLOB)) BETWEEN 1 AND 64
+        AND vm_owner NOT GLOB '*[^a-zA-Z0-9_-]*'),
+    vm BLOB CHECK(length(vm)=16),
+    action INTEGER NOT NULL CHECK(action BETWEEN 1 AND 23),
+    started_ms INTEGER NOT NULL CHECK(started_ms BETWEEN 0 AND 253402300799999),
+    status INTEGER NOT NULL DEFAULT 0 CHECK(status BETWEEN 0 AND 4),
+    reason INTEGER CHECK(reason BETWEEN 1 AND 52),
+    finished_ms INTEGER CHECK(finished_ms BETWEEN 0 AND 253402300799999),
+    terminal_order INTEGER UNIQUE CHECK(terminal_order>0),
+    cleanup_confirmed INTEGER CHECK(cleanup_confirmed IN (0,1)),
+    publication_failure INTEGER CHECK(publication_failure BETWEEN 1 AND 17)
+        CHECK(publication_failure IS NULL OR (action IN (15,16,17) AND status IN (1,2,3))),
+    CHECK(vm IS NOT NULL OR action=11 OR status=4),
+    CHECK(action NOT IN (13,14) OR status=4),
+    CHECK((status=0)=(finished_ms IS NULL)),
+    CHECK((status=0)=(terminal_order IS NULL)),
+    CHECK((status=4)=(reason IS NOT NULL)),
+    CHECK((actor='daemon')=(action IN (7,9,10,17,19)) AND (actor='agent' OR principal='arxd')),
+    CHECK((vm_owner IS NOT NULL)=(action IN (7,10,17,19)))
+) STRICT;
+INSERT INTO activity_v12(id,principal,actor,vm_owner,vm,action,started_ms,status,reason,
+    finished_ms,terminal_order,cleanup_confirmed,publication_failure)
+    SELECT id,principal,actor,vm_owner,vm,action,started_ms,status,reason,
+        finished_ms,terminal_order,cleanup_confirmed,publication_failure FROM activity;
+INSERT INTO sqlite_sequence(name,seq) SELECT 'activity_v12',seq FROM sqlite_sequence
+    WHERE name='activity' AND NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='activity_v12');
+UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT seq FROM sqlite_sequence WHERE name='activity'),0))
+    WHERE name='activity_v12';
+DROP TABLE activity;
+ALTER TABLE activity_v12 RENAME TO activity;
+CREATE INDEX activity_principal ON activity(principal,id);
+CREATE UNIQUE INDEX pending_vm ON activity(vm) WHERE status=0 AND (action<=6 OR action IN (12,18));
+
 CREATE TABLE vm_compose_projects (
     vm BLOB NOT NULL REFERENCES vm_static_instances(id),
     project TEXT NOT NULL,
     desired TEXT NOT NULL DEFAULT 'none' CHECK(desired IN ('none','started','stopped','down')),
+    recovery_id BLOB CHECK(length(recovery_id)=16),
     last_revision INTEGER NOT NULL DEFAULT 0 CHECK(last_revision>=0),
     committed INTEGER,
     committed_release BLOB,
@@ -61,6 +100,9 @@ CREATE TABLE vm_compose_boots (
     PRIMARY KEY(vm,generation,boot)
 ) STRICT, WITHOUT ROWID;
 CREATE UNIQUE INDEX vm_compose_current_boot ON vm_compose_boots(vm) WHERE retired=0;
+CREATE TABLE vm_compose_recovery_floors (
+    principal TEXT PRIMARY KEY, request BLOB NOT NULL CHECK(length(request)=16)
+) STRICT, WITHOUT ROWID;
 CREATE TABLE vm_compose_operations (
     id BLOB PRIMARY KEY CHECK(length(id)=16),
     principal TEXT NOT NULL,
@@ -73,6 +115,8 @@ CREATE TABLE vm_compose_operations (
     release BLOB NOT NULL,
     revision INTEGER NOT NULL CHECK(revision>0),
     valid_through_ms INTEGER NOT NULL CHECK(valid_through_ms>=0),
+    emergency INTEGER NOT NULL DEFAULT 0 CHECK(emergency IN (0,1)),
+    activity_id INTEGER UNIQUE REFERENCES activity(id) ON DELETE SET NULL,
     sent INTEGER NOT NULL DEFAULT 0 CHECK(sent IN (0,1)),
     receipt TEXT,
     closed TEXT CHECK(closed IN ('refused','secret_failed','retired_boot')),
@@ -81,11 +125,16 @@ CREATE TABLE vm_compose_operations (
     UNIQUE(principal,request),
     FOREIGN KEY(vm,project,release) REFERENCES vm_compose_releases(vm,project,id)
 ) STRICT, WITHOUT ROWID;
+CREATE UNIQUE INDEX vm_compose_emergency ON vm_compose_operations(vm,project) WHERE emergency=1;
 CREATE UNIQUE INDEX vm_compose_inflight ON vm_compose_operations(vm,project) WHERE receipt IS NULL AND closed IS NULL;
 -- Running/Recovering -> Stopped is committed only after host release proof.
 CREATE TRIGGER vm_compose_retire AFTER UPDATE OF state ON vm_static_instances
 WHEN OLD.state IN (2,3) AND NEW.state=1 BEGIN
     UPDATE vm_compose_boots SET retired=1 WHERE vm=NEW.id AND retired=0;
+    UPDATE vm_compose_projects SET recovery_id=(
+        SELECT id FROM vm_compose_operations o WHERE o.vm=vm_compose_projects.vm AND o.project=vm_compose_projects.project
+            AND o.kind='deploy' AND o.sent=1 AND o.receipt IS NULL AND o.closed IS NULL)
+        WHERE vm=NEW.id AND recovery_id IS NULL;
     UPDATE vm_compose_operations SET closed='retired_boot'
         WHERE vm=NEW.id AND receipt IS NULL AND closed IS NULL;
 END;
@@ -194,7 +243,7 @@ pub(crate) fn status(
 ) -> Result<Option<ProjectStatus>> {
     Ok(db.query_row(
         "SELECT p.desired,p.committed,p.observed,p.settled_generation,p.settled_boot,p.last_receipt,
-            (SELECT id FROM vm_compose_operations o WHERE o.vm=p.vm AND o.project=p.project AND o.receipt IS NULL AND o.closed IS NULL)
+            (SELECT id FROM vm_compose_operations o WHERE o.vm=p.vm AND o.project=p.project AND o.receipt IS NULL AND o.closed IS NULL),p.recovery_id
          FROM vm_compose_projects p JOIN vm_static_instances s ON s.id=p.vm
          WHERE p.vm=?1 AND p.project=?2 AND s.principal=?3",
         params![target.vm,target.project,principal],
@@ -207,7 +256,7 @@ pub(crate) fn status(
                 observation: raw.map(|raw| decode(&raw)).transpose()?,
                 generation: r.get(3)?,
                 boot: r.get(4)?,
-                pending: r.get(6)?,
+                pending: r.get(6)?, recovery_id:r.get(7)?,
                 last_receipt: last.map(|raw| decode(&raw)).transpose()?,
             })
         },
@@ -249,6 +298,14 @@ pub(crate) fn admit(
     let Some(status) = status(db, principal, target)? else {
         return Ok(Err(Fault::NotFound));
     };
+    if let Some(id) = status.recovery_id {
+        let key = db.query_row(
+            "SELECT request FROM vm_compose_operations WHERE id=?1 AND principal=?2",
+            params![id, principal],
+            |r| r.get(0),
+        )?;
+        return Ok(Err(Fault::RecoveryRequired(key)));
+    }
     if status.pending.is_some() {
         return Ok(Err(Fault::Busy));
     }
@@ -258,13 +315,16 @@ pub(crate) fn admit(
     }
     let high_water = super::retry_time(db, now)?;
     let valid_through = request.key.issued_at_ms + crate::vm::RETRY_WINDOW_MS;
-    if request.key.issued_at_ms > now || valid_through < high_water {
+    if request.key.issued_at_ms > now
+        || valid_through < high_water
+        || compacted_key(db, principal, request.key.key)?
+    {
         return Ok(Err(Fault::StaleKey));
     }
-    db.execute("DELETE FROM vm_compose_operations WHERE valid_through_ms<?1 AND (receipt IS NOT NULL OR closed IS NOT NULL)",[high_water])?;
+    db.execute("DELETE FROM vm_compose_operations WHERE valid_through_ms<?1 AND (receipt IS NOT NULL OR closed IS NOT NULL) AND id NOT IN (SELECT recovery_id FROM vm_compose_projects WHERE recovery_id IS NOT NULL)",[high_water])?;
     let receipts = count(
         db,
-        "SELECT count(*) FROM vm_compose_operations WHERE principal=?1",
+        "SELECT count(*) FROM vm_compose_operations WHERE principal=?1 AND emergency=0",
         [principal],
     )?;
     let limit = if matches!(request.kind, Kind::Deploy | Kind::Start) {
@@ -272,7 +332,9 @@ pub(crate) fn admit(
     } else {
         256
     };
-    if receipts >= limit {
+    let cleanup = matches!(request.kind, Kind::Stop | Kind::Down);
+    let emergency = cleanup && receipts >= limit;
+    if !cleanup && receipts >= limit {
         return Ok(Err(Fault::ReplayFull));
     }
     let (release, revision) = if let Some(release) = request.release {
@@ -315,17 +377,40 @@ pub(crate) fn admit(
     } else {
         Vec::new()
     };
+    if emergency {
+        // The ordinary replay window stays intact. Rotate only this project's
+        // extra terminal cleanup key. A compacted key can never become fresh.
+        let old:Option<Id>=db.query_row("SELECT request FROM vm_compose_operations WHERE vm=?1 AND project=?2 AND emergency=1",
+            params![target.vm,target.project],|r|r.get(0)).optional()?;
+        if let Some(old) = old {
+            if request.key.key <= old {
+                return Ok(Err(Fault::StaleKey));
+            }
+            db.execute(
+                "INSERT INTO vm_compose_recovery_floors(principal,request) VALUES(?1,?2)
+                ON CONFLICT(principal) DO UPDATE SET request=max(request,excluded.request)",
+                params![principal, old],
+            )?;
+            ensure!(db.execute("DELETE FROM vm_compose_operations WHERE principal=?1 AND request=?2 AND emergency=1 AND (closed IS NOT NULL OR receipt IS NOT NULL)",
+                params![principal,old])?==1,"Compose cleanup still active");
+        }
+    }
     if request.kind == Kind::Deploy {
         db.execute(
             "UPDATE vm_compose_projects SET last_revision=?3 WHERE vm=?1 AND project=?2",
             params![target.vm, target.project, revision],
         )?;
     }
+    db.execute(
+        "INSERT INTO activity(principal,vm,action,started_ms,actor) VALUES(?1,?2,?3,?4,'agent')",
+        params![principal, target.vm, request.kind.action(), now],
+    )?;
+    let activity = db.last_insert_rowid();
     let id = nonce()?;
     db.execute(
-        "INSERT INTO vm_compose_operations(id,principal,request,vm,project,generation,boot,kind,release,revision,secret_refs,valid_through_ms)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![id,principal,request.key.key,target.vm,target.project,generation,boot,request.kind.wire(),release,revision,serde_json::to_string(&secret_refs)?,valid_through],
+        "INSERT INTO vm_compose_operations(id,principal,request,vm,project,generation,boot,kind,release,revision,secret_refs,valid_through_ms,activity_id,emergency)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        params![id,principal,request.key.key,target.vm,target.project,generation,boot,request.kind.wire(),release,revision,serde_json::to_string(&secret_refs)?,valid_through,activity,emergency],
     )?;
     Ok(Ok(replay(db, principal, request.key.key)?.ok_or_else(
         || anyhow::anyhow!("Compose intent unavailable"),
@@ -351,10 +436,33 @@ fn secrets(
     Ok(refs)
 }
 
-pub(crate) fn close(db: &Connection, intent: &Intent, reason: &str) -> Result<()> {
+fn finish_audit(db: &Connection, id: Id, status: crate::vm::Status, now: i64) -> Result<()> {
+    let activity: i64 = db.query_row(
+        "SELECT activity_id FROM vm_compose_operations WHERE id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    super::finish(db, activity, status, now, None)
+}
+
+pub(super) fn finish_retired(db: &Connection, vm: Id, now: i64) -> Result<()> {
+    let mut stmt = db.prepare(
+        "SELECT o.activity_id FROM vm_compose_operations o JOIN activity a ON a.id=o.activity_id
+       WHERE o.vm=?1 AND o.closed='retired_boot' AND a.status=0",
+    )?;
+    let ids = stmt
+        .query_map([vm], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        super::finish(db, id, crate::vm::Status::Interrupted, now, None)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn close(db: &Connection, intent: &Intent, reason: &str, now: i64) -> Result<()> {
     ensure!(db.execute("UPDATE vm_compose_operations SET closed=?2 WHERE id=?1 AND receipt IS NULL AND closed IS NULL",
         params![intent.id,reason])? == 1, "Compose intent already closed");
-    Ok(())
+    finish_audit(db, intent.id, crate::vm::Status::Failed, now)
 }
 
 pub(crate) fn mark_sent(db: &Connection, intent: &Intent) -> Result<()> {
@@ -373,6 +481,7 @@ pub(crate) fn settle(
     intent: &Intent,
     receipt: &OperationView,
     observed: Option<&arx_guest::compose::ProjectView>,
+    now: i64,
 ) -> Result<()> {
     ensure!(
         db.execute("UPDATE vm_compose_operations SET receipt=?2 WHERE id=?1 AND sent=1 AND receipt IS NULL AND closed IS NULL",
@@ -404,6 +513,34 @@ pub(crate) fn settle(
             ],
         )?;
     }
+    finish_audit(
+        db,
+        intent.id,
+        if receipt.state == OperationState::Succeeded {
+            crate::vm::Status::Succeeded
+        } else {
+            crate::vm::Status::Failed
+        },
+        now,
+    )
+}
+
+pub(crate) fn clear_recovery(db: &Connection, intent: &Intent) -> Result<()> {
+    ensure!(db.execute("UPDATE vm_compose_projects SET recovery_id=NULL WHERE vm=?1 AND project=?2 AND recovery_id=?3",
+        params![intent.target.vm,intent.target.project,intent.id])?==1,"Compose recovery changed");
+    Ok(())
+}
+
+pub(crate) fn recover_committed(
+    db: &Connection,
+    intent: &Intent,
+    observed: &arx_guest::compose::ProjectView,
+    receipt: &OperationView,
+) -> Result<()> {
+    clear_recovery(db, intent)?;
+    db.execute("UPDATE vm_compose_projects SET committed=?3,committed_release=?4,desired=?5,
+        last_receipt=?6,observed=NULL,settled_boot=NULL,settled_generation=NULL WHERE vm=?1 AND project=?2",
+        params![intent.target.vm,intent.target.project,intent.revision,intent.release,desired_wire(observed.desired),serde_json::to_string(receipt)?])?;
     Ok(())
 }
 
@@ -446,6 +583,14 @@ pub(crate) fn mark_secret_sent(db: &Connection, intent: &Intent, bit: u8) -> Res
         "Compose secret delivery already submitted"
     );
     Ok(())
+}
+
+pub(super) fn compacted_key(db: &Connection, principal: &str, key: Id) -> Result<bool> {
+    Ok(count(
+        db,
+        "SELECT count(*) FROM vm_compose_recovery_floors WHERE principal=?1 AND request>=?2",
+        params![principal, key],
+    )? != 0)
 }
 
 pub(super) fn uses_key(db: &Connection, principal: &str, key: Id) -> Result<bool> {

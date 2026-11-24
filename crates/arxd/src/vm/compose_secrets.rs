@@ -141,7 +141,7 @@ impl<'a> Delivery<'a> {
             self.prove(channel, cancel).await?;
         }
         if self
-            .send(source, channel, cancel, || {
+            .send(source, channel, cancel, !submitted, || {
                 if submitted { Ok(()) } else { mark() }
             })
             .await?
@@ -150,7 +150,7 @@ impl<'a> Delivery<'a> {
         }
         self.prove(channel, cancel).await?;
         ensure!(
-            self.send(source, channel, cancel, || Ok(())).await?,
+            self.send(source, channel, cancel, false, || Ok(())).await?,
             "Compose secret receipt missing"
         );
         Ok(())
@@ -226,6 +226,7 @@ impl<'a> Delivery<'a> {
         source: &dyn SecretSource,
         channel: &mut ComposeChannel,
         cancel: &Shutdown,
+        initial: bool,
         mark: impl FnOnce() -> Result<()>,
     ) -> Result<bool> {
         use arx_guest::compose::{OperationKind, OperationStage, OperationState};
@@ -249,6 +250,26 @@ impl<'a> Delivery<'a> {
                 data,
             })
             .await?;
+        use arx_guest::compose::RejectCode;
+        if initial
+            && matches!(
+                &response,
+                ComposeResponse::ComposeRejected {
+                    code: RejectCode::StaleEpoch
+                        | RejectCode::SecretConflict
+                        | RejectCode::UnknownSlot
+                        | RejectCode::UnknownRelease
+                        | RejectCode::SecretSize
+                        | RejectCode::GenerationMismatch
+                        | RejectCode::Busy
+                        | RejectCode::ReconcileRequired
+                        | RejectCode::JournalFull,
+                    ..
+                }
+            )
+        {
+            return Err(FailedDelivery.into());
+        }
         if let ComposeResponse::ComposeOperationState { operation, .. } = &response {
             ensure!(
                 self.attributed(operation),
