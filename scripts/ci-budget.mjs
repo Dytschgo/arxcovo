@@ -7,16 +7,22 @@ const repository = process.env.GITHUB_REPOSITORY;
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? '')) throw Error('Invalid repository');
 const api = (path, args = []) => JSON.parse(execFileSync('gh', ['api', `repos/${repository}/${path}`, ...args], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }));
 const runs = query => api(`actions/workflows/ci.yml/runs?${query}&per_page=100`).workflow_runs;
-const firstAttempt = run => api(`actions/runs/${run.id}/attempts/1`);
-const measure = (listed, kind, repositoryId) => {
-  const run = firstAttempt(listed);
-  const jobs = api(`actions/runs/${listed.id}/attempts/1/jobs?per_page=100`);
+const measure = (listed, kind, repositoryId, attempt = 1) => {
+  const path = `actions/runs/${listed.id}/attempts/${attempt}`;
+  const run = api(path);
+  const jobs = api(`${path}/jobs?per_page=100`);
   // Keep the existing completed-attempt baseline validation before optional credit.
-  return queueMeasurement(duration(run), run, jobs, listed, kind, repositoryId);
+  return queueMeasurement(duration(run), run, jobs, listed, kind, repositoryId, attempt);
 };
 const getMainRun = () => {
-  const run = runs('branch=main&event=push&status=completed').sort((a, b) => b.run_number - a.run_number)[0];
-  return run ? measure(run, 'main') : null;
+  const listed = runs('branch=main&event=push&status=completed').sort((a, b) => b.run_number - a.run_number)[0];
+  if (!listed) return null;
+  const first = measure(listed, 'main');
+  const attempt = listed.run_attempt;
+  if (!first.runnerCancelled || listed.conclusion !== 'success' || !Number.isSafeInteger(attempt) || attempt <= 1) return first;
+  const retry = measure(listed, 'main', undefined, attempt);
+  // Reused jobs have timestamps from earlier attempts and cannot earn credit.
+  return retry.credit === 'applied' && retry.jobs.length === first.jobs.length ? { ...retry, attempt } : first;
 };
 const statuses = statusPublisher({
   readStatus: sha => api(`commits/${sha}/status?per_page=100`).statuses.find(status => status.context === 'ci-time-budget') ?? null,

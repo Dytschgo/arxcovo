@@ -39,6 +39,37 @@ test('first-attempt timing defeats a faster candidate listing', () => {
   assert.equal(result.posts.at(-1).state, 'failure');
 });
 
+test('main recovers a runner-cancelled first attempt using only a green full rerun of the same run', () => {
+  const result = evaluate('recovery-full-rerun');
+  assert.equal(result.error, null);
+  assert.deepEqual(result.posts.map(post => post.state), ['pending', 'success']);
+  assert.equal(result.posts.at(-1).description, 'Main run 20: attempt 2: wall 613s, charged 611s; budget satisfied');
+  assert.deepEqual(result.calls.filter(path => path.includes('/attempts/')), [
+    'actions/runs/20/attempts/1', 'actions/runs/20/attempts/1/jobs?per_page=100',
+    'actions/runs/20/attempts/2', 'actions/runs/20/attempts/2/jobs?per_page=100',
+  ]);
+});
+
+for (const [scenario, readsRetry, reason] of [
+  ['worker-failure', false, /did not succeed/],
+  ['slow-first', false, /over 900s/],
+  ['unknown-cancellation', false, /did not succeed/],
+  ['awaiting-rerun', false, /did not succeed/],
+  ['partial-rerun', true, /did not succeed/],
+  ['red-rerun', true, /did not succeed/],
+  ['mismatched-rerun', true, /did not succeed/],
+  ['rerun-topology-changed', true, /did not succeed/],
+]) {
+  test(`main remains blocked with recovery scenario: ${scenario}`, () => {
+    const result = evaluate(`recovery-${scenario}`);
+    assert.equal(result.error, null);
+    assert.equal(result.posts.at(-1).state, 'failure');
+    assert.match(result.posts.at(-1).description, reason);
+    assert.equal(result.calls.filter(path => path.includes('/attempts/2')).length, readsRetry ? 2 : 0);
+    assert.equal(result.calls.some(path => path.includes('/attempts/') && !path.startsWith('actions/runs/20/')), false);
+  });
+}
+
 test('current labels still control the speed exception after a large candidate read', () => {
   const result = evaluate('removed-label');
   assert.equal(result.error, null);

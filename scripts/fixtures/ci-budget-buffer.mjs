@@ -10,6 +10,7 @@ const scenario = process.argv[2];
 const probesBuffer = ['large-candidate', 'removed-label'].includes(scenario) || scenario.startsWith('oversized-');
 const incompleteMain = ['incomplete-main', 'fast-incomplete-main', 'record-incomplete-main'].includes(scenario);
 const mainSeconds = ['fast-main', 'fast-incomplete-main', 'record-incomplete-main'].includes(scenario) ? 800 : 1200;
+const recovery = scenario.startsWith('recovery-');
 const head = 'a'.repeat(40);
 const repository = scenario === 'invalid-repository' ? 'https://unsafe' : 'example/arxcovo';
 const prefix = 'repos/example/arxcovo/';
@@ -18,7 +19,7 @@ const posts = [];
 const payloadBytes = [];
 const transportErrors = [];
 let prReads = 0;
-const pr = { number: 1, state: 'open', head: { sha: head, repo: { id: 7 } }, labels: [{ name: 'ci-speed' }] };
+const pr = { number: 1, state: 'open', head: { sha: head, repo: { id: 7 } }, labels: recovery ? [] : [{ name: 'ci-speed' }] };
 const run = (id, seconds, extra = {}) => ({
   run_attempt: 1, path: '.github/workflows/ci.yml', event: id === 20 || id === 19 ? 'push' : 'pull_request', head_branch: 'main',
   id, run_number: id, head_sha: head, head_repository: { id: 7 },
@@ -27,6 +28,51 @@ const run = (id, seconds, extra = {}) => ({
   updated_at: new Date(Date.parse('2026-01-01T00:00:00Z') + seconds * 1000).toISOString().replace('.000Z', 'Z'),
   ...extra,
 });
+
+const at = seconds => new Date(Date.UTC(2026, 0, 1) + seconds * 1000).toISOString().replace('.000Z', 'Z');
+function recoveryRun(attempt) {
+  if (attempt === 1) return run(20, 913, { conclusion: scenario === 'recovery-slow-first' ? 'success' : 'failure' });
+  return run(20, 613, { run_attempt: 2, run_started_at: at(2000), updated_at: at(2613) });
+}
+
+function recoveryJobs(attempt) {
+  const offset = attempt === 1 ? 0 : 2000;
+  const firstRed = attempt === 1 && scenario !== 'recovery-slow-first';
+  const workerEnd = attempt === 1 ? 903 : 600;
+  const jobs = ['rust', 'ui', 'verify'].flatMap((phase, matrix) => ['ubuntu-latest', 'windows-latest', 'macos-latest'].map((os, index) => {
+    const gate = phase === 'verify';
+    const job = {
+      id: matrix * 3 + index + 1, run_id: 20, run_attempt: attempt, head_sha: head,
+      name: `${phase} (${os})`,
+      labels: [gate ? 'ubuntu-latest' : phase === 'rust' && index === 0 ? 'ubuntu-24.04' : os],
+      status: 'completed', conclusion: 'success', runner_id: 1,
+      created_at: at(offset + (gate ? workerEnd : 0)),
+      started_at: at(offset + (gate ? workerEnd + 2 : 0)),
+      completed_at: at(offset + (gate ? workerEnd + 6 : firstRed ? 400 : workerEnd)),
+      steps: [{ number: 1, status: 'completed', conclusion: 'success' }],
+    };
+    if (firstRed && gate) {
+      job.conclusion = 'failure';
+      job.steps = ['success', 'failure', 'success'].map((conclusion, i) => ({ number: i + 1, status: 'completed', conclusion }));
+    }
+    if (firstRed && phase === 'rust' && index === 1) {
+      job.conclusion = scenario === 'recovery-worker-failure' ? 'failure' : 'cancelled';
+      job.completed_at = at(scenario === 'recovery-unknown-cancellation' ? 719 : 749);
+    }
+    if (firstRed && phase === 'rust' && index === 2) {
+      Object.assign(job, { conclusion: 'cancelled', runner_id: 0, steps: [], completed_at: at(workerEnd) });
+    }
+    return job;
+  }));
+  if (attempt === 2 && scenario === 'recovery-partial-rerun') jobs[0].started_at = at(0);
+  if (attempt === 2 && scenario === 'recovery-red-rerun') jobs[0].conclusion = 'failure';
+  if (attempt === 2 && scenario === 'recovery-mismatched-rerun') jobs[0].run_attempt = 1;
+  if (attempt === 2 && scenario === 'recovery-rerun-topology-changed') {
+    const gates = jobs.slice(6).map((job, i) => ({ ...job, labels: [`${['ubuntu', 'windows', 'macos'][i]}-latest`] }));
+    return { total_count: gates.length, jobs: gates };
+  }
+  return { total_count: jobs.length, jobs };
+}
 
 function response(path, args) {
   if (path === 'pulls?state=open&per_page=100') return [pr];
@@ -42,7 +88,13 @@ function response(path, args) {
     return {};
   }
   if (path === 'actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&per_page=100') {
-    return { workflow_runs: [run(19, 1), run(20, 1, {run_attempt: 2})], ...(scenario === 'oversized-main' ? { padding: 'x'.repeat(9 * 1024 * 1024) } : {}) };
+    const latest = recovery && scenario === 'recovery-awaiting-rerun' ? recoveryRun(1) : run(20, 1, {run_attempt: 2});
+    return { workflow_runs: [run(19, 1), latest], ...(scenario === 'oversized-main' ? { padding: 'x'.repeat(9 * 1024 * 1024) } : {}) };
+  }
+  const recoveryPath = recovery && path.match(/^actions\/runs\/20\/attempts\/([12])(\/jobs\?per_page=100)?$/);
+  if (recoveryPath) {
+    const attempt = Number(recoveryPath[1]);
+    return recoveryPath[2] ? recoveryJobs(attempt) : recoveryRun(attempt);
   }
   if (path === 'actions/runs/20/attempts/1') return run(20, mainSeconds, scenario === 'attempt2-main' ? {run_attempt: 2} : incompleteMain ? {status: 'in_progress'} : {});
   const jobsPath = path.match(/^actions\/runs\/(20|11)\/attempts\/1\/jobs\?per_page=100$/);

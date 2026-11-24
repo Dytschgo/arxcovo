@@ -13,9 +13,11 @@ export async function evaluateEvent(io, triggeringHead) {
   }
 }
 
+const mainMarker = latest => latest ? `Main run ${latest.runId}:${latest.attempt ? ` attempt ${latest.attempt}:` : ''}` : 'No valid completed main CI baseline';
+
 export function decideBudget(latest, candidate, labels) {
   const charged = latest?.chargedSeconds == null ? `n/a (${latest?.credit?.split(':')[1] ?? 'run-invalid'})` : `${latest.chargedSeconds}s${creditable(latest) ? '' : ' uncredited (not-green)'}`;
-  const prefix = latest ? `Main run ${latest.runId}: wall ${latest.seconds}s, charged ${charged}; ` : '';
+  const prefix = latest ? `${mainMarker(latest)} wall ${latest.seconds}s, charged ${charged}; ` : '';
   try {
     budget(latest, candidate, labels.some(label => label.name === 'ci-speed'));
     const reduction = (creditable(latest) ? latest.chargedSeconds : latest.seconds) > 900;
@@ -61,13 +63,13 @@ export async function evaluatePullRequests({ listPullRequests, getPullRequest, g
       head = pr.head.sha;
       if (pr.state !== 'open') continue;
       const previous = await getStatus(head);
-      const marker = latest ? `Main run ${latest.runId}:` : 'No valid completed main CI baseline';
+      const marker = mainMarker(latest);
       // Unchanged final results stay final. Only invalidate an old success when
       // its authoritative main measurement changed, or initialize a new head.
       if (!previous || (previous.state === 'success' && !(previous.description ?? '').startsWith(marker))) {
         await postStatus(head, 'pending', `${marker} evaluating budget`);
       }
-      const candidate = latest?.seconds > 900 && pr.labels.some(label => label.name === 'ci-speed') ? await getCandidateRun(pr) : null;
+      const candidate = creditable(latest) && latest.chargedSeconds > 900 && pr.labels.some(label => label.name === 'ci-speed') ? await getCandidateRun(pr) : null;
       const current = await getPullRequest(pr.number);
       if (current.state !== 'open') continue;
       if (current.head.sha !== head) {

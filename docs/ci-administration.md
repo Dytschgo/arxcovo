@@ -130,3 +130,15 @@ reporting and conservative fallback; gates cannot be created before all workers
 finish. Fresh exact-source review and a normal new-head first attempt are needed.
 The held result is not retroactively credited; no speedup or PR182 release is
 established yet.
+
+## Recovering a main CI runner cancellation
+
+For the latest main push CI run, a runner cancellation that meets the
+[ADR 0025 recovery rule](adr/0025-ci-queue-outage-budget.md#main-runner-cancellation-recovery-2026-11-24)
+can recover through **Re-run all jobs** on that same run. After a full green
+rerun, trusted policy evaluates the new attempt's own timings against the
+900 s charged budget. Re-running only the cancelled jobs can restore the
+workflow's functional result, but GitHub keeps earlier successful jobs and
+their timestamps. Use a full rerun when the budget gate needs a fresh
+measurement. Genuine test or build failures and unclassified cancellations
+keep the gate blocked.

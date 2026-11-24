@@ -267,3 +267,54 @@ succeeded, and `ci-time-budget` reported wall 695 s, charged 690 s, budget
 satisfied. Credit applied. The authorization is consumed. It cannot be reused.
 
 Native paths remain **unverified on real hardware**.
+
+## Main runner cancellation recovery (2026-11-24)
+
+Main run [45420442928](https://github.com/Dytschgo/arxcovo/actions/runs/45420442928)
+on `cb285be3` took 913 s on attempt 1. The Rust macOS job never acquired a
+runner. The Rust Windows job was cancelled 749 s after starting, with every
+reported step successful or skipped. The three completion gates failed on
+the cancelled matrix. The same run's partial rerun succeeded in 613 s and
+reused four successful workers from attempt 1. Attempt 1 could earn neither
+idle queue credit nor a `ci-speed` comparison. The owner authorized a
+one-use bypass consumed by #310 and a budget policy fix.
+
+Attempt 1 remains authoritative unless the latest completed main push CI
+run has a classifiable runner cancellation. The existing attempt-1 run and
+job validation must pass. The run must report cancellation or failure and
+at least one job must report cancellation. Each cancelled job must show one
+of these signatures in the existing attempt jobs response.
+
+- The runner ID is zero, the step list is empty, and creation and start
+  timestamps are equal.
+- In the nine-job workflow, a positive runner ID has an elapsed time
+  between the configured 720 s job deadline and 750 s inclusive. Every
+  reported step is completed with success or skipped, and at least one
+  succeeded. The 30 s window covers the cancellation and teardown delay
+  observed in the incident. Job metadata carries no separate timeout cause,
+  so this signature is an inference. A failed, cancelled or unfinished step
+  cannot qualify for it.
+
+Uncancelled jobs must succeed, except for the split workflow's
+`verify` gates after a worker cancellation. Those gates must show the
+exact completed setup/failure/cleanup sequence. Their sole user step
+checks the two matrix results. A worker failure, an unknown cancellation, or another gate failure
+keeps the baseline blocked, even when the wall time is at or below 900 s.
+The classifier reads structured step status and conclusion, runner IDs and
+timestamps. It does not read job logs or step names.
+
+When the listing reports a later successful attempt of that same run, fetch
+only that attempt and its bounded jobs page. Require the same run and head, a
+completed successful run, the same job layout, and all jobs successful with valid
+timings inside the later attempt. Measure its own wall time and apply the
+unchanged charged-v1 rules and 900 s threshold. A partial rerun can restore
+functional health, but its inherited timestamps cannot form a complete
+budget measurement. A full green rerun can recover the gate. Candidate PRs
+continue to use attempt 1.
+
+Measuring a full attempt on the same commit retains a measured budget and
+accounts for all required work. Falling back to an older main run could
+hide a regression on the current commit. Passing through a missing baseline
+would drop the measurement requirement. Reusing only the jobs from a
+partial rerun could omit the cost of successful jobs. The attempt-1
+decision for a fully green run, including one over budget, stays binding.
