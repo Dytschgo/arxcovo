@@ -71,6 +71,11 @@ fn safe_component(name: &str) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArtifactRole {
     Qemu,
+    /// The separately pinned patched QEMU/libslirp build for a public-egress
+    /// static boot (ADR 0064). Never interchangeable with the stock `Qemu`.
+    PublicEgressQemu,
+    /// The read-only custodied public-egress policy artifact (ADR 0064).
+    PublicEgressPolicy,
     QemuImg,
     FirmwareCode,
     VarsSeed,
@@ -78,6 +83,10 @@ pub enum ArtifactRole {
     GuestDisk,
     StaticDisk,
     StaticVars,
+    SnapshotDisk,
+    SnapshotVars,
+    SnapshotStagingDisk,
+    SnapshotStagingVars,
     Golden,
     TestInstallDisk,
     WindowsSetupVars,
@@ -103,6 +112,8 @@ impl ArtifactRole {
                 | Self::GuestDisk
                 | Self::StaticDisk
                 | Self::StaticVars
+                | Self::SnapshotStagingDisk
+                | Self::SnapshotStagingVars
                 | Self::TestInstallDisk
                 | Self::Staging
                 | Self::Scratch

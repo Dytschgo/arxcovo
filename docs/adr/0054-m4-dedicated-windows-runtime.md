@@ -523,3 +523,203 @@ probe to authenticate the static generation's origin. A port conflict or
 unrelated listener cannot establish readiness. The port, private identity
 and raw probe response never enter MCP. Native behavior is **unverified on
 real hardware**. See [ADR 0063](0063-vm-store-v9-forward-only.md) for storage.
+
+## Amendment 2026-11-23 — Public-only egress variant for the static VM (ADR 0064 E1b)
+
+[ADR 0064](0064-v1-scope-docker-static-vm.md) adds a second sealed network
+for an installed static boot, `StaticNetwork::PublicEgress`, beside the
+restricted origin above. It names its read-only custodied policy artifact
+and seals a distinct plan kind, `PublicEgressBoot`. Its netdev is exactly
+`user,id=arxnet0,restrict=off,ipv4=on,ipv6=off,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,arx-public-egress=<custodied-policy>,hostfwd=tcp:127.0.0.1:<leased-port>-10.0.2.15:443`,
+followed by `-device virtio-net-pci,netdev=arxnet0`. The policy path is
+passed as a QEMU keyval string, with any comma doubled. The port is the A2
+supervisor lease from the fixed 49152–49215 range. The restricted origin,
+TEST boots and installer purposes keep their settled argv byte for byte.
+
+`arx-public-egress` exists only in the separately pinned patched
+QEMU/libslirp build from E1a. The plan requires a distinct
+`PublicEgressQemu` artifact role, so the stock `Qemu` image cannot run it
+and the patched image cannot run any other recipe. Both the policy and the
+image must name held objects: each carries a file identity and a bounded
+content pin.
+
+The candidate profile may carry an optional `public_egress` section. It
+holds the manifest `qemu-11.1.3-arx-public-egress-windows-x64`, the pins
+of the console executable and its receipt, and the enrolled policy pin.
+The patched build links libslirp statically, so it has no DLL slot. The
+section never replaces the stock `manifest`, which TEST VMs keep. A
+configured pin is not a qualified pin. Qualification requires an exact
+entry in the compiled reviewed-build list that pairs the receipt with the
+executable bytes it vouches for. A reviewed receipt never qualifies any
+other executable. The list stays empty until the E1a source, build and
+native receipt are independently reviewed. That receipt must cover the
+full payload and the loaded-dependency set. Any pin that names the
+reviewed stock 11.1.3 executable or receipt is refused.
+
+The policy artifact follows the E1a policy v1 contract. It is at most
+32 KiB of printable ASCII with LF line endings and a final LF, and has no
+spaces or blank lines. The fields appear in this order:
+
+- `version=1`;
+- `interface_index` and `interface_luid`, as nonzero canonical decimals;
+- `source` and `gateway`, as canonical IPv4 addresses that are nonzero and
+  distinct;
+- zero to 512 distinct `deny=` CIDRs, with prefixes 1–32 and clear host bits;
+- `fingerprint`, the lowercase SHA-256 of every preceding byte.
+
+The compiled special-purpose table and the synthetic subnet always apply in
+addition to the `deny=` lines. The table covers 0/8, 10/8, 100.64/10,
+127/8, 169.254/16, 172.16/12, 192.0.0/24, the documentation, benchmarking
+and 6to4 relay ranges, 192.168/16, multicast, reserved and broadcast.
+Admission is stricter than the backend: the enrolled source and gateway
+must already lie in the deny union. The in-file digest checks integrity
+only. The supervisor authenticates the whole file by the enrolled pin.
+
+Custody opens the policy read-only under an anchored directory and refuses
+links, reparse points, extra hard links and unsafe leaf names. It checks
+privacy through the held handles of both the directory and the file. On
+POSIX, the effective UID must own each object and no group or other
+permission bit may be set. On Windows, TokenUser must own each object, the
+DACL must be protected, and the DACL must consist of exactly one explicit,
+non-inheritable TokenUser FullControl entry, checked with the same
+`vm_acl::exact` helper as the runtime inputs above. Custody reads the bytes
+through the held handle and verifies the pin over exactly those bytes. At
+every verification, including admission, it re-checks the anchor directory
+and the leaf through their held handles: both names still denote the held
+objects, and both handles still meet the privacy rule.
+Windows holds the file without write or delete sharing and the directory
+without delete sharing. The patched executable is held read-only the same
+way and measured through its handle. As a bundle input it carries no
+owner-only rule.
+
+Admission refuses with a typed `EgressRefusal` when evidence is missing or
+mismatched:
+
+- the plan or its lease;
+- the policy's presence, custody, grammar, completeness or fingerprint;
+- a missing validated profile or public-egress enrollment (`Unenrolled`).
+  Admission checks enrollment first. It reads the enrolled policy pin and
+  the patched-binary pin from the validated `VmRuntimeProfile` itself,
+  never from loose values. Only `VmRuntimeProfile::parse`, with its size
+  limit and semantic validation, can produce that type. It implements no
+  `Deserialize` and has a private field, and the foreground file's runtime
+  section also goes through `parse`;
+- a held policy that differs from the profile's enrolled pin;
+- a held policy or executable that is not the exact object the plan's argv
+  names. The normalized local path must equal the argv spelling exactly,
+  case included, because NTFS directories can be case-sensitive. The file
+  identity and content pin must also match;
+- a route other than the enrolled default uplink (index, LUID, source and
+  gateway);
+- a patched binary that is missing, stock or unqualified, or whose held
+  bytes are not the qualified executable.
+
+Only a Windows drive path can name a plan input, so POSIX custody never
+binds a plan. Every such refusal maps to the existing
+`NetworkFenceUnverified`, so the MCP refusal vocabulary is unchanged. The
+reference matcher mirrors the backend's checks for tests. It allows only
+TCP and UDP. It drops the synthetic subnet, including the 10.0.2.2 and
+10.0.2.3 aliases, before translation, and checks the deny union both before
+translation and on the final socket destination. The single loopback
+forward is host-initiated only. A guest-initiated flow to the forward peer
+is refused.
+
+Admission success is a portable check only. The Windows launcher refuses
+`PublicEgressBoot` with `NetworkFenceUnverified`, as it refuses
+`StaticWebBoot`, and `LaunchAuthority` stays uninhabited. The patched
+build, Windows route and socket behavior, policy custody on the owner host
+and real egress are **unverified on real hardware**.
+
+## Amendment 2026-11-23 — Current-user native runtime on the enrolled PC
+
+The owner's decision under [ADR 0058](0058-v1-scope-static-vms-and-cloudflare.md)
+applies to this enrolled PC only. Native VM execution uses the owner's
+console logon in the foreground under [ADR 0029](0029-owner-selectable-windows-execution-account.md)
+`current_user`. This supersedes the dedicated-account requirement, the
+distinct owner and supervisor SID pins, and the distinct-SID/local-SAM WTS
+match above for this mode. An explicit dedicated account remains possible with
+its own identity boundary and qualification. Each execution mode requires its
+own evidence and fails closed on an identity mismatch. There is no fallback
+between modes.
+
+### Execution identity and shared-SID trust
+
+Pin one enrolled owner SID using canonical OS user-SID validation, including
+the enrolled cloud identity. Bind it to the actual foreground primary
+token's SID, logon SID, authentication LUID and session. Require an
+interactive, non-elevated Medium-integrity token in the active console logon.
+Accept a verified UAC-filtered token with Administrators marked deny-only.
+Refuse elevation, enabled Administrators or Hyper-V Administrators authority,
+SYSTEM, service, noninteractive and remote logons, impersonation, unknown
+group attributes and any mismatch. Derive the restricted QEMU and qemu-img
+tokens and verify the held suspended child's restrictions, group masks,
+privileges, integrity, logon binding and default DACL before resume.
+
+The owner accepts a shared Windows principal on this PC. Dedicated-account
+separation from the owner's files and credentials is lost. Same-SID code can
+interfere with local configuration, loaders, processes, pipes and storage.
+The trusted account includes the foreground startup and local evidence.
+Keep authenticated local transport, exact pipe ACL and live Job-child
+endpoint checks, cross-principal and NETWORK denials, and an unnamed
+non-inheritable kill-on-close Job with effective limits and no breakaway.
+Keep private roots and immutable inputs pinned by held handles. Require
+verified consumer opens and deny-replacement and no-redirection custody
+through handoff. Close any effect whose custody the pinned QEMU or helper
+cannot prove. These controls bind effects and limit child access and lifetime.
+They do not protect against malicious code running under the same Windows
+account (same SID) that interferes with the daemon, pipe or resources. Audit
+the execution mode as `current_user` with no dedicated-account isolation
+claim, and keep raw identities local.
+
+### Console activity and capacity
+
+Read WTS activity in the current session and bind it to the foreground token
+and a stable console logon incarnation across queries. Verify the SID mapping
+locally and require the unique active, unlocked owner console with sane input
+and logon timestamps. A SID match alone cannot identify a logon. Require ten
+minutes of inactivity and observations at most five seconds old at dispatch,
+clipped to the phase deadline. Recheck activity and reserves before resume,
+at dispatch and while running. Recent input closes admission. Lock,
+disconnect, session switch, ambiguity or stale observations also close
+admission. Bring owned work to bounded quiescence when the owner returns or
+activity or reserves cannot be established. Uncertain release stays charged.
+The owner chooses one console-idle window for the unattended live test.
+A static VM runs on this opportunistic host only when explicitly pinned to
+it, subject to the same activity and reserve rules.
+
+Enforce an aggregate **200 GiB VM disk cap on D:** with **at least 50 GiB
+always free on D:**. Verify physical fixed-size NTFS capacity and, for fixed
+VHDX backing, full physical allocation and both inner and outer free-space
+bounds. Charge allocated bytes, outstanding and quarantined generations,
+metadata and peak media, verification, snapshot, restore and copy staging
+under serialized admission. Reserve **16 GiB RAM** and **at least half the
+effective CPU cores** for the owner, accounting for nested Job scope and
+QEMU/WHPX overhead inside and outside Job counters. Qualify initially with
+one running VM at most, up to 8 GiB guest RAM and 4 vCPUs within those reserves.
+
+### Qualification and admission
+
+A complete, versioned native qualification record is valid for **at most
+seven days**. Load it with a bounded, strict schema that rejects missing,
+duplicate or unknown fields. Pin its reviewed digest locally and bind it to the
+enrolled Windows host, store, profile, exact release, recipe and network
+class. Requalify the affected scope before new work on material drift in the
+OS, runtime or dependencies, input media, recipe, hardware, volume, network
+or policy. After reboot, renew live startup evidence. Reject inconsistent
+record age or wall-clock rollback. Record validity and the five-second live
+observation limit apply independently. Owned teardown may finish after expiry.
+
+Native admission stays closed by default and remains closed until the private
+issuer in M4 PR 7c is in place and a fresh, matching native qualification
+record exists. Each new effect also requires matching live proof bound to
+its operation and generation. The reviewed qualification runner has private
+trial authority for its disposable store, separate from daemon launch
+authority. Qualify the restricted TEST/installer class, the static HTTPS
+loopback origin and any Docker egress scope independently. Docker requires
+its separate patched distribution and network evidence. Public publishing
+defaults off. Agents have no authority to delete static VMs or backups.
+[ADR 0058](0058-v1-scope-static-vms-and-cloudflare.md) · [ADR 0064](0064-v1-scope-docker-static-vm.md)
+
+The current-user activation gates and production native launches are
+**unverified on real hardware**. Follow the
+[native qualification runbook](../dev-host-setup.md#native-qualification-runbook).
