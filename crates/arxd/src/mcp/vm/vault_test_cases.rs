@@ -51,6 +51,33 @@ fn vault_vm_counts(harness: &Harness) -> (i64, i64, i64) {
         .unwrap()
 }
 
+async fn seal_vault_template(harness: &Harness, client: &Client, nonce: u64) {
+    let build = call(
+        client,
+        "vm_template_build",
+        json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(nonce)}),
+    )
+    .await;
+    assert_eq!(build["ok"], true, "{build}");
+    // This worker is the only job in the fresh fixture. Join it instead of
+    // querying SQLite repeatedly while the fixture is sealing the template.
+    let jobs = harness.fixture(Fixture::take_jobs);
+    harness.hold_build.notify_one();
+    tokio::time::timeout(Duration::from_secs(15), jobs.join())
+        .await
+        .expect("template fixture worker timed out")
+        .expect("template fixture worker failed");
+
+    let sealed = call(
+        client,
+        "vm_operation",
+        json!({"operation_id":build["operation_id"]}),
+    )
+    .await;
+    assert_eq!(sealed["state"], "succeeded", "{sealed}");
+    assert!(sealed["template_id"].is_string(), "{sealed}");
+}
+
 #[tokio::test]
 async fn vault_tester_requires_exit_and_reconciled_throwaway_custody() {
     assert!(log::STATIC_MAX_LEVEL <= log::LevelFilter::Info);
@@ -68,16 +95,7 @@ async fn vault_tester_requires_exit_and_reconciled_throwaway_custody() {
             .iter()
             .any(|tool| tool.name == "vault_test_version")
     );
-    let build = call(
-        &client,
-        "vm_template_build",
-        json!({
-            "recipe_id":hex::encode(RECIPE.0), "request_id":key(601)
-        }),
-    )
-    .await;
-    h.hold_build.notify_one();
-    assert_eq!(terminal(&client, &build).await["state"], "succeeded");
+    seal_vault_template(&h, &client, 601).await;
 
     let good = add_vault_version(&client, 1, VAULT_EXIT_0).await;
     let args = vault_write_args(&good, 2);
@@ -172,16 +190,7 @@ async fn vault_tester_quarantines_unconfirmed_disposal() {
     let mut h = Harness::start(false, false).await;
     h.supervisor().open_vault(h.temp.path()).unwrap();
     let client = h.client(0).await;
-    let build = call(
-        &client,
-        "vm_template_build",
-        json!({
-            "recipe_id":hex::encode(RECIPE.0), "request_id":key(602)
-        }),
-    )
-    .await;
-    h.hold_build.notify_one();
-    assert_eq!(terminal(&client, &build).await["state"], "succeeded");
+    seal_vault_template(&h, &client, 602).await;
 
     let version = add_vault_version(&client, 1, VAULT_EXIT_0).await;
     assert_eq!(
