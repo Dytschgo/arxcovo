@@ -139,14 +139,22 @@ impl AsyncWrite for FakeWriter {
         if !self.dispatch.begin_write() {
             return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
         }
+        let written =
+            self.dispatch
+                .write_pipe(&mut *self.written.borrow_mut(), bytes, &Shutdown::default());
         if self.late {
             // The peer may already have replied. Set the worker clock past
-            // the tracked window just before the actual write settles.
+            // the tracked window before recording the completion.
             *self.dispatch.test.clock.lock().unwrap() = Some(now + FRESHNESS);
         }
-        self.written.borrow_mut().extend_from_slice(bytes);
-        self.dispatch.end_write(true);
-        Poll::Ready(Ok(bytes.len()))
+        self.dispatch.end_write(matches!(written, Ok(true)));
+        Poll::Ready(written.and_then(|sent| {
+            if sent {
+                Ok(bytes.len())
+            } else {
+                Err(io::ErrorKind::TimedOut.into())
+            }
+        }))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -274,6 +282,10 @@ impl Fake {
     }
 
     async fn run(&mut self) -> TrialResult {
+        self.run_for(BUDGET).await
+    }
+
+    async fn run_for(&mut self, budget: Duration) -> TrialResult {
         let lat = |text| LocalPath::parse(text).unwrap();
         let image = lat(r"X:\fixture\qemu-system-x86_64.exe");
         let data = lat(r"X:\fixture\share");
@@ -284,7 +296,7 @@ impl Fake {
             bios: &bios,
         };
         let cancel = self.cancel.clone();
-        run(self, &plan, &cancel, Tick::now() + BUDGET, BUDGET).await
+        run(self, &plan, &cancel, Tick::now() + budget, BUDGET).await
     }
 }
 
@@ -760,6 +772,45 @@ async fn missing_or_late_release_proof_keeps_the_slot_charged() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn timely_settlement_releases_the_charge_after_live_deadlines() {
+    for (lag, expiring, cutoff) in [
+        (9, true, 1000),
+        (10, true, 1000),
+        (251, false, 1000),
+        (21, false, 20),
+    ] {
+        let (release, proof) = tokio::sync::oneshot::channel();
+        let mut host = Fake {
+            expiring_sample: expiring.then_some(8),
+            live_override: Some((9, |sample| sample.idle = false)),
+            proof_notification: Some(ProofNotification {
+                step: Step::Reopen,
+                receiver: RefCell::new(Some(proof)),
+            }),
+            ..Fake::default()
+        };
+        // Start exclusive reopen before advancing time. The live deadline
+        // can pass while the independent settlement deadline is still open.
+        let (result, ()) = tokio::join!(
+            biased;
+            host.run_for(Duration::from_millis(cutoff)),
+            async {
+                tokio::time::advance(Duration::from_millis(lag)).await;
+                release.send(()).unwrap();
+            }
+        );
+        assert_eq!(result.paused, Ok(()));
+        assert_eq!(result.release, StopDisposition::DirtyRelease);
+        assert!(
+            host.steps()
+                .ends_with(&[Step::Stop, Step::Reopen, Step::Settle])
+        );
+        assert!(!host.charge_retained);
+        assert_eq!(host.live_calls.get(), 9);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn dropping_pending_trial_stops_and_quarantines_every_charged_phase() {
     for (stall_at, last_before_stop) in [
         (Some(Step::Claim), Step::Claim),
@@ -1176,6 +1227,51 @@ async fn a_queued_qmp_write_cannot_outlive_its_observation_or_pressure_deadline(
                 .ends_with(&[Step::Resume, Step::Stop, Step::Reopen, Step::Settle])
         );
     }
+}
+
+#[test]
+fn a_qmp_producer_waiting_for_dispatch_does_not_enqueue_past_cutoff() {
+    use std::{sync::mpsc, thread};
+
+    let dispatch = Arc::new(DispatchGate::default());
+    let (locked, check_locked) = mpsc::channel();
+    let (attempt, check_attempt) = mpsc::channel();
+    let bound = Duration::from_secs(5);
+    let worker_gate = dispatch.clone();
+    let worker = thread::spawn(move || {
+        worker_gate.state.send_modify(|_| {
+            locked.send(()).unwrap();
+            check_attempt.recv_timeout(bound).unwrap();
+            thread::sleep(Duration::from_millis(90));
+        });
+    });
+    check_locked.recv_timeout(bound).unwrap();
+    let start = Tick::now();
+    let cancel = Shutdown::default();
+    let live = LivePoll::new(
+        &cancel,
+        &|| Ok(Tick::now()),
+        Freshness::new(start, start, start + Duration::from_millis(40)),
+    );
+    let mut writer = LiveWriter {
+        stream: LiveIo {
+            gate: &live,
+            inner: Vec::new(),
+        },
+        dispatch: &dispatch,
+    };
+    attempt.send(()).unwrap();
+    let outcome = Pin::new(&mut writer).poll_write(
+        &mut Context::from_waker(std::task::Waker::noop()),
+        b"fixture",
+    );
+    worker.join().unwrap();
+    assert!(
+        matches!(outcome, Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied)
+    );
+    assert!(writer.stream.inner.is_empty());
+    assert_eq!(live.refused.get(), Some(Failure::Timeout));
+    assert_eq!(dispatch.current(), Dispatch::Idle);
 }
 
 #[tokio::test(start_paused = true)]

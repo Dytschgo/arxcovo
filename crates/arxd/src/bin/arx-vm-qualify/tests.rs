@@ -903,6 +903,41 @@ fn a_cancellation_after_cleanup_and_before_finish_never_seals() {
     );
 }
 
+#[test]
+fn a_complete_trial_rechecks_the_budget_at_the_seal_point() {
+    struct SealClock {
+        current: Cell<Instant2>,
+        at_seal: Instant2,
+    }
+
+    impl Clock for SealClock {
+        fn now(&self) -> Instant2 {
+            self.current.replace(self.at_seal)
+        }
+
+        fn cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    let at_ms = |mono_ms| Instant2 {
+        utc: T0.utc + mono_ms / 1000,
+        mono_ms,
+    };
+    for seal_ms in [MAX_TRIAL_MS - 1, MAX_TRIAL_MS, MAX_TRIAL_MS + 1] {
+        let clock = SealClock {
+            current: Cell::new(at_ms(MAX_TRIAL_MS - 1)),
+            at_seal: at_ms(seal_ms),
+        };
+        let result = complete(Class::Test).0.finish(&clock);
+        if seal_ms <= MAX_TRIAL_MS {
+            assert!(result.is_ok(), "seal point: {seal_ms} ms");
+        } else {
+            assert!(matches!(result, Err(RunError::Incomplete)));
+        }
+    }
+}
+
 fn fixture_after_late_cleanup() -> Trial<Fixture> {
     let tripped = Rc::new(Cell::new(false));
     let mut trial = fixture(Class::Test);

@@ -233,9 +233,9 @@ impl<S: Source> Trial<S> {
     }
 
     /// Seal a trial whose every stage passed against a complete, current
-    /// dependency projection. The clock is the live time and cancellation
-    /// source; cancellation is sampled at the seal point itself. No writer
-    /// accepts the result in this version.
+    /// dependency projection. Check cancellation, the trial budget, and
+    /// binding expiry at the seal point. No writer accepts the result in
+    /// this version.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn finish(self, clock: &impl Clock) -> Result<Complete<S>, RunError> {
         self.state.finish(clock)
@@ -536,13 +536,18 @@ impl<S: Source> State<S> {
                 .collect(),
         };
         check_bundle(&seal, &files, S::ORIGIN)?;
-        // The seal point: a cancellation delivered after cleanup, or while
-        // the bundle was built, is observed here and nothing seals.
-        if clock.cancelled() {
+        let seal = canonical(&seal)?;
+        // Building, checking, and encoding the bundle consume trial time.
+        // Recheck cancellation, budget and expiry after all of that work.
+        let seal_point = clock.now();
+        if seal_point.mono_ms < now.mono_ms
+            || seal_point.utc < now.utc
+            || self.gate(seal_point, clock).is_some()
+        {
             return Err(RunError::Incomplete);
         }
         Ok(Complete {
-            seal: canonical(&seal)?,
+            seal,
             files,
             _source: std::marker::PhantomData,
         })

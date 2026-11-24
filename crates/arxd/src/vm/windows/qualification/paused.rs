@@ -271,6 +271,9 @@ impl<H: Host> Settlement<'_, H> {
         let reopened = stop.ready_to_verify_release()
             && by_deadline(deadline, self.host.reopen(slot, deadline)).await == Some(true);
         stop.verify_release(|| reopened);
+        // Release depends on timely child exit, an empty Job, joined
+        // workers, and exclusive reopen. Live activity and reserve samples
+        // govern new work, so their expiry cannot block safe settlement.
         let release = if Tick::now() < deadline {
             stop.disposition()
         } else {
@@ -481,15 +484,42 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for LiveWriter<'_, I> {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         let dispatch = self.dispatch;
+        // Reading the dispatch state can block. The live check must follow
+        // that acquisition, and arming has its own locked deadline check.
+        let state = dispatch.current();
         let gate = self.stream.gate;
         self.stream.poll_io(|io, observation| {
-            if dispatch.current() == Dispatch::Idle
-                && let Err(reason) = dispatch.arm_until(
-                    observation.captured.into_std(),
-                    Some(observation.deadline().into_std()),
-                )
-            {
-                gate.refused.set(Some(reason.into()));
+            let window = match state {
+                Dispatch::Idle => {
+                    let deadline = observation.deadline().into_std();
+                    if let Err(reason) =
+                        dispatch.arm_until(observation.captured.into_std(), Some(deadline))
+                    {
+                        // Prefer the current live refusal if the effect
+                        // expired while waiting for the dispatch lock.
+                        let failure = gate.require_fresh().err().unwrap_or_else(|| reason.into());
+                        gate.refused.set(Some(failure));
+                        return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
+                    }
+                    deadline
+                }
+                Dispatch::Armed(deadline)
+                | Dispatch::Writing(deadline)
+                | Dispatch::WrittenInTime(deadline) => deadline,
+                Dispatch::Expired | Dispatch::Ambiguous => {
+                    gate.refused.set(Some(Failure::Qmp(ChannelError::Refused)));
+                    return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
+                }
+            };
+            // Recheck after arming can block. A refreshed sample cannot
+            // extend this command's worker window or authorize stale bytes.
+            if let Err(reason) = gate.require_fresh() {
+                gate.refused.set(Some(reason));
+                return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
+            }
+            if Tick::now().into_std() >= window {
+                gate.refused
+                    .set(Some(NativeRefusal::ReservesUnverified.into()));
                 return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
             }
             io.poll_write(cx, bytes)
