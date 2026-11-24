@@ -95,6 +95,26 @@ impl AsyncRead for DelayedGreeting {
     }
 }
 
+/// Deliver bytes in the same poll that crosses the sample deadline.
+struct AdvancingGreeting {
+    elapsed: Option<Duration>,
+    replies: Cursor<Vec<u8>>,
+}
+
+impl AsyncRead for AdvancingGreeting {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some(elapsed) = self.elapsed.take() {
+            // Tokio 1.48 advances its paused clock before the first yield.
+            let _ = std::pin::pin!(tokio::time::advance(elapsed)).poll(cx);
+        }
+        Pin::new(&mut self.replies).poll_read(cx, buffer)
+    }
+}
+
 struct FakeWriter {
     written: Rc<RefCell<Vec<u8>>>,
     dispatch: Arc<DispatchGate>,
@@ -134,6 +154,12 @@ impl AsyncWrite for FakeWriter {
 }
 
 type LiveOverride = (usize, fn(&mut Live));
+type FakeReader = Box<dyn AsyncRead + Unpin>;
+
+struct ProofNotification {
+    step: Step,
+    receiver: RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
 
 struct FakeSlot;
 struct FakeOpens;
@@ -143,6 +169,7 @@ struct Fake {
     steps: RefCell<Vec<Step>>,
     written: Rc<RefCell<Vec<u8>>>,
     replies: Option<String>,
+    reader_override: RefCell<Option<FakeReader>>,
     greeting_delay: Option<Duration>,
     peer_hold: RefCell<Option<tokio::io::DuplexStream>>,
     dispatch: RefCell<Option<Arc<DispatchGate>>>,
@@ -158,6 +185,7 @@ struct Fake {
     stall_at: Option<Step>,
     slow_at: Option<Step>,
     proof_workspace_at: Option<Step>,
+    proof_notification: Option<ProofNotification>,
     proof_workspace_held: Cell<bool>,
     owner_active_at: Option<Step>,
     owner_active: Cell<bool>,
@@ -170,6 +198,7 @@ impl Default for Fake {
             steps: RefCell::default(),
             written: Rc::default(),
             replies: Some(format!("{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n")),
+            reader_override: RefCell::default(),
             greeting_delay: None,
             peer_hold: RefCell::default(),
             dispatch: RefCell::default(),
@@ -185,6 +214,7 @@ impl Default for Fake {
             stall_at: None,
             slow_at: None,
             proof_workspace_at: None,
+            proof_notification: None,
             proof_workspace_held: Cell::default(),
             owner_active_at: None,
             owner_active: Cell::default(),
@@ -222,6 +252,14 @@ impl Fake {
             tokio::time::sleep(PRESSURE_INTERVAL).await;
             self.proof_workspace_held.set(false);
         }
+        if let Some(notification) = &self.proof_notification
+            && notification.step == step
+        {
+            self.proof_workspace_held.set(true);
+            let receiver = notification.receiver.borrow_mut().take().unwrap();
+            receiver.await.unwrap();
+            self.proof_workspace_held.set(false);
+        }
     }
 
     async fn run(&mut self) -> TrialResult {
@@ -242,7 +280,7 @@ impl Fake {
 impl Host for Fake {
     type Opens = FakeOpens;
     type Slot = FakeSlot;
-    type Reader = Box<dyn AsyncRead + Unpin>;
+    type Reader = FakeReader;
     type Writer = FakeWriter;
 
     fn open_contract(&mut self, _: &PausedPlan<'_>) -> Result<(FakeOpens, Peak), NativeRefusal> {
@@ -333,22 +371,26 @@ impl Host for Fake {
     ) -> Result<Pipes<Self::Reader, Self::Writer>, NativeRefusal> {
         self.step(Step::InspectChild)?;
         self.checkpoint(Step::InspectChild).await;
-        let stdout: Self::Reader = match &self.replies {
-            Some(replies) => {
-                let replies = Cursor::new(replies.as_bytes().to_vec());
-                if let Some(delay) = self.greeting_delay {
-                    Box::new(DelayedGreeting {
-                        delay: Box::pin(tokio::time::sleep(delay)),
-                        replies,
-                    })
-                } else {
-                    Box::new(replies)
+        let stdout: Self::Reader = if let Some(reader) = self.reader_override.borrow_mut().take() {
+            reader
+        } else {
+            match &self.replies {
+                Some(replies) => {
+                    let replies = Cursor::new(replies.as_bytes().to_vec());
+                    if let Some(delay) = self.greeting_delay {
+                        Box::new(DelayedGreeting {
+                            delay: Box::pin(tokio::time::sleep(delay)),
+                            replies,
+                        })
+                    } else {
+                        Box::new(replies)
+                    }
                 }
-            }
-            None => {
-                let (read, write) = tokio::io::duplex(64);
-                *self.peer_hold.borrow_mut() = Some(write);
-                Box::new(read)
+                None => {
+                    let (read, write) = tokio::io::duplex(64);
+                    *self.peer_hold.borrow_mut() = Some(write);
+                    Box::new(read)
+                }
             }
         };
         let dispatch = Arc::new(DispatchGate::default());
@@ -867,6 +909,96 @@ async fn due_pressure_precedes_qmp_greeting_and_capabilities_write() {
     tokio::time::advance(PRESSURE_INTERVAL + Duration::from_millis(50)).await;
     assert_eq!(
         trial.await,
+        TrialResult {
+            paused: Err(Failure::OwnerActive),
+            release: StopDisposition::DirtyRelease,
+        }
+    );
+    assert!(host.written.borrow().is_empty());
+    assert!(
+        host.steps()
+            .ends_with(&[Step::Resume, Step::Stop, Step::Reopen, Step::Settle])
+    );
+}
+
+const INDEPENDENT_READY_AT: Duration = Duration::from_micros(250_100);
+
+async fn assert_independently_ready_proof_refuses(proof: Step) {
+    // At the signal the monotonic deadline has passed, but Tokio's rounded
+    // timer has not reached its millisecond tick yet.
+    tokio::time::advance(Duration::from_micros(500)).await;
+    let (signal, receiver) = tokio::sync::oneshot::channel();
+    let mut host = Fake {
+        proof_notification: Some(ProofNotification {
+            step: proof,
+            receiver: RefCell::new(Some(receiver)),
+        }),
+        ..Fake::default()
+    };
+    let (result, ()) = tokio::join!(biased; host.run(), async {
+        tokio::time::advance(INDEPENDENT_READY_AT).await;
+        let _ = signal.send(());
+    });
+    assert_eq!(
+        result,
+        TrialResult {
+            paused: Err(Failure::Refused(RESERVES)),
+            release: StopDisposition::DirtyRelease,
+        }
+    );
+    assert!(
+        host.steps()
+            .ends_with(&[proof, Step::Stop, Step::Reopen, Step::Settle])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn independently_ready_consumer_open_refuses_before_releasing_ram() {
+    assert_independently_ready_proof_refuses(Step::VerifyOpens).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn independently_ready_whpx_refuses_before_releasing_ram() {
+    assert_independently_ready_proof_refuses(Step::VerifyWhpx).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn independently_ready_greeting_refuses_without_qmp_writes() {
+    use tokio::io::AsyncWriteExt;
+
+    tokio::time::advance(Duration::from_micros(500)).await;
+    let (reader, mut peer) = tokio::io::duplex(4096);
+    let mut host = Fake {
+        reader_override: RefCell::new(Some(Box::new(reader))),
+        live_override: Some((5, |sample| sample.idle = false)),
+        ..Fake::default()
+    };
+    let (result, ()) = tokio::join!(biased; host.run(), async {
+        tokio::time::advance(INDEPENDENT_READY_AT).await;
+        let replies = format!("{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n");
+        let _ = peer.write_all(replies.as_bytes()).await;
+    });
+    assert_activity_refusal_without_qmp_writes(&host, result);
+}
+
+#[tokio::test(start_paused = true)]
+async fn due_pressure_between_qmp_read_and_write_in_one_poll_refuses() {
+    let replies = format!("{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n");
+    let mut host = Fake {
+        reader_override: RefCell::new(Some(Box::new(AdvancingGreeting {
+            elapsed: Some(INDEPENDENT_READY_AT),
+            replies: Cursor::new(replies.into_bytes()),
+        }))),
+        live_override: Some((5, |sample| sample.idle = false)),
+        ..Fake::default()
+    };
+    let result = host.run().await;
+    assert_activity_refusal_without_qmp_writes(&host, result);
+}
+
+fn assert_activity_refusal_without_qmp_writes(host: &Fake, result: TrialResult) {
+    assert_eq!(
+        result,
         TrialResult {
             paused: Err(Failure::OwnerActive),
             release: StopDisposition::DirtyRelease,

@@ -5,9 +5,15 @@
 
 use super::*;
 use crate::vm::{qmp::bounded, runtime::capacity};
-use std::{future::Future, sync::Arc};
+use std::{
+    cell::Cell,
+    future::{Future, poll_fn},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     time::Instant as Tick,
 };
 
@@ -287,82 +293,190 @@ struct TrialResult {
     release: StopDisposition,
 }
 
-fn before(cancel: &Shutdown, cutoff: Tick) -> Result<(), Failure> {
+fn before(cancel: &Shutdown, cutoff: Tick) -> Result<Tick, Failure> {
     if cancel.is_cancelled() {
         return Err(Failure::Cancelled);
     }
-    if Tick::now() >= cutoff {
+    let now = Tick::now();
+    if now >= cutoff {
         return Err(Failure::Timeout);
     }
-    Ok(())
+    Ok(now)
+}
+
+const PRESSURE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The live deadline and sample schedule follow the trial between operations.
+/// Timers wake the supervisor, but are not evidence that a deadline is still
+/// in the future. Check the monotonic clock just before advancing anything.
+struct LivePoll<'a> {
+    cancel: &'a Shutdown,
+    cutoff: Tick,
+    recheck: &'a dyn Fn() -> Result<Tick, Failure>,
+    next_sample: Cell<Tick>,
+    refused: Cell<Option<Failure>>,
+}
+
+impl<'a> LivePoll<'a> {
+    fn new(
+        cancel: &'a Shutdown,
+        cutoff: Tick,
+        recheck: &'a dyn Fn() -> Result<Tick, Failure>,
+        captured: Tick,
+    ) -> Self {
+        Self {
+            cancel,
+            cutoff,
+            recheck,
+            next_sample: Cell::new(captured + PRESSURE_INTERVAL),
+            refused: Cell::new(None),
+        }
+    }
+
+    fn sample(&self) -> Result<Tick, Failure> {
+        before(self.cancel, self.cutoff)?;
+        let captured = (self.recheck)()?;
+        let now = before(self.cancel, self.cutoff)?;
+        self.next_sample.set(now + PRESSURE_INTERVAL);
+        Ok(captured)
+    }
+
+    fn check_due(&self) -> Result<(), Failure> {
+        let now = before(self.cancel, self.cutoff)?;
+        if now >= self.next_sample.get() {
+            self.sample()?;
+        }
+        Ok(())
+    }
+
+    fn poll<T, E>(
+        &self,
+        refusal: impl FnOnce(Failure) -> E,
+        advance: impl FnOnce() -> Poll<Result<T, E>>,
+    ) -> Poll<Result<T, E>> {
+        let checked = match self.refused.get() {
+            Some(reason) => Err(reason),
+            None => self.check_due(),
+        };
+        match checked {
+            Ok(()) => advance(),
+            Err(reason) => {
+                self.refused.set(Some(reason));
+                Poll::Ready(Err(refusal(reason)))
+            }
+        }
+    }
+
+    async fn watch<T>(
+        &self,
+        action: impl Future<Output = Result<T, Failure>>,
+    ) -> Result<T, Failure> {
+        tokio::pin!(action);
+        let cutoff_alarm = tokio::time::sleep_until(self.cutoff);
+        tokio::pin!(cutoff_alarm);
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
+                _ = &mut cutoff_alarm => return Err(Failure::Timeout),
+                _ = tokio::time::sleep_until(self.next_sample.get()) => {
+                    self.check_due()?;
+                }
+                result = poll_fn(|cx| self.poll(|reason| reason, || action.as_mut().poll(cx))) => {
+                    // An inner QMP read or write can refuse during an action
+                    // poll. Preserve its typed reason through the IO boundary.
+                    if let Some(reason) = self.refused.get() {
+                        return Err(reason);
+                    }
+                    before(self.cancel, self.cutoff)?;
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+/// One QMP future can read the greeting and start writing in a single poll.
+/// Use the same gate on the underlying IO calls as on the outer future.
+struct LiveIo<'a, I> {
+    gate: &'a LivePoll<'a>,
+    inner: I,
+}
+
+impl<I: Unpin> LiveIo<'_, I> {
+    fn poll_io<T>(
+        &mut self,
+        advance: impl FnOnce(Pin<&mut I>) -> Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        self.gate.poll(
+            |_| io::ErrorKind::PermissionDenied.into(),
+            || advance(Pin::new(&mut self.inner)),
+        )
+    }
+}
+
+impl<I: AsyncRead + Unpin> AsyncRead for LiveIo<'_, I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.poll_io(|io| io.poll_read(cx, buffer))
+    }
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for LiveIo<'_, I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_io(|io| io.poll_write(cx, bytes))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_io(|io| io.poll_flush(cx))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_io(|io| io.poll_shutdown(cx))
+    }
 }
 
 async fn paused_exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     pipes: Pipes<R, W>,
-    cancel: &Shutdown,
-    cutoff: Tick,
-    recheck: &impl Fn() -> Result<Tick, Failure>,
+    gate: &LivePoll<'_>,
 ) -> Result<(), Failure> {
     let Pipes {
         stdout,
         stdin,
         dispatch,
     } = pipes;
-    let captured = recheck()?;
-    before(cancel, cutoff)?;
+    let (cancel, cutoff) = (gate.cancel, gate.cutoff);
+    let captured = gate.sample()?;
     dispatch.arm_until(captured.into_std(), Some(cutoff.into_std()))?;
-    let mut peer = watch_pressure(cancel, cutoff, recheck, async {
-        Ok(bounded(cancel, cutoff, Qmp::handshake(stdout, stdin, cancel)).await?)
-    })
-    .await?;
-    watch_pressure(cancel, cutoff, recheck, confirm_dispatch(&dispatch)).await?;
+    let stdout = LiveIo {
+        gate,
+        inner: stdout,
+    };
+    let stdin = LiveIo { gate, inner: stdin };
+    let mut peer = gate
+        .watch(async { Ok(bounded(cancel, cutoff, Qmp::handshake(stdout, stdin, cancel)).await?) })
+        .await?;
+    gate.watch(confirm_dispatch(&dispatch)).await?;
 
-    let captured = recheck()?;
-    before(cancel, cutoff)?;
+    let captured = gate.sample()?;
     dispatch.arm_until(captured.into_std(), Some(cutoff.into_std()))?;
-    let status = watch_pressure(cancel, cutoff, recheck, async {
-        Ok(bounded(cancel, cutoff, peer.status(cancel)).await?)
-    })
-    .await?;
-    watch_pressure(cancel, cutoff, recheck, confirm_dispatch(&dispatch)).await?;
+    let status = gate
+        .watch(async { Ok(bounded(cancel, cutoff, peer.status(cancel)).await?) })
+        .await?;
+    gate.watch(confirm_dispatch(&dispatch)).await?;
     if status != crate::vm::qmp::RunStatus::Prelaunch {
         return Err(Failure::Qmp(ChannelError::Unexpected));
     }
     // A new observation must still admit the paused child after prelaunch.
-    recheck()?;
-    before(cancel, cutoff)
-}
-
-const PRESSURE_INTERVAL: Duration = Duration::from_millis(250);
-
-/// Keep watching the owner and reserves while the paused child is alive,
-/// including when the peer stalls. A new sample does not extend a write window.
-async fn watch_pressure<T>(
-    cancel: &Shutdown,
-    cutoff: Tick,
-    recheck: &impl Fn() -> Result<Tick, Failure>,
-    action: impl Future<Output = Result<T, Failure>>,
-) -> Result<T, Failure> {
-    before(cancel, cutoff)?;
-    tokio::pin!(action);
-    let deadline = tokio::time::sleep_until(cutoff);
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Failure::Cancelled),
-            _ = &mut deadline => return Err(Failure::Timeout),
-            // Completing an operation can release memory or send QMP.
-            // Sample due pressure before the action can change those conditions.
-            _ = tokio::time::sleep(PRESSURE_INTERVAL) => {
-                recheck()?;
-            }
-            result = &mut action => {
-                before(cancel, cutoff)?;
-                return result;
-            }
-        }
-    }
+    gate.sample()?;
+    Ok(())
 }
 
 async fn confirm_dispatch(dispatch: &DispatchGate) -> Result<(), Failure> {
@@ -381,37 +495,23 @@ async fn launch_paused<H: Host>(
     slot: &H::Slot,
     plan: &PausedPlan<'_>,
     opens: &H::Opens,
-    peak: Peak,
-    cancel: &Shutdown,
-    cutoff: Tick,
+    gate: &LivePoll<'_>,
 ) -> Result<(), Failure> {
-    let recheck = || sample(host, peak);
-    watch_pressure(cancel, cutoff, &recheck, observe(host.confirm_claim(slot))).await?;
-    recheck()?;
-    watch_pressure(
-        cancel,
-        cutoff,
-        &recheck,
-        observe(host.create_suspended(slot, plan, opens)),
-    )
-    .await?;
-    recheck()?;
-    let pipes = watch_pressure(cancel, cutoff, &recheck, observe(host.verify_child(slot))).await?;
-    recheck()?;
-    watch_pressure(cancel, cutoff, &recheck, observe(host.resume(slot))).await?;
-    paused_exchange(pipes, cancel, cutoff, &recheck).await?;
+    gate.watch(observe(host.confirm_claim(slot))).await?;
+    gate.sample()?;
+    gate.watch(observe(host.create_suspended(slot, plan, opens)))
+        .await?;
+    gate.sample()?;
+    let pipes = gate.watch(observe(host.verify_child(slot))).await?;
+    gate.sample()?;
+    gate.watch(observe(host.resume(slot))).await?;
+    paused_exchange(pipes, gate).await?;
 
-    watch_pressure(
-        cancel,
-        cutoff,
-        &recheck,
-        observe(host.verify_opens(slot, opens)),
-    )
-    .await?;
-    recheck()?;
-    watch_pressure(cancel, cutoff, &recheck, observe(host.verify_whpx(slot))).await?;
-    recheck()?;
-    before(cancel, cutoff)
+    gate.watch(observe(host.verify_opens(slot, opens))).await?;
+    gate.sample()?;
+    gate.watch(observe(host.verify_whpx(slot))).await?;
+    gate.sample()?;
+    Ok(())
 }
 
 fn sample(host: &impl Host, peak: Peak) -> Result<Tick, Failure> {
@@ -434,9 +534,9 @@ async fn run<H: Host>(
         live.check(peak, Tick::now())?;
         before(cancel, cutoff)?;
         let slot = host.claim(&live, peak)?;
-        Ok((opens, peak, slot))
+        Ok((opens, peak, slot, live.captured))
     })();
-    let (opens, peak, slot) = match admitted {
+    let (opens, peak, slot, captured) = match admitted {
         Ok(admission) => admission,
         Err(failure) => {
             return TrialResult {
@@ -451,16 +551,18 @@ async fn run<H: Host>(
         slot: Some(slot),
         stop_requested: false,
     };
-    let paused = launch_paused(
-        settlement.host,
-        settlement.slot.as_ref().expect("settlement owns a slot"),
-        plan,
-        &opens,
-        peak,
-        cancel,
-        cutoff,
-    )
-    .await;
+    let paused = {
+        let recheck = || sample(settlement.host, peak);
+        let gate = LivePoll::new(cancel, cutoff, &recheck, captured);
+        launch_paused(
+            settlement.host,
+            settlement.slot.as_ref().expect("settlement owns a slot"),
+            plan,
+            &opens,
+            &gate,
+        )
+        .await
+    };
     // The effect deadline and caller cancellation cannot suppress cleanup.
     let release = settlement.finish(Tick::now() + settlement_budget).await;
     TrialResult { paused, release }
