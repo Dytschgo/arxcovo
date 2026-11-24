@@ -6,7 +6,7 @@ mod model;
 pub mod paths;
 mod policy;
 pub mod public_egress;
-mod publish;
+pub(crate) mod publish;
 pub mod qemu_args;
 pub mod qemu_img;
 pub mod qmp;

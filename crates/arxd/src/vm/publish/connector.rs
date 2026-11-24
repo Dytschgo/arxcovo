@@ -1,7 +1,6 @@
 //! One supervised connector, tied to an immutable image and authenticated loopback origin.
 use std::{
-    fmt,
-    fs::{self, OpenOptions},
+    fmt, fs,
     io::{Read, Write},
     net::{Ipv4Addr, TcpListener},
     num::NonZeroU16,
@@ -26,13 +25,13 @@ use super::{
     Hostname, TunnelId,
     cloudflare::status_code,
     hex_id,
-    windows::{HeldPath, Process},
+    windows::{HeldPath, Process, read_secret},
 };
 use crate::vm::paths::{ArtifactPin, LocalPath};
 
 const MAX_IMAGE: u64 = 128 * 1024 * 1024;
 const MAX_CA: u64 = 8192;
-const MAX_CREDENTIAL: u64 = 2048;
+const MAX_CREDENTIAL: usize = 2048;
 const IO_TIMEOUT: Duration = Duration::from_millis(200);
 const TICK: Duration = Duration::from_millis(20);
 const GRACE: Duration = Duration::from_millis(180);
@@ -47,10 +46,15 @@ pub(in crate::vm) enum ConnectorError {
     Spawn,
     Crashed,
     Readiness,
+    /// A spawned process whose termination could not be confirmed. The
+    /// connector is handed back through the start's `unsettled` slot.
     CleanupPending,
+    /// A failed ingress-file write whose same-handle removal could not be
+    /// confirmed. No process was spawned.
+    ResidueUnremoved,
 }
 
-pub(in crate::vm) struct TunnelCredential(String);
+pub(in crate::vm) struct TunnelCredential(zeroize::Zeroizing<Vec<u8>>);
 
 impl fmt::Debug for TunnelCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -75,21 +79,9 @@ impl TunnelCredential {
         account: &str,
         tunnel: &TunnelId,
     ) -> Result<Self, ConnectorError> {
-        let held = HeldPath::open(path, false, true).map_err(|_| ConnectorError::Credential)?;
-        let mut value = String::new();
-        (&held.file)
-            .take(MAX_CREDENTIAL + 1)
-            .read_to_string(&mut value)
-            .map_err(|_| ConnectorError::Credential)?;
-        Self::parse(value, account, tunnel)
-    }
-
-    fn parse(value: String, account: &str, tunnel: &TunnelId) -> Result<Self, ConnectorError> {
-        if value.len() > MAX_CREDENTIAL as usize {
-            return Err(ConnectorError::Credential);
-        }
+        let value = read_secret(path, MAX_CREDENTIAL).map_err(|_| ConnectorError::Credential)?;
         let json: CredentialJson<'_> =
-            serde_json::from_str(&value).map_err(|_| ConnectorError::Credential)?;
+            serde_json::from_slice(&value).map_err(|_| ConnectorError::Credential)?;
         let secret = json.tunnel_secret.as_bytes();
         // The locally created credential contains the standard base64 encoding of 32 bytes.
         if !hex_id(account)
@@ -126,6 +118,7 @@ pub(in crate::vm) struct Plan<'a> {
 pub(in crate::vm) struct Connector {
     process: Process,
     ready_port: NonZeroU16,
+    origin: (NonZeroU16, Hostname, TlsConnector),
     _config: Config,
     _binary: HeldPath,
     _ca: HeldPath,
@@ -133,17 +126,39 @@ pub(in crate::vm) struct Connector {
 }
 
 impl Connector {
-    /// Retry a pre-ready process crash once, each time with a fresh port and origin
-    /// proof. A crash after this method returns is handled by B2 as a revoke.
+    /// Retry a pre-ready crash once, after proving the old Job empty.
+    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "exercised by the independent connector integration fixture"
+    )]
     pub(in crate::vm) async fn start(plan: &Plan<'_>) -> Result<Self, ConnectorError> {
-        let result = Self::start_once(plan).await;
-        if matches!(&result, Err(ConnectorError::Crashed)) {
-            return Self::start_once(plan).await;
+        use crate::service::Shutdown;
+        Self::start_cancellable(plan, &Shutdown::default(), &Shutdown::default(), &mut None).await
+    }
+
+    pub(in crate::vm) async fn start_cancellable(
+        plan: &Plan<'_>,
+        retired: &crate::service::Shutdown,
+        shutdown: &crate::service::Shutdown,
+        unsettled: &mut Option<Self>,
+    ) -> Result<Self, ConnectorError> {
+        let result = Self::start_once(plan, retired, shutdown, unsettled).await;
+        if matches!(&result, Err(ConnectorError::Crashed))
+            && !retired.is_cancelled()
+            && !shutdown.is_cancelled()
+        {
+            return Self::start_once(plan, retired, shutdown, unsettled).await;
         }
         result
     }
 
-    async fn start_once(plan: &Plan<'_>) -> Result<Self, ConnectorError> {
+    async fn start_once(
+        plan: &Plan<'_>,
+        retired: &crate::service::Shutdown,
+        shutdown: &crate::service::Shutdown,
+        unsettled: &mut Option<Self>,
+    ) -> Result<Self, ConnectorError> {
         let binary = HeldPath::open(plan.executable, false, true)
             .map_err(|_| ConnectorError::BinaryReceipt)?;
         if !plan
@@ -157,7 +172,10 @@ impl Connector {
             HeldPath::open(plan.private_root, true, true).map_err(|_| ConnectorError::Custody)?;
         let ca = HeldPath::open(plan.ca_path, false, true).map_err(|_| ConnectorError::Origin)?;
         let tls = origin_tls(plan, &ca)?;
-        probe_origin(plan, &tls).await?;
+        probe_origin(plan.origin_port, plan.origin_name, &tls).await?;
+        if retired.is_cancelled() || shutdown.is_cancelled() {
+            return Err(ConnectorError::Origin);
+        }
         let config = Config::create(plan, &root, &ca)?;
         let config_arg = config.path.to_str().ok_or(ConnectorError::Custody)?;
         let listener =
@@ -183,29 +201,37 @@ impl Connector {
                 "run",
             ],
             &root.path,
-            &plan.credential.0,
+            std::str::from_utf8(&plan.credential.0).map_err(|_| ConnectorError::Credential)?,
         )
         .map_err(|_| ConnectorError::Spawn)?;
         let mut connector = Self {
             process,
             ready_port,
+            origin: (plan.origin_port, plan.origin_name.clone(), tls),
             _config: config,
             _binary: binary,
             _ca: ca,
             _root: root,
         };
-        let outcome = connector.await_ready().await;
-        let outcome = match outcome {
-            Ok(()) => probe_origin(plan, &tls).await,
-            err @ Err(_) => err,
+        let outcome = tokio::select! {
+            biased;
+            _ = retired.cancelled() => Err(ConnectorError::Origin),
+            _ = shutdown.cancelled() => Err(ConnectorError::Origin),
+            result = async {
+                connector.await_ready().await?;
+                connector.origin_ready().await?;
+                if !connector.running() {
+                    return Err(ConnectorError::Crashed);
+                }
+                Ok(())
+            } => result,
         };
         if let Err(error) = outcome {
-            connector.stop().await?;
+            if let Err(uncertain) = connector.stop().await {
+                *unsettled = Some(connector);
+                return Err(uncertain);
+            }
             return Err(error);
-        }
-        if !connector.process.running() {
-            connector.stop().await?;
-            return Err(ConnectorError::Crashed);
         }
         Ok(connector)
     }
@@ -229,6 +255,15 @@ impl Connector {
         })
         .await;
         result.unwrap_or(Err(ConnectorError::Readiness))
+    }
+
+    pub(in crate::vm) fn running(&self) -> bool {
+        self.process.running()
+    }
+
+    pub(in crate::vm) async fn origin_ready(&self) -> Result<(), ConnectorError> {
+        let (port, name, tls) = &self.origin;
+        probe_origin(*port, name, tls).await
     }
 
     pub(in crate::vm) async fn ready(&self) -> bool {
@@ -320,11 +355,15 @@ fn origin_tls(plan: &Plan<'_>, ca: &HeldPath) -> Result<TlsConnector, ConnectorE
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-async fn probe_origin(plan: &Plan<'_>, tls: &TlsConnector) -> Result<(), ConnectorError> {
+async fn probe_origin(
+    port: NonZeroU16,
+    origin_name: &Hostname,
+    tls: &TlsConnector,
+) -> Result<(), ConnectorError> {
     let failure = ConnectorError::Origin;
-    let name = ServerName::try_from(plan.origin_name.as_str().to_owned()).map_err(|_| failure)?;
+    let name = ServerName::try_from(origin_name.as_str().to_owned()).map_err(|_| failure)?;
     timeout(IO_TIMEOUT, async {
-        let socket = TcpStream::connect((Ipv4Addr::LOCALHOST, plan.origin_port.get())).await?;
+        let socket = TcpStream::connect((Ipv4Addr::LOCALHOST, port.get())).await?;
         tls.connect(name, socket).await
     })
     .await
@@ -332,6 +371,21 @@ async fn probe_origin(plan: &Plan<'_>, tls: &TlsConnector) -> Result<(), Connect
     .map_err(|_| failure)?;
     Ok(())
 }
+
+/// Observes a failed config's path, just before its writer closes.
+#[cfg(test)]
+pub(in crate::vm) type FailedWriteProbe = Box<dyn FnOnce(&Path) + Send>;
+
+/// Runs with the path of a failed config while its writer is still open,
+/// before the same-handle disposition.
+#[cfg(test)]
+pub(in crate::vm) static FAILED_WRITE_PROBE: std::sync::Mutex<Option<FailedWriteProbe>> =
+    std::sync::Mutex::new(None);
+
+/// Fails the next config write after creation, for the cleanup witness.
+#[cfg(test)]
+pub(in crate::vm) static FAIL_CONFIG_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 struct Config {
     path: PathBuf,
@@ -349,24 +403,41 @@ impl Config {
             .join(&format!("ingress-{}.yml", hex::encode(nonce)))
             .map_err(|_| refusal)?;
         let path = PathBuf::from(local.as_str());
-        // All interpolated strings passed the DNS, UUID or Windows LocalPath grammar.
-        // Origin verification stays at its secure default; the config names no TLS bypass key.
-        let text = format!(
-            "tunnel: '{}'\nwarp-routing:\n  enabled: false\ningress:\n  - hostname: '{}'\n    service: 'https://127.0.0.1:{}'\n    originRequest:\n      originServerName: '{}'\n      caPool: '{}'\n  - service: http_status:404\n",
-            plan.tunnel.as_str(),
-            plan.hostname.as_str(),
+        let text = super::ingress(
+            plan.tunnel,
+            std::array::from_ref(plan.hostname),
             plan.origin_port,
-            plan.origin_name.as_str(),
+            plan.origin_name,
             ca,
         );
-        let mut output = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .map_err(|_| refusal)?;
-        let mut config = Self { path, held: None };
-        output.write_all(text.as_bytes()).map_err(|_| refusal)?;
+        // Owned by TokenUser with a protected DACL before any content exists.
+        let mut output = super::windows::create_private(&path).map_err(|_| refusal)?;
+        let written = output.write_all(text.as_bytes());
+        #[cfg(test)]
+        let written = if FAIL_CONFIG_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            Err(std::io::Error::other("injected config write failure"))
+        } else {
+            written
+        };
+        if written.is_err() {
+            #[cfg(test)]
+            if let Some(probe) = FAILED_WRITE_PROBE.lock().unwrap().take() {
+                probe(&path);
+            }
+            // Delete through the share-exclusive writer itself: no other handle
+            // can open the failed file meanwhile, so no reader can keep it. An
+            // unconfirmed removal is surfaced, never retried by path; the
+            // residue keeps its private creation-time descriptor and is never
+            // handed to a connector.
+            let removed = super::windows::delete_on_close(&output);
+            drop(output);
+            return Err(match removed {
+                Ok(()) => refusal,
+                Err(_) => ConnectorError::ResidueUnremoved,
+            });
+        }
         drop(output);
+        let mut config = Self { path, held: None };
         let held = HeldPath::open(&config.path, false, true).map_err(|_| refusal)?;
         let mut actual = Vec::new();
         (&held.file)

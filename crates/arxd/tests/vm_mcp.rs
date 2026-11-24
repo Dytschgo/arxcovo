@@ -386,6 +386,9 @@ async fn inspect_vm(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>
             "static_vm_create",
             "static_vm_get",
             "static_vm_list",
+            "publish_site",
+            "unpublish_site",
+            "publish_status",
         ]
     );
     let response = client

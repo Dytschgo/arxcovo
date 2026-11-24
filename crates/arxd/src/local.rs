@@ -339,10 +339,19 @@ pub(crate) async fn serve_vm_profile_within(
     };
     // The barrier takes the gates, so any admission already past the fence
     // is registered before workers drain and recovery begins.
-    drained = drained
-        && supervisor.close_within(bound).await.is_ok()
-        && supervisor.drain_workers(bound).await.is_ok()
-        && supervisor.recover(bound).await.is_ok();
+    // Custody recovery assumes only quiescence: every worker and stop joined
+    // and local ingress confirmed down. A publication that is quiescent but
+    // not settled, such as DNS cleanup still pending, does not bar it, and
+    // still makes the drain unconfirmed. A worker or local custody timeout
+    // does bar it.
+    let quiescent = drained && supervisor.close_within(bound).await.is_ok();
+    let settlement = if quiescent {
+        supervisor.drain_workers(bound).await.ok()
+    } else {
+        None
+    };
+    let recovered = settlement.is_some() && supervisor.recover(bound).await.is_ok();
+    drained = recovered && settlement == Some(crate::vm::runtime::publication::Drained::Clean);
     if !drained {
         // The originating failure stays below the fixed drain category.
         return Err(match origin {
