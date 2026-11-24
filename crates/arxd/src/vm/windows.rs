@@ -1644,6 +1644,8 @@ struct GateHooks {
     clock: std::sync::Mutex<Option<std::time::Instant>>,
     /// Called with `true` before and `false` after each tracked write.
     checkpoint: std::sync::Mutex<Option<Checkpoint>>,
+    /// Signals the worker's attempt to acquire the dispatch-state lock.
+    before_write_lock: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 #[cfg(test)]
@@ -1690,15 +1692,15 @@ impl DispatchGate {
         captured: std::time::Instant,
         cutoff: Option<std::time::Instant>,
     ) -> Result<(), NativeRefusal> {
-        fresh_observation(captured, self.now(), NativeRefusal::ReservesUnverified)?;
         let deadline = captured + FRESHNESS;
         let deadline = cutoff.map_or(deadline, |cutoff| deadline.min(cutoff));
-        let mut armed = false;
-        self.state.send_modify(|state| {
-            if *state == Dispatch::Idle {
-                *state = Dispatch::Armed(deadline);
-                armed = true;
+        let armed = self.state.send_if_modified(|state| {
+            let now = self.now();
+            if *state != Dispatch::Idle || now < captured || now >= deadline {
+                return false;
             }
+            *state = Dispatch::Armed(deadline);
+            true
         });
         if armed {
             Ok(())
@@ -1707,14 +1709,18 @@ impl DispatchGate {
         }
     }
 
-    /// Worker: whether this write may start. Untracked when idle.
+    /// Worker: take write permission from the locked state. A timestamp
+    /// observed while waiting for the lock cannot authorize a pipe write.
     fn begin_write(&self) -> bool {
-        let now = self.now();
+        #[cfg(test)]
+        if let Some(signal) = self.test.before_write_lock.lock().unwrap().take() {
+            let _ = signal.send(());
+        }
         let mut start = false;
         self.state.send_modify(|state| match *state {
             Dispatch::Idle => start = true,
             Dispatch::Armed(deadline) | Dispatch::WrittenInTime(deadline) => {
-                start = now < deadline;
+                start = self.now() < deadline;
                 *state = if start {
                     Dispatch::Writing(deadline)
                 } else {
@@ -1728,12 +1734,43 @@ impl DispatchGate {
         start
     }
 
+    /// Worker: recheck at the pipe handoff, including after a short write
+    /// or interruption. Keep the state lock out of the blocking pipe call.
+    fn write_pipe(
+        &self,
+        pipe: &mut impl std::io::Write,
+        mut bytes: &[u8],
+        cancel: &Shutdown,
+    ) -> io::Result<bool> {
+        while !bytes.is_empty() {
+            let current = self.state.borrow();
+            if cancel.is_cancelled() {
+                return Ok(false);
+            }
+            let fresh = match *current {
+                Dispatch::Idle => true,
+                Dispatch::Writing(deadline) => self.now() < deadline,
+                _ => false,
+            };
+            drop(current);
+            if !fresh {
+                return Ok(false);
+            }
+            match pipe.write(bytes) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => bytes = &bytes[written..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
+    }
+
     /// Worker: record whether the write it started completed in time.
     fn end_write(&self, completed: bool) {
-        let now = self.now();
         self.state.send_modify(|state| {
             if let Dispatch::Writing(deadline) = *state {
-                *state = if completed && now < deadline {
+                *state = if completed && self.now() < deadline {
                     Dispatch::WrittenInTime(deadline)
                 } else {
                     Dispatch::Ambiguous
@@ -1800,7 +1837,6 @@ fn start_stdio(
     stdio: Stdio,
     gate: std::sync::Arc<DispatchGate>,
 ) -> io::Result<(tokio::io::DuplexStream, tokio::io::DuplexStream, WorkerSet)> {
-    use std::io::Write;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     let (reader, mut output) = duplex(8192);
@@ -1855,16 +1891,20 @@ fn start_stdio(
             }
             #[cfg(test)]
             gate.checkpoint(true);
-            let written = pipe.write_all(&bytes[..count]);
+            let written = gate.write_pipe(&mut pipe, &bytes[..count], &cancel);
             #[cfg(test)]
             gate.checkpoint(false);
             // The worker, not the QMP reply, records whether it was in time.
-            gate.end_write(written.is_ok());
-            if let Err(error) = written {
-                if cancel.is_cancelled() || error.kind() == io::ErrorKind::BrokenPipe {
+            gate.end_write(matches!(written, Ok(true)));
+            match written {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error)
+                    if cancel.is_cancelled() || error.kind() == io::ErrorKind::BrokenPipe =>
+                {
                     break;
                 }
-                return Err(error);
+                Err(error) => return Err(error),
             }
             // A late completion is ambiguous delivery: stop and close stdin.
             if gate.tripped() {
@@ -3471,6 +3511,130 @@ mod tests {
         set_clock(&gate, cutoff);
         assert!(!gate.begin_write());
         assert_eq!(gate.current(), Dispatch::Expired);
+    }
+
+    #[test]
+    fn a_worker_waiting_for_dispatch_rechecks_the_deadline_after_the_lock() {
+        use std::sync::{Arc, mpsc};
+
+        let now = std::time::Instant::now();
+        let short_window = Duration::from_millis(10);
+        for (captured, deadline, decision, allowed) in [
+            (
+                now - FRESHNESS + short_window,
+                now + FRESHNESS,
+                now + short_window - Duration::from_millis(1),
+                true,
+            ),
+            (
+                now - FRESHNESS + short_window,
+                now + FRESHNESS,
+                now + short_window,
+                false,
+            ),
+            (
+                now,
+                now + Duration::from_millis(250),
+                now + Duration::from_millis(250),
+                false,
+            ),
+            (
+                now,
+                now + Duration::from_millis(20),
+                now + Duration::from_millis(21),
+                false,
+            ),
+        ] {
+            let gate = Arc::new(DispatchGate::default());
+            set_clock(&gate, now);
+            gate.arm_until(captured, Some(deadline)).unwrap();
+            let state = gate.state.subscribe();
+            let held = state.borrow();
+            let (started, waiting) = mpsc::channel();
+            *gate.test.before_write_lock.lock().unwrap() = Some(started);
+            let worker_gate = gate.clone();
+            let worker = std::thread::spawn(move || worker_gate.begin_write());
+            let attempted = waiting.recv_timeout(BOUND);
+            set_clock(&gate, decision);
+            drop(held);
+            let permitted = worker.join().unwrap();
+            attempted.unwrap();
+            assert_eq!(permitted, allowed);
+            assert_eq!(
+                gate.current(),
+                if allowed {
+                    Dispatch::Writing(deadline.min(captured + FRESHNESS))
+                } else {
+                    Dispatch::Expired
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worker_rechecks_at_the_pipe_after_taking_write_permission() {
+        let now = std::time::Instant::now();
+        let mut io = gated(now);
+        let (reached, parked) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *io.gate.test.checkpoint.lock().unwrap() = Some(Box::new(move |before_write| {
+            if before_write {
+                reached.send(()).unwrap();
+                released.recv_timeout(BOUND).unwrap();
+            }
+        }));
+        io.gate.arm(now).unwrap();
+        io.write.write_all(CONT).await.unwrap();
+        parked.recv_timeout(BOUND).unwrap();
+        assert!(matches!(io.gate.current(), Dispatch::Writing(_)));
+        set_clock(&io.gate, now + FRESHNESS);
+        release.send(()).unwrap();
+        state_becomes(&io.gate, Dispatch::Ambiguous).await;
+        input_worker_exits(&io.workers).await;
+        assert_eq!(queued(&io.child.input), 0);
+        io.workers
+            .join(tokio::time::Instant::now() + BOUND)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn a_short_pipe_write_cannot_authorize_its_remaining_bytes_after_expiry() {
+        struct ShortWrite<'a> {
+            gate: &'a DispatchGate,
+            deadline: std::time::Instant,
+            written: Vec<u8>,
+        }
+
+        impl std::io::Write for ShortWrite<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.written.push(bytes[0]);
+                set_clock(self.gate, self.deadline);
+                Ok(1)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let now = std::time::Instant::now();
+        let deadline = now + FRESHNESS;
+        let gate = DispatchGate::default();
+        set_clock(&gate, now);
+        gate.arm(now).unwrap();
+        assert!(gate.begin_write());
+        let mut pipe = ShortWrite {
+            gate: &gate,
+            deadline,
+            written: Vec::new(),
+        };
+        assert!(
+            !gate
+                .write_pipe(&mut pipe, CONT, &Shutdown::default())
+                .unwrap()
+        );
+        assert_eq!(pipe.written, CONT[..1]);
     }
 
     #[tokio::test]

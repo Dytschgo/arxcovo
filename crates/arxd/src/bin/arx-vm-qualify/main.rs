@@ -1,4 +1,4 @@
-//! Owner-local Windows VM qualification runner (M4 PR 7b1).
+//! Owner-local Windows VM qualification runner.
 //!
 //! This binary crate owns the private `TrialAuthority`; the arxd library and
 //! the daemon cannot name it, and it never converts into `LaunchAuthority`.
