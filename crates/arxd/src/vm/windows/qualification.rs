@@ -7,6 +7,7 @@
 //! Native observations here are **unverified on real hardware**.
 
 mod capacity;
+mod paused;
 mod schema;
 mod sink;
 
@@ -364,6 +365,29 @@ fn take<T>(origin: Instant, run: impl FnOnce() -> Result<T, NativeRefusal>) -> T
     take_held(origin, || run().map(|result| (result, ()))).0
 }
 
+/// Collect capacity for the stock runner. The two callbacks are the
+/// read-only measurement and the effectful Job probe. Keep the refusal
+/// between them so a successful measurement cannot authorize a Job.
+#[doc(hidden)]
+pub fn stock_capacity<H>(
+    origin: Instant,
+    measure: impl FnOnce() -> Result<(Limits, H), NativeRefusal>,
+    probe_job: impl FnOnce() -> Result<(), NativeRefusal>,
+) -> (Taken<Limits>, Option<H>) {
+    take_held(origin, || {
+        let capacity = measure()?;
+        stock_open_contract()?;
+        probe_job()?;
+        Ok(capacity)
+    })
+}
+
+fn stock_open_contract() -> Result<(), NativeRefusal> {
+    // The stock receipt authenticates inventory. It supplies no evidence
+    // of what the loader and consumers of the held child actually open.
+    Err(NativeRefusal::DistributionUnverified)
+}
+
 /// Inspect only the explicitly enrolled roots, the current token and console,
 /// aggregate counters and the exact stock payload. Behavioral trials are
 /// later stages with their own collectors.
@@ -463,32 +487,35 @@ fn preflight_with(
         })
     });
     let (distribution, bundle_pins) = take_held(origin, || collect_distribution(&bundle));
-    let (limits, capacity_handles) = take_held(origin, || {
-        let reason = NativeRefusal::DiskCeilingUnverified;
-        let (vhd, facts) = capacity::fixed_vhd(names, &outer_volume, &backing_pin)?;
-        let device = capacity::volume_extent(&trial_volume, facts.disk)?;
-        let sample = capacity::CapacitySample {
-            provider_subtype: facts.provider_subtype,
-            vhd_virtual: facts.virtual_size,
-            vhd_physical: facts.physical_size,
-            sector: facts.sector,
-            extent_start: device.extent_start,
-            extent_length: device.extent_length,
-            inner: capacity::held_free(&trial_pin.leaf)?,
-            outer: capacity::held_free(&outer_volume.root)?,
-            backing_length: backing_pin.leaf.metadata().map_err(|_| reason)?.len(),
-            backing_allocated: backing_pin.allocated,
-        };
-        let limits = capacity::check_capacity(&sample)?;
-        empty_job()?;
-        // A drive letter rebound while the observation ran closes it.
-        if !capacity::still_bound(names, &trial_volume)
-            || !capacity::still_bound(names, &outer_volume)
-        {
-            return Err(reason);
-        }
-        Ok((limits, (vhd, device)))
-    });
+    let (limits, capacity_handles) = stock_capacity(
+        origin,
+        || {
+            let reason = NativeRefusal::DiskCeilingUnverified;
+            let (vhd, facts) = capacity::fixed_vhd(names, &outer_volume, &backing_pin)?;
+            let device = capacity::volume_extent(&trial_volume, facts.disk)?;
+            let sample = capacity::CapacitySample {
+                provider_subtype: facts.provider_subtype,
+                vhd_virtual: facts.virtual_size,
+                vhd_physical: facts.physical_size,
+                sector: facts.sector,
+                extent_start: device.extent_start,
+                extent_length: device.extent_length,
+                inner: capacity::held_free(&trial_pin.leaf)?,
+                outer: capacity::held_free(&outer_volume.root)?,
+                backing_length: backing_pin.leaf.metadata().map_err(|_| reason)?.len(),
+                backing_allocated: backing_pin.allocated,
+            };
+            let limits = capacity::check_capacity(&sample)?;
+            // A drive letter rebound while the observation ran closes it.
+            if !capacity::still_bound(names, &trial_volume)
+                || !capacity::still_bound(names, &outer_volume)
+            {
+                return Err(reason);
+            }
+            Ok((limits, (vhd, device)))
+        },
+        empty_job,
+    );
     let activity = take(origin, || {
         let console_idle = current_console_idle(&token)?;
         let (active_cpus, available_ram_bytes) = host_resources()?;
@@ -944,7 +971,7 @@ fn collect_distribution(
 }
 
 fn inspect_distribution(root: &File) -> Result<(Distribution, HeldTree), NativeRefusal> {
-    use crate::vm::public_egress::{STOCK_QEMU_1113, STOCK_RECEIPT_1113_SHA256};
+    use crate::vm::public_egress::STOCK_RECEIPT_1113_SHA256;
 
     let reason = NativeRefusal::DistributionUnverified;
     let mut dirs = BTreeMap::new();
@@ -962,11 +989,38 @@ fn inspect_distribution(root: &File) -> Result<(Distribution, HeldTree), NativeR
         return Err(reason);
     }
 
-    let payload = parse_manifest(&manifest_bytes, PAYLOAD_ENTRIES).ok_or(reason)?;
+    let (payload_bytes, tree) = inspect_payload(
+        root,
+        &manifest_bytes,
+        PAYLOAD_ENTRIES,
+        (vec![receipt, manifest], dirs),
+    )?;
+    Ok((
+        Distribution {
+            receipt: receipt_hash,
+            receipt_bytes: RECEIPT_BYTES as u64,
+            manifest: manifest_hash,
+            manifest_bytes: MANIFEST_BYTES as u64,
+            payload_files: PAYLOAD_ENTRIES as u16,
+            payload_bytes,
+        },
+        tree,
+    ))
+}
+
+fn inspect_payload(
+    root: &File,
+    manifest_bytes: &[u8],
+    count: usize,
+    (mut held, mut dirs): HeldTree,
+) -> Result<(u64, HeldTree), NativeRefusal> {
+    use crate::vm::public_egress::STOCK_QEMU_1113;
+
+    let reason = NativeRefusal::DistributionUnverified;
+    let payload = parse_manifest(manifest_bytes, count).ok_or(reason)?;
     let mut allowed_files =
         BTreeSet::from(["receipt.txt".to_owned(), "manifest.sha256".to_owned()]);
     let mut allowed_dirs = BTreeSet::new();
-    let mut held = vec![receipt, manifest];
     let mut payload_bytes = 0u64;
     for (name, sha256) in payload {
         let file = held_file(root, &mut dirs, name).map_err(|_| reason)?;
@@ -996,17 +1050,7 @@ fn inspect_distribution(root: &File) -> Result<(Distribution, HeldTree), NativeR
         held.push(file);
     }
     verify_inventory(root, &dirs, allowed_files, allowed_dirs)?;
-    Ok((
-        Distribution {
-            receipt: receipt_hash,
-            receipt_bytes: RECEIPT_BYTES as u64,
-            manifest: manifest_hash,
-            manifest_bytes: MANIFEST_BYTES as u64,
-            payload_files: PAYLOAD_ENTRIES as u16,
-            payload_bytes,
-        },
-        (held, dirs),
-    ))
+    Ok((payload_bytes, (held, dirs)))
 }
 
 /// Open every directory of `path` (a `/`-separated relative name) relative
@@ -1144,6 +1188,15 @@ fn listing(dir: &File) -> io::Result<Vec<(String, u32)>> {
     }
 }
 
+fn valid_manifest_name(name: &str) -> bool {
+    // Treat commas like underscores for spelling validation only. The original
+    // name is used for uniqueness, held relative opens and inventory checks.
+    !name.is_empty()
+        && name.len() <= 180
+        && !name.contains(['\\', ':'])
+        && LocalPath::parse(&format!("D:\\{}", name.replace(',', "_"))).is_ok()
+}
+
 fn parse_manifest(bytes: &[u8], count: usize) -> Option<Vec<(&str, [u8; 32])>> {
     if bytes.len() > MAX_MANIFEST_BYTES || count > PAYLOAD_ENTRIES {
         return None;
@@ -1154,9 +1207,7 @@ fn parse_manifest(bytes: &[u8], count: usize) -> Option<Vec<(&str, [u8; 32])>> {
     for line in raw.lines() {
         let (digest, name) = line.split_once("  ")?;
         if entries.len() == count
-            || name.len() > 180
-            || name.contains(['\\', ':'])
-            || LocalPath::parse(&format!("D:\\{name}")).is_err()
+            || !valid_manifest_name(name)
             || !seen.insert(name.to_ascii_lowercase())
         {
             return None;
@@ -1186,23 +1237,33 @@ mod tests {
     #[test]
     fn manifest_is_bounded_and_refuses_aliases_and_duplicate_names() {
         let digest = "a".repeat(64);
-        let valid = format!("{digest}  tools/a.exe\r\n{digest}  z.dll\r\n");
+        let valid = format!("{digest}  tools/a,b.exe\r\n{digest}  z.dll\r\n");
         assert_eq!(
             parse_manifest(valid.as_bytes(), 2).unwrap()[0].0,
-            "tools/a.exe"
+            "tools/a,b.exe"
         );
         for name in [
-            "../a.exe",
-            "C:/a.exe",
-            "/a.exe",
-            r"a\z.dll",
-            "tools/A.exe",
+            "",
+            "tools/../a,b.exe",
+            "tools/./a,b.exe",
+            "tools//a,b.exe",
+            "tools/a,b.exe/",
+            "C:/a,b.exe",
+            "/a,b.exe",
+            r"a\z,b.dll",
+            "tools/A,B.exe",
+            "tools/NUL.a,b",
+            "COM1/tools/a,b.exe",
+            "tools/a,b.exe.",
+            "tools/a,b.exe ",
             "receipt.txt",
-            "z.dll:ads",
+            "z,b.dll:ads",
         ] {
-            let bad = format!("{digest}  tools/a.exe\n{digest}  {name}\n");
-            assert!(parse_manifest(bad.as_bytes(), 2).is_none());
+            let bad = format!("{digest}  tools/a,b.exe\n{digest}  {name}\n");
+            assert!(parse_manifest(bad.as_bytes(), 2).is_none(), "{name:?}");
         }
+        let too_long = format!("{digest}  {},\n", "a".repeat(180));
+        assert!(parse_manifest(too_long.as_bytes(), 1).is_none());
         assert!(parse_manifest(valid.as_bytes(), 1).is_none());
         assert!(parse_manifest(&[b'a'; MAX_MANIFEST_BYTES + 1], 2).is_none());
     }
@@ -1557,6 +1618,47 @@ mod tests {
             );
             assert_eq!(std::fs::read_dir(&evidence).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn distribution_verifies_manifest_payload_with_commas() {
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        std::fs::create_dir(root.path().join("share")).unwrap();
+        let payload: [(&str, &[u8]); 2] = [
+            ("share/QEMU,cgthree.bin", b"fixture cgthree"),
+            ("share/QEMU,tcx.bin", b"fixture tcx"),
+        ];
+        let mut manifest_bytes = String::new();
+        for (name, bytes) in payload {
+            std::fs::write(root.path().join(name), bytes).unwrap();
+            let digest = hex::encode(Sha256::digest(bytes));
+            manifest_bytes.push_str(&format!("{digest}  {name}\n"));
+        }
+        std::fs::write(root.path().join("RECEIPT.txt"), b"fixture receipt").unwrap();
+        std::fs::write(root.path().join("MANIFEST.sha256"), manifest_bytes).unwrap();
+
+        let held_root = open_directory(root.path().to_str().unwrap()).unwrap();
+        let mut dirs = BTreeMap::new();
+        let receipt = held_file(&held_root, &mut dirs, "RECEIPT.txt").unwrap();
+        let manifest = held_file(&held_root, &mut dirs, "MANIFEST.sha256").unwrap();
+        let manifest_bytes = read_bounded(&manifest, MAX_MANIFEST_BYTES as u64).unwrap();
+        let (bytes, (files, dirs)) = inspect_payload(
+            &held_root,
+            &manifest_bytes,
+            payload.len(),
+            (vec![receipt, manifest], dirs),
+        )
+        .unwrap();
+        assert_eq!(
+            bytes,
+            payload
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum::<u64>()
+        );
+        assert_eq!(files.len(), 2 + payload.len());
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs.contains_key("share"));
     }
 
     #[test]

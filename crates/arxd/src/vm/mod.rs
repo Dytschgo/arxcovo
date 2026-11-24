@@ -10,6 +10,7 @@ mod policy;
 pub mod public_egress;
 pub(crate) mod publish;
 pub mod qemu_args;
+pub mod qemu_distribution;
 pub mod qemu_img;
 pub mod qmp;
 pub(crate) mod reaper;

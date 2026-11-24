@@ -1,7 +1,7 @@
 //! Native glue: project the held, read-only preflight into the closed graph
-//! and publish only an incomplete diagnostic. Every collector after the
-//! baseline is unimplemented in this contract version, and the native
-//! disposable-store proof type is uninhabited, so no effect can dispatch.
+//! and publish only an incomplete diagnostic. Stock QEMU has no reviewed
+//! loader and consumer-open witness. Refuse before taking a disposable slot
+//! or starting any native effect.
 //!
 //! Native observations are **unverified on real hardware**.
 
@@ -266,7 +266,10 @@ impl<S: Source<Store = NoNativeStore>> Collectors<S> for NativeCollectors {
 
     fn store(&mut self) -> (Collected, Option<NoNativeStore>) {
         (
-            Collected::at(self.now_ms(), StageResult::Unimplemented),
+            Collected::at(
+                self.now_ms(),
+                StageResult::Failed(Diagnostic::DistributionUnverified),
+            ),
             None,
         )
     }

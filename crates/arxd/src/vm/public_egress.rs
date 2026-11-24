@@ -44,7 +44,7 @@ pub const STOCK_QEMU_1113: ArtifactPin = ArtifactPin {
 pub const STOCK_RECEIPT_1113_SHA256: [u8; 32] =
     hex32("e0e33d3fb433c467f5f530bcb8cc8ce41bb8c3b10133bd54718915b7357b852e");
 
-const fn hex32(text: &str) -> [u8; 32] {
+pub(super) const fn hex32(text: &str) -> [u8; 32] {
     const fn nibble(c: u8) -> u8 {
         match c {
             b'0'..=b'9' => c - b'0',
