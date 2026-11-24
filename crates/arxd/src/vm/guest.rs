@@ -386,6 +386,7 @@ impl ComposeChannel {
             | ComposeOperationState { id, .. }
             | ComposeProjectStatus { id, .. }
             | ComposeLogPage { id, .. }
+            | ComposeRoutesInstalled { id, .. }
             | ComposeSecretAccepted { id, .. }
             | ComposeRejected { id, .. } => *id,
             ComposeHelloAck { .. } => return Err(ChannelError::Unexpected),

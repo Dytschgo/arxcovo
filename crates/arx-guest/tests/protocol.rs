@@ -700,14 +700,29 @@ mod compose_session {
         fn pause(&mut self, _: Duration) {}
     }
 
-    struct NoStore;
+    #[derive(Default)]
+    struct NoStore {
+        checkpoint: Option<Vec<u8>>,
+        installs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
 
     impl ComposeStore for NoStore {
         fn load_state(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
-            Ok(None)
+            Ok(self.checkpoint.clone())
         }
 
-        fn save_state(&mut self, _: &[u8]) -> Result<(), StoreError> {
+        fn install_routes(
+            &mut self,
+            table: &arx_guest::compose::routing::RoutingTable,
+        ) -> Result<(), StoreError> {
+            assert_eq!(table.routes()[0].service, "api");
+            self.installs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn save_state(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+            self.checkpoint = Some(bytes.to_vec());
             Ok(())
         }
 
@@ -787,7 +802,12 @@ mod compose_session {
     }
 
     fn service() -> ComposeService {
-        ComposeService::new(Box::new(NoEngine), Box::new(NoStore), Box::new(ZeroClock)).unwrap()
+        ComposeService::new(
+            Box::new(NoEngine),
+            Box::new(NoStore::default()),
+            Box::new(ZeroClock),
+        )
+        .unwrap()
     }
 
     fn frames(payloads: &[&[u8]]) -> Vec<u8> {
@@ -798,6 +818,99 @@ mod compose_session {
         let mut output = Vec::new();
         let result = serve_with_compose(input, &mut output, &mut PanicOnScript, Some(&service()));
         (result, output)
+    }
+
+    #[test]
+    fn route_install_checks_boot_project_and_closed_route_fields() {
+        let mut request = serde_json::json!({"type":"ComposeInstallRoutes","id":4,"generation":6,
+        "readiness_host":"arx-boot.invalid","zone":"example.invalid","routes":[{
+            "hostname":"site.example.invalid","project_id":"app","service":"web",
+            "project_slot":0,"service_index":0,"route_slot":0
+        }]});
+        for (generation, code) in [
+            (6, RejectCode::GenerationMismatch),
+            (7, RejectCode::UnknownProject),
+        ] {
+            request["generation"] = generation.into();
+            let (result, out) = compose(&frames(&[
+                COMPOSE_HELLO,
+                &serde_json::to_vec(&request).unwrap(),
+            ]));
+            result.unwrap();
+            let mut frames = out.as_slice();
+            assert!(matches!(
+                read_frame::<ComposeResponse>(&mut frames),
+                Ok(Some(ComposeResponse::ComposeHelloAck { .. }))
+            ));
+            assert!(
+                matches!(read_frame::<ComposeResponse>(&mut frames),Ok(Some(ComposeResponse::ComposeRejected{id:4,code:actual,..})) if code == actual)
+            );
+        }
+        request["routes"][0]["port"] = 1234.into();
+        assert!(
+            compose(&frames(&[
+                COMPOSE_HELLO,
+                &serde_json::to_vec(&request).unwrap()
+            ]))
+            .0
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn route_install_reaches_store_only_for_the_committed_service_slot() {
+        use serde_json::json;
+        let checkpoint = json!({"version":2,"projects":{"app":{
+            "slot":0,"desired":"started","committed":{"revision":1,"digest":"a".repeat(64),
+            "manifest":{"schema":1,"project_id":"app","volumes":[],"secrets":[],
+            "services":[{"name":"api","image":format!("example.invalid/app@sha256:{}","e".repeat(64)),
+             "platform":"linux/amd64","uid":1000,"gid":1000,"http_port":8080,"health_path":"/health",
+             "read_only_rootfs":true,"environment":[],"mounts":[],"secrets":[],
+             "limits":{"cpu_millis":500,"memory_mib":256,"pids":32}}]}},
+             "previous":null,"pending":null,"last_rendered":1,"recovery_required":false,"observed":[]}},
+             "volumes":{},"operations":[],"tombstones":[],"secret_bindings":{},"pending_epochs":{},"log":[],"next_log_seq":1});
+        let store = NoStore {
+            checkpoint: Some(serde_json::to_vec(&checkpoint).unwrap()),
+            ..Default::default()
+        };
+        let installs = store.installs.clone();
+        let svc =
+            ComposeService::new(Box::new(NoEngine), Box::new(store), Box::new(ZeroClock)).unwrap();
+        let mut request = json!({"type":"ComposeInstallRoutes","id":9,"generation":7,
+            "readiness_host":"arx-boot.invalid","zone":"example.invalid","routes":[{
+            "hostname":"api.example.invalid","project_id":"app","service":"web",
+            "project_slot":0,"service_index":0,"route_slot":0}]});
+        for (service, expected) in [("web", false), ("api", true)] {
+            request["routes"][0]["service"] = service.into();
+            let bytes = frames(&[COMPOSE_HELLO, &serde_json::to_vec(&request).unwrap()]);
+            let mut out = Vec::new();
+            serve_with_compose(bytes.as_slice(), &mut out, &mut PanicOnScript, Some(&svc)).unwrap();
+            let mut frames = out.as_slice();
+            let _ = read_frame::<ComposeResponse>(&mut frames).unwrap();
+            let ack = read_frame::<ComposeResponse>(&mut frames).unwrap().unwrap();
+            if expected {
+                assert_eq!(
+                    ack,
+                    ComposeResponse::ComposeRoutesInstalled {
+                        id: 9,
+                        generation: 7
+                    }
+                );
+            } else {
+                assert!(matches!(
+                    ack,
+                    ComposeResponse::ComposeRejected {
+                        id: 9,
+                        code: RejectCode::ProjectMismatch,
+                        ..
+                    }
+                ));
+            }
+            assert_eq!(
+                installs.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(expected)
+            );
+        }
     }
 
     fn hello_with(edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {

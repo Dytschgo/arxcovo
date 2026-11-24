@@ -428,31 +428,63 @@ pub(crate) mod publication {
     };
     use crate::{
         service::Shutdown,
-        store::vm::publish::{Intent, Phase, Update},
+        store::vm::publish::{HostIntent, HostState, Intent, Phase, Update},
         vm::{
             Clock, FailureReason as Failure, Id, OperationRef, Refusal, VmController,
             paths::{ArtifactPin, LocalPath},
             publish::{
-                Hostname, TunnelId,
+                Hostname, MAX_HOSTNAMES, RouteSlot, TunnelId,
                 cloudflare::{
                     DnsApi, DnsError, Reconciled, RecordId, Removal, Route, SendAuthority, Sent,
                     Submission, arbitrate,
                 },
-                hex_id,
+                hex_id, validate_hostname_set,
             },
             static_web::{ORIGIN_PORT_FIRST, ORIGIN_PORT_LAST, StaticName, StaticOriginIdentity},
         },
     };
     use std::sync::Arc;
 
+    /// One enrolled public hostname bound to a fixed Compose project/service/route slot.
+    #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct RouteBinding {
+        #[serde(deserialize_with = "single_hostname")]
+        pub(crate) hostname: Hostname,
+        pub(crate) project_id: String,
+        pub(crate) service: String,
+        pub(crate) project_slot: u8,
+        pub(crate) service_index: u8,
+        pub(crate) route_slot: u8,
+    }
+
+    impl RouteBinding {
+        fn slot(&self) -> RouteSlot {
+            RouteSlot {
+                project_id: self.project_id.clone(),
+                service: self.service.clone(),
+                project_slot: self.project_slot,
+                service_index: self.service_index,
+                route_slot: self.route_slot,
+            }
+        }
+    }
+
     /// All values come from the owner-private foreground profile.
+    #[cfg_attr(test, derive(Clone))]
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     pub(crate) struct Profile {
-        /// Validated once at deserialization and carried typed into the
-        /// intent and connector. ADR 0064 extends this bounded list.
+        /// Sorted, unique list of 1..=8 exact hostnames in the same enrolled
+        /// zone (ADR 0064 §4).
         #[serde(deserialize_with = "hostnames")]
-        hostnames: [Hostname; 1],
+        hostnames: Vec<Hostname>,
+        /// Optional explicit enrolled DNS zone name (e.g. `example.invalid`).
+        #[serde(default, deserialize_with = "opt_hostname")]
+        zone_name: Option<Hostname>,
+        /// Optional fixed project/service/route slots matching `hostnames` 1-to-1.
+        #[serde(default)]
+        routes: Vec<RouteBinding>,
         static_name: String,
         host_id: String,
         tunnel_id: String,
@@ -466,11 +498,43 @@ pub(crate) mod publication {
         connector_sha256: String,
     }
 
-    fn hostnames<'de, D: serde::Deserializer<'de>>(input: D) -> Result<[Hostname; 1], D::Error> {
-        let [name] = <[String; 1]>::deserialize(input)?;
-        Hostname::parse(&name)
-            .map(|name| [name])
-            .map_err(|_| serde::de::Error::custom("invalid publication hostname"))
+    fn single_hostname<'de, D: serde::Deserializer<'de>>(input: D) -> Result<Hostname, D::Error> {
+        let name = String::deserialize(input)?;
+        Hostname::parse(&name).map_err(|_| serde::de::Error::custom("invalid publication hostname"))
+    }
+
+    fn opt_hostname<'de, D: serde::Deserializer<'de>>(
+        input: D,
+    ) -> Result<Option<Hostname>, D::Error> {
+        let value = Option::<String>::deserialize(input)?;
+        value
+            .map(|name| {
+                Hostname::parse(&name)
+                    .map_err(|_| serde::de::Error::custom("invalid publication zone name"))
+            })
+            .transpose()
+    }
+
+    fn hostnames<'de, D: serde::Deserializer<'de>>(input: D) -> Result<Vec<Hostname>, D::Error> {
+        let raw = Vec::<String>::deserialize(input)?;
+        if raw.is_empty() || raw.len() > MAX_HOSTNAMES {
+            return Err(serde::de::Error::custom(
+                "publication hostname count out of bounds",
+            ));
+        }
+        let parsed: Vec<Hostname> = raw
+            .into_iter()
+            .map(|name| {
+                Hostname::parse(&name)
+                    .map_err(|_| serde::de::Error::custom("invalid publication hostname"))
+            })
+            .collect::<Result<_, _>>()?;
+        validate_hostname_set(&parsed, None).map_err(|_| {
+            serde::de::Error::custom(
+                "publication hostnames must be sorted, unique, and in one zone",
+            )
+        })?;
+        Ok(parsed)
     }
 
     impl Profile {
@@ -481,7 +545,66 @@ pub(crate) mod publication {
             Ok(path)
         }
 
+        /// Platform-independent validation of the hostname list, zone, and
+        /// project/service/route slot bindings.
+        pub(crate) fn validate_binding(&self) -> Result<()> {
+            ensure!(
+                validate_hostname_set(&self.hostnames, self.zone_name.as_ref()).is_ok(),
+                "invalid publication hostnames or zone"
+            );
+            ensure!(
+                self.hostnames.len() == 1 || !self.routes.is_empty(),
+                "multi-host binding requires route slots"
+            );
+            ensure!(
+                self.routes.is_empty() || self.zone_name.is_some(),
+                "routed binding requires an enrolled zone"
+            );
+            if !self.routes.is_empty() {
+                ensure!(
+                    self.routes.len() == self.hostnames.len(),
+                    "publication route count mismatch"
+                );
+                let mut route_slots = std::collections::BTreeSet::new();
+                let mut ports = std::collections::BTreeSet::new();
+                let mut project_slots = std::collections::BTreeMap::new();
+                let mut slot_projects = std::collections::BTreeMap::new();
+                for (expected_host, binding) in self.hostnames.iter().zip(&self.routes) {
+                    ensure!(
+                        binding.hostname == *expected_host,
+                        "publication route hostname order mismatch"
+                    );
+                    let slot = binding.slot();
+                    ensure!(slot.validate().is_ok(), "invalid publication route slot");
+                    ensure!(
+                        route_slots.insert(slot.route_slot),
+                        "duplicate publication route slot"
+                    );
+                    if let Some(&existing) = project_slots.get(binding.project_id.as_str()) {
+                        ensure!(
+                            existing == slot.project_slot,
+                            "publication project slot conflict"
+                        );
+                    } else {
+                        project_slots.insert(binding.project_id.as_str(), slot.project_slot);
+                    }
+                    if let Some(&existing) = slot_projects.get(&slot.project_slot) {
+                        ensure!(
+                            existing == binding.project_id.as_str(),
+                            "publication project slot conflict"
+                        );
+                    } else {
+                        slot_projects.insert(slot.project_slot, binding.project_id.as_str());
+                    }
+                    let port = slot.loopback_port();
+                    ensure!(ports.insert(port), "duplicate publication loopback port");
+                }
+            }
+            Ok(())
+        }
+
         pub(crate) fn validate(&self, state: &LocalPath) -> Result<()> {
+            self.validate_binding()?;
             let private = Self::path(&self.private_root)?;
             let dns = Self::path(&self.dns_ciphertext)?;
             let tunnel = Self::path(&self.tunnel_ciphertext)?;
@@ -517,9 +640,38 @@ pub(crate) mod publication {
         }
 
         pub(crate) fn intent(&self, vm: Id, origin: &Origin) -> Result<Intent> {
+            self.validate_binding()?;
+            ensure!(
+                !self.hostnames.contains(
+                    &origin
+                        .name()
+                        .map_err(|_| anyhow::anyhow!("invalid readiness name"))?
+                ),
+                "reserved readiness hostname"
+            );
             let mut hash = Sha256::new();
+            let feed = |hash: &mut Sha256, bytes: &[u8]| {
+                hash.update((bytes.len() as u64).to_be_bytes());
+                hash.update(bytes);
+            };
+            feed(&mut hash, &(self.hostnames.len() as u64).to_be_bytes());
+            for hostname in &self.hostnames {
+                feed(&mut hash, hostname.as_str().as_bytes());
+            }
+            if let Some(zone_name) = &self.zone_name {
+                feed(&mut hash, zone_name.as_str().as_bytes());
+            }
+            feed(&mut hash, &(self.routes.len() as u64).to_be_bytes());
+            for route in &self.routes {
+                feed(&mut hash, route.hostname.as_str().as_bytes());
+                feed(&mut hash, route.project_id.as_bytes());
+                feed(&mut hash, route.service.as_bytes());
+                feed(
+                    &mut hash,
+                    &[route.project_slot, route.service_index, route.route_slot],
+                );
+            }
             for bytes in [
-                self.hostnames[0].as_str().as_bytes(),
                 self.static_name.as_bytes(),
                 self.host_id.as_bytes(),
                 self.tunnel_id.as_bytes(),
@@ -532,24 +684,47 @@ pub(crate) mod publication {
                 self.connector_sha256.as_bytes(),
                 &self.connector_length.to_be_bytes(),
             ] {
-                hash.update((bytes.len() as u64).to_be_bytes());
-                hash.update(bytes);
+                feed(&mut hash, bytes);
+            }
+            let nonce =
+                Route::new_nonce().map_err(|_| anyhow::anyhow!("publication nonce unavailable"))?;
+            let mut seen_markers = std::collections::BTreeSet::new();
+            seen_markers.insert(nonce.clone());
+            let mut hosts = Vec::with_capacity(self.hostnames.len());
+            for (index, hostname) in self.hostnames.iter().enumerate() {
+                let marker = loop {
+                    let candidate = Route::new_nonce()
+                        .map_err(|_| anyhow::anyhow!("publication marker unavailable"))?;
+                    if seen_markers.insert(candidate.clone()) {
+                        break candidate;
+                    }
+                };
+                let route = self.routes.get(index).map(RouteBinding::slot);
+                hosts.push(HostIntent {
+                    position: u8::try_from(index)
+                        .map_err(|_| anyhow::anyhow!("publication host index overflow"))?,
+                    hostname: hostname.clone(),
+                    route,
+                    marker,
+                    post_possible: false,
+                    record: None,
+                    ambiguous: false,
+                    state: HostState::Pending,
+                    reason: None,
+                });
             }
             Ok(Intent {
                 vm,
                 generation: origin.generation,
                 boot: origin.boot,
                 revision: hash.finalize().into(),
-                hostname: self.hostnames[0].clone(),
                 tunnel: self.tunnel_id.clone(),
                 zone: self.zone_id.clone(),
                 credential_ref: Self::path(&self.dns_ciphertext)?.as_str().to_owned(),
-                nonce: Route::new_nonce()
-                    .map_err(|_| anyhow::anyhow!("publication nonce unavailable"))?,
+                nonce,
                 phase: Phase::Publishing,
-                post_possible: false,
-                record: None,
                 reason: None,
+                hosts,
             })
         }
     }
@@ -620,7 +795,13 @@ pub(crate) mod publication {
         }
     }
 
+    struct GuestRoutes {
+        session: Option<Arc<crate::vm::compose::Session>>,
+        zone: Hostname,
+    }
+
     pub(crate) struct Prepared {
+        routes: Option<GuestRoutes>,
         dns: Dns,
         start: Start,
     }
@@ -645,7 +826,7 @@ pub(crate) mod publication {
     }
 
     impl Profile {
-        fn prepare(self: &Arc<Self>) -> Result<Prepared, Refusal> {
+        fn prepare(self: &Arc<Self>, routes: Option<GuestRoutes>) -> Result<Prepared, Refusal> {
             #[cfg(all(windows, target_arch = "x86_64"))]
             {
                 let dns =
@@ -655,12 +836,16 @@ pub(crate) mod publication {
                     TunnelCredential::load(&self.tunnel_ciphertext, &self.account_id, &tunnel)
                         .map_err(|_| Refusal::PublishCredentialMissing)?;
                 Ok(Prepared {
+                    routes,
                     dns,
                     start: Start::Native(self.clone(), credential),
                 })
             }
             #[cfg(not(all(windows, target_arch = "x86_64")))]
-            Err(Refusal::QualificationMissing)
+            {
+                let _ = routes;
+                Err(Refusal::QualificationMissing)
+            }
         }
     }
 
@@ -675,13 +860,13 @@ pub(crate) mod publication {
             .map(Dns::Native)
     }
 
-    fn route(intent: &Intent) -> Result<Route, Failure> {
+    fn host_route(intent: &Intent, host: &HostIntent) -> Result<Route, Failure> {
         let invalid = |_| Failure::DnsUnavailable;
         Route::new(
             &intent.zone,
-            intent.hostname.clone(),
+            host.hostname.clone(),
             &TunnelId::parse(&intent.tunnel).map_err(invalid)?,
-            &intent.nonce,
+            &host.marker,
         )
         .map_err(invalid)
     }
@@ -746,7 +931,7 @@ pub(crate) mod publication {
     }
 
     impl LocalProcess {
-        async fn ready(&self) -> Result<(), Failure> {
+        async fn ready(&self, _probe_apps: bool) -> Result<(), Failure> {
             match *self {
                 #[cfg(not(any(test, all(windows, target_arch = "x86_64"))))]
                 Self::Closed(never) => match never {},
@@ -759,12 +944,21 @@ pub(crate) mod publication {
                         return Err(Failure::ConnectorUnready);
                     }
                     connector
-                        .origin_ready()
+                        .origin_ready(_probe_apps)
                         .await
                         .map_err(|_| Failure::OriginUnavailable)
                 }
                 #[cfg(test)]
-                Self::Fixture(ref fake) => fake.ready(),
+                Self::Fixture(ref fake) => {
+                    if _probe_apps
+                        && fake
+                            .upstream_unavailable
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return Err(Failure::OriginUnavailable);
+                    }
+                    fake.ready()
+                }
             }
         }
 
@@ -832,7 +1026,11 @@ pub(crate) mod publication {
             if !origin.current() || shutdown.is_cancelled() {
                 return Err(Failure::OriginUnavailable);
             }
-            let hostname = intent.hostname.clone();
+            let hostnames: Vec<Hostname> = intent
+                .hosts
+                .iter()
+                .map(|host| host.hostname.clone())
+                .collect();
             let tunnel = TunnelId::parse(&intent.tunnel).map_err(|_| Failure::ConnectorFailed)?;
             let origin_name = origin.name()?;
             match self {
@@ -843,14 +1041,23 @@ pub(crate) mod publication {
                     let mut sha256 = [0; 32];
                     hex::decode_to_slice(&profile.connector_sha256, &mut sha256)
                         .map_err(|_| Failure::ConnectorFailed)?;
+                    let probes: Vec<_> = profile
+                        .routes
+                        .iter()
+                        .map(|binding| {
+                            let target = binding.slot().target(&binding.hostname);
+                            (binding.hostname.clone(), target.probe_path())
+                        })
+                        .collect();
                     let plan = Plan {
+                        probes: &probes,
                         executable: &profile.connector,
                         binary_receipt: ArtifactPin {
                             size: profile.connector_length,
                             sha256,
                         },
                         private_root: &profile.private_root,
-                        hostname: &hostname,
+                        hostnames: &hostnames,
                         tunnel: &tunnel,
                         credential: &credential,
                         origin_port: origin.port,
@@ -887,6 +1094,8 @@ pub(crate) mod publication {
                 #[cfg(test)]
                 Self::Fixture(fake) => {
                     use std::sync::atomic::Ordering::SeqCst;
+                    // Probe each requested Host against the origin before starting the connector.
+                    fake.probe_origin_hosts(&hostnames)?;
                     fake.starts.fetch_add(1, SeqCst);
                     if fake.residue.swap(false, SeqCst) {
                         // As the native connector reports a failed ingress
@@ -903,13 +1112,16 @@ pub(crate) mod publication {
                             Unsettled::from_start(Some(LocalProcess::Fixture(fake)), false);
                         return Err(Failure::CleanupUnconfirmed);
                     }
-                    *fake.ingress.lock().unwrap() = Some(crate::vm::publish::ingress(
-                        &tunnel,
-                        std::array::from_ref(&hostname),
-                        origin.port,
-                        &origin_name,
-                        origin.ca_path.to_str().unwrap(),
-                    ));
+                    *fake.ingress.lock().unwrap() = Some(
+                        crate::vm::publish::ingress(
+                            &tunnel,
+                            &hostnames,
+                            origin.port,
+                            &origin_name,
+                            origin.ca_path.to_str().unwrap(),
+                        )
+                        .map_err(|_| Failure::ConnectorFailed)?,
+                    );
                     // As the native start, revocation or shutdown aborts it.
                     tokio::select! {
                         biased;
@@ -984,11 +1196,11 @@ pub(crate) mod publication {
         /// Cleared once that connector is confirmed stopped. This alone closes
         /// publish admission.
         unconfirmed: Option<u64>,
-        /// The intent nonce of a publication whose worker exited before
+        /// `(intent_nonce, host_marker)` pairs whose worker exited before
         /// submitting its marked POST. Kept until the intent is released, so
         /// a failed withdrawal and a failed release in one outage still leave
         /// the proof to a later cleanup.
-        unsubmitted: Option<String>,
+        unsubmitted: std::collections::HashSet<(String, String)>,
         /// Intent nonces an owner revocation cancelled. The owner cause wins
         /// over every other reason in the phase, release, audit and receipt
         /// writes of that intent, and is kept until the intent is gone.
@@ -1152,13 +1364,20 @@ pub(crate) mod publication {
         }
     }
 
-    /// What a publish worker knows about its own DNS POST.
+    /// What a publish worker knows about its own in-flight DNS POST.
     enum Evidence {
         Unknown,
-        /// A validated, owned create response whose ID may not be durable.
-        Acknowledged(RecordId),
-        /// The worker exited before submitting the POST it had marked.
-        NotSubmitted,
+        /// A validated, owned create response for `position` whose ID may not
+        /// be durable yet.
+        Acknowledged {
+            position: u8,
+            id: RecordId,
+        },
+        /// The worker exited before submitting the POST it had marked for
+        /// `position`.
+        NotSubmitted {
+            position: u8,
+        },
     }
 
     /// The outcome of one publication cleanup.
@@ -1343,7 +1562,19 @@ pub(crate) mod publication {
             })
         }
 
-        pub(crate) fn prepare(&self, profile: &Arc<Profile>) -> Result<Prepared, Refusal> {
+        pub(crate) fn prepare(
+            &self,
+            profile: &Arc<Profile>,
+            session: Option<Arc<crate::vm::compose::Session>>,
+        ) -> Result<Prepared, Refusal> {
+            let routes = if profile.routes.is_empty() {
+                None
+            } else {
+                Some(GuestRoutes {
+                    session,
+                    zone: profile.zone_name.clone().ok_or(Refusal::Invalid)?,
+                })
+            };
             #[cfg(test)]
             if let Some(fake) = self.fake.lock().unwrap().as_ref() {
                 use std::sync::atomic::Ordering;
@@ -1351,11 +1582,12 @@ pub(crate) mod publication {
                     return Err(Refusal::PublishCredentialMissing);
                 }
                 return Ok(Prepared {
+                    routes,
                     dns: Dns::Fixture(fake.clone()),
                     start: Start::Fixture(fake.clone()),
                 });
             }
-            profile.prepare()
+            profile.prepare(routes)
         }
 
         pub(crate) fn claim(&self) -> Option<OwnedMutexGuard<()>> {
@@ -1444,7 +1676,7 @@ pub(crate) mod publication {
             activations.stops.clear();
             if settled {
                 activations.cancelled.clear();
-                activations.unsubmitted = None;
+                activations.unsubmitted.clear();
             }
         }
 
@@ -1478,12 +1710,22 @@ pub(crate) mod publication {
             self.activations().cancelled.len()
         }
 
-        fn unsubmitted(&self, nonce: &str) -> bool {
-            self.activations().unsubmitted.as_deref() == Some(nonce)
+        fn unsubmitted(&self, nonce: &str, marker: &str) -> bool {
+            self.activations()
+                .unsubmitted
+                .contains(&(nonce.to_owned(), marker.to_owned()))
         }
 
-        fn set_unsubmitted(&self, nonce: Option<&str>) {
-            self.activations().unsubmitted = nonce.map(str::to_owned);
+        fn mark_unsubmitted(&self, nonce: &str, marker: &str) {
+            self.activations()
+                .unsubmitted
+                .insert((nonce.to_owned(), marker.to_owned()));
+        }
+
+        fn clear_unsubmitted(&self, nonce: &str) {
+            self.activations()
+                .unsubmitted
+                .retain(|(entry_nonce, _)| entry_nonce != nonce);
         }
 
         /// An owner revocation cancelled the publication of this intent.
@@ -1686,7 +1928,7 @@ pub(crate) mod publication {
                         && !shutdown.is_cancelled()
                 })
                 .ok_or(Failure::OriginUnavailable)?;
-            live.connector.ready().await
+            live.connector.ready(intent.phase != Phase::Published).await
         }
 
         #[allow(clippy::too_many_arguments)] // Explicit admission evidence and both cancellations.
@@ -1808,7 +2050,15 @@ pub(crate) mod publication {
             let (generation, revoked) = (ticket.generation, &ticket.revoked);
             #[cfg(test)]
             let _ = hold(&self.activate_gate).await;
-            let route = route(intent).map_err(|failure| (failure, Evidence::Unknown))?;
+            if intent.hosts.is_empty() {
+                return Err((Failure::OriginUnavailable, Evidence::Unknown));
+            }
+            let routes: Vec<(&HostIntent, Route)> = intent
+                .hosts
+                .iter()
+                .map(|host| Ok((host, host_route(intent, host)?)))
+                .collect::<Result<_, Failure>>()
+                .map_err(|failure| (failure, Evidence::Unknown))?;
             let map = |error| match error {
                 DnsError::Conflict => (Failure::DnsConflict, Evidence::Unknown),
                 _ => (Failure::DnsUnavailable, Evidence::Unknown),
@@ -1816,20 +2066,40 @@ pub(crate) mod publication {
             if !origin.current() || shutdown.is_cancelled() {
                 return Err((Failure::OriginUnavailable, Evidence::Unknown));
             }
-            tokio::select! {
-                biased;
-                _ = revoked.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
-                _ = origin.retired.token().cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
-                _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
-                result = prepared.dns.preflight(&route) => result.map_err(map)?,
+            // Preflight every hostname in stable position order before any
+            // connector start or DNS mutation.
+            for (_, route) in &routes {
+                tokio::select! {
+                    biased;
+                    _ = revoked.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
+                    _ = origin.retired.token().cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
+                    _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
+                    result = prepared.dns.preflight(route) => result.map_err(map)?,
+                }
             }
             {
                 let mut local = self.local.lock().await;
                 if local.is_some() {
                     return Err((Failure::CleanupUnconfirmed, Evidence::Unknown));
                 }
-                // Revocation aborts a connector start that holds the local slot.
                 let stop = Linked::new(revoked, shutdown);
+                if let Some(routes) = prepared.routes {
+                    let unavailable = (Failure::OriginUnavailable, Evidence::Unknown);
+                    let session = routes.session.ok_or(unavailable)?;
+                    let install = session.install_routes(
+                        controller.compose_store(),
+                        intent,
+                        origin.name().map_err(|e| (e, Evidence::Unknown))?,
+                        routes.zone,
+                        &stop.0,
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = origin.retired.token().cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
+                        _ = stop.0.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
+                        result = install => result.map_err(|_| (Failure::OriginUnavailable,Evidence::Unknown))?,
+                    }
+                }
                 let mut unsettled = Unsettled::default();
                 let started = prepared
                     .start
@@ -1860,109 +2130,137 @@ pub(crate) mod publication {
             self.ready(intent, shutdown)
                 .await
                 .map_err(|failure| (failure, Evidence::Unknown))?;
-            controller
-                .update_publication(&intent.nonce, Update::PostPossible)
-                .map_err(|_| (Failure::CleanupUnconfirmed, Evidence::Unknown))?;
-            #[cfg(test)]
-            let _ = hold(&self.marker_gate).await;
-            // Check cancellation before submitting DNS. From the durable
-            // marker onwards an interrupted POST remains possible, so only this
-            // pre-submission exit may withdraw the marker. The withdrawal also
-            // applies to an intent an owner unpublish already moved to
-            // `revoking`. If it fails, the receipt says so, and this worker's
-            // no-submission evidence still lets its cleanup release the
-            // intent with its marker, without consulting DNS.
-            if !origin.current() || shutdown.is_cancelled() || revoked.is_cancelled() {
-                self.set_unsubmitted(Some(&intent.nonce));
-                let failure = if origin.current() {
-                    Failure::Cancelled
-                } else {
-                    Failure::OriginUnavailable
-                };
-                // A failed withdrawal never replaces the cause: the
-                // nonce-scoped proof recorded above releases the intent
-                // without DNS once the store accepts a write.
-                let _withdrawn = controller
-                    .update_publication(&intent.nonce, Update::PostWithdrawn)
-                    .is_ok();
-                return Err((failure, Evidence::NotSubmitted));
-            }
-            #[cfg(test)]
-            let _ = hold(&self.submit_gate).await;
-            // The POST may reach Cloudflare only once the underlying transport
-            // accepts its first byte, below TLS and after connection setup.
-            // That first write runs under this activation's permit: owner
-            // revocation, the shutdown seal and origin retirement each either
-            // precede it and withhold it or follow it, and every attempt
-            // re-checks all three. Anything that ends the request before a
-            // byte is accepted (any cancellation, a pending write, or a
-            // zero-progress failure) is provably unsent. After it, an owner
-            // revocation lets the POST complete or time out and its
-            // acknowledged ID is then removed, while retirement or shutdown
-            // leaves it possible.
-            let cause = || {
-                if origin.retired.is_retired() {
-                    Some(Failure::OriginUnavailable)
-                } else if revoked.is_cancelled() || shutdown.is_cancelled() {
-                    Some(Failure::Cancelled)
-                } else {
-                    None
-                }
-            };
-            let permit = Permit {
-                publication: self,
-                generation,
-                origin,
-                shutdown,
-                possibly: Default::default(),
-            };
-            let submission = Submission::with(&permit);
-            let id = tokio::select! {
-                biased;
-                _ = origin.retired.token().cancelled() => Err(None),
-                _ = shutdown.cancelled() => Err(None),
-                // Owner revocation abandons the POST only while it is unsent.
-                _ = async {
-                    revoked.cancelled().await;
-                    if submission.sent() == Sent::Possibly {
-                        std::future::pending::<()>().await;
-                    }
-                } => Err(None),
-                result = prepared.dns.create(&route, &submission) => result.map_err(Some),
-            };
-            let id = match id {
-                Ok(id) => id,
-                Err(error) if submission.sent() == Sent::Possibly => {
-                    return Err(match error {
-                        Some(error) => map(error),
-                        None => (cause().unwrap_or(Failure::Cancelled), Evidence::Unknown),
-                    });
-                }
-                Err(error) => {
-                    let cause = cause()
-                        .or(error.map(|error| map(error).0))
-                        .unwrap_or(Failure::Cancelled);
-                    self.set_unsubmitted(Some(&intent.nonce));
-                    // As above, a failed withdrawal never replaces the cause.
+            // Create and verify every hostname in stable position order with
+            // independent per-row ownership markers, custody and cancellation
+            // evidence.
+            for (host, route) in &routes {
+                controller
+                    .update_publication(
+                        &intent.nonce,
+                        Update::HostPostPossible {
+                            position: host.position,
+                        },
+                    )
+                    .map_err(|_| (Failure::CleanupUnconfirmed, Evidence::Unknown))?;
+                #[cfg(test)]
+                let _ = hold(&self.marker_gate).await;
+                if !origin.current() || shutdown.is_cancelled() || revoked.is_cancelled() {
+                    self.mark_unsubmitted(&intent.nonce, &host.marker);
+                    let failure = if origin.current() {
+                        Failure::Cancelled
+                    } else {
+                        Failure::OriginUnavailable
+                    };
                     let _withdrawn = controller
-                        .update_publication(&intent.nonce, Update::PostWithdrawn)
+                        .update_publication(
+                            &intent.nonce,
+                            Update::HostPostWithdrawn {
+                                position: host.position,
+                            },
+                        )
                         .is_ok();
-                    return Err((cause, Evidence::NotSubmitted));
+                    return Err((
+                        failure,
+                        Evidence::NotSubmitted {
+                            position: host.position,
+                        },
+                    ));
                 }
-            };
-            // The acknowledged ID is durable before verification, so a failed
-            // exact lookup can never discard it.
-            if controller
-                .update_publication(&intent.nonce, Update::Record(id.as_str()))
-                .is_err()
-            {
-                return Err((Failure::CleanupUnconfirmed, Evidence::Acknowledged(id)));
-            }
-            tokio::select! {
-                biased;
-                _ = origin.retired.token().cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
-                _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
-                result = prepared.dns.verify(&route, &id) => result.map_err(map)?,
+                #[cfg(test)]
+                let _ = hold(&self.submit_gate).await;
+                let cause = || {
+                    if origin.retired.is_retired() {
+                        Some(Failure::OriginUnavailable)
+                    } else if revoked.is_cancelled() || shutdown.is_cancelled() {
+                        Some(Failure::Cancelled)
+                    } else {
+                        None
+                    }
+                };
+                let permit = Permit {
+                    publication: self,
+                    generation,
+                    origin,
+                    shutdown,
+                    possibly: Default::default(),
+                };
+                let submission = Submission::with(&permit);
+                let id = tokio::select! {
+                    biased;
+                    _ = origin.retired.token().cancelled() => Err(None),
+                    _ = shutdown.cancelled() => Err(None),
+                    // Owner revocation abandons the POST only while it is unsent.
+                    _ = async {
+                        revoked.cancelled().await;
+                        if submission.sent() == Sent::Possibly {
+                            std::future::pending::<()>().await;
+                        }
+                    } => Err(None),
+                    result = prepared.dns.create(route, &submission) => result.map_err(Some),
+                };
+                let id = match id {
+                    Ok(id) => id,
+                    Err(error) if submission.sent() == Sent::Possibly => {
+                        return Err(match error {
+                            Some(error) => map(error),
+                            None => (cause().unwrap_or(Failure::Cancelled), Evidence::Unknown),
+                        });
+                    }
+                    Err(error) => {
+                        let cause = cause()
+                            .or(error.map(|error| map(error).0))
+                            .unwrap_or(Failure::Cancelled);
+                        self.mark_unsubmitted(&intent.nonce, &host.marker);
+                        let _withdrawn = controller
+                            .update_publication(
+                                &intent.nonce,
+                                Update::HostPostWithdrawn {
+                                    position: host.position,
+                                },
+                            )
+                            .is_ok();
+                        return Err((
+                            cause,
+                            Evidence::NotSubmitted {
+                                position: host.position,
+                            },
+                        ));
+                    }
+                };
+                // The acknowledged ID is durable before verification, so a
+                // failed exact lookup can never discard it.
+                if controller
+                    .update_publication(
+                        &intent.nonce,
+                        Update::HostRecord {
+                            position: host.position,
+                            record: id.as_str(),
+                        },
+                    )
+                    .is_err()
+                {
+                    return Err((
+                        Failure::CleanupUnconfirmed,
+                        Evidence::Acknowledged {
+                            position: host.position,
+                            id,
+                        },
+                    ));
+                }
+                tokio::select! {
+                    biased;
+                    _ = origin.retired.token().cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
+                    _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
+                    result = prepared.dns.verify(route, &id) => result.map_err(map)?,
+                }
+                controller
+                    .update_publication(
+                        &intent.nonce,
+                        Update::HostVerified {
+                            position: host.position,
+                        },
+                    )
+                    .map_err(|_| (Failure::CleanupUnconfirmed, Evidence::Unknown))?;
             }
             self.ready(intent, shutdown)
                 .await
@@ -2057,8 +2355,12 @@ pub(crate) mod publication {
                 // No-submission proof and owner causes are kept only for the
                 // durable intent and live activations.
                 let mut activations = self.activations();
-                if intent.is_none() {
-                    activations.unsubmitted = None;
+                if let Some(intent) = &intent {
+                    activations
+                        .unsubmitted
+                        .retain(|(nonce, _)| nonce == &intent.nonce);
+                } else {
+                    activations.unsubmitted.clear();
                 }
                 activations.prune_causes(intent.as_ref().map(|intent| intent.nonce.as_str()));
             }
@@ -2132,25 +2434,74 @@ pub(crate) mod publication {
             // A latched owner cause wins over the reason this cleanup supplies.
             let reason = self.cause(&intent.nonce, reason);
             controller.update_publication(&intent.nonce, Update::Phase(Phase::Revoking, reason))?;
-            // A proven unsubmitted POST needs no remote work, so it is decided
-            // before DNS and before cancellation can win.
-            let unsubmitted = intent.record.is_none()
-                && (matches!(evidence, Evidence::NotSubmitted) || self.unsubmitted(&intent.nonce));
-            let dns = if !intent.post_possible || unsubmitted {
-                Ok(())
-            } else if let Some(shutdown) = shutdown {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => Err(Failure::Cancelled),
-                    result = self.remove_dns(controller, &intent, evidence) => result,
-                }
-            } else {
-                self.remove_dns(controller, &intent, evidence).await
+            // Clean EVERY child row independently without short-circuiting:
+            // owned DNS records are removed even when a different row is
+            // blocked or ambiguous.
+            let mut first_cleanup_error: Option<Failure> = None;
+            let (mut acknowledged, not_submitted_pos) = match evidence {
+                Evidence::Acknowledged { position, id } => (Some((position, id)), None),
+                Evidence::NotSubmitted { position } => (None, Some(position)),
+                Evidence::Unknown => (None, None),
             };
-            let outcome = match (dns, local) {
-                (Ok(()), true) => Cleanup::Released,
-                (dns, _) => {
-                    Cleanup::Pending(reason.or(dns.err()).unwrap_or(Failure::CleanupUnconfirmed))
+            for host in &intent.hosts {
+                if host.state == HostState::Cleaned {
+                    continue;
+                }
+                // A proven unsubmitted POST needs no remote work, so it is
+                // decided before DNS and before cancellation can win.
+                let unsubmitted = host.record.is_none()
+                    && (not_submitted_pos == Some(host.position)
+                        || self.unsubmitted(&intent.nonce, &host.marker));
+                let row_ack = acknowledged
+                    .as_ref()
+                    .is_some_and(|(pos, _)| *pos == host.position)
+                    .then(|| acknowledged.take().map(|(_, id)| id))
+                    .flatten();
+                let row_result = if !host.post_possible || unsubmitted {
+                    Ok(())
+                } else if let Some(shutdown) = shutdown {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => Err(Failure::Cancelled),
+                        result = self.remove_host_dns(controller, &intent, host, row_ack) => result,
+                    }
+                } else {
+                    self.remove_host_dns(controller, &intent, host, row_ack)
+                        .await
+                };
+                match row_result {
+                    Ok(()) => {
+                        if controller
+                            .update_publication(
+                                &intent.nonce,
+                                Update::HostCleaned {
+                                    position: host.position,
+                                },
+                            )
+                            .is_err()
+                        {
+                            first_cleanup_error.get_or_insert(Failure::CleanupUnconfirmed);
+                        }
+                    }
+                    Err(err) => {
+                        let still_ambiguous =
+                            host.record.is_none() && err == Failure::CleanupUnconfirmed;
+                        let _ = controller.update_publication(
+                            &intent.nonce,
+                            Update::HostCleanupPending {
+                                position: host.position,
+                                ambiguous: still_ambiguous,
+                                reason: Some(err),
+                            },
+                        );
+                        first_cleanup_error.get_or_insert(err);
+                    }
+                }
+            }
+            let outcome = match (first_cleanup_error, local) {
+                (None, true) => Cleanup::Released,
+                (dns_err, _) => {
+                    Cleanup::Pending(reason.or(dns_err).unwrap_or(Failure::CleanupUnconfirmed))
                 }
             };
             let update = match outcome {
@@ -2163,39 +2514,51 @@ pub(crate) mod publication {
             } else {
                 controller.update_publication(&intent.nonce, update)?;
             }
-            if released && self.unsubmitted(&intent.nonce) {
-                self.set_unsubmitted(None);
+            if released {
+                self.clear_unsubmitted(&intent.nonce);
             }
             Ok(outcome)
         }
 
-        async fn remove_dns<C: Clock>(
+        async fn remove_host_dns<C: Clock>(
             &self,
             controller: &VmController<C>,
             intent: &Intent,
-            evidence: Evidence,
+            host: &HostIntent,
+            acknowledged: Option<RecordId>,
         ) -> Result<(), Failure> {
-            if !intent.post_possible {
+            if !host.post_possible {
                 return Ok(());
             }
             let dns = self.cleanup_dns(intent).ok_or(Failure::DnsUnavailable)?;
-            let route = route(intent)?;
+            let route = host_route(intent, host)?;
             let unavailable = |_| Failure::DnsUnavailable;
-            let id = match (&intent.record, evidence) {
+            let id = match (&host.record, acknowledged) {
                 (Some(id), _) => {
                     RecordId::parse(id.clone()).map_err(|_| Failure::DnsUnavailable)?
                 }
                 // An acknowledged ID whose custody write failed: retry custody
                 // and target it either way.
-                (None, Evidence::Acknowledged(id)) => {
-                    let _ =
-                        controller.update_publication(&intent.nonce, Update::Record(id.as_str()));
+                (None, Some(id)) => {
+                    let _ = controller.update_publication(
+                        &intent.nonce,
+                        Update::HostRecord {
+                            position: host.position,
+                            record: id.as_str(),
+                        },
+                    );
                     id
                 }
-                (None, _) => match dns.reconcile(&route).await.map_err(unavailable)? {
+                (None, None) => match dns.reconcile(&route).await.map_err(unavailable)? {
                     Reconciled::Owned(id) | Reconciled::OwnedWithConflict(id) => {
                         controller
-                            .update_publication(&intent.nonce, Update::Record(id.as_str()))
+                            .update_publication(
+                                &intent.nonce,
+                                Update::HostRecord {
+                                    position: host.position,
+                                    record: id.as_str(),
+                                },
+                            )
                             .map_err(|_| Failure::CleanupUnconfirmed)?;
                         id
                     }
@@ -2271,6 +2634,31 @@ pub(crate) mod publication {
         pub(crate) lose_after_post: std::sync::atomic::AtomicBool,
         /// Every route tuple used for lookup or removal.
         pub(crate) routes: std::sync::Mutex<Vec<String>>,
+        /// Multi-host mode: tracks per-hostname ownership, conflicts, failures
+        /// and call ordering independently.
+        pub(crate) multi_host: std::sync::atomic::AtomicBool,
+        /// Owned DNS records per hostname: hostname -> (route_witness, record_id).
+        pub(crate) host_records:
+            Arc<std::sync::Mutex<std::collections::BTreeMap<String, (String, String)>>>,
+        /// Hostnames currently carrying a foreign/conflicting DNS record.
+        pub(crate) host_foreign: std::sync::Mutex<std::collections::BTreeSet<String>>,
+        /// Hostnames whose next POST fails after the first write.
+        pub(crate) host_fail_create: std::sync::Mutex<std::collections::BTreeSet<String>>,
+        /// Hostnames whose POST commits only after release and never acknowledges.
+        pub(crate) host_late_commit: std::sync::Mutex<
+            std::collections::BTreeMap<String, tokio::sync::oneshot::Receiver<()>>,
+        >,
+        /// Hostnames whose DNS removal currently fails (transient error).
+        pub(crate) host_fail_remove: std::sync::Mutex<std::collections::BTreeSet<String>>,
+        /// Hostnames that fail the origin TLS/Host probe before connector start.
+        pub(crate) host_origin_mismatch: std::sync::Mutex<std::collections::BTreeSet<String>>,
+        /// Observed origin Host probes, preflight order, create order and remove order.
+        pub(crate) starts_at_route_install: std::sync::Mutex<Vec<usize>>,
+        pub(crate) upstream_unavailable: std::sync::atomic::AtomicBool,
+        pub(crate) origin_probed: std::sync::Mutex<Vec<String>>,
+        pub(crate) preflight_order: std::sync::Mutex<Vec<String>>,
+        pub(crate) create_order: std::sync::Mutex<Vec<String>>,
+        pub(crate) remove_order: std::sync::Mutex<Vec<String>>,
     }
 
     #[cfg(test)]
@@ -2303,8 +2691,38 @@ pub(crate) mod publication {
 
         /// A replaced owner binding, for drift witnesses.
         pub(crate) fn drifted(host: Id, name: &str, hostname: &str, zone: &str) -> Self {
+            Self::synthetic_multi(host, name, &[hostname], None, zone)
+        }
+
+        pub(crate) fn synthetic_multi(
+            host: Id,
+            name: &str,
+            hostnames: &[&str],
+            zone_name: Option<&str>,
+            zone: &str,
+        ) -> Self {
             Self {
-                hostnames: [Hostname::parse(hostname).unwrap()],
+                hostnames: hostnames
+                    .iter()
+                    .map(|value| Hostname::parse(value).unwrap())
+                    .collect(),
+                zone_name: zone_name.map(|value| Hostname::parse(value).unwrap()),
+                routes: if hostnames.len() <= 1 {
+                    Vec::new()
+                } else {
+                    hostnames
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| RouteBinding {
+                            hostname: Hostname::parse(value).unwrap(),
+                            project_id: format!("project-{}", index / 4),
+                            service: format!("svc-{}", index % 4),
+                            project_slot: (index / 4) as u8,
+                            service_index: (index % 4) as u8,
+                            route_slot: index as u8,
+                        })
+                        .collect()
+                },
                 static_name: name.into(),
                 host_id: hex::encode(host),
                 tunnel_id: "12345678-1234-4321-8234-123456789abc".into(),
@@ -2317,6 +2735,15 @@ pub(crate) mod publication {
                 connector_length: 1,
                 connector_sha256: "c".repeat(64),
             }
+        }
+
+        pub(crate) fn with_routes(mut self, routes: Vec<RouteBinding>) -> Self {
+            self.routes = routes;
+            self
+        }
+
+        pub(crate) fn static_name(&self) -> &str {
+            &self.static_name
         }
     }
 
@@ -2331,15 +2758,38 @@ pub(crate) mod publication {
             }
         }
 
+        fn probe_origin_hosts(&self, hostnames: &[Hostname]) -> Result<(), Failure> {
+            let mut probed = self.origin_probed.lock().unwrap();
+            let mismatch = self.host_origin_mismatch.lock().unwrap();
+            for host in hostnames {
+                probed.push(host.as_str().to_owned());
+                if mismatch.contains(host.as_str()) {
+                    return Err(Failure::OriginUnavailable);
+                }
+            }
+            Ok(())
+        }
+
         fn id() -> RecordId {
             RecordId::parse("e".repeat(32)).unwrap()
+        }
+
+        fn multi_id(seq: usize) -> RecordId {
+            RecordId::parse(format!("{seq:032x}")).unwrap()
         }
     }
 
     #[cfg(test)]
     impl DnsApi for Fake {
         async fn preflight(&self, route: &Route) -> Result<(), DnsError> {
+            use std::sync::atomic::Ordering::SeqCst;
             hold(&self.preflight_gate).await?;
+            if self.multi_host.load(SeqCst) {
+                self.preflight_order
+                    .lock()
+                    .unwrap()
+                    .push(route.name().as_str().to_owned());
+            }
             match self.reconcile(route).await? {
                 Reconciled::Absent => Ok(()),
                 _ => Err(DnsError::Conflict),
@@ -2348,7 +2798,7 @@ pub(crate) mod publication {
 
         async fn create(
             &self,
-            _: &Route,
+            route: &Route,
             submission: &Submission<'_>,
         ) -> Result<RecordId, DnsError> {
             use std::sync::atomic::Ordering::SeqCst;
@@ -2370,6 +2820,37 @@ pub(crate) mod publication {
                 self.local.load(SeqCst),
                 "DNS activated before connector readiness"
             );
+            if self.multi_host.load(SeqCst) {
+                let name = route.name().as_str().to_owned();
+                let witness = route.witness();
+                let seq = self.posts.fetch_add(1, SeqCst) + 1;
+                self.create_order.lock().unwrap().push(name.clone());
+                let id = Self::multi_id(seq);
+                let id_str = id.as_str().to_owned();
+                let late = self.host_late_commit.lock().unwrap().remove(&name);
+                if let Some(release) = late {
+                    let records = self.host_records.clone();
+                    tokio::spawn(async move {
+                        if release.await.is_ok() {
+                            records.lock().unwrap().insert(name, (witness, id_str));
+                        }
+                    });
+                    return std::future::pending().await;
+                }
+                if self.host_fail_create.lock().unwrap().remove(&name) {
+                    return Err(DnsError::Unavailable);
+                }
+                {
+                    let mut records = self.host_records.lock().unwrap();
+                    assert!(!records.contains_key(&name), "repeated POST for {name}");
+                    records.insert(name, (witness, id_str));
+                }
+                if self.panic_after_post.swap(false, SeqCst) {
+                    panic!("synthetic worker panic after a possible POST");
+                }
+                hold(&self.post_gate).await?;
+                return Ok(id);
+            }
             assert!(!self.record.load(SeqCst), "repeated POST");
             self.posts.fetch_add(1, SeqCst);
             let late = self.late_commit.lock().unwrap().take();
@@ -2392,7 +2873,28 @@ pub(crate) mod publication {
 
         async fn reconcile(&self, route: &Route) -> Result<Reconciled, DnsError> {
             use std::sync::atomic::Ordering::SeqCst;
-            self.routes.lock().unwrap().push(route.witness());
+            let witness = route.witness();
+            self.routes.lock().unwrap().push(witness.clone());
+            if self.multi_host.load(SeqCst) {
+                let name = route.name().as_str();
+                let owned =
+                    self.host_records
+                        .lock()
+                        .unwrap()
+                        .get(name)
+                        .and_then(|(stored_witness, id)| {
+                            (stored_witness == &witness)
+                                .then(|| RecordId::parse(id.clone()).ok())
+                                .flatten()
+                        });
+                let foreign = self.host_foreign.lock().unwrap().contains(name);
+                return Ok(match (owned, foreign) {
+                    (Some(id), false) => Reconciled::Owned(id),
+                    (Some(id), true) => Reconciled::OwnedWithConflict(id),
+                    (None, true) => Reconciled::ForeignOrAmbiguous,
+                    (None, false) => Reconciled::Absent,
+                });
+            }
             if self.record.load(SeqCst) && self.lose_after_post.swap(false, SeqCst) {
                 self.record.store(false, SeqCst);
                 return Err(DnsError::Unavailable);
@@ -2410,11 +2912,38 @@ pub(crate) mod publication {
         async fn remove(&self, route: &Route, id: &RecordId) -> Result<Removal, DnsError> {
             use std::sync::atomic::Ordering::SeqCst;
             hold(&self.remove_gate).await?;
-            self.routes.lock().unwrap().push(route.witness());
+            let witness = route.witness();
+            self.routes.lock().unwrap().push(witness.clone());
             assert!(
                 !self.local.load(SeqCst),
                 "DNS removed before local connector stopped"
             );
+            if self.multi_host.load(SeqCst) {
+                let name = route.name().as_str();
+                self.remove_order.lock().unwrap().push(name.to_owned());
+                if self.host_fail_remove.lock().unwrap().contains(name) {
+                    return Err(DnsError::Unavailable);
+                }
+                let removed = {
+                    let mut records = self.host_records.lock().unwrap();
+                    match records.get(name) {
+                        Some((stored_witness, stored_id))
+                            if stored_witness == &witness && stored_id == id.as_str() =>
+                        {
+                            records.remove(name);
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if removed {
+                    self.deletes.fetch_add(1, SeqCst);
+                }
+                if self.host_foreign.lock().unwrap().contains(name) {
+                    return Ok(Removal::ForeignOrAmbiguous);
+                }
+                return Ok(Removal::Absent);
+            }
             assert_eq!(*id, Self::id());
             if self.record.swap(false, SeqCst) {
                 self.deletes.fetch_add(1, SeqCst);
@@ -2584,6 +3113,149 @@ pub(crate) mod publication {
             assert!(publication.revoke_owned("alpha", VM).is_empty());
             assert_eq!(publication.stop_obligations(), 0);
             assert!(publication.register(VM, "alpha", "later").is_none());
+        }
+
+        #[test]
+        fn profile_hostname_and_route_slot_bounds_are_enforced() {
+            let host = [9; 16];
+            let zone = "b".repeat(32);
+
+            // Empty hostnames list is rejected.
+            let empty = Profile::synthetic_multi(host, "site", &[], Some("example.invalid"), &zone);
+            assert!(empty.validate_binding().is_err());
+
+            // 8 sorted unique in-zone hostnames succeed.
+            let eight = [
+                "a.example.invalid",
+                "b.example.invalid",
+                "c.example.invalid",
+                "d.example.invalid",
+                "e.example.invalid",
+                "f.example.invalid",
+                "g.example.invalid",
+                "h.example.invalid",
+            ];
+            let valid8 =
+                Profile::synthetic_multi(host, "site", &eight, Some("example.invalid"), &zone);
+            assert!(valid8.validate_binding().is_ok());
+
+            // 9 hostnames exceed MAX_HOSTNAMES and are rejected.
+            let nine = [
+                "a.example.invalid",
+                "b.example.invalid",
+                "c.example.invalid",
+                "d.example.invalid",
+                "e.example.invalid",
+                "f.example.invalid",
+                "g.example.invalid",
+                "h.example.invalid",
+                "i.example.invalid",
+            ];
+            let invalid9 =
+                Profile::synthetic_multi(host, "site", &nine, Some("example.invalid"), &zone);
+            assert!(invalid9.validate_binding().is_err());
+
+            // Unsorted and duplicate lists are rejected.
+            let unsorted = Profile::synthetic_multi(
+                host,
+                "site",
+                &["b.example.invalid", "a.example.invalid"],
+                Some("example.invalid"),
+                &zone,
+            );
+            assert!(unsorted.validate_binding().is_err());
+            let dup = Profile::synthetic_multi(
+                host,
+                "site",
+                &["a.example.invalid", "a.example.invalid"],
+                Some("example.invalid"),
+                &zone,
+            );
+            assert!(dup.validate_binding().is_err());
+
+            // Cross-zone hostname is rejected.
+            let cross_zone = Profile::synthetic_multi(
+                host,
+                "site",
+                &["a.example.invalid", "b.other.invalid"],
+                Some("example.invalid"),
+                &zone,
+            );
+            assert!(cross_zone.validate_binding().is_err());
+
+            // Route bindings must match hostnames 1:1 with unique slots 0..32.
+            let with_routes = Profile::synthetic_multi(
+                host,
+                "site",
+                &["api.example.invalid", "app.example.invalid"],
+                Some("example.invalid"),
+                &zone,
+            )
+            .with_routes(vec![
+                RouteBinding {
+                    hostname: Hostname::parse("api.example.invalid").unwrap(),
+                    project_id: "proj-a".into(),
+                    service: "api".into(),
+                    project_slot: 0,
+                    service_index: 0,
+                    route_slot: 0,
+                },
+                RouteBinding {
+                    hostname: Hostname::parse("app.example.invalid").unwrap(),
+                    project_id: "proj-a".into(),
+                    service: "web".into(),
+                    project_slot: 0,
+                    service_index: 1,
+                    route_slot: 1,
+                },
+            ]);
+            assert!(with_routes.validate_binding().is_ok());
+
+            // Duplicate route_slot is rejected.
+            let slot_collision = Profile::synthetic_multi(
+                host,
+                "site",
+                &["api.example.invalid", "app.example.invalid"],
+                Some("example.invalid"),
+                &zone,
+            )
+            .with_routes(vec![
+                RouteBinding {
+                    hostname: Hostname::parse("api.example.invalid").unwrap(),
+                    project_id: "proj-a".into(),
+                    service: "api".into(),
+                    project_slot: 0,
+                    service_index: 0,
+                    route_slot: 3,
+                },
+                RouteBinding {
+                    hostname: Hostname::parse("app.example.invalid").unwrap(),
+                    project_id: "proj-b".into(),
+                    service: "web".into(),
+                    project_slot: 1,
+                    service_index: 0,
+                    route_slot: 3,
+                },
+            ]);
+            assert!(slot_collision.validate_binding().is_err());
+
+            // Out-of-range route_slot (>= 32) is rejected.
+            let bad_slot = Profile::synthetic_multi(
+                host,
+                "site",
+                &["api.example.invalid"],
+                Some("example.invalid"),
+                &zone,
+            )
+            .with_routes(vec![RouteBinding {
+                hostname: Hostname::parse("api.example.invalid").unwrap(),
+                project_id: "proj-a".into(),
+                service: "api".into(),
+                project_slot: 0,
+                service_index: 0,
+                route_slot: 32,
+            }]);
+            assert!(bad_slot.validate_binding().is_err());
         }
     }
 }

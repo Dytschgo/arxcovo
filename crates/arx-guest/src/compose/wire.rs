@@ -96,6 +96,13 @@ pub enum ComposeRequest {
         cursor: u64,
         limit: u32,
     },
+    ComposeInstallRoutes {
+        id: u32,
+        generation: u64,
+        readiness_host: String,
+        zone: String,
+        routes: Vec<super::routing::RouteTarget>,
+    },
     /// Private, non-logging secret delivery bound to an exact release digest.
     /// `data` is Base64 and is wiped when the request is dropped.
     ComposeSecretPut {
@@ -136,6 +143,9 @@ impl<'de> Deserialize<'de> for ComposeRequest {
             Limit,
             Slot,
             Epoch,
+            ReadinessHost,
+            Zone,
+            Routes,
         }
 
         struct RequestVisitor;
@@ -165,6 +175,9 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                 let mut cursor: Option<u64> = None;
                 let mut limit: Option<u32> = None;
                 let mut slot: Option<String> = None;
+                let mut readiness_host = None;
+                let mut zone = None;
+                let mut routes = None;
                 let mut epoch: Option<u64> = None;
 
                 macro_rules! set_once {
@@ -195,6 +208,9 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                         Field::Cursor => set_once!(cursor, "cursor"),
                         Field::Limit => set_once!(limit, "limit"),
                         Field::Slot => set_once!(slot, "slot"),
+                        Field::ReadinessHost => set_once!(readiness_host, "readiness_host"),
+                        Field::Zone => set_once!(zone, "zone"),
+                        Field::Routes => set_once!(routes, "routes"),
                         Field::Epoch => set_once!(epoch, "epoch"),
                     }
                 }
@@ -209,6 +225,13 @@ impl<'de> Deserialize<'de> for ComposeRequest {
 
                 let tag = tag.ok_or_else(|| de::Error::missing_field("type"))?;
                 let request = match tag.as_str() {
+                    "ComposeInstallRoutes" => ComposeRequest::ComposeInstallRoutes {
+                        id: take!(id, "id"),
+                        generation: take!(generation, "generation"),
+                        readiness_host: take!(readiness_host, "readiness_host"),
+                        zone: take!(zone, "zone"),
+                        routes: take!(routes, "routes"),
+                    },
                     "ComposeHello" => ComposeRequest::ComposeHello {
                         version: take!(version, "version"),
                         challenge: take!(challenge, "challenge"),
@@ -300,6 +323,9 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                     || cursor.is_some()
                     || limit.is_some()
                     || slot.is_some()
+                    || readiness_host.is_some()
+                    || zone.is_some()
+                    || routes.is_some()
                     || epoch.is_some()
                 {
                     return Err(de::Error::custom("unexpected field for ComposeRequest"));
@@ -315,6 +341,10 @@ impl<'de> Deserialize<'de> for ComposeRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum ComposeResponse {
+    ComposeRoutesInstalled {
+        id: u32,
+        generation: u64,
+    },
     ComposeHelloAck {
         version: u32,
         challenge: String,
@@ -631,6 +661,25 @@ impl Message for ComposeRequest {
                 validate_id(*id)?;
                 field(is_lower_hex(operation_id, 32))
             }
+            Self::ComposeInstallRoutes {
+                id,
+                generation,
+                readiness_host,
+                zone,
+                routes,
+            } => {
+                validate_id(*id)?;
+                field(
+                    *generation != 0
+                        && super::routing::RoutingTable::new(
+                            readiness_host,
+                            Some(zone.clone()),
+                            super::routing::SLIRP_FORWARD_PEER,
+                            routes.clone(),
+                        )
+                        .is_ok(),
+                )
+            }
             Self::ComposeStatus { id, project_id } => {
                 validate_id(*id)?;
                 field(is_project_id(project_id))
@@ -680,6 +729,10 @@ impl Message for ComposeResponse {
                 generation,
                 ..
             } => validate_hello(*version, challenge, *generation),
+            Self::ComposeRoutesInstalled { id, generation } => {
+                validate_id(*id)?;
+                field(*generation != 0)
+            }
             Self::ComposeStageProgress { id, .. }
             | Self::ComposeReleaseStaged { id, .. }
             | Self::ComposeOperationState { id, .. }

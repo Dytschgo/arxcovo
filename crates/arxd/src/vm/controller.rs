@@ -2151,9 +2151,23 @@ impl<C: Clock> VmController<C> {
                 return Ok(Err(Refusal::NotFound));
             }
             if let Some(intent) = store::publish::current(db)?.filter(|intent| intent.vm == vm) {
+                let hosts = intent
+                    .hosts
+                    .into_iter()
+                    .map(|host| store::publish::HostStatusView {
+                        position: host.position,
+                        state: host.state,
+                        ambiguous: host.ambiguous,
+                        route_slot: host.route.as_ref().map(|r| r.route_slot),
+                        project_id: host.route.as_ref().map(|r| r.project_id.clone()),
+                        service: host.route.as_ref().map(|r| r.service.clone()),
+                        reason: host.reason,
+                    })
+                    .collect();
                 return Ok(Ok(store::publish::SiteStatus {
                     phase: Some(intent.phase),
                     reason: intent.reason,
+                    hosts,
                 }));
             }
             let reason = db
@@ -2167,6 +2181,7 @@ impl<C: Clock> VmController<C> {
             Ok(Ok(store::publish::SiteStatus {
                 phase: None,
                 reason,
+                hosts: Vec::new(),
             }))
         })
     }
@@ -2239,6 +2254,12 @@ impl<C: Clock> VmController<C> {
                 )? == 0
                 {
                     return Ok(Err(Refusal::NotReady));
+                }
+                for route in intent.hosts.iter().filter_map(|host| host.route.as_ref()) {
+                    if store::count(db, "SELECT count(*) FROM vm_compose_projects p WHERE vm=?1 AND project=?2
+                        AND (recovery_id IS NOT NULL OR EXISTS (SELECT 1 FROM vm_compose_operations o
+                        WHERE o.vm=p.vm AND o.project=p.project AND o.receipt IS NULL AND o.closed IS NULL))",
+                        params![vm,route.project_id])? != 0 {return Ok(Err(Refusal::Busy));}
                 }
                 store::publish::reserve(db, intent)?;
             } else if let Some(current) = current.filter(|intent| intent.vm == vm) {
