@@ -2,6 +2,10 @@
 
 Status: **Active on main10aa891f, 2026-11-17, following the owner-authorized pinned PR163 bootstrap. First new exact-main CI and charged-v1 evaluation verified.** Original Opus design on `c612152`; current-main refresh uses Sol6.1.
 
+The [2026-11-24 amendment](#main-runner-cancellation-recovery-2026-11-24)
+supersedes the original main run selection, non-green gate behavior and
+status marker where they differ.
+
 The user chose to *prepare* a reviewed queue-outage amendment for the PR #162 deadlock. That choice grants no
 bootstrap, protection, status, label or merge exception. The ADR 0022 exception is exhausted and cannot be reused.
 No label makes this amendment, or its implementation, a `ci-speed` change. KICKOFF requires "15 minutes
@@ -122,7 +126,10 @@ a queue-only win with unchanged execution times. Runtime noise can still change
 that value; a `ci-speed` PR must identify and independently review the actual
 structural change rather than claiming a charged reduction from queue alone.
 
-## Status description (≤140 chars, `Main run {id}:` invalidation marker unchanged)
+## Original status description (≤140 chars)
+
+The runner recovery amendment below adds the attempt number to the
+invalidation marker.
 
 Format: `Main run {id}: wall {W}s, charged {C}; {verdict}`.
 - `{C}` is `{n}s`, `{n}s uncredited (not-green)`, or `n/a (run-invalid|jobs-invalid)`.
@@ -164,8 +171,8 @@ it stays charged.
 3. **Defects.** Each `run-invalid` and `jobs-invalid` clause gives null charged, its code, the wall gate and a
    denied `ci-speed`. Include `total_count` 2, 4 and 101, and assert that no second page is read. Existing
    unfinished-attempt rejection precedes credit validation at the entrypoint, even below900s and in `--record`.
-4. **Failed jobs.** A complete failed job gives `uncredited (not-green)`. A failed 800s run passes as today, and a
-   failed 1475s run fails.
+4. **Failed jobs.** A complete failed job gives `uncredited (not-green)`. The original wall-only fallback passed
+   a failed 800s run and blocked a failed 1475s run. The runner recovery amendment below blocks both.
 5. **`ci-speed`.** A queue-only reduction is denied. A reduction on both metrics passes. An uncreditable candidate
    or baseline is denied. Keep the existing removed-label, head/repo-mismatch and attempt-2 tests.
 6. **Actual runs.** Both reproduce the table exactly.
@@ -173,7 +180,7 @@ it stays charged.
 8. **History.** Old records stay byte-identical, appends work, duplicate run ids are not rewritten, and the
    workflow pins hold.
 
-## Implementation allowlist and invariants
+## Original activation allowlist and invariants
 
 The implementation may change only these files: `scripts/{policy,evaluate-budget,ci-budget}.mjs` and their
 `*.test.mjs`; `scripts/ci-workflow.test.mjs` (pins only); `scripts/fixtures/ci-budget-buffer.mjs`; a new
@@ -198,7 +205,7 @@ test/smoke/desktop counts, or history contents.
    root executor. The PR164 one-use exception and ADR0022/#57 are consumed, not reusable.
    Definition acceptance alone grants no bootstrap, protection, status or merge action.
 4. **Bounded route, still unauthorized.** Follow the detailed plan in
-   [ci-administration](../ci-administration.md#proposed-adr0025-bootstrap-not-authorized):
+   [historical CI administration proposal](../ci-administration.md#historical-adr-0025-bootstrap-proposal):
    zero armed auto-merges before the window and immediately before merge; exact
    head/base/main and settings pins; remove ONLY ci-time-budget temporarily;
    preserve admin enforcement and restore original strict/all five app bindings in
@@ -267,3 +274,55 @@ succeeded, and `ci-time-budget` reported wall 695 s, charged 690 s, budget
 satisfied. Credit applied. The authorization is consumed. It cannot be reused.
 
 Native paths remain **unverified on real hardware**.
+
+## Main runner cancellation recovery (2026-11-24)
+
+Main run [45420442928](https://github.com/Dytschgo/arxcovo/actions/runs/45420442928)
+on `cb285be3` took 913 s on attempt 1. The Rust macOS job never acquired a
+runner. The Rust Windows job was cancelled 749 s after starting, with every
+reported step successful or skipped. The three completion gates failed on
+the cancelled matrix. The same run's partial rerun succeeded in 613 s and
+reused four successful workers from attempt 1. Attempt 1 could earn neither
+idle queue credit nor a `ci-speed` comparison. The owner authorized a
+one-use bypass consumed by #310 and a budget policy fix.
+
+The main push CI run with the highest run number is authoritative across
+all statuses. A queued or running attempt keeps the gate pending. After
+60 minutes, the gate reports `stale-main-run` as a blocking failure.
+The clock uses the current attempt's start for in-progress runs and the
+run's last update for queued or other unfinished runs. Missing, invalid
+or future timestamps produce `invalid-main-run-timestamp`. Neither case
+falls back to a different run. See the [operator recovery procedure](../ci-administration.md#recovering-a-main-ci-budget-measurement).
+
+Once the latest run is complete, a green attempt 1 supplies the existing
+charged-v1 measurement and remains authoritative even if a later attempt
+is faster. If attempt 1 is non-green, inspect later attempts of the same
+run and commit in descending order. The scan is bounded by GitHub's
+50-rerun limit. The first full rerun is authoritative. Its run and all jobs
+must be green and pass the existing identity, topology and timing checks
+to earn credit. A full rerun that fails, exceeds the charged budget, or
+cannot be validated keeps the gate blocked, subject to the existing
+`ci-speed` rule for a valid green slow baseline.
+
+Each required job must have executed inside the full rerun's own time
+window. A later attempt proven partial by jobs with carried execution
+timestamps is skipped. Invalid or ambiguous metadata blocks the search
+rather than being treated as a partial rerun. When there is no full rerun,
+the non-green attempt 1 keeps the gate blocked, including below 900 s.
+Candidate PRs continue to use attempt 1.
+
+The budget gate measures duration. Required PR checks enforce correctness.
+A green full rerun supplies a new duration sample because it measures
+every required job together on the same commit. Partial reruns leave work
+out of that timing window. The reason for a non-green attempt 1 does not
+change the duration decision, so policy needs neither step classifications
+nor check annotations.
+
+GitHub does not emit `requested` for reruns, so policy also listens for
+`in_progress` on main push CI. Job-level concurrency serializes eligible
+evaluations. Ignored start events skip the evaluator before joining its
+concurrency group. An eligible event can replace a queued evaluation
+because every evaluation reads the latest state and evaluates all open
+PRs. Running evaluations finish without event-driven cancellation.
+[GitHub workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run) ·
+[GitHub concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)

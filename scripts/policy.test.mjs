@@ -5,13 +5,15 @@ import { actualRuns } from './fixtures/ci-queue-credit-runs.mjs';
 import { historicalSplitFirstAttempt } from './fixtures/ci-split-first-attempt.mjs';
 import { pinnedRustFirstAttempt } from './fixtures/ci-pinned-rust-first-attempt.mjs';
 test('slow main blocks normal PR and unmeasured speed claims', () => {
-  assert.throws(() => budget({ seconds: 901 }, null, false));
-  assert.throws(() => budget({ seconds: 901 }, null, true));
-  assert.throws(() => budget({ seconds: 901 }, { seconds: 902, conclusion: 'success' }, true));
-  assert.throws(() => budget({ seconds: 901 }, { seconds: 800, conclusion: 'failure' }, true));
-  assert.throws(() => budget({ seconds: 901 }, { seconds: 900, conclusion: 'success' }, true));
-  assert.equal(budget({ seconds: 900 }, null, false), true);
+  const latest = { seconds: 901, conclusion: 'success' };
+  assert.throws(() => budget(latest, null, false));
+  assert.throws(() => budget(latest, null, true));
+  assert.throws(() => budget(latest, { seconds: 902, conclusion: 'success' }, true));
+  assert.throws(() => budget(latest, { seconds: 800, conclusion: 'failure' }, true));
+  assert.throws(() => budget(latest, { seconds: 900, conclusion: 'success' }, true));
+  assert.equal(budget({ ...latest, seconds: 900 }, null, false), true);
   assert.throws(() => budget(null, null, false));
+  assert.throws(() => budget({ seconds: 900 }, null, false), /did not succeed/);
 });
 test('outsiders and forks never qualify for auto-merge', () => {
   assert.equal(eligible('agent', 'OWNER', true, ['agent']), true);
@@ -253,8 +255,7 @@ test('only a successful run and every successful worker and gate receive exact-n
     assert.equal(result.credit, 'withheld:not-green', `job ${i}: ${conclusion}`);
     assert.equal(result.queueCreditSeconds, 500);
     assert.equal(result.chargedSeconds, seconds - 500);
-    if (seconds === 800) assert.equal(budget(result, null, false), true);
-    else assert.throws(() => budget(result, null, false));
+    assert.throws(() => budget(result, null, false), /did not succeed/);
   }
   for (let i = 0; i < 9; i++) for (const [key, value] of [
     ['conclusion', 'skipped'], ['conclusion', null], ['conclusion', ''], ['status', 'queued'], ['status', 'in_progress'],
@@ -348,20 +349,41 @@ test('every metadata defect withholds credit and cannot authorize ci-speed', () 
   assert.equal(measure(missing).credit, 'unavailable:jobs-invalid');
 });
 
-test('failed run or any failed/cancelled complete job retains wall gate', () => {
+test('failed run or any failed/cancelled complete job blocks even below the wall budget', () => {
   for (const seconds of [800, 1475]) for (const target of ['run', 'job']) {
     const data = sample(undefined, seconds);
     (target === 'run' ? data.run : data.jobs.jobs[0]).conclusion = 'failure';
     const result = measure(data);
     assert.equal(result.credit, 'withheld:not-green');
-    if (seconds === 800) assert.equal(budget(result, null, false), true);
-    else assert.throws(() => budget(result, null, false));
+    assert.throws(() => budget(result, null, false), /did not succeed/);
   }
   const data = sample(); data.jobs.jobs[0].conclusion = 'cancelled';
   assert.equal(measure(data).credit, 'withheld:not-green');
   data.jobs.jobs[0].started_at = null;
   assert.equal(measure(data).credit, 'unavailable:jobs-invalid');
 });
+
+test('only a complete, same-identity rerun can supply a new timing measurement', () => {
+  const data = splitSample();
+  data.run.run_attempt = 2;
+  for (const job of data.jobs.jobs) job.run_attempt = 2;
+  const listed = { ...data.run, run_attempt: 3 };
+  const rerun = () => queueMeasurement(duration(data.run), data.run, data.jobs, listed, 'main', undefined, { attempt: 2, expectedJobCount: 9 });
+
+  assert.equal(rerun().credit, 'applied');
+  const carried = data.jobs.jobs[0];
+  carried.started_at = iso(-100);
+  carried.completed_at = iso(-50);
+  assert.equal(rerun().credit, 'unavailable:partial-rerun');
+  carried.created_at = iso(-110);
+  assert.equal(rerun().credit, 'unavailable:partial-rerun');
+  data.jobs.jobs[1].head_sha = 'b'.repeat(40);
+  assert.equal(rerun().credit, 'unavailable:jobs-invalid', 'malformed identity cannot be skipped as a partial rerun');
+  data.jobs.jobs[1].head_sha = listed.head_sha;
+  carried.completed_at = iso(1);
+  assert.equal(rerun().credit, 'unavailable:jobs-invalid', 'timing crossing the attempt boundary is ambiguous');
+});
+
 
 test('ci-speed rejects queue-only reduction, failed baseline even with faster green candidate, and requires both strict reductions', () => {
   const baseline = measure(sample([[0, 0, 1000], [0, 100, 1000], [0, 0, 1000]], 1500));

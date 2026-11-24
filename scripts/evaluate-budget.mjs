@@ -13,9 +13,13 @@ export async function evaluateEvent(io, triggeringHead) {
   }
 }
 
+const mainMarker = latest => latest ? `Main run ${latest.runId}: attempt ${latest.attempt ?? 1}:` : 'No valid completed main CI baseline';
+
 export function decideBudget(latest, candidate, labels) {
+  if (latest?.blocked) return { state: 'failure', description: `${mainMarker(latest)} ${latest.blocked}. Inspect Actions. If stuck, cancel and re-run all jobs` };
+  if (latest?.pending) return { state: 'pending', description: `${mainMarker(latest)} waiting for CI completion` };
   const charged = latest?.chargedSeconds == null ? `n/a (${latest?.credit?.split(':')[1] ?? 'run-invalid'})` : `${latest.chargedSeconds}s${creditable(latest) ? '' : ' uncredited (not-green)'}`;
-  const prefix = latest ? `Main run ${latest.runId}: wall ${latest.seconds}s, charged ${charged}; ` : '';
+  const prefix = latest ? `${mainMarker(latest)} wall ${latest.seconds}s, charged ${charged}; ` : '';
   try {
     budget(latest, candidate, labels.some(label => label.name === 'ci-speed'));
     const reduction = (creditable(latest) ? latest.chargedSeconds : latest.seconds) > 900;
@@ -60,14 +64,19 @@ export async function evaluatePullRequests({ listPullRequests, getPullRequest, g
       const pr = await getPullRequest(listed.number);
       head = pr.head.sha;
       if (pr.state !== 'open') continue;
+      if (latest?.pending) {
+        const result = decideBudget(latest, null, []);
+        await postStatus(head, result.state, result.description);
+        continue;
+      }
       const previous = await getStatus(head);
-      const marker = latest ? `Main run ${latest.runId}:` : 'No valid completed main CI baseline';
+      const marker = mainMarker(latest);
       // Unchanged final results stay final. Only invalidate an old success when
       // its authoritative main measurement changed, or initialize a new head.
       if (!previous || (previous.state === 'success' && !(previous.description ?? '').startsWith(marker))) {
         await postStatus(head, 'pending', `${marker} evaluating budget`);
       }
-      const candidate = latest?.seconds > 900 && pr.labels.some(label => label.name === 'ci-speed') ? await getCandidateRun(pr) : null;
+      const candidate = creditable(latest) && latest.chargedSeconds > 900 && pr.labels.some(label => label.name === 'ci-speed') ? await getCandidateRun(pr) : null;
       const current = await getPullRequest(pr.number);
       if (current.state !== 'open') continue;
       if (current.head.sha !== head) {
