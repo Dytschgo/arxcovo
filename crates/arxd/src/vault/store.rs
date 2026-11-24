@@ -200,6 +200,7 @@ impl WriteScope<'_> {
         db: &Connection,
         write: Write,
         tester_available: bool,
+        test_refusal: Option<Refusal>,
     ) -> Result<(Reply, Option<JobData>)> {
         let request = write.request_id();
         let now = scalar(
@@ -238,7 +239,13 @@ impl WriteScope<'_> {
                 Err(reason) => return self.refuse(db, reason),
             },
             Write::Test { version_id, .. } => {
-                match self.test(db, operation, version_id, tester_available)? {
+                match self.test(
+                    db,
+                    operation,
+                    version_id,
+                    test_refusal
+                        .or_else(|| (!tester_available).then_some(Refusal::TesterUnavailable)),
+                )? {
                     Ok(job) => (version_id, Some(job)),
                     Err(reason) => return self.refuse(db, reason),
                 }
@@ -344,7 +351,7 @@ impl WriteScope<'_> {
         db: &Connection,
         operation: Id,
         version: Id,
-        available: bool,
+        refusal: Option<Refusal>,
     ) -> Result<Result<JobData, Refusal>> {
         let subject: Option<(String, ScriptOs)> = db
             .query_row(
@@ -360,8 +367,8 @@ impl WriteScope<'_> {
         if state != "draft" {
             return Ok(Err(Refusal::NotDraft));
         }
-        if !available {
-            return Ok(Err(Refusal::TesterUnavailable));
+        if let Some(reason) = refusal {
+            return Ok(Err(reason));
         }
         if scalar(
             db,

@@ -63,7 +63,7 @@ pub(crate) fn for_activity(activity: &Arc<Activity>) -> Option<Arc<Vault>> {
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ScriptOs {
+pub(crate) enum ScriptOs {
     Windows,
     Ubuntu,
 }
@@ -105,7 +105,7 @@ impl Action {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Refusal {
+pub(crate) enum Refusal {
     Invalid,
     InvalidCursor,
     StaleKey,
@@ -114,6 +114,7 @@ enum Refusal {
     NotFound,
     NotDraft,
     TesterUnavailable,
+    VmAdmissionClosed,
     PassRequired,
     VersionSuperseded,
     Busy,
@@ -126,7 +127,7 @@ enum Refusal {
 }
 
 impl Refusal {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Invalid => "invalid",
             Self::InvalidCursor => "invalid_cursor",
@@ -136,6 +137,7 @@ impl Refusal {
             Self::NotFound => "not_found",
             Self::NotDraft => "not_draft",
             Self::TesterUnavailable => "tester_unavailable",
+            Self::VmAdmissionClosed => "vm_admission_closed",
             Self::PassRequired => "pass_required",
             Self::VersionSuperseded => "version_superseded",
             Self::Busy => "busy",
@@ -205,35 +207,36 @@ impl Write {
 /// Trusted daemon adapter. Enqueue is a prompt handoff after commit. The adapter
 /// must reserve a throwaway generation and qualify its teardown before reporting
 /// a pass. It must never log the job's body or expose it as guest output.
-trait VaultTester: Send + Sync {
+pub(crate) trait VaultTester: Send + Sync {
     fn enqueue(&self, job: TestJob);
 }
 
-// No production composition supplies a tester pending the M4 throwaway journey.
-// These adapter methods are exercised by the internal fake until that wiring lands.
-#[cfg_attr(not(test), allow(dead_code))]
-struct TestJob {
+pub(crate) struct TestJob {
     store: Arc<store::Store>,
     owner: String,
     data: store::JobData,
     settled: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl TestJob {
-    fn os(&self) -> ScriptOs {
+    pub(crate) fn os(&self) -> ScriptOs {
         self.data.os
     }
 
-    fn content(&self) -> &str {
+    pub(crate) fn content(&self) -> &str {
         &self.data.content
     }
 
+    #[cfg(test)]
     fn sha256(&self) -> [u8; 32] {
         self.data.hash
     }
 
-    fn complete(mut self, outcome: ScriptOutcome, cleanup_confirmed: bool) -> anyhow::Result<()> {
+    pub(crate) fn complete(
+        mut self,
+        outcome: ScriptOutcome,
+        cleanup_confirmed: bool,
+    ) -> anyhow::Result<()> {
         let (status, exit_code) = match outcome {
             ScriptOutcome::Exited { exit_code } => ("exited", Some(exit_code)),
             ScriptOutcome::Unavailable => ("unavailable", None),
@@ -289,7 +292,7 @@ pub(crate) struct Vault {
 }
 
 impl Vault {
-    fn open(
+    pub(crate) fn open(
         dir: &Path,
         tester: Option<Arc<dyn VaultTester>>,
         now: i64,
@@ -310,6 +313,7 @@ impl Vault {
         action: Action,
         write: Result<Write, Refusal>,
         now: i64,
+        test_refusal: Option<Refusal>,
     ) -> Reply {
         let scope = store::WriteScope {
             owner,
@@ -319,7 +323,7 @@ impl Vault {
         let (reply, job) = self
             .store
             .write(|db| match write {
-                Ok(write) => scope.execute(db, write, self.tester.is_some()),
+                Ok(write) => scope.execute(db, write, self.tester.is_some(), test_refusal),
                 Err(reason) => {
                     scope.audit(db, "refused", Some(reason.as_str()), None, None)?;
                     Ok((Err(reason), None))
@@ -366,7 +370,7 @@ impl Vault {
     }
 }
 
-fn utc_ms() -> anyhow::Result<i64> {
+pub(crate) fn utc_ms() -> anyhow::Result<i64> {
     let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
     anyhow::ensure!(now <= MAX_UTC_MS, "invalid vault clock");
     Ok(now)

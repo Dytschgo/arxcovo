@@ -1337,6 +1337,54 @@ pub(crate) struct ActivityReceipt {
 }
 
 impl<C: Clock> VmController<C> {
+    pub(crate) fn vault_test_template(
+        &self,
+        recipe: Id,
+        digest: [u8; 32],
+        guest: Guest,
+    ) -> Result<Option<Id>> {
+        self.store.transact(|db| {
+            let Some((template, _)) = store::sealed_pair(db, &hex::encode(recipe), digest)? else {
+                return Ok(None);
+            };
+            let compatible = store::count(
+                db,
+                "SELECT count(*) FROM vm_templates WHERE id=?1 AND guest=?2",
+                params![template, guest as i64],
+            )? == 1;
+            Ok(compatible.then_some(template))
+        })
+    }
+
+    pub(crate) fn vault_test_key(&self) -> Result<RequestId> {
+        let issued_at_ms = utc(self.clock.now())?;
+        let mut key = store::new_id()?;
+        key[..8].copy_from_slice(&issued_at_ms.to_be_bytes());
+        Ok(RequestId { key, issued_at_ms })
+    }
+
+    /// Accelerate the existing TEST lease cleanup. The reserved daemon
+    /// principal cannot be authenticated by a foreground client.
+    pub(crate) fn expire_vault_test(&self, vm: Id) -> Result<()> {
+        self.store.transact(|db| {
+            db.execute(
+                "UPDATE vm_instances SET expires_ms=min(expires_ms,?2)
+                 WHERE id=?1 AND principal='arxd'",
+                params![vm, utc(self.clock.now())?],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn vault_test_released(&self, vm: Id) -> Result<bool> {
+        self.store.transact(|db| {
+            let retired = store::tombstone_proof(db, "arxd", vm)?
+                .is_some_and(|(_, confirmed)| confirmed == Some(true));
+            let charge = store::count(db, "SELECT count(*) FROM vm_disk_claims WHERE vm=?1", [vm])?;
+            Ok(retired && charge == 0)
+        })
+    }
+
     pub(crate) fn foreground_catalog(
         &self,
         principal: &str,

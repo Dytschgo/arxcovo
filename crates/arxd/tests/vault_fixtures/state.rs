@@ -40,6 +40,7 @@ fn add(vault: &Arc<Vault>, nonce: u64, name: &str, body: &str) -> Reply {
             script: body.into(),
         }),
         NOW,
+        None,
     )
 }
 
@@ -56,6 +57,7 @@ fn test(vault: &Arc<Vault>, nonce: u64, version_id: Id) -> Reply {
             version_id,
         }),
         NOW,
+        None,
     )
 }
 
@@ -68,6 +70,7 @@ fn activate(vault: &Arc<Vault>, nonce: u64, version_id: Id) -> Reply {
             version_id,
         }),
         NOW,
+        None,
     )
 }
 
@@ -213,6 +216,7 @@ fn vault_replay_lock_recovery_and_clock_rollback() {
                     version_id: version,
                 },
                 true,
+                None,
             )?;
             assert!(job.is_some());
             Ok(())
@@ -233,7 +237,8 @@ fn vault_replay_lock_recovery_and_clock_rollback() {
                 request_id: key(3),
                 version_id: version,
             }),
-            NOW + crate::vm::RETRY_WINDOW_MS + 1
+            NOW + crate::vm::RETRY_WINDOW_MS + 1,
+            None,
         ),
         Err(Refusal::StaleKey)
     );
@@ -315,6 +320,7 @@ fn vault_owner_caps_keep_capacity_available_to_other_principals() {
                 script: content.into(),
             }),
             NOW,
+            None,
         )
     };
     assert!(add_as("byte-owner", 1, "bytes", &"x".repeat(MAX_SCRIPT)).is_ok());
