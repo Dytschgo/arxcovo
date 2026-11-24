@@ -5757,6 +5757,156 @@ mod tests {
         h.shutdown().await.unwrap();
     }
 
+    /// The latest release audit's publication cause.
+    fn release_cause(h: &Harness) -> Option<i64> {
+        h.supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                Ok(db.query_row(
+                    "SELECT publication_failure FROM activity WHERE action=17
+                     ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_owner_cause_survives_post_errors_checkpoint_outages_and_shutdown() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let cancelled = Some(crate::vm::FailureReason::Cancelled as i64);
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1800).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let host = h.supervisor().host_id;
+
+        // The owner revokes after the POST's first byte and the POST then
+        // fails. The receipt keeps the owner cause over the DNS failure, and
+        // the attributed record is removed.
+        let (post, in_post, release_post) = gate();
+        *fake.post_gate.lock().unwrap() = Some(post);
+        let pending = call(&a, "publish_site", args(1810)).await;
+        entered(in_post).await;
+        assert_eq!(
+            call(&a, "unpublish_site", args(1810)).await["reason"],
+            "key_collision"
+        );
+        until(|| !fake.local.load(SeqCst)).await;
+        drop(release_post);
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (&json!("failed"), &json!("cancelled"), &json!("confirmed")),
+            "{failed}"
+        );
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (1, 1));
+        let status = phase(&a, &vm).await;
+        assert_eq!(
+            (&status["phase"], &status["reason"]),
+            (&json!("unpublished"), &json!("cancelled")),
+            "{status}"
+        );
+
+        // The owner revokes before connector start and the `revoking`
+        // checkpoint fails. SQLite recovers and shutdown runs before any
+        // reaper turn: the final reconciliation still records the owner cause
+        // on the release, its audit and the receipt.
+        let (worker, in_worker, release_worker) = gate();
+        *h.supervisor().publisher.activate_gate.lock().unwrap() = Some(worker);
+        let pending = call(&a, "publish_site", args(1811)).await;
+        entered(in_worker).await;
+        assert_eq!(
+            call(&a, "unpublish_site", args(1811)).await["reason"],
+            "key_collision"
+        );
+        until(|| revocations_settled(h.supervisor())).await;
+        trigger(
+            &h,
+            "CREATE TRIGGER refuse_revoking BEFORE UPDATE OF phase ON vm_publication
+             WHEN NEW.phase='revoking'
+             BEGIN SELECT RAISE(ABORT, 'synthetic checkpoint failure'); END;",
+        );
+        release_worker.send(()).unwrap();
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert_eq!(phase(&a, &vm).await["phase"], "publishing");
+        trigger(&h, "DROP TRIGGER refuse_revoking");
+        drop(a);
+        h.shutdown().await.unwrap();
+        let mut h = h.reopen(|_| {}).await;
+        enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
+        let a = h.client(0).await;
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"]),
+            (&json!("failed"), &json!("cancelled")),
+            "{failed}"
+        );
+        let status = phase(&a, &vm).await;
+        assert_eq!(
+            (&status["phase"], &status["reason"]),
+            (&json!("unpublished"), &json!("cancelled")),
+            "{status}"
+        );
+        assert_eq!(release_cause(&h), cancelled);
+
+        // The owner revokes between the possible-POST marker and submission,
+        // and the withdrawal and the release both fail. SQLite recovers and
+        // shutdown runs before any reaper turn: the in-memory no-submission
+        // proof releases the intent without DNS, with the owner cause.
+        let start = call(&a, "vm_start", args(1812)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let (marker, in_marker, release_marker) = gate();
+        *h.supervisor().publisher.marker_gate.lock().unwrap() = Some(marker);
+        let posts = fake.posts.load(SeqCst);
+        let pending = call(&a, "publish_site", args(1813)).await;
+        entered(in_marker).await;
+        assert_eq!(
+            call(&a, "unpublish_site", args(1813)).await["reason"],
+            "key_collision"
+        );
+        trigger(
+            &h,
+            "CREATE TRIGGER withdrawal_failure BEFORE UPDATE OF post_possible ON vm_publication
+             WHEN OLD.post_possible=1 AND NEW.post_possible=0
+             BEGIN SELECT RAISE(ABORT, 'synthetic withdrawal failure'); END;
+             CREATE TRIGGER release_failure BEFORE DELETE ON vm_publication
+             BEGIN SELECT RAISE(ABORT, 'synthetic release failure'); END;",
+        );
+        release_marker.send(()).unwrap();
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert_eq!(phase(&a, &vm).await["phase"], "revoking");
+        trigger(
+            &h,
+            "DROP TRIGGER withdrawal_failure; DROP TRIGGER release_failure;",
+        );
+        fake.routes.lock().unwrap().clear();
+        drop(a);
+        h.shutdown().await.unwrap();
+        assert!(fake.routes.lock().unwrap().is_empty(), "DNS consulted");
+        let mut h = h.reopen(|_| {}).await;
+        enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
+        let a = h.client(0).await;
+        let failed = terminal(&a, &pending).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"]),
+            (&json!("failed"), &json!("cancelled")),
+            "{failed}"
+        );
+        let status = phase(&a, &vm).await;
+        assert_eq!(
+            (&status["phase"], &status["reason"]),
+            (&json!("unpublished"), &json!("cancelled")),
+            "{status}"
+        );
+        assert_eq!(release_cause(&h), cancelled);
+        assert_eq!(fake.posts.load(SeqCst), posts);
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_failed_revoking_checkpoint_keeps_the_owner_cause() {
         let mut h = Harness::start_with_web(false, false, true).await;
