@@ -193,10 +193,17 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    trial authority with a disposable store and enrolled inputs. Start paused,
    diskless and networkless. Select the reviewed witnessed distribution and
    exact sealed recipe after the native adapter has landed. Verify the
-   protected bundle and search directories. Collect the creation-to-exit
-   loader verdict and the per-stage held-open coverage, including transient
-   firmware and helper inputs. Keep both witnesses active through settlement.
-   Stop on any missing or inconclusive proof and retain the scoped refusal.
+   protected bundle and search directories. Verify single-process Job
+   and child-creation restrictions for QEMU and each helper. Collect the
+   creation-to-exit image verdict and stage coverage for file opens, data
+   mappings and named objects, including transient firmware and helper
+   inputs. Prove a fresh helper output against its held created object.
+   On refusal, stop the owned Job while preserving debugger containment.
+   Drain terminal events before waiting for held process exit. Verify
+   the Job is empty, workers have joined and file custody is intact
+   before releasing the slot.
+   Seal successful qualification only after clean settlement and complete
+   witness evidence. Record dirty release or quarantine on failure.
    [ADR 0054 qualification witness](adr/0054-m4-dedicated-windows-runtime.md#amendment-2026-11-24--actual-image-and-file-open-witness-for-m4-qualification)
 
    Prove `pc-q35-11.1` WHPX boot without fallback. On the held child, verify the
