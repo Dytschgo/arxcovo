@@ -31,7 +31,13 @@ Contention timeout, backoff beyond the custody deadline, shutdown before
 custody, and the absence of a guest verdict produce a retryable
 `test_inconclusive` result. It preserves the
 active version and frees the test slot. A fresh request can test the same
-version again. The vault v2 schema stores the retryable marker separately
+version again. Shutdown cancels the wait for the last VM worker and arms
+the clone's lease for the reaper. Final recovery requires the foreground
+to join its VM workers and custody work. If the process exits with a vault
+test still pending, reopening the vault records `test_inconclusive` and
+its audit entry in one transaction. The original request receipt remains
+available for replay. VM charges stay in place until the reaper confirms
+release. The vault v2 schema stores the retryable marker separately
 from permanent rejection and preserves prior v1 outcomes and request receipts.
 A confirmed expiry receipt and zero remaining disk claims are required before
 a zero exit can record a pass. The vault compares the exact version's digest

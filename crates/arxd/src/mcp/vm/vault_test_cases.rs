@@ -388,6 +388,134 @@ async fn vault_tester_drain_joins_pending_guest_and_vault_settlement() {
     assert_eq!(vault_vm_counts(&h), (1, 0, 0));
 }
 
+#[tokio::test]
+async fn vault_fence_cancels_pre_custody_wait_while_guest_is_pending() {
+    let mut h = Harness::start(false, false).await;
+    let supervisor = h.supervisor().clone();
+    supervisor.open_vault(h.temp.path()).unwrap();
+    let client = h.client(0).await;
+    seal_vault_template(&h, &client, 607).await;
+    let version = add_vault_version(&client, 1, VAULT_EXIT_0).await;
+    assert_eq!(
+        call(&client, "vault_test_version", vault_write_args(&version, 2)).await["ok"],
+        true
+    );
+    wait_for_vault_script(&h).await;
+    let mut teardown = Stall::install(&supervisor.stall_vault_teardown);
+    let mut acquisition = Stall::install(&supervisor.stall_vault_acquisition);
+
+    // Deliver the admission fence first and keep the guest worker parked.
+    // The vault job must finish before the normal worker drain is released.
+    supervisor.fenced.store(true, Ordering::SeqCst);
+    teardown.entered().await;
+    teardown.release_and_join().await;
+    supervisor
+        .drain_vault_jobs(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(acquisition.not_entered());
+    let row = crate::vault::mcp::invoke(
+        supervisor.vault.get().unwrap(),
+        "alpha",
+        "vault_get",
+        json!({"version_id":version}).as_object().unwrap().clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(row["state"], "test_inconclusive");
+    assert_eq!(vault_vm_counts(&h), (1, 1, 1));
+    drop(acquisition);
+    drop(client);
+    h.shutdown().await.unwrap();
+    assert_eq!(vault_vm_counts(&h), (1, 0, 0));
+}
+
+#[tokio::test]
+async fn vault_pre_custody_drain_timeout_allows_retry_after_reopen() {
+    let mut h = Harness::start(false, false).await;
+    let supervisor = h.supervisor().clone();
+    supervisor.open_vault(h.temp.path()).unwrap();
+    let client = h.client(0).await;
+    seal_vault_template(&h, &client, 606).await;
+    let active = add_vault_version(&client, 1, VAULT_EXIT_0).await;
+    assert_eq!(
+        call(&client, "vault_test_version", vault_write_args(&active, 2)).await["ok"],
+        true
+    );
+    h.hold_script.notify_one();
+    assert_eq!(
+        vault_result(&client, &active).await["test"]["cleanup_confirmed"],
+        true
+    );
+    assert_eq!(
+        call(&client, "vault_activate", vault_write_args(&active, 3)).await["ok"],
+        true
+    );
+
+    let hold = h.hold_script.clone();
+    h.fixture(|fixture| fixture.script_hold = Some(hold));
+    let version = add_vault_version(&client, 4, VAULT_EXIT_0).await;
+    let args = vault_write_args(&version, 5);
+    let receipt = call(&client, "vault_test_version", args.clone()).await;
+    assert_eq!(receipt["ok"], true);
+    wait_for_vault_script(&h).await;
+    let mut teardown = Stall::install(&supervisor.stall_vault_teardown);
+    let mut acquisition = Stall::install(&supervisor.stall_vault_acquisition);
+    let mut recovery = Stall::install(&supervisor.stall_recovery);
+    let server = h.server.take().unwrap();
+    h.interrupt.take().unwrap().send(()).unwrap();
+    teardown.entered().await;
+    let result = tokio::time::timeout(Duration::from_secs(15), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.unwrap_err().to_string(), "server-drain-unconfirmed");
+    assert!(acquisition.not_entered());
+    assert!(recovery.not_entered());
+    assert_eq!(vault_vm_counts(&h), (2, 1, 1));
+
+    // The preparation hook holds the sole pending job. Snapshot the quiescent
+    // vault image at process exit, before allowing the old job to unwind.
+    let mut restarted = Harness::start(false, false).await;
+    fs::copy(
+        h.temp.path().join("vault.sqlite3"),
+        restarted.temp.path().join("vault.sqlite3"),
+    )
+    .unwrap();
+    drop(acquisition);
+    teardown.release_and_join().await;
+    restarted
+        .supervisor()
+        .open_vault(restarted.temp.path())
+        .unwrap();
+    let new_client = restarted.client(0).await;
+    let row = vault_version(&new_client, &version).await;
+    assert_eq!(row["state"], "test_inconclusive");
+    assert_eq!(
+        row["test"],
+        json!({"status":"test_inconclusive","cleanup_confirmed":false})
+    );
+    assert_eq!(vault_version(&new_client, &active).await["state"], "active");
+    assert_eq!(call(&new_client, "vault_test_version", args).await, receipt);
+    seal_vault_template(&restarted, &new_client, 608).await;
+    let retry = call(
+        &new_client,
+        "vault_test_version",
+        vault_write_args(&version, 6),
+    )
+    .await;
+    assert_eq!(retry["ok"], true);
+    assert_ne!(retry["operation_id"], receipt["operation_id"]);
+    restarted.hold_script.notify_one();
+    assert_eq!(
+        vault_result(&new_client, &version).await["test"]["cleanup_confirmed"],
+        true
+    );
+    assert_eq!(vault_vm_counts(&h), (2, 1, 1));
+    drop(new_client);
+    restarted.shutdown().await.unwrap();
+}
+
 fn hold_vault_custody_lock(harness: &Harness) -> (Stall, JoinHandle<()>) {
     let slot = Mutex::default();
     let stall = Stall::install(&slot);

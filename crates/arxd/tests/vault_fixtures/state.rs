@@ -258,8 +258,24 @@ fn vault_replay_lock_recovery_and_clock_rollback() {
     drop(vault);
     let vault = Vault::open(dir.path(), None, NOW).unwrap();
     let recovered = vault.get(OWNER, version, false).unwrap();
-    assert_eq!(recovered["state"], "rejected");
-    assert_eq!(recovered["test"]["status"], "interrupted");
+    assert_eq!(recovered["state"], "test_inconclusive");
+    assert_eq!(
+        recovered["test"],
+        json!({"status":"test_inconclusive","cleanup_confirmed":false})
+    );
+    vault
+        .store
+        .read(|db| {
+            let count: i64 = db.query_row(
+                "SELECT count(*) FROM audit WHERE version=?1 AND action='vault_test_version'
+             AND outcome='failed' AND reason='test_inconclusive'",
+                [version],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 1);
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(add(&vault, 1, "one", "exit 0").unwrap(), receipt);
     assert!(test(&vault, 2, version).is_ok());
     assert_eq!(

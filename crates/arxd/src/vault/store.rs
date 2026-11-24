@@ -120,13 +120,13 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO audit(owner,action,at_ms,outcome,reason,version,operation)
-             SELECT s.owner,'vault_test_version',?1,'failed','interrupted',v.id,v.test_op
+             SELECT s.owner,'vault_test_version',?1,'failed','test_inconclusive',v.id,v.test_op
              FROM versions v JOIN scripts s ON s.seq=v.script
              WHERE v.state='testing' AND v.test_status IS NULL",
             [now],
         )?;
         tx.execute(
-            "UPDATE versions SET state='rejected',test_status='interrupted',cleanup_confirmed=0
+            "UPDATE versions SET state='rejected',test_status='interrupted',cleanup_confirmed=0,inconclusive=1
              WHERE state='testing' AND test_status IS NULL",
             [],
         )?;

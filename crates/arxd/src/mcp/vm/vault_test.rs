@@ -216,19 +216,12 @@ impl Run {
     }
 
     fn wait(&self, operation: Id) -> Option<OperationStatus> {
-        self.wait_for_worker(operation, self.deadline, true)
+        self.wait_for_worker(operation, self.deadline)
     }
 
-    fn wait_for_worker(
-        &self,
-        operation: Id,
-        deadline: Instant,
-        stop_when_fenced: bool,
-    ) -> Option<OperationStatus> {
+    fn wait_for_worker(&self, operation: Id, deadline: Instant) -> Option<OperationStatus> {
         let supervisor = &self.inventory.supervisor;
-        while Instant::now() < deadline
-            && !(stop_when_fenced && supervisor.fenced.load(Ordering::SeqCst))
-        {
+        while Instant::now() < deadline && !supervisor.fenced.load(Ordering::SeqCst) {
             let status = self.status(operation)?;
             #[cfg(test)]
             let working = supervisor
@@ -263,11 +256,11 @@ impl Run {
             stall.map(super::tests::StallHook::enter)
         };
         let deadline = Instant::now() + WORKER_SETTLE_BUDGET;
-        // Cancellation ends exercise immediately. Let an admitted VM worker
-        // settle before arming expiry so cleanup cannot race its last write.
+        // Arm the clone's lease even when shutdown cancels this wait. Final
+        // recovery owns cleanup after the foreground has joined its workers.
         let settled = self
             .last_operation
-            .is_some_and(|operation| self.wait_for_worker(operation, deadline, false).is_some());
+            .is_some_and(|operation| self.wait_for_worker(operation, deadline).is_some());
         if supervisor.controller.expire_vault_test(id).is_err() || !settled {
             return Inconclusive;
         }
