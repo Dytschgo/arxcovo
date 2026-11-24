@@ -109,7 +109,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 11;
+const VM_SCHEMA_VERSION: u32 = 12;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -479,6 +479,9 @@ pub(crate) mod publish;
 #[path = "vm_snapshot.rs"]
 pub(crate) mod snapshot;
 
+#[path = "vm_compose.rs"]
+pub(crate) mod compose;
+
 #[path = "vm_static.rs"]
 pub(crate) mod static_vm;
 
@@ -575,6 +578,9 @@ impl VmStore {
         }
         if version < 11 {
             tx.execute_batch(snapshot::MIGRATE_V11)?;
+        }
+        if version < 12 {
+            tx.execute_batch(compose::MIGRATE_V12)?;
         }
         recover(&tx, now)?;
         check_size(&tx)?;
@@ -1198,6 +1204,9 @@ impl Binding<'_> {
             } else {
                 Err(Refusal::KeyCollision)
             });
+        }
+        if compose::uses_key(db, self.principal, self.key.key)? {
+            return Ok(Err(Refusal::KeyCollision));
         }
         if self.key.issued_at_ms > now {
             return Ok(Err(Refusal::StaleKey));
@@ -3087,9 +3096,9 @@ mod tests {
     }
 
     #[test]
-    fn v11_keeps_v9_and_v10_activity_replay_and_static_generation() {
-        for version in [9, 10] {
-            verify_v11_upgrade(version);
+    fn v12_keeps_v9_through_v11_activity_replay_and_static_generation() {
+        for version in [9, 10, 11] {
+            verify_compose_upgrade(version);
         }
     }
 
@@ -3194,7 +3203,10 @@ mod tests {
         let store = VmStore::open(dir.path(), NOW).unwrap();
         store
             .transact(|db| {
-                assert_eq!(count(db, "PRAGMA user_version", [])?, 11);
+                assert_eq!(
+                    count(db, "PRAGMA user_version", [])?,
+                    i64::from(VM_SCHEMA_VERSION)
+                );
                 assert_eq!(
                     db.query_row(
                         "SELECT origin_generation FROM vm_static_instances WHERE id=?1",
@@ -3236,10 +3248,13 @@ mod tests {
             let version: u32 = db
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 11);
+            assert_eq!(version, VM_SCHEMA_VERSION);
             // Exact v10 VmStore::open and DashboardCatalog::open version gates.
             assert!(!matches!(version, 0 | 5..=10));
             assert_ne!(version, 10);
+            // Exact v11 writer and read-only dashboard gates.
+            assert!(!matches!(version, 0 | 5..=11));
+            assert_ne!(version, 11);
         }
         assert_eq!(fs::read(&copy_path).unwrap(), before_copy);
     }
@@ -3324,7 +3339,7 @@ mod tests {
             .unwrap();
     }
 
-    fn verify_v11_upgrade(version: u32) {
+    fn verify_compose_upgrade(version: u32) {
         let dir = private_temp();
         let db = v6_fixture(dir.path());
         db.execute_batch(MIGRATE_V7).unwrap();
@@ -3366,7 +3381,7 @@ mod tests {
             "UPDATE sqlite_sequence SET seq=900 WHERE name='activity'; PRAGMA user_version=9;",
         )
         .unwrap();
-        if version == 10 {
+        if version >= 10 {
             db.execute_batch(publish::MIGRATE_V10).unwrap();
             db.pragma_update(None, "user_version", 10).unwrap();
             db.execute(
@@ -3378,11 +3393,16 @@ mod tests {
             )
             .unwrap();
         }
+        if version == 11 {
+            db.execute_batch(snapshot::MIGRATE_V11).unwrap();
+            db.pragma_update(None, "user_version", 11).unwrap();
+        }
         let ledger = ledger_ids(&db).unwrap();
         drop(db);
         let store = VmStore::open(dir.path(), NOW).unwrap();
         store.transact(|db| {
-            assert_eq!(count(db, "PRAGMA user_version", [])?, 11);
+            assert_eq!(count(db, "PRAGMA user_version", [])?, i64::from(VM_SCHEMA_VERSION));
+            assert_eq!(count(db, "SELECT count(*) FROM vm_compose_projects", [])?, 0);
             assert_eq!(
                 db.query_row("SELECT origin_generation FROM vm_static_instances WHERE id=?1",
                     [vm], |row| row.get::<_, Id>(0))?,
@@ -3393,7 +3413,7 @@ mod tests {
             assert_eq!(replay.operation.id, recorded.id);
             assert_eq!(active(db)?, generation);
             assert_eq!(static_vm::owned_state(db, "alice", vm)?, Some(StaticState::Stopped));
-            if version == 10 {
+            if version >= 10 {
                 let route = publish::current(db)?.expect("v10 route retained");
                 assert_eq!(route.generation, generation[0]);
                 assert_eq!(route.nonce, "b".repeat(32));

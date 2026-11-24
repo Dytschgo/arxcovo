@@ -291,7 +291,7 @@ impl<'a> UbuntuWebRecipe<'a> {
 
 // Read only CIDATA emitted by UbuntuRecipe. File IDs follow the existing
 // bootstrap contract. Their extents and the directory layout come from ISO9660.
-fn cidata_files(base: &[u8]) -> Option<[&[u8]; 7]> {
+pub(super) fn cidata_files(base: &[u8]) -> Option<[&[u8]; 7]> {
     const DESCRIPTOR_SECTOR: usize = 2048;
     const NAMES: [&[u8]; 7] = [
         b"ARXAUDIT.;1",

@@ -246,6 +246,8 @@ struct Gate {
     allow_agent_public_sites: bool,
     publish_profile: Option<Arc<Profile>>,
     publish_jobs: tokio::task::JoinSet<anyhow::Result<()>>,
+    compose_jobs: tokio::task::JoinSet<()>,
+    compose_active: Arc<Mutex<std::collections::HashSet<Id>>>,
     #[cfg(test)]
     fixture: Option<tests::Fixture>,
     #[cfg(test)]
@@ -267,6 +269,7 @@ pub(crate) struct Supervisor {
     /// the closed candidate runtime; it never authorizes a launch here.
     runtime: Option<VmRuntimeProfile>,
     publisher: Publication,
+    compose: compose::Host,
     /// Deferred local stops queued by owner revocation, at most one in flight
     /// per activation generation. Kept outside the dispatch gate: revocation
     /// runs before the gate, the replay ledger and every store write.
@@ -340,6 +343,31 @@ impl Supervisor {
         )?;
         let state = Arc::get_mut(&mut supervisor)
             .ok_or_else(|| anyhow::anyhow!("VM supervisor shared before open"))?;
+        if let Some(secret_root) = profile.compose_secret_root.as_deref() {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            {
+                *state
+                    .compose
+                    .secrets
+                    .get_mut()
+                    .map_err(|_| anyhow::anyhow!("Compose custody unavailable"))? = Some(Arc::new(
+                    crate::vm::compose_secrets::Dpapi::new(secret_root, root)?,
+                ));
+            }
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            {
+                let _ = secret_root;
+                anyhow::bail!("Compose secret custody requires Windows x64");
+            }
+        }
+        if !profile.compose_releases.is_empty() {
+            let enrollments = profile
+                .compose_releases
+                .into_iter()
+                .map(compose::ReleaseInput::enroll)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            crate::store::vm::compose::enroll(state.controller.compose_store(), &enrollments)?;
+        }
         state.root_pin = Some(pin);
         let gate = state
             .gate
@@ -375,6 +403,8 @@ impl Supervisor {
                 allow_agent_public_sites: false,
                 publish_profile: None,
                 publish_jobs: Default::default(),
+                compose_jobs: Default::default(),
+                compose_active: Default::default(),
                 #[cfg(test)]
                 fixture: None,
                 #[cfg(test)]
@@ -388,6 +418,7 @@ impl Supervisor {
             native_refusal,
             runtime,
             publisher: Publication::default(),
+            compose: compose::Host::default(),
             stops: Mutex::default(),
             #[cfg(test)]
             stops_spawned: Default::default(),
@@ -612,7 +643,13 @@ impl Supervisor {
     /// quiescence.
     pub(crate) async fn drain_workers(&self, bound: Duration) -> anyhow::Result<Drained> {
         let deadline = tokio::time::Instant::now() + bound;
-        let mut publish_jobs = std::mem::take(&mut self.lock()?.publish_jobs);
+        let (mut publish_jobs, mut compose_jobs) = {
+            let mut gate = self.lock()?;
+            (
+                std::mem::take(&mut gate.publish_jobs),
+                std::mem::take(&mut gate.compose_jobs),
+            )
+        };
         tokio::time::timeout_at(deadline, async {
             // Local stop only: registrations without a connector belong to
             // workers that have not joined yet. The outcome is decided below.
@@ -651,6 +688,9 @@ impl Supervisor {
                 local && !self.publisher.stop_unconfirmed(),
                 "publication settlement unconfirmed"
             );
+            while let Some(job) = compose_jobs.join_next().await {
+                job?;
+            }
             Ok::<_, anyhow::Error>(())
         })
         .await??;
@@ -824,10 +864,16 @@ enum ToolName {
     SnapshotList,
     SnapshotRestore,
     SnapshotDelete,
+    ComposeDeploy,
+    ComposeStart,
+    ComposeStop,
+    ComposeDown,
+    ComposeStatus,
+    ComposeLogs,
 }
 
 impl ToolName {
-    const ALL: [Self; 22] = [
+    const ALL: [Self; 28] = [
         Self::Hosts,
         Self::Activity,
         Self::Catalog,
@@ -850,6 +896,12 @@ impl ToolName {
         Self::SnapshotList,
         Self::SnapshotRestore,
         Self::SnapshotDelete,
+        Self::ComposeDeploy,
+        Self::ComposeStart,
+        Self::ComposeStop,
+        Self::ComposeDown,
+        Self::ComposeStatus,
+        Self::ComposeLogs,
     ];
 
     fn name(self) -> &'static str {
@@ -876,6 +928,12 @@ impl ToolName {
             Self::SnapshotList => "vm_snapshot_list",
             Self::SnapshotRestore => "vm_snapshot_restore",
             Self::SnapshotDelete => "vm_snapshot_delete",
+            Self::ComposeDeploy => "compose_deploy",
+            Self::ComposeStart => "compose_start",
+            Self::ComposeStop => "compose_stop",
+            Self::ComposeDown => "compose_down",
+            Self::ComposeStatus => "compose_status",
+            Self::ComposeLogs => "compose_logs",
         }
     }
 
@@ -900,7 +958,34 @@ impl ToolName {
     fn schema(self) -> Tool {
         let id = json!({"type":"string","pattern":"^[0-9a-f]{32}$"});
         let ttl = json!({"type":"integer","minimum":60,"maximum":2592000});
+        let project = json!({"type":"string","pattern":"^[a-z](?:[a-z0-9-]{0,22}[a-z0-9])?$"});
         let (description, properties, required): (_, _, &[&str]) = match self {
+            Self::ComposeDeploy => (
+                "Deploy an owner-enrolled Compose release",
+                json!({"vm_id":id,"project_id":project,"release_id":id,"request_id":id}),
+                &["vm_id", "project_id", "release_id", "request_id"],
+            ),
+            Self::ComposeStart | Self::ComposeStop | Self::ComposeDown => (
+                match self {
+                    Self::ComposeStart => "Start the committed Compose revision",
+                    Self::ComposeStop => "Stop the committed Compose revision",
+                    _ => "Remove the project's containers and network while retaining volumes",
+                },
+                json!({"vm_id":id,"project_id":project,"request_id":id}),
+                &["vm_id", "project_id", "request_id"],
+            ),
+            Self::ComposeStatus => (
+                "Read durable Compose project status",
+                json!({"vm_id":id,"project_id":project}),
+                &["vm_id", "project_id"],
+            ),
+            Self::ComposeLogs => (
+                "Read typed Compose lifecycle diagnostics",
+                json!({"vm_id":id,"project_id":project,
+                    "limit":{"type":"integer","minimum":1,"maximum":arx_guest::compose::MAX_LOG_ENTRIES},
+                    "cursor":{"type":"integer","minimum":0,"maximum":i64::MAX}}),
+                &["vm_id", "project_id"],
+            ),
             Self::Hosts => ("List safe host facts", json!({}), &[]),
             Self::Activity => (
                 "List caller-scoped VM receipts",
@@ -1286,6 +1371,21 @@ impl VmInventory {
         let mut args = Args::new(request.arguments.unwrap_or_default());
         if args.malformed() {
             return self.refuse(tool.action().unwrap_or(READ_REFUSAL_ACTION), None, INVALID);
+        }
+        if matches!(
+            tool,
+            ToolName::ComposeDeploy
+                | ToolName::ComposeStart
+                | ToolName::ComposeStop
+                | ToolName::ComposeDown
+                | ToolName::ComposeStatus
+                | ToolName::ComposeLogs
+        ) {
+            if tool == ToolName::ComposeLogs {
+                drop(gate);
+                return self.compose_logs(args);
+            }
+            return self.compose_dispatch(&mut gate, tool, args);
         }
         if let Some(action) = tool.action() {
             // The attempted VM ID is only a candidate correlation. The audit
@@ -2167,6 +2267,197 @@ fn cleanup_wire(label: &str) -> Option<&'static str> {
         "unconfirmed" => Some(proof_wire(false)),
         "pending" => Some("pending"),
         _ => None,
+    }
+}
+
+impl VmInventory {
+    fn compose_target(args: &mut Args) -> Outcome<compose::Target> {
+        let vm = args.id("vm_id")?;
+        let project = args.get::<String>("project_id")?;
+        if !arx_guest::compose::is_project_id(&project) {
+            return Err(INVALID);
+        }
+        Ok(compose::Target { vm, project })
+    }
+
+    fn compose_dispatch(&self, gate: &mut Gate, tool: ToolName, mut args: Args) -> Outcome<Value> {
+        use crate::store::vm::compose as db;
+        let target = Self::compose_target(&mut args)?;
+        let store = self.supervisor.controller.compose_store();
+        let session = self.supervisor.compose.session(target.vm);
+        if tool == ToolName::ComposeStatus {
+            args.end()?;
+            let status = store
+                .transact(|tx| db::status(tx, &self.principal, &target))?
+                .ok_or(NOT_FOUND)?;
+            let generation = store.transact(|tx| db::boot(tx, &self.principal, &target))?;
+            let current = session.as_ref().is_some_and(|s| {
+                status.pending.is_none()
+                    && generation == Some(s.generation)
+                    && status.generation == generation
+                    && status.boot == Some(s.wire_boot)
+            });
+            return Ok(json!({
+                "desired":status.desired, "revision":status.revision,
+                "observed":status.observation, "current_boot":current,
+                "operation_id":status.pending.map(hex::encode),
+                "last_receipt":status.last_receipt,
+            }));
+        }
+        let kind = match tool {
+            ToolName::ComposeDeploy => compose::Kind::Deploy,
+            ToolName::ComposeStart => compose::Kind::Start,
+            ToolName::ComposeStop => compose::Kind::Stop,
+            ToolName::ComposeDown => compose::Kind::Down,
+            _ => return Err(INVALID),
+        };
+        let key = args.id("request_id")?;
+        let release = (kind == compose::Kind::Deploy)
+            .then(|| args.id("release_id"))
+            .transpose()?;
+        args.end()?;
+        let request = compose::Mutation {
+            target,
+            kind,
+            key,
+            release,
+        };
+        let intent = store
+            .transact(|tx| {
+                if let Some(known) = db::replay(tx, &self.principal, key)? {
+                    return Ok(if known.replay_matches(&request) {
+                        Ok(known)
+                    } else {
+                        Err(compose::Fault::KeyCollision)
+                    });
+                }
+                if crate::store::vm::count(
+                    tx,
+                    "SELECT count(*) FROM vm_operations WHERE principal=?1 AND request_key=?2",
+                    rusqlite::params![self.principal, key],
+                )? != 0
+                {
+                    return Ok(Err(compose::Fault::KeyCollision));
+                }
+                if db::status(tx, &self.principal, &request.target)?.is_none() {
+                    return Ok(Err(compose::Fault::NotFound));
+                }
+                let Some(session) = &session else {
+                    return Ok(Err(compose::Fault::NotReady));
+                };
+                if db::boot(tx, &self.principal, &request.target)? != Some(session.generation) {
+                    return Ok(Err(compose::Fault::NotReady));
+                }
+                db::admit(
+                    tx,
+                    &self.principal,
+                    &request,
+                    session.generation,
+                    session.wire_boot,
+                )
+            })?
+            .map_err(|fault| match fault {
+                compose::Fault::NotFound => Refusal::NotFound,
+                compose::Fault::NotReady => Refusal::NotReady,
+                compose::Fault::Busy => Refusal::Busy,
+                compose::Fault::ReplayFull => Refusal::ReplayFull,
+                compose::Fault::KeyCollision => Refusal::KeyCollision,
+            })?;
+        while let Some(joined) = gate.compose_jobs.try_join_next() {
+            if joined.is_err() {
+                return Err(STATE_UNAVAILABLE);
+            }
+        }
+        if let Some(session) =
+            session.filter(|s| s.generation == intent.generation && s.wire_boot == intent.boot)
+            && intent.receipt.is_none()
+        {
+            let active = gate.compose_active.clone();
+            let id = intent.id;
+            let started = active.lock().map_err(|_| STATE_UNAVAILABLE)?.insert(id);
+            if started {
+                let inventory = self.clone();
+                gate.compose_jobs.spawn(async move {
+                    let _running = ComposeRunning { active, id };
+                    let supervisor = &inventory.supervisor;
+                    // Durable pending state is the recovery authority. Drop
+                    // transport and state errors without logging their contents.
+                    let _ = supervisor
+                        .compose
+                        .drive(
+                            &supervisor.controller,
+                            &inventory.principal,
+                            key,
+                            &request.target,
+                            session,
+                            &supervisor.cancel,
+                        )
+                        .await;
+                });
+            }
+        }
+        Ok(
+            json!({"operation_id":hex::encode(intent.id),"revision":intent.revision,
+                "state":intent.receipt.as_ref().map_or(json!("pending"), |r| json!(r.state)),
+                "receipt":intent.receipt}),
+        )
+    }
+
+    fn compose_logs(&self, mut args: Args) -> Outcome<Value> {
+        use crate::store::vm::compose as db;
+        let target = Self::compose_target(&mut args)?;
+        let limit = args
+            .optional::<u32>("limit")?
+            .unwrap_or(arx_guest::compose::MAX_LOG_ENTRIES);
+        let cursor = args.optional::<i64>("cursor")?.unwrap_or(0);
+        args.end()?;
+        if !(1..=arx_guest::compose::MAX_LOG_ENTRIES).contains(&limit) || cursor < 0 {
+            return Err(INVALID);
+        }
+        let store = self.supervisor.controller.compose_store();
+        let (generation, services) = store
+            .transact(|tx| {
+                if db::status(tx, &self.principal, &target)?.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some((
+                    db::boot(tx, &self.principal, &target)?,
+                    db::service_names(tx, &target)?,
+                )))
+            })?
+            .ok_or(NOT_FOUND)?;
+        let session = self
+            .supervisor
+            .compose
+            .session(target.vm)
+            .filter(|s| Some(s.generation) == generation)
+            .ok_or(Fault("not_ready"))?;
+        let (entries, next_cursor) = tokio::runtime::Handle::current()
+            .block_on(self.supervisor.compose.logs(
+                session,
+                target,
+                compose::LogRead {
+                    cursor: cursor as u64,
+                    limit,
+                    services,
+                },
+                &self.supervisor.cancel,
+            ))
+            .ok_or(Fault("not_ready"))?;
+        Ok(json!({"entries":entries,"next_cursor":next_cursor}))
+    }
+}
+
+struct ComposeRunning {
+    active: Arc<Mutex<std::collections::HashSet<Id>>>,
+    id: Id,
+}
+
+impl Drop for ComposeRunning {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.id);
+        }
     }
 }
 
@@ -7993,6 +8284,476 @@ mod tests {
         h.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn compose_sdk_lost_reply_is_queried_and_settled_once() {
+        use crate::store::vm::compose as db;
+        use arx_guest::compose::{self as guest, ComposeRequest as Req, ComposeResponse as Resp};
+
+        struct FakeDpapi;
+        const CANARY: &[u8] = b"fixture-compose-custody-canary";
+        impl crate::vm::compose_secrets::SecretSource for FakeDpapi {
+            fn open(&self, reference: Id) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+                anyhow::ensure!(reference == [0x44; 16]);
+                Ok(zeroize::Zeroizing::new(CANARY.to_vec()))
+            }
+        }
+
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let b = h.client(1).await;
+        let (vm, _) = enrolled(&h, &a, 120).await;
+        let vm_id = parse_id(vm.as_str().unwrap()).unwrap();
+        let project = "fixture-compose";
+        let release_id = hex::encode([0x42; 16]);
+        let enrollment: compose::ReleaseInput = serde_json::from_value(json!({
+            "vm_id":vm, "release_id":release_id,
+            "manifest":{
+                "schema":guest::MANIFEST_SCHEMA,"project_id":project,
+                "volumes":[{"name":"data","uid":10001,"gid":10001}],"secrets":["password"],
+                "services":[{"name":"api","image":format!("example.invalid/api@sha256:{}", "a".repeat(64)),
+                    "platform":guest::PLATFORM,"uid":10001,"gid":10001,"read_only_rootfs":true,
+                    "environment":[],"mounts":[{"volume":"data","target":"/data","read_only":false}],
+                    "secrets":["password"],"limits":{"cpu_millis":500,"memory_mib":512,"pids":32}}]
+            },
+            "secrets":[{"slot":"password","epoch":7,"reference":hex::encode([0x44;16])}]
+        })).unwrap();
+        let enrollment = enrollment.enroll().unwrap();
+        let digest = enrollment.digest.clone();
+        let target = enrollment.target.clone();
+        let store = h.supervisor().controller.compose_store();
+        db::enroll(store, &[enrollment]).unwrap();
+        let generation = store
+            .transact(|tx| db::boot(tx, "alpha", &target))
+            .unwrap()
+            .unwrap();
+        *h.supervisor().compose.secrets.lock().unwrap() = Some(Arc::new(FakeDpapi));
+        let boot = 19;
+        let args =
+            json!({"vm_id":vm,"project_id":project,"release_id":release_id,"request_id":key(125)});
+        assert_eq!(
+            call(&a, "compose_deploy", args.clone()).await["reason"],
+            "not_ready"
+        );
+        let (host, mut peer) = tokio::io::duplex(64 * 1024);
+        let (effect, effect_seen) = tokio::sync::oneshot::channel();
+        let (close, allow_close) = tokio::sync::oneshot::channel();
+        let expected_digest = digest.clone();
+        let first = tokio::spawn(async move {
+            fake_compose_hello(&mut peer, boot).await;
+            let Req::ComposeOperation { id, .. } = fake_compose_read(&mut peer).await else {
+                panic!("operation query must precede submission")
+            };
+            fake_compose_reply(
+                &mut peer,
+                Resp::ComposeRejected {
+                    id,
+                    code: guest::RejectCode::UnknownOperation,
+                    rule: None,
+                },
+            )
+            .await;
+            let Req::ComposeStatus { id, project_id } = fake_compose_read(&mut peer).await else {
+                panic!("status query before submission")
+            };
+            assert_eq!(project_id, project);
+            fake_compose_reply(
+                &mut peer,
+                Resp::ComposeRejected {
+                    id,
+                    code: guest::RejectCode::UnknownProject,
+                    rule: None,
+                },
+            )
+            .await;
+            let Req::ComposeStageBegin {
+                id,
+                digest,
+                total_bytes,
+                chunks,
+            } = fake_compose_read(&mut peer).await
+            else {
+                panic!("stage begin")
+            };
+            assert_eq!(digest, expected_digest);
+            assert_eq!(chunks, 1);
+            fake_compose_reply(
+                &mut peer,
+                Resp::ComposeStageProgress {
+                    id,
+                    digest: digest.clone(),
+                    received_bytes: 0,
+                    next_index: 0,
+                },
+            )
+            .await;
+            let Req::ComposeStageChunk {
+                id,
+                index: 0,
+                digest: chunk_digest,
+                ..
+            } = fake_compose_read(&mut peer).await
+            else {
+                panic!("stage chunk")
+            };
+            assert_eq!(chunk_digest, digest);
+            fake_compose_reply(
+                &mut peer,
+                Resp::ComposeStageProgress {
+                    id,
+                    digest: digest.clone(),
+                    received_bytes: total_bytes,
+                    next_index: 1,
+                },
+            )
+            .await;
+            let Req::ComposeStageCommit {
+                id,
+                digest: commit_digest,
+            } = fake_compose_read(&mut peer).await
+            else {
+                panic!("stage commit")
+            };
+            assert_eq!(commit_digest, digest);
+            fake_compose_reply(
+                &mut peer,
+                Resp::ComposeReleaseStaged {
+                    id,
+                    digest: digest.clone(),
+                    project_id: project.into(),
+                },
+            )
+            .await;
+            let Req::ComposeSecretPut {
+                id,
+                generation,
+                project_id,
+                digest: bound_digest,
+                slot,
+                epoch,
+                data,
+                ..
+            } = fake_compose_read(&mut peer).await
+            else {
+                panic!("private secret delivery")
+            };
+            let reference = guest::SecretText::new(guest::encode_base64(CANARY));
+            assert!(data == reference);
+            assert_eq!(
+                (
+                    generation,
+                    project_id.as_str(),
+                    bound_digest.as_str(),
+                    slot.as_str(),
+                    epoch
+                ),
+                (boot, project, digest.as_str(), "password", 7)
+            );
+            fake_compose_reply(
+                &mut peer,
+                Resp::ComposeSecretAccepted {
+                    id,
+                    project_id,
+                    digest: digest.clone(),
+                    slot,
+                    epoch,
+                    recreate: None,
+                },
+            )
+            .await;
+            let Req::ComposeDeploy {
+                operation_id,
+                project_id,
+                revision,
+                digest: released,
+                ..
+            } = fake_compose_read(&mut peer).await
+            else {
+                panic!("one deploy")
+            };
+            assert_eq!(
+                (project_id.as_str(), revision, released.as_str()),
+                (project, 1, digest.as_str())
+            );
+            effect.send(operation_id).unwrap();
+            allow_close.await.unwrap();
+            // The fake effect is durable. Drop the reply and close the stream.
+        });
+        let channel =
+            crate::vm::guest::ComposeChannel::negotiate(host, boot, &h.supervisor().cancel)
+                .await
+                .unwrap();
+        h.supervisor()
+            .compose
+            .attach(vm_id, compose::Session::new(generation, channel))
+            .unwrap();
+        let accepted = call(&a, "compose_deploy", args.clone()).await;
+        assert_eq!(accepted["state"], "pending");
+        let operation_id = effect_seen.await.unwrap();
+        assert_eq!(accepted["operation_id"], operation_id);
+        assert_eq!(
+            call(&b, "compose_deploy", args.clone()).await["reason"],
+            "not_found"
+        );
+        assert_eq!(
+            call(
+                &a,
+                "compose_start",
+                json!({
+                    "vm_id":vm,"project_id":project,"request_id":key(125)
+                })
+            )
+            .await["reason"],
+            "key_collision"
+        );
+        assert_eq!(
+            call(
+                &a,
+                "compose_down",
+                json!({
+                    "vm_id":vm,"project_id":project,"request_id":key(126)
+                })
+            )
+            .await["reason"],
+            "busy"
+        );
+        a.cancel().await.unwrap();
+        close.send(()).unwrap();
+        first.await.unwrap();
+        until(|| {
+            h.supervisor()
+                .gate
+                .lock()
+                .unwrap()
+                .compose_active
+                .lock()
+                .unwrap()
+                .is_empty()
+        })
+        .await;
+        let a = h.client(0).await;
+        assert_eq!(
+            call(
+                &a,
+                "compose_status",
+                json!({"vm_id":vm,"project_id":project})
+            )
+            .await["desired"],
+            "none"
+        );
+
+        let (host, mut peer) = tokio::io::duplex(64 * 1024);
+        let recovered_operation = operation_id.clone();
+        let second = tokio::spawn(async move {
+            fake_compose_hello(&mut peer, boot).await;
+            for committed_revision in [None, Some(2), Some(1)] {
+                let Req::ComposeOperation { id, operation_id } = fake_compose_read(&mut peer).await
+                else {
+                    panic!("replay must query")
+                };
+                assert_eq!(operation_id, recovered_operation);
+                if committed_revision.is_none() {
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeRejected {
+                            id,
+                            code: guest::RejectCode::UnknownOperation,
+                            rule: None,
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+                fake_compose_reply(
+                    &mut peer,
+                    Resp::ComposeOperationState {
+                        id,
+                        operation: guest::OperationView {
+                            operation_id,
+                            kind: guest::OperationKind::Deploy,
+                            project_id: project.into(),
+                            revision: 1,
+                            state: guest::OperationState::Succeeded,
+                            stage: guest::OperationStage::Settled,
+                            failure: None,
+                            restored_previous: false,
+                        },
+                    },
+                )
+                .await;
+                let Req::ComposeStatus { id, .. } = fake_compose_read(&mut peer).await else {
+                    panic!("attributed state required")
+                };
+                fake_compose_reply(
+                    &mut peer,
+                    Resp::ComposeProjectStatus {
+                        id,
+                        project: guest::ProjectView {
+                            project_id: project.into(),
+                            desired: guest::Desired::Started,
+                            committed_revision,
+                            previous_revision: None,
+                            recovery_required: false,
+                            running_operation: None,
+                            observation: guest::Observation::Live,
+                            services: vec![guest::ServiceView {
+                                name: "api".into(),
+                                state: guest::ServiceState::Running,
+                                health: guest::HealthState::Healthy,
+                                revision: Some(1),
+                            }],
+                        },
+                    },
+                )
+                .await;
+            }
+            let Req::ComposeLogs {
+                id,
+                cursor: 0,
+                limit: 1,
+                ..
+            } = fake_compose_read(&mut peer).await
+            else {
+                panic!("bounded log read")
+            };
+            fake_compose_reply(
+                &mut peer,
+                Resp::ComposeLogPage {
+                    id,
+                    next_cursor: 2,
+                    entries: vec![guest::LogEntry {
+                        seq: 1,
+                        unix_s: 4,
+                        project_id: project.into(),
+                        event: guest::LogEvent::Promoted,
+                        service: Some("canary".into()),
+                        failure: None,
+                    }],
+                },
+            )
+            .await;
+        });
+        let channel =
+            crate::vm::guest::ComposeChannel::negotiate(host, boot, &h.supervisor().cancel)
+                .await
+                .unwrap();
+        h.supervisor()
+            .compose
+            .attach(vm_id, compose::Session::new(generation, channel))
+            .unwrap();
+        for _ in 0..3 {
+            assert_eq!(call(&a, "compose_deploy", args.clone()).await, accepted);
+            until(|| {
+                h.supervisor()
+                    .gate
+                    .lock()
+                    .unwrap()
+                    .compose_active
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            })
+            .await;
+        }
+        let settled = call(&a, "compose_deploy", args.clone()).await;
+        assert_eq!(settled["operation_id"], operation_id);
+        assert_eq!(settled["state"], "succeeded");
+        let logs = call(
+            &a,
+            "compose_logs",
+            json!({"vm_id":vm,"project_id":project,"limit":1}),
+        )
+        .await;
+        assert_eq!(logs["reason"], "not_ready");
+        assert!(!logs.to_string().contains("canary"));
+        second.await.unwrap();
+        let status = call(
+            &a,
+            "compose_status",
+            json!({"vm_id":vm,"project_id":project}),
+        )
+        .await;
+        assert_eq!(status["desired"], "started");
+        store
+            .transact(|tx| {
+                assert_eq!(
+                    crate::store::vm::count(tx, "SELECT sum(charge) FROM vm_compose_volumes", [])?,
+                    1
+                );
+                assert_eq!(
+                    crate::store::vm::count(tx, "SELECT count(*) FROM vm_compose_operations", [])?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+        drop(a);
+        drop(b);
+        h.shutdown().await.unwrap();
+        let mut h = h.reopen(|_| {}).await;
+        let a = h.client(0).await;
+        assert_eq!(call(&a, "compose_deploy", args).await, settled);
+        drop(a);
+        h.shutdown().await.unwrap();
+        let bytes = fs::read(h.temp.path().join("activity.sqlite3")).unwrap();
+        let encoded = guest::encode_base64(CANARY);
+        assert!(!bytes.windows(CANARY.len()).any(|window| window == CANARY));
+        assert!(
+            !bytes
+                .windows(encoded.len())
+                .any(|window| window == encoded.as_bytes())
+        );
+    }
+
+    async fn fake_compose_hello(peer: &mut tokio::io::DuplexStream, boot: u64) {
+        use arx_guest::compose::{ComposeRequest as Req, ComposeResponse as Resp};
+        let Req::ComposeHello {
+            version,
+            challenge,
+            generation,
+            capabilities,
+        } = fake_compose_read(peer).await
+        else {
+            panic!("Compose handshake required")
+        };
+        assert_eq!(generation, boot);
+        fake_compose_reply(
+            peer,
+            Resp::ComposeHelloAck {
+                version,
+                challenge,
+                generation,
+                capabilities,
+                cleared_staging: 0,
+                ambiguous_operations: 0,
+            },
+        )
+        .await;
+    }
+
+    async fn fake_compose_read(
+        peer: &mut tokio::io::DuplexStream,
+    ) -> arx_guest::compose::ComposeRequest {
+        use tokio::io::AsyncReadExt;
+        let size = peer.read_u32().await.unwrap() as usize;
+        assert!((1..=arx_guest::protocol::MAX_FRAME).contains(&size));
+        let mut frame = zeroize::Zeroizing::new(vec![0; 4 + size]);
+        frame[..4].copy_from_slice(&(size as u32).to_be_bytes());
+        peer.read_exact(&mut frame[4..]).await.unwrap();
+        arx_guest::protocol::read_frame(&mut frame.as_slice())
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn fake_compose_reply(
+        peer: &mut tokio::io::DuplexStream,
+        reply: arx_guest::compose::ComposeResponse,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let mut bytes = Vec::new();
+        arx_guest::protocol::write_frame(&mut bytes, &reply).unwrap();
+        peer.write_all(&bytes).await.unwrap();
+    }
+
     /// A running static VM enrolled for publication with a fake connector and
     /// DNS API holding valid synthetic credentials. Keys `base..base+3`.
     async fn enrolled(
@@ -11243,7 +12004,7 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
-        const EXPECTED_TOOL_COUNT: usize = 18 + 4;
+        const EXPECTED_TOOL_COUNT: usize = 18 + 4 + 6;
         assert_eq!(names.len(), EXPECTED_TOOL_COUNT);
         assert_eq!(names, ToolName::ALL.map(ToolName::name));
         for (tool_name, required, optional) in [

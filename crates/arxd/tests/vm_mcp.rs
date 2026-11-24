@@ -393,6 +393,12 @@ async fn inspect_vm(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>
             "vm_snapshot_list",
             "vm_snapshot_restore",
             "vm_snapshot_delete",
+            "compose_deploy",
+            "compose_start",
+            "compose_stop",
+            "compose_down",
+            "compose_status",
+            "compose_logs",
         ]
     );
     let id = json!({"type":"string","pattern":"^[0-9a-f]{32}$"});

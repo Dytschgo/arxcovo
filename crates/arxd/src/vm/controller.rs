@@ -46,6 +46,10 @@ impl AdmissionGate {
 }
 
 impl<C: Clock> VmController<C> {
+    pub(crate) fn compose_store(&self) -> &VmStore {
+        &self.store
+    }
+
     pub(crate) fn windows_recipe_id() -> Id {
         template::windows_recipe_id()
     }
