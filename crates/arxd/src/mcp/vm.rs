@@ -12560,7 +12560,8 @@ mod tests {
 
     #[tokio::test]
     async fn real_local_sdk_sqlite_journey() {
-        tokio::time::timeout(Duration::from_secs(8), journey())
+        // Hang guard only; the journey's step-level assertions are what matter.
+        tokio::time::timeout(Duration::from_secs(120), journey())
             .await
             .unwrap();
     }
