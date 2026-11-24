@@ -562,6 +562,10 @@ struct VmFile {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TestVms {
     pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) allow_agent_public_sites: bool,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) publication: Option<Box<crate::vm::runtime::publication::Profile>>,
     #[serde(default, deserialize_with = "validated_runtime")]
     pub(crate) runtime: Option<VmRuntimeProfile>,
     #[serde(default, deserialize_with = "present")]
@@ -723,6 +727,11 @@ impl TestVms {
                     && state.as_str().eq_ignore_ascii_case(configured.as_str()),
                 "invalid VM identity or state pairing"
             );
+        }
+        if let Some(publication) = &self.publication {
+            let state = LocalPath::parse(root.to_str().unwrap_or_default())
+                .map_err(|_| anyhow::anyhow!("invalid VM state"))?;
+            publication.validate(&state)?;
         }
         if let Some(recipes) = &self.recipes {
             anyhow::ensure!(recipes.len() <= 1, "unsupported VM recipe count");

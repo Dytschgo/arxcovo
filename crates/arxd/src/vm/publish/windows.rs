@@ -135,7 +135,8 @@ fn open_object(path: &Path, directory: bool) -> io::Result<File> {
     Ok(file)
 }
 
-fn require_owner(file: &File) -> io::Result<()> {
+/// A word-aligned TOKEN_USER buffer for the current process token.
+fn token_user() -> io::Result<Vec<usize>> {
     let mut token = null_mut();
     ok(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) })?;
     let token = owned(token)?;
@@ -154,6 +155,113 @@ fn require_owner(file: &File) -> io::Result<()> {
             &mut size,
         )
     })?;
+    Ok(user)
+}
+
+/// Creates `path` exclusively with TokenUser as owner and a protected DACL
+/// granting only that user, in the creation call itself, so no instant exists
+/// with inherited permissions or the token's default owner.
+pub(in crate::vm) fn create_private(path: &Path) -> io::Result<File> {
+    let user = token_user()?;
+    // The SID lives in `user`, which outlives every use below.
+    let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let mut text = null_mut();
+    ok(unsafe { ConvertSidToStringSidW(sid, &mut text) })?;
+    // SDDL SID strings are short and NUL-terminated.
+    let length = (0..256).find(|&index| unsafe { *text.add(index) } == 0);
+    let sid_text = length.map(|length| {
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) })
+    });
+    unsafe { LocalFree(text.cast()) };
+    let sid_text = sid_text.ok_or_else(refuse)?;
+    let sddl = wide(OsStr::new(&format!("O:{sid_text}D:P(A;;FA;;;{sid_text})")));
+    let mut descriptor = null_mut();
+    ok(unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    })?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let handle = unsafe {
+        CreateFileW(
+            wide(path.as_os_str()).as_ptr(),
+            FILE_GENERIC_WRITE | DELETE,
+            0,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    let created = io::Error::last_os_error();
+    unsafe { LocalFree(descriptor) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(created);
+    }
+    Ok(File::from(owned(handle)?))
+}
+
+/// Marks a file this process created for deletion through its own handle, so
+/// no by-path delete can race a concurrent reader. The file disappears when
+/// the last handle closes; other opens fail meanwhile.
+///
+/// The extended disposition ignores a read-only attribute another same-login
+/// handle may have set while the writer was open. Where it is unsupported,
+/// the classic disposition is tried on the same handle. Failure is returned
+/// to the caller, never retried through a reopened path.
+pub(in crate::vm) fn delete_on_close(file: &File) -> io::Result<()> {
+    let extended = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    // A witness can report the extended class as unsupported, as on an older
+    // platform; the classic attempt below is then the real call.
+    #[cfg(test)]
+    let unsupported = EXTENDED_UNSUPPORTED.swap(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let unsupported = false;
+    let marked = if unsupported {
+        Err(io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32))
+    } else {
+        ok(unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfoEx,
+                (&extended as *const FILE_DISPOSITION_INFO_EX).cast(),
+                size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+            )
+        })
+    };
+    match marked {
+        Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
+            let classic = FILE_DISPOSITION_INFO { DeleteFile: true };
+            ok(unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&classic as *const FILE_DISPOSITION_INFO).cast(),
+                    size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            })
+        }
+        marked => marked,
+    }
+}
+
+/// Reports the next extended disposition as unsupported, so the classic
+/// same-handle disposition runs for real, for the residue witness.
+#[cfg(test)]
+pub(in crate::vm) static EXTENDED_UNSUPPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn require_owner(file: &File) -> io::Result<()> {
+    let user = token_user()?;
     let mut owner = null_mut();
     let mut descriptor = null_mut();
     let status = unsafe {
@@ -280,7 +388,7 @@ impl Process {
             .collect::<Vec<_>>()
             .join(" ");
         let mut command = wide(OsStr::new(&command));
-        let mut env = connector_environment(credential)?;
+        let env = zeroize::Zeroizing::new(connector_environment(credential)?);
         let image = wide(executable.as_os_str());
         let cwd = wide(cwd.as_os_str());
         let mut startup = STARTUPINFOEXW::default();
@@ -309,7 +417,6 @@ impl Process {
                 &mut info,
             )
         };
-        env.fill(0);
         ok(status)?;
         let process = owned(info.hProcess)?;
         let thread = owned(info.hThread)?;
@@ -396,4 +503,59 @@ unsafe extern "system" {
         class: i32,
         reserved: u32,
     ) -> u32;
+}
+
+/// Load one DPAPI ciphertext through retained, non-aliasing custody.
+pub(in crate::vm) fn read_secret(
+    path: &Path,
+    limit: usize,
+) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    use std::io::Read;
+    let _root = HeldPath::open(path.parent().ok_or_else(refuse)?, true, true)?;
+    let held = HeldPath::open(path, false, true)?;
+    let mut encrypted = Vec::new();
+    (&held.file).take(16_385).read_to_end(&mut encrypted)?;
+    if encrypted.len() > 16_384 {
+        return Err(refuse());
+    }
+    crate::security::unprotect_current_user(&mut encrypted, limit).map_err(|_| refuse())
+}
+
+/// Native DNS uses the Windows HTTPS trust store and never uses the origin CA.
+pub(in crate::vm) fn public_roots() -> io::Result<rustls::RootCertStore> {
+    use windows_sys::Win32::Security::Cryptography::*;
+    let store = unsafe { CertOpenSystemStoreW(0, windows_sys::w!("ROOT")) };
+    if store.is_null() {
+        return Err(refuse());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let mut previous = null();
+    let mut count = 0;
+    loop {
+        // Enumeration frees the previous context. The final store close
+        // releases the store even when its bounded admission check fails.
+        let cert = unsafe { CertEnumCertificatesInStore(store, previous) };
+        if cert.is_null() {
+            break;
+        }
+        count += 1;
+        if count > 1024 {
+            unsafe { CertFreeCertificateContext(cert) };
+            roots.roots.clear();
+            break;
+        }
+        let context = unsafe { &*cert };
+        if !context.pbCertEncoded.is_null() && (1..=16_384).contains(&context.cbCertEncoded) {
+            let der = unsafe {
+                std::slice::from_raw_parts(context.pbCertEncoded, context.cbCertEncoded as usize)
+            };
+            let _ = roots.add(rustls::pki_types::CertificateDer::from(der));
+        }
+        previous = cert;
+    }
+    let closed = unsafe { CertCloseStore(store, 0) };
+    if closed == 0 || roots.is_empty() {
+        return Err(refuse());
+    }
+    Ok(roots)
 }

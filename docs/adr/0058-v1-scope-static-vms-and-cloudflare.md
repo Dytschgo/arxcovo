@@ -24,6 +24,7 @@ Two roadmap items move into v1. They keep the settled design and are built on th
   - When the build reaches the step that needs the credential, the coordinator records exactly what is needed in docs/PROGRESS.md and asks the owner once through a private secret request, while continuing other work.
 - **Tests.** CI tests use fakes and mocks of `cloudflared` and the Cloudflare API. The real tunnel path is **unverified on real hardware** until it is exercised with the owner's credential.
 - **Target.** The first publication target is the static Ubuntu web-server VM.
+- **Foreground controls.** An agent may publish an enrolled running static VM, unpublish it, or read its publication status. The daemon uses a dedicated locally managed tunnel with one approved exact hostname, a generation-specific TLS origin on IPv4 loopback, and a zone-scoped DNS credential. The [v10 store contract](0065-vm-store-v10-publish.md) records ownership and reconciles incomplete effects without automatically reopening ingress. An owner unpublish stops local ingress first, independently of DNS, the effects slot and store pressure.
 
 ## Acceptance
 

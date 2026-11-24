@@ -182,6 +182,10 @@ pub enum Refusal {
     NameUnavailable,
     StaticDeleteForbidden,
     UnknownTool,
+    PublicSitesDisabled,
+    PublishCredentialMissing,
+    PublishTargetMismatch,
+    PublishCleanupPending,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,6 +294,8 @@ pub(crate) const BUILD_ACTION: i64 = 11;
 pub(crate) const STATIC_CREATE_ACTION: i64 = 12;
 pub(crate) const READ_REFUSAL_ACTION: i64 = 13;
 pub(crate) const HOST_REFUSAL_ACTION: i64 = 14;
+pub(crate) const PUBLISH_ACTION: i64 = 15;
+pub(crate) const UNPUBLISH_ACTION: i64 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]
@@ -305,10 +311,16 @@ pub(crate) enum FailureReason {
     ExecutionUnknown,
     Cancelled,
     CleanupUnconfirmed,
+    DnsConflict,
+    DnsUnavailable,
+    ConnectorFailed,
+    ConnectorExited,
+    ConnectorUnready,
+    OriginUnavailable,
 }
 
 impl FailureReason {
-    const ALL: [Self; 11] = {
+    const ALL: [Self; 17] = {
         use FailureReason::*;
         [
             StagingFailed,
@@ -322,6 +334,12 @@ impl FailureReason {
             ExecutionUnknown,
             Cancelled,
             CleanupUnconfirmed,
+            DnsConflict,
+            DnsUnavailable,
+            ConnectorFailed,
+            ConnectorExited,
+            ConnectorUnready,
+            OriginUnavailable,
         ]
     };
 
@@ -345,6 +363,12 @@ impl FailureReason {
             Self::ExecutionUnknown => "execution_unknown",
             Self::Cancelled => "cancelled",
             Self::CleanupUnconfirmed => "cleanup_unconfirmed",
+            Self::DnsConflict => "dns_conflict",
+            Self::DnsUnavailable => "dns_unavailable",
+            Self::ConnectorFailed => "connector_failed",
+            Self::ConnectorExited => "connector_exited",
+            Self::ConnectorUnready => "connector_unready",
+            Self::OriginUnavailable => "origin_unavailable",
         }
     }
 }
