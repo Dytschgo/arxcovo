@@ -189,30 +189,137 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    [Arxcovo agent instructions](../AGENTS.md)
 
 4. **Run independently reviewed non-elevated native trials.** Review the
-   amendment and exact runner and enforcement code first. Use its private
-   trial authority with a disposable store and enrolled inputs. Start paused,
-   diskless and networkless. Select the reviewed witnessed distribution and
-   exact sealed recipe after the native adapter has landed. Verify the
-   protected bundle and search directories. Verify single-process Job
-   and child-creation restrictions for QEMU and each helper. Collect the
-   creation-to-exit image verdict and stage coverage for file opens, data
-   mappings and named objects, including transient firmware and helper
-   inputs. Prove a fresh helper output against its held created object.
-   On refusal, stop the owned Job while preserving debugger containment.
-   Drain terminal events before waiting for held process exit. Verify
-   the Job is empty, workers have joined and file custody is intact
-   before releasing the slot.
-   Seal successful qualification only after clean settlement and complete
-   witness evidence. Record dirty release or quarantine on failure.
-   [ADR 0054 qualification witness](adr/0054-m4-dedicated-windows-runtime.md#amendment-2026-11-24--actual-image-and-file-open-witness-for-m4-qualification)
+   amendment and exact runner and enforcement code first. For the paused
+   trial, use the reviewed stock 11.1.3 bundle and a fresh evidence directory.
+   The enrolled trial root must provide an empty `paused-cwd` directory.
+   The checked directories grant the current user read/execute access and
+   reserve writable ACEs for SYSTEM and Administrators. A directory owned
+   by the current user can still have its DACL changed by that account.
+   This follows ADR 0054's same-account trust boundary.
+
+   **Owner admin step.** Close any QEMU or qualification process using
+   this bundle. In an elevated PowerShell under the enrolled owner's
+   login, run the following with the existing enrollment JSON. This
+   replaces ACLs only inside the reviewed bundle and on `paused-cwd`.
+   It sets Administrators as the owner so the unelevated supervisor does
+   not retain implicit DACL control over these paths. The qualification
+   runner itself still runs later from the non-elevated owner console.
+
+   ```powershell
+   $ErrorActionPreference = 'Stop'
+   $enrollmentPath = Read-Host 'Full path of the existing qualification enrollment JSON'
+   $enrollment = Get-Content -LiteralPath $enrollmentPath -Raw | ConvertFrom-Json
+   $owner = [System.Security.Principal.SecurityIdentifier]::new($enrollment.owner_sid)
+   $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+   $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+   if ($owner -ne $identity.User -or
+       -not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+       throw 'Use the elevated enrolled owner login'
+   }
+   $system = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+   $admins = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+
+   function Get-OrdinaryItem([string]$path) {
+       $item = Get-Item -LiteralPath $path -Force
+       if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+           throw 'A setup path is a reparse point'
+       }
+       return $item
+   }
+
+   $bundle = 'D:\ArxcovoData\qemu\11.1.3'
+   if ([IO.Path]::GetFullPath($enrollment.stock_bundle) -ne $bundle) {
+       throw 'Expected the enrolled stock 11.1.3 bundle'
+   }
+   $trial = [IO.Path]::GetFullPath($enrollment.trial_root)
+   if ($trial -notmatch '^T:\\[A-Za-z0-9 _.-]+(?:\\[A-Za-z0-9 _.-]+)*$' -or
+       $trial -ne $enrollment.trial_root -or
+       ($trial.Split('\') | Where-Object { $_.EndsWith('.') -or $_.EndsWith(' ') })) {
+       throw 'Expected the exact enrolled directory on the trial volume'
+   }
+   foreach ($path in @('D:\', 'D:\ArxcovoData', 'D:\ArxcovoData\qemu', $bundle, 'T:\')) {
+       if ((Get-OrdinaryItem $path) -isnot [IO.DirectoryInfo]) { throw 'Expected a directory' }
+   }
+   $parent = 'T:\'
+   foreach ($part in $trial.Substring(3).Split('\')) {
+       $parent = Join-Path $parent $part
+       if ((Get-OrdinaryItem $parent) -isnot [IO.DirectoryInfo]) { throw 'Expected a directory' }
+   }
+
+   $pending = [Collections.Generic.Queue[IO.FileSystemInfo]]::new()
+   $nodes = [Collections.Generic.List[IO.FileSystemInfo]]::new()
+   $pending.Enqueue((Get-OrdinaryItem $bundle))
+   while ($pending.Count -gt 0) {
+       $node = $pending.Dequeue()
+       if ($node.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse point in bundle' }
+       $nodes.Add($node)
+       if ($node -is [IO.DirectoryInfo]) {
+           foreach ($entry in Get-ChildItem -LiteralPath $node.FullName -Force) {
+               if ($pending.Count + $nodes.Count -ge 512) { throw 'Bundle exceeds setup bound' }
+               $pending.Enqueue($entry)
+           }
+       }
+   }
+
+   $cwd = Join-Path $trial 'paused-cwd'
+   if (-not (Test-Path -LiteralPath $cwd)) {
+       New-Item -ItemType Directory -Path $cwd | Out-Null
+   }
+   $cwdItem = Get-OrdinaryItem $cwd
+   if ($cwdItem -isnot [IO.DirectoryInfo] -or (Get-ChildItem -LiteralPath $cwd -Force | Select-Object -First 1)) {
+       throw 'The paused working directory must be empty'
+   }
+   $nodes.Add($cwdItem)
+
+   # Protect descendants before their parents change inherited access.
+   for ($index = $nodes.Count - 1; $index -ge 0; $index--) {
+       $node = $nodes[$index]
+       $checked = Get-OrdinaryItem $node.FullName
+       if (($checked -is [IO.DirectoryInfo]) -ne ($node -is [IO.DirectoryInfo])) { throw 'Setup object type changed' }
+       $acl = if ($checked -is [IO.DirectoryInfo]) {
+           [System.Security.AccessControl.DirectorySecurity]::new()
+       } else {
+           [System.Security.AccessControl.FileSecurity]::new()
+       }
+       $acl.SetOwner($admins)
+       $acl.SetAccessRuleProtection($true, $false)
+       foreach ($sid in @($system, $admins, $owner)) {
+           $rights = if ($sid -eq $owner) { 'ReadAndExecute' } else { 'FullControl' }
+           $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+               $sid, [System.Security.AccessControl.FileSystemRights]$rights, 'Allow'
+           ))
+       }
+       Set-Acl -LiteralPath $checked.FullName -AclObject $acl
+   }
+   ```
+
+   [Windows ACL inheritance](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setnamedsecurityinfow#remarks)
+
+   **Owner rollback.** After the trial settles and all holds are released,
+   use the same elevated console and recheck the bundle and working
+   directory paths with the reparse-point and empty-directory checks above.
+   Run `icacls.exe $bundle /reset /T /L` to replace the protected bundle
+   DACLs with the current parent inheritance. Proceed only if it exits 0.
+   Remove the checked empty working directory with
+   `Remove-Item -LiteralPath $cwd`. Administrators remains the bundle owner.
+
+   From the non-elevated owner console, invoke the qualification runner
+   with `--paused-trial` before the existing enrollment and evidence
+   arguments. The trial selects a diskless and networkless
+   recipe, holds the entire inventory through stop, and records an
+   incomplete diagnostic. A retained `.arx-paused-trial-charge` under the
+   trial root indicates unsettled custody and prevents another trial.
+   Reconcile it using independent release evidence before retrying.
+   Later helpers and recipes require individual reviewed rows and qualification.
+   [ADR 0054 held bundle inventory](adr/0054-m4-dedicated-windows-runtime.md#amendment-2026-11-24--owner-fallback-to-held-bundle-inventory)
 
    Prove `pc-q35-11.1` WHPX boot without fallback. On the held child, verify the
    11.1.3 QMP greeting, negotiation, paused prelaunch, typed responses and
    clean release. Prove the installed boot's private pipe ACL, server PID and
    Job membership before exchanging a nonce. Verify disconnect handling and
    the guest script capability across cold boots, including firmware and
-   coalesced port events within the bounded retry policy. Close any stage
-   whose consumer opens cannot be established.
+   coalesced port events within the bounded retry policy. Refuse any stage
+   whose held bundle or confined inputs cannot be established.
    Exercise token, Job, ACL, wrong-PID, slot and path refusals and scoped
    supervisor loss. Test disk exhaustion on the disposable trial volume
    supplied under step 1, with pre-allocation denial and no pressure on
@@ -280,10 +387,10 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    Its manifest digest is
    `f1cf73c8ecae163e31467a3985fc13749aee1f12a8747756eb136108a1015759`.
    Use ADR 0054 and the manifest for the executable and remaining payload
-   pins. These hashes identify the stock build. For a witnessed trial, bind
-   the separate reviewed distribution receipt and manifest, contract
-   version, and sanitized per-stage coverage and release verdicts to the
-   qualification record. No native trial or acceptance hashes exist yet.
+   pins. These hashes identify the stock build. Bind the exact distribution,
+   contract version, held inventory, protected search scope, confinement,
+   and per-stage qualification and release results. No native trial or
+   acceptance hashes exist yet.
    After the issuer (7c), fresh qualification and the required acceptance
    dependencies are in place, run the one unattended live test
    in the chosen console-idle window. Seal `acceptance.json` and its manifest

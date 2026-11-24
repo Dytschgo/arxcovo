@@ -12,7 +12,7 @@ use std::io::Read;
 
 pub(crate) type Hash = [u8; 32];
 
-pub(crate) const CONTRACT: u16 = 2;
+pub(crate) const CONTRACT: u16 = 3;
 pub(crate) const COLLECTOR: u16 = 1;
 pub(crate) const RECORD_LIMIT: usize = 16 * 1024;
 /// Seven days, exclusive at the upper boundary.
@@ -73,8 +73,8 @@ pub(crate) enum Stage {
     SuspendedChild,
     /// QEMU `-S` prelaunch pause, diskless and networkless.
     QemuPrelaunchPause,
-    /// The actual loader and consumer opens of the held image and inputs.
-    LoaderConsumerOpens,
+    /// The protected bundle inventory rechecked after QMP prelaunch.
+    HeldBundleInventory,
     /// WHPX initialization and the first guest instruction, still diskless.
     FirstGuestExecution,
     SupervisorLossRelease,
@@ -117,7 +117,7 @@ const TEST: [Stage; 20] = [
     Stage::DisposableStore,
     Stage::SuspendedChild,
     Stage::QemuPrelaunchPause,
-    Stage::LoaderConsumerOpens,
+    Stage::HeldBundleInventory,
     Stage::FirstGuestExecution,
     Stage::SupervisorLossRelease,
     Stage::CapacityTrials,
@@ -139,7 +139,7 @@ const STATIC_ORIGIN: [Stage; 19] = [
     Stage::DisposableStore,
     Stage::SuspendedChild,
     Stage::QemuPrelaunchPause,
-    Stage::LoaderConsumerOpens,
+    Stage::HeldBundleInventory,
     Stage::FirstGuestExecution,
     Stage::SupervisorLossRelease,
     Stage::CapacityTrials,
@@ -160,7 +160,7 @@ const DOCKER: [Stage; 19] = [
     Stage::DisposableStore,
     Stage::SuspendedChild,
     Stage::QemuPrelaunchPause,
-    Stage::LoaderConsumerOpens,
+    Stage::HeldBundleInventory,
     Stage::FirstGuestExecution,
     Stage::SupervisorLossRelease,
     Stage::CapacityTrials,
@@ -201,10 +201,10 @@ impl Stage {
     }
 
     /// The first trial begins diskless and networkless, and stays paused
-    /// until the loader and consumer opens are proved.
+    /// while the held bundle and WHPX are rechecked.
     pub(crate) fn confinement(self) -> Option<EffectPlan> {
         match self {
-            Self::SuspendedChild | Self::QemuPrelaunchPause | Self::LoaderConsumerOpens => {
+            Self::SuspendedChild | Self::QemuPrelaunchPause | Self::HeldBundleInventory => {
                 Some(EffectPlan::CONFINED)
             }
             Self::FirstGuestExecution | Self::SupervisorLossRelease => Some(EffectPlan {
@@ -223,7 +223,7 @@ impl Stage {
             Self::CustodyJobCapacityBaseline
             | Self::DisposableStore
             | Self::SuspendedChild
-            | Self::LoaderConsumerOpens
+            | Self::HeldBundleInventory
             | Self::SupervisorLossRelease
             | Self::CapacityTrials => FileKind::CustodyJobCapacity,
             Self::ActivityReservesBaseline | Self::ReserveActivityTrials => {
@@ -369,9 +369,7 @@ pub(crate) enum Diagnostic {
     OtherRefusal,
 }
 
-/// Passed predicates for read-only stages. Native effect stages have no
-/// passing observation in this contract version: they can only be
-/// unimplemented, failed or inconclusive.
+/// Passed predicates for baseline and paused-trial stages.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Observation {
@@ -419,6 +417,12 @@ pub(crate) enum Observation {
     },
     Whpx {
         present: bool,
+    },
+    PausedStore {
+        validated: bool,
+    },
+    PausedTrial {
+        verified: bool,
     },
     Cleanup {
         dispatched_effects: u16,
@@ -527,6 +531,13 @@ impl Observation {
                     && *owner_cpu_reserve == active_cpus.div_ceil(2)
             }
             (Stage::WhpxCapability, O::Whpx { present }) => *present,
+            (Stage::DisposableStore, O::PausedStore { validated }) => {
+                origin == Origin::Native && *validated
+            }
+            (
+                Stage::SuspendedChild | Stage::QemuPrelaunchPause | Stage::HeldBundleInventory,
+                O::PausedTrial { verified },
+            ) => origin == Origin::Native && *verified,
             (
                 Stage::Cleanup,
                 O::Cleanup {

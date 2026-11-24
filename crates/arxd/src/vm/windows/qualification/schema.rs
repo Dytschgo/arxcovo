@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 
 /// The runner's record contract and collector versions.
-pub const RECORD_CONTRACT: u16 = 2;
+pub const RECORD_CONTRACT: u16 = 3;
 pub const RECORD_COLLECTOR: u16 = 1;
 /// Seven hours: no record time may exceed the trial budget.
 const MAX_TRIAL_MS: u64 = 7 * 60 * 60 * 1000;
@@ -62,7 +62,7 @@ pub(super) const STAGES: &[&str] = &[
     "disposable_store",
     "suspended_child",
     "qemu_prelaunch_pause",
-    "loader_consumer_opens",
+    "held_bundle_inventory",
     "first_guest_execution",
     "supervisor_loss_release",
     "capacity_trials",
@@ -232,6 +232,8 @@ const OBSERVATIONS: &[(&str, &[(&str, Shape)])] = &[
         ],
     ),
     ("whpx", &[("present", Shape::Bool)]),
+    ("paused_store", &[("validated", Shape::Bool)]),
+    ("paused_trial", &[("verified", Shape::Bool)]),
     (
         "cleanup",
         &[
@@ -329,11 +331,11 @@ fn rules(file: DiagnosticFile) -> Rules {
                 "custody_job_capacity_baseline",
                 "disposable_store",
                 "suspended_child",
-                "loader_consumer_opens",
+                "held_bundle_inventory",
                 "supervisor_loss_release",
                 "capacity_trials",
             ],
-            &["capacity"],
+            &["capacity", "paused_store", "paused_trial"],
         ),
         F::ActivityReserves => records(
             &["activity_reserves_baseline", "reserve_activity_trials"],
@@ -347,9 +349,9 @@ fn rules(file: DiagnosticFile) -> Rules {
                 "qmp_channel",
                 "installed_guest_endpoint",
             ],
-            &["whpx"],
+            &["whpx", "paused_trial"],
         ),
-        // No collector passes an effect stage in this contract version.
+        // Recipe and network collectors remain unavailable.
         F::NetworkRestrictedTest => records(&["restricted_test_network"], &[]),
         F::RecipeUbuntu => records(&["ubuntu_recipe"], &[]),
         F::RecipeWindows => records(&["windows_recipe"], &[]),
@@ -561,7 +563,7 @@ pub(super) mod tests {
     /// One canonical native `inputs.json` record list, as the runner writes it.
     pub(in super::super) fn inputs_record(extra: &str) -> String {
         format!(
-            r#"[{{"contract":2,"collector":1,"origin":"native","binding":{b},"stage":"inputs","started_ms":0,"finished_ms":3,"prior":{p},"result":{{"passed":{{"kind":"input_pins","held_roots":5,"enrollment_private":true,"evidence_private":true,"trial_root_private":true,"evidence_claimed":true{extra}}}}}}}]"#,
+            r#"[{{"contract":3,"collector":1,"origin":"native","binding":{b},"stage":"inputs","started_ms":0,"finished_ms":3,"prior":{p},"result":{{"passed":{{"kind":"input_pins","held_roots":5,"enrollment_private":true,"evidence_private":true,"trial_root_private":true,"evidence_claimed":true{extra}}}}}}}]"#,
             b = binding(),
             p = hash(0),
         )
@@ -569,7 +571,7 @@ pub(super) mod tests {
 
     fn summary(late: &str, unwritten: &str) -> String {
         format!(
-            r#"{{"contract":2,"origin":"native","binding":{b},"blocked_at":"disposable_store","unattempted":["suspended_child","cleanup"],"unmeasured":["artifact","owner_profile"],"dispatched_effects":0,"charge_retained":false,"late":{late},"unwritten":{unwritten}}}"#,
+            r#"{{"contract":3,"origin":"native","binding":{b},"blocked_at":"disposable_store","unattempted":["suspended_child","cleanup"],"unmeasured":["artifact","owner_profile"],"dispatched_effects":0,"charge_retained":false,"late":{late},"unwritten":{unwritten}}}"#,
             b = binding(),
         )
     }
@@ -600,7 +602,7 @@ pub(super) mod tests {
     fn distribution_record(receipt: [u8; 32], manifest: [u8; 32]) -> String {
         let array = |bytes: [u8; 32]| serde_json::to_string(&bytes).unwrap();
         format!(
-            r#"[{{"contract":2,"collector":1,"origin":"native","binding":{b},"stage":"distribution","started_ms":0,"finished_ms":3,"prior":{p},"result":{{"passed":{{"kind":"distribution","receipt":{r},"receipt_bytes":7438,"manifest":{m},"manifest_bytes":11915,"payload_files":136,"payload_bytes":1}}}}}}]"#,
+            r#"[{{"contract":3,"collector":1,"origin":"native","binding":{b},"stage":"distribution","started_ms":0,"finished_ms":3,"prior":{p},"result":{{"passed":{{"kind":"distribution","receipt":{r},"receipt_bytes":7438,"manifest":{m},"manifest_bytes":11915,"payload_files":136,"payload_bytes":1}}}}}}]"#,
             b = binding(),
             p = hash(0),
             r = array(receipt),
@@ -712,7 +714,7 @@ pub(super) mod tests {
             (
                 "wrong contract",
                 DiagnosticFile::Inputs,
-                good.replace(r#""contract":2"#, r#""contract":3"#),
+                good.replace(r#""contract":3"#, r#""contract":2"#),
             ),
             (
                 "short hash",
@@ -723,19 +725,19 @@ pub(super) mod tests {
                 "reordered fields",
                 DiagnosticFile::Inputs,
                 good.replace(
-                    r#""contract":2,"collector":1"#,
-                    r#""collector":1,"contract":2"#,
+                    r#""contract":3,"collector":1"#,
+                    r#""collector":1,"contract":3"#,
                 ),
             ),
             (
                 "duplicate field",
                 DiagnosticFile::Inputs,
-                good.replace(r#""contract":2,"#, r#""contract":2,"contract":2,"#),
+                good.replace(r#""contract":3,"#, r#""contract":3,"contract":3,"#),
             ),
             (
                 "whitespace",
                 DiagnosticFile::Inputs,
-                good.replace(r#""contract":2"#, r#""contract": 2"#),
+                good.replace(r#""contract":3"#, r#""contract": 2"#),
             ),
             (
                 "escaped spelling",
