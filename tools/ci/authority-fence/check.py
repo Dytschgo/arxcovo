@@ -4,11 +4,13 @@ Stable rustdoc passes a ``compile_fail`` doctest on any compile error and
 does not enforce the error code in its tag. This gate compiles every fenced
 block from the ``Baseline`` documentation against the built arxd library.
 
-- A ``compile_fail,EXXXX`` block must report that code. Its only other
-  errors may be code-less private-type errors, which come from the private
-  types of the struct's own fields.
-- The ``no_run`` positive control must type-check with no error, so each
-  refusal is the fence and not a missing path.
+- A ``compile_fail,EXXXX`` block passes only if rustc exits nonzero and
+  reports that code as a structured diagnostic. Its only other errors may
+  be code-less private-type errors, which come from the private types of
+  the struct's own fields.
+- The ``no_run`` positive control passes only if rustc exits 0 with no
+  error, so each refusal is the fence and not a missing path.
+- Output that cannot be parsed fails the block.
 
 Everything is read-only. Scratch output goes to a temporary directory.
 """
@@ -32,6 +34,8 @@ EXPECTED_TAGS = [
     "compile_fail,E0277",
     "compile_fail,E0277",
     "compile_fail,E0599",
+    "compile_fail,E0599",
+    "compile_fail,E0560",
     "no_run",
 ]
 
@@ -75,12 +79,15 @@ def program(body):
 
 
 def errors(stderr):
-    """The error diagnostics in rustc's JSON output, without the summary."""
+    """The error diagnostics in rustc's JSON output, without the summary.
+    A line that looks like JSON but does not parse raises ValueError."""
     found = []
     for line in stderr.splitlines():
         if not line.startswith("{"):
             continue
         diagnostic = json.loads(line)
+        if not isinstance(diagnostic, dict):
+            raise ValueError("diagnostic is not an object")
         if diagnostic.get("$message_type", "diagnostic") != "diagnostic":
             continue
         if diagnostic.get("level") != "error":
@@ -91,13 +98,18 @@ def errors(stderr):
     return found
 
 
-def verdict(tag, found):
-    """None when the block failed exactly as declared, else the reason."""
+def verdict(tag, status, found):
+    """None when rustc's exit status and structured errors match the block's
+    declaration, else the reason."""
     codes = expected_codes(tag)
     if not codes:
+        if status != 0:
+            return f"positive control: rustc exited {status}: {found}"
         return None if not found else f"positive control does not compile: {found}"
-    if not found:
+    if status == 0:
         return "compiled, but the fence must refuse it"
+    if not found:
+        return f"rustc exited {status} without a structured diagnostic"
     reported = {code for code, _ in found}
     missing = [code for code in codes if code not in reported]
     stray = [
@@ -173,7 +185,7 @@ def compile_block(body, rlib, deps, scratch, index):
         capture_output=True,
         text=True,
     )
-    return errors(run.stderr)
+    return run.returncode, run.stderr
 
 
 def main():
@@ -186,9 +198,13 @@ def main():
     failures = 0
     with tempfile.TemporaryDirectory(prefix="arx-fence-") as directory:
         for index, (tag, body) in enumerate(found):
-            reason = verdict(tag, compile_block(body, rlib, deps, Path(directory), index))
-            status = "ok" if reason is None else f"FAILED: {reason}"
-            print(f"block {index} ({tag}): {status}")
+            status, stderr = compile_block(body, rlib, deps, Path(directory), index)
+            try:
+                reason = verdict(tag, status, errors(stderr))
+            except ValueError as error:
+                reason = f"unparseable compiler output: {error}"
+            outcome = "ok" if reason is None else f"FAILED: {reason}"
+            print(f"block {index} ({tag}): {outcome}")
             failures += reason is not None
     return 1 if failures else 0
 

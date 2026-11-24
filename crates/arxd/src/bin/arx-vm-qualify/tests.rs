@@ -303,7 +303,7 @@ fn complete(class: Class) -> (Trial<Fixture>, Script) {
 fn sealed(class: Class) -> Complete<Fixture> {
     complete(class)
         .0
-        .finish(DONE)
+        .finish(&Script2::fixed(DONE))
         .expect("a complete fixture seals")
 }
 
@@ -428,7 +428,7 @@ fn a_complete_fixture_seals_and_passes_its_structural_self_check() {
         assert_eq!(trial.blocked_at(), None);
         assert_eq!(trial.records().len(), stages(class).len());
         assert_eq!(script.cleanups, [stages(class).len() as u16 - 8]);
-        let done = trial.finish(DONE).unwrap();
+        let done = trial.finish(&Script2::fixed(DONE)).unwrap();
         let seal: Seal = decode(&done.seal).unwrap();
         assert_eq!(seal.origin, Origin::Fixture);
         for ((kind, bytes), entry) in done.files.iter().zip(&seal.manifest) {
@@ -458,7 +458,7 @@ fn fixture_output_is_never_admissible_at_the_verifier() {
 #[test]
 fn a_relabelled_native_forgery_fails_provenance_and_the_pinned_digest() {
     let (trial, _) = complete(Class::Test);
-    let original = trial.finish(DONE).unwrap();
+    let original = trial.finish(&Script2::fixed(DONE)).unwrap();
     let records: Vec<Record> = original
         .files
         .iter()
@@ -548,7 +548,10 @@ fn every_non_passing_stage_blocks_later_work_but_cleanup_still_settles() {
             let summary = trial.incomplete();
             assert_eq!(summary.blocked_at, Some(*stage));
             assert_eq!(summary.unattempted, sequence[index + 1..sequence.len() - 1]);
-            assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
+            assert!(matches!(
+                trial.finish(&Script2::fixed(DONE)),
+                Err(RunError::Incomplete)
+            ));
         }
     }
 }
@@ -782,7 +785,10 @@ fn cancellation_after_admission_refuses_the_dispatch() {
     assert_eq!(attempt.stage, Stage::QemuPrelaunchPause);
     assert_eq!(attempt.result, StageResult::Failed(Diagnostic::Cancelled));
     assert_eq!(script.cleanups, [1], "teardown stays available");
-    assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
+    assert!(matches!(
+        trial.finish(&Script2::fixed(DONE)),
+        Err(RunError::Incomplete)
+    ));
 }
 
 #[test]
@@ -804,7 +810,10 @@ fn an_effect_completing_past_the_budget_is_latched_and_still_torn_down() {
     assert_eq!(attempt.result, StageResult::Failed(Diagnostic::Expired));
     assert_eq!(script.cleanups, [3]);
     assert_eq!(trial.late(), Some(Diagnostic::Expired));
-    assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
+    assert!(matches!(
+        trial.finish(&Script2::fixed(DONE)),
+        Err(RunError::Incomplete)
+    ));
 }
 
 #[test]
@@ -832,14 +841,66 @@ fn crossing_the_budget_during_cleanup_never_seals() {
     assert_eq!(trial.incomplete().late, Some(Diagnostic::Expired));
     for now in [DONE, OVER_BUDGET] {
         assert!(matches!(
-            fixture_after_late_cleanup().finish(now),
+            fixture_after_late_cleanup().finish(&Script2::fixed(now)),
             Err(RunError::Incomplete)
         ));
     }
     assert!(matches!(
-        trial.finish(OVER_BUDGET),
+        trial.finish(&Script2::fixed(OVER_BUDGET)),
         Err(RunError::Incomplete)
     ));
+}
+
+/// A fixed instant and a cancellation source the test controls.
+struct Cancellable {
+    now: Instant2,
+    cancelled: Rc<Cell<bool>>,
+}
+
+impl Clock for Cancellable {
+    fn now(&self) -> Instant2 {
+        self.now
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.get()
+    }
+}
+
+#[test]
+fn a_cancellation_after_cleanup_and_before_finish_never_seals() {
+    let cancelled = Rc::new(Cell::new(false));
+    let mut trial = fixture(Class::Test);
+    let mut script = Script::default();
+    trial.drive(
+        &mut script,
+        &Cancellable {
+            now: T0,
+            cancelled: cancelled.clone(),
+        },
+    );
+    // The graph ran and settled with no cancellation in sight.
+    assert_eq!(script.cleanups, [12]);
+    assert_eq!((trial.blocked_at(), trial.late()), (None, None));
+    // Cancellation arrives after cleanup and before the seal.
+    cancelled.set(true);
+    assert!(matches!(
+        trial.finish(&Cancellable {
+            now: DONE,
+            cancelled
+        }),
+        Err(RunError::Incomplete)
+    ));
+    // Control: the same settled trial seals when nothing cancels.
+    let (trial, _) = complete(Class::Test);
+    assert!(
+        trial
+            .finish(&Cancellable {
+                now: DONE,
+                cancelled: Rc::new(Cell::new(false)),
+            })
+            .is_ok()
+    );
 }
 
 fn fixture_after_late_cleanup() -> Trial<Fixture> {
@@ -861,7 +922,7 @@ fn a_seal_needs_a_finish_time_inside_the_budget_and_after_the_last_record() {
     // A complete fixture still refuses a finish time past the budget, even
     // with clocks that agree, or one before its last record.
     assert!(matches!(
-        complete(Class::Test).0.finish(OVER_BUDGET),
+        complete(Class::Test).0.finish(&Script2::fixed(OVER_BUDGET)),
         Err(RunError::Incomplete)
     ));
     let mut trial = fixture(Class::Test);
@@ -871,7 +932,10 @@ fn a_seal_needs_a_finish_time_inside_the_budget_and_after_the_last_record() {
     };
     trial.drive(&mut script, &Script2::fixed(T0));
     assert_eq!(trial.blocked_at(), None);
-    assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
+    assert!(matches!(
+        trial.finish(&Script2::fixed(DONE)),
+        Err(RunError::Incomplete)
+    ));
 }
 
 #[test]
@@ -887,7 +951,10 @@ fn an_uncertain_teardown_retains_charge_and_blocks_sealing() {
     let summary = trial.incomplete();
     assert!(summary.charge_retained);
     assert_eq!(summary.dispatched_effects, 12);
-    assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
+    assert!(matches!(
+        trial.finish(&Script2::fixed(DONE)),
+        Err(RunError::Incomplete)
+    ));
 }
 
 #[test]
@@ -1415,8 +1482,16 @@ struct Recording {
 }
 
 impl DiagnosticSink for Recording {
-    fn write(&mut self, output: Output, bytes: &[u8]) -> Result<(), RunError> {
-        self.writes.push((output, bytes.to_vec()));
+    fn publish(
+        &mut self,
+        records: &[Record],
+        _dependencies: &Dependencies,
+        summary: &Incomplete,
+    ) -> Result<(), RunError> {
+        for (kind, bytes) in group_files(records)? {
+            self.writes.push((Output::Records(kind), bytes));
+        }
+        self.writes.push((Output::Incomplete, canonical(summary)?));
         Ok(())
     }
 }
@@ -1432,52 +1507,6 @@ fn fixture_trials_have_no_route_to_the_diagnostic_sink() {
         Err(RunError::Untrusted)
     );
     assert!(sink.writes.is_empty());
-}
-
-/// Refuses one record file and records every other write.
-struct Refusing {
-    refuse: FileKind,
-    writes: Vec<(Output, Vec<u8>)>,
-}
-
-impl DiagnosticSink for Refusing {
-    fn write(&mut self, output: Output, bytes: &[u8]) -> Result<(), RunError> {
-        if output == Output::Records(self.refuse) {
-            return Err(RunError::Output);
-        }
-        self.writes.push((output, bytes.to_vec()));
-        Ok(())
-    }
-}
-
-#[test]
-fn a_refused_record_is_listed_and_the_summary_still_closes_the_directory() {
-    let mut trial = Trial::begin(TrialAuthority::<NativeProbe>::probe(
-        Class::Test,
-        SCOPE,
-        RUN,
-        deps(),
-        T0,
-    ));
-    let mut collectors = BaselineOnly(Script::default());
-    trial.drive(&mut collectors, &Script2::fixed(T0));
-    let mut sink = Refusing {
-        refuse: FileKind::Distribution,
-        writes: Vec::new(),
-    };
-    assert_eq!(publish_incomplete(&trial, &mut sink), Err(RunError::Output));
-    // Six other record files, then the summary naming the refused one.
-    assert_eq!(sink.writes.len(), 7);
-    let (last, bytes) = sink.writes.last().unwrap();
-    assert_eq!(*last, Output::Incomplete);
-    let summary: Incomplete = decode(bytes).unwrap();
-    assert_eq!(summary.unwritten, [FileKind::Distribution]);
-    assert!(
-        !sink
-            .writes
-            .iter()
-            .any(|(output, _)| *output == Output::Records(FileKind::Distribution))
-    );
 }
 
 /// A test-only source with native origin and the uninhabited native store,
@@ -1567,7 +1596,10 @@ fn a_blocked_native_run_publishes_only_incomplete_diagnostics_with_the_summary_l
     assert!(!summary.charge_retained);
     assert_eq!(summary.unmeasured, ["owner_profile"]);
     assert_eq!(summary.unattempted, stages(Class::Test)[7..19]);
-    assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
+    assert!(matches!(
+        trial.finish(&Script2::fixed(DONE)),
+        Err(RunError::Incomplete)
+    ));
 }
 
 // Trait-absence checks: the generic fallback is the only candidate unless
@@ -1770,7 +1802,10 @@ mod native_glue {
             ]
         );
         assert_eq!(summary.dispatched_effects, 0);
-        assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
+        assert!(matches!(
+            trial.finish(&Script2::fixed(DONE)),
+            Err(RunError::Incomplete)
+        ));
     }
 
     #[test]
@@ -1813,6 +1848,8 @@ mod native_glue {
             STOCK_MANIFEST_SHA256,
             arxd::vm::qualification::STOCK_MANIFEST_1113_SHA256
         );
+        // The writer derives the same release the runner binds.
+        assert_eq!(release(), arxd::vm::qualification::release_digest());
     }
 
     #[test]

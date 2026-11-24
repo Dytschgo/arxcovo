@@ -7,7 +7,9 @@
 
 use crate::frame::*;
 use crate::trial::*;
-use arxd::vm::qualification::{self, Baseline, DiagnosticFile, Preflight, Taken};
+#[cfg(test)]
+use arxd::vm::qualification::DiagnosticFile;
+use arxd::vm::qualification::{self, Baseline, Entry, Preflight, Taken};
 use arxd::vm::runtime::NativeRefusal;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -299,6 +301,7 @@ impl<S: Source<Store = NoNativeStore>> Collectors<S> for NativeCollectors {
 
 /// The diagnostic file for each record file. Exhaustive in both enums, and
 /// the name equality is tested, so the contract cannot drift silently.
+#[cfg(test)]
 pub(crate) fn diagnostic_file(output: Output) -> DiagnosticFile {
     match output {
         Output::Incomplete => DiagnosticFile::Incomplete,
@@ -321,20 +324,69 @@ pub(crate) fn diagnostic_file(output: Output) -> DiagnosticFile {
     }
 }
 
+/// The summary fields a caller may supply. The writer adds the contract,
+/// origin, binding and the list of files it could not commit.
+#[derive(serde::Serialize)]
+struct SummaryBody<'a> {
+    blocked_at: Option<Stage>,
+    unattempted: &'a [Stage],
+    unmeasured: &'a [String],
+    dispatched_effects: u16,
+    charge_retained: bool,
+    late: Option<Diagnostic>,
+}
+
 struct BaselineSink<'a>(&'a Baseline);
 
 impl DiagnosticSink for BaselineSink<'_> {
-    fn write(&mut self, output: Output, bytes: &[u8]) -> Result<(), RunError> {
-        self.0
-            .write(diagnostic_file(output), bytes)
-            .map_err(|_| RunError::Output)
+    /// Only stages, times, results and summary fields cross the boundary.
+    /// The writer draws the scope and run, derives the release, the keyed
+    /// dependency digest and the record chain, and commits the summary last.
+    fn publish(
+        &mut self,
+        records: &[Record],
+        dependencies: &Dependencies,
+        summary: &Incomplete,
+    ) -> Result<(), RunError> {
+        let entries: Vec<Entry<'_, Stage, StageResult>> = records
+            .iter()
+            .map(|record| Entry {
+                stage: &record.stage,
+                started_ms: record.started_ms,
+                finished_ms: record.finished_ms,
+                result: &record.result,
+            })
+            .collect();
+        let body = SummaryBody {
+            blocked_at: summary.blocked_at,
+            unattempted: &summary.unattempted,
+            unmeasured: &summary.unmeasured,
+            dispatched_effects: summary.dispatched_effects,
+            charge_retained: summary.charge_retained,
+            late: summary.late,
+        };
+        let unwritten = self
+            .0
+            .publish(
+                &summary.binding.class,
+                dependencies,
+                summary.binding.issued_utc,
+                &entries,
+                &body,
+            )
+            .map_err(|_| RunError::Output)?;
+        if unwritten.is_empty() {
+            Ok(())
+        } else {
+            Err(RunError::Output)
+        }
     }
 }
 
 pub(crate) fn run(enrollment: &str, evidence: &str) -> Result<Outcome, RunError> {
-    // Everything fallible happens before the preflight claims the output.
-    // After the claim, every failure settles as a typed diagnostic.
-    let ids = Ids::generate()?;
+    // Everything fallible happens before the preflight claims the output,
+    // including the writer's own random scope and run. After the claim,
+    // every failure settles as a typed diagnostic.
     let baseline = qualification::preflight(enrollment, evidence).map_err(RunError::Native)?;
     let clock = NativeClock {
         origin: baseline.origin(),
@@ -343,7 +395,7 @@ pub(crate) fn run(enrollment: &str, evidence: &str) -> Result<Outcome, RunError>
     let issued = clock.now();
     // The authority takes the preflight custody. The diagnostic sink and the
     // observations are reached only through the trial's own reference.
-    let trial_authority = TrialAuthority::issue(baseline, ids, Class::Test, dependencies, issued);
+    let trial_authority = TrialAuthority::issue(baseline, Class::Test, dependencies, issued);
     let mut trial = Trial::begin(trial_authority);
     let mut collectors = NativeCollectors::new(trial.custody().observations(), clock.origin);
     trial.drive(&mut collectors, &clock);

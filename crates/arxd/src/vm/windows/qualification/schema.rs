@@ -7,9 +7,14 @@
 //! path, SID, account name or endpoint has no field to travel in. The
 //! runner's writer mirrors these shapes, and a runner test checks every
 //! encoding it can produce against this module.
+//!
+//! The writer supplies every free byte array itself (binding and chain).
+//! The only arrays a caller's result may carry are the distribution
+//! digests, and those must equal the reviewed stock pins.
 
 use super::DiagnosticFile;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 /// The runner's record contract and collector versions.
@@ -30,6 +35,8 @@ enum Shape {
     Bool,
     /// A fixed-length array of bytes.
     Bytes(usize),
+    /// Exactly these 32 bytes.
+    Pinned(fn() -> [u8; 32]),
     Enum(&'static [&'static str]),
     /// A stage permitted in this file.
     FileStage,
@@ -187,9 +194,9 @@ const OBSERVATIONS: &[(&str, &[(&str, Shape)])] = &[
     (
         "distribution",
         &[
-            ("receipt", Shape::Bytes(32)),
+            ("receipt", Shape::Pinned(stock_receipt)),
             ("receipt_bytes", Shape::Uint(U64)),
-            ("manifest", Shape::Bytes(32)),
+            ("manifest", Shape::Pinned(stock_manifest)),
             ("manifest_bytes", Shape::Uint(U64)),
             ("payload_files", Shape::Uint(U16)),
             ("payload_bytes", Shape::Uint(U64)),
@@ -235,6 +242,64 @@ const OBSERVATIONS: &[(&str, &[(&str, Shape)])] = &[
         ],
     ),
 ];
+
+/// The reviewed stock distribution receipt digest (ADR 0054).
+fn stock_receipt() -> [u8; 32] {
+    crate::vm::public_egress::STOCK_RECEIPT_1113_SHA256
+}
+
+/// The reviewed stock distribution manifest digest (ADR 0054).
+pub(super) fn stock_manifest() -> [u8; 32] {
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(super::STOCK_MANIFEST_1113_SHA256, &mut bytes)
+        .expect("fixed manifest pin");
+    bytes
+}
+
+/// The release names the evidence contract, as the runner derives it: the
+/// contract and collector versions, this package version and the stock
+/// distribution pins.
+pub(super) fn release() -> [u8; 32] {
+    Sha256::digest(
+        serde_json::to_vec(&(
+            "arx-vm-qualify",
+            RECORD_CONTRACT,
+            RECORD_COLLECTOR,
+            env!("CARGO_PKG_VERSION"),
+            stock_receipt(),
+            stock_manifest(),
+        ))
+        .expect("fixed tuple"),
+    )
+    .into()
+}
+
+/// The record files, in manifest order.
+pub(super) const RECORD_KINDS: [DiagnosticFile; 14] = [
+    DiagnosticFile::Inputs,
+    DiagnosticFile::HostBaseline,
+    DiagnosticFile::Distribution,
+    DiagnosticFile::CustodyJobCapacity,
+    DiagnosticFile::ActivityReserves,
+    DiagnosticFile::WhpxQmpEndpoint,
+    DiagnosticFile::NetworkRestrictedTest,
+    DiagnosticFile::RecipeUbuntu,
+    DiagnosticFile::RecipeWindows,
+    DiagnosticFile::NetworkRestrictedOrigin,
+    DiagnosticFile::RecipeStaticWeb,
+    DiagnosticFile::NetworkPublicIpv4,
+    DiagnosticFile::RecipeDocker,
+    DiagnosticFile::Cleanup,
+];
+
+/// The index in `RECORD_KINDS` of the file that holds a stage, from the
+/// stage's JSON spelling.
+pub(super) fn record_file(stage: &str) -> Option<usize> {
+    let name: String = serde_json::from_str(stage).ok()?;
+    RECORD_KINDS
+        .iter()
+        .position(|file| rules(*file).stages.contains(&name.as_str()))
+}
 
 /// What one file may contain.
 struct Rules {
@@ -395,6 +460,22 @@ impl<'de> Visitor<'de> for Check<'_> {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<(), A::Error> {
+        if let Shape::Pinned(expected) = self.present() {
+            let mut value = [0u8; 32];
+            let mut count = 0;
+            while let Some(byte) = items.next_element::<u8>()? {
+                if count == value.len() {
+                    return reject();
+                }
+                value[count] = byte;
+                count += 1;
+            }
+            return if count == value.len() && value == expected() {
+                Ok(())
+            } else {
+                reject()
+            };
+        }
         let (item, min, max) = match self.present() {
             Shape::Bytes(length) => (&Shape::Uint(u8::MAX as u64), *length, *length),
             Shape::List(item, max) => (*item, 0, *max),
@@ -514,6 +595,64 @@ pub(super) mod tests {
             DiagnosticFile::CustodyJobCapacity,
             unimplemented.as_bytes()
         ));
+    }
+
+    fn distribution_record(receipt: [u8; 32], manifest: [u8; 32]) -> String {
+        let array = |bytes: [u8; 32]| serde_json::to_string(&bytes).unwrap();
+        format!(
+            r#"[{{"contract":2,"collector":1,"origin":"native","binding":{b},"stage":"distribution","started_ms":0,"finished_ms":3,"prior":{p},"result":{{"passed":{{"kind":"distribution","receipt":{r},"receipt_bytes":7438,"manifest":{m},"manifest_bytes":11915,"payload_files":136,"payload_bytes":1}}}}}}]"#,
+            b = binding(),
+            p = hash(0),
+            r = array(receipt),
+            m = array(manifest),
+        )
+    }
+
+    #[test]
+    fn distribution_digests_are_pinned_to_the_reviewed_stock_values() {
+        let (receipt, manifest) = (stock_receipt(), stock_manifest());
+        assert!(check(
+            DiagnosticFile::Distribution,
+            distribution_record(receipt, manifest).as_bytes()
+        ));
+        for (name, receipt, manifest) in [
+            ("chosen receipt", [7; 32], manifest),
+            ("chosen manifest", receipt, [7; 32]),
+        ] {
+            assert!(
+                !check(
+                    DiagnosticFile::Distribution,
+                    distribution_record(receipt, manifest).as_bytes()
+                ),
+                "{name}"
+            );
+        }
+        let short = distribution_record(receipt, manifest).replacen(
+            &serde_json::to_string(&receipt).unwrap(),
+            "[1,2]",
+            1,
+        );
+        assert!(!check(DiagnosticFile::Distribution, short.as_bytes()));
+    }
+
+    #[test]
+    fn stages_map_to_exactly_one_record_file() {
+        assert_eq!(record_file(r#""inputs""#), Some(0));
+        assert_eq!(record_file(r#""disposable_store""#), Some(3));
+        assert_eq!(record_file(r#""installed_guest_endpoint""#), Some(5));
+        assert_eq!(record_file(r#""cleanup""#), Some(13));
+        for stage in STAGES {
+            let spelled = serde_json::to_string(stage).unwrap();
+            let holders = RECORD_KINDS
+                .iter()
+                .filter(|file| rules(**file).stages.contains(stage))
+                .count();
+            assert_eq!(holders, 1, "{stage}");
+            assert!(record_file(&spelled).is_some(), "{stage}");
+        }
+        for bad in [r#""unknown""#, "inputs", "3", r#"["inputs"]"#] {
+            assert_eq!(record_file(bad), None, "{bad}");
+        }
     }
 
     #[test]

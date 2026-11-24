@@ -59,40 +59,20 @@ pub(crate) struct TrialAuthority<S: Source> {
     issued: Instant2,
 }
 
-/// The runner's opaque random scope and run identifiers. Generated before
-/// the preflight claims any output, so issuing a trial cannot fail after it.
-#[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) struct Ids {
-    scope: Hash,
-    run: [u8; 16],
-}
-
-#[cfg(all(windows, target_arch = "x86_64"))]
-impl Ids {
-    pub(crate) fn generate() -> Result<Self, RunError> {
-        let mut ids = Self {
-            scope: [0; 32],
-            run: [0; 16],
-        };
-        getrandom::fill(&mut ids.scope).map_err(|_| RunError::Input)?;
-        getrandom::fill(&mut ids.run).map_err(|_| RunError::Input)?;
-        Ok(ids)
-    }
-}
-
 #[cfg(all(windows, target_arch = "x86_64"))]
 impl TrialAuthority<Native> {
     /// The only native constructor. It takes ownership of the held preflight
-    /// custody and the runner's random identifiers, and binds the keyed
-    /// dependency projection. It is infallible once the output is claimed.
+    /// custody and binds the scope and run the evidence writer drew from its
+    /// own random generator before the claim, so the trial's binding is the
+    /// one the writer publishes. It is infallible once the output is claimed.
     pub(crate) fn issue(
         custody: NativeCustody,
-        ids: Ids,
         class: Class,
         dependencies: Dependencies,
         issued: Instant2,
     ) -> Self {
-        Self::bind(custody, class, ids.scope, ids.run, dependencies, issued)
+        let (scope, run) = (custody.scope(), custody.run());
+        Self::bind(custody, class, scope, run, dependencies, issued)
     }
 }
 
@@ -253,10 +233,12 @@ impl<S: Source> Trial<S> {
     }
 
     /// Seal a trial whose every stage passed against a complete, current
-    /// dependency projection. No writer accepts the result in this version.
+    /// dependency projection. The clock is the live time and cancellation
+    /// source; cancellation is sampled at the seal point itself. No writer
+    /// accepts the result in this version.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn finish(self, now: Instant2) -> Result<Complete<S>, RunError> {
-        self.state.finish(now)
+    pub(crate) fn finish(self, clock: &impl Clock) -> Result<Complete<S>, RunError> {
+        self.state.finish(clock)
     }
 }
 
@@ -483,26 +465,8 @@ impl<S: Source> State<S> {
         );
     }
 
-    /// Each record file in manifest order with its canonical encoding.
-    fn groups(&self) -> Vec<(FileKind, Result<Vec<u8>, RunError>)> {
-        FileKind::ALL
-            .into_iter()
-            .filter_map(|kind| {
-                let group: Vec<&Record> = self
-                    .records
-                    .iter()
-                    .filter(|record| record.stage.file() == kind)
-                    .collect();
-                (!group.is_empty()).then(|| (kind, canonical(&group)))
-            })
-            .collect()
-    }
-
     fn files(&self) -> Result<Vec<(FileKind, Vec<u8>)>, RunError> {
-        self.groups()
-            .into_iter()
-            .map(|(kind, bytes)| bytes.map(|bytes| (kind, bytes)))
-            .collect()
+        group_files(&self.records)
     }
 
     fn complete(&self) -> bool {
@@ -542,7 +506,8 @@ impl<S: Source> State<S> {
         }
     }
 
-    fn finish(self, now: Instant2) -> Result<Complete<S>, RunError> {
+    fn finish(self, clock: &impl Clock) -> Result<Complete<S>, RunError> {
+        let now = clock.now();
         let binding = self.binding();
         let dependencies = &self.dependencies;
         if !self.complete()
@@ -571,6 +536,11 @@ impl<S: Source> State<S> {
                 .collect(),
         };
         check_bundle(&seal, &files, S::ORIGIN)?;
+        // The seal point: a cancellation delivered after cleanup, or while
+        // the bundle was built, is observed here and nothing seals.
+        if clock.cancelled() {
+            return Err(RunError::Incomplete);
+        }
         Ok(Complete {
             seal: canonical(&seal)?,
             files,
@@ -587,20 +557,43 @@ pub(crate) struct Complete<S: Source> {
     _source: std::marker::PhantomData<S>,
 }
 
+/// Test-only label for one published file, used by recording sinks.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Output {
     Records(FileKind),
     Incomplete,
 }
 
-pub(crate) trait DiagnosticSink {
-    fn write(&mut self, output: Output, bytes: &[u8]) -> Result<(), RunError>;
+/// Each record file in manifest order with its canonical encoding.
+pub(crate) fn group_files(records: &[Record]) -> Result<Vec<(FileKind, Vec<u8>)>, RunError> {
+    FileKind::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            let group: Vec<&Record> = records
+                .iter()
+                .filter(|record| record.stage.file() == kind)
+                .collect();
+            (!group.is_empty()).then(|| canonical(&group).map(|bytes| (kind, bytes)))
+        })
+        .collect()
 }
 
-/// Publish an incomplete native run: every record file, then the summary
-/// last. A record the sink refuses is listed in the summary rather than
-/// ending publication, so a claimed directory always gets its summary.
-/// Fixture trials and complete-looking trials have no route here.
+/// Where an incomplete native run is published. The sink receives the
+/// records in chain order and the summary. The native sink passes only the
+/// stages, times, results and summary fields to the evidence writer, which
+/// derives every opaque value itself and writes the summary last.
+pub(crate) trait DiagnosticSink {
+    fn publish(
+        &mut self,
+        records: &[Record],
+        dependencies: &Dependencies,
+        summary: &Incomplete,
+    ) -> Result<(), RunError>;
+}
+
+/// Publish an incomplete native run. Fixture trials and complete-looking
+/// trials have no route here.
 pub(crate) fn publish_incomplete<S: Source>(
     trial: &Trial<S>,
     sink: &mut impl DiagnosticSink,
@@ -611,17 +604,9 @@ pub(crate) fn publish_incomplete<S: Source>(
     if !trial.state.settled || trial.state.complete() {
         return Err(RunError::Output);
     }
-    let mut summary = trial.incomplete();
-    for (file, bytes) in trial.state.groups() {
-        let written = bytes.and_then(|bytes| sink.write(Output::Records(file), &bytes));
-        if written.is_err() {
-            summary.unwritten.push(file);
-        }
-    }
-    sink.write(Output::Incomplete, &canonical(&summary)?)?;
-    if summary.unwritten.is_empty() {
-        Ok(())
-    } else {
-        Err(RunError::Output)
-    }
+    sink.publish(
+        &trial.state.records,
+        &trial.state.dependencies,
+        &trial.incomplete(),
+    )
 }

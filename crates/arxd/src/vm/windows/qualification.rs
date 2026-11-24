@@ -11,12 +11,16 @@ mod schema;
 mod sink;
 
 pub use schema::{RECORD_COLLECTOR, RECORD_CONTRACT};
-pub use sink::{DiagnosticFile, SinkError};
+pub use sink::{DiagnosticFile, Entry, SinkError};
 
 use super::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, io::Read, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+    time::Instant,
+};
 use windows_sys::{
     Wdk::System::SystemServices::RtlGetVersion,
     Win32::System::{
@@ -213,13 +217,36 @@ pub struct Preflight {
 /// let _ = arxd::vm::qualification::DiagnosticFile::Qualification;
 /// ```
 ///
+/// There is no byte-taking writer, so caller bytes never reach an opaque
+/// field:
+///
+/// ```compile_fail,E0599
+/// fn write(b: &arxd::vm::qualification::Baseline) {
+///     let _ = b.write(arxd::vm::qualification::DiagnosticFile::Inputs, b"[]");
+/// }
+/// ```
+///
+/// and a published entry has no field for the chain digest the writer
+/// derives:
+///
+/// ```compile_fail,E0560
+/// fn entry<'a>(
+///     stage: &'a &'static str,
+///     result: &'a (),
+/// ) -> arxd::vm::qualification::Entry<'a, &'static str, ()> {
+///     arxd::vm::qualification::Entry { stage, started_ms: 0, finished_ms: 0, result, prior: [0; 32] }
+/// }
+/// ```
+///
 /// Positive control: the authority-free surface these checks rely on
 /// compiles, so each refusal above is the fence and not a missing path.
 ///
 /// ```no_run
-/// use arxd::vm::qualification::{Baseline, DiagnosticFile, Preflight, SinkError};
-/// fn surface<'a>(b: &'a Baseline, record: &[u8]) -> Result<&'a Preflight, SinkError> {
-///     b.write(DiagnosticFile::Inputs, record)?;
+/// use arxd::vm::qualification::{Baseline, DiagnosticFile, Entry, Preflight, SinkError};
+/// fn surface<'a>(b: &'a Baseline) -> Result<&'a Preflight, SinkError> {
+///     let entry = Entry { stage: &"inputs", started_ms: 0, finished_ms: 1, result: &"unimplemented" };
+///     let unwritten: Vec<DiagnosticFile> = b.publish(&"test", &(), 0, &[entry], &())?;
+///     let _ = (unwritten, b.scope(), b.run());
 ///     Ok(b.observations())
 /// }
 /// let _ = surface;
@@ -233,8 +260,12 @@ pub struct Baseline {
     _held: Held,
 }
 
+/// Every payload file and every directory under the distribution root, each
+/// opened relative to its held parent.
+type HeldTree = (Vec<File>, BTreeMap<String, File>);
+
 struct Held {
-    _bundle: Vec<PathPin>,
+    _bundle: Option<(PathPin, HeldTree)>,
     _pins: [PathPin; 3],
     _volumes: [capacity::AnchoredVolume; 2],
     _token: VmToken,
@@ -251,11 +282,47 @@ impl Baseline {
         self.origin
     }
 
-    /// Write one diagnostic file into the claimed directory. The bytes must
-    /// be one canonical value of that file's closed schema.
-    pub fn write(&self, file: DiagnosticFile, bytes: &[u8]) -> Result<(), SinkError> {
-        self.evidence.write(file, bytes)
+    /// The run's opaque scope, drawn by the evidence writer's own random
+    /// generator before the claim.
+    pub fn scope(&self) -> [u8; 32] {
+        self.evidence.scope()
     }
+
+    /// The run's opaque identifier, drawn like the scope.
+    pub fn run(&self) -> [u8; 16] {
+        self.evidence.run()
+    }
+
+    /// Publish the run's diagnostics once: each entry's stage, times and
+    /// result, in chain order, then the summary fields. The writer derives
+    /// the binding (scope, run, release and the scope-keyed digest of
+    /// `dependencies`) and the record chain itself, commits every file
+    /// through a temporary entry, and writes the summary last. It returns the
+    /// record files it could not commit, which the summary lists.
+    pub fn publish<C, D, St, R, B>(
+        &self,
+        class: &C,
+        dependencies: &D,
+        issued_utc: u64,
+        entries: &[Entry<'_, St, R>],
+        summary: &B,
+    ) -> Result<Vec<DiagnosticFile>, SinkError>
+    where
+        C: Serialize,
+        D: Serialize,
+        St: Serialize,
+        R: Serialize,
+        B: Serialize,
+    {
+        self.evidence
+            .publish(class, dependencies, issued_utc, entries, summary)
+    }
+}
+
+/// The release digest the writer binds, as the runner derives it. Pure and
+/// authority-free; the runner's tests check the two derivations agree.
+pub fn release_digest() -> [u8; 32] {
+    schema::release()
 }
 
 /// The closed-schema check the held writer applies to `file`. Pure and
@@ -346,7 +413,9 @@ fn preflight_with(
     // volume come from the same proven objects.
     let outer_volume = capacity::anchor_volume(names, outer.as_str())?;
     let trial_volume = capacity::anchor_volume(names, &root.as_str()[..3])?;
-    let evidence_pin = capacity::walk(names, &outer_volume, &evidence_path, true, false)?;
+    // The evidence directory shares write so the writer can rename its
+    // committed entries relative to this held handle.
+    let evidence_pin = capacity::walk(names, &outer_volume, &evidence_path, true, true)?;
     let trial_pin = capacity::walk(names, &trial_volume, &root, true, false)?;
     let backing_pin = capacity::walk(names, &outer_volume, &backing, false, true)?;
     if !sink::held_private(&trial_pin.leaf, user_sid)
@@ -455,7 +524,7 @@ fn preflight_with(
         origin,
         evidence,
         _held: Held {
-            _bundle: bundle_pins.unwrap_or_default(),
+            _bundle: bundle_pins,
             _pins: [source, trial_pin, backing_pin],
             _volumes: [trial_volume, outer_volume],
             _token: token,
@@ -863,15 +932,26 @@ fn read_bounded(file: &File, max: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn collect_distribution(root: &LocalPath) -> Result<(Distribution, Vec<PathPin>), NativeRefusal> {
+fn collect_distribution(
+    root: &LocalPath,
+) -> Result<(Distribution, (PathPin, HeldTree)), NativeRefusal> {
+    let reason = NativeRefusal::DistributionUnverified;
+    // The only walk by name. Every later open and listing goes through this
+    // held root or a directory opened relative to it.
+    let root_pin = PathPin::open(root, true, false).map_err(|_| reason)?;
+    let (distribution, tree) = inspect_distribution(&root_pin.leaf)?;
+    Ok((distribution, (root_pin, tree)))
+}
+
+fn inspect_distribution(root: &File) -> Result<(Distribution, HeldTree), NativeRefusal> {
     use crate::vm::public_egress::{STOCK_QEMU_1113, STOCK_RECEIPT_1113_SHA256};
 
     let reason = NativeRefusal::DistributionUnverified;
-    let root_pin = PathPin::open(root, true, false).map_err(|_| reason)?;
-    let receipt = distribution_pin(root, "RECEIPT.txt")?;
-    let manifest = distribution_pin(root, "MANIFEST.sha256")?;
-    let receipt_bytes = read_bounded(&receipt.leaf, RECEIPT_BYTES as u64).map_err(|_| reason)?;
-    let manifest_bytes = read_bounded(&manifest.leaf, MANIFEST_BYTES as u64).map_err(|_| reason)?;
+    let mut dirs = BTreeMap::new();
+    let receipt = held_file(root, &mut dirs, "RECEIPT.txt").map_err(|_| reason)?;
+    let manifest = held_file(root, &mut dirs, "MANIFEST.sha256").map_err(|_| reason)?;
+    let receipt_bytes = read_bounded(&receipt, RECEIPT_BYTES as u64).map_err(|_| reason)?;
+    let manifest_bytes = read_bounded(&manifest, MANIFEST_BYTES as u64).map_err(|_| reason)?;
     let receipt_hash: [u8; 32] = Sha256::digest(&receipt_bytes).into();
     let manifest_hash: [u8; 32] = Sha256::digest(&manifest_bytes).into();
     if receipt_bytes.len() != RECEIPT_BYTES
@@ -882,15 +962,15 @@ fn collect_distribution(root: &LocalPath) -> Result<(Distribution, Vec<PathPin>)
         return Err(reason);
     }
 
-    let entries = parse_manifest(&manifest_bytes, PAYLOAD_ENTRIES).ok_or(reason)?;
+    let payload = parse_manifest(&manifest_bytes, PAYLOAD_ENTRIES).ok_or(reason)?;
     let mut allowed_files =
         BTreeSet::from(["receipt.txt".to_owned(), "manifest.sha256".to_owned()]);
     let mut allowed_dirs = BTreeSet::new();
-    let mut pins = vec![root_pin, receipt, manifest];
+    let mut held = vec![receipt, manifest];
     let mut payload_bytes = 0u64;
-    for (name, sha256) in entries {
-        let mut pin = distribution_pin(root, name)?;
-        let size = pin.leaf.metadata().map_err(|_| reason)?.len();
+    for (name, sha256) in payload {
+        let file = held_file(root, &mut dirs, name).map_err(|_| reason)?;
+        let size = file.metadata().map_err(|_| reason)?.len();
         payload_bytes = payload_bytes
             .checked_add(size)
             .filter(|&n| n <= MAX_PAYLOAD_BYTES)
@@ -901,16 +981,21 @@ fn collect_distribution(root: &LocalPath) -> Result<(Distribution, Vec<PathPin>)
         {
             return Err(reason);
         }
-        pin.verify_content(ArtifactPin { size, sha256 }, MAX_PAYLOAD_FILE)
-            .map_err(|_| reason)?;
+        // The held file itself is hashed, from its start.
+        if !matches!(
+            ArtifactPin { size, sha256 }.verify(&file, MAX_PAYLOAD_FILE),
+            Ok(true)
+        ) {
+            return Err(reason);
+        }
         let folded = name.to_ascii_lowercase();
         for (offset, _) in folded.match_indices('/') {
             allowed_dirs.insert(folded[..offset].to_owned());
         }
         allowed_files.insert(folded);
-        pins.push(pin);
+        held.push(file);
     }
-    verify_inventory(root, allowed_files, allowed_dirs)?;
+    verify_inventory(root, &dirs, allowed_files, allowed_dirs)?;
     Ok((
         Distribution {
             receipt: receipt_hash,
@@ -920,46 +1005,142 @@ fn collect_distribution(root: &LocalPath) -> Result<(Distribution, Vec<PathPin>)
             payload_files: PAYLOAD_ENTRIES as u16,
             payload_bytes,
         },
-        pins,
+        (held, dirs),
     ))
 }
 
-fn distribution_pin(root: &LocalPath, name: &str) -> Result<PathPin, NativeRefusal> {
-    let reason = NativeRefusal::DistributionUnverified;
-    let path = name
-        .split('/')
-        .try_fold(root.clone(), |dir, part| dir.join(part))
-        .map_err(|_| reason)?;
-    PathPin::open(&path, false, false).map_err(|_| reason)
+/// Open every directory of `path` (a `/`-separated relative name) relative
+/// to its held parent, keyed by the lowercased relative name.
+fn held_dir(root: &File, dirs: &mut BTreeMap<String, File>, path: &str) -> io::Result<()> {
+    let mut key = String::new();
+    for part in path.split('/') {
+        let child = if key.is_empty() {
+            part.to_ascii_lowercase()
+        } else {
+            format!("{key}/{}", part.to_ascii_lowercase())
+        };
+        if !dirs.contains_key(&child) {
+            let parent = if key.is_empty() { root } else { &dirs[&key] };
+            let dir = open_relative(parent, part, Node::Directory, false, false)?;
+            file_identity(&dir, true)?;
+            dirs.insert(child.clone(), dir);
+        }
+        key = child;
+    }
+    Ok(())
 }
 
+/// Open one file relative to its held parent directory, never by name from
+/// a drive letter.
+fn held_file(root: &File, dirs: &mut BTreeMap<String, File>, name: &str) -> io::Result<File> {
+    let (key, leaf) = match name.rsplit_once('/') {
+        Some((parent, leaf)) => {
+            held_dir(root, dirs, parent)?;
+            (parent.to_ascii_lowercase(), leaf)
+        }
+        None => (String::new(), name),
+    };
+    let parent = if key.is_empty() { root } else { &dirs[&key] };
+    let file = open_relative(parent, leaf, Node::File, false, false)?;
+    file_identity(&file, false)?;
+    Ok(file)
+}
+
+/// The held root and every held directory list exactly the allowed entries,
+/// read through their own handles.
 fn verify_inventory(
-    root: &LocalPath,
+    root: &File,
+    dirs: &BTreeMap<String, File>,
     mut files: BTreeSet<String>,
-    mut dirs: BTreeSet<String>,
+    mut allowed: BTreeSet<String>,
 ) -> Result<(), NativeRefusal> {
     let reason = NativeRefusal::DistributionUnverified;
-    let mut pending = vec![(root.clone(), String::new())];
-    while let Some((dir, prefix)) = pending.pop() {
-        let _held = PathPin::open(&dir, true, false).map_err(|_| reason)?;
-        for entry in std::fs::read_dir(dir.as_str()).map_err(|_| reason)? {
-            let entry = entry.map_err(|_| reason)?;
-            let name = entry.file_name();
-            let name = name.to_str().ok_or(reason)?;
-            let path = dir.join(name).map_err(|_| reason)?;
-            let key = format!("{prefix}{}", name.to_ascii_lowercase());
-            let kind = entry.file_type().map_err(|_| reason)?;
-            if kind.is_dir() && dirs.remove(&key) {
-                pending.push((path, format!("{key}/")));
-            } else if !kind.is_file() || !files.remove(&key) {
+    let held = std::iter::once(("", root)).chain(dirs.iter().map(|(key, dir)| (key.as_str(), dir)));
+    for (key, dir) in held {
+        for (name, attributes) in listing(dir).map_err(|_| reason)? {
+            let entry = if key.is_empty() {
+                name.to_ascii_lowercase()
+            } else {
+                format!("{key}/{}", name.to_ascii_lowercase())
+            };
+            let listed = if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                false
+            } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                allowed.remove(&entry)
+            } else {
+                files.remove(&entry)
+            };
+            if !listed {
                 return Err(reason);
             }
         }
     }
-    if files.is_empty() && dirs.is_empty() {
+    if files.is_empty() && allowed.is_empty() {
         Ok(())
     } else {
         Err(reason)
+    }
+}
+
+/// Every entry of a held directory with its attributes, read through the
+/// handle itself; the directory is never enumerated by name.
+fn listing(dir: &File) -> io::Result<Vec<(String, u32)>> {
+    const MAX_ENTRIES: usize = 4096;
+    let mut buffer = vec![0u64; 8192];
+    let capacity = buffer.len() * size_of::<u64>();
+    let header = size_of::<FILE_FULL_DIR_INFO>();
+    let name_offset = std::mem::offset_of!(FILE_FULL_DIR_INFO, FileName);
+    let mut found = Vec::new();
+    let mut class = FileFullDirectoryRestartInfo;
+    loop {
+        // The aligned buffer receives a chain of variable-length records.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                dir.as_raw_handle(),
+                class,
+                buffer.as_mut_ptr().cast(),
+                capacity as u32,
+            )
+        };
+        if ok == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                return Ok(found);
+            }
+            return Err(error);
+        }
+        class = FileFullDirectoryInfo;
+        let bytes = buffer.as_ptr().cast::<u8>();
+        let mut offset = 0;
+        loop {
+            if offset + header > capacity {
+                return Err(io::Error::other("directory record out of bounds"));
+            }
+            // The record starts inside the buffer at an 8-byte boundary.
+            let entry = unsafe { &*bytes.add(offset).cast::<FILE_FULL_DIR_INFO>() };
+            let length = entry.FileNameLength as usize;
+            if offset + name_offset + length > capacity || !length.is_multiple_of(2) {
+                return Err(io::Error::other("directory name out of bounds"));
+            }
+            // The name lies inside the buffer, as checked above.
+            let units = unsafe {
+                std::slice::from_raw_parts(
+                    bytes.add(offset + name_offset).cast::<u16>(),
+                    length / 2,
+                )
+            };
+            let name = String::from_utf16(units).map_err(io::Error::other)?;
+            if name != "." && name != ".." {
+                if found.len() == MAX_ENTRIES {
+                    return Err(io::Error::other("directory entry limit exceeded"));
+                }
+                found.push((name, entry.FileAttributes));
+            }
+            if entry.NextEntryOffset == 0 {
+                break;
+            }
+            offset += entry.NextEntryOffset as usize;
+        }
     }
 }
 
@@ -1376,5 +1557,45 @@ mod tests {
             );
             assert_eq!(std::fs::read_dir(&evidence).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn distribution_opens_and_lists_only_through_held_directories() {
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let named = root.path().join("named");
+        let held = root.path().join("held");
+        for dir in [&named, &held] {
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            std::fs::write(dir.join("a.txt"), b"a").unwrap();
+            std::fs::write(dir.join("sub").join("b.dll"), b"b").unwrap();
+        }
+        std::fs::write(named.join("only-named.txt"), b"n").unwrap();
+        std::fs::write(held.join("only-held.txt"), b"h").unwrap();
+        // A split: the inventory below matches the named directory, while
+        // the held object is its sibling.
+        let held_root = open_directory(held.to_str().unwrap()).unwrap();
+        let mut dirs = BTreeMap::new();
+        let set = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+        assert!(held_file(&held_root, &mut dirs, "only-named.txt").is_err());
+        assert!(held_file(&held_root, &mut dirs, "sub/b.dll").is_ok());
+        assert_eq!(
+            verify_inventory(
+                &held_root,
+                &dirs,
+                set(&["a.txt", "only-named.txt", "sub/b.dll"]),
+                set(&["sub"])
+            ),
+            Err(NativeRefusal::DistributionUnverified)
+        );
+        // Control: the held object's own inventory, through held handles.
+        assert_eq!(
+            verify_inventory(
+                &held_root,
+                &dirs,
+                set(&["a.txt", "only-held.txt", "sub/b.dll"]),
+                set(&["sub"])
+            ),
+            Ok(())
+        );
     }
 }

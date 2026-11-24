@@ -83,7 +83,7 @@ class VerdictTests(unittest.TestCase):
 
     def test_a_refusal_must_carry_its_declared_code_and_nothing_else(self):
         tag = "compile_fail,E0451"
-        self.assertIsNone(CHECK.verdict(tag, [("E0451", "fields are private"), PRIVATE]))
+        self.assertIsNone(CHECK.verdict(tag, 1, [("E0451", "fields are private"), PRIVATE]))
         for name, found in [
             ("compiled", []),
             ("only private-type noise", [PRIVATE]),
@@ -91,12 +91,32 @@ class VerdictTests(unittest.TestCase):
             ("declared code plus a stray code", [("E0451", "private"), ("E0308", "mismatched types")]),
             ("declared code plus a stray code-less error", [("E0451", "private"), (None, "cannot find value")]),
         ]:
-            self.assertIsNotNone(CHECK.verdict(tag, found), name)
+            self.assertIsNotNone(CHECK.verdict(tag, 1, found), name)
+
+    def test_a_refusal_needs_a_failing_compiler_exit(self):
+        tag = "compile_fail,E0451"
+        # Exit 0 with the expected diagnostic is not a refusal.
+        self.assertIsNotNone(CHECK.verdict(tag, 0, [("E0451", "fields are private")]))
+        # A failing exit without the structured code is not the fence.
+        self.assertIsNotNone(CHECK.verdict(tag, 1, []))
+        self.assertIsNotNone(CHECK.verdict(tag, 101, CHECK.errors("error: rustc crashed\nplain text")))
+        self.assertIsNotNone(CHECK.verdict(tag, 1, [("E0433", "failed to resolve")]))
 
     def test_the_positive_control_must_compile_cleanly(self):
-        self.assertIsNone(CHECK.verdict("no_run", []))
-        self.assertIsNotNone(CHECK.verdict("no_run", [PRIVATE]))
-        self.assertIsNotNone(CHECK.verdict("no_run", [("E0106", "missing lifetime specifier")]))
+        self.assertIsNone(CHECK.verdict("no_run", 0, []))
+        self.assertIsNotNone(CHECK.verdict("no_run", 0, [PRIVATE]))
+        self.assertIsNotNone(CHECK.verdict("no_run", 0, [("E0106", "missing lifetime specifier")]))
+
+    def test_a_positive_control_whose_compiler_fails_never_passes(self):
+        # Exit 1 with plain text only and no structured diagnostic.
+        found = CHECK.errors("error: could not compile\nterminated before JSON output")
+        self.assertEqual(found, [])
+        self.assertIsNotNone(CHECK.verdict("no_run", 1, found))
+
+    def test_unparseable_json_output_is_an_error(self):
+        for stderr in ["{not json", '{"level": "error"', "plain text\n{1}", "{}x"]:
+            with self.assertRaises(ValueError, msg=stderr):
+                CHECK.errors(stderr)
 
 
 if __name__ == "__main__":

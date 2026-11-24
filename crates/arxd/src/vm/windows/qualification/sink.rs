@@ -1,9 +1,23 @@
 //! Diagnostic-only evidence output. The directory is held, privately owned
 //! and claimed exclusively before any record is written. There is no file
 //! name for a completed qualification in this contract version.
+//!
+//! The writer is the provenance boundary for every opaque value. It draws
+//! the scope and run from its own random generator, derives the release,
+//! the scope-keyed dependency digest and the record chain by hashing, and
+//! the schema pins the distribution digests to the reviewed stock values.
+//! A caller supplies only stages, times, results and summary fields.
+//!
+//! Every file is committed through a hidden temporary entry that is
+//! written, flushed and renamed relative to the held directory, so an
+//! interrupted write never leaves an entry under a final name.
 
 use super::*;
+use serde::Serialize;
 use std::cell::Cell;
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+};
 
 /// The fixed diagnostic outputs. A completion marker does not exist here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +65,8 @@ impl DiagnosticFile {
 const CLAIM: &str = "claim.json";
 const CLAIM_BYTES: &[u8] = br#"{"claim":"arx-vm-qualify"}"#;
 const MAX_OUTPUT: usize = 16 * 1024;
+/// Seven days, the maximum qualification validity.
+const VALIDITY_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SinkError {
@@ -60,25 +76,70 @@ pub enum SinkError {
     Io,
 }
 
+/// One record as a caller publishes it. The writer adds the contract,
+/// origin, binding and chain digest; there is no field for any of them.
+pub struct Entry<'a, St, R> {
+    pub stage: &'a St,
+    pub started_ms: u64,
+    pub finished_ms: u64,
+    pub result: &'a R,
+}
+
+/// The two steps between creating a temporary entry and renaming it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Step {
+    Write,
+    Flush,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: fail one commit step of one file name on this thread.
+    static FAULT: Cell<Option<(&'static str, Step)>> = const { Cell::new(None) };
+}
+
+fn fault(name: &str, step: Step) -> io::Result<()> {
+    #[cfg(test)]
+    if FAULT
+        .with(Cell::get)
+        .is_some_and(|(at, when)| at == name && when == step)
+    {
+        return Err(io::Error::other("injected commit fault"));
+    }
+    #[cfg(not(test))]
+    let _ = (name, step);
+    Ok(())
+}
+
 pub(super) struct EvidenceDir {
     pin: PathPin,
     canaries: Vec<Vec<u8>>,
+    scope: [u8; 32],
+    run: [u8; 16],
     closed: Cell<bool>,
+}
+
+fn json<T: Serialize + ?Sized>(value: &T) -> Result<String, SinkError> {
+    serde_json::to_string(value).map_err(|_| SinkError::Invalid)
 }
 
 impl EvidenceDir {
     /// Hold the directory, require private ownership and emptiness through
-    /// the held object, then claim it with an exclusive create. A concurrent
-    /// runner loses the claim and writes nothing.
+    /// the held object, draw the run's opaque identifiers, then claim the
+    /// directory with an exclusive commit. A concurrent runner loses the
+    /// claim and writes nothing; an interrupted claim leaves no claim entry.
     pub(super) fn claim(
         pin: PathPin,
         owner: PSID,
         private_values: &[&str],
     ) -> Result<Self, NativeRefusal> {
         let reason = NativeRefusal::PathCustodyUnverified;
-        if !held_private(&pin.leaf, owner) || !empty(&pin)? {
+        if !held_private(&pin.leaf, owner) || !empty(&pin.leaf)? {
             return Err(reason);
         }
+        let (mut scope, mut run) = ([0; 32], [0; 16]);
+        getrandom::fill(&mut scope).map_err(|_| reason)?;
+        getrandom::fill(&mut run).map_err(|_| reason)?;
         let dir = Self {
             pin,
             canaries: private_values
@@ -93,29 +154,121 @@ impl EvidenceDir {
                     ]
                 })
                 .collect(),
+            scope,
+            run,
             closed: Cell::new(false),
         };
-        dir.create(CLAIM, CLAIM_BYTES).map_err(|_| reason)?;
+        dir.commit(CLAIM, CLAIM_BYTES).map_err(|_| reason)?;
         Ok(dir)
     }
 
-    /// Exclusive, bounded, one canonical value of the file's closed schema,
-    /// and free of raw private values. The summary closes the sink so it is
-    /// always the final file.
-    pub(super) fn write(&self, file: DiagnosticFile, bytes: &[u8]) -> Result<(), SinkError> {
-        if self.closed.get() {
+    pub(super) fn scope(&self) -> [u8; 32] {
+        self.scope
+    }
+
+    pub(super) fn run(&self) -> [u8; 16] {
+        self.run
+    }
+
+    /// Publish the run once: every record file in manifest order, then the
+    /// summary last. The writer composes each record around the caller's
+    /// stage, times and result, and chains it to the previous record in the
+    /// caller's order. It returns the record files it could not commit,
+    /// which the summary lists; a summary it cannot commit is an error.
+    pub(super) fn publish<C, D, St, R, B>(
+        &self,
+        class: &C,
+        dependencies: &D,
+        issued_utc: u64,
+        entries: &[Entry<'_, St, R>],
+        summary: &B,
+    ) -> Result<Vec<DiagnosticFile>, SinkError>
+    where
+        C: Serialize,
+        D: Serialize,
+        St: Serialize,
+        R: Serialize,
+        B: Serialize,
+    {
+        if self.closed.replace(true) {
             return Err(SinkError::Closed);
         }
+        let binding = self.binding(class, dependencies, issued_utc)?;
+        let mut grouped: Vec<Vec<Vec<u8>>> = vec![Vec::new(); super::schema::RECORD_KINDS.len()];
+        let mut prior = [0u8; 32];
+        let mut composed = true;
+        for entry in entries {
+            match record(&binding, entry, prior) {
+                Some((index, bytes)) => {
+                    prior = Sha256::digest(&bytes).into();
+                    grouped[index].push(bytes);
+                }
+                None => composed = false,
+            }
+        }
+        let mut unwritten = Vec::new();
+        for (records, file) in grouped.iter().zip(super::schema::RECORD_KINDS) {
+            if records.is_empty() {
+                continue;
+            }
+            let joined = records.join(&b',');
+            let bytes = [&b"["[..], joined.as_slice(), &b"]"[..]].concat();
+            // An entry that cannot be composed breaks the chain, so no
+            // record file is published.
+            if !composed || self.commit_checked(file, &bytes).is_err() {
+                unwritten.push(file);
+            }
+        }
+        let names: Vec<&str> = unwritten.iter().map(|file| file.name()).collect();
+        let body = json(summary)?;
+        let fields = body
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+            .filter(|fields| !fields.is_empty())
+            .ok_or(SinkError::Invalid)?;
+        let bytes = format!(
+            r#"{{"contract":{RECORD_CONTRACT},"origin":"native","binding":{binding},{fields},"unwritten":{}}}"#,
+            json(&names)?
+        );
+        self.commit_checked(DiagnosticFile::Incomplete, bytes.as_bytes())?;
+        if composed {
+            Ok(unwritten)
+        } else {
+            Err(SinkError::Invalid)
+        }
+    }
+
+    /// The binding every published file carries. The scope and run are the
+    /// writer's own; the dependency digest is keyed by the random scope, so
+    /// the private identities in the projection cannot be recovered.
+    fn binding<C: Serialize, D: Serialize>(
+        &self,
+        class: &C,
+        dependencies: &D,
+        issued_utc: u64,
+    ) -> Result<String, SinkError> {
+        let keyed: [u8; 32] = Sha256::digest(json(&(&self.scope, dependencies))?).into();
+        Ok(format!(
+            r#"{{"class":{},"scope":{},"release":{},"run":{},"dependencies":{},"issued_utc":{issued_utc},"expires_utc":{}}}"#,
+            json(class)?,
+            json(&self.scope)?,
+            json(&super::schema::release())?,
+            json(&self.run)?,
+            json(&keyed)?,
+            issued_utc.saturating_add(VALIDITY_SECS),
+        ))
+    }
+
+    /// Bounded, one canonical value of the file's closed schema, free of raw
+    /// private values, then committed under its final name.
+    fn commit_checked(&self, file: DiagnosticFile, bytes: &[u8]) -> Result<(), SinkError> {
         if !(1..=MAX_OUTPUT).contains(&bytes.len()) || !super::schema::check(file, bytes) {
             return Err(SinkError::Invalid);
         }
         if self.leaks(bytes) {
             return Err(SinkError::Private);
         }
-        if file == DiagnosticFile::Incomplete {
-            self.closed.set(true);
-        }
-        self.create(file.name(), bytes).map_err(|_| SinkError::Io)
+        self.commit(file.name(), bytes).map_err(|_| SinkError::Io)
     }
 
     fn leaks(&self, bytes: &[u8]) -> bool {
@@ -127,23 +280,163 @@ impl EvidenceDir {
             || self.canaries.iter().any(|canary| contains(canary))
     }
 
-    fn create(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        use std::io::Write;
-        let mut output = open_relative(&self.pin.leaf, name, Node::File, false, true)?;
-        let written = output.write(bytes)?;
-        if written != bytes.len() {
-            return Err(io::Error::other("short evidence write"));
+    /// Write a hidden temporary entry, flush it and rename it to `name`
+    /// relative to the held directory. On any failure the temporary entry is
+    /// deleted with its handle and no final name appears.
+    fn commit(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let temporary = create_hidden(&self.pin.leaf, &format!(".{name}.partial"))?;
+        let committed = finish_commit(&temporary, &self.pin.leaf, name, bytes);
+        if committed.is_err() {
+            let _ = discard(&temporary);
         }
-        output.sync_all()
+        committed
     }
 }
 
-fn empty(pin: &PathPin) -> Result<bool, NativeRefusal> {
-    // The held directory and its held ancestors refuse rename, so the name
-    // enumerated here is the pinned object.
-    let mut items =
-        std::fs::read_dir(pin.path.as_str()).map_err(|_| NativeRefusal::PathCustodyUnverified)?;
-    Ok(items.next().is_none())
+/// One record around the caller's stage, times and result, and the index of
+/// the record file that holds its stage.
+fn record<St: Serialize, R: Serialize>(
+    binding: &str,
+    entry: &Entry<'_, St, R>,
+    prior: [u8; 32],
+) -> Option<(usize, Vec<u8>)> {
+    let stage = serde_json::to_string(entry.stage).ok()?;
+    let index = super::schema::record_file(&stage)?;
+    let record = format!(
+        r#"{{"contract":{RECORD_CONTRACT},"collector":{RECORD_COLLECTOR},"origin":"native","binding":{binding},"stage":{stage},"started_ms":{},"finished_ms":{},"prior":{},"result":{}}}"#,
+        entry.started_ms,
+        entry.finished_ms,
+        serde_json::to_string(&prior).ok()?,
+        serde_json::to_string(entry.result).ok()?,
+    );
+    Some((index, record.into_bytes()))
+}
+
+fn finish_commit(file: &File, dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let mut writer = file;
+    if writer.write(bytes)? != bytes.len() {
+        return Err(io::Error::other("short evidence write"));
+    }
+    fault(name, Step::Write)?;
+    // The final entry is an ordinary file; only the temporary was hidden.
+    let basic = FILE_BASIC_INFO {
+        FileAttributes: FILE_ATTRIBUTE_NORMAL,
+        ..Default::default()
+    };
+    // Zero timestamps leave the times unchanged.
+    succeeded(unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            std::ptr::from_ref(&basic).cast(),
+            size_of_val(&basic) as u32,
+        )
+    })?;
+    file.sync_all()?;
+    fault(name, Step::Flush)?;
+    rename_within(file, dir, name)
+}
+
+/// Exclusively create a hidden entry under the held directory, with the
+/// delete access its rename or disposal needs.
+fn create_hidden(dir: &File, name: &str) -> io::Result<File> {
+    let mut units: Vec<u16> = name.encode_utf16().collect();
+    let bytes = u16::try_from(units.len() * 2).map_err(io::Error::other)?;
+    let object = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: units.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: dir.as_raw_handle(),
+        ObjectName: &object,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        SecurityDescriptor: null(),
+        SecurityQualityOfService: null(),
+    };
+    let mut handle = null_mut();
+    // Zero is a valid initial state for this output-only status block.
+    let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // The name buffer, attributes and parent handle outlive this call.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_GENERIC_WRITE | DELETE,
+            &attributes,
+            &mut status_block,
+            null(),
+            FILE_ATTRIBUTE_HIDDEN,
+            0,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            null(),
+            0,
+        )
+    };
+    if status < 0 {
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    // NtCreateFile succeeded and transferred a fresh handle.
+    Ok(File::from(unsafe { owned(handle) }?))
+}
+
+/// Rename the open entry to `name` under the held directory. An existing
+/// final name is never replaced.
+fn rename_within(file: &File, dir: &File, name: &str) -> io::Result<()> {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let length = units.len() * 2;
+    let size = size_of::<FILE_RENAME_INFORMATION>() + length;
+    let mut buffer = vec![0u64; size.div_ceil(8)];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // Zero is a valid initial state for this output-only status block.
+    let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // The zeroed, aligned buffer holds the header and the trailing name.
+    let status = unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = dir.as_raw_handle();
+        (*info).FileNameLength = length as u32;
+        std::ptr::copy_nonoverlapping(
+            units.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            units.len(),
+        );
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut status_block,
+            info.cast(),
+            size as u32,
+            FileRenameInformation,
+        )
+    };
+    if status < 0 {
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    Ok(())
+}
+
+/// Mark the open entry for deletion; it disappears when its handle closes.
+fn discard(file: &File) -> io::Result<()> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // A fixed-size input structure for the matching information class.
+    succeeded(unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            std::ptr::from_ref(&disposition).cast(),
+            size_of_val(&disposition) as u32,
+        )
+    })
+}
+
+/// The held directory has no entries, enumerated through its own handle.
+fn empty(dir: &File) -> Result<bool, NativeRefusal> {
+    listing(dir)
+        .map(|entries| entries.is_empty())
+        .map_err(|_| NativeRefusal::PathCustodyUnverified)
 }
 
 /// Owner and DACL of the held object itself: owned by the expected user,
@@ -273,98 +566,277 @@ mod tests {
         names
     }
 
-    #[test]
-    fn a_private_empty_directory_is_claimed_once_and_closes_after_the_summary() {
-        use super::super::schema::tests::{binding, inputs_record};
-        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
-        let (owner, path) = private_dir(root.path(), "evidence");
-        // The schema admits no free-form string, so this canary can only
-        // match a closed spelling; it proves the byte scan still runs.
-        let canary = "native";
+    const INPUTS: &str = r#"{"passed":{"kind":"input_pins","held_roots":5,"enrollment_private":true,"evidence_private":true,"trial_root_private":true,"evidence_claimed":true}}"#;
+
+    fn raw(text: &str) -> Box<serde_json::value::RawValue> {
+        serde_json::value::RawValue::from_string(text.to_owned()).unwrap()
+    }
+
+    /// The summary fields a caller supplies, in schema order.
+    #[derive(Serialize)]
+    struct Body {
+        blocked_at: Option<&'static str>,
+        unattempted: Vec<&'static str>,
+        unmeasured: Vec<&'static str>,
+        dispatched_effects: u16,
+        charge_retained: bool,
+        late: Option<&'static str>,
+    }
+
+    fn body() -> Body {
+        Body {
+            blocked_at: Some("disposable_store"),
+            unattempted: vec!["suspended_child"],
+            unmeasured: vec!["artifact"],
+            dispatched_effects: 0,
+            charge_retained: false,
+            late: None,
+        }
+    }
+
+    type Results = [(&'static str, Box<serde_json::value::RawValue>)];
+
+    fn entries(
+        results: &Results,
+    ) -> Vec<Entry<'_, &'static str, Box<serde_json::value::RawValue>>> {
+        results
+            .iter()
+            .map(|(stage, result)| Entry {
+                stage,
+                started_ms: 1,
+                finished_ms: 2,
+                result,
+            })
+            .collect()
+    }
+
+    /// A claimed private directory whose held handle shares write, as the
+    /// preflight holds it.
+    fn claimed(parent: &Path, canaries: &[&str]) -> (LocalPath, EvidenceDir) {
+        let (owner, path) = private_dir(parent, "evidence");
         let dir = EvidenceDir::claim(
-            PathPin::open(&path, true, false).unwrap(),
+            PathPin::open(&path, true, true).unwrap(),
             sid(&owner),
-            &[r"D:\Private\Canary-Root"],
+            canaries,
         )
         .unwrap();
+        (path, dir)
+    }
+
+    fn read(path: &LocalPath, name: &str) -> Vec<u8> {
+        std::fs::read(format!(r"{}\{name}", path.as_str())).unwrap()
+    }
+
+    fn value(path: &LocalPath, name: &str) -> serde_json::Value {
+        serde_json::from_slice(&read(path, name)).unwrap()
+    }
+
+    #[test]
+    fn publication_derives_the_binding_and_chain_inside_the_boundary() {
+        use serde_json::json;
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (path, dir) = claimed(root.path(), &[r"D:\Private\Canary-Root"]);
         // A concurrent runner on the same directory loses the claim.
+        let (owner, _) = user();
         assert_eq!(
             EvidenceDir::claim(PathPin::open(&path, true, false).unwrap(), sid(&owner), &[]).err(),
             Some(NativeRefusal::PathCustodyUnverified)
         );
-        let record = inputs_record("");
-        dir.write(DiagnosticFile::Inputs, record.as_bytes())
+        let results = [
+            ("inputs", raw(INPUTS)),
+            ("host_baseline", raw(r#"{"failed":"unsupported_platform"}"#)),
+            ("disposable_store", raw(r#""unimplemented""#)),
+            ("cleanup", raw(r#"{"inconclusive":"teardown_uncertain"}"#)),
+        ];
+        let dependencies = ("projection", 7u32);
+        let unwritten = dir
+            .publish(
+                &"test",
+                &dependencies,
+                1_800_000_000,
+                &entries(&results),
+                &body(),
+            )
             .unwrap();
-        // Exclusive creation refuses a collision with an existing record.
+        assert!(unwritten.is_empty());
         assert_eq!(
-            dir.write(DiagnosticFile::Inputs, record.as_bytes()),
-            Err(SinkError::Io)
+            names(&path),
+            [
+                "claim.json",
+                "cleanup.json",
+                "custody-job-capacity.json",
+                "host-baseline.json",
+                "incomplete.json",
+                "inputs.json"
+            ]
         );
-        for (name, file, bytes) in [
-            ("empty", DiagnosticFile::HostBaseline, String::new()),
-            (
-                "not json",
-                DiagnosticFile::HostBaseline,
-                "not json".to_owned(),
-            ),
-            (
-                "oversized",
-                DiagnosticFile::HostBaseline,
-                " ".repeat(MAX_OUTPUT + 1),
-            ),
-            (
-                "arbitrary JSON",
-                DiagnosticFile::HostBaseline,
-                r#"{"owner":"S-1-5-21-1-2-3-1001"}"#.to_owned(),
-            ),
-            (
-                "synthetic endpoint in an unknown field",
-                DiagnosticFile::Inputs,
-                inputs_record(r#","endpoint":"192.0.2.7:443""#),
-            ),
-            (
-                "private path in an unknown field",
-                DiagnosticFile::Inputs,
-                inputs_record(r#","path":"D:/Private/Canary-Root""#),
-            ),
-            (
-                "record under another file name",
-                DiagnosticFile::Distribution,
-                record.clone(),
-            ),
+        let inputs = &value(&path, "inputs.json")[0];
+        let binding = &inputs["binding"];
+        let keyed: [u8; 32] =
+            Sha256::digest(serde_json::to_vec(&(&dir.scope(), &dependencies)).unwrap()).into();
+        assert_eq!(binding["class"], json!("test"));
+        assert_eq!(binding["scope"], json!(dir.scope()));
+        assert_eq!(binding["run"], json!(dir.run()));
+        assert_eq!(binding["release"], json!(super::super::schema::release()));
+        assert_eq!(binding["dependencies"], json!(keyed));
+        assert_eq!(
+            binding["expires_utc"],
+            json!(1_800_000_000u64 + VALIDITY_SECS)
+        );
+        // The chain follows the caller's order across files.
+        let mut prior = [0u8; 32];
+        for name in [
+            "inputs.json",
+            "host-baseline.json",
+            "custody-job-capacity.json",
+            "cleanup.json",
         ] {
-            assert_eq!(
-                dir.write(file, bytes.as_bytes()),
-                Err(SinkError::Invalid),
-                "{name}"
-            );
+            assert_eq!(value(&path, name)[0]["prior"], json!(prior), "{name}");
+            let file = read(&path, name);
+            prior = Sha256::digest(&file[1..file.len() - 1]).into();
         }
-        let canary_dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
-        let (_, canary_path) = private_dir(canary_dir.path(), "evidence");
-        let scanned = EvidenceDir::claim(
-            PathPin::open(&canary_path, true, false).unwrap(),
-            sid(&owner),
-            &[canary],
-        )
-        .unwrap();
+        let summary = value(&path, "incomplete.json");
+        assert_eq!(&summary["binding"], binding);
+        assert_eq!(summary["unwritten"], json!([]));
+        // Published once: the sink is closed.
         assert_eq!(
-            scanned.write(DiagnosticFile::Inputs, record.as_bytes()),
-            Err(SinkError::Private)
-        );
-        let summary = format!(
-            r#"{{"contract":2,"origin":"native","binding":{},"blocked_at":null,"unattempted":[],"unmeasured":[],"dispatched_effects":0,"charge_retained":false,"late":null,"unwritten":[]}}"#,
-            binding()
-        );
-        dir.write(DiagnosticFile::Incomplete, summary.as_bytes())
-            .unwrap();
-        assert_eq!(
-            dir.write(DiagnosticFile::Cleanup, record.as_bytes()),
+            dir.publish(&"test", &dependencies, 0, &entries(&results), &body()),
             Err(SinkError::Closed)
         );
+    }
+
+    #[test]
+    fn a_caller_cannot_place_chosen_bytes_in_an_opaque_field() {
+        use serde_json::json;
+        let distribution = |receipt: [u8; 32]| {
+            raw(&format!(
+                r#"{{"passed":{{"kind":"distribution","receipt":{},"receipt_bytes":7438,"manifest":{},"manifest_bytes":11915,"payload_files":136,"payload_bytes":1}}}}"#,
+                serde_json::to_string(&receipt).unwrap(),
+                serde_json::to_string(&super::super::schema::stock_manifest()).unwrap()
+            ))
+        };
+        for (receipt, published) in [
+            ([7u8; 32], false),
+            (crate::vm::public_egress::STOCK_RECEIPT_1113_SHA256, true),
+        ] {
+            let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+            let (path, dir) = claimed(root.path(), &[]);
+            let results = [("distribution", distribution(receipt))];
+            let unwritten = dir
+                .publish(&"test", &(), 0, &entries(&results), &body())
+                .unwrap();
+            assert_eq!(unwritten.is_empty(), published, "{receipt:?}");
+            assert_eq!(
+                names(&path).contains(&"distribution.json".to_owned()),
+                published
+            );
+            // The binding is the writer's own; no parameter supplies it.
+            let summary = value(&path, "incomplete.json");
+            assert_eq!(summary["binding"]["scope"], json!(dir.scope()));
+            assert_eq!(summary["binding"]["run"], json!(dir.run()));
+        }
+    }
+
+    #[test]
+    fn an_interrupted_commit_leaves_no_final_entry_and_still_settles() {
+        use serde_json::json;
+        for (name, step) in [
+            ("inputs.json", Step::Write),
+            ("host-baseline.json", Step::Flush),
+        ] {
+            let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+            let (path, dir) = claimed(root.path(), &[]);
+            let results = [
+                ("inputs", raw(INPUTS)),
+                ("host_baseline", raw(r#""unimplemented""#)),
+            ];
+            FAULT.with(|fault| fault.set(Some((name, step))));
+            let published = dir.publish(&"test", &(), 0, &entries(&results), &body());
+            FAULT.with(|fault| fault.set(None));
+            let unwritten: Vec<&str> = published.unwrap().iter().map(|file| file.name()).collect();
+            assert_eq!(unwritten, [name]);
+            let listed = names(&path);
+            assert!(
+                !listed
+                    .iter()
+                    .any(|entry| entry == name || entry.ends_with(".partial")),
+                "{listed:?}"
+            );
+            assert_eq!(value(&path, "incomplete.json")["unwritten"], json!([name]));
+        }
+
+        // An interrupted claim leaves the directory empty, so a retry claims it.
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (owner, path) = private_dir(root.path(), "evidence");
+        FAULT.with(|fault| fault.set(Some(("claim.json", Step::Write))));
+        let refused =
+            EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[]).err();
+        FAULT.with(|fault| fault.set(None));
+        assert_eq!(refused, Some(NativeRefusal::PathCustodyUnverified));
+        assert!(names(&path).is_empty());
+        assert!(
+            EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[]).is_ok()
+        );
+        assert_eq!(names(&path), ["claim.json"]);
+
+        // A summary that cannot be committed is an error and leaves no entry.
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (path, dir) = claimed(root.path(), &[]);
+        let results = [("inputs", raw(INPUTS))];
+        FAULT.with(|fault| fault.set(Some(("incomplete.json", Step::Flush))));
+        let published = dir.publish(&"test", &(), 0, &entries(&results), &body());
+        FAULT.with(|fault| fault.set(None));
+        assert_eq!(published, Err(SinkError::Io));
+        assert_eq!(names(&path), ["claim.json", "inputs.json"]);
+    }
+
+    #[test]
+    fn written_records_pass_the_closed_schema_and_the_private_value_scan() {
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (path, dir) = claimed(root.path(), &[]);
+        let results = [
+            ("inputs", raw(INPUTS)),
+            // A synthetic endpoint in an unknown field of a caller's result.
+            (
+                "host_baseline",
+                raw(r#"{"failed":"other_refusal","endpoint":"192.0.2.7:443"}"#),
+            ),
+        ];
+        let unwritten = dir
+            .publish(&"test", &(), 0, &entries(&results), &body())
+            .unwrap();
+        assert_eq!(unwritten, [DiagnosticFile::HostBaseline]);
         assert_eq!(
             names(&path),
             ["claim.json", "incomplete.json", "inputs.json"]
         );
+
+        // The schema admits no free-form string, so this canary can only
+        // match a closed spelling; it proves the byte scan still runs.
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (path, dir) = claimed(root.path(), &["native"]);
+        assert_eq!(
+            dir.publish(&"test", &(), 0, &entries(&results[..1]), &body()),
+            Err(SinkError::Private)
+        );
+        assert_eq!(names(&path), ["claim.json"]);
+    }
+
+    #[test]
+    fn emptiness_is_read_from_the_held_directory_not_its_name() {
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (owner, named) = private_dir(root.path(), "named");
+        let (_, held) = private_dir(root.path(), "held");
+        std::fs::write(format!(r"{}\stale.json", held.as_str()), b"{}").unwrap();
+        // A split: the pin's name is the empty directory, its held object is not.
+        let mut pin = PathPin::open(&named, true, true).unwrap();
+        pin.leaf = PathPin::open(&held, true, true).unwrap().leaf;
+        assert_eq!(
+            EvidenceDir::claim(pin, sid(&owner), &[]).err(),
+            Some(NativeRefusal::PathCustodyUnverified)
+        );
+        assert_eq!(names(&held), ["stale.json"]);
+        assert!(names(&named).is_empty());
     }
 
     #[test]
