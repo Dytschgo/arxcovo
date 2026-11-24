@@ -87,6 +87,14 @@ pub enum ProtocolError {
     InvalidExitCode,
     ExpectedHello,
     UnsupportedVersion,
+    /// A Compose frame field failed its fixed format or bound.
+    InvalidComposeField,
+    /// A ComposeHello did not offer exactly the pinned capability list.
+    UnsupportedCapability,
+    /// A Compose request arrived on a legacy session.
+    ExpectedComposeHello,
+    /// A legacy script request arrived on a Compose session.
+    UnexpectedRequest,
 }
 
 impl fmt::Display for ProtocolError {
@@ -106,6 +114,10 @@ impl fmt::Display for ProtocolError {
             Self::InvalidExitCode => "invalid guest script exit code",
             Self::ExpectedHello => "expected guest handshake",
             Self::UnsupportedVersion => "unsupported guest protocol version",
+            Self::InvalidComposeField => "invalid guest compose field",
+            Self::UnsupportedCapability => "unsupported guest compose capability",
+            Self::ExpectedComposeHello => "expected guest compose handshake",
+            Self::UnexpectedRequest => "unexpected guest request for this session",
         })
     }
 }
@@ -118,7 +130,7 @@ impl From<io::Error> for ProtocolError {
     }
 }
 
-mod private {
+pub(crate) mod private {
     pub trait Sealed {}
 }
 
@@ -213,7 +225,7 @@ fn validate_id(id: u32) -> Result<(), ProtocolError> {
 #[derive(Deserialize)]
 struct WireTags {
     #[serde(rename = "type")]
-    _message_type: String,
+    message_type: String,
     #[serde(rename = "status")]
     _status: Option<String>,
     #[serde(rename = "script_execution")]
@@ -222,6 +234,31 @@ struct WireTags {
 
 /// Reads one frame, returning `None` only at EOF before a new prefix.
 pub fn read_frame<M: Message>(reader: &mut impl Read) -> Result<Option<M>, ProtocolError> {
+    match read_payload(reader)? {
+        Some(payload) => decode(payload.json()).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// One frame's UTF-8 JSON object text. The buffer is wiped when dropped,
+/// because Compose frames may carry secret bytes.
+pub(crate) struct Payload(Vec<u8>);
+
+impl Payload {
+    pub(crate) fn json(&self) -> &str {
+        // Checked by read_payload before construction.
+        str::from_utf8(&self.0).unwrap_or_default()
+    }
+}
+
+impl Drop for Payload {
+    fn drop(&mut self) {
+        crate::compose::wipe(&mut self.0);
+    }
+}
+
+/// Reads one frame's payload and checks its framing, UTF-8 and object shape.
+pub(crate) fn read_payload(reader: &mut impl Read) -> Result<Option<Payload>, ProtocolError> {
     let mut prefix = [0; 4];
     if read_retrying_interrupts(reader, &mut prefix[..1])? == 0 {
         return Ok(None);
@@ -232,20 +269,40 @@ pub fn read_frame<M: Message>(reader: &mut impl Read) -> Result<Option<M>, Proto
     if !(1..=MAX_FRAME).contains(&len) {
         return Err(ProtocolError::InvalidFrameLength);
     }
-    let mut payload = vec![0; len];
-    read_remaining(reader, &mut payload, ProtocolError::TruncatedPayload)?;
+    let mut payload = Payload(vec![0; len]);
+    read_remaining(reader, &mut payload.0, ProtocolError::TruncatedPayload)?;
 
-    let json = str::from_utf8(&payload).map_err(|_| ProtocolError::InvalidUtf8)?;
+    let json = str::from_utf8(&payload.0).map_err(|_| ProtocolError::InvalidUtf8)?;
     if !json
         .trim_start_matches([' ', '\t', '\r', '\n'])
         .starts_with('{')
     {
         return Err(ProtocolError::InvalidJson);
     }
-    serde_json::from_str::<WireTags>(json).map_err(|_| ProtocolError::InvalidJson)?;
+    Ok(Some(payload))
+}
+
+/// Decodes and validates one message from a checked payload.
+pub(crate) fn decode<M: Message>(json: &str) -> Result<M, ProtocolError> {
+    let tags = serde_json::from_str::<WireTags>(json).map_err(|_| ProtocolError::InvalidJson)?;
+    // Refuse any JSON escape sequence in a secret frame before full decode so
+    // serde_json's un-wiped string scratch buffer never receives secret bytes.
+    if tags.message_type == "ComposeSecretPut" && json.as_bytes().contains(&b'\\') {
+        return Err(ProtocolError::InvalidJson);
+    }
     let message: M = serde_json::from_str(json).map_err(|_| ProtocolError::InvalidJson)?;
     message.validate()?;
-    Ok(Some(message))
+    Ok(message)
+}
+
+/// The `type` tag of a checked payload, if it has exactly one string tag.
+pub(crate) fn peek_tag(json: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Tag {
+        #[serde(rename = "type")]
+        tag: String,
+    }
+    serde_json::from_str::<Tag>(json).ok().map(|tag| tag.tag)
 }
 
 fn read_retrying_interrupts(reader: &mut impl Read, bytes: &mut [u8]) -> io::Result<usize> {
