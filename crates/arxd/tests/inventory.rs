@@ -470,14 +470,32 @@ async fn activity_failure_refuses_inventory() {
     task.abort();
     let _ = task.await;
 }
+fn seed_started_activity(path: &Path, class: &str, tool: &str, count: u32) {
+    let mut db = rusqlite::Connection::open(path.join("activity.sqlite3")).unwrap();
+    let tx = db.transaction().unwrap();
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO activity(principal,tool,outcome,actor_kind,class,started_at_ms)
+                VALUES ('test-agent',?1,'started','agent',?2,0)",
+            )
+            .unwrap();
+        for _ in 0..count {
+            insert.execute(rusqlite::params![tool, class]).unwrap();
+        }
+    }
+    tx.commit().unwrap();
+}
+
 #[test]
 fn activity_retention_and_interrupted_restart() {
     let dir = private_dir();
     let store = Activity::open(dir.path()).unwrap();
     let host_id = store.host_id().unwrap();
-    // The read bucket retains 200 rows. Cross that actual boundary rather
-    // than the older pre-v2 1000-row action boundary.
-    for _ in 0..205 {
+    // Fill the pre-existing history in one transaction. The real starts
+    // still reach the read cap of 200 and overflow it five times.
+    seed_started_activity(dir.path(), "read", "list_hosts", 199);
+    for _ in 0..6 {
         store.start("test-agent", "list_hosts").unwrap();
     }
     drop(store);
