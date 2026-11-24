@@ -109,7 +109,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 12;
+const VM_SCHEMA_VERSION: u32 = 13;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -581,6 +581,9 @@ impl VmStore {
         }
         if version < 12 {
             tx.execute_batch(compose::MIGRATE_V12)?;
+        }
+        if version < 13 {
+            tx.execute_batch(publish::MIGRATE_V13)?;
         }
         recover(&tx, now)?;
         check_size(&tx)?;
@@ -3484,7 +3487,11 @@ mod tests {
                 let route = publish::current(db)?.expect("v10 route retained");
                 assert_eq!(route.generation, generation[0]);
                 assert_eq!(route.nonce, "b".repeat(32));
-                assert!(route.post_possible);
+                assert_eq!(route.hosts.len(), 1);
+                assert_eq!(route.hosts[0].hostname.as_str(), "site.example.invalid");
+                assert_eq!(route.hosts[0].marker, "b".repeat(32));
+                assert!(route.hosts[0].post_possible);
+                assert!(route.hosts[0].ambiguous);
                 assert!(route.phase == publish::Phase::CleanupPending);
                 assert!(!snapshot::route_quiescent(db, vm)?);
             } else {
@@ -3495,6 +3502,104 @@ mod tests {
             assert_eq!(count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?, 0);
             Ok(())
         }).unwrap();
+    }
+
+    #[test]
+    fn v13_migrates_b2_singleton_publication_without_losing_ownership_proof() {
+        for (label, phase, post_possible, record, expect_ambiguous) in [
+            (
+                "published_with_record",
+                "published",
+                1_i64,
+                Some("e".repeat(32)),
+                false,
+            ),
+            (
+                "ambiguous_post_without_record",
+                "publishing",
+                1_i64,
+                None,
+                true,
+            ),
+            ("pre_post_publishing", "publishing", 0_i64, None, false),
+        ] {
+            let dir = private_temp();
+            let db = v6_fixture(dir.path());
+            db.execute_batch(MIGRATE_V7).unwrap();
+            db.execute_batch(MIGRATE_V8).unwrap();
+            db.execute_batch(MIGRATE_V9).unwrap();
+            let vm = [0x83; 16];
+            let slots = static_fixture(&db, vm, "migrate-site").unwrap();
+            commit_static(&db, vm, slots, 1).unwrap();
+            let generation: Id = db
+                .query_row(
+                    "SELECT id FROM vm_generations WHERE static_id=?1 AND active=1",
+                    [vm],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            db.execute_batch(publish::MIGRATE_V10).unwrap();
+            db.execute_batch(snapshot::MIGRATE_V11).unwrap();
+            db.execute_batch(compose::MIGRATE_V12).unwrap();
+            db.pragma_update(None, "user_version", 12).unwrap();
+            let old_nonce = "c".repeat(32);
+            let zone = "a".repeat(32);
+            let tunnel = "12345678-1234-4321-8234-123456789abc";
+            db.execute(
+                "INSERT INTO vm_publication(singleton,vm,generation,boot,revision,hostname,
+                     tunnel,zone,credential_ref,nonce,phase,post_possible,record)
+                 VALUES(1,?1,?2,?3,?4,'legacy.example.invalid',?5,?6,'D:/priv/dns.dpapi',?7,?8,?9,?10)",
+                params![
+                    vm,
+                    generation,
+                    [4_u8; 16],
+                    [5_u8; 32],
+                    tunnel,
+                    zone,
+                    old_nonce,
+                    phase,
+                    post_possible,
+                    record,
+                ],
+            )
+            .unwrap();
+            drop(db);
+
+            let store = VmStore::open(dir.path(), NOW).unwrap();
+            store
+                .transact(|db| {
+                    assert_eq!(
+                        count(db, "PRAGMA user_version", [])?,
+                        i64::from(VM_SCHEMA_VERSION),
+                        "{label}"
+                    );
+                    let intent = publish::current(db)?.expect("migrated singleton intent");
+                    assert_eq!(intent.vm, vm, "{label}");
+                    assert_eq!(intent.generation, generation, "{label}");
+                    assert_eq!(intent.boot, [4_u8; 16], "{label}");
+                    assert_eq!(intent.revision, [5_u8; 32], "{label}");
+                    assert_eq!(intent.tunnel, tunnel, "{label}");
+                    assert_eq!(intent.zone, zone, "{label}");
+                    assert_eq!(intent.credential_ref, "D:/priv/dns.dpapi", "{label}");
+                    assert_eq!(intent.nonce, old_nonce, "{label}");
+                    assert_eq!(intent.phase, publish::Phase::CleanupPending, "{label}");
+                    assert_eq!(intent.hosts.len(), 1, "{label}");
+                    let child = &intent.hosts[0];
+                    assert_eq!(child.position, 0, "{label}");
+                    assert_eq!(child.hostname.as_str(), "legacy.example.invalid", "{label}");
+                    assert_eq!(child.marker, old_nonce, "{label}");
+                    assert_eq!(child.post_possible, post_possible == 1, "{label}");
+                    assert_eq!(child.record, record, "{label}");
+                    assert_eq!(child.ambiguous, expect_ambiguous, "{label}");
+                    assert_eq!(child.state, publish::HostState::CleanupPending, "{label}");
+                    assert_eq!(
+                        count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?,
+                        0
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
 
     #[test]

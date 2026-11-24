@@ -282,6 +282,7 @@ pub(crate) struct LogRead {
 pub(crate) struct Session {
     pub generation: Id,
     pub wire_boot: u64,
+    origin_boot: Option<Id>,
     channel: AsyncMutex<ComposeChannel>,
 }
 
@@ -290,6 +291,65 @@ pub(crate) struct Session {
     reason = "reserved for qualified activation and fake peer fixtures"
 )]
 impl Session {
+    /// The boot supervisor binds both witnesses while it holds the verified guest pipe
+    /// and the static VM's current origin lease.
+    pub(crate) fn for_origin(
+        origin: &super::runtime::publication::Origin,
+        channel: ComposeChannel,
+    ) -> Self {
+        Self {
+            origin_boot: Some(origin.boot),
+            ..Self::new(origin.generation, channel)
+        }
+    }
+
+    pub(crate) async fn install_routes(
+        &self,
+        db: &crate::store::vm::VmStore,
+        intent: &crate::store::vm::publish::Intent,
+        readiness: super::publish::Hostname,
+        zone: super::publish::Hostname,
+        cancel: &Shutdown,
+    ) -> Result<()> {
+        ensure!(
+            self.generation == intent.generation && self.origin_boot == Some(intent.boot),
+            "route session boot mismatch"
+        );
+        let mut channel = self
+            .channel
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("guest channel busy"))?;
+        ensure!(
+            db.transact(|tx| store::live_boot(tx, intent.vm, self.generation, self.wire_boot))?,
+            "route session retired"
+        );
+        let routes = intent
+            .hosts
+            .iter()
+            .map(|host| {
+                let slot = host
+                    .route
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("route slot missing"))?;
+                Ok(slot.target(&host.hostname))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let ack = channel
+            .exchange(cancel, |id| Req::ComposeInstallRoutes {
+                id,
+                generation: self.wire_boot,
+                readiness_host: readiness.as_str().into(),
+                zone: zone.as_str().into(),
+                routes,
+            })
+            .await?;
+        ensure!(
+            matches!(ack, Resp::ComposeRoutesInstalled{generation,..} if generation==self.wire_boot),
+            "guest route installation unconfirmed"
+        );
+        Ok(())
+    }
+
     pub(crate) fn is_open(&self) -> bool {
         self.channel
             .try_lock()
@@ -300,6 +360,7 @@ impl Session {
         Self {
             generation,
             wire_boot: channel.generation(),
+            origin_boot: None,
             channel: AsyncMutex::new(channel),
         }
     }
@@ -342,6 +403,10 @@ impl Host {
             }
             Entry::Occupied(slot) => {
                 let current = slot.get();
+                ensure!(
+                    current.origin_boot == session.origin_boot,
+                    "Compose reconnect origin changed"
+                );
                 let mut channel = current
                     .channel
                     .try_lock()
@@ -920,6 +985,25 @@ fn success_witness(intent: &Intent, manifest: &Project, result: &ProjectView) ->
 
 fn service_name(name: &str) -> bool {
     name.len() <= 16 && is_project_id(name)
+}
+
+/// While an ingress is active or its cleanup is uncertain, a new revision
+/// may reuse each published port only for the same enrolled service.
+pub(crate) fn deployment_preserves_routes(
+    db: &rusqlite::Connection,
+    request: &Mutation,
+) -> Result<bool> {
+    let Some(release) = request.release.filter(|_| request.kind == Kind::Deploy) else {
+        return Ok(true);
+    };
+    let conflicts: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM vm_publication p JOIN vm_publication_hosts h ON h.publication=p.singleton
+         JOIN vm_compose_releases r ON r.vm=p.vm AND r.project=h.project_id AND r.id=?3
+         WHERE p.vm=?1 AND h.project_id=?2 AND NOT EXISTS (
+             SELECT 1 FROM json_each(CAST(r.manifest AS TEXT),'$.services') s WHERE s.key=h.service_index
+             AND json_extract(s.value,'$.name')=h.service AND json_type(s.value,'$.http_port')='integer'))",
+        rusqlite::params![request.target.vm,request.target.project,release], |r| r.get(0))?;
+    Ok(!conflicts)
 }
 
 async fn observe(

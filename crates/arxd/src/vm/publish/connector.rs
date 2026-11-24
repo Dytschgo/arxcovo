@@ -101,12 +101,13 @@ impl TunnelCredential {
     }
 }
 
-/// Constructed by B2 only from the qualified owner install and pinned origin generation.
+/// Constructed by B2/E3 only from the qualified owner install and pinned origin generation.
 pub(in crate::vm) struct Plan<'a> {
     pub(in crate::vm) executable: &'a Path,
     pub(in crate::vm) binary_receipt: ArtifactPin,
     pub(in crate::vm) private_root: &'a Path,
-    pub(in crate::vm) hostname: &'a Hostname,
+    pub(in crate::vm) probes: &'a [(Hostname, String)],
+    pub(in crate::vm) hostnames: &'a [Hostname],
     pub(in crate::vm) tunnel: &'a TunnelId,
     pub(in crate::vm) credential: &'a TunnelCredential,
     pub(in crate::vm) origin_port: NonZeroU16,
@@ -118,7 +119,7 @@ pub(in crate::vm) struct Plan<'a> {
 pub(in crate::vm) struct Connector {
     process: Process,
     ready_port: NonZeroU16,
-    origin: (NonZeroU16, Hostname, TlsConnector),
+    origin: (NonZeroU16, Hostname, Vec<(Hostname, String)>, TlsConnector),
     _config: Config,
     _binary: HeldPath,
     _ca: HeldPath,
@@ -172,7 +173,7 @@ impl Connector {
             HeldPath::open(plan.private_root, true, true).map_err(|_| ConnectorError::Custody)?;
         let ca = HeldPath::open(plan.ca_path, false, true).map_err(|_| ConnectorError::Origin)?;
         let tls = origin_tls(plan, &ca)?;
-        probe_origin(plan.origin_port, plan.origin_name, &tls).await?;
+        probe_origin(plan.origin_port, plan.origin_name, plan.probes, &tls).await?;
         if retired.is_cancelled() || shutdown.is_cancelled() {
             return Err(ConnectorError::Origin);
         }
@@ -207,7 +208,12 @@ impl Connector {
         let mut connector = Self {
             process,
             ready_port,
-            origin: (plan.origin_port, plan.origin_name.clone(), tls),
+            origin: (
+                plan.origin_port,
+                plan.origin_name.clone(),
+                plan.probes.to_vec(),
+                tls,
+            ),
             _config: config,
             _binary: binary,
             _ca: ca,
@@ -262,8 +268,8 @@ impl Connector {
     }
 
     pub(in crate::vm) async fn origin_ready(&self) -> Result<(), ConnectorError> {
-        let (port, name, tls) = &self.origin;
-        probe_origin(*port, name, tls).await
+        let (port, name, hostnames, tls) = &self.origin;
+        probe_origin(*port, name, hostnames, tls).await
     }
 
     pub(in crate::vm) async fn ready(&self) -> bool {
@@ -358,18 +364,77 @@ fn origin_tls(plan: &Plan<'_>, ca: &HeldPath) -> Result<TlsConnector, ConnectorE
 async fn probe_origin(
     port: NonZeroU16,
     origin_name: &Hostname,
+    probes: &[(Hostname, String)],
+    tls: &TlsConnector,
+) -> Result<(), ConnectorError> {
+    let failure = ConnectorError::Origin;
+    if probes.is_empty() {
+        // Existing B2 static sites can serve arbitrary content. Their boot proof
+        // is the pinned TLS identity, independent of HTTP behavior.
+        let name = ServerName::try_from(origin_name.as_str().to_owned()).map_err(|_| failure)?;
+        timeout(IO_TIMEOUT, async {
+            let socket = TcpStream::connect((Ipv4Addr::LOCALHOST, port.get())).await?;
+            tls.connect(name, socket).await
+        })
+        .await
+        .map_err(|_| failure)?
+        .map_err(|_| failure)?;
+        return Ok(());
+    }
+    probe_host(port, origin_name, origin_name, "/arx-health", false, tls).await?;
+    for (host, path) in probes {
+        probe_host(port, origin_name, host, path, true, tls).await?;
+        probe_host(port, origin_name, host, "/", false, tls).await?;
+    }
+    Ok(())
+}
+
+async fn probe_host(
+    port: NonZeroU16,
+    origin_name: &Hostname,
+    host: &Hostname,
+    path: &str,
+    binding_witness: bool,
     tls: &TlsConnector,
 ) -> Result<(), ConnectorError> {
     let failure = ConnectorError::Origin;
     let name = ServerName::try_from(origin_name.as_str().to_owned()).map_err(|_| failure)?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {}\r\nCF-Connecting-IP: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        host.as_str()
+    );
     timeout(IO_TIMEOUT, async {
-        let socket = TcpStream::connect((Ipv4Addr::LOCALHOST, port.get())).await?;
-        tls.connect(name, socket).await
+        let socket = TcpStream::connect((Ipv4Addr::LOCALHOST, port.get()))
+            .await
+            .map_err(|_| failure)?;
+        let mut stream = tls.connect(name, socket).await.map_err(|_| failure)?;
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|_| failure)?;
+        stream.flush().await.map_err(|_| failure)?;
+        let mut line = [0u8; 128];
+        for end in 0..line.len() {
+            line[end] = stream.read_u8().await.map_err(|_| failure)?;
+            if line[end] == b'\n' {
+                let text = std::str::from_utf8(&line[..=end])
+                    .map_err(|_| failure)?
+                    .strip_suffix("\r\n")
+                    .ok_or(failure)?;
+                return match status_code(text) {
+                    Some(code)
+                        if (200..300).contains(&code) && (!binding_witness || code == 204) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(failure),
+                };
+            }
+        }
+        Err(failure)
     })
     .await
     .map_err(|_| failure)?
-    .map_err(|_| failure)?;
-    Ok(())
 }
 
 /// Observes a failed config's path, just before its writer closes.
@@ -405,11 +470,12 @@ impl Config {
         let path = PathBuf::from(local.as_str());
         let text = super::ingress(
             plan.tunnel,
-            std::array::from_ref(plan.hostname),
+            plan.hostnames,
             plan.origin_port,
             plan.origin_name,
             ca,
-        );
+        )
+        .map_err(|_| refusal)?;
         // Owned by TokenUser with a protected DACL before any content exists.
         let mut output = super::windows::create_private(&path).map_err(|_| refusal)?;
         let written = output.write_all(text.as_bytes());

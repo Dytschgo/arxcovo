@@ -217,3 +217,52 @@ fn stdio_guest_refuses_the_compose_handshake_like_a_legacy_guest() {
     assert!(output.stdout.is_empty());
     assert_eq!(output.stderr, b"arx-guest: invalid guest frame JSON\n");
 }
+
+#[test]
+fn enrolled_host_and_range_headers_reach_each_fixed_upstream() {
+    use arx_guest::compose::routing::{RouteTarget, RoutingTable, SLIRP_FORWARD_PEER};
+
+    let table = RoutingTable::new(
+        "arx-fedcba9876543210fedcba9876543210.invalid",
+        Some("example.invalid".into()),
+        SLIRP_FORWARD_PEER,
+        vec![
+            RouteTarget {
+                hostname: "a.example.invalid".into(),
+                project_id: "calm-life".into(),
+                service: "web".into(),
+                project_slot: 0,
+                service_index: 0,
+                route_slot: 0,
+            },
+            RouteTarget {
+                hostname: "b.example.invalid".into(),
+                project_id: "second-app".into(),
+                service: "web".into(),
+                project_slot: 1,
+                service_index: 0,
+                route_slot: 1,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(table.routes()[0].loopback_port(), 20000);
+    assert_eq!(table.routes()[1].loopback_port(), 20004);
+    let config = table.render_nginx_config();
+    for route in table.routes() {
+        let server = config
+            .split(&format!("server_name {};", route.hostname))
+            .nth(1)
+            .unwrap()
+            .split("  server {")
+            .next()
+            .unwrap();
+        assert!(server.contains(&format!("if ($http_host != {})", route.hostname)));
+        assert!(server.contains(&format!(
+            "proxy_pass http://127.0.0.1:{};",
+            route.loopback_port()
+        )));
+        assert!(server.contains("proxy_set_header Range $http_range;"));
+        assert!(server.contains("proxy_set_header If-Range $http_if_range;"));
+    }
+}

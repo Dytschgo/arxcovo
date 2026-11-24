@@ -77,6 +77,9 @@ pub enum SecretMatch {
 /// Root-owned guest storage. The Linux store is fd-relative and no-follow and
 /// is **unverified on real hardware**; tests use an in-memory fake.
 pub trait ComposeStore: Send {
+    fn install_routes(&mut self, _table: &super::routing::RoutingTable) -> Result<(), StoreError> {
+        Err(StoreError)
+    }
     fn load_state(&mut self) -> Result<Option<Vec<u8>>, StoreError>;
     fn save_state(&mut self, bytes: &[u8]) -> Result<(), StoreError>;
     fn write_revision(
@@ -689,6 +692,53 @@ impl ComposeService {
             }
             ComposeRequest::ComposeReconcile { id, operation_id } => {
                 self.reconcile(id, &operation_id)
+            }
+            ComposeRequest::ComposeInstallRoutes {
+                id,
+                generation,
+                readiness_host,
+                zone,
+                routes,
+            } => {
+                let inner = lock(&self.shared.inner);
+                if inner.generation != Some(generation) {
+                    return reject(id, RejectCode::GenerationMismatch);
+                }
+                if inner.running.is_some() || inner.store_uncertain {
+                    return reject(id, RejectCode::Busy);
+                }
+                let Ok(table) = super::routing::RoutingTable::new(
+                    readiness_host,
+                    Some(zone),
+                    super::routing::SLIRP_FORWARD_PEER,
+                    routes,
+                ) else {
+                    return reject(id, RejectCode::ProjectMismatch);
+                };
+                for route in table.routes() {
+                    let Some(project) = inner.state.projects.get(&route.project_id) else {
+                        return reject(id, RejectCode::UnknownProject);
+                    };
+                    let service = project.committed.as_ref().and_then(|revision| {
+                        revision
+                            .manifest
+                            .services
+                            .get(usize::from(route.service_index))
+                    });
+                    if project.slot != route.project_slot
+                        || project.recovery_required
+                        || project.pending.is_some()
+                        || project.desired != Desired::Started
+                        || !service
+                            .is_some_and(|s| s.name == route.service && s.http_port.is_some())
+                    {
+                        return reject(id, RejectCode::ProjectMismatch);
+                    }
+                }
+                if lock(&self.shared.store).install_routes(&table).is_err() {
+                    return reject(id, RejectCode::StoreFailure);
+                }
+                ComposeResponse::ComposeRoutesInstalled { id, generation }
             }
             ComposeRequest::ComposeStatus { id, project_id } => self.status(id, &project_id),
             ComposeRequest::ComposeLogs {

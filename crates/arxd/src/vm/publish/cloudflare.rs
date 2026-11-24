@@ -111,6 +111,12 @@ impl Route {
 
     /// The exact persisted tuple, for fake witnesses only.
     #[cfg(test)]
+    pub(in crate::vm) fn name(&self) -> &Hostname {
+        &self.name
+    }
+
+    /// The exact persisted tuple, for fake witnesses only.
+    #[cfg(test)]
     pub(in crate::vm) fn witness(&self) -> String {
         format!(
             "{} {} {} {}",
