@@ -556,6 +556,8 @@ native receipt are independently reviewed. That receipt must cover the
 full payload and the loaded-dependency set. Any pin that names the
 reviewed stock 11.1.3 executable or receipt is refused.
 
+E1b follow-up adds the independently reviewed E1a (#292, re-review 94835d03) executable and receipt pair to the compiled list.
+
 The policy artifact follows the E1a policy v1 contract. It is at most
 32 KiB of printable ASCII with LF line endings and a final LF, and has no
 spaces or blank lines. The fields appear in this order:
