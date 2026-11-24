@@ -10,6 +10,7 @@ const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta
 const playwrightConfig = readFileSync(new URL('../playwright.config.ts', import.meta.url), 'utf8');
 const jobs = Object.fromEntries([...workflow.split('\njobs:\n')[1].matchAll(/^ {2}(\w+):\n([\s\S]*?)(?=^ {2}\w+:\n|$(?![\s\S]))/gm)].map(([, id, body]) => [id, body]));
 const matrix = '    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, windows-latest, macos-latest]\n';
+const rustTimeout = "    timeout-minutes: ${{ matrix.os == 'windows-latest' && 13 || 12 }}";
 const gate = "if ('${{ needs.rust.result }}' -ne 'success' -or '${{ needs.ui.result }}' -ne 'success') { exit 1 }";
 const checkout = 'uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262';
 const steps = id => jobs[id].split('    steps:\n')[1].trimEnd().split(/^ {6}- /m).slice(1).map(step => step.trimEnd());
@@ -22,7 +23,8 @@ test('CI runs unconditional Rust and UI matrices in parallel behind the existing
     const runner = id === 'rust'
       ? `\${{ matrix.os == 'ubuntu-latest' && '${RUST_UBUNTU_RUNNER}' || matrix.os }}`
       : '${{ matrix.os }}';
-    assert.equal(jobs[id].split('    steps:\n')[0], `    name: ${id} (\${{ matrix.os }})\n${matrix}    runs-on: ${runner}\n    timeout-minutes: 12\n${env}`);
+    const timeout = id === 'rust' ? rustTimeout : '    timeout-minutes: 12';
+    assert.equal(jobs[id].split('    steps:\n')[0], `    name: ${id} (\${{ matrix.os }})\n${matrix}    runs-on: ${runner}\n${timeout}\n${env}`);
     assert.doesNotMatch(jobs[id], /^ {4}(?:needs|if|environment|services|concurrency):/m);
   }
   assert.equal(jobs.verify, `    name: verify (\${{ matrix.os }})\n    needs: [rust, ui]\n    if: \${{ always() }}\n${matrix}    runs-on: ubuntu-latest\n    timeout-minutes: 12\n    steps:\n      - name: Require every Rust and UI worker to succeed\n        shell: pwsh\n        run: ${gate}\n`);
@@ -142,7 +144,12 @@ test('Rust retains every native, Python and package validation with exact comman
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -I -B scripts/check-bound-sqlite.py --check-loader-env
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo check --workspace --all-targets --locked --message-format=json > $messages
+          if ($IsWindows) {
+            # Clippy checks the same targets and emits the SQLite build-script proof.
+            cargo clippy --workspace --all-targets --locked --message-format=json-render-diagnostics -- -D warnings > $messages
+          } else {
+            cargo check --workspace --all-targets --locked --message-format=json > $messages
+          }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -I -B scripts/check-bound-sqlite.py --metadata $metadata --build-messages $messages --self-test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -154,6 +161,7 @@ test('Rust retains every native, Python and package validation with exact comman
           cargo --version --verbose
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
     `name: Preflight loader environment and lint Rust
+        if: runner.os != 'Windows'
         shell: pwsh
         run: |
           python -I -B scripts/check-bound-sqlite.py --check-loader-env
@@ -212,8 +220,6 @@ test('Rust retains every native, Python and package validation with exact comman
           python -I -B -m unittest discover -s tools/ci/authority-fence -p 'test_*.py'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -I -B tools/ci/authority-fence/check.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p arxd --doc --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
     `name: Hosted distinct-UID custody qualification
         if: runner.os == 'Linux'
@@ -320,15 +326,16 @@ test('UI retains every Node, browser and Electron validation with exact commands
   assert.doesNotMatch(playwrightConfig, /\bheadless\s*:\s*false\b/, 'headed smoke needs a reviewed install change');
 });
 
-test('CI replaces superseded PR runs without cancelling main measurements and retains every 12-minute limit', () => {
+test('CI replaces superseded PR runs and gives only Windows Rust a 13-minute job limit', () => {
   const concurrency = workflow.match(/^concurrency:\n((?:[ \t]+[^\n]*\n)+)/m)?.[1];
   assert.equal(concurrency, "  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}', github.run_id) }}\n  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n");
   assert.equal((workflow.match(/^\s*concurrency:/gm) ?? []).length, 1);
   for (const name of ['rust', 'ui', 'verify']) {
-    assert.deepEqual(jobs[name].match(/^ {4}timeout-minutes:.*$/gm), ['    timeout-minutes: 12'], name);
+    const timeout = name === 'rust' ? rustTimeout : '    timeout-minutes: 12';
+    assert.deepEqual(jobs[name].match(/^ {4}timeout-minutes:.*$/gm), [timeout], name);
   }
   assert.deepEqual(workflow.match(/^.*\btimeout-minutes['"]?\s*:.*$/gm), [
-    '    timeout-minutes: 12',
+    rustTimeout,
     '        timeout-minutes: 3',
     '        timeout-minutes: 2',
     '        timeout-minutes: 2',
@@ -339,7 +346,7 @@ test('CI replaces superseded PR runs without cancelling main measurements and re
 });
 
 test('CI disables dev debuginfo for Rust without overriding runtime profile defaults', () => {
-  assert.match(jobs.rust, /^ {4}timeout-minutes: 12\n {4}env:\n {6}CARGO_PROFILE_DEV_DEBUG: '0'\n {4}steps:$/m);
+  assert.ok(jobs.rust.includes(`${rustTimeout}\n    env:\n      CARGO_PROFILE_DEV_DEBUG: '0'\n    steps:\n`));
   assert.equal((workflow.match(/^\s*env:/gm) ?? []).length, 2);
   assert.deepEqual(workflow.match(/\bCARGO_\w+/g), ['CARGO_PROFILE_DEV_DEBUG', 'CARGO_HOME', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR']);
   assertNoCargoProfileOverride(cargoPolicyFiles, path => readFileSync(new URL(path, import.meta.url), 'utf8'));

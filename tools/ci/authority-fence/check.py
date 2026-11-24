@@ -25,6 +25,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "crates" / "arxd" / "src" / "vm" / "windows" / "qualification.rs"
+MANIFEST = ROOT / "crates" / "arxd" / "Cargo.toml"
 EDITION = "2024"
 OPEN = re.compile(r"\s*/// ```(\S+)")
 CLOSE = re.compile(r"\s*/// ```")
@@ -137,37 +138,46 @@ def judge(tag, status, stderr):
         return f"unparseable compiler output: {error}"
 
 
-def library():
-    """The arxd library rlib and its dependency directory, from Cargo."""
-    built = subprocess.run(
-        ["cargo", "build", "--locked", "-p", "arxd", "--lib", "--message-format=json"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+def doctest_library(output):
+    """Find the workspace arxd rlib in the doctest build's Cargo messages."""
     rlibs = []
-    deps = set()
-    for line in built.stdout.splitlines():
-        if not line.startswith("{"):
+    build_finished = False
+    for line in output.splitlines():
+        if build_finished or not line.startswith("{"):
+            print(line)
             continue
         message = json.loads(line)
+        if message.get("reason") == "build-finished":
+            build_finished = True
         target = message.get("target") or {}
         if (
             message.get("reason") == "compiler-artifact"
+            and Path(message["manifest_path"]) == MANIFEST
             and target.get("name") == "arxd"
             and "lib" in target.get("kind", [])
+            and message["profile"]["test"] is False
         ):
             for name in message.get("filenames", []):
                 path = Path(name)
-                if path.suffix == ".rlib":
+                if path.suffix == ".rlib" and path.parent.name == "deps":
                     rlibs.append(path)
-                # The uplifted rlib sits beside, not inside, its dependencies.
-                if path.parent.name == "deps":
-                    deps.add(path.parent)
-    if len(rlibs) != 1 or len(deps) != 1:
-        raise RuntimeError(f"expected one arxd rlib and deps directory: {rlibs} {deps}")
-    return rlibs[0], deps.pop()
+    if len(rlibs) != 1:
+        raise RuntimeError(f"expected one arxd doctest rlib in deps: {rlibs}")
+    return rlibs[0]
+
+
+def library():
+    """Run doctests and reuse their library, which nextest normally builds."""
+    tested = subprocess.run(
+        ["cargo", "test", "-p", "arxd", "--doc", "--locked", "--message-format=json-render-diagnostics"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        encoding="utf-8",
+    )
+    if tested.returncode:
+        print(tested.stdout, end="")
+        tested.check_returncode()
+    return doctest_library(tested.stdout)
 
 
 def compile_block(body, rlib, deps, scratch, index):
@@ -207,11 +217,11 @@ def main():
     if tags != EXPECTED_TAGS:
         print(f"authority fence blocks changed: {tags}", file=sys.stderr)
         return 1
-    rlib, deps = library()
+    rlib = library()
     failures = 0
     with tempfile.TemporaryDirectory(prefix="arx-fence-") as directory:
         for index, (tag, body) in enumerate(found):
-            status, stderr = compile_block(body, rlib, deps, Path(directory), index)
+            status, stderr = compile_block(body, rlib, rlib.parent, Path(directory), index)
             reason = judge(tag, status, stderr)
             outcome = "ok" if reason is None else f"FAILED: {reason}"
             print(f"block {index} ({tag}): {outcome}")

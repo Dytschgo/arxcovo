@@ -59,7 +59,10 @@ fn keyset_isolation_own_row_and_exact_boundaries() {
 fn read_flood_preserves_actions_and_lifecycle() {
     let dir = private_dir();
     let store = Activity::open(dir.path()).unwrap();
-    for _ in 0..1001 {
+    // Start just below the cap. The real action starts fill it and overflow
+    // it before the lifecycle record and read flood exercise both buckets.
+    seed_started_activity(dir.path(), "action", "run_command", 999);
+    for _ in 0..2 {
         store.start("test-agent", "run_command").unwrap();
     }
     let lifecycle = store.start_lifecycle(Lifecycle::Stop).unwrap();
