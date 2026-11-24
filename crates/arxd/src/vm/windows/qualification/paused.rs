@@ -179,10 +179,10 @@ struct Pipes<R, W> {
     dispatch: Arc<DispatchGate>,
 }
 
-/// Private OS adapter contract. Each observation is about the same held
-/// slot and child. Failed or partial creation leaves any acquired resources
-/// with the adapter for teardown. A slot claim is atomic or fails without
-/// charging or creating anything.
+/// Private OS adapter contract. Every observation concerns the same held
+/// slot and child. Pending operations must yield promptly so the supervisor
+/// can monitor pressure and stop the Job. The adapter retains partial
+/// creation resources and prevents effects from starting after stop.
 trait Host {
     type Opens;
     type Slot;
@@ -195,10 +195,14 @@ trait Host {
         &mut self,
         plan: &PausedPlan<'_>,
     ) -> Result<(Self::Opens, Peak), NativeRefusal>;
-    fn live(&mut self) -> Result<Live, NativeRefusal>;
+    /// Provide a bounded sample independently of a pending operation.
+    fn live(&self) -> Result<Live, NativeRefusal>;
+    /// Acquire the charged slot atomically, or fail without acquiring it.
     fn claim(&mut self, live: &Live, peak: Peak) -> Result<Self::Slot, NativeRefusal>;
-    fn create_suspended(
-        &mut self,
+    /// Complete any wait needed to confirm the already owned claim.
+    async fn confirm_claim(&self, slot: &Self::Slot) -> Result<(), NativeRefusal>;
+    async fn create_suspended(
+        &self,
         slot: &Self::Slot,
         plan: &PausedPlan<'_>,
         opens: &Self::Opens,
@@ -206,26 +210,75 @@ trait Host {
     /// Verify held image identity, the restricted child token, creation-time
     /// assignment and the effective one-process Job before releasing the OS
     /// hold. The pipe worker gates the actual write, not the enqueue.
-    fn verify_child(
-        &mut self,
+    async fn verify_child(
+        &self,
         slot: &Self::Slot,
     ) -> Result<Pipes<Self::Reader, Self::Writer>, NativeRefusal>;
-    fn resume(&mut self, slot: &Self::Slot) -> Result<(), NativeRefusal>;
+    async fn resume(&self, slot: &Self::Slot) -> Result<(), NativeRefusal>;
     /// Confirm the exact loaded modules and consumed firmware/data opens of
     /// this held child. Unobserved opens refuse even while QEMU is paused.
-    fn verify_opens(&mut self, slot: &Self::Slot, opens: &Self::Opens)
-    -> Result<(), NativeRefusal>;
+    async fn verify_opens(
+        &self,
+        slot: &Self::Slot,
+        opens: &Self::Opens,
+    ) -> Result<(), NativeRefusal>;
     /// Observe the selected accelerator initialized on this same child.
     /// The capability probe and the configure-time argv are not that proof.
-    fn verify_whpx(&mut self, slot: &Self::Slot) -> Result<(), NativeRefusal>;
+    async fn verify_whpx(&self, slot: &Self::Slot) -> Result<(), NativeRefusal>;
     /// Request termination of only the attributed Job and stop its workers.
-    /// Dropping a timed-out observation cannot suppress this request.
+    /// This and settle must also work on an incomplete claim or launch.
     fn request_stop(&mut self, slot: &Self::Slot);
     async fn observe_stop(&mut self, slot: &Self::Slot, deadline: Tick) -> StopEvidence;
     async fn reopen(&mut self, slot: &Self::Slot, deadline: Tick) -> bool;
     /// Persist the charge on uncertain release. Dropping the scoped slot must
     /// never be enough to make its reservation available again.
     fn settle(&mut self, slot: Self::Slot, disposition: StopDisposition);
+}
+
+/// Owns teardown from the instant the charge is acquired. An externally
+/// dropped future can still synchronously request stop and quarantine.
+/// Only a live caller that collected release evidence can release the slot.
+struct Settlement<'a, H: Host> {
+    host: &'a mut H,
+    slot: Option<H::Slot>,
+    stop_requested: bool,
+}
+
+impl<H: Host> Settlement<'_, H> {
+    fn stop(&mut self) {
+        if !self.stop_requested
+            && let Some(slot) = &self.slot
+        {
+            self.host.request_stop(slot);
+            self.stop_requested = true;
+        }
+    }
+
+    async fn finish(mut self, deadline: Tick) -> StopDisposition {
+        self.stop();
+        let slot = self.slot.as_ref().expect("settlement owns a slot");
+        let mut stop = by_deadline(deadline, self.host.observe_stop(slot, deadline))
+            .await
+            .unwrap_or_default();
+        // Exclusive reopen is itself an effect. Wait for independent stop
+        // evidence and reject any proof that arrives at or after the cutoff.
+        let reopened = stop.ready_to_verify_release()
+            && by_deadline(deadline, self.host.reopen(slot, deadline)).await == Some(true);
+        stop.verify_release(|| reopened);
+        let release = stop.disposition();
+        self.host
+            .settle(self.slot.take().expect("settlement owns a slot"), release);
+        release
+    }
+}
+
+impl<H: Host> Drop for Settlement<'_, H> {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(slot) = self.slot.take() {
+            self.host.settle(slot, StopDisposition::ChargedQuarantine);
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -248,7 +301,7 @@ async fn paused_exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     pipes: Pipes<R, W>,
     cancel: &Shutdown,
     cutoff: Tick,
-    recheck: &mut impl FnMut() -> Result<Tick, Failure>,
+    recheck: &impl Fn() -> Result<Tick, Failure>,
 ) -> Result<(), Failure> {
     let Pipes {
         stdout,
@@ -258,18 +311,20 @@ async fn paused_exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let captured = recheck()?;
     before(cancel, cutoff)?;
     dispatch.arm_until(captured.into_std(), Some(cutoff.into_std()))?;
-    let mut peer = watch_pressure(
-        bounded(cancel, cutoff, Qmp::handshake(stdout, stdin, cancel)),
-        recheck,
-    )
+    let mut peer = watch_pressure(cancel, cutoff, recheck, async {
+        Ok(bounded(cancel, cutoff, Qmp::handshake(stdout, stdin, cancel)).await?)
+    })
     .await?;
-    confirm_dispatch(&dispatch, cancel, cutoff).await?;
+    watch_pressure(cancel, cutoff, recheck, confirm_dispatch(&dispatch)).await?;
 
     let captured = recheck()?;
     before(cancel, cutoff)?;
     dispatch.arm_until(captured.into_std(), Some(cutoff.into_std()))?;
-    let status = watch_pressure(bounded(cancel, cutoff, peer.status(cancel)), recheck).await?;
-    confirm_dispatch(&dispatch, cancel, cutoff).await?;
+    let status = watch_pressure(cancel, cutoff, recheck, async {
+        Ok(bounded(cancel, cutoff, peer.status(cancel)).await?)
+    })
+    .await?;
+    watch_pressure(cancel, cutoff, recheck, confirm_dispatch(&dispatch)).await?;
     if status != crate::vm::qmp::RunStatus::Prelaunch {
         return Err(Failure::Qmp(ChannelError::Unexpected));
     }
@@ -281,14 +336,24 @@ async fn paused_exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// Keep watching the owner and reserves while the paused child is alive,
 /// including when the peer stalls. A new sample does not extend a write window.
 async fn watch_pressure<T>(
-    exchange: impl Future<Output = Result<T, ChannelError>>,
-    recheck: &mut impl FnMut() -> Result<Tick, Failure>,
+    cancel: &Shutdown,
+    cutoff: Tick,
+    recheck: &impl Fn() -> Result<Tick, Failure>,
+    action: impl Future<Output = Result<T, Failure>>,
 ) -> Result<T, Failure> {
-    tokio::pin!(exchange);
+    before(cancel, cutoff)?;
+    tokio::pin!(action);
+    let deadline = tokio::time::sleep_until(cutoff);
+    tokio::pin!(deadline);
     loop {
         tokio::select! {
             biased;
-            result = &mut exchange => return result.map_err(Into::into),
+            _ = cancel.cancelled() => return Err(Failure::Cancelled),
+            _ = &mut deadline => return Err(Failure::Timeout),
+            result = &mut action => {
+                before(cancel, cutoff)?;
+                return result;
+            }
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
                 recheck()?;
             }
@@ -296,24 +361,19 @@ async fn watch_pressure<T>(
     }
 }
 
-async fn confirm_dispatch(
-    dispatch: &DispatchGate,
-    cancel: &Shutdown,
-    cutoff: Tick,
-) -> Result<(), Failure> {
-    before(cancel, cutoff)?;
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(Failure::Cancelled),
-        result = tokio::time::timeout_at(cutoff, dispatch.settle(Duration::from_millis(100))) => {
-            before(cancel, cutoff)?;
-            result.map_err(|_| Failure::Timeout)?.map_err(|_| Failure::Qmp(ChannelError::Refused))
-        }
-    }
+async fn confirm_dispatch(dispatch: &DispatchGate) -> Result<(), Failure> {
+    dispatch
+        .settle(Duration::from_millis(100))
+        .await
+        .map_err(|_| Failure::Qmp(ChannelError::Refused))
+}
+
+async fn observe<T>(action: impl Future<Output = Result<T, NativeRefusal>>) -> Result<T, Failure> {
+    Ok(action.await?)
 }
 
 async fn launch_paused<H: Host>(
-    host: &mut H,
+    host: &H,
     slot: &H::Slot,
     plan: &PausedPlan<'_>,
     opens: &H::Opens,
@@ -321,21 +381,36 @@ async fn launch_paused<H: Host>(
     cancel: &Shutdown,
     cutoff: Tick,
 ) -> Result<(), Failure> {
-    before(cancel, cutoff)?;
-    sample(host, peak)?;
-    before(cancel, cutoff)?;
-    host.create_suspended(slot, plan, opens)?;
-    let pipes = host.verify_child(slot)?;
-    sample(host, peak)?;
-    before(cancel, cutoff)?;
-    host.resume(slot)?;
-    paused_exchange(pipes, cancel, cutoff, &mut || sample(host, peak)).await?;
-    host.verify_opens(slot, opens)?;
-    host.verify_whpx(slot)?;
+    let recheck = || sample(host, peak);
+    watch_pressure(cancel, cutoff, &recheck, observe(host.confirm_claim(slot))).await?;
+    recheck()?;
+    watch_pressure(
+        cancel,
+        cutoff,
+        &recheck,
+        observe(host.create_suspended(slot, plan, opens)),
+    )
+    .await?;
+    recheck()?;
+    let pipes = watch_pressure(cancel, cutoff, &recheck, observe(host.verify_child(slot))).await?;
+    recheck()?;
+    watch_pressure(cancel, cutoff, &recheck, observe(host.resume(slot))).await?;
+    paused_exchange(pipes, cancel, cutoff, &recheck).await?;
+
+    watch_pressure(
+        cancel,
+        cutoff,
+        &recheck,
+        observe(host.verify_opens(slot, opens)),
+    )
+    .await?;
+    recheck()?;
+    watch_pressure(cancel, cutoff, &recheck, observe(host.verify_whpx(slot))).await?;
+    recheck()?;
     before(cancel, cutoff)
 }
 
-fn sample(host: &mut impl Host, peak: Peak) -> Result<Tick, Failure> {
+fn sample(host: &impl Host, peak: Peak) -> Result<Tick, Failure> {
     let live = host.live()?;
     live.check(peak, Tick::now())?;
     Ok(live.captured)
@@ -367,20 +442,23 @@ async fn run<H: Host>(
         }
     };
 
-    let paused = launch_paused(host, &slot, plan, &opens, peak, cancel, cutoff).await;
+    let settlement = Settlement {
+        host,
+        slot: Some(slot),
+        stop_requested: false,
+    };
+    let paused = launch_paused(
+        settlement.host,
+        settlement.slot.as_ref().expect("settlement owns a slot"),
+        plan,
+        &opens,
+        peak,
+        cancel,
+        cutoff,
+    )
+    .await;
     // The effect deadline and caller cancellation cannot suppress cleanup.
-    let deadline = Tick::now() + settlement_budget;
-    host.request_stop(&slot);
-    let mut stop = by_deadline(deadline, host.observe_stop(&slot, deadline))
-        .await
-        .unwrap_or_default();
-    // Reopen only after independent stop evidence. A late success cannot
-    // release a slot even if the async operation returned Ready.
-    let reopened = stop.ready_to_verify_release()
-        && by_deadline(deadline, host.reopen(&slot, deadline)).await == Some(true);
-    stop.verify_release(|| reopened);
-    let release = stop.disposition();
-    host.settle(slot, release);
+    let release = settlement.finish(Tick::now() + settlement_budget).await;
     TrialResult { paused, release }
 }
 

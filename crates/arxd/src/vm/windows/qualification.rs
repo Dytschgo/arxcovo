@@ -365,6 +365,29 @@ fn take<T>(origin: Instant, run: impl FnOnce() -> Result<T, NativeRefusal>) -> T
     take_held(origin, || run().map(|result| (result, ()))).0
 }
 
+/// Collect capacity for the stock runner. The two callbacks are the
+/// read-only measurement and the effectful Job probe. Keep the refusal
+/// between them so a successful measurement cannot authorize a Job.
+#[doc(hidden)]
+pub fn stock_capacity<H>(
+    origin: Instant,
+    measure: impl FnOnce() -> Result<(Limits, H), NativeRefusal>,
+    probe_job: impl FnOnce() -> Result<(), NativeRefusal>,
+) -> (Taken<Limits>, Option<H>) {
+    take_held(origin, || {
+        let capacity = measure()?;
+        stock_open_contract()?;
+        probe_job()?;
+        Ok(capacity)
+    })
+}
+
+fn stock_open_contract() -> Result<(), NativeRefusal> {
+    // The stock receipt authenticates inventory. It supplies no evidence
+    // of what the loader and consumers of the held child actually open.
+    Err(NativeRefusal::DistributionUnverified)
+}
+
 /// Inspect only the explicitly enrolled roots, the current token and console,
 /// aggregate counters and the exact stock payload. Behavioral trials are
 /// later stages with their own collectors.
@@ -464,32 +487,35 @@ fn preflight_with(
         })
     });
     let (distribution, bundle_pins) = take_held(origin, || collect_distribution(&bundle));
-    let (limits, capacity_handles) = take_held(origin, || {
-        let reason = NativeRefusal::DiskCeilingUnverified;
-        let (vhd, facts) = capacity::fixed_vhd(names, &outer_volume, &backing_pin)?;
-        let device = capacity::volume_extent(&trial_volume, facts.disk)?;
-        let sample = capacity::CapacitySample {
-            provider_subtype: facts.provider_subtype,
-            vhd_virtual: facts.virtual_size,
-            vhd_physical: facts.physical_size,
-            sector: facts.sector,
-            extent_start: device.extent_start,
-            extent_length: device.extent_length,
-            inner: capacity::held_free(&trial_pin.leaf)?,
-            outer: capacity::held_free(&outer_volume.root)?,
-            backing_length: backing_pin.leaf.metadata().map_err(|_| reason)?.len(),
-            backing_allocated: backing_pin.allocated,
-        };
-        let limits = capacity::check_capacity(&sample)?;
-        empty_job()?;
-        // A drive letter rebound while the observation ran closes it.
-        if !capacity::still_bound(names, &trial_volume)
-            || !capacity::still_bound(names, &outer_volume)
-        {
-            return Err(reason);
-        }
-        Ok((limits, (vhd, device)))
-    });
+    let (limits, capacity_handles) = stock_capacity(
+        origin,
+        || {
+            let reason = NativeRefusal::DiskCeilingUnverified;
+            let (vhd, facts) = capacity::fixed_vhd(names, &outer_volume, &backing_pin)?;
+            let device = capacity::volume_extent(&trial_volume, facts.disk)?;
+            let sample = capacity::CapacitySample {
+                provider_subtype: facts.provider_subtype,
+                vhd_virtual: facts.virtual_size,
+                vhd_physical: facts.physical_size,
+                sector: facts.sector,
+                extent_start: device.extent_start,
+                extent_length: device.extent_length,
+                inner: capacity::held_free(&trial_pin.leaf)?,
+                outer: capacity::held_free(&outer_volume.root)?,
+                backing_length: backing_pin.leaf.metadata().map_err(|_| reason)?.len(),
+                backing_allocated: backing_pin.allocated,
+            };
+            let limits = capacity::check_capacity(&sample)?;
+            // A drive letter rebound while the observation ran closes it.
+            if !capacity::still_bound(names, &trial_volume)
+                || !capacity::still_bound(names, &outer_volume)
+            {
+                return Err(reason);
+            }
+            Ok((limits, (vhd, device)))
+        },
+        empty_job,
+    );
     let activity = take(origin, || {
         let console_idle = current_console_idle(&token)?;
         let (active_cpus, available_ram_bytes) = host_resources()?;

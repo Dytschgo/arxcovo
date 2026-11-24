@@ -1,6 +1,6 @@
 use super::*;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     io::Cursor,
     pin::Pin,
     rc::Rc,
@@ -122,53 +122,77 @@ struct FakeOpens;
 
 struct Fake {
     cancel: Shutdown,
-    steps: Vec<Step>,
+    steps: RefCell<Vec<Step>>,
     written: Rc<RefCell<Vec<u8>>>,
     replies: Option<String>,
-    peer_hold: Option<tokio::io::DuplexStream>,
-    dispatch: Option<Arc<DispatchGate>>,
+    peer_hold: RefCell<Option<tokio::io::DuplexStream>>,
+    dispatch: RefCell<Option<Arc<DispatchGate>>>,
     fail: Option<(Step, NativeRefusal)>,
     live_override: Option<LiveOverride>,
-    live_calls: usize,
+    live_calls: Cell<usize>,
     stop: Stop,
     reopen: bool,
     late_reopen: bool,
     late_write: bool,
     cancel_on_resume: bool,
     charge_retained: bool,
+    stall_at: Option<Step>,
+    slow_at: Option<Step>,
+    owner_active_at: Option<Step>,
+    owner_active: Cell<bool>,
 }
 
 impl Default for Fake {
     fn default() -> Self {
         Self {
             cancel: Shutdown::default(),
-            steps: Vec::new(),
+            steps: RefCell::default(),
             written: Rc::default(),
             replies: Some(format!("{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n")),
-            peer_hold: None,
-            dispatch: None,
+            peer_hold: RefCell::default(),
+            dispatch: RefCell::default(),
             fail: None,
             live_override: None,
-            live_calls: 0,
+            live_calls: Cell::default(),
             stop: Stop::Confirmed,
             reopen: true,
             late_reopen: false,
             late_write: false,
             cancel_on_resume: false,
             charge_retained: false,
+            stall_at: None,
+            slow_at: None,
+            owner_active_at: None,
+            owner_active: Cell::default(),
         }
     }
 }
 
 impl Fake {
-    fn step(&mut self, step: Step) -> Result<(), NativeRefusal> {
-        self.steps.push(step);
+    fn step(&self, step: Step) -> Result<(), NativeRefusal> {
+        self.steps.borrow_mut().push(step);
+        if self.owner_active_at == Some(step) {
+            self.owner_active.set(true);
+        }
         if let Some((when, failure)) = self.fail
             && when == step
         {
             return Err(failure);
         }
         Ok(())
+    }
+
+    fn steps(&self) -> Vec<Step> {
+        self.steps.borrow().clone()
+    }
+
+    async fn checkpoint(&self, step: Step) {
+        if self.stall_at == Some(step) {
+            std::future::pending::<()>().await;
+        }
+        if self.slow_at == Some(step) {
+            tokio::time::sleep(BUDGET * 2).await;
+        }
     }
 
     async fn run(&mut self) -> TrialResult {
@@ -197,17 +221,20 @@ impl Host for Fake {
         Ok((FakeOpens, PEAK))
     }
 
-    fn live(&mut self) -> Result<Live, NativeRefusal> {
+    fn live(&self) -> Result<Live, NativeRefusal> {
         let mut observation = live();
-        if let Some(dispatch) = &self.dispatch {
+        if let Some(dispatch) = &*self.dispatch.borrow() {
             *dispatch.test.clock.lock().unwrap() = Some(observation.captured.into_std());
         }
         if let Some((at, mutate)) = self.live_override
-            && self.live_calls == at
+            && self.live_calls.get() == at
         {
             mutate(&mut observation);
         }
-        self.live_calls += 1;
+        self.live_calls.set(self.live_calls.get() + 1);
+        if self.owner_active.get() {
+            observation.idle = false;
+        }
         Ok(observation)
     }
 
@@ -218,8 +245,13 @@ impl Host for Fake {
         Ok(FakeSlot)
     }
 
-    fn create_suspended(
-        &mut self,
+    async fn confirm_claim(&self, _: &FakeSlot) -> Result<(), NativeRefusal> {
+        self.checkpoint(Step::Claim).await;
+        Ok(())
+    }
+
+    async fn create_suspended(
+        &self,
         _: &FakeSlot,
         plan: &PausedPlan<'_>,
         _: &FakeOpens,
@@ -258,24 +290,27 @@ impl Host for Fake {
                 "chardev=arxqmp,mode=control",
             ]
         );
-        self.step(Step::Create)
+        self.step(Step::Create)?;
+        self.checkpoint(Step::Create).await;
+        Ok(())
     }
 
-    fn verify_child(
-        &mut self,
+    async fn verify_child(
+        &self,
         _: &FakeSlot,
     ) -> Result<Pipes<Self::Reader, Self::Writer>, NativeRefusal> {
         self.step(Step::InspectChild)?;
-        let stdout: Self::Reader = match self.replies.take() {
-            Some(replies) => Box::new(Cursor::new(replies.into_bytes())),
+        self.checkpoint(Step::InspectChild).await;
+        let stdout: Self::Reader = match &self.replies {
+            Some(replies) => Box::new(Cursor::new(replies.as_bytes().to_vec())),
             None => {
                 let (read, write) = tokio::io::duplex(64);
-                self.peer_hold = Some(write);
+                *self.peer_hold.borrow_mut() = Some(write);
                 Box::new(read)
             }
         };
         let dispatch = Arc::new(DispatchGate::default());
-        self.dispatch = Some(dispatch.clone());
+        *self.dispatch.borrow_mut() = Some(dispatch.clone());
         let stdin = FakeWriter {
             written: self.written.clone(),
             dispatch: dispatch.clone(),
@@ -288,28 +323,34 @@ impl Host for Fake {
         })
     }
 
-    fn resume(&mut self, _: &FakeSlot) -> Result<(), NativeRefusal> {
+    async fn resume(&self, _: &FakeSlot) -> Result<(), NativeRefusal> {
         self.step(Step::Resume)?;
+        self.checkpoint(Step::Resume).await;
         if self.cancel_on_resume {
             self.cancel.cancel();
         }
         Ok(())
     }
 
-    fn verify_opens(&mut self, _: &FakeSlot, _: &FakeOpens) -> Result<(), NativeRefusal> {
-        self.step(Step::VerifyOpens)
+    async fn verify_opens(&self, _: &FakeSlot, _: &FakeOpens) -> Result<(), NativeRefusal> {
+        self.step(Step::VerifyOpens)?;
+        self.checkpoint(Step::VerifyOpens).await;
+        Ok(())
     }
 
-    fn verify_whpx(&mut self, _: &FakeSlot) -> Result<(), NativeRefusal> {
-        self.step(Step::VerifyWhpx)
+    async fn verify_whpx(&self, _: &FakeSlot) -> Result<(), NativeRefusal> {
+        self.step(Step::VerifyWhpx)?;
+        self.checkpoint(Step::VerifyWhpx).await;
+        Ok(())
     }
 
     fn request_stop(&mut self, _: &FakeSlot) {
-        self.steps.push(Step::Stop);
+        self.steps.borrow_mut().push(Step::Stop);
     }
 
     async fn observe_stop(&mut self, _: &FakeSlot, deadline: Tick) -> StopEvidence {
-        assert!(self.steps.ends_with(&[Step::Stop]));
+        assert!(self.steps().ends_with(&[Step::Stop]));
+        self.checkpoint(Step::Stop).await;
         if matches!(self.stop, Stop::Late) {
             tokio::time::sleep_until(deadline).await;
         }
@@ -324,7 +365,8 @@ impl Host for Fake {
     }
 
     async fn reopen(&mut self, _: &FakeSlot, deadline: Tick) -> bool {
-        self.steps.push(Step::Reopen);
+        self.steps.borrow_mut().push(Step::Reopen);
+        self.checkpoint(Step::Reopen).await;
         if self.late_reopen {
             tokio::time::sleep_until(deadline).await;
         }
@@ -332,7 +374,7 @@ impl Host for Fake {
     }
 
     fn settle(&mut self, _: FakeSlot, disposition: StopDisposition) {
-        self.steps.push(Step::Settle);
+        self.steps.borrow_mut().push(Step::Settle);
         self.charge_retained = disposition == StopDisposition::ChargedQuarantine;
     }
 }
@@ -348,9 +390,9 @@ async fn exact_recipe_and_qmp_pause_require_custody_and_settle() {
             release: StopDisposition::DirtyRelease
         }
     );
-    assert_eq!(host.live_calls, 6);
+    assert_eq!(host.live_calls.get(), 9);
     assert_eq!(
-        host.steps,
+        host.steps(),
         [
             Step::ProveContract,
             Step::Claim,
@@ -382,7 +424,7 @@ async fn missing_contract_and_claim_refuse_before_create() {
             Step::ProveContract => vec![Step::ProveContract],
             _ => vec![Step::ProveContract, Step::Claim],
         };
-        assert_eq!(host.steps, expected);
+        assert_eq!(host.steps(), expected);
         assert!(!host.charge_retained);
     }
 }
@@ -396,10 +438,10 @@ async fn failed_creation_assignment_or_resume_stops_without_qmp() {
         };
         assert_eq!(host.run().await.paused, Err(Failure::Refused(JOB)));
         assert!(
-            host.steps
+            host.steps()
                 .ends_with(&[Step::Stop, Step::Reopen, Step::Settle])
         );
-        assert_eq!(host.steps.contains(&Step::Resume), step == Step::Resume);
+        assert_eq!(host.steps().contains(&Step::Resume), step == Step::Resume);
         assert!(host.written.borrow().is_empty());
         assert!(!host.charge_retained);
     }
@@ -413,7 +455,7 @@ async fn qmp_status_is_no_substitute_for_actual_opens() {
     };
     assert_eq!(host.run().await.paused, Err(Failure::Refused(OPENS)));
     assert!(
-        host.steps
+        host.steps()
             .ends_with(&[Step::VerifyOpens, Step::Stop, Step::Reopen, Step::Settle])
     );
 }
@@ -426,7 +468,7 @@ async fn preflight_capability_cannot_substitute_for_whpx_initialization() {
         ..Fake::default()
     };
     assert_eq!(host.run().await.paused, Err(Failure::Refused(refusal)));
-    assert!(host.steps.ends_with(&[
+    assert!(host.steps().ends_with(&[
         Step::VerifyOpens,
         Step::VerifyWhpx,
         Step::Stop,
@@ -468,10 +510,10 @@ async fn greeting_reply_correlation_and_paused_state_fail_closed() {
         };
         assert_eq!(host.run().await.paused, Err(Failure::Qmp(reason)));
         assert!(
-            host.steps
+            host.steps()
                 .ends_with(&[Step::Stop, Step::Reopen, Step::Settle])
         );
-        assert!(!host.steps.contains(&Step::VerifyOpens));
+        assert!(!host.steps().contains(&Step::VerifyOpens));
     }
 }
 
@@ -489,7 +531,7 @@ async fn acknowledgement_cannot_cure_late_stdio_write() {
         host.written.borrow().as_slice(),
         b"{\"execute\":\"qmp_capabilities\",\"id\":1}\r\n"
     );
-    assert!(!host.steps.contains(&Step::VerifyOpens));
+    assert!(!host.steps().contains(&Step::VerifyOpens));
 }
 
 #[tokio::test(start_paused = true)]
@@ -499,18 +541,18 @@ async fn stalled_peer_is_bounded_and_pressure_is_sampled_while_waiting() {
         ..Fake::default()
     };
     assert_eq!(stalled.run().await.paused, Err(Failure::Timeout));
-    assert!(stalled.live_calls > 4);
+    assert!(stalled.live_calls.get() > 5);
     assert!(!stalled.charge_retained);
 
     let mut pressured = Fake {
         replies: None,
-        live_override: Some((4, |sample| sample.idle = false)),
+        live_override: Some((5, |sample| sample.idle = false)),
         ..Fake::default()
     };
     assert_eq!(pressured.run().await.paused, Err(Failure::OwnerActive));
     assert!(
         pressured
-            .steps
+            .steps()
             .ends_with(&[Step::Stop, Step::Reopen, Step::Settle])
     );
 }
@@ -520,7 +562,7 @@ async fn cancellation_before_claim_and_after_resume_suppresses_qmp() {
     let mut cancelled = Fake::default();
     cancelled.cancel.cancel();
     assert_eq!(cancelled.run().await.paused, Err(Failure::Cancelled));
-    assert!(cancelled.steps.is_empty());
+    assert!(cancelled.steps().is_empty());
 
     let mut after_resume = Fake {
         cancel_on_resume: true,
@@ -529,7 +571,7 @@ async fn cancellation_before_claim_and_after_resume_suppresses_qmp() {
     assert_eq!(after_resume.run().await.paused, Err(Failure::Cancelled));
     assert!(
         after_resume
-            .steps
+            .steps()
             .ends_with(&[Step::Stop, Step::Reopen, Step::Settle])
     );
     assert!(after_resume.written.borrow().is_empty());
@@ -544,7 +586,7 @@ async fn live_pressure_and_freshness_gate_creation_resume_and_prelaunch() {
         ..Fake::default()
     };
     assert_eq!(before_claim.run().await.paused, Err(Failure::Refused(DISK)));
-    assert_eq!(before_claim.steps, [Step::ProveContract]);
+    assert_eq!(before_claim.steps(), [Step::ProveContract]);
 
     let mut before_create = Fake {
         live_override: Some((1, |sample| sample.whpx = false)),
@@ -554,10 +596,10 @@ async fn live_pressure_and_freshness_gate_creation_resume_and_prelaunch() {
         before_create.run().await.paused,
         Err(Failure::Refused(NativeRefusal::WhpxUnverified))
     );
-    assert!(!before_create.steps.contains(&Step::Create));
+    assert!(!before_create.steps().contains(&Step::Create));
 
     let mut before_resume = Fake {
-        live_override: Some((2, |sample| {
+        live_override: Some((3, |sample| {
             sample.captured -= FRESHNESS + Duration::from_millis(1)
         })),
         ..Fake::default()
@@ -566,17 +608,17 @@ async fn live_pressure_and_freshness_gate_creation_resume_and_prelaunch() {
         before_resume.run().await.paused,
         Err(Failure::Refused(RESERVES))
     );
-    assert!(!before_resume.steps.contains(&Step::Resume));
+    assert!(!before_resume.steps().contains(&Step::Resume));
 
     let mut after_prelaunch = Fake {
-        live_override: Some((5, |sample| sample.available_ram_bytes = RAM_RESERVE)),
+        live_override: Some((6, |sample| sample.available_ram_bytes = RAM_RESERVE)),
         ..Fake::default()
     };
     assert_eq!(
         after_prelaunch.run().await.paused,
         Err(Failure::Refused(RESERVES))
     );
-    assert!(!after_prelaunch.steps.contains(&Step::VerifyOpens));
+    assert!(!after_prelaunch.steps().contains(&Step::VerifyOpens));
     assert!(!after_prelaunch.charge_retained);
 }
 
@@ -593,7 +635,7 @@ async fn missing_or_late_release_proof_keeps_the_slot_charged() {
             ..Fake::default()
         };
         assert_eq!(host.run().await.release, StopDisposition::ChargedQuarantine);
-        assert!(!host.steps.contains(&Step::Reopen));
+        assert!(!host.steps().contains(&Step::Reopen));
         assert!(host.charge_retained);
     }
     for (reopen, late_reopen) in [(false, false), (true, true)] {
@@ -603,8 +645,132 @@ async fn missing_or_late_release_proof_keeps_the_slot_charged() {
             ..Fake::default()
         };
         assert_eq!(host.run().await.release, StopDisposition::ChargedQuarantine);
-        assert!(host.steps.contains(&Step::Reopen));
+        assert!(host.steps().contains(&Step::Reopen));
         assert!(host.charge_retained);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_pending_trial_stops_and_quarantines_every_charged_phase() {
+    for (stall_at, last_before_stop) in [
+        (Some(Step::Claim), Step::Claim),
+        (Some(Step::Create), Step::Create),
+        (Some(Step::InspectChild), Step::InspectChild),
+        (Some(Step::Resume), Step::Resume),
+        (None, Step::Resume), // No greeting arrives.
+        (Some(Step::VerifyOpens), Step::VerifyOpens),
+        (Some(Step::VerifyWhpx), Step::VerifyWhpx),
+        (Some(Step::Stop), Step::Stop),
+        (Some(Step::Reopen), Step::Reopen),
+    ] {
+        let mut host = Fake {
+            stall_at,
+            ..Fake::default()
+        };
+        if stall_at.is_none() {
+            host.replies = None;
+        }
+        let mut trial = Box::pin(host.run());
+        let mut ctx = Context::from_waker(std::task::Waker::noop());
+        assert!(trial.as_mut().poll(&mut ctx).is_pending(), "{stall_at:?}");
+        drop(trial);
+
+        let steps = host.steps();
+        let before_settle = steps
+            .strip_suffix(&[Step::Settle])
+            .expect("quarantine recorded");
+        assert_eq!(steps.iter().filter(|&&step| step == Step::Stop).count(), 1);
+        if matches!(last_before_stop, Step::Stop | Step::Reopen) {
+            assert_eq!(before_settle.last(), Some(&last_before_stop));
+        } else {
+            assert!(before_settle.ends_with(&[last_before_stop, Step::Stop]));
+        }
+        assert!(host.charge_retained, "{stall_at:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_during_a_pending_claim_or_proof_settles_release() {
+    for step in [Step::Claim, Step::VerifyOpens] {
+        let mut host = Fake {
+            stall_at: Some(step),
+            ..Fake::default()
+        };
+        let cancel = host.cancel.clone();
+        let mut trial = Box::pin(host.run());
+        let mut ctx = Context::from_waker(std::task::Waker::noop());
+        assert!(trial.as_mut().poll(&mut ctx).is_pending());
+        cancel.cancel();
+        assert_eq!(
+            trial.await,
+            TrialResult {
+                paused: Err(Failure::Cancelled),
+                release: StopDisposition::DirtyRelease,
+            }
+        );
+        assert!(
+            host.steps()
+                .ends_with(&[step, Step::Stop, Step::Reopen, Step::Settle])
+        );
+        assert!(!host.charge_retained);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn owner_activity_during_a_stalled_live_phase_refuses_and_stops() {
+    for step in [
+        Step::Create,
+        Step::InspectChild,
+        Step::Resume,
+        Step::VerifyOpens,
+        Step::VerifyWhpx,
+    ] {
+        let mut host = Fake {
+            stall_at: Some(step),
+            owner_active_at: Some(step),
+            ..Fake::default()
+        };
+        let start = Tick::now();
+        let result = host.run().await;
+        assert_eq!(result.paused, Err(Failure::OwnerActive), "{step:?}");
+        assert_eq!(result.release, StopDisposition::DirtyRelease);
+        assert!(Tick::now() - start < BUDGET);
+        assert!(
+            host.steps()
+                .ends_with(&[step, Step::Stop, Step::Reopen, Step::Settle])
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_proof_is_cut_off_before_next_stage_and_before_success() {
+    for proof in [Step::VerifyOpens, Step::VerifyWhpx] {
+        let mut host = Fake {
+            slow_at: Some(proof),
+            ..Fake::default()
+        };
+        let started = Tick::now();
+        assert_eq!(host.run().await.paused, Err(Failure::Timeout));
+        assert!(Tick::now() - started < BUDGET * 2);
+        assert!(
+            host.steps()
+                .ends_with(&[proof, Step::Stop, Step::Reopen, Step::Settle])
+        );
+    }
+}
+
+#[tokio::test]
+async fn immediate_proof_completion_cannot_hide_new_owner_activity() {
+    for proof in [Step::VerifyOpens, Step::VerifyWhpx] {
+        let mut host = Fake {
+            owner_active_at: Some(proof),
+            ..Fake::default()
+        };
+        assert_eq!(host.run().await.paused, Err(Failure::OwnerActive));
+        assert!(
+            host.steps()
+                .ends_with(&[proof, Step::Stop, Step::Reopen, Step::Settle])
+        );
     }
 }
 
