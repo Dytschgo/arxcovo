@@ -10,7 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arx_guest::compose::{
-    self, Clock, CommandRunner, ComposeService, ComposeStore, Invocation, RunResult, StoreError,
+    self, Clock, CommandRunner, ComposeService, ComposeStore, Invocation, MAX_SECRET, RunResult,
+    SecretFileWitness, SecretMatch, StoreError,
 };
 use arx_guest::{MAX_SCRIPT, ScriptExecution, ScriptExecutor, ScriptOutcome, serve_with_compose};
 
@@ -1136,14 +1137,21 @@ impl CommandRunner for DockerRunner {
             return RunResult::LaunchFailed;
         };
         let reader = child.stdout.take().map(|mut stdout| {
-            thread::spawn(move || {
+            thread::spawn(move || -> Result<(Vec<u8>, bool), ()> {
                 let mut bytes = Vec::new();
-                let _ = (&mut stdout)
-                    .take(compose::MAX_CAPTURE as u64)
-                    .read_to_end(&mut bytes);
-                // Drain the rest so the child never blocks on a full pipe.
-                let _ = io::copy(&mut stdout, &mut io::sink());
-                bytes
+                // Read up to MAX_CAPTURE + 1 bytes so exact-bound output is
+                // distinguished from truncated output.
+                (&mut stdout)
+                    .take(compose::MAX_CAPTURE as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| ())?;
+                let truncated = bytes.len() > compose::MAX_CAPTURE;
+                if truncated {
+                    bytes.clear();
+                    // Drain the rest so the child never blocks on a full pipe.
+                    let _ = io::copy(&mut stdout, &mut io::sink());
+                }
+                Ok((bytes, truncated))
             })
         });
         let deadline = Instant::now() + invocation.timeout;
@@ -1165,12 +1173,14 @@ impl CommandRunner for DockerRunner {
             // still hold the pipe.
             return RunResult::TimedOut;
         };
-        let stdout = reader
-            .and_then(|reader| reader.join().ok())
-            .unwrap_or_default();
-        match status.code() {
-            Some(code) => RunResult::Exited { code, stdout },
-            None => RunResult::Signaled,
+        let capture_result = match reader {
+            Some(reader) => reader.join().ok().and_then(Result::ok),
+            None => Some((Vec::new(), false)),
+        };
+        match (status.code(), capture_result) {
+            (Some(code), Some((stdout, false))) => RunResult::Exited { code, stdout },
+            (Some(code), _) => RunResult::OutputIncomplete { code },
+            (None, _) => RunResult::Signaled,
         }
     }
 
@@ -1271,7 +1281,9 @@ impl ComposeStore for LinuxComposeStore {
 
     fn save_state(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
         let dir = self.version_dir().map_err(|_| StoreError)?;
-        replace_at(dir.as_fd(), "state.json", bytes, 0o600, None).map_err(|_| StoreError)
+        replace_at(dir.as_fd(), "state.json", bytes, 0o600, None)
+            .map(|_| ())
+            .map_err(|_| StoreError)
     }
 
     fn write_revision(
@@ -1285,34 +1297,123 @@ impl ComposeStore for LinuxComposeStore {
             dir = private_subdir(dir.as_fd(), name, self.owner, true).map_err(|_| StoreError)?;
         }
         replace_at(dir.as_fd(), "compose.yaml", yaml.as_bytes(), 0o600, None)
+            .map(|_| ())
             .map_err(|_| StoreError)
+    }
+
+    fn write_rotation(
+        &mut self,
+        project: &str,
+        revision: u64,
+        operation_id: &str,
+        yaml: &str,
+    ) -> Result<(), StoreError> {
+        let mut dir = self.version_dir().map_err(|_| StoreError)?;
+        for name in ["projects", project, &format!("r{revision}")] {
+            dir = private_subdir(dir.as_fd(), name, self.owner, true).map_err(|_| StoreError)?;
+        }
+        replace_at(
+            dir.as_fd(),
+            &format!("rot-{operation_id}.yaml"),
+            yaml.as_bytes(),
+            0o600,
+            None,
+        )
+        .map(|_| ())
+        .map_err(|_| StoreError)
     }
 
     fn write_secret(
         &mut self,
         project: &str,
-        slot: &str,
+        instance: &str,
         owner: (u32, u32),
         bytes: &[u8],
-    ) -> Result<(), StoreError> {
+    ) -> Result<SecretFileWitness, StoreError> {
         let dir = private_subdir(self.secrets.as_fd(), project, self.owner, true)
             .map_err(|_| StoreError)?;
-        replace_at(dir.as_fd(), slot, bytes, 0o400, Some(owner)).map_err(|_| StoreError)
+        replace_at(dir.as_fd(), instance, bytes, 0o400, Some(owner)).map_err(|_| StoreError)
     }
 
-    fn has_secret(&mut self, project: &str, slot: &str, owner: (u32, u32)) -> bool {
-        let Ok(dir) = private_subdir(self.secrets.as_fd(), project, self.owner, false) else {
-            return false;
-        };
-        open_at(dir.as_fd(), slot, libc::O_RDONLY, 0)
+    fn stat_secret(
+        &mut self,
+        project: &str,
+        instance: &str,
+        owner: (u32, u32),
+    ) -> Option<SecretFileWitness> {
+        let dir = private_subdir(self.secrets.as_fd(), project, self.owner, false).ok()?;
+        let metadata = open_at(dir.as_fd(), instance, libc::O_RDONLY, 0)
             .map(File::from)
             .and_then(|file| file.metadata())
-            .is_ok_and(|metadata| {
-                metadata.is_file()
-                    && (metadata.uid(), metadata.gid()) == owner
-                    && metadata.mode() & 0o7777 == 0o400
-                    && metadata.nlink() == 1
+            .ok()?;
+        if metadata.is_file()
+            && (metadata.uid(), metadata.gid()) == owner
+            && metadata.mode() & 0o7777 == 0o400
+            && metadata.nlink() == 1
+        {
+            Some(SecretFileWitness {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                uid: metadata.uid(),
+                gid: metadata.gid(),
             })
+        } else {
+            None
+        }
+    }
+
+    fn compare_secret(
+        &mut self,
+        project: &str,
+        instance: &str,
+        owner: (u32, u32),
+        bytes: &[u8],
+    ) -> SecretMatch {
+        struct Wiped(Vec<u8>);
+        impl Drop for Wiped {
+            fn drop(&mut self) {
+                compose::wipe_bytes(&mut self.0);
+            }
+        }
+
+        let dir = match private_subdir(self.secrets.as_fd(), project, self.owner, false) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return SecretMatch::Missing,
+            Err(_) => return SecretMatch::Error,
+        };
+        let file = match open_at(dir.as_fd(), instance, libc::O_RDONLY, 0) {
+            Ok(fd) => File::from(fd),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return SecretMatch::Missing,
+            Err(_) => return SecretMatch::Error,
+        };
+        let Ok(metadata) = file.metadata() else {
+            return SecretMatch::Error;
+        };
+        if !metadata.is_file()
+            || (metadata.uid(), metadata.gid()) != owner
+            || metadata.mode() & 0o7777 != 0o400
+            || metadata.nlink() != 1
+        {
+            return SecretMatch::Mismatch;
+        }
+        let mut stored = Wiped(Vec::with_capacity(bytes.len().min(MAX_SECRET) + 1));
+        if file
+            .take(MAX_SECRET as u64 + 1)
+            .read_to_end(&mut stored.0)
+            .is_err()
+        {
+            return SecretMatch::Error;
+        }
+        if stored.0.as_slice() == bytes {
+            SecretMatch::Match(SecretFileWitness {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+            })
+        } else {
+            SecretMatch::Mismatch
+        }
     }
 
     fn prepare_volume(&mut self, name: &str, owner: (u32, u32)) -> Result<(), StoreError> {
@@ -1437,7 +1538,7 @@ fn replace_at(
     bytes: &[u8],
     mode: libc::mode_t,
     owner: Option<(u32, u32)>,
-) -> io::Result<()> {
+) -> io::Result<SecretFileWitness> {
     let target = component(name)?;
     let temporary_name = format!(".{name}.tmp");
     let temporary = component(&temporary_name)?;
@@ -1454,17 +1555,24 @@ fn replace_at(
         libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
         mode,
     )?);
-    let written = (|| {
+    let written = (|| -> io::Result<SecretFileWitness> {
         if let Some((uid, gid)) = owner {
             std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
         }
         file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(bytes)?;
-        file.sync_all()
+        file.sync_all()?;
+        let metadata = file.metadata()?;
+        Ok(SecretFileWitness {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        })
     })();
     drop(file);
     // SAFETY: both names are NUL-terminated components of the live dir.
-    let renamed = written.and_then(|()| {
+    let renamed = written.and_then(|witness| {
         if unsafe {
             libc::renameat(
                 dir.as_raw_fd(),
@@ -1476,19 +1584,22 @@ fn replace_at(
         {
             Err(io::Error::last_os_error())
         } else {
-            Ok(())
+            Ok(witness)
         }
     });
-    if renamed.is_err() {
-        // SAFETY: as above.
-        unsafe { libc::unlinkat(dir.as_raw_fd(), temporary.as_ptr(), 0) };
-        return renamed;
-    }
+    let witness = match renamed {
+        Ok(witness) => witness,
+        Err(error) => {
+            // SAFETY: as above.
+            unsafe { libc::unlinkat(dir.as_raw_fd(), temporary.as_ptr(), 0) };
+            return Err(error);
+        }
+    };
     // SAFETY: dir is a live descriptor.
     if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok(witness)
 }
 
 fn is_tmpfs(dir: BorrowedFd<'_>) -> io::Result<bool> {
@@ -2266,11 +2377,19 @@ mod compose_tests {
 
     #[test]
     fn docker_runner_bounds_output_and_classifies_ends() {
-        let result = run("/bin/sh", &["-c", "yes | head -c 40000"], TEST_HANG_GUARD);
-        let RunResult::Exited { code: 0, stdout } = result else {
-            panic!("{result:?}");
+        let exact_cmd = format!("yes | head -c {}", compose::MAX_CAPTURE);
+        let exact = run("/bin/sh", &["-c", &exact_cmd], TEST_HANG_GUARD);
+        let RunResult::Exited { code: 0, stdout } = exact else {
+            panic!("{exact:?}");
         };
         assert_eq!(stdout.len(), compose::MAX_CAPTURE);
+
+        // Output exceeding MAX_CAPTURE is explicitly reported as incomplete so
+        // a truncated prefix can never be mistaken for a complete inventory.
+        assert_eq!(
+            run("/bin/sh", &["-c", "yes | head -c 40000"], TEST_HANG_GUARD),
+            RunResult::OutputIncomplete { code: 0 }
+        );
 
         let started = Instant::now();
         assert_eq!(
@@ -2338,32 +2457,67 @@ mod compose_tests {
         assert_eq!(fs::read(&yaml).unwrap(), b"name: x\n");
         assert_eq!(fs::metadata(&yaml).unwrap().mode() & 0o777, 0o600);
 
-        assert!(!store.has_secret("calm-life", "admin_password", owner));
-        store
+        assert!(
+            store
+                .stat_secret("calm-life", "admin_password", owner)
+                .is_none()
+        );
+        assert_eq!(
+            store.compare_secret("calm-life", "admin_password", owner, b"first"),
+            SecretMatch::Missing
+        );
+        let first_witness = store
             .write_secret("calm-life", "admin_password", owner, b"first")
             .unwrap();
         let secret = scratch.0.join("secrets/calm-life/admin_password");
         assert_eq!(fs::metadata(&secret).unwrap().mode() & 0o7777, 0o400);
-        assert!(store.has_secret("calm-life", "admin_password", owner));
-        assert!(!store.has_secret("calm-life", "admin_password", (owner.0 + 1, owner.1)));
+        assert_eq!(
+            store.stat_secret("calm-life", "admin_password", owner),
+            Some(first_witness)
+        );
+        assert_eq!(
+            store.compare_secret("calm-life", "admin_password", owner, b"first"),
+            SecretMatch::Match(first_witness)
+        );
+        assert_eq!(
+            store.compare_secret("calm-life", "admin_password", owner, b"other"),
+            SecretMatch::Mismatch
+        );
+        assert!(
+            store
+                .stat_secret("calm-life", "admin_password", (owner.0 + 1, owner.1))
+                .is_none()
+        );
 
         // A planted link at the target is replaced, never written through.
         let outside = scratch.0.join("outside");
         fs::write(&outside, b"untouched").unwrap();
         fs::remove_file(&secret).unwrap();
         symlink(&outside, &secret).unwrap();
-        assert!(!store.has_secret("calm-life", "admin_password", owner));
+        assert!(
+            store
+                .stat_secret("calm-life", "admin_password", owner)
+                .is_none()
+        );
+        assert_eq!(
+            store.compare_secret("calm-life", "admin_password", owner, b"untouched"),
+            SecretMatch::Error
+        );
         symlink(
             &outside,
             scratch.0.join("secrets/calm-life/.admin_password.tmp"),
         )
         .unwrap();
-        store
+        let second_witness = store
             .write_secret("calm-life", "admin_password", owner, b"second")
             .unwrap();
         assert_eq!(fs::read(&outside).unwrap(), b"untouched");
         assert!(fs::symlink_metadata(&secret).unwrap().is_file());
         assert_eq!(fs::read(&secret).unwrap(), b"second");
+        assert_eq!(
+            store.compare_secret("calm-life", "admin_password", owner, b"second"),
+            SecretMatch::Match(second_witness)
+        );
 
         // A linked project directory is refused.
         let elsewhere = scratch.0.join("elsewhere");

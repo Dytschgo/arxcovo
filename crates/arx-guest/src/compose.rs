@@ -21,18 +21,20 @@ mod tests;
 mod wire;
 
 pub(crate) use codec::wipe;
-pub use codec::{SecretText, base64_len, encode_base64, sha256_hex};
+pub use codec::{SecretText, base64_len, encode_base64, sha256_hex, wipe_bytes};
 pub use engine::{
     APPLY_TIMEOUT, Clock, CommandRunner, DOCKER, ENGINE_CWD, ENGINE_ENV, HEALTH_ATTEMPTS,
     HEALTH_INTERVAL, Invocation, MAX_CAPTURE, PULL_TIMEOUT, QUERY_TIMEOUT, RunResult, STOP_TIMEOUT,
-    compose_down, compose_ps, compose_recreate, compose_stop, compose_up, container_rm,
-    container_stop, image_inspect, image_pull, parse_ps, volume_create, volume_label,
+    compose_down, compose_ps, compose_recreate, compose_recreate_file, compose_stop, compose_up,
+    container_inspect_mounts, container_rm, container_stop, image_inspect, image_pull,
+    network_list, network_rm, parse_ps, volume_create, volume_label, volume_list,
     volume_mountpoint,
 };
 pub use layout::{
     DOCKER_CONFIG, DOCKER_VOLUME_ROOT, LAYOUT_VERSION, LOOPBACK_BASE, SECRET_ROOT, STATE_ROOT,
     compose_file, compose_project, loopback_port, network_name, revision_dir,
-    revision_dir_relative, secret_file, state_file, volume_name, volume_token,
+    revision_dir_relative, rotation_compose_file, secret_file, secret_instance, state_file,
+    volume_name, volume_token,
 };
 pub use manifest::{
     EnvVar, Limits, MANIFEST_SCHEMA, MAX_ENV, MAX_MOUNTS, MAX_PROJECTS, MAX_SECRET_SLOTS,
@@ -41,8 +43,8 @@ pub use manifest::{
 };
 pub use render::{PROJECT_LABEL, REVISION_LABEL, VOLUME_LABEL, render};
 pub use service::{
-    ComposeService, ComposeStore, MAX_JOURNAL, MAX_LOG, MAX_STAGED, MAX_STATE_BYTES,
-    MAX_TOMBSTONES, StoreError,
+    ComposeService, ComposeStore, MAX_JOURNAL, MAX_LOG, MAX_SECRET_BINDINGS, MAX_STAGED,
+    MAX_STATE_BYTES, MAX_TOMBSTONES, SecretFileWitness, SecretMatch, StoreError,
 };
 pub(crate) use wire::is_compose_tag;
 pub use wire::{

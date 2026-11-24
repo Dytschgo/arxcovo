@@ -14,9 +14,10 @@ use super::codec::{SecretText, is_base64_text, is_lower_hex};
 use super::manifest::{ManifestRule, is_project_id, is_slot_name};
 use crate::protocol::{Message, ProtocolError, private};
 
-/// Version of the Compose session. It is pinned separately from the legacy
-/// frame version, which stays at 1.
-pub const COMPOSE_PROTOCOL_VERSION: u32 = 1;
+/// Version of the Compose session. Pinned separately from the legacy frame
+/// version (which stays at 1) and bumped to v2 for digest-bound secret intake
+/// and unified operation receipts.
+pub const COMPOSE_PROTOCOL_VERSION: u32 = 2;
 /// The closed, sorted capability set. A ComposeHello must name exactly this
 /// list; anything else closes the connection.
 pub const COMPOSE_CAPABILITIES: [&str; 5] = ["lifecycle", "logs", "manifest", "secrets", "status"];
@@ -95,13 +96,14 @@ pub enum ComposeRequest {
         cursor: u64,
         limit: u32,
     },
-    /// Private, non-logging secret delivery. `data` is Base64 and is wiped
-    /// when the request is dropped.
+    /// Private, non-logging secret delivery bound to an exact release digest.
+    /// `data` is Base64 and is wiped when the request is dropped.
     ComposeSecretPut {
         id: u32,
         operation_id: String,
         generation: u64,
         project_id: String,
+        digest: String,
         slot: String,
         epoch: u64,
         data: SecretText,
@@ -274,6 +276,7 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                         operation_id: take!(operation_id, "operation_id"),
                         generation: take!(generation, "generation"),
                         project_id: take!(project_id, "project_id"),
+                        digest: take!(digest, "digest"),
                         slot: take!(slot, "slot"),
                         epoch: take!(epoch, "epoch"),
                         data: take!(data, "data"),
@@ -347,6 +350,7 @@ pub enum ComposeResponse {
     ComposeSecretAccepted {
         id: u32,
         project_id: String,
+        digest: String,
         slot: String,
         epoch: u64,
         recreate: Option<OperationView>,
@@ -383,6 +387,7 @@ pub enum RejectCode {
     GenerationMismatch,
     UnknownSlot,
     StaleEpoch,
+    SecretConflict,
     SecretSize,
     SecretMissing,
     SecretOwnerMismatch,
@@ -399,6 +404,7 @@ pub enum OperationKind {
     Start,
     Stop,
     Down,
+    SecretPut,
     Recreate,
 }
 
@@ -643,6 +649,7 @@ impl Message for ComposeRequest {
                 operation_id,
                 generation,
                 project_id,
+                digest,
                 slot,
                 epoch,
                 data,
@@ -652,6 +659,7 @@ impl Message for ComposeRequest {
                     is_lower_hex(operation_id, 32)
                         && *generation != 0
                         && is_project_id(project_id)
+                        && is_lower_hex(digest, 64)
                         && is_slot_name(slot)
                         && *epoch != 0
                         && is_base64_text(data.as_str(), MAX_SECRET),

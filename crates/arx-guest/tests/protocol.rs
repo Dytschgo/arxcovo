@@ -672,18 +672,19 @@ mod compose_session {
     use std::time::Duration;
 
     use arx_guest::compose::{
-        COMPOSE_CAPABILITIES, Clock, CommandRunner, ComposeRequest, ComposeResponse,
-        ComposeService, ComposeStore, Invocation, RejectCode, RunResult, STAGE_CHUNK, SecretText,
-        StoreError, encode_base64,
+        COMPOSE_CAPABILITIES, COMPOSE_PROTOCOL_VERSION, Clock, CommandRunner, ComposeRequest,
+        ComposeResponse, ComposeService, ComposeStore, Invocation, RejectCode, RunResult,
+        STAGE_CHUNK, SecretFileWitness, SecretMatch, SecretText, StoreError, encode_base64,
     };
     use arx_guest::serve_with_compose;
 
     use super::*;
 
-    const COMPOSE_HELLO: &[u8] = br#"{"type":"ComposeHello","version":1,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["lifecycle","logs","manifest","secrets","status"]}"#;
-    const COMPOSE_HELLO_ACK: &[u8] = br#"{"type":"ComposeHelloAck","version":1,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["lifecycle","logs","manifest","secrets","status"],"cleared_staging":0,"ambiguous_operations":0}"#;
+    const COMPOSE_HELLO: &[u8] = br#"{"type":"ComposeHello","version":2,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["lifecycle","logs","manifest","secrets","status"]}"#;
+    const COMPOSE_HELLO_ACK: &[u8] = br#"{"type":"ComposeHelloAck","version":2,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["lifecycle","logs","manifest","secrets","status"],"cleared_staging":0,"ambiguous_operations":0}"#;
     const STATUS: &[u8] = br#"{"type":"ComposeStatus","id":3,"project_id":"calm-life"}"#;
     const SCRIPT: &[u8] = br#"{"type":"RunScript","id":2,"script":"echo hello","timeout_s":1}"#;
+    const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     struct NoEngine;
 
@@ -714,18 +715,26 @@ mod compose_session {
             Ok(())
         }
 
+        fn write_rotation(&mut self, _: &str, _: u64, _: &str, _: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+
         fn write_secret(
             &mut self,
             _: &str,
             _: &str,
             _: (u32, u32),
             _: &[u8],
-        ) -> Result<(), StoreError> {
+        ) -> Result<SecretFileWitness, StoreError> {
             panic!("an unknown project reached secret storage");
         }
 
-        fn has_secret(&mut self, _: &str, _: &str, _: (u32, u32)) -> bool {
-            false
+        fn stat_secret(&mut self, _: &str, _: &str, _: (u32, u32)) -> Option<SecretFileWitness> {
+            None
+        }
+
+        fn compare_secret(&mut self, _: &str, _: &str, _: (u32, u32), _: &[u8]) -> SecretMatch {
+            SecretMatch::Missing
         }
 
         fn prepare_volume(&mut self, _: &str, _: (u32, u32)) -> Result<(), StoreError> {
@@ -852,7 +861,7 @@ mod compose_session {
     #[test]
     fn compose_hello_and_ack_have_golden_bytes() {
         let request = ComposeRequest::ComposeHello {
-            version: 1,
+            version: COMPOSE_PROTOCOL_VERSION,
             challenge: CHALLENGE.to_owned(),
             generation: 7,
             capabilities: COMPOSE_CAPABILITIES.map(str::to_owned).to_vec(),
@@ -889,8 +898,13 @@ mod compose_session {
                 hello_with(|v| v["capabilities"].as_array_mut().unwrap().reverse()),
                 ProtocolError::UnsupportedCapability,
             ),
+            // v1 ComposeHello is fenced off after protocol bump to v2.
             (
-                hello_with(|v| v["version"] = 2.into()),
+                hello_with(|v| v["version"] = 1.into()),
+                ProtocolError::UnsupportedVersion,
+            ),
+            (
+                hello_with(|v| v["version"] = 3.into()),
                 ProtocolError::UnsupportedVersion,
             ),
             (
@@ -1013,25 +1027,28 @@ mod compose_session {
     fn secret_frames_never_echo_their_bytes() {
         let canary = format!("arx-canary-{:016x}", 0x0dd_ba11_c0ff_ee00_u64);
         let encoded = encode_base64(canary.as_bytes());
-        let put = |slot: &str| {
+        let put = |slot: &str, digest: &str| {
             serde_json::to_vec(&ComposeRequest::ComposeSecretPut {
                 id: 4,
                 operation_id: "0".repeat(32),
                 generation: 7,
                 project_id: "calm-life".to_owned(),
+                digest: digest.to_owned(),
                 slot: slot.to_owned(),
                 epoch: 1,
                 data: SecretText::new(encoded.clone()),
             })
             .unwrap()
         };
-        let (result, bytes) = compose(&frames(&[COMPOSE_HELLO, &put("admin_password")]));
+        let (result, bytes) = compose(&frames(&[COMPOSE_HELLO, &put("admin_password", DIGEST)]));
         assert_eq!(result, Ok(()));
         let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(text.contains("unknown_project"));
-        let (result, _) = compose(&frames(&[COMPOSE_HELLO, &put("Bad-Slot")]));
+        let (result, _) = compose(&frames(&[COMPOSE_HELLO, &put("Bad-Slot", DIGEST)]));
         let error = result.unwrap_err();
         assert_eq!(error, ProtocolError::InvalidComposeField);
+        let (bad_digest, _) = compose(&frames(&[COMPOSE_HELLO, &put("admin_password", "not-hex")]));
+        assert_eq!(bad_digest, Err(ProtocolError::InvalidComposeField));
         for haystack in [text, format!("{error:?} {error}")] {
             assert!(!haystack.contains(&canary) && !haystack.contains(&encoded));
         }
@@ -1040,14 +1057,16 @@ mod compose_session {
     #[test]
     fn escaped_secret_json_and_malformed_compose_frames_are_rejected() {
         let escaped_cases: &[&[u8]] = &[
+            // Missing explicit release digest on v2 ComposeSecretPut.
+            br#"{"type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1,"data":"QUFBQQ=="}"#,
             // Unicode escape in Base64 secret field.
-            br#"{"type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1,"data":"\u0041\u0041\u0041\u0041"}"#,
+            br#"{"type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","slot":"admin_password","epoch":1,"data":"\u0041\u0041\u0041\u0041"}"#,
             // Forward-slash escape in Base64 secret field.
-            br#"{"type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1,"data":"QUJ\/"}"#,
+            br#"{"type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","slot":"admin_password","epoch":1,"data":"QUJ\/"}"#,
             // Escaped type tag on a secret frame.
-            br#"{"type":"\u0043omposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1,"data":"QUFBQQ=="}"#,
+            br#"{"type":"\u0043omposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","slot":"admin_password","epoch":1,"data":"QUFBQQ=="}"#,
             // Secret field before type, followed by an unknown field.
-            br#"{"data":"QUFBQQ==","type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1,"extra":true}"#,
+            br#"{"data":"QUFBQQ==","type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","slot":"admin_password","epoch":1,"extra":true}"#,
             // Cross-variant extra field on a Compose request.
             br#"{"type":"ComposeStatus","id":3,"project_id":"calm-life","revision":1}"#,
             // Duplicate field on a Compose request.
@@ -1068,10 +1087,10 @@ mod compose_session {
             ));
         }
         // Even direct serde_json deserialization refuses escaped SecretText.
-        let escaped = r#"{"type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1,"data":"\u0041\u0041\u0041\u0041"}"#;
+        let escaped = r#"{"type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","slot":"admin_password","epoch":1,"data":"\u0041\u0041\u0041\u0041"}"#;
         assert!(serde_json::from_str::<ComposeRequest>(escaped).is_err());
         // Unescaped SecretText in any key order still decodes cleanly.
-        let reordered = br#"{"data":"QUFBQQ==","type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1}"#;
+        let reordered = br#"{"data":"QUFBQQ==","type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","slot":"admin_password","epoch":1}"#;
         assert!(matches!(
             read_frame::<ComposeRequest>(&mut frame(reordered).as_slice()),
             Ok(Some(ComposeRequest::ComposeSecretPut { epoch: 1, .. }))

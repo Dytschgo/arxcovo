@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use super::layout::{
-    DOCKER_CONFIG, ENGINE_CWD as CWD, compose_file, compose_project, revision_dir,
+    DOCKER_CONFIG, ENGINE_CWD as CWD, compose_file, compose_project, network_name, revision_dir,
 };
 use super::render::{PROJECT_LABEL, REVISION_LABEL, VOLUME_LABEL};
 use super::wire::{HealthState, ServiceState, ServiceView};
@@ -41,9 +41,12 @@ pub struct Invocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunResult {
-    /// The process exited. `stdout` is empty unless the invocation captures,
-    /// and never longer than [`MAX_CAPTURE`].
+    /// The process exited and captured output (if any) fit completely within
+    /// [`MAX_CAPTURE`].
     Exited { code: i32, stdout: Vec<u8> },
+    /// The process exited, but captured stdout exceeded [`MAX_CAPTURE`] or its
+    /// reader failed. Incomplete output cannot prove completeness or absence.
+    OutputIncomplete { code: i32 },
     /// Killed by a signal other than the runner's own deadline kill.
     Signaled,
     /// The deadline expired and the runner killed the process.
@@ -73,9 +76,8 @@ fn global(args: &[&str]) -> Vec<String> {
         .collect()
 }
 
-fn compose(project: &str, revision: u64, args: &[&str]) -> Vec<String> {
+fn compose_with_file(project: &str, revision: u64, file: &str, args: &[&str]) -> Vec<String> {
     let dir = revision_dir(project, revision);
-    let file = compose_file(project, revision);
     let name = compose_project(project);
     let mut argv = global(&[
         "compose",
@@ -86,13 +88,18 @@ fn compose(project: &str, revision: u64, args: &[&str]) -> Vec<String> {
         "--project-directory",
         &dir,
         "--file",
-        &file,
+        file,
         // An explicit empty env file disables working-directory dotenv.
         "--env-file",
         "/dev/null",
     ]);
     argv.extend(args.iter().map(|arg| (*arg).to_owned()));
     argv
+}
+
+fn compose(project: &str, revision: u64, args: &[&str]) -> Vec<String> {
+    let file = compose_file(project, revision);
+    compose_with_file(project, revision, &file, args)
 }
 
 pub fn image_inspect(image: &str) -> Invocation {
@@ -121,6 +128,14 @@ pub fn image_pull(image: &str) -> Invocation {
         ]),
         timeout: PULL_TIMEOUT,
         capture: false,
+    }
+}
+
+pub fn volume_list() -> Invocation {
+    Invocation {
+        argv: global(&["volume", "ls", "--format", "json"]),
+        timeout: QUERY_TIMEOUT,
+        capture: true,
     }
 }
 
@@ -164,7 +179,12 @@ pub fn compose_up(project: &str, revision: u64) -> Invocation {
     }
 }
 
-pub fn compose_recreate(project: &str, revision: u64, services: &[String]) -> Invocation {
+pub fn compose_recreate_file(
+    project: &str,
+    revision: u64,
+    file: &str,
+    services: &[String],
+) -> Invocation {
     let mut args = vec![
         "up",
         "--detach",
@@ -176,10 +196,15 @@ pub fn compose_recreate(project: &str, revision: u64, services: &[String]) -> In
     ];
     args.extend(services.iter().map(String::as_str));
     Invocation {
-        argv: compose(project, revision, &args),
+        argv: compose_with_file(project, revision, file, &args),
         timeout: APPLY_TIMEOUT,
         capture: false,
     }
+}
+
+pub fn compose_recreate(project: &str, revision: u64, services: &[String]) -> Invocation {
+    let file = compose_file(project, revision);
+    compose_recreate_file(project, revision, &file, services)
 }
 
 pub fn compose_stop(project: &str, revision: u64) -> Invocation {
@@ -218,6 +243,39 @@ pub fn container_rm(id: &str) -> Invocation {
     }
 }
 
+/// Fixed-field inspection of a container's exact ID and mount table.
+pub fn container_inspect_mounts(id: &str) -> Invocation {
+    Invocation {
+        argv: global(&[
+            "container",
+            "inspect",
+            "--format",
+            "{{.Id}}\n{{json .Mounts}}",
+            id,
+        ]),
+        timeout: QUERY_TIMEOUT,
+        capture: true,
+    }
+}
+
+/// Complete bounded inventory of Docker networks with full IDs and labels.
+pub fn network_list() -> Invocation {
+    Invocation {
+        argv: global(&["network", "ls", "--no-trunc", "--format", "json"]),
+        timeout: QUERY_TIMEOUT,
+        capture: true,
+    }
+}
+
+/// Removes one verified broker-attributed network by its hex ID.
+pub fn network_rm(id: &str) -> Invocation {
+    Invocation {
+        argv: global(&["network", "rm", id]),
+        timeout: STOP_TIMEOUT,
+        capture: false,
+    }
+}
+
 pub fn compose_ps(project: &str, revision: u64) -> Invocation {
     Invocation {
         argv: compose(project, revision, &["ps", "--all", "--format", "json"]),
@@ -239,12 +297,7 @@ pub(crate) fn is_container_id(text: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Parses `compose ps --format json` (one object per line, or one array)
-/// into every broker-attributed container for `project`, including services
-/// retired by a later release. Containers without `PROJECT_LABEL` or labelled
-/// for another project are ignored. Returns `None` for output that is not
-/// that shape.
-pub(crate) fn parse_ps_attributed(stdout: &[u8], project: &str) -> Option<Vec<ObservedContainer>> {
+fn parse_json_objects(stdout: &[u8]) -> Option<Vec<serde_json::Value>> {
     let text = std::str::from_utf8(stdout).ok()?;
     let trimmed = text.trim();
     let objects: Vec<serde_json::Value> = if trimmed.is_empty() {
@@ -262,19 +315,30 @@ pub(crate) fn parse_ps_attributed(stdout: &[u8], project: &str) -> Option<Vec<Ob
     if objects.len() > 64 {
         return None;
     }
+    Some(objects)
+}
+
+fn find_label<'a>(labels: &'a str, key: &str) -> Option<&'a str> {
+    labels
+        .split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| value)
+}
+
+/// Parses `compose ps --format json` (one object per line, or one array)
+/// into every broker-attributed container for `project`, including services
+/// retired by a later release. Containers without `PROJECT_LABEL` or labelled
+/// for another project are ignored. Returns `None` for output that is not
+/// that shape.
+pub(crate) fn parse_ps_attributed(stdout: &[u8], project: &str) -> Option<Vec<ObservedContainer>> {
+    let objects = parse_json_objects(stdout)?;
     let mut containers = Vec::new();
     for object in &objects {
         let field = |key: &str| object.get(key).and_then(serde_json::Value::as_str);
         let name = field("Service")?;
         let labels = field("Labels").unwrap_or("");
-        let label = |key: &str| {
-            labels
-                .split(',')
-                .filter_map(|pair| pair.split_once('='))
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| value)
-        };
-        if label(PROJECT_LABEL) != Some(project) {
+        if find_label(labels, PROJECT_LABEL) != Some(project) {
             continue;
         }
         let id = field("ID")
@@ -299,13 +363,161 @@ pub(crate) fn parse_ps_attributed(stdout: &[u8], project: &str) -> Option<Vec<Ob
                     "healthy" => HealthState::Healthy,
                     _ => HealthState::Unhealthy,
                 },
-                revision: label(REVISION_LABEL).and_then(|value| value.parse().ok()),
+                revision: find_label(labels, REVISION_LABEL).and_then(|value| value.parse().ok()),
             },
             id,
         });
     }
     containers.sort_by(|a, b| a.view.name.cmp(&b.view.name).then(a.id.cmp(&b.id)));
     Some(containers)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContainerMount {
+    pub(crate) mount_type: String,
+    pub(crate) source: String,
+    pub(crate) destination: String,
+    pub(crate) rw: bool,
+}
+
+/// Parses `container inspect --format "{{.Id}}\n{{json .Mounts}}"`.
+/// Returns `None` if the ID does not match `expected_id` or the mount table is
+/// malformed or over the bound.
+pub(crate) fn parse_container_mounts(
+    stdout: &[u8],
+    expected_id: &str,
+) -> Option<Vec<ContainerMount>> {
+    #[derive(serde::Deserialize)]
+    struct RawMount {
+        #[serde(rename = "Type")]
+        mount_type: String,
+        #[serde(rename = "Source")]
+        source: String,
+        #[serde(rename = "Destination")]
+        destination: String,
+        #[serde(rename = "RW")]
+        rw: bool,
+    }
+
+    let text = std::str::from_utf8(stdout).ok()?;
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    let (id_line, mounts_line) = trimmed.split_once('\n')?;
+    let id_line = id_line.trim();
+    if !is_container_id(id_line) || !(id_line == expected_id || id_line.starts_with(expected_id)) {
+        return None;
+    }
+    let mounts_line = mounts_line.trim();
+    if mounts_line == "null" {
+        return Some(Vec::new());
+    }
+    let raw: Vec<RawMount> = serde_json::from_str(mounts_line).ok()?;
+    if raw.len() > 64 {
+        return None;
+    }
+    Some(
+        raw.into_iter()
+            .map(|m| ContainerMount {
+                mount_type: m.mount_type,
+                source: m.source,
+                destination: m.destination,
+                rw: m.rw,
+            })
+            .collect(),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NetworkObservation {
+    Absent,
+    OwnedPresent(Vec<String>),
+    ForeignConflict,
+    Unavailable,
+}
+
+/// Classifies the generated project network from a complete `network ls` JSON
+/// inventory. Distinguishes absence, broker-owned presence, foreign exact-name
+/// collision, and malformed/over-bound output.
+pub(crate) fn parse_network_inventory(stdout: &[u8], project: &str) -> NetworkObservation {
+    let Some(objects) = parse_json_objects(stdout) else {
+        return NetworkObservation::Unavailable;
+    };
+    let expected_name = network_name(project);
+    let mut owned = Vec::new();
+    for object in &objects {
+        let field = |key: &str| object.get(key).and_then(serde_json::Value::as_str);
+        let Some(name) = field("Name") else {
+            return NetworkObservation::Unavailable;
+        };
+        let labels = field("Labels").unwrap_or("");
+        let owner = find_label(labels, PROJECT_LABEL);
+        let name_matches = name == expected_name;
+        let owner_matches = owner == Some(project);
+        if name_matches {
+            if !owner_matches {
+                return NetworkObservation::ForeignConflict;
+            }
+            let Some(id) = field("ID").filter(|id| is_container_id(id)) else {
+                return NetworkObservation::ForeignConflict;
+            };
+            owned.push(id.to_owned());
+        } else if owner_matches {
+            let Some(id) = field("ID").filter(|id| is_container_id(id)) else {
+                return NetworkObservation::ForeignConflict;
+            };
+            owned.push(id.to_owned());
+        }
+    }
+    owned.sort();
+    owned.dedup();
+    if owned.is_empty() {
+        NetworkObservation::Absent
+    } else {
+        NetworkObservation::OwnedPresent(owned)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VolumeObservation {
+    Absent,
+    OwnedPresent,
+    Collision,
+    Unavailable,
+}
+
+/// Classifies one named volume from a complete `volume ls --format json`
+/// inventory. Never confuses missing/malformed output with absence.
+pub(crate) fn parse_volume_inventory(
+    stdout: &[u8],
+    name: &str,
+    expected_token: &str,
+) -> VolumeObservation {
+    let Some(objects) = parse_json_objects(stdout) else {
+        return VolumeObservation::Unavailable;
+    };
+    let mut matched: Option<&serde_json::Value> = None;
+    for object in &objects {
+        let Some(vol_name) = object.get("Name").and_then(serde_json::Value::as_str) else {
+            return VolumeObservation::Unavailable;
+        };
+        if vol_name == name {
+            if matched.is_some() {
+                return VolumeObservation::Unavailable;
+            }
+            matched = Some(object);
+        }
+    }
+    let Some(object) = matched else {
+        return VolumeObservation::Absent;
+    };
+    let labels = object
+        .get("Labels")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if find_label(labels, VOLUME_LABEL) == Some(expected_token) {
+        VolumeObservation::OwnedPresent
+    } else {
+        VolumeObservation::Collision
+    }
 }
 
 pub(crate) fn to_service_views(containers: &[ObservedContainer]) -> Vec<ServiceView> {

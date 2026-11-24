@@ -4,6 +4,7 @@
 //! validation already restricted, so no YAML escaping, anchors, tags, merge
 //! keys or interpolation can appear.
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use super::layout::{compose_project, loopback_port, network_name, secret_file, volume_name};
@@ -14,7 +15,15 @@ pub const PROJECT_LABEL: &str = "org.arxcovo.project";
 pub const VOLUME_LABEL: &str = "org.arxcovo.volume";
 const NETWORK_KEY: &str = "arx-project";
 
-pub fn render(project: &Project, revision: u64, slot: u8) -> String {
+/// Renders canonical Compose YAML for `project` at `revision` and `slot`,
+/// projecting each declared secret slot onto its pinned immutable tmpfs
+/// instance name from `secret_instances`.
+pub fn render(
+    project: &Project,
+    revision: u64,
+    slot: u8,
+    secret_instances: &BTreeMap<String, String>,
+) -> String {
     let manifest = project.manifest();
     let id = manifest.project_id.as_str();
     let mut out = String::with_capacity(4096);
@@ -128,6 +137,11 @@ pub fn render(project: &Project, revision: u64, slot: u8) -> String {
     line(&mut out, format_args!("  \"{NETWORK_KEY}\":"));
     line(&mut out, format_args!("    name: \"{}\"", network_name(id)));
     out.push_str("    driver: \"bridge\"\n");
+    out.push_str("    labels:\n");
+    line(
+        &mut out,
+        format_args!("      \"{PROJECT_LABEL}\": \"{id}\""),
+    );
     if !manifest.volumes.is_empty() {
         out.push_str("volumes:\n");
         for volume in &manifest.volumes {
@@ -140,10 +154,14 @@ pub fn render(project: &Project, revision: u64, slot: u8) -> String {
     if !manifest.secrets.is_empty() {
         out.push_str("secrets:\n");
         for slot_name in &manifest.secrets {
+            let instance = secret_instances
+                .get(slot_name)
+                .map(String::as_str)
+                .expect("every declared secret slot has a pinned instance before render");
             line(&mut out, format_args!("  \"{slot_name}\":"));
             line(
                 &mut out,
-                format_args!("    file: \"{}\"", secret_file(id, slot_name)),
+                format_args!("    file: \"{}\"", secret_file(id, instance)),
             );
         }
     }

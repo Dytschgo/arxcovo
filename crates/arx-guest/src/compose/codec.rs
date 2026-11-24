@@ -9,12 +9,16 @@ use sha2::{Digest, Sha256};
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Overwrites bytes with zeros through volatile writes the optimizer keeps.
-pub(crate) fn wipe(bytes: &mut [u8]) {
+pub fn wipe_bytes(bytes: &mut [u8]) {
     for byte in bytes.iter_mut() {
         // SAFETY: `byte` is a valid, aligned and exclusive reference.
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
     compiler_fence(Ordering::SeqCst);
+}
+
+pub(crate) fn wipe(bytes: &mut [u8]) {
+    wipe_bytes(bytes);
 }
 
 pub(crate) fn wipe_string(text: &mut String) {
@@ -186,30 +190,6 @@ pub fn encode_base64(bytes: &[u8]) -> String {
 /// Lowercase hexadecimal SHA-256.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-/// Domain-separated SHA-256 commitment to a secret delivery's attribution and
-/// decoded bytes, used only to detect conflicting operation-ID replays without
-/// persisting plaintext or base64 bytes.
-pub(crate) fn secret_op_digest(
-    generation: u64,
-    project: &str,
-    slot: &str,
-    epoch: u64,
-    bytes: &[u8],
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"arx-secret-op-v1\0");
-    hasher.update(generation.to_be_bytes());
-    hasher.update(b"\0");
-    hasher.update(project.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(slot.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(epoch.to_be_bytes());
-    hasher.update(b"\0");
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 pub(crate) fn is_lower_hex(text: &str, len: usize) -> bool {

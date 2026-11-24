@@ -34,8 +34,24 @@ pub fn compose_file(project: &str, revision: u64) -> String {
     format!("{}/compose.yaml", revision_dir(project, revision))
 }
 
-pub fn secret_file(project: &str, slot: &str) -> String {
-    format!("{SECRET_ROOT}/{project}/{slot}")
+/// Rotation-scoped Compose file inside the revision directory so the prior
+/// committed `compose.yaml` stays intact until rotation settles.
+pub fn rotation_compose_file(project: &str, revision: u64, operation_id: &str) -> String {
+    format!(
+        "{}/rot-{operation_id}.yaml",
+        revision_dir(project, revision)
+    )
+}
+
+/// Immutable filename for one `(slot, release_digest, epoch, generation)`
+/// secret binding on tmpfs. Distinct releases, epochs and boot generations
+/// never share a source path.
+pub fn secret_instance(slot: &str, digest: &str, epoch: u64, generation: u64) -> String {
+    format!("{slot}-{digest}-e{epoch}-g{generation}")
+}
+
+pub fn secret_file(project: &str, instance: &str) -> String {
+    format!("{SECRET_ROOT}/{project}/{instance}")
 }
 
 /// Compose project name. Project IDs contain no `_`, so names cannot collide.
