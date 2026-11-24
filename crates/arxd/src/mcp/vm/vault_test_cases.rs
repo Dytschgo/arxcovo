@@ -244,46 +244,52 @@ async fn vault_tester_quarantines_unconfirmed_disposal() {
 }
 
 #[tokio::test]
-async fn vault_tester_waits_for_overlapping_reaper_selection() {
+async fn vault_tester_gets_next_turn_ahead_of_periodic_backlog() {
     let mut h = Harness::start(false, false).await;
     h.supervisor().open_vault(h.temp.path()).unwrap();
     let client = h.client(0).await;
     let template = seal_vault_template(&h, &client, 603).await;
-    let older = call(
-        &client,
-        "vm_create",
-        json!({"template_id":template,"request_id":key(604),"ttl_s":60}),
-    )
-    .await;
-    assert_eq!(older["ok"], true, "{older}");
-    tokio::time::timeout(
-        Duration::from_secs(15),
-        h.fixture(Fixture::take_jobs).join(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let older = call(
-        &client,
-        "vm_operation",
-        json!({"operation_id":older["operation_id"]}),
-    )
-    .await;
-    assert_eq!(older["state"], "succeeded", "{older}");
+    for nonce in [604, 605] {
+        let older = call(
+            &client,
+            "vm_create",
+            json!({"template_id":template,"request_id":key(nonce),"ttl_s":60}),
+        )
+        .await;
+        assert_eq!(older["ok"], true, "{older}");
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            h.fixture(Fixture::take_jobs).join(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let older = call(
+            &client,
+            "vm_operation",
+            json!({"operation_id":older["operation_id"]}),
+        )
+        .await;
+        assert_eq!(older["state"], "succeeded", "{older}");
+    }
 
     let version = add_vault_version(&client, 1, VAULT_EXIT_0).await;
     let receipt = call(&client, "vault_test_version", vault_write_args(&version, 2)).await;
     assert_eq!(receipt["ok"], true, "{receipt}");
     wait_for_vault_script(&h).await;
-    // The ordinary turn selects the older lease and parks with the sweep
-    // lock held before the vault clone becomes due.
+    // An ordinary turn selects both old leases before the vault is due.
+    // Hold the first item while the vault queues, and park a second hook
+    // that would keep the vault behind the whole batch without yielding.
     h.now.store(UTC + 60_000, Ordering::SeqCst);
     let reaper = h.fixture(|f| f.reaper());
     let mut stall = Stall::install(&reaper.after_selection);
     let controller = h.supervisor().controller.clone();
-    let sweep =
-        tokio::task::spawn_blocking(move || controller.sweep_with(&reaper, &*reaper.custody));
+    let batch_reaper = reaper.clone();
+    let sweep = tokio::task::spawn_blocking(move || {
+        controller.sweep_with(&batch_reaper, &*batch_reaper.custody)
+    });
     stall.entered().await;
+    let mut second = Stall::install(&reaper.after_selection);
 
     let (waiting, observed) = tokio::sync::oneshot::channel();
     *h.supervisor().vault_cleanup_waiting.lock().unwrap() = Some(waiting);
@@ -296,13 +302,30 @@ async fn vault_tester_waits_for_overlapping_reaper_selection() {
     assert_eq!(vault_vm_counts(&h), (1, 1, 1));
 
     stall.release_and_join().await;
+    let passed = tokio::select! {
+        biased;
+        _ = second.entered() => panic!("ordinary backlog started another item before vault custody"),
+        result = vault_result(&client, &version) => result,
+    };
     assert!(sweep.await.unwrap().unwrap());
-    let passed = vault_result(&client, &version).await;
+    assert!(second.not_entered());
     assert_eq!(
         passed["test"],
         json!({"status":"exited","exit_code":0,"cleanup_confirmed":true})
     );
     assert_eq!(vault_vm_counts(&h), (1, 0, 0));
+    let remaining = || {
+        read_state(&h)
+            .query_row(
+                "SELECT count(*) FROM vm_instances WHERE principal='alpha'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(remaining(), 1, "the next ordinary item was deferred");
+    h.sweep().await;
+    assert_eq!(remaining(), 0);
     assert_eq!(
         call(&client, "vault_activate", vault_write_args(&version, 3)).await["ok"],
         true

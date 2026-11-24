@@ -16,6 +16,7 @@ const DAEMON: &str = "arxd"; // Reserved by the TEST VM profile loader.
 const LEASE_SECONDS: u64 = 600;
 const SCRIPT_SECONDS: u32 = 30;
 const JOB_BUDGET: Duration = Duration::from_secs(480);
+const WORKER_SETTLE_BUDGET: Duration = Duration::from_secs(15);
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -90,11 +91,15 @@ impl Supervisor {
             .map(super::tests::Fixture::reaper);
         #[cfg(test)]
         if let Some(reaper) = fixture {
-            return self
-                .controller
-                .sweep_vault_test_with(vm, &reaper, &*reaper.custody);
+            return self.controller.sweep_vault_test_with(
+                vm,
+                &reaper,
+                &*reaper.custody,
+                TEARDOWN_BUDGET,
+            );
         }
-        self.controller.sweep_vault_test(vm, &self.candidate())
+        self.controller
+            .sweep_vault_test(vm, &self.candidate(), TEARDOWN_BUDGET)
     }
 
     pub(super) async fn drain_vault_jobs(
@@ -243,7 +248,7 @@ impl Run {
             let stall = supervisor.stall_vault_teardown.lock().unwrap().take();
             stall.map(super::tests::StallHook::enter)
         };
-        let deadline = Instant::now() + TEARDOWN_BUDGET;
+        let deadline = Instant::now() + WORKER_SETTLE_BUDGET;
         // Cancellation ends exercise immediately. Let an admitted VM worker
         // settle before arming expiry so cleanup cannot race its last write.
         let settled = self
@@ -252,12 +257,12 @@ impl Run {
         if supervisor.controller.expire_vault_test(id).is_err() || !settled {
             return false;
         }
-        // An overlapping sweep may have selected its work before this lease
-        // expired. Retry until this exact clone has proof, an attempted
-        // unconfirmed cleanup, or the bounded wait expires.
-        while Instant::now() < deadline {
+        // The periodic batch yields at the next item boundary. Time waiting
+        // for its lock does not count as a failed cleanup of this clone.
+        let _priority = supervisor.controller.prioritize_vault_sweep();
+        loop {
             match supervisor.sweep_vault_test(id) {
-                Ok(Some(confirmed)) => return confirmed && Instant::now() < deadline,
+                Ok(Some(confirmed)) => return confirmed,
                 Err(_) => return false,
                 Ok(None) => {
                     #[cfg(test)]
@@ -268,6 +273,5 @@ impl Run {
                 }
             }
         }
-        false
     }
 }

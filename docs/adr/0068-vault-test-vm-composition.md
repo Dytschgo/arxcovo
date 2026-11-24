@@ -13,7 +13,8 @@ job gets a ten-minute TEST lease and separate VM request keys. On every
 post-clone path, the adapter brings forward expiry for the daemon-owned VM
 and runs a custody turn for that exact clone under the periodic reaper's
 lock. The turn uses the same release, disposal and accounting checks.
-A busy lock or a deferred claim earns a bounded retry. A confirmed expiry
+A waiting vault teardown takes the next custody turn after the active
+reaper item. Its deadline starts when it acquires the lock. A confirmed expiry
 receipt and zero remaining disk claims are required before a zero exit can
 record a pass. The vault compares the exact version's digest again when
 committing the result.

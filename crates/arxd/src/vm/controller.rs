@@ -18,7 +18,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::{
     path::Path,
-    sync::{Arc, Mutex, TryLockError},
+    sync::{
+        Arc, Mutex, TryLockError,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -30,7 +33,16 @@ pub struct VmController<C> {
     clock: C,
     gate: Mutex<AdmissionGate>,
     sweeps: Mutex<Sweeps>,
+    vault_sweep_waiters: AtomicUsize,
     worker_binding: Arc<()>,
+}
+
+pub(crate) struct VaultSweepPriority<'a>(&'a AtomicUsize);
+
+impl Drop for VaultSweepPriority<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Default)]
@@ -74,6 +86,7 @@ impl<C: Clock> VmController<C> {
             clock,
             gate: Mutex::default(),
             sweeps: Mutex::default(),
+            vault_sweep_waiters: AtomicUsize::default(),
             worker_binding: Arc::new(()),
         })
     }
@@ -948,7 +961,7 @@ impl<C: Clock> VmController<C> {
     }
 
     /// Run once after open, under the store's supervisor lock, before the
-    /// foreground exposes tools. Returns false if another sweep is in flight.
+    /// foreground exposes tools. Returns false if the turn could not start.
     pub fn sweep_once(&self, runtime: &CandidateRuntime<'_>) -> Result<bool> {
         self.sweep_with(runtime, &ClosedCustody)
     }
@@ -1002,6 +1015,9 @@ impl<C: Clock> VmController<C> {
             Err(TryLockError::WouldBlock) => return Ok(false),
             Err(TryLockError::Poisoned(_)) => anyhow::bail!("VM reaper unavailable"),
         };
+        if self.vault_sweep_waiting() {
+            return Ok(false);
+        }
         let (mut items, mut uncertain) = {
             let mut gate = self
                 .gate
@@ -1023,6 +1039,11 @@ impl<C: Clock> VmController<C> {
         };
         sweeps.prepare(&mut items);
         for work in items {
+            if self.vault_sweep_waiting() {
+                // Keep custody uncertain until a complete ordinary turn.
+                // The unprocessed claims are already durable.
+                return Ok(true);
+            }
             if !sweeps.due(work.kind, self.clock.now().monotonic) {
                 uncertain = true;
                 continue;
@@ -1035,6 +1056,9 @@ impl<C: Clock> VmController<C> {
             .store
             .transact(|db| store::static_vm::recovery_claims(db))?;
         for claim in claims {
+            if self.vault_sweep_waiting() {
+                return Ok(true);
+            }
             let start = self.clock.now().monotonic;
             let released = start
                 .checked_add(STATIC_RELEASE_BUDGET)
@@ -1060,15 +1084,26 @@ impl<C: Clock> VmController<C> {
         Ok(true)
     }
 
-    /// Try one custody turn for the vault's exact expired TEST clone. Pending
-    /// means the sweep lock, retry window or staged-clone recovery still owns
-    /// the decision. It does not attest that custody could not be resolved.
+    /// A settled vault job registers before trying the sweep lock. Ordinary
+    /// turns yield at item boundaries and skip new batches until it finishes.
+    pub(crate) fn prioritize_vault_sweep(&self) -> VaultSweepPriority<'_> {
+        self.vault_sweep_waiters.fetch_add(1, Ordering::SeqCst);
+        VaultSweepPriority(&self.vault_sweep_waiters)
+    }
+
+    fn vault_sweep_waiting(&self) -> bool {
+        self.vault_sweep_waiters.load(Ordering::SeqCst) != 0
+    }
+
+    /// Try one custody turn for the vault's exact expired TEST clone. A busy
+    /// lock has no cleanup result and consumes none of the custody budget.
     pub(crate) fn sweep_vault_test(
         &self,
         vm: Id,
         runtime: &CandidateRuntime<'_>,
+        budget: Duration,
     ) -> Result<Option<bool>> {
-        self.sweep_vault_test_with(vm, runtime, &ClosedCustody)
+        self.sweep_vault_test_with(vm, runtime, &ClosedCustody, budget)
     }
 
     pub(crate) fn sweep_vault_test_with(
@@ -1076,12 +1111,14 @@ impl<C: Clock> VmController<C> {
         vm: Id,
         runtime: &impl ReaperRuntime,
         custody: &impl ArtifactCustody,
+        budget: Duration,
     ) -> Result<Option<bool>> {
         let mut sweeps = match self.sweeps.try_lock() {
             Ok(sweeps) => sweeps,
             Err(TryLockError::WouldBlock) => return Ok(None),
             Err(TryLockError::Poisoned(_)) => anyhow::bail!("VM reaper unavailable"),
         };
+        let deadline = self.clock.now().monotonic + budget;
         let work = self.store.transact(|db| {
             let now = utc(self.clock.now())?;
             match store::vault_test_expiry(db, vm, now)? {
@@ -1090,10 +1127,13 @@ impl<C: Clock> VmController<C> {
             }
         })?;
         let Some(mut work) = work else {
-            return Ok(self.vault_test_released(vm)?.then_some(true));
+            return Ok(Some(
+                self.vault_test_released(vm)? && self.clock.now().monotonic < deadline,
+            ));
         };
-        if !sweeps.due(work.kind, self.clock.now().monotonic) {
-            return Ok(None);
+        let now = self.clock.now().monotonic;
+        if !sweeps.due(work.kind, now) || now >= deadline {
+            return Ok(Some(false));
         }
         sweeps.observe_worker(&mut work);
         let confirmed = self.reconcile_cleanup(&mut sweeps, &work, runtime, custody)?;
@@ -1103,7 +1143,9 @@ impl<C: Clock> VmController<C> {
                 .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?
                 .custody_uncertain = true;
         }
-        Ok(Some(confirmed && self.vault_test_released(vm)?))
+        Ok(Some(
+            confirmed && self.vault_test_released(vm)? && self.clock.now().monotonic < deadline,
+        ))
     }
 
     fn reconcile_cleanup(
