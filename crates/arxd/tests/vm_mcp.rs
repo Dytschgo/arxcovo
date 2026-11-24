@@ -936,6 +936,9 @@ async fn executable_directory_overlap_is_refused() {
     assert_eq!(std::fs::read_dir(inside.path()).unwrap().count(), 0);
 }
 
+// TEST VM profile validation accepts only Windows drive-letter state roots
+// (`config.rs` `LocalPath::parse`), so this config check is Windows-only.
+#[cfg(windows)]
 #[test]
 fn multi_host_publication_config_validates_bounds_and_defaults_policy_off() {
     let (temp, owner, alternate) = private_temp();
