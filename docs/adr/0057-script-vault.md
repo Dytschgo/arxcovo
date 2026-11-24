@@ -2,8 +2,8 @@
 
 The general foreground local MCP Inventory serves caller-owned scripts. The
 authenticated principal owns its per-OS name namespace, request receipts, and
-activity entries. Only that principal can request content explicitly. HTTP,
-the installed service, and the M4 VM profile have separate authority.
+activity entries. Only that principal can request content explicitly. HTTP
+and the installed service have separate authority.
 
 The vault database follows the VM store's private path and lock checks, pinned
 SQLite main-file identity from ADR 0035, and full-sync rollback journal. It
@@ -38,3 +38,5 @@ events include full tool arguments and results, including script bytes.
 `template_tools` reports the pinned Ubuntu recipe's declared guest agent and
 the unavailable Windows recipe. Observed tools and sealed instance IDs need
 evidence from the M4 journey.
+
+The TEST VM foreground composition is specified in [ADR 0068](0068-vault-test-vm-composition.md).

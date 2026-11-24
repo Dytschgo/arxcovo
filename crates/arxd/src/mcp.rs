@@ -247,6 +247,7 @@ impl ServerHandler for Inventory {
                 &principal.0,
                 request.name.as_ref(),
                 request.arguments.unwrap_or_default(),
+                None,
             )
             .into());
         }

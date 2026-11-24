@@ -27,7 +27,10 @@ pub use windows::qualification;
 
 pub(crate) use crate::store::vm::{DashboardCatalog, DashboardVm};
 pub use controller::VmController;
-pub(crate) use controller::{ActivityReceipt, CatalogEntry, ForegroundSubject, Precheck};
+pub(crate) use controller::{
+    ActivityReceipt, CatalogEntry, ForegroundSubject, Precheck, VaultSweepPriority,
+    VaultTestCleanup,
+};
 pub use model::*;
 pub use policy::{Capacity, HostObservation, Resources, VmPolicy};
 pub use reaper::{MonotonicReaperTicks, ReaperTick};

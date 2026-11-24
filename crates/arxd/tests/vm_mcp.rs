@@ -399,6 +399,13 @@ async fn inspect_vm(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>
             "compose_down",
             "compose_status",
             "compose_logs",
+            "vault_list",
+            "vault_get",
+            "vault_add_version",
+            "vault_test_version",
+            "vault_activate",
+            "vault_history",
+            "template_tools",
         ]
     );
     let id = json!({"type":"string","pattern":"^[0-9a-f]{32}$"});
@@ -419,7 +426,7 @@ async fn inspect_vm(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>
             "required":["vm_id","snapshot_id","request_id"]
         }),
     ];
-    for (tool, mut expected) in tools.tools[18..].iter().zip(
+    for (tool, mut expected) in tools.tools[18..22].iter().zip(
         [
             &snapshot_schemas[0],
             &snapshot_schemas[1],
@@ -484,6 +491,37 @@ async fn inspect_vm(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>
             json!({"ok":false,"reason":refusal})
         );
     }
+    let key = |nonce: u8| format!("{now:016x}{nonce:016x}");
+    let add = client
+        .call_tool(
+            CallToolRequestParams::new("vault_add_version").with_arguments(
+                json!({"os":"ubuntu","name":"boundary","script":"exit 0","request_id":key(3)})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(add["ok"], true);
+    let refused = client
+        .call_tool(
+            CallToolRequestParams::new("vault_test_version").with_arguments(
+                json!({"version_id":add["version_id"],"request_id":key(4)})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.is_error, Some(true));
+    assert_eq!(
+        refused.structured_content.unwrap(),
+        json!({"ok":false,"reason":"vm_admission_closed"})
+    );
 }
 
 #[tokio::test]
@@ -671,18 +709,16 @@ async fn foreground_profile_boundaries() {
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect::<Vec<_>>();
         entries.sort();
-        // The legacy Inventory also opens the M5 vault store. The VM candidate
-        // returns before the vault opens, so it creates only its own store.
-        let expected: &[&str] = match enabled {
-            None => &[
+        assert_eq!(
+            entries,
+            [
                 "activity.lock",
                 "activity.sqlite3",
                 "vault.lock",
-                "vault.sqlite3",
+                "vault.sqlite3"
             ],
-            Some(_) => &["activity.lock", "activity.sqlite3"],
-        };
-        assert_eq!(entries, expected, "{label}: unexpected state entries");
+            "{label}: unexpected state entries"
+        );
     }
 }
 
