@@ -24,6 +24,7 @@ enum Failure {
     WindowsBootEvidenceMismatch,
     LeaseClockDisagreement,
     LeaseEndedEarly,
+    LeaseTimingInconclusive,
     Timeout(&'static str),
     Check(&'static str),
 }
@@ -255,6 +256,9 @@ fn windows_boot_witness<'a>(
 }
 
 const LEASE_CLOCK_TOLERANCE_MS: i64 = 1_000;
+const LEASE_WITNESS_TOLERANCE: Duration = Duration::from_millis(250);
+const LEASE_DENSE_WINDOW: Duration = Duration::from_secs(3);
+const LEASE_DENSE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy)]
 struct ClockSample {
@@ -302,24 +306,73 @@ impl LeaseClock {
         }
         Ok(())
     }
+}
 
-    fn observe(&self, status: &Value, now: ClockSample) -> Result<bool> {
-        self.check_clock(now)?;
+struct LeaseWatch<'a> {
+    clock: &'a LeaseClock,
+    last_stopped_request: Option<Instant>,
+}
+
+impl<'a> LeaseWatch<'a> {
+    fn new(clock: &'a LeaseClock) -> Self {
+        Self {
+            clock,
+            last_stopped_request: None,
+        }
+    }
+
+    fn has_deadline_witness(&self) -> bool {
+        self.last_stopped_request.is_some_and(|sent| {
+            self.clock
+                .monotonic_deadline
+                .saturating_duration_since(sent)
+                <= LEASE_WITNESS_TOLERANCE
+        })
+    }
+
+    fn next_poll(&self, sent: Instant, normal_interval: Duration) -> Instant {
+        let deadline = self.clock.monotonic_deadline;
+        let dense_from = deadline - LEASE_DENSE_WINDOW;
+        if sent < dense_from {
+            (sent + normal_interval).min(dense_from)
+        } else if sent < deadline {
+            (sent + LEASE_DENSE_INTERVAL).min(deadline)
+        } else {
+            sent + normal_interval
+        }
+    }
+
+    fn observe(
+        &mut self,
+        status: &Value,
+        sent: ClockSample,
+        received: ClockSample,
+    ) -> Result<bool> {
+        self.clock.check_clock(sent)?;
+        self.clock.check_clock(received)?;
         match status["state"].as_str() {
             Some("stopped") => {
                 check(
-                    status["expires_at_ms"] == self.utc_deadline,
+                    status["expires_at_ms"] == self.clock.utc_deadline,
                     "lease_changed",
                 )?;
+                // The daemon may have sampled anywhere between the send
+                // and receipt. Only the send time is a safe lower bound.
+                self.last_stopped_request = Some(sent.monotonic);
                 Ok(false)
             }
             Some(state @ ("expired" | "teardown")) => {
-                if now.utc_ms < self.utc_deadline || now.monotonic < self.monotonic_deadline {
+                if received.utc_ms < self.clock.utc_deadline
+                    || received.monotonic < self.clock.monotonic_deadline
+                {
                     return Err(Failure::LeaseEndedEarly);
+                }
+                if !self.has_deadline_witness() {
+                    return Err(Failure::LeaseTimingInconclusive);
                 }
                 if state == "teardown" {
                     check(
-                        status["expires_at_ms"] == self.utc_deadline,
+                        status["expires_at_ms"] == self.clock.utc_deadline,
                         "lease_changed",
                     )?;
                 }
@@ -619,33 +672,132 @@ fn lease_refuses_clock_steps_early_teardown_and_changed_deadline() {
         utc_ms,
         monotonic: origin.monotonic + Duration::from_secs(elapsed),
     };
+    let mut watch = LeaseWatch::new(&lease);
+    let mut observe = |status: &Value, at| watch.observe(status, at, at);
     let live = json!({"state":"stopped","expires_at_ms":160_000});
     let expired = json!({"state":"expired"});
     let teardown = json!({"state":"teardown","expires_at_ms":160_000});
-    assert_eq!(lease.observe(&live, now(10, 110_000)), Ok(false));
+    assert_eq!(observe(&live, now(10, 110_000)), Ok(false));
     assert_eq!(
-        lease.observe(&expired, now(10, 160_000)),
+        observe(&expired, now(10, 160_000)),
         Err(Failure::LeaseClockDisagreement)
     );
     assert_eq!(
-        lease.observe(&live, now(10, 108_000)),
+        observe(&live, now(10, 108_000)),
         Err(Failure::LeaseClockDisagreement)
     );
     assert_eq!(
-        lease.observe(&expired, now(10, 110_000)),
+        observe(&expired, now(10, 110_000)),
         Err(Failure::LeaseEndedEarly)
     );
     assert_eq!(
-        lease.observe(&teardown, now(59, 159_000)),
+        observe(&teardown, now(59, 159_000)),
         Err(Failure::LeaseEndedEarly)
     );
-    assert_eq!(lease.observe(&teardown, now(61, 161_000)), Ok(false));
-    assert_eq!(lease.observe(&expired, now(61, 161_000)), Ok(true));
+    assert_eq!(observe(&live, now(60, 160_000)), Ok(false));
+    assert_eq!(observe(&teardown, now(61, 161_000)), Ok(false));
+    assert_eq!(observe(&expired, now(61, 161_000)), Ok(true));
     assert_eq!(
-        lease.observe(
+        observe(
             &json!({"state":"stopped","expires_at_ms":160_001}),
             now(10, 110_000)
         ),
         Err(Failure::Check("lease_changed"))
     );
+}
+
+fn lease_timing_fixture() -> LeaseClock {
+    LeaseClock::new(
+        ClockSample {
+            utc_ms: 100_000,
+            monotonic: Instant::now(),
+        },
+        160_000,
+        Duration::from_secs(60),
+        Duration::from_secs(15),
+    )
+    .unwrap()
+}
+
+fn lease_sample(lease: &LeaseClock, elapsed_ms: u64, utc_step_ms: i64) -> ClockSample {
+    ClockSample {
+        utc_ms: lease.origin.utc_ms + elapsed_ms as i64 + utc_step_ms,
+        monotonic: lease.origin.monotonic + Duration::from_millis(elapsed_ms),
+    }
+}
+
+#[test]
+fn lease_rejects_expiry_during_an_unobserved_utc_step() {
+    let lease = lease_timing_fixture();
+    let mut watch = LeaseWatch::new(&lease);
+    let last_live = lease_sample(&lease, 58_500, 0);
+    let live = json!({"state":"stopped","expires_at_ms":lease.utc_deadline});
+    assert_eq!(watch.observe(&live, last_live, last_live), Ok(false));
+
+    // The daemon expires the VM at t=59 s under a transient +1.1 s UTC
+    // step. The client samples neither the step nor the early transition.
+    let stepped = lease_sample(&lease, 59_000, 1_100);
+    assert_eq!(
+        lease.check_clock(stepped),
+        Err(Failure::LeaseClockDisagreement)
+    );
+    let expired = json!({"state":"expired","expired_at_ms":stepped.utc_ms,"cleanup":"confirmed"});
+    let after_revert = lease_sample(&lease, 60_500, 0);
+    assert!(stepped.utc_ms >= lease.utc_deadline && stepped.utc_ms <= after_revert.utc_ms);
+    assert_eq!(
+        watch.observe(&expired, after_revert, after_revert),
+        Err(Failure::LeaseTimingInconclusive)
+    );
+}
+
+#[test]
+fn lease_accepts_on_time_expiry_after_a_timely_stopped_observation() {
+    let lease = lease_timing_fixture();
+    let mut watch = LeaseWatch::new(&lease);
+    let live = json!({"state":"stopped","expires_at_ms":lease.utc_deadline});
+    let sent = lease_sample(&lease, 59_750, 0);
+    let received = lease_sample(&lease, 59_800, 0);
+    assert_eq!(watch.observe(&live, sent, received), Ok(false));
+    let due = lease_sample(&lease, 60_000, 0);
+    assert_eq!(
+        watch.observe(
+            &json!({"state":"teardown","expires_at_ms":lease.utc_deadline}),
+            due,
+            due
+        ),
+        Ok(false)
+    );
+    let later = lease_sample(&lease, 61_000, 0);
+    assert_eq!(
+        watch.observe(&json!({"state":"expired"}), later, later),
+        Ok(true)
+    );
+}
+
+#[test]
+fn lease_refuses_an_observation_gap_even_if_a_stale_stopped_reply_arrives_late() {
+    let lease = lease_timing_fixture();
+    let mut watch = LeaseWatch::new(&lease);
+    let sent = lease_sample(&lease, 59_749, 0);
+    let received = lease_sample(&lease, 59_900, 0);
+    let live = json!({"state":"stopped","expires_at_ms":lease.utc_deadline});
+    assert_eq!(watch.observe(&live, sent, received), Ok(false));
+    let later = lease_sample(&lease, 60_500, 0);
+    assert_eq!(
+        watch.observe(&json!({"state":"expired"}), later, later),
+        Err(Failure::LeaseTimingInconclusive)
+    );
+}
+
+#[test]
+fn lease_polling_enters_and_leaves_the_dense_window_at_known_times() {
+    let lease = lease_timing_fixture();
+    let watch = LeaseWatch::new(&lease);
+    let at = |ms| lease_sample(&lease, ms, 0).monotonic;
+    let normal = Duration::from_secs(2);
+    assert_eq!(watch.next_poll(at(50_000), normal), at(52_000));
+    assert_eq!(watch.next_poll(at(56_500), normal), at(57_000));
+    assert_eq!(watch.next_poll(at(57_000), normal), at(57_100));
+    assert_eq!(watch.next_poll(at(59_950), normal), at(60_000));
+    assert_eq!(watch.next_poll(at(60_000), normal), at(62_000));
 }

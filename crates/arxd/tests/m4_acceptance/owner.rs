@@ -500,19 +500,33 @@ impl Acceptance<'_> {
         )
     }
 
+    async fn observe_lease(
+        &self,
+        vm: &Vm,
+        watch: &mut LeaseWatch<'_>,
+        sent: ClockSample,
+    ) -> Result<(Value, bool)> {
+        vm.lease.check_clock(sent)?;
+        let status = self.vm(vm.id).await.map_err(|failure| match failure {
+            Failure::Timeout(_) => Failure::LeaseTimingInconclusive,
+            other => other,
+        })?;
+        let expired = watch.observe(&status, sent, clock_sample()?)?;
+        Ok((status, expired))
+    }
+
     async fn expiry(&mut self, vm: &Vm, extra: Option<&Pair>, later: Option<&Vm>) -> Result<i64> {
-        // Poll through the lease. Keep the two stopped VMs under observation
-        // while waiting for Ubuntu so an early Windows expiry also fails.
         let cutoff = vm.lease.monotonic_deadline + EXPIRY_GRACE;
-        let tombstone = timeout_at(cutoff, async {
+        let mut watch = LeaseWatch::new(&vm.lease);
+        let mut later = later.map(|vm| (vm, LeaseWatch::new(&vm.lease)));
+        let observed = timeout_at(cutoff, async {
             loop {
-                vm.lease.check_clock(clock_sample()?)?;
-                let status = self.vm(vm.id).await?;
-                let expired = vm.lease.observe(&status, clock_sample()?)?;
-                if let Some(later) = later {
-                    later.lease.check_clock(clock_sample()?)?;
-                    let later_status = self.vm(later.id).await?;
-                    later.lease.observe(&later_status, clock_sample()?)?;
+                let sent = clock_sample()?;
+                let (status, expired) = self.observe_lease(vm, &mut watch, sent).await?;
+                if let Some((later_vm, later_watch)) = &mut later {
+                    let (later_status, _) = self
+                        .observe_lease(later_vm, later_watch, clock_sample()?)
+                        .await?;
                     check(
                         later_status["state"] == "stopped",
                         "later_lease_not_stopped",
@@ -521,11 +535,17 @@ impl Acceptance<'_> {
                 if expired {
                     return Ok(status);
                 }
-                sleep(TICK).await;
+                tokio::time::sleep_until(watch.next_poll(sent.monotonic, TICK)).await;
             }
         })
-        .await
-        .map_err(|_| Failure::Timeout("lease_sweep"))??;
+        .await;
+        let tombstone = observed.map_err(|_| {
+            if watch.has_deadline_witness() {
+                Failure::Timeout("lease_sweep")
+            } else {
+                Failure::LeaseTimingInconclusive
+            }
+        })??;
         let activity = tombstone["cleanup_activity_id"]
             .as_i64()
             .filter(|n| *n > 0)
@@ -563,7 +583,8 @@ impl Acceptance<'_> {
             "daemon_expiry",
             json!({"vm_id":hex::encode(vm.id),"activity_id":activity,
             "deadline_ms":vm.deadline,"expired_at_ms":expired,"charges":charge.evidence(),
-            "tombstone_and_physical_cleanup_confirmed":true}),
+            "tombstone_and_physical_cleanup_confirmed":true,
+            "live_observation_tolerance_ms":LEASE_WITNESS_TOLERANCE.as_millis()}),
         );
         Ok(activity)
     }

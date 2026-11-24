@@ -52,9 +52,14 @@ The journey checks tool schemas and admission, selects or builds both qualified
 goldens, and checks the clone pairs under 30-minute Ubuntu and 40-minute Windows
 leases. The client polls both leases during the Ubuntu expiry wait and continues
 polling Windows through its expiry. It rejects early teardown or more than one
-second of disagreement between UTC and monotonic elapsed time. Each expiry wait
-ends at the monotonic deadline plus three minutes. Boots
-run sequentially. The Ubuntu guest changes only a disposable marker and returns
+second of disagreement between UTC and monotonic elapsed time. During the final
+three seconds it schedules polls 100 ms apart. An expiry also requires a stopped
+reply to a request sent no earlier than 250 ms before the monotonic deadline.
+Using the request start gives a conservative lower bound on when the daemon
+observed the stopped VM. An observation gap or stalled read can cause
+`lease_timing_inconclusive`. The remaining early-expiry tolerance is 250 ms
+relative to the monotonic deadline, and each wait ends by that deadline plus
+three minutes. Boots run sequentially. The Ubuntu guest changes only a disposable marker and returns
 exit 7 before offline restore replaces the generation. The foreground's normal
 sweep retires the old pair and expires the live pairs and the TEST snapshot. The
 client checks the restored bytes, fresh boot and original marker before verifying
