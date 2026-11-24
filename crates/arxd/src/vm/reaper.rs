@@ -1246,4 +1246,146 @@ mod reaper_tests {
         assert_eq!(f.count("SELECT count(*) FROM vm_disk_claims"), 1);
         f.assert_pair(pair, true);
     }
+
+    #[test]
+    fn snapshot_retire_sql_settlement_failure_keeps_claim_armed_and_retries_after_backoff() {
+        let f = Fixture::new();
+        let golden = f.build(1, true);
+        let (vm, active_slots) = f.clone(golden, 2, true);
+        let stage_copy = |work: &store::snapshot::Work, worker: &PendingOperation| {
+            let slots = work.candidate.unwrap();
+            let mut proof = Vec::new();
+            for slot in [slots.disk, slots.vars] {
+                f.ctl.snapshot_leaf_begin(worker, work, slot).unwrap();
+                let ev = f.custody.stage(slot, b"clone").unwrap();
+                f.ctl
+                    .snapshot_leaf_identity(worker, work, slot, ev.identity, ev.directory)
+                    .unwrap();
+                f.ctl
+                    .snapshot_leaf_complete(worker, work, slot, ev)
+                    .unwrap();
+                proof.push(ev);
+            }
+            f.ctl
+                .finish_snapshot_copy(
+                    worker,
+                    work,
+                    [proof[0], proof[1]],
+                    None,
+                    host(),
+                    resources(),
+                )
+                .unwrap();
+        };
+
+        let (create_work, create_worker, _) = f
+            .ctl
+            .admit_snapshot(
+                OWNER,
+                key(NOW, 10),
+                vm,
+                Action::Snapshot as i64,
+                &snapshot::Request::Create(None),
+                None,
+                host(),
+                resources(),
+            )
+            .unwrap()
+            .unwrap();
+        stage_copy(&create_work, &create_worker);
+        let point = create_work.target;
+
+        let (restore_work, restore_worker, _) = f
+            .ctl
+            .admit_snapshot(
+                OWNER,
+                key(NOW, 11),
+                vm,
+                Action::Restore as i64,
+                &snapshot::Request::Restore(point),
+                None,
+                host(),
+                resources(),
+            )
+            .unwrap()
+            .unwrap();
+        stage_copy(&restore_work, &restore_worker);
+        assert_eq!(
+            f.count("SELECT count(*) FROM vm_snapshot_work WHERE phase='retire'"),
+            1
+        );
+        let bytes_before = f
+            .ctl
+            .reaper_test_store()
+            .transact(|db| store::disk_bytes(db))
+            .unwrap()
+            .unwrap();
+
+        // Fail the SQL settlement transaction after physical disposal succeeds.
+        f.ctl
+            .reaper_test_store()
+            .transact(|db| {
+                db.execute_batch(
+                    "CREATE TRIGGER fail_retire_settle BEFORE DELETE ON vm_snapshot_work
+                     BEGIN SELECT RAISE(ABORT,'transient sql failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        f.sweep(&Runtime::new(offline));
+        f.assert_pair(active_slots, false);
+        assert_eq!(
+            f.count("SELECT count(*) FROM vm_snapshot_work WHERE phase='retire'"),
+            1
+        );
+        assert_eq!(
+            f.count("SELECT count(*) FROM vm_snapshot_reconciliation"),
+            0
+        );
+        assert_eq!(
+            f.ctl
+                .reaper_test_store()
+                .transact(|db| store::disk_bytes(db))
+                .unwrap()
+                .unwrap(),
+            bytes_before
+        );
+
+        // Remove the fault. A sweep before backoff elapses leaves the claim armed.
+        f.ctl
+            .reaper_test_store()
+            .transact(|db| {
+                db.execute_batch("DROP TRIGGER fail_retire_settle;")?;
+                Ok(())
+            })
+            .unwrap();
+        f.sweep(&Runtime::new(offline));
+        assert_eq!(
+            f.count("SELECT count(*) FROM vm_snapshot_work WHERE phase='retire'"),
+            1
+        );
+
+        // Advance past backoff: the next eligible turn proves disposed files
+        // absent and settles the claim and correlated daemon receipt once.
+        f.clock.set(NOW + 10_000, 10);
+        f.sweep(&Runtime::new(offline));
+        assert_eq!(f.count("SELECT count(*) FROM vm_snapshot_work"), 0);
+        assert_eq!(
+            f.count(
+                "SELECT count(*) FROM vm_snapshot_reconciliation r
+                 JOIN activity a ON a.id=r.activity_id
+                 WHERE r.cause='retired' AND a.action=19 AND a.actor='daemon'
+                   AND a.status=1 AND a.cleanup_confirmed=1"
+            ),
+            1
+        );
+        assert!(
+            f.ctl
+                .reaper_test_store()
+                .transact(|db| store::disk_bytes(db))
+                .unwrap()
+                .unwrap()
+                < bytes_before
+        );
+    }
 }

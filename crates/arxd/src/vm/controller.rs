@@ -2172,23 +2172,6 @@ impl<C: Clock> VmController<C> {
         })
     }
 
-    pub(crate) fn prove_dirty_release(
-        &self,
-        vm: Id,
-        epoch: Id,
-        pair: store::snapshot::Pair,
-    ) -> Result<()> {
-        self.store.transact(|db| {
-            store::snapshot::prove_stop(
-                db,
-                vm,
-                epoch,
-                pair,
-                super::runtime::StopDisposition::DirtyRelease,
-            )
-        })
-    }
-
     pub(crate) fn active_release_epoch(&self, vm: Id, is_static: bool) -> Result<Option<(Id, Id)>> {
         self.store
             .transact(|db| store::snapshot::active_release_epoch(db, vm, is_static))
@@ -2347,6 +2330,17 @@ impl<C: Clock> VmController<C> {
         })
     }
 
+    pub(crate) fn snapshot_leaf_begin(
+        &self,
+        worker: &PendingOperation,
+        work: &store::snapshot::Work,
+        slot: ArtifactSlot,
+    ) -> Result<()> {
+        self.check_snapshot_worker(worker, work)?;
+        self.store
+            .transact(|db| store::snapshot::begin_leaf_create(db, work, slot))
+    }
+
     pub(crate) fn snapshot_leaf_identity(
         &self,
         worker: &PendingOperation,
@@ -2378,10 +2372,22 @@ impl<C: Clock> VmController<C> {
         work: &store::snapshot::Work,
         pair: [ArtifactEvidence; 2],
         route: Option<&super::runtime::publication::SnapshotRoute>,
+        host: HostObservation,
+        resources: Resources,
     ) -> Result<()> {
         self.check_snapshot_worker(worker, work)?;
-        self.store
-            .transact(|db| store::snapshot::commit(db, work, pair, utc(self.clock.now())?, route))
+        self.store.transact(|db| {
+            let capacity = self
+                .policy
+                .host(host, resources)
+                .map_err(|_| anyhow::anyhow!("snapshot owner reserve crossed"))?;
+            ensure!(
+                self.validate_disk(db, capacity, DiskClaim::default())?
+                    .is_ok(),
+                "snapshot disk reserve crossed"
+            );
+            store::snapshot::commit(db, work, pair, utc(self.clock.now())?, route)
+        })
     }
 
     pub(crate) fn fail_snapshot_copy(

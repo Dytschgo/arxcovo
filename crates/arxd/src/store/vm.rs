@@ -1826,10 +1826,12 @@ pub(crate) fn settle_clone(
 fn abandon_inactive(db: &Connection, generation: Option<Id>) -> Result<()> {
     // Identity is custody evidence, never evidence that a process exited.
     // Keep every charge and never publish an incomplete generation.
+    // Typed snapshot candidates keep their own durable leaf classification.
     db.execute(
         "UPDATE vm_artifacts SET state=CASE WHEN state='identified' THEN 'pending_disposal' ELSE 'quarantined' END
          WHERE state IN ('planned','created','identified') AND generation_id IN
-            (SELECT id FROM vm_generations WHERE active=0 AND static_id IS NULL AND (?1 IS NULL OR id=?1))",
+            (SELECT id FROM vm_generations WHERE active=0 AND static_id IS NULL AND (?1 IS NULL OR id=?1)
+             AND id NOT IN (SELECT candidate FROM vm_snapshot_work WHERE candidate IS NOT NULL))",
         [generation],
     )?;
     Ok(())
@@ -2376,8 +2378,10 @@ pub(crate) fn settle_cleanup(
         }
         return Ok(false);
     }
-    let confirmed =
-        outcome.released && outcome.disposed && current.accounted && current.artifacts == work.artifacts;
+    let confirmed = outcome.released
+        && outcome.disposed
+        && current.accounted
+        && current.artifacts == work.artifacts;
     if let Some(vm) = work.kind.vm() {
         interrupt_pending(db, vm, now, confirmed)?;
     }
@@ -3053,6 +3057,237 @@ mod tests {
         for version in [9, 10] {
             verify_v11_upgrade(version);
         }
+    }
+
+    #[test]
+    fn v11_direct_v10_rollback_retry_nonempty_v0_and_v10_opener_refusal() {
+        // 1. Nonempty version-0 database is refused without altering bytes.
+        let dir0 = private_temp();
+        let path0 = dir0.path().join("activity.sqlite3");
+        {
+            let db = Connection::open(&path0).unwrap();
+            db.execute_batch("CREATE TABLE stray(x INTEGER);").unwrap();
+        }
+        let before0 = fs::read(&path0).unwrap();
+        assert!(VmStore::open(dir0.path(), NOW).is_err());
+        assert_eq!(fs::read(&path0).unwrap(), before0);
+
+        // 2. Direct populated v10 -> v11 rolls back on failure and retries cleanly.
+        let dir = private_temp();
+        let db = v6_fixture(dir.path());
+        db.execute_batch(MIGRATE_V7).unwrap();
+        db.execute_batch(MIGRATE_V8).unwrap();
+        db.execute_batch(MIGRATE_V9).unwrap();
+        let vm = [0x73; 16];
+        let slots = static_fixture(&db, vm, "rollback-site").unwrap();
+        commit_static(&db, vm, slots, 1).unwrap();
+        let generation: Id = db
+            .query_row(
+                "SELECT id FROM vm_generations WHERE static_id=?1 AND active=1",
+                [vm],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let binding = Binding {
+            principal: "alice",
+            key: RequestId {
+                key: [0x19; 16],
+                issued_at_ms: NOW,
+            },
+            subject: Subject::Vm(vm),
+            action: Action::Start as i64,
+        };
+        let recorded = binding.record(&db, NOW, Some(vm), None).unwrap();
+        finish(
+            &db,
+            recorded.receipt.activity_id,
+            Status::Failed,
+            NOW,
+            Some(true),
+        )
+        .unwrap();
+        db.execute_batch(
+            "UPDATE sqlite_sequence SET seq=900 WHERE name='activity'; PRAGMA user_version=9;",
+        )
+        .unwrap();
+        db.execute_batch(publish::MIGRATE_V10).unwrap();
+        db.pragma_update(None, "user_version", 10).unwrap();
+        db.execute(
+            "INSERT INTO vm_publication(singleton,vm,generation,boot,revision,hostname,
+                 tunnel,zone,credential_ref,nonce,phase,post_possible)
+             VALUES(1,?1,?2,zeroblob(16),zeroblob(32),'rollback.example.invalid',
+                 '00000000-0000-0000-0000-000000000001',?3,'fixture.dpapi',?4,'publishing',1)",
+            params![vm, generation, "a".repeat(32), "b".repeat(32)],
+        )
+        .unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_v11_upgrade BEFORE UPDATE ON vm_static_instances
+             BEGIN SELECT RAISE(ABORT,'injected v11 upgrade failure'); END;",
+        )
+        .unwrap();
+        let expected_ledger = ledger_ids(&db).unwrap();
+        drop(db);
+
+        assert!(VmStore::open(dir.path(), NOW).is_err());
+        {
+            let db = Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+            assert_eq!(count(&db, "PRAGMA user_version", []).unwrap(), 10);
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT count(*) FROM sqlite_schema WHERE name='vm_restore_points'",
+                    []
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                count(&db, "SELECT count(*) FROM vm_publication", []).unwrap(),
+                1
+            );
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT seq FROM sqlite_sequence WHERE name='activity'",
+                    []
+                )
+                .unwrap(),
+                900
+            );
+            db.execute_batch("DROP TRIGGER fail_v11_upgrade;").unwrap();
+        }
+
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store
+            .transact(|db| {
+                assert_eq!(count(db, "PRAGMA user_version", [])?, 11);
+                assert_eq!(
+                    db.query_row(
+                        "SELECT origin_generation FROM vm_static_instances WHERE id=?1",
+                        [vm],
+                        |row| row.get::<_, Id>(0)
+                    )?,
+                    generation
+                );
+                assert_eq!(ledger_ids(db)?, expected_ledger);
+                assert_eq!(
+                    count(
+                        db,
+                        "SELECT seq FROM sqlite_sequence WHERE name='activity'",
+                        []
+                    )?,
+                    900
+                );
+                assert!(
+                    publish::current(db)?.expect("v10 route retained").phase
+                        == publish::Phase::CleanupPending
+                );
+                assert_eq!(
+                    count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        // 3. A v10 opener refuses a copy of the migrated v11 database without altering bytes.
+        let copy_dir = private_temp();
+        let copy_path = copy_dir.path().join("activity.sqlite3");
+        fs::copy(dir.path().join("activity.sqlite3"), &copy_path).unwrap();
+        let before_copy = fs::read(&copy_path).unwrap();
+        {
+            let db =
+                Connection::open_with_flags(&copy_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let version: u32 = db
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 11);
+            // Exact v10 VmStore::open and DashboardCatalog::open version gates.
+            assert!(!matches!(version, 0 | 5..=10));
+            assert_ne!(version, 10);
+        }
+        assert_eq!(fs::read(&copy_path).unwrap(), before_copy);
+    }
+
+    #[test]
+    fn legacy_snapshot_5_6_keys_collide_with_typed_bindings_without_promotion() {
+        let dir = private_temp();
+        let store = VmStore::open(dir.path(), NOW).unwrap();
+        store
+            .transact(|db| {
+                let template = [0x41; 16];
+                let vm = [0x42; 16];
+                let legacy_snap = [0x43; 16];
+                db.execute(
+                    "INSERT INTO vm_templates VALUES(?1,1,zeroblob(32),zeroblob(32),zeroblob(32),1024)",
+                    [template],
+                )?;
+                db.execute(
+                    "INSERT INTO vm_instances(id,template,principal,expires_ms,state)
+                     VALUES(?1,?2,'alice',?3,1)",
+                    params![vm, template, NOW + 60_000],
+                )?;
+                db.execute(
+                    "INSERT INTO vm_snapshots(vm,id,ready,dashboard_created_ms) VALUES(?1,?2,1,?3)",
+                    params![vm, legacy_snap, NOW],
+                )?;
+                let key5 = RequestId {
+                    key: [0x55; 16],
+                    issued_at_ms: NOW,
+                };
+                let key6 = RequestId {
+                    key: [0x56; 16],
+                    issued_at_ms: NOW,
+                };
+                let legacy5 = Binding {
+                    principal: "alice",
+                    key: key5,
+                    subject: Subject::Vm(vm),
+                    action: Action::Snapshot as i64,
+                };
+                let op5 = legacy5.record(db, NOW, Some(vm), None)?;
+                db.execute(
+                    "INSERT INTO vm_disk_claims(activity_id,vm,snapshot,persistent,staging)
+                     VALUES(?1,?2,?3,4096,0)",
+                    params![op5.receipt.activity_id, vm, legacy_snap],
+                )?;
+                finish(db, op5.receipt.activity_id, Status::Succeeded, NOW, Some(true))?;
+                let legacy6 = Binding {
+                    principal: "alice",
+                    key: key6,
+                    subject: Subject::Vm(vm),
+                    action: Action::Restore as i64,
+                };
+                let op6 = legacy6.record(db, NOW, Some(vm), None)?;
+                finish(db, op6.receipt.activity_id, Status::Succeeded, NOW, Some(true))?;
+
+                let bytes_before = disk_bytes(db)?;
+                let typed5 = Binding {
+                    principal: "alice",
+                    key: key5,
+                    subject: crate::vm::snapshot::Request::Create(None).binding(vm),
+                    action: Action::Snapshot as i64,
+                };
+                assert!(matches!(
+                    typed5.replay(db, NOW, false)?,
+                    Err(Refusal::KeyCollision)
+                ));
+                let typed6 = Binding {
+                    principal: "alice",
+                    key: key6,
+                    subject: crate::vm::snapshot::Request::Restore(legacy_snap).binding(vm),
+                    action: Action::Restore as i64,
+                };
+                assert!(matches!(
+                    typed6.replay(db, NOW, false)?,
+                    Err(Refusal::KeyCollision)
+                ));
+                assert!(snapshot::list(db, "alice", vm, None, 4)?.unwrap().is_empty());
+                assert_eq!(disk_bytes(db)?, bytes_before);
+                Ok(())
+            })
+            .unwrap();
     }
 
     fn verify_v11_upgrade(version: u32) {

@@ -157,6 +157,7 @@ CREATE TABLE vm_snapshot_work (
     phase TEXT NOT NULL CHECK(phase IN ('copy','delete','abandoned','retire')),
     persistent INTEGER NOT NULL CHECK(persistent>=0),
     staging INTEGER NOT NULL CHECK(staging>=0),
+    quarantine_audited INTEGER NOT NULL DEFAULT 0 CHECK(quarantine_audited IN (0,1)),
     CHECK((vm IS NOT NULL)+(static_vm IS NOT NULL)=1),
     CHECK((action=18)=(phase='delete')),
     CHECK((candidate IS NULL)=(phase IN ('delete','retire'))),
@@ -172,6 +173,16 @@ CREATE TABLE vm_snapshot_expiry (
     generation BLOB NOT NULL UNIQUE REFERENCES vm_generations(id),
     expiry INTEGER NOT NULL,
     PRIMARY KEY(vm,generation)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE vm_snapshot_reconciliation (
+    activity_id INTEGER PRIMARY KEY REFERENCES activity(id) ON DELETE CASCADE,
+    vm BLOB NOT NULL CHECK(length(vm)=16),
+    generation BLOB NOT NULL CHECK(length(generation)=16),
+    source_activity INTEGER CHECK(source_activity>0),
+    expiry_activity INTEGER CHECK(expiry_activity>0),
+    cause TEXT NOT NULL CHECK(cause IN
+        ('retired','abandoned','orphan_copy','expiry_point','quarantined'))
 ) STRICT, WITHOUT ROWID;
 
 ";
@@ -381,9 +392,14 @@ pub(super) fn recover(db: &Connection, now: i64) -> Result<()> {
 }
 
 pub(super) fn abandon_copies(db: &Connection, vm: Option<Id>) -> Result<()> {
+    // Preserve provably untouched ('planned', no file_id) leaves; only leaves
+    // whose create attempt crossed the durable pre-create boundary ('created')
+    // without recording a file identity become quarantined.
     db.execute(
-        "UPDATE vm_artifacts SET state=CASE WHEN file_id IS NULL THEN 'quarantined'
-            ELSE 'pending_disposal' END
+        "UPDATE vm_artifacts SET state=CASE
+            WHEN state='planned' AND file_id IS NULL THEN 'planned'
+            WHEN file_id IS NOT NULL THEN 'pending_disposal'
+            ELSE 'quarantined' END
          WHERE generation_id IN (SELECT candidate FROM vm_snapshot_work
             WHERE phase='copy' AND (?1 IS NULL OR vm=?1))",
         [vm],
@@ -457,12 +473,16 @@ struct CleanupAuthority {
     point: Option<Id>,
     is_static: bool,
     phase: String,
+    expiry: Option<i64>,
+    quarantine_audited: bool,
 }
 
 fn cleanup_authority(db: &Connection, vm: Id, generation: Id) -> Result<Option<CleanupAuthority>> {
     Ok(db.query_row(
         "SELECT w.activity,
-             CASE WHEN w.phase='delete' THEN w.target END, w.static_vm IS NOT NULL,w.phase
+             CASE WHEN w.phase='delete' THEN w.target END, w.static_vm IS NOT NULL, w.phase,
+             (SELECT expiry FROM vm_snapshot_expiry WHERE vm=w.vm AND generation=g.id),
+             w.quarantine_audited
          FROM vm_snapshot_work w JOIN vm_generations g ON g.id=?2 AND g.active=0
          WHERE (
             (w.vm=?1 AND g.vm_id=?1 AND (
@@ -474,7 +494,7 @@ fn cleanup_authority(db: &Connection, vm: Id, generation: Id) -> Result<Option<C
             OR (w.static_vm=?1 AND g.static_id=?1 AND w.phase IN ('copy','abandoned') AND w.candidate=g.id))
            AND (w.phase='delete' OR NOT EXISTS(SELECT 1 FROM vm_restore_points WHERE generation=g.id))
          UNION ALL
-         SELECT NULL,p.id,0,'expiry'
+         SELECT NULL,p.id,0,'expiry',e.expiry,0
          FROM vm_snapshot_expiry e JOIN vm_instances v ON v.id=e.vm
          JOIN vm_generations g ON g.id=e.generation AND g.vm_id=e.vm AND g.active=0
          JOIN vm_restore_points p ON p.vm=e.vm AND p.generation=g.id
@@ -483,7 +503,12 @@ fn cleanup_authority(db: &Connection, vm: Id, generation: Id) -> Result<Option<C
            AND NOT EXISTS(SELECT 1 FROM vm_snapshot_work w WHERE w.vm=e.vm)",
         params![vm, generation],
         |row| Ok(CleanupAuthority {
-            activity: row.get(0)?, point: row.get(1)?, is_static: row.get(2)?, phase: row.get(3)?,
+            activity: row.get(0)?,
+            point: row.get(1)?,
+            is_static: row.get(2)?,
+            phase: row.get(3)?,
+            expiry: row.get(4)?,
+            quarantine_audited: row.get(5)?,
         }),
     ).optional()?)
 }
@@ -542,11 +567,13 @@ pub(super) fn cleanup_work(
                     if state == "planned"
                         && leaf.directory.is_none()
                         && leaf.identity.is_none() => {}
-                "copy"
-                    if matches!(state.as_str(), "created" | "identified") && identified =>
-                {
+                "copy" if matches!(state.as_str(), "created" | "identified") && identified => {
                     artifacts.push(leaf);
                 }
+                "copy"
+                    if state == "planned"
+                        && leaf.directory.is_none()
+                        && leaf.identity.is_none() => {}
                 _ => {
                     accounted = false;
                     break;
@@ -561,6 +588,91 @@ pub(super) fn cleanup_work(
         accounted,
         release_only: false,
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_reconciliation(
+    db: &Connection,
+    vm: Id,
+    generation: Id,
+    source_activity: Option<i64>,
+    expiry_activity: Option<i64>,
+    cause: &str,
+    now: i64,
+    succeeded: bool,
+) -> Result<()> {
+    db.execute(
+        "INSERT INTO activity(principal,actor,vm_owner,vm,action,started_ms)
+         SELECT 'arxd','daemon',principal,id,19,?2 FROM vm_instances WHERE id=?1
+         UNION ALL
+         SELECT 'arxd','daemon',principal,id,19,?2 FROM vm_static_instances WHERE id=?1",
+        params![vm, now],
+    )?;
+    let activity_id = db.last_insert_rowid();
+    db.execute(
+        "INSERT INTO vm_snapshot_reconciliation(
+            activity_id,vm,generation,source_activity,expiry_activity,cause)
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            activity_id,
+            vm,
+            generation,
+            source_activity,
+            expiry_activity,
+            cause
+        ],
+    )?;
+    finish(
+        db,
+        activity_id,
+        if succeeded {
+            Status::Succeeded
+        } else {
+            Status::Failed
+        },
+        now,
+        Some(succeeded),
+    )
+}
+
+fn audit_quarantine_once(
+    db: &Connection,
+    authority: &CleanupAuthority,
+    vm: Id,
+    generation: Id,
+    now: i64,
+) -> Result<()> {
+    let Some(activity) = authority.activity else {
+        return Ok(());
+    };
+    if authority.quarantine_audited {
+        return Ok(());
+    }
+    if count(
+        db,
+        "SELECT count(*) FROM vm_artifacts WHERE generation_id=?1 AND state='quarantined'",
+        [generation],
+    )? == 0
+    {
+        return Ok(());
+    }
+    if db.execute(
+        "UPDATE vm_snapshot_work SET quarantine_audited=1 WHERE activity=?1 AND quarantine_audited=0",
+        [activity],
+    )? == 1
+    {
+        record_reconciliation(
+            db,
+            vm,
+            generation,
+            Some(activity),
+            authority.expiry,
+            "quarantined",
+            now,
+            false,
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn settle_cleanup(
@@ -593,11 +705,14 @@ pub(super) fn settle_cleanup(
             finish(db, activity, Status::Interrupted, now, Some(false))?;
         }
         if !(outcome.disposed && current.accounted && current.artifacts == work.artifacts) {
-            // Unidentified leaves stay quarantined; identified leaves move to
-            // pending_disposal for retry on the next turn.
+            // Preserve untouched ('planned') leaves, move identified leaves to
+            // pending_disposal, and quarantine attempted-without-identity leaves.
             db.execute(
-                "UPDATE vm_artifacts SET state=CASE WHEN file_id IS NULL THEN 'quarantined'
-                    ELSE 'pending_disposal' END WHERE generation_id=?1",
+                "UPDATE vm_artifacts SET state=CASE
+                    WHEN state='planned' AND file_id IS NULL THEN 'planned'
+                    WHEN file_id IS NOT NULL THEN 'pending_disposal'
+                    ELSE 'quarantined' END
+                 WHERE generation_id=?1",
                 [generation],
             )?;
             if let Some(activity) = authority.activity {
@@ -606,6 +721,7 @@ pub(super) fn settle_cleanup(
                     [activity],
                 )?;
             }
+            audit_quarantine_once(db, &authority, vm, generation, now)?;
             return Ok(false);
         }
     } else if !(outcome.released
@@ -613,6 +729,9 @@ pub(super) fn settle_cleanup(
         && current.accounted
         && current.artifacts == work.artifacts)
     {
+        if outcome.released && authority.phase == "abandoned" {
+            audit_quarantine_once(db, &authority, vm, generation, now)?;
+        }
         return Ok(false);
     }
     if let Some(activity) = authority.activity {
@@ -639,19 +758,21 @@ pub(super) fn settle_cleanup(
     {
         finish(db, activity, Status::Succeeded, now, Some(true))?;
     } else {
-        db.execute(
-            "INSERT INTO activity(principal,actor,vm_owner,vm,action,started_ms)
-             SELECT 'arxd','daemon',principal,id,19,?2 FROM vm_instances WHERE id=?1
-             UNION ALL
-             SELECT 'arxd','daemon',principal,id,19,?2 FROM vm_static_instances WHERE id=?1",
-            params![vm, now],
-        )?;
-        finish(
+        let cause = match authority.phase.as_str() {
+            "retire" => "retired",
+            "copy" => "orphan_copy",
+            "expiry" => "expiry_point",
+            _ => "abandoned",
+        };
+        record_reconciliation(
             db,
-            db.last_insert_rowid(),
-            Status::Succeeded,
+            vm,
+            generation,
+            authority.activity,
+            authority.expiry,
+            cause,
             now,
-            Some(true),
+            true,
         )?;
     }
     Ok(true)
@@ -1057,8 +1178,30 @@ mod effects {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum StagedLeaf {
         Untouched,
-        Identified,
+        Identified(FileIdentity, Id),
         Unknown,
+    }
+
+    fn work_phase(db: &Connection, work: &Work) -> Result<Option<String>> {
+        Ok(db
+            .query_row(
+                "SELECT w.phase FROM vm_snapshot_work w JOIN vm_operations o ON o.activity_id=w.activity
+                 WHERE w.activity=?1 AND coalesce(w.vm,w.static_vm)=?2 AND w.action=?3
+                   AND w.expected=?4 AND w.source=?5 AND w.candidate IS ?6 AND w.epoch=?7 AND w.lineage=?8
+                   AND o.vm=?2 AND o.binding_kind='snapshot' AND w.phase IN ('copy','abandoned')",
+                params![
+                    work.activity,
+                    work.vm,
+                    work.action,
+                    work.active.pair.0.disk.generation,
+                    work.source.0.disk.generation,
+                    work.candidate.map(|p| p.disk.generation),
+                    work.active.epoch,
+                    work.active.lineage,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub(crate) fn fail_copy(
@@ -1067,9 +1210,9 @@ mod effects {
         leaves: [StagedLeaf; 2],
         now: i64,
     ) -> Result<()> {
-        if !pending(db, work)? {
+        let Some(phase) = work_phase(db, work)? else {
             return Ok(());
-        }
+        };
         if let Some(slots) = work.candidate {
             for (slot, staged) in [slots.disk, slots.vars].into_iter().zip(leaves) {
                 match staged {
@@ -1083,24 +1226,50 @@ mod effects {
                         )? == 1;
                         if !untouched {
                             db.execute(
-                                "UPDATE vm_artifacts SET state='quarantined'
+                                "UPDATE vm_artifacts SET state=CASE
+                                    WHEN file_id IS NOT NULL THEN 'pending_disposal'
+                                    ELSE 'quarantined' END
                                  WHERE generation_id=?1 AND role=?2 AND object_key=?3",
                                 params![slot.generation, slot.role, slot.key],
                             )?;
                         }
                     }
-                    StagedLeaf::Identified => {
-                        let marked = db.execute(
+                    StagedLeaf::Identified(identity, directory) => {
+                        let existing = db.execute(
                             "UPDATE vm_artifacts SET state='pending_disposal'
-                             WHERE generation_id=?1 AND role=?2 AND object_key=?3 AND file_id IS NOT NULL",
-                            params![slot.generation, slot.role, slot.key],
+                             WHERE generation_id=?1 AND role=?2 AND object_key=?3
+                               AND volume_id=?4 AND directory_id=?5 AND file_id=?6",
+                            params![
+                                slot.generation,
+                                slot.role,
+                                slot.key,
+                                identity.volume.to_be_bytes(),
+                                directory,
+                                identity.file,
+                            ],
                         )?;
-                        if marked != 1 {
-                            db.execute(
-                                "UPDATE vm_artifacts SET state='quarantined'
-                                 WHERE generation_id=?1 AND role=?2 AND object_key=?3",
-                                params![slot.generation, slot.role, slot.key],
+                        if existing != 1 {
+                            let handed_off = db.execute(
+                                "UPDATE vm_artifacts SET state='pending_disposal',
+                                    volume_id=?4,directory_id=?5,file_id=?6
+                                 WHERE generation_id=?1 AND role=?2 AND object_key=?3
+                                   AND state IN ('created','quarantined') AND file_id IS NULL",
+                                params![
+                                    slot.generation,
+                                    slot.role,
+                                    slot.key,
+                                    identity.volume.to_be_bytes(),
+                                    directory,
+                                    identity.file,
+                                ],
                             )?;
+                            if handed_off != 1 {
+                                db.execute(
+                                    "UPDATE vm_artifacts SET state='quarantined'
+                                     WHERE generation_id=?1 AND role=?2 AND object_key=?3",
+                                    params![slot.generation, slot.role, slot.key],
+                                )?;
+                            }
                         }
                     }
                     StagedLeaf::Unknown => {
@@ -1113,19 +1282,57 @@ mod effects {
                 }
             }
         }
-        db.execute(
-            "UPDATE vm_snapshot_work SET phase='abandoned' WHERE activity=?1",
-            [work.activity],
-        )?;
-        finish_with_script(
+        if phase == "copy" {
+            db.execute(
+                "UPDATE vm_snapshot_work SET phase='abandoned' WHERE activity=?1 AND phase='copy'",
+                [work.activity],
+            )?;
+        }
+        if count(
             db,
-            work.activity,
-            Status::Failed,
-            now,
-            Some(false),
-            None,
-            Some(FailureReason::CleanupUnconfirmed),
-        )
+            "SELECT count(*) FROM activity WHERE id=?1 AND status=0",
+            [work.activity],
+        )? == 1
+        {
+            finish_with_script(
+                db,
+                work.activity,
+                Status::Failed,
+                now,
+                Some(false),
+                None,
+                Some(FailureReason::CleanupUnconfirmed),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Durable pre-create attempt boundary: marks the planned leaf as `created`
+    /// (with NULL file_id) before any exclusive filesystem creation occurs, so
+    /// restart or expiry can distinguish never-attempted slots from attempted
+    /// slots whose identity write was lost.
+    pub(crate) fn begin_leaf_create(
+        db: &Connection,
+        work: &Work,
+        slot: ArtifactSlot,
+    ) -> Result<()> {
+        ensure!(
+            pending(db, work)?
+                && work
+                    .candidate
+                    .is_some_and(|p| [p.disk, p.vars].contains(&slot)),
+            "snapshot worker no longer owns staging"
+        );
+        ensure!(
+            db.execute(
+                "UPDATE vm_artifacts SET state='created'
+                 WHERE generation_id=?1 AND role=?2 AND object_key=?3
+                   AND state='planned' AND file_id IS NULL",
+                params![slot.generation, slot.role, slot.key],
+            )? == 1,
+            "snapshot staging leaf already attempted"
+        );
+        Ok(())
     }
 
     pub(crate) fn record_identity(
@@ -1144,8 +1351,9 @@ mod effects {
         );
         ensure!(
             db.execute(
-                "UPDATE vm_artifacts SET state='created',volume_id=?4,directory_id=?5,file_id=?6
-             WHERE generation_id=?1 AND role=?2 AND object_key=?3 AND state='planned'",
+                "UPDATE vm_artifacts SET volume_id=?4,directory_id=?5,file_id=?6
+             WHERE generation_id=?1 AND role=?2 AND object_key=?3
+               AND state='created' AND file_id IS NULL",
                 params![
                     slot.generation,
                     slot.role,
