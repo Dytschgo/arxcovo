@@ -6,7 +6,7 @@ import { decideBudget, evaluatePullRequests, evaluateEvent, statusPublisher } fr
 function fixture() {
   const posts = [];
   const pr = { number: 1, state: 'open', head: { sha: 'a'.repeat(40) }, labels: [] };
-  const io = { listPullRequests: () => [pr], getPullRequest: () => pr, getMainRun: () => ({ runId: 42, seconds: 40 }), getCandidateRun: () => null, getStatus: () => null, postStatus: (sha, state, description) => posts.push({ sha, state, description }) };
+  const io = { listPullRequests: () => [pr], getPullRequest: () => pr, getMainRun: () => ({ runId: 42, seconds: 40, conclusion: 'success' }), getCandidateRun: () => null, getStatus: () => null, postStatus: (sha, state, description) => posts.push({ sha, state, description }) };
   return { io, posts, pr };
 }
 test('fast main passes without history or a candidate measurement', async () => {
@@ -14,7 +14,7 @@ test('fast main passes without history or a candidate measurement', async () => 
   io.getCandidateRun = () => assert.fail('fast baseline needs no candidate');
   await evaluatePullRequests(io);
   assert.equal(posts.at(-1).state, 'success');
-  assert.match(posts.at(-1).description, /42: wall 40s/);
+  assert.match(posts.at(-1).description, /42: attempt 1: wall 40s/);
 });
 test('measurement failure invalidates old success for every discovered PR', async () => {
   const { io, posts, pr } = fixture();
@@ -27,10 +27,37 @@ test('removed label cannot reuse the old ci-speed snapshot', async () => {
   const { io, posts, pr } = fixture();
   let reads = 0;
   io.getPullRequest = () => ({ ...pr, labels: ++reads === 1 ? [{ name: 'ci-speed' }] : [] });
-  io.getMainRun = () => ({ runId: 42, seconds: 901 });
-  io.getCandidateRun = () => ({ seconds: 800, conclusion: 'success' });
+  io.getMainRun = () => ({ runId: 42, seconds: 901, chargedSeconds: 901, longestJobSeconds: 901, credit: 'applied', conclusion: 'success' });
+  io.getCandidateRun = () => ({ seconds: 800, chargedSeconds: 800, longestJobSeconds: 800, credit: 'applied', conclusion: 'success' });
   await evaluatePullRequests(io);
   assert.equal(posts.at(-1).state, 'failure');
+});
+test('recovered main replaces a status scoped to the same run and an earlier attempt', async () => {
+  const { io, posts } = fixture();
+  io.getStatus = () => ({ state: 'success', description: 'Main run 42: attempt 2: wall 700s, charged 690s; budget satisfied' });
+  io.getMainRun = () => ({ runId: 42, attempt: 3, seconds: 613, chargedSeconds: 610, credit: 'applied', conclusion: 'success' });
+  await evaluatePullRequests(io);
+  assert.deepEqual(posts.map(post => post.state), ['pending', 'success']);
+  assert.equal(posts.at(-1).description, 'Main run 42: attempt 3: wall 613s, charged 610s; budget satisfied');
+});
+
+test('falling back to the failed first attempt invalidates a success from the same run', async () => {
+  const { io, posts } = fixture();
+  io.getStatus = () => ({ state: 'success', description: 'Main run 42: attempt 2: wall 700s, charged 690s; budget satisfied' });
+  io.getMainRun = () => ({ runId: 42, seconds: 913, conclusion: 'failure' });
+  await evaluatePullRequests(io);
+  assert.deepEqual(posts.map(post => post.state), ['pending', 'failure']);
+  assert.match(posts[0].description, /^Main run 42: attempt 1:/);
+});
+
+test('a non-green main under 900 seconds blocks without reading a speed candidate', async () => {
+  const { io, posts, pr } = fixture();
+  pr.labels = [{ name: 'ci-speed' }];
+  io.getMainRun = () => ({ runId: 42, seconds: 60, chargedSeconds: 50, credit: 'withheld:not-green', conclusion: 'failure' });
+  io.getCandidateRun = () => assert.fail('non-green main cannot qualify for ci-speed');
+  await evaluatePullRequests(io);
+  assert.equal(posts.at(-1).state, 'failure');
+  assert.match(posts.at(-1).description, /did not succeed/);
 });
 test('repeated idle evaluations never consume statuses for unchanged results', async () => {
   const { io, posts } = fixture();
@@ -101,7 +128,7 @@ test('status descriptions retain main marker and fit 140 characters without publ
     const latest = { runId: 43880904887, seconds: 604800, chargedSeconds: credit.startsWith('unavailable') ? null : 604800, longestJobSeconds: 604800, credit, conclusion: credit === 'applied' ? 'success' : 'failure' };
     for (const candidate of [null, { ...latest, chargedSeconds: 604799, longestJobSeconds: 604799 }]) {
       const result = decideBudget(latest, candidate, [{name: 'ci-speed'}]);
-      assert.ok(result.description.startsWith('Main run 43880904887:'));
+      assert.ok(result.description.startsWith('Main run 43880904887: attempt 1:'));
       assert.ok(result.description.length <= 140, result.description);
       if (credit === 'withheld:not-green') assert.match(result.description, /uncredited \(not-green\)/);
     }
