@@ -525,12 +525,19 @@ pub struct ReviewedEgressBuild {
     pub receipt: ArtifactPin,
 }
 
-/// Reviewed, qualified patched builds. Empty until the E1a source, build and
-/// native receipt (which must cover the full payload and loaded-dependency
-/// set) are independently reviewed; until then every configured patched pin
-/// is refused as unqualified. Adding a receipt alone is not enough: each
-/// entry pins the executable together with its receipt.
-pub const REVIEWED_EGRESS_BUILDS: &[ReviewedEgressBuild] = &[];
+/// Independently reviewed patched builds. Each entry pairs the exact executable
+/// with its native receipt, which covers the full payload and loaded dependencies.
+pub const REVIEWED_EGRESS_BUILDS: &[ReviewedEgressBuild] = &[ReviewedEgressBuild {
+    // E1a (#292), security re-review 94835d03. Receipt SHA-256 is pinned below.
+    qemu: ArtifactPin {
+        size: 28_692_871,
+        sha256: hex32("8a9ba75905f7026003a4c4bf87cfb70a5099f18500969f185590e742b367b0ee"),
+    },
+    receipt: ArtifactPin {
+        size: 5_192,
+        sha256: hex32("68cbd5c35db0f270b82808ed7167920823e7d678667cefe9357191f0eded5402"),
+    },
+}];
 
 /// Proof that a configured pin is a reviewed, qualified patched build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1176,10 +1183,60 @@ mod tests {
         );
         assert_eq!(STOCK_QEMU_1113.sha256[..2], [0x0e, 0xff]);
         assert_eq!(STOCK_RECEIPT_1113_SHA256[31], 0x2e);
-        assert!(
-            REVIEWED_EGRESS_BUILDS.is_empty(),
-            "no patched build is reviewed yet"
+    }
+
+    #[test]
+    fn reviewed_e1a_build_requires_the_exact_executable_and_receipt_pins() {
+        let reviewed = EgressBinaryPin {
+            qemu: ArtifactPin {
+                size: 28_692_871,
+                sha256: hex32("8a9ba75905f7026003a4c4bf87cfb70a5099f18500969f185590e742b367b0ee"),
+            },
+            receipt: ArtifactPin {
+                size: 5_192,
+                sha256: hex32("68cbd5c35db0f270b82808ed7167920823e7d678667cefe9357191f0eded5402"),
+            },
+        };
+        assert_eq!(REVIEWED_EGRESS_BUILDS.len(), 1);
+        assert_eq!(
+            reviewed.qualify().map(QualifiedEgressBinary::pin),
+            Ok(reviewed)
         );
+
+        for (change_executable, expected) in [(true, reviewed.qemu), (false, reviewed.receipt)] {
+            for other in [
+                ArtifactPin {
+                    sha256: [0x42; 32],
+                    ..expected
+                },
+                ArtifactPin {
+                    size: expected.size + 1,
+                    ..expected
+                },
+            ] {
+                let mut configured = reviewed;
+                if change_executable {
+                    configured.qemu = other;
+                } else {
+                    configured.receipt = other;
+                }
+                assert_eq!(configured.qualify(), Err(EgressRefusal::BinaryUnqualified));
+            }
+        }
+
+        let stock_executable = EgressBinaryPin {
+            qemu: STOCK_QEMU_1113,
+            ..reviewed
+        };
+        assert_eq!(stock_executable.qualify(), Err(EgressRefusal::BinaryStock));
+        let stock_receipt = EgressBinaryPin {
+            receipt: ArtifactPin {
+                sha256: STOCK_RECEIPT_1113_SHA256,
+                ..reviewed.receipt
+            },
+            ..reviewed
+        };
+        assert_eq!(stock_receipt.qualify(), Err(EgressRefusal::BinaryStock));
     }
 
     /// A reviewed receipt vouches only for its own executable bytes.
@@ -1249,8 +1306,7 @@ mod tests {
         assert_eq!(held.artifact().unwrap_err(), EgressRefusal::BinaryCustody);
     }
 
-    /// The positive path needs a reviewed build, which only this private
-    /// seam can supply; production always refuses until one is reviewed.
+    /// The positive path uses a fixture build pinned through the private seam.
     /// Every mismatch keeps the same digest, bytes, identity or pin where it
     /// can, so only the binding under test refuses it.
     #[cfg(windows)]
