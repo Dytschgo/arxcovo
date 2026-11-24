@@ -52,8 +52,18 @@ backing on D:. The client compares the live mount and the held directory
 identity with the plan and refuses changed mounts, aliases and reparse points.
 It checks the ledger through the enrolled volume path and creates a temporary
 configuration alongside the private daemon configuration. The daemon checks
-the enrolled identity again before opening state, then opens the ledger and
-vault through the held volume path. Use a TEST-only profile without a Compose
+all three enrollment pins on its held directory handle before opening state,
+then opens the ledger and vault through the held volume path. The client uses
+that volume identity for live ledger and artifact reads and rechecks the
+binding before and after each batch. The configured drive spelling is used
+as the expected qcow backing header value.
+
+The acceptance run trusts the enrolled owner account. The client refuses when
+it detects a drive rebind. Deliberate races by the owner against their own
+acceptance run are outside this threat model.
+[ADR 0054 same-account boundary](adr/0054-m4-dedicated-windows-runtime.md#storage-and-owner-activity)
+
+Use a TEST-only profile without a Compose
 secret root. Config load refuses the combination of an expected store identity
 and a Compose secret root before any state opens.
 Keep the build scratch, binary, configuration, plan and evidence on D:.

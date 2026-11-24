@@ -6,7 +6,9 @@ use arxd::{
     },
     vm::paths::{FileIdentity, LocalPath},
 };
-use ledger::{Claim, Id, Ledger, Pair, PairProof, config, digest, id, open, pin_root, safe};
+use ledger::{
+    Claim, Id, Ledger, LiveLedger, Pair, PairProof, config, digest, id, open, pin_root, safe,
+};
 use rmcp::{
     RoleClient, ServiceExt, model::CallToolRequestParams, service::RunningService,
     transport::async_rw::AsyncRwTransport,
@@ -56,7 +58,7 @@ struct Plan {
     daemon_sha256: String,
     daemon_config: PathBuf,
     client_config: PathBuf,
-    store: StorePin,
+    store: ExpectedVmStore,
     qualification_sha256: Option<String>,
     evidence_dir: PathBuf,
     ubuntu: Recipe,
@@ -92,23 +94,6 @@ struct VmProfile {
 struct RuntimeRoot {
     state: PathBuf,
     volume: PathBuf,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StorePin {
-    volume_guid: String,
-    volume_serial: String,
-    directory_file_id: String,
-}
-
-impl StorePin {
-    fn expected(&self) -> ExpectedVmStore {
-        ExpectedVmStore {
-            volume_serial: self.volume_serial.clone(),
-            directory_file_id: self.directory_file_id.clone(),
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -217,7 +202,7 @@ async fn terminal(client: &Client, operation: Id, budget: Duration) -> Result<Va
 
 struct Acceptance<'a> {
     client: &'a Client,
-    ledger: Ledger,
+    ledger: LiveLedger,
     evidence: &'a mut Evidence,
     principal: &'a str,
     operations: Vec<Operation>,
@@ -318,7 +303,7 @@ impl Acceptance<'_> {
             let (_, label, action) = op.action.wire();
             let activity = self
                 .ledger
-                .activity(operation, op.request, self.principal, action)?;
+                .read(|ledger| ledger.activity(operation, op.request, self.principal, action))?;
             let row = self.activity(activity).await?;
             check(
                 row["identity_mode"] == "local_vm_principal"
@@ -364,13 +349,16 @@ impl Acceptance<'_> {
             check(built["recipe_id"] == recipe.recipe_id, "build_recipe")?;
             id(&built, "template_id")?
         };
-        let (pair, charge) = self.ledger.golden(
-            template,
-            &recipe.recipe_id,
-            &recipe.recipe_sha256,
-            guest.code(),
-        )?;
-        let proof = self.ledger.inspect(&pair, None, true)?;
+        let (pair, charge, proof) = self.ledger.read(|ledger| {
+            let (pair, charge) = ledger.golden(
+                template,
+                &recipe.recipe_id,
+                &recipe.recipe_sha256,
+                guest.code(),
+            )?;
+            let proof = ledger.inspect(&pair, None, true)?;
+            Ok((pair, charge, proof))
+        })?;
         self.evidence.record("sealed_template", json!({"guest":guest.label(),"template_id":hex::encode(template),
             "recipe_id":recipe.recipe_id,"recipe_sha256":recipe.recipe_sha256,
             "generation":hex::encode(Ledger::generation(&pair)),"charge":charge,"pair":proof.evidence()}));
@@ -410,14 +398,16 @@ impl Acceptance<'_> {
         )?;
         let lease = LeaseClock::new(issued_at, deadline, ttl_duration, RPC)?;
         lease.check_clock(clock_sample()?)?;
-        let pair = self.ledger.vm_pair(vm)?;
-        self.ledger.distinct(&golden.pair, &pair)?;
-        let proof = self.ledger.inspect(&pair, Some(&golden.pair), false)?;
+        let (pair, proof, claim) = self.ledger.read(|ledger| {
+            let pair = ledger.vm_pair(vm)?;
+            ledger.distinct(&golden.pair, &pair)?;
+            let proof = ledger.inspect(&pair, Some(&golden.pair), false)?;
+            Ok((pair, proof, ledger.charge(vm)?))
+        })?;
         check(
             proof.contents[1] == golden.proof.contents[1],
             "clone_vars_initial_pin",
         )?;
-        let claim = self.ledger.charge(vm)?;
         check(
             claim.active > 0 && claim.snapshot == 0 && claim.staged == 0 && claim.generations == 1,
             "clone_charge",
@@ -428,19 +418,19 @@ impl Acceptance<'_> {
             "deadline_ms":deadline,"pair":proof.evidence(),"charges":claim.evidence()}),
         );
         if replay {
-            let before = self.ledger.effect(vm)?;
+            let before = self.ledger.read(|ledger| ledger.effect(vm))?;
             let second = rpc(self.client, "vm_create", args).await?;
             let second_row = terminal(self.client, id(&second, "operation_id")?, VM_WORK).await?;
-            retry_unchanged(&receipt, &second, &before, &self.ledger.effect(vm)?)?;
+            let after = self.ledger.read(|ledger| ledger.effect(vm))?;
+            retry_unchanged(&receipt, &second, &before, &after)?;
             check(
                 second_row == completed
                     && self.vm(vm).await? == status
-                    && self.ledger.vm_pair(vm)? == pair
-                    && self
-                        .ledger
-                        .inspect(&pair, Some(&golden.pair), false)?
-                        .contents
-                        == proof.contents,
+                    && self.ledger.read(|ledger| {
+                        Ok(ledger.vm_pair(vm)? == pair
+                            && ledger.inspect(&pair, Some(&golden.pair), false)?.contents
+                                == proof.contents)
+                    })?,
                 "retry_clone_unchanged",
             )?;
             self.evidence.record(
@@ -468,7 +458,8 @@ impl Acceptance<'_> {
             "fresh_ready_boot",
         )?;
         let epoch = id(&started, "operation_id")?;
-        self.ledger.release(&vm.pair, epoch, false)?;
+        self.ledger
+            .read(|ledger| ledger.release(&vm.pair, epoch, false))?;
         if matches!(guest, Guest::Windows) {
             let witness = windows_boot_witness(
                 &state,
@@ -496,7 +487,8 @@ impl Acceptance<'_> {
             .await?;
         succeeded(&stopped)?;
         self.stopped(vm).await?;
-        self.ledger.release(&vm.pair, epoch, true)?;
+        self.ledger
+            .read(|ledger| ledger.release(&vm.pair, epoch, true))?;
         self.evidence.record(
             "clean_release",
             json!({"vm_id":hex::encode(vm.id),"epoch":hex::encode(epoch),
@@ -594,13 +586,14 @@ impl Acceptance<'_> {
                 && tombstone["ready"] == false,
             "expiry_proof",
         )?;
-        self.ledger
-            .expiry(vm.id, self.principal, activity, vm.deadline, expired)?;
-        check(self.ledger.gone(&vm.pair)?, "expired_pair_gone")?;
-        if let Some(pair) = extra {
-            check(self.ledger.gone(pair)?, "expired_snapshot_gone")?;
-        }
-        let charge = self.ledger.charge(vm.id)?;
+        let charge = self.ledger.read(|ledger| {
+            ledger.expiry(vm.id, self.principal, activity, vm.deadline, expired)?;
+            check(ledger.gone(&vm.pair)?, "expired_pair_gone")?;
+            if let Some(pair) = extra {
+                check(ledger.gone(pair)?, "expired_snapshot_gone")?;
+            }
+            ledger.charge(vm.id)
+        })?;
         check(
             charge
                 == (Claim {
@@ -731,38 +724,39 @@ async fn catalog(client: &Client, plan: &Plan) -> Result<(Vec<Value>, String)> {
 }
 
 async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) -> Result<()> {
-    accept.ledger.quiet()?;
-    let initial = accept.ledger.goldens()?;
-    let mut initial_goldens = Vec::new();
-    for (recipe, guest) in [
-        (&plan.ubuntu, Guest::Ubuntu),
-        (&plan.windows, Guest::Windows),
-    ] {
-        for entry in entries.iter().filter(|entry| {
-            entry["state"] == "sealed"
-                && entry["recipe_id"] == recipe.recipe_id
-                && entry["guest"] == guest.label()
-        }) {
-            let (pair, _) = accept.ledger.golden(
-                id(entry, "template_id")?,
-                &recipe.recipe_id,
-                &recipe.recipe_sha256,
-                guest.code(),
-            )?;
-            initial_goldens.push(pair);
+    let (initial, charged_bytes, ledger_bytes) = accept.ledger.read(|ledger| {
+        ledger.quiet()?;
+        let initial = ledger.goldens()?;
+        let mut initial_goldens = Vec::new();
+        for (recipe, guest) in [
+            (&plan.ubuntu, Guest::Ubuntu),
+            (&plan.windows, Guest::Windows),
+        ] {
+            for entry in entries.iter().filter(|entry| {
+                entry["state"] == "sealed"
+                    && entry["recipe_id"] == recipe.recipe_id
+                    && entry["guest"] == guest.label()
+            }) {
+                let (pair, _) = ledger.golden(
+                    id(entry, "template_id")?,
+                    &recipe.recipe_id,
+                    &recipe.recipe_sha256,
+                    guest.code(),
+                )?;
+                initial_goldens.push(pair);
+            }
         }
-    }
-    check(
-        initial.len() == initial_goldens.len() && initial.len() <= 2,
-        "isolated_golden_inventory",
-    )?;
-    accept
-        .ledger
-        .inventory(&initial_goldens.iter().collect::<Vec<_>>())?;
+        check(
+            initial.len() == initial_goldens.len() && initial.len() <= 2,
+            "isolated_golden_inventory",
+        )?;
+        ledger.inventory(&initial_goldens.iter().collect::<Vec<_>>())?;
+        Ok((initial, ledger.aggregate()?, ledger.metadata_bytes()?))
+    })?;
     accept.evidence.record(
         "initial_ledger",
         json!({"golden_templates":initial.iter().map(hex::encode).collect::<Vec<_>>(),
-        "charged_bytes":accept.ledger.aggregate()?,"ledger_bytes":accept.ledger.metadata_bytes()?}),
+        "charged_bytes":charged_bytes,"ledger_bytes":ledger_bytes}),
     );
     let ubuntu = accept
         .template(entries, &plan.ubuntu, Guest::Ubuntu)
@@ -770,7 +764,9 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
     let windows = accept
         .template(entries, &plan.windows, Guest::Windows)
         .await?;
-    accept.ledger.distinct(&ubuntu.pair, &windows.pair)?;
+    accept
+        .ledger
+        .read(|ledger| ledger.distinct(&ubuntu.pair, &windows.pair))?;
     let mut u = accept
         .clone(&ubuntu, Guest::Ubuntu, UBUNTU_TTL, true)
         .await?;
@@ -778,8 +774,10 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
         .clone(&windows, Guest::Windows, WINDOWS_TTL, false)
         .await?;
     check(u.deadline < w.deadline, "lease_order")?;
-    accept.ledger.distinct(&u.pair, &w.pair)?;
-    let windows_charge = accept.ledger.charge(w.id)?;
+    let windows_charge = accept.ledger.read(|ledger| {
+        ledger.distinct(&u.pair, &w.pair)?;
+        ledger.charge(w.id)
+    })?;
 
     let u_marker = hex::encode(fresh()?);
     let changed = hex::encode(fresh()?);
@@ -790,7 +788,9 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
         "set -euC\numask 077\nprintf '%s' '{u_marker}' > '{path}'\ncat /proc/sys/kernel/random/boot_id > '{path}.boot'\ntest \"$(cat '{path}')\" = '{u_marker}'"
     ), 0).await?;
     accept.stop(&u, u_first).await?;
-    let baseline = accept.ledger.inspect(&u.pair, Some(&ubuntu.pair), false)?;
+    let baseline = accept
+        .ledger
+        .read(|ledger| ledger.inspect(&u.pair, Some(&ubuntu.pair), false))?;
 
     let w_marker = hex::encode(fresh()?);
     let w_boot = accept.start(&w, Guest::Windows).await?;
@@ -805,10 +805,9 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
         .await?;
     succeeded(&captured)?;
     let point = id(&captured, "snapshot_id")?;
-    let (snapshot, charge) =
-        accept
-            .ledger
-            .point(u.id, point, ubuntu.template, Ledger::generation(&u.pair))?;
+    let (snapshot, charge) = accept
+        .ledger
+        .read(|ledger| ledger.point(u.id, point, ubuntu.template, Ledger::generation(&u.pair)))?;
     let point_list = rpc(accept.client, "vm_snapshot_list", json!({"vm_id":vm})).await?;
     check(
         point_list["vm_id"] == vm
@@ -821,8 +820,10 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
             }),
         "snapshot_list",
     )?;
-    accept.ledger.distinct(&u.pair, &snapshot)?;
-    let saved = accept.ledger.inspect(&snapshot, Some(&ubuntu.pair), true)?;
+    let saved = accept.ledger.read(|ledger| {
+        ledger.distinct(&u.pair, &snapshot)?;
+        ledger.inspect(&snapshot, Some(&ubuntu.pair), true)
+    })?;
     check(
         saved.contents == baseline.contents && charge > 0,
         "snapshot_pair_copied",
@@ -853,34 +854,40 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
         "restore_commit",
     )?;
     accept.stopped(&u).await?;
-    let old = std::mem::replace(&mut u.pair, accept.ledger.vm_pair(u.id)?);
-    accept.ledger.distinct(&old, &u.pair)?;
-    accept.ledger.distinct(&snapshot, &u.pair)?;
-    let current = accept.ledger.inspect(&u.pair, Some(&ubuntu.pair), false)?;
+    let (pair, current) = accept.ledger.read(|ledger| {
+        let pair = ledger.vm_pair(u.id)?;
+        ledger.distinct(&u.pair, &pair)?;
+        ledger.distinct(&snapshot, &pair)?;
+        let proof = ledger.inspect(&pair, Some(&ubuntu.pair), false)?;
+        Ok((pair, proof))
+    })?;
+    let old = std::mem::replace(&mut u.pair, pair);
     check(
         current.contents == saved.contents,
         "restored_pair_matches_snapshot",
     )?;
     let restore_op = id(&restored, "operation_id")?;
     let retired = poll("retired_generation_sweep", EXPIRY_GRACE, TICK, || async {
-        if !accept.ledger.gone(&old)? {
-            return Ok(None);
-        }
-        let claim = accept.ledger.charge(u.id)?;
-        check(
-            claim.active > 0
-                && claim.snapshot == charge
-                && claim.staged == 0
-                && claim.generations == 2,
-            "retired_charge_released",
-        )?;
-        Ok(Some(accept.ledger.reconciled(
-            u.id,
-            Ledger::generation(&old),
-            "retired",
-            Some(restore_op),
-            None,
-        )?))
+        accept.ledger.read(|ledger| {
+            if !ledger.gone(&old)? {
+                return Ok(None);
+            }
+            let claim = ledger.charge(u.id)?;
+            check(
+                claim.active > 0
+                    && claim.snapshot == charge
+                    && claim.staged == 0
+                    && claim.generations == 2,
+                "retired_charge_released",
+            )?;
+            Ok(Some(ledger.reconciled(
+                u.id,
+                Ledger::generation(&old),
+                "retired",
+                Some(restore_op),
+                None,
+            )?))
+        })
     })
     .await?;
     accept.evidence.record(
@@ -902,56 +909,62 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
 
     accept.stopped(&w).await?;
     let u_expiry = accept.expiry(&u, Some(&snapshot), Some(&w)).await?;
-    let snapshot_cleanup = accept.ledger.reconciled(
-        u.id,
-        Ledger::generation(&snapshot),
-        "expiry_point",
-        None,
-        Some(u_expiry),
-    )?;
+    let snapshot_cleanup = accept.ledger.read(|ledger| {
+        ledger.reconciled(
+            u.id,
+            Ledger::generation(&snapshot),
+            "expiry_point",
+            None,
+            Some(u_expiry),
+        )
+    })?;
     accept.evidence.record(
         "snapshot_expired",
         json!({"snapshot_id":hex::encode(point),
         "reconciliation_activity_id":snapshot_cleanup,"expiry_activity_id":u_expiry}),
     );
     accept.stopped(&w).await?;
-    check(
-        windows_charge == accept.ledger.charge(w.id)? && windows_charge.active > 0,
-        "windows_separately_charged",
-    )?;
-    accept.ledger.inspect(&w.pair, Some(&windows.pair), false)?;
+    accept.ledger.read(|ledger| {
+        check(
+            windows_charge == ledger.charge(w.id)? && windows_charge.active > 0,
+            "windows_separately_charged",
+        )?;
+        ledger.inspect(&w.pair, Some(&windows.pair), false)
+    })?;
     accept
         .evidence
         .record("windows_still_charged", windows_charge.evidence());
     accept.expiry(&w, None, None).await?;
 
-    for (golden, recipe, guest) in [
-        (&ubuntu, &plan.ubuntu, Guest::Ubuntu),
-        (&windows, &plan.windows, Guest::Windows),
-    ] {
-        let (after, charge) = accept.ledger.golden(
-            golden.template,
-            &recipe.recipe_id,
-            &recipe.recipe_sha256,
-            guest.code(),
-        )?;
-        check(
-            after == golden.pair
-                && charge == golden.charge
-                && accept.ledger.inspect(&after, None, true)? == golden.proof,
-            "golden_unchanged",
-        )?;
-    }
-    accept.ledger.quiet()?;
-    accept.ledger.inventory(&[&ubuntu.pair, &windows.pair])?;
-    let remaining = accept.ledger.aggregate()?;
+    let (remaining, ledger_bytes) = accept.ledger.read(|ledger| {
+        for (golden, recipe, guest) in [
+            (&ubuntu, &plan.ubuntu, Guest::Ubuntu),
+            (&windows, &plan.windows, Guest::Windows),
+        ] {
+            let (after, charge) = ledger.golden(
+                golden.template,
+                &recipe.recipe_id,
+                &recipe.recipe_sha256,
+                guest.code(),
+            )?;
+            check(
+                after == golden.pair
+                    && charge == golden.charge
+                    && ledger.inspect(&after, None, true)? == golden.proof,
+                "golden_unchanged",
+            )?;
+        }
+        ledger.quiet()?;
+        ledger.inventory(&[&ubuntu.pair, &windows.pair])?;
+        Ok((ledger.aggregate()?, ledger.metadata_bytes()?))
+    })?;
     check(
         remaining == ubuntu.charge + windows.charge,
         "remaining_charges",
     )?;
     accept.evidence.record("final_ledger",json!({"goldens_unchanged":true,"golden_charged_bytes":remaining,
         "golden_allocated_bytes":ubuntu.proof.allocated.iter().chain(windows.proof.allocated.iter()).sum::<u64>(),
-        "non_golden_charged_bytes":0,"unattributed_media":0,"ledger_bytes":accept.ledger.metadata_bytes()?}));
+        "non_golden_charged_bytes":0,"unattributed_media":0,"ledger_bytes":ledger_bytes}));
     accept.correlate().await
 }
 
@@ -1061,7 +1074,12 @@ fn fixture_command(config: &Path) -> Command {
 fn fixture_expected_store(state: &Path) -> ExpectedVmStore {
     let folder = open(state, true, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap();
     let measured = store_identity(&folder).unwrap();
+    let local = local_path(state).unwrap();
     ExpectedVmStore {
+        volume_guid: mounted_volume(&local.as_str()[..3])
+            .unwrap()
+            .to_ascii_lowercase()
+            .replacen("volume", "Volume", 1),
         volume_serial: format!("{:016x}", measured.volume),
         directory_file_id: hex::encode(measured.file),
     }
@@ -1153,6 +1171,42 @@ async fn foreground_store_replacement_cannot_open_state_or_startup_sweep() {
 }
 
 #[tokio::test]
+async fn foreground_store_wrong_guid_refuses_before_state_open() {
+    use arxd::config::{ForegroundConfig, VmStoreIdentityRefusal};
+
+    let fixture = private_fixture::private_dir();
+    let state = fixture_drive_path(fixture.path()).join("state");
+    fs::create_dir(&state).unwrap();
+    let mut expected = fixture_expected_store(&state);
+    let (profile, address) = fixture_foreground(&state);
+    let config = fixture.path().join("original.json");
+    fs::write(&config, profile.to_string()).unwrap();
+    fixture_set_owner(&[fixture.path(), &state, &config]);
+    let correct = prepare_pinned_config(&config, &expected).unwrap();
+    fixture_set_owner(&[&correct]);
+    assert!(ForegroundConfig::load(&correct).is_ok());
+
+    let wrong_guid = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\";
+    assert_ne!(expected.volume_guid, wrong_guid);
+    // Keep the actual filesystem serial and 128-bit directory ID.
+    expected.volume_guid = wrong_guid.into();
+    let launch = prepare_pinned_config(&config, &expected).unwrap();
+    fixture_set_owner(&[&launch]);
+    let exit = timeout(Duration::from_secs(5), fixture_command(&launch).output()).await;
+    assert_eq!(
+        fs::read_dir(&state).unwrap().count(),
+        0,
+        "unexpected state writes"
+    );
+    assert!(require_unused(&address).is_ok());
+    let exit = exit.unwrap().unwrap();
+    assert!(!exit.status.success());
+    assert_eq!(exit.stderr, b"arxd: server-config\n");
+    let refused = ForegroundConfig::load(&launch).err().unwrap();
+    assert!(refused.is::<VmStoreIdentityRefusal>());
+}
+
+#[tokio::test]
 async fn foreground_opens_enrolled_state_through_the_stable_volume_path() {
     let fixture = private_fixture::private_dir();
     let state = fixture_drive_path(fixture.path()).join("state");
@@ -1183,6 +1237,8 @@ async fn foreground_opens_enrolled_state_through_the_stable_volume_path() {
         with_enrolled_vm_store(&state, &expected, |path| Ledger::preflight(path, recipes)).unwrap(),
         Ok(())
     );
+    let live = LiveLedger::open(&state, &expected).unwrap();
+    assert_eq!(live.read(|ledger| ledger.inventory(&[])), Ok(()));
 }
 
 #[tokio::test]
@@ -1243,7 +1299,7 @@ async fn mismatched_endpoint_refuses_foreground_inputs_before_startup() {
         daemon_sha256: String::new(),
         daemon_config: config,
         client_config: client.clone(),
-        store: StorePin {
+        store: ExpectedVmStore {
             volume_guid: String::new(),
             volume_serial: String::new(),
             directory_file_id: String::new(),
@@ -1349,7 +1405,7 @@ async fn with_client(
             let (entries, selected) = catalog(&client, plan).await?;
             evidence.qualification_sha256 = Some(selected);
             let _store = pin_store(store, &plan.store, mounted_volume)?;
-            let ledger = Ledger::open(&foreground.state_dir)?;
+            let ledger = LiveLedger::open(&foreground.state_dir, &plan.store)?;
             let mut acceptance = Acceptance {
                 client: &client,
                 ledger,
@@ -1495,7 +1551,7 @@ fn held_volume_path(file: &File) -> Result<String> {
 
 fn pin_store(
     state: &LocalPath,
-    enrolled: &StorePin,
+    enrolled: &ExpectedVmStore,
     mount_name: impl Fn(&str) -> Result<String>,
 ) -> Result<Vec<File>> {
     let drive = &state.as_str()[..3];
@@ -1552,7 +1608,7 @@ fn store_requires_exact_enrolled_volume_and_directory() {
     let volume_guid = mounted_volume(drive).unwrap();
     let directory_file = open(directory.path(), true, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap();
     let identity = store_identity(&directory_file).unwrap();
-    let enrolled = StorePin {
+    let enrolled = ExpectedVmStore {
         volume_guid: volume_guid
             .to_ascii_lowercase()
             .replacen("volume", "Volume", 1),
@@ -1588,7 +1644,7 @@ fn store_requires_exact_enrolled_volume_and_directory() {
         pin_store(&wrong_directory, &enrolled, mounted_volume).err(),
         Some(Failure::Check("store_directory_pin"))
     );
-    let wrong_serial = StorePin {
+    let wrong_serial = ExpectedVmStore {
         volume_serial: format!("{:016x}", identity.volume ^ 1),
         ..enrolled
     };
@@ -1607,7 +1663,7 @@ fn store_refuses_reparse_path_to_the_enrolled_directory() {
     let state = local_path(&target).unwrap();
     let identity =
         store_identity(&open(&target, true, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap()).unwrap();
-    let enrolled = StorePin {
+    let enrolled = ExpectedVmStore {
         volume_guid: mounted_volume(&state.as_str()[..3])
             .unwrap()
             .to_ascii_lowercase()
@@ -1729,7 +1785,7 @@ async fn run_with_inputs(plan: &Plan, daemon_config: &File, evidence_pins: &[Fil
     let result = async {
         require_unused(&foreground.local.address)?;
         safe(
-            with_enrolled_vm_store(&foreground.state_dir, &plan.store.expected(), |root| {
+            with_enrolled_vm_store(&foreground.state_dir, &plan.store, |root| {
                 Ledger::preflight(
                     root,
                     [
@@ -1740,7 +1796,7 @@ async fn run_with_inputs(plan: &Plan, daemon_config: &File, evidence_pins: &[Fil
             }),
             "foreground_store_binding",
         )??;
-        let launch_config = prepare_pinned_config(&plan.daemon_config, &plan.store.expected())?;
+        let launch_config = prepare_pinned_config(&plan.daemon_config, &plan.store)?;
         let _launch_config = open(&launch_config, false, FILE_SHARE_READ)?;
         let console = Console::allocate()?;
         let _startup_store = pin_store(&state, &plan.store, mounted_volume)?;

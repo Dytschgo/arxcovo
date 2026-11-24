@@ -372,10 +372,11 @@ pub struct VmForeground {
     pub(crate) root: Box<RootPin>,
 }
 
-/// The enrollment's Windows FILE_ID_INFO, encoded as lowercase hex.
+/// The independently enrolled Windows volume name and FILE_ID_INFO.
 #[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExpectedVmStore {
+    pub volume_guid: String,
     pub volume_serial: String,
     pub directory_file_id: String,
 }
@@ -403,8 +404,49 @@ impl std::fmt::Display for VmStoreComposeConflict {
 impl std::error::Error for VmStoreComposeConflict {}
 
 #[cfg(windows)]
+struct EnrolledStoreIdentity {
+    volume_guid: String,
+    directory: crate::vm::paths::FileIdentity,
+}
+
+#[cfg(windows)]
+impl EnrolledStoreIdentity {
+    fn verified_path(&self, file: &std::fs::File) -> Result<PathBuf> {
+        anyhow::ensure!(
+            full_directory_identity(file)? == self.directory,
+            VmStoreIdentityRefusal
+        );
+        let path = held_volume_path(file)?;
+        anyhow::ensure!(
+            path.to_str()
+                .and_then(|name| name.get(..self.volume_guid.len()))
+                .is_some_and(|volume| volume.eq_ignore_ascii_case(&self.volume_guid)),
+            VmStoreIdentityRefusal
+        );
+        Ok(path)
+    }
+}
+
+#[cfg(windows)]
 impl ExpectedVmStore {
-    fn identity(&self) -> Result<crate::vm::paths::FileIdentity> {
+    fn identity(&self) -> Result<EnrolledStoreIdentity> {
+        let guid = self
+            .volume_guid
+            .strip_prefix(r"\\?\Volume{")
+            .and_then(|value| value.strip_suffix(r"}\"))
+            .ok_or(VmStoreIdentityRefusal)?;
+        let mut parts = guid.split('-');
+        for length in [8, 4, 4, 4, 12] {
+            let part = parts.next().ok_or(VmStoreIdentityRefusal)?;
+            anyhow::ensure!(
+                part.len() == length
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                VmStoreIdentityRefusal
+            );
+        }
+        anyhow::ensure!(parts.next().is_none(), VmStoreIdentityRefusal);
         let mut file = [0; 16];
         let volume =
             u64::from_str_radix(&self.volume_serial, 16).map_err(|_| VmStoreIdentityRefusal)?;
@@ -415,7 +457,10 @@ impl ExpectedVmStore {
                 && hex::encode(file) == self.directory_file_id,
             VmStoreIdentityRefusal
         );
-        Ok(crate::vm::paths::FileIdentity { volume, file })
+        Ok(EnrolledStoreIdentity {
+            volume_guid: self.volume_guid.clone(),
+            directory: crate::vm::paths::FileIdentity { volume, file },
+        })
     }
 }
 
@@ -471,7 +516,7 @@ pub(crate) struct RootPin {
     leaf: std::fs::File,
     identity: (u64, u64),
     #[cfg(windows)]
-    enrolled: Option<(PathBuf, crate::vm::paths::FileIdentity)>,
+    enrolled: Option<(PathBuf, EnrolledStoreIdentity)>,
 }
 
 #[cfg(windows)]
@@ -554,19 +599,11 @@ impl RootPin {
         let acquire = || {
             let expected = expected.identity()?;
             let original = Self::acquire(root)?;
-            anyhow::ensure!(
-                full_directory_identity(&original.leaf)? == expected,
-                VmStoreIdentityRefusal
-            );
             // The drive letter can be rebound independently of a directory
-            // handle. Resolve the GUID path from the verified handle, then
-            // hold that chain and use its stable name for state I/O.
-            let path = held_volume_path(&original.leaf)?;
+            // handle. Require the independently enrolled GUID on that handle
+            // before holding its GUID path for state I/O.
+            let path = expected.verified_path(&original.leaf)?;
             let mut anchored = Self::acquire(&path)?;
-            anyhow::ensure!(
-                full_directory_identity(&anchored.leaf)? == expected,
-                VmStoreIdentityRefusal
-            );
             anchored.enrolled = Some((path, expected));
             anchored.verify(root)?;
             Ok::<_, anyhow::Error>(anchored)
@@ -593,8 +630,11 @@ impl RootPin {
     pub(crate) fn verify(&self, root: &Path) -> Result<()> {
         #[cfg(windows)]
         if let Some((path, expected)) = &self.enrolled {
-            let matches =
-                |file: &std::fs::File| full_directory_identity(file).ok() == Some(*expected);
+            let matches = |file: &std::fs::File| {
+                expected
+                    .verified_path(file)
+                    .is_ok_and(|current| current.as_os_str().eq_ignore_ascii_case(path.as_os_str()))
+            };
             anyhow::ensure!(
                 matches(&self.leaf)
                     && Self::acquire(root).is_ok_and(|current| matches(&current.leaf))
@@ -620,16 +660,45 @@ impl RootPin {
     }
 }
 
-/// Synchronous ledger access through the enrolled, held volume path.
+/// Holds the enrolled volume path across synchronous acceptance read batches.
+#[cfg(windows)]
+pub struct EnrolledVmStore {
+    configured: PathBuf,
+    pin: RootPin,
+}
+
+#[cfg(windows)]
+impl EnrolledVmStore {
+    pub fn open(root: &Path, expected: &ExpectedVmStore) -> Result<Self> {
+        let configured = vm_path(root).map_err(|_| VmStoreIdentityRefusal)?;
+        let pin = RootPin::acquire_enrolled(&configured, expected)?;
+        Ok(Self { configured, pin })
+    }
+
+    pub fn read<T>(&self, action: impl FnOnce(&Path) -> T) -> Result<T> {
+        self.read_from(|| self.configured.as_path(), action)
+    }
+
+    fn read_from<'a, T>(
+        &self,
+        configured: impl Fn() -> &'a Path,
+        action: impl FnOnce(&Path) -> T,
+    ) -> Result<T> {
+        self.pin.verify(configured())?;
+        let output = self.pin.state_path(&self.configured).access(action);
+        self.pin.verify(configured())?;
+        Ok(output)
+    }
+}
+
+/// A single synchronous acceptance read batch.
 #[cfg(windows)]
 pub fn with_enrolled_vm_store<T>(
     root: &Path,
     expected: &ExpectedVmStore,
     action: impl FnOnce(&Path) -> T,
 ) -> Result<T> {
-    let root = vm_path(root).map_err(|_| VmStoreIdentityRefusal)?;
-    let pin = RootPin::acquire_enrolled(&root, expected)?;
-    Ok(pin.state_path(&root).access(action))
+    EnrolledVmStore::open(root, expected)?.read(action)
 }
 
 #[cfg(windows)]
@@ -674,6 +743,60 @@ fn held_volume_path(file: &std::fs::File) -> Result<PathBuf> {
     let path = String::from_utf16(&output[..length])?;
     anyhow::ensure!(path.starts_with(r"\\?\Volume{"), VmStoreIdentityRefusal);
     Ok(PathBuf::from(path))
+}
+
+#[cfg(all(test, windows))]
+mod enrolled_store_tests {
+    use super::*;
+    use std::{cell::Cell, fs};
+
+    #[test]
+    fn later_artifact_batch_discards_evidence_when_configured_mount_rebinds() {
+        let scratch = std::env::temp_dir().canonicalize().unwrap();
+        let enrolled = tempfile::tempdir_in(&scratch).unwrap();
+        let replacement = tempfile::tempdir_in(&scratch).unwrap();
+        let drive_path =
+            |path: &Path| PathBuf::from(path.to_str().unwrap().trim_start_matches(r"\\?\"));
+        let configured = drive_path(enrolled.path());
+        let alternate = drive_path(replacement.path());
+        let file = pin_directory(&configured).unwrap();
+        let identity = full_directory_identity(&file).unwrap();
+        let volume_path = held_volume_path(&file).unwrap();
+        let name = volume_path.to_str().unwrap();
+        let guid_end = name.find(r"}\").unwrap() + 2;
+        let expected = ExpectedVmStore {
+            volume_guid: name[..guid_end]
+                .to_ascii_lowercase()
+                .replacen("volume", "Volume", 1),
+            volume_serial: format!("{:016x}", identity.volume),
+            directory_file_id: hex::encode(identity.file),
+        };
+        let store = EnrolledVmStore::open(&configured, &expected).unwrap();
+        fs::write(configured.join("artifact"), b"enrolled fixture").unwrap();
+        assert!(!alternate.join("artifact").exists());
+        let read_artifact = |root: &Path| {
+            let path = root.join("artifact");
+            checked_path(&path).unwrap();
+            fs::read(&path).unwrap()
+        };
+        assert_eq!(store.read(read_artifact).unwrap(), b"enrolled fixture");
+
+        let rebound = Cell::new(false);
+        let alias = || {
+            if rebound.get() {
+                alternate.as_path()
+            } else {
+                configured.as_path()
+            }
+        };
+        let later = store.read_from(alias, |root| {
+            // Inject a newer drive resolution while the actual I/O still uses
+            // the pinned volume. The proof must be discarded after the read.
+            rebound.set(true);
+            read_artifact(root)
+        });
+        assert!(later.unwrap_err().is::<VmStoreIdentityRefusal>());
+    }
 }
 
 /// An ordinary local directory opened without following a reparse point and
