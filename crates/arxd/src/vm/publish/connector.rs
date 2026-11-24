@@ -46,7 +46,12 @@ pub(in crate::vm) enum ConnectorError {
     Spawn,
     Crashed,
     Readiness,
+    /// A spawned process whose termination could not be confirmed. The
+    /// connector is handed back through the start's `unsettled` slot.
     CleanupPending,
+    /// A failed ingress-file write whose same-handle removal could not be
+    /// confirmed. No process was spawned.
+    ResidueUnremoved,
 }
 
 pub(in crate::vm) struct TunnelCredential(zeroize::Zeroizing<Vec<u8>>);
@@ -428,7 +433,7 @@ impl Config {
             drop(output);
             return Err(match removed {
                 Ok(()) => refusal,
-                Err(_) => ConnectorError::CleanupPending,
+                Err(_) => ConnectorError::ResidueUnremoved,
             });
         }
         drop(output);

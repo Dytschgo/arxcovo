@@ -6097,6 +6097,126 @@ mod tests {
         assert!(!fake.record.load(SeqCst));
     }
 
+    /// A start that fails after spawn hands back a process whose termination
+    /// it could not confirm. The process stays in the local slot: cleanup
+    /// reports it unconfirmed and closes publish admission, a retried stop
+    /// settles it, and while it stays unconfirmed the drain is not quiescent
+    /// and custody recovery never runs.
+    #[tokio::test]
+    async fn a_start_that_cannot_confirm_termination_keeps_process_custody() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 2100).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        fake.start_held.store(true, SeqCst);
+        fake.stop_failures.store(1, SeqCst);
+        let failed = call(&a, "publish_site", args(2110)).await;
+        let failed = terminal(&a, &failed).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (
+                &json!("failed"),
+                &json!("cleanup_unconfirmed"),
+                &json!(proof_wire(false))
+            ),
+            "{failed}"
+        );
+        assert!(fake.local.load(SeqCst), "the held process was not kept");
+        assert!(h.supervisor().publisher.stop_unconfirmed());
+        assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
+        assert_eq!(
+            call(&a, "publish_site", args(2111)).await["reason"],
+            "state_unavailable"
+        );
+        // The next reaper turn retries the stop and settles the publication.
+        let status = settle(&h, &a, &vm).await;
+        assert_eq!(status["reason"], "cleanup_unconfirmed", "{status}");
+        assert!(!fake.local.load(SeqCst));
+        assert!(!h.supervisor().publisher.stop_unconfirmed());
+        let published = call(&a, "publish_site", args(2112)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let revoke = call(&a, "unpublish_site", args(2113)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+
+        // A held process whose stop keeps failing bars custody recovery.
+        fake.start_held.store(true, SeqCst);
+        fake.stop_failures.store(1_000, SeqCst);
+        let failed = call(&a, "publish_site", args(2114)).await;
+        assert_eq!(terminal(&a, &failed).await["state"], "failed");
+        assert!(fake.local.load(SeqCst));
+        let supervisor = h.supervisor().clone();
+        let _recovery = Stall::install(&supervisor.stall_recovery);
+        drop(a);
+        assert!(h.shutdown().await.is_err());
+        assert!(
+            supervisor.stall_recovery.lock().unwrap().is_some(),
+            "custody recovery ran with process termination unconfirmed"
+        );
+        assert!(fake.local.load(SeqCst));
+        fake.stop_failures.store(0, SeqCst);
+    }
+
+    /// A failed ingress-file disposition leaves its publish receipt
+    /// unconfirmed even when the receipt's own terminal write fails after the
+    /// no-POST intent was released and orphan settlement records it, by the
+    /// final drain before any reaper turn or by a reaper turn.
+    #[tokio::test]
+    async fn an_orphaned_residue_receipt_stays_unconfirmed() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 2200).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let host = h.supervisor().host_id;
+        let fail_terminal = "CREATE TRIGGER terminal_failure BEFORE UPDATE OF status ON activity
+             WHEN OLD.action=15 AND OLD.status=0 AND NEW.status<>0
+             BEGIN SELECT RAISE(ABORT, 'synthetic terminal write failure'); END;";
+        let unconfirmed = |row: &Value| {
+            assert_eq!(
+                (&row["state"], &row["reason"], &row["cleanup"]),
+                (
+                    &json!("failed"),
+                    &json!("cleanup_unconfirmed"),
+                    &json!(proof_wire(false))
+                ),
+                "{row}"
+            );
+        };
+
+        // Settled by the final drain before any reaper turn.
+        fake.residue.store(true, SeqCst);
+        trigger(&h, fail_terminal);
+        let pending = call(&a, "publish_site", args(2210)).await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert_eq!(operation(&a, &pending).await["state"], "pending");
+        trigger(&h, "DROP TRIGGER terminal_failure");
+        drop(a);
+        assert!(h.shutdown().await.is_err());
+        let mut h = h.reopen(|_| {}).await;
+        enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
+        let a = h.client(0).await;
+        unconfirmed(&terminal(&a, &pending).await);
+
+        // Settled by a reaper turn.
+        let start = call(&a, "vm_start", args(2211)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        fake.residue.store(true, SeqCst);
+        trigger(&h, fail_terminal);
+        let pending = call(&a, "publish_site", args(2212)).await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert_eq!(operation(&a, &pending).await["state"], "pending");
+        trigger(&h, "DROP TRIGGER terminal_failure");
+        h.tick().await;
+        unconfirmed(&terminal(&a, &pending).await);
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (0, 0));
+        drop(a);
+        assert!(h.shutdown().await.is_err());
+    }
+
     #[tokio::test]
     async fn a_failed_revoking_checkpoint_keeps_the_owner_cause() {
         let mut h = Harness::start_with_web(false, false, true).await;

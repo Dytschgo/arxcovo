@@ -333,12 +333,15 @@ pub(crate) fn finish(
 /// write, once their VM has no publication intent left. `live` holds the
 /// receipts whose worker is still running. A lost publish failed: its intent
 /// was released without committing `published`. A lost unpublish succeeded:
-/// the released intent was its effect. Returns how many were settled.
+/// the released intent was its effect. A receipt in `unconfirmed` keeps its
+/// cleanup unconfirmed, such as a publish whose failed ingress-file write left
+/// a residue. Returns the settled receipts.
 pub(crate) fn settle_orphans(
     db: &Connection,
     live: &std::collections::HashSet<i64>,
+    unconfirmed: &std::collections::HashSet<i64>,
     now: i64,
-) -> Result<usize> {
+) -> Result<Vec<i64>> {
     let pending = db
         .prepare(
             "SELECT a.id,a.action,s.publication_failure FROM activity a
@@ -354,7 +357,7 @@ pub(crate) fn settle_orphans(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut settled = 0;
+    let mut settled = Vec::new();
     for (operation, action, failure) in pending {
         if live.contains(&operation) {
             continue;
@@ -369,8 +372,14 @@ pub(crate) fn settle_orphans(
         } else {
             None
         };
-        finish(db, operation, now, failure, Some(true))?;
-        settled += 1;
+        finish(
+            db,
+            operation,
+            now,
+            failure,
+            Some(!unconfirmed.contains(&operation)),
+        )?;
+        settled.push(operation);
     }
     Ok(settled)
 }

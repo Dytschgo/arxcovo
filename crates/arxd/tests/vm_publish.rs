@@ -1514,7 +1514,7 @@ mod vm {
                     .load(std::sync::atomic::Ordering::SeqCst),
                 "the disposition was never attempted"
             );
-            assert_eq!(error, ConnectorError::CleanupPending);
+            assert_eq!(error, ConnectorError::ResidueUnremoved);
             let residue = ingress_files();
             assert_eq!(residue.len(), 1, "the unremoved residue is not visible");
             assert_secured("unremoved ingress residue", &residue[0]);

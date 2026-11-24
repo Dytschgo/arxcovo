@@ -798,16 +798,26 @@ pub(crate) mod publication {
     enum Unsettled {
         #[default]
         Nothing,
-        /// A process whose termination is not yet confirmed.
-        #[cfg_attr(
-            not(all(windows, target_arch = "x86_64")),
-            allow(dead_code, reason = "held only by the Windows connector")
-        )]
+        /// A spawned process whose termination is not yet confirmed. It stays
+        /// in the local slot, so stops retry it and quiescence waits for it.
         Process(LocalProcess),
         /// A failed ingress-file write whose removal could not be confirmed.
         /// The residue keeps its private custody and is never handed to a
         /// connector, but its cleanup is not confirmed.
         Residue,
+    }
+
+    impl Unsettled {
+        /// The start boundary's custody decision. A held process always wins:
+        /// a failed file disposition never stands in for unconfirmed process
+        /// termination.
+        fn from_start(held: Option<LocalProcess>, residue: bool) -> Self {
+            match (held, residue) {
+                (Some(process), _) => Self::Process(process),
+                (None, true) => Self::Residue,
+                (None, false) => Self::Nothing,
+            }
+        }
     }
 
     impl Start {
@@ -855,9 +865,11 @@ pub(crate) mod publication {
                         &mut held,
                     )
                     .await;
-                    if let Some(held) = held {
-                        *unsettled = Unsettled::Process(LocalProcess::Native(Box::new(held)));
-                    }
+                    let residue = matches!(result, Err(ConnectorError::ResidueUnremoved));
+                    *unsettled = Unsettled::from_start(
+                        held.map(|held| LocalProcess::Native(Box::new(held))),
+                        residue,
+                    );
                     result
                         .map(Box::new)
                         .map(LocalProcess::Native)
@@ -865,8 +877,7 @@ pub(crate) mod publication {
                             ConnectorError::Origin => Failure::OriginUnavailable,
                             ConnectorError::Crashed => Failure::ConnectorExited,
                             ConnectorError::Readiness => Failure::ConnectorUnready,
-                            ConnectorError::CleanupPending => {
-                                *unsettled = Unsettled::Residue;
+                            ConnectorError::CleanupPending | ConnectorError::ResidueUnremoved => {
                                 Failure::CleanupUnconfirmed
                             }
                             _ => Failure::ConnectorFailed,
@@ -875,12 +886,20 @@ pub(crate) mod publication {
                 #[cfg(test)]
                 Self::Fixture(fake) => {
                     use std::sync::atomic::Ordering::SeqCst;
-                    // The fixture holds no process that could outlive a failed start.
                     fake.starts.fetch_add(1, SeqCst);
                     if fake.residue.swap(false, SeqCst) {
                         // As the native connector reports a failed ingress
                         // write whose removal it could not confirm.
-                        *unsettled = Unsettled::Residue;
+                        *unsettled = Unsettled::from_start(None, true);
+                        return Err(Failure::CleanupUnconfirmed);
+                    }
+                    if fake.start_held.swap(false, SeqCst) {
+                        // As a native start that failed after spawn and whose
+                        // stop could not confirm termination: the process is
+                        // still running and handed back.
+                        fake.local.store(true, SeqCst);
+                        *unsettled =
+                            Unsettled::from_start(Some(LocalProcess::Fixture(fake)), false);
                         return Err(Failure::CleanupUnconfirmed);
                     }
                     *fake.ingress.lock().unwrap() = Some(crate::vm::publish::ingress(
@@ -985,6 +1004,10 @@ pub(crate) mod publication {
         /// The last activation whose failed ingress-file write left a residue
         /// it could not remove. Sticky: the final drain stays unconfirmed.
         residue: Option<u64>,
+        /// Publish receipts whose cleanup an unremoved residue left
+        /// unconfirmed, kept until their terminal write is durable, so orphan
+        /// settlement records them as unconfirmed as well.
+        unconfirmed_receipts: std::collections::HashSet<i64>,
     }
 
     impl Activations {
@@ -1691,12 +1714,20 @@ pub(crate) mod publication {
                 )
                 .await?;
             // An unremoved ingress residue is never confirmed cleanup, even
-            // though no process or DNS effect remains.
-            let clean =
-                cleanup == Cleanup::Released && self.activations().residue != Some(generation);
+            // though no process or DNS effect remains. Until this receipt's
+            // terminal write is durable, the reaper and the final drain settle
+            // it as unconfirmed too.
+            let residue = self.activations().residue == Some(generation);
+            let receipt = operation.receipt.activity_id;
+            if residue {
+                self.activations().unconfirmed_receipts.insert(receipt);
+            }
+            let clean = cleanup == Cleanup::Released && !residue;
             // A latched owner cause wins over this worker's local failure.
             let failure = self.cause(&intent.nonce, Some(failure));
-            controller.finish_publication(operation, None, failure, Some(clean))
+            controller.finish_publication(operation, None, failure, Some(clean))?;
+            self.activations().unconfirmed_receipts.remove(&receipt);
+            Ok(())
         }
 
         /// Errors carry this worker's POST evidence: an acknowledged record ID
@@ -1994,8 +2025,15 @@ pub(crate) mod publication {
             // Under the slot no worker settles concurrently. A receipt whose
             // worker exited without its terminal write is settled here once
             // its VM has no publication intent left.
-            let workers = self.workers();
-            controller.settle_orphaned_publications(&workers)?;
+            let unconfirmed = self.activations().unconfirmed_receipts.clone();
+            let settled = {
+                let workers = self.workers();
+                controller.settle_orphaned_publications(&workers, &unconfirmed)?
+            };
+            let mut activations = self.activations();
+            for receipt in settled {
+                activations.unconfirmed_receipts.remove(&receipt);
+            }
             Ok(turn)
         }
 
@@ -2141,6 +2179,9 @@ pub(crate) mod publication {
         pub(crate) stop_failures: std::sync::atomic::AtomicUsize,
         /// The next connector start fails with an unremoved ingress residue.
         pub(crate) residue: std::sync::atomic::AtomicBool,
+        /// The next connector start fails after spawn with its process still
+        /// running and unconfirmed.
+        pub(crate) start_held: std::sync::atomic::AtomicBool,
         /// Parks the next connector start before readiness, abortably.
         pub(crate) start_gate: std::sync::Mutex<Option<FakeGate>>,
         /// The next connector stop panics before stopping anything.

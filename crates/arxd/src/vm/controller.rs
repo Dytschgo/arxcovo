@@ -2019,11 +2019,11 @@ impl<C: Clock> VmController<C> {
     pub(crate) fn settle_orphaned_publications(
         &self,
         live: &std::collections::HashSet<i64>,
-    ) -> Result<()> {
+        unconfirmed: &std::collections::HashSet<i64>,
+    ) -> Result<Vec<i64>> {
         let now = utc(self.clock.now())?;
         self.store
-            .transact(|db| store::publish::settle_orphans(db, live, now))
-            .map(drop)
+            .transact(|db| store::publish::settle_orphans(db, live, unconfirmed, now))
     }
 
     pub(crate) fn finish_publication(
