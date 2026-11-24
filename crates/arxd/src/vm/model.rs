@@ -189,6 +189,7 @@ pub enum Refusal {
     SnapshotPublishNotQuiesced,
     StaticBackupDeleteForbidden,
     SnapshotOfflineRequired,
+    ComposeRecoveryRequired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
