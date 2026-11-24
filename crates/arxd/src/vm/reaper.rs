@@ -1248,6 +1248,105 @@ mod reaper_tests {
     }
 
     #[test]
+    fn crash_before_snapshot_identity_preserves_each_leafs_charge_and_custody() {
+        for disk_state in ["planned", "identified", "unknown"] {
+            let f = Fixture::new();
+            let golden = f.build(1, true);
+            let (vm, _) = f.clone(golden, 2, true);
+            let bytes = |f: &Fixture| {
+                f.ctl
+                    .reaper_test_store()
+                    .transact(|db| store::disk_bytes(db))
+                    .unwrap()
+                    .unwrap()
+            };
+            let original = bytes(&f);
+            let (work, worker, op) = f
+                .ctl
+                .admit_snapshot(
+                    OWNER,
+                    key(NOW, 10),
+                    vm,
+                    Action::Snapshot as i64,
+                    &snapshot::Request::Create(None),
+                    None,
+                    host(),
+                    resources(),
+                )
+                .unwrap()
+                .unwrap();
+            let charged = bytes(&f);
+            assert!(charged > original);
+            let slot = work.candidate.unwrap().disk;
+            let path = f.custody.path(slot.role, slot.key);
+            if disk_state != "planned" {
+                f.ctl.snapshot_leaf_begin(&worker, &work, slot).unwrap();
+                let receipt = f.custody.stage(slot, b"clone").unwrap();
+                if disk_state == "identified" {
+                    f.ctl
+                        .snapshot_leaf_identity(
+                            &worker,
+                            &work,
+                            slot,
+                            receipt.identity,
+                            receipt.directory,
+                        )
+                        .unwrap();
+                }
+            }
+            // Drop the writer before any failure handler, shutdown drain or sweep.
+            let f = f.reopen();
+            assert_eq!(
+                f.ctl.operation_status(OWNER, op.id).unwrap().unwrap().state,
+                Status::Interrupted
+            );
+            assert_eq!(bytes(&f), charged);
+            f.sweep(&Runtime::new(offline));
+            let unknown = disk_state == "unknown";
+            assert_eq!(path.exists(), unknown);
+            assert_eq!(bytes(&f), if unknown { charged } else { original });
+            assert_eq!(
+                f.count("SELECT count(*) FROM vm_snapshot_work"),
+                i64::from(unknown)
+            );
+            assert_eq!(
+                f.count("SELECT count(*) FROM vm_snapshot_reconciliation"),
+                1
+            );
+            assert_eq!(
+                f.count(
+                    "SELECT count(*) FROM vm_snapshot_reconciliation WHERE cause='quarantined'"
+                ),
+                i64::from(unknown)
+            );
+        }
+    }
+
+    #[test]
+    fn release_only_expiry_never_calls_artifact_custody() {
+        struct Probe;
+        impl ArtifactCustody for Probe {
+            fn reconcile(&self, _: &CleanupWork, _: Instant) -> bool {
+                panic!("release-only expiry called artifact custody")
+            }
+        }
+
+        let work = CleanupWork {
+            kind: CleanupKind::Expiry {
+                vm: [8; 16],
+                activity_id: 1,
+            },
+            pending_worker: None,
+            artifacts: Vec::new(),
+            accounted: false,
+            release_only: true,
+        };
+        let outcome = reconcile(&work, &Runtime::new(offline), &Probe, Instant::now);
+        assert!(outcome.released);
+        assert!(!outcome.disposed);
+    }
+
+    #[test]
     fn snapshot_retire_sql_settlement_failure_keeps_claim_armed_and_retries_after_backoff() {
         let f = Fixture::new();
         let golden = f.build(1, true);

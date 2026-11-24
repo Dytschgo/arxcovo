@@ -3187,6 +3187,9 @@ mod tests {
             let Some(vm) = work.kind.vm() else {
                 return runtime::Quiesced::Offline;
             };
+            if live.release_pending.contains(&vm) {
+                return runtime::Quiesced::Unconfirmed;
+            }
             if live.working.contains(&vm) {
                 if matches!(work.kind, crate::vm::reaper::CleanupKind::Expiry { .. })
                     && let Some(cancel) = live.snapshot_cancels.get(&vm)
@@ -3222,16 +3225,22 @@ mod tests {
         }
 
         fn graceful_stop(&self, work: &CleanupWork, deadline: Instant) -> runtime::StopDisposition {
+            let Some(vm) = work.kind.vm() else {
+                return runtime::StopDisposition::ChargedQuarantine;
+            };
             let boot = {
                 let mut live = self.live.lock().unwrap();
-                let Some(vm) = work.kind.vm() else {
-                    return runtime::StopDisposition::ChargedQuarantine;
-                };
-                if live.force_reap_only.contains(&vm) || live.stuck.contains(&vm) {
+                if live.force_reap_only.contains(&vm)
+                    || live.stuck.contains(&vm)
+                    || live.release_pending.contains(&vm)
+                {
                     return runtime::StopDisposition::ChargedQuarantine;
                 }
                 match live.boots.remove(&vm) {
-                    Some(Slot::Idle(boot)) => Some(*boot),
+                    Some(Slot::Idle(boot)) => {
+                        live.release_pending.insert(vm);
+                        Some(*boot)
+                    }
                     Some(slot) => {
                         live.boots.insert(vm, slot);
                         return runtime::StopDisposition::ChargedQuarantine;
@@ -3247,7 +3256,10 @@ mod tests {
                 .handle
                 .block_on(tokio::time::timeout_at(timeout, boot.stop()))
             {
-                Ok(Ok(())) => runtime::StopDisposition::CleanRelease,
+                Ok(Ok(())) => {
+                    self.live.lock().unwrap().release_pending.remove(&vm);
+                    runtime::StopDisposition::CleanRelease
+                }
                 _ => runtime::StopDisposition::ChargedQuarantine,
             }
         }
@@ -3258,11 +3270,14 @@ mod tests {
             };
             let boot = {
                 let mut live = self.live.lock().unwrap();
-                if live.stuck.contains(&vm) {
+                if live.stuck.contains(&vm) || live.release_pending.contains(&vm) {
                     return runtime::StopDisposition::ChargedQuarantine;
                 }
                 match live.boots.remove(&vm) {
-                    Some(Slot::Idle(boot)) => Some(*boot),
+                    Some(Slot::Idle(boot)) => {
+                        live.release_pending.insert(vm);
+                        Some(*boot)
+                    }
                     Some(slot) => {
                         live.boots.insert(vm, slot);
                         return runtime::StopDisposition::ChargedQuarantine;
@@ -3278,14 +3293,18 @@ mod tests {
                 .handle
                 .block_on(tokio::time::timeout_at(timeout, boot.force_release()))
             {
-                Ok(Ok(())) => runtime::StopDisposition::DirtyRelease,
+                Ok(Ok(())) => {
+                    self.live.lock().unwrap().release_pending.remove(&vm);
+                    runtime::StopDisposition::DirtyRelease
+                }
                 _ => runtime::StopDisposition::ChargedQuarantine,
             }
         }
 
         fn static_released(&self, vm: Id, _: Id, _: Instant) -> bool {
             let live = self.live.lock().unwrap();
-            !live.boots.contains_key(&vm)
+            !live.release_pending.contains(&vm)
+                && !live.boots.contains_key(&vm)
                 && !live.working.contains(&vm)
                 && !live.stuck.contains(&vm)
         }
@@ -3324,6 +3343,9 @@ mod tests {
         /// VMs whose next stop simulates a failed graceful powerdown followed
         /// by safe force-release (typed dirty disposition).
         dirty_stop: HashSet<Id>,
+        /// A removed Boot remains charged until its peer and guest joins succeed.
+        /// A timeout or failed join leaves the fixture unable to prove release.
+        release_pending: HashSet<Id>,
         /// TEST VMs whose expiry graceful stop fails so force-reap must run.
         force_reap_only: HashSet<Id>,
     }
@@ -3401,12 +3423,19 @@ mod tests {
 
         /// Release idle boots once every worker holding a slot is joined.
         pub(super) async fn release(self) -> Result<()> {
-            let boots = std::mem::take(&mut self.live.lock().unwrap().boots);
+            let (boots, release_pending) = {
+                let mut live = self.live.lock().unwrap();
+                (
+                    std::mem::take(&mut live.boots),
+                    !live.release_pending.is_empty(),
+                )
+            };
             for slot in boots.into_values() {
                 if let Slot::Idle(boot) = slot {
                     (*boot).release().await?;
                 }
             }
+            ensure!(!release_pending, "fixture boot release unconfirmed");
             Ok(())
         }
     }
@@ -3510,7 +3539,10 @@ mod tests {
             }
             let controller = &inventory.supervisor.controller;
             let mut registry = self.live.lock().unwrap();
-            if registry.working.contains(&vm) || registry.boots.contains_key(&vm) {
+            if registry.release_pending.contains(&vm)
+                || registry.working.contains(&vm)
+                || registry.boots.contains_key(&vm)
+            {
                 return inventory.refuse(action, Some(vm), Refusal::SnapshotOfflineRequired.into());
             }
             if let Some(route) = route.as_mut()
@@ -3626,6 +3658,9 @@ mod tests {
             let live = self.live.clone();
             let artifacts = self.artifacts.clone();
             let mut registry = self.live.lock().unwrap();
+            if registry.release_pending.contains(&id) {
+                return inventory.refuse(action, Some(id), Refusal::CleanupUnconfirmed.into());
+            }
             let (operation, vm) = match work {
                 Work::Build => {
                     let recipe = hex::encode(id);
@@ -4800,6 +4835,13 @@ mod tests {
         }
     }
 
+    type HarnessState = (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<AtomicI64>,
+        Arc<Mutex<HashMap<Id, Arc<FixtureOrigin>>>>,
+    );
+
     struct Harness {
         temp: tempfile::TempDir,
         media: std::path::PathBuf,
@@ -4854,12 +4896,7 @@ mod tests {
         /// Open a supervisor, fixture and server over existing state and
         /// fixture media, as a fresh foreground process would.
         async fn launch(
-            (temp, media, now, origins): (
-                tempfile::TempDir,
-                std::path::PathBuf,
-                Arc<AtomicI64>,
-                Arc<Mutex<HashMap<Id, Arc<FixtureOrigin>>>>,
-            ),
+            (temp, media, now, origins): HarnessState,
             fail_cancelled: bool,
             interrupt_on_fatal_accept: bool,
             web: bool,
@@ -6204,7 +6241,7 @@ mod tests {
         let ubu_active = fixture_pair_paths(&h, &ubu_vm, true);
         let backup_vars = h.media.join("tamper-backup-vars");
         fs::rename(&ubu_active[1], &backup_vars).unwrap();
-        fs::write(&ubu_active[1], b"vars").unwrap();
+        fs::copy(&backup_vars, &ubu_active[1]).unwrap();
         let bad_boot = terminal(
             &a,
             &call(
@@ -6237,9 +6274,12 @@ mod tests {
             .unwrap();
         let orig_digest = fake_pair.1[0].pin.sha256;
         fake_pair.1[0].pin.sha256 = [0xAA; 32];
-        assert!(
+        assert_eq!(
             store
                 .transact(|db| {
+                    // Model the next writer before its stop settles, so only the
+                    // epoch check rejects the displaced writer's digest.
+                    crate::store::vm::snapshot::invalidate_release(db, win_id, [0xEF; 16])?;
                     crate::store::vm::snapshot::prove_stop(
                         db,
                         win_id,
@@ -6248,7 +6288,9 @@ mod tests {
                         runtime::StopDisposition::CleanRelease,
                     )
                 })
-                .is_err()
+                .unwrap_err()
+                .to_string(),
+            "snapshot stop writer epoch changed"
         );
         let after_digest = store
             .transact(|db| {
@@ -7096,7 +7138,7 @@ mod tests {
             let mut file = fs::OpenOptions::new().write(true).open(&paths[0]).unwrap();
             file.seek(SeekFrom::Start(FIXTURE_CERT_MARKER_OFFSET))
                 .unwrap();
-            file.write_all(&[b'E']).unwrap();
+            file.write_all(b"E").unwrap();
             file.sync_all().unwrap();
         }
         assert_eq!(
@@ -7177,7 +7219,7 @@ mod tests {
             let mut file = fs::OpenOptions::new().write(true).open(&paths[0]).unwrap();
             file.seek(SeekFrom::Start(FIXTURE_CERT_MARKER_OFFSET))
                 .unwrap();
-            file.write_all(&[b'U']).unwrap();
+            file.write_all(b"U").unwrap();
             file.sync_all().unwrap();
         }
         assert_eq!(
@@ -7418,7 +7460,10 @@ mod tests {
             "succeeded"
         );
         drop(a);
-        h.shutdown().await.unwrap();
+        assert_eq!(
+            h.shutdown().await.unwrap_err().to_string(),
+            "server-drain-unconfirmed"
+        );
         let mut h = h.reopen(|_| {}).await;
         enroll(
             &h,
@@ -7493,6 +7538,69 @@ mod tests {
         ));
         drop(a);
         h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_boot_join_keeps_later_expiry_turns_unconfirmed() {
+        use crate::vm::{reaper::CleanupKind, runtime::ReaperRuntime};
+        for force in [false, true] {
+            let root = crate::service::application::tests::private_temp();
+            let fixture = Fixture::new(root.path(), Default::default());
+            let vm = [7; 16];
+            let mut boot = Boot::start(&Shutdown::default()).await.unwrap();
+            // A running blocking task cannot be aborted. Hold this join across
+            // the stop deadline, even on the forced path.
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, hold) = std::sync::mpsc::channel();
+            let (finished, joined) = tokio::sync::oneshot::channel();
+            let original = std::mem::replace(
+                &mut boot.guest,
+                tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    let _ = hold.recv();
+                    let _ = finished.send(());
+                    Ok(())
+                }),
+            );
+            started.await.unwrap();
+            fixture
+                .live
+                .lock()
+                .unwrap()
+                .boots
+                .insert(vm, Slot::Idle(Box::new(boot)));
+            let reaper = fixture.reaper();
+            tokio::task::spawn_blocking(move || {
+                let work = CleanupWork {
+                    kind: CleanupKind::Expiry { vm, activity_id: 1 },
+                    pending_worker: None,
+                    artifacts: Vec::new(),
+                    accounted: false,
+                    release_only: true,
+                };
+                let deadline = Instant::now() + Duration::from_millis(20);
+                let result = if force {
+                    reaper.force_reap(&work, deadline)
+                } else {
+                    reaper.graceful_stop(&work, deadline)
+                };
+                assert_eq!(result, runtime::StopDisposition::ChargedQuarantine);
+                let later = Instant::now() + Duration::from_secs(1);
+                assert!(matches!(
+                    reaper.quiesce(&work, later),
+                    runtime::Quiesced::Unconfirmed
+                ));
+                assert_eq!(
+                    reaper.force_reap(&work, later),
+                    runtime::StopDisposition::ChargedQuarantine
+                );
+            })
+            .await
+            .unwrap();
+            release.send(()).unwrap();
+            joined.await.unwrap();
+            original.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -11333,7 +11441,7 @@ mod tests {
         for args in [
             json!({"vm_id":vm,"request_id":key(6),"script":null}),
             json!({"vm_id":vm,"request_id":key(6),"script":"\0"}),
-            json!({"vm_id":vm,"request_id":key(6),"script":"é".repeat(2049)}),
+            json!({"vm_id":vm,"request_id":key(6),"script":"ÃƒÆ’Ã‚Â©".repeat(2049)}),
             json!({"vm_id":vm,"request_id":key(6),"script":"exit 0","timeout_s":1.5}),
             json!({"vm_id":vm,"request_id":key(6),"script":"exit 0","timeout_s":"30"}),
             json!({"vm_id":vm,"request_id":key(6),"script":"exit 0","timeout_s":121}),
