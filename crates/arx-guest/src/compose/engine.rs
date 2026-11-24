@@ -199,6 +199,25 @@ pub fn compose_down(project: &str, revision: u64) -> Invocation {
     }
 }
 
+/// Stops one broker-attributed container by its verified hex ID.
+pub fn container_stop(id: &str) -> Invocation {
+    Invocation {
+        argv: global(&["container", "stop", id]),
+        timeout: STOP_TIMEOUT,
+        capture: false,
+    }
+}
+
+/// Removes one stopped broker-attributed container by its verified hex ID.
+/// Never passes `--volumes`, `-v` or `--force`.
+pub fn container_rm(id: &str) -> Invocation {
+    Invocation {
+        argv: global(&["container", "rm", id]),
+        timeout: STOP_TIMEOUT,
+        capture: false,
+    }
+}
+
 pub fn compose_ps(project: &str, revision: u64) -> Invocation {
     Invocation {
         argv: compose(project, revision, &["ps", "--all", "--format", "json"]),
@@ -207,11 +226,25 @@ pub fn compose_ps(project: &str, revision: u64) -> Invocation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedContainer {
+    pub(crate) view: ServiceView,
+    pub(crate) id: Option<String>,
+}
+
+pub(crate) fn is_container_id(text: &str) -> bool {
+    (12..=64).contains(&text.len())
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Parses `compose ps --format json` (one object per line, or one array)
-/// into views for the project's own declared services. Unknown services and
-/// containers labelled for another project are ignored. Returns `None` for
-/// output that is not that shape.
-pub fn parse_ps(stdout: &[u8], project: &str, services: &[&str]) -> Option<Vec<ServiceView>> {
+/// into every broker-attributed container for `project`, including services
+/// retired by a later release. Containers without `PROJECT_LABEL` or labelled
+/// for another project are ignored. Returns `None` for output that is not
+/// that shape.
+pub(crate) fn parse_ps_attributed(stdout: &[u8], project: &str) -> Option<Vec<ObservedContainer>> {
     let text = std::str::from_utf8(stdout).ok()?;
     let trimmed = text.trim();
     let objects: Vec<serde_json::Value> = if trimmed.is_empty() {
@@ -229,7 +262,7 @@ pub fn parse_ps(stdout: &[u8], project: &str, services: &[&str]) -> Option<Vec<S
     if objects.len() > 64 {
         return None;
     }
-    let mut views = Vec::new();
+    let mut containers = Vec::new();
     for object in &objects {
         let field = |key: &str| object.get(key).and_then(serde_json::Value::as_str);
         let name = field("Service")?;
@@ -244,40 +277,58 @@ pub fn parse_ps(stdout: &[u8], project: &str, services: &[&str]) -> Option<Vec<S
         if label(PROJECT_LABEL) != Some(project) {
             continue;
         }
-        let Some(declared) = services.iter().find(|declared| **declared == name) else {
-            continue;
-        };
-        if views
-            .iter()
-            .any(|view: &ServiceView| view.name == *declared)
-        {
-            // Two containers for one service: report the conflict as unknown.
-            for view in views.iter_mut().filter(|view| view.name == *declared) {
-                view.state = ServiceState::Unknown;
-            }
-            continue;
-        }
-        views.push(ServiceView {
-            name: (*declared).to_owned(),
-            state: match field("State").unwrap_or("") {
-                "created" => ServiceState::Created,
-                "running" => ServiceState::Running,
-                "restarting" => ServiceState::Restarting,
-                "paused" => ServiceState::Paused,
-                "exited" => ServiceState::Exited,
-                "dead" => ServiceState::Dead,
-                "removing" => ServiceState::Removing,
-                _ => ServiceState::Unknown,
+        let id = field("ID")
+            .filter(|id| is_container_id(id))
+            .map(str::to_owned);
+        containers.push(ObservedContainer {
+            view: ServiceView {
+                name: name.to_owned(),
+                state: match field("State").unwrap_or("") {
+                    "created" => ServiceState::Created,
+                    "running" => ServiceState::Running,
+                    "restarting" => ServiceState::Restarting,
+                    "paused" => ServiceState::Paused,
+                    "exited" => ServiceState::Exited,
+                    "dead" => ServiceState::Dead,
+                    "removing" => ServiceState::Removing,
+                    _ => ServiceState::Unknown,
+                },
+                health: match field("Health").unwrap_or("") {
+                    "" => HealthState::None,
+                    "starting" => HealthState::Starting,
+                    "healthy" => HealthState::Healthy,
+                    _ => HealthState::Unhealthy,
+                },
+                revision: label(REVISION_LABEL).and_then(|value| value.parse().ok()),
             },
-            health: match field("Health").unwrap_or("") {
-                "" => HealthState::None,
-                "starting" => HealthState::Starting,
-                "healthy" => HealthState::Healthy,
-                _ => HealthState::Unhealthy,
-            },
-            revision: label(REVISION_LABEL).and_then(|value| value.parse().ok()),
+            id,
         });
     }
+    containers.sort_by(|a, b| a.view.name.cmp(&b.view.name).then(a.id.cmp(&b.id)));
+    Some(containers)
+}
+
+pub(crate) fn to_service_views(containers: &[ObservedContainer]) -> Vec<ServiceView> {
+    let mut views: Vec<ServiceView> = Vec::new();
+    for container in containers {
+        if let Some(existing) = views
+            .iter_mut()
+            .find(|view| view.name == container.view.name)
+        {
+            // Two containers for one service: report the conflict as unknown.
+            existing.state = ServiceState::Unknown;
+            continue;
+        }
+        views.push(container.view.clone());
+    }
     views.sort_by(|a, b| a.name.cmp(&b.name));
-    Some(views)
+    views
+}
+
+/// Parses `compose ps --format json` into views for every broker-attributed
+/// container of `project`, including services retired by a later release.
+/// Containers labelled for another project or without `PROJECT_LABEL` are
+/// ignored.
+pub fn parse_ps(stdout: &[u8], project: &str) -> Option<Vec<ServiceView>> {
+    parse_ps_attributed(stdout, project).map(|containers| to_service_views(&containers))
 }

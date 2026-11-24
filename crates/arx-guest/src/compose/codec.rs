@@ -1,8 +1,9 @@
 //! Strict encodings for the Compose channel and wiping of controlled buffers.
 
+use std::fmt;
 use std::sync::atomic::{Ordering, compiler_fence};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -23,8 +24,10 @@ pub(crate) fn wipe_string(text: &mut String) {
 }
 
 /// Base64 text that carries secret bytes. It is never formatted, and its
-/// buffer is wiped when dropped.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// buffer is wiped when dropped. Deserialization accepts only a borrowed JSON
+/// string slice (no escape sequences) so parser scratch buffers never hold
+/// secret bytes.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct SecretText(String);
 
@@ -35,6 +38,45 @@ impl SecretText {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Moves the text out for non-secret payloads (such as manifest chunks)
+    /// once the frame tag is known not to be a secret frame.
+    pub(crate) fn into_non_secret_string(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretText {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BorrowedSecretVisitor;
+
+        impl<'de> de::Visitor<'de> for BorrowedSecretVisitor {
+            type Value = SecretText;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an unescaped base64 JSON string")
+            }
+
+            fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+                // Allocate once at the exact length so no intermediate buffer
+                // escapes the Drop wipe path.
+                let mut text = String::with_capacity(value.len());
+                text.push_str(value);
+                Ok(SecretText(text))
+            }
+
+            fn visit_str<E: de::Error>(self, _value: &str) -> Result<Self::Value, E> {
+                Err(E::custom("escaped secret text is forbidden"))
+            }
+
+            fn visit_string<E: de::Error>(self, mut value: String) -> Result<Self::Value, E> {
+                wipe_string(&mut value);
+                Err(E::custom("owned secret text is forbidden"))
+            }
+        }
+
+        deserializer.deserialize_str(BorrowedSecretVisitor)
     }
 }
 
@@ -144,6 +186,30 @@ pub fn encode_base64(bytes: &[u8]) -> String {
 /// Lowercase hexadecimal SHA-256.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Domain-separated SHA-256 commitment to a secret delivery's attribution and
+/// decoded bytes, used only to detect conflicting operation-ID replays without
+/// persisting plaintext or base64 bytes.
+pub(crate) fn secret_op_digest(
+    generation: u64,
+    project: &str,
+    slot: &str,
+    epoch: u64,
+    bytes: &[u8],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"arx-secret-op-v1\0");
+    hasher.update(generation.to_be_bytes());
+    hasher.update(b"\0");
+    hasher.update(project.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(slot.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(epoch.to_be_bytes());
+    hasher.update(b"\0");
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 pub(crate) fn is_lower_hex(text: &str, len: usize) -> bool {

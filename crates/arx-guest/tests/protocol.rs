@@ -753,6 +753,30 @@ mod compose_session {
         }
     }
 
+    struct ScriptsUnavailable;
+
+    impl ScriptExecutor for ScriptsUnavailable {
+        fn script_execution(&self) -> ScriptExecution {
+            ScriptExecution::Unavailable
+        }
+
+        fn run_script(&mut self, _: &str, _: u32) -> ScriptOutcome {
+            ScriptOutcome::Unavailable
+        }
+    }
+
+    struct PanicOnScript;
+
+    impl ScriptExecutor for PanicOnScript {
+        fn script_execution(&self) -> ScriptExecution {
+            ScriptExecution::Available
+        }
+
+        fn run_script(&mut self, _: &str, _: u32) -> ScriptOutcome {
+            panic!("compose-qualified guest dispatched a legacy script");
+        }
+    }
+
     fn service() -> ComposeService {
         ComposeService::new(Box::new(NoEngine), Box::new(NoStore), Box::new(ZeroClock)).unwrap()
     }
@@ -763,7 +787,7 @@ mod compose_session {
 
     fn compose(input: &[u8]) -> (Result<(), ProtocolError>, Vec<u8>) {
         let mut output = Vec::new();
-        let result = serve_with_compose(input, &mut output, &mut Fixed, Some(&service()));
+        let result = serve_with_compose(input, &mut output, &mut PanicOnScript, Some(&service()));
         (result, output)
     }
 
@@ -785,12 +809,24 @@ mod compose_session {
             frames(&[HELLO, br#"{"type":"Ping","id":0}"#]),
             frame(HELLO)[..9].to_vec(),
         ];
-        for input in streams {
+        for input in &streams {
+            // Non-Compose guests keep TEST/Windows bytes and scripts identically.
             let mut legacy = Vec::new();
             let legacy_result = serve(input.as_slice(), &mut legacy, &mut Fixed);
-            let (compose_result, compose_bytes) = compose(&input);
-            assert_eq!(compose_result, legacy_result);
-            assert_eq!(compose_bytes, legacy);
+            let mut non_compose = Vec::new();
+            let non_compose_result =
+                serve_with_compose(input.as_slice(), &mut non_compose, &mut Fixed, None);
+            assert_eq!(non_compose_result, legacy_result);
+            assert_eq!(non_compose, legacy);
+
+            // A Compose-qualified guest keeps exact legacy framing and disables
+            // scripts even if a script-capable executor is supplied (design §3).
+            let mut no_scripts = Vec::new();
+            let no_scripts_result =
+                serve(input.as_slice(), &mut no_scripts, &mut ScriptsUnavailable);
+            let (compose_result, compose_bytes) = compose(input);
+            assert_eq!(compose_result, no_scripts_result);
+            assert_eq!(compose_bytes, no_scripts);
         }
         // A legacy guest still refuses the Compose handshake as unknown JSON.
         let mut output = Vec::new();
@@ -885,17 +921,18 @@ mod compose_session {
         ));
         assert!(bytes.is_empty());
 
-        // A Compose session answers Ping and refuses scripts; a legacy Hello
-        // starts a fresh legacy session.
+        // A Compose session answers Ping and refuses scripts; switching to a
+        // legacy Hello on a Compose-qualified guest still keeps scripts
+        // unavailable (design §3) and never dispatches to the script executor.
         let (result, bytes) = compose(&frames(&[COMPOSE_HELLO, PING, HELLO, SCRIPT]));
         assert_eq!(result, Ok(()));
         let mut expected = frame(COMPOSE_HELLO_ACK);
         expected.extend(frame(br#"{"type":"Pong","id":1}"#));
         expected.extend(frame(
-            br#"{"type":"HelloAck","version":1,"challenge":"0123456789abcdef0123456789abcdef","script_execution":"available"}"#,
+            br#"{"type":"HelloAck","version":1,"challenge":"0123456789abcdef0123456789abcdef","script_execution":"unavailable"}"#,
         ));
         expected.extend(frame(
-            br#"{"type":"ScriptResult","id":2,"status":"Exited","exit_code":3}"#,
+            br#"{"type":"ScriptResult","id":2,"status":"Unavailable"}"#,
         ));
         assert_eq!(bytes, expected);
         let (result, bytes) = compose(&frames(&[COMPOSE_HELLO, SCRIPT]));
@@ -998,5 +1035,46 @@ mod compose_session {
         for haystack in [text, format!("{error:?} {error}")] {
             assert!(!haystack.contains(&canary) && !haystack.contains(&encoded));
         }
+    }
+
+    #[test]
+    fn escaped_secret_json_and_malformed_compose_frames_are_rejected() {
+        let escaped_cases: &[&[u8]] = &[
+            // Unicode escape in Base64 secret field.
+            br#"{"type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1,"data":"\u0041\u0041\u0041\u0041"}"#,
+            // Forward-slash escape in Base64 secret field.
+            br#"{"type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1,"data":"QUJ\/"}"#,
+            // Escaped type tag on a secret frame.
+            br#"{"type":"\u0043omposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1,"data":"QUFBQQ=="}"#,
+            // Secret field before type, followed by an unknown field.
+            br#"{"data":"QUFBQQ==","type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1,"extra":true}"#,
+            // Cross-variant extra field on a Compose request.
+            br#"{"type":"ComposeStatus","id":3,"project_id":"calm-life","revision":1}"#,
+            // Duplicate field on a Compose request.
+            br#"{"type":"ComposeStatus","id":3,"id":4,"project_id":"calm-life"}"#,
+        ];
+        for payload in escaped_cases {
+            let (result, bytes) = compose(&frames(&[COMPOSE_HELLO, payload]));
+            assert_eq!(
+                result,
+                Err(ProtocolError::InvalidJson),
+                "session accepted: {}",
+                String::from_utf8_lossy(payload)
+            );
+            assert_eq!(bytes, frame(COMPOSE_HELLO_ACK));
+            assert!(matches!(
+                read_frame::<ComposeRequest>(&mut frame(payload).as_slice()),
+                Err(ProtocolError::InvalidJson)
+            ));
+        }
+        // Even direct serde_json deserialization refuses escaped SecretText.
+        let escaped = r#"{"type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1,"data":"\u0041\u0041\u0041\u0041"}"#;
+        assert!(serde_json::from_str::<ComposeRequest>(escaped).is_err());
+        // Unescaped SecretText in any key order still decodes cleanly.
+        let reordered = br#"{"data":"QUFBQQ==","type":"ComposeSecretPut","id":4,"operation_id":"00000000000000000000000000000000","generation":7,"project_id":"calm-life","slot":"admin_password","epoch":1}"#;
+        assert!(matches!(
+            read_frame::<ComposeRequest>(&mut frame(reordered).as_slice()),
+            Ok(Some(ComposeRequest::ComposeSecretPut { epoch: 1, .. }))
+        ));
     }
 }

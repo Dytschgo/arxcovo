@@ -18,9 +18,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::codec::{SecretText, decode_secret, sha256_hex, wipe};
+use super::codec::{SecretText, decode_secret, secret_op_digest, sha256_hex, wipe};
 use super::engine::{
-    self, Clock, CommandRunner, HEALTH_ATTEMPTS, HEALTH_INTERVAL, RunResult, parse_ps,
+    self, Clock, CommandRunner, HEALTH_ATTEMPTS, HEALTH_INTERVAL, ObservedContainer, RunResult,
+    parse_ps_attributed, to_service_views,
 };
 use super::layout::{self, loopback_port, volume_name, volume_token};
 use super::manifest::{MAX_PROJECTS, MAX_VOLUMES, Project, ProjectManifest, VolumeSpec};
@@ -36,6 +37,8 @@ const STATE_VERSION: u32 = 1;
 /// Committed staged releases held for deploy. Older ones are dropped first.
 pub const MAX_STAGED: usize = 8;
 pub const MAX_JOURNAL: usize = 64;
+/// Evicted settled operation IDs retained so trimmed IDs never re-execute.
+pub const MAX_TOMBSTONES: usize = 4096;
 pub const MAX_LOG: usize = 128;
 pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -85,6 +88,8 @@ struct ProjectRecord {
     last_rendered: Option<u64>,
     recovery_required: bool,
     observed: Vec<ServiceView>,
+    #[serde(default)]
+    observed_ids: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -106,6 +111,17 @@ struct SecretRecord {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SecretOpRecord {
+    operation_id: String,
+    generation: u64,
+    project_id: String,
+    slot: String,
+    epoch: u64,
+    digest: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OperationRecord {
     operation_id: String,
     kind: OperationKind,
@@ -116,6 +132,16 @@ struct OperationRecord {
     stage: OperationStage,
     failure: Option<FailureCode>,
     restored_previous: bool,
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    slot: Option<String>,
+    #[serde(default)]
+    epoch: Option<u64>,
+    #[serde(default)]
+    services: Vec<String>,
+    #[serde(default)]
+    prior_container_ids: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,6 +151,10 @@ struct State {
     projects: BTreeMap<String, ProjectRecord>,
     volumes: BTreeMap<String, VolumeRecord>,
     operations: Vec<OperationRecord>,
+    #[serde(default)]
+    secret_ops: Vec<SecretOpRecord>,
+    #[serde(default)]
+    tombstones: VecDeque<String>,
     secrets: BTreeMap<String, SecretRecord>,
     log: VecDeque<LogEntry>,
     next_log_seq: u64,
@@ -137,6 +167,8 @@ impl State {
             projects: BTreeMap::new(),
             volumes: BTreeMap::new(),
             operations: Vec::new(),
+            secret_ops: Vec::new(),
+            tombstones: VecDeque::new(),
             secrets: BTreeMap::new(),
             log: VecDeque::new(),
             next_log_seq: 1,
@@ -152,6 +184,8 @@ impl State {
             || state.projects.len() > MAX_PROJECTS
             || state.volumes.len() > MAX_VOLUMES
             || state.operations.len() > MAX_JOURNAL
+            || state.secret_ops.len() > MAX_JOURNAL
+            || state.tombstones.len() > MAX_TOMBSTONES
             || state.log.len() > MAX_LOG
         {
             return Err(StoreError);
@@ -190,6 +224,7 @@ impl Drop for Staging {
 
 struct Staged {
     digest: String,
+    total_bytes: usize,
     project: Project,
 }
 
@@ -251,7 +286,7 @@ enum Plan {
         project: Project,
         slot: u8,
         revision: u64,
-        prior: Option<(Project, u64)>,
+        prior: Option<(Project, u64, Desired)>,
     },
     Start {
         project: Project,
@@ -271,6 +306,7 @@ enum Plan {
         slot: u8,
         revision: u64,
         services: Vec<String>,
+        prior_container_ids: BTreeMap<String, Vec<String>>,
     },
 }
 
@@ -284,6 +320,7 @@ struct Settlement {
     clear_pending: bool,
     recovery_required: Option<bool>,
     observed: Option<Vec<ServiceView>>,
+    observed_ids: Option<BTreeMap<String, Vec<String>>>,
     event: LogEvent,
 }
 
@@ -298,6 +335,7 @@ impl Settlement {
             clear_pending: false,
             recovery_required: Some(false),
             observed: None,
+            observed_ids: None,
             event,
         }
     }
@@ -312,6 +350,7 @@ impl Settlement {
             clear_pending: false,
             recovery_required: None,
             observed: None,
+            observed_ids: None,
             event: LogEvent::OperationFailed,
         }
     }
@@ -326,14 +365,29 @@ impl Settlement {
             clear_pending: false,
             recovery_required: None,
             observed: None,
+            observed_ids: None,
             event: LogEvent::OperationAmbiguous,
         }
     }
 
-    fn observed(mut self, views: Vec<ServiceView>) -> Self {
-        self.observed = Some(views);
+    fn observed_containers(mut self, containers: &[ObservedContainer]) -> Self {
+        self.observed = Some(to_service_views(containers));
+        self.observed_ids = Some(collect_container_ids(containers));
         self
     }
+}
+
+fn collect_container_ids(containers: &[ObservedContainer]) -> BTreeMap<String, Vec<String>> {
+    let mut ids: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for container in containers {
+        if let Some(id) = &container.id {
+            let entry = ids.entry(container.view.name.clone()).or_default();
+            if !entry.contains(id) {
+                entry.push(id.clone());
+            }
+        }
+    }
+    ids
 }
 
 enum Step {
@@ -522,7 +576,17 @@ impl ComposeService {
         let mut inner = lock(&self.shared.inner);
         // The quota holds one incomplete staging; a new one replaces it.
         inner.staging = None;
-        if inner.staged.iter().any(|staged| staged.digest == digest) {
+        if let Some(pos) = inner
+            .staged
+            .iter()
+            .position(|staged| staged.digest == digest)
+        {
+            if inner.staged[pos].total_bytes != total {
+                return reject(id, RejectCode::StageSize);
+            }
+            if let Some(entry) = inner.staged.remove(pos) {
+                inner.staged.push_back(entry);
+            }
             return ComposeResponse::ComposeStageProgress {
                 id,
                 digest,
@@ -578,11 +642,19 @@ impl ComposeService {
 
     fn stage_commit(&self, id: u32, digest: &str) -> ComposeResponse {
         let mut inner = lock(&self.shared.inner);
-        if let Some(staged) = inner.staged.iter().find(|staged| staged.digest == digest) {
+        if let Some(pos) = inner
+            .staged
+            .iter()
+            .position(|staged| staged.digest == digest)
+        {
+            let project_id = inner.staged[pos].project.id().to_owned();
+            if let Some(entry) = inner.staged.remove(pos) {
+                inner.staged.push_back(entry);
+            }
             return ComposeResponse::ComposeReleaseStaged {
                 id,
                 digest: digest.to_owned(),
-                project_id: staged.project.id().to_owned(),
+                project_id,
             };
         }
         let Some(staging) = inner.staging.take_if(|s| s.digest == digest) else {
@@ -595,6 +667,7 @@ impl ComposeService {
         if sha256_hex(&staging.bytes) != digest {
             return reject(id, RejectCode::StageDigest);
         }
+        let total_bytes = staging.total;
         let project = match Project::parse(&staging.bytes) {
             Ok(project) => project,
             Err(rule) => {
@@ -612,6 +685,7 @@ impl ComposeService {
         }
         inner.staged.push_back(Staged {
             digest: digest.to_owned(),
+            total_bytes,
             project,
         });
         ComposeResponse::ComposeReleaseStaged {
@@ -637,6 +711,7 @@ impl ComposeService {
             OperationKind::Deploy,
             &project_id,
             Some(revision),
+            Some(digest),
         ) {
             return response;
         }
@@ -666,6 +741,7 @@ impl ComposeService {
                         Project::validate(committed.manifest.clone())
                             .expect("state manifests are validated at load"),
                         committed.revision,
+                        record.desired,
                     )
                 });
                 (record.slot, prior)
@@ -706,6 +782,7 @@ impl ComposeService {
                 last_rendered: None,
                 recovery_required: false,
                 observed: Vec::new(),
+                observed_ids: BTreeMap::new(),
             });
         let old_pending = record.pending.replace(target);
         let plan = Plan::Deploy {
@@ -720,6 +797,7 @@ impl ComposeService {
             OperationKind::Deploy,
             &project_id,
             revision,
+            Some(digest.to_owned()),
             plan,
         ) {
             Ok(response) => with_id(response, id),
@@ -742,6 +820,7 @@ impl ComposeService {
             &operation_id,
             OperationKind::Start,
             &project_id,
+            None,
             None,
         ) {
             return response;
@@ -772,6 +851,7 @@ impl ComposeService {
             OperationKind::Start,
             &project_id,
             revision,
+            None,
             plan,
         ) {
             Ok(response) => with_id(response, id),
@@ -787,7 +867,7 @@ impl ComposeService {
         kind: OperationKind,
     ) -> ComposeResponse {
         let mut inner = lock(&self.shared.inner);
-        if let Some(response) = existing(&inner, id, &operation_id, kind, &project_id, None) {
+        if let Some(response) = existing(&inner, id, &operation_id, kind, &project_id, None, None) {
             return response;
         }
         if let Some(code) = gate(&inner, &project_id) {
@@ -815,7 +895,15 @@ impl ComposeService {
                 revision,
             }
         };
-        match self.launch(&mut inner, operation_id, kind, &project_id, revision, plan) {
+        match self.launch(
+            &mut inner,
+            operation_id,
+            kind,
+            &project_id,
+            revision,
+            None,
+            plan,
+        ) {
             Ok(response) => with_id(response, id),
             Err(code) => reject(id, code),
         }
@@ -823,6 +911,7 @@ impl ComposeService {
 
     /// Journals a Running entry, persists it, then starts the worker. The
     /// returned reply is built before the worker runs, so it is Running.
+    #[allow(clippy::too_many_arguments)]
     fn launch(
         &self,
         inner: &mut MutexGuard<'_, Inner>,
@@ -830,9 +919,10 @@ impl ComposeService {
         kind: OperationKind,
         project_id: &str,
         revision: u64,
+        digest: Option<String>,
         plan: Plan,
     ) -> Result<ComposeResponse, RejectCode> {
-        trim_journal(&mut inner.state.operations);
+        let evicted = trim_journal(&mut inner.state)?;
         if inner.state.operations.len() >= MAX_JOURNAL {
             return Err(RejectCode::JournalFull);
         }
@@ -846,11 +936,17 @@ impl ComposeService {
             stage: OperationStage::Queued,
             failure: None,
             restored_previous: false,
+            digest,
+            slot: None,
+            epoch: None,
+            services: Vec::new(),
+            prior_container_ids: BTreeMap::new(),
         };
         let response = operation_state(1, &record);
         inner.state.operations.push(record);
         if self.persist(inner).is_err() {
             inner.state.operations.pop();
+            restore_evicted_op(&mut inner.state, evicted);
             return Err(RejectCode::StoreFailure);
         }
         self.log(inner, project_id, LogEvent::OperationStarted, None, None);
@@ -904,10 +1000,12 @@ impl ComposeService {
         if inner.running.is_some() {
             return reject(id, RejectCode::Busy);
         }
-        let (kind, project_id, revision) = (
+        let (kind, project_id, revision, op_services, prior_ids) = (
             operation.kind,
             operation.project_id.clone(),
             operation.revision,
+            operation.services.clone(),
+            operation.prior_container_ids.clone(),
         );
         let Some(record) = inner.state.projects.get(&project_id) else {
             return reject(id, RejectCode::UnknownProject);
@@ -935,15 +1033,15 @@ impl ComposeService {
                 runner: &mut **runner,
                 last_observed: Vec::new(),
             };
-            steps.observe(&project, revision, slot, kind)
+            steps.observe(&project, revision, slot, kind, &op_services, &prior_ids)
         };
 
         let mut inner = lock(&self.shared.inner);
         inner.running = None;
         let response = match observed {
             None => reject(id, RejectCode::EngineUnavailable),
-            Some((applied, views)) => {
-                let any_container = !views.is_empty();
+            Some((applied, containers)) => {
+                let any_container = !containers.is_empty();
                 let settlement = if applied {
                     let mut settlement = Settlement::succeeded(
                         LogEvent::Reconciled,
@@ -959,14 +1057,15 @@ impl ComposeService {
                     let mut settlement = Settlement::failed(FailureCode::NotApplied);
                     settlement.event = LogEvent::Reconciled;
                     settlement.clear_pending = kind == OperationKind::Deploy;
-                    settlement.recovery_required = Some(any_container);
+                    settlement.recovery_required =
+                        Some(any_container || kind == OperationKind::Recreate);
                     settlement
                 };
                 apply_settlement(
                     &self.shared,
                     &mut inner,
                     operation_id,
-                    settlement.observed(views),
+                    settlement.observed_containers(&containers),
                 );
                 let _ = self.persist(&inner);
                 operation_state(id, find(&inner, operation_id).expect("journaled"))
@@ -986,19 +1085,6 @@ impl ComposeService {
             .as_ref()
             .map(|committed| committed.revision)
             .or(record.last_rendered);
-        let names: Vec<String> = [&record.committed, &record.pending]
-            .into_iter()
-            .flatten()
-            .next()
-            .map(|revision| {
-                revision
-                    .manifest
-                    .services
-                    .iter()
-                    .map(|service| service.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
         let idle = inner.running.is_none();
         drop(inner);
 
@@ -1006,15 +1092,12 @@ impl ComposeService {
         // the last recorded observation. The query is one bounded `ps`.
         let live = match (idle, revision) {
             (true, Some(revision)) => match self.shared.runner.try_lock() {
-                Ok(mut runner) => {
-                    let names: Vec<&str> = names.iter().map(String::as_str).collect();
-                    match runner.run(&engine::compose_ps(project_id, revision)) {
-                        RunResult::Exited { code: 0, stdout } => {
-                            parse_ps(&stdout, project_id, &names)
-                        }
-                        _ => None,
+                Ok(mut runner) => match runner.run(&engine::compose_ps(project_id, revision)) {
+                    RunResult::Exited { code: 0, stdout } => {
+                        parse_ps_attributed(&stdout, project_id)
                     }
-                }
+                    _ => None,
+                },
                 Err(_) => None,
             },
             _ => None,
@@ -1026,8 +1109,9 @@ impl ComposeService {
             return reject(id, RejectCode::UnknownProject);
         };
         let observation = match live {
-            Some(views) => {
-                record.observed = views;
+            Some(containers) => {
+                record.observed = to_service_views(&containers);
+                record.observed_ids = collect_container_ids(&containers);
                 Observation::Live
             }
             None => Observation::Recorded,
@@ -1094,40 +1178,114 @@ impl ComposeService {
         if inner.generation != Some(generation) {
             return reject(id, RejectCode::GenerationMismatch);
         }
+        // Check operation-ID replay/conflict before touching storage.
+        if is_tombstoned(&inner, &operation_id) {
+            return reject(id, RejectCode::OperationConflict);
+        }
+        if let Some(known) = find(&inner, &operation_id).cloned() {
+            let content_matches = decode_secret(&data, MAX_SECRET).is_some_and(|bytes| {
+                known.digest.as_deref()
+                    == Some(
+                        secret_op_digest(generation, &project_id, &slot, epoch, bytes.as_slice())
+                            .as_str(),
+                    )
+            });
+            drop(data);
+            if known.kind == OperationKind::Recreate
+                && known.project_id == project_id
+                && known.generation == generation
+                && known.slot.as_deref() == Some(slot.as_str())
+                && known.epoch == Some(epoch)
+                && content_matches
+            {
+                return ComposeResponse::ComposeSecretAccepted {
+                    id,
+                    project_id,
+                    slot,
+                    epoch,
+                    recreate: Some(view(&known)),
+                };
+            }
+            return reject(id, RejectCode::OperationConflict);
+        }
+        if let Some(known) = inner
+            .state
+            .secret_ops
+            .iter()
+            .find(|op| op.operation_id == operation_id)
+            .cloned()
+        {
+            let content_matches = decode_secret(&data, MAX_SECRET).is_some_and(|bytes| {
+                known.digest
+                    == secret_op_digest(generation, &project_id, &slot, epoch, bytes.as_slice())
+            });
+            drop(data);
+            if known.generation == generation
+                && known.project_id == project_id
+                && known.slot == slot
+                && known.epoch == epoch
+                && content_matches
+            {
+                return ComposeResponse::ComposeSecretAccepted {
+                    id,
+                    project_id,
+                    slot,
+                    epoch,
+                    recreate: None,
+                };
+            }
+            return reject(id, RejectCode::OperationConflict);
+        }
+
+        // Resolve the slot against the target staged release first (so new
+        // slots and owner changes can be delivered before deploy), falling
+        // back to the committed manifest.
         let record = inner.state.projects.get(&project_id);
         let committed = record
             .and_then(|record| record.committed.as_ref())
             .map(|committed| {
                 Project::validate(committed.manifest.clone()).expect("state manifests validated")
             });
-        let defining = committed.or_else(|| {
-            inner
-                .staged
-                .iter()
-                .rev()
-                .find(|staged| staged.project.id() == project_id)
-                .map(|staged| staged.project.clone())
-        });
-        let Some(project) = defining else {
+        let any_staged = inner
+            .staged
+            .iter()
+            .any(|staged| staged.project.id() == project_id);
+        if !any_staged && committed.is_none() {
             return reject(id, RejectCode::UnknownProject);
-        };
-        let Some(owner) = project.slot_owner(&slot) else {
+        }
+        let staged_owner = inner
+            .staged
+            .iter()
+            .rev()
+            .find(|staged| staged.project.id() == project_id)
+            .and_then(|staged| staged.project.slot_owner(&slot))
+            .or_else(|| {
+                inner
+                    .staged
+                    .iter()
+                    .rev()
+                    .filter(|staged| staged.project.id() == project_id)
+                    .find_map(|staged| staged.project.slot_owner(&slot))
+            });
+        let committed_owner = committed
+            .as_ref()
+            .and_then(|project| project.slot_owner(&slot));
+        let Some(owner) = staged_owner.or(committed_owner) else {
             return reject(id, RejectCode::UnknownSlot);
         };
+
         let key = secret_key(&project_id, &slot);
         let prior = inner.state.secrets.get(&key).copied();
         if prior.is_some_and(|prior| epoch < prior.epoch) {
             return reject(id, RejectCode::StaleEpoch);
         }
-        let known = find(&inner, &operation_id).cloned();
-        if known.as_ref().is_some_and(|known| {
-            known.kind != OperationKind::Recreate || known.project_id != project_id
-        }) {
-            return reject(id, RejectCode::OperationConflict);
-        }
         let started = record
             .is_some_and(|record| record.desired == Desired::Started && record.committed.is_some());
-        let rotation = known.is_none() && started && prior.is_some_and(|prior| epoch > prior.epoch);
+        // Rotate only when the currently running committed release uses this
+        // slot with the same owner. Delivery for a staged release's new slot
+        // or changed owner prepares tmpfs without recreating the old release.
+        let rotation =
+            started && committed_owner == Some(owner) && prior.is_some_and(|p| epoch > p.epoch);
         if rotation && let Some(code) = gate(&inner, &project_id) {
             return reject(id, code);
         }
@@ -1135,20 +1293,168 @@ impl ComposeService {
             return reject(id, RejectCode::SecretSize);
         };
         drop(data);
-        let written =
-            lock(&self.shared.store).write_secret(&project_id, &slot, owner, bytes.as_slice());
-        drop(bytes);
-        if written.is_err() {
-            return reject(id, RejectCode::SecretWrite);
+        let content_digest =
+            secret_op_digest(generation, &project_id, &slot, epoch, bytes.as_slice());
+
+        if rotation {
+            let committed_project = committed.expect("started project is committed");
+            let (project_slot, revision, observed_ids) = {
+                let record = inner
+                    .state
+                    .projects
+                    .get(&project_id)
+                    .expect("started project");
+                let rev = record
+                    .committed
+                    .as_ref()
+                    .expect("started project is committed")
+                    .revision;
+                (record.slot, rev, record.observed_ids.clone())
+            };
+            let affected_services = committed_project.services_using(&slot);
+            let mut prior_container_ids = BTreeMap::new();
+            for service in &affected_services {
+                if let Some(ids) = observed_ids.get(service) {
+                    prior_container_ids.insert(service.clone(), ids.clone());
+                }
+            }
+            let evicted = match trim_journal(&mut inner.state) {
+                Ok(evicted) => evicted,
+                Err(code) => return reject(id, code),
+            };
+            if inner.state.operations.len() >= MAX_JOURNAL {
+                return reject(id, RejectCode::JournalFull);
+            }
+            let op_record = OperationRecord {
+                operation_id: operation_id.clone(),
+                kind: OperationKind::Recreate,
+                project_id: project_id.clone(),
+                revision,
+                generation,
+                state: OperationState::Running,
+                stage: OperationStage::Queued,
+                failure: None,
+                restored_previous: false,
+                digest: Some(content_digest),
+                slot: Some(slot.clone()),
+                epoch: Some(epoch),
+                services: affected_services.clone(),
+                prior_container_ids: prior_container_ids.clone(),
+            };
+            let queued_view = view(&op_record);
+            inner.state.operations.push(op_record);
+            // Journal and persist rotation intent BEFORE replacing the tmpfs file.
+            if self.persist(&inner).is_err() {
+                inner.state.operations.pop();
+                restore_evicted_op(&mut inner.state, evicted);
+                return reject(id, RejectCode::StoreFailure);
+            }
+            let written =
+                lock(&self.shared.store).write_secret(&project_id, &slot, owner, bytes.as_slice());
+            drop(bytes);
+            if written.is_err() {
+                apply_settlement(
+                    &self.shared,
+                    &mut inner,
+                    &operation_id,
+                    Settlement::failed(FailureCode::StoreFailed),
+                );
+                let _ = self.persist(&inner);
+                return reject(id, RejectCode::SecretWrite);
+            }
+            inner.state.secrets.insert(
+                key,
+                SecretRecord {
+                    epoch,
+                    uid: owner.0,
+                    gid: owner.1,
+                },
+            );
+            self.log(
+                &mut inner,
+                &project_id,
+                LogEvent::SecretDelivered,
+                None,
+                None,
+            );
+            self.log(
+                &mut inner,
+                &project_id,
+                LogEvent::OperationStarted,
+                None,
+                None,
+            );
+            let _ = self.persist(&inner);
+            inner.running = Some(operation_id.clone());
+            let plan = Plan::Recreate {
+                project: committed_project,
+                slot: project_slot,
+                revision,
+                services: affected_services,
+                prior_container_ids,
+            };
+            let shared = Arc::clone(&self.shared);
+            let worker_id = operation_id.clone();
+            let spawned = thread::Builder::new()
+                .name("arx-compose-op".to_owned())
+                .spawn(move || run_worker(shared, worker_id, plan));
+            let recreate = if spawned.is_err() {
+                inner.running = None;
+                let mut settlement = Settlement::failed(FailureCode::WorkerUnavailable);
+                settlement.recovery_required = Some(true);
+                apply_settlement(&self.shared, &mut inner, &operation_id, settlement);
+                let _ = self.persist(&inner);
+                Some(view(find(&inner, &operation_id).expect("journaled above")))
+            } else {
+                Some(queued_view)
+            };
+            return ComposeResponse::ComposeSecretAccepted {
+                id,
+                project_id,
+                slot,
+                epoch,
+                recreate,
+            };
         }
-        inner.state.secrets.insert(
-            key,
+
+        // Non-rotation delivery: record operation attribution durably BEFORE
+        // touching the tmpfs file so journal failures leave the old file intact.
+        let evicted = match trim_secret_ops(&mut inner.state) {
+            Ok(evicted) => evicted,
+            Err(code) => return reject(id, code),
+        };
+        inner.state.secret_ops.push(SecretOpRecord {
+            operation_id,
+            generation,
+            project_id: project_id.clone(),
+            slot: slot.clone(),
+            epoch,
+            digest: content_digest,
+        });
+        let old_secret = inner.state.secrets.insert(
+            key.clone(),
             SecretRecord {
                 epoch,
                 uid: owner.0,
                 gid: owner.1,
             },
         );
+        if self.persist(&inner).is_err() {
+            inner.state.secret_ops.pop();
+            restore_evicted_secret_op(&mut inner.state, evicted);
+            restore_secret(&mut inner.state.secrets, &key, old_secret);
+            return reject(id, RejectCode::StoreFailure);
+        }
+        let written =
+            lock(&self.shared.store).write_secret(&project_id, &slot, owner, bytes.as_slice());
+        drop(bytes);
+        if written.is_err() {
+            inner.state.secret_ops.pop();
+            restore_evicted_secret_op(&mut inner.state, evicted);
+            restore_secret(&mut inner.state.secrets, &key, old_secret);
+            let _ = self.persist(&inner);
+            return reject(id, RejectCode::SecretWrite);
+        }
         self.log(
             &mut inner,
             &project_id,
@@ -1156,49 +1462,28 @@ impl ComposeService {
             None,
             None,
         );
-        let recreate = if rotation {
-            let record = inner
-                .state
-                .projects
-                .get(&project_id)
-                .expect("started project");
-            let committed = record
-                .committed
-                .as_ref()
-                .expect("started project is committed");
-            let plan = Plan::Recreate {
-                services: project.services_using(&slot),
-                project,
-                slot: record.slot,
-                revision: committed.revision,
-            };
-            let revision = committed.revision;
-            match self.launch(
-                &mut inner,
-                operation_id,
-                OperationKind::Recreate,
-                &project_id,
-                revision,
-                plan,
-            ) {
-                Ok(ComposeResponse::ComposeOperationState { operation, .. }) => Some(operation),
-                _ => {
-                    // The file is replaced; the container keeps the old inode
-                    // until a later start or rotation recreates it.
-                    let _ = self.persist(&inner);
-                    None
-                }
-            }
-        } else {
-            let _ = self.persist(&inner);
-            known.as_ref().map(view)
-        };
+        let _ = self.persist(&inner);
         ComposeResponse::ComposeSecretAccepted {
             id,
             project_id,
             slot,
             epoch,
-            recreate,
+            recreate: None,
+        }
+    }
+}
+
+fn restore_secret(
+    secrets: &mut BTreeMap<String, SecretRecord>,
+    key: &str,
+    old: Option<SecretRecord>,
+) {
+    match old {
+        Some(record) => {
+            secrets.insert(key.to_owned(), record);
+        }
+        None => {
+            secrets.remove(key);
         }
     }
 }
@@ -1220,6 +1505,10 @@ fn find<'a>(inner: &'a Inner, operation_id: &str) -> Option<&'a OperationRecord>
         .find(|operation| operation.operation_id == operation_id)
 }
 
+fn is_tombstoned(inner: &Inner, operation_id: &str) -> bool {
+    inner.state.tombstones.iter().any(|id| id == operation_id)
+}
+
 fn existing(
     inner: &Inner,
     id: u32,
@@ -1227,16 +1516,28 @@ fn existing(
     kind: OperationKind,
     project_id: &str,
     revision: Option<u64>,
+    digest: Option<&str>,
 ) -> Option<ComposeResponse> {
-    let operation = find(inner, operation_id)?;
-    if operation.kind == kind
-        && operation.project_id == project_id
-        && revision.is_none_or(|revision| revision == operation.revision)
-    {
-        Some(operation_state(id, operation))
-    } else {
-        Some(reject(id, RejectCode::OperationConflict))
+    if let Some(operation) = find(inner, operation_id) {
+        if operation.kind == kind
+            && operation.project_id == project_id
+            && revision.is_none_or(|revision| revision == operation.revision)
+            && digest.is_none_or(|digest| operation.digest.as_deref() == Some(digest))
+        {
+            return Some(operation_state(id, operation));
+        }
+        return Some(reject(id, RejectCode::OperationConflict));
     }
+    if is_tombstoned(inner, operation_id)
+        || inner
+            .state
+            .secret_ops
+            .iter()
+            .any(|op| op.operation_id == operation_id)
+    {
+        return Some(reject(id, RejectCode::OperationConflict));
+    }
+    None
 }
 
 fn gate(inner: &Inner, project_id: &str) -> Option<RejectCode> {
@@ -1251,17 +1552,49 @@ fn gate(inner: &Inner, project_id: &str) -> Option<RejectCode> {
     None
 }
 
-fn trim_journal(operations: &mut Vec<OperationRecord>) {
-    while operations.len() >= MAX_JOURNAL {
-        let Some(oldest) = operations.iter().position(|operation| {
-            matches!(
-                operation.state,
-                OperationState::Succeeded | OperationState::Failed
-            )
-        }) else {
-            return;
-        };
-        operations.remove(oldest);
+fn trim_journal(state: &mut State) -> Result<Option<(usize, OperationRecord)>, RejectCode> {
+    if state.operations.len() < MAX_JOURNAL {
+        return Ok(None);
+    }
+    let Some(oldest) = state.operations.iter().position(|operation| {
+        matches!(
+            operation.state,
+            OperationState::Succeeded | OperationState::Failed
+        )
+    }) else {
+        return Err(RejectCode::JournalFull);
+    };
+    if state.tombstones.len() >= MAX_TOMBSTONES {
+        return Err(RejectCode::JournalFull);
+    }
+    let removed = state.operations.remove(oldest);
+    state.tombstones.push_back(removed.operation_id.clone());
+    Ok(Some((oldest, removed)))
+}
+
+fn restore_evicted_op(state: &mut State, evicted: Option<(usize, OperationRecord)>) {
+    if let Some((index, record)) = evicted {
+        state.tombstones.pop_back();
+        state.operations.insert(index, record);
+    }
+}
+
+fn trim_secret_ops(state: &mut State) -> Result<Option<SecretOpRecord>, RejectCode> {
+    if state.secret_ops.len() < MAX_JOURNAL {
+        return Ok(None);
+    }
+    if state.tombstones.len() >= MAX_TOMBSTONES {
+        return Err(RejectCode::JournalFull);
+    }
+    let removed = state.secret_ops.remove(0);
+    state.tombstones.push_back(removed.operation_id.clone());
+    Ok(Some(removed))
+}
+
+fn restore_evicted_secret_op(state: &mut State, evicted: Option<SecretOpRecord>) {
+    if let Some(record) = evicted {
+        state.tombstones.pop_back();
+        state.secret_ops.insert(0, record);
     }
 }
 
@@ -1270,7 +1603,10 @@ fn check_volumes(state: &State, project: &Project) -> Option<RejectCode> {
     for volume in &project.manifest().volumes {
         let name = volume_name(project.id(), &volume.name);
         match state.volumes.get(&name) {
-            Some(record) if record.project != project.id() => {
+            Some(record)
+                if record.project != project.id()
+                    || (record.uid, record.gid) != (volume.uid, volume.gid) =>
+            {
                 return Some(RejectCode::VolumeCollision);
             }
             Some(_) => {}
@@ -1342,6 +1678,9 @@ fn apply_settlement(
         if let Some(observed) = settlement.observed {
             record.observed = observed;
         }
+        if let Some(observed_ids) = settlement.observed_ids {
+            record.observed_ids = observed_ids;
+        }
     }
     push_log(
         shared,
@@ -1380,10 +1719,18 @@ struct Steps<'a> {
     shared: &'a Shared,
     operation_id: &'a str,
     runner: &'a mut dyn CommandRunner,
-    last_observed: Vec<ServiceView>,
+    last_observed: Vec<ObservedContainer>,
 }
 
 impl Steps<'_> {
+    fn persist(&self, inner: &Inner) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(&inner.state).map_err(|_| StoreError)?;
+        if bytes.len() > MAX_STATE_BYTES {
+            return Err(StoreError);
+        }
+        lock(&self.shared.store).save_state(&bytes)
+    }
+
     fn stage(&self, stage: OperationStage) {
         let mut inner = lock(&self.shared.inner);
         if let Some(operation) = inner
@@ -1414,48 +1761,125 @@ impl Steps<'_> {
                 slot,
                 revision,
             } => self.start(&project, slot, revision),
-            Plan::Stop { project, revision } => {
-                self.stage(OperationStage::Stopping);
-                match self.apply(
-                    &engine::compose_stop(&project, revision),
-                    FailureCode::StopFailed,
-                ) {
-                    Ok(()) => Settlement::succeeded(LogEvent::Stopped, Desired::Stopped),
-                    Err(step) => step.into(),
-                }
-            }
-            Plan::Down { project, revision } => {
-                self.stage(OperationStage::Removing);
-                match self.apply(
-                    &engine::compose_down(&project, revision),
-                    FailureCode::DownFailed,
-                ) {
-                    Ok(()) => {
-                        Settlement::succeeded(LogEvent::Removed, Desired::Down).observed(Vec::new())
-                    }
-                    Err(step) => step.into(),
-                }
-            }
+            Plan::Stop { project, revision } => self.stop(&project, revision),
+            Plan::Down { project, revision } => self.down(&project, revision),
             Plan::Recreate {
                 project,
                 slot,
                 revision,
                 services,
-            } => {
-                self.stage(OperationStage::Recreating);
-                let invocation = engine::compose_recreate(project.id(), revision, &services);
-                if let Err(step) = self.apply(&invocation, FailureCode::UpFailed) {
-                    return step.into();
+                prior_container_ids,
+            } => self.recreate(&project, slot, revision, &services, prior_container_ids),
+        }
+    }
+
+    fn stop(&mut self, project: &str, revision: u64) -> Settlement {
+        self.stage(OperationStage::Stopping);
+        if let Err(step) = self.apply(
+            &engine::compose_stop(project, revision),
+            FailureCode::StopFailed,
+        ) {
+            return step.into();
+        }
+        match self.stop_remaining_attributed(project, revision) {
+            Ok(containers) => Settlement::succeeded(LogEvent::Stopped, Desired::Stopped)
+                .observed_containers(&containers),
+            Err(step) => {
+                let mut settlement = Settlement::from(step);
+                if settlement.state == OperationState::Failed {
+                    settlement.recovery_required = Some(true);
                 }
-                self.stage(OperationStage::HealthCheck);
-                match self.prove_health(&project, revision, slot) {
-                    Ok(views) => {
-                        Settlement::succeeded(LogEvent::Recreated, Desired::Started).observed(views)
-                    }
-                    Err(step) => {
-                        Settlement::from(step).observed(std::mem::take(&mut self.last_observed))
+                let observed = std::mem::take(&mut self.last_observed);
+                settlement.observed_containers(&observed)
+            }
+        }
+    }
+
+    fn down(&mut self, project: &str, revision: u64) -> Settlement {
+        self.stage(OperationStage::Removing);
+        if let Err(step) = self.apply(
+            &engine::compose_down(project, revision),
+            FailureCode::DownFailed,
+        ) {
+            return step.into();
+        }
+        match self.remove_remaining_attributed(project, revision) {
+            Ok(()) => {
+                Settlement::succeeded(LogEvent::Removed, Desired::Down).observed_containers(&[])
+            }
+            Err(step) => {
+                let mut settlement = Settlement::from(step);
+                if settlement.state == OperationState::Failed {
+                    settlement.recovery_required = Some(true);
+                }
+                let observed = std::mem::take(&mut self.last_observed);
+                settlement.observed_containers(&observed)
+            }
+        }
+    }
+
+    fn recreate(
+        &mut self,
+        project: &Project,
+        slot: u8,
+        revision: u64,
+        services: &[String],
+        mut prior_container_ids: BTreeMap<String, Vec<String>>,
+    ) -> Settlement {
+        self.stage(OperationStage::Recreating);
+        // Refresh pre-rotation container IDs before `--force-recreate` so
+        // reconciliation and post-recreate health both prove replacement.
+        if let Some(before) = self.ps_attributed(project.id(), revision) {
+            let mut updated = false;
+            for container in &before {
+                if services.contains(&container.view.name)
+                    && let Some(cid) = &container.id
+                {
+                    let entry = prior_container_ids
+                        .entry(container.view.name.clone())
+                        .or_default();
+                    if !entry.contains(cid) {
+                        entry.push(cid.clone());
+                        updated = true;
                     }
                 }
+            }
+            if updated {
+                let mut inner = lock(&self.shared.inner);
+                if let Some(op) = inner
+                    .state
+                    .operations
+                    .iter_mut()
+                    .find(|op| op.operation_id == self.operation_id)
+                {
+                    op.prior_container_ids = prior_container_ids.clone();
+                }
+                if self.persist(&inner).is_err() {
+                    let mut settlement = Settlement::failed(FailureCode::StoreFailed);
+                    settlement.recovery_required = Some(true);
+                    return settlement;
+                }
+            }
+        }
+        let invocation = engine::compose_recreate(project.id(), revision, services);
+        if let Err(step) = self.apply(&invocation, FailureCode::UpFailed) {
+            let mut settlement = Settlement::from(step);
+            if settlement.state == OperationState::Failed {
+                settlement.recovery_required = Some(true);
+            }
+            return settlement;
+        }
+        self.stage(OperationStage::HealthCheck);
+        match self.prove_health_recreate(project, revision, slot, services, &prior_container_ids) {
+            Ok(containers) => Settlement::succeeded(LogEvent::Recreated, Desired::Started)
+                .observed_containers(&containers),
+            Err(step) => {
+                let mut settlement = Settlement::from(step);
+                if settlement.state == OperationState::Failed {
+                    settlement.recovery_required = Some(true);
+                }
+                let observed = std::mem::take(&mut self.last_observed);
+                settlement.observed_containers(&observed)
             }
         }
     }
@@ -1465,7 +1889,7 @@ impl Steps<'_> {
         project: &Project,
         slot: u8,
         revision: u64,
-        prior: Option<(Project, u64)>,
+        prior: Option<(Project, u64, Desired)>,
     ) -> Settlement {
         let id = project.id();
         self.stage(OperationStage::Rendering);
@@ -1492,11 +1916,11 @@ impl Steps<'_> {
             Err(Step::Failed(code)) => return self.restore(code, project, slot, revision, prior),
         }
         self.stage(OperationStage::HealthCheck);
-        match self.prove_health(project, revision, slot) {
-            Ok(views) => {
+        match self.prove_health(project, revision, slot, true) {
+            Ok(containers) => {
                 self.log(id, LogEvent::HealthPassed, None);
-                let mut settlement =
-                    Settlement::succeeded(LogEvent::Promoted, Desired::Started).observed(views);
+                let mut settlement = Settlement::succeeded(LogEvent::Promoted, Desired::Started)
+                    .observed_containers(&containers);
                 settlement.promote = true;
                 settlement
             }
@@ -1508,63 +1932,121 @@ impl Steps<'_> {
         }
     }
 
-    /// After a failed apply or health proof: bring back the previous committed
-    /// revision when its volume and secret layout is unchanged, otherwise stop
-    /// the failed revision and report recovery required. Data is kept.
+    /// After a failed apply or health proof: preserve the prior lifecycle
+    /// state. A previously started compatible revision is restored; a
+    /// deliberately stopped or down release stays stopped or down. Data is kept.
     fn restore(
         &mut self,
         code: FailureCode,
         project: &Project,
         slot: u8,
         revision: u64,
-        prior: Option<(Project, u64)>,
+        prior: Option<(Project, u64, Desired)>,
     ) -> Settlement {
         let id = project.id();
         let failed_views = std::mem::take(&mut self.last_observed);
-        let compatible = prior.filter(|(previous, _)| {
-            previous.manifest().volumes == project.manifest().volumes
-                && previous.manifest().secrets == project.manifest().secrets
-                && previous
-                    .manifest()
-                    .secrets
-                    .iter()
-                    .all(|slot| previous.slot_owner(slot) == project.slot_owner(slot))
-        });
         let mut settlement = Settlement::failed(code);
         settlement.clear_pending = true;
-        if let Some((previous, previous_revision)) = compatible {
-            self.stage(OperationStage::Restoring);
-            let restored = self
-                .apply(
-                    &engine::compose_up(id, previous_revision),
-                    FailureCode::UpFailed,
-                )
-                .is_ok()
-                && match self.prove_health(&previous, previous_revision, slot) {
-                    Ok(views) => {
-                        settlement.observed = Some(views);
-                        true
+        match prior {
+            Some((previous, previous_revision, Desired::Started))
+                if compatible_layout(&previous, project) =>
+            {
+                self.stage(OperationStage::Restoring);
+                let restored = self
+                    .apply(
+                        &engine::compose_up(id, previous_revision),
+                        FailureCode::UpFailed,
+                    )
+                    .is_ok()
+                    && match self.prove_health(&previous, previous_revision, slot, true) {
+                        Ok(containers) => {
+                            settlement = settlement.observed_containers(&containers);
+                            true
+                        }
+                        Err(_) => false,
+                    };
+                if restored {
+                    self.log(id, LogEvent::Restored, None);
+                }
+                settlement.restored = restored;
+                settlement.desired = Some(Desired::Started);
+                settlement.recovery_required = Some(!restored);
+                if !restored {
+                    let observed = std::mem::take(&mut self.last_observed);
+                    settlement = settlement.observed_containers(&observed);
+                }
+                settlement
+            }
+            Some((_, _, Desired::Stopped)) => {
+                self.stage(OperationStage::Stopping);
+                let stopped = self
+                    .apply(&engine::compose_stop(id, revision), FailureCode::StopFailed)
+                    .and_then(|()| self.stop_remaining_attributed(id, revision));
+                match stopped {
+                    Ok(containers) => {
+                        self.log(id, LogEvent::Restored, None);
+                        settlement.restored = true;
+                        settlement.desired = Some(Desired::Stopped);
+                        settlement.recovery_required = Some(false);
+                        settlement.observed_containers(&containers)
                     }
-                    Err(_) => false,
-                };
-            if restored {
-                self.log(id, LogEvent::Restored, None);
+                    Err(_) => {
+                        settlement.restored = false;
+                        settlement.desired = Some(Desired::Stopped);
+                        settlement.recovery_required = Some(true);
+                        let observed = std::mem::take(&mut self.last_observed);
+                        if observed.is_empty() {
+                            settlement.observed_containers(&failed_views)
+                        } else {
+                            settlement.observed_containers(&observed)
+                        }
+                    }
+                }
             }
-            settlement.restored = restored;
-            settlement.recovery_required = Some(!restored);
-            if !restored {
-                settlement.observed = Some(std::mem::take(&mut self.last_observed));
+            Some((_, _, Desired::Down)) => {
+                self.stage(OperationStage::Removing);
+                let removed = self
+                    .apply(&engine::compose_down(id, revision), FailureCode::DownFailed)
+                    .and_then(|()| self.remove_remaining_attributed(id, revision));
+                match removed {
+                    Ok(()) => {
+                        self.log(id, LogEvent::Restored, None);
+                        settlement.restored = true;
+                        settlement.desired = Some(Desired::Down);
+                        settlement.recovery_required = Some(false);
+                        settlement.observed_containers(&[])
+                    }
+                    Err(_) => {
+                        settlement.restored = false;
+                        settlement.desired = Some(Desired::Down);
+                        settlement.recovery_required = Some(true);
+                        let observed = std::mem::take(&mut self.last_observed);
+                        if observed.is_empty() {
+                            settlement.observed_containers(&failed_views)
+                        } else {
+                            settlement.observed_containers(&observed)
+                        }
+                    }
+                }
             }
-            return settlement;
+            other => {
+                let had_started = matches!(other, Some((_, _, Desired::Started)));
+                self.stage(OperationStage::Stopping);
+                let stopped = self
+                    .apply(&engine::compose_stop(id, revision), FailureCode::StopFailed)
+                    .and_then(|()| self.stop_remaining_attributed(id, revision));
+                match stopped {
+                    Ok(containers) => {
+                        settlement.recovery_required = Some(had_started);
+                        settlement.observed_containers(&containers)
+                    }
+                    Err(_) => {
+                        settlement.recovery_required = Some(true);
+                        settlement.observed_containers(&failed_views)
+                    }
+                }
+            }
         }
-        self.stage(OperationStage::Stopping);
-        let stopped = matches!(
-            self.runner.run(&engine::compose_stop(id, revision)),
-            RunResult::Exited { code: 0, .. }
-        );
-        settlement.recovery_required = Some(!stopped);
-        settlement.observed = Some(failed_views);
-        settlement
     }
 
     fn start(&mut self, project: &Project, slot: u8, revision: u64) -> Settlement {
@@ -1579,11 +2061,13 @@ impl Steps<'_> {
             return step.into();
         }
         self.stage(OperationStage::HealthCheck);
-        match self.prove_health(project, revision, slot) {
-            Ok(views) => {
-                Settlement::succeeded(LogEvent::HealthPassed, Desired::Started).observed(views)
+        match self.prove_health(project, revision, slot, true) {
+            Ok(containers) => Settlement::succeeded(LogEvent::HealthPassed, Desired::Started)
+                .observed_containers(&containers),
+            Err(step) => {
+                let observed = std::mem::take(&mut self.last_observed);
+                Settlement::from(step).observed_containers(&observed)
             }
-            Err(step) => Settlement::from(step).observed(std::mem::take(&mut self.last_observed)),
         }
     }
 
@@ -1648,6 +2132,44 @@ impl Steps<'_> {
         }
     }
 
+    /// Charges a volume durably before creation so a subsequent mountpoint or
+    /// ownership failure can never leave an uncharged volume past the cap.
+    fn charge_volume(&self, project: &str, name: &str, volume: &VolumeSpec) -> Result<bool, Step> {
+        let mut inner = lock(&self.shared.inner);
+        if let Some(existing) = inner.state.volumes.get(name) {
+            if existing.project != project
+                || (existing.uid, existing.gid) != (volume.uid, volume.gid)
+            {
+                return Err(Step::Failed(FailureCode::VolumeCollision));
+            }
+            return Ok(false);
+        }
+        if inner.state.volumes.len() >= MAX_VOLUMES {
+            return Err(Step::Failed(FailureCode::VolumeFailed));
+        }
+        inner.state.volumes.insert(
+            name.to_owned(),
+            VolumeRecord {
+                project: project.to_owned(),
+                volume: volume.name.clone(),
+                uid: volume.uid,
+                gid: volume.gid,
+            },
+        );
+        if self.persist(&inner).is_err() {
+            inner.state.volumes.remove(name);
+            return Err(Step::Failed(FailureCode::StoreFailed));
+        }
+        Ok(true)
+    }
+
+    fn uncharge_volume(&self, name: &str) {
+        let mut inner = lock(&self.shared.inner);
+        if inner.state.volumes.remove(name).is_some() {
+            let _ = self.persist(&inner);
+        }
+    }
+
     /// Volumes are created by the broker, labelled with an ownership token and
     /// verified after creation, because `volume create` also succeeds for an
     /// existing foreign volume. Compose sees them only as external.
@@ -1655,15 +2177,30 @@ impl Steps<'_> {
         let name = volume_name(project, &volume.name);
         let token = volume_token(project, &volume.name, volume.uid, volume.gid);
         match self.volume_label(&name)? {
-            Some(label) if label == token => {}
+            Some(label) if label == token => {
+                self.charge_volume(project, &name, volume)?;
+            }
             Some(_) => return Err(Step::Failed(FailureCode::VolumeCollision)),
             None => {
+                let newly_charged = self.charge_volume(project, &name, volume)?;
                 match self.runner.run(&engine::volume_create(&name, &token)) {
                     RunResult::Exited { code: 0, .. } => {}
                     RunResult::LaunchFailed => {
+                        if newly_charged {
+                            self.uncharge_volume(&name);
+                        }
                         return Err(Step::Failed(FailureCode::EngineLaunchFailed));
                     }
-                    _ => return Err(Step::Failed(FailureCode::VolumeFailed)),
+                    RunResult::Exited { .. } => {
+                        if newly_charged && matches!(self.volume_label(&name), Ok(None)) {
+                            self.uncharge_volume(&name);
+                        }
+                        return Err(Step::Failed(FailureCode::VolumeFailed));
+                    }
+                    RunResult::TimedOut | RunResult::Signaled => {
+                        // Creation outcome is unknown; keep the volume charged.
+                        return Err(Step::Failed(FailureCode::VolumeFailed));
+                    }
                 }
                 if self.volume_label(&name)?.as_deref() != Some(token.as_str()) {
                     return Err(Step::Failed(FailureCode::VolumeCollision));
@@ -1681,24 +2218,7 @@ impl Steps<'_> {
         {
             return Err(Step::Failed(FailureCode::VolumeFailed));
         }
-        let mut inner = lock(&self.shared.inner);
-        inner.state.volumes.insert(
-            name,
-            VolumeRecord {
-                project: project.to_owned(),
-                volume: volume.name.clone(),
-                uid: volume.uid,
-                gid: volume.gid,
-            },
-        );
-        push_log(
-            self.shared,
-            &mut inner,
-            project,
-            LogEvent::VolumeReady,
-            None,
-            None,
-        );
+        self.log(project, LogEvent::VolumeReady, None);
         Ok(())
     }
 
@@ -1712,20 +2232,133 @@ impl Steps<'_> {
         }
     }
 
-    fn ps(&mut self, project: &Project, revision: u64) -> Option<Vec<ServiceView>> {
-        let names: Vec<&str> = project
-            .manifest()
-            .services
-            .iter()
-            .map(|service| service.name.as_str())
-            .collect();
-        match self.runner.run(&engine::compose_ps(project.id(), revision)) {
-            RunResult::Exited { code: 0, stdout } => parse_ps(&stdout, project.id(), &names),
+    fn ps_attributed(&mut self, project: &str, revision: u64) -> Option<Vec<ObservedContainer>> {
+        match self.runner.run(&engine::compose_ps(project, revision)) {
+            RunResult::Exited { code: 0, stdout } => parse_ps_attributed(&stdout, project),
             _ => None,
         }
     }
 
-    fn ready(&mut self, project: &Project, revision: u64, slot: u8, views: &[ServiceView]) -> bool {
+    fn stop_retired_containers(
+        &mut self,
+        project: &Project,
+        containers: &[ObservedContainer],
+    ) -> Result<bool, Step> {
+        let retired: Vec<&ObservedContainer> = containers
+            .iter()
+            .filter(|container| {
+                !project
+                    .manifest()
+                    .services
+                    .iter()
+                    .any(|service| service.name == container.view.name)
+            })
+            .collect();
+        if retired.is_empty() {
+            return Ok(false);
+        }
+        for container in retired {
+            let Some(cid) = container.id.as_deref() else {
+                return Err(Step::Failed(FailureCode::DownFailed));
+            };
+            if is_active_state(container.view.state) {
+                self.apply(&engine::container_stop(cid), FailureCode::StopFailed)?;
+            }
+            self.apply(&engine::container_rm(cid), FailureCode::DownFailed)?;
+        }
+        Ok(true)
+    }
+
+    fn stop_remaining_attributed(
+        &mut self,
+        project: &str,
+        revision: u64,
+    ) -> Result<Vec<ObservedContainer>, Step> {
+        let Some(mut containers) = self.ps_attributed(project, revision) else {
+            return Err(Step::Failed(FailureCode::StopFailed));
+        };
+        let active: Vec<ObservedContainer> = containers
+            .iter()
+            .filter(|container| is_active_state(container.view.state))
+            .cloned()
+            .collect();
+        if !active.is_empty() {
+            for container in &active {
+                let Some(cid) = container.id.as_deref() else {
+                    self.last_observed = containers;
+                    return Err(Step::Failed(FailureCode::StopFailed));
+                };
+                self.apply(&engine::container_stop(cid), FailureCode::StopFailed)?;
+            }
+            let Some(rechecked) = self.ps_attributed(project, revision) else {
+                self.last_observed = containers;
+                return Err(Step::Failed(FailureCode::StopFailed));
+            };
+            containers = rechecked;
+        }
+        if containers
+            .iter()
+            .any(|container| is_active_state(container.view.state))
+        {
+            self.last_observed = containers;
+            return Err(Step::Failed(FailureCode::StopFailed));
+        }
+        Ok(containers)
+    }
+
+    fn remove_remaining_attributed(&mut self, project: &str, revision: u64) -> Result<(), Step> {
+        let Some(mut containers) = self.ps_attributed(project, revision) else {
+            return Err(Step::Failed(FailureCode::DownFailed));
+        };
+        if !containers.is_empty() {
+            for container in &containers {
+                let Some(cid) = container.id.as_deref() else {
+                    self.last_observed = containers;
+                    return Err(Step::Failed(FailureCode::DownFailed));
+                };
+                if is_active_state(container.view.state) {
+                    self.apply(&engine::container_stop(cid), FailureCode::DownFailed)?;
+                }
+                self.apply(&engine::container_rm(cid), FailureCode::DownFailed)?;
+            }
+            // Re-run fixed down (no orphan/volume/image flags) so the project
+            // network is removed cleanly once retired containers detach.
+            self.apply(
+                &engine::compose_down(project, revision),
+                FailureCode::DownFailed,
+            )?;
+            let Some(rechecked) = self.ps_attributed(project, revision) else {
+                self.last_observed = containers;
+                return Err(Step::Failed(FailureCode::DownFailed));
+            };
+            containers = rechecked;
+        }
+        if !containers.is_empty() {
+            self.last_observed = containers;
+            return Err(Step::Failed(FailureCode::DownFailed));
+        }
+        Ok(())
+    }
+
+    fn ready(
+        &mut self,
+        project: &Project,
+        revision: u64,
+        slot: u8,
+        containers: &[ObservedContainer],
+    ) -> bool {
+        // Any remaining broker-attributed retired container blocks readiness.
+        let has_retired = containers.iter().any(|container| {
+            !project
+                .manifest()
+                .services
+                .iter()
+                .any(|service| service.name == container.view.name)
+        });
+        if has_retired {
+            return false;
+        }
+        let views = to_service_views(containers);
         let running = project.manifest().services.iter().all(|service| {
             views.iter().any(|view| {
                 view.name == service.name
@@ -1751,48 +2384,140 @@ impl Steps<'_> {
     }
 
     /// The health proof before promotion: every declared service runs the
-    /// revision, and every HTTP service answers 2xx on its loopback port.
+    /// revision, retired attributed containers are stopped and removed, and
+    /// every HTTP service answers 2xx on its loopback port.
     fn prove_health(
         &mut self,
         project: &Project,
         revision: u64,
         slot: u8,
-    ) -> Result<Vec<ServiceView>, Step> {
+        cleanup_retired: bool,
+    ) -> Result<Vec<ObservedContainer>, Step> {
+        let mut cleaned_retired = false;
         for attempt in 0..HEALTH_ATTEMPTS {
             if attempt > 0 {
                 self.runner.pause(HEALTH_INTERVAL);
             }
-            let Some(views) = self.ps(project, revision) else {
+            let Some(mut containers) = self.ps_attributed(project.id(), revision) else {
                 continue;
             };
-            if self.ready(project, revision, slot, &views) {
-                return Ok(views);
+            if cleanup_retired && !cleaned_retired {
+                cleaned_retired = true;
+                if self.stop_retired_containers(project, &containers)? {
+                    let Some(rechecked) = self.ps_attributed(project.id(), revision) else {
+                        continue;
+                    };
+                    containers = rechecked;
+                }
             }
-            self.last_observed = views;
+            if self.ready(project, revision, slot, &containers) {
+                return Ok(containers);
+            }
+            self.last_observed = containers;
+        }
+        Err(Step::Failed(FailureCode::HealthFailed))
+    }
+
+    fn prove_health_recreate(
+        &mut self,
+        project: &Project,
+        revision: u64,
+        slot: u8,
+        services: &[String],
+        prior_container_ids: &BTreeMap<String, Vec<String>>,
+    ) -> Result<Vec<ObservedContainer>, Step> {
+        for attempt in 0..HEALTH_ATTEMPTS {
+            if attempt > 0 {
+                self.runner.pause(HEALTH_INTERVAL);
+            }
+            let Some(containers) = self.ps_attributed(project.id(), revision) else {
+                continue;
+            };
+            if self.ready(project, revision, slot, &containers)
+                && containers_replaced(&containers, services, prior_container_ids)
+            {
+                return Ok(containers);
+            }
+            self.last_observed = containers;
         }
         Err(Step::Failed(FailureCode::HealthFailed))
     }
 
     /// Reconcile's read-only query. Returns whether the ambiguous effect is
-    /// observed as applied, with the views, or `None` when the engine cannot
-    /// answer.
+    /// observed as applied, with every broker-attributed container, or `None`
+    /// when the engine cannot answer.
     fn observe(
         &mut self,
         project: &Project,
         revision: u64,
         slot: u8,
         kind: OperationKind,
-    ) -> Option<(bool, Vec<ServiceView>)> {
-        let views = self.ps(project, revision)?;
+        op_services: &[String],
+        prior_ids: &BTreeMap<String, Vec<String>>,
+    ) -> Option<(bool, Vec<ObservedContainer>)> {
+        let containers = self.ps_attributed(project.id(), revision)?;
         let applied = match kind {
-            OperationKind::Deploy | OperationKind::Start | OperationKind::Recreate => {
-                self.ready(project, revision, slot, &views)
+            OperationKind::Deploy | OperationKind::Start => {
+                self.ready(project, revision, slot, &containers)
             }
-            OperationKind::Stop => views.iter().all(|view| {
-                !matches!(view.state, ServiceState::Running | ServiceState::Restarting)
-            }),
-            OperationKind::Down => views.is_empty(),
+            OperationKind::Recreate => {
+                self.ready(project, revision, slot, &containers)
+                    && containers_replaced(&containers, op_services, prior_ids)
+            }
+            OperationKind::Stop => containers
+                .iter()
+                .all(|container| !is_active_state(container.view.state)),
+            OperationKind::Down => containers.is_empty(),
         };
-        Some((applied, views))
+        Some((applied, containers))
     }
+}
+
+fn compatible_layout(previous: &Project, next: &Project) -> bool {
+    previous.manifest().volumes == next.manifest().volumes
+        && previous.manifest().secrets == next.manifest().secrets
+        && previous
+            .manifest()
+            .secrets
+            .iter()
+            .all(|slot| previous.slot_owner(slot) == next.slot_owner(slot))
+}
+
+fn is_active_state(state: ServiceState) -> bool {
+    matches!(
+        state,
+        ServiceState::Running
+            | ServiceState::Restarting
+            | ServiceState::Paused
+            | ServiceState::Unknown
+    )
+}
+
+/// Proves that every affected service is running a single container with a
+/// verified ID distinct from every container ID observed before `--force-recreate`.
+fn containers_replaced(
+    containers: &[ObservedContainer],
+    services: &[String],
+    prior_ids: &BTreeMap<String, Vec<String>>,
+) -> bool {
+    !services.is_empty()
+        && services.iter().all(|service| {
+            let Some(prior) = prior_ids.get(service) else {
+                return false;
+            };
+            if prior.is_empty() {
+                return false;
+            }
+            let matching: Vec<&ObservedContainer> = containers
+                .iter()
+                .filter(|container| container.view.name == *service)
+                .collect();
+            if matching.len() != 1 {
+                return false;
+            }
+            matching[0]
+                .id
+                .as_ref()
+                .is_some_and(|new_id| !prior.contains(new_id))
+        })
 }

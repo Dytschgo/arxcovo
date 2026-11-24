@@ -27,13 +27,20 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(1);
 
 pub(crate) fn serve_virtio() -> Result<(), &'static str> {
     let port = open_port().map_err(|_| "virtio setup failed")?;
-    let runner = ReapOwner::establish().ok().and_then(|owner| {
-        CgroupRoot::qualify()
-            .ok()
-            .map(|root| ScriptRunner::new(root, Some(port.as_fd()), owner))
-    });
     // Compose is served only when the recipe's fixed roots and engine qualify.
     let compose = qualify_compose();
+    // Design §3: the script runner shares the guest network namespace and has
+    // no ingress-isolation witness for UID/GID 65534, so legacy scripts stay
+    // disabled on a Compose-qualified guest.
+    let runner = if compose.is_some() {
+        None
+    } else {
+        ReapOwner::establish().ok().and_then(|owner| {
+            CgroupRoot::qualify()
+                .ok()
+                .map(|root| ScriptRunner::new(root, Some(port.as_fd()), owner))
+        })
+    };
     let result = serve_connection_with(&port, &port, runner, compose.as_ref());
     // Intent survives a disconnected host: let a running operation finish
     // before the service exits. A later session queries it by operation ID.
@@ -102,7 +109,8 @@ fn serve_connection_with(
 ) -> Result<(), &'static str> {
     let retired = Cell::new(false);
     let mut executor = LinuxExecutor {
-        runner,
+        // Defense in depth: never retain a script runner alongside Compose.
+        runner: if compose.is_some() { None } else { runner },
         retired: &retired,
     };
     let result = serve_with_compose(
@@ -2375,5 +2383,105 @@ mod compose_tests {
             walk_owned_dirs("/proc/self", owner.0).is_err(),
             "followed a link"
         );
+    }
+
+    #[test]
+    fn docker_runner_discards_stderr_and_non_capturing_stdout_canary() {
+        let canary = format!("arx-proc-canary-{:016x}", 0x1234_5678_9abc_def0_u64);
+        let script = format!("printf '%s\\n' '{canary}'; printf '%s\\n' '{canary}' >&2; exit 1");
+        let non_capturing = DockerRunner {
+            program: "/bin/sh",
+            cwd: "/",
+        }
+        .run(&Invocation {
+            argv: vec!["-c".to_owned(), script],
+            timeout: TEST_HANG_GUARD,
+            capture: false,
+        });
+        assert_eq!(
+            non_capturing,
+            RunResult::Exited {
+                code: 1,
+                stdout: Vec::new(),
+            },
+            "non-capturing invocation leaked subprocess output"
+        );
+
+        let stderr_script = format!("printf 'ok\\n'; printf '%s\\n' '{canary}' >&2");
+        let capturing = run("/bin/sh", &["-c", &stderr_script], TEST_HANG_GUARD);
+        let RunResult::Exited { code: 0, stdout } = capturing else {
+            panic!("{capturing:?}");
+        };
+        assert_eq!(stdout, b"ok\n");
+        assert!(
+            !String::from_utf8_lossy(&stdout).contains(&canary),
+            "stderr canary reached captured stdout"
+        );
+    }
+
+    #[test]
+    fn compose_qualified_guest_disables_legacy_scripts() {
+        use arx_guest::{Request, Response, ScriptStatus, read_frame, write_frame};
+
+        let scratch = Scratch::new();
+        let compose = ComposeService::new(
+            Box::new(DockerRunner {
+                program: "/bin/false",
+                cwd: "/",
+            }),
+            Box::new(scratch.store()),
+            Box::new(SystemClock),
+        )
+        .unwrap();
+        let mut requests = Vec::new();
+        write_frame(
+            &mut requests,
+            &Request::Hello {
+                version: 1,
+                challenge: "0123456789abcdef0123456789abcdef".to_owned(),
+            },
+        )
+        .unwrap();
+        write_frame(
+            &mut requests,
+            &Request::RunScript {
+                id: 1,
+                script: "exit 7".to_owned(),
+                timeout_s: 5,
+            },
+        )
+        .unwrap();
+        let mut responses = Vec::new();
+        let root = CgroupRoot {
+            path: PathBuf::from("/proc/self/cgroup"),
+            owner: effective_uid(),
+        };
+        let runner = ScriptRunner::new(root, None, ReapOwner::verify().unwrap());
+        assert_eq!(
+            serve_connection_with(
+                requests.as_slice(),
+                &mut responses,
+                Some(runner),
+                Some(&compose),
+            ),
+            Ok(())
+        );
+        let mut reader = responses.as_slice();
+        assert!(matches!(
+            read_frame::<Response>(&mut reader).unwrap(),
+            Some(Response::HelloAck {
+                script_execution: ScriptExecution::Unavailable,
+                ..
+            })
+        ));
+        assert!(matches!(
+            read_frame::<Response>(&mut reader).unwrap(),
+            Some(Response::ScriptResult {
+                id: 1,
+                status: ScriptStatus::Unavailable,
+                exit_code: None,
+            })
+        ));
+        assert!(reader.is_empty());
     }
 }

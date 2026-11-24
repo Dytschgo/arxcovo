@@ -25,8 +25,9 @@ pub use codec::{SecretText, base64_len, encode_base64, sha256_hex};
 pub use engine::{
     APPLY_TIMEOUT, Clock, CommandRunner, DOCKER, ENGINE_CWD, ENGINE_ENV, HEALTH_ATTEMPTS,
     HEALTH_INTERVAL, Invocation, MAX_CAPTURE, PULL_TIMEOUT, QUERY_TIMEOUT, RunResult, STOP_TIMEOUT,
-    compose_down, compose_ps, compose_recreate, compose_stop, compose_up, image_inspect,
-    image_pull, parse_ps, volume_create, volume_label, volume_mountpoint,
+    compose_down, compose_ps, compose_recreate, compose_stop, compose_up, container_rm,
+    container_stop, image_inspect, image_pull, parse_ps, volume_create, volume_label,
+    volume_mountpoint,
 };
 pub use layout::{
     DOCKER_CONFIG, DOCKER_VOLUME_ROOT, LAYOUT_VERSION, LOOPBACK_BASE, SECRET_ROOT, STATE_ROOT,
@@ -40,7 +41,8 @@ pub use manifest::{
 };
 pub use render::{PROJECT_LABEL, REVISION_LABEL, VOLUME_LABEL, render};
 pub use service::{
-    ComposeService, ComposeStore, MAX_JOURNAL, MAX_LOG, MAX_STAGED, MAX_STATE_BYTES, StoreError,
+    ComposeService, ComposeStore, MAX_JOURNAL, MAX_LOG, MAX_STAGED, MAX_STATE_BYTES,
+    MAX_TOMBSTONES, StoreError,
 };
 pub(crate) use wire::is_compose_tag;
 pub use wire::{

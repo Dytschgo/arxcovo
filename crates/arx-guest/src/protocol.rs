@@ -225,7 +225,7 @@ fn validate_id(id: u32) -> Result<(), ProtocolError> {
 #[derive(Deserialize)]
 struct WireTags {
     #[serde(rename = "type")]
-    _message_type: String,
+    message_type: String,
     #[serde(rename = "status")]
     _status: Option<String>,
     #[serde(rename = "script_execution")]
@@ -284,7 +284,12 @@ pub(crate) fn read_payload(reader: &mut impl Read) -> Result<Option<Payload>, Pr
 
 /// Decodes and validates one message from a checked payload.
 pub(crate) fn decode<M: Message>(json: &str) -> Result<M, ProtocolError> {
-    serde_json::from_str::<WireTags>(json).map_err(|_| ProtocolError::InvalidJson)?;
+    let tags = serde_json::from_str::<WireTags>(json).map_err(|_| ProtocolError::InvalidJson)?;
+    // Refuse any JSON escape sequence in a secret frame before full decode so
+    // serde_json's un-wiped string scratch buffer never receives secret bytes.
+    if tags.message_type == "ComposeSecretPut" && json.as_bytes().contains(&b'\\') {
+        return Err(ProtocolError::InvalidJson);
+    }
     let message: M = serde_json::from_str(json).map_err(|_| ProtocolError::InvalidJson)?;
     message.validate()?;
     Ok(message)

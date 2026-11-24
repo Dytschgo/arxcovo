@@ -11,8 +11,13 @@
 //! A guest that serves Compose also accepts a pinned ComposeHello, which
 //! starts a Compose session in the same way. Frames whose tag does not start
 //! with `Compose` are decoded exactly as on a legacy guest, so legacy sessions
-//! keep their bytes. A Compose session answers Ping and Compose requests and
-//! refuses scripts; a legacy session refuses Compose requests.
+//! keep their framing and wire format. Per settled design §3, a Compose-qualified
+//! guest disables legacy script execution (reporting `unavailable` on legacy
+//! `Hello` and `Unavailable` on legacy `RunScript`, and closing a Compose
+//! session with `UnexpectedRequest` on `RunScript`) because the script runner
+//! shares the guest network namespace and has no ingress-isolation witness.
+//! Non-Compose guests (`serve` and `serve_with_compose(..., None)`) keep TEST
+//! and Windows behavior byte-for-byte.
 
 use std::io::{Read, Write};
 
@@ -134,21 +139,23 @@ pub fn serve_with_compose(
         let response = match request {
             Request::Hello { version, challenge } => {
                 mode = Mode::Legacy;
+                // Design §3: scripts are disabled on Compose-qualified guests
+                // because the script runner cannot qualify ingress isolation.
                 Response::HelloAck {
                     version,
                     challenge,
-                    script_execution: executor.script_execution(),
+                    script_execution: ScriptExecution::Unavailable,
                 }
             }
             Request::Ping { id } => Response::Pong { id },
             Request::RunScript { .. } if mode == Mode::Compose => {
                 return Err(ProtocolError::UnexpectedRequest);
             }
-            Request::RunScript {
+            Request::RunScript { id, .. } => Response::ScriptResult {
                 id,
-                script,
-                timeout_s,
-            } => run_script(executor, id, &script, timeout_s),
+                status: ScriptStatus::Unavailable,
+                exit_code: None,
+            },
         };
         write_frame(&mut writer, &response)?;
     }

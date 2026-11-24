@@ -88,14 +88,25 @@ struct Fault {
     apply: bool,
 }
 
+#[derive(Clone)]
+struct Container {
+    id: String,
+    service: String,
+    state: &'static str,
+    revision: u64,
+}
+
 #[derive(Default)]
 struct Docker {
     images: BTreeSet<String>,
     arch: Option<&'static str>,
     pull_fails: bool,
     volumes: BTreeMap<String, String>,
-    containers: BTreeMap<String, Vec<(String, &'static str, u64)>>,
+    containers: BTreeMap<String, Vec<Container>>,
     services: BTreeMap<String, Vec<String>>,
+    revision_services: BTreeMap<(String, u64), Vec<String>>,
+    next_container_id: u64,
+    output_canary: Option<String>,
     unhealthy: BTreeSet<u64>,
     faults: Vec<Fault>,
     block: Option<(&'static str, mpsc::Receiver<()>)>,
@@ -111,6 +122,23 @@ fn exited(code: i32, stdout: impl Into<Vec<u8>>) -> RunResult {
 }
 
 impl Docker {
+    fn fresh_id(&mut self) -> String {
+        self.next_container_id += 1;
+        format!("{:012x}", self.next_container_id)
+    }
+
+    fn declared_services(&self, project: &str, revision: u64) -> Vec<String> {
+        self.revision_services
+            .get(&(project.to_owned(), revision))
+            .or_else(|| self.services.get(project))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn noise(&self) -> String {
+        self.output_canary.clone().unwrap_or_default()
+    }
+
     fn exec(&mut self, argv: &[String]) -> RunResult {
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         assert_eq!(&args[..2], ["--config", DOCKER_CONFIG]);
@@ -125,7 +153,7 @@ impl Docker {
                 if self.images.contains(*image) {
                     exited(0, format!("{}\n", self.arch.unwrap_or("linux/amd64")))
                 } else {
-                    exited(1, "")
+                    exited(1, self.noise())
                 }
             }
             [
@@ -137,24 +165,24 @@ impl Docker {
                 image,
             ] => {
                 if self.pull_fails {
-                    exited(1, "")
+                    exited(1, self.noise())
                 } else {
                     self.images.insert((*image).to_owned());
-                    exited(0, "")
+                    exited(0, self.noise())
                 }
             }
             ["volume", "inspect", "--format", "{{.Mountpoint}}", name] => {
                 if self.volumes.contains_key(*name) {
                     exited(0, format!("/var/lib/docker/volumes/{name}/_data\n"))
                 } else {
-                    exited(1, "")
+                    exited(1, self.noise())
                 }
             }
             ["volume", "inspect", "--format", format, name] => {
                 assert_eq!(*format, "{{index .Labels \"org.arxcovo.volume\"}}");
                 match self.volumes.get(*name) {
                     Some(label) => exited(0, format!("{label}\n")),
-                    None => exited(1, ""),
+                    None => exited(1, self.noise()),
                 }
             }
             [
@@ -170,7 +198,41 @@ impl Docker {
                 self.volumes
                     .entry((*name).to_owned())
                     .or_insert_with(|| token.to_owned());
-                exited(0, "")
+                exited(0, self.noise())
+            }
+            ["container", "stop", id] => {
+                let mut found = false;
+                for list in self.containers.values_mut() {
+                    for container in list {
+                        if container.id == *id {
+                            container.state = "exited";
+                            found = true;
+                        }
+                    }
+                }
+                if found {
+                    exited(0, self.noise())
+                } else {
+                    exited(1, self.noise())
+                }
+            }
+            ["container", "rm", id] => {
+                let mut removed = false;
+                for list in self.containers.values_mut() {
+                    if let Some(pos) = list.iter().position(|c| c.id == *id) {
+                        assert_ne!(
+                            list[pos].state, "running",
+                            "container rm without --force requires stopped container"
+                        );
+                        list.remove(pos);
+                        removed = true;
+                    }
+                }
+                if removed {
+                    exited(0, self.noise())
+                } else {
+                    exited(1, self.noise())
+                }
             }
             [
                 "compose",
@@ -196,45 +258,90 @@ impl Docker {
                     .parse()
                     .unwrap();
                 match rest {
-                    ["up", "--detach", "--no-build", "--pull", "never", ..] => {
-                        let services = self.services.get(&project).cloned().unwrap_or_default();
-                        self.containers.insert(
-                            project,
-                            services
-                                .into_iter()
-                                .map(|service| (service, "running", revision))
-                                .collect(),
-                        );
-                        exited(0, "")
+                    [
+                        "up",
+                        "--detach",
+                        "--no-build",
+                        "--pull",
+                        "never",
+                        "--force-recreate",
+                        "--no-deps",
+                        targets @ ..,
+                    ] => {
+                        let new_ids: Vec<(String, String)> = targets
+                            .iter()
+                            .map(|service| ((*service).to_owned(), self.fresh_id()))
+                            .collect();
+                        let list = self.containers.entry(project).or_default();
+                        for (service, id) in new_ids {
+                            list.retain(|container| container.service != service);
+                            list.push(Container {
+                                id,
+                                service,
+                                state: "running",
+                                revision,
+                            });
+                        }
+                        exited(0, self.noise())
+                    }
+                    ["up", "--detach", "--no-build", "--pull", "never"] => {
+                        let services = self.declared_services(&project, revision);
+                        let new_ids: Vec<(String, String)> = services
+                            .into_iter()
+                            .map(|service| (service, self.fresh_id()))
+                            .collect();
+                        // Real Docker Compose `up` without `--remove-orphans`
+                        // replaces declared services and leaves retired ones.
+                        let list = self.containers.entry(project).or_default();
+                        for (service, id) in new_ids {
+                            list.retain(|container| container.service != service);
+                            list.push(Container {
+                                id,
+                                service,
+                                state: "running",
+                                revision,
+                            });
+                        }
+                        exited(0, self.noise())
                     }
                     ["stop"] => {
+                        let services = self.declared_services(&project, revision);
                         for container in self.containers.entry(project).or_default() {
-                            container.1 = "exited";
+                            if services.contains(&container.service) {
+                                container.state = "exited";
+                            }
                         }
-                        exited(0, "")
+                        exited(0, self.noise())
                     }
                     ["down"] => {
-                        self.containers.remove(&project);
-                        exited(0, "")
+                        let services = self.declared_services(&project, revision);
+                        if let Some(list) = self.containers.get_mut(&project) {
+                            list.retain(|container| !services.contains(&container.service));
+                        }
+                        exited(0, self.noise())
                     }
                     ["ps", "--all", "--format", "json"] => {
+                        let extra = self.output_canary.as_deref();
                         let lines: String = self
                             .containers
                             .get(&project)
                             .into_iter()
                             .flatten()
-                            .map(|(service, state, revision)| {
-                                format!(
-                                    "{}\n",
-                                    json!({
-                                        "Service": service,
-                                        "State": state,
-                                        "Health": "",
-                                        "Labels": format!(
-                                            "org.arxcovo.project={project},org.arxcovo.revision={revision}"
-                                        ),
-                                    })
-                                )
+                            .map(|container| {
+                                let mut obj = json!({
+                                    "ID": container.id,
+                                    "Service": container.service,
+                                    "State": container.state,
+                                    "Health": "",
+                                    "Labels": format!(
+                                        "org.arxcovo.project={project},org.arxcovo.revision={}",
+                                        container.revision
+                                    ),
+                                });
+                                if let Some(canary) = extra {
+                                    obj["Status"] = json!(canary);
+                                }
+                                format!("{obj}\n")
                             })
                             .collect();
                         exited(0, lines)
@@ -290,8 +397,8 @@ impl CommandRunner for FakeRunner {
             .containers
             .values()
             .flatten()
-            .filter(|container| container.1 == "running")
-            .map(|container| container.2)
+            .filter(|container| container.state == "running")
+            .map(|container| container.revision)
             .max();
         running.is_some_and(|revision| !docker.unhealthy.contains(&revision))
     }
@@ -308,6 +415,9 @@ struct Disk {
     revisions: BTreeMap<(String, u64), String>,
     secrets: BTreeMap<(String, String), StoredSecret>,
     prepared: BTreeMap<String, (u32, u32)>,
+    fail_save_state: bool,
+    fail_write_secret: bool,
+    secret_writes: usize,
 }
 
 struct MemoryStore(Arc<Mutex<Disk>>);
@@ -318,7 +428,11 @@ impl ComposeStore for MemoryStore {
     }
 
     fn save_state(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
-        self.0.lock().unwrap().state = Some(bytes.to_vec());
+        let mut disk = self.0.lock().unwrap();
+        if disk.fail_save_state {
+            return Err(StoreError);
+        }
+        disk.state = Some(bytes.to_vec());
         Ok(())
     }
 
@@ -343,7 +457,12 @@ impl ComposeStore for MemoryStore {
         owner: (u32, u32),
         bytes: &[u8],
     ) -> Result<(), StoreError> {
-        self.0.lock().unwrap().secrets.insert(
+        let mut disk = self.0.lock().unwrap();
+        if disk.fail_write_secret {
+            return Err(StoreError);
+        }
+        disk.secret_writes += 1;
+        disk.secrets.insert(
             (project.to_owned(), slot.to_owned()),
             (bytes.to_vec(), owner),
         );
@@ -1169,6 +1288,8 @@ fn engine_argv_is_fixed_and_environment_is_closed() {
         compose_recreate(PROJECT, 3, &["web".to_owned()]),
         compose_stop(PROJECT, 3),
         compose_down(PROJECT, 3),
+        container_stop("000000000001"),
+        container_rm("000000000001"),
         compose_ps(PROJECT, 3),
     ] {
         assert_eq!(&invocation.argv[..2], ["--config", DOCKER_CONFIG]);
@@ -1182,6 +1303,8 @@ fn engine_argv_is_fixed_and_environment_is_closed() {
             "-H",
             "--context",
             "--privileged",
+            "--force",
+            "-f",
         ] {
             assert!(!invocation.argv.iter().any(|arg| arg == flag), "{flag}");
         }
@@ -1559,6 +1682,9 @@ fn secret_canary_never_reaches_yaml_argv_env_logs_status_errors_or_state() {
     let canary = format!("arx-canary-{:016x}", 0x5eed_c0de_feed_f00d_u64);
     let encoded = encode_base64(canary.as_bytes());
     let h = Harness::new();
+    // Make every fake subprocess emit both raw and base64 canary on stdout
+    // (including error exits and extra ps JSON fields).
+    h.docker.lock().unwrap().output_canary = Some(format!("proc-out {canary} {encoded}\n"));
     let mut replies = vec![h.hello()];
     let digest = h.stage(&bytes(&manifest()));
     replies.push(h.put_secret(90, 1, canary.as_bytes()));
@@ -1566,6 +1692,18 @@ fn secret_canary_never_reaches_yaml_argv_env_logs_status_errors_or_state() {
     h.settle();
     replies.push(h.put_secret(91, 2, canary.as_bytes()));
     h.settle();
+    // Also exercise a failing subprocess that emits the canary on stdout.
+    h.docker.lock().unwrap().faults.push(Fault {
+        needle: "/dev/null stop",
+        result: exited(1, format!("stderr/stdout {canary} {encoded}\n")),
+        apply: false,
+    });
+    replies.push(h.lifecycle(95, PROJECT, OperationKind::Stop));
+    h.settle();
+    replies.push(h.svc.handle(ComposeRequest::ComposeOperation {
+        id: 8,
+        operation_id: op(95),
+    }));
     replies.push(h.put_secret(92, 1, canary.as_bytes()));
     replies.push(h.put_secret_as(93, GENERATION + 1, SLOT, 5, canary.as_bytes()));
     replies.push(h.put_secret_as(94, GENERATION, "other", 5, canary.as_bytes()));
@@ -1701,45 +1839,59 @@ fn replies_carry_no_paths_or_urls() {
 }
 
 #[test]
-fn ps_parsing_keeps_only_declared_services_of_the_project() {
-    let line = |service: &str, project: &str, state: &str| {
+fn ps_parsing_keeps_all_attributed_services_of_the_project() {
+    let line = |service: &str, project: Option<&str>, state: &str| {
+        let labels = match project {
+            Some(project) => format!("org.arxcovo.project={project},org.arxcovo.revision=4"),
+            None => String::new(),
+        };
         json!({
+            "ID": "000000000001",
             "Service": service,
             "State": state,
             "Health": "healthy",
-            "Labels": format!("org.arxcovo.project={project},org.arxcovo.revision=4"),
+            "Labels": labels,
         })
         .to_string()
     };
     let ndjson = [
-        line("web", PROJECT, "running"),
-        line("web", "other", "running"),
-        line("intruder", PROJECT, "running"),
+        line("web", Some(PROJECT), "running"),
+        line("web", Some("other"), "running"),
+        line("retired", Some(PROJECT), "running"),
+        line("foreign", None, "running"),
     ]
     .join("\n");
-    let views = parse_ps(ndjson.as_bytes(), PROJECT, &["web"]).unwrap();
+    let views = parse_ps(ndjson.as_bytes(), PROJECT).unwrap();
     assert_eq!(
         views,
-        vec![ServiceView {
-            name: "web".to_owned(),
-            state: ServiceState::Running,
-            health: HealthState::Healthy,
-            revision: Some(4),
-        }]
+        vec![
+            ServiceView {
+                name: "retired".to_owned(),
+                state: ServiceState::Running,
+                health: HealthState::Healthy,
+                revision: Some(4),
+            },
+            ServiceView {
+                name: "web".to_owned(),
+                state: ServiceState::Running,
+                health: HealthState::Healthy,
+                revision: Some(4),
+            },
+        ]
     );
     let array = format!(
         "[{},{}]",
-        line("web", PROJECT, "exited"),
-        line("web", PROJECT, "running")
+        line("web", Some(PROJECT), "exited"),
+        line("web", Some(PROJECT), "running")
     );
-    let views = parse_ps(array.as_bytes(), PROJECT, &["web"]).unwrap();
+    let views = parse_ps(array.as_bytes(), PROJECT).unwrap();
     assert_eq!(
         views[0].state,
         ServiceState::Unknown,
         "duplicate containers"
     );
-    assert_eq!(parse_ps(b"", PROJECT, &["web"]), Some(Vec::new()));
-    assert_eq!(parse_ps(b"not json", PROJECT, &["web"]), None);
+    assert_eq!(parse_ps(b"", PROJECT), Some(Vec::new()));
+    assert_eq!(parse_ps(b"not json", PROJECT), None);
 }
 
 #[test]
@@ -1761,4 +1913,524 @@ fn base64_is_strict_and_canonical() {
         None,
         "over the bound"
     );
+}
+
+#[test]
+fn secret_delivery_journals_before_file_replace_and_rejects_conflicting_replay() {
+    let h = Harness::new();
+    h.deployed();
+    assert_eq!(h.disk.lock().unwrap().secret_writes, 1);
+
+    let reply = h.put_secret(91, 2, b"second value");
+    assert!(matches!(
+        reply,
+        ComposeResponse::ComposeSecretAccepted {
+            epoch: 2,
+            recreate: Some(_),
+            ..
+        }
+    ));
+    h.settle();
+    assert_eq!(h.operation(91).state, OperationState::Succeeded);
+    assert_eq!(h.disk.lock().unwrap().secret_writes, 2);
+    let recreates = h.count("--force-recreate");
+    assert_eq!(recreates, 1);
+
+    // Replayed operation ID with different epoch, slot, or content is a conflict
+    // and never touches the tmpfs file.
+    assert_eq!(
+        rejected(&h.put_secret(91, 3, b"third value")),
+        Some(RejectCode::OperationConflict)
+    );
+    assert_eq!(
+        rejected(&h.put_secret_as(91, GENERATION, "other", 2, b"second value")),
+        Some(RejectCode::OperationConflict)
+    );
+    assert_eq!(
+        rejected(&h.put_secret(91, 2, b"tampered value")),
+        Some(RejectCode::OperationConflict)
+    );
+    assert_eq!(h.disk.lock().unwrap().secret_writes, 2);
+    assert_eq!(
+        h.disk.lock().unwrap().secrets[&(PROJECT.to_owned(), SLOT.to_owned())].0,
+        b"second value"
+    );
+
+    // Exact replay returns the journaled view without rewriting the file or recreating.
+    assert!(matches!(
+        h.put_secret(91, 2, b"second value"),
+        ComposeResponse::ComposeSecretAccepted {
+            epoch: 2,
+            recreate: Some(OperationView {
+                state: OperationState::Succeeded,
+                ..
+            }),
+            ..
+        }
+    ));
+    assert_eq!(h.disk.lock().unwrap().secret_writes, 2);
+    assert_eq!(h.count("--force-recreate"), recreates);
+
+    // Non-rotation replay with different content also conflicts without touching the file.
+    assert_eq!(
+        rejected(&h.put_secret(90, 1, b"tampered")),
+        Some(RejectCode::OperationConflict)
+    );
+    assert_eq!(h.disk.lock().unwrap().secret_writes, 2);
+
+    // Journal persistence failure leaves the old tmpfs file untouched for both
+    // rotation and non-rotation deliveries.
+    h.disk.lock().unwrap().fail_save_state = true;
+    assert_eq!(
+        rejected(&h.put_secret(92, 3, b"third value")),
+        Some(RejectCode::StoreFailure)
+    );
+    assert_eq!(
+        rejected(&h.put_secret(93, 2, b"second value")),
+        Some(RejectCode::StoreFailure)
+    );
+    assert_eq!(h.disk.lock().unwrap().secret_writes, 2);
+    assert_eq!(
+        h.disk.lock().unwrap().secrets[&(PROJECT.to_owned(), SLOT.to_owned())].0,
+        b"second value"
+    );
+    assert_eq!(h.count("--force-recreate"), recreates);
+
+    // Once storage recovers, a fresh rotation succeeds.
+    h.disk.lock().unwrap().fail_save_state = false;
+    assert!(matches!(
+        h.put_secret(94, 3, b"third value"),
+        ComposeResponse::ComposeSecretAccepted {
+            epoch: 3,
+            recreate: Some(_),
+            ..
+        }
+    ));
+    h.settle();
+    assert_eq!(h.operation(94).state, OperationState::Succeeded);
+    assert_eq!(
+        h.disk.lock().unwrap().secrets[&(PROJECT.to_owned(), SLOT.to_owned())].0,
+        b"third value"
+    );
+}
+
+#[test]
+fn rotation_succeeds_only_when_container_replacement_is_observed() {
+    // Timed-out recreate with zero replacements reconciles to Failed + recovery_required.
+    let h = Harness::new();
+    h.deployed();
+    h.docker.lock().unwrap().faults.push(Fault {
+        needle: "--force-recreate",
+        result: RunResult::TimedOut,
+        apply: false,
+    });
+    h.put_secret(91, 2, b"second value");
+    h.settle();
+    assert_eq!(h.operation(91).state, OperationState::Ambiguous);
+    h.svc.handle(ComposeRequest::ComposeReconcile {
+        id: 17,
+        operation_id: op(91),
+    });
+    assert_eq!(h.operation(91).state, OperationState::Failed);
+    assert_eq!(h.operation(91).failure, Some(FailureCode::NotApplied));
+    assert!(h.status(PROJECT).recovery_required);
+
+    // Even an exit-0 recreate that leaves the old container ID in place fails.
+    let h_noop = Harness::new();
+    h_noop.deployed();
+    h_noop.docker.lock().unwrap().faults.push(Fault {
+        needle: "--force-recreate",
+        result: exited(0, ""),
+        apply: false,
+    });
+    h_noop.put_secret(91, 2, b"second value");
+    h_noop.settle();
+    assert_eq!(h_noop.operation(91).state, OperationState::Failed);
+    assert_eq!(
+        h_noop.operation(91).failure,
+        Some(FailureCode::HealthFailed)
+    );
+    assert!(h_noop.status(PROJECT).recovery_required);
+
+    // Timed-out recreate after actual container replacement reconciles to Succeeded.
+    let h_applied = Harness::new();
+    h_applied.deployed();
+    h_applied.docker.lock().unwrap().faults.push(Fault {
+        needle: "--force-recreate",
+        result: RunResult::TimedOut,
+        apply: true,
+    });
+    h_applied.put_secret(91, 2, b"second value");
+    h_applied.settle();
+    assert_eq!(h_applied.operation(91).state, OperationState::Ambiguous);
+    h_applied.svc.handle(ComposeRequest::ComposeReconcile {
+        id: 18,
+        operation_id: op(91),
+    });
+    assert_eq!(h_applied.operation(91).state, OperationState::Succeeded);
+    assert!(!h_applied.status(PROJECT).recovery_required);
+}
+
+#[test]
+fn staged_release_can_receive_new_secret_slot_and_changed_owner() {
+    let h = Harness::new();
+    h.deployed();
+
+    // Revision 2 declares a brand-new secret slot.
+    let mut rev2 = manifest();
+    rev2["secrets"] = json!(["next_slot"]);
+    rev2["services"][0]["secrets"] = json!(["next_slot"]);
+    let digest2 = h.stage(&bytes(&rev2));
+    assert_eq!(
+        rejected(&h.deploy(2, PROJECT, 2, &digest2)),
+        Some(RejectCode::SecretMissing)
+    );
+    assert!(matches!(
+        h.put_secret_as(91, GENERATION, "next_slot", 1, b"next value"),
+        ComposeResponse::ComposeSecretAccepted {
+            epoch: 1,
+            recreate: None,
+            ..
+        }
+    ));
+    assert_eq!(h.count("--force-recreate"), 0);
+    h.deploy(2, PROJECT, 2, &digest2);
+    h.settle();
+    assert_eq!(h.operation(2).state, OperationState::Succeeded);
+
+    // Revision 3 changes the owner of `next_slot` from 1000:1000 to 2000:2000.
+    let mut rev3 = rev2;
+    rev3["services"][0]["uid"] = json!(2000);
+    rev3["services"][0]["gid"] = json!(2000);
+    rev3["services"][0]["mounts"] = json!([]);
+    rev3["volumes"] = json!([]);
+    let digest3 = h.stage(&bytes(&rev3));
+    assert_eq!(
+        rejected(&h.deploy(3, PROJECT, 3, &digest3)),
+        Some(RejectCode::SecretOwnerMismatch)
+    );
+    assert!(matches!(
+        h.put_secret_as(92, GENERATION, "next_slot", 2, b"new owner value"),
+        ComposeResponse::ComposeSecretAccepted {
+            epoch: 2,
+            recreate: None,
+            ..
+        }
+    ));
+    assert_eq!(h.count("--force-recreate"), 0);
+    assert_eq!(
+        h.disk.lock().unwrap().secrets[&(PROJECT.to_owned(), "next_slot".to_owned())].1,
+        (2000, 2000)
+    );
+    h.deploy(3, PROJECT, 3, &digest3);
+    h.settle();
+    assert_eq!(h.operation(3).state, OperationState::Succeeded);
+}
+
+#[test]
+fn deploy_and_down_cover_retired_attributed_services() {
+    let h = Harness::new();
+    h.hello();
+    let mut rev1 = manifest();
+    rev1["services"].as_array_mut().unwrap().push(json!({
+        "name": "worker",
+        "image": image(),
+        "platform": "linux/amd64",
+        "uid": 1000,
+        "gid": 1000,
+        "http_port": null,
+        "health_path": null,
+        "read_only_rootfs": true,
+        "environment": [],
+        "mounts": [],
+        "secrets": [],
+        "limits": {"cpu_millis": 100, "memory_mib": 64, "pids": 32}
+    }));
+    {
+        let mut docker = h.docker.lock().unwrap();
+        docker.revision_services.insert(
+            (PROJECT.to_owned(), 1),
+            vec!["web".to_owned(), "worker".to_owned()],
+        );
+        docker
+            .revision_services
+            .insert((PROJECT.to_owned(), 2), vec!["web".to_owned()]);
+    }
+    let digest1 = h.stage(&bytes(&rev1));
+    h.put_secret(90, 1, b"first value");
+    h.deploy(1, PROJECT, 1, &digest1);
+    h.settle();
+    assert_eq!(h.operation(1).state, OperationState::Succeeded);
+    assert_eq!(h.docker.lock().unwrap().containers[PROJECT].len(), 2);
+
+    // Revision 2 retires `worker`: deploy stops and removes the retired container.
+    let digest2 = h.stage(&bytes(&manifest()));
+    h.deploy(2, PROJECT, 2, &digest2);
+    h.settle();
+    assert_eq!(h.operation(2).state, OperationState::Succeeded);
+    {
+        let docker = h.docker.lock().unwrap();
+        let names: Vec<&str> = docker.containers[PROJECT]
+            .iter()
+            .map(|c| c.service.as_str())
+            .collect();
+        assert_eq!(names, vec!["web"], "retired service remained after deploy");
+    }
+    assert!(h.count("container stop") >= 1);
+    assert!(h.count("container rm") >= 1);
+    assert_eq!(h.count("--remove-orphans"), 0);
+
+    // Inject a lingering attributed retired container and test Down + Reconcile:
+    // `apply: true` removes the declared `web` container while leaving only the
+    // retired attributed container running, so reconcile must still fail.
+    h.docker
+        .lock()
+        .unwrap()
+        .containers
+        .entry(PROJECT.to_owned())
+        .or_default()
+        .push(Container {
+            id: "00000000abcd".to_owned(),
+            service: "retired".to_owned(),
+            state: "running",
+            revision: 1,
+        });
+    h.docker.lock().unwrap().faults.push(Fault {
+        needle: "/dev/null down",
+        result: RunResult::TimedOut,
+        apply: true,
+    });
+    h.lifecycle(3, PROJECT, OperationKind::Down);
+    h.settle();
+    assert_eq!(h.operation(3).state, OperationState::Ambiguous);
+    h.svc.handle(ComposeRequest::ComposeReconcile {
+        id: 17,
+        operation_id: op(3),
+    });
+    assert_eq!(h.operation(3).state, OperationState::Failed);
+    assert_eq!(h.operation(3).failure, Some(FailureCode::NotApplied));
+    assert!(h.status(PROJECT).recovery_required);
+
+    // Normal Down removes both declared and retired attributed containers without
+    // `--remove-orphans` or volume flags.
+    h.lifecycle(4, PROJECT, OperationKind::Down);
+    h.settle();
+    assert_eq!(h.operation(4).state, OperationState::Succeeded);
+    assert!(h.docker.lock().unwrap().containers[PROJECT].is_empty());
+    assert_eq!(h.count("--remove-orphans"), 0);
+
+    // If removing a lingering attributed container fails, Down never succeeds.
+    h.docker
+        .lock()
+        .unwrap()
+        .containers
+        .entry(PROJECT.to_owned())
+        .or_default()
+        .push(Container {
+            id: "00000000abce".to_owned(),
+            service: "retired".to_owned(),
+            state: "running",
+            revision: 1,
+        });
+    h.docker.lock().unwrap().faults.push(Fault {
+        needle: "container rm",
+        result: exited(1, ""),
+        apply: false,
+    });
+    h.lifecycle(5, PROJECT, OperationKind::Down);
+    h.settle();
+    assert_eq!(h.operation(5).state, OperationState::Failed);
+    assert_eq!(h.operation(5).failure, Some(FailureCode::DownFailed));
+    assert!(h.status(PROJECT).recovery_required);
+}
+
+#[test]
+fn volume_cap_holds_under_repeated_failed_preparations() {
+    let h = Harness::new();
+    h.docker
+        .lock()
+        .unwrap()
+        .services
+        .insert(PROJECT.to_owned(), vec!["app".to_owned()]);
+    h.hello();
+    for revision in 1..=9u64 {
+        let slot = format!("data{revision}");
+        let digest = h.stage(&bytes(&plain(PROJECT, &[&slot])));
+        h.docker.lock().unwrap().faults.push(Fault {
+            needle: "{{.Mountpoint}}",
+            result: exited(1, ""),
+            apply: false,
+        });
+        let reply = h.deploy(100 + revision as u32, PROJECT, revision, &digest);
+        if revision <= MAX_VOLUMES as u64 {
+            assert!(
+                matches!(reply, ComposeResponse::ComposeOperationState { .. }),
+                "rev {revision}: {reply:?}"
+            );
+            h.settle();
+            assert_eq!(
+                h.operation(100 + revision as u32).failure,
+                Some(FailureCode::VolumeFailed)
+            );
+        } else {
+            assert_eq!(rejected(&reply), Some(RejectCode::VolumeLimit));
+        }
+    }
+    assert_eq!(h.docker.lock().unwrap().volumes.len(), MAX_VOLUMES);
+    // Revision 9 was rejected at admission, so its injected mountpoint fault
+    // was never reached; clear it before testing retry of an already-charged volume.
+    {
+        let mut docker = h.docker.lock().unwrap();
+        assert_eq!(docker.faults.len(), 1);
+        docker.faults.clear();
+    }
+
+    // Retrying an already-charged volume succeeds without double-charging.
+    let digest = h.stage(&bytes(&plain(PROJECT, &["data1"])));
+    h.deploy(200, PROJECT, 10, &digest);
+    h.settle();
+    assert_eq!(h.operation(200).state, OperationState::Succeeded);
+    assert_eq!(h.docker.lock().unwrap().volumes.len(), MAX_VOLUMES);
+}
+
+#[test]
+fn failed_deploy_preserves_stopped_and_down_lifecycle_states() {
+    // Deliberately stopped release stays stopped after an unhealthy revision 2.
+    let h = Harness::new();
+    let digest = h.deployed();
+    h.lifecycle(10, PROJECT, OperationKind::Stop);
+    h.settle();
+    assert_eq!(h.operation(10).state, OperationState::Succeeded);
+    h.docker.lock().unwrap().unhealthy.insert(2);
+    let before = h.calls().len();
+    h.deploy(2, PROJECT, 2, &digest);
+    h.settle();
+    assert_eq!(h.operation(2).state, OperationState::Failed);
+    assert_eq!(h.operation(2).failure, Some(FailureCode::HealthFailed));
+    let up1 = compose_argv(1, &["up", "--detach", "--no-build", "--pull", "never"]);
+    assert!(
+        !h.calls()[before..].contains(&up1),
+        "failed deploy restarted the stopped revision"
+    );
+    assert!(
+        h.docker.lock().unwrap().containers[PROJECT]
+            .iter()
+            .all(|c| c.state != "running"),
+        "a container remained running after rollback to Stopped"
+    );
+    let status = h.status(PROJECT);
+    assert_eq!(status.desired, Desired::Stopped);
+    assert_eq!(status.committed_revision, Some(1));
+    assert!(!status.recovery_required);
+
+    // Deliberately down release stays down after an unhealthy revision 2.
+    let h_down = Harness::new();
+    let digest = h_down.deployed();
+    h_down.lifecycle(10, PROJECT, OperationKind::Down);
+    h_down.settle();
+    assert_eq!(h_down.operation(10).state, OperationState::Succeeded);
+    h_down.docker.lock().unwrap().unhealthy.insert(2);
+    let before = h_down.calls().len();
+    h_down.deploy(2, PROJECT, 2, &digest);
+    h_down.settle();
+    assert_eq!(h_down.operation(2).state, OperationState::Failed);
+    assert!(
+        !h_down.calls()[before..].contains(&up1),
+        "failed deploy restarted a down revision"
+    );
+    assert!(
+        h_down
+            .docker
+            .lock()
+            .unwrap()
+            .containers
+            .get(PROJECT)
+            .is_none_or(Vec::is_empty),
+        "containers remained after rollback to Down"
+    );
+    let status = h_down.status(PROJECT);
+    assert_eq!(status.desired, Desired::Down);
+    assert_eq!(status.committed_revision, Some(1));
+    assert!(!status.recovery_required);
+}
+
+#[test]
+fn deploy_replay_binds_digest_and_tombstones_survive_trimming() {
+    let h = Harness::new();
+    let digest1 = h.deployed();
+
+    let mut changed = manifest();
+    changed["services"][0]["environment"][0]["value"] = json!("8081");
+    let digest2 = h.stage(&bytes(&changed));
+    assert_ne!(digest1, digest2);
+    assert_eq!(
+        rejected(&h.deploy(1, PROJECT, 1, &digest2)),
+        Some(RejectCode::OperationConflict)
+    );
+
+    // Fill past MAX_JOURNAL so op 1 is evicted into tombstones.
+    for i in 0..MAX_JOURNAL as u32 {
+        let kind = if i % 2 == 0 {
+            OperationKind::Stop
+        } else {
+            OperationKind::Start
+        };
+        let reply = h.lifecycle(100 + i, PROJECT, kind);
+        assert!(
+            matches!(reply, ComposeResponse::ComposeOperationState { .. }),
+            "op {i}: {reply:?}"
+        );
+        h.settle();
+        assert_eq!(h.operation(100 + i).state, OperationState::Succeeded);
+    }
+
+    let before = h.calls().len();
+    assert_eq!(
+        rejected(&h.deploy(1, PROJECT, 1, &digest1)),
+        Some(RejectCode::OperationConflict)
+    );
+    assert_eq!(
+        rejected(&h.lifecycle(1, PROJECT, OperationKind::Stop)),
+        Some(RejectCode::OperationConflict)
+    );
+    assert_eq!(h.calls().len(), before, "evicted operation ID re-executed");
+
+    // Tombstones persist across restart.
+    let restarted = Harness::on(Arc::clone(&h.disk));
+    restarted.hello();
+    assert_eq!(
+        rejected(&restarted.lifecycle(1, PROJECT, OperationKind::Stop)),
+        Some(RejectCode::OperationConflict)
+    );
+}
+
+#[test]
+fn cached_staging_enforces_exact_byte_count() {
+    let h = Harness::new();
+    h.hello();
+    let input = bytes(&manifest());
+    let digest = h.stage(&input);
+    for wrong in [input.len() as u32 + 1, input.len() as u32 - 1] {
+        let reply = h.svc.handle(ComposeRequest::ComposeStageBegin {
+            id: 8,
+            digest: digest.clone(),
+            total_bytes: wrong,
+            chunks: 1,
+        });
+        assert_eq!(rejected(&reply), Some(RejectCode::StageSize));
+    }
+    let exact = h.svc.handle(ComposeRequest::ComposeStageBegin {
+        id: 8,
+        digest,
+        total_bytes: input.len() as u32,
+        chunks: 1,
+    });
+    assert!(matches!(
+        exact,
+        ComposeResponse::ComposeStageProgress {
+            received_bytes,
+            next_index: 1,
+            ..
+        } if received_bytes == input.len() as u32
+    ));
 }
