@@ -135,16 +135,43 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    that the existing VHDX matches the recorded file identity and size at the
    checked path, the read-only `Get-DiskImage` query from step 7 reports it
    detached, and `T:` is unused. Verify the task-owned temporary directory
-   before running the block. [DiskPart attachment](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/attach-vdisk)
+   before running the block. The block itself refuses a scratch root that is a
+   reparse point and a script path that already exists, creates the script
+   fresh, and removes it whether or not DiskPart succeeds. The elevated owner session runs the
+   `Get-DiskImage` guard, the same as the rest of the block. Whether
+   Storage-module queries need elevation is **unverified on real hardware**.
+   [DiskPart attachment](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/attach-vdisk)
 
    ```powershell
-   $trialAttachScript = New-TemporaryFile -ErrorAction Stop
-   @'
+   $trialImage = @(Get-DiskImage -ImagePath 'D:\ArxcovoData\qualify\trial.vhdx' -ErrorAction Stop)
+   if ($trialImage.Count -ne 1 -or
+       $trialImage[0].ImagePath -ne 'D:\ArxcovoData\qualify\trial.vhdx' -or
+       $trialImage[0].Attached -isnot [bool]) {
+       throw 'Trial volume attachment state is uncertain'
+   }
+   if (-not ($trialImage[0].Attached -eq $false)) {
+       throw 'Trial volume attachment state is uncertain'
+   }
+   $trialAttachScript = 'D:\Temp\arx-m4-activation\trial-attach.txt'
+   $scratchRoot = Get-Item -LiteralPath 'D:\Temp\arx-m4-activation' -Force -ErrorAction Stop
+   if (-not $scratchRoot.PSIsContainer -or
+       ($scratchRoot.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+       throw 'Re-attach scratch root is not an ordinary directory'
+   }
+   if (Test-Path -LiteralPath $trialAttachScript) { throw 'Re-attach script path is not fresh' }
+   # New-Item without -Force fails if any entry, including a link, already has this name.
+   $null = New-Item -ItemType File -Path $trialAttachScript -ErrorAction Stop
+   try {
+       @'
    select vdisk file=D:\ArxcovoData\qualify\trial.vhdx
    attach vdisk
-   '@ | Set-Content -LiteralPath $trialAttachScript.FullName -Encoding ascii -ErrorAction Stop
-   diskpart.exe /s $trialAttachScript.FullName
-   if ($LASTEXITCODE -ne 0) { throw 'Trial volume reattachment failed' }
+   '@ | Set-Content -LiteralPath $trialAttachScript -Encoding ascii -ErrorAction Stop
+       diskpart.exe /s $trialAttachScript
+       if ($LASTEXITCODE -ne 0) { throw 'Trial volume reattachment failed' }
+   } finally {
+       # Non-terminating, so a cleanup problem never hides the reattachment error.
+       Remove-Item -LiteralPath $trialAttachScript -Force -ErrorAction Continue
+   }
    ```
 
    Repeat preflight from the Medium console after any setup. Recheck WHPX,
@@ -257,7 +284,7 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
 
    After the trial or during rollback, the owner runs the deferred command
    from the step 3 batch only for the VHDX created by that batch. First prove
-   all trial handles are released, the backing file matches the recorded
+   all trial handles are released, and the backing file matches the recorded
    identity under the same checked path. If detaching, verify the script path
    is fresh under the task-owned scratch root. Query the exact image path and
    skip detach only when it reports `Attached = False`. A reboot or missing drive
