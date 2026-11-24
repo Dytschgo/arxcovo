@@ -20,6 +20,15 @@ pub(crate) fn host_id(db: &Connection) -> Result<Id> {
     )?)
 }
 
+#[cfg(test)]
+pub(crate) fn origin_generation(db: &Connection, vm: Id) -> Result<Id> {
+    Ok(db.query_row(
+        "SELECT origin_generation FROM vm_static_instances WHERE id=?1",
+        [vm],
+        |row| row.get(0),
+    )?)
+}
+
 fn state(code: i64) -> rusqlite::Result<StaticState> {
     match code {
         0 => Ok(StaticState::Creating),
@@ -99,7 +108,8 @@ pub(crate) fn launch_busy(db: &Connection) -> Result<bool> {
 pub(super) fn recover(db: &Connection, now: i64) -> Result<()> {
     db.execute(
         "UPDATE vm_artifacts SET state='quarantined'
-         WHERE generation_id IN (SELECT id FROM vm_generations WHERE static_id IS NOT NULL AND active=0)",
+         WHERE generation_id IN (SELECT id FROM vm_generations WHERE active=0
+            AND static_id IN (SELECT id FROM vm_static_instances WHERE state=0))",
         [],
     )?;
     db.execute("UPDATE vm_static_instances SET state=4 WHERE state=0", [])?;
@@ -503,6 +513,7 @@ pub(crate) fn settle_create(
                 identify(db, slot, evidence)?;
             }
             activate(db, slots, "active")?;
+            snapshot::initial_release(db, slots.disk.generation)?;
             db.execute(
                 "UPDATE vm_static_instances SET state=1,staging=0 WHERE id=?1",
                 [vm],

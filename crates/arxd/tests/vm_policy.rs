@@ -13,7 +13,7 @@ const VM: Id = [2; 16];
 const MIB: u64 = 1024 * 1024;
 /// The VM store's `user_version`. `store::vm::VM_SCHEMA_VERSION` is
 /// crate-private, so this integration test mirrors it; update both together.
-const VM_SCHEMA_VERSION: i64 = 10;
+const VM_SCHEMA_VERSION: i64 = 11;
 /// The shared activity store's `user_version` (crate-private in `store`),
 /// which must stay distinct from the VM store's.
 const ACTIVITY_SCHEMA_VERSION: i64 = 5;
@@ -971,27 +971,9 @@ fn catalog_pending_instance_and_snapshot_caps_hold() {
             },
         )
     };
-    for vm in 10..14 {
-        for byte in 1..=4 {
-            f.finish(f.admit(snapshot(vm, byte, u64::from(vm) * 10 + u64::from(byte))));
-        }
-        refused(
-            f.admit(snapshot(vm, 5, u64::from(vm) * 10 + 5)),
-            Refusal::SnapshotLimit,
-        );
-    }
-    refused(f.admit(snapshot(14, 1, 141)), Refusal::SnapshotLimit);
-    assert_eq!(
-        scalar(
-            f.dir.path(),
-            "SELECT count(*) FROM vm_snapshots WHERE ready=1"
-        ),
-        16
-    );
-    assert_eq!(
-        scalar(f.dir.path(), "SELECT sum(staging) FROM vm_disk_claims"),
-        0
-    );
+    // The metadata API has no paired-copy authority.
+    refused(f.admit(snapshot(10, 1, 101)), Refusal::Invalid);
+    assert_eq!(scalar(f.dir.path(), "SELECT count(*) FROM vm_snapshots"), 0);
 }
 
 #[test]
