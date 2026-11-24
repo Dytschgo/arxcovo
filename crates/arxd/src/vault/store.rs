@@ -94,7 +94,7 @@ impl Store {
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         let application: u32 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
         ensure!(
-            matches!((version, application), (0, 0) | (1, APPLICATION_ID)),
+            matches!((version, application), (0, 0) | (1 | 2, APPLICATION_ID)),
             "unsupported vault state"
         );
         db.execute_batch(
@@ -109,17 +109,24 @@ impl Store {
             );
             tx.execute_batch(SCHEMA)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-            tx.pragma_update(None, "user_version", 1)?;
+        }
+        if version < 2 {
+            tx.execute_batch(
+                "ALTER TABLE versions ADD COLUMN inconclusive INTEGER NOT NULL DEFAULT 0
+                 CHECK(inconclusive IN (0,1) AND (inconclusive=0 OR
+                       (state='rejected' AND test_status IS 'interrupted' AND cleanup_confirmed IS 0)));",
+            )?;
+            tx.pragma_update(None, "user_version", 2)?;
         }
         tx.execute(
             "INSERT INTO audit(owner,action,at_ms,outcome,reason,version,operation)
-             SELECT s.owner,'vault_test_version',?1,'failed','interrupted',v.id,v.test_op
+             SELECT s.owner,'vault_test_version',?1,'failed','test_inconclusive',v.id,v.test_op
              FROM versions v JOIN scripts s ON s.seq=v.script
              WHERE v.state='testing' AND v.test_status IS NULL",
             [now],
         )?;
         tx.execute(
-            "UPDATE versions SET state='rejected',test_status='interrupted',cleanup_confirmed=0
+            "UPDATE versions SET state='rejected',test_status='interrupted',cleanup_confirmed=0,inconclusive=1
              WHERE state='testing' AND test_status IS NULL",
             [],
         )?;
@@ -200,6 +207,7 @@ impl WriteScope<'_> {
         db: &Connection,
         write: Write,
         tester_available: bool,
+        test_refusal: Option<Refusal>,
     ) -> Result<(Reply, Option<JobData>)> {
         let request = write.request_id();
         let now = scalar(
@@ -238,7 +246,13 @@ impl WriteScope<'_> {
                 Err(reason) => return self.refuse(db, reason),
             },
             Write::Test { version_id, .. } => {
-                match self.test(db, operation, version_id, tester_available)? {
+                match self.test(
+                    db,
+                    operation,
+                    version_id,
+                    test_refusal
+                        .or_else(|| (!tester_available).then_some(Refusal::TesterUnavailable)),
+                )? {
                     Ok(job) => (version_id, Some(job)),
                     Err(reason) => return self.refuse(db, reason),
                 }
@@ -344,24 +358,25 @@ impl WriteScope<'_> {
         db: &Connection,
         operation: Id,
         version: Id,
-        available: bool,
+        refusal: Option<Refusal>,
     ) -> Result<Result<JobData, Refusal>> {
-        let subject: Option<(String, ScriptOs)> = db
+        let subject: Option<(bool, ScriptOs)> = db
             .query_row(
-                "SELECT v.state,s.os FROM versions v JOIN scripts s ON s.seq=v.script
-             WHERE v.id=?1 AND s.owner=?2",
+                "SELECT v.state='draft' OR v.inconclusive=1,s.os
+                 FROM versions v JOIN scripts s ON s.seq=v.script
+                 WHERE v.id=?1 AND s.owner=?2",
                 params![version, self.owner],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some((state, os)) = subject else {
+        let Some((retryable, os)) = subject else {
             return Ok(Err(Refusal::NotFound));
         };
-        if state != "draft" {
+        if !retryable {
             return Ok(Err(Refusal::NotDraft));
         }
-        if !available {
-            return Ok(Err(Refusal::TesterUnavailable));
+        if let Some(reason) = refusal {
+            return Ok(Err(reason));
         }
         if scalar(
             db,
@@ -373,7 +388,8 @@ impl WriteScope<'_> {
         }
         let (content, hash) = content(db, version)?;
         db.execute(
-            "UPDATE versions SET state='testing',test_op=?1 WHERE id=?2",
+            "UPDATE versions SET state='testing',test_op=?1,test_status=NULL,
+                 exit_code=NULL,cleanup_confirmed=NULL,inconclusive=0 WHERE id=?2",
             params![operation, version],
         )?;
         Ok(Ok(JobData {

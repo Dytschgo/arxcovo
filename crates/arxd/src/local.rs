@@ -254,6 +254,12 @@ pub async fn run_vm_profile(profile: crate::config::VmForeground) -> Result<()> 
     supervisor
         .verify_root(&config.state_dir)
         .context("server-state")?;
+    supervisor
+        .open_vault(&config.state_dir)
+        .context("server-state")?;
+    supervisor
+        .verify_root(&config.state_dir)
+        .context("server-state")?;
     let listener = Listener::bind(endpoint).context("server-bind")?;
     serve_vm_profile(listener, Arc::new(config), supervisor, async {
         tokio::signal::ctrl_c().await.context("server-listener")

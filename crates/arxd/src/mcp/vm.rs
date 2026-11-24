@@ -1,4 +1,5 @@
 //! Foreground-only VM tools. This module is selected after local authentication.
+mod vault_test;
 use crate::{
     config::{TestVms, VmRuntimeProfile},
     service::Shutdown,
@@ -272,6 +273,16 @@ pub(crate) struct Supervisor {
     runtime: Option<VmRuntimeProfile>,
     publisher: Publication,
     compose: compose::Host,
+    vault: std::sync::OnceLock<Arc<crate::vault::Vault>>,
+    vault_jobs: Mutex<vault_test::Jobs>,
+    #[cfg(test)]
+    vault_cleanup_waiting: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    stall_vault_teardown: Mutex<Option<tests::StallHook>>,
+    #[cfg(test)]
+    stall_vault_acquisition: Mutex<Option<tests::StallHook>>,
+    #[cfg(test)]
+    vault_drain_waiting: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Deferred local stops queued by owner revocation, at most one in flight
     /// per activation generation. Kept outside the dispatch gate: revocation
     /// runs before the gate, the replay ledger and every store write.
@@ -421,6 +432,16 @@ impl Supervisor {
             runtime,
             publisher: Publication::default(),
             compose: compose::Host::default(),
+            vault: Default::default(),
+            vault_jobs: Default::default(),
+            #[cfg(test)]
+            vault_cleanup_waiting: Default::default(),
+            #[cfg(test)]
+            stall_vault_teardown: Default::default(),
+            #[cfg(test)]
+            stall_vault_acquisition: Default::default(),
+            #[cfg(test)]
+            vault_drain_waiting: Default::default(),
             stops: Mutex::default(),
             #[cfg(test)]
             stops_spawned: Default::default(),
@@ -540,7 +561,9 @@ impl Supervisor {
             .and_then(|mut stall| stall.take())
             .map(tests::StallHook::enter);
         #[cfg(test)]
-        if let Some(reaper) = self.lock()?.fixture.as_ref().map(tests::Fixture::reaper) {
+        let fixture = self.lock()?.fixture.as_ref().map(tests::Fixture::reaper);
+        #[cfg(test)]
+        if let Some(reaper) = fixture {
             self.controller.sweep_with(&reaper, &*reaper.custody)?;
             return Ok(());
         }
@@ -704,6 +727,7 @@ impl Supervisor {
                 self.lock()?.drained = Some(drained);
             }
         }
+        self.drain_vault_jobs(deadline).await?;
         // Quiescent: every worker and stop joined and local ingress is down.
         // The final reconciliation decides the publication settlement; a
         // remote timeout or failure leaves the intent intact for startup
@@ -1121,8 +1145,13 @@ impl ServerHandler for VmInventory {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools: Vec<_> = ToolName::ALL.map(ToolName::schema).into();
+        if self.supervisor.vault.get().is_some() {
+            crate::vault::mcp::extend_activity_schema(&mut tools[1]);
+            tools.extend(crate::vault::mcp::tools());
+        }
         Ok(ListToolsResult {
-            tools: ToolName::ALL.map(ToolName::schema).into(),
+            tools,
             ..Default::default()
         })
     }
@@ -1356,6 +1385,20 @@ impl VmInventory {
             return Err(SHUTDOWN);
         }
         let name = request.name.as_ref();
+        if let Some(vault) = self.supervisor.vault.get()
+            && crate::vault::mcp::handles(name, request.arguments.as_ref())
+        {
+            let refusal = (!self.supervisor.vault_test_available(&gate))
+                .then_some(crate::vault::Refusal::VmAdmissionClosed);
+            return crate::vault::mcp::invoke(
+                vault,
+                &self.principal,
+                name,
+                request.arguments.unwrap_or_default(),
+                refusal,
+            )
+            .map_err(|reason| Fault(reason.as_str()));
+        }
         if matches!(name, "run_command" | "discover_tools") {
             return self.refuse(HOST_REFUSAL_ACTION, None, HOST_EXECUTION_DISABLED);
         }
@@ -2603,6 +2646,9 @@ mod tests {
         metadata: 0,
     };
     const UTC: i64 = 1_800_000_000_000;
+    const VAULT_CANARY: &str = "arx-vault-fixture-canary-a58c";
+    const VAULT_EXIT_0: &str = "echo arx-vault-fixture-canary-a58c; exit 0";
+    const VAULT_EXIT_7: &str = "echo arx-vault-fixture-canary-a58c; exit 7";
     const RECIPE: (Id, [u8; 32]) = ([3; 16], [4; 32]);
     const WEB_DIGEST: [u8; 32] = [17; 32];
     const WEB_RETAINED: DiskClaim = DiskClaim {
@@ -3876,6 +3922,10 @@ mod tests {
 
         pub(super) fn ready(&self, vm: Id) -> bool {
             self.live.lock().unwrap().boots.contains_key(&vm)
+        }
+
+        pub(super) fn worker_active(&self, vm: Id) -> bool {
+            self.live.lock().unwrap().working.contains(&vm)
         }
 
         pub(super) fn publish_origin(&self, vm: Id) -> Option<Origin> {
@@ -5257,18 +5307,31 @@ mod tests {
                     script_execution: ScriptExecution::Available,
                 },
                 Request::RunScript { id, script, .. }
-                    if script == "exit 7" || script == "exit 0" =>
+                    if matches!(
+                        script.as_str(),
+                        "exit 7" | "exit 0" | VAULT_EXIT_7 | VAULT_EXIT_0
+                    ) =>
                 {
                     Response::ScriptResult {
                         id,
                         status: ScriptStatus::Exited,
-                        exit_code: Some(if script == "exit 7" { 7 } else { 0 }),
+                        exit_code: Some(if matches!(script.as_str(), "exit 7" | VAULT_EXIT_7) {
+                            7
+                        } else {
+                            0
+                        }),
                     }
                 }
                 _ => anyhow::bail!("unexpected fixture guest request"),
             };
             let mut frame = Vec::new();
             arx_guest::write_frame(&mut frame, &response)?;
+            ensure!(
+                !frame
+                    .windows(VAULT_CANARY.len())
+                    .any(|window| window == VAULT_CANARY.as_bytes()),
+                "fixture guest response leaked script bytes"
+            );
             stream.write_all(&frame).await?;
         }
         Ok(())
@@ -13751,6 +13814,8 @@ mod tests {
         drop(a);
         h.shutdown().await.unwrap();
     }
+
+    include!("vm/vault_test_cases.rs");
 
     #[tokio::test]
     async fn authenticated_windows_fixture_build_and_clone_keep_guest_kind() {

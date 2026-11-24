@@ -2000,23 +2000,45 @@ pub(crate) fn expiry_claims(db: &Connection, now: i64) -> Result<Vec<ExpiryClaim
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     due.into_iter()
-        .map(|(vm, previous)| {
-            if let Some(previous) = previous {
-                db.execute(
-                    "UPDATE vm_instances SET state=4,cleanup_route='lease',cleanup_id=NULL WHERE id=?1",
-                    [vm],
-                )?;
-                finish(db, previous, Status::Interrupted, now, Some(false))?;
-            }
-            let activity_id = activity(db, "arxd", vm, Action::Expire, now)?;
-            db.execute(
-                "UPDATE vm_instances SET state=4,cleanup_route='lease',cleanup_id=?2 WHERE id=?1",
-                params![vm, activity_id],
-            )?;
-            snapshot::claim_expiry(db, vm, activity_id, now)?;
-            Ok(ExpiryClaim { vm, activity_id })
-        })
+        .map(|(vm, previous)| begin_expiry(db, vm, previous, now))
         .collect()
+}
+
+/// Select only a committed daemon-owned TEST clone. Unpublished clone
+/// generations still belong to the normal staging recovery route.
+pub(crate) fn vault_test_expiry(db: &Connection, vm: Id, now: i64) -> Result<Option<ExpiryClaim>> {
+    let row: Option<(i64, Option<i64>, Option<String>)> = db
+        .query_row(
+            "SELECT state,cleanup_id,cleanup_route FROM vm_instances
+             WHERE id=?1 AND principal='arxd' AND expires_ms<=?2",
+            params![vm, now],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    match row {
+        Some((1..=3, previous, _)) => begin_expiry(db, vm, previous, now).map(Some),
+        Some((4, Some(activity_id), Some(route))) if route == "lease" => {
+            Ok(Some(ExpiryClaim { vm, activity_id }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn begin_expiry(db: &Connection, vm: Id, previous: Option<i64>, now: i64) -> Result<ExpiryClaim> {
+    if let Some(previous) = previous {
+        db.execute(
+            "UPDATE vm_instances SET state=4,cleanup_route='lease',cleanup_id=NULL WHERE id=?1",
+            [vm],
+        )?;
+        finish(db, previous, Status::Interrupted, now, Some(false))?;
+    }
+    let activity_id = activity(db, "arxd", vm, Action::Expire, now)?;
+    db.execute(
+        "UPDATE vm_instances SET state=4,cleanup_route='lease',cleanup_id=?2 WHERE id=?1",
+        params![vm, activity_id],
+    )?;
+    snapshot::claim_expiry(db, vm, activity_id, now)?;
+    Ok(ExpiryClaim { vm, activity_id })
 }
 
 pub(crate) fn purge_tombstones(db: &Connection, now: i64) -> Result<()> {
