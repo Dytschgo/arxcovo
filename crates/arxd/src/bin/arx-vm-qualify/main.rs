@@ -2,9 +2,9 @@
 //!
 //! This binary crate owns the private `TrialAuthority`; the arxd library and
 //! the daemon cannot name it, and it never converts into `LaunchAuthority`.
-//! The arxd library supplies only an authority-free, read-only preflight
-//! and a diagnostic-only evidence sink. In this contract version the
-//! executable can write only an incomplete baseline diagnostic.
+//! The library provides held preflight, a fixed paused-trial adapter, and
+//! a diagnostic-only evidence sink. The executable publishes incomplete
+//! qualification diagnostics.
 //!
 //! An evidence directory serves exactly one run. Before the runner's claim
 //! exists, the sink removes only its own temporary entries left by an
@@ -30,16 +30,22 @@ mod tests;
 fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
 
-    let args: Vec<_> = std::env::args_os().skip(1).take(3).collect();
-    let [enrollment, evidence] = args.as_slice() else {
-        eprintln!("usage: arx-vm-qualify ENROLLMENT_JSON EMPTY_EVIDENCE_DIRECTORY");
-        return ExitCode::FAILURE;
+    let args: Vec<_> = std::env::args_os().skip(1).take(4).collect();
+    let (enrollment, evidence, paused) = match args.as_slice() {
+        [enrollment, evidence] => (enrollment, evidence, false),
+        [flag, enrollment, evidence] if flag == "--paused-trial" => (enrollment, evidence, true),
+        _ => {
+            eprintln!(
+                "usage: arx-vm-qualify [--paused-trial] ENROLLMENT_JSON EMPTY_EVIDENCE_DIRECTORY"
+            );
+            return ExitCode::FAILURE;
+        }
     };
     let result = enrollment
         .to_str()
         .zip(evidence.to_str())
         .ok_or(frame::RunError::Input)
-        .and_then(|(enrollment, evidence)| native::run(enrollment, evidence));
+        .and_then(|(enrollment, evidence)| native::run(enrollment, evidence, paused));
     // Only typed, path-free outcomes reach the console.
     match result {
         Ok(native::Outcome::Incomplete) => {

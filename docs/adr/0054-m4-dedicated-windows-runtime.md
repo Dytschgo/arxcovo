@@ -1168,3 +1168,82 @@ quarantine.
 Run the full enabled recipe and helper matrix, including real WHPX cold
 boots and observed coverage through teardown. These witness,
 adapter and full-recipe cases are **unverified on real hardware**.
+
+
+## Amendment 2026-11-24 — Owner fallback to held bundle inventory
+
+The owner selected option 2 for v1 once the full witness could no longer
+be delivered in a host-only adapter. The owner's rationale was that
+"the witness only matters while host execution (current_user) is itself
+fenced; an agent with host exec can do much more without touching QEMU."
+Its marginal value does not justify stalling M4. This amendment replaces
+the earlier loader and consumer witness requirements for v1 startup and
+qualification. The full witness is tracked in [Known issues / later
+release](../ROADMAP.md#known-issues--later-release).
+
+The 7b3 builder found that #314 acknowledges the granted ROM handle
+before the pinned child binds it into the CRT descriptor via the fallible
+`_open_osfhandle`. The builder also found no reviewed exact-Windows-build
+System32, KnownDLL, API-set, activation or native runtime-object coverage
+inventory. Evidence `D:/Temp/arx-m4-7b3/report.md`, SHA-256
+`44eba6f9a84ad995365a13a1a09f19d9f35a5246565b95f913fe3e526ac9aa98`.
+Independent verification confirmed the coverage and native-evidence gap
+as a hard blocker. It confirmed the handshake order and noted that the
+supervisor can nevertheless verify the same live Win32 handle before ACK.
+Evidence `D:/Temp/arx-m4-7b3-verify/verdict.md`, SHA-256
+`2e3c83bfad25bba235b9a59b50f51f8b084466ee6a3c04270036418ddb5a0c27`.
+[Witnessed distribution review](https://github.com/dytschgo/arxcovo/pull/314)
+
+The paused trial uses the reviewed stock Windows x64 QEMU 11.1.3 pin from
+#284 and its 136-file receipt and manifest. Stock QEMU can run the sealed
+recipe directly. The #314 child requires its witness protocol and accepts
+only the reviewed paused argv and helper rows. The stock pin also applies
+to the M4 production QEMU and helper plans. Their pre-launch requirement
+is the same held-bundle inventory with a sealed per-plan executable, data
+and writable inputs. The separately reviewed [Docker public-egress
+pin](0064-v1-scope-docker-static-vm.md) retains its own artifact,
+qualification and network gates. This slice wires only the paused trial.
+[Landed stock pin](https://github.com/dytschgo/arxcovo/pull/284)
+
+The inventory authenticates the stock receipt and manifest, walks every
+manifest entry relative to held, non-reparse NTFS directories and checks
+each default data stream's length and SHA-256. The authenticated SHA-256
+commits the bytes and therefore their length even for manifest rows
+whose only per-file pin is a digest. The inventory matches exact case
+and the complete tree of files and directories, rejects extra and missing
+names, and bounds names, counts, bytes and the time allowed between local
+filesystem operations. Listed objects stay open without write or delete
+sharing from verification through stop and settlement. Windows sharing
+does not block a new sibling from being created, so the executable,
+bundle and empty working directories must also pass the protected directory
+ACL check. The absolute recipe, minimal environment and initial image
+search policy remain enforced. The paused adapter verifies the held
+inventory immediately before create and again after the paused QMP
+exchange. See [Windows file sharing](https://learn.microsoft.com/en-us/windows/desktop/FileIO/creating-and-opening-files)
+and [creation-time image policy](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
+
+The inventory attests that the complete reviewed bundle was present and
+held under that namespace policy. Actual mapped modules, firmware and
+other consumer opens, alternate OS activation or data mappings and
+kernel/named-object coverage are outside its evidence. Same-SID host
+execution remains inside the trusted boundary. WHPX is checked both via
+fresh platform capability samples and through the paused child's typed
+`query-accelerators` reply.
+
+For 7c, a complete native record binds the exact release, contract,
+host/build and execution profile, volume and store identities, stock
+receipt and manifest digests and lengths, and the sealed recipe, firmware,
+media, guest-protocol and network-policy inputs. Require the held-bundle
+inventory and protected search scope for every admitted plan, the
+restricted token and effective Job, live WTS/WHPX and capacity/reserve
+results, per-class network and guest/recipe acceptance, independent
+release proof, and a clean end-to-end settlement in the validity window.
+The issuer must validate the complete native record and local digest
+selection, reject fixture or incomplete diagnostics, and recheck live
+inputs and inventory before its own dispatch. This replaces the
+full-witness prerequisite assumed by the initial 7c investigation
+(`D:/Temp/arx-m4-7c/report.md`, SHA-256
+`0d714a1731c9a9fd79712f854352c5986ea0c7232f5d9c66ee40d80d5730289f`).
+The paused runner keeps its authority separate from 7c and cannot
+produce the complete record. Native launch, live host observations and
+settlement are **unverified on real hardware**.

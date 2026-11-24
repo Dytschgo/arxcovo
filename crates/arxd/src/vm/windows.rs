@@ -426,25 +426,25 @@ fn ptr_of<T>(value: &mut T) -> *mut core::ffi::c_void {
 /// therefore keeps each value live through `DeleteProcThreadAttributeList`.
 struct Attributes {
     storage: Vec<usize>,
-    values: Vec<Box<[HANDLE]>>,
+    values: Vec<Box<[usize]>>,
 }
 
 impl Attributes {
-    fn new() -> io::Result<Self> {
+    fn new(count: u32) -> io::Result<Self> {
         let mut bytes = 0;
         // The first call obtains the required size.
-        unsafe { InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut bytes) };
+        unsafe { InitializeProcThreadAttributeList(null_mut(), count, 0, &mut bytes) };
         if bytes == 0 || bytes > 65_536 {
             return Err(io::Error::other("invalid attribute list size"));
         }
         let mut storage = vec![0; bytes.div_ceil(size_of::<usize>())];
         // The heap allocation is aligned and lives until DeleteProcThreadAttributeList.
         succeeded(unsafe {
-            InitializeProcThreadAttributeList(storage.as_mut_ptr().cast(), 2, 0, &mut bytes)
+            InitializeProcThreadAttributeList(storage.as_mut_ptr().cast(), count, 0, &mut bytes)
         })?;
         Ok(Self {
             storage,
-            values: Vec::with_capacity(2),
+            values: Vec::with_capacity(count as usize),
         })
     }
 
@@ -453,11 +453,16 @@ impl Attributes {
     }
 
     fn insert(&mut self, attribute: usize, handles: &[HANDLE]) -> io::Result<()> {
+        let words: Vec<_> = handles.iter().map(|handle| *handle as usize).collect();
+        self.insert_words(attribute, &words, size_of_val(handles))
+    }
+
+    fn insert_words(&mut self, attribute: usize, words: &[usize], size: usize) -> io::Result<()> {
         // Retain the copy before the list can reference it, so even a failed
         // update leaves no dangling value.
-        self.values.push(handles.into());
+        self.values.push(words.into());
         let value = self.values.last().expect("value retained above");
-        let (address, size) = (value.as_ptr(), size_of_val(&**value));
+        let address = value.as_ptr();
         // The boxed value lives in this guard until after list destruction.
         succeeded(unsafe {
             UpdateProcThreadAttribute(
@@ -485,6 +490,14 @@ struct Job(OwnedHandle);
 
 impl Job {
     fn new(memory_limit: usize, cpu_rate: Option<u32>) -> io::Result<Self> {
+        Self::with_process_limit(memory_limit, cpu_rate, None)
+    }
+
+    fn with_process_limit(
+        memory_limit: usize,
+        cpu_rate: Option<u32>,
+        processes: Option<u32>,
+    ) -> io::Result<Self> {
         if memory_limit == 0 || cpu_rate.is_some_and(|rate| !(1..=5000).contains(&rate)) {
             return Err(io::Error::other("invalid Job limits"));
         }
@@ -492,7 +505,14 @@ impl Job {
         let job = Self(unsafe { owned(CreateJobObjectW(null(), null())) }?);
         let extended = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
             BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
-                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_JOB_MEMORY,
+                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                    | JOB_OBJECT_LIMIT_JOB_MEMORY
+                    | if processes.is_some() {
+                        JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                    } else {
+                        0
+                    },
+                ActiveProcessLimit: processes.unwrap_or(0),
                 ..Default::default()
             },
             JobMemoryLimit: memory_limit,
@@ -519,6 +539,8 @@ impl Job {
         job.query(JobObjectExtendedLimitInformation, &mut actual)?;
         if actual.BasicLimitInformation.LimitFlags != extended.BasicLimitInformation.LimitFlags
             || actual.JobMemoryLimit != memory_limit
+            || processes
+                .is_some_and(|limit| actual.BasicLimitInformation.ActiveProcessLimit != limit)
         {
             return Err(io::Error::other("Job containment flags unavailable"));
         }
@@ -694,6 +716,11 @@ enum Launch<'a> {
         token: &'a OwnedHandle,
         plan: &'a CommandPlan<'a>,
     },
+    Paused {
+        token: &'a OwnedHandle,
+        image: &'a LocalPath,
+        args: &'a [String],
+    },
     #[cfg(test)]
     Fixture { image: &'a Path, args: &'a [String] },
 }
@@ -752,6 +779,7 @@ fn create_suspended(
 ) -> Result<(OwnedHandle, OwnedHandle), SpawnError> {
     let (image, args): (&Path, &[String]) = match launch {
         Launch::Restricted { plan, .. } => (Path::new(plan.image().as_str()), plan.args()),
+        Launch::Paused { image, args, .. } => (Path::new(image.as_str()), args),
         #[cfg(test)]
         Launch::Fixture { image, args } => (image, args),
     };
@@ -779,7 +807,31 @@ fn create_suspended(
         return Err(recipe("command line too long"));
     }
     let handles = stdio.handles();
-    let mut attributes = Attributes::new().map_err(at(SpawnStage::Attributes))?;
+    let paused = matches!(launch, Launch::Paused { .. });
+    let mut attributes =
+        Attributes::new(if paused { 4 } else { 2 }).map_err(at(SpawnStage::Attributes))?;
+    if paused {
+        if size_of::<usize>() != size_of::<u64>() {
+            return Err(recipe("paused qualification requires x64"));
+        }
+        // These creation policies apply before the loader processes initial imports.
+        let image_policy = (1u64 << 52) | (1u64 << 56) | (1u64 << 60);
+        attributes
+            .insert_words(
+                PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
+                &[image_policy as usize],
+                size_of::<u64>(),
+            )
+            .map_err(at(SpawnStage::Attributes))?;
+        // PROCESS_CREATION_CHILD_PROCESS_RESTRICTED, a DWORD policy.
+        attributes
+            .insert_words(
+                PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY as usize,
+                &[1],
+                size_of::<u32>(),
+            )
+            .map_err(at(SpawnStage::Attributes))?;
+    }
     for (index, handle) in handles.iter().copied().enumerate() {
         let mut flags = 0;
         // Verify the exact distinct child ends and their inheritance flags.
@@ -823,19 +875,21 @@ fn create_suspended(
     // All arrays, command buffer, and attribute storage remain live for this call.
     succeeded(unsafe {
         match launch {
-            Launch::Restricted { token, .. } => CreateProcessAsUserW(
-                token.as_raw_handle(),
-                image.as_ptr(),
-                command.as_mut_ptr(),
-                null(),
-                null(),
-                1,
-                flags,
-                environment.as_ptr().cast(),
-                cwd.as_ptr(),
-                &startup.StartupInfo,
-                &mut process,
-            ),
+            Launch::Restricted { token, .. } | Launch::Paused { token, .. } => {
+                CreateProcessAsUserW(
+                    token.as_raw_handle(),
+                    image.as_ptr(),
+                    command.as_mut_ptr(),
+                    null(),
+                    null(),
+                    1,
+                    flags,
+                    environment.as_ptr().cast(),
+                    cwd.as_ptr(),
+                    &startup.StartupInfo,
+                    &mut process,
+                )
+            }
             #[cfg(test)]
             Launch::Fixture { .. } => CreateProcessW(
                 image.as_ptr(),
@@ -3355,15 +3409,18 @@ mod tests {
     fn attribute_values_outlive_the_list_on_a_creation_error() {
         let job = Job::new(64 * 1024 * 1024, None).unwrap();
         // The guard copies values, so a caller's temporary array may end first.
-        let mut attributes = Attributes::new().unwrap();
+        let mut attributes = Attributes::new(2).unwrap();
         {
             let temporary = [job.0.as_raw_handle()];
             attributes
                 .insert(PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, &temporary)
                 .unwrap();
-            assert_ne!(attributes.values[0].as_ptr(), temporary.as_ptr());
+            assert_ne!(
+                attributes.values[0].as_ptr(),
+                temporary.as_ptr().cast::<usize>()
+            );
         }
-        assert_eq!(&*attributes.values[0], &[job.0.as_raw_handle()]);
+        assert_eq!(&*attributes.values[0], &[job.0.as_raw_handle() as usize]);
         drop(attributes);
         // Failure injection: both attributes are set, then creation fails.
         let (child_io, _parent_io) = fixture_stdio();

@@ -1,7 +1,10 @@
-//! Private contract for the first paused host trial. An adapter must prove a
-//! reviewed open contract before acquiring a slot. The stock runner has no
-//! such adapter. In particular, an inventory hash and a second pathname
-//! lookup cannot establish what the loader or device model actually opened.
+//! Private contract for the first paused host trial. The reviewed stock
+//! bundle inventory remains held from admission through teardown.
+
+mod native;
+
+pub(super) use native::run_native;
+pub use native::{PausedTrial, PausedVerdict};
 
 use super::*;
 use crate::vm::{qmp::bounded, runtime::capacity};
@@ -195,8 +198,7 @@ trait Host {
     type Reader: AsyncRead + Unpin;
     type Writer: AsyncWrite + Unpin;
 
-    /// Requires a reviewed launch-time witness protocol for both the OS loader
-    /// and QEMU (including short-lived consumers). No by-name fallback.
+    /// Hold and validate the selected stock bundle before acquiring the slot.
     fn open_contract(
         &mut self,
         plan: &PausedPlan<'_>,
@@ -221,8 +223,7 @@ trait Host {
         slot: &Self::Slot,
     ) -> Result<Pipes<Self::Reader, Self::Writer>, NativeRefusal>;
     async fn resume(&self, slot: &Self::Slot) -> Result<(), NativeRefusal>;
-    /// Confirm the exact loaded modules and consumed firmware/data opens of
-    /// this held child. Unobserved opens refuse even while QEMU is paused.
+    /// Recheck the held bundle against the reviewed inventory after prelaunch.
     async fn verify_opens(
         &self,
         slot: &Self::Slot,
@@ -230,7 +231,11 @@ trait Host {
     ) -> Result<(), NativeRefusal>;
     /// Observe the selected accelerator initialized on this same child.
     /// The capability probe and the configure-time argv are not that proof.
-    async fn verify_whpx(&self, slot: &Self::Slot) -> Result<(), NativeRefusal>;
+    async fn verify_whpx(
+        &self,
+        slot: &Self::Slot,
+        query: impl Future<Output = Result<(), Failure>>,
+    ) -> Result<(), Failure>;
     /// Request termination of only the attributed Job and stop its workers.
     /// This and settle must also work on an incomplete claim or launch.
     fn request_stop(&mut self, slot: &Self::Slot);
@@ -238,7 +243,7 @@ trait Host {
     async fn reopen(&mut self, slot: &Self::Slot, deadline: Tick) -> bool;
     /// Persist the charge on uncertain release. Dropping the scoped slot must
     /// never be enough to make its reservation available again.
-    fn settle(&mut self, slot: Self::Slot, disposition: StopDisposition);
+    fn settle(&mut self, slot: Self::Slot, disposition: StopDisposition) -> StopDisposition;
 }
 
 /// Owns teardown from the instant the charge is acquired. An externally
@@ -280,8 +285,7 @@ impl<H: Host> Settlement<'_, H> {
             StopDisposition::ChargedQuarantine
         };
         self.host
-            .settle(self.slot.take().expect("settlement owns a slot"), release);
-        release
+            .settle(self.slot.take().expect("settlement owns a slot"), release)
     }
 }
 
@@ -535,10 +539,32 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for LiveWriter<'_, I> {
     }
 }
 
-async fn paused_exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    pipes: Pipes<R, W>,
+async fn confirm_dispatch(dispatch: &DispatchGate) -> Result<(), Failure> {
+    dispatch
+        .settle(Duration::from_millis(100))
+        .await
+        .map_err(|_| Failure::Qmp(ChannelError::Refused))
+}
+
+async fn observe<T>(action: impl Future<Output = Result<T, NativeRefusal>>) -> Result<T, Failure> {
+    Ok(action.await?)
+}
+
+async fn launch_paused<H: Host>(
+    host: &H,
+    slot: &H::Slot,
+    plan: &PausedPlan<'_>,
+    opens: &H::Opens,
     gate: &LivePoll<'_>,
 ) -> Result<(), Failure> {
+    gate.watch(observe(host.confirm_claim(slot))).await?;
+    gate.sample()?;
+    gate.watch(observe(host.create_suspended(slot, plan, opens)))
+        .await?;
+    gate.sample()?;
+    let pipes = gate.watch(observe(host.verify_child(slot))).await?;
+    gate.sample()?;
+    gate.watch(observe(host.resume(slot))).await?;
     let Pipes {
         stdout,
         stdin,
@@ -569,40 +595,16 @@ async fn paused_exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
     // A new observation must still admit the paused child after prelaunch.
     gate.sample()?;
-    Ok(())
-}
-
-async fn confirm_dispatch(dispatch: &DispatchGate) -> Result<(), Failure> {
-    dispatch
-        .settle(Duration::from_millis(100))
-        .await
-        .map_err(|_| Failure::Qmp(ChannelError::Refused))
-}
-
-async fn observe<T>(action: impl Future<Output = Result<T, NativeRefusal>>) -> Result<T, Failure> {
-    Ok(action.await?)
-}
-
-async fn launch_paused<H: Host>(
-    host: &H,
-    slot: &H::Slot,
-    plan: &PausedPlan<'_>,
-    opens: &H::Opens,
-    gate: &LivePoll<'_>,
-) -> Result<(), Failure> {
-    gate.watch(observe(host.confirm_claim(slot))).await?;
-    gate.sample()?;
-    gate.watch(observe(host.create_suspended(slot, plan, opens)))
-        .await?;
-    gate.sample()?;
-    let pipes = gate.watch(observe(host.verify_child(slot))).await?;
-    gate.sample()?;
-    gate.watch(observe(host.resume(slot))).await?;
-    paused_exchange(pipes, gate).await?;
 
     gate.watch(observe(host.verify_opens(slot, opens))).await?;
     gate.sample()?;
-    gate.watch(observe(host.verify_whpx(slot))).await?;
+    gate.watch(host.verify_whpx(slot, async {
+        bounded(cancel, cutoff, peer.verify_whpx())
+            .await
+            .map_err(|_| NativeRefusal::WhpxUnverified)?;
+        confirm_dispatch(&dispatch).await
+    }))
+    .await?;
     gate.sample()?;
     Ok(())
 }

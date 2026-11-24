@@ -403,7 +403,7 @@ fn stage_tables_are_closed_and_class_specific() {
     for stage in [
         Stage::SuspendedChild,
         Stage::QemuPrelaunchPause,
-        Stage::LoaderConsumerOpens,
+        Stage::HeldBundleInventory,
     ] {
         assert_eq!(stage.confinement(), Some(EffectPlan::CONFINED));
     }
@@ -491,7 +491,7 @@ fn a_relabelled_native_forgery_fails_provenance_and_the_pinned_digest() {
 }
 
 #[test]
-fn no_native_observation_validates_any_store_or_effect_stage() {
+fn baseline_and_fixture_observations_do_not_pass_native_effect_stages() {
     let samples: Vec<Observation> = stages(Class::Test)[..6]
         .iter()
         .map(|stage| good(*stage))
@@ -521,6 +521,27 @@ fn no_native_observation_validates_any_store_or_effect_stage() {
             );
             assert!(!StageResult::Unimplemented.passes(*stage, Origin::Fixture));
         }
+    }
+}
+
+#[test]
+fn paused_inventory_evidence_cannot_admit_later_native_or_fixture_stages() {
+    let verified = Observation::PausedTrial { verified: true };
+    let refused = Observation::PausedTrial { verified: false };
+    for &stage in stages(Class::Test) {
+        assert_eq!(
+            verified.validates(stage, Origin::Native),
+            matches!(
+                stage,
+                Stage::DisposableStore
+                    | Stage::SuspendedChild
+                    | Stage::QemuPrelaunchPause
+                    | Stage::HeldBundleInventory
+            ),
+            "{stage:?}"
+        );
+        assert!(!verified.validates(stage, Origin::Fixture));
+        assert!(!refused.validates(stage, Origin::Native));
     }
 }
 
@@ -614,7 +635,7 @@ fn confinement_is_checked_before_the_effect_dispatches() {
             0,
         ),
         (
-            Stage::LoaderConsumerOpens,
+            Stage::HeldBundleInventory,
             EffectPlan {
                 paused: false,
                 ..EffectPlan::CONFINED
@@ -734,7 +755,7 @@ fn expiry_clock_rollback_and_cancellation_stop_the_graph_and_settle() {
     // effect is refused, earlier effects are counted and still settled.
     let tripped = Rc::new(Cell::new(false));
     let mut trial = fixture(Class::Test);
-    let mut script = Script::tripping(Hook::Live(Stage::LoaderConsumerOpens), &tripped);
+    let mut script = Script::tripping(Hook::Live(Stage::HeldBundleInventory), &tripped);
     trial.drive(
         &mut script,
         &Switch {
@@ -742,7 +763,7 @@ fn expiry_clock_rollback_and_cancellation_stop_the_graph_and_settle() {
             trip: Trip::Time(expired),
         },
     );
-    assert_eq!(trial.blocked_at(), Some(Stage::LoaderConsumerOpens));
+    assert_eq!(trial.blocked_at(), Some(Stage::HeldBundleInventory));
     assert_eq!(script.effects, 2);
     assert_eq!(script.cleanups, [2]);
     assert_eq!(trial.late(), Some(Diagnostic::Expired));
@@ -795,7 +816,7 @@ fn cancellation_after_admission_refuses_the_dispatch() {
 fn an_effect_completing_past_the_budget_is_latched_and_still_torn_down() {
     let tripped = Rc::new(Cell::new(false));
     let mut trial = fixture(Class::Test);
-    let mut script = Script::tripping(Hook::Effect(Stage::LoaderConsumerOpens), &tripped);
+    let mut script = Script::tripping(Hook::Effect(Stage::HeldBundleInventory), &tripped);
     trial.drive(
         &mut script,
         &Switch {
@@ -803,10 +824,10 @@ fn an_effect_completing_past_the_budget_is_latched_and_still_torn_down() {
             trip: Trip::Time(OVER_BUDGET),
         },
     );
-    assert_eq!(trial.blocked_at(), Some(Stage::LoaderConsumerOpens));
+    assert_eq!(trial.blocked_at(), Some(Stage::HeldBundleInventory));
     assert_eq!(script.effects, 3);
     let attempt = &trial.records()[trial.records().len() - 2];
-    assert_eq!(attempt.stage, Stage::LoaderConsumerOpens);
+    assert_eq!(attempt.stage, Stage::HeldBundleInventory);
     assert_eq!(attempt.result, StageResult::Failed(Diagnostic::Expired));
     assert_eq!(script.cleanups, [3]);
     assert_eq!(trial.late(), Some(Diagnostic::Expired));
@@ -1048,10 +1069,10 @@ fn strict_records_reject_duplicate_unknown_missing_and_noncanonical_fields() {
     assert_eq!(decode::<Record>(&encoded).unwrap(), record);
     let valid = String::from_utf8(encoded).unwrap();
     for changed in [
-        valid.replacen("\"contract\":2", "\"contract\":2,\"contract\":2", 1),
+        valid.replacen("\"contract\":3", "\"contract\":3,\"contract\":3", 1),
         valid.replacen(
-            "\"contract\":2",
-            "\"contract\":2,\"raw_path\":\"private\"",
+            "\"contract\":3",
+            "\"contract\":3,\"raw_path\":\"private\"",
             1,
         ),
         valid.replacen("\"collector\":1,", "", 1),

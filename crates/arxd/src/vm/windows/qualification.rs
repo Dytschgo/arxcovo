@@ -1,27 +1,22 @@
-//! Authority-free, read-only preflight for the separate owner-local
-//! qualification runner. Nothing here can mint trial or launch authority:
-//! the runner's private `TrialAuthority` lives in its own binary crate. The
-//! only output is a held, claimed, diagnostic-only evidence directory whose
-//! every file passes a closed schema at the held writer.
+//! Owner-local qualification mechanisms. The separate runner owns its
+//! private trial authority. The held baseline supports a fixed paused
+//! trial and publishes diagnostic evidence only.
 //!
 //! Native observations here are **unverified on real hardware**.
 
 mod capacity;
+pub(super) mod inventory;
 mod paused;
 mod schema;
 mod sink;
 
+pub use paused::{PausedTrial, PausedVerdict};
 pub use schema::{RECORD_COLLECTOR, RECORD_CONTRACT};
 pub use sink::{DiagnosticFile, Entry, SinkError};
 
 use super::*;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::Read,
-    time::Instant,
-};
+use std::{io::Read, time::Instant};
 use windows_sys::{
     Wdk::System::SystemServices::RtlGetVersion,
     Win32::System::{
@@ -36,12 +31,6 @@ const OUTER_FLOOR: u64 = 50 * GIB;
 const RAM_RESERVE: u64 = 16 * GIB;
 const JOB_MEMORY_BYTES: usize = 2 * (1 << 30);
 const JOB_CPU_RATE: u32 = 2500;
-const MANIFEST_BYTES: usize = 11_915;
-const RECEIPT_BYTES: usize = 7_438;
-const PAYLOAD_ENTRIES: usize = 136;
-const MAX_MANIFEST_BYTES: usize = 32_768;
-const MAX_PAYLOAD_FILE: u64 = 512 * 1024 * 1024;
-const MAX_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ENROLLMENT_BYTES: u64 = 8192;
 /// Reviewed stock distribution manifest (ADR 0054).
 pub const STOCK_MANIFEST_1113_SHA256: &str =
@@ -123,6 +112,7 @@ pub struct Distribution {
     pub payload_bytes: u64,
 }
 
+#[derive(Clone, Copy)]
 pub struct Limits {
     pub inner_caller_free_bytes: u64,
     pub inner_total_free_bytes: u64,
@@ -261,19 +251,33 @@ pub struct Baseline {
     _held: Held,
 }
 
-/// Every payload file and every directory under the distribution root, each
-/// opened relative to its held parent.
-type HeldTree = (Vec<File>, BTreeMap<String, File>);
-
 struct Held {
-    _bundle: Option<(PathPin, HeldTree)>,
-    _pins: [PathPin; 3],
-    _volumes: [capacity::AnchoredVolume; 2],
-    _token: VmToken,
+    bundle: Option<inventory::Bundle>,
+    _source: PathPin,
+    trial: PathPin,
+    _backing: PathPin,
+    volumes: [capacity::AnchoredVolume; 2],
+    token: VmToken,
     _capacity: Option<(OwnedHandle, capacity::HeldDevice)>,
+    paused: bool,
 }
 
 impl Baseline {
+    /// Run the owner-local, diskless and networkless diagnostic. The
+    /// enrollment, exact stock pin and held trial store must still pass.
+    pub async fn paused_trial(&self, cancel: &Shutdown) -> PausedTrial {
+        paused::run_native(self, cancel).await
+    }
+
+    /// Check live owner activity before dispatching the paused operation.
+    pub fn paused_live(&self) -> Result<Instant, NativeRefusal> {
+        let captured = Instant::now();
+        if !self._held.paused || !current_console_idle(&self._held.token)? {
+            return Err(NativeRefusal::OwnerActivityUnverified);
+        }
+        Ok(captured)
+    }
+
     pub fn observations(&self) -> &Preflight {
         &self.observations
     }
@@ -392,7 +396,17 @@ fn stock_open_contract() -> Result<(), NativeRefusal> {
 /// aggregate counters and the exact stock payload. Behavioral trials are
 /// later stages with their own collectors.
 pub fn preflight(enrollment_file: &str, evidence_dir: &str) -> Result<Baseline, NativeRefusal> {
-    preflight_with(&capacity::MountManager, enrollment_file, evidence_dir)
+    preflight_with(
+        &capacity::MountManager,
+        enrollment_file,
+        evidence_dir,
+        false,
+    )
+}
+
+/// Preflight for the explicit paused-trial entry point in the owner runner.
+pub fn preflight_paused(enrollment: &str, evidence: &str) -> Result<Baseline, NativeRefusal> {
+    preflight_with(&capacity::MountManager, enrollment, evidence, true)
 }
 
 /// Every refusal before the claim leaves the evidence directory untouched,
@@ -402,6 +416,7 @@ fn preflight_with(
     names: &impl capacity::VolumeNames,
     enrollment_file: &str,
     evidence_dir: &str,
+    paused: bool,
 ) -> Result<Baseline, NativeRefusal> {
     let origin = Instant::now();
     let custody = NativeRefusal::PathCustodyUnverified;
@@ -486,36 +501,45 @@ fn preflight_with(
             machine: machine_guid()?,
         })
     });
-    let (distribution, bundle_pins) = take_held(origin, || collect_distribution(&bundle));
-    let (limits, capacity_handles) = stock_capacity(
-        origin,
-        || {
-            let reason = NativeRefusal::DiskCeilingUnverified;
-            let (vhd, facts) = capacity::fixed_vhd(names, &outer_volume, &backing_pin)?;
-            let device = capacity::volume_extent(&trial_volume, facts.disk)?;
-            let sample = capacity::CapacitySample {
-                provider_subtype: facts.provider_subtype,
-                vhd_virtual: facts.virtual_size,
-                vhd_physical: facts.physical_size,
-                sector: facts.sector,
-                extent_start: device.extent_start,
-                extent_length: device.extent_length,
-                inner: capacity::held_free(&trial_pin.leaf)?,
-                outer: capacity::held_free(&outer_volume.root)?,
-                backing_length: backing_pin.leaf.metadata().map_err(|_| reason)?.len(),
-                backing_allocated: backing_pin.allocated,
-            };
-            let limits = capacity::check_capacity(&sample)?;
-            // A drive letter rebound while the observation ran closes it.
-            if !capacity::still_bound(names, &trial_volume)
-                || !capacity::still_bound(names, &outer_volume)
-            {
-                return Err(reason);
-            }
-            Ok((limits, (vhd, device)))
-        },
-        empty_job,
-    );
+    let (distribution, bundle_pins) = take_held(origin, || inventory::collect(&bundle));
+    let measure = || {
+        let reason = NativeRefusal::DiskCeilingUnverified;
+        let (vhd, facts) = capacity::fixed_vhd(names, &outer_volume, &backing_pin)?;
+        let device = capacity::volume_extent(&trial_volume, facts.disk)?;
+        let sample = capacity::CapacitySample {
+            provider_subtype: facts.provider_subtype,
+            vhd_virtual: facts.virtual_size,
+            vhd_physical: facts.physical_size,
+            sector: facts.sector,
+            extent_start: device.extent_start,
+            extent_length: device.extent_length,
+            inner: capacity::held_free(&trial_pin.leaf)?,
+            outer: capacity::held_free(&outer_volume.root)?,
+            backing_length: backing_pin.leaf.metadata().map_err(|_| reason)?.len(),
+            backing_allocated: backing_pin.allocated,
+        };
+        let limits = capacity::check_capacity(&sample)?;
+        // A drive letter rebound while the observation ran closes it.
+        if !capacity::still_bound(names, &trial_volume)
+            || !capacity::still_bound(names, &outer_volume)
+        {
+            return Err(reason);
+        }
+        Ok((limits, (vhd, device)))
+    };
+    let (limits, capacity_handles) = if paused {
+        take_held(origin, || {
+            let bundle = bundle_pins
+                .as_ref()
+                .ok_or(NativeRefusal::DistributionUnverified)?;
+            bundle.protected(&token, Instant::now() + Duration::from_secs(2))?;
+            let measured = measure()?;
+            empty_job()?;
+            Ok(measured)
+        })
+    } else {
+        stock_capacity(origin, measure, empty_job)
+    };
     let activity = take(origin, || {
         let console_idle = current_console_idle(&token)?;
         let (active_cpus, available_ram_bytes) = host_resources()?;
@@ -551,11 +575,14 @@ fn preflight_with(
         origin,
         evidence,
         _held: Held {
-            _bundle: bundle_pins,
-            _pins: [source, trial_pin, backing_pin],
-            _volumes: [trial_volume, outer_volume],
-            _token: token,
+            bundle: bundle_pins,
+            _source: source,
+            trial: trial_pin,
+            _backing: backing_pin,
+            volumes: [trial_volume, outer_volume],
+            token,
             _capacity: capacity_handles,
+            paused,
         },
     })
 }
@@ -959,177 +986,17 @@ fn read_bounded(file: &File, max: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn collect_distribution(
-    root: &LocalPath,
-) -> Result<(Distribution, (PathPin, HeldTree)), NativeRefusal> {
-    let reason = NativeRefusal::DistributionUnverified;
-    // The only walk by name. Every later open and listing goes through this
-    // held root or a directory opened relative to it.
-    let root_pin = PathPin::open(root, true, false).map_err(|_| reason)?;
-    let (distribution, tree) = inspect_distribution(&root_pin.leaf)?;
-    Ok((distribution, (root_pin, tree)))
-}
-
-fn inspect_distribution(root: &File) -> Result<(Distribution, HeldTree), NativeRefusal> {
-    use crate::vm::public_egress::STOCK_RECEIPT_1113_SHA256;
-
-    let reason = NativeRefusal::DistributionUnverified;
-    let mut dirs = BTreeMap::new();
-    let receipt = held_file(root, &mut dirs, "RECEIPT.txt").map_err(|_| reason)?;
-    let manifest = held_file(root, &mut dirs, "MANIFEST.sha256").map_err(|_| reason)?;
-    let receipt_bytes = read_bounded(&receipt, RECEIPT_BYTES as u64).map_err(|_| reason)?;
-    let manifest_bytes = read_bounded(&manifest, MANIFEST_BYTES as u64).map_err(|_| reason)?;
-    let receipt_hash: [u8; 32] = Sha256::digest(&receipt_bytes).into();
-    let manifest_hash: [u8; 32] = Sha256::digest(&manifest_bytes).into();
-    if receipt_bytes.len() != RECEIPT_BYTES
-        || receipt_hash != STOCK_RECEIPT_1113_SHA256
-        || manifest_bytes.len() != MANIFEST_BYTES
-        || hex::encode(manifest_hash) != STOCK_MANIFEST_1113_SHA256
-    {
-        return Err(reason);
-    }
-
-    let (payload_bytes, tree) = inspect_payload(
-        root,
-        &manifest_bytes,
-        PAYLOAD_ENTRIES,
-        (vec![receipt, manifest], dirs),
-    )?;
-    Ok((
-        Distribution {
-            receipt: receipt_hash,
-            receipt_bytes: RECEIPT_BYTES as u64,
-            manifest: manifest_hash,
-            manifest_bytes: MANIFEST_BYTES as u64,
-            payload_files: PAYLOAD_ENTRIES as u16,
-            payload_bytes,
-        },
-        tree,
-    ))
-}
-
-fn inspect_payload(
-    root: &File,
-    manifest_bytes: &[u8],
-    count: usize,
-    (mut held, mut dirs): HeldTree,
-) -> Result<(u64, HeldTree), NativeRefusal> {
-    use crate::vm::public_egress::STOCK_QEMU_1113;
-
-    let reason = NativeRefusal::DistributionUnverified;
-    let payload = parse_manifest(manifest_bytes, count).ok_or(reason)?;
-    let mut allowed_files =
-        BTreeSet::from(["receipt.txt".to_owned(), "manifest.sha256".to_owned()]);
-    let mut allowed_dirs = BTreeSet::new();
-    let mut payload_bytes = 0u64;
-    for (name, sha256) in payload {
-        let file = held_file(root, &mut dirs, name).map_err(|_| reason)?;
-        let size = file.metadata().map_err(|_| reason)?.len();
-        payload_bytes = payload_bytes
-            .checked_add(size)
-            .filter(|&n| n <= MAX_PAYLOAD_BYTES)
-            .ok_or(reason)?;
-        if name == "qemu-system-x86_64.exe"
-            && (size != STOCK_QEMU_1113.size || sha256 != STOCK_QEMU_1113.sha256)
-            || name == "qemu-img.exe" && size != 2_520_350
-        {
-            return Err(reason);
-        }
-        // The held file itself is hashed, from its start.
-        if !matches!(
-            ArtifactPin { size, sha256 }.verify(&file, MAX_PAYLOAD_FILE),
-            Ok(true)
-        ) {
-            return Err(reason);
-        }
-        let folded = name.to_ascii_lowercase();
-        for (offset, _) in folded.match_indices('/') {
-            allowed_dirs.insert(folded[..offset].to_owned());
-        }
-        allowed_files.insert(folded);
-        held.push(file);
-    }
-    verify_inventory(root, &dirs, allowed_files, allowed_dirs)?;
-    Ok((payload_bytes, (held, dirs)))
-}
-
-/// Open every directory of `path` (a `/`-separated relative name) relative
-/// to its held parent, keyed by the lowercased relative name.
-fn held_dir(root: &File, dirs: &mut BTreeMap<String, File>, path: &str) -> io::Result<()> {
-    let mut key = String::new();
-    for part in path.split('/') {
-        let child = if key.is_empty() {
-            part.to_ascii_lowercase()
-        } else {
-            format!("{key}/{}", part.to_ascii_lowercase())
-        };
-        if !dirs.contains_key(&child) {
-            let parent = if key.is_empty() { root } else { &dirs[&key] };
-            let dir = open_relative(parent, part, Node::Directory, false, false)?;
-            file_identity(&dir, true)?;
-            dirs.insert(child.clone(), dir);
-        }
-        key = child;
-    }
-    Ok(())
-}
-
-/// Open one file relative to its held parent directory, never by name from
-/// a drive letter.
-fn held_file(root: &File, dirs: &mut BTreeMap<String, File>, name: &str) -> io::Result<File> {
-    let (key, leaf) = match name.rsplit_once('/') {
-        Some((parent, leaf)) => {
-            held_dir(root, dirs, parent)?;
-            (parent.to_ascii_lowercase(), leaf)
-        }
-        None => (String::new(), name),
-    };
-    let parent = if key.is_empty() { root } else { &dirs[&key] };
-    let file = open_relative(parent, leaf, Node::File, false, false)?;
-    file_identity(&file, false)?;
-    Ok(file)
-}
-
-/// The held root and every held directory list exactly the allowed entries,
-/// read through their own handles.
-fn verify_inventory(
-    root: &File,
-    dirs: &BTreeMap<String, File>,
-    mut files: BTreeSet<String>,
-    mut allowed: BTreeSet<String>,
-) -> Result<(), NativeRefusal> {
-    let reason = NativeRefusal::DistributionUnverified;
-    let held = std::iter::once(("", root)).chain(dirs.iter().map(|(key, dir)| (key.as_str(), dir)));
-    for (key, dir) in held {
-        for (name, attributes) in listing(dir).map_err(|_| reason)? {
-            let entry = if key.is_empty() {
-                name.to_ascii_lowercase()
-            } else {
-                format!("{key}/{}", name.to_ascii_lowercase())
-            };
-            let listed = if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                false
-            } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                allowed.remove(&entry)
-            } else {
-                files.remove(&entry)
-            };
-            if !listed {
-                return Err(reason);
-            }
-        }
-    }
-    if files.is_empty() && allowed.is_empty() {
-        Ok(())
-    } else {
-        Err(reason)
-    }
-}
-
 /// Every entry of a held directory with its attributes, read through the
 /// handle itself; the directory is never enumerated by name.
 fn listing(dir: &File) -> io::Result<Vec<(String, u32)>> {
-    const MAX_ENTRIES: usize = 4096;
+    listing_bounded(dir, 4096, None)
+}
+
+fn listing_bounded(
+    dir: &File,
+    max_entries: usize,
+    deadline: Option<Instant>,
+) -> io::Result<Vec<(String, u32)>> {
     let mut buffer = vec![0u64; 8192];
     let capacity = buffer.len() * size_of::<u64>();
     let header = size_of::<FILE_FULL_DIR_INFO>();
@@ -1137,6 +1004,9 @@ fn listing(dir: &File) -> io::Result<Vec<(String, u32)>> {
     let mut found = Vec::new();
     let mut class = FileFullDirectoryRestartInfo;
     loop {
+        if deadline.is_some_and(|until| Instant::now() >= until) {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
         // The aligned buffer receives a chain of variable-length records.
         let ok = unsafe {
             GetFileInformationByHandleEx(
@@ -1175,7 +1045,7 @@ fn listing(dir: &File) -> io::Result<Vec<(String, u32)>> {
             };
             let name = String::from_utf16(units).map_err(io::Error::other)?;
             if name != "." && name != ".." {
-                if found.len() == MAX_ENTRIES {
+                if found.len() == max_entries {
                     return Err(io::Error::other("directory entry limit exceeded"));
                 }
                 found.push((name, entry.FileAttributes));
@@ -1183,90 +1053,18 @@ fn listing(dir: &File) -> io::Result<Vec<(String, u32)>> {
             if entry.NextEntryOffset == 0 {
                 break;
             }
-            offset += entry.NextEntryOffset as usize;
+            let next = entry.NextEntryOffset as usize;
+            if next < name_offset + length || !next.is_multiple_of(8) {
+                return Err(io::Error::other("invalid directory record offset"));
+            }
+            offset += next;
         }
     }
-}
-
-fn valid_manifest_name(name: &str) -> bool {
-    // Treat commas like underscores for spelling validation only. The original
-    // name is used for uniqueness, held relative opens and inventory checks.
-    !name.is_empty()
-        && name.len() <= 180
-        && !name.contains(['\\', ':'])
-        && LocalPath::parse(&format!("D:\\{}", name.replace(',', "_"))).is_ok()
-}
-
-fn parse_manifest(bytes: &[u8], count: usize) -> Option<Vec<(&str, [u8; 32])>> {
-    if bytes.len() > MAX_MANIFEST_BYTES || count > PAYLOAD_ENTRIES {
-        return None;
-    }
-    let raw = std::str::from_utf8(bytes).ok()?;
-    let mut entries = Vec::with_capacity(count);
-    let mut seen = BTreeSet::from(["manifest.sha256".to_owned(), "receipt.txt".to_owned()]);
-    for line in raw.lines() {
-        let (digest, name) = line.split_once("  ")?;
-        if entries.len() == count
-            || !valid_manifest_name(name)
-            || !seen.insert(name.to_ascii_lowercase())
-        {
-            return None;
-        }
-        entries.push((name, sha256_spelling(digest)?));
-    }
-    (entries.len() == count).then_some(entries)
-}
-
-fn sha256_spelling(digest: &str) -> Option<[u8; 32]> {
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return None;
-    }
-    let mut bytes = [0; 32];
-    hex::decode_to_slice(digest, &mut bytes).ok()?;
-    Some(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn manifest_is_bounded_and_refuses_aliases_and_duplicate_names() {
-        let digest = "a".repeat(64);
-        let valid = format!("{digest}  tools/a,b.exe\r\n{digest}  z.dll\r\n");
-        assert_eq!(
-            parse_manifest(valid.as_bytes(), 2).unwrap()[0].0,
-            "tools/a,b.exe"
-        );
-        for name in [
-            "",
-            "tools/../a,b.exe",
-            "tools/./a,b.exe",
-            "tools//a,b.exe",
-            "tools/a,b.exe/",
-            "C:/a,b.exe",
-            "/a,b.exe",
-            r"a\z,b.dll",
-            "tools/A,B.exe",
-            "tools/NUL.a,b",
-            "COM1/tools/a,b.exe",
-            "tools/a,b.exe.",
-            "tools/a,b.exe ",
-            "receipt.txt",
-            "z,b.dll:ads",
-        ] {
-            let bad = format!("{digest}  tools/a,b.exe\n{digest}  {name}\n");
-            assert!(parse_manifest(bad.as_bytes(), 2).is_none(), "{name:?}");
-        }
-        let too_long = format!("{digest}  {},\n", "a".repeat(180));
-        assert!(parse_manifest(too_long.as_bytes(), 1).is_none());
-        assert!(parse_manifest(valid.as_bytes(), 1).is_none());
-        assert!(parse_manifest(&[b'a'; MAX_MANIFEST_BYTES + 1], 2).is_none());
-    }
 
     #[test]
     fn canonical_sid_round_trips_only_exact_spellings() {
@@ -1618,86 +1416,5 @@ mod tests {
             );
             assert_eq!(std::fs::read_dir(&evidence).unwrap().count(), 0);
         }
-    }
-
-    #[test]
-    fn distribution_verifies_manifest_payload_with_commas() {
-        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
-        std::fs::create_dir(root.path().join("share")).unwrap();
-        let payload: [(&str, &[u8]); 2] = [
-            ("share/QEMU,cgthree.bin", b"fixture cgthree"),
-            ("share/QEMU,tcx.bin", b"fixture tcx"),
-        ];
-        let mut manifest_bytes = String::new();
-        for (name, bytes) in payload {
-            std::fs::write(root.path().join(name), bytes).unwrap();
-            let digest = hex::encode(Sha256::digest(bytes));
-            manifest_bytes.push_str(&format!("{digest}  {name}\n"));
-        }
-        std::fs::write(root.path().join("RECEIPT.txt"), b"fixture receipt").unwrap();
-        std::fs::write(root.path().join("MANIFEST.sha256"), manifest_bytes).unwrap();
-
-        let held_root = open_directory(root.path().to_str().unwrap()).unwrap();
-        let mut dirs = BTreeMap::new();
-        let receipt = held_file(&held_root, &mut dirs, "RECEIPT.txt").unwrap();
-        let manifest = held_file(&held_root, &mut dirs, "MANIFEST.sha256").unwrap();
-        let manifest_bytes = read_bounded(&manifest, MAX_MANIFEST_BYTES as u64).unwrap();
-        let (bytes, (files, dirs)) = inspect_payload(
-            &held_root,
-            &manifest_bytes,
-            payload.len(),
-            (vec![receipt, manifest], dirs),
-        )
-        .unwrap();
-        assert_eq!(
-            bytes,
-            payload
-                .iter()
-                .map(|(_, bytes)| bytes.len() as u64)
-                .sum::<u64>()
-        );
-        assert_eq!(files.len(), 2 + payload.len());
-        assert_eq!(dirs.len(), 1);
-        assert!(dirs.contains_key("share"));
-    }
-
-    #[test]
-    fn distribution_opens_and_lists_only_through_held_directories() {
-        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
-        let named = root.path().join("named");
-        let held = root.path().join("held");
-        for dir in [&named, &held] {
-            std::fs::create_dir_all(dir.join("sub")).unwrap();
-            std::fs::write(dir.join("a.txt"), b"a").unwrap();
-            std::fs::write(dir.join("sub").join("b.dll"), b"b").unwrap();
-        }
-        std::fs::write(named.join("only-named.txt"), b"n").unwrap();
-        std::fs::write(held.join("only-held.txt"), b"h").unwrap();
-        // A split: the inventory below matches the named directory, while
-        // the held object is its sibling.
-        let held_root = open_directory(held.to_str().unwrap()).unwrap();
-        let mut dirs = BTreeMap::new();
-        let set = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
-        assert!(held_file(&held_root, &mut dirs, "only-named.txt").is_err());
-        assert!(held_file(&held_root, &mut dirs, "sub/b.dll").is_ok());
-        assert_eq!(
-            verify_inventory(
-                &held_root,
-                &dirs,
-                set(&["a.txt", "only-named.txt", "sub/b.dll"]),
-                set(&["sub"])
-            ),
-            Err(NativeRefusal::DistributionUnverified)
-        );
-        // Control: the held object's own inventory, through held handles.
-        assert_eq!(
-            verify_inventory(
-                &held_root,
-                &dirs,
-                set(&["a.txt", "only-held.txt", "sub/b.dll"]),
-                set(&["sub"])
-            ),
-            Ok(())
-        );
     }
 }
