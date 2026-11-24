@@ -1,6 +1,6 @@
 # Coordinator CI administration
 
-Historical installation instructions below are not an activation grant. Protection is already installed. PR163 refresh is preparation only: the owner accepted ADR0025's definition, while activation/bootstrap/protection/merge remain unauthorized. ADR0022/#57 and PR164 exceptions are consumed.
+Protection is installed. The installation and bootstrap plans below are historical. ADR 0025 records the charged-v1 activation and the consumed exceptions.
 
 ## Review and protection
 
@@ -33,38 +33,58 @@ The command checks the allowlist, same-repository source, OWNER/MEMBER/COLLABORA
 
 ## Measurement and records
 
-Policy runs trusted default-branch code on workflow_run for CI and label signals, with a periodic retry. It never executes candidate code. API calls are bounded; discovery at 100 open PRs fails closed and needs pagination before scaling. Head and labels are read live; statuses are per SHA. Attempt 1 supplies the wall-clock measurement so a partial rerun cannot appear faster. The latest completed main push run is authoritative. Missing baseline fails. The currently active wall policy permits only a successful faster same-head/repository ci-speed candidate when main exceeds 900 seconds.
+The trusted default-branch policy runs on CI and label signals and retries
+periodically. It reads PR head and labels live and publishes per-SHA statuses.
+API reads are bounded. Discovery at 100 open PRs and transport errors fail closed.
 
-**Owner-accepted amendment, conditional and not active:** [ADR0025](adr/0025-ci-queue-outage-budget.md) retains wall seconds and adds charged-v1. A validated sweep credits only intervals with a created pending required job and no executing job. Execution, overlapping waits, prefix/tail and no-pending idle remain charged. The exact three completed platform jobs must match attempt 1, run/head, names, labels and strict timestamp ranges. One bounded jobs page is read; invalid metadata withholds credit with run-invalid/jobs-invalid, using the original wall gate. Transport/8 MiB overflow still fails closed. Failed runs or jobs retain computed measurements as not-green but receive no credit. A green valid baseline may use charged time at the unchanged 900s threshold. Above it, ci-speed requires BOTH baseline and candidate green/creditable and strictly reduced charged time AND longest execution. These metrics alone do not prove a source speedup or exclude runtime noise.
+[ADR 0025](adr/0025-ci-queue-outage-budget.md) defines the active charged-v1
+budget. Valid green runs get credit only for intervals with a pending required
+job and no executing job. Invalid timing metadata on a green run leaves the
+wall-time rule in effect with the same 900 s threshold. Above that threshold,
+`ci-speed` requires green, creditable measurements for main and the candidate,
+with strict reductions in charged time and longest job execution. Candidates
+use attempt 1 of the latest completed same-head, same-repository PR run.
 
-Historical main43880904887 was RED: wall1475s/charged738s/Q737s/longest372s, credit withheld. PR162 run43889323450 is green: wall1311s/charged877s/Q434s/longest585s. It cannot qualify for ci-speed against this failed main. Current main3022d601 run44126173935 attempt1 failed at905s due to zero-step macOS infrastructure cancellation; the single final read verified root's macOS-only attempt2 completed/success on exact3022d601. Functional health is restored; its outcome cannot credit attempt1. The separate exact-main health prerequisite remains binding.
+With the runner recovery amendment, the latest main push CI run is
+authoritative. An unfinished run keeps the status pending, and a missing
+baseline fails. A completed non-green baseline blocks even below 900 s unless
+it satisfies the recovery rule below. Status descriptions identify the
+measurement as `Main run {id}: attempt {n}:`. A change in run or attempt
+invalidates old success before evaluating the current head. Unchanged
+statuses are deduplicated, and a failed update on one head does not stop
+evaluation of others.
 
-Status publication compares the current context's state and description and skips unchanged results. Unchanged heads are not cycled through pending on periodic checks. The `Main run {id}:` marker remains intact; descriptions report wall, charged or unavailability, and verdict within 140 characters. A changed main measurement invalidates old successes; errors for one head do not prevent evaluating the others. The evaluator reports aggregate failure if a head cannot be updated.
-
-The 30 existing duration-history records remain untouched and wall-only. After separately authorized activation, `--record` may append new run ids with charged-v1 fields and validated sorted job timestamps; duplicate ids are not rewritten. Preparation executes only synthetic VM record tests with intercepted filesystem/API operations, never live `scripts/ci-budget.mjs` or `--record`. A GitHub API outage can prevent status updates; evaluation fails rather than claiming to update unreachable heads.
-
-This is preparation only, pending root review and independent Sol6.1 high source/exact-head review under current routing. The owner already accepted KICKOFF's definition deviation. Activation, bootstrap, status/label/protection changes and merges remain unauthorized. Historical installation text and consumed ADR0022/#57 or PR164 exceptions grant nothing for this refresh.
+`--record` appends completed measurements by run ID with charged-v1 fields and
+validated, sorted job timestamps. Duplicate IDs and existing rows are preserved.
 
 ## Historical installation acceptance plan
 
 After the reviewed installation merge: measure main CI, commit the first baseline, install/read back protection and settings, demonstrate an allowlisted trivial PR auto-merging after all gates, and demonstrate a slow-main probe remaining blocked plus measured ci-speed recovery. Unit tests do not prove this end-to-end acceptance. This historical plan is not a statement of current installation status or a new grant.
 
 
-## Proposed ADR0025 bootstrap (not authorized)
+<a name="proposed-adr0025-bootstrap-not-authorized"></a>
 
-The owner accepted ADR0025's budget-definition change on 2026-11-16. Activation and the one-use bootstrap route remain unauthorized. The earlier preparation-only wording is historical.
+## Historical ADR 0025 bootstrap proposal
+
+This section records the original proposal. ADR 0025 records the completed
+activation and consumed exception. For current operations, see
+[Recovering a main CI budget measurement](#recovering-a-main-ci-budget-measurement).
+
+The owner accepted ADR0025's budget-definition change on 2026-11-16. At
+the time of this proposal, activation and the one-use bootstrap route
+still required separate authorization.
 The historical2026-11-16 mainc612152 snapshot required all three verify jobs
 (App15368), agent-review (no app pin), and ci-time-budget (App15368), with
 strict=true and enforce_admins=true. The amendment cannot satisfy its own old
 budget gate and is not a ci-speed PR. ADR0022's prior exception is exhausted.
 
-After this amendment PR has an exact-head independent PASS and three successful
-platform jobs, present its full head SHA and results to the owner. The proposed
-one-use route requires separate activation permission for a named root executor to bootstrap ONLY that pinned amendment PR.
-Definition acceptance is already settled; do not ask for it again. It grants nothing for PR162, PR159 or feature work.
+The proposal called for the coordinator to present the amendment PR's full
+head SHA and results to the owner after an exact-head independent PASS
+and three successful platform jobs. The proposed route required separate
+permission for a named executor and applied only to that pinned amendment PR.
 
 If separately authorized, the executor must first confirm that no open PR has an armed auto-merge request,
-then snapshot the live full protection configuration and pin the full reviewed PR head, PR base SHA and actual main SHA (all must match the approved decision), rechecking all four other gates. Current prepared base/main is3022d601f09f24b0e5f092a33f2e9343b500471d; any later drift requires renewed assessment.
+then snapshot the live full protection configuration and pin the full reviewed PR head, PR base SHA and actual main SHA (all must match the approved decision), rechecking all four other gates. The prepared base/main for that proposal was 3022d601f09f24b0e5f092a33f2e9343b500471d.
 Check again for zero armed auto-merges immediately before the pinned merge; abort if any is armed. Keep the
 protection window short and perform no unrelated action within it. Then temporarily
 remove ONLY ci-time-budget from the required-check list, and perform the pinned
@@ -130,3 +150,21 @@ reporting and conservative fallback; gates cannot be created before all workers
 finish. Fresh exact-source review and a normal new-head first attempt are needed.
 The held result is not retroactively credited; no speedup or PR182 release is
 established yet.
+
+## Recovering a main CI budget measurement
+
+Open the latest main push CI run identified by the budget status. If its
+first attempt was non-green and the budget needs a fresh measurement,
+choose **Re-run all jobs** on that same run. Policy measures the latest
+full rerun if it is green and has valid job timings. GitHub carries earlier
+job timings into a partial rerun, so a partial rerun cannot supply the
+measurement. A green first attempt still supplies the original timing.
+[ADR 0025 recovery rule](adr/0025-ci-queue-outage-budget.md#main-runner-cancellation-recovery-2026-11-24)
+
+An unfinished attempt waits for up to 60 minutes from its reported start
+if running, or its last update if queued. For `stale-main-run` or
+`invalid-main-run-timestamp`, inspect the attempt in Actions. If the run
+is stuck, cancel it, wait for it to complete, and choose **Re-run all jobs**.
+If GitHub cannot cancel or rerun it, investigate the Actions outage or
+escalate to the coordinator. The budget check stays blocked until it can
+evaluate the authoritative run.
