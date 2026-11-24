@@ -15,7 +15,7 @@ test('an unrelated workflow start cannot cancel a trusted policy evaluation', ()
   const workflow = readFileSync(new URL('../.github/workflows/policy.yml', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
   assert.match(workflow, /types: \[requested, in_progress, completed\]/);
   assert.doesNotMatch(workflow, /^concurrency:/m);
-  assert.match(workflow, /  evaluate:\n    if: github\.event\.action != 'in_progress' \|\| \(github\.event\.workflow_run\.event == 'push' && github\.event\.workflow_run\.head_branch == 'main'\)\n    concurrency:\n      group: trusted-ci-policy\n      cancel-in-progress: false\n/);
+  assert.match(workflow, / {2}evaluate:\n {4}if: github\.event\.action != 'in_progress' \|\| \(github\.event\.workflow_run\.event == 'push' && github\.event\.workflow_run\.head_branch == 'main'\)\n {4}concurrency:\n {6}group: trusted-ci-policy\n {6}cancel-in-progress: false\n/);
   assert.doesNotMatch(workflow, /^ {2}checks:/m);
 });
 
