@@ -82,7 +82,7 @@ def main():
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--check-loader-env', action='store_true', help='reject caller/config loader overrides before Cargo')
     parser.add_argument('--metadata', type=Path, help='fresh cargo metadata --locked --offline JSON')
-    parser.add_argument('--build-messages', type=Path, help='fresh cargo check --message-format=json output')
+    parser.add_argument('--build-messages', type=Path, help='fresh Cargo JSON build messages')
     parser.add_argument('--self-test', action='store_true')
     args=parser.parse_args()
     root=Path(__file__).resolve().parent.parent
