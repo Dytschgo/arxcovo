@@ -14665,6 +14665,13 @@ mod tests {
                 };
                 assert_eq!(boot, generation);
                 assert!(!witness.local.load(SeqCst));
+                let names: Vec<_> = routes.iter().map(|route| route.hostname.clone()).collect();
+                assert!(witness.preflight_order.lock().unwrap().ends_with(&names));
+                witness
+                    .starts_at_route_install
+                    .lock()
+                    .unwrap()
+                    .push(witness.starts.load(SeqCst));
                 assert!(
                     arx_guest::compose::routing::RoutingTable::new(
                         readiness_host,
@@ -14742,6 +14749,11 @@ mod tests {
         h.supervisor().gate.lock().unwrap().allow_agent_public_sites = true;
         let published = call(&a, "publish_site", args(4111)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        assert_eq!(
+            *fake.starts_at_route_install.lock().unwrap(),
+            [0],
+            "boot-bound peer must receive the route set"
+        );
         assert_eq!(fake.starts.load(SeqCst), 1, "must use one connector Job");
         assert_eq!(fake.posts.load(SeqCst), 2);
         assert!(fake.local.load(SeqCst));
@@ -14783,6 +14795,21 @@ mod tests {
             "{ingress}"
         );
         assert!(ingress.contains("- service: http_status:404"), "{ingress}");
+
+        fake.upstream_unavailable.store(true, SeqCst);
+        let supervisor = h.supervisor();
+        drop(supervisor.publisher.slot().await);
+        assert_eq!(
+            supervisor
+                .publisher
+                .turn(&supervisor.controller, &supervisor.cancel)
+                .await
+                .unwrap(),
+            crate::vm::runtime::publication::Turn::Healthy,
+        );
+        assert!(fake.local.load(SeqCst));
+        assert_eq!(fake.host_records.lock().unwrap().len(), 2);
+        fake.upstream_unavailable.store(false, SeqCst);
 
         // Publish status projects per-host non-secret state without leaking hostnames or record IDs.
         let status = phase(&a, &vm).await;
@@ -15076,6 +15103,8 @@ mod tests {
         assert_eq!(fake.starts.load(SeqCst), 0);
         assert_eq!(fake.posts.load(SeqCst), 0);
 
+        assert!(fake.starts_at_route_install.lock().unwrap().is_empty());
+
         // Clear foreign record and publish both hosts.
         fake.host_foreign.lock().unwrap().clear();
         let published = call(&a, "publish_site", args(4411)).await;
@@ -15139,6 +15168,23 @@ mod tests {
         settle(&h, &a, &vm).await;
         assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
         assert!(fake.host_records.lock().unwrap().is_empty());
+
+        let republish = call(&a, "publish_site", args(4414)).await;
+        assert_eq!(terminal(&a, &republish).await["state"], "succeeded");
+        trigger(
+            &h,
+            "CREATE TRIGGER refuse_row BEFORE UPDATE OF state ON vm_publication_hosts
+                     WHEN NEW.position=0 AND NEW.state='cleaned'
+                     BEGIN SELECT RAISE(ABORT, 'synthetic row write'); END;",
+        );
+        let revoke = call(&a, "unpublish_site", args(4415)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "failed");
+        assert!(fake.host_records.lock().unwrap().is_empty());
+        let status = phase(&a, &vm).await;
+        assert_eq!(status["phase"], "cleanup_pending");
+        assert_eq!(status["hosts"][1]["state"], "cleaned");
+        trigger(&h, "DROP TRIGGER refuse_row");
+        settle(&h, &a, &vm).await;
 
         drop(a);
         h.shutdown().await.unwrap();

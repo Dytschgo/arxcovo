@@ -1066,13 +1066,9 @@ mod vm {
             pem
         }
 
-        async fn origin(root: &Path) -> (NonZeroU16, PathBuf, ArtifactPin, JoinHandle<()>) {
-            origin_for_hosts(root, vec![NAME.to_owned()]).await
-        }
-
-        async fn origin_for_hosts(
+        async fn origin(
             root: &Path,
-            allowed_hosts: Vec<String>,
+            app_status: Arc<std::sync::atomic::AtomicU16>,
         ) -> (NonZeroU16, PathBuf, ArtifactPin, JoinHandle<()>) {
             let mut params = CertificateParams::default();
             params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -1099,11 +1095,10 @@ mod vm {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let port = NonZeroU16::new(listener.local_addr().unwrap().port()).unwrap();
             let acceptor = TlsAcceptor::from(Arc::new(tls));
-            let allowed = Arc::new(allowed_hosts);
             let task = tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     let acceptor = acceptor.clone();
-                    let allowed = allowed.clone();
+                    let app_status = app_status.clone();
                     tokio::spawn(async move {
                         let Ok(Ok(mut tls)) =
                             timeout(Duration::from_millis(500), acceptor.accept(socket)).await
@@ -1131,17 +1126,21 @@ mod vm {
                                 k.eq_ignore_ascii_case("host").then(|| v.trim())
                             })
                             .unwrap_or("");
-                        let ok = (host == ORIGIN_NAME && path == "/arx-health")
-                            || allowed.iter().any(|h| h == host);
+                        let ok = (host == ORIGIN_NAME && path == "/arx-health") || host == NAME;
                         if ok && path == "/.arxcovo/route/fixture" {
                             tls.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
                                 .await
                                 .unwrap();
                             let _ = tls.shutdown().await;
                         } else if ok {
+                            let code = if path == "/" {
+                                app_status.load(std::sync::atomic::Ordering::SeqCst)
+                            } else {
+                                200
+                            };
                             let body = format!("host={host};path={path}");
                             let resp = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                "HTTP/1.1 {code} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                 body.len()
                             );
                             let _ = tls.write_all(resp.as_bytes()).await;
@@ -1299,7 +1298,10 @@ mod vm {
             secure(root);
             assert_secured("fixture root", root);
             let (binary, binary_receipt) = fixture_binary(root);
-            let (origin_port, ca_path, ca_receipt, origin_task) = origin(root).await;
+            use std::sync::atomic::{AtomicU16, Ordering::SeqCst};
+            let app_status = Arc::new(AtomicU16::new(401));
+            let (origin_port, ca_path, ca_receipt, origin_task) =
+                origin(root, app_status.clone()).await;
             let route = route();
             let fake = FakeDns::start().await;
             let hostname = Hostname::parse(NAME).unwrap();
@@ -1404,6 +1406,17 @@ mod vm {
             .await
             .expect("publish exceeded its deadline");
             let publish_elapsed = publish_started.elapsed();
+            app_status.store(503, SeqCst);
+            assert_eq!(
+                connector.origin_ready(true).await,
+                Err(ConnectorError::Origin)
+            );
+            connector
+                .origin_ready(false)
+                .await
+                .expect("an app outage preserves an active binding");
+            app_status.store(302, SeqCst);
+            connector.origin_ready(true).await.unwrap();
 
             // The child created the witness inside the fixture root.
             secure(&witness_path);

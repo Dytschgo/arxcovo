@@ -386,7 +386,16 @@ pub mod routing {
         let _ = writeln!(out, "      proxy_http_version 1.1;");
         let _ = writeln!(out, "      proxy_set_header Host $host;");
         let _ = writeln!(out, "      proxy_set_header CF-Connecting-IP \"\";");
-        let _ = writeln!(out, "      proxy_set_header True-Client-IP \"\";");
+        for header in [
+            "True-Client-IP",
+            "X-Client-IP",
+            "CF-Connecting-IPv6",
+            "X-Forwarded-Port",
+            "X-Original-Forwarded-For",
+            "X-Cluster-Client-IP",
+        ] {
+            let _ = writeln!(out, "      proxy_set_header {header} \"\";");
+        }
         let _ = writeln!(out, "      proxy_set_header X-Forwarded-For $arx_cf_ip;");
         let _ = writeln!(out, "      proxy_set_header X-Real-IP $arx_cf_ip;");
         let _ = writeln!(out, "      proxy_set_header Forwarded \"\";");

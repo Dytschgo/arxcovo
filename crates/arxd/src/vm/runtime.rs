@@ -842,7 +842,10 @@ pub(crate) mod publication {
                 })
             }
             #[cfg(not(all(windows, target_arch = "x86_64")))]
-            Err(Refusal::QualificationMissing)
+            {
+                let _ = routes;
+                Err(Refusal::QualificationMissing)
+            }
         }
     }
 
@@ -928,7 +931,7 @@ pub(crate) mod publication {
     }
 
     impl LocalProcess {
-        async fn ready(&self) -> Result<(), Failure> {
+        async fn ready(&self, _probe_apps: bool) -> Result<(), Failure> {
             match *self {
                 #[cfg(not(any(test, all(windows, target_arch = "x86_64"))))]
                 Self::Closed(never) => match never {},
@@ -941,12 +944,21 @@ pub(crate) mod publication {
                         return Err(Failure::ConnectorUnready);
                     }
                     connector
-                        .origin_ready()
+                        .origin_ready(_probe_apps)
                         .await
                         .map_err(|_| Failure::OriginUnavailable)
                 }
                 #[cfg(test)]
-                Self::Fixture(ref fake) => fake.ready(),
+                Self::Fixture(ref fake) => {
+                    if _probe_apps
+                        && fake
+                            .upstream_unavailable
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return Err(Failure::OriginUnavailable);
+                    }
+                    fake.ready()
+                }
             }
         }
 
@@ -1916,7 +1928,7 @@ pub(crate) mod publication {
                         && !shutdown.is_cancelled()
                 })
                 .ok_or(Failure::OriginUnavailable)?;
-            live.connector.ready().await
+            live.connector.ready(intent.phase != Phase::Published).await
         }
 
         #[allow(clippy::too_many_arguments)] // Explicit admission evidence and both cancellations.
@@ -2425,7 +2437,7 @@ pub(crate) mod publication {
             // Clean EVERY child row independently without short-circuiting:
             // owned DNS records are removed even when a different row is
             // blocked or ambiguous.
-            let mut first_dns_error: Option<Failure> = None;
+            let mut first_cleanup_error: Option<Failure> = None;
             let (mut acknowledged, not_submitted_pos) = match evidence {
                 Evidence::Acknowledged { position, id } => (Some((position, id)), None),
                 Evidence::NotSubmitted { position } => (None, Some(position)),
@@ -2459,12 +2471,17 @@ pub(crate) mod publication {
                 };
                 match row_result {
                     Ok(()) => {
-                        controller.update_publication(
-                            &intent.nonce,
-                            Update::HostCleaned {
-                                position: host.position,
-                            },
-                        )?;
+                        if controller
+                            .update_publication(
+                                &intent.nonce,
+                                Update::HostCleaned {
+                                    position: host.position,
+                                },
+                            )
+                            .is_err()
+                        {
+                            first_cleanup_error.get_or_insert(Failure::CleanupUnconfirmed);
+                        }
                     }
                     Err(err) => {
                         let still_ambiguous =
@@ -2477,11 +2494,11 @@ pub(crate) mod publication {
                                 reason: Some(err),
                             },
                         );
-                        first_dns_error.get_or_insert(err);
+                        first_cleanup_error.get_or_insert(err);
                     }
                 }
             }
-            let outcome = match (first_dns_error, local) {
+            let outcome = match (first_cleanup_error, local) {
                 (None, true) => Cleanup::Released,
                 (dns_err, _) => {
                     Cleanup::Pending(reason.or(dns_err).unwrap_or(Failure::CleanupUnconfirmed))
@@ -2636,6 +2653,8 @@ pub(crate) mod publication {
         /// Hostnames that fail the origin TLS/Host probe before connector start.
         pub(crate) host_origin_mismatch: std::sync::Mutex<std::collections::BTreeSet<String>>,
         /// Observed origin Host probes, preflight order, create order and remove order.
+        pub(crate) starts_at_route_install: std::sync::Mutex<Vec<usize>>,
+        pub(crate) upstream_unavailable: std::sync::atomic::AtomicBool,
         pub(crate) origin_probed: std::sync::Mutex<Vec<String>>,
         pub(crate) preflight_order: std::sync::Mutex<Vec<String>>,
         pub(crate) create_order: std::sync::Mutex<Vec<String>>,

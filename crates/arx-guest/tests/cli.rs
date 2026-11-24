@@ -249,6 +249,52 @@ fn enrolled_host_and_range_headers_reach_each_fixed_upstream() {
     assert_eq!(table.routes()[0].loopback_port(), 20000);
     assert_eq!(table.routes()[1].loopback_port(), 20004);
     let config = table.render_nginx_config();
+    // Evaluate the emitted map rule. Python's re supports this PCRE subset.
+    let map = config
+        .split_once("map $http_cf_connecting_ip $arx_cf_ip {\n")
+        .unwrap()
+        .1
+        .split_once("\n  }")
+        .unwrap()
+        .0;
+    assert!(map.contains("default \"\";"));
+    let rule = map
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("\"~")
+                .and_then(|pattern| pattern.strip_suffix("\" $remote_addr;"))
+        })
+        .unwrap();
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let checked = Command::new(python)
+        .args([
+            "-I",
+            "-B",
+            "-c",
+            r#"
+import ipaddress, re, sys
+pattern = re.compile(sys.argv[1])
+cases = ["", " 1.2.3.4", "1.2.3.4 ", "1.2.3.4,::1", "1.2.3.4:80",
+         "001.2.3.4", "::1%lo", "[::1]", "a:::b", "10000::", "::ffff:256.0.0.1"]
+cases += [f"192.0.2.{n}" for n in range(258)]
+for left in range(9):
+    for right in range(9):
+        cases.append(":".join(["abcd"] * left) + "::" + ":".join(["1"] * right))
+cases += ["::ffff:192.0.2.1", "2001:db8:0:0:0:0:0:1", "255.255.255.255"]
+for value in cases:
+    try:
+        ipaddress.ip_address(value)
+        valid = "%" not in value
+    except ValueError:
+        valid = False
+    assert bool(pattern.search(value)) == valid, value
+"#,
+            rule,
+        ])
+        .status()
+        .expect("Python 3 for nginx IP map test");
+    assert!(checked.success());
     for route in table.routes() {
         let server = config
             .split(&format!("server_name {};", route.hostname))
@@ -262,7 +308,34 @@ fn enrolled_host_and_range_headers_reach_each_fixed_upstream() {
             "proxy_pass http://127.0.0.1:{};",
             route.loopback_port()
         )));
-        assert!(server.contains("proxy_set_header Range $http_range;"));
-        assert!(server.contains("proxy_set_header If-Range $http_if_range;"));
+        for header in [
+            "CF-Connecting-IP",
+            "CF-Connecting-IPv6",
+            "True-Client-IP",
+            "X-Client-IP",
+            "X-Original-Forwarded-For",
+            "X-Forwarded-Port",
+            "X-Cluster-Client-IP",
+            "Forwarded",
+        ] {
+            assert_eq!(
+                server
+                    .matches(&format!("proxy_set_header {header} \"\";"))
+                    .count(),
+                3
+            );
+        }
+        assert_eq!(
+            server
+                .matches("proxy_set_header Range $http_range;")
+                .count(),
+            3
+        );
+        assert_eq!(
+            server
+                .matches("proxy_set_header If-Range $http_if_range;")
+                .count(),
+            3
+        );
     }
 }

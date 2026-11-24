@@ -173,7 +173,7 @@ impl Connector {
             HeldPath::open(plan.private_root, true, true).map_err(|_| ConnectorError::Custody)?;
         let ca = HeldPath::open(plan.ca_path, false, true).map_err(|_| ConnectorError::Origin)?;
         let tls = origin_tls(plan, &ca)?;
-        probe_origin(plan.origin_port, plan.origin_name, plan.probes, &tls).await?;
+        probe_origin(plan.origin_port, plan.origin_name, plan.probes, true, &tls).await?;
         if retired.is_cancelled() || shutdown.is_cancelled() {
             return Err(ConnectorError::Origin);
         }
@@ -225,7 +225,7 @@ impl Connector {
             _ = shutdown.cancelled() => Err(ConnectorError::Origin),
             result = async {
                 connector.await_ready().await?;
-                connector.origin_ready().await?;
+                connector.origin_ready(true).await?;
                 if !connector.running() {
                     return Err(ConnectorError::Crashed);
                 }
@@ -267,9 +267,9 @@ impl Connector {
         self.process.running()
     }
 
-    pub(in crate::vm) async fn origin_ready(&self) -> Result<(), ConnectorError> {
+    pub(in crate::vm) async fn origin_ready(&self, probe_apps: bool) -> Result<(), ConnectorError> {
         let (port, name, hostnames, tls) = &self.origin;
-        probe_origin(*port, name, hostnames, tls).await
+        probe_origin(*port, name, hostnames, probe_apps, tls).await
     }
 
     pub(in crate::vm) async fn ready(&self) -> bool {
@@ -365,6 +365,7 @@ async fn probe_origin(
     port: NonZeroU16,
     origin_name: &Hostname,
     probes: &[(Hostname, String)],
+    probe_apps: bool,
     tls: &TlsConnector,
 ) -> Result<(), ConnectorError> {
     let failure = ConnectorError::Origin;
@@ -381,10 +382,20 @@ async fn probe_origin(
         .map_err(|_| failure)?;
         return Ok(());
     }
-    probe_host(port, origin_name, origin_name, "/arx-health", false, tls).await?;
+    probe_host(
+        port,
+        origin_name,
+        origin_name,
+        "/arx-health",
+        200..=200,
+        tls,
+    )
+    .await?;
     for (host, path) in probes {
-        probe_host(port, origin_name, host, path, true, tls).await?;
-        probe_host(port, origin_name, host, "/", false, tls).await?;
+        probe_host(port, origin_name, host, path, 204..=204, tls).await?;
+        if probe_apps {
+            probe_host(port, origin_name, host, "/", 200..=499, tls).await?;
+        }
     }
     Ok(())
 }
@@ -394,7 +405,7 @@ async fn probe_host(
     origin_name: &Hostname,
     host: &Hostname,
     path: &str,
-    binding_witness: bool,
+    accepted: std::ops::RangeInclusive<u16>,
     tls: &TlsConnector,
 ) -> Result<(), ConnectorError> {
     let failure = ConnectorError::Origin;
@@ -421,14 +432,10 @@ async fn probe_host(
                     .map_err(|_| failure)?
                     .strip_suffix("\r\n")
                     .ok_or(failure)?;
-                return match status_code(text) {
-                    Some(code)
-                        if (200..300).contains(&code) && (!binding_witness || code == 204) =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err(failure),
-                };
+                return status_code(text)
+                    .filter(|code| accepted.contains(code))
+                    .map(|_| ())
+                    .ok_or(failure);
             }
         }
         Err(failure)
