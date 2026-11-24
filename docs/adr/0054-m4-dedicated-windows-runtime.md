@@ -911,19 +911,52 @@ any write or truncation.
 
 For a fresh qemu-img output, the pre-claim row identifies the held
 parent and exact relative leaf, and starts with no file ID. After the
-slot is durably charged and while borrowing its offline lease, the
-supervisor uses an exclusive create relative to the held parent,
-with no reparse traversal. An occupied leaf refuses, even if it
-matches the desired format. Capture the volume and file ID from the
-handle returned by the successful create and bind the row to that
-identity once, before handing off the minimum necessary rights to the
-same held helper. Hold the original created object and its parents
-through helper exit and post-exit verification. At settlement, verify
-the output's identity, header and permitted allocation or mutation
-against the held created handle and compare the reserved name through
-a new relative no-follow open. A different name binding or inconclusive
-verification prevents acceptance. No prior identity is assumed. Stock
-Windows `-add-fd` cannot provide this handoff.
+slot is durably charged and while borrowing its offline lease, use
+`FILE_CREATE` relative to the held parent without reparse traversal.
+Create a non-inheritable handle with read and write access and only
+`FILE_SHARE_READ`. An occupied leaf refuses, even if it matches the
+desired format.
+Capture the volume and file ID from the create handle and bind the
+row to that identity once. The create's sharing mode excludes
+independent data writers and deletion from the instant of creation.
+
+Keep that same open file object continuously held under the lease.
+Before handoff, use `DuplicateHandle` to make a non-inheritable local
+duplicate with only `FILE_READ_DATA`, `FILE_READ_ATTRIBUTES` and
+`SYNCHRONIZE`. Duplicate the create handle with the minimum required
+write-capable rights into only the held helper, as a non-inheritable
+handle. Both duplicates reference the same open file object.
+The supervisor uses its create handle only to bind identity and make
+these duplicates. Confirm the rights and identity,
+then close the supervisor's original write-capable handle before
+acknowledging helper I/O. Any verification duplicate has no write
+rights. The reviewed helper uses only its one grant for output I/O
+and cannot reopen the output, export the grant or create a writable
+file mapping. Stock Windows `-add-fd` cannot provide this handoff.
+
+On success, the helper completes and flushes its writes and closes
+its grant before exit. Require held helper exit, an empty Job and joined
+workers before verification. Those checks and the closed grant inventory
+prove no write-capable duplicate survives. The read-only duplicate
+keeps the original open and its deny-write and deny-delete sharing
+in force even after both write-capable handles close. Verify file
+identity, header and permitted allocation through that retained
+duplicate. Check the reserved name with a relative no-follow open
+requesting only `FILE_READ_ATTRIBUTES`, with read and write sharing
+for compatibility with the original open. Its identity must match
+the create identity. The metadata open leaves the original sharing
+guard in force. Keep the duplicate and parent pins until settlement
+is proven.
+
+If creation, identity or rights verification, duplication or closing
+the supervisor's writer fails during handoff, withhold I/O authority,
+stop any attributed helper and retain the custody already acquired.
+A lost hold, surviving or unaccounted writer, name mismatch or
+inconclusive verification refuses and keeps the affected generation
+quarantined and charged.
+Reacquiring a leaf by name cannot restore continuity.
+[Microsoft native file creation and sharing](https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntcreatefile) ·
+[Microsoft file objects and handle duplication](https://learn.microsoft.com/en-us/windows/win32/sysinfo/kernel-objects)
 
 At each enrolled consumption site, the pinned binary adopts the granted
 handle in the actual reader or writer and blocks before the first read,
@@ -934,9 +967,10 @@ Only a matching, in-window acknowledgement releases that operation.
 The reviewed hook must use that exact handle for I/O and deny an
 unlisted request or a by-name fallback. There is no permit based on a
 path string, a handle value alone, or a separately reopened path. Keep
-the channel active through the last reopen or helper exit. Exclusively
-reopen and verify writable outputs, headers and allowed mutations at
-settlement as applicable.
+the channel active through the last reopen or helper exit. Use the
+writer-excluding reopen and allowed-mutation checks at settlement
+for existing writable pins. A fresh create uses the retained-object
+proof above, with no second data open for settlement.
 
 Demonstrate coverage per exact binary and sealed recipe. Map each
 reachable regular-file input and output site to an open-table row and
@@ -1043,7 +1077,8 @@ release proceed in this order.
 4. With custody still held, require all attributed held process
    handles signaled, the owned Job empty and the debugger, I/O and
    witness workers joined. Then prove file custody and exclusive
-   release, including applicable writable verification above. Only
+   release. Use the writer-excluding reopen for existing writable
+   pins and the continuous create hold for fresh outputs. Only
    after this independent settlement proof release the process, Job
    and custody handles and settle the slot. A timely, independently
    proven containment release may settle a failed trial as dirty
@@ -1123,8 +1158,13 @@ descendant refusal for each launcher and the debugger's pre-execution
 stop with an isolated fixture. Cover protected activation and named
 objects, an occupied and a freshly created output, missing or
 substituted input proof, and refusal during initial and late loads.
-Demonstrate terminal-event drain, debugger and supervisor loss,
-clean or dirty release and durable quarantine.
+For fresh outputs, prove a separate writer is refused immediately
+after creation, during helper I/O and through settlement after both
+write-capable handles close. Verify the read-only duplicate cannot
+write and still verifies the original object. Exercise a failed handoff
+and loss of the continuous hold. Demonstrate terminal-event drain,
+debugger and supervisor loss, clean or dirty release and durable
+quarantine.
 Run the full enabled recipe and helper matrix, including real WHPX cold
 boots and observed coverage through teardown. These witness,
 adapter and full-recipe cases are **unverified on real hardware**.
