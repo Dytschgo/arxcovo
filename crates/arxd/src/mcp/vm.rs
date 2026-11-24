@@ -8,6 +8,7 @@ use crate::{
             NativeRefusal,
             publication::{Drained, Origin, Profile, Publication},
         },
+        snapshot::{Request as SnapshotRequest, SnapshotName},
         static_web::{StaticName, StaticState},
         *,
     },
@@ -130,6 +131,9 @@ fn refusal_wire(reason: Refusal) -> &'static str {
         Refusal::PublishCredentialMissing => "publish_credential_missing",
         Refusal::PublishTargetMismatch => "publish_target_mismatch",
         Refusal::PublishCleanupPending => "publish_cleanup_pending",
+        Refusal::SnapshotPublishNotQuiesced => "snapshot_publish_not_quiesced",
+        Refusal::StaticBackupDeleteForbidden => "static_backup_delete_forbidden",
+        Refusal::SnapshotOfflineRequired => "snapshot_offline_required",
     }
 }
 
@@ -147,7 +151,7 @@ fn refusal_from_wire(reason: &str) -> Option<Refusal> {
         .find(|code| refusal_wire(*code) == reason)
 }
 
-const REFUSAL_CODES: [Refusal; 48] = {
+const REFUSAL_CODES: [Refusal; 51] = {
     use Refusal::*;
     [
         Invalid,
@@ -198,6 +202,9 @@ const REFUSAL_CODES: [Refusal; 48] = {
         PublishCredentialMissing,
         PublishTargetMismatch,
         PublishCleanupPending,
+        SnapshotPublishNotQuiesced,
+        StaticBackupDeleteForbidden,
+        SnapshotOfflineRequired,
     ]
 };
 
@@ -548,7 +555,7 @@ impl Supervisor {
                         _ = self.publication_turn() => {}
                     }
                     let supervisor = self.clone();
-                    tokio::task::spawn_blocking(move || supervisor.sweep()).await??;
+                    let _ = tokio::task::spawn_blocking(move || supervisor.sweep()).await?;
                 }
             }
         }
@@ -813,10 +820,14 @@ enum ToolName {
     Publish,
     Unpublish,
     PublishStatus,
+    SnapshotCreate,
+    SnapshotList,
+    SnapshotRestore,
+    SnapshotDelete,
 }
 
 impl ToolName {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 22] = [
         Self::Hosts,
         Self::Activity,
         Self::Catalog,
@@ -835,6 +846,10 @@ impl ToolName {
         Self::Publish,
         Self::Unpublish,
         Self::PublishStatus,
+        Self::SnapshotCreate,
+        Self::SnapshotList,
+        Self::SnapshotRestore,
+        Self::SnapshotDelete,
     ];
 
     fn name(self) -> &'static str {
@@ -857,6 +872,10 @@ impl ToolName {
             Self::Publish => "publish_site",
             Self::Unpublish => "unpublish_site",
             Self::PublishStatus => "publish_status",
+            Self::SnapshotCreate => "vm_snapshot_create",
+            Self::SnapshotList => "vm_snapshot_list",
+            Self::SnapshotRestore => "vm_snapshot_restore",
+            Self::SnapshotDelete => "vm_snapshot_delete",
         }
     }
 
@@ -871,6 +890,9 @@ impl ToolName {
             Self::Extend => Action::Extend as i64,
             Self::Publish => PUBLISH_ACTION,
             Self::Unpublish => UNPUBLISH_ACTION,
+            Self::SnapshotCreate => Action::Snapshot as i64,
+            Self::SnapshotRestore => Action::Restore as i64,
+            Self::SnapshotDelete => SNAPSHOT_DELETE_ACTION,
             _ => return None,
         })
     }
@@ -927,6 +949,28 @@ impl ToolName {
                 },
                 json!({"vm_id":id,"request_id":id}),
                 &["vm_id", "request_id"],
+            ),
+            Self::SnapshotCreate => (
+                "Capture a stopped VM disk and firmware pair",
+                json!({"vm_id":id,"request_id":id,
+                    "name":{"type":"string","minLength":1,"maxLength":48,
+                    "pattern":"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$"}}),
+                &["vm_id", "request_id"],
+            ),
+            Self::SnapshotList => (
+                "List caller-owned VM restore points",
+                json!({"vm_id":id,"limit":{"type":"integer","minimum":1,"maximum":4,"default":4},
+                    "cursor":{"type":"string","maxLength":96,"pattern":"^[A-Za-z0-9_-]+$"}}),
+                &["vm_id"],
+            ),
+            Self::SnapshotRestore | Self::SnapshotDelete => (
+                if self == Self::SnapshotRestore {
+                    "Restore a stopped VM from a sealed pair"
+                } else {
+                    "Delete a stopped TEST VM restore point"
+                },
+                json!({"vm_id":id,"snapshot_id":id,"request_id":id}),
+                &["vm_id", "snapshot_id", "request_id"],
             ),
             Self::PublishStatus => (
                 "Read a caller-owned static site status",
@@ -1097,6 +1141,7 @@ enum Work {
     StaticCreate(StaticName),
     Publish,
     Unpublish,
+    Snapshot(SnapshotRequest),
     Start,
     Stop,
     Script(
@@ -1155,6 +1200,17 @@ impl Mutation {
             ToolName::Publish => Work::Publish,
             ToolName::Unpublish => Work::Unpublish,
             ToolName::Stop => Work::Stop,
+            ToolName::SnapshotCreate => Work::Snapshot(SnapshotRequest::Create(
+                args.optional::<String>("name")?
+                    .map(|name| SnapshotName::parse(&name).map_err(|_| INVALID))
+                    .transpose()?,
+            )),
+            ToolName::SnapshotRestore => {
+                Work::Snapshot(SnapshotRequest::Restore(args.id("snapshot_id")?))
+            }
+            ToolName::SnapshotDelete => {
+                Work::Snapshot(SnapshotRequest::Delete(args.id("snapshot_id")?))
+            }
             ToolName::Script => {
                 let script: String = args.get("script")?;
                 let timeout = args.optional("timeout_s")?.unwrap_or(30);
@@ -1247,7 +1303,7 @@ impl VmInventory {
         }
         let vm = if matches!(
             tool,
-            ToolName::Get | ToolName::StaticGet | ToolName::PublishStatus
+            ToolName::Get | ToolName::StaticGet | ToolName::PublishStatus | ToolName::SnapshotList
         ) {
             args.0
                 .get("vm_id")
@@ -1300,6 +1356,7 @@ impl VmInventory {
                     .finalize()
                     .into(),
             ),
+            Work::Snapshot(snapshot) => snapshot.binding(request.id),
             _ => Subject::Vm(request.id),
         };
         let replay = controller.foreground_replay(&self.principal, request.key, subject, action);
@@ -1337,6 +1394,44 @@ impl VmInventory {
             Work::Script(..) => Some(ForegroundSubject::Script(request.id)),
             Work::Extend(_) => Some(ForegroundSubject::Extend(request.id)),
             Work::Publish | Work::Unpublish => return self.publication(gate, action, request),
+            Work::Snapshot(snapshot) => {
+                let result = controller.foreground_snapshot_precheck(
+                    &self.principal,
+                    request.id,
+                    snapshot,
+                )?;
+                let is_static = match result {
+                    Ok(is_static) => is_static,
+                    Err(reason) => return self.refuse(action, request.vm(), reason.into()),
+                };
+                let route = if is_static {
+                    let Some(proof) = self
+                        .supervisor
+                        .publisher
+                        .snapshot_route(request.id)
+                        .filter(|proof| proof.vm() == request.id)
+                    else {
+                        return self.refuse(
+                            action,
+                            request.vm(),
+                            Refusal::SnapshotPublishNotQuiesced.into(),
+                        );
+                    };
+                    Some(proof)
+                } else {
+                    None
+                };
+                #[cfg(test)]
+                if let Some(fixture) = &mut gate.fixture {
+                    return fixture.snapshot(self, action, request, route);
+                }
+                let _route = route;
+                return self.refuse(
+                    action,
+                    request.vm(),
+                    Fault(native_reason(self.supervisor.native_refusal)),
+                );
+            }
         };
         if let Some(subject) = subject
             && let Err(reason) = controller.foreground_precheck(&self.principal, subject)?
@@ -1556,6 +1651,7 @@ impl VmInventory {
                 )
             }
             ToolName::Activity => self.activity(args),
+            ToolName::SnapshotList => self.snapshot_page(args),
             ToolName::Catalog | ToolName::List | ToolName::StaticList => {
                 self.page(gate, tool, args)
             }
@@ -1682,28 +1778,94 @@ impl VmInventory {
         Ok(value)
     }
 
-    fn cursor(&self, tool: ToolName, (kind, id): (u8, Id)) -> String {
+    fn snapshot_page(&self, mut args: Args) -> Outcome<Value> {
+        let vm = args.id("vm_id")?;
+        let limit: u32 = args.optional("limit")?.unwrap_or(snapshot::POINTS_PER_VM);
+        if !(1..=snapshot::POINTS_PER_VM).contains(&limit) {
+            return Err(INVALID);
+        }
+        let cursor: Option<String> = args.optional("cursor")?;
+        args.end()?;
+        let tool = ToolName::SnapshotList;
+        let after = cursor
+            .as_deref()
+            .map(|cursor| {
+                self.decode_scoped_cursor(tool, Some(vm), cursor)
+                    .map(|(_, id)| id)
+            })
+            .transpose()?;
+        let mut points = self.supervisor.controller.foreground_snapshot_list(
+            &self.principal,
+            vm,
+            after,
+            limit + 1,
+        )??;
+        let mut page = json!({"vm_id":hex::encode(vm)});
+        if points.len() > limit as usize {
+            points.pop();
+            let last = points.last().expect("positive limit");
+            page["next_cursor"] = json!(self.scoped_cursor(tool, Some(vm), (0, last.id)));
+        }
+        page["entries"] = Value::Array(
+            points
+                .into_iter()
+                .map(|point| {
+                    let mut row = json!({
+                        "snapshot_id":hex::encode(point.id),
+                        "captured_at_ms":point.captured_ms,
+                        "charged_bytes":point.charge,
+                        "protected":point.protected,
+                        "restore_eligible":point.restore_eligible,
+                    });
+                    if let Some(name) = point.name {
+                        row["name"] = json!(name);
+                    }
+                    row
+                })
+                .collect(),
+        );
+        Ok(page)
+    }
+
+    fn cursor(&self, tool: ToolName, key: (u8, Id)) -> String {
+        self.scoped_cursor(tool, None, key)
+    }
+
+    fn scoped_cursor(&self, tool: ToolName, vm: Option<Id>, (kind, id): (u8, Id)) -> String {
         let mut bytes = [0; 51];
         bytes[0] = 1;
         bytes[1] = kind;
         bytes[2..18].copy_from_slice(&id);
-        let tag = self.cursor_mac(tool, &bytes[..19]);
+        let tag = self.cursor_mac(tool, vm, &bytes[..19]);
         bytes[19..].copy_from_slice(tag.as_ref());
         encode_cursor(bytes)
     }
 
-    fn cursor_mac(&self, tool: ToolName, bytes: &[u8]) -> hmac::Tag {
+    fn cursor_mac(&self, tool: ToolName, vm: Option<Id>, bytes: &[u8]) -> hmac::Tag {
         let mut mac = hmac::Context::with_key(&self.supervisor.cursor_key);
         mac.update(b"arxcovo.vm.cursor.v1\0");
         mac.update(tool.name().as_bytes());
         mac.update(&[0]);
         mac.update(self.principal.as_bytes());
         mac.update(&[0]);
+        if let Some(vm) = vm {
+            mac.update(&self.supervisor.host_id);
+            mac.update(&vm);
+        }
         mac.update(bytes);
         mac.sign()
     }
 
     fn decode_cursor(&self, tool: ToolName, value: &str) -> Outcome<(u8, Id)> {
+        self.decode_scoped_cursor(tool, None, value)
+    }
+
+    fn decode_scoped_cursor(
+        &self,
+        tool: ToolName,
+        vm: Option<Id>,
+        value: &str,
+    ) -> Outcome<(u8, Id)> {
         use subtle::ConstantTimeEq;
         let bytes = decode_cursor(value)?;
         let valid_kind = if tool == ToolName::Catalog {
@@ -1711,7 +1873,7 @@ impl VmInventory {
         } else {
             bytes[1] == 0
         };
-        let expected = self.cursor_mac(tool, &bytes[..19]);
+        let expected = self.cursor_mac(tool, vm, &bytes[..19]);
         if bytes[0] != 1
             || !valid_kind
             || bytes[18] != 0
@@ -1900,6 +2062,9 @@ fn operation_row(operation: OperationStatus) -> Value {
     if let Some(vm) = operation.vm {
         value["vm_id"] = json!(hex::encode(vm));
     }
+    if let Some(snapshot) = operation.snapshot {
+        value["snapshot_id"] = json!(hex::encode(snapshot));
+    }
     if let Some(recipe) = operation.recipe {
         value["recipe_id"] = json!(recipe);
     }
@@ -1942,6 +2107,7 @@ fn action_wire(code: i64) -> Option<&'static str> {
         HOST_REFUSAL_ACTION => "host_execution",
         PUBLISH_ACTION => "publish",
         UNPUBLISH_ACTION => "unpublish",
+        SNAPSHOT_DELETE_ACTION => "snapshot_delete",
         _ => return None,
     })
 }
@@ -2101,6 +2267,20 @@ mod tests {
             proof: ArtifactEvidence,
             delete: bool,
         ) -> Result<custody::Held> {
+            let mut held = self.hold_identity(slot, proof, delete)?;
+            ensure!(
+                proof.pin.verify(&mut held.file, SNAPSHOT_FILE_LIMIT)?,
+                "fixture artifact changed"
+            );
+            Ok(held)
+        }
+
+        fn hold_identity(
+            &self,
+            slot: ArtifactSlot,
+            proof: ArtifactEvidence,
+            delete: bool,
+        ) -> Result<custody::Held> {
             let path = self.0.path(slot.role, slot.key);
             let (parent, name) = path
                 .parent()
@@ -2115,20 +2295,48 @@ mod tests {
                     },
                 "fixture directory changed"
             );
-            let mut file = custody::open_leaf(&directory, &path, name, delete)?;
+            let file = custody::open_leaf(&directory, &path, name, delete)?;
             ensure!(
                 custody::identity(&file, false)? == proof.identity,
                 "fixture artifact identity changed"
-            );
-            ensure!(
-                proof.pin.verify(&mut file, 131_072)?,
-                "fixture artifact changed"
             );
             Ok(custody::Held {
                 directory,
                 file,
                 name: name.to_owned(),
             })
+        }
+
+        /// Observe the stopped fixture writer's current bytes through the
+        /// recorded identities. The handles stay held through stop settlement.
+        fn released_pair(&self, (slots, [disk, vars]): Pair) -> Result<([custody::Held; 2], Pair)> {
+            let mut held = [
+                self.hold_identity(slots.disk, disk, false)?,
+                self.hold_identity(slots.vars, vars, false)?,
+            ];
+            let observe = |file: &mut fs::File, mut evidence: ArtifactEvidence| {
+                use std::io::Read;
+                let mut hash = Sha256::new();
+                let size = std::io::copy(&mut file.take(SNAPSHOT_FILE_LIMIT + 1), &mut hash)?;
+                ensure!(
+                    (1..=SNAPSHOT_FILE_LIMIT).contains(&size),
+                    "fixture pair exceeds bound"
+                );
+                evidence.pin = crate::vm::paths::ArtifactPin {
+                    size,
+                    sha256: hash.finalize().into(),
+                };
+                Ok::<_, anyhow::Error>(evidence)
+            };
+            let proof = [
+                observe(&mut held[0].file, disk)?,
+                observe(&mut held[1].file, vars)?,
+            ];
+            ensure!(
+                proof[1].pin.size == vars.pin.size,
+                "fixture firmware variables size changed"
+            );
+            Ok((held, (slots, proof)))
         }
 
         fn verify(&self, slot: ArtifactSlot, proof: ArtifactEvidence) -> Result<()> {
@@ -2494,36 +2702,612 @@ mod tests {
         header
     }
 
+    const SNAPSHOT_VM_BYTES: u64 = 1 << 20;
+    const SNAPSHOT_FILE_LIMIT: u64 = 131_072;
+
+    fn fixture_snapshot_path(slot: ArtifactSlot) -> crate::vm::paths::LocalPath {
+        crate::vm::paths::LocalPath::parse("D:/fixture-snapshot")
+            .unwrap()
+            .join(&hex::encode(slot.generation))
+            .unwrap()
+            .join(&format!("{}-{}", slot.role, hex::encode(slot.key)))
+            .unwrap()
+    }
+
+    fn fixture_snapshot_overlay(golden: ArtifactSlot) -> Vec<u8> {
+        let mut disk = fixture_qcow2();
+        let backing = fixture_snapshot_path(golden);
+        let backing = backing.as_str().as_bytes();
+        disk[8..16].copy_from_slice(&144u64.to_be_bytes());
+        disk[16..20].copy_from_slice(&(backing.len() as u32).to_be_bytes());
+        disk[112..116].copy_from_slice(&0xe279_2acau32.to_be_bytes());
+        disk[116..120].copy_from_slice(&5u32.to_be_bytes());
+        disk[120..125].copy_from_slice(b"qcow2");
+        disk[144..144 + backing.len()].copy_from_slice(backing);
+        disk
+    }
+
+    fn qcow2_virtual_size(file: &mut fs::File) -> Result<u64> {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(24))?;
+        let mut bytes = [0u8; 8];
+        file.read_exact(&mut bytes)?;
+        file.rewind()?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    struct FixtureCopy<'a> {
+        controller: &'a Controller,
+        work: &'a crate::store::vm::snapshot::Work,
+        host: Arc<dyn Fn() -> HostObservation + Send + Sync>,
+        staging_disk_path: crate::vm::paths::LocalPath,
+        active: [custody::Held; 2],
+        source: Option<[custody::Held; 2]>,
+        golden: Option<custody::Held>,
+        staging: [fs::File; 2],
+    }
+
+    impl FixtureCopy<'_> {
+        fn files(&mut self, side: snapshot::Side) -> [&mut fs::File; 2] {
+            match side {
+                snapshot::Side::Staging => self.staging.each_mut(),
+                snapshot::Side::Active => self.active.each_mut().map(|held| &mut held.file),
+                snapshot::Side::Source => self
+                    .source
+                    .as_mut()
+                    .unwrap_or(&mut self.active)
+                    .each_mut()
+                    .map(|held| &mut held.file),
+            }
+        }
+    }
+
+    impl snapshot::CopyCustody for FixtureCopy<'_> {
+        fn checkpoint(
+            &mut self,
+            _: &snapshot::CopyPlan,
+            worker: &PendingOperation,
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<(), snapshot::Refusal> {
+            let observation = (self.host)();
+            self.controller
+                .snapshot_checkpoint(worker, self.work, observation, RESOURCES)
+                .map_err(|_| snapshot::Refusal::Custody)
+        }
+
+        fn observe(
+            &mut self,
+            side: snapshot::Side,
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<[snapshot::Observation; 2], snapshot::Refusal> {
+            let [disk, vars] = self.files(side);
+            let inspect = |file: &fs::File| -> Result<snapshot::Observation, snapshot::Refusal> {
+                Ok(snapshot::Observation {
+                    identity: custody::identity(file, false)
+                        .map_err(|_| snapshot::Refusal::Identity)?,
+                    size: file.metadata().map_err(|_| snapshot::Refusal::Io)?.len(),
+                })
+            };
+            Ok([inspect(disk)?, inspect(vars)?])
+        }
+
+        fn read(
+            &mut self,
+            side: snapshot::Side,
+            role: snapshot::FileRole,
+            offset: u64,
+            bytes: &mut [u8],
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<(), snapshot::Refusal> {
+            use std::io::{Read, Seek, SeekFrom};
+            let index = usize::from(role == snapshot::FileRole::Vars);
+            let file = &mut self.files(side)[index];
+            file.seek(SeekFrom::Start(offset))
+                .and_then(|_| file.read_exact(bytes))
+                .map_err(|_| snapshot::Refusal::Io)
+        }
+
+        fn write_staging(
+            &mut self,
+            role: snapshot::FileRole,
+            offset: u64,
+            bytes: &[u8],
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<(), snapshot::Refusal> {
+            use std::io::{Seek, SeekFrom, Write};
+            let file = &mut self.staging[usize::from(role == snapshot::FileRole::Vars)];
+            file.seek(SeekFrom::Start(offset))
+                .and_then(|_| file.write_all(bytes))
+                .map_err(|_| snapshot::Refusal::Io)
+        }
+
+        fn golden_header(
+            &mut self,
+            golden: &snapshot::Golden,
+            header: &mut [u8],
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<(), snapshot::Refusal> {
+            use std::io::{Read, Seek};
+            let file = &mut self.golden.as_mut().ok_or(snapshot::Refusal::Custody)?.file;
+            file.rewind().map_err(|_| snapshot::Refusal::Io)?;
+            if custody::identity(file, false).map_err(|_| snapshot::Refusal::Identity)?
+                != golden.identity
+                || !golden
+                    .pin
+                    .verify(&mut *file, SNAPSHOT_FILE_LIMIT)
+                    .map_err(|_| snapshot::Refusal::Pin)?
+            {
+                return Err(snapshot::Refusal::Pin);
+            }
+            file.rewind()
+                .and_then(|_| file.read_exact(header))
+                .map_err(|_| snapshot::Refusal::Io)
+        }
+
+        fn inspect(
+            &mut self,
+            info: &crate::vm::qemu_args::SnapshotInfo<'_>,
+            output: &mut [u8],
+            _: &snapshot::CopyBudget<'_>,
+        ) -> Result<usize, snapshot::Refusal> {
+            let path = info.path().as_str();
+            if info.args() != ["info", "--output=json", "-f", "qcow2", path] {
+                return Err(snapshot::Refusal::Inspection);
+            }
+            let active_path = fixture_snapshot_path(self.work.active.pair.0.disk);
+            let source_path = fixture_snapshot_path(self.work.source.0.disk);
+            let file = if self.staging_disk_path.as_str() == path {
+                &mut self.staging[0]
+            } else if source_path.as_str() == path && self.source.is_some() {
+                &mut self.source.as_mut().unwrap()[0].file
+            } else if active_path.as_str() == path {
+                &mut self.active[0].file
+            } else {
+                return Err(snapshot::Refusal::Inspection);
+            };
+            let actual_size = file.metadata().map_err(|_| snapshot::Refusal::Io)?.len();
+            let virtual_size =
+                qcow2_virtual_size(file).map_err(|_| snapshot::Refusal::Inspection)?;
+            let mut body = json!({
+                "filename":path,
+                "format":"qcow2",
+                "virtual-size":virtual_size,
+                "actual-size":actual_size,
+                "dirty-flag":false,
+            });
+            if let Some(golden) = info.golden() {
+                let golden = golden
+                    .path_for(crate::vm::paths::ArtifactRole::Golden)
+                    .map_err(|_| snapshot::Refusal::Inspection)?
+                    .as_str();
+                body["backing-filename"] = json!(golden);
+                body["full-backing-filename"] = json!(golden);
+                body["backing-filename-format"] = json!("qcow2");
+            }
+            let encoded = serde_json::to_vec(&body).map_err(|_| snapshot::Refusal::Inspection)?;
+            output
+                .get_mut(..encoded.len())
+                .ok_or(snapshot::Refusal::Inspection)?
+                .copy_from_slice(&encoded);
+            Ok(encoded.len())
+        }
+
+        fn flush_staging(&mut self, _: &snapshot::CopyBudget<'_>) -> Result<(), snapshot::Refusal> {
+            for leaf in &self.staging {
+                leaf.sync_all().map_err(|_| snapshot::Refusal::Io)?;
+            }
+            #[cfg(unix)]
+            self.active[0]
+                .directory
+                .sync_all()
+                .map_err(|_| snapshot::Refusal::Io)?;
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_fixture_snapshot(
+        artifacts: &Artifacts,
+        controller: &Controller,
+        work: &crate::store::vm::snapshot::Work,
+        worker: &PendingOperation,
+        route: Option<&runtime::publication::SnapshotRoute>,
+        host: Arc<dyn Fn() -> HostObservation + Send + Sync>,
+        hold: Option<(Arc<Notify>, Arc<Notify>)>,
+        fault: Option<SnapshotFault>,
+        cancel: &Shutdown,
+        vm_cancel: &Shutdown,
+    ) -> std::result::Result<Pair, [crate::store::vm::snapshot::StagedLeaf; 2]> {
+        use crate::store::vm::snapshot::StagedLeaf;
+        let mut leaves = [StagedLeaf::Untouched; 2];
+        let result = copy_fixture_snapshot_inner(
+            artifacts,
+            controller,
+            work,
+            worker,
+            route,
+            host,
+            hold,
+            fault,
+            cancel,
+            vm_cancel,
+            &mut leaves,
+        )
+        .await;
+        result.map_err(|_| leaves)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_fixture_snapshot_inner(
+        artifacts: &Artifacts,
+        controller: &Controller,
+        work: &crate::store::vm::snapshot::Work,
+        worker: &PendingOperation,
+        route: Option<&runtime::publication::SnapshotRoute>,
+        host: Arc<dyn Fn() -> HostObservation + Send + Sync>,
+        hold: Option<(Arc<Notify>, Arc<Notify>)>,
+        fault: Option<SnapshotFault>,
+        cancel: &Shutdown,
+        vm_cancel: &Shutdown,
+        leaves: &mut [crate::store::vm::snapshot::StagedLeaf; 2],
+    ) -> Result<Pair> {
+        use crate::store::vm::snapshot::StagedLeaf;
+        use snapshot::{
+            ActiveRelease, Compatibility, CopyPlan, Destination, Golden, Leaf, Limits, Lineage,
+            StoredPair,
+        };
+        let slots = work.candidate.expect("copy candidate");
+        let held_pair = |(slots, [disk, vars]): Pair| {
+            Ok::<_, anyhow::Error>([
+                artifacts.hold(slots.disk, disk, false)?,
+                artifacts.hold(slots.vars, vars, false)?,
+            ])
+        };
+        let mut active = held_pair(work.active.pair)?;
+        let mut source = (work.action == 6)
+            .then(|| held_pair(work.source))
+            .transpose()?;
+        let (lineage, golden) = if let Some((golden_slots, [golden, _])) = work.active.golden {
+            let slot = golden_slots.disk;
+            (
+                Lineage::Test {
+                    template: work.active.template,
+                    golden: Golden {
+                        object: slot.key,
+                        path: fixture_snapshot_path(slot),
+                        identity: golden.identity,
+                        pin: golden.pin,
+                    },
+                },
+                Some(artifacts.hold(slot, golden, false)?),
+            )
+        } else {
+            (
+                Lineage::Static {
+                    origin: work.active.origin,
+                },
+                None,
+            )
+        };
+        let firmware = crate::vm::paths::ArtifactPin {
+            size: b"fixture firmware".len() as u64,
+            sha256: Sha256::digest(b"fixture firmware").into(),
+        };
+        let active_virtual = qcow2_virtual_size(&mut active[0].file)?;
+        let source_virtual = match source.as_mut() {
+            Some(held) => qcow2_virtual_size(&mut held[0].file)?,
+            None => active_virtual,
+        };
+        let map_leaf = |slot: ArtifactSlot, proof: ArtifactEvidence| Leaf {
+            key: slot.key,
+            path: fixture_snapshot_path(slot),
+            identity: proof.identity,
+            pin: proof.pin,
+        };
+        let stored = |(slots, [disk, vars]): Pair, virtual_disk_bytes: u64| StoredPair {
+            compatibility: Compatibility {
+                host: work.active.host,
+                vm: work.vm,
+                lineage: lineage.clone(),
+                recipe: work.active.recipe,
+                firmware,
+                virtual_disk_bytes,
+                vars_bytes: vars.pin.size,
+            },
+            generation: slots.disk.generation,
+            disk: map_leaf(slots.disk, disk),
+            vars: map_leaf(slots.vars, vars),
+        };
+        let action = if work.action == 5 {
+            snapshot::Action::Capture {
+                snapshot: work.target,
+            }
+        } else {
+            snapshot::Action::Restore {
+                snapshot: work.target,
+            }
+        };
+        let [vm_points, host_points] = work.points;
+        let plan = CopyPlan::new(
+            snapshot::Intent {
+                activity_id: work.activity,
+                action,
+                active: stored(work.active.pair, active_virtual),
+                active_writer_epoch: work.active.epoch,
+                release: ActiveRelease {
+                    generation: work.active.pair.0.disk.generation,
+                    writer_epoch: work.active.epoch,
+                    disposition: if work.active.clean {
+                        runtime::StopDisposition::CleanRelease
+                    } else {
+                        runtime::StopDisposition::DirtyRelease
+                    },
+                    endpoints_released: true,
+                },
+                selected: (work.action == 6)
+                    .then(|| (work.target, stored(work.source, source_virtual))),
+                destination: Destination {
+                    generation: slots.disk.generation,
+                    disk_key: slots.disk.key,
+                    vars_key: slots.vars.key,
+                },
+            },
+            &crate::vm::paths::LocalPath::parse("D:/fixture-snapshot").unwrap(),
+            work.active.pair.1[0].identity.volume,
+            Limits {
+                vm_points,
+                host_points,
+                max_file_bytes: SNAPSHOT_FILE_LIMIT,
+                max_virtual_bytes: SNAPSHOT_VM_BYTES,
+                restore_growth_bytes: if work.action == 6 { source_virtual } else { 0 },
+                staging_bytes: work.claim.staging,
+                metadata_bytes: work.claim.metadata,
+            },
+        )
+        .map_err(|reason| anyhow::anyhow!("fixture snapshot plan: {reason:?}"))?;
+        ensure!(
+            plan.additional_claim().total() == work.claim.total(),
+            "fixture snapshot charge changed"
+        );
+        if matches!(fault, Some(SnapshotFault::FailBeforeCreate)) {
+            anyhow::bail!("injected snapshot fail before create");
+        }
+        let mut hold = hold;
+        if matches!(fault, Some(SnapshotFault::HoldBeforeCreate))
+            && let Some((entered, release)) = hold.take()
+        {
+            entered.notify_one();
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => anyhow::bail!("fixture snapshot cancelled"),
+                _ = vm_cancel.cancelled() => anyhow::bail!("fixture snapshot lease cancelled"),
+                _ = release.notified() => {}
+            }
+        }
+        let mut create = |index: usize, slot: ArtifactSlot, directory| {
+            let path = artifacts.0.path(slot.role, slot.key);
+            controller.snapshot_leaf_begin(worker, work, slot)?;
+            leaves[index] = StagedLeaf::Unknown;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            if (index == 0 && matches!(fault, Some(SnapshotFault::FailAfterDiskAttemptNoId)))
+                || (index == 1 && matches!(fault, Some(SnapshotFault::FailAfterVarsAttemptNoId)))
+            {
+                anyhow::bail!("injected snapshot attempt without recorded identity");
+            }
+            let identity = custody::identity(&file, false)?;
+            leaves[index] = StagedLeaf::Identified(identity, directory);
+            controller.snapshot_leaf_identity(worker, work, slot, identity, directory)?;
+            protect_fixture(&path, false)?;
+            Ok::<_, anyhow::Error>((file, identity))
+        };
+        controller.snapshot_checkpoint(worker, work, host(), RESOURCES)?;
+        let directory = work.active.pair.1[0].directory;
+        let (disk, disk_identity) = create(0, slots.disk, directory)?;
+        if matches!(fault, Some(SnapshotFault::FailAfterDiskIdentified)) {
+            anyhow::bail!("injected snapshot fail after disk identified");
+        }
+        if matches!(fault, Some(SnapshotFault::OrphanPanicAfterDiskOnly)) {
+            panic!("injected snapshot orphan panic after disk identified");
+        }
+        let (vars, vars_identity) = create(1, slots.vars, directory)?;
+        if matches!(fault, Some(SnapshotFault::OrphanPanicAfterIdentified)) {
+            panic!("injected snapshot orphan panic after both leaves identified");
+        }
+        if let Some((entered, release)) = hold {
+            entered.notify_one();
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => anyhow::bail!("fixture snapshot cancelled"),
+                _ = vm_cancel.cancelled() => anyhow::bail!("fixture snapshot lease cancelled"),
+                _ = release.notified() => {}
+            }
+        }
+        let mut custody = FixtureCopy {
+            controller,
+            work,
+            host,
+            staging_disk_path: plan.destination_paths()[0].clone(),
+            active,
+            source,
+            golden,
+            staging: [disk, vars],
+        };
+        let cancelled = || cancel.is_cancelled() || vm_cancel.is_cancelled();
+        let mut copied = snapshot::copy_pair(
+            &plan,
+            worker,
+            &mut custody,
+            [disk_identity, vars_identity],
+            &cancelled,
+        )
+        .map_err(|reason| anyhow::anyhow!("fixture snapshot copy: {reason:?}"))?;
+        let [disk, vars] =
+            [&copied.pair().disk, &copied.pair().vars].map(|leaf| ArtifactEvidence {
+                identity: leaf.identity,
+                pin: leaf.pin,
+                directory,
+            });
+        controller.snapshot_leaf_complete(worker, work, slots.disk, disk)?;
+        controller.snapshot_leaf_complete(worker, work, slots.vars, vars)?;
+        copied
+            .recheck()
+            .map_err(|reason| anyhow::anyhow!("fixture snapshot recheck: {reason:?}"))?;
+        if matches!(fault, Some(SnapshotFault::FailAfterFlushBeforeCommit)) {
+            anyhow::bail!("injected snapshot fail after flush before commit");
+        }
+        let final_host = (custody.host)();
+        controller.finish_snapshot_copy(
+            worker,
+            work,
+            [disk, vars],
+            route,
+            final_host,
+            RESOURCES,
+        )?;
+        Ok((slots, [disk, vars]))
+    }
+
     /// The fixture's teardown authority for the 4c2b reaper. Release is
     /// offline only when no fixture boot or worker holds the subject.
     #[derive(Clone)]
     pub(super) struct FixtureReaper {
+        after_selection: Arc<Mutex<Option<StallHook>>>,
         live: Arc<Mutex<Live>>,
+        live_changed: Arc<std::sync::Condvar>,
+        handle: tokio::runtime::Handle,
         pub(super) custody: Arc<FixtureCustody>,
     }
 
     impl runtime::ReaperRuntime for FixtureReaper {
-        fn quiesce(&self, work: &CleanupWork, _: Instant) -> runtime::Quiesced {
-            let live = self.live.lock().unwrap();
-            match work.kind.vm() {
-                Some(vm) if live.boots.contains_key(&vm) || live.working.contains(&vm) => {
+        fn quiesce(&self, work: &CleanupWork, deadline: Instant) -> runtime::Quiesced {
+            let stall = self.after_selection.lock().unwrap().take();
+            let _completed = stall.map(StallHook::enter);
+            let mut live = self.live.lock().unwrap();
+            let Some(vm) = work.kind.vm() else {
+                return runtime::Quiesced::Offline;
+            };
+            if live.release_pending.contains(&vm) {
+                return runtime::Quiesced::Unconfirmed;
+            }
+            if live.working.contains(&vm) {
+                if matches!(work.kind, crate::vm::reaper::CleanupKind::Expiry { .. })
+                    && let Some(cancel) = live.snapshot_cancels.get(&vm)
+                {
+                    cancel.cancel();
+                    let wait_until = deadline.min(Instant::now() + Duration::from_millis(500));
+                    while live.working.contains(&vm) {
+                        let Some(remaining) = wait_until.checked_duration_since(Instant::now())
+                        else {
+                            break;
+                        };
+                        let (guard, timeout) =
+                            self.live_changed.wait_timeout(live, remaining).unwrap();
+                        live = guard;
+                        if timeout.timed_out() {
+                            break;
+                        }
+                    }
+                }
+                if live.working.contains(&vm) {
+                    return runtime::Quiesced::Unconfirmed;
+                }
+            }
+            if live.boots.contains_key(&vm) {
+                if matches!(work.kind, crate::vm::reaper::CleanupKind::Expiry { .. }) {
+                    runtime::Quiesced::OwnedTestJob
+                } else {
                     runtime::Quiesced::Unconfirmed
                 }
-                _ => runtime::Quiesced::Offline,
+            } else {
+                runtime::Quiesced::Offline
             }
         }
 
-        fn graceful_stop(&self, _: &CleanupWork, _: Instant) -> runtime::StopDisposition {
-            runtime::StopDisposition::ChargedQuarantine
+        fn graceful_stop(&self, work: &CleanupWork, deadline: Instant) -> runtime::StopDisposition {
+            let Some(vm) = work.kind.vm() else {
+                return runtime::StopDisposition::ChargedQuarantine;
+            };
+            let boot = {
+                let mut live = self.live.lock().unwrap();
+                if live.force_reap_only.contains(&vm)
+                    || live.stuck.contains(&vm)
+                    || live.release_pending.contains(&vm)
+                {
+                    return runtime::StopDisposition::ChargedQuarantine;
+                }
+                match live.boots.remove(&vm) {
+                    Some(Slot::Idle(boot)) => {
+                        live.release_pending.insert(vm);
+                        Some(*boot)
+                    }
+                    Some(slot) => {
+                        live.boots.insert(vm, slot);
+                        return runtime::StopDisposition::ChargedQuarantine;
+                    }
+                    None => None,
+                }
+            };
+            let Some(boot) = boot else {
+                return runtime::StopDisposition::CleanRelease;
+            };
+            let timeout = tokio::time::Instant::from_std(deadline);
+            match self
+                .handle
+                .block_on(tokio::time::timeout_at(timeout, boot.stop()))
+            {
+                Ok(Ok(())) => {
+                    self.live.lock().unwrap().release_pending.remove(&vm);
+                    runtime::StopDisposition::CleanRelease
+                }
+                _ => runtime::StopDisposition::ChargedQuarantine,
+            }
         }
 
-        fn force_reap(&self, _: &CleanupWork, _: Instant) -> runtime::StopDisposition {
-            runtime::StopDisposition::ChargedQuarantine
+        fn force_reap(&self, work: &CleanupWork, deadline: Instant) -> runtime::StopDisposition {
+            let crate::vm::reaper::CleanupKind::Expiry { vm, .. } = work.kind else {
+                return runtime::StopDisposition::ChargedQuarantine;
+            };
+            let boot = {
+                let mut live = self.live.lock().unwrap();
+                if live.stuck.contains(&vm) || live.release_pending.contains(&vm) {
+                    return runtime::StopDisposition::ChargedQuarantine;
+                }
+                match live.boots.remove(&vm) {
+                    Some(Slot::Idle(boot)) => {
+                        live.release_pending.insert(vm);
+                        Some(*boot)
+                    }
+                    Some(slot) => {
+                        live.boots.insert(vm, slot);
+                        return runtime::StopDisposition::ChargedQuarantine;
+                    }
+                    None => None,
+                }
+            };
+            let Some(boot) = boot else {
+                return runtime::StopDisposition::DirtyRelease;
+            };
+            let timeout = tokio::time::Instant::from_std(deadline);
+            match self
+                .handle
+                .block_on(tokio::time::timeout_at(timeout, boot.force_release()))
+            {
+                Ok(Ok(())) => {
+                    self.live.lock().unwrap().release_pending.remove(&vm);
+                    runtime::StopDisposition::DirtyRelease
+                }
+                _ => runtime::StopDisposition::ChargedQuarantine,
+            }
         }
 
         fn static_released(&self, vm: Id, _: Id, _: Instant) -> bool {
             let live = self.live.lock().unwrap();
-            !live.boots.contains_key(&vm)
+            !live.release_pending.contains(&vm)
+                && !live.boots.contains_key(&vm)
                 && !live.working.contains(&vm)
                 && !live.stuck.contains(&vm)
         }
@@ -2555,8 +3339,31 @@ mod tests {
         boots: HashMap<Id, Slot>,
         /// VMs with a registered, not yet joined fixture worker.
         working: HashSet<Id>,
+        /// Per-VM scoped cancellation tokens for live snapshot copy workers.
+        snapshot_cancels: HashMap<Id, Shutdown>,
         /// Static VMs whose boot release this fixture refuses to prove.
         stuck: HashSet<Id>,
+        /// VMs whose next stop simulates a failed graceful powerdown followed
+        /// by safe force-release (typed dirty disposition).
+        dirty_stop: HashSet<Id>,
+        /// A removed Boot remains charged until its peer and guest joins succeed.
+        /// A timeout or failed join leaves the fixture unable to prove release.
+        release_pending: HashSet<Id>,
+        /// TEST VMs whose expiry graceful stop fails so force-reap must run.
+        force_reap_only: HashSet<Id>,
+    }
+
+    /// Injected snapshot copy faults, consumed by the next snapshot copy.
+    #[derive(Clone, Copy)]
+    pub(super) enum SnapshotFault {
+        FailBeforeCreate,
+        FailAfterDiskIdentified,
+        FailAfterDiskAttemptNoId,
+        FailAfterVarsAttemptNoId,
+        FailAfterFlushBeforeCommit,
+        OrphanPanicAfterIdentified,
+        OrphanPanicAfterDiskOnly,
+        HoldBeforeCreate,
     }
 
     /// Injected static copy faults, consumed by the next static create.
@@ -2575,21 +3382,32 @@ mod tests {
 
     pub(super) struct Fixture {
         jobs: JoinSet<Result<()>>,
+        snapshot_jobs: JoinSet<Result<()>>,
         live: Arc<Mutex<Live>>,
+        live_changed: Arc<std::sync::Condvar>,
+        handle: tokio::runtime::Handle,
+        origins: Arc<Mutex<HashMap<Id, Arc<FixtureOrigin>>>>,
         artifacts: Artifacts,
         build_hold: Option<Arc<Notify>>,
         script_hold: Option<Arc<Notify>>,
         static_hold: Option<Arc<Notify>>,
         static_fault: Option<StaticFault>,
         windows_recipe: bool,
+        pub(super) snapshot_test_media: bool,
         host: HostObservation,
+        pub(super) host_observer: Option<Arc<dyn Fn() -> HostObservation + Send + Sync>>,
+        pub(super) snapshot_hold: Option<(Arc<Notify>, Arc<Notify>)>,
+        pub(super) snapshot_fault: Option<SnapshotFault>,
+        pub(super) skip_restore_map_update: bool,
         /// A cancelled build worker reports failure, to witness drain errors.
         fail_cancelled: bool,
         failed: bool,
+        snapshot_worker_failed: bool,
     }
 
     pub(super) struct FixtureDrain {
         jobs: JoinSet<Result<()>>,
+        snapshot_jobs: JoinSet<Result<()>>,
         live: Arc<Mutex<Live>>,
         failed: bool,
     }
@@ -2599,36 +3417,56 @@ mod tests {
             while let Some(result) = self.jobs.join_next().await {
                 self.failed |= !matches!(result, Ok(Ok(())));
             }
+            while let Some(result) = self.snapshot_jobs.join_next().await {
+                self.failed |= !matches!(result, Ok(Ok(())));
+            }
             ensure!(!self.failed, "fixture job failed");
             Ok(self)
         }
 
         /// Release idle boots once every worker holding a slot is joined.
         pub(super) async fn release(self) -> Result<()> {
-            let boots = std::mem::take(&mut self.live.lock().unwrap().boots);
+            let (boots, release_pending) = {
+                let mut live = self.live.lock().unwrap();
+                (
+                    std::mem::take(&mut live.boots),
+                    !live.release_pending.is_empty(),
+                )
+            };
             for slot in boots.into_values() {
                 if let Slot::Idle(boot) = slot {
                     (*boot).release().await?;
                 }
             }
+            ensure!(!release_pending, "fixture boot release unconfirmed");
             Ok(())
         }
     }
 
     impl Fixture {
-        fn new(root: &Path) -> Self {
+        fn new(root: &Path, origins: Arc<Mutex<HashMap<Id, Arc<FixtureOrigin>>>>) -> Self {
             Self {
                 jobs: JoinSet::new(),
+                snapshot_jobs: JoinSet::new(),
                 live: Arc::new(Mutex::new(Live::default())),
+                live_changed: Arc::new(std::sync::Condvar::new()),
+                handle: tokio::runtime::Handle::current(),
+                origins,
                 artifacts: Artifacts(Arc::new(FixtureCustody::open(root).unwrap())),
                 build_hold: None,
                 script_hold: None,
                 static_hold: None,
                 static_fault: None,
                 windows_recipe: false,
+                snapshot_test_media: false,
                 host: HOST,
+                host_observer: None,
+                snapshot_hold: None,
+                snapshot_fault: None,
+                skip_restore_map_update: false,
                 fail_cancelled: false,
                 failed: false,
+                snapshot_worker_failed: false,
             }
         }
 
@@ -2655,7 +3493,10 @@ mod tests {
 
         pub(super) fn reaper(&self) -> FixtureReaper {
             FixtureReaper {
+                after_selection: Default::default(),
                 live: self.live.clone(),
+                live_changed: self.live_changed.clone(),
+                handle: self.handle.clone(),
                 custody: self.artifacts.0.clone(),
             }
         }
@@ -2664,14 +3505,129 @@ mod tests {
             while let Some(result) = self.jobs.try_join_next() {
                 self.failed |= !matches!(result, Ok(Ok(())));
             }
+            // Snapshot worker failures or panics are preserved for shutdown
+            // evidence, while leaving same-process foreground SDK available
+            // once the reaper reconciles the orphaned durable intent.
+            while let Some(result) = self.snapshot_jobs.try_join_next() {
+                self.snapshot_worker_failed |= !matches!(result, Ok(Ok(())));
+            }
         }
 
         pub(super) fn take_jobs(&mut self) -> FixtureDrain {
             FixtureDrain {
                 jobs: std::mem::take(&mut self.jobs),
+                snapshot_jobs: std::mem::take(&mut self.snapshot_jobs),
                 live: self.live.clone(),
-                failed: self.failed,
+                failed: self.failed || self.snapshot_worker_failed,
             }
+        }
+
+        pub(super) fn snapshot(
+            &mut self,
+            inventory: &VmInventory,
+            action: i64,
+            mutation: Mutation,
+            mut route: Option<runtime::publication::SnapshotRoute>,
+        ) -> Outcome<Value> {
+            self.reap();
+            let Mutation {
+                key,
+                id: vm,
+                work: Work::Snapshot(request),
+            } = mutation
+            else {
+                unreachable!("snapshot mutation");
+            };
+            if self.failed {
+                return Err(STATE_UNAVAILABLE);
+            }
+            let controller = &inventory.supervisor.controller;
+            let mut registry = self.live.lock().unwrap();
+            if registry.release_pending.contains(&vm)
+                || registry.working.contains(&vm)
+                || registry.boots.contains_key(&vm)
+            {
+                return inventory.refuse(action, Some(vm), Refusal::SnapshotOfflineRequired.into());
+            }
+            if let Some(route) = route.as_mut()
+                && let Some((generation, epoch)) = controller.active_release_epoch(vm, true)?
+            {
+                // Independent local-origin release proof: no fixture boot or
+                // live origin listener exists for this exact generation/epoch.
+                route.bind_origin_release(generation, epoch);
+            }
+            let (work, worker, operation) = match controller.admit_snapshot(
+                &inventory.principal,
+                key,
+                vm,
+                action,
+                &request,
+                route.as_ref(),
+                self.host,
+                RESOURCES,
+            )? {
+                Ok(work) => work,
+                Err(reason) => return inventory.refuse(action, Some(vm), reason.into()),
+            };
+            if work.candidate.is_none() {
+                let reaper = self.reaper();
+                drop(registry);
+                let controller = controller.clone();
+                self.snapshot_jobs.spawn(async move {
+                    // Transient SQL settlement failures keep claims armed for
+                    // the periodic reaper to retry after backoff.
+                    let _ = controller.sweep_with(&reaper, &*reaper.custody);
+                    Ok(())
+                });
+            } else {
+                let artifacts = self.artifacts.clone();
+                let cancel = inventory.supervisor.cancel.clone();
+                let vm_cancel = Shutdown::default();
+                let controller = controller.clone();
+                registry.working.insert(vm);
+                registry.snapshot_cancels.insert(vm, vm_cancel.clone());
+                let working = Working(self.live.clone(), self.live_changed.clone(), vm);
+                let host = self.host;
+                let host_observer = self
+                    .host_observer
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(move || host));
+                let hold = self.snapshot_hold.take();
+                let fault = self.snapshot_fault.take();
+                let skip_map_update = self.skip_restore_map_update;
+                self.snapshot_jobs.spawn(async move {
+                    let _working = working;
+                    let copied = copy_fixture_snapshot(
+                        &artifacts,
+                        &controller,
+                        &work,
+                        &worker,
+                        route.as_ref(),
+                        host_observer,
+                        hold,
+                        fault,
+                        &cancel,
+                        &vm_cancel,
+                    )
+                    .await;
+                    match copied {
+                        Ok(pair) if work.action == 6 && !skip_map_update => {
+                            let mut live = _working.0.lock().unwrap();
+                            if work.is_static {
+                                if let Some((current, _)) = live.static_instances.get_mut(&vm) {
+                                    *current = pair;
+                                }
+                            } else {
+                                live.instances.insert(vm, pair);
+                            }
+                        }
+                        Err(leaves) => controller.fail_snapshot_copy(&worker, &work, leaves)?,
+                        _ => {}
+                    }
+                    Ok(())
+                });
+            }
+            Ok(receipt(operation.id, None))
         }
 
         pub(super) fn admit(
@@ -2706,15 +3662,23 @@ mod tests {
             let live = self.live.clone();
             let artifacts = self.artifacts.clone();
             let mut registry = self.live.lock().unwrap();
+            if registry.release_pending.contains(&id) {
+                return inventory.refuse(action, Some(id), Refusal::CleanupUnconfirmed.into());
+            }
             let (operation, vm) = match work {
                 Work::Build => {
                     let recipe = hex::encode(id);
                     let web = id == WEB_RECIPE_ID;
                     let windows = id == Controller::windows_recipe_id();
+                    let snapshot_image = self.snapshot_test_media;
                     let (retained, transient) = if web {
                         (WEB_RETAINED, WEB_TRANSIENT)
+                    } else if windows && snapshot_image {
+                        (WEB_RETAINED, WINDOWS_TRANSIENT)
                     } else if windows {
                         (RETAINED, WINDOWS_TRANSIENT)
+                    } else if snapshot_image {
+                        (WEB_RETAINED, WEB_TRANSIENT)
                     } else {
                         (RETAINED, TRANSIENT)
                     };
@@ -2770,7 +3734,13 @@ mod tests {
                             let sealed = controller.finish_windows_fixture_build(
                                 spec,
                                 (slots, worker, reference),
-                                &|slot, bytes| artifacts.stage(slot, bytes),
+                                &|slot, bytes| {
+                                    if snapshot_image && slot == slots.pair.disk {
+                                        artifacts.stage(slot, &fixture_qcow2())
+                                    } else {
+                                        artifacts.stage(slot, bytes)
+                                    }
+                                },
                                 &|slot, proof| artifacts.verify(slot, proof),
                                 &|slot, proof| artifacts.remove(slot, proof),
                             )?;
@@ -2786,7 +3756,7 @@ mod tests {
                         ];
                         let mut proof = Vec::new();
                         for slot in [disk, vars, seed, overlay, verify_vars] {
-                            let file = if web && slot == disk {
+                            let file = if (web || snapshot_image) && slot == disk {
                                 artifacts.stage(slot, &fixture_qcow2())?
                             } else {
                                 artifacts.write(slot)?
@@ -2852,6 +3822,7 @@ mod tests {
                     };
                     let hold = self.static_hold.take();
                     let fault = self.static_fault.take();
+                    let origins = self.origins.clone();
                     self.jobs.spawn(async move {
                         let copied = if released(hold, &cancel).await {
                             copy_and_provision(&artifacts, (golden, proof), slots, fault, &cancel)
@@ -2869,9 +3840,14 @@ mod tests {
                         if status == Status::Succeeded
                             && let Ok((pair, origin)) = copied
                         {
+                            let origin = Arc::new(origin);
+                            origins
+                                .lock()
+                                .unwrap()
+                                .insert(slots.disk.generation, origin.clone());
                             registry
                                 .static_instances
-                                .insert(vm, ((slots, pair), Arc::new(origin)));
+                                .insert(vm, ((slots, pair), origin));
                         }
                         Ok(())
                     });
@@ -2886,11 +3862,16 @@ mod tests {
                         .ok_or(STATE_UNAVAILABLE)?;
                     artifacts.verify(golden.disk, proof[0])?;
                     artifacts.verify(golden.vars, proof[1])?;
+                    let snapshot_image = self.snapshot_test_media;
                     let request = Request {
                         principal,
                         request_id: key,
                         vm: [0; 16],
-                        disk: RETAINED,
+                        disk: if snapshot_image {
+                            WEB_RETAINED
+                        } else {
+                            RETAINED
+                        },
                         operation: Operation::Clone {
                             template: id,
                             lease_seconds: Some(ttl),
@@ -2915,7 +3896,12 @@ mod tests {
                         .operation_status(principal, reference.id)??
                         .expires_at_ms;
                     self.jobs.spawn(async move {
-                        let pair = [artifacts.write(slots.disk)?, artifacts.write(slots.vars)?];
+                        let disk = if snapshot_image {
+                            artifacts.stage(slots.disk, &fixture_snapshot_overlay(golden.disk))?
+                        } else {
+                            artifacts.write(slots.disk)?
+                        };
+                        let pair = [disk, artifacts.write(slots.vars)?];
                         let mut registry = live.lock().unwrap();
                         ensure!(
                             controller.finish_linked_clone(&worker, slots, Some(pair))?
@@ -2934,8 +3920,8 @@ mod tests {
                         .ok_or(STATE_UNAVAILABLE)?;
                     return Ok(receipt(replay.operation.id, Some(end)));
                 }
-                Work::Publish | Work::Unpublish => {
-                    unreachable!("publication has separate admission")
+                Work::Publish | Work::Unpublish | Work::Snapshot(_) => {
+                    unreachable!("separate mutation admission")
                 }
                 Work::Start => (Operation::Start, id),
                 Work::Stop => (Operation::Stop, id),
@@ -2954,25 +3940,58 @@ mod tests {
                 operation,
                 disk: DiskClaim::default(),
             };
-            if matches!(work, Work::Start)
-                && !registry.static_instances.contains_key(&vm)
-                && !controller
+            if matches!(work, Work::Start) {
+                if !controller
                     .foreground_static_rows(principal, Some(vm), None, 1)?
                     .is_empty()
-            {
-                // Rehydrate the committed pair from durable custody records;
-                // the boot re-verifies both files before launch. The fixture
-                // origin key is in memory only, so a fresh one is issued
-                // for the same generation name.
-                match controller.static_custody(principal, vm)? {
-                    Some(pair) => {
-                        let origin = FixtureOrigin::new(pair.0.disk.generation)
-                            .map_err(|_| STATE_UNAVAILABLE)?;
-                        registry
-                            .static_instances
-                            .insert(vm, (pair, Arc::new(origin)));
+                {
+                    // Always rehydrate the committed pair from durable custody
+                    // records, preserving host-side FixtureOrigin trust when
+                    // already loaded in this process.
+                    match controller.static_custody(principal, vm)? {
+                        Some((slots, evidence, origin_generation)) => {
+                            let origin = registry
+                                .static_instances
+                                .get(&vm)
+                                .filter(|(_, existing)| existing.generation == origin_generation)
+                                .map(|(_, existing)| existing.clone())
+                                .or_else(|| {
+                                    self.origins
+                                        .lock()
+                                        .unwrap()
+                                        .get(&origin_generation)
+                                        .cloned()
+                                })
+                                .map(Ok)
+                                .unwrap_or_else(|| {
+                                    let origin = Arc::new(FixtureOrigin::new(origin_generation)?);
+                                    self.origins
+                                        .lock()
+                                        .unwrap()
+                                        .insert(origin_generation, origin.clone());
+                                    Ok::<_, anyhow::Error>(origin)
+                                })
+                                .map_err(|_| STATE_UNAVAILABLE)?;
+                            registry
+                                .static_instances
+                                .insert(vm, ((slots, evidence), origin));
+                        }
+                        None => {
+                            return inventory.refuse(action, Some(vm), Refusal::NotReady.into());
+                        }
                     }
-                    None => return inventory.refuse(action, Some(vm), Refusal::NotReady.into()),
+                } else if controller.has_test_generation(principal, vm)? {
+                    // Always rehydrate the committed TEST pair from durable
+                    // custody records so reopen or crash-after-commit never
+                    // bypasses paired file verification before boot.
+                    match controller.test_custody(principal, vm)? {
+                        Some(pair) => {
+                            registry.instances.insert(vm, pair);
+                        }
+                        None => {
+                            return inventory.refuse(action, Some(vm), Refusal::NotReady.into());
+                        }
+                    }
                 }
             }
             let mut worker = match controller.admit(request, self.host, RESOURCES)? {
@@ -2986,24 +4005,39 @@ mod tests {
                 Admission::Refused(reason) => return Err(reason.into()),
             };
             let activity = worker.activity_id();
+            let operation_id = controller.foreground_operation_ref(principal, activity)?;
             // Registered synchronously with the committed admission; the
             // guard leaves the reaper's offline proof closed until joined.
             registry.working.insert(vm);
-            let working = Working(live.clone(), vm);
+            let working = Working(live.clone(), self.live_changed.clone(), vm);
             match work {
                 Work::Start => {
                     let controller = controller.clone();
                     let static_pair = registry.static_instances.get(&vm).cloned();
+                    let test_pair = registry.instances.get(&vm).copied();
+                    let writer_epoch = operation_id;
                     self.jobs.spawn(async move {
                         let _working = working;
                         let boot = match static_pair {
                             Some((pair, identity)) => {
                                 Boot::start_static(&artifacts, pair, &identity, &cancel).await
                             }
-                            None => Boot::start(&cancel).await,
+                            None => {
+                                let verified = test_pair
+                                    .map(|(slots, [disk, vars])| {
+                                        artifacts.verify(slots.disk, disk)?;
+                                        artifacts.verify(slots.vars, vars)
+                                    })
+                                    .transpose();
+                                match verified {
+                                    Ok(_) => Boot::start(&cancel).await,
+                                    Err(error) => Err(error),
+                                }
+                            }
                         };
                         match boot {
-                            Ok(boot) => {
+                            Ok(mut boot) => {
+                                boot.writer_epoch = writer_epoch;
                                 // Publish ready only if this worker's settlement
                                 // won; a worker that lost to expiry or shutdown
                                 // is reaped without a ready boot.
@@ -3038,16 +4072,71 @@ mod tests {
                         Some(Slot::Idle(boot)) => Some(*boot),
                         Some(Slot::Exchanging) | None => None,
                     };
+                    let writer_epoch = boot.as_ref().map(|boot| boot.writer_epoch);
+                    let dirty = registry.dirty_stop.remove(&vm);
                     if let Some(origin) =
                         boot.as_ref().and_then(|boot| boot.publish_origin.as_ref())
                     {
                         origin.retired.retire();
                     }
+                    let pair = registry
+                        .static_instances
+                        .get(&vm)
+                        .map(|(pair, _)| *pair)
+                        .or_else(|| registry.instances.get(&vm).copied());
                     let supervisor = inventory.supervisor.clone();
                     let controller = controller.clone();
                     self.jobs.spawn(async move {
                         let _working = working;
                         let local = supervisor.publisher.stop_local(Some(vm)).await;
+                        if dirty && let Some(boot) = boot {
+                            boot.release().await?;
+                            if local {
+                                match pair.map(|pair| artifacts.released_pair(pair)).transpose() {
+                                    Ok(Some((held, pair))) => {
+                                        let mut live = live.lock().unwrap();
+                                        controller.finish_fixture_stop(
+                                            &worker,
+                                            vm,
+                                            writer_epoch.unwrap_or([0; 16]),
+                                            Some(pair),
+                                            runtime::StopDisposition::DirtyRelease,
+                                        )?;
+                                        if let Some((current, _)) =
+                                            live.static_instances.get_mut(&vm)
+                                        {
+                                            *current = pair;
+                                        } else {
+                                            live.instances.insert(vm, pair);
+                                        }
+                                        drop(held);
+                                    }
+                                    Ok(None) => {
+                                        controller.finish_fixture_stop(
+                                            &worker,
+                                            vm,
+                                            writer_epoch.unwrap_or([0; 16]),
+                                            None,
+                                            runtime::StopDisposition::DirtyRelease,
+                                        )?;
+                                    }
+                                    Err(_) => {
+                                        controller.finish_with_cause(
+                                            &worker,
+                                            Completion::CleanupUnconfirmed,
+                                            Some(FailureReason::DirtyStop),
+                                        )?;
+                                    }
+                                }
+                                return Ok(());
+                            }
+                            controller.finish_with_cause(
+                                &worker,
+                                Completion::CleanupUnconfirmed,
+                                Some(FailureReason::DirtyStop),
+                            )?;
+                            anyhow::bail!("publication stop unconfirmed");
+                        }
                         // A failed powerdown is a known dirty stop; a missing
                         // boot leaves the cause unknown.
                         let (completion, cause) = match boot {
@@ -3060,7 +4149,48 @@ mod tests {
                             },
                             None => (Completion::CleanupUnconfirmed, None),
                         };
-                        controller.finish_with_cause(&worker, completion, cause)?;
+                        if local && completion == Completion::Succeeded {
+                            match pair.map(|pair| artifacts.released_pair(pair)).transpose() {
+                                Ok(Some((held, pair))) => {
+                                    let mut live = live.lock().unwrap();
+                                    if controller.finish_fixture_stop(
+                                        &worker,
+                                        vm,
+                                        writer_epoch.unwrap_or([0; 16]),
+                                        Some(pair),
+                                        runtime::StopDisposition::CleanRelease,
+                                    )? == Status::Succeeded
+                                    {
+                                        if let Some((current, _)) =
+                                            live.static_instances.get_mut(&vm)
+                                        {
+                                            *current = pair;
+                                        } else {
+                                            live.instances.insert(vm, pair);
+                                        }
+                                    }
+                                    drop(held);
+                                }
+                                Ok(None) => {
+                                    controller.finish_fixture_stop(
+                                        &worker,
+                                        vm,
+                                        writer_epoch.unwrap_or([0; 16]),
+                                        None,
+                                        runtime::StopDisposition::CleanRelease,
+                                    )?;
+                                }
+                                Err(_) => {
+                                    controller.finish_with_cause(
+                                        &worker,
+                                        Completion::CleanupUnconfirmed,
+                                        Some(FailureReason::CleanupUnconfirmed),
+                                    )?;
+                                }
+                            }
+                        } else {
+                            controller.finish_with_cause(&worker, completion, cause)?;
+                        }
                         if local {
                             Ok(())
                         } else {
@@ -3236,12 +4366,14 @@ mod tests {
     }
 
     /// Marks a VM as held by a fixture worker until the worker finishes.
-    struct Working(Arc<Mutex<Live>>, Id);
+    struct Working(Arc<Mutex<Live>>, Arc<std::sync::Condvar>, Id);
 
     impl Drop for Working {
         fn drop(&mut self) {
             if let Ok(mut live) = self.0.lock() {
-                live.working.remove(&self.1);
+                live.working.remove(&self.2);
+                live.snapshot_cancels.remove(&self.2);
+                self.1.notify_all();
             }
         }
     }
@@ -3276,13 +4408,17 @@ mod tests {
         guest: JoinHandle<Result<()>>,
         origin: Option<crate::vm::static_web::OriginPortLease>,
         publish_origin: Option<Origin>,
+        writer_epoch: Id,
     }
 
     /// Synthetic guest endpoint and independently configured host trust.
     /// This fixture has no production serial encoder, and never logs key bytes.
     struct FixtureOrigin {
+        generation: Id,
         name: String,
         guest: Arc<rustls::ServerConfig>,
+        expired_guest: Arc<rustls::ServerConfig>,
+        untrusted_guest: Arc<rustls::ServerConfig>,
         client: Arc<rustls::ClientConfig>,
     }
 
@@ -3300,25 +4436,62 @@ mod tests {
             let mut ca = CertificateParams::default();
             ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
             ca.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-            ca.not_before = now - time::Duration::minutes(1);
-            ca.not_after = now + time::Duration::days(1);
+            ca.not_before = now - time::Duration::days(3);
+            ca.not_after = now + time::Duration::days(3);
             let ca_key = KeyPair::generate()?;
             let certificate = ca.self_signed(&ca_key)?;
             let issuer = Issuer::new(ca, ca_key);
-            let mut leaf = CertificateParams::new(vec![name.clone()])?;
-            leaf.not_before = now - time::Duration::minutes(1);
-            leaf.not_after = now + time::Duration::days(1);
-            leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-            let key = KeyPair::generate()?;
-            let cert = leaf.signed_by(&key, &issuer)?;
+            let mut untrusted_ca = CertificateParams::default();
+            untrusted_ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+            untrusted_ca.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+            untrusted_ca.not_before = now - time::Duration::days(3);
+            untrusted_ca.not_after = now + time::Duration::days(3);
+            let untrusted_ca_key = KeyPair::generate()?;
+            let _ = untrusted_ca.self_signed(&untrusted_ca_key)?;
+            let untrusted_issuer = Issuer::new(untrusted_ca, untrusted_ca_key);
             let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let guest = rustls::ServerConfig::builder_with_provider(provider.clone())
-                .with_safe_default_protocol_versions()?
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![cert.der().clone()],
-                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-                )?;
+            let sign_leaf = |not_before,
+                             not_after,
+                             cert: rcgen::Certificate,
+                             key: KeyPair|
+             -> Result<Arc<rustls::ServerConfig>> {
+                let _ = (not_before, not_after);
+                Ok(Arc::new(
+                    rustls::ServerConfig::builder_with_provider(provider.clone())
+                        .with_safe_default_protocol_versions()?
+                        .with_no_client_auth()
+                        .with_single_cert(
+                            vec![cert.der().clone()],
+                            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+                        )?,
+                ))
+            };
+            let make_leaf = |not_before, not_after| -> Result<CertificateParams> {
+                let mut leaf = CertificateParams::new(vec![name.clone()])?;
+                leaf.not_before = not_before;
+                leaf.not_after = not_after;
+                leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+                Ok(leaf)
+            };
+            let key = KeyPair::generate()?;
+            let cert = make_leaf(
+                now - time::Duration::minutes(1),
+                now + time::Duration::days(1),
+            )?
+            .signed_by(&key, &issuer)?;
+            let guest = sign_leaf((), (), cert, key)?;
+            let expired_key = KeyPair::generate()?;
+            let expired_cert =
+                make_leaf(now - time::Duration::days(2), now - time::Duration::days(1))?
+                    .signed_by(&expired_key, &issuer)?;
+            let expired_guest = sign_leaf((), (), expired_cert, expired_key)?;
+            let untrusted_key = KeyPair::generate()?;
+            let untrusted_cert = make_leaf(
+                now - time::Duration::minutes(1),
+                now + time::Duration::days(1),
+            )?
+            .signed_by(&untrusted_key, &untrusted_issuer)?;
+            let untrusted_guest = sign_leaf((), (), untrusted_cert, untrusted_key)?;
             let mut roots = rustls::RootCertStore::empty();
             roots.add(certificate.der().clone())?;
             let client = rustls::ClientConfig::builder_with_provider(provider)
@@ -3326,8 +4499,11 @@ mod tests {
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             Ok(Self {
+                generation,
                 name,
-                guest: Arc::new(guest),
+                guest,
+                expired_guest,
+                untrusted_guest,
                 client: Arc::new(client),
             })
         }
@@ -3337,9 +4513,18 @@ mod tests {
             lease: &crate::vm::static_web::OriginPortLease,
             expected: String,
         ) -> Result<()> {
+            self.probe_with(lease, expected, self.guest.clone()).await
+        }
+
+        async fn probe_with(
+            &self,
+            lease: &crate::vm::static_web::OriginPortLease,
+            expected: String,
+            guest_config: Arc<rustls::ServerConfig>,
+        ) -> Result<()> {
             let listener = tokio::net::TcpListener::from_std(lease.fixture_listener()?)?;
             let address = listener.local_addr()?;
-            let tls = tokio_rustls::TlsAcceptor::from(self.guest.clone());
+            let tls = tokio_rustls::TlsAcceptor::from(guest_config);
             let connector = tokio_rustls::TlsConnector::from(self.client.clone());
             const REQUEST: &[u8] =
                 b"GET /arx-health HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n";
@@ -3370,6 +4555,8 @@ mod tests {
         }
     }
 
+    const FIXTURE_CERT_MARKER_OFFSET: u64 = 4097;
+
     impl Boot {
         async fn start_static(
             artifacts: &Artifacts,
@@ -3377,14 +4564,31 @@ mod tests {
             identity: &FixtureOrigin,
             cancel: &Shutdown,
         ) -> Result<Self> {
-            for (slot, proof) in [(slots.disk, disk), (slots.vars, vars)] {
-                artifacts.verify(slot, proof)?;
-            }
+            use std::io::{Read, Seek, SeekFrom};
+            let mut held_disk = artifacts.hold(slots.disk, disk, false)?;
+            let held_vars = artifacts.hold(slots.vars, vars, false)?;
+            let cert_marker = if disk.pin.size > FIXTURE_CERT_MARKER_OFFSET {
+                held_disk
+                    .file
+                    .seek(SeekFrom::Start(FIXTURE_CERT_MARKER_OFFSET))?;
+                let mut byte = [0u8; 1];
+                held_disk.file.read_exact(&mut byte)?;
+                byte[0]
+            } else {
+                0
+            };
+            drop(held_disk);
+            drop(held_vars);
+            let guest_config = match cert_marker {
+                b'E' => identity.expired_guest.clone(),
+                b'U' => identity.untrusted_guest.clone(),
+                _ => identity.guest.clone(),
+            };
             let origin = crate::vm::static_web::OriginPortLease::acquire()?;
             ensure!(origin.verify(), "static origin listener mismatch");
             let mut boot = Self::start(cancel).await?;
             if identity
-                .probe(&origin, identity.name.clone())
+                .probe_with(&origin, identity.name.clone(), guest_config)
                 .await
                 .is_err()
             {
@@ -3393,6 +4597,7 @@ mod tests {
             }
             boot.publish_origin = Some(Origin {
                 generation: slots.disk.generation,
+                origin_generation: identity.generation,
                 boot: crate::store::vm::new_id()?,
                 port: origin.port().try_into()?,
                 ca_path: artifacts.0.path("origin_ca", slots.disk.generation),
@@ -3466,6 +4671,7 @@ mod tests {
                     guest,
                     origin: None,
                     publish_origin: None,
+                    writer_epoch: [0; 16],
                 }),
                 Err(_) => {
                     peer.await??;
@@ -3473,6 +4679,19 @@ mod tests {
                     anyhow::bail!("fixture boot unconfirmed")
                 }
             }
+        }
+
+        async fn force_release(self) -> Result<()> {
+            if let Some(origin) = &self.publish_origin {
+                origin.retired.retire();
+            }
+            self.peer.abort();
+            self.guest.abort();
+            drop(self.qmp);
+            drop(self.channel);
+            let _ = self.peer.await;
+            let _ = self.guest.await;
+            Ok(())
         }
 
         async fn release(self) -> Result<()> {
@@ -3620,10 +4839,18 @@ mod tests {
         }
     }
 
+    type HarnessState = (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<AtomicI64>,
+        Arc<Mutex<HashMap<Id, Arc<FixtureOrigin>>>>,
+    );
+
     struct Harness {
         temp: tempfile::TempDir,
         media: std::path::PathBuf,
         now: Arc<AtomicI64>,
+        origins: Arc<Mutex<HashMap<Id, Arc<FixtureOrigin>>>>,
         supervisor: Option<Arc<Supervisor>>,
         endpoint: Endpoint,
         tokens: [String; 2],
@@ -3659,8 +4886,9 @@ mod tests {
             fs::create_dir(&media).unwrap();
             protect_fixture(&media, true).unwrap();
             let now = Arc::new(AtomicI64::new(UTC));
+            let origins = Arc::new(Mutex::new(HashMap::new()));
             Self::launch(
-                (temp, media, now),
+                (temp, media, now, origins),
                 fail_cancelled,
                 interrupt_on_fatal_accept,
                 web,
@@ -3672,7 +4900,7 @@ mod tests {
         /// Open a supervisor, fixture and server over existing state and
         /// fixture media, as a fresh foreground process would.
         async fn launch(
-            (temp, media, now): (tempfile::TempDir, std::path::PathBuf, Arc<AtomicI64>),
+            (temp, media, now, origins): HarnessState,
             fail_cancelled: bool,
             interrupt_on_fatal_accept: bool,
             web: bool,
@@ -3695,7 +4923,7 @@ mod tests {
             }
             let hold_build = Arc::new(Notify::new());
             let hold_script = Arc::new(Notify::new());
-            let mut fixture = Fixture::new(&media);
+            let mut fixture = Fixture::new(&media, origins.clone());
             fixture.build_hold = Some(hold_build.clone());
             fixture.script_hold = Some(hold_script.clone());
             fixture.fail_cancelled = fail_cancelled;
@@ -3760,6 +4988,7 @@ mod tests {
                 temp,
                 media,
                 now,
+                origins,
                 supervisor: Some(supervisor),
                 endpoint,
                 tokens,
@@ -3776,6 +5005,16 @@ mod tests {
             self.supervisor.as_ref().unwrap()
         }
 
+        /// Run one synchronous reaper sweep on the blocking pool so workers and
+        /// boot tasks on a current-thread test runtime can make progress.
+        async fn sweep(&self) {
+            let supervisor = self.supervisor().clone();
+            tokio::task::spawn_blocking(move || supervisor.sweep())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
         /// Interrupt the server and return its drain and recovery result.
         /// Callers drop their clients first.
         async fn shutdown(&mut self) -> Result<()> {
@@ -3789,7 +5028,7 @@ mod tests {
         async fn reopen(self, configure: impl FnOnce(&mut Fixture)) -> Self {
             assert!(self.server.is_none(), "shut down before reopening");
             Self::launch(
-                (self.temp, self.media, self.now),
+                (self.temp, self.media, self.now, self.origins),
                 false,
                 false,
                 true,
@@ -4096,6 +5335,2661 @@ mod tests {
                 "static_delete_forbidden"
             );
         }
+        h.shutdown().await.unwrap();
+    }
+
+    fn fixture_pair_paths(h: &Harness, vm: &Value, active: bool) -> [std::path::PathBuf; 2] {
+        let vm = parse_id(vm.as_str().unwrap()).unwrap();
+        h.supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                let mut query = db.prepare(
+                    "SELECT a.role,a.object_key FROM vm_generations g
+                 JOIN vm_artifacts a ON a.generation_id=g.id
+                 WHERE (g.vm_id=?1 OR g.static_id=?1) AND g.active=?2
+                    AND a.state=CASE WHEN ?2 THEN 'active' ELSE 'pending_disposal' END
+                 ORDER BY role LIMIT 3",
+                )?;
+                let files = query
+                    .query_map(rusqlite::params![vm, active], |row| {
+                        Ok(h.media.join(format!(
+                            "{}-{}",
+                            row.get::<_, String>(0)?,
+                            hex::encode(row.get::<_, Id>(1)?)
+                        )))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(files.try_into().expect("exact fixture pair"))
+            })
+            .unwrap()
+    }
+
+    fn simulate_pair_write(paths: &[std::path::PathBuf; 2]) -> [Vec<u8>; 2] {
+        use std::io::{Seek, SeekFrom, Write};
+        let saved = paths.each_ref().map(|path| fs::read(path).unwrap());
+        for (path, offset, marker) in [(&paths[0], 4096, b'D'), (&paths[1], 0, b'V')] {
+            let mut writer = fs::OpenOptions::new().write(true).open(path).unwrap();
+            writer.seek(SeekFrom::Start(offset)).unwrap();
+            writer.write_all(&[marker]).unwrap();
+            writer.sync_all().unwrap();
+        }
+        saved
+    }
+
+    #[tokio::test]
+    async fn static_snapshot_keeps_origin_and_refuses_a_durable_b2_route() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let b = h.client(1).await;
+        let (vm, fake) = enrolled(&h, &a, 1800).await;
+        let args = |nonce| json!({"vm_id":vm,"request_id":key(nonce)});
+        let published = call(&a, "publish_site", args(1803)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let capture = json!({"vm_id":vm,"request_id":key(1804),"name":"Before-Update"});
+        assert_eq!(
+            call(&a, "vm_snapshot_create", capture.clone()).await["reason"],
+            "snapshot_publish_not_quiesced"
+        );
+        let unpublished = call(&a, "unpublish_site", args(1805)).await;
+        assert_eq!(terminal(&a, &unpublished).await["state"], "succeeded");
+        let stop = call(&a, "vm_stop", args(1806)).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+
+        let store = h.supervisor().controller.store_for_test();
+        let vm_id = parse_id(vm.as_str().unwrap()).unwrap();
+        let generation = |column: &str| {
+            let sql = match column {
+                "origin" => "SELECT origin_generation FROM vm_static_instances WHERE id=?1",
+                _ => "SELECT id FROM vm_generations WHERE static_id=?1 AND active=1",
+            };
+            store
+                .transact(|db| Ok(db.query_row(sql, [vm_id], |row| row.get::<_, Id>(0))?))
+                .unwrap()
+        };
+        let original = generation("origin");
+        assert_eq!(original, generation("active"));
+
+        let created = call(&a, "vm_snapshot_create", capture.clone()).await;
+        let row = terminal(&a, &created).await;
+        assert_eq!(row["state"], "succeeded", "{row}");
+        let point = row["snapshot_id"].clone();
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm,"request_id":key(1804),"name":"before-update"})
+            )
+            .await,
+            created
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm,"request_id":key(1804),"name":"other"})
+            )
+            .await["reason"],
+            "key_collision"
+        );
+        let running = call(&a, "vm_start", args(1811)).await;
+        assert_eq!(terminal(&a, &running).await["state"], "succeeded");
+        let original_paths = fixture_pair_paths(&h, &vm, true);
+        let saved = simulate_pair_write(&original_paths);
+        let stopped = call(&a, "vm_stop", args(1812)).await;
+        assert_eq!(terminal(&a, &stopped).await["state"], "succeeded");
+        let restore = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1807)});
+        let restored = call(&a, "vm_snapshot_restore", restore.clone()).await;
+        let row = terminal(&a, &restored).await;
+        assert_eq!(row["state"], "succeeded", "{row}");
+        assert_eq!(row["snapshot_id"], point);
+        assert_eq!(
+            fixture_pair_paths(&h, &vm, true).map(|path| fs::read(path).unwrap()),
+            saved
+        );
+        assert_eq!(fs::read(&original_paths[0]).unwrap()[4096], b'D');
+        assert_eq!(fs::read(&original_paths[1]).unwrap()[0], b'V');
+        assert_ne!(generation("active"), original);
+        assert_eq!(generation("origin"), original);
+        store
+            .transact(|db| {
+                assert!(
+                    db.execute("DELETE FROM vm_restore_points WHERE static_vm=?1", [vm_id])
+                        .is_err()
+                );
+                assert_eq!(
+                    db.query_row(
+                        "SELECT count(*) FROM vm_restore_points WHERE static_vm=?1",
+                        [vm_id],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
+        let list_args = json!({"vm_id":vm,"limit":1});
+        let page = call(&a, "vm_snapshot_list", list_args.clone()).await;
+        assert_eq!(page["entries"][0]["protected"], true);
+        assert!(page["next_cursor"].is_string());
+        let next = json!({"vm_id":vm,"limit":1,"cursor":page["next_cursor"]});
+        assert_eq!(
+            call(&b, "vm_snapshot_list", next.clone()).await["reason"],
+            "invalid_cursor"
+        );
+        let page2 = call(&a, "vm_snapshot_list", next).await;
+        assert_eq!(page2["entries"][0]["protected"], true);
+        assert!(page2["next_cursor"].is_null());
+        let delete = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1808)});
+        assert_eq!(
+            call(&b, "vm_snapshot_delete", delete.clone()).await["reason"],
+            "not_found"
+        );
+        assert_eq!(
+            call(&a, "vm_snapshot_delete", delete).await["reason"],
+            "static_backup_delete_forbidden"
+        );
+        assert_eq!(call(&a, "vm_snapshot_restore", restore).await, restored);
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (1, 1));
+        let started = call(&a, "vm_start", args(1809)).await;
+        assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+        let republished = call(&a, "publish_site", args(1810)).await;
+        assert_eq!(terminal(&a, &republished).await["state"], "succeeded");
+        drop(a);
+        drop(b);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_replay_survives_delete_and_original_lease_expiry() {
+        let mut h = Harness::start(false, false).await;
+        h.fixture(|fixture| fixture.snapshot_test_media = true);
+        let a = h.client(0).await;
+        let build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(1850)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(&a, &build).await["template_id"].clone();
+        let clone = call(
+            &a,
+            "vm_create",
+            json!({"template_id":template,"request_id":key(1851),"ttl_s":60}),
+        )
+        .await;
+        let vm = terminal(&a, &clone).await["vm_id"].clone();
+        let capture = json!({"vm_id":vm,"request_id":key(1852)});
+        let created = call(&a, "vm_snapshot_create", capture.clone()).await;
+        let captured = terminal(&a, &created).await;
+        assert_eq!(captured["state"], "succeeded", "{captured}");
+        let point = captured["snapshot_id"].clone();
+        let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(1855)})).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let original_paths = fixture_pair_paths(&h, &vm, true);
+        let saved = simulate_pair_write(&original_paths);
+        let stop = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(1856)})).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        let restore_args = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1857)});
+        let restore = call(&a, "vm_snapshot_restore", restore_args.clone()).await;
+        let restored = terminal(&a, &restore).await;
+        assert_eq!(restored["state"], "succeeded", "{restored}");
+        assert_eq!(restored["cleanup"], "cleanup_unconfirmed");
+        assert_eq!(
+            fixture_pair_paths(&h, &vm, true).map(|path| fs::read(path).unwrap()),
+            saved
+        );
+        assert_eq!(fixture_pair_paths(&h, &vm, false), original_paths);
+        h.supervisor().sweep().unwrap();
+        assert!(original_paths.iter().all(|path| !path.exists()));
+        let cold = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(1858)})).await;
+        assert_eq!(terminal(&a, &cold).await["state"], "succeeded");
+        assert_eq!(call(&a, "vm_snapshot_restore", restore_args).await, restore);
+        let stop = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(1859)})).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        let delete = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1853)});
+        let deleted = call(&a, "vm_snapshot_delete", delete.clone()).await;
+        assert_eq!(terminal(&a, &deleted).await["state"], "succeeded");
+        assert_eq!(
+            call(&a, "vm_snapshot_delete", delete.clone()).await,
+            deleted
+        );
+        let surviving = call(
+            &a,
+            "vm_snapshot_create",
+            json!({"vm_id":vm,"request_id":key(1854)}),
+        )
+        .await;
+        assert_eq!(terminal(&a, &surviving).await["state"], "succeeded");
+        let deadline = clone["expires_at_ms"].as_i64().unwrap();
+        h.now.store(deadline, Ordering::Relaxed);
+        // The reaper proves and records each pair separately. Drive the exact
+        // two turns synchronously so work can never be skipped by scheduling.
+        h.supervisor().sweep().unwrap();
+        h.supervisor().sweep().unwrap();
+        assert_eq!(
+            call(&a, "vm_get", json!({"vm_id":vm})).await["state"],
+            "expired"
+        );
+        assert_eq!(call(&a, "vm_snapshot_delete", delete).await, deleted);
+        assert_eq!(call(&a, "vm_snapshot_create", capture).await, created);
+        assert_eq!(operation(&a, &created).await["snapshot_id"], point);
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_sdk_validation_cursor_replay_legacy_collision_and_pruning() {
+        let mut h = Harness::start_configured(false, false, false, |fixture| {
+            fixture.snapshot_test_media = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let b = h.client(1).await;
+        let build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(2100)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(&a, &build).await["template_id"].clone();
+        let vm1 = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_create",
+                json!({"template_id":template,"request_id":key(2101),"ttl_s":600}),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+        let vm2 = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_create",
+                json!({"template_id":template,"request_id":key(2102),"ttl_s":600}),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+
+        let create1 = json!({"vm_id":vm1,"request_id":key(2103),"name":"Alpha-1"});
+        let created1 = call(&a, "vm_snapshot_create", create1.clone()).await;
+        let snap1 = terminal(&a, &created1).await["snapshot_id"].clone();
+        let created2 = call(
+            &a,
+            "vm_snapshot_create",
+            json!({"vm_id":vm1,"request_id":key(2104)}),
+        )
+        .await;
+        let snap2 = terminal(&a, &created2).await["snapshot_id"].clone();
+
+        // Strict input validation across all four snapshot tools.
+        for (tool, args, expected) in [
+            (
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(2110),"extra":1}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(2111),"name":null}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(2112),"name":"-bad"}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(2113),"name":"bad-"}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(2114),"name":"a--b"}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(2115),"name":"a_b"}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(2116),"name":"a".repeat(49)}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_create",
+                json!({"vm_id":"ZZ","request_id":key(2117)}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_list",
+                json!({"vm_id":vm1,"extra":true}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_list",
+                json!({"vm_id":vm1,"limit":null}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_list",
+                json!({"vm_id":vm1,"limit":0}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_list",
+                json!({"vm_id":vm1,"limit":5}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_list",
+                json!({"vm_id":vm1,"cursor":null}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_list",
+                json!({"vm_id":vm1,"cursor":"not-a-valid-cursor"}),
+                "invalid_cursor",
+            ),
+            (
+                "vm_snapshot_list",
+                json!({"vm_id":vm1,"cursor":"a".repeat(97)}),
+                "invalid_cursor",
+            ),
+            (
+                "vm_snapshot_restore",
+                json!({"vm_id":vm1,"snapshot_id":snap1,"request_id":key(2118),"extra":1}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_restore",
+                json!({"vm_id":vm1,"snapshot_id":null,"request_id":key(2119)}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_delete",
+                json!({"vm_id":vm1,"snapshot_id":snap1,"request_id":key(2120),"extra":1}),
+                "invalid",
+            ),
+            (
+                "vm_snapshot_delete",
+                json!({"vm_id":vm1,"snapshot_id":"bad","request_id":key(2121)}),
+                "invalid",
+            ),
+        ] {
+            let reply = call(&a, tool, args).await;
+            assert_eq!(reply["reason"], expected, "tool={tool} reply={reply}");
+        }
+
+        // Cursor isolation across VM, principal and tool.
+        let page1 = call(&a, "vm_snapshot_list", json!({"vm_id":vm1,"limit":1})).await;
+        assert_eq!(page1["entries"].as_array().unwrap().len(), 1);
+        let cursor = page1["next_cursor"].as_str().unwrap().to_owned();
+        assert_eq!(
+            call(&a, "vm_snapshot_list", json!({"vm_id":vm2,"cursor":cursor})).await["reason"],
+            "invalid_cursor"
+        );
+        assert_eq!(
+            call(&b, "vm_snapshot_list", json!({"vm_id":vm1,"cursor":cursor})).await["reason"],
+            "invalid_cursor"
+        );
+        assert_eq!(
+            call(&a, "vm_list", json!({"cursor":cursor})).await["reason"],
+            "invalid_cursor"
+        );
+        let page2 = call(&a, "vm_snapshot_list", json!({"vm_id":vm1,"cursor":cursor})).await;
+        assert_eq!(page2["entries"].as_array().unwrap().len(), 1);
+        assert!(page2["next_cursor"].is_null());
+
+        // Populated legacy action 5/6 keys collide with typed create/restore
+        // without promoting legacy vm_snapshots or altering legacy charges.
+        let vm1_id = parse_id(vm1.as_str().unwrap()).unwrap();
+        let legacy_snap: Id = [0x91; 16];
+        let legacy_create_key = key(2150);
+        let legacy_restore_key = key(2151);
+        let store = h.supervisor().controller.store_for_test();
+        let charge_with_legacy = store
+            .transact(|db| {
+                db.execute(
+                    "INSERT INTO vm_snapshots(vm,id,ready,dashboard_created_ms) VALUES(?1,?2,1,?3)",
+                    rusqlite::params![vm1_id, legacy_snap, UTC],
+                )?;
+                let k5 = RequestId::parse(&legacy_create_key).unwrap();
+                let op5 = crate::store::vm::Binding {
+                    principal: "alpha",
+                    key: k5,
+                    subject: crate::vm::Subject::Vm(vm1_id),
+                    action: Action::Snapshot as i64,
+                }
+                .record(db, UTC, Some(vm1_id), None)?;
+                db.execute(
+                    "INSERT INTO vm_disk_claims(activity_id,vm,snapshot,persistent,staging)
+                     VALUES(?1,?2,?3,4096,0)",
+                    rusqlite::params![op5.receipt.activity_id, vm1_id, legacy_snap],
+                )?;
+                crate::store::vm::finish(
+                    db,
+                    op5.receipt.activity_id,
+                    Status::Succeeded,
+                    UTC,
+                    Some(true),
+                )?;
+                let k6 = RequestId::parse(&legacy_restore_key).unwrap();
+                let op6 = crate::store::vm::Binding {
+                    principal: "alpha",
+                    key: k6,
+                    subject: crate::vm::Subject::Vm(vm1_id),
+                    action: Action::Restore as i64,
+                }
+                .record(db, UTC, Some(vm1_id), None)?;
+                crate::store::vm::finish(
+                    db,
+                    op6.receipt.activity_id,
+                    Status::Succeeded,
+                    UTC,
+                    Some(true),
+                )?;
+                crate::store::vm::disk_bytes(db)
+            })
+            .unwrap();
+        assert_eq!(
+            call(&a, "vm_snapshot_list", json!({"vm_id":vm1})).await["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":legacy_create_key})
+            )
+            .await["reason"],
+            "key_collision"
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_restore",
+                json!({"vm_id":vm1,"snapshot_id":snap1,"request_id":legacy_restore_key})
+            )
+            .await["reason"],
+            "key_collision"
+        );
+        assert_eq!(
+            store
+                .transact(|db| crate::store::vm::disk_bytes(db))
+                .unwrap(),
+            charge_with_legacy
+        );
+
+        // Independent changed VM, action and target collisions on typed keys.
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm2,"request_id":key(2103),"name":"alpha-1"})
+            )
+            .await["reason"],
+            "key_collision"
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(2103),"name":"other"})
+            )
+            .await["reason"],
+            "key_collision"
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_restore",
+                json!({"vm_id":vm1,"snapshot_id":snap1,"request_id":key(2103)})
+            )
+            .await["reason"],
+            "key_collision"
+        );
+        let restored = call(
+            &a,
+            "vm_snapshot_restore",
+            json!({"vm_id":vm1,"snapshot_id":snap1,"request_id":key(2105)}),
+        )
+        .await;
+        assert_eq!(terminal(&a, &restored).await["state"], "succeeded");
+        h.sweep().await;
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_restore",
+                json!({"vm_id":vm1,"snapshot_id":snap2,"request_id":key(2105)})
+            )
+            .await["reason"],
+            "key_collision"
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_restore",
+                json!({"vm_id":vm2,"snapshot_id":snap1,"request_id":key(2105)})
+            )
+            .await["reason"],
+            "key_collision"
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_delete",
+                json!({"vm_id":vm1,"snapshot_id":snap1,"request_id":key(2105)})
+            )
+            .await["reason"],
+            "key_collision"
+        );
+
+        // Prune >128 audit rows, reopen, and verify accepted replay survives.
+        let created1_op = parse_id(created1["operation_id"].as_str().unwrap()).unwrap();
+        let created1_activity: i64 = store
+            .transact(|db| {
+                let activity_id: i64 = db.query_row(
+                    "SELECT activity_id FROM vm_operations WHERE operation_id=?1",
+                    [created1_op],
+                    |row| row.get(0),
+                )?;
+                for i in 0..135 {
+                    db.execute(
+                        "INSERT INTO activity(principal,actor,vm,action,started_ms,status,reason,finished_ms,terminal_order)
+                         VALUES('alpha','agent',?1,13,?2,4,1,?2,(SELECT coalesce(max(terminal_order),0)+1 FROM activity))",
+                        rusqlite::params![vm1_id, UTC + i],
+                    )?;
+                }
+                crate::store::vm::prune(db)?;
+                let remaining: i64 = db.query_row(
+                    "SELECT count(*) FROM activity WHERE id=?1",
+                    [activity_id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(remaining, 0);
+                Ok(activity_id)
+            })
+            .unwrap();
+        assert!(created1_activity > 0);
+        drop(a);
+        drop(b);
+        h.shutdown().await.unwrap();
+        let mut h = h.reopen(|fixture| fixture.snapshot_test_media = true).await;
+        let a = h.client(0).await;
+        assert_eq!(call(&a, "vm_snapshot_create", create1).await, created1);
+        let op_after = operation(&a, &created1).await;
+        assert_eq!(op_after["state"], "succeeded");
+        assert_eq!(op_after["snapshot_id"], snap1);
+        assert_eq!(
+            call(&a, "vm_snapshot_list", json!({"vm_id":vm1})).await["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_windows_and_ubuntu_snapshot_lifecycle_reopen_custody_and_stale_epoch() {
+        let mut h = Harness::start_configured(false, false, true, |fixture| {
+            fixture.windows_recipe = true;
+            fixture.snapshot_test_media = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let ubuntu_build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(2200)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let ubuntu_tpl = terminal(&a, &ubuntu_build).await["template_id"].clone();
+        let win_build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(Controller::windows_recipe_id()),"request_id":key(2201)}),
+        )
+        .await;
+        let win_tpl = terminal(&a, &win_build).await["template_id"].clone();
+        let web_build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(WEB_RECIPE_ID),"request_id":key(2202)}),
+        )
+        .await;
+        let web_tpl = terminal(&a, &web_build).await["template_id"].clone();
+
+        let win_clone = call(
+            &a,
+            "vm_create",
+            json!({"template_id":win_tpl,"request_id":key(2203),"ttl_s":600}),
+        )
+        .await;
+        let win_vm = terminal(&a, &win_clone).await["vm_id"].clone();
+        let ubu_clone = call(
+            &a,
+            "vm_create",
+            json!({"template_id":ubuntu_tpl,"request_id":key(2204),"ttl_s":600}),
+        )
+        .await;
+        let ubu_vm = terminal(&a, &ubu_clone).await["vm_id"].clone();
+        let sib_clone = call(
+            &a,
+            "vm_create",
+            json!({"template_id":ubuntu_tpl,"request_id":key(2205),"ttl_s":600}),
+        )
+        .await;
+        let sib_vm = terminal(&a, &sib_clone).await["vm_id"].clone();
+        let stat_vm = terminal(
+            &a,
+            &call(
+                &a,
+                "static_vm_create",
+                json!({"name":"sib-static","template_id":web_tpl,"request_id":key(2206)}),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+
+        let golden_paths = |tpl: &Value| -> [std::path::PathBuf; 2] {
+            let tpl_id = parse_id(tpl.as_str().unwrap()).unwrap();
+            h.supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| {
+                    let mut stmt = db.prepare(
+                        "SELECT a.role,a.object_key FROM vm_build_intents b
+                         JOIN vm_generations g ON g.build_id=b.id AND g.active=1
+                         JOIN vm_artifacts a ON a.generation_id=g.id
+                         WHERE b.template_id=?1 ORDER BY a.role",
+                    )?;
+                    let files = stmt
+                        .query_map([tpl_id], |row| {
+                            Ok(h.media.join(format!(
+                                "{}-{}",
+                                row.get::<_, String>(0)?,
+                                hex::encode(row.get::<_, Id>(1)?)
+                            )))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(files.try_into().expect("golden pair"))
+                })
+                .unwrap()
+        };
+        let win_golden_paths = golden_paths(&win_tpl);
+        let ubu_golden_paths = golden_paths(&ubuntu_tpl);
+        let win_golden_bytes = win_golden_paths.each_ref().map(|p| fs::read(p).unwrap());
+        let ubu_golden_bytes = ubu_golden_paths.each_ref().map(|p| fs::read(p).unwrap());
+        let sib_paths = fixture_pair_paths(&h, &sib_vm, true);
+        let sib_bytes = sib_paths.each_ref().map(|p| fs::read(p).unwrap());
+        let stat_paths = fixture_pair_paths(&h, &stat_vm, true);
+        let stat_bytes = stat_paths.each_ref().map(|p| fs::read(p).unwrap());
+
+        // Paired marker capture -> mutate -> restore -> charged retirement -> cold boot
+        // for both Windows and Ubuntu TEST VMs, preserving original leases.
+        let mut nonce = 2210u64;
+        for (vm, orig_clone) in [(&win_vm, &win_clone), (&ubu_vm, &ubu_clone)] {
+            let orig_deadline = orig_clone["expires_at_ms"].as_i64().unwrap();
+            let p1 = terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_snapshot_create",
+                    json!({"vm_id":vm,"request_id":key(nonce)}),
+                )
+                .await,
+            )
+            .await["snapshot_id"]
+                .clone();
+            nonce += 1;
+            assert_eq!(
+                terminal(
+                    &a,
+                    &call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(nonce)})).await,
+                )
+                .await["state"],
+                "succeeded"
+            );
+            nonce += 1;
+            let active_before = fixture_pair_paths(&h, vm, true);
+            let saved = simulate_pair_write(&active_before);
+            assert_eq!(
+                terminal(
+                    &a,
+                    &call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(nonce)})).await,
+                )
+                .await["state"],
+                "succeeded"
+            );
+            nonce += 1;
+            let restored = terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_snapshot_restore",
+                    json!({"vm_id":vm,"snapshot_id":p1,"request_id":key(nonce)}),
+                )
+                .await,
+            )
+            .await;
+            nonce += 1;
+            assert_eq!(restored["state"], "succeeded", "{restored}");
+            assert_eq!(restored["cleanup"], "cleanup_unconfirmed");
+            assert_eq!(
+                fixture_pair_paths(&h, vm, true).map(|p| fs::read(p).unwrap()),
+                saved
+            );
+            assert_eq!(fixture_pair_paths(&h, vm, false), active_before);
+            let charge_retired = h
+                .supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| crate::store::vm::disk_bytes(db))
+                .unwrap()
+                .unwrap();
+            h.sweep().await;
+            assert!(active_before.iter().all(|p| !p.exists()));
+            let charge_after = h
+                .supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| crate::store::vm::disk_bytes(db))
+                .unwrap()
+                .unwrap();
+            assert!(charge_after < charge_retired);
+            assert_eq!(
+                call(&a, "vm_get", json!({"vm_id":vm})).await["expires_at_ms"],
+                orig_deadline
+            );
+            assert_eq!(
+                terminal(
+                    &a,
+                    &call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(nonce)})).await,
+                )
+                .await["state"],
+                "succeeded"
+            );
+            nonce += 1;
+            assert_eq!(
+                terminal(
+                    &a,
+                    &call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(nonce)})).await,
+                )
+                .await["state"],
+                "succeeded"
+            );
+            nonce += 1;
+        }
+
+        // Crash-after-commit before in-memory fixture map update still boots
+        // via durable SQLite pair rehydration.
+        let p2 = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":win_vm,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await["snapshot_id"]
+            .clone();
+        nonce += 1;
+        h.fixture(|fixture| fixture.skip_restore_map_update = true);
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_snapshot_restore",
+                    json!({"vm_id":win_vm,"snapshot_id":p2,"request_id":key(nonce)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        h.fixture(|fixture| fixture.skip_restore_map_update = false);
+        h.sweep().await;
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_start",
+                    json!({"vm_id":win_vm,"request_id":key(nonce)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_stop",
+                    json!({"vm_id":win_vm,"request_id":key(nonce)})
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+
+        // Reopen: committed TEST pair rehydrates and verifies on boot;
+        // replacing a leaf refuses boot; stale writer epoch fails and rolls back.
+        drop(a);
+        h.shutdown().await.unwrap();
+        let mut h = h
+            .reopen(|fixture| {
+                fixture.windows_recipe = true;
+                fixture.snapshot_test_media = true;
+            })
+            .await;
+        let a = h.client(0).await;
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_start",
+                    json!({"vm_id":win_vm,"request_id":key(nonce)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_stop",
+                    json!({"vm_id":win_vm,"request_id":key(nonce)})
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+
+        // Tamper one leaf on ubu_vm: boot refuses before start.
+        let ubu_active = fixture_pair_paths(&h, &ubu_vm, true);
+        let backup_vars = h.media.join("tamper-backup-vars");
+        fs::rename(&ubu_active[1], &backup_vars).unwrap();
+        fs::copy(&backup_vars, &ubu_active[1]).unwrap();
+        let bad_boot = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_start",
+                json!({"vm_id":ubu_vm,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(bad_boot["state"], "interrupted", "{bad_boot}");
+        assert_eq!(bad_boot["reason"], "boot_failed");
+        assert_eq!(
+            call(&a, "vm_get", json!({"vm_id":ubu_vm})).await["ready"],
+            false
+        );
+        fs::remove_file(&ubu_active[1]).unwrap();
+        fs::rename(&backup_vars, &ubu_active[1]).unwrap();
+        h.sweep().await;
+
+        // Stale writer epoch on prove_stop rejects and rolls back digest updates.
+        let win_id = parse_id(win_vm.as_str().unwrap()).unwrap();
+        let store = h.supervisor().controller.store_for_test();
+        let mut fake_pair = store
+            .transact(|db| {
+                Ok(crate::store::vm::snapshot::active(db, win_id, false)?
+                    .unwrap()
+                    .pair)
+            })
+            .unwrap();
+        let orig_digest = fake_pair.1[0].pin.sha256;
+        fake_pair.1[0].pin.sha256 = [0xAA; 32];
+        assert_eq!(
+            store
+                .transact(|db| {
+                    // Model the next writer before its stop settles, so only the
+                    // epoch check rejects the displaced writer's digest.
+                    crate::store::vm::snapshot::invalidate_release(db, win_id, [0xEF; 16])?;
+                    crate::store::vm::snapshot::prove_stop(
+                        db,
+                        win_id,
+                        [0xEE; 16],
+                        fake_pair,
+                        runtime::StopDisposition::CleanRelease,
+                    )
+                })
+                .unwrap_err()
+                .to_string(),
+            "snapshot stop writer epoch changed"
+        );
+        let after_digest = store
+            .transact(|db| {
+                Ok(crate::store::vm::snapshot::active(db, win_id, false)?
+                    .unwrap()
+                    .pair
+                    .1[0]
+                    .pin
+                    .sha256)
+            })
+            .unwrap();
+        assert_eq!(after_digest, orig_digest);
+
+        // Golden, TEST sibling and static sibling bytes are untouched.
+        assert_eq!(
+            win_golden_paths.each_ref().map(|p| fs::read(p).unwrap()),
+            win_golden_bytes
+        );
+        assert_eq!(
+            ubu_golden_paths.each_ref().map(|p| fs::read(p).unwrap()),
+            ubu_golden_bytes
+        );
+        assert_eq!(
+            sib_paths.each_ref().map(|p| fs::read(p).unwrap()),
+            sib_bytes
+        );
+        assert_eq!(
+            stat_paths.each_ref().map(|p| fs::read(p).unwrap()),
+            stat_bytes
+        );
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_copy_delete_failure_graph_reopen_orphan_expiry_and_sql_retry() {
+        let mut h = Harness::start_configured(false, false, false, |fixture| {
+            fixture.snapshot_test_media = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(2300)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(&a, &build).await["template_id"].clone();
+        let mut nonce = 2301u64;
+        let make_vm = async |client: &Client, ttl: u64, n: u64| {
+            let c = call(
+                client,
+                "vm_create",
+                json!({"template_id":template,"request_id":key(n),"ttl_s":ttl}),
+            )
+            .await;
+            let res = terminal(client, &c).await;
+            (res["vm_id"].clone(), c["expires_at_ms"].as_i64().unwrap())
+        };
+        let (before_create_vm, before_deadline) = make_vm(&a, 60, 2370).await;
+        let (after_create_vm, after_deadline) = make_vm(&a, 120, 2371).await;
+        let (vm_o1, _) = make_vm(&a, 600, 2372).await;
+        let (vm1, _) = make_vm(&a, 600, nonce).await;
+        nonce += 1;
+
+        // 1. Both untouched + reopen: abandon_inactive must NOT rewrite planned -> quarantined.
+        h.fixture(|f| f.snapshot_fault = Some(SnapshotFault::FailBeforeCreate));
+        let fail_untouched = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await;
+        nonce += 1;
+        assert_eq!(fail_untouched["state"], "failed");
+        drop(a);
+        h.shutdown().await.unwrap();
+        let mut h = h.reopen(|f| f.snapshot_test_media = true).await;
+        let a = h.client(0).await;
+        let vm1_id = parse_id(vm1.as_str().unwrap()).unwrap();
+        h.supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                assert_eq!(
+                    crate::store::vm::count(db, "SELECT count(*) FROM vm_snapshot_work WHERE vm=?1", [vm1_id])?,
+                    0
+                );
+                assert_eq!(
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_snapshot_reconciliation WHERE vm=?1 AND cause='abandoned'",
+                        [vm1_id]
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        // 2. Identified disk + untouched VARS + reopen: disposes disk, accepts planned VARS.
+        h.fixture(|f| f.snapshot_fault = Some(SnapshotFault::FailAfterDiskIdentified));
+        let fail_half = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await;
+        nonce += 1;
+        assert_eq!(fail_half["state"], "failed");
+        drop(a);
+        h.shutdown().await.unwrap();
+        let mut h = h.reopen(|f| f.snapshot_test_media = true).await;
+        let a = h.client(0).await;
+        h.supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                assert_eq!(
+                    crate::store::vm::count(db, "SELECT count(*) FROM vm_snapshot_work WHERE vm=?1", [vm1_id])?,
+                    0
+                );
+                assert_eq!(
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_snapshot_reconciliation WHERE vm=?1 AND cause='abandoned'",
+                        [vm1_id]
+                    )?,
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        // 3. Fail after flush before commit + reopen: old active pointer stays, no auto-promotion.
+        let active_gen_before: Id = h
+            .supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                Ok(db.query_row(
+                    "SELECT id FROM vm_generations WHERE vm_id=?1 AND active=1",
+                    [vm1_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        h.fixture(|f| f.snapshot_fault = Some(SnapshotFault::FailAfterFlushBeforeCommit));
+        let fail_flush = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await;
+        nonce += 1;
+        assert_eq!(fail_flush["state"], "failed");
+        drop(a);
+        h.shutdown().await.unwrap();
+        let mut h = h.reopen(|f| f.snapshot_test_media = true).await;
+        let a = h.client(0).await;
+        h.supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                let gen_after: Id = db.query_row(
+                    "SELECT id FROM vm_generations WHERE vm_id=?1 AND active=1",
+                    [vm1_id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(gen_after, active_gen_before);
+                assert_eq!(
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_restore_points WHERE vm=?1",
+                        [vm1_id]
+                    )?,
+                    0
+                );
+                assert_eq!(
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_snapshot_work WHERE vm=?1",
+                        [vm1_id]
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        // 4. Loss of host disk reserve during final recheck/settlement refuses commit.
+        let controller = h.supervisor().controller.clone();
+        h.fixture(|f| {
+            f.host_observer = Some(Arc::new(move || {
+                let both_identified = controller.store_for_test()
+                    .transact(|db| {
+                        crate::store::vm::count(
+                            db,
+                            "SELECT count(*) FROM vm_artifacts a JOIN vm_snapshot_work w ON w.candidate=a.generation_id WHERE w.vm=?1 AND w.phase='copy' AND a.state='identified'",
+                            [vm1_id],
+                        )
+                    })
+                    .unwrap_or(0)
+                    >= 2;
+                if both_identified {
+                    HostObservation {
+                        capacity: Some(Capacity {
+                            free_bytes: 0,
+                            managed_bytes: 0,
+                        }),
+                        ..HOST
+                    }
+                } else {
+                    HOST
+                }
+            }));
+        });
+        let cap_fail = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await;
+        nonce += 1;
+        assert_eq!(cap_fail["state"], "failed");
+        h.fixture(|f| f.host_observer = None);
+        h.sweep().await;
+        assert_eq!(
+            call(&a, "vm_snapshot_list", json!({"vm_id":vm1})).await["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // 5. Reopen mid-TEST-delete (one leaf already removed, other remains).
+        let snap_del = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm1,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await["snapshot_id"]
+            .clone();
+        nonce += 1;
+        let snap_del_id = parse_id(snap_del.as_str().unwrap()).unwrap();
+        let (del_work, _, _) = h
+            .supervisor()
+            .controller
+            .admit_snapshot(
+                "alpha",
+                RequestId::parse(&key(nonce)).unwrap(),
+                vm1_id,
+                SNAPSHOT_DELETE_ACTION,
+                &snapshot::Request::Delete(snap_del_id),
+                None,
+                HOST,
+                RESOURCES,
+            )
+            .unwrap()
+            .unwrap();
+        nonce += 1;
+        // Remove disk leaf manually to simulate crash between leaf removals.
+        let del_disk = h.media.join(format!(
+            "{}-{}",
+            del_work.source.0.disk.role,
+            hex::encode(del_work.source.0.disk.key)
+        ));
+        let del_vars = h.media.join(format!(
+            "{}-{}",
+            del_work.source.0.vars.role,
+            hex::encode(del_work.source.0.vars.key)
+        ));
+        fs::remove_file(&del_disk).unwrap();
+        assert!(del_vars.exists());
+        drop(a);
+        h.shutdown().await.unwrap();
+        let mut h = h.reopen(|f| f.snapshot_test_media = true).await;
+        let a = h.client(0).await;
+        assert!(!del_vars.exists());
+        assert_eq!(
+            call(&a, "vm_snapshot_list", json!({"vm_id":vm1})).await["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // 6. Held copy + lease expiry cancellation and handoff:
+        //    (a) held before create (untouched) and (b) held after both leaves identified.
+        for (vm_exp, exp_deadline, hold_before_create, label) in [
+            (before_create_vm, before_deadline, true, "before-create"),
+            (after_create_vm, after_deadline, false, "after-identified"),
+        ] {
+            let vm_exp_id = parse_id(vm_exp.as_str().unwrap()).unwrap();
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            h.fixture(|f| {
+                f.snapshot_hold = Some((entered.clone(), release.clone()));
+                if hold_before_create {
+                    f.snapshot_fault = Some(SnapshotFault::HoldBeforeCreate);
+                }
+            });
+            let op = call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm_exp,"request_id":key(nonce)}),
+            )
+            .await;
+            nonce += 1;
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .unwrap();
+            h.now.store(exp_deadline, Ordering::Relaxed);
+            // Sweep 1 cancels the scoped snapshot worker, joins it, and settles
+            // the candidate (untouched or identified) correlated to expiry.
+            h.sweep().await;
+            // Sweep 2 disposes the active pair last and writes the tombstone.
+            h.sweep().await;
+            assert_eq!(
+                call(&a, "vm_get", json!({"vm_id":vm_exp})).await["state"],
+                "expired",
+                "case={label}"
+            );
+            assert_eq!(operation(&a, &op).await["state"], "interrupted");
+            h.supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| {
+                    assert_eq!(
+                        crate::store::vm::count(
+                            db,
+                            "SELECT count(*) FROM vm_snapshot_reconciliation
+                             WHERE vm=?1 AND cause='abandoned' AND expiry_activity IS NOT NULL",
+                            [vm_exp_id]
+                        )?,
+                        1
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        // 7. Orphan live copy worker panic reconciliation + same-process foreground SDK recovery
+        //    + shutdown failure preservation.
+        let vm_o1_id = parse_id(vm_o1.as_str().unwrap()).unwrap();
+        for fault in [
+            SnapshotFault::OrphanPanicAfterDiskOnly,
+            SnapshotFault::OrphanPanicAfterIdentified,
+        ] {
+            h.fixture(|f| f.snapshot_fault = Some(fault));
+            let op = call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm_o1,"request_id":key(nonce)}),
+            )
+            .await;
+            nonce += 1;
+            until(|| !h.fixture(|f| f.live.lock().unwrap().working.contains(&vm_o1_id))).await;
+            assert_eq!(operation(&a, &op).await["state"], "pending");
+            h.sweep().await;
+            let settled = operation(&a, &op).await;
+            assert_eq!(settled["state"], "interrupted", "{settled}");
+            assert_eq!(settled["cleanup"], "cleanup_unconfirmed");
+        }
+        h.supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                assert_eq!(
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_snapshot_reconciliation WHERE vm=?1 AND cause='orphan_copy'",
+                        [vm_o1_id]
+                    )?,
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
+        // Same-process foreground SDK recovers once the reaper reconciled the orphan intent.
+        let recovered = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm_o1,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(recovered["state"], "succeeded", "{recovered}");
+        drop(a);
+        // Shutdown still preserves failure evidence from the panicked snapshot worker.
+        assert!(h.shutdown().await.is_err());
+
+        // 8. Quarantine cases (attempted-create without recorded identity, both
+        //    disk-only and vars-after-disk, plus staging file rename/replacement):
+        //    keep charges quarantined, never delete replaced identities, and emit
+        //    ONE correlated daemon quarantine receipt without duplicates across sweeps.
+        let mut h2 = Harness::start_configured(false, false, false, |fixture| {
+            fixture.snapshot_test_media = true;
+        })
+        .await;
+        let a2 = h2.client(0).await;
+        let b2 = call(
+            &a2,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(2350)}),
+        )
+        .await;
+        h2.hold_build.notify_one();
+        let tpl2 = terminal(&a2, &b2).await["template_id"].clone();
+        let vm_q1 = terminal(
+            &a2,
+            &call(
+                &a2,
+                "vm_create",
+                json!({"template_id":tpl2,"request_id":key(2351),"ttl_s":600}),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+        let vm_q1_id = parse_id(vm_q1.as_str().unwrap()).unwrap();
+        let vm_q2 = terminal(
+            &a2,
+            &call(
+                &a2,
+                "vm_create",
+                json!({"template_id":tpl2,"request_id":key(2352),"ttl_s":600}),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+        let vm_q2_id = parse_id(vm_q2.as_str().unwrap()).unwrap();
+        let vm_rep = terminal(
+            &a2,
+            &call(
+                &a2,
+                "vm_create",
+                json!({"template_id":tpl2,"request_id":key(2353),"ttl_s":600}),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+        let vm_rep_id = parse_id(vm_rep.as_str().unwrap()).unwrap();
+
+        h2.fixture(|f| f.snapshot_fault = Some(SnapshotFault::FailAfterDiskAttemptNoId));
+        assert_eq!(
+            terminal(
+                &a2,
+                &call(
+                    &a2,
+                    "vm_snapshot_create",
+                    json!({"vm_id":vm_q1,"request_id":key(2354)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "failed"
+        );
+        h2.fixture(|f| f.snapshot_fault = Some(SnapshotFault::FailAfterVarsAttemptNoId));
+        assert_eq!(
+            terminal(
+                &a2,
+                &call(
+                    &a2,
+                    "vm_snapshot_create",
+                    json!({"vm_id":vm_q2,"request_id":key(2355)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "failed"
+        );
+        h2.fixture(|f| f.snapshot_fault = Some(SnapshotFault::FailAfterDiskIdentified));
+        assert_eq!(
+            terminal(
+                &a2,
+                &call(
+                    &a2,
+                    "vm_snapshot_create",
+                    json!({"vm_id":vm_rep,"request_id":key(2356)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "failed"
+        );
+        let staged_disk_path = h2
+            .supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                let (role, obj): (String, Id) = db.query_row(
+                    "SELECT a.role,a.object_key FROM vm_snapshot_work w
+                     JOIN vm_artifacts a ON a.generation_id=w.candidate
+                     WHERE w.vm=?1 AND a.role='disk'",
+                    [vm_rep_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                Ok(h2.media.join(format!("{role}-{}", hex::encode(obj))))
+            })
+            .unwrap();
+        let moved_orig = h2.media.join("moved-staged-disk");
+        let staged_bytes = fs::read(&staged_disk_path).unwrap();
+        fs::rename(&staged_disk_path, &moved_orig).unwrap();
+        fs::write(&staged_disk_path, &staged_bytes).unwrap();
+
+        h2.sweep().await;
+        h2.sweep().await;
+        assert!(staged_disk_path.exists());
+        h2.supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                for vm_id in [vm_q1_id, vm_q2_id] {
+                    assert_eq!(
+                        crate::store::vm::count(
+                            db,
+                            "SELECT count(*) FROM vm_snapshot_work WHERE vm=?1 AND quarantine_audited=1",
+                            [vm_id]
+                        )?,
+                        1
+                    );
+                    assert_eq!(
+                        crate::store::vm::count(
+                            db,
+                            "SELECT count(*) FROM vm_snapshot_reconciliation r
+                             JOIN activity a ON a.id=r.activity_id
+                             WHERE r.vm=?1 AND r.cause='quarantined' AND a.status=2 AND a.cleanup_confirmed=0",
+                            [vm_id]
+                        )?,
+                        1
+                    );
+                }
+                assert_eq!(
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_snapshot_work WHERE vm=?1",
+                        [vm_rep_id]
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+        drop(a2);
+        let _ = h2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn static_snapshot_protection_caps_dirty_displacement_and_negative_trust() {
+        let mut h = Harness::start_configured(false, false, true, |fixture| {
+            fixture.snapshot_test_media = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let web_build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(WEB_RECIPE_ID),"request_id":key(2400)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let web_tpl = terminal(&a, &web_build).await["template_id"].clone();
+        let ubu_tpl = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_template_build",
+                json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(2401)}),
+            )
+            .await,
+        )
+        .await["template_id"]
+            .clone();
+
+        let mut nonce = 2402u64;
+        let make_static = |name: &str, n: u64| {
+            let client = &a;
+            let tpl = web_tpl.clone();
+            let name = name.to_owned();
+            async move {
+                terminal(
+                    client,
+                    &call(
+                        client,
+                        "static_vm_create",
+                        json!({"name":name,"template_id":tpl,"request_id":key(n)}),
+                    )
+                    .await,
+                )
+                .await["vm_id"]
+                    .clone()
+            }
+        };
+        let stat1 = make_static("cap-site-1", nonce).await;
+        nonce += 1;
+        let stat2 = make_static("cap-site-2", nonce).await;
+        nonce += 1;
+        let stat3 = make_static("cap-site-3", nonce).await;
+        nonce += 1;
+
+        // 1. Static per-VM cap: 3 manual points + 1 reserved 4th slot for restore displacement.
+        let mut s1_points = Vec::new();
+        for _ in 0..3 {
+            let r = terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_snapshot_create",
+                    json!({"vm_id":stat1,"request_id":key(nonce)}),
+                )
+                .await,
+            )
+            .await;
+            nonce += 1;
+            assert_eq!(r["state"], "succeeded");
+            s1_points.push(r["snapshot_id"].clone());
+        }
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":stat1,"request_id":key(nonce)})
+            )
+            .await["reason"],
+            "snapshot_limit"
+        );
+        nonce += 1;
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_snapshot_restore",
+                    json!({"vm_id":stat1,"snapshot_id":s1_points[0],"request_id":key(nonce)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        assert_eq!(
+            call(&a, "vm_snapshot_list", json!({"vm_id":stat1})).await["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_restore",
+                json!({"vm_id":stat1,"snapshot_id":s1_points[1],"request_id":key(nonce)})
+            )
+            .await["reason"],
+            "snapshot_limit"
+        );
+        nonce += 1;
+
+        // 2. Dirty stop refuses capture; after static recovery, restore displaces
+        //    the dirty active pair into protected, restore-ineligible dirty_release.
+        let stat2_id = parse_id(stat2.as_str().unwrap()).unwrap();
+        let orig2: Id = h
+            .supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                Ok(db.query_row(
+                    "SELECT origin_generation FROM vm_static_instances WHERE id=?1",
+                    [stat2_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        let c1 = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":stat2,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await["snapshot_id"]
+            .clone();
+        nonce += 1;
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_start",
+                    json!({"vm_id":stat2,"request_id":key(nonce)})
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        h.fixture(|f| {
+            f.live.lock().unwrap().dirty_stop.insert(stat2_id);
+        });
+        let dirty_stop = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_stop",
+                json!({"vm_id":stat2,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await;
+        nonce += 1;
+        assert_eq!(dirty_stop["state"], "failed");
+        assert_eq!(dirty_stop["reason"], "dirty_stop");
+        // Recover static VM from Recovering -> Stopped while preserving dirty disposition.
+        h.sweep().await;
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":stat2,"request_id":key(nonce)})
+            )
+            .await["reason"],
+            "snapshot_offline_required"
+        );
+        nonce += 1;
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_snapshot_restore",
+                    json!({"vm_id":stat2,"snapshot_id":c1,"request_id":key(nonce)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        let list2 = call(&a, "vm_snapshot_list", json!({"vm_id":stat2})).await;
+        let entries2 = list2["entries"].as_array().unwrap();
+        assert_eq!(entries2.len(), 2);
+        let dirty_entry = entries2
+            .iter()
+            .find(|e| e["restore_eligible"] == false)
+            .expect("protected dirty_release point");
+        assert_eq!(dirty_entry["protected"], true);
+        let dirty_id = dirty_entry["snapshot_id"].clone();
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_restore",
+                json!({"vm_id":stat2,"snapshot_id":dirty_id,"request_id":key(nonce)})
+            )
+            .await["reason"],
+            "not_found"
+        );
+        nonce += 1;
+        for target in [&c1, &dirty_id] {
+            assert_eq!(
+                call(
+                    &a,
+                    "vm_snapshot_delete",
+                    json!({"vm_id":stat2,"snapshot_id":target,"request_id":key(nonce)})
+                )
+                .await["reason"],
+                "static_backup_delete_forbidden"
+            );
+            nonce += 1;
+        }
+        h.supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                assert!(
+                    db.execute(
+                        "DELETE FROM vm_restore_points WHERE static_vm=?1",
+                        [stat2_id]
+                    )
+                    .is_err()
+                );
+                let (active_gen, origin_gen): (Id, Id) = db.query_row(
+                    "SELECT g.id,s.origin_generation FROM vm_static_instances s
+                     JOIN vm_generations g ON g.static_id=s.id AND g.active=1 WHERE s.id=?1",
+                    [stat2_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(origin_gen, orig2);
+                assert_ne!(active_gen, orig2);
+                Ok(())
+            })
+            .unwrap();
+
+        // 3. Same-process negative TLS trust (expired cert marker 'E') under unchanged host trust.
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_start",
+                    json!({"vm_id":stat2,"request_id":key(nonce)})
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        let boot_origin = h.fixture(|f| f.publish_origin(stat2_id)).unwrap();
+        assert_eq!(boot_origin.origin_generation, orig2);
+        assert_ne!(boot_origin.generation, orig2);
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let paths = fixture_pair_paths(&h, &stat2, true);
+            let mut file = fs::OpenOptions::new().write(true).open(&paths[0]).unwrap();
+            file.seek(SeekFrom::Start(FIXTURE_CERT_MARKER_OFFSET))
+                .unwrap();
+            file.write_all(b"E").unwrap();
+            file.sync_all().unwrap();
+        }
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_stop",
+                    json!({"vm_id":stat2,"request_id":key(nonce)})
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_snapshot_create",
+                    json!({"vm_id":stat2,"request_id":key(nonce)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        let expired_boot = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_start",
+                json!({"vm_id":stat2,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await;
+        nonce += 1;
+        assert_eq!(expired_boot["state"], "interrupted");
+        assert_eq!(expired_boot["reason"], "boot_failed");
+        h.sweep().await;
+
+        // 4. Prepare stat3 with untrusted CA marker 'U' (2 points: clean + untrusted).
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_snapshot_create",
+                    json!({"vm_id":stat3,"request_id":key(nonce)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_start",
+                    json!({"vm_id":stat3,"request_id":key(nonce)})
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let paths = fixture_pair_paths(&h, &stat3, true);
+            let mut file = fs::OpenOptions::new().write(true).open(&paths[0]).unwrap();
+            file.seek(SeekFrom::Start(FIXTURE_CERT_MARKER_OFFSET))
+                .unwrap();
+            file.write_all(b"U").unwrap();
+            file.sync_all().unwrap();
+        }
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_stop",
+                    json!({"vm_id":stat3,"request_id":key(nonce)})
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        nonce += 1;
+        let p_untrusted = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":stat3,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await["snapshot_id"]
+            .clone();
+        nonce += 1;
+
+        // 5. Shared 16-point host cap across static (4+3+2=9) and TEST (4+3=7) VMs.
+        let t1 = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_create",
+                json!({"template_id":ubu_tpl,"request_id":key(nonce),"ttl_s":600}),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+        nonce += 1;
+        let t2 = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_create",
+                json!({"template_id":ubu_tpl,"request_id":key(nonce),"ttl_s":600}),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+        nonce += 1;
+        for (vm, count) in [(&t1, 4usize), (&t2, 3usize)] {
+            for _ in 0..count {
+                assert_eq!(
+                    terminal(
+                        &a,
+                        &call(
+                            &a,
+                            "vm_snapshot_create",
+                            json!({"vm_id":vm,"request_id":key(nonce)}),
+                        )
+                        .await,
+                    )
+                    .await["state"],
+                    "succeeded"
+                );
+                nonce += 1;
+            }
+        }
+        // Host now holds exactly 16 points (4+3+2+4+3).
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":t2,"request_id":key(nonce)})
+            )
+            .await["reason"],
+            "snapshot_limit"
+        );
+        nonce += 1;
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":stat3,"request_id":key(nonce)})
+            )
+            .await["reason"],
+            "snapshot_limit"
+        );
+        nonce += 1;
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_restore",
+                json!({"vm_id":stat3,"snapshot_id":p_untrusted,"request_id":key(nonce)})
+            )
+            .await["reason"],
+            "snapshot_limit"
+        );
+        nonce += 1;
+
+        // 6. Reopen retaining the exact same host-side FixtureOrigin trust root
+        //    and assert untrusted guest cert ('U') is refused across restart.
+        drop(a);
+        h.shutdown().await.unwrap();
+        let mut h = h.reopen(|f| f.snapshot_test_media = true).await;
+        let a = h.client(0).await;
+        let untrusted_boot = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_start",
+                json!({"vm_id":stat3,"request_id":key(nonce)}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(untrusted_boot["state"], "interrupted");
+        assert_eq!(untrusted_boot["reason"], "boot_failed");
+        h.sweep().await;
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn b2_snapshot_barrier_races_busy_unpublish_pending_removal_and_old_origin() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 2500).await;
+        let vm_id = parse_id(vm.as_str().unwrap()).unwrap();
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+
+        // Create a clean baseline snapshot first.
+        assert_eq!(
+            terminal(&a, &call(&a, "vm_stop", args(2505)).await).await["state"],
+            "succeeded"
+        );
+        let p1 =
+            terminal(&a, &call(&a, "vm_snapshot_create", args(2506)).await).await["snapshot_id"]
+                .clone();
+        assert_eq!(
+            terminal(&a, &call(&a, "vm_start", args(2507)).await).await["state"],
+            "succeeded"
+        );
+
+        // 1. Publish-first: held DNS POST blocks snapshot create and restore.
+        let (entered, in_post) = tokio::sync::oneshot::channel();
+        let (release, hold) = tokio::sync::oneshot::channel();
+        *fake.post_gate.lock().unwrap() = Some((entered, hold));
+        let pub1 = call(&a, "publish_site", args(2508)).await;
+        tokio::time::timeout(Duration::from_secs(2), in_post)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            call(&a, "vm_snapshot_create", args(2509)).await["reason"],
+            "snapshot_publish_not_quiesced"
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_restore",
+                json!({"vm_id":vm,"snapshot_id":p1,"request_id":key(2510)})
+            )
+            .await["reason"],
+            "snapshot_publish_not_quiesced"
+        );
+        release.send(()).unwrap();
+        assert_eq!(terminal(&a, &pub1).await["state"], "succeeded");
+        // Colliding-key owner unpublish still triggers early local ingress revocation.
+        assert_eq!(
+            call(&a, "unpublish_site", args(2508)).await["reason"],
+            "key_collision"
+        );
+        until(|| !fake.local.load(SeqCst)).await;
+        let unpub1 = call(&a, "unpublish_site", args(2511)).await;
+        assert_eq!(terminal(&a, &unpub1).await["state"], "succeeded");
+        assert_eq!(call(&a, "unpublish_site", args(2511)).await, unpub1);
+        assert_eq!(
+            terminal(&a, &call(&a, "vm_stop", args(2512)).await).await["state"],
+            "succeeded"
+        );
+
+        // 2. Restore-first: held snapshot copy holds effects slot; publish and fresh
+        //    same-VM unpublish (with no durable intent) both refuse Busy with no action 16,
+        //    and restore commits cleanly once released.
+        let snap_entered = Arc::new(Notify::new());
+        let snap_release = Arc::new(Notify::new());
+        h.fixture(|f| f.snapshot_hold = Some((snap_entered.clone(), snap_release.clone())));
+        let restoring = call(
+            &a,
+            "vm_snapshot_restore",
+            json!({"vm_id":vm,"snapshot_id":p1,"request_id":key(2513)}),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), snap_entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(call(&a, "publish_site", args(2514)).await["reason"], "busy");
+        assert_eq!(
+            call(&a, "unpublish_site", args(2515)).await["reason"],
+            "busy"
+        );
+        assert_eq!(
+            h.supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| crate::store::vm::count(
+                    db,
+                    "SELECT count(*) FROM activity WHERE vm=?1 AND status=0 AND action=16",
+                    [vm_id]
+                ))
+                .unwrap(),
+            0
+        );
+        snap_release.notify_one();
+        assert_eq!(terminal(&a, &restoring).await["state"], "succeeded");
+
+        // 3. Pending DNS removal across restart still fences snapshots until settled.
+        assert_eq!(
+            terminal(&a, &call(&a, "vm_start", args(2516)).await).await["state"],
+            "succeeded"
+        );
+        assert_eq!(
+            terminal(&a, &call(&a, "publish_site", args(2517)).await).await["state"],
+            "succeeded"
+        );
+        fake.credential.store(false, SeqCst);
+        let unpub_fail = call(&a, "unpublish_site", args(2518)).await;
+        assert_eq!(terminal(&a, &unpub_fail).await["state"], "failed");
+        assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
+        assert_eq!(
+            terminal(&a, &call(&a, "vm_stop", args(2519)).await).await["state"],
+            "succeeded"
+        );
+        drop(a);
+        assert_eq!(
+            h.shutdown().await.unwrap_err().to_string(),
+            "server-drain-unconfirmed"
+        );
+        let mut h = h.reopen(|_| {}).await;
+        enroll(
+            &h,
+            &fake,
+            true,
+            Profile::synthetic(h.supervisor().host_id, "tunnel-site"),
+        );
+        let a = h.client(0).await;
+        assert_eq!(
+            call(&a, "vm_snapshot_create", args(2520)).await["reason"],
+            "snapshot_publish_not_quiesced"
+        );
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_restore",
+                json!({"vm_id":vm,"snapshot_id":p1,"request_id":key(2521)})
+            )
+            .await["reason"],
+            "snapshot_publish_not_quiesced"
+        );
+        fake.credential.store(true, SeqCst);
+        settle(&h, &a, &vm).await;
+        let old_gen: Id = h
+            .supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                Ok(db.query_row(
+                    "SELECT id FROM vm_generations WHERE static_id=?1 AND active=1",
+                    [vm_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_snapshot_restore",
+                    json!({"vm_id":vm,"snapshot_id":p1,"request_id":key(2522)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        assert_eq!(
+            terminal(&a, &call(&a, "vm_start", args(2523)).await).await["state"],
+            "succeeded"
+        );
+
+        // 4. Publish intent carrying the displaced old generation is rejected.
+        let mut stale_origin = h.fixture(|f| f.publish_origin(vm_id)).unwrap();
+        assert_ne!(stale_origin.generation, old_gen);
+        stale_origin.generation = old_gen;
+        let profile = Profile::synthetic(h.supervisor().host_id, "tunnel-site");
+        let stale_intent = profile.intent(vm_id, &stale_origin).unwrap();
+        let stale_name = crate::vm::static_web::StaticName::parse("tunnel-site").unwrap();
+        assert!(matches!(
+            h.supervisor()
+                .controller
+                .admit_publication(
+                    "alpha",
+                    RequestId::parse(&key(2524)).unwrap(),
+                    vm_id,
+                    Some((&stale_intent, &stale_name)),
+                )
+                .unwrap(),
+            Err(Refusal::NotReady)
+        ));
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_copy_cleanup_preserves_committed_static_point_and_active_media() {
+        let mut h =
+            Harness::start_configured(false, false, true, |f| f.snapshot_test_media = true).await;
+        let a = h.client(0).await;
+        let build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(WEB_RECIPE_ID),"request_id":key(2700)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(&a, &build).await["template_id"].clone();
+        let vm = terminal(
+            &a,
+            &call(
+                &a,
+                "static_vm_create",
+                json!({
+                    "template_id":template,"name":"stale-cleanup","request_id":key(2701)
+                }),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+        let vm_id = parse_id(vm.as_str().unwrap()).unwrap();
+        let mut point = Value::Null;
+        for restore in [false, true] {
+            let entered = Arc::new(Notify::new());
+            let resume = Arc::new(Notify::new());
+            h.fixture(|f| f.snapshot_hold = Some((entered.clone(), resume.clone())));
+            let op = if restore {
+                call(
+                    &a,
+                    "vm_snapshot_restore",
+                    json!({"vm_id":vm,"snapshot_id":point,"request_id":key(2703)}),
+                )
+                .await
+            } else {
+                call(
+                    &a,
+                    "vm_snapshot_create",
+                    json!({"vm_id":vm,"request_id":key(2702)}),
+                )
+                .await
+            };
+            assert_eq!(op["ok"], true, "{op}");
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .unwrap();
+
+            // Both candidate identities exist. Suspend quiescence after this
+            // sweep collected them, then publish those exact objects.
+            let reaper = h.fixture(|f| f.reaper());
+            let mut stall = Stall::install(&reaper.after_selection);
+            let ctl = h.supervisor().controller.clone();
+            let sweep =
+                tokio::task::spawn_blocking(move || ctl.sweep_with(&reaper, &*reaper.custody));
+            stall.entered().await;
+            let candidate: Id = h
+                .supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| {
+                    Ok(db.query_row(
+                        "SELECT candidate FROM vm_snapshot_work WHERE static_vm=?1",
+                        [vm_id],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            resume.notify_one();
+            let result = terminal(&a, &op).await;
+            assert_eq!(result["state"], "succeeded", "{result}");
+            if !restore {
+                point = result["snapshot_id"].clone();
+            }
+            let paths = h
+                .supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| {
+                    let published: bool = db.query_row(
+                        "SELECT active FROM vm_generations WHERE id=?1 AND static_id=?2",
+                        rusqlite::params![candidate, vm_id],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(published, restore);
+                    if !restore {
+                        let ready = crate::store::vm::count(
+                            db,
+                            "SELECT count(*) FROM vm_restore_points
+                             WHERE static_vm=?1 AND generation=?2 AND state='ready'",
+                            rusqlite::params![vm_id, candidate],
+                        )?;
+                        assert_eq!(ready, 1);
+                    }
+                    let mut stmt = db.prepare(
+                    "SELECT role,object_key FROM vm_artifacts WHERE generation_id=?1 ORDER BY role",
+                )?;
+                    let paths = stmt.query_map([candidate], |row| {
+                        let role: String = row.get(0)?;
+                        let key: Id = row.get(1)?;
+                        Ok(h.media.join(format!("{role}-{}", hex::encode(key))))
+                    })?;
+                    Ok(paths.collect::<rusqlite::Result<Vec<_>>>()?)
+                })
+                .unwrap();
+            assert_eq!(paths.len(), 2);
+            let bytes = paths
+                .iter()
+                .map(fs::read)
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap();
+            stall.release_and_join().await;
+            assert!(sweep.await.unwrap().unwrap());
+            for (path, original) in paths.iter().zip(bytes) {
+                assert!(
+                    fs::read(path).is_ok_and(|bytes| bytes == original),
+                    "stale reaper removed committed media"
+                );
+            }
+            h.sweep().await;
+        }
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_boot_join_keeps_later_expiry_turns_unconfirmed() {
+        use crate::vm::{reaper::CleanupKind, runtime::ReaperRuntime};
+        for force in [false, true] {
+            let root = crate::service::application::tests::private_temp();
+            let fixture = Fixture::new(root.path(), Default::default());
+            let vm = [7; 16];
+            let mut boot = Boot::start(&Shutdown::default()).await.unwrap();
+            // A running blocking task cannot be aborted. Hold this join across
+            // the stop deadline, even on the forced path.
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, hold) = std::sync::mpsc::channel();
+            let (finished, joined) = tokio::sync::oneshot::channel();
+            let original = std::mem::replace(
+                &mut boot.guest,
+                tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    let _ = hold.recv();
+                    let _ = finished.send(());
+                    Ok(())
+                }),
+            );
+            started.await.unwrap();
+            fixture
+                .live
+                .lock()
+                .unwrap()
+                .boots
+                .insert(vm, Slot::Idle(Box::new(boot)));
+            let reaper = fixture.reaper();
+            tokio::task::spawn_blocking(move || {
+                let work = CleanupWork {
+                    kind: CleanupKind::Expiry { vm, activity_id: 1 },
+                    pending_worker: None,
+                    snapshot_phase: None,
+                    artifacts: Vec::new(),
+                    accounted: false,
+                    release_only: true,
+                };
+                let deadline = Instant::now() + Duration::from_millis(20);
+                let result = if force {
+                    reaper.force_reap(&work, deadline)
+                } else {
+                    reaper.graceful_stop(&work, deadline)
+                };
+                assert_eq!(result, runtime::StopDisposition::ChargedQuarantine);
+                let later = Instant::now() + Duration::from_secs(1);
+                assert!(matches!(
+                    reaper.quiesce(&work, later),
+                    runtime::Quiesced::Unconfirmed
+                ));
+                assert_eq!(
+                    reaper.force_reap(&work, later),
+                    runtime::StopDisposition::ChargedQuarantine
+                );
+            })
+            .await
+            .unwrap();
+            release.send(()).unwrap();
+            joined.await.unwrap();
+            original.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn running_test_expiry_force_reaps_without_disposing_media_then_reconciles_pairs_active_last()
+     {
+        let mut h = Harness::start_configured(false, false, true, |fixture| {
+            fixture.snapshot_test_media = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let ubu_build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(2600)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let ubu_tpl = terminal(&a, &ubu_build).await["template_id"].clone();
+        let web_tpl = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_template_build",
+                json!({"recipe_id":hex::encode(WEB_RECIPE_ID),"request_id":key(2601)}),
+            )
+            .await,
+        )
+        .await["template_id"]
+            .clone();
+
+        let run_clone = call(
+            &a,
+            "vm_create",
+            json!({"template_id":ubu_tpl,"request_id":key(2602),"ttl_s":60}),
+        )
+        .await;
+        let vm_run = terminal(&a, &run_clone).await["vm_id"].clone();
+        let vm_run_id = parse_id(vm_run.as_str().unwrap()).unwrap();
+        let sib_test = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_create",
+                json!({"template_id":ubu_tpl,"request_id":key(2603),"ttl_s":600}),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+        let sib_static = terminal(
+            &a,
+            &call(
+                &a,
+                "static_vm_create",
+                json!({"name":"exp-sib-static","template_id":web_tpl,"request_id":key(2604)}),
+            )
+            .await,
+        )
+        .await["vm_id"]
+            .clone();
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_snapshot_create",
+                    json!({"vm_id":sib_static,"request_id":key(2605)}),
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+
+        let snap1 = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm_run,"request_id":key(2606)}),
+            )
+            .await,
+        )
+        .await["snapshot_id"]
+            .clone();
+        let snap2 = terminal(
+            &a,
+            &call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm_run,"request_id":key(2607)}),
+            )
+            .await,
+        )
+        .await["snapshot_id"]
+            .clone();
+
+        // Start vm_run and force expiry through force_reap (joining peer+guest).
+        assert_eq!(
+            terminal(
+                &a,
+                &call(
+                    &a,
+                    "vm_start",
+                    json!({"vm_id":vm_run,"request_id":key(2608)})
+                )
+                .await,
+            )
+            .await["state"],
+            "succeeded"
+        );
+        h.fixture(|f| {
+            f.live.lock().unwrap().force_reap_only.insert(vm_run_id);
+        });
+
+        let active_paths = fixture_pair_paths(&h, &vm_run, true);
+        let sib_test_paths = fixture_pair_paths(&h, &sib_test, true);
+        let sib_static_paths = fixture_pair_paths(&h, &sib_static, true);
+        let snap_paths = |snap: &Value| -> [std::path::PathBuf; 2] {
+            let sid = parse_id(snap.as_str().unwrap()).unwrap();
+            h.supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| {
+                    let mut stmt = db.prepare(
+                        "SELECT a.role,a.object_key FROM vm_restore_points p
+                         JOIN vm_artifacts a ON a.generation_id=p.generation
+                         WHERE p.id=?1 ORDER BY a.role",
+                    )?;
+                    let files = stmt
+                        .query_map([sid], |row| {
+                            Ok(h.media.join(format!(
+                                "{}-{}",
+                                row.get::<_, String>(0)?,
+                                hex::encode(row.get::<_, Id>(1)?)
+                            )))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(files.try_into().expect("snapshot pair"))
+                })
+                .unwrap()
+        };
+        let snap1_paths = snap_paths(&snap1);
+        let snap2_paths = snap_paths(&snap2);
+        let golden_paths: [std::path::PathBuf; 2] = {
+            let tpl_id = parse_id(ubu_tpl.as_str().unwrap()).unwrap();
+            h.supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| {
+                    let mut stmt = db.prepare(
+                        "SELECT a.role,a.object_key FROM vm_build_intents b
+                         JOIN vm_generations g ON g.build_id=b.id AND g.active=1
+                         JOIN vm_artifacts a ON a.generation_id=g.id
+                         WHERE b.template_id=?1 ORDER BY a.role",
+                    )?;
+                    let files = stmt
+                        .query_map([tpl_id], |row| {
+                            Ok(h.media.join(format!(
+                                "{}-{}",
+                                row.get::<_, String>(0)?,
+                                hex::encode(row.get::<_, Id>(1)?)
+                            )))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(files.try_into().expect("golden pair"))
+                })
+                .unwrap()
+        };
+        let deadline = run_clone["expires_at_ms"].as_i64().unwrap();
+        h.now.store(deadline, Ordering::Relaxed);
+
+        // Sweep 1: release-only force_reap joins boot without disposing active media,
+        // then disposes exactly ONE non-active snapshot pair.
+        h.sweep().await;
+        assert!(!h.fixture(|f| f.ready(vm_run_id)));
+        assert!(active_paths.iter().all(|p| p.exists()));
+        let s1_alive = snap1_paths.iter().all(|p| p.exists());
+        let s2_alive = snap2_paths.iter().all(|p| p.exists());
+        assert_ne!(s1_alive, s2_alive, "exactly one snapshot pair disposed");
+        assert_eq!(
+            h.supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| crate::store::vm::count(
+                    db,
+                    "SELECT count(*) FROM vm_tombstones",
+                    []
+                ))
+                .unwrap(),
+            0
+        );
+
+        // Sweep 2: disposes the second non-active snapshot pair; active still kept.
+        h.sweep().await;
+        assert!(active_paths.iter().all(|p| p.exists()));
+        assert!(snap1_paths.iter().all(|p| !p.exists()));
+        assert!(snap2_paths.iter().all(|p| !p.exists()));
+        assert_eq!(
+            h.supervisor()
+                .controller
+                .store_for_test()
+                .transact(|db| crate::store::vm::count(
+                    db,
+                    "SELECT count(*) FROM vm_tombstones",
+                    []
+                ))
+                .unwrap(),
+            0
+        );
+
+        // Sweep 3: disposes active pair LAST and writes the tombstone.
+        h.sweep().await;
+        assert!(active_paths.iter().all(|p| !p.exists()));
+        assert_eq!(
+            call(&a, "vm_get", json!({"vm_id":vm_run})).await["state"],
+            "expired"
+        );
+        h.supervisor()
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                assert_eq!(
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_tombstones WHERE id=?1",
+                        [vm_run_id]
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_snapshot_reconciliation
+                         WHERE vm=?1 AND cause='expiry_point' AND expiry_activity IS NOT NULL",
+                        [vm_run_id]
+                    )?,
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        // Sibling TEST, sibling static (+ backup), and golden remain untouched.
+        assert!(golden_paths.iter().all(|p| p.exists()));
+        assert!(sib_test_paths.iter().all(|p| p.exists()));
+        assert!(sib_static_paths.iter().all(|p| p.exists()));
+        assert_eq!(
+            call(&a, "vm_snapshot_list", json!({"vm_id":sib_static})).await["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(a);
         h.shutdown().await.unwrap();
     }
 
@@ -7349,7 +11243,61 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
+        const EXPECTED_TOOL_COUNT: usize = 18 + 4;
+        assert_eq!(names.len(), EXPECTED_TOOL_COUNT);
         assert_eq!(names, ToolName::ALL.map(ToolName::name));
+        for (tool_name, required, optional) in [
+            (
+                "vm_snapshot_create",
+                &["vm_id", "request_id"][..],
+                &["name"][..],
+            ),
+            ("vm_snapshot_list", &["vm_id"][..], &["limit", "cursor"][..]),
+            (
+                "vm_snapshot_restore",
+                &["vm_id", "snapshot_id", "request_id"][..],
+                &[][..],
+            ),
+            (
+                "vm_snapshot_delete",
+                &["vm_id", "snapshot_id", "request_id"][..],
+                &[][..],
+            ),
+        ] {
+            let tool = tools
+                .tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == tool_name)
+                .unwrap_or_else(|| panic!("missing tool {tool_name}"));
+            let actual_required = tool
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual_required, required,
+                "required mismatch for {tool_name}"
+            );
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .unwrap();
+            assert_eq!(
+                properties.len(),
+                required.len() + optional.len(),
+                "property count mismatch for {tool_name}"
+            );
+            for prop in required.iter().chain(optional.iter()) {
+                assert!(
+                    properties.contains_key(*prop),
+                    "missing property {prop} on {tool_name}"
+                );
+            }
+        }
         assert!(
             tools.tools.iter().all(|tool| {
                 tool.input_schema.get("additionalProperties") == Some(&json!(false))

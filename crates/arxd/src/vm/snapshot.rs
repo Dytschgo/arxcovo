@@ -54,6 +54,36 @@ impl SnapshotName {
     }
 }
 
+pub(crate) enum Request {
+    Create(Option<SnapshotName>),
+    Restore(Id),
+    Delete(Id),
+}
+
+impl Request {
+    pub(crate) fn binding(&self, vm: Id) -> super::model::Subject<'static> {
+        let mut hash = Sha256::new()
+            .chain_update(b"arxcovo.vm.snapshot.request.v1\0")
+            .chain_update(vm);
+        match self {
+            Self::Create(None) => hash.update([0]),
+            Self::Create(Some(name)) => {
+                hash.update([1]);
+                hash.update(name.as_str());
+            }
+            Self::Restore(id) => {
+                hash.update([2]);
+                hash.update(id);
+            }
+            Self::Delete(id) => {
+                hash.update([3]);
+                hash.update(id);
+            }
+        }
+        super::model::Subject::Snapshot(vm, hash.finalize().into())
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct Golden {
     pub object: Id,

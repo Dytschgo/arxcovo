@@ -859,6 +859,112 @@ async fn vm_list_and_detail_use_the_controller_catalog() {
     .await;
 }
 
+#[tokio::test]
+async fn dashboard_vm_catalog_shows_ready_test_snapshots_and_hides_pending_deleting_and_static() {
+    let dir = directory();
+    let assets = dir.path().join("dist");
+    fs::create_dir(&assets).unwrap();
+    fs::write(assets.join("index.html"), "<!doctype html>").unwrap();
+    fs::write(assets.join("script.js"), "export {};").unwrap();
+    let activity = Arc::new(Activity::open(dir.path()).unwrap());
+    let clock = Arc::new(TestClock(Mutex::new(ClockReading {
+        monotonic: tokio::time::Instant::now().into_std(),
+        utc_ms: NOW,
+    })));
+    let root = dir.path().join("vm");
+    private_dir(&root);
+    let _controller =
+        crate::vm::VmController::open(&root, crate::vm::VmPolicy::default(), SystemClock).unwrap();
+    let db = rusqlite::Connection::open(root.join("activity.sqlite3")).unwrap();
+    db.execute_batch(
+        "INSERT INTO vm_templates VALUES(zeroblob(16),1,zeroblob(32),zeroblob(32),zeroblob(32),1024);
+         INSERT INTO vm_instances(id,template,principal,expires_ms,state,dashboard_cpus,dashboard_memory)
+            VALUES(unhex('01010101010101010101010101010101'),zeroblob(16),'alice',1795438800000,1,4,4096);
+         INSERT INTO vm_snapshots(vm,id,ready,dashboard_created_ms)
+            VALUES(unhex('01010101010101010101010101010101'),unhex('00000000000000000000000000000001'),1,1795435200000);
+         INSERT INTO vm_generations(id,vm_id,generation,active)
+            VALUES
+              (unhex('10000000000000000000000000000001'),unhex('01010101010101010101010101010101'),1,1),
+              (unhex('10000000000000000000000000000002'),unhex('01010101010101010101010101010101'),2,0),
+              (unhex('10000000000000000000000000000003'),unhex('01010101010101010101010101010101'),3,0),
+              (unhex('10000000000000000000000000000004'),unhex('01010101010101010101010101010101'),4,0),
+              (unhex('10000000000000000000000000000005'),unhex('01010101010101010101010101010101'),5,0);
+         INSERT INTO vm_restore_points(id,vm,static_vm,host,name,captured_ms,state,provenance,generation,lineage,charge)
+            SELECT unhex('00000000000000000000000000000002'),unhex('01010101010101010101010101010101'),NULL,
+                id,'ready-point',1795435300000,'ready',unhex('10000000000000000000000000000001'),
+                unhex('10000000000000000000000000000002'),zeroblob(32),8192
+            FROM vm_state_host WHERE singleton=1;
+         INSERT INTO vm_restore_points(id,vm,static_vm,host,name,captured_ms,state,provenance,generation,lineage,charge)
+            SELECT unhex('00000000000000000000000000000003'),unhex('01010101010101010101010101010101'),NULL,
+                id,'copying-point',1795435400000,'copying',unhex('10000000000000000000000000000001'),
+                unhex('10000000000000000000000000000003'),zeroblob(32),8192
+            FROM vm_state_host WHERE singleton=1;
+         INSERT INTO vm_restore_points(id,vm,static_vm,host,name,captured_ms,state,provenance,generation,lineage,charge)
+            SELECT unhex('00000000000000000000000000000004'),unhex('01010101010101010101010101010101'),NULL,
+                id,'deleting-point',1795435500000,'deleting',unhex('10000000000000000000000000000001'),
+                unhex('10000000000000000000000000000004'),zeroblob(32),8192
+            FROM vm_state_host WHERE singleton=1;
+         INSERT INTO vm_restore_points(id,vm,static_vm,host,name,captured_ms,state,provenance,generation,lineage,charge)
+            SELECT unhex('00000000000000000000000000000005'),unhex('01010101010101010101010101010101'),NULL,
+                id,'quarantined-point',1795435600000,'quarantined',unhex('10000000000000000000000000000001'),
+                unhex('10000000000000000000000000000005'),zeroblob(32),8192
+            FROM vm_state_host WHERE singleton=1;
+         INSERT INTO vm_static_instances(id,name,principal,host,template,source_generation,
+                recipe_digest,disk_digest,vars_digest,state,persistent,staging,origin_generation)
+            SELECT unhex('02020202020202020202020202020202'),'web-site','alice',id,zeroblob(16),
+                unhex('20000000000000000000000000000001'),zeroblob(32),zeroblob(32),zeroblob(32),1,4096,0,
+                unhex('20000000000000000000000000000001')
+            FROM vm_state_host WHERE singleton=1;
+         INSERT INTO vm_generations(id,static_id,generation,active)
+            VALUES
+              (unhex('20000000000000000000000000000001'),unhex('02020202020202020202020202020202'),1,1),
+              (unhex('20000000000000000000000000000002'),unhex('02020202020202020202020202020202'),2,0);
+         INSERT INTO vm_restore_points(id,vm,static_vm,host,name,captured_ms,state,provenance,generation,lineage,charge)
+            SELECT unhex('00000000000000000000000000000006'),NULL,unhex('02020202020202020202020202020202'),
+                id,'static-ready',1795435700000,'ready',unhex('20000000000000000000000000000001'),
+                unhex('20000000000000000000000000000002'),zeroblob(32),8192
+            FROM vm_state_host WHERE singleton=1;",
+    )
+    .unwrap();
+    drop(db);
+    let vm_catalog = Some(Arc::new(crate::vm::DashboardCatalog::open(&root).unwrap()));
+    let sessions = Arc::new(Sessions::new());
+    let state = Dashboard {
+        boundary: Boundary::new("localhost:4444".into(), false),
+        assets: Arc::new(Assets::load(&assets).unwrap()),
+        activity: activity.clone(),
+        vm_catalog,
+        verifier: Arc::new(Verifier::cheap(PASSWORD)),
+        sessions: sessions.clone(),
+        clock: clock.clone(),
+        capacity: Arc::new(tokio::sync::Semaphore::new(8)),
+        streams: streams::Backends::new(None),
+        _password_lock: None,
+    };
+    let f = Fixture {
+        _dir: dir,
+        app: state.clone().router(),
+        state,
+        activity,
+        clock,
+        sessions,
+    };
+    let (cookie, _) = f.login(None).await;
+    let list = body(f.get("/api/v1/vms", &cookie).await).await;
+    let vms = list["vms"].as_array().unwrap();
+    assert_eq!(vms.len(), 1);
+    let snapshots = vms[0]["snapshots"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[0]["id"], "00000000000000000000000000000001");
+    assert_eq!(snapshots[1]["id"], "00000000000000000000000000000002");
+    assert_eq!(snapshots[1]["sizeBytes"], 8192);
+    let id = vms[0]["id"].as_str().unwrap();
+    assert_eq!(
+        body(f.get(&format!("/api/v1/vms/{id}"), &cookie).await).await,
+        vms[0]
+    );
+}
+
 #[test]
 fn static_snapshot_is_bounded_and_immutable() {
     let dir = directory();

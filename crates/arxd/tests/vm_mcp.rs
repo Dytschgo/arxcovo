@@ -389,8 +389,47 @@ async fn inspect_vm(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>
             "publish_site",
             "unpublish_site",
             "publish_status",
+            "vm_snapshot_create",
+            "vm_snapshot_list",
+            "vm_snapshot_restore",
+            "vm_snapshot_delete",
         ]
     );
+    let id = json!({"type":"string","pattern":"^[0-9a-f]{32}$"});
+    let snapshot_schemas = [
+        json!({
+            "properties":{"vm_id":id,"request_id":id,
+                "name":{"type":"string","minLength":1,"maxLength":48,
+                    "pattern":"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$"}},
+            "required":["vm_id","request_id"]
+        }),
+        json!({
+            "properties":{"vm_id":id,"limit":{"type":"integer","minimum":1,"maximum":4,"default":4},
+                "cursor":{"type":"string","maxLength":96,"pattern":"^[A-Za-z0-9_-]+$"}},
+            "required":["vm_id"]
+        }),
+        json!({
+            "properties":{"vm_id":id,"snapshot_id":id,"request_id":id},
+            "required":["vm_id","snapshot_id","request_id"]
+        }),
+    ];
+    for (tool, mut expected) in tools.tools[18..].iter().zip(
+        [
+            &snapshot_schemas[0],
+            &snapshot_schemas[1],
+            &snapshot_schemas[2],
+            &snapshot_schemas[2],
+        ]
+        .into_iter()
+        .cloned(),
+    ) {
+        expected["type"] = json!("object");
+        expected["additionalProperties"] = json!(false);
+        assert_eq!(
+            serde_json::Value::Object((*tool.input_schema).clone()),
+            expected
+        );
+    }
     let response = client
         .call_tool(CallToolRequestParams::new("vm_catalog"))
         .await
