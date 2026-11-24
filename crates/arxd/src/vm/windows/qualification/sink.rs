@@ -104,6 +104,9 @@ thread_local! {
     static FAULT: Cell<Option<(&'static str, Step)>> = const { Cell::new(None) };
     /// Test-only: end the whole process at one commit step, as a kill would.
     static EXIT: Cell<Option<(&'static str, Step)>> = const { Cell::new(None) };
+    /// Test-only: runs once between the debris listing and its removal.
+    static AFTER_LISTING: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn fault(name: &str, step: Step) -> io::Result<()> {
@@ -385,13 +388,49 @@ fn clear_debris(dir: &File) -> io::Result<()> {
     if !debris {
         return Ok(());
     }
+    #[cfg(test)]
+    AFTER_LISTING.with(|hook| {
+        if let Some(mut run) = hook.borrow_mut().take() {
+            run();
+        }
+    });
     for (name, _) in &entries {
         // An entry another process still holds open refuses the exclusive
         // open, so a live commit is never disturbed.
         let entry = open_child(dir, name, DELETE | SYNCHRONIZE, 0, FILE_OPEN)?;
+        // A run creates its temporary entries only after its claim.json is
+        // committed, and final names are never removed. So while this
+        // exclusive handle is held, the absence of claim.json under the held
+        // directory proves the entry is pre-claim debris that no run owns,
+        // however stale the listing above is. Holding the entry also stalls
+        // a concurrent claimant's own cleanup and emptiness check. If a claim
+        // exists, the handle closes without deletion and the claim refuses.
+        if claim_exists(dir)? {
+            return Err(io::Error::other("a claim exists beside the debris"));
+        }
         discard(&entry)?;
     }
     Ok(())
+}
+
+/// Whether claim.json exists under the held directory, looked up relative to
+/// its handle. The probe shares everything, so it never conflicts with
+/// another open; any outcome other than found or not found is an error.
+fn claim_exists(dir: &File) -> io::Result<bool> {
+    let probe = nt_open(
+        dir,
+        CLAIM,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    );
+    match probe {
+        Ok(_) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Exclusively create a hidden entry under the held directory, with the
@@ -414,6 +453,28 @@ fn open_child(
     access: u32,
     attributes_on_create: u32,
     disposition: u32,
+) -> io::Result<File> {
+    nt_open(
+        dir,
+        name,
+        access,
+        attributes_on_create,
+        0,
+        disposition,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    )
+}
+
+/// One relative open under the held directory that never follows a reparse
+/// point in the name.
+fn nt_open(
+    dir: &File,
+    name: &str,
+    access: u32,
+    attributes_on_create: u32,
+    share: u32,
+    disposition: u32,
+    options: u32,
 ) -> io::Result<File> {
     let mut units: Vec<u16> = name.encode_utf16().collect();
     let bytes = u16::try_from(units.len() * 2).map_err(io::Error::other)?;
@@ -442,9 +503,9 @@ fn open_child(
             &mut status_block,
             null(),
             attributes_on_create,
-            0,
+            share,
             disposition,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            options,
             null(),
             0,
         )
@@ -1004,6 +1065,98 @@ mod tests {
         put(&consumed, ".incomplete.json.partial");
         assert_eq!(claim(&consumed), refused);
         assert_eq!(names(&consumed), [".incomplete.json.partial", "claim.json"]);
+    }
+
+    /// Set by the race test for its claimant-B child process.
+    const RACE_CHILD: &str = "ARX_SINK_RACE_CLAIMANT";
+
+    /// Runs only as a child process: claimant B claims the named directory,
+    /// publishes one record, and ends the process while writing its summary
+    /// temporary, before the rename. Filesystem work only.
+    #[test]
+    #[ignore = "child process of a_stale_debris_list_never_deletes_a_file_beside_a_valid_claim"]
+    fn race_claimant_child() {
+        let Some(path) = std::env::var_os(RACE_CHILD) else {
+            return;
+        };
+        let path = LocalPath::parse(path.to_str().unwrap()).unwrap();
+        let (owner, _) = user();
+        let dir = EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[])
+            .unwrap();
+        EXIT.with(|exit| exit.set(Some(("incomplete.json", Step::Write))));
+        let results = [("inputs", raw(INPUTS))];
+        let _ = dir.publish(&"test", &(), 0, &entries(&results), &body());
+        unreachable!("claimant B ends during its summary write");
+    }
+
+    #[test]
+    fn a_stale_debris_list_never_deletes_a_file_beside_a_valid_claim() {
+        use std::{cell::RefCell, rc::Rc};
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (owner, path) = private_dir(root.path(), "evidence");
+        // Pre-claim debris from an earlier interrupted run.
+        std::fs::write(
+            format!(r"{}\.incomplete.json.partial", path.as_str()),
+            b"old debris",
+        )
+        .unwrap();
+        let target = path.as_str().to_owned();
+        let after_b = Rc::new(RefCell::new(Vec::<String>::new()));
+        let b_temporary = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let (seen, seen_bytes) = (after_b.clone(), b_temporary.clone());
+        // Claimant A pauses after listing the debris; claimant B then claims
+        // the directory and ends inside its summary commit.
+        AFTER_LISTING.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "vm::windows::qualification::sink::tests::race_claimant_child",
+                        "--exact",
+                        "--ignored",
+                        "--test-threads=1",
+                    ])
+                    .env(RACE_CHILD, &target)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap();
+                assert_eq!(status.code(), Some(3), "B ends inside its summary commit");
+                let directory = LocalPath::parse(&target).unwrap();
+                *seen.borrow_mut() = names(&directory);
+                *seen_bytes.borrow_mut() = read(&directory, ".incomplete.json.partial");
+            }));
+        });
+        let claimed_by_a =
+            EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[]).err();
+        // B's run: its claim, its record and its summary temporary.
+        assert_eq!(
+            *after_b.borrow(),
+            [".incomplete.json.partial", "claim.json", "inputs.json"]
+        );
+        assert!(b_temporary.borrow().starts_with(br#"{"contract""#));
+        // A resumes with its stale list, finds B's claim under the held
+        // directory, deletes nothing and refuses.
+        assert_eq!(claimed_by_a, Some(NativeRefusal::PathCustodyUnverified));
+        assert_eq!(
+            names(&path),
+            [".incomplete.json.partial", "claim.json", "inputs.json"]
+        );
+        assert_eq!(
+            read(&path, ".incomplete.json.partial"),
+            *b_temporary.borrow()
+        );
+    }
+
+    #[test]
+    fn a_live_temporary_entry_is_never_deleted() {
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (_, path) = private_dir(root.path(), "evidence");
+        let pin = PathPin::open(&path, true, true).unwrap();
+        let live = create_hidden(&pin.leaf, ".incomplete.json.partial").unwrap();
+        let other = PathPin::open(&path, true, true).unwrap();
+        assert!(clear_debris(&other.leaf).is_err());
+        assert_eq!(names(&path), [".incomplete.json.partial"]);
+        drop(live);
     }
 
     #[test]
