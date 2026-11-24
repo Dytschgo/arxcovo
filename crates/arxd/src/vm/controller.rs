@@ -46,6 +46,10 @@ impl AdmissionGate {
 }
 
 impl<C: Clock> VmController<C> {
+    pub(crate) fn compose_now(&self) -> Result<i64> {
+        utc(self.clock.now())
+    }
+
     pub(crate) fn compose_store(&self) -> &VmStore {
         &self.store
     }

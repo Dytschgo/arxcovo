@@ -78,6 +78,7 @@ pub(crate) enum Fault {
     NotReady,
     Busy,
     ReplayFull,
+    StaleKey,
     KeyCollision,
 }
 
@@ -174,7 +175,7 @@ pub(crate) fn nonce() -> Result<Id> {
 pub(crate) struct Mutation {
     pub target: Target,
     pub kind: Kind,
-    pub key: Id,
+    pub key: super::RequestId,
     pub release: Option<Id>,
 }
 
@@ -187,6 +188,7 @@ pub(crate) struct Intent {
     pub release: Id,
     pub revision: u64,
     pub sent: bool,
+    pub closed: Option<String>,
     pub receipt: Option<OperationView>,
     pub secrets: Vec<SecretRef>,
     pub secret_sent: u8,
@@ -201,6 +203,16 @@ impl Intent {
             && request
                 .release
                 .is_none_or(|release| release == self.release)
+    }
+
+    pub(crate) fn pending_state(&self) -> &str {
+        self.closed
+            .as_deref()
+            .unwrap_or(if self.sent || self.secret_sent != 0 {
+                "unresolved"
+            } else {
+                "pending"
+            })
     }
 
     fn accepts(&self, view: &OperationView) -> bool {
@@ -267,6 +279,12 @@ pub(crate) struct Session {
     reason = "reserved for qualified activation and fake peer fixtures"
 )]
 impl Session {
+    pub(crate) fn is_open(&self) -> bool {
+        self.channel
+            .try_lock()
+            .is_ok_and(|channel| channel.is_open())
+    }
+
     pub(crate) fn new(generation: Id, channel: ComposeChannel) -> Self {
         Self {
             generation,
@@ -289,23 +307,30 @@ impl Host {
         dead_code,
         reason = "reserved for qualified activation and fake peer fixtures"
     )]
-    pub(crate) fn attach(&self, vm: Id, session: Session) -> Result<()> {
+    pub(crate) fn attach(
+        &self,
+        store: &crate::store::vm::VmStore,
+        vm: Id,
+        session: Session,
+    ) -> Result<()> {
         use std::collections::hash_map::Entry;
         let mut sessions = self
             .sessions
             .lock()
             .map_err(|_| anyhow::anyhow!("Compose sessions unavailable"))?;
+        store.transact(|db| store::register_boot(db, vm, session.generation, session.wire_boot))?;
         match sessions.entry(vm) {
             Entry::Vacant(slot) => {
                 slot.insert(Arc::new(session));
             }
+            Entry::Occupied(mut slot)
+                if slot.get().generation != session.generation
+                    || slot.get().wire_boot != session.wire_boot =>
+            {
+                slot.insert(Arc::new(session));
+            }
             Entry::Occupied(slot) => {
                 let current = slot.get();
-                ensure!(
-                    current.generation == session.generation
-                        && current.wire_boot == session.wire_boot,
-                    "Compose boot replacement requires retirement"
-                );
                 let mut channel = current
                     .channel
                     .try_lock()
@@ -386,9 +411,11 @@ impl Host {
             return Ok(());
         };
         if intent.receipt.is_some()
+            || intent.closed.is_some()
             || intent.target != *target
             || intent.generation != session.generation
             || intent.boot != session.wire_boot
+            || !db.transact(|db| store::live_boot(db, target.vm, intent.generation, intent.boot))?
             || db.transact(|db| store::boot(db, principal, target))? != Some(intent.generation)
         {
             return Ok(());
@@ -413,21 +440,27 @@ impl Host {
                 ..
             } if !intent.sent => {
                 let current = observe(&mut channel, target, cancel).await?;
-                ensure!(
-                    current
+                if intent.secret_sent == 0
+                    && current
                         .as_ref()
-                        .is_none_or(|v| !v.recovery_required && v.running_operation.is_none()),
-                    "Compose guest busy"
-                );
+                        .is_some_and(|v| v.recovery_required || v.running_operation.is_some())
+                {
+                    return db.transact(|db| store::close(db, &intent, "refused"));
+                }
                 let expected = db
                     .transact(|db| store::status(db, principal, target))?
                     .ok_or_else(|| anyhow::anyhow!("Compose project unavailable"))?;
-                ensure!(
-                    current.as_ref().and_then(|v| v.committed_revision) == expected.revision
-                        && (intent.kind == Kind::Deploy
-                            || expected.revision == Some(intent.revision)),
-                    "Compose committed revision changed"
-                );
+                let guest_revision = current.as_ref().and_then(|view| view.committed_revision);
+                if guest_revision != expected.revision
+                    || (intent.kind != Kind::Deploy && expected.revision != Some(intent.revision))
+                {
+                    // Never discard a possibly submitted private effect.
+                    ensure!(
+                        intent.secret_sent == 0,
+                        "Compose revision changed during secret recovery"
+                    );
+                    return db.transact(|db| store::close(db, &intent, "refused"));
+                }
                 if intent.kind == Kind::Deploy {
                     stage(&mut channel, &intent, cancel).await?;
                 }
@@ -442,7 +475,7 @@ impl Host {
                         let bit = 1_u8 << index;
                         let delivery =
                             super::compose_secrets::Delivery::new(&intent, slot, expected.revision);
-                        delivery
+                        let result = delivery
                             .deliver(
                                 source.as_ref(),
                                 &mut channel,
@@ -459,7 +492,15 @@ impl Host {
                                     })
                                 },
                             )
-                            .await?;
+                            .await;
+                        if result
+                            .as_ref()
+                            .err()
+                            .is_some_and(|e| e.is::<super::compose_secrets::FailedDelivery>())
+                        {
+                            return db.transact(|db| store::close(db, &intent, "secret_failed"));
+                        }
+                        result?;
                     }
                 }
                 db.transact(|db| {
@@ -471,6 +512,22 @@ impl Host {
                 })?;
                 match channel.exchange(cancel, |id| intent.request(id)).await? {
                     Resp::ComposeOperationState { operation, .. } => operation,
+                    Resp::ComposeRejected {
+                        code:
+                            RejectCode::JournalFull
+                            | RejectCode::Busy
+                            | RejectCode::UnknownRelease
+                            | RejectCode::UnknownProject
+                            | RejectCode::RevisionNotNewer
+                            | RejectCode::NotCommitted
+                            | RejectCode::ProjectMismatch
+                            | RejectCode::ReconcileRequired
+                            | RejectCode::ProjectLimit
+                            | RejectCode::VolumeLimit
+                            | RejectCode::VolumeCollision
+                            | RejectCode::SecretMissing,
+                        ..
+                    } => return db.transact(|db| store::close(db, &intent, "refused")),
                     // An unproven rejection is ambiguous after crossing the submission boundary.
                     _ => return Ok(()),
                 }
@@ -572,9 +629,10 @@ fn success_witness(intent: &Intent, manifest: &Project, result: &ProjectView) ->
                             service.name == spec.name
                                 && service.revision == Some(intent.revision)
                                 && service.state == ServiceState::Running
-                                && (service.health == HealthState::Healthy
-                                    || (spec.health_path.is_none()
-                                        && service.health == HealthState::None))
+                                && matches!(
+                                    service.health,
+                                    HealthState::Healthy | HealthState::None
+                                )
                         })
                     })
             }

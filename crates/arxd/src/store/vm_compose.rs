@@ -10,6 +10,7 @@ CREATE TABLE vm_compose_projects (
     vm BLOB NOT NULL REFERENCES vm_static_instances(id),
     project TEXT NOT NULL,
     desired TEXT NOT NULL DEFAULT 'none' CHECK(desired IN ('none','started','stopped','down')),
+    last_revision INTEGER NOT NULL DEFAULT 0 CHECK(last_revision>=0),
     committed INTEGER,
     committed_release BLOB,
     settled_generation BLOB,
@@ -48,6 +49,18 @@ CREATE TABLE vm_compose_secrets (
     PRIMARY KEY(vm,project,slot,epoch),
     FOREIGN KEY(vm,project) REFERENCES vm_compose_projects(vm,project)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE vm_compose_release_epochs (
+    vm BLOB NOT NULL, project TEXT NOT NULL, release BLOB NOT NULL, slot TEXT NOT NULL, epoch INTEGER NOT NULL,
+    PRIMARY KEY(vm,project,release,slot,epoch),
+    FOREIGN KEY(vm,project,release) REFERENCES vm_compose_releases(vm,project,id),
+    FOREIGN KEY(vm,project,slot,epoch) REFERENCES vm_compose_secrets(vm,project,slot,epoch)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE vm_compose_boots (
+    vm BLOB NOT NULL REFERENCES vm_static_instances(id), generation BLOB NOT NULL, boot INTEGER NOT NULL,
+    retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1)),
+    PRIMARY KEY(vm,generation,boot)
+) STRICT, WITHOUT ROWID;
+CREATE UNIQUE INDEX vm_compose_current_boot ON vm_compose_boots(vm) WHERE retired=0;
 CREATE TABLE vm_compose_operations (
     id BLOB PRIMARY KEY CHECK(length(id)=16),
     principal TEXT NOT NULL,
@@ -59,14 +72,23 @@ CREATE TABLE vm_compose_operations (
     kind TEXT NOT NULL CHECK(kind IN ('deploy','start','stop','down')),
     release BLOB NOT NULL,
     revision INTEGER NOT NULL CHECK(revision>0),
+    valid_through_ms INTEGER NOT NULL CHECK(valid_through_ms>=0),
     sent INTEGER NOT NULL DEFAULT 0 CHECK(sent IN (0,1)),
     receipt TEXT,
+    closed TEXT CHECK(closed IN ('refused','secret_failed','retired_boot')),
     secret_refs TEXT NOT NULL,
     secret_sent INTEGER NOT NULL DEFAULT 0 CHECK(secret_sent BETWEEN 0 AND 15),
     UNIQUE(principal,request),
     FOREIGN KEY(vm,project,release) REFERENCES vm_compose_releases(vm,project,id)
 ) STRICT, WITHOUT ROWID;
-CREATE UNIQUE INDEX vm_compose_inflight ON vm_compose_operations(vm,project) WHERE receipt IS NULL;
+CREATE UNIQUE INDEX vm_compose_inflight ON vm_compose_operations(vm,project) WHERE receipt IS NULL AND closed IS NULL;
+-- Running/Recovering -> Stopped is committed only after host release proof.
+CREATE TRIGGER vm_compose_retire AFTER UPDATE OF state ON vm_static_instances
+WHEN OLD.state IN (2,3) AND NEW.state=1 BEGIN
+    UPDATE vm_compose_boots SET retired=1 WHERE vm=NEW.id AND retired=0;
+    UPDATE vm_compose_operations SET closed='retired_boot'
+        WHERE vm=NEW.id AND receipt IS NULL AND closed IS NULL;
+END;
 ";
 
 pub(crate) fn enroll(store: &VmStore, releases: &[Enrollment]) -> Result<()> {
@@ -118,10 +140,39 @@ pub(crate) fn enroll(store: &VmStore, releases: &[Enrollment]) -> Result<()> {
                     db.execute("INSERT INTO vm_compose_secrets VALUES(?1,?2,?3,?4,?5)",
                         params![vm, project, secret.slot, secret.epoch, secret.reference])?;
                 }
+                db.execute("INSERT OR IGNORE INTO vm_compose_release_epochs VALUES(?1,?2,?3,?4,?5)",
+                    params![vm, project, release.id, secret.slot, secret.epoch])?;
             }
         }
         require_headroom(db)
     })
+}
+
+pub(crate) fn register_boot(db: &Connection, vm: Id, generation: Id, boot: u64) -> Result<()> {
+    ensure!(
+        count(
+            db,
+            "SELECT count(*) FROM vm_static_instances s JOIN vm_generations g ON g.static_id=s.id
+        WHERE s.id=?1 AND g.id=?2 AND g.active=1 AND s.state=2",
+            params![vm, generation]
+        )? == 1,
+        "Compose generation unavailable"
+    );
+    db.execute(
+        "INSERT INTO vm_compose_boots(vm,generation,boot) VALUES(?1,?2,?3)
+        ON CONFLICT(vm,generation,boot) DO NOTHING",
+        params![vm, generation, boot],
+    )?;
+    ensure!(live_boot(db, vm, generation, boot)?, "Compose boot retired");
+    Ok(())
+}
+
+pub(crate) fn live_boot(db: &Connection, vm: Id, generation: Id, boot: u64) -> Result<bool> {
+    Ok(count(
+        db,
+        "SELECT count(*) FROM vm_compose_boots WHERE vm=?1 AND generation=?2 AND boot=?3 AND retired=0",
+        params![vm, generation, boot],
+    )? == 1)
 }
 
 pub(crate) fn boot(db: &Connection, principal: &str, target: &Target) -> Result<Option<Id>> {
@@ -143,7 +194,7 @@ pub(crate) fn status(
 ) -> Result<Option<ProjectStatus>> {
     Ok(db.query_row(
         "SELECT p.desired,p.committed,p.observed,p.settled_generation,p.settled_boot,p.last_receipt,
-            (SELECT id FROM vm_compose_operations o WHERE o.vm=p.vm AND o.project=p.project AND o.receipt IS NULL)
+            (SELECT id FROM vm_compose_operations o WHERE o.vm=p.vm AND o.project=p.project AND o.receipt IS NULL AND o.closed IS NULL)
          FROM vm_compose_projects p JOIN vm_static_instances s ON s.id=p.vm
          WHERE p.vm=?1 AND p.project=?2 AND s.principal=?3",
         params![target.vm,target.project,principal],
@@ -170,7 +221,7 @@ fn decode<T: serde::de::DeserializeOwned>(raw: &str) -> rusqlite::Result<T> {
 pub(crate) fn replay(db: &Connection, principal: &str, request: Id) -> Result<Option<Intent>> {
     Ok(db.query_row(
         "SELECT o.id,o.vm,o.project,o.generation,o.boot,o.kind,o.release,o.revision,o.sent,o.receipt,
-                r.digest,r.manifest,o.secret_refs,o.secret_sent
+                r.digest,r.manifest,o.secret_refs,o.secret_sent,o.closed
          FROM vm_compose_operations o JOIN vm_compose_releases r
            ON (r.vm,r.project,r.id)=(o.vm,o.project,o.release)
          WHERE o.principal=?1 AND o.request=?2", params![principal,request], |r| {
@@ -180,7 +231,7 @@ pub(crate) fn replay(db: &Connection, principal: &str, request: Id) -> Result<Op
                 generation:r.get(3)?, boot:r.get(4)?, kind:Kind::parse(&r.get::<_, String>(5)?)?,
                 release:r.get(6)?, revision:r.get(7)?, sent:r.get(8)?,
                 receipt:raw.map(|raw| decode(&raw)).transpose()?,
-                digest:r.get(10)?, bytes:r.get(11)?, secrets:decode(&r.get::<_, String>(12)?)?, secret_sent:r.get(13)?,
+                digest:r.get(10)?, bytes:r.get(11)?, secrets:decode(&r.get::<_, String>(12)?)?, secret_sent:r.get(13)?, closed:r.get(14)?,
             })
         },
     ).optional()?)
@@ -192,6 +243,7 @@ pub(crate) fn admit(
     request: &Mutation,
     generation: Id,
     boot: u64,
+    now: i64,
 ) -> Result<Result<Intent, Fault>> {
     let target = &request.target;
     let Some(status) = status(db, principal, target)? else {
@@ -204,6 +256,12 @@ pub(crate) fn admit(
     if matches!(request.kind, Kind::Deploy | Kind::Start) {
         require_headroom(db)?;
     }
+    let high_water = super::retry_time(db, now)?;
+    let valid_through = request.key.issued_at_ms + crate::vm::RETRY_WINDOW_MS;
+    if request.key.issued_at_ms > now || valid_through < high_water {
+        return Ok(Err(Fault::StaleKey));
+    }
+    db.execute("DELETE FROM vm_compose_operations WHERE valid_through_ms<?1 AND (receipt IS NOT NULL OR closed IS NOT NULL)",[high_water])?;
     let receipts = count(
         db,
         "SELECT count(*) FROM vm_compose_operations WHERE principal=?1",
@@ -219,8 +277,9 @@ pub(crate) fn admit(
     }
     let (release, revision) = if let Some(release) = request.release {
         let next: u64 = db.query_row(
-            "SELECT coalesce(max(revision),0)+1 FROM vm_compose_operations WHERE vm=?1 AND project=?2",
-            params![target.vm,target.project], |r| r.get(0),
+            "SELECT last_revision+1 FROM vm_compose_projects WHERE vm=?1 AND project=?2",
+            params![target.vm, target.project],
+            |r| r.get(0),
         )?;
         (release, next)
     } else {
@@ -248,7 +307,7 @@ pub(crate) fn admit(
         let project = arx_guest::compose::Project::parse(&bytes)
             .map_err(|_| anyhow::anyhow!("invalid enrolled Compose manifest"))?;
         let slots = &project.manifest().secrets;
-        let collected = secrets(db, target, slots)?;
+        let collected = secrets(db, target, release, slots)?;
         if collected.len() != slots.len() {
             return Ok(Err(Fault::NotReady));
         }
@@ -256,23 +315,34 @@ pub(crate) fn admit(
     } else {
         Vec::new()
     };
+    if request.kind == Kind::Deploy {
+        db.execute(
+            "UPDATE vm_compose_projects SET last_revision=?3 WHERE vm=?1 AND project=?2",
+            params![target.vm, target.project, revision],
+        )?;
+    }
     let id = nonce()?;
     db.execute(
-        "INSERT INTO vm_compose_operations(id,principal,request,vm,project,generation,boot,kind,release,revision,secret_refs)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-        params![id,principal,request.key,target.vm,target.project,generation,boot,request.kind.wire(),release,revision,serde_json::to_string(&secret_refs)?],
+        "INSERT INTO vm_compose_operations(id,principal,request,vm,project,generation,boot,kind,release,revision,secret_refs,valid_through_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![id,principal,request.key.key,target.vm,target.project,generation,boot,request.kind.wire(),release,revision,serde_json::to_string(&secret_refs)?,valid_through],
     )?;
-    Ok(Ok(replay(db, principal, request.key)?.ok_or_else(
+    Ok(Ok(replay(db, principal, request.key.key)?.ok_or_else(
         || anyhow::anyhow!("Compose intent unavailable"),
     )?))
 }
 
-fn secrets(db: &Connection, target: &Target, slots: &[String]) -> Result<Vec<SecretRef>> {
+fn secrets(
+    db: &Connection,
+    target: &Target,
+    release: Id,
+    slots: &[String],
+) -> Result<Vec<SecretRef>> {
     let mut refs = Vec::with_capacity(slots.len());
     for slot in slots {
         if let Some(secret) = db.query_row(
-            "SELECT epoch,reference FROM vm_compose_secrets WHERE vm=?1 AND project=?2 AND slot=?3 ORDER BY epoch DESC LIMIT 1",
-            params![target.vm,target.project,slot],
+            "SELECT epoch,reference FROM vm_compose_secrets JOIN vm_compose_release_epochs USING(vm,project,slot,epoch) WHERE vm=?1 AND project=?2 AND slot=?3 AND release=?4 ORDER BY epoch DESC LIMIT 1",
+            params![target.vm,target.project,slot,release],
             |r| Ok(SecretRef { slot:slot.clone(), epoch:r.get(0)?, reference:r.get(1)? }),
         ).optional()? {
             refs.push(secret);
@@ -281,10 +351,16 @@ fn secrets(db: &Connection, target: &Target, slots: &[String]) -> Result<Vec<Sec
     Ok(refs)
 }
 
+pub(crate) fn close(db: &Connection, intent: &Intent, reason: &str) -> Result<()> {
+    ensure!(db.execute("UPDATE vm_compose_operations SET closed=?2 WHERE id=?1 AND receipt IS NULL AND closed IS NULL",
+        params![intent.id,reason])? == 1, "Compose intent already closed");
+    Ok(())
+}
+
 pub(crate) fn mark_sent(db: &Connection, intent: &Intent) -> Result<()> {
     ensure!(
         db.execute(
-            "UPDATE vm_compose_operations SET sent=1 WHERE id=?1 AND sent=0 AND receipt IS NULL",
+            "UPDATE vm_compose_operations SET sent=1 WHERE id=?1 AND sent=0 AND receipt IS NULL AND closed IS NULL",
             [intent.id]
         )? == 1,
         "Compose intent already submitted"
@@ -299,7 +375,7 @@ pub(crate) fn settle(
     observed: Option<&arx_guest::compose::ProjectView>,
 ) -> Result<()> {
     ensure!(
-        db.execute("UPDATE vm_compose_operations SET receipt=?2 WHERE id=?1 AND sent=1 AND receipt IS NULL",
+        db.execute("UPDATE vm_compose_operations SET receipt=?2 WHERE id=?1 AND sent=1 AND receipt IS NULL AND closed IS NULL",
             params![intent.id, serde_json::to_string(receipt)?])? == 1,
         "Compose intent is not unsettled"
     );
@@ -364,7 +440,7 @@ pub(crate) fn mark_secret_sent(db: &Connection, intent: &Intent, bit: u8) -> Res
     ensure!(
         db.execute(
             "UPDATE vm_compose_operations SET secret_sent=secret_sent | ?2
-             WHERE id=?1 AND sent=0 AND receipt IS NULL AND secret_sent & ?2=0",
+             WHERE id=?1 AND sent=0 AND receipt IS NULL AND closed IS NULL AND secret_sent & ?2=0",
             params![intent.id, bit],
         )? == 1,
         "Compose secret delivery already submitted"

@@ -2287,16 +2287,28 @@ impl VmInventory {
         let session = self.supervisor.compose.session(target.vm);
         if tool == ToolName::ComposeStatus {
             args.end()?;
-            let status = store
+            let mut status = store
                 .transact(|tx| db::status(tx, &self.principal, &target))?
                 .ok_or(NOT_FOUND)?;
-            let generation = store.transact(|tx| db::boot(tx, &self.principal, &target))?;
+            let generation = store.transact(|tx| {
+                if let Some(s) = &session
+                    && db::live_boot(tx, target.vm, s.generation, s.wire_boot)?
+                {
+                    db::boot(tx, &self.principal, &target)
+                } else {
+                    Ok(None)
+                }
+            })?;
             let current = session.as_ref().is_some_and(|s| {
-                status.pending.is_none()
+                s.is_open()
+                    && status.pending.is_none()
                     && generation == Some(s.generation)
                     && status.generation == generation
                     && status.boot == Some(s.wire_boot)
             });
+            if let Some(view) = &mut status.observation {
+                view.observation = arx_guest::compose::Observation::Recorded;
+            }
             return Ok(json!({
                 "desired":status.desired, "revision":status.revision,
                 "observed":status.observation, "current_boot":current,
@@ -2311,7 +2323,8 @@ impl VmInventory {
             ToolName::ComposeDown => compose::Kind::Down,
             _ => return Err(INVALID),
         };
-        let key = args.id("request_id")?;
+        let request_id = RequestId::parse(&args.get::<String>("request_id")?)?;
+        let key = request_id.key;
         let release = (kind == compose::Kind::Deploy)
             .then(|| args.id("release_id"))
             .transpose()?;
@@ -2319,7 +2332,7 @@ impl VmInventory {
         let request = compose::Mutation {
             target,
             kind,
-            key,
+            key: request_id,
             release,
         };
         let intent = store
@@ -2345,7 +2358,9 @@ impl VmInventory {
                 let Some(session) = &session else {
                     return Ok(Err(compose::Fault::NotReady));
                 };
-                if db::boot(tx, &self.principal, &request.target)? != Some(session.generation) {
+                if db::boot(tx, &self.principal, &request.target)? != Some(session.generation)
+                    || !db::live_boot(tx, request.target.vm, session.generation, session.wire_boot)?
+                {
                     return Ok(Err(compose::Fault::NotReady));
                 }
                 db::admit(
@@ -2354,12 +2369,14 @@ impl VmInventory {
                     &request,
                     session.generation,
                     session.wire_boot,
+                    self.supervisor.controller.compose_now()?,
                 )
             })?
             .map_err(|fault| match fault {
                 compose::Fault::NotFound => Refusal::NotFound,
                 compose::Fault::NotReady => Refusal::NotReady,
                 compose::Fault::Busy => Refusal::Busy,
+                compose::Fault::StaleKey => Refusal::StaleKey,
                 compose::Fault::ReplayFull => Refusal::ReplayFull,
                 compose::Fault::KeyCollision => Refusal::KeyCollision,
             })?;
@@ -2371,6 +2388,7 @@ impl VmInventory {
         if let Some(session) =
             session.filter(|s| s.generation == intent.generation && s.wire_boot == intent.boot)
             && intent.receipt.is_none()
+            && intent.closed.is_none()
         {
             let active = gate.compose_active.clone();
             let id = intent.id;
@@ -2398,7 +2416,7 @@ impl VmInventory {
         }
         Ok(
             json!({"operation_id":hex::encode(intent.id),"revision":intent.revision,
-                "state":intent.receipt.as_ref().map_or(json!("pending"), |r| json!(r.state)),
+                "state":intent.receipt.as_ref().map_or_else(|| json!(intent.pending_state()), |r| json!(r.state)),
                 "receipt":intent.receipt}),
         )
     }
@@ -2432,6 +2450,11 @@ impl VmInventory {
             .session(target.vm)
             .filter(|s| Some(s.generation) == generation)
             .ok_or(Fault("not_ready"))?;
+        if !store
+            .transact(|tx| db::live_boot(tx, target.vm, session.generation, session.wire_boot))?
+        {
+            return Err(Fault("not_ready"));
+        }
         let (entries, next_cursor) = tokio::runtime::Handle::current()
             .block_on(self.supervisor.compose.logs(
                 session,
@@ -8305,23 +8328,32 @@ mod tests {
         let vm_id = parse_id(vm.as_str().unwrap()).unwrap();
         let project = "fixture-compose";
         let release_id = hex::encode([0x42; 16]);
-        let enrollment: compose::ReleaseInput = serde_json::from_value(json!({
+        let mut second_release = json!({
             "vm_id":vm, "release_id":release_id,
             "manifest":{
                 "schema":guest::MANIFEST_SCHEMA,"project_id":project,
                 "volumes":[{"name":"data","uid":10001,"gid":10001}],"secrets":["password"],
                 "services":[{"name":"api","image":format!("example.invalid/api@sha256:{}", "a".repeat(64)),
-                    "platform":guest::PLATFORM,"uid":10001,"gid":10001,"read_only_rootfs":true,
+                    "platform":guest::PLATFORM,"uid":10001,"gid":10001,"read_only_rootfs":true,"http_port":8080,"health_path":"/health",
                     "environment":[],"mounts":[{"volume":"data","target":"/data","read_only":false}],
                     "secrets":["password"],"limits":{"cpu_millis":500,"memory_mib":512,"pids":32}}]
             },
             "secrets":[{"slot":"password","epoch":7,"reference":hex::encode([0x44;16])}]
-        })).unwrap();
+        });
+        let enrollment: compose::ReleaseInput =
+            serde_json::from_value(second_release.clone()).unwrap();
+        second_release["release_id"] = json!(hex::encode([0x43; 16]));
+        second_release["secrets"][0]["epoch"] = json!(8);
+        second_release["secrets"][0]["reference"] = json!(hex::encode([0x45; 16]));
+        second_release["manifest"]["services"][0]["gid"] = json!(10002);
+        second_release["manifest"]["services"][0]["mounts"] = json!([]);
+        second_release["manifest"]["volumes"] = json!([]);
+        let other: compose::ReleaseInput = serde_json::from_value(second_release).unwrap();
         let enrollment = enrollment.enroll().unwrap();
         let digest = enrollment.digest.clone();
         let target = enrollment.target.clone();
         let store = h.supervisor().controller.compose_store();
-        db::enroll(store, &[enrollment]).unwrap();
+        db::enroll(store, &[enrollment, other.enroll().unwrap()]).unwrap();
         let generation = store
             .transact(|tx| db::boot(tx, "alpha", &target))
             .unwrap()
@@ -8484,10 +8516,43 @@ mod tests {
                 .unwrap();
         h.supervisor()
             .compose
-            .attach(vm_id, compose::Session::new(generation, channel))
+            .attach(store, vm_id, compose::Session::new(generation, channel))
             .unwrap();
+        let mut extras = args.clone();
+        extras["extra"] = json!(true);
+        let invalid = call(&a, "compose_deploy", extras).await;
+        assert!(invalid["operation_id"].is_null());
+        let mut legacy_key = args.clone();
+        legacy_key["request_id"] = json!(key(122));
+        assert_eq!(
+            call(&a, "compose_deploy", legacy_key).await["reason"],
+            "key_collision"
+        );
         let accepted = call(&a, "compose_deploy", args.clone()).await;
         assert_eq!(accepted["state"], "pending");
+        for (field, value) in [
+            ("vm_id", json!(key(141))),
+            ("project_id", json!("another")),
+            ("release_id", json!(hex::encode([0x43; 16]))),
+        ] {
+            let mut changed = args.clone();
+            changed[field] = value;
+            assert_eq!(
+                call(&a, "compose_deploy", changed).await["reason"],
+                "key_collision"
+            );
+        }
+        assert_eq!(
+            call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(125)})).await["reason"],
+            "key_collision"
+        );
+        let pinned = store
+            .transact(|tx| db::replay(tx, "alpha", parse_id(key(125).as_str()).unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.secrets.len(), 1);
+        assert_eq!(pinned.secrets[0].reference, [0x44; 16]);
+        assert_eq!(pinned.secrets[0].epoch, 7);
         let operation_id = effect_seen.await.unwrap();
         assert_eq!(accepted["operation_id"], operation_id);
         assert_eq!(
@@ -8543,15 +8608,29 @@ mod tests {
 
         let (host, mut peer) = tokio::io::duplex(64 * 1024);
         let recovered_operation = operation_id.clone();
+        let revision = accepted["revision"].as_u64().unwrap();
         let second = tokio::spawn(async move {
             fake_compose_hello(&mut peer, boot).await;
-            for committed_revision in [None, Some(2), Some(1)] {
+            for case in [
+                "unknown",
+                "wrong_operation",
+                "wrong_stage",
+                "wrong_revision",
+                "recorded",
+                "unhealthy",
+                "proved",
+            ] {
+                let committed_revision = Some(if case == "wrong_revision" {
+                    revision + 1
+                } else {
+                    revision
+                });
                 let Req::ComposeOperation { id, operation_id } = fake_compose_read(&mut peer).await
                 else {
                     panic!("replay must query")
                 };
                 assert_eq!(operation_id, recovered_operation);
-                if committed_revision.is_none() {
+                if case == "unknown" {
                     fake_compose_reply(
                         &mut peer,
                         Resp::ComposeRejected {
@@ -8568,18 +8647,29 @@ mod tests {
                     Resp::ComposeOperationState {
                         id,
                         operation: guest::OperationView {
-                            operation_id,
+                            operation_id: if case == "wrong_operation" {
+                                hex::encode([0xff; 16])
+                            } else {
+                                operation_id
+                            },
                             kind: guest::OperationKind::Deploy,
                             project_id: project.into(),
                             revision: 1,
                             state: guest::OperationState::Succeeded,
-                            stage: guest::OperationStage::Settled,
+                            stage: if case == "wrong_stage" {
+                                guest::OperationStage::Applying
+                            } else {
+                                guest::OperationStage::Settled
+                            },
                             failure: None,
                             restored_previous: false,
                         },
                     },
                 )
                 .await;
+                if matches!(case, "wrong_operation" | "wrong_stage") {
+                    continue;
+                }
                 let Req::ComposeStatus { id, .. } = fake_compose_read(&mut peer).await else {
                     panic!("attributed state required")
                 };
@@ -8594,11 +8684,19 @@ mod tests {
                             previous_revision: None,
                             recovery_required: false,
                             running_operation: None,
-                            observation: guest::Observation::Live,
+                            observation: if case == "recorded" {
+                                guest::Observation::Recorded
+                            } else {
+                                guest::Observation::Live
+                            },
                             services: vec![guest::ServiceView {
                                 name: "api".into(),
                                 state: guest::ServiceState::Running,
-                                health: guest::HealthState::Healthy,
+                                health: if case == "unhealthy" {
+                                    guest::HealthState::Unhealthy
+                                } else {
+                                    guest::HealthState::None
+                                },
                                 revision: Some(1),
                             }],
                         },
@@ -8631,6 +8729,215 @@ mod tests {
                 },
             )
             .await;
+            let mut desired = guest::Desired::Started;
+            for (kind, refusal) in [
+                (guest::OperationKind::Stop, true),
+                (guest::OperationKind::Stop, false),
+                (guest::OperationKind::Start, true),
+                (guest::OperationKind::Start, false),
+                (guest::OperationKind::Down, false),
+                (guest::OperationKind::Stop, true),
+            ] {
+                let Req::ComposeOperation { id, operation_id } = fake_compose_read(&mut peer).await
+                else {
+                    panic!("initial lookup")
+                };
+                fake_compose_reply(
+                    &mut peer,
+                    Resp::ComposeRejected {
+                        id,
+                        code: guest::RejectCode::UnknownOperation,
+                        rule: None,
+                    },
+                )
+                .await;
+                let status = |desired| guest::ProjectView {
+                    project_id: project.into(),
+                    desired,
+                    committed_revision: Some(revision),
+                    previous_revision: None,
+                    recovery_required: false,
+                    running_operation: None,
+                    observation: guest::Observation::Live,
+                    services: if desired == guest::Desired::Down {
+                        vec![]
+                    } else {
+                        vec![guest::ServiceView {
+                            name: "api".into(),
+                            revision: Some(revision),
+                            state: if desired == guest::Desired::Started {
+                                guest::ServiceState::Running
+                            } else {
+                                guest::ServiceState::Exited
+                            },
+                            health: guest::HealthState::None,
+                        }]
+                    },
+                };
+                let Req::ComposeStatus { id, .. } = fake_compose_read(&mut peer).await else {
+                    panic!("preflight")
+                };
+                fake_compose_reply(
+                    &mut peer,
+                    Resp::ComposeProjectStatus {
+                        id,
+                        project: status(desired),
+                    },
+                )
+                .await;
+                if kind == guest::OperationKind::Start {
+                    let Req::ComposeSecretPut {
+                        operation_id: secret_operation,
+                        id,
+                        project_id,
+                        digest,
+                        slot,
+                        epoch,
+                        ..
+                    } = fake_compose_read(&mut peer).await
+                    else {
+                        panic!("start redelivery")
+                    };
+                    if refusal {
+                        fake_compose_reply(
+                            &mut peer,
+                            Resp::ComposeOperationState {
+                                id,
+                                operation: guest::OperationView {
+                                    project_id,
+                                    kind: guest::OperationKind::SecretPut,
+                                    operation_id: secret_operation,
+                                    revision,
+                                    stage: guest::OperationStage::Settled,
+                                    state: guest::OperationState::Failed,
+                                    failure: Some(guest::FailureCode::NotApplied),
+                                    restored_previous: false,
+                                },
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeSecretAccepted {
+                            id,
+                            project_id,
+                            digest,
+                            slot,
+                            epoch,
+                            recreate: None,
+                        },
+                    )
+                    .await;
+                }
+                let (id, echo, next) = match fake_compose_read(&mut peer).await {
+                    Req::ComposeStart {
+                        id, operation_id, ..
+                    } if kind == guest::OperationKind::Start => {
+                        (id, operation_id, guest::Desired::Started)
+                    }
+                    Req::ComposeStop {
+                        id, operation_id, ..
+                    } if kind == guest::OperationKind::Stop => {
+                        (id, operation_id, guest::Desired::Stopped)
+                    }
+                    Req::ComposeDown {
+                        id, operation_id, ..
+                    } if kind == guest::OperationKind::Down => {
+                        (id, operation_id, guest::Desired::Down)
+                    }
+                    _ => panic!("lifecycle attribution"),
+                };
+                assert_eq!(echo, operation_id);
+                if refusal {
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeRejected {
+                            id,
+                            code: if desired == guest::Desired::Down {
+                                guest::RejectCode::StoreFailure
+                            } else {
+                                guest::RejectCode::JournalFull
+                            },
+                            rule: None,
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+                let mut id = id;
+                if kind == guest::OperationKind::Down {
+                    // The container view may already be empty while the generated network
+                    // still exists. Only the guest can verify both inventories.
+                    for state in [
+                        guest::OperationState::Running,
+                        guest::OperationState::Ambiguous,
+                    ] {
+                        fake_compose_reply(
+                            &mut peer,
+                            Resp::ComposeOperationState {
+                                id,
+                                operation: guest::OperationView {
+                                    operation_id: operation_id.clone(),
+                                    project_id: project.into(),
+                                    revision,
+                                    kind,
+                                    stage: guest::OperationStage::Removing,
+                                    state,
+                                    failure: None,
+                                    restored_previous: false,
+                                },
+                            },
+                        )
+                        .await;
+                        let (next_id, lookup) = match fake_compose_read(&mut peer).await {
+                            Req::ComposeOperation { id, operation_id }
+                                if state == guest::OperationState::Running =>
+                            {
+                                (id, operation_id)
+                            }
+                            Req::ComposeReconcile { id, operation_id }
+                                if state == guest::OperationState::Ambiguous =>
+                            {
+                                (id, operation_id)
+                            }
+                            _ => panic!("Down requires durable network and container absence"),
+                        };
+                        assert_eq!(lookup, operation_id);
+                        id = next_id;
+                    }
+                }
+                desired = next;
+                fake_compose_reply(
+                    &mut peer,
+                    Resp::ComposeOperationState {
+                        id,
+                        operation: guest::OperationView {
+                            operation_id,
+                            kind,
+                            project_id: project.into(),
+                            revision,
+                            state: guest::OperationState::Succeeded,
+                            stage: guest::OperationStage::Settled,
+                            failure: None,
+                            restored_previous: false,
+                        },
+                    },
+                )
+                .await;
+                let Req::ComposeStatus { id, .. } = fake_compose_read(&mut peer).await else {
+                    panic!("settlement observation")
+                };
+                fake_compose_reply(
+                    &mut peer,
+                    Resp::ComposeProjectStatus {
+                        id,
+                        project: status(desired),
+                    },
+                )
+                .await;
+            }
         });
         let channel =
             crate::vm::guest::ComposeChannel::negotiate(host, boot, &h.supervisor().cancel)
@@ -8638,10 +8945,12 @@ mod tests {
                 .unwrap();
         h.supervisor()
             .compose
-            .attach(vm_id, compose::Session::new(generation, channel))
+            .attach(store, vm_id, compose::Session::new(generation, channel))
             .unwrap();
-        for _ in 0..3 {
-            assert_eq!(call(&a, "compose_deploy", args.clone()).await, accepted);
+        for _ in 0..7 {
+            let replay = call(&a, "compose_deploy", args.clone()).await;
+            assert_eq!(replay["operation_id"], accepted["operation_id"]);
+            assert_eq!(replay["state"], "unresolved");
             until(|| {
                 h.supervisor()
                     .gate
@@ -8654,6 +8963,36 @@ mod tests {
             })
             .await;
         }
+        // Fill the normal admission budget with retained terminal receipts. Roll back
+        // this pressure fixture after checking the Stop reserve and expiry maintenance.
+        store.transact(|tx| {
+            tx.execute_batch("SAVEPOINT pressure")?;
+            tx.execute("WITH RECURSIVE seq(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM seq WHERE i<239)
+                INSERT INTO vm_compose_operations(id,principal,request,vm,project,generation,boot,kind,release,revision,valid_through_ms,secret_refs,closed)
+                SELECT randomblob(16),principal,randomblob(16),vm,project,generation,boot,kind,release,revision,valid_through_ms,secret_refs,'refused'
+                FROM vm_compose_operations,seq WHERE id=?1",[pinned.id])?;
+            let key=RequestId::parse(&key(181)).unwrap();
+            let mut request=compose::Mutation {key,kind:compose::Kind::Start,release:None,target:target.clone()};
+            assert!(matches!(db::admit(tx,"alpha",&request,generation,boot,UTC)?,Err(compose::Fault::ReplayFull)));
+            request.kind=compose::Kind::Stop;
+            assert!(db::admit(tx,"alpha",&request,generation,boot,UTC)?.is_ok());
+            let later=UTC+crate::vm::RETRY_WINDOW_MS+1;
+            let fresh=RequestId::parse(&format!("{later:016x}{:016x}",182)).unwrap();
+            // Positive boot retirement releases the lease; simulate completed stop/start.
+            tx.execute("UPDATE vm_static_instances SET state=1 WHERE id=?1",[vm_id])?;
+            tx.execute("UPDATE vm_static_instances SET state=2 WHERE id=?1",[vm_id])?;
+            db::register_boot(tx,vm_id,generation,boot+1)?;
+            request.key=fresh;
+            request.kind=compose::Kind::Deploy;
+            request.release=Some(pinned.release);
+            let next=db::admit(tx,"alpha",&request,generation,boot+1,later)?.unwrap();
+            assert_eq!(next.revision,pinned.revision+1);
+            db::close(tx,&next,"refused")?;
+            request.key=key;
+            assert!(matches!(db::admit(tx,"alpha",&request,generation,boot+1,UTC)?,Err(compose::Fault::StaleKey)));
+            tx.execute_batch("ROLLBACK TO pressure; RELEASE pressure")?;
+            Ok(())
+        }).unwrap();
         let settled = call(&a, "compose_deploy", args.clone()).await;
         assert_eq!(settled["operation_id"], operation_id);
         assert_eq!(settled["state"], "succeeded");
@@ -8665,14 +9004,68 @@ mod tests {
         .await;
         assert_eq!(logs["reason"], "not_ready");
         assert!(!logs.to_string().contains("canary"));
+        for (index, (tool, state)) in [
+            ("compose_stop", "refused"),
+            ("compose_stop", "succeeded"),
+            ("compose_start", "secret_failed"),
+            ("compose_start", "succeeded"),
+            ("compose_down", "succeeded"),
+            ("compose_stop", "unresolved"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let args = json!({"vm_id":vm,"project_id":project,"request_id":key(130+index as u64)});
+            let begun = call(&a, tool, args.clone()).await;
+            assert_eq!(begun["state"], "pending");
+            until(|| {
+                h.supervisor()
+                    .gate
+                    .lock()
+                    .unwrap()
+                    .compose_active
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            })
+            .await;
+            let outcome = call(&a, tool, args).await;
+            assert_eq!(outcome["operation_id"], begun["operation_id"]);
+            assert_eq!(outcome["state"], state);
+        }
         second.await.unwrap();
+        let stopped = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(199)})).await;
+        assert_eq!(terminal(&a, &stopped).await["state"], "succeeded");
+        let retired = call(
+            &a,
+            "compose_stop",
+            json!({"vm_id":vm,"project_id":project,"request_id":key(135)}),
+        )
+        .await;
+        assert_eq!(retired["state"], "retired_boot");
+        assert!(retired["receipt"].is_null());
+        let restarted = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(200)})).await;
+        assert_eq!(terminal(&a, &restarted).await["state"], "succeeded");
+        store
+            .transact(|tx| {
+                assert!(db::register_boot(tx, vm_id, generation, boot).is_err());
+                db::register_boot(tx, vm_id, generation, boot + 1)?;
+                assert!(db::register_boot(tx, vm_id, generation, boot + 2).is_err());
+                let old = db::replay(tx, "alpha", parse_id(key(135).as_str()).unwrap())?.unwrap();
+                assert!(db::mark_sent(tx, &old).is_err());
+                Ok(())
+            })
+            .unwrap();
         let status = call(
             &a,
             "compose_status",
             json!({"vm_id":vm,"project_id":project}),
         )
         .await;
-        assert_eq!(status["desired"], "started");
+        assert_eq!(status["desired"], "down");
+        assert_eq!(status["current_boot"], false);
+        assert_eq!(status["observed"]["observation"], "recorded");
+        assert!(status["operation_id"].is_null());
         store
             .transact(|tx| {
                 assert_eq!(
@@ -8681,7 +9074,7 @@ mod tests {
                 );
                 assert_eq!(
                     crate::store::vm::count(tx, "SELECT count(*) FROM vm_compose_operations", [])?,
-                    1
+                    7
                 );
                 Ok(())
             })
@@ -8694,7 +9087,20 @@ mod tests {
         assert_eq!(call(&a, "compose_deploy", args).await, settled);
         drop(a);
         h.shutdown().await.unwrap();
-        let bytes = fs::read(h.temp.path().join("activity.sqlite3")).unwrap();
+        let mut bytes = Vec::new();
+        for entry in fs::read_dir(h.temp.path()).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("activity.sqlite3")
+                && entry.path().is_file()
+            {
+                bytes.extend(fs::read(entry.path()).unwrap());
+            }
+        }
+        for projection in [&accepted, &settled, &status, &logs] {
+            bytes.extend(serde_json::to_vec(projection).unwrap());
+        }
         let encoded = guest::encode_base64(CANARY);
         assert!(!bytes.windows(CANARY.len()).any(|window| window == CANARY));
         assert!(
@@ -8702,6 +9108,171 @@ mod tests {
                 .windows(encoded.len())
                 .any(|window| window == encoded.as_bytes())
         );
+    }
+
+    #[tokio::test]
+    async fn compose_secret_replay_proves_only_known_exact_delivery() {
+        use crate::vm::compose_secrets::{Delivery, FailedDelivery, SecretSource};
+        use arx_guest::compose::{self as g, ComposeRequest as Req, ComposeResponse as Resp};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Source(AtomicUsize);
+        impl SecretSource for Source {
+            fn open(&self, reference: Id) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+                assert_eq!(reference, [8; 16]);
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(zeroize::Zeroizing::new(vec![42]))
+            }
+        }
+        let boot = 19;
+        let intent = compose::Intent {
+            id: [1; 16],
+            target: compose::Target {
+                vm: [2; 16],
+                project: "api".into(),
+            },
+            generation: [3; 16],
+            boot,
+            kind: compose::Kind::Deploy,
+            release: [4; 16],
+            revision: 1,
+            sent: false,
+            closed: None,
+            receipt: None,
+            secrets: vec![],
+            secret_sent: 1,
+            digest: "a".repeat(64),
+            bytes: vec![],
+        };
+        let secret = compose::SecretRef {
+            slot: "password".into(),
+            epoch: 7,
+            reference: [8; 16],
+        };
+        let delivery = Delivery::new(&intent, &secret, None);
+        for case in [
+            "unknown",
+            "wrong_project",
+            "failed",
+            "after_write",
+            "after_settle",
+            "missing_file",
+        ] {
+            let (host, mut peer) = tokio::io::duplex(65536);
+            let cancel = crate::service::Shutdown::default();
+            let task = tokio::spawn(async move {
+                fake_compose_hello(&mut peer, boot).await;
+                let Req::ComposeOperation { id, operation_id } = fake_compose_read(&mut peer).await
+                else {
+                    panic!("lookup first")
+                };
+                let mut operation = g::OperationView {
+                    operation_id: operation_id.clone(),
+                    project_id: if case == "wrong_project" {
+                        "another"
+                    } else {
+                        "api"
+                    }
+                    .into(),
+                    kind: g::OperationKind::SecretPut,
+                    revision: 0,
+                    stage: g::OperationStage::Applying,
+                    state: g::OperationState::Ambiguous,
+                    failure: None,
+                    restored_previous: false,
+                };
+                if matches!(case, "failed" | "after_settle") {
+                    operation.stage = g::OperationStage::Settled;
+                    operation.state = if case == "failed" {
+                        operation.failure = Some(g::FailureCode::NotApplied);
+                        g::OperationState::Failed
+                    } else {
+                        g::OperationState::Succeeded
+                    };
+                }
+                let reply = if case == "unknown" {
+                    Resp::ComposeRejected {
+                        id,
+                        code: g::RejectCode::UnknownOperation,
+                        rule: None,
+                    }
+                } else {
+                    Resp::ComposeOperationState {
+                        id,
+                        operation: operation.clone(),
+                    }
+                };
+                fake_compose_reply(&mut peer, reply).await;
+                if matches!(case, "after_write" | "after_settle" | "missing_file") {
+                    let Req::ComposeSecretPut {
+                        id,
+                        operation_id: echo,
+                        project_id,
+                        digest,
+                        generation,
+                        slot,
+                        epoch,
+                        data,
+                    } = fake_compose_read(&mut peer).await
+                    else {
+                        panic!("exact compare")
+                    };
+                    assert_eq!(echo, operation_id);
+                    assert_eq!(
+                        (
+                            project_id.as_str(),
+                            digest.as_str(),
+                            generation,
+                            slot.as_str(),
+                            epoch
+                        ),
+                        ("api", "a".repeat(64).as_str(), boot, "password", 7)
+                    );
+                    assert!(data == g::SecretText::new(g::encode_base64(&[42])));
+                    let response = if case == "missing_file" {
+                        operation.stage = g::OperationStage::Settled;
+                        operation.state = g::OperationState::Failed;
+                        operation.failure = Some(g::FailureCode::NotApplied);
+                        Resp::ComposeOperationState { id, operation }
+                    } else {
+                        Resp::ComposeSecretAccepted {
+                            id,
+                            project_id,
+                            digest,
+                            slot,
+                            epoch,
+                            recreate: None,
+                        }
+                    };
+                    fake_compose_reply(&mut peer, response).await;
+                }
+            });
+            let mut channel = crate::vm::guest::ComposeChannel::negotiate(host, boot, &cancel)
+                .await
+                .unwrap();
+            let source = Source(AtomicUsize::new(0));
+            let result = delivery
+                .deliver(&source, &mut channel, &cancel, true, || {
+                    panic!("no new submission")
+                })
+                .await;
+            task.await.unwrap();
+            assert_eq!(
+                result.is_ok(),
+                matches!(case, "after_write" | "after_settle"),
+                "{case}"
+            );
+            assert_eq!(
+                result.err().is_some_and(|e| e.is::<FailedDelivery>()),
+                matches!(case, "failed" | "missing_file")
+            );
+            assert_eq!(
+                source.0.load(Ordering::SeqCst),
+                usize::from(matches!(
+                    case,
+                    "after_write" | "after_settle" | "missing_file"
+                ))
+            );
+        }
     }
 
     async fn fake_compose_hello(peer: &mut tokio::io::DuplexStream, boot: u64) {
@@ -12008,6 +12579,32 @@ mod tests {
         assert_eq!(names.len(), EXPECTED_TOOL_COUNT);
         assert_eq!(names, ToolName::ALL.map(ToolName::name));
         for (tool_name, required, optional) in [
+            (
+                "compose_deploy",
+                &["vm_id", "project_id", "release_id", "request_id"][..],
+                &[][..],
+            ),
+            (
+                "compose_start",
+                &["vm_id", "project_id", "request_id"][..],
+                &[][..],
+            ),
+            (
+                "compose_stop",
+                &["vm_id", "project_id", "request_id"][..],
+                &[][..],
+            ),
+            (
+                "compose_down",
+                &["vm_id", "project_id", "request_id"][..],
+                &[][..],
+            ),
+            ("compose_status", &["vm_id", "project_id"][..], &[][..]),
+            (
+                "compose_logs",
+                &["vm_id", "project_id"][..],
+                &["limit", "cursor"][..],
+            ),
             (
                 "vm_snapshot_create",
                 &["vm_id", "request_id"][..],

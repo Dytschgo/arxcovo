@@ -85,6 +85,17 @@ impl SecretSource for Dpapi {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct FailedDelivery;
+
+impl std::fmt::Display for FailedDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Compose secret operation failed")
+    }
+}
+
+impl std::error::Error for FailedDelivery {}
+
 pub(crate) struct Delivery<'a> {
     intent: &'a Intent,
     secret: &'a SecretRef,
@@ -97,6 +108,8 @@ impl<'a> Delivery<'a> {
         let mut hash = Sha256::new();
         hash.update(b"arxcovo-compose-secret-delivery-v1");
         hash.update(intent.id);
+        hash.update(intent.release);
+        hash.update(intent.digest.as_bytes());
         hash.update(intent.generation);
         hash.update(intent.boot.to_be_bytes());
         hash.update(secret.reference);
@@ -118,9 +131,13 @@ impl<'a> Delivery<'a> {
         submitted: bool,
         mark: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        ensure!(
+            channel.generation() == self.intent.boot,
+            "Compose secret boot mismatch"
+        );
         if submitted {
-            // Re-sending the bytes is only a private proof of the settled
-            // file's equality. An unknown query never authorizes writing it.
+            // Re-sending the bytes is only a private comparison against the
+            // guest's exact journaled file instance. An unknown query never authorizes writing it.
             self.prove(channel, cancel).await?;
         }
         if self
@@ -178,7 +195,21 @@ impl<'a> Delivery<'a> {
                 "Compose secret operation attribution mismatch"
             );
             match operation.state {
-                OperationState::Succeeded if operation.stage == OperationStage::Settled => {
+                OperationState::Failed
+                    if operation.stage == OperationStage::Settled
+                        && operation.failure.is_some() =>
+                {
+                    return Err(FailedDelivery.into());
+                }
+                OperationState::Ambiguous
+                    if operation.kind == arx_guest::compose::OperationKind::SecretPut =>
+                {
+                    return Ok(());
+                }
+                OperationState::Succeeded
+                    if operation.stage == OperationStage::Settled
+                        && operation.failure.is_none() =>
+                {
                     return Ok(());
                 }
                 OperationState::Ambiguous if !reconcile => reconcile = true,
@@ -218,6 +249,19 @@ impl<'a> Delivery<'a> {
                 data,
             })
             .await?;
+        if let ComposeResponse::ComposeOperationState { operation, .. } = &response {
+            ensure!(
+                self.attributed(operation),
+                "Compose secret operation attribution mismatch"
+            );
+            if operation.stage == OperationStage::Settled
+                && operation.state == OperationState::Failed
+                && operation.failure.is_some()
+            {
+                return Err(FailedDelivery.into());
+            }
+            return Ok(false);
+        }
         let ComposeResponse::ComposeSecretAccepted {
             project_id,
             digest,
@@ -241,9 +285,15 @@ impl<'a> Delivery<'a> {
                 self.attributed(&view) && view.kind == OperationKind::Recreate,
                 "Compose recreate receipt attribution mismatch"
             );
-            return Ok(
-                view.state == OperationState::Succeeded && view.stage == OperationStage::Settled
-            );
+            if view.state == OperationState::Failed
+                && view.stage == OperationStage::Settled
+                && view.failure.is_some()
+            {
+                return Err(FailedDelivery.into());
+            }
+            return Ok(view.failure.is_none()
+                && view.state == OperationState::Succeeded
+                && view.stage == OperationStage::Settled);
         }
         Ok(true)
     }

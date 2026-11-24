@@ -3396,13 +3396,79 @@ mod tests {
         if version == 11 {
             db.execute_batch(snapshot::MIGRATE_V11).unwrap();
             db.pragma_update(None, "user_version", 11).unwrap();
+            let snapshot = Binding {
+                principal: "alice",
+                key: RequestId {
+                    key: [10; 16],
+                    issued_at_ms: NOW,
+                },
+                subject: Subject::Snapshot(vm, [6; 32]),
+                action: Action::Snapshot as i64,
+            }
+            .record(&db, NOW, Some(vm), None)
+            .unwrap();
+            let point = [0x56_u8; 16];
+            db.execute(
+                "INSERT INTO vm_generations(id,static_id,generation) VALUES(?1,?2,2)",
+                params![point, vm],
+            )
+            .unwrap();
+            db.execute("INSERT INTO vm_restore_points(id,static_vm,host,name,captured_ms,state,provenance,generation,lineage,charge)
+                SELECT ?1,id,host,'kept',?3,'ready',origin_generation,?1,zeroblob(32),500 FROM vm_static_instances WHERE id=?2",
+                params![point,vm,NOW]).unwrap();
+            db.execute(
+                "UPDATE vm_operations SET snapshot_result=?1 WHERE activity_id=?2",
+                params![point, snapshot.receipt.activity_id],
+            )
+            .unwrap();
+            finish(
+                &db,
+                snapshot.receipt.activity_id,
+                Status::Succeeded,
+                NOW,
+                Some(true),
+            )
+            .unwrap();
+            // Force a failure halfway through v12 DDL; retry from the populated v11 store.
+            db.execute_batch("CREATE TABLE vm_compose_operations(injected INTEGER)")
+                .unwrap();
         }
         let ledger = ledger_ids(&db).unwrap();
+        let sequence = count(
+            &db,
+            "SELECT seq FROM sqlite_sequence WHERE name='activity'",
+            [],
+        )
+        .unwrap();
         drop(db);
+        if version == 11 {
+            assert!(VmStore::open(dir.path(), NOW).is_err());
+            let db = Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+            assert_eq!(count(&db, "PRAGMA user_version", []).unwrap(), 11);
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT count(*) FROM sqlite_schema WHERE name='vm_compose_projects'",
+                    []
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(ledger_ids(&db).unwrap(), ledger);
+            db.execute_batch("DROP TABLE vm_compose_operations")
+                .unwrap();
+        }
         let store = VmStore::open(dir.path(), NOW).unwrap();
         store.transact(|db| {
             assert_eq!(count(db, "PRAGMA user_version", [])?, i64::from(VM_SCHEMA_VERSION));
-            assert_eq!(count(db, "SELECT count(*) FROM vm_compose_projects", [])?, 0);
+            for table in ["projects","releases","volumes","secrets","release_epochs","boots","operations"] {
+                assert_eq!(count(db,&format!("SELECT count(*) FROM vm_compose_{table}"),[])?,0);
+            }
+            if version==11 {
+                assert_eq!(count(db,"SELECT charge FROM vm_restore_points WHERE name='kept' AND state='ready'",[])?,500);
+                assert_eq!(count(db,"SELECT count(*) FROM vm_operations o JOIN vm_restore_points p ON o.snapshot_result=p.id
+                    JOIN activity a ON a.id=o.activity_id WHERE o.binding_kind='snapshot' AND a.status=1 AND p.static_vm=o.vm",[])?,1);
+            }
             assert_eq!(
                 db.query_row("SELECT origin_generation FROM vm_static_instances WHERE id=?1",
                     [vm], |row| row.get::<_, Id>(0))?,
@@ -3424,7 +3490,7 @@ mod tests {
                 assert!(publish::current(db)?.is_none());
             }
             assert_eq!(count(db, "SELECT count(*) FROM vm_static_instances WHERE publication_failure IS NULL", [])?, 1);
-            assert_eq!(count(db, "SELECT seq FROM sqlite_sequence WHERE name='activity'", [])?, 900);
+            assert_eq!(count(db, "SELECT seq FROM sqlite_sequence WHERE name='activity'", [])?, sequence);
             assert_eq!(count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?, 0);
             Ok(())
         }).unwrap();
