@@ -200,6 +200,15 @@ pub(super) fn owner(db: &Connection, principal: &str, vm: Id) -> Result<Option<O
         .optional()?)
 }
 
+/// Operational predicate for pending same-VM lifecycle and snapshot actions.
+pub(crate) fn has_pending_vm_activity(db: &Connection, vm: Id) -> Result<bool> {
+    Ok(count(
+        db,
+        "SELECT count(*) FROM activity WHERE vm=?1 AND status=0 AND (action<=6 OR action IN (12,18))",
+        [vm],
+    )? != 0)
+}
+
 /// Durable half of the route fence, re-read in every mutating transaction.
 /// B2 retains the intent until its connector and owned DNS are both settled.
 pub(super) fn route_quiescent(db: &Connection, vm: Id) -> Result<bool> {
@@ -288,12 +297,7 @@ pub(crate) fn precheck(
         Owner::Static(StaticState::Stopped) | Owner::Test { state: 1, .. } => {}
         _ => return Ok(Err(Refusal::SnapshotOfflineRequired)),
     }
-    if count(
-        db,
-        "SELECT count(*) FROM activity WHERE vm=?1 AND status=0 AND (action<=6 OR action IN (12,18))",
-        [vm],
-    )? != 0
-    {
+    if has_pending_vm_activity(db, vm)? {
         return Ok(Err(Refusal::Busy));
     }
     if unsettled(db, vm)? {
@@ -426,11 +430,14 @@ pub(super) fn expiry_waits(db: &Connection, vm: Id) -> Result<bool> {
 
 /// At most one destructive snapshot pair per VM per turn. Resolve the
 /// operation first because the intent can hold a reference to its source.
+/// Includes live `copy` intents so an orphaned worker that panicked or hit a
+/// settlement error reconciles once independent quiescence proves it offline.
 pub(super) fn cleanup_kinds(db: &Connection) -> Result<Vec<CleanupKind>> {
     let mut stmt = db.prepare(
         "SELECT coalesce(vm,static_vm),
-            CASE phase WHEN 'abandoned' THEN candidate WHEN 'retire' THEN expected ELSE source END
-         FROM vm_snapshot_work WHERE phase<>'copy'
+            CASE phase WHEN 'copy' THEN candidate WHEN 'abandoned' THEN candidate
+                WHEN 'retire' THEN expected ELSE source END
+         FROM vm_snapshot_work
          UNION ALL
          SELECT e.vm,min(e.generation) FROM vm_snapshot_expiry e
            WHERE NOT EXISTS(SELECT 1 FROM vm_snapshot_work w WHERE w.vm=e.vm)
@@ -459,12 +466,12 @@ fn cleanup_authority(db: &Connection, vm: Id, generation: Id) -> Result<Option<C
          FROM vm_snapshot_work w JOIN vm_generations g ON g.id=?2 AND g.active=0
          WHERE (
             (w.vm=?1 AND g.vm_id=?1 AND (
-                (w.phase='abandoned' AND w.candidate=g.id)
+                (w.phase IN ('copy','abandoned') AND w.candidate=g.id)
                 OR (w.phase='retire' AND w.expected=g.id)
                 OR (w.phase='delete' AND w.source=g.id AND EXISTS(
                     SELECT 1 FROM vm_restore_points p
                     WHERE p.id=w.target AND p.vm=w.vm AND p.generation=g.id AND p.state='deleting'))))
-            OR (w.static_vm=?1 AND g.static_id=?1 AND w.phase='abandoned' AND w.candidate=g.id))
+            OR (w.static_vm=?1 AND g.static_id=?1 AND w.phase IN ('copy','abandoned') AND w.candidate=g.id))
            AND (w.phase='delete' OR NOT EXISTS(SELECT 1 FROM vm_restore_points WHERE generation=g.id))
          UNION ALL
          SELECT NULL,p.id,0,'expiry'
@@ -518,25 +525,41 @@ pub(super) fn cleanup_work(
     } else {
         ["disk", "vars"]
     };
-    let accounted = rows.len() == 2
-        && rows
-            .iter()
-            .zip(expected_roles)
-            .all(|((state, leaf), role)| {
-                leaf.role == role
-                    && leaf.directory.is_some()
-                    && leaf.identity.is_some()
-                    && match authority.phase.as_str() {
-                        "expiry" | "delete" => state == "sealed",
-                        "abandoned" | "retire" => state == "pending_disposal",
-                        _ => false,
-                    }
-            });
+    let mut accounted = rows.len() == 2;
+    let mut artifacts = Vec::new();
+    if accounted {
+        for ((state, leaf), role) in rows.into_iter().zip(expected_roles) {
+            if leaf.role != role {
+                accounted = false;
+                break;
+            }
+            let identified = leaf.directory.is_some() && leaf.identity.is_some();
+            match authority.phase.as_str() {
+                "expiry" | "delete" if state == "sealed" && identified => artifacts.push(leaf),
+                "retire" if state == "pending_disposal" && identified => artifacts.push(leaf),
+                "abandoned" if state == "pending_disposal" && identified => artifacts.push(leaf),
+                "abandoned"
+                    if state == "planned"
+                        && leaf.directory.is_none()
+                        && leaf.identity.is_none() => {}
+                "copy"
+                    if matches!(state.as_str(), "created" | "identified") && identified =>
+                {
+                    artifacts.push(leaf);
+                }
+                _ => {
+                    accounted = false;
+                    break;
+                }
+            }
+        }
+    }
     Ok(Some(CleanupWork {
         kind,
         pending_worker: authority.activity,
-        artifacts: rows.into_iter().map(|(_, leaf)| leaf).collect(),
+        artifacts,
         accounted,
+        release_only: false,
     }))
 }
 
@@ -546,17 +569,52 @@ pub(super) fn settle_cleanup(
     vm: Id,
     generation: Id,
     now: i64,
-    confirmed: bool,
+    outcome: crate::vm::reaper::ReconcileOutcome,
 ) -> Result<bool> {
     let Some(current) = cleanup_work(db, work.kind, vm, generation)? else {
         return Ok(false);
     };
-    if !confirmed || !current.accounted || current.artifacts != work.artifacts {
-        return Ok(false);
-    }
     let Some(authority) = cleanup_authority(db, vm, generation)? else {
         return Ok(false);
     };
+    if authority.phase == "copy" {
+        if !outcome.released {
+            return Ok(false);
+        }
+        // Independent quiescence proved the live copy worker gone. Interrupt
+        // its pending caller receipt without rewriting any already-terminal one.
+        if let Some(activity) = authority.activity
+            && count(
+                db,
+                "SELECT count(*) FROM activity WHERE id=?1 AND status=0",
+                [activity],
+            )? == 1
+        {
+            finish(db, activity, Status::Interrupted, now, Some(false))?;
+        }
+        if !(outcome.disposed && current.accounted && current.artifacts == work.artifacts) {
+            // Unidentified leaves stay quarantined; identified leaves move to
+            // pending_disposal for retry on the next turn.
+            db.execute(
+                "UPDATE vm_artifacts SET state=CASE WHEN file_id IS NULL THEN 'quarantined'
+                    ELSE 'pending_disposal' END WHERE generation_id=?1",
+                [generation],
+            )?;
+            if let Some(activity) = authority.activity {
+                db.execute(
+                    "UPDATE vm_snapshot_work SET phase='abandoned' WHERE activity=?1 AND phase='copy'",
+                    [activity],
+                )?;
+            }
+            return Ok(false);
+        }
+    } else if !(outcome.released
+        && outcome.disposed
+        && current.accounted
+        && current.artifacts == work.artifacts)
+    {
+        return Ok(false);
+    }
     if let Some(activity) = authority.activity {
         db.execute("DELETE FROM vm_snapshot_work WHERE activity=?1", [activity])?;
     }
@@ -797,7 +855,20 @@ mod effects {
         id.map(|id| pair(db, id, is_static, "sealed")).transpose()
     }
 
-    pub(crate) fn prove_stop(db: &Connection, vm: Id, pair: Pair) -> Result<()> {
+    pub(crate) fn prove_stop(
+        db: &Connection,
+        vm: Id,
+        epoch: Id,
+        pair: Pair,
+        disposition: crate::vm::runtime::StopDisposition,
+    ) -> Result<()> {
+        let label = match disposition {
+            crate::vm::runtime::StopDisposition::CleanRelease => "clean",
+            crate::vm::runtime::StopDisposition::DirtyRelease => "dirty",
+            crate::vm::runtime::StopDisposition::ChargedQuarantine => {
+                anyhow::bail!("cannot prove release on charged quarantine");
+            }
+        };
         let (slots, proof) = pair;
         let charge: u64 = db.query_row(
             "SELECT persistent FROM vm_disk_claims WHERE vm=?1 AND snapshot IS NULL AND persistent>0
@@ -837,21 +908,43 @@ mod effects {
             );
         }
         ensure!(db.execute(
-            "UPDATE vm_snapshot_release SET disposition='clean'
-             WHERE generation=?2 AND disposition IS NULL AND generation IN (
+            "UPDATE vm_snapshot_release SET disposition=?4
+             WHERE generation=?2 AND epoch=?3 AND disposition IS NULL AND generation IN (
                 SELECT id FROM vm_generations WHERE id=?2 AND active=1 AND (vm_id=?1 OR static_id=?1))",
-            params![vm,slots.disk.generation],
+            params![vm, slots.disk.generation, epoch, label],
         )? == 1, "snapshot stop writer epoch changed");
         Ok(())
+    }
+
+    pub(crate) fn active_release_epoch(
+        db: &Connection,
+        vm: Id,
+        is_static: bool,
+    ) -> Result<Option<(Id, Id)>> {
+        Ok(db
+            .query_row(
+                "SELECT g.id,r.epoch FROM vm_generations g
+                 JOIN vm_snapshot_release r ON r.generation=g.id
+                 WHERE ((NOT ?2 AND g.vm_id=?1) OR (?2 AND g.static_id=?1))
+                   AND g.active=1 AND r.disposition IS NOT NULL",
+                params![vm, is_static],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
     }
 
     pub(crate) fn check_route(
         db: &Connection,
         vm: Id,
         is_static: bool,
+        generation: Id,
+        epoch: Id,
         route: Option<&SnapshotRoute>,
     ) -> Result<bool> {
-        Ok(!is_static || (route.is_some_and(|route| route.vm() == vm) && route_quiescent(db, vm)?))
+        Ok(!is_static
+            || (route.is_some_and(|route| {
+                route.vm() == vm && route.origin_release() == Some((generation, epoch))
+            }) && route_quiescent(db, vm)?))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -961,15 +1054,65 @@ mod effects {
         )? == 1)
     }
 
-    pub(crate) fn fail_copy(db: &Connection, work: &Work, now: i64) -> Result<()> {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum StagedLeaf {
+        Untouched,
+        Identified,
+        Unknown,
+    }
+
+    pub(crate) fn fail_copy(
+        db: &Connection,
+        work: &Work,
+        leaves: [StagedLeaf; 2],
+        now: i64,
+    ) -> Result<()> {
         if !pending(db, work)? {
             return Ok(());
         }
-        db.execute(
-            "UPDATE vm_artifacts SET state=CASE WHEN file_id IS NULL THEN 'quarantined'
-                ELSE 'pending_disposal' END WHERE generation_id=?1",
-            [work.candidate.map(|slots| slots.disk.generation)],
-        )?;
+        if let Some(slots) = work.candidate {
+            for (slot, staged) in [slots.disk, slots.vars].into_iter().zip(leaves) {
+                match staged {
+                    StagedLeaf::Untouched => {
+                        let untouched = count(
+                            db,
+                            "SELECT count(*) FROM vm_artifacts
+                             WHERE generation_id=?1 AND role=?2 AND object_key=?3
+                               AND state='planned' AND file_id IS NULL",
+                            params![slot.generation, slot.role, slot.key],
+                        )? == 1;
+                        if !untouched {
+                            db.execute(
+                                "UPDATE vm_artifacts SET state='quarantined'
+                                 WHERE generation_id=?1 AND role=?2 AND object_key=?3",
+                                params![slot.generation, slot.role, slot.key],
+                            )?;
+                        }
+                    }
+                    StagedLeaf::Identified => {
+                        let marked = db.execute(
+                            "UPDATE vm_artifacts SET state='pending_disposal'
+                             WHERE generation_id=?1 AND role=?2 AND object_key=?3 AND file_id IS NOT NULL",
+                            params![slot.generation, slot.role, slot.key],
+                        )?;
+                        if marked != 1 {
+                            db.execute(
+                                "UPDATE vm_artifacts SET state='quarantined'
+                                 WHERE generation_id=?1 AND role=?2 AND object_key=?3",
+                                params![slot.generation, slot.role, slot.key],
+                            )?;
+                        }
+                    }
+                    StagedLeaf::Unknown => {
+                        db.execute(
+                            "UPDATE vm_artifacts SET state='quarantined'
+                             WHERE generation_id=?1 AND role=?2 AND object_key=?3",
+                            params![slot.generation, slot.role, slot.key],
+                        )?;
+                    }
+                }
+            }
+        }
         db.execute(
             "UPDATE vm_snapshot_work SET phase='abandoned' WHERE activity=?1",
             [work.activity],
@@ -1066,7 +1209,15 @@ mod effects {
         route: Option<&SnapshotRoute>,
     ) -> Result<()> {
         ensure!(
-            can_copy(db, work, now)? && check_route(db, work.vm, work.is_static, route)?,
+            can_copy(db, work, now)?
+                && check_route(
+                    db,
+                    work.vm,
+                    work.is_static,
+                    work.active.pair.0.disk.generation,
+                    work.active.epoch,
+                    route,
+                )?,
             "snapshot commit fenced"
         );
         let current = active(db, work.vm, work.is_static)?

@@ -1284,15 +1284,29 @@ pub(crate) mod publication {
 
     /// Held from the runtime route check through the snapshot commit or abort.
     /// The dispatch gate precedes the effects slot, and registry/local guards
-    /// are released before any SQLite operation.
+    /// are released before any SQLite operation. Local-origin release for the
+    /// exact active generation and writer epoch is bound independently before
+    /// admission and commit.
     pub(crate) struct SnapshotRoute {
         vm: Id,
+        #[cfg(test)]
+        origin_release: Option<(Id, Id)>,
         _slot: OwnedMutexGuard<()>,
     }
 
     impl SnapshotRoute {
         pub(crate) fn vm(&self) -> Id {
             self.vm
+        }
+
+        #[cfg(test)]
+        pub(crate) fn bind_origin_release(&mut self, generation: Id, epoch: Id) {
+            self.origin_release = Some((generation, epoch));
+        }
+
+        #[cfg(test)]
+        pub(crate) fn origin_release(&self) -> Option<(Id, Id)> {
+            self.origin_release
         }
     }
 
@@ -1304,7 +1318,11 @@ pub(crate) mod publication {
                 .into_iter()
                 .flatten()
                 .any(|activation| activation.vm == vm);
-            if registered || activations.lost {
+            if registered
+                || activations.lost
+                || activations.unconfirmed.is_some()
+                || !activations.stops.is_empty()
+            {
                 return None;
             }
             drop(activations);
@@ -1317,7 +1335,12 @@ pub(crate) mod publication {
             {
                 return None;
             }
-            Some(SnapshotRoute { vm, _slot: slot })
+            Some(SnapshotRoute {
+                vm,
+                #[cfg(test)]
+                origin_release: None,
+                _slot: slot,
+            })
         }
 
         pub(crate) fn prepare(&self, profile: &Arc<Profile>) -> Result<Prepared, Refusal> {

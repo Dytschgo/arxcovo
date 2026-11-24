@@ -1855,7 +1855,7 @@ pub(crate) fn recover(db: &Connection, now: i64) -> Result<()> {
         begin_recovery(db, vm, now)?;
     }
     let mut stmt = db.prepare(
-        "SELECT id FROM activity WHERE status=0 AND (action<=6 OR action IN (11,12)) ORDER BY id LIMIT ?1",
+        "SELECT id FROM activity WHERE status=0 AND (action<=6 OR action IN (11,12,18)) ORDER BY id LIMIT ?1",
     )?;
     let pending = stmt
         .query_map([MAX_CALLER_PENDING], |row| row.get(0))?
@@ -2224,7 +2224,23 @@ pub(crate) fn cleanup_work(db: &Connection, kind: CleanupKind) -> Result<Option<
         return Ok(None);
     }
     if route == Some("lease") && snapshot::expiry_waits(db, id)? {
-        return Ok(None);
+        // Split expiry's release proof from active media disposal: let the
+        // reaper quiesce or force-reap the owned TEST job without disposing
+        // active media while snapshot pairs remain.
+        let pending_worker = db
+            .query_row(
+                "SELECT id FROM activity WHERE vm=?1 AND status=0 AND (action<=6 OR action=18)",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        return Ok(Some(CleanupWork {
+            kind,
+            pending_worker,
+            artifacts: Vec::new(),
+            accounted: false,
+            release_only: true,
+        }));
     }
     let mut stmt = db.prepare(
         "SELECT g.id,g.generation,g.active,a.role,a.object_key,a.state,a.volume_id,a.directory_id,a.file_id
@@ -2307,7 +2323,7 @@ pub(crate) fn cleanup_work(db: &Connection, kind: CleanupKind) -> Result<Option<
         None
     } else {
         db.query_row(
-            "SELECT id FROM activity WHERE vm=?1 AND status=0 AND action<=6",
+            "SELECT id FROM activity WHERE vm=?1 AND status=0 AND (action<=6 OR action=18)",
             [id],
             |row| row.get(0),
         )
@@ -2318,6 +2334,7 @@ pub(crate) fn cleanup_work(db: &Connection, kind: CleanupKind) -> Result<Option<
         pending_worker,
         artifacts,
         accounted,
+        release_only: false,
     }))
 }
 
@@ -2337,15 +2354,30 @@ pub(crate) fn settle_cleanup(
     db: &Connection,
     work: &CleanupWork,
     now: i64,
-    confirmed: bool,
+    outcome: crate::vm::reaper::ReconcileOutcome,
 ) -> Result<bool> {
     if let CleanupKind::Snapshot { vm, generation } = work.kind {
-        return snapshot::settle_cleanup(db, work, vm, generation, now, confirmed);
+        return snapshot::settle_cleanup(db, work, vm, generation, now, outcome);
     }
     let Some(current) = cleanup_work(db, work.kind)? else {
         return Ok(true);
     };
-    let confirmed = confirmed && current.accounted && current.artifacts == work.artifacts;
+    if work.release_only {
+        if let Some(vm) = work.kind.vm() {
+            interrupt_pending(db, vm, now, outcome.released)?;
+        }
+        if !outcome.released
+            && let CleanupKind::Expiry { activity_id, .. } = work.kind
+        {
+            db.execute(
+                "UPDATE activity SET cleanup_confirmed=0 WHERE id=?1",
+                [activity_id],
+            )?;
+        }
+        return Ok(false);
+    }
+    let confirmed =
+        outcome.released && outcome.disposed && current.accounted && current.artifacts == work.artifacts;
     if let Some(vm) = work.kind.vm() {
         interrupt_pending(db, vm, now, confirmed)?;
     }
@@ -2387,7 +2419,7 @@ pub(crate) fn settle_cleanup(
 pub(crate) fn interrupt_pending(db: &Connection, vm: Id, now: i64, released: bool) -> Result<()> {
     let pending = db
         .query_row(
-            "SELECT id FROM activity WHERE vm=?1 AND status=0 AND action<=6",
+            "SELECT id FROM activity WHERE vm=?1 AND status=0 AND (action<=6 OR action=18)",
             [vm],
             |row| row.get(0),
         )
@@ -2396,6 +2428,74 @@ pub(crate) fn interrupt_pending(db: &Connection, vm: Id, now: i64, released: boo
         finish(db, id, Status::Interrupted, now, Some(released))?;
     }
     Ok(())
+}
+
+/// Whether an owned TEST VM has durable generation custody rows.
+#[cfg(test)]
+pub(crate) fn has_test_generation(db: &Connection, principal: &str, vm: Id) -> Result<bool> {
+    Ok(count(
+        db,
+        "SELECT EXISTS(
+            SELECT 1 FROM vm_instances v JOIN vm_generations g ON g.vm_id=v.id
+            WHERE v.id=?1 AND v.principal=?2
+         )",
+        params![vm, principal],
+    )? != 0)
+}
+
+/// Rehydrate the committed pair of a stopped TEST VM after reopen or commit.
+/// The caller re-verifies identity and content before any boot.
+#[cfg(test)]
+pub(crate) fn active_test_pair(
+    db: &Connection,
+    principal: &str,
+    vm: Id,
+) -> Result<Option<(PairSlots, [ArtifactEvidence; 2])>> {
+    let mut stmt = db.prepare(
+        "SELECT g.id,a.role,a.object_key,a.volume_id,a.directory_id,a.file_id,a.content_digest,a.bytes
+         FROM vm_instances v JOIN vm_generations g ON g.vm_id=v.id AND g.active=1
+         JOIN vm_artifacts a ON a.generation_id=g.id AND a.state='active'
+         WHERE v.id=?1 AND v.principal=?2 AND v.state=1 AND a.role IN ('disk','vars')
+         ORDER BY a.role",
+    )?;
+    let rows = stmt
+        .query_map(params![vm, principal], |row| {
+            let role = match row.get::<_, String>(1)?.as_str() {
+                "disk" => "disk",
+                "vars" => "vars",
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            let slot = ArtifactSlot {
+                generation: row.get(0)?,
+                role,
+                key: row.get(2)?,
+            };
+            let volume = row.get::<_, Option<[u8; 8]>>(3)?.map(u64::from_be_bytes);
+            let directory = row.get::<_, Option<Vec<u8>>>(4)?.and_then(identity_bytes);
+            let file = row.get::<_, Option<Vec<u8>>>(5)?.and_then(identity_bytes);
+            let digest = row.get::<_, Option<[u8; 32]>>(6)?;
+            let size = row.get::<_, Option<u64>>(7)?;
+            let evidence = match (volume, directory, file, digest, size) {
+                (Some(volume), Some(directory), Some(file), Some(sha256), Some(size)) => {
+                    Some(ArtifactEvidence {
+                        identity: FileIdentity { volume, file },
+                        directory,
+                        pin: crate::vm::paths::ArtifactPin { size, sha256 },
+                    })
+                }
+                _ => None,
+            };
+            Ok((slot, evidence))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(match rows[..] {
+        [(disk, Some(disk_proof)), (vars, Some(vars_proof))]
+            if disk.role == "disk" && vars.role == "vars" =>
+        {
+            Some((PairSlots { disk, vars }, [disk_proof, vars_proof]))
+        }
+        _ => None,
+    })
 }
 
 fn forget_generations(db: &Connection, id: Id, build: bool) -> Result<()> {

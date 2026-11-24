@@ -555,7 +555,7 @@ impl Supervisor {
                         _ = self.publication_turn() => {}
                     }
                     let supervisor = self.clone();
-                    tokio::task::spawn_blocking(move || supervisor.sweep()).await??;
+                    let _ = tokio::task::spawn_blocking(move || supervisor.sweep()).await?;
                 }
             }
         }
@@ -2727,10 +2727,20 @@ mod tests {
         disk
     }
 
+    fn qcow2_virtual_size(file: &mut fs::File) -> Result<u64> {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(24))?;
+        let mut bytes = [0u8; 8];
+        file.read_exact(&mut bytes)?;
+        file.rewind()?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
     struct FixtureCopy<'a> {
         controller: &'a Controller,
         work: &'a crate::store::vm::snapshot::Work,
-        host: HostObservation,
+        host: Arc<dyn Fn() -> HostObservation + Send + Sync>,
+        staging_disk_path: crate::vm::paths::LocalPath,
         active: [custody::Held; 2],
         source: Option<[custody::Held; 2]>,
         golden: Option<custody::Held>,
@@ -2759,8 +2769,9 @@ mod tests {
             worker: &PendingOperation,
             _: &snapshot::CopyBudget<'_>,
         ) -> Result<(), snapshot::Refusal> {
+            let observation = (self.host)();
             self.controller
-                .snapshot_checkpoint(worker, self.work, self.host, RESOURCES)
+                .snapshot_checkpoint(worker, self.work, observation, RESOURCES)
                 .map_err(|_| snapshot::Refusal::Custody)
         }
 
@@ -2843,11 +2854,25 @@ mod tests {
             if info.args() != ["info", "--output=json", "-f", "qcow2", path] {
                 return Err(snapshot::Refusal::Inspection);
             }
+            let active_path = fixture_snapshot_path(self.work.active.pair.0.disk);
+            let source_path = fixture_snapshot_path(self.work.source.0.disk);
+            let file = if self.staging_disk_path.as_str() == path {
+                &mut self.staging[0]
+            } else if source_path.as_str() == path && self.source.is_some() {
+                &mut self.source.as_mut().unwrap()[0].file
+            } else if active_path.as_str() == path {
+                &mut self.active[0].file
+            } else {
+                return Err(snapshot::Refusal::Inspection);
+            };
+            let actual_size = file.metadata().map_err(|_| snapshot::Refusal::Io)?.len();
+            let virtual_size =
+                qcow2_virtual_size(file).map_err(|_| snapshot::Refusal::Inspection)?;
             let mut body = json!({
                 "filename":path,
                 "format":"qcow2",
-                "virtual-size":SNAPSHOT_VM_BYTES,
-                "actual-size":self.work.source.1[0].pin.size,
+                "virtual-size":virtual_size,
+                "actual-size":actual_size,
                 "dirty-flag":false,
             });
             if let Some(golden) = info.golden() {
@@ -2880,15 +2905,47 @@ mod tests {
         }
     }
 
-    fn copy_fixture_snapshot(
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_fixture_snapshot(
         artifacts: &Artifacts,
         controller: &Controller,
         work: &crate::store::vm::snapshot::Work,
         worker: &PendingOperation,
         route: Option<&runtime::publication::SnapshotRoute>,
-        host: HostObservation,
+        host: Arc<dyn Fn() -> HostObservation + Send + Sync>,
+        hold: Option<(Arc<Notify>, Arc<Notify>)>,
         cancel: &Shutdown,
+    ) -> std::result::Result<Pair, [crate::store::vm::snapshot::StagedLeaf; 2]> {
+        use crate::store::vm::snapshot::StagedLeaf;
+        let mut leaves = [StagedLeaf::Untouched; 2];
+        let result = copy_fixture_snapshot_inner(
+            artifacts,
+            controller,
+            work,
+            worker,
+            route,
+            host,
+            hold,
+            cancel,
+            &mut leaves,
+        )
+        .await;
+        result.map_err(|_| leaves)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_fixture_snapshot_inner(
+        artifacts: &Artifacts,
+        controller: &Controller,
+        work: &crate::store::vm::snapshot::Work,
+        worker: &PendingOperation,
+        route: Option<&runtime::publication::SnapshotRoute>,
+        host: Arc<dyn Fn() -> HostObservation + Send + Sync>,
+        hold: Option<(Arc<Notify>, Arc<Notify>)>,
+        cancel: &Shutdown,
+        leaves: &mut [crate::store::vm::snapshot::StagedLeaf; 2],
     ) -> Result<Pair> {
+        use crate::store::vm::snapshot::StagedLeaf;
         use snapshot::{
             ActiveRelease, Compatibility, CopyPlan, Destination, Golden, Leaf, Limits, Lineage,
             StoredPair,
@@ -2900,8 +2957,8 @@ mod tests {
                 artifacts.hold(slots.vars, vars, false)?,
             ])
         };
-        let active = held_pair(work.active.pair)?;
-        let source = (work.action == 6)
+        let mut active = held_pair(work.active.pair)?;
+        let mut source = (work.action == 6)
             .then(|| held_pair(work.source))
             .transpose()?;
         let (lineage, golden) = if let Some((golden_slots, [golden, _])) = work.active.golden {
@@ -2926,17 +2983,14 @@ mod tests {
                 None,
             )
         };
-        let compatibility = Compatibility {
-            host: work.active.host,
-            vm: work.vm,
-            lineage,
-            recipe: work.active.recipe,
-            firmware: crate::vm::paths::ArtifactPin {
-                size: b"fixture firmware".len() as u64,
-                sha256: Sha256::digest(b"fixture firmware").into(),
-            },
-            virtual_disk_bytes: SNAPSHOT_VM_BYTES,
-            vars_bytes: work.active.pair.1[1].pin.size,
+        let firmware = crate::vm::paths::ArtifactPin {
+            size: b"fixture firmware".len() as u64,
+            sha256: Sha256::digest(b"fixture firmware").into(),
+        };
+        let active_virtual = qcow2_virtual_size(&mut active[0].file)?;
+        let source_virtual = match source.as_mut() {
+            Some(held) => qcow2_virtual_size(&mut held[0].file)?,
+            None => active_virtual,
         };
         let map_leaf = |slot: ArtifactSlot, proof: ArtifactEvidence| Leaf {
             key: slot.key,
@@ -2944,8 +2998,16 @@ mod tests {
             identity: proof.identity,
             pin: proof.pin,
         };
-        let stored = |(slots, [disk, vars]): Pair| StoredPair {
-            compatibility: compatibility.clone(),
+        let stored = |(slots, [disk, vars]): Pair, virtual_disk_bytes: u64| StoredPair {
+            compatibility: Compatibility {
+                host: work.active.host,
+                vm: work.vm,
+                lineage: lineage.clone(),
+                recipe: work.active.recipe,
+                firmware,
+                virtual_disk_bytes,
+                vars_bytes: vars.pin.size,
+            },
             generation: slots.disk.generation,
             disk: map_leaf(slots.disk, disk),
             vars: map_leaf(slots.vars, vars),
@@ -2964,7 +3026,7 @@ mod tests {
             snapshot::Intent {
                 activity_id: work.activity,
                 action,
-                active: stored(work.active.pair),
+                active: stored(work.active.pair, active_virtual),
                 active_writer_epoch: work.active.epoch,
                 release: ActiveRelease {
                     generation: work.active.pair.0.disk.generation,
@@ -2976,7 +3038,8 @@ mod tests {
                     },
                     endpoints_released: true,
                 },
-                selected: (work.action == 6).then(|| (work.target, stored(work.source))),
+                selected: (work.action == 6)
+                    .then(|| (work.target, stored(work.source, source_virtual))),
                 destination: Destination {
                     generation: slots.disk.generation,
                     disk_key: slots.disk.key,
@@ -2991,7 +3054,7 @@ mod tests {
                 max_file_bytes: SNAPSHOT_FILE_LIMIT,
                 max_virtual_bytes: SNAPSHOT_VM_BYTES,
                 restore_growth_bytes: if work.action == 6 {
-                    SNAPSHOT_VM_BYTES
+                    source_virtual
                 } else {
                     0
                 },
@@ -3004,8 +3067,9 @@ mod tests {
             plan.additional_claim().total() == work.claim.total(),
             "fixture snapshot charge changed"
         );
-        let create = |slot: ArtifactSlot, directory| {
+        let mut create = |index: usize, slot: ArtifactSlot, directory| {
             let path = artifacts.0.path(slot.role, slot.key);
+            leaves[index] = StagedLeaf::Unknown;
             let file = fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -3013,17 +3077,27 @@ mod tests {
                 .open(&path)?;
             let identity = custody::identity(&file, false)?;
             controller.snapshot_leaf_identity(worker, work, slot, identity, directory)?;
+            leaves[index] = StagedLeaf::Identified;
             protect_fixture(&path, false)?;
             Ok::<_, anyhow::Error>((file, identity))
         };
-        controller.snapshot_checkpoint(worker, work, host, RESOURCES)?;
+        controller.snapshot_checkpoint(worker, work, host(), RESOURCES)?;
         let directory = work.active.pair.1[0].directory;
-        let (disk, disk_identity) = create(slots.disk, directory)?;
-        let (vars, vars_identity) = create(slots.vars, directory)?;
+        let (disk, disk_identity) = create(0, slots.disk, directory)?;
+        let (vars, vars_identity) = create(1, slots.vars, directory)?;
+        if let Some((entered, release)) = hold {
+            entered.notify_one();
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => anyhow::bail!("fixture snapshot cancelled"),
+                _ = release.notified() => {}
+            }
+        }
         let mut custody = FixtureCopy {
             controller,
             work,
             host,
+            staging_disk_path: plan.destination_paths()[0].clone(),
             active,
             source,
             golden,
@@ -3065,19 +3139,55 @@ mod tests {
         fn quiesce(&self, work: &CleanupWork, _: Instant) -> runtime::Quiesced {
             let live = self.live.lock().unwrap();
             match work.kind.vm() {
-                Some(vm) if live.boots.contains_key(&vm) || live.working.contains(&vm) => {
-                    runtime::Quiesced::Unconfirmed
+                Some(vm) if live.working.contains(&vm) => runtime::Quiesced::Unconfirmed,
+                Some(vm) if live.boots.contains_key(&vm) => {
+                    if matches!(work.kind, crate::vm::reaper::CleanupKind::Expiry { .. }) {
+                        runtime::Quiesced::OwnedTestJob
+                    } else {
+                        runtime::Quiesced::Unconfirmed
+                    }
                 }
                 _ => runtime::Quiesced::Offline,
             }
         }
 
-        fn graceful_stop(&self, _: &CleanupWork, _: Instant) -> runtime::StopDisposition {
-            runtime::StopDisposition::ChargedQuarantine
+        fn graceful_stop(&self, work: &CleanupWork, _: Instant) -> runtime::StopDisposition {
+            let mut live = self.live.lock().unwrap();
+            let Some(vm) = work.kind.vm() else {
+                return runtime::StopDisposition::ChargedQuarantine;
+            };
+            if live.force_reap_only.contains(&vm) || live.stuck.contains(&vm) {
+                return runtime::StopDisposition::ChargedQuarantine;
+            }
+            match live.boots.remove(&vm) {
+                Some(Slot::Idle(boot)) => {
+                    boot.abort();
+                    runtime::StopDisposition::CleanRelease
+                }
+                Some(slot) => {
+                    live.boots.insert(vm, slot);
+                    runtime::StopDisposition::ChargedQuarantine
+                }
+                None => runtime::StopDisposition::CleanRelease,
+            }
         }
 
-        fn force_reap(&self, _: &CleanupWork, _: Instant) -> runtime::StopDisposition {
-            runtime::StopDisposition::ChargedQuarantine
+        fn force_reap(&self, work: &CleanupWork, _: Instant) -> runtime::StopDisposition {
+            let crate::vm::reaper::CleanupKind::Expiry { vm, .. } = work.kind else {
+                return runtime::StopDisposition::ChargedQuarantine;
+            };
+            let mut live = self.live.lock().unwrap();
+            if live.stuck.contains(&vm) {
+                return runtime::StopDisposition::ChargedQuarantine;
+            }
+            match live.boots.remove(&vm) {
+                Some(Slot::Idle(boot)) => {
+                    boot.abort();
+                    runtime::StopDisposition::DirtyRelease
+                }
+                Some(Slot::Exchanging) => runtime::StopDisposition::DirtyRelease,
+                None => runtime::StopDisposition::DirtyRelease,
+            }
         }
 
         fn static_released(&self, vm: Id, _: Id, _: Instant) -> bool {
@@ -3116,6 +3226,11 @@ mod tests {
         working: HashSet<Id>,
         /// Static VMs whose boot release this fixture refuses to prove.
         stuck: HashSet<Id>,
+        /// VMs whose next stop simulates a failed graceful powerdown followed
+        /// by safe force-release (typed dirty disposition).
+        dirty_stop: HashSet<Id>,
+        /// TEST VMs whose expiry graceful stop fails so force-reap must run.
+        force_reap_only: HashSet<Id>,
     }
 
     /// Injected static copy faults, consumed by the next static create.
@@ -3143,6 +3258,9 @@ mod tests {
         windows_recipe: bool,
         pub(super) snapshot_test_media: bool,
         host: HostObservation,
+        pub(super) host_observer: Option<Arc<dyn Fn() -> HostObservation + Send + Sync>>,
+        pub(super) snapshot_hold: Option<(Arc<Notify>, Arc<Notify>)>,
+        pub(super) skip_restore_map_update: bool,
         /// A cancelled build worker reports failure, to witness drain errors.
         fail_cancelled: bool,
         failed: bool,
@@ -3188,6 +3306,9 @@ mod tests {
                 windows_recipe: false,
                 snapshot_test_media: false,
                 host: HOST,
+                host_observer: None,
+                snapshot_hold: None,
+                skip_restore_map_update: false,
                 fail_cancelled: false,
                 failed: false,
             }
@@ -3240,7 +3361,7 @@ mod tests {
             inventory: &VmInventory,
             action: i64,
             mutation: Mutation,
-            route: Option<runtime::publication::SnapshotRoute>,
+            mut route: Option<runtime::publication::SnapshotRoute>,
         ) -> Outcome<Value> {
             self.reap();
             let Mutation {
@@ -3258,6 +3379,13 @@ mod tests {
             let mut registry = self.live.lock().unwrap();
             if registry.working.contains(&vm) || registry.boots.contains_key(&vm) {
                 return inventory.refuse(action, Some(vm), Refusal::SnapshotOfflineRequired.into());
+            }
+            if let Some(route) = route.as_mut()
+                && let Some((generation, epoch)) = controller.active_release_epoch(vm, true)?
+            {
+                // Independent local-origin release proof: no fixture boot or
+                // live origin listener exists for this exact generation/epoch.
+                route.bind_origin_release(generation, epoch);
             }
             let (work, worker, operation) = match controller.admit_snapshot(
                 &inventory.principal,
@@ -3287,6 +3415,12 @@ mod tests {
                 registry.working.insert(vm);
                 let working = Working(self.live.clone(), vm);
                 let host = self.host;
+                let host_observer = self
+                    .host_observer
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(move || host));
+                let hold = self.snapshot_hold.take();
+                let skip_map_update = self.skip_restore_map_update;
                 self.jobs.spawn(async move {
                     let _working = working;
                     let copied = copy_fixture_snapshot(
@@ -3295,11 +3429,13 @@ mod tests {
                         &work,
                         &worker,
                         route.as_ref(),
-                        host,
+                        host_observer,
+                        hold,
                         &cancel,
-                    );
+                    )
+                    .await;
                     match copied {
-                        Ok(pair) if work.action == 6 => {
+                        Ok(pair) if work.action == 6 && !skip_map_update => {
                             let mut live = _working.0.lock().unwrap();
                             if work.is_static {
                                 if let Some((current, _)) = live.static_instances.get_mut(&vm) {
@@ -3309,7 +3445,7 @@ mod tests {
                                 live.instances.insert(vm, pair);
                             }
                         }
-                        Err(_) => controller.fail_snapshot_copy(&worker, &work)?,
+                        Err(leaves) => controller.fail_snapshot_copy(&worker, &work, leaves)?,
                         _ => {}
                     }
                     Ok(())
@@ -3609,25 +3745,42 @@ mod tests {
                 operation,
                 disk: DiskClaim::default(),
             };
-            if matches!(work, Work::Start)
-                && !registry.static_instances.contains_key(&vm)
-                && !controller
+            if matches!(work, Work::Start) {
+                if !controller
                     .foreground_static_rows(principal, Some(vm), None, 1)?
                     .is_empty()
-            {
-                // Rehydrate the committed pair from durable custody records;
-                // the boot re-verifies both files before launch. The fixture
-                // origin key is in memory only, so a fresh one is issued
-                // for the same generation name.
-                match controller.static_custody(principal, vm)? {
-                    Some((slots, evidence, origin_generation)) => {
-                        let origin =
-                            FixtureOrigin::new(origin_generation).map_err(|_| STATE_UNAVAILABLE)?;
-                        registry
-                            .static_instances
-                            .insert(vm, ((slots, evidence), Arc::new(origin)));
+                {
+                    // Always rehydrate the committed pair from durable custody
+                    // records, preserving host-side FixtureOrigin trust when
+                    // already loaded in this process.
+                    match controller.static_custody(principal, vm)? {
+                        Some((slots, evidence, origin_generation)) => {
+                            let origin = registry
+                                .static_instances
+                                .get(&vm)
+                                .filter(|(_, existing)| existing.generation == origin_generation)
+                                .map(|(_, existing)| existing.clone())
+                                .map(Ok)
+                                .unwrap_or_else(|| {
+                                    FixtureOrigin::new(origin_generation).map(Arc::new)
+                                })
+                                .map_err(|_| STATE_UNAVAILABLE)?;
+                            registry
+                                .static_instances
+                                .insert(vm, ((slots, evidence), origin));
+                        }
+                        None => return inventory.refuse(action, Some(vm), Refusal::NotReady.into()),
                     }
-                    None => return inventory.refuse(action, Some(vm), Refusal::NotReady.into()),
+                } else if controller.has_test_generation(principal, vm)? {
+                    // Always rehydrate the committed TEST pair from durable
+                    // custody records so reopen or crash-after-commit never
+                    // bypasses paired file verification before boot.
+                    match controller.test_custody(principal, vm)? {
+                        Some(pair) => {
+                            registry.instances.insert(vm, pair);
+                        }
+                        None => return inventory.refuse(action, Some(vm), Refusal::NotReady.into()),
+                    }
                 }
             }
             let mut worker = match controller.admit(request, self.host, RESOURCES)? {
@@ -3641,6 +3794,7 @@ mod tests {
                 Admission::Refused(reason) => return Err(reason.into()),
             };
             let activity = worker.activity_id();
+            let operation_id = controller.foreground_operation_ref(principal, activity)?;
             // Registered synchronously with the committed admission; the
             // guard leaves the reaper's offline proof closed until joined.
             registry.working.insert(vm);
@@ -3649,10 +3803,8 @@ mod tests {
                 Work::Start => {
                     let controller = controller.clone();
                     let static_pair = registry.static_instances.get(&vm).cloned();
-                    let test_pair = self
-                        .snapshot_test_media
-                        .then(|| registry.instances.get(&vm).copied())
-                        .flatten();
+                    let test_pair = registry.instances.get(&vm).copied();
+                    let writer_epoch = operation_id;
                     self.jobs.spawn(async move {
                         let _working = working;
                         let boot = match static_pair {
@@ -3673,7 +3825,8 @@ mod tests {
                             }
                         };
                         match boot {
-                            Ok(boot) => {
+                            Ok(mut boot) => {
+                                boot.writer_epoch = writer_epoch;
                                 // Publish ready only if this worker's settlement
                                 // won; a worker that lost to expiry or shutdown
                                 // is reaped without a ready boot.
@@ -3708,6 +3861,8 @@ mod tests {
                         Some(Slot::Idle(boot)) => Some(*boot),
                         Some(Slot::Exchanging) | None => None,
                     };
+                    let writer_epoch = boot.as_ref().map(|boot| boot.writer_epoch);
+                    let dirty = registry.dirty_stop.remove(&vm);
                     if let Some(origin) =
                         boot.as_ref().and_then(|boot| boot.publish_origin.as_ref())
                     {
@@ -3723,6 +3878,54 @@ mod tests {
                     self.jobs.spawn(async move {
                         let _working = working;
                         let local = supervisor.publisher.stop_local(Some(vm)).await;
+                        if dirty && let Some(boot) = boot {
+                            boot.release().await?;
+                            if local {
+                                match pair.map(|pair| artifacts.released_pair(pair)).transpose() {
+                                    Ok(Some((held, pair))) => {
+                                        let mut live = live.lock().unwrap();
+                                        controller.finish_fixture_stop(
+                                            &worker,
+                                            vm,
+                                            writer_epoch.unwrap_or([0; 16]),
+                                            Some(pair),
+                                            runtime::StopDisposition::DirtyRelease,
+                                        )?;
+                                        if let Some((current, _)) =
+                                            live.static_instances.get_mut(&vm)
+                                        {
+                                            *current = pair;
+                                        } else {
+                                            live.instances.insert(vm, pair);
+                                        }
+                                        drop(held);
+                                    }
+                                    Ok(None) => {
+                                        controller.finish_fixture_stop(
+                                            &worker,
+                                            vm,
+                                            writer_epoch.unwrap_or([0; 16]),
+                                            None,
+                                            runtime::StopDisposition::DirtyRelease,
+                                        )?;
+                                    }
+                                    Err(_) => {
+                                        controller.finish_with_cause(
+                                            &worker,
+                                            Completion::CleanupUnconfirmed,
+                                            Some(FailureReason::DirtyStop),
+                                        )?;
+                                    }
+                                }
+                                return Ok(());
+                            }
+                            controller.finish_with_cause(
+                                &worker,
+                                Completion::CleanupUnconfirmed,
+                                Some(FailureReason::DirtyStop),
+                            )?;
+                            anyhow::bail!("publication stop unconfirmed");
+                        }
                         // A failed powerdown is a known dirty stop; a missing
                         // boot leaves the cause unknown.
                         let (completion, cause) = match boot {
@@ -3739,8 +3942,13 @@ mod tests {
                             match pair.map(|pair| artifacts.released_pair(pair)).transpose() {
                                 Ok(Some((held, pair))) => {
                                     let mut live = live.lock().unwrap();
-                                    if controller.finish_fixture_stop(&worker, vm, Some(pair))?
-                                        == Status::Succeeded
+                                    if controller.finish_fixture_stop(
+                                        &worker,
+                                        vm,
+                                        writer_epoch.unwrap_or([0; 16]),
+                                        Some(pair),
+                                        runtime::StopDisposition::CleanRelease,
+                                    )? == Status::Succeeded
                                     {
                                         if let Some((current, _)) =
                                             live.static_instances.get_mut(&vm)
@@ -3753,7 +3961,13 @@ mod tests {
                                     drop(held);
                                 }
                                 Ok(None) => {
-                                    controller.finish_fixture_stop(&worker, vm, None)?;
+                                    controller.finish_fixture_stop(
+                                        &worker,
+                                        vm,
+                                        writer_epoch.unwrap_or([0; 16]),
+                                        None,
+                                        runtime::StopDisposition::CleanRelease,
+                                    )?;
                                 }
                                 Err(_) => {
                                     controller.finish_with_cause(
@@ -3981,6 +4195,7 @@ mod tests {
         guest: JoinHandle<Result<()>>,
         origin: Option<crate::vm::static_web::OriginPortLease>,
         publish_origin: Option<Origin>,
+        writer_epoch: Id,
     }
 
     /// Synthetic guest endpoint and independently configured host trust.
@@ -3989,6 +4204,8 @@ mod tests {
         generation: Id,
         name: String,
         guest: Arc<rustls::ServerConfig>,
+        expired_guest: Arc<rustls::ServerConfig>,
+        untrusted_guest: Arc<rustls::ServerConfig>,
         client: Arc<rustls::ClientConfig>,
     }
 
@@ -4006,25 +4223,53 @@ mod tests {
             let mut ca = CertificateParams::default();
             ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
             ca.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-            ca.not_before = now - time::Duration::minutes(1);
-            ca.not_after = now + time::Duration::days(1);
+            ca.not_before = now - time::Duration::days(3);
+            ca.not_after = now + time::Duration::days(3);
             let ca_key = KeyPair::generate()?;
             let certificate = ca.self_signed(&ca_key)?;
             let issuer = Issuer::new(ca, ca_key);
-            let mut leaf = CertificateParams::new(vec![name.clone()])?;
-            leaf.not_before = now - time::Duration::minutes(1);
-            leaf.not_after = now + time::Duration::days(1);
-            leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-            let key = KeyPair::generate()?;
-            let cert = leaf.signed_by(&key, &issuer)?;
+            let mut untrusted_ca = CertificateParams::default();
+            untrusted_ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+            untrusted_ca.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+            untrusted_ca.not_before = now - time::Duration::days(3);
+            untrusted_ca.not_after = now + time::Duration::days(3);
+            let untrusted_ca_key = KeyPair::generate()?;
+            let _ = untrusted_ca.self_signed(&untrusted_ca_key)?;
+            let untrusted_issuer = Issuer::new(untrusted_ca, untrusted_ca_key);
             let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let guest = rustls::ServerConfig::builder_with_provider(provider.clone())
-                .with_safe_default_protocol_versions()?
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![cert.der().clone()],
-                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-                )?;
+            let sign_leaf = |not_before, not_after, cert: rcgen::Certificate, key: KeyPair| -> Result<Arc<rustls::ServerConfig>> {
+                let _ = (not_before, not_after);
+                Ok(Arc::new(
+                    rustls::ServerConfig::builder_with_provider(provider.clone())
+                        .with_safe_default_protocol_versions()?
+                        .with_no_client_auth()
+                        .with_single_cert(
+                            vec![cert.der().clone()],
+                            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+                        )?,
+                ))
+            };
+            let make_leaf = |not_before, not_after| -> Result<CertificateParams> {
+                let mut leaf = CertificateParams::new(vec![name.clone()])?;
+                leaf.not_before = not_before;
+                leaf.not_after = not_after;
+                leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+                Ok(leaf)
+            };
+            let key = KeyPair::generate()?;
+            let cert = make_leaf(now - time::Duration::minutes(1), now + time::Duration::days(1))?
+                .signed_by(&key, &issuer)?;
+            let guest = sign_leaf((), (), cert, key)?;
+            let expired_key = KeyPair::generate()?;
+            let expired_cert =
+                make_leaf(now - time::Duration::days(2), now - time::Duration::days(1))?
+                    .signed_by(&expired_key, &issuer)?;
+            let expired_guest = sign_leaf((), (), expired_cert, expired_key)?;
+            let untrusted_key = KeyPair::generate()?;
+            let untrusted_cert =
+                make_leaf(now - time::Duration::minutes(1), now + time::Duration::days(1))?
+                    .signed_by(&untrusted_key, &untrusted_issuer)?;
+            let untrusted_guest = sign_leaf((), (), untrusted_cert, untrusted_key)?;
             let mut roots = rustls::RootCertStore::empty();
             roots.add(certificate.der().clone())?;
             let client = rustls::ClientConfig::builder_with_provider(provider)
@@ -4034,7 +4279,9 @@ mod tests {
             Ok(Self {
                 generation,
                 name,
-                guest: Arc::new(guest),
+                guest,
+                expired_guest,
+                untrusted_guest,
                 client: Arc::new(client),
             })
         }
@@ -4044,9 +4291,18 @@ mod tests {
             lease: &crate::vm::static_web::OriginPortLease,
             expected: String,
         ) -> Result<()> {
+            self.probe_with(lease, expected, self.guest.clone()).await
+        }
+
+        async fn probe_with(
+            &self,
+            lease: &crate::vm::static_web::OriginPortLease,
+            expected: String,
+            guest_config: Arc<rustls::ServerConfig>,
+        ) -> Result<()> {
             let listener = tokio::net::TcpListener::from_std(lease.fixture_listener()?)?;
             let address = listener.local_addr()?;
-            let tls = tokio_rustls::TlsAcceptor::from(self.guest.clone());
+            let tls = tokio_rustls::TlsAcceptor::from(guest_config);
             let connector = tokio_rustls::TlsConnector::from(self.client.clone());
             const REQUEST: &[u8] =
                 b"GET /arx-health HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n";
@@ -4077,6 +4333,8 @@ mod tests {
         }
     }
 
+    const FIXTURE_CERT_MARKER_OFFSET: u64 = 4097;
+
     impl Boot {
         async fn start_static(
             artifacts: &Artifacts,
@@ -4084,14 +4342,31 @@ mod tests {
             identity: &FixtureOrigin,
             cancel: &Shutdown,
         ) -> Result<Self> {
-            for (slot, proof) in [(slots.disk, disk), (slots.vars, vars)] {
-                artifacts.verify(slot, proof)?;
-            }
+            use std::io::{Read, Seek, SeekFrom};
+            let mut held_disk = artifacts.hold(slots.disk, disk, false)?;
+            let held_vars = artifacts.hold(slots.vars, vars, false)?;
+            let cert_marker = if disk.pin.size > FIXTURE_CERT_MARKER_OFFSET {
+                held_disk
+                    .file
+                    .seek(SeekFrom::Start(FIXTURE_CERT_MARKER_OFFSET))?;
+                let mut byte = [0u8; 1];
+                held_disk.file.read_exact(&mut byte)?;
+                byte[0]
+            } else {
+                0
+            };
+            drop(held_disk);
+            drop(held_vars);
+            let guest_config = match cert_marker {
+                b'E' => identity.expired_guest.clone(),
+                b'U' => identity.untrusted_guest.clone(),
+                _ => identity.guest.clone(),
+            };
             let origin = crate::vm::static_web::OriginPortLease::acquire()?;
             ensure!(origin.verify(), "static origin listener mismatch");
             let mut boot = Self::start(cancel).await?;
             if identity
-                .probe(&origin, identity.name.clone())
+                .probe_with(&origin, identity.name.clone(), guest_config)
                 .await
                 .is_err()
             {
@@ -4174,6 +4449,7 @@ mod tests {
                     guest,
                     origin: None,
                     publish_origin: None,
+                    writer_epoch: [0; 16],
                 }),
                 Err(_) => {
                     peer.await??;
@@ -4181,6 +4457,14 @@ mod tests {
                     anyhow::bail!("fixture boot unconfirmed")
                 }
             }
+        }
+
+        fn abort(self) {
+            if let Some(origin) = &self.publish_origin {
+                origin.retired.retire();
+            }
+            self.peer.abort();
+            self.guest.abort();
         }
 
         async fn release(self) -> Result<()> {
@@ -5006,7 +5290,7 @@ mod tests {
         let restore = call(&a, "vm_snapshot_restore", restore_args.clone()).await;
         let restored = terminal(&a, &restore).await;
         assert_eq!(restored["state"], "succeeded", "{restored}");
-        assert_eq!(restored["cleanup"], "unconfirmed");
+        assert_eq!(restored["cleanup"], "cleanup_unconfirmed");
         assert_eq!(
             fixture_pair_paths(&h, &vm, true).map(|path| fs::read(path).unwrap()),
             saved
@@ -8300,7 +8584,33 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
-        assert_eq!(names, ToolName::ALL.map(ToolName::name));
+        assert_eq!(
+            names,
+            [
+                "list_hosts",
+                "list_activity",
+                "vm_catalog",
+                "vm_template_build",
+                "vm_create",
+                "vm_list",
+                "vm_get",
+                "vm_start",
+                "vm_stop",
+                "vm_run_script",
+                "vm_lease_extend",
+                "vm_operation",
+                "static_vm_create",
+                "static_vm_list",
+                "static_vm_get",
+                "publish_site",
+                "unpublish_site",
+                "publish_status",
+                "vm_snapshot_create",
+                "vm_snapshot_list",
+                "vm_snapshot_restore",
+                "vm_snapshot_delete",
+            ]
+        );
         assert!(
             tools.tools.iter().all(|tool| {
                 tool.input_schema.get("additionalProperties") == Some(&json!(false))

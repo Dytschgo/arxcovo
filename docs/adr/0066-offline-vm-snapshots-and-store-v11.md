@@ -21,4 +21,3 @@ The opener accepts an empty version 0 store and versions 5 through 11. It applie
 Static origin identity backfills from the active generation in existing stores. The first activation assigns it on new instances. The later activation of a restored generation leaves the provisioned identity intact.
 
 See [ADR 0063](0063-vm-store-v9-forward-only.md) for static generations and [ADR 0065](0065-vm-store-v10-publish.md) for B2 publication settlement.
-

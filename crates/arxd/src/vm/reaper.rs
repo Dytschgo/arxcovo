@@ -115,6 +115,13 @@ pub(crate) struct CleanupWork {
     pub pending_worker: Option<i64>,
     pub artifacts: Vec<CleanupArtifact>,
     pub accounted: bool,
+    pub release_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReconcileOutcome {
+    pub released: bool,
+    pub disposed: bool,
 }
 
 /// Requires the exact generated slots, including each recorded directory and
@@ -159,6 +166,10 @@ impl Sweeps {
         self.retries.get(&kind).is_none_or(|(_, next)| now >= *next)
     }
 
+    pub fn clear_retry(&mut self, kind: CleanupKind) {
+        self.retries.remove(&kind);
+    }
+
     pub fn settle(&mut self, work: &CleanupWork, now: Instant, confirmed: bool) {
         let kind = work.kind;
         if confirmed {
@@ -181,14 +192,17 @@ pub(super) fn reconcile(
     runtime: &impl ReaperRuntime,
     custody: &impl ArtifactCustody,
     now: impl Fn() -> Instant,
-) -> bool {
+) -> ReconcileOutcome {
     let start = now();
     let (Some(join_by), Some(stop_by), Some(finish_by)) = (
         start.checked_add(WORKER_BUDGET),
         start.checked_add(STOP_BUDGET),
         start.checked_add(ITEM_BUDGET),
     ) else {
-        return false;
+        return ReconcileOutcome {
+            released: false,
+            disposed: false,
+        };
     };
     let released = match runtime.quiesce(work, join_by) {
         Quiesced::Offline => true,
@@ -197,14 +211,19 @@ pub(super) fn reconcile(
             let stopped =
                 runtime.graceful_stop(work, stop_by) != StopDisposition::ChargedQuarantine;
             stopped
-                || (work.accounted
+                || ((work.accounted || work.release_only)
                     && matches!(work.kind, CleanupKind::Expiry { .. })
                     && now() < finish_by
                     && runtime.force_reap(work, finish_by) != StopDisposition::ChargedQuarantine)
         }
         Quiesced::OwnedTestJob => false,
     };
-    released && work.accounted && now() < finish_by && custody.reconcile(work, finish_by)
+    let disposed = released
+        && !work.release_only
+        && work.accounted
+        && now() < finish_by
+        && custody.reconcile(work, finish_by);
+    ReconcileOutcome { released, disposed }
 }
 
 #[cfg(test)]

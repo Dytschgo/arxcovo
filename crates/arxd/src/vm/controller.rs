@@ -972,7 +972,13 @@ impl<C: Clock> VmController<C> {
                     if !more {
                         return Ok(());
                     }
-                    self.sweep_with(runtime, custody)?;
+                    // Recoverable store settlement failures keep claims armed
+                    // and retry on the next tick rather than ending the reaper.
+                    if self.sweep_with(runtime, custody).is_err()
+                        && let Ok(mut gate) = self.gate.lock()
+                    {
+                        gate.custody_uncertain = true;
+                    }
                 }
             }
         }
@@ -1013,12 +1019,24 @@ impl<C: Clock> VmController<C> {
                 uncertain = true;
                 continue;
             }
-            let proved = reaper::reconcile(&work, runtime, custody, || self.clock.now().monotonic);
-            let confirmed = self
+            let outcome = reaper::reconcile(&work, runtime, custody, || self.clock.now().monotonic);
+            match self
                 .store
-                .transact(|db| store::settle_cleanup(db, &work, utc(self.clock.now())?, proved))?;
-            uncertain |= !confirmed;
-            sweeps.settle(&work, self.clock.now().monotonic, confirmed);
+                .transact(|db| store::settle_cleanup(db, &work, utc(self.clock.now())?, outcome))
+            {
+                Ok(confirmed) => {
+                    uncertain |= !confirmed;
+                    if work.release_only && outcome.released {
+                        sweeps.clear_retry(work.kind);
+                    } else {
+                        sweeps.settle(&work, self.clock.now().monotonic, confirmed);
+                    }
+                }
+                Err(_) => {
+                    uncertain = true;
+                    sweeps.settle(&work, self.clock.now().monotonic, false);
+                }
+            }
         }
         // Committed static generations settle without any deletion route.
         // Unproven release keeps them recovering, which fences launches.
@@ -1033,9 +1051,15 @@ impl<C: Clock> VmController<C> {
                     runtime.static_released(claim.vm, claim.generation, deadline)
                         && self.clock.now().monotonic < deadline
                 });
-            self.store.transact(|db| {
-                store::static_vm::settle_recovery(db, claim, released, utc(self.clock.now())?)
-            })?;
+            if self
+                .store
+                .transact(|db| {
+                    store::static_vm::settle_recovery(db, claim, released, utc(self.clock.now())?)
+                })
+                .is_err()
+            {
+                uncertain = true;
+            }
         }
         uncertain |= self.store.transact(|db| store::static_vm::recovering(db))?;
         self.gate
@@ -1243,14 +1267,7 @@ fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Tar
         return Ok(Err(reason));
     }
     let state = lease.state;
-    if !matches!(state, 1 | 2)
-        || store::count(
-            db,
-            "SELECT EXISTS(SELECT 1 FROM activity
-        WHERE vm=?1 AND status=0 AND action<=6)",
-            [request.vm],
-        )? != 0
-    {
+    if !matches!(state, 1 | 2) || store::snapshot::has_pending_vm_activity(db, request.vm)? {
         return Ok(Err(Refusal::Busy));
     }
     if request.disk.images != 0 || request.disk.metadata != 0 {
@@ -1624,12 +1641,7 @@ fn static_target(
     if request.disk.total() != Some(0) {
         return Ok(Err(Refusal::Invalid));
     }
-    if store::count(
-        db,
-        "SELECT EXISTS(SELECT 1 FROM activity WHERE vm=?1 AND status=0 AND (action<=6 OR action=12))",
-        [request.vm],
-    )? != 0
-    {
+    if store::snapshot::has_pending_vm_activity(db, request.vm)? {
         return Ok(Err(Refusal::Busy));
     }
     if store::snapshot::unsettled(db, request.vm)? {
@@ -1788,6 +1800,24 @@ impl<C: Clock> VmController<C> {
         })
     }
 
+    /// The committed pair of an owned, stopped TEST VM, for a fresh identity
+    /// check by the launcher after reopen or commit.
+    #[cfg(test)]
+    pub(crate) fn test_custody(
+        &self,
+        principal: &str,
+        vm: Id,
+    ) -> Result<Option<(PairSlots, [ArtifactEvidence; 2])>> {
+        self.store
+            .transact(|db| store::active_test_pair(db, principal, vm))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_test_generation(&self, principal: &str, vm: Id) -> Result<bool> {
+        self.store
+            .transact(|db| store::has_test_generation(db, principal, vm))
+    }
+
     /// The committed pair of an owned, stopped static VM, for a fresh
     /// identity check by the launcher after reopen.
     #[cfg(test)]
@@ -1920,6 +1950,8 @@ impl<C: Clock> VmController<C> {
                     &current.nonce,
                     store::publish::Update::Phase(store::publish::Phase::Revoking, None),
                 )?;
+            } else if store::snapshot::unsettled(db, vm)? {
+                return Ok(Err(Refusal::Busy));
             }
             if intent.is_none() {
                 db.execute(
@@ -2071,26 +2103,95 @@ impl<C: Clock> VmController<C> {
         &self,
         worker: &PendingOperation,
         vm: Id,
+        epoch: Id,
         pair: Option<store::snapshot::Pair>,
+        disposition: super::runtime::StopDisposition,
     ) -> Result<Status> {
+        use super::runtime::StopDisposition;
         self.check_worker(worker)?;
         self.store.transact(|db| {
             let now = self.clock.now();
-            let completion = if now.monotonic < worker.deadline {
-                Completion::Succeeded
-            } else {
-                Completion::CleanupUnconfirmed
-            };
+            let before_deadline = now.monotonic < worker.deadline;
             ensure!(store::count(db,
                 "SELECT count(*) FROM vm_operations WHERE activity_id=?1 AND vm=?2 AND action=4 AND status=0",
                 params![worker.activity_id, vm],
             )? == 1, "invalid offline release worker");
-            let status = store::settle_operation(db, worker.activity_id, utc(now)?, completion)?;
-            if status == Status::Succeeded && let Some(pair) = pair {
-                store::snapshot::prove_stop(db, vm, pair)?;
+            match disposition {
+                StopDisposition::CleanRelease => {
+                    let completion = if before_deadline {
+                        Completion::Succeeded
+                    } else {
+                        Completion::CleanupUnconfirmed
+                    };
+                    let status =
+                        store::settle_operation(db, worker.activity_id, utc(now)?, completion)?;
+                    if status == Status::Succeeded
+                        && let Some(pair) = pair
+                    {
+                        store::snapshot::prove_stop(db, vm, epoch, pair, disposition)?;
+                    }
+                    Ok(status)
+                }
+                StopDisposition::DirtyRelease => {
+                    // Safely released after a failed graceful stop: settle the
+                    // stop operation as unconfirmed/dirty recovery, and persist
+                    // the typed dirty release disposition independently of
+                    // generic cleanup confirmation.
+                    let is_static = store::count(
+                        db,
+                        "SELECT EXISTS(SELECT 1 FROM vm_static_instances WHERE id=?1)",
+                        [vm],
+                    )? != 0;
+                    let completion = if is_static && before_deadline {
+                        Completion::Failed
+                    } else {
+                        Completion::CleanupUnconfirmed
+                    };
+                    let status = store::settle_with_script(
+                        db,
+                        worker.activity_id,
+                        utc(now)?,
+                        completion,
+                        None,
+                        Some(FailureReason::DirtyStop),
+                    )?;
+                    if let Some(pair) = pair {
+                        store::snapshot::prove_stop(db, vm, epoch, pair, disposition)?;
+                    }
+                    Ok(status)
+                }
+                StopDisposition::ChargedQuarantine => store::settle_with_script(
+                    db,
+                    worker.activity_id,
+                    utc(now)?,
+                    Completion::CleanupUnconfirmed,
+                    None,
+                    Some(FailureReason::DirtyStop),
+                ),
             }
-            Ok(status)
         })
+    }
+
+    pub(crate) fn prove_dirty_release(
+        &self,
+        vm: Id,
+        epoch: Id,
+        pair: store::snapshot::Pair,
+    ) -> Result<()> {
+        self.store.transact(|db| {
+            store::snapshot::prove_stop(
+                db,
+                vm,
+                epoch,
+                pair,
+                super::runtime::StopDisposition::DirtyRelease,
+            )
+        })
+    }
+
+    pub(crate) fn active_release_epoch(&self, vm: Id, is_static: bool) -> Result<Option<(Id, Id)>> {
+        self.store
+            .transact(|db| store::snapshot::active_release_epoch(db, vm, is_static))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2129,7 +2230,7 @@ impl<C: Clock> VmController<C> {
                 Ok(is_static) => is_static,
                 Err(reason) => return Ok(Err(reason)),
             };
-            if !snapshot::check_route(db, vm, is_static, route)? {
+            if is_static && route.is_none_or(|route| route.vm() != vm) {
                 return Ok(Err(Refusal::SnapshotPublishNotQuiesced));
             }
             if gate.custody_uncertain || store::has_failed_clone_cleanup(db)? {
@@ -2143,6 +2244,16 @@ impl<C: Clock> VmController<C> {
             let Some(active) = snapshot::active(db, vm, is_static)? else {
                 return Ok(Err(Refusal::SnapshotOfflineRequired));
             };
+            if !snapshot::check_route(
+                db,
+                vm,
+                is_static,
+                active.pair.0.disk.generation,
+                active.epoch,
+                route,
+            )? {
+                return Ok(Err(Refusal::SnapshotPublishNotQuiesced));
+            }
             let source = match request {
                 Request::Create(_) if active.clean => active.pair,
                 Request::Create(_) => return Ok(Err(Refusal::SnapshotOfflineRequired)),
@@ -2277,6 +2388,7 @@ impl<C: Clock> VmController<C> {
         &self,
         worker: &PendingOperation,
         work: &store::snapshot::Work,
+        leaves: [store::snapshot::StagedLeaf; 2],
     ) -> Result<()> {
         self.check_worker(worker)?;
         ensure!(
@@ -2284,6 +2396,6 @@ impl<C: Clock> VmController<C> {
             "snapshot worker mismatch"
         );
         self.store
-            .transact(|db| store::snapshot::fail_copy(db, work, utc(self.clock.now())?))
+            .transact(|db| store::snapshot::fail_copy(db, work, leaves, utc(self.clock.now())?))
     }
 }
