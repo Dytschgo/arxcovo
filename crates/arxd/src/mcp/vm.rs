@@ -2590,8 +2590,10 @@ mod tests {
     /// returns when both sides finish; this bound only stops a stuck socket.
     /// Real TLS and I/O errors still return immediately and fence the boot.
     const FIXTURE_TLS_DEADLINE: Duration = Duration::from_secs(10);
-    /// Longer than [`FIXTURE_TLS_DEADLINE`] so a static start can publish its
-    /// receipt after a slow probe. A settled operation returns immediately.
+    /// Outer hang guard for an expected static fixture start and the standalone
+    /// origin probe. Longer than [`FIXTURE_TLS_DEADLINE`] so a slow valid
+    /// exchange can publish its receipt. A settled operation returns immediately.
+    /// Other fixture operations keep the two-second guard in [`terminal`].
     const FIXTURE_START_GUARD: Duration = Duration::from_secs(15);
 
     /// Staged fixture files with real file identities, written through the
@@ -5261,10 +5263,18 @@ mod tests {
     }
 
     async fn terminal(client: &Client, reference: &Value) -> Value {
+        // Hang guard only. A settled row returns at once. Expected static
+        // starts use [`terminal_static_start`] so a slow probe can finish.
+        await_operation(client, reference, Duration::from_secs(2)).await
+    }
+
+    async fn terminal_static_start(client: &Client, reference: &Value) -> Value {
+        await_operation(client, reference, FIXTURE_START_GUARD).await
+    }
+
+    async fn await_operation(client: &Client, reference: &Value, bound: Duration) -> Value {
         assert_eq!(reference["ok"], true, "{reference}");
-        // Hang guard only. Longer than the fixture TLS deadline so a slow
-        // static start can record its receipt. A settled row returns at once.
-        tokio::time::timeout(FIXTURE_START_GUARD, async {
+        tokio::time::timeout(bound, async {
             loop {
                 let result = call(
                     client,
@@ -5723,7 +5733,10 @@ mod tests {
             "not_ready"
         );
         let start = call(&a, "vm_start", args(609)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         assert_eq!(
             call(&a, "publish_site", args(610)).await["reason"],
             "publish_credential_missing"
@@ -5805,7 +5818,10 @@ mod tests {
         );
 
         let start = call(&a, "vm_start", args(618)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(619)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         fake.health.store(1, SeqCst);
@@ -5940,7 +5956,10 @@ mod tests {
             "key_collision"
         );
         let running = call(&a, "vm_start", args(1811)).await;
-        assert_eq!(terminal(&a, &running).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &running).await["state"],
+            "succeeded"
+        );
         let original_paths = fixture_pair_paths(&h, &vm, true);
         let saved = simulate_pair_write(&original_paths);
         let stopped = call(&a, "vm_stop", args(1812)).await;
@@ -6000,7 +6019,10 @@ mod tests {
         assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
         assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (1, 1));
         let started = call(&a, "vm_start", args(1809)).await;
-        assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &started).await["state"],
+            "succeeded"
+        );
         let republished = call(&a, "publish_site", args(1810)).await;
         assert_eq!(terminal(&a, &republished).await["state"], "succeeded");
         drop(a);
@@ -7515,7 +7537,7 @@ mod tests {
             .clone();
         nonce += 1;
         assert_eq!(
-            terminal(
+            terminal_static_start(
                 &a,
                 &call(
                     &a,
@@ -7626,7 +7648,7 @@ mod tests {
 
         // 3. Same-process negative TLS trust (expired cert marker 'E') under unchanged host trust.
         assert_eq!(
-            terminal(
+            terminal_static_start(
                 &a,
                 &call(
                     &a,
@@ -7710,7 +7732,7 @@ mod tests {
         );
         nonce += 1;
         assert_eq!(
-            terminal(
+            terminal_static_start(
                 &a,
                 &call(
                     &a,
@@ -7874,7 +7896,7 @@ mod tests {
         let p1 =
             terminal(&a, &call(&a, "vm_snapshot_create", args(2506)).await).await["snapshot_id"]
                 .clone();
-        let started = terminal(&a, &call(&a, "vm_start", args(2507)).await).await;
+        let started = terminal_static_start(&a, &call(&a, "vm_start", args(2507)).await).await;
         assert_settled_static_start(&h, &vm, &started);
 
         // 1. Publish-first: held DNS POST blocks snapshot create and restore.
@@ -7952,7 +7974,7 @@ mod tests {
 
         // 3. Pending DNS removal across restart still fences snapshots until settled.
         assert_eq!(
-            terminal(&a, &call(&a, "vm_start", args(2516)).await).await["state"],
+            terminal_static_start(&a, &call(&a, "vm_start", args(2516)).await).await["state"],
             "succeeded"
         );
         assert_eq!(
@@ -8021,7 +8043,7 @@ mod tests {
             "succeeded"
         );
         assert_eq!(
-            terminal(&a, &call(&a, "vm_start", args(2523)).await).await["state"],
+            terminal_static_start(&a, &call(&a, "vm_start", args(2523)).await).await["state"],
             "succeeded"
         );
 
@@ -9334,7 +9356,10 @@ mod tests {
         assert_eq!(retired["state"], "retired_boot");
         assert!(retired["receipt"].is_null());
         let restarted = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(200)})).await;
-        assert_eq!(terminal(&a, &restarted).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &restarted).await["state"],
+            "succeeded"
+        );
         store
             .transact(|tx| {
                 assert!(db::register_boot(tx, vm_id, generation, boot).is_err());
@@ -9609,7 +9634,10 @@ mod tests {
         let a = h.client(0).await;
         let store = h.supervisor().controller.compose_store();
         let started = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(3022)})).await;
-        assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &started).await["state"],
+            "succeeded"
+        );
         let (host, mut peer) = tokio::io::duplex(65536);
         let second = tokio::spawn(async move {
             fake_compose_hello(&mut peer, boot + 1).await;
@@ -10043,7 +10071,10 @@ mod tests {
             h = h.reopen(|_| {}).await;
             let a = h.client(0).await;
             let started = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(4012)})).await;
-            assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+            assert_eq!(
+                terminal_static_start(&a, &started).await["state"],
+                "succeeded"
+            );
             let (host, mut peer) = tokio::io::duplex(65536);
             let hello = tokio::spawn(async move {
                 fake_compose_hello(&mut peer, boot + 1).await;
@@ -10485,7 +10516,7 @@ mod tests {
             json!({"vm_id":vm,"request_id":key(base + 2)}),
         )
         .await;
-        assert_eq!(terminal(a, &start).await["state"], "succeeded");
+        assert_eq!(terminal_static_start(a, &start).await["state"], "succeeded");
         let fake = Arc::new(crate::vm::runtime::publication::Fake::default());
         fake.credential.store(true, SeqCst);
         enroll(
@@ -10684,7 +10715,10 @@ mod tests {
 
         // Restart after DNS acknowledgement while cleanup credentials are gone.
         let start = call(&a, "vm_start", args(811)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(812)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         let before = intent(&h).unwrap();
@@ -10742,7 +10776,10 @@ mod tests {
         assert_eq!(terminal(&a, &revoke).await["state"], "failed");
         assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
         let start = call(&a, "vm_start", args(814)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         fake.credential.store(true, SeqCst);
         h.supervisor().gate.lock().unwrap().allow_agent_public_sites = true;
         assert_eq!(
@@ -10810,7 +10847,10 @@ mod tests {
         };
         assert_eq!(pinned(&intent(&h).unwrap()), pinned(&before));
         let start = call(&a, "vm_start", args(817)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         assert_eq!(
             call(&a, "publish_site", args(818)).await["reason"],
             "publish_cleanup_pending"
@@ -11711,7 +11751,10 @@ mod tests {
         assert_eq!(fake.posts.load(SeqCst), 0);
         assert!(fake.routes.lock().unwrap().is_empty());
         let start = call(&a, "vm_start", args(1232)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(1233)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         let revoke = call(&a, "unpublish_site", args(1234)).await;
@@ -11913,7 +11956,10 @@ mod tests {
         assert!(fake.routes.lock().unwrap().is_empty());
         assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
         let start = call(&a, "vm_start", args(1432)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(1433)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         let revoke = call(&a, "unpublish_site", args(1434)).await;
@@ -12225,7 +12271,10 @@ mod tests {
         // shutdown runs before any reaper turn: the in-memory no-submission
         // proof releases the intent without DNS, with the owner cause.
         let start = call(&a, "vm_start", args(1812)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let (marker, in_marker, release_marker) = gate();
         *h.supervisor().publisher.marker_gate.lock().unwrap() = Some(marker);
         let posts = fake.posts.load(SeqCst);
@@ -12356,7 +12405,10 @@ mod tests {
         enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
         let a = h.client(0).await;
         let start = call(&a, "vm_start", args(1911)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         trigger(&h, refuse_commit);
         let pending = call(&a, "publish_site", args(1912)).await;
         assert_eq!(pending["ok"], true, "{pending}");
@@ -12389,7 +12441,10 @@ mod tests {
         // A final reconciliation parked past the drain deadline is unconfirmed
         // and keeps the intent for restart cleanup.
         let start = call(&a, "vm_start", args(1913)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(1914)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         let (remove, _in_remove, _held) = gate();
@@ -12412,7 +12467,7 @@ mod tests {
         // call harvests the panic and its cleanup settles the publication,
         // yet the drain stays unconfirmed.
         let start = call(&a, "vm_start", args(1915)).await;
-        let started = terminal(&a, &start).await;
+        let started = terminal_static_start(&a, &start).await;
         assert_settled_static_start(&h, &vm, &started);
         let posts = fake.posts.load(SeqCst);
         fake.panic_after_post.store(true, SeqCst);
@@ -12437,7 +12492,10 @@ mod tests {
         enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
         let a = h.client(0).await;
         let start = call(&a, "vm_start", args(1918)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let published = call(&a, "publish_site", args(1919)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         fake.stop_panic.store(true, SeqCst);
@@ -12560,7 +12618,10 @@ mod tests {
 
         // Settled by a reaper turn.
         let start = call(&a, "vm_start", args(2211)).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         fake.residue.store(true, SeqCst);
         trigger(&h, fail_terminal);
         let pending = call(&a, "publish_site", args(2212)).await;
@@ -13023,7 +13084,10 @@ mod tests {
         let files = static_files();
         assert_eq!(files.len(), 2);
         let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(106)})).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let running = call(&a, "static_vm_get", get.clone()).await;
         assert_eq!(running["state"], "running");
         assert_eq!(running["web_health"], "healthy");
@@ -13131,7 +13195,10 @@ mod tests {
         assert_eq!(charges(), (persistent, 0));
 
         let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(111)})).await;
-        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
         let stop = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(112)})).await;
         assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
         assert_eq!(static_files(), files);
@@ -13364,7 +13431,10 @@ mod tests {
         };
         let start = lifecycle("vm_start", &site_a, 304);
         let started = call(&a, start.0, start.1).await;
-        assert_eq!(terminal(&a, &started).await["state"], "succeeded");
+        assert_eq!(
+            terminal_static_start(&a, &started).await["state"],
+            "succeeded"
+        );
         let recovery = |h: &Harness, name: &str| -> (i64, i64, Option<bool>) {
             read_state(h)
                 .query_row(
@@ -13401,11 +13471,12 @@ mod tests {
         ] {
             let (tool, args) = lifecycle(tool, vm, number);
             let operation = call(&a, tool, args).await;
-            assert_eq!(
-                terminal(&a, &operation).await["state"],
-                "succeeded",
-                "{tool}"
-            );
+            let settled = if tool == "vm_start" {
+                terminal_static_start(&a, &operation).await
+            } else {
+                terminal(&a, &operation).await
+            };
+            assert_eq!(settled["state"], "succeeded", "{tool}");
         }
         let running = call(&a, "static_vm_get", get(&site_b)).await;
         assert_eq!(
@@ -13453,11 +13524,12 @@ mod tests {
         ] {
             let (tool, args) = lifecycle(tool, vm, number);
             let operation = call(&a, tool, args).await;
-            assert_eq!(
-                terminal(&a, &operation).await["state"],
-                "succeeded",
-                "{tool}"
-            );
+            let settled = if tool == "vm_start" {
+                terminal_static_start(&a, &operation).await
+            } else {
+                terminal(&a, &operation).await
+            };
+            assert_eq!(settled["state"], "succeeded", "{tool}");
         }
         assert_eq!(static_paths(&h.media), files);
     }
@@ -13639,7 +13711,7 @@ mod tests {
         });
         let began = Instant::now();
         let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(452)})).await;
-        let started = terminal(&a, &start).await;
+        let started = terminal_static_start(&a, &start).await;
         assert!(
             began.elapsed() >= PROBE_DELAY,
             "the fixture probe did not apply its delay"
