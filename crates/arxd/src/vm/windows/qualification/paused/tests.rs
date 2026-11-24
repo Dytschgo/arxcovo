@@ -77,6 +77,24 @@ enum Stop {
     Late,
 }
 
+struct DelayedGreeting {
+    delay: Pin<Box<tokio::time::Sleep>>,
+    replies: Cursor<Vec<u8>>,
+}
+
+impl AsyncRead for DelayedGreeting {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.delay.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.replies).poll_read(cx, buf)
+    }
+}
+
 struct FakeWriter {
     written: Rc<RefCell<Vec<u8>>>,
     dispatch: Arc<DispatchGate>,
@@ -125,6 +143,7 @@ struct Fake {
     steps: RefCell<Vec<Step>>,
     written: Rc<RefCell<Vec<u8>>>,
     replies: Option<String>,
+    greeting_delay: Option<Duration>,
     peer_hold: RefCell<Option<tokio::io::DuplexStream>>,
     dispatch: RefCell<Option<Arc<DispatchGate>>>,
     fail: Option<(Step, NativeRefusal)>,
@@ -138,6 +157,8 @@ struct Fake {
     charge_retained: bool,
     stall_at: Option<Step>,
     slow_at: Option<Step>,
+    proof_workspace_at: Option<Step>,
+    proof_workspace_held: Cell<bool>,
     owner_active_at: Option<Step>,
     owner_active: Cell<bool>,
 }
@@ -149,6 +170,7 @@ impl Default for Fake {
             steps: RefCell::default(),
             written: Rc::default(),
             replies: Some(format!("{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n")),
+            greeting_delay: None,
             peer_hold: RefCell::default(),
             dispatch: RefCell::default(),
             fail: None,
@@ -162,6 +184,8 @@ impl Default for Fake {
             charge_retained: false,
             stall_at: None,
             slow_at: None,
+            proof_workspace_at: None,
+            proof_workspace_held: Cell::default(),
             owner_active_at: None,
             owner_active: Cell::default(),
         }
@@ -192,6 +216,11 @@ impl Fake {
         }
         if self.slow_at == Some(step) {
             tokio::time::sleep(BUDGET * 2).await;
+        }
+        if self.proof_workspace_at == Some(step) {
+            self.proof_workspace_held.set(true);
+            tokio::time::sleep(PRESSURE_INTERVAL).await;
+            self.proof_workspace_held.set(false);
         }
     }
 
@@ -234,6 +263,9 @@ impl Host for Fake {
         self.live_calls.set(self.live_calls.get() + 1);
         if self.owner_active.get() {
             observation.idle = false;
+        }
+        if self.proof_workspace_held.get() {
+            observation.available_ram_bytes = RAM_RESERVE;
         }
         Ok(observation)
     }
@@ -302,7 +334,17 @@ impl Host for Fake {
         self.step(Step::InspectChild)?;
         self.checkpoint(Step::InspectChild).await;
         let stdout: Self::Reader = match &self.replies {
-            Some(replies) => Box::new(Cursor::new(replies.as_bytes().to_vec())),
+            Some(replies) => {
+                let replies = Cursor::new(replies.as_bytes().to_vec());
+                if let Some(delay) = self.greeting_delay {
+                    Box::new(DelayedGreeting {
+                        delay: Box::pin(tokio::time::sleep(delay)),
+                        replies,
+                    })
+                } else {
+                    Box::new(replies)
+                }
+            }
             None => {
                 let (read, write) = tokio::io::duplex(64);
                 *self.peer_hold.borrow_mut() = Some(write);
@@ -346,6 +388,7 @@ impl Host for Fake {
 
     fn request_stop(&mut self, _: &FakeSlot) {
         self.steps.borrow_mut().push(Step::Stop);
+        self.proof_workspace_held.set(false);
     }
 
     async fn observe_stop(&mut self, _: &FakeSlot, deadline: Tick) -> StopEvidence {
@@ -772,6 +815,68 @@ async fn immediate_proof_completion_cannot_hide_new_owner_activity() {
                 .ends_with(&[proof, Step::Stop, Step::Reopen, Step::Settle])
         );
     }
+}
+
+async fn assert_due_pressure_precedes_proof_release(proof: Step) {
+    let mut host = Fake {
+        proof_workspace_at: Some(proof),
+        ..Fake::default()
+    };
+    let mut trial = Box::pin(host.run());
+    let mut ctx = Context::from_waker(std::task::Waker::noop());
+    assert!(trial.as_mut().poll(&mut ctx).is_pending());
+
+    // Both timers mature before the next poll, well inside the cutoff.
+    // The proof would restore RAM on its completion poll.
+    tokio::time::advance(PRESSURE_INTERVAL + Duration::from_millis(50)).await;
+    assert_eq!(
+        trial.await,
+        TrialResult {
+            paused: Err(Failure::Refused(RESERVES)),
+            release: StopDisposition::DirtyRelease,
+        }
+    );
+    assert!(
+        host.steps()
+            .ends_with(&[proof, Step::Stop, Step::Reopen, Step::Settle])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn due_pressure_precedes_consumer_open_workspace_release() {
+    assert_due_pressure_precedes_proof_release(Step::VerifyOpens).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn due_pressure_precedes_whpx_workspace_release() {
+    assert_due_pressure_precedes_proof_release(Step::VerifyWhpx).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn due_pressure_precedes_qmp_greeting_and_capabilities_write() {
+    let mut host = Fake {
+        greeting_delay: Some(PRESSURE_INTERVAL),
+        // The first sample scheduled while awaiting the greeting sees input.
+        live_override: Some((5, |sample| sample.idle = false)),
+        ..Fake::default()
+    };
+    let mut trial = Box::pin(host.run());
+    let mut ctx = Context::from_waker(std::task::Waker::noop());
+    assert!(trial.as_mut().poll(&mut ctx).is_pending());
+
+    tokio::time::advance(PRESSURE_INTERVAL + Duration::from_millis(50)).await;
+    assert_eq!(
+        trial.await,
+        TrialResult {
+            paused: Err(Failure::OwnerActive),
+            release: StopDisposition::DirtyRelease,
+        }
+    );
+    assert!(host.written.borrow().is_empty());
+    assert!(
+        host.steps()
+            .ends_with(&[Step::Resume, Step::Stop, Step::Reopen, Step::Settle])
+    );
 }
 
 #[test]

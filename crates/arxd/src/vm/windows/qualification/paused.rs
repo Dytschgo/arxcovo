@@ -333,6 +333,8 @@ async fn paused_exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     before(cancel, cutoff)
 }
 
+const PRESSURE_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Keep watching the owner and reserves while the paused child is alive,
 /// including when the peer stalls. A new sample does not extend a write window.
 async fn watch_pressure<T>(
@@ -350,12 +352,14 @@ async fn watch_pressure<T>(
             biased;
             _ = cancel.cancelled() => return Err(Failure::Cancelled),
             _ = &mut deadline => return Err(Failure::Timeout),
+            // Completing an operation can release memory or send QMP.
+            // Sample due pressure before the action can change those conditions.
+            _ = tokio::time::sleep(PRESSURE_INTERVAL) => {
+                recheck()?;
+            }
             result = &mut action => {
                 before(cancel, cutoff)?;
                 return result;
-            }
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                recheck()?;
             }
         }
     }
