@@ -3462,7 +3462,7 @@ mod tests {
         let store = VmStore::open(dir.path(), NOW).unwrap();
         store.transact(|db| {
             assert_eq!(count(db, "PRAGMA user_version", [])?, i64::from(VM_SCHEMA_VERSION));
-            for table in ["projects","releases","volumes","secrets","release_epochs","boots","operations","recovery_floors"] {
+            for table in ["projects","releases","volumes","secrets","release_epochs","boots","operations","compacted_keys"] {
                 assert_eq!(count(db,&format!("SELECT count(*) FROM vm_compose_{table}"),[])?,0);
             }
             if version==11 {

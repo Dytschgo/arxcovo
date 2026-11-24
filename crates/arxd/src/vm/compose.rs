@@ -418,7 +418,7 @@ impl Host {
         let mut channel = session.channel.lock().await;
         // Another worker may have completed this operation while we waited.
         let db = controller.compose_store();
-        let Some(intent) = db.transact(|db| store::replay(db, principal, key))? else {
+        let Some(mut intent) = db.transact(|db| store::replay(db, principal, key))? else {
             return Ok(());
         };
         if intent.closed.as_deref() == Some("retired_boot")
@@ -440,6 +440,39 @@ impl Host {
         {
             return Ok(());
         }
+        if !intent.sent && matches!(intent.kind, Kind::Stop | Kind::Down) {
+            let prior = db.transact(|tx| {
+                let row: Option<Id> = tx.query_row(
+                    "SELECT o.request FROM vm_compose_projects p LEFT JOIN vm_compose_operations o ON o.id=p.recovery_id
+                     WHERE p.vm=?1 AND p.project=?2", rusqlite::params![target.vm,target.project], |r|r.get(0))?;
+                row.map(|key|store::replay(tx,principal,key)).transpose().map(Option::flatten)
+            })?;
+            if let Some(prior) = prior
+                && prior.generation == session.generation
+                && prior.boot != session.wire_boot
+            {
+                recover_deploy(db, principal, &prior, &session, &mut channel, cancel).await?;
+            }
+            // Repair may have selected the newer release. Bind the unsent cleanup
+            // atomically before querying or submitting its own operation ID.
+            let rebound = db.transact(|tx| {
+                ensure!(store::live_boot(tx,target.vm,intent.generation,intent.boot)?, "Compose cleanup boot changed");
+                let state=store::status(tx,principal,target)?.ok_or_else(||anyhow::anyhow!("Compose project unavailable"))?;
+                if state.revision.is_none() {
+                    store::close(tx,&intent,"compose_recovery_required",controller.compose_now()?)?;
+                    return Ok(None);
+                }
+                if state.revision != Some(intent.revision) {
+                    ensure!(tx.execute("UPDATE vm_compose_operations SET (release,revision)=(SELECT committed_release,committed FROM vm_compose_projects WHERE vm=?1 AND project=?2)
+                       WHERE id=?3 AND sent=0 AND closed IS NULL",rusqlite::params![target.vm,target.project,intent.id])?==1,"Compose cleanup changed");
+                }
+                store::replay(tx,principal,key)
+            })?;
+            let Some(current) = rebound else {
+                return Ok(());
+            };
+            intent = current;
+        }
         let manifest = Project::parse(&intent.bytes)
             .map_err(|_| anyhow::anyhow!("invalid enrolled Compose manifest"))?;
         ensure!(
@@ -460,6 +493,14 @@ impl Host {
                 ..
             } if !intent.sent => {
                 let current = observe(&mut channel, target, cancel).await?;
+                let expected = db
+                    .transact(|db| store::status(db, principal, target))?
+                    .ok_or_else(|| anyhow::anyhow!("Compose project unavailable"))?;
+                let refusal = if expected.recovery_id.is_some() {
+                    "compose_recovery_required"
+                } else {
+                    "refused"
+                };
                 if intent.secret_sent == 0
                     && current.as_ref().is_some_and(|v| {
                         v.running_operation.is_some()
@@ -468,12 +509,9 @@ impl Host {
                     })
                 {
                     return db.transact(|db| {
-                        store::close(db, &intent, "refused", controller.compose_now()?)
+                        store::close(db, &intent, refusal, controller.compose_now()?)
                     });
                 }
-                let expected = db
-                    .transact(|db| store::status(db, principal, target))?
-                    .ok_or_else(|| anyhow::anyhow!("Compose project unavailable"))?;
                 let guest_revision = current.as_ref().and_then(|view| view.committed_revision);
                 if guest_revision != expected.revision
                     || (intent.kind != Kind::Deploy && expected.revision != Some(intent.revision))
@@ -484,7 +522,7 @@ impl Host {
                         "Compose revision changed during secret recovery"
                     );
                     return db.transact(|db| {
-                        store::close(db, &intent, "refused", controller.compose_now()?)
+                        store::close(db, &intent, refusal, controller.compose_now()?)
                     });
                 }
                 if intent.kind == Kind::Deploy {
@@ -545,6 +583,19 @@ impl Host {
                 })?;
                 match channel.exchange(cancel, |id| intent.request(id)).await? {
                     Resp::ComposeOperationState { operation, .. } => operation,
+                    Resp::ComposeRejected {
+                        code: RejectCode::ReconcileRequired,
+                        ..
+                    } if expected.recovery_id.is_some() => {
+                        return db.transact(|db| {
+                            store::close(
+                                db,
+                                &intent,
+                                "compose_recovery_required",
+                                controller.compose_now()?,
+                            )
+                        });
+                    }
                     Resp::ComposeRejected {
                         code:
                             RejectCode::JournalFull
@@ -677,18 +728,41 @@ async fn recover_deploy(
         Ok(state)
     };
     db.transact(|tx| current(tx))?;
-    let Resp::ComposeOperationState { operation, .. } = channel
+    let mut reply = channel
         .exchange(cancel, |id| Req::ComposeOperation {
             id,
             operation_id: hex::encode(intent.id),
         })
-        .await?
-    else {
-        return Ok(());
-    };
-    if !intent.accepts(&operation) || operation.stage != OperationStage::Settled {
-        return Ok(());
+        .await?;
+    if let Resp::ComposeOperationState { operation, .. } = &reply
+        && intent.accepts(operation)
+        && operation.state == OperationState::Ambiguous
+    {
+        reply = channel
+            .exchange(cancel, |id| Req::ComposeReconcile {
+                id,
+                operation_id: hex::encode(intent.id),
+            })
+            .await?;
     }
+    let operation = match reply {
+        Resp::ComposeOperationState { operation, .. }
+            if intent.accepts(&operation) && operation.stage == OperationStage::Settled =>
+        {
+            Some(operation)
+        }
+        Resp::ComposeRejected {
+            code: RejectCode::UnknownOperation,
+            ..
+        } => None,
+        Resp::ComposeOperationState { operation, .. }
+            if intent.accepts(&operation) && operation.state == OperationState::Ambiguous =>
+        {
+            observe(channel, &intent.target, cancel).await?;
+            return Ok(());
+        }
+        _ => return Ok(()),
+    };
     let observed = observe(channel, &intent.target, cancel).await?;
     if observed
         .as_ref()
@@ -699,6 +773,19 @@ async fn recover_deploy(
     let revision = observed.as_ref().and_then(|p| p.committed_revision);
     db.transact(|tx| {
         let state = current(tx)?;
+        let Some(operation) = operation else {
+            // Unknown can mean never journaled or trimmed after promotion. Verify
+            // the committed revision on the same disk before classifying it.
+            if revision == state.revision {
+                store::retire_unapplied(tx, intent)?;
+            } else if let Some(observed) = observed
+                .as_ref()
+                .filter(|_| revision == Some(intent.revision))
+            {
+                store::recover_committed(tx, intent, observed, None)?;
+            }
+            return Ok(());
+        };
         match operation.state {
             OperationState::Succeeded
                 if operation.failure.is_none()
@@ -709,7 +796,7 @@ async fn recover_deploy(
                     tx,
                     intent,
                     observed.as_ref().expect("committed revision observed"),
-                    &operation,
+                    Some(&operation),
                 )?;
             }
             OperationState::Failed if operation.failure.is_some() && revision == state.revision => {

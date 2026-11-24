@@ -100,8 +100,9 @@ CREATE TABLE vm_compose_boots (
     PRIMARY KEY(vm,generation,boot)
 ) STRICT, WITHOUT ROWID;
 CREATE UNIQUE INDEX vm_compose_current_boot ON vm_compose_boots(vm) WHERE retired=0;
-CREATE TABLE vm_compose_recovery_floors (
-    principal TEXT PRIMARY KEY, request BLOB NOT NULL CHECK(length(request)=16)
+CREATE TABLE vm_compose_compacted_keys (
+    principal TEXT NOT NULL, request BLOB NOT NULL CHECK(length(request)=16),
+    valid_through_ms INTEGER NOT NULL, PRIMARY KEY(principal,request)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE vm_compose_operations (
     id BLOB PRIMARY KEY CHECK(length(id)=16),
@@ -119,7 +120,7 @@ CREATE TABLE vm_compose_operations (
     activity_id INTEGER UNIQUE REFERENCES activity(id) ON DELETE SET NULL,
     sent INTEGER NOT NULL DEFAULT 0 CHECK(sent IN (0,1)),
     receipt TEXT,
-    closed TEXT CHECK(closed IN ('refused','secret_failed','retired_boot')),
+    closed TEXT CHECK(closed IN ('refused','secret_failed','retired_boot','not_applied','compose_recovery_required')),
     secret_refs TEXT NOT NULL,
     secret_sent INTEGER NOT NULL DEFAULT 0 CHECK(secret_sent BETWEEN 0 AND 15),
     UNIQUE(principal,request),
@@ -298,7 +299,9 @@ pub(crate) fn admit(
     let Some(status) = status(db, principal, target)? else {
         return Ok(Err(Fault::NotFound));
     };
-    if let Some(id) = status.recovery_id {
+    if let Some(id) = status.recovery_id
+        && matches!(request.kind, Kind::Start | Kind::Deploy)
+    {
         let key = db.query_row(
             "SELECT request FROM vm_compose_operations WHERE id=?1 AND principal=?2",
             params![id, principal],
@@ -344,6 +347,14 @@ pub(crate) fn admit(
             |r| r.get(0),
         )?;
         (release, next)
+    } else if status.revision.is_none()
+        && let Some(id) = status.recovery_id
+    {
+        db.query_row(
+            "SELECT release, revision FROM vm_compose_operations WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
     } else {
         let Some(revision) = status.revision else {
             return Ok(Err(Fault::NotReady));
@@ -377,19 +388,20 @@ pub(crate) fn admit(
     } else {
         Vec::new()
     };
+    db.execute(
+        "DELETE FROM vm_compose_compacted_keys WHERE valid_through_ms<?1",
+        [high_water],
+    )?;
     if emergency {
         // The ordinary replay window stays intact. Rotate only this project's
         // extra terminal cleanup key. A compacted key can never become fresh.
         let old:Option<Id>=db.query_row("SELECT request FROM vm_compose_operations WHERE vm=?1 AND project=?2 AND emergency=1",
             params![target.vm,target.project],|r|r.get(0)).optional()?;
         if let Some(old) = old {
-            if request.key.key <= old {
-                return Ok(Err(Fault::StaleKey));
-            }
             db.execute(
-                "INSERT INTO vm_compose_recovery_floors(principal,request) VALUES(?1,?2)
-                ON CONFLICT(principal) DO UPDATE SET request=max(request,excluded.request)",
-                params![principal, old],
+                "INSERT INTO vm_compose_compacted_keys(principal,request,valid_through_ms)
+                 SELECT principal,request,valid_through_ms FROM vm_compose_operations WHERE principal=?1 AND request=?2",
+                params![principal,old],
             )?;
             ensure!(db.execute("DELETE FROM vm_compose_operations WHERE principal=?1 AND request=?2 AND emergency=1 AND (closed IS NOT NULL OR receipt IS NOT NULL)",
                 params![principal,old])?==1,"Compose cleanup still active");
@@ -531,16 +543,25 @@ pub(crate) fn clear_recovery(db: &Connection, intent: &Intent) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn retire_unapplied(db: &Connection, intent: &Intent) -> Result<()> {
+    clear_recovery(db, intent)?;
+    ensure!(db.execute(
+        "UPDATE vm_compose_operations SET closed='not_applied' WHERE id=?1 AND closed='retired_boot'",
+        [intent.id],
+    )? == 1, "Compose retirement changed");
+    Ok(())
+}
+
 pub(crate) fn recover_committed(
     db: &Connection,
     intent: &Intent,
     observed: &arx_guest::compose::ProjectView,
-    receipt: &OperationView,
+    receipt: Option<&OperationView>,
 ) -> Result<()> {
     clear_recovery(db, intent)?;
     db.execute("UPDATE vm_compose_projects SET committed=?3,committed_release=?4,desired=?5,
         last_receipt=?6,observed=NULL,settled_boot=NULL,settled_generation=NULL WHERE vm=?1 AND project=?2",
-        params![intent.target.vm,intent.target.project,intent.revision,intent.release,desired_wire(observed.desired),serde_json::to_string(receipt)?])?;
+        params![intent.target.vm,intent.target.project,intent.revision,intent.release,desired_wire(observed.desired),receipt.map(serde_json::to_string).transpose()?])?;
     Ok(())
 }
 
@@ -588,7 +609,7 @@ pub(crate) fn mark_secret_sent(db: &Connection, intent: &Intent, bit: u8) -> Res
 pub(super) fn compacted_key(db: &Connection, principal: &str, key: Id) -> Result<bool> {
     Ok(count(
         db,
-        "SELECT count(*) FROM vm_compose_recovery_floors WHERE principal=?1 AND request>=?2",
+        "SELECT count(*) FROM vm_compose_compacted_keys WHERE principal=?1 AND request=?2",
         params![principal, key],
     )? != 0)
 }

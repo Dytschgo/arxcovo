@@ -9059,13 +9059,17 @@ mod tests {
                 assert!(!tx.query_row("SELECT emergency FROM vm_compose_operations WHERE id=?1",[cleanup.id],|r|r.get::<_,bool>(0))?);
                 db::close(tx,&cleanup,"refused",UTC)?;
             }
+            let rollback=RequestId::parse(&format!("{:016x}{:016x}",UTC-1,900)).unwrap();
+            let legacy=crate::store::vm::Binding {principal:"alpha",key:rollback,subject:crate::vm::Subject::Vm(vm_id),action:crate::vm::Action::Stop as i64};
+            assert!(matches!(legacy.replay(tx,UTC-1,false)?,Ok(None)));
             let first_spare=RequestId::parse(&format!("{UTC:016x}{:016x}",197)).unwrap();
             request.key=first_spare;
             let emergency=db::admit(tx,"alpha",&request,generation,boot,UTC)?.unwrap();
             assert_eq!(db::replay(tx,"alpha",first_spare.key)?.unwrap().id,emergency.id);
             db::close(tx,&emergency,"refused",UTC)?;
-            request.key=RequestId::parse(&format!("{UTC:016x}{:016x}",198)).unwrap();
-            let replacement=db::admit(tx,"alpha",&request,generation,boot,UTC)?.unwrap();
+            request.key=RequestId::parse(&format!("{:016x}{:016x}",UTC-1,198)).unwrap();
+            let replacement=db::admit(tx,"alpha",&request,generation,boot,UTC-1)?.unwrap();
+            assert!(matches!(legacy.replay(tx,UTC-1,false)?,Ok(None)));
             assert_ne!(replacement.id,emergency.id);
             assert!(db::replay(tx,"alpha",key.key)?.is_some());
             assert_eq!(tx.query_row("SELECT count(*) FROM vm_compose_operations WHERE emergency=1",[],|r|r.get::<_,i64>(0))?,1);
@@ -9240,6 +9244,24 @@ mod tests {
 
     #[tokio::test]
     async fn compose_lost_deploy_reconciles_after_verified_restart() {
+        compose_retirement(None).await;
+    }
+
+    #[tokio::test]
+    async fn compose_missing_retired_deploy_allows_stop_and_down_after_reopen() {
+        for down in [false, true] {
+            compose_retirement(Some((false, down))).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn compose_ambiguous_retired_deploy_allows_stop_and_down_after_reopen() {
+        for down in [false, true] {
+            compose_retirement(Some((true, down))).await;
+        }
+    }
+
+    async fn compose_retirement(cleanup: Option<(bool, bool)>) {
         use crate::store::vm::compose as db;
         use arx_guest::compose::{self as g, ComposeRequest as Req, ComposeResponse as Resp};
         const PROJECT: &str = "reboot-test";
@@ -9424,11 +9446,112 @@ mod tests {
         assert_eq!(db_status_revision(store, &target), Some(1));
         let stopped = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(3021)})).await;
         assert_eq!(terminal(&a, &stopped).await["state"], "succeeded");
+        drop(a);
+        h.shutdown().await.unwrap();
+        let mut h = h.reopen(|_| {}).await;
+        let a = h.client(0).await;
+        let store = h.supervisor().controller.compose_store();
         let started = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(3022)})).await;
         assert_eq!(terminal(&a, &started).await["state"], "succeeded");
         let (host, mut peer) = tokio::io::duplex(65536);
         let second = tokio::spawn(async move {
             fake_compose_hello(&mut peer, boot + 1).await;
+            if let Some((ambiguous, down)) = cleanup {
+                let Req::ComposeOperation { id, operation_id } = fake_compose_read(&mut peer).await
+                else {
+                    panic!("retired operation lookup")
+                };
+                assert_eq!(operation_id, journal.operation_id);
+                if ambiguous {
+                    let mut queued = journal.clone();
+                    queued.stage = g::OperationStage::Queued;
+                    queued.state = g::OperationState::Ambiguous;
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeOperationState {
+                            id,
+                            operation: queued,
+                        },
+                    )
+                    .await;
+                    let Req::ComposeReconcile { id, operation_id } =
+                        fake_compose_read(&mut peer).await
+                    else {
+                        panic!("exact retired intent reconciliation")
+                    };
+                    assert_eq!(operation_id, journal.operation_id);
+                    let mut failed = journal.clone();
+                    failed.state = g::OperationState::Failed;
+                    failed.failure = Some(g::FailureCode::NotApplied);
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeOperationState {
+                            id,
+                            operation: failed,
+                        },
+                    )
+                    .await;
+                } else {
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeRejected {
+                            id,
+                            code: g::RejectCode::UnknownOperation,
+                            rule: None,
+                        },
+                    )
+                    .await;
+                }
+                status(&mut peer, Some(1)).await;
+                let queried = unknown(&mut peer).await;
+                status(&mut peer, Some(1)).await;
+                let (id, op, kind, desired) = match fake_compose_read(&mut peer).await {
+                    Req::ComposeDown {
+                        id, operation_id, ..
+                    } if down => (id, operation_id, g::OperationKind::Down, g::Desired::Down),
+                    Req::ComposeStop {
+                        id, operation_id, ..
+                    } if !down => (
+                        id,
+                        operation_id,
+                        g::OperationKind::Stop,
+                        g::Desired::Stopped,
+                    ),
+                    _ => panic!("fresh cleanup"),
+                };
+                assert_eq!(op, queried);
+                fake_compose_reply(
+                    &mut peer,
+                    Resp::ComposeOperationState {
+                        id,
+                        operation: g::OperationView {
+                            operation_id: op,
+                            kind,
+                            revision: 1,
+                            ..journal
+                        },
+                    },
+                )
+                .await;
+                let Req::ComposeStatus { id, project_id } = fake_compose_read(&mut peer).await
+                else {
+                    panic!("cleanup settlement")
+                };
+                assert_eq!(project_id, PROJECT);
+                fake_compose_reply(
+                    &mut peer,
+                    Resp::ComposeProjectStatus {
+                        id,
+                        project: g::ProjectView {
+                            desired,
+                            services: Vec::new(),
+                            ..view(1)
+                        },
+                    },
+                )
+                .await;
+                return;
+            }
             for proof in [false, true] {
                 let Req::ComposeOperation { id, operation_id } = fake_compose_read(&mut peer).await
                 else {
@@ -9443,7 +9566,7 @@ mod tests {
                 } else {
                     Resp::ComposeRejected {
                         id,
-                        code: g::RejectCode::UnknownOperation,
+                        code: g::RejectCode::StoreFailure,
                         rule: None,
                     }
                 };
@@ -9488,6 +9611,25 @@ mod tests {
             .attach(store, vm_id, compose::Session::new(generation, channel))
             .unwrap();
         let fresh = json!({"vm_id":vm,"project_id":PROJECT,"request_id":key(3030)});
+        if let Some((ambiguous, down)) = cleanup {
+            let tool = if down { "compose_down" } else { "compose_stop" };
+            assert_eq!(call(&a, tool, fresh.clone()).await["state"], "pending");
+            idle(&h).await;
+            assert_eq!(call(&a, tool, fresh).await["state"], "succeeded");
+            let retired = call(&a, "compose_deploy", args(2)).await;
+            assert_eq!(
+                retired["state"],
+                if ambiguous {
+                    "retired_boot"
+                } else {
+                    "not_applied"
+                }
+            );
+            second.await.unwrap();
+            drop(a);
+            h.shutdown().await.unwrap();
+            return;
+        }
         for expected in [1, revision] {
             assert_eq!(
                 call(&a, "compose_start", fresh.clone()).await["reason"],
