@@ -1027,35 +1027,7 @@ impl<C: Clock> VmController<C> {
                 uncertain = true;
                 continue;
             }
-            let now = || self.clock.now().monotonic;
-            let (released, finish_by) = reaper::release(&work, runtime, now);
-            if released
-                && work.accounted
-                && !self
-                    .store
-                    .transact(|db| store::claim_disposal(db, &work, utc(self.clock.now())?))?
-            {
-                uncertain = true;
-                continue;
-            }
-            let outcome = reaper::dispose(&work, custody, released, finish_by, now);
-            match self
-                .store
-                .transact(|db| store::settle_cleanup(db, &work, utc(self.clock.now())?, outcome))
-            {
-                Ok(confirmed) => {
-                    uncertain |= !confirmed;
-                    if work.release_only && outcome.released {
-                        sweeps.clear_retry(work.kind);
-                    } else {
-                        sweeps.settle(&work, self.clock.now().monotonic, confirmed);
-                    }
-                }
-                Err(_) => {
-                    uncertain = true;
-                    sweeps.settle(&work, self.clock.now().monotonic, false);
-                }
-            }
+            uncertain |= !self.reconcile_cleanup(&mut sweeps, &work, runtime, custody)?;
         }
         // Committed static generations settle without any deletion route.
         // Unproven release keeps them recovering, which fences launches.
@@ -1086,6 +1058,88 @@ impl<C: Clock> VmController<C> {
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?
             .custody_uncertain = uncertain;
         Ok(true)
+    }
+
+    /// Try one custody turn for the vault's exact expired TEST clone. Pending
+    /// means the sweep lock, retry window or staged-clone recovery still owns
+    /// the decision. It does not attest that custody could not be resolved.
+    pub(crate) fn sweep_vault_test(
+        &self,
+        vm: Id,
+        runtime: &CandidateRuntime<'_>,
+    ) -> Result<Option<bool>> {
+        self.sweep_vault_test_with(vm, runtime, &ClosedCustody)
+    }
+
+    pub(crate) fn sweep_vault_test_with(
+        &self,
+        vm: Id,
+        runtime: &impl ReaperRuntime,
+        custody: &impl ArtifactCustody,
+    ) -> Result<Option<bool>> {
+        let mut sweeps = match self.sweeps.try_lock() {
+            Ok(sweeps) => sweeps,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => anyhow::bail!("VM reaper unavailable"),
+        };
+        let work = self.store.transact(|db| {
+            let now = utc(self.clock.now())?;
+            match store::vault_test_expiry(db, vm, now)? {
+                Some(claim) => store::cleanup_work(db, claim.into()),
+                None => Ok(None),
+            }
+        })?;
+        let Some(mut work) = work else {
+            return Ok(self.vault_test_released(vm)?.then_some(true));
+        };
+        if !sweeps.due(work.kind, self.clock.now().monotonic) {
+            return Ok(None);
+        }
+        sweeps.observe_worker(&mut work);
+        let confirmed = self.reconcile_cleanup(&mut sweeps, &work, runtime, custody)?;
+        if !confirmed {
+            self.gate
+                .lock()
+                .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?
+                .custody_uncertain = true;
+        }
+        Ok(Some(confirmed && self.vault_test_released(vm)?))
+    }
+
+    fn reconcile_cleanup(
+        &self,
+        sweeps: &mut Sweeps,
+        work: &reaper::CleanupWork,
+        runtime: &impl ReaperRuntime,
+        custody: &impl ArtifactCustody,
+    ) -> Result<bool> {
+        let now = || self.clock.now().monotonic;
+        let (released, finish_by) = reaper::release(work, runtime, now);
+        if released
+            && work.accounted
+            && !self
+                .store
+                .transact(|db| store::claim_disposal(db, work, utc(self.clock.now())?))?
+        {
+            return Ok(false);
+        }
+        let outcome = reaper::dispose(work, custody, released, finish_by, now);
+        let confirmed = match self
+            .store
+            .transact(|db| store::settle_cleanup(db, work, utc(self.clock.now())?, outcome))
+        {
+            Ok(confirmed) => confirmed,
+            Err(_) => {
+                sweeps.settle(work, self.clock.now().monotonic, false);
+                return Ok(false);
+            }
+        };
+        if work.release_only && outcome.released {
+            sweeps.clear_retry(work.kind);
+        } else {
+            sweeps.settle(work, self.clock.now().monotonic, confirmed);
+        }
+        Ok(confirmed)
     }
 
     #[cfg(test)]

@@ -51,7 +51,7 @@ fn vault_vm_counts(harness: &Harness) -> (i64, i64, i64) {
         .unwrap()
 }
 
-async fn seal_vault_template(harness: &Harness, client: &Client, nonce: u64) {
+async fn seal_vault_template(harness: &Harness, client: &Client, nonce: u64) -> Value {
     let build = call(
         client,
         "vm_template_build",
@@ -76,6 +76,17 @@ async fn seal_vault_template(harness: &Harness, client: &Client, nonce: u64) {
     .await;
     assert_eq!(sealed["state"], "succeeded", "{sealed}");
     assert!(sealed["template_id"].is_string(), "{sealed}");
+    sealed["template_id"].clone()
+}
+
+async fn wait_for_vault_script(harness: &Harness) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness.fixture(|fixture| fixture.script_hold.is_some()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("vault guest worker was not admitted");
 }
 
 #[tokio::test]
@@ -197,7 +208,7 @@ async fn vault_tester_quarantines_unconfirmed_disposal() {
         call(&client, "vault_test_version", vault_write_args(&version, 2)).await["ok"],
         true
     );
-    until(|| h.fixture(|fixture| fixture.script_hold.is_none())).await;
+    wait_for_vault_script(&h).await;
     h.fixture(|fixture| {
         let mut live = fixture.live.lock().unwrap();
         let vm = *live.boots.keys().next().unwrap();
@@ -230,4 +241,119 @@ async fn vault_tester_quarantines_unconfirmed_disposal() {
         "server-drain-unconfirmed"
     );
     assert_eq!(vault_vm_counts(&h), (1, 1, 1));
+}
+
+#[tokio::test]
+async fn vault_tester_waits_for_overlapping_reaper_selection() {
+    let mut h = Harness::start(false, false).await;
+    h.supervisor().open_vault(h.temp.path()).unwrap();
+    let client = h.client(0).await;
+    let template = seal_vault_template(&h, &client, 603).await;
+    let older = call(
+        &client,
+        "vm_create",
+        json!({"template_id":template,"request_id":key(604),"ttl_s":60}),
+    )
+    .await;
+    assert_eq!(older["ok"], true, "{older}");
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        h.fixture(Fixture::take_jobs).join(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let older = call(
+        &client,
+        "vm_operation",
+        json!({"operation_id":older["operation_id"]}),
+    )
+    .await;
+    assert_eq!(older["state"], "succeeded", "{older}");
+
+    let version = add_vault_version(&client, 1, VAULT_EXIT_0).await;
+    let receipt = call(&client, "vault_test_version", vault_write_args(&version, 2)).await;
+    assert_eq!(receipt["ok"], true, "{receipt}");
+    wait_for_vault_script(&h).await;
+    // The ordinary turn selects the older lease and parks with the sweep
+    // lock held before the vault clone becomes due.
+    h.now.store(UTC + 60_000, Ordering::SeqCst);
+    let reaper = h.fixture(|f| f.reaper());
+    let mut stall = Stall::install(&reaper.after_selection);
+    let controller = h.supervisor().controller.clone();
+    let sweep =
+        tokio::task::spawn_blocking(move || controller.sweep_with(&reaper, &*reaper.custody));
+    stall.entered().await;
+
+    let (waiting, observed) = tokio::sync::oneshot::channel();
+    *h.supervisor().vault_cleanup_waiting.lock().unwrap() = Some(waiting);
+    h.hold_script.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), observed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(vault_version(&client, &version).await["test"].is_null());
+    assert_eq!(vault_vm_counts(&h), (1, 1, 1));
+
+    stall.release_and_join().await;
+    assert!(sweep.await.unwrap().unwrap());
+    let passed = vault_result(&client, &version).await;
+    assert_eq!(
+        passed["test"],
+        json!({"status":"exited","exit_code":0,"cleanup_confirmed":true})
+    );
+    assert_eq!(vault_vm_counts(&h), (1, 0, 0));
+    assert_eq!(
+        call(&client, "vault_activate", vault_write_args(&version, 3)).await["ok"],
+        true
+    );
+    drop(client);
+    h.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn vault_tester_drain_joins_pending_guest_and_vault_settlement() {
+    let mut h = Harness::start(false, false).await;
+    let supervisor = h.supervisor().clone();
+    supervisor.open_vault(h.temp.path()).unwrap();
+    let client = h.client(0).await;
+    seal_vault_template(&h, &client, 605).await;
+
+    let version = add_vault_version(&client, 1, VAULT_EXIT_0).await;
+    let receipt = call(&client, "vault_test_version", vault_write_args(&version, 2)).await;
+    assert_eq!(receipt["ok"], true, "{receipt}");
+    wait_for_vault_script(&h).await;
+    let mut teardown = Stall::install(&supervisor.stall_vault_teardown);
+    let mut recovery = Stall::install(&supervisor.stall_recovery);
+    let (waiting, observed) = tokio::sync::oneshot::channel();
+    *supervisor.vault_drain_waiting.lock().unwrap() = Some(waiting);
+    let mut server = h.server.take().unwrap();
+    h.interrupt.take().unwrap().send(()).unwrap();
+    teardown.entered().await;
+    tokio::select! {
+        _ = recovery.entered() => panic!("recovery started before the vault job settled"),
+        result = &mut server => panic!("foreground returned before the vault job settled: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(3), observed) => result.unwrap().unwrap(),
+    }
+    assert!(recovery.not_entered());
+    assert_eq!(vault_vm_counts(&h), (1, 1, 1));
+
+    teardown.release_and_join().await;
+    recovery.entered().await;
+    recovery.release_and_join().await;
+    server.await.unwrap().unwrap();
+    let result = crate::vault::mcp::invoke(
+        supervisor.vault.get().unwrap(),
+        "alpha",
+        "vault_get",
+        json!({"version_id":version}).as_object().unwrap().clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(result["state"], "rejected");
+    assert_eq!(
+        result["test"],
+        json!({"status":"unavailable","cleanup_confirmed":true})
+    );
+    assert_eq!(vault_vm_counts(&h), (1, 0, 0));
 }

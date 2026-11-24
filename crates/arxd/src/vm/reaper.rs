@@ -152,13 +152,17 @@ impl Sweeps {
         self.workers
             .retain(|vm, _| items.iter().any(|work| work.kind.vm() == Some(*vm)));
         for work in items {
-            if let Some(vm) = work.kind.vm() {
-                if let Some(worker) = work.pending_worker {
-                    self.workers.insert(vm, worker);
-                } else {
-                    // Caller settlement does not establish worker release.
-                    work.pending_worker = self.workers.get(&vm).copied();
-                }
+            self.observe_worker(work);
+        }
+    }
+
+    pub fn observe_worker(&mut self, work: &mut CleanupWork) {
+        if let Some(vm) = work.kind.vm() {
+            if let Some(worker) = work.pending_worker {
+                self.workers.insert(vm, worker);
+            } else {
+                // Caller settlement does not establish worker release.
+                work.pending_worker = self.workers.get(&vm).copied();
             }
         }
     }

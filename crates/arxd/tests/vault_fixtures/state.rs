@@ -180,6 +180,39 @@ fn vault_failed_replacement_keeps_predecessor_active_and_redacts_audit() {
 }
 
 #[test]
+fn vault_completion_refuses_a_changed_digest() {
+    let dir = private::private_dir();
+    let tester = Arc::new(Fixture::default());
+    let vault = Vault::open(dir.path(), Some(tester.clone()), NOW).unwrap();
+    let version = version_id(add(&vault, 1, "build", "exit 0").unwrap());
+    test(&vault, 2, version).unwrap();
+    let job = tester.take();
+    let changed_body = b"exit 7";
+    let changed_digest: [u8; 32] = Sha256::digest(changed_body).into();
+    assert_ne!(job.sha256(), changed_digest);
+    vault
+        .store
+        .write(|db| {
+            assert_eq!(
+                db.execute(
+                    "UPDATE versions SET body=?1,hash=?2 WHERE id=?3",
+                    params![changed_body.as_slice(), changed_digest, version],
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let completion = job.complete(ScriptOutcome::Exited { exit_code: 0 }, true);
+    assert!(completion.is_err(), "stale digest recorded a completion");
+    let row = vault.get(OWNER, version, false).unwrap();
+    assert_eq!(row["state"], "testing");
+    assert!(row["test"].is_null());
+    assert_eq!(activate(&vault, 3, version), Err(Refusal::PassRequired));
+}
+
+#[test]
 fn vault_replay_lock_recovery_and_clock_rollback() {
     let dir = private::private_dir();
     let vault = Vault::open(dir.path(), None, NOW).unwrap();

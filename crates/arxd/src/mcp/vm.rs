@@ -275,6 +275,12 @@ pub(crate) struct Supervisor {
     compose: compose::Host,
     vault: std::sync::OnceLock<Arc<crate::vault::Vault>>,
     vault_jobs: Mutex<vault_test::Jobs>,
+    #[cfg(test)]
+    vault_cleanup_waiting: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    stall_vault_teardown: Mutex<Option<tests::StallHook>>,
+    #[cfg(test)]
+    vault_drain_waiting: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Deferred local stops queued by owner revocation, at most one in flight
     /// per activation generation. Kept outside the dispatch gate: revocation
     /// runs before the gate, the replay ledger and every store write.
@@ -426,6 +432,12 @@ impl Supervisor {
             compose: compose::Host::default(),
             vault: Default::default(),
             vault_jobs: Default::default(),
+            #[cfg(test)]
+            vault_cleanup_waiting: Default::default(),
+            #[cfg(test)]
+            stall_vault_teardown: Default::default(),
+            #[cfg(test)]
+            vault_drain_waiting: Default::default(),
             stops: Mutex::default(),
             #[cfg(test)]
             stops_spawned: Default::default(),

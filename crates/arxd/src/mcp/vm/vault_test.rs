@@ -16,6 +16,7 @@ const DAEMON: &str = "arxd"; // Reserved by the TEST VM profile loader.
 const LEASE_SECONDS: u64 = 600;
 const SCRIPT_SECONDS: u32 = 30;
 const JOB_BUDGET: Duration = Duration::from_secs(480);
+const TEARDOWN_BUDGET: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Default)]
@@ -46,6 +47,7 @@ impl VaultTester for Tester {
                     },
                     deadline: Instant::now() + JOB_BUDGET,
                     clone_operation: None,
+                    last_operation: None,
                     vm: None,
                 };
                 let outcome = run.exercise(&job).unwrap_or(ScriptOutcome::Unavailable);
@@ -79,6 +81,22 @@ impl Supervisor {
         )
     }
 
+    fn sweep_vault_test(&self, vm: Id) -> anyhow::Result<Option<bool>> {
+        #[cfg(test)]
+        let fixture = self
+            .lock()?
+            .fixture
+            .as_ref()
+            .map(super::tests::Fixture::reaper);
+        #[cfg(test)]
+        if let Some(reaper) = fixture {
+            return self
+                .controller
+                .sweep_vault_test_with(vm, &reaper, &*reaper.custody);
+        }
+        self.controller.sweep_vault_test(vm, &self.candidate())
+    }
+
     pub(super) async fn drain_vault_jobs(
         &self,
         deadline: tokio::time::Instant,
@@ -89,6 +107,12 @@ impl Supervisor {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("vault drain unconfirmed"))?,
         );
+        #[cfg(test)]
+        if !jobs.tasks.is_empty()
+            && let Some(waiting) = self.vault_drain_waiting.lock().unwrap().take()
+        {
+            let _ = waiting.send(());
+        }
         while let Some(result) = tokio::time::timeout_at(deadline, jobs.tasks.join_next()).await? {
             jobs.failed |= !matches!(result, Ok(Ok(())));
         }
@@ -101,6 +125,7 @@ struct Run {
     inventory: VmInventory,
     deadline: Instant,
     clone_operation: Option<Id>,
+    last_operation: Option<Id>,
     vm: Option<Id>,
 }
 
@@ -144,7 +169,7 @@ impl Run {
         })
     }
 
-    fn submit(&self, action: Action, id: Id, work: Work) -> Option<Id> {
+    fn submit(&mut self, action: Action, id: Id, work: Work) -> Option<Id> {
         let supervisor = &self.inventory.supervisor;
         let mut gate = supervisor.lock().ok()?;
         if gate.closed
@@ -158,7 +183,9 @@ impl Run {
             .inventory
             .mutate(&mut gate, action as i64, Mutation { key, id, work })
             .ok()?;
-        parse_id(value.get("operation_id")?.as_str()?).ok()
+        let operation = parse_id(value.get("operation_id")?.as_str()?).ok()?;
+        self.last_operation = Some(operation);
+        Some(operation)
     }
 
     fn status(&self, operation: Id) -> Option<OperationStatus> {
@@ -171,8 +198,19 @@ impl Run {
     }
 
     fn wait(&self, operation: Id) -> Option<OperationStatus> {
+        self.wait_for_worker(operation, self.deadline, true)
+    }
+
+    fn wait_for_worker(
+        &self,
+        operation: Id,
+        deadline: Instant,
+        stop_when_fenced: bool,
+    ) -> Option<OperationStatus> {
         let supervisor = &self.inventory.supervisor;
-        while !supervisor.fenced.load(Ordering::SeqCst) && Instant::now() < self.deadline {
+        while Instant::now() < deadline
+            && !(stop_when_fenced && supervisor.fenced.load(Ordering::SeqCst))
+        {
             let status = self.status(operation)?;
             #[cfg(test)]
             let working = supervisor
@@ -200,14 +238,36 @@ impl Run {
             return false;
         };
         let supervisor = &self.inventory.supervisor;
-        // The reaper stops the owned TEST job, verifies generation disposal,
-        // reconciles the charge, and records the expiry proof. It retains any
-        // uncertain custody for subsequent turns.
-        supervisor
-            .controller
-            .expire_vault_test(id)
-            .and_then(|()| supervisor.sweep())
-            .and_then(|()| supervisor.controller.vault_test_released(id))
-            .unwrap_or(false)
+        #[cfg(test)]
+        let _completed = {
+            let stall = supervisor.stall_vault_teardown.lock().unwrap().take();
+            stall.map(super::tests::StallHook::enter)
+        };
+        let deadline = Instant::now() + TEARDOWN_BUDGET;
+        // Cancellation ends exercise immediately. Let an admitted VM worker
+        // settle before arming expiry so cleanup cannot race its last write.
+        let settled = self
+            .last_operation
+            .is_some_and(|operation| self.wait_for_worker(operation, deadline, false).is_some());
+        if supervisor.controller.expire_vault_test(id).is_err() || !settled {
+            return false;
+        }
+        // An overlapping sweep may have selected its work before this lease
+        // expired. Retry until this exact clone has proof, an attempted
+        // unconfirmed cleanup, or the bounded wait expires.
+        while Instant::now() < deadline {
+            match supervisor.sweep_vault_test(id) {
+                Ok(Some(confirmed)) => return confirmed && Instant::now() < deadline,
+                Err(_) => return false,
+                Ok(None) => {
+                    #[cfg(test)]
+                    if let Some(waiting) = supervisor.vault_cleanup_waiting.lock().unwrap().take() {
+                        let _ = waiting.send(());
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
+        }
+        false
     }
 }

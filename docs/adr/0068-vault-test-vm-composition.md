@@ -11,10 +11,12 @@ The adapter selects the pinned, sealed TEST template for the requested OS
 and uses the VM foreground's operation admission and worker receipts. Each
 job gets a ten-minute TEST lease and separate VM request keys. On every
 post-clone path, the adapter brings forward expiry for the daemon-owned VM
-and invokes the normal reaper. The reaper must confirm process release and
-artifact disposal. The adapter requires a confirmed expiry receipt and
-zero remaining disk claims before a zero exit can record a pass. The vault
-compares the exact version's digest again when committing the result.
+and runs a custody turn for that exact clone under the periodic reaper's
+lock. The turn uses the same release, disposal and accounting checks.
+A busy lock or a deferred claim earns a bounded retry. A confirmed expiry
+receipt and zero remaining disk claims are required before a zero exit can
+record a pass. The vault compares the exact version's digest again when
+committing the result.
 
 Native VM admission currently returns `vm_admission_closed` at vault test
 submission. M4 must supply qualified clone, launch, guest channel and reaper
