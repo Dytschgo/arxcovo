@@ -16,6 +16,7 @@ export async function evaluateEvent(io, triggeringHead) {
 const mainMarker = latest => latest ? `Main run ${latest.runId}: attempt ${latest.attempt ?? 1}:` : 'No valid completed main CI baseline';
 
 export function decideBudget(latest, candidate, labels) {
+  if (latest?.blocked) return { state: 'failure', description: `${mainMarker(latest)} ${latest.blocked}. Inspect Actions. If stuck, cancel and re-run all jobs` };
   if (latest?.pending) return { state: 'pending', description: `${mainMarker(latest)} waiting for CI completion` };
   const charged = latest?.chargedSeconds == null ? `n/a (${latest?.credit?.split(':')[1] ?? 'run-invalid'})` : `${latest.chargedSeconds}s${creditable(latest) ? '' : ' uncredited (not-green)'}`;
   const prefix = latest ? `${mainMarker(latest)} wall ${latest.seconds}s, charged ${charged}; ` : '';

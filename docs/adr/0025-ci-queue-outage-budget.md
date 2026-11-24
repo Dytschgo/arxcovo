@@ -205,7 +205,7 @@ test/smoke/desktop counts, or history contents.
    root executor. The PR164 one-use exception and ADR0022/#57 are consumed, not reusable.
    Definition acceptance alone grants no bootstrap, protection, status or merge action.
 4. **Bounded route, still unauthorized.** Follow the detailed plan in
-   [ci-administration](../ci-administration.md#proposed-adr0025-bootstrap-not-authorized):
+   [historical CI administration proposal](../ci-administration.md#historical-adr-0025-bootstrap-proposal):
    zero armed auto-merges before the window and immediately before merge; exact
    head/base/main and settings pins; remove ONLY ci-time-budget temporarily;
    preserve admin enforcement and restore original strict/all five app bindings in
@@ -287,57 +287,42 @@ idle queue credit nor a `ci-speed` comparison. The owner authorized a
 one-use bypass consumed by #310 and a budget policy fix.
 
 The main push CI run with the highest run number is authoritative across
-all statuses. A queued or running attempt keeps the gate pending. This
-applies to new pushes and reruns, so policy never measures an older run
-while the latest one awaits completion. Policy listens for main CI
-`in_progress` events because GitHub does not emit `requested` for reruns.
-Each status identifies both the run and the attempt.
+all statuses. A queued or running attempt keeps the gate pending. After
+60 minutes, the gate reports `stale-main-run` as a blocking failure.
+The clock uses the current attempt's start for in-progress runs and the
+run's last update for queued or other unfinished runs. Missing, invalid
+or future timestamps produce `invalid-main-run-timestamp`. Neither case
+falls back to a different run. See the [operator recovery procedure](../ci-administration.md#recovering-a-main-ci-budget-measurement).
 
-When the run is complete, attempt 1 remains authoritative unless it has
-a verified runner interruption. Existing run and job validation must
-pass. The run must report cancellation or failure and at least one job
-must report cancellation. Each cancelled job must have matching job
-metadata and a GitHub Actions check annotation that confirms the cause.
+Once the latest run is complete, a green attempt 1 supplies the existing
+charged-v1 measurement and remains authoritative even if a later attempt
+is faster. If attempt 1 is non-green, inspect later attempts of the same
+run and commit in descending order. The scan is bounded by GitHub's
+50-rerun limit. The first full rerun is authoritative. Its run and all jobs
+must be green and pass the existing identity, topology and timing checks
+to earn credit. A full rerun that fails, exceeds the charged budget, or
+cannot be validated keeps the gate blocked, subject to the existing
+`ci-speed` rule for a valid green slow baseline.
 
-- A job whose runner ID is zero, whose step list is empty and whose
-  creation and start timestamps match needs the hosted runner acquisition
-  failure annotation.
-- In the nine-job workflow, a started job needs the configured 12-minute
-  deadline annotation and an observed runtime of 720–750 s. Its required
-  build and test steps (or the verify dependency check) and the terminal
-  job completion step must have succeeded. The 30 s window covers the
-  incident's teardown delay. Missing, failed, unfinished or cancelled
-  required work blocks recovery. A deadline during a test may be a hang,
-  so even a confirmed deadline does not excuse that cancellation.
+Each required job must have executed inside the full rerun's own time
+window. A later attempt proven partial by jobs with carried execution
+timestamps is skipped. Invalid or ambiguous metadata blocks the search
+rather than being treated as a partial rerun. When there is no full rerun,
+the non-green attempt 1 keeps the gate blocked, including below 900 s.
+Candidate PRs continue to use attempt 1.
 
-Uncancelled jobs must succeed, except for the split workflow's
-`verify` gates after a worker cancellation. Those gates must show the
-exact completed setup/failure/cleanup sequence. Their sole user step
-checks the two matrix results. A worker failure, an unknown cancellation,
-or another gate failure keeps the baseline blocked, even when the wall
-time is at or below 900 s.
+The budget gate measures duration. Required PR checks enforce correctness.
+A green full rerun supplies a new duration sample because it measures
+every required job together on the same commit. Partial reruns leave work
+out of that timing window. The reason for a non-green attempt 1 does not
+change the duration decision, so policy needs neither step classifications
+nor check annotations.
 
-For a potential recovery, policy reads one bounded annotations page per
-structurally eligible cancelled job. It verifies that the job's check URL
-identifies that job in the same repository and only then requests the
-repository-local endpoint. It accepts one exact provider failure
-annotation at the Actions system location, with no other failure on that
-page. Missing, ambiguous or truncated evidence blocks recovery. This
-requires `checks: read` on the trusted policy workflow. Job logs are
-outside the decision.
-
-When the listing reports a later successful attempt of that same run, fetch
-only that attempt and its bounded jobs page. Require the same run and head, a
-completed successful run, the same job layout, and all jobs successful with valid
-timings inside the later attempt. Measure its own wall time and apply the
-unchanged charged-v1 rules and 900 s threshold. A partial rerun can restore
-functional health, but its inherited timestamps cannot form a complete
-budget measurement. A full green rerun can recover the gate. Candidate PRs
-continue to use attempt 1.
-
-Measuring a full attempt on the same commit retains a measured budget and
-accounts for all required work. Falling back to an older main run could
-hide a regression on the current commit. Passing through a missing baseline
-would drop the measurement requirement. Reusing only the jobs from a
-partial rerun could omit the cost of successful jobs. The attempt-1
-decision for a fully green run, including one over budget, stays binding.
+GitHub does not emit `requested` for reruns, so policy also listens for
+`in_progress` on main push CI. Job-level concurrency serializes eligible
+evaluations. Ignored start events skip the evaluator before joining its
+concurrency group. An eligible event can replace a queued evaluation
+because every evaluation reads the latest state and evaluates all open
+PRs. Running evaluations finish without event-driven cancellation.
+[GitHub workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run) ·
+[GitHub concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)

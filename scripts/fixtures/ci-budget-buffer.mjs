@@ -11,8 +11,10 @@ const probesBuffer = ['large-candidate', 'removed-label'].includes(scenario) || 
 const incompleteMain = ['incomplete-main', 'fast-incomplete-main', 'record-incomplete-main'].includes(scenario);
 const mainSeconds = ['fast-main', 'fast-incomplete-main', 'record-incomplete-main'].includes(scenario) ? 800 : 1200;
 const recovery = scenario.startsWith('recovery-');
-const activeMain = scenario === 'recovery-rerun-in-progress' ? 'in_progress'
-  : ['recovery-push-queued', 'record-push-queued'].includes(scenario) ? 'queued' : null;
+const activeMain = ['recovery-rerun-in-progress', 'recovery-stale-rerun'].includes(scenario) ? 'in_progress'
+  : ['recovery-push-queued', 'recovery-stale-queued', 'recovery-invalid-queue-time', 'record-push-queued'].includes(scenario) ? 'queued' : null;
+const firstGreen = ['recovery-green-first', 'recovery-slow-first'].includes(scenario);
+const latestAttempt = scenario.startsWith('recovery-latest-') ? 3 : 2;
 const head = 'a'.repeat(40);
 const repository = scenario === 'invalid-repository' ? 'https://unsafe' : 'example/arxcovo';
 const prefix = 'repos/example/arxcovo/';
@@ -32,48 +34,54 @@ const run = (id, seconds, extra = {}) => ({
 });
 
 const at = seconds => new Date(Date.UTC(2026, 0, 1) + seconds * 1000).toISOString().replace('.000Z', 'Z');
-const completedStep = name => ({ name, status: 'completed', conclusion: 'success' });
+class FixedClock extends Date {
+  static now() { return Date.parse(at(7200)); }
+}
+
 function recoveryRun(attempt) {
-  if (attempt === 1) return run(20, 913, { conclusion: scenario === 'recovery-slow-first' ? 'success' : 'failure' });
-  return run(20, 613, { run_attempt: 2, run_started_at: at(2000), updated_at: at(2613) });
+  if (attempt === 1) return run(20, scenario === 'recovery-green-first' ? 800 : 913, { conclusion: firstGreen ? 'success' : 'failure' });
+  const offset = (attempt - 1) * 2000;
+  const seconds = scenario === 'recovery-rerun-over-budget' ? 913 : 613;
+  const conclusion = attempt === 3 && scenario === 'recovery-latest-full-red' ? 'failure' : 'success';
+  return run(20, seconds, { run_attempt: attempt, conclusion, run_started_at: at(offset), updated_at: at(offset + seconds) });
 }
 
 function recoveryJobs(attempt) {
-  const offset = attempt === 1 ? 0 : 2000;
-  const firstRed = attempt === 1 && scenario !== 'recovery-slow-first';
-  const workerEnd = attempt === 1 ? 903 : 600;
+  const offset = (attempt - 1) * 2000;
+  const firstRed = attempt === 1 && !firstGreen;
+  const workerEnd = attempt === 1 ? (scenario === 'recovery-green-first' ? 780 : 903)
+    : scenario === 'recovery-rerun-over-budget' ? 903 : 600;
   const jobs = ['rust', 'ui', 'verify'].flatMap((phase, matrix) => ['ubuntu-latest', 'windows-latest', 'macos-latest'].map((os, index) => {
     const gate = phase === 'verify';
     const job = {
       id: matrix * 3 + index + 1, run_id: 20, run_attempt: attempt, head_sha: head,
       name: `${phase} (${os})`,
       labels: [gate ? 'ubuntu-latest' : phase === 'rust' && index === 0 ? 'ubuntu-24.04' : os],
-      status: 'completed', conclusion: 'success', runner_id: 1,
+      status: 'completed', conclusion: 'success',
       created_at: at(offset + (gate ? workerEnd : 0)),
       started_at: at(offset + (gate ? workerEnd + 2 : 0)),
       completed_at: at(offset + (gate ? workerEnd + 6 : firstRed ? 400 : workerEnd)),
-      steps: [{ number: 1, status: 'completed', conclusion: 'success' }],
     };
     if (firstRed && gate) {
       job.conclusion = 'failure';
-      job.steps = ['success', 'failure', 'success'].map((conclusion, i) => ({ number: i + 1, status: 'completed', conclusion }));
     }
     if (firstRed && phase === 'rust' && index === 1) {
-      job.conclusion = scenario === 'recovery-worker-failure' ? 'failure' : 'cancelled';
-      job.completed_at = at(scenario === 'recovery-unknown-cancellation' ? 719 : 749);
-      job.steps = ['Set up job', 'Verify pinned SQLite binding build', 'Preflight loader environment and run workspace tests', 'Complete job'].map(completedStep);
-      if (scenario === 'recovery-setup-only') job.steps = job.steps.slice(0, 1);
-      if (scenario === 'recovery-test-cancelled') job.steps[2].conclusion = 'cancelled';
+      job.conclusion = 'failure';
+      job.completed_at = at(749);
     }
     if (firstRed && phase === 'rust' && index === 2) {
-      Object.assign(job, { conclusion: 'cancelled', runner_id: 0, steps: [], completed_at: at(workerEnd) });
+      Object.assign(job, { conclusion: 'cancelled', completed_at: at(workerEnd) });
     }
-    job.check_run_url = `https://api.github.com/${prefix}check-runs/${job.id}`;
-    if (job.id === 2 && scenario === 'recovery-wrong-check-run') job.check_run_url += '9';
     return job;
   }));
-  if (attempt === 2 && scenario === 'recovery-partial-rerun') jobs[0].started_at = at(0);
-  if (attempt === 2 && scenario === 'recovery-red-rerun') jobs[0].conclusion = 'failure';
+  if ((attempt === 2 && scenario === 'recovery-partial-rerun') ||
+      (attempt === 3 && scenario === 'recovery-latest-partial')) {
+    jobs[0].started_at = at(offset - 2000);
+    jobs[0].completed_at = at(offset - 1500);
+  }
+  if ((attempt === 2 && scenario === 'recovery-red-rerun') ||
+      (attempt === 3 && scenario === 'recovery-latest-full-red')) jobs[0].conclusion = 'failure';
+  if (attempt === 3 && scenario === 'recovery-latest-invalid') jobs[0].started_at = at(offset - 2000);
   if (attempt === 2 && scenario === 'recovery-mismatched-rerun') jobs[0].run_attempt = 1;
   if (attempt === 2 && scenario === 'recovery-rerun-topology-changed') {
     const gates = jobs.slice(6).map((job, i) => ({ ...job, labels: [`${['ubuntu', 'windows', 'macos'][i]}-latest`] }));
@@ -98,24 +106,17 @@ function response(path, args) {
     return {};
   }
   if (/^actions\/workflows\/ci\.yml\/runs\?branch=main&event=push(?:&status=completed)?&per_page=100$/.test(path)) {
-    const latest = activeMain ? run(20, 1, { status: activeMain, conclusion: null, run_attempt: activeMain === 'queued' ? 1 : 2 })
-      : scenario === 'recovery-awaiting-rerun' ? recoveryRun(1) : run(20, 1, {run_attempt: 2});
+    const activityTime = at(scenario.startsWith('recovery-stale-') ? 3600 : 3601);
+    const latest = activeMain ? run(20, 1, {
+      status: activeMain, conclusion: null, run_attempt: activeMain === 'queued' ? 1 : 2,
+      run_started_at: activeMain === 'in_progress' ? activityTime : at(0),
+      updated_at: scenario === 'recovery-invalid-queue-time' ? null : activeMain === 'in_progress' ? at(7199) : activityTime,
+    }) : scenario === 'recovery-awaiting-rerun' ? recoveryRun(1)
+      : recovery ? recoveryRun(latestAttempt) : run(20, 1, { run_attempt: 2 });
     const workflow_runs = activeMain && path.includes('&status=completed') ? [run(19, 600)] : [run(19, 600), latest];
     return { workflow_runs, ...(scenario === 'oversized-main' ? { padding: 'x'.repeat(9 * 1024 * 1024) } : {}) };
   }
-  const checkRun = recovery && path.match(/^check-runs\/([23])\/annotations\?per_page=100$/);
-  if (checkRun) {
-    const unassigned = checkRun[1] === '3';
-    if ((unassigned && scenario === 'recovery-no-acquisition-evidence') ||
-        (!unassigned && scenario === 'recovery-no-deadline-evidence')) return [];
-    return [{
-      path: '.github', start_line: 1, end_line: 1, start_column: null, end_column: null,
-      annotation_level: 'failure', title: '', raw_details: '',
-      message: unassigned ? 'The job was not acquired by Runner of type hosted even after multiple attempts'
-        : 'The job has exceeded the maximum execution time of 12m0s',
-    }];
-  }
-  const recoveryPath = recovery && path.match(/^actions\/runs\/20\/attempts\/([12])(\/jobs\?per_page=100)?$/);
+  const recoveryPath = recovery && path.match(/^actions\/runs\/20\/attempts\/([123])(\/jobs\?per_page=100)?$/);
   if (recoveryPath) {
     const attempt = Number(recoveryPath[1]);
     return recoveryPath[2] ? recoveryJobs(attempt) : recoveryRun(attempt);
@@ -172,7 +173,7 @@ function fakeExec(command, args, options) {
 const history = readFileSync(new URL('../../docs/ci-duration-history.json', import.meta.url), 'utf8');
 const initialHistory = scenario === 'record-duplicate' ? JSON.stringify([{runId:20, marker:'unchanged'}], null, 2) + '\n' : history;
 let written = null;
-const context = createContext({ process: { env: { GITHUB_REPOSITORY: repository, GITHUB_EVENT_PATH: 'synthetic-event' }, argv: scenario.startsWith('record') ? ['--record'] : [] } });
+const context = createContext({ Date: FixedClock, process: { env: { GITHUB_REPOSITORY: repository, GITHUB_EVENT_PATH: 'synthetic-event' }, argv: scenario.startsWith('record') ? ['--record'] : [] } });
 const modules = new Map();
 modules.set('node:child_process', new SyntheticModule(['execFileSync'], function () { this.setExport('execFileSync', fakeExec); }, { context }));
 modules.set('node:fs', new SyntheticModule(['readFileSync', 'writeFileSync'], function () {
