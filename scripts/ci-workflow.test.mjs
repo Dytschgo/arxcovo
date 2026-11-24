@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, rmdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -330,10 +330,64 @@ test('CI disables dev debuginfo for Rust without overriding runtime profile defa
   assert.match(jobs.rust, /^ {4}timeout-minutes: 12\n {4}env:\n {6}CARGO_PROFILE_DEV_DEBUG: '0'\n {4}steps:$/m);
   assert.equal((workflow.match(/^\s*env:/gm) ?? []).length, 2);
   assert.deepEqual(workflow.match(/\bCARGO_\w+/g), ['CARGO_PROFILE_DEV_DEBUG', 'CARGO_HOME', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR']);
-  for (const path of ['../Cargo.toml', '../.cargo/config', '../.cargo/config.toml']) {
-    const url = new URL(path, import.meta.url);
-    if (existsSync(url)) {
-      assert.doesNotMatch(readFileSync(url, 'utf8'), /^\s*\[\s*profile\b/m, `${path} must not override Cargo profiles`);
+  assertNoCargoProfileOverride(cargoPolicyFiles, path => readFileSync(new URL(path, import.meta.url), 'utf8'));
+});
+
+const cargoPolicyFiles = [
+  { path: '../Cargo.toml', required: true },
+  { path: '../.cargo/config', required: false },
+  { path: '../.cargo/config.toml', required: false },
+];
+
+function assertNoCargoProfileOverride(files, readFile) {
+  for (const { path, required } of files) {
+    let text;
+    try {
+      text = readFile(path);
+    } catch (error) {
+      if (!required && error?.code === 'ENOENT') continue;
+      const code = error?.code ? ` (${error.code})` : '';
+      throw new Error(`${path} must be readable to check Cargo profiles${code}`, { cause: error });
     }
+    assert.doesNotMatch(text, /^\s*\[\s*profile\b/m, `${path} must not override Cargo profiles`);
+  }
+}
+
+test('Cargo profile policy skips only a missing optional config and fails closed on every other read', () => {
+  const clean = Object.fromEntries(cargoPolicyFiles.map(file => [file.path, '[package]\nname = "arxcovo"\n']));
+  const read = results => path => {
+    const result = results[path];
+    if (result instanceof Error) throw result;
+    return result;
+  };
+  const ioError = code => Object.assign(new Error(code), { code });
+
+  assertNoCargoProfileOverride(cargoPolicyFiles, read(clean));
+  assertNoCargoProfileOverride(cargoPolicyFiles, read({
+    ...clean,
+    '../.cargo/config': ioError('ENOENT'),
+    '../.cargo/config.toml': ioError('ENOENT'),
+  }));
+
+  for (const code of ['EACCES', 'EPERM', 'EIO']) {
+    for (const file of cargoPolicyFiles) {
+      assert.throws(
+        () => assertNoCargoProfileOverride(cargoPolicyFiles, read({ ...clean, [file.path]: ioError(code) })),
+        error => error?.message?.includes(`${file.path} must be readable to check Cargo profiles (${code})`),
+        `${file.path} ${code}`,
+      );
+    }
+  }
+  assert.throws(
+    () => assertNoCargoProfileOverride(cargoPolicyFiles, read({ ...clean, '../Cargo.toml': ioError('ENOENT') })),
+    error => error?.message?.includes('../Cargo.toml must be readable to check Cargo profiles (ENOENT)'),
+  );
+
+  for (const file of cargoPolicyFiles) {
+    assert.throws(
+      () => assertNoCargoProfileOverride(cargoPolicyFiles, read({ ...clean, [file.path]: '[profile.dev]\ndebug = 0\n' })),
+      error => error?.message?.includes(`${file.path} must not override Cargo profiles`),
+      file.path,
+    );
   }
 });
