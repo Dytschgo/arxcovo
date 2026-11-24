@@ -109,7 +109,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 11;
+const VM_SCHEMA_VERSION: u32 = 12;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -479,6 +479,9 @@ pub(crate) mod publish;
 #[path = "vm_snapshot.rs"]
 pub(crate) mod snapshot;
 
+#[path = "vm_compose.rs"]
+pub(crate) mod compose;
+
 #[path = "vm_static.rs"]
 pub(crate) mod static_vm;
 
@@ -575,6 +578,9 @@ impl VmStore {
         }
         if version < 11 {
             tx.execute_batch(snapshot::MIGRATE_V11)?;
+        }
+        if version < 12 {
+            tx.execute_batch(compose::MIGRATE_V12)?;
         }
         recover(&tx, now)?;
         check_size(&tx)?;
@@ -1199,7 +1205,11 @@ impl Binding<'_> {
                 Err(Refusal::KeyCollision)
             });
         }
-        if self.key.issued_at_ms > now {
+        if compose::uses_key(db, self.principal, self.key.key)? {
+            return Ok(Err(Refusal::KeyCollision));
+        }
+        if self.key.issued_at_ms > now || compose::compacted_key(db, self.principal, self.key.key)?
+        {
             return Ok(Err(Refusal::StaleKey));
         }
         if closed {
@@ -3087,9 +3097,9 @@ mod tests {
     }
 
     #[test]
-    fn v11_keeps_v9_and_v10_activity_replay_and_static_generation() {
-        for version in [9, 10] {
-            verify_v11_upgrade(version);
+    fn v12_keeps_v9_through_v11_activity_replay_and_static_generation() {
+        for version in [9, 10, 11] {
+            verify_compose_upgrade(version);
         }
     }
 
@@ -3194,7 +3204,10 @@ mod tests {
         let store = VmStore::open(dir.path(), NOW).unwrap();
         store
             .transact(|db| {
-                assert_eq!(count(db, "PRAGMA user_version", [])?, 11);
+                assert_eq!(
+                    count(db, "PRAGMA user_version", [])?,
+                    i64::from(VM_SCHEMA_VERSION)
+                );
                 assert_eq!(
                     db.query_row(
                         "SELECT origin_generation FROM vm_static_instances WHERE id=?1",
@@ -3236,10 +3249,13 @@ mod tests {
             let version: u32 = db
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 11);
+            assert_eq!(version, VM_SCHEMA_VERSION);
             // Exact v10 VmStore::open and DashboardCatalog::open version gates.
             assert!(!matches!(version, 0 | 5..=10));
             assert_ne!(version, 10);
+            // Exact v11 writer and read-only dashboard gates.
+            assert!(!matches!(version, 0 | 5..=11));
+            assert_ne!(version, 11);
         }
         assert_eq!(fs::read(&copy_path).unwrap(), before_copy);
     }
@@ -3324,7 +3340,7 @@ mod tests {
             .unwrap();
     }
 
-    fn verify_v11_upgrade(version: u32) {
+    fn verify_compose_upgrade(version: u32) {
         let dir = private_temp();
         let db = v6_fixture(dir.path());
         db.execute_batch(MIGRATE_V7).unwrap();
@@ -3366,7 +3382,7 @@ mod tests {
             "UPDATE sqlite_sequence SET seq=900 WHERE name='activity'; PRAGMA user_version=9;",
         )
         .unwrap();
-        if version == 10 {
+        if version >= 10 {
             db.execute_batch(publish::MIGRATE_V10).unwrap();
             db.pragma_update(None, "user_version", 10).unwrap();
             db.execute(
@@ -3378,11 +3394,82 @@ mod tests {
             )
             .unwrap();
         }
+        if version == 11 {
+            db.execute_batch(snapshot::MIGRATE_V11).unwrap();
+            db.pragma_update(None, "user_version", 11).unwrap();
+            let snapshot = Binding {
+                principal: "alice",
+                key: RequestId {
+                    key: [10; 16],
+                    issued_at_ms: NOW,
+                },
+                subject: Subject::Snapshot(vm, [6; 32]),
+                action: Action::Snapshot as i64,
+            }
+            .record(&db, NOW, Some(vm), None)
+            .unwrap();
+            let point = [0x56_u8; 16];
+            db.execute(
+                "INSERT INTO vm_generations(id,static_id,generation) VALUES(?1,?2,2)",
+                params![point, vm],
+            )
+            .unwrap();
+            db.execute("INSERT INTO vm_restore_points(id,static_vm,host,name,captured_ms,state,provenance,generation,lineage,charge)
+                SELECT ?1,id,host,'kept',?3,'ready',origin_generation,?1,zeroblob(32),500 FROM vm_static_instances WHERE id=?2",
+                params![point,vm,NOW]).unwrap();
+            db.execute(
+                "UPDATE vm_operations SET snapshot_result=?1 WHERE activity_id=?2",
+                params![point, snapshot.receipt.activity_id],
+            )
+            .unwrap();
+            finish(
+                &db,
+                snapshot.receipt.activity_id,
+                Status::Succeeded,
+                NOW,
+                Some(true),
+            )
+            .unwrap();
+            // Force a failure halfway through v12 DDL; retry from the populated v11 store.
+            db.execute_batch("CREATE TABLE vm_compose_operations(injected INTEGER)")
+                .unwrap();
+        }
         let ledger = ledger_ids(&db).unwrap();
+        let sequence = count(
+            &db,
+            "SELECT seq FROM sqlite_sequence WHERE name='activity'",
+            [],
+        )
+        .unwrap();
         drop(db);
+        if version == 11 {
+            assert!(VmStore::open(dir.path(), NOW).is_err());
+            let db = Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+            assert_eq!(count(&db, "PRAGMA user_version", []).unwrap(), 11);
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT count(*) FROM sqlite_schema WHERE name='vm_compose_projects'",
+                    []
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(ledger_ids(&db).unwrap(), ledger);
+            db.execute_batch("DROP TABLE vm_compose_operations")
+                .unwrap();
+        }
         let store = VmStore::open(dir.path(), NOW).unwrap();
         store.transact(|db| {
-            assert_eq!(count(db, "PRAGMA user_version", [])?, 11);
+            assert_eq!(count(db, "PRAGMA user_version", [])?, i64::from(VM_SCHEMA_VERSION));
+            for table in ["projects","releases","volumes","secrets","release_epochs","boots","operations","compacted_keys"] {
+                assert_eq!(count(db,&format!("SELECT count(*) FROM vm_compose_{table}"),[])?,0);
+            }
+            if version==11 {
+                assert_eq!(count(db,"SELECT charge FROM vm_restore_points WHERE name='kept' AND state='ready'",[])?,500);
+                assert_eq!(count(db,"SELECT count(*) FROM vm_operations o JOIN vm_restore_points p ON o.snapshot_result=p.id
+                    JOIN activity a ON a.id=o.activity_id WHERE o.binding_kind='snapshot' AND a.status=1 AND p.static_vm=o.vm",[])?,1);
+            }
             assert_eq!(
                 db.query_row("SELECT origin_generation FROM vm_static_instances WHERE id=?1",
                     [vm], |row| row.get::<_, Id>(0))?,
@@ -3393,7 +3480,7 @@ mod tests {
             assert_eq!(replay.operation.id, recorded.id);
             assert_eq!(active(db)?, generation);
             assert_eq!(static_vm::owned_state(db, "alice", vm)?, Some(StaticState::Stopped));
-            if version == 10 {
+            if version >= 10 {
                 let route = publish::current(db)?.expect("v10 route retained");
                 assert_eq!(route.generation, generation[0]);
                 assert_eq!(route.nonce, "b".repeat(32));
@@ -3404,7 +3491,7 @@ mod tests {
                 assert!(publish::current(db)?.is_none());
             }
             assert_eq!(count(db, "SELECT count(*) FROM vm_static_instances WHERE publication_failure IS NULL", [])?, 1);
-            assert_eq!(count(db, "SELECT seq FROM sqlite_sequence WHERE name='activity'", [])?, 900);
+            assert_eq!(count(db, "SELECT seq FROM sqlite_sequence WHERE name='activity'", [])?, sequence);
             assert_eq!(count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?, 0);
             Ok(())
         }).unwrap();

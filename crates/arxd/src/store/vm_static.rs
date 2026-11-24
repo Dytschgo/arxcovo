@@ -208,6 +208,7 @@ pub(crate) fn settle_recovery(
         )? == 1,
         "invalid static recovery"
     );
+    super::compose::finish_retired(db, claim.vm, now)?;
     finish(db, claim.activity_id, Status::Succeeded, now, Some(true))?;
     Ok(true)
 }
@@ -336,6 +337,9 @@ pub(super) fn settle_operation(
             "UPDATE vm_static_instances SET state=?2 WHERE id=?1",
             params![vm, next as i64],
         )?;
+    }
+    if event == Some(StaticEvent::Stopped) {
+        super::compose::finish_retired(db, vm, now)?;
     }
     // A failed stop leaves the boot unproven, like an interrupted effect.
     let cleanup = status != Status::Interrupted && !(status == Status::Failed && action == 4);

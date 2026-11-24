@@ -243,10 +243,10 @@ struct Inbound {
 }
 
 impl Inbound {
-    async fn next_frame(
+    async fn next_frame<M: Message>(
         &mut self,
         transport: &mut (impl AsyncRead + Unpin),
-    ) -> Result<Response, ChannelError> {
+    ) -> Result<M, ChannelError> {
         loop {
             if self.bytes.len() >= 4 {
                 let size = u32::from_be_bytes(self.bytes[..4].try_into().unwrap()) as usize;
@@ -292,4 +292,131 @@ fn read_error(error: std::io::Error) -> ChannelError {
     } else {
         ChannelError::Io
     }
+}
+
+/// Compose-only channel over a pipe already verified by the boot supervisor.
+/// A timeout, invalid frame or mismatched reply permanently closes the channel.
+pub struct ComposeChannel {
+    transport: Option<Box<dyn ComposeTransport>>,
+    inbound: Inbound,
+    generation: u64,
+    next_id: u32,
+}
+
+trait ComposeTransport: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ComposeTransport for T {}
+
+impl ComposeChannel {
+    pub async fn negotiate(
+        mut transport: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        generation: u64,
+        cancel: &Shutdown,
+    ) -> Result<Self, ChannelError> {
+        use arx_guest::compose::{
+            COMPOSE_CAPABILITIES, COMPOSE_PROTOCOL_VERSION, ComposeRequest, ComposeResponse,
+        };
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).map_err(|_| ChannelError::Io)?;
+        let challenge = hex::encode(random);
+        let capabilities = COMPOSE_CAPABILITIES.map(str::to_owned).to_vec();
+        let mut inbound = Inbound::default();
+        let ack: ComposeResponse = bounded(cancel, Instant::now() + FRAME_BOUND, async {
+            send_compose(
+                &mut transport,
+                ComposeRequest::ComposeHello {
+                    version: COMPOSE_PROTOCOL_VERSION,
+                    challenge: challenge.clone(),
+                    generation,
+                    capabilities: capabilities.clone(),
+                },
+            )
+            .await?;
+            inbound.next_frame(&mut transport).await
+        })
+        .await?;
+        if !matches!(ack, ComposeResponse::ComposeHelloAck {
+            version:COMPOSE_PROTOCOL_VERSION, challenge:echo, generation:boot, capabilities:offered, ..
+        } if echo == challenge && boot == generation && offered == capabilities)
+        {
+            return Err(ChannelError::Unexpected);
+        }
+        Ok(Self {
+            transport: Some(Box::new(transport)),
+            inbound,
+            generation,
+            next_id: 1,
+        })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.transport.is_some()
+    }
+
+    pub(crate) async fn exchange(
+        &mut self,
+        cancel: &Shutdown,
+        request: impl FnOnce(u32) -> arx_guest::compose::ComposeRequest,
+    ) -> anyhow::Result<arx_guest::compose::ComposeResponse> {
+        self.exchange_frame(cancel, request)
+            .await
+            .map_err(|_| anyhow::anyhow!("Compose guest exchange unavailable"))
+    }
+
+    async fn exchange_frame(
+        &mut self,
+        cancel: &Shutdown,
+        request: impl FnOnce(u32) -> arx_guest::compose::ComposeRequest,
+    ) -> Result<arx_guest::compose::ComposeResponse, ChannelError> {
+        use arx_guest::compose::ComposeResponse::*;
+        let mut transport = self.transport.take().ok_or(ChannelError::Closed)?;
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).ok_or(ChannelError::Closed)?;
+        let response = bounded(cancel, Instant::now() + FRAME_BOUND, async {
+            send_compose(&mut transport, request(id)).await?;
+            self.inbound.next_frame(&mut transport).await
+        })
+        .await?;
+        let echo = match &response {
+            ComposeStageProgress { id, .. }
+            | ComposeReleaseStaged { id, .. }
+            | ComposeOperationState { id, .. }
+            | ComposeProjectStatus { id, .. }
+            | ComposeLogPage { id, .. }
+            | ComposeSecretAccepted { id, .. }
+            | ComposeRejected { id, .. } => *id,
+            ComposeHelloAck { .. } => return Err(ChannelError::Unexpected),
+        };
+        if echo != id {
+            return Err(ChannelError::Unexpected);
+        }
+        self.transport = Some(transport);
+        Ok(response)
+    }
+}
+
+async fn send_compose(
+    transport: &mut (impl AsyncWrite + Unpin),
+    request: arx_guest::compose::ComposeRequest,
+) -> Result<(), ChannelError> {
+    use zeroize::Zeroizing;
+
+    request.validate().map_err(|_| ChannelError::Invalid)?;
+    // The generic guest write_frame uses a non-wiping stack buffer. This
+    // writer owns a fixed, wiping frame, including after partial writes.
+    let mut frame = Zeroizing::new(vec![0u8; 4 + MAX_FRAME]);
+    let mut writer = std::io::Cursor::new(&mut frame[4..]);
+    serde_json::to_writer(&mut writer, &request).map_err(|_| ChannelError::Invalid)?;
+    let len = writer.position() as usize;
+    drop(request);
+    frame[..4].copy_from_slice(&(len as u32).to_be_bytes());
+    transport
+        .write_all(&frame[..4 + len])
+        .await
+        .map_err(|_| ChannelError::Io)?;
+    drop(frame);
+    transport.flush().await.map_err(|_| ChannelError::Io)
 }

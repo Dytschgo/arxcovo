@@ -326,3 +326,17 @@ because every evaluation reads the latest state and evaluates all open
 PRs. Running evaluations finish without event-driven cancellation.
 [GitHub workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run) ·
 [GitHub concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
+
+## Executed one-use bypasses (2026-11-24)
+
+Three PR-scoped one-use permissions. Deadlock 2 permitted #310. Deadlock 3 permitted #311 and #312, each conditional on independent review and green platform CI. Two were executed: #310 and #311. #312 merged on the normal gates as `167f5f1a`, and its unused permission cannot be reused.
+
+Both executions followed the #296 route. Snapshot the protection document and check it for drift. Pin the PR head and main. Leave auto-merge unarmed. Remove only `ci-time-budget`. Squash-merge that pinned head. Restore the protection document in `finally`. For each execution, `protection-before.json` and `protection-after.json` were byte-identical. All four SHA-256 digests begin `4497eb1f`, the same prefix as the #296 snapshot.
+
+PR #310 merged as `f54a510c` from pinned head `c918a1ea`, with main pinned at `cb285be3`. Agent-review status `59778875154`. Deadlock 2 was main run `45420442928` on `cb285be3`: attempt 1 was not green after runner-timeout cancellations (913 s), and attempt 2 was green at 613 s and uncounted. That permission is consumed.
+
+Deadlock 3 was main run `45429978623` on `f54a510c`. Attempt 1 failed the intermittent Windows drain-settlement test and a macOS UI cancellation. PR #311 merged as `04964078` from pinned head `4ed76505`, with main pinned at `f54a510c`. Agent-review status `59786622218`. That permission is consumed.
+
+If attempt 1 is non-green, the latest full rerun of the same run is authoritative, as the rule above states by taking the first full rerun in newest-first order. That full rerun must itself be green and pass the existing checks. Partial reruns do not count. Main run `45443900861` on `04964078` was green on attempt 1 (wall 830 s, charged 825 s). Main run `45455400458` was green on attempt 1 (709 s). Main run `45457780671` failed attempt 1, and its latest full rerun, attempt 2, was green at 544 s with every required job inside that attempt's own window.
+
+Native paths remain **unverified on real hardware**.
