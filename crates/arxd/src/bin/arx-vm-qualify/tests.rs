@@ -1772,7 +1772,7 @@ mod native_glue {
     }
 
     #[test]
-    fn the_native_glue_stops_at_the_unimplemented_store_and_writes_only_diagnostics() {
+    fn the_native_glue_refuses_stock_before_claiming_a_slot_or_dispatching() {
         let p = preflight(true, 32 * GIB, true);
         let (trial, sink) = run(&p);
         assert_eq!(trial.blocked_at(), Some(Stage::DisposableStore));
@@ -1785,7 +1785,10 @@ mod native_glue {
                 record.stage
             );
         }
-        assert_eq!(records[6].result, StageResult::Unimplemented);
+        assert_eq!(
+            records[6].result,
+            StageResult::Failed(Diagnostic::DistributionUnverified)
+        );
         assert_eq!(records[7].stage, Stage::Cleanup);
         let names: Vec<&str> = sink
             .writes

@@ -7,6 +7,7 @@
 //! Native observations here are **unverified on real hardware**.
 
 mod capacity;
+mod paused;
 mod schema;
 mod sink;
 

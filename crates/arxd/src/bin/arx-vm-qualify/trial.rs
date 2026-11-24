@@ -22,8 +22,8 @@ pub(crate) trait Source {
 
 pub(crate) struct Native;
 
-/// The disposable-store collector is unimplemented: no value of this type can
-/// exist, so the native effect path is statically unreachable.
+/// The pinned stock distribution cannot prove actual opens. No native trial
+/// can claim a slot until that pre-effect gate has a reviewed witness.
 pub(crate) enum NoNativeStore {}
 
 #[cfg(all(windows, target_arch = "x86_64"))]
