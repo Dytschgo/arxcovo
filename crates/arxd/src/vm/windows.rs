@@ -49,6 +49,8 @@ use windows_sys::Win32::{
     },
 };
 
+pub mod qualification;
+
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
@@ -1055,10 +1057,99 @@ impl Identity {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TokenMode {
+    Dedicated,
+    CurrentUser,
+}
+
+impl TokenMode {
+    fn accepts_elevation(self, kind: TOKEN_ELEVATION_TYPE) -> bool {
+        kind == TokenElevationTypeDefault
+            || (self == Self::CurrentUser && kind == TokenElevationTypeLimited)
+    }
+
+    fn accepts_groups(self, entries: &[SID_AND_ATTRIBUTES]) -> bool {
+        use windows_sys::Win32::System::SystemServices::*;
+        let allowed = (SE_GROUP_MANDATORY
+            | SE_GROUP_ENABLED_BY_DEFAULT
+            | SE_GROUP_ENABLED
+            | SE_GROUP_OWNER
+            | SE_GROUP_USE_FOR_DENY_ONLY
+            | SE_GROUP_INTEGRITY
+            | SE_GROUP_INTEGRITY_ENABLED
+            | SE_GROUP_LOGON_ID) as u32;
+        entries.iter().all(|entry| {
+            // These group SIDs come from the bounded token information query.
+            let (admin, hyperv, system) = unsafe {
+                (
+                    IsWellKnownSid(entry.Sid, WinBuiltinAdministratorsSid) != 0,
+                    IsWellKnownSid(entry.Sid, WinBuiltinHyperVAdminsSid) != 0,
+                    IsWellKnownSid(entry.Sid, WinLocalSystemSid) != 0,
+                )
+            };
+            !system
+                && (self == Self::Dedicated || entry.Attributes & !allowed == 0)
+                && (!(admin || hyperv)
+                    || (self == Self::CurrentUser
+                        && entry.Attributes & SE_GROUP_USE_FOR_DENY_ONLY as u32 != 0
+                        && entry.Attributes
+                            & (SE_GROUP_ENABLED | SE_GROUP_ENABLED_BY_DEFAULT) as u32
+                            == 0))
+        })
+    }
+}
+
+/// The documented TokenGroups layout, bounded by its backing buffer.
+fn token_entries(groups: &[usize]) -> io::Result<&[SID_AND_ATTRIBUTES]> {
+    let offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+    if size_of_val(groups) < offset {
+        return Err(io::Error::other("invalid token group buffer"));
+    }
+    // The buffer starts with a TOKEN_GROUPS header and the count is checked
+    // against the remaining bytes before the slice is formed.
+    unsafe {
+        let token_groups = groups.as_ptr().cast::<TOKEN_GROUPS>();
+        let count = (*token_groups).GroupCount as usize;
+        if count > (size_of_val(groups) - offset) / size_of::<SID_AND_ATTRIBUTES>() {
+            return Err(io::Error::other("invalid token group count"));
+        }
+        Ok(std::slice::from_raw_parts(
+            std::ptr::addr_of!((*token_groups).Groups).cast::<SID_AND_ATTRIBUTES>(),
+            count,
+        ))
+    }
+}
+
+/// An owned copy of every group SID and its exact attribute mask.
+fn captured_groups(entries: &[SID_AND_ATTRIBUTES]) -> io::Result<Vec<(Vec<u8>, u32)>> {
+    entries
+        .iter()
+        .map(|entry| {
+            // Each SID is checked for validity before its length is trusted.
+            unsafe {
+                if IsValidSid(entry.Sid) == 0 {
+                    return Err(io::Error::other("invalid token group SID"));
+                }
+                let len = GetLengthSid(entry.Sid) as usize;
+                let bytes = std::slice::from_raw_parts(entry.Sid.cast::<u8>(), len).to_vec();
+                Ok((bytes, entry.Attributes))
+            }
+        })
+        .collect()
+}
+
+/// The restricted child must carry exactly the captured parent groups and
+/// masks: same SIDs, same order, same attributes.
+fn groups_match(expected: &[(Vec<u8>, u32)], entries: &[SID_AND_ATTRIBUTES]) -> bool {
+    captured_groups(entries).is_ok_and(|actual| actual == expected)
+}
+
 fn token_identity(
     token: &OwnedHandle,
     account: &LocalSid,
     restricted: bool,
+    mode: TokenMode,
 ) -> io::Result<Identity> {
     let user = token_data(token, TokenUser)?;
     let integrity = token_data(token, TokenIntegrityLevel)?;
@@ -1068,6 +1159,18 @@ fn token_identity(
     let stats = token_data(token, TokenStatistics)?;
     let groups = token_data(token, TokenGroups)?;
     let logon = token_data(token, TokenLogonSid)?;
+    if restricted && mode == TokenMode::CurrentUser {
+        let restrictions = token_data(token, TokenRestrictedSids)?;
+        // The query owns the pointed-to SID. Require only the enrolled user
+        // in the write restriction list, as supplied to CreateRestrictedToken.
+        let exact = unsafe {
+            let groups = &*restrictions.as_ptr().cast::<TOKEN_GROUPS>();
+            groups.GroupCount == 1 && EqualSid(groups.Groups[0].Sid, account.0) != 0
+        };
+        if !exact {
+            return Err(io::Error::other("unexpected VM token restrictions"));
+        }
+    }
     // These are the documented layouts of the respective token information
     // classes, and each kernel-returned SID stays within its backing buffer.
     unsafe {
@@ -1076,29 +1179,18 @@ fn token_identity(
             .Label
             .Sid;
         let stats = &*stats.as_ptr().cast::<TOKEN_STATISTICS>();
-        let token_groups = groups.as_ptr().cast::<TOKEN_GROUPS>();
-        let count = (*token_groups).GroupCount as usize;
-        let offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
-        if count > (size_of_val(groups.as_slice()) - offset) / size_of::<SID_AND_ATTRIBUTES>() {
-            return Err(io::Error::other("invalid token group count"));
-        }
-        let entries = std::slice::from_raw_parts(
-            std::ptr::addr_of!((*token_groups).Groups).cast::<SID_AND_ATTRIBUTES>(),
-            count,
-        );
-        if EqualSid(actual_user, account.0) == 0
+        let entries = token_entries(&groups)?;
+        if IsWellKnownSid(actual_user, WinLocalSystemSid) != 0
+            || EqualSid(actual_user, account.0) == 0
             || IsWellKnownSid(integrity, WinMediumLabelSid) == 0
             || elevation[0] != 0
-            || elevation_kind[0] as i32 != TokenElevationTypeDefault
+            || !mode.accepts_elevation(elevation_kind[0] as i32)
             || session == 0
+            || (mode == TokenMode::CurrentUser && WTSGetActiveConsoleSessionId() != session)
             || stats.TokenType != TokenPrimary
             || (IsTokenRestricted(token.as_raw_handle()) != 0) != restricted
             || (*logon.as_ptr().cast::<TOKEN_GROUPS>()).GroupCount != 1
-            || entries.iter().any(|entry| {
-                IsWellKnownSid(entry.Sid, WinBuiltinAdministratorsSid) != 0
-                    || IsWellKnownSid(entry.Sid, WinBuiltinHyperVAdminsSid) != 0
-                    || IsWellKnownSid(entry.Sid, WinLocalSystemSid) != 0
-            })
+            || !mode.accepts_groups(entries)
         {
             return Err(io::Error::other("unqualified VM token"));
         }
@@ -1171,6 +1263,9 @@ struct VmToken {
     network: LocalSid,
     system: LocalSid,
     identity: Identity,
+    mode: TokenMode,
+    /// The parent's group SIDs and masks, captured as the child policy.
+    groups: Vec<(Vec<u8>, u32)>,
 }
 
 impl VmToken {
@@ -1185,11 +1280,31 @@ impl VmToken {
         if unsafe { EqualSid(owner.0, account.0) } != 0 {
             return Err(io::Error::other("owner and supervisor must differ"));
         }
+        Self::derive_for(account, TokenMode::Dedicated)
+    }
+
+    fn derive_current_user(account: LocalSid) -> io::Result<Self> {
+        // An impersonating thread cannot collect or launch on behalf of the console.
+        let mut impersonation = null_mut();
+        if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut impersonation) } != 0 {
+            drop(unsafe { owned(impersonation) }?);
+            return Err(io::Error::other(
+                "impersonation is outside the VM token policy",
+            ));
+        }
+        if unsafe { GetLastError() } != ERROR_NO_TOKEN {
+            return Err(io::Error::last_os_error());
+        }
+        Self::derive_for(account, TokenMode::CurrentUser)
+    }
+
+    fn derive_for(account: LocalSid, mode: TokenMode) -> io::Result<Self> {
         let supervisor = process_token(
             unsafe { GetCurrentProcess() },
             TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
         )?;
-        let identity = token_identity(&supervisor, &account, false)?;
+        let identity = token_identity(&supervisor, &account, false, mode)?;
+        let groups = captured_groups(token_entries(&token_data(&supervisor, TokenGroups)?)?)?;
         let mut token = null_mut();
         let restricting = SID_AND_ATTRIBUTES {
             Sid: account.0,
@@ -1217,6 +1332,8 @@ impl VmToken {
             network: LocalSid::parse("S-1-5-2")?,
             system: LocalSid::parse("S-1-5-18")?,
             identity,
+            mode,
+            groups,
         };
         candidate.install_default_acl()?;
         candidate.verify(&candidate.token)?;
@@ -1277,7 +1394,15 @@ impl VmToken {
     }
 
     fn verify(&self, token: &OwnedHandle) -> io::Result<()> {
-        let observed = token_identity(token, &self.account, true)?;
+        let observed = token_identity(token, &self.account, true, self.mode)?;
+        if !groups_match(
+            &self.groups,
+            token_entries(&token_data(token, TokenGroups)?)?,
+        ) {
+            return Err(io::Error::other(
+                "VM child token groups differ from the policy",
+            ));
+        }
         let data = token_data(token, TokenDefaultDacl)?;
         // Both identities and the ACL remain backed by the token query allocations.
         let matches = unsafe {
@@ -3644,6 +3769,145 @@ mod tests {
         if converted.is_ok() {
             drop(result);
             std::fs::remove_dir(&a).unwrap();
+        }
+    }
+
+    fn group(sid: &LocalSid, attributes: i32) -> SID_AND_ATTRIBUTES {
+        SID_AND_ATTRIBUTES {
+            Sid: sid.0,
+            Attributes: attributes as u32,
+        }
+    }
+
+    #[test]
+    fn dedicated_and_current_user_token_policies_stay_distinct() {
+        use windows_sys::Win32::System::SystemServices::*;
+        for (kind, dedicated, current) in [
+            (TokenElevationTypeDefault, true, true),
+            (TokenElevationTypeLimited, false, true),
+            (TokenElevationTypeFull, false, false),
+        ] {
+            assert_eq!(TokenMode::Dedicated.accepts_elevation(kind), dedicated);
+            assert_eq!(TokenMode::CurrentUser.accepts_elevation(kind), current);
+        }
+        let users = LocalSid::parse("S-1-5-32-545").unwrap();
+        let admins = LocalSid::parse("S-1-5-32-544").unwrap();
+        let hyperv = LocalSid::parse("S-1-5-32-578").unwrap();
+        let system = LocalSid::parse("S-1-5-18").unwrap();
+        let enabled = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
+        let deny = SE_GROUP_USE_FOR_DENY_ONLY;
+        for (name, entries, dedicated, current) in [
+            ("ordinary group", vec![group(&users, enabled)], true, true),
+            (
+                "deny-only Administrators",
+                vec![group(&admins, deny)],
+                false,
+                true,
+            ),
+            (
+                "deny-only Hyper-V Administrators",
+                vec![group(&hyperv, deny)],
+                false,
+                true,
+            ),
+            (
+                "enabled Administrators",
+                vec![group(&admins, enabled)],
+                false,
+                false,
+            ),
+            (
+                "Administrators neither enabled nor deny-only",
+                vec![group(&admins, 0)],
+                false,
+                false,
+            ),
+            (
+                "deny-only but enabled",
+                vec![group(&admins, deny | SE_GROUP_ENABLED)],
+                false,
+                false,
+            ),
+            (
+                "enabled Hyper-V Administrators",
+                vec![group(&hyperv, enabled)],
+                false,
+                false,
+            ),
+            (
+                "SYSTEM even deny-only",
+                vec![group(&system, deny)],
+                false,
+                false,
+            ),
+            (
+                "unknown attribute bits",
+                vec![group(&users, enabled | SE_GROUP_RESOURCE)],
+                true,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                TokenMode::Dedicated.accepts_groups(&entries),
+                dedicated,
+                "{name}"
+            );
+            assert_eq!(
+                TokenMode::CurrentUser.accepts_groups(&entries),
+                current,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn dedicated_mode_still_refuses_a_shared_owner_and_supervisor() {
+        let same = "S-1-5-21-1-2-3-1001";
+        let error = VmToken::derive_checked(same, same).err().unwrap();
+        assert_eq!(error.to_string(), "owner and supervisor must differ");
+        assert_eq!(
+            VmToken::derive(same, same).err(),
+            Some(NativeRefusal::IdentityUnverified)
+        );
+    }
+
+    #[test]
+    fn restricted_child_groups_must_match_the_captured_parent_masks() {
+        use windows_sys::Win32::System::SystemServices::*;
+        let users = LocalSid::parse("S-1-5-32-545").unwrap();
+        let interactive = LocalSid::parse("S-1-5-4").unwrap();
+        let other = LocalSid::parse("S-1-5-11").unwrap();
+        let enabled = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
+        let parent = [group(&users, enabled), group(&interactive, enabled)];
+        let policy = captured_groups(&parent).unwrap();
+        assert!(groups_match(&policy, &parent));
+        for (name, child) in [
+            (
+                "mask changed",
+                vec![
+                    group(&users, SE_GROUP_USE_FOR_DENY_ONLY),
+                    group(&interactive, enabled),
+                ],
+            ),
+            (
+                "order swapped",
+                vec![group(&interactive, enabled), group(&users, enabled)],
+            ),
+            ("group missing", vec![group(&users, enabled)]),
+            (
+                "group added",
+                vec![
+                    group(&users, enabled),
+                    group(&interactive, enabled),
+                    group(&other, enabled),
+                ],
+            ),
+            (
+                "group replaced",
+                vec![group(&users, enabled), group(&other, enabled)],
+            ),
+        ] {
+            assert!(!groups_match(&policy, &child), "{name}");
         }
     }
 }

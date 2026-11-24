@@ -18,6 +18,10 @@ mod template;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[doc(hidden)]
+pub use windows::qualification;
+
 pub(crate) use crate::store::vm::{DashboardCatalog, DashboardVm};
 pub use controller::VmController;
 pub(crate) use controller::{ActivityReceipt, CatalogEntry, ForegroundSubject, Precheck};
