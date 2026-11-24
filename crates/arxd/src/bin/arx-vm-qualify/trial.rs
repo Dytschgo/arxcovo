@@ -5,13 +5,12 @@
 //! Every stage transition checks its prerequisites before the collector runs.
 //! Effects additionally consume a disposable-store proof, a confinement plan
 //! and a fresh live sample. Cleanup always runs. Only a trial whose every
-//! stage passed can be sealed, and in this contract version no native
-//! effect collector exists, so native trials are always incomplete.
+//! stage passed can be sealed, and the first guest and all subsequent native effects remain
+//! unavailable, so native trials are always incomplete.
 
 use crate::frame::*;
 
-/// What an evidence source supplies. The native source's store proof is
-/// uninhabited in this contract version, so a native effect cannot dispatch.
+/// What an evidence source supplies.
 pub(crate) trait Source {
     const ORIGIN: Origin;
     /// Opaque custody held for the whole trial (the native preflight pins).
@@ -22,8 +21,8 @@ pub(crate) trait Source {
 
 pub(crate) struct Native;
 
-/// The pinned stock distribution cannot prove actual opens. No native trial
-/// can claim a slot until that pre-effect gate has a reviewed witness.
+/// Portable fixtures for the baseline-only collector have no store proof.
+#[cfg(any(test, not(all(windows, target_arch = "x86_64"))))]
 pub(crate) enum NoNativeStore {}
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -34,6 +33,9 @@ pub(crate) enum NativeCustody {}
 impl Source for Native {
     const ORIGIN: Origin = Origin::Native;
     type Custody = NativeCustody;
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    type Store = crate::native::PausedStore;
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     type Store = NoNativeStore;
 }
 
@@ -148,6 +150,13 @@ pub(crate) trait Clock {
 /// may run, and it counts every effect it dispatches.
 pub(crate) trait Collectors<S: Source> {
     fn baseline(&mut self, stage: Stage) -> Collected;
+    fn implemented(&self, _stage: Stage) -> bool {
+        true
+    }
+    /// Project a row from an already completed effect without dispatching again.
+    fn previous_effect(&mut self, _stage: Stage) -> Option<Collected> {
+        None
+    }
     /// The store stage's record, and the proof only when it was produced.
     fn store(&mut self) -> (Collected, Option<S::Store>);
     fn plan(&mut self, stage: Stage) -> EffectPlan;
@@ -195,6 +204,7 @@ impl<S: Source> Trial<S> {
     }
 
     /// Run the closed graph to its first non-passing stage, then settle.
+    #[cfg(test)]
     pub(crate) fn drive(&mut self, collectors: &mut impl Collectors<S>, clock: &impl Clock) {
         self.state.drive(collectors, clock);
     }
@@ -239,6 +249,18 @@ impl<S: Source> Trial<S> {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn finish(self, clock: &impl Clock) -> Result<Complete<S>, RunError> {
         self.state.finish(clock)
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl Trial<Native> {
+    pub(crate) fn drive_native(
+        &mut self,
+        paused_runtime: Option<&tokio::runtime::Runtime>,
+        clock: &impl Clock,
+    ) {
+        let mut collectors = crate::native::PausedCollectors::new(&self.custody, paused_runtime);
+        self.state.drive(&mut collectors, clock);
     }
 }
 
@@ -402,24 +424,32 @@ impl<S: Source> State<S> {
                     },
                     (collected, _) => collected,
                 },
-                StageKind::Effect => match self.admit(stage, collectors) {
-                    Err(reason) => Collected::at(self.driver_ms(now), StageResult::Failed(reason)),
-                    Ok((plan, captured)) => {
-                        // Recheck immediately before dispatch: planning and
-                        // live collection take time of their own.
-                        let at = clock.now();
-                        match self.dispatchable(captured, at, clock) {
-                            Some(reason) => {
-                                Collected::at(self.driver_ms(at), StageResult::Failed(reason))
-                            }
-                            None => {
-                                self.dispatched = self.dispatched.saturating_add(1);
-                                let store =
-                                    self.store.as_ref().expect("admission requires the store");
-                                collectors.effect(stage, plan, store)
+                StageKind::Effect if !collectors.implemented(stage) => {
+                    Collected::at(self.driver_ms(now), StageResult::Unimplemented)
+                }
+                StageKind::Effect => match collectors.previous_effect(stage) {
+                    Some(collected) => collected,
+                    None => match self.admit(stage, collectors) {
+                        Err(reason) => {
+                            Collected::at(self.driver_ms(now), StageResult::Failed(reason))
+                        }
+                        Ok((plan, captured)) => {
+                            // Recheck immediately before dispatch: planning and
+                            // live collection take time of their own.
+                            let at = clock.now();
+                            match self.dispatchable(captured, at, clock) {
+                                Some(reason) => {
+                                    Collected::at(self.driver_ms(at), StageResult::Failed(reason))
+                                }
+                                None => {
+                                    self.dispatched = self.dispatched.saturating_add(1);
+                                    let store =
+                                        self.store.as_ref().expect("admission requires the store");
+                                    collectors.effect(stage, plan, store)
+                                }
                             }
                         }
-                    }
+                    },
                 },
                 StageKind::Cleanup => unreachable!("cleanup is settled below"),
             };

@@ -20,6 +20,7 @@
 
 use super::*;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
@@ -435,7 +436,7 @@ fn claim_exists(dir: &File) -> io::Result<bool> {
 
 /// Exclusively create a hidden entry under the held directory, with the
 /// delete access its rename or disposal needs.
-fn create_hidden(dir: &File, name: &str) -> io::Result<File> {
+pub(super) fn create_hidden(dir: &File, name: &str) -> io::Result<File> {
     open_child(
         dir,
         name,
@@ -554,7 +555,7 @@ fn rename_within(file: &File, dir: &File, name: &str) -> io::Result<()> {
 }
 
 /// Mark the open entry for deletion; it disappears when its handle closes.
-fn discard(file: &File) -> io::Result<()> {
+pub(super) fn discard(file: &File) -> io::Result<()> {
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     // A fixed-size input structure for the matching information class.
     succeeded(unsafe {

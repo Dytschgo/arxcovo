@@ -219,6 +219,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
         let (name, arguments) = match command {
             Command::Capabilities => ("qmp_capabilities", None),
             Command::Status => ("query-status", None),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            Command::Accelerators => ("query-accelerators", None),
             Command::Continue => ("cont", None),
             Command::Powerdown => ("system_powerdown", None),
             Command::Screendump(filename) => (
@@ -270,6 +272,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
 enum Command<'a> {
     Capabilities,
     Status,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    Accelerators,
     Continue,
     Powerdown,
     Screendump(&'a str),
@@ -461,6 +465,42 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
         Ok(status)
     }
 
+    /// Checks which accelerator the held paused QEMU child actually initialized.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) async fn verify_whpx(&mut self) -> Result<(), ChannelError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Accelerators {
+            enabled: String,
+            present: Vec<String>,
+        }
+
+        let stream = self.stream.as_mut().ok_or(ChannelError::Closed)?;
+        let response = stream
+            .command(Command::Accelerators, &mut Events::default())
+            .await?;
+        let actual: Accelerators =
+            serde_json::from_value(response).map_err(|_| ChannelError::Invalid)?;
+        if actual.enabled != "whpx"
+            || actual.present.len() > 8
+            || actual
+                .present
+                .iter()
+                .filter(|name| name.as_str() == "whpx")
+                .count()
+                != 1
+            || actual.present.iter().any(|name| {
+                !matches!(
+                    name.as_str(),
+                    "hvf" | "kvm" | "mshv" | "nvmm" | "qtest" | "tcg" | "whpx" | "xen"
+                )
+            })
+        {
+            return Err(ChannelError::Unexpected);
+        }
+        Ok(())
+    }
+
     /// One-time release of the `-S` hold. `revalidate` runs after the
     /// prelaunch status receipt and before `cont`; `false` sends no `cont`
     /// and closes the channel.
@@ -629,5 +669,52 @@ fn empty(value: Value) -> Result<(), ChannelError> {
         Ok(())
     } else {
         Err(ChannelError::Invalid)
+    }
+}
+
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+mod accelerator_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn paused_trial_requires_typed_whpx_selection() {
+        for (response, accepted) in [
+            (r#"{"enabled":"whpx","present":["whpx","tcg"]}"#, true),
+            (r#"{"enabled":"tcg","present":["whpx","tcg"]}"#, false),
+            (r#"{"enabled":"whpx","present":["tcg"]}"#, false),
+            (r#"{"enabled":"whpx","present":["whpx","whpx"]}"#, false),
+            (
+                r#"{"enabled":"whpx","present":["whpx"],"extra":true}"#,
+                false,
+            ),
+        ] {
+            let (host, simulated) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(host);
+            let mut qmp = Qmp {
+                stream: Some(Stream {
+                    reader: BufReader::new(reader),
+                    writer,
+                    next_id: 1,
+                    pending: Vec::new(),
+                }),
+                started: false,
+                installer: None,
+            };
+            let (_, result) = tokio::join!(
+                async {
+                    let mut peer = BufReader::new(simulated);
+                    let mut command = String::new();
+                    peer.read_line(&mut command).await.unwrap();
+                    assert_eq!(command, "{\"execute\":\"query-accelerators\",\"id\":1}\r\n");
+                    peer.get_mut()
+                        .write_all(format!("{{\"return\":{response},\"id\":1}}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                },
+                qmp.verify_whpx()
+            );
+            assert_eq!(result.is_ok(), accepted, "{response}");
+        }
     }
 }

@@ -1,7 +1,5 @@
-//! Native glue: project the held, read-only preflight into the closed graph
-//! and publish only an incomplete diagnostic. Stock QEMU has no reviewed
-//! loader and consumer-open witness. Refuse before taking a disposable slot
-//! or starting any native effect.
+//! Project held preflight and paused-trial observations into the closed graph.
+//! Native runs publish an incomplete diagnostic. Later stages remain closed.
 //!
 //! Native observations are **unverified on real hardware**.
 
@@ -9,8 +7,14 @@ use crate::frame::*;
 use crate::trial::*;
 #[cfg(test)]
 use arxd::vm::qualification::DiagnosticFile;
-use arxd::vm::qualification::{self, Baseline, Entry, Preflight, Taken};
-use arxd::vm::runtime::NativeRefusal;
+use arxd::vm::qualification::{
+    self, Baseline, Entry, PausedPhase, PausedTrial, PausedTrialPermit, PausedVerdict, Preflight,
+    Taken,
+};
+use arxd::{
+    service::Shutdown,
+    vm::runtime::{NativeRefusal, StopDisposition},
+};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -220,8 +224,7 @@ pub(crate) fn project(p: &Preflight, stage: Stage) -> Collected {
 }
 
 /// Baseline results are projected once from the held preflight, before the
-/// graph runs; the custody itself stays owned by the trial. The store proof
-/// type is uninhabited, so these collectors can never dispatch an effect.
+/// graph runs. The trial retains the custody.
 pub(crate) struct NativeCollectors {
     baseline: Vec<(Stage, Collected)>,
     origin: Instant,
@@ -253,8 +256,8 @@ impl NativeCollectors {
     }
 }
 
-impl<S: Source<Store = NoNativeStore>> Collectors<S> for NativeCollectors {
-    fn baseline(&mut self, stage: Stage) -> Collected {
+impl NativeCollectors {
+    fn take_stage(&mut self, stage: Stage) -> Collected {
         match self.baseline.iter().position(|(s, _)| *s == stage) {
             Some(index) => self.baseline.swap_remove(index).1,
             None => Collected::at(
@@ -262,6 +265,13 @@ impl<S: Source<Store = NoNativeStore>> Collectors<S> for NativeCollectors {
                 StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+impl<S: Source<Store = NoNativeStore>> Collectors<S> for NativeCollectors {
+    fn baseline(&mut self, stage: Stage) -> Collected {
+        self.take_stage(stage)
     }
 
     fn store(&mut self) -> (Collected, Option<NoNativeStore>) {
@@ -299,6 +309,166 @@ impl<S: Source<Store = NoNativeStore>> Collectors<S> for NativeCollectors {
         } else {
             Teardown::Uncertain
         }
+    }
+}
+
+/// Only this collector can construct the native store proof. The OS
+/// adapter separately owns the exclusive on-volume slot.
+pub(crate) struct PausedStore(());
+
+pub(crate) struct PausedCollectors<'a> {
+    baseline: &'a Baseline,
+    projected: NativeCollectors,
+    runtime: Option<&'a tokio::runtime::Runtime>,
+    permit: Option<PausedTrialPermit<'a>>,
+    result: Option<PausedTrial>,
+}
+
+impl<'a> PausedCollectors<'a> {
+    pub(crate) fn new(
+        baseline: &'a Baseline,
+        runtime: Option<&'a tokio::runtime::Runtime>,
+    ) -> Self {
+        Self {
+            baseline,
+            projected: NativeCollectors::new(baseline.observations(), baseline.origin()),
+            runtime,
+            permit: None,
+            result: None,
+        }
+    }
+}
+
+impl Collectors<Native> for PausedCollectors<'_> {
+    fn baseline(&mut self, stage: Stage) -> Collected {
+        self.projected.take_stage(stage)
+    }
+
+    fn store(&mut self) -> (Collected, Option<PausedStore>) {
+        let prepared = if self.runtime.is_some() {
+            self.baseline.prepare_paused_trial()
+        } else {
+            Err(NativeRefusal::DistributionUnverified)
+        };
+        let (result, proof) = match prepared {
+            Ok(permit) => {
+                self.permit = Some(permit);
+                (
+                    StageResult::Passed(Observation::PausedStore { validated: true }),
+                    Some(PausedStore(())),
+                )
+            }
+            Err(reason) => (StageResult::Failed(refused(reason)), None),
+        };
+        (Collected::at(self.projected.now_ms(), result), proof)
+    }
+
+    fn implemented(&self, stage: Stage) -> bool {
+        paused_phase(stage).is_some()
+    }
+
+    fn previous_effect(&mut self, stage: Stage) -> Option<Collected> {
+        matches!(
+            stage,
+            Stage::QemuPrelaunchPause | Stage::HeldBundleInventory
+        )
+        .then(|| {
+            Collected::at(
+                self.projected.now_ms(),
+                project_paused(stage, self.result.as_ref()),
+            )
+        })
+    }
+
+    fn plan(&mut self, _: Stage) -> EffectPlan {
+        EffectPlan::CONFINED
+    }
+
+    fn live(&mut self) -> Option<u64> {
+        self.baseline.paused_live().ok().map(|captured| {
+            u64::try_from(captured.duration_since(self.baseline.origin()).as_millis())
+                .unwrap_or(u64::MAX)
+        })
+    }
+
+    fn effect(&mut self, stage: Stage, _: EffectPlan, _: &PausedStore) -> Collected {
+        let started_ms = self.projected.now_ms();
+        if stage != Stage::SuspendedChild {
+            return Collected::at(started_ms, StageResult::Unimplemented);
+        }
+        if let (Some(runtime), Some(permit)) = (self.runtime, self.permit.take()) {
+            // Startup, paused QMP, inventory recheck and stop are one held
+            // operation. Subsequent rows only project its verified result.
+            self.result = Some(runtime.block_on(async {
+                let cancel = Shutdown::default();
+                let signal = cancel.clone();
+                let interrupt = tokio::spawn(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        signal.cancel();
+                    }
+                });
+                let result = permit.run(&cancel).await;
+                interrupt.abort();
+                result
+            }));
+        }
+        let result = project_paused(stage, self.result.as_ref());
+        Collected {
+            started_ms,
+            finished_ms: self.projected.now_ms(),
+            result,
+        }
+    }
+
+    fn cleanup(&mut self, _: u16) -> Teardown {
+        paused_teardown(self.result.as_ref())
+    }
+}
+
+fn paused_phase(stage: Stage) -> Option<PausedPhase> {
+    match stage {
+        Stage::SuspendedChild => Some(PausedPhase::SuspendedChild),
+        Stage::QemuPrelaunchPause => Some(PausedPhase::Prelaunch),
+        Stage::HeldBundleInventory => Some(PausedPhase::BundleInventory),
+        _ => None,
+    }
+}
+
+fn project_paused(stage: Stage, trial: Option<&PausedTrial>) -> StageResult {
+    let Some(phase) = paused_phase(stage) else {
+        return StageResult::Unimplemented;
+    };
+    let Some(trial) = trial else {
+        return StageResult::Inconclusive(Diagnostic::PrerequisiteMissing);
+    };
+    let pass = StageResult::Passed(Observation::PausedTrial { verified: true });
+    if matches!(
+        (phase, trial.phase),
+        (
+            PausedPhase::SuspendedChild,
+            PausedPhase::Prelaunch | PausedPhase::BundleInventory
+        ) | (PausedPhase::Prelaunch, PausedPhase::BundleInventory)
+    ) {
+        return pass;
+    }
+    if phase != trial.phase {
+        return StageResult::Inconclusive(Diagnostic::PrerequisiteMissing);
+    }
+    match trial.verdict {
+        PausedVerdict::Verified => pass,
+        PausedVerdict::Refused(reason) => StageResult::Failed(refused(reason)),
+        PausedVerdict::OwnerActive => StageResult::Failed(Diagnostic::OwnerActive),
+        PausedVerdict::Qmp => StageResult::Failed(Diagnostic::OtherRefusal),
+        PausedVerdict::Timeout => StageResult::Failed(Diagnostic::Expired),
+        PausedVerdict::Cancelled => StageResult::Failed(Diagnostic::Cancelled),
+    }
+}
+
+fn paused_teardown(trial: Option<&PausedTrial>) -> Teardown {
+    if trial.is_some_and(|trial| trial.release == StopDisposition::ChargedQuarantine) {
+        Teardown::Uncertain
+    } else {
+        Teardown::Released
     }
 }
 
@@ -386,11 +556,24 @@ impl DiagnosticSink for BaselineSink<'_> {
     }
 }
 
-pub(crate) fn run(enrollment: &str, evidence: &str) -> Result<Outcome, RunError> {
+pub(crate) fn run(enrollment: &str, evidence: &str, paused: bool) -> Result<Outcome, RunError> {
+    let runtime = paused
+        .then(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+        })
+        .transpose()
+        .map_err(|_| RunError::Native(NativeRefusal::JobUnverified))?;
     // Everything fallible happens before the preflight claims the output,
     // including the writer's own random scope and run. After the claim,
     // every failure settles as a typed diagnostic.
-    let baseline = qualification::preflight(enrollment, evidence).map_err(RunError::Native)?;
+    let preflight = if paused {
+        qualification::preflight_paused
+    } else {
+        qualification::preflight
+    };
+    let baseline = preflight(enrollment, evidence).map_err(RunError::Native)?;
     let clock = NativeClock {
         origin: baseline.origin(),
     };
@@ -400,8 +583,44 @@ pub(crate) fn run(enrollment: &str, evidence: &str) -> Result<Outcome, RunError>
     // observations are reached only through the trial's own reference.
     let trial_authority = TrialAuthority::issue(baseline, Class::Test, dependencies, issued);
     let mut trial = Trial::begin(trial_authority);
-    let mut collectors = NativeCollectors::new(trial.custody().observations(), clock.origin);
-    trial.drive(&mut collectors, &clock);
+    trial.drive_native(runtime.as_ref(), &clock);
     publish_incomplete(&trial, &mut BaselineSink(trial.custody()))?;
     Ok(Outcome::Incomplete)
+}
+
+#[cfg(test)]
+mod paused_tests {
+    use super::*;
+
+    #[test]
+    fn projections_are_limited_to_completed_paused_phases() {
+        let mut trial = PausedTrial {
+            phase: PausedPhase::BundleInventory,
+            verdict: PausedVerdict::Refused(NativeRefusal::DistributionUnverified),
+            release: StopDisposition::ChargedQuarantine,
+        };
+        let pass = StageResult::Passed(Observation::PausedTrial { verified: true });
+        assert_eq!(project_paused(Stage::SuspendedChild, Some(&trial)), pass);
+        assert_eq!(
+            project_paused(Stage::QemuPrelaunchPause, Some(&trial)),
+            pass
+        );
+        assert_eq!(
+            project_paused(Stage::HeldBundleInventory, Some(&trial)),
+            StageResult::Failed(Diagnostic::DistributionUnverified)
+        );
+        assert!(matches!(paused_teardown(Some(&trial)), Teardown::Uncertain));
+        trial.verdict = PausedVerdict::Verified;
+        trial.release = StopDisposition::DirtyRelease;
+        assert_eq!(
+            project_paused(Stage::HeldBundleInventory, Some(&trial)),
+            pass
+        );
+        assert_eq!(
+            project_paused(Stage::FirstGuestExecution, Some(&trial)),
+            StageResult::Unimplemented
+        );
+        assert!(matches!(paused_teardown(Some(&trial)), Teardown::Released));
+        assert!(matches!(paused_teardown(None), Teardown::Released));
+    }
 }
