@@ -271,7 +271,11 @@ impl<H: Host> Settlement<'_, H> {
         let reopened = stop.ready_to_verify_release()
             && by_deadline(deadline, self.host.reopen(slot, deadline)).await == Some(true);
         stop.verify_release(|| reopened);
-        let release = stop.disposition();
+        let release = if Tick::now() < deadline {
+            stop.disposition()
+        } else {
+            StopDisposition::ChargedQuarantine
+        };
         self.host
             .settle(self.slot.take().expect("settlement owns a slot"), release);
         release
@@ -306,60 +310,96 @@ fn before(cancel: &Shutdown, cutoff: Tick) -> Result<Tick, Failure> {
 
 const PRESSURE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The live deadline and sample schedule follow the trial between operations.
-/// Timers wake the supervisor, but are not evidence that a deadline is still
-/// in the future. Check the monotonic clock just before advancing anything.
+/// The bounds on one host observation. A pressure sample and the evidence
+/// it produced can come due at different times.
+#[derive(Clone, Copy)]
+struct Freshness {
+    captured: Tick,
+    sample_due: Tick,
+    cutoff: Tick,
+}
+
+impl Freshness {
+    fn new(captured: Tick, sampled: Tick, cutoff: Tick) -> Self {
+        Self {
+            captured,
+            sample_due: sampled + PRESSURE_INTERVAL,
+            cutoff,
+        }
+    }
+
+    fn deadline(self) -> Tick {
+        self.sample_due
+            .min(self.captured + FRESHNESS)
+            .min(self.cutoff)
+    }
+
+    fn fresh_at(self, now: Tick) -> bool {
+        (self.captured..self.deadline()).contains(&now)
+    }
+}
+
+/// Timers wake the supervisor, but each decision compares the monotonic
+/// clock to the same pressure, observation and effect deadlines.
 struct LivePoll<'a> {
     cancel: &'a Shutdown,
-    cutoff: Tick,
     recheck: &'a dyn Fn() -> Result<Tick, Failure>,
-    next_sample: Cell<Tick>,
+    observation: Cell<Freshness>,
     refused: Cell<Option<Failure>>,
 }
 
 impl<'a> LivePoll<'a> {
     fn new(
         cancel: &'a Shutdown,
-        cutoff: Tick,
         recheck: &'a dyn Fn() -> Result<Tick, Failure>,
-        captured: Tick,
+        observation: Freshness,
     ) -> Self {
         Self {
             cancel,
-            cutoff,
             recheck,
-            next_sample: Cell::new(captured + PRESSURE_INTERVAL),
+            observation: Cell::new(observation),
             refused: Cell::new(None),
         }
     }
 
-    fn sample(&self) -> Result<Tick, Failure> {
-        before(self.cancel, self.cutoff)?;
-        let captured = (self.recheck)()?;
-        let now = before(self.cancel, self.cutoff)?;
-        self.next_sample.set(now + PRESSURE_INTERVAL);
-        Ok(captured)
+    fn cutoff(&self) -> Tick {
+        self.observation.get().cutoff
     }
 
-    fn check_due(&self) -> Result<(), Failure> {
-        let now = before(self.cancel, self.cutoff)?;
-        if now >= self.next_sample.get() {
-            self.sample()?;
+    fn sample(&self) -> Result<Freshness, Failure> {
+        let cutoff = self.cutoff();
+        before(self.cancel, cutoff)?;
+        let captured = (self.recheck)()?;
+        let now = before(self.cancel, cutoff)?;
+        let observation = Freshness::new(captured, now, cutoff);
+        if !observation.fresh_at(now) {
+            return Err(NativeRefusal::ReservesUnverified.into());
         }
-        Ok(())
+        self.observation.set(observation);
+        Ok(observation)
+    }
+
+    fn require_fresh(&self) -> Result<Freshness, Failure> {
+        let now = before(self.cancel, self.cutoff())?;
+        let observation = self.observation.get();
+        if observation.fresh_at(now) {
+            Ok(observation)
+        } else {
+            self.sample()
+        }
     }
 
     fn poll<T, E>(
         &self,
         refusal: impl FnOnce(Failure) -> E,
-        advance: impl FnOnce() -> Poll<Result<T, E>>,
+        advance: impl FnOnce(Freshness) -> Poll<Result<T, E>>,
     ) -> Poll<Result<T, E>> {
         let checked = match self.refused.get() {
             Some(reason) => Err(reason),
-            None => self.check_due(),
+            None => self.require_fresh(),
         };
         match checked {
-            Ok(()) => advance(),
+            Ok(observation) => advance(observation),
             Err(reason) => {
                 self.refused.set(Some(reason));
                 Poll::Ready(Err(refusal(reason)))
@@ -372,24 +412,26 @@ impl<'a> LivePoll<'a> {
         action: impl Future<Output = Result<T, Failure>>,
     ) -> Result<T, Failure> {
         tokio::pin!(action);
-        let cutoff_alarm = tokio::time::sleep_until(self.cutoff);
+        let cutoff_alarm = tokio::time::sleep_until(self.cutoff());
         tokio::pin!(cutoff_alarm);
         loop {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Err(Failure::Cancelled),
                 _ = &mut cutoff_alarm => return Err(Failure::Timeout),
-                _ = tokio::time::sleep_until(self.next_sample.get()) => {
-                    self.check_due()?;
+                _ = tokio::time::sleep_until(self.observation.get().deadline()) => {
+                    self.require_fresh()?;
                 }
-                result = poll_fn(|cx| self.poll(|reason| reason, || action.as_mut().poll(cx))) => {
+                result = poll_fn(|cx| self.poll(|reason| reason, |_| action.as_mut().poll(cx))) => {
                     // An inner QMP read or write can refuse during an action
                     // poll. Preserve its typed reason through the IO boundary.
                     if let Some(reason) = self.refused.get() {
                         return Err(reason);
                     }
-                    before(self.cancel, self.cutoff)?;
-                    return result;
+                    before(self.cancel, self.cutoff())?;
+                    let value = result?;
+                    self.require_fresh()?;
+                    return Ok(value);
                 }
             }
         }
@@ -406,11 +448,11 @@ struct LiveIo<'a, I> {
 impl<I: Unpin> LiveIo<'_, I> {
     fn poll_io<T>(
         &mut self,
-        advance: impl FnOnce(Pin<&mut I>) -> Poll<io::Result<T>>,
+        advance: impl FnOnce(Pin<&mut I>, Freshness) -> Poll<io::Result<T>>,
     ) -> Poll<io::Result<T>> {
         self.gate.poll(
             |_| io::ErrorKind::PermissionDenied.into(),
-            || advance(Pin::new(&mut self.inner)),
+            |observation| advance(Pin::new(&mut self.inner), observation),
         )
     }
 }
@@ -421,25 +463,45 @@ impl<I: AsyncRead + Unpin> AsyncRead for LiveIo<'_, I> {
         cx: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.poll_io(|io| io.poll_read(cx, buffer))
+        self.poll_io(|io, _| io.poll_read(cx, buffer))
     }
 }
 
-impl<I: AsyncWrite + Unpin> AsyncWrite for LiveIo<'_, I> {
+/// Arm at the first actual write attempt of each command. The dispatch
+/// worker checks the same deadline at the pipe, including time spent queued.
+struct LiveWriter<'a, I> {
+    stream: LiveIo<'a, I>,
+    dispatch: &'a DispatchGate,
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for LiveWriter<'_, I> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.poll_io(|io| io.poll_write(cx, bytes))
+        let dispatch = self.dispatch;
+        let gate = self.stream.gate;
+        self.stream.poll_io(|io, observation| {
+            if dispatch.current() == Dispatch::Idle
+                && let Err(reason) = dispatch.arm_until(
+                    observation.captured.into_std(),
+                    Some(observation.deadline().into_std()),
+                )
+            {
+                gate.refused.set(Some(reason.into()));
+                return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
+            }
+            io.poll_write(cx, bytes)
+        })
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_io(|io| io.poll_flush(cx))
+        self.stream.poll_io(|io, _| io.poll_flush(cx))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_io(|io| io.poll_shutdown(cx))
+        self.stream.poll_io(|io, _| io.poll_shutdown(cx))
     }
 }
 
@@ -452,21 +514,22 @@ async fn paused_exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         stdin,
         dispatch,
     } = pipes;
-    let (cancel, cutoff) = (gate.cancel, gate.cutoff);
-    let captured = gate.sample()?;
-    dispatch.arm_until(captured.into_std(), Some(cutoff.into_std()))?;
+    let (cancel, cutoff) = (gate.cancel, gate.cutoff());
+    gate.sample()?;
     let stdout = LiveIo {
         gate,
         inner: stdout,
     };
-    let stdin = LiveIo { gate, inner: stdin };
+    let stdin = LiveWriter {
+        stream: LiveIo { gate, inner: stdin },
+        dispatch: &dispatch,
+    };
     let mut peer = gate
         .watch(async { Ok(bounded(cancel, cutoff, Qmp::handshake(stdout, stdin, cancel)).await?) })
         .await?;
     gate.watch(confirm_dispatch(&dispatch)).await?;
 
-    let captured = gate.sample()?;
-    dispatch.arm_until(captured.into_std(), Some(cutoff.into_std()))?;
+    gate.sample()?;
     let status = gate
         .watch(async { Ok(bounded(cancel, cutoff, peer.status(cancel)).await?) })
         .await?;
@@ -531,12 +594,16 @@ async fn run<H: Host>(
         before(cancel, cutoff)?;
         let (opens, peak) = host.open_contract(plan)?;
         let live = host.live()?;
-        live.check(peak, Tick::now())?;
-        before(cancel, cutoff)?;
+        let sampled = Tick::now();
+        live.check(peak, sampled)?;
+        let observation = Freshness::new(live.captured, sampled, cutoff);
+        if !observation.fresh_at(before(cancel, cutoff)?) {
+            return Err(NativeRefusal::ReservesUnverified.into());
+        }
         let slot = host.claim(&live, peak)?;
-        Ok((opens, peak, slot, live.captured))
+        Ok((opens, peak, slot, observation))
     })();
-    let (opens, peak, slot, captured) = match admitted {
+    let (opens, peak, slot, observation) = match admitted {
         Ok(admission) => admission,
         Err(failure) => {
             return TrialResult {
@@ -553,7 +620,7 @@ async fn run<H: Host>(
     };
     let paused = {
         let recheck = || sample(settlement.host, peak);
-        let gate = LivePoll::new(cancel, cutoff, &recheck, captured);
+        let gate = LivePoll::new(cancel, &recheck, observation);
         launch_paused(
             settlement.host,
             settlement.slot.as_ref().expect("settlement owns a slot"),
@@ -572,7 +639,15 @@ async fn by_deadline<T>(deadline: Tick, action: impl Future<Output = T>) -> Opti
     if Tick::now() >= deadline {
         return None;
     }
-    let value = tokio::time::timeout_at(deadline, action).await.ok()?;
+    tokio::pin!(action);
+    let guarded = poll_fn(|cx| {
+        if Tick::now() >= deadline {
+            Poll::Ready(None)
+        } else {
+            action.as_mut().poll(cx).map(Some)
+        }
+    });
+    let value = tokio::time::timeout_at(deadline, guarded).await.ok()??;
     (Tick::now() < deadline).then_some(value)
 }
 

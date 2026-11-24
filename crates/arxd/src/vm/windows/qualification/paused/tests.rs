@@ -119,14 +119,19 @@ struct FakeWriter {
     written: Rc<RefCell<Vec<u8>>>,
     dispatch: Arc<DispatchGate>,
     late: bool,
+    queued_lag: Option<Duration>,
 }
 
 impl AsyncWrite for FakeWriter {
     fn poll_write(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Some(lag) = self.queued_lag.take() {
+            // The worker can be scheduled after the supervisor submits.
+            let _ = std::pin::pin!(tokio::time::advance(lag)).poll(cx);
+        }
         // The fixture's async deadlines and pipe-worker dispatch share the
         // same clock, including when Tokio advances it in a paused test.
         let now = Tick::now().into_std();
@@ -175,11 +180,14 @@ struct Fake {
     dispatch: RefCell<Option<Arc<DispatchGate>>>,
     fail: Option<(Step, NativeRefusal)>,
     live_override: Option<LiveOverride>,
+    expiring_sample: Option<usize>,
     live_calls: Cell<usize>,
     stop: Stop,
     reopen: bool,
     late_reopen: bool,
     late_write: bool,
+    queued_write_lag: Option<Duration>,
+    pre_resume_lag: Option<Duration>,
     cancel_on_resume: bool,
     charge_retained: bool,
     stall_at: Option<Step>,
@@ -204,11 +212,14 @@ impl Default for Fake {
             dispatch: RefCell::default(),
             fail: None,
             live_override: None,
+            expiring_sample: None,
             live_calls: Cell::default(),
             stop: Stop::Confirmed,
             reopen: true,
             late_reopen: false,
             late_write: false,
+            queued_write_lag: None,
+            pre_resume_lag: None,
             cancel_on_resume: false,
             charge_retained: false,
             stall_at: None,
@@ -290,6 +301,9 @@ impl Host for Fake {
 
     fn live(&self) -> Result<Live, NativeRefusal> {
         let mut observation = live();
+        if self.expiring_sample == Some(self.live_calls.get()) {
+            observation.captured -= FRESHNESS - OBSERVATION_REMAINING;
+        }
         if let Some(dispatch) = &*self.dispatch.borrow() {
             *dispatch.test.clock.lock().unwrap() = Some(observation.captured.into_std());
         }
@@ -399,6 +413,7 @@ impl Host for Fake {
             written: self.written.clone(),
             dispatch: dispatch.clone(),
             late: self.late_write,
+            queued_lag: self.queued_write_lag,
         };
         Ok(Pipes {
             stdout,
@@ -407,13 +422,22 @@ impl Host for Fake {
         })
     }
 
-    async fn resume(&self, _: &FakeSlot) -> Result<(), NativeRefusal> {
-        self.step(Step::Resume)?;
-        self.checkpoint(Step::Resume).await;
-        if self.cancel_on_resume {
-            self.cancel.cancel();
+    fn resume(&self, _: &FakeSlot) -> impl Future<Output = Result<(), NativeRefusal>> {
+        if let Some(lag) = self.pre_resume_lag {
+            // Simulate preemption after sampling and before the first resume
+            // poll. The resume effect itself remains inside that future.
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let _ = std::pin::pin!(tokio::time::advance(lag)).poll(&mut cx);
+            self.owner_active.set(true);
         }
-        Ok(())
+        async move {
+            self.step(Step::Resume)?;
+            self.checkpoint(Step::Resume).await;
+            if self.cancel_on_resume {
+                self.cancel.cancel();
+            }
+            Ok(())
+        }
     }
 
     async fn verify_opens(&self, _: &FakeSlot, _: &FakeOpens) -> Result<(), NativeRefusal> {
@@ -1008,6 +1032,162 @@ fn assert_activity_refusal_without_qmp_writes(host: &Fake, result: TrialResult) 
     assert!(
         host.steps()
             .ends_with(&[Step::Resume, Step::Stop, Step::Reopen, Step::Settle])
+    );
+}
+
+const OBSERVATION_REMAINING: Duration = Duration::from_millis(10);
+const EXPIRED_AFTER: Duration = Duration::from_millis(11);
+
+#[tokio::test(start_paused = true)]
+async fn expiring_observation_gates_the_first_resume_poll() {
+    for (lag, resumed) in [
+        (Duration::from_millis(9), true),
+        (OBSERVATION_REMAINING, false),
+        (EXPIRED_AFTER, false),
+    ] {
+        let mut host = Fake {
+            expiring_sample: Some(3),
+            pre_resume_lag: Some(lag),
+            ..Fake::default()
+        };
+        assert_eq!(
+            host.run().await,
+            TrialResult {
+                paused: Err(Failure::OwnerActive),
+                release: StopDisposition::DirtyRelease,
+            },
+        );
+        let steps = host.steps();
+        assert_eq!(steps.contains(&Step::Resume), resumed, "{lag:?}");
+        assert!(steps.ends_with(&[Step::Stop, Step::Reopen, Step::Settle]));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiring_observation_gates_proof_completion_and_pause_acceptance() {
+    for (proof, sample_call) in [(Step::VerifyOpens, 6), (Step::VerifyWhpx, 7)] {
+        let (signal, receiver) = tokio::sync::oneshot::channel();
+        let mut host = Fake {
+            expiring_sample: Some(sample_call),
+            proof_notification: Some(ProofNotification {
+                step: proof,
+                receiver: RefCell::new(Some(receiver)),
+            }),
+            ..Fake::default()
+        };
+        let (result, ()) = tokio::join!(biased; host.run(), async {
+            tokio::time::advance(EXPIRED_AFTER).await;
+            let _ = signal.send(());
+        });
+        // The proof holds simulated RAM until its completion poll. A
+        // replacement observation must see that RAM before it is released.
+        assert_eq!(
+            result,
+            TrialResult {
+                paused: Err(Failure::Refused(RESERVES)),
+                release: StopDisposition::DirtyRelease,
+            },
+            "{proof:?}",
+        );
+        assert!(
+            host.steps()
+                .ends_with(&[proof, Step::Stop, Step::Reopen, Step::Settle])
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiring_observation_while_a_proof_returns_ready_requires_resampling() {
+    let cancel = Shutdown::default();
+    let now = Tick::now();
+    let captured = now - (FRESHNESS - OBSERVATION_REMAINING);
+    let gate = LivePoll::new(
+        &cancel,
+        &|| Err(Failure::OwnerActive),
+        Freshness::new(captured, now, now + BUDGET),
+    );
+    let result = gate
+        .watch(poll_fn(|cx| {
+            // Start the poll with valid evidence, then cross expiry before
+            // the result is available to the accepting caller.
+            let _ = std::pin::pin!(tokio::time::advance(EXPIRED_AFTER)).poll(cx);
+            Poll::Ready(Ok(()))
+        }))
+        .await;
+    assert_eq!(result, Err(Failure::OwnerActive));
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiring_observation_in_the_final_sample_prevents_accepting_pause() {
+    let mut host = Fake {
+        live_override: Some((8, |sample| sample.captured -= FRESHNESS)),
+        ..Fake::default()
+    };
+    assert_eq!(
+        host.run().await,
+        TrialResult {
+            paused: Err(Failure::Refused(RESERVES)),
+            release: StopDisposition::DirtyRelease,
+        },
+    );
+    assert!(
+        host.steps()
+            .ends_with(&[Step::VerifyWhpx, Step::Stop, Step::Reopen, Step::Settle])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiring_observation_prevents_a_qmp_command_after_readiness() {
+    let replies = format!("{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n");
+    let mut host = Fake {
+        reader_override: RefCell::new(Some(Box::new(AdvancingGreeting {
+            elapsed: Some(EXPIRED_AFTER),
+            replies: Cursor::new(replies.into_bytes()),
+        }))),
+        expiring_sample: Some(4),
+        live_override: Some((5, |sample| sample.idle = false)),
+        ..Fake::default()
+    };
+    let result = host.run().await;
+    assert_activity_refusal_without_qmp_writes(&host, result);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_qmp_write_cannot_outlive_its_observation_or_pressure_deadline() {
+    for (expiring_sample, lag) in [
+        (Some(4), EXPIRED_AFTER),
+        (None, PRESSURE_INTERVAL + Duration::from_millis(1)),
+    ] {
+        let mut host = Fake {
+            expiring_sample,
+            queued_write_lag: Some(lag),
+            ..Fake::default()
+        };
+        assert_eq!(
+            host.run().await,
+            TrialResult {
+                paused: Err(Failure::Qmp(ChannelError::Io)),
+                release: StopDisposition::DirtyRelease,
+            }
+        );
+        assert!(host.written.borrow().is_empty());
+        assert!(
+            host.steps()
+                .ends_with(&[Step::Resume, Step::Stop, Step::Reopen, Step::Settle])
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_healthy_delayed_greeting_arms_from_fresh_evidence_at_dispatch() {
+    let mut host = Fake {
+        greeting_delay: Some(PRESSURE_INTERVAL + Duration::from_millis(50)),
+        ..Fake::default()
+    };
+    assert_eq!(host.run().await.paused, Ok(()));
+    assert_eq!(
+        host.written.borrow().as_slice(),
+        b"{\"execute\":\"qmp_capabilities\",\"id\":1}\r\n{\"execute\":\"query-status\",\"id\":2}\r\n"
     );
 }
 
