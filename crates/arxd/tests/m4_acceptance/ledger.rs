@@ -183,28 +183,63 @@ impl PairProof {
 impl Ledger {
     /// The real foreground sweeps at startup. Check a stopped store before
     /// launching it, so a wrong profile cannot sweep someone else's VMs.
-    pub fn preflight(state: &Path, root: &Path) -> Result<()> {
+    pub fn preflight(state: &Path, recipes: [(&str, &str); 2]) -> Result<()> {
         let _state = pin_root(state)?;
-        let _media = pin_root(root)?;
         match state.join("activity.sqlite3").symlink_metadata() {
-            Ok(_) => Self::open(state, root.to_path_buf())?.quiet(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                for entry in safe(read_dir(state), "fresh_state")?.take(2) {
-                    check(safe(entry, "fresh_state")?.path() == root, "fresh_state")?;
+            Ok(_) => {
+                for suffix in ["-journal", "-wal", "-shm"] {
+                    match state
+                        .join(format!("activity.sqlite3{suffix}"))
+                        .symlink_metadata()
+                    {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        _ => return Err(Failure::Check("unsettled_startup_ledger")),
+                    }
                 }
+                let ledger = Self::open(state)?;
+                ledger.quiet()?;
+                let templates = ledger.goldens()?;
                 check(
-                    safe(read_dir(root), "fresh_media")?.next().is_none(),
-                    "fresh_media",
-                )
+                    templates.len() <= recipes.len(),
+                    "isolated_golden_inventory",
+                )?;
+                let mut selected = Vec::new();
+                for template in templates {
+                    let guest = safe(
+                        ledger.db.query_row(
+                            "SELECT guest FROM vm_templates WHERE id=?1",
+                            [template],
+                            |row| row.get::<_, i64>(0),
+                        ),
+                        "golden_guest",
+                    )?;
+                    let (recipe, pin) = match guest {
+                        1 => recipes[0],
+                        2 => recipes[1],
+                        _ => return Err(Failure::Check("golden_guest")),
+                    };
+                    let (pair, _) = ledger.golden(template, recipe, pin, guest)?;
+                    ledger.inspect(&pair, None, true)?;
+                    selected.push(pair);
+                }
+                ledger.inventory(&selected.iter().collect::<Vec<_>>())
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => check(
+                safe(read_dir(state), "fresh_state")?.next().is_none(),
+                "fresh_state",
+            ),
             Err(_) => Err(Failure::Check("ledger_preflight")),
         }
     }
-    pub fn open(state: &Path, root: PathBuf) -> Result<Self> {
-        let mut pins = pin_root(state)?;
-        pins.extend(pin_root(&root)?);
+
+    pub fn open(state: &Path) -> Result<Self> {
+        let pins = pin_root(state)?;
         let path = state.join("activity.sqlite3");
         let database = open(&path, false, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+        check(
+            safe(database.metadata(), "ledger_metadata")?.len() <= 4 * 1024 * 1024,
+            "ledger_size_bound",
+        )?;
         for suffix in ["-journal", "-wal", "-shm"] {
             let sidecar = state.join(format!("activity.sqlite3{suffix}"));
             match sidecar.symlink_metadata() {
@@ -253,7 +288,7 @@ impl Ledger {
         )?;
         Ok(Self {
             db,
-            root,
+            root: state.to_path_buf(),
             _pins: pins,
             database,
         })
@@ -622,7 +657,12 @@ impl Ledger {
         for (number, entry) in safe(read_dir(&self.root), "media_inventory")?.enumerate() {
             check(number < 256, "media_inventory_bound")?;
             let dir = safe(entry, "media_inventory")?.path();
-            let name = json!(dir.file_name().and_then(|name| name.to_str()));
+            let name = dir.file_name().and_then(|name| name.to_str());
+            if matches!(name, Some("activity.sqlite3" | "activity.lock")) {
+                open(&dir, false, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+                continue;
+            }
+            let name = json!(name);
             check(opaque(&name, 32).is_some(), "unattributed_media")?;
             let _dir = open(&dir, true, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
             for entry in safe(read_dir(&dir), "media_inventory")? {
@@ -636,39 +676,68 @@ impl Ledger {
 }
 
 #[test]
-fn startup_preflight_refuses_existing_vms_and_untracked_media() {
+fn startup_preflight_refuses_occupied_or_foreign_inventory() {
     let temporary = tempfile::tempdir().unwrap();
-    let state = temporary.path().join("state");
-    let media = temporary.path().join("media");
-    std::fs::create_dir(&state).unwrap();
-    std::fs::create_dir(&media).unwrap();
-    assert_eq!(Ledger::preflight(&state, &media), Ok(()));
+    let state = temporary.path();
+    let recipes = [("ubuntu", "unused"), ("windows", "unused")];
+    assert_eq!(Ledger::preflight(state, recipes), Ok(()));
 
-    let orphan = media.join("untracked");
+    let orphan = state.join("untracked");
     std::fs::write(&orphan, b"fixture").unwrap();
     assert_eq!(
-        Ledger::preflight(&state, &media),
-        Err(Failure::Check("fresh_media"))
+        Ledger::preflight(state, recipes),
+        Err(Failure::Check("fresh_state"))
     );
-    std::fs::remove_file(&orphan).unwrap();
 
     let database = Connection::open(state.join("activity.sqlite3")).unwrap();
     database
         .execute_batch(
             "PRAGMA user_version=11;
-             CREATE TABLE vm_instances (id INTEGER);
-             INSERT INTO vm_instances VALUES (1);
-             CREATE TABLE vm_static_instances (id INTEGER);
-             CREATE TABLE vm_restore_points (id INTEGER);
-             CREATE TABLE vm_snapshot_work (id INTEGER);
-             CREATE TABLE vm_build_intents (state TEXT);
-             CREATE TABLE vm_operations (status INTEGER);
-             CREATE TABLE vm_disk_claims (id INTEGER);",
+         CREATE TABLE vm_instances (id INTEGER);
+         CREATE TABLE vm_static_instances (id INTEGER);
+         CREATE TABLE vm_restore_points (id INTEGER);
+         CREATE TABLE vm_snapshot_work (id INTEGER);
+         CREATE TABLE vm_build_intents (state TEXT);
+         CREATE TABLE vm_operations (status INTEGER);
+         CREATE TABLE vm_disk_claims (id INTEGER);
+         CREATE TABLE vm_templates (id BLOB);
+         CREATE TABLE vm_artifacts (id BLOB);",
         )
         .unwrap();
     drop(database);
+
+    let sidecar = state.join("activity.sqlite3-journal");
+    std::fs::write(&sidecar, b"fixture").unwrap();
     assert_eq!(
-        Ledger::preflight(&state, &media),
+        Ledger::preflight(state, recipes),
+        Err(Failure::Check("unsettled_startup_ledger"))
+    );
+    std::fs::remove_file(sidecar).unwrap();
+
+    // The same foreign file must also fail with an existing, idle ledger.
+    assert_eq!(
+        Ledger::preflight(state, recipes),
+        Err(Failure::Check("unattributed_media"))
+    );
+    std::fs::remove_file(&orphan).unwrap();
+    let dir = state.join("aa".repeat(16));
+    std::fs::create_dir(&dir).unwrap();
+    let orphan = dir.join("untracked");
+    std::fs::write(&orphan, b"fixture").unwrap();
+    assert_eq!(
+        Ledger::preflight(state, recipes),
+        Err(Failure::Check("unattributed_media"))
+    );
+    std::fs::remove_file(&orphan).unwrap();
+    assert_eq!(Ledger::preflight(state, recipes), Ok(()));
+
+    let database = Connection::open(state.join("activity.sqlite3")).unwrap();
+    database
+        .execute("INSERT INTO vm_instances VALUES (1)", [])
+        .unwrap();
+    drop(database);
+    assert_eq!(
+        Ledger::preflight(state, recipes),
         Err(Failure::Check("ledger_not_isolated"))
     );
 }

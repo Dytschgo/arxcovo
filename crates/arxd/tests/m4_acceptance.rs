@@ -16,6 +16,14 @@ enum Failure {
     MissingTool(&'static str),
     SchemaChanged(&'static str),
     AdmissionClosed(&'static str),
+    DaemonQualificationEvidenceUnavailable,
+    DaemonQualificationEvidenceMismatch,
+    SessionProcessEvidenceUnavailable,
+    SessionProcessMismatch,
+    WindowsBootEvidenceUnavailable,
+    WindowsBootEvidenceMismatch,
+    LeaseClockDisagreement,
+    LeaseEndedEarly,
     Timeout(&'static str),
     Check(&'static str),
 }
@@ -184,6 +192,142 @@ fn opaque(value: &Value, len: usize) -> Option<&str> {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
+}
+
+// The 7c receipt adapter must read this projection from the process-verified
+// session. A plan pin is an expectation only, never the attested digest.
+fn qualification_digest<'a>(
+    catalog: &'a Value,
+    expected_digest: Option<&str>,
+    expected_recipes: [(&str, &str, &str); 2],
+) -> Result<&'a str> {
+    let selected = &catalog["capability"]["selected_test_qualification"];
+    let digest =
+        opaque(&selected["sha256"], 64).ok_or(Failure::DaemonQualificationEvidenceUnavailable)?;
+    let scopes = selected["recipes"]
+        .as_array()
+        .ok_or(Failure::DaemonQualificationEvidenceUnavailable)?;
+    if expected_digest != Some(digest)
+        || scopes.len() != expected_recipes.len()
+        || !expected_recipes.into_iter().all(|(guest, id, pin)| {
+            scopes
+                .iter()
+                .filter(|entry| {
+                    entry["guest"] == guest
+                        && entry["recipe_id"] == id
+                        && entry["recipe_sha256"] == pin
+                })
+                .count()
+                == 1
+        })
+    {
+        return Err(Failure::DaemonQualificationEvidenceMismatch);
+    }
+    Ok(digest)
+}
+
+fn bind_session_process(expected: u32, connected_peer: Option<u32>) -> Result<()> {
+    let peer = connected_peer.ok_or(Failure::SessionProcessEvidenceUnavailable)?;
+    if expected == 0 || peer != expected {
+        return Err(Failure::SessionProcessMismatch);
+    }
+    Ok(())
+}
+
+fn windows_boot_witness<'a>(
+    status: &'a Value,
+    vm_id: &str,
+    generation: &str,
+    start: &str,
+) -> Result<&'a str> {
+    let receipt = &status["native_boot_witness"];
+    let witness =
+        opaque(&receipt["witness_id"], 32).ok_or(Failure::WindowsBootEvidenceUnavailable)?;
+    if receipt["source"] != "guest_ready_handshake"
+        || receipt["vm_id"] != vm_id
+        || receipt["generation"] != generation
+        || receipt["operation_id"] != start
+        || witness == start
+    {
+        return Err(Failure::WindowsBootEvidenceMismatch);
+    }
+    Ok(witness)
+}
+
+const LEASE_CLOCK_TOLERANCE_MS: i64 = 1_000;
+
+#[derive(Clone, Copy)]
+struct ClockSample {
+    utc_ms: i64,
+    monotonic: Instant,
+}
+
+struct LeaseClock {
+    origin: ClockSample,
+    utc_deadline: i64,
+    monotonic_deadline: Instant,
+}
+
+impl LeaseClock {
+    fn new(
+        origin: ClockSample,
+        utc_deadline: i64,
+        ttl: Duration,
+        dispatch_bound: Duration,
+    ) -> Result<Self> {
+        let delta = i128::from(utc_deadline) - i128::from(origin.utc_ms);
+        let delay = u64::try_from(delta)
+            .map(Duration::from_millis)
+            .map_err(|_| Failure::Check("lease_deadline_bound"))?;
+        check(
+            delay >= ttl && delay <= ttl + dispatch_bound,
+            "lease_deadline_bound",
+        )?;
+        Ok(Self {
+            origin,
+            utc_deadline,
+            monotonic_deadline: origin.monotonic + delay,
+        })
+    }
+
+    fn check_clock(&self, now: ClockSample) -> Result<()> {
+        let utc = i128::from(now.utc_ms) - i128::from(self.origin.utc_ms);
+        let monotonic = now
+            .monotonic
+            .checked_duration_since(self.origin.monotonic)
+            .ok_or(Failure::LeaseClockDisagreement)?
+            .as_millis() as i128;
+        if (utc - monotonic).abs() > i128::from(LEASE_CLOCK_TOLERANCE_MS) {
+            return Err(Failure::LeaseClockDisagreement);
+        }
+        Ok(())
+    }
+
+    fn observe(&self, status: &Value, now: ClockSample) -> Result<bool> {
+        self.check_clock(now)?;
+        match status["state"].as_str() {
+            Some("stopped") => {
+                check(
+                    status["expires_at_ms"] == self.utc_deadline,
+                    "lease_changed",
+                )?;
+                Ok(false)
+            }
+            Some(state @ ("expired" | "teardown")) => {
+                if now.utc_ms < self.utc_deadline || now.monotonic < self.monotonic_deadline {
+                    return Err(Failure::LeaseEndedEarly);
+                }
+                if state == "teardown" {
+                    check(
+                        status["expires_at_ms"] == self.utc_deadline,
+                        "lease_changed",
+                    )?;
+                }
+                Ok(state == "expired")
+            }
+            _ => Err(Failure::Check("expiry_state")),
+        }
+    }
 }
 
 fn retry_unchanged(
@@ -374,4 +518,134 @@ fn retry_needs_same_receipt_and_unchanged_effect() {
     let mut duplicate = effect.clone();
     duplicate["vm_count"] = json!(2);
     assert!(retry_unchanged(&original, &original, &effect, &duplicate).is_err());
+}
+
+#[test]
+fn open_catalog_requires_the_daemons_selected_record_and_exact_test_scopes() {
+    let pin = "aa".repeat(32);
+    let recipe = "11".repeat(16);
+    let second = "22".repeat(16);
+    let digest = "bb".repeat(32);
+    let expected = [
+        ("ubuntu", recipe.as_str(), pin.as_str()),
+        ("windows", second.as_str(), pin.as_str()),
+    ];
+    let mut catalog = json!({"capability":{"available":true}});
+    assert_eq!(
+        qualification_digest(&catalog, Some(&digest), expected),
+        Err(Failure::DaemonQualificationEvidenceUnavailable)
+    );
+    catalog["capability"]["selected_test_qualification"] = json!({
+        "sha256":digest,"recipes":[
+            {"guest":"ubuntu","recipe_id":recipe,"recipe_sha256":pin},
+            {"guest":"windows","recipe_id":second,"recipe_sha256":pin}
+        ]
+    });
+    assert_eq!(
+        qualification_digest(&catalog, Some(&digest), expected),
+        Ok(digest.as_str())
+    );
+    assert_eq!(
+        qualification_digest(&catalog, Some(&"cc".repeat(32)), expected),
+        Err(Failure::DaemonQualificationEvidenceMismatch)
+    );
+    assert_eq!(
+        qualification_digest(&catalog, None, expected),
+        Err(Failure::DaemonQualificationEvidenceMismatch)
+    );
+    catalog["capability"]["selected_test_qualification"]["recipes"][1]["recipe_sha256"] =
+        json!("dd".repeat(32));
+    assert_eq!(
+        qualification_digest(&catalog, Some(&digest), expected),
+        Err(Failure::DaemonQualificationEvidenceMismatch)
+    );
+}
+
+#[test]
+fn session_binding_refuses_unavailable_and_wrong_peer_pid() {
+    assert_eq!(
+        bind_session_process(18, None),
+        Err(Failure::SessionProcessEvidenceUnavailable)
+    );
+    assert_eq!(
+        bind_session_process(18, Some(19)),
+        Err(Failure::SessionProcessMismatch)
+    );
+    assert_eq!(bind_session_process(18, Some(18)), Ok(()));
+}
+
+#[test]
+fn windows_ready_flag_and_admission_epoch_are_insufficient() {
+    let vm = "11".repeat(16);
+    let generation = "22".repeat(16);
+    let start = "33".repeat(16);
+    let witness = "44".repeat(16);
+    let mut status = json!({"state":"running","ready":true,"operation_id":start});
+    assert_eq!(
+        windows_boot_witness(&status, &vm, &generation, &start),
+        Err(Failure::WindowsBootEvidenceUnavailable)
+    );
+    status["native_boot_witness"] = json!({"source":"guest_ready_handshake","vm_id":vm,
+        "generation":generation,"operation_id":start,"witness_id":witness});
+    assert_eq!(
+        windows_boot_witness(&status, &vm, &generation, &start),
+        Ok(witness.as_str())
+    );
+    for (field, mismatched) in [
+        ("vm_id", &generation),
+        ("generation", &vm),
+        ("operation_id", &vm),
+        ("witness_id", &start),
+    ] {
+        let mut wrong = status.clone();
+        wrong["native_boot_witness"][field] = json!(mismatched);
+        assert_eq!(
+            windows_boot_witness(&wrong, &vm, &generation, &start),
+            Err(Failure::WindowsBootEvidenceMismatch)
+        );
+    }
+}
+
+#[test]
+fn lease_refuses_clock_steps_early_teardown_and_changed_deadline() {
+    let origin = ClockSample {
+        utc_ms: 100_000,
+        monotonic: Instant::now(),
+    };
+    let ttl = Duration::from_secs(60);
+    let lease = LeaseClock::new(origin, 160_000, ttl, Duration::from_secs(15)).unwrap();
+    assert!(LeaseClock::new(origin, 176_000, ttl, Duration::from_secs(15)).is_err());
+    let now = |elapsed, utc_ms| ClockSample {
+        utc_ms,
+        monotonic: origin.monotonic + Duration::from_secs(elapsed),
+    };
+    let live = json!({"state":"stopped","expires_at_ms":160_000});
+    let expired = json!({"state":"expired"});
+    let teardown = json!({"state":"teardown","expires_at_ms":160_000});
+    assert_eq!(lease.observe(&live, now(10, 110_000)), Ok(false));
+    assert_eq!(
+        lease.observe(&expired, now(10, 160_000)),
+        Err(Failure::LeaseClockDisagreement)
+    );
+    assert_eq!(
+        lease.observe(&live, now(10, 108_000)),
+        Err(Failure::LeaseClockDisagreement)
+    );
+    assert_eq!(
+        lease.observe(&expired, now(10, 110_000)),
+        Err(Failure::LeaseEndedEarly)
+    );
+    assert_eq!(
+        lease.observe(&teardown, now(59, 159_000)),
+        Err(Failure::LeaseEndedEarly)
+    );
+    assert_eq!(lease.observe(&teardown, now(61, 161_000)), Ok(false));
+    assert_eq!(lease.observe(&expired, now(61, 161_000)), Ok(true));
+    assert_eq!(
+        lease.observe(
+            &json!({"state":"stopped","expires_at_ms":160_001}),
+            now(10, 110_000)
+        ),
+        Err(Failure::Check("lease_changed"))
+    );
 }

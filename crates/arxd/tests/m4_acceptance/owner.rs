@@ -1,15 +1,12 @@
 use super::*;
+use arxd::vm::paths::LocalPath;
 use ledger::{Claim, Id, Ledger, Pair, PairProof, config, digest, id, open, pin_root, safe};
-use rmcp::{
-    RoleClient, ServiceExt, model::CallToolRequestParams, service::RunningService,
-    transport::async_rw::AsyncRwTransport,
-};
+use rmcp::{RoleClient, model::CallToolRequestParams, service::RunningService};
 use serde::Deserialize;
 use std::{
     env,
     fs::{self, File, OpenOptions},
     io::Write,
-    os::windows::io::{AsRawHandle, FromRawHandle},
     path::{Path, PathBuf},
     process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
@@ -19,15 +16,9 @@ use tokio::{
     time::timeout,
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_FILE_NOT_FOUND, GetLastError, INVALID_HANDLE_VALUE},
-    Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SECURITY_ANONYMOUS,
-        SECURITY_SQOS_PRESENT,
-    },
-    System::{
-        Console::*,
-        Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW},
-    },
+    Foundation::{ERROR_FILE_NOT_FOUND, GetLastError},
+    Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE},
+    System::{Console::*, Pipes::WaitNamedPipeW},
 };
 
 mod ledger;
@@ -47,9 +38,7 @@ struct Plan {
     daemon_sha256: String,
     daemon_config: PathBuf,
     client_config: PathBuf,
-    qualification: Option<PathBuf>,
     qualification_sha256: Option<String>,
-    artifact_root: PathBuf,
     evidence_dir: PathBuf,
     ubuntu: Recipe,
     windows: Recipe,
@@ -82,6 +71,12 @@ struct VmProfile {
     #[serde(default)]
     allow_agent_public_sites: bool,
     publication: Option<Value>,
+    runtime: Option<RuntimeRoot>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeRoot {
+    state: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -141,6 +136,13 @@ fn fresh() -> Result<Id> {
 fn now_ms() -> Result<i64> {
     let duration = safe(SystemTime::now().duration_since(UNIX_EPOCH), "utc_clock")?;
     safe(i64::try_from(duration.as_millis()), "utc_clock")
+}
+
+fn clock_sample() -> Result<ClockSample> {
+    Ok(ClockSample {
+        monotonic: Instant::now(),
+        utc_ms: now_ms()?,
+    })
 }
 
 type Client = RunningService<RoleClient, ()>;
@@ -349,8 +351,8 @@ impl Acceptance<'_> {
     }
 
     async fn clone(&mut self, golden: &Golden, guest: Guest, ttl: i64, replay: bool) -> Result<Vm> {
-        let issued_at = now_ms()?;
-        let lease_clock = Instant::now();
+        let issued_at = clock_sample()?;
+        let ttl_duration = Duration::from_secs(ttl as u64);
         let template = hex::encode(golden.template);
         let (completed, receipt, args) = self
             .operation(
@@ -371,11 +373,11 @@ impl Acceptance<'_> {
                 && status["ready"] == false
                 && status["guest"] == guest.label()
                 && status["template_id"] == template
-                && status["expires_at_ms"] == completed["expires_at_ms"]
-                && deadline >= issued_at + ttl * 1_000
-                && deadline <= now_ms()? + ttl * 1_000,
+                && status["expires_at_ms"] == completed["expires_at_ms"],
             "clone_lease",
         )?;
+        let lease = LeaseClock::new(issued_at, deadline, ttl_duration, RPC)?;
+        lease.check_clock(clock_sample()?)?;
         let pair = self.ledger.vm_pair(vm)?;
         self.ledger.distinct(&golden.pair, &pair)?;
         let proof = self.ledger.inspect(&pair, Some(&golden.pair), false)?;
@@ -417,12 +419,12 @@ impl Acceptance<'_> {
         Ok(Vm {
             id: vm,
             deadline,
-            earliest_expiry: lease_clock + Duration::from_secs(ttl as u64),
+            lease,
             pair,
         })
     }
 
-    async fn start(&mut self, vm: &Vm) -> Result<Id> {
+    async fn start(&mut self, vm: &Vm, guest: Guest) -> Result<Id> {
         let args = json!({"vm_id":hex::encode(vm.id)});
         let (started, _, _) = self.operation(Action::Start, args, VM_WORK).await?;
         succeeded(&started)?;
@@ -435,6 +437,19 @@ impl Acceptance<'_> {
         )?;
         let epoch = id(&started, "operation_id")?;
         self.ledger.release(&vm.pair, epoch, false)?;
+        if matches!(guest, Guest::Windows) {
+            let witness = windows_boot_witness(
+                &state,
+                &hex::encode(vm.id),
+                &hex::encode(Ledger::generation(&vm.pair)),
+                &hex::encode(epoch),
+            )?;
+            self.evidence.record(
+                "windows_native_boot",
+                json!({"vm_id":hex::encode(vm.id),
+                "operation_id":hex::encode(epoch),"witness_id":witness}),
+            );
+        }
         self.evidence.record(
             "ready_boot",
             json!({"vm_id":hex::encode(vm.id),
@@ -485,21 +500,32 @@ impl Acceptance<'_> {
         )
     }
 
-    async fn expiry(&mut self, vm: &Vm, extra: Option<&Pair>) -> Result<i64> {
-        // Read the real lease from the daemon and wait on both wall and
-        // monotonic clocks. A forward clock jump cannot stand in for a lease.
-        let remaining = vm.deadline - now_ms()?;
-        let until = Instant::now() + Duration::from_millis(remaining.max(0) as u64);
-        tokio::time::sleep_until(until.max(vm.earliest_expiry)).await;
-        let tombstone = poll("lease_sweep", EXPIRY_GRACE, TICK, || async {
-            let status = self.vm(vm.id).await?;
-            match status["state"].as_str() {
-                Some("expired") => Ok(Some(status)),
-                Some("stopped" | "teardown") => Ok(None),
-                _ => Err(Failure::Check("expiry_state")),
+    async fn expiry(&mut self, vm: &Vm, extra: Option<&Pair>, later: Option<&Vm>) -> Result<i64> {
+        // Poll through the lease. Keep the two stopped VMs under observation
+        // while waiting for Ubuntu so an early Windows expiry also fails.
+        let cutoff = vm.lease.monotonic_deadline + EXPIRY_GRACE;
+        let tombstone = timeout_at(cutoff, async {
+            loop {
+                vm.lease.check_clock(clock_sample()?)?;
+                let status = self.vm(vm.id).await?;
+                let expired = vm.lease.observe(&status, clock_sample()?)?;
+                if let Some(later) = later {
+                    later.lease.check_clock(clock_sample()?)?;
+                    let later_status = self.vm(later.id).await?;
+                    later.lease.observe(&later_status, clock_sample()?)?;
+                    check(
+                        later_status["state"] == "stopped",
+                        "later_lease_not_stopped",
+                    )?;
+                }
+                if expired {
+                    return Ok(status);
+                }
+                sleep(TICK).await;
             }
         })
-        .await?;
+        .await
+        .map_err(|_| Failure::Timeout("lease_sweep"))??;
         let activity = tombstone["cleanup_activity_id"]
             .as_i64()
             .filter(|n| *n > 0)
@@ -507,9 +533,11 @@ impl Acceptance<'_> {
         let expired = tombstone["expired_at_ms"]
             .as_i64()
             .ok_or(Failure::Check("expired_at"))?;
+        let now = clock_sample()?;
+        vm.lease.check_clock(now)?;
         check(
             expired >= vm.deadline
-                && expired <= now_ms()?
+                && expired <= now.utc_ms
                 && tombstone["cleanup"] == "confirmed"
                 && tombstone["ready"] == false,
             "expiry_proof",
@@ -578,11 +606,27 @@ struct Golden {
 struct Vm {
     id: Id,
     deadline: i64,
-    earliest_expiry: Instant,
+    lease: LeaseClock,
     pair: Pair,
 }
 
-async fn catalog(client: &Client, plan: &Plan) -> Result<Vec<Value>> {
+fn selected_digest<'a>(reply: &'a Value, plan: &Plan) -> Result<&'a str> {
+    assert_admitted(reply)?;
+    qualification_digest(
+        reply,
+        plan.qualification_sha256.as_deref(),
+        [
+            ("ubuntu", &plan.ubuntu.recipe_id, &plan.ubuntu.recipe_sha256),
+            (
+                "windows",
+                &plan.windows.recipe_id,
+                &plan.windows.recipe_sha256,
+            ),
+        ],
+    )
+}
+
+async fn catalog(client: &Client, plan: &Plan) -> Result<(Vec<Value>, String)> {
     let mut cursor = Value::Null;
     let mut entries = Vec::new();
     for _ in 0..4 {
@@ -592,7 +636,7 @@ async fn catalog(client: &Client, plan: &Plan) -> Result<Vec<Value>> {
             json!({"cursor":cursor})
         };
         let result = rpc(client, "vm_catalog", args).await?;
-        assert_admitted(&result)?;
+        let selected = selected_digest(&result, plan)?;
         check(result["arch"] == "x86_64", "catalog_arch")?;
         let page = result["entries"]
             .as_array()
@@ -617,7 +661,7 @@ async fn catalog(client: &Client, plan: &Plan) -> Result<Vec<Value>> {
                     return Err(Failure::AdmissionClosed("recipe_unqualified"));
                 }
             }
-            return Ok(entries);
+            return Ok((entries, selected.to_owned()));
         }
         check(
             cursor.as_str().is_some_and(|value| {
@@ -688,7 +732,7 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
     let changed = hex::encode(fresh()?);
     check(changed != u_marker, "unique_break_marker")?;
     let path = format!("/var/tmp/arxcovo-m4-{u_marker}");
-    let u_first = accept.start(&u).await?;
+    let u_first = accept.start(&u, Guest::Ubuntu).await?;
     accept.script(&u, format!(
         "set -euC\numask 077\nprintf '%s' '{u_marker}' > '{path}'\ncat /proc/sys/kernel/random/boot_id > '{path}.boot'\ntest \"$(cat '{path}')\" = '{u_marker}'"
     ), 0).await?;
@@ -696,7 +740,7 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
     let baseline = accept.ledger.inspect(&u.pair, Some(&ubuntu.pair), false)?;
 
     let w_marker = hex::encode(fresh()?);
-    let w_boot = accept.start(&w).await?;
+    let w_boot = accept.start(&w, Guest::Windows).await?;
     accept.script(&w, format!(
         "$ErrorActionPreference='Stop'\n$p=[IO.Path]::Combine($env:TEMP,'arxcovo-m4-{w_marker}')\nif ([IO.File]::Exists($p)) {{ exit 2 }}\n[IO.File]::WriteAllText($p,'{w_marker}')\nif ([IO.File]::ReadAllText($p) -cne '{w_marker}') {{ exit 3 }}\nexit 0"
     ),0).await?;
@@ -733,7 +777,7 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
     accept.evidence.record("snapshot_pair", json!({"snapshot_id":hex::encode(point),
         "generation":hex::encode(Ledger::generation(&snapshot)),"charge":charge,"pair":saved.evidence()}));
 
-    let broken_boot = accept.start(&u).await?;
+    let broken_boot = accept.start(&u, Guest::Ubuntu).await?;
     check(broken_boot != u_first, "break_fresh_boot")?;
     accept.script(&u,format!(
         "set -eu\nold=$(cat '{path}.boot')\nnew=$(cat /proc/sys/kernel/random/boot_id)\ntest -n \"$old\" && test -n \"$new\" && test \"$old\" != \"$new\" || exit 2\ntest \"$(cat '{path}')\" = '{u_marker}' || exit 3\nprintf '%s' '{changed}' > '{path}'\ntest \"$(cat '{path}')\" = '{changed}'"
@@ -793,7 +837,7 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
         "snapshot_id":hex::encode(point),"pair":current.evidence()}),
     );
 
-    let recovered_boot = accept.start(&u).await?;
+    let recovered_boot = accept.start(&u, Guest::Ubuntu).await?;
     check(
         recovered_boot != broken_boot && recovered_boot != u_first,
         "restore_fresh_boot",
@@ -804,7 +848,7 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
     accept.stop(&u, recovered_boot).await?;
 
     accept.stopped(&w).await?;
-    let u_expiry = accept.expiry(&u, Some(&snapshot)).await?;
+    let u_expiry = accept.expiry(&u, Some(&snapshot), Some(&w)).await?;
     let snapshot_cleanup = accept.ledger.reconciled(
         u.id,
         Ledger::generation(&snapshot),
@@ -826,7 +870,7 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
     accept
         .evidence
         .record("windows_still_charged", windows_charge.evidence());
-    accept.expiry(&w, None).await?;
+    accept.expiry(&w, None, None).await?;
 
     for (golden, recipe, guest) in [
         (&ubuntu, &plan.ubuntu, Guest::Ubuntu),
@@ -938,67 +982,38 @@ fn require_unused(endpoint: &str) -> Result<()> {
 }
 
 async fn ready(daemon: &mut Child, endpoint: &str) -> Result<()> {
-    let wide = pipe_name(endpoint);
+    let name = pipe_name(endpoint);
     timeout(RPC, async {
         loop {
             check(
                 safe(daemon.try_wait(), "foreground_status")?.is_none(),
                 "foreground_startup",
             )?;
-            if unsafe { WaitNamedPipeW(wide.as_ptr(), 1) } != 0 {
-                break;
+            if unsafe { WaitNamedPipeW(name.as_ptr(), 1) } != 0 {
+                return Ok(());
             }
             sleep(Duration::from_millis(50)).await;
         }
-        // The unauthenticated pipe probe identifies the actual pipe
-        // server. It is dropped before the one authenticated MCP session.
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                0x12019b,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
-                std::ptr::null_mut(),
-            )
-        };
-        check(handle != INVALID_HANDLE_VALUE, "foreground_pipe_probe")?;
-        let pipe = unsafe { File::from_raw_handle(handle) };
-        let mut process = 0;
-        check(
-            unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut process) } != 0
-                && daemon.id() == Some(process),
-            "foreground_pipe_process",
-        )
     })
     .await
     .map_err(|_| Failure::Timeout("foreground_listener"))?
 }
-async fn with_client(plan: &Plan, foreground: &Foreground, evidence: &mut Evidence) -> Result<()> {
-    let mut bridge = safe(
-        Command::new(&plan.daemon)
-            .arg("mcp-stdio")
-            .arg("--client-config")
-            .arg(&plan.client_config)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn(),
-        "bridge_spawn",
-    )?;
-    let stdout = bridge
-        .stdout
-        .take()
-        .ok_or(Failure::Check("bridge_stdout"))?;
-    let stdin = bridge.stdin.take().ok_or(Failure::Check("bridge_stdin"))?;
-    let client = safe(
-        timeout(RPC, ().serve(AsyncRwTransport::new_client(stdout, stdin)))
-            .await
-            .map_err(|_| Failure::Timeout("mcp_initialize"))?,
-        "mcp_initialize",
-    )?;
+
+async fn open_bound_bridge(_plan: &Plan, expected_pid: u32) -> Result<(Child, Client)> {
+    // The stdio bridge exposes no kernel peer PID from its own pipe handle.
+    // A future adapter must check that handle BEFORE sending the credential
+    // and retain the same connection through MCP initialization and calls.
+    bind_session_process(expected_pid, None)?;
+    Err(Failure::SessionProcessEvidenceUnavailable)
+}
+
+async fn with_client(
+    plan: &Plan,
+    foreground: &Foreground,
+    expected_pid: u32,
+    evidence: &mut Evidence,
+) -> Result<()> {
+    let (mut bridge, client) = open_bound_bridge(plan, expected_pid).await?;
     let observed = async {
         let discovered = timeout(RPC, client.list_tools(None))
             .await
@@ -1009,11 +1024,11 @@ async fn with_client(plan: &Plan, foreground: &Foreground, evidence: &mut Eviden
         // Preflight while idle delay is still running. Closed admission returns
         // its own reason immediately without touching media or waiting for WTS.
         let first = rpc(&client, "vm_catalog", json!({})).await?;
-        assert_admitted(&first)?;
-        check(plan.qualification.is_some(), "qualification_pin_required")?;
+        selected_digest(&first, plan)?;
         sleep(Duration::from_secs(plan.idle_delay_s)).await;
-        let entries = catalog(&client, plan).await?;
-        let ledger = Ledger::open(&foreground.state_dir, plan.artifact_root.clone())?;
+        let (entries, selected) = catalog(&client, plan).await?;
+        evidence.qualification_sha256 = Some(selected);
+        let ledger = Ledger::open(&foreground.state_dir)?;
         let mut acceptance = Acceptance {
             client: &client,
             ledger,
@@ -1045,13 +1060,42 @@ fn verify_hex(value: &str, length: usize, name: &'static str) -> Result<()> {
     check(opaque(&json!(value), length).is_some(), name)
 }
 
-fn d_path(path: &Path) -> Result<()> {
+fn local_path(path: &Path) -> Result<LocalPath> {
     let raw = path.to_str().ok_or(Failure::Check("local_path"))?;
-    let local = safe(arxd::vm::paths::LocalPath::parse(raw), "local_path")?;
+    safe(LocalPath::parse(raw), "local_path")
+}
+
+fn d_path(path: &Path) -> Result<()> {
+    let local = local_path(path)?;
     check(
         !local.is_drive_root() && local.as_str()[..2].eq_ignore_ascii_case("D:"),
         "d_drive_path",
     )
+}
+
+fn custody_root(state: &Path, runtime: Option<&Path>) -> Result<LocalPath> {
+    let state = local_path(state)?;
+    if let Some(root) = runtime {
+        check(
+            local_path(root)?
+                .as_str()
+                .eq_ignore_ascii_case(state.as_str()),
+            "foreground_custody_root",
+        )?;
+    }
+    Ok(state)
+}
+
+#[test]
+fn refuses_runtime_custody_root_outside_foreground_store() {
+    let state = Path::new("D:/acceptance/state");
+    let same = Path::new("d:/acceptance/STATE");
+    let other = Path::new("D:/acceptance/other");
+    assert_eq!(custody_root(state, Some(same)), custody_root(state, None));
+    assert_eq!(
+        custody_root(state, Some(other)),
+        Err(Failure::Check("foreground_custody_root"))
+    );
 }
 
 fn pin_digest(path: &Path, expected: &str, max: u64) -> Result<File> {
@@ -1080,25 +1124,18 @@ async fn run() -> Result<()> {
         "test_recipe_ids",
     )?;
     let mut pins = Vec::new();
-    for path in [&plan.daemon, &plan.daemon_config, &plan.client_config]
-        .into_iter()
-        .chain(plan.qualification.iter())
-    {
+    for path in [&plan.daemon, &plan.daemon_config, &plan.client_config] {
         d_path(path)?;
         pins.extend(pin_root(
             path.parent().ok_or(Failure::Check("input_parent"))?,
         )?);
     }
-    for path in [&plan.evidence_dir, &plan.artifact_root] {
-        d_path(path)?;
-    }
+    d_path(&plan.evidence_dir)?;
     pins.extend(pin_root(&plan.evidence_dir)?);
     let _daemon = pin_digest(&plan.daemon, &plan.daemon_sha256, 512 * 1024 * 1024)?;
-    let _qualification = match (&plan.qualification, &plan.qualification_sha256) {
-        (Some(path), Some(digest)) => Some(pin_digest(path, digest, 4 * 1024 * 1024)?),
-        (None, None) => None,
-        _ => return Err(Failure::Check("qualification_pin_pair")),
-    };
+    if let Some(pin) = &plan.qualification_sha256 {
+        verify_hex(pin, 64, "qualification_pin")?;
+    }
     let daemon_config = open(&plan.daemon_config, false, FILE_SHARE_READ)?;
     let client_config = open(&plan.client_config, false, FILE_SHARE_READ)?;
     let foreground: Foreground = config(&daemon_config)?;
@@ -1115,21 +1152,16 @@ async fn run() -> Result<()> {
     )?;
     d_path(&foreground.state_dir)?;
     pins.extend(pin_root(&foreground.state_dir)?);
-    pins.extend(pin_root(&plan.artifact_root)?);
-    let path = |p: &Path| {
-        safe(
-            arxd::vm::paths::LocalPath::parse(p.to_str().unwrap_or_default()),
-            "local_path",
-        )
-    };
-    let state = path(&foreground.state_dir)?;
-    let artifacts = path(&plan.artifact_root)?;
-    let evidence_root = path(&plan.evidence_dir)?;
-    check(!artifacts.contains(&state), "separate_media_root")?;
-    check(
-        !evidence_root.overlaps(&state) && !evidence_root.overlaps(&artifacts),
-        "isolated_evidence_root",
+    let state = custody_root(
+        &foreground.state_dir,
+        foreground
+            .test_vms
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.state.as_path()),
     )?;
+    let evidence_root = local_path(&plan.evidence_dir)?;
+    check(!evidence_root.overlaps(&state), "isolated_evidence_root")?;
     safe(foreground.local.validate(), "foreground_endpoint")?;
     let executable = safe(env::current_exe(), "client_executable")?;
     let client_file = open(&executable, false, FILE_SHARE_READ)?;
@@ -1139,7 +1171,7 @@ async fn run() -> Result<()> {
         run_id: run_id.clone(),
         client_sha256: hex::encode(digest(&client_file, 512 * 1024 * 1024)?.1),
         daemon_sha256: plan.daemon_sha256.clone(),
-        qualification_sha256: plan.qualification_sha256.clone(),
+        qualification_sha256: None,
         started_at_ms: now_ms()?,
         finished_at_ms: 0,
         observations: Vec::new(),
@@ -1150,12 +1182,21 @@ async fn run() -> Result<()> {
 
     let result = async {
         require_unused(&foreground.local.address)?;
-        Ledger::preflight(&foreground.state_dir, &plan.artifact_root)?;
+        Ledger::preflight(
+            &foreground.state_dir,
+            [
+                (&plan.ubuntu.recipe_id, &plan.ubuntu.recipe_sha256),
+                (&plan.windows.recipe_id, &plan.windows.recipe_sha256),
+            ],
+        )?;
         let console = Console::allocate()?;
         let mut daemon = spawn_daemon(&plan)?;
         let observed = async {
             ready(&mut daemon, &foreground.local.address).await?;
-            with_client(&plan, &foreground, &mut evidence).await
+            let expected_pid = daemon
+                .id()
+                .ok_or(Failure::SessionProcessEvidenceUnavailable)?;
+            with_client(&plan, &foreground, expected_pid, &mut evidence).await
         }
         .await;
         let drained = console.drain(&mut daemon).await;
