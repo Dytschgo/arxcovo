@@ -246,7 +246,9 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    [ADR 0059](adr/0059-windows-guest-script-identity.md)
 
 6. **Hash and seal the evidence.** Write one attributable run under the owned
-   evidence root on D:. The allowlisted record set is `inputs.json`,
+   evidence root on D:. Give every run a fresh, empty, private evidence
+   directory; once the runner has claimed it, retry in a new directory.
+   The allowlisted record set is `inputs.json`,
    `host-baseline.json`, `distribution.json`, `custody-job-capacity.json`,
    `activity-reserves.json`, `whpx-qmp-endpoint.json`, `network-<class>.json`,
    `recipe-<id>.json` and `cleanup.json`. Record scope, input hashes and lengths,
