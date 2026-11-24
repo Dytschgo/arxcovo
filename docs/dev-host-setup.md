@@ -435,6 +435,8 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    Remove-Item -LiteralPath 'D:\ArxcovoData\qualify\trial.vhdx' -ErrorAction Stop
    ```
 
+Use the [M4 owner-host acceptance runbook](m4-acceptance.md) after qualification and native issuance are ready.
+
 ## Foreground VM profile: state root custody
 
 `arxd --config FILE` with a `test_vms` section serves the foreground VM tools from the configured `state_dir`. That directory must be an existing, owner-private, ordinary local directory: no link or reparse point, and not inside the protected service workspace or the executable's folder.
