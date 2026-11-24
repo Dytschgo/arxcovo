@@ -28,6 +28,11 @@ recipe IDs and pins. Paths below are placeholders.
   "daemon_sha256": "<reviewed release SHA-256>",
   "daemon_config": "D:/acceptance/private/daemon.json",
   "client_config": "D:/acceptance/private/client.json",
+  "store": {
+    "volume_guid": "\\\\?\\Volume{<lowercase volume GUID>}\\",
+    "volume_serial": "<16 lowercase hex digits from FILE_ID_INFO.VolumeSerialNumber>",
+    "directory_file_id": "<32 lowercase hex digits from FILE_ID_INFO.FileId.Identifier>"
+  },
   "qualification_sha256": "<reviewed qualification SHA-256>",
   "evidence_dir": "D:/acceptance/evidence",
   "idle_delay_s": 660,
@@ -35,6 +40,15 @@ recipe IDs and pins. Paths below are placeholders.
   "windows": { "recipe_id": "3c2fe2069942ce6c6cebe5c3e700e758", "recipe_sha256": "<recipe SHA-256>" }
 }
 ```
+
+Take all three store pins from the independently verified production enrollment.
+The serial is the numeric value rendered in hex, and the directory ID is the
+identifier bytes in order. The configured state and runtime state must name
+the same directory under the configured runtime drive root. The production
+store can use another mounted drive letter when the enrollment verifies its
+backing on D:. The client compares the live mount and the held directory
+identity with the plan and refuses changed mounts, aliases and reparse points.
+Keep the build scratch, binary, configuration, plan and evidence on D:.
 
 Use an existing evidence directory outside the state and media roots. Set
 [build scratch paths on D:](dev-scratch.md) and build the test ahead of the idle
@@ -49,7 +63,10 @@ cargo test --locked -p arxd --test m4_acceptance --no-run -j 4
 cargo test --locked -p arxd --test m4_acceptance -j 4 -- owner::owner_host_m4 --exact --ignored --nocapture
 ```
 
-The client requires one authenticated MCP session bound to the foreground process.
+The client checks the kernel server PID on the owner-checked named-pipe handle
+against its held foreground child before writing any credential bytes. The
+same connection carries authentication and every MCP call. A missing PID or
+a mismatch stops the journey.
 The journey checks tool schemas and admission, selects or builds both qualified
 goldens, and checks the clone pairs under 30-minute Ubuntu and 40-minute Windows
 leases. The client polls both leases during the Ubuntu expiry wait and continues
@@ -78,10 +95,6 @@ identities, credentials, and raw MCP transcripts are excluded.
 
 ## Current refusal behavior
 
-- The stdio bridge keeps its pipe handle private. The client currently returns
-  `session_process_evidence_unavailable` before sending credentials. The bridge
-  needs to expose the kernel peer PID on the connection that will carry
-  authentication and MCP.
 - An authenticated catalog with closed admission returns `admission_closed`
   with a reason such as `qualification_missing`. An open catalog without the
   selected-record receipt returns `daemon_qualification_evidence_unavailable`.

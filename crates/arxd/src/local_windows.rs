@@ -1,4 +1,4 @@
-use super::{ClientConfig, Endpoint};
+use super::{AUTH_TIMEOUT, ClientConfig, Endpoint, LoadedClient, bridge_connected};
 use anyhow::{Result, bail};
 use std::{
     ffi::c_void,
@@ -6,12 +6,15 @@ use std::{
     path::Path,
     ptr,
 };
-use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions},
+};
 use windows_sys::Win32::{
     Foundation::*,
     Security::{Authorization::*, *},
     Storage::FileSystem::*,
-    System::Threading::*,
+    System::{Pipes::GetNamedPipeServerProcessId, Threading::*},
 };
 
 pub fn validate_identity(value: &str) -> Result<()> {
@@ -249,9 +252,197 @@ pub async fn connect(config: &ClientConfig) -> Result<NamedPipeClient> {
     }
 }
 
+#[derive(Debug)]
+pub enum ForegroundBridgeError {
+    EndpointMismatch,
+    ConnectTimeout,
+    ConnectRejected,
+    ProcessUnavailable,
+    ProcessMismatch,
+}
+
+/// The owner-checked connection whose kernel server PID matched the foreground.
+/// Consuming it for the bridge keeps the verified handle through auth and MCP.
+pub struct ForegroundBridge {
+    pipe: NamedPipeClient,
+    config: ClientConfig,
+}
+
+impl ForegroundBridge {
+    pub async fn forward(self, io: impl AsyncRead + AsyncWrite + Unpin) -> Result<()> {
+        let (input, output) = tokio::io::split(io);
+        bridge_connected(self.pipe, self.config, input, output).await
+    }
+}
+
+/// Open one owner-checked connection and bind it to the spawned foreground.
+/// The caller must retain its child process handle for the whole session.
+pub async fn bind_foreground_bridge(
+    config: LoadedClient,
+    expected_address: &str,
+    expected_pid: u32,
+) -> Result<ForegroundBridge, ForegroundBridgeError> {
+    bind_foreground_pipe(
+        config.ordinary,
+        expected_address,
+        expected_pid,
+        kernel_server_pid,
+    )
+    .await
+}
+
+fn kernel_server_pid(pipe: &NamedPipeClient) -> Option<u32> {
+    let mut pid = 0;
+    // The client owns this live pipe handle and the output is one writable DWORD.
+    (unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } != 0).then_some(pid)
+}
+
+async fn bind_foreground_pipe(
+    config: ClientConfig,
+    expected_address: &str,
+    expected_pid: u32,
+    server_pid: impl FnOnce(&NamedPipeClient) -> Option<u32>,
+) -> Result<ForegroundBridge, ForegroundBridgeError> {
+    use ForegroundBridgeError::*;
+
+    if config.address != expected_address {
+        return Err(EndpointMismatch);
+    }
+    let pipe = tokio::time::timeout(AUTH_TIMEOUT, connect(&config))
+        .await
+        .map_err(|_| ConnectTimeout)?
+        .map_err(|_| ConnectRejected)?;
+    let peer = server_pid(&pipe)
+        .filter(|pid| *pid != 0)
+        .ok_or(ProcessUnavailable)?;
+    if peer != expected_pid {
+        return Err(ProcessMismatch);
+    }
+    Ok(ForegroundBridge { pipe, config })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        time::timeout,
+    };
+
+    const FIXTURE_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn pipe_fixture() -> (ClientConfig, Endpoint, NamedPipeServer) {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let endpoint = Endpoint {
+            address: format!(r"\\.\pipe\arxcovo-m4-test-{}", hex::encode(nonce)),
+            client_identity: current_identity().unwrap(),
+        };
+        let server = create(&endpoint, true).unwrap();
+        let config = ClientConfig {
+            address: endpoint.address.clone(),
+            expected_server_identity: endpoint.client_identity.clone(),
+            token: FIXTURE_TOKEN.into(),
+        };
+        (config, endpoint, server)
+    }
+
+    async fn rejected_pipe(
+        expected: u32,
+        query: impl FnOnce(&NamedPipeClient) -> Option<u32>,
+        verify: impl FnOnce(ForegroundBridgeError),
+    ) {
+        let (config, endpoint, mut server) = pipe_fixture();
+        // Drive the credential-writing entry even if a mutated gate lets this
+        // peer through. Any byte on the server side is a test failure.
+        let client = async {
+            match bind_foreground_pipe(config, &endpoint.address, expected, query).await {
+                Err(error) => verify(error),
+                Ok(bound) => {
+                    let (_sdk, io) = tokio::io::duplex(256);
+                    let _ = bound.forward(io).await;
+                    panic!("accepted an unverified foreground pipe");
+                }
+            }
+        };
+        let no_auth = async {
+            server.connect().await.unwrap();
+            let mut byte = [0; 1];
+            assert_eq!(server.read(&mut byte).await.unwrap(), 0, "auth byte sent");
+        };
+        timeout(AUTH_TIMEOUT, async { tokio::join!(no_auth, client) })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreground_pipe_missing_pid_sends_no_credentials() {
+        for pid in [None, Some(0)] {
+            rejected_pipe(
+                std::process::id(),
+                |pipe| {
+                    assert_eq!(kernel_server_pid(pipe), Some(std::process::id()));
+                    pid
+                },
+                |error| assert!(matches!(error, ForegroundBridgeError::ProcessUnavailable)),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_pipe_wrong_pid_sends_no_credentials() {
+        rejected_pipe(std::process::id() ^ 1, kernel_server_pid, |error| {
+            assert!(matches!(error, ForegroundBridgeError::ProcessMismatch));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn foreground_pipe_verified_instance_carries_auth_and_mcp() {
+        const REQUEST: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+        const RESPONSE: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
+        let (config, endpoint, mut server) = pipe_fixture();
+        let bound = bind_foreground_bridge(
+            LoadedClient { ordinary: config },
+            &endpoint.address,
+            std::process::id(),
+        )
+        .await
+        .unwrap();
+        timeout(AUTH_TIMEOUT, server.connect())
+            .await
+            .unwrap()
+            .unwrap();
+        // A fresh connection could open this other instance with the same
+        // owner and PID. Only the verified instance responds to auth and MCP.
+        let _standby = create(&endpoint, false).unwrap();
+        let (mut sdk, io) = tokio::io::duplex(256);
+        let client = async { bound.forward(io).await.unwrap() };
+        let receive = async {
+            let mut auth = [0; 70];
+            server.read_exact(&mut auth).await.unwrap();
+            assert_eq!(&auth[..5], b"ARX1 ");
+            assert!(auth[5..69] == *FIXTURE_TOKEN.as_bytes());
+            assert_eq!(auth[69], b'\n');
+            server.write_all(b"OK\n").await.unwrap();
+            let mut received = [0; REQUEST.len()];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, REQUEST);
+            server.write_all(RESPONSE).await.unwrap();
+        };
+        let round_trip = async move {
+            sdk.write_all(REQUEST).await.unwrap();
+            let mut received = [0; RESPONSE.len()];
+            sdk.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, RESPONSE);
+        };
+        timeout(AUTH_TIMEOUT, async {
+            tokio::join!(receive, client, round_trip);
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn direct_client_endpoint_policy_refuses_nonlocal_or_invalid_addresses() {

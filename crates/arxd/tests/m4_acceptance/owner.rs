@@ -1,23 +1,36 @@
 use super::*;
-use arxd::vm::paths::LocalPath;
+use arxd::{
+    local::{
+        ClientConfig, ForegroundBridgeError, LoadedClient, RESPONSE_LIMIT, bind_foreground_bridge,
+    },
+    vm::paths::{FileIdentity, LocalPath},
+};
 use ledger::{Claim, Id, Ledger, Pair, PairProof, config, digest, id, open, pin_root, safe};
-use rmcp::{RoleClient, model::CallToolRequestParams, service::RunningService};
+use rmcp::{
+    RoleClient, ServiceExt, model::CallToolRequestParams, service::RunningService,
+    transport::async_rw::AsyncRwTransport,
+};
 use serde::Deserialize;
 use std::{
     env,
     fs::{self, File, OpenOptions},
     io::Write,
+    os::windows::io::AsRawHandle,
     path::{Path, PathBuf},
     process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     process::{Child, Command},
+    task::JoinSet,
     time::timeout,
 };
 use windows_sys::Win32::{
     Foundation::{ERROR_FILE_NOT_FOUND, GetLastError},
-    Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE},
+    Storage::FileSystem::{
+        FILE_ID_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx,
+        GetFinalPathNameByHandleW, GetVolumeNameForVolumeMountPointW, VOLUME_NAME_GUID,
+    },
     System::{Console::*, Pipes::WaitNamedPipeW},
 };
 
@@ -38,6 +51,7 @@ struct Plan {
     daemon_sha256: String,
     daemon_config: PathBuf,
     client_config: PathBuf,
+    store: StorePin,
     qualification_sha256: Option<String>,
     evidence_dir: PathBuf,
     ubuntu: Recipe,
@@ -62,11 +76,6 @@ struct Foreground {
 }
 
 #[derive(Deserialize)]
-struct BridgeConfig {
-    address: String,
-}
-
-#[derive(Deserialize)]
 struct VmProfile {
     #[serde(default)]
     allow_agent_public_sites: bool,
@@ -77,6 +86,15 @@ struct VmProfile {
 #[derive(Deserialize)]
 struct RuntimeRoot {
     state: PathBuf,
+    volume: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorePin {
+    volume_guid: String,
+    volume_serial: String,
+    directory_file_id: String,
 }
 
 #[derive(Serialize)]
@@ -1020,61 +1038,87 @@ async fn ready(daemon: &mut Child, endpoint: &str) -> Result<()> {
     .map_err(|_| Failure::Timeout("foreground_listener"))?
 }
 
-async fn open_bound_bridge(_plan: &Plan, expected_pid: u32) -> Result<(Child, Client)> {
-    // The stdio bridge exposes no kernel peer PID from its own pipe handle.
-    // A future adapter must check that handle BEFORE sending the credential
-    // and retain the same connection through MCP initialization and calls.
-    bind_session_process(expected_pid, None)?;
-    Err(Failure::SessionProcessEvidenceUnavailable)
+fn bridge_failure(error: ForegroundBridgeError) -> Failure {
+    match error {
+        ForegroundBridgeError::EndpointMismatch => Failure::Check("bridge_endpoint_binding"),
+        ForegroundBridgeError::ConnectTimeout => Failure::Timeout("bridge_connect"),
+        ForegroundBridgeError::ConnectRejected => Failure::Check("bridge_connect"),
+        ForegroundBridgeError::ProcessUnavailable => Failure::SessionProcessEvidenceUnavailable,
+        ForegroundBridgeError::ProcessMismatch => Failure::SessionProcessMismatch,
+    }
 }
 
 async fn with_client(
     plan: &Plan,
     foreground: &Foreground,
-    expected_pid: u32,
+    store: &LocalPath,
+    daemon: &Child,
+    config: LoadedClient,
     evidence: &mut Evidence,
 ) -> Result<()> {
-    let (mut bridge, client) = open_bound_bridge(plan, expected_pid).await?;
+    let expected_pid = daemon
+        .id()
+        .ok_or(Failure::SessionProcessEvidenceUnavailable)?;
+    let bound = bind_foreground_bridge(config, &foreground.local.address, expected_pid)
+        .await
+        .map_err(bridge_failure)?;
+    let (sdk, io) = tokio::io::duplex(RESPONSE_LIMIT);
+    let mut bridge = JoinSet::new();
+    bridge.spawn(bound.forward(io));
+
     let observed = async {
-        let discovered = timeout(RPC, client.list_tools(None))
+        let (read, write) = tokio::io::split(sdk);
+        let transport =
+            AsyncRwTransport::new_client(read, write).with_max_line_length(RESPONSE_LIMIT);
+        let initialized = timeout(RPC, ().serve(transport))
             .await
-            .map_err(|_| Failure::Discovery)?
-            .map_err(|_| Failure::Discovery)
-            .and_then(|reply| serde_json::to_value(reply).map_err(|_| Failure::Discovery));
-        discover(discovered)?;
-        // Preflight while idle delay is still running. Closed admission returns
-        // its own reason immediately without touching media or waiting for WTS.
-        let first = rpc(&client, "vm_catalog", json!({})).await?;
-        selected_digest(&first, plan)?;
-        sleep(Duration::from_secs(plan.idle_delay_s)).await;
-        let (entries, selected) = catalog(&client, plan).await?;
-        evidence.qualification_sha256 = Some(selected);
-        let ledger = Ledger::open(&foreground.state_dir)?;
-        let mut acceptance = Acceptance {
-            client: &client,
-            ledger,
-            evidence,
-            principal: &foreground.agents[0].principal,
-            operations: Vec::new(),
-        };
-        journey(&mut acceptance, plan, &entries).await
+            .map_err(|_| Failure::Timeout("bridge_initialize"))?;
+        let client = safe(initialized, "bridge_initialize")?;
+        let journey_result = async {
+            let discovered = timeout(RPC, client.list_tools(None))
+                .await
+                .map_err(|_| Failure::Discovery)?
+                .map_err(|_| Failure::Discovery)
+                .and_then(|reply| serde_json::to_value(reply).map_err(|_| Failure::Discovery));
+            discover(discovered)?;
+            // Closed admission returns its reason before the idle delay.
+            let first = rpc(&client, "vm_catalog", json!({})).await?;
+            selected_digest(&first, plan)?;
+            sleep(Duration::from_secs(plan.idle_delay_s)).await;
+            let (entries, selected) = catalog(&client, plan).await?;
+            evidence.qualification_sha256 = Some(selected);
+            let _store = pin_store(store, &plan.store, mounted_volume)?;
+            let ledger = Ledger::open(&foreground.state_dir)?;
+            let mut acceptance = Acceptance {
+                client: &client,
+                ledger,
+                evidence,
+                principal: &foreground.agents[0].principal,
+                operations: Vec::new(),
+            };
+            journey(&mut acceptance, plan, &entries).await
+        }
+        .await;
+        let cancelled = timeout(RPC, client.cancel())
+            .await
+            .map_err(|_| Failure::Timeout("bridge_cancel"))
+            .and_then(|result| safe(result, "bridge_cancel"));
+        journey_result.and(cancelled.map(|_| ()))
     }
     .await;
-    let cancelled = timeout(RPC, client.cancel())
-        .await
-        .map_err(|_| Failure::Timeout("bridge_cancel"))
-        .and_then(|result| safe(result, "bridge_cancel"));
-    // End any remaining bridge process before sending Ctrl+C to the console.
-    // This process holds the client transport only.
-    let joined = timeout(RPC, bridge.wait())
-        .await
-        .map_err(|_| Failure::Timeout("bridge_exit"))
-        .and_then(|result| safe(result, "bridge_exit"))
-        .and_then(|status| check(status.success(), "bridge_exit"));
-    if joined.is_err() {
-        let _ = timeout(RPC, bridge.kill()).await;
-    }
-    observed.and(cancelled.map(|_| ())).and(joined)
+    // Finish the task holding the pipe before interrupting the foreground.
+    let joined = match timeout(RPC, bridge.join_next()).await {
+        Ok(Some(result)) => {
+            safe(result, "bridge_exit").and_then(|result| safe(result, "bridge_exit"))
+        }
+        Ok(None) => Err(Failure::Check("bridge_exit")),
+        Err(_) => {
+            bridge.abort_all();
+            let _ = timeout(RPC, bridge.join_next()).await;
+            Err(Failure::Timeout("bridge_exit"))
+        }
+    };
+    observed.and(joined)
 }
 
 fn verify_hex(value: &str, length: usize, name: &'static str) -> Result<()> {
@@ -1094,13 +1138,17 @@ fn d_path(path: &Path) -> Result<()> {
     )
 }
 
-fn custody_root(state: &Path, runtime: Option<&Path>) -> Result<LocalPath> {
+fn custody_root(state: &Path, runtime: Option<&RuntimeRoot>) -> Result<LocalPath> {
     let state = local_path(state)?;
-    if let Some(root) = runtime {
+    check(!state.is_drive_root(), "foreground_custody_root")?;
+    if let Some(runtime) = runtime {
+        let volume = local_path(&runtime.volume)?;
         check(
-            local_path(root)?
+            local_path(&runtime.state)?
                 .as_str()
-                .eq_ignore_ascii_case(state.as_str()),
+                .eq_ignore_ascii_case(state.as_str())
+                && volume.is_drive_root()
+                && volume.contains(&state),
             "foreground_custody_root",
         )?;
     }
@@ -1109,14 +1157,233 @@ fn custody_root(state: &Path, runtime: Option<&Path>) -> Result<LocalPath> {
 
 #[test]
 fn refuses_runtime_custody_root_outside_foreground_store() {
-    let state = Path::new("D:/acceptance/state");
-    let same = Path::new("d:/acceptance/STATE");
-    let other = Path::new("D:/acceptance/other");
-    assert_eq!(custody_root(state, Some(same)), custody_root(state, None));
+    let state = Path::new("V:/acceptance/state");
+    let mut runtime = RuntimeRoot {
+        state: "v:/acceptance/STATE".into(),
+        volume: "V:/".into(),
+    };
     assert_eq!(
-        custody_root(state, Some(other)),
+        custody_root(state, Some(&runtime)),
+        custody_root(state, None)
+    );
+    runtime.volume = "D:/".into();
+    assert_eq!(
+        custody_root(state, Some(&runtime)),
         Err(Failure::Check("foreground_custody_root"))
     );
+    runtime.volume = "V:/".into();
+    runtime.state = "V:/acceptance/other".into();
+    assert_eq!(
+        custody_root(state, Some(&runtime)),
+        Err(Failure::Check("foreground_custody_root"))
+    );
+}
+
+fn mounted_volume(root: &str) -> Result<String> {
+    let wide: Vec<_> = root.encode_utf16().chain(Some(0)).collect();
+    let mut output = [0; 64];
+    check(
+        unsafe {
+            GetVolumeNameForVolumeMountPointW(
+                wide.as_ptr(),
+                output.as_mut_ptr(),
+                output.len() as u32,
+            )
+        } != 0,
+        "store_volume_mount",
+    )?;
+    let end = output
+        .iter()
+        .position(|&unit| unit == 0)
+        .ok_or(Failure::Check("store_volume_mount"))?;
+    safe(String::from_utf16(&output[..end]), "store_volume_mount")
+}
+
+fn store_identity(file: &File) -> Result<FileIdentity> {
+    let mut id = FILE_ID_INFO::default();
+    check(
+        unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                std::ptr::from_mut(&mut id).cast(),
+                size_of_val(&id) as u32,
+            )
+        } != 0,
+        "store_file_identity",
+    )?;
+    Ok(FileIdentity {
+        volume: id.VolumeSerialNumber,
+        file: id.FileId.Identifier,
+    })
+}
+
+fn held_volume_path(file: &File) -> Result<String> {
+    let mut output = [0; 512];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            output.as_mut_ptr(),
+            output.len() as u32,
+            VOLUME_NAME_GUID,
+        )
+    } as usize;
+    check(length > 0 && length < output.len(), "store_volume_path")?;
+    safe(String::from_utf16(&output[..length]), "store_volume_path")
+}
+
+fn pin_store(
+    state: &LocalPath,
+    enrolled: &StorePin,
+    mount_name: impl Fn(&str) -> Result<String>,
+) -> Result<Vec<File>> {
+    let drive = &state.as_str()[..3];
+    let guid = enrolled
+        .volume_guid
+        .strip_prefix(r"\\?\Volume{")
+        .and_then(|value| value.strip_suffix(r"}\"))
+        .ok_or(Failure::Check("store_volume_pin"))?;
+    let mut parts = guid.split('-');
+    for length in [8, 4, 4, 4, 12] {
+        verify_hex(parts.next().unwrap_or_default(), length, "store_volume_pin")?;
+    }
+    check(parts.next().is_none(), "store_volume_pin")?;
+    verify_hex(&enrolled.volume_serial, 16, "store_volume_pin")?;
+    verify_hex(&enrolled.directory_file_id, 32, "store_directory_pin")?;
+    let verify_mount = || {
+        check(
+            mount_name(drive)?.eq_ignore_ascii_case(&enrolled.volume_guid),
+            "store_volume_mount",
+        )
+    };
+    verify_mount()?;
+    // Ledger's no-follow opens hold the chain without delete sharing. Check
+    // each live handle against its expected GUID path, including the root,
+    // so an alias, mount transition or mixed chain cannot supply the pin.
+    let path = Path::new(state.as_str());
+    let pins = pin_root(path)?;
+    for (part, file) in path.ancestors().zip(pins.iter().rev()) {
+        let suffix = &part.to_str().ok_or(Failure::Check("store_volume_path"))?[3..];
+        let expected = format!("{}{suffix}", enrolled.volume_guid);
+        check(
+            held_volume_path(file)?
+                .trim_end_matches('\\')
+                .eq_ignore_ascii_case(expected.trim_end_matches('\\')),
+            "store_volume_path",
+        )?;
+    }
+    let store = pins.last().ok_or(Failure::Check("store_directory_pin"))?;
+    let actual = store_identity(store)?;
+    check(
+        format!("{:016x}", actual.volume) == enrolled.volume_serial
+            && hex::encode(actual.file) == enrolled.directory_file_id,
+        "store_directory_pin",
+    )?;
+    verify_mount()?;
+    Ok(pins)
+}
+
+#[test]
+fn store_requires_exact_enrolled_volume_and_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = local_path(directory.path()).unwrap();
+    let drive = &state.as_str()[..3];
+    let volume_guid = mounted_volume(drive).unwrap();
+    let directory_file = open(directory.path(), true, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap();
+    let identity = store_identity(&directory_file).unwrap();
+    let enrolled = StorePin {
+        volume_guid: volume_guid
+            .to_ascii_lowercase()
+            .replacen("volume", "Volume", 1),
+        volume_serial: format!("{:016x}", identity.volume),
+        directory_file_id: hex::encode(identity.file),
+    };
+    assert!(pin_store(&state, &enrolled, mounted_volume).is_ok());
+
+    let rebind = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\";
+    assert_eq!(
+        pin_store(&state, &enrolled, |_| Ok(rebind.into())).err(),
+        Some(Failure::Check("store_volume_mount"))
+    );
+    let calls = std::cell::Cell::new(0);
+    let changed_during_open = pin_store(&state, &enrolled, |_| {
+        calls.set(calls.get() + 1);
+        Ok(if calls.get() == 1 {
+            &volume_guid
+        } else {
+            rebind
+        }
+        .to_owned())
+    });
+    assert_eq!(calls.get(), 2);
+    assert_eq!(
+        changed_during_open.err(),
+        Some(Failure::Check("store_volume_mount"))
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    let wrong_directory = local_path(other.path()).unwrap();
+    assert_eq!(
+        pin_store(&wrong_directory, &enrolled, mounted_volume).err(),
+        Some(Failure::Check("store_directory_pin"))
+    );
+    let wrong_serial = StorePin {
+        volume_serial: format!("{:016x}", identity.volume ^ 1),
+        ..enrolled
+    };
+    assert_eq!(
+        pin_store(&state, &wrong_serial, mounted_volume).err(),
+        Some(Failure::Check("store_directory_pin"))
+    );
+}
+
+#[test]
+fn store_refuses_reparse_path_to_the_enrolled_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("enrolled");
+    let alias = root.path().join("junction");
+    fs::create_dir(&target).unwrap();
+    let state = local_path(&target).unwrap();
+    let identity =
+        store_identity(&open(&target, true, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap()).unwrap();
+    let enrolled = StorePin {
+        volume_guid: mounted_volume(&state.as_str()[..3])
+            .unwrap()
+            .to_ascii_lowercase()
+            .replacen("volume", "Volume", 1),
+        volume_serial: format!("{:016x}", identity.volume),
+        directory_file_id: hex::encode(identity.file),
+    };
+    assert!(
+        std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&target)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        pin_store(&local_path(&alias).unwrap(), &enrolled, mounted_volume).err(),
+        Some(Failure::Check("unsafe_local_path"))
+    );
+}
+
+fn require_distinct_evidence(store: &[File], evidence: &[File]) -> Result<()> {
+    let identities = |pins: &[File]| pins.iter().map(store_identity).collect::<Result<Vec<_>>>();
+    let store = identities(store)?;
+    let evidence = identities(evidence)?;
+    let store_leaf = store
+        .last()
+        .ok_or(Failure::Check("foreground_custody_root"))?;
+    let evidence_leaf = evidence
+        .last()
+        .ok_or(Failure::Check("isolated_evidence_root"))?;
+    check(
+        !store.contains(evidence_leaf) && !evidence.contains(store_leaf),
+        "isolated_evidence_root",
+    )
 }
 
 fn pin_digest(path: &Path, expected: &str, max: u64) -> Result<File> {
@@ -1152,37 +1419,26 @@ async fn run() -> Result<()> {
         )?);
     }
     d_path(&plan.evidence_dir)?;
-    pins.extend(pin_root(&plan.evidence_dir)?);
+    let evidence_pins = pin_root(&plan.evidence_dir)?;
     let _daemon = pin_digest(&plan.daemon, &plan.daemon_sha256, 512 * 1024 * 1024)?;
     if let Some(pin) = &plan.qualification_sha256 {
         verify_hex(pin, 64, "qualification_pin")?;
     }
     let daemon_config = open(&plan.daemon_config, false, FILE_SHARE_READ)?;
-    let client_config = open(&plan.client_config, false, FILE_SHARE_READ)?;
+    let _client_config = open(&plan.client_config, false, FILE_SHARE_READ)?;
     let foreground: Foreground = config(&daemon_config)?;
-    let bridge: BridgeConfig = config(&client_config)?;
-    check(
-        bridge.address == foreground.local.address,
-        "bridge_endpoint_binding",
-    )?;
+    let client = safe(ClientConfig::load(&plan.client_config), "bridge_config")?;
     check(
         foreground.agents.len() == 1
             && !foreground.test_vms.allow_agent_public_sites
             && foreground.test_vms.publication.is_none(),
         "isolated_foreground_profile",
     )?;
-    d_path(&foreground.state_dir)?;
-    pins.extend(pin_root(&foreground.state_dir)?);
-    let state = custody_root(
-        &foreground.state_dir,
-        foreground
-            .test_vms
-            .runtime
-            .as_ref()
-            .map(|runtime| runtime.state.as_path()),
-    )?;
+    let state = custody_root(&foreground.state_dir, foreground.test_vms.runtime.as_ref())?;
+    let store_pins = pin_store(&state, &plan.store, mounted_volume)?;
     let evidence_root = local_path(&plan.evidence_dir)?;
     check(!evidence_root.overlaps(&state), "isolated_evidence_root")?;
+    require_distinct_evidence(&store_pins, &evidence_pins)?;
     safe(foreground.local.validate(), "foreground_endpoint")?;
     let executable = safe(env::current_exe(), "client_executable")?;
     let client_file = open(&executable, false, FILE_SHARE_READ)?;
@@ -1211,19 +1467,20 @@ async fn run() -> Result<()> {
             ],
         )?;
         let console = Console::allocate()?;
+        let _startup_store = pin_store(&state, &plan.store, mounted_volume)?;
         let mut daemon = spawn_daemon(&plan)?;
         let observed = async {
             ready(&mut daemon, &foreground.local.address).await?;
-            let expected_pid = daemon
-                .id()
-                .ok_or(Failure::SessionProcessEvidenceUnavailable)?;
-            with_client(&plan, &foreground, expected_pid, &mut evidence).await
+            let _live_store = pin_store(&state, &plan.store, mounted_volume)?;
+            with_client(&plan, &foreground, &state, &daemon, client, &mut evidence).await
         }
         .await;
         let drained = console.drain(&mut daemon).await;
         evidence.drain = drained.is_ok();
         evidence.drain_failure = drained.clone().err();
-        observed.and(drained)
+        observed
+            .and(drained)
+            .and_then(|()| pin_store(&state, &plan.store, mounted_volume).map(|_| ()))
     }
     .await;
 

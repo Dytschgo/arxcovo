@@ -18,7 +18,9 @@ enum Failure {
     AdmissionClosed(&'static str),
     DaemonQualificationEvidenceUnavailable,
     DaemonQualificationEvidenceMismatch,
+    #[cfg(all(windows, target_arch = "x86_64"))]
     SessionProcessEvidenceUnavailable,
+    #[cfg(all(windows, target_arch = "x86_64"))]
     SessionProcessMismatch,
     WindowsBootEvidenceUnavailable,
     WindowsBootEvidenceMismatch,
@@ -225,14 +227,6 @@ fn qualification_digest<'a>(
         return Err(Failure::DaemonQualificationEvidenceMismatch);
     }
     Ok(digest)
-}
-
-fn bind_session_process(expected: u32, connected_peer: Option<u32>) -> Result<()> {
-    let peer = connected_peer.ok_or(Failure::SessionProcessEvidenceUnavailable)?;
-    if expected == 0 || peer != expected {
-        return Err(Failure::SessionProcessMismatch);
-    }
-    Ok(())
 }
 
 fn windows_boot_witness<'a>(
@@ -612,19 +606,6 @@ fn open_catalog_requires_the_daemons_selected_record_and_exact_test_scopes() {
         qualification_digest(&catalog, Some(&digest), expected),
         Err(Failure::DaemonQualificationEvidenceMismatch)
     );
-}
-
-#[test]
-fn session_binding_refuses_unavailable_and_wrong_peer_pid() {
-    assert_eq!(
-        bind_session_process(18, None),
-        Err(Failure::SessionProcessEvidenceUnavailable)
-    );
-    assert_eq!(
-        bind_session_process(18, Some(19)),
-        Err(Failure::SessionProcessMismatch)
-    );
-    assert_eq!(bind_session_process(18, Some(18)), Ok(()));
 }
 
 #[test]

@@ -14,6 +14,8 @@ mod platform;
 
 #[cfg(windows)]
 pub(crate) use platform::current_identity;
+#[cfg(windows)]
+pub use platform::{ForegroundBridge, ForegroundBridgeError, bind_foreground_bridge};
 
 pub(crate) use platform::owned as require_owner;
 
