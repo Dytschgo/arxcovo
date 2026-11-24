@@ -129,6 +129,7 @@ fn spelling_rejects_aliases_and_overlapping_roots() {
     assert!(root.contains(&LocalPath::parse("d:/test vm/disk").unwrap()));
     assert!(!root.overlaps(&LocalPath::parse("D:/Test VM backup").unwrap()));
     assert!(root.join("D:/unowned").is_err());
+    assert!(root.join("QEMU,tcx.bin").is_err());
 }
 
 #[test]
