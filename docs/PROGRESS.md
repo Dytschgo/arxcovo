@@ -520,7 +520,7 @@ Per-task provider, effort and outcome for this batch. Effort and the attempt tal
 
 - **Since #300 (2026-11-24).** Last merged PR is **#303** at `ae2df911`; the prior merge was **#302** at `ba71d096`. This batch does not accept a milestone. Counted builder failures, review rounds, and CI or provider interruptions are listed separately below. Live and native paths in this batch are **unverified on real hardware**.
 
-  Merges, in the order they landed, with the agent-review status id where the notes give one:
+  Merges, in the order they landed, with the agent-review status id (from the coordinator notes, and from GitHub for #301):
 
   | PR | Merge | What | Agent-review status |
   | --- | --- | --- | --- |
