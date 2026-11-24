@@ -2,6 +2,10 @@
 
 Status: **Active on main10aa891f, 2026-11-17, following the owner-authorized pinned PR163 bootstrap. First new exact-main CI and charged-v1 evaluation verified.** Original Opus design on `c612152`; current-main refresh uses Sol6.1.
 
+The [2026-11-24 amendment](#main-runner-cancellation-recovery-2026-11-24)
+supersedes the original main run selection, non-green gate behavior and
+status marker where they differ.
+
 The user chose to *prepare* a reviewed queue-outage amendment for the PR #162 deadlock. That choice grants no
 bootstrap, protection, status, label or merge exception. The ADR 0022 exception is exhausted and cannot be reused.
 No label makes this amendment, or its implementation, a `ci-speed` change. KICKOFF requires "15 minutes
@@ -122,7 +126,10 @@ a queue-only win with unchanged execution times. Runtime noise can still change
 that value; a `ci-speed` PR must identify and independently review the actual
 structural change rather than claiming a charged reduction from queue alone.
 
-## Status description (≤140 chars, `Main run {id}:` invalidation marker unchanged)
+## Original status description (≤140 chars)
+
+The runner recovery amendment below adds the attempt number to the
+invalidation marker.
 
 Format: `Main run {id}: wall {W}s, charged {C}; {verdict}`.
 - `{C}` is `{n}s`, `{n}s uncredited (not-green)`, or `n/a (run-invalid|jobs-invalid)`.
@@ -164,8 +171,8 @@ it stays charged.
 3. **Defects.** Each `run-invalid` and `jobs-invalid` clause gives null charged, its code, the wall gate and a
    denied `ci-speed`. Include `total_count` 2, 4 and 101, and assert that no second page is read. Existing
    unfinished-attempt rejection precedes credit validation at the entrypoint, even below900s and in `--record`.
-4. **Failed jobs.** A complete failed job gives `uncredited (not-green)`. A failed 800s run passes as today, and a
-   failed 1475s run fails.
+4. **Failed jobs.** A complete failed job gives `uncredited (not-green)`. The original wall-only fallback passed
+   a failed 800s run and blocked a failed 1475s run. The runner recovery amendment below blocks both.
 5. **`ci-speed`.** A queue-only reduction is denied. A reduction on both metrics passes. An uncreditable candidate
    or baseline is denied. Keep the existing removed-label, head/repo-mismatch and attempt-2 tests.
 6. **Actual runs.** Both reproduce the table exactly.
@@ -173,7 +180,7 @@ it stays charged.
 8. **History.** Old records stay byte-identical, appends work, duplicate run ids are not rewritten, and the
    workflow pins hold.
 
-## Implementation allowlist and invariants
+## Original activation allowlist and invariants
 
 The implementation may change only these files: `scripts/{policy,evaluate-budget,ci-budget}.mjs` and their
 `*.test.mjs`; `scripts/ci-workflow.test.mjs` (pins only); `scripts/fixtures/ci-budget-buffer.mjs`; a new
@@ -279,29 +286,45 @@ reused four successful workers from attempt 1. Attempt 1 could earn neither
 idle queue credit nor a `ci-speed` comparison. The owner authorized a
 one-use bypass consumed by #310 and a budget policy fix.
 
-Attempt 1 remains authoritative unless the latest completed main push CI
-run has a classifiable runner cancellation. The existing attempt-1 run and
-job validation must pass. The run must report cancellation or failure and
-at least one job must report cancellation. Each cancelled job must show one
-of these signatures in the existing attempt jobs response.
+The main push CI run with the highest run number is authoritative across
+all statuses. A queued or running attempt keeps the gate pending. This
+applies to new pushes and reruns, so policy never measures an older run
+while the latest one awaits completion. Policy listens for main CI
+`in_progress` events because GitHub does not emit `requested` for reruns.
+Each status identifies both the run and the attempt.
 
-- The runner ID is zero, the step list is empty, and creation and start
-  timestamps are equal.
-- In the nine-job workflow, a positive runner ID has an elapsed time
-  between the configured 720 s job deadline and 750 s inclusive. Every
-  reported step is completed with success or skipped, and at least one
-  succeeded. The 30 s window covers the cancellation and teardown delay
-  observed in the incident. Job metadata carries no separate timeout cause,
-  so this signature is an inference. A failed, cancelled or unfinished step
-  cannot qualify for it.
+When the run is complete, attempt 1 remains authoritative unless it has
+a verified runner interruption. Existing run and job validation must
+pass. The run must report cancellation or failure and at least one job
+must report cancellation. Each cancelled job must have matching job
+metadata and a GitHub Actions check annotation that confirms the cause.
+
+- A job whose runner ID is zero, whose step list is empty and whose
+  creation and start timestamps match needs the hosted runner acquisition
+  failure annotation.
+- In the nine-job workflow, a started job needs the configured 12-minute
+  deadline annotation and an observed runtime of 720–750 s. Its required
+  build and test steps (or the verify dependency check) and the terminal
+  job completion step must have succeeded. The 30 s window covers the
+  incident's teardown delay. Missing, failed, unfinished or cancelled
+  required work blocks recovery. A deadline during a test may be a hang,
+  so even a confirmed deadline does not excuse that cancellation.
 
 Uncancelled jobs must succeed, except for the split workflow's
 `verify` gates after a worker cancellation. Those gates must show the
 exact completed setup/failure/cleanup sequence. Their sole user step
-checks the two matrix results. A worker failure, an unknown cancellation, or another gate failure
-keeps the baseline blocked, even when the wall time is at or below 900 s.
-The classifier reads structured step status and conclusion, runner IDs and
-timestamps. It does not read job logs or step names.
+checks the two matrix results. A worker failure, an unknown cancellation,
+or another gate failure keeps the baseline blocked, even when the wall
+time is at or below 900 s.
+
+For a potential recovery, policy reads one bounded annotations page per
+structurally eligible cancelled job. It verifies that the job's check URL
+identifies that job in the same repository and only then requests the
+repository-local endpoint. It accepts one exact provider failure
+annotation at the Actions system location, with no other failure on that
+page. Missing, ambiguous or truncated evidence blocks recovery. This
+requires `checks: read` on the trusted policy workflow. Job logs are
+outside the decision.
 
 When the listing reports a later successful attempt of that same run, fetch
 only that attempt and its bounded jobs page. Require the same run and head, a

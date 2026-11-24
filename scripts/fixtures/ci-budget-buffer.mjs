@@ -11,6 +11,8 @@ const probesBuffer = ['large-candidate', 'removed-label'].includes(scenario) || 
 const incompleteMain = ['incomplete-main', 'fast-incomplete-main', 'record-incomplete-main'].includes(scenario);
 const mainSeconds = ['fast-main', 'fast-incomplete-main', 'record-incomplete-main'].includes(scenario) ? 800 : 1200;
 const recovery = scenario.startsWith('recovery-');
+const activeMain = scenario === 'recovery-rerun-in-progress' ? 'in_progress'
+  : ['recovery-push-queued', 'record-push-queued'].includes(scenario) ? 'queued' : null;
 const head = 'a'.repeat(40);
 const repository = scenario === 'invalid-repository' ? 'https://unsafe' : 'example/arxcovo';
 const prefix = 'repos/example/arxcovo/';
@@ -30,6 +32,7 @@ const run = (id, seconds, extra = {}) => ({
 });
 
 const at = seconds => new Date(Date.UTC(2026, 0, 1) + seconds * 1000).toISOString().replace('.000Z', 'Z');
+const completedStep = name => ({ name, status: 'completed', conclusion: 'success' });
 function recoveryRun(attempt) {
   if (attempt === 1) return run(20, 913, { conclusion: scenario === 'recovery-slow-first' ? 'success' : 'failure' });
   return run(20, 613, { run_attempt: 2, run_started_at: at(2000), updated_at: at(2613) });
@@ -58,10 +61,15 @@ function recoveryJobs(attempt) {
     if (firstRed && phase === 'rust' && index === 1) {
       job.conclusion = scenario === 'recovery-worker-failure' ? 'failure' : 'cancelled';
       job.completed_at = at(scenario === 'recovery-unknown-cancellation' ? 719 : 749);
+      job.steps = ['Set up job', 'Verify pinned SQLite binding build', 'Preflight loader environment and run workspace tests', 'Complete job'].map(completedStep);
+      if (scenario === 'recovery-setup-only') job.steps = job.steps.slice(0, 1);
+      if (scenario === 'recovery-test-cancelled') job.steps[2].conclusion = 'cancelled';
     }
     if (firstRed && phase === 'rust' && index === 2) {
       Object.assign(job, { conclusion: 'cancelled', runner_id: 0, steps: [], completed_at: at(workerEnd) });
     }
+    job.check_run_url = `https://api.github.com/${prefix}check-runs/${job.id}`;
+    if (job.id === 2 && scenario === 'recovery-wrong-check-run') job.check_run_url += '9';
     return job;
   }));
   if (attempt === 2 && scenario === 'recovery-partial-rerun') jobs[0].started_at = at(0);
@@ -80,16 +88,32 @@ function response(path, args) {
     prReads++;
     return { ...pr, labels: scenario === 'removed-label' && prReads > 1 ? [] : pr.labels };
   }
-  if (path === `commits/${head}/status?per_page=100`) return { statuses: [] };
+  if (path === `commits/${head}/status?per_page=100`) return {
+    statuses: activeMain ? [{ context: 'ci-time-budget', state: 'success', description: 'Main run 19: attempt 1: wall 600s, charged 600s; budget satisfied' }] : [],
+  };
   if (path === `statuses/${head}`) {
     assert.deepEqual(Array.from(args.slice(0, 2)), ['-X', 'POST']);
     assert.equal(args[5], 'context=ci-time-budget');
     posts.push({ sha: head, state: args[3].slice('state='.length), description: args[7].slice('description='.length) });
     return {};
   }
-  if (path === 'actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&per_page=100') {
-    const latest = recovery && scenario === 'recovery-awaiting-rerun' ? recoveryRun(1) : run(20, 1, {run_attempt: 2});
-    return { workflow_runs: [run(19, 1), latest], ...(scenario === 'oversized-main' ? { padding: 'x'.repeat(9 * 1024 * 1024) } : {}) };
+  if (/^actions\/workflows\/ci\.yml\/runs\?branch=main&event=push(?:&status=completed)?&per_page=100$/.test(path)) {
+    const latest = activeMain ? run(20, 1, { status: activeMain, conclusion: null, run_attempt: activeMain === 'queued' ? 1 : 2 })
+      : scenario === 'recovery-awaiting-rerun' ? recoveryRun(1) : run(20, 1, {run_attempt: 2});
+    const workflow_runs = activeMain && path.includes('&status=completed') ? [run(19, 600)] : [run(19, 600), latest];
+    return { workflow_runs, ...(scenario === 'oversized-main' ? { padding: 'x'.repeat(9 * 1024 * 1024) } : {}) };
+  }
+  const checkRun = recovery && path.match(/^check-runs\/([23])\/annotations\?per_page=100$/);
+  if (checkRun) {
+    const unassigned = checkRun[1] === '3';
+    if ((unassigned && scenario === 'recovery-no-acquisition-evidence') ||
+        (!unassigned && scenario === 'recovery-no-deadline-evidence')) return [];
+    return [{
+      path: '.github', start_line: 1, end_line: 1, start_column: null, end_column: null,
+      annotation_level: 'failure', title: '', raw_details: '',
+      message: unassigned ? 'The job was not acquired by Runner of type hosted even after multiple attempts'
+        : 'The job has exceeded the maximum execution time of 12m0s',
+    }];
   }
   const recoveryPath = recovery && path.match(/^actions\/runs\/20\/attempts\/([12])(\/jobs\?per_page=100)?$/);
   if (recoveryPath) {
@@ -97,7 +121,8 @@ function response(path, args) {
     return recoveryPath[2] ? recoveryJobs(attempt) : recoveryRun(attempt);
   }
   if (path === 'actions/runs/20/attempts/1') return run(20, mainSeconds, scenario === 'attempt2-main' ? {run_attempt: 2} : incompleteMain ? {status: 'in_progress'} : {});
-  const jobsPath = path.match(/^actions\/runs\/(20|11)\/attempts\/1\/jobs\?per_page=100$/);
+  if (path === 'actions/runs/19/attempts/1') return run(19, 600);
+  const jobsPath = path.match(/^actions\/runs\/(19|20|11)\/attempts\/1\/jobs\?per_page=100$/);
   if (jobsPath) {
     if (scenario === 'missing-jobs') throw Error('Synthetic unavailable jobs transport');
     const id = Number(jobsPath[1]);

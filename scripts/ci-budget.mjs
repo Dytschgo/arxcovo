@@ -7,20 +7,34 @@ const repository = process.env.GITHUB_REPOSITORY;
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? '')) throw Error('Invalid repository');
 const api = (path, args = []) => JSON.parse(execFileSync('gh', ['api', `repos/${repository}/${path}`, ...args], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }));
 const runs = query => api(`actions/workflows/ci.yml/runs?${query}&per_page=100`).workflow_runs;
-const measure = (listed, kind, repositoryId, attempt = 1) => {
+const readAnnotations = job => {
+  const path = `check-runs/${job.id}`;
+  const url = `https://api.github.com/repos/${repository.toLowerCase()}/${path}`;
+  if (typeof job.check_run_url !== 'string' || job.check_run_url.toLowerCase() !== url) return [];
+  return api(`${path}/annotations?per_page=100`);
+};
+const measure = (listed, kind, repositoryId, options = {}) => {
+  const { attempt = 1 } = options;
   const path = `actions/runs/${listed.id}/attempts/${attempt}`;
   const run = api(path);
   const jobs = api(`${path}/jobs?per_page=100`);
   // Keep the existing completed-attempt baseline validation before optional credit.
-  return queueMeasurement(duration(run), run, jobs, listed, kind, repositoryId, attempt);
+  return queueMeasurement(duration(run), run, jobs, listed, kind, repositoryId, options);
 };
 const getMainRun = () => {
-  const listed = runs('branch=main&event=push&status=completed').sort((a, b) => b.run_number - a.run_number)[0];
+  const mainRuns = runs('branch=main&event=push');
+  if (!Array.isArray(mainRuns) || mainRuns.some(run => !Number.isSafeInteger(run?.run_number) || run.run_number < 1)) {
+    throw Error('Invalid main CI listing');
+  }
+  const listed = mainRuns.sort((a, b) => b.run_number - a.run_number)[0];
   if (!listed) return null;
-  const first = measure(listed, 'main');
   const attempt = listed.run_attempt;
-  if (!first.runnerCancelled || listed.conclusion !== 'success' || !Number.isSafeInteger(attempt) || attempt <= 1) return first;
-  const retry = measure(listed, 'main', undefined, attempt);
+  if (!Number.isSafeInteger(listed.id) || listed.id < 1 || !Number.isSafeInteger(attempt) || attempt < 1) throw Error('Invalid main CI listing');
+  if (listed.status !== 'completed') return { runId: listed.id, attempt, pending: true };
+  const canRecover = listed.conclusion === 'success' && attempt > 1;
+  const first = measure(listed, 'main', undefined, canRecover ? { readAnnotations } : {});
+  if (!first.runnerCancelled) return first;
+  const retry = measure(listed, 'main', undefined, { attempt });
   // Reused jobs have timestamps from earlier attempts and cannot earn credit.
   return retry.credit === 'applied' && retry.jobs.length === first.jobs.length ? { ...retry, attempt } : first;
 };
@@ -32,7 +46,7 @@ const postStatus = statuses.post;
 
 if (process.argv.includes('--record')) {
   const latest = getMainRun();
-  if (!latest) throw Error('No baseline to record');
+  if (!latest || latest.pending) throw Error('No completed baseline to record');
   const path = 'docs/ci-duration-history.json';
   const records = JSON.parse(readFileSync(path, 'utf8'));
   if (!records.some(record => record.runId === latest.runId)) {

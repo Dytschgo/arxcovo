@@ -1,6 +1,11 @@
 export const RUST_UBUNTU_RUNNER = 'ubuntu-24.04';
 const JOB_TIMEOUT_SECONDS = 12 * 60;
 const JOB_TIMEOUT_SETTLE_SECONDS = 30;
+const requiredWork = {
+  rust: ['Verify pinned SQLite binding build', 'Preflight loader environment and run workspace tests'],
+  ui: ['Run npm run build', 'Run npm test'],
+  verify: ['Require every Rust and UI worker to succeed'],
+};
 
 export function budget(latest, candidate, speed) {
   if (!latest || !Number.isFinite(latest.seconds) || latest.seconds < 0) throw Error('No valid completed main CI baseline');
@@ -22,16 +27,33 @@ function timestamp(value) {
   return Number.isFinite(ms) && new Date(ms).toISOString() === value.replace('Z', '.000Z') ? ms / 1000 : NaN;
 }
 
-function isRunnerCancellation(job, split) {
-  if (job.conclusion !== 'cancelled' || !Array.isArray(job.steps)) return false;
-  if (job.runner_id === 0) return job.steps.length === 0 && job.created_at === job.started_at;
+function runnerCancellationReason(job, split) {
+  if (!Array.isArray(job.steps)) return null;
+  if (job.runner_id === 0 && job.steps.length === 0 && job.created_at === job.started_at) {
+    return 'The job was not acquired by Runner of type hosted even after multiple attempts';
+  }
   const seconds = timestamp(job.completed_at) - timestamp(job.started_at);
-  // A cancelled or failed step could be a hung or failing test. Only recognize
-  // the current split workflow's job deadline after all reported steps settled.
-  return split && Number.isSafeInteger(job.runner_id) && job.runner_id > 0 &&
-    seconds >= JOB_TIMEOUT_SECONDS && seconds <= JOB_TIMEOUT_SECONDS + JOB_TIMEOUT_SETTLE_SECONDS &&
-    job.steps.some(step => step?.conclusion === 'success') &&
-    job.steps.every(step => step?.status === 'completed' && ['success', 'skipped'].includes(step.conclusion));
+  if (!split || !Number.isSafeInteger(job.runner_id) || job.runner_id <= 0 ||
+      seconds < JOB_TIMEOUT_SECONDS || seconds > JOB_TIMEOUT_SECONDS + JOB_TIMEOUT_SETTLE_SECONDS) return null;
+  if (!job.steps.every(step => step?.status === 'completed' && ['success', 'skipped'].includes(step.conclusion))) return null;
+  const completed = new Set(job.steps.filter(step => step.conclusion === 'success').map(step => step.name));
+  const finalStep = job.steps.at(-1);
+  const phase = job.name.split(' ')[0];
+  // A job deadline while a required step is missing or cancelled may be a test hang.
+  return finalStep?.name === 'Complete job' && finalStep.conclusion === 'success' &&
+    requiredWork[phase].every(step => completed.has(step))
+    ? 'The job has exceeded the maximum execution time of 12m0s'
+    : null;
+}
+
+function hasRunnerAnnotation(annotations, message) {
+  if (!Array.isArray(annotations) || annotations.length >= 100) return false;
+  const failures = annotations.filter(annotation => annotation?.annotation_level === 'failure');
+  if (failures.length !== 1) return false;
+  const [failure] = failures;
+  return failure.path === '.github' && failure.start_line === 1 && failure.end_line === 1 &&
+    failure.start_column === null && failure.end_column === null && failure.title === '' &&
+    failure.raw_details === '' && failure.message === message;
 }
 
 function isDependencyFailure(job) {
@@ -43,20 +65,23 @@ function isDependencyFailure(job) {
     });
 }
 
-function onlyRunnerCancellations(run, jobs, split) {
+function onlyRunnerCancellations(run, jobs, split, readAnnotations) {
   if (!['cancelled', 'failure'].includes(run.conclusion)) return false;
   const cancelled = jobs.filter(job => job.conclusion === 'cancelled');
-  if (!cancelled.length || !cancelled.every(job => isRunnerCancellation(job, split))) return false;
+  if (!cancelled.length) return false;
   const cancelledWorker = split && cancelled.some(job => !job.name.startsWith('verify ('));
-  return jobs.every(job => {
+  const otherJobsExpected = jobs.every(job => {
     if (job.conclusion === 'cancelled') return true;
     if (cancelledWorker && job.name.startsWith('verify (')) return isDependencyFailure(job);
     return job.conclusion === 'success';
   });
+  const reasons = cancelled.map(job => runnerCancellationReason(job, split));
+  return otherJobsExpected && reasons.every(Boolean) &&
+    cancelled.every((job, i) => hasRunnerAnnotation(readAnnotations(job), reasons[i]));
 }
 
 // All validation precedes the sweep. Metadata defects on green runs retain the wall rule.
-export function queueMeasurement(wall, run, payload, listed, kind, repositoryId, attempt = 1) {
+export function queueMeasurement(wall, run, payload, listed, kind, repositoryId, { attempt = 1, readAnnotations } = {}) {
   const unavailable = code => ({ ...wall, metric: 'charged-v1', chargedSeconds: null, queueCreditSeconds: null, longestJobSeconds: null, credit: `unavailable:${code}`, jobs: [] });
   const S = timestamp(run?.run_started_at), U = timestamp(run?.updated_at);
   if (!run || !Number.isSafeInteger(run.id) || run.id < 1 || run.id !== listed.id || run.run_attempt !== attempt ||
@@ -103,7 +128,7 @@ export function queueMeasurement(wall, run, payload, listed, kind, repositoryId,
   return { ...wall, metric: 'charged-v1', chargedSeconds: wall.seconds - queueCreditSeconds, queueCreditSeconds,
     longestJobSeconds: Math.max(...intervals.map(({ s, e }) => e - s)),
     credit: run.conclusion === 'success' && payload.jobs.every(job => job.conclusion === 'success') ? 'applied' : 'withheld:not-green',
-    ...(kind === 'main' && attempt === 1 && onlyRunnerCancellations(run, payload.jobs, split) ? { runnerCancelled: true } : {}),
+    ...(kind === 'main' && attempt === 1 && readAnnotations && onlyRunnerCancellations(run, payload.jobs, split, readAnnotations) ? { runnerCancelled: true } : {}),
     jobs: payload.jobs.map(job => ({ id: job.id, name: job.name, conclusion: job.conclusion, created: job.created_at, started: job.started_at, completed: job.completed_at })).sort((a, b) => a.name.localeCompare(b.name)) };
 }
 export function eligible(author, association, sameRepository, allowlist) {

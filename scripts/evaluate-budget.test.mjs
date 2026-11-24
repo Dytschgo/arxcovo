@@ -14,7 +14,7 @@ test('fast main passes without history or a candidate measurement', async () => 
   io.getCandidateRun = () => assert.fail('fast baseline needs no candidate');
   await evaluatePullRequests(io);
   assert.equal(posts.at(-1).state, 'success');
-  assert.match(posts.at(-1).description, /42: wall 40s/);
+  assert.match(posts.at(-1).description, /42: attempt 1: wall 40s/);
 });
 test('measurement failure invalidates old success for every discovered PR', async () => {
   const { io, posts, pr } = fixture();
@@ -39,6 +39,15 @@ test('recovered main replaces a status scoped to the same run and an earlier att
   await evaluatePullRequests(io);
   assert.deepEqual(posts.map(post => post.state), ['pending', 'success']);
   assert.equal(posts.at(-1).description, 'Main run 42: attempt 3: wall 613s, charged 610s; budget satisfied');
+});
+
+test('falling back to the failed first attempt invalidates a success from the same run', async () => {
+  const { io, posts } = fixture();
+  io.getStatus = () => ({ state: 'success', description: 'Main run 42: attempt 2: wall 700s, charged 690s; budget satisfied' });
+  io.getMainRun = () => ({ runId: 42, seconds: 913, conclusion: 'failure' });
+  await evaluatePullRequests(io);
+  assert.deepEqual(posts.map(post => post.state), ['pending', 'failure']);
+  assert.match(posts[0].description, /^Main run 42: attempt 1:/);
 });
 
 test('a non-green main under 900 seconds blocks without reading a speed candidate', async () => {
@@ -119,7 +128,7 @@ test('status descriptions retain main marker and fit 140 characters without publ
     const latest = { runId: 43880904887, seconds: 604800, chargedSeconds: credit.startsWith('unavailable') ? null : 604800, longestJobSeconds: 604800, credit, conclusion: credit === 'applied' ? 'success' : 'failure' };
     for (const candidate of [null, { ...latest, chargedSeconds: 604799, longestJobSeconds: 604799 }]) {
       const result = decideBudget(latest, candidate, [{name: 'ci-speed'}]);
-      assert.ok(result.description.startsWith('Main run 43880904887:'));
+      assert.ok(result.description.startsWith('Main run 43880904887: attempt 1:'));
       assert.ok(result.description.length <= 140, result.description);
       if (credit === 'withheld:not-green') assert.match(result.description, /uncredited \(not-green\)/);
     }

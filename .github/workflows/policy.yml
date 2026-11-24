@@ -2,7 +2,7 @@ name: CI policy
 on:
   workflow_run:
     workflows: [CI, Policy signal]
-    types: [requested, completed]
+    types: [requested, in_progress, completed]
   workflow_dispatch:
   schedule:
     - cron: '*/30 * * * *'
@@ -12,10 +12,12 @@ concurrency:
 permissions:
   contents: read
   actions: read
+  checks: read
   statuses: write
   pull-requests: read
 jobs:
   evaluate:
+    if: github.event.action != 'in_progress' || (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

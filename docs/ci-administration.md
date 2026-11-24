@@ -1,6 +1,6 @@
 # Coordinator CI administration
 
-Historical installation instructions below are not an activation grant. Protection is already installed. PR163 refresh is preparation only: the owner accepted ADR0025's definition, while activation/bootstrap/protection/merge remain unauthorized. ADR0022/#57 and PR164 exceptions are consumed.
+Protection is installed. The installation and bootstrap plans below are historical. ADR 0025 records the charged-v1 activation and the consumed exceptions.
 
 ## Review and protection
 
@@ -33,17 +33,29 @@ The command checks the allowlist, same-repository source, OWNER/MEMBER/COLLABORA
 
 ## Measurement and records
 
-Policy runs trusted default-branch code on workflow_run for CI and label signals, with a periodic retry. It never executes candidate code. API calls are bounded; discovery at 100 open PRs fails closed and needs pagination before scaling. Head and labels are read live; statuses are per SHA. Attempt 1 supplies the wall-clock measurement so a partial rerun cannot appear faster. The latest completed main push run is authoritative. Missing baseline fails. The currently active wall policy permits only a successful faster same-head/repository ci-speed candidate when main exceeds 900 seconds.
+The trusted default-branch policy runs on CI and label signals and retries
+periodically. It reads PR head and labels live and publishes per-SHA statuses.
+API reads are bounded. Discovery at 100 open PRs and transport errors fail closed.
 
-**Owner-accepted amendment, conditional and not active:** [ADR0025](adr/0025-ci-queue-outage-budget.md) retains wall seconds and adds charged-v1. A validated sweep credits only intervals with a created pending required job and no executing job. Execution, overlapping waits, prefix/tail and no-pending idle remain charged. The exact three completed platform jobs must match attempt 1, run/head, names, labels and strict timestamp ranges. One bounded jobs page is read; invalid metadata withholds credit with run-invalid/jobs-invalid, using the original wall gate. Transport/8 MiB overflow still fails closed. Failed runs or jobs retain computed measurements as not-green but receive no credit. A green valid baseline may use charged time at the unchanged 900s threshold. Above it, ci-speed requires BOTH baseline and candidate green/creditable and strictly reduced charged time AND longest execution. These metrics alone do not prove a source speedup or exclude runtime noise.
+[ADR 0025](adr/0025-ci-queue-outage-budget.md) defines the active charged-v1
+budget. Valid green runs get credit only for intervals with a pending required
+job and no executing job. Invalid timing metadata on a green run leaves the
+wall-time rule in effect with the same 900 s threshold. Above that threshold,
+`ci-speed` requires green, creditable measurements for main and the candidate,
+with strict reductions in charged time and longest job execution. Candidates
+use attempt 1 of the latest completed same-head, same-repository PR run.
 
-Historical main43880904887 was RED: wall1475s/charged738s/Q737s/longest372s, credit withheld. PR162 run43889323450 is green: wall1311s/charged877s/Q434s/longest585s. It cannot qualify for ci-speed against this failed main. Current main3022d601 run44126173935 attempt1 failed at905s due to zero-step macOS infrastructure cancellation; the single final read verified root's macOS-only attempt2 completed/success on exact3022d601. Functional health is restored; its outcome cannot credit attempt1. The separate exact-main health prerequisite remains binding.
+With the runner recovery amendment, the latest main push CI run is
+authoritative. An unfinished run keeps the status pending, and a missing
+baseline fails. A completed non-green baseline blocks even below 900 s unless
+it satisfies the recovery rule below. Status descriptions identify the
+measurement as `Main run {id}: attempt {n}:`. A change in run or attempt
+invalidates old success before evaluating the current head. Unchanged
+statuses are deduplicated, and a failed update on one head does not stop
+evaluation of others.
 
-Status publication compares the current context's state and description and skips unchanged results. Unchanged heads are not cycled through pending on periodic checks. The `Main run {id}:` marker remains intact; descriptions report wall, charged or unavailability, and verdict within 140 characters. A changed main measurement invalidates old successes; errors for one head do not prevent evaluating the others. The evaluator reports aggregate failure if a head cannot be updated.
-
-The 30 existing duration-history records remain untouched and wall-only. After separately authorized activation, `--record` may append new run ids with charged-v1 fields and validated sorted job timestamps; duplicate ids are not rewritten. Preparation executes only synthetic VM record tests with intercepted filesystem/API operations, never live `scripts/ci-budget.mjs` or `--record`. A GitHub API outage can prevent status updates; evaluation fails rather than claiming to update unreachable heads.
-
-This is preparation only, pending root review and independent Sol6.1 high source/exact-head review under current routing. The owner already accepted KICKOFF's definition deviation. Activation, bootstrap, status/label/protection changes and merges remain unauthorized. Historical installation text and consumed ADR0022/#57 or PR164 exceptions grant nothing for this refresh.
+`--record` appends completed measurements by run ID with charged-v1 fields and
+validated, sorted job timestamps. Duplicate IDs and existing rows are preserved.
 
 ## Historical installation acceptance plan
 

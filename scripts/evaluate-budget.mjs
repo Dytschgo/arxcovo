@@ -13,9 +13,10 @@ export async function evaluateEvent(io, triggeringHead) {
   }
 }
 
-const mainMarker = latest => latest ? `Main run ${latest.runId}:${latest.attempt ? ` attempt ${latest.attempt}:` : ''}` : 'No valid completed main CI baseline';
+const mainMarker = latest => latest ? `Main run ${latest.runId}: attempt ${latest.attempt ?? 1}:` : 'No valid completed main CI baseline';
 
 export function decideBudget(latest, candidate, labels) {
+  if (latest?.pending) return { state: 'pending', description: `${mainMarker(latest)} waiting for CI completion` };
   const charged = latest?.chargedSeconds == null ? `n/a (${latest?.credit?.split(':')[1] ?? 'run-invalid'})` : `${latest.chargedSeconds}s${creditable(latest) ? '' : ' uncredited (not-green)'}`;
   const prefix = latest ? `${mainMarker(latest)} wall ${latest.seconds}s, charged ${charged}; ` : '';
   try {
@@ -62,6 +63,11 @@ export async function evaluatePullRequests({ listPullRequests, getPullRequest, g
       const pr = await getPullRequest(listed.number);
       head = pr.head.sha;
       if (pr.state !== 'open') continue;
+      if (latest?.pending) {
+        const result = decideBudget(latest, null, []);
+        await postStatus(head, result.state, result.description);
+        continue;
+      }
       const previous = await getStatus(head);
       const marker = mainMarker(latest);
       // Unchanged final results stay final. Only invalidate an old success when

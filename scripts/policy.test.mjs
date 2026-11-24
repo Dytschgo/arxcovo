@@ -32,7 +32,7 @@ function sample(spans = [[0, 400, 500], [0, 400, 500], [0, 400, 500]], seconds =
   const jobs = { total_count: 3, jobs: spans.map(([c, s, e], i) => ({ id: i + 1, run_id: 42, run_attempt: 1, head_sha: run.head_sha, name: `verify (${['ubuntu', 'windows', 'macos'][i]}-latest)`, labels: [`${['ubuntu', 'windows', 'macos'][i]}-latest`], status: 'completed', conclusion: 'success', created_at: iso(c), started_at: iso(s), completed_at: iso(e) })) };
   return { run, jobs };
 }
-const measure = ({ run, jobs }, listed = run, kind = 'main', repositoryId) => queueMeasurement(duration(run), run, jobs, listed, kind, repositoryId);
+const measure = ({ run, jobs, readAnnotations }, listed = run, kind = 'main', repositoryId) => queueMeasurement(duration(run), run, jobs, listed, kind, repositoryId, { readAnnotations });
 
 function splitSample(workerSpans = Array(6).fill([0, 400, 500]), gateSpans = Array(3).fill([500, 600, 700]), seconds = 1000) {
   const data = sample(undefined, seconds);
@@ -369,8 +369,16 @@ test('main recovery requires every cancellation and dependent verify failure to 
       [[0, 0, 749], [0, 0, 903], ...Array(4).fill([0, 0, 300])], Array(3).fill([903, 905, 909]), 913,
     );
     data.run.conclusion = 'failure';
-    Object.assign(data.jobs.jobs[0], { conclusion: 'cancelled', runner_id: 123, steps: [{ status: 'completed', conclusion: 'success' }] });
+    const steps = ['Set up job', 'Verify pinned SQLite binding build', 'Preflight loader environment and run workspace tests', 'Complete job']
+      .map(name => ({ name, status: 'completed', conclusion: 'success' }));
+    Object.assign(data.jobs.jobs[0], { conclusion: 'cancelled', runner_id: 123, steps });
     Object.assign(data.jobs.jobs[1], { conclusion: 'cancelled', runner_id: 0, steps: [] });
+    data.readAnnotations = job => [{
+      path: '.github', start_line: 1, end_line: 1, start_column: null, end_column: null,
+      title: '', raw_details: '', annotation_level: 'failure',
+      message: job.runner_id === 0 ? 'The job was not acquired by Runner of type hosted even after multiple attempts'
+        : 'The job has exceeded the maximum execution time of 12m0s',
+    }];
     for (const job of data.jobs.jobs.slice(6)) {
       job.conclusion = 'failure';
       job.steps = ['success', 'failure', 'success'].map((conclusion, i) => ({ number: i + 1, status: 'completed', conclusion }));
@@ -387,12 +395,27 @@ test('main recovery requires every cancellation and dependent verify failure to 
     ['failed step', ({ jobs }) => { jobs.jobs[0].steps[0].conclusion = 'failure'; }],
     ['unfinished step', ({ jobs }) => { jobs.jobs[0].steps[0].status = 'in_progress'; }],
     ['no completed worker step', ({ jobs }) => { jobs.jobs[0].steps = []; }],
+    ['missing successful build step', ({ jobs }) => { jobs.jobs[0].steps.splice(1, 1); }],
+    ['missing successful workspace test step', ({ jobs }) => { jobs.jobs[0].steps.splice(2, 1); }],
+    ['missing job completion step', ({ jobs }) => { jobs.jobs[0].steps.pop(); }],
     ['unknown runner ID', ({ jobs }) => { delete jobs.jobs[1].runner_id; }],
     ['no-runner job started', ({ jobs }) => { jobs.jobs[1].started_at = iso(1); }],
     ['no-runner job ran a step', ({ jobs }) => { jobs.jobs[1].steps = [{ status: 'completed', conclusion: 'success' }]; }],
     ['wrong gate failure step', ({ jobs }) => { jobs.jobs[6].steps[1].number = 4; }],
     ['gate unexpectedly passed', ({ jobs }) => { jobs.jobs[6].conclusion = 'success'; }],
     ['wrong attempt', ({ jobs }) => { jobs.jobs[1].run_attempt = 2; }],
+    ['annotation text at another path', data => {
+      const read = data.readAnnotations;
+      data.readAnnotations = job => read(job).map(annotation => ({ ...annotation, path: 'repo.txt' }));
+    }],
+    ['additional failure annotation', data => {
+      const read = data.readAnnotations;
+      data.readAnnotations = job => [...read(job), { annotation_level: 'failure', message: 'Unknown failure' }];
+    }],
+    ['potentially paginated evidence', data => {
+      const read = data.readAnnotations;
+      data.readAnnotations = job => [...read(job), ...Array(99).fill({ annotation_level: 'warning' })];
+    }],
   ];
   for (const [name, mutate] of mutations) {
     const data = make();
