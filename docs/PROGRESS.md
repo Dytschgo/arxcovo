@@ -524,7 +524,7 @@ Per-task provider, effort and outcome for this batch. Effort and the attempt tal
 
   | PR | Merge | What | Agent-review status |
   | --- | --- | --- | --- |
-  | #301 | `31f7c963` | M4 7a runbook nits | none in the notes |
+  | #301 | `31f7c963` | M4 7a runbook nits | `59735479608` |
   | #290 | `3b9c84c3` | Cloudflare B2, tunnel publish and unpublish | `59745830250` |
   | #302 | `ba71d096` | M4 7b1, closed qualification runner | `59749717099` |
   | #303 | `ae2df911` | Docker E2a, guest Compose side | `59759649014` |
@@ -547,8 +547,8 @@ Per-task provider, effort and outcome for this batch. Effort and the attempt tal
     - E2b, the host half, has not started. It waits for 6b.
   - **Cloudflare B2 (#290).** The implementation merged at `3b9c84c3`. Acceptance of the real tunnel (off by default, owner credential, fakes in CI) has not been shown on hardware. **Blocker:** the live tunnel has not been run. Re-review 10 PASS `e8623d16…9002` (Opus, bounded contract), status `59745830250`. Builders: Sol 3/3, Opus 3/3, Opus #2 3/3, Opus #3 1/3. A non-blocking known issue is on the ROADMAP: after a failed `revoking` checkpoint during a database outage, the worker failure reason is lost and falls back to `cancelled`. The live tunnel is **unverified on real hardware**.
   - **Owner decisions (2026-11-24, direct).**
-    - Per-PR builder authorizations, each for that task: #290 Opus builder #3 (the notes' 4th per-case); #302 Opus builder #2 (5th per-case); M4 6b Neon, after the Sol stop; M4 6b Neon #2 (6th per-case); M4 6b Astra builder #2 (7th per-case), after a short independent review.
-    - Use Neon instead of Opus for now, and let the current ones finish. The Opus agents left to finish were the E2a builder and the #302 builder. New Opus-role delegations in that window went to Gemini 4 Neon at thought level high.
+    - Per-PR builder authorizations, each for that task: #290 Opus builder #3 (the notes' 4th per-case); #302 Opus builder #2 (5th per-case); M4 6b Neon #2 (6th per-case); M4 6b Astra builder #2 (7th per-case), after a short independent review.
+    - Use Neon instead of Opus for now, and let the current ones finish. The Opus agents left to finish were the E2a builder and the #302 builder. New Opus-role delegations in that window went to Gemini 4 Neon at thought level high. Under this routing, the first M4 6b Neon builder followed the Sol stop as the standing Opus-after-Sol substitute (owner 2026-11-22 rule), not as a per-case authorization.
     - After the Neon quota stop: use Astra 6.2 for the open tasks until Neon resets.
   - **Counted builder failures.** This list is the attempt counters.
     - #290 Opus #2 stopped at 3/3 in round 7. Failure 3: the first run of the new TLS test failed in the fake server `accept()` with `BrokenPipe`. The client-side assertions held. WIP `b569a2dc` (on merge `8341eaff`) was pinned as `wip/cf-b2-r7-opus2-stop`. Sol 3/3 and the first Opus 3/3 stay as recorded under Since #287.
