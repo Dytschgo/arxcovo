@@ -13,6 +13,9 @@ use windows_sys::Win32::Storage::FileSystem::*;
 
 pub(super) type Id = [u8; 16];
 
+#[path = "../vault_fixtures/private.rs"]
+mod private_fixture;
+
 const MAX_ARTIFACT: u64 = 200 * 1024 * 1024 * 1024;
 type Hash = [u8; 32];
 
@@ -180,6 +183,17 @@ impl PairProof {
     }
 }
 
+// The store constant is private. Read its declaration from the same crate
+// source used to build this test, and refuse if it is no longer readable.
+fn built_vm_schema_version() -> Result<u32> {
+    include_str!("../../src/store/vm.rs")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("const VM_SCHEMA_VERSION: u32 ="))
+        .and_then(|value| value.trim().strip_suffix(';'))
+        .and_then(|value| value.parse().ok())
+        .ok_or(Failure::Check("built_ledger_version"))
+}
+
 impl Ledger {
     /// The real foreground sweeps at startup. Check a stopped store before
     /// launching it, so a wrong profile cannot sweep someone else's VMs.
@@ -283,7 +297,7 @@ impl Ledger {
             safe(
                 db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)),
                 "ledger_version",
-            )? == 11,
+            )? == built_vm_schema_version()?,
             "ledger_version",
         )?;
         Ok(Self {
@@ -692,8 +706,7 @@ fn startup_preflight_refuses_occupied_or_foreign_inventory() {
     let database = Connection::open(state.join("activity.sqlite3")).unwrap();
     database
         .execute_batch(
-            "PRAGMA user_version=11;
-         CREATE TABLE vm_instances (id INTEGER);
+            "CREATE TABLE vm_instances (id INTEGER);
          CREATE TABLE vm_static_instances (id INTEGER);
          CREATE TABLE vm_restore_points (id INTEGER);
          CREATE TABLE vm_snapshot_work (id INTEGER);
@@ -703,6 +716,9 @@ fn startup_preflight_refuses_occupied_or_foreign_inventory() {
          CREATE TABLE vm_templates (id BLOB);
          CREATE TABLE vm_artifacts (id BLOB);",
         )
+        .unwrap();
+    database
+        .pragma_update(None, "user_version", built_vm_schema_version().unwrap())
         .unwrap();
     drop(database);
 
@@ -740,4 +756,56 @@ fn startup_preflight_refuses_occupied_or_foreign_inventory() {
         Ledger::preflight(state, recipes),
         Err(Failure::Check("ledger_not_isolated"))
     );
+}
+
+#[test]
+fn ledger_accepts_the_store_version_written_by_the_built_crate() {
+    use arxd::vm::{Clock, ClockReading, VmController, VmPolicy};
+
+    struct StoreClock;
+
+    impl Clock for StoreClock {
+        fn now(&self) -> ClockReading {
+            ClockReading {
+                utc_ms: 1_800_000_000_000,
+                monotonic: std::time::Instant::now(),
+            }
+        }
+    }
+
+    let temporary = private_fixture::private_dir();
+    let state = temporary.path();
+    let recipes = [("ubuntu", "unused"), ("windows", "unused")];
+    let controller = VmController::open(state, VmPolicy::default(), StoreClock).unwrap();
+
+    // Check the reader against a real freshly migrated store. Read the
+    // version from that store rather than stamping it with the parser.
+    let path = state.join("activity.sqlite3");
+    let database = Connection::open(&path).unwrap();
+    let version: u32 = database
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(built_vm_schema_version(), Ok(version));
+    drop(database);
+    assert!(Ledger::open(state).is_ok());
+    drop(controller);
+    assert_eq!(Ledger::preflight(state, recipes), Ok(()));
+
+    for unsupported in [0, version - 1, version + 1] {
+        let database = Connection::open(&path).unwrap();
+        database
+            .pragma_update(None, "user_version", unsupported)
+            .unwrap();
+        drop(database);
+        let original = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            Ledger::open(state),
+            Err(Failure::Check("ledger_version"))
+        ));
+        assert_eq!(
+            Ledger::preflight(state, recipes),
+            Err(Failure::Check("ledger_version"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
 }

@@ -11,8 +11,10 @@ acceptance principal, public publishing disabled, and a fresh endpoint. Keep the
 daemon configuration and client configuration private. The
 [local bridge setup](windows-execution-accounts.md) describes the server identity
 pin. The client derives the media inventory from the foreground's configured
-custody root. Before startup, it verifies an empty store or an idle v11 ledger
-whose only media are the selected TEST goldens. The scan includes generation
+custody root. Before startup, it verifies an empty store or an idle ledger
+at the VM store schema version compiled into the client. The reader refuses
+older, newer, or unknown versions. The only media allowed are the selected TEST
+goldens. The scan includes generation
 directories, `disk-<key>` and `vars-<key>` leaves, and the ledger metadata.
 
 Prepare an owner-private JSON plan on D:. The qualification digest is an expected
