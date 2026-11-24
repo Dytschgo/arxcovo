@@ -667,3 +667,336 @@ fn dispatches_valid_scripts_and_returns_all_executor_statuses_in_order() {
     assert!(matches!(read_frame::<Response>(&mut reader), Ok(None)));
     assert_eq!(responses, golden);
 }
+
+mod compose_session {
+    use std::time::Duration;
+
+    use arx_guest::compose::{
+        COMPOSE_CAPABILITIES, Clock, CommandRunner, ComposeRequest, ComposeResponse,
+        ComposeService, ComposeStore, Invocation, RejectCode, RunResult, STAGE_CHUNK, SecretText,
+        StoreError, encode_base64,
+    };
+    use arx_guest::serve_with_compose;
+
+    use super::*;
+
+    const COMPOSE_HELLO: &[u8] = br#"{"type":"ComposeHello","version":1,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["lifecycle","logs","manifest","secrets","status"]}"#;
+    const COMPOSE_HELLO_ACK: &[u8] = br#"{"type":"ComposeHelloAck","version":1,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["lifecycle","logs","manifest","secrets","status"],"cleared_staging":0,"ambiguous_operations":0}"#;
+    const STATUS: &[u8] = br#"{"type":"ComposeStatus","id":3,"project_id":"calm-life"}"#;
+    const SCRIPT: &[u8] = br#"{"type":"RunScript","id":2,"script":"echo hello","timeout_s":1}"#;
+
+    struct NoEngine;
+
+    impl CommandRunner for NoEngine {
+        fn run(&mut self, _: &Invocation) -> RunResult {
+            panic!("the session reached the engine");
+        }
+
+        fn probe_http(&mut self, _: u16, _: &str) -> bool {
+            false
+        }
+
+        fn pause(&mut self, _: Duration) {}
+    }
+
+    struct NoStore;
+
+    impl ComposeStore for NoStore {
+        fn load_state(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
+            Ok(None)
+        }
+
+        fn save_state(&mut self, _: &[u8]) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn write_revision(&mut self, _: &str, _: u64, _: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn write_secret(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: (u32, u32),
+            _: &[u8],
+        ) -> Result<(), StoreError> {
+            panic!("an unknown project reached secret storage");
+        }
+
+        fn has_secret(&mut self, _: &str, _: &str, _: (u32, u32)) -> bool {
+            false
+        }
+
+        fn prepare_volume(&mut self, _: &str, _: (u32, u32)) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    struct ZeroClock;
+
+    impl Clock for ZeroClock {
+        fn now_unix(&self) -> u64 {
+            0
+        }
+    }
+
+    struct Fixed;
+
+    impl ScriptExecutor for Fixed {
+        fn script_execution(&self) -> ScriptExecution {
+            ScriptExecution::Available
+        }
+
+        fn run_script(&mut self, _: &str, _: u32) -> ScriptOutcome {
+            ScriptOutcome::Exited { exit_code: 3 }
+        }
+    }
+
+    fn service() -> ComposeService {
+        ComposeService::new(Box::new(NoEngine), Box::new(NoStore), Box::new(ZeroClock)).unwrap()
+    }
+
+    fn frames(payloads: &[&[u8]]) -> Vec<u8> {
+        payloads.iter().flat_map(|payload| frame(payload)).collect()
+    }
+
+    fn compose(input: &[u8]) -> (Result<(), ProtocolError>, Vec<u8>) {
+        let mut output = Vec::new();
+        let result = serve_with_compose(input, &mut output, &mut Fixed, Some(&service()));
+        (result, output)
+    }
+
+    fn hello_with(edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+        let mut value: serde_json::Value = serde_json::from_slice(COMPOSE_HELLO).unwrap();
+        edit(&mut value);
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    #[test]
+    fn legacy_sessions_keep_their_bytes_on_a_compose_guest() {
+        let streams: Vec<Vec<u8>> = vec![
+            frames(&[HELLO, PING, SCRIPT, HELLO, PING]),
+            frames(&[PING]),
+            frames(&[HELLO, br#"{"type":"Nope","id":1}"#]),
+            frames(&[HELLO, br#"{"type":"Ping","type":"ComposeHello","id":1}"#]),
+            frames(&[WRONG_VERSION_HELLO]),
+            frames(&[HELLO, b"[1]"]),
+            frames(&[HELLO, br#"{"type":"Ping","id":0}"#]),
+            frame(HELLO)[..9].to_vec(),
+        ];
+        for input in streams {
+            let mut legacy = Vec::new();
+            let legacy_result = serve(input.as_slice(), &mut legacy, &mut Fixed);
+            let (compose_result, compose_bytes) = compose(&input);
+            assert_eq!(compose_result, legacy_result);
+            assert_eq!(compose_bytes, legacy);
+        }
+        // A legacy guest still refuses the Compose handshake as unknown JSON.
+        let mut output = Vec::new();
+        assert_eq!(
+            serve(frame(COMPOSE_HELLO).as_slice(), &mut output, &mut Fixed),
+            Err(ProtocolError::InvalidJson)
+        );
+        assert!(output.is_empty());
+        // Without a Compose service the dispatcher is the legacy one.
+        let mut output = Vec::new();
+        assert_eq!(
+            serve_with_compose(
+                frame(COMPOSE_HELLO).as_slice(),
+                &mut output,
+                &mut Fixed,
+                None
+            ),
+            Err(ProtocolError::InvalidJson)
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn compose_hello_and_ack_have_golden_bytes() {
+        let request = ComposeRequest::ComposeHello {
+            version: 1,
+            challenge: CHALLENGE.to_owned(),
+            generation: 7,
+            capabilities: COMPOSE_CAPABILITIES.map(str::to_owned).to_vec(),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        assert_eq!(bytes, frame(COMPOSE_HELLO));
+        assert_eq!(
+            compose(&frame(COMPOSE_HELLO)),
+            (Ok(()), frame(COMPOSE_HELLO_ACK))
+        );
+    }
+
+    #[test]
+    fn compose_handshake_is_closed_and_sessions_stay_separate() {
+        let refused: Vec<(Vec<u8>, ProtocolError)> = vec![
+            (
+                hello_with(|v| {
+                    v["capabilities"] =
+                        serde_json::json!(["lifecycle", "logs", "manifest", "secrets"])
+                }),
+                ProtocolError::UnsupportedCapability,
+            ),
+            (
+                hello_with(|v| {
+                    v["capabilities"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push("shell".into())
+                }),
+                ProtocolError::UnsupportedCapability,
+            ),
+            (
+                hello_with(|v| v["capabilities"].as_array_mut().unwrap().reverse()),
+                ProtocolError::UnsupportedCapability,
+            ),
+            (
+                hello_with(|v| v["version"] = 2.into()),
+                ProtocolError::UnsupportedVersion,
+            ),
+            (
+                hello_with(|v| v["generation"] = 0.into()),
+                ProtocolError::InvalidComposeField,
+            ),
+            (
+                hello_with(|v| v["challenge"] = "ABC".into()),
+                ProtocolError::InvalidChallenge,
+            ),
+            (
+                hello_with(|v| v["debug"] = true.into()),
+                ProtocolError::InvalidJson,
+            ),
+            (STATUS.to_vec(), ProtocolError::ExpectedHello),
+        ];
+        for (payload, error) in refused {
+            assert_eq!(compose(&frame(&payload)), (Err(error), Vec::new()));
+        }
+
+        // Compose requests need the Compose handshake.
+        let (result, bytes) = compose(&frames(&[HELLO, STATUS]));
+        assert_eq!(result, Err(ProtocolError::ExpectedComposeHello));
+        let mut bytes = bytes.as_slice();
+        assert!(matches!(
+            read_frame::<Response>(&mut bytes),
+            Ok(Some(Response::HelloAck { .. }))
+        ));
+        assert!(bytes.is_empty());
+
+        // A Compose session answers Ping and refuses scripts; a legacy Hello
+        // starts a fresh legacy session.
+        let (result, bytes) = compose(&frames(&[COMPOSE_HELLO, PING, HELLO, SCRIPT]));
+        assert_eq!(result, Ok(()));
+        let mut expected = frame(COMPOSE_HELLO_ACK);
+        expected.extend(frame(br#"{"type":"Pong","id":1}"#));
+        expected.extend(frame(
+            br#"{"type":"HelloAck","version":1,"challenge":"0123456789abcdef0123456789abcdef","script_execution":"available"}"#,
+        ));
+        expected.extend(frame(
+            br#"{"type":"ScriptResult","id":2,"status":"Exited","exit_code":3}"#,
+        ));
+        assert_eq!(bytes, expected);
+        let (result, bytes) = compose(&frames(&[COMPOSE_HELLO, SCRIPT]));
+        assert_eq!(result, Err(ProtocolError::UnexpectedRequest));
+        assert_eq!(bytes, frame(COMPOSE_HELLO_ACK));
+
+        // Field bounds close the connection before dispatch.
+        for (payload, error) in [
+            (
+                &br#"{"type":"ComposeLogs","id":3,"project_id":"calm-life","cursor":0,"limit":33}"#
+                    [..],
+                ProtocolError::InvalidComposeField,
+            ),
+            (
+                br#"{"type":"ComposeStatus","id":3,"project_id":"Calm_Life"}"#,
+                ProtocolError::InvalidComposeField,
+            ),
+            (
+                br#"{"type":"ComposeStatus","id":0,"project_id":"calm-life"}"#,
+                ProtocolError::InvalidId,
+            ),
+            (
+                br#"{"type":"ComposeOperation","id":3,"operation_id":"xyz"}"#,
+                ProtocolError::InvalidComposeField,
+            ),
+        ] {
+            let (result, bytes) = compose(&frames(&[COMPOSE_HELLO, payload]));
+            assert_eq!(result, Err(error));
+            assert_eq!(bytes, frame(COMPOSE_HELLO_ACK));
+        }
+
+        // Typed refusals keep the session open.
+        let (result, bytes) = compose(&frames(&[COMPOSE_HELLO, STATUS, PING]));
+        assert_eq!(result, Ok(()));
+        let mut bytes = &bytes[frame(COMPOSE_HELLO_ACK).len()..];
+        assert_eq!(
+            read_frame::<ComposeResponse>(&mut bytes),
+            Ok(Some(ComposeResponse::ComposeRejected {
+                id: 3,
+                code: RejectCode::UnknownProject,
+                rule: None,
+            }))
+        );
+        assert!(matches!(
+            read_frame::<Response>(&mut bytes),
+            Ok(Some(Response::Pong { id: 1 }))
+        ));
+    }
+
+    #[test]
+    fn manifest_chunks_fit_one_frame_at_the_bound() {
+        let at_bound = ComposeRequest::ComposeStageChunk {
+            id: 1,
+            digest: "a".repeat(64),
+            index: 0,
+            data: encode_base64(&[0x41; STAGE_CHUNK]),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &at_bound).unwrap();
+        assert!(bytes.len() <= MAX_FRAME + 4);
+        assert!(matches!(
+            read_frame::<ComposeRequest>(&mut bytes.as_slice()),
+            Ok(Some(decoded)) if decoded == at_bound
+        ));
+        let over = ComposeRequest::ComposeStageChunk {
+            id: 1,
+            digest: "a".repeat(64),
+            index: 0,
+            data: encode_base64(&[0x41; STAGE_CHUNK + 3]),
+        };
+        assert_eq!(
+            write_frame(&mut Vec::new(), &over),
+            Err(ProtocolError::InvalidComposeField)
+        );
+    }
+
+    #[test]
+    fn secret_frames_never_echo_their_bytes() {
+        let canary = format!("arx-canary-{:016x}", 0x0dd_ba11_c0ff_ee00_u64);
+        let encoded = encode_base64(canary.as_bytes());
+        let put = |slot: &str| {
+            serde_json::to_vec(&ComposeRequest::ComposeSecretPut {
+                id: 4,
+                operation_id: "0".repeat(32),
+                generation: 7,
+                project_id: "calm-life".to_owned(),
+                slot: slot.to_owned(),
+                epoch: 1,
+                data: SecretText::new(encoded.clone()),
+            })
+            .unwrap()
+        };
+        let (result, bytes) = compose(&frames(&[COMPOSE_HELLO, &put("admin_password")]));
+        assert_eq!(result, Ok(()));
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(text.contains("unknown_project"));
+        let (result, _) = compose(&frames(&[COMPOSE_HELLO, &put("Bad-Slot")]));
+        let error = result.unwrap_err();
+        assert_eq!(error, ProtocolError::InvalidComposeField);
+        for haystack in [text, format!("{error:?} {error}")] {
+            assert!(!haystack.contains(&canary) && !haystack.contains(&encoded));
+        }
+    }
+}

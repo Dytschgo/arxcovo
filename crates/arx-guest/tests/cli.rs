@@ -203,3 +203,17 @@ fn ci_test_profile_keeps_runtime_checks_when_debuginfo_is_off() {
         "compiled caller location smoke check"
     );
 }
+
+#[test]
+fn stdio_guest_refuses_the_compose_handshake_like_a_legacy_guest() {
+    let output = run_guest(&["serve-stdio"], Stdio::piped(), |mut input, _| {
+        let request = br#"{"type":"ComposeHello","version":1,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["lifecycle","logs","manifest","secrets","status"]}"#;
+        input
+            .write_all(&(request.len() as u32).to_be_bytes())
+            .unwrap();
+        input.write_all(request).unwrap();
+    });
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"arx-guest: invalid guest frame JSON\n");
+}
