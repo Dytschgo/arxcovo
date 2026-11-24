@@ -753,13 +753,26 @@ pub(crate) mod publication {
         }
     }
 
+    /// What a failed connector start left behind locally.
+    #[derive(Default)]
+    enum Unsettled {
+        #[default]
+        Nothing,
+        /// A process whose termination is not yet confirmed.
+        Process(LocalProcess),
+        /// A failed ingress-file write whose removal could not be confirmed.
+        /// The residue keeps its private custody and is never handed to a
+        /// connector, but its cleanup is not confirmed.
+        Residue,
+    }
+
     impl Start {
         async fn connect(
             self,
             intent: &Intent,
             origin: &Origin,
             shutdown: &Shutdown,
-            unsettled: &mut Option<LocalProcess>,
+            unsettled: &mut Unsettled,
         ) -> Result<LocalProcess, Failure> {
             if !origin.current() || shutdown.is_cancelled() {
                 return Err(Failure::OriginUnavailable);
@@ -794,7 +807,9 @@ pub(crate) mod publication {
                     let result =
                         Connector::start_cancellable(&plan, &origin.retired, shutdown, &mut held)
                             .await;
-                    *unsettled = held.map(Box::new).map(LocalProcess::Native);
+                    if let Some(held) = held {
+                        *unsettled = Unsettled::Process(LocalProcess::Native(Box::new(held)));
+                    }
                     result
                         .map(Box::new)
                         .map(LocalProcess::Native)
@@ -802,16 +817,24 @@ pub(crate) mod publication {
                             ConnectorError::Origin => Failure::OriginUnavailable,
                             ConnectorError::Crashed => Failure::ConnectorExited,
                             ConnectorError::Readiness => Failure::ConnectorUnready,
-                            ConnectorError::CleanupPending => Failure::CleanupUnconfirmed,
+                            ConnectorError::CleanupPending => {
+                                *unsettled = Unsettled::Residue;
+                                Failure::CleanupUnconfirmed
+                            }
                             _ => Failure::ConnectorFailed,
                         })
                 }
                 #[cfg(test)]
                 Self::Fixture(fake) => {
+                    use std::sync::atomic::Ordering::SeqCst;
                     // The fixture holds no process that could outlive a failed start.
-                    *unsettled = None;
-                    fake.starts
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    fake.starts.fetch_add(1, SeqCst);
+                    if fake.residue.swap(false, SeqCst) {
+                        // As the native connector reports a failed ingress
+                        // write whose removal it could not confirm.
+                        *unsettled = Unsettled::Residue;
+                        return Err(Failure::CleanupUnconfirmed);
+                    }
                     *fake.ingress.lock().unwrap() = Some(crate::vm::publish::ingress(
                         &tunnel,
                         std::array::from_ref(&hostname),
@@ -820,7 +843,7 @@ pub(crate) mod publication {
                         origin.ca_path.to_str().unwrap(),
                     ));
                     fake.ready()?;
-                    fake.local.store(true, std::sync::atomic::Ordering::SeqCst);
+                    fake.local.store(true, SeqCst);
                     Ok(LocalProcess::Fixture(fake))
                 }
             }
@@ -879,6 +902,9 @@ pub(crate) mod publication {
         /// the revocation as its cause. Not an activation: it matches no
         /// unpublish, and that cleanup or the VM's next activation clears it.
         revoked_retired: Option<Id>,
+        /// The last activation whose failed ingress-file write left a residue
+        /// it could not remove. Sticky: the final drain stays unconfirmed.
+        residue: Option<u64>,
     }
 
     impl Activations {
@@ -1087,6 +1113,12 @@ pub(crate) mod publication {
         /// publish admission.
         pub(crate) fn stop_unconfirmed(&self) -> bool {
             self.activations().unconfirmed.is_some()
+        }
+
+        /// A failed ingress-file write left a residue this process could not
+        /// remove.
+        pub(crate) fn residue(&self) -> bool {
+            self.activations().residue.is_some()
         }
 
         #[cfg(test)]
@@ -1317,6 +1349,9 @@ pub(crate) mod publication {
                     Some(shutdown),
                 )
                 .await?;
+            // An unremoved ingress residue is never confirmed cleanup, even
+            // though no process or DNS effect remains.
+            let clean = clean && self.activations().residue != Some(generation);
             controller.finish_publication(operation, None, Some(failure), Some(clean))
         }
 
@@ -1357,18 +1392,24 @@ pub(crate) mod publication {
                 }
                 // Revocation aborts a connector start that holds the local slot.
                 let stop = Linked::new(revoked, shutdown);
-                let mut unsettled = None;
+                let mut unsettled = Unsettled::default();
                 let started = prepared
                     .start
                     .connect(intent, origin, &stop.0, &mut unsettled)
                     .await;
-                if let Some(connector) = unsettled {
-                    *local = Some(Live {
-                        vm: intent.vm,
-                        generation,
-                        origin: origin.clone(),
-                        connector,
-                    });
+                match unsettled {
+                    Unsettled::Nothing => {}
+                    Unsettled::Process(connector) => {
+                        *local = Some(Live {
+                            vm: intent.vm,
+                            generation,
+                            origin: origin.clone(),
+                            connector,
+                        });
+                    }
+                    // Recorded for this publication's receipt and for the
+                    // final drain, which cannot claim a clean settlement.
+                    Unsettled::Residue => self.activations().residue = Some(generation),
                 }
                 let connector = started.map_err(|failure| (failure, Evidence::Unknown))?;
                 *local = Some(Live {
@@ -1679,6 +1720,8 @@ pub(crate) mod publication {
         pub(crate) starts: std::sync::atomic::AtomicUsize,
         /// The next N connector stops fail and leave the connector live.
         pub(crate) stop_failures: std::sync::atomic::AtomicUsize,
+        /// The next connector start fails with an unremoved ingress residue.
+        pub(crate) residue: std::sync::atomic::AtomicBool,
         pub(crate) posts: std::sync::atomic::AtomicUsize,
         pub(crate) deletes: std::sync::atomic::AtomicUsize,
         pub(crate) ingress: std::sync::Mutex<Option<String>>,

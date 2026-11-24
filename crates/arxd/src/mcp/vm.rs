@@ -637,7 +637,7 @@ impl Supervisor {
             // Every worker and deferred stop has joined: confirm the final local
             // state and clear what remains of the registry.
             let local = self.publisher.stop_all().await;
-            failed |= !local || self.publisher.stop_unconfirmed();
+            failed |= !local || self.publisher.stop_unconfirmed() || self.publisher.residue();
             anyhow::ensure!(!failed, "publication settlement unconfirmed");
             Ok::<_, anyhow::Error>(())
         })
@@ -5574,6 +5574,43 @@ mod tests {
         assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
         drop(a);
         h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unremoved_ingress_residue_is_never_reported_as_confirmed_cleanup() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1500).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        // The connector start fails after a failed ingress-file write whose
+        // removal could not be confirmed, before any process or DNS effect.
+        fake.residue.store(true, SeqCst);
+        let failed = call(&a, "publish_site", args(1510)).await;
+        let failed = terminal(&a, &failed).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (
+                &json!("failed"),
+                &json!("cleanup_unconfirmed"),
+                &json!(proof_wire(false))
+            ),
+            "{failed}"
+        );
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (0, 0));
+        assert!(!fake.local.load(SeqCst));
+        // No DNS effect exists, so the intent is released. The private residue
+        // is never handed to a connector, so later publication proceeds.
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        let published = call(&a, "publish_site", args(1511)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let revoke = call(&a, "unpublish_site", args(1512)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        drop(a);
+        assert!(
+            h.shutdown().await.is_err(),
+            "the drain claimed a clean settlement with an unremoved residue"
+        );
     }
 
     #[tokio::test]

@@ -1491,14 +1491,37 @@ mod vm {
                 "a read-only failed config was left"
             );
             // A removal that cannot be confirmed is a typed cleanup failure. The
+            // extended class is reported unsupported, so the real classic
+            // same-handle disposition runs and refuses the read-only file. The
             // residue keeps private custody and no connector is launched.
-            super::publish::windows::FAIL_DISPOSITION
+            super::publish::windows::EXTENDED_UNSUPPORTED
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let error = failed_write(Box::new(|_: &Path| {})).await;
+            let probed: Probed = Arc::default();
+            let marker = probed.clone();
+            let error = failed_write(Box::new(move |path: &Path| {
+                let mut permissions = fs::metadata(path).unwrap().permissions();
+                permissions.set_readonly(true);
+                *marker.lock().unwrap() = Some(fs::set_permissions(path, permissions));
+            }))
+            .await;
+            let marked = probed.lock().unwrap().take().expect("probe ran");
+            assert!(
+                marked.is_ok(),
+                "the read-only probe did not apply: {marked:?}"
+            );
+            assert!(
+                !super::publish::windows::EXTENDED_UNSUPPORTED
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "the disposition was never attempted"
+            );
             assert_eq!(error, ConnectorError::CleanupPending);
             let residue = ingress_files();
             assert_eq!(residue.len(), 1, "the unremoved residue is not visible");
             assert_secured("unremoved ingress residue", &residue[0]);
+            let mut permissions = fs::metadata(&residue[0]).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(&residue[0], permissions).unwrap();
             fs::remove_file(&residue[0]).unwrap();
             assert_gone(&witness_path, 5);
             origin_task.abort();

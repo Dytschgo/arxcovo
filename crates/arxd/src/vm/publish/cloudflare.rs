@@ -706,18 +706,20 @@ mod first_write {
         pin::Pin,
         sync::{
             Mutex,
-            atomic::{AtomicBool, Ordering::SeqCst},
+            atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
         },
         task::{Context, Poll, Waker},
     };
 
     use super::*;
 
-    /// Holds every write at `Pending` while `hold` is set, fails the next write
-    /// with zero progress while `fail` is set, and logs accepted bytes.
+    /// Holds every write at `Pending` while `hold` is set (counting each held
+    /// attempt), fails the next write with zero progress while `fail` is set,
+    /// and logs accepted bytes.
     struct Controlled<S> {
         inner: S,
         hold: Arc<AtomicBool>,
+        held: Arc<AtomicUsize>,
         fail: Arc<AtomicBool>,
         accepted: Arc<Mutex<Vec<u8>>>,
     }
@@ -727,6 +729,7 @@ mod first_write {
             Self {
                 inner,
                 hold: Arc::default(),
+                held: Arc::default(),
                 fail: Arc::default(),
                 accepted: Arc::default(),
             }
@@ -751,6 +754,7 @@ mod first_write {
         ) -> Poll<io::Result<usize>> {
             let this = self.get_mut();
             if this.hold.load(SeqCst) {
+                this.held.fetch_add(1, SeqCst);
                 return Poll::Pending;
             }
             if this.fail.swap(false, SeqCst) {
@@ -887,32 +891,56 @@ mod first_write {
             .with_no_client_auth();
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
-        let peer = tokio::spawn(async move {
-            let mut stream = acceptor.accept(server_io).await.unwrap();
-            let mut received = Vec::new();
-            let _ = stream.read_to_end(&mut received).await;
-            received
-        });
+        let connector = TlsConnector::from(Arc::new(client));
         let io = Controlled::new(client_io);
-        let hold = io.hold.clone();
+        let (hold, held, accepted) = (io.hold.clone(), io.held.clone(), io.accepted.clone());
         let gate = Arc::new(SendGate::default());
         let submission = Submission::new(gate.clone(), &never);
-        let stream = tls_gated(&TlsConnector::from(Arc::new(client)), io, Some(&submission))
-            .await
-            .unwrap();
-        // The handshake is complete; the socket now holds every write.
+        // Both sides finish the handshake together while both duplex halves
+        // live, so the server's post-handshake TLS 1.3 tickets always have a
+        // writable peer. The server stream stays open through cancellation.
+        let (stream, mut peer) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                tls_gated(&connector, io, Some(&submission)),
+                acceptor.accept(server_io)
+            )
+        })
+        .await
+        .expect("TLS handshake exceeded its bound")
+        .expect("TLS handshake failed");
+        // Everything the socket accepted so far is handshake output.
+        let handshake = accepted.lock().unwrap().len();
+        assert!(handshake > 0, "the handshake wrote nothing");
+        // The socket now holds every write.
         hold.store(true, SeqCst);
-        let mut request = Box::pin(exchange(stream, "POST / HTTP/1.1\r\n\r\n", b"{}"));
+        let mut request = Box::pin(exchange(
+            stream,
+            "POST / HTTP/1.1
+
+",
+            b"{}",
+        ));
         assert!(poll_once(request.as_mut()).is_pending());
+        assert!(
+            held.load(SeqCst) > 0,
+            "no post-handshake ciphertext write reached the held socket"
+        );
         assert_eq!(gate.sent(), Sent::Never);
-        assert!(gate.revoke());
+        assert!(gate.revoke(), "a held first write must stay revocable");
         hold.store(false, SeqCst);
         assert!(request.await.is_err());
         assert_eq!(gate.sent(), Sent::Never);
-        let received = tokio::time::timeout(Duration::from_secs(5), peer)
+        assert_eq!(
+            accepted.lock().unwrap().len(),
+            handshake,
+            "application data followed revocation"
+        );
+        // The client stream is gone. The peer sees only the abrupt end of the
+        // connection, which is expected here, and no application byte.
+        let mut received = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut received))
             .await
-            .unwrap()
-            .unwrap();
+            .expect("peer read exceeded its bound");
         assert!(received.is_empty(), "application data followed revocation");
     }
 }

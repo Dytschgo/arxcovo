@@ -217,21 +217,27 @@ pub(in crate::vm) fn create_private(path: &Path) -> io::Result<File> {
 /// the classic disposition is tried on the same handle. Failure is returned
 /// to the caller, never retried through a reopened path.
 pub(in crate::vm) fn delete_on_close(file: &File) -> io::Result<()> {
-    #[cfg(test)]
-    if FAIL_DISPOSITION.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        return Err(io::Error::other("injected disposition failure"));
-    }
     let extended = FILE_DISPOSITION_INFO_EX {
         Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
     };
-    let marked = ok(unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileDispositionInfoEx,
-            (&extended as *const FILE_DISPOSITION_INFO_EX).cast(),
-            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
-        )
-    });
+    // A witness can report the extended class as unsupported, as on an older
+    // platform; the classic attempt below is then the real call.
+    #[cfg(test)]
+    let unsupported = EXTENDED_UNSUPPORTED.swap(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let unsupported = false;
+    let marked = if unsupported {
+        Err(io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32))
+    } else {
+        ok(unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfoEx,
+                (&extended as *const FILE_DISPOSITION_INFO_EX).cast(),
+                size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+            )
+        })
+    };
     match marked {
         Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
             let classic = FILE_DISPOSITION_INFO { DeleteFile: true };
@@ -248,9 +254,10 @@ pub(in crate::vm) fn delete_on_close(file: &File) -> io::Result<()> {
     }
 }
 
-/// Fails the next same-handle disposition, for the residue witness.
+/// Reports the next extended disposition as unsupported, so the classic
+/// same-handle disposition runs for real, for the residue witness.
 #[cfg(test)]
-pub(in crate::vm) static FAIL_DISPOSITION: std::sync::atomic::AtomicBool =
+pub(in crate::vm) static EXTENDED_UNSUPPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 fn require_owner(file: &File) -> io::Result<()> {
