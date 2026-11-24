@@ -776,6 +776,9 @@ pub(crate) mod publication {
                 #[cfg(test)]
                 Self::Fixture(ref fake) => {
                     use std::sync::atomic::Ordering::SeqCst;
+                    if fake.stop_panic.swap(false, SeqCst) {
+                        panic!("synthetic connector stop panic");
+                    }
                     if fake
                         .stop_failures
                         .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
@@ -1130,6 +1133,51 @@ pub(crate) mod publication {
         NotSubmitted,
     }
 
+    /// The outcome of one publication cleanup.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Cleanup {
+        /// The local connector is confirmed stopped and no intent remains.
+        Released,
+        /// The intent stays durable as pending, for this reason.
+        Pending(Failure),
+    }
+
+    /// The outcome of one reaper or final reconciliation turn.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Turn {
+        /// Another effect holds the slot; nothing was decided.
+        Busy,
+        /// No publication intent remains.
+        Idle,
+        /// A published intent whose connector is ready.
+        Healthy,
+        /// The intent stays durable as pending, for this reason.
+        Pending(Failure),
+    }
+
+    /// Why a final drain cannot claim a clean publication settlement.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Unconfirmed {
+        /// A durable intent or a pending publication receipt remains.
+        Publication,
+        /// A worker or stop completion was lost to a panic or cancellation.
+        LostCompletion,
+        /// A failed ingress-file write left a residue this process could not
+        /// remove.
+        LocalResidue,
+        /// The final reconciliation failed or did not finish in time.
+        Reconciliation,
+    }
+
+    /// The publication part of a quiescent drain.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Drained {
+        /// Every effect joined, local ingress is confirmed down, no intent and
+        /// no pending publication receipt remain.
+        Clean,
+        Unconfirmed(Unconfirmed),
+    }
+
     /// A token cancelled by either input, for one bounded await.
     struct Linked(Shutdown, tokio::task::AbortHandle);
 
@@ -1318,13 +1366,8 @@ pub(crate) mod publication {
             self.activations().unconfirmed.is_some()
         }
 
-        /// A failed ingress-file write left a residue this process could not
-        /// remove.
-        pub(crate) fn residue(&self) -> bool {
-            self.activations().residue.is_some()
-        }
-
         /// A worker or stop completion was lost to a panic or cancellation.
+        #[cfg(test)]
         pub(crate) fn lost(&self) -> bool {
             self.activations().lost
         }
@@ -1628,7 +1671,7 @@ pub(crate) mod publication {
                 Ok(()) if !origin.current() => (Failure::OriginUnavailable, Evidence::Unknown),
                 Ok(()) => (Failure::Cancelled, Evidence::Unknown),
             };
-            let clean = self
+            let cleanup = self
                 .cleanup(
                     controller,
                     intent.vm,
@@ -1639,7 +1682,8 @@ pub(crate) mod publication {
                 .await?;
             // An unremoved ingress residue is never confirmed cleanup, even
             // though no process or DNS effect remains.
-            let clean = clean && self.activations().residue != Some(generation);
+            let clean =
+                cleanup == Cleanup::Released && self.activations().residue != Some(generation);
             // A latched owner cause wins over this worker's local failure.
             let failure = self.cause(&intent.nonce, Some(failure));
             controller.finish_publication(operation, None, failure, Some(clean))
@@ -1834,25 +1878,76 @@ pub(crate) mod publication {
             #[cfg(test)]
             let _ = hold(&self.unpublish_gate).await;
             let _slot = self.slot().await;
-            let clean = self
+            let released = self
                 .cleanup(controller, vm, None, Evidence::Unknown, Some(shutdown))
-                .await?;
+                .await?
+                == Cleanup::Released;
             controller.finish_publication(
                 operation,
                 None,
-                (!clean).then_some(Failure::CleanupUnconfirmed),
-                Some(clean),
+                (!released).then_some(Failure::CleanupUnconfirmed),
+                Some(released),
             )
         }
 
+        /// One reaper turn. Skips as busy while another effect holds the slot.
         pub(crate) async fn turn<C: Clock>(
             &self,
             controller: &VmController<C>,
             shutdown: &Shutdown,
-        ) -> Result<()> {
+        ) -> Result<Turn> {
             let Some(_slot) = self.claim() else {
-                return Ok(());
+                return Ok(Turn::Busy);
             };
+            self.reconcile(controller, shutdown).await
+        }
+
+        /// The final drain's reconciliation, after every worker and stop
+        /// joined and local ingress is confirmed down. It waits for the
+        /// exclusive effects slot within `deadline`. Clean requires no intent,
+        /// no pending publication receipt, no lost completion and no residue;
+        /// a timeout or failure is unconfirmed and leaves the durable intent,
+        /// cause and evidence in place. Settled entries are cleared, and owner
+        /// causes and no-submission proof only on a clean settlement.
+        pub(crate) async fn finish<C: Clock>(
+            &self,
+            controller: &VmController<C>,
+            shutdown: &Shutdown,
+            deadline: tokio::time::Instant,
+        ) -> Drained {
+            let turn = tokio::time::timeout_at(deadline, async {
+                let _slot = self.slot().await;
+                self.reconcile(controller, shutdown).await
+            })
+            .await;
+            let outcome = match turn {
+                Ok(Ok(Turn::Idle)) => match controller.publication_receipts_pending() {
+                    Ok(0) => None,
+                    _ => Some(Unconfirmed::Publication),
+                },
+                Ok(Ok(_)) => Some(Unconfirmed::Publication),
+                Ok(Err(_)) | Err(_) => Some(Unconfirmed::Reconciliation),
+            };
+            let (lost, residue) = {
+                let activations = self.activations();
+                (activations.lost, activations.residue.is_some())
+            };
+            let outcome = if lost {
+                Some(Unconfirmed::LostCompletion)
+            } else if residue {
+                Some(Unconfirmed::LocalResidue)
+            } else {
+                outcome
+            };
+            self.clear(outcome.is_none());
+            outcome.map_or(Drained::Clean, Drained::Unconfirmed)
+        }
+
+        async fn reconcile<C: Clock>(
+            &self,
+            controller: &VmController<C>,
+            shutdown: &Shutdown,
+        ) -> Result<Turn> {
             let intent = controller.publication_intent()?;
             {
                 // No-submission proof and owner causes are kept only for the
@@ -1863,24 +1958,35 @@ pub(crate) mod publication {
                 }
                 activations.prune_causes(intent.as_ref().map(|intent| intent.nonce.as_str()));
             }
-            if let Some(intent) = intent {
-                let stale = if intent.phase == Phase::Published {
-                    self.ready(&intent, shutdown).await.err().map(Some)
-                } else {
-                    // A latched owner cause wins over a durable generic reason,
-                    // including when its own checkpoint never became durable.
-                    Some(self.cause(&intent.nonce, intent.reason))
-                };
-                if let Some(reason) = stale {
-                    self.cleanup(controller, intent.vm, reason, Evidence::Unknown, None)
-                        .await?;
+            let turn = match intent {
+                None => Turn::Idle,
+                Some(intent) => {
+                    let stale = if intent.phase == Phase::Published {
+                        self.ready(&intent, shutdown).await.err().map(Some)
+                    } else {
+                        // A latched owner cause wins over a durable generic
+                        // reason, including when its own checkpoint never
+                        // became durable.
+                        Some(self.cause(&intent.nonce, intent.reason))
+                    };
+                    match stale {
+                        None => Turn::Healthy,
+                        Some(reason) => match self
+                            .cleanup(controller, intent.vm, reason, Evidence::Unknown, None)
+                            .await?
+                        {
+                            Cleanup::Released => Turn::Idle,
+                            Cleanup::Pending(why) => Turn::Pending(why),
+                        },
+                    }
                 }
-            }
+            };
             // Under the slot no worker settles concurrently. A receipt whose
             // worker exited without its terminal write is settled here once
             // its VM has no publication intent left.
             let workers = self.workers();
-            controller.settle_orphaned_publications(&workers)
+            controller.settle_orphaned_publications(&workers)?;
+            Ok(turn)
         }
 
         async fn cleanup<C: Clock>(
@@ -1890,7 +1996,7 @@ pub(crate) mod publication {
             reason: Option<Failure>,
             evidence: Evidence,
             shutdown: Option<&Shutdown>,
-        ) -> Result<bool> {
+        ) -> Result<Cleanup> {
             #[cfg(test)]
             self.cleanup_registry
                 .lock()
@@ -1906,7 +2012,11 @@ pub(crate) mod publication {
                 .publication_intent()?
                 .filter(|intent| intent.vm == vm)
             else {
-                return Ok(local);
+                return Ok(if local {
+                    Cleanup::Released
+                } else {
+                    Cleanup::Pending(Failure::CleanupUnconfirmed)
+                });
             };
             // A latched owner cause wins over the reason this cleanup supplies.
             let reason = self.cause(&intent.nonce, reason);
@@ -1926,16 +2036,17 @@ pub(crate) mod publication {
             } else {
                 self.remove_dns(controller, &intent, evidence).await
             };
-            let update = match (&dns, local) {
-                (Ok(()), true) => Update::Released(reason),
-                _ => Update::Phase(
-                    Phase::CleanupPending,
-                    reason
-                        .or_else(|| dns.err())
-                        .or(Some(Failure::CleanupUnconfirmed)),
-                ),
+            let outcome = match (dns, local) {
+                (Ok(()), true) => Cleanup::Released,
+                (dns, _) => {
+                    Cleanup::Pending(reason.or(dns.err()).unwrap_or(Failure::CleanupUnconfirmed))
+                }
             };
-            let released = matches!(update, Update::Released(_));
+            let update = match outcome {
+                Cleanup::Released => Update::Released(reason),
+                Cleanup::Pending(why) => Update::Phase(Phase::CleanupPending, Some(why)),
+            };
+            let released = outcome == Cleanup::Released;
             if shutdown.is_none() {
                 controller.reconcile_publication(&intent, update, reason, released)?;
             } else {
@@ -1944,7 +2055,7 @@ pub(crate) mod publication {
             if released && self.unsubmitted(&intent.nonce) {
                 self.set_unsubmitted(None);
             }
-            Ok(released)
+            Ok(outcome)
         }
 
         async fn remove_dns<C: Clock>(
@@ -2022,6 +2133,12 @@ pub(crate) mod publication {
         pub(crate) residue: std::sync::atomic::AtomicBool,
         /// Parks the next connector start before readiness, abortably.
         pub(crate) start_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// The next connector stop panics before stopping anything.
+        pub(crate) stop_panic: std::sync::atomic::AtomicBool,
+        /// The next POST panics its worker after its first byte was accepted.
+        pub(crate) panic_after_post: std::sync::atomic::AtomicBool,
+        /// Parks the next record removal.
+        pub(crate) remove_gate: std::sync::Mutex<Option<FakeGate>>,
         pub(crate) posts: std::sync::atomic::AtomicUsize,
         pub(crate) deletes: std::sync::atomic::AtomicUsize,
         pub(crate) ingress: std::sync::Mutex<Option<String>>,
@@ -2152,6 +2269,9 @@ pub(crate) mod publication {
                 return std::future::pending().await;
             }
             self.record.store(true, SeqCst);
+            if self.panic_after_post.swap(false, SeqCst) {
+                panic!("synthetic worker panic after a possible POST");
+            }
             hold(&self.post_gate).await?;
             Ok(Self::id())
         }
@@ -2175,6 +2295,7 @@ pub(crate) mod publication {
 
         async fn remove(&self, route: &Route, id: &RecordId) -> Result<Removal, DnsError> {
             use std::sync::atomic::Ordering::SeqCst;
+            hold(&self.remove_gate).await?;
             self.routes.lock().unwrap().push(route.witness());
             assert!(
                 !self.local.load(SeqCst),

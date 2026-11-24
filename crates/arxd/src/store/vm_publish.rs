@@ -375,6 +375,16 @@ pub(crate) fn settle_orphans(
     Ok(settled)
 }
 
+/// Publication receipts still pending.
+pub(crate) fn pending_receipts(db: &Connection) -> Result<usize> {
+    let count: i64 = db.query_row(
+        "SELECT count(*) FROM activity WHERE status=0 AND action IN (15,16)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(usize::try_from(count)?)
+}
+
 pub(super) fn recover(db: &Connection, now: i64) -> Result<()> {
     db.execute(
         "UPDATE vm_publication SET phase='cleanup_pending',cleanup_reason=coalesce(cleanup_reason,11)",

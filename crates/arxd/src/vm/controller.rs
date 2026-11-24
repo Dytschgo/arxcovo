@@ -2007,6 +2007,13 @@ impl<C: Clock> VmController<C> {
         })
     }
 
+    /// Publication receipts still pending, for the final drain's settlement
+    /// proof.
+    pub(crate) fn publication_receipts_pending(&self) -> Result<usize> {
+        self.store
+            .transact(|db| store::publish::pending_receipts(db))
+    }
+
     /// Settles publication receipts that lost their terminal write; see
     /// [`store::publish::settle_orphans`].
     pub(crate) fn settle_orphaned_publications(

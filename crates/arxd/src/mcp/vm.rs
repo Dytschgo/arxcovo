@@ -6,7 +6,7 @@ use crate::{
     vm::{
         runtime::{
             NativeRefusal,
-            publication::{Origin, Profile, Publication},
+            publication::{Drained, Origin, Profile, Publication},
         },
         static_web::{StaticName, StaticState},
         *,
@@ -598,7 +598,12 @@ impl Supervisor {
     /// Cancel and join every admitted worker and its terminal audit write.
     /// The caller has passed the close barrier, so no new worker can be
     /// registered.
-    pub(crate) async fn drain_workers(&self, bound: Duration) -> anyhow::Result<()> {
+    ///
+    /// `Err` means the drain is not quiescent: a worker or stop did not
+    /// finish, or local ingress is not confirmed down. `Ok` carries whether
+    /// the publication then settled cleanly; custody recovery needs only
+    /// quiescence.
+    pub(crate) async fn drain_workers(&self, bound: Duration) -> anyhow::Result<Drained> {
         let deadline = tokio::time::Instant::now() + bound;
         let mut publish_jobs = std::mem::take(&mut self.lock()?.publish_jobs);
         tokio::time::timeout_at(deadline, async {
@@ -636,10 +641,7 @@ impl Supervisor {
             // not, so the final local state decides.
             let local = self.publisher.stop_local(None).await;
             anyhow::ensure!(
-                local
-                    && !self.publisher.stop_unconfirmed()
-                    && !self.publisher.residue()
-                    && !self.publisher.lost(),
+                local && !self.publisher.stop_unconfirmed(),
                 "publication settlement unconfirmed"
             );
             Ok::<_, anyhow::Error>(())
@@ -653,20 +655,14 @@ impl Supervisor {
                 self.lock()?.drained = Some(drained);
             }
         }
-        // Local containment and worker settlement have their own proof.
-        // A remote timeout leaves the intent intact for startup reconciliation.
-        let turn = tokio::time::timeout_at(
-            deadline,
-            self.publisher.turn(&self.controller, &self.cancel),
-        )
-        .await;
-        // Every worker and stop has joined and local ingress is down: clear
-        // the registry.
-        self.publisher.clear(true);
-        if let Ok(result) = turn {
-            result?;
-        }
-        Ok(())
+        // Quiescent: every worker and stop joined and local ingress is down.
+        // The final reconciliation decides the publication settlement; a
+        // remote timeout or failure leaves the intent intact for startup
+        // reconciliation and is reported as unconfirmed.
+        Ok(self
+            .publisher
+            .finish(&self.controller, &self.cancel, deadline)
+            .await)
     }
 
     /// Final controller recovery, after the reaper and workers are joined,
@@ -4338,7 +4334,11 @@ mod tests {
         assert!(before.record.is_some());
         fake.credential.store(false, SeqCst);
         drop(a);
-        h.shutdown().await.unwrap();
+        // Local ingress is down, but the record stays: no clean drain.
+        assert!(
+            h.shutdown().await.is_err(),
+            "a drain with DNS cleanup pending reported clean"
+        );
         assert!(!fake.local.load(SeqCst));
         assert!(fake.record.load(SeqCst));
 
@@ -4414,7 +4414,11 @@ mod tests {
         assert!(before.post_possible && before.record.is_none());
         let starts = fake.starts.load(SeqCst);
         drop(a);
-        h.shutdown().await.unwrap();
+        // The possible POST stays ambiguous: no clean drain.
+        assert!(
+            h.shutdown().await.is_err(),
+            "a drain with an ambiguous POST reported clean"
+        );
         assert!(!fake.record.load(SeqCst));
         assert!(!fake.local.load(SeqCst));
         // Policy on and a drifted owner binding: the possible POST keeps the
@@ -5905,6 +5909,185 @@ mod tests {
         assert_eq!(fake.posts.load(SeqCst), posts);
         drop(a);
         h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_later_admitted_unpublish_never_erases_a_durable_owner_cause() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let cancelled = Some(crate::vm::FailureReason::Cancelled as i64);
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 2000).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let host = h.supervisor().host_id;
+        let published = call(&a, "publish_site", args(2010)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        // The owner's admitted unpublish leaves DNS cleanup pending.
+        fake.credential.store(false, SeqCst);
+        let first = call(&a, "unpublish_site", args(2011)).await;
+        assert_eq!(terminal(&a, &first).await["state"], "failed");
+        let status = phase(&a, &vm).await;
+        assert_eq!(
+            (&status["phase"], &status["reason"]),
+            (&json!("cleanup_pending"), &json!("cancelled")),
+            "{status}"
+        );
+        drop(a);
+        assert!(h.shutdown().await.is_err());
+        // A new process holds no in-memory owner cause. A second admitted
+        // unpublish writes a null reason and its cleanup a DNS failure; the
+        // durable owner cause survives both.
+        let mut h = h.reopen(|_| {}).await;
+        enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
+        let a = h.client(0).await;
+        let second = call(&a, "unpublish_site", args(2012)).await;
+        assert_eq!(terminal(&a, &second).await["state"], "failed");
+        let status = phase(&a, &vm).await;
+        assert_eq!(
+            (&status["phase"], &status["reason"]),
+            (&json!("cleanup_pending"), &json!("cancelled")),
+            "{status}"
+        );
+        fake.credential.store(true, SeqCst);
+        assert_eq!(settle(&h, &a, &vm).await["reason"], "cancelled");
+        assert_eq!(release_cause(&h), cancelled);
+        assert_eq!(fake.deletes.load(SeqCst), 1);
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clean_foreground_drain_requires_full_publication_settlement() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1900).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let host = h.supervisor().host_id;
+        let intent = |h: &Harness| h.supervisor().controller.publication_intent().unwrap();
+        let refuse_commit = "CREATE TRIGGER refuse_commit BEFORE UPDATE OF phase ON vm_publication
+             WHEN NEW.phase='published'
+             BEGIN SELECT RAISE(ABORT, 'synthetic publish commit failure'); END;";
+
+        // A handled worker error is superseded by a confirmed reconciliation:
+        // the publish commit fails after DNS ID custody, and the final turn
+        // removes the record.
+        trigger(&h, refuse_commit);
+        let pending = call(&a, "publish_site", args(1910)).await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        until(|| fake.posts.load(SeqCst) == 1).await;
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert!(intent(&h).unwrap().record.is_some());
+        trigger(&h, "DROP TRIGGER refuse_commit");
+        drop(a);
+        h.shutdown().await.unwrap();
+        assert_eq!(fake.deletes.load(SeqCst), 1);
+        assert!(!fake.local.load(SeqCst));
+
+        // The same failed terminal write with the DNS credential gone: local
+        // ingress stops, the intent and its record stay, and the drain is
+        // unconfirmed. Restart cleanup removes the record once the credential
+        // returns.
+        let mut h = h.reopen(|_| {}).await;
+        enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
+        let a = h.client(0).await;
+        let start = call(&a, "vm_start", args(1911)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        trigger(&h, refuse_commit);
+        let pending = call(&a, "publish_site", args(1912)).await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        until(|| fake.posts.load(SeqCst) == 2).await;
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        trigger(&h, "DROP TRIGGER refuse_commit");
+        let before = intent(&h).unwrap();
+        assert!(before.record.is_some());
+        fake.credential.store(false, SeqCst);
+        drop(a);
+        assert!(
+            h.shutdown().await.is_err(),
+            "a drain with DNS cleanup pending reported clean"
+        );
+        assert!(!fake.local.load(SeqCst));
+        assert!(fake.record.load(SeqCst));
+        let mut h = h.reopen(|_| {}).await;
+        enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
+        let after = intent(&h).unwrap();
+        assert_eq!(
+            (&after.nonce, &after.record),
+            (&before.nonce, &before.record)
+        );
+        fake.credential.store(true, SeqCst);
+        let a = h.client(0).await;
+        settle(&h, &a, &vm).await;
+        assert_eq!(fake.deletes.load(SeqCst), 2);
+        assert_ne!(terminal(&a, &pending).await["state"], "succeeded");
+
+        // A final reconciliation parked past the drain deadline is unconfirmed
+        // and keeps the intent for restart cleanup.
+        let start = call(&a, "vm_start", args(1913)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let published = call(&a, "publish_site", args(1914)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let (remove, _in_remove, _held) = gate();
+        *fake.remove_gate.lock().unwrap() = Some(remove);
+        drop(a);
+        assert!(
+            h.shutdown().await.is_err(),
+            "a final reconciliation past its deadline reported clean"
+        );
+        assert!(!fake.local.load(SeqCst));
+        assert!(fake.record.load(SeqCst));
+        let mut h = h.reopen(|_| {}).await;
+        enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
+        assert!(intent(&h).is_some());
+        let a = h.client(0).await;
+        settle(&h, &a, &vm).await;
+        assert_eq!(fake.deletes.load(SeqCst), 3);
+
+        // A worker panics after its POST's first byte. Another publication
+        // call harvests the panic and its cleanup settles the publication,
+        // yet the drain stays unconfirmed.
+        let start = call(&a, "vm_start", args(1915)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let posts = fake.posts.load(SeqCst);
+        fake.panic_after_post.store(true, SeqCst);
+        let pending = call(&a, "publish_site", args(1916)).await;
+        assert_eq!(pending["ok"], true, "{pending}");
+        until(|| h.supervisor().publisher.workers().is_empty()).await;
+        assert_eq!(fake.posts.load(SeqCst), posts + 1);
+        let revoke = call(&a, "unpublish_site", args(1917)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        assert!(h.supervisor().publisher.lost());
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert!(!fake.record.load(SeqCst));
+        drop(a);
+        assert!(
+            h.shutdown().await.is_err(),
+            "a harvested worker panic disappeared from the drain"
+        );
+
+        // A deferred stop panics. Shutdown still contains the connector and
+        // settles the publication, and the drain stays unconfirmed.
+        let mut h = h.reopen(|_| {}).await;
+        enroll(&h, &fake, true, Profile::synthetic(host, "tunnel-site"));
+        let a = h.client(0).await;
+        let start = call(&a, "vm_start", args(1918)).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let published = call(&a, "publish_site", args(1919)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        fake.stop_panic.store(true, SeqCst);
+        assert_eq!(
+            call(&a, "unpublish_site", args(1919)).await["reason"],
+            "key_collision"
+        );
+        until(|| h.supervisor().publisher.lost()).await;
+        drop(a);
+        assert!(
+            h.shutdown().await.is_err(),
+            "a lost stop completion disappeared from the drain"
+        );
+        assert!(!fake.local.load(SeqCst));
+        assert!(!fake.record.load(SeqCst));
     }
 
     #[tokio::test]
