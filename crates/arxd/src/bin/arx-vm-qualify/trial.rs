@@ -59,22 +59,40 @@ pub(crate) struct TrialAuthority<S: Source> {
     issued: Instant2,
 }
 
+/// The runner's opaque random scope and run identifiers. Generated before
+/// the preflight claims any output, so issuing a trial cannot fail after it.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) struct Ids {
+    scope: Hash,
+    run: [u8; 16],
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl Ids {
+    pub(crate) fn generate() -> Result<Self, RunError> {
+        let mut ids = Self {
+            scope: [0; 32],
+            run: [0; 16],
+        };
+        getrandom::fill(&mut ids.scope).map_err(|_| RunError::Input)?;
+        getrandom::fill(&mut ids.run).map_err(|_| RunError::Input)?;
+        Ok(ids)
+    }
+}
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 impl TrialAuthority<Native> {
     /// The only native constructor. It takes ownership of the held preflight
-    /// custody, generates an opaque scope and run, and binds the keyed
-    /// dependency projection.
+    /// custody and the runner's random identifiers, and binds the keyed
+    /// dependency projection. It is infallible once the output is claimed.
     pub(crate) fn issue(
         custody: NativeCustody,
+        ids: Ids,
         class: Class,
         dependencies: Dependencies,
         issued: Instant2,
-    ) -> Result<Self, RunError> {
-        let mut scope = [0; 32];
-        let mut run = [0; 16];
-        getrandom::fill(&mut scope).map_err(|_| RunError::Input)?;
-        getrandom::fill(&mut run).map_err(|_| RunError::Input)?;
-        Ok(Self::bind(custody, class, scope, run, dependencies, issued))
+    ) -> Self {
+        Self::bind(custody, class, ids.scope, ids.run, dependencies, issued)
     }
 }
 
@@ -186,6 +204,7 @@ impl<S: Source> Trial<S> {
                 dispatched: 0,
                 charge_retained: false,
                 settled: false,
+                late: None,
             },
         }
     }
@@ -198,10 +217,6 @@ impl<S: Source> Trial<S> {
     /// Run the closed graph to its first non-passing stage, then settle.
     pub(crate) fn drive(&mut self, collectors: &mut impl Collectors<S>, clock: &impl Clock) {
         self.state.drive(collectors, clock);
-    }
-
-    pub(crate) fn files(&self) -> Result<Vec<(FileKind, Vec<u8>)>, RunError> {
-        self.state.files()
     }
 
     pub(crate) fn incomplete(&self) -> Incomplete {
@@ -221,6 +236,11 @@ impl<S: Source> Trial<S> {
     #[cfg(test)]
     pub(crate) fn charge_retained(&self) -> bool {
         self.state.charge_retained
+    }
+
+    #[cfg(test)]
+    pub(crate) fn late(&self) -> Option<Diagnostic> {
+        self.state.late
     }
 
     #[cfg(test)]
@@ -250,6 +270,9 @@ struct State<S: Source> {
     dispatched: u16,
     charge_retained: bool,
     settled: bool,
+    /// Latched when any completion lands after cancellation, the trial
+    /// budget, expiry or a clock inconsistency. A latched trial never seals.
+    late: Option<Diagnostic>,
 }
 
 impl<S: Source> State<S> {
@@ -338,13 +361,14 @@ impl<S: Source> State<S> {
         }
     }
 
-    /// Admission for an effect, checked before the collector is called.
+    /// Admission for an effect: the store proof, an unblocked graph, the
+    /// stage's confinement, and a live sample whose capture time the driver
+    /// checks again immediately before dispatch.
     fn admit(
         &self,
         stage: Stage,
         collectors: &mut impl Collectors<S>,
-        now: Instant2,
-    ) -> Result<EffectPlan, Diagnostic> {
+    ) -> Result<(EffectPlan, u64), Diagnostic> {
         if self.store.is_none() || self.blocked_at.is_some() {
             return Err(Diagnostic::PrerequisiteMissing);
         }
@@ -352,14 +376,19 @@ impl<S: Source> State<S> {
         if stage.confinement().is_some_and(|limit| !plan.within(limit)) {
             return Err(Diagnostic::EffectUnconfined);
         }
-        match collectors.live() {
-            Some(captured)
-                if captured <= now.mono_ms && now.mono_ms - captured <= LIVE_FRESHNESS_MS =>
-            {
-                Ok(plan)
-            }
-            _ => Err(Diagnostic::StaleLiveSample),
-        }
+        collectors
+            .live()
+            .map(|captured| (plan, captured))
+            .ok_or(Diagnostic::StaleLiveSample)
+    }
+
+    /// The dispatch-time check, taken after planning and live collection:
+    /// cancellation, clocks, budget and expiry, then live freshness.
+    fn dispatchable(&self, captured: u64, at: Instant2, clock: &impl Clock) -> Option<Diagnostic> {
+        self.gate(at, clock).or_else(|| {
+            (captured > at.mono_ms || at.mono_ms - captured > LIVE_FRESHNESS_MS)
+                .then_some(Diagnostic::StaleLiveSample)
+        })
     }
 
     /// Run the closed graph to its first non-passing stage, then settle.
@@ -391,27 +420,54 @@ impl<S: Source> State<S> {
                     },
                     (collected, _) => collected,
                 },
-                StageKind::Effect => match self.admit(stage, collectors, now) {
+                StageKind::Effect => match self.admit(stage, collectors) {
                     Err(reason) => Collected::at(self.driver_ms(now), StageResult::Failed(reason)),
-                    Ok(plan) => {
-                        self.dispatched = self.dispatched.saturating_add(1);
-                        let store = self.store.as_ref().expect("admission requires the store");
-                        collectors.effect(stage, plan, store)
+                    Ok((plan, captured)) => {
+                        // Recheck immediately before dispatch: planning and
+                        // live collection take time of their own.
+                        let at = clock.now();
+                        match self.dispatchable(captured, at, clock) {
+                            Some(reason) => {
+                                Collected::at(self.driver_ms(at), StageResult::Failed(reason))
+                            }
+                            None => {
+                                self.dispatched = self.dispatched.saturating_add(1);
+                                let store =
+                                    self.store.as_ref().expect("admission requires the store");
+                                collectors.effect(stage, plan, store)
+                            }
+                        }
                     }
                 },
                 StageKind::Cleanup => unreachable!("cleanup is settled below"),
+            };
+            // A completion after cancellation, the budget, expiry or a clock
+            // inconsistency is latched: it never passes and the trial stops.
+            let done = clock.now();
+            let collected = match self.gate(done, clock) {
+                Some(reason) => {
+                    self.late.get_or_insert(reason);
+                    Collected::at(self.driver_ms(done), StageResult::Failed(reason))
+                }
+                None => collected,
             };
             let _ = self.record(stage, collected);
         }
         self.settle(collectors, clock);
     }
 
+    /// Teardown is always available, including after expiry, cancellation
+    /// or a late completion. A settlement that ends late is latched.
     fn settle(&mut self, collectors: &mut impl Collectors<S>, clock: &impl Clock) {
         let started = self.driver_ms(clock.now());
         let teardown = collectors.cleanup(self.dispatched);
         // An uncertain teardown keeps every charge, whatever was dispatched.
         self.charge_retained = teardown != Teardown::Released;
-        let finished = self.driver_ms(clock.now()).max(started);
+        let end = clock.now();
+        if let Some(reason) = self.gate(end, clock) {
+            self.late.get_or_insert(reason);
+        }
+        let finished = self.driver_ms(end).max(started);
         let _ = self.record(
             Stage::Cleanup,
             Collected {
@@ -421,12 +477,14 @@ impl<S: Source> State<S> {
                     dispatched_effects: self.dispatched,
                     released: !self.charge_retained,
                     charge_retained: self.charge_retained,
+                    late: self.late.is_some(),
                 }),
             },
         );
     }
 
-    fn files(&self) -> Result<Vec<(FileKind, Vec<u8>)>, RunError> {
+    /// Each record file in manifest order with its canonical encoding.
+    fn groups(&self) -> Vec<(FileKind, Result<Vec<u8>, RunError>)> {
         FileKind::ALL
             .into_iter()
             .filter_map(|kind| {
@@ -435,8 +493,15 @@ impl<S: Source> State<S> {
                     .iter()
                     .filter(|record| record.stage.file() == kind)
                     .collect();
-                (!group.is_empty()).then(|| canonical(&group).map(|bytes| (kind, bytes)))
+                (!group.is_empty()).then(|| (kind, canonical(&group)))
             })
+            .collect()
+    }
+
+    fn files(&self) -> Result<Vec<(FileKind, Vec<u8>)>, RunError> {
+        self.groups()
+            .into_iter()
+            .map(|(kind, bytes)| bytes.map(|bytes| (kind, bytes)))
             .collect()
     }
 
@@ -444,6 +509,7 @@ impl<S: Source> State<S> {
         let sequence = stages(self.binding().class);
         self.settled
             && self.blocked_at.is_none()
+            && self.late.is_none()
             && !self.charge_retained
             && self.records.len() == sequence.len()
             && self.records.iter().zip(sequence).all(|(record, stage)| {
@@ -471,6 +537,8 @@ impl<S: Source> State<S> {
                 .collect(),
             dispatched_effects: self.dispatched,
             charge_retained: self.charge_retained,
+            late: self.late,
+            unwritten: Vec::new(),
         }
     }
 
@@ -479,6 +547,8 @@ impl<S: Source> State<S> {
         let dependencies = &self.dependencies;
         if !self.complete()
             || !dependencies.complete()
+            || now.mono_ms > MAX_TRIAL_MS
+            || now.mono_ms < self.last_finished()
             || !clocks_agree(self.issued, now)
             || !binding.live_at(now.utc, dependencies.key(binding.scope))
         {
@@ -528,7 +598,9 @@ pub(crate) trait DiagnosticSink {
 }
 
 /// Publish an incomplete native run: every record file, then the summary
-/// last. Fixture trials and complete-looking trials have no route here.
+/// last. A record the sink refuses is listed in the summary rather than
+/// ending publication, so a claimed directory always gets its summary.
+/// Fixture trials and complete-looking trials have no route here.
 pub(crate) fn publish_incomplete<S: Source>(
     trial: &Trial<S>,
     sink: &mut impl DiagnosticSink,
@@ -539,8 +611,17 @@ pub(crate) fn publish_incomplete<S: Source>(
     if !trial.state.settled || trial.state.complete() {
         return Err(RunError::Output);
     }
-    for (file, bytes) in trial.files()? {
-        sink.write(Output::Records(file), &bytes)?;
+    let mut summary = trial.incomplete();
+    for (file, bytes) in trial.state.groups() {
+        let written = bytes.and_then(|bytes| sink.write(Output::Records(file), &bytes));
+        if written.is_err() {
+            summary.unwritten.push(file);
+        }
     }
-    sink.write(Output::Incomplete, &canonical(&trial.incomplete())?)
+    sink.write(Output::Incomplete, &canonical(&summary)?)?;
+    if summary.unwritten.is_empty() {
+        Ok(())
+    } else {
+        Err(RunError::Output)
+    }
 }

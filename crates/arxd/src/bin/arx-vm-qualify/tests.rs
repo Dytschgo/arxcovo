@@ -3,11 +3,17 @@
 
 use crate::frame::*;
 use crate::trial::*;
-use std::cell::{Cell, RefCell};
+use std::{cell::Cell, rc::Rc};
 
 const T0: Instant2 = Instant2 {
     utc: 1_800_000_000,
     mono_ms: 0,
+};
+/// A finish instant after every scripted record: scripted collectors stamp
+/// one millisecond per call from zero, and no trial makes 1000 calls.
+const DONE: Instant2 = Instant2 {
+    utc: T0.utc,
+    mono_ms: 1_000,
 };
 const SCOPE: Hash = [1; 32];
 const RUN: [u8; 16] = [3; 16];
@@ -20,17 +26,21 @@ type Files = Vec<(FileKind, Vec<u8>)>;
 fn deps() -> Dependencies {
     Dependencies {
         release: release(),
+        artifact: Measured::Measured([13; 32]),
         host: Measured::Measured(HostDependency {
             windows_build: 26_100,
             windows_revision: 4_000,
+            machine: [14; 16],
         }),
         store: Measured::Measured(StoreDependency {
             trial_volume: 11,
             trial_volume_root: [5; 16],
+            trial_volume_guid: [15; 16],
             trial_root: [6; 16],
-            backing_volume: 12,
-            backing_file: [7; 16],
             outer_volume: 12,
+            outer_volume_root: [16; 16],
+            outer_volume_guid: [17; 16],
+            backing_file: [7; 16],
             vhd_virtual_bytes: 100 * GIB,
             inner_extent_bytes: 99 * GIB,
         }),
@@ -97,6 +107,19 @@ fn good(stage: Stage) -> Observation {
     }
 }
 
+/// A point inside a collector call where a test trips the clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Hook {
+    /// After a stage's collector produced its result.
+    Collect(Stage),
+    /// While the live sample for an admitted effect is taken.
+    Live(Stage),
+    /// After an effect returned.
+    Effect(Stage),
+    /// Inside teardown.
+    Cleanup,
+}
+
 /// Scripted collectors that record every call the driver makes.
 struct Script {
     overrides: Vec<(Stage, StageResult)>,
@@ -107,6 +130,8 @@ struct Script {
     effects: u16,
     cleanups: Vec<u16>,
     t: u64,
+    trip: Option<(Hook, Rc<Cell<bool>>)>,
+    planning: Option<Stage>,
 }
 
 impl Default for Script {
@@ -120,6 +145,8 @@ impl Default for Script {
             effects: 0,
             cleanups: Vec::new(),
             t: 0,
+            trip: None,
+            planning: None,
         }
     }
 }
@@ -132,6 +159,21 @@ impl Script {
         }
     }
 
+    fn tripping(hook: Hook, switch: &Rc<Cell<bool>>) -> Self {
+        Self {
+            trip: Some((hook, switch.clone())),
+            ..Self::default()
+        }
+    }
+
+    fn fire(&self, hook: Hook) {
+        if let Some((at, switch)) = &self.trip
+            && *at == hook
+        {
+            switch.set(true);
+        }
+    }
+
     fn collect(&mut self, stage: Stage) -> Collected {
         self.calls.push(stage);
         let result = self
@@ -141,6 +183,7 @@ impl Script {
             .map(|(_, result)| result.clone())
             .unwrap_or_else(|| StageResult::Passed(good(stage)));
         self.t += 1;
+        self.fire(Hook::Collect(stage));
         Collected {
             started_ms: self.t,
             finished_ms: self.t,
@@ -159,6 +202,7 @@ impl<S: Source<Store = FixtureStore>> Collectors<S> for Script {
     }
 
     fn plan(&mut self, stage: Stage) -> EffectPlan {
+        self.planning = Some(stage);
         self.plans
             .iter()
             .find(|(s, _)| *s == stage)
@@ -166,52 +210,78 @@ impl<S: Source<Store = FixtureStore>> Collectors<S> for Script {
     }
 
     fn live(&mut self) -> Option<u64> {
+        if let Some(stage) = self.planning {
+            self.fire(Hook::Live(stage));
+        }
         self.live
     }
 
     fn effect(&mut self, stage: Stage, _plan: EffectPlan, _store: &FixtureStore) -> Collected {
         self.effects += 1;
-        self.collect(stage)
+        let collected = self.collect(stage);
+        self.fire(Hook::Effect(stage));
+        collected
     }
 
     fn cleanup(&mut self, dispatched: u16) -> Teardown {
         self.cleanups.push(dispatched);
+        self.fire(Hook::Cleanup);
         self.teardown
     }
 }
 
-/// Returns scripted instants in order and repeats the last one.
-struct Script2 {
-    times: RefCell<Vec<Instant2>>,
-    cancel_at: Option<usize>,
-    calls: Cell<usize>,
-}
+/// A clock that always reads one instant.
+struct Script2(Instant2);
 
 impl Script2 {
     fn fixed(now: Instant2) -> Self {
-        Self {
-            times: RefCell::new(vec![now]),
-            cancel_at: None,
-            calls: Cell::new(0),
-        }
+        Self(now)
     }
 }
 
 impl Clock for Script2 {
     fn now(&self) -> Instant2 {
-        self.calls.set(self.calls.get() + 1);
-        let mut times = self.times.borrow_mut();
-        if times.len() > 1 {
-            times.remove(0)
-        } else {
-            times[0]
+        self.0
+    }
+
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// What a tripped `Switch` clock reports.
+#[derive(Clone, Copy)]
+enum Trip {
+    /// Time jumps to this instant.
+    Time(Instant2),
+    /// Cancellation is requested.
+    Cancel,
+}
+
+/// Reads `T0` until a collector hook trips it, independent of how many
+/// times the driver reads the clock.
+struct Switch {
+    tripped: Rc<Cell<bool>>,
+    trip: Trip,
+}
+
+impl Clock for Switch {
+    fn now(&self) -> Instant2 {
+        match (self.tripped.get(), self.trip) {
+            (true, Trip::Time(later)) => later,
+            _ => T0,
         }
     }
 
     fn cancelled(&self) -> bool {
-        self.cancel_at.is_some_and(|at| self.calls.get() > at)
+        self.tripped.get() && matches!(self.trip, Trip::Cancel)
     }
 }
+
+const OVER_BUDGET: Instant2 = Instant2 {
+    utc: T0.utc + MAX_TRIAL_MS / 1000 + 1,
+    mono_ms: MAX_TRIAL_MS + 1000,
+};
 
 fn fixture(class: Class) -> Trial<Fixture> {
     Trial::begin(TrialAuthority::<Fixture>::probe(
@@ -233,7 +303,7 @@ fn complete(class: Class) -> (Trial<Fixture>, Script) {
 fn sealed(class: Class) -> Complete<Fixture> {
     complete(class)
         .0
-        .finish(T0)
+        .finish(DONE)
         .expect("a complete fixture seals")
 }
 
@@ -358,7 +428,7 @@ fn a_complete_fixture_seals_and_passes_its_structural_self_check() {
         assert_eq!(trial.blocked_at(), None);
         assert_eq!(trial.records().len(), stages(class).len());
         assert_eq!(script.cleanups, [stages(class).len() as u16 - 8]);
-        let done = trial.finish(T0).unwrap();
+        let done = trial.finish(DONE).unwrap();
         let seal: Seal = decode(&done.seal).unwrap();
         assert_eq!(seal.origin, Origin::Fixture);
         for ((kind, bytes), entry) in done.files.iter().zip(&seal.manifest) {
@@ -388,7 +458,7 @@ fn fixture_output_is_never_admissible_at_the_verifier() {
 #[test]
 fn a_relabelled_native_forgery_fails_provenance_and_the_pinned_digest() {
     let (trial, _) = complete(Class::Test);
-    let original = trial.finish(T0).unwrap();
+    let original = trial.finish(DONE).unwrap();
     let records: Vec<Record> = original
         .files
         .iter()
@@ -429,6 +499,7 @@ fn no_native_observation_validates_any_store_or_effect_stage() {
             dispatched_effects: 0,
             released: true,
             charge_retained: false,
+            late: false,
         }])
         .collect();
     for class in [Class::Test, Class::StaticOrigin, Class::Docker] {
@@ -477,7 +548,7 @@ fn every_non_passing_stage_blocks_later_work_but_cleanup_still_settles() {
             let summary = trial.incomplete();
             assert_eq!(summary.blocked_at, Some(*stage));
             assert_eq!(summary.unattempted, sequence[index + 1..sequence.len() - 1]);
-            assert!(matches!(trial.finish(T0), Err(RunError::Incomplete)));
+            assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
         }
     }
 }
@@ -656,35 +727,151 @@ fn expiry_clock_rollback_and_cancellation_stop_the_graph_and_settle() {
             StageResult::Passed(Observation::Cleanup { .. })
         ));
     }
-    // Expiry in the middle of the run: already dispatched effects are
-    // counted and still settled.
-    let mut times = vec![T0; 9];
-    times.push(expired);
-    let clock = Script2 {
-        times: RefCell::new(times),
-        cancel_at: None,
-        calls: Cell::new(0),
-    };
+    // Expiry in the middle of the run, seen at the dispatch recheck: the
+    // effect is refused, earlier effects are counted and still settled.
+    let tripped = Rc::new(Cell::new(false));
     let mut trial = fixture(Class::Test);
-    let mut script = Script::default();
-    trial.drive(&mut script, &clock);
+    let mut script = Script::tripping(Hook::Live(Stage::LoaderConsumerOpens), &tripped);
+    trial.drive(
+        &mut script,
+        &Switch {
+            tripped,
+            trip: Trip::Time(expired),
+        },
+    );
     assert_eq!(trial.blocked_at(), Some(Stage::LoaderConsumerOpens));
     assert_eq!(script.effects, 2);
     assert_eq!(script.cleanups, [2]);
-    // Cancellation behaves the same way.
-    let clock = Script2 {
-        cancel_at: Some(4),
-        ..Script2::fixed(T0)
-    };
+    assert_eq!(trial.late(), Some(Diagnostic::Expired));
+    // Cancellation during a baseline collector latches that stage.
+    let tripped = Rc::new(Cell::new(false));
     let mut trial = fixture(Class::Test);
-    let mut script = Script::default();
-    trial.drive(&mut script, &clock);
-    assert_eq!(trial.blocked_at(), Some(Stage::ActivityReservesBaseline));
+    let mut script = Script::tripping(Hook::Collect(Stage::CustodyJobCapacityBaseline), &tripped);
+    trial.drive(
+        &mut script,
+        &Switch {
+            tripped,
+            trip: Trip::Cancel,
+        },
+    );
+    assert_eq!(trial.blocked_at(), Some(Stage::CustodyJobCapacityBaseline));
     assert_eq!(
-        trial.records()[4].result,
+        trial.records()[3].result,
         StageResult::Failed(Diagnostic::Cancelled)
     );
     assert_eq!(script.cleanups, [0]);
+    assert_eq!(trial.late(), Some(Diagnostic::Cancelled));
+}
+
+#[test]
+fn cancellation_after_admission_refuses_the_dispatch() {
+    let tripped = Rc::new(Cell::new(false));
+    let mut trial = fixture(Class::Test);
+    let mut script = Script::tripping(Hook::Live(Stage::QemuPrelaunchPause), &tripped);
+    trial.drive(
+        &mut script,
+        &Switch {
+            tripped,
+            trip: Trip::Cancel,
+        },
+    );
+    assert_eq!(trial.blocked_at(), Some(Stage::QemuPrelaunchPause));
+    assert_eq!(script.effects, 1, "only the suspended child dispatched");
+    assert!(!script.calls.contains(&Stage::QemuPrelaunchPause));
+    let attempt = &trial.records()[trial.records().len() - 2];
+    assert_eq!(attempt.stage, Stage::QemuPrelaunchPause);
+    assert_eq!(attempt.result, StageResult::Failed(Diagnostic::Cancelled));
+    assert_eq!(script.cleanups, [1], "teardown stays available");
+    assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
+}
+
+#[test]
+fn an_effect_completing_past_the_budget_is_latched_and_still_torn_down() {
+    let tripped = Rc::new(Cell::new(false));
+    let mut trial = fixture(Class::Test);
+    let mut script = Script::tripping(Hook::Effect(Stage::LoaderConsumerOpens), &tripped);
+    trial.drive(
+        &mut script,
+        &Switch {
+            tripped,
+            trip: Trip::Time(OVER_BUDGET),
+        },
+    );
+    assert_eq!(trial.blocked_at(), Some(Stage::LoaderConsumerOpens));
+    assert_eq!(script.effects, 3);
+    let attempt = &trial.records()[trial.records().len() - 2];
+    assert_eq!(attempt.stage, Stage::LoaderConsumerOpens);
+    assert_eq!(attempt.result, StageResult::Failed(Diagnostic::Expired));
+    assert_eq!(script.cleanups, [3]);
+    assert_eq!(trial.late(), Some(Diagnostic::Expired));
+    assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
+}
+
+#[test]
+fn crossing_the_budget_during_cleanup_never_seals() {
+    let tripped = Rc::new(Cell::new(false));
+    let mut trial = fixture(Class::Test);
+    let mut script = Script::tripping(Hook::Cleanup, &tripped);
+    trial.drive(
+        &mut script,
+        &Switch {
+            tripped,
+            trip: Trip::Time(OVER_BUDGET),
+        },
+    );
+    // Every stage passed and teardown released everything, but it ended
+    // after the budget: the settlement is latched and cannot complete.
+    assert_eq!(script.cleanups, [12]);
+    assert_eq!(trial.late(), Some(Diagnostic::Expired));
+    assert!(!trial.charge_retained());
+    assert!(matches!(
+        trial.records().last().unwrap().result,
+        StageResult::Passed(Observation::Cleanup { late: true, .. })
+    ));
+    assert_eq!(trial.blocked_at(), Some(Stage::Cleanup));
+    assert_eq!(trial.incomplete().late, Some(Diagnostic::Expired));
+    for now in [DONE, OVER_BUDGET] {
+        assert!(matches!(
+            fixture_after_late_cleanup().finish(now),
+            Err(RunError::Incomplete)
+        ));
+    }
+    assert!(matches!(
+        trial.finish(OVER_BUDGET),
+        Err(RunError::Incomplete)
+    ));
+}
+
+fn fixture_after_late_cleanup() -> Trial<Fixture> {
+    let tripped = Rc::new(Cell::new(false));
+    let mut trial = fixture(Class::Test);
+    let mut script = Script::tripping(Hook::Cleanup, &tripped);
+    trial.drive(
+        &mut script,
+        &Switch {
+            tripped,
+            trip: Trip::Time(OVER_BUDGET),
+        },
+    );
+    trial
+}
+
+#[test]
+fn a_seal_needs_a_finish_time_inside_the_budget_and_after_the_last_record() {
+    // A complete fixture still refuses a finish time past the budget, even
+    // with clocks that agree, or one before its last record.
+    assert!(matches!(
+        complete(Class::Test).0.finish(OVER_BUDGET),
+        Err(RunError::Incomplete)
+    ));
+    let mut trial = fixture(Class::Test);
+    let mut script = Script {
+        t: 1_000,
+        ..Script::default()
+    };
+    trial.drive(&mut script, &Script2::fixed(T0));
+    assert_eq!(trial.blocked_at(), None);
+    assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
 }
 
 #[test]
@@ -700,7 +887,7 @@ fn an_uncertain_teardown_retains_charge_and_blocks_sealing() {
     let summary = trial.incomplete();
     assert!(summary.charge_retained);
     assert_eq!(summary.dispatched_effects, 12);
-    assert!(matches!(trial.finish(T0), Err(RunError::Incomplete)));
+    assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
 }
 
 #[test]
@@ -928,6 +1115,7 @@ fn the_verifier_checks_selection_scope_dependencies_and_time_independently() {
     drifted.host = Measured::Measured(HostDependency {
         windows_build: 26_100,
         windows_revision: 4_001,
+        machine: [14; 16],
     });
     let mut unmeasured = deps();
     unmeasured.install_media = Measured::Unmeasured;
@@ -1002,18 +1190,28 @@ fn every_dependency_participates_in_the_invalidation_key() {
     assert!(base.complete());
     let key = base.key(SCOPE);
     assert_ne!(base.key([2; 32]), key, "the key is scoped");
-    let drifts: [Mutation<Dependencies>; 12] = [
+    let drifts: [Mutation<Dependencies>; 14] = [
         ("release", |d| d.release[0] ^= 1),
+        ("artifact", |d| d.artifact = Measured::Measured([0; 32])),
         ("host build", |d| {
             d.host = Measured::Measured(HostDependency {
                 windows_build: 26_200,
                 windows_revision: 4_000,
+                machine: [14; 16],
             })
         }),
         ("host revision", |d| {
             d.host = Measured::Measured(HostDependency {
                 windows_build: 26_100,
                 windows_revision: 4_001,
+                machine: [14; 16],
+            })
+        }),
+        ("host machine", |d| {
+            d.host = Measured::Measured(HostDependency {
+                windows_build: 26_100,
+                windows_revision: 4_000,
+                machine: [0; 16],
             })
         }),
         ("store", |d| {
@@ -1063,13 +1261,15 @@ fn every_dependency_participates_in_the_invalidation_key() {
         Measured::Measured(store) => store.clone(),
         Measured::Unmeasured => unreachable!(),
     };
-    let store_drifts: [fn(&mut StoreDependency); 8] = [
+    let store_drifts: [fn(&mut StoreDependency); 10] = [
         |s| s.trial_volume += 1,
         |s| s.trial_volume_root[0] ^= 1,
+        |s| s.trial_volume_guid[0] ^= 1,
         |s| s.trial_root[0] ^= 1,
-        |s| s.backing_volume += 1,
-        |s| s.backing_file[0] ^= 1,
         |s| s.outer_volume += 1,
+        |s| s.outer_volume_root[0] ^= 1,
+        |s| s.outer_volume_guid[0] ^= 1,
+        |s| s.backing_file[0] ^= 1,
         |s| s.vhd_virtual_bytes += 1,
         |s| s.inner_extent_bytes += 1,
     ];
@@ -1081,8 +1281,9 @@ fn every_dependency_participates_in_the_invalidation_key() {
         assert_ne!(changed.key(SCOPE), key);
         store_fields += 1;
     }
-    assert_eq!(store_fields, 8);
-    // Any unmeasured dependency keeps the projection incomplete.
+    assert_eq!(store_fields, 10);
+    // Any unmeasured dependency keeps the projection incomplete, including
+    // an explicitly absent reviewed artifact.
     let mut native_like = deps();
     native_like.owner_profile = Measured::Unmeasured;
     native_like.network_topology = Measured::Unmeasured;
@@ -1091,6 +1292,10 @@ fn every_dependency_participates_in_the_invalidation_key() {
         native_like.unmeasured(),
         ["owner_profile", "network_topology"]
     );
+    let mut no_artifact = deps();
+    no_artifact.artifact = Measured::Unmeasured;
+    assert!(!no_artifact.complete());
+    assert_eq!(no_artifact.unmeasured(), ["artifact"]);
 }
 
 #[test]
@@ -1229,6 +1434,52 @@ fn fixture_trials_have_no_route_to_the_diagnostic_sink() {
     assert!(sink.writes.is_empty());
 }
 
+/// Refuses one record file and records every other write.
+struct Refusing {
+    refuse: FileKind,
+    writes: Vec<(Output, Vec<u8>)>,
+}
+
+impl DiagnosticSink for Refusing {
+    fn write(&mut self, output: Output, bytes: &[u8]) -> Result<(), RunError> {
+        if output == Output::Records(self.refuse) {
+            return Err(RunError::Output);
+        }
+        self.writes.push((output, bytes.to_vec()));
+        Ok(())
+    }
+}
+
+#[test]
+fn a_refused_record_is_listed_and_the_summary_still_closes_the_directory() {
+    let mut trial = Trial::begin(TrialAuthority::<NativeProbe>::probe(
+        Class::Test,
+        SCOPE,
+        RUN,
+        deps(),
+        T0,
+    ));
+    let mut collectors = BaselineOnly(Script::default());
+    trial.drive(&mut collectors, &Script2::fixed(T0));
+    let mut sink = Refusing {
+        refuse: FileKind::Distribution,
+        writes: Vec::new(),
+    };
+    assert_eq!(publish_incomplete(&trial, &mut sink), Err(RunError::Output));
+    // Six other record files, then the summary naming the refused one.
+    assert_eq!(sink.writes.len(), 7);
+    let (last, bytes) = sink.writes.last().unwrap();
+    assert_eq!(*last, Output::Incomplete);
+    let summary: Incomplete = decode(bytes).unwrap();
+    assert_eq!(summary.unwritten, [FileKind::Distribution]);
+    assert!(
+        !sink
+            .writes
+            .iter()
+            .any(|(output, _)| *output == Output::Records(FileKind::Distribution))
+    );
+}
+
 /// A test-only source with native origin and the uninhabited native store,
 /// for exercising the publication path without host custody.
 struct NativeProbe;
@@ -1316,7 +1567,7 @@ fn a_blocked_native_run_publishes_only_incomplete_diagnostics_with_the_summary_l
     assert!(!summary.charge_retained);
     assert_eq!(summary.unmeasured, ["owner_profile"]);
     assert_eq!(summary.unattempted, stages(Class::Test)[7..19]);
-    assert!(matches!(trial.finish(T0), Err(RunError::Incomplete)));
+    assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
 }
 
 // Trait-absence checks: the generic fallback is the only candidate unless
@@ -1357,16 +1608,26 @@ fn trial_authority_is_private_inert_and_never_launch_authority() {
     <TrialAuthority<Native> as AmbiguousIfFrom<Dependencies, _>>::check();
     <Complete<Native> as AmbiguousIfFrom<Complete<Fixture>, _>>::check();
     <Trial<Native> as AmbiguousIfFrom<Trial<Fixture>, _>>::check();
+    // The library's held baseline converts into neither authority.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        use arxd::vm::qualification::Baseline;
+        <LaunchAuthority as AmbiguousIfFrom<Baseline, _>>::check();
+        <TrialAuthority<Native> as AmbiguousIfFrom<Baseline, _>>::check();
+        assert_not_impl!(LaunchAuthority: TryFrom<Baseline>);
+        assert_not_impl!(Baseline: Clone, Default, serde::Serialize, serde::de::DeserializeOwned);
+    }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod native_glue {
     use super::*;
-    use crate::native::{NativeCollectors, dependencies, diagnostic_file};
+    use crate::native::{NativeCollectors, dependencies, diagnostic_file, project, refused};
     use arxd::vm::qualification::{
         Activity, DiagnosticFile, Distribution, Host, Inputs, Limits, Observation as Timed,
-        Preflight, StoreIdentity,
+        Preflight, StoreIdentity, Taken,
     };
+    use arxd::vm::runtime::NativeRefusal;
 
     fn timed<T>(started_ms: u64, result: T) -> Timed<T> {
         Timed {
@@ -1374,6 +1635,10 @@ mod native_glue {
             finished_ms: started_ms + 1,
             result,
         }
+    }
+
+    fn taken<T>(started_ms: u64, result: T) -> Taken<T> {
+        Taken::Observed(timed(started_ms, result))
     }
 
     fn preflight(console_idle: bool, available_ram_bytes: u64, whpx: bool) -> Preflight {
@@ -1388,14 +1653,15 @@ mod native_glue {
                     evidence_claimed: true,
                 },
             ),
-            host: timed(
+            host: taken(
                 2,
                 Host {
                     windows_build: 26_100,
                     windows_revision: 4_000,
+                    machine: [14; 16],
                 },
             ),
-            distribution: timed(
+            distribution: taken(
                 4,
                 Distribution {
                     receipt: arxd::vm::public_egress::STOCK_RECEIPT_1113_SHA256,
@@ -1406,7 +1672,7 @@ mod native_glue {
                     payload_bytes: 300_000_000,
                 },
             ),
-            limits: timed(
+            limits: taken(
                 6,
                 Limits {
                     inner_caller_free_bytes: 80 * GIB,
@@ -1425,7 +1691,7 @@ mod native_glue {
                     empty_job_cpu_rate: JOB_CPU_RATE,
                 },
             ),
-            activity: timed(
+            activity: taken(
                 8,
                 Activity {
                     console_idle,
@@ -1435,16 +1701,16 @@ mod native_glue {
                     owner_cpu_reserve: 4,
                 },
             ),
-            whpx_present: timed(10, whpx),
+            whpx_present: taken(10, whpx),
             store: StoreIdentity {
                 trial_volume: 11,
                 trial_volume_root: [5; 16],
+                trial_volume_guid: [15; 16],
                 trial_root: [6; 16],
-                backing_volume: 12,
-                backing_file: [7; 16],
                 outer_volume: 12,
-                vhd_virtual_bytes: 100 * GIB,
-                inner_extent_bytes: 99 * GIB,
+                outer_volume_root: [16; 16],
+                outer_volume_guid: [17; 16],
+                backing_file: [7; 16],
             },
         }
     }
@@ -1494,6 +1760,7 @@ mod native_glue {
         assert_eq!(
             summary.unmeasured,
             [
+                "artifact",
                 "owner_profile",
                 "install_media",
                 "recipes",
@@ -1503,7 +1770,7 @@ mod native_glue {
             ]
         );
         assert_eq!(summary.dispatched_effects, 0);
-        assert!(matches!(trial.finish(T0), Err(RunError::Incomplete)));
+        assert!(matches!(trial.finish(DONE), Err(RunError::Incomplete)));
     }
 
     #[test]
@@ -1546,5 +1813,291 @@ mod native_glue {
             STOCK_MANIFEST_SHA256,
             arxd::vm::qualification::STOCK_MANIFEST_1113_SHA256
         );
+    }
+
+    #[test]
+    fn refused_post_claim_observations_settle_as_typed_failures() {
+        type Refuse = fn(&mut Preflight);
+        let cases: [(Refuse, Stage, Diagnostic, &str); 5] = [
+            (
+                |p| {
+                    p.host = Taken::Refused {
+                        at_ms: 3,
+                        reason: NativeRefusal::UnsupportedPlatform,
+                    }
+                },
+                Stage::HostBaseline,
+                Diagnostic::UnsupportedPlatform,
+                "host",
+            ),
+            (
+                |p| {
+                    p.distribution = Taken::Refused {
+                        at_ms: 5,
+                        reason: NativeRefusal::DistributionUnverified,
+                    }
+                },
+                Stage::Distribution,
+                Diagnostic::DistributionUnverified,
+                "distribution",
+            ),
+            (
+                |p| {
+                    p.limits = Taken::Refused {
+                        at_ms: 7,
+                        reason: NativeRefusal::DiskCeilingUnverified,
+                    }
+                },
+                Stage::CustodyJobCapacityBaseline,
+                Diagnostic::DiskCeilingUnverified,
+                "store",
+            ),
+            (
+                |p| {
+                    p.activity = Taken::Refused {
+                        at_ms: 9,
+                        reason: NativeRefusal::OwnerActivityUnverified,
+                    }
+                },
+                Stage::ActivityReservesBaseline,
+                Diagnostic::OwnerActivityUnverified,
+                "",
+            ),
+            (
+                |p| {
+                    p.whpx_present = Taken::Refused {
+                        at_ms: 11,
+                        reason: NativeRefusal::WhpxUnverified,
+                    }
+                },
+                Stage::WhpxCapability,
+                Diagnostic::WhpxUnverified,
+                "",
+            ),
+        ];
+        for (refuse, stage, diagnostic, dependency) in cases {
+            let mut p = preflight(true, 32 * GIB, true);
+            refuse(&mut p);
+            let (trial, sink) = run(&p);
+            assert_eq!(trial.blocked_at(), Some(stage), "{stage:?}");
+            let attempt = &trial.records()[trial.records().len() - 2];
+            assert_eq!(attempt.stage, stage);
+            assert_eq!(attempt.result, StageResult::Failed(diagnostic));
+            assert_eq!(trial.records().last().unwrap().stage, Stage::Cleanup);
+            let (last, bytes) = sink.writes.last().unwrap();
+            assert_eq!(*last, Output::Incomplete, "{stage:?}");
+            let summary: Incomplete = decode(bytes).unwrap();
+            assert_eq!(summary.blocked_at, Some(stage));
+            assert!(summary.unwritten.is_empty());
+            if !dependency.is_empty() {
+                assert!(
+                    summary.unmeasured.iter().any(|name| name == dependency),
+                    "{stage:?}"
+                );
+            }
+        }
+        // Refusals outside the preflight's observations map to one code.
+        for reason in [
+            NativeRefusal::Disabled,
+            NativeRefusal::IdentityUnverified,
+            NativeRefusal::InstallerDeadlineExpired,
+        ] {
+            assert_eq!(refused(reason), Diagnostic::OtherRefusal);
+        }
+    }
+
+    #[test]
+    fn the_native_projection_binds_exact_host_and_store_identities() {
+        let p = preflight(true, 32 * GIB, true);
+        let projected = dependencies(&p);
+        // No reviewed artifact pin exists yet: explicitly absent.
+        assert_eq!(projected.artifact, Measured::Unmeasured);
+        assert_eq!(
+            projected.host,
+            Measured::Measured(HostDependency {
+                windows_build: 26_100,
+                windows_revision: 4_000,
+                machine: [14; 16],
+            })
+        );
+        assert_eq!(
+            projected.store,
+            Measured::Measured(StoreDependency {
+                trial_volume: 11,
+                trial_volume_root: [5; 16],
+                trial_volume_guid: [15; 16],
+                trial_root: [6; 16],
+                outer_volume: 12,
+                outer_volume_root: [16; 16],
+                outer_volume_guid: [17; 16],
+                backing_file: [7; 16],
+                vhd_virtual_bytes: 100 * GIB,
+                inner_extent_bytes: 99 * GIB,
+            })
+        );
+        // The machine identity binds the key but never reaches a record.
+        assert_eq!(
+            project(&p, Stage::HostBaseline).result,
+            StageResult::Passed(Observation::Host {
+                windows_build: 26_100,
+                windows_revision: 4_000,
+            })
+        );
+    }
+
+    /// Every diagnostic, by an exhaustive successor chain: a new variant
+    /// fails to compile until it is placed here.
+    fn all_diagnostics() -> Vec<Diagnostic> {
+        use Diagnostic as D;
+        let next = |d: D| match d {
+            D::OwnerActive => Some(D::ReservesShort),
+            D::ReservesShort => Some(D::WhpxAbsent),
+            D::WhpxAbsent => Some(D::ObservationInvalid),
+            D::ObservationInvalid => Some(D::Expired),
+            D::Expired => Some(D::ClockInconsistent),
+            D::ClockInconsistent => Some(D::Cancelled),
+            D::Cancelled => Some(D::StaleLiveSample),
+            D::StaleLiveSample => Some(D::PrerequisiteMissing),
+            D::PrerequisiteMissing => Some(D::EffectUnconfined),
+            D::EffectUnconfined => Some(D::TeardownUncertain),
+            D::TeardownUncertain => Some(D::UnsupportedPlatform),
+            D::UnsupportedPlatform => Some(D::DistributionUnverified),
+            D::DistributionUnverified => Some(D::PathCustodyUnverified),
+            D::PathCustodyUnverified => Some(D::JobUnverified),
+            D::JobUnverified => Some(D::WhpxUnverified),
+            D::WhpxUnverified => Some(D::DiskCeilingUnverified),
+            D::DiskCeilingUnverified => Some(D::OwnerActivityUnverified),
+            D::OwnerActivityUnverified => Some(D::ReservesUnverified),
+            D::ReservesUnverified => Some(D::OtherRefusal),
+            D::OtherRefusal => None,
+        };
+        std::iter::successors(Some(D::OwnerActive), |d| next(*d)).collect()
+    }
+
+    #[test]
+    fn every_writer_encoding_passes_the_library_schema() {
+        use arxd::vm::qualification::{RECORD_COLLECTOR, RECORD_CONTRACT, schema_accepts};
+        assert_eq!((CONTRACT, COLLECTOR), (RECORD_CONTRACT, RECORD_COLLECTOR));
+        let binding = Binding {
+            class: Class::Test,
+            scope: SCOPE,
+            release: release(),
+            run: RUN,
+            dependencies: [4; 32],
+            issued_utc: T0.utc,
+            expires_utc: T0.utc + MAX_VALIDITY,
+        };
+        let encode = |stage: Stage, result: StageResult| {
+            canonical(&vec![Record {
+                contract: CONTRACT,
+                collector: COLLECTOR,
+                origin: Origin::Native,
+                binding,
+                stage,
+                started_ms: 1,
+                finished_ms: MAX_TRIAL_MS,
+                prior: [9; 32],
+                result,
+            }])
+            .unwrap()
+        };
+        let accepts = |kind: FileKind, bytes: &[u8]| {
+            schema_accepts(diagnostic_file(Output::Records(kind)), bytes)
+        };
+        let diagnostics = all_diagnostics();
+        assert_eq!(diagnostics.len(), 20);
+        for class in [Class::Test, Class::StaticOrigin, Class::Docker] {
+            for &stage in stages(class) {
+                for &diagnostic in &diagnostics {
+                    for result in [
+                        StageResult::Failed(diagnostic),
+                        StageResult::Inconclusive(diagnostic),
+                    ] {
+                        assert!(accepts(stage.file(), &encode(stage, result)), "{stage:?}");
+                    }
+                }
+                let bytes = encode(stage, StageResult::Unimplemented);
+                for kind in FileKind::ALL {
+                    assert_eq!(accepts(kind, &bytes), kind == stage.file(), "{stage:?}");
+                }
+            }
+        }
+        let cleanup = |released, late| Observation::Cleanup {
+            dispatched_effects: 12,
+            released,
+            charge_retained: !released,
+            late,
+        };
+        for (stage, observation) in stages(Class::Test)[..6]
+            .iter()
+            .map(|stage| (*stage, good(*stage)))
+            .chain([
+                (Stage::Cleanup, cleanup(true, false)),
+                (Stage::Cleanup, cleanup(false, true)),
+            ])
+        {
+            let bytes = encode(stage, StageResult::Passed(observation));
+            assert!(accepts(stage.file(), &bytes), "{stage:?}");
+        }
+        // A fixture witness never reaches the native writer.
+        let witness = Observation::FixtureEffect {
+            stage: Stage::SuspendedChild,
+        };
+        assert!(!accepts(
+            FileKind::CustodyJobCapacity,
+            &encode(Stage::SuspendedChild, StageResult::Passed(witness))
+        ));
+        // A synthetic endpoint smuggled into a writer record is refused.
+        let mut smuggled = encode(Stage::Inputs, StageResult::Passed(good(Stage::Inputs)));
+        let at = smuggled.len() - 2;
+        smuggled.splice(at..at, br#","endpoint":"192.0.2.7:443""#.iter().copied());
+        assert!(!accepts(FileKind::Inputs, &smuggled));
+
+        let unmeasured: Vec<String> = Dependencies {
+            artifact: Measured::Unmeasured,
+            host: Measured::Unmeasured,
+            store: Measured::Unmeasured,
+            owner_profile: Measured::Unmeasured,
+            distribution: Measured::Unmeasured,
+            install_media: Measured::Unmeasured,
+            recipes: Measured::Unmeasured,
+            firmware: Measured::Unmeasured,
+            guest_protocol: Measured::Unmeasured,
+            network_topology: Measured::Unmeasured,
+            ..deps()
+        }
+        .unmeasured()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(unmeasured.len(), 10);
+        let summary = |late, blocked_at, unwritten: Vec<FileKind>| Incomplete {
+            contract: CONTRACT,
+            origin: Origin::Native,
+            binding,
+            blocked_at,
+            unattempted: stages(Class::Test)[7..].to_vec(),
+            unmeasured: unmeasured.clone(),
+            dispatched_effects: 0,
+            charge_retained: true,
+            late,
+            unwritten,
+        };
+        let incomplete = |value: &Incomplete| {
+            schema_accepts(DiagnosticFile::Incomplete, &canonical(value).unwrap())
+        };
+        assert!(incomplete(&summary(None, None, Vec::new())));
+        assert!(incomplete(&summary(
+            None,
+            Some(Stage::Cleanup),
+            FileKind::ALL.to_vec()
+        )));
+        for &late in &diagnostics {
+            assert!(incomplete(&summary(
+                Some(late),
+                Some(Stage::DisposableStore),
+                Vec::new()
+            )));
+        }
     }
 }

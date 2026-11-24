@@ -1,13 +1,16 @@
 //! Authority-free, read-only preflight for the separate owner-local
 //! qualification runner. Nothing here can mint trial or launch authority:
 //! the runner's private `TrialAuthority` lives in its own binary crate. The
-//! only output is a held, claimed, diagnostic-only evidence directory.
+//! only output is a held, claimed, diagnostic-only evidence directory whose
+//! every file passes a closed schema at the held writer.
 //!
 //! Native observations here are **unverified on real hardware**.
 
 mod capacity;
+mod schema;
 mod sink;
 
+pub use schema::{RECORD_COLLECTOR, RECORD_CONTRACT};
 pub use sink::{DiagnosticFile, SinkError};
 
 use super::*;
@@ -55,6 +58,8 @@ struct Enrollment {
     stock_bundle: String,
     trial_root: String,
     trial_volume: VolumePin,
+    /// The mount manager's `\\?\Volume{GUID}\` name of the trial volume.
+    trial_volume_guid: String,
     trial_identity: VolumePin,
     outer_root: String,
     backing_file: String,
@@ -81,6 +86,13 @@ pub struct Observation<T> {
     pub result: T,
 }
 
+/// A post-claim observation. A refusal here never ends the run early: the
+/// runner settles it as a typed diagnostic and finishes the directory.
+pub enum Taken<T> {
+    Observed(Observation<T>),
+    Refused { at_ms: u64, reason: NativeRefusal },
+}
+
 pub struct Inputs {
     pub held_roots: u8,
     pub enrollment_private: bool,
@@ -92,6 +104,9 @@ pub struct Inputs {
 pub struct Host {
     pub windows_build: u32,
     pub windows_revision: u32,
+    /// The installation's `MachineGuid`. Local only: the runner binds it into
+    /// the keyed invalidation digest and never publishes it.
+    pub machine: [u8; 16],
 }
 
 pub struct Distribution {
@@ -128,26 +143,27 @@ pub struct Activity {
     pub owner_cpu_reserve: u32,
 }
 
-/// Stable identities for the runner's local invalidation projection. They
-/// are published only inside a digest keyed by the runner's random scope.
+/// Stable identities of the held store objects, taken before the claim from
+/// the GUID-anchored walks. They are published only inside a digest keyed
+/// by the runner's random scope.
 pub struct StoreIdentity {
     pub trial_volume: u64,
     pub trial_volume_root: [u8; 16],
+    pub trial_volume_guid: [u8; 16],
     pub trial_root: [u8; 16],
-    pub backing_volume: u64,
-    pub backing_file: [u8; 16],
     pub outer_volume: u64,
-    pub vhd_virtual_bytes: u64,
-    pub inner_extent_bytes: u64,
+    pub outer_volume_root: [u8; 16],
+    pub outer_volume_guid: [u8; 16],
+    pub backing_file: [u8; 16],
 }
 
 pub struct Preflight {
     pub inputs: Observation<Inputs>,
-    pub host: Observation<Host>,
-    pub distribution: Observation<Distribution>,
-    pub limits: Observation<Limits>,
-    pub activity: Observation<Activity>,
-    pub whpx_present: Observation<bool>,
+    pub host: Taken<Host>,
+    pub distribution: Taken<Distribution>,
+    pub limits: Taken<Limits>,
+    pub activity: Taken<Activity>,
+    pub whpx_present: Taken<bool>,
     pub store: StoreIdentity,
 }
 
@@ -160,11 +176,34 @@ pub struct Preflight {
 /// use arxd::vm::qualification::TrialAuthority;
 /// ```
 ///
-/// A baseline cannot be assembled outside the preflight:
+/// A baseline cannot be assembled outside the preflight. Every field is
+/// supplied, so field privacy is the only refusal:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// fn forge(p: arxd::vm::qualification::Preflight) -> arxd::vm::qualification::Baseline {
-///     arxd::vm::qualification::Baseline { observations: p }
+///     arxd::vm::qualification::Baseline {
+///         observations: p,
+///         origin: std::time::Instant::now(),
+///         evidence: todo!(),
+///         _held: todo!(),
+///     }
+/// }
+/// ```
+///
+/// Nor converted into the daemon's launch authority, by `From`:
+///
+/// ```compile_fail,E0277
+/// fn launch(b: arxd::vm::qualification::Baseline) -> arxd::vm::runtime::LaunchAuthority {
+///     b.into()
+/// }
+/// ```
+///
+/// or by `TryFrom`:
+///
+/// ```compile_fail,E0277
+/// use arxd::vm::runtime::LaunchAuthority;
+/// fn launch(b: arxd::vm::qualification::Baseline) -> Option<LaunchAuthority> {
+///     LaunchAuthority::try_from(b).ok()
 /// }
 /// ```
 ///
@@ -172,6 +211,20 @@ pub struct Preflight {
 ///
 /// ```compile_fail,E0599
 /// let _ = arxd::vm::qualification::DiagnosticFile::Qualification;
+/// ```
+///
+/// Positive control: the authority-free surface these checks rely on
+/// compiles, so each refusal above is the fence and not a missing path.
+///
+/// ```no_run
+/// use arxd::vm::qualification::{Baseline, DiagnosticFile, Preflight, SinkError};
+/// fn surface<'a>(b: &'a Baseline, record: &[u8]) -> Result<&'a Preflight, SinkError> {
+///     b.write(DiagnosticFile::Inputs, record)?;
+///     Ok(b.observations())
+/// }
+/// let _ = surface;
+/// let _ = arxd::vm::qualification::preflight;
+/// let _: Option<arxd::vm::runtime::LaunchAuthority> = None;
 /// ```
 pub struct Baseline {
     observations: Preflight,
@@ -182,10 +235,10 @@ pub struct Baseline {
 
 struct Held {
     _bundle: Vec<PathPin>,
-    _roots: [PathPin; 5],
+    _pins: [PathPin; 3],
+    _volumes: [capacity::AnchoredVolume; 2],
     _token: VmToken,
-    _vhd: OwnedHandle,
-    _volume: capacity::HeldVolume,
+    _capacity: Option<(OwnedHandle, capacity::HeldDevice)>,
 }
 
 impl Baseline {
@@ -198,33 +251,67 @@ impl Baseline {
         self.origin
     }
 
-    /// Write one diagnostic file into the claimed directory.
+    /// Write one diagnostic file into the claimed directory. The bytes must
+    /// be one canonical value of that file's closed schema.
     pub fn write(&self, file: DiagnosticFile, bytes: &[u8]) -> Result<(), SinkError> {
         self.evidence.write(file, bytes)
     }
+}
+
+/// The closed-schema check the held writer applies to `file`. Pure and
+/// authority-free; the runner's tests keep every encoding inside it.
+pub fn schema_accepts(file: DiagnosticFile, bytes: &[u8]) -> bool {
+    schema::check(file, bytes)
 }
 
 fn elapsed(origin: Instant) -> u64 {
     u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn observe<T>(
+/// Take one post-claim observation and whatever it must keep held.
+fn take_held<T, H>(
     origin: Instant,
-    run: impl FnOnce() -> Result<T, NativeRefusal>,
-) -> Result<Observation<T>, NativeRefusal> {
+    run: impl FnOnce() -> Result<(T, H), NativeRefusal>,
+) -> (Taken<T>, Option<H>) {
     let started_ms = elapsed(origin);
-    let result = run()?;
-    Ok(Observation {
-        started_ms,
-        finished_ms: elapsed(origin),
-        result,
-    })
+    match run() {
+        Ok((result, held)) => (
+            Taken::Observed(Observation {
+                started_ms,
+                finished_ms: elapsed(origin),
+                result,
+            }),
+            Some(held),
+        ),
+        Err(reason) => (
+            Taken::Refused {
+                at_ms: elapsed(origin),
+                reason,
+            },
+            None,
+        ),
+    }
+}
+
+fn take<T>(origin: Instant, run: impl FnOnce() -> Result<T, NativeRefusal>) -> Taken<T> {
+    take_held(origin, || run().map(|result| (result, ()))).0
 }
 
 /// Inspect only the explicitly enrolled roots, the current token and console,
 /// aggregate counters and the exact stock payload. Behavioral trials are
 /// later stages with their own collectors.
 pub fn preflight(enrollment_file: &str, evidence_dir: &str) -> Result<Baseline, NativeRefusal> {
+    preflight_with(&capacity::MountManager, enrollment_file, evidence_dir)
+}
+
+/// Every refusal before the claim leaves the evidence directory untouched,
+/// so a corrected invocation can retry in it. After the claim nothing
+/// returns early: each observation is a typed result the runner settles.
+fn preflight_with(
+    names: &impl capacity::VolumeNames,
+    enrollment_file: &str,
+    evidence_dir: &str,
+) -> Result<Baseline, NativeRefusal> {
     let origin = Instant::now();
     let custody = NativeRefusal::PathCustodyUnverified;
     let user = current_user().map_err(|_| NativeRefusal::IdentityUnverified)?;
@@ -238,6 +325,14 @@ pub fn preflight(enrollment_file: &str, evidence_dir: &str) -> Result<Baseline, 
         .map_err(|_| NativeRefusal::QualificationMissing)?;
     let enrollment: Enrollment =
         serde_json::from_slice(&bytes).map_err(|_| NativeRefusal::QualificationMissing)?;
+    // Identity first, before any root is pinned or output claimed: the
+    // enrolled owner must be this process's interactive, non-elevated,
+    // non-impersonating console token. An elevated or mismatched invocation
+    // is refused here and writes nothing.
+    let owner = canonical_sid(&enrollment.owner_sid)?;
+    let token =
+        VmToken::derive_current_user(owner).map_err(|_| NativeRefusal::IdentityUnverified)?;
+
     let root = local(&enrollment.trial_root)?;
     let outer = local(&enrollment.outer_root)?;
     let backing = local(&enrollment.backing_file)?;
@@ -246,32 +341,40 @@ pub fn preflight(enrollment_file: &str, evidence_dir: &str) -> Result<Baseline, 
     if !roots_disjoint(&path, &root, &outer, &backing, &bundle, &evidence_path) {
         return Err(custody);
     }
-    let evidence_pin = PathPin::open(&evidence_path, true, false)?;
-    let trial_pin = PathPin::open(&root, true, false)?;
-    let outer_pin = PathPin::open(&outer, true, false)?;
-    let backing_pin = PathPin::open(&backing, false, true)?;
-    let trial_volume = PathPin::open(&local(&root.as_str()[..3])?, true, false)?;
+    // Each drive letter is resolved once, to a GUID root held for the run.
+    // Every leaf is walked from its held root, so all observations of a
+    // volume come from the same proven objects.
+    let outer_volume = capacity::anchor_volume(names, outer.as_str())?;
+    let trial_volume = capacity::anchor_volume(names, &root.as_str()[..3])?;
+    let evidence_pin = capacity::walk(names, &outer_volume, &evidence_path, true, false)?;
+    let trial_pin = capacity::walk(names, &trial_volume, &root, true, false)?;
+    let backing_pin = capacity::walk(names, &outer_volume, &backing, false, true)?;
     if !sink::held_private(&trial_pin.leaf, user_sid)
         || !enrollment.trial_volume.matches(trial_volume.identity)
+        || !trial_volume
+            .guid
+            .eq_ignore_ascii_case(&enrollment.trial_volume_guid)
         || !enrollment.trial_identity.matches(trial_pin.identity)
         || !enrollment.backing_identity.matches(backing_pin.identity)
-        || trial_pin.identity.volume == backing_pin.identity.volume
-        || outer_pin.identity.volume != backing_pin.identity.volume
+        || trial_volume.guid_bytes == outer_volume.guid_bytes
+        || trial_volume.identity.volume == outer_volume.identity.volume
     {
         return Err(custody);
     }
-    // Claim once every input root is held and checked. A concurrent runner
-    // loses here, before any observation is taken.
     let private_values = [
         enrollment.owner_sid.as_str(),
         enrollment.stock_bundle.as_str(),
         enrollment.trial_root.as_str(),
+        enrollment.trial_volume_guid.as_str(),
         enrollment.outer_root.as_str(),
         enrollment.backing_file.as_str(),
         enrollment_file,
         evidence_dir,
     ];
+    // Claim once identity and every input root are held and checked. A
+    // concurrent runner loses here, before any observation is taken.
     let evidence = sink::EvidenceDir::claim(evidence_pin, user_sid, &private_values)?;
+
     let inputs = Observation {
         started_ms: 0,
         finished_ms: elapsed(origin),
@@ -283,53 +386,41 @@ pub fn preflight(enrollment_file: &str, evidence_dir: &str) -> Result<Baseline, 
             evidence_claimed: true,
         },
     };
-
-    let host = observe(origin, || {
-        let windows_build = platform()?;
+    let host = take(origin, || {
         Ok(Host {
-            windows_build,
+            windows_build: platform()?,
             windows_revision: windows_revision()?,
+            machine: machine_guid()?,
         })
-    })?;
-    let owner = canonical_sid(&enrollment.owner_sid)?;
-    let token =
-        VmToken::derive_current_user(owner).map_err(|_| NativeRefusal::IdentityUnverified)?;
-    let distribution_start = elapsed(origin);
-    let (distribution, bundle_pins) = collect_distribution(&bundle)?;
-    let distribution = Observation {
-        started_ms: distribution_start,
-        finished_ms: elapsed(origin),
-        result: distribution,
-    };
-
-    let limits_start = elapsed(origin);
-    let (vhd, facts) = capacity::fixed_vhd(&backing_pin)?;
-    let volume = capacity::bind_volume(&trial_volume, facts.disk)?;
-    let sample = capacity::CapacitySample {
-        provider_subtype: facts.provider_subtype,
-        vhd_virtual: facts.virtual_size,
-        vhd_physical: facts.physical_size,
-        sector: facts.sector,
-        extent_start: volume.extent_start,
-        extent_length: volume.extent_length,
-        inner: capacity::held_free(&trial_pin.leaf)?,
-        outer: capacity::held_free(&outer_pin.leaf)?,
-        backing_length: backing_pin
-            .leaf
-            .metadata()
-            .map_err(|_| NativeRefusal::DiskCeilingUnverified)?
-            .len(),
-        backing_allocated: backing_pin.allocated,
-    };
-    let limit_values = capacity::check_capacity(&sample)?;
-    empty_job()?;
-    let limits = Observation {
-        started_ms: limits_start,
-        finished_ms: elapsed(origin),
-        result: limit_values,
-    };
-
-    let activity = observe(origin, || {
+    });
+    let (distribution, bundle_pins) = take_held(origin, || collect_distribution(&bundle));
+    let (limits, capacity_handles) = take_held(origin, || {
+        let reason = NativeRefusal::DiskCeilingUnverified;
+        let (vhd, facts) = capacity::fixed_vhd(names, &outer_volume, &backing_pin)?;
+        let device = capacity::volume_extent(&trial_volume, facts.disk)?;
+        let sample = capacity::CapacitySample {
+            provider_subtype: facts.provider_subtype,
+            vhd_virtual: facts.virtual_size,
+            vhd_physical: facts.physical_size,
+            sector: facts.sector,
+            extent_start: device.extent_start,
+            extent_length: device.extent_length,
+            inner: capacity::held_free(&trial_pin.leaf)?,
+            outer: capacity::held_free(&outer_volume.root)?,
+            backing_length: backing_pin.leaf.metadata().map_err(|_| reason)?.len(),
+            backing_allocated: backing_pin.allocated,
+        };
+        let limits = capacity::check_capacity(&sample)?;
+        empty_job()?;
+        // A drive letter rebound while the observation ran closes it.
+        if !capacity::still_bound(names, &trial_volume)
+            || !capacity::still_bound(names, &outer_volume)
+        {
+            return Err(reason);
+        }
+        Ok((limits, (vhd, device)))
+    });
+    let activity = take(origin, || {
         let console_idle = current_console_idle(&token)?;
         let (active_cpus, available_ram_bytes) = host_resources()?;
         Ok(Activity {
@@ -339,17 +430,17 @@ pub fn preflight(enrollment_file: &str, evidence_dir: &str) -> Result<Baseline, 
             owner_ram_reserve_bytes: RAM_RESERVE,
             owner_cpu_reserve: active_cpus.div_ceil(2),
         })
-    })?;
-    let whpx_present = observe(origin, hypervisor_present)?;
+    });
+    let whpx_present = take(origin, hypervisor_present);
     let store = StoreIdentity {
         trial_volume: trial_volume.identity.volume,
         trial_volume_root: trial_volume.identity.file,
+        trial_volume_guid: trial_volume.guid_bytes,
         trial_root: trial_pin.identity.file,
-        backing_volume: backing_pin.identity.volume,
+        outer_volume: outer_volume.identity.volume,
+        outer_volume_root: outer_volume.identity.file,
+        outer_volume_guid: outer_volume.guid_bytes,
         backing_file: backing_pin.identity.file,
-        outer_volume: outer_pin.identity.volume,
-        vhd_virtual_bytes: limits.result.vhd_virtual_bytes,
-        inner_extent_bytes: limits.result.inner_extent_bytes,
     };
     Ok(Baseline {
         observations: Preflight {
@@ -364,11 +455,11 @@ pub fn preflight(enrollment_file: &str, evidence_dir: &str) -> Result<Baseline, 
         origin,
         evidence,
         _held: Held {
-            _bundle: bundle_pins,
-            _roots: [source, trial_pin, outer_pin, backing_pin, trial_volume],
+            _bundle: bundle_pins.unwrap_or_default(),
+            _pins: [source, trial_pin, backing_pin],
+            _volumes: [trial_volume, outer_volume],
             _token: token,
-            _vhd: vhd,
-            _volume: volume,
+            _capacity: capacity_handles,
         },
     })
 }
@@ -454,6 +545,21 @@ fn canonical_sid(raw: &str) -> Result<LocalSid, NativeRefusal> {
     matches.then_some(sid).ok_or(reason)
 }
 
+/// The 16 bytes of an `8-4-4-4-12` hexadecimal GUID spelling.
+fn parse_guid(text: &str) -> Option<[u8; 16]> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 36 || [8, 13, 18, 23].iter().any(|&i| bytes[i] != b'-') {
+        return None;
+    }
+    let digits: String = text.chars().filter(|&c| c != '-').collect();
+    if digits.len() != 32 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0; 16];
+    hex::decode_to_slice(&digits, &mut out).ok()?;
+    Some(out)
+}
+
 fn platform() -> Result<u32, NativeRefusal> {
     let reason = NativeRefusal::UnsupportedPlatform;
     let (mut process, mut machine) = (0, 0);
@@ -500,6 +606,34 @@ fn windows_revision() -> Result<u32, NativeRefusal> {
         return Err(NativeRefusal::UnsupportedPlatform);
     }
     Ok(value)
+}
+
+/// The installation's stable `MachineGuid`, for the local invalidation key.
+fn machine_guid() -> Result<[u8; 16], NativeRefusal> {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+    let reason = NativeRefusal::UnsupportedPlatform;
+    let mut value = [0u16; 40];
+    let mut size = size_of_val(&value) as u32;
+    // A typed, terminated string read of one fixed value into a fixed buffer.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            wide(r"SOFTWARE\Microsoft\Cryptography").as_ptr(),
+            wide("MachineGuid").as_ptr(),
+            RRF_RT_REG_SZ,
+            null_mut(),
+            value.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    // Thirty-six UTF-16 units and the terminator.
+    if status != ERROR_SUCCESS || size != 74 {
+        return Err(reason);
+    }
+    String::from_utf16(&value[..36])
+        .ok()
+        .and_then(|text| parse_guid(&text))
+        .ok_or(reason)
 }
 
 fn hypervisor_present() -> Result<bool, NativeRefusal> {
@@ -553,27 +687,52 @@ struct WtsSample {
     current: i64,
 }
 
-/// The LSA record for the token's logon LUID.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// The account names a WTS sample reports for the session.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct WtsAccount {
+    user: String,
+    domain: String,
+}
+
+/// The LSA record for the token's logon LUID, read from the local logon
+/// session itself. Its names are the record's own, never looked up by name.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct LsaLogon {
     logon_type: u32,
     session: u32,
     logon_time: i64,
     owner: bool,
+    user: String,
+    domain: String,
 }
 
 struct ConsoleEvidence {
     token_session: u32,
     active_console: u32,
-    /// The WTS account name resolved locally to the enrolled SID; `None`
-    /// when no local mapping exists (including unknown cloud mappings).
-    mapped: Option<bool>,
-    same_account: bool,
+    /// The account names of both WTS samples; `None` when unreadable.
+    accounts: [Option<WtsAccount>; 2],
     wts: [WtsSample; 2],
     lsa: [LsaLogon; 2],
     /// The token's session, LUID and logon SID did not change.
     token_stable: bool,
     now: i64,
+}
+
+/// Offline binding of the WTS session account to the LSA logon record that
+/// is already pinned by the token's LUID and the enrolled SID: both must
+/// name the same account. Nothing is resolved by name, so no lookup can
+/// leave the host. Empty, qualified or unequal names are ambiguous and
+/// close; WTS truncates long names, so a truncated name never matches.
+fn account_bound(account: Option<&WtsAccount>, lsa: &LsaLogon) -> bool {
+    let plain = |name: &str| !name.is_empty() && !name.contains('\\');
+    account.is_some_and(|wts| {
+        plain(&wts.user)
+            && plain(&wts.domain)
+            && plain(&lsa.user)
+            && plain(&lsa.domain)
+            && wts.user.eq_ignore_ascii_case(&lsa.user)
+            && wts.domain.eq_ignore_ascii_case(&lsa.domain)
+    })
 }
 
 /// Every comparison closes admission. A valid negative observation (recent
@@ -589,8 +748,8 @@ fn console_decision(e: &ConsoleEvidence) -> Result<bool, NativeRefusal> {
             && lsa.logon_time > 0
             && lsa.logon_time.abs_diff(first.logon) <= LOGON_SKEW_TICKS as u64
     }) && e.lsa[0] == e.lsa[1];
-    if e.mapped != Some(true)
-        || !e.same_account
+    if e.accounts[0] != e.accounts[1]
+        || !account_bound(e.accounts[0].as_ref(), &e.lsa[0])
         || !e.token_stable
         || !lsa_ok
         || e.active_console != session
@@ -613,8 +772,11 @@ fn console_decision(e: &ConsoleEvidence) -> Result<bool, NativeRefusal> {
     Ok(second.current - second.input >= IDLE_TICKS)
 }
 
-fn wts_sample(session: u32) -> Option<(WtsSample, [u16; 21], [u16; 18])> {
+fn wts_sample(session: u32) -> Option<(WtsSample, Option<WtsAccount>)> {
     let raw = wts_session(session)?;
+    let account = wts_text(&raw.UserName)
+        .zip(wts_text(&raw.DomainName))
+        .map(|(user, domain)| WtsAccount { user, domain });
     Some((
         WtsSample {
             session: raw.SessionId,
@@ -624,9 +786,18 @@ fn wts_sample(session: u32) -> Option<(WtsSample, [u16; 21], [u16; 18])> {
             input: raw.LastInputTime,
             current: raw.CurrentTime,
         },
-        raw.UserName,
-        raw.DomainName,
+        account,
     ))
+}
+
+/// A counted LSA string; anything malformed reads as empty, which closes.
+fn lsa_text(text: &LSA_UNICODE_STRING) -> String {
+    if text.Buffer.is_null() || !text.Length.is_multiple_of(2) || text.Length > text.MaximumLength {
+        return String::new();
+    }
+    // The LSA record owns this counted buffer until it is released.
+    let units = unsafe { std::slice::from_raw_parts(text.Buffer, usize::from(text.Length / 2)) };
+    String::from_utf16(units).unwrap_or_default()
 }
 
 fn lsa_logon(luid: &LUID, owner: PSID) -> Option<LsaLogon> {
@@ -642,6 +813,8 @@ fn lsa_logon(luid: &LUID, owner: PSID) -> Option<LsaLogon> {
         session: record.Session,
         logon_time: record.LogonTime,
         owner: !record.Sid.is_null() && unsafe { EqualSid(record.Sid, owner) } != 0,
+        user: lsa_text(&record.UserName),
+        domain: lsa_text(&record.LogonDomain),
     };
     unsafe { LsaFreeReturnBuffer(data.cast()) };
     Some(logon)
@@ -652,9 +825,8 @@ fn current_console_idle(token: &VmToken) -> Result<bool, NativeRefusal> {
     let session = token.identity.session;
     let luid = token.identity.authentication;
     let lsa_first = lsa_logon(&luid, token.account.0).ok_or(reason)?;
-    let (first, user, domain) = wts_sample(session).ok_or(reason)?;
-    let mapped = map_account(&domain, &user, &token.account);
-    let (second, user_again, domain_again) = wts_sample(session).ok_or(reason)?;
+    let (first, account) = wts_sample(session).ok_or(reason)?;
+    let (second, account_again) = wts_sample(session).ok_or(reason)?;
     let lsa_second = lsa_logon(&luid, token.account.0).ok_or(reason)?;
     let actual = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).map_err(|_| reason)?;
     let now_identity = token_identity(&actual, &token.account, false, TokenMode::CurrentUser)
@@ -669,40 +841,12 @@ fn current_console_idle(token: &VmToken) -> Result<bool, NativeRefusal> {
     console_decision(&ConsoleEvidence {
         token_session: session,
         active_console: unsafe { WTSGetActiveConsoleSessionId() },
-        mapped,
-        same_account: user == user_again && domain == domain_again,
+        accounts: [account, account_again],
         wts: [first, second],
         lsa: [lsa_first, lsa_second],
         token_stable,
         now,
     })
-}
-
-/// Resolve the WTS account name locally. `None` means no local mapping.
-fn map_account(domain: &[u16], user: &[u16], account: &LocalSid) -> Option<bool> {
-    let domain = wts_text(domain).filter(|name| !name.is_empty() && !name.contains('\\'))?;
-    let user = wts_text(user).filter(|name| !name.is_empty() && !name.contains('\\'))?;
-    let mut sid = [0usize; 16];
-    let mut sid_size = size_of_val(&sid) as u32;
-    let mut resolved_domain = [0u16; 256];
-    let mut domain_size = resolved_domain.len() as u32;
-    let mut kind = 0;
-    // A fixed local lookup of the session's own qualified account name.
-    let ok = unsafe {
-        LookupAccountNameW(
-            null(),
-            wide(format!("{domain}\\{user}")).as_ptr(),
-            sid.as_mut_ptr().cast(),
-            &mut sid_size,
-            resolved_domain.as_mut_ptr(),
-            &mut domain_size,
-            &mut kind,
-        )
-    };
-    if ok == 0 || kind != SidTypeUser {
-        return None;
-    }
-    Some(unsafe { EqualSid(sid.as_mut_ptr().cast(), account.0) } != 0)
 }
 
 fn read_bounded(file: &File, max: u64) -> io::Result<Vec<u8>> {
@@ -1006,6 +1150,13 @@ mod tests {
 
     type Mutation = (&'static str, fn(&mut ConsoleEvidence));
 
+    fn account(user: &str, domain: &str) -> Option<WtsAccount> {
+        Some(WtsAccount {
+            user: user.to_owned(),
+            domain: domain.to_owned(),
+        })
+    }
+
     fn console() -> ConsoleEvidence {
         let wts = WtsSample {
             session: 2,
@@ -1020,12 +1171,13 @@ mod tests {
             session: 2,
             logon_time: 150,
             owner: true,
+            user: "Owner".to_owned(),
+            domain: "AzureAD".to_owned(),
         };
         ConsoleEvidence {
             token_session: 2,
             active_console: 2,
-            mapped: Some(true),
-            same_account: true,
+            accounts: [account("Owner", "AzureAD"), account("Owner", "AzureAD")],
             wts: [
                 wts,
                 WtsSample {
@@ -1033,7 +1185,7 @@ mod tests {
                     ..wts
                 },
             ],
-            lsa: [lsa, lsa],
+            lsa: [lsa.clone(), lsa],
             token_stable: true,
             now: wts.current + 20,
         }
@@ -1049,11 +1201,40 @@ mod tests {
             Ok(false),
             "recent input is owner activity"
         );
+        // Account names compare case-insensitively on both sides.
+        let mut cased = console();
+        cased.accounts = [account("OWNER", "azuread"), account("OWNER", "azuread")];
+        assert_eq!(console_decision(&cased), Ok(true));
 
-        let cases: [Mutation; 19] = [
-            ("unknown cloud mapping", |e| e.mapped = None),
-            ("mapped to another SID", |e| e.mapped = Some(false)),
-            ("account name changed", |e| e.same_account = false),
+        let cases: [Mutation; 25] = [
+            ("unreadable WTS account", |e| e.accounts = [None, None]),
+            ("LSA record names another account", |e| {
+                e.lsa[0].user = "Other".to_owned();
+                e.lsa[1].user = "Other".to_owned();
+            }),
+            ("LSA record names another domain", |e| {
+                e.lsa[0].domain = "WORKGROUP".to_owned();
+                e.lsa[1].domain = "WORKGROUP".to_owned();
+            }),
+            ("empty names on both sides", |e| {
+                e.lsa[0].user = String::new();
+                e.lsa[1].user = String::new();
+                e.accounts = [account("", "AzureAD"), account("", "AzureAD")];
+            }),
+            ("qualified names on both sides", |e| {
+                e.accounts = [
+                    account(r"AzureAD\Owner", "AzureAD"),
+                    account(r"AzureAD\Owner", "AzureAD"),
+                ];
+                e.lsa[0].user = r"AzureAD\Owner".to_owned();
+                e.lsa[1].user = r"AzureAD\Owner".to_owned();
+            }),
+            ("truncated WTS name", |e| {
+                e.accounts = [account("Own", "AzureAD"), account("Own", "AzureAD")]
+            }),
+            ("account name changed", |e| {
+                e.accounts[1] = account("Owner2", "AzureAD")
+            }),
             ("token incarnation changed", |e| e.token_stable = false),
             ("switched console", |e| e.active_console = 3),
             ("session mismatch", |e| e.wts[1].session = 3),
@@ -1076,9 +1257,16 @@ mod tests {
             ("LSA session differs", |e| e.lsa[1].session = 3),
             ("LSA SID differs", |e| e.lsa[0].owner = false),
             ("LSA record changed", |e| e.lsa[1].logon_time = 151),
+            ("LSA names changed between samples", |e| {
+                e.lsa[1].user = "Other".to_owned()
+            }),
             ("LSA logon far from WTS logon", |e| {
                 e.lsa[0].logon_time = 100 + LOGON_SKEW_TICKS + 1;
                 e.lsa[1].logon_time = 100 + LOGON_SKEW_TICKS + 1;
+            }),
+            ("zero LSA logon time", |e| {
+                e.lsa[0].logon_time = 0;
+                e.lsa[1].logon_time = 0;
             }),
         ];
         for (name, mutate) in cases {
@@ -1089,6 +1277,104 @@ mod tests {
                 Err(NativeRefusal::OwnerActivityUnverified),
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn guid_spellings_parse_to_exact_bytes() {
+        assert_eq!(
+            parse_guid("0123abcd-4567-89AB-cdef-0123456789ab"),
+            Some([
+                0x01, 0x23, 0xab, 0xcd, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+                0x89, 0xab
+            ])
+        );
+        for bad in [
+            "0123abcd-4567-89ab-cdef-0123456789a",
+            "0123abcd-4567-89ab-cdef-0123456789abc",
+            "0123abcd_4567-89ab-cdef-0123456789ab",
+            "0123abcd-4567-89ab-cdef-0123456789ag",
+            "0123abcd-4567-89ab-cdef--123456789ab",
+            "{123abcd-4567-89ab-cdef-0123456789ab}",
+        ] {
+            assert_eq!(parse_guid(bad), None, "{bad}");
+        }
+    }
+
+    /// A private file owned by the current user, as the owner enrolls it.
+    fn private_file(dir: &Path, name: &str, bytes: &[u8]) -> String {
+        use std::io::Write;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        };
+        let user = current_user().unwrap();
+        let mut text = null_mut();
+        assert_ne!(
+            unsafe { ConvertSidToStringSidW(user_sid(&user), &mut text) },
+            0
+        );
+        let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+        let me = String::from_utf16(unsafe { std::slice::from_raw_parts(text, len) }).unwrap();
+        unsafe { LocalFree(text.cast()) };
+        let mut descriptor = null_mut();
+        let sddl = wide(format!("O:{me}D:P(A;;FA;;;{me})"));
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let path = dir.join(name);
+        let handle = unsafe {
+            CreateFileW(
+                wide(&path).as_ptr(),
+                FILE_GENERIC_WRITE,
+                0,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        unsafe { LocalFree(descriptor) };
+        let mut file = File::from(unsafe { owned(handle) }.unwrap());
+        file.write_all(bytes).unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn identity_is_refused_before_any_root_is_pinned_or_output_claimed() {
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let evidence = root.path().join("evidence");
+        std::fs::create_dir(&evidence).unwrap();
+        let pin = r#"{"volume":1,"file":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#;
+        // Every root is unusable, so only an identity check that runs first
+        // can produce the identity refusal.
+        for (index, owner) in ["S-1-5-21-1-2-3-1001", "S-1-5-018"].iter().enumerate() {
+            let enrollment = format!(
+                r#"{{"owner_sid":"{owner}","stock_bundle":"Q:\\missing\\qemu","trial_root":"T:\\missing","trial_volume":{pin},"trial_volume_guid":"none","trial_identity":{pin},"outer_root":"D:\\","backing_file":"D:\\missing\\trial.vhdx","backing_identity":{pin}}}"#
+            );
+            let file = private_file(
+                root.path(),
+                &format!("enrollment-{index}.json"),
+                enrollment.as_bytes(),
+            );
+            assert_eq!(
+                preflight(&file, evidence.to_str().unwrap()).err(),
+                Some(NativeRefusal::IdentityUnverified),
+                "{owner}"
+            );
+            assert_eq!(std::fs::read_dir(&evidence).unwrap().count(), 0);
         }
     }
 }

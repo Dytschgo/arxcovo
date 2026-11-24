@@ -1,6 +1,12 @@
 //! Read-only capacity observations for the enrolled disposable volume.
 //! Never attaches, enumerates or opens a physical disk, and every handle used
 //! for a query is retained for the life of the preflight.
+//!
+//! Each volume is anchored once: its drive letter is resolved to a GUID root
+//! that is held for the run, every leaf is walked from that held root, and
+//! the VHD and device queries use names derived from the same held objects.
+//! A drive-letter rebinding therefore cannot join observations of two
+//! volumes; a rebinding seen after the observations closes them.
 
 use super::*;
 use windows_sys::Wdk::Storage::FileSystem::{
@@ -118,6 +124,161 @@ pub(super) fn held_free(dir: &File) -> Result<Free, NativeRefusal> {
     })
 }
 
+/// Name resolution behind every volume anchor. Production asks the mount
+/// manager and the held handle itself; tests inject rebinding.
+pub(super) trait VolumeNames {
+    /// The `\\?\Volume{GUID}\` name currently mounted at a drive root.
+    fn drive_guid(&self, drive: &str) -> Option<String>;
+    /// The GUID-form final path of a held handle.
+    fn final_guid_path(&self, file: &File) -> Option<String>;
+}
+
+pub(super) struct MountManager;
+
+impl VolumeNames for MountManager {
+    fn drive_guid(&self, drive: &str) -> Option<String> {
+        volume_guid(drive)
+    }
+
+    fn final_guid_path(&self, file: &File) -> Option<String> {
+        let mut path = [0u16; 1024];
+        // The buffer is sized in UTF-16 units; a longer name is refused.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                path.as_mut_ptr(),
+                path.len() as u32,
+                VOLUME_NAME_GUID,
+            )
+        } as usize;
+        if length == 0 || length >= path.len() {
+            return None;
+        }
+        String::from_utf16(&path[..length]).ok()
+    }
+}
+
+/// A volume root opened once through its GUID name and held for the run.
+/// Every later leaf on this volume is walked from `root`.
+pub(super) struct AnchoredVolume {
+    pub drive: String,
+    pub guid: String,
+    pub guid_bytes: [u8; 16],
+    pub root: File,
+    pub identity: FileIdentity,
+}
+
+/// Resolve the drive letter once and hold the GUID root it named.
+pub(super) fn anchor_volume(
+    names: &impl VolumeNames,
+    drive: &str,
+) -> Result<AnchoredVolume, NativeRefusal> {
+    let reason = NativeRefusal::PathCustodyUnverified;
+    let letter = drive.as_bytes();
+    if letter.len() != 3 || !letter[0].is_ascii_alphabetic() || &letter[1..] != b":\\" {
+        return Err(reason);
+    }
+    let guid = names
+        .drive_guid(drive)
+        .filter(|guid| guid_spelling(guid))
+        .ok_or(reason)?;
+    let guid_bytes = parse_guid(&guid[11..47]).ok_or(reason)?;
+    // Only a fixed local volume (drive type 3) can hold the trial store.
+    if unsafe { GetDriveTypeW(wide(&guid).as_ptr()) } != 3 {
+        return Err(reason);
+    }
+    let root = open_directory(&guid).map_err(|_| reason)?;
+    let (identity, _) = file_identity(&root, true).map_err(|_| reason)?;
+    verify_ntfs(&root).map_err(|_| reason)?;
+    Ok(AnchoredVolume {
+        drive: drive.to_ascii_uppercase(),
+        guid,
+        guid_bytes,
+        root,
+        identity,
+    })
+}
+
+/// `actual` is the GUID-form name of `relative` on the volume `guid`.
+fn on_volume(actual: &str, guid: &str, relative: &str) -> bool {
+    actual.len() == guid.len() + relative.len()
+        && actual
+            .get(..guid.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(guid))
+        && actual
+            .get(guid.len()..)
+            .is_some_and(|rest| rest.eq_ignore_ascii_case(relative))
+}
+
+/// Walk `path` from the anchored root's held handle, never from its drive
+/// letter, so the leaf provably descends from that exact root. The OS's own
+/// GUID-form name for the held leaf must also lie on the anchored volume.
+pub(super) fn walk(
+    names: &impl VolumeNames,
+    volume: &AnchoredVolume,
+    path: &LocalPath,
+    directory: bool,
+    mutable: bool,
+) -> Result<PathPin, NativeRefusal> {
+    let reason = NativeRefusal::PathCustodyUnverified;
+    let raw = path.as_str();
+    if raw.len() <= 3 || !raw[..3].eq_ignore_ascii_case(&volume.drive) {
+        return Err(reason);
+    }
+    let relative = &raw[3..];
+    let components: Vec<&str> = relative.split('\\').collect();
+    let mut ancestors = vec![volume.root.try_clone().map_err(|_| reason)?];
+    for (index, name) in components.iter().enumerate() {
+        let last = index + 1 == components.len();
+        let node = if last && !directory {
+            Node::File
+        } else {
+            Node::Directory
+        };
+        let parent = ancestors.last().expect("the anchored root is held");
+        let file = open_relative(parent, name, node, last && mutable, false).map_err(|_| reason)?;
+        let (identity, allocated) =
+            file_identity(&file, node == Node::Directory).map_err(|_| reason)?;
+        if identity.volume != volume.identity.volume {
+            return Err(reason);
+        }
+        if !last {
+            ancestors.push(file);
+            continue;
+        }
+        // Reopen through the same held parent and compare the object.
+        let check = open_relative(parent, name, node, mutable, false).map_err(|_| reason)?;
+        if file_identity(&check, directory).map_err(|_| reason)?.0 != identity
+            || !names
+                .final_guid_path(&file)
+                .is_some_and(|actual| on_volume(&actual, &volume.guid, relative))
+        {
+            return Err(reason);
+        }
+        return Ok(PathPin {
+            _ancestors: ancestors,
+            leaf: file,
+            identity,
+            allocated,
+            path: path.clone(),
+            mutable,
+            verified_content: None,
+        });
+    }
+    Err(reason)
+}
+
+/// The drive letter still names the anchored volume and its root object.
+/// Checked after the observations: a rebinding during them closes the run.
+pub(super) fn still_bound(names: &impl VolumeNames, volume: &AnchoredVolume) -> bool {
+    names
+        .drive_guid(&volume.drive)
+        .is_some_and(|guid| guid.eq_ignore_ascii_case(&volume.guid))
+        && open_directory(&volume.guid)
+            .and_then(|root| file_identity(&root, true))
+            .is_ok_and(|(identity, _)| identity == volume.identity)
+}
+
 pub(super) struct VhdFacts {
     pub provider_subtype: u32,
     pub virtual_size: u64,
@@ -126,11 +287,35 @@ pub(super) struct VhdFacts {
     pub disk: u32,
 }
 
-/// Query the enrolled VHDX. The API takes a name; the held backing pin and
-/// its held ancestors refuse rename and delete for the whole preflight, so
-/// the name stays bound to the pinned object while the handle is retained.
-pub(super) fn fixed_vhd(backing: &PathPin) -> Result<(OwnedHandle, VhdFacts), NativeRefusal> {
+/// The name the VHD API opens: the held backing leaf's own GUID-form name,
+/// on the anchored outer volume, at exactly the enrolled location. A drive
+/// letter is never reparsed for the query.
+pub(super) fn vhd_query_path(
+    names: &impl VolumeNames,
+    outer: &AnchoredVolume,
+    backing: &PathPin,
+) -> Option<String> {
+    let raw = backing.path.as_str();
+    if !raw.get(..3)?.eq_ignore_ascii_case(&outer.drive)
+        || backing.identity.volume != outer.identity.volume
+    {
+        return None;
+    }
+    names
+        .final_guid_path(&backing.leaf)
+        .filter(|path| on_volume(path, &outer.guid, &raw[3..]))
+}
+
+/// Query the enrolled VHDX through the held backing object's GUID-form
+/// name. The held leaf and its ancestors refuse rename for the whole run,
+/// and the name is compared again after the query.
+pub(super) fn fixed_vhd(
+    names: &impl VolumeNames,
+    outer: &AnchoredVolume,
+    backing: &PathPin,
+) -> Result<(OwnedHandle, VhdFacts), NativeRefusal> {
     let reason = NativeRefusal::DiskCeilingUnverified;
+    let path = vhd_query_path(names, outer, backing).ok_or(reason)?;
     let storage_type = VIRTUAL_STORAGE_TYPE {
         DeviceId: VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
         VendorId: VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
@@ -144,11 +329,11 @@ pub(super) fn fixed_vhd(backing: &PathPin) -> Result<(OwnedHandle, VhdFacts), Na
         },
     };
     let mut handle = null_mut();
-    // Information access only, no parents, against the held backing name.
+    // Information access only, no parents, against the held object's name.
     let status = unsafe {
         OpenVirtualDisk(
             &storage_type,
-            wide(backing.path.as_str()).as_ptr(),
+            wide(&path).as_ptr(),
             VIRTUAL_DISK_ACCESS_GET_INFO,
             OPEN_VIRTUAL_DISK_FLAG_NO_PARENTS,
             &parameters,
@@ -173,7 +358,9 @@ pub(super) fn fixed_vhd(backing: &PathPin) -> Result<(OwnedHandle, VhdFacts), Na
             physical.as_mut_ptr(),
         )
     };
-    if status != ERROR_SUCCESS {
+    if status != ERROR_SUCCESS
+        || vhd_query_path(names, outer, backing).as_deref() != Some(path.as_str())
+    {
         return Err(reason);
     }
     let disk = disk_number(&physical).ok_or(reason)?;
@@ -214,10 +401,9 @@ fn disk_number(buffer: &[u16]) -> Option<u32> {
     number.parse().ok()
 }
 
-/// The trial volume, bound by its stable volume GUID rather than the drive
-/// letter, with both the GUID root and the device handle retained.
-pub(super) struct HeldVolume {
-    _root: File,
+/// The trial volume's device, opened through the anchored GUID name and
+/// retained with the single extent it reported.
+pub(super) struct HeldDevice {
     _device: OwnedHandle,
     pub extent_start: i64,
     pub extent_length: i64,
@@ -251,19 +437,15 @@ fn guid_spelling(name: &str) -> bool {
         })
 }
 
-/// Bind the held drive-root pin to its GUID volume, read the single extent
-/// through a retained device handle, then prove the drive still resolves to
-/// the same GUID and root object.
-pub(super) fn bind_volume(drive_root: &PathPin, disk: u32) -> Result<HeldVolume, NativeRefusal> {
+/// Read the single extent of the anchored volume through a device handle
+/// opened by the same GUID name; the drive letter is never consulted.
+pub(super) fn volume_extent(
+    volume: &AnchoredVolume,
+    disk: u32,
+) -> Result<HeldDevice, NativeRefusal> {
     let reason = NativeRefusal::DiskCeilingUnverified;
-    let drive = &drive_root.path.as_str()[..3];
-    let guid = volume_guid(drive).ok_or(reason)?;
-    let root = open_directory(&guid).map_err(|_| reason)?;
-    if file_identity(&root, true).map_err(|_| reason)?.0 != drive_root.identity {
-        return Err(reason);
-    }
     // `\\?\Volume{GUID}` without the trailing separator names the device.
-    let device_name = wide(&guid[..guid.len() - 1]);
+    let device_name = wide(&volume.guid[..volume.guid.len() - 1]);
     // No data access is needed for the read-only extent query.
     let device = unsafe {
         owned(CreateFileW(
@@ -296,16 +478,10 @@ pub(super) fn bind_volume(drive_root: &PathPin, disk: u32) -> Result<HeldVolume,
         || written as usize != size_of_val(&extents)
         || extents.NumberOfDiskExtents != 1
         || extent.DiskNumber != disk
-        || volume_guid(drive).as_deref() != Some(guid.as_str())
-        || file_identity(&open_directory(&guid).map_err(|_| reason)?, true)
-            .map_err(|_| reason)?
-            .0
-            != drive_root.identity
     {
         return Err(reason);
     }
-    Ok(HeldVolume {
-        _root: root,
+    Ok(HeldDevice {
         _device: device,
         extent_start: extent.StartingOffset,
         extent_length: extent.ExtentLength,
@@ -315,6 +491,7 @@ pub(super) fn bind_volume(drive_root: &PathPin, disk: u32) -> Result<HeldVolume,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn physical_drive_parser_accepts_only_bounded_device_numbers() {
@@ -438,5 +615,139 @@ mod tests {
         let free = held_free(&file).unwrap();
         assert!(free.total > 0);
         assert!(free.caller <= free.total_free && free.total_free <= free.total);
+    }
+
+    /// A fresh directory named by its long, normalized path: walks compare
+    /// the OS's own name, so 8.3 aliases in a runner's temp path are expanded.
+    fn long_temp() -> (tempfile::TempDir, LocalPath) {
+        let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let long = std::fs::canonicalize(dir.path()).unwrap();
+        let text = long
+            .to_str()
+            .unwrap()
+            .strip_prefix(r"\\?\")
+            .unwrap()
+            .to_owned();
+        (dir, LocalPath::parse(&text).unwrap())
+    }
+
+    const OTHER: &str = r"\\?\Volume{00000000-0000-0000-0000-000000000001}\";
+
+    /// Real names, except where a test injects a rebinding.
+    #[derive(Default)]
+    struct Rebinding {
+        drive_calls: Cell<u32>,
+        /// Every drive resolution after the first names this volume.
+        later_drive: Option<&'static str>,
+        /// Every held leaf is reported under this volume instead.
+        leaf_volume: Option<&'static str>,
+    }
+
+    impl VolumeNames for Rebinding {
+        fn drive_guid(&self, drive: &str) -> Option<String> {
+            let calls = self.drive_calls.get();
+            self.drive_calls.set(calls + 1);
+            match self.later_drive {
+                Some(volume) if calls > 0 => Some(volume.to_owned()),
+                _ => MountManager.drive_guid(drive),
+            }
+        }
+
+        fn final_guid_path(&self, file: &File) -> Option<String> {
+            let actual = MountManager.final_guid_path(file)?;
+            match self.leaf_volume {
+                Some(volume) => Some(format!("{volume}{}", actual.get(49..)?)),
+                None => Some(actual),
+            }
+        }
+    }
+
+    #[test]
+    fn a_leaf_walked_from_the_guid_anchor_is_the_object_its_name_reaches() {
+        let (_dir, path) = long_temp();
+        let drive = &path.as_str()[..3];
+        let volume = anchor_volume(&MountManager, drive).unwrap();
+        assert_eq!(volume.drive, drive.to_ascii_uppercase());
+        let pin = walk(&MountManager, &volume, &path, true, false).unwrap();
+        assert_eq!(
+            pin.identity,
+            PathPin::open(&path, true, false).unwrap().identity
+        );
+        assert!(still_bound(&MountManager, &volume));
+        // A path on another drive letter cannot be walked from this anchor.
+        let elsewhere = LocalPath::parse(r"Q:\elsewhere").unwrap();
+        assert_eq!(
+            walk(&MountManager, &volume, &elsewhere, true, false).err(),
+            Some(NativeRefusal::PathCustodyUnverified)
+        );
+    }
+
+    #[test]
+    fn a_drive_letter_rebound_after_anchoring_closes_the_observation() {
+        let (_dir, path) = long_temp();
+        let names = Rebinding {
+            later_drive: Some(OTHER),
+            ..Rebinding::default()
+        };
+        let volume = anchor_volume(&names, &path.as_str()[..3]).unwrap();
+        // The walk uses only the held root, so the rebinding cannot redirect it.
+        assert!(walk(&names, &volume, &path, true, false).is_ok());
+        assert!(!still_bound(&names, &volume));
+    }
+
+    #[test]
+    fn a_leaf_the_os_places_on_another_volume_is_refused() {
+        let (_dir, path) = long_temp();
+        let names = Rebinding {
+            leaf_volume: Some(OTHER),
+            ..Rebinding::default()
+        };
+        let volume = anchor_volume(&names, &path.as_str()[..3]).unwrap();
+        assert_eq!(
+            walk(&names, &volume, &path, true, false).err(),
+            Some(NativeRefusal::PathCustodyUnverified)
+        );
+    }
+
+    #[test]
+    fn the_vhd_query_names_the_held_backing_on_the_anchored_volume() {
+        let (dir, parent) = long_temp();
+        std::fs::write(dir.path().join("trial.vhdx"), b"synthetic").unwrap();
+        let path = parent.join("trial.vhdx").unwrap();
+        let volume = anchor_volume(&MountManager, &path.as_str()[..3]).unwrap();
+        let backing = walk(&MountManager, &volume, &path, false, true).unwrap();
+        let name = vhd_query_path(&MountManager, &volume, &backing).unwrap();
+        assert!(on_volume(&name, &volume.guid, &path.as_str()[3..]));
+        // The same held leaf reported on another volume is never queried.
+        let rebound = Rebinding {
+            leaf_volume: Some(OTHER),
+            ..Rebinding::default()
+        };
+        assert_eq!(vhd_query_path(&rebound, &volume, &backing), None);
+    }
+
+    #[test]
+    fn guid_form_names_must_match_volume_and_location_exactly() {
+        let guid = r"\\?\Volume{0123abcd-4567-89ab-cdef-0123456789ab}\";
+        let upper = r"\\?\VOLUME{0123ABCD-4567-89AB-CDEF-0123456789AB}\";
+        assert!(on_volume(
+            &format!(r"{guid}Arx\t.vhdx"),
+            guid,
+            r"Arx\t.vhdx"
+        ));
+        assert!(on_volume(
+            &format!(r"{upper}ARX\T.VHDX"),
+            guid,
+            r"Arx\t.vhdx"
+        ));
+        for actual in [
+            format!(r"{OTHER}Arx\t.vhdx"),
+            format!(r"{guid}Arx\t.vhdx.bak"),
+            format!(r"{guid}Other\t.vhdx"),
+            format!(r"{guid}Arx"),
+            r"D:\Arx\t.vhdx".to_owned(),
+        ] {
+            assert!(!on_volume(&actual, guid, r"Arx\t.vhdx"), "{actual}");
+        }
     }
 }

@@ -7,7 +7,8 @@
 
 use crate::frame::*;
 use crate::trial::*;
-use arxd::vm::qualification::{self, Baseline, DiagnosticFile, Preflight};
+use arxd::vm::qualification::{self, Baseline, DiagnosticFile, Preflight, Taken};
+use arxd::vm::runtime::NativeRefusal;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -40,31 +41,50 @@ impl Clock for NativeClock {
     }
 }
 
-/// The local invalidation projection. Dependencies without a reviewed
-/// collector stay unmeasured, which keeps every native trial unsealable.
+fn observed<T>(taken: &Taken<T>) -> Option<&T> {
+    match taken {
+        Taken::Observed(observation) => Some(&observation.result),
+        Taken::Refused { .. } => None,
+    }
+}
+
+fn measured<T>(value: Option<T>) -> Measured<T> {
+    value.map_or(Measured::Unmeasured, Measured::Measured)
+}
+
+/// The local invalidation projection. A dependency whose observation was
+/// refused, or that no reviewed collector measures yet, stays unmeasured,
+/// which keeps every native trial unsealable.
 pub(crate) fn dependencies(p: &Preflight) -> Dependencies {
     let s = &p.store;
     Dependencies {
         release: release(),
-        host: Measured::Measured(HostDependency {
-            windows_build: p.host.result.windows_build,
-            windows_revision: p.host.result.windows_revision,
-        }),
-        store: Measured::Measured(StoreDependency {
+        // No reviewed artifact pin exists in 7b1; 7c binds the selected one.
+        artifact: Measured::Unmeasured,
+        host: measured(observed(&p.host).map(|host| HostDependency {
+            windows_build: host.windows_build,
+            windows_revision: host.windows_revision,
+            machine: host.machine,
+        })),
+        store: measured(observed(&p.limits).map(|limits| StoreDependency {
             trial_volume: s.trial_volume,
             trial_volume_root: s.trial_volume_root,
+            trial_volume_guid: s.trial_volume_guid,
             trial_root: s.trial_root,
-            backing_volume: s.backing_volume,
-            backing_file: s.backing_file,
             outer_volume: s.outer_volume,
-            vhd_virtual_bytes: s.vhd_virtual_bytes,
-            inner_extent_bytes: s.inner_extent_bytes,
-        }),
+            outer_volume_root: s.outer_volume_root,
+            outer_volume_guid: s.outer_volume_guid,
+            backing_file: s.backing_file,
+            vhd_virtual_bytes: limits.vhd_virtual_bytes,
+            inner_extent_bytes: limits.inner_extent_bytes,
+        })),
         owner_profile: Measured::Unmeasured,
-        distribution: Measured::Measured(DistributionDependency {
-            receipt: p.distribution.result.receipt,
-            manifest: p.distribution.result.manifest,
-        }),
+        distribution: measured(observed(&p.distribution).map(|distribution| {
+            DistributionDependency {
+                receipt: distribution.receipt,
+                manifest: distribution.manifest,
+            }
+        })),
         install_media: Measured::Unmeasured,
         recipes: Measured::Unmeasured,
         firmware: Measured::Unmeasured,
@@ -74,83 +94,101 @@ pub(crate) fn dependencies(p: &Preflight) -> Dependencies {
     }
 }
 
+/// The typed diagnostic for a refused post-claim observation. Exhaustive,
+/// so a new refusal cannot be settled silently.
+pub(crate) fn refused(reason: NativeRefusal) -> Diagnostic {
+    use NativeRefusal as R;
+    match reason {
+        R::UnsupportedPlatform => Diagnostic::UnsupportedPlatform,
+        R::DistributionUnverified => Diagnostic::DistributionUnverified,
+        R::PathCustodyUnverified => Diagnostic::PathCustodyUnverified,
+        R::JobUnverified => Diagnostic::JobUnverified,
+        R::WhpxUnverified => Diagnostic::WhpxUnverified,
+        R::DiskCeilingUnverified => Diagnostic::DiskCeilingUnverified,
+        R::OwnerActivityUnverified => Diagnostic::OwnerActivityUnverified,
+        R::ReservesUnverified => Diagnostic::ReservesUnverified,
+        R::Disabled
+        | R::QualificationMissing
+        | R::IdentityUnverified
+        | R::QmpUnverified
+        | R::GuestEndpointUnverified
+        | R::NetworkFenceUnverified
+        | R::InstallerPhaseUnavailable
+        | R::InstallerPhaseMismatch
+        | R::InstallerDeadlineExpired => Diagnostic::OtherRefusal,
+    }
+}
+
+/// Project one post-claim observation: a refusal becomes a typed failure at
+/// its own time, and an observation goes through `pass`.
+fn settle<T>(taken: &Taken<T>, pass: impl FnOnce(&T) -> StageResult) -> Collected {
+    match taken {
+        Taken::Observed(o) => Collected {
+            started_ms: o.started_ms,
+            finished_ms: o.finished_ms,
+            result: pass(&o.result),
+        },
+        Taken::Refused { at_ms, reason } => {
+            Collected::at(*at_ms, StageResult::Failed(refused(*reason)))
+        }
+    }
+}
+
 /// Project one baseline stage from the preflight observations. A valid
-/// negative observation becomes a typed failure, never a pass.
+/// negative observation or a refusal becomes a typed failure, never a pass.
 pub(crate) fn project(p: &Preflight, stage: Stage) -> Collected {
-    let timed = |started_ms, finished_ms, result| Collected {
-        started_ms,
-        finished_ms,
-        result,
-    };
     match stage {
         Stage::Inputs => {
             let o = &p.inputs;
-            timed(
-                o.started_ms,
-                o.finished_ms,
-                StageResult::Passed(Observation::InputPins {
+            Collected {
+                started_ms: o.started_ms,
+                finished_ms: o.finished_ms,
+                result: StageResult::Passed(Observation::InputPins {
                     held_roots: o.result.held_roots,
                     enrollment_private: o.result.enrollment_private,
                     evidence_private: o.result.evidence_private,
                     trial_root_private: o.result.trial_root_private,
                     evidence_claimed: o.result.evidence_claimed,
                 }),
-            )
+            }
         }
-        Stage::HostBaseline => {
-            let o = &p.host;
-            timed(
-                o.started_ms,
-                o.finished_ms,
-                StageResult::Passed(Observation::Host {
-                    windows_build: o.result.windows_build,
-                    windows_revision: o.result.windows_revision,
-                }),
-            )
-        }
-        Stage::Distribution => {
-            let o = &p.distribution;
-            timed(
-                o.started_ms,
-                o.finished_ms,
-                StageResult::Passed(Observation::Distribution {
-                    receipt: o.result.receipt,
-                    receipt_bytes: o.result.receipt_bytes,
-                    manifest: o.result.manifest,
-                    manifest_bytes: o.result.manifest_bytes,
-                    payload_files: o.result.payload_files,
-                    payload_bytes: o.result.payload_bytes,
-                }),
-            )
-        }
-        Stage::CustodyJobCapacityBaseline => {
-            let o = &p.limits;
-            let l = &o.result;
-            timed(
-                o.started_ms,
-                o.finished_ms,
-                StageResult::Passed(Observation::Capacity {
-                    inner_caller_free_bytes: l.inner_caller_free_bytes,
-                    inner_total_free_bytes: l.inner_total_free_bytes,
-                    inner_total_bytes: l.inner_total_bytes,
-                    inner_extent_bytes: l.inner_extent_bytes,
-                    vhd_virtual_bytes: l.vhd_virtual_bytes,
-                    outer_caller_free_bytes: l.outer_caller_free_bytes,
-                    outer_total_free_bytes: l.outer_total_free_bytes,
-                    backing_allocated_bytes: l.backing_allocated_bytes,
-                    backing_length_bytes: l.backing_length_bytes,
-                    disk_ceiling_bytes: l.disk_ceiling_bytes,
-                    outer_floor_bytes: l.outer_floor_bytes,
-                    disk_budget_bytes: l.disk_budget_bytes,
-                    empty_job_memory_limit_bytes: l.empty_job_memory_limit_bytes,
-                    empty_job_cpu_rate: l.empty_job_cpu_rate,
-                }),
-            )
-        }
-        Stage::ActivityReservesBaseline => {
-            let o = &p.activity;
-            let a = &o.result;
-            let result = if !a.console_idle {
+        // The machine identity is a local dependency and is never published.
+        Stage::HostBaseline => settle(&p.host, |h| {
+            StageResult::Passed(Observation::Host {
+                windows_build: h.windows_build,
+                windows_revision: h.windows_revision,
+            })
+        }),
+        Stage::Distribution => settle(&p.distribution, |d| {
+            StageResult::Passed(Observation::Distribution {
+                receipt: d.receipt,
+                receipt_bytes: d.receipt_bytes,
+                manifest: d.manifest,
+                manifest_bytes: d.manifest_bytes,
+                payload_files: d.payload_files,
+                payload_bytes: d.payload_bytes,
+            })
+        }),
+        Stage::CustodyJobCapacityBaseline => settle(&p.limits, |l| {
+            StageResult::Passed(Observation::Capacity {
+                inner_caller_free_bytes: l.inner_caller_free_bytes,
+                inner_total_free_bytes: l.inner_total_free_bytes,
+                inner_total_bytes: l.inner_total_bytes,
+                inner_extent_bytes: l.inner_extent_bytes,
+                vhd_virtual_bytes: l.vhd_virtual_bytes,
+                outer_caller_free_bytes: l.outer_caller_free_bytes,
+                outer_total_free_bytes: l.outer_total_free_bytes,
+                backing_allocated_bytes: l.backing_allocated_bytes,
+                backing_length_bytes: l.backing_length_bytes,
+                disk_ceiling_bytes: l.disk_ceiling_bytes,
+                outer_floor_bytes: l.outer_floor_bytes,
+                disk_budget_bytes: l.disk_budget_bytes,
+                empty_job_memory_limit_bytes: l.empty_job_memory_limit_bytes,
+                empty_job_cpu_rate: l.empty_job_cpu_rate,
+            })
+        }),
+        Stage::ActivityReservesBaseline => settle(&p.activity, |a| {
+            if !a.console_idle {
                 StageResult::Failed(Diagnostic::OwnerActive)
             } else if a.active_cpus <= 1 || a.available_ram_bytes <= a.owner_ram_reserve_bytes {
                 StageResult::Failed(Diagnostic::ReservesShort)
@@ -162,18 +200,15 @@ pub(crate) fn project(p: &Preflight, stage: Stage) -> Collected {
                     owner_ram_reserve_bytes: a.owner_ram_reserve_bytes,
                     owner_cpu_reserve: a.owner_cpu_reserve,
                 })
-            };
-            timed(o.started_ms, o.finished_ms, result)
-        }
-        Stage::WhpxCapability => {
-            let o = &p.whpx_present;
-            let result = if o.result {
+            }
+        }),
+        Stage::WhpxCapability => settle(&p.whpx_present, |present| {
+            if *present {
                 StageResult::Passed(Observation::Whpx { present: true })
             } else {
                 StageResult::Failed(Diagnostic::WhpxAbsent)
-            };
-            timed(o.started_ms, o.finished_ms, result)
-        }
+            }
+        }),
         // Only baseline stages reach this projection.
         _ => Collected::at(
             0,
@@ -297,6 +332,9 @@ impl DiagnosticSink for BaselineSink<'_> {
 }
 
 pub(crate) fn run(enrollment: &str, evidence: &str) -> Result<Outcome, RunError> {
+    // Everything fallible happens before the preflight claims the output.
+    // After the claim, every failure settles as a typed diagnostic.
+    let ids = Ids::generate()?;
     let baseline = qualification::preflight(enrollment, evidence).map_err(RunError::Native)?;
     let clock = NativeClock {
         origin: baseline.origin(),
@@ -305,7 +343,7 @@ pub(crate) fn run(enrollment: &str, evidence: &str) -> Result<Outcome, RunError>
     let issued = clock.now();
     // The authority takes the preflight custody. The diagnostic sink and the
     // observations are reached only through the trial's own reference.
-    let trial_authority = TrialAuthority::issue(baseline, Class::Test, dependencies, issued)?;
+    let trial_authority = TrialAuthority::issue(baseline, ids, Class::Test, dependencies, issued);
     let mut trial = Trial::begin(trial_authority);
     let mut collectors = NativeCollectors::new(trial.custody().observations(), clock.origin);
     trial.drive(&mut collectors, &clock);

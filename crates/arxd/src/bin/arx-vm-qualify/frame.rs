@@ -356,6 +356,17 @@ pub(crate) enum Diagnostic {
     PrerequisiteMissing,
     EffectUnconfined,
     TeardownUncertain,
+    /// A preflight observation refused after the claim, settled as a typed
+    /// diagnostic instead of ending the run.
+    UnsupportedPlatform,
+    DistributionUnverified,
+    PathCustodyUnverified,
+    JobUnverified,
+    WhpxUnverified,
+    DiskCeilingUnverified,
+    OwnerActivityUnverified,
+    ReservesUnverified,
+    OtherRefusal,
 }
 
 /// Passed predicates for read-only stages. Native effect stages have no
@@ -413,6 +424,9 @@ pub(crate) enum Observation {
         dispatched_effects: u16,
         released: bool,
         charge_retained: bool,
+        /// The run completed after cancellation, the trial budget, expiry
+        /// or a clock inconsistency. Teardown still ran; nothing may seal.
+        late: bool,
     },
     /// Test-only stand-in for an effect witness. It does not exist outside
     /// test builds and never validates under native origin.
@@ -518,9 +532,10 @@ impl Observation {
                 O::Cleanup {
                     released,
                     charge_retained,
+                    late,
                     ..
                 },
-            ) => *released && !*charge_retained,
+            ) => *released && !*charge_retained && !*late,
             #[cfg(test)]
             (_, O::FixtureEffect { stage: witnessed }) => {
                 origin == Origin::Fixture
@@ -580,8 +595,11 @@ impl Binding {
     }
 }
 
-/// The release is derived from reviewed inputs: the evidence contract, the
-/// collector version, this package version and the stock distribution pins.
+/// The release names the evidence contract: the contract and collector
+/// versions, this package version and the stock distribution pins. Two
+/// builds sharing those values share a release, so the exact reviewed
+/// artifact is a separate `artifact` dependency, which stays unmeasured
+/// until 7c binds the owner-selected reviewed digest.
 pub(crate) fn release() -> Hash {
     digest(
         &serde_json::to_vec(&(
@@ -631,22 +649,29 @@ impl<T> Measured<T> {
     }
 }
 
+/// The OS build and revision and the installation's stable machine
+/// identity. Raw values stay local, inside the scope-keyed digest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct HostDependency {
     pub windows_build: u32,
     pub windows_revision: u32,
+    pub machine: [u8; 16],
 }
 
 /// Raw identities stay local: the projection is only ever published as a
-/// digest keyed by the random scope.
+/// digest keyed by the random scope. Volumes are bound by serial, root
+/// object and mount-manager GUID, so a reformatted or swapped volume with a
+/// colliding serial still drifts.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct StoreDependency {
     pub trial_volume: u64,
     pub trial_volume_root: [u8; 16],
+    pub trial_volume_guid: [u8; 16],
     pub trial_root: [u8; 16],
-    pub backing_volume: u64,
-    pub backing_file: [u8; 16],
     pub outer_volume: u64,
+    pub outer_volume_root: [u8; 16],
+    pub outer_volume_guid: [u8; 16],
+    pub backing_file: [u8; 16],
     pub vhd_virtual_bytes: u64,
     pub inner_extent_bytes: u64,
 }
@@ -688,6 +713,9 @@ impl PolicyDependency {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct Dependencies {
     pub release: Hash,
+    /// The exact reviewed artifact digest. No reviewed pin exists in 7b1, so
+    /// native runs mark it explicitly absent and stay incomplete.
+    pub artifact: Measured<Hash>,
     pub host: Measured<HostDependency>,
     pub store: Measured<StoreDependency>,
     pub owner_profile: Measured<Hash>,
@@ -708,6 +736,7 @@ impl Dependencies {
     /// Names of the dependencies that no reviewed collector measures.
     pub(crate) fn unmeasured(&self) -> Vec<&'static str> {
         [
+            ("artifact", self.artifact.is_measured()),
             ("host", self.host.is_measured()),
             ("store", self.store.is_measured()),
             ("owner_profile", self.owner_profile.is_measured()),
@@ -825,6 +854,18 @@ pub(crate) struct Selection {
 }
 
 /// Independently re-measured state at verification time.
+///
+/// Clock anchor. Within one boot, `issued` is the issuance instant and
+/// `clocks_agree` compares elapsed UTC with elapsed monotonic time, which
+/// catches a wall-clock rollback inside the validity window. A reboot resets
+/// the monotonic origin, so this verifier fails closed after one. The 7c
+/// issuer supplies the independent anchor instead: at each foreground start
+/// it opens a new supervisor epoch from live evidence, recording the epoch's
+/// UTC and monotonic pair together with a persisted, only-increasing UTC
+/// high-water mark held in the owner-local enrollment store. It refuses an
+/// epoch whose UTC is below the high-water mark or the record's issue time,
+/// then verifies within the epoch against that pair. Until 7c lands, a
+/// qualification never survives a reboot.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Fresh<'a> {
     pub now: Instant2,
@@ -943,4 +984,8 @@ pub(crate) struct Incomplete {
     pub unmeasured: Vec<String>,
     pub dispatched_effects: u16,
     pub charge_retained: bool,
+    /// Why a completion was latched late, if it was.
+    pub late: Option<Diagnostic>,
+    /// Record files the sink refused; the summary is still written last.
+    pub unwritten: Vec<FileKind>,
 }

@@ -203,6 +203,18 @@ test('Rust retains every native, Python and package validation with exact comman
             }
             $receipt | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $proofRoot 'arxd-receipt.json') -Encoding ascii -NoNewline
           }`,
+    `name: Windows authority compile-fail fence
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I -B -m unittest discover -s tools/ci/authority-fence -p 'test_*.py'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I -B tools/ci/authority-fence/check.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p arxd --doc --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
     `name: Hosted distinct-UID custody qualification
         if: runner.os == 'Linux'
         shell: bash

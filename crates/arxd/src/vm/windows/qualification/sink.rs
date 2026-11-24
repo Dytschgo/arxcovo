@@ -99,15 +99,14 @@ impl EvidenceDir {
         Ok(dir)
     }
 
-    /// Exclusive, bounded, JSON-only and free of raw private values. The
-    /// summary closes the sink so it is always the final file.
+    /// Exclusive, bounded, one canonical value of the file's closed schema,
+    /// and free of raw private values. The summary closes the sink so it is
+    /// always the final file.
     pub(super) fn write(&self, file: DiagnosticFile, bytes: &[u8]) -> Result<(), SinkError> {
         if self.closed.get() {
             return Err(SinkError::Closed);
         }
-        if !(1..=MAX_OUTPUT).contains(&bytes.len())
-            || serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_err()
-        {
+        if !(1..=MAX_OUTPUT).contains(&bytes.len()) || !super::schema::check(file, bytes) {
             return Err(SinkError::Invalid);
         }
         if self.leaks(bytes) {
@@ -276,13 +275,16 @@ mod tests {
 
     #[test]
     fn a_private_empty_directory_is_claimed_once_and_closes_after_the_summary() {
+        use super::super::schema::tests::{binding, inputs_record};
         let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
         let (owner, path) = private_dir(root.path(), "evidence");
-        let canary = r"D:\Private\Canary-Root";
+        // The schema admits no free-form string, so this canary can only
+        // match a closed spelling; it proves the byte scan still runs.
+        let canary = "native";
         let dir = EvidenceDir::claim(
             PathPin::open(&path, true, false).unwrap(),
             sid(&owner),
-            &[canary],
+            &[r"D:\Private\Canary-Root"],
         )
         .unwrap();
         // A concurrent runner on the same directory loses the claim.
@@ -290,34 +292,73 @@ mod tests {
             EvidenceDir::claim(PathPin::open(&path, true, false).unwrap(), sid(&owner), &[]).err(),
             Some(NativeRefusal::PathCustodyUnverified)
         );
-        dir.write(DiagnosticFile::Inputs, br#"{"kind":"input_pins"}"#)
+        let record = inputs_record("");
+        dir.write(DiagnosticFile::Inputs, record.as_bytes())
             .unwrap();
         // Exclusive creation refuses a collision with an existing record.
         assert_eq!(
-            dir.write(DiagnosticFile::Inputs, br#"{"kind":"input_pins"}"#),
+            dir.write(DiagnosticFile::Inputs, record.as_bytes()),
             Err(SinkError::Io)
         );
-        for (bytes, error) in [
-            (&b""[..], SinkError::Invalid),
-            (&b"not json"[..], SinkError::Invalid),
-            (&[b' '; MAX_OUTPUT + 1][..], SinkError::Invalid),
-            (br#"{"owner":"S-1-5-21-1-2-3-1001"}"#, SinkError::Private),
+        for (name, file, bytes) in [
+            ("empty", DiagnosticFile::HostBaseline, String::new()),
             (
-                br#"{"path":"d:\\private\\canary-root"}"#,
-                SinkError::Private,
+                "not json",
+                DiagnosticFile::HostBaseline,
+                "not json".to_owned(),
             ),
             (
-                br#"{"path":"D:/Private/Canary-Root/x"}"#,
-                SinkError::Private,
+                "oversized",
+                DiagnosticFile::HostBaseline,
+                " ".repeat(MAX_OUTPUT + 1),
             ),
-            (br#"{"path":"C:\\elsewhere"}"#, SinkError::Private),
+            (
+                "arbitrary JSON",
+                DiagnosticFile::HostBaseline,
+                r#"{"owner":"S-1-5-21-1-2-3-1001"}"#.to_owned(),
+            ),
+            (
+                "synthetic endpoint in an unknown field",
+                DiagnosticFile::Inputs,
+                inputs_record(r#","endpoint":"192.0.2.7:443""#),
+            ),
+            (
+                "private path in an unknown field",
+                DiagnosticFile::Inputs,
+                inputs_record(r#","path":"D:/Private/Canary-Root""#),
+            ),
+            (
+                "record under another file name",
+                DiagnosticFile::Distribution,
+                record.clone(),
+            ),
         ] {
-            assert_eq!(dir.write(DiagnosticFile::HostBaseline, bytes), Err(error));
+            assert_eq!(
+                dir.write(file, bytes.as_bytes()),
+                Err(SinkError::Invalid),
+                "{name}"
+            );
         }
-        dir.write(DiagnosticFile::Incomplete, br#"{"incomplete":true}"#)
+        let canary_dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (_, canary_path) = private_dir(canary_dir.path(), "evidence");
+        let scanned = EvidenceDir::claim(
+            PathPin::open(&canary_path, true, false).unwrap(),
+            sid(&owner),
+            &[canary],
+        )
+        .unwrap();
+        assert_eq!(
+            scanned.write(DiagnosticFile::Inputs, record.as_bytes()),
+            Err(SinkError::Private)
+        );
+        let summary = format!(
+            r#"{{"contract":2,"origin":"native","binding":{},"blocked_at":null,"unattempted":[],"unmeasured":[],"dispatched_effects":0,"charge_retained":false,"late":null,"unwritten":[]}}"#,
+            binding()
+        );
+        dir.write(DiagnosticFile::Incomplete, summary.as_bytes())
             .unwrap();
         assert_eq!(
-            dir.write(DiagnosticFile::Cleanup, br#"{"late":true}"#),
+            dir.write(DiagnosticFile::Cleanup, record.as_bytes()),
             Err(SinkError::Closed)
         );
         assert_eq!(
