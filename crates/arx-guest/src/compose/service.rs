@@ -229,6 +229,10 @@ struct State {
     tombstones: VecDeque<String>,
     #[serde(default)]
     secret_bindings: BTreeMap<String, SecretBinding>,
+    // Highest epoch reserved before a possible tmpfs publication, independent
+    // of receipt retention. A later successful delivery supersedes it.
+    #[serde(default)]
+    pending_epochs: BTreeMap<String, (u64, u64)>,
     log: VecDeque<LogEntry>,
     next_log_seq: u64,
 }
@@ -242,6 +246,7 @@ impl State {
             operations: Vec::new(),
             tombstones: VecDeque::new(),
             secret_bindings: BTreeMap::new(),
+            pending_epochs: BTreeMap::new(),
             log: VecDeque::new(),
             next_log_seq: 1,
         }
@@ -258,6 +263,7 @@ impl State {
             || state.operations.len() > MAX_JOURNAL
             || state.tombstones.len() > MAX_TOMBSTONES
             || state.secret_bindings.len() > MAX_SECRET_BINDINGS
+            || state.pending_epochs.len() > MAX_SECRET_BINDINGS
             || state.log.len() > MAX_LOG
         {
             return Err(StoreError);
@@ -379,6 +385,31 @@ fn collect_container_ids(containers: &[ObservedContainer]) -> BTreeMap<String, V
     ids
 }
 
+/// A retry may reuse an already published file only after private byte
+/// comparison at admission and verification of the same inode at use.
+enum SecretPublication {
+    Create(SecretBytes),
+    Reuse(SecretFileWitness),
+}
+
+impl SecretPublication {
+    fn publish(
+        self,
+        store: &mut dyn ComposeStore,
+        project: &str,
+        instance: &str,
+        owner: (u32, u32),
+    ) -> Result<SecretFileWitness, StoreError> {
+        match self {
+            Self::Create(bytes) => store.write_secret(project, instance, owner, bytes.as_slice()),
+            Self::Reuse(witness) => store
+                .stat_secret(project, instance, owner)
+                .filter(|current| *current == witness)
+                .ok_or(StoreError),
+        }
+    }
+}
+
 /// The physical work of one worker operation, fixed at admission.
 enum Plan {
     Deploy {
@@ -412,7 +443,7 @@ enum Plan {
         generation: u64,
         owner: (u32, u32),
         instance: String,
-        bytes: SecretBytes,
+        bytes: SecretPublication,
         base_bindings: BTreeMap<String, SecretBinding>,
         services: Vec<String>,
     },
@@ -1172,10 +1203,22 @@ impl ComposeService {
 
     fn reconcile(&self, id: u32, operation_id: &str) -> ComposeResponse {
         let mut inner = lock(&self.shared.inner);
+        let recovering = inner.store_uncertain;
+        if recovering {
+            if inner.running.is_some() {
+                return reject(id, RejectCode::Busy);
+            }
+            if let Err(code) = reload_uncertain(&self.shared, &mut inner) {
+                return reject(id, code);
+            }
+        }
         let Some(operation) = find(&inner, operation_id).cloned() else {
             return reject(id, RejectCode::UnknownOperation);
         };
         if operation.state != OperationState::Ambiguous {
+            if recovering {
+                return operation_state(id, &operation);
+            }
             return reject(id, RejectCode::NotAmbiguous);
         }
         if inner.running.is_some() {
@@ -1611,6 +1654,27 @@ impl ComposeService {
                 .and_then(|c| c.secret_bindings.get(&slot).cloned())
         });
 
+        let instance = secret_instance(&slot, &digest, epoch, generation);
+        let mut reuse = None;
+        if let Some(&(reserved_generation, reserved_epoch)) = inner.state.pending_epochs.get(&bkey)
+        {
+            if epoch < reserved_epoch {
+                return reject(id, RejectCode::StaleEpoch);
+            }
+            if generation == reserved_generation && epoch == reserved_epoch {
+                match lock(&self.shared.store).compare_secret(
+                    &project_id,
+                    &instance,
+                    owner,
+                    bytes.as_slice(),
+                ) {
+                    SecretMatch::Match(witness) => reuse = Some(witness),
+                    SecretMatch::Error => return reject(id, RejectCode::StoreFailure),
+                    _ => return reject(id, RejectCode::SecretConflict),
+                }
+            }
+        }
+
         // Epoch immutability: decreasing epochs fail; equal epochs reuse only
         // for identical bytes and valid live file witness, or allow new-generation
         // redelivery after tmpfs loss.
@@ -1651,14 +1715,12 @@ impl ComposeService {
                             baseline_complete: false,
                             prior_container_ids: BTreeMap::new(),
                         };
-                        let saved = commit_state(&self.shared, &mut inner, |state| {
-                            trim_journal(state)?;
-                            if state.operations.len() >= MAX_JOURNAL {
-                                return Err(RejectCode::JournalFull);
-                            }
-                            state.operations.push(op_record);
-                            Ok(())
-                        });
+                        let saved = commit_settlement(
+                            &self.shared,
+                            &mut inner,
+                            &operation_id,
+                            SettlementCommit::Receipt(op_record),
+                        );
                         return match saved {
                             Ok(()) => ComposeResponse::ComposeSecretAccepted {
                                 id,
@@ -1675,13 +1737,11 @@ impl ComposeService {
                         return reject(id, RejectCode::SecretConflict);
                     }
                     SecretMatch::Missing => {
-                        // A live same-generation release cannot silently swap
-                        // its bound epoch without a new generation or rotation.
-                        if existing.generation == generation && is_live_committed {
+                        // A missing file has no evidence for same-generation reuse.
+                        if existing.generation == generation {
                             return reject(id, RejectCode::SecretConflict);
                         }
-                        // Otherwise (new generation after tmpfs reset, or
-                        // non-live release): fall through to publish a fresh
+                        // After a generation change, fall through to publish a fresh
                         // immutable instance for this generation.
                     }
                     SecretMatch::Error => return reject(id, RejectCode::StoreFailure),
@@ -1689,7 +1749,10 @@ impl ComposeService {
             }
         }
 
-        let instance = secret_instance(&slot, &digest, epoch, generation);
+        let bytes = match reuse {
+            Some(witness) => SecretPublication::Reuse(witness),
+            None => SecretPublication::Create(bytes),
+        };
         let rotation =
             is_live_committed && existing_binding.as_ref().is_some_and(|b| epoch > b.epoch);
 
@@ -1733,7 +1796,7 @@ impl ComposeService {
                 if state.operations.len() >= MAX_JOURNAL {
                     return Err(RejectCode::JournalFull);
                 }
-                ensure_secret_binding_capacity(state, &staged_digests, &bkey)?;
+                reserve_secret_epoch(state, &staged_digests, &bkey, generation, epoch)?;
                 state.operations.push(op_record);
                 push_log(
                     &self.shared,
@@ -1823,7 +1886,7 @@ impl ComposeService {
             if state.operations.len() >= MAX_JOURNAL {
                 return Err(RejectCode::JournalFull);
             }
-            ensure_secret_binding_capacity(state, &staged_digests, &bkey)?;
+            reserve_secret_epoch(state, &staged_digests, &bkey, generation, epoch)?;
             state.operations.push(op_record);
             Ok(())
         });
@@ -1833,9 +1896,12 @@ impl ComposeService {
 
         // 2. Publish immutable tmpfs file. An error may follow rename, so an
         // uncertain publish leaves the operation Ambiguous (never Accepted).
-        let written =
-            lock(&self.shared.store).write_secret(&project_id, &instance, owner, bytes.as_slice());
-        drop(bytes);
+        let written = bytes.publish(
+            lock(&self.shared.store).as_mut(),
+            &project_id,
+            &instance,
+            owner,
+        );
         let witness = match written {
             Ok(witness) => witness,
             Err(StoreError) => {
@@ -2103,6 +2169,24 @@ fn resolve_release_manifest(
     }
 }
 
+fn reserve_secret_epoch(
+    state: &mut State,
+    staged_digests: &BTreeSet<String>,
+    key: &str,
+    generation: u64,
+    epoch: u64,
+) -> Result<(), RejectCode> {
+    ensure_secret_binding_capacity(state, staged_digests, key)?;
+    if !state.pending_epochs.contains_key(key) && state.pending_epochs.len() >= MAX_SECRET_BINDINGS
+    {
+        return Err(RejectCode::StoreFailure);
+    }
+    state
+        .pending_epochs
+        .insert(key.to_owned(), (generation, epoch));
+    Ok(())
+}
+
 fn ensure_secret_binding_capacity(
     state: &mut State,
     staged_digests: &BTreeSet<String>,
@@ -2279,17 +2363,20 @@ fn commit_state(
     inner: &mut Inner,
     mutate: impl FnOnce(&mut State) -> Result<(), RejectCode>,
 ) -> Result<(), RejectCode> {
+    if inner.store_uncertain {
+        return Err(RejectCode::StoreFailure);
+    }
     let mut candidate = inner.state.clone();
     mutate(&mut candidate)?;
     let bytes = serde_json::to_vec(&candidate).map_err(|_| RejectCode::StoreFailure)?;
     if bytes.len() > MAX_STATE_BYTES {
         return Err(RejectCode::StoreFailure);
     }
-    lock(&shared.store)
-        .save_state(&bytes)
-        .map_err(|_| RejectCode::StoreFailure)?;
+    if lock(&shared.store).save_state(&bytes).is_err() {
+        inner.store_uncertain = true;
+        return Err(RejectCode::StoreFailure);
+    }
     inner.state = candidate;
-    inner.store_uncertain = false;
     Ok(())
 }
 
@@ -2323,6 +2410,7 @@ fn apply_settlement_to_state(
     let project_id = operation.project_id.clone();
     if let Some(binding) = settlement.upsert_secret {
         let key = binding_key(&binding.project_id, &binding.release_digest, &binding.slot);
+        state.pending_epochs.remove(&key);
         state.secret_bindings.insert(key, binding);
     }
     if let Some(record) = state.projects.get_mut(&project_id) {
@@ -2362,6 +2450,32 @@ fn apply_settlement_to_state(
     );
 }
 
+enum SettlementCommit {
+    Existing(Settlement),
+    Receipt(OperationRecord),
+}
+
+impl From<Settlement> for SettlementCommit {
+    fn from(settlement: Settlement) -> Self {
+        Self::Existing(settlement)
+    }
+}
+
+/// Recover the actual side of a failed rename before computing another transition.
+fn reload_uncertain(shared: &Shared, inner: &mut Inner) -> Result<(), RejectCode> {
+    if inner.store_uncertain {
+        let snapshot = lock(&shared.store)
+            .load_state()
+            .map_err(|_| RejectCode::StoreFailure)?;
+        inner.state = match snapshot {
+            Some(bytes) => State::load(&bytes).map_err(|_| RejectCode::StoreFailure)?,
+            None => State::new(),
+        };
+        inner.store_uncertain = false;
+    }
+    Ok(())
+}
+
 /// THE single durable settlement path shared by workers, synchronous intake,
 /// and read-only reconciliation. Commits the terminal receipt and all affected
 /// project/binding state together before exposing either. If persistence fails,
@@ -2371,18 +2485,25 @@ fn commit_settlement(
     shared: &Shared,
     inner: &mut Inner,
     operation_id: &str,
-    settlement: Settlement,
-) -> Result<(), StoreError> {
-    let mut candidate = inner.state.clone();
-    apply_settlement_to_state(shared, &mut candidate, operation_id, settlement);
-    let bytes = serde_json::to_vec(&candidate).map_err(|_| StoreError)?;
-    if bytes.len() > MAX_STATE_BYTES {
-        mark_uncertain(inner, operation_id);
-        return Err(StoreError);
+    settlement: impl Into<SettlementCommit>,
+) -> Result<(), RejectCode> {
+    if inner.store_uncertain {
+        return Err(RejectCode::StoreFailure);
     }
-    if lock(&shared.store).save_state(&bytes).is_err() {
+    let mut candidate = inner.state.clone();
+    match settlement.into() {
+        SettlementCommit::Existing(s) => {
+            apply_settlement_to_state(shared, &mut candidate, operation_id, s)
+        }
+        SettlementCommit::Receipt(receipt) => {
+            trim_journal(&mut candidate)?;
+            candidate.operations.push(receipt);
+        }
+    }
+    let bytes = serde_json::to_vec(&candidate).map_err(|_| RejectCode::StoreFailure)?;
+    if bytes.len() > MAX_STATE_BYTES || lock(&shared.store).save_state(&bytes).is_err() {
         mark_uncertain(inner, operation_id);
-        return Err(StoreError);
+        return Err(RejectCode::StoreFailure);
     }
     inner.state = candidate;
     inner.store_uncertain = false;
@@ -2415,7 +2536,13 @@ fn run_worker(shared: Arc<Shared>, operation_id: String, plan: Plan) {
     // An unexpected panic leaves the effect unknown.
     .unwrap_or_else(|_| Settlement::ambiguous());
     let mut inner = lock(&shared.inner);
-    let _ = commit_settlement(&shared, &mut inner, &operation_id, settlement);
+    // A worker may be finishing after a failed pre-effect checkpoint. Resolve
+    // that save before committing its failure against the actual durable state.
+    if reload_uncertain(&shared, &mut inner).is_ok() {
+        let _ = commit_settlement(&shared, &mut inner, &operation_id, settlement);
+    } else {
+        mark_uncertain(&mut inner, &operation_id);
+    }
     inner.running = None;
     drop(inner);
     shared.idle.notify_all();
@@ -2564,7 +2691,7 @@ impl Steps<'_> {
         generation: u64,
         owner: (u32, u32),
         instance: &str,
-        bytes: SecretBytes,
+        bytes: SecretPublication,
         base_bindings: BTreeMap<String, SecretBinding>,
         services: &[String],
     ) -> Settlement {
@@ -2613,9 +2740,12 @@ impl Steps<'_> {
         // 2. Publish the new immutable tmpfs secret file and render the
         // rotation-scoped compose file (keeping `compose.yaml` untouched until
         // durable settlement).
-        let written =
-            lock(&self.shared.store).write_secret(project.id(), instance, owner, bytes.as_slice());
-        drop(bytes);
+        let written = bytes.publish(
+            lock(&self.shared.store).as_mut(),
+            project.id(),
+            instance,
+            owner,
+        );
         let Ok(witness) = written else {
             return Settlement::failed(FailureCode::StoreFailed);
         };
@@ -2632,7 +2762,9 @@ impl Steps<'_> {
         };
         let mut new_bindings = base_bindings;
         new_bindings.insert(secret_slot.to_owned(), new_binding.clone());
-        let rot_yaml = render(project, revision, slot, &secret_instance_map(&new_bindings));
+        let Ok(rot_yaml) = self.render_pinned(project, revision, slot, &new_bindings) else {
+            return Settlement::failed(FailureCode::StoreFailed);
+        };
         if lock(&self.shared.store)
             .write_rotation(project.id(), revision, self.operation_id, &rot_yaml)
             .is_err()
@@ -2711,6 +2843,54 @@ impl Steps<'_> {
         }
     }
 
+    /// Render only from verified instance names and pinned file witnesses.
+    /// Every launching path writes this projection to its selected Compose file.
+    fn render_pinned(
+        &self,
+        project: &Project,
+        revision: u64,
+        slot: u8,
+        bindings: &BTreeMap<String, SecretBinding>,
+    ) -> Result<String, StoreError> {
+        let mut store = lock(&self.shared.store);
+        for name in &project.manifest().secrets {
+            let binding = bindings.get(name).ok_or(StoreError)?;
+            let owner = project.slot_owner(name).ok_or(StoreError)?;
+            if binding.project_id != project.id()
+                || binding.slot != *name
+                || (binding.uid, binding.gid) != owner
+                || binding.instance
+                    != secret_instance(
+                        name,
+                        &binding.release_digest,
+                        binding.epoch,
+                        binding.generation,
+                    )
+                || store.stat_secret(project.id(), &binding.instance, owner)
+                    != Some(binding.witness)
+            {
+                return Err(StoreError);
+            }
+        }
+        Ok(render(
+            project,
+            revision,
+            slot,
+            &secret_instance_map(bindings),
+        ))
+    }
+
+    fn write_pinned_revision(
+        &self,
+        project: &Project,
+        revision: u64,
+        slot: u8,
+        bindings: &BTreeMap<String, SecretBinding>,
+    ) -> Result<(), StoreError> {
+        let yaml = self.render_pinned(project, revision, slot, bindings)?;
+        lock(&self.shared.store).write_revision(project.id(), revision, &yaml)
+    }
+
     fn deploy(
         &mut self,
         project: &Project,
@@ -2721,9 +2901,8 @@ impl Steps<'_> {
     ) -> Settlement {
         let id = project.id();
         self.stage(OperationStage::Rendering);
-        let yaml = render(project, revision, slot, &secret_instance_map(bindings));
-        if lock(&self.shared.store)
-            .write_revision(id, revision, &yaml)
+        if self
+            .write_pinned_revision(project, revision, slot, bindings)
             .is_err()
         {
             return Settlement::failed(FailureCode::StoreFailed);
@@ -2793,11 +2972,14 @@ impl Steps<'_> {
             {
                 self.stage(OperationStage::Restoring);
                 let restored = self
-                    .apply(
-                        &engine::compose_up(id, previous_revision),
-                        FailureCode::UpFailed,
-                    )
+                    .write_pinned_revision(&previous, previous_revision, slot, &previous_bindings)
                     .is_ok()
+                    && self
+                        .apply(
+                            &engine::compose_up(id, previous_revision),
+                            FailureCode::UpFailed,
+                        )
+                        .is_ok()
                     && match self.prove_health(
                         &previous,
                         previous_revision,
@@ -2901,9 +3083,8 @@ impl Steps<'_> {
     ) -> Settlement {
         // Re-render from the current pinned bindings so post-reboot
         // new-generation secret instances are mounted on Start.
-        let yaml = render(project, revision, slot, &secret_instance_map(bindings));
-        if lock(&self.shared.store)
-            .write_revision(project.id(), revision, &yaml)
+        if self
+            .write_pinned_revision(project, revision, slot, bindings)
             .is_err()
         {
             return Settlement::failed(FailureCode::StoreFailed);

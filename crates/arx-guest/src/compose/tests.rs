@@ -868,6 +868,12 @@ impl ComposeStore for MemoryStore {
         bytes: &[u8],
     ) -> Result<SecretFileWitness, StoreError> {
         let mut disk = self.0.lock().unwrap();
+        if disk
+            .secrets
+            .contains_key(&(project.to_owned(), instance.to_owned()))
+        {
+            return Err(StoreError);
+        }
         if let Some(fault) = disk.write_secret_faults.pop_front() {
             if fault == StoreFault::AfterRename {
                 disk.secret_writes += 1;
@@ -2820,8 +2826,9 @@ fn contract_c_rotation_evidence() {
         h.settle();
         assert_eq!(h.operation(4).state, OperationState::Failed);
         assert_eq!(h.count("--force-recreate"), 0);
-        h.disk.lock().unwrap().fail_write_secret = false;
-
+    }
+    {
+        let (h, digest) = setup_multi();
         h.disk.lock().unwrap().fail_write_rotation = true;
         h.put_secret(5, &digest, 2, b"epoch-2");
         h.settle();
@@ -4104,6 +4111,129 @@ fn contract_h_existing_fences_and_new_query_canary() {
         assert!(
             !haystack.contains(&encoded),
             "encoded canary leaked: {haystack}"
+        );
+    }
+}
+
+#[test]
+fn contract_b_failed_rotation_cannot_reassign_its_epoch_instance() {
+    let h = Harness::new();
+    let digest = h.deployed();
+    let instance = secret_instance(SLOT, &digest, 2, GENERATION);
+    let key = (PROJECT.to_owned(), instance);
+    h.disk.lock().unwrap().fail_write_rotation = true;
+    h.put_secret(91, &digest, 2, b"fixture A");
+    h.settle();
+    assert_eq!(h.operation(91).failure, Some(FailureCode::StoreFailed));
+    assert_eq!(h.count("--force-recreate"), 0);
+    let first = h.disk.lock().unwrap().secrets[&key].1;
+    h.disk.lock().unwrap().fail_write_rotation = false;
+    let calls_before = h.count("--force-recreate");
+    let h = Harness::on_shared(Arc::clone(&h.disk), Arc::clone(&h.docker));
+    h.hello();
+    assert_eq!(
+        rejected(&h.put_secret(92, &digest, 2, b"fixture B")),
+        Some(RejectCode::SecretConflict)
+    );
+    h.settle();
+    let second = h.disk.lock().unwrap().secrets[&key].1;
+    assert_eq!(
+        second.ino, first.ino,
+        "a new ID replaced the already published epoch-2 inode"
+    );
+    assert_eq!(h.count("--force-recreate"), calls_before);
+
+    let writes_before = h.disk.lock().unwrap().secret_writes;
+    h.put_secret(93, &digest, 2, b"fixture A");
+    h.settle();
+    assert_eq!(h.operation(93).state, OperationState::Succeeded);
+    assert_eq!(h.count("--force-recreate"), calls_before + 1);
+    let disk = h.disk.lock().unwrap();
+    assert_eq!(disk.secret_writes, writes_before);
+    assert_eq!(disk.secrets[&key].1, first);
+}
+
+#[test]
+fn contract_d_rollback_must_mount_reconciled_epoch() {
+    let h = Harness::new();
+    let digest = h.deployed();
+    let epoch2 = secret_file(PROJECT, &secret_instance(SLOT, &digest, 2, GENERATION));
+    h.docker.lock().unwrap().faults.push(Fault {
+        needle: "--force-recreate",
+        result: RunResult::TimedOut,
+        apply: true,
+    });
+    h.put_secret(91, &digest, 2, b"rotated fixture");
+    h.settle();
+    assert_eq!(h.operation(91).state, OperationState::Ambiguous);
+    h.reconcile(91);
+    assert_eq!(h.operation(91).state, OperationState::Succeeded);
+    assert_eq!(
+        h.docker.lock().unwrap().containers[PROJECT][0].mounts[0].source,
+        epoch2
+    );
+
+    let mut other = manifest();
+    other["services"][0]["environment"][0]["value"] = json!("8099");
+    let other_digest = h.stage(&bytes(&other));
+    h.put_secret(92, &other_digest, 1, b"fixture for next revision");
+    h.docker.lock().unwrap().unhealthy.insert(2);
+    h.deploy(2, PROJECT, 2, &other_digest);
+    h.settle();
+    assert_eq!(h.operation(2).failure, Some(FailureCode::HealthFailed));
+    assert_eq!(h.docker.lock().unwrap().containers[PROJECT][0].revision, 1);
+    assert_eq!(
+        h.docker.lock().unwrap().containers[PROJECT][0].mounts[0].source,
+        epoch2,
+        "rollback relaunched the prior revision on a superseded secret epoch"
+    );
+    assert!(h.operation(2).restored_previous);
+}
+
+#[test]
+fn contract_g_uncertain_receipt_cannot_rebind_operation_id() {
+    for fault in [StoreFault::AfterRename, StoreFault::BeforeRename] {
+        let h = Harness::new();
+        h.hello();
+        let digest_a = h.stage(&bytes(&manifest()));
+        let mut other = manifest();
+        other["services"][0]["environment"][0]["value"] = json!("8099");
+        let digest_b = h.stage(&bytes(&other));
+        assert!(matches!(
+            h.put_secret(90, &digest_a, 1, b"fixture A"),
+            ComposeResponse::ComposeSecretAccepted { .. }
+        ));
+
+        h.disk.lock().unwrap().save_faults.push_back(Some(fault));
+        assert_eq!(
+            rejected(&h.put_secret(91, &digest_a, 1, b"fixture A")),
+            Some(RejectCode::StoreFailure)
+        );
+        let persisted = Harness::on(Arc::new(Mutex::new(Disk {
+            state: h.disk.lock().unwrap().state.clone(),
+            ..Disk::default()
+        })));
+        persisted.hello();
+        if fault == StoreFault::AfterRename {
+            assert_eq!(persisted.operation(91).state, OperationState::Succeeded);
+        }
+        let writes_before = h.disk.lock().unwrap().secret_writes;
+        let reply = h.put_secret(91, &digest_b, 1, b"fixture B");
+        let disk = h.disk.lock().unwrap();
+        let state: Value = serde_json::from_slice(disk.state.as_ref().unwrap()).unwrap();
+        let record = state["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["operation_id"] == op(91));
+        let reaccepted = matches!(reply, ComposeResponse::ComposeSecretAccepted { digest, .. }
+        if digest == digest_b);
+        let rebound = record.is_some_and(|op| op["digest"] == digest_b);
+        let new_writes = disk.secret_writes - writes_before;
+        assert_eq!(
+            (reaccepted, rebound, new_writes),
+            (false, false, 0),
+            "live broker re-accepted the same ID for B, rebound its durable digest, and wrote a file"
         );
     }
 }

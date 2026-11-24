@@ -1530,8 +1530,8 @@ fn private_subdir(
 
 /// Replaces `name` in `dir` atomically. The temporary is created O_EXCL and
 /// no-follow, receives its owner and mode on the descriptor, is written and
-/// synced, then renamed over the target; a planted symlink is replaced, never
-/// followed.
+/// synced, then renamed. Owner-bound secret instances require an unused target
+/// name. State and revision files use replacing rename. Neither follows links.
 fn replace_at(
     dir: BorrowedFd<'_>,
     name: &str,
@@ -1574,11 +1574,16 @@ fn replace_at(
     // SAFETY: both names are NUL-terminated components of the live dir.
     let renamed = written.and_then(|witness| {
         if unsafe {
-            libc::renameat(
+            libc::renameat2(
                 dir.as_raw_fd(),
                 temporary.as_ptr(),
                 dir.as_raw_fd(),
                 target.as_ptr(),
+                if owner.is_some() {
+                    libc::RENAME_NOREPLACE
+                } else {
+                    0
+                },
             )
         } != 0
         {
@@ -2489,7 +2494,15 @@ mod compose_tests {
                 .is_none()
         );
 
-        // A planted link at the target is replaced, never written through.
+        // Immutable publication refuses both an existing inode and a planted link.
+        assert_eq!(
+            store.write_secret("calm-life", "admin_password", owner, b"second"),
+            Err(StoreError)
+        );
+        assert_eq!(
+            store.stat_secret("calm-life", "admin_password", owner),
+            Some(first_witness)
+        );
         let outside = scratch.0.join("outside");
         fs::write(&outside, b"untouched").unwrap();
         fs::remove_file(&secret).unwrap();
@@ -2508,16 +2521,12 @@ mod compose_tests {
             scratch.0.join("secrets/calm-life/.admin_password.tmp"),
         )
         .unwrap();
-        let second_witness = store
-            .write_secret("calm-life", "admin_password", owner, b"second")
-            .unwrap();
-        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
-        assert!(fs::symlink_metadata(&secret).unwrap().is_file());
-        assert_eq!(fs::read(&secret).unwrap(), b"second");
         assert_eq!(
-            store.compare_secret("calm-life", "admin_password", owner, b"second"),
-            SecretMatch::Match(second_witness)
+            store.write_secret("calm-life", "admin_password", owner, b"second"),
+            Err(StoreError)
         );
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+        assert!(fs::symlink_metadata(&secret).unwrap().is_symlink());
 
         // A linked project directory is refused.
         let elsewhere = scratch.0.join("elsewhere");
