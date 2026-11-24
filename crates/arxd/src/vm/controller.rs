@@ -1960,6 +1960,9 @@ impl<C: Clock> VmController<C> {
         released: bool,
     ) -> Result<()> {
         self.store.transact(|db| {
+            // The audit records the effective cause, read before the release
+            // removes the intent.
+            let reason = store::publish::effective_cause(db, &intent.nonce, reason)?;
             store::publish::update(db, &intent.nonce, update)?;
             // One daemon receipt for loss or a completed reconciliation.
             // Retry turns with unchanged pending cleanup cannot fill the audit.

@@ -211,17 +211,47 @@ pub(in crate::vm) fn create_private(path: &Path) -> io::Result<File> {
 /// Marks a file this process created for deletion through its own handle, so
 /// no by-path delete can race a concurrent reader. The file disappears when
 /// the last handle closes; other opens fail meanwhile.
+///
+/// The extended disposition ignores a read-only attribute another same-login
+/// handle may have set while the writer was open. Where it is unsupported,
+/// the classic disposition is tried on the same handle. Failure is returned
+/// to the caller, never retried through a reopened path.
 pub(in crate::vm) fn delete_on_close(file: &File) -> io::Result<()> {
-    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
-    ok(unsafe {
+    #[cfg(test)]
+    if FAIL_DISPOSITION.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err(io::Error::other("injected disposition failure"));
+    }
+    let extended = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    let marked = ok(unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),
-            FileDispositionInfo,
-            (&info as *const FILE_DISPOSITION_INFO).cast(),
-            size_of::<FILE_DISPOSITION_INFO>() as u32,
+            FileDispositionInfoEx,
+            (&extended as *const FILE_DISPOSITION_INFO_EX).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
         )
-    })
+    });
+    match marked {
+        Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
+            let classic = FILE_DISPOSITION_INFO { DeleteFile: true };
+            ok(unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&classic as *const FILE_DISPOSITION_INFO).cast(),
+                    size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            })
+        }
+        marked => marked,
+    }
 }
+
+/// Fails the next same-handle disposition, for the residue witness.
+#[cfg(test)]
+pub(in crate::vm) static FAIL_DISPOSITION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn require_owner(file: &File) -> io::Result<()> {
     let user = token_user()?;

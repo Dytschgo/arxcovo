@@ -188,22 +188,66 @@ pub(in crate::vm) enum Removal {
     ForeignOrAmbiguous,
 }
 
-/// The single commit point of a DNS mutation. Connection and TLS setup send
-/// nothing that could reach the record API. Immediately before the first
-/// request byte is written, [`Submission::commit`] re-samples cancellation:
-/// once it returns `true` the mutation may reach Cloudflare, and before that
-/// the request is provably unsent.
+/// What one DNS mutation may have handed to the network.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::vm) enum Sent {
+    /// The underlying transport accepted no request byte.
+    Never,
+    /// The underlying transport accepted request bytes. Never reclassified.
+    Possibly,
+}
+
+#[derive(Default)]
+struct GateState {
+    revoked: bool,
+    possibly: bool,
+}
+
+/// The first-write authority for one activation's POST. Owner revocation and
+/// the first underlying transport write are arbitrated under this one lock, so
+/// no request byte can follow an observed revocation, and a revocation that
+/// lands after a byte was accepted knows the POST may have been sent.
+#[derive(Default)]
+pub(in crate::vm) struct SendGate(std::sync::Mutex<GateState>);
+
+impl SendGate {
+    fn state(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Owner revocation. Returns `true` when no byte was accepted, in which
+    /// case none can be.
+    pub(in crate::vm) fn revoke(&self) -> bool {
+        let mut state = self.state();
+        state.revoked = true;
+        !state.possibly
+    }
+
+    pub(in crate::vm) fn sent(&self) -> Sent {
+        if self.state().possibly {
+            Sent::Possibly
+        } else {
+            Sent::Never
+        }
+    }
+}
+
+/// One DNS mutation's send authority: its activation's [`SendGate`] plus the
+/// other cancellation sources (origin retirement and shutdown), sampled at
+/// every attempt of the first underlying write.
 pub(in crate::vm) struct Submission<'a> {
+    gate: Arc<SendGate>,
     cancelled: &'a (dyn Fn() -> bool + Sync),
-    committed: std::sync::atomic::AtomicBool,
 }
 
 impl<'a> Submission<'a> {
-    pub(in crate::vm) fn new(cancelled: &'a (dyn Fn() -> bool + Sync)) -> Self {
-        Self {
-            cancelled,
-            committed: std::sync::atomic::AtomicBool::new(false),
-        }
+    pub(in crate::vm) fn new(
+        gate: Arc<SendGate>,
+        cancelled: &'a (dyn Fn() -> bool + Sync),
+    ) -> Self {
+        Self { gate, cancelled }
     }
 
     /// A submission no cancellation can withhold.
@@ -212,31 +256,114 @@ impl<'a> Submission<'a> {
         fn never() -> bool {
             false
         }
-        Submission::new(&never)
+        Submission::new(Arc::default(), &never)
     }
 
-    /// Claims the commit point unless cancellation has been observed.
-    pub(in crate::vm) fn commit(&self) -> bool {
-        if (self.cancelled)() {
-            return false;
+    pub(in crate::vm) fn sent(&self) -> Sent {
+        self.gate.sent()
+    }
+
+    /// Arbitrates one attempt of the first underlying write. Cancellation is
+    /// re-sampled on every attempt; `Pending` and any zero-progress result
+    /// leave the request unsent and revocable. Only an accepted byte moves it
+    /// to [`Sent::Possibly`], after which writes pass straight through.
+    pub(in crate::vm) fn first_write(
+        &self,
+        write: impl FnOnce() -> std::task::Poll<io::Result<usize>>,
+    ) -> std::task::Poll<io::Result<usize>> {
+        let mut state = self.gate.state();
+        if state.possibly {
+            drop(state);
+            return write();
         }
-        self.committed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        true
+        if state.revoked || (self.cancelled)() {
+            return std::task::Poll::Ready(Err(io::Error::other("submission withheld")));
+        }
+        let result = write();
+        if matches!(result, std::task::Poll::Ready(Ok(accepted)) if accepted > 0) {
+            state.possibly = true;
+        }
+        result
+    }
+}
+
+/// The transport below TLS. Once armed, every write goes through the
+/// submission's first-write authority; before arming (TLS handshake) and for
+/// requests without a submission it passes through.
+struct GatedIo<'s, 'c, S> {
+    inner: S,
+    submission: Option<&'s Submission<'c>>,
+    armed: bool,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for GatedIo<'_, '_, S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for GatedIo<'_, '_, S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let inner = &mut this.inner;
+        match this.submission.filter(|_| this.armed) {
+            Some(submission) => {
+                submission.first_write(|| std::pin::Pin::new(inner).poll_write(cx, buf))
+            }
+            None => std::pin::Pin::new(inner).poll_write(cx, buf),
+        }
     }
 
-    /// Whether the request may have reached Cloudflare.
-    pub(in crate::vm) fn committed(&self) -> bool {
-        self.committed.load(std::sync::atomic::Ordering::SeqCst)
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// TLS over a gated transport. The handshake completes and its output is
+/// flushed before the gate arms, so the first gated write carries the
+/// request's application data. Early data is off in this client
+/// configuration.
+async fn tls_gated<'s, 'c, S: AsyncRead + AsyncWrite + Unpin>(
+    tls: &TlsConnector,
+    io: S,
+    submission: Option<&'s Submission<'c>>,
+) -> io::Result<tokio_rustls::client::TlsStream<GatedIo<'s, 'c, S>>> {
+    let name = ServerName::try_from(API_HOST).expect("fixed TLS server name");
+    let gated = GatedIo {
+        inner: io,
+        submission,
+        armed: false,
+    };
+    let mut stream = tls.connect(name, gated).await?;
+    stream.flush().await?;
+    stream.get_mut().0.armed = true;
+    Ok(stream)
 }
 
 pub(in crate::vm) trait DnsApi {
     async fn preflight(&self, route: &Route) -> Result<(), DnsError>;
     /// Returns the validated, owned record ID acknowledged by the single POST.
     /// The caller persists it before [`DnsApi::verify`], so a failed
-    /// verification never discards an acknowledged ID. Nothing is written
-    /// unless `submission` commits immediately before the first request byte.
+    /// verification never discards an acknowledged ID. The first request byte
+    /// is written only through `submission`'s first-write authority.
     async fn create(
         &self,
         route: &Route,
@@ -396,8 +523,8 @@ impl DnsApi for CloudflareDns {
 }
 
 impl CloudflareDns {
-    /// A mutation's `submission` is committed after connection and TLS setup,
-    /// immediately before the first request byte.
+    /// A mutation's first request byte passes its `submission`'s first-write
+    /// authority, below TLS and after connection setup.
     async fn request(
         &self,
         method: Method,
@@ -411,27 +538,20 @@ impl CloudflareDns {
             self.bearer.0.as_str(),
             body.len()
         ));
-        let commit = || {
-            if submission.is_none_or(Submission::commit) {
-                Ok(())
-            } else {
-                Err(io::Error::other("submission withheld"))
-            }
-        };
         let result = timeout(self.deadline, async {
             match &self.transport {
                 Transport::Cloudflare(tls) => {
                     let stream = TcpStream::connect((API_HOST, 443)).await?;
-                    let name = ServerName::try_from(API_HOST).expect("fixed TLS server name");
-                    let stream = tls.connect(name, stream).await?;
-                    commit()?;
-                    exchange(stream, &headers, body).await
+                    exchange(tls_gated(tls, stream, submission).await?, &headers, body).await
                 }
                 #[cfg(test)]
                 Transport::Fixture(addr) => {
-                    let stream = TcpStream::connect(addr).await?;
-                    commit()?;
-                    exchange(stream, &headers, body).await
+                    let gated = GatedIo {
+                        inner: TcpStream::connect(addr).await?,
+                        submission,
+                        armed: true,
+                    };
+                    exchange(gated, &headers, body).await
                 }
             }
         })
@@ -574,5 +694,225 @@ fn decode_chunks(mut bytes: &[u8]) -> Option<Vec<u8>> {
         }
         body.extend_from_slice(bytes.get(..size)?);
         bytes = bytes.get(size..)?.strip_prefix(b"\r\n")?;
+    }
+}
+
+#[cfg(test)]
+mod first_write {
+    //! The first underlying write decides DNS evidence. A controlled transport
+    //! holds or fails writes, and records every byte it accepts.
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering::SeqCst},
+        },
+        task::{Context, Poll, Waker},
+    };
+
+    use super::*;
+
+    /// Holds every write at `Pending` while `hold` is set, fails the next write
+    /// with zero progress while `fail` is set, and logs accepted bytes.
+    struct Controlled<S> {
+        inner: S,
+        hold: Arc<AtomicBool>,
+        fail: Arc<AtomicBool>,
+        accepted: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<S> Controlled<S> {
+        fn new(inner: S) -> Self {
+            Self {
+                inner,
+                hold: Arc::default(),
+                fail: Arc::default(),
+                accepted: Arc::default(),
+            }
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Controlled<S> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Controlled<S> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if this.hold.load(SeqCst) {
+                return Poll::Pending;
+            }
+            if this.fail.swap(false, SeqCst) {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+            let written = Pin::new(&mut this.inner).poll_write(cx, buf);
+            if let Poll::Ready(Ok(accepted)) = written {
+                this.accepted
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buf[..accepted]);
+            }
+            written
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    fn never() -> bool {
+        false
+    }
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[tokio::test]
+    async fn a_pending_first_write_stays_revocable_and_sends_nothing() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let io = Controlled::new(client);
+        let (hold, accepted) = (io.hold.clone(), io.accepted.clone());
+        hold.store(true, SeqCst);
+        let gate = Arc::new(SendGate::default());
+        let submission = Submission::new(gate.clone(), &never);
+        let gated = GatedIo {
+            inner: io,
+            submission: Some(&submission),
+            armed: true,
+        };
+        let mut request = Box::pin(exchange(gated, "POST / HTTP/1.1\r\n\r\n", b"{}"));
+        assert!(poll_once(request.as_mut()).is_pending());
+        assert_eq!(gate.sent(), Sent::Never);
+        assert!(gate.revoke(), "a pending first write must stay revocable");
+        hold.store(false, SeqCst);
+        assert!(request.await.is_err());
+        assert_eq!(gate.sent(), Sent::Never);
+        assert!(
+            accepted.lock().unwrap().is_empty(),
+            "a byte followed revocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_byte_first_write_failure_is_never_sent() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let io = Controlled::new(client);
+        io.fail.store(true, SeqCst);
+        let accepted = io.accepted.clone();
+        let gate = Arc::new(SendGate::default());
+        let submission = Submission::new(gate.clone(), &never);
+        let gated = GatedIo {
+            inner: io,
+            submission: Some(&submission),
+            armed: true,
+        };
+        assert!(
+            exchange(gated, "POST / HTTP/1.1\r\n\r\n", b"{}")
+                .await
+                .is_err()
+        );
+        assert_eq!(gate.sent(), Sent::Never);
+        assert!(accepted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_accepted_first_byte_is_never_reclassified() {
+        let (client, server) = tokio::io::duplex(4096);
+        let io = Controlled::new(client);
+        let accepted = io.accepted.clone();
+        let gate = Arc::new(SendGate::default());
+        let submission = Submission::new(gate.clone(), &never);
+        let gated = GatedIo {
+            inner: io,
+            submission: Some(&submission),
+            armed: true,
+        };
+        let mut request = Box::pin(exchange(gated, "POST / HTTP/1.1\r\n\r\n", b"{}"));
+        // The request is written and now waits for the response.
+        assert!(poll_once(request.as_mut()).is_pending());
+        assert_eq!(gate.sent(), Sent::Possibly);
+        assert!(!gate.revoke(), "a revocation after a byte must know it");
+        assert_eq!(gate.sent(), Sent::Possibly);
+        drop(server);
+        let _ = request.await;
+        assert!(accepted.lock().unwrap().starts_with(b"POST "));
+    }
+
+    /// TLS buffers the request's application data while the socket below it is
+    /// held at `Pending`; a revocation then sends no application byte at all.
+    #[tokio::test]
+    async fn buffered_tls_application_data_waits_on_the_first_write() {
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        let provider = || Arc::new(rustls::crypto::ring::default_provider());
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec![API_HOST.to_owned()])
+            .unwrap()
+            .signed_by(&key, &ca)
+            .unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let client = ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let peer = tokio::spawn(async move {
+            let mut stream = acceptor.accept(server_io).await.unwrap();
+            let mut received = Vec::new();
+            let _ = stream.read_to_end(&mut received).await;
+            received
+        });
+        let io = Controlled::new(client_io);
+        let hold = io.hold.clone();
+        let gate = Arc::new(SendGate::default());
+        let submission = Submission::new(gate.clone(), &never);
+        let stream = tls_gated(&TlsConnector::from(Arc::new(client)), io, Some(&submission))
+            .await
+            .unwrap();
+        // The handshake is complete; the socket now holds every write.
+        hold.store(true, SeqCst);
+        let mut request = Box::pin(exchange(stream, "POST / HTTP/1.1\r\n\r\n", b"{}"));
+        assert!(poll_once(request.as_mut()).is_pending());
+        assert_eq!(gate.sent(), Sent::Never);
+        assert!(gate.revoke());
+        hold.store(false, SeqCst);
+        assert!(request.await.is_err());
+        assert_eq!(gate.sent(), Sent::Never);
+        let received = tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(received.is_empty(), "application data followed revocation");
     }
 }

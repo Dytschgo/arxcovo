@@ -371,7 +371,8 @@ async fn probe_origin(
 #[cfg(test)]
 pub(in crate::vm) type FailedWriteProbe = Box<dyn FnOnce(&Path) + Send>;
 
-/// Runs with the path of a failed config, just before its writer closes.
+/// Runs with the path of a failed config while its writer is still open,
+/// before the same-handle disposition.
 #[cfg(test)]
 pub(in crate::vm) static FAILED_WRITE_PROBE: std::sync::Mutex<Option<FailedWriteProbe>> =
     std::sync::Mutex::new(None);
@@ -414,18 +415,21 @@ impl Config {
             written
         };
         if written.is_err() {
-            // Delete through the share-exclusive writer itself: no other handle
-            // can open the failed file meanwhile, so no reader can keep it.
-            let marked = super::windows::delete_on_close(&output).is_ok();
             #[cfg(test)]
             if let Some(probe) = FAILED_WRITE_PROBE.lock().unwrap().take() {
                 probe(&path);
             }
+            // Delete through the share-exclusive writer itself: no other handle
+            // can open the failed file meanwhile, so no reader can keep it. An
+            // unconfirmed removal is surfaced, never retried by path; the
+            // residue keeps its private creation-time descriptor and is never
+            // handed to a connector.
+            let removed = super::windows::delete_on_close(&output);
             drop(output);
-            if !marked {
-                let _ = fs::remove_file(&path);
-            }
-            return Err(refusal);
+            return Err(match removed {
+                Ok(()) => refusal,
+                Err(_) => ConnectorError::CleanupPending,
+            });
         }
         drop(output);
         let mut config = Self { path, held: None };

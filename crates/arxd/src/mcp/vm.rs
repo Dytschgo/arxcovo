@@ -1474,8 +1474,8 @@ impl VmInventory {
             Ok(Ok(operation)) => operation,
             refused => {
                 drop(workers);
-                if let Some((generation, _)) = activation {
-                    publisher.abandon(generation);
+                if let Some(ticket) = &activation {
+                    publisher.abandon(ticket.generation);
                 }
                 return match refused {
                     Ok(Err(reason)) => refuse(reason),
@@ -1487,8 +1487,8 @@ impl VmInventory {
         workers.insert(operation.receipt.activity_id);
         drop(workers);
         let tracked = Tracked(supervisor.clone(), operation.receipt.activity_id);
-        if let Some((generation, _)) = activation {
-            publisher.admitted(generation);
+        if let Some(ticket) = &activation {
+            publisher.admitted(ticket.generation);
         } else {
             // The admitted unpublish committed `revoking`: revoke again for an
             // activation admitted between the early check and this point.
@@ -1500,7 +1500,7 @@ impl VmInventory {
         gate.publish_jobs.spawn(async move {
             let _tracked = tracked;
             match (prepared, activation) {
-                (Some((intent, credentials, origin)), Some((generation, revoked))) => {
+                (Some((intent, credentials, origin)), Some(ticket)) => {
                     let _slot = slot;
                     supervisor
                         .publisher
@@ -1510,7 +1510,7 @@ impl VmInventory {
                             intent,
                             credentials,
                             origin,
-                            (generation, &revoked),
+                            &ticket,
                             &supervisor.cancel,
                         )
                         .await
@@ -5046,13 +5046,10 @@ mod tests {
         let revoke = call(&a, "unpublish_site", args(1055)).await;
         release.send(()).unwrap();
         let failed = terminal(&a, &pending).await;
+        // A failed withdrawal keeps the owner cause.
         assert_eq!(
             (&failed["state"], &failed["reason"], &failed["cleanup"]),
-            (
-                &json!("failed"),
-                &json!("cleanup_unconfirmed"),
-                &json!("confirmed")
-            ),
+            (&json!("failed"), &json!("cancelled"), &json!("confirmed")),
             "{failed}"
         );
         assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
@@ -5543,6 +5540,37 @@ mod tests {
         let published = call(&a, "publish_site", args(1433)).await;
         assert_eq!(terminal(&a, &published).await["state"], "succeeded");
         let revoke = call(&a, "unpublish_site", args(1434)).await;
+        assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_zero_byte_first_write_failure_releases_without_dns() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 1480).await;
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        fake.first_write_error.store(true, SeqCst);
+        let failed = call(&a, "publish_site", args(1490)).await;
+        let failed = terminal(&a, &failed).await;
+        assert_eq!(
+            (&failed["state"], &failed["reason"], &failed["cleanup"]),
+            (
+                &json!("failed"),
+                &json!("dns_unavailable"),
+                &json!("confirmed")
+            ),
+            "{failed}"
+        );
+        // Only the preflight lookup ran: no POST, no cleanup lookup, no delete.
+        assert_eq!((fake.posts.load(SeqCst), fake.deletes.load(SeqCst)), (0, 0));
+        assert_eq!(fake.routes.lock().unwrap().len(), 1);
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        let published = call(&a, "publish_site", args(1491)).await;
+        assert_eq!(terminal(&a, &published).await["state"], "succeeded");
+        let revoke = call(&a, "unpublish_site", args(1492)).await;
         assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
         drop(a);
         h.shutdown().await.unwrap();

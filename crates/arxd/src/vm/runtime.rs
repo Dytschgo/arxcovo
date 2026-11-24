@@ -434,7 +434,10 @@ pub(crate) mod publication {
             paths::{ArtifactPin, LocalPath},
             publish::{
                 Hostname, TunnelId,
-                cloudflare::{DnsApi, DnsError, Reconciled, RecordId, Removal, Route, Submission},
+                cloudflare::{
+                    DnsApi, DnsError, Reconciled, RecordId, Removal, Route, SendGate, Sent,
+                    Submission,
+                },
                 hex_id,
             },
             static_web::{ORIGIN_PORT_FIRST, ORIGIN_PORT_LAST, StaticName, StaticOriginIdentity},
@@ -841,6 +844,16 @@ pub(crate) mod publication {
         vm: Id,
         owner: String,
         token: Shutdown,
+        /// The first-write authority for this activation's POST. Revocation
+        /// is arbitrated against the first transport write under its lock.
+        send: Arc<SendGate>,
+    }
+
+    /// What admission hands a publish worker for its activation.
+    pub(crate) struct Ticket {
+        pub(crate) generation: u64,
+        pub(crate) revoked: Shutdown,
+        send: Arc<SendGate>,
     }
 
     #[derive(Default)]
@@ -878,6 +891,7 @@ pub(crate) mod publication {
                 })
                 .map(|activation| {
                     activation.token.cancel();
+                    activation.send.revoke();
                     activation.generation
                 })
                 .collect()
@@ -1002,18 +1016,24 @@ pub(crate) mod publication {
         /// Registers the activation about to be admitted, before its admission
         /// transaction. The caller holds the dispatch gate and the effects slot,
         /// and then calls [`Self::admitted`] or [`Self::abandon`].
-        pub(crate) fn register(&self, vm: Id, owner: &str) -> (u64, Shutdown) {
+        pub(crate) fn register(&self, vm: Id, owner: &str) -> Ticket {
             let mut activations = self.activations();
             activations.issued += 1;
             let generation = activations.issued;
             let token = Shutdown::default();
+            let send = Arc::<SendGate>::default();
             activations.pending = Some(Activation {
                 generation,
                 vm,
                 owner: owner.to_owned(),
                 token: token.clone(),
+                send: send.clone(),
             });
-            (generation, token)
+            Ticket {
+                generation,
+                revoked: token,
+                send,
+            }
         }
 
         /// The registered activation was admitted and is now current.
@@ -1220,13 +1240,12 @@ pub(crate) mod publication {
             intent: Intent,
             prepared: Prepared,
             origin: Origin,
-            (generation, revoked): (u64, &Shutdown),
+            ticket: &Ticket,
             shutdown: &Shutdown,
         ) -> Result<()> {
+            let (generation, revoked) = (ticket.generation, &ticket.revoked);
             let result = self
-                .activate(
-                    controller, &intent, prepared, &origin, generation, revoked, shutdown,
-                )
+                .activate(controller, &intent, prepared, &origin, ticket, shutdown)
                 .await;
             let authorized =
                 || origin.current() && !shutdown.is_cancelled() && !revoked.is_cancelled();
@@ -1310,10 +1329,10 @@ pub(crate) mod publication {
             intent: &Intent,
             prepared: Prepared,
             origin: &Origin,
-            generation: u64,
-            revoked: &Shutdown,
+            ticket: &Ticket,
             shutdown: &Shutdown,
         ) -> Result<(), (Failure, Evidence)> {
+            let (generation, revoked) = (ticket.generation, &ticket.revoked);
             #[cfg(test)]
             let _ = hold(&self.activate_gate).await;
             let route = route(intent).map_err(|failure| (failure, Evidence::Unknown))?;
@@ -1381,23 +1400,26 @@ pub(crate) mod publication {
                 } else {
                     Failure::OriginUnavailable
                 };
-                let failure =
-                    match controller.update_publication(&intent.nonce, Update::PostWithdrawn) {
-                        Ok(()) => failure,
-                        Err(_) => Failure::CleanupUnconfirmed,
-                    };
+                // A failed withdrawal never replaces the cause: the
+                // nonce-scoped proof recorded above releases the intent
+                // without DNS once the store accepts a write.
+                let _withdrawn = controller
+                    .update_publication(&intent.nonce, Update::PostWithdrawn)
+                    .is_ok();
                 return Err((failure, Evidence::NotSubmitted));
             }
             #[cfg(test)]
             let _ = hold(&self.submit_gate).await;
-            // The POST may reach Cloudflare only after its commit point, which
-            // the transport claims immediately before the first request byte,
-            // after connection and TLS setup. The commit re-samples owner
-            // revocation, origin retirement and shutdown. Anything that ends
-            // the request before that point (any cancellation, or a connection
-            // failure) is provably unsent. After it, an owner revocation lets
-            // the POST complete or time out and its acknowledged ID is then
-            // removed, while retirement or shutdown leaves it possible.
+            // The POST may reach Cloudflare only once the underlying transport
+            // accepts its first byte, below TLS and after connection setup.
+            // That first write is arbitrated against owner revocation under the
+            // activation's send gate and re-samples origin retirement and
+            // shutdown on every attempt. Anything that ends the request before
+            // a byte is accepted (any cancellation, a pending write, or a
+            // zero-progress failure) is provably unsent. After it, an owner
+            // revocation lets the POST complete or time out and its
+            // acknowledged ID is then removed, while retirement or shutdown
+            // leaves it possible.
             let cause = || {
                 if origin.retired.is_cancelled() {
                     Some(Failure::OriginUnavailable)
@@ -1408,15 +1430,15 @@ pub(crate) mod publication {
                 }
             };
             let cancelled = || cause().is_some();
-            let submission = Submission::new(&cancelled);
+            let submission = Submission::new(ticket.send.clone(), &cancelled);
             let id = tokio::select! {
                 biased;
                 _ = origin.retired.cancelled() => Err(None),
                 _ = shutdown.cancelled() => Err(None),
-                // Owner revocation abandons the POST only before its commit.
+                // Owner revocation abandons the POST only while it is unsent.
                 _ = async {
                     revoked.cancelled().await;
-                    if submission.committed() {
+                    if submission.sent() == Sent::Possibly {
                         std::future::pending::<()>().await;
                     }
                 } => Err(None),
@@ -1424,7 +1446,7 @@ pub(crate) mod publication {
             };
             let id = match id {
                 Ok(id) => id,
-                Err(error) if submission.committed() => {
+                Err(error) if submission.sent() == Sent::Possibly => {
                     return Err(match error {
                         Some(error) => map(error),
                         None => (cause().unwrap_or(Failure::Cancelled), Evidence::Unknown),
@@ -1435,12 +1457,11 @@ pub(crate) mod publication {
                         .or(error.map(|error| map(error).0))
                         .unwrap_or(Failure::Cancelled);
                     self.set_unsubmitted(Some(&intent.nonce));
-                    let failure =
-                        match controller.update_publication(&intent.nonce, Update::PostWithdrawn) {
-                            Ok(()) => cause,
-                            Err(_) => Failure::CleanupUnconfirmed,
-                        };
-                    return Err((failure, Evidence::NotSubmitted));
+                    // As above, a failed withdrawal never replaces the cause.
+                    let _withdrawn = controller
+                        .update_publication(&intent.nonce, Update::PostWithdrawn)
+                        .is_ok();
+                    return Err((cause, Evidence::NotSubmitted));
                 }
             };
             // The acknowledged ID is durable before verification, so a failed
@@ -1664,8 +1685,10 @@ pub(crate) mod publication {
         pub(crate) record: Arc<std::sync::atomic::AtomicBool>,
         pub(crate) post_gate: std::sync::Mutex<Option<FakeGate>>,
         /// Parks the next create during connection and TLS setup, before its
-        /// commit point.
+        /// first write.
         pub(crate) tls_gate: std::sync::Mutex<Option<FakeGate>>,
+        /// The next first write fails with zero bytes accepted.
+        pub(crate) first_write_error: std::sync::atomic::AtomicBool,
         pub(crate) preflight_gate: std::sync::Mutex<Option<FakeGate>>,
         /// The next POST commits only after release, in a task that outlives
         /// the abandoned request, and never acknowledges.
@@ -1757,7 +1780,16 @@ pub(crate) mod publication {
             use std::sync::atomic::Ordering::SeqCst;
             // Connection and TLS setup: nothing is written yet.
             hold(&self.tls_gate).await?;
-            if !submission.commit() {
+            // One attempt of the first underlying write.
+            let failing = self.first_write_error.swap(false, SeqCst);
+            let written = submission.first_write(|| {
+                std::task::Poll::Ready(if failing {
+                    Err(std::io::Error::other("zero-byte first write failure"))
+                } else {
+                    Ok(1)
+                })
+            });
+            if !matches!(written, std::task::Poll::Ready(Ok(_))) {
                 return Err(DnsError::Unavailable);
             }
             assert!(

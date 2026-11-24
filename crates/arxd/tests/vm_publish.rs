@@ -37,7 +37,8 @@ mod vm {
     use publish::{
         Hostname, TunnelId,
         cloudflare::{
-            CloudflareDns, DnsApi, DnsBearer, DnsError, Reconciled, Removal, Route, Submission,
+            CloudflareDns, DnsApi, DnsBearer, DnsError, Reconciled, Removal, Route, SendGate, Sent,
+            Submission,
         },
     };
     use serde_json::{Value, json};
@@ -375,8 +376,8 @@ mod vm {
         .unwrap();
     }
 
-    /// The commit point follows connection setup: a cancellation observed there writes no
-    /// request byte at all.
+    /// The first-write authority follows connection setup: a cancellation or an owner
+    /// revocation observed there writes no request byte at all.
     #[tokio::test]
     async fn dns_create_writes_nothing_once_cancelled_before_the_first_byte() {
         use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
@@ -385,21 +386,29 @@ mod vm {
             let route = route();
             let cancelled = AtomicBool::new(true);
             let observe = || cancelled.load(SeqCst);
-            let withheld = Submission::new(&observe);
+            let withheld = Submission::new(Arc::default(), &observe);
             assert_eq!(
                 fake.client.create(&route, &withheld).await,
                 Err(DnsError::Unavailable)
             );
-            assert!(!withheld.committed());
+            assert_eq!(withheld.sent(), Sent::Never);
+            cancelled.store(false, SeqCst);
+            let gate = Arc::new(SendGate::default());
+            assert!(gate.revoke());
+            let revoked = Submission::new(gate.clone(), &observe);
+            assert_eq!(
+                fake.client.create(&route, &revoked).await,
+                Err(DnsError::Unavailable)
+            );
+            assert_eq!(gate.sent(), Sent::Never);
             {
                 let state = fake.state.lock().unwrap();
                 assert_eq!(state.post_count, 0);
                 assert!(state.records.is_empty());
             }
-            cancelled.store(false, SeqCst);
-            let allowed = Submission::new(&observe);
+            let allowed = Submission::new(Arc::default(), &observe);
             fake.client.create(&route, &allowed).await.unwrap();
-            assert!(allowed.committed());
+            assert_eq!(allowed.sent(), Sent::Possibly);
             assert_eq!(fake.state.lock().unwrap().post_count, 1);
         })
         .await
@@ -1410,53 +1419,87 @@ mod vm {
                 hang_started.elapsed(),
                 revoke_started.elapsed()
             );
-            // A failed config write closes the share-exclusive writer before the
-            // guard deletes the file, so nothing is left behind.
+            // A failed config write is removed through the writer's own handle. Each
+            // schedule's probe runs while that exclusive writer is still open.
             let ingress_files = || {
                 fs::read_dir(root)
                     .unwrap()
-                    .filter(|entry| {
-                        entry
-                            .as_ref()
+                    .filter_map(|entry| {
+                        let path = entry.unwrap().path();
+                        path.file_name()
                             .unwrap()
-                            .file_name()
                             .to_string_lossy()
                             .starts_with("ingress-")
+                            .then_some(path)
                     })
-                    .count()
+                    .collect::<Vec<_>>()
             };
-            assert_eq!(ingress_files(), 0);
-            // A same-login reader that tries to open the failed file, denying delete
-            // sharing, just before the writer closes.
-            let probed: Arc<std::sync::Mutex<Option<std::io::Result<fs::File>>>> = Arc::default();
-            {
-                let probed = probed.clone();
+            assert!(ingress_files().is_empty());
+            type Probed = Arc<std::sync::Mutex<Option<std::io::Result<()>>>>;
+            let failed_write = |probe: Box<dyn FnOnce(&Path) + Send>| async {
                 *super::publish::connector::FAILED_WRITE_PROBE
                     .lock()
-                    .unwrap() = Some(Box::new(move |path: &Path| {
-                    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
-                    *probed.lock().unwrap() = Some(
-                        fs::OpenOptions::new()
-                            .read(true)
-                            .share_mode(FILE_SHARE_READ)
-                            .open(path),
-                    );
-                }));
-            }
-            super::publish::connector::FAIL_CONFIG_WRITE
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            let error = match timeout(LEG, Connector::start(&plan))
-                .await
-                .expect("failed config write exceeded its deadline")
-            {
-                Err(error) => error,
-                Ok(_) => panic!("a failed config write reached the connector"),
+                    .unwrap() = Some(probe);
+                super::publish::connector::FAIL_CONFIG_WRITE
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                match timeout(LEG, Connector::start(&plan))
+                    .await
+                    .expect("failed config write exceeded its deadline")
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("a failed config write reached the connector"),
+                }
             };
+            // A same-login reader denying delete sharing cannot open the file.
+            let probed: Probed = Arc::default();
+            let reader = probed.clone();
+            let error = failed_write(Box::new(move |path: &Path| {
+                use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+                *reader.lock().unwrap() = Some(
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(FILE_SHARE_READ)
+                        .open(path)
+                        .map(drop),
+                );
+            }))
+            .await;
             assert_eq!(error, ConnectorError::Custody);
-            let reader = probed.lock().unwrap().take().expect("probe ran");
-            assert!(reader.is_err(), "a reader opened the failed config");
-            drop(reader);
-            assert_eq!(ingress_files(), 0, "a failed config write left its file");
+            let opened = probed.lock().unwrap().take().expect("probe ran");
+            assert!(opened.is_err(), "a reader opened the failed config");
+            assert!(
+                ingress_files().is_empty(),
+                "a failed config write left its file"
+            );
+            // A same-login metadata change marks the open file read-only.
+            let probed: Probed = Arc::default();
+            let marker = probed.clone();
+            let error = failed_write(Box::new(move |path: &Path| {
+                let mut permissions = fs::metadata(path).unwrap().permissions();
+                permissions.set_readonly(true);
+                *marker.lock().unwrap() = Some(fs::set_permissions(path, permissions));
+            }))
+            .await;
+            let marked = probed.lock().unwrap().take().expect("probe ran");
+            assert!(
+                marked.is_ok(),
+                "the read-only probe did not apply: {marked:?}"
+            );
+            assert_eq!(error, ConnectorError::Custody);
+            assert!(
+                ingress_files().is_empty(),
+                "a read-only failed config was left"
+            );
+            // A removal that cannot be confirmed is a typed cleanup failure. The
+            // residue keeps private custody and no connector is launched.
+            super::publish::windows::FAIL_DISPOSITION
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let error = failed_write(Box::new(|_: &Path| {})).await;
+            assert_eq!(error, ConnectorError::CleanupPending);
+            let residue = ingress_files();
+            assert_eq!(residue.len(), 1, "the unremoved residue is not visible");
+            assert_secured("unremoved ingress residue", &residue[0]);
+            fs::remove_file(&residue[0]).unwrap();
             assert_gone(&witness_path, 5);
             origin_task.abort();
         }

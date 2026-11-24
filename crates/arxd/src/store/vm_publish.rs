@@ -156,6 +156,28 @@ impl Phase {
     }
 }
 
+/// The release cause after owner-cause precedence: a durable owner
+/// cancellation on the intent wins over the reason a cleanup supplies.
+pub(crate) fn effective_cause(
+    db: &Connection,
+    nonce: &str,
+    reason: Option<FailureReason>,
+) -> Result<Option<FailureReason>> {
+    let durable: Option<i64> = db
+        .query_row(
+            "SELECT cleanup_reason FROM vm_publication WHERE nonce=?1",
+            [nonce],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(if durable == Some(FailureReason::Cancelled as i64) {
+        Some(FailureReason::Cancelled)
+    } else {
+        reason
+    })
+}
+
 pub(crate) fn current(db: &Connection) -> Result<Option<Intent>> {
     Ok(db
         .query_row(
@@ -236,15 +258,30 @@ pub(crate) fn update(db: &Connection, nonce: &str, change: Update<'_>) -> Result
             "UPDATE vm_publication SET record=?2 WHERE nonce=?1 AND post_possible=1 AND (record IS NULL OR record=?2)",
             params![nonce,id],
         )?,
+        // A recorded owner cause has precedence: a later null or generic
+        // cleanup reason never erases it, and a null keeps any earlier reason.
         Update::Phase(phase, reason) => db.execute(
-            "UPDATE vm_publication SET phase=?2,cleanup_reason=?3 WHERE nonce=?1",
-            params![nonce,phase.wire(),reason.map(|value| value as i64)],
+            "UPDATE vm_publication SET phase=?2,cleanup_reason=coalesce(
+                 CASE WHEN cleanup_reason=?4 THEN cleanup_reason END,?3,cleanup_reason)
+             WHERE nonce=?1",
+            params![
+                nonce,
+                phase.wire(),
+                reason.map(|value| value as i64),
+                FailureReason::Cancelled as i64
+            ],
         )?,
         Update::Released(reason) => {
             db.execute(
-                "UPDATE vm_static_instances SET publication_failure=?2
+                "UPDATE vm_static_instances SET publication_failure=coalesce(
+                     (SELECT CASE WHEN cleanup_reason=?3 THEN cleanup_reason END
+                      FROM vm_publication WHERE nonce=?1),?2)
                  WHERE id=(SELECT vm FROM vm_publication WHERE nonce=?1)",
-                params![nonce, reason.map(|value| value as i64)],
+                params![
+                    nonce,
+                    reason.map(|value| value as i64),
+                    FailureReason::Cancelled as i64
+                ],
             )?;
             db.execute("DELETE FROM vm_publication WHERE nonce=?1", [nonce])?
         }
