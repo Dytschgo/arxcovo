@@ -88,14 +88,10 @@ impl Bundle {
         Ok(file_identity(file, false).map_err(|_| REFUSAL)?.0)
     }
 
-    pub(super) fn protected(
-        &self,
-        token: &VmToken,
-        deadline: Instant,
-    ) -> Result<(), NativeRefusal> {
+    pub(super) fn protected(&self, owner: PSID, deadline: Instant) -> Result<(), NativeRefusal> {
         if !std::iter::once(&self.root.leaf)
             .chain(self.directories.values())
-            .all(|dir| Instant::now() < deadline && protected_directory(dir, token.account.0))
+            .all(|dir| Instant::now() < deadline && protected_directory(dir, owner))
         {
             return Err(REFUSAL);
         }
@@ -132,6 +128,15 @@ pub(super) fn protected_directory(dir: &File, owner: PSID) -> bool {
     if status != ERROR_SUCCESS {
         return false;
     }
+    // GetSecurityInfo owns both values until LocalFree.
+    let protected = unsafe { protected_descriptor(actual_owner, dacl, owner) };
+    unsafe { LocalFree(descriptor) };
+    protected
+}
+
+/// All non-null pointers are backed by a live Windows security descriptor
+/// or by the enrolled account SID.
+unsafe fn protected_descriptor(actual_owner: PSID, dacl: *const ACL, owner: PSID) -> bool {
     // Untrusted principals cannot change the DACL, delete children or add
     // entries. The verified CurrentUser token and its child have no enabled
     // administrators group. Same-account tampering is outside this boundary.
@@ -139,7 +144,7 @@ pub(super) fn protected_directory(dir: &File, owner: PSID) -> bool {
         IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
             || IsWellKnownSid(sid, WinLocalSystemSid) != 0
     };
-    let protected = unsafe {
+    unsafe {
         !dacl.is_null()
             && !actual_owner.is_null()
             && (EqualSid(actual_owner, owner) != 0 || trusted_writer(actual_owner))
@@ -164,9 +169,7 @@ pub(super) fn protected_directory(dir: &File, owner: PSID) -> bool {
                     _ => false,
                 }
             })
-    };
-    unsafe { LocalFree(descriptor) };
-    protected
+    }
 }
 
 impl Bundle {
@@ -353,21 +356,21 @@ fn sha256_spelling(digest: &str) -> Option<[u8; 32]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::fs;
 
-    const NAME: &str = "share/Firmware.bin";
+    pub(super) const NAME: &str = "share/Firmware,ROM.bin";
     const BYTES: &[u8] = b"reviewed firmware fixture";
 
-    struct Fixture {
-        root: tempfile::TempDir,
+    pub(in crate::vm::windows::qualification) struct Fixture {
+        pub(in crate::vm::windows::qualification) root: tempfile::TempDir,
         path: LocalPath,
         manifest: String,
     }
 
     impl Fixture {
-        fn new() -> Self {
+        pub(in crate::vm::windows::qualification) fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
             let path = local(root.path().to_str().unwrap()).unwrap();
             fs::create_dir(root.path().join("share")).unwrap();
@@ -382,7 +385,10 @@ mod tests {
             }
         }
 
-        fn inspect(&self, deadline: Instant) -> Result<Bundle, NativeRefusal> {
+        pub(in crate::vm::windows::qualification) fn inspect(
+            &self,
+            deadline: Instant,
+        ) -> Result<Bundle, NativeRefusal> {
             let mut bundle = Bundle::open(&self.path)?;
             bundle.add_file("RECEIPT.txt")?;
             bundle.add_file("MANIFEST.sha256")?;
@@ -430,6 +436,121 @@ mod tests {
         assert!(parse_manifest(too_long.as_bytes(), 1).is_none());
         assert!(parse_manifest(valid.as_bytes(), 1).is_none());
         assert!(parse_manifest(&[b'a'; MAX_MANIFEST_BYTES + 1], 2).is_none());
+    }
+
+    pub(in crate::vm::windows::qualification) const READ_ONLY: &str =
+        "D:P(A;OICI;GRGX;;;WD)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+    pub(in crate::vm::windows::qualification) const WRITABLE: &str = "D:P(A;OICI;GA;;;WD)";
+
+    struct Descriptor(PSECURITY_DESCRIPTOR);
+
+    impl Descriptor {
+        fn from_sddl(sddl: &str) -> Self {
+            use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+            let mut descriptor = null_mut();
+            succeeded(unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide(sddl).as_ptr(),
+                    1,
+                    &mut descriptor,
+                    null_mut(),
+                )
+            })
+            .unwrap();
+            Self(descriptor)
+        }
+
+        fn dacl(&self) -> *mut ACL {
+            let (mut present, mut defaulted, mut dacl) = (0, 0, null_mut());
+            succeeded(unsafe {
+                GetSecurityDescriptorDacl(self.0, &mut present, &mut dacl, &mut defaulted)
+            })
+            .unwrap();
+            dacl
+        }
+    }
+
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    pub(in crate::vm::windows::qualification) fn set_dacl(path: &Path, sddl: &str) {
+        use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+        let descriptor = Descriptor::from_sddl(sddl);
+        assert_eq!(
+            unsafe {
+                SetNamedSecurityInfoW(
+                    wide(path).as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    descriptor.dacl(),
+                    null_mut(),
+                )
+            },
+            ERROR_SUCCESS
+        );
+    }
+
+    #[test]
+    fn directory_policy_requires_an_enrolled_or_system_owner() {
+        let owner = canonical_sid("S-1-5-21-1-2-3-1001").unwrap();
+        let foreign = canonical_sid("S-1-5-21-1-2-3-1002").unwrap();
+        let system = canonical_sid("S-1-5-18").unwrap();
+        let acl = Descriptor::from_sddl(READ_ONLY);
+        assert!(unsafe { protected_descriptor(owner.0, acl.dacl(), owner.0) });
+        assert!(unsafe { protected_descriptor(system.0, acl.dacl(), owner.0) });
+        assert!(!unsafe { protected_descriptor(foreign.0, acl.dacl(), owner.0) });
+    }
+
+    #[test]
+    fn directory_policy_refuses_unknown_ace_types() {
+        let owner = canonical_sid("S-1-5-21-1-2-3-1001").unwrap();
+        let acl = Descriptor::from_sddl(
+            "D:P(OD;;GW;a5140930-5512-42d8-aa70-7d472a726228;;WD)(A;;GRGX;;;WD)",
+        );
+        assert!(!unsafe { protected_descriptor(owner.0, acl.dacl(), owner.0) });
+    }
+
+    #[test]
+    fn directory_policy_refuses_own_sid_writes_inherit_only_writes_and_null_dacl() {
+        let raw = "S-1-5-21-1-2-3-1001";
+        let owner = canonical_sid(raw).unwrap();
+        for sddl in [
+            format!("D:P(A;;GRGX;;;WD)(A;;GW;;;{raw})"),
+            "D:P(A;;GRGX;;;WD)(A;OICIIO;GA;;;CO)".to_owned(),
+            "D:P(D;;GW;;;WD)(A;;GRGW;;;WD)".to_owned(),
+            "D:NO_ACCESS_CONTROL".to_owned(),
+        ] {
+            let acl = Descriptor::from_sddl(&sddl);
+            assert!(
+                !unsafe { protected_descriptor(owner.0, acl.dacl(), owner.0) },
+                "{sddl}"
+            );
+        }
+    }
+
+    #[test]
+    fn distribution_opens_and_lists_only_through_held_directories() {
+        let held = Fixture::new();
+        let sibling = Fixture::new();
+        fs::remove_file(held.root.path().join(NAME)).unwrap();
+        fs::write(sibling.root.path().join("share/sibling.bin"), BYTES).unwrap();
+        assert!(sibling.root.path().join(NAME).is_file());
+        held.refuse();
+
+        fs::write(held.root.path().join(NAME), BYTES).unwrap();
+        let mut bundle = held.inspect(Instant::now() + INVENTORY_TIME).unwrap();
+        // The advisory spelling now points at a distinct directory with
+        // an extra entry. Only the held tree may answer the inventory.
+        bundle.root.path = sibling.path.clone();
+        assert!(bundle.check(Instant::now() + INVENTORY_TIME).is_ok());
+        fs::write(held.root.path().join("share/held-only.bin"), BYTES).unwrap();
+        assert!(!sibling.root.path().join("share/held-only.bin").exists());
+        assert_eq!(bundle.check(Instant::now() + INVENTORY_TIME), Err(REFUSAL));
     }
 
     #[test]
@@ -499,7 +620,11 @@ mod tests {
 
     #[test]
     fn inventory_refuses_missing_renamed_and_case_variant_files() {
-        for replacement in [None, Some("share/another.bin"), Some("share/firmware.bin")] {
+        for replacement in [
+            None,
+            Some("share/another.bin"),
+            Some("share/firmware,rom.bin"),
+        ] {
             let f = Fixture::new();
             let original = f.root.path().join(NAME);
             if let Some(replacement) = replacement {
@@ -526,7 +651,7 @@ mod tests {
     fn inventory_refuses_a_junction_even_when_its_target_bytes_match() {
         let f = Fixture::new();
         let target = tempfile::tempdir().unwrap();
-        fs::write(target.path().join("Firmware.bin"), BYTES).unwrap();
+        fs::write(target.path().join("Firmware,ROM.bin"), BYTES).unwrap();
         let junction = f.root.path().join("share");
         fs::remove_file(f.root.path().join(NAME)).unwrap();
         fs::remove_dir(&junction).unwrap();

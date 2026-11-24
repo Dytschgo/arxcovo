@@ -153,6 +153,10 @@ pub(crate) trait Collectors<S: Source> {
     fn implemented(&self, _stage: Stage) -> bool {
         true
     }
+    /// Project a row from an already completed effect without dispatching again.
+    fn previous_effect(&mut self, _stage: Stage) -> Option<Collected> {
+        None
+    }
     /// The store stage's record, and the proof only when it was produced.
     fn store(&mut self) -> (Collected, Option<S::Store>);
     fn plan(&mut self, stage: Stage) -> EffectPlan;
@@ -423,24 +427,29 @@ impl<S: Source> State<S> {
                 StageKind::Effect if !collectors.implemented(stage) => {
                     Collected::at(self.driver_ms(now), StageResult::Unimplemented)
                 }
-                StageKind::Effect => match self.admit(stage, collectors) {
-                    Err(reason) => Collected::at(self.driver_ms(now), StageResult::Failed(reason)),
-                    Ok((plan, captured)) => {
-                        // Recheck immediately before dispatch: planning and
-                        // live collection take time of their own.
-                        let at = clock.now();
-                        match self.dispatchable(captured, at, clock) {
-                            Some(reason) => {
-                                Collected::at(self.driver_ms(at), StageResult::Failed(reason))
-                            }
-                            None => {
-                                self.dispatched = self.dispatched.saturating_add(1);
-                                let store =
-                                    self.store.as_ref().expect("admission requires the store");
-                                collectors.effect(stage, plan, store)
+                StageKind::Effect => match collectors.previous_effect(stage) {
+                    Some(collected) => collected,
+                    None => match self.admit(stage, collectors) {
+                        Err(reason) => {
+                            Collected::at(self.driver_ms(now), StageResult::Failed(reason))
+                        }
+                        Ok((plan, captured)) => {
+                            // Recheck immediately before dispatch: planning and
+                            // live collection take time of their own.
+                            let at = clock.now();
+                            match self.dispatchable(captured, at, clock) {
+                                Some(reason) => {
+                                    Collected::at(self.driver_ms(at), StageResult::Failed(reason))
+                                }
+                                None => {
+                                    self.dispatched = self.dispatched.saturating_add(1);
+                                    let store =
+                                        self.store.as_ref().expect("admission requires the store");
+                                    collectors.effect(stage, plan, store)
+                                }
                             }
                         }
-                    }
+                    },
                 },
                 StageKind::Cleanup => unreachable!("cleanup is settled below"),
             };

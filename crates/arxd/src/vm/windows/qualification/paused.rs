@@ -3,8 +3,7 @@
 
 mod native;
 
-pub(super) use native::run_native;
-pub use native::{PausedTrial, PausedVerdict};
+pub use native::{PausedPhase, PausedTrial, PausedTrialPermit, PausedVerdict};
 
 use super::*;
 use crate::vm::{qmp::bounded, runtime::capacity};

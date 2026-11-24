@@ -232,6 +232,7 @@ const OBSERVATIONS: &[(&str, &[(&str, Shape)])] = &[
         ],
     ),
     ("whpx", &[("present", Shape::Bool)]),
+    ("paused_store", &[("validated", Shape::Bool)]),
     ("paused_trial", &[("verified", Shape::Bool)]),
     (
         "cleanup",
@@ -334,7 +335,7 @@ fn rules(file: DiagnosticFile) -> Rules {
                 "supervisor_loss_release",
                 "capacity_trials",
             ],
-            &["capacity", "paused_trial"],
+            &["capacity", "paused_store", "paused_trial"],
         ),
         F::ActivityReserves => records(
             &["activity_reserves_baseline", "reserve_activity_trials"],

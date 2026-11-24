@@ -10,7 +10,7 @@ mod paused;
 mod schema;
 mod sink;
 
-pub use paused::{PausedTrial, PausedVerdict};
+pub use paused::{PausedPhase, PausedTrial, PausedTrialPermit, PausedVerdict};
 pub use schema::{RECORD_COLLECTOR, RECORD_CONTRACT};
 pub use sink::{DiagnosticFile, Entry, SinkError};
 
@@ -240,6 +240,9 @@ pub struct Preflight {
 ///     let _ = (unwritten, b.scope(), b.run());
 ///     Ok(b.observations())
 /// }
+/// fn permit(b: &arxd::vm::qualification::Baseline) {
+///     let _ = b.prepare_paused_trial();
+/// }
 /// let _ = surface;
 /// let _ = arxd::vm::qualification::preflight;
 /// let _: Option<arxd::vm::runtime::LaunchAuthority> = None;
@@ -263,16 +266,23 @@ struct Held {
 }
 
 impl Baseline {
-    /// Run the owner-local, diskless and networkless diagnostic. The
-    /// enrollment, exact stock pin and held trial store must still pass.
-    pub async fn paused_trial(&self, cancel: &Shutdown) -> PausedTrial {
-        paused::run_native(self, cancel).await
+    /// Prepare the fixed owner-local trial from held, explicitly enrolled
+    /// prerequisites. The caller must consume its permit to dispatch.
+    ///
+    /// The permit cannot be constructed by a caller:
+    ///
+    /// ```compile_fail,E0603
+    /// let permit = arxd::vm::qualification::PausedTrialPermit(());
+    /// ```
+    pub fn prepare_paused_trial(&self) -> Result<PausedTrialPermit<'_>, NativeRefusal> {
+        PausedTrialPermit::prepare(self)
     }
 
     /// Check live owner activity before dispatching the paused operation.
     pub fn paused_live(&self) -> Result<Instant, NativeRefusal> {
+        require_paused(self._held.paused)?;
         let captured = Instant::now();
-        if !self._held.paused || !current_console_idle(&self._held.token)? {
+        if !current_console_idle(&self._held.token)? {
             return Err(NativeRefusal::OwnerActivityUnverified);
         }
         Ok(captured)
@@ -404,6 +414,12 @@ pub fn preflight(enrollment_file: &str, evidence_dir: &str) -> Result<Baseline, 
     )
 }
 
+fn require_paused(paused: bool) -> Result<(), NativeRefusal> {
+    paused
+        .then_some(())
+        .ok_or(NativeRefusal::DistributionUnverified)
+}
+
 /// Preflight for the explicit paused-trial entry point in the owner runner.
 pub fn preflight_paused(enrollment: &str, evidence: &str) -> Result<Baseline, NativeRefusal> {
     preflight_with(&capacity::MountManager, enrollment, evidence, true)
@@ -532,7 +548,7 @@ fn preflight_with(
             let bundle = bundle_pins
                 .as_ref()
                 .ok_or(NativeRefusal::DistributionUnverified)?;
-            bundle.protected(&token, Instant::now() + Duration::from_secs(2))?;
+            bundle.protected(token.account.0, Instant::now() + Duration::from_secs(2))?;
             let measured = measure()?;
             empty_job()?;
             Ok(measured)
@@ -1065,6 +1081,15 @@ fn listing_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_mode_cannot_enter_paused_preparation_or_live_sampling() {
+        assert_eq!(
+            require_paused(false),
+            Err(NativeRefusal::DistributionUnverified)
+        );
+        assert_eq!(require_paused(true), Ok(()));
+    }
 
     #[test]
     fn canonical_sid_round_trips_only_exact_spellings() {

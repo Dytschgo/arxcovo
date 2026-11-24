@@ -8,7 +8,8 @@ use crate::trial::*;
 #[cfg(test)]
 use arxd::vm::qualification::DiagnosticFile;
 use arxd::vm::qualification::{
-    self, Baseline, Entry, PausedTrial, PausedVerdict, Preflight, Taken,
+    self, Baseline, Entry, PausedPhase, PausedTrial, PausedTrialPermit, PausedVerdict, Preflight,
+    Taken,
 };
 use arxd::{
     service::Shutdown,
@@ -319,6 +320,7 @@ pub(crate) struct PausedCollectors<'a> {
     baseline: &'a Baseline,
     projected: NativeCollectors,
     runtime: Option<&'a tokio::runtime::Runtime>,
+    permit: Option<PausedTrialPermit<'a>>,
     result: Option<PausedTrial>,
 }
 
@@ -331,6 +333,7 @@ impl<'a> PausedCollectors<'a> {
             baseline,
             projected: NativeCollectors::new(baseline.observations(), baseline.origin()),
             runtime,
+            permit: None,
             result: None,
         }
     }
@@ -342,24 +345,39 @@ impl Collectors<Native> for PausedCollectors<'_> {
     }
 
     fn store(&mut self) -> (Collected, Option<PausedStore>) {
-        let open =
-            self.runtime.is_some() && observed(&self.baseline.observations().limits).is_some();
-        let result = if open {
-            StageResult::Passed(Observation::PausedTrial { verified: true })
+        let prepared = if self.runtime.is_some() {
+            self.baseline.prepare_paused_trial()
         } else {
-            StageResult::Failed(Diagnostic::DistributionUnverified)
+            Err(NativeRefusal::DistributionUnverified)
         };
-        (
-            Collected::at(self.projected.now_ms(), result),
-            open.then_some(PausedStore(())),
-        )
+        let (result, proof) = match prepared {
+            Ok(permit) => {
+                self.permit = Some(permit);
+                (
+                    StageResult::Passed(Observation::PausedStore { validated: true }),
+                    Some(PausedStore(())),
+                )
+            }
+            Err(reason) => (StageResult::Failed(refused(reason)), None),
+        };
+        (Collected::at(self.projected.now_ms(), result), proof)
     }
 
     fn implemented(&self, stage: Stage) -> bool {
+        paused_phase(stage).is_some()
+    }
+
+    fn previous_effect(&mut self, stage: Stage) -> Option<Collected> {
         matches!(
             stage,
-            Stage::SuspendedChild | Stage::QemuPrelaunchPause | Stage::HeldBundleInventory
+            Stage::QemuPrelaunchPause | Stage::HeldBundleInventory
         )
+        .then(|| {
+            Collected::at(
+                self.projected.now_ms(),
+                project_paused(stage, self.result.as_ref()),
+            )
+        })
     }
 
     fn plan(&mut self, _: Stage) -> EffectPlan {
@@ -375,9 +393,10 @@ impl Collectors<Native> for PausedCollectors<'_> {
 
     fn effect(&mut self, stage: Stage, _: EffectPlan, _: &PausedStore) -> Collected {
         let started_ms = self.projected.now_ms();
-        if stage == Stage::SuspendedChild
-            && let Some(runtime) = self.runtime
-        {
+        if stage != Stage::SuspendedChild {
+            return Collected::at(started_ms, StageResult::Unimplemented);
+        }
+        if let (Some(runtime), Some(permit)) = (self.runtime, self.permit.take()) {
             // Startup, paused QMP, inventory recheck and stop are one held
             // operation. Subsequent rows only project its verified result.
             self.result = Some(runtime.block_on(async {
@@ -388,22 +407,12 @@ impl Collectors<Native> for PausedCollectors<'_> {
                         signal.cancel();
                     }
                 });
-                let result = self.baseline.paused_trial(&cancel).await;
+                let result = permit.run(&cancel).await;
                 interrupt.abort();
                 result
             }));
         }
-        let result = match self.result.as_ref().map(|trial| &trial.verdict) {
-            Some(PausedVerdict::Verified) => {
-                StageResult::Passed(Observation::PausedTrial { verified: true })
-            }
-            Some(PausedVerdict::Refused(reason)) => StageResult::Failed(refused(*reason)),
-            Some(PausedVerdict::OwnerActive) => StageResult::Failed(Diagnostic::OwnerActive),
-            Some(PausedVerdict::Qmp) => StageResult::Failed(Diagnostic::OtherRefusal),
-            Some(PausedVerdict::Timeout) => StageResult::Failed(Diagnostic::Expired),
-            Some(PausedVerdict::Cancelled) => StageResult::Failed(Diagnostic::Cancelled),
-            None => StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
-        };
+        let result = project_paused(stage, self.result.as_ref());
         Collected {
             started_ms,
             finished_ms: self.projected.now_ms(),
@@ -412,15 +421,54 @@ impl Collectors<Native> for PausedCollectors<'_> {
     }
 
     fn cleanup(&mut self, _: u16) -> Teardown {
-        if self
-            .result
-            .as_ref()
-            .is_some_and(|run| run.release == StopDisposition::ChargedQuarantine)
-        {
-            Teardown::Uncertain
-        } else {
-            Teardown::Released
-        }
+        paused_teardown(self.result.as_ref())
+    }
+}
+
+fn paused_phase(stage: Stage) -> Option<PausedPhase> {
+    match stage {
+        Stage::SuspendedChild => Some(PausedPhase::SuspendedChild),
+        Stage::QemuPrelaunchPause => Some(PausedPhase::Prelaunch),
+        Stage::HeldBundleInventory => Some(PausedPhase::BundleInventory),
+        _ => None,
+    }
+}
+
+fn project_paused(stage: Stage, trial: Option<&PausedTrial>) -> StageResult {
+    let Some(phase) = paused_phase(stage) else {
+        return StageResult::Unimplemented;
+    };
+    let Some(trial) = trial else {
+        return StageResult::Inconclusive(Diagnostic::PrerequisiteMissing);
+    };
+    let pass = StageResult::Passed(Observation::PausedTrial { verified: true });
+    if matches!(
+        (phase, trial.phase),
+        (
+            PausedPhase::SuspendedChild,
+            PausedPhase::Prelaunch | PausedPhase::BundleInventory
+        ) | (PausedPhase::Prelaunch, PausedPhase::BundleInventory)
+    ) {
+        return pass;
+    }
+    if phase != trial.phase {
+        return StageResult::Inconclusive(Diagnostic::PrerequisiteMissing);
+    }
+    match trial.verdict {
+        PausedVerdict::Verified => pass,
+        PausedVerdict::Refused(reason) => StageResult::Failed(refused(reason)),
+        PausedVerdict::OwnerActive => StageResult::Failed(Diagnostic::OwnerActive),
+        PausedVerdict::Qmp => StageResult::Failed(Diagnostic::OtherRefusal),
+        PausedVerdict::Timeout => StageResult::Failed(Diagnostic::Expired),
+        PausedVerdict::Cancelled => StageResult::Failed(Diagnostic::Cancelled),
+    }
+}
+
+fn paused_teardown(trial: Option<&PausedTrial>) -> Teardown {
+    if trial.is_some_and(|trial| trial.release == StopDisposition::ChargedQuarantine) {
+        Teardown::Uncertain
+    } else {
+        Teardown::Released
     }
 }
 
@@ -538,4 +586,41 @@ pub(crate) fn run(enrollment: &str, evidence: &str, paused: bool) -> Result<Outc
     trial.drive_native(runtime.as_ref(), &clock);
     publish_incomplete(&trial, &mut BaselineSink(trial.custody()))?;
     Ok(Outcome::Incomplete)
+}
+
+#[cfg(test)]
+mod paused_tests {
+    use super::*;
+
+    #[test]
+    fn projections_are_limited_to_completed_paused_phases() {
+        let mut trial = PausedTrial {
+            phase: PausedPhase::BundleInventory,
+            verdict: PausedVerdict::Refused(NativeRefusal::DistributionUnverified),
+            release: StopDisposition::ChargedQuarantine,
+        };
+        let pass = StageResult::Passed(Observation::PausedTrial { verified: true });
+        assert_eq!(project_paused(Stage::SuspendedChild, Some(&trial)), pass);
+        assert_eq!(
+            project_paused(Stage::QemuPrelaunchPause, Some(&trial)),
+            pass
+        );
+        assert_eq!(
+            project_paused(Stage::HeldBundleInventory, Some(&trial)),
+            StageResult::Failed(Diagnostic::DistributionUnverified)
+        );
+        assert!(matches!(paused_teardown(Some(&trial)), Teardown::Uncertain));
+        trial.verdict = PausedVerdict::Verified;
+        trial.release = StopDisposition::DirtyRelease;
+        assert_eq!(
+            project_paused(Stage::HeldBundleInventory, Some(&trial)),
+            pass
+        );
+        assert_eq!(
+            project_paused(Stage::FirstGuestExecution, Some(&trial)),
+            StageResult::Unimplemented
+        );
+        assert!(matches!(paused_teardown(Some(&trial)), Teardown::Released));
+        assert!(matches!(paused_teardown(None), Teardown::Released));
+    }
 }

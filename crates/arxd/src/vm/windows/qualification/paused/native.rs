@@ -20,47 +20,62 @@ pub enum PausedVerdict {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PausedPhase {
+    SuspendedChild,
+    Prelaunch,
+    BundleInventory,
+}
+
 pub struct PausedTrial {
     pub verdict: PausedVerdict,
     pub release: StopDisposition,
+    pub phase: PausedPhase,
 }
 
-pub(in crate::vm::windows::qualification) async fn run_native(
-    baseline: &Baseline,
-    cancel: &Shutdown,
-) -> PausedTrial {
-    let prepared = Prepared::new(baseline);
-    let result = match prepared {
-        Ok(mut prepared) => {
-            let plan = PausedPlan {
-                image: &prepared.image,
-                data: &prepared.data,
-                bios: &prepared.bios,
-            };
-            run(
-                &mut prepared.host,
-                &plan,
-                cancel,
-                Tick::now() + Duration::from_secs(15),
-                Duration::from_secs(5),
-            )
-            .await
+/// Consumed by the fixed owner-local trial. A diagnostic baseline cannot
+/// produce this permit, and the held prerequisites are borrowed for its life.
+pub struct PausedTrialPermit<'a>(Prepared<'a>);
+
+impl<'a> PausedTrialPermit<'a> {
+    pub(in crate::vm::windows::qualification) fn prepare(
+        baseline: &'a Baseline,
+    ) -> Result<Self, NativeRefusal> {
+        Prepared::new(baseline).map(Self)
+    }
+
+    pub async fn run(self, cancel: &Shutdown) -> PausedTrial {
+        let Prepared {
+            mut host,
+            image,
+            data,
+            bios,
+        } = self.0;
+        let plan = PausedPlan {
+            image: &image,
+            data: &data,
+            bios: &bios,
+        };
+        let result = run(
+            &mut host,
+            &plan,
+            cancel,
+            Tick::now() + Duration::from_secs(15),
+            Duration::from_secs(5),
+        )
+        .await;
+        PausedTrial {
+            verdict: match result.paused {
+                Ok(()) => PausedVerdict::Verified,
+                Err(Failure::Refused(reason)) => PausedVerdict::Refused(reason),
+                Err(Failure::OwnerActive) => PausedVerdict::OwnerActive,
+                Err(Failure::Qmp(_)) => PausedVerdict::Qmp,
+                Err(Failure::Timeout) => PausedVerdict::Timeout,
+                Err(Failure::Cancelled) => PausedVerdict::Cancelled,
+            },
+            release: result.release,
+            phase: host.phase.get(),
         }
-        Err(reason) => TrialResult {
-            paused: Err(reason.into()),
-            release: StopDisposition::DirtyRelease,
-        },
-    };
-    PausedTrial {
-        verdict: match result.paused {
-            Ok(()) => PausedVerdict::Verified,
-            Err(Failure::Refused(reason)) => PausedVerdict::Refused(reason),
-            Err(Failure::OwnerActive) => PausedVerdict::OwnerActive,
-            Err(Failure::Qmp(_)) => PausedVerdict::Qmp,
-            Err(Failure::Timeout) => PausedVerdict::Timeout,
-            Err(Failure::Cancelled) => PausedVerdict::Cancelled,
-        },
-        release: result.release,
     }
 }
 
@@ -75,7 +90,8 @@ impl<'a> Prepared<'a> {
     fn new(baseline: &'a Baseline) -> Result<Self, NativeRefusal> {
         let held = &baseline._held;
         let reason = NativeRefusal::DistributionUnverified;
-        let bundle = held.bundle.as_ref().filter(|_| held.paused).ok_or(reason)?;
+        require_paused(held.paused)?;
+        let bundle = held.bundle.as_ref().ok_or(reason)?;
         let limits = match &baseline.observations.limits {
             Taken::Observed(limits) => &limits.result,
             Taken::Refused { reason, .. } => return Err(*reason),
@@ -102,6 +118,7 @@ impl<'a> Prepared<'a> {
                 bundle,
                 limits,
                 cwd,
+                phase: Cell::new(PausedPhase::SuspendedChild),
             },
             image,
             data,
@@ -115,6 +132,7 @@ struct Windows<'a> {
     bundle: &'a inventory::Bundle,
     limits: &'a Limits,
     cwd: PathPin,
+    phase: Cell<PausedPhase>,
 }
 
 struct Opens<'a> {
@@ -136,19 +154,46 @@ struct ChildState {
     uncertain: bool,
 }
 
-impl Windows<'_> {
-    fn validate_search_and_bundle(&self, bundle: &inventory::Bundle) -> Result<(), NativeRefusal> {
+struct LaunchGate<'a> {
+    cwd: &'a PathPin,
+    owner: PSID,
+}
+
+impl LaunchGate<'_> {
+    fn validate_search_and_bundle(
+        &self,
+        bundle: &inventory::Bundle,
+        safe_search: bool,
+    ) -> Result<(), NativeRefusal> {
         let deadline = Instant::now() + INVENTORY_TIME;
-        let token = &self.baseline._held.token;
-        if !safe_dll_search()
-            || !inventory::protected_directory(&self.cwd.leaf, token.account.0)
+        if !safe_search
+            || !inventory::protected_directory(&self.cwd.leaf, self.owner)
             || !listing_bounded(&self.cwd.leaf, 0, Some(deadline))
                 .is_ok_and(|entries| entries.is_empty())
         {
             return Err(NativeRefusal::PathCustodyUnverified);
         }
-        inventory::binding(&self.cwd)?;
-        bundle.protected(token, deadline)
+        inventory::binding(self.cwd)?;
+        bundle.protected(self.owner, deadline)
+    }
+
+    fn verify_opens(
+        &self,
+        bundle: &inventory::Bundle,
+        safe_search: bool,
+        verify_live: impl FnOnce() -> Result<(), NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        verify_live()?;
+        self.validate_search_and_bundle(bundle, safe_search)
+    }
+}
+
+impl Windows<'_> {
+    fn launch_gate(&self) -> LaunchGate<'_> {
+        LaunchGate {
+            cwd: &self.cwd,
+            owner: self.baseline._held.token.account.0,
+        }
     }
 
     fn live_limits(&self) -> Result<Limits, NativeRefusal> {
@@ -194,7 +239,8 @@ impl<'a> Host for Windows<'a> {
         }
         let image = self.bundle.identity(IMAGE)?;
         self.bundle.identity("share/bios-256k.bin")?;
-        self.validate_search_and_bundle(self.bundle)?;
+        self.launch_gate()
+            .validate_search_and_bundle(self.bundle, safe_dll_search())?;
         let peak = Peak {
             // Conservative admission headroom for the diskless paused recipe.
             // Live samples continue through the exchange. Owner qualification
@@ -270,7 +316,8 @@ impl<'a> Host for Windows<'a> {
         };
         // No child creation precedes the final held inventory and namespace
         // check. All custody stays in the borrowed Baseline through settlement.
-        self.validate_search_and_bundle(opens.bundle)?;
+        self.launch_gate()
+            .validate_search_and_bundle(opens.bundle, safe_dll_search())?;
         let live = self.live()?;
         live.check(opens.peak, Tick::now())
             .map_err(|error| match error {
@@ -328,12 +375,15 @@ impl<'a> Host for Windows<'a> {
             .as_mut()
             .ok_or(NativeRefusal::JobUnverified)?
             .resume()
-            .map_err(|_| NativeRefusal::JobUnverified)
+            .map_err(|_| NativeRefusal::JobUnverified)?;
+        self.phase.set(PausedPhase::Prelaunch);
+        Ok(())
     }
 
     async fn verify_opens(&self, slot: &Slot, opens: &Opens<'a>) -> Result<(), NativeRefusal> {
-        require_live(slot)?;
-        self.validate_search_and_bundle(opens.bundle)
+        self.phase.set(PausedPhase::BundleInventory);
+        self.launch_gate()
+            .verify_opens(opens.bundle, safe_dll_search(), || require_live(slot))
     }
 
     async fn verify_whpx(
@@ -341,9 +391,11 @@ impl<'a> Host for Windows<'a> {
         slot: &Slot,
         query: impl Future<Output = Result<(), Failure>>,
     ) -> Result<(), Failure> {
+        self.phase.set(PausedPhase::Prelaunch);
         require_live(slot)?;
         query.await?;
         require_live(slot)?;
+        self.phase.set(PausedPhase::BundleInventory);
         Ok(())
     }
 
@@ -550,6 +602,148 @@ fn verify_child_policy(child: &Child, token: &VmToken) -> Result<(), NativeRefus
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::vm::windows::qualification::inventory::tests::{
+        Fixture, READ_ONLY, WRITABLE, set_dacl,
+    };
+
+    struct GateFixture {
+        bundle: inventory::Bundle,
+        fixture: Fixture,
+        pin: PathPin,
+        cwd: tempfile::TempDir,
+        user: Vec<usize>,
+    }
+
+    impl GateFixture {
+        fn new() -> Self {
+            let fixture = Fixture::new();
+            // Establish holds before changing the fixture DACL, so the
+            // check must use those objects through the namespace change.
+            let bundle = fixture.inspect(Instant::now() + INVENTORY_TIME).unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let pin =
+                PathPin::open(&local(cwd.path().to_str().unwrap()).unwrap(), true, false).unwrap();
+            let user = current_user().unwrap();
+            let fixture = Self {
+                bundle,
+                fixture,
+                cwd,
+                pin,
+                user,
+            };
+            for path in [
+                fixture.fixture.root.path(),
+                &fixture.fixture.root.path().join("share"),
+                fixture.cwd.path(),
+            ] {
+                set_dacl(path, READ_ONLY);
+            }
+            fixture
+        }
+
+        fn gate(&self) -> LaunchGate<'_> {
+            LaunchGate {
+                cwd: &self.pin,
+                owner: user_sid(&self.user),
+            }
+        }
+    }
+
+    impl Drop for GateFixture {
+        fn drop(&mut self) {
+            for path in [
+                self.fixture.root.path(),
+                &self.fixture.root.path().join("share"),
+                self.cwd.path(),
+            ] {
+                set_dacl(path, WRITABLE);
+            }
+        }
+    }
+
+    #[test]
+    fn native_launch_gate_refuses_unsafe_or_nonempty_cwd() {
+        let f = GateFixture::new();
+        let bundle = &f.bundle;
+        let gate = f.gate();
+        assert_eq!(gate.validate_search_and_bundle(bundle, true), Ok(()));
+        assert_eq!(
+            gate.validate_search_and_bundle(bundle, false),
+            Err(NativeRefusal::PathCustodyUnverified)
+        );
+        set_dacl(f.cwd.path(), WRITABLE);
+        assert_eq!(
+            gate.validate_search_and_bundle(bundle, true),
+            Err(NativeRefusal::PathCustodyUnverified)
+        );
+        std::fs::write(f.cwd.path().join("unexpected.bin"), b"fixture").unwrap();
+        set_dacl(f.cwd.path(), READ_ONLY);
+        assert_eq!(
+            gate.validate_search_and_bundle(bundle, true),
+            Err(NativeRefusal::PathCustodyUnverified)
+        );
+    }
+
+    #[test]
+    fn native_launch_gate_refuses_writable_bundle_root_or_subdirectory() {
+        let f = GateFixture::new();
+        let bundle = &f.bundle;
+        for path in [f.fixture.root.path(), &f.fixture.root.path().join("share")] {
+            assert_eq!(f.gate().validate_search_and_bundle(bundle, true), Ok(()));
+            set_dacl(path, WRITABLE);
+            assert_eq!(
+                f.gate().validate_search_and_bundle(bundle, true),
+                Err(NativeRefusal::DistributionUnverified)
+            );
+            set_dacl(path, READ_ONLY);
+        }
+    }
+
+    #[test]
+    fn native_post_prelaunch_gate_rechecks_for_new_file_and_directory() {
+        for directory in [false, true] {
+            let f = GateFixture::new();
+            let bundle = &f.bundle;
+            let gate = f.gate();
+            assert_eq!(gate.verify_opens(bundle, true, || Ok(())), Ok(()));
+            assert_eq!(
+                gate.verify_opens(bundle, true, || Err(NativeRefusal::JobUnverified)),
+                Err(NativeRefusal::JobUnverified)
+            );
+            let share = f.fixture.root.path().join("share");
+            set_dacl(&share, WRITABLE);
+            let extra = share.join("unlisted.dll");
+            if directory {
+                std::fs::create_dir(extra).unwrap();
+            } else {
+                std::fs::write(extra, b"fixture").unwrap();
+            }
+            // Restore the ACL to isolate the held inventory as the refusal.
+            set_dacl(&share, READ_ONLY);
+            assert_eq!(
+                gate.verify_opens(bundle, true, || Ok(())),
+                Err(NativeRefusal::DistributionUnverified)
+            );
+        }
+    }
+
+    #[test]
+    fn paused_environment_is_minimal_and_nul_terminated() {
+        let cwd = LocalPath::parse(r"D:\fixture\paused-cwd").unwrap();
+        let block = environment(&cwd).unwrap();
+        assert!(block.ends_with(&[0, 0]));
+        let values = block[..block.len() - 2]
+            .split(|unit| *unit == 0)
+            .map(|value| String::from_utf16(value).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 4);
+        let root = values[0].strip_prefix("SystemRoot=").unwrap();
+        assert!(LocalPath::parse(root).is_ok());
+        assert_eq!(values[1], format!("TEMP={}", cwd.as_str()));
+        assert_eq!(values[2], format!("TMP={}", cwd.as_str()));
+        assert_eq!(values[3], format!("WINDIR={root}"));
+    }
 
     #[test]
     fn durable_slot_releases_only_a_settled_generation() {

@@ -1226,7 +1226,10 @@ The inventory attests that the complete reviewed bundle was present and
 held under that namespace policy. Actual mapped modules, firmware and
 other consumer opens, alternate OS activation or data mappings and
 kernel/named-object coverage are outside its evidence. Same-SID host
-execution remains inside the trusted boundary. WHPX is checked both via
+execution remains inside the trusted boundary. If the enrolled user owns
+a checked directory, that user can exercise implicit WRITE_DAC to grant
+write access and change the directory between observations. The inventory
+guarantee assumes a trusted owner, administrator and SYSTEM. WHPX is checked via
 fresh platform capability samples and through the paused child's typed
 `query-accelerators` reply.
 

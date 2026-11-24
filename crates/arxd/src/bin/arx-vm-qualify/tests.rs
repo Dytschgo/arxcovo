@@ -132,6 +132,8 @@ struct Script {
     t: u64,
     trip: Option<(Hook, Rc<Cell<bool>>)>,
     planning: Option<Stage>,
+    project: Option<Stage>,
+    unavailable: Option<Stage>,
 }
 
 impl Default for Script {
@@ -147,6 +149,8 @@ impl Default for Script {
             t: 0,
             trip: None,
             planning: None,
+            project: None,
+            unavailable: None,
         }
     }
 }
@@ -195,6 +199,14 @@ impl Script {
 impl<S: Source<Store = FixtureStore>> Collectors<S> for Script {
     fn baseline(&mut self, stage: Stage) -> Collected {
         self.collect(stage)
+    }
+
+    fn implemented(&self, stage: Stage) -> bool {
+        self.unavailable != Some(stage)
+    }
+
+    fn previous_effect(&mut self, stage: Stage) -> Option<Collected> {
+        (self.project == Some(stage)).then(|| self.collect(stage))
     }
 
     fn store(&mut self) -> (Collected, Option<FixtureStore>) {
@@ -528,21 +540,41 @@ fn baseline_and_fixture_observations_do_not_pass_native_effect_stages() {
 fn paused_inventory_evidence_cannot_admit_later_native_or_fixture_stages() {
     let verified = Observation::PausedTrial { verified: true };
     let refused = Observation::PausedTrial { verified: false };
+    let store = Observation::PausedStore { validated: true };
+    assert!(store.validates(Stage::DisposableStore, Origin::Native));
+    assert!(!store.validates(Stage::DisposableStore, Origin::Fixture));
+    assert!(!store.validates(Stage::SuspendedChild, Origin::Native));
     for &stage in stages(Class::Test) {
         assert_eq!(
             verified.validates(stage, Origin::Native),
             matches!(
                 stage,
-                Stage::DisposableStore
-                    | Stage::SuspendedChild
-                    | Stage::QemuPrelaunchPause
-                    | Stage::HeldBundleInventory
+                Stage::SuspendedChild | Stage::QemuPrelaunchPause | Stage::HeldBundleInventory
             ),
             "{stage:?}"
         );
         assert!(!verified.validates(stage, Origin::Fixture));
         assert!(!refused.validates(stage, Origin::Native));
     }
+}
+
+#[test]
+fn a_projection_and_an_unimplemented_row_do_not_dispatch_again() {
+    let mut trial = fixture(Class::Test);
+    let mut collectors = Script {
+        project: Some(Stage::QemuPrelaunchPause),
+        unavailable: Some(Stage::HeldBundleInventory),
+        ..Script::default()
+    };
+    trial.drive(&mut collectors, &Script2::fixed(T0));
+    assert!(collectors.calls.contains(&Stage::QemuPrelaunchPause));
+    assert!(!collectors.calls.contains(&Stage::HeldBundleInventory));
+    assert_eq!(collectors.effects, 1);
+    assert_eq!(collectors.cleanups, [1]);
+    assert_eq!(trial.blocked_at(), Some(Stage::HeldBundleInventory));
+    assert!(trial.records().iter().any(|record| {
+        record.stage == Stage::HeldBundleInventory && record.result == StageResult::Unimplemented
+    }));
 }
 
 #[test]

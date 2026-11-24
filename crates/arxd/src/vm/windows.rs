@@ -448,6 +448,22 @@ impl Attributes {
         })
     }
 
+    fn insert_paused_policy(&mut self) -> io::Result<()> {
+        // Enforce no remote/Low-label images and prefer System32 from creation.
+        let image_policy = (1u64 << 52) | (1u64 << 56) | (1u64 << 60);
+        self.insert_words(
+            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
+            &[image_policy as usize],
+            size_of::<u64>(),
+        )?;
+        // PROCESS_CREATION_CHILD_PROCESS_RESTRICTED, a DWORD policy.
+        self.insert_words(
+            PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY as usize,
+            &[1],
+            size_of::<u32>(),
+        )
+    }
+
     fn pointer(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
         self.storage.as_mut_ptr().cast()
     }
@@ -811,25 +827,8 @@ fn create_suspended(
     let mut attributes =
         Attributes::new(if paused { 4 } else { 2 }).map_err(at(SpawnStage::Attributes))?;
     if paused {
-        if size_of::<usize>() != size_of::<u64>() {
-            return Err(recipe("paused qualification requires x64"));
-        }
-        // These creation policies apply before the loader processes initial imports.
-        let image_policy = (1u64 << 52) | (1u64 << 56) | (1u64 << 60);
         attributes
-            .insert_words(
-                PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
-                &[image_policy as usize],
-                size_of::<u64>(),
-            )
-            .map_err(at(SpawnStage::Attributes))?;
-        // PROCESS_CREATION_CHILD_PROCESS_RESTRICTED, a DWORD policy.
-        attributes
-            .insert_words(
-                PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY as usize,
-                &[1],
-                size_of::<u32>(),
-            )
+            .insert_paused_policy()
             .map_err(at(SpawnStage::Attributes))?;
     }
     for (index, handle) in handles.iter().copied().enumerate() {
@@ -2560,6 +2559,26 @@ fn allocated_under(root: &LocalPath, expected: u64, limit: usize) -> Result<u64,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paused_launch_attributes_and_single_process_job_are_applied() {
+        let mut attributes = Attributes::new(4).unwrap();
+        attributes.insert_paused_policy().unwrap();
+        assert_eq!(&*attributes.values[0], &[0x1110_0000_0000_0000]);
+        assert_eq!(&*attributes.values[1], &[1]);
+        let job = Job::with_process_limit(2 << 30, None, Some(1)).unwrap();
+        let mut actual = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        job.query(JobObjectExtendedLimitInformation, &mut actual)
+            .unwrap();
+        assert_eq!(actual.BasicLimitInformation.ActiveProcessLimit, 1);
+        assert_eq!(
+            actual.BasicLimitInformation.LimitFlags,
+            JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                | JOB_OBJECT_LIMIT_JOB_MEMORY
+        );
+    }
+
     use std::{
         io::{Read, Write},
         os::windows::fs::MetadataExt,

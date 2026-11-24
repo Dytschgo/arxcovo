@@ -31,21 +31,14 @@ fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
 
     let args: Vec<_> = std::env::args_os().skip(1).take(4).collect();
-    let (enrollment, evidence, paused) = match args.as_slice() {
-        [enrollment, evidence] => (enrollment, evidence, false),
-        [flag, enrollment, evidence] if flag == "--paused-trial" => (enrollment, evidence, true),
-        _ => {
-            eprintln!(
-                "usage: arx-vm-qualify [--paused-trial] ENROLLMENT_JSON EMPTY_EVIDENCE_DIRECTORY"
-            );
-            return ExitCode::FAILURE;
-        }
+    let Some((enrollment, evidence, paused)) = parse_args(&args) else {
+        eprintln!(
+            "usage: arx-vm-qualify [--paused-trial] ENROLLMENT_JSON EMPTY_EVIDENCE_DIRECTORY"
+        );
+        eprintln!("{}", failure_line(&frame::RunError::Input));
+        return ExitCode::FAILURE;
     };
-    let result = enrollment
-        .to_str()
-        .zip(evidence.to_str())
-        .ok_or(frame::RunError::Input)
-        .and_then(|(enrollment, evidence)| native::run(enrollment, evidence, paused));
+    let result = native::run(enrollment, evidence, paused);
     // Only typed, path-free outcomes reach the console.
     match result {
         Ok(native::Outcome::Incomplete) => {
@@ -56,6 +49,46 @@ fn main() -> std::process::ExitCode {
             eprintln!("{}", failure_line(&reason));
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn parse_args(args: &[std::ffi::OsString]) -> Option<(&str, &str, bool)> {
+    match args {
+        [enrollment, evidence] if !enrollment.to_str()?.starts_with("--") => {
+            Some((enrollment.to_str()?, evidence.to_str()?, false))
+        }
+        [flag, enrollment, evidence] if flag == "--paused-trial" => {
+            Some((enrollment.to_str()?, evidence.to_str()?, true))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn paused_cli_requires_the_exact_opt_in_and_both_paths() {
+    for (raw, expected) in [
+        (
+            vec!["enrollment", "evidence"],
+            Some(("enrollment", "evidence", false)),
+        ),
+        (
+            vec!["--paused-trial", "enrollment", "evidence"],
+            Some(("enrollment", "evidence", true)),
+        ),
+        (vec!["--paused-trial", "enrollment"], None),
+        (vec!["--unknown", "enrollment", "evidence"], None),
+        (
+            vec!["--paused-trial", "enrollment", "evidence", "extra"],
+            None,
+        ),
+    ] {
+        let args = raw
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(parse_args(&args), expected);
     }
 }
 

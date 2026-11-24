@@ -73,7 +73,7 @@ pub(crate) enum Stage {
     SuspendedChild,
     /// QEMU `-S` prelaunch pause, diskless and networkless.
     QemuPrelaunchPause,
-    /// The actual loader and consumer opens of the held image and inputs.
+    /// The protected bundle inventory rechecked after QMP prelaunch.
     HeldBundleInventory,
     /// WHPX initialization and the first guest instruction, still diskless.
     FirstGuestExecution,
@@ -418,6 +418,9 @@ pub(crate) enum Observation {
     Whpx {
         present: bool,
     },
+    PausedStore {
+        validated: bool,
+    },
     PausedTrial {
         verified: bool,
     },
@@ -528,11 +531,11 @@ impl Observation {
                     && *owner_cpu_reserve == active_cpus.div_ceil(2)
             }
             (Stage::WhpxCapability, O::Whpx { present }) => *present,
+            (Stage::DisposableStore, O::PausedStore { validated }) => {
+                origin == Origin::Native && *validated
+            }
             (
-                Stage::DisposableStore
-                | Stage::SuspendedChild
-                | Stage::QemuPrelaunchPause
-                | Stage::HeldBundleInventory,
+                Stage::SuspendedChild | Stage::QemuPrelaunchPause | Stage::HeldBundleInventory,
                 O::PausedTrial { verified },
             ) => origin == Origin::Native && *verified,
             (
