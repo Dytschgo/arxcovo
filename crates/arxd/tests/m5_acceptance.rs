@@ -451,3 +451,20 @@ fn unrelated_version_must_not_pass() {
         Err(Fail::Check("submitted_binding"))
     );
 }
+
+/// The started and failed rows for the submitted tester operation stay a
+/// valid pair. An earlier, unrelated audit row reuses that operation id.
+/// Removing the total-row comparison accepts this audit.
+#[test]
+fn reused_tester_operation_id_must_not_pass() {
+    let submitted = bound();
+    for previous_row in [0, 1, 2, 3, 4] {
+        let (mut sample, good_sha, broken_sha) = observed();
+        sample.activity["activities"][previous_row]["operation_id"] =
+            json!(submitted.broken_operation_id);
+        assert_eq!(
+            accept_vault(&sample, &submitted, &good_sha, &broken_sha),
+            Err(Fail::Check("submitted_binding"))
+        );
+    }
+}
