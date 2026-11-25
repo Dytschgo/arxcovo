@@ -1197,8 +1197,13 @@ fn test_seed_appends_route_without_changing_shared_finalizer() {
 #[test]
 fn network_probe_python_fixture() {
     // The interpreter is required only for the explicitly enabled guest-script
-    // check. Ordinary Rust test runs have no host Python dependency.
+    // check. Ordinary local Rust test runs have no host Python dependency.
+    // Hosted CI sets CI=true and must name the interpreter; otherwise this
+    // check would pass without running.
     let Some(python) = std::env::var_os("ARX_TEST_NETWORK_PROBE_PYTHON") else {
+        if std::env::var("CI").ok().as_deref() == Some("true") {
+            panic!("ARX_TEST_NETWORK_PROBE_PYTHON must name a Python 3 interpreter when CI=true");
+        }
         return;
     };
     // Run the functions embedded in the seed with a fake socket. No packets
