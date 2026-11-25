@@ -857,146 +857,190 @@ C11_PROMO_DECL = "    mod promotion_campaign;"
 # adds one of each (`cfg_attr` contributes the `cfg`).
 C11_CFG = 1
 C11_IGNORE = 1
-# Hosted's declaration is the one `#[cfg(all(test, target_os = "linux"))]`.
-# `mod promotion_campaign` has no cfg. Neither file has a path attribute.
-C11_HOSTED_CFG = 1
-C11_PROMO_CFG = 0
-C11_PATH_ATTRS = 0
+C11_LIB = "crates/arxd/src/lib.rs"
+C11_CLUSTER = "crates/arxd/src/cluster.rs"
+C11_CONSENSUS = "crates/arxd/src/cluster/consensus.rs"
+C11_BOUND = "crates/arxd/src/cluster/consensus/bound_start.rs"
+C11_ENROLL_DECL = '#[cfg(target_os = "linux")]\nmod enrollment_ingress;'
+# Whole-file raw counts from main. Block-comment removal is pinned to the
+# same numbers: main has no comment-split cfg or ignore. The target file is
+# main's 0,0 plus the one gate. Counts cover every file that declares the
+# path, not a region bounded by `;` or `}`. A semicolon in a trailing
+# comment would otherwise hide an added cfg.
+C11_FILES = (
+    (C11_LIB, 1, 0),
+    (C11_CLUSTER, 2, 0),
+    (C11_CONSENSUS, 63, 0),
+    (C11_BOUND, 106, 0),
+    (C11_PARENT, 14, 0),
+    (C11_MODULE, C11_CFG, C11_IGNORE),
+)
 
 
-def _declaration_region(source, decl):
+def _pin_once(source, decl):
     if source.count(decl) != 1:
-        raise AssertionError("parent module declaration must occur once")
-    at = source.index(decl)
-    prev = max(source.rfind(";", 0, at), source.rfind("}", 0, at))
-    if prev < 0:
-        raise AssertionError("parent module declaration is unbound")
-    return source[prev + 1:at + len(decl)]
+        raise AssertionError("module declaration drifted")
 
 
-def _pin_declaration(source, decl, expected, cfg_count):
-    region = _declaration_region(source, decl)
-    stripped = _strip_block_comments(region)
-    if _norm(region) != _norm(expected) or _norm(stripped) != _norm(expected):
-        raise AssertionError("parent module declaration drifted")
-    if (region.count("cfg"), stripped.count("cfg")) != (cfg_count, cfg_count):
-        raise AssertionError("parent module declaration cfg count drifted")
-
-
-def _pin_path(source):
-    stripped = _strip_block_comments(source)
-    if (source.count("#[path"), stripped.count("#[path")) != (
-            C11_PATH_ATTRS, C11_PATH_ATTRS):
-        raise AssertionError("path attribute would redirect a module")
-
-
-def assert_c11_linux_quarantine(module, parent):
-    stripped = _strip_block_comments(module)
-    if (module.count("cfg"), module.count("ignore"),
-            stripped.count("cfg"), stripped.count("ignore")) != (
-            C11_CFG, C11_IGNORE, C11_CFG, C11_IGNORE):
-        raise AssertionError("promotion campaign cfg or ignore token count drifted")
-    _pin_path(module)
-    _pin_path(parent)
-    _pin_declaration(parent, C11_HOSTED_DECL, C11_HOSTED_DECL, C11_HOSTED_CFG)
-    _pin_declaration(parent, C11_PROMO_DECL, C11_PROMO_DECL, C11_PROMO_CFG)
+def assert_c11_linux_quarantine(files):
+    if set(files) != {path for path, _, _ in C11_FILES}:
+        raise AssertionError("module chain drifted")
+    for path, cfg, ignore in C11_FILES:
+        source = files[path]
+        stripped = _strip_block_comments(source)
+        if (source.count("cfg"), source.count("ignore"),
+                stripped.count("cfg"), stripped.count("ignore")) != (
+                cfg, ignore, cfg, ignore):
+            raise AssertionError("cfg or ignore token count drifted")
+        if (source.count("#[path"), stripped.count("#[path")) != (0, 0):
+            raise AssertionError("path attribute would redirect a module")
+    module = files[C11_MODULE]
     gate = _norm('#[cfg_attr(' + C11_PREDICATE + ', ignore = "' + C11_REASON + '")]')
     if _norm(module).count(gate + "asyncfn" + C11_TEST + "(") != 1:
         raise AssertionError("Linux ignore must stay on the C11 retained-joiners test")
+    parent = files[C11_PARENT]
+    _pin_once(parent, C11_HOSTED_DECL)
+    _pin_once(parent, C11_PROMO_DECL)
+    _pin_once(files[C11_BOUND], C11_ENROLL_DECL)
+    _pin_once(files[C11_CONSENSUS], "mod bound_start;")
+    _pin_once(files[C11_CLUSTER], "pub mod consensus;")
+    _pin_once(files[C11_LIB], "pub mod cluster;")
 
 
 def _c11_gate(predicate):
     return C11_GATE.replace(C11_PREDICATE, predicate, 1)
 
 
+def _c11_sources():
+    return {path: (ROOT / path).read_text(encoding="utf-8") for path, _, _ in C11_FILES}
+
+
+def _c11_with(files, path, text):
+    changed = dict(files)
+    changed[path] = text
+    return changed
+
+
 class C11LinuxQuarantineTests(unittest.TestCase):
     def test_exact_linux_only_c11_retained_joiners_quarantine(self):
-        module = (ROOT / C11_MODULE).read_text(encoding="utf-8")
-        parent = (ROOT / C11_PARENT).read_text(encoding="utf-8")
-        assert_c11_linux_quarantine(module, parent)
+        files = _c11_sources()
+        assert_c11_linux_quarantine(files)
+        module = files[C11_MODULE]
+        parent = files[C11_PARENT]
+        bound = files[C11_BOUND]
         other = "async fn close_learner("
         target = "#[tokio::test(flavor = \"current_thread\")]\n" + C11_GATE
         mutants = {
-            "gate removed": module.replace(C11_GATE + "\n", "", 1),
-            "predicate unix": module.replace(C11_GATE, _c11_gate("unix"), 1),
-            "predicate all()": module.replace(C11_GATE, _c11_gate("all()"), 1),
-            "predicate not(windows)": module.replace(
-                C11_GATE, _c11_gate("not(windows)"), 1
+            "gate removed": (C11_MODULE, module.replace(C11_GATE + "\n", "", 1)),
+            "predicate unix": (C11_MODULE, module.replace(C11_GATE, _c11_gate("unix"), 1)),
+            "predicate all()": (C11_MODULE, module.replace(C11_GATE, _c11_gate("all()"), 1)),
+            "predicate not(windows)": (
+                C11_MODULE, module.replace(C11_GATE, _c11_gate("not(windows)"), 1)
             ),
-            "wrong reason": module.replace(C11_REASON, "unapproved reason", 1),
-            "renamed function": module.replace(
-                "async fn " + C11_TEST + "(", "async fn renamed(", 1
+            "wrong reason": (C11_MODULE, module.replace(C11_REASON, "unapproved reason", 1)),
+            "renamed function": (
+                C11_MODULE,
+                module.replace("async fn " + C11_TEST + "(", "async fn renamed(", 1),
             ),
-            "second ignore": module.replace(other, "#[ignore]\n" + other, 1),
-            "cfg on target function": module.replace(
-                target, '#[cfg(not(target_os="linux"))]\n' + target, 1
+            "second ignore": (C11_MODULE, module.replace(other, "#[ignore]\n" + other, 1)),
+            "cfg on target function": (
+                C11_MODULE, module.replace(target, '#[cfg(not(target_os="linux"))]\n' + target, 1)
             ),
-            "cfg on neighbor": module.replace(
-                other, '#[cfg(not(target_os="linux"))]\n' + other, 1
+            "cfg on neighbor": (
+                C11_MODULE, module.replace(other, '#[cfg(not(target_os="linux"))]\n' + other, 1)
             ),
-            "inner cfg on test module": "#![cfg(not(windows))]\n" + module,
-            "comment cfg on target": module.replace(
-                target,
-                "#[/* Fixture limitation */ cfg(not(target_os = \"windows\"))] "
-                "// Platform restriction\n" + target,
-                1,
+            "inner cfg on test module": (C11_MODULE, "#![cfg(not(windows))]\n" + module),
+            "comment cfg on target": (
+                C11_MODULE,
+                module.replace(
+                    target,
+                    "#[/* Fixture limitation */ cfg(not(target_os = \"windows\"))] "
+                    "// Platform restriction\n" + target,
+                    1,
+                ),
             ),
-            "comment cfg on neighbor": module.replace(
-                other,
-                "#[/* Fixture limitation */ cfg(not(target_os = \"windows\"))]\n"
-                + other,
-                1,
+            "comment cfg on neighbor": (
+                C11_MODULE,
+                module.replace(
+                    other,
+                    "#[/* Fixture limitation */ cfg(not(target_os = \"windows\"))]\n" + other,
+                    1,
+                ),
             ),
-            "raw cfg identifier": module.replace(
-                target,
-                "#[r#cfg(not(target_os = \"windows\"))] // raw\n" + target,
-                1,
+            "raw cfg identifier": (
+                C11_MODULE,
+                module.replace(
+                    target, "#[r#cfg(not(target_os = \"windows\"))] // raw\n" + target, 1
+                ),
             ),
             "macro generated cfg": (
+                C11_MODULE,
                 "macro_rules! hide { ($item:item) => { "
-                "#[cfg(not(target_os = \"windows\"))] $item }; }\n" + module
+                "#[cfg(not(target_os = \"windows\"))] $item }; }\n" + module,
             ),
-            "comment split ignore": module.replace(
-                other, "#[ig/**/nore]\n" + other, 1
+            "comment split ignore": (
+                C11_MODULE, module.replace(other, "#[ig/**/nore]\n" + other, 1)
+            ),
+            "path on promotion module": (
+                C11_PARENT,
+                parent.replace(
+                    C11_PROMO_DECL, '    #[path = "other.rs"]\n' + C11_PROMO_DECL, 1
+                ),
+            ),
+            "comment split path": (
+                C11_PARENT,
+                parent.replace(
+                    C11_PROMO_DECL, '    #[pa/**/th = "other.rs"]\n' + C11_PROMO_DECL, 1
+                ),
+            ),
+            "hosted predicate unix": (
+                C11_PARENT,
+                parent.replace(C11_HOSTED_DECL, '#[cfg(all(test, unix))]\nmod hosted {', 1),
+            ),
+            "cfg on promotion declaration": (
+                C11_PARENT,
+                parent.replace(C11_PROMO_DECL, "    #[cfg(unix)]\n" + C11_PROMO_DECL, 1),
+            ),
+            "comment cfg on hosted declaration": (
+                C11_PARENT,
+                parent.replace(
+                    C11_HOSTED_DECL,
+                    "#[/* cfg */ cfg(all(test, target_os = \"linux\"))]\nmod hosted {",
+                    1,
+                ),
+            ),
+            # Reviewer reproducer: a semicolon in the trailing comment used to
+            # end the declaration region before this cfg.
+            "comment semicolon cfg before promotion module": (
+                C11_PARENT,
+                parent.replace(
+                    C11_PROMO_DECL,
+                    "    #[cfg(any())] // Fixture is disabled;\n" + C11_PROMO_DECL,
+                    1,
+                ),
+            ),
+            "comment semicolon cfg before hosted module": (
+                C11_PARENT,
+                parent.replace(
+                    C11_HOSTED_DECL,
+                    "#[cfg(any())] // Fixture is disabled;\n" + C11_HOSTED_DECL,
+                    1,
+                ),
+            ),
+            "cfg on enrollment parent file": (
+                C11_BOUND,
+                bound.replace(
+                    C11_ENROLL_DECL,
+                    "#[cfg(any())] // Fixture is disabled;\n" + C11_ENROLL_DECL,
+                    1,
+                ),
             ),
         }
-        parent_mutants = {
-            "path on promotion module": parent.replace(
-                C11_PROMO_DECL,
-                '    #[path = "other.rs"]\n' + C11_PROMO_DECL,
-                1,
-            ),
-            "comment split path": parent.replace(
-                C11_PROMO_DECL,
-                '    #[pa/**/th = "other.rs"]\n' + C11_PROMO_DECL,
-                1,
-            ),
-            "hosted predicate unix": parent.replace(
-                C11_HOSTED_DECL,
-                '#[cfg(all(test, unix))]\nmod hosted {',
-                1,
-            ),
-            "cfg on promotion declaration": parent.replace(
-                C11_PROMO_DECL,
-                "    #[cfg(unix)]\n" + C11_PROMO_DECL,
-                1,
-            ),
-            "comment cfg on hosted declaration": parent.replace(
-                C11_HOSTED_DECL,
-                "#[/* cfg */ cfg(all(test, target_os = \"linux\"))]\nmod hosted {",
-                1,
-            ),
-        }
-        for label, mutant in mutants.items():
+        for label, (path, text) in mutants.items():
             with self.subTest(mutant=label):
-                self.assertNotEqual(mutant, module)
+                self.assertNotEqual(text, files[path])
                 with self.assertRaises(AssertionError):
-                    assert_c11_linux_quarantine(mutant, parent)
-        for label, mutant in parent_mutants.items():
-            with self.subTest(mutant=label):
-                self.assertNotEqual(mutant, parent)
-                with self.assertRaises(AssertionError):
-                    assert_c11_linux_quarantine(module, mutant)
+                    assert_c11_linux_quarantine(_c11_with(files, path, text))
 
 
 if __name__ == "__main__":
