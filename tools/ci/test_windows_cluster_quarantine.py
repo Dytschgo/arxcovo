@@ -700,5 +700,67 @@ class HeavyServiceGroupTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     assert_heavy_service_group(mutant)
 
+
+# Kept in this module because the existing static CI step selects this file.
+B2_TEST = "b2_snapshot_barrier_races_busy_unpublish_pending_removal_and_old_origin"
+B2_REASON = (
+    "intermittent macOS b2 snapshot barrier shutdown: docs/ROADMAP.md Known issues"
+)
+B2_PREDICATE = 'target_os = "macos"'
+B2_GATE = (
+    "#[cfg_attr(\n"
+    "        " + B2_PREDICATE + ",\n"
+    '        ignore = "' + B2_REASON + '"\n'
+    "    )]"
+)
+B2_BINDING = "#[tokio::test]\n    " + B2_GATE + "\n    async fn " + B2_TEST + "("
+
+
+def assert_b2_macos_quarantine(source):
+    marker = "pub(crate) mod tests {\n"
+    if source.count(marker) != 1:
+        raise AssertionError("vm tests module binding required")
+    tests = source.split(marker, 1)[1]
+    if tests.count(B2_BINDING) != 1 or tests.count("async fn " + B2_TEST + "(") != 1:
+        raise AssertionError("macOS ignore must stay on the b2 snapshot barrier test")
+    if len(re.findall(r"\bignore\b", source)) != 1:
+        raise AssertionError("vm.rs tests may carry exactly one ignore")
+    matched = [
+        body
+        for body in re.findall(r"#\s*!?\s*\[([^\]]*)\]", tests)
+        if re.search(r"\bignore\b", body)
+    ]
+    if len(matched) != 1:
+        raise AssertionError("vm.rs tests may carry exactly one ignore")
+    expected = 'cfg_attr(' + B2_PREDICATE + ', ignore = "' + B2_REASON + '")'
+    if re.sub(r"\s+", "", matched[0]) != re.sub(r"\s+", "", expected):
+        raise AssertionError("macOS ignore predicate and reason drifted")
+    if source.count(B2_PREDICATE) != 1:
+        raise AssertionError("macOS ignore predicate drifted")
+
+
+class B2MacosQuarantineTests(unittest.TestCase):
+    def test_exact_macos_only_b2_snapshot_barrier_quarantine(self):
+        source = (ROOT / "crates/arxd/src/mcp/vm.rs").read_text(encoding="utf-8")
+        assert_b2_macos_quarantine(source)
+        other = "async fn stale_copy_cleanup_preserves_committed_static_point_and_active_media("
+        mutants = {
+            "gate removed": source.replace(B2_GATE + "\n", "", 1),
+            "predicate unix": source.replace(B2_PREDICATE, "unix", 1),
+            "predicate all()": source.replace(B2_PREDICATE, "all()", 1),
+            "predicate not(windows)": source.replace(B2_PREDICATE, "not(windows)", 1),
+            "wrong reason": source.replace(B2_REASON, "unapproved reason", 1),
+            "renamed function": source.replace(
+                "async fn " + B2_TEST + "(", "async fn renamed(", 1
+            ),
+            "second ignore": source.replace(other, "#[ignore]\n    " + other, 1),
+        }
+        for label, mutant in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(mutant, source)
+                with self.assertRaises(AssertionError):
+                    assert_b2_macos_quarantine(mutant)
+
+
 if __name__ == "__main__":
     unittest.main()
