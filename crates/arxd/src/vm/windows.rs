@@ -49,6 +49,7 @@ use windows_sys::Win32::{
     },
 };
 
+pub(super) mod offline_read;
 pub mod qualification;
 
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
@@ -542,25 +543,46 @@ impl Job {
                 Anonymous: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0 { CpuRate: rate },
             };
             job.set(JobObjectCpuRateControlInformation, &cpu)?;
+        }
+        job.verify_limits(memory_limit, cpu_rate, processes)?;
+        Ok(job)
+    }
+
+    fn verify_limits(
+        &self,
+        memory_limit: usize,
+        cpu_rate: Option<u32>,
+        processes: Option<u32>,
+    ) -> io::Result<()> {
+        let expected_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_JOB_MEMORY
+            | if processes.is_some() {
+                JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            } else {
+                0
+            };
+        if let Some(rate) = cpu_rate {
+            let expected_cpu_flags =
+                JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
             let mut actual = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
-            job.query(JobObjectCpuRateControlInformation, &mut actual)?;
+            self.query(JobObjectCpuRateControlInformation, &mut actual)?;
             // Hard-cap flags select the CpuRate union member.
-            if actual.ControlFlags != cpu.ControlFlags
+            if actual.ControlFlags != expected_cpu_flags
                 || unsafe { actual.Anonymous.CpuRate } != rate
             {
                 return Err(io::Error::other("Job CPU cap unavailable"));
             }
         }
         let mut actual = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        job.query(JobObjectExtendedLimitInformation, &mut actual)?;
-        if actual.BasicLimitInformation.LimitFlags != extended.BasicLimitInformation.LimitFlags
+        self.query(JobObjectExtendedLimitInformation, &mut actual)?;
+        if actual.BasicLimitInformation.LimitFlags != expected_flags
             || actual.JobMemoryLimit != memory_limit
             || processes
                 .is_some_and(|limit| actual.BasicLimitInformation.ActiveProcessLimit != limit)
         {
             return Err(io::Error::other("Job containment flags unavailable"));
         }
-        Ok(job)
+        Ok(())
     }
 
     fn set<T>(&self, class: JOBOBJECTINFOCLASS, info: &T) -> io::Result<()> {
@@ -823,10 +845,10 @@ fn create_suspended(
         return Err(recipe("command line too long"));
     }
     let handles = stdio.handles();
-    let paused = matches!(launch, Launch::Paused { .. });
+    let restricted = matches!(launch, Launch::Paused { .. } | Launch::Restricted { .. });
     let mut attributes =
-        Attributes::new(if paused { 4 } else { 2 }).map_err(at(SpawnStage::Attributes))?;
-    if paused {
+        Attributes::new(if restricted { 4 } else { 2 }).map_err(at(SpawnStage::Attributes))?;
+    if restricted {
         attributes
             .insert_paused_policy()
             .map_err(at(SpawnStage::Attributes))?;
@@ -1198,6 +1220,20 @@ fn groups_match(expected: &[(Vec<u8>, u32)], entries: &[SID_AND_ATTRIBUTES]) -> 
     captured_groups(entries).is_ok_and(|actual| actual == expected)
 }
 
+fn require_unimpersonated() -> io::Result<()> {
+    let mut impersonation = null_mut();
+    if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut impersonation) } != 0 {
+        drop(unsafe { owned(impersonation) }?);
+        return Err(io::Error::other(
+            "impersonation is outside the VM token policy",
+        ));
+    }
+    if unsafe { GetLastError() } != ERROR_NO_TOKEN {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn token_identity(
     token: &OwnedHandle,
     account: &LocalSid,
@@ -1259,7 +1295,7 @@ fn token_identity(
         if !local {
             return Err(io::Error::other("unqualified VM logon"));
         }
-        verify_privileges(token)?;
+        verify_privileges(token, restricted && mode == TokenMode::CurrentUser)?;
         Ok(Identity {
             logon,
             authentication: stats.AuthenticationId,
@@ -1268,7 +1304,7 @@ fn token_identity(
     }
 }
 
-fn verify_privileges(token: &OwnedHandle) -> io::Result<()> {
+fn verify_privileges(token: &OwnedHandle, current_user_child: bool) -> io::Result<()> {
     let data = token_data(token, TokenPrivileges)?;
     let privileges = data.as_ptr().cast::<TOKEN_PRIVILEGES>();
     // The kernel returned a variable-length array with this layout.
@@ -1292,7 +1328,8 @@ fn verify_privileges(token: &OwnedHandle) -> io::Result<()> {
         })?;
         let name = String::from_utf16(&name[..size as usize]).map_err(io::Error::other)?;
         if name != "SeChangeNotifyPrivilege"
-            && (entry.Attributes & SE_PRIVILEGE_ENABLED != 0
+            && (current_user_child
+                || entry.Attributes & SE_PRIVILEGE_ENABLED != 0
                 || !matches!(
                     name.as_str(),
                     "SeShutdownPrivilege"
@@ -1337,17 +1374,7 @@ impl VmToken {
     }
 
     fn derive_current_user(account: LocalSid) -> io::Result<Self> {
-        // An impersonating thread cannot collect or launch on behalf of the console.
-        let mut impersonation = null_mut();
-        if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut impersonation) } != 0 {
-            drop(unsafe { owned(impersonation) }?);
-            return Err(io::Error::other(
-                "impersonation is outside the VM token policy",
-            ));
-        }
-        if unsafe { GetLastError() } != ERROR_NO_TOKEN {
-            return Err(io::Error::last_os_error());
-        }
+        require_unimpersonated()?;
         Self::derive_for(account, TokenMode::CurrentUser)
     }
 
@@ -1391,6 +1418,38 @@ impl VmToken {
         candidate.install_default_acl()?;
         candidate.verify(&candidate.token)?;
         Ok(candidate)
+    }
+
+    /// Private local profile key. Only a scope-bound dependency digest goes
+    /// into published evidence.
+    fn profile_key(&self) -> io::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        if self.mode != TokenMode::CurrentUser {
+            return Err(io::Error::other("current-user profile required"));
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"arx-vm-execution-profile-v1/current_user");
+        for sid in [self.account.0, self.identity.logon_sid()] {
+            // Both SIDs are retained by the validated token snapshot.
+            let sid = unsafe {
+                if IsValidSid(sid) == 0 {
+                    return Err(io::Error::other("invalid profile SID"));
+                }
+                std::slice::from_raw_parts(sid.cast::<u8>(), GetLengthSid(sid) as usize)
+            };
+            hash.update([sid.len() as u8]);
+            hash.update(sid);
+        }
+        let luid = self.identity.authentication;
+        hash.update(luid.LowPart.to_le_bytes());
+        hash.update(luid.HighPart.to_le_bytes());
+        hash.update(self.identity.session.to_le_bytes());
+        for (sid, flags) in &self.groups {
+            hash.update([sid.len() as u8]);
+            hash.update(sid);
+            hash.update(flags.to_le_bytes());
+        }
+        Ok(hash.finalize().into())
     }
 
     fn entries(&self) -> [vm_acl::Entry; 4] {
@@ -2036,64 +2095,393 @@ impl VmToken {
     }
 }
 
+fn verify_image(
+    child: &Child,
+    expected: &LocalPath,
+    identity: FileIdentity,
+) -> Result<(), NativeRefusal> {
+    let reason = NativeRefusal::DistributionUnverified;
+    let mut name = [0u16; 512];
+    let mut size = name.len() as u32;
+    succeeded(unsafe {
+        QueryFullProcessImageNameW(
+            child.process.as_raw_handle(),
+            0,
+            name.as_mut_ptr(),
+            &mut size,
+        )
+    })
+    .map_err(|_| reason)?;
+    let name = String::from_utf16(name.get(..size as usize).ok_or(reason)?).map_err(|_| reason)?;
+    if !name.eq_ignore_ascii_case(expected.as_str())
+        || PathPin::open(expected, false, false)?.identity != identity
+    {
+        return Err(reason);
+    }
+    Ok(())
+}
+
+fn verify_child_policy(child: &Child, token: &VmToken) -> Result<(), NativeRefusal> {
+    let reason = NativeRefusal::JobUnverified;
+    child.verify_live().map_err(|_| reason)?;
+    if !matches!(child.job.active(), Ok(1)) {
+        return Err(reason);
+    }
+    let actual = process_token(child.process.as_raw_handle(), TOKEN_QUERY)
+        .map_err(|_| NativeRefusal::IdentityUnverified)?;
+    token
+        .verify(&actual)
+        .map_err(|_| NativeRefusal::IdentityUnverified)?;
+    for (policy, flags) in [
+        (ProcessChildProcessPolicy, 1u32),
+        (ProcessImageLoadPolicy, 0b111),
+    ] {
+        let mut actual = 0u32;
+        succeeded(unsafe {
+            GetProcessMitigationPolicy(
+                child.process.as_raw_handle(),
+                policy,
+                ptr_of(&mut actual),
+                size_of_val(&actual),
+            )
+        })
+        .map_err(|_| reason)?;
+        if actual & flags != flags {
+            return Err(reason);
+        }
+    }
+    Ok(())
+}
+
+/// Read the host's configured IPv4 DNS resolvers via `iphlpapi.dll`
+/// `GetNetworkParams`, matching libslirp's Windows resolver source for `10.0.2.3`.
+fn host_dns_servers() -> io::Result<Vec<std::net::IpAddr>> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+
+    #[repr(C)]
+    struct IpAddrString {
+        next: *const IpAddrString,
+        ip_address: [u8; 16],
+        ip_mask: [u8; 16],
+        context: u32,
+    }
+
+    #[repr(C)]
+    struct FixedInfoHeader {
+        host_name: [u8; 132],
+        domain_name: [u8; 132],
+        current_dns_server: *const IpAddrString,
+        dns_server_list: IpAddrString,
+    }
+
+    const MAX_BUF: usize = 64 * 1024;
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+
+    let lib = unsafe {
+        LoadLibraryExW(
+            wide("iphlpapi.dll").as_ptr(),
+            null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if lib.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let entry = unsafe { GetProcAddress(lib, c"GetNetworkParams".as_ptr().cast()) }
+            .ok_or_else(|| io::Error::other("GetNetworkParams unavailable"))?;
+        type GetNetworkParamsFn = unsafe extern "system" fn(*mut u8, *mut u32) -> u32;
+        let query: GetNetworkParamsFn = unsafe { std::mem::transmute(entry) };
+        let mut size = size_of::<FixedInfoHeader>() as u32;
+        let mut buf = vec![0u8; size as usize];
+        let mut status = unsafe { query(buf.as_mut_ptr(), &mut size) };
+        if status == ERROR_BUFFER_OVERFLOW {
+            let needed = size as usize;
+            if needed < size_of::<FixedInfoHeader>() || needed > MAX_BUF {
+                return Err(io::Error::other("GetNetworkParams buffer out of bounds"));
+            }
+            buf.resize(needed, 0);
+            status = unsafe { query(buf.as_mut_ptr(), &mut size) };
+        }
+        if status != ERROR_SUCCESS || buf.len() < size_of::<FixedInfoHeader>() {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let base = buf.as_ptr() as usize;
+        let end = base + buf.len();
+        let mut out = Vec::new();
+        let header = unsafe { &*buf.as_ptr().cast::<FixedInfoHeader>() };
+        let mut current: *const IpAddrString = &header.dns_server_list;
+        for _ in 0..32 {
+            if current.is_null() {
+                break;
+            }
+            let addr = current as usize;
+            if addr < base
+                || addr + size_of::<IpAddrString>() > end
+                || !addr.is_multiple_of(align_of::<IpAddrString>())
+            {
+                return Err(io::Error::other("DNS resolver node out of bounds"));
+            }
+            let node = unsafe { &*current };
+            let len = node
+                .ip_address
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(node.ip_address.len());
+            if let Ok(text) = std::str::from_utf8(&node.ip_address[..len])
+                && let Ok(ip) = text.trim().parse::<std::net::Ipv4Addr>()
+                && !ip.is_unspecified()
+            {
+                out.push(std::net::IpAddr::V4(ip));
+            }
+            current = node.next;
+        }
+        Ok(out)
+    })();
+    unsafe { FreeLibrary(lib) };
+    result
+}
+
+/// Run- and generation-bound ownership of a disposable workspace and its
+/// exclusive slot file. Replaces bare mutable paths on the native launch edge.
+struct WorkspaceCustody<'a> {
+    run: [u8; 16],
+    generation: u64,
+    root: &'a PathPin,
+    slot: &'a File,
+}
+
+impl<'a> WorkspaceCustody<'a> {
+    fn new(
+        run: [u8; 16],
+        generation: u64,
+        root: &'a PathPin,
+        slot: &'a File,
+    ) -> Result<Self, NativeRefusal> {
+        let custody = NativeRefusal::PathCustodyUnverified;
+        if run == [0; 16] || generation == 0 {
+            return Err(custody);
+        }
+        qualification::inventory::binding(root)?;
+        let (slot_id, _) = file_identity(slot, false).map_err(|_| custody)?;
+        if slot_id.volume != root.identity.volume {
+            return Err(custody);
+        }
+        Ok(Self {
+            run,
+            generation,
+            root,
+            slot,
+        })
+    }
+
+    fn verify(&self) -> Result<(), NativeRefusal> {
+        let custody = NativeRefusal::PathCustodyUnverified;
+        qualification::inventory::binding(self.root)?;
+        let (root_id, _) = file_identity(&self.root.leaf, true).map_err(|_| custody)?;
+        let (slot_id, _) = file_identity(self.slot, false).map_err(|_| custody)?;
+        if root_id != self.root.identity || slot_id.volume != self.root.identity.volume {
+            return Err(custody);
+        }
+        Ok(())
+    }
+
+    fn path(&self) -> &LocalPath {
+        &self.root.path
+    }
+}
+
+/// The checked stock inventory and protected, empty startup namespace.
+struct StockLaunch<'a> {
+    bundle: &'a qualification::inventory::Bundle,
+    token: &'a VmToken,
+    cwd: PathPin,
+}
+
+impl StockLaunch<'_> {
+    fn recheck(&self) -> Result<(), NativeRefusal> {
+        use qualification::inventory;
+        require_unimpersonated().map_err(|_| NativeRefusal::IdentityUnverified)?;
+        inventory::validate_launch_namespace(
+            self.bundle,
+            &self.cwd,
+            self.token.account.0,
+            inventory::safe_dll_search(),
+        )
+    }
+
+    /// Re-verify bundle, search namespace, workspace custody and every
+    /// consumed input pin at the create edge and after prelaunch.
+    fn recheck_all(
+        &self,
+        pins: &[PathPin],
+        workspace: Option<&WorkspaceCustody<'_>>,
+    ) -> Result<(), NativeRefusal> {
+        use qualification::inventory::binding;
+        let custody = NativeRefusal::PathCustodyUnverified;
+        self.recheck()?;
+        if let Some(workspace) = workspace {
+            workspace.verify()?;
+        }
+        for pin in pins {
+            binding(pin)?;
+            let is_dir = pin.leaf.metadata().map_err(|_| custody)?.is_dir();
+            let (current_id, _) = file_identity(&pin.leaf, is_dir).map_err(|_| custody)?;
+            if current_id != pin.identity {
+                return Err(custody);
+            }
+            if let Some(expected) = pin.verified_content
+                && pin.leaf.metadata().map_err(|_| custody)?.len() != expected.size
+            {
+                return Err(custody);
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_inputs(
+        &self,
+        plan: &CommandPlan<'_>,
+        pins: &[PathPin],
+        workspace: &WorkspaceCustody<'_>,
+    ) -> Result<Vec<usize>, NativeRefusal> {
+        use ArtifactRole::*;
+        use qualification::inventory::binding;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let custody = NativeRefusal::PathCustodyUnverified;
+        workspace.verify()?;
+        let workspace_path = workspace.path();
+        if &self.cwd.path == workspace_path {
+            return Err(custody);
+        }
+        if pins.len() != plan.inputs().len() || workspace_path.overlaps(&self.bundle.root.path) {
+            return Err(custody);
+        }
+        let mut identities = Vec::with_capacity(pins.len());
+        let mut writers = Vec::new();
+        let mut images = Vec::new();
+        let mut golden = None;
+        for (role, artifact) in plan.inputs() {
+            let role = *role;
+            let path = artifact.path_for(role).map_err(|_| custody)?;
+            let (i, pin) = pins
+                .iter()
+                .enumerate()
+                .find(|(_, pin)| pin.path == *path)
+                .ok_or(custody)?;
+            if identities.contains(&pin.identity) || path.overlaps(&self.cwd.path) {
+                return Err(custody);
+            }
+            identities.push(pin.identity);
+            binding(pin)?;
+            match role {
+                Qemu | QemuImg => {
+                    let leaf = if role == Qemu {
+                        "qemu-system-x86_64.exe"
+                    } else {
+                        "qemu-img.exe"
+                    };
+                    let expected = self.bundle.root.path.join(leaf).map_err(|_| custody)?;
+                    if path != &expected
+                        || path != plan.image()
+                        || pin.identity != self.bundle.identity(leaf)?
+                        || pin.mutable
+                    {
+                        return Err(NativeRefusal::DistributionUnverified);
+                    }
+                }
+                Data => {
+                    let expected = self.bundle.root.path.join("share").map_err(|_| custody)?;
+                    if path != &expected || pin.mutable {
+                        return Err(NativeRefusal::DistributionUnverified);
+                    }
+                }
+                PublicEgressQemu | PublicEgressPolicy | StaticDisk | StaticVars | Scratch | Dll => {
+                    return Err(NativeRefusal::NetworkFenceUnverified);
+                }
+                _ => {
+                    if artifact.identity() != Some(pin.identity) || pin.mutable != role.writable() {
+                        return Err(custody);
+                    }
+                    if role.writable() {
+                        if !workspace_path.contains(path)
+                            || pin.identity.volume != workspace.root.identity.volume
+                        {
+                            return Err(custody);
+                        }
+                        writers.push(i);
+                    } else if artifact.pin().is_none() || artifact.pin() != pin.verified_content {
+                        return Err(custody);
+                    }
+                    match role {
+                        Golden => golden = Some(pin),
+                        GuestDisk | TestInstallDisk | SnapshotDisk | SnapshotStagingDisk => {
+                            images.push(pin)
+                        }
+                        Staging if !pin.leaf.metadata().is_ok_and(|m| m.len() == 0) => {
+                            return Err(custody);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let inspect = |pin: &PathPin, backing: Option<&LocalPath>| {
+            let mut file = &pin.leaf;
+            let mut header = vec![0; super::qemu_img::CLUSTER];
+            file.seek(SeekFrom::Start(0))
+                .and_then(|_| file.read_exact(&mut header))
+                .map_err(|_| custody)?;
+            super::qemu_img::inspect_header(&header, backing).map_err(|_| custody)
+        };
+        let golden_size = golden.map(|pin| inspect(pin, None)).transpose()?;
+        for disk in images {
+            let size = inspect(disk, golden.map(|pin| &pin.path))?;
+            if golden_size.is_some_and(|expected| size != expected) {
+                return Err(custody);
+            }
+        }
+        Ok(writers)
+    }
+}
+
 struct LaunchInputs<'a> {
     plan: CommandPlan<'a>,
     cwd: &'a LocalPath,
-    scratch: &'a LocalPath,
-    loader_root: &'a LocalPath,
+    workspace: WorkspaceCustody<'a>,
+    bundle: &'a qualification::inventory::Bundle,
     memory: usize,
     cpu_rate: u32,
     installer: Option<InstallerStage>,
+    finalization_slots: Option<super::PairSlots>,
     // The issuer must retain all executable, firmware, DLL/data, media,
     // volume and writable slot custody here, including their ancestors.
     pins: Vec<PathPin>,
 }
 
-struct NativeLaunch<'a> {
+/// Private checked execution core shared below separate daemon and qualifier
+/// entry points. Neither entry can mint or convert into the other's authority.
+struct CheckedLaunchCore<'a> {
     child: Child,
     workers: Option<WorkerSet>,
     gate: std::sync::Arc<DispatchGate>,
     pins: std::sync::Arc<[PathPin]>,
     setup_vars_handoff: Option<File>,
-    installer_writers: Vec<usize>,
+    writers: Vec<usize>,
+    stock: StockLaunch<'a>,
+    finalization: Option<(super::PairSlots, [usize; 2])>,
     kind: PlanKind,
     installer: Option<InstallerStage>,
-    _authority: &'a LaunchAuthority,
-    // A mutating qemu-img launch stays borrowed against its offline lease.
-    _offline: Option<&'a OfflineLease>,
 }
 
-type PipeQmp = Qmp<tokio::io::DuplexStream, tokio::io::DuplexStream>;
-type SerialGuest = GuestChannel<tokio::net::windows::named_pipe::NamedPipeClient>;
-type BootIo = (tokio::io::DuplexStream, tokio::io::DuplexStream);
-
-enum BootOutcome {
-    Installed(Box<(PipeQmp, SerialGuest)>),
-    InstallerReleased,
-}
-
-enum BootFailure {
-    Native(NativeRefusal),
-    Installer(InstallerFailure),
-}
-
-impl From<ChannelError> for InstallerFailureReason {
-    fn from(error: ChannelError) -> Self {
-        match error {
-            ChannelError::Timeout => Self::Timeout,
-            ChannelError::Cancelled => Self::Cancelled,
-            error => Self::Protocol(error),
-        }
-    }
-}
-
-impl<'a> NativeLaunch<'a> {
-    /// Shared entry for sealed QEMU and qemu-img plans. There is no issuer
-    /// for LaunchAuthority in this slice.
-    fn hold(
-        authority: &'a LaunchAuthority,
-        token: &VmToken,
+impl<'a> CheckedLaunchCore<'a> {
+    fn hold_checked(
+        token: &'a VmToken,
         inputs: LaunchInputs<'a>,
+        refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
     ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
         let kind = inputs.plan.kind();
         // ADR 0064: a public-egress plan also stays closed until its patched
@@ -2113,24 +2501,51 @@ impl<'a> NativeLaunch<'a> {
             }
             _ => {}
         }
-        let mut installer_writers = Vec::new();
+        let stock = StockLaunch {
+            bundle: inputs.bundle,
+            token,
+            cwd: PathPin::open(inputs.cwd, true, false)?,
+        };
+        let writers = stock.verify_inputs(&inputs.plan, &inputs.pins, &inputs.workspace)?;
+        use super::runtime::InstallerPhase;
+        let finalization = match (kind, inputs.finalization_slots) {
+            (PlanKind::InstallerBoot(InstallerPhase::WindowsFinalize), Some(slots)) => {
+                let index = |role| {
+                    inputs
+                        .plan
+                        .installer_artifacts()
+                        .iter()
+                        .find(|input| input.role == role)
+                        .and_then(|input| {
+                            inputs.pins.iter().position(|pin| pin.path == *input.path)
+                        })
+                        .ok_or(NativeRefusal::PathCustodyUnverified)
+                };
+                Some((
+                    slots,
+                    [
+                        index(ArtifactRole::TestInstallDisk)?,
+                        index(ArtifactRole::Vars)?,
+                    ],
+                ))
+            }
+            (PlanKind::InstallerBoot(InstallerPhase::WindowsFinalize), None) | (_, Some(_)) => {
+                return Err(NativeRefusal::InstallerPhaseMismatch);
+            }
+            (_, None) => None,
+        };
         let mut setup_vars = None;
         for expected in inputs.plan.installer_artifacts() {
             let (index, setup_digest) = bind_installer_pin(expected, &inputs.pins)?;
             if let Some(digest) = setup_digest {
                 setup_vars = Some((index, digest));
             }
-            if expected.role.writable() {
-                installer_writers.push(index);
-            }
         }
-        let offline = inputs.plan.offline_lease();
         let gate = std::sync::Arc::new(DispatchGate::default());
         let (stdio, parent) = token.stdio().map_err(|_| NativeRefusal::QmpUnverified)?;
-        let job = Job::new(inputs.memory, Some(inputs.cpu_rate))
+        let job = Job::with_process_limit(inputs.memory, Some(inputs.cpu_rate), Some(1))
             .map_err(|_| NativeRefusal::JobUnverified)?;
-        let environment = launch_environment(inputs.loader_root, inputs.scratch)
-            .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
+        let environment = qualification::inventory::restricted_environment(inputs.cwd)?;
         let setup_vars_handoff = setup_vars
             .map(|(index, digest)| guard_setup_vars(&inputs.pins[index], digest))
             .transpose()?;
@@ -2140,6 +2555,14 @@ impl<'a> NativeLaunch<'a> {
         {
             return Err(NativeRefusal::InstallerDeadlineExpired);
         }
+        // Recheck all consumed inputs, bundle and workspace custody right at
+        // the actual process-creation edge.
+        stock.recheck_all(&inputs.pins, Some(&inputs.workspace))?;
+        fresh_observation(
+            refresh()?,
+            std::time::Instant::now(),
+            NativeRefusal::ReservesUnverified,
+        )?;
         let child = spawn(
             Launch::Restricted {
                 token: &token.token,
@@ -2151,13 +2574,44 @@ impl<'a> NativeLaunch<'a> {
             stdio,
         )
         .map_err(|_| NativeRefusal::JobUnverified)?;
-        let actual = process_token(child.process.as_raw_handle(), TOKEN_QUERY)
-            .map_err(|_| NativeRefusal::IdentityUnverified)?;
-        token
-            .verify(&actual)
-            .map_err(|_| NativeRefusal::IdentityUnverified)?;
-        let (read, write, workers) =
-            start_stdio(parent, gate.clone()).map_err(|_| NativeRefusal::QmpUnverified)?;
+        // Every post-spawn error must explicitly terminate and wait on the
+        // created child/Job before returning.
+        let settle_spawned = |child: Child| {
+            let _ = child.job.terminate();
+            let _ = wait(&child.process, 2_000);
+            drop(child);
+        };
+        let program = if matches!(kind, PlanKind::Boot | PlanKind::InstallerBoot(_)) {
+            "qemu-system-x86_64.exe"
+        } else {
+            "qemu-img.exe"
+        };
+        let expected_image = match inputs.bundle.identity(program) {
+            Ok(id) => id,
+            Err(reason) => {
+                settle_spawned(child);
+                return Err(reason);
+            }
+        };
+        if let Err(reason) = verify_image(&child, inputs.plan.image(), expected_image)
+            .and_then(|()| verify_child_policy(&child, token))
+            .and_then(|()| {
+                child
+                    .job
+                    .verify_limits(inputs.memory, Some(inputs.cpu_rate), Some(1))
+                    .map_err(|_| NativeRefusal::JobUnverified)
+            })
+        {
+            settle_spawned(child);
+            return Err(reason);
+        }
+        let (read, write, workers) = match start_stdio(parent, gate.clone()) {
+            Ok(started) => started,
+            Err(_) => {
+                settle_spawned(child);
+                return Err(NativeRefusal::QmpUnverified);
+            }
+        };
         Ok((
             Self {
                 child,
@@ -2165,9 +2619,100 @@ impl<'a> NativeLaunch<'a> {
                 gate,
                 pins: inputs.pins.into(),
                 setup_vars_handoff,
-                installer_writers,
+                writers,
+                stock,
+                finalization,
                 kind,
                 installer: inputs.installer,
+            },
+            read,
+            write,
+        ))
+    }
+}
+
+/// Private qualifier-only entry point below the checked execution core.
+/// Accepts only sealed TEST plans and held disposable workspace custody,
+/// with no path to daemon `LaunchAuthority` or `OfflineLease`.
+#[allow(dead_code, reason = "recipe collectors wire this entry in PR 2")]
+struct QualifierPlanPermit {
+    run: [u8; 16],
+    generation: u64,
+}
+
+#[allow(dead_code, reason = "recipe collectors wire this entry in PR 2")]
+struct QualifierLaunch<'a> {
+    core: CheckedLaunchCore<'a>,
+}
+
+#[allow(dead_code, reason = "recipe collectors wire this entry in PR 2")]
+impl<'a> QualifierLaunch<'a> {
+    fn hold(
+        permit: &QualifierPlanPermit,
+        token: &'a VmToken,
+        inputs: LaunchInputs<'a>,
+        refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
+        if inputs.workspace.run != permit.run
+            || inputs.workspace.generation != permit.generation
+            || inputs.plan.offline_lease().is_some()
+            || !matches!(
+                inputs.plan.kind(),
+                PlanKind::Boot | PlanKind::InstallerBoot(_) | PlanKind::Inspect
+            )
+        {
+            return Err(NativeRefusal::QualificationMissing);
+        }
+        let (core, read, write) = CheckedLaunchCore::hold_checked(token, inputs, refresh)?;
+        Ok((Self { core }, read, write))
+    }
+}
+
+struct NativeLaunch<'a> {
+    core: CheckedLaunchCore<'a>,
+    _authority: &'a LaunchAuthority,
+    // A mutating qemu-img launch stays borrowed against its offline lease.
+    _offline: Option<&'a OfflineLease>,
+}
+
+type PipeQmp = Qmp<tokio::io::DuplexStream, tokio::io::DuplexStream>;
+type SerialGuest = GuestChannel<tokio::net::windows::named_pipe::NamedPipeClient>;
+type BootIo = (tokio::io::DuplexStream, tokio::io::DuplexStream);
+
+enum BootOutcome {
+    Installed(Box<(PipeQmp, SerialGuest)>),
+    InstallerReleased(Option<offline_read::ReleasedPair>),
+}
+
+enum BootFailure {
+    Native(NativeRefusal),
+    Installer(InstallerFailure),
+}
+
+impl From<ChannelError> for InstallerFailureReason {
+    fn from(error: ChannelError) -> Self {
+        match error {
+            ChannelError::Timeout => Self::Timeout,
+            ChannelError::Cancelled => Self::Cancelled,
+            error => Self::Protocol(error),
+        }
+    }
+}
+
+impl<'a> NativeLaunch<'a> {
+    /// Daemon entry for sealed QEMU and qemu-img plans. There is no issuer
+    /// for LaunchAuthority in this slice.
+    fn hold(
+        authority: &'a LaunchAuthority,
+        token: &'a VmToken,
+        inputs: LaunchInputs<'a>,
+        refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
+        let offline = inputs.plan.offline_lease();
+        let (core, read, write) = CheckedLaunchCore::hold_checked(token, inputs, refresh)?;
+        Ok((
+            Self {
+                core,
                 _authority: authority,
                 _offline: offline,
             },
@@ -2185,23 +2730,24 @@ impl<'a> NativeLaunch<'a> {
         mut revalidate: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<BootOutcome, BootFailure> {
-        if let Some(stage) = self.installer {
+        if let Some(stage) = self.core.installer {
             return self
                 .boot_installer(stage, io, cancel, &mut revalidate, verify_release)
                 .await
                 .map_err(BootFailure::Installer);
         }
         let (token, serial) = endpoint
-            .filter(|_| self.kind == PlanKind::Boot)
+            .filter(|_| self.core.kind == PlanKind::Boot)
             .ok_or(BootFailure::Native(NativeRefusal::QmpUnverified))?;
-        self.child
+        self.core
+            .child
             .resume_checked(cancel, &mut revalidate)
             .map_err(BootFailure::Native)?;
         // Workers are already draining. Do not await the QMP greeting while
         // QEMU may be waiting for a client at CreateNamedPipe/ConnectNamedPipe.
         let pipe = connect_serial(
             serial,
-            &self.child,
+            &self.core.child,
             token.account.0,
             &token.entries(),
             cancel,
@@ -2234,16 +2780,21 @@ impl<'a> NativeLaunch<'a> {
         revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
         stage: Option<InstallerStage>,
     ) -> Result<(), InstallerFailureReason> {
-        // Resample between the prelaunch status receipt and `cont`, and arm the
-        // stdin worker with that sample's deadline.
+        // Resample between the prelaunch status receipt and `cont`, rechecking
+        // bundle, search namespace and all consumed input pins before arming.
         let mut refused = None;
-        let gate = self.gate.clone();
+        let gate = self.core.gate.clone();
         let released = qmp
             .release_startup_hold(cancel, || {
-                let armed = revalidate().and_then(|captured| match stage {
-                    Some(stage) => gate.arm_until(captured, Some(stage.deadline().into_std())),
-                    None => gate.arm(captured),
-                });
+                let armed = self
+                    .core
+                    .stock
+                    .recheck_all(&self.core.pins, None)
+                    .and_then(|()| revalidate())
+                    .and_then(|captured| match stage {
+                        Some(stage) => gate.arm_until(captured, Some(stage.deadline().into_std())),
+                        None => gate.arm(captured),
+                    });
                 match armed {
                     Ok(()) => true,
                     Err(reason) => {
@@ -2265,11 +2816,12 @@ impl<'a> NativeLaunch<'a> {
                 biased;
                 _ = cancel.cancelled() => return Err(InstallerFailureReason::Cancelled),
                 _ = tokio::time::sleep_until(deadline) => return Err(InstallerFailureReason::Timeout),
-                result = self.gate.settle(grace) => result,
+                result = self.core.gate.settle(grace) => result,
             }
         } else {
-            self.gate.settle(grace).await
-        }.map_err(InstallerFailureReason::Native)
+            self.core.gate.settle(grace).await
+        }
+        .map_err(InstallerFailureReason::Native)
     }
 
     async fn boot_installer(
@@ -2291,10 +2843,10 @@ impl<'a> NativeLaunch<'a> {
             if Instant::now() >= deadline {
                 return Err(Failure::Timeout);
             }
-            self.child.resume_checked_with_handoff(cancel, revalidate, || {
+            self.core.child.resume_checked_with_handoff(cancel, revalidate, || {
                 // QEMU opens writable pflash by name after resume. The
                 // original object and ancestry pin stays held across it.
-                drop(self.setup_vars_handoff.take());
+                drop(self.core.setup_vars_handoff.take());
             }).map_err(Failure::Native)?;
             let (read, write) = io;
             let mut qmp = Qmp::installer_handshake(read, write, cancel, stage).await?;
@@ -2321,9 +2873,9 @@ impl<'a> NativeLaunch<'a> {
                 biased;
                 _ = cancel.cancelled() => Err(Failure::Cancelled),
                 _ = sleep_until(exit_by) => Err(Failure::Timeout),
-                result = self.child.reap(exit_by) => {
+                result = self.core.child.reap(exit_by) => {
                     result.map_err(|_| Failure::ReleaseUnverified)?;
-                    (self.child.exit_code() == Ok(0)).then_some(()).ok_or(Failure::ProcessFailed)
+                    (self.core.child.exit_code() == Ok(0)).then_some(()).ok_or(Failure::ProcessFailed)
                 }
             }
         }.await;
@@ -2332,7 +2884,7 @@ impl<'a> NativeLaunch<'a> {
             Ok(()) => deadline.min(Instant::now() + grace),
             Err(reason) => {
                 // Failure teardown has an independent bound after stage expiry.
-                if self.child.job.terminate().is_err() {
+                if self.core.child.job.terminate().is_err() {
                     return Err(InstallerFailure {
                         phase: stage.phase(),
                         reason,
@@ -2346,7 +2898,24 @@ impl<'a> NativeLaunch<'a> {
             .release_evidence(result.is_ok(), result.is_ok(), release_by, verify_release)
             .await;
         stage.complete(result, observed, cancel.is_cancelled())?;
-        Ok(BootOutcome::InstallerReleased)
+        let released = match self.core.finalization {
+            Some((slots, indices)) => {
+                let readers = offline_read::ReleasedPair::hold(
+                    slots,
+                    self.core.pins.clone(),
+                    indices,
+                    observed,
+                )
+                .map_err(|_| InstallerFailure {
+                    phase: stage.phase(),
+                    reason: Failure::ReleaseUnverified,
+                    recovery: StopDisposition::ChargedQuarantine,
+                })?;
+                Some(readers)
+            }
+            None => None,
+        };
+        Ok(BootOutcome::InstallerReleased(released))
     }
 
     /// Every caller, including a failed boot, must reconcile this owned launch.
@@ -2362,9 +2931,9 @@ impl<'a> NativeLaunch<'a> {
             observed.guest_shutdown = qmp.powerdown(cancel).await.is_ok();
         }
         let grace = tokio::time::Instant::now() + Duration::from_secs(2);
-        if observed.guest_shutdown && self.child.reap(grace).await.is_ok() {
-            observed.clean_process_exit = self.child.exit_code() == Ok(0);
-        } else if self.child.job.terminate().is_err() {
+        if observed.guest_shutdown && self.core.child.reap(grace).await.is_ok() {
+            observed.clean_process_exit = self.core.child.exit_code() == Ok(0);
+        } else if self.core.child.job.terminate().is_err() {
             return StopDisposition::ChargedQuarantine;
         }
         self.release_evidence(
@@ -2388,15 +2957,15 @@ impl<'a> NativeLaunch<'a> {
             clean_process_exit,
             ..StopEvidence::default()
         };
-        observed.process_exited = self.child.reap(deadline).await.is_ok();
-        observed.job_empty = matches!(self.child.job.active(), Ok(0));
-        observed.workers_joined = if let Some(workers) = self.workers.take() {
+        observed.process_exited = self.core.child.reap(deadline).await.is_ok();
+        observed.job_empty = matches!(self.core.child.job.active(), Ok(0));
+        observed.workers_joined = if let Some(workers) = self.core.workers.take() {
             workers.join(deadline).await.is_ok()
         } else {
             false
         };
-        let pins = self.pins.clone();
-        let writers = self.installer_writers.clone();
+        let pins = self.core.pins.clone();
+        let writers = self.core.writers.clone();
         finish_release(
             observed,
             deadline,

@@ -101,7 +101,70 @@ impl Bundle {
     }
 }
 
-pub(super) fn binding(pin: &PathPin) -> Result<(), NativeRefusal> {
+pub(in crate::vm::windows) fn safe_dll_search() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW,
+    };
+    let mut value = 0u32;
+    let mut size = size_of_val(&value) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            wide(r"SYSTEM\CurrentControlSet\Control\Session Manager").as_ptr(),
+            wide("SafeDllSearchMode").as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            ptr_of(&mut value),
+            &mut size,
+        )
+    };
+    // Safe DLL search is on by default. An explicit value must enable it.
+    status == ERROR_FILE_NOT_FOUND || (status == ERROR_SUCCESS && size == 4 && value == 1)
+}
+
+pub(in crate::vm::windows) fn restricted_environment(
+    cwd: &LocalPath,
+) -> Result<Vec<u16>, NativeRefusal> {
+    let mut root = [0u16; 260];
+    let size = unsafe { GetSystemWindowsDirectoryW(root.as_mut_ptr(), root.len() as u32) } as usize;
+    let reason = NativeRefusal::PathCustodyUnverified;
+    if size == 0 || size >= root.len() {
+        return Err(reason);
+    }
+    let root = String::from_utf16(&root[..size]).map_err(|_| reason)?;
+    let mut env = Vec::new();
+    for (key, value) in [
+        ("SystemRoot", root.as_str()),
+        ("TEMP", cwd.as_str()),
+        ("TMP", cwd.as_str()),
+        ("WINDIR", root.as_str()),
+    ] {
+        env.extend(format!("{key}={value}").encode_utf16().chain(Some(0)));
+    }
+    env.push(0);
+    Ok(env)
+}
+
+/// The shared initial search namespace. The working directory remains
+/// held and empty. The bundle retains every reviewed exact-case leaf.
+pub(in crate::vm::windows) fn validate_launch_namespace(
+    bundle: &Bundle,
+    cwd: &PathPin,
+    owner: PSID,
+    safe_search: bool,
+) -> Result<(), NativeRefusal> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    if !safe_search
+        || !protected_directory(&cwd.leaf, owner)
+        || !listing_bounded(&cwd.leaf, 0, Some(deadline)).is_ok_and(|entries| entries.is_empty())
+    {
+        return Err(NativeRefusal::PathCustodyUnverified);
+    }
+    binding(cwd)?;
+    bundle.protected(owner, deadline)
+}
+
+pub(in crate::vm::windows) fn binding(pin: &PathPin) -> Result<(), NativeRefusal> {
     // PathPin retains every non-reparse component. Reconfirm the one
     // external lookup, the drive letter, against the held volume root.
     let root = pin._ancestors.first().unwrap_or(&pin.leaf);

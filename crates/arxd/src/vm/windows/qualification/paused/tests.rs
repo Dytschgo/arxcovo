@@ -46,7 +46,9 @@ fn live() -> Live {
     }
 }
 
-const PEAK: Peak = Peak {
+const PEAK: JobEnvelope = JobEnvelope {
+    job_memory_bytes: JOB_MEMORY_BYTES,
+    job_cpu_rate: JOB_CPU_RATE,
     outside_ram_bytes: GIB,
     outside_cpu_rate: 250,
     inner_bytes: 1024 * 1024,
@@ -205,6 +207,14 @@ struct Fake {
     proof_workspace_held: Cell<bool>,
     owner_active_at: Option<Step>,
     owner_active: Cell<bool>,
+    channel_override: RefCell<Option<FakeReader>>,
+    channel_fail: Option<NativeRefusal>,
+    opened_channels: RefCell<Vec<String>>,
+    armed_fault: Cell<Option<ControlledFault>>,
+    suppress_fault_denial: bool,
+    stop_done: Cell<Option<StopProtocol>>,
+    clean_exit: bool,
+    completed_phases: Cell<PausedCompleted>,
 }
 
 impl Default for Fake {
@@ -237,6 +247,14 @@ impl Default for Fake {
             proof_workspace_held: Cell::default(),
             owner_active_at: None,
             owner_active: Cell::default(),
+            channel_override: RefCell::default(),
+            channel_fail: None,
+            opened_channels: RefCell::default(),
+            armed_fault: Cell::default(),
+            suppress_fault_denial: false,
+            stop_done: Cell::default(),
+            clean_exit: false,
+            completed_phases: Cell::default(),
         }
     }
 }
@@ -286,6 +304,10 @@ impl Fake {
     }
 
     async fn run_for(&mut self, budget: Duration) -> TrialResult {
+        self.run_purpose(LaunchPurpose::Paused, budget).await
+    }
+
+    async fn run_purpose(&mut self, purpose: LaunchPurpose<'_>, budget: Duration) -> TrialResult {
         let lat = |text| LocalPath::parse(text).unwrap();
         let image = lat(r"X:\fixture\qemu-system-x86_64.exe");
         let data = lat(r"X:\fixture\share");
@@ -294,6 +316,7 @@ impl Fake {
             image: &image,
             data: &data,
             bios: &bios,
+            purpose,
         };
         let cancel = self.cancel.clone();
         run(self, &plan, &cancel, Tick::now() + budget, BUDGET).await
@@ -305,13 +328,17 @@ impl Host for Fake {
     type Slot = FakeSlot;
     type Reader = FakeReader;
     type Writer = FakeWriter;
+    type Channel = FakeReader;
 
-    fn open_contract(&mut self, _: &PausedPlan<'_>) -> Result<(FakeOpens, Peak), NativeRefusal> {
+    fn open_contract(
+        &mut self,
+        _: &PausedPlan<'_>,
+    ) -> Result<(FakeOpens, JobEnvelope), NativeRefusal> {
         self.step(Step::ProveContract)?;
         Ok((FakeOpens, PEAK))
     }
 
-    fn live(&self) -> Result<Live, NativeRefusal> {
+    fn live(&self, _: JobEnvelope) -> Result<Live, NativeRefusal> {
         let mut observation = live();
         if self.expiring_sample == Some(self.live_calls.get()) {
             observation.captured -= FRESHNESS - OBSERVATION_REMAINING;
@@ -331,10 +358,22 @@ impl Host for Fake {
         if self.proof_workspace_held.get() {
             observation.available_ram_bytes = RAM_RESERVE;
         }
+        if let Some(fault) = self.armed_fault.take()
+            && !self.suppress_fault_denial
+        {
+            match fault {
+                ControlledFault::WtsAmbiguity => {
+                    return Err(NativeRefusal::OwnerActivityUnverified);
+                }
+                ControlledFault::CpuReserve => observation.effective_cpus = 1,
+                ControlledFault::RamReserve => observation.available_ram_bytes = RAM_RESERVE,
+                ControlledFault::DiskReserve => observation.limits.inner_caller_free_bytes = 0,
+            }
+        }
         Ok(observation)
     }
 
-    fn claim(&mut self, _: &Live, _: Peak) -> Result<FakeSlot, NativeRefusal> {
+    fn claim(&mut self, _: &Live, _: JobEnvelope) -> Result<FakeSlot, NativeRefusal> {
         self.step(Step::Claim)?;
         assert!(!self.charge_retained);
         self.charge_retained = true;
@@ -354,38 +393,40 @@ impl Host for Fake {
     ) -> Result<(), NativeRefusal> {
         assert!(self.charge_retained);
         assert_eq!(plan.image.as_str(), r"X:\fixture\qemu-system-x86_64.exe");
-        assert_eq!(
-            plan.args(),
-            [
-                "-no-user-config",
-                "-nodefaults",
-                "-display",
-                "none",
-                "-serial",
-                "none",
-                "-monitor",
-                "none",
-                "-nic",
-                "none",
-                "-accel",
-                "whpx",
-                "-machine",
-                "pc-q35-11.1",
-                "-smp",
-                "1",
-                "-m",
-                "256M",
-                "-L",
-                r"X:\fixture\share",
-                "-bios",
-                r"X:\fixture\share\bios-256k.bin",
-                "-S",
-                "-chardev",
-                "stdio,id=arxqmp,signal=off",
-                "-mon",
-                "chardev=arxqmp,mode=control",
-            ]
-        );
+        if matches!(plan.purpose, LaunchPurpose::Paused) {
+            assert_eq!(
+                plan.args(),
+                [
+                    "-no-user-config",
+                    "-nodefaults",
+                    "-display",
+                    "none",
+                    "-serial",
+                    "none",
+                    "-monitor",
+                    "none",
+                    "-nic",
+                    "none",
+                    "-accel",
+                    "whpx",
+                    "-machine",
+                    "pc-q35-11.1",
+                    "-smp",
+                    "1",
+                    "-m",
+                    "256M",
+                    "-L",
+                    r"X:\fixture\share",
+                    "-bios",
+                    r"X:\fixture\share\bios-256k.bin",
+                    "-S",
+                    "-chardev",
+                    "stdio,id=arxqmp,signal=off",
+                    "-mon",
+                    "chardev=arxqmp,mode=control",
+                ]
+            );
+        }
         self.step(Step::Create)?;
         self.checkpoint(Step::Create).await;
         Ok(())
@@ -394,6 +435,7 @@ impl Host for Fake {
     async fn verify_child(
         &self,
         _: &FakeSlot,
+        _: JobEnvelope,
     ) -> Result<Pipes<Self::Reader, Self::Writer>, NativeRefusal> {
         self.step(Step::InspectChild)?;
         self.checkpoint(Step::InspectChild).await;
@@ -468,6 +510,53 @@ impl Host for Fake {
         Ok(())
     }
 
+    async fn open_channel(
+        &self,
+        _: &FakeSlot,
+        name: &SerialName,
+        _: &Shutdown,
+        _: Tick,
+    ) -> Result<Self::Channel, NativeRefusal> {
+        self.opened_channels
+            .borrow_mut()
+            .push(name.basename().to_owned());
+        if let Some(reason) = self.channel_fail {
+            return Err(reason);
+        }
+        Ok(self
+            .channel_override
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| Box::new(tokio::io::empty())))
+    }
+
+    fn mark_phase_complete(&self, _: &FakeSlot, phase: PausedPhase) {
+        let mut done = self.completed_phases.get();
+        match phase {
+            PausedPhase::SuspendedChild => done.suspended_child = true,
+            PausedPhase::Prelaunch => done.prelaunch = true,
+            PausedPhase::BundleInventory => done.bundle_inventory = true,
+        }
+        self.completed_phases.set(done);
+    }
+
+    fn mark_stop_protocol_done(&self, _: &FakeSlot, protocol: StopProtocol) {
+        self.stop_done.set(Some(protocol));
+    }
+
+    fn completed_stop_protocol(&self, _: &FakeSlot) -> Option<StopProtocol> {
+        self.stop_done.get()
+    }
+
+    fn arm_fault(&self, _: &FakeSlot, fault: ControlledFault) -> Result<(), NativeRefusal> {
+        self.armed_fault.set(Some(fault));
+        Ok(())
+    }
+
+    fn lose_supervisor(&self, _: &FakeSlot) -> Result<(), NativeRefusal> {
+        Ok(())
+    }
+
     fn request_stop(&mut self, _: &FakeSlot) {
         self.steps.borrow_mut().push(Step::Stop);
         self.proof_workspace_held.set(false);
@@ -480,6 +569,8 @@ impl Host for Fake {
             tokio::time::sleep_until(deadline).await;
         }
         StopEvidence {
+            guest_shutdown: self.stop_done.get() == Some(StopProtocol::QmpPowerdown),
+            clean_process_exit: self.clean_exit,
             process_exited: !matches!(self.stop, Stop::ChildAlive),
             // Supervisor loss can provide a signaled wait-only process
             // handle. It cannot alone establish the whole Job was empty.
@@ -525,12 +616,21 @@ async fn exact_recipe_and_qmp_pause_require_custody_and_settle() {
             Step::Create,
             Step::InspectChild,
             Step::Resume,
-            Step::VerifyOpens,
             Step::VerifyWhpx,
+            Step::VerifyOpens,
             Step::Stop,
             Step::Reopen,
             Step::Settle,
         ]
+    );
+    assert!(host.opened_channels.borrow().is_empty());
+    assert_eq!(
+        host.completed_phases.get(),
+        PausedCompleted {
+            suspended_child: true,
+            prelaunch: true,
+            bundle_inventory: true,
+        }
     );
     assert_eq!(host.written.borrow().as_slice(),
         b"{\"execute\":\"qmp_capabilities\",\"id\":1}\r\n{\"execute\":\"query-status\",\"id\":2}\r\n");
@@ -597,12 +697,21 @@ async fn preflight_capability_cannot_substitute_for_whpx_initialization() {
     };
     assert_eq!(host.run().await.paused, Err(Failure::Refused(refusal)));
     assert!(host.steps().ends_with(&[
-        Step::VerifyOpens,
+        Step::Resume,
         Step::VerifyWhpx,
         Step::Stop,
         Step::Reopen,
         Step::Settle
     ]));
+    assert!(!host.steps().contains(&Step::VerifyOpens));
+    assert_eq!(
+        host.completed_phases.get(),
+        PausedCompleted {
+            suspended_child: true,
+            prelaunch: false,
+            bundle_inventory: false,
+        }
+    );
 }
 
 #[tokio::test]
@@ -1123,7 +1232,7 @@ async fn expiring_observation_gates_the_first_resume_poll() {
 
 #[tokio::test(start_paused = true)]
 async fn expiring_observation_gates_proof_completion_and_pause_acceptance() {
-    for (proof, sample_call) in [(Step::VerifyOpens, 6), (Step::VerifyWhpx, 7)] {
+    for (proof, sample_call) in [(Step::VerifyWhpx, 6), (Step::VerifyOpens, 7)] {
         let (signal, receiver) = tokio::sync::oneshot::channel();
         let mut host = Fake {
             expiring_sample: Some(sample_call),
@@ -1190,7 +1299,7 @@ async fn expiring_observation_in_the_final_sample_prevents_accepting_pause() {
     );
     assert!(
         host.steps()
-            .ends_with(&[Step::VerifyWhpx, Step::Stop, Step::Reopen, Step::Settle])
+            .ends_with(&[Step::VerifyOpens, Step::Stop, Step::Reopen, Step::Settle])
     );
 }
 
@@ -1315,19 +1424,361 @@ fn reserve_check_includes_nested_cpu_capacity_and_outside_job_ram() {
 #[test]
 fn accounting_checks_both_free_bounds_cap_and_outstanding_charges() {
     let mut sample = live();
-    assert_eq!(sample.check_disk(PEAK), Ok(()));
+    assert_eq!(
+        sample.check_disk(PEAK.inner_bytes, PEAK.outer_bytes),
+        Ok(())
+    );
     sample.outstanding_inner_bytes = 70 * GIB;
-    assert_eq!(sample.check_disk(PEAK), Err(DISK));
+    assert_eq!(
+        sample.check_disk(PEAK.inner_bytes, PEAK.outer_bytes),
+        Err(DISK)
+    );
     sample.outstanding_inner_bytes = 0;
     sample.outstanding_outer_bytes = 10 * GIB;
-    assert_eq!(sample.check_disk(PEAK), Err(DISK));
+    assert_eq!(
+        sample.check_disk(PEAK.inner_bytes, PEAK.outer_bytes),
+        Err(DISK)
+    );
     sample.outstanding_outer_bytes = 0;
     sample.limits.outer_total_free_bytes = OUTER_FLOOR;
-    assert_eq!(sample.check_disk(PEAK), Err(DISK));
+    assert_eq!(
+        sample.check_disk(PEAK.inner_bytes, PEAK.outer_bytes),
+        Err(DISK)
+    );
     sample.limits.outer_total_free_bytes = 60 * GIB;
     sample.limits.disk_budget_bytes = 98 * GIB;
-    assert_eq!(sample.check_disk(PEAK), Err(DISK));
+    assert_eq!(
+        sample.check_disk(PEAK.inner_bytes, PEAK.outer_bytes),
+        Err(DISK)
+    );
     sample.limits.inner_total_bytes = DISK_CEILING + GIB;
     sample.limits.disk_budget_bytes = DISK_CEILING + GIB;
-    assert_eq!(sample.check_disk(PEAK), Err(DISK));
+    assert_eq!(
+        sample.check_disk(PEAK.inner_bytes, PEAK.outer_bytes),
+        Err(DISK)
+    );
+}
+
+#[tokio::test]
+async fn exact_firmware_marker_is_bounded_and_typed() {
+    assert_eq!(
+        firmware_sec(&b"startup\r\nSecCoreStartupWithStack(0xFF, 0x40100)\r\n"[..]).await,
+        Ok(())
+    );
+    for invalid in [
+        b"SecCoreStartupWithStack(0xFF, 0xGG)\n".as_slice(),
+        b"fake SecCoreStartupWithStack(0xFF, 0x100)\n".as_slice(),
+        b"SecCoreStartupWithStack(0xFF, 0x100)".as_slice(),
+    ] {
+        assert_eq!(
+            firmware_sec(invalid).await,
+            Err(Failure::Qmp(ChannelError::Eof))
+        );
+    }
+    assert_eq!(
+        firmware_sec(&vec![b'x'; 257][..]).await,
+        Err(Failure::Qmp(ChannelError::Oversize))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn launch_purpose_derives_exact_channel_prelaunch_quiet_and_stop_verb() {
+    use tokio::io::AsyncWriteExt;
+
+    let lat = |text| LocalPath::parse(text).unwrap();
+    let code = lat(r"X:\fixture\share\edk2-x86_64-code.fd");
+    let vars = lat(r"X:\fixture\share\edk2-i386-vars.fd");
+    let console = SerialName::generate().unwrap();
+
+    // Full Firmware path: opens exact generated console, waits quiet window,
+    // releases -S, receives SEC marker, issues QMP quit, and gets CleanRelease.
+    let (ch_read, mut ch_write) = tokio::io::duplex(256);
+    let qmp_replies = format!(
+        "{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n\
+         {{\"return\":{{\"running\":false,\"status\":\"prelaunch\"}},\"id\":3}}\n\
+         {{\"return\":{{}},\"id\":4}}\n\
+         {{\"return\":{{\"running\":true,\"status\":\"running\"}},\"id\":5}}\n\
+         {{\"return\":{{}},\"id\":6}}\n"
+    );
+    let mut host = Fake {
+        replies: Some(qmp_replies.clone()),
+        channel_override: RefCell::new(Some(Box::new(ch_read))),
+        clean_exit: true,
+        ..Fake::default()
+    };
+    let (result, ()) = tokio::join!(
+        host.run_purpose(
+            LaunchPurpose::Firmware(Firmware {
+                code: &code,
+                vars: &vars,
+                console: &console,
+            }),
+            BUDGET,
+        ),
+        async {
+            // Stay silent across the prelaunch quiet window, then emit SEC marker.
+            tokio::time::sleep(PRELAUNCH_QUIET_WINDOW + Duration::from_millis(10)).await;
+            let _ = ch_write
+                .write_all(b"SecCoreStartupWithStack(0xFF, 0x40100)\r\n")
+                .await;
+        }
+    );
+    assert_eq!(
+        result,
+        TrialResult {
+            paused: Ok(()),
+            release: StopDisposition::CleanRelease,
+        }
+    );
+    assert_eq!(
+        host.opened_channels.borrow().as_slice(),
+        [console.basename()]
+    );
+    assert!(String::from_utf8_lossy(&host.written.borrow()).contains("\"execute\":\"quit\""));
+
+    // Delayed early frame inside the prelaunch quiet window MUST refuse.
+    let (early_read, mut early_write) = tokio::io::duplex(64);
+    let mut early_host = Fake {
+        replies: Some(format!("{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n")),
+        channel_override: RefCell::new(Some(Box::new(early_read))),
+        ..Fake::default()
+    };
+    let (early_result, ()) = tokio::join!(
+        early_host.run_purpose(
+            LaunchPurpose::Firmware(Firmware {
+                code: &code,
+                vars: &vars,
+                console: &console,
+            }),
+            BUDGET,
+        ),
+        async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = early_write.write_all(b"early").await;
+        }
+    );
+    assert_eq!(
+        early_result.paused,
+        Err(Failure::Refused(NativeRefusal::GuestEndpointUnverified))
+    );
+    assert!(
+        !String::from_utf8_lossy(&early_host.written.borrow()).contains("\"execute\":\"cont\"")
+    );
+
+    // Wrong PID / missing pipe failure at open_channel stops and settles without QMP.
+    let mut missing_pipe = Fake {
+        channel_fail: Some(NativeRefusal::GuestEndpointUnverified),
+        ..Fake::default()
+    };
+    let pipe_res = missing_pipe
+        .run_purpose(
+            LaunchPurpose::Firmware(Firmware {
+                code: &code,
+                vars: &vars,
+                console: &console,
+            }),
+            BUDGET,
+        )
+        .await;
+    assert_eq!(
+        pipe_res.paused,
+        Err(Failure::Refused(NativeRefusal::GuestEndpointUnverified))
+    );
+    assert!(missing_pipe.written.borrow().is_empty());
+
+    // Even when QMP quit succeeded cleanly, a failed exclusive reopen MUST
+    // quarantine and retain the charge rather than returning CleanRelease.
+    let (q_read, mut q_write) = tokio::io::duplex(256);
+    let mut bad_reopen_fw = Fake {
+        replies: Some(qmp_replies),
+        channel_override: RefCell::new(Some(Box::new(q_read))),
+        clean_exit: true,
+        reopen: false,
+        ..Fake::default()
+    };
+    let (q_res, ()) = tokio::join!(
+        bad_reopen_fw.run_purpose(
+            LaunchPurpose::Firmware(Firmware {
+                code: &code,
+                vars: &vars,
+                console: &console,
+            }),
+            BUDGET,
+        ),
+        async {
+            tokio::time::sleep(PRELAUNCH_QUIET_WINDOW + Duration::from_millis(10)).await;
+            let _ = q_write
+                .write_all(b"SecCoreStartupWithStack(0xFF, 0x40100)\r\n")
+                .await;
+        }
+    );
+    assert_eq!(q_res.paused, Ok(()));
+    assert_eq!(q_res.release, StopDisposition::ChargedQuarantine);
+    assert!(bad_reopen_fw.charge_retained);
+}
+
+#[tokio::test(start_paused = true)]
+async fn controlled_faults_traverse_live_poll_refusal_to_stop_and_quarantine_on_bad_reopen() {
+    for (fault, expected) in [
+        (
+            ControlledFault::WtsAmbiguity,
+            NativeRefusal::OwnerActivityUnverified,
+        ),
+        (
+            ControlledFault::CpuReserve,
+            NativeRefusal::ReservesUnverified,
+        ),
+        (
+            ControlledFault::RamReserve,
+            NativeRefusal::ReservesUnverified,
+        ),
+        (
+            ControlledFault::DiskReserve,
+            NativeRefusal::DiskCeilingUnverified,
+        ),
+    ] {
+        let mut host = Fake::default();
+        let result = host
+            .run_purpose(LaunchPurpose::ControlledFault(fault), BUDGET)
+            .await;
+        assert_eq!(result.paused, Err(Failure::Refused(expected)), "{fault:?}");
+        assert_eq!(result.release, StopDisposition::DirtyRelease, "{fault:?}");
+        assert!(host.opened_channels.borrow().is_empty());
+        assert!(host.steps().ends_with(&[
+            Step::VerifyOpens,
+            Step::Stop,
+            Step::Reopen,
+            Step::Settle
+        ]));
+    }
+
+    // If a fault fails to trigger denial, the active LivePoll wait times out (fails!).
+    let mut no_denial = Fake {
+        suppress_fault_denial: true,
+        ..Fake::default()
+    };
+    assert_eq!(
+        no_denial
+            .run_purpose(
+                LaunchPurpose::ControlledFault(ControlledFault::CpuReserve),
+                BUDGET,
+            )
+            .await
+            .paused,
+        Err(Failure::Timeout)
+    );
+
+    // An uncertain reopen after fault refusal MUST retain the charge (ChargedQuarantine).
+    let mut bad_reopen = Fake {
+        reopen: false,
+        ..Fake::default()
+    };
+    let q = bad_reopen
+        .run_purpose(
+            LaunchPurpose::ControlledFault(ControlledFault::RamReserve),
+            BUDGET,
+        )
+        .await;
+    assert_eq!(
+        q,
+        TrialResult {
+            paused: Err(Failure::Refused(NativeRefusal::ReservesUnverified)),
+            release: StopDisposition::ChargedQuarantine,
+        }
+    );
+    assert!(bad_reopen.charge_retained);
+}
+
+#[tokio::test(start_paused = true)]
+async fn network_purpose_verifies_zero_hostfwd_channel_and_clean_powerdown_path() {
+    use tokio::io::AsyncWriteExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let make_pin = |name: &str, bytes: &[u8]| {
+        let p = temp.path().join(name);
+        std::fs::write(&p, bytes).unwrap();
+        let lp = LocalPath::parse(p.to_str().unwrap()).unwrap();
+        let mut pin = PathPin::open(&lp, false, false).unwrap();
+        pin.verify_content(
+            ArtifactPin {
+                size: bytes.len() as u64,
+                sha256: crate::vm::qualification_record::digest(bytes),
+            },
+            1024,
+        )
+        .unwrap();
+        pin
+    };
+    let source = super::super::test::NetworkInputs {
+        media: [
+            make_pin("iso.iso", b"iso"),
+            make_pin("vmlinuz", b"kernel"),
+            make_pin("initrd", b"initrd"),
+        ],
+        witnesses: crate::vm::guest::network_probe::fixture_targets(),
+        projection: [7; 32],
+    };
+    let seed = make_pin("cidata.iso", b"cidata");
+    let lat = |text| LocalPath::parse(text).unwrap();
+    let code = lat(r"X:\fixture\share\edk2-x86_64-code.fd");
+    let vars = lat(r"X:\fixture\share\edk2-i386-vars.fd");
+    let console = SerialName::generate().unwrap();
+    let nonce = [0x42; 16];
+
+    let plan = PausedPlan {
+        image: &lat(r"X:\fixture\qemu-system-x86_64.exe"),
+        data: &lat(r"X:\fixture\share"),
+        bios: &lat(r"X:\fixture\share\bios-256k.bin"),
+        purpose: LaunchPurpose::Network(NetworkBoot {
+            source: &source,
+            seed: &seed,
+            code: &code,
+            vars: &vars,
+            console: &console,
+            nonce,
+        }),
+    };
+    assert_eq!(plan.verify_network_isolation(), Ok(()));
+    assert_eq!(plan.purpose.envelope(), JobEnvelope::NETWORK_LIVE);
+    assert_eq!(plan.purpose.stop_protocol(), StopProtocol::QmpPowerdown);
+    assert_eq!(
+        plan.purpose.channel().map(SerialName::basename),
+        Some(console.basename())
+    );
+    let args = plan.args();
+    assert!(args.iter().any(|a| a == crate::vm::qemu_args::NETWORK));
+    assert!(args.iter().all(|a| !a.contains("hostfwd=")));
+    assert!(args.iter().any(|a| a.contains(console.basename())));
+
+    // Run through the Fake host with early bytes on the network channel: must refuse.
+    let (ch_read, mut ch_write) = tokio::io::duplex(64);
+    let mut host = Fake {
+        replies: Some(format!("{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n")),
+        channel_override: RefCell::new(Some(Box::new(ch_read))),
+        ..Fake::default()
+    };
+    let (res, ()) = tokio::join!(
+        host.run_purpose(
+            LaunchPurpose::Network(NetworkBoot {
+                source: &source,
+                seed: &seed,
+                code: &code,
+                vars: &vars,
+                console: &console,
+                nonce,
+            }),
+            BUDGET,
+        ),
+        async {
+            let _ = ch_write.write_all(b"X").await;
+        }
+    );
+    assert_eq!(
+        res.paused,
+        Err(Failure::Refused(NativeRefusal::GuestEndpointUnverified))
+    );
+    assert_eq!(
+        host.opened_channels.borrow().as_slice(),
+        [console.basename()]
+    );
 }
