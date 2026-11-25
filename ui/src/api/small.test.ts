@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import { incompatibility, formatBytes } from '../app/format';
 import { href, parseRoute, type Route } from '../app/router';
-import { parseCommandLine } from './command';
+import { exampleCommand, parseCommandLine } from './command';
 import { chooseAdapter } from './select';
 
 describe('adapter selection', () => {
@@ -13,6 +13,18 @@ describe('adapter selection', () => {
   test('the dev server and tests default to the stand-in and can opt into HTTP', () => {
     expect(chooseAdapter({ standinAllowed: true })).toBe('standin');
     expect(chooseAdapter({ standinAllowed: true, VITE_ARX_API: 'http' })).toBe('http');
+  });
+});
+
+describe('command example', () => {
+  test('is built from the first discovered tool and never invents git', () => {
+    expect(exampleCommand([{ name: 'cargo' }, { name: 'node' }])).toBe('cargo --version');
+    expect(exampleCommand([])).toBe('tool name and arguments');
+  });
+
+  test('an empty line is told to type a tool without naming a tool the host may lack', () => {
+    const empty = parseCommandLine('  ');
+    expect(empty).toEqual({ ok: false, error: 'Type a tool name followed by its arguments.' });
   });
 });
 

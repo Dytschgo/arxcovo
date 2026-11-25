@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import { parseCommandLine } from '../../api/command';
+import { exampleCommand, parseCommandLine } from '../../api/command';
 import { isApiError, type Host, type TerminalSession, type TerminalStatus } from '../../api/types';
 import { useApi, useResource, useSession } from '../context';
 import { href, navigate } from '../router';
@@ -162,7 +162,7 @@ function Terminal({ host }: { host: Host }) {
           spellCheck={false}
           autoCapitalize="none"
           maxLength={16384}
-          placeholder="git --version"
+          placeholder={exampleCommand(host.tools)}
           aria-describedby="terminal-help"
           aria-invalid={inputError ? true : undefined}
           disabled={status !== 'ready' && status !== 'running'}
