@@ -1330,3 +1330,39 @@ The fixed TEST provisioners configure the guest-only IPv4 default route
 through `10.0.2.2` for the installed VirtIO NIC. The installed endpoint
 checks the route before running the witness probes. The launcher continues
 to enforce slirp `restrict=on` throughout. [ADR 0055 records both pin changes](0055-m4-offline-template-recipes.md#test-guest-default-route-amendment).
+
+### 7b PR 3 amendment — foreground selection and boot-bound records
+
+Contract 4 binds the boot marker, the qualifier stage clock's origin in
+Windows uptime milliseconds, and the issuance time on that stage clock.
+The reader checks the marker independently and adds the recorded origin to
+relative issuance and completion times. The UTC validity window and the
+elapsed UTC versus monotonic check remain separate gates. Contract 3
+dossiers must be requalified.
+
+Windows supplies the boot sequence in the current process's
+ProcessTelemetryIdInformation header. The OS loader increments the
+sequence at boot. Changing the wall clock cannot set the loader's
+sequence. A domain-separated digest of the sequence is recorded. The
+reader fails closed on a failed or malformed query. GetTickCount64 supplies
+the common uptime basis. Both binaries independently read these sources.
+[Windows process telemetry header](https://learn.microsoft.com/en-us/windows/win32/devnotes/process_telemetry_id_information_type)
+[Loader boot sequence](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-kuser_shared_data)
+[Windows uptime](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount64)
+
+Foreground selection borrows the production store guard, pins both
+reviewed release images, and accepts the pinned daemon as the executing
+image. It measures the same projection as the qualifier from held native
+inputs before reading the selected record. It opens existing seal rows
+relative to the read-only dossier directory, with write and delete sharing
+denied. The qualifier continues to claim only its own new output directory.
+
+Foreground execution consumes a 7c permit at the checked create edge. It
+matches the pinned seal and the exact production workspace, lease file and
+generation. The checked Job and boot protocol retain the verified guest
+channel until teardown. Settlement carries exact generation slots and
+holds both writer-excluded handles after child exit, an empty Job and
+joined stdio workers. Uncertain settlement keeps the generation charged.
+The qualifier's separate disposable path still rejects daemon offline
+leases. Production dispatch, WHPX guest boot and teardown remain
+**unverified on real hardware**.

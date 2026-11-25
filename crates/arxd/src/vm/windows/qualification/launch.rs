@@ -74,6 +74,7 @@ impl HeldAsset {
 
 /// Run- and generation-bound ownership of a disposable workspace and its
 /// exclusive slot file. Replaces bare mutable paths on the native launch edge.
+#[derive(Clone, Copy)]
 pub(in crate::vm::windows) struct WorkspaceCustody<'a> {
     run: [u8; 16],
     generation: u64,
@@ -82,6 +83,20 @@ pub(in crate::vm::windows) struct WorkspaceCustody<'a> {
 }
 
 impl<'a> WorkspaceCustody<'a> {
+    pub(in crate::vm::windows) fn production(
+        root: &'a PathPin,
+        slot: &'a File,
+    ) -> Result<Self, NativeRefusal> {
+        let custody = Self {
+            run: [0; 16],
+            generation: 0,
+            root,
+            slot,
+        };
+        custody.verify()?;
+        Ok(custody)
+    }
+
     fn new(
         run: [u8; 16],
         generation: u64,
@@ -250,65 +265,10 @@ impl<'a> QualifierLaunch<'a> {
             inputs,
             |inputs| {
                 let (core, read, write) =
-                    CheckedLaunchCore::hold_checked(&baseline._held.token, inputs, refresh)?;
+                    CheckedLaunchCore::hold_checked(&baseline._held.token, inputs, |_| refresh())?;
                 Ok((Self { core }, read, write))
             },
         )
-    }
-
-    async fn helper(
-        &mut self,
-        (mut read, write): BootIo,
-        cancel: &Shutdown,
-        deadline: tokio::time::Instant,
-        mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
-    ) -> (Result<Vec<u8>, NativeRefusal>, StopDisposition) {
-        use tokio::io::AsyncReadExt;
-        let refused = NativeRefusal::JobUnverified;
-        let work = async {
-            if !matches!(
-                self.core.kind,
-                PlanKind::Inspect | PlanKind::QualifierCreate
-            ) {
-                return Err(NativeRefusal::QualificationMissing);
-            }
-            self.core
-                .stock
-                .recheck_all(&self.core.pins, Some(&self.core.workspace))?;
-            self.core.child.resume_checked(cancel, &mut refresh)?;
-            let mut output = Vec::new();
-            (&mut read)
-                .take(16 * 1024 + 1)
-                .read_to_end(&mut output)
-                .await
-                .map_err(|_| refused)?;
-            self.core.child.reap(deadline).await.map_err(|_| refused)?;
-            if output.len() > 16 * 1024 || self.core.child.exit_code()? != 0 {
-                return Err(refused);
-            }
-            Ok(output)
-        };
-        let result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(refused),
-            _ = tokio::time::sleep_until(deadline) => Err(refused),
-            result = work => result,
-        };
-        drop(write);
-        if result.is_err() && self.core.child.job.terminate().is_err() {
-            return (result, StopDisposition::ChargedQuarantine);
-        }
-        let successful = result.is_ok();
-        let release = self
-            .core
-            .release_evidence(
-                successful,
-                successful,
-                tokio::time::Instant::now() + Duration::from_secs(5),
-                || true,
-            )
-            .await;
-        (result, release)
     }
 }
 
@@ -562,7 +522,8 @@ impl RecipeCommands<'_> {
             .deadline
             .min(tokio::time::Instant::now() + Duration::from_secs(30));
         let (result, release) = launch
-            .helper(io, self.cancel, helper_deadline, || self.live())
+            .core
+            .helper(io, self.cancel, helper_deadline, || self.live(), || true)
             .await;
         drop(launch);
         if release != StopDisposition::CleanRelease {
@@ -600,7 +561,8 @@ impl RecipeCommands<'_> {
             .deadline
             .min(tokio::time::Instant::now() + Duration::from_secs(30));
         let (output, release) = launch
-            .helper(io, self.cancel, deadline, || self.live())
+            .core
+            .helper(io, self.cancel, deadline, || self.live(), || true)
             .await;
         if release != StopDisposition::CleanRelease {
             return Err(reason);
@@ -770,7 +732,7 @@ impl RecipeCommands<'_> {
             })
             .await;
         match running {
-            Ok(Ok(BootOutcome::InstallerReleased(pair))) => Ok(pair),
+            Ok(Ok(BootOutcome::InstallerReleased(pair, _))) => Ok(pair),
             Ok(Ok(BootOutcome::Installed(channel))) => {
                 let (qmp, mut guest) = *channel;
                 let tested = self.watch(check(&mut guest)).await;
@@ -789,7 +751,7 @@ impl RecipeCommands<'_> {
                 active.core.stop(None, self.cancel, || true).await;
                 Err(error)
             }
-            Ok(Err(BootFailure::Installer(error))) => {
+            Ok(Err(BootFailure::Installer(error, _))) => {
                 if error.recovery == StopDisposition::ChargedQuarantine {
                     return Err(NativeRefusal::PathCustodyUnverified);
                 }
@@ -1796,10 +1758,13 @@ impl RecipeProjection {
     }
 }
 
-pub(super) fn project_recipes(baseline: &Baseline) -> Result<RecipeProjection, NativeRefusal> {
+pub(super) fn project_recipes(
+    held: &Held,
+    run: [u8; 16],
+    scope: [u8; 32],
+) -> Result<RecipeProjection, NativeRefusal> {
     use crate::vm::qualification_record::{RecipeIdentity, TestRecipes, digest};
     let reason = NativeRefusal::InstallerPhaseUnavailable;
-    let held = &baseline._held;
     let ubuntu_guest = held.ubuntu_guest.as_ref().map_err(|reason| *reason)?;
     let windows = held.windows_recipe.as_ref().map_err(|reason| *reason)?;
     let setup_vars = held.windows_setup_vars.as_ref().map_err(|reason| *reason)?;
@@ -1830,8 +1795,8 @@ pub(super) fn project_recipes(baseline: &Baseline) -> Result<RecipeProjection, N
     };
     let key = |bytes: Vec<u8>| digest(&bytes);
     Ok(RecipeProjection {
-        run: baseline.run(),
-        scope: baseline.scope(),
+        run,
+        scope,
         install_media: key(serde_json::to_vec(&(
             "arx-vm-install-media-v1",
             network.projection,
@@ -1855,8 +1820,7 @@ pub(super) fn project_recipes(baseline: &Baseline) -> Result<RecipeProjection, N
     })
 }
 
-pub(super) fn revalidate_assets(baseline: &Baseline) -> Result<(), NativeRefusal> {
-    let held = &baseline._held;
+pub(super) fn revalidate_assets(held: &Held) -> Result<(), NativeRefusal> {
     let reason = NativeRefusal::InstallerPhaseUnavailable;
     let windows = held.windows_recipe.as_ref().map_err(|r| *r)?;
     let setup = held.windows_setup_vars.as_ref().map_err(|r| *r)?;

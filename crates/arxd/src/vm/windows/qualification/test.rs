@@ -106,9 +106,10 @@ impl Storage {
 
 pub(super) struct Scope {
     pub(super) recipe: Storage,
-    production: Storage,
+    pub(super) production: Storage,
     _database: PathPin,
     _lock: PathPin,
+    host: crate::vm::Id,
     pub(super) key: [u8; 32],
 }
 
@@ -132,8 +133,9 @@ impl Scope {
         backing: &PathPin,
         volumes: [&capacity::AnchoredVolume; 2],
         evidence: &LocalPath,
-        owner: PSID,
+        guard: (PSID, Option<&crate::store::vm::VmStore>),
     ) -> Result<Self, NativeRefusal> {
+        let (owner, store) = guard;
         let reason = NativeRefusal::PathCustodyUnverified;
         let [trial_volume, outer] = volumes;
         let recipe = Storage::hold(names, &enrollment.recipe, outer, owner)?;
@@ -175,8 +177,11 @@ impl Scope {
             .path
             .join("activity.lock")
             .map_err(|_| reason)?;
-        let database = capacity::walk(names, &production.volume, &database, false, false)?;
-        let lock = capacity::walk(names, &production.volume, &lock, false, false)?;
+        // The daemon's SQLite connection and locked guard already hold the
+        // exact leaves with write access. Open compatible read handles.
+        let database =
+            capacity::walk(names, &production.volume, &database, false, store.is_some())?;
+        let lock = capacity::walk(names, &production.volume, &lock, false, store.is_some())?;
         if !sink::held_private(&database.leaf, owner)
             || !sink::held_private(&lock.leaf, owner)
             || [database.identity, lock.identity]
@@ -186,7 +191,10 @@ impl Scope {
         {
             return Err(reason);
         }
-        let host = read_store_host(&production.root, &database)?;
+        let host = match store {
+            Some(store) => read_guarded_host(store, &database)?,
+            None => read_store_host(&production.root, &database)?,
+        };
         let key = crate::vm::qualification_record::digest(
             &serde_json::to_vec(&(
                 "arx-vm-qualification-storage-v1",
@@ -203,8 +211,20 @@ impl Scope {
             production,
             _database: database,
             _lock: lock,
+            host,
             key,
         })
+    }
+
+    pub(super) fn validate_foreground(
+        &self,
+        store: &crate::store::vm::VmStore,
+    ) -> Result<(), NativeRefusal> {
+        self.validate_live()?;
+        if read_guarded_host(store, &self._database)? != self.host {
+            return Err(NativeRefusal::PathCustodyUnverified);
+        }
+        Ok(())
     }
 
     pub(super) fn within_shared_cap(&self, trial: &Limits) -> bool {
@@ -228,6 +248,26 @@ impl Scope {
             extra_bytes,
         )
     }
+}
+
+fn read_guarded_host(
+    store: &crate::store::vm::VmStore,
+    database: &PathPin,
+) -> Result<crate::vm::Id, NativeRefusal> {
+    let reason = NativeRefusal::PathCustodyUnverified;
+    // VmStore keeps both its verified SQLite main file and exclusive lock
+    // pinned against replacement for the whole borrow.
+    store
+        .read_backup_owner(|db| {
+            let opened = db.path().and_then(|path| local(path).ok());
+            anyhow::ensure!(
+                opened
+                    .is_some_and(|path| path.as_str().eq_ignore_ascii_case(database.path.as_str())),
+                "store guard mismatch"
+            );
+            crate::store::vm::static_vm::host_id(db)
+        })
+        .map_err(|_| reason)
 }
 
 pub(super) fn aggregate_within_cap(

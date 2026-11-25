@@ -4,7 +4,10 @@
 //!
 //! Native observations here are **unverified on real hardware**.
 
+mod boot;
 mod capacity;
+mod foreground;
+pub(crate) use foreground::ForegroundQualification;
 pub(super) mod inventory;
 mod launch;
 pub(super) use launch::WorkspaceCustody;
@@ -12,6 +15,12 @@ pub use launch::{RecipeProbe, RecipeProjection};
 mod network;
 pub(in crate::vm) use network::Targets as WitnessTargets;
 mod paused;
+mod production;
+#[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
+pub(crate) use production::{
+    FinalizedPair, InstallerSettlement, LaunchPermit, LaunchPermitBinding, LaunchRequest,
+    LaunchTarget, NativeLaunch, ProductionWorkspace, ReleasedGeneration, WorkspaceBinding,
+};
 mod schema;
 mod sink;
 mod test;
@@ -114,6 +123,7 @@ fn hold_release(
     release: &ReleaseEnrollment,
     current_image: &LocalPath,
     evidence: &LocalPath,
+    daemon_running: bool,
 ) -> Result<([u8; 32], [PathPin; 2]), NativeRefusal> {
     let reason = NativeRefusal::QualificationMissing;
     let hold = |image: &ReleaseImage, basename: &str| {
@@ -143,7 +153,12 @@ fn hold_release(
     };
     let (daemon, daemon_pin) = hold(&release.daemon, "arxd.exe")?;
     let (qualifier, qualifier_pin) = hold(&release.qualifier, "arx-vm-qualify.exe")?;
-    if !qualifier_pin
+    let running = if daemon_running {
+        &daemon_pin
+    } else {
+        &qualifier_pin
+    };
+    if !running
         .path
         .as_str()
         .eq_ignore_ascii_case(current_image.as_str())
@@ -381,11 +396,19 @@ struct Held {
 }
 
 impl Baseline {
+    pub fn dependencies(&self) -> Dependencies {
+        self.observations.dependencies()
+    }
+
+    pub fn boot_anchor(&self) -> crate::vm::qualification_record::BootAnchor {
+        self.evidence.boot_anchor()
+    }
+
     pub fn recipe_projection(&self) -> Result<RecipeProjection, NativeRefusal> {
         if !self._held.full_test {
             return Err(NativeRefusal::QualificationMissing);
         }
-        launch::project_recipes(self)
+        launch::project_recipes(&self._held, self.run(), self.scope())
     }
 
     /// A settled full-TEST chain stays borrowed against its exact held
@@ -419,8 +442,14 @@ impl Baseline {
             return Err(SinkError::Invalid);
         }
         self.evidence
-            .publish_complete(bundle, issued, cancel, clock, || {
+            .publish_complete(bundle, issued, cancel, &clock, || {
                 let captured = self.paused_live().map_err(|_| SinkError::Invalid)?;
+                if self.boot_anchor().on_boot(clock()).is_none_or(|time| {
+                    time.mono_ms.abs_diff(boot::uptime())
+                        > crate::vm::qualification_record::CLOCK_SKEW_MS
+                }) {
+                    return Err(SinkError::Invalid);
+                }
                 let scope = held.scope.as_ref().ok_or(SinkError::Invalid)?;
                 scope.validate_live().map_err(|_| SinkError::Invalid)?;
                 for volume in &held.volumes {
@@ -441,7 +470,7 @@ impl Baseline {
                 {
                     return Err(SinkError::Invalid);
                 }
-                launch::revalidate_assets(self).map_err(|_| SinkError::Invalid)?;
+                launch::revalidate_assets(held).map_err(|_| SinkError::Invalid)?;
                 let no_charge = |root: &PathPin, forbidden: &[&str]| {
                     listing_bounded(
                         &root.leaf,
@@ -592,6 +621,68 @@ impl Baseline {
     }
 }
 
+impl Preflight {
+    pub fn dependencies(&self) -> crate::vm::qualification_record::Dependencies {
+        dependencies(self)
+    }
+}
+
+fn observed<T>(value: &Taken<T>) -> Option<&T> {
+    match value {
+        Taken::Observed(observation) => Some(&observation.result),
+        Taken::Refused { .. } => None,
+    }
+}
+
+use crate::vm::qualification_record::{Dependencies, Measured};
+
+fn measured<T>(value: Option<T>) -> Measured<T> {
+    value.map_or(Measured::Unmeasured, Measured::Measured)
+}
+
+/// The local invalidation projection. A dependency whose observation was
+/// refused, or that no reviewed collector measures yet, stays unmeasured,
+/// which keeps every native trial unsealable.
+fn dependencies(p: &Preflight) -> Dependencies {
+    use crate::vm::qualification_record::*;
+    let s = &p.store;
+    Dependencies {
+        release: release(),
+        artifact: measured(p.reviewed_release),
+        host: measured(observed(&p.host).map(|host| HostDependency {
+            windows_build: host.windows_build,
+            windows_revision: host.windows_revision,
+            machine: host.machine,
+        })),
+        store: measured(observed(&p.limits).map(|limits| StoreDependency {
+            trial_volume: s.trial_volume,
+            trial_volume_root: s.trial_volume_root,
+            trial_volume_guid: s.trial_volume_guid,
+            trial_root: s.trial_root,
+            outer_volume: s.outer_volume,
+            outer_volume_root: s.outer_volume_root,
+            outer_volume_guid: s.outer_volume_guid,
+            backing_file: s.backing_file,
+            vhd_virtual_bytes: limits.vhd_virtual_bytes,
+            inner_extent_bytes: limits.inner_extent_bytes,
+            test_scope: p.test_scope,
+        })),
+        owner_profile: measured(p.owner_profile),
+        distribution: measured(observed(&p.distribution).map(|distribution| {
+            DistributionDependency {
+                receipt: distribution.receipt,
+                manifest: distribution.manifest,
+            }
+        })),
+        install_media: Measured::Unmeasured,
+        recipes: Measured::Unmeasured,
+        firmware: Measured::Unmeasured,
+        guest_protocol: Measured::Unmeasured,
+        network_topology: Measured::Unmeasured,
+        policy: PolicyDependency::CURRENT,
+    }
+}
+
 /// The release digest the writer binds, as the runner derives it. Pure and
 /// authority-free; the runner's tests check the two derivations agree.
 pub fn release_digest() -> [u8; 32] {
@@ -692,7 +783,44 @@ fn preflight_with(
     paused: bool,
     full_test: bool,
 ) -> Result<Baseline, NativeRefusal> {
+    let (observations, origin, _held, evidence) = collect_preflight(
+        names,
+        enrollment_file,
+        evidence_dir,
+        paused,
+        full_test,
+        None,
+        sink::EvidenceDir::claim,
+    )?;
+    Ok(Baseline {
+        observations,
+        origin,
+        _held,
+        evidence,
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one shared native collector with separate custody modes"
+)]
+fn collect_preflight<E>(
+    names: &impl capacity::VolumeNames,
+    enrollment_file: &str,
+    evidence_dir: &str,
+    paused: bool,
+    full_test: bool,
+    store: Option<&crate::store::vm::VmStore>,
+    open_evidence: impl FnOnce(
+        PathPin,
+        PSID,
+        &[&str],
+        crate::vm::qualification_record::BootAnchor,
+    ) -> Result<E, NativeRefusal>,
+) -> Result<(Preflight, Instant, Held, E), NativeRefusal> {
+    let origin_boot_ms = boot::uptime();
     let origin = Instant::now();
+    let boot = boot::capture(origin_boot_ms)?;
     let custody = NativeRefusal::PathCustodyUnverified;
     let user = current_user().map_err(|_| NativeRefusal::IdentityUnverified)?;
     let user_sid = user_sid(&user);
@@ -728,7 +856,7 @@ fn preflight_with(
                 let image =
                     std::env::current_exe().map_err(|_| NativeRefusal::QualificationMissing)?;
                 let image = local(image.to_str().ok_or(NativeRefusal::QualificationMissing)?)?;
-                let (key, pins) = hold_release(release, &image, &evidence_path)?;
+                let (key, pins) = hold_release(release, &image, &evidence_path, store.is_some())?;
                 (Some(key), Some(pins))
             }
             (_, None) => (None, None),
@@ -747,7 +875,7 @@ fn preflight_with(
     let trial_volume = capacity::anchor_volume(names, &root.as_str()[..3])?;
     // The evidence directory shares write so the writer can rename its
     // committed entries relative to this held handle.
-    let evidence_pin = capacity::walk(names, &outer_volume, &evidence_path, true, true)?;
+    let evidence_pin = capacity::walk(names, &outer_volume, &evidence_path, true, store.is_none())?;
     let trial_pin = capacity::walk(names, &trial_volume, &root, true, false)?;
     let backing_pin = capacity::walk(names, &outer_volume, &backing, false, true)?;
     if !sink::held_private(&trial_pin.leaf, user_sid)
@@ -773,7 +901,7 @@ fn preflight_with(
             &backing_pin,
             [&trial_volume, &outer_volume],
             &evidence_path,
-            user_sid,
+            (user_sid, store),
         )?)
     } else {
         None
@@ -849,7 +977,7 @@ fn preflight_with(
     }
     // Claim once identity and every input root are held and checked. A
     // concurrent runner loses here, before any observation is taken.
-    let evidence = sink::EvidenceDir::claim(evidence_pin, user_sid, &private_values)?;
+    let evidence = open_evidence(evidence_pin, user_sid, &private_values, boot)?;
 
     let inputs = Observation {
         started_ms: 0,
@@ -859,7 +987,7 @@ fn preflight_with(
             enrollment_private: true,
             evidence_private: true,
             trial_root_private: true,
-            evidence_claimed: true,
+            evidence_claimed: store.is_none(),
         },
     };
     let host = take(origin, || {
@@ -934,8 +1062,8 @@ fn preflight_with(
         outer_volume_guid: outer_volume.guid_bytes,
         backing_file: backing_pin.identity.file,
     };
-    Ok(Baseline {
-        observations: Preflight {
+    Ok((
+        Preflight {
             inputs,
             host,
             distribution,
@@ -948,8 +1076,7 @@ fn preflight_with(
             test_scope: test_scope.as_ref().map(|scope| scope.key),
         },
         origin,
-        evidence,
-        _held: Held {
+        Held {
             bundle: bundle_pins,
             _source: source,
             _release: release_pins,
@@ -967,7 +1094,8 @@ fn preflight_with(
             paused,
             full_test,
         },
-    })
+        evidence,
+    ))
 }
 
 /// Containment rules for the enrolled roots and the evidence directory.
@@ -1464,7 +1592,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_release_binds_two_held_images_and_current_qualifier() {
+    fn exact_release_binds_two_held_images_and_the_expected_current_image() {
         let scratch = tempfile::tempdir().unwrap();
         let image = |name, data: &[u8]| {
             let path = scratch.path().join(name);
@@ -1481,7 +1609,11 @@ mod tests {
         };
         let qualifier = local(&release.qualifier.path).unwrap();
         let evidence = LocalPath::parse(scratch.path().join("evidence").to_str().unwrap()).unwrap();
-        let (_, pins) = hold_release(&release, &qualifier, &evidence).unwrap();
+        let (qualified, pins) = hold_release(&release, &qualifier, &evidence, false).unwrap();
+        let daemon = local(&release.daemon.path).unwrap();
+        let (deployed, foreground_pins) = hold_release(&release, &daemon, &evidence, true).unwrap();
+        assert_eq!(qualified, deployed);
+        assert!(hold_release(&release, &qualifier, &evidence, true).is_err());
         assert!(
             std::fs::OpenOptions::new()
                 .write(true)
@@ -1489,10 +1621,19 @@ mod tests {
                 .is_err(),
             "release pin excludes writers"
         );
-        assert!(hold_release(&release, &local(&release.daemon.path).unwrap(), &evidence).is_err());
+        assert!(
+            hold_release(
+                &release,
+                &local(&release.daemon.path).unwrap(),
+                &evidence,
+                false
+            )
+            .is_err()
+        );
         drop(pins);
+        drop(foreground_pins);
         release.daemon.size += 1;
-        assert!(hold_release(&release, &qualifier, &evidence).is_err());
+        assert!(hold_release(&release, &qualifier, &evidence, false).is_err());
     }
 
     #[test]
