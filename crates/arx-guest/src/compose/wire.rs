@@ -12,15 +12,26 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 
 use super::codec::{SecretText, is_base64_text, is_lower_hex};
 use super::manifest::{ManifestRule, is_project_id, is_slot_name};
+use crate::compose_backup::{
+    BACKUP_CHUNK_BYTES, MAX_BACKUP_BYTES, MAX_BACKUP_CHUNKS, MAX_BACKUP_DEADLINE_S, is_db_basename,
+    is_volume_slot,
+};
 use crate::protocol::{Message, ProtocolError, private};
 
 /// Version of the Compose session. Pinned separately from the legacy frame
-/// version (which stays at 1) and bumped to v2 for digest-bound secret intake
-/// and unified operation receipts.
-pub const COMPOSE_PROTOCOL_VERSION: u32 = 2;
+/// version (which stays at 1) and bumped to v3 for protected SQLite backups
+/// (leg E4).
+pub const COMPOSE_PROTOCOL_VERSION: u32 = 3;
 /// The closed, sorted capability set. A ComposeHello must name exactly this
 /// list; anything else closes the connection.
-pub const COMPOSE_CAPABILITIES: [&str; 5] = ["lifecycle", "logs", "manifest", "secrets", "status"];
+pub const COMPOSE_CAPABILITIES: [&str; 6] = [
+    "backup",
+    "lifecycle",
+    "logs",
+    "manifest",
+    "secrets",
+    "status",
+];
 /// Decoded bytes per staged manifest chunk. Only the last chunk is shorter.
 pub const STAGE_CHUNK: usize = 16 * 1024;
 /// Decoded bytes per staged manifest.
@@ -115,6 +126,36 @@ pub enum ComposeRequest {
         epoch: u64,
         data: SecretText,
     },
+    /// Begins a consistent SQLite online backup of an enrolled project volume
+    /// into root-owned guest staging under the project's maintenance lease.
+    ComposeBackupBegin {
+        id: u32,
+        operation_id: String,
+        generation: u64,
+        project_id: String,
+        volume: String,
+        database: String,
+        max_bytes: u64,
+        deadline_s: u32,
+    },
+    /// Queries verified metadata (size, chunk count, SHA-256 digest) of a
+    /// succeeded staged backup. Never carries any filesystem path.
+    ComposeBackupMeta {
+        id: u32,
+        operation_id: String,
+    },
+    /// Reads one exact 16 KiB decoded chunk of a staged backup by index.
+    ComposeBackupChunk {
+        id: u32,
+        operation_id: String,
+        index: u32,
+    },
+    /// Releases guest staging for a backup operation after host settlement or
+    /// host-side cancellation. Never touches project volumes or host backups.
+    ComposeBackupRelease {
+        id: u32,
+        operation_id: String,
+    },
 }
 
 // Hand-written Deserialize avoids serde's internally-tagged `Content` buffer so
@@ -146,6 +187,10 @@ impl<'de> Deserialize<'de> for ComposeRequest {
             ReadinessHost,
             Zone,
             Routes,
+            Volume,
+            Database,
+            MaxBytes,
+            DeadlineS,
         }
 
         struct RequestVisitor;
@@ -179,6 +224,10 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                 let mut zone = None;
                 let mut routes = None;
                 let mut epoch: Option<u64> = None;
+                let mut volume: Option<String> = None;
+                let mut database: Option<String> = None;
+                let mut max_bytes: Option<u64> = None;
+                let mut deadline_s: Option<u32> = None;
 
                 macro_rules! set_once {
                     ($slot:ident, $name:literal) => {{
@@ -212,6 +261,10 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                         Field::Zone => set_once!(zone, "zone"),
                         Field::Routes => set_once!(routes, "routes"),
                         Field::Epoch => set_once!(epoch, "epoch"),
+                        Field::Volume => set_once!(volume, "volume"),
+                        Field::Database => set_once!(database, "database"),
+                        Field::MaxBytes => set_once!(max_bytes, "max_bytes"),
+                        Field::DeadlineS => set_once!(deadline_s, "deadline_s"),
                     }
                 }
 
@@ -304,6 +357,29 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                         epoch: take!(epoch, "epoch"),
                         data: take!(data, "data"),
                     },
+                    "ComposeBackupBegin" => ComposeRequest::ComposeBackupBegin {
+                        id: take!(id, "id"),
+                        operation_id: take!(operation_id, "operation_id"),
+                        generation: take!(generation, "generation"),
+                        project_id: take!(project_id, "project_id"),
+                        volume: take!(volume, "volume"),
+                        database: take!(database, "database"),
+                        max_bytes: take!(max_bytes, "max_bytes"),
+                        deadline_s: take!(deadline_s, "deadline_s"),
+                    },
+                    "ComposeBackupMeta" => ComposeRequest::ComposeBackupMeta {
+                        id: take!(id, "id"),
+                        operation_id: take!(operation_id, "operation_id"),
+                    },
+                    "ComposeBackupChunk" => ComposeRequest::ComposeBackupChunk {
+                        id: take!(id, "id"),
+                        operation_id: take!(operation_id, "operation_id"),
+                        index: take!(index, "index"),
+                    },
+                    "ComposeBackupRelease" => ComposeRequest::ComposeBackupRelease {
+                        id: take!(id, "id"),
+                        operation_id: take!(operation_id, "operation_id"),
+                    },
                     _ => return Err(de::Error::custom("unknown ComposeRequest type")),
                 };
 
@@ -327,6 +403,10 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                     || zone.is_some()
                     || routes.is_some()
                     || epoch.is_some()
+                    || volume.is_some()
+                    || database.is_some()
+                    || max_bytes.is_some()
+                    || deadline_s.is_some()
                 {
                     return Err(de::Error::custom("unexpected field for ComposeRequest"));
                 }
@@ -385,6 +465,26 @@ pub enum ComposeResponse {
         epoch: u64,
         recreate: Option<OperationView>,
     },
+    ComposeBackupReady {
+        id: u32,
+        operation_id: String,
+        project_id: String,
+        revision: u64,
+        total_bytes: u64,
+        chunks: u32,
+        digest: String,
+    },
+    ComposeBackupData {
+        id: u32,
+        operation_id: String,
+        index: u32,
+        data: String,
+    },
+    ComposeBackupReleased {
+        id: u32,
+        operation_id: String,
+        removed: bool,
+    },
     ComposeRejected {
         id: u32,
         code: RejectCode,
@@ -425,6 +525,11 @@ pub enum RejectCode {
     StoreFailure,
     EngineUnavailable,
     JournalFull,
+    UnknownVolume,
+    InvalidDatabase,
+    BackupNotReady,
+    BackupChunkOutOfRange,
+    BackupStagingOccupied,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,6 +541,7 @@ pub enum OperationKind {
     Down,
     SecretPut,
     Recreate,
+    Backup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,6 +568,7 @@ pub enum OperationStage {
     Stopping,
     Removing,
     Recreating,
+    BackingUp,
     Settled,
 }
 
@@ -482,6 +589,11 @@ pub enum FailureCode {
     EngineTimedOut,
     NotApplied,
     WorkerUnavailable,
+    BackupNotFound,
+    BackupFailed,
+    BackupTimedOut,
+    BackupTooLarge,
+    BackupCorrupt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -577,6 +689,9 @@ pub enum LogEvent {
     Reconciled,
     SecretDelivered,
     StagingCleared,
+    BackupStarted,
+    BackupStaged,
+    BackupReleased,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -714,6 +829,40 @@ impl Message for ComposeRequest {
                         && is_base64_text(data.as_str(), MAX_SECRET),
                 )
             }
+            Self::ComposeBackupBegin {
+                id,
+                operation_id,
+                generation,
+                project_id,
+                volume,
+                database,
+                max_bytes,
+                deadline_s,
+            } => {
+                validate_id(*id)?;
+                field(
+                    is_lower_hex(operation_id, 32)
+                        && *generation != 0
+                        && is_project_id(project_id)
+                        && is_volume_slot(volume)
+                        && is_db_basename(database)
+                        && (1..=MAX_BACKUP_BYTES).contains(max_bytes)
+                        && (1..=MAX_BACKUP_DEADLINE_S).contains(deadline_s),
+                )
+            }
+            Self::ComposeBackupMeta { id, operation_id }
+            | Self::ComposeBackupRelease { id, operation_id } => {
+                validate_id(*id)?;
+                field(is_lower_hex(operation_id, 32))
+            }
+            Self::ComposeBackupChunk {
+                id,
+                operation_id,
+                index,
+            } => {
+                validate_id(*id)?;
+                field(is_lower_hex(operation_id, 32) && *index < MAX_BACKUP_CHUNKS)
+            }
         }
     }
 }
@@ -732,6 +881,44 @@ impl Message for ComposeResponse {
             Self::ComposeRoutesInstalled { id, generation } => {
                 validate_id(*id)?;
                 field(*generation != 0)
+            }
+            Self::ComposeBackupReady {
+                id,
+                operation_id,
+                project_id,
+                revision,
+                total_bytes,
+                chunks,
+                digest,
+            } => {
+                validate_id(*id)?;
+                field(
+                    is_lower_hex(operation_id, 32)
+                        && is_project_id(project_id)
+                        && *revision != 0
+                        && (1..=MAX_BACKUP_BYTES).contains(total_bytes)
+                        && crate::compose_backup::chunk_count(*total_bytes) == Some(*chunks)
+                        && is_lower_hex(digest, 64),
+                )
+            }
+            Self::ComposeBackupData {
+                id,
+                operation_id,
+                index,
+                data,
+            } => {
+                validate_id(*id)?;
+                field(
+                    is_lower_hex(operation_id, 32)
+                        && *index < MAX_BACKUP_CHUNKS
+                        && is_base64_text(data, BACKUP_CHUNK_BYTES),
+                )
+            }
+            Self::ComposeBackupReleased {
+                id, operation_id, ..
+            } => {
+                validate_id(*id)?;
+                field(is_lower_hex(operation_id, 32))
             }
             Self::ComposeStageProgress { id, .. }
             | Self::ComposeReleaseStaged { id, .. }

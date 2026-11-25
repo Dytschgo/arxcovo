@@ -13,6 +13,12 @@ use arx_guest::compose::{
     self, Clock, CommandRunner, ComposeService, ComposeStore, Invocation, MAX_SECRET, RunResult,
     SecretFileWitness, SecretMatch, StoreError,
 };
+use arx_guest::compose_backup::{
+    self, BackupHelperError, LINUX_HELPER_CONFIG_FD, LINUX_HELPER_DST_STAT_FD,
+    LINUX_HELPER_RESULT_FD, LINUX_HELPER_VOL_FD, LinuxBackupHelperConfig, LinuxBackupHelperReply,
+    MAX_BACKUP_BYTES, StagedBackupMeta, is_db_basename, verify_dir_file_no_follow_fstatat,
+    verify_pinned_sqlite, verify_portable_sqlite_file,
+};
 use arx_guest::{MAX_SCRIPT, ScriptExecution, ScriptExecutor, ScriptOutcome, serve_with_compose};
 
 const PORT: &str = "org.arxcovo.agent.0";
@@ -1219,8 +1225,11 @@ impl CommandRunner for DockerRunner {
 /// files are chowned and chmodded on the descriptor before any byte lands.
 struct LinuxComposeStore {
     state: OwnedFd,
+    state_path: PathBuf,
     secrets: OwnedFd,
-    volume_root: &'static str,
+    volume_root: String,
+    #[cfg(test)]
+    volume_root_fd: Option<OwnedFd>,
     owner: u32,
 }
 
@@ -1228,23 +1237,47 @@ impl LinuxComposeStore {
     fn open(
         state: &str,
         secrets: &str,
-        volume_root: &'static str,
+        volume_root: &str,
         owner: u32,
         require_tmpfs: bool,
     ) -> io::Result<Self> {
-        let state = walk_owned_dirs(state, owner)?;
-        verify_private_dir(state.as_fd(), owner)?;
+        let state_fd = walk_owned_dirs(state, owner)?;
+        verify_private_dir(state_fd.as_fd(), owner)?;
         let secrets = walk_owned_dirs(secrets, owner)?;
         verify_private_dir(secrets.as_fd(), owner)?;
         if require_tmpfs && !is_tmpfs(secrets.as_fd())? {
             return Err(invalid());
         }
         Ok(Self {
-            state,
+            state: state_fd,
+            state_path: PathBuf::from(state),
             secrets,
-            volume_root,
+            volume_root: volume_root.to_owned(),
+            #[cfg(test)]
+            volume_root_fd: None,
             owner,
         })
+    }
+
+    fn open_volume_parent(&self, volume_name: &str) -> io::Result<OwnedFd> {
+        #[cfg(test)]
+        if let Some(root_fd) = &self.volume_root_fd {
+            let dir = open_at(
+                root_fd.as_fd(),
+                volume_name,
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?;
+            let meta = File::from(dir.try_clone()?).metadata()?;
+            if !meta.is_dir()
+                || (meta.uid() != self.owner && meta.uid() != ROOT_UID)
+                || meta.mode() & 0o022 != 0
+            {
+                return Err(invalid());
+            }
+            return Ok(dir);
+        }
+        walk_owned_dirs(&format!("{}/{volume_name}", self.volume_root), self.owner)
     }
 
     fn version_dir(&self) -> io::Result<OwnedFd> {
@@ -1254,6 +1287,10 @@ impl LinuxComposeStore {
             self.owner,
             true,
         )
+    }
+
+    fn backup_staging_dir(&self) -> io::Result<OwnedFd> {
+        private_subdir(self.state.as_fd(), "backup-staging", self.owner, true)
     }
 }
 
@@ -1562,6 +1599,410 @@ impl ComposeStore for LinuxComposeStore {
         std::os::unix::fs::fchown(&data, Some(owner.0), Some(owner.1)).map_err(|_| StoreError)?;
         data.set_permissions(fs::Permissions::from_mode(0o700))
             .map_err(|_| StoreError)
+    }
+
+    fn run_sqlite_backup(
+        &mut self,
+        operation_id: &str,
+        volume_name: &str,
+        owner: (u32, u32),
+        database: &str,
+        max_bytes: u64,
+        deadline: Duration,
+    ) -> Result<StagedBackupMeta, BackupHelperError> {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        verify_pinned_sqlite()?;
+        if operation_id.len() != 32
+            || !operation_id
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            || !is_db_basename(database)
+            || max_bytes == 0
+            || max_bytes > MAX_BACKUP_BYTES
+            || component(volume_name).is_err()
+        {
+            return Err(BackupHelperError::InvalidInput);
+        }
+        let deadline_at = Instant::now() + deadline;
+
+        // 1. Walk volume root fd-relative with O_NOFOLLOW and verify ownership.
+        let vol_parent = self
+            .open_volume_parent(volume_name)
+            .map_err(|_| BackupHelperError::PathViolation)?;
+        let vol_data_fd = open_at(
+            vol_parent.as_fd(),
+            "_data",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                BackupHelperError::NotFound
+            } else {
+                BackupHelperError::PathViolation
+            }
+        })?;
+        let vol_meta = File::from(
+            vol_data_fd
+                .try_clone()
+                .map_err(|_| BackupHelperError::StoreFailed)?,
+        )
+        .metadata()
+        .map_err(|_| BackupHelperError::PathViolation)?;
+        if !vol_meta.is_dir() || (vol_meta.uid(), vol_meta.gid()) != owner {
+            return Err(BackupHelperError::PathViolation);
+        }
+
+        // 2. Non-blocking, no-follow fstatat pre-check of DB and optional
+        // WAL/SHM/journal companions before spawning the helper process.
+        verify_dir_file_no_follow_fstatat(vol_data_fd.as_fd(), database, owner, true)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let companion = format!("{database}{suffix}");
+            verify_dir_file_no_follow_fstatat(vol_data_fd.as_fd(), &companion, owner, false)?;
+        }
+
+        // 3. Create exclusive 0600 root-owned staging leaf under backup-staging.
+        let staging_dir = self
+            .backup_staging_dir()
+            .map_err(|_| BackupHelperError::StoreFailed)?;
+        let final_name = format!("{operation_id}.sqlite3");
+        let dst_fd = open_at(
+            staging_dir.as_fd(),
+            &final_name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )
+        .map_err(|_| BackupHelperError::StoreFailed)?;
+        let dst_meta = File::from(
+            dst_fd
+                .try_clone()
+                .map_err(|_| BackupHelperError::StoreFailed)?,
+        )
+        .metadata()
+        .map_err(|_| BackupHelperError::StoreFailed)?;
+        if !dst_meta.is_file()
+            || dst_meta.nlink() != 1
+            || dst_meta.uid() != self.owner
+            || dst_meta.mode() & 0o7777 != 0o600
+        {
+            unlink_staging_artifacts(staging_dir.as_fd(), &final_name);
+            return Err(BackupHelperError::StoreFailed);
+        }
+        let dst_path = self.state_path.join("backup-staging").join(&final_name);
+
+        let result = (|| -> Result<StagedBackupMeta, BackupHelperError> {
+            let remaining_ms = deadline_at
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            if remaining_ms == 0 {
+                return Err(BackupHelperError::TimedOut);
+            }
+            let isolate_root = self.owner == ROOT_UID;
+            let cfg = LinuxBackupHelperConfig {
+                database: database.to_owned(),
+                dst_path: dst_path
+                    .to_str()
+                    .ok_or(BackupHelperError::PathViolation)?
+                    .to_owned(),
+                vol_path: if isolate_root {
+                    None
+                } else {
+                    Some(format!("{}/{volume_name}/_data", self.volume_root))
+                },
+                max_bytes,
+                deadline_ms: remaining_ms,
+                uid: owner.0,
+                gid: owner.1,
+                isolate_root,
+            };
+            let cfg_bytes = serde_json::to_vec(&cfg).map_err(|_| BackupHelperError::StoreFailed)?;
+            let (cfg_read, mut cfg_write) =
+                io::pipe().map_err(|_| BackupHelperError::StoreFailed)?;
+            let (res_read, res_write) = io::pipe().map_err(|_| BackupHelperError::StoreFailed)?;
+            cfg_write
+                .write_all(&cfg_bytes)
+                .map_err(|_| BackupHelperError::StoreFailed)?;
+            drop(cfg_write);
+
+            // Dup descriptors above 9 with CLOEXEC so pre_exec dup2 onto fds 3..=6
+            // can never collide with a source fd number.
+            let vol_high = dup_above_cloexec(vol_data_fd.as_fd(), 10)
+                .map_err(|_| BackupHelperError::StoreFailed)?;
+            let dst_high = dup_above_cloexec(dst_fd.as_fd(), 10)
+                .map_err(|_| BackupHelperError::StoreFailed)?;
+            let cfg_high = dup_above_cloexec(cfg_read.as_fd(), 10)
+                .map_err(|_| BackupHelperError::StoreFailed)?;
+            let res_high = dup_above_cloexec(res_write.as_fd(), 10)
+                .map_err(|_| BackupHelperError::StoreFailed)?;
+            let vol_raw = vol_high.as_raw_fd();
+            let dst_raw = dst_high.as_raw_fd();
+            let cfg_raw = cfg_high.as_raw_fd();
+            let res_raw = res_high.as_raw_fd();
+
+            let exe = std::env::current_exe().map_err(|_| BackupHelperError::Unavailable)?;
+            let mut cmd = Command::new(exe);
+            cmd.env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            #[cfg(not(test))]
+            {
+                cmd.arg("backup-sqlite-helper");
+            }
+            #[cfg(test)]
+            {
+                cmd.env("ARX_TEST_BACKUP_HELPER", "1").args([
+                    "--exact",
+                    "--test-threads=1",
+                    "platform::linux::compose_tests::backup_sqlite_helper_test_trampoline",
+                ]);
+            }
+            // SAFETY: closure runs between fork and exec and uses only
+            // async-signal-safe libc calls (setpgid, dup2).
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    for (src, dst) in [
+                        (vol_raw, LINUX_HELPER_VOL_FD),
+                        (dst_raw, LINUX_HELPER_DST_STAT_FD),
+                        (cfg_raw, LINUX_HELPER_CONFIG_FD),
+                        (res_raw, LINUX_HELPER_RESULT_FD),
+                    ] {
+                        if libc::dup2(src, dst) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+
+            let mut child = cmd.spawn().map_err(|_| BackupHelperError::Unavailable)?;
+            // Close parent ends of child-only fds immediately after spawn.
+            drop(vol_high);
+            drop(dst_high);
+            drop(cfg_high);
+            drop(res_high);
+            drop(cfg_read);
+            drop(res_write);
+
+            // Wait for helper process with hard deadline; kill process group and reap on timeout.
+            let hard_deadline = deadline_at + Duration::from_secs(2);
+            let status = loop {
+                if let Some(status) = child
+                    .try_wait()
+                    .map_err(|_| BackupHelperError::StoreFailed)?
+                {
+                    break Some(status);
+                }
+                if Instant::now() >= hard_deadline {
+                    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+                        // SAFETY: child leads its own process group and has not been reaped.
+                        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                thread::sleep(POLL_INTERVAL);
+            };
+            let Some(status) = status else {
+                return Err(BackupHelperError::TimedOut);
+            };
+
+            let mut reply_bytes = Vec::new();
+            let _ = res_read.take(1025).read_to_end(&mut reply_bytes);
+            if let Ok(reply) = serde_json::from_slice::<LinuxBackupHelperReply>(&reply_bytes) {
+                if !reply.ok {
+                    let code = reply.error.as_deref().unwrap_or("backup_failed");
+                    return Err(BackupHelperError::from_wire_code(code));
+                }
+            } else if !status.success() {
+                return Err(BackupHelperError::BackupFailed);
+            }
+            if !status.success() {
+                return Err(BackupHelperError::BackupFailed);
+            }
+
+            // 4. Normalize staged database to portable DELETE journal mode
+            // (header bytes 18/19 = 1/1), flush leaf + staging directory, and
+            // run PRAGMA quick_check + SHA-256 verification on the root-owned copy.
+            {
+                let conn = rusqlite::Connection::open_with_flags(
+                    &dst_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )
+                .map_err(|_| BackupHelperError::Corrupt)?;
+                conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")
+                    .map_err(|_| BackupHelperError::StoreFailed)?;
+            }
+            for suffix in ["-wal", "-shm", "-journal"] {
+                if let Ok(cname) = component(&format!("{final_name}{suffix}")) {
+                    // SAFETY: staging_dir is a live directory descriptor.
+                    unsafe { libc::unlinkat(staging_dir.as_raw_fd(), cname.as_ptr(), 0) };
+                }
+            }
+            let final_file = File::from(
+                open_at(staging_dir.as_fd(), &final_name, libc::O_RDWR, 0)
+                    .map_err(|_| BackupHelperError::StoreFailed)?,
+            );
+            let final_meta = final_file
+                .metadata()
+                .map_err(|_| BackupHelperError::StoreFailed)?;
+            if !final_meta.is_file()
+                || final_meta.nlink() != 1
+                || final_meta.uid() != self.owner
+                || final_meta.mode() & 0o7777 != 0o600
+                || (final_meta.dev(), final_meta.ino()) != (dst_meta.dev(), dst_meta.ino())
+            {
+                return Err(BackupHelperError::PathViolation);
+            }
+            final_file
+                .sync_all()
+                .map_err(|_| BackupHelperError::StoreFailed)?;
+            drop(final_file);
+            // SAFETY: staging_dir is a live directory descriptor.
+            if unsafe { libc::fsync(staging_dir.as_raw_fd()) } != 0 {
+                return Err(BackupHelperError::StoreFailed);
+            }
+            verify_portable_sqlite_file(&dst_path, max_bytes)
+        })();
+
+        drop(dst_fd);
+        drop(vol_data_fd);
+        if result.is_err() {
+            unlink_staging_artifacts(staging_dir.as_fd(), &final_name);
+        }
+        result
+    }
+
+    fn read_backup_chunk(
+        &mut self,
+        operation_id: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, StoreError> {
+        if operation_id.len() != 32
+            || !operation_id
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            || len == 0
+            || len > compose_backup::BACKUP_CHUNK_BYTES
+        {
+            return Err(StoreError);
+        }
+        let dir = self.backup_staging_dir().map_err(|_| StoreError)?;
+        let name = format!("{operation_id}.sqlite3");
+        let mut file =
+            File::from(open_at(dir.as_fd(), &name, libc::O_RDONLY, 0).map_err(|_| StoreError)?);
+        let meta = file.metadata().map_err(|_| StoreError)?;
+        if !meta.is_file()
+            || meta.uid() != self.owner
+            || meta.mode() & 0o7777 != 0o600
+            || meta.nlink() != 1
+        {
+            return Err(StoreError);
+        }
+        file.seek(SeekFrom::Start(offset)).map_err(|_| StoreError)?;
+        let mut buf = vec![0u8; len];
+        file.read_exact(&mut buf).map_err(|_| StoreError)?;
+        Ok(buf)
+    }
+
+    fn verify_backup_staging(
+        &mut self,
+        operation_id: &str,
+        expected_bytes: u64,
+        expected_digest: &str,
+    ) -> bool {
+        if operation_id.len() != 32
+            || !operation_id
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return false;
+        }
+        let Ok(dir) = self.backup_staging_dir() else {
+            return false;
+        };
+        let name = format!("{operation_id}.sqlite3");
+        let Ok(fd) = open_at(dir.as_fd(), &name, libc::O_RDONLY, 0) else {
+            return false;
+        };
+        let Ok(fd_meta) = File::from(fd).metadata() else {
+            return false;
+        };
+        if !fd_meta.is_file()
+            || fd_meta.uid() != self.owner
+            || fd_meta.mode() & 0o7777 != 0o600
+            || fd_meta.nlink() != 1
+        {
+            return false;
+        }
+        let plain_path = self.state_path.join("backup-staging").join(&name);
+        let Ok(path_meta) = fs::symlink_metadata(&plain_path) else {
+            return false;
+        };
+        if path_meta.file_type().is_symlink()
+            || (path_meta.dev(), path_meta.ino()) != (fd_meta.dev(), fd_meta.ino())
+        {
+            return false;
+        }
+        let Ok(meta) = verify_portable_sqlite_file(&plain_path, MAX_BACKUP_BYTES) else {
+            return false;
+        };
+        meta.total_bytes == expected_bytes && meta.digest == expected_digest
+    }
+
+    fn remove_backup_staging(&mut self, operation_id: &str) -> Result<bool, StoreError> {
+        if operation_id.len() != 32
+            || !operation_id
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(StoreError);
+        }
+        let dir = self.backup_staging_dir().map_err(|_| StoreError)?;
+        let name = format!("{operation_id}.sqlite3");
+        let cname = component(&name).map_err(|_| StoreError)?;
+        // SAFETY: dir is a live root-owned staging dir fd and cname is NUL-terminated.
+        let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) };
+        if rc == 0 {
+            let _ = unsafe { libc::fsync(dir.as_raw_fd()) };
+            Ok(true)
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(StoreError)
+            }
+        }
+    }
+}
+
+fn dup_above_cloexec(fd: BorrowedFd<'_>, min_fd: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: fd is a live descriptor and F_DUPFD_CLOEXEC returns a fresh fd >= min_fd.
+    let dup = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min_fd) };
+    if dup < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: dup is a fresh descriptor owned by this caller.
+    Ok(unsafe { OwnedFd::from_raw_fd(dup) })
+}
+
+fn unlink_staging_artifacts(dir: BorrowedFd<'_>, leaf_name: &str) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        if let Ok(cname) = component(&format!("{leaf_name}{suffix}")) {
+            // SAFETY: dir is a live directory descriptor and cname is NUL-terminated.
+            unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) };
+        }
     }
 }
 
@@ -2533,12 +2974,18 @@ mod compose_tests {
     impl Scratch {
         fn new() -> Self {
             static NEXT: AtomicU32 = AtomicU32::new(0);
-            let path = std::env::temp_dir().join(format!(
+            let raw = std::env::temp_dir().join(format!(
                 "arx-compose-store-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            for dir in [path.clone(), path.join("state"), path.join("secrets")] {
+            fs::DirBuilder::new().mode(0o700).create(&raw).unwrap();
+            let path = fs::canonicalize(&raw).unwrap();
+            for dir in [
+                path.join("state"),
+                path.join("secrets"),
+                path.join("volumes"),
+            ] {
                 fs::DirBuilder::new().mode(0o700).create(dir).unwrap();
             }
             Self(path)
@@ -2547,8 +2994,10 @@ mod compose_tests {
         fn store(&self) -> LinuxComposeStore {
             LinuxComposeStore {
                 state: File::open(self.0.join("state")).unwrap().into(),
+                state_path: self.0.join("state"),
                 secrets: File::open(self.0.join("secrets")).unwrap().into(),
-                volume_root: "/nonexistent",
+                volume_root: self.0.join("volumes").to_string_lossy().into_owned(),
+                volume_root_fd: Some(File::open(self.0.join("volumes")).unwrap().into()),
                 owner: effective_uid(),
             }
         }
@@ -2762,5 +3211,223 @@ mod compose_tests {
             })
         ));
         assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn backup_sqlite_helper_test_trampoline() {
+        if std::env::var_os("ARX_TEST_BACKUP_HELPER").is_some() {
+            let code = compose_backup::run_linux_backup_helper_main();
+            std::process::exit(if code == std::process::ExitCode::SUCCESS {
+                0
+            } else {
+                1
+            });
+        }
+    }
+
+    #[test]
+    fn linux_compose_store_runs_sqlite_backup_and_refuses_symlinks_fifos_and_foreign_owners() {
+        let scratch = Scratch::new();
+        let mut store = scratch.store();
+        let uid = effective_uid();
+        // SAFETY: getegid is always safe and side-effect-free.
+        let gid = unsafe { libc::getegid() };
+        let owner = (uid, gid);
+
+        let vol_name = "arx-calm-life-data";
+        let vol_dir = scratch.0.join("volumes").join(vol_name);
+        let vol_data = vol_dir.join("_data");
+        fs::DirBuilder::new().mode(0o700).create(&vol_dir).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&vol_data).unwrap();
+
+        let db_path = vol_data.join("calm-life.sqlite3");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE events(id INTEGER PRIMARY KEY, label TEXT NOT NULL, val INTEGER NOT NULL);
+             INSERT INTO events(label, val) VALUES ('boot', 1), ('wal_uncheckpointed', 42);",
+        )
+        .unwrap();
+        assert!(vol_data.join("calm-life.sqlite3-wal").exists());
+
+        // 1. End-to-end WAL backup via isolated helper subprocess.
+        let op1 = "11111111111111111111111111111111";
+        let meta = store
+            .run_sqlite_backup(
+                op1,
+                vol_name,
+                owner,
+                "calm-life.sqlite3",
+                MAX_BACKUP_BYTES,
+                Duration::from_secs(15),
+            )
+            .unwrap();
+        assert!(meta.total_bytes >= 4096);
+        assert_eq!(meta.digest.len(), 64);
+
+        let staging_dir = scratch.0.join("state/backup-staging");
+        let staged_leaf = staging_dir.join(format!("{op1}.sqlite3"));
+        let staged_meta = fs::symlink_metadata(&staged_leaf).unwrap();
+        assert_eq!(staged_meta.mode() & 0o7777, 0o600);
+        assert_eq!(staged_meta.nlink(), 1);
+        let staged_bytes = fs::read(&staged_leaf).unwrap();
+        assert_eq!(&staged_bytes[18..20], &[1, 1]);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!staging_dir.join(format!("{op1}.sqlite3{suffix}")).exists());
+        }
+        // Only the staged leaf exists in backup-staging (no .work-* leftovers).
+        let entries: Vec<_> = fs::read_dir(&staging_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries.len(), 1);
+
+        // Verify staging check, exact chunk read, and offline restore of WAL rows.
+        assert!(store.verify_backup_staging(op1, meta.total_bytes, &meta.digest));
+        assert!(!store.verify_backup_staging(op1, meta.total_bytes + 1, &meta.digest));
+        let first_len = (meta.total_bytes as usize).min(compose_backup::BACKUP_CHUNK_BYTES);
+        let chunk0 = store.read_backup_chunk(op1, 0, first_len).unwrap();
+        assert_eq!(chunk0, &staged_bytes[..first_len]);
+
+        let restore_dir = scratch.0.join("restore");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&restore_dir)
+            .unwrap();
+        let report = compose_backup::restore_sqlite_offline(
+            &staged_leaf,
+            &restore_dir,
+            "restored.sqlite3",
+            &meta.digest,
+            MAX_BACKUP_BYTES,
+        )
+        .unwrap();
+        let restored = rusqlite::Connection::open(&report.path).unwrap();
+        let rows: Vec<(String, i64)> = restored
+            .prepare("SELECT label, val FROM events ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("boot".to_owned(), 1),
+                ("wal_uncheckpointed".to_owned(), 42)
+            ]
+        );
+        drop(restored);
+
+        // Release removes staged leaf cleanly.
+        assert_eq!(store.remove_backup_staging(op1), Ok(true));
+        assert!(!staged_leaf.exists());
+        assert_eq!(store.remove_backup_staging(op1), Ok(false));
+
+        // 2. Foreign-owned file / volume owner mismatch is refused.
+        let wrong_owner = (uid.saturating_add(1), gid);
+        assert_eq!(
+            store.run_sqlite_backup(
+                "22222222222222222222222222222222",
+                vol_name,
+                wrong_owner,
+                "calm-life.sqlite3",
+                MAX_BACKUP_BYTES,
+                Duration::from_secs(10),
+            ),
+            Err(BackupHelperError::PathViolation)
+        );
+        let vol_fd = open_at(
+            File::open(&vol_dir).unwrap().as_fd(),
+            "_data",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_dir_file_no_follow_fstatat(
+                vol_fd.as_fd(),
+                "calm-life.sqlite3",
+                wrong_owner,
+                true,
+            ),
+            Err(BackupHelperError::PathViolation)
+        );
+        drop(vol_fd);
+        drop(conn);
+
+        // 3. FIFO companion (<db>-journal) returns PathViolation quickly without hanging.
+        let fifo_path = vol_data.join("calm-life.sqlite3-journal");
+        let fifo_cstr = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        // SAFETY: fifo_cstr is NUL-terminated and 0o600 is a valid FIFO mode.
+        assert_eq!(unsafe { libc::mkfifo(fifo_cstr.as_ptr(), 0o600) }, 0);
+        let fifo_start = Instant::now();
+        assert_eq!(
+            store.run_sqlite_backup(
+                "33333333333333333333333333333333",
+                vol_name,
+                owner,
+                "calm-life.sqlite3",
+                MAX_BACKUP_BYTES,
+                Duration::from_secs(10),
+            ),
+            Err(BackupHelperError::PathViolation)
+        );
+        assert!(
+            fifo_start.elapsed() < Duration::from_secs(2),
+            "FIFO companion check blocked"
+        );
+        fs::remove_file(&fifo_path).unwrap();
+
+        // 4. Symlinked db, -wal, -shm, and -journal are all refused.
+        let outside = scratch.0.join("outside.sqlite3");
+        fs::write(&outside, &staged_bytes).unwrap();
+        symlink(&outside, vol_data.join("linked.sqlite3")).unwrap();
+        assert_eq!(
+            store.run_sqlite_backup(
+                "44444444444444444444444444444444",
+                vol_name,
+                owner,
+                "linked.sqlite3",
+                MAX_BACKUP_BYTES,
+                Duration::from_secs(10),
+            ),
+            Err(BackupHelperError::PathViolation)
+        );
+        for (idx, suffix) in ["-wal", "-shm", "-journal"].iter().enumerate() {
+            let link = vol_data.join(format!("calm-life.sqlite3{suffix}"));
+            let _ = fs::remove_file(&link);
+            symlink(&outside, &link).unwrap();
+            let op_id = format!("{:032x}", 0x50 + idx);
+            assert_eq!(
+                store.run_sqlite_backup(
+                    &op_id,
+                    vol_name,
+                    owner,
+                    "calm-life.sqlite3",
+                    MAX_BACKUP_BYTES,
+                    Duration::from_secs(10),
+                ),
+                Err(BackupHelperError::PathViolation),
+                "symlinked {suffix} was not refused"
+            );
+            fs::remove_file(&link).unwrap();
+        }
+
+        // 5. Oversized DB is refused and staging leaf is removed.
+        let op_big = "66666666666666666666666666666666";
+        assert_eq!(
+            store.run_sqlite_backup(
+                op_big,
+                vol_name,
+                owner,
+                "calm-life.sqlite3",
+                4096,
+                Duration::from_secs(10),
+            ),
+            Err(BackupHelperError::TooLarge)
+        );
+        assert!(!staging_dir.join(format!("{op_big}.sqlite3")).exists());
     }
 }
