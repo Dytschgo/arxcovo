@@ -1255,6 +1255,18 @@ fn token_identity(
     restricted: bool,
     mode: TokenMode,
 ) -> io::Result<Identity> {
+    inspect_token_identity(token, account, restricted, mode, true)
+}
+
+/// The read-only console witness can query the anchored owner token while
+/// another session is active. Every effect gate uses token_identity above.
+fn inspect_token_identity(
+    token: &OwnedHandle,
+    account: &LocalSid,
+    restricted: bool,
+    mode: TokenMode,
+    require_active_console: bool,
+) -> io::Result<Identity> {
     let user = token_data(token, TokenUser)?;
     let integrity = token_data(token, TokenIntegrityLevel)?;
     let elevation = token_data(token, TokenElevation)?;
@@ -1290,7 +1302,9 @@ fn token_identity(
             || elevation[0] != 0
             || !mode.accepts_elevation(elevation_kind[0] as i32)
             || session == 0
-            || (mode == TokenMode::CurrentUser && WTSGetActiveConsoleSessionId() != session)
+            || (require_active_console
+                && mode == TokenMode::CurrentUser
+                && WTSGetActiveConsoleSessionId() != session)
             || stats.TokenType != TokenPrimary
             || (IsTokenRestricted(token.as_raw_handle()) != 0) != restricted
             || (*logon.as_ptr().cast::<TOKEN_GROUPS>()).GroupCount != 1

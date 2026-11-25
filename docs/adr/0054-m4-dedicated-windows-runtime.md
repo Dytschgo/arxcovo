@@ -677,10 +677,26 @@ claim, and keep raw identities local.
 
 Read WTS activity in the current session and bind it to the foreground token
 and a stable console logon incarnation across queries. Verify the SID mapping
-locally and require the unique active, unlocked owner console with sane input
-and logon timestamps. A SID match alone cannot identify a logon. Require ten
-minutes of inactivity and observations at most five seconds old at dispatch,
-clipped to the phase deadline. Recheck activity and reserves before resume,
+locally and require the unique active, unlocked owner console with sane
+timestamps. A SID match alone cannot identify a logon.
+
+Use WTS last-input time when the corroborating samples provide coherent
+timestamps. If both samples report zero last-input time, `current_user` may use
+`GetLastInputInfo` in the enrolled owner's process after corroborating that
+process's physical-console session and the same logon. Prove ten continuous
+minutes without observed input on a monotonic clock. Reset the observation
+interval on input, stale evidence, lock, disconnect, session change or
+uncertainty. Each WTS sample must be at or after its logon time in the
+zero-input path. A change between corroborated input sources invalidates the
+collector for its lifetime. Re-establish the collector before admission.
+Mixed WTS input, clock wrap and backward steps close admission. The
+diagnostic witness may observe the anchored owner's identity and WTS state
+while switched away. Effects require the original owner console to be
+active, unlocked and freshly verified idle.
+
+Require ten minutes of inactivity and observations at most five seconds old
+at dispatch, clipped to the phase deadline. Recheck activity and reserves
+before resume,
 at dispatch and while running. Recent input closes admission. Lock,
 disconnect, session switch, ambiguity or stale observations also close
 admission. Bring owned work to bounded quiescence when the owner returns or

@@ -782,15 +782,10 @@ impl<'a> ReserveActivityPermit<'a> {
 /// Corroborated two-sample console observation used by `ConsoleWitnessMachine`.
 #[derive(Clone, Debug)]
 struct ConsoleTransitionSnapshot {
-    token_stable: bool,
-    owner_session: u32,
-    active_console: u32,
-    owner_lsa: [LsaLogon; 2],
-    owner_wts: [WtsSample; 2],
-    owner_accounts: [Option<WtsAccount>; 2],
+    owner: ConsoleEvidence,
+    input: activity::Input,
     /// Present whenever `active_console` is a non-zero, non-owner session.
     witness: Option<([WtsSample; 2], [Option<WtsAccount>; 2])>,
-    now: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -812,8 +807,9 @@ struct ConsoleWitnessMachine {
     anchor_owner_session: u32,
     anchor_owner_logon: i64,
     anchor_owner_lsa: LsaLogon,
-    pre_prompt_input: i64,
-    phase0_input: Option<i64>,
+    pre_prompt_input: u64,
+    input_source: activity::Source,
+    phase0_input: Option<u64>,
     phase2_witness: Option<(u32, i64)>,
     phase4_current: Option<i64>,
     /// Current phase: 0..=4 for transitions, 5 for post-return fresh idle.
@@ -830,30 +826,26 @@ impl ConsoleWitnessMachine {
     ) -> Result<Self, NativeRefusal> {
         let reason = NativeRefusal::OwnerActivityUnverified;
         validate_owner_snapshot(initial, None)?;
-        if initial.active_console != initial.owner_session
-            || initial.owner_wts[0].state != WTSActive
-            || initial.owner_wts[1].state != WTSActive
-            || initial.owner_wts[0].flags != WTS_SESSIONSTATE_UNLOCK as i32
-            || initial.owner_wts[1].flags != WTS_SESSIONSTATE_UNLOCK as i32
-        {
+        if !initial.owner.owner_console_active() {
             return Err(reason);
         }
         // Enrolled witness account cannot alias the owner account.
         if enrolled_witness
             .user
-            .eq_ignore_ascii_case(&initial.owner_lsa[0].user)
+            .eq_ignore_ascii_case(&initial.owner.lsa[0].user)
             && enrolled_witness
                 .domain
-                .eq_ignore_ascii_case(&initial.owner_lsa[0].domain)
+                .eq_ignore_ascii_case(&initial.owner.lsa[0].domain)
         {
             return Err(reason);
         }
         Ok(Self {
             enrolled_witness,
-            anchor_owner_session: initial.owner_session,
-            anchor_owner_logon: initial.owner_wts[1].logon,
-            anchor_owner_lsa: initial.owner_lsa[1].clone(),
-            pre_prompt_input: initial.owner_wts[1].input,
+            anchor_owner_session: initial.owner.token_session,
+            anchor_owner_logon: initial.owner.wts[1].logon,
+            anchor_owner_lsa: initial.owner.lsa[1].clone(),
+            pre_prompt_input: initial.input.cursor.ok_or(reason)?,
+            input_source: initial.input.source,
             phase0_input: None,
             phase2_witness: None,
             phase4_current: None,
@@ -880,36 +872,39 @@ impl ConsoleWitnessMachine {
         {
             return ConsoleStep::Invalid(reason);
         }
-        // Owner input cursor must never move backwards from the pre-prompt anchor.
-        if snap.owner_wts[0].input < self.pre_prompt_input
-            || snap.owner_wts[1].input < self.pre_prompt_input
+        // A different source or clock era cannot extend our input cursor.
+        let cursor = snap.input.cursor;
+        if snap.input.source != self.input_source
+            || cursor.is_some_and(|cursor| {
+                cursor < self.pre_prompt_input
+                    || (self.input_source == activity::Source::Local
+                        && cursor >> 32 != self.pre_prompt_input >> 32)
+            })
+            || (self.input_source == activity::Source::Wts
+                && (snap.owner.wts[0].input as u64) < self.pre_prompt_input)
         {
             return ConsoleStep::Invalid(reason);
         }
 
-        let owner_unlocked_active = snap.active_console == self.anchor_owner_session
-            && snap.owner_wts[0].state == WTSActive
-            && snap.owner_wts[1].state == WTSActive
-            && snap.owner_wts[0].flags == WTS_SESSIONSTATE_UNLOCK as i32
-            && snap.owner_wts[1].flags == WTS_SESSIONSTATE_UNLOCK as i32;
+        let owner_unlocked_active = snap.owner.owner_console_active();
 
-        let owner_locked_active = snap.active_console == self.anchor_owner_session
-            && snap.owner_wts[0].state == WTSActive
-            && snap.owner_wts[1].state == WTSActive
-            && snap.owner_wts[0].flags == WTS_SESSIONSTATE_LOCK as i32
-            && snap.owner_wts[1].flags == WTS_SESSIONSTATE_LOCK as i32;
+        let owner_locked_active = snap.owner.active_console == self.anchor_owner_session
+            && snap.owner.wts[0].state == WTSActive
+            && snap.owner.wts[1].state == WTSActive
+            && snap.owner.wts[0].flags == WTS_SESSIONSTATE_LOCK as i32
+            && snap.owner.wts[1].flags == WTS_SESSIONSTATE_LOCK as i32;
 
         // If another user session became active, validate its session IDs and
         // require it to be the enrolled witness (wrong witness closes the run).
-        let witness_active = if snap.active_console != self.anchor_owner_session
-            && snap.active_console != 0
-            && snap.active_console != u32::MAX
+        let witness_active = if snap.owner.active_console != self.anchor_owner_session
+            && snap.owner.active_console != 0
+            && snap.owner.active_console != u32::MAX
         {
             let Some(([w0, w1], [a0, a1])) = &snap.witness else {
                 return ConsoleStep::Invalid(reason);
             };
-            if w0.session != snap.active_console
-                || w1.session != snap.active_console
+            if w0.session != snap.owner.active_console
+                || w1.session != snap.owner.active_console
                 || w0.logon <= 0
                 || w0.logon != w1.logon
                 || a0 != a1
@@ -929,7 +924,7 @@ impl ConsoleWitnessMachine {
                 return ConsoleStep::Invalid(reason);
             }
             if let Some((expected_id, expected_logon)) = self.phase2_witness
-                && (snap.active_console != expected_id || w1.logon != expected_logon)
+                && (snap.owner.active_console != expected_id || w1.logon != expected_logon)
             {
                 return ConsoleStep::Invalid(reason);
             }
@@ -945,8 +940,8 @@ impl ConsoleWitnessMachine {
             // Phase 0: strictly advance past pre-prompt input cursor.
             0 => {
                 owner_unlocked_active
-                    && snap.owner_wts[1].input > self.pre_prompt_input
-                    && snap.owner_wts[1].current - snap.owner_wts[1].input < IDLE_TICKS
+                    && cursor.is_some_and(|input| input > self.pre_prompt_input)
+                    && !snap.input.idle
             }
             // Phase 1: owner session locked on console.
             1 => owner_locked_active,
@@ -955,22 +950,20 @@ impl ConsoleWitnessMachine {
             // Phase 3: enrolled witness active and owner session disconnected.
             3 => {
                 witness_active
-                    && snap.owner_wts[0].state == WTSDisconnected
-                    && snap.owner_wts[1].state == WTSDisconnected
+                    && snap.owner.wts[0].state == WTSDisconnected
+                    && snap.owner.wts[1].state == WTSDisconnected
             }
             // Phase 4: returned to original unlocked owner session with fresh unlock/input.
             4 => {
                 let prior = self.phase0_input.unwrap_or(self.pre_prompt_input);
                 owner_unlocked_active
-                    && snap.owner_wts[1].input > prior
-                    && snap.owner_wts[1].current - snap.owner_wts[1].input < IDLE_TICKS
+                    && cursor.is_some_and(|input| input > prior)
+                    && !snap.input.idle
             }
             // Phase 5: fresh idle observation after return before next effect.
             5 => {
                 let floor = self.phase4_current.unwrap_or(0);
-                owner_unlocked_active
-                    && snap.owner_wts[1].current >= floor
-                    && snap.owner_wts[1].current - snap.owner_wts[1].input >= IDLE_TICKS
+                owner_unlocked_active && snap.owner.wts[1].current >= floor && snap.input.idle
             }
             _ => return ConsoleStep::Invalid(reason),
         };
@@ -986,13 +979,13 @@ impl ConsoleWitnessMachine {
         self.corroborated = 0;
         let finished = self.phase;
         match finished {
-            0 => self.phase0_input = Some(snap.owner_wts[1].input),
+            0 => self.phase0_input = cursor,
             2 => {
                 if let Some(([_, w1], _)) = &snap.witness {
-                    self.phase2_witness = Some((snap.active_console, w1.logon));
+                    self.phase2_witness = Some((snap.owner.active_console, w1.logon));
                 }
             }
-            4 => self.phase4_current = Some(snap.owner_wts[1].current),
+            4 => self.phase4_current = Some(snap.owner.wts[1].current),
             5 => {
                 self.phase = 6;
                 return ConsoleStep::IdleVerified;
@@ -1009,45 +1002,29 @@ fn validate_owner_snapshot(
     anchor: Option<(u32, i64, &LsaLogon)>,
 ) -> Result<(), NativeRefusal> {
     let reason = NativeRefusal::OwnerActivityUnverified;
-    let [first, second] = snap.owner_wts;
-    let session = snap.owner_session;
-    let lsa_ok = snap.owner_lsa.iter().all(|lsa| {
-        lsa.owner
-            && lsa.session == session
-            && lsa.logon_type == LOGON_INTERACTIVE
-            && lsa.logon_time > 0
-            && lsa.logon_time.abs_diff(first.logon) <= LOGON_SKEW_TICKS as u64
-    }) && snap.owner_lsa[0] == snap.owner_lsa[1];
-    if !snap.token_stable
-        || !lsa_ok
-        || snap.owner_accounts[0] != snap.owner_accounts[1]
-        || !account_bound(snap.owner_accounts[0].as_ref(), &snap.owner_lsa[0])
-        || first.session != session
-        || second.session != session
-        || first.logon <= 0
-        || first.logon != second.logon
-        || first.input < first.logon
-        || second.input < first.input
-        || second.current < first.current
-        || second.current < second.input
-        || !(0..=LIVE_TICKS).contains(&snap.now.saturating_sub(second.current))
+    let owner = &snap.owner;
+    let session = owner.token_session;
+    let first = owner.wts[0];
+    if console_source(owner, activity::View::Transition)? != snap.input.source
+        || (snap.input.source == activity::Source::Local
+            && owner.owner_console_active() != snap.input.cursor.is_some())
     {
         return Err(reason);
     }
     if let Some((expected_session, expected_logon, expected_lsa)) = anchor
         && (session != expected_session
             || first.logon != expected_logon
-            || &snap.owner_lsa[0] != expected_lsa)
+            || &snap.owner.lsa[0] != expected_lsa)
     {
         return Err(reason);
     }
     Ok(())
 }
 
-fn capture_transition_snapshot(
-    token: &VmToken,
-) -> Result<ConsoleTransitionSnapshot, NativeRefusal> {
-    let e = console_evidence(token)?;
+fn capture_transition_snapshot(held: &Held) -> Result<ConsoleTransitionSnapshot, NativeRefusal> {
+    let (e, input) = held
+        .activity
+        .capture(&held.token, activity::View::Transition)?;
     let witness = if e.active_console != e.token_session
         && e.active_console != 0
         && e.active_console != u32::MAX
@@ -1061,14 +1038,9 @@ fn capture_transition_snapshot(
         None
     };
     Ok(ConsoleTransitionSnapshot {
-        token_stable: e.token_stable,
-        owner_session: e.token_session,
-        active_console: e.active_console,
-        owner_lsa: e.lsa,
-        owner_wts: e.wts,
-        owner_accounts: e.accounts,
+        owner: e,
+        input,
         witness,
-        now: e.now,
     })
 }
 
@@ -1077,8 +1049,7 @@ async fn observe_console_transitions(
     witness: &WtsAccount,
     cancel: &Shutdown,
 ) -> Option<[u64; 5]> {
-    let token = &baseline._held.token;
-    let initial = capture_transition_snapshot(token).ok()?;
+    let initial = capture_transition_snapshot(&baseline._held).ok()?;
     let mut machine = ConsoleWitnessMachine::begin(witness.clone(), &initial).ok()?;
     let mut output = [0; 5];
     let deadline = Tick::now() + Duration::from_secs(20 * 60);
@@ -1098,7 +1069,7 @@ async fn observe_console_transitions(
             eprintln!("{}", prompts[phase]);
             prompted = Some(phase);
         }
-        let snapshot = capture_transition_snapshot(token).ok()?;
+        let snapshot = capture_transition_snapshot(&baseline._held).ok()?;
         match machine.step(&snapshot) {
             ConsoleStep::Pending => {}
             ConsoleStep::PhaseMatched(done) => {
@@ -1727,15 +1698,17 @@ impl<'a> Host for Windows<'a> {
         let captured = Tick::now();
         // Capture the checked two-sample WTS/LSA observation once so any armed
         // WtsAmbiguity fault records original facts from this exact observation.
-        let mut console = console_evidence(&self.baseline._held.token)?;
-        let idle = console_decision(&console)?;
+        let held = &self.baseline._held;
+        let (mut console, input) = held
+            .activity
+            .capture(&held.token, activity::View::Admission)?;
         let (active_cpus, available_ram_bytes) = host_resources()?;
         let effective_cpus = cpu_scope()?;
         let whpx = hypervisor_present()?;
         let limits = self.live_limits()?;
         let mut live = Live {
             captured,
-            idle,
+            idle: input.idle,
             active_cpus,
             effective_cpus,
             available_ram_bytes,
@@ -1771,7 +1744,7 @@ impl<'a> Host for Windows<'a> {
                 ControlledFault::WtsAmbiguity => {
                     // Mutate the exact checked two-sample WTS/LSA observation.
                     console.accounts[1] = None;
-                    let _ = console_decision(&console)?;
+                    let _ = console_source(&console, activity::View::Admission)?;
                 }
                 ControlledFault::CpuReserve => {
                     live.effective_cpus = 1;
@@ -2376,24 +2349,55 @@ mod tests {
             ([ws, ws], [wa.clone(), wa])
         });
         ConsoleTransitionSnapshot {
-            token_stable: true,
-            owner_session: 2,
-            active_console,
-            owner_lsa: [lsa.clone(), lsa],
-            owner_wts: [wts, wts],
-            owner_accounts: [account.clone(), account],
+            owner: ConsoleEvidence {
+                token_stable: true,
+                token_session: 2,
+                active_console,
+                lsa: [lsa.clone(), lsa],
+                wts: [wts, wts],
+                accounts: [account.clone(), account],
+                now: current + 10,
+                local_input: None,
+            },
+            input: activity::Input::wts(wts),
             witness,
-            now: current + 10,
         }
     }
 
     #[test]
     fn console_witness_enforces_ordered_corroborated_transitions_cursor_witness_and_idle() {
+        for source in [activity::Source::Wts, activity::Source::Local] {
+            exercise_console_witness(source);
+        }
+    }
+
+    fn exercise_console_witness(source: activity::Source) {
+        let t0 = 1_000 + IDLE_TICKS;
+        let owner_snapshot = |console, state, flags, input, current, witness| {
+            let mut snapshot = self::owner_snapshot(console, state, flags, input, current, witness);
+            if source == activity::Source::Local {
+                let active = snapshot.owner.owner_console_active();
+                snapshot.input = activity::Input {
+                    source,
+                    cursor: active.then(|| {
+                        if input == 1_000 {
+                            1
+                        } else {
+                            (input - t0) as u64 + 2
+                        }
+                    }),
+                    idle: active && snapshot.input.idle,
+                };
+                for wts in &mut snapshot.owner.wts {
+                    wts.input = 0;
+                }
+            }
+            snapshot
+        };
         let enrolled = WtsAccount {
             user: "Witness".to_owned(),
             domain: "LOCAL".to_owned(),
         };
-        let t0 = 1_000 + IDLE_TICKS;
         let initial = owner_snapshot(
             2,
             WTSActive,
@@ -2522,22 +2526,22 @@ mod tests {
         let mut machine = ConsoleWitnessMachine::begin(enrolled, &initial).unwrap();
 
         let mut lost_logon = initial.clone();
-        lost_logon.owner_wts[0].logon = 1_001;
-        lost_logon.owner_wts[1].logon = 1_001;
+        lost_logon.owner.wts[0].logon = 1_001;
+        lost_logon.owner.wts[1].logon = 1_001;
         assert_eq!(
             machine.step(&lost_logon),
             ConsoleStep::Invalid(NativeRefusal::OwnerActivityUnverified)
         );
 
         let mut bad_sid = initial.clone();
-        bad_sid.owner_wts[1].session = 99;
+        bad_sid.owner.wts[1].session = 99;
         assert_eq!(
             machine.step(&bad_sid),
             ConsoleStep::Invalid(NativeRefusal::OwnerActivityUnverified)
         );
 
         let mut unstable_token = initial;
-        unstable_token.token_stable = false;
+        unstable_token.owner.token_stable = false;
         assert_eq!(
             machine.step(&unstable_token),
             ConsoleStep::Invalid(NativeRefusal::OwnerActivityUnverified)

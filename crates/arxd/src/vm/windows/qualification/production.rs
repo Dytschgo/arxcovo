@@ -67,7 +67,7 @@ impl ForegroundQualification<'_> {
         let captured = Instant::now();
         self.fresh()?;
         let held = &self.held;
-        if !current_console_idle(&held.token)? {
+        if !held.current_console_idle()? {
             return Err(NativeRefusal::OwnerActivityUnverified);
         }
         let (cpus, ram) = host_resources()?;
