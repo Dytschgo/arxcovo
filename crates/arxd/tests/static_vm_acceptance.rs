@@ -1054,13 +1054,31 @@ fn verify_backup_restore_event(
     if report.size_bytes != expected_size || report.digest != expected_sha256 {
         return Err(Failure::BackupRestoreMismatch("restore_report_mismatch"));
     }
+    let open_error = || Failure::BackupRestoreMismatch("restored_db_open");
+    let path = &report.path;
+    #[cfg(unix)]
+    let path = {
+        // SQLite's Unix VFS also rejects symlink ancestors under NOFOLLOW.
+        // Resolve OS temp-root aliases while leaving the database leaf unfollowed.
+        let parent = path.parent().ok_or_else(open_error)?;
+        let leaf = path.file_name().ok_or_else(open_error)?;
+        if !fs::symlink_metadata(parent)
+            .map_err(|_| open_error())?
+            .is_dir()
+        {
+            return Err(open_error());
+        }
+        fs::canonicalize(parent)
+            .map_err(|_| open_error())?
+            .join(leaf)
+    };
     let db = Connection::open_with_flags(
-        &report.path,
+        path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NOFOLLOW
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|_| Failure::BackupRestoreMismatch("restored_db_open"))?;
+    .map_err(|_| open_error())?;
     let mut stmt = db
         .prepare(query)
         .map_err(|_| Failure::BackupRestoreMismatch("restored_query_prepare"))?;
@@ -2204,7 +2222,16 @@ fn offline_backup_restore_verifies_wal_event_survival_and_preserves_settled_copy
     let backups = temp.path().join("backups");
     fs::create_dir(&backups).unwrap();
     let settled = backups.join("settled.sqlite3");
-    let restore_dir = temp.path().join("restore");
+    let restore_root = temp.path().join("restore-root");
+    fs::create_dir(&restore_root).unwrap();
+    #[cfg(unix)]
+    let restore_root = {
+        // Model a symlink ancestor such as macOS /var even when TMPDIR is canonical.
+        let alias = temp.path().join("restore-alias");
+        std::os::unix::fs::symlink(&restore_root, &alias).unwrap();
+        alias
+    };
+    let restore_dir = restore_root.join("restore");
     fs::create_dir(&restore_dir).unwrap();
 
     let nonce = "a5".repeat(16);
