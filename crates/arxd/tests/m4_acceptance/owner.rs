@@ -39,6 +39,15 @@ use windows_sys::Win32::{
 
 mod ledger;
 
+#[path = "../m5_acceptance/host.rs"]
+mod m5;
+
+#[derive(Clone, Copy)]
+enum Journey {
+    Vm,
+    Vault,
+}
+
 #[cfg(test)]
 #[path = "../vault_fixtures/private.rs"]
 mod private_fixture;
@@ -1311,7 +1320,7 @@ async fn mismatched_endpoint_refuses_foreground_inputs_before_startup() {
         idle_delay_s: 0,
     };
     assert_eq!(
-        run_with_inputs(&plan, &source, &[]).await,
+        run_with_inputs(&plan, &source, &[], Journey::Vm).await,
         Err(Failure::Check("bridge_endpoint_binding"))
     );
     assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
@@ -1321,7 +1330,7 @@ async fn mismatched_endpoint_refuses_foreground_inputs_before_startup() {
     fs::write(&client, settings.to_string()).unwrap();
     let source = open(&plan.daemon_config, false, FILE_SHARE_READ).unwrap();
     assert_eq!(
-        run_with_inputs(&plan, &source, &[]).await,
+        run_with_inputs(&plan, &source, &[], Journey::Vm).await,
         Err(Failure::Check("store_volume_pin"))
     );
 }
@@ -1372,6 +1381,7 @@ async fn with_client(
     daemon: &Child,
     config: LoadedClient,
     evidence: &mut Evidence,
+    kind: Journey,
 ) -> Result<()> {
     let expected_pid = daemon
         .id()
@@ -1397,23 +1407,41 @@ async fn with_client(
                 .map_err(|_| Failure::Discovery)?
                 .map_err(|_| Failure::Discovery)
                 .and_then(|reply| serde_json::to_value(reply).map_err(|_| Failure::Discovery));
-            discover(discovered)?;
+            match kind {
+                Journey::Vm => discover(discovered)?,
+                Journey::Vault => m5::discover_tools(discovered)?,
+            }
             // Closed admission returns its reason before the idle delay.
             let first = rpc(&client, "vm_catalog", json!({})).await?;
-            selected_digest(&first, plan)?;
+            match kind {
+                Journey::Vm => {
+                    selected_digest(&first, plan)?;
+                }
+                Journey::Vault => {
+                    m5::require_qualification(&first, plan)?;
+                }
+            }
             sleep(Duration::from_secs(plan.idle_delay_s)).await;
-            let (entries, selected) = catalog(&client, plan).await?;
+            let (entries, selected) = match kind {
+                Journey::Vm => catalog(&client, plan).await?,
+                Journey::Vault => m5::qualified_catalog(&client, plan).await?,
+            };
             evidence.qualification_sha256 = Some(selected);
             let _store = pin_store(store, &plan.store, mounted_volume)?;
-            let ledger = LiveLedger::open(&foreground.state_dir, &plan.store)?;
-            let mut acceptance = Acceptance {
-                client: &client,
-                ledger,
-                evidence,
-                principal: &foreground.agents[0].principal,
-                operations: Vec::new(),
-            };
-            journey(&mut acceptance, plan, &entries).await
+            match kind {
+                Journey::Vm => {
+                    let ledger = LiveLedger::open(&foreground.state_dir, &plan.store)?;
+                    let mut acceptance = Acceptance {
+                        client: &client,
+                        ledger,
+                        evidence,
+                        principal: &foreground.agents[0].principal,
+                        operations: Vec::new(),
+                    };
+                    journey(&mut acceptance, plan, &entries).await
+                }
+                Journey::Vault => m5::after_admission(&client, plan, evidence).await,
+            }
         }
         .await;
         let cancelled = timeout(RPC, client.cancel())
@@ -1710,13 +1738,7 @@ fn pin_digest(path: &Path, expected: &str, max: u64) -> Result<File> {
     Ok(file)
 }
 
-async fn run() -> Result<()> {
-    let plan_path = PathBuf::from(
-        env::var_os("ARX_M4_ACCEPTANCE_PLAN").ok_or(Failure::Check("acceptance_plan_required"))?,
-    );
-    d_path(&plan_path)?;
-    let _plan_path = pin_root(plan_path.parent().ok_or(Failure::Check("plan_parent"))?)?;
-    let plan: Plan = config(&open(&plan_path, false, FILE_SHARE_READ)?)?;
+fn bind_plan(plan: &Plan) -> Result<(File, Vec<File>, Vec<File>, File)> {
     check(plan.idle_delay_s <= 900, "idle_delay_bound")?;
     for recipe in [&plan.ubuntu, &plan.windows] {
         verify_hex(&recipe.recipe_id, 32, "recipe_id")?;
@@ -1737,16 +1759,33 @@ async fn run() -> Result<()> {
     }
     d_path(&plan.evidence_dir)?;
     let evidence_pins = pin_root(&plan.evidence_dir)?;
-    let _daemon = pin_digest(&plan.daemon, &plan.daemon_sha256, 512 * 1024 * 1024)?;
+    let daemon = pin_digest(&plan.daemon, &plan.daemon_sha256, 512 * 1024 * 1024)?;
     if let Some(pin) = &plan.qualification_sha256 {
         verify_hex(pin, 64, "qualification_pin")?;
     }
     let daemon_config = open(&plan.daemon_config, false, FILE_SHARE_READ)?;
-    let _client_config = open(&plan.client_config, false, FILE_SHARE_READ)?;
-    run_with_inputs(&plan, &daemon_config, &evidence_pins).await
+    let client_config = open(&plan.client_config, false, FILE_SHARE_READ)?;
+    pins.push(client_config);
+    Ok((daemon_config, evidence_pins, pins, daemon))
 }
 
-async fn run_with_inputs(plan: &Plan, daemon_config: &File, evidence_pins: &[File]) -> Result<()> {
+async fn run() -> Result<()> {
+    let plan_path = PathBuf::from(
+        env::var_os("ARX_M4_ACCEPTANCE_PLAN").ok_or(Failure::Check("acceptance_plan_required"))?,
+    );
+    d_path(&plan_path)?;
+    let _plan_path = pin_root(plan_path.parent().ok_or(Failure::Check("plan_parent"))?)?;
+    let plan: Plan = config(&open(&plan_path, false, FILE_SHARE_READ)?)?;
+    let (daemon_config, evidence_pins, _input_pins, _daemon) = bind_plan(&plan)?;
+    run_with_inputs(&plan, &daemon_config, &evidence_pins, Journey::Vm).await
+}
+
+async fn run_with_inputs(
+    plan: &Plan,
+    daemon_config: &File,
+    evidence_pins: &[File],
+    kind: Journey,
+) -> Result<()> {
     let foreground: Foreground = config(daemon_config)?;
     let client = safe(ClientConfig::load(&plan.client_config), "bridge_config")?;
     check(
@@ -1804,7 +1843,16 @@ async fn run_with_inputs(plan: &Plan, daemon_config: &File, evidence_pins: &[Fil
         let observed = async {
             ready(&mut daemon, &foreground.local.address).await?;
             let _live_store = pin_store(&state, &plan.store, mounted_volume)?;
-            with_client(plan, &foreground, &state, &daemon, client, &mut evidence).await
+            with_client(
+                plan,
+                &foreground,
+                &state,
+                &daemon,
+                client,
+                &mut evidence,
+                kind,
+            )
+            .await
         }
         .await;
         let drained = console.drain(&mut daemon).await;
@@ -1819,7 +1867,11 @@ async fn run_with_inputs(plan: &Plan, daemon_config: &File, evidence_pins: &[Fil
     evidence.finished_at_ms = now_ms()?;
     evidence.failure = result.clone().err();
     evidence.write(&plan.evidence_dir)?;
-    println!("M4 acceptance run {run_id}");
+    let label = match kind {
+        Journey::Vm => "M4",
+        Journey::Vault => "M5",
+    };
+    println!("{label} acceptance run {run_id}");
     result
 }
 

@@ -2705,20 +2705,53 @@ async fn monitor_running<T, E>(
         }
     };
     check()?;
-    observe()?;
-    let result = loop {
-        check()?;
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break Err(interrupted(ChannelError::Cancelled)),
-            _ = tokio::time::sleep_until(deadline) => break Err(interrupted(ChannelError::Timeout)),
-            _ = tokio::time::sleep(LIVE_POLL) => observe()?,
-            result = &mut work => break result,
-        }
+    // An observer refusal, like a work result, still takes the terminal
+    // sample and yields to cancellation or expiry before it is returned.
+    let result = match observe() {
+        Err(error) => Err(error),
+        Ok(()) => loop {
+            check()?;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break Err(interrupted(ChannelError::Cancelled)),
+                _ = tokio::time::sleep_until(deadline) => break Err(interrupted(ChannelError::Timeout)),
+                _ = tokio::time::sleep(LIVE_POLL) => {
+                    if let Err(error) = observe() {
+                        break Err(error);
+                    }
+                }
+                result = &mut work => break result,
+            }
+        },
     };
     let terminal = observe();
     check()?;
     result.and_then(|value| terminal.map(|()| value))
+}
+
+/// Release keeps its own teardown budget so custody evidence is collected
+/// after a refusal too. Output is accepted only if cancellation, the original
+/// cutoff and a fresh host sample still allow it after release settles. The
+/// held release is returned in either case.
+async fn accept_after_release<T, E, R>(
+    result: Result<T, E>,
+    release: impl std::future::Future<Output = R>,
+    cancel: &Shutdown,
+    deadline: tokio::time::Instant,
+    recheck: impl FnOnce() -> Result<(), E>,
+    interrupted: impl Fn(ChannelError) -> E,
+) -> (Result<T, E>, R) {
+    let release = release.await;
+    let result = result.and_then(|value| {
+        if cancel.is_cancelled() {
+            Err(interrupted(ChannelError::Cancelled))
+        } else if tokio::time::Instant::now() >= deadline {
+            Err(interrupted(ChannelError::Timeout))
+        } else {
+            recheck().map(|()| value)
+        }
+    });
+    (result, release)
 }
 
 trait InstallerChild {
@@ -2916,15 +2949,20 @@ impl CheckedLaunchCore<'_> {
             return (result, (StopDisposition::ChargedQuarantine, None));
         }
         let successful = result.is_ok();
-        let release = self
-            .release_evidence_held(
+        accept_after_release(
+            result,
+            self.release_evidence_held(
                 successful,
                 successful,
                 tokio::time::Instant::now() + Duration::from_secs(5),
                 verify_release,
-            )
-            .await;
-        (result, release)
+            ),
+            cancel,
+            deadline,
+            || refresh().map(drop),
+            |_| refused,
+        )
+        .await
     }
 
     async fn boot(

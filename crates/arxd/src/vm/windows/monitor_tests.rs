@@ -279,3 +279,107 @@ async fn installer_owner_return_after_shutdown_refuses_clean_settlement() {
     );
     assert_eq!(failure.recovery, StopDisposition::DirtyRelease);
 }
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_during_observer_refusal_wins_after_terminal_sample() {
+    let cancel = Shutdown::default();
+    let samples = Cell::new(0);
+    let result = monitor_running(
+        async {
+            sleep(LIVE_POLL * 3).await;
+            Ok(7)
+        },
+        || {
+            samples.set(samples.get() + 1);
+            if samples.get() == 2 {
+                cancel.cancel();
+                Err(ChannelError::Remote)
+            } else {
+                Ok(())
+            }
+        },
+        &cancel,
+        Instant::now() + Duration::from_secs(10),
+        |error| error,
+    )
+    .await;
+    assert_eq!(result, Err(ChannelError::Cancelled));
+    assert_eq!(samples.get(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_observer_refusal_still_takes_the_terminal_sample() {
+    let samples = Cell::new(0);
+    let result = monitor_running(
+        async { Ok(7) },
+        || {
+            samples.set(samples.get() + 1);
+            Err(NativeRefusal::OwnerActivityUnverified)
+        },
+        &Shutdown::default(),
+        Instant::now() + Duration::from_secs(10),
+        |_| NativeRefusal::QmpUnverified,
+    )
+    .await;
+    assert_eq!(result, Err(NativeRefusal::OwnerActivityUnverified));
+    assert_eq!(samples.get(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_during_helper_release_withholds_output_and_keeps_proof() {
+    let cancel = Shutdown::default();
+    let (result, held) = accept_after_release(
+        Ok::<_, ChannelError>(b"helper output"),
+        async {
+            sleep(LIVE_POLL).await;
+            cancel.cancel();
+            "held proof"
+        },
+        &cancel,
+        Instant::now() + Duration::from_secs(10),
+        || Ok(()),
+        |error| error,
+    )
+    .await;
+    assert_eq!(result, Err(ChannelError::Cancelled));
+    assert_eq!(held, "held proof");
+}
+
+#[tokio::test(start_paused = true)]
+async fn helper_release_past_the_cutoff_or_failing_host_withholds_output() {
+    let deadline = Instant::now() + LIVE_POLL;
+    let (expired, held) = accept_after_release(
+        Ok::<_, ChannelError>(1),
+        async {
+            sleep(LIVE_POLL * 2).await;
+            "held proof"
+        },
+        &Shutdown::default(),
+        deadline,
+        || Ok(()),
+        |error| error,
+    )
+    .await;
+    assert_eq!(expired, Err(ChannelError::Timeout));
+    assert_eq!(held, "held proof");
+    let (host, _) = accept_after_release(
+        Ok::<_, NativeRefusal>(1),
+        async {},
+        &Shutdown::default(),
+        Instant::now() + LIVE_POLL,
+        || Err(NativeRefusal::OwnerActivityUnverified),
+        |_| NativeRefusal::QmpUnverified,
+    )
+    .await;
+    assert_eq!(host, Err(NativeRefusal::OwnerActivityUnverified));
+    let (accepted, _) = accept_after_release(
+        Ok::<_, NativeRefusal>(1),
+        async {},
+        &Shutdown::default(),
+        Instant::now() + LIVE_POLL,
+        || Ok(()),
+        |_| NativeRefusal::QmpUnverified,
+    )
+    .await;
+    assert_eq!(accepted, Ok(1));
+}
