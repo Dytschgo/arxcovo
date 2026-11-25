@@ -373,12 +373,20 @@ fn stage_tables_are_closed_and_class_specific() {
         let sequence = stages(class);
         assert_eq!(&sequence[..15], shared);
         assert_eq!(sequence.last(), Some(&Stage::Cleanup));
-        let endpoint = position(class, Stage::InstalledGuestEndpoint).unwrap();
-        assert_eq!(
-            endpoint,
-            sequence.len() - 2,
-            "endpoint follows the class boots"
-        );
+        let end = sequence.len() - 1;
+        if class == Class::Test {
+            assert_eq!(
+                &sequence[end - 4..end],
+                &[
+                    Stage::UbuntuRecipe,
+                    Stage::UbuntuInstalledEndpoint,
+                    Stage::WindowsRecipe,
+                    Stage::WindowsInstalledEndpoint,
+                ]
+            );
+        } else {
+            assert_eq!(sequence[end - 1], Stage::InstalledGuestEndpoint);
+        }
         for (index, stage) in sequence.iter().enumerate() {
             assert_eq!(position(class, *stage), Some(index), "no duplicate stages");
             assert!(stage.file().required(class));

@@ -314,7 +314,7 @@ printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
 /// Probe-only NoCloud seed. The live guest reports the launch nonce, NIC
 /// setup observations and socket outcomes from a fixed program. The seed has no
 /// autoinstall stanza, guest service, bootloader action or credential.
-#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+#[cfg(test)]
 pub(in crate::vm) fn network_probe_seed(
     nonce: &[u8; 16],
     targets: &crate::vm::guest::network_probe::Targets,
@@ -346,6 +346,47 @@ pub(in crate::vm) fn network_probe_seed(
     )
     .expect("String write");
     script.push_str(PROBE_BODY);
+    script.push_str(PROBE_ENTRY);
+    write_probe_seed(&encoded_nonce, &script)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(in crate::vm) fn network_witness_seed(
+    nonce: &[u8; 16],
+    targets: &crate::vm::windows::qualification::WitnessTargets,
+) -> Result<Vec<u8>, RecipeError> {
+    use std::fmt::Write;
+    let encoded_nonce = hex::encode(nonce);
+    let mut script = String::from(PROBE_START);
+    writeln!(script, "NONCE = bytes.fromhex({encoded_nonce:?})").expect("String write");
+    for (kind, addresses) in [("TCP", targets.tcp), ("UDP", targets.udp)] {
+        writeln!(script, "{kind} = [").expect("String write");
+        for address in addresses {
+            writeln!(
+                script,
+                "    ({:?}, {}),",
+                address.ip().to_string(),
+                address.port()
+            )
+            .expect("String write");
+        }
+        writeln!(script, "]").expect("String write");
+    }
+    writeln!(
+        script,
+        "DNS = ({:?}, {})",
+        targets.dns.ip().to_string(),
+        targets.dns.port()
+    )
+    .expect("String write");
+    script.push_str(PROBE_BODY);
+    script.push_str(WITNESS_ENTRY);
+    write_probe_seed(&encoded_nonce, &script)
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn write_probe_seed(encoded_nonce: &str, script: &str) -> Result<Vec<u8>, RecipeError> {
+    use std::fmt::Write;
     let mut cloud = String::from(
         "#cloud-config\nwrite_files:\n  - path: /run/arxcovo-network-probe.py\n    permissions: '0600'\n    content: |\n",
     );
@@ -431,22 +472,25 @@ def probe_dns(target, bind_v4):
             conn.connect(target)
             conn.send(payload)
             reply = conn.recv(512)
-            if (
-                len(reply) >= len(payload)
-                and reply[:2] == ident
-                and (reply[2] & 0x80) != 0
-                and ((reply[2] >> 3) & 0x0f) == 0
-                and (reply[2] & 0x02) == 0
-                and (reply[3] & 0x0f) in (0, 3)
-                and reply[4:6] == b'\x00\x01'
-                and reply[12:len(payload)] == question
-            ):
-                return 'R'
-            return 'M'
+            return dns_reply(payload, reply)
     except OSError:
         return 'E'
 
-def run_probes(devices):
+def dns_reply(query, reply):
+    if (
+        len(reply) >= len(query)
+        and reply[:2] == query[:2]
+        and (reply[2] & 0x80) != 0
+        and ((reply[2] >> 3) & 0x0f) == 0
+        and (reply[2] & 0x02) == 0
+        and (reply[3] & 0x0f) in (0, 3)
+        and reply[4:6] == b'\x00\x01'
+        and reply[12:len(query)] == query[12:]
+    ):
+        return 'R'
+    return 'M'
+
+def nic_setup(devices):
     ports = [p for p in devices if p.name != 'lo']
     nic_ready = (
         len(ports) == 1
@@ -476,6 +520,10 @@ def run_probes(devices):
 
     ipv4_lease = guest_v4 == '10.0.2.15'
     setup = ''.join('1' if flag else '0' for flag in (nic_ready, ipv4_lease, default_route, no_v6))
+    return setup, guest_v4, ports[0].name if nic_ready else None
+
+def run_probes(devices):
+    setup, guest_v4, _ = nic_setup(devices)
     if setup == '1111':
         outcomes = ''.join(probe_tcp(t, guest_v4) for t in TCP)
         outcomes += probe_dns(DNS, guest_v4) + probe_dns(('10.0.2.3', 53), guest_v4)
@@ -483,7 +531,10 @@ def run_probes(devices):
         outcomes = 'E' * 8
 
     return setup, outcomes
+"#;
 
+#[cfg(test)]
+const PROBE_ENTRY: &str = r#"
 if __name__ == '__main__':
     port = pathlib.Path('/dev/virtio-ports/org.arxcovo.agent.0')
     for _ in range(40):
@@ -497,7 +548,168 @@ if __name__ == '__main__':
             wire.write(b'ARXNET2 ' + NONCE.hex().encode('ascii') + b' ' + setup.encode('ascii') + b' ' + outcomes.encode('ascii') + b'\n')
 "#;
 
-pub(super) const DETACHED_HEALTH: &str = r#"set -eu
+#[cfg(all(windows, target_arch = "x86_64"))]
+const WITNESS_ENTRY: &str = r#"
+import errno
+
+def witness_attempt(target, source, nic, tcp, payload=b''):
+    v6 = ':' in target[0]
+    family = socket.AF_INET6 if v6 else socket.AF_INET
+    mode = socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM
+    try:
+        with socket.socket(family, mode) as conn:
+            conn.settimeout(1.0)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, nic.encode('ascii') + b'\0')
+            if not v6:
+                conn.bind((source, 0))
+            try:
+                if tcp:
+                    conn.connect(target)
+                    return 'R'
+                return 'S' if conn.sendto(payload, target) == len(payload) else 'E'
+            except TimeoutError:
+                return 'T'
+            except OSError as error:
+                if v6 and error.errno in (errno.ENETUNREACH, errno.EADDRNOTAVAIL):
+                    return 'L'
+                if not v6 and tcp and error.errno in (errno.ECONNREFUSED, errno.ECONNRESET):
+                    return 'F'
+                return 'E'
+    except OSError:
+        return 'E'
+
+def gateway_reachable(nic):
+    try:
+        reply = subprocess.run(['ip', '-4', 'neigh', 'get', '10.0.2.2', 'dev', nic],
+                               timeout=1, check=True, capture_output=True).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(reply and reply[0] == b'10.0.2.2' and b'lladdr' in reply and b'REACHABLE' in reply)
+
+def witness_dns(target, source, nic, query):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as conn:
+            conn.settimeout(1.0)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, nic.encode('ascii') + b'\0')
+            conn.bind((source, 0))
+            conn.connect(target)
+            if conn.send(query) != len(query):
+                return 'E'
+            try:
+                return dns_reply(query, conn.recv(512))
+            except TimeoutError:
+                # A sent query only. The independent witness determines
+                # whether the datagram crossed the restricted backend.
+                return 'S'
+    except OSError:
+        return 'E'
+
+def witness_results(devices):
+    setup, source, nic = nic_setup(devices)
+    if setup != '1111':
+        return setup, '0', 'EEEEEEEE'
+    # First issue the host-alias UDP probe. Resolving the gateway neighbor
+    # also yields the positive on-link slirp control, separate from IP egress.
+    alias = witness_attempt(UDP[2], source, nic, False, NONCE)
+    for _ in range(10):
+        if gateway_reachable(nic):
+            control = '1'
+            break
+        time.sleep(0.1)
+    else:
+        control = '0'
+    tcp = ''.join(witness_attempt(target, source, nic, True) for target in TCP)
+    udp = ''.join(witness_attempt(target, source, nic, False, NONCE) for target in UDP[:2]) + alias
+    label = b'arx-' + NONCE.hex().encode('ascii')
+    query = NONCE[:2] + bytes.fromhex('01000001000000000000') + bytes([len(label)]) + label
+    query += b'\x07invalid\x00\x00\x01\x00\x01'
+    dns = ''.join(witness_dns(target, source, nic, query) for target in (DNS, ('10.0.2.3', 53)))
+    return setup, control, tcp + udp + dns
+
+if __name__ == '__main__':
+    port = pathlib.Path('/dev/virtio-ports/org.arxcovo.agent.0')
+    for _ in range(40):
+        if port.exists():
+            break
+        time.sleep(0.25)
+    setup, control, outcomes = witness_results(pathlib.Path('/sys/class/net').iterdir())
+    if port.exists():
+        with port.open('wb', buffering=0) as wire:
+            wire.write(('ARXNET3 ' + NONCE.hex() + ' ' + setup + ' ' + control + ' ' + outcomes + '\n').encode('ascii'))
+"#;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(in crate::vm) fn installed_witness_script(
+    nonce: [u8; 16],
+    targets: &crate::vm::windows::qualification::WitnessTargets,
+) -> Result<String, RecipeError> {
+    use std::fmt::Write;
+    let mut script = String::from(
+        "set -eu\n/usr/bin/python3 - <<'ARX_NETWORK'\nimport pathlib, socket, subprocess, time\n",
+    );
+    writeln!(script, "NONCE=bytes.fromhex({:?})", hex::encode(nonce)).expect("String write");
+    for (name, addresses) in [
+        ("TCP", targets.tcp.to_vec()),
+        ("UDP", targets.udp.to_vec()),
+        (
+            "DNS",
+            vec![targets.dns, "10.0.2.3:53".parse().expect("fixed")],
+        ),
+    ] {
+        writeln!(script, "{name}=[").expect("String write");
+        for target in addresses {
+            writeln!(script, "({:?},{}),", target.ip().to_string(), target.port())
+                .expect("String write");
+        }
+        script.push_str("]\n");
+    }
+    let functions = WITNESS_ENTRY
+        .split("def witness_results(")
+        .next()
+        .expect("fixed script");
+    script.push_str(functions);
+    let dns = PROBE_BODY
+        .split("def dns_reply(")
+        .nth(1)
+        .expect("fixed script");
+    script.push_str("def dns_reply(");
+    script.push_str(dns.split("def nic_setup(").next().expect("fixed script"));
+    script.push_str(r#"
+ports=[p for p in pathlib.Path('/sys/class/net').iterdir() if p.name!='lo']
+assert len(ports)==1 and (ports[0]/'device/driver').resolve().name=='virtio_net'
+assert (ports[0]/'operstate').read_text().strip()=='up'
+n=ports[0].name
+def ip(*args):
+    return subprocess.run(['/usr/sbin/ip', *args],check=True,timeout=1,capture_output=True).stdout.split()
+assert b'10.0.2.15/24' in ip('-4','addr','show','dev',n)
+assert b'10.0.2.2' in ip('-4','route','show','default','dev',n)
+assert b'inet6' not in ip('-6','addr','show','dev',n,'scope','global')
+assert not ip('-6','route','show','default','dev',n)
+a=witness_attempt(UDP[2],'10.0.2.15',n,False,NONCE)
+for _ in range(10):
+    if gateway_reachable(n): break
+    time.sleep(.1)
+else: raise SystemExit(1)
+t=[witness_attempt(d,'10.0.2.15',n,True) for d in TCP]
+u=[witness_attempt(d,'10.0.2.15',n,False,NONCE) for d in UDP[:2]]+[a]
+x=b'arx-'+NONCE.hex().encode()
+q=NONCE[:2]+bytes.fromhex('01000001000000000000')+bytes([len(x)])+x+b'\x07invalid\0\0\1\0\1'
+assert t[0] in 'FT' and t[1]=='L' and t[2] in 'FT' and u==list('SLS')
+assert [witness_dns(d,'10.0.2.15',n,q) for d in DNS]==['S','S']
+ARX_NETWORK
+"#);
+    let script = script
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if script.len() > arx_guest::protocol::MAX_SCRIPT {
+        return Err(RecipeError::MediaLimit);
+    }
+    Ok(script)
+}
+
+pub(in crate::vm) const DETACHED_HEALTH: &str = r#"set -eu
 export LC_ALL=C
 verify_account_result() {
     boot_id=$(cat "$1")
@@ -743,6 +955,18 @@ with patch.object(socket, 'socket') as constructor:
     assert probe_dns(('192.0.2.1', 53), '10.0.2.15') == 'E'
     sock.send.assert_called_once()
     sock.recv.assert_called_once()
+
+label = b'arx-' + NONCE.hex().encode('ascii')
+query = NONCE[:2] + bytes.fromhex('01000001000000000000') + bytes([len(label)]) + label
+query += b'\x07invalid\x00\x00\x01\x00\x01'
+good = query[:2] + b'\x81\x83' + query[4:]
+for reply, expected in [(good, 'R'), (good[:-1], 'M'), (b'\x13' + good[1:], 'M')]:
+    sock = MagicMock()
+    sock.recv.return_value = reply
+    with patch.object(socket, 'socket') as constructor:
+        constructor.return_value.__enter__.return_value = sock
+        assert probe_dns(('192.0.2.1', 53), '10.0.2.15') == expected
+        sock.send.assert_called_once_with(query)
 
 def check_ipv6(addresses, routes, expected):
     def read(path):

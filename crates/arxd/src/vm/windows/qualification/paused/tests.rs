@@ -216,7 +216,7 @@ struct Fake {
     stop_done: Cell<Option<StopProtocol>>,
     clean_exit: bool,
     completed_phases: Cell<PausedCompleted>,
-    network_report: Cell<Option<NetworkProbeReport>>,
+    network_report: Cell<Option<WitnessReport>>,
     network_post_controls_ok: bool,
 }
 
@@ -564,7 +564,7 @@ impl Host for Fake {
         self.stop_done.set(Some(protocol));
     }
 
-    fn record_network_report(&self, _: &FakeSlot, report: NetworkProbeReport) {
+    fn record_network_report(&self, _: &FakeSlot, report: WitnessReport) {
         self.network_report.set(Some(report));
     }
 
@@ -1847,7 +1847,10 @@ async fn network_purpose_verifies_zero_hostfwd_channel_and_clean_powerdown_path(
             make_pin("vmlinuz", b"kernel"),
             make_pin("initrd", b"initrd"),
         ],
-        witnesses: crate::vm::guest::network_probe::fixture_targets(),
+        witnesses: serde_json::from_str(
+            r#"{"ipv4":"192.0.2.10","ipv6":"2001:db8::1","dns":"192.0.2.10"}"#,
+        )
+        .unwrap(),
         projection: [7; 32],
     };
     let seed = make_pin("cidata.iso", b"cidata");
@@ -1947,15 +1950,13 @@ async fn network_purpose_verifies_zero_hostfwd_channel_and_clean_powerdown_path(
             ),
             async {
                 tokio::time::sleep(PRELAUNCH_QUIET_WINDOW + Duration::from_millis(10)).await;
-                let frame = format!("ARXNET2 {} 1111 EEEEEEEE\n", hex::encode(nonce));
+                let frame = format!("ARXNET3 {} 1111 1 TLTSLSSS\n", hex::encode(nonce));
                 ch_write.write_all(frame.as_bytes()).await.unwrap();
             }
         );
         let report = host.network_report.get().unwrap();
-        assert_eq!(
-            report.outcomes,
-            [crate::vm::qualification_record::ProbeOutcome::SocketError; 8]
-        );
+        assert_eq!(report.validated_attempts, 8);
+        assert!(report.gateway_reachable);
         let written = host.written.borrow();
         assert_eq!(
             String::from_utf8_lossy(&written).contains("\"execute\":\"system_powerdown\""),

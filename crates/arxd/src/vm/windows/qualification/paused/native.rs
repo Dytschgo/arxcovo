@@ -1120,6 +1120,7 @@ pub struct NetworkProbe {
     pub diagnostic:
         Result<crate::vm::qualification_record::RestrictedNetworkDiagnostic, NativeRefusal>,
     pub release: StopDisposition,
+    pub accepted: Option<crate::vm::qualification_record::Observation>,
 }
 
 pub struct NetworkProbePermit<'a>(Prepared<'a>);
@@ -1152,6 +1153,7 @@ impl<'a> NetworkProbePermit<'a> {
         let absent = |reason| NetworkProbe {
             diagnostic: Err(reason),
             release: StopDisposition::DirtyRelease,
+            accepted: None,
         };
         let setup = (|| {
             getrandom::fill(&mut nonce).map_err(|_| reason)?;
@@ -1160,38 +1162,39 @@ impl<'a> NetworkProbePermit<'a> {
             let vars = data.join(VARS).map_err(|_| reason)?;
             let path = trial.path.join(SEED).map_err(|_| reason)?;
             let console = SerialName::generate().map_err(|_| reason)?;
-            let bytes = crate::vm::template::network_probe_seed(&nonce, &source.witnesses)
-                .map_err(|_| reason)?;
-            if bytes.len() as u64 > MAX_SEED {
-                return Err(reason);
-            }
             let live = host.live(envelope)?;
             live.check(envelope, Tick::now()).map_err(|_| reason)?;
-            Ok((source, code, vars, path, console, bytes))
+            Ok((source, code, vars, path, console))
         })();
-        let (source, code, vars, path, console, bytes) = match setup {
+        let (source, code, vars, path, console) = match setup {
             Ok(setup) => setup,
             Err(reason) => return absent(reason),
         };
         let deadline = Tick::now() + Duration::from_secs(240);
-        let host_controls_pre = matches!(
-            bounded(cancel, deadline, async {
-                Ok(source.witnesses.known_live(&nonce).await)
-            })
-            .await,
-            Ok(true)
-        );
-        if !host_controls_pre {
+        if !host_dns_servers().is_ok_and(|resolvers| source.witnesses.valid(&resolvers)) {
             return absent(reason);
         }
+        let (witnesses, targets) =
+            match super::super::network::Witnesses::prepare(&source.witnesses, nonce).await {
+                Ok(ready) => ready,
+                Err(_) => return absent(reason),
+            };
         let slot = match Slot::claim_named(&trial.leaf, baseline.run(), CHARGE) {
             Ok(slot) => SlotGuard::new(slot),
-            Err(reason) => return absent(reason),
+            Err(reason) => {
+                let _ = witnesses.settle().await;
+                return absent(reason);
+            }
         };
         let mut seed_created = false;
         let mut identity = None;
         let staged = (|| {
             before(cancel, deadline).map_err(|_| reason)?;
+            let bytes =
+                crate::vm::template::network_witness_seed(&nonce, &targets).map_err(|_| reason)?;
+            if bytes.len() as u64 > MAX_SEED {
+                return Err(reason);
+            }
             host.confirm_claim_for_seed(slot.slot(), envelope)?;
             let mut file = sink::create_hidden(&trial.leaf, SEED).map_err(|_| reason)?;
             seed_created = true;
@@ -1248,6 +1251,7 @@ impl<'a> NetworkProbePermit<'a> {
                 release: StopDisposition::DirtyRelease,
             },
         };
+        let receipts = witnesses.settle().await;
         // Retain the seed charge on ANY ambiguous creation, open, release or
         // removal (including when create_hidden succeeded before identity/write failed).
         let seed_removed = if !seed_created {
@@ -1276,19 +1280,64 @@ impl<'a> NetworkProbePermit<'a> {
         // A report can only arrive after the plan and pre-controls passed.
         // Preserve it even if post-controls, guest shutdown or seed cleanup
         // failed so the incomplete record shows where the observation ended.
-        let diagnostic = host.network_report.get().ok_or(reason).map(|guest| {
-            crate::vm::qualification_record::RestrictedNetworkDiagnostic {
-                guest,
-                host_controls_post: host.post_controls.get(),
-                clean_guest_shutdown: host.stop_done.get() == Some(StopProtocol::QmpPowerdown)
-                    && observed.release == StopDisposition::CleanRelease,
-                seed_charge_released: release != StopDisposition::ChargedQuarantine,
-            }
+        let diagnostic = host.network_report.get().ok_or(reason).map(|report| {
+            network_diagnostic(
+                report.diagnostic,
+                host.post_controls.get(),
+                host.stop_done.get(),
+                observed.release,
+                release,
+            )
         });
+        use crate::vm::qualification_record::{Observation, Origin, Stage};
+        let accepted = host
+            .network_report
+            .get()
+            .zip(diagnostic.as_ref().ok())
+            .and_then(|(report, diagnostic)| {
+                let guest = diagnostic.guest;
+                let evidence = Observation::RestrictedNetworkWitness {
+                    ipv4_and_ipv6_setup: guest.nic_ready
+                        && guest.ipv4_lease
+                        && guest.default_route
+                        && guest.no_ipv6_egress_route,
+                    reachable_gateway_control: report.gateway_reachable,
+                    validated_attempts: report.validated_attempts,
+                    witness_receipts: receipts
+                        .as_ref()
+                        .map_or(u8::MAX, |bits| bits.count_ones() as u8),
+                    witnesses_settled: receipts.is_ok(),
+                    clean_guest_shutdown: diagnostic.clean_guest_shutdown,
+                    seed_charge_released: diagnostic.seed_charge_released,
+                };
+                (observed.paused.is_ok()
+                    && !cancel.is_cancelled()
+                    && Tick::now() < deadline
+                    && diagnostic.host_controls_post
+                    && evidence.validates(Stage::RestrictedTestNetwork, Origin::Native))
+                .then_some(evidence)
+            });
         NetworkProbe {
             diagnostic,
             release,
+            accepted,
         }
+    }
+}
+
+fn network_diagnostic(
+    guest: crate::vm::qualification_record::NetworkProbeReport,
+    host_controls_post: bool,
+    stop: Option<StopProtocol>,
+    guest_release: StopDisposition,
+    seed_release: StopDisposition,
+) -> crate::vm::qualification_record::RestrictedNetworkDiagnostic {
+    crate::vm::qualification_record::RestrictedNetworkDiagnostic {
+        guest,
+        host_controls_post,
+        clean_guest_shutdown: stop == Some(StopProtocol::QmpPowerdown)
+            && guest_release == StopDisposition::CleanRelease,
+        seed_charge_released: seed_release != StopDisposition::ChargedQuarantine,
     }
 }
 
@@ -1448,7 +1497,7 @@ struct Windows<'a> {
     fault_sample: Cell<Option<FaultRecord>>,
     prelaunch_quiet: Cell<bool>,
     sec_marker_verified: Cell<bool>,
-    network_report: Cell<Option<NetworkProbeReport>>,
+    network_report: Cell<Option<WitnessReport>>,
     post_controls: Cell<bool>,
     stop_done: Cell<Option<StopProtocol>>,
     loss_signals: Cell<Option<LossSignals>>,
@@ -1913,12 +1962,12 @@ impl<'a> Host for Windows<'a> {
         self.sec_marker_verified.set(true);
     }
 
-    fn record_network_report(&self, _: &Slot, report: NetworkProbeReport) {
+    fn record_network_report(&self, _: &Slot, report: WitnessReport) {
         self.network_report.set(Some(report));
     }
 
     async fn network_post_controls(&self, network: &NetworkBoot<'_>) -> bool {
-        network.source.witnesses.known_live(&network.nonce).await
+        host_dns_servers().is_ok_and(|resolvers| network.source.witnesses.valid(&resolvers))
     }
 
     fn mark_post_controls(&self, _: &Slot) {
@@ -2145,6 +2194,58 @@ mod tests {
     use crate::vm::windows::qualification::inventory::tests::{
         Fixture, READ_ONLY, WRITABLE, set_dacl,
     };
+
+    #[test]
+    fn network_diagnostic_projects_post_control_shutdown_and_seed_release_independently() {
+        use crate::vm::qualification_record::{NetworkProbeReport, ProbeOutcome};
+        use StopDisposition::{ChargedQuarantine, CleanRelease, DirtyRelease};
+        let guest = NetworkProbeReport {
+            nic_ready: true,
+            ipv4_lease: true,
+            default_route: true,
+            no_ipv6_egress_route: true,
+            outcomes: [ProbeOutcome::Reachable; 8],
+        };
+        for (post, protocol, vm, seed, clean, released) in [
+            (
+                false,
+                Some(StopProtocol::QmpPowerdown),
+                CleanRelease,
+                CleanRelease,
+                true,
+                true,
+            ),
+            (
+                true,
+                Some(StopProtocol::QmpQuit),
+                CleanRelease,
+                CleanRelease,
+                false,
+                true,
+            ),
+            (
+                true,
+                Some(StopProtocol::QmpPowerdown),
+                DirtyRelease,
+                DirtyRelease,
+                false,
+                true,
+            ),
+            (
+                true,
+                Some(StopProtocol::QmpPowerdown),
+                CleanRelease,
+                ChargedQuarantine,
+                true,
+                false,
+            ),
+        ] {
+            let report = network_diagnostic(guest, post, protocol, vm, seed);
+            assert_eq!(report.host_controls_post, post);
+            assert_eq!(report.clean_guest_shutdown, clean);
+            assert_eq!(report.seed_charge_released, released);
+        }
+    }
 
     #[test]
     fn controlled_fault_requires_its_own_refusal_and_dirty_release() {

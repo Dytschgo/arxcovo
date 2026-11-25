@@ -70,13 +70,13 @@ const MAX_FIRMWARE: u64 = 64 * 1024 * 1024;
         reason = "owner Windows image inspection is qualification work"
     )
 )]
-pub(super) enum InstallImage {
+pub(in crate::vm) enum InstallImage {
     Wim,
     Esd,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct Edition<'a> {
+pub(in crate::vm) struct Edition<'a> {
     pub index: u32,
     pub name: &'a str,
     pub edition_id: &'a str,
@@ -86,7 +86,7 @@ pub(super) struct Edition<'a> {
     pub container: InstallImage,
 }
 
-pub(super) struct WindowsPins<'a> {
+pub(in crate::vm) struct WindowsPins<'a> {
     pub iso: AssetPin,
     pub edition: Edition<'a>,
     pub driver_medium: AssetPin,
@@ -102,7 +102,7 @@ pub(super) struct WindowsPins<'a> {
     pub qemu_receipt: AssetPin,
 }
 
-pub(super) struct WindowsAssets<'a> {
+pub(in crate::vm) struct WindowsAssets<'a> {
     pub iso: &'a mut dyn Read,
     pub edition: Edition<'a>,
     pub driver_medium: &'a mut dyn Read,
@@ -115,17 +115,17 @@ pub(super) struct WindowsAssets<'a> {
 }
 
 #[derive(Default)]
-pub(super) struct WindowsRecipe<'a> {
+pub(in crate::vm) struct WindowsRecipe<'a> {
     // There are no built-in owner ISO, edition or driver pins.
     pub pins: Option<WindowsPins<'a>>,
 }
 
-pub(super) struct PreparedWindows {
+pub(in crate::vm) struct PreparedWindows {
     pub digest: [u8; 32],
     pub image: InstalledImage,
 }
 
-pub(super) struct InstalledImage {
+pub(in crate::vm) struct InstalledImage {
     version: String,
     revision: Option<u32>,
     edition: String,
@@ -153,7 +153,7 @@ impl InstalledImage {
 impl WindowsRecipe<'_> {
     /// Validate every asset before writing. The digest binds the versioned
     /// recipe and verified metadata, and is returned only after a full write.
-    pub(super) fn write_test_seed(
+    pub(in crate::vm) fn write_test_seed(
         &self,
         assets: WindowsAssets<'_>,
         guest: &[u8],
@@ -820,7 +820,7 @@ impl InstalledTarget {
 }
 
 impl InstalledImage {
-    fn probe(&self, validation: bool) -> String {
+    pub(in crate::vm) fn probe(&self, validation: bool) -> String {
         let validation = if validation { "$true" } else { "$false" };
         let revision = self
             .revision
@@ -841,6 +841,15 @@ pub(super) struct OfflineSetupState {
 }
 
 impl OfflineSetupState {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) fn from_released_pair(registry: bool, state_ini: bool) -> Self {
+        let observed = |generalized| if generalized { GENERALIZED_OOBE } else { "" }.to_owned();
+        Self {
+            registry: observed(registry),
+            state_ini: observed(state_ini),
+        }
+    }
+
     fn is_generalized(&self) -> bool {
         // A clean QMP stop proves the release, while the two Setup witnesses
         // establish successful generalization on the released disk itself.

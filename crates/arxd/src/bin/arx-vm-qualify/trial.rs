@@ -247,13 +247,41 @@ impl<S: Source> Trial<S> {
     /// binding expiry at the seal point. No writer accepts the result in
     /// this version.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn finish(self, clock: &impl Clock) -> Result<Complete<S>, RunError> {
+    pub(crate) fn finish(&self, clock: &impl Clock) -> Result<Complete<S>, RunError> {
         self.state.finish(clock)
     }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 impl Trial<Native> {
+    pub(crate) fn publish_native_complete(
+        &self,
+        complete: Complete<Native>,
+        projection: &arxd::vm::qualification::RecipeProjection,
+        cancel: &arxd::service::Shutdown,
+        clock: &impl Clock,
+    ) -> Result<(), RunError> {
+        self.custody
+            .publish_test_completion(
+                &SealBundle {
+                    seal: complete.seal,
+                    files: complete.files,
+                },
+                self.state.issued,
+                cancel,
+                || clock.now(),
+                &self.state.dependencies,
+                projection,
+            )
+            .map_err(|_| RunError::Output)
+    }
+
+    pub(crate) fn latch_publication_time(&mut self, clock: &impl Clock) {
+        if let Some(reason) = self.state.gate(clock.now(), clock) {
+            self.state.late.get_or_insert(reason);
+        }
+    }
+
     pub(crate) fn drive_native(
         &mut self,
         paused_runtime: Option<&tokio::runtime::Runtime>,
@@ -502,10 +530,6 @@ impl<S: Source> State<S> {
         );
     }
 
-    fn files(&self) -> Result<Vec<(FileKind, Vec<u8>)>, RunError> {
-        group_files(&self.records)
-    }
-
     fn complete(&self) -> bool {
         let sequence = stages(self.binding().class);
         self.settled
@@ -543,7 +567,7 @@ impl<S: Source> State<S> {
         }
     }
 
-    fn finish(self, clock: &impl Clock) -> Result<Complete<S>, RunError> {
+    fn finish(&self, clock: &impl Clock) -> Result<Complete<S>, RunError> {
         let now = clock.now();
         let binding = self.binding();
         let dependencies = &self.dependencies;
@@ -556,24 +580,8 @@ impl<S: Source> State<S> {
         {
             return Err(RunError::Incomplete);
         }
-        let files = self.files()?;
-        let seal = Seal {
-            contract: CONTRACT,
-            collector: COLLECTOR,
-            origin: S::ORIGIN,
-            binding,
-            finished_utc: now.utc,
-            manifest: files
-                .iter()
-                .map(|(file, bytes)| ManifestEntry {
-                    file: *file,
-                    length: bytes.len() as u64,
-                    sha256: digest(bytes),
-                })
-                .collect(),
-        };
-        check_bundle(&seal, &files, S::ORIGIN)?;
-        let seal = canonical(&seal)?;
+        let SealBundle { seal, files } =
+            produce_bundle(S::ORIGIN, binding, &self.records, now.utc)?;
         // Building, checking, and encoding the bundle consume trial time.
         // Recheck cancellation, budget and expiry after all of that work.
         let seal_point = clock.now();
@@ -608,6 +616,7 @@ pub(crate) enum Output {
 }
 
 /// Each record file in manifest order with its canonical encoding.
+#[cfg(test)]
 pub(crate) fn group_files(records: &[Record]) -> Result<Vec<(FileKind, Vec<u8>)>, RunError> {
     FileKind::ALL
         .into_iter()
@@ -643,7 +652,7 @@ pub(crate) fn publish_incomplete<S: Source>(
     if S::ORIGIN != Origin::Native {
         return Err(RunError::Untrusted);
     }
-    if !trial.state.settled || trial.state.complete() {
+    if !trial.state.settled || (trial.state.complete() && trial.state.dependencies.complete()) {
         return Err(RunError::Output);
     }
     sink.publish(

@@ -41,6 +41,10 @@ fn main() -> std::process::ExitCode {
     let result = native::run(enrollment, evidence, mode);
     // Only typed, path-free outcomes reach the console.
     match result {
+        Ok(native::Outcome::Complete) => {
+            println!("Complete");
+            ExitCode::SUCCESS
+        }
         Ok(native::Outcome::Incomplete) => {
             eprintln!("Incomplete");
             ExitCode::from(2)
