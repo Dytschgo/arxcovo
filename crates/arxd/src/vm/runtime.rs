@@ -187,7 +187,7 @@ pub(crate) mod test_issuer {
             &self,
             workspace: WorkspaceBinding,
             slot: ArtifactSlot,
-        ) -> Result<LaunchAuthority, NativeRefusal> {
+        ) -> Result<SlotAuthority, NativeRefusal> {
             self.authorize(workspace, &[slot])
         }
 
@@ -195,9 +195,12 @@ pub(crate) mod test_issuer {
             &self,
             workspace: WorkspaceBinding,
             slots: &[ArtifactSlot],
-        ) -> Result<LaunchAuthority, NativeRefusal> {
+        ) -> Result<SlotAuthority, NativeRefusal> {
             self.verify(workspace, slots)?;
-            Ok(LaunchAuthority { _issued: () })
+            Ok(SlotAuthority {
+                workspace,
+                slots: slots.to_vec(),
+            })
         }
 
         pub(crate) fn launch<'a>(
@@ -217,6 +220,86 @@ pub(crate) mod test_issuer {
                 expected: EffectPlan::from_target(expected)?,
                 slots,
             })
+        }
+    }
+
+    /// A bounded attempt can finish without proof. Keep the owned launch in the
+    /// caller until evidence is recorded, and let a stop or reaper wake a retry.
+    pub(crate) async fn reconcile_release<T>(
+        mut settlement: T,
+        wake: &tokio::sync::Notify,
+        mut record: impl FnMut(&T) -> anyhow::Result<bool>,
+        mut quarantine: impl FnMut() -> anyhow::Result<()>,
+        mut retry: impl AsyncFnMut() -> T,
+    ) -> anyhow::Result<()> {
+        let mut delay = std::time::Duration::from_secs(2);
+        loop {
+            if record(&settlement)? {
+                return Ok(());
+            }
+            drop(settlement);
+            quarantine()?;
+            tokio::select! {
+                _ = wake.notified() => {}
+                _ = tokio::time::sleep(delay) => {}
+            }
+            delay = (delay * 2).min(std::time::Duration::from_secs(60));
+            settlement = retry().await;
+        }
+    }
+
+    /// A start refused before boot holds no launch, so the stopped pair is its
+    /// only custody. Settle the start, then record that pair's release for the
+    /// exact epoch. Until an observation succeeds the generation stays fenced
+    /// and charged, and a stop or reaper wake retries.
+    pub(crate) async fn settle_unlaunched<F>(
+        finish_start: impl FnOnce() -> anyhow::Result<()>,
+        wake: &tokio::sync::Notify,
+        mut observe: impl FnMut() -> Option<F>,
+        mut record: impl FnMut(&F) -> anyhow::Result<()>,
+        fence: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        finish_start()?;
+        reconcile_release(
+            observe(),
+            wake,
+            |observed| match observed {
+                Some(observed) => record(observed).map(|()| true),
+                None => Ok(false),
+            },
+            fence,
+            async || observe(),
+        )
+        .await
+    }
+
+    /// One staging or guest-script effect, bound to the exact workspace and
+    /// slots it was authorized for. Consumption at the effect edge refuses any
+    /// other target.
+    #[must_use]
+    pub(crate) struct SlotAuthority {
+        workspace: WorkspaceBinding,
+        slots: Vec<ArtifactSlot>,
+    }
+
+    impl SlotAuthority {
+        pub(crate) fn consume(
+            self,
+            workspace: WorkspaceBinding,
+            slots: &[ArtifactSlot],
+        ) -> Result<LaunchAuthority, NativeRefusal> {
+            if self.workspace != workspace || self.slots != slots {
+                return Err(REFUSED);
+            }
+            Ok(LaunchAuthority { _issued: () })
+        }
+
+        #[cfg(test)]
+        pub(crate) fn for_test(workspace: WorkspaceBinding, slots: &[ArtifactSlot]) -> Self {
+            Self {
+                workspace,
+                slots: slots.to_vec(),
+            }
         }
     }
 

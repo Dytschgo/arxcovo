@@ -408,6 +408,17 @@ impl<C: Clock> VmController<C> {
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn native_cleanup_safe(&self, work: &reaper::CleanupWork) -> Result<bool> {
         self.store.transact(|db| {
+            // A failed build settles its receipt only after its helper and boot
+            // teardown. Disposal then reopens every recorded object under writer
+            // exclusion, or proves an unrecorded slot was never created.
+            if let reaper::CleanupKind::Build(build) = work.kind {
+                return Ok(work.accounted
+                    && store::count(db,
+                        "SELECT count(*) FROM vm_build_intents b
+                         JOIN vm_operations o ON o.operation_id=b.operation_id
+                         WHERE b.id=?1 AND o.status=0",
+                        [build])? == 0);
+            }
             let Some(vm) = work.kind.vm() else { return Ok(false) };
             if store::count(db, "SELECT count(*) FROM vm_instances WHERE id=?1", [vm])? != 1 {
                 return Ok(false);
@@ -432,6 +443,9 @@ impl<C: Clock> VmController<C> {
                     Some("expiry" | "delete" | "abandoned") => Ok(work.accounted),
                     _ => Ok(false),
                 },
+                // Failed clone staging: its worker has settled (checked above)
+                // and disposal carries the same writer-exclusion proof.
+                reaper::CleanupKind::Staging { .. } => Ok(work.accounted),
                 _ => Ok(false),
             }
         })
@@ -446,6 +460,20 @@ impl<C: Clock> VmController<C> {
         worker: &PendingOperation,
         slot: ArtifactSlot,
         evidence: ArtifactEvidence,
+    ) -> Result<()> {
+        self.native_slot_created(worker, slot, evidence.identity, evidence.directory)
+    }
+
+    /// Record a new slot's object identity as soon as the issuer creates it,
+    /// before any payload or helper. A failed worker then leaves the reaper
+    /// an exact object to reopen under writer exclusion.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn native_slot_created(
+        &self,
+        worker: &PendingOperation,
+        slot: ArtifactSlot,
+        identity: super::paths::FileIdentity,
+        directory: Id,
     ) -> Result<()> {
         self.check_worker(worker)?;
         self.store.transact(|db| {
@@ -462,8 +490,8 @@ impl<C: Clock> VmController<C> {
                 "UPDATE vm_artifacts SET volume_id=?4,directory_id=?5,file_id=?6
                  WHERE generation_id=?1 AND role=?2 AND object_key=?3 AND state='created'
                    AND (file_id IS NULL OR (volume_id=?4 AND directory_id=?5 AND file_id=?6))",
-                params![slot.generation, slot.role, slot.key, evidence.identity.volume.to_be_bytes(),
-                    evidence.directory, evidence.identity.file],
+                params![slot.generation, slot.role, slot.key, identity.volume.to_be_bytes(),
+                    directory, identity.file],
             )? == 1, "native helper artifact changed");
             store::require_headroom(db)
         })
@@ -516,29 +544,31 @@ impl<C: Clock> VmController<C> {
             let action = request.operation.action();
 
             let target = || {
-                if let Some(epoch) = stop_epoch && matches!(request.operation, Operation::Stop) {
-                    // A stop can join this owned TEST start or its recovery. Bind
-                    // the exception to the principal, active generation and boot.
-                    let start: Option<(i64,i64)> = db.query_row(
-                        "SELECT o.activity_id,o.status FROM vm_instances v
-                         JOIN vm_generations g ON g.vm_id=v.id AND g.active=1 AND g.static_id IS NULL
-                         JOIN vm_snapshot_release r ON r.generation=g.id AND r.epoch=?3
-                         JOIN vm_operations o ON o.vm=v.id AND o.operation_id=r.epoch AND o.action=3
-                         WHERE v.id=?1 AND v.principal=?2 AND o.principal=?2 AND r.disposition IS NULL
-                         AND NOT EXISTS(SELECT 1 FROM activity a WHERE a.vm=v.id AND a.status=0
-                         AND (a.action<=6 OR a.action IN (12,18)) AND a.id<>o.activity_id)",
-                        params![request.vm,request.principal,epoch], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
-                    let Some((activity,status)) = start else { return Ok(Err(Refusal::Busy)); };
+                if let Some(epoch) = stop_epoch
+                    && matches!(request.operation, Operation::Stop)
+                {
+                    let start = owned_test_epoch(db, request.vm, request.principal, epoch)?;
+                    let Some((activity, status)) = start else {
+                        return Ok(Err(Refusal::Busy));
+                    };
                     if status == Status::Pending.code() {
                         // Retire the exact start in the transaction inserting the
                         // stop. The original worker retains teardown custody.
-                        store::settle_with_script(db,activity,now,Completion::CleanupUnconfirmed,None,Some(FailureReason::BootFailed))?;
+                        store::settle_with_script(
+                            db,
+                            activity,
+                            now,
+                            Completion::CleanupUnconfirmed,
+                            None,
+                            Some(FailureReason::BootFailed),
+                        )?;
                     }
                     return Ok(Ok(Target::Existing));
                 }
                 target(db, &request, now)
             };
-            let decision = self.admit_inner(db, &request, (host, resources), clock, &closed, target)?;
+            let decision =
+                self.admit_inner(db, &request, (host, resources), clock, &closed, target)?;
             if let Admission::Refused(reason) = decision {
                 store::refusal(db, request.principal, request.vm, action, now, reason)?;
             }
@@ -1845,6 +1875,31 @@ impl Target {
     }
 }
 
+/// A stop can join an owned TEST start or its recovery. The exception is bound
+/// to the principal, the active non-static generation and the exact unreleased
+/// boot epoch, with no other lifecycle activity pending on the VM. Returns the
+/// start's activity and status.
+fn owned_test_epoch(
+    db: &Connection,
+    vm: Id,
+    principal: &str,
+    epoch: Id,
+) -> Result<Option<(i64, i64)>> {
+    Ok(db
+        .query_row(
+            "SELECT o.activity_id,o.status FROM vm_instances v
+             JOIN vm_generations g ON g.vm_id=v.id AND g.active=1 AND g.static_id IS NULL
+             JOIN vm_snapshot_release r ON r.generation=g.id AND r.epoch=?3
+             JOIN vm_operations o ON o.vm=v.id AND o.operation_id=r.epoch AND o.action=3
+             WHERE v.id=?1 AND v.principal=?2 AND o.principal=?2 AND r.disposition IS NULL
+             AND NOT EXISTS(SELECT 1 FROM activity a WHERE a.vm=v.id AND a.status=0
+             AND (a.action<=6 OR a.action IN (12,18)) AND a.id<>o.activity_id)",
+            params![vm, principal, epoch],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
 fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Target, Refusal>> {
     if let Operation::Clone {
         template,
@@ -2191,8 +2246,15 @@ impl<C: Clock> VmController<C> {
                         Some(lease) => lease.check(now),
                     }));
                 }
+                // The same epoch-bound exception as stop admission. Otherwise
+                // the ordinary stop check reports scope and state as usual.
+                ForegroundSubject::TestStop(vm, epoch)
+                    if owned_test_epoch(db, vm, principal, epoch)?.is_some() =>
+                {
+                    return Ok(Ok(()));
+                }
                 ForegroundSubject::Start(_) => Operation::Start,
-                ForegroundSubject::Stop(_) => Operation::Stop,
+                ForegroundSubject::Stop(_) | ForegroundSubject::TestStop(..) => Operation::Stop,
                 ForegroundSubject::Script(_) => Operation::Script {
                     script: "",
                     timeout_seconds: 0,
@@ -2288,6 +2350,10 @@ pub(crate) enum ForegroundSubject {
     Template(Id),
     Start(Id),
     Stop(Id),
+    /// An owned stop of the in-flight TEST run with this boot epoch. It stays
+    /// authorized during boot, recovery and admission closure.
+    #[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+    TestStop(Id, Id),
     Script(Id),
     Extend(Id),
 }
@@ -2298,6 +2364,7 @@ impl ForegroundSubject {
             Self::Template(id)
             | Self::Start(id)
             | Self::Stop(id)
+            | Self::TestStop(id, _)
             | Self::Script(id)
             | Self::Extend(id) => id,
         }

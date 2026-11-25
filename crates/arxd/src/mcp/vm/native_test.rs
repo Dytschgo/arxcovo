@@ -13,7 +13,8 @@ use crate::vm::qualification_record::{
 };
 use crate::vm::runtime::{
     InstallerBudget, InstallerPhase, InstallerRecipe, InstallerStage, NativeEffectBinding,
-    StopDisposition, test_issuer::Intent,
+    StopDisposition,
+    test_issuer::{Intent, reconcile_release, settle_unlaunched},
 };
 use arx_guest::protocol::ScriptStatus;
 use std::collections::HashMap;
@@ -37,6 +38,25 @@ pub(super) struct SelectedTest {
     invalidated: AtomicBool,
     running: Mutex<HashMap<Id, Running>>,
     removed: Mutex<std::collections::HashSet<RemovedSlot>>,
+    /// Clone VMs and build intents whose worker has not returned. A reaper
+    /// claim can interrupt their receipt while helper teardown is still live.
+    jobs: Mutex<std::collections::HashSet<Id>>,
+}
+
+/// Held by a clone or build worker that `register_job` recorded before its
+/// spawn. Releases the registration when the worker returns, even by
+/// unwinding. A worker that never runs leaves cleanup unconfirmed.
+struct LiveJob<'a> {
+    jobs: &'a Mutex<std::collections::HashSet<Id>>,
+    subject: Id,
+}
+
+impl Drop for LiveJob<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.remove(&self.subject);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,6 +98,66 @@ impl Running {
         self.witness = None;
         self.control.stop.cancel();
         self.control.retry.notify_one();
+    }
+}
+
+/// The boot epoch of an owned run a stop may still join: boot pending or in
+/// recovery, with no stop admitted yet. A ready run takes the ordinary stop.
+fn joinable_stop_epoch(running: &HashMap<Id, Running>, vm: Id) -> Option<Id> {
+    running
+        .get(&vm)
+        .filter(|item| item.stop_worker.is_none() && item.witness.is_none())
+        .map(|item| item.epoch)
+}
+
+/// Every native slot role a TEST cleanup may reconcile, including a build's
+/// seed and verification overlay.
+fn reapable_role(role: &str) -> Option<&'static str> {
+    match role {
+        "disk" => Some("disk"),
+        "vars" => Some("vars"),
+        "seed" => Some("seed"),
+        "verification_overlay" => Some("verification_overlay"),
+        _ => None,
+    }
+}
+
+/// Records a freshly created slot object before any payload or helper runs.
+fn record_created<'a>(
+    intent: &'a Intent<'_, ForegroundClock>,
+    workspace: &'a ProductionWorkspace,
+    slot: ArtifactSlot,
+) -> impl FnOnce(FileIdentity) -> Result<(), NativeRefusal> + 'a {
+    move |identity| {
+        intent
+            .controller
+            .native_slot_created(
+                intent.worker,
+                slot,
+                identity,
+                workspace.binding().workspace.file,
+            )
+            .map_err(|_| PATH)
+    }
+}
+
+/// Unchanged bytes from a start that never spawned QEMU are a clean release.
+/// A spawned and terminated child, or any byte change, is dirty.
+fn unlaunched_disposition(
+    spawned: bool,
+    observed: &[ArtifactEvidence; 2],
+    stopped: &[ArtifactEvidence; 2],
+) -> StopDisposition {
+    if !spawned && observed == stopped {
+        StopDisposition::CleanRelease
+    } else {
+        StopDisposition::DirtyRelease
+    }
+}
+
+fn withdraw_witness(running: &mut HashMap<Id, Running>, vm: Id) {
+    if let Some(item) = running.get_mut(&vm) {
+        item.witness = None;
     }
 }
 
@@ -157,7 +237,16 @@ impl SelectedTest {
             invalidated: AtomicBool::new(false),
             running: Mutex::default(),
             removed: Mutex::default(),
+            jobs: Mutex::default(),
         })
+    }
+
+    fn register_job(&self, subject: Id) -> Result<(), Fault> {
+        self.jobs
+            .lock()
+            .map_err(|_| STATE_UNAVAILABLE)?
+            .insert(subject);
+        Ok(())
     }
 
     fn refresh_epoch(&self, controller: &Controller) -> Result<Instant, NativeRefusal> {
@@ -194,6 +283,10 @@ impl SelectedTest {
             state: self,
             controller,
         }
+    }
+
+    pub(super) fn owned_stop_epoch(&self, vm: Id) -> Option<Id> {
+        joinable_stop_epoch(&*self.running.lock().ok()?, vm)
     }
 
     pub(super) fn capability(&self, controller: &Controller) -> Result<Value, NativeRefusal> {
@@ -284,7 +377,13 @@ impl SelectedTest {
                         }
                     };
                 let work = owner_work(worker, operation.id);
+                let job = slots.id;
+                self.register_job(job)?;
                 spawn_owned(gate, supervisor, move |native, supervisor, executor| {
+                    let _job = LiveJob {
+                        jobs: &native.jobs,
+                        subject: job,
+                    };
                     let outcome = executor.block_on(native.build(supervisor, &work, slots, recipe));
                     match outcome {
                         Ok(proof) => {
@@ -371,19 +470,24 @@ impl SelectedTest {
                         .flatten()
                         .and_then(|prior| prior.lease_end)
                 };
-                let (slots, worker, operation) = match controller
+                let (vm, slots, worker, operation) = match controller
                     .admit_linked_clone(request, host, RESOURCES, golden, proof)??
                 {
                     CloneAdmission::Existing(operation) => {
                         return Ok(receipt(operation.id, expires()));
                     }
-                    CloneAdmission::Fresh(_, slots, worker, operation) => {
-                        (slots, worker, operation)
+                    CloneAdmission::Fresh(vm, slots, worker, operation) => {
+                        (vm, slots, worker, operation)
                     }
                 };
                 let lease = expires();
                 let work = owner_work(worker, operation.id);
+                self.register_job(vm)?;
                 spawn_owned(gate, supervisor, move |native, supervisor, executor| {
+                    let _job = LiveJob {
+                        jobs: &native.jobs,
+                        subject: vm,
+                    };
                     let result = executor.block_on(native.clone_pair(
                         supervisor,
                         &work,
@@ -852,6 +956,14 @@ impl SelectedTest {
         row
     }
 
+    /// Withdraw readiness at once when the guest channel is lost, before
+    /// teardown. A poisoned lock withholds every projection anyway.
+    fn invalidate_witness(&self, vm: Id) {
+        if let Ok(mut running) = self.running.lock() {
+            withdraw_witness(&mut running, vm);
+        }
+    }
+
     fn witness(&self, vm: Id, value: Option<Witness>) -> anyhow::Result<()> {
         self.running
             .lock()
@@ -877,6 +989,7 @@ impl SelectedTest {
             .into_iter()
             .find(|id| id.recipe_sha256 == active.recipe);
         let prepare_by = work.worker.deadline() - crate::vm::guest::INSTALLED_BOOT_BUDGET;
+        let stopped = || supervisor.cancel.is_cancelled() || cancel.is_cancelled();
         let prepared = || -> Result<_, NativeRefusal> {
             let recipe = recipe.ok_or(MISSING)?;
             let (pair, evidence) = active.pair;
@@ -884,25 +997,24 @@ impl SelectedTest {
                 .qualification
                 .generation_workspace(pair.disk.generation, false)?;
             // Verify both stopped bytes before the generation can write again.
-            open_pair(&workspace, pair, evidence, prepare_by)?;
+            // Owner stop or shutdown interrupts the bounded hashing.
+            open_pair_until(&workspace, pair, evidence, prepare_by, &stopped)?;
             let (golden, proof) = active.golden.ok_or(PATH)?;
             let golden_ws = self
                 .qualification
                 .generation_workspace(golden.disk.generation, false)?;
-            let (golden_disk, _) = open_pair(&golden_ws, golden, proof, prepare_by)?;
+            let (golden_disk, _) =
+                open_pair_until(&golden_ws, golden, proof, prepare_by, &stopped)?;
             let backing = golden_disk.artifact(ArtifactRole::Golden)?;
             Ok((recipe, workspace, golden_disk, backing))
         };
-        let fail_start = || -> anyhow::Result<()> {
-            controller.finish_native_start(
-                &work.worker,
-                work.operation,
-                Completion::CleanupUnconfirmed,
-            )?;
-            Ok(())
-        };
+        // No QEMU writer exists before launch construction. Construction can
+        // spawn and then terminate a suspended child, which is a distinct,
+        // dirty custody outcome.
+        let fail_start =
+            |spawned| self.release_unlaunched(controller, vm, work, &control, active.pair, spawned);
         let Ok((recipe, workspace, _golden_pin, backing)) = prepared() else {
-            return fail_start();
+            return fail_start(false).await;
         };
         let (pair, evidence) = active.pair;
         let ids = evidence.map(|file| file.identity);
@@ -929,14 +1041,14 @@ impl SelectedTest {
             backing: Some(&backing),
             staged: None,
         }) else {
-            return fail_start();
+            return fail_start(false).await;
         };
         let planner = qualified.planner();
         let Ok(plan) = planner.plan() else {
-            return fail_start();
+            return fail_start(false).await;
         };
-        if Instant::now() >= prepare_by {
-            return fail_start();
+        if Instant::now() >= prepare_by || stopped() {
+            return fail_start(false).await;
         }
         let launch = self.launch(
             &intent,
@@ -950,7 +1062,7 @@ impl SelectedTest {
             &[pair.disk, pair.vars],
         );
         let Ok(mut launch) = launch else {
-            return fail_start();
+            return fail_start(true).await;
         };
         let boot_refresh = || {
             if Instant::now() >= work.worker.deadline() {
@@ -1021,10 +1133,9 @@ impl SelectedTest {
                                         controller.finish_script(&worker.worker, ScriptResult::Unavailable)?;
                                         continue;
                                     };
-                                    match launch.run_script(authority, script, timeout, &cancel, script_refresh, || true).await {
+                                    match launch.run_script(authority, script, timeout, &cancel, script_refresh, || true, || self.invalidate_witness(vm)).await {
                                         Ok(result) => { controller.finish_script(&worker.worker, script_result(result))?; }
                                         Err(failure) => {
-                                            self.witness(vm, None)?;
                                             controller.finish_with_cause(&worker.worker, Completion::CleanupUnconfirmed, Some(FailureReason::ExecutionUnknown))?;
                                             failed_release = Some((failure.disposition, failure.released.map(|held| *held)));
                                             break;
@@ -1034,7 +1145,7 @@ impl SelectedTest {
                                 _ => break,
                             },
                             _ = interval.tick() => {
-                                if let Err(failure) = launch.ping(&cancel, refresh, || true).await {
+                                if let Err(failure) = launch.ping(&cancel, refresh, || true, || self.invalidate_witness(vm)).await {
                                     failed_release = Some((failure.disposition, failure.released.map(|held| *held)));
                                     break;
                                 }
@@ -1070,64 +1181,123 @@ impl SelectedTest {
                         Instant::now() + Duration::from_secs(20),
                     )
                 {
-                    let mut running = self
-                        .running
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("TEST run custody lost"))?;
-                    let instance = running
-                        .get_mut(&vm)
-                        .ok_or_else(|| anyhow::anyhow!("TEST run custody lost"))?;
-                    if instance
-                        .stop_worker
-                        .as_ref()
-                        .is_some_and(|worker| Instant::now() < worker.deadline())
-                        && controller
-                            .native_running_epoch(&work.principal, vm)
-                            .ok()
-                            .flatten()
-                            == Some((pair.disk.generation, work.operation))
-                        && let Some(stop) = &instance.stop_worker
-                    {
-                        controller.finish_offline_stop(
-                            stop,
-                            vm,
-                            work.operation,
-                            Some((pair, files)),
-                            *disposition,
-                        )?;
-                        instance.stop_worker.take();
-                    } else {
-                        controller.native_record_release(
-                            vm,
-                            work.operation,
-                            (pair, files),
-                            *disposition,
-                        )?;
-                    }
+                    self.record_owned_release(controller, vm, work, pair, files, *disposition)?;
                     return Ok(true);
                 }
                 Ok(false)
             },
-            || {
-                controller.native_quarantine(vm, work.operation)?;
-                {
-                    let mut running = self
-                        .running
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("TEST run custody lost"))?;
-                    let instance = running
-                        .get_mut(&vm)
-                        .ok_or_else(|| anyhow::anyhow!("TEST run custody lost"))?;
-                    if let Some(stop) = &instance.stop_worker {
-                        controller.finish_native_stop(stop, vm, work.operation)?;
-                        instance.stop_worker.take();
-                    }
-                }
-                Ok(())
-            },
+            || self.fence_owned(controller, vm, work),
             async || launch.stop_generation(&cancel, || true).await,
         )
         .await
+    }
+
+    /// A start that failed before boot holds no launch, so its custody is the
+    /// stopped pair itself. Re-read it under writer exclusion and record the
+    /// exact epoch's release. Until that succeeds the generation stays fenced
+    /// and charged, and a stop or the reaper can wake a retry.
+    async fn release_unlaunched(
+        &self,
+        controller: &Controller,
+        vm: Id,
+        work: &OwnerWork,
+        control: &RunControl,
+        (pair, evidence): crate::store::vm::snapshot::Pair,
+        spawned: bool,
+    ) -> anyhow::Result<()> {
+        let ids = evidence.map(|file| file.identity);
+        let observe = || {
+            self.qualification
+                .generation_workspace(pair.disk.generation, false)
+                .and_then(|workspace| {
+                    read_pair(
+                        &workspace,
+                        pair,
+                        ids,
+                        Instant::now() + Duration::from_secs(20),
+                    )
+                })
+                .ok()
+        };
+        settle_unlaunched(
+            || {
+                controller.finish_native_start(
+                    &work.worker,
+                    work.operation,
+                    Completion::CleanupUnconfirmed,
+                )?;
+                Ok(())
+            },
+            &control.retry,
+            observe,
+            |files| {
+                let disposition = unlaunched_disposition(spawned, files, &evidence);
+                self.record_owned_release(controller, vm, work, pair, *files, disposition)
+            },
+            || self.fence_owned(controller, vm, work),
+        )
+        .await
+    }
+
+    /// Record a proved release for the exact epoch. An admitted owner stop
+    /// settles with it while its worker is live.
+    fn record_owned_release(
+        &self,
+        controller: &Controller,
+        vm: Id,
+        work: &OwnerWork,
+        pair: PairSlots,
+        files: [ArtifactEvidence; 2],
+        disposition: StopDisposition,
+    ) -> anyhow::Result<()> {
+        let mut running = self
+            .running
+            .lock()
+            .map_err(|_| anyhow::anyhow!("TEST run custody lost"))?;
+        let instance = running
+            .get_mut(&vm)
+            .ok_or_else(|| anyhow::anyhow!("TEST run custody lost"))?;
+        if instance
+            .stop_worker
+            .as_ref()
+            .is_some_and(|worker| Instant::now() < worker.deadline())
+            && controller
+                .native_running_epoch(&work.principal, vm)
+                .ok()
+                .flatten()
+                == Some((pair.disk.generation, work.operation))
+            && let Some(stop) = &instance.stop_worker
+        {
+            controller.finish_offline_stop(
+                stop,
+                vm,
+                work.operation,
+                Some((pair, files)),
+                disposition,
+            )?;
+            instance.stop_worker.take();
+        } else {
+            controller.native_record_release(vm, work.operation, (pair, files), disposition)?;
+        }
+        Ok(())
+    }
+
+    /// Keep the charge, fence the exact epoch in recovery and settle any
+    /// admitted owner stop as unconfirmed. The worker keeps retry custody.
+    fn fence_owned(&self, controller: &Controller, vm: Id, work: &OwnerWork) -> anyhow::Result<()> {
+        controller.native_quarantine(vm, work.operation)?;
+        let mut running = self
+            .running
+            .lock()
+            .map_err(|_| anyhow::anyhow!("TEST run custody lost"))?;
+        let instance = running
+            .get_mut(&vm)
+            .ok_or_else(|| anyhow::anyhow!("TEST run custody lost"))?;
+        if let Some(stop) = &instance.stop_worker {
+            controller.finish_native_stop(stop, vm, work.operation)?;
+            instance.stop_worker.take();
+        }
+        Ok(())
     }
 
     fn sealed_evidence(
@@ -1231,8 +1401,11 @@ impl SelectedTest {
         size: u64,
         golden: Option<(&Artifact, &[u8])>,
     ) -> Result<(FileIdentity, ArtifactEvidence), NativeRefusal> {
-        let (disk, offline) =
-            workspace.fresh_disk(slot, intent.stage(workspace.binding(), slot)?)?;
+        let (disk, offline) = workspace.fresh_disk(
+            slot,
+            intent.stage(workspace.binding(), slot)?,
+            record_created(intent, workspace, slot),
+        )?;
         let disk_arg = disk.artifact(ArtifactRole::Staging)?;
         let id = disk.identity();
         let helper = self.qualification.helper_image()?;
@@ -1318,6 +1491,7 @@ impl SelectedTest {
             slots.vars,
             &golden_vars.vars()?,
             intent.stage(workspace.binding(), slots.vars)?,
+            record_created(&intent, &workspace, slots.vars),
         )?;
         let vars = vars.evidence(16 << 20, work.worker.deadline())?;
         Ok([disk, vars])
@@ -1413,7 +1587,15 @@ impl SelectedTest {
         {
             let authority = intent.authorize(workspace.binding(), &[pair.disk, pair.vars])?;
             match launch
-                .run_script(authority, script, 30, intent.cancel, refresh, || true)
+                .run_script(
+                    authority,
+                    script,
+                    30,
+                    intent.cancel,
+                    refresh,
+                    || true,
+                    || {},
+                )
                 .await
             {
                 Ok((ScriptStatus::Exited, Some(0))) => {}
@@ -1513,6 +1695,10 @@ impl SelectedTest {
         controller
             .build_evidence(&work.worker, slots.id, &[(slots.seed, Some(seed))])
             .map_err(|_| FailureReason::StagingFailed)?;
+        // The installer still writes VARS. Record only its object identity.
+        controller
+            .native_slot_created(&work.worker, primary.vars, vars.identity, vars.directory)
+            .map_err(|_| FailureReason::StagingFailed)?;
         let (disk, _) = self
             .create_disk(&intent, &workspace, primary.disk, size, None)
             .await
@@ -1599,6 +1785,7 @@ impl SelectedTest {
                 verification
                     .stage(verification_ws.binding(), verify.vars)
                     .map_err(|_| FailureReason::CloneFailed)?,
+                record_created(&verification, &verification_ws, verify.vars),
             )
             .map_err(|_| FailureReason::CloneFailed)?;
         let ids = [disk, vars.identity()];
@@ -1657,31 +1844,6 @@ mod tests;
 
 fn native_identity(artifact: &Artifact) -> Result<FileIdentity, NativeRefusal> {
     crate::vm::runtime::test_issuer::artifact_identity(artifact).ok_or(PATH)
-}
-
-/// A bounded attempt can finish without proof. Keep the owned launch in the
-/// caller until evidence is recorded, and let a stop or reaper wake a retry.
-async fn reconcile_release<T>(
-    mut settlement: T,
-    wake: &tokio::sync::Notify,
-    mut record: impl FnMut(&T) -> anyhow::Result<bool>,
-    mut quarantine: impl FnMut() -> anyhow::Result<()>,
-    mut retry: impl AsyncFnMut() -> T,
-) -> anyhow::Result<()> {
-    let mut delay = Duration::from_secs(2);
-    loop {
-        if record(&settlement)? {
-            return Ok(());
-        }
-        drop(settlement);
-        quarantine()?;
-        tokio::select! {
-            _ = wake.notified() => {}
-            _ = tokio::time::sleep(delay) => {}
-        }
-        delay = (delay * 2).min(Duration::from_secs(60));
-        settlement = retry().await;
-    }
 }
 
 fn spawn_owned(
@@ -1755,11 +1917,21 @@ fn open_pair(
     evidence: [ArtifactEvidence; 2],
     deadline: Instant,
 ) -> Result<(HeldSlot, HeldSlot), NativeRefusal> {
+    open_pair_until(workspace, pair, evidence, deadline, &|| false)
+}
+
+fn open_pair_until(
+    workspace: &ProductionWorkspace,
+    pair: PairSlots,
+    evidence: [ArtifactEvidence; 2],
+    deadline: Instant,
+    stop: &dyn Fn() -> bool,
+) -> Result<(HeldSlot, HeldSlot), NativeRefusal> {
     let [disk, vars] = evidence;
     let mut disk_slot = workspace.open_slot(pair.disk, disk.identity, false)?;
     let mut vars_slot = workspace.open_slot(pair.vars, vars.identity, false)?;
-    if disk_slot.evidence(41 * GIB, deadline)? != disk
-        || vars_slot.evidence(16 << 20, deadline)? != vars
+    if disk_slot.evidence_until(41 * GIB, deadline, stop)? != disk
+        || vars_slot.evidence_until(16 << 20, deadline, stop)? != vars
     {
         return Err(PATH);
     }
@@ -1819,6 +1991,14 @@ impl runtime::ReaperRuntime for NativeReaper<'_> {
             return unknown;
         }
         drop(running);
+        if self
+            .state
+            .jobs
+            .lock()
+            .map_or(true, |jobs| jobs.contains(&work.kind.subject()))
+        {
+            return unknown;
+        }
         if Instant::now() >= deadline || !self.controller.native_cleanup_safe(work).unwrap_or(false)
         {
             return unknown;
@@ -1845,13 +2025,31 @@ impl reaper::ArtifactCustody for NativeReaper<'_> {
                 if Instant::now() >= deadline {
                     return Err(PATH);
                 }
-                let role = match asset.role.as_str() {
-                    "disk" => "disk",
-                    "vars" => "vars",
-                    _ => return Err(PATH),
+                let role = reapable_role(&asset.role).ok_or(PATH)?;
+                let slot = ArtifactSlot {
+                    generation: asset.generation,
+                    role,
+                    key: asset.key,
                 };
-                let identity = asset.identity.ok_or(PATH)?;
-                let directory = asset.directory.ok_or(PATH)?;
+                let (Some(identity), Some(directory)) = (asset.identity, asset.directory) else {
+                    // Never identified: dispose only on proof that no object
+                    // exists. A retained slot always has recorded custody.
+                    if asset.retain || asset.identity.is_some() || asset.directory.is_some() {
+                        return Err(PATH);
+                    }
+                    match self
+                        .state
+                        .qualification
+                        .generation_workspace(slot.generation, false)
+                    {
+                        Ok(ws) => ws.slot_absent(slot)?,
+                        Err(_) => self
+                            .state
+                            .qualification
+                            .generation_absent(slot.generation)?,
+                    }
+                    continue;
+                };
                 let receipt = RemovedSlot {
                     generation: asset.generation,
                     key: asset.key,
@@ -1862,11 +2060,6 @@ impl reaper::ArtifactCustody for NativeReaper<'_> {
                 if !asset.retain && removed.contains(&receipt) {
                     continue;
                 }
-                let slot = ArtifactSlot {
-                    generation: asset.generation,
-                    role,
-                    key: asset.key,
-                };
                 use std::collections::hash_map::Entry;
                 let ws = match workspaces.entry(slot.generation) {
                     Entry::Occupied(entry) => entry.into_mut(),

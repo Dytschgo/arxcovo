@@ -1344,3 +1344,50 @@ async fn released_proof_binds_generation_and_keeps_the_writer_exclusion() {
         );
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn lost_channel_withdraws_readiness_before_a_stalled_teardown() {
+    use std::cell::Cell;
+    let ready = Cell::new(true);
+    let start = tokio::time::Instant::now();
+    let result = lose_then_settle(
+        Err::<(), _>(NativeRefusal::GuestEndpointUnverified),
+        || ready.set(false),
+        async |reason| {
+            // A projection taken during the bounded QMP stop and writer
+            // release must already see the channel as lost.
+            assert!(!ready.get());
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            assert!(!ready.get());
+            reason
+        },
+    )
+    .await;
+    assert_eq!(result, Err(NativeRefusal::GuestEndpointUnverified));
+    assert_eq!(start.elapsed(), Duration::from_secs(30));
+    ready.set(true);
+    let healthy = lose_then_settle(Ok(7), || ready.set(false), async |reason| reason).await;
+    assert_eq!(healthy, Ok::<_, NativeRefusal>(7));
+    assert!(ready.get());
+}
+
+#[test]
+fn bounded_hashing_yields_to_cancellation_between_chunks() {
+    use std::cell::Cell;
+    let bytes = vec![7u8; (256 << 10) * 3];
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let chunks = Cell::new(0);
+    let stop = || {
+        chunks.set(chunks.get() + 1);
+        chunks.get() > 1
+    };
+    let mut reader = std::io::Cursor::new(&bytes);
+    assert_eq!(
+        launch::digest_bounded(&mut reader, bytes.len() as u64, deadline, &stop),
+        Err(NativeRefusal::PathCustodyUnverified)
+    );
+    assert_eq!(chunks.get(), 2);
+    assert_eq!(reader.position(), 256 << 10);
+    let mut reader = std::io::Cursor::new(&bytes);
+    assert!(launch::digest_bounded(&mut reader, bytes.len() as u64, deadline, &|| false).is_ok());
+}

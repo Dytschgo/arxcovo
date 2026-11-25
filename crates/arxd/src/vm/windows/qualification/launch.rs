@@ -384,7 +384,17 @@ pub(super) fn hash_at_rest(
     limit: u64,
     deadline: Instant,
 ) -> Result<ArtifactPin, NativeRefusal> {
-    use sha2::{Digest, Sha256};
+    hash_at_rest_until(pin, limit, deadline, &|| false)
+}
+
+/// Bounded hashing that also stops at the first chunk boundary after `stop`
+/// reports cancellation.
+pub(super) fn hash_at_rest_until(
+    pin: &mut PathPin,
+    limit: u64,
+    deadline: Instant,
+    stop: &dyn Fn() -> bool,
+) -> Result<ArtifactPin, NativeRefusal> {
     use std::io::{Seek, SeekFrom};
     let reason = NativeRefusal::PathCustodyUnverified;
     inventory::binding(pin)?;
@@ -394,11 +404,28 @@ pub(super) fn hash_at_rest(
     }
     let mut reader = &pin.leaf;
     reader.seek(SeekFrom::Start(0)).map_err(|_| reason)?;
+    let sha256 = digest_bounded(&mut reader, size, deadline, stop)?;
+    inventory::binding(pin)?;
+    let expected = ArtifactPin { size, sha256 };
+    pin.verified_content = Some(expected);
+    Ok(expected)
+}
+
+/// Exactly `size` bytes followed by end of file, checked against the deadline
+/// and cancellation before every chunk.
+pub(super) fn digest_bounded(
+    reader: &mut impl Read,
+    size: u64,
+    deadline: Instant,
+    stop: &dyn Fn() -> bool,
+) -> Result<[u8; 32], NativeRefusal> {
+    use sha2::{Digest, Sha256};
+    let reason = NativeRefusal::PathCustodyUnverified;
     let mut digest = Sha256::new();
     let mut work = vec![0; 256 << 10];
     let mut remaining = size;
     while remaining != 0 {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || stop() {
             return Err(reason);
         }
         let len = remaining.min(work.len() as u64) as usize;
@@ -410,13 +437,7 @@ pub(super) fn hash_at_rest(
     if reader.read(&mut overflow).map_err(|_| reason)? != 0 {
         return Err(reason);
     }
-    inventory::binding(pin)?;
-    let expected = ArtifactPin {
-        size,
-        sha256: digest.finalize().into(),
-    };
-    pin.verified_content = Some(expected);
-    Ok(expected)
+    Ok(digest.finalize().into())
 }
 
 pub(super) fn header(pin: &PathPin) -> Result<Vec<u8>, NativeRefusal> {

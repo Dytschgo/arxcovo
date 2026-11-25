@@ -292,3 +292,238 @@ fn native_expiry_requires_release_for_the_exact_active_generation() {
         1
     );
 }
+
+#[test]
+fn foreground_test_stop_precheck_admits_boot_and_recovery_for_the_exact_epoch() {
+    use crate::vm::controller::{ForegroundSubject, Precheck};
+    let f = Fixture::new();
+    let (vm, _) = f.clone(f.build(61, true), 62, true);
+    let start = f.worker(vm, 63, Operation::Start);
+    let epoch = f
+        .ctl
+        .foreground_operation_ref(OWNER, start.activity_id())
+        .unwrap();
+    let check = |owner: &str, subject| f.ctl.foreground_precheck(owner, subject).unwrap();
+    let assert_states = || {
+        assert_eq!(
+            check(OWNER, ForegroundSubject::Stop(vm)),
+            Err(Precheck::Refused(Refusal::Busy))
+        );
+        assert_eq!(check(OWNER, ForegroundSubject::TestStop(vm, epoch)), Ok(()));
+        assert_eq!(
+            check(OWNER, ForegroundSubject::TestStop(vm, [0; 16])),
+            Err(Precheck::Refused(Refusal::Busy))
+        );
+        assert_eq!(
+            check("bob", ForegroundSubject::TestStop(vm, epoch)),
+            Err(Precheck::Refused(Refusal::NotFound))
+        );
+    };
+    // The boot is still pending.
+    assert_states();
+    // A lost channel fenced the generation in recovery.
+    f.ctl.finish(&start, Completion::Succeeded).unwrap();
+    f.ctl.native_quarantine(vm, epoch).unwrap();
+    assert_states();
+    // Both prechecks agree with the epoch-bound stop admission.
+    assert!(matches!(
+        native_admit(&f, vm, 64, OWNER, Operation::Stop, Some(epoch)),
+        Admission::Admitted(_)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unlaunched_start_releases_its_pair_or_stays_fenced_until_a_retry() {
+    use runtime::test_issuer::settle_unlaunched;
+    use std::cell::Cell;
+    let f = Fixture::new();
+    let (vm, _) = f.clone(f.build(71, true), 72, true);
+    let (pair, evidence) = f.ctl.native_start_pair(OWNER, vm).unwrap().unwrap().pair;
+    let admit_start = |number| {
+        let Admission::Admitted(start) =
+            native_admit(&f, vm, number, OWNER, Operation::Start, None)
+        else {
+            panic!("start refused")
+        };
+        let epoch = f
+            .ctl
+            .foreground_operation_ref(OWNER, start.activity_id())
+            .unwrap();
+        (start, epoch)
+    };
+
+    // The first observation is refused: the epoch is fenced and charged, and
+    // the woken retry records the stopped pair for recovery.
+    let (start, epoch) = admit_start(73);
+    let wake = tokio::sync::Notify::new();
+    let attempts = Cell::new(0);
+    settle_unlaunched(
+        || {
+            f.ctl
+                .finish_native_start(&start, epoch, Completion::CleanupUnconfirmed)?;
+            Ok(())
+        },
+        &wake,
+        || {
+            attempts.set(attempts.get() + 1);
+            (attempts.get() > 1).then_some(evidence)
+        },
+        |files| {
+            assert_eq!(
+                f.count("SELECT count(*) FROM vm_instances WHERE state=3"),
+                1
+            );
+            f.ctl.native_record_release(
+                vm,
+                epoch,
+                (pair, *files),
+                runtime::StopDisposition::CleanRelease,
+            )
+        },
+        || {
+            f.ctl.native_quarantine(vm, epoch)?;
+            wake.notify_one();
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(
+        f.count("SELECT count(*) FROM vm_disk_claims WHERE persistent>0"),
+        1
+    );
+    let claim = f.ctl.recovery_intents().unwrap().pop().unwrap();
+    let cleanup = f
+        .ctl
+        .reaper_test_store()
+        .transact(|db| store::cleanup_work(db, claim.into()))
+        .unwrap()
+        .unwrap();
+    assert!(f.ctl.native_cleanup_safe(&cleanup).unwrap());
+
+    // Without a recorded release the recovery that the unconfirmed start
+    // opened is stranded. A proof on the first observation unblocks it.
+    let f = Fixture::new();
+    let (vm, _) = f.clone(f.build(74, true), 75, true);
+    let (pair, evidence) = f.ctl.native_start_pair(OWNER, vm).unwrap().unwrap().pair;
+    let Admission::Admitted(start) = native_admit(&f, vm, 76, OWNER, Operation::Start, None) else {
+        panic!("start refused")
+    };
+    let epoch = f
+        .ctl
+        .foreground_operation_ref(OWNER, start.activity_id())
+        .unwrap();
+    settle_unlaunched(
+        || {
+            f.ctl
+                .finish_native_start(&start, epoch, Completion::CleanupUnconfirmed)?;
+            Ok(())
+        },
+        &tokio::sync::Notify::new(),
+        || {
+            let claim = f.ctl.recovery_intents().unwrap().pop().unwrap();
+            let cleanup = f
+                .ctl
+                .reaper_test_store()
+                .transact(|db| store::cleanup_work(db, claim.into()))
+                .unwrap()
+                .unwrap();
+            assert!(!f.ctl.native_cleanup_safe(&cleanup).unwrap());
+            Some(evidence)
+        },
+        |files| {
+            f.ctl.native_record_release(
+                vm,
+                epoch,
+                (pair, *files),
+                runtime::StopDisposition::CleanRelease,
+            )
+        },
+        || panic!("a proved release must not fence"),
+    )
+    .await
+    .unwrap();
+    let claim = f.ctl.recovery_intents().unwrap().pop().unwrap();
+    let cleanup = f
+        .ctl
+        .reaper_test_store()
+        .transact(|db| store::cleanup_work(db, claim.into()))
+        .unwrap()
+        .unwrap();
+    assert!(f.ctl.native_cleanup_safe(&cleanup).unwrap());
+}
+
+#[test]
+fn failed_clone_staging_and_build_reach_native_disposal_after_their_workers() {
+    let f = Fixture::new();
+    let golden = f.build(81, true);
+    let (vm, slots, worker) = f.reserve_clone(golden, 82);
+    f.clock.set(NOW + 61_000, 1);
+    f.sweep(&Runtime::new(|_| Quiesced::Unconfirmed));
+    let staging = || {
+        let store = f.ctl.reaper_test_store();
+        let activity_id = store
+            .transact(|db| {
+                Ok(db.query_row(
+                    "SELECT cleanup_id FROM vm_instances WHERE id=?1 AND cleanup_route='staging'",
+                    [vm],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        store
+            .transact(|db| store::cleanup_work(db, CleanupKind::Staging { vm, activity_id }))
+            .unwrap()
+            .unwrap()
+    };
+    // The claim interrupted the clone receipt. The native reaper's in-memory
+    // job registry keeps it unconfirmed until the worker returns.
+    f.clock.set(NOW, 0);
+    f.ctl.finish_linked_clone(&worker, slots, None).unwrap();
+    let work = staging();
+    assert!(work.accounted);
+    assert!(f.ctl.native_cleanup_safe(&work).unwrap());
+
+    // That staging row correctly keeps fresh admission closed, so the failed
+    // build runs on its own ledger.
+    let f = Fixture::new();
+    let spec = BuildRequest {
+        principal: OWNER,
+        key: key(NOW, 83),
+        recipe: "e03a3012c18d20b8691490b580ab41e9",
+        digest: [83; 32],
+        retained: disk(),
+        transient: disk(),
+    };
+    let BuildAdmission::Fresh(build, worker, _) = f
+        .ctl
+        .admit_build(spec, host(), resources(), |_, _| unreachable!())
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("fresh build required");
+    };
+    let cleanup = || {
+        f.ctl
+            .reaper_test_store()
+            .transact(|db| store::cleanup_work(db, CleanupKind::Build(build.id)))
+            .unwrap()
+    };
+    if let Some(pending) = cleanup() {
+        assert!(!f.ctl.native_cleanup_safe(&pending).unwrap());
+    }
+    f.ctl
+        .fail_build_with(&worker, *build, false, Some(FailureReason::InstallFailed))
+        .unwrap();
+    let work = cleanup().unwrap();
+    assert!(work.accounted);
+    assert_eq!(
+        work.artifacts
+            .iter()
+            .map(|asset| asset.role.as_str())
+            .collect::<Vec<_>>(),
+        ["disk", "seed", "vars", "vars", "verification_overlay"]
+    );
+    assert!(f.ctl.native_cleanup_safe(&work).unwrap());
+}

@@ -65,17 +65,21 @@ impl ProductionWorkspace {
         })
     }
 
+    /// `created` records the new object's identity before any payload is
+    /// written, so a failed write still leaves reapable custody.
     pub(crate) fn create_slot(
         &self,
         slot: ArtifactSlot,
         bytes: &[u8],
-        authority: crate::vm::runtime::LaunchAuthority,
+        authority: crate::vm::runtime::test_issuer::SlotAuthority,
+        created: impl FnOnce(FileIdentity) -> Result<(), NativeRefusal>,
     ) -> Result<HeldSlot, NativeRefusal> {
         let reason = NativeRefusal::PathCustodyUnverified;
         if bytes.len() > MAX_SETUP_VARS_BYTES as usize {
             return Err(reason);
         }
         let mut writer = self.create_writer(slot, authority)?;
+        created(writer.held().identity())?;
         writer.write(0, bytes)?;
         writer.flush()
     }
@@ -83,10 +87,11 @@ impl ProductionWorkspace {
     pub(crate) fn create_writer(
         &self,
         slot: ArtifactSlot,
-        _authority: crate::vm::runtime::LaunchAuthority,
+        authority: crate::vm::runtime::test_issuer::SlotAuthority,
     ) -> Result<SlotWriter, NativeRefusal> {
         let reason = NativeRefusal::PathCustodyUnverified;
         self.valid_slot(slot)?;
+        let _authority = authority.consume(self.binding, &[slot])?;
         WorkspaceCustody::production(&self.root, &self.lease)?;
         let path = slot_path(&self.root.path, slot)?;
         let leaf = path.as_str().rsplit('\\').next().ok_or(reason)?;
@@ -100,12 +105,13 @@ impl ProductionWorkspace {
     pub(crate) fn fresh_disk(
         &self,
         slot: ArtifactSlot,
-        authority: crate::vm::runtime::LaunchAuthority,
+        authority: crate::vm::runtime::test_issuer::SlotAuthority,
+        created: impl FnOnce(FileIdentity) -> Result<(), NativeRefusal>,
     ) -> Result<(HeldSlot, crate::vm::runtime::OfflineLease), NativeRefusal> {
         if !matches!(slot.role, "disk" | "verification_overlay") {
             return Err(NativeRefusal::PathCustodyUnverified);
         }
-        let pin = self.create_slot(slot, &[], authority)?;
+        let pin = self.create_slot(slot, &[], authority, created)?;
         let lease = crate::vm::runtime::OfflineLease::new(self.binding, vec![pin.identity()]);
         Ok((pin, lease))
     }
@@ -131,6 +137,19 @@ impl ProductionWorkspace {
         }
         crate::vm::publish::windows::delete_on_close(&file).map_err(|_| reason)?;
         drop(file);
+        match open_relative(&self.root.leaf, leaf, Node::File, false, false) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(reason),
+        }
+    }
+
+    /// Proof that a slot whose identity was never recorded has no object.
+    pub(crate) fn slot_absent(&self, slot: ArtifactSlot) -> Result<(), NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        self.valid_slot(slot)?;
+        WorkspaceCustody::production(&self.root, &self.lease)?;
+        let path = slot_path(&self.root.path, slot)?;
+        let leaf = path.as_str().rsplit('\\').next().ok_or(reason)?;
         match open_relative(&self.root.leaf, leaf, Node::File, false, false) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             _ => Err(reason),
@@ -235,7 +254,17 @@ impl HeldSlot {
         limit: u64,
         deadline: Instant,
     ) -> Result<crate::vm::ArtifactEvidence, NativeRefusal> {
-        let pin = launch::hash_at_rest(&mut self.pin, limit, deadline)?;
+        self.evidence_until(limit, deadline, &|| false)
+    }
+
+    /// Evidence that also yields to cancellation between hashed chunks.
+    pub(crate) fn evidence_until(
+        &mut self,
+        limit: u64,
+        deadline: Instant,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<crate::vm::ArtifactEvidence, NativeRefusal> {
+        let pin = launch::hash_at_rest_until(&mut self.pin, limit, deadline, stop)?;
         Ok(crate::vm::ArtifactEvidence {
             identity: self.pin.identity,
             directory: self.directory,
@@ -261,6 +290,25 @@ impl ForegroundQualification {
             lease_name,
             generation,
         )
+    }
+
+    /// Proof that a generation directory was never created.
+    pub(crate) fn generation_absent(&self, generation: Id) -> Result<(), NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        if generation == [0; 16] {
+            return Err(reason);
+        }
+        let production = self.production_root();
+        match open_relative(
+            &production.leaf,
+            &hex::encode(generation),
+            Node::Directory,
+            false,
+            false,
+        ) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(reason),
+        }
     }
 
     pub(crate) fn generation_workspace(
@@ -722,26 +770,43 @@ impl<'a> NativeLaunch<'a> {
         cancel: &Shutdown,
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
         verify_release: impl FnOnce() -> bool + Send + 'static,
+        lost: impl FnOnce(),
     ) -> Result<(), LaunchFailure<'a>> {
-        self.guest_exchange(GuestRequest::Ping, cancel, refresh, verify_release)
+        self.guest_exchange(GuestRequest::Ping, cancel, refresh, verify_release, lost)
             .await
             .map(|_| ())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_script(
         &mut self,
-        _authority: crate::vm::runtime::LaunchAuthority,
+        authority: crate::vm::runtime::test_issuer::SlotAuthority,
         script: String,
         timeout_s: u32,
         cancel: &Shutdown,
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
         verify_release: impl FnOnce() -> bool + Send + 'static,
+        lost: impl FnOnce(),
     ) -> Result<(ScriptStatus, Option<u32>), LaunchFailure<'a>> {
+        // The script permit must name this launch's workspace and pair.
+        let bound = match &self.targets {
+            ReleaseTargets::Pair { pair, .. } => authority
+                .consume(self.binding, &[pair.disk, pair.vars])
+                .is_ok(),
+            ReleaseTargets::Helper { .. } => false,
+        };
+        if !bound {
+            lost();
+            return Err(self
+                .settle_failure(NativeRefusal::QualificationMissing, cancel, verify_release)
+                .await);
+        }
         self.guest_exchange(
             GuestRequest::Script(script, timeout_s),
             cancel,
             refresh,
             verify_release,
+            lost,
         )
         .await
         .map(|result| result.expect("script request returns a script result"))
@@ -753,6 +818,7 @@ impl<'a> NativeLaunch<'a> {
         cancel: &Shutdown,
         mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
         verify_release: impl FnOnce() -> bool + Send + 'static,
+        lost: impl FnOnce(),
     ) -> Result<Option<(ScriptStatus, Option<u32>)>, LaunchFailure<'a>> {
         let unavailable = NativeRefusal::GuestEndpointUnverified;
         let seconds = match &request {
@@ -786,10 +852,10 @@ impl<'a> NativeLaunch<'a> {
             }
             _ => Err(unavailable),
         };
-        match outcome {
-            Ok(result) => Ok(result),
-            Err(reason) => Err(self.settle_failure(reason, cancel, verify_release).await),
-        }
+        lose_then_settle(outcome, lost, async |reason| {
+            self.settle_failure(reason, cancel, verify_release).await
+        })
+        .await
     }
 
     async fn settle_failure(
@@ -1059,6 +1125,22 @@ pub(crate) struct ReleasedGeneration<'a> {
     targets: ReleaseTargets,
     _workspace: WorkspaceCustody<'a>,
     _held: HeldWriters,
+}
+
+/// A lost guest channel invalidates every readiness projection before the
+/// bounded teardown waits begin.
+async fn lose_then_settle<T, F>(
+    outcome: Result<T, NativeRefusal>,
+    lost: impl FnOnce(),
+    settle: impl AsyncFnOnce(NativeRefusal) -> F,
+) -> Result<T, F> {
+    match outcome {
+        Ok(value) => Ok(value),
+        Err(reason) => {
+            lost();
+            Err(settle(reason).await)
+        }
+    }
 }
 
 #[derive(Clone)]

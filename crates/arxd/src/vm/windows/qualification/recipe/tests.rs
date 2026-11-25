@@ -214,19 +214,35 @@ fn stage_requires_exact_reservation_and_preserves_the_staged_identity() {
     };
     assert_eq!(check_stage_slots(binding, pair, wrong), Err(PATH));
     let path = slot_path(&ws.root.path, slot).unwrap();
+    let bound = |slots: &[ArtifactSlot]| SlotAuthority::for_test(ws.binding(), slots);
     assert!(
-        stage_input::<()>(&ws, wrong, b"seed", 10, false, |_| panic!(
+        stage_input(&ws, wrong, b"seed", 10, false, |_| panic!(
             "wrong generation"
         ))
         .is_err()
     );
-    assert!(stage_input::<()>(&ws, slot, b"seed", 3, false, |_| panic!("over limit")).is_err());
-    assert!(stage_input::<()>(&ws, slot, b"seed", 10, false, |_| Err(PHASE)).is_err());
+    assert!(stage_input(&ws, slot, b"seed", 3, false, |_| panic!("over limit")).is_err());
+    assert!(stage_input(&ws, slot, b"seed", 10, false, |_| Err(PHASE)).is_err());
+    // A permit for another slot, or for a different workspace, fails at the
+    // effect edge before the object is created.
+    assert!(stage_input(&ws, slot, b"seed", 10, false, |_| Ok(bound(&[pair.vars]))).is_err());
+    assert!(
+        stage_input(&ws, slot, b"seed", 10, false, |_| Ok(
+            SlotAuthority::for_test(
+                WorkspaceBinding {
+                    generation: [2; 16],
+                    ..ws.binding()
+                },
+                &[slot]
+            )
+        ))
+        .is_err()
+    );
     assert!(!std::path::Path::new(path.as_str()).exists());
     let staged = stage_input(&ws, slot, b"seed", 10, false, |pin| {
         assert_eq!(pin.sha256, digest(b"seed"));
         assert!(!std::path::Path::new(path.as_str()).exists());
-        Ok(())
+        Ok(bound(&[slot]))
     })
     .unwrap();
     assert_eq!(std::fs::read(path.as_str()).unwrap(), b"seed");
@@ -236,7 +252,7 @@ fn stage_requires_exact_reservation_and_preserves_the_staged_identity() {
             .open(path.as_str())
             .is_err()
     );
-    assert!(stage_input(&ws, slot, b"new", 10, false, |_| Ok(())).is_err());
+    assert!(stage_input(&ws, slot, b"new", 10, false, |_| Ok(bound(&[slot]))).is_err());
     assert_eq!(
         ws.pin_slot(slot, staged.identity, false).unwrap().identity,
         staged.identity

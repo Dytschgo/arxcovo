@@ -1639,7 +1639,7 @@ impl VmInventory {
             Work::Build => None,
             Work::Create(_) => Some(ForegroundSubject::Template(request.id)),
             Work::Start => Some(ForegroundSubject::Start(request.id)),
-            Work::Stop => Some(ForegroundSubject::Stop(request.id)),
+            Work::Stop => Some(stop_subject(&self.supervisor, request.id)),
             Work::Script(..) => Some(ForegroundSubject::Script(request.id)),
             Work::Extend(_) => Some(ForegroundSubject::Extend(request.id)),
             Work::Publish | Work::Unpublish => return self.publication(gate, action, request),
@@ -1712,7 +1712,24 @@ impl VmInventory {
             Fault(native_reason(self.supervisor.native_refusal)),
         )
     }
+}
 
+/// An owned stop of an in-flight TEST boot or recovery is prechecked against
+/// its exact epoch, so it reaches the native cancellation and retry path.
+fn stop_subject(supervisor: &Supervisor, vm: Id) -> ForegroundSubject {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if let Some(epoch) = supervisor
+        .native_test
+        .as_ref()
+        .and_then(|native| native.owned_stop_epoch(vm))
+    {
+        return ForegroundSubject::TestStop(vm, epoch);
+    }
+    let _ = supervisor;
+    ForegroundSubject::Stop(vm)
+}
+
+impl VmInventory {
     /// Owner revocation for an authenticated `unpublish_site`, with no lock
     /// beyond the activation registry's. Any such call from the principal
     /// that started an active or registered publication of the named VM

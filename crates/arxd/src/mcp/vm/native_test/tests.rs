@@ -159,3 +159,110 @@ fn witness_requires_the_current_generation_and_start_operation() {
         .matches(Some(([4; 16], [5; 16])))
     );
 }
+
+#[test]
+fn only_an_unready_run_without_a_stop_takes_the_epoch_bound_stop() {
+    let run = |ready: bool, stopping: bool| Running {
+        control: RunControl::default(),
+        stop_worker: stopping.then(|| PendingOperation {
+            activity_id: 7,
+            deadline: Instant::now(),
+            binding: Arc::new(()),
+        }),
+        queue: mpsc::channel(1).0,
+        epoch: [2; 16],
+        witness: ready.then_some(Witness {
+            generation: [1; 16],
+            operation: [2; 16],
+            id: [3; 16],
+        }),
+    };
+    for (ready, stopping, joinable) in [
+        (false, false, true),
+        (true, false, false),
+        (false, true, false),
+    ] {
+        let running = HashMap::from([([5; 16], run(ready, stopping))]);
+        assert_eq!(
+            joinable_stop_epoch(&running, [5; 16]),
+            joinable.then_some([2; 16])
+        );
+        assert_eq!(joinable_stop_epoch(&running, [6; 16]), None);
+    }
+}
+
+#[test]
+fn guest_loss_withdraws_only_its_own_witness() {
+    let ready = || Running {
+        control: RunControl::default(),
+        stop_worker: None,
+        queue: mpsc::channel(1).0,
+        epoch: [2; 16],
+        witness: Some(Witness {
+            generation: [1; 16],
+            operation: [2; 16],
+            id: [3; 16],
+        }),
+    };
+    let mut running = HashMap::from([([5; 16], ready()), ([6; 16], ready())]);
+    withdraw_witness(&mut running, [5; 16]);
+    assert!(running[&[5; 16]].witness.is_none());
+    assert!(running[&[6; 16]].witness.is_some());
+    // The epoch-bound stop can then join the run in recovery.
+    assert_eq!(joinable_stop_epoch(&running, [5; 16]), Some([2; 16]));
+    withdraw_witness(&mut running, [7; 16]);
+}
+
+#[test]
+fn unlaunched_release_is_clean_only_without_a_spawn_or_byte_change() {
+    use crate::vm::paths::ArtifactPin;
+    let file = |byte| ArtifactEvidence {
+        identity: FileIdentity {
+            volume: 1,
+            file: [byte; 16],
+        },
+        directory: [9; 16],
+        pin: ArtifactPin {
+            size: 1,
+            sha256: [byte; 32],
+        },
+    };
+    let stopped = [file(1), file(2)];
+    assert_eq!(
+        unlaunched_disposition(false, &stopped, &stopped),
+        StopDisposition::CleanRelease
+    );
+    assert_eq!(
+        unlaunched_disposition(true, &stopped, &stopped),
+        StopDisposition::DirtyRelease
+    );
+    assert_eq!(
+        unlaunched_disposition(false, &[file(1), file(3)], &stopped),
+        StopDisposition::DirtyRelease
+    );
+}
+
+#[test]
+fn reaper_accepts_build_seed_and_verification_roles_only() {
+    for role in ["disk", "vars", "seed", "verification_overlay"] {
+        assert_eq!(reapable_role(role), Some(role));
+    }
+    for role in ["static_disk", "static_vars", "golden", ""] {
+        assert_eq!(reapable_role(role), None);
+    }
+}
+
+#[test]
+fn a_live_clone_or_build_job_is_registered_until_its_worker_returns() {
+    let jobs = Mutex::new(std::collections::HashSet::from([[4; 16]]));
+    let job = LiveJob {
+        jobs: &jobs,
+        subject: [4; 16],
+    };
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _job = job;
+        panic!("worker failed");
+    }));
+    assert!(unwound.is_err());
+    assert!(jobs.lock().unwrap().is_empty());
+}

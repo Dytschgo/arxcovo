@@ -6,7 +6,7 @@ use super::*;
 use crate::vm::paths::Artifact;
 use crate::vm::qemu_args::{BootPurpose, BootRecipe};
 use crate::vm::qualification_record::{Hash, RecipeIdentity, TestRecipes, digest};
-use crate::vm::runtime::{InstallerPhase, LaunchAuthority};
+use crate::vm::runtime::{InstallerPhase, test_issuer::SlotAuthority};
 use crate::vm::{ArtifactEvidence, ArtifactSlot, PairSlots};
 use std::io::Write;
 
@@ -229,7 +229,7 @@ impl ForegroundQualification {
     pub(crate) fn stage_installer<'a>(
         &self,
         reservation: InstallerReservation<'a>,
-        mut authorize: impl FnMut(StageTarget) -> Result<LaunchAuthority, NativeRefusal>,
+        mut authorize: impl FnMut(StageTarget) -> Result<SlotAuthority, NativeRefusal>,
     ) -> Result<StagedInstaller<'a>, NativeRefusal> {
         let InstallerReservation {
             workspace,
@@ -548,13 +548,13 @@ fn check_deadline(deadline: Instant) -> Result<(), NativeRefusal> {
         .ok_or(NativeRefusal::InstallerDeadlineExpired)
 }
 
-fn stage_input<A>(
+fn stage_input(
     workspace: &ProductionWorkspace,
     slot: ArtifactSlot,
     bytes: &[u8],
     limit: u64,
     mutable: bool,
-    authorize: impl FnOnce(ArtifactPin) -> Result<A, NativeRefusal>,
+    authorize: impl FnOnce(ArtifactPin) -> Result<SlotAuthority, NativeRefusal>,
 ) -> Result<PathPin, NativeRefusal> {
     let size = bytes.len() as u64;
     if !(1..=limit).contains(&size) || slot.generation != workspace.binding().generation {
@@ -567,7 +567,7 @@ fn stage_input<A>(
         sha256: digest(bytes),
     };
     WorkspaceCustody::production(&workspace.root, &workspace.lease)?;
-    let _authority = authorize(content)?;
+    let _authority = authorize(content)?.consume(workspace.binding(), &[slot])?;
     let created =
         open_relative(&workspace.root.leaf, leaf, Node::File, true, true).map_err(|_| PATH)?;
     let id = file_identity(&created, false).map_err(|_| PATH)?.0;
