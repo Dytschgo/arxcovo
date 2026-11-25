@@ -891,17 +891,17 @@ Per-task provider, effort and outcome for this batch. Where the notes name an ef
   - **Static VM and Docker.** No merge in this batch. Guest Docker, the patched egress fence, Windows custody and the live tunnel stay **unverified on real hardware**.
   - **Counted builder failures.** This list is the attempt counters for this batch. Interruptions below are not counted. One suite run with one root cause counts as one failure. A tooling or lint miss does not count. A new builder after a fresh diagnosis has its own budget. A provider substitution does not reset a counter.
     - #337 Claude Sonnet 5.5 opened at 0/3. The Sol review FAIL counted as 1/3. Merged at 1/3. An environment miss on the first smoke browser path was left uncounted in the builder report.
-    - #335 Sol stayed at 3/3, the tally already open under Since #322. Gemini 4 Neon high, its own budget, reached 2/3 on `0e7b0e06` (one review-driven fix and one test failure in that report). Merged at Neon 2/3.
+    - #335 Sol stayed at 3/3, the tally already open under Since #322. Gemini 4 Neon high, its own budget, reached 2/3 on `0e7b0e06` (one build failure, borrowing from temporary `BootRecipe` values, and one failure in the first targeted test run, per that report). Merged at Neon 2/3.
     - #338 Sol opened at 0/3 and is 1/3 for the inventory-test buffer move recorded in the builder report. Merged at 1/3.
     - 7c Sol stopped twice before an edit. Both stops stay at 0/3. No counted fix.
-    - #339, the same Sol builder on 7b PR4, records 1/3 in its builder report. The PR is open. Review is outstanding.
+    - #339, the same Sol builder on 7b PR4, records 1/3 in its builder report. At the batch cutoff (2026-11-25 15:34Z) the PR was open; Gemini 4 Neon's review then passed on the same head (`agent-review` status `59886051325`, 15:38Z), with merge pending.
     - Paused-trial run 2 has no result and is not a counted builder failure.
   - **Review rounds.** Holds and passes, apart from the attempt counters. The status id on each merged head is in the table above.
     - #336: Sol re-review 2 PASS `d5ac1991…35a4` on `cd964f64`. Status `59876465489`. The two P3s are corrected above.
     - #337: Sol review 1 FAIL `98693326…d968` on `380129a1`. Sol re-review 2 PASS `11cc61ec…5607` on `fa13709c`. Status `59880077988` on `17109364`.
     - #335: Neon review 1 FAIL `0f790f16…6c24`. Grok 4.7 re-review 2 PASS `ca1a0bed…6730` on `0e7b0e06`. Status `59881808518` on `cfee83db`.
     - #338: Gemini 4 Neon PASS `957752de…2cae` on `f0ebabae`, with four P3s on the ROADMAP. Status `59883937325` on `cbd7b457`.
-    - #339: no `agent-review` status on `5fd59ac8`.
+    - #339: at the batch cutoff, no `agent-review` status on `5fd59ac8`; Neon's PASS (`59886051325`) followed at 15:38Z.
   - **CI and provider interruptions.** Separate from the counted failures.
     - Main run `45629527819`, attempt 1, above. The jobs were green and the charged time was over 900 s. Attempt 2, a full rerun, succeeded. The owner then removed `ci-time-budget` from the required checks.
     - #335's re-review recorded hosted `verify` jobs failing because `rust (macos-latest)` was cancelled while `ci-time-budget` was still pending on `0e7b0e06`. The merged head `cfee83db` carries the passing `agent-review` status above. This batch does not claim a separate green-main reading for that intermediate head.
@@ -916,7 +916,7 @@ Per-task provider, effort and outcome for this batch. Where a report or the coor
 | #338 dashboard password | Sol 6.2 high; Gemini 4 Neon high review | Sol 1/3 | Merged `36adf6ac`. Status `59883937325`. PASS `957752de…2cae`. ConPTY passed. Real Windows Terminal **unverified on real hardware**. |
 | M6 owner-host acceptance | Owner, own PC and login | No counted failure | PASSED localhost, 2026-11-25 14:45–14:50 local. Password wrapper caveat. Screenshots unpublished. Deployed HTTPS and the native console **unverified on real hardware**. |
 | M4 7c stops | Sol 6.2 high | 0/3, stopped twice before an edit | Second report `76d94ba6…d417`. Fence amended: 7b PR4, then 7c. **Unverified on real hardware**. |
-| #339 M4 7b PR4 | Same Sol builder | Report records 1/3 | Open at `5fd59ac8`. No `agent-review` status. No merge claimed. **Unverified on real hardware**. |
+| #339 M4 7b PR4 | Same Sol builder | Report records 1/3 | Open at `5fd59ac8` at the batch cutoff; Neon review PASS (`59886051325`) after it. No merge claimed. **Unverified on real hardware**. |
 | Paused-trial run 2 | Waiting for an idle window | No result | No result claimed. |
 | CI time budget | Owner decision 2026-11-25 | No counted failure | `ci-time-budget` removed from required checks until v1. Strict mode, verify ×3 and `agent-review` remain. Run `45629527819` charged 947 s. |
 
