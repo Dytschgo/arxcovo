@@ -2665,23 +2665,118 @@ const LIVE_POLL: Duration = Duration::from_secs(1);
 async fn monitor_running<T, E>(
     work: impl std::future::Future<Output = Result<T, E>>,
     mut observe: impl FnMut() -> Result<(), E>,
+    cancel: &Shutdown,
+    deadline: tokio::time::Instant,
+    interrupted: impl Fn(ChannelError) -> E,
 ) -> Result<T, E> {
     use tokio::time::{Instant, MissedTickBehavior, interval_at};
     let mut tick = interval_at(Instant::now() + LIVE_POLL, LIVE_POLL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tokio::pin!(work);
+    let check = || {
+        if cancel.is_cancelled() {
+            Err(interrupted(ChannelError::Cancelled))
+        } else if Instant::now() >= deadline {
+            Err(interrupted(ChannelError::Timeout))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
     observe()?;
-    loop {
+    let result = loop {
+        check()?;
         tokio::select! {
             biased;
+            _ = cancel.cancelled() => break Err(interrupted(ChannelError::Cancelled)),
+            _ = tokio::time::sleep_until(deadline) => break Err(interrupted(ChannelError::Timeout)),
             _ = tick.tick() => observe()?,
-            result = &mut work => {
-                let result = result?;
-                observe()?;
-                return Ok(result);
-            }
+            result = &mut work => break result,
         }
+    };
+    let terminal = observe();
+    check()?;
+    result.and_then(|value| terminal.map(|()| value))
+}
+
+trait InstallerChild {
+    fn observe(&self, captured: std::time::Instant) -> Result<(), NativeRefusal>;
+    async fn dispatch(
+        &self,
+        qmp: &mut PipeQmp,
+        cancel: &Shutdown,
+        stage: InstallerStage,
+        refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(), InstallerFailureReason>;
+    async fn exit(&self, by: tokio::time::Instant) -> Result<(), InstallerFailureReason>;
+}
+
+impl InstallerChild for CheckedLaunchCore<'_> {
+    fn observe(&self, captured: std::time::Instant) -> Result<(), NativeRefusal> {
+        self.check_running(|| Ok(captured), true)
     }
+
+    async fn dispatch(
+        &self,
+        qmp: &mut PipeQmp,
+        cancel: &Shutdown,
+        stage: InstallerStage,
+        mut refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(), InstallerFailureReason> {
+        self.dispatch_cont(qmp, cancel, &mut refresh, Some(stage))
+            .await
+    }
+
+    async fn exit(&self, by: tokio::time::Instant) -> Result<(), InstallerFailureReason> {
+        self.child
+            .reap(by)
+            .await
+            .map_err(|_| InstallerFailureReason::ReleaseUnverified)?;
+        (self.child.exit_code() == Ok(0))
+            .then_some(())
+            .ok_or(InstallerFailureReason::ProcessFailed)
+    }
+}
+
+async fn installer_session(
+    child: &impl InstallerChild,
+    stage: InstallerStage,
+    (read, write): BootIo,
+    cancel: &Shutdown,
+    refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+) -> Result<(), InstallerFailureReason> {
+    use InstallerFailureReason as Failure;
+    use tokio::time::Instant;
+    let refresh = std::cell::RefCell::new(refresh);
+    monitor_running(
+        async {
+            let mut qmp = Qmp::installer_handshake(read, write, cancel, stage).await?;
+            qmp.verify_whpx(cancel).await.map_err(|error| match error {
+                ChannelError::Timeout | ChannelError::Cancelled => Failure::from(error),
+                _ => Failure::Native(NativeRefusal::WhpxUnverified),
+            })?;
+            child
+                .dispatch(&mut qmp, cancel, stage, || refresh.borrow_mut()())
+                .await?;
+            qmp.observe_installer_shutdown(cancel).await?;
+            // Keep QMP stdin open until the owned child exits.
+            let by = stage
+                .deadline()
+                .min(Instant::now() + Duration::from_secs(2));
+            tokio::time::timeout_at(by, child.exit(by))
+                .await
+                .map_err(|_| Failure::Timeout)?
+        },
+        || {
+            refresh.borrow_mut()()
+                .and_then(|captured| child.observe(captured))
+                .map_err(Failure::Native)
+        },
+        cancel,
+        stage.deadline(),
+        Failure::from,
+    )
+    .await
 }
 
 enum BootOutcome {
@@ -2787,15 +2882,13 @@ impl CheckedLaunchCore<'_> {
                     Ok(output)
                 },
                 || self.check_running(&mut refresh, true),
+                cancel,
+                deadline,
+                |_| refused,
             )
             .await
         };
-        let result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(refused),
-            _ = tokio::time::sleep_until(deadline) => Err(refused),
-            result = work => result,
-        };
+        let result = work.await;
         drop(write);
         if result.is_err() && self.child.job.terminate().is_err() {
             return (result, (StopDisposition::ChargedQuarantine, None));
@@ -2852,7 +2945,7 @@ impl CheckedLaunchCore<'_> {
                 let mut qmp = Qmp::handshake(read, write, cancel)
                     .await
                     .map_err(|_| NativeRefusal::QmpUnverified)?;
-                qmp.verify_whpx()
+                qmp.verify_whpx(cancel)
                     .await
                     .map_err(|_| NativeRefusal::WhpxUnverified)?;
                 self.dispatch_cont(&mut qmp, cancel, &mut || refresh.borrow_mut()(), None)
@@ -2867,6 +2960,11 @@ impl CheckedLaunchCore<'_> {
                 Ok(BootOutcome::Installed(Box::new((qmp, guest))))
             },
             || self.check_running(&mut *refresh.borrow_mut(), false),
+            cancel,
+            tokio::time::Instant::now()
+                + super::guest::GUEST_READY_BUDGET
+                + Duration::from_secs(60),
+            |_| NativeRefusal::QmpUnverified,
         )
         .await
         .map_err(BootFailure::Native)
@@ -2931,7 +3029,7 @@ impl CheckedLaunchCore<'_> {
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<BootOutcome, (InstallerFailure, Option<HeldWriters>)> {
         use InstallerFailureReason as Failure;
-        use tokio::time::{Instant, sleep_until};
+        use tokio::time::Instant;
         let grace = Duration::from_secs(2);
         let deadline = stage.deadline();
         let result = async {
@@ -2948,36 +3046,7 @@ impl CheckedLaunchCore<'_> {
                     drop(self.setup_vars_handoff.take());
                 })
                 .map_err(Failure::Native)?;
-            let (read, write) = io;
-            let mut qmp = Qmp::installer_handshake(read, write, cancel, stage).await?;
-            qmp.verify_whpx()
-                .await
-                .map_err(|_| Failure::Native(NativeRefusal::WhpxUnverified))?;
-            self.dispatch_cont(&mut qmp, cancel, revalidate, Some(stage))
-                .await?;
-            monitor_running(
-                async {
-                    qmp.observe_installer_shutdown(cancel)
-                        .await
-                        .map_err(Failure::from)
-                },
-                || {
-                    self.check_running(&mut *revalidate, true)
-                        .map_err(Failure::Native)
-                },
-            )
-            .await?;
-            // Keep QMP's stdin open while QEMU exits voluntarily.
-            let exit_by = deadline.min(Instant::now() + grace);
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => Err(Failure::Cancelled),
-                _ = sleep_until(exit_by) => Err(Failure::Timeout),
-                result = self.child.reap(exit_by) => {
-                    result.map_err(|_| Failure::ReleaseUnverified)?;
-                    (self.child.exit_code() == Ok(0)).then_some(()).ok_or(Failure::ProcessFailed)
-                }
-            }
+            installer_session(self, stage, io, cancel, &mut *revalidate).await
         }
         .await;
 
@@ -2998,9 +3067,29 @@ impl CheckedLaunchCore<'_> {
                 Instant::now() + grace
             }
         };
-        let (observed, held) = self
-            .release_evidence_held(result.is_ok(), result.is_ok(), release_by, verify_release)
-            .await;
+        let successful = result.is_ok();
+        let mut result = result;
+        let (observed, held) = {
+            let release =
+                self.release_evidence_held(successful, successful, release_by, verify_release);
+            tokio::pin!(release);
+            let mut tick = tokio::time::interval_at(Instant::now() + LIVE_POLL, LIVE_POLL);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled(), if result.is_ok() => result = Err(Failure::Cancelled),
+                    _ = tick.tick(), if result.is_ok() => {
+                        result = revalidate().map(|_| ()).map_err(Failure::Native);
+                    }
+                    proof = &mut release => break proof,
+                }
+            }
+        };
+        if result.is_ok() {
+            result = self
+                .check_running(revalidate, true)
+                .map_err(Failure::Native);
+        }
         if let Err(failure) = stage.complete(result, observed, cancel.is_cancelled()) {
             return Err((failure, held));
         }

@@ -485,6 +485,11 @@ impl<'a> NativeLaunch<'a> {
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<Option<(ScriptStatus, Option<u32>)>, LaunchFailure<'a>> {
         let unavailable = NativeRefusal::GuestEndpointUnverified;
+        let seconds = match &request {
+            GuestRequest::Ping => 5,
+            GuestRequest::Script(_, timeout) => u64::from(*timeout) + 5,
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
         let outcome = match self.live.as_deref_mut() {
             Some((_, guest)) if !cancel.is_cancelled() => {
                 monitor_running(
@@ -503,6 +508,9 @@ impl<'a> NativeLaunch<'a> {
                             false,
                         )
                     },
+                    cancel,
+                    deadline,
+                    |_| unavailable,
                 )
                 .await
             }

@@ -977,7 +977,7 @@ async fn launch_paused<H: Host>(
     gate.sample()?;
 
     gate.watch(host.verify_whpx(slot, async {
-        bounded(cancel, cutoff, peer.verify_whpx())
+        bounded(cancel, cutoff, peer.verify_whpx(cancel))
             .await
             .map_err(|_| NativeRefusal::WhpxUnverified)?;
         confirm_dispatch(&dispatch).await

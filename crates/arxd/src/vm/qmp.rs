@@ -471,7 +471,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
 
     /// Checks which accelerator the held paused QEMU child actually initialized.
     #[cfg(all(windows, target_arch = "x86_64"))]
-    pub(super) async fn verify_whpx(&mut self) -> Result<(), ChannelError> {
+    pub(super) async fn verify_whpx(&mut self, cancel: &Shutdown) -> Result<(), ChannelError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Accelerators {
@@ -479,10 +479,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
             present: Vec<String>,
         }
 
-        let stream = self.stream.as_mut().ok_or(ChannelError::Closed)?;
-        let response = stream
-            .command(Command::Accelerators, &mut Events::default())
-            .await?;
+        let mut events = self.installer.take().unwrap_or_default();
+        let deadline = setup_deadline(events.installer.as_ref().map(|installer| installer.stage));
+        let mut stream = self.stream.take().ok_or(ChannelError::Closed)?;
+        let response = bounded(cancel, deadline, async {
+            stream.command(Command::Accelerators, &mut events).await
+        })
+        .await?;
         let actual: Accelerators =
             serde_json::from_value(response).map_err(|_| ChannelError::Invalid)?;
         if actual.enabled != "whpx"
@@ -502,6 +505,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
         {
             return Err(ChannelError::Unexpected);
         }
+        self.installer = events.installer.is_some().then_some(events);
+        self.stream = Some(stream);
         Ok(())
     }
 
@@ -710,6 +715,46 @@ mod accelerator_tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+    #[tokio::test(start_paused = true)]
+    async fn silent_accelerator_respects_setup_deadline_and_cancellation() {
+        for interrupt in [false, true] {
+            let (host, simulated) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(host);
+            let mut qmp = Qmp {
+                stream: Some(Stream {
+                    reader: BufReader::new(reader),
+                    writer,
+                    next_id: 1,
+                    pending: Vec::new(),
+                }),
+                started: false,
+                installer: None,
+            };
+            let cancel = Shutdown::default();
+            let mut peer = BufReader::new(simulated);
+            let (_, result) = tokio::join!(
+                async {
+                    let mut command = String::new();
+                    peer.read_line(&mut command).await.unwrap();
+                    assert!(command.contains("query-accelerators"));
+                    if interrupt {
+                        cancel.cancel();
+                    }
+                },
+                tokio::time::timeout(SETUP * 2, qmp.verify_whpx(&cancel))
+            );
+            assert_eq!(
+                result.unwrap(),
+                Err(if interrupt {
+                    ChannelError::Cancelled
+                } else {
+                    ChannelError::Timeout
+                })
+            );
+            assert!(qmp.stream.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn paused_trial_requires_typed_whpx_selection() {
         for (response, accepted) in [
@@ -734,6 +779,7 @@ mod accelerator_tests {
                 started: false,
                 installer: None,
             };
+            let cancel = Shutdown::default();
             let (_, result) = tokio::join!(
                 async {
                     let mut peer = BufReader::new(simulated);
@@ -745,7 +791,7 @@ mod accelerator_tests {
                         .await
                         .unwrap();
                 },
-                qmp.verify_whpx()
+                qmp.verify_whpx(&cancel)
             );
             assert_eq!(result.is_ok(), accepted, "{response}");
         }
