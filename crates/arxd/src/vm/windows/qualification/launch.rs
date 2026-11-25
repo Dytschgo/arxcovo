@@ -870,10 +870,10 @@ pub(super) async fn run_ubuntu(
     baseline: &Baseline,
     cancel: &Shutdown,
 ) -> Result<RecipeProbe, NativeRefusal> {
-    use crate::vm::qualification_record::{Observation, RecipeIdentity};
+    use crate::vm::UbuntuAssets;
+    use crate::vm::qualification_record::Observation;
     use crate::vm::runtime::{InstallerBudget, InstallerPhase, InstallerRecipe};
     use crate::vm::template::{UBUNTU_DETACHED_HEALTH, installed_witness_script};
-    use crate::vm::{UbuntuAssets, UbuntuRecipe};
     use arx_guest::protocol::ScriptStatus;
     use sha2::{Digest, Sha256};
     use std::io::{Seek, SeekFrom};
@@ -934,45 +934,17 @@ pub(super) async fn run_ubuntu(
     else {
         unreachable!("fixed recipe assets")
     };
-    let recipe = UbuntuRecipe {
-        iso: Some(asset_pin(content(iso)?)),
-        kernel: Some(asset_pin(content(kernel)?)),
-        initrd: Some(asset_pin(content(initrd)?)),
-        guest: Some(asset_pin(guest.expected)),
-        service: Some(asset_pin(ArtifactPin {
-            size: UbuntuRecipe::SERVICE.len() as u64,
-            sha256: Sha256::digest(UbuntuRecipe::SERVICE).into(),
-        })),
-        finalize: Some(asset_pin(ArtifactPin {
-            size: UbuntuRecipe::FINALIZE.len() as u64,
-            sha256: Sha256::digest(UbuntuRecipe::FINALIZE).into(),
-        })),
-        nocloud_schema: Some(UbuntuRecipe::NOCLOUD_PROFILE_PIN),
-        firmware_code: Some(asset_pin(content(&firmware)?)),
-        firmware_vars: Some(asset_pin(content(&vars_seed)?)),
-        qemu_receipt: Some(asset_pin(content(&receipt)?)),
-    };
-    let mut hash = Sha256::new()
-        .chain_update(b"arxcovo.recipe\0")
-        .chain_update(UbuntuRecipe::ID);
-    for pin in [
-        recipe.iso,
-        recipe.kernel,
-        recipe.initrd,
-        recipe.guest,
-        recipe.firmware_code,
-        recipe.firmware_vars,
-        recipe.qemu_receipt,
-    ] {
-        let pin = pin.ok_or(reason)?;
-        hash.update(pin.length.to_be_bytes());
-        hash.update(pin.sha256);
-    }
-    let sha: [u8; 32] = hash.finalize().into();
-    let identity = RecipeIdentity {
-        recipe_id: sha[..16].try_into().expect("digest prefix"),
-        recipe_sha256: sha,
-    };
+    let external_pins = [
+        content(iso)?,
+        content(kernel)?,
+        content(initrd)?,
+        guest.expected,
+        content(&firmware)?,
+        content(&vars_seed)?,
+        content(&receipt)?,
+    ];
+    let recipe = ubuntu_test_recipe(external_pins);
+    let identity = ubuntu_identity(external_pins)?;
     let mut seed_bytes = Vec::new();
     recipe
         .write_test_seed(
@@ -1759,20 +1731,48 @@ pub(super) async fn run_windows(
     })
 }
 
-fn ubuntu_identity(pins: [ArtifactPin; 7]) -> crate::vm::qualification_record::RecipeIdentity {
+fn ubuntu_test_recipe(pins: [ArtifactPin; 7]) -> crate::vm::UbuntuRecipe {
+    use crate::vm::UbuntuRecipe;
     use sha2::{Digest, Sha256};
-    let mut hash = Sha256::new()
-        .chain_update(b"arxcovo.recipe\0")
-        .chain_update(crate::vm::UbuntuRecipe::ID);
-    for pin in pins {
-        hash.update(pin.size.to_be_bytes());
-        hash.update(pin.sha256);
+    let [
+        iso,
+        kernel,
+        initrd,
+        guest,
+        firmware_code,
+        firmware_vars,
+        qemu_receipt,
+    ] = pins;
+    UbuntuRecipe {
+        iso: Some(asset_pin(iso)),
+        kernel: Some(asset_pin(kernel)),
+        initrd: Some(asset_pin(initrd)),
+        guest: Some(asset_pin(guest)),
+        service: Some(asset_pin(ArtifactPin {
+            size: UbuntuRecipe::SERVICE.len() as u64,
+            sha256: Sha256::digest(UbuntuRecipe::SERVICE).into(),
+        })),
+        finalize: Some(asset_pin(ArtifactPin {
+            size: UbuntuRecipe::FINALIZE.len() as u64,
+            sha256: Sha256::digest(UbuntuRecipe::FINALIZE).into(),
+        })),
+        nocloud_schema: Some(UbuntuRecipe::NOCLOUD_PROFILE_PIN),
+        firmware_code: Some(asset_pin(firmware_code)),
+        firmware_vars: Some(asset_pin(firmware_vars)),
+        qemu_receipt: Some(asset_pin(qemu_receipt)),
     }
-    let sha: [u8; 32] = hash.finalize().into();
-    crate::vm::qualification_record::RecipeIdentity {
+}
+
+fn ubuntu_identity(
+    pins: [ArtifactPin; 7],
+) -> Result<crate::vm::qualification_record::RecipeIdentity, NativeRefusal> {
+    let sha = ubuntu_test_recipe(pins)
+        .test_recipe_digest()
+        .map_err(|_| NativeRefusal::InstallerPhaseUnavailable)?;
+    Ok(crate::vm::qualification_record::RecipeIdentity {
         recipe_id: sha[..16].try_into().expect("digest prefix"),
         recipe_sha256: sha,
-    }
+    })
 }
 
 pub struct RecipeProjection {
@@ -1822,7 +1822,7 @@ pub(super) fn project_recipes(baseline: &Baseline) -> Result<RecipeProjection, N
             firmware[0],
             firmware[1],
             content(&receipt)?,
-        ]),
+        ])?,
         windows: RecipeIdentity {
             recipe_id: crate::vm::template::windows_recipe_id(),
             recipe_sha256: prepared.digest,
@@ -1977,6 +1977,268 @@ mod tests {
         assert!(linux.ends_with("ARX_NETWORK"));
         assert!(windows.len() <= arx_guest::protocol::MAX_SCRIPT);
         assert!(windows.contains("$sent=$s.SendTo"));
+    }
+
+    #[test]
+    fn ubuntu_identity_uses_single_embedded_recipe_digest() {
+        let pin = |seed: u8| ArtifactPin {
+            size: u64::from(seed) + 1,
+            sha256: [seed; 32],
+        };
+        let pins = [pin(1), pin(2), pin(3), pin(4), pin(5), pin(6), pin(7)];
+        let identity = ubuntu_identity(pins).unwrap();
+        let expected = ubuntu_test_recipe(pins).test_recipe_digest().unwrap();
+        assert_eq!(identity.recipe_sha256, expected);
+        assert_eq!(identity.recipe_id, expected[..16]);
+
+        let mut other = pins;
+        other[3].sha256[0] ^= 1;
+        assert_ne!(ubuntu_identity(other).unwrap(), identity);
+    }
+
+    #[tokio::test]
+    async fn windows_installed_witness_script_behavior_with_fake_sockets_and_cmdlets() {
+        use tokio::io::AsyncWriteExt;
+
+        let nonce = [0xef; 16];
+        let tcp = [
+            "192.0.2.10:42001".parse().unwrap(),
+            "[2001:db8::10]:42002".parse().unwrap(),
+            "10.0.2.2:42003".parse().unwrap(),
+        ];
+        let udp = [
+            "192.0.2.10:42004".parse().unwrap(),
+            "[2001:db8::10]:42005".parse().unwrap(),
+            "10.0.2.2:42006".parse().unwrap(),
+        ];
+        let targets = super::super::WitnessTargets {
+            tcp,
+            udp,
+            dns: "192.0.2.53:53".parse().unwrap(),
+        };
+        let emitted = windows_witness_script(nonce, &targets);
+        let temp = tempfile::tempdir().unwrap();
+        let script_path = temp.path().join("witness.ps1");
+        std::fs::write(&script_path, &emitted).unwrap();
+
+        let expected_dns = crate::vm::guest::network_probe::dns_query(&nonce);
+        let nonce_csv = nonce
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let dns_csv = expected_dns
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let harness = format!(
+            r#"$ErrorActionPreference = 'Stop'
+$global:arxScriptPath = $env:ARX_WITNESS_SCRIPT
+$global:arxExpectedNonce = [byte[]]@({nonce_csv})
+$global:arxExpectedDns = [byte[]]@({dns_csv})
+
+function Invoke-WitnessCase {{
+    param([hashtable]$Config)
+    $global:arxCfg = $Config
+    $global:arxAttempts = [System.Collections.Generic.List[string]]::new()
+    $global:arxUdpAliasSent = $false
+
+    function Get-NetAdapter {{
+        return @([pscustomobject]@{{ Status = 'Up'; ifIndex = 7 }})
+    }}
+    function Get-NetIPAddress {{
+        param([int]$InterfaceIndex, [string]$AddressFamily)
+        if ($InterfaceIndex -ne 7) {{ throw "wrong ifIndex $InterfaceIndex" }}
+        if ($AddressFamily -eq 'IPv4') {{
+            if ($global:arxCfg.ContainsKey('ipv4')) {{ return $global:arxCfg.ipv4 }}
+            return @([pscustomobject]@{{ IPAddress = '10.0.2.15'; PrefixLength = 24 }})
+        }}
+        if ($global:arxCfg.ContainsKey('ipv6')) {{ return $global:arxCfg.ipv6 }}
+        return @([pscustomobject]@{{ IPAddress = 'fe80::1' }})
+    }}
+    function Get-NetRoute {{
+        param([int]$InterfaceIndex, [string]$AddressFamily)
+        if ($InterfaceIndex -ne 7) {{ throw "wrong ifIndex $InterfaceIndex" }}
+        if ($AddressFamily -eq 'IPv4') {{
+            if ($global:arxCfg.ContainsKey('v4route')) {{ return $global:arxCfg.v4route }}
+            return @([pscustomobject]@{{ DestinationPrefix = '0.0.0.0/0'; NextHop = '10.0.2.2' }})
+        }}
+        if ($global:arxCfg.ContainsKey('v6route')) {{ return $global:arxCfg.v6route }}
+        return @()
+    }}
+    function Get-NetNeighbor {{
+        param([int]$InterfaceIndex, [string]$IPAddress)
+        if ($InterfaceIndex -ne 7 -or $IPAddress -ne '10.0.2.2') {{ throw 'wrong neighbor query' }}
+        if (-not $global:arxUdpAliasSent) {{
+            return @([pscustomobject]@{{ State = 'Stale' }})
+        }}
+        if ($global:arxCfg.ContainsKey('neighbor')) {{ return $global:arxCfg.neighbor }}
+        return @([pscustomobject]@{{ State = 'Reachable' }})
+    }}
+    function New-Object {{
+        param([string]$TypeName, [object[]]$ArgumentList)
+        if ($TypeName -ne 'Net.Sockets.Socket') {{
+            if ($null -eq $ArgumentList) {{
+                return Microsoft.PowerShell.Utility\New-Object -TypeName $TypeName
+            }}
+            return Microsoft.PowerShell.Utility\New-Object -TypeName $TypeName -ArgumentList $ArgumentList
+        }}
+        $af, $kind, $proto = $ArgumentList
+        $sock = [pscustomobject]@{{
+            Af = $af
+            Kind = $kind
+            Proto = $proto
+            Bound = $null
+            Disposed = $false
+        }}
+        $sock | Add-Member -MemberType ScriptMethod -Name Bind -Value {{
+            param($ep)
+            $this.Bound = $ep.Address.ToString()
+        }}
+        $sock | Add-Member -MemberType ScriptMethod -Name BeginConnect -Value {{
+            param($to, $cb, $state)
+            $key = "tcp:$($to.Address):$($to.Port)"
+            if ($this.Af -eq 'InterNetwork' -and $this.Bound -ne '10.0.2.15') {{ throw 'missing ipv4 bind' }}
+            if ($this.Af -eq 'InterNetworkV6' -and $null -ne $this.Bound) {{ throw 'unexpected ipv6 bind' }}
+            $global:arxAttempts.Add($key)
+            $action = if ($global:arxCfg.overrides -and $global:arxCfg.overrides.ContainsKey($key)) {{ $global:arxCfg.overrides[$key] }} else {{ $null }}
+            $waited = $true
+            if ($null -eq $action) {{
+                if ($key -eq 'tcp:192.0.2.10:42001') {{ $waited = $false }}
+                elseif ($key -eq 'tcp:2001:db8::10:42002') {{ $action = 'NetworkUnreachable' }}
+                elseif ($key -eq 'tcp:10.0.2.2:42003') {{ $action = 'ConnectionRefused' }}
+                else {{ throw "unexpected tcp target $key" }}
+            }} elseif ($action -eq 'timeout') {{
+                $waited = $false
+            }}
+            $wh = [pscustomobject]@{{ Waited = $waited }}
+            $wh | Add-Member -MemberType ScriptMethod -Name WaitOne -Value {{ param($ms) return $this.Waited }}
+            return [pscustomobject]@{{ AsyncWaitHandle = $wh; Action = $action }}
+        }}
+        $sock | Add-Member -MemberType ScriptMethod -Name EndConnect -Value {{
+            param($async)
+            if ($async.Action -eq 'connect') {{ return }}
+            if ($async.Action) {{
+                $code = [int][Enum]::Parse([System.Net.Sockets.SocketError], $async.Action)
+                throw ([System.Net.Sockets.SocketException]::new($code))
+            }}
+        }}
+        $sock | Add-Member -MemberType ScriptMethod -Name SendTo -Value {{
+            param([byte[]]$data, $to)
+            $key = "udp:$($to.Address):$($to.Port)"
+            if ($this.Af -eq 'InterNetwork' -and $this.Bound -ne '10.0.2.15') {{ throw 'missing ipv4 bind' }}
+            if ($this.Af -eq 'InterNetworkV6' -and $null -ne $this.Bound) {{ throw 'unexpected ipv6 bind' }}
+            $global:arxAttempts.Add($key)
+            if ($to.Port -eq 53) {{
+                if (([Convert]::ToBase64String($data)) -ne ([Convert]::ToBase64String($global:arxExpectedDns))) {{ throw 'bad dns query' }}
+            }} else {{
+                if (([Convert]::ToBase64String($data)) -ne ([Convert]::ToBase64String($global:arxExpectedNonce))) {{ throw 'bad udp nonce' }}
+            }}
+            if ($key -eq 'udp:10.0.2.2:42006') {{ $global:arxUdpAliasSent = $true }}
+            $action = if ($global:arxCfg.overrides -and $global:arxCfg.overrides.ContainsKey($key)) {{ $global:arxCfg.overrides[$key] }} else {{ $null }}
+            if ($null -eq $action) {{
+                if ($key -eq 'udp:2001:db8::10:42005') {{
+                    throw ([System.Net.Sockets.SocketException]::new([int][System.Net.Sockets.SocketError]::AddressNotAvailable))
+                }}
+                return $data.Length
+            }}
+            if ($action -eq 'short') {{ return ($data.Length - 1) }}
+            $code = [int][Enum]::Parse([System.Net.Sockets.SocketError], $action)
+            throw ([System.Net.Sockets.SocketException]::new($code))
+        }}
+        $sock | Add-Member -MemberType ScriptMethod -Name Dispose -Value {{ $this.Disposed = $true }}
+        return $sock
+    }}
+
+    $global:LASTEXITCODE = 0
+    & $global:arxScriptPath
+    return [pscustomobject]@{{
+        ExitCode = $global:LASTEXITCODE
+        Attempts = @($global:arxAttempts)
+    }}
+}}
+
+$expectedAttempts = @(
+    'tcp:192.0.2.10:42001',
+    'tcp:2001:db8::10:42002',
+    'tcp:10.0.2.2:42003',
+    'udp:10.0.2.2:42006',
+    'udp:2001:db8::10:42005',
+    'udp:192.0.2.10:42004',
+    'udp:192.0.2.53:53',
+    'udp:10.0.2.3:53'
+)
+
+# 1. Reachable control and complete 8-attempt set.
+$ok = Invoke-WitnessCase @{{}}
+if ($ok.ExitCode -ne 0) {{ throw "happy path failed: $($ok.ExitCode)" }}
+if (($ok.Attempts -join ',') -ne ($expectedAttempts -join ',')) {{
+    throw "wrong attempts: $($ok.Attempts -join ',')"
+}}
+
+# 2. Unreachable gateway neighbor fails closed.
+$stale = Invoke-WitnessCase @{{ neighbor = @([pscustomobject]@{{ State = 'Stale' }}) }}
+if ($stale.ExitCode -ne 1) {{ throw 'stale neighbor should fail' }}
+
+# 3. Local IPv4 errors fail closed.
+foreach ($ov in @(
+    @{{ 'tcp:192.0.2.10:42001' = 'NetworkUnreachable' }},
+    @{{ 'tcp:10.0.2.2:42003' = 'HostUnreachable' }},
+    @{{ 'udp:192.0.2.10:42004' = 'NetworkUnreachable' }},
+    @{{ 'udp:192.0.2.53:53' = 'short' }}
+)) {{
+    $r = Invoke-WitnessCase @{{ overrides = $ov }}
+    if ($r.ExitCode -ne 1) {{ throw 'local ipv4 error should fail' }}
+}}
+
+# 4. Absent/wrong route, global IPv6, unexpected TCP connect, or IPv6 timeout fail closed.
+foreach ($case in @(
+    @{{ v4route = @() }},
+    @{{ v4route = @([pscustomobject]@{{ DestinationPrefix = '0.0.0.0/0'; NextHop = '10.0.2.1' }}) }},
+    @{{ ipv4 = @([pscustomobject]@{{ IPAddress = '10.0.2.99'; PrefixLength = 24 }}) }},
+    @{{ ipv6 = @([pscustomobject]@{{ IPAddress = '2001:db8::1' }}) }},
+    @{{ v6route = @([pscustomobject]@{{ DestinationPrefix = '::/0'; NextHop = 'fe80::1' }}) }},
+    @{{ overrides = @{{ 'tcp:192.0.2.10:42001' = 'connect' }} }},
+    @{{ overrides = @{{ 'tcp:2001:db8::10:42002' = 'timeout' }} }}
+)) {{
+    $r = Invoke-WitnessCase $case
+    if ($r.ExitCode -ne 1) {{ throw 'negative case should fail' }}
+}}
+"#
+        );
+
+        let mut check = tokio::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "& ([ScriptBlock]::Create([Console]::In.ReadToEnd()))",
+            ])
+            .env("ARX_WITNESS_SCRIPT", &script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(120), async move {
+            let mut input = check.stdin.take().unwrap();
+            input.write_all(harness.as_bytes()).await.unwrap();
+            drop(input);
+            check.wait_with_output().await.unwrap()
+        })
+        .await
+        .expect("PowerShell witness fixture exceeded its test budget");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     #[test]

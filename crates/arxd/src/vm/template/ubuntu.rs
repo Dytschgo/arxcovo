@@ -324,6 +324,70 @@ chmod 0600 "$file"
         append_test_route_seed(&base, out)
     }
 
+    /// Compute the sealed Ubuntu TEST recipe digest over the recipe ID,
+    /// seven external asset pins, and the embedded TEST recipe content
+    /// (service unit, shared finalizer, NoCloud profile pin, TEST route late
+    /// command, and detached health script).
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    pub(in crate::vm) fn test_recipe_digest(&self) -> Result<[u8; 32], RecipeError> {
+        let schema = required(self.nocloud_schema)?;
+        verify_nocloud_profile(schema)?;
+        self.test_recipe_digest_with(
+            Self::SERVICE,
+            Self::FINALIZE,
+            Self::NOCLOUD_PROFILE_PIN,
+            Self::TEST_ROUTE_COMMAND,
+            DETACHED_HEALTH,
+        )
+    }
+
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    fn test_recipe_digest_with(
+        &self,
+        service_bytes: &[u8],
+        finalize_bytes: &[u8],
+        nocloud_profile: AssetPin,
+        test_route_command: &str,
+        detached_health: &str,
+    ) -> Result<[u8; 32], RecipeError> {
+        let service = required(self.service)?;
+        let finalize = required(self.finalize)?;
+        let schema = required(self.nocloud_schema)?;
+        service.verify(service_bytes)?;
+        finalize.verify(finalize_bytes)?;
+        if schema.length != nocloud_profile.length || schema.sha256 != nocloud_profile.sha256 {
+            return Err(RecipeError::Unqualified);
+        }
+        let mut hash = Sha256::new()
+            .chain_update(b"arxcovo.recipe.ubuntu-test.v1\0")
+            .chain_update(Self::ID);
+        for pin in [
+            self.iso,
+            self.kernel,
+            self.initrd,
+            self.guest,
+            self.firmware_code,
+            self.firmware_vars,
+            self.qemu_receipt,
+        ] {
+            let pin = required(pin)?;
+            hash.update(pin.length.to_be_bytes());
+            hash.update(pin.sha256);
+        }
+        for bytes in [
+            service_bytes,
+            finalize_bytes,
+            test_route_command.as_bytes(),
+            detached_health.as_bytes(),
+        ] {
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(Sha256::digest(bytes));
+        }
+        hash.update(nocloud_profile.length.to_be_bytes());
+        hash.update(nocloud_profile.sha256);
+        Ok(hash.finalize().into())
+    }
+
     fn seed_config(&self, build_id: Id, guest: &[u8]) -> Result<(String, String), RecipeError> {
         let guest_pin = required(self.guest)?;
         let service = required(self.service)?;
@@ -335,30 +399,34 @@ chmod 0600 "$file"
         guest_pin.verify(guest)?;
         service.verify(Self::SERVICE)?;
         finalize.verify(Self::FINALIZE)?;
-        let expected = Self::NOCLOUD_PROFILE_PIN;
-        if schema.length != expected.length || schema.sha256 != expected.sha256 {
-            return Err(RecipeError::Unqualified);
-        }
-        let separator: &[u8] = b"\0";
-        schema.verify(
-            Self::NOCLOUD_SCHEMA
-                .chain(separator)
-                .chain(USER_DATA_TEMPLATE.as_bytes())
-                .chain(separator)
-                .chain(Self::SERVICE)
-                .chain(separator)
-                .chain(Self::FINALIZE)
-                .chain(separator)
-                .chain(Self::ACCOUNT_AUDIT_SERVICE)
-                .chain(separator)
-                .chain(Self::ACCOUNT_AUDIT_SCRIPT),
-        )?;
+        verify_nocloud_profile(schema)?;
         let meta = format!(
             "instance-id: arx-install-{}\nlocal-hostname: arxcovo\n",
             hex::encode(build_id),
         );
         Ok((meta, user_data(guest_pin, service, finalize)))
     }
+}
+
+fn verify_nocloud_profile(schema: AssetPin) -> Result<(), RecipeError> {
+    let expected = UbuntuRecipe::NOCLOUD_PROFILE_PIN;
+    if schema.length != expected.length || schema.sha256 != expected.sha256 {
+        return Err(RecipeError::Unqualified);
+    }
+    let separator: &[u8] = b"\0";
+    schema.verify(
+        UbuntuRecipe::NOCLOUD_SCHEMA
+            .chain(separator)
+            .chain(USER_DATA_TEMPLATE.as_bytes())
+            .chain(separator)
+            .chain(UbuntuRecipe::SERVICE)
+            .chain(separator)
+            .chain(UbuntuRecipe::FINALIZE)
+            .chain(separator)
+            .chain(UbuntuRecipe::ACCOUNT_AUDIT_SERVICE)
+            .chain(separator)
+            .chain(UbuntuRecipe::ACCOUNT_AUDIT_SCRIPT),
+    )
 }
 
 /// Probe-only NoCloud seed. The live guest reports the launch nonce, NIC
@@ -405,11 +473,21 @@ pub(in crate::vm) fn network_witness_seed(
     nonce: &[u8; 16],
     targets: &crate::vm::windows::qualification::WitnessTargets,
 ) -> Result<Vec<u8>, RecipeError> {
+    network_witness_seed_for(nonce, targets.tcp, targets.udp, targets.dns)
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn network_witness_seed_for(
+    nonce: &[u8; 16],
+    tcp: [std::net::SocketAddr; 3],
+    udp: [std::net::SocketAddr; 3],
+    dns: std::net::SocketAddr,
+) -> Result<Vec<u8>, RecipeError> {
     use std::fmt::Write;
     let encoded_nonce = hex::encode(nonce);
     let mut script = String::from(PROBE_START);
     writeln!(script, "NONCE = bytes.fromhex({encoded_nonce:?})").expect("String write");
-    for (kind, addresses) in [("TCP", targets.tcp), ("UDP", targets.udp)] {
+    for (kind, addresses) in [("TCP", tcp), ("UDP", udp)] {
         writeln!(script, "{kind} = [").expect("String write");
         for address in addresses {
             writeln!(
@@ -422,13 +500,7 @@ pub(in crate::vm) fn network_witness_seed(
         }
         writeln!(script, "]").expect("String write");
     }
-    writeln!(
-        script,
-        "DNS = ({:?}, {})",
-        targets.dns.ip().to_string(),
-        targets.dns.port()
-    )
-    .expect("String write");
+    writeln!(script, "DNS = ({:?}, {})", dns.ip().to_string(), dns.port()).expect("String write");
     script.push_str(PROBE_BODY);
     script.push_str(WITNESS_ENTRY);
     write_probe_seed(&encoded_nonce, &script)
@@ -598,7 +670,7 @@ if __name__ == '__main__':
             wire.write(b'ARXNET2 ' + NONCE.hex().encode('ascii') + b' ' + setup.encode('ascii') + b' ' + outcomes.encode('ascii') + b'\n')
 "#;
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 const WITNESS_ENTRY: &str = r#"
 import errno
 
@@ -697,18 +769,25 @@ pub(in crate::vm) fn installed_witness_script(
     nonce: [u8; 16],
     targets: &crate::vm::windows::qualification::WitnessTargets,
 ) -> Result<String, RecipeError> {
+    installed_witness_script_for(nonce, targets.tcp, targets.udp, targets.dns)
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn installed_witness_script_for(
+    nonce: [u8; 16],
+    tcp: [std::net::SocketAddr; 3],
+    udp: [std::net::SocketAddr; 3],
+    dns: std::net::SocketAddr,
+) -> Result<String, RecipeError> {
     use std::fmt::Write;
     let mut script = String::from(
         "set -eu\n/usr/bin/python3 - <<'ARX_NETWORK'\nimport pathlib, socket, subprocess, time\n",
     );
     writeln!(script, "NONCE=bytes.fromhex({:?})", hex::encode(nonce)).expect("String write");
     for (name, addresses) in [
-        ("TCP", targets.tcp.to_vec()),
-        ("UDP", targets.udp.to_vec()),
-        (
-            "DNS",
-            vec![targets.dns, "10.0.2.3:53".parse().expect("fixed")],
-        ),
+        ("TCP", tcp.to_vec()),
+        ("UDP", udp.to_vec()),
+        ("DNS", vec![dns, "10.0.2.3:53".parse().expect("fixed")]),
     ] {
         writeln!(script, "{name}=[").expect("String write");
         for target in addresses {
@@ -1178,3 +1257,459 @@ for tokens, expected in [
         seen = False
     assert seen is expected
 "#;
+
+#[cfg(test)]
+fn python_executable() -> std::ffi::OsString {
+    std::env::var_os("ARX_TEST_NETWORK_PROBE_PYTHON")
+        .unwrap_or_else(|| std::ffi::OsString::from("python"))
+}
+
+#[cfg(test)]
+fn extract_probe_script_from_cidata(iso: &[u8]) -> String {
+    const BLOCK: usize = 2048;
+    let primary = &iso[16 * BLOCK..17 * BLOCK];
+    assert_eq!(&primary[..7], b"\x01CD001\x01");
+    let root_lba = u32::from_le_bytes(primary[158..162].try_into().unwrap()) as usize;
+    let root_len = u32::from_le_bytes(primary[166..170].try_into().unwrap()) as usize;
+    let mut dir = &iso[root_lba * BLOCK..root_lba * BLOCK + root_len];
+    let mut userdata = None;
+    while let Some(&len) = dir.first().filter(|&&len| len != 0) {
+        let (rec, rest) = dir.split_at(usize::from(len));
+        dir = rest;
+        let name = &rec[33..33 + usize::from(rec[32])];
+        if name == b"USERDATA.;1" {
+            let start = u32::from_le_bytes(rec[2..6].try_into().unwrap()) as usize * BLOCK;
+            let size = u32::from_le_bytes(rec[10..14].try_into().unwrap()) as usize;
+            userdata = Some(std::str::from_utf8(&iso[start..start + size]).unwrap());
+            break;
+        }
+    }
+    let cloud = userdata.expect("USERDATA.;1 in probe ISO");
+    let body = cloud
+        .strip_prefix("#cloud-config\nwrite_files:\n  - path: /run/arxcovo-network-probe.py\n    permissions: '0600'\n    content: |\n")
+        .expect("probe cloud-config prefix")
+        .strip_suffix("runcmd:\n  - [python3, /run/arxcovo-network-probe.py]\n")
+        .expect("probe cloud-config suffix");
+    let mut out = String::new();
+    for line in body.lines() {
+        out.push_str(line.strip_prefix("      ").expect("6-space yaml indent"));
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn ubuntu_test_recipe_identity_binds_embedded_route_and_preserves_shared_goldens() {
+    use super::ubuntu_web::{
+        IsoPoolManifest, IsoPoolVerifier, PROFILE_PIN, PoolPackage, UbuntuWebRecipe,
+    };
+    use crate::vm::paths::ArtifactPin;
+
+    struct OkVerifier;
+    impl IsoPoolVerifier for OkVerifier {
+        fn verify(&self, _: &UbuntuRecipe, _: &IsoPoolManifest<'_>) -> bool {
+            true
+        }
+    }
+
+    let pin = |bytes: &[u8]| AssetPin {
+        length: bytes.len() as u64,
+        sha256: Sha256::digest(bytes).into(),
+    };
+    let guest = b"offline-test-guest\x00\xff";
+    let host = Some(pin(b"synthetic host asset"));
+    let iso_pin = AssetPin {
+        length: 19,
+        sha256: UbuntuRecipe::ISO_SHA256,
+    };
+    let recipe = UbuntuRecipe {
+        iso: Some(iso_pin),
+        kernel: host,
+        initrd: host,
+        guest: Some(pin(guest)),
+        service: Some(pin(UbuntuRecipe::SERVICE)),
+        finalize: Some(pin(UbuntuRecipe::FINALIZE)),
+        nocloud_schema: Some(UbuntuRecipe::NOCLOUD_PROFILE_PIN),
+        firmware_code: host,
+        firmware_vars: host,
+        qemu_receipt: host,
+    };
+
+    let original = recipe.test_recipe_digest().unwrap();
+    assert_eq!(original, recipe.test_recipe_digest().unwrap());
+
+    // Changing one byte of the TEST route late command changes the TEST recipe
+    // digest and 16-byte ID prefix.
+    let modified_route = UbuntuRecipe::TEST_ROUTE_COMMAND.replace("10.0.2.2", "10.0.2.9");
+    assert_ne!(modified_route, UbuntuRecipe::TEST_ROUTE_COMMAND);
+    let with_changed_route = recipe
+        .test_recipe_digest_with(
+            UbuntuRecipe::SERVICE,
+            UbuntuRecipe::FINALIZE,
+            UbuntuRecipe::NOCLOUD_PROFILE_PIN,
+            &modified_route,
+            DETACHED_HEALTH,
+        )
+        .unwrap();
+    assert_ne!(with_changed_route, original);
+    assert_ne!(with_changed_route[..16], original[..16]);
+
+    // Changing FINALIZE, SERVICE, NOCLOUD_PROFILE_PIN or DETACHED_HEALTH also
+    // alters the TEST recipe identity.
+    let mut alt_finalize = UbuntuRecipe::FINALIZE.to_vec();
+    alt_finalize.push(b'\n');
+    let mut recipe_alt_finalize = UbuntuRecipe {
+        finalize: Some(pin(&alt_finalize)),
+        ..UbuntuRecipe {
+            iso: recipe.iso,
+            kernel: recipe.kernel,
+            initrd: recipe.initrd,
+            guest: recipe.guest,
+            service: recipe.service,
+            finalize: recipe.finalize,
+            nocloud_schema: recipe.nocloud_schema,
+            firmware_code: recipe.firmware_code,
+            firmware_vars: recipe.firmware_vars,
+            qemu_receipt: recipe.qemu_receipt,
+        }
+    };
+    assert!(recipe_alt_finalize.test_recipe_digest().is_err());
+    assert_ne!(
+        recipe_alt_finalize
+            .test_recipe_digest_with(
+                UbuntuRecipe::SERVICE,
+                &alt_finalize,
+                UbuntuRecipe::NOCLOUD_PROFILE_PIN,
+                UbuntuRecipe::TEST_ROUTE_COMMAND,
+                DETACHED_HEALTH,
+            )
+            .unwrap(),
+        original
+    );
+    let mut alt_profile = UbuntuRecipe::NOCLOUD_PROFILE_PIN;
+    alt_profile.sha256[0] ^= 1;
+    recipe_alt_finalize.finalize = recipe.finalize;
+    recipe_alt_finalize.nocloud_schema = Some(alt_profile);
+    assert!(recipe_alt_finalize.test_recipe_digest().is_err());
+    assert_ne!(
+        recipe_alt_finalize
+            .test_recipe_digest_with(
+                UbuntuRecipe::SERVICE,
+                UbuntuRecipe::FINALIZE,
+                alt_profile,
+                UbuntuRecipe::TEST_ROUTE_COMMAND,
+                DETACHED_HEALTH,
+            )
+            .unwrap(),
+        original
+    );
+    let alt_health = format!("{DETACHED_HEALTH}\n");
+    assert_ne!(
+        recipe
+            .test_recipe_digest_with(
+                UbuntuRecipe::SERVICE,
+                UbuntuRecipe::FINALIZE,
+                UbuntuRecipe::NOCLOUD_PROFILE_PIN,
+                UbuntuRecipe::TEST_ROUTE_COMMAND,
+                &alt_health,
+            )
+            .unwrap(),
+        original
+    );
+
+    // Shared base Ubuntu seed and static-web seed/recipe goldens stay unchanged.
+    let build = [0x5a; 16];
+    let base_seed = recipe.render_seed(build, guest).unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(&base_seed)),
+        "08fd082e494459e6a3ed24857ee59b4039feaf312b32e74ebc1d740a6aa66755"
+    );
+    let packages = [
+        PoolPackage {
+            name: "nginx-common",
+            version: "1.24.0-2ubuntu7.1",
+            relative_path: "pool/main/n/nginx/nginx-common_all.deb",
+            artifact: ArtifactPin {
+                size: 24,
+                sha256: [
+                    0x2b, 0xec, 0x25, 0x98, 0x51, 0x17, 0xff, 0x20, 0xab, 0xeb, 0xef, 0x50, 0xc1,
+                    0x16, 0xa5, 0x65, 0xde, 0x44, 0xb7, 0xd2, 0x38, 0xbd, 0xcb, 0x25, 0x9a, 0xbd,
+                    0x93, 0xbd, 0xd2, 0x92, 0xf7, 0xa5,
+                ],
+            },
+        },
+        PoolPackage {
+            name: "nginx",
+            version: "1.24.0-2ubuntu7.1",
+            relative_path: "pool/main/n/nginx/nginx_amd64.deb",
+            artifact: ArtifactPin {
+                size: 17,
+                sha256: [
+                    0x17, 0x37, 0x8f, 0xea, 0x18, 0x6a, 0xbd, 0x99, 0x24, 0xc3, 0xb3, 0x32, 0x72,
+                    0x85, 0xd2, 0x27, 0xe6, 0x29, 0xa2, 0x5e, 0x1d, 0xb3, 0xc1, 0x23, 0x85, 0xe0,
+                    0x4c, 0x5b, 0x1f, 0xa3, 0x62, 0x85,
+                ],
+            },
+        },
+    ];
+    let manifest = IsoPoolManifest {
+        iso: iso_pin,
+        signed_metadata: ArtifactPin {
+            size: 17,
+            sha256: [0x83; 32],
+        },
+        packages: &packages,
+    };
+    let web = UbuntuWebRecipe::qualify(
+        &recipe,
+        Some(PROFILE_PIN),
+        &manifest,
+        Some(manifest.canonical_pin().unwrap()),
+        &OkVerifier,
+    )
+    .unwrap();
+    let web_seed = web.render_seed(build, guest).unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(&web_seed)),
+        "5cfdb57ec055450f90a6349d8ed5cc4f2fcee7dbb829f9a370872ad9476adfc0"
+    );
+    assert_eq!(
+        hex::encode(web.recipe_digest()),
+        "807f245f5b0d20fa2c44054e70f108a56b1ddc2924f9186979ad54d96285e00f"
+    );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn arxnet3_witness_seed_script_behavior_with_fake_sockets_and_tools() {
+    use crate::vm::qualification_record::ProbeOutcome;
+    use crate::vm::{guest::network_probe::witness_response, qmp::ChannelError};
+    use std::collections::BTreeMap;
+    use std::net::SocketAddr;
+    use std::process::{Command, Stdio};
+
+    let nonce = [0xab; 16];
+    let tcp: [SocketAddr; 3] = [
+        "192.0.2.10:40001".parse().unwrap(),
+        "[2001:db8::10]:40002".parse().unwrap(),
+        "10.0.2.2:40003".parse().unwrap(),
+    ];
+    let udp: [SocketAddr; 3] = [
+        "192.0.2.10:40004".parse().unwrap(),
+        "[2001:db8::10]:40005".parse().unwrap(),
+        "10.0.2.2:40006".parse().unwrap(),
+    ];
+    let dns: SocketAddr = "192.0.2.53:53".parse().unwrap();
+
+    let iso = network_witness_seed_for(&nonce, tcp, udp, dns).unwrap();
+    let emitted = extract_probe_script_from_cidata(&iso);
+    let meta = serde_json::json!({
+        "nonce": hex::encode(nonce),
+        "tcp": tcp.map(|a| (a.ip().to_string(), a.port())),
+        "udp": udp.map(|a| (a.ip().to_string(), a.port())),
+        "dns": (dns.ip().to_string(), dns.port()),
+    })
+    .to_string();
+
+    let mut child = Command::new(python_executable())
+        .args([
+            "-I",
+            "-B",
+            "-c",
+            include_str!("witness_script_fixture.py"),
+            "arxnet3",
+            &meta,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Python 3 is required for witness script behavioral tests");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(emitted.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let frames: BTreeMap<String, String> = serde_json::from_slice(&output.stdout).unwrap();
+
+    // Feed the exact emitted ARXNET3 frames into Rust's witness_response parser.
+    let reachable = witness_response(frames["reachable"].as_bytes(), &nonce)
+        .await
+        .unwrap();
+    assert!(reachable.gateway_reachable);
+    assert_eq!(reachable.validated_attempts, 8);
+    assert_eq!(
+        reachable.diagnostic.outcomes,
+        [
+            ProbeOutcome::TimedOut,
+            ProbeOutcome::Ipv6PathAbsent,
+            ProbeOutcome::RefusedOrReset,
+            ProbeOutcome::DatagramSent,
+            ProbeOutcome::Ipv6PathAbsent,
+            ProbeOutcome::DatagramSent,
+            ProbeOutcome::DatagramSent,
+            ProbeOutcome::DatagramSent,
+        ]
+    );
+
+    for key in [
+        "gateway_stale",
+        "gateway_wrong_ip",
+        "gateway_no_lladdr",
+        "gateway_cmd_fail",
+    ] {
+        let parsed = witness_response(frames[key].as_bytes(), &nonce)
+            .await
+            .unwrap();
+        assert!(!parsed.gateway_reachable, "{key}");
+        assert_eq!(parsed.validated_attempts, 8, "{key}");
+    }
+
+    for (key, idx) in [
+        ("ipv4_tcp_local_err", 0),
+        ("ipv4_udp_local_err", 3),
+        ("ipv4_udp_short_send", 5),
+        ("ipv4_dns_local_err", 6),
+    ] {
+        let parsed = witness_response(frames[key].as_bytes(), &nonce)
+            .await
+            .unwrap();
+        assert_eq!(
+            parsed.diagnostic.outcomes[idx],
+            ProbeOutcome::SocketError,
+            "{key}"
+        );
+        assert_eq!(parsed.validated_attempts, 7, "{key}");
+    }
+
+    for key in [
+        "absent_no_lease",
+        "absent_no_route",
+        "absent_no_nic",
+        "absent_global_v6",
+    ] {
+        let parsed = witness_response(frames[key].as_bytes(), &nonce)
+            .await
+            .unwrap();
+        assert!(!parsed.gateway_reachable, "{key}");
+        assert_eq!(parsed.validated_attempts, 0, "{key}");
+        assert!(
+            parsed
+                .diagnostic
+                .outcomes
+                .iter()
+                .all(|o| *o == ProbeOutcome::NotAttempted),
+            "{key}"
+        );
+    }
+
+    for (key, idx, expected) in [
+        ("malformed_dns_short", 6, ProbeOutcome::MalformedReply),
+        ("malformed_dns_wrong_id", 6, ProbeOutcome::MalformedReply),
+        ("malformed_dns_tc", 7, ProbeOutcome::MalformedReply),
+        ("valid_dns_reply", 6, ProbeOutcome::Reachable),
+        ("unexpected_tcp_connect", 0, ProbeOutcome::Reachable),
+    ] {
+        let parsed = witness_response(frames[key].as_bytes(), &nonce)
+            .await
+            .unwrap();
+        assert_eq!(parsed.diagnostic.outcomes[idx], expected, "{key}");
+        assert_eq!(parsed.validated_attempts, 7, "{key}");
+    }
+
+    assert!(matches!(
+        witness_response(frames["absent_port"].as_bytes(), &nonce).await,
+        Err(ChannelError::Eof)
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn installed_ubuntu_witness_script_behavior_with_fake_sockets_and_tools() {
+    use std::net::SocketAddr;
+    use std::process::{Command, Stdio};
+
+    let nonce = [0xcd; 16];
+    let tcp: [SocketAddr; 3] = [
+        "192.0.2.10:41001".parse().unwrap(),
+        "[2001:db8::10]:41002".parse().unwrap(),
+        "10.0.2.2:41003".parse().unwrap(),
+    ];
+    let udp: [SocketAddr; 3] = [
+        "192.0.2.10:41004".parse().unwrap(),
+        "[2001:db8::10]:41005".parse().unwrap(),
+        "10.0.2.2:41006".parse().unwrap(),
+    ];
+    let dns: SocketAddr = "192.0.2.53:53".parse().unwrap();
+
+    let shell_script = installed_witness_script_for(nonce, tcp, udp, dns).unwrap();
+    #[cfg(unix)]
+    {
+        let mut sh = Command::new("sh")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        sh.stdin
+            .take()
+            .unwrap()
+            .write_all(shell_script.as_bytes())
+            .unwrap();
+        let res = sh.wait_with_output().unwrap();
+        assert!(
+            res.status.success(),
+            "sh -n failed: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+    }
+
+    let python_body = shell_script
+        .strip_prefix("set -eu\n/usr/bin/python3 - <<'ARX_NETWORK'\n")
+        .expect("installed script shell wrapper prefix")
+        .strip_suffix("\nARX_NETWORK")
+        .expect("installed script heredoc suffix");
+    let meta = serde_json::json!({
+        "nonce": hex::encode(nonce),
+        "tcp": tcp.map(|a| (a.ip().to_string(), a.port())),
+        "udp": udp.map(|a| (a.ip().to_string(), a.port())),
+        "dns": (dns.ip().to_string(), dns.port()),
+    })
+    .to_string();
+
+    let mut child = Command::new(python_executable())
+        .args([
+            "-I",
+            "-B",
+            "-c",
+            include_str!("witness_script_fixture.py"),
+            "installed",
+            &meta,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Python 3 is required for installed witness script behavioral tests");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(python_body.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
