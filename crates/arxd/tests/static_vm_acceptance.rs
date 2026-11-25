@@ -62,8 +62,6 @@ enum Failure {
     #[cfg(all(windows, target_arch = "x86_64"))]
     SessionProcessMismatch,
     #[cfg(all(windows, target_arch = "x86_64"))]
-    StoreComposeConflict,
-    #[cfg(all(windows, target_arch = "x86_64"))]
     PublicPublishingEnabled,
     RefusalMismatch(&'static str),
     OriginResponseMismatch(&'static str),
@@ -89,6 +87,10 @@ struct StaticPlan {
     store: ExpectedVmStore,
     qualification_sha256: String,
     m4_qualification_sha256: String,
+    network_receipt: PathBuf,
+    network_receipt_sha256: String,
+    #[serde(default)]
+    witness_dir: Option<PathBuf>,
     evidence_dir: PathBuf,
     backup_root: PathBuf,
     restore_dir: PathBuf,
@@ -102,6 +104,8 @@ struct StaticPlan {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StaticVmSpec {
+    vm_id: String,
+    generation: String,
     name: String,
     recipe_id: String,
     recipe_sha256: String,
@@ -208,6 +212,7 @@ impl StaticPlan {
         for path in [
             &self.daemon,
             &self.origin_ca_path,
+            &self.network_receipt,
             &self.daemon_config,
             &self.client_config,
             &self.evidence_dir,
@@ -216,6 +221,7 @@ impl StaticPlan {
             &self.public_egress.policy_path,
         ]
         .into_iter()
+        .chain(self.witness_dir.as_ref())
         .chain(self.compose.primary.admin_password_file.as_ref())
         {
             let raw = path.to_str().ok_or(Failure::Check("d_drive_path"))?;
@@ -230,6 +236,15 @@ impl StaticPlan {
             opaque_hex(&self.store.volume_serial, 16)
                 && opaque_hex(&self.store.directory_file_id, 32),
             "store_identity",
+        )?;
+        check(
+            opaque_nonzero_hex(&self.static_vm.vm_id, 32)
+                && opaque_nonzero_hex(&self.static_vm.generation, 32),
+            "enrolled_vm_pin",
+        )?;
+        check(
+            opaque_nonzero_hex(&self.network_receipt_sha256, 64),
+            "network_receipt_pin",
         )?;
         check(self.idle_delay_s <= 900, "idle_delay_bound")?;
         check(opaque_hex(&self.daemon_sha256, 64), "daemon_sha256")?;
@@ -1088,21 +1103,174 @@ fn verify_backup_restore_event(
     }))
 }
 
+fn verify_public_witness(request: &Value, response: &Value) -> Result<()> {
+    check(
+        request["version"] == 1
+            && response["version"] == 1
+            && opaque(&request["challenge"], 32).is_some()
+            && response["challenge"] == request["challenge"]
+            && response["phase"] == request["phase"],
+        "public_witness_binding",
+    )?;
+    let reference = &request["reference"];
+    if request["phase"] == "cleanup" {
+        return check(
+            response["connector_stopped"] == true
+                && response["owned_dns_absent"] == 2
+                && response["names_no_longer_serve"] == 2,
+            "public_cleanup_witness",
+        );
+    }
+    let body_hashes = response["marker_body_sha256"]
+        .as_array()
+        .ok_or(Failure::Check("public_markers"))?;
+    check(
+        matches!(request["phase"].as_str(), Some("first" | "republished"))
+            && response["matching_markers"] == 2
+            && body_hashes.len() == 2
+            && body_hashes.iter().all(|v| opaque(v, 64).is_some())
+            && body_hashes[0] != body_hashes[1],
+        "public_markers",
+    )?;
+    let start = reference["start"]
+        .as_u64()
+        .ok_or(Failure::Check("public_range"))?;
+    let end = reference["end"]
+        .as_u64()
+        .ok_or(Failure::Check("public_range"))?;
+    let total = reference["total"]
+        .as_u64()
+        .ok_or(Failure::Check("public_range"))?;
+    check(
+        start <= end
+            && end < total
+            && response["full_status"] == 200
+            && response["full_sha256"] == reference["full_sha256"]
+            && response["partial_status"] == 206
+            && response["partial_sha256"] == reference["range_sha256"]
+            && response["content_range"] == format!("bytes {start}-{end}/{total}")
+            && response["content_length"] == end - start + 1
+            && response["accept_ranges"] == "bytes"
+            && response["unsatisfiable_status"] == 416
+            && response["unsatisfiable_range"] == format!("bytes */{total}"),
+        "public_range",
+    )
+}
+
+#[test]
+fn external_witness_rejects_replay_bad_content_and_incomplete_cleanup() {
+    let req = json!({"version":1,"phase":"first","challenge":"12".repeat(16),"reference":{"start":2,"end":3,"total":8,"full_sha256":"aa".repeat(32),"range_sha256":"ab".repeat(32)}});
+    let res = json!({"version":1,"phase":"first","challenge":req["challenge"],"matching_markers":2,"marker_body_sha256":["cd".repeat(32),"ce".repeat(32)],"full_status":200,"full_sha256":req["reference"]["full_sha256"],"partial_status":206,"partial_sha256":req["reference"]["range_sha256"],"content_range":"bytes 2-3/8","content_length":2,"accept_ranges":"bytes","unsatisfiable_status":416,"unsatisfiable_range":"bytes */8"});
+    assert_eq!(verify_public_witness(&req, &res), Ok(()));
+    for field in [
+        "phase",
+        "challenge",
+        "matching_markers",
+        "partial_sha256",
+        "content_range",
+        "unsatisfiable_range",
+    ] {
+        let mut bad = res.clone();
+        bad[field] = Value::Null;
+        assert!(verify_public_witness(&req, &bad).is_err());
+    }
+    let mut req = req;
+    req["phase"] = json!("cleanup");
+    let mut off = json!({"version":1,"phase":"cleanup","challenge":req["challenge"],"connector_stopped":true,"owned_dns_absent":2,"names_no_longer_serve":2});
+    assert_eq!(verify_public_witness(&req, &off), Ok(()));
+    off["owned_dns_absent"] = json!(1);
+    assert!(verify_public_witness(&req, &off).is_err());
+}
+
+/// The owner pins the separately reviewed Design §2 receipt. A request sent by a UDP socket
+/// alone is not a delivery witness. The qualification records replies and destination captures.
+fn verify_network_receipt(plan: &StaticPlan, bytes: &[u8]) -> Result<()> {
+    check(
+        bytes.len() <= 65_536 && hex::encode(Sha256::digest(bytes)) == plan.network_receipt_sha256,
+        "network_receipt_pin",
+    )?;
+    let r: Value =
+        serde_json::from_slice(bytes).map_err(|_| Failure::Check("network_receipt_format"))?;
+    let spec = &plan.public_egress;
+    check(
+        r["version"] == 1
+            && r["qualification_sha256"] == plan.qualification_sha256
+            && r["m4_qualification_sha256"] == plan.m4_qualification_sha256
+            && r["recipe_sha256"] == plan.static_vm.recipe_sha256
+            && r["policy_sha256"] == spec.policy_sha256
+            && r["qemu_sha256"] == spec.qemu_sha256,
+        "network_receipt_binding",
+    )?;
+    check(
+        r["static"]["tcp_target"] == spec.public_tcp_target
+            && r["static"]["dns_target"] == spec.public_dns_target
+            && r["static"]["public_tcp_connected"] == true
+            && r["static"]["udp_dns_answer"] == true
+            && r["static"]["ipv6_disabled"] == true
+            && r["static"]["root_capable_fixture"] == true
+            && r["static"]["route_drift_closed"] == true,
+        "static_network_controls",
+    )?;
+    let rows = r["static"]["denied"]
+        .as_array()
+        .ok_or(Failure::Check("network_denials"))?;
+    check(
+        rows.len() == spec.denied_targets.len()
+            && spec.denied_targets.iter().all(|target| {
+                rows.iter()
+                    .filter(|row| {
+                        row["target"] == *target
+                            && row["tcp_connected"] == false
+                            && row["udp_replied"] == false
+                            && row["witness_tcp_arrivals"] == 0
+                            && row["witness_udp_arrivals"] == 0
+                    })
+                    .count()
+                    == 1
+            }),
+        "network_denials",
+    )?;
+    check(
+        r["test"]["network_class"] == "restricted"
+            && r["test"]["tcp_target"] == spec.public_tcp_target
+            && r["test"]["dns_target"] == spec.public_dns_target
+            && r["test"]["public_tcp_connected"] == false
+            && r["test"]["udp_dns_answer"] == false
+            && r["test"]["witness_tcp_arrivals"] == 0
+            && r["test"]["witness_udp_arrivals"] == 0,
+        "test_network_isolation",
+    )
+}
+
+#[test]
+fn reviewed_receipt_requires_each_transport_and_test_isolation() {
+    let mut plan = StaticPlan::parse_bytes(sample_plan_json().to_string().as_bytes()).unwrap();
+    let e = &plan.public_egress;
+    let denied:Vec<_>=e.denied_targets.iter().map(|t|json!({"target":t,"tcp_connected":false,"udp_replied":false,"witness_tcp_arrivals":0,"witness_udp_arrivals":0})).collect();
+    let r = json!({"version":1,"qualification_sha256":plan.qualification_sha256,"m4_qualification_sha256":plan.m4_qualification_sha256,"recipe_sha256":plan.static_vm.recipe_sha256,"policy_sha256":e.policy_sha256,"qemu_sha256":e.qemu_sha256,"static":{"tcp_target":e.public_tcp_target,"dns_target":e.public_dns_target,"public_tcp_connected":true,"udp_dns_answer":true,"ipv6_disabled":true,"root_capable_fixture":true,"route_drift_closed":true,"denied":denied},"test":{"network_class":"restricted","tcp_target":e.public_tcp_target,"dns_target":e.public_dns_target,"public_tcp_connected":false,"udp_dns_answer":false,"witness_tcp_arrivals":0,"witness_udp_arrivals":0}});
+    let mut verify = |value: &Value| {
+        let bytes = serde_json::to_vec(value).unwrap();
+        plan.network_receipt_sha256 = hex::encode(Sha256::digest(&bytes));
+        verify_network_receipt(&plan, &bytes)
+    };
+    assert_eq!(verify(&r), Ok(()));
+    for path in [
+        "/static/denied/0/tcp_connected",
+        "/static/denied/1/udp_replied",
+        "/test/udp_dns_answer",
+        "/static/denied/0/witness_udp_arrivals",
+        "/qemu_sha256",
+    ] {
+        let mut bad = r.clone();
+        *bad.pointer_mut(path).unwrap() = json!(true);
+        assert!(verify(&bad).is_err(), "{path}");
+    }
+}
+
 /// Save a strictly allowlisted projection, never hostnames, script bodies,
 /// raw paths, credentials, IPs, or arbitrary MCP text.
 fn operation_evidence(response: &Value) -> Value {
     let mut out = json!({});
-    for key in [
-        "operation_id",
-        "vm_id",
-        "template_id",
-        "recipe_id",
-        "backup_id",
-    ] {
-        if let Some(id) = opaque(&response[key], 32) {
-            out[key] = json!(id);
-        }
-    }
     if let Some(sha) = opaque(&response["sha256"], 64) {
         out["sha256"] = json!(sha);
     }
@@ -1163,9 +1331,6 @@ fn operation_evidence(response: &Value) -> Value {
 
 fn publish_status_evidence(response: &Value) -> Value {
     let mut out = json!({});
-    if let Some(vm) = opaque(&response["vm_id"], 32) {
-        out["vm_id"] = json!(vm);
-    }
     for phase in [
         "unpublished",
         "publishing",
@@ -1198,9 +1363,6 @@ fn compose_status_evidence(response: &Value) -> Value {
     }
     if let Some(current) = response["current_boot"].as_bool() {
         out["current_boot"] = json!(current);
-    }
-    if let Some(op) = opaque(&response["operation_id"], 32) {
-        out["operation_id"] = json!(op);
     }
     out["recovery_required"] = json!(!response["recovery"].is_null());
     out
@@ -1253,8 +1415,12 @@ fn sample_plan_json() -> Value {
         "evidence_dir": "D:/acceptance/evidence",
         "backup_root": "D:/acceptance/backups",
         "restore_dir": "D:/acceptance/restore",
+        "network_receipt": "D:/acceptance/private/network.json",
+        "network_receipt_sha256": "73".repeat(32),
         "idle_delay_s": 0,
         "static_vm": {
+            "vm_id": "71".repeat(16),
+            "generation": "72".repeat(16),
             "name": "calm-life-static",
             "recipe_id": "44".repeat(16),
             "recipe_sha256": "55".repeat(32)
@@ -2182,9 +2348,6 @@ fn evidence_projections_drop_hostnames_passwords_paths_ips_and_scripts() {
     assert_eq!(
         op,
         json!({
-            "operation_id": "aa".repeat(16),
-            "vm_id": "bb".repeat(16),
-            "backup_id": "cc".repeat(16),
             "action": "compose_backup",
             "state": "succeeded",
             "size_bytes": 4096,
@@ -2200,10 +2363,7 @@ fn evidence_projections_drop_hostnames_passwords_paths_ips_and_scripts() {
         "hostname": "calm.example.invalid",
         "tunnel_id": "secret-tunnel"
     }));
-    assert_eq!(
-        pub_ev,
-        json!({"vm_id": "bb".repeat(16), "phase": "unpublished", "host_count": 0})
-    );
+    assert_eq!(pub_ev, json!({"phase": "unpublished", "host_count": 0}));
 
     let compose_ev = compose_status_evidence(&json!({
         "desired": "started",

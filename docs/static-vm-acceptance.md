@@ -1,106 +1,33 @@
-# Static VM and Compose owner-host acceptance
+# Static VM and Compose owner acceptance
 
-Run this journey on the enrolled Windows x64 host under the owner's non-elevated
-console login, after the [host runbook](dev-host-setup.md), [M4 acceptance](m4-acceptance.md),
-and independently reviewed native static-VM, Compose recipe, and patched
-QEMU/libslirp public-egress qualification are complete. The Rust integration
-test keeps the physical journey owner-run (`#[ignore]`). Its deterministic
-checks run in normal CI with fakes.
+The local journey checks Calm Life and a synthetic second project through a PID-bound, authenticated foreground MCP session. A separate ignored test drives the public tunnel. Both require a qualified Windows x64 host and the owner's non-elevated login. Native Docker, public-only networking, Windows custody, persistence and Cloudflare publishing remain **unverified on real hardware**. The product gaps below currently prevent a live acceptance claim. See [ADR 0058](adr/0058-v1-scope-static-vms-and-cloudflare.md), [ADR 0064](adr/0064-v1-scope-docker-static-vm.md) and the [M4 host procedure](m4-acceptance.md).
 
-All owner-host static-VM paths — guest Docker, patched QEMU/libslirp public
-egress, Windows DPAPI/NTFS custody, live VM persistence and restore, and
-Cloudflare Tunnel publishing — are **unverified on real hardware**.
+## Enroll a dedicated acceptance VM
 
-## Scope and boundaries
+1. Complete M4 host setup, independently review the M4 and patched public-egress qualification receipts, and qualify the digest-pinned Calm Life release. Prepare a new isolated state directory on D: and enroll its volume and directory identities using the M4 procedure. Never select an existing owner workload for this journey.
+2. Start the qualified foreground daemon against that store with one acceptance principal, no Compose releases and no publication configuration. Use the authenticated local MCP client to call `vm_catalog`. Select the qualified Ubuntu Compose recipe and its sealed template. If needed call `vm_template_build` with the catalog recipe ID and a fresh request key, then poll `vm_operation` until it succeeds. Mutation keys consist of 16 lowercase hexadecimal digits for current Unix milliseconds followed by 16 random hexadecimal digits. Reuse the same key only for a retry of the same request.
+3. Call `static_vm_create` with that template ID, a unique acceptance name and a new request key. Poll the returned operation to success. Verify `static_vm_get` reports the expected VM ID, name, stopped state and recipe digest. Drain the bootstrap daemon. In the stopped owner-private ledger, use a read-only SQLite connection to run `SELECT lower(hex(id)) FROM vm_generations WHERE lower(hex(static_id)) = ? AND active = 1` with the acceptance VM ID as parameter. Put that generation and VM ID into the private plan.
+4. Prepare the workload foreground config for the same store, endpoint and principal. Set `test_vms.compose_secret_root` to a disjoint owner-private directory. Supply the current-user DPAPI ciphertext named `<reference>.dpapi` for the workload's admin secret. In `test_vms.compose_releases`, supply exactly the two qualified entries. Each has this VM's `vm_id`, its own `release_id`, the typed `manifest` (including `project_id`), and the enrolled `secrets` slot/epoch/reference list when needed. Use the reviewed image digests and actual workload configuration. On the driver's next daemon launch, arxd enrolls these releases against the already committed static VM. Before boot the client verifies both release rows, the caller, name, recipe, template and generation.
+5. For the default-off run **omit** both `allow_agent_public_sites` and `publication` from `test_vms`. Leave `expected_store` out of the source profile. The client inserts the independent store pin into a private launch copy. Supply existing disjoint owner-private evidence, backup and restore directories. Keep credential files private, local and outside those roots. Plan and config paths must be on D: without reparse points.
 
-This runbook covers the v1 static-VM and Docker/Compose acceptance criteria in
-[ADR 0058](adr/0058-v1-scope-static-vms-and-cloudflare.md),
-[ADR 0064](adr/0064-v1-scope-docker-static-vm.md),
-[ADR 0067](adr/0067-vm-store-v12-compose-host.md),
-[ADR 0069](adr/0069-vm-store-v13-multihost-publish.md),
-[ADR 0070](adr/0070-vm-store-v14-compose-backup.md), and
-[ADR 0071](adr/0071-vm-store-v15-compose-backup-retirement.md):
+## Qualify static egress and TEST isolation
 
-- **Compose static VM serving two configured names:** deploy the primary
-  workload (Calm Life) and a synthetic second service on the static Ubuntu
-  Compose VM; verify direct TLS over the localhost-only forward using the
-  custodied per-generation origin CA and pinned `originServerName`
-  (`arx-<generation>.invalid`) serves distinct HTTP 200 responses for each
-  configured `Host` and rejects unknown `Host` headers.
-- **Byte-range behaviour:** verify full GET returns `200` with
-  `Accept-Ranges: bytes`, a single valid `Range` returns `206` with exact
-  `Content-Range`, `Content-Length`, and byte slice, an unsatisfiable range
-  returns `416` with `Content-Range: bytes */<length>`, and `If-Range` matches
-  or falls back to `200` when ETag is present.
-- **SQLite persistence across restart and offline backup restore:** verify
-  unauthenticated admin access is refused, ingest a synthetic SQLite event,
-  create a protected host SQLite backup via `compose_backup`, restart the
-  static VM (`vm_stop` -> `vm_start`) and confirm the event survives on the
-  persistent volume, then restore the settled host backup offline into a
-  disjoint disposable target directory and confirm `PRAGMA quick_check`,
-  exact SHA-256, portable DELETE journal mode, event presence, and unchanged
-  settled backup source bytes.
-- **Agent delete fence:** verify `list_tools` exposes none of the forbidden
-  delete/restore/host-execution tools and direct calls to `static_vm_delete`,
-  `vm_delete`, `backup_delete`, `vm_backup_delete`, `compose_backup_delete`,
-  `compose_volume_delete`, `compose_project_delete`, `compose_backup_restore`,
-  `vm_snapshot_delete` (against an owned Compose backup ID), `run_command`,
-  and `discover_tools` return their exact typed refusal codes while leaving
-  the static VM, Compose volumes, and settled backup intact.
-- **Public-only egress:** verify the enrolled v1 public-egress policy file and
-  patched QEMU/libslirp pin (refusing stock QEMU 11.1.3 bytes), require
-  daemon attestation of Design §2 network qualification, and verify inside the
-  guest that IPv6 is disabled, public IPv4 TCP/UDP work, and slirp aliases
-  (`10.0.2.2`, `10.0.2.3`), link-local (`169.254/16`), CGNAT (`100.64/10`),
-  private RFC1918, and enrolled host/LAN/hairpin targets are refused.
-- **Public publishing default off:** keep `allow_agent_public_sites: false`
-  with no `publication` block in the foreground profile; verify `publish_site`
-  refuses with `public_sites_disabled`, `publish_status` reports `unpublished`
-  with `host_count: 0`, and `vm_publication` / `vm_publication_hosts` remain
-  empty.
+Use the independently supervised, disposable network qualification fixture described in Design §2 of ADR 0064. The Compose guest disables agent scripts. Perform these observations using the owner's fixture console or offline-provisioned qualification payload. Keep the deployed Compose image and the agent interface intact. If a qualified fixture entry point or capture is unavailable, stop here.
 
-## Cloudflare Tunnel publishing (ADR 0058)
+1. On the qualified Windows route and patched binary, operate benign witness listeners with receiver-side captures. Establish the positive controls from a permitted source. Use an owned public TCP service and public recursive UDP DNS resolver. Include the synthetic gateway and DNS aliases, host interfaces and endpoints, gateway, private, link-local and CGNAT destinations, enrolled public-numbered LAN and WAN hairpin. Bind the listed ports to the agreed controls. Capture the corresponding path for alias translations. For the TEST comparison, use the same working public endpoints in the restricted TEST recipe. Use the actual approved targets only.
+2. Copy **only** the `public_egress` target inventory (the three keys `public_tcp_target`, `public_dns_target`, `denied_targets`) and [the network observer](../tools/acceptance/static_network_witness.py) to the private fixture. Run the following commands on their respective fixtures. The static observer attempts TCP and a UDP DNS datagram to every denial target. The TEST observer checks public TCP and UDP DNS. A UDP send without a validated positive-control DNS response cannot pass the static measurement.
 
-Cloudflare Tunnel publishing stays **off** throughout this acceptance driver.
-The driver refuses to launch if `allow_agent_public_sites` is `true` or a
-`publication` block is present. It **never** contacts the real Cloudflare API,
-never launches `cloudflared`, and requires no Cloudflare token or DNS
-credential.
+   ```sh
+   python3 static_network_witness.py --owner-qualification-fixture --role static inventory.json static.json
+   python3 static_network_witness.py --owner-qualification-fixture --role test inventory.json test.json
+   ```
 
-Live Cloudflare Tunnel publishing (`allow_agent_public_sites: true`, real
-`cloudflared`, real DNS record creation, multi-hostname public HTTPS through
-the tunnel, and unpublish cleanup) is a separate owner-authorized step after
-M4 and static-VM acceptance qualify, and remains **unverified on real
-hardware**.
+3. Complete the rest of Design §2 in the separately qualified root-capable test environment. Exercise the static guest and its container, local firewall removal and DNS/route changes, pre/post-translation denial, DNS rebinding and UDP peer changes, IPv6 disabled, route drift during traffic, public TCP/UDP/DNS, and the localhost-only inbound forward. Verify the corresponding Windows/receiver capture records no forbidden connection or datagram, including traffic to the host services and through the slirp aliases. Record whether the gate closed on drift. A timeout or an unavailable listener alone is insufficient.
+4. Assemble an owner-private JSON receipt with integer `version: 1` and the exact `qualification_sha256`, `m4_qualification_sha256`, `recipe_sha256`, `policy_sha256` and patched `qemu_sha256` from this reviewed qualification. Under `static` put the static observer's JSON. Add the observed `root_capable_fixture`, `ipv6_disabled` and `route_drift_closed` booleans, and the independently measured integer `witness_tcp_arrivals` and `witness_udp_arrivals` to **each** denial row. Under `test` put the TEST observer's JSON and its public controls' measured `witness_tcp_arrivals` and `witness_udp_arrivals`. Retain capture evidence privately. An independent reviewer checks the receipt against the qualification and captures. Put the reviewed file's path and SHA-256 into the plan. The driver checks the pins and all transport outcomes before daemon launch.
 
-The local HTTPS checks cover the origin only. ADR 0064 also requires an independent
-public client, video seeking, cache and forwarded-client-IP checks, explicit republish
-after restart, and removal of local ingress and owned DNS on unpublish. These remain
-open owner checks. The guest probe exercises a subset of Design §2. The independent
-network qualification must also cover container traffic, UDP destination enforcement,
-TEST isolation, route drift under traffic and the other §2 witnesses.
+## Private local journey plan
 
-## Owner-private plan
-
-Prepare an owner-private JSON plan on `D:`. All paths (`daemon`,
-`daemon_config`, `client_config`, `evidence_dir`, `backup_root`, `restore_dir`,
-`public_egress.policy_path`, `origin_ca_path`, and `admin_password_file`) must be local
-`D:` paths without reparse points. `state_dir`, `evidence_dir`, `backup_root`,
-and `restore_dir` must be four mutually disjoint directories. Use a fresh
-acceptance store with no existing static or TEST VMs. A repeat requires a new
-isolated enrollment. Provision the origin CA as DER at the owner-specified path
-and supply a private HTTP bearer credential for the qualified workload.
-Ensure the guest has bash, timeout and dig. Supply a reachable TCP witness,
-a public recursive IPv4 DNS resolver, and approved denial witnesses with
-known-live services. Include the enrolled uplink source and gateway, an
-RFC1918 destination, the public-numbered LAN and the WAN hairpin.
-
-`qualification_sha256` is an expected pin only: the client records it only
-after an authenticated, PID-verified daemon `vm_catalog` response presents a
-matching M4 `selected_test_qualification` digest and a `selected_static_qualification` receipt covering both the Compose
-recipe and the non-stock patched public-egress build and policy.
-
-Paths and values below are placeholders:
+Replace all placeholders with the qualified private values. The bearer credential applies to the workload HTTP admin endpoint. The origin CA file contains the current generation's DER certificate.
 
 ```json
 {
@@ -119,9 +46,13 @@ Paths and values below are placeholders:
   "evidence_dir": "D:/acceptance/evidence",
   "backup_root": "D:/acceptance/backups",
   "restore_dir": "D:/acceptance/restore",
+  "network_receipt": "D:/acceptance/private/reviewed-network.json",
+  "network_receipt_sha256": "<digest of the reviewed network receipt>",
   "idle_delay_s": 660,
   "static_vm": {
     "name": "calm-life-static",
+    "vm_id": "<dedicated acceptance VM ID>",
+    "generation": "<active generation ID>",
     "recipe_id": "<Ubuntu Compose recipe ID (32 lowercase hex)>",
     "recipe_sha256": "<Ubuntu Compose recipe SHA-256>"
   },
@@ -172,76 +103,56 @@ Paths and values below are placeholders:
 }
 ```
 
-## Running the owner journey
+## Run the local journey
 
-Use this command only after the product gaps below close and the owner has
-reviewed the daemon and qualification digests. The daemon starts to verify
-its authenticated catalog. VM mutations begin only after the receipt matches.
-
-Set [build scratch paths on D:](dev-scratch.md), verify at least 20 GB free on
-`C:`, keep the console active and unlocked, and build ahead of the idle window:
+Use [D: build scratch](dev-scratch.md) and verify the host reserve. Keep the owner's console unlocked and idle during the configured delay.
 
 ```powershell
 $env:ARX_STATIC_VM_ACCEPTANCE_PLAN = 'D:/acceptance/private/static-plan.json'
-cargo test --locked -p arxd --test static_vm_acceptance --no-run -j 3
-cargo test --locked -p arxd --test static_vm_acceptance -j 3 -- owner::owner_host_static_vm --exact --ignored --nocapture
+cargo test --locked -p arxd --test static_vm_acceptance -j 3 -- owner::owner_host_static_vm --exact --ignored
 ```
 
-The client reuses the M4 acceptance client's named-pipe transport,
-authentication, kernel server PID check (`bind_foreground_bridge`), enrolled
-volume/directory store pinning (`pin_store` / `EnrolledVmStore`), private
-Ctrl+C `Console` drain, and preflight schema-version checks (`VM_SCHEMA_VERSION`
-compiled from `crates/arxd/src/store/vm.rs`).
+Require a successful drain and successful owner evidence. The client demands a typed publishing refusal under the omitted setting and an empty publication ledger. It checks both HTTPS markers at the local origin, exact MP4 bytes and range headers (206/416), unavailable anonymous admin access, authenticated event visibility before and after VM restart, and the same event in a verified offline restore. Agent deletion of the static VM, project/volume and backup must be refused. The client checks the static disk/firmware identities, volume count and settled backup after the attempts. Leave the protected VM and backups in owner custody.
 
-## Evidence and redaction
+## Optional public tunnel journey
 
-Each run writes `acceptance.json` and its SHA-256 and byte length in
-`manifest.json` under `evidence_dir/<run_id>/`. Recorded evidence contains only
-opaque IDs, SHA-256 digests, typed refusal reasons, HTTP status codes, byte
-counts, and boolean predicates. Hostnames, admin passwords, DPAPI ciphertext or
-plaintext, guest script bodies, private LAN/host IPs, raw paths, and raw MCP
-transcripts are excluded and rejected by the client's sanitization check before
-writing.
+Only the owner runs this stage, after the default-off journey passes and the host and connector have qualified. Agents and CI use the fake transport tests. The local journey does not read tunnel credentials.
 
-## Current refusal behavior and product gaps before live runs
+1. Prepare a second private plan for the same VM, generation, qualified releases and receipt. Change `daemon_config` to an owner-private public profile. Add `witness_dir`, a fresh owner-private D: directory disjoint from state, secrets, backup, restore and evidence. In the public profile set `allow_agent_public_sites: true`. Supply the B2 `publication` block with the acceptance `static_name`, `host_id`, one `tunnel_id`, `account_id`, `zone_id`, `zone_name`, sorted exact `hostnames` and matching ordered `routes` entries. Each entry has `hostname`, `project_id`, `service`, `project_slot`, `service_index` and `route_slot`. Supply `private_root`, `dns_ciphertext`, `tunnel_ciphertext`, and the qualified `connector`, `connector_length`, `connector_sha256`. Use the two approved names in the enrolled zone, assigned to the respective projects. Keep the current-user credentials in their enrolled private ciphertext leaves. See [ADR 0069](adr/0069-vm-store-v13-multihost-publish.md).
+2. Prepare an independent public client on a different network with normal public DNS and trusted HTTPS roots. Transfer the [public observer](../tools/acceptance/static_public_witness.py) there. Keep the plan, workload credentials, VM identifiers and tunnel credentials on the owner host. Only the per-phase challenge and response need transferring.
+3. Start this exact ignored entry point in the owner console. Unset the opt-in after the run.
 
-Until M4 and static/Compose native activation land, running the owner journey
-fails closed at the earliest unmet gate:
+   ```powershell
+   $env:ARX_STATIC_VM_ACCEPTANCE_PLAN = 'D:/acceptance/private/public-plan.json'
+   $env:ARX_STATIC_VM_PUBLIC_TUNNEL = 'owner-opt-in'
+   try {
+       cargo test --locked -p arxd --test static_vm_acceptance -j 3 -- owner::owner_host_public_tunnel --exact --ignored
+   } finally {
+       Remove-Item Env:ARX_STATIC_VM_PUBLIC_TUNNEL
+   }
+   ```
 
-1. **Closed native admission (`admission_closed: qualification_missing`):**
-   `Supervisor::capability` in `crates/arxd/src/mcp/vm.rs` keeps native
-   admission closed behind an uninhabited `LaunchAuthority` until M4 and
-   public-egress qualification receipts are issued.
-2. **Daemon qualification receipt (`daemon_qualification_evidence_unavailable`):**
-   `vm_catalog` does not yet emit `capability.selected_static_qualification`
-   binding the reviewed qualification digest, the `ubuntu-noble-amd64-compose-v1`
-   recipe pin, and the patched `qemu-11.1.3-arx-public-egress-windows-x64`
-   binary/policy pins with `network_qualified: true`.
-3. **Static origin witness (`static_origin_evidence_unavailable`):**
-   `static_vm_get` does not yet emit `static_origin_witness` (bound to `vm_id`,
-   `generation`, `operation_id`, `witness_id`, `origin_port` in
-   `49152..=49215`, `origin_server_name`, `origin_ca_sha256`,
-   `network_class: "public_egress"`, and `policy_sha256`), and `StaticRow.ready`
-   is closed in non-test builds.
-4. **Enrolled store pin vs. Compose secret root (`store_compose_conflict`):**
-   `TestVms::validate` in `crates/arxd/src/config.rs` currently refuses
-   combining `expected_store` (injected by `pinned_vm_config`) with
-   `compose_secret_root` (`VmStoreComposeConflict`). Profiles requiring
-   DPAPI-backed `ADMIN_PASSWORD_FILE` delivery need product support for
-   co-pinning `expected_store` alongside a disjoint `compose_secret_root` (and
-   `backup_root`) before live runs with Compose secrets can use store pinning.
-5. **Closed production Compose & backup wiring:**
-   `Supervisor::open` does not yet enroll the `ubuntu-noble-amd64-compose-v1`
-   recipe slot, wire `BackupHost` custody/capacity or config fields for
-   `compose_backup_root` / `compose_backup_targets`, or attach live
-   `ComposeChannel` / `BackupSession` instances on static VM boot (see
-   [ADR 0070](adr/0070-vm-store-v14-compose-backup.md)). In addition,
-   `store::vm::compose::enroll` requires a committed `vm_static_instances` row
-   at daemon open, so fresh static-VM creation and initial Compose release
-   enrollment currently require either a pre-created static VM or a daemon
-   restart between `static_vm_create` and release enrollment.
+4. The driver starts the pinned VM, deploys both releases, publishes through authenticated MCP and checks the two owned DNS rows, one parent tunnel and both verified route slots. In the new private subdirectory of `witness_dir`, transfer `first-request.json` to the independent client. Inspect the two exact names and paths, then run the command below. Transfer `first-response.json` back to the same subdirectory using a private temporary filename and rename it atomically after transfer. Each phase waits up to 15 minutes. The driver checks the fresh challenge, distinct markers, full-body digest, exact 206 slice and headers, and 416 for an unsatisfiable range.
 
-If the foreground fails to drain cleanly or custody is uncertain, preserve the
-ledger, static VM media, and settled backups and follow the rollback and
-[owner backup retirement](dev-host-setup.md#retire-a-compose-backup)
-procedures. Never bypass agent delete refusals.
+   ```sh
+   python3 static_public_witness.py --owner-live-public-https first-request.json first-response.json
+   ```
+
+   During this first public window, exercise video seeking in the browser. Use the qualified workload's event and admin endpoints to ingest a fresh synthetic event, verify anonymous admin refusal and authenticated visibility. Confirm bypass of shared caching for private routes and that a synthetic forged forwarding header cannot replace the real client address at the trusted proxy boundary. Record these manual workload observations privately before returning the response.
+5. The driver stops and restarts the static VM, requires a new boot witness and empty publication state, and explicitly calls publish again. Repeat the same independent command and transfer using `republished-request.json` and `republished-response.json`. Verify the pre-restart event through the workload. No implicit republish qualifies.
+6. After unpublish, the driver requires an empty local publication ledger and unpublished status. When `cleanup-request.json` appears, independently inspect the enrolled connector and its local ingress, and use the owner's Cloudflare zone dashboard to verify both owned DNS records have been removed. For each published phase, compare the two record IDs and markers in the owner zone dashboard with the private ledger query `SELECT hostname, record, marker FROM vm_publication_hosts ORDER BY position` opened read-only during that phase. For final cleanup use the pair saved during republish. After both records are absent and the enrolled connector has stopped, run the command below. It checks the two names no longer serve the markers. Return `cleanup-response.json` atomically. Preserve evidence and follow the existing owner cleanup procedure if any child stays ambiguous or cleanup-pending.
+
+   ```sh
+   python3 static_public_witness.py --owner-live-public-https --confirmed-connector-stopped-and-both-owned-records-absent cleanup-request.json cleanup-response.json
+   ```
+
+## Evidence and current blockers
+
+Under `evidence_dir/<run digest>/`, the client writes `acceptance.json` and a SHA-256/size manifest. The evidence includes result codes, bounded measurements, timestamps and digests. Raw VM, template, recipe, activity, operation and backup identifiers are excluded. Keep the plan, qualification captures, per-phase witness exchange and independent manual observations private.
+
+- M4 native admission and the daemon-selected static qualification and current-boot origin receipt are still required. Closed admission or a missing proof blocks the journey before the corresponding effect.
+- `TestVms::validate` currently rejects an enrolled `expected_store` together with `compose_secret_root`. The acceptance client requires both the independently pinned store and the disjoint private secret root. Allowing the combination requires product work.
+- Production enrollment of the Ubuntu Compose recipe, boot-time Compose/backup channels, host backup custody and capacity must be available. E2 enrollment runs at daemon startup and requires the committed VM row already present. The bootstrap and workload starts above are distinct.
+- The qualified Compose guest disables legacy scripts. The separate root-capable qualification and restricted TEST witnesses must exist before either stage. The network observer only measures the paths described above. The reviewed §2 qualification and captures supply the remaining evidence.
+- E3 installs multi-host routing during publish. If the qualified workload cannot serve its configured names at the private origin while policy is off, the local journey fails the routing check. Record the missing origin routing support rather than enabling publication to pass the default-off run.
+- Cloudflare Tunnel publishing and other owner paths remain **unverified on real hardware** until completed under owner control and independently reviewed. Preserve uncertain custody, VM media and backups and follow the [host runbook](dev-host-setup.md).

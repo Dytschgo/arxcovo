@@ -36,6 +36,7 @@ use windows_sys::Win32::{
 };
 
 mod ledger;
+mod tunnel;
 
 #[cfg(test)]
 #[path = "../vault_fixtures/private.rs"]
@@ -46,7 +47,6 @@ const TICK: Duration = Duration::from_secs(2);
 const VM_WORK: Duration = Duration::from_secs(600);
 const COMPOSE_WORK: Duration = Duration::from_secs(900);
 const BACKUP_WORK: Duration = Duration::from_secs(660);
-const SCRIPT_TIMEOUT: u64 = 100;
 
 #[derive(Deserialize)]
 struct Foreground {
@@ -59,8 +59,10 @@ struct Foreground {
 #[derive(Deserialize)]
 struct VmProfile {
     #[serde(default)]
-    allow_agent_public_sites: bool,
+    allow_agent_public_sites: Option<bool>,
     publication: Option<Value>,
+    #[serde(default)]
+    compose_releases: Vec<Value>,
     runtime: Option<RuntimeRoot>,
     compose_secret_root: Option<PathBuf>,
 }
@@ -74,6 +76,7 @@ struct RuntimeRoot {
 #[derive(Serialize)]
 struct Evidence {
     version: u8,
+    #[serde(skip)]
     run_id: String,
     client_sha256: String,
     daemon_sha256: String,
@@ -234,7 +237,6 @@ impl Acceptance<'_> {
             "operation_admitted",
             json!({
                 "action": action_label,
-                "request_id": hex::encode(request),
                 "receipt": operation_evidence(&received),
             }),
         );
@@ -427,8 +429,6 @@ impl Acceptance<'_> {
             self.evidence.record(
                 "activity_correlated",
                 json!({
-                    "activity_id": activity_id,
-                    "operation_id": hex::encode(op.operation),
                     "caller": "local_vm_principal",
                 }),
             );
@@ -486,36 +486,6 @@ fn read_admin_bearer(path: Option<&Path>) -> Result<Option<String>> {
     Ok(Some(trimmed))
 }
 
-fn build_egress_probe_script(spec: &PublicEgressSpec) -> String {
-    let mut lines = vec![
-        "set -eu".to_owned(),
-        "test \"$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)\" = '1'".to_owned(),
-    ];
-    lines.push("test \"$(id -u)\" = 0".into());
-    let tcp = parse_ipv4_endpoint(&spec.public_tcp_target).expect("validated public tcp");
-    let dns = parse_ipv4_endpoint(&spec.public_dns_target).expect("validated public dns");
-    lines.push(format!(
-        "timeout 5 bash -c 'exec 3<>/dev/tcp/{}/{}' >/dev/null 2>&1",
-        tcp.ip(),
-        tcp.port()
-    ));
-    lines.push(format!(
-        r#"dig +notcp +ignore +short +time=3 +tries=1 @{} -p {} example.org A | grep -Eq '^[0-9]+([.][0-9]+){{3}}$'"#,
-        dns.ip(),
-        dns.port()
-    ));
-    for raw in &spec.denied_targets {
-        let ep = parse_ipv4_endpoint(raw).expect("validated denied target");
-        lines.push(format!(
-            "if timeout 2 bash -c 'exec 3<>/dev/tcp/{}/{}' >/dev/null 2>&1; then exit 41; fi",
-            ep.ip(),
-            ep.port()
-        ));
-    }
-    lines.push("exit 0".to_owned());
-    lines.join("\n")
-}
-
 async fn catalog(client: &Client, plan: &StaticPlan) -> Result<(Vec<Value>, String)> {
     let mut cursor = Value::Null;
     let mut entries = Vec::new();
@@ -554,67 +524,42 @@ async fn catalog(client: &Client, plan: &StaticPlan) -> Result<(Vec<Value>, Stri
 }
 
 async fn journey(accept: &mut Acceptance<'_>, plan: &StaticPlan, entries: &[Value]) -> Result<()> {
-    // 1. Select or build the qualified Ubuntu Compose golden template.
-    let template_id = if let Some(sealed) = entries.iter().find(|entry| {
-        entry["guest"] == "ubuntu"
-            && entry["recipe_id"] == plan.static_vm.recipe_id
-            && entry["state"] == "sealed"
-    }) {
-        id(sealed, "template_id")?
-    } else {
-        let (built, _, _) = accept
-            .vm_op(
-                "vm_template_build",
-                "template_build",
-                11,
-                json!({"recipe_id": plan.static_vm.recipe_id}),
-                Duration::from_secs(3_660),
-            )
-            .await?;
-        succeeded(&built)?;
-        id(&built, "template_id")?
-    };
-
-    // 2. Create a fresh named static Ubuntu Compose VM and prove
-    //    idempotent replay + non-expiring static provenance.
-    let listed = rpc(accept.client, "static_vm_list", json!({})).await?;
+    let vm_hex = &plan.static_vm.vm_id;
+    let enrolled = rpc(accept.client, "static_vm_get", json!({"vm_id":vm_hex})).await?;
+    let static_vm_id = id(&enrolled, "vm_id")?;
+    let template = &enrolled["provenance"]["template_id"];
     check(
-        listed["entries"].as_array().is_some_and(Vec::is_empty) && listed["next_cursor"].is_null(),
-        "isolated_static_catalog",
+        enrolled["vm_id"] == *vm_hex
+            && enrolled["state"] == "stopped"
+            && enrolled["kind"] == "static"
+            && enrolled["name"] == plan.static_vm.name
+            && enrolled["provenance"]["recipe_digest"] == plan.static_vm.recipe_sha256
+            && opaque(template, 32).is_some()
+            && entries.iter().any(|entry| {
+                entry["state"] == "sealed"
+                    && entry["template_id"] == *template
+                    && entry["recipe_id"] == plan.static_vm.recipe_id
+            }),
+        "enrolled_static_vm",
     )?;
-    let static_vm_id = {
-        let (created, first_receipt, create_args) = accept
-            .vm_op(
-                "static_vm_create",
-                "static_create",
-                12,
-                json!({
-                    "template_id": hex::encode(template_id),
-                    "name": plan.static_vm.name,
-                }),
-                VM_WORK,
-            )
-            .await?;
-        succeeded(&created)?;
-        let replay = rpc(accept.client, "static_vm_create", create_args).await?;
-        check(
-            replay["operation_id"] == first_receipt["operation_id"],
-            "static_create_replay",
+    let vm_ledger = accept.ledger.read(|ledger| {
+        ledger.require_release(
+            static_vm_id,
+            &plan.compose.primary.project_id,
+            &plan.compose.primary.release_id,
         )?;
-        id(&created, "vm_id")?
-    };
-    let vm_hex = hex::encode(static_vm_id);
-    let vm_ledger = accept
-        .ledger
-        .read(|ledger| ledger.static_vm(static_vm_id, &plan.static_vm.name, accept.principal))?;
+        ledger.require_release(
+            static_vm_id,
+            &plan.compose.secondary.project_id,
+            &plan.compose.secondary.release_id,
+        )?;
+        ledger.static_vm(static_vm_id, &plan.static_vm.name, accept.principal)
+    })?;
     let gen_hex = hex::encode(vm_ledger.generation);
+    check(gen_hex == plan.static_vm.generation, "enrolled_generation")?;
     accept.evidence.record(
-        "static_vm_ready_for_boot",
-        json!({
-            "vm_id": vm_hex,
-            "generation": gen_hex,
-            "persistent_charge": vm_ledger.persistent_charge,
-        }),
+        "enrolled_vm_verified",
+        json!({"persistent_charge":vm_ledger.persistent_charge}),
     );
 
     // 3. Start static VM and verify static origin witness + public-egress policy pin.
@@ -625,8 +570,8 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &StaticPlan, entries: &[Valu
     let first_start_op = hex::encode(id(&started, "operation_id")?);
     let static_status = rpc(accept.client, "static_vm_get", json!({"vm_id": vm_hex})).await?;
     check(
-        static_status["vm_id"] == vm_hex
-            && static_status["provenance"]["template_id"] == hex::encode(template_id)
+        static_status["vm_id"] == *vm_hex
+            && static_status["provenance"]["template_id"] == *template
             && static_status["provenance"]["recipe_digest"] == plan.static_vm.recipe_sha256,
         "static_provenance",
     )?;
@@ -639,7 +584,7 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &StaticPlan, entries: &[Valu
     )?;
     let origin = static_origin_witness(
         &static_status,
-        &vm_hex,
+        vm_hex,
         &gen_hex,
         &first_start_op,
         &plan.public_egress.policy_sha256,
@@ -647,41 +592,46 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &StaticPlan, entries: &[Valu
     let ca_der = read_origin_ca_der(&origin, &plan.origin_ca_path)?;
 
     // 4. Verify public publishing stays OFF by default (ADR 0058 / ADR 0064).
-    let pub_attempt = rpc_raw(
-        accept.client,
-        "publish_site",
-        json!({"vm_id": vm_hex, "request_id": hex::encode(request_key()?)}),
-    )
-    .await?;
-    assert_refused(&pub_attempt, "public_sites_disabled")?;
-    let pub_status = rpc(accept.client, "publish_status", json!({"vm_id": vm_hex})).await?;
-    check(
-        pub_status["phase"] == "unpublished"
-            && pub_status["host_count"] == 0
-            && pub_status["hosts"].as_array().is_some_and(Vec::is_empty),
-        "publish_status_unpublished",
-    )?;
-    accept.ledger.read(Ledger::publication_empty)?;
-    accept.evidence.record(
-        "public_publishing_default_off",
-        publish_status_evidence(&pub_status),
-    );
-
+    if plan.witness_dir.is_none() {
+        let pub_attempt = rpc_raw(
+            accept.client,
+            "publish_site",
+            json!({"vm_id": vm_hex, "request_id": hex::encode(request_key()?)}),
+        )
+        .await?;
+        assert_refused(&pub_attempt, "public_sites_disabled")?;
+        let pub_status = rpc(accept.client, "publish_status", json!({"vm_id": vm_hex})).await?;
+        check(
+            pub_status["phase"] == "unpublished"
+                && pub_status["host_count"] == 0
+                && pub_status["hosts"].as_array().is_some_and(Vec::is_empty),
+            "publish_status_unpublished",
+        )?;
+        accept.ledger.read(Ledger::publication_empty)?;
+        accept.evidence.record(
+            "public_publishing_default_off",
+            publish_status_evidence(&pub_status),
+        );
+    }
     // 5. Deploy primary (Calm Life) and secondary (synthetic second service).
     accept
         .deploy_and_wait(
-            &vm_hex,
+            vm_hex,
             &plan.compose.primary.project_id,
             &plan.compose.primary.release_id,
         )
         .await?;
     accept
         .deploy_and_wait(
-            &vm_hex,
+            vm_hex,
             &plan.compose.secondary.project_id,
             &plan.compose.secondary.release_id,
         )
         .await?;
+
+    if let Some(directory) = &plan.witness_dir {
+        return tunnel::journey(accept, plan, vm_hex, directory, &origin, &ca_der).await;
+    }
 
     // 6. Verify direct TLS origin serves both configured names, rejects unknown Host,
     //    serves exact HTTP 206/416/If-Range byte ranges, and ingests a SQLite event.
@@ -902,7 +852,7 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &StaticPlan, entries: &[Valu
 
     // 7. Create a protected host SQLite backup and verify ledger & physical custody.
     let (backup_id, backup_size, backup_sha) = accept
-        .create_backup(&vm_hex, &plan.compose.primary.project_id)
+        .create_backup(vm_hex, &plan.compose.primary.project_id)
         .await?;
     let settled_backup = accept.ledger.read(|ledger| {
         ledger.compose_backup(
@@ -920,7 +870,7 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &StaticPlan, entries: &[Valu
     let volumes = accept.ledger.read(|ledger| {
         ledger.compose_volumes_intact(static_vm_id, &plan.compose.primary.project_id)
     })?;
-    accept.verify_delete_refusals(&vm_hex, backup_id).await?;
+    accept.verify_delete_refusals(vm_hex, backup_id).await?;
     accept.ledger.read(|ledger| {
         check(
             ledger.static_vm(static_vm_id, &plan.static_vm.name, accept.principal)? == vm_ledger,
@@ -942,36 +892,6 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &StaticPlan, entries: &[Valu
         Ok(())
     })?;
 
-    // 9. Public-only egress probe inside the running static VM.
-    let probe_script = build_egress_probe_script(&plan.public_egress);
-    let (egress_row, _, _) = accept
-        .vm_op(
-            "vm_run_script",
-            "run_script",
-            2,
-            json!({
-                "vm_id": vm_hex,
-                "timeout_s": SCRIPT_TIMEOUT,
-                "script": probe_script,
-            }),
-            Duration::from_secs(SCRIPT_TIMEOUT + 30),
-        )
-        .await?;
-    check(
-        egress_row["cleanup"] == "confirmed"
-            && egress_row["script_status"] == "exited"
-            && egress_row["exit_code"] == 0
-            && egress_row["state"] == "succeeded",
-        "public_egress_probe",
-    )?;
-    accept.evidence.record(
-        "public_egress_probe_passed",
-        json!({
-            "denied_target_count": plan.public_egress.denied_targets.len(),
-            "ipv6_disabled": true,
-        }),
-    );
-
     // 10. Restart static VM and verify SQLite event survives restart.
     let (stopped, _, _) = accept
         .vm_op("vm_stop", "stop", 4, json!({"vm_id": vm_hex}), VM_WORK)
@@ -986,7 +906,7 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &StaticPlan, entries: &[Valu
     let after_status = rpc(accept.client, "static_vm_get", json!({"vm_id": vm_hex})).await?;
     let after_origin = static_origin_witness(
         &after_status,
-        &vm_hex,
+        vm_hex,
         &gen_hex,
         &second_start_op,
         &plan.public_egress.policy_sha256,
@@ -1011,7 +931,7 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &StaticPlan, entries: &[Valu
     )?;
     accept.evidence.record(
         "restart_persistence_verified",
-        json!({"survived_restart": true, "fresh_boot_op": second_start_op}),
+        json!({"survived_restart": true, "fresh_boot": true}),
     );
 
     // 11. Offline restore of the settled host backup into a disposable target
@@ -1190,17 +1110,78 @@ fn custody_root(state: &Path, runtime: Option<&RuntimeRoot>) -> Result<LocalPath
     Ok(state)
 }
 
-fn validate_foreground_profile(foreground: &Foreground) -> Result<()> {
+fn validate_foreground_profile(
+    foreground: &Foreground,
+    plan: &StaticPlan,
+    tunnel: bool,
+) -> Result<()> {
     check(foreground.agents.len() == 1, "isolated_foreground_profile")?;
-    if foreground.test_vms.allow_agent_public_sites || foreground.test_vms.publication.is_some() {
+    let profile = &foreground.test_vms;
+    check(tunnel == plan.witness_dir.is_some(), "tunnel_stage_opt_in")?;
+    if tunnel {
+        check(
+            profile.allow_agent_public_sites == Some(true),
+            "tunnel_policy",
+        )?;
+        let publication = profile
+            .publication
+            .as_ref()
+            .ok_or(Failure::Check("tunnel_binding"))?;
+        check(
+            publication["static_name"] == plan.static_vm.name,
+            "tunnel_binding",
+        )?;
+        let mut names = [
+            &plan.compose.primary.hostname,
+            &plan.compose.secondary.hostname,
+        ];
+        names.sort();
+        check(publication["hostnames"] == json!(names), "tunnel_names")?;
+        let routes = publication["routes"]
+            .as_array()
+            .ok_or(Failure::Check("tunnel_routes"))?;
+        check(
+            routes.len() == 2
+                && service_pairs(plan).iter().all(|(host, project, _)| {
+                    routes
+                        .iter()
+                        .any(|route| route["hostname"] == *host && route["project_id"] == *project)
+                }),
+            "tunnel_routes",
+        )?;
+    } else if profile.allow_agent_public_sites.is_some() || profile.publication.is_some() {
         return Err(Failure::PublicPublishingEnabled);
     }
-    // Current product constraint (`arxd::config::VmStoreComposeConflict`):
-    // `expected_store` cannot yet be combined with `compose_secret_root`.
-    if foreground.test_vms.compose_secret_root.is_some() {
-        return Err(Failure::StoreComposeConflict);
-    }
-    Ok(())
+    check(
+        profile.compose_secret_root.is_some(),
+        "secret_root_required",
+    )?;
+    check(
+        profile.compose_releases.len() == 2
+            && service_pairs(plan).iter().all(|(_, project, release)| {
+                profile.compose_releases.iter().any(|row| {
+                    row["vm_id"] == plan.static_vm.vm_id
+                        && row["manifest"]["project_id"] == *project
+                        && row["release_id"] == *release
+                })
+            }),
+        "release_profile_binding",
+    )
+}
+
+fn service_pairs(plan: &StaticPlan) -> [(&str, &str, &str); 2] {
+    [
+        (
+            &plan.compose.primary.hostname,
+            &plan.compose.primary.project_id,
+            &plan.compose.primary.release_id,
+        ),
+        (
+            &plan.compose.secondary.hostname,
+            &plan.compose.secondary.project_id,
+            &plan.compose.secondary.release_id,
+        ),
+    ]
 }
 
 fn require_distinct_roots(roots: &[(&LocalPath, &[File])]) -> Result<()> {
@@ -1395,7 +1376,13 @@ async fn with_client(
     observed.and(joined)
 }
 
-async fn run() -> Result<()> {
+async fn run(tunnel: bool) -> Result<()> {
+    if tunnel {
+        check(
+            env::var("ARX_STATIC_VM_PUBLIC_TUNNEL").as_deref() == Ok("owner-opt-in"),
+            "tunnel_stage_opt_in",
+        )?;
+    }
     let plan_path = PathBuf::from(
         env::var_os("ARX_STATIC_VM_ACCEPTANCE_PLAN")
             .ok_or(Failure::Check("acceptance_plan_required"))?,
@@ -1464,7 +1451,55 @@ async fn run() -> Result<()> {
         client.address() == foreground.local.address,
         "bridge_endpoint_binding",
     )?;
-    validate_foreground_profile(&foreground)?;
+    validate_foreground_profile(&foreground, &plan, tunnel)?;
+    let secrets = foreground
+        .test_vms
+        .compose_secret_root
+        .as_ref()
+        .ok_or(Failure::Check("secret_root_required"))?;
+    d_path(secrets)?;
+    let secret_pins = pin_root(secrets)?;
+    safe(
+        arxd::config::checked_owner_private_path(secrets),
+        "private_secret_root",
+    )?;
+    let secret_root = local_path(secrets)?;
+    if let Some(dir) = &plan.witness_dir {
+        d_path(dir)?;
+        input_pins.extend(pin_root(dir)?);
+        safe(
+            arxd::config::checked_owner_private_path(dir),
+            "private_witness_directory",
+        )?;
+        for other in [
+            &foreground.state_dir,
+            secrets,
+            &plan.evidence_dir,
+            &plan.backup_root,
+            &plan.restore_dir,
+        ] {
+            check(
+                !local_path(dir)?.overlaps(&local_path(other)?),
+                "witness_directory_overlap",
+            )?;
+        }
+    }
+    let witness_parent = plan
+        .network_receipt
+        .parent()
+        .ok_or(Failure::Check("network_receipt_path"))?;
+    input_pins.extend(pin_root(witness_parent)?);
+    let receipt = open(&plan.network_receipt, false, FILE_SHARE_READ)?;
+    safe(
+        arxd::config::checked_owner_private_path(&plan.network_receipt),
+        "network_receipt_permissions",
+    )?;
+    let mut bytes = Vec::new();
+    safe(
+        receipt.take(65537).read_to_end(&mut bytes),
+        "network_receipt_read",
+    )?;
+    verify_network_receipt(&plan, &bytes)?;
 
     d_path(&foreground.state_dir)?;
     let state = custody_root(&foreground.state_dir, foreground.test_vms.runtime.as_ref())?;
@@ -1474,6 +1509,7 @@ async fn run() -> Result<()> {
     let restore_root = local_path(&plan.restore_dir)?;
     require_distinct_roots(&[
         (&state, &store_pins),
+        (&secret_root, &secret_pins),
         (&evidence_root, &evidence_pins),
         (&backup_root, &backup_pins),
         (&restore_root, &restore_pins),
@@ -1482,14 +1518,14 @@ async fn run() -> Result<()> {
 
     let executable = safe(env::current_exe(), "client_executable")?;
     let client_file = open(&executable, false, FILE_SHARE_READ)?;
-    let run_id = hex::encode(fresh()?);
+    let run_id = hex::encode(Sha256::digest(fresh()?));
     let mut evidence = Evidence {
         version: 1,
-        run_id: run_id.clone(),
+        run_id,
         client_sha256: hex::encode(digest(&client_file, 512 * 1024 * 1024)?.1),
         daemon_sha256: plan.daemon_sha256.clone(),
         qualification_sha256: None,
-        cloudflare_publishing_disabled: true,
+        cloudflare_publishing_disabled: !tunnel,
         started_at_ms: now_ms()?,
         finished_at_ms: 0,
         observations: Vec::new(),
@@ -1498,10 +1534,16 @@ async fn run() -> Result<()> {
         drain_failure: None,
     };
 
+    evidence.record(
+        "reviewed_network_qualification",
+        json!({"sha256":plan.network_receipt_sha256}),
+    );
     let result = async {
         require_unused(&foreground.local.address)?;
         safe(
-            with_enrolled_vm_store(&foreground.state_dir, &plan.store, Ledger::preflight),
+            with_enrolled_vm_store(&foreground.state_dir, &plan.store, |root| {
+                Ledger::preflight(root, Some(&plan.static_vm.vm_id))
+            }),
             "foreground_store_binding",
         )??;
         let launch_config = prepare_pinned_config(&plan.daemon_config, &plan.store)?;
@@ -1536,15 +1578,23 @@ async fn run() -> Result<()> {
         ],
     )?;
     evidence.write(&plan.evidence_dir)?;
-    println!("Static VM acceptance run {run_id}");
+
     result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "owner-host static-VM acceptance requires independently reviewed M4 and public-egress native qualification"]
 async fn owner_host_static_vm() {
-    if let Err(error) = run().await {
+    if let Err(error) = run(false).await {
         panic!("Static VM acceptance {error:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires explicit private owner tunnel enrollment and independent public witnesses"]
+async fn owner_host_public_tunnel() {
+    if let Err(error) = run(true).await {
+        panic!("Tunnel acceptance {error:?}");
     }
 }
 
@@ -1561,45 +1611,29 @@ mod owner_tests {
         assert!((before..=now_ms().unwrap()).contains(&issued));
     }
 
-    fn sample_foreground(
-        allow_public: bool,
-        has_publication: bool,
-        has_secrets: bool,
-    ) -> Foreground {
-        serde_json::from_value(json!({
-            "state_dir": "D:/acceptance/state",
-            "local": {"address": r"\\.\pipe\arxcovo-static-fixture", "client_identity": "S-1-5-21-1-2-3-1001"},
-            "agents": [{"principal": "accept", "token_sha256": "a".repeat(64)}],
-            "test_vms": {
-                "allow_agent_public_sites": allow_public,
-                "publication": if has_publication { json!({"hostnames": ["calm.example.invalid"]}) } else { Value::Null },
-                "compose_secret_root": if has_secrets { json!("D:/acceptance/secrets") } else { Value::Null }
-            }
-        }))
-        .unwrap()
-    }
-
     #[test]
-    fn static_profile_refuses_publishing_enabled_or_publication_block() {
-        assert_eq!(
-            validate_foreground_profile(&sample_foreground(false, false, false)),
-            Ok(())
+    fn foreground_defaults_release_enrollment_and_explicit_tunnel_stage() {
+        let mut plan = StaticPlan::parse_bytes(sample_plan_json().to_string().as_bytes()).unwrap();
+        let releases: Vec<_> = service_pairs(&plan).iter().map(|(_,p,r)|json!({"vm_id":plan.static_vm.vm_id,"release_id":r,"manifest":{"project_id":p}})).collect();
+        let mut profile: Foreground=serde_json::from_value(json!({"state_dir":"D:/state","local":{"address":"fixture","client_identity":"fixture"},"agents":[{"principal":"fixture","token_sha256":"00".repeat(32)}],"test_vms":{"compose_secret_root":"D:/private","compose_releases":releases}})).unwrap();
+        assert_eq!(validate_foreground_profile(&profile, &plan, false), Ok(()));
+        for value in [false, true] {
+            profile.test_vms.allow_agent_public_sites = Some(value);
+            assert_eq!(
+                validate_foreground_profile(&profile, &plan, false),
+                Err(Failure::PublicPublishingEnabled)
+            );
+        }
+        plan.witness_dir = Some(PathBuf::from("D:/witness"));
+        assert!(validate_foreground_profile(&profile, &plan, false).is_err());
+        profile.test_vms.publication = Some(
+            json!({"static_name":plan.static_vm.name,"hostnames":[plan.compose.primary.hostname,plan.compose.secondary.hostname],"routes":service_pairs(&plan).map(|(h,p,_)|json!({"hostname":h,"project_id":p}))}),
         );
+        assert_eq!(validate_foreground_profile(&profile, &plan, true), Ok(()));
+        profile.test_vms.compose_releases[0]["vm_id"] = json!("other");
         assert_eq!(
-            validate_foreground_profile(&sample_foreground(true, false, false)),
-            Err(Failure::PublicPublishingEnabled)
-        );
-        assert_eq!(
-            validate_foreground_profile(&sample_foreground(false, true, false)),
-            Err(Failure::PublicPublishingEnabled)
-        );
-    }
-
-    #[test]
-    fn static_profile_detects_enrolled_store_compose_secret_conflict() {
-        assert_eq!(
-            validate_foreground_profile(&sample_foreground(false, false, true)),
-            Err(Failure::StoreComposeConflict)
+            validate_foreground_profile(&profile, &plan, true),
+            Err(Failure::Check("release_profile_binding"))
         );
     }
 

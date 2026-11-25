@@ -197,7 +197,7 @@ impl Ledger {
     /// Preflight a stopped VM store before foreground launch. Accepts an empty
     /// directory or an idle v15 store with no in-flight operations, no active
     /// publication intent, and no foreign files.
-    pub fn preflight(state: &Path) -> Result<()> {
+    pub fn preflight(state: &Path, expected: Option<&str>) -> Result<()> {
         let _state = pin_root(state)?;
         match state.join("activity.sqlite3").symlink_metadata() {
             Ok(_) => {
@@ -211,12 +211,12 @@ impl Ledger {
                     }
                 }
                 let ledger = Self::open(state)?;
-                ledger.quiet_for_static()?;
+                ledger.quiet_for_static(expected)?;
                 ledger.publication_empty()?;
                 ledger.no_foreign_root_entries()
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => check(
-                safe(read_dir(state), "fresh_state")?.next().is_none(),
+                expected.is_none() && safe(read_dir(state), "fresh_state")?.next().is_none(),
                 "fresh_state",
             ),
             Err(_) => Err(Failure::Check("ledger_preflight")),
@@ -284,18 +284,19 @@ impl Ledger {
         })
     }
 
-    pub fn quiet_for_static(&self) -> Result<()> {
+    pub fn quiet_for_static(&self, expected: Option<&str>) -> Result<()> {
         check(
             safe(
                 self.db.query_row(
                     "SELECT (SELECT count(*) FROM vm_instances)
-                  + (SELECT count(*) FROM vm_static_instances)
+                  + (SELECT count(*) FROM vm_static_instances WHERE lower(hex(id)) IS NOT ?1 OR state<>1)
+                  + (?1 IS NOT NULL AND NOT EXISTS (SELECT 1 FROM vm_static_instances WHERE lower(hex(id))=?1))
                   + (SELECT count(*) FROM vm_build_intents WHERE state<>'sealed')
                   + (SELECT count(*) FROM vm_operations WHERE status=0)
                   + (SELECT count(*) FROM vm_compose_operations WHERE receipt IS NULL AND closed IS NULL)
                   + (SELECT count(*) FROM vm_compose_backup_ops WHERE status='pending')
                   + (SELECT count(*) FROM vm_compose_backups WHERE state IN ('staging','partial_uncertain'))",
-                    [],
+                    [expected],
                     |r| r.get::<_, i64>(0),
                 ),
                 "ledger_quiet",
@@ -317,6 +318,15 @@ impl Ledger {
             )? == 0,
             "publication_not_empty",
         )
+    }
+
+    pub fn published_pair(&self, vm: &str, first: &str, second: &str) -> Result<()> {
+        let records:i64 = safe(self.db.query_row(
+          "SELECT count(DISTINCT h.record) FROM vm_publication p JOIN vm_publication_hosts h ON h.publication=p.singleton
+           WHERE lower(hex(p.vm))=?1 AND p.phase='published' AND h.hostname IN (?2,?3)
+             AND h.state='verified' AND h.post_possible=1 AND h.ambiguous=0",
+          params![vm,first,second], |r|r.get(0)), "publication_pair_read")?;
+        check(records == 2, "publication_pair")
     }
 
     pub fn no_foreign_root_entries(&self) -> Result<()> {
@@ -376,6 +386,11 @@ impl Ledger {
             disk_file,
             vars_file,
         })
+    }
+
+    pub fn require_release(&self, vm: Id, project: &str, release: &str) -> Result<()> {
+        let exists: bool = safe(self.db.query_row("SELECT EXISTS(SELECT 1 FROM vm_compose_releases WHERE vm=?1 AND project=?2 AND lower(hex(id))=?3)", params![vm, project, release], |r| r.get(0)), "release_inventory")?;
+        check(exists, "release_not_enrolled")
     }
 
     pub fn compose_volumes_intact(&self, vm: Id, project: &str) -> Result<i64> {
@@ -512,7 +527,7 @@ mod tests {
     fn static_ledger_preflight_checks_schema_version_and_isolation() {
         let temporary = private_fixture::private_dir();
         let state = temporary.path();
-        assert_eq!(Ledger::preflight(state), Ok(()));
+        assert_eq!(Ledger::preflight(state, None), Ok(()));
 
         let controller = VmController::open(state, VmPolicy::default(), StoreClock).unwrap();
         let db_path = state.join("activity.sqlite3");
@@ -524,12 +539,12 @@ mod tests {
         drop(db);
         drop(controller);
 
-        assert_eq!(Ledger::preflight(state), Ok(()));
+        assert_eq!(Ledger::preflight(state, None), Ok(()));
 
         let orphan = state.join("foreign.tmp");
         fs::write(&orphan, b"stray").unwrap();
         assert_eq!(
-            Ledger::preflight(state),
+            Ledger::preflight(state, None),
             Err(Failure::Check("unattributed_media"))
         );
         fs::remove_file(&orphan).unwrap();
@@ -537,7 +552,7 @@ mod tests {
         let sidecar = state.join("activity.sqlite3-wal");
         fs::write(&sidecar, b"wal").unwrap();
         assert_eq!(
-            Ledger::preflight(state),
+            Ledger::preflight(state, None),
             Err(Failure::Check("unsettled_startup_ledger"))
         );
         fs::remove_file(&sidecar).unwrap();
@@ -547,7 +562,7 @@ mod tests {
             db.pragma_update(None, "user_version", unsupported).unwrap();
             drop(db);
             assert_eq!(
-                Ledger::preflight(state),
+                Ledger::preflight(state, None),
                 Err(Failure::Check("ledger_version"))
             );
         }
@@ -636,6 +651,31 @@ mod tests {
 
         let ledger = Ledger::open(&state).unwrap();
         ledger.publication_empty().unwrap();
+        assert!(ledger.quiet_for_static(Some(&hex::encode(vm_id))).is_err()); // running
+        let edit = Connection::open(state.join("activity.sqlite3")).unwrap();
+        edit.execute(
+            "UPDATE vm_static_instances SET state=1 WHERE id=?1",
+            [vm_id],
+        )
+        .unwrap();
+        edit.execute("INSERT INTO vm_compose_releases(vm,project,id,digest,manifest) VALUES(?1,'calm-life',?2,?3,?4)",params![vm_id,[0x77u8;16],"aa".repeat(32),b"{}"]).unwrap();
+        drop(edit);
+        assert_eq!(ledger.quiet_for_static(Some(&hex::encode(vm_id))), Ok(()));
+        assert!(ledger.quiet_for_static(Some(&"ff".repeat(16))).is_err());
+        assert_eq!(
+            ledger.require_release(vm_id, "calm-life", &"77".repeat(16)),
+            Ok(())
+        );
+        assert!(
+            ledger
+                .require_release(vm_id, "other", &"77".repeat(16))
+                .is_err()
+        );
+        assert!(
+            ledger
+                .require_release(vm_id, "calm-life", &"99".repeat(16))
+                .is_err()
+        );
         assert_eq!(ledger.compose_volumes_intact(vm_id, "calm-life"), Ok(1));
         let verified = ledger
             .compose_backup(
