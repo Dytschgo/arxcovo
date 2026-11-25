@@ -848,7 +848,7 @@ pub(crate) fn backup_replay(
         .query_row(
             "SELECT o.id,o.backup_id,o.vm,o.project,o.generation,o.boot,o.revision,
                     o.volume,o.database,o.max_bytes,o.sent,o.status,o.failure,
-                    b.size_bytes,b.sha256,b.state,b.host_staging_charge,b.retained_charge
+                    b.size_bytes,b.sha256,b.state,b.host_staging_charge,b.retained_charge,b.file_id IS NOT NULL
              FROM vm_compose_backup_ops o
              JOIN vm_compose_backups b ON b.id=o.backup_id
              WHERE o.principal=?1 AND o.request=?2",
@@ -876,6 +876,7 @@ pub(crate) fn backup_replay(
                     backup_state: compose_backup::BackupRecordState::parse(
                         &r.get::<_, String>(15)?,
                     )?,
+                    has_staging_witness: r.get(18)?,
                     host_staging_charge: r.get(16)?,
                     retained_charge: r.get(17)?,
                 })
@@ -1256,27 +1257,16 @@ pub(crate) fn list_partial_uncertain_backups(
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Returns the most recent terminal backup operation ID on `(vm, generation, boot)`
-/// other than `current_op`, so the host can release stale guest staging on
-/// `BackupStagingOccupied`.
-pub(crate) fn latest_terminal_backup_op_on_boot(
+/// Verify the guest-reported staging owner is a terminal operation on this boot.
+pub(crate) fn terminal_backup_on_boot(
     db: &Connection,
-    vm: Id,
+    target: &Target,
     generation: Id,
     boot: u64,
-    current_op: Id,
-) -> Result<Option<Id>> {
-    Ok(db
-        .query_row(
-            "SELECT o.id FROM vm_compose_backup_ops o
-             JOIN vm_compose_backups b ON b.id=o.backup_id
-             WHERE o.vm=?1 AND o.generation=?2 AND o.boot=?3 AND o.id<>?4 AND o.status<>'pending'
-             ORDER BY b.created_ms DESC, o.id DESC
-             LIMIT 1",
-            params![vm, generation, boot, current_op],
-            |r| r.get(0),
-        )
-        .optional()?)
+    owner: Id,
+) -> Result<bool> {
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM vm_compose_backup_ops WHERE vm=?1 AND generation=?2 AND boot=?3 AND id=?4 AND status<>'pending')",
+        params![target.vm, generation, boot, owner], |r| r.get(0))?)
 }
 
 /// Releases the charge of a `partial_uncertain` backup ONLY when presented with
@@ -1289,8 +1279,8 @@ pub(crate) fn reconcile_partial_backup(
 ) -> Result<bool> {
     let changed = db.execute(
         "UPDATE vm_compose_backups SET state='cleaned', host_staging_charge=0, guest_staging_charge=0
-         WHERE id=?1 AND state='partial_uncertain'",
-        [proof.backup_id()],
+         WHERE id=?1 AND state='partial_uncertain' AND volume_id=?2 AND directory_id=?3 AND file_id=?4",
+        params![proof.backup_id(),proof.witness().identity.volume.to_be_bytes(),proof.witness().directory_id,proof.witness().identity.file],
     )?;
     prune_orphaned_cleaned_backups(db)?;
     Ok(changed == 1)

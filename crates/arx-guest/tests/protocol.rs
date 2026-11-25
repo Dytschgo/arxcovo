@@ -1753,10 +1753,9 @@ mod compose_session {
                 max_bytes: MAX_BACKUP_BYTES,
                 deadline_s: 30,
             }),
-            ComposeResponse::ComposeRejected {
+            ComposeResponse::ComposeBackupOccupied {
                 id: 9,
-                code: RejectCode::BackupStagingOccupied,
-                rule: None,
+                operation_id: op1.clone(),
             }
         );
 

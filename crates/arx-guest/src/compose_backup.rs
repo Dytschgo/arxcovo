@@ -295,12 +295,20 @@ pub fn verify_portable_sqlite_file(
     if size > max_bytes {
         return Err(BackupHelperError::TooLarge);
     }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut companion = path.as_os_str().to_owned();
+        companion.push(suffix);
+        match fs::symlink_metadata(companion) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            _ => return Err(BackupHelperError::Corrupt),
+        }
+    }
     // Check header magic + compute exact SHA-256 in one bounded streaming read.
     let mut file = open_readonly_no_follow(path)?;
-    let mut header = [0u8; 16];
+    let mut header = [0u8; 20];
     file.read_exact(&mut header)
         .map_err(|_| BackupHelperError::Corrupt)?;
-    if &header != SQLITE_HEADER_MAGIC {
+    if &header[..16] != SQLITE_HEADER_MAGIC || header[18..20] != [1, 1] {
         return Err(BackupHelperError::Corrupt);
     }
     let mut hasher = Sha256::new();
@@ -1030,6 +1038,29 @@ mod tests {
         assert!(!is_volume_slot("data-"));
         assert!(!is_volume_slot("DATA"));
         assert!(!is_volume_slot("a_b"));
+    }
+
+    #[test]
+    fn portable_verifier_refuses_wal_format_and_companions() {
+        let dir = scratch_dir("portable");
+        let path = dir.join("snapshot.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE sample(value)")
+            .unwrap();
+        drop(db);
+        assert_eq!(&fs::read(&path).unwrap()[18..20], &[2, 2]);
+        assert!(verify_portable_sqlite_file(&path, MAX_BACKUP_BYTES).is_err());
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+        drop(db);
+        verify_portable_sqlite_file(&path, MAX_BACKUP_BYTES).unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let companion = dir.join(format!("snapshot.db{suffix}"));
+            fs::write(&companion, []).unwrap();
+            assert!(verify_portable_sqlite_file(&path, MAX_BACKUP_BYTES).is_err());
+            fs::remove_file(companion).unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

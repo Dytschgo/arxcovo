@@ -137,6 +137,7 @@ pub(crate) struct BackupIntent {
     pub database: String,
     pub max_bytes: u64,
     pub sent: bool,
+    pub has_staging_witness: bool,
     pub status: BackupOpStatus,
     pub failure: Option<String>,
     pub size_bytes: Option<u64>,
@@ -224,9 +225,14 @@ pub(crate) struct PartialBackupRecord {
 #[derive(Debug)]
 pub(crate) struct PartialCleanupProof {
     backup_id: Id,
+    witness: HostFileWitness,
 }
 
 impl PartialCleanupProof {
+    pub(crate) fn witness(&self) -> HostFileWitness {
+        self.witness
+    }
+
     pub(crate) fn backup_id(&self) -> Id {
         self.backup_id
     }
@@ -242,6 +248,7 @@ pub(crate) enum PublishError {
     /// settled directory. Caller MUST retain charge (`partial_uncertain`) until
     /// attributed reconciliation confirms removal.
     PostPublishUncertain,
+    HardLinkUnavailable,
 }
 
 /// Held handle keeping the published backup protected (deny write/delete, allow
@@ -334,6 +341,9 @@ pub(crate) struct ManagedBackupDir {
     staging_dir: PathBuf,
     settled_dir: PathBuf,
     pin: crate::config::RootPin,
+    namespace: Arc<BackupNamespace>,
+    publish_link: fn(&BackupNamespace, &Path, &Path) -> std::io::Result<()>,
+    flush_published: fn(&File) -> std::io::Result<()>,
 }
 
 #[allow(
@@ -366,12 +376,24 @@ impl ManagedBackupDir {
             .to_str()
             .and_then(|raw| LocalPath::parse(raw).ok());
         Ok(Self {
+            namespace: Arc::new(BackupNamespace::open(
+                backup_root,
+                &staging_dir,
+                &settled_dir,
+            )?),
+            publish_link: BackupNamespace::link,
+            flush_published: File::sync_all,
             root: backup_root.to_path_buf(),
             local_root,
             staging_dir,
             settled_dir,
             pin,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_published_flush(&mut self) {
+        self.flush_published = |_| Err(std::io::Error::other("injected post-link flush failure"));
     }
 
     /// Resolves the settled leaf path for owner-only offline restore verification.
@@ -453,11 +475,96 @@ fn settled_leaf_path(
     Ok(path)
 }
 
+struct BackupNamespace {
+    staging: File,
+    settled: File,
+    id: Id,
+}
+
+fn directory_handle(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::*;
+        options
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_dir() && !is_reparse(&metadata),
+        "invalid backup directory"
+    );
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn leaf_name(path: &Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    let leaf = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
+    Ok(std::ffi::CString::new(leaf.as_bytes())?)
+}
+
+impl BackupNamespace {
+    #[cfg(unix)]
+    fn link(&self, staging: &Path, settled: &Path) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let source = leaf_name(staging)?;
+        let destination = leaf_name(settled)?;
+        if unsafe {
+            libc::linkat(
+                self.staging.as_raw_fd(),
+                source.as_ptr(),
+                self.settled.as_raw_fd(),
+                destination.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn link(&self, staging: &Path, settled: &Path) -> std::io::Result<()> {
+        fs::hard_link(staging, settled)
+    }
+
+    fn open(root: &Path, staging_path: &Path, settled_path: &Path) -> Result<Self> {
+        let root = directory_handle(root)?;
+        let staging = directory_handle(staging_path)?;
+        let settled = directory_handle(settled_path)?;
+        let mut digest = Sha256::new();
+        for directory in [&root, &staging, &settled] {
+            let identity = file_identity(directory)?;
+            digest.update(identity.volume.to_be_bytes());
+            digest.update(identity.file);
+        }
+        let mut id = [0; 16];
+        id.copy_from_slice(&digest.finalize()[..16]);
+        Ok(Self {
+            staging,
+            settled,
+            id,
+        })
+    }
+}
+
 struct LocalBackupHold {
+    namespace: Arc<BackupNamespace>,
+    witness: HostFileWitness,
     file: Option<File>,
     settled_file: Option<File>,
     staging_path: PathBuf,
-    staging_dir: PathBuf,
 }
 
 impl BackupHold for LocalBackupHold {
@@ -466,8 +573,7 @@ impl BackupHold for LocalBackupHold {
         // transient staging hard-link after the settled leaf is durable in DB.
         drop(self.settled_file.take());
         drop(self.file.take());
-        let _ = fs::remove_file(&self.staging_path);
-        let _ = sync_directory(&self.staging_dir);
+        let _ = remove_attributed_file(&self.namespace.staging, &self.staging_path, self.witness);
     }
 }
 
@@ -476,9 +582,11 @@ impl BackupHold for LocalBackupHold {
     reason = "reserved for qualified backup custody activation and E4 fixtures"
 )]
 struct LocalStagingWriter {
+    namespace: Arc<BackupNamespace>,
+    publish_link: fn(&BackupNamespace, &Path, &Path) -> std::io::Result<()>,
+    flush_published: fn(&File) -> std::io::Result<()>,
     root: PathBuf,
     local_root: Option<LocalPath>,
-    staging_dir: PathBuf,
     staging_path: PathBuf,
     settled_dir: PathBuf,
     file: Option<File>,
@@ -493,17 +601,20 @@ impl BackupCustody for ManagedBackupDir {
         self.pin.verify(&self.root)?;
         check_no_reparse(&self.staging_dir)?;
         let staging_path = self.staging_path(operation_id)?;
-        let file = open_exclusive_private(&staging_path)?;
+        let file = open_exclusive_private(&self.namespace.staging, &staging_path)?;
         let identity = file_identity(&file)?;
-        let directory_id = dir_id_hash(&self.staging_dir)?;
+        let directory_id = self.namespace.id;
         let witness = HostFileWitness {
             identity,
             directory_id,
         };
         Ok(Box::new(LocalStagingWriter {
+            namespace: self.namespace.clone(),
+            publish_link: self.publish_link,
+            flush_published: self.flush_published,
             root: self.root.clone(),
             local_root: self.local_root.clone(),
-            staging_dir: self.staging_dir.clone(),
+
             staging_path,
             settled_dir: self.settled_dir.clone(),
             file: Some(file),
@@ -525,8 +636,11 @@ impl BackupCustody for ManagedBackupDir {
         check_no_reparse(&self.settled_dir)?;
         let staging = self.staging_path(operation_id)?;
         let settled = self.settled_path(backup_id)?;
-        let staging_ok = remove_attributed_file(&staging, expected)?;
-        let settled_ok = remove_attributed_file(&settled, expected)?;
+        let Some(expected) = expected.filter(|w| w.directory_id == self.namespace.id) else {
+            return Ok(false);
+        };
+        let staging_ok = remove_attributed_file(&self.namespace.staging, &staging, expected)?;
+        let settled_ok = remove_attributed_file(&self.namespace.settled, &settled, expected)?;
         Ok(staging_ok && settled_ok)
     }
 }
@@ -564,7 +678,7 @@ impl StagingWriter for LocalStagingWriter {
     ) -> std::result::Result<PublishedBackup, PublishError> {
         // Phase 1: pre-publication verification while holding the exclusive
         // writable handle (deny write and delete, allow read on Windows).
-        let (mut file, settled_path) = (|| -> Result<(File, PathBuf)> {
+        let (file, settled_path) = (|| -> Result<(File, PathBuf)> {
             ensure!(
                 self.written == expected_size
                     && (1..=MAX_BACKUP_BYTES).contains(&expected_size)
@@ -650,20 +764,17 @@ impl StagingWriter for LocalStagingWriter {
         // Phase 2: publication. Any failure from this point on leaves the row
         // `partial_uncertain` (charged) until attributed reconciliation proves
         // removal of both staging and any unpublished settled leaf.
+        if let Err(error) = (self.publish_link)(&self.namespace, &self.staging_path, &settled_path)
+        {
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                PublishError::PostPublishUncertain
+            } else {
+                PublishError::HardLinkUnavailable
+            });
+        }
         (|| -> Result<PublishedBackup> {
-            let (held, expected_identity) =
-                if fs::hard_link(&self.staging_path, &settled_path).is_ok() {
-                    (file, self.witness.identity)
-                } else {
-                    let mut dst = open_exclusive_private(&settled_path)?;
-                    file.seek(SeekFrom::Start(0))?;
-                    std::io::copy(&mut file, &mut dst)?;
-                    dst.sync_all()?;
-                    let dst_id = file_identity(&dst)?;
-                    drop(file);
-                    (dst, dst_id)
-                };
-
+            let held = file;
+            let expected_identity = self.witness.identity;
             let settled_ro = open_readonly_no_reparse(&settled_path)?;
             let settled_identity = file_identity(&settled_ro)?;
             ensure!(
@@ -673,20 +784,22 @@ impl StagingWriter for LocalStagingWriter {
 
             // Flush through the held writable handle after publication
             // (FlushFileBuffers on Windows, fsync on Unix) and sync settled dir.
-            held.sync_all()?;
-            sync_directory(&self.settled_dir)?;
+            (self.flush_published)(&held)?;
+            #[cfg(unix)]
+            self.namespace.settled.sync_all()?;
 
-            let directory_id = dir_id_hash(&self.settled_dir)?;
+            let directory_id = self.namespace.id;
             Ok(PublishedBackup {
                 witness: HostFileWitness {
                     identity: settled_identity,
                     directory_id,
                 },
                 hold: Box::new(LocalBackupHold {
+                    namespace: self.namespace.clone(),
+                    witness: self.witness,
                     file: Some(held),
                     settled_file: Some(settled_ro),
                     staging_path: self.staging_path.clone(),
-                    staging_dir: self.staging_dir.clone(),
                 }),
             })
         })()
@@ -695,7 +808,7 @@ impl StagingWriter for LocalStagingWriter {
 
     fn abort_and_cleanup(mut self: Box<Self>) -> Result<bool> {
         drop(self.file.take());
-        remove_attributed_file(&self.staging_path, Some(self.witness))
+        remove_attributed_file(&self.namespace.staging, &self.staging_path, self.witness)
     }
 }
 
@@ -792,15 +905,28 @@ fn is_reparse(meta: &fs::Metadata) -> bool {
     dead_code,
     reason = "reserved for qualified backup custody activation and E4 fixtures"
 )]
-fn open_exclusive_private(path: &Path) -> Result<File> {
+#[cfg(unix)]
+fn open_exclusive_private(dir: &File, path: &Path) -> Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = leaf_name(path)?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_int,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(windows)]
+fn open_exclusive_private(_dir: &File, path: &Path) -> Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
@@ -856,35 +982,144 @@ fn open_readonly_no_reparse(path: &Path) -> Result<File> {
     dead_code,
     reason = "reserved for qualified backup custody activation and E4 fixtures"
 )]
-fn remove_attributed_file(path: &Path, expected: Option<HostFileWitness>) -> Result<bool> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+fn remove_attributed_file(dir: &File, path: &Path, expected: HostFileWitness) -> Result<bool> {
+    remove_verified(dir, path, expected, || {})
+}
+
+#[cfg(windows)]
+fn remove_verified(
+    _dir: &File,
+    path: &Path,
+    expected: HostFileWitness,
+    after_verify: impl FnOnce(),
+) -> Result<bool> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let file = match OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) => return Ok(error.kind() == std::io::ErrorKind::NotFound),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() || is_reparse(&meta) || file_identity(&file)? != expected.identity {
+        return Ok(false);
+    }
+    after_verify();
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    Ok(unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of_val(&disposition) as u32,
+        ) != 0
+    })
+}
+
+#[cfg(unix)]
+fn remove_verified(
+    dir: &File,
+    path: &Path,
+    expected: HostFileWitness,
+    after_verify: impl FnOnce(),
+) -> Result<bool> {
+    use std::ffi::CString;
+    use std::os::unix::{
+        ffi::OsStrExt,
+        io::{AsRawFd, FromRawFd},
+    };
+    let name = CString::new(
+        path.file_name()
+            .ok_or_else(|| anyhow::anyhow!("missing leaf"))?
+            .as_bytes(),
+    )?;
+    let directory = dir.as_raw_fd();
+    let open = |name: &CString| -> std::io::Result<File> {
+        let fd = unsafe {
+            libc::openat(
+                directory,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    };
+    // A deterministic private directory preserves custody across a crash between
+    // rename and unlink. Reconciliation inspects that slot even if the source is absent.
+    let private = CString::new(format!(".cleanup-{}", name.to_str()?))?;
+    if unsafe { libc::mkdirat(directory, private.as_ptr(), 0o700) } != 0
+        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Ok(false);
+    }
+    let quarantine = open(&private)?;
+    if unsafe { libc::flock(quarantine.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Ok(false);
+    }
+    ensure!(quarantine.metadata()?.is_dir(), "invalid cleanup directory");
+    let q = quarantine.as_raw_fd();
+    let inspect = || -> Result<Option<File>> {
+        let fd = unsafe {
+            libc::openat(
+                q,
+                c"leaf".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if fd >= 0 {
+            return Ok(Some(unsafe { File::from_raw_fd(fd) }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error.into())
+        }
+    };
+    let remove_isolated = |file: File| -> Result<bool> {
+        Ok(file.metadata()?.is_file()
+            && file_identity(&file)? == expected.identity
+            && unsafe { libc::unlinkat(q, c"leaf".as_ptr(), 0) } == 0)
+    };
+    if let Some(previous) = inspect()?
+        && !remove_isolated(previous)?
+    {
+        return Ok(false);
+    }
+    match open(&name) {
+        Ok(file) => {
+            if !file.metadata()?.is_file() || file_identity(&file)? != expected.identity {
+                return Ok(false);
+            }
+            after_verify();
+            if unsafe { libc::renameat(directory, name.as_ptr(), q, c"leaf".as_ptr()) } != 0 {
+                return Ok(false);
+            }
+            if !remove_isolated(inspect()?.ok_or_else(|| anyhow::anyhow!("cleanup slot missing"))?)?
+            {
+                // Preserve the replacement and its original name where possible.
+                if unsafe { libc::linkat(q, c"leaf".as_ptr(), directory, name.as_ptr(), 0) } == 0 {
+                    unsafe { libc::unlinkat(q, c"leaf".as_ptr(), 0) };
+                }
+                return Ok(false);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(_) => return Ok(false),
-    };
-    if is_reparse(&meta) || !meta.is_file() {
-        return Ok(false);
     }
-    // Never remove an on-disk file without a matching recorded file identity.
-    let Some(expected) = expected else {
-        return Ok(false);
-    };
-    let Ok(file) = open_readonly_no_reparse(path) else {
-        return Ok(false);
-    };
-    let Ok(actual) = file_identity(&file) else {
-        return Ok(false);
-    };
-    drop(file);
-    if actual != expected.identity {
-        return Ok(false);
-    }
-    if fs::remove_file(path).is_err() {
-        return Ok(false);
-    }
-    if let Some(parent) = path.parent() {
-        let _ = sync_directory(parent);
-    }
+    quarantine.sync_all()?;
+    ensure!(
+        unsafe { libc::unlinkat(directory, private.as_ptr(), libc::AT_REMOVEDIR) } == 0,
+        "cleanup directory retained"
+    );
+    dir.sync_all()?;
     Ok(true)
 }
 
@@ -897,7 +1132,7 @@ fn file_identity(file: &File) -> Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
     let meta = file.metadata()?;
     ensure!(
-        meta.is_file() && !meta.file_type().is_symlink(),
+        (meta.is_file() || meta.is_dir()) && !meta.file_type().is_symlink(),
         "regular file required"
     );
     let mut file_id = [0u8; 16];
@@ -915,60 +1150,23 @@ fn file_identity(file: &File) -> Result<FileIdentity> {
 #[cfg(windows)]
 fn file_identity(file: &File) -> Result<FileIdentity> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType,
-    };
-    let handle = file.as_raw_handle();
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let mut info = FILE_ID_INFO::default();
     ensure!(
         unsafe {
-            GetFileType(handle) == FILE_TYPE_DISK
-                && GetFileInformationByHandle(handle, &mut info) != 0
-        },
-        "unable to read backup file identity"
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                size_of_val(&info) as u32,
+            )
+        } != 0,
+        "backup identity unavailable"
     );
-    ensure!(
-        info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0,
-        "regular backup file required"
-    );
-    let mut file_id = [0u8; 16];
-    file_id[..4].copy_from_slice(&info.nFileIndexHigh.to_be_bytes());
-    file_id[4..8].copy_from_slice(&info.nFileIndexLow.to_be_bytes());
     Ok(FileIdentity {
-        volume: u64::from(info.dwVolumeSerialNumber),
-        file: file_id,
+        volume: info.VolumeSerialNumber,
+        file: info.FileId.Identifier,
     })
-}
-
-#[allow(
-    dead_code,
-    reason = "reserved for qualified backup custody activation and E4 fixtures"
-)]
-fn dir_id_hash(dir: &Path) -> Result<Id> {
-    let canonical = fs::canonicalize(dir)?;
-    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&digest[..16]);
-    Ok(id)
-}
-
-#[allow(
-    dead_code,
-    reason = "reserved for qualified backup custody activation and E4 fixtures"
-)]
-fn sync_directory(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        if let Ok(d) = File::open(dir) {
-            d.sync_all()?;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-    }
-    Ok(())
 }
 
 /// Verified serial backup session bound to one active VM generation and boot.
@@ -1072,12 +1270,14 @@ impl BackupHost {
         let partials = db.transact(|tx| store::list_partial_uncertain_backups(tx))?;
         let mut reconciled = 0usize;
         for row in partials {
+            let Some(witness) = row.witness else { continue };
             if custody
                 .cleanup_partial_staging(row.operation_id, row.backup_id, row.witness)
                 .unwrap_or(false)
             {
                 let proof = PartialCleanupProof {
                     backup_id: row.backup_id,
+                    witness,
                 };
                 if db.transact(|tx| store::reconcile_partial_backup(tx, proof))? {
                     reconciled += 1;
@@ -1090,8 +1290,7 @@ impl BackupHost {
     /// Drives one admitted `compose_backup` operation over the verified Compose
     /// serial channel to durable host settlement (or attributed failure/partial).
     ///
-    /// Never returns early after admission without settling the operation and
-    /// releasing the project lease.
+    /// Store errors propagate to dispatch. A pending lease can be retried with the same key.
     pub(crate) async fn drive<C: Clock>(
         &self,
         controller: &super::VmController<C>,
@@ -1102,9 +1301,9 @@ impl BackupHost {
         cancel: &Shutdown,
     ) -> Result<()> {
         let db = controller.compose_store();
-        let Ok(Some(intent)) = db.transact(|tx| store::backup_replay(tx, principal, key)) else {
-            return Ok(());
-        };
+        let intent = db
+            .transact(|tx| store::backup_replay(tx, principal, key))?
+            .ok_or_else(|| anyhow::anyhow!("admitted backup unavailable"))?;
         if intent.status != BackupOpStatus::Pending
             || intent.target != *target
             || intent.generation != session.generation
@@ -1114,24 +1313,24 @@ impl BackupHost {
         }
 
         let settle_fail = |reason: &str, interrupted: bool, cleaned: bool| -> Result<()> {
-            let now = controller.compose_now().unwrap_or(0);
-            let _ = db.transact(|tx| {
+            let now = controller.compose_now()?;
+            db.transact(|tx| {
                 store::settle_backup_failed(tx, &intent, reason, interrupted, cleaned, now)
-            });
-            Ok(())
+            })
         };
 
+        if intent.has_staging_witness {
+            return settle_fail("attribution_commit_failed", true, false);
+        }
         let Some(custody) = self.custody() else {
             return settle_fail("backup_custody_unavailable", false, true);
         };
-        let boot_live = db
-            .transact(|tx| {
-                Ok(
-                    store::live_boot(tx, target.vm, intent.generation, intent.boot)?
-                        && store::boot(tx, principal, target)? == Some(intent.generation),
-                )
-            })
-            .unwrap_or(false);
+        let boot_live = db.transact(|tx| {
+            Ok(
+                store::live_boot(tx, target.vm, intent.generation, intent.boot)?
+                    && store::boot(tx, principal, target)? == Some(intent.generation),
+            )
+        })?;
         if !boot_live {
             return settle_fail("retired_boot", true, true);
         }
@@ -1140,14 +1339,21 @@ impl BackupHost {
         let min_budget = timeouts.idle.min(MIN_EXCHANGE_BUDGET);
         let abs_deadline = Instant::now() + timeouts.absolute;
         let op_hex = hex::encode(intent.id);
-        let mut channel = session.channel.lock().await;
+        let mut channel = match super::qmp::bounded(cancel, abs_deadline, async {
+            Ok(session.channel.lock().await)
+        })
+        .await
+        {
+            Ok(channel) => channel,
+            Err(_) => return settle_fail("guest_channel_error", true, true),
+        };
 
-        let next_timeout = || -> Option<Duration> {
+        let next_timeout = || -> Option<Instant> {
             let left = abs_deadline.saturating_duration_since(Instant::now());
             if left < min_budget || left.is_zero() {
                 None
             } else {
-                Some(left.min(timeouts.idle))
+                Some(abs_deadline.min(Instant::now() + timeouts.idle))
             }
         };
 
@@ -1156,7 +1362,7 @@ impl BackupHost {
             return settle_fail("deadline_exceeded", true, true);
         };
         let query = match channel
-            .exchange_with_timeout(cancel, t, |id| Req::ComposeOperation {
+            .exchange_until(cancel, t, |id| Req::ComposeOperation {
                 id,
                 operation_id: op_hex.clone(),
             })
@@ -1197,7 +1403,7 @@ impl BackupHost {
                         return settle_fail("deadline_exceeded", true, true);
                     };
                     match channel
-                        .exchange_with_timeout(cancel, t, |id| Req::ComposeBackupBegin {
+                        .exchange_until(cancel, t, |id| Req::ComposeBackupBegin {
                             id,
                             operation_id: op_hex.clone(),
                             generation: intent.boot,
@@ -1210,46 +1416,41 @@ impl BackupHost {
                         .await
                     {
                         Ok(Resp::ComposeOperationState { operation, .. }) => break operation,
-                        Ok(Resp::ComposeRejected {
-                            code: RejectCode::BackupStagingOccupied,
+                        Ok(Resp::ComposeBackupOccupied {
+                            operation_id: stale_hex,
                             ..
                         }) if !retried_stale_staging => {
-                            // Clear stale staging left by an earlier terminal
-                            // backup on this VM and boot, then retry Begin once.
                             retried_stale_staging = true;
-                            let stale_op = db
-                                .transact(|tx| {
-                                    store::latest_terminal_backup_op_on_boot(
+                            let mut stale_id = [0; 16];
+                            if hex::decode_to_slice(&stale_hex, &mut stale_id).is_err()
+                                || !db.transact(|tx| {
+                                    store::terminal_backup_on_boot(
                                         tx,
-                                        target.vm,
+                                        target,
                                         intent.generation,
                                         intent.boot,
-                                        intent.id,
+                                        stale_id,
                                     )
-                                })
-                                .ok()
-                                .flatten();
-                            let Some(stale_id) = stale_op else {
-                                return settle_fail(
-                                    reject_label(RejectCode::BackupStagingOccupied),
-                                    false,
-                                    true,
-                                );
-                            };
+                                })?
+                            {
+                                return settle_fail("backup_staging_occupied", false, true);
+                            }
                             let Some(rel_t) = next_timeout() else {
                                 return settle_fail("deadline_exceeded", true, true);
                             };
-                            let stale_hex = hex::encode(stale_id);
+
                             match channel
-                                .exchange_with_timeout(cancel, rel_t, |id| {
-                                    Req::ComposeBackupRelease {
-                                        id,
-                                        operation_id: stale_hex,
-                                    }
+                                .exchange_until(cancel, rel_t, |id| Req::ComposeBackupRelease {
+                                    id,
+                                    operation_id: stale_hex.clone(),
                                 })
                                 .await
                             {
-                                Ok(Resp::ComposeBackupReleased { .. }) => continue,
+                                Ok(Resp::ComposeBackupReleased {
+                                    operation_id,
+                                    removed: true,
+                                    ..
+                                }) if operation_id == stale_hex => continue,
                                 _ => {
                                     return settle_fail(
                                         reject_label(RejectCode::BackupStagingOccupied),
@@ -1305,7 +1506,7 @@ impl BackupHost {
                         return settle_fail("deadline_exceeded", true, true);
                     };
                     match channel
-                        .exchange_with_timeout(cancel, t, |id| Req::ComposeReconcile {
+                        .exchange_until(cancel, t, |id| Req::ComposeReconcile {
                             id,
                             operation_id: op_hex.clone(),
                         })
@@ -1336,7 +1537,7 @@ impl BackupHost {
                         return settle_fail("deadline_exceeded", true, true);
                     };
                     match channel
-                        .exchange_with_timeout(cancel, t, |id| Req::ComposeOperation {
+                        .exchange_until(cancel, t, |id| Req::ComposeOperation {
                             id,
                             operation_id: op_hex.clone(),
                         })
@@ -1368,7 +1569,7 @@ impl BackupHost {
             return settle_fail("deadline_exceeded", true, true);
         };
         let (total_bytes, chunks, digest_hex) = match channel
-            .exchange_with_timeout(cancel, t, |id| Req::ComposeBackupMeta {
+            .exchange_until(cancel, t, |id| Req::ComposeBackupMeta {
                 id,
                 operation_id: op_hex.clone(),
             })
@@ -1461,7 +1662,7 @@ impl BackupHost {
                 return settle_fail("chunk_bounds_error", false, cleaned);
             };
             let reply = channel
-                .exchange_with_timeout(cancel, t, |id| Req::ComposeBackupChunk {
+                .exchange_until(cancel, t, |id| Req::ComposeBackupChunk {
                     id,
                     operation_id: op_hex.clone(),
                     index,
@@ -1540,14 +1741,22 @@ impl BackupHost {
         let published = match writer.finish_and_publish(intent.backup_id, total_bytes, expected_sha)
         {
             Ok(p) => p,
-            Err(PublishError::PrePublish) => {
+            Err(error @ (PublishError::PrePublish | PublishError::HardLinkUnavailable)) => {
                 // Publication never touched the settled directory; attributed
                 // cleanup of the staging leaf may safely release the charge.
                 let cleaned = custody
                     .cleanup_partial_staging(intent.id, intent.backup_id, Some(staging_witness))
                     .unwrap_or(false);
                 let _ = best_effort_release(&mut channel, &op_hex, timeouts.idle).await;
-                return settle_fail("verification_or_flush_failed", false, cleaned);
+                return settle_fail(
+                    if error == PublishError::HardLinkUnavailable {
+                        "hard_link_unavailable"
+                    } else {
+                        "verification_or_flush_failed"
+                    },
+                    false,
+                    cleaned,
+                );
             }
             Err(PublishError::PostPublishUncertain) => {
                 // Publication started or hit an occupied settled leaf: ALWAYS
@@ -1580,22 +1789,13 @@ impl BackupHost {
                 )
             })
         });
-        if committed.is_err() {
+        if let Err(error) = committed {
             // Keep the settled file and charge conservative (partial_uncertain)
             // and record its settled identity so the reconciler can attribute it.
             drop(published.hold);
-            let _ = db.transact(|tx| {
-                store::record_backup_staging_identity(
-                    tx,
-                    intent.backup_id,
-                    settled_witness.identity.volume,
-                    settled_witness.directory_id,
-                    settled_witness.identity.file,
-                )
-            });
-            let _ = settle_fail("attribution_commit_failed", true, false);
+            settle_fail("attribution_commit_failed", true, false)?;
             let _ = best_effort_release(&mut channel, &op_hex, timeouts.idle).await;
-            return Ok(());
+            return Err(error);
         }
 
         // Durable store commit succeeded: release the held handle and remove
@@ -1618,12 +1818,14 @@ async fn best_effort_release(
     // attempted when the caller's shutdown token was cancelled mid-transfer.
     let local = Shutdown::default();
     let _ = channel
-        .exchange_with_timeout(&local, timeout.min(Duration::from_secs(2)), |id| {
-            Req::ComposeBackupRelease {
+        .exchange_until(
+            &local,
+            Instant::now() + timeout.min(Duration::from_secs(2)),
+            |id| Req::ComposeBackupRelease {
                 id,
                 operation_id: operation_id.to_owned(),
-            }
-        })
+            },
+        )
         .await;
     Ok(())
 }
@@ -1694,14 +1896,46 @@ mod tests {
     }
 
     #[test]
+    fn attributed_cleanup_preserves_concurrent_replacement() {
+        let root = crate::mcp::vm::tests::backup_fixture_root();
+        let state = tempfile::tempdir().unwrap();
+        let managed = ManagedBackupDir::new(root.path(), state.path(), None).unwrap();
+        let op = [19; 16];
+        let writer = managed.begin_staging(op).unwrap();
+        let witness = writer.witness();
+        drop(writer);
+        let leaf = managed.staging_path(op).unwrap();
+        let saved = leaf.with_extension("saved");
+        let removed = remove_verified(&managed.namespace.staging, &leaf, witness, || {
+            let rename = fs::rename(&leaf, &saved);
+            #[cfg(windows)]
+            assert!(rename.is_err(), "delete handle must exclude rename");
+            #[cfg(unix)]
+            assert!(rename.is_ok());
+            if rename.is_ok() {
+                fs::write(&leaf, b"replacement").unwrap();
+            }
+        })
+        .unwrap();
+        #[cfg(windows)]
+        assert!(removed && !leaf.exists());
+        #[cfg(unix)]
+        {
+            assert!(!removed);
+            assert_eq!(fs::read(leaf).unwrap(), b"replacement");
+        }
+    }
+
+    #[test]
     fn managed_backup_dir_enforces_size_exclusive_leaf_held_handle_and_restore_disjointness() {
         let state_root = tempfile::tempdir().unwrap();
-        let backup_root = crate::service::application::tests::private_temp();
+        let backup_root = crate::mcp::vm::tests::backup_fixture_root();
         let src_dir = tempfile::tempdir().unwrap();
         let restore_dir = tempfile::tempdir().unwrap();
 
         let (bytes, sha) = make_valid_portable_sqlite(src_dir.path());
-        let managed = ManagedBackupDir::new(backup_root.path(), state_root.path(), None).unwrap();
+        let mut managed =
+            ManagedBackupDir::new(backup_root.path(), state_root.path(), None).unwrap();
 
         // 1. Mismatched expected_size fails finish_and_publish even when the
         // written bytes are a valid portable SQLite file whose digest matches
@@ -1837,5 +2071,21 @@ mod tests {
         );
         assert!(!managed.settled_path(b_crash).unwrap().exists());
         assert!(!managed.staging_path(op_crash).unwrap().exists());
+        managed.publish_link = |_, _, _| Err(std::io::ErrorKind::Unsupported.into());
+        let mut writer = managed.begin_staging(op_crash).unwrap();
+        let witness = writer.witness();
+        writer.write_chunk(&bytes).unwrap();
+        assert_eq!(
+            writer
+                .finish_and_publish(b_crash, bytes.len() as u64, sha)
+                .err(),
+            Some(PublishError::HardLinkUnavailable)
+        );
+        assert!(!managed.settled_path(b_crash).unwrap().exists());
+        assert!(
+            managed
+                .cleanup_partial_staging(op_crash, b_crash, Some(witness))
+                .unwrap()
+        );
     }
 }

@@ -251,7 +251,7 @@ struct Gate {
     allow_agent_public_sites: bool,
     publish_profile: Option<Arc<Profile>>,
     publish_jobs: tokio::task::JoinSet<anyhow::Result<()>>,
-    compose_jobs: tokio::task::JoinSet<()>,
+    compose_jobs: tokio::task::JoinSet<anyhow::Result<()>>,
     compose_active: Arc<Mutex<std::collections::HashSet<Id>>>,
     #[cfg(test)]
     fixture: Option<tests::Fixture>,
@@ -718,7 +718,7 @@ impl Supervisor {
                 "publication settlement unconfirmed"
             );
             while let Some(job) = compose_jobs.join_next().await {
-                job?;
+                job??;
             }
             Ok::<_, anyhow::Error>(())
         })
@@ -2515,7 +2515,7 @@ impl VmInventory {
             Err(compose::Fault::KeyCollision) => return Err(Refusal::KeyCollision.into()),
         };
         while let Some(joined) = gate.compose_jobs.try_join_next() {
-            if joined.is_err() {
+            if !matches!(joined, Ok(Ok(()))) {
                 return Err(STATE_UNAVAILABLE);
             }
         }
@@ -2545,6 +2545,7 @@ impl VmInventory {
                             &supervisor.cancel,
                         )
                         .await;
+                    Ok(())
                 });
             }
         }
@@ -2678,7 +2679,7 @@ impl VmInventory {
         };
 
         while let Some(joined) = gate.compose_jobs.try_join_next() {
-            if joined.is_err() {
+            if !matches!(joined, Ok(Ok(()))) {
                 return Err(STATE_UNAVAILABLE);
             }
         }
@@ -2695,7 +2696,7 @@ impl VmInventory {
                 gate.compose_jobs.spawn(async move {
                     let _running = ComposeRunning { active, id };
                     let supervisor = &inventory.supervisor;
-                    let _ = supervisor
+                    supervisor
                         .compose_backup
                         .drive(
                             &supervisor.controller,
@@ -2705,7 +2706,7 @@ impl VmInventory {
                             session,
                             &supervisor.cancel,
                         )
-                        .await;
+                        .await
                 });
             }
         }
@@ -2745,7 +2746,7 @@ impl Drop for ComposeRunning {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         config::{Agent, Config},
@@ -15760,6 +15761,30 @@ mod tests {
     // Docker E4 protected SQLite backup tests
     // -------------------------------------------------------------------------
 
+    pub(crate) fn backup_fixture_root() -> tempfile::TempDir {
+        let root = crate::service::application::tests::private_temp();
+        protect_fixture(root.path(), true).unwrap();
+        for name in ["settled", "staging"] {
+            let child = root.path().join(name);
+            fs::create_dir(&child).unwrap();
+            protect_fixture(&child, true).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn backup_fixture_custody_directories_have_the_current_owner() {
+        let root = backup_fixture_root();
+        for path in [
+            root.path().to_owned(),
+            root.path().join("staging"),
+            root.path().join("settled"),
+        ] {
+            crate::local::require_owner(&path).unwrap();
+            crate::security::private(&path).unwrap();
+        }
+    }
+
     async fn setup_compose_backup_project(
         h: &Harness,
         a: &Client,
@@ -15830,8 +15855,7 @@ mod tests {
             .enroll_compose_backup_target(vm_id, project, "data", "calm-life.sqlite3", max_bytes)
             .unwrap();
 
-        let backup_root = tempfile::tempdir().unwrap();
-        protect_fixture(backup_root.path(), true).unwrap();
+        let backup_root = backup_fixture_root();
         let managed = Arc::new(
             compose_backup::ManagedBackupDir::new(backup_root.path(), h.temp.path(), None).unwrap(),
         );
@@ -16287,8 +16311,55 @@ mod tests {
                 .is_err()
         );
 
-        // Reaper tick / TEST reap leaves both settled backups untouched on disk and in DB.
-        h.tick().await;
+        // Drive pressure admission against the same host and await a full reaper sweep.
+        let template = store
+            .transact(|tx| {
+                Ok(
+                    tx.query_row("SELECT id FROM vm_templates LIMIT 1", [], |r| {
+                        r.get::<_, Id>(0)
+                    })?,
+                )
+            })
+            .unwrap();
+        let stop = call(&a, "vm_stop", json!({"vm_id": vm,"request_id":key(5141)})).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        let create = call(
+            &a,
+            "vm_create",
+            json!({"template_id":hex::encode(template), "request_id":key(5140),"ttl_s":60}),
+        )
+        .await;
+        let victim = terminal(&a, &create).await;
+        assert_eq!(victim["state"], "succeeded", "{victim}");
+        h.fixture(|f| {
+            f.host.capacity = Some(Capacity {
+                free_bytes: 0,
+                managed_bytes: 0,
+            })
+        });
+        let pressure = call(
+            &a,
+            "static_vm_create",
+            json!({
+                "name":"pressure", "template_id":hex::encode(template), "request_id":key(5117)
+            }),
+        )
+        .await;
+        assert_eq!(pressure["reason"], "disk", "{pressure}");
+        let test_id = parse_id(victim["vm_id"].as_str().unwrap()).unwrap();
+        let proof = || {
+            store
+                .transact(|tx| crate::store::vm::tombstone_proof(tx, "alpha", test_id))
+                .unwrap()
+        };
+        assert!(proof().is_none());
+        h.now
+            .store(create["expires_at_ms"].as_i64().unwrap(), Ordering::Relaxed);
+        h.sweep().await;
+        assert!(proof().is_some());
+        let tombstone = call(&a, "vm_get", json!({"vm_id":victim["vm_id"]})).await;
+        assert_eq!(tombstone["cleanup"], "confirmed", "{tombstone}");
+        assert_eq!(tombstone["state"], "expired");
         assert!(managed.settled_path(b1_id).unwrap().exists());
         assert!(managed.settled_path(b2_id).unwrap().exists());
         let records = store
@@ -16701,56 +16772,12 @@ mod tests {
         // Case 5: Uncertain partial (post-publish failure) retains
         // host_staging_charge in disk_bytes until attributed reconciliation
         // proves cleanup and releases the charge.
-        struct UncertainCustody {
-            allow_cleanup: Arc<std::sync::atomic::AtomicBool>,
-        }
-        struct UncertainWriter;
-        impl compose_backup::StagingWriter for UncertainWriter {
-            fn witness(&self) -> compose_backup::HostFileWitness {
-                compose_backup::HostFileWitness {
-                    identity: crate::vm::paths::FileIdentity {
-                        volume: 7,
-                        file: [9; 16],
-                    },
-                    directory_id: [8; 16],
-                }
-            }
-            fn write_chunk(&mut self, _bytes: &[u8]) -> Result<()> {
-                Ok(())
-            }
-            fn finish_and_publish(
-                self: Box<Self>,
-                _backup_id: Id,
-                _expected_size: u64,
-                _expected_sha256: [u8; 32],
-            ) -> std::result::Result<compose_backup::PublishedBackup, compose_backup::PublishError>
-            {
-                Err(compose_backup::PublishError::PostPublishUncertain)
-            }
-            fn abort_and_cleanup(self: Box<Self>) -> Result<bool> {
-                Ok(false)
-            }
-        }
-        impl compose_backup::BackupCustody for UncertainCustody {
-            fn begin_staging(
-                &self,
-                _operation_id: Id,
-            ) -> Result<Box<dyn compose_backup::StagingWriter>> {
-                Ok(Box::new(UncertainWriter))
-            }
-            fn cleanup_partial_staging(
-                &self,
-                _operation_id: Id,
-                _backup_id: Id,
-                _expected: Option<compose_backup::HostFileWitness>,
-            ) -> Result<bool> {
-                Ok(self.allow_cleanup.load(Ordering::SeqCst))
-            }
-        }
-        let allow_partial_cleanup = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        *h.supervisor().compose_backup.custody.lock().unwrap() = Some(Arc::new(UncertainCustody {
-            allow_cleanup: allow_partial_cleanup.clone(),
-        }));
+        let flush_root = backup_fixture_root();
+        let mut native =
+            compose_backup::ManagedBackupDir::new(flush_root.path(), h.temp.path(), None).unwrap();
+        native.fail_published_flush();
+        let native = Arc::new(native);
+        *h.supervisor().compose_backup.custody.lock().unwrap() = Some(native.clone());
         let disk_before_partial = store
             .transact(|tx| crate::store::vm::disk_bytes(tx))
             .unwrap()
@@ -16834,12 +16861,17 @@ mod tests {
             })
         })
         .await;
-        let r_partial = poll_compose_backup_terminal(
-            &a,
-            &json!({"vm_id": vm, "project_id": "calm-life", "request_id": key(5214)}),
-        )
+        let args5 = json!({"vm_id": vm, "project_id": "calm-life", "request_id": key(5214)});
+        let accepted = call(&a, "compose_backup", args5.clone()).await;
+        assert_eq!(accepted["state"], "pending");
+        let replay_key = RequestId::parse(&key(5214)).unwrap().key;
+        until(|| {
+            store
+                .transact(|tx| crate::store::vm::compose::backup_replay(tx, "alpha", replay_key))
+                .unwrap()
+                .is_some_and(|intent| intent.status != compose_backup::BackupOpStatus::Pending)
+        })
         .await;
-        assert_eq!(r_partial["state"], "failed", "{r_partial}");
         // Uncertain partial retains host_staging_charge in disk_bytes!
         let disk_with_partial = store
             .transact(|tx| crate::store::vm::disk_bytes(tx))
@@ -16854,7 +16886,17 @@ mod tests {
             .find(|b| b.state == compose_backup::BackupRecordState::PartialUncertain)
             .expect("partial_uncertain record");
         assert_eq!(partial.host_staging_charge, max_bytes);
-        // Unconfirmed cleanup leaves partial_uncertain charged.
+
+        assert!(native.settled_path(partial.id).unwrap().is_file());
+        // Missing names in a different root cannot certify cleanup.
+        let other = backup_fixture_root();
+        let empty = Arc::new(
+            compose_backup::ManagedBackupDir::new(other.path(), h.temp.path(), None).unwrap(),
+        );
+        *h.supervisor().compose_backup.custody.lock().unwrap() = Some(empty);
+        let r_partial = call(&a, "compose_backup", args5).await;
+        assert_eq!(r_partial["state"], "failed", "{r_partial}");
+        assert!(r_partial.get("backup_id").is_none());
         assert_eq!(
             h.supervisor()
                 .compose_backup
@@ -16871,7 +16913,7 @@ mod tests {
             max_bytes
         );
         // Attributed reconciliation releases the charge only after confirmed removal.
-        allow_partial_cleanup.store(true, Ordering::SeqCst);
+        *h.supervisor().compose_backup.custody.lock().unwrap() = Some(native);
         assert_eq!(
             h.supervisor()
                 .compose_backup
@@ -16889,8 +16931,7 @@ mod tests {
         // Case 6: Query-before-submit recovery on same boot: mark sent=1 in DB
         // before driving, and prove ComposeBackupBegin is NOT re-sent!
         let (_tmp_good, good_managed) = {
-            let d = tempfile::tempdir().unwrap();
-            protect_fixture(d.path(), true).unwrap();
+            let d = backup_fixture_root();
             let m = Arc::new(
                 compose_backup::ManagedBackupDir::new(d.path(), h.temp.path(), None).unwrap(),
             );
@@ -17126,6 +17167,30 @@ mod tests {
         // Case 8: sent=1 + UnknownOperation -> lost_operation_unknown (NO second Begin).
         let k8 = RequestId::parse(&key(5219)).unwrap();
         let now8 = h.supervisor().controller.compose_now().unwrap();
+        let staged_owner = store
+            .transact(|tx| {
+                let owner = crate::store::vm::compose::admit_backup(
+                    tx,
+                    "alpha",
+                    &target,
+                    RequestId::parse(&format!("{:016x}{:016x}", now8 - 1, 5240)).unwrap(),
+                    generation,
+                    5210,
+                    now8 - 1,
+                    |_, _| Ok(Ok(())),
+                )?
+                .unwrap();
+                crate::store::vm::compose::settle_backup_failed(
+                    tx,
+                    &owner,
+                    "lost_release",
+                    true,
+                    true,
+                    now8 - 1,
+                )?;
+                Ok(hex::encode(owner.id))
+            })
+            .unwrap();
         store
             .transact(|tx| {
                 let intent = crate::store::vm::compose::admit_backup(
@@ -17215,10 +17280,9 @@ mod tests {
                 };
                 fake_compose_reply(
                     &mut peer,
-                    Resp::ComposeRejected {
+                    Resp::ComposeBackupOccupied {
                         id,
-                        code: RejectCode::BackupStagingOccupied,
-                        rule: None,
+                        operation_id: staged_owner.clone(),
                     },
                 )
                 .await;
@@ -17229,7 +17293,7 @@ mod tests {
                 else {
                     panic!("expected release of stale op")
                 };
-                assert_ne!(stale_op, operation_id);
+                assert_eq!(stale_op, staged_owner);
                 peer_stale.fetch_add(1, Ordering::SeqCst);
                 fake_compose_reply(
                     &mut peer,
@@ -17741,8 +17805,6 @@ mod tests {
             ch_backup.is_open(),
             "shared ComposeChannel::is_open must stay true during an in-flight exchange"
         );
-        in_flight_gate.notify_one();
-        let _ = probe_task.await.unwrap();
 
         store2
             .transact(|tx| crate::store::vm::compose::register_boot(tx, vm2_id, gen2, 5501))
@@ -17761,17 +17823,67 @@ mod tests {
 
         *h2.supervisor().compose_backup.timeouts.lock().unwrap() = compose_backup::BackupTimeouts {
             idle: Duration::from_secs(5),
-            absolute: Duration::from_millis(10),
+            absolute: Duration::from_millis(200),
             poll: Duration::from_millis(5),
             guest_deadline_s: 10,
         };
+        store2
+            .transact(|tx| {
+                Ok(tx.execute_batch(
+            "CREATE TRIGGER reject_settlement BEFORE UPDATE OF status ON vm_compose_backup_ops
+             BEGIN SELECT RAISE(ABORT,'fixture settlement failure'); END"
+        )?)
+            })
+            .unwrap();
+        let replay_args = json!({"vm_id": vm2, "project_id": "calm-life", "request_id": key(5510)});
+        let refused = poll_compose_backup_terminal(&a2, &replay_args).await;
+        assert_eq!(refused["reason"], "state_unavailable", "{refused}");
+        let pending = store2
+            .transact(|tx| {
+                crate::store::vm::compose::backup_replay(
+                    tx,
+                    "alpha",
+                    RequestId::parse(&key(5510)).unwrap().key,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.status, compose_backup::BackupOpStatus::Pending);
+        assert_eq!(pending.host_staging_charge, max_bytes);
+        // Shadow the replay table on this fixture connection. The pending row
+        // on disk survives a failed SELECT and the subsequent retry uses it.
+        store2
+            .transact(|tx| {
+                Ok(tx.execute_batch("CREATE TEMP TABLE vm_compose_backup_ops(missing INTEGER)")?)
+            })
+            .unwrap();
+        let host = &h2.supervisor().compose_backup;
+        let replay_failure = host
+            .drive(
+                &h2.supervisor().controller,
+                "alpha",
+                RequestId::parse(&key(5510)).unwrap().key,
+                &pending.target,
+                host.session(vm2_id).unwrap(),
+                &h2.supervisor().cancel,
+            )
+            .await;
+        store2
+            .transact(|tx| Ok(tx.execute_batch("DROP TABLE temp.vm_compose_backup_ops")?))
+            .unwrap();
+        assert!(replay_failure.is_err());
+        store2
+            .transact(|tx| Ok(tx.execute_batch("DROP TRIGGER reject_settlement")?))
+            .unwrap();
         let r_dl = poll_compose_backup_terminal(
             &a2,
             &json!({"vm_id": vm2, "project_id": "calm-life", "request_id": key(5510)}),
         )
         .await;
         assert_eq!(r_dl["state"], "interrupted", "{r_dl}");
-        assert_eq!(r_dl["failure"], "deadline_exceeded");
+        assert_eq!(r_dl["failure"], "guest_channel_error");
+        in_flight_gate.notify_one();
+        let _ = probe_task.await.unwrap();
         assert!(ch_backup.is_open(), "shared channel must remain open");
 
         let stop_req = json!({"vm_id": vm2, "project_id": "other-app", "request_id": key(5511)});

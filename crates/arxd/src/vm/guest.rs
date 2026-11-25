@@ -386,24 +386,15 @@ impl ComposeChannel {
         cancel: &Shutdown,
         request: impl FnOnce(u32) -> arx_guest::compose::ComposeRequest,
     ) -> anyhow::Result<arx_guest::compose::ComposeResponse> {
-        self.exchange_frame(cancel, FRAME_BOUND, request)
+        self.exchange_until(cancel, Instant::now() + FRAME_BOUND, request)
             .await
             .map_err(|_| anyhow::anyhow!("Compose guest exchange unavailable"))
     }
 
-    pub(crate) async fn exchange_with_timeout(
+    pub(crate) async fn exchange_until(
         &mut self,
         cancel: &Shutdown,
-        timeout: Duration,
-        request: impl FnOnce(u32) -> arx_guest::compose::ComposeRequest,
-    ) -> Result<arx_guest::compose::ComposeResponse, ChannelError> {
-        self.exchange_frame(cancel, timeout, request).await
-    }
-
-    async fn exchange_frame(
-        &mut self,
-        cancel: &Shutdown,
-        timeout: Duration,
+        deadline: Instant,
         request: impl FnOnce(u32) -> arx_guest::compose::ComposeRequest,
     ) -> Result<arx_guest::compose::ComposeResponse, ChannelError> {
         use arx_guest::compose::ComposeResponse::*;
@@ -418,7 +409,7 @@ impl ComposeChannel {
             }
         }
 
-        let mut state = self.inner.lock().await;
+        let mut state = bounded(cancel, deadline, async { Ok(self.inner.lock().await) }).await?;
         let Some(mut transport) = state.transport.take() else {
             self.open.store(false, Ordering::Release);
             return Err(ChannelError::Closed);
@@ -426,7 +417,7 @@ impl ComposeChannel {
         let mut guard = CloseOnDrop(&self.open, true);
         let id = state.next_id;
         state.next_id = id.checked_add(1).ok_or(ChannelError::Closed)?;
-        let response = bounded(cancel, Instant::now() + timeout, async {
+        let response = bounded(cancel, deadline, async {
             send_compose(&mut transport, request(id)).await?;
             state.inbound.next_frame(&mut transport).await
         })
@@ -441,6 +432,7 @@ impl ComposeChannel {
             | ComposeSecretAccepted { id, .. }
             | ComposeBackupReady { id, .. }
             | ComposeBackupData { id, .. }
+            | ComposeBackupOccupied { id, .. }
             | ComposeBackupReleased { id, .. }
             | ComposeRejected { id, .. } => *id,
             ComposeHelloAck { .. } => return Err(ChannelError::Unexpected),

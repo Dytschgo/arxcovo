@@ -480,6 +480,10 @@ pub enum ComposeResponse {
         index: u32,
         data: String,
     },
+    ComposeBackupOccupied {
+        id: u32,
+        operation_id: String,
+    },
     ComposeBackupReleased {
         id: u32,
         operation_id: String,
@@ -914,7 +918,8 @@ impl Message for ComposeResponse {
                         && is_base64_text(data, BACKUP_CHUNK_BYTES),
                 )
             }
-            Self::ComposeBackupReleased {
+            Self::ComposeBackupOccupied { id, operation_id }
+            | Self::ComposeBackupReleased {
                 id, operation_id, ..
             } => {
                 validate_id(*id)?;

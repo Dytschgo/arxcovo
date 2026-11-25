@@ -2327,7 +2327,10 @@ impl ComposeService {
         }
         if let Some(staged) = &inner.state.staged_backup {
             if staged.generation == generation && staged.operation_id != operation_id {
-                return reject(id, RejectCode::BackupStagingOccupied);
+                return ComposeResponse::ComposeBackupOccupied {
+                    id,
+                    operation_id: staged.operation_id.clone(),
+                };
             }
             // Stale staging from a prior boot generation is cleaned before a new backup.
             let stale_op = staged.operation_id.clone();

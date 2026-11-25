@@ -4795,6 +4795,7 @@ mod tests {
             )?;
             let synthetic_intent = crate::vm::compose_backup::BackupIntent {
                 id: syn_op,
+                has_staging_witness: false,
                 backup_id: syn_bk,
                 target: target1.clone(),
                 generation: gen_id,
