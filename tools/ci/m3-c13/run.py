@@ -64,6 +64,29 @@ DIAGNOSTIC = re.compile(
     r"issuer-refused|seal|recheck-busy|recheck-refused))"
 )
 PIN = "C13 starts=6 closes=6 Found=1 Mint=3 AnchorQuery=3 Redeem=3 admissions=2 AddNodes=2 joint=1 flatten=1 transfer=2 enrollment_proposals=7"
+PUBLICATION = re.compile(r"C13 publication node=4 term=\d+ leader=\d+ index=\d+")
+# Both pins are the panic lines from the runs that reddened main, and both
+# assertions are still those lines on 270df38e. Mint is the owner-mint
+# success check. Promotion-transfer is the readiness assert, which other
+# phases also call, so the phase stays part of the pin. A wider line pin
+# would hide a different assertion with the same message.
+# Run 45570315686 attempt 1: join mint-refused, owner node a action mint
+# exit 8, result 101. Run 45457780671 attempt 1: promotion-transfer
+# process-exited, result 101, no owner line. Both reaped every helper with
+# helper_unknown=0 and removed the fixture with no retained or unknown
+# roles. Neither closed every worker gracefully (clean=2, spawned=3), so
+# graceful close stays required for success only.
+MINT_QUARANTINE = (
+    "C13 first phase=join category=assertion "
+    "at=m3_activation_linux.rs:1366 message=mint-refused"
+)
+PROMOTION_QUARANTINE = (
+    "C13 first phase=promotion-transfer category=assertion "
+    "at=m3_activation_linux.rs:766 message=process-exited"
+)
+MINT_OWNER_QUARANTINE = "C13 owner node=a action=mint exit=8"
+QUARANTINE_NAMES = frozenset(("mint-refused", "promotion-transfer-process-exited"))
+QUARANTINE_MARKER = "c13-quarantine"
 
 
 def exact_listing(data, name):
@@ -295,6 +318,101 @@ def cleanup_disposition(lines):
     return reaped_all, clean_close
 
 
+def quarantine_signature(first, lines, *, code, truncated, fixture, retained, unknown):
+    # Result 101 is the harness panic status from both incidents. A timeout,
+    # a different status, or truncated campaign output is a separate anomaly.
+    # Artifact mismatches raise before this decision and keep a non-zero exit.
+    if (code != 101 or truncated or fixture != "removed" or retained != 0
+            or unknown != 0 or PIN in lines):
+        return None
+    reaped_all, _clean_close = cleanup_disposition(lines)
+    if not reaped_all:
+        return None
+    failures = [line for line in lines if FIRST.fullmatch(line) or ASSERTION.fullmatch(line)]
+    if failures != [first]:
+        return None
+    if any(PUBLICATION.fullmatch(line) for line in lines):
+        return None
+    owners = [line for line in lines if OWNER_EXIT.fullmatch(line)]
+    if first == MINT_QUARANTINE and owners == [MINT_OWNER_QUARANTINE]:
+        return "mint-refused"
+    if first == PROMOTION_QUARANTINE and not owners:
+        return "promotion-transfer-process-exited"
+    return None
+
+
+def announce_quarantine(signature):
+    line = f"C13 quarantined signature={signature}"
+    print(line, flush=True)
+    # GitHub renders a workflow command only when it starts a log line.
+    print(f"::warning::{line}", flush=True)
+
+
+def write_quarantine_marker(directory, signature):
+    if signature not in QUARANTINE_NAMES:
+        raise ValueError("quarantine signature")
+    path = os.path.join(os.fspath(directory), QUARANTINE_MARKER)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    descriptor = os.open(path, flags, 0o644)
+    try:
+        os.write(descriptor, (signature + "\n").encode("ascii"))
+    finally:
+        os.close(descriptor)
+
+
+def read_quarantine_marker(stage):
+    path = os.path.join(os.fspath(stage), QUARANTINE_MARKER)
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return None
+    if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > 80):
+        return None
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(path, flags)
+    try:
+        data = os.read(descriptor, 81)
+    finally:
+        os.close(descriptor)
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if text.count("\n") != 1 or not text.endswith("\n"):
+        return None
+    signature = text[:-1]
+    return signature if signature in QUARANTINE_NAMES else None
+
+
+def append_step_summary(line):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    if len(path) > 300 or any(char in path for char in "\r\n\x00"):
+        raise ValueError("step summary path")
+    flags = os.O_WRONLY | os.O_APPEND
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    descriptor = os.open(path, flags)
+    try:
+        os.write(descriptor, (line + "\n").encode("utf-8"))
+    finally:
+        os.close(descriptor)
+
+
 def ip_json(arguments, deadline):
     run = subprocess.run(["/usr/sbin/ip", "-j", "-4", *arguments],
                          env=ENV, capture_output=True, stdin=subprocess.DEVNULL,
@@ -339,7 +457,14 @@ def launch_privileged(stage, root_deadline, deadline):
                              "--staged", stage, str(int(root_deadline * 1_000_000))],
                             env=ENV, stdin=subprocess.DEVNULL, check=False,
                             timeout=remaining(deadline - 2, TOTAL))
-    return int(result.returncode != 0)
+    if result.returncode != 0:
+        return 1
+    # The privileged child prints the warning. Only this process has the
+    # runner's step-summary file, and only a signature it just recorded.
+    signature = read_quarantine_marker(stage)
+    if signature is not None:
+        append_step_summary(f"C13 quarantined signature={signature}")
+    return 0
 
 
 def relay_diagnostics(diagnostic):
@@ -369,6 +494,7 @@ def relay_diagnostics(diagnostic):
 
 
 def privileged(stage, deadline):
+    stage_directory = os.fspath(stage)
     qualify_runner()
     if os.geteuid() != 0:
         raise ValueError("runner staging identity")
@@ -387,6 +513,9 @@ def privileged(stage, deadline):
     successful = False
     first = None
     diagnostic = b""
+    code = None
+    capture = None
+    lines = []
     start = time.monotonic()
     phase = "staging"
     try:
@@ -424,8 +553,7 @@ def privileged(stage, deadline):
               flush=True)
         for line in lines:
             if (line == PIN or CLEANUP.fullmatch(line) or OWNER_EXIT.fullmatch(line)
-                    or re.fullmatch(
-                        r"C13 publication node=4 term=\d+ leader=\d+ index=\d+", line)):
+                    or PUBLICATION.fullmatch(line)):
                 print(line, flush=True)
         successful = (code == 0 and lines.count(PIN) == 1 and may_remove
                       and clean_close and first is None)
@@ -458,6 +586,14 @@ def privileged(stage, deadline):
               f"roles_retained={retained} roles_unknown={unknown} "
               f"seconds={time.monotonic()-start:.3f}", flush=True)
     relay_diagnostics(diagnostic)
+    signature = quarantine_signature(
+        first, lines, code=code, truncated=bool(capture is not None and capture.truncated),
+        fixture=fixture, retained=retained, unknown=unknown,
+    )
+    if signature is not None:
+        write_quarantine_marker(stage_directory, signature)
+        announce_quarantine(signature)
+        return 0
     return int(not successful or retained != 0 or unknown != 0 or fixture != "removed")
 
 

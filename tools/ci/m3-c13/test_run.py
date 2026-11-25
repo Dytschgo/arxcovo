@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -14,7 +15,7 @@ SPEC.loader.exec_module(RUN)
 
 
 class LauncherTests(unittest.TestCase):
-    def fixture_campaign(self, code, capture, diagnostics):
+    def fixture_campaign(self, code, capture, diagnostics, role="removed"):
         stage = MagicMock(is_symlink=lambda: False)
         stage.stat.return_value.st_uid = 23
         output = io.StringIO()
@@ -31,7 +32,7 @@ class LauncherTests(unittest.TestCase):
               patch.object(RUN, "stage_binary"),
               patch.object(RUN, "primary_ip", return_value="10.1.0.22"),
               patch.object(RUN, "run_campaign", return_value=(code, capture, diagnostics)),
-              patch.object(RUN, "remove_role", return_value="removed") as remove_role,
+              patch.object(RUN, "remove_role", return_value=role) as remove_role,
               patch.object(RUN.time, "monotonic", return_value=10),
               redirect_stdout(output)):
             status = RUN.privileged("/tmp/arx-c13-abcdefgh", 178)
@@ -172,6 +173,8 @@ class LauncherTests(unittest.TestCase):
         _, write, close = self.optional_pipe(BrokenPipeError)
         status, output, roles, commands = self.fixture_campaign(0, capture, diagnostic)
         self.assertEqual(status, 0)
+        self.assertNotIn("quarantined", output)
+        self.assertNotIn("::warning::", output)
         self.assertIn("fixture=removed roles_removed=8 roles_retained=0 roles_unknown=0", output)
         self.assertEqual((roles, commands), (8, 9))
         write.assert_called_once_with(11, diagnostic)
@@ -295,3 +298,170 @@ class LauncherTests(unittest.TestCase):
         self.assertAlmostEqual(child.wait.call_args.kwargs["timeout"], 0.2)
         child.__exit__.assert_not_called()
         child.stdout.__exit__.assert_called_once()
+
+    def evidence(self, first, cleanup, owner=None, extra=()):
+        lines = [line for line in (owner, cleanup, first, *extra) if line is not None]
+        capture = RUN.Capture()
+        capture.feed(("\n".join(lines) + "\n").encode("ascii"))
+        return lines, capture
+
+    def test_quarantine_pins_are_the_observed_failures(self):
+        self.assertEqual(
+            RUN.MINT_QUARANTINE,
+            "C13 first phase=join category=assertion "
+            "at=m3_activation_linux.rs:1366 message=mint-refused",
+        )
+        self.assertEqual(RUN.MINT_OWNER_QUARANTINE, "C13 owner node=a action=mint exit=8")
+        self.assertEqual(
+            RUN.PROMOTION_QUARANTINE,
+            "C13 first phase=promotion-transfer category=assertion "
+            "at=m3_activation_linux.rs:766 message=process-exited",
+        )
+
+    def test_clean_signatures_quarantine_and_mutants_stay_red(self):
+        mint_cleanup = ("C13 cleanup spawned=3 signaled=3 reaped=3 clean=2 "
+                        "helpers=16 helpers_reaped=16 helper_unknown=0")
+        promotion_cleanup = ("C13 cleanup spawned=3 signaled=2 reaped=3 clean=2 "
+                             "helpers=22 helpers_reaped=22 helper_unknown=0")
+        mint_lines, _ = self.evidence(RUN.MINT_QUARANTINE, mint_cleanup, RUN.MINT_OWNER_QUARANTINE)
+        promotion_lines, _ = self.evidence(RUN.PROMOTION_QUARANTINE, promotion_cleanup)
+        clean = {"code": 101, "truncated": False, "fixture": "removed", "retained": 0, "unknown": 0}
+        self.assertEqual(RUN.quarantine_signature(RUN.MINT_QUARANTINE, mint_lines, **clean),
+                         "mint-refused")
+        self.assertEqual(
+            RUN.quarantine_signature(RUN.PROMOTION_QUARANTINE, promotion_lines, **clean),
+            "promotion-transfer-process-exited",
+        )
+        success = [RUN.PIN, promotion_cleanup.replace("spawned=3 signaled=2 reaped=3 clean=2",
+                                                      "spawned=6 signaled=6 reaped=6 clean=6")]
+        self.assertIsNone(RUN.quarantine_signature(None, success, code=0, truncated=False,
+                                                   fixture="removed", retained=0, unknown=0))
+        mutants = {
+            "unclean teardown": {**clean, "fixture": "retained", "retained": 8},
+            "different message": None,
+            "different phase": None,
+            "extra anomaly": None,
+            "missing owner": None,
+            "parse failure": None,
+            "timeout": {**clean, "code": None},
+            "other status": {**clean, "code": 102},
+            "truncated output": {**clean, "truncated": True},
+        }
+        different_message, _ = self.evidence(
+            RUN.MINT_QUARANTINE.replace("message=mint-refused", "message=join-refused"),
+            mint_cleanup, RUN.MINT_OWNER_QUARANTINE,
+        )
+        different_phase, _ = self.evidence(
+            RUN.PROMOTION_QUARANTINE.replace("phase=promotion-transfer", "phase=join"),
+            promotion_cleanup,
+        )
+        extra, _ = self.evidence(
+            RUN.MINT_QUARANTINE, mint_cleanup, RUN.MINT_OWNER_QUARANTINE,
+            extra=("C13 first phase=close category=assertion",),
+        )
+        missing_owner, _ = self.evidence(RUN.MINT_QUARANTINE, mint_cleanup)
+        unparsed, _ = self.evidence(
+            RUN.MINT_QUARANTINE, "C13 cleanup spawned=3 signaled=3 reaped=3",
+            RUN.MINT_OWNER_QUARANTINE,
+        )
+        cases = (
+            ("unclean teardown", RUN.MINT_QUARANTINE, mint_lines, mutants["unclean teardown"]),
+            ("different message", different_message[2], different_message, clean),
+            ("different phase", different_phase[1], different_phase, clean),
+            ("extra anomaly", RUN.MINT_QUARANTINE, extra, clean),
+            ("missing owner", RUN.MINT_QUARANTINE, missing_owner, clean),
+            ("parse failure", RUN.MINT_QUARANTINE, unparsed, clean),
+            ("timeout", RUN.MINT_QUARANTINE, mint_lines, mutants["timeout"]),
+            ("other status", RUN.MINT_QUARANTINE, mint_lines, mutants["other status"]),
+            ("truncated output", RUN.MINT_QUARANTINE, mint_lines, mutants["truncated output"]),
+        )
+        for name, first, lines, fields in cases:
+            with self.subTest(name=name):
+                self.assertIsNone(RUN.quarantine_signature(first, lines, **fields))
+
+    def test_privileged_quarantine_warns_and_success_stays_success(self):
+        mint_cleanup = ("C13 cleanup spawned=3 signaled=3 reaped=3 clean=2 "
+                        "helpers=16 helpers_reaped=16 helper_unknown=0")
+        promotion_cleanup = ("C13 cleanup spawned=3 signaled=2 reaped=3 clean=2 "
+                             "helpers=22 helpers_reaped=22 helper_unknown=0")
+        cases = (
+            ("mint-refused", RUN.MINT_QUARANTINE, mint_cleanup, RUN.MINT_OWNER_QUARANTINE),
+            ("promotion-transfer-process-exited", RUN.PROMOTION_QUARANTINE, promotion_cleanup, None),
+        )
+        for signature, first, cleanup, owner in cases:
+            with self.subTest(signature=signature):
+                _, capture = self.evidence(first, cleanup, owner)
+                with patch.object(RUN, "write_quarantine_marker") as marker:
+                    status, output, roles, commands = self.fixture_campaign(101, capture, b"")
+                self.assertEqual(status, 0)
+                self.assertEqual((roles, commands), (8, 9))
+                line = f"C13 quarantined signature={signature}\n"
+                self.assertIn(line, output)
+                self.assertIn(f"::warning::{line}", output)
+                marker.assert_called_once_with("/tmp/arx-c13-abcdefgh", signature)
+        refused = (
+            ("unclean teardown", RUN.MINT_QUARANTINE, mint_cleanup, RUN.MINT_OWNER_QUARANTINE, "retained"),
+            ("different message",
+             RUN.MINT_QUARANTINE.replace("message=mint-refused", "message=join-refused"),
+             mint_cleanup, RUN.MINT_OWNER_QUARANTINE, "removed"),
+            ("different phase",
+             RUN.PROMOTION_QUARANTINE.replace("phase=promotion-transfer", "phase=founder"),
+             promotion_cleanup, None, "removed"),
+            ("extra anomaly", RUN.PROMOTION_QUARANTINE, promotion_cleanup, None, "removed"),
+            ("missing owner", RUN.MINT_QUARANTINE, mint_cleanup, None, "removed"),
+        )
+        for name, first, cleanup, owner, role in refused:
+            with self.subTest(privileged=name):
+                extra = ("C13 publication node=4 term=1 leader=1 index=1",) if name == "extra anomaly" else ()
+                _, capture = self.evidence(first, cleanup, owner, extra)
+                with patch.object(RUN, "write_quarantine_marker") as marker:
+                    status, output, _, _ = self.fixture_campaign(101, capture, b"", role)
+                self.assertEqual(status, 1)
+                self.assertNotIn("quarantined", output)
+                self.assertNotIn("::warning::", output)
+                marker.assert_not_called()
+
+    def test_step_summary_follows_only_a_recorded_quarantine(self):
+        stage = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        summary = stage / "summary.txt"
+        summary.write_bytes(b"")
+        marker = stage / RUN.QUARANTINE_MARKER
+        env = {"GITHUB_STEP_SUMMARY": str(summary)}
+
+        def launch(code, **kwargs):
+            with (patch.dict(RUN.os.environ, env, clear=True),
+                  patch.object(RUN.time, "monotonic", return_value=10),
+                  patch.object(RUN.subprocess, "run", return_value=MagicMock(returncode=code))):
+                return RUN.launch_privileged(stage, 20, 30)
+
+        self.assertEqual(launch(0), 0)
+        self.assertEqual(summary.read_bytes(), b"")
+        marker.write_bytes(b"mint-refused\n")
+        self.assertEqual(launch(0), 0)
+        self.assertEqual(summary.read_bytes(), b"C13 quarantined signature=mint-refused\n")
+        self.assertEqual(launch(1), 1)
+        self.assertEqual(summary.read_bytes(), b"C13 quarantined signature=mint-refused\n")
+        marker.write_bytes(b"promotion-transfer-process-exited\n")
+        self.assertEqual(launch(0), 0)
+        self.assertEqual(
+            summary.read_text(encoding="utf-8"),
+            "C13 quarantined signature=mint-refused\n"
+            "C13 quarantined signature=promotion-transfer-process-exited\n",
+        )
+        summary.write_bytes(b"")
+        marker.unlink()
+        marker.mkdir()
+        self.assertEqual(launch(0), 0)
+        self.assertEqual(summary.read_bytes(), b"")
+        marker.rmdir()
+        marker.write_bytes(b"not-a-signature\n")
+        self.assertEqual(launch(0), 0)
+        self.assertEqual(summary.read_bytes(), b"")
+
+    def test_launcher_timeout_is_not_quarantined(self):
+        stage = Path("/tmp/arx-c13-abcdefgh")
+        with (patch.object(RUN.time, "monotonic", return_value=10),
+              patch.object(RUN.subprocess, "run",
+                           side_effect=RUN.subprocess.TimeoutExpired("sudo", 1))):
+            with self.assertRaises(RUN.subprocess.TimeoutExpired):
+                RUN.launch_privileged(stage, 20, 30)
