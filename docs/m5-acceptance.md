@@ -95,10 +95,8 @@ paths, identities, credentials, and raw MCP transcripts are excluded.
   `vm_admission_closed` until a qualified runtime opens that gate. The client
   records the refusal and fails. This journey does not change that product
   behavior.
-- The M4 owner discovery check still expects the pre-vault `list_activity`
-  schema. This journey checks the vault `oneOf` schema and does not change
-  that M4 check. An M4 owner run against the current TEST foreground fails
-  `schema_changed` for `list_activity`.
+- Both journeys require the vault `oneOf` `list_activity` schema. The
+  pre-vault activity object, and any other shape, is `schema_changed`.
 - A broken version that activates, exits 0, skips cleanup, or replaces the
   active version fails the acceptance.
 
