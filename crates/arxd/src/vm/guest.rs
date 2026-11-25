@@ -468,3 +468,342 @@ async fn send_compose(
     drop(frame);
     transport.flush().await.map_err(|_| ChannelError::Io)
 }
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+pub(super) mod network_probe {
+    use serde::Deserialize;
+    use std::{
+        collections::BTreeSet,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+    };
+    use tokio::io::{AsyncRead, AsyncReadExt};
+
+    use super::ChannelError;
+
+    /// Enrolled witness sockets. The alias control is on the host loopback
+    /// and is addressed by its slirp alias only from the probe guest.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(in crate::vm) struct Targets {
+        pub ipv4: SocketAddr,
+        pub ipv6: SocketAddr,
+        pub host: SocketAddr,
+        pub host_alias_port: u16,
+        pub management: SocketAddr,
+        pub public: SocketAddr,
+        pub dns: SocketAddr,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(in crate::vm) struct ProbeReport {
+        pub nic_ready: bool,
+        pub ipv4_lease: bool,
+        pub default_route: bool,
+        pub ipv6_disabled: bool,
+        pub denied_probes: u8,
+    }
+
+    impl ProbeReport {
+        pub(in crate::vm) fn passed(self) -> bool {
+            self.nic_ready
+                && self.ipv4_lease
+                && self.default_route
+                && self.ipv6_disabled
+                && self.denied_probes == 8
+        }
+    }
+
+    impl Targets {
+        pub(in crate::vm) fn guest_tcp(&self) -> [SocketAddr; 6] {
+            [
+                self.ipv4,
+                self.ipv6,
+                self.host,
+                (Ipv4Addr::new(10, 0, 2, 2), self.host_alias_port).into(),
+                self.management,
+                self.public,
+            ]
+        }
+
+        pub(in crate::vm) fn valid(&self) -> bool {
+            let tcp = self.guest_tcp();
+            let v4 = |address: SocketAddr| match address.ip() {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            };
+            let is_slirp = |ip: Ipv4Addr| {
+                let [a, b, c, _] = ip.octets();
+                a == 10 && b == 0 && c == 2
+            };
+            let is_private_v4 = |ip: Ipv4Addr| {
+                ip.is_private()
+                    || ip.is_link_local()
+                    || matches!(ip.octets(), [100, b, ..] if (64..=127).contains(&b))
+            };
+            let Some(ipv4) = v4(self.ipv4) else {
+                return false;
+            };
+            let Some(host) = v4(self.host) else {
+                return false;
+            };
+            let Some(management) = v4(self.management) else {
+                return false;
+            };
+            let Some(public) = v4(self.public) else {
+                return false;
+            };
+            let dns_not_slirp = !matches!(self.dns.ip(), IpAddr::V4(ip) if is_slirp(ip));
+            self.ipv6.is_ipv6()
+                && !self.ipv6.ip().is_loopback()
+                && !ipv4.is_loopback()
+                && !is_slirp(ipv4)
+                && !host.is_loopback()
+                && !is_slirp(host)
+                && !management.is_loopback()
+                && !is_slirp(management)
+                && is_private_v4(management)
+                && !public.is_loopback()
+                && !is_slirp(public)
+                && !is_private_v4(public)
+                && self.dns.port() == 53
+                && dns_not_slirp
+                && tcp.into_iter().chain([self.dns]).all(valid_socket)
+                && tcp.into_iter().collect::<BTreeSet<_>>().len() == tcp.len()
+        }
+
+        /// Bind the enrolled DNS witness to a real host resolver backing the
+        /// slirp `10.0.2.3` alias.
+        pub(in crate::vm) fn valid_with_resolvers(&self, host_resolvers: &[IpAddr]) -> bool {
+            self.valid() && host_resolvers.contains(&self.dns.ip())
+        }
+
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        pub(in crate::vm) async fn known_live(&self, nonce: &[u8; 16]) -> bool {
+            use std::time::Duration;
+            use tokio::{
+                io::AsyncWriteExt,
+                net::{TcpStream, UdpSocket},
+                time::timeout,
+            };
+            if !self.valid() {
+                return false;
+            }
+            let mut controls = self.guest_tcp();
+            controls[3].set_ip(Ipv4Addr::LOCALHOST.into());
+            for address in controls {
+                let result = timeout(Duration::from_secs(2), async {
+                    let mut stream = TcpStream::connect(address).await?;
+                    stream.write_all(nonce).await?;
+                    let mut answer = [0; 16];
+                    stream.read_exact(&mut answer).await?;
+                    std::io::Result::Ok(answer == *nonce)
+                })
+                .await;
+                if !matches!(result, Ok(Ok(true))) {
+                    return false;
+                }
+            }
+            matches!(
+                timeout(Duration::from_secs(2), async {
+                    let bind: SocketAddr = if self.dns.is_ipv4() {
+                        (Ipv4Addr::UNSPECIFIED, 0).into()
+                    } else {
+                        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+                    };
+                    let socket = UdpSocket::bind(bind).await?;
+                    socket.connect(self.dns).await?;
+                    let query = dns_query(nonce);
+                    socket.send(&query).await?;
+                    let mut response = [0; 512];
+                    let count = socket.recv(&mut response).await?;
+                    std::io::Result::Ok(validate_dns_reply(&query, &response[..count]))
+                })
+                .await,
+                Ok(Ok(true))
+            )
+        }
+    }
+
+    fn valid_socket(address: SocketAddr) -> bool {
+        address.port() != 0
+            && !address.ip().is_unspecified()
+            && !address.ip().is_multicast()
+            && !matches!(address.ip(), IpAddr::V4(ip) if ip == Ipv4Addr::BROADCAST)
+    }
+
+    pub(in crate::vm) fn dns_query(nonce: &[u8; 16]) -> Vec<u8> {
+        let mut packet = Vec::from(&nonce[..2]);
+        packet.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 36]);
+        packet.extend_from_slice(b"arx-");
+        packet.extend_from_slice(hex::encode(nonce).as_bytes());
+        packet.extend_from_slice(b"\x07invalid\x00\x00\x01\x00\x01");
+        packet
+    }
+
+    /// Require a full, non-truncated, standard DNS reply whose transaction ID
+    /// and echoed question section match the exact nonce-bound query.
+    pub(in crate::vm) fn validate_dns_reply(query: &[u8], reply: &[u8]) -> bool {
+        if query.len() < 12 || reply.len() < query.len() {
+            return false;
+        }
+        let qr = reply[2] & 0x80 != 0;
+        let opcode = (reply[2] >> 3) & 0x0f;
+        let truncated = reply[2] & 0x02 != 0;
+        let rcode = reply[3] & 0x0f;
+        let qdcount = u16::from_be_bytes([reply[4], reply[5]]);
+        reply[..2] == query[..2]
+            && qr
+            && opcode == 0
+            && !truncated
+            && matches!(rcode, 0 | 3)
+            && qdcount == 1
+            && reply[12..query.len()] == query[12..]
+    }
+
+    /// One exact structured response, bound to the seed. The enclosing caller
+    /// holds the PID/Job-verified pipe and imposes the absolute read deadline.
+    pub(in crate::vm) async fn response(
+        mut source: impl AsyncRead + Unpin,
+        nonce: &[u8; 16],
+    ) -> Result<ProbeReport, ChannelError> {
+        let mut buffer = [0; 55];
+        source
+            .read_exact(&mut buffer)
+            .await
+            .map_err(|_| ChannelError::Eof)?;
+        let text = std::str::from_utf8(&buffer).map_err(|_| ChannelError::Invalid)?;
+        let body = text
+            .strip_prefix("ARXNET2 ")
+            .and_then(|rest| rest.strip_suffix('\n'))
+            .ok_or(ChannelError::Invalid)?;
+        let mut parts = body.split(' ');
+        let (Some(got_nonce), Some(setup), Some(outcomes), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(ChannelError::Invalid);
+        };
+        if got_nonce != hex::encode(nonce)
+            || setup.len() != 4
+            || !setup.bytes().all(|b| matches!(b, b'0' | b'1'))
+            || outcomes.len() != 8
+            || !outcomes
+                .bytes()
+                .all(|b| matches!(b, b'D' | b'R' | b'M' | b'E'))
+        {
+            return Err(ChannelError::Unexpected);
+        }
+        let flags: Vec<bool> = setup.bytes().map(|b| b == b'1').collect();
+        let report = ProbeReport {
+            nic_ready: flags[0],
+            ipv4_lease: flags[1],
+            default_route: flags[2],
+            ipv6_disabled: flags[3],
+            denied_probes: outcomes.bytes().filter(|&b| b == b'D').count() as u8,
+        };
+        if !report.passed() {
+            return Err(ChannelError::Unexpected);
+        }
+        Ok(report)
+    }
+
+    #[cfg(test)]
+    pub(in crate::vm) fn fixture_targets() -> Targets {
+        serde_json::from_str(
+            r#"{
+            "ipv4":"192.0.2.10:8001","ipv6":"[2001:db8::2]:8002",
+            "host":"192.0.2.11:8003","host_alias_port":8004,
+            "management":"10.0.1.2:8005","public":"192.0.2.13:8006",
+            "dns":"192.0.2.14:53"
+        }"#,
+        )
+        .unwrap()
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn restricted_network_response_requires_setup_nonce_and_all_denials() {
+        let nonce = [42; 16];
+        let targets = fixture_targets();
+        assert!(targets.valid());
+        assert!(targets.valid_with_resolvers(&[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 14))]));
+        assert!(!targets.valid_with_resolvers(&[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99))]));
+        let frame =
+            |nonce, setup, outcomes| format!("ARXNET2 {} {setup} {outcomes}\n", hex::encode(nonce));
+        assert_eq!(
+            response(frame(nonce, "1111", "DDDDDDDD").as_bytes(), &nonce).await,
+            Ok(ProbeReport {
+                nic_ready: true,
+                ipv4_lease: true,
+                default_route: true,
+                ipv6_disabled: true,
+                denied_probes: 8,
+            })
+        );
+        for (bad_nonce, setup, outcomes) in [
+            ([14; 16], "1111", "DDDDDDDD"),
+            (nonce, "1011", "DDDDDDDD"), // missing IPv4 DHCP lease
+            (nonce, "1101", "DDDDDDDD"), // missing default route
+            (nonce, "1110", "DDDDDDDD"), // IPv6 not disabled
+            (nonce, "1111", "DDDDDDDR"), // one probe reached target
+            (nonce, "1111", "DDDDDDDM"), // malformed DNS reply
+            (nonce, "1111", "DDDDDDDE"), // setup error instead of denial
+        ] {
+            assert_eq!(
+                response(frame(bad_nonce, setup, outcomes).as_bytes(), &nonce).await,
+                Err(ChannelError::Unexpected),
+                "{setup} {outcomes}"
+            );
+        }
+        assert_eq!(
+            response(b"ARXNET2 ".as_slice(), &nonce).await,
+            Err(ChannelError::Eof)
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn dns_reply_validation_requires_exact_nonce_question_and_header() {
+        let nonce = [0x5a; 16];
+        let query = dns_query(&nonce);
+        let mut reply = query.clone();
+        reply[2] = 0x81; // QR=1, opcode=0, RD=1
+        reply[3] = 0x83; // RA=1, NXDOMAIN
+        assert!(validate_dns_reply(&query, &reply));
+        let mut noerror = reply.clone();
+        noerror[3] = 0x80;
+        assert!(validate_dns_reply(&query, &noerror));
+        // Wrong txid, QR=0, truncated, SERVFAIL, QDCOUNT=0, mutated question, short packet.
+        for mutate in [
+            |r: &mut Vec<u8>| r[0] ^= 1,
+            |r: &mut Vec<u8>| r[2] &= 0x7f,
+            |r: &mut Vec<u8>| r[2] |= 0x02,
+            |r: &mut Vec<u8>| r[3] = 0x82,
+            |r: &mut Vec<u8>| r[5] = 0,
+            |r: &mut Vec<u8>| r[20] ^= 1,
+            |r: &mut Vec<u8>| r.truncate(12),
+        ] {
+            let mut bad = reply.clone();
+            mutate(&mut bad);
+            assert!(!validate_dns_reply(&query, &bad));
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn target_validation_enforces_roles_and_rejects_slirp_and_wrong_dns_port() {
+        let mut bad_public = fixture_targets();
+        bad_public.public = "10.0.1.9:8006".parse().unwrap();
+        assert!(!bad_public.valid());
+
+        let mut bad_mgmt = fixture_targets();
+        bad_mgmt.management = "192.0.2.50:8005".parse().unwrap();
+        assert!(!bad_mgmt.valid());
+
+        let mut bad_slirp = fixture_targets();
+        bad_slirp.host = "10.0.2.99:8003".parse().unwrap();
+        assert!(!bad_slirp.valid());
+
+        let mut bad_dns_port = fixture_targets();
+        bad_dns_port.dns = "192.0.2.14:5353".parse().unwrap();
+        assert!(!bad_dns_port.valid());
+    }
+}

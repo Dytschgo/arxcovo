@@ -325,6 +325,19 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    supplied under step 1, with pre-allocation denial and no pressure on
    shared D:. Exercise recent input, idle, lock/unlock, switch/disconnect and
    ambiguous WTS, as well as CPU/RAM/disk reserve loss and bounded quiescence.
+   The qualifier checks CPU, RAM and disk refusal and WTS ambiguity by
+   applying fixed, controlled faults to fresh native samples during owned
+   diskless trials. It verifies the real stop and release each time. Do not
+   induce host pressure or ambiguous WTS state. During the separate console
+   witness window, wait for each runner message before acting. In the
+   original unlocked session, tap Shift or move the pointer once. When
+   prompted, press Windows+L. On the lock screen choose Switch user and
+   unlock the enrolled witness session. Leave it active until the runner
+   observes the original session disconnected. Switch back to the original
+   owner session and unlock it without signing out. Leave that session
+   unlocked and idle until the runner resumes. Arrange the witness session
+   before starting, and preserve the owner's original logon throughout.
+
    Use owner-arranged unrelated-principal and NETWORK witnesses. Missing or
    inconclusive witnesses prevent a complete record.
 
@@ -340,6 +353,21 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    credential. Any publishing trial is separate and defaults off.
    [ADR 0058](adr/0058-v1-scope-static-vms-and-cloudflare.md) · [ADR 0064](adr/0064-v1-scope-docker-static-vm.md)
 
+   The first network probe boots the pinned Ubuntu 24.04.3 live installer
+   with kernel and initrd pins verified against `/casper/vmlinuz` and
+   `/casper/initrd` inside the held ISO and a generated probe-only NoCloud
+   seed. The guest does not install an OS. Enroll controlled TCP echo sockets
+   and a UDP DNS witness matching a configured host DNS resolver backing the
+   slirp alias. The TCP witnesses must return the exact 16-byte challenge,
+   including the host loopback control for the slirp alias. The DNS witness
+   must return a valid non-truncated reply echoing the exact nonce-bound
+   query. Keep all witnesses live through both host control checks. The guest
+   must positively confirm single `virtio_net` link up, a `10.0.2.x` DHCP
+   lease, default route via `10.0.2.2`, and disabled IPv6 before recording
+   attributable per-probe denials (`ARXNET2`). Repeat the probes with the
+   installed guests and their installed drivers in PR 2. Live TEST network
+   behavior is **unverified on real hardware**.
+
    Boot the exact Ubuntu offline recipe with the pinned ISO, CIDATA and
    kernel/initrd. Verify the cleaned standalone candidate, detached installed
    health and clean release of its disposable verification overlay. For Windows,
@@ -352,6 +380,10 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    before seal. Boot two Windows clones independently and prove distinct
    machine SID, hostname and per-VM identity without exporting their values.
    Apply ADR 0054's installer deadlines, reset limits and release gates.
+   For the finalized Windows candidate, the offline proof reads the SOFTWARE
+   hive and Setup State.ini from the writer-excluded disk and rechecks both
+   disk and VARS content pins. The inspection uses the held files directly.
+   A dirty hive, unsupported image layout or ambiguous state refuses seal.
 
 5. **Verify installed script containment and release.** In the Windows guest,
    verify LocalService in session 0, the service privilege allowlist, raw

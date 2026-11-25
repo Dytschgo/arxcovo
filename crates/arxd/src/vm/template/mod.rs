@@ -4,6 +4,8 @@ pub mod ubuntu_compose;
 pub mod ubuntu_web;
 mod windows;
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(in crate::vm) use ubuntu::network_probe_seed;
 pub use ubuntu::{AssetPin, RecipeError, UbuntuAssets, UbuntuRecipe};
 
 pub(super) fn windows_recipe_id() -> super::Id {
@@ -272,7 +274,18 @@ mod lifecycle {
             _files: Pair,
             _deadline: tokio::time::Instant,
         ) -> Result<windows::OfflineSetupState, Failure> {
+            // Keep Finalize fail-closed in PR 1 until PR 2 validates the
+            // offline reader against a sanitized generalized Windows image.
             Err(Failure::Native(NativeRefusal::InstallerPhaseUnavailable))
+        }
+
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[allow(
+            dead_code,
+            reason = "wired in PR 2 after real generalized image verification"
+        )]
+        fn windows_released_pair(&self) -> Option<&crate::vm::windows::offline_read::ReleasedPair> {
+            None
         }
         /// Launch with media detached and establish boot-local readiness by
         /// the deadline. If startup fails before handing back a boot handle,

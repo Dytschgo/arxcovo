@@ -63,6 +63,26 @@ impl<'a> Image<'a> {
     }
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+impl<'a> Image<'a, 2> {
+    pub(super) fn probe(files: [&'a [u8]; 2]) -> Option<Self> {
+        let lengths = files.map(<[u8]>::len);
+        if lengths.iter().any(|len| *len == 0 || *len > 16 * 1024) {
+            return None;
+        }
+        let (extents, sectors) = file_extents(lengths)?;
+        Some(Self {
+            files,
+            extents,
+            sectors,
+            label: "CIDATA",
+            primary: ["METADATA.;1", "USERDATA.;1"],
+            joliet: ["meta-data.;1", "user-data.;1"],
+            joliet_order: [0, 1],
+        })
+    }
+}
+
 impl<'a> Image<'a, 5> {
     pub(super) fn windows(files: [&'a [u8]; 5]) -> Option<Self> {
         let lengths = files.map(<[u8]>::len);

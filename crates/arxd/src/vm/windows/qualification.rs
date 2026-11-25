@@ -6,11 +6,19 @@
 
 mod capacity;
 pub(super) mod inventory;
+mod launch;
+pub(super) use launch::WorkspaceCustody;
 mod paused;
 mod schema;
 mod sink;
+mod test;
 
-pub use paused::{PausedPhase, PausedTrial, PausedTrialPermit, PausedVerdict};
+pub use paused::{
+    CapacityProbe, CapacityProbePermit, FirmwareProbe, FirmwareProbePermit, NetworkProbe,
+    NetworkProbePermit, PausedCompleted, PausedPhase, PausedTrial, PausedTrialPermit,
+    PausedVerdict, ReserveActivityPermit, ReserveActivityProbe, SupervisorLossPermit,
+    SupervisorLossProbe,
+};
 pub use schema::{RECORD_COLLECTOR, RECORD_CONTRACT};
 pub use sink::{DiagnosticFile, Entry, SinkError};
 
@@ -33,8 +41,7 @@ const JOB_MEMORY_BYTES: usize = 2 * (1 << 30);
 const JOB_CPU_RATE: u32 = 2500;
 const MAX_ENROLLMENT_BYTES: u64 = 8192;
 /// Reviewed stock distribution manifest (ADR 0054).
-pub const STOCK_MANIFEST_1113_SHA256: &str =
-    "f1cf73c8ecae163e31467a3985fc13749aee1f12a8747756eb136108a1015759";
+pub use crate::vm::qualification_record::STOCK_MANIFEST_SHA256 as STOCK_MANIFEST_1113_SHA256;
 /// Five seconds in WTS/FILETIME 100 ns units.
 const LIVE_TICKS: i64 = 50_000_000;
 const IDLE_TICKS: i64 = 6_000_000_000;
@@ -49,6 +56,13 @@ const LOGON_INTERACTIVE: u32 = 2;
 #[serde(deny_unknown_fields)]
 struct Enrollment {
     owner_sid: String,
+    /// Early diagnostic enrollments predate explicit mode and release pins.
+    execution_profile: Option<ExecutionProfile>,
+    release: Option<ReleaseEnrollment>,
+    storage: Option<test::StorageEnrollment>,
+    network: Option<test::NetworkEnrollment>,
+    /// Enrolled witness account for the full TEST console-switch prompt loop.
+    witness_session: Option<WitnessEnrollment>,
     stock_bundle: String,
     trial_root: String,
     trial_volume: VolumePin,
@@ -58,6 +72,90 @@ struct Enrollment {
     outer_root: String,
     backing_file: String,
     backing_identity: VolumePin,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WitnessEnrollment {
+    user: String,
+    domain: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionProfile {
+    CurrentUser,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseEnrollment {
+    daemon: ReleaseImage,
+    qualifier: ReleaseImage,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseImage {
+    path: String,
+    size: u64,
+    sha256: String,
+}
+
+const MAX_RELEASE_IMAGE_BYTES: u64 = 128 * (1 << 20);
+
+fn hold_release(
+    release: &ReleaseEnrollment,
+    current_image: &LocalPath,
+    evidence: &LocalPath,
+) -> Result<([u8; 32], [PathPin; 2]), NativeRefusal> {
+    let reason = NativeRefusal::QualificationMissing;
+    let hold = |image: &ReleaseImage, basename: &str| {
+        let path = local(&image.path)?;
+        if path.overlaps(evidence)
+            || !path
+                .as_str()
+                .rsplit('\\')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(basename))
+            || !image
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(reason);
+        }
+        let mut sha256 = [0; 32];
+        hex::decode_to_slice(&image.sha256, &mut sha256).map_err(|_| reason)?;
+        let expected = ArtifactPin {
+            size: image.size,
+            sha256,
+        };
+        let mut pin = PathPin::open(&path, false, false)?;
+        pin.verify_content(expected, MAX_RELEASE_IMAGE_BYTES)?;
+        Ok((expected, pin))
+    };
+    let (daemon, daemon_pin) = hold(&release.daemon, "arxd.exe")?;
+    let (qualifier, qualifier_pin) = hold(&release.qualifier, "arx-vm-qualify.exe")?;
+    if !qualifier_pin
+        .path
+        .as_str()
+        .eq_ignore_ascii_case(current_image.as_str())
+        || daemon_pin.identity == qualifier_pin.identity
+        || daemon.sha256 == qualifier.sha256
+    {
+        return Err(reason);
+    }
+    let key = crate::vm::qualification_record::digest(
+        &serde_json::to_vec(&(
+            "arx-vm-reviewed-release-v1",
+            release_digest(),
+            (daemon.size, daemon.sha256),
+            (qualifier.size, qualifier.sha256),
+        ))
+        .map_err(|_| reason)?,
+    );
+    Ok((key, [daemon_pin, qualifier_pin]))
 }
 
 #[derive(Deserialize)]
@@ -160,6 +258,9 @@ pub struct Preflight {
     pub activity: Taken<Activity>,
     pub whpx_present: Taken<bool>,
     pub store: StoreIdentity,
+    pub owner_profile: Option<[u8; 32]>,
+    pub reviewed_release: Option<[u8; 32]>,
+    pub test_scope: Option<[u8; 32]>,
 }
 
 /// Held custody for the whole run. No public constructor, no Clone, and no
@@ -257,12 +358,17 @@ pub struct Baseline {
 struct Held {
     bundle: Option<inventory::Bundle>,
     _source: PathPin,
+    _release: Option<[PathPin; 2]>,
+    scope: Option<test::Scope>,
+    network: Option<test::NetworkInputs>,
+    witness_session: Option<WtsAccount>,
     trial: PathPin,
     _backing: PathPin,
     volumes: [capacity::AnchoredVolume; 2],
     token: VmToken,
     _capacity: Option<(OwnedHandle, capacity::HeldDevice)>,
     paused: bool,
+    full_test: bool,
 }
 
 impl Baseline {
@@ -280,12 +386,32 @@ impl Baseline {
 
     /// Check live owner activity before dispatching the paused operation.
     pub fn paused_live(&self) -> Result<Instant, NativeRefusal> {
-        require_paused(self._held.paused)?;
+        require_paused(self._held.paused || self._held.full_test)?;
         let captured = Instant::now();
         if !current_console_idle(&self._held.token)? {
             return Err(NativeRefusal::OwnerActivityUnverified);
         }
         Ok(captured)
+    }
+
+    pub fn prepare_firmware_probe(&self) -> Result<FirmwareProbePermit<'_>, NativeRefusal> {
+        FirmwareProbePermit::prepare(self)
+    }
+
+    pub fn prepare_supervisor_loss(&self) -> Result<SupervisorLossPermit<'_>, NativeRefusal> {
+        SupervisorLossPermit::prepare(self)
+    }
+
+    pub fn prepare_capacity_probe(&self) -> Result<CapacityProbePermit<'_>, NativeRefusal> {
+        CapacityProbePermit::prepare(self)
+    }
+
+    pub fn prepare_reserve_activity(&self) -> Result<ReserveActivityPermit<'_>, NativeRefusal> {
+        ReserveActivityPermit::prepare(self)
+    }
+
+    pub fn prepare_network_probe(&self) -> Result<NetworkProbePermit<'_>, NativeRefusal> {
+        NetworkProbePermit::prepare(self)
     }
 
     pub fn observations(&self) -> &Preflight {
@@ -379,27 +505,21 @@ fn take<T>(origin: Instant, run: impl FnOnce() -> Result<T, NativeRefusal>) -> T
     take_held(origin, || run().map(|result| (result, ()))).0
 }
 
-/// Collect capacity for the stock runner. The two callbacks are the
-/// read-only measurement and the effectful Job probe. Keep the refusal
-/// between them so a successful measurement cannot authorize a Job.
+/// Probe the empty Job only after measuring the held volume and verifying
+/// the protected stock distribution.
 #[doc(hidden)]
 pub fn stock_capacity<H>(
     origin: Instant,
     measure: impl FnOnce() -> Result<(Limits, H), NativeRefusal>,
+    verify_distribution: impl FnOnce() -> Result<(), NativeRefusal>,
     probe_job: impl FnOnce() -> Result<(), NativeRefusal>,
 ) -> (Taken<Limits>, Option<H>) {
     take_held(origin, || {
         let capacity = measure()?;
-        stock_open_contract()?;
+        verify_distribution()?;
         probe_job()?;
         Ok(capacity)
     })
-}
-
-fn stock_open_contract() -> Result<(), NativeRefusal> {
-    // The stock receipt authenticates inventory. It supplies no evidence
-    // of what the loader and consumers of the held child actually open.
-    Err(NativeRefusal::DistributionUnverified)
 }
 
 /// Inspect only the explicitly enrolled roots, the current token and console,
@@ -410,6 +530,7 @@ pub fn preflight(enrollment_file: &str, evidence_dir: &str) -> Result<Baseline, 
         &capacity::MountManager,
         enrollment_file,
         evidence_dir,
+        false,
         false,
     )
 }
@@ -422,7 +543,11 @@ fn require_paused(paused: bool) -> Result<(), NativeRefusal> {
 
 /// Preflight for the explicit paused-trial entry point in the owner runner.
 pub fn preflight_paused(enrollment: &str, evidence: &str) -> Result<Baseline, NativeRefusal> {
-    preflight_with(&capacity::MountManager, enrollment, evidence, true)
+    preflight_with(&capacity::MountManager, enrollment, evidence, true, false)
+}
+
+pub fn preflight_full_test(enrollment: &str, evidence: &str) -> Result<Baseline, NativeRefusal> {
+    preflight_with(&capacity::MountManager, enrollment, evidence, false, true)
 }
 
 /// Every refusal before the claim leaves the evidence directory untouched,
@@ -433,6 +558,7 @@ fn preflight_with(
     enrollment_file: &str,
     evidence_dir: &str,
     paused: bool,
+    full_test: bool,
 ) -> Result<Baseline, NativeRefusal> {
     let origin = Instant::now();
     let custody = NativeRefusal::PathCustodyUnverified;
@@ -455,11 +581,30 @@ fn preflight_with(
     let token =
         VmToken::derive_current_user(owner).map_err(|_| NativeRefusal::IdentityUnverified)?;
 
+    let owner_profile = token
+        .profile_key()
+        .map_err(|_| NativeRefusal::IdentityUnverified)?;
+
     let root = local(&enrollment.trial_root)?;
     let outer = local(&enrollment.outer_root)?;
     let backing = local(&enrollment.backing_file)?;
     let bundle = local(&enrollment.stock_bundle)?;
     let evidence_path = local(evidence_dir)?;
+    let (reviewed_release, release_pins) =
+        match (&enrollment.execution_profile, &enrollment.release) {
+            (Some(ExecutionProfile::CurrentUser), Some(release)) => {
+                let image =
+                    std::env::current_exe().map_err(|_| NativeRefusal::QualificationMissing)?;
+                let image = local(image.to_str().ok_or(NativeRefusal::QualificationMissing)?)?;
+                let (key, pins) = hold_release(release, &image, &evidence_path)?;
+                (Some(key), Some(pins))
+            }
+            (_, None) => (None, None),
+            (None, Some(_)) => return Err(NativeRefusal::IdentityUnverified),
+        };
+    if full_test && reviewed_release.is_none() {
+        return Err(NativeRefusal::QualificationMissing);
+    }
     if !roots_disjoint(&path, &root, &outer, &backing, &bundle, &evidence_path) {
         return Err(custody);
     }
@@ -485,7 +630,47 @@ fn preflight_with(
     {
         return Err(custody);
     }
-    let private_values = [
+    let test_scope = if full_test {
+        Some(test::Scope::hold(
+            names,
+            enrollment
+                .storage
+                .as_ref()
+                .ok_or(NativeRefusal::QualificationMissing)?,
+            &trial_pin,
+            &backing_pin,
+            [&trial_volume, &outer_volume],
+            &evidence_path,
+            user_sid,
+        )?)
+    } else {
+        None
+    };
+    let network = if full_test {
+        Some(test::NetworkInputs::hold(
+            enrollment
+                .network
+                .ok_or(NativeRefusal::QualificationMissing)?,
+            &evidence_path,
+        )?)
+    } else {
+        None
+    };
+    let witness_session = match &enrollment.witness_session {
+        Some(witness) => {
+            let plain = |s: &str| !s.is_empty() && !s.contains('\\') && s.len() <= 128;
+            if !plain(&witness.user) || !plain(&witness.domain) {
+                return Err(NativeRefusal::IdentityUnverified);
+            }
+            Some(WtsAccount {
+                user: witness.user.clone(),
+                domain: witness.domain.clone(),
+            })
+        }
+        None if full_test => return Err(NativeRefusal::QualificationMissing),
+        None => None,
+    };
+    let mut private_values = vec![
         enrollment.owner_sid.as_str(),
         enrollment.stock_bundle.as_str(),
         enrollment.trial_root.as_str(),
@@ -495,6 +680,10 @@ fn preflight_with(
         enrollment_file,
         evidence_dir,
     ];
+    if let Some(witness) = &enrollment.witness_session {
+        private_values.push(witness.user.as_str());
+        private_values.push(witness.domain.as_str());
+    }
     // Claim once identity and every input root are held and checked. A
     // concurrent runner loses here, before any observation is taken.
     let evidence = sink::EvidenceDir::claim(evidence_pin, user_sid, &private_values)?;
@@ -535,6 +724,12 @@ fn preflight_with(
             backing_allocated: backing_pin.allocated,
         };
         let limits = capacity::check_capacity(&sample)?;
+        if test_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.within_shared_cap(&limits))
+        {
+            return Err(reason);
+        }
         // A drive letter rebound while the observation ran closes it.
         if !capacity::still_bound(names, &trial_volume)
             || !capacity::still_bound(names, &outer_volume)
@@ -543,19 +738,17 @@ fn preflight_with(
         }
         Ok((limits, (vhd, device)))
     };
-    let (limits, capacity_handles) = if paused {
-        take_held(origin, || {
+    let (limits, capacity_handles) = stock_capacity(
+        origin,
+        measure,
+        || {
             let bundle = bundle_pins
                 .as_ref()
                 .ok_or(NativeRefusal::DistributionUnverified)?;
-            bundle.protected(token.account.0, Instant::now() + Duration::from_secs(2))?;
-            let measured = measure()?;
-            empty_job()?;
-            Ok(measured)
-        })
-    } else {
-        stock_capacity(origin, measure, empty_job)
-    };
+            bundle.protected(token.account.0, Instant::now() + Duration::from_secs(2))
+        },
+        empty_job,
+    );
     let activity = take(origin, || {
         let console_idle = current_console_idle(&token)?;
         let (active_cpus, available_ram_bytes) = host_resources()?;
@@ -587,18 +780,26 @@ fn preflight_with(
             activity,
             whpx_present,
             store,
+            owner_profile: Some(owner_profile),
+            reviewed_release,
+            test_scope: test_scope.as_ref().map(|scope| scope.key),
         },
         origin,
         evidence,
         _held: Held {
             bundle: bundle_pins,
             _source: source,
+            _release: release_pins,
+            scope: test_scope,
+            network,
+            witness_session,
             trial: trial_pin,
             _backing: backing_pin,
             volumes: [trial_volume, outer_volume],
             token,
             _capacity: capacity_handles,
             paused,
+            full_test,
         },
     })
 }
@@ -960,7 +1161,12 @@ fn lsa_logon(luid: &LUID, owner: PSID) -> Option<LsaLogon> {
 }
 
 fn current_console_idle(token: &VmToken) -> Result<bool, NativeRefusal> {
+    console_decision(&console_evidence(token)?)
+}
+
+fn console_evidence(token: &VmToken) -> Result<ConsoleEvidence, NativeRefusal> {
     let reason = NativeRefusal::OwnerActivityUnverified;
+    require_unimpersonated().map_err(|_| reason)?;
     let session = token.identity.session;
     let luid = token.identity.authentication;
     let lsa_first = lsa_logon(&luid, token.account.0).ok_or(reason)?;
@@ -977,7 +1183,7 @@ fn current_console_idle(token: &VmToken) -> Result<bool, NativeRefusal> {
     let mut time = FILETIME::default();
     unsafe { GetSystemTimeAsFileTime(&mut time) };
     let now = ((u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)) as i64;
-    console_decision(&ConsoleEvidence {
+    Ok(ConsoleEvidence {
         token_session: session,
         active_console: unsafe { WTSGetActiveConsoleSessionId() },
         accounts: [account, account_again],
@@ -1089,6 +1295,38 @@ mod tests {
             Err(NativeRefusal::DistributionUnverified)
         );
         assert_eq!(require_paused(true), Ok(()));
+    }
+
+    #[test]
+    fn exact_release_binds_two_held_images_and_current_qualifier() {
+        let scratch = tempfile::tempdir().unwrap();
+        let image = |name, data: &[u8]| {
+            let path = scratch.path().join(name);
+            std::fs::write(&path, data).unwrap();
+            ReleaseImage {
+                path: path.to_str().unwrap().to_owned(),
+                size: data.len() as u64,
+                sha256: hex::encode(crate::vm::qualification_record::digest(data)),
+            }
+        };
+        let mut release = ReleaseEnrollment {
+            daemon: image("arxd.exe", b"reviewed daemon fixture"),
+            qualifier: image("arx-vm-qualify.exe", b"reviewed qualifier fixture"),
+        };
+        let qualifier = local(&release.qualifier.path).unwrap();
+        let evidence = LocalPath::parse(scratch.path().join("evidence").to_str().unwrap()).unwrap();
+        let (_, pins) = hold_release(&release, &qualifier, &evidence).unwrap();
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&release.daemon.path)
+                .is_err(),
+            "release pin excludes writers"
+        );
+        assert!(hold_release(&release, &local(&release.daemon.path).unwrap(), &evidence).is_err());
+        drop(pins);
+        release.daemon.size += 1;
+        assert!(hold_release(&release, &qualifier, &evidence).is_err());
     }
 
     #[test]

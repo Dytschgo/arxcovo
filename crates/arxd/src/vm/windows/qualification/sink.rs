@@ -1,6 +1,6 @@
-//! Diagnostic-only evidence output. The directory is held, privately owned
-//! and claimed exclusively before any record is written. There is no file
-//! name for a completed qualification in this contract version.
+//! Held evidence output. The directory is privately owned and claimed
+//! exclusively before any record is written. Diagnostics and complete
+//! evidence use distinct publication paths.
 //!
 //! The writer is the provenance boundary for every opaque value. It draws
 //! the scope and run from its own random generator, derives the release,
@@ -19,6 +19,7 @@
 //! outcome, and a retry uses a fresh empty directory.
 
 use super::*;
+use crate::vm::qualification_record::{self as records, FileKind, Fresh, Selection};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -70,6 +71,7 @@ impl DiagnosticFile {
 }
 
 const CLAIM: &str = "claim.json";
+const COMPLETE: &str = "qualification.json";
 const CLAIM_BYTES: &[u8] = br#"{"claim":"arx-vm-qualify"}"#;
 const MAX_OUTPUT: usize = 16 * 1024;
 /// Seven days, the maximum qualification validity.
@@ -261,6 +263,66 @@ impl EvidenceDir {
         }
     }
 
+    /// Native-only publication. The closed trial must supply its complete
+    /// chain and a fresh local observation. Once claimed, a partially written
+    /// run is consumed and lacks a selection marker.
+    pub(super) fn publish_complete<'a>(
+        &self,
+        seal_bytes: &[u8],
+        files: &[(FileKind, Vec<u8>)],
+        mut fresh: impl FnMut() -> Result<Fresh<'a>, SinkError>,
+    ) -> Result<(), SinkError> {
+        if self.closed.replace(true) {
+            return Err(SinkError::Closed);
+        }
+        let seal: records::Seal = records::decode(seal_bytes).map_err(|_| SinkError::Invalid)?;
+        if seal.binding.run != self.run || seal.binding.scope != self.scope {
+            return Err(SinkError::Invalid);
+        }
+        let selection = Selection {
+            seal_sha256: records::digest(seal_bytes),
+            scope: self.scope,
+        };
+        records::verify_native(seal_bytes, files, &selection, &fresh()?)
+            .map_err(|_| SinkError::Invalid)?;
+        if self.leaks(seal_bytes) || files.iter().any(|(_, bytes)| self.leaks(bytes)) {
+            return Err(SinkError::Private);
+        }
+        for (kind, bytes) in files {
+            self.commit(&kind.name(), bytes)
+                .map_err(|_| SinkError::Io)?;
+        }
+        // Reopen by the held directory, and hold each exact row without
+        // write/delete sharing across verification and the final rename.
+        let mut held = Vec::with_capacity(files.len());
+        records::read_native(
+            seal_bytes,
+            seal_bytes.len() as u64,
+            |kind| {
+                let file = open_relative(&self.pin.leaf, &kind.name(), Node::File, false, false)
+                    .map_err(|_| records::RunError::Output)?;
+                file_identity(&file, false).map_err(|_| records::RunError::Output)?;
+                held.push(file.try_clone().map_err(|_| records::RunError::Output)?);
+                Ok(file)
+            },
+            &selection,
+            &fresh()?,
+        )
+        .map_err(|_| SinkError::Invalid)?;
+        self.commit_checked_at_rename(COMPLETE, seal_bytes, || {
+            records::verify_native(
+                seal_bytes,
+                files,
+                &selection,
+                &fresh().map_err(|_| io::Error::other("qualification freshness unavailable"))?,
+            )
+            .map_err(|_| io::Error::other("qualification expired before publication"))
+        })
+        .map_err(|_| SinkError::Io)?;
+        drop(held);
+        Ok(())
+    }
+
     /// The binding every published file carries. The scope and run are the
     /// writer's own; the dependency digest is keyed by the random scope, so
     /// the private identities in the projection cannot be recovered.
@@ -307,8 +369,17 @@ impl EvidenceDir {
     /// relative to the held directory. On any failure the temporary entry is
     /// deleted with its handle and no final name appears.
     fn commit(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        self.commit_checked_at_rename(name, bytes, || Ok(()))
+    }
+
+    fn commit_checked_at_rename(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        final_check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
         let temporary = create_hidden(&self.pin.leaf, &temporary_name(name))?;
-        let committed = finish_commit(&temporary, &self.pin.leaf, name, bytes);
+        let committed = finish_commit(&temporary, &self.pin.leaf, name, bytes, final_check);
         if committed.is_err() {
             let _ = discard(&temporary);
         }
@@ -335,7 +406,13 @@ fn record<St: Serialize, R: Serialize>(
     Some((index, record.into_bytes()))
 }
 
-fn finish_commit(file: &File, dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
+fn finish_commit(
+    file: &File,
+    dir: &File,
+    name: &str,
+    bytes: &[u8],
+    final_check: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     use std::io::Write;
     let mut writer = file;
     if writer.write(bytes)? != bytes.len() {
@@ -358,6 +435,7 @@ fn finish_commit(file: &File, dir: &File, name: &str, bytes: &[u8]) -> io::Resul
     })?;
     file.sync_all()?;
     fault(name, Step::Flush)?;
+    final_check()?;
     rename_within(file, dir, name)
 }
 
@@ -568,6 +646,14 @@ pub(super) fn discard(file: &File) -> io::Result<()> {
     })
 }
 
+pub(super) fn discard_owned(dir: &File, name: &str, expected: FileIdentity) -> io::Result<()> {
+    let file = open_child(dir, name, FILE_GENERIC_READ | DELETE, 0, FILE_OPEN)?;
+    if file_identity(&file, false)?.0 != expected {
+        return Err(io::Error::other("owned entry changed"));
+    }
+    discard(&file)
+}
+
 /// The held directory has no entries, enumerated through its own handle.
 fn empty(dir: &File) -> Result<bool, NativeRefusal> {
     listing(dir)
@@ -700,6 +786,26 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn a_refusal_at_the_last_rename_never_exposes_the_marker() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (data, path) = private_dir(scratch.path(), "evidence");
+        let pin = PathPin::open(&path, true, true).unwrap();
+        let sink = EvidenceDir::claim(pin, sid(&data), &[]).unwrap();
+        let called = Cell::new(false);
+        let refused = sink.commit_checked_at_rename(COMPLETE, b"{}", || {
+            called.set(true);
+            assert!(
+                !names(&path).contains(&COMPLETE.to_owned()),
+                "marker must never be renamed into place before final_check runs"
+            );
+            Err(io::ErrorKind::TimedOut.into())
+        });
+        assert!(called.get());
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(names(&path), [CLAIM]);
     }
 
     const INPUTS: &str = r#"{"passed":{"kind":"input_pins","held_roots":5,"enrollment_private":true,"evidence_private":true,"trial_root_private":true,"evidence_claimed":true}}"#;

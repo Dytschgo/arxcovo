@@ -257,9 +257,16 @@ impl Trial<Native> {
     pub(crate) fn drive_native(
         &mut self,
         paused_runtime: Option<&tokio::runtime::Runtime>,
+        full_test: bool,
+        cancel: &arxd::service::Shutdown,
         clock: &impl Clock,
     ) {
-        let mut collectors = crate::native::PausedCollectors::new(&self.custody, paused_runtime);
+        let mut collectors = crate::native::PausedCollectors::new(
+            &self.custody,
+            paused_runtime,
+            full_test,
+            cancel.clone(),
+        );
         self.state.drive(&mut collectors, clock);
     }
 }

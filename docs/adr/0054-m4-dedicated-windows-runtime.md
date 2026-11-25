@@ -1250,3 +1250,51 @@ full-witness prerequisite assumed by the initial 7c investigation
 The paused runner keeps its authority separate from 7c and cannot
 produce the complete record. Native launch, live host observations and
 settlement are **unverified on real hardware**.
+
+### 7b implementation notes (PR 1 host qualification groundwork)
+
+The qualification record decoder and manifest checks are shared with the
+owner-local writer. The writer uses the held evidence directory for each
+create-new row, reopens the allowlisted rows for verification, and checks
+freshness again after flushing the temporary marker and before the final
+rename. Complete publication stays unwired in PR 1 (deferred to PR 2); both
+`--paused-trial` and `--full-test` remain diagnostic-only and publish
+`incomplete.json`, while daemon `LaunchAuthority` and `OfflineLease` stay
+uninhabited below the extracted private checked execution core.
+
+The native Finalize primitive yields the held disk and VARS objects after
+clean release. The offline reader enforces cooperative end-to-end time, I/O,
+step and heap budgets, validates primary and backup GPT headers and entries,
+verifies qcow2 refcount allocation (`refcount == 1`), checks `$Volume` clean
+state and `$MFT` `$BITMAP` allocation, and reconciles path traversal against
+authoritative `$I30` directory indexes while refusing reparse points,
+attribute lists and extension records. It reads only the SOFTWARE hive image
+state and Setup `State.ini` without host mounting or new crate dependencies.
+Finalize's `windows_offline_setup_state` remains fail-closed
+(`InstallerPhaseUnavailable`) in PR 1 pending PR 2 and verification against a
+sanitized Windows-produced generalized image. The installed path remains
+**unverified on real hardware**.
+
+The host launch purpose is one private enum deriving argv, channel name,
+bounded prelaunch quiet check, parser, stop protocol and a single per-purpose
+Job/overhead envelope (2 GiB Job for diskless rows; 6 GiB Job for live
+network). Controlled WTS-ambiguity and CPU, RAM and disk reserve faults
+traverse the live `LivePoll` refusal-to-stop path and record original facts
+from the same checked two-sample WTS/LSA observation used for the mutation.
+The console witness loop captures a pre-prompt input cursor, binds the
+enrolled witness account, validates returned session IDs and stable owner
+logon identity, corroborates transitions across samples, and requires a fresh
+idle observation before the next effect. Per-invocation release dispositions
+are recorded in a run-wide ledger that latches `ChargedQuarantine`. Deliberate
+live pressure and console witness runs remain **unverified on real hardware**.
+
+The TEST network probe authenticates the pinned Ubuntu 24.04.3 ISO and binds
+the enrolled kernel and initrd pins directly to `/casper/vmlinuz` and
+`/casper/initrd` inside the held ISO, binds `Targets.dns` to a real host DNS
+resolver backing the slirp alias, validates full nonce-bound DNS query/reply
+echoes, requires positive `virtio_net` link/DHCP/default-route/no-IPv6 setup
+with attributable per-probe outcomes (`ARXNET2`), proves zero hostfwd/ingress
+and read-only media, rechecks media drive bindings at create and after
+prelaunch, keeps QMP `powerdown` separate from control-plane `quit`, and
+retains the seed charge on any ambiguous creation, open, release or removal.
+Live TEST network behavior is **unverified on real hardware**.

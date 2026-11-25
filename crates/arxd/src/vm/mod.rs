@@ -14,6 +14,8 @@ pub mod qemu_args;
 pub mod qemu_distribution;
 pub mod qemu_img;
 pub mod qmp;
+#[doc(hidden)]
+pub mod qualification_record;
 pub(crate) mod reaper;
 pub mod runtime;
 pub mod snapshot;
