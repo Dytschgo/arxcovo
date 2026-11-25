@@ -14,24 +14,41 @@ TOTAL_DEADLINE_S = 60
 RESPONSE_CAP = 32 * 1024 * 1024
 
 
-def get(host, path, byte_range=None, deadline_s=TOTAL_DEADLINE_S, clock=time.monotonic,
-        connection_factory=None):
-    """Fetch with a per-socket inactivity timeout and a total deadline for the whole exchange."""
-    end = clock() + deadline_s
+def _remaining(end, clock):
+    left = end - clock()
+    if left <= 0:
+        raise TimeoutError("total deadline")
+    return left
+
+
+def get(host, path, byte_range=None, end=None, clock=time.monotonic, connection_factory=None):
+    """Fetch within a shared absolute deadline `end` (monotonic seconds).
+
+    Every blocking step (connect and TLS, request, headers, each body read) is
+    bounded by the time left, and the deadline is rechecked after each step, so
+    a slow step that returns late is still refused.
+    """
+    if end is None:
+        end = clock() + TOTAL_DEADLINE_S
+    timeout = min(15.0, _remaining(end, clock))
     factory = connection_factory or (
-        lambda: http.client.HTTPSConnection(host, timeout=15, context=ssl.create_default_context()))
-    connection = factory()
+        lambda t: http.client.HTTPSConnection(host, timeout=t, context=ssl.create_default_context()))
+    connection = factory(timeout)
     try:
         headers = {"Cache-Control": "no-cache", "Accept-Encoding": "identity"}
         if byte_range:
             headers["Range"] = byte_range
         connection.request("GET", path, headers=headers)
+        _remaining(end, clock)
         response = connection.getresponse()
+        _remaining(end, clock)
         chunks, size = [], 0
         while True:
-            if clock() > end:
-                raise TimeoutError("total deadline")
+            sock = getattr(connection, "sock", None)
+            if sock is not None:
+                sock.settimeout(min(15.0, _remaining(end, clock)))
             chunk = response.read(65536)
+            _remaining(end, clock)
             if not chunk:
                 break
             size += len(chunk)
@@ -43,7 +60,19 @@ def get(host, path, byte_range=None, deadline_s=TOTAL_DEADLINE_S, clock=time.mon
         connection.close()
 
 
-def measure(request, cleanup_confirmed, fetch=get):
+def phase_fetch(clock=time.monotonic, deadline_s=TOTAL_DEADLINE_S, connection_factory=None):
+    """One deadline shared by every request of a measurement phase."""
+    end = clock() + deadline_s
+
+    def fetch(host, path, byte_range=None):
+        return get(host, path, byte_range, end=end, clock=clock, connection_factory=connection_factory)
+
+    return fetch
+
+
+def measure(request, cleanup_confirmed, fetch=None):
+    if fetch is None:
+        fetch = phase_fetch()
     reference = request["reference"]
     hosts = reference["hosts"]
     if request["version"] != 1 or len(hosts) != 2 or hosts[0]["name"] == hosts[1]["name"]:

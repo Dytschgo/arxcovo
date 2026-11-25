@@ -49,46 +49,94 @@ def udp(target):
     return True, dns_answered(reply, question)
 
 
+class _Malformed(Exception):
+    pass
+
+
+def _read_name(message, offset):
+    """Decode a DNS name at offset. Returns (lowercased labels, offset after the name).
+
+    Compression pointers must point strictly backwards to an earlier label, so a
+    pointer can never loop; labels are at most 63 bytes and names at most 255.
+    """
+    labels, end, total, limit = [], None, 0, offset
+    while True:
+        if offset >= len(message):
+            raise _Malformed("name runs past the message")
+        length = message[offset]
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(message):
+                raise _Malformed("truncated pointer")
+            target = ((length & 0x3F) << 8) | message[offset + 1]
+            if target < 12 or target >= limit:
+                raise _Malformed("pointer must go strictly backwards")
+            if end is None:
+                end = offset + 2
+            offset = limit = target
+            continue
+        if length & 0xC0:
+            raise _Malformed("reserved label type")
+        offset += 1
+        if length == 0:
+            return labels, (end if end is not None else offset)
+        if offset + length > len(message):
+            raise _Malformed("label runs past the message")
+        total += length + 1
+        if total > 255:
+            raise _Malformed("name too long")
+        labels.append(bytes(message[offset:offset + length]).lower())
+        offset += length
+
+
 def dns_answered(reply, question):
-    """True only for a matching NOERROR reply that carries a complete IN A record for the query."""
-    if len(reply) < len(question) or reply[:2] != question[:2]:
-        return False
-    if not reply[2] & 128 or reply[3] & 15 != 0:
-        return False
-    if int.from_bytes(reply[4:6], "big") != 1 or int.from_bytes(reply[6:8], "big") < 1:
-        return False
-    # The question section must echo the query exactly.
-    if reply[12:len(question)] != question[12:]:
-        return False
-    offset = len(question)
-    for _ in range(int.from_bytes(reply[6:8], "big")):
-        if offset + 2 > len(reply):
+    """True only for a well-formed NOERROR reply to exactly this query whose answer
+    section is complete and resolves the queried name (directly or through CNAME
+    aliases) to an IN A record with a four-byte address."""
+    try:
+        if len(reply) < len(question) or reply[:2] != question[:2]:
             return False
-        if reply[offset] & 0xC0 == 0xC0:
-            offset += 2
-        else:
-            while True:
-                if offset >= len(reply):
+        if not reply[2] & 128 or reply[2] & 0x7A or reply[3] & 15 != 0:  # QR set; opcode 0; not truncated; NOERROR
+            return False
+        if int.from_bytes(reply[4:6], "big") != 1:
+            return False
+        answers = int.from_bytes(reply[6:8], "big")
+        if answers < 1:
+            return False
+        if reply[12:len(question)] != question[12:]:
+            return False
+        wanted, _ = _read_name(question, 12)
+        offset = len(question)
+        records = []
+        for _ in range(answers):
+            owner, offset = _read_name(reply, offset)
+            if offset + 10 > len(reply):
+                return False
+            rtype = int.from_bytes(reply[offset:offset + 2], "big")
+            rclass = int.from_bytes(reply[offset + 2:offset + 4], "big")
+            rdlength = int.from_bytes(reply[offset + 8:offset + 10], "big")
+            data = offset + 10
+            if data + rdlength > len(reply):
+                return False
+            target = None
+            if rtype == 5 and rclass == 1:
+                target, consumed = _read_name(reply, data)
+                if consumed != data + rdlength:
                     return False
-                length = reply[offset]
-                offset += 1
-                if length == 0:
-                    break
-                if length & 0xC0:
-                    return False
-                offset += length
-        if offset + 10 > len(reply):
-            return False
-        rtype = int.from_bytes(reply[offset:offset + 2], "big")
-        rclass = int.from_bytes(reply[offset + 2:offset + 4], "big")
-        rdlength = int.from_bytes(reply[offset + 8:offset + 10], "big")
-        offset += 10
-        if offset + rdlength > len(reply):
-            return False
-        if rtype == 1 and rclass == 1 and rdlength == 4:
-            return True
-        offset += rdlength
-    return False
+            records.append((owner, rtype, rclass, rdlength, target))
+            offset = data + rdlength
+        # Follow at most a short alias chain from the queried name.
+        name = wanted
+        for _ in range(8):
+            for owner, rtype, rclass, rdlength, _target in records:
+                if owner == name and rtype == 1 and rclass == 1 and rdlength == 4:
+                    return True
+            aliases = [t for owner, rtype, rclass, _l, t in records if owner == name and rtype == 5 and rclass == 1]
+            if len(aliases) != 1:
+                return False
+            name = aliases[0]
+        return False
+    except _Malformed:
+        return False
 
 
 def measure(inventory, role, connect=tcp, query=udp):

@@ -77,26 +77,86 @@ class WitnessTests(unittest.TestCase):
         nxdomain = header[:3] + b"\x83" + header[4:]
         self.assertFalse(network.dns_answered(nxdomain + query[12:] + answer, query))
 
-    def test_public_fetch_enforces_a_total_deadline(self):
-        now = [0.0]
+    def test_dns_rejects_malformed_names_unrelated_owners_and_short_answer_sections(self):
+        query = self._query()
+        header = bytes.fromhex("123481800001000100000000")
+        a_rest = bytes.fromhex("000100010000003c00045db8d822")  # TYPE A, IN, TTL, RDLENGTH 4, address
 
+        def reply(answers_bytes, count=1):
+            h = header[:6] + count.to_bytes(2, "big") + header[8:]
+            return h + query[12:] + answers_bytes
+
+        self_pointer = len(query).to_bytes(2, "big")
+        self_pointer = bytes([0xC0 | self_pointer[0], self_pointer[1]])
+        self.assertFalse(network.dns_answered(reply(self_pointer + a_rest), query))
+        self.assertFalse(network.dns_answered(reply(b"\xcf\xff" + a_rest), query))
+        overlong = b"\x40" + b"a" * 64 + b"\x00"
+        self.assertFalse(network.dns_answered(reply(overlong + a_rest), query))
+        unrelated = b"\x05other\x03org\x00"
+        self.assertFalse(network.dns_answered(reply(unrelated + a_rest), query))
+        self.assertFalse(network.dns_answered(reply(b"\xc0\x0c" + a_rest, count=2), query))
+        literal_owner = b"\x07EXAMPLE\x03org\x00"
+        self.assertTrue(network.dns_answered(reply(literal_owner + a_rest), query))
+        # CNAME example.org -> www.example.org, then A for the alias.
+        cname_rdata = b"\x03www\xc0\x0c"
+        cname = b"\xc0\x0c" + bytes.fromhex("000500010000003c") + len(cname_rdata).to_bytes(2, "big") + cname_rdata
+        alias_offset = len(query) + 12
+        alias_ptr = bytes([0xC0 | (alias_offset >> 8), alias_offset & 0xFF])
+        self.assertTrue(network.dns_answered(reply(cname + alias_ptr + a_rest, count=2), query))
+        self.assertFalse(network.dns_answered(reply(cname + unrelated + a_rest, count=2), query))
+        truncated_flag = reply(b"\xc0\x0c" + a_rest)
+        truncated_flag = truncated_flag[:2] + bytes([truncated_flag[2] | 0x02]) + truncated_flag[3:]
+        self.assertFalse(network.dns_answered(truncated_flag, query))
+
+    @staticmethod
+    def _fake_connection(now, read_advance, body=b"x", header_advance=0.0):
         class Response:
             status, headers = 200, {}
 
+            def __init__(self):
+                self.sent = False
+
             def read(self, _size):
-                now[0] += 30
-                return b"x"
+                now[0] += read_advance
+                if self.sent:
+                    return b""
+                self.sent = True
+                return body
 
         class Connection:
+            sock = None
+
+            def __init__(self, timeout):
+                self.timeout = timeout
+
             def request(self, *args, **kwargs):
                 pass
 
             def getresponse(self):
+                now[0] += header_advance
                 return Response()
 
             def close(self):
                 pass
 
+        return Connection
+
+    def test_public_fetch_enforces_a_total_deadline(self):
+        now = [0.0]
+        clock = lambda: now[0]
+        # A read that returns late (here: EOF at 61 s) is still refused.
         with self.assertRaises(TimeoutError):
-            public.get("example.invalid", "/", deadline_s=60, clock=lambda: now[0],
-                       connection_factory=Connection)
+            public.get("example.invalid", "/", end=60, clock=clock,
+                       connection_factory=self._fake_connection(now, 61, body=b""))
+        # Late response headers are refused before any body is read.
+        now[0] = 0.0
+        with self.assertRaises(TimeoutError):
+            public.get("example.invalid", "/", end=60, clock=clock,
+                       connection_factory=self._fake_connection(now, 0, header_advance=61))
+        # One deadline spans every request of a phase.
+        now[0] = 0.0
+        fetch = public.phase_fetch(clock=clock, deadline_s=60,
+                                   connection_factory=self._fake_connection(now, 20))
+        self.assertEqual(fetch("example.invalid", "/")[0], 200)
+        with self.assertRaises(TimeoutError):
+            fetch("example.invalid", "/")
