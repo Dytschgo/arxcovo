@@ -713,60 +713,55 @@ B2_GATE = (
     '        ignore = "' + B2_REASON + '"\n'
     "    )]"
 )
-B2_BINDING = "#[tokio::test]\n    " + B2_GATE + "\n    async fn " + B2_TEST + "("
-# cfg / cfg_attr bodies inside `mod tests` on main, whitespace removed.
-# The macOS ignore is the only permitted addition.
-B2_MAIN_TESTS_CFGS = (
-    ("cfg(unix)", 11),
-    ("cfg(windows)", 9),
-    ("cfg_attr(windows,allow(dead_code))", 2),
-    ("cfg_attr(windows,allow(unused_mut))", 1),
-)
 B2_TESTS_DECL = "pub(crate) mod tests {"
-B2_TESTS_GAP = "\n\n#[cfg(test)]\n"
-B2_FN_STACK = "    #[tokio::test]\n    " + B2_GATE + "\n"
+# Raw substring counts. The tests-module figures are main's counts plus the
+# one macOS gate (`cfg_attr` contributes one `cfg`, and the gate contributes
+# one `ignore`). The declaration figure is main's `#[cfg(test)]` only.
+B2_TESTS_CFG = 24
+B2_TESTS_IGNORE = 1
+B2_DECL_CFG = 1
+B2_PATH_ATTRS = 0
 
 
-def _cfg_bodies(text):
-    return [
-        re.sub(r"\s+", "", body)
-        for body in re.findall(r"#\s*!?\s*\[([^\]]*)\]", text)
-        if re.match(r"\s*cfg(?:_attr)?\b", body)
-    ]
+def _strip_block_comments(text):
+    # Join tokens a block comment splits (`ig/**/nore`) without dropping a
+    # `cfg` or `ignore` that is written in the raw text, including inside
+    # comments and strings. Those raw substrings are counted separately.
+    return re.sub(r"/\*.*?\*/", "", text, flags=re.S)
 
 
-def assert_b2_macos_quarantine(source):
+def _norm(text):
+    return re.sub(r"\s+", "", text)
+
+
+def _tests_parts(source):
     if source.count(B2_TESTS_DECL) != 1:
         raise AssertionError("vm tests module binding required")
     prefix, tests = source.split(B2_TESTS_DECL, 1)
-    # The module chain inside mcp/vm.rs: no file-level inner attribute, and
-    # the tests module keeps exactly main's #[cfg(test)].
-    if "#![" in source:
-        raise AssertionError("vm.rs inner cfg would compile out the test")
-    if prefix[prefix.rfind("}"):][1:] != B2_TESTS_GAP:
-        raise AssertionError("tests module cfg stack drifted")
-    signature = "async fn " + B2_TEST + "("
-    if tests.count(B2_BINDING) != 1 or tests.count(signature) != 1:
+    start = prefix.rfind("\n}")
+    if start < 0:
+        raise AssertionError("vm tests module binding required")
+    # Attributes on `mod tests`, through the declaration, including any path.
+    declaration = prefix[start:] + B2_TESTS_DECL
+    return declaration, tests
+
+
+def assert_b2_macos_quarantine(source):
+    declaration, tests = _tests_parts(source)
+    stripped = _strip_block_comments(tests)
+    if (tests.count("cfg"), tests.count("ignore"),
+            stripped.count("cfg"), stripped.count("ignore")) != (
+            B2_TESTS_CFG, B2_TESTS_IGNORE, B2_TESTS_CFG, B2_TESTS_IGNORE):
+        raise AssertionError("tests module cfg or ignore token count drifted")
+    decl_stripped = _strip_block_comments(declaration)
+    if (declaration.count("cfg"), decl_stripped.count("cfg")) != (B2_DECL_CFG, B2_DECL_CFG):
+        raise AssertionError("tests module declaration cfg count drifted")
+    file_stripped = _strip_block_comments(source)
+    if (source.count("#[path"), file_stripped.count("#[path")) != (B2_PATH_ATTRS, B2_PATH_ATTRS):
+        raise AssertionError("vm.rs path attribute would redirect the tests module")
+    gate = _norm('#[cfg_attr(' + B2_PREDICATE + ', ignore = "' + B2_REASON + '")]')
+    if _norm(tests).count(gate + "asyncfn" + B2_TEST + "(") != 1:
         raise AssertionError("macOS ignore must stay on the b2 snapshot barrier test")
-    fn_prefix = tests.split(signature, 1)[0]
-    stack = re.search(r"((?:[ \t]*#\[[^\]]*\][ \t]*\n)+)[ \t]*$", fn_prefix)
-    if stack is None or stack.group(1) != B2_FN_STACK:
-        raise AssertionError("target function gained a cfg or lost its macOS ignore")
-    if len(re.findall(r"\bignore\b", source)) != 1:
-        raise AssertionError("vm.rs tests may carry exactly one ignore")
-    expected_gate = re.sub(
-        r"\s+", "", 'cfg_attr(' + B2_PREDICATE + ', ignore = "' + B2_REASON + '")'
-    )
-    actual = {}
-    for body in _cfg_bodies(tests):
-        actual[body] = actual.get(body, 0) + 1
-    if actual.get(expected_gate) != 1:
-        raise AssertionError("macOS ignore predicate and reason drifted")
-    del actual[expected_gate]
-    if actual != dict(B2_MAIN_TESTS_CFGS):
-        raise AssertionError("tests module cfg set drifted from main")
-    if source.count(B2_PREDICATE) != 1:
-        raise AssertionError("macOS ignore predicate drifted")
 
 
 class B2MacosQuarantineTests(unittest.TestCase):
@@ -801,6 +796,34 @@ class B2MacosQuarantineTests(unittest.TestCase):
                 B2_TESTS_DECL + "\n",
                 B2_TESTS_DECL + "\n    #![cfg(not(windows))]\n",
                 1,
+            ),
+            "comment cfg on target": source.replace(
+                "    #[tokio::test]\n    " + B2_GATE,
+                "    #[/* Fixture limitation */ cfg(not(target_os = \"windows\"))] "
+                "// Platform restriction\n    #[tokio::test]\n    " + B2_GATE,
+                1,
+            ),
+            "comment cfg on neighbor": source.replace(
+                "    #[tokio::test]\n    " + other,
+                "    #[/* Fixture limitation */ cfg(not(target_os = \"windows\"))]\n"
+                "    #[tokio::test]\n    " + other,
+                1,
+            ),
+            "raw cfg identifier": source.replace(
+                "    #[tokio::test]\n    " + B2_GATE,
+                "    #[r#cfg(not(target_os = \"windows\"))] // raw\n"
+                "    #[tokio::test]\n    " + B2_GATE,
+                1,
+            ),
+            "macro generated cfg": source.replace(
+                B2_TESTS_DECL + "\n",
+                B2_TESTS_DECL + "\n"
+                "    macro_rules! hide { ($item:item) => { "
+                "#[cfg(not(target_os = \"windows\"))] $item }; }\n",
+                1,
+            ),
+            "comment split ignore": source.replace(
+                other, "#[ig/**/nore]\n    " + other, 1
             ),
         }
         for label, mutant in mutants.items():
