@@ -50,6 +50,11 @@ use super::policy::Capacity;
 use crate::service::Shutdown;
 use crate::store::vm::compose as store;
 
+#[path = "compose_backup_owner.rs"]
+mod owner;
+pub use owner::backup_retire_cli;
+pub(crate) use owner::{OwnerBackup, OwnerRetirementProof};
+
 /// Maximum settled backups retained per project before owner-only maintenance.
 pub const MAX_RETAINED_BACKUPS_PER_PROJECT: i64 = 2;
 /// Default idle deadline per guest backup frame / chunk exchange.
@@ -289,6 +294,11 @@ pub(crate) trait StagingWriter: Send {
 /// staging leaves and never-settled `partial_uncertain` leaves may be removed
 /// after attributed identity verification.
 pub(crate) trait BackupCustody: Send + Sync {
+    /// Namespace recorded before any guest or host backup I/O.
+    fn namespace_id(&self) -> Option<Id> {
+        None
+    }
+
     /// Creates an exclusive staging leaf for `operation_id` inside the managed
     /// staging role. Never uses any guest-supplied path.
     fn begin_staging(&self, operation_id: Id) -> Result<Box<dyn StagingWriter>>;
@@ -356,6 +366,15 @@ impl ManagedBackupDir {
         state_root: &Path,
         secret_root: Option<&Path>,
     ) -> Result<Self> {
+        Self::open(backup_root, state_root, secret_root, true)
+    }
+
+    fn open(
+        backup_root: &Path,
+        state_root: &Path,
+        secret_root: Option<&Path>,
+        create: bool,
+    ) -> Result<Self> {
         ensure_disjoint_roots(backup_root, state_root)?;
         if let Some(secret) = secret_root {
             ensure_disjoint_roots(backup_root, secret)?;
@@ -370,8 +389,8 @@ impl ManagedBackupDir {
         crate::local::require_owner(backup_root)?;
         pin.verify(backup_root)?;
 
-        let staging_dir = ensure_private_subdir(backup_root, "staging")?;
-        let settled_dir = ensure_private_subdir(backup_root, "settled")?;
+        let staging_dir = private_subdir(backup_root, "staging", create)?;
+        let settled_dir = private_subdir(backup_root, "settled", create)?;
         let local_root = backup_root
             .to_str()
             .and_then(|raw| LocalPath::parse(raw).ok());
@@ -597,6 +616,10 @@ struct LocalStagingWriter {
 }
 
 impl BackupCustody for ManagedBackupDir {
+    fn namespace_id(&self) -> Option<Id> {
+        Some(self.namespace.id)
+    }
+
     fn begin_staging(&self, operation_id: Id) -> Result<Box<dyn StagingWriter>> {
         self.pin.verify(&self.root)?;
         check_no_reparse(&self.staging_dir)?;
@@ -845,7 +868,7 @@ fn ensure_disjoint_roots(a: &Path, b: &Path) -> Result<()> {
     dead_code,
     reason = "reserved for qualified backup custody activation and E4 fixtures"
 )]
-fn ensure_private_subdir(root: &Path, name: &str) -> Result<PathBuf> {
+fn private_subdir(root: &Path, name: &str, create: bool) -> Result<PathBuf> {
     let dir = root.join(name);
     match fs::symlink_metadata(&dir) {
         Ok(meta) => {
@@ -854,7 +877,7 @@ fn ensure_private_subdir(root: &Path, name: &str) -> Result<PathBuf> {
                 "Compose backup subdir is not a real directory"
             );
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt;
@@ -1333,6 +1356,13 @@ impl BackupHost {
         })?;
         if !boot_live {
             return settle_fail("retired_boot", true, true);
+        }
+
+        if let Some(directory_id) = custody.namespace_id()
+            && !db
+                .transact(|tx| store::bind_backup_namespace(tx, intent.backup_id, directory_id))?
+        {
+            return settle_fail("backup_custody_unavailable", true, false);
         }
 
         let timeouts = self.timeouts();
