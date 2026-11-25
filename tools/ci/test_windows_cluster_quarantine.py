@@ -833,5 +833,171 @@ class B2MacosQuarantineTests(unittest.TestCase):
                     assert_b2_macos_quarantine(mutant)
 
 
+# The C11 case is compiled only inside hosted, which is Linux-only. The
+# ignore still names target_os = "linux" so the gate cannot widen later.
+C11_TEST = "retained_joiners_promote_and_reconcile"
+C11_REASON = (
+    "intermittent Linux C11 retained-joiners refusal: docs/ROADMAP.md Known issues"
+)
+C11_PREDICATE = 'target_os = "linux"'
+C11_GATE = (
+    "#[cfg_attr(\n"
+    "    " + C11_PREDICATE + ",\n"
+    '    ignore = "' + C11_REASON + '"\n'
+    ")]"
+)
+C11_MODULE = (
+    "crates/arxd/src/cluster/consensus/bound_start/enrollment_ingress/hosted/"
+    "promotion_campaign.rs"
+)
+C11_PARENT = "crates/arxd/src/cluster/consensus/bound_start/enrollment_ingress.rs"
+C11_HOSTED_DECL = '#[cfg(all(test, target_os = "linux"))]\nmod hosted {'
+C11_PROMO_DECL = "    mod promotion_campaign;"
+# promotion_campaign.rs on main had no `cfg` or `ignore` substring. The gate
+# adds one of each (`cfg_attr` contributes the `cfg`).
+C11_CFG = 1
+C11_IGNORE = 1
+# Hosted's declaration is the one `#[cfg(all(test, target_os = "linux"))]`.
+# `mod promotion_campaign` has no cfg. Neither file has a path attribute.
+C11_HOSTED_CFG = 1
+C11_PROMO_CFG = 0
+C11_PATH_ATTRS = 0
+
+
+def _declaration_region(source, decl):
+    if source.count(decl) != 1:
+        raise AssertionError("parent module declaration must occur once")
+    at = source.index(decl)
+    prev = max(source.rfind(";", 0, at), source.rfind("}", 0, at))
+    if prev < 0:
+        raise AssertionError("parent module declaration is unbound")
+    return source[prev + 1:at + len(decl)]
+
+
+def _pin_declaration(source, decl, expected, cfg_count):
+    region = _declaration_region(source, decl)
+    stripped = _strip_block_comments(region)
+    if _norm(region) != _norm(expected) or _norm(stripped) != _norm(expected):
+        raise AssertionError("parent module declaration drifted")
+    if (region.count("cfg"), stripped.count("cfg")) != (cfg_count, cfg_count):
+        raise AssertionError("parent module declaration cfg count drifted")
+
+
+def _pin_path(source):
+    stripped = _strip_block_comments(source)
+    if (source.count("#[path"), stripped.count("#[path")) != (
+            C11_PATH_ATTRS, C11_PATH_ATTRS):
+        raise AssertionError("path attribute would redirect a module")
+
+
+def assert_c11_linux_quarantine(module, parent):
+    stripped = _strip_block_comments(module)
+    if (module.count("cfg"), module.count("ignore"),
+            stripped.count("cfg"), stripped.count("ignore")) != (
+            C11_CFG, C11_IGNORE, C11_CFG, C11_IGNORE):
+        raise AssertionError("promotion campaign cfg or ignore token count drifted")
+    _pin_path(module)
+    _pin_path(parent)
+    _pin_declaration(parent, C11_HOSTED_DECL, C11_HOSTED_DECL, C11_HOSTED_CFG)
+    _pin_declaration(parent, C11_PROMO_DECL, C11_PROMO_DECL, C11_PROMO_CFG)
+    gate = _norm('#[cfg_attr(' + C11_PREDICATE + ', ignore = "' + C11_REASON + '")]')
+    if _norm(module).count(gate + "asyncfn" + C11_TEST + "(") != 1:
+        raise AssertionError("Linux ignore must stay on the C11 retained-joiners test")
+
+
+def _c11_gate(predicate):
+    return C11_GATE.replace(C11_PREDICATE, predicate, 1)
+
+
+class C11LinuxQuarantineTests(unittest.TestCase):
+    def test_exact_linux_only_c11_retained_joiners_quarantine(self):
+        module = (ROOT / C11_MODULE).read_text(encoding="utf-8")
+        parent = (ROOT / C11_PARENT).read_text(encoding="utf-8")
+        assert_c11_linux_quarantine(module, parent)
+        other = "async fn close_learner("
+        target = "#[tokio::test(flavor = \"current_thread\")]\n" + C11_GATE
+        mutants = {
+            "gate removed": module.replace(C11_GATE + "\n", "", 1),
+            "predicate unix": module.replace(C11_GATE, _c11_gate("unix"), 1),
+            "predicate all()": module.replace(C11_GATE, _c11_gate("all()"), 1),
+            "predicate not(windows)": module.replace(
+                C11_GATE, _c11_gate("not(windows)"), 1
+            ),
+            "wrong reason": module.replace(C11_REASON, "unapproved reason", 1),
+            "renamed function": module.replace(
+                "async fn " + C11_TEST + "(", "async fn renamed(", 1
+            ),
+            "second ignore": module.replace(other, "#[ignore]\n" + other, 1),
+            "cfg on target function": module.replace(
+                target, '#[cfg(not(target_os="linux"))]\n' + target, 1
+            ),
+            "cfg on neighbor": module.replace(
+                other, '#[cfg(not(target_os="linux"))]\n' + other, 1
+            ),
+            "inner cfg on test module": "#![cfg(not(windows))]\n" + module,
+            "comment cfg on target": module.replace(
+                target,
+                "#[/* Fixture limitation */ cfg(not(target_os = \"windows\"))] "
+                "// Platform restriction\n" + target,
+                1,
+            ),
+            "comment cfg on neighbor": module.replace(
+                other,
+                "#[/* Fixture limitation */ cfg(not(target_os = \"windows\"))]\n"
+                + other,
+                1,
+            ),
+            "raw cfg identifier": module.replace(
+                target,
+                "#[r#cfg(not(target_os = \"windows\"))] // raw\n" + target,
+                1,
+            ),
+            "macro generated cfg": (
+                "macro_rules! hide { ($item:item) => { "
+                "#[cfg(not(target_os = \"windows\"))] $item }; }\n" + module
+            ),
+            "comment split ignore": module.replace(
+                other, "#[ig/**/nore]\n" + other, 1
+            ),
+        }
+        parent_mutants = {
+            "path on promotion module": parent.replace(
+                C11_PROMO_DECL,
+                '    #[path = "other.rs"]\n' + C11_PROMO_DECL,
+                1,
+            ),
+            "comment split path": parent.replace(
+                C11_PROMO_DECL,
+                '    #[pa/**/th = "other.rs"]\n' + C11_PROMO_DECL,
+                1,
+            ),
+            "hosted predicate unix": parent.replace(
+                C11_HOSTED_DECL,
+                '#[cfg(all(test, unix))]\nmod hosted {',
+                1,
+            ),
+            "cfg on promotion declaration": parent.replace(
+                C11_PROMO_DECL,
+                "    #[cfg(unix)]\n" + C11_PROMO_DECL,
+                1,
+            ),
+            "comment cfg on hosted declaration": parent.replace(
+                C11_HOSTED_DECL,
+                "#[/* cfg */ cfg(all(test, target_os = \"linux\"))]\nmod hosted {",
+                1,
+            ),
+        }
+        for label, mutant in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(mutant, module)
+                with self.assertRaises(AssertionError):
+                    assert_c11_linux_quarantine(mutant, parent)
+        for label, mutant in parent_mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(mutant, parent)
+                with self.assertRaises(AssertionError):
+                    assert_c11_linux_quarantine(module, mutant)
+
+
 if __name__ == "__main__":
     unittest.main()
