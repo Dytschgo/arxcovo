@@ -5,6 +5,32 @@ use anyhow::{Result, ensure};
 use arx_guest::compose::{Desired, MAX_PROJECTS, MAX_VOLUMES, OperationState, OperationView};
 use rusqlite::{Connection, OptionalExtension, params};
 
+/// Owner maintenance keeps the original backup row immutable. A prepared
+/// retirement is charged until the owner has proved removal.
+pub(super) const MIGRATE_V15: &str = "
+ALTER TABLE vm_compose_backups ADD COLUMN namespace_tracked INTEGER NOT NULL DEFAULT 0
+    CHECK(namespace_tracked IN (0,1));
+CREATE TABLE vm_compose_backup_retirements (
+    backup_id BLOB PRIMARY KEY REFERENCES vm_compose_backups(id) CHECK(length(backup_id)=16),
+    owner TEXT NOT NULL CHECK(length(owner) BETWEEN 1 AND 184),
+    started_ms INTEGER NOT NULL CHECK(started_ms BETWEEN 0 AND 253402300799999),
+    finished_ms INTEGER CHECK(finished_ms BETWEEN started_ms AND 253402300799999),
+    sha256 BLOB CHECK(sha256 IS NULL OR length(sha256)=32)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER vm_compose_backup_retirements_no_delete
+BEFORE DELETE ON vm_compose_backup_retirements BEGIN
+    SELECT RAISE(ABORT,'backup retirement audit cannot be deleted');
+END;
+CREATE TRIGGER vm_compose_backup_retirements_complete_only
+BEFORE UPDATE ON vm_compose_backup_retirements WHEN
+    OLD.finished_ms IS NOT NULL OR NEW.finished_ms IS NULL OR
+    NEW.backup_id IS NOT OLD.backup_id OR NEW.owner IS NOT OLD.owner OR
+    NEW.started_ms IS NOT OLD.started_ms OR NEW.sha256 IS NOT OLD.sha256
+BEGIN
+    SELECT RAISE(ABORT,'backup retirement audit is immutable');
+END;
+";
+
 /// Store v14 migration: protected Compose SQLite backups (ADR 0070, leg E4).
 pub(super) const MIGRATE_V14: &str = "
 CREATE TABLE activity_v14 (
@@ -899,7 +925,9 @@ pub(crate) fn owned_backup(db: &Connection, principal: &str, vm: Id, id: Id) -> 
 pub(crate) fn settled_backup_count(db: &Connection, target: &Target) -> Result<i64> {
     count(
         db,
-        "SELECT count(*) FROM vm_compose_backups WHERE vm=?1 AND project=?2 AND state='settled'",
+        "SELECT count(*) FROM vm_compose_backups b WHERE vm=?1 AND project=?2 AND state='settled'
+         AND NOT EXISTS (SELECT 1 FROM vm_compose_backup_retirements r
+                         WHERE r.backup_id=b.id AND r.finished_ms IS NOT NULL)",
         params![target.vm, target.project],
     )
 }
@@ -1025,8 +1053,8 @@ pub(crate) fn admit_backup(
     db.execute(
         "INSERT INTO vm_compose_backups(
             id,operation_id,principal,vm,project,generation,boot,revision,volume,database,
-            state,host_staging_charge,guest_staging_charge,retained_charge,created_ms
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'staging',?11,?11,0,?12)",
+            state,host_staging_charge,guest_staging_charge,retained_charge,created_ms,namespace_tracked
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'staging',?11,?11,0,?12,1)",
         params![
             backup_id,
             op_id,
@@ -1080,6 +1108,94 @@ pub(crate) fn mark_backup_sent(db: &Connection, op_id: Id) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn owner_backups(
+    db: &Connection,
+    id: Option<Id>,
+) -> Result<Vec<compose_backup::OwnerBackup>> {
+    let mut statement = db.prepare(
+        "SELECT b.id,b.operation_id,b.state,b.directory_id,b.volume_id,b.file_id,
+                b.namespace_tracked,b.sha256,r.owner,r.started_ms,r.finished_ms
+         FROM vm_compose_backups b
+         LEFT JOIN vm_compose_backup_retirements r ON r.backup_id=b.id
+         WHERE (?1 IS NULL OR b.id=?1) AND (b.state='settled' OR
+                (b.state='partial_uncertain' AND b.volume_id IS NULL AND b.file_id IS NULL))
+         ORDER BY b.created_ms,b.id",
+    )?;
+    let rows = statement.query_map([id], |r| {
+        let directory_id = r.get(3)?;
+        let volume_id: Option<[u8; 8]> = r.get(4)?;
+        let file_id = r.get(5)?;
+        let witness = match (directory_id, volume_id, file_id) {
+            (Some(directory_id), Some(volume_id), Some(file)) => {
+                Some(compose_backup::HostFileWitness {
+                    identity: crate::vm::paths::FileIdentity {
+                        volume: u64::from_be_bytes(volume_id),
+                        file,
+                    },
+                    directory_id,
+                })
+            }
+            _ => None,
+        };
+        Ok(compose_backup::OwnerBackup {
+            id: r.get(0)?,
+            operation_id: r.get(1)?,
+            state: compose_backup::BackupRecordState::parse(&r.get::<_, String>(2)?)?,
+            directory_id,
+            witness,
+            namespace_tracked: r.get(6)?,
+            sha256: r.get(7)?,
+            owner: r.get(8)?,
+            started_ms: r.get(9)?,
+            finished_ms: r.get(10)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub(crate) fn prepare_owner_retirement(
+    db: &Connection,
+    id: Id,
+    owner: &str,
+    now: i64,
+) -> Result<()> {
+    ensure!(
+        db.execute(
+            "INSERT INTO vm_compose_backup_retirements(backup_id,owner,started_ms,sha256)
+             SELECT id,?2,?3,sha256 FROM vm_compose_backups
+             WHERE id=?1 AND (state='settled' OR
+                (state='partial_uncertain' AND volume_id IS NULL AND file_id IS NULL))",
+            params![id, owner, now],
+        )? == 1,
+        "backup unavailable for retirement"
+    );
+    Ok(())
+}
+
+pub(crate) fn complete_owner_retirement(
+    db: &Connection,
+    proof: compose_backup::OwnerRetirementProof,
+    now: i64,
+) -> Result<()> {
+    ensure!(
+        db.execute(
+            "UPDATE vm_compose_backup_retirements SET finished_ms=max(started_ms,?2)
+             WHERE backup_id=?1 AND finished_ms IS NULL",
+            params![proof.backup_id(), now],
+        )? == 1,
+        "backup retirement was not prepared"
+    );
+    Ok(())
+}
+
+pub(crate) fn bind_backup_namespace(db: &Connection, id: Id, directory_id: Id) -> Result<bool> {
+    Ok(db.execute(
+        "UPDATE vm_compose_backups SET directory_id=?2
+         WHERE id=?1 AND state='staging' AND (directory_id IS NULL OR directory_id=?2)",
+        params![id, directory_id],
+    )? == 1)
+}
+
 pub(crate) fn record_backup_staging_identity(
     db: &Connection,
     backup_id: Id,
@@ -1090,7 +1206,8 @@ pub(crate) fn record_backup_staging_identity(
     ensure!(
         db.execute(
             "UPDATE vm_compose_backups SET volume_id=?2,directory_id=?3,file_id=?4
-             WHERE id=?1 AND state IN ('staging','partial_uncertain')",
+             WHERE id=?1 AND state IN ('staging','partial_uncertain')
+               AND (directory_id IS NULL OR directory_id=?3) AND file_id IS NULL",
             params![backup_id, volume_id.to_be_bytes(), directory_id, file_id],
         )? == 1,
         "Compose backup not staging"
@@ -1232,6 +1349,8 @@ pub(crate) fn list_partial_uncertain_backups(
         "SELECT id, operation_id, volume_id, directory_id, file_id
          FROM vm_compose_backups
          WHERE state='partial_uncertain'
+           AND NOT EXISTS (SELECT 1 FROM vm_compose_backup_retirements r
+                           WHERE r.backup_id=vm_compose_backups.id)
          ORDER BY created_ms ASC, id ASC",
     )?;
     let rows = stmt.query_map([], |r| {
