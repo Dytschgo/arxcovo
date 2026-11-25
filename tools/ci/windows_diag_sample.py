@@ -957,7 +957,10 @@ def sample(ctx, rep, start):
     rep.event = ev if ev in EVENTS else "-"
     if not ctx.is_windows or ctx.in_venv:
         raise Guard("platform")
-    check_anchor(env.get("ARX_DIAG_T0"), clock.time())
+    # Keep this age. A later wall-clock step backward must not admit work
+    # that this reading already showed does not fit the job cap.
+    opened = clock.monotonic()
+    first_age = check_anchor(env.get("ARX_DIAG_T0"), clock.time())
     if rep.event == "-":
         rep.outcome = "skipped_event"
         return rep
@@ -975,7 +978,10 @@ def sample(ctx, rep, start):
     junit = os.path.join(tdirs[-1], JUNIT_NAME)
     require(fs, junit, ("file", "missing"))
     check_deadline(clock, start + VALIDATION_S)
-    e, admitted = admission(check_anchor(env.get("ARX_DIAG_T0"), clock.time()))
+    second_age = check_anchor(env.get("ARX_DIAG_T0"), clock.time())
+    elapsed = clock.monotonic() - opened
+    grown = first_age + (int(elapsed) if elapsed > 0 else 0)
+    e, admitted = admission(max(first_age, second_age, grown))
     rep.e_s = e
     if not admitted:
         rep.outcome = "skipped_budget"

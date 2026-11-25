@@ -349,6 +349,46 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(h.field("e_s"), "-")
         self.assertEqual(h.log, [])
 
+    def _shift_later_wall_read(self, clock, delta):
+        original = clock.time
+        seen = {"n": 0}
+
+        def time():
+            seen["n"] += 1
+            now = original()
+            return now + delta if seen["n"] > 1 else now
+
+        clock.time = time
+        return seen
+
+    def test_backward_wall_step_cannot_admit_after_a_late_anchor(self):
+        # Review replay: first age 750 s, then the wall clock steps back 165 s
+        # so a second read alone would be 585 s and E=600.
+        h = Harness()
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 750)
+        seen = self._shift_later_wall_read(h.clock, -165)
+        code, lines = h.run()
+        self.assertGreaterEqual(seen["n"], 2)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), str(750 + w.ANCHOR_PRE_S))
+        self.assertEqual(lines, [lines[0]])
+        self.assertNotIn("guard", lines[0])
+        self.assertEqual(h.log, [])
+
+    def test_forward_wall_step_uses_the_later_age(self):
+        # First age would admit (585 s, E=600). A forward step to 750 s must skip.
+        h = Harness()
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        seen = self._shift_later_wall_read(h.clock, 165)
+        code, lines = h.run()
+        self.assertGreaterEqual(seen["n"], 2)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), str(750 + w.ANCHOR_PRE_S))
+        self.assertEqual(lines, [lines[0]])
+        self.assertEqual(h.log, [])
+
 
 class InventoryTests(unittest.TestCase):
     def check(self, data, reason):
