@@ -743,12 +743,47 @@ impl Observation {
     }
 }
 
+/// Socket observations from the held live guest channel. A socket error can
+/// also result from guest setup or routing, so it carries no denial claim.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeOutcome {
+    Reachable,
+    MalformedReply,
+    SocketError,
+    NotAttempted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkProbeReport {
+    pub nic_ready: bool,
+    pub ipv4_lease: bool,
+    pub default_route: bool,
+    pub no_ipv6_egress_route: bool,
+    /// IPv4, IPv6, host, slirp host alias, management, public, DNS and slirp
+    /// DNS alias, in the order the pinned guest script runs them.
+    pub outcomes: [ProbeOutcome; 8],
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestrictedNetworkDiagnostic {
+    pub guest: NetworkProbeReport,
+    pub host_controls_post: bool,
+    pub clean_guest_shutdown: bool,
+    pub seed_charge_released: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StageResult {
     Passed(Observation),
     Failed(Diagnostic),
     Inconclusive(Diagnostic),
+    /// A live TEST probe report without independent packet attribution.
+    /// The graph treats this as non-passing.
+    NetworkDiagnostic(RestrictedNetworkDiagnostic),
     /// The native collector for this stage is not implemented in this
     /// contract version. Never completes a dossier.
     Unimplemented,

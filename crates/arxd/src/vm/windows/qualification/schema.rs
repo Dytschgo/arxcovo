@@ -44,6 +44,8 @@ enum Shape {
     Optional(&'static Shape),
     /// At most this many items of the inner shape.
     List(&'static Shape, usize),
+    /// Exactly this many items of the inner shape.
+    FixedList(&'static Shape, usize),
     /// `"unimplemented"`, `{"failed":D}`, `{"inconclusive":D}` or
     /// `{"passed":O}` with an observation kind permitted in this file.
     StageResult,
@@ -157,6 +159,32 @@ const RECORD: &[(&str, Shape)] = &[
 ];
 
 const ANY_STAGE: Shape = Shape::Enum(STAGES);
+
+const NETWORK_GUEST: &[(&str, Shape)] = &[
+    ("nic_ready", Shape::Bool),
+    ("ipv4_lease", Shape::Bool),
+    ("default_route", Shape::Bool),
+    ("no_ipv6_egress_route", Shape::Bool),
+    (
+        "outcomes",
+        Shape::FixedList(
+            &Shape::Enum(&[
+                "reachable",
+                "malformed_reply",
+                "socket_error",
+                "not_attempted",
+            ]),
+            8,
+        ),
+    ),
+];
+
+const NETWORK_DIAGNOSTIC: Shape = Shape::Object(&[
+    ("guest", Shape::Object(NETWORK_GUEST)),
+    ("host_controls_post", Shape::Bool),
+    ("clean_guest_shutdown", Shape::Bool),
+    ("seed_charge_released", Shape::Bool),
+]);
 
 const INCOMPLETE: &[(&str, Shape)] = &[
     ("contract", Shape::Const(RECORD_CONTRACT as u64)),
@@ -366,6 +394,7 @@ struct Rules {
     top: Shape,
     stages: &'static [&'static str],
     kinds: &'static [&'static str],
+    network_diagnostic: bool,
 }
 
 const RECORDS: Shape = Shape::List(&Shape::Object(RECORD), 24);
@@ -375,6 +404,7 @@ fn records(stages: &'static [&'static str], kinds: &'static [&'static str]) -> R
         top: RECORDS,
         stages,
         kinds,
+        network_diagnostic: false,
     }
 }
 
@@ -415,8 +445,10 @@ fn rules(file: DiagnosticFile) -> Rules {
             ],
             &["whpx", "paused_trial", "firmware_sec", "qmp_firmware"],
         ),
-        // PR 1 can persist network diagnostics, but cannot attest isolation.
-        F::NetworkRestrictedTest => records(&["restricted_test_network"], &[]),
+        F::NetworkRestrictedTest => Rules {
+            network_diagnostic: true,
+            ..records(&["restricted_test_network"], &[])
+        },
         F::RecipeUbuntu => records(&["ubuntu_recipe"], &[]),
         F::RecipeWindows => records(&["windows_recipe"], &[]),
         F::NetworkRestrictedOrigin => records(&["restricted_origin_network"], &[]),
@@ -428,6 +460,7 @@ fn rules(file: DiagnosticFile) -> Rules {
             top: Shape::Object(INCOMPLETE),
             stages: &[],
             kinds: &[],
+            network_diagnostic: false,
         },
     }
 }
@@ -545,6 +578,7 @@ impl<'de> Visitor<'de> for Check<'_> {
         let (item, min, max) = match self.present() {
             Shape::Bytes(length) => (&Shape::Uint(u8::MAX as u64), *length, *length),
             Shape::List(item, max) => (*item, 0, *max),
+            Shape::FixedList(item, length) => (*item, *length, *length),
             _ => return reject(),
         };
         let mut count = 0;
@@ -566,6 +600,7 @@ impl<'de> Visitor<'de> for Check<'_> {
                 let value = match key.as_str() {
                     "passed" => &Shape::Observation,
                     "failed" | "inconclusive" => &Shape::Enum(DIAGNOSTICS),
+                    "network_diagnostic" if self.rules.network_diagnostic => &NETWORK_DIAGNOSTIC,
                     _ => return reject(),
                 };
                 map.next_value_seed(self.with(value))?;

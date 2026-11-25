@@ -12,8 +12,8 @@ pub use native::{
 };
 
 use super::*;
-use crate::vm::guest::network_probe::ProbeReport;
 use crate::vm::qualification_record::ControlledFault;
+use crate::vm::qualification_record::NetworkProbeReport;
 use crate::vm::{qmp::bounded, runtime::capacity};
 use std::{
     cell::Cell,
@@ -558,7 +558,10 @@ trait Host {
     fn mark_phase_complete(&self, _slot: &Self::Slot, _phase: PausedPhase) {}
     fn mark_prelaunch_quiet(&self, _slot: &Self::Slot) {}
     fn mark_sec_marker(&self, _slot: &Self::Slot) {}
-    fn record_network_report(&self, _slot: &Self::Slot, _report: ProbeReport) {}
+    fn record_network_report(&self, _slot: &Self::Slot, _report: NetworkProbeReport) {}
+    async fn network_post_controls(&self, _network: &NetworkBoot<'_>) -> bool {
+        false
+    }
     fn mark_post_controls(&self, _slot: &Self::Slot) {}
 
     /// Record completion of the purpose's expected graceful stop protocol.
@@ -1046,7 +1049,7 @@ async fn launch_paused<H: Host>(
                 .await?;
             host.record_network_report(slot, report);
             gate.watch(async {
-                if network.source.witnesses.known_live(&network.nonce).await {
+                if host.network_post_controls(network).await {
                     Ok(())
                 } else {
                     Err(NativeRefusal::NetworkFenceUnverified.into())

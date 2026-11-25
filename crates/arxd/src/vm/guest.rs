@@ -431,6 +431,7 @@ pub(super) mod network_probe {
     use tokio::io::{AsyncRead, AsyncReadExt};
 
     use super::ChannelError;
+    use crate::vm::qualification_record::{NetworkProbeReport, ProbeOutcome};
 
     /// Enrolled witness sockets. The alias control is on the host loopback
     /// and is addressed by its slirp alias only from the probe guest.
@@ -444,25 +445,6 @@ pub(super) mod network_probe {
         pub management: SocketAddr,
         pub public: SocketAddr,
         pub dns: SocketAddr,
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(in crate::vm) struct ProbeReport {
-        pub nic_ready: bool,
-        pub ipv4_lease: bool,
-        pub default_route: bool,
-        pub ipv6_disabled: bool,
-        pub denied_probes: u8,
-    }
-
-    impl ProbeReport {
-        pub(in crate::vm) fn passed(self) -> bool {
-            self.nic_ready
-                && self.ipv4_lease
-                && self.default_route
-                && self.ipv6_disabled
-                && self.denied_probes == 8
-        }
     }
 
     impl Targets {
@@ -617,7 +599,7 @@ pub(super) mod network_probe {
     pub(in crate::vm) async fn response(
         mut source: impl AsyncRead + Unpin,
         nonce: &[u8; 16],
-    ) -> Result<ProbeReport, ChannelError> {
+    ) -> Result<NetworkProbeReport, ChannelError> {
         let mut buffer = [0; 55];
         source
             .read_exact(&mut buffer)
@@ -634,28 +616,39 @@ pub(super) mod network_probe {
         else {
             return Err(ChannelError::Invalid);
         };
-        if got_nonce != hex::encode(nonce)
-            || setup.len() != 4
-            || !setup.bytes().all(|b| matches!(b, b'0' | b'1'))
-            || outcomes.len() != 8
-            || !outcomes
-                .bytes()
-                .all(|b| matches!(b, b'D' | b'R' | b'M' | b'E'))
-        {
+        let flags: [u8; 4] = setup
+            .as_bytes()
+            .try_into()
+            .map_err(|_| ChannelError::Unexpected)?;
+        let codes: [u8; 8] = outcomes
+            .as_bytes()
+            .try_into()
+            .map_err(|_| ChannelError::Unexpected)?;
+        if got_nonce != hex::encode(nonce) || !flags.iter().all(|&b| matches!(b, b'0' | b'1')) {
             return Err(ChannelError::Unexpected);
         }
-        let flags: Vec<bool> = setup.bytes().map(|b| b == b'1').collect();
-        let report = ProbeReport {
-            nic_ready: flags[0],
-            ipv4_lease: flags[1],
-            default_route: flags[2],
-            ipv6_disabled: flags[3],
-            denied_probes: outcomes.bytes().filter(|&b| b == b'D').count() as u8,
-        };
-        if !report.passed() {
+        let setup_ready = flags == *b"1111";
+        if (!setup_ready && codes != *b"EEEEEEEE") || codes[..6].contains(&b'M') {
             return Err(ChannelError::Unexpected);
         }
-        Ok(report)
+        let mut outcomes = [ProbeOutcome::SocketError; 8];
+        for (outcome, code) in outcomes.iter_mut().zip(codes) {
+            *outcome = match code {
+                b'E' if !setup_ready => ProbeOutcome::NotAttempted,
+                b'E' => ProbeOutcome::SocketError,
+                b'R' => ProbeOutcome::Reachable,
+                b'M' => ProbeOutcome::MalformedReply,
+                _ => return Err(ChannelError::Unexpected),
+            };
+        }
+        let [nic_ready, ipv4_lease, default_route, no_ipv6_egress_route] = flags.map(|b| b == b'1');
+        Ok(NetworkProbeReport {
+            nic_ready,
+            ipv4_lease,
+            default_route,
+            no_ipv6_egress_route,
+            outcomes,
+        })
     }
 
     #[cfg(test)]
@@ -673,7 +666,7 @@ pub(super) mod network_probe {
 
     #[cfg(test)]
     #[tokio::test]
-    async fn restricted_network_response_requires_setup_nonce_and_all_denials() {
+    async fn restricted_network_response_preserves_observations_without_claiming_denials() {
         let nonce = [42; 16];
         let targets = fixture_targets();
         assert!(targets.valid());
@@ -682,23 +675,45 @@ pub(super) mod network_probe {
         let frame =
             |nonce, setup, outcomes| format!("ARXNET2 {} {setup} {outcomes}\n", hex::encode(nonce));
         assert_eq!(
-            response(frame(nonce, "1111", "DDDDDDDD").as_bytes(), &nonce).await,
-            Ok(ProbeReport {
+            response(frame(nonce, "1111", "EREEEEMR").as_bytes(), &nonce).await,
+            Ok(NetworkProbeReport {
                 nic_ready: true,
                 ipv4_lease: true,
                 default_route: true,
-                ipv6_disabled: true,
-                denied_probes: 8,
+                no_ipv6_egress_route: true,
+                outcomes: [
+                    ProbeOutcome::SocketError,
+                    ProbeOutcome::Reachable,
+                    ProbeOutcome::SocketError,
+                    ProbeOutcome::SocketError,
+                    ProbeOutcome::SocketError,
+                    ProbeOutcome::SocketError,
+                    ProbeOutcome::MalformedReply,
+                    ProbeOutcome::Reachable,
+                ],
             })
         );
+        for setup in ["1001", "1101", "1110", "0000"] {
+            let report = response(frame(nonce, setup, "EEEEEEEE").as_bytes(), &nonce)
+                .await
+                .unwrap();
+            assert_eq!(
+                [
+                    report.nic_ready,
+                    report.ipv4_lease,
+                    report.default_route,
+                    report.no_ipv6_egress_route
+                ],
+                std::array::from_fn(|index| setup.as_bytes()[index] == b'1'),
+            );
+            assert_eq!(report.outcomes, [ProbeOutcome::NotAttempted; 8]);
+        }
         for (bad_nonce, setup, outcomes) in [
-            ([14; 16], "1111", "DDDDDDDD"),
-            (nonce, "1011", "DDDDDDDD"), // missing IPv4 DHCP lease
-            (nonce, "1101", "DDDDDDDD"), // missing default route
-            (nonce, "1110", "DDDDDDDD"), // IPv6 not disabled
-            (nonce, "1111", "DDDDDDDR"), // one probe reached target
-            (nonce, "1111", "DDDDDDDM"), // malformed DNS reply
-            (nonce, "1111", "DDDDDDDE"), // setup error instead of denial
+            ([14; 16], "1111", "EEEEEEEE"),
+            (nonce, "1111", "DDDDDDDD"), // obsolete denial codes
+            (nonce, "1011", "REEEEEEE"), // probe with incomplete setup
+            (nonce, "1111", "MEEEEEEE"), // TCP never emits a DNS parse result
+            (nonce, "11x1", "EEEEEEEE"),
         ] {
             assert_eq!(
                 response(frame(bad_nonce, setup, outcomes).as_bytes(), &nonce).await,

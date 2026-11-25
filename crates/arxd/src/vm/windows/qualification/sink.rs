@@ -874,6 +874,80 @@ mod tests {
     }
 
     #[test]
+    fn live_network_socket_observations_publish_as_incomplete_only() {
+        use records::{
+            NetworkProbeReport, Origin, ProbeOutcome, RestrictedNetworkDiagnostic, Stage,
+            StageResult,
+        };
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (path, dir) = claimed(root.path(), &[]);
+        let report = RestrictedNetworkDiagnostic {
+            guest: NetworkProbeReport {
+                nic_ready: true,
+                ipv4_lease: true,
+                default_route: true,
+                no_ipv6_egress_route: true,
+                outcomes: [ProbeOutcome::SocketError; 8],
+            },
+            host_controls_post: true,
+            clean_guest_shutdown: true,
+            seed_charge_released: true,
+        };
+        let result = StageResult::NetworkDiagnostic(report);
+        assert!(!result.passes(Stage::RestrictedTestNetwork, Origin::Native));
+        let wire = serde_json::to_string(&result).unwrap();
+        let publish = |dir: &EvidenceDir, stage, result: &str| {
+            dir.publish(
+                &"test",
+                &"projection",
+                1_800_000_000,
+                &entries(&[(stage, raw(result))]),
+                &Body {
+                    blocked_at: Some(stage),
+                    ..body()
+                },
+            )
+        };
+        assert_eq!(publish(&dir, "restricted_test_network", &wire), Ok(vec![]));
+        let file = DiagnosticFile::NetworkRestrictedTest;
+        let bytes = read(&path, file.name());
+        let rows: Vec<records::Record> = records::decode(&bytes).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].stage, Stage::RestrictedTestNetwork);
+        assert_eq!(rows[0].result, result);
+        assert_eq!(
+            names(&path),
+            [
+                "claim.json",
+                "incomplete.json",
+                "network-restricted-test.json"
+            ]
+        );
+        let check = |bytes: String| super::super::schema::check(file, bytes.as_bytes());
+        let row = String::from_utf8(bytes).unwrap();
+        assert!(!check(row.replacen(",\"socket_error\"", "", 1)));
+        assert!(!check(row.replacen(
+            "\"socket_error\"",
+            "\"socket_error\",\"socket_error\"",
+            1
+        )));
+        assert!(!check(row.replacen("\"socket_error\"", "\"denied\"", 1)));
+        assert!(!check(row.replacen(
+            "\"network_diagnostic\"",
+            "\"passed\"",
+            1
+        )));
+
+        let other = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let (other_path, other_dir) = claimed(other.path(), &[]);
+        assert_eq!(
+            publish(&other_dir, "qmp_channel", &wire),
+            Ok(vec![DiagnosticFile::WhpxQmpEndpoint]),
+        );
+        assert_eq!(names(&other_path), ["claim.json", "incomplete.json"]);
+    }
+
+    #[test]
     fn publication_derives_the_binding_and_chain_inside_the_boundary() {
         use serde_json::json;
         let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
