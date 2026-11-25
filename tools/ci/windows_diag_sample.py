@@ -137,6 +137,34 @@ def admission(age):
     return e, e <= ADMIT_E_MAX
 
 
+def _whole_up(v):
+    """Whole seconds, rounding a fraction upward so it cannot hide under the cap."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+        raise Guard("internal")
+    whole = int(v)
+    return whole + 1 if v > whole else whole
+
+
+def admission_clock(first_age, wall_delta, mono_delta):
+    """Return (E, admitted) from the first validated age and later clock deltas.
+
+    E = first_age + max(0, wall_delta, mono_delta) + ANCHOR_PRE_S.
+    wall_delta and mono_delta are seconds since that first reading. The
+    monotonic term is the validation time on the deadline clock. A backward
+    monotonic reading is an OS anomaly and never admits.
+    """
+    if (isinstance(wall_delta, bool) or isinstance(mono_delta, bool)
+            or not isinstance(wall_delta, (int, float))
+            or not isinstance(mono_delta, (int, float))
+            or isinstance(first_age, bool) or not isinstance(first_age, int)
+            or first_age < 0):
+        raise Guard("internal")
+    e = _whole_up(first_age + max(0, wall_delta, mono_delta) + ANCHOR_PRE_S)
+    if mono_delta < 0:
+        return e, False
+    return e, e <= ADMIT_E_MAX
+
+
 # --- Typed D1 grammar -----------------------------------------------------------
 class _NoMatch(Exception):
     pass
@@ -957,10 +985,11 @@ def sample(ctx, rep, start):
     rep.event = ev if ev in EVENTS else "-"
     if not ctx.is_windows or ctx.in_venv:
         raise Guard("platform")
-    # Keep this age. A later wall-clock step backward must not admit work
-    # that this reading already showed does not fit the job cap.
-    opened = clock.monotonic()
-    first_age = check_anchor(env.get("ARX_DIAG_T0"), clock.time())
+    # Keep this reading. Later clocks can only add elapsed validation
+    # time; a backward step must not shrink the age or admit the sample.
+    mono_first = clock.monotonic()
+    wall_first = clock.time()
+    first_age = check_anchor(env.get("ARX_DIAG_T0"), wall_first)
     if rep.event == "-":
         rep.outcome = "skipped_event"
         return rep
@@ -978,10 +1007,10 @@ def sample(ctx, rep, start):
     junit = os.path.join(tdirs[-1], JUNIT_NAME)
     require(fs, junit, ("file", "missing"))
     check_deadline(clock, start + VALIDATION_S)
-    second_age = check_anchor(env.get("ARX_DIAG_T0"), clock.time())
-    elapsed = clock.monotonic() - opened
-    grown = first_age + (int(elapsed) if elapsed > 0 else 0)
-    e, admitted = admission(max(first_age, second_age, grown))
+    wall_now = clock.time()
+    check_anchor(env.get("ARX_DIAG_T0"), wall_now)
+    mono_now = clock.monotonic()
+    e, admitted = admission_clock(first_age, wall_now - wall_first, mono_now - mono_first)
     rep.e_s = e
     if not admitted:
         rep.outcome = "skipped_budget"

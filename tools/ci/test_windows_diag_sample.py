@@ -389,6 +389,59 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(lines, [lines[0]])
         self.assertEqual(h.log, [])
 
+    def _on_first_junit_kind(self, h, move):
+        original = h.fs.kind
+        seen = {"n": 0}
+
+        def kind(path):
+            if path == JUNIT and seen["n"] == 0:
+                seen["n"] += 1
+                move(h.clock)
+            return original(path)
+
+        h.fs.kind = kind
+        return seen
+
+    def test_backward_monotonic_after_validation_skips(self):
+        # Both wall readings are 585 s (E=600). A 165 s stall then a 167 s
+        # monotonic rollback leaves the deadline clock behind its first reading.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        def stall_then_roll_back(clock):
+            clock.t += 165
+            clock.t -= 167
+
+        seen = self._on_first_junit_kind(h, stall_then_roll_back)
+        code, lines = h.run()
+        self.assertEqual(seen["n"], 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), "600")
+        self.assertEqual(lines, [lines[0]])
+        self.assertEqual(h.log, [])
+
+    def test_validation_time_consumes_admit_budget(self):
+        # Age 585 s would admit. One second on the deadline clock makes E=601.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        seen = self._on_first_junit_kind(h, lambda clock: setattr(clock, "t", clock.t + 1))
+        code, lines = h.run()
+        self.assertEqual(seen["n"], 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), "601")
+        self.assertEqual(lines, [lines[0]])
+        self.assertEqual(h.log, [])
+
+    def test_fast_validation_still_admits(self):
+        h = Harness()
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        self.assertEqual(h.run()[0], 0)
+        self.assertEqual(h.field("outcome"), "all_pass")
+        self.assertEqual(h.field("e_s"), "600")
+        self.assertIn("spawn:list", h.log)
+        self.assertIn("spawn:run", h.log)
+
 
 class InventoryTests(unittest.TestCase):
     def check(self, data, reason):
