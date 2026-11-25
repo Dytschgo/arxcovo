@@ -574,3 +574,35 @@ traffic and route drift are **unverified on real hardware**. The public
 profile remains gated on owner-host qualification.
 [Build and policy contract](../tools/qemu/README.md) ·
 [Build receipt pin](../tools/qemu/public-egress-receipt.json)
+
+
+## Retire a Compose backup
+
+Run this maintenance from a local console as the non-elevated account that
+owns the foreground VM state store. Start the current controller once to
+upgrade the store to v15, then stop it before running either command. Use the
+foreground VM state directory containing `activity.sqlite3` and
+`activity.lock`. The command uses the same store lock as the controller.
+
+```text
+arxd backup-retire --state-dir STATE_DIR --list
+arxd backup-retire --state-dir STATE_DIR --backup-root BACKUP_ROOT --backup-id BACKUP_ID
+```
+
+Use the original private Compose backup root containing `staging` and
+`settled`. List prints the ID, status and digest when available. Verify that
+you have the intended copy and that another usable copy exists if you need
+to retain the data. Type the displayed 32-character backup ID and press
+Enter. A successful retirement permanently removes that copy and frees its
+retention slot and disk charge. Restart the controller when finished.
+
+If interrupted, rerun list and repeat retirement with the same account,
+backup ID and root for an entry marked `retirement-pending`. Its charge stays
+in place until the command confirms absence. Leave replacements and
+unattributed leaves intact for owner investigation. A v14 partial shown as
+`partial-unbound-legacy` lacks the namespace identity needed to prove
+absence. Its charge remains in place.
+
+The schema upgrade is forward-only. To roll back the binary, restore a
+matched offline copy of the pre-upgrade ledger and its corresponding backup
+namespace. Restoring only the ledger cannot recover retired backup contents.
