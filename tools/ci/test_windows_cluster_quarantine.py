@@ -887,6 +887,7 @@ C11_BLOCK_BOUND = ""
 C11_BLOCK_ENROLL = '#[cfg(target_os="linux")]'
 C11_BLOCK_HOSTED = '#[cfg(all(test,target_os="linux"))]'
 C11_BLOCK_PROMOTION = ""
+C11_BLOCK_TEST = _norm('#[tokio::test(flavor = "current_thread")]' + C11_GATE)
 # Normalized active declaration. Promotion must stay `;` so an inline `{`
 # module cannot replace the file. A same-line attribute fails the line match.
 C11_LINE_CLUSTER = "pubmodcluster;"
@@ -1107,6 +1108,22 @@ def assert_c11_linux_quarantine(files):
         raise AssertionError(
             f"{C11_MODULE}: expected 1 C11 linux ignore gate, found {found}"
         )
+    # The test's own attribute block must stay exactly main's test attribute
+    # plus the gate, so commenting out or replacing `#[tokio::test]` fails.
+    fn_line = re.compile(r"^[ \t]*async fn " + C11_TEST + r"\(", re.M)
+    starts = [m.start() for m in fn_line.finditer(masked[C11_MODULE])]
+    if len(starts) != 1:
+        raise AssertionError(
+            f"{C11_MODULE}: async fn {C11_TEST} expected 1 active definition, "
+            f"found {len(starts)}"
+        )
+    cut = _attribute_cut(masked[C11_MODULE][: starts[0]])
+    actual_block = _norm(module[cut : starts[0]])
+    if actual_block != C11_BLOCK_TEST:
+        raise AssertionError(
+            f"{C11_MODULE}: {C11_TEST} attribute block expected {C11_BLOCK_TEST!r} "
+            f"actual {actual_block!r}"
+        )
 
 
 def _c11_gate(predicate):
@@ -1254,6 +1271,28 @@ class C11LinuxQuarantineTests(unittest.TestCase):
             "commented-out promotion module": (
                 C11_PARENT,
                 parent.replace(C11_PROMO_DECL, "//" + C11_PROMO_DECL, 1),
+            ),
+            # Review 3: without its test attribute the case leaves discovery.
+            "commented-out test attribute": (
+                C11_MODULE, module.replace(target, "// " + target, 1)
+            ),
+            "removed test attribute": (
+                C11_MODULE,
+                module.replace(target, C11_GATE, 1),
+            ),
+            "block-commented test attribute": (
+                C11_MODULE,
+                module.replace(
+                    target,
+                    "/* #[tokio::test(flavor = \"current_thread\")] */\n" + C11_GATE,
+                    1,
+                ),
+            ),
+            "different test attribute": (
+                C11_MODULE,
+                module.replace(
+                    target, "#[tokio::test(flavor = \"multi_thread\")]\n" + C11_GATE, 1
+                ),
             ),
             "same-line cfg on promotion module": (
                 C11_PARENT,
