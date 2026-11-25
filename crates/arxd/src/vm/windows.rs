@@ -2460,6 +2460,8 @@ struct CheckedLaunchCore<'a> {
     pins: std::sync::Arc<[PathPin]>,
     setup_vars_handoff: Option<File>,
     writers: Vec<usize>,
+    memory: usize,
+    cpu_rate: u32,
     stock: StockLaunch<'a>,
     workspace: WorkspaceCustody<'a>,
     finalization: Option<(super::PairSlots, [usize; 2])>,
@@ -2637,6 +2639,8 @@ impl<'a> CheckedLaunchCore<'a> {
                 pins: inputs.pins.into(),
                 setup_vars_handoff,
                 writers,
+                memory: inputs.memory,
+                cpu_rate: inputs.cpu_rate,
                 stock,
                 workspace: inputs.workspace,
                 finalization,
@@ -2653,6 +2657,32 @@ type PipeQmp = Qmp<tokio::io::DuplexStream, tokio::io::DuplexStream>;
 type SerialGuest = GuestChannel<tokio::net::windows::named_pipe::NamedPipeClient>;
 type BootIo = (tokio::io::DuplexStream, tokio::io::DuplexStream);
 type HeldRelease = (StopDisposition, Option<HeldWriters>);
+
+const LIVE_POLL: Duration = Duration::from_secs(1);
+
+/// Keep polling the same operation and prefer refusal over a simultaneous
+/// result. The caller owns teardown after this future releases its I/O borrows.
+async fn monitor_running<T, E>(
+    work: impl std::future::Future<Output = Result<T, E>>,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<T, E> {
+    use tokio::time::{Instant, MissedTickBehavior, interval_at};
+    let mut tick = interval_at(Instant::now() + LIVE_POLL, LIVE_POLL);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tokio::pin!(work);
+    observe()?;
+    loop {
+        tokio::select! {
+            biased;
+            _ = tick.tick() => observe()?,
+            result = &mut work => {
+                let result = result?;
+                observe()?;
+                return Ok(result);
+            }
+        }
+    }
+}
 
 enum BootOutcome {
     Installed(Box<(PipeQmp, SerialGuest)>),
@@ -2675,6 +2705,37 @@ impl From<ChannelError> for InstallerFailureReason {
 }
 
 impl CheckedLaunchCore<'_> {
+    fn check_running(
+        &self,
+        refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
+        allow_exited: bool,
+    ) -> Result<(), NativeRefusal> {
+        let job_error = NativeRefusal::JobUnverified;
+        let captured = refresh()?;
+        self.stock.recheck_all(&self.pins, Some(&self.workspace))?;
+        self.child
+            .job
+            .verify_limits(self.memory, Some(self.cpu_rate), Some(1))
+            .map_err(|_| job_error)?;
+        let live = self
+            .child
+            .verify_live()
+            .map_err(|_| job_error)
+            .and_then(|_| verify_child_policy(&self.child, self.stock.token));
+        if let Err(reason) = live
+            && !(allow_exited
+                && self.child.exited().is_ok_and(|exited| exited)
+                && matches!(self.child.job.active(), Ok(0)))
+        {
+            return Err(reason);
+        }
+        fresh_observation(
+            captured,
+            std::time::Instant::now(),
+            NativeRefusal::ReservesUnverified,
+        )
+    }
+
     async fn helper(
         &mut self,
         io: BootIo,
@@ -2711,17 +2772,23 @@ impl CheckedLaunchCore<'_> {
             }
             self.stock.recheck_all(&self.pins, Some(&self.workspace))?;
             self.child.resume_checked(cancel, &mut refresh)?;
-            let mut output = Vec::new();
-            (&mut read)
-                .take(16 * 1024 + 1)
-                .read_to_end(&mut output)
-                .await
-                .map_err(|_| refused)?;
-            self.child.reap(deadline).await.map_err(|_| refused)?;
-            if output.len() > 16 * 1024 || self.child.exit_code()? != 0 {
-                return Err(refused);
-            }
-            Ok(output)
+            monitor_running(
+                async {
+                    let mut output = Vec::new();
+                    (&mut read)
+                        .take(16 * 1024 + 1)
+                        .read_to_end(&mut output)
+                        .await
+                        .map_err(|_| refused)?;
+                    self.child.reap(deadline).await.map_err(|_| refused)?;
+                    if output.len() > 16 * 1024 || self.child.exit_code()? != 0 {
+                        return Err(refused);
+                    }
+                    Ok(output)
+                },
+                || self.check_running(&mut refresh, true),
+            )
+            .await
         };
         let result = tokio::select! {
             biased;
@@ -2766,37 +2833,43 @@ impl CheckedLaunchCore<'_> {
         self.child
             .resume_checked(cancel, &mut revalidate)
             .map_err(BootFailure::Native)?;
-        // Workers are already draining. Do not await the QMP greeting while
-        // QEMU may be waiting for a client at CreateNamedPipe/ConnectNamedPipe.
-        let pipe = connect_serial(
-            serial,
-            &self.child,
-            token.account.0,
-            &token.entries(),
-            cancel,
-            tokio::time::Instant::now() + Duration::from_secs(10),
+        // The periodic monitor and cont gate both sample synchronously on the
+        // same task. The cell shares the sampler without a borrow across I/O.
+        let refresh = std::cell::RefCell::new(revalidate);
+        monitor_running(
+            async {
+                // QEMU can wait for a serial client before sending QMP greeting.
+                let pipe = connect_serial(
+                    serial,
+                    &self.child,
+                    token.account.0,
+                    &token.entries(),
+                    cancel,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .await?;
+                let (read, write) = io;
+                let mut qmp = Qmp::handshake(read, write, cancel)
+                    .await
+                    .map_err(|_| NativeRefusal::QmpUnverified)?;
+                qmp.verify_whpx()
+                    .await
+                    .map_err(|_| NativeRefusal::WhpxUnverified)?;
+                self.dispatch_cont(&mut qmp, cancel, &mut || refresh.borrow_mut()(), None)
+                    .await
+                    .map_err(|error| match error {
+                        InstallerFailureReason::Native(reason) => reason,
+                        _ => NativeRefusal::QmpUnverified,
+                    })?;
+                let guest = GuestChannel::ready(pipe, &mut qmp, cancel)
+                    .await
+                    .map_err(|_| NativeRefusal::GuestEndpointUnverified)?;
+                Ok(BootOutcome::Installed(Box::new((qmp, guest))))
+            },
+            || self.check_running(&mut *refresh.borrow_mut(), false),
         )
         .await
-        .map_err(BootFailure::Native)?;
-        let (read, write) = io;
-        let mut qmp = Qmp::handshake(read, write, cancel)
-            .await
-            .map_err(|_| BootFailure::Native(NativeRefusal::QmpUnverified))?;
-        qmp.verify_whpx()
-            .await
-            .map_err(|_| BootFailure::Native(NativeRefusal::WhpxUnverified))?;
-        self.dispatch_cont(&mut qmp, cancel, &mut revalidate, None)
-            .await
-            .map_err(|error| {
-                BootFailure::Native(match error {
-                    InstallerFailureReason::Native(reason) => reason,
-                    _ => NativeRefusal::QmpUnverified,
-                })
-            })?;
-        let guest = GuestChannel::ready(pipe, &mut qmp, cancel)
-            .await
-            .map_err(|_| BootFailure::Native(NativeRefusal::GuestEndpointUnverified))?;
-        Ok(BootOutcome::Installed(Box::new((qmp, guest))))
+        .map_err(BootFailure::Native)
     }
 
     async fn dispatch_cont(
@@ -2868,31 +2941,32 @@ impl CheckedLaunchCore<'_> {
             if Instant::now() >= deadline {
                 return Err(Failure::Timeout);
             }
-            self.child.resume_checked_with_handoff(cancel, revalidate, || {
-                // QEMU opens writable pflash by name after resume. The
-                // original object and ancestry pin stays held across it.
-                drop(self.setup_vars_handoff.take());
-            }).map_err(Failure::Native)?;
+            self.child
+                .resume_checked_with_handoff(cancel, revalidate, || {
+                    // QEMU opens writable pflash by name after resume. The
+                    // original object and ancestry pin stays held across it.
+                    drop(self.setup_vars_handoff.take());
+                })
+                .map_err(Failure::Native)?;
             let (read, write) = io;
             let mut qmp = Qmp::installer_handshake(read, write, cancel, stage).await?;
-            qmp.verify_whpx().await.map_err(|_| Failure::Native(NativeRefusal::WhpxUnverified))?;
-            self.dispatch_cont(&mut qmp, cancel, revalidate, Some(stage)).await?;
-            {
-                let progress = qmp.observe_installer_shutdown(cancel);
-                tokio::pin!(progress);
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => return Err(Failure::Cancelled),
-                        result = &mut progress => { result?; break; }
-                        _ = tokio::time::sleep(FRESHNESS) => {
-                            let captured = revalidate().map_err(Failure::Native)?;
-                            fresh_observation(captured, std::time::Instant::now(), NativeRefusal::ReservesUnverified)
-                                .map_err(Failure::Native)?;
-                        }
-                    }
-                }
-            }
+            qmp.verify_whpx()
+                .await
+                .map_err(|_| Failure::Native(NativeRefusal::WhpxUnverified))?;
+            self.dispatch_cont(&mut qmp, cancel, revalidate, Some(stage))
+                .await?;
+            monitor_running(
+                async {
+                    qmp.observe_installer_shutdown(cancel)
+                        .await
+                        .map_err(Failure::from)
+                },
+                || {
+                    self.check_running(&mut *revalidate, true)
+                        .map_err(Failure::Native)
+                },
+            )
+            .await?;
             // Keep QMP's stdin open while QEMU exits voluntarily.
             let exit_by = deadline.min(Instant::now() + grace);
             tokio::select! {
@@ -2904,7 +2978,8 @@ impl CheckedLaunchCore<'_> {
                     (self.child.exit_code() == Ok(0)).then_some(()).ok_or(Failure::ProcessFailed)
                 }
             }
-        }.await;
+        }
+        .await;
 
         let release_by = match result {
             Ok(()) => deadline.min(Instant::now() + grace),
@@ -3179,6 +3254,9 @@ fn allocated_under(root: &LocalPath, expected: u64, limit: usize) -> Result<u64,
     }
     Ok(total)
 }
+
+#[cfg(test)]
+mod monitor_tests;
 
 #[cfg(test)]
 mod tests {

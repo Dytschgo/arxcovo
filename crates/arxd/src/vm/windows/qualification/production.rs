@@ -4,6 +4,7 @@ use super::recipe::{QualifiedBoot, TEST_JOB_MEMORY};
 use super::*;
 use crate::vm::qualification_record::Hash;
 use crate::vm::{ArtifactSlot, Id, PairSlots};
+use arx_guest::protocol::ScriptStatus;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WorkspaceBinding {
@@ -64,6 +65,15 @@ impl ForegroundQualification<'_> {
     }
 
     pub(super) fn launch_live(&self, memory: usize) -> Result<Instant, NativeRefusal> {
+        self.observe_host(memory).map(|(captured, _)| captured)
+    }
+
+    /// Admission uses the current free-space bounds from the same held
+    /// volumes as the monitor. The controller applies its durable charges.
+    pub(crate) fn observe_host(
+        &self,
+        memory: usize,
+    ) -> Result<(Instant, crate::vm::HostObservation), NativeRefusal> {
         let captured = Instant::now();
         self.fresh()?;
         let held = &self.held;
@@ -80,12 +90,35 @@ impl ForegroundQualification<'_> {
             .as_ref()
             .ok_or(NativeRefusal::QualificationMissing)?;
         let inner = capacity::held_free(&scope.production.root.leaf)?;
+        let inner_free = inner.caller.min(inner.total_free);
         if outer.caller.min(outer.total_free) < OUTER_FLOOR
             || inner.total != scope.production.limits.inner_total_bytes
+            || inner_free == 0
         {
             return Err(NativeRefusal::DiskCeilingUnverified);
         }
-        Ok(captured)
+        let used = inner
+            .total
+            .checked_sub(inner.total_free)
+            .ok_or(NativeRefusal::DiskCeilingUnverified)?;
+        let capacity = crate::vm::runtime::capacity(
+            used,
+            inner_free,
+            outer.caller.min(outer.total_free),
+            inner.total,
+            DISK_CEILING,
+            OUTER_FLOOR,
+        )?;
+        fresh_observation(captured, Instant::now(), NativeRefusal::ReservesUnverified)?;
+        Ok((
+            captured,
+            crate::vm::HostObservation {
+                owner_idle: Some(true),
+                logical_cpus: Some(cpus),
+                available_ram: Some(ram),
+                capacity: Some(capacity),
+            },
+        ))
     }
 }
 
@@ -375,29 +408,33 @@ impl<'a> NativeLaunch<'a> {
         &mut self,
         cancel: &Shutdown,
         mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
-    ) -> Result<(), NativeRefusal> {
-        if self.core.kind != PlanKind::Boot {
-            return Err(NativeRefusal::QualificationMissing);
-        }
-        let serial = self.serial.ok_or(NativeRefusal::QualificationMissing)?;
-        let io = self.io.take().ok_or(NativeRefusal::QualificationMissing)?;
-        let outcome = self
-            .core
-            .boot(
-                Some((&self.qualification.held.token, serial)),
-                io,
-                cancel,
-                || Ok(self.qualification.launch_live(self.memory)?.min(refresh()?)),
-                || false,
-            )
-            .await;
+        verify_release: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<(), LaunchFailure<'a>> {
+        let outcome = match (self.core.kind, self.serial, self.io.take()) {
+            (PlanKind::Boot, Some(serial), Some(io)) => {
+                self.core
+                    .boot(
+                        Some((&self.qualification.held.token, serial)),
+                        io,
+                        cancel,
+                        || Ok(self.qualification.launch_live(self.memory)?.min(refresh()?)),
+                        || false,
+                    )
+                    .await
+            }
+            _ => Err(BootFailure::Native(NativeRefusal::QualificationMissing)),
+        };
         match outcome {
             Ok(BootOutcome::Installed(live)) => {
                 self.live = Some(live);
                 Ok(())
             }
-            Err(BootFailure::Native(reason)) => Err(reason),
-            _ => Err(NativeRefusal::QualificationMissing),
+            Err(BootFailure::Native(reason)) => {
+                Err(self.settle_failure(reason, cancel, verify_release).await)
+            }
+            _ => Err(self
+                .settle_failure(NativeRefusal::QualificationMissing, cancel, verify_release)
+                .await),
         }
     }
 
@@ -405,30 +442,90 @@ impl<'a> NativeLaunch<'a> {
         &self,
         refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
-        let captured = self.qualification.launch_live(self.memory)?;
-        self.core
-            .stock
-            .recheck_all(&self.core.pins, Some(&self.core.workspace))?;
-        self.core
-            .child
-            .verify_live()
-            .map_err(|_| NativeRefusal::JobUnverified)?;
-        fresh_observation(
-            captured.min(refresh()?),
-            Instant::now(),
-            NativeRefusal::ReservesUnverified,
+        self.core.check_running(
+            || Ok(self.qualification.launch_live(self.memory)?.min(refresh()?)),
+            false,
         )
     }
 
-    pub(crate) fn guest(
+    pub(crate) async fn ping(
         &mut self,
-        refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
-    ) -> Result<&mut SerialGuest, NativeRefusal> {
-        self.check_live(refresh)?;
-        self.live
-            .as_mut()
-            .map(|live| &mut live.1)
-            .ok_or(NativeRefusal::GuestEndpointUnverified)
+        cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<(), LaunchFailure<'a>> {
+        self.guest_exchange(GuestRequest::Ping, cancel, refresh, verify_release)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn run_script(
+        &mut self,
+        script: String,
+        timeout_s: u32,
+        cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<(ScriptStatus, Option<u32>), LaunchFailure<'a>> {
+        self.guest_exchange(
+            GuestRequest::Script(script, timeout_s),
+            cancel,
+            refresh,
+            verify_release,
+        )
+        .await
+        .map(|result| result.expect("script request returns a script result"))
+    }
+
+    async fn guest_exchange(
+        &mut self,
+        request: GuestRequest,
+        cancel: &Shutdown,
+        mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<Option<(ScriptStatus, Option<u32>)>, LaunchFailure<'a>> {
+        let unavailable = NativeRefusal::GuestEndpointUnverified;
+        let outcome = match self.live.as_deref_mut() {
+            Some((_, guest)) if !cancel.is_cancelled() => {
+                monitor_running(
+                    async {
+                        match request {
+                            GuestRequest::Ping => guest.ping(cancel).await.map(|()| None),
+                            GuestRequest::Script(script, timeout) => {
+                                guest.run_script(cancel, script, timeout).await.map(Some)
+                            }
+                        }
+                        .map_err(|_| unavailable)
+                    },
+                    || {
+                        self.core.check_running(
+                            || Ok(self.qualification.launch_live(self.memory)?.min(refresh()?)),
+                            false,
+                        )
+                    },
+                )
+                .await
+            }
+            _ => Err(unavailable),
+        };
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(reason) => Err(self.settle_failure(reason, cancel, verify_release).await),
+        }
+    }
+
+    async fn settle_failure(
+        &mut self,
+        reason: NativeRefusal,
+        cancel: &Shutdown,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
+    ) -> LaunchFailure<'a> {
+        let (disposition, released) = self.stop_generation(cancel, verify_release).await;
+        LaunchFailure {
+            reason,
+            disposition,
+            released: released.map(Box::new),
+        }
     }
 
     pub(crate) async fn run_installer(
@@ -517,6 +614,14 @@ impl<'a> NativeLaunch<'a> {
         cancel: &Shutdown,
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> (StopDisposition, Option<ReleasedGeneration<'a>>) {
+        self.stop_generation(cancel, verify_release).await
+    }
+
+    async fn stop_generation(
+        &mut self,
+        cancel: &Shutdown,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
+    ) -> (StopDisposition, Option<ReleasedGeneration<'a>>) {
         let qmp = self.live.take().map(|live| live.0);
         drop(self.io.take());
         let (disposition, held) = self.core.stop_held(qmp, cancel, verify_release).await;
@@ -534,6 +639,18 @@ impl<'a> NativeLaunch<'a> {
             held,
         )
     }
+}
+
+enum GuestRequest {
+    Ping,
+    Script(String, u32),
+}
+
+#[must_use = "settle the failed effect with its held proof or retain its charge"]
+pub(crate) struct LaunchFailure<'a> {
+    pub reason: NativeRefusal,
+    pub disposition: StopDisposition,
+    pub released: Option<Box<ReleasedGeneration<'a>>>,
 }
 
 fn check_permit(
