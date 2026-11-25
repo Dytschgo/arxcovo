@@ -2,8 +2,9 @@
 mod checks;
 
 use checks::{
-    BROKEN_SCRIPT, Fail, GOOD_SCRIPT, Observed, SCRIPT_NAME, WINDOWS_RECIPE, accept_vault,
-    discover, hidden, parse_plan, project, qualification, script_sha256, vault_reason,
+    BROKEN_SCRIPT, Fail, GOOD_SCRIPT, Observed, SCRIPT_NAME, Submitted, WINDOWS_RECIPE,
+    accept_vault, discover, hidden, parse_plan, project, qualification, script_sha256,
+    vault_reason,
 };
 use serde_json::{Value, json};
 
@@ -233,27 +234,51 @@ fn version(id: &str, sha: &str, state: &str, exit: u64) -> Value {
     })
 }
 
-fn activity(good: &str, broken: &str) -> Value {
-    let row = |tool, outcome, version: Option<&str>, reason: Option<&str>| {
-        let mut value = json!({"tool": tool, "outcome": outcome, "at_ms": 10});
-        if let Some(version) = version {
-            value["version_id"] = json!(version);
-        }
-        if let Some(reason) = reason {
-            value["reason"] = json!(reason);
-        }
-        value
-    };
+fn ids() -> (String, String, String, String) {
+    (
+        hex_pair("ef", 16),
+        hex_pair("ab", 16),
+        hex_pair("cd", 16),
+        hex_pair("56", 16),
+    )
+}
+
+fn bound() -> Submitted {
+    let (script, good, broken, operation) = ids();
+    Submitted {
+        script_id: script,
+        good_version_id: good,
+        broken_version_id: broken,
+        broken_operation_id: operation,
+    }
+}
+
+fn activity(good: &str, broken: &str, operation: &str) -> Value {
+    let row =
+        |tool, outcome, version: Option<&str>, operation: Option<&str>, reason: Option<&str>| {
+            let mut value = json!({"tool": tool, "outcome": outcome, "at_ms": 10});
+            if let Some(version) = version {
+                value["version_id"] = json!(version);
+            }
+            if let Some(operation) = operation {
+                value["operation_id"] = json!(operation);
+            }
+            if let Some(reason) = reason {
+                value["reason"] = json!(reason);
+            }
+            value
+        };
     json!({
         "ok": true,
         "activities": [
-            row("vault_add_version", "succeeded", Some(good), None),
-            row("vault_test_version", "started", Some(good), None),
-            row("vault_test_version", "succeeded", Some(good), None),
-            row("vault_activate", "succeeded", Some(good), None),
-            row("vault_add_version", "succeeded", Some(broken), None),
-            row("vault_test_version", "failed", Some(broken), Some("exited")),
-            row("vault_activate", "refused", None, Some("pass_required"))
+            row("vault_add_version", "succeeded", Some(good), None, None),
+            row("vault_test_version", "started", Some(good), None, None),
+            row("vault_test_version", "succeeded", Some(good), None, None),
+            row("vault_activate", "succeeded", Some(good), None, None),
+            row("vault_add_version", "succeeded", Some(broken), None, None),
+            row("vault_test_version", "started", Some(broken), Some(operation), None),
+            row("vault_test_version", "failed", Some(broken), Some(operation), Some("exited")),
+            row("vault_activate", "refused", None, None, Some("pass_required"))
         ]
     })
 }
@@ -261,8 +286,16 @@ fn activity(good: &str, broken: &str) -> Value {
 fn observed() -> (Observed, String, String) {
     let good_sha = script_sha256(GOOD_SCRIPT);
     let broken_sha = script_sha256(BROKEN_SCRIPT);
-    let good = hex_pair("ab", 16);
-    let broken = hex_pair("cd", 16);
+    let (script, good, broken, operation) = ids();
+    let list = json!({
+        "ok": true,
+        "entries": [{
+            "script_id": script,
+            "os": "ubuntu",
+            "name": SCRIPT_NAME,
+            "active_version_id": good
+        }]
+    });
     let observed = Observed {
         passed: version(&good, &good_sha, "testing", 0),
         activate_good: json!({
@@ -273,16 +306,9 @@ fn observed() -> (Observed, String, String) {
         activated: version(&good, &good_sha, "active", 0),
         broken: version(&broken, &broken_sha, "rejected", 7),
         activate_broken: json!({"ok": false, "reason": "pass_required"}),
-        list: json!({
-            "ok": true,
-            "entries": [{
-                "script_id": hex_pair("ef", 16),
-                "os": "ubuntu",
-                "name": SCRIPT_NAME,
-                "active_version_id": good
-            }]
-        }),
-        activity: activity(&good, &broken),
+        active_before: list.clone(),
+        list,
+        activity: activity(&good, &broken, &operation),
     };
     (observed, good_sha, broken_sha)
 }
@@ -290,28 +316,39 @@ fn observed() -> (Observed, String, String) {
 #[test]
 fn broken_version_rejection_is_required() {
     let (sample, good_sha, broken_sha) = observed();
-    let proof = accept_vault(&sample, &good_sha, &broken_sha).unwrap();
+    let proof = accept_vault(&sample, &bound(), &good_sha, &broken_sha).unwrap();
     assert_eq!(hidden(&proof, &[GOOD_SCRIPT, BROKEN_SCRIPT]), Ok(()));
-    assert_eq!(proof["active_version_id"], sample.passed["version_id"]);
+    assert_eq!(
+        proof["active_version_id"],
+        sample.list["entries"][0]["active_version_id"]
+    );
+    assert_eq!(
+        project(&sample.list)["entries"][0]["active_version_id"],
+        sample.list["entries"][0]["active_version_id"]
+    );
+    assert_eq!(
+        project(&sample.active_before)["entries"][0]["active_version_id"],
+        sample.active_before["entries"][0]["active_version_id"]
+    );
 
     let mut accepted = sample_parts();
     accepted.broken["state"] = json!("active");
     assert_eq!(
-        accept_vault(&accepted, &good_sha, &broken_sha),
+        accept_vault(&accepted, &bound(), &good_sha, &broken_sha),
         Err(Fail::Check("broken_version_rejected"))
     );
 
     let mut zero = sample_parts();
     zero.broken["test"]["exit_code"] = json!(0);
     assert_eq!(
-        accept_vault(&zero, &good_sha, &broken_sha),
+        accept_vault(&zero, &bound(), &good_sha, &broken_sha),
         Err(Fail::Check("broken_version_rejected"))
     );
 
     let mut dirty = sample_parts();
     dirty.broken["test"]["cleanup_confirmed"] = json!(false);
     assert_eq!(
-        accept_vault(&dirty, &good_sha, &broken_sha),
+        accept_vault(&dirty, &bound(), &good_sha, &broken_sha),
         Err(Fail::Check("broken_version_rejected"))
     );
 
@@ -322,14 +359,14 @@ fn broken_version_rejection_is_required() {
         "operation_id": hex_pair("34", 16)
     });
     assert_eq!(
-        accept_vault(&activated, &good_sha, &broken_sha),
+        accept_vault(&activated, &bound(), &good_sha, &broken_sha),
         Err(Fail::Check("broken_version_rejected"))
     );
 
     let mut other = sample_parts();
     other.activate_broken["reason"] = json!("not_draft");
     assert_eq!(
-        accept_vault(&other, &good_sha, &broken_sha),
+        accept_vault(&other, &bound(), &good_sha, &broken_sha),
         Err(Fail::Check("broken_version_rejected"))
     );
 }
@@ -341,19 +378,26 @@ fn sample_parts() -> Observed {
 #[test]
 fn previous_version_stays_active_is_required() {
     let (sample, good_sha, broken_sha) = observed();
-    assert!(accept_vault(&sample, &good_sha, &broken_sha).is_ok());
+    assert!(accept_vault(&sample, &bound(), &good_sha, &broken_sha).is_ok());
 
     let mut replaced = sample_parts();
     replaced.list["entries"][0]["active_version_id"] = replaced.broken["version_id"].clone();
     assert_eq!(
-        accept_vault(&replaced, &good_sha, &broken_sha),
+        accept_vault(&replaced, &bound(), &good_sha, &broken_sha),
+        Err(Fail::Check("previous_version_active"))
+    );
+
+    let mut earlier = sample_parts();
+    earlier.active_before["entries"][0]["active_version_id"] = earlier.broken["version_id"].clone();
+    assert_eq!(
+        accept_vault(&earlier, &bound(), &good_sha, &broken_sha),
         Err(Fail::Check("previous_version_active"))
     );
 
     let mut superseded = sample_parts();
     superseded.activated["state"] = json!("superseded");
     assert_eq!(
-        accept_vault(&superseded, &good_sha, &broken_sha),
+        accept_vault(&superseded, &bound(), &good_sha, &broken_sha),
         Err(Fail::Check("previous_version_active"))
     );
 
@@ -363,7 +407,47 @@ fn previous_version_stays_active_is_required() {
         .unwrap()
         .remove("active_version_id");
     assert_eq!(
-        accept_vault(&missing, &good_sha, &broken_sha),
+        accept_vault(&missing, &bound(), &good_sha, &broken_sha),
         Err(Fail::Check("previous_version_active"))
+    );
+}
+
+/// The reviewer's false pass: the rejected version keeps its failing test and
+/// the original active version, but it belongs to another script.
+#[test]
+fn unrelated_script_must_not_pass() {
+    let (mut sample, good_sha, broken_sha) = observed();
+    sample.broken["script_id"] = json!(hex_pair("99", 16));
+    sample.broken["name"] = json!("other-script");
+    assert_eq!(
+        accept_vault(&sample, &bound(), &good_sha, &broken_sha),
+        Err(Fail::Check("submitted_binding"))
+    );
+}
+
+/// A consistent rejection of some other version, plus a submit operation that
+/// is not the one this run queued.
+#[test]
+fn unrelated_version_must_not_pass() {
+    let (mut sample, good_sha, broken_sha) = observed();
+    let submitted = bound();
+    let other = hex_pair("77", 16);
+    sample.broken["version_id"] = json!(&other);
+    for row in sample.activity["activities"].as_array_mut().unwrap() {
+        if row["version_id"] == submitted.broken_version_id.as_str() {
+            row["version_id"] = json!(&other);
+        }
+    }
+    assert_eq!(
+        accept_vault(&sample, &submitted, &good_sha, &broken_sha),
+        Err(Fail::Check("submitted_binding"))
+    );
+
+    let (sample, good_sha, broken_sha) = observed();
+    let mut swapped = bound();
+    swapped.broken_operation_id = hex_pair("88", 16);
+    assert_eq!(
+        accept_vault(&sample, &swapped, &good_sha, &broken_sha),
+        Err(Fail::Check("submitted_binding"))
     );
 }

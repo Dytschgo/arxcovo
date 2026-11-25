@@ -62,8 +62,19 @@ pub(super) struct Observed {
     pub activated: Value,
     pub broken: Value,
     pub activate_broken: Value,
+    /// `vault_list` after the known-good activation and before the broken add.
+    pub active_before: Value,
     pub list: Value,
     pub activity: Value,
+}
+
+/// Identifiers taken from this run's add and test-submit receipts. The verifier
+/// matches observations to these values and does not re-derive them.
+pub(super) struct Submitted {
+    pub script_id: String,
+    pub good_version_id: String,
+    pub broken_version_id: String,
+    pub broken_operation_id: String,
 }
 
 pub(super) fn script_sha256(script: &str) -> String {
@@ -364,7 +375,12 @@ pub(super) fn project(response: &Value) -> Value {
         });
     }
     let mut out = json!({});
-    for key in ["version_id", "script_id", "operation_id"] {
+    for key in [
+        "version_id",
+        "script_id",
+        "operation_id",
+        "active_version_id",
+    ] {
         keep_id(&mut out, response, key, 32);
     }
     keep_id(&mut out, response, "sha256", 64);
@@ -477,10 +493,6 @@ fn check(condition: bool, name: &'static str) -> Result<()> {
     condition.then_some(()).ok_or(Fail::Check(name))
 }
 
-fn version_id(row: &Value) -> Result<&str> {
-    opaque(&row["version_id"], 32).ok_or(Fail::Check("version_id"))
-}
-
 fn test_exit(row: &Value, exit: u64) -> Result<()> {
     let test = &row["test"];
     check(test["status"] == "exited", "test_status")?;
@@ -495,39 +507,105 @@ fn test_exit(row: &Value, exit: u64) -> Result<()> {
     )
 }
 
-fn row_matches(
-    rows: &[Value],
-    tool: &str,
-    outcome: &str,
-    version: Option<&str>,
-    reason: Option<&str>,
-) -> bool {
-    rows.iter().any(|row| {
-        row["tool"] == tool
-            && row["outcome"] == outcome
-            && version.is_none_or(|id| row["version_id"] == id)
-            && reason.map_or(row.get("reason").is_none(), |code| row["reason"] == code)
-    })
+fn one(rows: &[Value], pred: impl Fn(&Value) -> bool, name: &'static str) -> Result<()> {
+    check(rows.iter().filter(|row| pred(row)).count() == 1, name)
 }
 
-pub(super) fn accept_vault(observed: &Observed, good_sha: &str, broken_sha: &str) -> Result<Value> {
-    let good = version_id(&observed.passed)?;
-    let broken = version_id(&observed.broken)?;
+fn bind_ids(observed: &Observed, submitted: &Submitted) -> Result<()> {
+    verify_hex(&submitted.script_id, 32, "submitted_binding")?;
+    verify_hex(&submitted.good_version_id, 32, "submitted_binding")?;
+    verify_hex(&submitted.broken_version_id, 32, "submitted_binding")?;
+    verify_hex(&submitted.broken_operation_id, 32, "submitted_binding")?;
+    let script = submitted.script_id.as_str();
+    let good = submitted.good_version_id.as_str();
+    let broken = submitted.broken_version_id.as_str();
     check(good != broken, "distinct_versions")?;
-    check(observed.passed["os"] == "ubuntu", "script_os")?;
-    check(observed.passed["name"] == SCRIPT_NAME, "script_name")?;
+    for row in [&observed.passed, &observed.activated, &observed.broken] {
+        // Script identity is checked before the name so a different script
+        // cannot pass by also changing its display name.
+        check(
+            opaque(&row["script_id"], 32) == Some(script),
+            "submitted_binding",
+        )?;
+        check(row["os"] == "ubuntu", "script_os")?;
+        check(row["name"] == SCRIPT_NAME, "script_name")?;
+    }
+    check(
+        opaque(&observed.passed["version_id"], 32) == Some(good),
+        "submitted_binding",
+    )?;
+    check(
+        opaque(&observed.activated["version_id"], 32) == Some(good),
+        "submitted_binding",
+    )?;
+    check(
+        opaque(&observed.broken["version_id"], 32) == Some(broken),
+        "submitted_binding",
+    )?;
+    check(
+        opaque(&observed.activate_good["version_id"], 32) == Some(good),
+        "submitted_binding",
+    )?;
+    if let Some(id) = observed.activate_broken.get("version_id") {
+        check(opaque(id, 32) == Some(broken), "submitted_binding")?;
+    }
+    Ok(())
+}
+
+/// The activate refusal audit stores a null operation. The submit receipt is
+/// bound to the started row and the failed `exited` row for that version.
+fn test_operation(rows: &[Value], broken: &str, operation: &str) -> Result<()> {
+    let tied = rows
+        .iter()
+        .filter(|row| row["operation_id"] == operation)
+        .count();
+    let started = rows
+        .iter()
+        .filter(|row| {
+            row["operation_id"] == operation
+                && row["tool"] == "vault_test_version"
+                && row["outcome"] == "started"
+                && row["version_id"] == broken
+                && row.get("reason").is_none()
+        })
+        .count();
+    let failed = rows
+        .iter()
+        .filter(|row| {
+            row["operation_id"] == operation
+                && row["tool"] == "vault_test_version"
+                && row["outcome"] == "failed"
+                && row["reason"] == "exited"
+                && row["version_id"] == broken
+        })
+        .count();
+    check(
+        tied == 2 && started == 1 && failed == 1,
+        "submitted_binding",
+    )
+}
+
+pub(super) fn accept_vault(
+    observed: &Observed,
+    submitted: &Submitted,
+    good_sha: &str,
+    broken_sha: &str,
+) -> Result<Value> {
+    let good = submitted.good_version_id.as_str();
+    let broken = submitted.broken_version_id.as_str();
+    let script = submitted.script_id.as_str();
+    bind_ids(observed, submitted)?;
     check(observed.passed["sha256"] == good_sha, "good_sha256")?;
     check(observed.passed["state"] == "testing", "good_test")?;
     test_exit(&observed.passed, 0)?;
     check(observed.activate_good["ok"] == true, "good_activation")?;
     check(
-        observed.activate_good["version_id"] == good
-            && opaque(&observed.activate_good["operation_id"], 32).is_some(),
+        opaque(&observed.activate_good["operation_id"], 32).is_some(),
         "good_activation",
     )?;
 
-    broken_rejected(observed, broken, broken_sha)?;
-    previous_stays_active(observed, good)?;
+    broken_rejected(observed, broken_sha)?;
+    previous_stays_active(observed, script, good)?;
 
     let activity = observed.activity["activities"]
         .as_array()
@@ -535,43 +613,65 @@ pub(super) fn accept_vault(observed: &Observed, good_sha: &str, broken_sha: &str
     check(activity.len() <= 20, "vault_activity")?;
     check(
         observed.activity.get("next_cursor").is_none()
-            && observed.list.get("next_cursor").is_none(),
+            && observed.list.get("next_cursor").is_none()
+            && observed.active_before.get("next_cursor").is_none(),
         "vault_page",
     )?;
-    for (tool, outcome, version, reason) in [
-        ("vault_add_version", "succeeded", Some(good), None),
-        ("vault_test_version", "succeeded", Some(good), None),
-        ("vault_activate", "succeeded", Some(good), None),
-        ("vault_add_version", "succeeded", Some(broken), None),
-        ("vault_test_version", "failed", Some(broken), Some("exited")),
-        ("vault_activate", "refused", None, Some("pass_required")),
+    test_operation(activity, broken, submitted.broken_operation_id.as_str())?;
+    for (tool, version) in [
+        ("vault_add_version", good),
+        ("vault_test_version", good),
+        ("vault_activate", good),
+        ("vault_add_version", broken),
     ] {
-        check(
-            row_matches(activity, tool, outcome, version, reason),
+        one(
+            activity,
+            |row| {
+                row["tool"] == tool
+                    && row["outcome"] == "succeeded"
+                    && row["version_id"] == version
+                    && row.get("reason").is_none()
+            },
             "vault_activity",
         )?;
     }
+    one(
+        activity,
+        |row| {
+            row["tool"] == "vault_activate"
+                && row["outcome"] == "refused"
+                && row["reason"] == "pass_required"
+                && row.get("version_id").is_none()
+                && row.get("operation_id").is_none()
+        },
+        "vault_activity",
+    )?;
 
+    let active = opaque(&observed.list["entries"][0]["active_version_id"], 32)
+        .ok_or(Fail::Check("previous_version_active"))?;
     let proof = json!({
+        "script_id": script,
         "good_version_id": good,
         "broken_version_id": broken,
+        "broken_operation_id": submitted.broken_operation_id,
         "good_sha256": good_sha,
         "broken_sha256": broken_sha,
         "passed": project(&observed.passed),
         "activated": project(&observed.activated),
         "broken": project(&observed.broken),
         "activate_broken": project(&observed.activate_broken),
-        "active_version_id": good,
+        "active_version_id": active,
+        "active_before": project(&observed.active_before),
+        "list": project(&observed.list),
         "activity": project(&observed.activity),
     });
     hidden(&proof, &[GOOD_SCRIPT, BROKEN_SCRIPT])?;
     Ok(proof)
 }
 
-fn broken_rejected(observed: &Observed, broken: &str, broken_sha: &str) -> Result<()> {
+fn broken_rejected(observed: &Observed, broken_sha: &str) -> Result<()> {
     if observed.broken["state"] != "rejected"
         || observed.broken["sha256"] != broken_sha
-        || observed.broken["version_id"] != broken
         || test_exit(&observed.broken, 7).is_err()
         || observed.activate_broken["ok"] != false
         || observed.activate_broken["reason"] != "pass_required"
@@ -581,18 +681,25 @@ fn broken_rejected(observed: &Observed, broken: &str, broken_sha: &str) -> Resul
     Ok(())
 }
 
-fn previous_stays_active(observed: &Observed, good: &str) -> Result<()> {
-    let entries = observed.list["entries"]
+fn one_active(list: &Value, script: &str, good: &str) -> Result<()> {
+    let entries = list["entries"]
         .as_array()
         .ok_or(Fail::Check("previous_version_active"))?;
     let active = entries.len() == 1
         && entries[0]["name"] == SCRIPT_NAME
         && entries[0]["os"] == "ubuntu"
-        && entries[0]["active_version_id"] == good;
-    if !active
-        || observed.activated["version_id"] != good
+        && opaque(&entries[0]["script_id"], 32) == Some(script)
+        && opaque(&entries[0]["active_version_id"], 32) == Some(good);
+    check(active, "previous_version_active")
+}
+
+fn previous_stays_active(observed: &Observed, script: &str, good: &str) -> Result<()> {
+    one_active(&observed.active_before, script, good)?;
+    one_active(&observed.list, script, good)?;
+    if observed.activated["version_id"] != good
         || observed.activated["state"] != "active"
         || observed.activated["sha256"] != observed.passed["sha256"]
+        || opaque(&observed.activated["script_id"], 32) != Some(script)
     {
         return Err(Fail::Check("previous_version_active"));
     }

@@ -21,6 +21,13 @@ Use the same reviewed foreground, owner-private TEST profile, and store pins as
 the M4 runbook. Keep a Compose secret root out of this profile. Paths below are
 placeholders. The owner-host commands are **unverified on real hardware**.
 
+The principal's vault must be clean before the journey. M5 creates the only
+script for that principal and reads one unpaginated audit page. A vault that
+already has scripts, versions, or audit rows can fail after this run has
+written its versions, including when every current-run row is present. Use a
+dedicated principal, or an empty vault for this principal. Repeating the
+journey on the same vault is not a valid acceptance.
+
 ```json
 {
   "daemon": "D:/acceptance/bin/arxd.exe",
@@ -66,19 +73,26 @@ After the idle delay it rechecks that receipt. It adds an Ubuntu script named
 `m5-accept` whose body is `exit 0`, queues `vault_test_version`, and waits until
 the tester records a pass. A pass is `state` `testing`, `test.status` `exited`,
 `exit_code` 0, and `cleanup_confirmed` true. The client then calls
-`vault_activate`. It adds a second version whose body is `exit 7` and queues
-that test. The broken version must settle as `rejected` with exit 7 and
-confirmed cleanup. `vault_activate` on it must return `pass_required`. The
-script's `active_version_id` must still be the first version, and that version's
-`state` must be `active`. Activity rows for the add, the passing test, the
-activation, the failing test (`failed` / `exited`), and the refused activation
-must be present. Any other shape fails closed.
+`vault_activate` and records `vault_list`. That list's `active_version_id` is
+the active version before the broken add. It adds a second version whose body
+is `exit 7` and queues that test. The checks bind every result to this run: the
+script ID on the known-good version, the broken version ID from its add
+receipt, and the tester operation ID from that version's submit receipt. The
+started audit row and the failed `exited` audit row must both carry that
+operation and version. `vault_activate` on the broken version must return
+`pass_required`. The active version before the broken add and after the refused
+activation must both be the known-good version, and that version's `state` must
+be `active`. A mismatch or a second match fails closed. Activity rows for the
+add, the passing test, the activation, and the refused activation must be
+present. Any other shape fails closed.
 
 The poll budget is 12 minutes. The tester's own lease is 10 minutes, so a clone
 that does not finish inside that lease is a failed acceptance, not a longer
 wait. Each run writes `acceptance.json` and `manifest.json` under a generated
-run ID in the evidence directory. Evidence holds digests, version and operation
-IDs, test receipts, the refusal, and the active version. Script bodies, raw
+run ID in the evidence directory. Evidence holds digests, the script ID, version
+and operation IDs, test receipts, and the refusal. `vault_list` and the
+acceptance proof keep the daemon's `active_version_id` from the list row, both
+before the broken add and after the refused activation. Script bodies, raw
 paths, identities, credentials, and raw MCP transcripts are excluded.
 
 ## Current refusal behavior

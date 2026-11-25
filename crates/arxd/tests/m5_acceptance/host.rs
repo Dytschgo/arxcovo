@@ -220,10 +220,13 @@ pub(super) async fn after_admission(
     let good = opaque(&added["version_id"], 32)
         .ok_or(Failure::Check("good_version"))?
         .to_owned();
-    let submitted = test_version(client, &good).await?;
-    record(evidence, "good_test_submit", &submitted)?;
+    let submitted_test = test_version(client, &good).await?;
+    record(evidence, "good_test_submit", &submitted_test)?;
     let passed = settled(client, &good).await?;
     record(evidence, "good_test", &passed)?;
+    let script = opaque(&passed["script_id"], 32)
+        .ok_or(Failure::Check("script_id"))?
+        .to_owned();
 
     let activate_good = vault_ok(
         client,
@@ -234,6 +237,8 @@ pub(super) async fn after_admission(
     record(evidence, "good_activation", &activate_good)?;
     let activated = vault_ok(client, "vault_get", json!({"version_id": &good})).await?;
     record(evidence, "good_active", &activated)?;
+    let active_before = vault_ok(client, "vault_list", json!({})).await?;
+    record(evidence, "active_before", &active_before)?;
 
     let broken_added = add_version(client, checks::BROKEN_SCRIPT).await?;
     record(evidence, "broken_draft", &broken_added)?;
@@ -243,6 +248,13 @@ pub(super) async fn after_admission(
     check(broken != good, "distinct_versions")?;
     let broken_submit = test_version(client, &broken).await?;
     record(evidence, "broken_test_submit", &broken_submit)?;
+    let broken_operation = opaque(&broken_submit["operation_id"], 32)
+        .ok_or(Failure::Check("broken_operation"))?
+        .to_owned();
+    check(
+        opaque(&broken_submit["version_id"], 32) == Some(broken.as_str()),
+        "broken_operation",
+    )?;
     let rejected = settled(client, &broken).await?;
     record(evidence, "broken_test", &rejected)?;
     let activate_broken = vault_call(
@@ -264,8 +276,15 @@ pub(super) async fn after_admission(
             activated,
             broken: rejected,
             activate_broken,
+            active_before,
             list,
             activity,
+        },
+        &checks::Submitted {
+            script_id: script,
+            good_version_id: good,
+            broken_version_id: broken,
+            broken_operation_id: broken_operation,
         },
         &good_sha,
         &broken_sha,
