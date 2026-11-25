@@ -7,21 +7,38 @@ import json
 import socket
 import ssl
 import sys
+import time
 from pathlib import Path
 
+TOTAL_DEADLINE_S = 60
+RESPONSE_CAP = 32 * 1024 * 1024
 
-def get(host, path, byte_range=None):
-    connection = http.client.HTTPSConnection(host, timeout=15, context=ssl.create_default_context())
+
+def get(host, path, byte_range=None, deadline_s=TOTAL_DEADLINE_S, clock=time.monotonic,
+        connection_factory=None):
+    """Fetch with a per-socket inactivity timeout and a total deadline for the whole exchange."""
+    end = clock() + deadline_s
+    factory = connection_factory or (
+        lambda: http.client.HTTPSConnection(host, timeout=15, context=ssl.create_default_context()))
+    connection = factory()
     try:
         headers = {"Cache-Control": "no-cache", "Accept-Encoding": "identity"}
         if byte_range:
             headers["Range"] = byte_range
         connection.request("GET", path, headers=headers)
         response = connection.getresponse()
-        body = response.read(32 * 1024 * 1024 + 1)
-        if len(body) > 32 * 1024 * 1024:
-            raise ValueError("response bound")
-        return response.status, response.headers, body
+        chunks, size = [], 0
+        while True:
+            if clock() > end:
+                raise TimeoutError("total deadline")
+            chunk = response.read(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > RESPONSE_CAP:
+                raise ValueError("response bound")
+            chunks.append(chunk)
+        return response.status, response.headers, b"".join(chunks)
     finally:
         connection.close()
 

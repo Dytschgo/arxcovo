@@ -46,8 +46,49 @@ def udp(target):
         except OSError as error:
             denied(error)
             return False, False
-    return True, (len(reply) >= 12 and reply[:2] == tag and bool(reply[2] & 128)
-                  and reply[3] & 15 == 0 and int.from_bytes(reply[6:8], "big") > 0)
+    return True, dns_answered(reply, question)
+
+
+def dns_answered(reply, question):
+    """True only for a matching NOERROR reply that carries a complete IN A record for the query."""
+    if len(reply) < len(question) or reply[:2] != question[:2]:
+        return False
+    if not reply[2] & 128 or reply[3] & 15 != 0:
+        return False
+    if int.from_bytes(reply[4:6], "big") != 1 or int.from_bytes(reply[6:8], "big") < 1:
+        return False
+    # The question section must echo the query exactly.
+    if reply[12:len(question)] != question[12:]:
+        return False
+    offset = len(question)
+    for _ in range(int.from_bytes(reply[6:8], "big")):
+        if offset + 2 > len(reply):
+            return False
+        if reply[offset] & 0xC0 == 0xC0:
+            offset += 2
+        else:
+            while True:
+                if offset >= len(reply):
+                    return False
+                length = reply[offset]
+                offset += 1
+                if length == 0:
+                    break
+                if length & 0xC0:
+                    return False
+                offset += length
+        if offset + 10 > len(reply):
+            return False
+        rtype = int.from_bytes(reply[offset:offset + 2], "big")
+        rclass = int.from_bytes(reply[offset + 2:offset + 4], "big")
+        rdlength = int.from_bytes(reply[offset + 8:offset + 10], "big")
+        offset += 10
+        if offset + rdlength > len(reply):
+            return False
+        if rtype == 1 and rclass == 1 and rdlength == 4:
+            return True
+        offset += rdlength
+    return False
 
 
 def measure(inventory, role, connect=tcp, query=udp):

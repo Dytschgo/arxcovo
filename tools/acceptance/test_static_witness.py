@@ -54,3 +54,49 @@ class WitnessTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             public.measure(request, True, fetch)
         self.assertEqual(public.measure(request, True, lambda *_: (404, {}, b""))["names_no_longer_serve"], 2)
+
+    @staticmethod
+    def _query():
+        return b"\x12\x34" + bytes.fromhex("01000001000000000000") + b"\x07example\x03org\x00\x00\x01\x00\x01"
+
+    def test_dns_answer_requires_a_complete_matching_a_record(self):
+        query = self._query()
+        header = bytes.fromhex("123481800001000100000000")
+        answer = bytes.fromhex("c00c000100010000003c00045db8d822")
+        self.assertTrue(network.dns_answered(header + query[12:] + answer, query))
+        # Header that claims one answer but carries none (review reproduction).
+        self.assertFalse(network.dns_answered(header, query))
+        self.assertFalse(network.dns_answered(header + query[12:], query))
+        # Truncated record, wrong id, mismatched question, non-A record, error rcode.
+        self.assertFalse(network.dns_answered(header + query[12:] + answer[:-2], query))
+        self.assertFalse(network.dns_answered(b"\x00\x00" + (header + query[12:] + answer)[2:], query))
+        other = query[:13] + b"x" + query[14:]
+        self.assertFalse(network.dns_answered(header + other[12:] + answer, query))
+        aaaa = bytes.fromhex("c00c001c00010000003c000400000000")
+        self.assertFalse(network.dns_answered(header + query[12:] + aaaa, query))
+        nxdomain = header[:3] + b"\x83" + header[4:]
+        self.assertFalse(network.dns_answered(nxdomain + query[12:] + answer, query))
+
+    def test_public_fetch_enforces_a_total_deadline(self):
+        now = [0.0]
+
+        class Response:
+            status, headers = 200, {}
+
+            def read(self, _size):
+                now[0] += 30
+                return b"x"
+
+        class Connection:
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        with self.assertRaises(TimeoutError):
+            public.get("example.invalid", "/", deadline_s=60, clock=lambda: now[0],
+                       connection_factory=Connection)

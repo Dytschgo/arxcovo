@@ -1220,6 +1220,10 @@ fn overlaps(first: &Path, second: &Path) -> bool {
 }
 
 /// Verify custody for an owner-run client before it reads private inputs or writes evidence.
+///
+/// This is a point-in-time check of the path. Callers that rely on it must hold the
+/// relevant directory or file handles open (without delete/write sharing) for as long as
+/// they depend on the result; otherwise the path can be swapped after the check.
 #[cfg(windows)]
 pub fn checked_owner_private_path(path: &Path) -> Result<()> {
     checked_path(path)?;
