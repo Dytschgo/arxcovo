@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { RUST_UBUNTU_RUNNER } from './policy.mjs';
+import yaml from 'js-yaml';
 
 const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
 const playwrightConfig = readFileSync(new URL('../playwright.config.ts', import.meta.url), 'utf8');
@@ -53,6 +54,43 @@ function assertHostedC14Quarantine(workflowText) {
   for (const step of bodies) {
     if (step !== quarantined[0]) assert.equal(step.includes('continue-on-error'), false);
   }
+  assertParsedHostedC14Quarantine(workflowText);
+}
+
+// Structural guard on the parsed YAML, so escapes, flow mappings, explicit keys, tags,
+// escaped line breaks and aliases cannot add a second non-blocking step or job.
+const hostedC14Parsed = {
+  name: 'Hosted C14 target-authorized delegated build',
+  if: "runner.os == 'Linux'",
+  'timeout-minutes': 2,
+  'continue-on-error': true,
+  shell: 'bash',
+  run: `${hostedC14Step.split('run: |\n')[1].split('\n').map(line => line.slice(10)).join('\n')}\n`,
+};
+
+function assertParsedHostedC14Quarantine(workflowText) {
+  let doc;
+  try {
+    doc = yaml.load(workflowText, { schema: yaml.CORE_SCHEMA });
+  } catch (error) {
+    assert.fail(`workflow must parse as plain YAML: ${error.message}`);
+  }
+  const hits = [];
+  const walk = (node, path) => {
+    if (Array.isArray(node)) node.forEach((item, i) => walk(item, `${path}[${i}]`));
+    else if (node && typeof node === 'object') {
+      for (const [key, value] of Object.entries(node)) {
+        if (/^continue[\s_-]*on[\s_-]*error$/i.test(key.trim())) hits.push({ path, node });
+        walk(value, `${path}.${key}`);
+      }
+    }
+  };
+  walk(doc, '$');
+  assert.equal(hits.length, 1);
+  assert.match(hits[0].path, /^\$\.jobs\.rust\.steps\[\d+\]$/);
+  assert.deepEqual(hits[0].node, hostedC14Parsed);
+  const named = Object.values(doc.jobs).flatMap(job => job.steps ?? []).filter(step => step?.name === hostedC14Parsed.name);
+  assert.equal(named.length, 1);
 }
 
 test('CI runs unconditional Rust and UI matrices in parallel behind the existing required checks', () => {
@@ -101,9 +139,25 @@ test('hosted C14 quarantine cannot widen past that single step', () => {
       '      - name: Hosted C16 live three-container acceptance\n        Continue-On-Error: true\n',
     ),
   ];
-  for (const mutant of mutants) {
+  // YAML spellings that hide the key from text matching; the parsed guard alone must reject each.
+  const structural = [
+    '      -\n        {name: Extra, "continue\\x2don-error": true, run: "true"}\n',
+    '      - ? "continue\\x2don-error"\n        : true\n        name: Extra\n        run: "true"\n',
+    '      - !!str continue-on-error: true\n        name: Extra\n        run: "true"\n',
+    '      - ? "continue-\\\n          on-error"\n        : true\n        name: Extra\n        run: "true"\n',
+    '      - &extra {name: Extra, "continue\\u002don-error": true, run: "true"}\n      - *extra\n',
+  ].map(extra => workflow.replace(
+    '      - name: Hosted C16 live three-container acceptance\n',
+    `${extra}      - name: Hosted C16 live three-container acceptance\n`,
+  ));
+  for (const mutant of [...mutants, ...structural]) {
     assert.notEqual(mutant, workflow);
     assert.throws(() => assertHostedC14Quarantine(mutant), assert.AssertionError);
+  }
+  assertParsedHostedC14Quarantine(workflow);
+  for (const mutant of structural) {
+    assert.doesNotThrow(() => yaml.load(mutant, { schema: yaml.CORE_SCHEMA }));
+    assert.throws(() => assertParsedHostedC14Quarantine(mutant), assert.AssertionError);
   }
 });
 
