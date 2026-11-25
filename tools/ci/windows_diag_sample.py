@@ -1012,11 +1012,12 @@ def sample(ctx, rep, start):
     wall_now = clock.time()
     check_anchor(env.get("ARX_DIAG_T0"), wall_now)
     mono_now = clock.monotonic()
-    # Every observed deadline-clock reading counts: elapsed is charged from
-    # the latest one, and any reading below an earlier one never admits.
+    # Every observed deadline-clock reading counts, from the wrapper's start
+    # reading on: elapsed is charged from the latest one, and any reading
+    # below an earlier one never admits.
     e, admitted = admission_clock(first_age, wall_now - wall_first,
                                   max(mono_check, mono_now) - mono_first)
-    if not mono_first <= mono_check <= mono_now:
+    if not start <= mono_first <= mono_check <= mono_now:
         admitted = False
     rep.e_s = e
     if not admitted:

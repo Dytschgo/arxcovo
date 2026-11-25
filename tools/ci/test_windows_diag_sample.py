@@ -464,6 +464,23 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(h.field("outcome"), "skipped_budget")
         self.assertEqual(h.log, [])
 
+    def test_backward_monotonic_after_wrapper_start_skips_through_run(self):
+        # run() takes the step-deadline reading (1001.75); the sampler's first,
+        # checkpoint and admission reads all sit 1.50 s lower. Wall age is 585 s.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        pending = [1001.75, 1000.25, 1000.25, 1000.25]
+        h.clock.t = 1000.25
+        frozen = h.clock.time()
+        h.clock.time = lambda: frozen
+        h.clock.monotonic = lambda: pending.pop(0) if pending else h.clock.t
+        code, lines = h.run()
+        self.assertEqual(pending, [])
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(lines, [lines[0]])
+        self.assertEqual(h.log, [])
+
     def test_monotonic_elapsed_counts_with_frozen_wall_and_rounds_up(self):
         # Both wall reads give age 585 s; only the deadline clock advances
         # 0.25 s, which must round E up to 601 and skip.
