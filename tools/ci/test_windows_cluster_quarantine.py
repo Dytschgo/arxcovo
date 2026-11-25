@@ -714,27 +714,57 @@ B2_GATE = (
     "    )]"
 )
 B2_BINDING = "#[tokio::test]\n    " + B2_GATE + "\n    async fn " + B2_TEST + "("
+# cfg / cfg_attr bodies inside `mod tests` on main, whitespace removed.
+# The macOS ignore is the only permitted addition.
+B2_MAIN_TESTS_CFGS = (
+    ("cfg(unix)", 11),
+    ("cfg(windows)", 9),
+    ("cfg_attr(windows,allow(dead_code))", 2),
+    ("cfg_attr(windows,allow(unused_mut))", 1),
+)
+B2_TESTS_DECL = "pub(crate) mod tests {"
+B2_TESTS_GAP = "\n\n#[cfg(test)]\n"
+B2_FN_STACK = "    #[tokio::test]\n    " + B2_GATE + "\n"
+
+
+def _cfg_bodies(text):
+    return [
+        re.sub(r"\s+", "", body)
+        for body in re.findall(r"#\s*!?\s*\[([^\]]*)\]", text)
+        if re.match(r"\s*cfg(?:_attr)?\b", body)
+    ]
 
 
 def assert_b2_macos_quarantine(source):
-    marker = "pub(crate) mod tests {\n"
-    if source.count(marker) != 1:
+    if source.count(B2_TESTS_DECL) != 1:
         raise AssertionError("vm tests module binding required")
-    tests = source.split(marker, 1)[1]
-    if tests.count(B2_BINDING) != 1 or tests.count("async fn " + B2_TEST + "(") != 1:
+    prefix, tests = source.split(B2_TESTS_DECL, 1)
+    # The module chain inside mcp/vm.rs: no file-level inner attribute, and
+    # the tests module keeps exactly main's #[cfg(test)].
+    if "#![" in source:
+        raise AssertionError("vm.rs inner cfg would compile out the test")
+    if prefix[prefix.rfind("}"):][1:] != B2_TESTS_GAP:
+        raise AssertionError("tests module cfg stack drifted")
+    signature = "async fn " + B2_TEST + "("
+    if tests.count(B2_BINDING) != 1 or tests.count(signature) != 1:
         raise AssertionError("macOS ignore must stay on the b2 snapshot barrier test")
+    fn_prefix = tests.split(signature, 1)[0]
+    stack = re.search(r"((?:[ \t]*#\[[^\]]*\][ \t]*\n)+)[ \t]*$", fn_prefix)
+    if stack is None or stack.group(1) != B2_FN_STACK:
+        raise AssertionError("target function gained a cfg or lost its macOS ignore")
     if len(re.findall(r"\bignore\b", source)) != 1:
         raise AssertionError("vm.rs tests may carry exactly one ignore")
-    matched = [
-        body
-        for body in re.findall(r"#\s*!?\s*\[([^\]]*)\]", tests)
-        if re.search(r"\bignore\b", body)
-    ]
-    if len(matched) != 1:
-        raise AssertionError("vm.rs tests may carry exactly one ignore")
-    expected = 'cfg_attr(' + B2_PREDICATE + ', ignore = "' + B2_REASON + '")'
-    if re.sub(r"\s+", "", matched[0]) != re.sub(r"\s+", "", expected):
+    expected_gate = re.sub(
+        r"\s+", "", 'cfg_attr(' + B2_PREDICATE + ', ignore = "' + B2_REASON + '")'
+    )
+    actual = {}
+    for body in _cfg_bodies(tests):
+        actual[body] = actual.get(body, 0) + 1
+    if actual.get(expected_gate) != 1:
         raise AssertionError("macOS ignore predicate and reason drifted")
+    del actual[expected_gate]
+    if actual != dict(B2_MAIN_TESTS_CFGS):
+        raise AssertionError("tests module cfg set drifted from main")
     if source.count(B2_PREDICATE) != 1:
         raise AssertionError("macOS ignore predicate drifted")
 
@@ -754,6 +784,24 @@ class B2MacosQuarantineTests(unittest.TestCase):
                 "async fn " + B2_TEST + "(", "async fn renamed(", 1
             ),
             "second ignore": source.replace(other, "#[ignore]\n    " + other, 1),
+            "cfg on target function": source.replace(
+                "    #[tokio::test]\n    " + B2_GATE,
+                '    #[cfg(not(target_os="linux"))]\n    #[tokio::test]\n    ' + B2_GATE,
+                1,
+            ),
+            "cfg on neighbor": source.replace(
+                other, '#[cfg(not(target_os="linux"))]\n    ' + other, 1
+            ),
+            "cfg on tests module": source.replace(
+                "#[cfg(test)]\n" + B2_TESTS_DECL,
+                '#[cfg(not(target_os="linux"))]\n#[cfg(test)]\n' + B2_TESTS_DECL,
+                1,
+            ),
+            "inner cfg on tests module": source.replace(
+                B2_TESTS_DECL + "\n",
+                B2_TESTS_DECL + "\n    #![cfg(not(windows))]\n",
+                1,
+            ),
         }
         for label, mutant in mutants.items():
             with self.subTest(mutant=label):
