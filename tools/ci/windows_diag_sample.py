@@ -117,11 +117,16 @@ def cargo_argv(phase):
 
 # --- Budget ------------------------------------------------------------------------
 def check_anchor(raw, now):
-    """Return the anchor age in whole seconds or gate `anchor`."""
+    """Return the anchor age in whole seconds, or gate a bad anchor.
+
+    A missing, malformed, or non-positive timestamp, and a future anchor,
+    are misconfiguration and gate. Age past CAP_S is a slow runner: return
+    it so admission records skipped_budget instead of failing the job.
+    """
     if not isinstance(raw, str) or not re.fullmatch(r"[1-9][0-9]{0,10}", raw, re.ASCII):
         raise Guard("anchor")
     age = int(now) - int(raw)
-    if age < 0 or age > CAP_S:
+    if age < 0:
         raise Guard("anchor")
     return age
 
@@ -129,6 +134,36 @@ def check_anchor(raw, now):
 def admission(age):
     """Return (E, admitted). Admitted only if E <= 600 s."""
     e = age + ANCHOR_PRE_S
+    return e, e <= ADMIT_E_MAX
+
+
+def _whole_up(v):
+    """Whole seconds, rounding a fraction upward so it cannot hide under the cap."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+        raise Guard("internal")
+    whole = int(v)
+    return whole + 1 if v > whole else whole
+
+
+def admission_clock(first_age, wall_delta, mono_delta):
+    """Return (E, admitted) from the first validated age and later clock deltas.
+
+    E = first_age + max(0, wall_delta, mono_delta) + ANCHOR_PRE_S.
+    wall_delta and mono_delta are seconds since that first reading. The
+    monotonic term is the validation time on the deadline clock, taken from
+    the latest observed reading. A backward monotonic reading is an OS
+    anomaly and never admits; sample() also refuses a rollback between
+    observed readings.
+    """
+    if (isinstance(wall_delta, bool) or isinstance(mono_delta, bool)
+            or not isinstance(wall_delta, (int, float))
+            or not isinstance(mono_delta, (int, float))
+            or isinstance(first_age, bool) or not isinstance(first_age, int)
+            or first_age < 0):
+        raise Guard("internal")
+    e = _whole_up(first_age + max(0, wall_delta, mono_delta) + ANCHOR_PRE_S)
+    if mono_delta < 0:
+        return e, False
     return e, e <= ADMIT_E_MAX
 
 
@@ -952,7 +987,11 @@ def sample(ctx, rep, start):
     rep.event = ev if ev in EVENTS else "-"
     if not ctx.is_windows or ctx.in_venv:
         raise Guard("platform")
-    check_anchor(env.get("ARX_DIAG_T0"), clock.time())
+    # Keep this reading. Later clocks can only add elapsed validation
+    # time; a backward step must not shrink the age or admit the sample.
+    mono_first = clock.monotonic()
+    wall_first = clock.time()
+    first_age = check_anchor(env.get("ARX_DIAG_T0"), wall_first)
     if rep.event == "-":
         rep.outcome = "skipped_event"
         return rep
@@ -969,8 +1008,17 @@ def sample(ctx, rep, start):
         require(fs, d, ("dir", "missing"))
     junit = os.path.join(tdirs[-1], JUNIT_NAME)
     require(fs, junit, ("file", "missing"))
-    check_deadline(clock, start + VALIDATION_S)
-    e, admitted = admission(check_anchor(env.get("ARX_DIAG_T0"), clock.time()))
+    mono_check = check_deadline(clock, start + VALIDATION_S)
+    wall_now = clock.time()
+    check_anchor(env.get("ARX_DIAG_T0"), wall_now)
+    mono_now = clock.monotonic()
+    # Every observed deadline-clock reading counts, from the wrapper's start
+    # reading on: elapsed is charged from the latest one, and any reading
+    # below an earlier one never admits.
+    e, admitted = admission_clock(first_age, wall_now - wall_first,
+                                  max(mono_check, mono_now) - mono_first)
+    if not start <= mono_first <= mono_check <= mono_now:
+        admitted = False
     rep.e_s = e
     if not admitted:
         rep.outcome = "skipped_budget"
@@ -1052,8 +1100,10 @@ def sample(ctx, rep, start):
 def check_deadline(clock, deadline):
     # Synchronous OS/interpreter stalls cannot be preempted. Refuse subsequent
     # work and successful reporting once control returns after the deadline.
-    if clock.monotonic() >= deadline:
+    now = clock.monotonic()
+    if now >= deadline:
         raise Guard("deadline")
+    return now
 
 
 def run(ctx, start=None):
