@@ -56,6 +56,19 @@ fn schemas() -> Vec<(&'static str, Value)> {
         &[],
     );
     activity["not"] = json!({"required":["activity_id","before_id"]});
+    // The TEST foreground wraps this object with the vault audit branch.
+    // The pre-vault object alone is not the current contract.
+    let audit = json!({
+        "type":"object",
+        "properties":{
+            "source":{"const":"vault"},
+            "limit":{"type":"integer","minimum":1,"maximum":20,"default":20},
+            "cursor":{"type":"string","pattern":"^[a-f0-9]{82}$"}
+        },
+        "required":["source"],
+        "additionalProperties":false
+    });
+    let activity = json!({"type":"object","oneOf":[activity, audit]});
     vec![
         ("list_activity", activity),
         (
@@ -487,6 +500,63 @@ fn discovery_rejects_transport_failure_duplicate_and_schema_drift() {
     assert_eq!(
         discover(Ok(json!({"tools":tools}))),
         Err(Failure::SchemaChanged("vm_catalog"))
+    );
+}
+
+#[test]
+fn discovery_rejects_the_pre_vault_activity_schema() {
+    let legacy = json!({
+        "type":"object",
+        "properties":{
+            "limit":{"type":"integer","minimum":1,"maximum":50,"default":20},
+            "before_id":{"type":"integer","minimum":1,"maximum":i64::MAX},
+            "activity_id":{"type":"integer","minimum":1,"maximum":i64::MAX},
+            "include_reads":{"type":"boolean","default":false}
+        },
+        "required":[],
+        "additionalProperties":false,
+        "not":{"required":["activity_id","before_id"]}
+    });
+    let pinned = schemas()
+        .into_iter()
+        .find(|(name, _)| *name == "list_activity")
+        .map(|(_, schema)| schema)
+        .expect("list_activity");
+    let branches = pinned["oneOf"]
+        .as_array()
+        .expect("list_activity must be the vault oneOf schema");
+    assert_eq!(branches.len(), 2);
+    assert_eq!(branches[0], legacy);
+    assert_ne!(pinned, legacy);
+
+    let mut tools: Vec<_> = schemas()
+        .into_iter()
+        .map(|(name, schema)| json!({"name":name,"inputSchema":schema}))
+        .collect();
+    assert_eq!(discover(Ok(json!({"tools":tools.clone()}))), Ok(()));
+    tools
+        .iter_mut()
+        .find(|tool| tool["name"] == "list_activity")
+        .expect("list_activity")["inputSchema"] = legacy;
+    assert_eq!(
+        discover(Ok(json!({"tools":tools}))),
+        Err(Failure::SchemaChanged("list_activity"))
+    );
+
+    let mut widened: Vec<_> = schemas()
+        .into_iter()
+        .map(|(name, schema)| json!({"name":name,"inputSchema":schema}))
+        .collect();
+    widened
+        .iter_mut()
+        .find(|tool| tool["name"] == "list_activity")
+        .expect("list_activity")["inputSchema"]["oneOf"]
+        .as_array_mut()
+        .expect("oneOf")
+        .push(json!({"type":"object"}));
+    assert_eq!(
+        discover(Ok(json!({"tools":widened}))),
+        Err(Failure::SchemaChanged("list_activity"))
     );
 }
 
