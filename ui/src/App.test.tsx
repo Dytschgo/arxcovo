@@ -1,9 +1,9 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, test, vi } from 'vitest';
 import { App } from './App';
-import { DEMO_CREDENTIALS, FIXTURE_HOSTS } from './api/fixtures';
+import { DEMO_CREDENTIALS, FIXTURE_ACTIVITY, FIXTURE_HOSTS } from './api/fixtures';
 import { StandinApi, type StandinOptions } from './api/standin';
-import { ApiError, type ArxApi } from './api/types';
+import { ApiError, type ArxApi, type Host } from './api/types';
 import { formatDate } from './app/format';
 import { ViewBoundary } from './app/ui';
 
@@ -94,6 +94,49 @@ describe('hosts', () => {
   });
 });
 
+describe('host detail polish', () => {
+  const atlas = FIXTURE_HOSTS[0];
+
+  test('availability is labelled as availability, never as a dedicated account', async () => {
+    await signIn({}, '#/hosts/atlas');
+    const facts = (await screen.findByText('Operating system')).closest('dl')!;
+    expect(within(facts).getByText('Availability').closest('div')!.textContent).toBe('AvailabilityAlways on');
+    expect(within(facts).queryByText('Mode')).toBeNull();
+    expect(facts.textContent).not.toMatch(/dedicated/i);
+    go('#/hosts/harbor');
+    expect((await screen.findByText('Opportunistic (used day to day)'))).toBeTruthy();
+  });
+
+  test('a CPU reading shows a bar with its percentage', async () => {
+    await signIn({}, '#/hosts/atlas');
+    const cpu = await screen.findByRole('meter', { name: 'CPU' });
+    expect(cpu.getAttribute('aria-valuenow')).toBe('38');
+    expect(cpu.getAttribute('aria-valuetext')).toBe('38%');
+    expect(cpu.getAttribute('aria-hidden')).toBeNull();
+    expect(cpu.hasAttribute('data-unknown')).toBe(false);
+    expect(within(cpu.closest('.meter') as HTMLElement).queryByText(/usage unavailable/)).toBeNull();
+  });
+
+  test('when the host reports no CPU usage the row says so instead of faking a bar', async () => {
+    const host: Host = { ...atlas, cpu: { ...atlas.cpu, usedPercent: null } };
+    await signIn({ hosts: [host] }, '#/hosts/atlas');
+    const row = (await screen.findByText('Processor')).closest('.panels')!.querySelector('.meter') as HTMLElement;
+    expect(within(row).getByText('CPU')).toBeTruthy();
+    // No false 0% for assistive technology: the track is decorative, not a meter.
+    expect(screen.queryByRole('meter', { name: 'CPU' })).toBeNull();
+    const track = row.querySelector('.meter-track')!;
+    expect(track.getAttribute('aria-hidden')).toBe('true');
+    expect(track.getAttribute('role')).toBeNull();
+    expect(track.hasAttribute('aria-valuenow')).toBe(false);
+    expect(track.hasAttribute('aria-valuetext')).toBe(false);
+    // The state is conveyed by visible text that stays in the accessibility tree.
+    const text = within(row).getByText('16 cores · usage unavailable');
+    expect(text.closest('[aria-hidden="true"]')).toBeNull();
+    // Memory and disk keep real meters.
+    expect(screen.getByRole('meter', { name: 'Memory' }).getAttribute('aria-valuenow')).toBe('55');
+  });
+});
+
 describe('virtual machines', () => {
   test('the table shows an arch badge per VM and filters by architecture', async () => {
     await signIn({}, '#/vms');
@@ -139,6 +182,22 @@ describe('activity', () => {
     expect(screen.getByRole('button', { name: 'Older' })).toHaveProperty('disabled', true);
   });
 
+  test('a row whose summary only repeats the tool name shows the tool once', async () => {
+    const base = FIXTURE_ACTIVITY[0];
+    const entries = [
+      { ...base, id: 2, tool: 'run_command', summary: 'run_command', hostId: 'atlas', exitCode: 0 },
+      { ...base, id: 1, tool: 'run_command', summary: 'cargo test --workspace', hostId: 'atlas', exitCode: 0 },
+    ];
+    await signIn({ activity: entries }, '#/activity');
+    const list = await screen.findByRole('list', { name: /Activity/ });
+    const [repeat, distinct] = within(list).getAllByRole('listitem');
+    expect(within(repeat).getAllByText('run_command')).toHaveLength(1);
+    expect(repeat.textContent).toContain('exit 0');
+    expect(within(repeat).getByRole('link', { name: 'atlas' })).toBeTruthy();
+    expect(within(distinct).getByText('run_command')).toBeTruthy();
+    expect(within(distinct).getByText('cargo test --workspace')).toBeTruthy();
+  });
+
   test('filters with no matches show an empty state with a way out', async () => {
     await signIn({}, '#/activity');
     await screen.findByRole('list', { name: 'Activity, page 1' });
@@ -164,6 +223,21 @@ describe('terminal', () => {
     expect(input).toHaveProperty('value', '');
     fireEvent.keyDown(input, { key: 'ArrowUp' });
     expect(input).toHaveProperty('value', 'git --version');
+  });
+
+  test('the placeholder suggests a tool the host actually has, or a neutral hint', async () => {
+    const atlas = FIXTURE_HOSTS[0];
+    const noGit: Host = { ...atlas, tools: [{ name: 'cargo', version: '1.91.0' }, { name: 'node', version: null }] };
+    await signIn({ hosts: [noGit] }, '#/terminal/atlas');
+    expect((await screen.findByLabelText('Command')).getAttribute('placeholder')).toBe('cargo --version');
+  });
+
+  test('a host with no discovered tools gets a neutral placeholder, not a git example', async () => {
+    const bare: Host = { ...FIXTURE_HOSTS[0], tools: [] };
+    await signIn({ hosts: [bare] }, '#/terminal/atlas');
+    const placeholder = (await screen.findByLabelText('Command')).getAttribute('placeholder');
+    expect(placeholder).toBe('tool name and arguments');
+    expect(placeholder).not.toContain('git');
   });
 
   test('a malformed command line is explained without being sent', async () => {

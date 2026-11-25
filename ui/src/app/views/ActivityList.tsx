@@ -10,7 +10,7 @@ export function ActivityList({ entries, label }: { entries: ActivityEntry[]; lab
         <li key={e.id} className="activity-item" data-outcome={e.outcome}>
           <div className="activity-main">
             <code className="activity-tool">{e.tool}</code>
-            <span className="activity-summary">{e.summary}</span>
+            {e.summary !== e.tool ? <span className="activity-summary">{e.summary}</span> : null}
           </div>
           <div className="activity-meta">
             <Pill tone={e.actor.kind === 'agent' ? 'info' : 'muted'}>
