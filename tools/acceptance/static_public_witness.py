@@ -9,6 +9,8 @@ import ssl
 import sys
 import time
 from pathlib import Path
+from queue import Empty, SimpleQueue
+from threading import Thread
 
 TOTAL_DEADLINE_S = 60
 RESPONSE_CAP = 32 * 1024 * 1024
@@ -21,15 +23,7 @@ def _remaining(end, clock):
     return left
 
 
-def get(host, path, byte_range=None, end=None, clock=time.monotonic, connection_factory=None):
-    """Fetch within a shared absolute deadline `end` (monotonic seconds).
-
-    Every blocking step (connect and TLS, request, headers, each body read) is
-    bounded by the time left, and the deadline is rechecked after each step, so
-    a slow step that returns late is still refused.
-    """
-    if end is None:
-        end = clock() + TOTAL_DEADLINE_S
+def _fetch(host, path, byte_range, end, clock, connection_factory):
     timeout = min(15.0, _remaining(end, clock))
     factory = connection_factory or (
         lambda t: http.client.HTTPSConnection(host, timeout=t, context=ssl.create_default_context()))
@@ -38,26 +32,55 @@ def get(host, path, byte_range=None, end=None, clock=time.monotonic, connection_
         headers = {"Cache-Control": "no-cache", "Accept-Encoding": "identity"}
         if byte_range:
             headers["Range"] = byte_range
+        _remaining(end, clock)
         connection.request("GET", path, headers=headers)
         _remaining(end, clock)
-        response = connection.getresponse()
-        _remaining(end, clock)
-        chunks, size = [], 0
-        while True:
-            sock = getattr(connection, "sock", None)
-            if sock is not None:
-                sock.settimeout(min(15.0, _remaining(end, clock)))
-            chunk = response.read(65536)
+        with connection.getresponse() as response:
             _remaining(end, clock)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > RESPONSE_CAP:
-                raise ValueError("response bound")
-            chunks.append(chunk)
-        return response.status, response.headers, b"".join(chunks)
+            chunks, size = [], 0
+            while True:
+                chunk = response.read(65536)
+                _remaining(end, clock)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > RESPONSE_CAP:
+                    raise ValueError("response bound")
+                chunks.append(chunk)
+            return response.status, response.headers, b"".join(chunks)
     finally:
         connection.close()
+
+
+def get(host, path, byte_range=None, end=None, clock=time.monotonic, connection_factory=None):
+    """Fetch before the absolute monotonic deadline.
+
+    A daemon worker owns the HTTPS connection from DNS through close. The
+    caller abandons the worker at the deadline and rejects all late outcomes,
+    including DNS errors used as cleanup evidence.
+    """
+    if end is None:
+        end = clock() + TOTAL_DEADLINE_S
+    _remaining(end, clock)
+    outcomes = SimpleQueue()
+
+    def run():
+        try:
+            result = _fetch(host, path, byte_range, end, clock, connection_factory)
+        except Exception as error:
+            outcomes.put((None, error))
+        else:
+            outcomes.put((result, None))
+
+    Thread(target=run, daemon=True).start()
+    try:
+        result, error = outcomes.get(timeout=_remaining(end, clock))
+    except Empty:
+        raise TimeoutError("total deadline") from None
+    _remaining(end, clock)
+    if error is not None:
+        raise error
+    return result
 
 
 def phase_fetch(clock=time.monotonic, deadline_s=TOTAL_DEADLINE_S, connection_factory=None):

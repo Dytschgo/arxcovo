@@ -9,6 +9,8 @@ import socket
 import sys
 from pathlib import Path
 
+MAX_CNAME_LINKS = 8
+
 
 def endpoint(value):
     ip, port = value.rsplit(":", 1)
@@ -53,39 +55,56 @@ class _Malformed(Exception):
     pass
 
 
-def _read_name(message, offset):
-    """Decode a DNS name at offset. Returns (lowercased labels, offset after the name).
-
-    Compression pointers must point strictly backwards to an earlier label, so a
-    pointer can never loop; labels are at most 63 bytes and names at most 255.
-    """
-    labels, end, total, limit = [], None, 0, offset
+def _read_name(message, offset, limit, suffixes):
+    """Decode one name and remember its label boundaries for subsequent names."""
+    labels, starts = [], []
     while True:
-        if offset >= len(message):
+        if offset >= limit:
             raise _Malformed("name runs past the message")
+        starts.append(offset)
         length = message[offset]
         if length & 0xC0 == 0xC0:
-            if offset + 1 >= len(message):
+            if offset + 1 >= limit:
                 raise _Malformed("truncated pointer")
             target = ((length & 0x3F) << 8) | message[offset + 1]
-            if target < 12 or target >= limit:
-                raise _Malformed("pointer must go strictly backwards")
-            if end is None:
-                end = offset + 2
-            offset = limit = target
-            continue
+            if target not in suffixes:
+                raise _Malformed("pointer must target a prior name boundary")
+            tail = suffixes[target]
+            offset += 2
+            break
         if length & 0xC0:
             raise _Malformed("reserved label type")
         offset += 1
         if length == 0:
-            return labels, (end if end is not None else offset)
-        if offset + length > len(message):
-            raise _Malformed("label runs past the message")
-        total += length + 1
-        if total > 255:
-            raise _Malformed("name too long")
-        labels.append(bytes(message[offset:offset + length]).lower())
+            tail = ()
+            break
+        if offset + length > limit:
+            raise _Malformed("label runs past the name field")
+        labels.append(message[offset:offset + length].lower())
         offset += length
+    name = tuple(labels) + tail
+    if 1 + sum(len(label) + 1 for label in name) > 255:
+        raise _Malformed("name too long")
+    suffixes.update((start, name[index:]) for index, start in enumerate(starts))
+    return name, offset
+
+
+def _read_answer_names(message, rtype, start, end, suffixes):
+    """Decode RFC 1035 name fields in RDATA. Other RDATA stays opaque."""
+    if rtype in {2, 3, 4, 5, 7, 8, 9, 12}:  # NS, MD, MF, CNAME, MB, MG, MR, PTR
+        name, offset = _read_name(message, start, end, suffixes)
+    elif rtype == 15:  # MX preference, then exchange
+        name, offset = _read_name(message, start + 2, end, suffixes)
+    elif rtype in {6, 14}:  # SOA and MINFO start with two names
+        name, offset = _read_name(message, start, end, suffixes)
+        _, offset = _read_name(message, offset, end, suffixes)
+        if rtype == 6:
+            offset += 20  # serial, refresh, retry, expire, minimum
+    else:
+        return None
+    if offset != end:
+        raise _Malformed("invalid name-bearing RDATA length")
+    return name
 
 
 def dns_answered(reply, question):
@@ -93,9 +112,10 @@ def dns_answered(reply, question):
     section is complete and resolves the queried name (directly or through CNAME
     aliases) to an IN A record with a four-byte address."""
     try:
-        if len(reply) < len(question) or reply[:2] != question[:2]:
+        if len(question) < 17 or len(reply) < len(question) or reply[:2] != question[:2]:
             return False
-        if not reply[2] & 128 or reply[2] & 0x7A or reply[3] & 15 != 0:  # QR set; opcode 0; not truncated; NOERROR
+        # Require QR, opcode 0, TC clear, the reserved bit clear and NOERROR.
+        if reply[2] & 0xFA != 0x80 or reply[3] & 0x4F:
             return False
         if int.from_bytes(reply[4:6], "big") != 1:
             return False
@@ -104,11 +124,14 @@ def dns_answered(reply, question):
             return False
         if reply[12:len(question)] != question[12:]:
             return False
-        wanted, _ = _read_name(question, 12)
-        offset = len(question)
-        records = []
+        suffixes = {}
+        wanted, question_end = _read_name(reply, 12, len(question) - 4, suffixes)
+        if question[question_end:] != b"\x00\x01\x00\x01":
+            return False
+        offset = question_end + 4
+        owners, addresses, aliases = set(), set(), {}
         for _ in range(answers):
-            owner, offset = _read_name(reply, offset)
+            owner, offset = _read_name(reply, offset, len(reply), suffixes)
             if offset + 10 > len(reply):
                 return False
             rtype = int.from_bytes(reply[offset:offset + 2], "big")
@@ -117,24 +140,27 @@ def dns_answered(reply, question):
             data = offset + 10
             if data + rdlength > len(reply):
                 return False
-            target = None
-            if rtype == 5 and rclass == 1:
-                target, consumed = _read_name(reply, data)
-                if consumed != data + rdlength:
-                    return False
-            records.append((owner, rtype, rclass, rdlength, target))
-            offset = data + rdlength
-        # Follow at most a short alias chain from the queried name.
-        name = wanted
-        for _ in range(8):
-            for owner, rtype, rclass, rdlength, _target in records:
-                if owner == name and rtype == 1 and rclass == 1 and rdlength == 4:
-                    return True
-            aliases = [t for owner, rtype, rclass, _l, t in records if owner == name and rtype == 5 and rclass == 1]
-            if len(aliases) != 1:
+            end = data + rdlength
+            target = _read_answer_names(reply, rtype, data, end, suffixes)
+            if owner in aliases or (rtype == 5 and owner in owners):
                 return False
-            name = aliases[0]
-        return False
+            if rtype == 5:
+                aliases[owner] = (rclass, target)
+            if rtype == 1 and rclass == 1:
+                if rdlength != 4:
+                    return False
+                addresses.add(owner)
+            owners.add(owner)
+            offset = end
+        name = wanted
+        for _ in range(MAX_CNAME_LINKS):
+            if name in addresses:
+                return True
+            alias = aliases.get(name)
+            if alias is None or alias[0] != 1:
+                return False
+            name = alias[1]
+        return name in addresses
     except _Malformed:
         return False
 
