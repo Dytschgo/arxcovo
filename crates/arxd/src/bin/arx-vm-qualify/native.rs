@@ -615,11 +615,9 @@ impl Collectors<Native> for PausedCollectors<'_> {
                 (Some(runtime), Ok(permit)) => {
                     let probe = runtime.block_on(permit.run(&self.cancel));
                     self.releases.record(stage, probe.release);
-                    // Guest socket outcomes do not attribute a denial to the
-                    // slirp filter, even when both host controls succeeded.
-                    match probe.refusal {
-                        Some(reason) => StageResult::Failed(refused(reason)),
-                        None => StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
+                    match probe.diagnostic {
+                        Ok(report) => StageResult::NetworkDiagnostic(report),
+                        Err(reason) => StageResult::Failed(refused(reason)),
                     }
                 }
                 (_, Err(reason)) => StageResult::Failed(refused(reason)),

@@ -311,9 +311,8 @@ printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
     }
 }
 
-/// Run once over the script-capable channel of the detached verification boot.
-/// Probe-only NoCloud seed. The live guest follows a fixed Python program
-/// and reports only its launch nonce and a deny mask. The seed has no
+/// Probe-only NoCloud seed. The live guest reports the launch nonce, NIC
+/// setup observations and socket outcomes from a fixed program. The seed has no
 /// autoinstall stanza, guest service, bootloader action or credential.
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(in crate::vm) fn network_probe_seed(
@@ -365,7 +364,7 @@ pub(in crate::vm) fn network_probe_seed(
 }
 
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
-const PROBE_START: &str = "import fcntl, pathlib, socket, struct, subprocess, time\n";
+const PROBE_START: &str = "import fcntl, ipaddress, pathlib, socket, struct, subprocess, time\n";
 
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
 const PROBE_BODY: &str = r#"
@@ -394,18 +393,14 @@ def ipv6_is_disabled(name):
         for line in pathlib.Path('/proc/net/if_inet6').read_text().splitlines():
             cols = line.split()
             if len(cols) >= 6 and cols[5] == name:
-                addr = cols[0].lower()
-                if not addr.startswith('fe80'):
+                if len(cols[0]) != 32 or not ipaddress.IPv6Address(int(cols[0], 16)).is_link_local:
                     return False
-    except OSError:
-        pass
-    try:
         for line in pathlib.Path('/proc/net/ipv6_route').read_text().splitlines():
             cols = line.split()
             if len(cols) >= 10 and cols[9] == name and cols[0] == '0' * 32 and cols[1] == '00':
                 return False
-    except OSError:
-        pass
+    except (OSError, ValueError):
+        return False
     return True
 
 def probe_tcp(target, bind_v4):
@@ -716,14 +711,66 @@ fn network_probe_seed_has_only_live_nocloud_configuration() {
 
 #[cfg(test)]
 #[test]
-fn network_probe_connect_errors_are_setup_failures() {
+fn network_probe_python_fixture() {
+    // The interpreter is required only for the explicitly enabled guest-script
+    // check. Ordinary Rust test runs have no host Python dependency.
+    let Some(python) = std::env::var_os("ARX_TEST_NETWORK_PROBE_PYTHON") else {
+        return;
+    };
     // Run the functions embedded in the seed with a fake socket. No packets
     // are sent and the fixture does not inspect the host's routes.
     let fixture = include_str!("network_probe_fixture.py");
-    let program = format!("__name__ = 'fixture'\n{PROBE_BODY}\n{fixture}");
-    let result = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
+    // fcntl is Linux-only. These mocked fixture calls never use its ioctl.
+    let program = format!(
+        "__name__ = 'fixture'\nimport sys, types\nsys.modules['fcntl'] = types.ModuleType('fcntl')\n{PROBE_START}{PROBE_BODY}\n{PROBE_FIXTURE_BEFORE}\n{fixture}\n{PROBE_FIXTURE_AFTER}"
+    );
+    let result = std::process::Command::new(python)
         .args(["-I", "-B", "-c", &program])
         .status()
         .unwrap();
     assert!(result.success());
 }
+
+#[cfg(test)]
+const PROBE_FIXTURE_BEFORE: &str = r#"
+from unittest.mock import MagicMock, patch
+
+sock = MagicMock()
+sock.recv.side_effect = socket.timeout('fixture')
+NONCE = bytes(16)
+with patch.object(socket, 'socket') as constructor:
+    constructor.return_value.__enter__.return_value = sock
+    assert probe_dns(('192.0.2.1', 53), '10.0.2.15') == 'E'
+    sock.send.assert_called_once()
+    sock.recv.assert_called_once()
+
+def check_ipv6(addresses, routes, expected):
+    def read(path):
+        data = {'if_inet6': addresses, 'ipv6_route': routes}[path.name]
+        if data is None:
+            raise OSError('fixture')
+        return data
+    with patch.object(pathlib.Path, 'read_text', read):
+        assert ipv6_is_disabled('eth0') is expected
+
+local = 'febf0000000000000000000000000001 02 40 20 80 eth0'
+global_addr = '20010db8000000000000000000000001 02 40 00 80 eth0'
+default_route = ('0' * 32 + ' 00 ' + '0' * 32 + ' 00 ' + '0' * 32 +
+                 ' 00000400 00000000 00000000 00000001 eth0')
+check_ipv6(local, '', True)
+check_ipv6(global_addr, '', False)
+check_ipv6(local, default_route, False)
+check_ipv6(None, '', False)
+check_ipv6(local, None, False)
+"#;
+
+#[cfg(test)]
+const PROBE_FIXTURE_AFTER: &str = r#"
+nic_ipv4 = lambda name: '10.0.2.15'
+has_slirp_default_route = lambda name: True
+ipv6_is_disabled = lambda name: False
+probe_tcp, probe_dns = MagicMock(return_value='R'), MagicMock(return_value='R')
+assert run_probes([nic]) == ('1110', 'EEEEEEEE')
+probe_tcp.assert_not_called()
+probe_dns.assert_not_called()
+"#;
