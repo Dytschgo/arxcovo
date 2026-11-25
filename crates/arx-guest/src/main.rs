@@ -61,6 +61,10 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        #[cfg(target_os = "linux")]
+        (Some("backup-sqlite-helper"), None) => {
+            arx_guest::compose_backup::run_linux_backup_helper_main()
+        }
         #[cfg(windows)]
         (Some("serve-service"), None) => match platform::serve_service() {
             Ok(()) => ExitCode::SUCCESS,

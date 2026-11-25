@@ -87,6 +87,10 @@ pub enum ArtifactRole {
     SnapshotVars,
     SnapshotStagingDisk,
     SnapshotStagingVars,
+    /// Settled protected SQLite backup leaf in the separate managed D: backup role (ADR 0064 §6).
+    ComposeBackup,
+    /// Transient host staging leaf while streaming a Compose SQLite backup.
+    ComposeBackupStaging,
     Golden,
     TestInstallDisk,
     WindowsSetupVars,
@@ -114,6 +118,7 @@ impl ArtifactRole {
                 | Self::StaticVars
                 | Self::SnapshotStagingDisk
                 | Self::SnapshotStagingVars
+                | Self::ComposeBackupStaging
                 | Self::TestInstallDisk
                 | Self::Staging
                 | Self::Scratch

@@ -680,8 +680,8 @@ mod compose_session {
 
     use super::*;
 
-    const COMPOSE_HELLO: &[u8] = br#"{"type":"ComposeHello","version":2,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["lifecycle","logs","manifest","secrets","status"]}"#;
-    const COMPOSE_HELLO_ACK: &[u8] = br#"{"type":"ComposeHelloAck","version":2,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["lifecycle","logs","manifest","secrets","status"],"cleared_staging":0,"ambiguous_operations":0}"#;
+    const COMPOSE_HELLO: &[u8] = br#"{"type":"ComposeHello","version":3,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["backup","lifecycle","logs","manifest","secrets","status"]}"#;
+    const COMPOSE_HELLO_ACK: &[u8] = br#"{"type":"ComposeHelloAck","version":3,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["backup","lifecycle","logs","manifest","secrets","status"],"cleared_staging":0,"ambiguous_operations":0}"#;
     const STATUS: &[u8] = br#"{"type":"ComposeStatus","id":3,"project_id":"calm-life"}"#;
     const SCRIPT: &[u8] = br#"{"type":"RunScript","id":2,"script":"echo hello","timeout_s":1}"#;
     const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1011,13 +1011,17 @@ mod compose_session {
                 hello_with(|v| v["capabilities"].as_array_mut().unwrap().reverse()),
                 ProtocolError::UnsupportedCapability,
             ),
-            // v1 ComposeHello is fenced off after protocol bump to v2.
+            // v1 and v2 ComposeHello are fenced off after protocol bump to v3.
             (
                 hello_with(|v| v["version"] = 1.into()),
                 ProtocolError::UnsupportedVersion,
             ),
             (
-                hello_with(|v| v["version"] = 3.into()),
+                hello_with(|v| v["version"] = 2.into()),
+                ProtocolError::UnsupportedVersion,
+            ),
+            (
+                hello_with(|v| v["version"] = 4.into()),
                 ProtocolError::UnsupportedVersion,
             ),
             (
@@ -1208,5 +1212,643 @@ mod compose_session {
             read_frame::<ComposeRequest>(&mut frame(reordered).as_slice()),
             Ok(Some(ComposeRequest::ComposeSecretPut { epoch: 1, .. }))
         ));
+    }
+
+    #[test]
+    fn backup_frames_validate_bounds_and_reject_unsafe_fields() {
+        use arx_guest::compose_backup::{
+            BACKUP_CHUNK_BYTES, MAX_BACKUP_BYTES, MAX_BACKUP_CHUNKS, MAX_BACKUP_DEADLINE_S,
+        };
+
+        let op = "11111111111111111111111111111111".to_owned();
+        let valid_begin = ComposeRequest::ComposeBackupBegin {
+            id: 1,
+            operation_id: op.clone(),
+            generation: 7,
+            project_id: "calm-life".to_owned(),
+            volume: "data".to_owned(),
+            database: "calm-life.sqlite3".to_owned(),
+            max_bytes: MAX_BACKUP_BYTES,
+            deadline_s: MAX_BACKUP_DEADLINE_S,
+        };
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &valid_begin).unwrap();
+        assert!(read_frame::<ComposeRequest>(&mut wire.as_slice()).unwrap() == Some(valid_begin));
+
+        // Unsafe database basenames, oversize caps, zero deadlines, and out-of-range chunks fail.
+        for bad in [
+            ComposeRequest::ComposeBackupBegin {
+                id: 1,
+                operation_id: op.clone(),
+                generation: 7,
+                project_id: "calm-life".to_owned(),
+                volume: "data".to_owned(),
+                database: "../etc/passwd".to_owned(),
+                max_bytes: 4096,
+                deadline_s: 30,
+            },
+            ComposeRequest::ComposeBackupBegin {
+                id: 1,
+                operation_id: op.clone(),
+                generation: 7,
+                project_id: "calm-life".to_owned(),
+                volume: "data".to_owned(),
+                database: "app.db".to_owned(),
+                max_bytes: MAX_BACKUP_BYTES + 1,
+                deadline_s: 30,
+            },
+            ComposeRequest::ComposeBackupBegin {
+                id: 1,
+                operation_id: op.clone(),
+                generation: 7,
+                project_id: "calm-life".to_owned(),
+                volume: "data".to_owned(),
+                database: "app.db".to_owned(),
+                max_bytes: 4096,
+                deadline_s: 0,
+            },
+            ComposeRequest::ComposeBackupChunk {
+                id: 2,
+                operation_id: op.clone(),
+                index: MAX_BACKUP_CHUNKS,
+            },
+        ] {
+            let mut out = Vec::new();
+            assert_eq!(
+                write_frame(&mut out, &bad),
+                Err(ProtocolError::InvalidComposeField)
+            );
+        }
+
+        // Exact 16 KiB decoded chunk fits comfortably inside MAX_FRAME (32 KiB).
+        let full_chunk = ComposeResponse::ComposeBackupData {
+            id: 3,
+            operation_id: op,
+            index: 0,
+            data: encode_base64(&vec![0x5a; BACKUP_CHUNK_BYTES]),
+        };
+        let mut chunk_wire = Vec::new();
+        write_frame(&mut chunk_wire, &full_chunk).unwrap();
+        assert!(chunk_wire.len() - 4 <= MAX_FRAME);
+        assert_eq!(
+            read_frame::<ComposeResponse>(&mut chunk_wire.as_slice()).unwrap(),
+            Some(full_chunk)
+        );
+    }
+
+    #[test]
+    fn compose_service_executes_sqlite_wal_backup_chunks_release_and_guards() {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        use arx_guest::compose::{
+            Clock, CommandRunner, ComposeService, ComposeStore, Invocation, OperationKind,
+            OperationStage, OperationState, RejectCode, RunResult, SecretFileWitness, SecretMatch,
+            StoreError, decode_base64_bounded, sha256_hex,
+        };
+        use arx_guest::compose_backup::{
+            BACKUP_CHUNK_BYTES, BackupHelperError, MAX_BACKUP_BYTES, StagedBackupMeta,
+            backup_sqlite_online, restore_sqlite_offline,
+        };
+
+        #[derive(Default)]
+        struct BackupTestRunner {
+            volumes: std::collections::BTreeMap<String, String>,
+            running: bool,
+        }
+        impl CommandRunner for BackupTestRunner {
+            fn run(&mut self, invocation: &Invocation) -> RunResult {
+                let args: Vec<&str> = invocation.argv.iter().map(String::as_str).collect();
+                let tail = if args.len() >= 2 && args[0] == "--config" {
+                    &args[2..]
+                } else {
+                    &args[..]
+                };
+                match tail {
+                    ["image", "inspect", ..] => RunResult::Exited {
+                        code: 0,
+                        stdout: b"linux/amd64\n".to_vec(),
+                    },
+                    ["image", "pull", ..] => RunResult::Exited {
+                        code: 0,
+                        stdout: Vec::new(),
+                    },
+                    ["volume", "ls", "--format", "json"] => {
+                        let out: String = self
+                            .volumes
+                            .iter()
+                            .map(|(name, token)| {
+                                format!(
+                                    "{}\n",
+                                    serde_json::json!({
+                                        "Name": name,
+                                        "Labels": format!("org.arxcovo.volume={token}"),
+                                    })
+                                )
+                            })
+                            .collect();
+                        RunResult::Exited {
+                            code: 0,
+                            stdout: out.into_bytes(),
+                        }
+                    }
+                    ["volume", "inspect", "--format", "{{.Mountpoint}}", name] => {
+                        if self.volumes.contains_key(*name) {
+                            RunResult::Exited {
+                                code: 0,
+                                stdout: format!("/var/lib/docker/volumes/{name}/_data\n")
+                                    .into_bytes(),
+                            }
+                        } else {
+                            RunResult::Exited {
+                                code: 1,
+                                stdout: Vec::new(),
+                            }
+                        }
+                    }
+                    ["volume", "inspect", "--format", _, name] => match self.volumes.get(*name) {
+                        Some(tok) => RunResult::Exited {
+                            code: 0,
+                            stdout: format!("{tok}\n").into_bytes(),
+                        },
+                        None => RunResult::Exited {
+                            code: 1,
+                            stdout: Vec::new(),
+                        },
+                    },
+                    [
+                        "volume",
+                        "create",
+                        "--driver",
+                        "local",
+                        "--label",
+                        label,
+                        name,
+                    ] => {
+                        let tok = label.strip_prefix("org.arxcovo.volume=").unwrap();
+                        self.volumes.insert((*name).to_owned(), tok.to_owned());
+                        RunResult::Exited {
+                            code: 0,
+                            stdout: Vec::new(),
+                        }
+                    }
+                    ["network", "ls", ..] => RunResult::Exited {
+                        code: 0,
+                        stdout: Vec::new(),
+                    },
+                    ["compose", rest @ ..] if rest.contains(&"up") => {
+                        self.running = true;
+                        RunResult::Exited {
+                            code: 0,
+                            stdout: Vec::new(),
+                        }
+                    }
+                    ["compose", rest @ ..] if rest.contains(&"ps") => {
+                        let out = if self.running {
+                            format!(
+                                "{}\n",
+                                serde_json::json!({
+                                    "ID": "000000000001",
+                                    "Service": "app",
+                                    "State": "running",
+                                    "Health": "",
+                                    "Labels": "org.arxcovo.project=calm-life,org.arxcovo.revision=1",
+                                })
+                            )
+                        } else {
+                            String::new()
+                        };
+                        RunResult::Exited {
+                            code: 0,
+                            stdout: out.into_bytes(),
+                        }
+                    }
+                    _ => RunResult::Exited {
+                        code: 0,
+                        stdout: Vec::new(),
+                    },
+                }
+            }
+            fn probe_http(&mut self, _: u16, _: &str) -> bool {
+                true
+            }
+            fn pause(&mut self, _: Duration) {}
+        }
+
+        struct FixedClock(u64);
+        impl Clock for FixedClock {
+            fn now_unix(&self) -> u64 {
+                self.0
+            }
+        }
+
+        struct BackupTestStore {
+            state: Option<Vec<u8>>,
+            volume_dir: std::path::PathBuf,
+            staging_dir: std::path::PathBuf,
+            staged: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        }
+
+        impl ComposeStore for BackupTestStore {
+            fn load_state(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
+                Ok(self.state.clone())
+            }
+            fn save_state(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+                self.state = Some(bytes.to_vec());
+                Ok(())
+            }
+            fn write_revision(&mut self, _: &str, _: u64, _: &str) -> Result<(), StoreError> {
+                Ok(())
+            }
+            fn write_rotation(
+                &mut self,
+                _: &str,
+                _: u64,
+                _: &str,
+                _: &str,
+            ) -> Result<(), StoreError> {
+                Ok(())
+            }
+            fn write_secret(
+                &mut self,
+                _: &str,
+                _: &str,
+                owner: (u32, u32),
+                _: &[u8],
+            ) -> Result<SecretFileWitness, StoreError> {
+                Ok(SecretFileWitness {
+                    dev: 1,
+                    ino: 1,
+                    uid: owner.0,
+                    gid: owner.1,
+                })
+            }
+            fn stat_secret(
+                &mut self,
+                _: &str,
+                _: &str,
+                _: (u32, u32),
+            ) -> Option<SecretFileWitness> {
+                None
+            }
+            fn compare_secret(&mut self, _: &str, _: &str, _: (u32, u32), _: &[u8]) -> SecretMatch {
+                SecretMatch::Missing
+            }
+            fn prepare_volume(&mut self, _: &str, _: (u32, u32)) -> Result<(), StoreError> {
+                Ok(())
+            }
+            fn run_sqlite_backup(
+                &mut self,
+                operation_id: &str,
+                _volume_name: &str,
+                _owner: (u32, u32),
+                database: &str,
+                max_bytes: u64,
+                deadline: Duration,
+            ) -> Result<StagedBackupMeta, BackupHelperError> {
+                let out = self.staging_dir.join(format!("{operation_id}.sqlite3"));
+                let meta = backup_sqlite_online(
+                    &self.volume_dir,
+                    database,
+                    &out,
+                    max_bytes,
+                    Instant::now() + deadline,
+                )?;
+                let bytes = fs::read(&out).map_err(|_| BackupHelperError::StoreFailed)?;
+                self.staged
+                    .lock()
+                    .unwrap()
+                    .insert(operation_id.to_owned(), bytes);
+                Ok(meta)
+            }
+            fn read_backup_chunk(
+                &mut self,
+                operation_id: &str,
+                offset: u64,
+                len: usize,
+            ) -> Result<Vec<u8>, StoreError> {
+                let map = self.staged.lock().unwrap();
+                let bytes = map.get(operation_id).ok_or(StoreError)?;
+                let start = usize::try_from(offset).map_err(|_| StoreError)?;
+                let end = start.checked_add(len).ok_or(StoreError)?;
+                if end > bytes.len() {
+                    return Err(StoreError);
+                }
+                Ok(bytes[start..end].to_vec())
+            }
+            fn verify_backup_staging(
+                &mut self,
+                operation_id: &str,
+                expected_bytes: u64,
+                expected_digest: &str,
+            ) -> bool {
+                self.staged
+                    .lock()
+                    .unwrap()
+                    .get(operation_id)
+                    .is_some_and(|b| {
+                        b.len() as u64 == expected_bytes && sha256_hex(b) == expected_digest
+                    })
+            }
+            fn remove_backup_staging(&mut self, operation_id: &str) -> Result<bool, StoreError> {
+                let _ = fs::remove_file(self.staging_dir.join(format!("{operation_id}.sqlite3")));
+                Ok(self.staged.lock().unwrap().remove(operation_id).is_some())
+            }
+        }
+
+        let base =
+            std::env::temp_dir().join(format!("arx-guest-svc-backup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let vol = base.join("vol");
+        let stg = base.join("stg");
+        let restore_dir = base.join("restore");
+        fs::create_dir_all(&vol).unwrap();
+        fs::create_dir_all(&stg).unwrap();
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        let db_path = vol.join("calm-life.sqlite3");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+             INSERT INTO notes(body) VALUES('wal-only-row');",
+        )
+        .unwrap();
+        assert!(vol.join("calm-life.sqlite3-wal").exists());
+
+        // Seed committed project with held volume `data` via Stage + Deploy.
+        let manifest_json = serde_json::json!({
+            "schema": 1,
+            "project_id": "calm-life",
+            "volumes": [{"name": "data", "uid": 2000, "gid": 2000}],
+            "secrets": [],
+            "services": [{
+                "name": "app",
+                "image": format!("registry.example.test/app@sha256:{}", "b".repeat(64)),
+                "platform": "linux/amd64",
+                "uid": 2000,
+                "gid": 2000,
+                "http_port": null,
+                "health_path": null,
+                "read_only_rootfs": false,
+                "environment": [],
+                "mounts": [{"volume": "data", "target": "/data", "read_only": false}],
+                "secrets": [],
+                "limits": {"cpu_millis": 100, "memory_mib": 64, "pids": 32}
+            }]
+        })
+        .to_string();
+        let manifest_bytes = manifest_json.as_bytes();
+        let manifest_digest = sha256_hex(manifest_bytes);
+
+        let store = BackupTestStore {
+            state: None,
+            volume_dir: vol.clone(),
+            staging_dir: stg.clone(),
+            staged: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let svc = ComposeService::new(
+            Box::new(BackupTestRunner::default()),
+            Box::new(store),
+            Box::new(FixedClock(1_700_000_000)),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            svc.handle(ComposeRequest::ComposeHello {
+                version: arx_guest::compose::COMPOSE_PROTOCOL_VERSION,
+                challenge: "0123456789abcdef0123456789abcdef".into(),
+                generation: 77,
+                capabilities: arx_guest::compose::COMPOSE_CAPABILITIES
+                    .iter()
+                    .map(|c| (*c).to_owned())
+                    .collect(),
+            }),
+            ComposeResponse::ComposeHelloAck { generation: 77, .. }
+        ));
+
+        let deploy_id = "02020202020202020202020202020202".to_owned();
+        assert!(matches!(
+            svc.handle(ComposeRequest::ComposeStageBegin {
+                id: 1,
+                digest: manifest_digest.clone(),
+                total_bytes: manifest_bytes.len() as u32,
+                chunks: 1,
+            }),
+            ComposeResponse::ComposeStageProgress { .. }
+        ));
+        assert!(matches!(
+            svc.handle(ComposeRequest::ComposeStageChunk {
+                id: 2,
+                digest: manifest_digest.clone(),
+                index: 0,
+                data: encode_base64(manifest_bytes),
+            }),
+            ComposeResponse::ComposeStageProgress { .. }
+        ));
+        assert!(matches!(
+            svc.handle(ComposeRequest::ComposeStageCommit {
+                id: 3,
+                digest: manifest_digest.clone(),
+            }),
+            ComposeResponse::ComposeReleaseStaged { .. }
+        ));
+        assert!(matches!(
+            svc.handle(ComposeRequest::ComposeDeploy {
+                id: 4,
+                operation_id: deploy_id.clone(),
+                project_id: "calm-life".into(),
+                revision: 1,
+                digest: manifest_digest,
+            }),
+            ComposeResponse::ComposeOperationState { .. }
+        ));
+        // Poll deploy to terminal.
+        loop {
+            match svc.handle(ComposeRequest::ComposeOperation {
+                id: 5,
+                operation_id: deploy_id.clone(),
+            }) {
+                ComposeResponse::ComposeOperationState { operation, .. }
+                    if operation.state == OperationState::Succeeded =>
+                {
+                    break;
+                }
+                ComposeResponse::ComposeOperationState { operation, .. }
+                    if operation.state == OperationState::Failed =>
+                {
+                    panic!("deploy failed: {:?}", operation.failure);
+                }
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+
+        // Unknown volume slot is rejected.
+        assert_eq!(
+            svc.handle(ComposeRequest::ComposeBackupBegin {
+                id: 6,
+                operation_id: "03030303030303030303030303030303".into(),
+                generation: 77,
+                project_id: "calm-life".into(),
+                volume: "other".into(),
+                database: "calm-life.sqlite3".into(),
+                max_bytes: MAX_BACKUP_BYTES,
+                deadline_s: 30,
+            }),
+            ComposeResponse::ComposeRejected {
+                id: 6,
+                code: RejectCode::UnknownVolume,
+                rule: None,
+            }
+        );
+
+        // Start a valid online WAL backup.
+        let op1 = "04040404040404040404040404040404".to_owned();
+        assert!(matches!(
+            svc.handle(ComposeRequest::ComposeBackupBegin {
+                id: 7,
+                operation_id: op1.clone(),
+                generation: 77,
+                project_id: "calm-life".into(),
+                volume: "data".into(),
+                database: "calm-life.sqlite3".into(),
+                max_bytes: MAX_BACKUP_BYTES,
+                deadline_s: 30,
+            }),
+            ComposeResponse::ComposeOperationState { .. }
+        ));
+        loop {
+            match svc.handle(ComposeRequest::ComposeOperation {
+                id: 8,
+                operation_id: op1.clone(),
+            }) {
+                ComposeResponse::ComposeOperationState { operation, .. }
+                    if operation.state == OperationState::Succeeded =>
+                {
+                    assert_eq!(operation.kind, OperationKind::Backup);
+                    assert_eq!(operation.stage, OperationStage::Settled);
+                    break;
+                }
+                ComposeResponse::ComposeOperationState { operation, .. }
+                    if operation.state == OperationState::Failed =>
+                {
+                    panic!("backup failed: {:?}", operation.failure);
+                }
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+
+        // Second backup while first staging is still held is refused with BackupStagingOccupied.
+        assert_eq!(
+            svc.handle(ComposeRequest::ComposeBackupBegin {
+                id: 9,
+                operation_id: "05050505050505050505050505050505".into(),
+                generation: 77,
+                project_id: "calm-life".into(),
+                volume: "data".into(),
+                database: "calm-life.sqlite3".into(),
+                max_bytes: MAX_BACKUP_BYTES,
+                deadline_s: 30,
+            }),
+            ComposeResponse::ComposeBackupOccupied {
+                id: 9,
+                operation_id: op1.clone(),
+            }
+        );
+
+        // Fetch metadata and stream exact 16 KiB chunks.
+        let (total_bytes, chunks, digest) = match svc.handle(ComposeRequest::ComposeBackupMeta {
+            id: 10,
+            operation_id: op1.clone(),
+        }) {
+            ComposeResponse::ComposeBackupReady {
+                total_bytes,
+                chunks,
+                digest,
+                ..
+            } => (total_bytes, chunks, digest),
+            other => panic!("expected ComposeBackupReady, got {other:?}"),
+        };
+        let mut assembled = Vec::new();
+        for idx in 0..chunks {
+            match svc.handle(ComposeRequest::ComposeBackupChunk {
+                id: 11 + idx,
+                operation_id: op1.clone(),
+                index: idx,
+            }) {
+                ComposeResponse::ComposeBackupData { data, index, .. } => {
+                    assert_eq!(index, idx);
+                    let decoded = decode_base64_bounded(&data, BACKUP_CHUNK_BYTES).unwrap();
+                    assembled.extend_from_slice(&decoded);
+                }
+                other => panic!("expected ComposeBackupData, got {other:?}"),
+            }
+        }
+        assert_eq!(assembled.len() as u64, total_bytes);
+        assert_eq!(sha256_hex(&assembled), digest);
+
+        // Out-of-range chunk index is rejected.
+        assert_eq!(
+            svc.handle(ComposeRequest::ComposeBackupChunk {
+                id: 99,
+                operation_id: op1.clone(),
+                index: chunks,
+            }),
+            ComposeResponse::ComposeRejected {
+                id: 99,
+                code: RejectCode::BackupChunkOutOfRange,
+                rule: None,
+            }
+        );
+
+        // Verify offline restore into disposable target captures the uncheckpointed WAL row!
+        let settled_dir = base.join("host-settled");
+        fs::create_dir_all(&settled_dir).unwrap();
+        let copy_path = settled_dir.join("transferred.sqlite3");
+        fs::write(&copy_path, &assembled).unwrap();
+        let report = restore_sqlite_offline(
+            &copy_path,
+            &restore_dir,
+            "restored.sqlite3",
+            &digest,
+            MAX_BACKUP_BYTES,
+        )
+        .unwrap();
+        let restored_conn = rusqlite::Connection::open(&report.path).unwrap();
+        let body: String = restored_conn
+            .query_row("SELECT body FROM notes WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(body, "wal-only-row");
+        drop(restored_conn);
+        drop(conn);
+
+        // Release guest staging and verify metadata is no longer ready.
+        assert_eq!(
+            svc.handle(ComposeRequest::ComposeBackupRelease {
+                id: 100,
+                operation_id: op1.clone(),
+            }),
+            ComposeResponse::ComposeBackupReleased {
+                id: 100,
+                operation_id: op1.clone(),
+                removed: true,
+            }
+        );
+        assert_eq!(
+            svc.handle(ComposeRequest::ComposeBackupMeta {
+                id: 101,
+                operation_id: op1,
+            }),
+            ComposeResponse::ComposeRejected {
+                id: 101,
+                code: RejectCode::BackupNotReady,
+                rule: None,
+            }
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

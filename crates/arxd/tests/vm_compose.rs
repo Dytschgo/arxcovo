@@ -126,6 +126,7 @@ fn compose_offline_closure_attests_order_medium_and_install_profiles() {
     assert!(detached.contains("test ! -e /dev/disk/by-label/ARXCOMPOSE"));
     assert!(detached.contains("test ! -e /run/docker.sock"));
     assert!(detached.contains("verify_package '' 'docker-compose-plugin' '5:1.2.3-1~noble'"));
+    assert!(detached.contains("/var/lib/arx-compose/backup-staging"));
     let seed = recipe.render_seed([1; 16], guest).unwrap();
     const SECTOR: usize = 2048;
     let primary = &seed[16 * SECTOR..17 * SECTOR];
@@ -143,4 +144,5 @@ fn compose_offline_closure_attests_order_medium_and_install_profiles() {
     assert!(has(
         "systemctl --root=\"$target\" mask docker.service docker.socket containerd.service nginx.service"
     ));
+    assert!(has("$target/var/lib/arx-compose/backup-staging"));
 }
