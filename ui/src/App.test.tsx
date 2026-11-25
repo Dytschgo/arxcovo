@@ -111,6 +111,8 @@ describe('host detail polish', () => {
     await signIn({}, '#/hosts/atlas');
     const cpu = await screen.findByRole('meter', { name: 'CPU' });
     expect(cpu.getAttribute('aria-valuenow')).toBe('38');
+    expect(cpu.getAttribute('aria-valuetext')).toBe('38%');
+    expect(cpu.getAttribute('aria-hidden')).toBeNull();
     expect(cpu.hasAttribute('data-unknown')).toBe(false);
     expect(within(cpu.closest('.meter') as HTMLElement).queryByText(/usage unavailable/)).toBeNull();
   });
@@ -118,11 +120,20 @@ describe('host detail polish', () => {
   test('when the host reports no CPU usage the row says so instead of faking a bar', async () => {
     const host: Host = { ...atlas, cpu: { ...atlas.cpu, usedPercent: null } };
     await signIn({ hosts: [host] }, '#/hosts/atlas');
-    const cpu = await screen.findByRole('meter', { name: 'CPU' });
-    expect(cpu.getAttribute('aria-valuenow')).toBeNull();
-    expect(cpu.getAttribute('aria-valuetext')).toBe('usage unavailable');
-    expect(cpu.getAttribute('data-unknown')).toBe('true');
-    expect((cpu.closest('.meter') as HTMLElement).textContent).toContain('16 cores · usage unavailable');
+    const row = (await screen.findByText('Processor')).closest('.panels')!.querySelector('.meter') as HTMLElement;
+    expect(within(row).getByText('CPU')).toBeTruthy();
+    // No false 0% for assistive technology: the track is decorative, not a meter.
+    expect(screen.queryByRole('meter', { name: 'CPU' })).toBeNull();
+    const track = row.querySelector('.meter-track')!;
+    expect(track.getAttribute('aria-hidden')).toBe('true');
+    expect(track.getAttribute('role')).toBeNull();
+    expect(track.hasAttribute('aria-valuenow')).toBe(false);
+    expect(track.hasAttribute('aria-valuetext')).toBe(false);
+    // The state is conveyed by visible text that stays in the accessibility tree.
+    const text = within(row).getByText('16 cores · usage unavailable');
+    expect(text.closest('[aria-hidden="true"]')).toBeNull();
+    // Memory and disk keep real meters.
+    expect(screen.getByRole('meter', { name: 'Memory' }).getAttribute('aria-valuenow')).toBe('55');
   });
 });
 
