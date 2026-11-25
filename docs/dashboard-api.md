@@ -49,9 +49,14 @@ several browsers and Electron; a pairing token would need its own long-lived
 credential afterwards anyway. Pairing tokens remain the host *join* mechanism.
 
 Provision the password with `arxd dashboard-password --state-dir DIRECTORY`
-while the dashboard daemon is stopped. The command reads one UTF-8 line from
-standard input and hides terminal input. Use the same private state directory
-as the daemon's `state_dir`.
+while the dashboard daemon is stopped. Use the same private state directory
+as the daemon's `state_dir`. In a terminal, choose a password of 1–1024 UTF-8
+characters and press Enter. Repeat it when prompted. Both entries are hidden.
+If they differ, the command lets you start over, up to three attempts total.
+With piped standard input, the command reads one UTF-8 line without asking
+for confirmation. After success, sign in as `owner` at the dashboard URL.
+The command knows only the state directory, so it shows the documented
+loopback URL pattern and refers you to the configured URL for HTTPS.
 
 Set `dashboard.listen` and `dashboard.dist` in the foreground daemon's
 private JSON config to enable the listener. The dist path is an absolute path

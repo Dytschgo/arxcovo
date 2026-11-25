@@ -10,8 +10,9 @@ fn main() {
             eprintln!("arxd: usage: arxd dashboard-password --state-dir DIRECTORY");
             std::process::exit(2);
         }
-        if arxd::dashboard::set_password(&PathBuf::from(&args[2])).is_err() {
-            eprintln!("arxd: dashboard-password-refused");
+        if let Err(error) = arxd::dashboard::set_password(&PathBuf::from(&args[2])) {
+            // Display only the password command's fixed outer message.
+            eprintln!("arxd: {error}");
             std::process::exit(1);
         }
         return;

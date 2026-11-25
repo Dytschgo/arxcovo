@@ -1,11 +1,11 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use argon2::{
     Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version,
     password_hash::SaltString,
 };
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     path::Path,
 };
 use subtle::ConstantTimeEq;
@@ -15,6 +15,15 @@ const MEMORY_KIB: u32 = 64 * 1024;
 const ITERATIONS: u32 = 3;
 const PASSWORD_FILE: &str = "dashboard-owner.phc";
 const LOCK_FILE: &str = "dashboard-owner.lock";
+const MAX_PASSWORD_CHARS: usize = 1024;
+// A UTF-8 scalar takes up to four bytes. Allow CRLF and one overflow byte.
+const PASSWORD_READ_LIMIT: usize = 4 * MAX_PASSWORD_CHARS + 3;
+const PROMPT_ATTEMPTS: usize = 3;
+const CHOOSE_PROMPT: &str =
+    "Choose the dashboard password for user 'owner' (1–1024 UTF-8 characters, input hidden): ";
+const REPEAT_PROMPT: &str = "Repeat password (input hidden): ";
+const PROMPT_IO_ERROR: &str = "Could not display the dashboard password prompt.";
+const SUCCESS: &str = "Dashboard password saved for 'owner'. Sign in at the configured dashboard URL (http://localhost:<port> for local HTTP).";
 
 fn parameters() -> Params {
     Params::new(MEMORY_KIB, ITERATIONS, 1, Some(32)).expect("fixed Argon2id parameters")
@@ -172,29 +181,143 @@ fn lock(dir: &Path) -> Result<File> {
 }
 
 pub fn set_password(dir: &Path) -> Result<()> {
-    let _lock = lock(dir)?;
-    let input = std::io::stdin();
-    let guard = input.is_terminal().then(no_echo).transpose()?;
-    let password = read_password(input.lock());
-    if let Some(guard) = guard {
-        guard.restore()?;
-        eprintln!();
-    }
-    write_password(dir, &password?)
+    let _lock = lock(dir).context(
+        "Could not lock the dashboard password file. Check the private state directory and stop the dashboard daemon before retrying.",
+    )?;
+    let stdin = io::stdin();
+    let terminal = stdin.is_terminal();
+    let mut input = stdin.lock();
+    let password = if terminal {
+        let mut guard = no_echo().context("Could not hide input on the console.")?;
+        let mode = if cfg!(windows) {
+            InputMode::WindowsConsole { skip_lf: false }
+        } else {
+            InputMode::Terminal
+        };
+        let password = confirm_password(&mut input, &mut io::stderr().lock(), mode);
+        guard
+            .restore()
+            .context("Could not restore the console input mode.")?;
+        password?
+    } else {
+        read_password(&mut input, &mut InputMode::Piped)?
+    };
+    write_password(dir, &password).context("Could not save the dashboard password.")?;
+    let _ = writeln!(io::stdout().lock(), "{SUCCESS}");
+    Ok(())
 }
 
-fn read_password(input: impl BufRead) -> Result<Zeroizing<String>> {
-    // A UTF-8 scalar needs at most four bytes, plus a possible CRLF.
-    let mut bytes = Zeroizing::new(Vec::with_capacity(4099));
-    input.take(4099).read_until(b'\n', &mut bytes)?;
-    let raw = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
-    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-    let password = std::str::from_utf8(raw)?;
+enum InputMode {
+    Piped,
+    Terminal,
+    WindowsConsole { skip_lf: bool },
+}
+
+fn confirm_password(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    mut mode: InputMode,
+) -> Result<Zeroizing<String>> {
+    for attempt in 1..=PROMPT_ATTEMPTS {
+        let mut ask = |prompt| {
+            write!(output, "{prompt}").context(PROMPT_IO_ERROR)?;
+            output.flush().context(PROMPT_IO_ERROR)?;
+            let password = read_password(input, &mut mode);
+            writeln!(output).context(PROMPT_IO_ERROR)?;
+            password
+        };
+        let password = ask(CHOOSE_PROMPT)?;
+        let confirmation = ask(REPEAT_PROMPT)?;
+        if password.as_bytes() == confirmation.as_bytes() {
+            return Ok(password);
+        }
+        if attempt < PROMPT_ATTEMPTS {
+            writeln!(output, "Passwords do not match. Try again.").context(PROMPT_IO_ERROR)?;
+        }
+    }
+    bail!("Passwords did not match after {PROMPT_ATTEMPTS} attempts.")
+}
+
+fn read_password(input: &mut impl BufRead, mode: &mut InputMode) -> Result<Zeroizing<String>> {
+    let mut bytes = Zeroizing::new(Vec::with_capacity(PASSWORD_READ_LIMIT));
+    let mut input = input.take(PASSWORD_READ_LIMIT as u64);
+    match mode {
+        InputMode::WindowsConsole { skip_lf } => read_windows_line(&mut input, &mut bytes, skip_lf),
+        _ => input.read_until(b'\n', &mut bytes).map(|_| ()),
+    }
+    .context("Could not read the password from standard input.")?;
+    if bytes.is_empty() {
+        match mode {
+            InputMode::Piped => bail!(
+                "No password received. Use a console or supply one UTF-8 line on standard input."
+            ),
+            _ => bail!("Password entry ended before a line was received."),
+        }
+    }
+    let raw = strip_terminator(&bytes);
     ensure!(
-        !password.is_empty() && password.chars().count() <= 1024,
-        "invalid password length"
+        raw.len() <= 4 * MAX_PASSWORD_CHARS,
+        "Password is too long. Use at most {MAX_PASSWORD_CHARS} UTF-8 characters."
+    );
+    let password = std::str::from_utf8(raw).context("Password must be valid UTF-8.")?;
+    ensure!(
+        !password.is_empty(),
+        "Password is too short. Enter at least one character."
+    );
+    ensure!(
+        password.chars().count() <= MAX_PASSWORD_CHARS,
+        "Password is too long. Use at most {MAX_PASSWORD_CHARS} UTF-8 characters."
     );
     Ok(Zeroizing::new(password.into()))
+}
+
+fn strip_terminator(bytes: &[u8]) -> &[u8] {
+    bytes
+        .strip_suffix(b"\r\n")
+        .or_else(|| bytes.strip_suffix(b"\n"))
+        .or_else(|| bytes.strip_suffix(b"\r"))
+        .unwrap_or(bytes)
+}
+
+fn windows_line_end(bytes: &[u8]) -> Option<usize> {
+    let index = bytes
+        .iter()
+        .position(|byte| matches!(byte, b'\r' | b'\n'))?;
+    Some(
+        index
+            + if bytes[index..].starts_with(b"\r\n") {
+                2
+            } else {
+                1
+            },
+    )
+}
+
+fn read_windows_line(
+    input: &mut impl BufRead,
+    bytes: &mut Vec<u8>,
+    skip_lf: &mut bool,
+) -> io::Result<()> {
+    // A bare CR ends the read immediately. If CRLF straddles a buffer boundary,
+    // discard its LF on the next line read, without waiting for it after CR.
+    if std::mem::take(skip_lf) && input.fill_buf()?.starts_with(b"\n") {
+        input.consume(1);
+    }
+    loop {
+        let chunk = input.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if let Some(end) = windows_line_end(chunk) {
+            bytes.extend_from_slice(&chunk[..end]);
+            *skip_lf = end == chunk.len() && chunk.ends_with(b"\r");
+            input.consume(end);
+            return Ok(());
+        }
+        bytes.extend_from_slice(chunk);
+        let len = chunk.len();
+        input.consume(len);
+    }
 }
 
 fn write_password(dir: &Path, password: &str) -> Result<()> {
@@ -248,7 +371,7 @@ fn no_echo() -> std::io::Result<Echo> {
 
 #[cfg(unix)]
 impl Echo {
-    fn restore(&self) -> std::io::Result<()> {
+    fn restore(&mut self) -> std::io::Result<()> {
         // SAFETY: the saved termios remains initialized.
         if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.0) } != 0 {
             return Err(std::io::Error::last_os_error());
@@ -258,36 +381,95 @@ impl Echo {
 }
 
 #[cfg(windows)]
-struct Echo(windows_sys::Win32::Foundation::HANDLE, u32);
+use windows_console::{Echo, no_echo};
 
 #[cfg(windows)]
-fn no_echo() -> std::io::Result<Echo> {
-    use windows_sys::Win32::System::Console::*;
-    let mut original = 0;
-    // SAFETY: console standard input is a borrowed process handle.
-    unsafe {
-        let handle = GetStdHandle(STD_INPUT_HANDLE);
-        if GetConsoleMode(handle, &mut original) == 0
-            || SetConsoleMode(
-                handle,
-                original & !(ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT),
-            ) == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Echo(handle, original))
+mod windows_console {
+    use std::{io, sync::Mutex};
+    use windows_sys::Win32::{Foundation::HANDLE, System::Console::*};
+
+    pub(super) struct Echo(Option<HANDLE>);
+    static SAVED_MODE: Mutex<Option<u32>> = Mutex::new(None);
+
+    fn prompt_modes(original: u32) -> (u32, u32) {
+        // Keep processed input for Ctrl+C and keep the console's line editing.
+        (original & !ENABLE_ECHO_INPUT, original)
     }
-}
 
-#[cfg(windows)]
-impl Echo {
-    fn restore(&self) -> std::io::Result<()> {
-        use windows_sys::Win32::System::Console::SetConsoleMode;
-        // SAFETY: the standard input handle is still borrowed from the process.
-        if unsafe { SetConsoleMode(self.0, self.1) } == 0 {
-            return Err(std::io::Error::last_os_error());
+    unsafe extern "system" fn restore_on_interrupt(event: u32) -> i32 {
+        // Windows terminates the process on a separate thread for Ctrl+C/Break,
+        // so Drop cannot restore the input mode in that case.
+        if matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT)
+            && let Ok(saved) = SAVED_MODE.lock()
+            && let Some(original) = *saved
+        {
+            // SAFETY: the CLI leaves its borrowed stdin handle in place.
+            unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), original) };
         }
-        Ok(())
+        // Continue dispatch so the default cancellation behavior still runs.
+        0
+    }
+
+    pub(super) fn no_echo() -> io::Result<Echo> {
+        let mut saved = SAVED_MODE
+            .lock()
+            .map_err(|_| io::Error::other("console mode lock poisoned"))?;
+        if saved.is_some() {
+            return Err(io::Error::other("console input is already hidden"));
+        }
+        // SAFETY: stdin is borrowed, original has writable storage and the
+        // handler can only access the saved mode while holding the same lock.
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut original = 0;
+            if GetConsoleMode(handle, &mut original) == 0
+                || SetConsoleCtrlHandler(Some(restore_on_interrupt), 1) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let (hidden, restore) = prompt_modes(original);
+            if SetConsoleMode(handle, hidden) == 0 {
+                let error = io::Error::last_os_error();
+                SetConsoleCtrlHandler(Some(restore_on_interrupt), 0);
+                return Err(error);
+            }
+            *saved = Some(restore);
+            Ok(Echo(Some(handle)))
+        }
+    }
+
+    impl Echo {
+        pub(super) fn restore(&mut self) -> io::Result<()> {
+            if let Some(handle) = self.0 {
+                let mut saved = SAVED_MODE
+                    .lock()
+                    .map_err(|_| io::Error::other("console mode lock poisoned"))?;
+                let original = saved.ok_or_else(|| io::Error::other("missing console mode"))?;
+                // SAFETY: the saved stdin handle is still borrowed from the process.
+                unsafe {
+                    if SetConsoleMode(handle, original) == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    *saved = None;
+                    self.0 = None;
+                    SetConsoleCtrlHandler(Some(restore_on_interrupt), 0);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn windows_modes_preserve_input_flags_and_restore_the_original() {
+        let flags = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_MOUSE_INPUT;
+        assert_eq!(
+            prompt_modes(flags | ENABLE_ECHO_INPUT),
+            (flags, flags | ENABLE_ECHO_INPUT)
+        );
+        assert_eq!(
+            prompt_modes(ENABLE_MOUSE_INPUT),
+            (ENABLE_MOUSE_INPUT, ENABLE_MOUSE_INPUT)
+        );
     }
 }
 
@@ -300,6 +482,109 @@ impl Drop for Echo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_terminator_is_stripped_and_interior_cr_is_preserved() {
+        for (line, password) in [
+            (b"abc\r".as_slice(), b"abc".as_slice()),
+            (b"abc\n", b"abc"),
+            (b"abc\r\n", b"abc"),
+            (b"\r\n", b""),
+            (b"abc\r\r\n", b"abc\r"),
+            (b"a\rbc\n", b"a\rbc"),
+            (b"abc", b"abc"),
+        ] {
+            assert_eq!(strip_terminator(line), password);
+        }
+    }
+
+    #[test]
+    fn windows_console_finds_the_first_terminator() {
+        assert_eq!(windows_line_end(b"abc\r"), Some(4));
+        assert_eq!(windows_line_end(b"abc\n"), Some(4));
+        assert_eq!(windows_line_end(b"abc\r\nnext"), Some(5));
+        assert_eq!(windows_line_end(b"\r\n"), Some(2));
+        assert_eq!(windows_line_end(b"abc\rnext\n"), Some(4));
+        assert_eq!(windows_line_end(b"abc"), None);
+    }
+
+    #[test]
+    fn confirmation_retries_a_mismatch_and_accepts_a_match() {
+        // Force CR and LF into different reads for the first line.
+        let mut input = io::BufReader::with_capacity(4, b"one\r\ntwo\rthree\rthree\r".as_slice());
+        let mut output = Vec::new();
+        let password = confirm_password(
+            &mut input,
+            &mut output,
+            InputMode::WindowsConsole { skip_lf: false },
+        )
+        .unwrap();
+        assert_eq!(password.as_str(), "three");
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!(
+                "{CHOOSE_PROMPT}\n{REPEAT_PROMPT}\nPasswords do not match. Try again.\n{CHOOSE_PROMPT}\n{REPEAT_PROMPT}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn confirmation_fails_after_three_mismatches() {
+        let mut input = b"one\ntwo\none\ntwo\none\ntwo\nunused\n".as_slice();
+        let mut output = Vec::new();
+        let error = confirm_password(&mut input, &mut output, InputMode::Terminal).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Passwords did not match after 3 attempts."
+        );
+        assert_eq!(input, b"unused\n");
+    }
+
+    #[test]
+    fn password_validation_reports_safe_messages() {
+        for (input, message) in [
+            (
+                b"\n".to_vec(),
+                "Password is too short. Enter at least one character.",
+            ),
+            (
+                vec![b'x'; 1025],
+                "Password is too long. Use at most 1024 UTF-8 characters.",
+            ),
+            (vec![0xff], "Password must be valid UTF-8."),
+            (
+                vec![],
+                "No password received. Use a console or supply one UTF-8 line on standard input.",
+            ),
+        ] {
+            let error = read_password(&mut input.as_slice(), &mut InputMode::Piped).unwrap_err();
+            assert_eq!(error.to_string(), message);
+        }
+        struct BrokenStdin;
+        impl Read for BrokenStdin {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("must not expose the inner error"))
+            }
+        }
+        let mut unreadable = io::BufReader::new(BrokenStdin);
+        let error = read_password(&mut unreadable, &mut InputMode::Piped).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Could not read the password from standard input."
+        );
+    }
+
+    #[test]
+    fn piping_keeps_an_interior_cr_and_reads_only_the_first_line() {
+        let mut input = b"a\rb\r\nunused\n".as_slice();
+        assert_eq!(
+            read_password(&mut input, &mut InputMode::Piped)
+                .unwrap()
+                .as_str(),
+            "a\rb"
+        );
+        assert_eq!(input, b"unused\n");
+    }
 
     #[test]
     fn new_private_files_are_owned_at_creation_and_never_reopened() {
