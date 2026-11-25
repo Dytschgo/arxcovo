@@ -150,8 +150,10 @@ def admission_clock(first_age, wall_delta, mono_delta):
 
     E = first_age + max(0, wall_delta, mono_delta) + ANCHOR_PRE_S.
     wall_delta and mono_delta are seconds since that first reading. The
-    monotonic term is the validation time on the deadline clock. A backward
-    monotonic reading is an OS anomaly and never admits.
+    monotonic term is the validation time on the deadline clock, taken from
+    the latest observed reading. A backward monotonic reading is an OS
+    anomaly and never admits; sample() also refuses a rollback between
+    observed readings.
     """
     if (isinstance(wall_delta, bool) or isinstance(mono_delta, bool)
             or not isinstance(wall_delta, (int, float))
@@ -1006,11 +1008,16 @@ def sample(ctx, rep, start):
         require(fs, d, ("dir", "missing"))
     junit = os.path.join(tdirs[-1], JUNIT_NAME)
     require(fs, junit, ("file", "missing"))
-    check_deadline(clock, start + VALIDATION_S)
+    mono_check = check_deadline(clock, start + VALIDATION_S)
     wall_now = clock.time()
     check_anchor(env.get("ARX_DIAG_T0"), wall_now)
     mono_now = clock.monotonic()
-    e, admitted = admission_clock(first_age, wall_now - wall_first, mono_now - mono_first)
+    # Every observed deadline-clock reading counts: elapsed is charged from
+    # the latest one, and any reading below an earlier one never admits.
+    e, admitted = admission_clock(first_age, wall_now - wall_first,
+                                  max(mono_check, mono_now) - mono_first)
+    if not mono_first <= mono_check <= mono_now:
+        admitted = False
     rep.e_s = e
     if not admitted:
         rep.outcome = "skipped_budget"
@@ -1092,8 +1099,10 @@ def sample(ctx, rep, start):
 def check_deadline(clock, deadline):
     # Synchronous OS/interpreter stalls cannot be preempted. Refuse subsequent
     # work and successful reporting once control returns after the deadline.
-    if clock.monotonic() >= deadline:
+    now = clock.monotonic()
+    if now >= deadline:
         raise Guard("deadline")
+    return now
 
 
 def run(ctx, start=None):

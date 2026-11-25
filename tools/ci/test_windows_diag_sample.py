@@ -420,6 +420,84 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(lines, [lines[0]])
         self.assertEqual(h.log, [])
 
+    def _freeze_wall_and_script_monotonic(self, h, readings):
+        # Decouple the clocks at the last validation read: wall time stops and
+        # the deadline clock returns `readings` before resuming at the last one.
+        def move(clock):
+            frozen = clock.time()
+            pending = list(readings)
+            clock.t = pending[-1]
+            clock.time = lambda: frozen
+            clock.monotonic = lambda: pending.pop(0) if pending else clock.t
+        return self._on_first_junit_kind(h, move)
+
+    def test_backward_monotonic_between_checkpoint_and_admission_skips(self):
+        # The validation checkpoint reads 1001.75; the admission read rolls
+        # back to 1000.25, still above the first reading (1000.00).
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 584)
+        seen = self._freeze_wall_and_script_monotonic(h, [1001.75, 1000.25])
+        code, lines = h.run()
+        self.assertEqual(seen["n"], 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), "601")
+        self.assertEqual(lines, [lines[0]])
+        self.assertEqual(h.log, [])
+        # The rollback alone refuses admission even when E is well inside budget.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 500)
+        seen = self._freeze_wall_and_script_monotonic(h, [1001.75, 1000.25])
+        code, lines = h.run()
+        self.assertEqual(seen["n"], 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), "517")
+        self.assertEqual(h.log, [])
+        # A rollback ending below the checkpoint but not below the first read
+        # is the same refusal when the checkpoint itself went backwards.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 500)
+        seen = self._freeze_wall_and_script_monotonic(h, [999.5, 1000.25])
+        code, lines = h.run()
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.log, [])
+
+    def test_monotonic_elapsed_counts_with_frozen_wall_and_rounds_up(self):
+        # Both wall reads give age 585 s; only the deadline clock advances
+        # 0.25 s, which must round E up to 601 and skip.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        seen = self._freeze_wall_and_script_monotonic(h, [1000.25, 1000.25])
+        code, lines = h.run()
+        self.assertEqual(seen["n"], 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), "601")
+        self.assertEqual(h.log, [])
+
+    def test_second_anchor_read_gates_after_valid_first_read(self):
+        def late(value):
+            def move(clock):
+                if value is None:
+                    del h.env["ARX_DIAG_T0"]
+                else:
+                    h.env["ARX_DIAG_T0"] = value(clock)
+            return move
+
+        cases = {"missing": None, "malformed": lambda c: "abc", "zero": lambda c: "0",
+                 "future": lambda c: str(int(c.time()) + 10)}
+        for name, value in cases.items():
+            with self.subTest(case=name):
+                h = Harness()
+                seen = self._on_first_junit_kind(h, late(value))
+                code, lines = h.run()
+                self.assertEqual(seen["n"], 1)
+                self.assertEqual(code, 1)
+                self.assertEqual(lines[-1], "ARXDIAG v1 guard reason=anchor")
+                self.assertEqual(h.log, [])
+
     def test_validation_time_consumes_admit_budget(self):
         # Age 585 s would admit. One second on the deadline clock makes E=601.
         h = Harness(run_s=50.0)
