@@ -131,5 +131,6 @@ hardware**.
 ## M5 journey
 
 The TEST VM foreground opens the vault with its throwaway-VM tester after the
-startup sweep. M5 acceptance requires a qualified TEST golden and its own
-vault journey. [Foreground vault wiring](../crates/arxd/src/local.rs#L271-L273)
+startup sweep. M5 acceptance requires this qualified TEST runtime and its own
+vault journey. The owner runbook is [M5 owner-host acceptance](m5-acceptance.md).
+[Foreground vault wiring](../crates/arxd/src/local.rs#L271-L273)
