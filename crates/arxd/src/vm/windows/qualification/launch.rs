@@ -1322,8 +1322,15 @@ const WINDOWS_IDENTITY: &str = r#"
 $ErrorActionPreference='Stop'
 $s = @(Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" | Where-Object SID -match '^S-1-5-21-[0-9]+-[0-9]+-[0-9]+-500$')
 if ($s.Count -ne 1) { exit 0 }
+$value = switch ($identityKind) {
+    0 { $s[0].SID }
+    1 { $env:COMPUTERNAME }
+    2 { Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid }
+    default { exit 0 }
+}
+if ([string]::IsNullOrWhiteSpace($value)) { exit 0 }
 $sha=[Security.Cryptography.SHA256]::Create()
-$d=$sha.ComputeHash([Text.Encoding]::ASCII.GetBytes($s[0].SID))
+$d=$sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($value))
 exit (([BitConverter]::ToInt32($d,0) -band 0x3fffffff) + 1)
 "#;
 
@@ -1394,7 +1401,7 @@ $i=$n[0].ifIndex
 $a=@(Get-NetIPAddress -InterfaceIndex $i -AddressFamily IPv4)
 if ($a.Count -ne 1 -or $a[0].IPAddress -ne '10.0.2.15' -or $a[0].PrefixLength -ne 24) {exit 1}
 $r=@(Get-NetRoute -InterfaceIndex $i -AddressFamily IPv4 | Where-Object DestinationPrefix -eq '0.0.0.0/0')
-if ($r.Count -ne 1 -or $r[0].NextHop -ne '10.0.2.2') {exit 1}
+if (!$r.Count -or @($r | Where-Object NextHop -ne '10.0.2.2').Count) {exit 1}
 if (@(Get-NetIPAddress -InterfaceIndex $i -AddressFamily IPv6 | Where-Object IPAddress -notmatch '^fe[89ab]').Count) {exit 1}
 if (@(Get-NetRoute -InterfaceIndex $i -AddressFamily IPv6 | Where-Object DestinationPrefix -eq '::/0').Count) {exit 1}
 
@@ -1617,7 +1624,7 @@ pub(super) async fn run_windows(
     drop(released);
     commands.inspect_golden(&golden, DISK, 9).await?;
 
-    let mut identities = [0; 2];
+    let mut identities = [[0; 3]; 2];
     let mut boot_identity = [0; 16];
     getrandom::fill(&mut boot_identity).map_err(|_| reason)?;
     for (index, identity) in identities.iter_mut().enumerate() {
@@ -1676,15 +1683,17 @@ pub(super) async fn run_windows(
                         {
                             return Err(NativeRefusal::GuestEndpointUnverified);
                         }
-                        match guest
-                            .run_script(&signal, WINDOWS_IDENTITY.to_owned(), 30)
-                            .await
-                        {
-                            Ok((ScriptStatus::Exited, Some(value @ 1..=0x4000_0000))) => {
-                                received.set(Some(value))
+                        let mut fingerprints = [0; 3];
+                        for (kind, fingerprint) in fingerprints.iter_mut().enumerate() {
+                            let script = format!("$identityKind={kind}\n{WINDOWS_IDENTITY}");
+                            match guest.run_script(&signal, script, 30).await {
+                                Ok((ScriptStatus::Exited, Some(value @ 1..=0x4000_0000))) => {
+                                    *fingerprint = value
+                                }
+                                _ => return Err(NativeRefusal::GuestEndpointUnverified),
                             }
-                            _ => return Err(NativeRefusal::GuestEndpointUnverified),
                         }
+                        received.set(Some(fingerprints));
                         Ok(())
                     })
                 },
@@ -1707,7 +1716,10 @@ pub(super) async fn run_windows(
         )
         .map_err(|_| reason)?;
     }
-    if identities[0] == identities[1]
+    if identities[0]
+        .iter()
+        .zip(identities[1])
+        .any(|(a, b)| *a == b)
         || hash_at_rest(&mut golden, DISK + GIB, deadline.into_std())? != pinned_disk
         || hash_at_rest(&mut golden_vars, 16 << 20, deadline.into_std())? != pinned_vars
     {

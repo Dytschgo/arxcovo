@@ -676,6 +676,20 @@ function Write-SetupPhase([string]$Value) {
     } finally { $file.Dispose() }
 }
 
+function Set-TestDefaultRoute {
+    $nics = @(Get-CimInstance Win32_NetworkAdapter -Filter "ServiceName='netkvm'" |
+        Where-Object { $_.InterfaceIndex -gt 0 })
+    if ($nics.Count -ne 1) { throw 'test nic' }
+    $index = $nics[0].InterfaceIndex
+    $prefix = '0.0.0.0/0'
+    $gateway = '10.0.2.2'
+    $saved = @(Get-NetRoute -InterfaceIndex $index -DestinationPrefix $prefix -PolicyStore PersistentStore -ErrorAction SilentlyContinue)
+    if (@($saved | Where-Object NextHop -ne $gateway).Count) { throw 'test route' }
+    if (!$saved.Count) {
+        New-NetRoute -InterfaceIndex $index -DestinationPrefix $prefix -NextHop $gateway -RouteMetric 4096 | Out-Null
+    }
+}
+
 function Finish-Setup {
     $imageState = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State'
     $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -707,6 +721,7 @@ function Finish-Setup {
     Assert-NoBootstrap
     Clear-SetupCaches
     if ($stage -eq '1') {
+        Set-TestDefaultRoute
         Set-GuestPowerShellLogging
         Write-SetupPhase "2:$boot"
         # SCM checks the auto-start configuration. Start explicitly on this
@@ -878,6 +893,10 @@ try {
         $devices = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter "Service = '$name'")
         if ($devices.Count -ne 1 -or $devices[0].ConfigManagerErrorCode -ne 0) { exit 1 }
     }
+    $nic = @(Get-NetAdapter | Where-Object Status -eq 'Up')
+    if ($nic.Count -ne 1) { exit 1 }
+    $routes = @(Get-NetRoute -InterfaceIndex $nic[0].ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0')
+    if (!$routes.Count -or @($routes | Where-Object NextHop -ne '10.0.2.2').Count) { exit 1 }
     if (@(Get-LocalUser | Where-Object { $_.Name -in @('ArxBootstrap','defaultuser0') }).Count -ne 0) { exit 1 }
     $programs = Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion' -Name ProgramFilesDir
     if (-not [IO.Path]::IsPathRooted($programs)) { exit 1 }
@@ -1463,7 +1482,7 @@ if ($errors) { throw 'invalid provisioner syntax' }
 # Load only the tested function definitions. All guest operations callable
 # from these functions are stubbed or restricted to the test temp directory.
 foreach ($name in 'Set-VerifiedRegistryValue','Set-GuestPowerShellLogging','Set-PortSecurity',
-                  'Write-SetupPhase','Finish-Setup') {
+                  'Write-SetupPhase','Set-TestDefaultRoute','Finish-Setup') {
     $definition = $ast.Find({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
@@ -1492,6 +1511,8 @@ $script:expectedPolicy = @(
     'SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription\EnableTranscripting'
 )
 $script:serviceSid = 'S-1-5-80-1-2-3-4-5'
+$script:savedRoute = $false
+$script:routeWrites = 0
 [IO.File]::WriteAllText($script, 'fixture')
 
 function Expect($Condition, $Description) {
@@ -1534,9 +1555,23 @@ function Get-ItemPropertyValue {
         $Name -ceq 'ImageState') { return 'IMAGE_STATE_COMPLETE' }
     throw 'unexpected Setup read'
 }
-function Get-CimInstance($ClassName) {
+function Get-CimInstance($ClassName, $Filter) {
+    if ($ClassName -ceq 'Win32_NetworkAdapter' -and $Filter -ceq "ServiceName='netkvm'") {
+        return [pscustomobject]@{ InterfaceIndex = 12 }
+    }
     Expect ($ClassName -ceq 'Win32_OperatingSystem') 'wrong boot witness'
     @{ LastBootUpTime = $script:boot }
+}
+function Get-NetRoute($InterfaceIndex, $DestinationPrefix, $PolicyStore, $ErrorAction) {
+    Expect ($InterfaceIndex -eq 12 -and $DestinationPrefix -ceq '0.0.0.0/0' -and
+        $PolicyStore -ceq 'PersistentStore') 'wrong persistent route query'
+    if ($script:savedRoute) { [pscustomobject]@{ NextHop = '10.0.2.2' } }
+}
+function New-NetRoute($InterfaceIndex, $DestinationPrefix, $NextHop, $RouteMetric) {
+    Expect ($InterfaceIndex -eq 12 -and $DestinationPrefix -ceq '0.0.0.0/0' -and
+        $NextHop -ceq '10.0.2.2' -and $RouteMetric -eq 4096) 'wrong new route'
+    $script:savedRoute = $true
+    $script:routeWrites++
 }
 function Assert-PlainPath($Path) { Expect ($Path -ceq $script:state) 'unexpected phase path' }
 function Clear-Bootstrap {}
@@ -1608,6 +1643,7 @@ foreach ($fault in 'kind','value') {
 $script:registryFault = ''
 Finish-Setup
 Expect (($tools -join '|') -ceq '/s /t 0|config arx-guest start= auto|start arx-guest') 'unexpected startup sequence'
+Expect ($routeWrites -eq 1 -and $savedRoute) 'route missing or rewritten'
 Expect ($registry.Count -eq 5) 'unexpected registry keys'
 Expect-Failure 'stage'
 
@@ -1679,6 +1715,16 @@ Expect ($tools.Count -eq 4 -and $tools[3] -ceq '/generalize /oobe /shutdown /qui
         if ($case -eq 'setup account') { return [pscustomobject]@{ Name = 'defaultuser0' } }
         if ($case -eq 'bootstrap account') { return [pscustomobject]@{ Name = 'ArxBootstrap' } }
     }
+    function Get-NetAdapter { [pscustomobject]@{ Status = 'Up'; ifIndex = 12 } }
+    function Get-NetRoute($InterfaceIndex, $AddressFamily, $DestinationPrefix) {
+        if ($InterfaceIndex -ne 12 -or $AddressFamily -cne 'IPv4' -or $DestinationPrefix -cne '0.0.0.0/0') {
+            throw 'unexpected route query'
+        }
+        if ($case -ne 'missing route') {
+            $nextHop = if ($case -eq 'wrong gateway') { '10.0.2.1' } else { '10.0.2.2' }
+            [pscustomobject]@{ NextHop = $nextHop }
+        }
+    }
     function Test-Path([string]$LiteralPath) {
         if ($LiteralPath -eq $phase) { return $case -eq 'finalizer marker' }
         if ($LiteralPath -eq (Join-Path $disk 'autounattend.xml')) { return $case -eq 'root answer' }
@@ -1710,7 +1756,8 @@ Expect ($tools.Count -eq 4 -and $tools[3] -ceq '/generalize /oobe /shutdown /qui
     Check-Probe 'clean verification' $verification 0
     Check-Probe 'stale readiness' $validation 1
     foreach ($scenario in 'wrong build','wrong edition','wrong revision','answer override','setup account',
-        'bootstrap account','root answer','staging answer','nested answer','setup profile','finalizer marker') {
+        'bootstrap account','root answer','staging answer','nested answer','setup profile','finalizer marker',
+        'missing route','wrong gateway') {
         Check-Probe $scenario $verification 1
     }
 }

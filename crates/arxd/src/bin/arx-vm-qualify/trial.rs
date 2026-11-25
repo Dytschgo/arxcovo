@@ -5,8 +5,7 @@
 //! Every stage transition checks its prerequisites before the collector runs.
 //! Effects additionally consume a disposable-store proof, a confinement plan
 //! and a fresh live sample. Cleanup always runs. Only a trial whose every
-//! stage passed can be sealed, and the first guest and all subsequent native effects remain
-//! unavailable, so native trials are always incomplete.
+//! stage passed can be sealed.
 
 use crate::frame::*;
 
@@ -244,8 +243,7 @@ impl<S: Source> Trial<S> {
 
     /// Seal a trial whose every stage passed against a complete, current
     /// dependency projection. Check cancellation, the trial budget, and
-    /// binding expiry at the seal point. No writer accepts the result in
-    /// this version.
+    /// binding expiry at the seal point. The trial retains its custody.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn finish(&self, clock: &impl Clock) -> Result<Complete<S>, RunError> {
         self.state.finish(clock)
@@ -599,7 +597,7 @@ impl<S: Source> State<S> {
     }
 }
 
-/// A sealed bundle. There is no route from this type to any writer.
+/// A sealed bundle. Only the native trial's writer accepts its native form.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Complete<S: Source> {
     pub seal: Vec<u8>,

@@ -462,11 +462,13 @@ impl Baseline {
                         u64::try_from(captured.duration_since(self.origin).as_millis())
                             .unwrap_or(u64::MAX),
                     ),
-                    settled: no_charge(&scope.recipe.root, &[".arx-recipes-charge"])
-                        && no_charge(
-                            &held.trial,
-                            &[".arx-paused-trial-charge", ".arx-network-seed-charge"],
-                        ),
+                    settled: no_charge(
+                        &scope.recipe.root,
+                        &[".arx-recipes-charge", ".arx-recipe-capacity-charge"],
+                    ) && no_charge(
+                        &held.trial,
+                        &[".arx-paused-trial-charge", ".arx-network-seed-charge"],
+                    ),
                 })
             })
     }

@@ -118,11 +118,11 @@ impl UbuntuRecipe {
     /// SHA256 and length of the schema identifier, user-data template, guest
     /// unit, finalizer, audit unit and audit script, separated by NUL bytes.
     pub const NOCLOUD_PROFILE_PIN: AssetPin = AssetPin {
-        length: 4757,
+        length: 5388,
         sha256: [
-            0x37, 0xaa, 0xba, 0x54, 0x48, 0x07, 0x89, 0x14, 0xff, 0x93, 0xf6, 0x46, 0xcc, 0xe7,
-            0x8d, 0x26, 0x55, 0x88, 0xf1, 0xa1, 0x4d, 0x5d, 0x34, 0xe6, 0x62, 0x55, 0x22, 0x95,
-            0xae, 0xe0, 0x57, 0x2c,
+            0x48, 0xe6, 0xff, 0x41, 0x33, 0xae, 0xf0, 0x02, 0x7d, 0x3c, 0x0b, 0x44, 0xde, 0x73,
+            0x35, 0x3d, 0x6f, 0xf4, 0x54, 0x5e, 0x64, 0x4d, 0x0a, 0x86, 0x0b, 0xd1, 0xcb, 0x1e,
+            0xb9, 0x4d, 0xab, 0x29,
         ],
     };
 
@@ -210,6 +210,29 @@ rm -rf /var/lib/cloud /var/log/installer /var/lib/subiquity /var/lib/arx-guest
 rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 rm -rf /root/.ssh
 rm -f /etc/ssh/ssh_host_* /var/lib/systemd/random-seed
+
+# The installer network stayed off. Only the installed TEST NIC uses DHCP
+# and the on-link slirp gateway for positive setup before isolation probes.
+test -f /etc/netplan/00-installer-config.yaml
+test ! -L /etc/netplan/00-installer-config.yaml
+umask 077
+cat > /etc/netplan/00-installer-config.yaml <<'ARX_NETPLAN'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    arxcovo-test:
+      match:
+        driver: virtio_net
+      dhcp4: true
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      routes:
+        - to: default
+          via: 10.0.2.2
+ARX_NETPLAN
+chmod 0600 /etc/netplan/00-installer-config.yaml
 
 # An empty regular machine-id permits a transient ID on the first boot.
 # Drop the persisted D-Bus fallback and point subsequent lookups to systemd.
@@ -638,6 +661,10 @@ if __name__ == '__main__':
             wire.write(('ARXNET3 ' + NONCE.hex() + ' ' + setup + ' ' + control + ' ' + outcomes + '\n').encode('ascii'))
 "#;
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+const INSTALLED_ROUTE_ASSERTION: &str =
+    "assert ip('-4','route','show','default','dev',n)[:3]==[b'default',b'via',b'10.0.2.2']\n";
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(in crate::vm) fn installed_witness_script(
     nonce: [u8; 16],
@@ -682,7 +709,10 @@ n=ports[0].name
 def ip(*args):
     return subprocess.run(['/usr/sbin/ip', *args],check=True,timeout=1,capture_output=True).stdout.split()
 assert b'10.0.2.15/24' in ip('-4','addr','show','dev',n)
-assert b'10.0.2.2' in ip('-4','route','show','default','dev',n)
+"#);
+    script.push_str(INSTALLED_ROUTE_ASSERTION);
+    script.push_str(
+        r#"
 assert b'inet6' not in ip('-6','addr','show','dev',n,'scope','global')
 assert not ip('-6','route','show','default','dev',n)
 a=witness_attempt(UDP[2],'10.0.2.15',n,False,NONCE)
@@ -697,7 +727,8 @@ q=NONCE[:2]+bytes.fromhex('01000001000000000000')+bytes([len(x)])+x+b'\x07invali
 assert t[0] in 'FT' and t[1]=='L' and t[2] in 'FT' and u==list('SLS')
 assert [witness_dns(d,'10.0.2.15',n,q) for d in DNS]==['S','S']
 ARX_NETWORK
-"#);
+"#,
+    );
     let script = script
         .lines()
         .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
@@ -932,9 +963,10 @@ fn network_probe_python_fixture() {
     // Run the functions embedded in the seed with a fake socket. No packets
     // are sent and the fixture does not inspect the host's routes.
     let fixture = include_str!("network_probe_fixture.py");
+    let route = serde_json::to_string(INSTALLED_ROUTE_ASSERTION).unwrap();
     // fcntl is Linux-only. These mocked fixture calls never use its ioctl.
     let program = format!(
-        "__name__ = 'fixture'\nimport sys, types\nsys.modules['fcntl'] = types.ModuleType('fcntl')\n{PROBE_START}{PROBE_BODY}\n{PROBE_FIXTURE_BEFORE}\n{fixture}\n{PROBE_FIXTURE_AFTER}"
+        "__name__ = 'fixture'\nimport sys, types\nsys.modules['fcntl'] = types.ModuleType('fcntl')\n{PROBE_START}{PROBE_BODY}\n{PROBE_FIXTURE_BEFORE}\n{fixture}\nROUTE_SOURCE = {route}\n{PROBE_FIXTURE_AFTER}"
     );
     let result = std::process::Command::new(python)
         .args(["-I", "-B", "-c", &program])
@@ -997,4 +1029,16 @@ probe_tcp, probe_dns = MagicMock(return_value='R'), MagicMock(return_value='R')
 assert run_probes([nic]) == ('1110', 'EEEEEEEE')
 probe_tcp.assert_not_called()
 probe_dns.assert_not_called()
+
+for tokens, expected in [
+    (b'default via 10.0.2.2 dev eth0'.split(), True),
+    (b'default via 10.0.2.1 dev eth0'.split(), False),
+    ([], False),
+]:
+    try:
+        exec(ROUTE_SOURCE, {'ip': lambda *args: tokens, 'n': 'eth0'})
+        seen = True
+    except AssertionError:
+        seen = False
+    assert seen is expected
 "#;

@@ -2,9 +2,9 @@
 //!
 //! This binary crate owns the private `TrialAuthority`; the arxd library and
 //! the daemon cannot name it, and it never converts into `LaunchAuthority`.
-//! The library provides held preflight, a fixed paused-trial adapter, and
-//! a diagnostic-only evidence sink. The executable publishes incomplete
-//! qualification diagnostics.
+//! The library provides held preflight, the native TEST adapters, and the
+//! evidence sink. A settled full TEST run publishes a completion marker
+//! after every row is committed and verified.
 //!
 //! An evidence directory serves exactly one run. Before the runner's claim
 //! exists, the sink removes only its own temporary entries left by an

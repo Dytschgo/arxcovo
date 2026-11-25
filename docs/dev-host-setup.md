@@ -382,6 +382,13 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    also requires probes with both installed guests' actual drivers.
    Live TEST network behavior is **unverified on real hardware**.
 
+   The fixed TEST provisioners configure the installed guest's IPv4 default
+   route via `10.0.2.2` through Netplan on Ubuntu and the persistent route
+   store on Windows. The restricted guest scripts check the route before
+   probing. Slirp `restrict=on` remains the egress policy. Use the revised
+   NoCloud and Windows provisioner pins recorded in
+   [ADR 0055](adr/0055-m4-offline-template-recipes.md#test-guest-default-route-amendment).
+
    Boot the exact Ubuntu offline recipe with the pinned ISO, CIDATA and
    kernel/initrd. Verify the cleaned standalone candidate, detached installed
    health and clean release of its disposable verification overlay. Enroll the

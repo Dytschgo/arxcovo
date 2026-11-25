@@ -58,3 +58,18 @@ R2 runs installer and finalizer boots with QMP-only startup and completion. It o
 4. Boot the distinct verification overlay and VARS pair with all installation media detached. Require complete offline OOBE within the installed readiness contract, working SCM and re-enumerated drivers, absent cached answers, tasks and bootstrap state, and a clean release. Recheck immutable candidate identity, digests and accounting before sealing. Qualification includes two independently booted linked clones with distinct machine SID, hostname and per-VM identity without exposing those values in receipts.
 
 5a supplies the Windows service and restricted executor. R1 and R2 supply typed media and boot plans, one-shot boot handling and bounded QMP installer completion. 5c supplies the durable lifecycle, fixed health checks, private catalog and qualification evidence. Native activation needs the dedicated host and identity controls of ADR 0054 plus independent exact-head review and the owner-host checks. A real Windows Setup, offline OOBE, signed driver behavior, SCM installation, Sysprep, and distinct clone identities are **unverified on real hardware**.
+
+## TEST guest default route amendment
+
+The offline Ubuntu installer retains its disabled network configuration.
+The TEST finalizer writes the installed VirtIO NIC's Netplan config with
+DHCPv4 and the guest-only default route via `10.0.2.2`. Windows writes the
+same route for the NetKVM NIC from the privileged provisioning step. The
+installed probes require an active route through that gateway. Egress
+remains subject to the sealed slirp `restrict=on` policy and the host-side
+witnesses. The owner-host behavior is **unverified on real hardware**.
+
+| Pinned input | Previous bytes and SHA-256 | Revised bytes and SHA-256 |
+| --- | --- | --- |
+| Ubuntu NoCloud profile | 4,757 · `37aaba5448078914ff93f646cce78d265588f1a14d5d34e662552295aee0572c` | 5,388 · `48e6ff4133aef0027d3c0b44de73353d6ff4545e644d0a860bd1cb1eb94dab29` |
+| Windows provisioner | 13,110 · `d12b9627ee20087dcd2478646873a3932d5463b9dbe1af3c8c2056ad766f72cf` | 13,816 · `1c832f7047ce76ede0ff1f627a646f294cf0fa01df2d39a2877b72f77aaa1544` |

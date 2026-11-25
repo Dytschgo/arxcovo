@@ -759,6 +759,41 @@ pub(super) mod network_probe {
 
     #[cfg(test)]
     #[tokio::test]
+    async fn installed_witness_frame_counts_only_validated_attempts() {
+        let nonce = [42; 16];
+        let read = |setup, control, outcomes| {
+            format!(
+                "ARXNET3 {} {setup} {control} {outcomes}\n",
+                hex::encode(nonce)
+            )
+        };
+        for (outcomes, count) in [
+            ("TLTSLSSS", 8),
+            ("ELTSLSSS", 7),
+            ("TFTSLSSS", 7),
+            ("TLTSLSSM", 7),
+        ] {
+            let report = witness_response(read("1111", "1", outcomes).as_bytes(), &nonce)
+                .await
+                .unwrap();
+            assert_eq!(report.validated_attempts, count);
+            assert!(report.gateway_reachable);
+            assert!(report.diagnostic.default_route);
+        }
+        let missing = witness_response(read("1101", "0", "EEEEEEEE").as_bytes(), &nonce)
+            .await
+            .unwrap();
+        assert!(!missing.diagnostic.default_route);
+        assert!(!missing.gateway_reachable);
+        assert_eq!(missing.validated_attempts, 0);
+        assert_eq!(
+            witness_response(read("1101", "1", "TLTSLSSS").as_bytes(), &nonce).await,
+            Err(ChannelError::Unexpected),
+        );
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
     async fn restricted_network_response_preserves_observations_without_claiming_denials() {
         let nonce = [42; 16];
         let targets = fixture_targets();

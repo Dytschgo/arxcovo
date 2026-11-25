@@ -1,5 +1,5 @@
 //! Project held preflight and paused-trial observations into the closed graph.
-//! Native runs publish an incomplete diagnostic. Later stages remain closed.
+//! Full TEST runs can publish a seal only through their held baseline.
 //!
 //! Native observations are **unverified on real hardware**.
 

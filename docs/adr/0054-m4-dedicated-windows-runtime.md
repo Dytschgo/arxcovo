@@ -1325,3 +1325,8 @@ path, size and SHA-256 before Setup and after verified release. The mutable
 copy carries the one-shot BootNext entry. The reviewed owner-host seed is
 pending, and absent or invalid input yields an incomplete dossier. The
 BootNext handoff is **unverified on real hardware**.
+
+The fixed TEST provisioners configure the guest-only IPv4 default route
+through `10.0.2.2` for the installed VirtIO NIC. The installed endpoint
+checks the route before running the witness probes. The launcher continues
+to enforce slirp `restrict=on` throughout. [ADR 0055 records both pin changes](0055-m4-offline-template-recipes.md#test-guest-default-route-amendment).
