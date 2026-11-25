@@ -3,6 +3,14 @@ import type { TerminalCommand } from './types';
 export const MAX_ARGS = 128;
 export const MAX_ARG_LENGTH = 8192;
 
+/** Neutral hint shown when the host has no discovered tools to suggest. */
+export const NEUTRAL_COMMAND_HINT = 'tool name and arguments';
+
+/** An example command line built from a tool the host really has, never a guess. */
+export function exampleCommand(tools: readonly { name: string }[]): string {
+  return tools.length > 0 ? `${tools[0].name} --version` : NEUTRAL_COMMAND_HINT;
+}
+
 export type ParsedCommand = { ok: true; command: TerminalCommand } | { ok: false; error: string };
 
 /**
@@ -35,7 +43,7 @@ export function parseCommandLine(line: string): ParsedCommand {
   }
   if (quote) return { ok: false, error: 'Close the open quote.' };
   if (inToken) tokens.push(current);
-  if (tokens.length === 0) return { ok: false, error: 'Type a tool name, for example: git --version' };
+  if (tokens.length === 0) return { ok: false, error: 'Type a tool name followed by its arguments.' };
   const [tool, ...args] = tokens;
   if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/.test(tool)) return { ok: false, error: 'The tool name must be a plain program name, not a path.' };
   if (args.length > MAX_ARGS) return { ok: false, error: `At most ${MAX_ARGS} arguments.` };

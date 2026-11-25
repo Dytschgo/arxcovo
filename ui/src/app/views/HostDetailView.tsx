@@ -32,7 +32,7 @@ export function HostDetailView({ id }: { id: string }) {
                   ['Operating system', `${OS_LABEL[host.os]} · ${host.osVersion}`],
                   ['Architecture', <ArchBadge key="a" arch={host.arch} />],
                   ['Processor', host.cpu.model],
-                  ['Mode', host.mode === 'always_on' ? 'Always on (dedicated)' : 'Opportunistic (daily use)'],
+                  ['Availability', host.mode === 'always_on' ? 'Always on' : 'Opportunistic (used day to day)'],
                   ['Agent rights', host.agentRights === 'admin' ? 'Admin' : 'Standard privileges'],
                   ['Last seen', formatDate(host.lastSeenAt)],
                 ]} />

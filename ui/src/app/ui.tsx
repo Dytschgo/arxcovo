@@ -91,9 +91,9 @@ export function Meter({ label, value, detail }: { label: string; value: number |
     <div className="meter" data-tone={tone}>
       <div className="meter-label">
         <span>{label}</span>
-        <span className="meter-detail">{detail}</span>
+        <span className="meter-detail">{detail}{value === null ? ' · usage unavailable' : ''}</span>
       </div>
-      <div className="meter-track" role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={value ?? undefined} aria-valuetext={value === null ? 'unknown' : `${value}%`}>
+      <div className="meter-track" data-unknown={value === null ? 'true' : undefined} role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={value ?? undefined} aria-valuetext={value === null ? 'usage unavailable' : `${value}%`}>
         <div className="meter-fill" style={{ inlineSize: `${value ?? 0}%` }} />
       </div>
     </div>
