@@ -327,17 +327,25 @@ chmod 0600 "$file"
     /// Compute the sealed Ubuntu TEST recipe digest over the recipe ID,
     /// seven external asset pins, and the embedded TEST recipe content
     /// (service unit, shared finalizer, NoCloud profile pin, TEST route late
-    /// command, and detached health script).
+    /// command, detached health script, and canonical NoCloud documents).
     #[cfg(any(test, all(windows, target_arch = "x86_64")))]
     pub(in crate::vm) fn test_recipe_digest(&self) -> Result<[u8; 32], RecipeError> {
         let schema = required(self.nocloud_schema)?;
         verify_nocloud_profile(schema)?;
+        let user = user_data(
+            required(self.guest)?,
+            required(self.service)?,
+            required(self.finalize)?,
+        );
+        let meta = nocloud_meta(TEST_RECIPE_DIGEST_BUILD_ID);
+        let test_user = append_test_route_user_data(&user)?;
         self.test_recipe_digest_with(
             Self::SERVICE,
             Self::FINALIZE,
             Self::NOCLOUD_PROFILE_PIN,
             Self::TEST_ROUTE_COMMAND,
             DETACHED_HEALTH,
+            (&meta, &test_user),
         )
     }
 
@@ -349,6 +357,7 @@ chmod 0600 "$file"
         nocloud_profile: AssetPin,
         test_route_command: &str,
         detached_health: &str,
+        (meta, user): (&str, &str),
     ) -> Result<[u8; 32], RecipeError> {
         let service = required(self.service)?;
         let finalize = required(self.finalize)?;
@@ -359,7 +368,7 @@ chmod 0600 "$file"
             return Err(RecipeError::Unqualified);
         }
         let mut hash = Sha256::new()
-            .chain_update(b"arxcovo.recipe.ubuntu-test.v1\0")
+            .chain_update(b"arxcovo.recipe.ubuntu-test.v2\0")
             .chain_update(Self::ID);
         for pin in [
             self.iso,
@@ -379,6 +388,8 @@ chmod 0600 "$file"
             finalize_bytes,
             test_route_command.as_bytes(),
             detached_health.as_bytes(),
+            meta.as_bytes(),
+            user.as_bytes(),
         ] {
             hash.update((bytes.len() as u64).to_be_bytes());
             hash.update(Sha256::digest(bytes));
@@ -400,12 +411,21 @@ chmod 0600 "$file"
         service.verify(Self::SERVICE)?;
         finalize.verify(Self::FINALIZE)?;
         verify_nocloud_profile(schema)?;
-        let meta = format!(
-            "instance-id: arx-install-{}\nlocal-hostname: arxcovo\n",
-            hex::encode(build_id),
-        );
-        Ok((meta, user_data(guest_pin, service, finalize)))
+        Ok((
+            nocloud_meta(build_id),
+            user_data(guest_pin, service, finalize),
+        ))
     }
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+const TEST_RECIPE_DIGEST_BUILD_ID: Id = [0; 16];
+
+fn nocloud_meta(build_id: Id) -> String {
+    format!(
+        "instance-id: arx-install-{}\nlocal-hostname: arxcovo\n",
+        hex::encode(build_id),
+    )
 }
 
 fn verify_nocloud_profile(schema: AssetPin) -> Result<(), RecipeError> {
@@ -948,12 +968,22 @@ fn required(pin: Option<AssetPin>) -> Result<AssetPin, RecipeError> {
 
 fn append_test_route_seed(base: &[u8], out: impl Write) -> Result<(), RecipeError> {
     let mut files = super::ubuntu_web::cidata_files(base).ok_or(RecipeError::Unqualified)?;
-    let mut user = String::from_utf8(files[6].to_vec()).map_err(|_| RecipeError::Unqualified)?;
+    let user = std::str::from_utf8(files[6]).map_err(|_| RecipeError::Unqualified)?;
+    let user = append_test_route_user_data(user)?;
+    files[6] = user.as_bytes();
+    Image::new(files)
+        .ok_or(RecipeError::Unqualified)?
+        .write(out)
+        .map_err(|error| RecipeError::Write(error.kind()))
+}
+
+fn append_test_route_user_data(user: &str) -> Result<String, RecipeError> {
     if !user.ends_with(
         "      curtin in-target --target=/target -- /bin/sh /usr/local/sbin/arx-finalize\n",
     ) {
         return Err(RecipeError::Unqualified);
     }
+    let mut user = user.to_owned();
     user.push_str("    - |\n");
     for line in UbuntuRecipe::TEST_ROUTE_COMMAND.lines() {
         if !line.is_empty() {
@@ -962,11 +992,7 @@ fn append_test_route_seed(base: &[u8], out: impl Write) -> Result<(), RecipeErro
         }
         user.push('\n');
     }
-    files[6] = user.as_bytes();
-    Image::new(files)
-        .ok_or(RecipeError::Unqualified)?
-        .write(out)
-        .map_err(|error| RecipeError::Write(error.kind()))
+    Ok(user)
 }
 
 fn image<'a>(guest: &'a [u8], meta: &'a str, user: &'a str) -> Result<Image<'a>, RecipeError> {
@@ -1259,9 +1285,128 @@ for tokens, expected in [
 "#;
 
 #[cfg(test)]
-fn python_executable() -> std::ffi::OsString {
-    std::env::var_os("ARX_TEST_NETWORK_PROBE_PYTHON")
-        .unwrap_or_else(|| std::ffi::OsString::from("python"))
+fn valid_python(path: &std::path::Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    #[cfg(windows)]
+    let metadata = std::fs::symlink_metadata(path);
+    #[cfg(not(windows))]
+    let metadata = std::fs::metadata(path);
+    let Ok(metadata) = metadata else { return false };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    metadata.is_file() && metadata.len() > 0
+}
+
+#[cfg(test)]
+fn resolve_python(override_path: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    if let Some(path) = override_path {
+        return valid_python(&path).then_some(path);
+    }
+    #[cfg(unix)]
+    let names = {
+        let system = std::path::PathBuf::from("/usr/bin/python3");
+        if valid_python(&system) {
+            return Some(system);
+        }
+        ["python3", "python"]
+    };
+    #[cfg(windows)]
+    let names = ["python.exe", "python3.exe"];
+    let paths = std::env::var_os("PATH")?;
+    names
+        .into_iter()
+        .flat_map(|name| {
+            std::env::split_paths(&paths)
+                .filter(|dir| dir.is_absolute())
+                .map(move |dir| dir.join(name))
+        })
+        .find(|path| valid_python(path))
+}
+
+#[cfg(test)]
+fn python_executable() -> &'static std::path::Path {
+    static PYTHON: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PYTHON.get_or_init(|| {
+        resolve_python(std::env::var_os("ARX_TEST_NETWORK_PROBE_PYTHON").map(Into::into))
+            .expect("Python 3 is required for witness script behavioral tests")
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn witness_python_rejects_relative_override() {
+    assert!(resolve_python(Some("python".into())).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn witness_python_rejects_missing_override() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(resolve_python(Some(dir.path().join("missing-python"))).is_none());
+}
+
+#[cfg(test)]
+async fn run_witness_interpreter(
+    program: &std::path::Path,
+    args: &[&str],
+    input: &str,
+    seconds: u64,
+) -> Vec<u8> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    assert!(program.is_absolute());
+    let output = tokio::time::timeout(std::time::Duration::from_secs(seconds), async {
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap_or_else(|e| panic!("could not start {}: {e}", program.display()));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .await
+            .unwrap();
+        child.wait_with_output().await.unwrap()
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} exceeded {seconds}s", program.display()));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+#[cfg(test)]
+async fn run_witness_python(mode: &str, meta: &str, input: &str) -> Vec<u8> {
+    run_witness_interpreter(
+        python_executable(),
+        &[
+            "-I",
+            "-B",
+            "-c",
+            include_str!("witness_script_fixture.py"),
+            mode,
+            meta,
+        ],
+        input,
+        60,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1337,7 +1482,57 @@ fn ubuntu_test_recipe_identity_binds_embedded_route_and_preserves_shared_goldens
     };
 
     let original = recipe.test_recipe_digest().unwrap();
-    assert_eq!(original, recipe.test_recipe_digest().unwrap());
+    let canonical = recipe
+        .render_test_seed(TEST_RECIPE_DIGEST_BUILD_ID, guest)
+        .unwrap();
+    let files = super::ubuntu_web::cidata_files(&canonical).unwrap();
+    let meta = std::str::from_utf8(files[5]).unwrap();
+    let user = std::str::from_utf8(files[6]).unwrap();
+    assert_eq!(meta, nocloud_meta(TEST_RECIPE_DIGEST_BUILD_ID));
+    let (_, base_user) = recipe
+        .seed_config(TEST_RECIPE_DIGEST_BUILD_ID, guest)
+        .unwrap();
+    assert_eq!(user, append_test_route_user_data(&base_user).unwrap());
+    let digest = |meta: &str, user: &str| {
+        recipe
+            .test_recipe_digest_with(
+                UbuntuRecipe::SERVICE,
+                UbuntuRecipe::FINALIZE,
+                UbuntuRecipe::NOCLOUD_PROFILE_PIN,
+                UbuntuRecipe::TEST_ROUTE_COMMAND,
+                DETACHED_HEALTH,
+                (meta, user),
+            )
+            .unwrap()
+    };
+    assert_eq!(digest(meta, user), original);
+    let route_block = user.strip_prefix(&base_user).unwrap();
+    let change_route_block =
+        |old: &str, new: &str| format!("{base_user}{}", route_block.replacen(old, new, 1));
+    let changed_header = change_route_block("    - |\n", "    - |-\n");
+    let changed_indent = change_route_block("      set -eu\n", "     set -eu\n");
+    let changed_meta = meta.replacen(
+        "local-hostname: arxcovo\n",
+        "local-hostname: arxcovo-alt\n",
+        1,
+    );
+    assert_ne!(digest(meta, &changed_header), original);
+    assert_ne!(digest(meta, &changed_indent), original);
+    assert_ne!(digest(&changed_meta, user), original);
+    let first = recipe.render_test_seed([0x11; 16], guest).unwrap();
+    let second = recipe.render_test_seed([0x22; 16], guest).unwrap();
+    assert_ne!(first, second);
+    let first = super::ubuntu_web::cidata_files(&first).unwrap();
+    let second = super::ubuntu_web::cidata_files(&second).unwrap();
+    assert_ne!(first[5], second[5]);
+    for (files, build_id) in [(first, [0x11; 16]), (second, [0x22; 16])] {
+        assert_eq!(files[5], nocloud_meta(build_id).as_bytes());
+        assert_eq!(files[6], user.as_bytes());
+        assert_eq!(
+            digest(meta, std::str::from_utf8(files[6]).unwrap()),
+            original
+        );
+    }
 
     // Changing one byte of the TEST route late command changes the TEST recipe
     // digest and 16-byte ID prefix.
@@ -1350,6 +1545,7 @@ fn ubuntu_test_recipe_identity_binds_embedded_route_and_preserves_shared_goldens
             UbuntuRecipe::NOCLOUD_PROFILE_PIN,
             &modified_route,
             DETACHED_HEALTH,
+            (meta, user),
         )
         .unwrap();
     assert_ne!(with_changed_route, original);
@@ -1383,6 +1579,7 @@ fn ubuntu_test_recipe_identity_binds_embedded_route_and_preserves_shared_goldens
                 UbuntuRecipe::NOCLOUD_PROFILE_PIN,
                 UbuntuRecipe::TEST_ROUTE_COMMAND,
                 DETACHED_HEALTH,
+                (meta, user),
             )
             .unwrap(),
         original
@@ -1400,6 +1597,7 @@ fn ubuntu_test_recipe_identity_binds_embedded_route_and_preserves_shared_goldens
                 alt_profile,
                 UbuntuRecipe::TEST_ROUTE_COMMAND,
                 DETACHED_HEALTH,
+                (meta, user),
             )
             .unwrap(),
         original
@@ -1413,6 +1611,7 @@ fn ubuntu_test_recipe_identity_binds_embedded_route_and_preserves_shared_goldens
                 UbuntuRecipe::NOCLOUD_PROFILE_PIN,
                 UbuntuRecipe::TEST_ROUTE_COMMAND,
                 &alt_health,
+                (meta, user),
             )
             .unwrap(),
         original
@@ -1487,7 +1686,6 @@ async fn arxnet3_witness_seed_script_behavior_with_fake_sockets_and_tools() {
     use crate::vm::{guest::network_probe::witness_response, qmp::ChannelError};
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
-    use std::process::{Command, Stdio};
 
     let nonce = [0xab; 16];
     let tcp: [SocketAddr; 3] = [
@@ -1512,34 +1710,8 @@ async fn arxnet3_witness_seed_script_behavior_with_fake_sockets_and_tools() {
     })
     .to_string();
 
-    let mut child = Command::new(python_executable())
-        .args([
-            "-I",
-            "-B",
-            "-c",
-            include_str!("witness_script_fixture.py"),
-            "arxnet3",
-            &meta,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Python 3 is required for witness script behavioral tests");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(emitted.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let frames: BTreeMap<String, String> = serde_json::from_slice(&output.stdout).unwrap();
+    let stdout = run_witness_python("arxnet3", &meta, &emitted).await;
+    let frames: BTreeMap<String, String> = serde_json::from_slice(&stdout).unwrap();
 
     // Feed the exact emitted ARXNET3 frames into Rust's witness_response parser.
     let reachable = witness_response(frames["reachable"].as_bytes(), &nonce)
@@ -1633,10 +1805,9 @@ async fn arxnet3_witness_seed_script_behavior_with_fake_sockets_and_tools() {
 }
 
 #[cfg(test)]
-#[test]
-fn installed_ubuntu_witness_script_behavior_with_fake_sockets_and_tools() {
+#[tokio::test]
+async fn installed_ubuntu_witness_script_behavior_with_fake_sockets_and_tools() {
     use std::net::SocketAddr;
-    use std::process::{Command, Stdio};
 
     let nonce = [0xcd; 16];
     let tcp: [SocketAddr; 3] = [
@@ -1654,23 +1825,7 @@ fn installed_ubuntu_witness_script_behavior_with_fake_sockets_and_tools() {
     let shell_script = installed_witness_script_for(nonce, tcp, udp, dns).unwrap();
     #[cfg(unix)]
     {
-        let mut sh = Command::new("sh")
-            .arg("-n")
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        sh.stdin
-            .take()
-            .unwrap()
-            .write_all(shell_script.as_bytes())
-            .unwrap();
-        let res = sh.wait_with_output().unwrap();
-        assert!(
-            res.status.success(),
-            "sh -n failed: {}",
-            String::from_utf8_lossy(&res.stderr)
-        );
+        run_witness_interpreter(std::path::Path::new("/bin/sh"), &["-n"], &shell_script, 15).await;
     }
 
     let python_body = shell_script
@@ -1686,30 +1841,5 @@ fn installed_ubuntu_witness_script_behavior_with_fake_sockets_and_tools() {
     })
     .to_string();
 
-    let mut child = Command::new(python_executable())
-        .args([
-            "-I",
-            "-B",
-            "-c",
-            include_str!("witness_script_fixture.py"),
-            "installed",
-            &meta,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Python 3 is required for installed witness script behavioral tests");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(python_body.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    run_witness_python("installed", &meta, python_body).await;
 }

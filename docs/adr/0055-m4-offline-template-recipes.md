@@ -69,13 +69,14 @@ static-web and Compose seeds are unaffected. The Ubuntu TEST qualification seed
 (`render_test_seed` / `write_test_seed`) appends one installer-side late command
 that writes `/target/etc/netplan/60-arxcovo-test.yaml` with DHCPv4 and the
 guest-only default route via `10.0.2.2` without rewriting
-`00-installer-config.yaml`. The sealed Ubuntu TEST recipe identity shared by
-the collector and preflight projection binds `UbuntuRecipe::ID`, the seven
-external asset pins, and the embedded TEST recipe content (`SERVICE`,
-`FINALIZE`, `NOCLOUD_PROFILE_PIN`, `TEST_ROUTE_COMMAND`, and
-`DETACHED_HEALTH`), so a TEST route edit alters the TEST recipe identity while
-leaving the shared base, static-web, and Compose seeds and recipe digests
-unchanged. Windows writes the same route for the NetKVM NIC
+`00-installer-config.yaml`. The collector (`run_ubuntu`) and preflight projection
+(`project_recipes`) both call `ubuntu_identity`, which uses `test_recipe_digest`.
+In the `arxcovo.recipe.ubuntu-test.v2` domain, the digest binds `UbuntuRecipe::ID`,
+the seven external asset pins, `SERVICE`, `FINALIZE`, `TEST_ROUTE_COMMAND`,
+`DETACHED_HEALTH`, the canonical NoCloud meta-data and rendered TEST user-data
+bodies, and `NOCLOUD_PROFILE_PIN`. Canonical meta-data uses a 16-byte zero build
+ID. Each live build ID changes the staged ISO while preserving the recipe identity.
+Windows writes the same route for the NetKVM NIC
 from the privileged provisioning step. The installed probes require an active
 route through that gateway. Egress remains subject to the sealed slirp
 `restrict=on` policy and the host-side witnesses. The owner-host behavior is

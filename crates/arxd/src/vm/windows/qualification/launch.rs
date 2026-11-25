@@ -2209,7 +2209,15 @@ foreach ($case in @(
 "#
         );
 
-        let mut check = tokio::process::Command::new("powershell.exe")
+        let powershell = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
+        )
+        .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        assert!(
+            powershell.is_absolute(),
+            "expected absolute Windows PowerShell path"
+        );
+        let mut check = tokio::process::Command::new(powershell)
             .args([
                 "-NoLogo",
                 "-NoProfile",
