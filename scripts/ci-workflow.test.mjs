@@ -38,6 +38,13 @@ const hostedC14Step = `name: Hosted C14 target-authorized delegated build
 function assertHostedC14Quarantine(workflowText) {
   const keys = workflowText.match(/^[ \t]*continue-on-error\s*:\s*\S+/gm) ?? [];
   assert.deepEqual(keys, ['        continue-on-error: true']);
+  // Whole-workflow token guard: exactly one spelling anywhere (quoted, flow-style or any case),
+  // it sits inside the single exact C14 step, and no quoted mapping key (which could hide an
+  // escaped spelling) exists anywhere in the workflow.
+  assert.equal((workflowText.match(/continue-on-error/gi) ?? []).length, 1);
+  assert.equal(workflowText.split(hostedC14Step).length, 2);
+  assert.equal(workflowText.split(hostedC14Step).join('').includes('continue-on-error'), false);
+  assert.doesNotMatch(workflowText, /^[ \t]*(?:-[ \t]+)?["'][^\n]*["'][ \t]*:/m);
   const parsed = Object.fromEntries([...workflowText.split('\njobs:\n')[1].matchAll(/^ {2}(\w+):\n([\s\S]*?)(?=^ {2}\w+:\n|$(?![\s\S]))/gm)].map(([, id, body]) => [id, body]));
   const bodies = ['rust', 'ui', 'verify'].flatMap(id => parsed[id].split('    steps:\n')[1].trimEnd().split(/^ {6}- /m).slice(1).map(step => step.trimEnd()));
   const quarantined = bodies.filter(step => step.startsWith('name: Hosted C14 target-authorized delegated build\n'));
@@ -81,6 +88,18 @@ test('hosted C14 quarantine cannot widen past that single step', () => {
     workflow.replace(/ {10}echo "Hosted C14 target-authorized delegated build quarantined single case:.*\n/, ''),
     workflow.replace('timeout-minutes: 2\n        continue-on-error: true', 'timeout-minutes: 9\n        continue-on-error: true'),
     workflow.replace(probe, `# ${probe}`),
+    workflow.replace(
+      '      - name: Hosted C16 live three-container acceptance\n',
+      '      -\n        "continue-on-error": true\n        name: Extra\n        run: "true"\n      - name: Hosted C16 live three-container acceptance\n',
+    ),
+    workflow.replace(
+      '      - name: Hosted C16 live three-container acceptance\n',
+      '      - name: Hosted C16 live three-container acceptance\n        "continue\\x2don-error": true\n',
+    ),
+    workflow.replace(
+      '      - name: Hosted C16 live three-container acceptance\n',
+      '      - name: Hosted C16 live three-container acceptance\n        Continue-On-Error: true\n',
+    ),
   ];
   for (const mutant of mutants) {
     assert.notEqual(mutant, workflow);
