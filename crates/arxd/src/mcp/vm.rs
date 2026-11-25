@@ -15785,26 +15785,17 @@ pub(crate) mod tests {
         }
     }
 
-    async fn setup_compose_backup_project(
+    fn enroll_backup_project(
         h: &Harness,
-        a: &Client,
-        key_base: u64,
+        vm_id: Id,
+        project: &str,
+        release_id: Id,
         max_bytes: u64,
-    ) -> (
-        Value,
-        Id,
-        Id,
-        compose::Target,
-        tempfile::TempDir,
-        Arc<compose_backup::ManagedBackupDir>,
-    ) {
+    ) -> (compose::Target, Id) {
         use crate::store::vm::compose as db;
         use arx_guest::compose as guest;
 
-        let (vm, _) = enrolled(h, a, key_base).await;
-        let vm_id = parse_id(vm.as_str().unwrap()).unwrap();
-        let project = "calm-life";
-        let release_id = [0x61; 16];
+        let vm = hex::encode(vm_id);
         let enrollment: compose::ReleaseInput = serde_json::from_value(json!({
             "vm_id": vm,
             "release_id": hex::encode(release_id),
@@ -15855,6 +15846,26 @@ pub(crate) mod tests {
             .enroll_compose_backup_target(vm_id, project, "data", "calm-life.sqlite3", max_bytes)
             .unwrap();
 
+        (target, generation)
+    }
+
+    async fn setup_compose_backup_project(
+        h: &Harness,
+        a: &Client,
+        key_base: u64,
+        max_bytes: u64,
+    ) -> (
+        Value,
+        Id,
+        Id,
+        compose::Target,
+        tempfile::TempDir,
+        Arc<compose_backup::ManagedBackupDir>,
+    ) {
+        let (vm, _) = enrolled(h, a, key_base).await;
+        let vm_id = parse_id(vm.as_str().unwrap()).unwrap();
+        let (target, generation) =
+            enroll_backup_project(h, vm_id, "calm-life", [0x61; 16], max_bytes);
         let backup_root = backup_fixture_root();
         let managed = Arc::new(
             compose_backup::ManagedBackupDir::new(backup_root.path(), h.temp.path(), None).unwrap(),
@@ -15930,14 +15941,474 @@ pub(crate) mod tests {
         (bytes, meta.digest)
     }
 
-    #[tokio::test]
-    async fn compose_backup_wal_end_to_end_restore_retention_cap_and_delete_authority() {
+    async fn backup_test_peer(h: &Harness, vm: Id, generation: Id, boot: u64) -> DuplexStream {
+        let (host_io, mut peer) = tokio::io::duplex(256 * 1024);
+        let supervisor = h.supervisor();
+        let (channel, ()) = tokio::join!(
+            crate::vm::guest::ComposeChannel::negotiate(host_io, boot, &supervisor.cancel),
+            fake_compose_hello(&mut peer, boot)
+        );
+        supervisor
+            .controller
+            .compose_store()
+            .transact(|tx| crate::store::vm::compose::register_boot(tx, vm, generation, boot))
+            .unwrap();
+        supervisor
+            .compose_backup
+            .attach(
+                vm,
+                compose_backup::BackupSession::new(generation, channel.unwrap()),
+            )
+            .unwrap();
+        peer
+    }
+
+    async fn serve_backup_payloads(
+        mut peer: DuplexStream,
+        boot: u64,
+        mut payloads: std::collections::VecDeque<(Vec<u8>, String)>,
+        releases: Arc<AtomicU64>,
+    ) {
         use arx_guest::compose::{
             ComposeRequest as Req, ComposeResponse as Resp, OperationKind, OperationStage,
             OperationState, OperationView, RejectCode, encode_base64,
         };
         use arx_guest::compose_backup::{BACKUP_CHUNK_BYTES, chunk_count};
 
+        let mut active: Option<(String, Vec<u8>, String)> = None;
+        loop {
+            use tokio::io::AsyncReadExt;
+            let Ok(len) = peer.read_u32().await else {
+                break;
+            };
+            let mut buf = vec![0; len as usize];
+            if peer.read_exact(&mut buf).await.is_err() {
+                break;
+            }
+            let req: Req = serde_json::from_slice(&buf).unwrap();
+            match req {
+                Req::ComposeOperation { id, operation_id } => {
+                    let resp = match &active {
+                        Some((op, _, _)) if *op == operation_id => Resp::ComposeOperationState {
+                            id,
+                            operation: OperationView {
+                                operation_id,
+                                kind: OperationKind::Backup,
+                                project_id: "calm-life".into(),
+                                revision: 1,
+                                state: OperationState::Succeeded,
+                                stage: OperationStage::Settled,
+                                failure: None,
+                                restored_previous: false,
+                            },
+                        },
+                        _ => Resp::ComposeRejected {
+                            id,
+                            code: RejectCode::UnknownOperation,
+                            rule: None,
+                        },
+                    };
+                    fake_compose_reply(&mut peer, resp).await;
+                }
+                Req::ComposeBackupBegin {
+                    id,
+                    operation_id,
+                    generation: g,
+                    project_id,
+                    volume,
+                    database,
+                    ..
+                } => {
+                    assert_eq!(g, boot);
+                    assert_eq!(project_id, "calm-life");
+                    assert_eq!(volume, "data");
+                    assert_eq!(database, "calm-life.sqlite3");
+                    let (data, digest) = payloads.pop_front().unwrap();
+                    active = Some((operation_id.clone(), data, digest));
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeOperationState {
+                            id,
+                            operation: OperationView {
+                                operation_id,
+                                kind: OperationKind::Backup,
+                                project_id,
+                                revision: 1,
+                                state: OperationState::Succeeded,
+                                stage: OperationStage::Settled,
+                                failure: None,
+                                restored_previous: false,
+                            },
+                        },
+                    )
+                    .await;
+                }
+                Req::ComposeBackupMeta { id, operation_id } => {
+                    let (op, data, digest) = active.as_ref().unwrap();
+                    assert_eq!(op, &operation_id);
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeBackupReady {
+                            id,
+                            operation_id,
+                            project_id: "calm-life".into(),
+                            revision: 1,
+                            total_bytes: data.len() as u64,
+                            chunks: chunk_count(data.len() as u64).unwrap(),
+                            digest: digest.clone(),
+                        },
+                    )
+                    .await;
+                }
+                Req::ComposeBackupChunk {
+                    id,
+                    operation_id,
+                    index,
+                } => {
+                    let (op, data, _) = active.as_ref().unwrap();
+                    assert_eq!(op, &operation_id);
+                    let start = index as usize * BACKUP_CHUNK_BYTES;
+                    let end = (start + BACKUP_CHUNK_BYTES).min(data.len());
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeBackupData {
+                            id,
+                            operation_id,
+                            index,
+                            data: encode_base64(&data[start..end]),
+                        },
+                    )
+                    .await;
+                }
+                Req::ComposeBackupRelease { id, operation_id } => {
+                    if active
+                        .as_ref()
+                        .is_some_and(|(op, _, _)| op == &operation_id)
+                    {
+                        active = None;
+                    }
+                    releases.fetch_add(1, Ordering::SeqCst);
+                    fake_compose_reply(
+                        &mut peer,
+                        Resp::ComposeBackupReleased {
+                            id,
+                            operation_id,
+                            removed: true,
+                        },
+                    )
+                    .await;
+                }
+                _ => panic!("unexpected compose request"),
+            }
+        }
+    }
+
+    fn admit_test_backup(
+        h: &Harness,
+        target: &compose::Target,
+        nonce: u64,
+    ) -> compose_backup::BackupIntent {
+        let supervisor = h.supervisor();
+        let session = supervisor.compose_backup.session(target.vm).unwrap();
+        let now = supervisor.controller.compose_now().unwrap();
+        supervisor
+            .controller
+            .compose_store()
+            .transact(|tx| {
+                Ok(crate::store::vm::compose::admit_backup(
+                    tx,
+                    "alpha",
+                    target,
+                    RequestId::parse(&key(nonce)).unwrap(),
+                    session.generation,
+                    session.wire_boot,
+                    now,
+                    |_, _| Ok(Ok(())),
+                )?
+                .unwrap())
+            })
+            .unwrap()
+    }
+
+    fn replay_test_backup(h: &Harness, nonce: u64) -> compose_backup::BackupIntent {
+        h.supervisor()
+            .controller
+            .compose_store()
+            .transact(|tx| {
+                crate::store::vm::compose::backup_replay(
+                    tx,
+                    "alpha",
+                    RequestId::parse(&key(nonce)).unwrap().key,
+                )
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn drive_test_backup(
+        h: &Harness,
+        target: &compose::Target,
+        nonce: u64,
+        cancel: &Shutdown,
+    ) -> Result<()> {
+        let supervisor = h.supervisor();
+        supervisor
+            .compose_backup
+            .drive(
+                &supervisor.controller,
+                "alpha",
+                RequestId::parse(&key(nonce)).unwrap().key,
+                target,
+                supervisor.compose_backup.session(target.vm).unwrap(),
+                cancel,
+            )
+            .await
+    }
+
+    async fn assert_no_queued_frame(peer: &mut DuplexStream) {
+        tokio::select! {
+            biased;
+            byte = peer.read_u8() => panic!("unexpected guest traffic or channel closure: {byte:?}"),
+            () = std::future::ready(()) => (),
+        }
+    }
+
+    #[tokio::test]
+    async fn compose_backup_queued_project_releases_lease_on_deadline_and_cancel() {
+        use arx_guest::compose::{ComposeRequest as Req, ComposeResponse as Resp, RejectCode};
+        use compose_backup::{BackupOpStatus, BackupRecordState};
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let client = h.client(0).await;
+        let cap = 256 * 1024;
+        let (_, vm, generation, first, _root, _managed) =
+            setup_compose_backup_project(&h, &client, 5700, cap).await;
+        let (queued, _) = enroll_backup_project(&h, vm, "queued-app", [0x62; 16], cap);
+        let mut peer = backup_test_peer(&h, vm, generation, 5701).await;
+        let supervisor = h.supervisor();
+        let disk = || {
+            supervisor
+                .controller
+                .compose_store()
+                .transact(|tx| crate::store::vm::disk_bytes(tx))
+                .unwrap()
+                .unwrap()
+        };
+        let initial_disk = disk();
+        let holder = admit_test_backup(&h, &first, 5710);
+        {
+            let active = drive_test_backup(&h, &first, 5710, &supervisor.cancel);
+            tokio::pin!(active);
+            let query = tokio::select! {
+                result = &mut active => panic!("first backup settled before query: {result:?}"),
+                request = fake_compose_read(&mut peer) => request,
+            };
+            let Req::ComposeOperation { id, operation_id } = query else {
+                panic!("expected holder query")
+            };
+            assert_eq!(operation_id, hex::encode(holder.id));
+
+            // Keep the first driver's query unanswered while both queued operations finish.
+            for (nonce, shutdown) in [(5711, false), (5712, true)] {
+                supervisor.compose_backup.timeouts.lock().unwrap().absolute = if shutdown {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::from_millis(200)
+                };
+                let pending = admit_test_backup(&h, &queued, nonce);
+                assert_eq!(pending.host_staging_charge, cap);
+                assert_eq!(disk(), initial_disk + 2 * cap);
+                let cancel = Shutdown::default();
+                let waiting = drive_test_backup(&h, &queued, nonce, &cancel);
+                tokio::pin!(waiting);
+                tokio::select! {
+                    biased;
+                    result = &mut waiting => panic!("queued operation did not wait: {result:?}"),
+                    () = std::future::ready(()) => (),
+                }
+                if shutdown {
+                    cancel.cancel();
+                }
+                tokio::time::timeout(Duration::from_secs(3), waiting)
+                    .await
+                    .expect("queued backup held its lease")
+                    .unwrap();
+                let done = replay_test_backup(&h, nonce);
+                assert_eq!(done.status, BackupOpStatus::Interrupted);
+                assert_eq!(done.backup_state, BackupRecordState::Cleaned);
+                assert_eq!(done.host_staging_charge, 0);
+                assert!(!done.sent);
+                assert_eq!(disk(), initial_disk + cap);
+                assert_no_queued_frame(&mut peer).await;
+            }
+            fake_compose_reply(
+                &mut peer,
+                Resp::ComposeRejected {
+                    id,
+                    code: RejectCode::Busy,
+                    rule: None,
+                },
+            )
+            .await;
+            active.await.unwrap();
+        }
+        assert_eq!(disk(), initial_disk);
+        drop(client);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compose_backup_postpublication_commit_failure_and_witness_retry_keep_charge() {
+        use compose_backup::{BackupOpStatus, BackupRecordState};
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let client = h.client(0).await;
+        let cap = 256 * 1024;
+        let (vm_value, vm, generation, target, root, managed) =
+            setup_compose_backup_project(&h, &client, 5800, cap).await;
+        let source = tempfile::tempdir().unwrap();
+        let payload = make_wal_sqlite_bytes(source.path(), "commit", &[("entry", 1)], 0);
+        let peer = backup_test_peer(&h, vm, generation, 5801).await;
+        let task = tokio::spawn(serve_backup_payloads(
+            peer,
+            5801,
+            [payload.clone(), payload].into(),
+            Arc::new(AtomicU64::new(0)),
+        ));
+        let supervisor = h.supervisor();
+        let store = supervisor.controller.compose_store();
+        let disk = || {
+            store
+                .transact(|tx| crate::store::vm::disk_bytes(tx))
+                .unwrap()
+                .unwrap()
+        };
+        let baseline = disk();
+        for (nonce, retry) in [(5810, false), (5811, true)] {
+            let intent = admit_test_backup(&h, &target, nonce);
+            let staging = root
+                .path()
+                .join("staging")
+                .join(format!("{}.part", hex::encode(intent.id)));
+            let settled = managed.settled_path(intent.backup_id).unwrap();
+            store.transact(|tx| {
+                tx.execute_batch("CREATE TEMP TRIGGER reject_commit BEFORE UPDATE OF state ON vm_compose_backups
+                    WHEN NEW.state='settled' BEGIN SELECT RAISE(ABORT,'fixture commit failure'); END;")?;
+                if retry {
+                    tx.execute_batch("CREATE TEMP TRIGGER reject_failure BEFORE UPDATE OF status ON vm_compose_backup_ops
+                        WHEN NEW.status='interrupted' BEGIN SELECT RAISE(ABORT,'fixture settlement failure'); END;")?;
+                }
+                Ok(())
+            }).unwrap();
+            assert!(
+                drive_test_backup(&h, &target, nonce, &supervisor.cancel)
+                    .await
+                    .is_err()
+            );
+            store
+                .transact(|tx| {
+                    Ok(tx.execute_batch(
+                        "DROP TRIGGER reject_commit; DROP TRIGGER IF EXISTS reject_failure",
+                    )?)
+                })
+                .unwrap();
+            assert!(staging.is_file() && settled.is_file());
+            if retry {
+                let pending = replay_test_backup(&h, nonce);
+                assert_eq!(pending.status, BackupOpStatus::Pending);
+                assert!(pending.has_staging_witness);
+                assert_eq!(pending.host_staging_charge, cap);
+                // A retry during shutdown must honor the persisted witness before any clean exit.
+                let cancel = Shutdown::default();
+                cancel.cancel();
+                drive_test_backup(&h, &target, nonce, &cancel)
+                    .await
+                    .unwrap();
+            }
+            let terminal = replay_test_backup(&h, nonce);
+            assert_eq!(terminal.status, BackupOpStatus::Interrupted);
+            assert_eq!(
+                terminal.failure.as_deref(),
+                Some("attribution_commit_failed")
+            );
+            assert_eq!(terminal.backup_state, BackupRecordState::PartialUncertain);
+            assert_eq!(terminal.host_staging_charge, cap);
+            assert_eq!(disk(), baseline + cap);
+            assert!(settled.is_file() && staging.is_file());
+            assert_eq!(
+                supervisor.compose_backup.reconcile_partials(store).unwrap(),
+                1
+            );
+            assert!(!settled.exists() && !staging.exists());
+            assert_eq!(disk(), baseline);
+            let response = call(
+                &client,
+                "compose_backup",
+                json!({"vm_id":vm_value,"project_id":target.project,"request_id":key(nonce)}),
+            )
+            .await;
+            assert_eq!(response["state"], "interrupted");
+            assert!(response.get("backup_id").is_none());
+        }
+        task.abort();
+        drop(client);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compose_backup_refuses_guest_named_unknown_and_pending_owners() {
+        use arx_guest::compose::{ComposeRequest as Req, ComposeResponse as Resp, RejectCode};
+        let mut h = Harness::start_with_web(false, false, true).await;
+        let client = h.client(0).await;
+        let cap = 256 * 1024;
+        let (_, vm, generation, target, _root, _managed) =
+            setup_compose_backup_project(&h, &client, 5900, cap).await;
+        let mut peer = backup_test_peer(&h, vm, generation, 5901).await;
+        let supervisor = h.supervisor();
+        supervisor.compose_backup.timeouts.lock().unwrap().idle = Duration::from_secs(1);
+        for (nonce, unknown) in [(5910, true), (5911, false)] {
+            let intent = admit_test_backup(&h, &target, nonce);
+            let owner = if unknown { [0xA5; 16] } else { intent.id };
+            let responder = async {
+                let Req::ComposeOperation { id, .. } = fake_compose_read(&mut peer).await else {
+                    panic!("expected query")
+                };
+                fake_compose_reply(
+                    &mut peer,
+                    Resp::ComposeRejected {
+                        id,
+                        code: RejectCode::UnknownOperation,
+                        rule: None,
+                    },
+                )
+                .await;
+                let Req::ComposeBackupBegin { id, .. } = fake_compose_read(&mut peer).await else {
+                    panic!("expected begin")
+                };
+                fake_compose_reply(
+                    &mut peer,
+                    Resp::ComposeBackupOccupied {
+                        id,
+                        operation_id: hex::encode(owner),
+                    },
+                )
+                .await;
+            };
+            let (result, ()) = tokio::join!(
+                drive_test_backup(&h, &target, nonce, &supervisor.cancel),
+                responder
+            );
+            result.unwrap();
+            let done = replay_test_backup(&h, nonce);
+            assert_eq!(done.failure.as_deref(), Some("backup_staging_occupied"));
+            assert_eq!(done.status, compose_backup::BackupOpStatus::Failed);
+            assert_no_queued_frame(&mut peer).await;
+        }
+        drop(client);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compose_backup_wal_end_to_end_restore_retention_cap_and_delete_authority() {
+        use arx_guest::compose_backup::BACKUP_CHUNK_BYTES;
         let mut h = Harness::start_with_web(false, false, true).await;
         let a = h.client(0).await;
         let max_bytes = 2 * 1024 * 1024;
@@ -15959,163 +16430,20 @@ pub(crate) mod tests {
         // Backup #1 genuinely spans multiple 16 KiB serial chunks.
         assert!(bytes1.len() > BACKUP_CHUNK_BYTES);
 
-        let boot = 5101u64;
-        let (host_io, mut peer) = tokio::io::duplex(256 * 1024);
-        let payloads = Arc::new(Mutex::new(std::collections::VecDeque::from([
-            (bytes1.clone(), digest1.clone()),
-            (bytes2.clone(), digest2.clone()),
-        ])));
-        let peer_payloads = payloads.clone();
+        let boot = 5101;
+        let peer = backup_test_peer(&h, vm_id, generation, boot).await;
         let releases_seen = Arc::new(AtomicU64::new(0));
-        let peer_releases = releases_seen.clone();
-        let guest_task = tokio::spawn(async move {
-            fake_compose_hello(&mut peer, boot).await;
-            let mut active: Option<(String, Vec<u8>, String)> = None;
-            loop {
-                use tokio::io::AsyncReadExt;
-                let Ok(len) = peer.read_u32().await else {
-                    break;
-                };
-                let mut buf = vec![0; len as usize];
-                if peer.read_exact(&mut buf).await.is_err() {
-                    break;
-                }
-                let req: Req = serde_json::from_slice(&buf).unwrap();
-                match req {
-                    Req::ComposeOperation { id, operation_id } => {
-                        let resp = match &active {
-                            Some((op, _, _)) if *op == operation_id => {
-                                Resp::ComposeOperationState {
-                                    id,
-                                    operation: OperationView {
-                                        operation_id,
-                                        kind: OperationKind::Backup,
-                                        project_id: "calm-life".into(),
-                                        revision: 1,
-                                        state: OperationState::Succeeded,
-                                        stage: OperationStage::Settled,
-                                        failure: None,
-                                        restored_previous: false,
-                                    },
-                                }
-                            }
-                            _ => Resp::ComposeRejected {
-                                id,
-                                code: RejectCode::UnknownOperation,
-                                rule: None,
-                            },
-                        };
-                        fake_compose_reply(&mut peer, resp).await;
-                    }
-                    Req::ComposeBackupBegin {
-                        id,
-                        operation_id,
-                        generation: g,
-                        project_id,
-                        volume,
-                        database,
-                        ..
-                    } => {
-                        assert_eq!(g, boot);
-                        assert_eq!(project_id, "calm-life");
-                        assert_eq!(volume, "data");
-                        assert_eq!(database, "calm-life.sqlite3");
-                        let (data, digest) = peer_payloads.lock().unwrap().pop_front().unwrap();
-                        active = Some((operation_id.clone(), data, digest));
-                        fake_compose_reply(
-                            &mut peer,
-                            Resp::ComposeOperationState {
-                                id,
-                                operation: OperationView {
-                                    operation_id,
-                                    kind: OperationKind::Backup,
-                                    project_id,
-                                    revision: 1,
-                                    state: OperationState::Succeeded,
-                                    stage: OperationStage::Settled,
-                                    failure: None,
-                                    restored_previous: false,
-                                },
-                            },
-                        )
-                        .await;
-                    }
-                    Req::ComposeBackupMeta { id, operation_id } => {
-                        let (op, data, digest) = active.as_ref().unwrap();
-                        assert_eq!(op, &operation_id);
-                        fake_compose_reply(
-                            &mut peer,
-                            Resp::ComposeBackupReady {
-                                id,
-                                operation_id,
-                                project_id: "calm-life".into(),
-                                revision: 1,
-                                total_bytes: data.len() as u64,
-                                chunks: chunk_count(data.len() as u64).unwrap(),
-                                digest: digest.clone(),
-                            },
-                        )
-                        .await;
-                    }
-                    Req::ComposeBackupChunk {
-                        id,
-                        operation_id,
-                        index,
-                    } => {
-                        let (op, data, _) = active.as_ref().unwrap();
-                        assert_eq!(op, &operation_id);
-                        let start = index as usize * BACKUP_CHUNK_BYTES;
-                        let end = (start + BACKUP_CHUNK_BYTES).min(data.len());
-                        fake_compose_reply(
-                            &mut peer,
-                            Resp::ComposeBackupData {
-                                id,
-                                operation_id,
-                                index,
-                                data: encode_base64(&data[start..end]),
-                            },
-                        )
-                        .await;
-                    }
-                    Req::ComposeBackupRelease { id, operation_id } => {
-                        if active
-                            .as_ref()
-                            .is_some_and(|(op, _, _)| op == &operation_id)
-                        {
-                            active = None;
-                        }
-                        peer_releases.fetch_add(1, Ordering::SeqCst);
-                        fake_compose_reply(
-                            &mut peer,
-                            Resp::ComposeBackupReleased {
-                                id,
-                                operation_id,
-                                removed: true,
-                            },
-                        )
-                        .await;
-                    }
-                    _ => panic!("unexpected compose request"),
-                }
-            }
-        });
-
-        let channel =
-            crate::vm::guest::ComposeChannel::negotiate(host_io, boot, &h.supervisor().cancel)
-                .await
-                .unwrap();
+        let guest_task = tokio::spawn(serve_backup_payloads(
+            peer,
+            boot,
+            [
+                (bytes1.clone(), digest1.clone()),
+                (bytes2.clone(), digest2.clone()),
+            ]
+            .into(),
+            releases_seen.clone(),
+        ));
         let store = h.supervisor().controller.compose_store();
-        store
-            .transact(|tx| crate::store::vm::compose::register_boot(tx, vm_id, generation, boot))
-            .unwrap();
-        h.supervisor()
-            .compose_backup
-            .attach(
-                vm_id,
-                compose_backup::BackupSession::new(generation, channel),
-            )
-            .unwrap();
-
         let disk_before = store
             .transact(|tx| crate::store::vm::disk_bytes(tx))
             .unwrap()
