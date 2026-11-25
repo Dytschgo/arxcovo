@@ -1,5 +1,6 @@
 //! One consumed foreground permit per checked process creation.
 
+use super::recipe::{QualifiedBoot, TEST_JOB_MEMORY};
 use super::*;
 use crate::vm::qualification_record::Hash;
 use crate::vm::{ArtifactSlot, Id, PairSlots};
@@ -16,13 +17,33 @@ pub(crate) struct WorkspaceBinding {
 /// slot file. The issuer owns reservation and creation of that file.
 pub(crate) struct ProductionWorkspace {
     binding: WorkspaceBinding,
-    root: PathPin,
-    lease: File,
+    pub(super) root: PathPin,
+    pub(super) lease: File,
 }
 
 impl ProductionWorkspace {
     pub(crate) fn binding(&self) -> WorkspaceBinding {
         self.binding
+    }
+
+    pub(super) fn pin_slot(
+        &self,
+        slot: ArtifactSlot,
+        identity: FileIdentity,
+        mutable: bool,
+    ) -> Result<PathPin, NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        let pin = PathPin::open(&slot_path(&self.root.path, slot)?, false, mutable)?;
+        if slot.generation != self.binding.generation
+            || pin.identity != identity
+            || pin.identity.volume != self.root.identity.volume
+            || !pin._ancestors.last().is_some_and(|parent| {
+                file_identity(parent, true).is_ok_and(|(id, _)| id == self.root.identity)
+            })
+        {
+            return Err(reason);
+        }
+        Ok(pin)
     }
 }
 
@@ -42,11 +63,11 @@ impl ForegroundQualification<'_> {
         )
     }
 
-    fn launch_live(&self, memory: usize) -> Result<Instant, NativeRefusal> {
+    pub(super) fn launch_live(&self, memory: usize) -> Result<Instant, NativeRefusal> {
         let captured = Instant::now();
         self.fresh()?;
         let held = &self.held;
-        if !current_console_idle(&held.token)? {
+        if !held.current_console_idle()? {
             return Err(NativeRefusal::OwnerActivityUnverified);
         }
         let (cpus, ram) = host_resources()?;
@@ -136,6 +157,7 @@ pub(crate) struct LaunchTarget<'a, 'plan> {
     pub cwd: &'a LocalPath,
     pub pair: Option<PairSlots>,
     pub installer: Option<InstallerStage>,
+    pub recipe: Option<crate::vm::qualification_record::RecipeIdentity>,
     pub memory: usize,
     pub cpu_rate: u32,
 }
@@ -152,6 +174,7 @@ pub(crate) trait LaunchPermit {
 
 pub(crate) struct LaunchRequest<'a> {
     pub plan: CommandPlan<'a>,
+    pub boot_inputs: Option<&'a QualifiedBoot<'a>>,
     pub cwd: &'a LocalPath,
     pub workspace: &'a ProductionWorkspace,
     pub pair: Option<PairSlots>,
@@ -167,7 +190,8 @@ pub(crate) struct NativeLaunch<'a> {
     core: CheckedLaunchCore<'a>,
     qualification: &'a ForegroundQualification<'a>,
     binding: WorkspaceBinding,
-    pair: Option<(PairSlots, [FileIdentity; 2])>,
+    targets: ReleaseTargets,
+    serial: Option<&'a SerialName>,
     _offline: Option<&'a crate::vm::runtime::OfflineLease>,
     _authority: crate::vm::runtime::LaunchAuthority,
     memory: usize,
@@ -245,6 +269,7 @@ impl<'a> NativeLaunch<'a> {
     ) -> Result<Self, NativeRefusal> {
         let LaunchRequest {
             plan,
+            boot_inputs,
             cwd,
             workspace,
             pair,
@@ -267,8 +292,37 @@ impl<'a> NativeLaunch<'a> {
             memory,
             cpu_rate,
         )?;
+        match (kind, boot_inputs) {
+            (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(inputs))
+                if memory == TEST_JOB_MEMORY && cpu_rate == JOB_CPU_RATE =>
+            {
+                inputs.verify(
+                    workspace_binding,
+                    qualification.seal_sha256(),
+                    qualification.evidence().recipes,
+                    pair,
+                    cwd,
+                    &plan,
+                )?
+            }
+            (PlanKind::Inspect | PlanKind::InspectWritable | PlanKind::Mutate, None) => {}
+            _ => return Err(reason),
+        }
+        let pins = hold_plan_inputs(&plan)?;
+        let targets = match bound_pair {
+            Some((pair, ids)) => ReleaseTargets::Pair { pair, ids },
+            None => ReleaseTargets::Helper {
+                kind,
+                inputs: plan
+                    .inputs()
+                    .iter()
+                    .zip(&pins)
+                    .map(|((role, _), pin)| (*role, pin.identity))
+                    .collect(),
+            },
+        };
         let inputs = LaunchInputs {
-            pins: hold_plan_inputs(&plan)?,
+            pins,
             plan,
             cwd,
             workspace: WorkspaceCustody::production(&workspace.root, &workspace.lease)?,
@@ -293,6 +347,7 @@ impl<'a> NativeLaunch<'a> {
                     cwd,
                     pair,
                     installer,
+                    recipe: boot_inputs.map(QualifiedBoot::recipe_identity),
                     memory,
                     cpu_rate,
                 };
@@ -306,7 +361,8 @@ impl<'a> NativeLaunch<'a> {
             core,
             qualification,
             binding: workspace_binding,
-            pair: bound_pair,
+            targets,
+            serial: boot_inputs.map(QualifiedBoot::serial),
             _offline: offline,
             _authority,
             memory,
@@ -317,13 +373,13 @@ impl<'a> NativeLaunch<'a> {
 
     pub(crate) async fn boot(
         &mut self,
-        serial: &SerialName,
         cancel: &Shutdown,
         mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
         if self.core.kind != PlanKind::Boot {
             return Err(NativeRefusal::QualificationMissing);
         }
+        let serial = self.serial.ok_or(NativeRefusal::QualificationMissing)?;
         let io = self.io.take().ok_or(NativeRefusal::QualificationMissing)?;
         let outcome = self
             .core
@@ -404,45 +460,53 @@ impl<'a> NativeLaunch<'a> {
                     finalization: finalization.map(FinalizedPair),
                 })
             }
-            Err(BootFailure::Installer(failure, held)) => Ok(InstallerSettlement::Failed {
-                failure,
-                released: held.and_then(|held| self.release_proof(held)),
-            }),
+            Err(BootFailure::Installer(mut failure, held)) => {
+                let released = held.and_then(|held| self.release_proof(held));
+                if released.is_none() {
+                    failure.recovery = StopDisposition::ChargedQuarantine;
+                }
+                Ok(InstallerSettlement::Failed { failure, released })
+            }
             _ => Err(NativeRefusal::QualificationMissing),
         }
     }
 
     pub(crate) async fn run_helper(
-        &mut self,
+        mut self,
         cancel: &Shutdown,
         deadline: tokio::time::Instant,
         mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
         verify_release: impl FnOnce() -> bool + Send + 'static,
-    ) -> (Result<Vec<u8>, NativeRefusal>, StopDisposition) {
+    ) -> HelperSettlement<'a> {
         if !matches!(
             self.core.kind,
             PlanKind::Inspect | PlanKind::InspectWritable | PlanKind::Mutate
         ) {
-            return (
-                Err(NativeRefusal::QualificationMissing),
-                StopDisposition::ChargedQuarantine,
-            );
+            return HelperSettlement::quarantined(Err(NativeRefusal::QualificationMissing));
         }
         let Some(io) = self.io.take() else {
-            return (
-                Err(NativeRefusal::QualificationMissing),
-                StopDisposition::ChargedQuarantine,
-            );
+            return HelperSettlement::quarantined(Err(NativeRefusal::QualificationMissing));
         };
-        self.core
-            .helper(
+        let (output, release) = self
+            .core
+            .helper_held(
                 io,
                 cancel,
                 deadline,
                 || Ok(self.qualification.launch_live(self.memory)?.min(refresh()?)),
                 verify_release,
             )
-            .await
+            .await;
+        let (disposition, held) = release;
+        let released = held.and_then(|held| self.release_proof(held));
+        match released {
+            Some(released) => HelperSettlement {
+                output,
+                disposition,
+                released: Some(released),
+            },
+            None => HelperSettlement::quarantined(output),
+        }
     }
 
     /// Stop remains available across admission closure. Uncertain settlement
@@ -456,19 +520,19 @@ impl<'a> NativeLaunch<'a> {
         let qmp = self.live.take().map(|live| live.0);
         drop(self.io.take());
         let (disposition, held) = self.core.stop_held(qmp, cancel, verify_release).await;
-        let proof = held.and_then(|held| self.release_proof(held));
-        (disposition, proof)
+        match held.and_then(|held| self.release_proof(held)) {
+            Some(proof) => (disposition, Some(proof)),
+            None => (StopDisposition::ChargedQuarantine, None),
+        }
     }
 
     fn release_proof(&self, held: HeldWriters) -> Option<ReleasedGeneration<'a>> {
-        let (pair, ids) = self.pair?;
-        Some(ReleasedGeneration {
-            binding: self.binding,
-            pair,
-            ids,
-            _workspace: self.core.workspace,
-            _held: held,
-        })
+        ReleasedGeneration::checked(
+            self.binding,
+            self.targets.clone(),
+            self.core.workspace,
+            held,
+        )
     }
 }
 
@@ -481,14 +545,23 @@ fn check_permit(
         .ok_or(NativeRefusal::QualificationMissing)
 }
 
-fn check_pair(workspace: WorkspaceBinding, pair: PairSlots) -> Result<(), NativeRefusal> {
+pub(super) fn check_pair(
+    workspace: WorkspaceBinding,
+    pair: PairSlots,
+) -> Result<(), NativeRefusal> {
     (workspace.generation == pair.disk.generation
         && workspace.generation == pair.vars.generation
         && matches!(pair.disk.role, "disk" | "verification_overlay")
         && pair.vars.role == "vars"
-        && pair.disk.key != pair.vars.key)
-        .then_some(())
-        .ok_or(NativeRefusal::PathCustodyUnverified)
+        && pair.disk.key != pair.vars.key
+        && ![pair.disk.key, pair.vars.key].contains(&[0; 16]))
+    .then_some(())
+    .ok_or(NativeRefusal::PathCustodyUnverified)
+}
+
+pub(super) fn slot_path(root: &LocalPath, slot: ArtifactSlot) -> Result<LocalPath, NativeRefusal> {
+    root.join(&format!("{}-{}", slot.role, hex::encode(slot.key)))
+        .map_err(|_| NativeRefusal::PathCustodyUnverified)
 }
 
 fn hold_plan_inputs(plan: &CommandPlan<'_>) -> Result<Vec<PathPin>, NativeRefusal> {
@@ -514,9 +587,7 @@ fn pair_ids(
 ) -> Result<[FileIdentity; 2], NativeRefusal> {
     let reason = NativeRefusal::PathCustodyUnverified;
     let find = |role, slot: ArtifactSlot| {
-        let expected = root
-            .join(&format!("{}-{}", slot.role, hex::encode(slot.key)))
-            .map_err(|_| reason)?;
+        let expected = slot_path(root, slot)?;
         let artifact = plan
             .inputs()
             .iter()
@@ -552,6 +623,23 @@ pub(crate) enum InstallerSettlement<'a> {
     },
 }
 
+#[must_use = "the durable helper intent needs release or quarantine"]
+pub(crate) struct HelperSettlement<'a> {
+    pub output: Result<Vec<u8>, NativeRefusal>,
+    pub disposition: StopDisposition,
+    pub released: Option<ReleasedGeneration<'a>>,
+}
+
+impl HelperSettlement<'_> {
+    fn quarantined(output: Result<Vec<u8>, NativeRefusal>) -> Self {
+        Self {
+            output: output.and(Err(NativeRefusal::PathCustodyUnverified)),
+            disposition: StopDisposition::ChargedQuarantine,
+            released: None,
+        }
+    }
+}
+
 pub(crate) struct FinalizedPair(offline_read::ReleasedPair);
 
 impl FinalizedPair {
@@ -568,24 +656,83 @@ impl FinalizedPair {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[must_use = "settle only the generation and artifacts carried by this proof"]
 pub(crate) struct ReleasedGeneration<'a> {
     binding: WorkspaceBinding,
-    pair: PairSlots,
-    ids: [FileIdentity; 2],
+    targets: ReleaseTargets,
     _workspace: WorkspaceCustody<'a>,
     _held: HeldWriters,
 }
 
-impl ReleasedGeneration<'_> {
+#[derive(Clone)]
+enum ReleaseTargets {
+    Pair {
+        pair: PairSlots,
+        ids: [FileIdentity; 2],
+    },
+    Helper {
+        kind: PlanKind,
+        inputs: Vec<(ArtifactRole, FileIdentity)>,
+    },
+}
+
+impl<'a> ReleasedGeneration<'a> {
+    fn checked(
+        binding: WorkspaceBinding,
+        targets: ReleaseTargets,
+        workspace: WorkspaceCustody<'a>,
+        held: HeldWriters,
+    ) -> Option<Self> {
+        let expected_writers: Vec<_> = match &targets {
+            ReleaseTargets::Pair { ids, .. } => ids.to_vec(),
+            ReleaseTargets::Helper { inputs, .. } => inputs
+                .iter()
+                .filter_map(|(role, id)| role.writable().then_some(*id))
+                .collect(),
+        };
+        let guards = &held.1;
+        if guards.len() != expected_writers.len()
+            || expected_writers.iter().any(|id| {
+                !guards
+                    .iter()
+                    .any(|guard| file_identity(guard, false).is_ok_and(|(held, _)| held == *id))
+            })
+        {
+            return None;
+        }
+        Some(Self {
+            binding,
+            targets,
+            _workspace: workspace,
+            _held: held,
+        })
+    }
+
     pub(crate) fn matches(
         &self,
         workspace: WorkspaceBinding,
         pair: PairSlots,
         ids: [FileIdentity; 2],
     ) -> bool {
-        self.binding == workspace && self.pair == pair && self.ids == ids
+        self.binding == workspace
+            && matches!(
+                self.targets, ReleaseTargets::Pair { pair: held, ids: held_ids }
+                    if held == pair && held_ids == ids
+            )
+    }
+
+    pub(crate) fn matches_helper(
+        &self,
+        workspace: WorkspaceBinding,
+        kind: PlanKind,
+        inputs: &[(ArtifactRole, FileIdentity)],
+    ) -> bool {
+        self.binding == workspace
+            && matches!(
+                &self.targets, ReleaseTargets::Helper { kind: held, inputs: held_inputs }
+                    if *held == kind && held_inputs == inputs
+            )
     }
 }

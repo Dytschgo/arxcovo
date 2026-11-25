@@ -4,6 +4,7 @@
 //!
 //! Native observations here are **unverified on real hardware**.
 
+mod activity;
 mod boot;
 mod capacity;
 mod foreground;
@@ -18,8 +19,15 @@ mod paused;
 mod production;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use production::{
-    FinalizedPair, InstallerSettlement, LaunchPermit, LaunchPermitBinding, LaunchRequest,
-    LaunchTarget, NativeLaunch, ProductionWorkspace, ReleasedGeneration, WorkspaceBinding,
+    FinalizedPair, HelperSettlement, InstallerSettlement, LaunchPermit, LaunchPermitBinding,
+    LaunchRequest, LaunchTarget, NativeLaunch, ProductionWorkspace, ReleasedGeneration,
+    WorkspaceBinding,
+};
+mod recipe;
+#[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
+pub(crate) use recipe::{
+    BootReservation, InstallerReservation, QualifiedBoot, QualifiedBootPlan, StageTarget,
+    StagedInstaller,
 };
 mod schema;
 mod sink;
@@ -389,7 +397,8 @@ struct Held {
     trial: PathPin,
     _backing: PathPin,
     volumes: [capacity::AnchoredVolume; 2],
-    token: VmToken,
+    token: std::sync::Arc<VmToken>,
+    activity: activity::Collector,
     _capacity: Option<(OwnedHandle, capacity::HeldDevice)>,
     paused: bool,
     full_test: bool,
@@ -549,7 +558,7 @@ impl Baseline {
     pub fn paused_live(&self) -> Result<Instant, NativeRefusal> {
         require_paused(self._held.paused || self._held.full_test)?;
         let captured = Instant::now();
-        if !current_console_idle(&self._held.token)? {
+        if !self._held.current_console_idle()? {
             return Err(NativeRefusal::OwnerActivityUnverified);
         }
         Ok(captured)
@@ -858,8 +867,9 @@ fn collect_preflight<E>(
     // non-impersonating console token. An elevated or mismatched invocation
     // is refused here and writes nothing.
     let owner = canonical_sid(&enrollment.owner_sid)?;
-    let token =
-        VmToken::derive_current_user(owner).map_err(|_| NativeRefusal::IdentityUnverified)?;
+    let token = std::sync::Arc::new(
+        VmToken::derive_current_user(owner).map_err(|_| NativeRefusal::IdentityUnverified)?,
+    );
 
     let owner_profile = token
         .profile_key()
@@ -1067,8 +1077,9 @@ fn collect_preflight<E>(
         },
         empty_job,
     );
+    let activity_collector = activity::Collector::default();
     let activity = take(origin, || {
-        let console_idle = current_console_idle(&token)?;
+        let console_idle = activity_collector.baseline(&token, mode.is_qualifier())?;
         let (active_cpus, available_ram_bytes) = host_resources()?;
         Ok(Activity {
             console_idle,
@@ -1117,6 +1128,7 @@ fn collect_preflight<E>(
             _backing: backing_pin,
             volumes: [trial_volume, outer_volume],
             token,
+            activity: activity_collector,
             _capacity: capacity_handles,
             paused,
             full_test,
@@ -1367,6 +1379,7 @@ struct LsaLogon {
     domain: String,
 }
 
+#[derive(Clone, Debug)]
 struct ConsoleEvidence {
     token_session: u32,
     active_console: u32,
@@ -1377,6 +1390,24 @@ struct ConsoleEvidence {
     /// The token's session, LUID and logon SID did not change.
     token_stable: bool,
     now: i64,
+    local_input: Option<activity::LocalSample>,
+}
+
+impl ConsoleEvidence {
+    fn owner_console_active(&self) -> bool {
+        self.active_console == self.token_session
+            && self.wts.iter().all(|sample| {
+                sample.state == WTSActive && sample.flags == WTS_SESSIONSTATE_UNLOCK as i32
+            })
+    }
+}
+
+impl Held {
+    fn current_console_idle(&self) -> Result<bool, NativeRefusal> {
+        self.activity
+            .capture(&self.token, activity::View::Admission)
+            .map(|(_, input)| input.idle)
+    }
 }
 
 /// Offline binding of the WTS session account to the LSA logon record that
@@ -1396,9 +1427,11 @@ fn account_bound(account: Option<&WtsAccount>, lsa: &LsaLogon) -> bool {
     })
 }
 
-/// Every comparison closes admission. A valid negative observation (recent
-/// input) is returned as `Ok(false)` so the runner can record owner activity.
-fn console_decision(e: &ConsoleEvidence) -> Result<bool, NativeRefusal> {
+/// Prove the WTS/LSA identity and chronology before selecting an input source.
+fn console_source(
+    e: &ConsoleEvidence,
+    view: activity::View,
+) -> Result<activity::Source, NativeRefusal> {
     let reason = NativeRefusal::OwnerActivityUnverified;
     let [first, second] = e.wts;
     let session = e.token_session;
@@ -1413,24 +1446,28 @@ fn console_decision(e: &ConsoleEvidence) -> Result<bool, NativeRefusal> {
         || !account_bound(e.accounts[0].as_ref(), &e.lsa[0])
         || !e.token_stable
         || !lsa_ok
-        || e.active_console != session
+        || (view == activity::View::Admission && !e.owner_console_active())
         || first.session != session
         || second.session != session
-        || first.state != WTSActive
-        || second.state != WTSActive
-        || first.flags != WTS_SESSIONSTATE_UNLOCK as i32
-        || second.flags != WTS_SESSIONSTATE_UNLOCK as i32
         || first.logon <= 0
         || first.logon != second.logon
-        || first.input < first.logon
-        || second.input < first.input
         || second.current < first.current
-        || second.current < second.input
         || !(0..=LIVE_TICKS).contains(&e.now.saturating_sub(second.current))
     {
         return Err(reason);
     }
-    Ok(second.current - second.input >= IDLE_TICKS)
+    match (first.input, second.input) {
+        // Both logon times match and current time cannot decrease.
+        (0, 0) if first.current >= first.logon => Ok(activity::Source::Local),
+        (0, _) | (_, 0) => Err(reason),
+        _ if first.input >= first.logon
+            && second.input >= first.input
+            && second.current >= second.input =>
+        {
+            Ok(activity::Source::Wts)
+        }
+        _ => Err(reason),
+    }
 }
 
 fn wts_sample(session: u32) -> Option<(WtsSample, Option<WtsAccount>)> {
@@ -1481,22 +1518,37 @@ fn lsa_logon(luid: &LUID, owner: PSID) -> Option<LsaLogon> {
     Some(logon)
 }
 
-fn current_console_idle(token: &VmToken) -> Result<bool, NativeRefusal> {
-    console_decision(&console_evidence(token)?)
-}
-
-fn console_evidence(token: &VmToken) -> Result<ConsoleEvidence, NativeRefusal> {
+fn console_evidence(
+    token: &VmToken,
+    view: activity::View,
+) -> Result<ConsoleEvidence, NativeRefusal> {
     let reason = NativeRefusal::OwnerActivityUnverified;
     require_unimpersonated().map_err(|_| reason)?;
     let session = token.identity.session;
     let luid = token.identity.authentication;
     let lsa_first = lsa_logon(&luid, token.account.0).ok_or(reason)?;
     let (first, account) = wts_sample(session).ok_or(reason)?;
+    // Bracket the session-local query with independent WTS observations.
+    let local_input = if first.input == 0
+        && first.session == session
+        && first.state == WTSActive
+        && first.flags == WTS_SESSIONSTATE_UNLOCK as i32
+    {
+        activity::local_sample(session)
+    } else {
+        None
+    };
     let (second, account_again) = wts_sample(session).ok_or(reason)?;
     let lsa_second = lsa_logon(&luid, token.account.0).ok_or(reason)?;
     let actual = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).map_err(|_| reason)?;
-    let now_identity = token_identity(&actual, &token.account, false, TokenMode::CurrentUser)
-        .map_err(|_| reason)?;
+    let now_identity = inspect_token_identity(
+        &actual,
+        &token.account,
+        false,
+        TokenMode::CurrentUser,
+        view == activity::View::Admission,
+    )
+    .map_err(|_| reason)?;
     let token_stable = now_identity.session == session
         && now_identity.authentication.LowPart == luid.LowPart
         && now_identity.authentication.HighPart == luid.HighPart
@@ -1512,6 +1564,7 @@ fn console_evidence(token: &VmToken) -> Result<ConsoleEvidence, NativeRefusal> {
         lsa: [lsa_first, lsa_second],
         token_stable,
         now,
+        local_input: local_input.filter(|sample| sample.fresh_at(boot::uptime())),
     })
 }
 
@@ -1794,7 +1847,7 @@ mod tests {
         })
     }
 
-    fn console() -> ConsoleEvidence {
+    pub(super) fn console() -> ConsoleEvidence {
         let wts = WtsSample {
             session: 2,
             state: WTSActive,
@@ -1825,6 +1878,14 @@ mod tests {
             lsa: [lsa.clone(), lsa],
             token_stable: true,
             now: wts.current + 20,
+            local_input: None,
+        }
+    }
+
+    fn console_decision(e: &ConsoleEvidence) -> Result<bool, NativeRefusal> {
+        match console_source(e, activity::View::Admission)? {
+            activity::Source::Wts => Ok(activity::Input::wts(e.wts[1]).idle),
+            activity::Source::Local => Err(NativeRefusal::OwnerActivityUnverified),
         }
     }
 
