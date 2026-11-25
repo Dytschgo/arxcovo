@@ -773,6 +773,26 @@ pub fn preflight_full_test(enrollment: &str, evidence: &str) -> Result<Baseline,
     preflight_with(&capacity::MountManager, enrollment, evidence, false, true)
 }
 
+#[derive(Clone, Copy)]
+enum CollectMode<'a> {
+    /// Standalone qualifier claiming a fresh writable evidence directory and
+    /// reading the stopped production store without a daemon lock.
+    Qualifier,
+    /// Daemon foreground reader borrowing its already-locked `VmStore` and
+    /// opening an existing evidence dossier read-only.
+    Foreground(&'a crate::store::vm::VmStore),
+}
+
+impl CollectMode<'_> {
+    fn is_foreground(self) -> bool {
+        matches!(self, Self::Foreground(_))
+    }
+
+    fn is_qualifier(self) -> bool {
+        matches!(self, Self::Qualifier)
+    }
+}
+
 /// Every refusal before the claim leaves the evidence directory untouched,
 /// so a corrected invocation can retry in it. After the claim nothing
 /// returns early: each observation is a typed result the runner settles.
@@ -789,7 +809,7 @@ fn preflight_with(
         evidence_dir,
         paused,
         full_test,
-        None,
+        CollectMode::Qualifier,
         sink::EvidenceDir::claim,
     )?;
     Ok(Baseline {
@@ -810,7 +830,7 @@ fn collect_preflight<E>(
     evidence_dir: &str,
     paused: bool,
     full_test: bool,
-    store: Option<&crate::store::vm::VmStore>,
+    mode: CollectMode<'_>,
     open_evidence: impl FnOnce(
         PathPin,
         PSID,
@@ -856,7 +876,8 @@ fn collect_preflight<E>(
                 let image =
                     std::env::current_exe().map_err(|_| NativeRefusal::QualificationMissing)?;
                 let image = local(image.to_str().ok_or(NativeRefusal::QualificationMissing)?)?;
-                let (key, pins) = hold_release(release, &image, &evidence_path, store.is_some())?;
+                let (key, pins) =
+                    hold_release(release, &image, &evidence_path, mode.is_foreground())?;
                 (Some(key), Some(pins))
             }
             (_, None) => (None, None),
@@ -873,9 +894,15 @@ fn collect_preflight<E>(
     // volume come from the same proven objects.
     let outer_volume = capacity::anchor_volume(names, outer.as_str())?;
     let trial_volume = capacity::anchor_volume(names, &root.as_str()[..3])?;
-    // The evidence directory shares write so the writer can rename its
-    // committed entries relative to this held handle.
-    let evidence_pin = capacity::walk(names, &outer_volume, &evidence_path, true, store.is_none())?;
+    // The evidence directory shares write in qualifier mode so the writer can
+    // rename its committed entries relative to this held handle.
+    let evidence_pin = capacity::walk(
+        names,
+        &outer_volume,
+        &evidence_path,
+        true,
+        mode.is_qualifier(),
+    )?;
     let trial_pin = capacity::walk(names, &trial_volume, &root, true, false)?;
     let backing_pin = capacity::walk(names, &outer_volume, &backing, false, true)?;
     if !sink::held_private(&trial_pin.leaf, user_sid)
@@ -901,7 +928,7 @@ fn collect_preflight<E>(
             &backing_pin,
             [&trial_volume, &outer_volume],
             &evidence_path,
-            (user_sid, store),
+            (user_sid, mode),
         )?)
     } else {
         None
@@ -987,7 +1014,7 @@ fn collect_preflight<E>(
             enrollment_private: true,
             evidence_private: true,
             trial_root_private: true,
-            evidence_claimed: store.is_none(),
+            evidence_claimed: mode.is_qualifier(),
         },
     };
     let host = take(origin, || {

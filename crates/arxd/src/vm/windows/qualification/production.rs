@@ -33,40 +33,13 @@ impl ForegroundQualification<'_> {
         lease_name: &str,
         generation: Id,
     ) -> Result<ProductionWorkspace, NativeRefusal> {
-        let reason = NativeRefusal::PathCustodyUnverified;
-        let production = self.production_root();
-        if production.path.as_str().eq_ignore_ascii_case(root.as_str())
-            || !production.path.contains(root)
-            || generation == [0; 16]
-        {
-            return Err(reason);
-        }
-        root.join(lease_name).map_err(|_| reason)?;
-        let root = PathPin::open(root, true, false)?;
-        if !root._ancestors.iter().any(|parent| {
-            file_identity(parent, true).is_ok_and(|(id, _)| id == production.identity)
-        }) || !sink::held_private(&root.leaf, self.held.token.account.0)
-        {
-            return Err(reason);
-        }
-        let lease =
-            open_relative(&root.leaf, lease_name, Node::File, false, false).map_err(|_| reason)?;
-        let (lease_id, _) = file_identity(&lease, false).map_err(|_| reason)?;
-        if !sink::held_private(&lease, self.held.token.account.0) {
-            return Err(reason);
-        }
-        lease.try_lock().map_err(|_| reason)?;
-        WorkspaceCustody::production(&root, &lease)?;
-        Ok(ProductionWorkspace {
-            binding: WorkspaceBinding {
-                generation,
-                production: production.identity,
-                workspace: root.identity,
-                lease: lease_id,
-            },
+        hold_workspace_under(
+            self.production_root(),
+            self.held.token.account.0,
             root,
-            lease,
-        })
+            lease_name,
+            generation,
+        )
     }
 
     fn launch_live(&self, memory: usize) -> Result<Instant, NativeRefusal> {
@@ -77,7 +50,7 @@ impl ForegroundQualification<'_> {
             return Err(NativeRefusal::OwnerActivityUnverified);
         }
         let (cpus, ram) = host_resources()?;
-        if cpus < 2 || ram < RAM_RESERVE + memory as u64 || !hypervisor_present()? {
+        if !launch_reserves_sufficient(cpus, ram, memory) || !hypervisor_present()? {
             return Err(NativeRefusal::ReservesUnverified);
         }
         let outer = capacity::held_free(&held.volumes[1].root)?;
@@ -95,14 +68,70 @@ impl ForegroundQualification<'_> {
     }
 }
 
+/// Host WHPX kernel overhead reserved above the Job memory limit, consistent
+/// with the 7 GiB headroom check for a 6 GiB Job in `recipe_live`.
+const WHPX_RAM_OVERHEAD: u64 = GIB;
+
+fn launch_reserves_sufficient(cpus: u32, available_ram: u64, memory: usize) -> bool {
+    let required = u64::try_from(memory)
+        .ok()
+        .and_then(|memory| RAM_RESERVE.checked_add(memory))
+        .and_then(|total| total.checked_add(WHPX_RAM_OVERHEAD));
+    cpus >= 2 && required.is_some_and(|required| available_ram >= required)
+}
+
+fn hold_workspace_under(
+    production: &PathPin,
+    owner: PSID,
+    root: &LocalPath,
+    lease_name: &str,
+    generation: Id,
+) -> Result<ProductionWorkspace, NativeRefusal> {
+    let reason = NativeRefusal::PathCustodyUnverified;
+    if production.path.as_str().eq_ignore_ascii_case(root.as_str())
+        || !production.path.contains(root)
+        || generation == [0; 16]
+    {
+        return Err(reason);
+    }
+    root.join(lease_name).map_err(|_| reason)?;
+    let root = PathPin::open(root, true, false)?;
+    if !root
+        ._ancestors
+        .iter()
+        .any(|parent| file_identity(parent, true).is_ok_and(|(id, _)| id == production.identity))
+        || !sink::held_private(&root.leaf, owner)
+    {
+        return Err(reason);
+    }
+    let lease =
+        open_relative(&root.leaf, lease_name, Node::File, false, false).map_err(|_| reason)?;
+    let (lease_id, _) = file_identity(&lease, false).map_err(|_| reason)?;
+    if !sink::held_private(&lease, owner) {
+        return Err(reason);
+    }
+    lease.try_lock().map_err(|_| reason)?;
+    WorkspaceCustody::production(&root, &lease)?;
+    Ok(ProductionWorkspace {
+        binding: WorkspaceBinding {
+            generation,
+            production: production.identity,
+            workspace: root.identity,
+            lease: lease_id,
+        },
+        root,
+        lease,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LaunchPermitBinding {
     pub workspace: WorkspaceBinding,
     pub seal_sha256: Hash,
+    pub kind: PlanKind,
 }
 
 pub(crate) struct LaunchTarget<'a, 'plan> {
-    pub binding: LaunchPermitBinding,
     pub plan: &'a CommandPlan<'plan>,
     pub cwd: &'a LocalPath,
     pub pair: Option<PairSlots>,
@@ -112,10 +141,13 @@ pub(crate) struct LaunchTarget<'a, 'plan> {
 }
 
 /// Implemented by the 7c issuer. Consumption must check the exact sealed
-/// plan, durable intent, charges, deadline and cancellation at create.
-/// Return the binding stored at issuance.
+/// plan, durable intent, charges, deadline and cancellation at create, and
+/// return the issuance-time binding together with `LaunchAuthority`.
 pub(crate) trait LaunchPermit {
-    fn consume(self, target: LaunchTarget<'_, '_>) -> Result<LaunchPermitBinding, NativeRefusal>;
+    fn consume(
+        self,
+        target: LaunchTarget<'_, '_>,
+    ) -> Result<(LaunchPermitBinding, crate::vm::runtime::LaunchAuthority), NativeRefusal>;
 }
 
 pub(crate) struct LaunchRequest<'a> {
@@ -137,9 +169,71 @@ pub(crate) struct NativeLaunch<'a> {
     binding: WorkspaceBinding,
     pair: Option<(PairSlots, [FileIdentity; 2])>,
     _offline: Option<&'a crate::vm::runtime::OfflineLease>,
+    _authority: crate::vm::runtime::LaunchAuthority,
     memory: usize,
     io: Option<BootIo>,
     live: Option<Box<(PipeQmp, SerialGuest)>>,
+}
+
+struct ValidatedLaunch<'a> {
+    workspace_binding: WorkspaceBinding,
+    kind: PlanKind,
+    offline: Option<&'a crate::vm::runtime::OfflineLease>,
+    bound_pair: Option<(PairSlots, [FileIdentity; 2])>,
+    finalization_slots: Option<PairSlots>,
+}
+
+fn check_plan_gate(
+    kind: PlanKind,
+    has_pair: bool,
+    has_offline_lease: bool,
+) -> Result<(), NativeRefusal> {
+    match (kind, has_pair, has_offline_lease) {
+        (PlanKind::Boot | PlanKind::InstallerBoot(_), true, false)
+        | (PlanKind::Inspect, false, false)
+        | (PlanKind::InspectWritable | PlanKind::Mutate, false, true) => Ok(()),
+        _ => Err(NativeRefusal::QualificationMissing),
+    }
+}
+
+fn validate_launch_request<'a>(
+    production: FileIdentity,
+    workspace: &ProductionWorkspace,
+    plan: &CommandPlan<'a>,
+    pair: Option<PairSlots>,
+    memory: usize,
+    cpu_rate: u32,
+) -> Result<ValidatedLaunch<'a>, NativeRefusal> {
+    let reason = NativeRefusal::QualificationMissing;
+    let workspace_binding = workspace.binding();
+    if workspace_binding.production != production
+        || !(1..=6 * GIB as usize).contains(&memory)
+        || !(1..=JOB_CPU_RATE).contains(&cpu_rate)
+    {
+        return Err(reason);
+    }
+    let kind = plan.kind();
+    let offline = plan.offline_lease();
+    check_plan_gate(kind, pair.is_some(), offline.is_some())?;
+    let bound_pair = match (kind, pair) {
+        (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(pair)) => {
+            check_pair(workspace_binding, pair)?;
+            Some((pair, pair_ids(plan, &workspace.root.path, pair)?))
+        }
+        (PlanKind::Inspect | PlanKind::InspectWritable | PlanKind::Mutate, None) => None,
+        _ => return Err(reason),
+    };
+    let finalization_slots = (kind
+        == PlanKind::InstallerBoot(crate::vm::runtime::InstallerPhase::WindowsFinalize))
+    .then_some(pair)
+    .flatten();
+    Ok(ValidatedLaunch {
+        workspace_binding,
+        kind,
+        offline,
+        bound_pair,
+        finalization_slots,
+    })
 }
 
 impl<'a> NativeLaunch<'a> {
@@ -159,28 +253,20 @@ impl<'a> NativeLaunch<'a> {
             cpu_rate,
         } = request;
         let reason = NativeRefusal::QualificationMissing;
-        let workspace_binding = workspace.binding();
-        if workspace_binding.production != qualification.production_root().identity
-            || !(1..=6 * GIB as usize).contains(&memory)
-            || !(1..=JOB_CPU_RATE).contains(&cpu_rate)
-        {
-            return Err(reason);
-        }
-        let kind = plan.kind();
-        let offline = plan.offline_lease();
-        let bound_pair = match (kind, pair) {
-            (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(pair)) if offline.is_none() => {
-                check_pair(workspace_binding, pair)?;
-                Some((pair, pair_ids(&plan, &workspace.root.path, pair)?))
-            }
-            (PlanKind::Inspect, None) if offline.is_none() => None,
-            (PlanKind::InspectWritable | PlanKind::Mutate, None) if offline.is_some() => None,
-            _ => return Err(reason),
-        };
-        let finalization_slots = (kind
-            == PlanKind::InstallerBoot(crate::vm::runtime::InstallerPhase::WindowsFinalize))
-        .then_some(pair)
-        .flatten();
+        let ValidatedLaunch {
+            workspace_binding,
+            kind,
+            offline,
+            bound_pair,
+            finalization_slots,
+        } = validate_launch_request(
+            qualification.production_root().identity,
+            workspace,
+            &plan,
+            pair,
+            memory,
+            cpu_rate,
+        )?;
         let inputs = LaunchInputs {
             pins: hold_plan_inputs(&plan)?,
             plan,
@@ -195,13 +281,14 @@ impl<'a> NativeLaunch<'a> {
         let target_binding = LaunchPermitBinding {
             workspace: workspace_binding,
             seal_sha256: qualification.seal_sha256(),
+            kind,
         };
+        let mut authority = None;
         let (core, read, write) =
             CheckedLaunchCore::hold_checked(&qualification.held.token, inputs, |plan| {
                 let live = qualification.launch_live(memory)?;
                 let captured = refresh()?;
                 let target = LaunchTarget {
-                    binding: target_binding,
                     plan,
                     cwd,
                     pair,
@@ -209,15 +296,19 @@ impl<'a> NativeLaunch<'a> {
                     memory,
                     cpu_rate,
                 };
-                check_permit(target_binding, permit.consume(target)?)?;
+                let (issued, granted) = permit.consume(target)?;
+                check_permit(target_binding, issued)?;
+                authority = Some(granted);
                 Ok(captured.min(live))
             })?;
+        let _authority = authority.ok_or(reason)?;
         Ok(Self {
             core,
             qualification,
             binding: workspace_binding,
             pair: bound_pair,
             _offline: offline,
+            _authority,
             memory,
             io: Some((read, write)),
             live: None,

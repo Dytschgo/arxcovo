@@ -29,7 +29,7 @@ impl<'a> ForegroundQualification<'a> {
             dossier,
             false,
             true,
-            Some(store),
+            CollectMode::Foreground(store),
             |pin, owner, _, _| ReadDossier::open(pin, owner),
         )?;
         let mut dependencies = observations.dependencies();

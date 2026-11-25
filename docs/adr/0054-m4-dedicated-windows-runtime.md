@@ -1357,12 +1357,14 @@ inputs before reading the selected record. It opens existing seal rows
 relative to the read-only dossier directory, with write and delete sharing
 denied. The qualifier continues to claim only its own new output directory.
 
-Foreground execution consumes a 7c permit at the checked create edge. It
-matches the pinned seal and the exact production workspace, lease file and
-generation. The checked Job and boot protocol retain the verified guest
-channel until teardown. Settlement carries exact generation slots and
-holds both writer-excluded handles after child exit, an empty Job and
-joined stdio workers. Uncertain settlement keeps the generation charged.
-The qualifier's separate disposable path still rejects daemon offline
+Foreground execution consumes a 7c permit at the checked create edge,
+yielding the uninhabited `LaunchAuthority` and matching the pinned seal,
+plan kind/phase, and exact production workspace, lease file and generation.
+The live reserve check includes 1 GiB of WHPX kernel overhead on top of the
+Job memory limit, matching `recipe_live`. The checked Job and boot protocol
+retain the verified guest channel until teardown. Settlement carries exact
+generation slots and holds both writer-excluded handles after child exit, an
+empty Job and joined stdio workers. Uncertain settlement keeps the generation
+charged. The qualifier's separate disposable path still rejects daemon offline
 leases. Production dispatch, WHPX guest boot and teardown remain
 **unverified on real hardware**.
