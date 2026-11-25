@@ -218,7 +218,8 @@ impl Read for BoundedHashRead<'_> {
         let max = buffer
             .len()
             .min(usize::try_from(*self.remaining).unwrap_or(usize::MAX));
-        if max == 0 && !buffer.is_empty() {
+        // ArtifactPin asks for one more byte to distinguish EOF from truncation.
+        if max == 0 && !buffer.is_empty() && self.file.read(&mut [0u8; 1])? != 0 {
             return Err(io::Error::other("hash byte budget exhausted"));
         }
         let n = self.file.read(&mut buffer[..max])?;

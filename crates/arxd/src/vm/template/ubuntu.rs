@@ -365,20 +365,10 @@ pub(in crate::vm) fn network_probe_seed(
 }
 
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
-const PROBE_START: &str = "import errno, fcntl, os, pathlib, socket, struct, time\n";
+const PROBE_START: &str = "import fcntl, pathlib, socket, struct, subprocess, time\n";
 
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
 const PROBE_BODY: &str = r#"
-DENY_ERRNOS = {
-    errno.ECONNREFUSED,
-    errno.ECONNRESET,
-    errno.EHOSTUNREACH,
-    errno.ENETUNREACH,
-    errno.EACCES,
-    errno.EPERM,
-    errno.ETIMEDOUT,
-}
-
 def nic_ipv4(name):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -426,15 +416,8 @@ def probe_tcp(target, bind_v4):
             conn.settimeout(1.0)
             if not is_v6:
                 conn.bind((bind_v4, 0))
-            try:
-                conn.connect(target)
-                return 'R'
-            except TimeoutError:
-                return 'D'
-            except OSError as err:
-                if err.errno in DENY_ERRNOS:
-                    return 'D'
-                return 'E'
+            conn.connect(target)
+            return 'R'
     except OSError:
         return 'E'
 
@@ -450,67 +433,73 @@ def probe_dns(target, bind_v4):
             conn.settimeout(1.0)
             if not is_v6:
                 conn.bind((bind_v4, 0))
-            try:
-                conn.connect(target)
-                conn.send(payload)
-                reply = conn.recv(512)
-                if (
-                    len(reply) >= len(payload)
-                    and reply[:2] == ident
-                    and (reply[2] & 0x80) != 0
-                    and ((reply[2] >> 3) & 0x0f) == 0
-                    and (reply[2] & 0x02) == 0
-                    and (reply[3] & 0x0f) in (0, 3)
-                    and reply[4:6] == b'\x00\x01'
-                    and reply[12:len(payload)] == question
-                ):
-                    return 'R'
-                return 'M'
-            except TimeoutError:
-                return 'D'
-            except OSError as err:
-                if err.errno in DENY_ERRNOS:
-                    return 'D'
-                return 'E'
+            conn.connect(target)
+            conn.send(payload)
+            reply = conn.recv(512)
+            if (
+                len(reply) >= len(payload)
+                and reply[:2] == ident
+                and (reply[2] & 0x80) != 0
+                and ((reply[2] >> 3) & 0x0f) == 0
+                and (reply[2] & 0x02) == 0
+                and (reply[3] & 0x0f) in (0, 3)
+                and reply[4:6] == b'\x00\x01'
+                and reply[12:len(payload)] == question
+            ):
+                return 'R'
+            return 'M'
     except OSError:
         return 'E'
 
-port = pathlib.Path('/dev/virtio-ports/org.arxcovo.agent.0')
-for _ in range(40):
-    if port.exists():
-        break
-    time.sleep(0.25)
+def run_probes(devices):
+    ports = [p for p in devices if p.name != 'lo']
+    nic_ready = (
+        len(ports) == 1
+        and (ports[0] / 'device/driver').resolve().name == 'virtio_net'
+        and (ports[0] / 'operstate').read_text().strip() == 'up'
+    )
+    guest_v4 = None
+    default_route = False
+    no_v6 = False
+    if nic_ready:
+        name = ports[0].name
+        for _ in range(40):
+            guest_v4 = nic_ipv4(name)
+            # The sealed TEST netdev uses the default slirp subnet. Restricted
+            # DHCP supplies the address but may omit the router option.
+            if guest_v4 == '10.0.2.15' and not has_slirp_default_route(name):
+                try:
+                    subprocess.run(['ip', '-4', 'route', 'add', 'default', 'via', '10.0.2.2',
+                                    'dev', name], check=False, timeout=1)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            default_route = has_slirp_default_route(name)
+            if guest_v4 == '10.0.2.15' and default_route:
+                break
+            time.sleep(0.25)
+        no_v6 = ipv6_is_disabled(name)
 
-ports = [p for p in pathlib.Path('/sys/class/net').iterdir() if p.name != 'lo']
-nic_ready = (
-    len(ports) == 1
-    and (ports[0] / 'device/driver').resolve().name == 'virtio_net'
-    and (ports[0] / 'operstate').read_text().strip() == 'up'
-)
-guest_v4 = None
-default_route = False
-no_v6 = False
-if nic_ready:
-    name = ports[0].name
+    ipv4_lease = guest_v4 == '10.0.2.15'
+    setup = ''.join('1' if flag else '0' for flag in (nic_ready, ipv4_lease, default_route, no_v6))
+    if setup == '1111':
+        outcomes = ''.join(probe_tcp(t, guest_v4) for t in TCP)
+        outcomes += probe_dns(DNS, guest_v4) + probe_dns(('10.0.2.3', 53), guest_v4)
+    else:
+        outcomes = 'E' * 8
+
+    return setup, outcomes
+
+if __name__ == '__main__':
+    port = pathlib.Path('/dev/virtio-ports/org.arxcovo.agent.0')
     for _ in range(40):
-        guest_v4 = nic_ipv4(name)
-        default_route = has_slirp_default_route(name)
-        if guest_v4 and guest_v4.startswith('10.0.2.') and default_route:
+        if port.exists():
             break
         time.sleep(0.25)
-    no_v6 = ipv6_is_disabled(name)
 
-ipv4_lease = bool(guest_v4 and guest_v4.startswith('10.0.2.'))
-setup = ''.join('1' if flag else '0' for flag in (nic_ready, ipv4_lease, default_route, no_v6))
-if setup == '1111':
-    outcomes = ''.join(probe_tcp(t, guest_v4) for t in TCP)
-    outcomes += probe_dns(DNS, guest_v4) + probe_dns(('10.0.2.3', 53), guest_v4)
-else:
-    outcomes = 'E' * 8
-
-if port.exists():
-    with port.open('wb', buffering=0) as wire:
-        wire.write(b'ARXNET2 ' + NONCE.hex().encode('ascii') + b' ' + setup.encode('ascii') + b' ' + outcomes.encode('ascii') + b'\n')
+    setup, outcomes = run_probes(pathlib.Path('/sys/class/net').iterdir())
+    if port.exists():
+        with port.open('wb', buffering=0) as wire:
+            wire.write(b'ARXNET2 ' + NONCE.hex().encode('ascii') + b' ' + setup.encode('ascii') + b' ' + outcomes.encode('ascii') + b'\n')
 "#;
 
 pub(super) const DETACHED_HEALTH: &str = r#"set -eu
@@ -723,4 +712,18 @@ fn network_probe_seed_has_only_live_nocloud_configuration() {
     );
     assert!(!seed.windows(11).any(|bytes| bytes == b"autoinstall"));
     assert!(seed.len() <= 64 * 1024);
+}
+
+#[cfg(test)]
+#[test]
+fn network_probe_connect_errors_are_setup_failures() {
+    // Run the functions embedded in the seed with a fake socket. No packets
+    // are sent and the fixture does not inspect the host's routes.
+    let fixture = include_str!("network_probe_fixture.py");
+    let program = format!("__name__ = 'fixture'\n{PROBE_BODY}\n{fixture}");
+    let result = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
+        .args(["-I", "-B", "-c", &program])
+        .status()
+        .unwrap();
+    assert!(result.success());
 }

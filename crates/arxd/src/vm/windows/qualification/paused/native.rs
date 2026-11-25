@@ -266,8 +266,7 @@ impl<'a> SupervisorLossPermit<'a> {
         let job_empty_notified = host.loss_job_empty.get();
         let accepted = trial.paused.is_ok()
             && trial.release == StopDisposition::DirtyRelease
-            && child_exited
-            && job_empty_notified;
+            && supervisor_loss_released(child_exited, job_empty_notified);
         let inconclusive = trial.paused.is_ok()
             && (!job_empty_notified || trial.release == StopDisposition::ChargedQuarantine);
         SupervisorLossProbe {
@@ -656,6 +655,15 @@ fn expected_fault_refusal(fault: ControlledFault) -> NativeRefusal {
     }
 }
 
+fn fault_settled(fault: ControlledFault, result: &TrialResult) -> bool {
+    result.paused == Err(Failure::Refused(expected_fault_refusal(fault)))
+        && result.release == StopDisposition::DirtyRelease
+}
+
+fn supervisor_loss_released(child_exited: bool, job_empty: bool) -> bool {
+    child_exited && job_empty
+}
+
 impl<'a> ReserveActivityPermit<'a> {
     pub(in crate::vm::windows::qualification) fn prepare(
         baseline: &'a Baseline,
@@ -695,10 +703,7 @@ impl<'a> ReserveActivityPermit<'a> {
             invocations.push(result.release);
             // The injected fault must traverse LivePoll, cause the exact
             // expected refusal, and complete verified forced-stop settlement.
-            let expected = expected_fault_refusal(fault);
-            if result.paused != Err(Failure::Refused(expected))
-                || result.release != StopDisposition::DirtyRelease
-            {
+            if !fault_settled(fault, &result) {
                 return ReserveActivityProbe {
                     observations: None,
                     release: if invocations.contains(&StopDisposition::ChargedQuarantine) {
@@ -1081,18 +1086,8 @@ async fn observe_console_transitions(
 
 /// Bounded typed observation for the live restricted TEST network probe.
 pub struct NetworkProbe {
-    pub accepted: bool,
     pub refusal: Option<NativeRefusal>,
     pub release: StopDisposition,
-    pub job_memory_limit_bytes: u64,
-    pub job_cpu_rate: u32,
-    pub host_controls_pre: bool,
-    pub host_controls_post: bool,
-    pub nic_setup_verified: bool,
-    pub denied_probes: u8,
-    pub zero_hostfwd: bool,
-    pub clean_guest_shutdown: bool,
-    pub seed_released: bool,
 }
 
 pub struct NetworkProbePermit<'a>(Prepared<'a>);
@@ -1123,18 +1118,8 @@ impl<'a> NetworkProbePermit<'a> {
         let envelope = JobEnvelope::NETWORK_LIVE;
         let mut nonce = [0; 16];
         let absent = |reason| NetworkProbe {
-            accepted: false,
             refusal: Some(reason),
             release: StopDisposition::DirtyRelease,
-            job_memory_limit_bytes: envelope.job_memory_bytes as u64,
-            job_cpu_rate: envelope.job_cpu_rate,
-            host_controls_pre: false,
-            host_controls_post: false,
-            nic_setup_verified: false,
-            denied_probes: 0,
-            zero_hostfwd: false,
-            clean_guest_shutdown: false,
-            seed_released: false,
         };
         let setup = (|| {
             getrandom::fill(&mut nonce).map_err(|_| reason)?;
@@ -1266,7 +1251,7 @@ impl<'a> NetworkProbePermit<'a> {
             .is_some_and(|r| r.nic_ready && r.ipv4_lease && r.default_route && r.ipv6_disabled);
         let denied_probes = report.map_or(0, |r| r.denied_probes);
         let seed_released = seed_removed && release == StopDisposition::CleanRelease;
-        let accepted = observed.paused.is_ok()
+        let diagnostics_complete = observed.paused.is_ok()
             && host_controls_pre
             && host_controls_post
             && nic_setup_verified
@@ -1275,18 +1260,8 @@ impl<'a> NetworkProbePermit<'a> {
             && clean_guest_shutdown
             && seed_released;
         NetworkProbe {
-            accepted,
-            refusal: (!accepted).then_some(reason),
+            refusal: (!diagnostics_complete).then_some(reason),
             release,
-            job_memory_limit_bytes: envelope.job_memory_bytes as u64,
-            job_cpu_rate: envelope.job_cpu_rate,
-            host_controls_pre,
-            host_controls_post,
-            nic_setup_verified,
-            denied_probes,
-            zero_hostfwd,
-            clean_guest_shutdown,
-            seed_released,
         }
     }
 }
@@ -2021,7 +1996,7 @@ impl<'a> Host for Windows<'a> {
             self.loss_child_exited.set(loss_child_exited);
             self.loss_job_empty.set(loss_job_empty);
         }
-        let loss_released = loss_child_exited && loss_job_empty;
+        let loss_released = supervisor_loss_released(loss_child_exited, loss_job_empty);
         let reaped = match &child {
             Some(child) => child.reap(deadline).await.is_ok(),
             None => true,
@@ -2128,6 +2103,44 @@ mod tests {
     use crate::vm::windows::qualification::inventory::tests::{
         Fixture, READ_ONLY, WRITABLE, set_dacl,
     };
+
+    #[test]
+    fn supervisor_loss_requires_both_release_signals() {
+        for exited in [false, true] {
+            for empty in [false, true] {
+                assert_eq!(
+                    supervisor_loss_released(exited, empty),
+                    (exited, empty) == (true, true)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_fault_requires_its_own_refusal_and_dirty_release() {
+        for fault in ControlledFault::ALL {
+            let expected = Err(Failure::Refused(expected_fault_refusal(fault)));
+            let result = TrialResult {
+                paused: expected,
+                release: StopDisposition::DirtyRelease,
+            };
+            assert!(fault_settled(fault, &result));
+            assert!(!fault_settled(
+                fault,
+                &TrialResult {
+                    paused: Err(Failure::Refused(NativeRefusal::JobUnverified)),
+                    ..result
+                }
+            ));
+            assert!(!fault_settled(
+                fault,
+                &TrialResult {
+                    release: StopDisposition::CleanRelease,
+                    ..result
+                }
+            ));
+        }
+    }
 
     #[tokio::test]
     async fn supervisor_loss_needs_job_empty_evidence_even_if_the_child_has_exited() {

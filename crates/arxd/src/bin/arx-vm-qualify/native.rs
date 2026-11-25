@@ -615,22 +615,11 @@ impl Collectors<Native> for PausedCollectors<'_> {
                 (Some(runtime), Ok(permit)) => {
                     let probe = runtime.block_on(permit.run(&self.cancel));
                     self.releases.record(stage, probe.release);
-                    if probe.accepted {
-                        StageResult::Passed(Observation::RestrictedNetworkLive {
-                            job_memory_limit_bytes: probe.job_memory_limit_bytes,
-                            job_cpu_rate: probe.job_cpu_rate,
-                            host_controls_pre: probe.host_controls_pre,
-                            host_controls_post: probe.host_controls_post,
-                            nic_setup_verified: probe.nic_setup_verified,
-                            denied_probes: probe.denied_probes,
-                            zero_hostfwd: probe.zero_hostfwd,
-                            clean_guest_shutdown: probe.clean_guest_shutdown,
-                            seed_released: probe.seed_released,
-                        })
-                    } else {
-                        StageResult::Failed(
-                            probe.refusal.map_or(Diagnostic::TeardownUncertain, refused),
-                        )
+                    // Guest socket outcomes do not attribute a denial to the
+                    // slirp filter, even when both host controls succeeded.
+                    match probe.refusal {
+                        Some(reason) => StageResult::Failed(refused(reason)),
+                        None => StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
                     }
                 }
                 (_, Err(reason)) => StageResult::Failed(refused(reason)),

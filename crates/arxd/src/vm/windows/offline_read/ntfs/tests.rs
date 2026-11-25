@@ -441,6 +441,97 @@ fn inspect(qcow: Vec<u8>) -> Result<(bool, bool)> {
 }
 
 #[test]
+fn released_pair_observes_at_the_exact_two_pass_hash_budget() {
+    use super::super::{PathPin, ReleasedPair};
+    use crate::vm::{
+        ArtifactEvidence, ArtifactSlot, PairSlots,
+        paths::{ArtifactPin, LocalPath},
+        runtime::StopDisposition,
+    };
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let contents = [qcow(&raw_image(), None), vec![1; 512]];
+    let pins = ["disk", "vars"]
+        .into_iter()
+        .zip(&contents)
+        .map(|(name, data)| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, data).unwrap();
+            PathPin::open(
+                &LocalPath::parse(path.to_str().unwrap()).unwrap(),
+                false,
+                false,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let evidence = std::array::from_fn(|i| ArtifactEvidence {
+        directory: [1; 16],
+        identity: pins[i].identity,
+        pin: ArtifactPin {
+            size: contents[i].len() as u64,
+            sha256: Sha256::digest(&contents[i]).into(),
+        },
+    });
+    let slot = |role, key| ArtifactSlot {
+        generation: [1; 16],
+        role,
+        key: [key; 16],
+    };
+    let slots = PairSlots {
+        disk: slot("disk", 2),
+        vars: slot("vars", 3),
+    };
+    let pair =
+        ReleasedPair::hold(slots, pins.into(), [0, 1], StopDisposition::CleanRelease).unwrap();
+    assert_eq!(
+        pair.observe(slots, evidence, Instant::now() + Duration::from_secs(5)),
+        Ok((true, true))
+    );
+}
+
+#[test]
+fn hash_reader_refuses_a_byte_beyond_the_budget() {
+    use super::super::BoundedHashRead;
+    use std::io::{Read, Seek, Write};
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(b"abcd").unwrap();
+    file.rewind().unwrap();
+    let mut remaining = 3;
+    let mut reader = BoundedHashRead {
+        file: &file,
+        remaining: &mut remaining,
+        deadline: Instant::now() + Duration::from_secs(5),
+    };
+    let mut bytes = [0; 3];
+    reader.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"abc");
+    assert!(reader.read(&mut [0; 1]).is_err());
+}
+
+#[test]
+fn data_cluster_cannot_read_a_refcounted_metadata_cluster() {
+    let mut disk = qcow(&[7; CLUSTER], None);
+    put_be64(&mut disk, 4 * CLUSTER, 3 * CLUSTER as u64);
+    let mut image = Image::open(
+        Cursor::new(disk),
+        None,
+        Budget::new(Instant::now() + Duration::from_secs(5)),
+    )
+    .unwrap();
+    assert_eq!(fixed_at::<8>(&mut image, 0), Err(Invalid));
+}
+
+#[test]
+fn free_cell_must_end_inside_its_hive_bin() {
+    let mut raw = raw_image();
+    let end = 928 + (REG_KEY.encode_utf16().count() * 2 + 6).next_multiple_of(8);
+    put_le32(&mut raw, HIVE + 4096 + end, (4096 - end + 8) as u32);
+    assert_eq!(inspect(qcow(&raw, None)), Err(Invalid));
+}
+
+#[test]
 fn released_disk_proves_both_offline_states_independently() {
     let mut raw = raw_image();
     assert_eq!(inspect(qcow(&raw, None)), Ok((true, true)));

@@ -644,31 +644,9 @@ impl Observation {
                     && *quit_clean_eof
                     && *clean_release
             }
-            (
-                Stage::RestrictedTestNetwork,
-                O::RestrictedNetworkLive {
-                    job_memory_limit_bytes,
-                    job_cpu_rate,
-                    host_controls_pre,
-                    host_controls_post,
-                    nic_setup_verified,
-                    denied_probes,
-                    zero_hostfwd,
-                    clean_guest_shutdown,
-                    seed_released,
-                },
-            ) => {
-                origin == Origin::Native
-                    && *job_memory_limit_bytes == 6 * GIB
-                    && *job_cpu_rate == JOB_CPU_RATE
-                    && *host_controls_pre
-                    && *host_controls_post
-                    && *nic_setup_verified
-                    && *denied_probes == 8
-                    && *zero_hostfwd
-                    && *clean_guest_shutdown
-                    && *seed_released
-            }
+            // Older diagnostics can be decoded, but their socket-error counts
+            // carry no evidence that the restricted backend denied a packet.
+            (Stage::RestrictedTestNetwork, O::RestrictedNetworkLive { .. }) => false,
             (
                 Stage::SupervisorLossRelease,
                 O::SupervisorLoss {

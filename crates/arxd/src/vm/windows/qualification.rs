@@ -6,6 +6,8 @@
 
 mod capacity;
 pub(super) mod inventory;
+mod launch;
+pub(super) use launch::WorkspaceCustody;
 mod paused;
 mod schema;
 mod sink;

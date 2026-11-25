@@ -2430,7 +2430,12 @@ fn typed_host_observations_validate_and_match_the_closed_writer_schema() {
         ),
     ];
     for (stage, obs) in cases {
-        assert!(obs.validates(stage, Origin::Native), "{stage:?}");
+        let can_attest = stage != Stage::RestrictedTestNetwork;
+        assert_eq!(
+            obs.validates(stage, Origin::Native),
+            can_attest,
+            "{stage:?}"
+        );
         assert!(!obs.validates(stage, Origin::Fixture), "{stage:?}");
         #[cfg(all(windows, target_arch = "x86_64"))]
         {
@@ -2455,9 +2460,10 @@ fn typed_host_observations_validate_and_match_the_closed_writer_schema() {
             }];
             let bytes = canonical(&record).unwrap();
             let file = crate::native::diagnostic_file(Output::Records(stage.file()));
-            assert!(
+            assert_eq!(
                 arxd::vm::qualification::schema_accepts(file, &bytes),
-                "schema rejected {stage:?}: {}",
+                can_attest,
+                "schema result for {stage:?}: {}",
                 String::from_utf8_lossy(&bytes)
             );
         }

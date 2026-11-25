@@ -51,6 +51,7 @@ use windows_sys::Win32::{
 
 pub(super) mod offline_read;
 pub mod qualification;
+use qualification::WorkspaceCustody;
 
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
@@ -2244,55 +2245,6 @@ fn host_dns_servers() -> io::Result<Vec<std::net::IpAddr>> {
     result
 }
 
-/// Run- and generation-bound ownership of a disposable workspace and its
-/// exclusive slot file. Replaces bare mutable paths on the native launch edge.
-struct WorkspaceCustody<'a> {
-    run: [u8; 16],
-    generation: u64,
-    root: &'a PathPin,
-    slot: &'a File,
-}
-
-impl<'a> WorkspaceCustody<'a> {
-    fn new(
-        run: [u8; 16],
-        generation: u64,
-        root: &'a PathPin,
-        slot: &'a File,
-    ) -> Result<Self, NativeRefusal> {
-        let custody = NativeRefusal::PathCustodyUnverified;
-        if run == [0; 16] || generation == 0 {
-            return Err(custody);
-        }
-        qualification::inventory::binding(root)?;
-        let (slot_id, _) = file_identity(slot, false).map_err(|_| custody)?;
-        if slot_id.volume != root.identity.volume {
-            return Err(custody);
-        }
-        Ok(Self {
-            run,
-            generation,
-            root,
-            slot,
-        })
-    }
-
-    fn verify(&self) -> Result<(), NativeRefusal> {
-        let custody = NativeRefusal::PathCustodyUnverified;
-        qualification::inventory::binding(self.root)?;
-        let (root_id, _) = file_identity(&self.root.leaf, true).map_err(|_| custody)?;
-        let (slot_id, _) = file_identity(self.slot, false).map_err(|_| custody)?;
-        if root_id != self.root.identity || slot_id.volume != self.root.identity.volume {
-            return Err(custody);
-        }
-        Ok(())
-    }
-
-    fn path(&self) -> &LocalPath {
-        &self.root.path
-    }
-}
-
 /// The checked stock inventory and protected, empty startup namespace.
 struct StockLaunch<'a> {
     bundle: &'a qualification::inventory::Bundle,
@@ -2342,7 +2294,8 @@ impl StockLaunch<'_> {
     }
 
     fn verify_inputs(
-        &self,
+        bundle: &qualification::inventory::Bundle,
+        cwd: &LocalPath,
         plan: &CommandPlan<'_>,
         pins: &[PathPin],
         workspace: &WorkspaceCustody<'_>,
@@ -2354,10 +2307,10 @@ impl StockLaunch<'_> {
         let custody = NativeRefusal::PathCustodyUnverified;
         workspace.verify()?;
         let workspace_path = workspace.path();
-        if &self.cwd.path == workspace_path {
+        if cwd == workspace_path {
             return Err(custody);
         }
-        if pins.len() != plan.inputs().len() || workspace_path.overlaps(&self.bundle.root.path) {
+        if pins.len() != plan.inputs().len() || workspace_path.overlaps(&bundle.root.path) {
             return Err(custody);
         }
         let mut identities = Vec::with_capacity(pins.len());
@@ -2372,7 +2325,7 @@ impl StockLaunch<'_> {
                 .enumerate()
                 .find(|(_, pin)| pin.path == *path)
                 .ok_or(custody)?;
-            if identities.contains(&pin.identity) || path.overlaps(&self.cwd.path) {
+            if identities.contains(&pin.identity) || path.overlaps(cwd) {
                 return Err(custody);
             }
             identities.push(pin.identity);
@@ -2384,17 +2337,17 @@ impl StockLaunch<'_> {
                     } else {
                         "qemu-img.exe"
                     };
-                    let expected = self.bundle.root.path.join(leaf).map_err(|_| custody)?;
+                    let expected = bundle.root.path.join(leaf).map_err(|_| custody)?;
                     if path != &expected
                         || path != plan.image()
-                        || pin.identity != self.bundle.identity(leaf)?
+                        || pin.identity != bundle.identity(leaf)?
                         || pin.mutable
                     {
                         return Err(NativeRefusal::DistributionUnverified);
                     }
                 }
                 Data => {
-                    let expected = self.bundle.root.path.join("share").map_err(|_| custody)?;
+                    let expected = bundle.root.path.join("share").map_err(|_| custody)?;
                     if path != &expected || pin.mutable {
                         return Err(NativeRefusal::DistributionUnverified);
                     }
@@ -2408,7 +2361,7 @@ impl StockLaunch<'_> {
                     }
                     if role.writable() {
                         if !workspace_path.contains(path)
-                            || pin.identity.volume != workspace.root.identity.volume
+                            || pin.identity.volume != workspace.volume()
                         {
                             return Err(custody);
                         }
@@ -2506,7 +2459,13 @@ impl<'a> CheckedLaunchCore<'a> {
             token,
             cwd: PathPin::open(inputs.cwd, true, false)?,
         };
-        let writers = stock.verify_inputs(&inputs.plan, &inputs.pins, &inputs.workspace)?;
+        let writers = StockLaunch::verify_inputs(
+            stock.bundle,
+            &stock.cwd.path,
+            &inputs.plan,
+            &inputs.pins,
+            &inputs.workspace,
+        )?;
         use super::runtime::InstallerPhase;
         let finalization = match (kind, inputs.finalization_slots) {
             (PlanKind::InstallerBoot(InstallerPhase::WindowsFinalize), Some(slots)) => {
@@ -2628,43 +2587,6 @@ impl<'a> CheckedLaunchCore<'a> {
             read,
             write,
         ))
-    }
-}
-
-/// Private qualifier-only entry point below the checked execution core.
-/// Accepts only sealed TEST plans and held disposable workspace custody,
-/// with no path to daemon `LaunchAuthority` or `OfflineLease`.
-#[allow(dead_code, reason = "recipe collectors wire this entry in PR 2")]
-struct QualifierPlanPermit {
-    run: [u8; 16],
-    generation: u64,
-}
-
-#[allow(dead_code, reason = "recipe collectors wire this entry in PR 2")]
-struct QualifierLaunch<'a> {
-    core: CheckedLaunchCore<'a>,
-}
-
-#[allow(dead_code, reason = "recipe collectors wire this entry in PR 2")]
-impl<'a> QualifierLaunch<'a> {
-    fn hold(
-        permit: &QualifierPlanPermit,
-        token: &'a VmToken,
-        inputs: LaunchInputs<'a>,
-        refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
-    ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
-        if inputs.workspace.run != permit.run
-            || inputs.workspace.generation != permit.generation
-            || inputs.plan.offline_lease().is_some()
-            || !matches!(
-                inputs.plan.kind(),
-                PlanKind::Boot | PlanKind::InstallerBoot(_) | PlanKind::Inspect
-            )
-        {
-            return Err(NativeRefusal::QualificationMissing);
-        }
-        let (core, read, write) = CheckedLaunchCore::hold_checked(token, inputs, refresh)?;
-        Ok((Self { core }, read, write))
     }
 }
 

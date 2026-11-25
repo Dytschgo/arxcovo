@@ -252,20 +252,6 @@ const OBSERVATIONS: &[(&str, &[(&str, Shape)])] = &[
         ],
     ),
     (
-        "restricted_network_live",
-        &[
-            ("job_memory_limit_bytes", Shape::Uint(U64)),
-            ("job_cpu_rate", Shape::Uint(U32)),
-            ("host_controls_pre", Shape::Bool),
-            ("host_controls_post", Shape::Bool),
-            ("nic_setup_verified", Shape::Bool),
-            ("denied_probes", Shape::Uint(u8::MAX as u64)),
-            ("zero_hostfwd", Shape::Bool),
-            ("clean_guest_shutdown", Shape::Bool),
-            ("seed_released", Shape::Bool),
-        ],
-    ),
-    (
         "supervisor_loss",
         &[
             ("job_memory_limit_bytes", Shape::Uint(U64)),
@@ -429,10 +415,8 @@ fn rules(file: DiagnosticFile) -> Rules {
             ],
             &["whpx", "paused_trial", "firmware_sec", "qmp_firmware"],
         ),
-        F::NetworkRestrictedTest => {
-            records(&["restricted_test_network"], &["restricted_network_live"])
-        }
-        // Recipe and non-TEST network collectors remain unavailable in PR 1.
+        // PR 1 can persist network diagnostics, but cannot attest isolation.
+        F::NetworkRestrictedTest => records(&["restricted_test_network"], &[]),
         F::RecipeUbuntu => records(&["ubuntu_recipe"], &[]),
         F::RecipeWindows => records(&["windows_recipe"], &[]),
         F::NetworkRestrictedOrigin => records(&["restricted_origin_network"], &[]),

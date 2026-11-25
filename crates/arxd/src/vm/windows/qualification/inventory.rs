@@ -434,12 +434,20 @@ pub(super) mod tests {
 
     impl Fixture {
         pub(in crate::vm::windows::qualification) fn new() -> Self {
+            Self::with_payload(NAME, BYTES)
+        }
+
+        pub(in crate::vm::windows::qualification) fn with_payload(
+            name: &str,
+            bytes: &[u8],
+        ) -> Self {
             let root = tempfile::tempdir().unwrap();
             let path = local(root.path().to_str().unwrap()).unwrap();
-            fs::create_dir(root.path().join("share")).unwrap();
-            fs::write(root.path().join(NAME), BYTES).unwrap();
+            let file = root.path().join(name);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, bytes).unwrap();
             fs::write(root.path().join("RECEIPT.txt"), b"receipt").unwrap();
-            let manifest = format!("{}  {NAME}\n", hex::encode(Sha256::digest(BYTES)));
+            let manifest = format!("{}  {name}\n", hex::encode(Sha256::digest(bytes)));
             fs::write(root.path().join("MANIFEST.sha256"), &manifest).unwrap();
             Self {
                 root,
