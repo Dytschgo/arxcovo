@@ -88,11 +88,36 @@ fn native_utc_high_water_survives_a_store_reopen() {
 }
 
 #[test]
+fn native_monitor_queries_refuse_store_contention() {
+    use std::sync::mpsc;
+    let fixture = Fixture::new();
+    let controller = &fixture.ctl;
+    std::thread::scope(|scope| {
+        let held = controller
+            .reaper_test_store()
+            .try_live_connection()
+            .unwrap();
+        let (send, receive) = mpsc::channel();
+        scope.spawn(move || {
+            let clock = controller.advance_native_clock();
+            let live = controller.native_vm_unexpired(OWNER, [0; 16]);
+            let _ = send.send(clock.is_err() && live.is_err());
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        assert_eq!(result, Ok(true));
+    });
+}
+
+#[test]
 fn native_expiry_requires_release_for_the_exact_active_generation() {
     let fixture = Fixture::new();
     let golden = fixture.build(50, true);
     let (vm, _) = fixture.clone(golden, 51, true);
+    assert!(fixture.ctl.native_vm_unexpired(OWNER, vm).unwrap());
+    assert!(!fixture.ctl.native_vm_unexpired("bob", vm).unwrap());
     fixture.clock.set(NOW + 61_000, 61);
+    assert!(!fixture.ctl.native_vm_unexpired(OWNER, vm).unwrap());
     let claim = fixture.ctl.claim_expired().unwrap().pop().unwrap();
     let work = fixture
         .ctl

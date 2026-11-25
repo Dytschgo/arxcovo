@@ -190,15 +190,28 @@ impl<C: Clock> VmController<C> {
     /// replay cannot advance the ledger between sampling and comparison.
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn advance_native_clock(&self) -> Result<Option<ClockReading>> {
-        self.store.transact(|db| {
-            let clock = self.clock.now();
-            let now = utc(clock)?;
-            let updated = db.execute(
-                "UPDATE vm_retry_clock SET high_water_ms=?1 WHERE singleton=1 AND high_water_ms<=?1",
-                [now],
-            )?;
-            Ok((updated == 1).then_some(clock))
-        })
+        let mut db = self.store.try_live_connection()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let clock = self.clock.now();
+        let now = utc(clock)?;
+        let updated = tx.execute(
+            "UPDATE vm_retry_clock SET high_water_ms=?1 WHERE singleton=1 AND high_water_ms<=?1",
+            [now],
+        )?;
+        tx.commit()?;
+        Ok((updated == 1).then_some(clock))
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn native_vm_unexpired(&self, principal: &str, vm: Id) -> Result<bool> {
+        let db = self.store.try_live_connection()?;
+        let now = utc(self.clock.now())?;
+        Ok(
+            store::vm_status_rows(&db, principal, Some(vm), None, 1, now)?
+                .first()
+                .and_then(|row| row.expires_at_ms)
+                .is_some_and(|expiry| expiry > now),
+        )
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]

@@ -859,12 +859,10 @@ impl SelectedTest {
                 return Err(MISSING);
             }
             let captured = self.refresh_epoch(controller)?;
-            let status = controller
-                .get_status(&work.principal, vm)
+            if !controller
+                .native_vm_unexpired(&work.principal, vm)
                 .map_err(|_| MISSING)?
-                .map_err(|_| MISSING)?;
-            let now = controller.compose_now().map_err(|_| MISSING)?;
-            if status.expires_at_ms.is_none_or(|expiry| expiry <= now) {
+            {
                 return Err(MISSING);
             }
             Ok(captured)
