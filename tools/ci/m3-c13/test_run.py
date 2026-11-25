@@ -458,6 +458,36 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(launch(0), 0)
         self.assertEqual(summary.read_bytes(), b"")
 
+    def test_replay_rejects_unframed_and_near_miss_records(self):
+        # The six privileged replays from the #332 review. Each previously
+        # reached the marker writer and returned zero.
+        owner = RUN.MINT_OWNER_QUARANTINE.encode("ascii")
+        cleanup = (b"C13 cleanup spawned=3 signaled=3 reaped=3 clean=2 "
+                   b"helpers=16 helpers_reaped=16 helper_unknown=0")
+        first = RUN.MINT_QUARANTINE.encode("ascii")
+        framed = owner + b"\n" + cleanup + b"\n" + first + b"\n"
+        cases = (
+            ("cr-delimited cleanup",
+             owner + b"\n" + b"ordinary\r" + cleanup + b"\rordinary\n" + first + b"\n"),
+            ("cr-delimited owner",
+             b"ordinary\r" + owner + b"\rordinary\n" + cleanup + b"\n" + first + b"\n"),
+            ("unterminated cleanup", owner + b"\n" + first + b"\n" + cleanup),
+            ("malformed cleanup", framed + b"C13 cleanup spawned=3 signaled=3 reaped=3\n"),
+            ("owner exit out of grammar", framed + b"C13 owner node=a action=mint exit=9999\n"),
+            ("unlisted first-failure",
+             framed + b"C13 first phase=not-a-phase category=not-a-category\n"),
+        )
+        for name, payload in cases:
+            with self.subTest(name=name):
+                capture = RUN.Capture()
+                capture.feed(payload)
+                with patch.object(RUN, "write_quarantine_marker") as marker:
+                    status, output, _, _ = self.fixture_campaign(101, capture, b"")
+                self.assertEqual(status, 1)
+                self.assertNotIn("quarantined", output)
+                self.assertNotIn("::warning::", output)
+                marker.assert_not_called()
+
     def test_launcher_timeout_is_not_quarantined(self):
         stage = Path("/tmp/arx-c13-abcdefgh")
         with (patch.object(RUN.time, "monotonic", return_value=10),

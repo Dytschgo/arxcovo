@@ -318,22 +318,68 @@ def cleanup_disposition(lines):
     return reaped_all, clean_close
 
 
-def quarantine_signature(first, lines, *, code, truncated, fixture, retained, unknown):
+EVIDENCE_MARKERS = ("C13 cleanup", "C13 owner", "C13 first")
+
+
+def campaign_lines(text):
+    """LF-terminated records, and whether framing blocks quarantine.
+
+    CR is never a record boundary. A CR inside a line that also carries a
+    cleanup, owner, or first-failure marker is a malformed record. An
+    unterminated tail is not a record; when it carries one of those markers
+    it blocks quarantine instead of being dropped.
+    """
+    blocked = False
+    if not text.endswith("\n"):
+        body, tail = text.rsplit("\n", 1) if "\n" in text else ("", text)
+        if any(marker in tail for marker in EVIDENCE_MARKERS):
+            blocked = True
+        text = f"{body}\n" if body else ""
+    records = []
+    if text:
+        for line in text[:-1].split("\n"):
+            if "\r" in line:
+                if any(marker in line for marker in EVIDENCE_MARKERS):
+                    blocked = True
+                continue
+            records.append(line)
+    return records, blocked
+
+
+def evidence_conflict(lines):
+    """True when a candidate record is missing, duplicated, or not exact."""
+    cleanup = [line for line in lines if line.startswith("C13 cleanup")]
+    owners = [line for line in lines if line.startswith("C13 owner")]
+    failures = [line for line in lines if line.startswith("C13 first")]
+    if len(cleanup) != 1 or any(CLEANUP.fullmatch(line) is None for line in cleanup):
+        return True
+    if len(owners) > 1 or any(OWNER_EXIT.fullmatch(line) is None for line in owners):
+        return True
+    if len(failures) != 1 or any(FIRST.fullmatch(line) is None and ASSERTION.fullmatch(line) is None
+                                 for line in failures):
+        return True
+    return False
+
+
+def quarantine_signature(first, lines, *, code, truncated, fixture, retained, unknown,
+                         evidence_blocked=False):
     # Result 101 is the harness panic status from both incidents. A timeout,
     # a different status, or truncated campaign output is a separate anomaly.
     # Artifact mismatches raise before this decision and keep a non-zero exit.
-    if (code != 101 or truncated or fixture != "removed" or retained != 0
-            or unknown != 0 or PIN in lines):
+    # Candidate records are counted before the exact field check, so a
+    # near-miss cannot disappear and leave one allowlisted record.
+    if (evidence_blocked or code != 101 or truncated or fixture != "removed" or retained != 0
+            or unknown != 0 or PIN in lines or evidence_conflict(lines)):
         return None
     reaped_all, _clean_close = cleanup_disposition(lines)
     if not reaped_all:
         return None
-    failures = [line for line in lines if FIRST.fullmatch(line) or ASSERTION.fullmatch(line)]
+    failures = [line for line in lines if line.startswith("C13 first")]
     if failures != [first]:
         return None
     if any(PUBLICATION.fullmatch(line) for line in lines):
         return None
-    owners = [line for line in lines if OWNER_EXIT.fullmatch(line)]
+    owners = [line for line in lines if line.startswith("C13 owner")]
     if first == MINT_QUARANTINE and owners == [MINT_OWNER_QUARANTINE]:
         return "mint-refused"
     if first == PROMOTION_QUARANTINE and not owners:
@@ -516,6 +562,7 @@ def privileged(stage, deadline):
     code = None
     capture = None
     lines = []
+    evidence_blocked = False
     start = time.monotonic()
     phase = "staging"
     try:
@@ -543,7 +590,7 @@ def privileged(stage, deadline):
             [root / "campaign", "--exact", SELECTOR, "--ignored", "--nocapture"],
             env=environment, timeout=timeout,
         )
-        lines = capture.text().splitlines()
+        lines, evidence_blocked = campaign_lines(capture.text())
         first = capture.first
         reaped_all, clean_close = cleanup_disposition(lines)
         # A reaped daemon can fail to close gracefully. Reclaim its disposable
@@ -588,7 +635,7 @@ def privileged(stage, deadline):
     relay_diagnostics(diagnostic)
     signature = quarantine_signature(
         first, lines, code=code, truncated=bool(capture is not None and capture.truncated),
-        fixture=fixture, retained=retained, unknown=unknown,
+        fixture=fixture, retained=retained, unknown=unknown, evidence_blocked=evidence_blocked,
     )
     if signature is not None:
         write_quarantine_marker(stage_directory, signature)
