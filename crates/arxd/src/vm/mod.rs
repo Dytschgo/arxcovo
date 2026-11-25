@@ -1,6 +1,8 @@
 //! VM admission and confined runtime components. Native issuance is closed.
 pub(crate) mod compose;
 pub(crate) mod compose_backup;
+#[doc(hidden)]
+pub use compose_backup::backup_retire_cli;
 pub(crate) mod compose_secrets;
 pub mod console;
 mod controller;

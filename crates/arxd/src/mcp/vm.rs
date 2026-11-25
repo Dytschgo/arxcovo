@@ -16579,6 +16579,10 @@ pub(crate) mod tests {
             let r = call(&a, tool, json!({"vm_id": vm})).await;
             assert_eq!(r["reason"], "static_delete_forbidden", "{tool}: {r}");
         }
+        for tool in ["backup-retire", "backup_retire", "compose_backup_retire"] {
+            let r = call(&a, tool, json!({"vm_id": vm, "backup_id": b1["backup_id"]})).await;
+            assert_eq!(r["reason"], "unknown_tool", "{tool}: {r}");
+        }
         let snap_del = call(
             &a,
             "vm_snapshot_delete",
