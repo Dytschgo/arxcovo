@@ -3,14 +3,15 @@
 //!
 //! Native observations are **unverified on real hardware**.
 
+use crate::Mode;
 use crate::frame::*;
 use crate::trial::*;
-#[cfg(test)]
-use arxd::vm::qualification::DiagnosticFile;
 use arxd::vm::qualification::{
-    self, Baseline, Entry, PausedPhase, PausedTrial, PausedTrialPermit, PausedVerdict, Preflight,
-    Taken,
+    self, Baseline, Entry, FirmwareProbe, PausedPhase, PausedTrial, PausedTrialPermit,
+    PausedVerdict, Preflight, Taken,
 };
+#[cfg(test)]
+use arxd::vm::qualification::{DiagnosticFile, PausedCompleted};
 use arxd::{
     service::Shutdown,
     vm::runtime::{NativeRefusal, StopDisposition},
@@ -25,6 +26,7 @@ pub(crate) enum Outcome {
 
 struct NativeClock {
     origin: Instant,
+    cancel: Shutdown,
 }
 
 fn ms_since(origin: Instant) -> u64 {
@@ -43,7 +45,7 @@ impl Clock for NativeClock {
     }
 
     fn cancelled(&self) -> bool {
-        false
+        self.cancel.is_cancelled()
     }
 }
 
@@ -65,8 +67,7 @@ pub(crate) fn dependencies(p: &Preflight) -> Dependencies {
     let s = &p.store;
     Dependencies {
         release: release(),
-        // No reviewed artifact pin exists in 7b1; 7c binds the selected one.
-        artifact: Measured::Unmeasured,
+        artifact: measured(p.reviewed_release),
         host: measured(observed(&p.host).map(|host| HostDependency {
             windows_build: host.windows_build,
             windows_revision: host.windows_revision,
@@ -83,8 +84,9 @@ pub(crate) fn dependencies(p: &Preflight) -> Dependencies {
             backing_file: s.backing_file,
             vhd_virtual_bytes: limits.vhd_virtual_bytes,
             inner_extent_bytes: limits.inner_extent_bytes,
+            test_scope: p.test_scope,
         })),
-        owner_profile: Measured::Unmeasured,
+        owner_profile: measured(p.owner_profile),
         distribution: measured(observed(&p.distribution).map(|distribution| {
             DistributionDependency {
                 receipt: distribution.receipt,
@@ -312,6 +314,40 @@ impl<S: Source<Store = NoNativeStore>> Collectors<S> for NativeCollectors {
     }
 }
 
+/// Records one verified release disposition per invocation and latches
+/// `ChargedQuarantine` for the entire run so no later stage can clear it.
+#[derive(Default)]
+pub(crate) struct ReleaseLedger {
+    invocations: Vec<(Stage, StopDisposition)>,
+    quarantined: bool,
+}
+
+impl ReleaseLedger {
+    pub(crate) fn record(&mut self, stage: Stage, disposition: StopDisposition) {
+        self.invocations.push((stage, disposition));
+        if disposition == StopDisposition::ChargedQuarantine {
+            self.quarantined = true;
+        }
+    }
+
+    pub(crate) fn is_quarantined(&self) -> bool {
+        self.quarantined
+    }
+
+    pub(crate) fn teardown(&self) -> Teardown {
+        if self.quarantined {
+            Teardown::Uncertain
+        } else {
+            Teardown::Released
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> usize {
+        self.invocations.len()
+    }
+}
+
 /// Only this collector can construct the native store proof. The OS
 /// adapter separately owns the exclusive on-volume slot.
 pub(crate) struct PausedStore(());
@@ -320,21 +356,31 @@ pub(crate) struct PausedCollectors<'a> {
     baseline: &'a Baseline,
     projected: NativeCollectors,
     runtime: Option<&'a tokio::runtime::Runtime>,
+    cancel: Shutdown,
     permit: Option<PausedTrialPermit<'a>>,
     result: Option<PausedTrial>,
+    full_test: bool,
+    releases: ReleaseLedger,
+    firmware_qmp: Option<FirmwareProbe>,
 }
 
 impl<'a> PausedCollectors<'a> {
     pub(crate) fn new(
         baseline: &'a Baseline,
         runtime: Option<&'a tokio::runtime::Runtime>,
+        full_test: bool,
+        cancel: Shutdown,
     ) -> Self {
         Self {
             baseline,
             projected: NativeCollectors::new(baseline.observations(), baseline.origin()),
             runtime,
+            cancel,
             permit: None,
             result: None,
+            full_test,
+            releases: ReleaseLedger::default(),
+            firmware_qmp: None,
         }
     }
 }
@@ -365,9 +411,39 @@ impl Collectors<Native> for PausedCollectors<'_> {
 
     fn implemented(&self, stage: Stage) -> bool {
         paused_phase(stage).is_some()
+            || (self.full_test
+                && matches!(
+                    stage,
+                    Stage::FirstGuestExecution
+                        | Stage::SupervisorLossRelease
+                        | Stage::CapacityTrials
+                        | Stage::ReserveActivityTrials
+                        | Stage::QmpChannel
+                        | Stage::RestrictedTestNetwork
+                ))
     }
 
     fn previous_effect(&mut self, stage: Stage) -> Option<Collected> {
+        if self.full_test && stage == Stage::QmpChannel {
+            let result = match &self.firmware_qmp {
+                Some(probe)
+                    if probe.accepted
+                        && probe.greeting_verified
+                        && probe.whpx_enabled
+                        && probe.quit_clean_eof
+                        && probe.release == StopDisposition::CleanRelease =>
+                {
+                    StageResult::Passed(Observation::QmpFirmware {
+                        greeting_verified: probe.greeting_verified,
+                        whpx_enabled: probe.whpx_enabled,
+                        quit_clean_eof: probe.quit_clean_eof,
+                        clean_release: probe.release == StopDisposition::CleanRelease,
+                    })
+                }
+                _ => StageResult::Failed(Diagnostic::PrerequisiteMissing),
+            };
+            return Some(Collected::at(self.projected.now_ms(), result));
+        }
         matches!(
             stage,
             Stage::QemuPrelaunchPause | Stage::HeldBundleInventory
@@ -380,8 +456,17 @@ impl Collectors<Native> for PausedCollectors<'_> {
         })
     }
 
-    fn plan(&mut self, _: Stage) -> EffectPlan {
-        EffectPlan::CONFINED
+    fn plan(&mut self, stage: Stage) -> EffectPlan {
+        EffectPlan {
+            paused: !matches!(
+                stage,
+                Stage::FirstGuestExecution
+                    | Stage::SupervisorLossRelease
+                    | Stage::RestrictedTestNetwork
+            ),
+            network: stage == Stage::RestrictedTestNetwork,
+            ..EffectPlan::CONFINED
+        }
     }
 
     fn live(&mut self) -> Option<u64> {
@@ -393,24 +478,179 @@ impl Collectors<Native> for PausedCollectors<'_> {
 
     fn effect(&mut self, stage: Stage, _: EffectPlan, _: &PausedStore) -> Collected {
         let started_ms = self.projected.now_ms();
+        if self.releases.is_quarantined() {
+            return Collected::at(
+                started_ms,
+                StageResult::Failed(Diagnostic::TeardownUncertain),
+            );
+        }
+        if self.full_test && stage == Stage::ReserveActivityTrials {
+            let result = match (self.runtime, self.baseline.prepare_reserve_activity()) {
+                (Some(runtime), Ok(permit)) => {
+                    let observed = runtime.block_on(permit.run(&self.cancel));
+                    for disp in &observed.invocations {
+                        self.releases.record(stage, *disp);
+                    }
+                    if observed.invocations.is_empty() {
+                        self.releases.record(stage, observed.release);
+                    }
+                    match observed.observations {
+                        Some((controlled_faults, console_transitions_ms))
+                            if !self.releases.is_quarantined() =>
+                        {
+                            StageResult::Passed(Observation::ReserveActivity {
+                                controlled_faults: Box::new(controlled_faults),
+                                console_transitions_ms,
+                            })
+                        }
+                        _ if self.releases.is_quarantined() => {
+                            StageResult::Failed(Diagnostic::TeardownUncertain)
+                        }
+                        None => StageResult::Inconclusive(Diagnostic::OwnerActivityUnverified),
+                        Some(_) => StageResult::Failed(Diagnostic::TeardownUncertain),
+                    }
+                }
+                (_, Err(reason)) => StageResult::Failed(refused(reason)),
+                _ => StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
+            };
+            return Collected {
+                started_ms,
+                finished_ms: self.projected.now_ms(),
+                result,
+            };
+        }
+        if self.full_test && stage == Stage::FirstGuestExecution {
+            let result = match (self.runtime, self.baseline.prepare_firmware_probe()) {
+                (Some(runtime), Ok(permit)) => {
+                    let probe = runtime.block_on(permit.run(&self.cancel));
+                    self.releases.record(stage, probe.release);
+                    if probe.accepted {
+                        let obs = Observation::FirmwareSec {
+                            sec_marker_verified: probe.sec_marker_verified,
+                            prelaunch_quiet: probe.prelaunch_quiet,
+                            job_memory_limit_bytes: probe.job_memory_limit_bytes,
+                            job_cpu_rate: probe.job_cpu_rate,
+                            clean_release: probe.release == StopDisposition::CleanRelease,
+                        };
+                        self.firmware_qmp = Some(probe);
+                        StageResult::Passed(obs)
+                    } else {
+                        StageResult::Failed(
+                            probe.refusal.map_or(Diagnostic::TeardownUncertain, refused),
+                        )
+                    }
+                }
+                (_, Err(reason)) => StageResult::Failed(refused(reason)),
+                _ => StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
+            };
+            return Collected {
+                started_ms,
+                finished_ms: self.projected.now_ms(),
+                result,
+            };
+        }
+        if self.full_test && stage == Stage::SupervisorLossRelease {
+            let result = match (self.runtime, self.baseline.prepare_supervisor_loss()) {
+                (Some(runtime), Ok(permit)) => {
+                    let probe = runtime.block_on(permit.run(&self.cancel));
+                    self.releases.record(stage, probe.release);
+                    if probe.accepted {
+                        StageResult::Passed(Observation::SupervisorLoss {
+                            job_memory_limit_bytes: probe.job_memory_limit_bytes,
+                            job_cpu_rate: probe.job_cpu_rate,
+                            active_process_limit: probe.active_process_limit,
+                            child_exited: probe.child_exited,
+                            job_empty_notified: probe.job_empty_notified,
+                            dirty_release: probe.release == StopDisposition::DirtyRelease,
+                        })
+                    } else if probe.inconclusive {
+                        StageResult::Inconclusive(Diagnostic::TeardownUncertain)
+                    } else {
+                        StageResult::Failed(
+                            probe.refusal.map_or(Diagnostic::TeardownUncertain, refused),
+                        )
+                    }
+                }
+                (_, Err(reason)) => StageResult::Failed(refused(reason)),
+                _ => StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
+            };
+            return Collected {
+                started_ms,
+                finished_ms: self.projected.now_ms(),
+                result,
+            };
+        }
+        if self.full_test && stage == Stage::CapacityTrials {
+            let result = match (self.runtime, self.baseline.prepare_capacity_probe()) {
+                (Some(runtime), Ok(permit)) => {
+                    let probe = runtime.block_on(permit.run(&self.cancel));
+                    self.releases.record(stage, probe.release);
+                    if probe.accepted {
+                        StageResult::Passed(Observation::CapacityExercised {
+                            trial_allocated_bytes: probe.trial_allocated_bytes,
+                            recipe_allocated_bytes: probe.recipe_allocated_bytes,
+                            denial_checks: probe.denial_checks,
+                            overlap_excluded: probe.overlap_excluded,
+                            aggregate_cap_checked: probe.aggregate_cap_checked,
+                            trial_released: probe.trial_released,
+                            recipe_released: probe.recipe_released,
+                        })
+                    } else {
+                        StageResult::Failed(
+                            probe.refusal.map_or(Diagnostic::TeardownUncertain, refused),
+                        )
+                    }
+                }
+                (_, Err(reason)) => StageResult::Failed(refused(reason)),
+                _ => StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
+            };
+            return Collected {
+                started_ms,
+                finished_ms: self.projected.now_ms(),
+                result,
+            };
+        }
+        if self.full_test && stage == Stage::RestrictedTestNetwork {
+            let result = match (self.runtime, self.baseline.prepare_network_probe()) {
+                (Some(runtime), Ok(permit)) => {
+                    let probe = runtime.block_on(permit.run(&self.cancel));
+                    self.releases.record(stage, probe.release);
+                    if probe.accepted {
+                        StageResult::Passed(Observation::RestrictedNetworkLive {
+                            job_memory_limit_bytes: probe.job_memory_limit_bytes,
+                            job_cpu_rate: probe.job_cpu_rate,
+                            host_controls_pre: probe.host_controls_pre,
+                            host_controls_post: probe.host_controls_post,
+                            nic_setup_verified: probe.nic_setup_verified,
+                            denied_probes: probe.denied_probes,
+                            zero_hostfwd: probe.zero_hostfwd,
+                            clean_guest_shutdown: probe.clean_guest_shutdown,
+                            seed_released: probe.seed_released,
+                        })
+                    } else {
+                        StageResult::Failed(
+                            probe.refusal.map_or(Diagnostic::TeardownUncertain, refused),
+                        )
+                    }
+                }
+                (_, Err(reason)) => StageResult::Failed(refused(reason)),
+                _ => StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
+            };
+            return Collected {
+                started_ms,
+                finished_ms: self.projected.now_ms(),
+                result,
+            };
+        }
         if stage != Stage::SuspendedChild {
             return Collected::at(started_ms, StageResult::Unimplemented);
         }
         if let (Some(runtime), Some(permit)) = (self.runtime, self.permit.take()) {
             // Startup, paused QMP, inventory recheck and stop are one held
             // operation. Subsequent rows only project its verified result.
-            self.result = Some(runtime.block_on(async {
-                let cancel = Shutdown::default();
-                let signal = cancel.clone();
-                let interrupt = tokio::spawn(async move {
-                    if tokio::signal::ctrl_c().await.is_ok() {
-                        signal.cancel();
-                    }
-                });
-                let result = permit.run(&cancel).await;
-                interrupt.abort();
-                result
-            }));
+            let trial = runtime.block_on(permit.run(&self.cancel));
+            self.releases.record(stage, trial.release);
+            self.result = Some(trial);
         }
         let result = project_paused(stage, self.result.as_ref());
         Collected {
@@ -421,7 +661,10 @@ impl Collectors<Native> for PausedCollectors<'_> {
     }
 
     fn cleanup(&mut self, _: u16) -> Teardown {
-        paused_teardown(self.result.as_ref())
+        match self.releases.teardown() {
+            Teardown::Uncertain => Teardown::Uncertain,
+            Teardown::Released => paused_teardown(self.result.as_ref()),
+        }
     }
 }
 
@@ -442,25 +685,41 @@ fn project_paused(stage: Stage, trial: Option<&PausedTrial>) -> StageResult {
         return StageResult::Inconclusive(Diagnostic::PrerequisiteMissing);
     };
     let pass = StageResult::Passed(Observation::PausedTrial { verified: true });
-    if matches!(
-        (phase, trial.phase),
-        (
-            PausedPhase::SuspendedChild,
-            PausedPhase::Prelaunch | PausedPhase::BundleInventory
-        ) | (PausedPhase::Prelaunch, PausedPhase::BundleInventory)
-    ) {
-        return pass;
-    }
-    if phase != trial.phase {
-        return StageResult::Inconclusive(Diagnostic::PrerequisiteMissing);
-    }
-    match trial.verdict {
-        PausedVerdict::Verified => pass,
-        PausedVerdict::Refused(reason) => StageResult::Failed(refused(reason)),
+    let failed = |verdict: &PausedVerdict| match verdict {
+        PausedVerdict::Verified => pass.clone(),
+        PausedVerdict::Refused(reason) => StageResult::Failed(refused(*reason)),
         PausedVerdict::OwnerActive => StageResult::Failed(Diagnostic::OwnerActive),
         PausedVerdict::Qmp => StageResult::Failed(Diagnostic::OtherRefusal),
         PausedVerdict::Timeout => StageResult::Failed(Diagnostic::Expired),
         PausedVerdict::Cancelled => StageResult::Failed(Diagnostic::Cancelled),
+    };
+    let done = trial.completed;
+    match phase {
+        PausedPhase::SuspendedChild => {
+            if done.suspended_child {
+                pass
+            } else {
+                failed(&trial.verdict)
+            }
+        }
+        PausedPhase::Prelaunch => {
+            if done.prelaunch {
+                pass
+            } else if done.suspended_child {
+                failed(&trial.verdict)
+            } else {
+                StageResult::Inconclusive(Diagnostic::PrerequisiteMissing)
+            }
+        }
+        PausedPhase::BundleInventory => {
+            if done.bundle_inventory && matches!(trial.verdict, PausedVerdict::Verified) {
+                pass
+            } else if done.prelaunch {
+                failed(&trial.verdict)
+            } else {
+                StageResult::Inconclusive(Diagnostic::PrerequisiteMissing)
+            }
+        }
     }
 }
 
@@ -556,8 +815,8 @@ impl DiagnosticSink for BaselineSink<'_> {
     }
 }
 
-pub(crate) fn run(enrollment: &str, evidence: &str, paused: bool) -> Result<Outcome, RunError> {
-    let runtime = paused
+pub(crate) fn run(enrollment: &str, evidence: &str, mode: Mode) -> Result<Outcome, RunError> {
+    let runtime = (mode != Mode::Baseline)
         .then(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -568,14 +827,24 @@ pub(crate) fn run(enrollment: &str, evidence: &str, paused: bool) -> Result<Outc
     // Everything fallible happens before the preflight claims the output,
     // including the writer's own random scope and run. After the claim,
     // every failure settles as a typed diagnostic.
-    let preflight = if paused {
-        qualification::preflight_paused
-    } else {
-        qualification::preflight
+    let preflight = match mode {
+        Mode::Baseline => qualification::preflight,
+        Mode::Paused => qualification::preflight_paused,
+        Mode::Test => qualification::preflight_full_test,
     };
     let baseline = preflight(enrollment, evidence).map_err(RunError::Native)?;
+    let cancel = Shutdown::default();
+    let interrupt = runtime.as_ref().map(|rt| {
+        let signal = cancel.clone();
+        rt.spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal.cancel();
+            }
+        })
+    });
     let clock = NativeClock {
         origin: baseline.origin(),
+        cancel: cancel.clone(),
     };
     let dependencies = dependencies(baseline.observations());
     let issued = clock.now();
@@ -583,7 +852,10 @@ pub(crate) fn run(enrollment: &str, evidence: &str, paused: bool) -> Result<Outc
     // observations are reached only through the trial's own reference.
     let trial_authority = TrialAuthority::issue(baseline, Class::Test, dependencies, issued);
     let mut trial = Trial::begin(trial_authority);
-    trial.drive_native(runtime.as_ref(), &clock);
+    trial.drive_native(runtime.as_ref(), mode == Mode::Test, &cancel, &clock);
+    if let Some(handle) = interrupt {
+        handle.abort();
+    }
     publish_incomplete(&trial, &mut BaselineSink(trial.custody()))?;
     Ok(Outcome::Incomplete)
 }
@@ -596,6 +868,11 @@ mod paused_tests {
     fn projections_are_limited_to_completed_paused_phases() {
         let mut trial = PausedTrial {
             phase: PausedPhase::BundleInventory,
+            completed: PausedCompleted {
+                suspended_child: true,
+                prelaunch: true,
+                bundle_inventory: false,
+            },
             verdict: PausedVerdict::Refused(NativeRefusal::DistributionUnverified),
             release: StopDisposition::ChargedQuarantine,
         };
@@ -610,6 +887,7 @@ mod paused_tests {
             StageResult::Failed(Diagnostic::DistributionUnverified)
         );
         assert!(matches!(paused_teardown(Some(&trial)), Teardown::Uncertain));
+        trial.completed.bundle_inventory = true;
         trial.verdict = PausedVerdict::Verified;
         trial.release = StopDisposition::DirtyRelease;
         assert_eq!(
@@ -622,5 +900,23 @@ mod paused_tests {
         );
         assert!(matches!(paused_teardown(Some(&trial)), Teardown::Released));
         assert!(matches!(paused_teardown(None), Teardown::Released));
+    }
+
+    #[test]
+    fn release_ledger_records_each_invocation_and_latches_quarantine() {
+        let mut ledger = ReleaseLedger::default();
+        ledger.record(Stage::SuspendedChild, StopDisposition::DirtyRelease);
+        ledger.record(Stage::FirstGuestExecution, StopDisposition::CleanRelease);
+        assert!(!ledger.is_quarantined());
+        assert_eq!(ledger.teardown(), Teardown::Released);
+        ledger.record(
+            Stage::SupervisorLossRelease,
+            StopDisposition::ChargedQuarantine,
+        );
+        // Subsequent CleanRelease must NEVER clear latched quarantine.
+        ledger.record(Stage::CapacityTrials, StopDisposition::CleanRelease);
+        assert!(ledger.is_quarantined());
+        assert_eq!(ledger.teardown(), Teardown::Uncertain);
+        assert_eq!(ledger.count(), 4);
     }
 }

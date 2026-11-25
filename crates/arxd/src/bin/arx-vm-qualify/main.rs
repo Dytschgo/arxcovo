@@ -31,14 +31,14 @@ fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
 
     let args: Vec<_> = std::env::args_os().skip(1).take(4).collect();
-    let Some((enrollment, evidence, paused)) = parse_args(&args) else {
+    let Some((enrollment, evidence, mode)) = parse_args(&args) else {
         eprintln!(
-            "usage: arx-vm-qualify [--paused-trial] ENROLLMENT_JSON EMPTY_EVIDENCE_DIRECTORY"
+            "usage: arx-vm-qualify [--paused-trial | --full-test] ENROLLMENT_JSON EMPTY_EVIDENCE_DIRECTORY"
         );
         eprintln!("{}", failure_line(&frame::RunError::Input));
         return ExitCode::FAILURE;
     };
-    let result = native::run(enrollment, evidence, paused);
+    let result = native::run(enrollment, evidence, mode);
     // Only typed, path-free outcomes reach the console.
     match result {
         Ok(native::Outcome::Incomplete) => {
@@ -53,13 +53,24 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
-fn parse_args(args: &[std::ffi::OsString]) -> Option<(&str, &str, bool)> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    Baseline,
+    Paused,
+    Test,
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn parse_args(args: &[std::ffi::OsString]) -> Option<(&str, &str, Mode)> {
     match args {
         [enrollment, evidence] if !enrollment.to_str()?.starts_with("--") => {
-            Some((enrollment.to_str()?, evidence.to_str()?, false))
+            Some((enrollment.to_str()?, evidence.to_str()?, Mode::Baseline))
         }
         [flag, enrollment, evidence] if flag == "--paused-trial" => {
-            Some((enrollment.to_str()?, evidence.to_str()?, true))
+            Some((enrollment.to_str()?, evidence.to_str()?, Mode::Paused))
+        }
+        [flag, enrollment, evidence] if flag == "--full-test" => {
+            Some((enrollment.to_str()?, evidence.to_str()?, Mode::Test))
         }
         _ => None,
     }
@@ -71,11 +82,15 @@ fn paused_cli_requires_the_exact_opt_in_and_both_paths() {
     for (raw, expected) in [
         (
             vec!["enrollment", "evidence"],
-            Some(("enrollment", "evidence", false)),
+            Some(("enrollment", "evidence", Mode::Baseline)),
         ),
         (
             vec!["--paused-trial", "enrollment", "evidence"],
-            Some(("enrollment", "evidence", true)),
+            Some(("enrollment", "evidence", Mode::Paused)),
+        ),
+        (
+            vec!["--full-test", "enrollment", "evidence"],
+            Some(("enrollment", "evidence", Mode::Test)),
         ),
         (vec!["--paused-trial", "enrollment"], None),
         (vec!["--unknown", "enrollment", "evidence"], None),

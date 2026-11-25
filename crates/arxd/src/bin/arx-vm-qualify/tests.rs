@@ -43,6 +43,7 @@ fn deps() -> Dependencies {
             backing_file: [7; 16],
             vhd_virtual_bytes: 100 * GIB,
             inner_extent_bytes: 99 * GIB,
+            test_scope: Some([19; 32]),
         }),
         owner_profile: Measured::Measured([8; 32]),
         distribution: Measured::Measured(DistributionDependency {
@@ -465,6 +466,43 @@ fn fixture_output_is_never_admissible_at_the_verifier() {
         verify_native(&done.seal, &done.files, &selection, &fresh(&dependencies)),
         Err(RunError::Untrusted)
     );
+}
+
+#[test]
+fn shared_reader_rejects_untrusted_seal_and_manifest_before_opening_rows() {
+    let done = sealed(Class::Test);
+    let dependencies = deps();
+    let reading = |seal: &Seal, expected: RunError| {
+        let bytes = canonical(seal).unwrap();
+        let selected = Selection {
+            seal_sha256: digest(&bytes),
+            scope: SCOPE,
+        };
+        assert_eq!(
+            read_native::<&[u8]>(
+                bytes.as_slice(),
+                bytes.len() as u64,
+                |_| panic!("refused manifest opened an evidence row"),
+                &selected,
+                &fresh(&dependencies)
+            ),
+            Err(expected)
+        );
+    };
+
+    let mut seal: Seal = decode(&done.seal).unwrap();
+    reading(&seal, RunError::Untrusted);
+    seal.origin = Origin::Native;
+    seal.manifest[0].length = RECORD_LIMIT as u64 + 1;
+    reading(&seal, RunError::Encoding);
+    seal.manifest[0].length = 0;
+    reading(&seal, RunError::Encoding);
+    seal.manifest[0].length = done.files[0].1.len() as u64;
+    seal.manifest[0].file = FileKind::RecipeDocker;
+    reading(&seal, RunError::Encoding);
+    seal.manifest[0].file = FileKind::Inputs;
+    seal.manifest.push(seal.manifest[0].clone());
+    reading(&seal, RunError::Incomplete);
 }
 
 #[test]
@@ -1843,6 +1881,9 @@ mod native_glue {
                 },
             ),
             whpx_present: taken(10, whpx),
+            owner_profile: None,
+            reviewed_release: None,
+            test_scope: None,
             store: StoreIdentity {
                 trial_volume: 11,
                 trial_volume_root: [5; 16],
@@ -1935,6 +1976,7 @@ mod native_glue {
                     reads.set(reads.get() + 1);
                     Ok((capacity_facts(), ()))
                 },
+                || Err(NativeRefusal::DistributionUnverified),
                 || {
                     jobs.set(jobs.get() + 1);
                     Ok(())
@@ -2122,6 +2164,7 @@ mod native_glue {
                 backing_file: [7; 16],
                 vhd_virtual_bytes: 100 * GIB,
                 inner_extent_bytes: 99 * GIB,
+                test_scope: None,
             })
         );
         // The machine identity binds the key but never reaches a record.
@@ -2289,4 +2332,152 @@ mod native_glue {
             )));
         }
     }
+}
+
+#[test]
+fn controlled_fault_rows_require_an_ordered_real_sample_and_console_sequence() {
+    let faults = ControlledFault::ALL.map(|fault| FaultRecord {
+        fault,
+        sampled_ms: 20,
+        settled_ms: 30,
+        console_idle: true,
+        effective_cpus: 4,
+        available_ram_bytes: 24 * GIB,
+        inner_free_bytes: GIB / 2,
+        outer_free_bytes: 80 * GIB,
+    });
+    let mut faults = faults;
+    for (index, fault) in faults.iter_mut().enumerate() {
+        fault.sampled_ms += index as u64 * 20;
+        fault.settled_ms += index as u64 * 20;
+    }
+    let stage = Stage::ReserveActivityTrials;
+    let observed = |controlled_faults, console_transitions_ms| Observation::ReserveActivity {
+        controlled_faults: Box::new(controlled_faults),
+        console_transitions_ms,
+    };
+    let timestamps = [100, 120, 140, 160, 180];
+    let passing = observed(faults, timestamps);
+    assert!(passing.validates(stage, Origin::Native));
+    assert!(!passing.validates(stage, Origin::Fixture));
+    let mut incorrect = faults;
+    incorrect[0].fault = ControlledFault::DiskReserve;
+    assert!(!observed(incorrect, timestamps).validates(stage, Origin::Native));
+    incorrect = faults;
+    incorrect[0].settled_ms = incorrect[0].sampled_ms;
+    assert!(!observed(incorrect, timestamps).validates(stage, Origin::Native));
+    assert!(!observed(faults, [100, 120, 140, 160, 160]).validates(stage, Origin::Native));
+}
+
+#[test]
+fn typed_host_observations_validate_and_match_the_closed_writer_schema() {
+    let cases = [
+        (
+            Stage::FirstGuestExecution,
+            Observation::FirmwareSec {
+                sec_marker_verified: true,
+                prelaunch_quiet: true,
+                job_memory_limit_bytes: JOB_MEMORY_BYTES,
+                job_cpu_rate: JOB_CPU_RATE,
+                clean_release: true,
+            },
+        ),
+        (
+            Stage::QmpChannel,
+            Observation::QmpFirmware {
+                greeting_verified: true,
+                whpx_enabled: true,
+                quit_clean_eof: true,
+                clean_release: true,
+            },
+        ),
+        (
+            Stage::SupervisorLossRelease,
+            Observation::SupervisorLoss {
+                job_memory_limit_bytes: JOB_MEMORY_BYTES,
+                job_cpu_rate: JOB_CPU_RATE,
+                active_process_limit: 1,
+                child_exited: true,
+                job_empty_notified: true,
+                dirty_release: true,
+            },
+        ),
+        (
+            Stage::CapacityTrials,
+            Observation::CapacityExercised {
+                trial_allocated_bytes: 1 << 20,
+                recipe_allocated_bytes: 1 << 20,
+                denial_checks: 5,
+                overlap_excluded: true,
+                aggregate_cap_checked: true,
+                trial_released: true,
+                recipe_released: true,
+            },
+        ),
+        (
+            Stage::RestrictedTestNetwork,
+            Observation::RestrictedNetworkLive {
+                job_memory_limit_bytes: 6 * GIB,
+                job_cpu_rate: JOB_CPU_RATE,
+                host_controls_pre: true,
+                host_controls_post: true,
+                nic_setup_verified: true,
+                denied_probes: 8,
+                zero_hostfwd: true,
+                clean_guest_shutdown: true,
+                seed_released: true,
+            },
+        ),
+    ];
+    for (stage, obs) in cases {
+        assert!(obs.validates(stage, Origin::Native), "{stage:?}");
+        assert!(!obs.validates(stage, Origin::Fixture), "{stage:?}");
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let record = vec![Record {
+                contract: CONTRACT,
+                collector: COLLECTOR,
+                origin: Origin::Native,
+                binding: Binding {
+                    class: Class::Test,
+                    scope: SCOPE,
+                    release: release(),
+                    run: RUN,
+                    dependencies: deps().key(SCOPE),
+                    issued_utc: 1_800_000_000,
+                    expires_utc: 1_800_604_800,
+                },
+                stage,
+                started_ms: 10,
+                finished_ms: 20,
+                prior: [0; 32],
+                result: StageResult::Passed(obs),
+            }];
+            let bytes = canonical(&record).unwrap();
+            let file = crate::native::diagnostic_file(Output::Records(stage.file()));
+            assert!(
+                arxd::vm::qualification::schema_accepts(file, &bytes),
+                "schema rejected {stage:?}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
+    // Check confinement covers the host & restricted network stages.
+    assert_eq!(
+        Stage::CapacityTrials.confinement(),
+        Some(EffectPlan::CONFINED)
+    );
+    assert_eq!(
+        Stage::ReserveActivityTrials.confinement(),
+        Some(EffectPlan::CONFINED)
+    );
+    assert_eq!(Stage::QmpChannel.confinement(), Some(EffectPlan::CONFINED));
+    assert_eq!(
+        Stage::RestrictedTestNetwork.confinement(),
+        Some(EffectPlan {
+            paused: false,
+            disks: 0,
+            network: true,
+        })
+    );
 }
