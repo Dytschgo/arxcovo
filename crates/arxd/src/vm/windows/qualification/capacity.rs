@@ -409,6 +409,17 @@ pub(super) struct HeldDevice {
     pub extent_length: i64,
 }
 
+#[cfg(test)]
+impl HeldDevice {
+    pub(super) fn test_dummy(file: &File) -> Self {
+        Self {
+            _device: OwnedHandle::from(file.try_clone().unwrap()),
+            extent_start: 0,
+            extent_length: 0,
+        }
+    }
+}
+
 fn volume_guid(drive_root: &str) -> Option<String> {
     let mut name = [0u16; 64];
     // The fixed buffer exceeds the 49-unit `\\?\Volume{GUID}\` name.

@@ -73,7 +73,8 @@ impl TrialAuthority<Native> {
         issued: Instant2,
     ) -> Self {
         let (scope, run) = (custody.scope(), custody.run());
-        Self::bind(custody, class, scope, run, dependencies, issued)
+        let boot = custody.boot_anchor();
+        Self::bind(custody, class, scope, run, dependencies, issued, boot)
     }
 }
 
@@ -88,7 +89,18 @@ impl<S: Source<Custody = ()>> TrialAuthority<S> {
         dependencies: Dependencies,
         issued: Instant2,
     ) -> Self {
-        Self::bind((), class, scope, run, dependencies, issued)
+        Self::bind(
+            (),
+            class,
+            scope,
+            run,
+            dependencies,
+            issued,
+            BootAnchor {
+                marker: [1; 32],
+                origin_mono_ms: 0,
+            },
+        )
     }
 }
 
@@ -100,6 +112,7 @@ impl<S: Source> TrialAuthority<S> {
         run: [u8; 16],
         dependencies: Dependencies,
         issued: Instant2,
+        boot: BootAnchor,
     ) -> Self {
         Self {
             custody,
@@ -109,6 +122,8 @@ impl<S: Source> TrialAuthority<S> {
                 release: release(),
                 run,
                 dependencies: dependencies.key(scope),
+                boot,
+                issued_mono_ms: issued.mono_ms,
                 issued_utc: issued.utc,
                 expires_utc: issued.utc.saturating_add(MAX_VALIDITY),
             },

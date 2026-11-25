@@ -12,7 +12,7 @@ use std::io::Read;
 
 pub type Hash = [u8; 32];
 
-pub const CONTRACT: u16 = 3;
+pub const CONTRACT: u16 = 4;
 pub const COLLECTOR: u16 = 1;
 pub const RECORD_LIMIT: usize = 16 * 1024;
 /// Seven days, exclusive at the upper boundary.
@@ -978,11 +978,24 @@ pub struct Binding {
     pub run: [u8; 16],
     /// Keyed digest of the complete dependency projection.
     pub dependencies: Hash,
+    pub boot: BootAnchor,
+    /// Elapsed time from the qualifier's stage clock origin.
+    pub issued_mono_ms: u64,
     pub issued_utc: u64,
     pub expires_utc: u64,
 }
 
 impl Binding {
+    pub fn issued_on_boot(self, marker: Hash) -> Option<Instant2> {
+        if marker == [0; 32] || self.boot.marker != marker || self.issued_mono_ms > MAX_TRIAL_MS {
+            return None;
+        }
+        Some(Instant2 {
+            utc: self.issued_utc,
+            mono_ms: self.boot.origin_mono_ms.checked_add(self.issued_mono_ms)?,
+        })
+    }
+
     pub fn live_at(self, now_utc: u64, dependencies: Hash) -> bool {
         self.scope != [0; 32]
             && self.release == release()
@@ -992,6 +1005,23 @@ impl Binding {
             && self.issued_utc <= now_utc
             && now_utc < self.expires_utc
             && self.expires_utc - self.issued_utc <= MAX_VALIDITY
+    }
+}
+
+/// The boot-scoped marker and the qualifier stage clock's origin on that boot.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootAnchor {
+    pub marker: Hash,
+    pub origin_mono_ms: u64,
+}
+
+impl BootAnchor {
+    pub fn on_boot(self, instant: Instant2) -> Option<Instant2> {
+        Some(Instant2 {
+            utc: instant.utc,
+            mono_ms: self.origin_mono_ms.checked_add(instant.mono_ms)?,
+        })
     }
 }
 
@@ -1300,20 +1330,13 @@ pub struct Selection {
 
 /// Independently re-measured state at verification time.
 ///
-/// Clock anchor. Within one boot, `issued` is the issuance instant and
-/// `clocks_agree` compares elapsed UTC with elapsed monotonic time, which
-/// catches a wall-clock rollback inside the validity window. A reboot resets
-/// the monotonic origin, so this verifier fails closed after one. The 7c
-/// issuer supplies the independent anchor instead: at each foreground start
-/// it opens a new supervisor epoch from live evidence, recording the epoch's
-/// UTC and monotonic pair together with a persisted, only-increasing UTC
-/// high-water mark held in the owner-local enrollment store. It refuses an
-/// epoch whose UTC is below the high-water mark or the record's issue time,
-/// then verifies within the epoch against that pair. Until 7c lands, a
-/// qualification never survives a reboot.
+/// The reader compares an independent boot marker and boot uptime with the
+/// pinned issuance instant. The daemon's persistent UTC high-water mark is
+/// an additional admission check outside this reader.
 pub struct Fresh<'a> {
+    /// Monotonic milliseconds since host boot.
     pub now: Instant2,
-    pub issued: Instant2,
+    pub boot_marker: Hash,
     pub dependencies: &'a Dependencies,
 }
 
@@ -1366,8 +1389,14 @@ fn verify_native_rows(
 ) -> Result<TestRecipes, RunError> {
     let checked = bundle_rows(seal, files, Origin::Native)?;
     let recipes = checked.recipes.ok_or(RunError::Incomplete)?;
+    let finished = seal
+        .binding
+        .boot
+        .origin_mono_ms
+        .checked_add(checked.last_finished_ms)
+        .ok_or(RunError::Untrusted)?;
     if fresh.dependencies.recipes != Measured::Measured(recipes.key())
-        || fresh.now.mono_ms < checked.last_finished_ms
+        || fresh.now.mono_ms < finished
     {
         return Err(RunError::Untrusted);
     }
@@ -1384,13 +1413,15 @@ fn selected_seal(
     }
     let seal: Seal = decode(seal_bytes)?;
     let binding = seal.binding;
+    let issued = binding
+        .issued_on_boot(fresh.boot_marker)
+        .ok_or(RunError::Untrusted)?;
     if seal.origin != Origin::Native
         || binding.class != Class::Test
         || binding.scope != selection.scope
         || !fresh.dependencies.complete()
         || !binding.live_at(fresh.now.utc, fresh.dependencies.key(binding.scope))
-        || fresh.issued.utc != binding.issued_utc
-        || !clocks_agree(fresh.issued, fresh.now)
+        || !clocks_agree(issued, fresh.now)
         || seal.finished_utc < binding.issued_utc
         || seal.finished_utc > fresh.now.utc
     {

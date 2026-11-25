@@ -115,8 +115,8 @@ impl<'a> PublishSample<'a> {
             return Err(SinkError::Invalid);
         }
         Ok(Fresh {
-            now,
-            issued,
+            now: binding.boot.on_boot(now).ok_or(SinkError::Invalid)?,
+            boot_marker: binding.boot.marker,
             dependencies: self.dependencies,
         })
     }
@@ -174,6 +174,7 @@ pub(super) struct EvidenceDir {
     canaries: Vec<Vec<u8>>,
     scope: [u8; 32],
     run: [u8; 16],
+    boot: records::BootAnchor,
     closed: Cell<bool>,
 }
 
@@ -190,9 +191,10 @@ impl EvidenceDir {
         pin: PathPin,
         owner: PSID,
         private_values: &[&str],
+        boot: records::BootAnchor,
     ) -> Result<Self, NativeRefusal> {
         let reason = NativeRefusal::PathCustodyUnverified;
-        if !held_private(&pin.leaf, owner) {
+        if !pin.mutable || !held_private(&pin.leaf, owner) {
             return Err(reason);
         }
         clear_debris(&pin.leaf).map_err(|_| reason)?;
@@ -218,6 +220,7 @@ impl EvidenceDir {
                 .collect(),
             scope,
             run,
+            boot,
             closed: Cell::new(false),
         };
         dir.commit(CLAIM, CLAIM_BYTES).map_err(|_| reason)?;
@@ -230,6 +233,10 @@ impl EvidenceDir {
 
     pub(super) fn run(&self) -> [u8; 16] {
         self.run
+    }
+
+    pub(super) fn boot_anchor(&self) -> records::BootAnchor {
+        self.boot
     }
 
     /// Publish the run once: every record file in manifest order, then the
@@ -321,6 +328,8 @@ impl EvidenceDir {
         let seal: records::Seal = records::decode(seal_bytes).map_err(|_| SinkError::Invalid)?;
         if seal.binding.run != self.run
             || seal.binding.scope != self.scope
+            || seal.binding.boot != self.boot
+            || seal.binding.issued_mono_ms != issued.mono_ms
             || seal.binding.issued_utc != issued.utc
         {
             return Err(SinkError::Invalid);
@@ -390,12 +399,13 @@ impl EvidenceDir {
     ) -> Result<String, SinkError> {
         let keyed: [u8; 32] = Sha256::digest(json(&(&self.scope, dependencies))?).into();
         Ok(format!(
-            r#"{{"class":{},"scope":{},"release":{},"run":{},"dependencies":{},"issued_utc":{issued_utc},"expires_utc":{}}}"#,
+            r#"{{"class":{},"scope":{},"release":{},"run":{},"dependencies":{},"boot":{},"issued_mono_ms":0,"issued_utc":{issued_utc},"expires_utc":{}}}"#,
             json(class)?,
             json(&self.scope)?,
             json(&super::schema::release())?,
             json(&self.run)?,
             json(&keyed)?,
+            json(&self.boot)?,
             issued_utc.saturating_add(VALIDITY_SECS),
         ))
     }
@@ -777,6 +787,12 @@ unsafe fn private_descriptor(actual_owner: PSID, dacl: *const ACL, owner: PSID) 
 
 #[cfg(test)]
 mod tests {
+    #[path = "foreground_tests.rs"]
+    mod foreground;
+    const TEST_BOOT: records::BootAnchor = records::BootAnchor {
+        marker: [1; 32],
+        origin_mono_ms: 100_000_000,
+    };
     use super::*;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
@@ -849,7 +865,7 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let (data, path) = private_dir(scratch.path(), "evidence");
         let pin = PathPin::open(&path, true, true).unwrap();
-        let sink = EvidenceDir::claim(pin, sid(&data), &[]).unwrap();
+        let sink = EvidenceDir::claim(pin, sid(&data), &[], TEST_BOOT).unwrap();
         let called = Cell::new(false);
         let refused = sink.commit_checked_at_rename(COMPLETE, b"{}", || {
             called.set(true);
@@ -916,6 +932,7 @@ mod tests {
             PathPin::open(&path, true, true).unwrap(),
             sid(&owner),
             canaries,
+            TEST_BOOT,
         )
         .unwrap();
         (path, dir)
@@ -1056,6 +1073,8 @@ mod tests {
             release: release(),
             run: dir.run(),
             dependencies: deps.key(dir.scope()),
+            boot: TEST_BOOT,
+            issued_mono_ms: ISSUE.mono_ms,
             issued_utc: ISSUE.utc,
             expires_utc: ISSUE.utc + MAX_VALIDITY,
         };
@@ -1300,8 +1319,8 @@ mod tests {
                 scope: dir.scope(),
             },
             &Fresh {
-                now: NOW,
-                issued: ISSUE,
+                now: TEST_BOOT.on_boot(NOW).unwrap(),
+                boot_marker: TEST_BOOT.marker,
                 dependencies: &deps,
             },
         )
@@ -1422,7 +1441,13 @@ mod tests {
         // A concurrent runner on the same directory loses the claim.
         let (owner, _) = user();
         assert_eq!(
-            EvidenceDir::claim(PathPin::open(&path, true, false).unwrap(), sid(&owner), &[]).err(),
+            EvidenceDir::claim(
+                PathPin::open(&path, true, false).unwrap(),
+                sid(&owner),
+                &[],
+                TEST_BOOT
+            )
+            .err(),
             Some(NativeRefusal::PathCustodyUnverified)
         );
         let results = [
@@ -1552,13 +1577,24 @@ mod tests {
         let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
         let (owner, path) = private_dir(root.path(), "evidence");
         FAULT.with(|fault| fault.set(Some(("claim.json", Step::Write))));
-        let refused =
-            EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[]).err();
+        let refused = EvidenceDir::claim(
+            PathPin::open(&path, true, true).unwrap(),
+            sid(&owner),
+            &[],
+            TEST_BOOT,
+        )
+        .err();
         FAULT.with(|fault| fault.set(None));
         assert_eq!(refused, Some(NativeRefusal::PathCustodyUnverified));
         assert!(names(&path).is_empty());
         assert!(
-            EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[]).is_ok()
+            EvidenceDir::claim(
+                PathPin::open(&path, true, true).unwrap(),
+                sid(&owner),
+                &[],
+                TEST_BOOT
+            )
+            .is_ok()
         );
         assert_eq!(names(&path), ["claim.json"]);
 
@@ -1615,7 +1651,7 @@ mod tests {
         let mut pin = PathPin::open(&named, true, true).unwrap();
         pin.leaf = PathPin::open(&held, true, true).unwrap().leaf;
         assert_eq!(
-            EvidenceDir::claim(pin, sid(&owner), &[]).err(),
+            EvidenceDir::claim(pin, sid(&owner), &[], TEST_BOOT).err(),
             Some(NativeRefusal::PathCustodyUnverified)
         );
         assert_eq!(names(&held), ["stale.json"]);
@@ -1636,7 +1672,12 @@ mod tests {
         let path = LocalPath::parse(path.to_str().unwrap()).unwrap();
         let (owner, _) = user();
         EXIT.with(|exit| exit.set(Some((CLAIM, Step::Write))));
-        let _ = EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[]);
+        let _ = EvidenceDir::claim(
+            PathPin::open(&path, true, true).unwrap(),
+            sid(&owner),
+            &[],
+            TEST_BOOT,
+        );
         unreachable!("the claim ends the process before its rename");
     }
 
@@ -1661,8 +1702,13 @@ mod tests {
         assert_eq!(names(&path), [".claim.json.partial"]);
         // The retry recognizes its own debris, deletes it through the held
         // handle, and claims the same directory.
-        let dir = EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[])
-            .unwrap();
+        let dir = EvidenceDir::claim(
+            PathPin::open(&path, true, true).unwrap(),
+            sid(&owner),
+            &[],
+            TEST_BOOT,
+        )
+        .unwrap();
         assert_eq!(names(&path), ["claim.json"]);
         drop(dir);
     }
@@ -1675,8 +1721,13 @@ mod tests {
             std::fs::write(format!(r"{}\{name}", dir.as_str()), b"x").unwrap()
         };
         let claim = |dir: &LocalPath| {
-            EvidenceDir::claim(PathPin::open(dir, true, true).unwrap(), sid(&owner), &[])
-                .map(|_| ())
+            EvidenceDir::claim(
+                PathPin::open(dir, true, true).unwrap(),
+                sid(&owner),
+                &[],
+                TEST_BOOT,
+            )
+            .map(|_| ())
         };
         let refused = Err(NativeRefusal::PathCustodyUnverified);
 
@@ -1729,8 +1780,13 @@ mod tests {
         };
         let path = LocalPath::parse(path.to_str().unwrap()).unwrap();
         let (owner, _) = user();
-        let dir = EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[])
-            .unwrap();
+        let dir = EvidenceDir::claim(
+            PathPin::open(&path, true, true).unwrap(),
+            sid(&owner),
+            &[],
+            TEST_BOOT,
+        )
+        .unwrap();
         EXIT.with(|exit| exit.set(Some(("incomplete.json", Step::Write))));
         let results = [("inputs", raw(INPUTS))];
         let _ = dir.publish(&"test", &(), 0, &entries(&results), &body());
@@ -1774,8 +1830,13 @@ mod tests {
                 *seen_bytes.borrow_mut() = read(&directory, ".incomplete.json.partial");
             }));
         });
-        let claimed_by_a =
-            EvidenceDir::claim(PathPin::open(&path, true, true).unwrap(), sid(&owner), &[]).err();
+        let claimed_by_a = EvidenceDir::claim(
+            PathPin::open(&path, true, true).unwrap(),
+            sid(&owner),
+            &[],
+            TEST_BOOT,
+        )
+        .err();
         // B's run: its claim, its record and its summary temporary.
         assert_eq!(
             *after_b.borrow(),
@@ -1892,8 +1953,13 @@ mod tests {
         std::fs::write(format!(r"{}\stale.json", full.as_str()), b"{}").unwrap();
         for path in [&shared, &full] {
             assert_eq!(
-                EvidenceDir::claim(PathPin::open(path, true, false).unwrap(), sid(&owner), &[])
-                    .err(),
+                EvidenceDir::claim(
+                    PathPin::open(path, true, false).unwrap(),
+                    sid(&owner),
+                    &[],
+                    TEST_BOOT
+                )
+                .err(),
                 Some(NativeRefusal::PathCustodyUnverified),
                 "{}",
                 path.as_str()
@@ -1903,7 +1969,13 @@ mod tests {
         let (_, private) = private_dir(root.path(), "private");
         let other = LocalSid::parse("S-1-5-21-1-2-3-1001").unwrap();
         assert_eq!(
-            EvidenceDir::claim(PathPin::open(&private, true, false).unwrap(), other.0, &[]).err(),
+            EvidenceDir::claim(
+                PathPin::open(&private, true, false).unwrap(),
+                other.0,
+                &[],
+                TEST_BOOT
+            )
+            .err(),
             Some(NativeRefusal::PathCustodyUnverified)
         );
         assert!(names(&private).is_empty());

@@ -50,59 +50,6 @@ impl Clock for NativeClock {
     }
 }
 
-fn observed<T>(taken: &Taken<T>) -> Option<&T> {
-    match taken {
-        Taken::Observed(observation) => Some(&observation.result),
-        Taken::Refused { .. } => None,
-    }
-}
-
-fn measured<T>(value: Option<T>) -> Measured<T> {
-    value.map_or(Measured::Unmeasured, Measured::Measured)
-}
-
-/// The local invalidation projection. A dependency whose observation was
-/// refused, or that no reviewed collector measures yet, stays unmeasured,
-/// which keeps every native trial unsealable.
-pub(crate) fn dependencies(p: &Preflight) -> Dependencies {
-    let s = &p.store;
-    Dependencies {
-        release: release(),
-        artifact: measured(p.reviewed_release),
-        host: measured(observed(&p.host).map(|host| HostDependency {
-            windows_build: host.windows_build,
-            windows_revision: host.windows_revision,
-            machine: host.machine,
-        })),
-        store: measured(observed(&p.limits).map(|limits| StoreDependency {
-            trial_volume: s.trial_volume,
-            trial_volume_root: s.trial_volume_root,
-            trial_volume_guid: s.trial_volume_guid,
-            trial_root: s.trial_root,
-            outer_volume: s.outer_volume,
-            outer_volume_root: s.outer_volume_root,
-            outer_volume_guid: s.outer_volume_guid,
-            backing_file: s.backing_file,
-            vhd_virtual_bytes: limits.vhd_virtual_bytes,
-            inner_extent_bytes: limits.inner_extent_bytes,
-            test_scope: p.test_scope,
-        })),
-        owner_profile: measured(p.owner_profile),
-        distribution: measured(observed(&p.distribution).map(|distribution| {
-            DistributionDependency {
-                receipt: distribution.receipt,
-                manifest: distribution.manifest,
-            }
-        })),
-        install_media: Measured::Unmeasured,
-        recipes: Measured::Unmeasured,
-        firmware: Measured::Unmeasured,
-        guest_protocol: Measured::Unmeasured,
-        network_topology: Measured::Unmeasured,
-        policy: PolicyDependency::CURRENT,
-    }
-}
-
 /// The typed diagnostic for a refused post-claim observation. Exhaustive,
 /// so a new refusal cannot be settled silently.
 pub(crate) fn refused(reason: NativeRefusal) -> Diagnostic {
@@ -921,7 +868,7 @@ pub(crate) fn run(enrollment: &str, evidence: &str, mode: Mode) -> Result<Outcom
         origin: baseline.origin(),
         cancel: cancel.clone(),
     };
-    let mut dependencies = dependencies(baseline.observations());
+    let mut dependencies = baseline.dependencies();
     let projection = (mode == Mode::Test)
         .then(|| baseline.recipe_projection().ok())
         .flatten();

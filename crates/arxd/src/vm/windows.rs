@@ -10,8 +10,8 @@ use super::{
     qemu_args::{CommandPlan, InstallerArtifact, PlanKind, SerialName},
     qmp::{ChannelError, Qmp},
     runtime::{
-        FRESHNESS, InstallerFailure, InstallerFailureReason, InstallerStage, LaunchAuthority,
-        NativeRefusal, OfflineLease, StopDisposition, StopEvidence, fresh_observation,
+        FRESHNESS, InstallerFailure, InstallerFailureReason, InstallerStage, NativeRefusal,
+        StopDisposition, StopEvidence, fresh_observation,
     },
 };
 use crate::{security::vm_acl, service::Shutdown};
@@ -1075,6 +1075,11 @@ fn disk_free(root: &LocalPath) -> Result<(u64, u64), NativeRefusal> {
 
 struct LocalSid(PSID);
 
+// A LocalAlloc SID has no thread affinity. This owner exposes the retained
+// address only to read-only SID operations and frees it on exclusive drop.
+unsafe impl Send for LocalSid {}
+unsafe impl Sync for LocalSid {}
+
 impl LocalSid {
     fn parse(text: &str) -> io::Result<Self> {
         let mut sid = null_mut();
@@ -1130,6 +1135,15 @@ impl Identity {
     fn logon_sid(&self) -> PSID {
         // Constructed only after verifying TokenLogonSid returned one group.
         unsafe { (*self.logon.as_ptr().cast::<TOKEN_GROUPS>()).Groups[0].Sid }
+    }
+
+    fn same_logon(&self, other: &Self) -> bool {
+        // Both SIDs remain backed by the token query allocations.
+        let same_sid = unsafe { EqualSid(self.logon_sid(), other.logon_sid()) != 0 };
+        same_sid
+            && self.session == other.session
+            && self.authentication.LowPart == other.authentication.LowPart
+            && self.authentication.HighPart == other.authentication.HighPart
     }
 }
 
@@ -1453,6 +1467,17 @@ impl VmToken {
         Ok(hash.finalize().into())
     }
 
+    fn verify_current_profile(&self) -> io::Result<()> {
+        require_unimpersonated()?;
+        let parent = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY)?;
+        let current = token_identity(&parent, &self.account, false, self.mode)?;
+        let groups = captured_groups(token_entries(&token_data(&parent, TokenGroups)?)?)?;
+        if !self.identity.same_logon(&current) || groups != self.groups {
+            return Err(io::Error::other("VM parent profile changed"));
+        }
+        self.verify(&self.token)
+    }
+
     fn entries(&self) -> [vm_acl::Entry; 4] {
         [
             vm_acl::Entry {
@@ -1519,10 +1544,7 @@ impl VmToken {
         let data = token_data(token, TokenDefaultDacl)?;
         // Both identities and the ACL remain backed by the token query allocations.
         let matches = unsafe {
-            EqualSid(observed.logon_sid(), self.identity.logon_sid()) != 0
-                && observed.session == self.identity.session
-                && observed.authentication.LowPart == self.identity.authentication.LowPart
-                && observed.authentication.HighPart == self.identity.authentication.HighPart
+            observed.same_logon(&self.identity)
                 && vm_acl::matches(
                     (*data.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl,
                     &self.entries(),
@@ -2435,7 +2457,7 @@ impl<'a> CheckedLaunchCore<'a> {
     fn hold_checked(
         token: &'a VmToken,
         inputs: LaunchInputs<'a>,
-        refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
+        refresh: impl FnOnce(&CommandPlan<'_>) -> Result<std::time::Instant, NativeRefusal>,
     ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
         let kind = inputs.plan.kind();
         // ADR 0064: a public-egress plan also stays closed until its patched
@@ -2519,7 +2541,7 @@ impl<'a> CheckedLaunchCore<'a> {
         // the actual process-creation edge.
         stock.recheck_all(&inputs.pins, Some(&inputs.workspace))?;
         fresh_observation(
-            refresh()?,
+            refresh(&inputs.plan)?,
             std::time::Instant::now(),
             NativeRefusal::ReservesUnverified,
         )?;
@@ -2592,25 +2614,18 @@ impl<'a> CheckedLaunchCore<'a> {
     }
 }
 
-struct NativeLaunch<'a> {
-    core: CheckedLaunchCore<'a>,
-    _authority: &'a LaunchAuthority,
-    // A mutating qemu-img launch stays borrowed against its offline lease.
-    _offline: Option<&'a OfflineLease>,
-}
-
 type PipeQmp = Qmp<tokio::io::DuplexStream, tokio::io::DuplexStream>;
 type SerialGuest = GuestChannel<tokio::net::windows::named_pipe::NamedPipeClient>;
 type BootIo = (tokio::io::DuplexStream, tokio::io::DuplexStream);
 
 enum BootOutcome {
     Installed(Box<(PipeQmp, SerialGuest)>),
-    InstallerReleased(Option<offline_read::ReleasedPair>),
+    InstallerReleased(Option<offline_read::ReleasedPair>, HeldWriters),
 }
 
 enum BootFailure {
     Native(NativeRefusal),
-    Installer(InstallerFailure),
+    Installer(InstallerFailure, Option<HeldWriters>),
 }
 
 impl From<ChannelError> for InstallerFailureReason {
@@ -2623,33 +2638,63 @@ impl From<ChannelError> for InstallerFailureReason {
     }
 }
 
-impl<'a> NativeLaunch<'a> {
-    /// Daemon entry for sealed QEMU and qemu-img plans. There is no issuer
-    /// for LaunchAuthority in this slice.
-    fn hold(
-        authority: &'a LaunchAuthority,
-        token: &'a VmToken,
-        inputs: LaunchInputs<'a>,
-        refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
-    ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
-        if inputs.plan.kind() == PlanKind::QualifierCreate {
-            return Err(NativeRefusal::QualificationMissing);
-        }
-        let offline = inputs.plan.offline_lease();
-        let (core, read, write) = CheckedLaunchCore::hold_checked(token, inputs, refresh)?;
-        Ok((
-            Self {
-                core,
-                _authority: authority,
-                _offline: offline,
-            },
-            read,
-            write,
-        ))
-    }
-}
-
 impl CheckedLaunchCore<'_> {
+    async fn helper(
+        &mut self,
+        (mut read, write): BootIo,
+        cancel: &Shutdown,
+        deadline: tokio::time::Instant,
+        mut refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
+    ) -> (Result<Vec<u8>, NativeRefusal>, StopDisposition) {
+        use tokio::io::AsyncReadExt;
+        let refused = NativeRefusal::JobUnverified;
+        let work = async {
+            if !matches!(
+                self.kind,
+                PlanKind::Inspect
+                    | PlanKind::QualifierCreate
+                    | PlanKind::InspectWritable
+                    | PlanKind::Mutate
+            ) {
+                return Err(NativeRefusal::QualificationMissing);
+            }
+            self.stock.recheck_all(&self.pins, Some(&self.workspace))?;
+            self.child.resume_checked(cancel, &mut refresh)?;
+            let mut output = Vec::new();
+            (&mut read)
+                .take(16 * 1024 + 1)
+                .read_to_end(&mut output)
+                .await
+                .map_err(|_| refused)?;
+            self.child.reap(deadline).await.map_err(|_| refused)?;
+            if output.len() > 16 * 1024 || self.child.exit_code()? != 0 {
+                return Err(refused);
+            }
+            Ok(output)
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(refused),
+            _ = tokio::time::sleep_until(deadline) => Err(refused),
+            result = work => result,
+        };
+        drop(write);
+        if result.is_err() && self.child.job.terminate().is_err() {
+            return (result, StopDisposition::ChargedQuarantine);
+        }
+        let successful = result.is_ok();
+        let release = self
+            .release_evidence(
+                successful,
+                successful,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                verify_release,
+            )
+            .await;
+        (result, release)
+    }
+
     async fn boot(
         &mut self,
         endpoint: Option<(&VmToken, &SerialName)>,
@@ -2663,7 +2708,7 @@ impl CheckedLaunchCore<'_> {
             return self
                 .boot_installer(stage, io, cancel, &mut revalidate, verify_release)
                 .await
-                .map_err(BootFailure::Installer);
+                .map_err(|(failure, held)| BootFailure::Installer(failure, held));
         }
         let (token, serial) = endpoint
             .filter(|_| self.kind == PlanKind::Boot)
@@ -2708,7 +2753,7 @@ impl CheckedLaunchCore<'_> {
         &self,
         qmp: &mut PipeQmp,
         cancel: &Shutdown,
-        revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
+        revalidate: &mut impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
         stage: Option<InstallerStage>,
     ) -> Result<(), InstallerFailureReason> {
         // Resample between the prelaunch status receipt and `cont`, rechecking
@@ -2759,9 +2804,9 @@ impl CheckedLaunchCore<'_> {
         stage: InstallerStage,
         io: BootIo,
         cancel: &Shutdown,
-        revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
+        revalidate: &mut impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
         verify_release: impl FnOnce() -> bool + Send + 'static,
-    ) -> Result<BootOutcome, InstallerFailure> {
+    ) -> Result<BootOutcome, (InstallerFailure, Option<HeldWriters>)> {
         use InstallerFailureReason as Failure;
         use tokio::time::{Instant, sleep_until};
         let grace = Duration::from_secs(2);
@@ -2816,33 +2861,45 @@ impl CheckedLaunchCore<'_> {
             Err(reason) => {
                 // Failure teardown has an independent bound after stage expiry.
                 if self.child.job.terminate().is_err() {
-                    return Err(InstallerFailure {
-                        phase: stage.phase(),
-                        reason,
-                        recovery: StopDisposition::ChargedQuarantine,
-                    });
+                    return Err((
+                        InstallerFailure {
+                            phase: stage.phase(),
+                            reason,
+                            recovery: StopDisposition::ChargedQuarantine,
+                        },
+                        None,
+                    ));
                 }
                 Instant::now() + grace
             }
         };
-        let observed = self
-            .release_evidence(result.is_ok(), result.is_ok(), release_by, verify_release)
+        let (observed, held) = self
+            .release_evidence_held(result.is_ok(), result.is_ok(), release_by, verify_release)
             .await;
-        stage.complete(result, observed, cancel.is_cancelled())?;
+        if let Err(failure) = stage.complete(result, observed, cancel.is_cancelled()) {
+            return Err((failure, held));
+        }
+        let unverified = || {
+            (
+                InstallerFailure {
+                    phase: stage.phase(),
+                    reason: Failure::ReleaseUnverified,
+                    recovery: StopDisposition::ChargedQuarantine,
+                },
+                None,
+            )
+        };
+        let held = held.ok_or_else(unverified)?;
         let released = match self.finalization {
             Some((slots, indices)) => {
                 let readers =
                     offline_read::ReleasedPair::hold(slots, self.pins.clone(), indices, observed)
-                        .map_err(|_| InstallerFailure {
-                        phase: stage.phase(),
-                        reason: Failure::ReleaseUnverified,
-                        recovery: StopDisposition::ChargedQuarantine,
-                    })?;
+                        .map_err(|_| unverified())?;
                 Some(readers)
             }
             None => None,
         };
-        Ok(BootOutcome::InstallerReleased(released))
+        Ok(BootOutcome::InstallerReleased(released, held))
     }
 
     /// Every caller, including a failed boot, must reconcile this owned launch.
@@ -2853,6 +2910,15 @@ impl CheckedLaunchCore<'_> {
         cancel: &Shutdown,
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> StopDisposition {
+        self.stop_held(qmp, cancel, verify_release).await.0
+    }
+
+    async fn stop_held(
+        &mut self,
+        qmp: Option<PipeQmp>,
+        cancel: &Shutdown,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
+    ) -> (StopDisposition, Option<HeldWriters>) {
         let mut observed = StopEvidence::default();
         if let Some(qmp) = qmp {
             observed.guest_shutdown = qmp.powerdown(cancel).await.is_ok();
@@ -2861,9 +2927,9 @@ impl CheckedLaunchCore<'_> {
         if observed.guest_shutdown && self.child.reap(grace).await.is_ok() {
             observed.clean_process_exit = self.child.exit_code() == Ok(0);
         } else if self.child.job.terminate().is_err() {
-            return StopDisposition::ChargedQuarantine;
+            return (StopDisposition::ChargedQuarantine, None);
         }
-        self.release_evidence(
+        self.release_evidence_held(
             observed.guest_shutdown,
             observed.clean_process_exit,
             tokio::time::Instant::now() + Duration::from_secs(2),
@@ -2879,6 +2945,18 @@ impl CheckedLaunchCore<'_> {
         deadline: tokio::time::Instant,
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> StopDisposition {
+        self.release_evidence_held(guest_shutdown, clean_process_exit, deadline, verify_release)
+            .await
+            .0
+    }
+
+    async fn release_evidence_held(
+        &mut self,
+        guest_shutdown: bool,
+        clean_process_exit: bool,
+        deadline: tokio::time::Instant,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
+    ) -> (StopDisposition, Option<HeldWriters>) {
         let mut observed = StopEvidence {
             guest_shutdown,
             clean_process_exit,
@@ -2893,7 +2971,7 @@ impl CheckedLaunchCore<'_> {
         };
         let pins = self.pins.clone();
         let writers = self.writers.clone();
-        finish_release(
+        finish_release_held(
             observed,
             deadline,
             move || {
@@ -2911,18 +2989,31 @@ impl CheckedLaunchCore<'_> {
     }
 }
 
+type HeldWriters = (std::sync::Arc<[PathPin]>, Vec<File>);
+
 /// The worker owns custody and can only report evidence. The async caller
 /// alone accepts it and decides release. A detached worker may finish I/O,
 /// but a closed receiver suppresses any new callback or accepted proof.
-async fn finish_release<T: 'static>(
-    mut observed: StopEvidence,
+async fn finish_release<T: Send + 'static>(
+    observed: StopEvidence,
     deadline: tokio::time::Instant,
     reopen: impl FnOnce() -> io::Result<T> + Send + 'static,
     verify_release: impl FnOnce() -> bool + Send + 'static,
 ) -> StopDisposition {
+    finish_release_held(observed, deadline, reopen, verify_release)
+        .await
+        .0
+}
+
+async fn finish_release_held<T: Send + 'static>(
+    mut observed: StopEvidence,
+    deadline: tokio::time::Instant,
+    reopen: impl FnOnce() -> io::Result<T> + Send + 'static,
+    verify_release: impl FnOnce() -> bool + Send + 'static,
+) -> (StopDisposition, Option<T>) {
     use tokio::time::{Instant, sleep_until};
     if !observed.ready_to_verify_release() || Instant::now() >= deadline {
-        return StopDisposition::ChargedQuarantine;
+        return (StopDisposition::ChargedQuarantine, None);
     }
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     let Ok(worker) = Worker::start("arx-vm-release", move || {
@@ -2931,23 +3022,22 @@ async fn finish_release<T: 'static>(
         }
         let guard = reopen()?;
         let verified = !tx.is_closed() && verify_release();
-        drop(guard);
-        let _ = tx.send(verified);
+        let _ = tx.send(verified.then_some(guard));
         Ok(())
     }) else {
-        return StopDisposition::ChargedQuarantine;
+        return (StopDisposition::ChargedQuarantine, None);
     };
     let verified = tokio::select! {
         biased;
         _ = sleep_until(deadline) => {
             rx.close();
             worker.cancel_io();
-            false
+            None
         }
-        evidence = &mut rx => matches!(evidence, Ok(true)) && Instant::now() < deadline,
+        evidence = &mut rx => evidence.ok().flatten().filter(|_| Instant::now() < deadline),
     };
-    observed.verify_release(|| verified);
-    observed.disposition()
+    observed.verify_release(|| verified.is_some());
+    (observed.disposition(), verified)
 }
 
 impl Child {
