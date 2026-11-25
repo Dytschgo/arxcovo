@@ -300,13 +300,15 @@ class BudgetTests(unittest.TestCase):
 
     def test_anchor_cases(self):
         now = 1_800_000_000
-        for raw in (None, "", "abc", "012", "1.5", "-5", " 1", "1\n", "\u0661\u0662",
-                    "123456789012", str(now + 1), str(now - 721)):
+        for raw in (None, "", "0", "abc", "012", "1.5", "-5", " 1", "1\n", "\u0661\u0662",
+                    "123456789012", str(now + 1)):
             with self.subTest(raw=raw), self.assertRaises(w.Guard) as g:
                 w.check_anchor(raw, now)
             self.assertEqual(g.exception.reason, "anchor")
         self.assertEqual(w.check_anchor(str(now), now), 0)
         self.assertEqual(w.check_anchor(str(now - 720), now), 720)
+        self.assertEqual(w.check_anchor(str(now - 721), now), 721)
+        self.assertEqual(w.check_anchor(str(now - 3600), now), 3600)
 
     def test_budget_skip_spawns_nothing_and_exits_zero(self):
         h = Harness()
@@ -326,6 +328,214 @@ class BudgetTests(unittest.TestCase):
         del h.env["ARX_DIAG_T0"]
         self.assertEqual(h.run(), (1, [h.lines[0], "ARXDIAG v1 guard reason=anchor"]))
         self.assertEqual(h.field("e_s"), "-")
+
+    def test_anchor_past_cap_skips_budget_without_diagnostic_work(self):
+        for age in (w.CAP_S + 1, 3600):
+            with self.subTest(age=age):
+                h = Harness()
+                h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - age)
+                code, lines = h.run()
+                self.assertEqual(code, 0)
+                self.assertEqual(h.field("outcome"), "skipped_budget")
+                self.assertEqual(h.field("e_s"), str(age + w.ANCHOR_PRE_S))
+                self.assertEqual(lines, [lines[0]])
+                self.assertNotIn("guard", lines[0])
+                self.assertEqual(h.log, [])
+
+    def test_negative_age_still_guards(self):
+        h = Harness()
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) + 1)
+        self.assertEqual(h.run(), (1, [h.lines[0], "ARXDIAG v1 guard reason=anchor"]))
+        self.assertEqual(h.field("e_s"), "-")
+        self.assertEqual(h.log, [])
+
+    def _shift_later_wall_read(self, clock, delta):
+        original = clock.time
+        seen = {"n": 0}
+
+        def time():
+            seen["n"] += 1
+            now = original()
+            return now + delta if seen["n"] > 1 else now
+
+        clock.time = time
+        return seen
+
+    def test_backward_wall_step_cannot_admit_after_a_late_anchor(self):
+        # Review replay: first age 750 s, then the wall clock steps back 165 s
+        # so a second read alone would be 585 s and E=600.
+        h = Harness()
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 750)
+        seen = self._shift_later_wall_read(h.clock, -165)
+        code, lines = h.run()
+        self.assertGreaterEqual(seen["n"], 2)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), str(750 + w.ANCHOR_PRE_S))
+        self.assertEqual(lines, [lines[0]])
+        self.assertNotIn("guard", lines[0])
+        self.assertEqual(h.log, [])
+
+    def test_forward_wall_step_uses_the_later_age(self):
+        # First age would admit (585 s, E=600). A forward step to 750 s must skip.
+        h = Harness()
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        seen = self._shift_later_wall_read(h.clock, 165)
+        code, lines = h.run()
+        self.assertGreaterEqual(seen["n"], 2)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), str(750 + w.ANCHOR_PRE_S))
+        self.assertEqual(lines, [lines[0]])
+        self.assertEqual(h.log, [])
+
+    def _on_first_junit_kind(self, h, move):
+        original = h.fs.kind
+        seen = {"n": 0}
+
+        def kind(path):
+            if path == JUNIT and seen["n"] == 0:
+                seen["n"] += 1
+                move(h.clock)
+            return original(path)
+
+        h.fs.kind = kind
+        return seen
+
+    def test_backward_monotonic_after_validation_skips(self):
+        # Both wall readings are 585 s (E=600). A 165 s stall then a 167 s
+        # monotonic rollback leaves the deadline clock behind its first reading.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        def stall_then_roll_back(clock):
+            clock.t += 165
+            clock.t -= 167
+
+        seen = self._on_first_junit_kind(h, stall_then_roll_back)
+        code, lines = h.run()
+        self.assertEqual(seen["n"], 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), "600")
+        self.assertEqual(lines, [lines[0]])
+        self.assertEqual(h.log, [])
+
+    def _freeze_wall_and_script_monotonic(self, h, readings):
+        # Decouple the clocks at the last validation read: wall time stops and
+        # the deadline clock returns `readings` before resuming at the last one.
+        def move(clock):
+            frozen = clock.time()
+            pending = list(readings)
+            clock.t = pending[-1]
+            clock.time = lambda: frozen
+            clock.monotonic = lambda: pending.pop(0) if pending else clock.t
+        return self._on_first_junit_kind(h, move)
+
+    def test_backward_monotonic_between_checkpoint_and_admission_skips(self):
+        # The validation checkpoint reads 1001.75; the admission read rolls
+        # back to 1000.25, still above the first reading (1000.00).
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 584)
+        seen = self._freeze_wall_and_script_monotonic(h, [1001.75, 1000.25])
+        code, lines = h.run()
+        self.assertEqual(seen["n"], 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), "601")
+        self.assertEqual(lines, [lines[0]])
+        self.assertEqual(h.log, [])
+        # The rollback alone refuses admission even when E is well inside budget.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 500)
+        seen = self._freeze_wall_and_script_monotonic(h, [1001.75, 1000.25])
+        code, lines = h.run()
+        self.assertEqual(seen["n"], 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), "517")
+        self.assertEqual(h.log, [])
+        # A rollback ending below the checkpoint but not below the first read
+        # is the same refusal when the checkpoint itself went backwards.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 500)
+        seen = self._freeze_wall_and_script_monotonic(h, [999.5, 1000.25])
+        code, lines = h.run()
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.log, [])
+
+    def test_backward_monotonic_after_wrapper_start_skips_through_run(self):
+        # run() takes the step-deadline reading (1001.75); the sampler's first,
+        # checkpoint and admission reads all sit 1.50 s lower. Wall age is 585 s.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        pending = [1001.75, 1000.25, 1000.25, 1000.25]
+        h.clock.t = 1000.25
+        frozen = h.clock.time()
+        h.clock.time = lambda: frozen
+        h.clock.monotonic = lambda: pending.pop(0) if pending else h.clock.t
+        code, lines = h.run()
+        self.assertEqual(pending, [])
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(lines, [lines[0]])
+        self.assertEqual(h.log, [])
+
+    def test_monotonic_elapsed_counts_with_frozen_wall_and_rounds_up(self):
+        # Both wall reads give age 585 s; only the deadline clock advances
+        # 0.25 s, which must round E up to 601 and skip.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        seen = self._freeze_wall_and_script_monotonic(h, [1000.25, 1000.25])
+        code, lines = h.run()
+        self.assertEqual(seen["n"], 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), "601")
+        self.assertEqual(h.log, [])
+
+    def test_second_anchor_read_gates_after_valid_first_read(self):
+        def late(value):
+            def move(clock):
+                if value is None:
+                    del h.env["ARX_DIAG_T0"]
+                else:
+                    h.env["ARX_DIAG_T0"] = value(clock)
+            return move
+
+        cases = {"missing": None, "malformed": lambda c: "abc", "zero": lambda c: "0",
+                 "future": lambda c: str(int(c.time()) + 10)}
+        for name, value in cases.items():
+            with self.subTest(case=name):
+                h = Harness()
+                seen = self._on_first_junit_kind(h, late(value))
+                code, lines = h.run()
+                self.assertEqual(seen["n"], 1)
+                self.assertEqual(code, 1)
+                self.assertEqual(lines[-1], "ARXDIAG v1 guard reason=anchor")
+                self.assertEqual(h.log, [])
+
+    def test_validation_time_consumes_admit_budget(self):
+        # Age 585 s would admit. One second on the deadline clock makes E=601.
+        h = Harness(run_s=50.0)
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        seen = self._on_first_junit_kind(h, lambda clock: setattr(clock, "t", clock.t + 1))
+        code, lines = h.run()
+        self.assertEqual(seen["n"], 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(h.field("outcome"), "skipped_budget")
+        self.assertEqual(h.field("e_s"), "601")
+        self.assertEqual(lines, [lines[0]])
+        self.assertEqual(h.log, [])
+
+    def test_fast_validation_still_admits(self):
+        h = Harness()
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - 585)
+        self.assertEqual(h.run()[0], 0)
+        self.assertEqual(h.field("outcome"), "all_pass")
+        self.assertEqual(h.field("e_s"), "600")
+        self.assertIn("spawn:list", h.log)
+        self.assertIn("spawn:run", h.log)
 
 
 class InventoryTests(unittest.TestCase):
