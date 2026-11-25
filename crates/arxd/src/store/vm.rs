@@ -109,7 +109,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 14;
+const VM_SCHEMA_VERSION: u32 = 15;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -501,35 +501,7 @@ impl VmStore {
         now: i64,
         connect: impl FnOnce(&Path) -> Result<Connection>,
     ) -> Result<Self> {
-        crate::config::checked_path(dir)?;
-        crate::security::private(dir)?;
-        ensure!(dir.is_dir(), "VM state directory required");
-
-        let lock_path = dir.join("activity.lock");
-        check_existing_file(&lock_path)?;
-        let lock = state_options().write(true).create(true).open(&lock_path)?;
-        lock.try_lock()?;
-        verify_state_identity(&lock, &lock_path)?;
-
-        let path = dir.join("activity.sqlite3");
-        let exists = check_existing_file(&path)?;
-        for suffix in ["-journal", "-wal", "-shm"] {
-            check_existing_file(&dir.join(format!("activity.sqlite3{suffix}")))?;
-        }
-        let database = if exists {
-            state_options().open(&path)?
-        } else {
-            state_options().write(true).create_new(true).open(&path)?
-        };
-        // The guard stays unlocked because SQLite owns the database locks.
-        verify_state_identity(&database, &path)?;
-        let expected = state_identity(&database)?;
-        let mut db = connect(&path)?;
-        ensure!(
-            sqlite_main_identity(&mut db)? == expected && state_identity(&database)? == expected,
-            "SQLite VM main database identity changed"
-        );
-        verify_state_identity(&database, &path)?;
+        let (mut db, database, lock) = Self::open_locked(dir, false, connect)?;
         db.busy_timeout(Duration::from_millis(250))?;
         check_size(&db)?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -588,6 +560,9 @@ impl VmStore {
         if version < 14 {
             tx.execute_batch(compose::MIGRATE_V14)?;
         }
+        if version < 15 {
+            tx.execute_batch(compose::MIGRATE_V15)?;
+        }
         recover(&tx, now)?;
         check_size(&tx)?;
         if upgrade {
@@ -611,6 +586,103 @@ impl VmStore {
             _database: database,
             _lock: lock,
         })
+    }
+
+    pub(crate) fn open_for_backup_owner(dir: &Path, write: bool) -> Result<Self> {
+        let (db, database, lock) = Self::open_locked(dir, true, |path| {
+            let mode = if write {
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+            } else {
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+            };
+            Ok(Connection::open_with_flags(
+                path,
+                mode | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?)
+        })?;
+        check_size(&db)?;
+        ensure!(
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?
+                == VM_SCHEMA_VERSION,
+            "start the current controller once to upgrade the VM store"
+        );
+        db.execute_batch(
+            "PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY;",
+        )?;
+        if write {
+            db.execute_batch(
+                "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA max_page_count=1024;",
+            )?;
+        }
+        Ok(Self {
+            db: Mutex::new(db),
+            _database: database,
+            _lock: lock,
+        })
+    }
+
+    fn open_locked(
+        dir: &Path,
+        existing_owner_only: bool,
+        connect: impl FnOnce(&Path) -> Result<Connection>,
+    ) -> Result<(Connection, fs::File, fs::File)> {
+        crate::config::checked_path(dir)?;
+        crate::security::private(dir)?;
+        ensure!(dir.is_dir(), "VM state directory required");
+
+        let lock_path = dir.join("activity.lock");
+        let lock_exists = check_existing_file(&lock_path)?;
+        if existing_owner_only {
+            ensure!(lock_exists, "VM store lock missing");
+            crate::local::require_owner(dir)?;
+            crate::local::require_owner(&lock_path)?;
+        }
+        let lock = state_options()
+            .write(true)
+            .create(!existing_owner_only)
+            .open(&lock_path)?;
+        lock.try_lock()
+            .map_err(|_| anyhow::anyhow!("VM store lock unavailable; stop the controller"))?;
+        verify_state_identity(&lock, &lock_path)?;
+
+        let path = dir.join("activity.sqlite3");
+        let exists = check_existing_file(&path)?;
+        if existing_owner_only {
+            ensure!(exists, "VM store missing");
+            crate::local::require_owner(&path)?;
+        }
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let companion = dir.join(format!("activity.sqlite3{suffix}"));
+            if check_existing_file(&companion)? && existing_owner_only {
+                crate::local::require_owner(&companion)?;
+            }
+        }
+        let database = if exists {
+            state_options().open(&path)?
+        } else {
+            state_options().write(true).create_new(true).open(&path)?
+        };
+        // The guard stays unlocked because SQLite owns the database locks.
+        verify_state_identity(&database, &path)?;
+        let expected = state_identity(&database)?;
+        let mut db = connect(&path)?;
+        ensure!(
+            sqlite_main_identity(&mut db)? == expected && state_identity(&database)? == expected,
+            "SQLite VM main database identity changed"
+        );
+        verify_state_identity(&database, &path)?;
+        Ok((db, database, lock))
+    }
+
+    pub(crate) fn read_backup_owner<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM state unavailable"))?;
+        read(&db)
     }
 
     pub(crate) fn transact<T>(&self, run: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
@@ -1420,8 +1492,12 @@ pub(crate) fn disk_bytes(db: &Connection) -> Result<Option<u64>> {
         UNION ALL SELECT charge FROM vm_restore_points
         UNION ALL SELECT persistent FROM vm_snapshot_work
         UNION ALL SELECT staging FROM vm_snapshot_work
-        UNION ALL SELECT host_staging_charge FROM vm_compose_backups
-        UNION ALL SELECT retained_charge FROM vm_compose_backups",
+        UNION ALL SELECT host_staging_charge FROM vm_compose_backups b
+            WHERE NOT EXISTS (SELECT 1 FROM vm_compose_backup_retirements r
+                WHERE r.backup_id=b.id AND r.finished_ms IS NOT NULL)
+        UNION ALL SELECT retained_charge FROM vm_compose_backups b
+            WHERE NOT EXISTS (SELECT 1 FROM vm_compose_backup_retirements r
+                WHERE r.backup_id=b.id AND r.finished_ms IS NOT NULL)",
     )?;
     let mut rows = stmt.query([])?;
     let mut total = 0u64;
@@ -2605,9 +2681,113 @@ pub(crate) fn record_recovered(db: &Connection, claim: RecoveryClaim, now: i64) 
 }
 
 #[cfg(test)]
+pub(crate) use tests::backup_owner_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::vm::{BUILD_ACTION, static_web::StaticState};
+
+    pub(crate) fn backup_owner_fixture()
+    -> Result<(tempfile::TempDir, VmStore, crate::vm::compose::Target, Id)> {
+        let dir = private_temp();
+        let store = VmStore::open(dir.path(), NOW)?;
+        let target = crate::vm::compose::Target {
+            vm: [0x51; 16],
+            project: "calm-life".into(),
+        };
+        let generation = store.transact(|db| {
+            let slots = static_fixture(db, target.vm, "backup-owner")?;
+            commit_static(db, target.vm, slots, 2)?;
+            let generation = slots.disk.generation;
+            let release = [0x52u8; 16];
+            db.execute(
+                "INSERT INTO vm_compose_projects(vm,project) VALUES(?1,?2)",
+                params![target.vm, target.project],
+            )?;
+            db.execute(
+                "INSERT INTO vm_compose_releases(vm,project,id,digest,manifest)
+                 VALUES(?1,?2,?3,?4,X'7B7D')",
+                params![target.vm, target.project, release, "a".repeat(64)],
+            )?;
+            db.execute(
+                "UPDATE vm_compose_projects SET desired='started',last_revision=1,
+                 committed=1,committed_release=?3,rendered_revision=1,rendered_release=?3,
+                 settled_generation=?4 WHERE vm=?1 AND project=?2",
+                params![target.vm, target.project, release, generation],
+            )?;
+            db.execute(
+                "INSERT INTO vm_compose_volumes(vm,project,slot,uid,gid) VALUES(?1,?2,'data',10001,10001)",
+                params![target.vm, target.project],
+            )?;
+            compose::enroll_backup_target(db, target.vm, &target.project, "data", "app.sqlite3", 65_536)?;
+            compose::register_boot(db, target.vm, generation, 1)?;
+            Ok(generation)
+        })?;
+        #[cfg(windows)]
+        for file in [
+            dir.path(),
+            &dir.path().join("activity.lock"),
+            &dir.path().join("activity.sqlite3"),
+        ] {
+            crate::dashboard::tests::set_owner_private(file);
+        }
+        Ok((dir, store, target, generation))
+    }
+
+    #[test]
+    fn v14_upgrades_without_inventing_a_namespace_for_legacy_partials() -> Result<()> {
+        let (dir, store, target, generation) = backup_owner_fixture()?;
+        let id = store.transact(|db| {
+            let intent = compose::admit_backup(
+                db,
+                "alice",
+                &target,
+                RequestId {
+                    key: [3; 16],
+                    issued_at_ms: NOW,
+                },
+                generation,
+                1,
+                NOW,
+                |_, _| Ok(Ok(())),
+            )?
+            .unwrap();
+            compose::settle_backup_failed(db, &intent, "interrupted", true, false, NOW)?;
+            db.execute_batch(
+                "DROP TABLE vm_compose_backup_retirements;
+                 ALTER TABLE vm_compose_backups DROP COLUMN namespace_tracked;
+                 PRAGMA user_version=14;",
+            )?;
+            Ok(intent.backup_id)
+        })?;
+        drop(store);
+        assert!(VmStore::open_for_backup_owner(dir.path(), true).is_err());
+        let store = VmStore::open(dir.path(), NOW)?;
+        store.transact(|db| {
+            assert_eq!(
+                count(db, "PRAGMA user_version", [])?,
+                i64::from(VM_SCHEMA_VERSION)
+            );
+            let row = compose::owner_backups(db, Some(id))?.pop().unwrap();
+            assert!(!row.namespace_tracked);
+            assert!(row.directory_id.is_none());
+            assert!(row.finished_ms.is_none());
+            assert_eq!(
+                count(
+                    db,
+                    "SELECT host_staging_charge FROM vm_compose_backups WHERE id=?1",
+                    [id]
+                )?,
+                65_536
+            );
+            assert_eq!(
+                count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?,
+                0
+            );
+            Ok(())
+        })
+    }
 
     fn legacy_binding(nonce: u64, vm: Id, action: Action) -> Binding<'static> {
         Binding {
