@@ -318,68 +318,75 @@ def cleanup_disposition(lines):
     return reaped_all, clean_close
 
 
-EVIDENCE_MARKERS = ("C13 cleanup", "C13 owner", "C13 first")
+def account_lines(text):
+    """LF records used to decide campaign success. Not the quarantine gate."""
+    if not text:
+        return []
+    parts = text.split("\n")
+    if text.endswith("\n"):
+        del parts[-1]
+    return parts
 
 
-def campaign_lines(text):
-    """LF-terminated records, and whether framing blocks quarantine.
-
-    CR is never a record boundary. A CR inside a line that also carries a
-    cleanup, owner, or first-failure marker is a malformed record. An
-    unterminated tail is not a record; when it carries one of those markers
-    it blocks quarantine instead of being dropped.
-    """
-    blocked = False
-    if not text.endswith("\n"):
-        body, tail = text.rsplit("\n", 1) if "\n" in text else ("", text)
-        if any(marker in tail for marker in EVIDENCE_MARKERS):
-            blocked = True
-        text = f"{body}\n" if body else ""
-    records = []
-    if text:
-        for line in text[:-1].split("\n"):
-            if "\r" in line:
-                if any(marker in line for marker in EVIDENCE_MARKERS):
-                    blocked = True
-                continue
-            records.append(line)
-    return records, blocked
+# Substrings, not records. A veto refuses quarantine whatever framing surrounds
+# it, and it never turns a successful campaign into a green quarantine.
+QUARANTINE_VETOES = (PIN.encode("ascii"), b"C13 publication")
 
 
-def evidence_conflict(lines):
-    """True when a candidate record is missing, duplicated, or not exact."""
-    cleanup = [line for line in lines if line.startswith("C13 cleanup")]
-    owners = [line for line in lines if line.startswith("C13 owner")]
-    failures = [line for line in lines if line.startswith("C13 first")]
-    if len(cleanup) != 1 or any(CLEANUP.fullmatch(line) is None for line in cleanup):
-        return True
-    if len(owners) > 1 or any(OWNER_EXIT.fullmatch(line) is None for line in owners):
-        return True
-    if len(failures) != 1 or any(FIRST.fullmatch(line) is None and ASSERTION.fullmatch(line) is None
-                                 for line in failures):
-        return True
-    return False
+def evidence_bytes(evidence):
+    if isinstance(evidence, (bytes, bytearray)):
+        return bytes(evidence)
+    if isinstance(evidence, str):
+        return evidence.encode("ascii")
+    return "".join(f"{line}\n" for line in evidence).encode("ascii")
 
 
-def quarantine_signature(first, lines, *, code, truncated, fixture, retained, unknown,
-                         evidence_blocked=False):
+def quarantine_bytes_eligible(data):
+    """Campaign bytes may be quarantined only as LF plus printable ASCII."""
+    return bool(data) and data.endswith(b"\n") and all(
+        byte == 0x0A or 0x20 <= byte <= 0x7E for byte in data)
+
+
+def quarantine_signature(first, evidence, *, code, truncated, fixture, retained, unknown):
     # Result 101 is the harness panic status from both incidents. A timeout,
     # a different status, or truncated campaign output is a separate anomaly.
     # Artifact mismatches raise before this decision and keep a non-zero exit.
-    # Candidate records are counted before the exact field check, so a
-    # near-miss cannot disappear and leave one allowlisted record.
-    if (evidence_blocked or code != 101 or truncated or fixture != "removed" or retained != 0
-            or unknown != 0 or PIN in lines or evidence_conflict(lines)):
+    # Veto tokens are searched before the byte gate. The gate then rejects
+    # every byte that is not LF or printable ASCII, including a capture that
+    # does not end in LF. Lines are split only after that gate.
+    raw = evidence_bytes(evidence)
+    if any(token in raw for token in QUARANTINE_VETOES):
         return None
-    reaped_all, _clean_close = cleanup_disposition(lines)
+    # The one teardown record is this launcher result. A campaign line with
+    # the teardown prefix is a second record and is rejected below.
+    if (code != 101 or truncated or fixture != "removed" or retained != 0 or unknown != 0
+            or not quarantine_bytes_eligible(raw)):
+        return None
+    cleanup = []
+    owners = []
+    failures = []
+    for line in (part.decode("ascii") for part in raw[:-1].split(b"\n")):
+        if line.startswith("C13 cleanup"):
+            if CLEANUP.fullmatch(line) is None:
+                return None
+            cleanup.append(line)
+        elif line.startswith("C13 owner"):
+            if OWNER_EXIT.fullmatch(line) is None:
+                return None
+            owners.append(line)
+        elif line.startswith("C13 first"):
+            if FIRST.fullmatch(line) is None and ASSERTION.fullmatch(line) is None:
+                return None
+            failures.append(line)
+        elif line.startswith("C13 teardown"):
+            return None
+    # Cleanup and the pinned first failure are each one strict line. Mint's
+    # owner pin is one exact line. Promotion's pin is no owner line.
+    if len(cleanup) != 1 or len(failures) != 1 or failures[0] != first:
+        return None
+    reaped_all, _clean_close = cleanup_disposition(cleanup)
     if not reaped_all:
         return None
-    failures = [line for line in lines if line.startswith("C13 first")]
-    if failures != [first]:
-        return None
-    if any(PUBLICATION.fullmatch(line) for line in lines):
-        return None
-    owners = [line for line in lines if line.startswith("C13 owner")]
     if first == MINT_QUARANTINE and owners == [MINT_OWNER_QUARANTINE]:
         return "mint-refused"
     if first == PROMOTION_QUARANTINE and not owners:
@@ -562,7 +569,6 @@ def privileged(stage, deadline):
     code = None
     capture = None
     lines = []
-    evidence_blocked = False
     start = time.monotonic()
     phase = "staging"
     try:
@@ -590,7 +596,7 @@ def privileged(stage, deadline):
             [root / "campaign", "--exact", SELECTOR, "--ignored", "--nocapture"],
             env=environment, timeout=timeout,
         )
-        lines, evidence_blocked = campaign_lines(capture.text())
+        lines = account_lines(capture.text())
         first = capture.first
         reaped_all, clean_close = cleanup_disposition(lines)
         # A reaped daemon can fail to close gracefully. Reclaim its disposable
@@ -634,8 +640,9 @@ def privileged(stage, deadline):
               f"seconds={time.monotonic()-start:.3f}", flush=True)
     relay_diagnostics(diagnostic)
     signature = quarantine_signature(
-        first, lines, code=code, truncated=bool(capture is not None and capture.truncated),
-        fixture=fixture, retained=retained, unknown=unknown, evidence_blocked=evidence_blocked,
+        first, bytes(capture.bulk) if capture is not None else b"", code=code,
+        truncated=bool(capture is not None and capture.truncated),
+        fixture=fixture, retained=retained, unknown=unknown,
     )
     if signature is not None:
         write_quarantine_marker(stage_directory, signature)

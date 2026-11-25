@@ -488,6 +488,166 @@ class LauncherTests(unittest.TestCase):
                 self.assertNotIn("::warning::", output)
                 marker.assert_not_called()
 
+    def assert_quarantine_refused(self, payload):
+        capture = RUN.Capture()
+        capture.feed(payload)
+        with patch.object(RUN, "write_quarantine_marker") as marker:
+            status, output, _, _ = self.fixture_campaign(101, capture, b"")
+        self.assertEqual(status, 1)
+        self.assertNotIn("quarantined", output)
+        self.assertNotIn("::warning::", output)
+        marker.assert_not_called()
+
+    def assert_quarantined(self, payload, signature):
+        capture = RUN.Capture()
+        capture.feed(payload)
+        with patch.object(RUN, "write_quarantine_marker") as marker:
+            status, output, _, _ = self.fixture_campaign(101, capture, b"")
+        self.assertEqual(status, 0)
+        line = f"C13 quarantined signature={signature}\n"
+        self.assertIn(line, output)
+        self.assertIn(f"::warning::{line}", output)
+        marker.assert_called_once_with("/tmp/arx-c13-abcdefgh", signature)
+
+    def mint_framed(self):
+        owner = RUN.MINT_OWNER_QUARANTINE.encode("ascii")
+        cleanup = (b"C13 cleanup spawned=3 signaled=3 reaped=3 clean=2 "
+                   b"helpers=16 helpers_reaped=16 helper_unknown=0")
+        first = RUN.MINT_QUARANTINE.encode("ascii")
+        return owner + b"\n" + cleanup + b"\n" + first + b"\n"
+
+    def promotion_framed(self):
+        cleanup = (b"C13 cleanup spawned=3 signaled=2 reaped=3 clean=2 "
+                   b"helpers=22 helpers_reaped=22 helper_unknown=0")
+        return cleanup + b"\n" + RUN.PROMOTION_QUARANTINE.encode("ascii") + b"\n"
+
+    def test_harness_text_around_exact_signatures_still_quarantines(self):
+        # Campaign stdout is the Rust test harness plus the C13 records.
+        # Teardown is the launcher's own line, and promotion has no owner line.
+        harness = (
+            b"running 1 test\n"
+            b"test c13 ... FAILED\n"
+            b"\n"
+            b"thread 'c13' panicked at m3_activation_linux.rs:1366:9:\n"
+            b"C13 real owner Mint refused\n"
+            b"note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+            b"test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
+        )
+        self.assert_quarantined(harness + self.mint_framed(), "mint-refused")
+        self.assert_quarantined(harness + self.promotion_framed(), "promotion-transfer-process-exited")
+
+    def test_replay_rejects_forbidden_bytes(self):
+        # Review 2: a non-LF separator, NUL, or invalid UTF-8 hid a second
+        # marker and the quarantine still fired. Any byte outside LF and
+        # printable ASCII makes the whole capture ineligible.
+        framed = self.mint_framed()
+        markers = (
+            ("cleanup",
+             b"C13 cleanup spawned=3 signaled=3 reaped=3 clean=2 "
+             b"helpers=16 helpers_reaped=16 helper_unknown=0"),
+            ("owner", RUN.MINT_OWNER_QUARANTINE.encode("ascii")),
+            ("first", RUN.MINT_QUARANTINE.encode("ascii")),
+        )
+        forbidden = (
+            ("cr", b"\r"),
+            ("nul", b"\x00"),
+            ("tab", b"\t"),
+            ("vt", b"\x0b"),
+            ("ff", b"\x0c"),
+            ("fs", b"\x1c"),
+            ("gs", b"\x1d"),
+            ("rs", b"\x1e"),
+            ("byte-85", b"\x85"),
+            ("del", b"\x7f"),
+            ("u0085", "\u0085".encode("utf-8")),
+            ("u2028", "\u2028".encode("utf-8")),
+            ("u2029", "\u2029".encode("utf-8")),
+            ("invalid-utf8", b"\xff"),
+        )
+        for class_name, blob in forbidden:
+            with self.subTest(byte=class_name, marker="none"):
+                self.assert_quarantine_refused(framed + b"ordinary" + blob + b"note\n")
+            for kind, marker in markers:
+                with self.subTest(byte=class_name, marker=kind):
+                    self.assert_quarantine_refused(framed + b"ordinary" + blob + marker + b"\n")
+
+    def test_replay_rejects_u2028_conflict_one_byte_at_a_time(self):
+        payload = self.mint_framed() + b"ordinary" + "\u2028".encode("utf-8") + RUN.MINT_QUARANTINE.encode("ascii") + b"\n"
+        capture = RUN.Capture()
+        for index in range(len(payload)):
+            capture.feed(payload[index:index + 1])
+        with patch.object(RUN, "write_quarantine_marker") as marker:
+            status, output, _, _ = self.fixture_campaign(101, capture, b"")
+        self.assertEqual(status, 1)
+        self.assertNotIn("quarantined", output)
+        self.assertNotIn("::warning::", output)
+        marker.assert_not_called()
+
+    def test_replay_rejects_veto_tokens_regardless_of_framing(self):
+        framed = self.mint_framed()
+        tokens = (
+            ("success pin", RUN.PIN.encode("ascii")),
+            ("publication", b"C13 publication node=4 term=1 leader=1 index=1"),
+        )
+        placements = (
+            ("crlf", lambda token: framed + token + b"\r\n"),
+            ("no final lf", lambda token: framed + token),
+            ("after nul", lambda token: framed + b"\x00" + token),
+            ("lf", lambda token: framed + token + b"\n"),
+            ("embedded", lambda token: framed + b"ordinary " + token + b"\n"),
+        )
+        for token_name, token in tokens:
+            for placement_name, place in placements:
+                with self.subTest(token=token_name, placement=placement_name):
+                    self.assert_quarantine_refused(place(token))
+
+    def test_veto_does_not_turn_a_successful_campaign_red(self):
+        payload = (
+            RUN.PIN + "\n"
+            "C13 cleanup spawned=6 signaled=6 reaped=6 clean=6 "
+            "helpers=93 helpers_reaped=93 helper_unknown=0\n"
+            "C13 publication node=4 term=1 leader=1 index=1\n"
+        ).encode("ascii")
+        capture = RUN.Capture()
+        capture.feed(payload)
+        with patch.object(RUN, "write_quarantine_marker") as marker:
+            status, output, _, _ = self.fixture_campaign(0, capture, b"")
+        self.assertEqual(status, 0)
+        self.assertNotIn("quarantined", output)
+        self.assertNotIn("::warning::", output)
+        marker.assert_not_called()
+
+    def test_replay_rejects_duplicate_and_nonstrict_evidence(self):
+        framed = self.mint_framed()
+        owner = RUN.MINT_OWNER_QUARANTINE.encode("ascii")
+        cleanup = (b"C13 cleanup spawned=3 signaled=3 reaped=3 clean=2 "
+                   b"helpers=16 helpers_reaped=16 helper_unknown=0")
+        first = RUN.MINT_QUARANTINE.encode("ascii")
+        cases = (
+            ("duplicate cleanup", framed + cleanup + b"\n"),
+            ("duplicate owner", framed + owner + b"\n"),
+            ("duplicate first", framed + first + b"\n"),
+            ("conflicting first", framed + RUN.PROMOTION_QUARANTINE.encode("ascii") + b"\n"),
+            ("cleanup suffix", framed + cleanup + b" extra\n"),
+            ("owner suffix", framed + owner + b" extra\n"),
+            ("first suffix", framed + first + b" extra\n"),
+            ("replaced cleanup",
+             owner + b"\n" + b"C13 cleanup spawned=3 signaled=3 reaped=3\n" + first + b"\n"),
+            ("replaced owner",
+             b"C13 owner node=a action=mint exit=9999\n" + cleanup + b"\n" + first + b"\n"),
+            ("replaced first",
+             owner + b"\n" + cleanup + b"\n"
+             + b"C13 first phase=not-a-phase category=not-a-category\n"),
+            ("teardown prefix", framed + b"C13 teardown nope\n"),
+            ("second teardown",
+             framed + b"C13 teardown fixture=removed roles_removed=8 "
+             b"roles_retained=0 roles_unknown=0 seconds=1.134\n"),
+            ("promotion with owner", self.promotion_framed() + owner + b"\n"),
+        )
+        for name, payload in cases:
+            with self.subTest(name=name):
+                self.assert_quarantine_refused(payload)
+
     def test_launcher_timeout_is_not_quarantined(self):
         stage = Path("/tmp/arx-c13-abcdefgh")
         with (patch.object(RUN.time, "monotonic", return_value=10),
