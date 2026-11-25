@@ -1,11 +1,19 @@
-//! Private contract for the first paused host trial. The reviewed stock
-//! bundle inventory remains held from admission through teardown.
+//! Private contract for host qualification trials. One private `LaunchPurpose`
+//! enum derives argv, channel name, parser, stop protocol and Job envelope.
+//! The reviewed stock bundle inventory remains held from admission through teardown.
 
 mod native;
 
-pub use native::{PausedPhase, PausedTrial, PausedTrialPermit, PausedVerdict};
+pub use native::{
+    CapacityProbe, CapacityProbePermit, FirmwareProbe, FirmwareProbePermit, NetworkProbe,
+    NetworkProbePermit, PausedCompleted, PausedPhase, PausedTrial, PausedTrialPermit,
+    PausedVerdict, ReserveActivityPermit, ReserveActivityProbe, SupervisorLossPermit,
+    SupervisorLossProbe,
+};
 
 use super::*;
+use crate::vm::guest::network_probe::ProbeReport;
+use crate::vm::qualification_record::ControlledFault;
 use crate::vm::{qmp::bounded, runtime::capacity};
 use std::{
     cell::Cell,
@@ -15,21 +23,124 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
     time::Instant as Tick,
 };
 
-/// Fixed, one-vCPU recipe. No caller-supplied options, inherited environment,
-/// guest disk, network, serial endpoint or command that releases `-S`.
+/// Bounded quiet window proving no early guest or firmware bytes arrive on the
+/// channel before `-S` is released.
+const PRELAUNCH_QUIET_WINDOW: Duration = Duration::from_millis(25);
+
+/// Single verified per-purpose Job and outside-Job overhead envelope.
+/// Replaces implicit arithmetic between Job limits and reserve admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JobEnvelope {
+    job_memory_bytes: usize,
+    job_cpu_rate: u32,
+    outside_ram_bytes: u64,
+    outside_cpu_rate: u32,
+    inner_bytes: u64,
+    outer_bytes: u64,
+}
+
+impl JobEnvelope {
+    const DISKLESS: Self = Self {
+        job_memory_bytes: JOB_MEMORY_BYTES,
+        job_cpu_rate: JOB_CPU_RATE,
+        outside_ram_bytes: GIB,
+        outside_cpu_rate: 1250,
+        inner_bytes: 1 << 20,
+        outer_bytes: 1 << 20,
+    };
+
+    const NETWORK_LIVE: Self = Self {
+        job_memory_bytes: 6 * (1 << 30),
+        job_cpu_rate: JOB_CPU_RATE,
+        outside_ram_bytes: GIB,
+        outside_cpu_rate: 1250,
+        inner_bytes: 2 << 20,
+        outer_bytes: 2 << 20,
+    };
+}
+
+/// Stop protocol derived from `LaunchPurpose`. Keeps control-plane QMP `quit`
+/// distinct from guest `system_powerdown` and forced/supervisor-loss stop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopProtocol {
+    ForceTerminate,
+    QmpQuit,
+    QmpPowerdown,
+    DropLastJobHandle,
+}
+
+/// Closed launch purpose enum. Every mode's argv, channel name, parser,
+/// Job envelope and stop protocol are derived exclusively from this type.
+enum LaunchPurpose<'a> {
+    Paused,
+    Firmware(Firmware<'a>),
+    SupervisorLoss,
+    ControlledFault(ControlledFault),
+    Network(NetworkBoot<'a>),
+}
+
+impl<'a> LaunchPurpose<'a> {
+    fn channel(&self) -> Option<&'a SerialName> {
+        match self {
+            Self::Firmware(firmware) => Some(firmware.console),
+            Self::Network(network) => Some(network.console),
+            Self::Paused | Self::SupervisorLoss | Self::ControlledFault(_) => None,
+        }
+    }
+
+    fn stop_protocol(&self) -> StopProtocol {
+        match self {
+            Self::Paused | Self::ControlledFault(_) => StopProtocol::ForceTerminate,
+            Self::Firmware(_) => StopProtocol::QmpQuit,
+            Self::Network(_) => StopProtocol::QmpPowerdown,
+            Self::SupervisorLoss => StopProtocol::DropLastJobHandle,
+        }
+    }
+
+    fn envelope(&self) -> JobEnvelope {
+        match self {
+            Self::Network(_) => JobEnvelope::NETWORK_LIVE,
+            Self::Paused | Self::Firmware(_) | Self::SupervisorLoss | Self::ControlledFault(_) => {
+                JobEnvelope::DISKLESS
+            }
+        }
+    }
+
+    fn needs_job_watch(&self) -> bool {
+        matches!(self, Self::SupervisorLoss)
+    }
+}
+
+/// Fixed recipe. No caller-supplied options or inherited environment.
 struct PausedPlan<'a> {
     image: &'a LocalPath,
     data: &'a LocalPath,
     bios: &'a LocalPath,
+    purpose: LaunchPurpose<'a>,
+}
+
+struct Firmware<'a> {
+    code: &'a LocalPath,
+    vars: &'a LocalPath,
+    console: &'a SerialName,
+}
+
+struct NetworkBoot<'a> {
+    source: &'a super::test::NetworkInputs,
+    seed: &'a PathPin,
+    code: &'a LocalPath,
+    vars: &'a LocalPath,
+    console: &'a SerialName,
+    nonce: [u8; 16],
 }
 
 impl PausedPlan<'_> {
-    fn args(&self) -> Vec<&str> {
-        vec![
+    fn args(&self) -> Vec<String> {
+        let mut args: Vec<_> = [
             "-no-user-config",
             "-nodefaults",
             "-display",
@@ -38,27 +149,231 @@ impl PausedPlan<'_> {
             "none",
             "-monitor",
             "none",
-            "-nic",
-            "none",
             "-accel",
             "whpx",
             "-machine",
-            "pc-q35-11.1",
+            match &self.purpose {
+                LaunchPurpose::Firmware(_) | LaunchPurpose::Network(_) => {
+                    "pc-q35-11.1,pflash0=code,pflash1=vars"
+                }
+                LaunchPurpose::Paused
+                | LaunchPurpose::SupervisorLoss
+                | LaunchPurpose::ControlledFault(_) => "pc-q35-11.1",
+            },
             "-smp",
-            "1",
+            match &self.purpose {
+                LaunchPurpose::Network(_) => "2",
+                _ => "1",
+            },
             "-m",
-            "256M",
+            match &self.purpose {
+                LaunchPurpose::Network(_) => "4096M",
+                _ => "256M",
+            },
             "-L",
             self.data.as_str(),
-            "-bios",
-            self.bios.as_str(),
             "-S",
             "-chardev",
             "stdio,id=arxqmp,signal=off",
             "-mon",
             "chardev=arxqmp,mode=control",
         ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        match &self.purpose {
+            LaunchPurpose::Network(network) => {
+                use crate::vm::qemu_args::{self as args_for, GUEST_PORT, GUEST_PORT_ID, NETWORK};
+                let [iso, kernel, initrd] = &network.source.media;
+                for (node, path) in [("code", network.code), ("vars", network.vars)] {
+                    args_for::block(&mut args, "raw", node, path, true, None);
+                }
+                args_for::cd(&mut args, "osiso", &iso.path, "ide.0");
+                args_for::cd(&mut args, "cidata", &network.seed.path, "ide.1");
+                args.extend([
+                    "-kernel".into(),
+                    kernel.path.as_str().into(),
+                    "-initrd".into(),
+                    initrd.path.as_str().into(),
+                    "-append".into(),
+                    "boot=casper ds=nocloud ---".into(),
+                    "-netdev".into(),
+                    NETWORK.into(),
+                    "-device".into(),
+                    "virtio-net-pci,netdev=arxnet0".into(),
+                    "-device".into(),
+                    "virtio-serial-pci,id=arxserial".into(),
+                    "-chardev".into(),
+                    format!("pipe,id=arxguest,path={}", network.console.basename()),
+                    "-device".into(),
+                    format!(
+                        "virtserialport,bus=arxserial.0,chardev=arxguest,id={GUEST_PORT_ID},name={GUEST_PORT}"
+                    ),
+                ]);
+            }
+            LaunchPurpose::Firmware(firmware) => {
+                let at = args
+                    .iter()
+                    .position(|arg| arg == "-accel")
+                    .expect("fixed recipe");
+                args.splice(at..at, ["-nic".into(), "none".into()]);
+                for (node, path) in [("code", firmware.code), ("vars", firmware.vars)] {
+                    args.extend([
+                        "-blockdev".into(),
+                        serde_json::json!({
+                            "driver": "raw", "node-name": node, "read-only": true,
+                            "file": {"driver": "file", "filename": path.as_str(), "read-only": true}
+                        })
+                        .to_string(),
+                    ]);
+                }
+                args.extend([
+                    "-chardev".into(),
+                    format!("pipe,id=arxfirmware,path={}", firmware.console.basename()),
+                    "-device".into(),
+                    "isa-debugcon,iobase=0x402,chardev=arxfirmware".into(),
+                ]);
+            }
+            LaunchPurpose::Paused
+            | LaunchPurpose::SupervisorLoss
+            | LaunchPurpose::ControlledFault(_) => {
+                // Keep the original paused recipe's exact argument order.
+                let at = args
+                    .iter()
+                    .position(|arg| arg == "-accel")
+                    .expect("fixed recipe");
+                args.splice(at..at, ["-nic".into(), "none".into()]);
+                let at = args
+                    .iter()
+                    .position(|arg| arg == "-S")
+                    .expect("fixed recipe");
+                args.splice(at..at, ["-bios".into(), self.bios.as_str().into()]);
+            }
+        }
+        args
     }
+
+    /// Prove zero unintended ingress/hostfwd, zero TAP/bridge/sharing/IPv6,
+    /// and read-only media on the generated argv before process creation.
+    fn verify_network_isolation(&self) -> Result<(), NativeRefusal> {
+        let reason = NativeRefusal::NetworkFenceUnverified;
+        let args = self.args();
+        let forbidden = [
+            "hostfwd=",
+            "guestfwd=",
+            "smb=",
+            "tftp=",
+            "ipv6=on",
+            "restrict=off",
+            "tap,",
+            "bridge,",
+            "socket,",
+        ];
+        if args
+            .iter()
+            .any(|arg| forbidden.iter().any(|bad| arg.contains(bad)))
+        {
+            return Err(reason);
+        }
+        let mut netdevs = Vec::new();
+        let mut nics = Vec::new();
+        let mut blockdevs = Vec::new();
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-net" => return Err(reason),
+                "-netdev" => netdevs.push(iter.next().ok_or(reason)?.as_str()),
+                "-nic" => nics.push(iter.next().ok_or(reason)?.as_str()),
+                "-blockdev" => blockdevs.push(iter.next().ok_or(reason)?.as_str()),
+                _ => {}
+            }
+        }
+        // Every attached blockdev must be explicitly read-only.
+        for blockdev in blockdevs {
+            let parsed: serde_json::Value = serde_json::from_str(blockdev).map_err(|_| reason)?;
+            if parsed.get("read-only") != Some(&serde_json::Value::Bool(true))
+                || parsed.pointer("/file/read-only") != Some(&serde_json::Value::Bool(true))
+            {
+                return Err(reason);
+            }
+        }
+        match &self.purpose {
+            LaunchPurpose::Network(_) => {
+                if netdevs != [crate::vm::qemu_args::NETWORK]
+                    || !nics.is_empty()
+                    || !args.windows(2).any(|pair| {
+                        pair[0] == "-device" && pair[1] == "virtio-net-pci,netdev=arxnet0"
+                    })
+                {
+                    return Err(reason);
+                }
+            }
+            _ => {
+                if !netdevs.is_empty() || nics != ["none"] {
+                    return Err(reason);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Confirm no early bytes or EOF arrive on the guest/firmware channel before
+/// `-S` is released, using an explicit bounded async receive seam.
+async fn verify_prelaunch_quiet(
+    mut source: impl AsyncRead + Unpin,
+    quiet_window: Duration,
+) -> Result<(), Failure> {
+    let mut byte = [0u8; 1];
+    match tokio::time::timeout(quiet_window, source.read(&mut byte)).await {
+        Err(_) => Ok(()),
+        Ok(_) => Err(NativeRefusal::GuestEndpointUnverified.into()),
+    }
+}
+
+/// The exact CODE pin contains this SEC debug print. Neither guest
+/// addresses nor raw output are returned.
+async fn firmware_sec(mut source: impl AsyncRead + Unpin) -> Result<(), Failure> {
+    const MAX_OUTPUT: usize = 16 * 1024;
+    const MAX_LINE: usize = 256;
+    let mut line = Vec::with_capacity(MAX_LINE);
+    let visible = |line: &[u8]| {
+        line.strip_prefix(b"SecCoreStartupWithStack(")
+            .and_then(|tail| tail.strip_suffix(b")"))
+            .and_then(|tail| {
+                let comma = tail.iter().position(|&byte| byte == b',')?;
+                Some((&tail[..comma], &tail[comma + 1..]))
+            })
+            .is_some_and(|(left, right)| {
+                [left, right.strip_prefix(b" ").unwrap_or(right)]
+                    .into_iter()
+                    .all(|address| {
+                        address.strip_prefix(b"0x").is_some_and(|digits| {
+                            (1..=8).contains(&digits.len())
+                                && digits.iter().all(u8::is_ascii_hexdigit)
+                        })
+                    })
+            })
+    };
+    for _ in 0..MAX_OUTPUT {
+        let byte = source
+            .read_u8()
+            .await
+            .map_err(|_| Failure::Qmp(ChannelError::Eof))?;
+        if byte == b'\n' {
+            if visible(line.strip_suffix(b"\r").unwrap_or(&line)) {
+                return Ok(());
+            }
+            line.clear();
+        } else {
+            if line.len() == MAX_LINE {
+                return Err(Failure::Qmp(ChannelError::Oversize));
+            }
+            line.push(byte);
+        }
+    }
+    Err(Failure::Qmp(ChannelError::Oversize))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,16 +401,6 @@ impl From<ChannelError> for Failure {
     }
 }
 
-/// Measured outside-Job overhead and reserved peak storage for this plan.
-/// The stock runner cannot claim any of these measurements.
-#[derive(Clone, Copy)]
-struct Peak {
-    outside_ram_bytes: u64,
-    outside_cpu_rate: u32,
-    inner_bytes: u64,
-    outer_bytes: u64,
-}
-
 struct Live {
     captured: Tick,
     /// Already bound to the enrolled console incarnation.
@@ -112,7 +417,7 @@ struct Live {
 }
 
 impl Live {
-    fn check(&self, peak: Peak, now: Tick) -> Result<(), Failure> {
+    fn check(&self, envelope: JobEnvelope, now: Tick) -> Result<(), Failure> {
         let reserves = NativeRefusal::ReservesUnverified;
         fresh_observation(self.captured.into_std(), now.into_std(), reserves)?;
         if !self.idle {
@@ -122,13 +427,13 @@ impl Live {
             return Err(NativeRefusal::WhpxUnverified.into());
         }
         let ram_needed = RAM_RESERVE
-            .checked_add(JOB_MEMORY_BYTES as u64)
-            .and_then(|bytes| bytes.checked_add(peak.outside_ram_bytes))
+            .checked_add(envelope.job_memory_bytes as u64)
+            .and_then(|bytes| bytes.checked_add(envelope.outside_ram_bytes))
             .ok_or(reserves)?;
         // A Job rate is in units of 1/100 percent. Bound it against the
         // global capacity and leave the rounded-up half of effective CPUs.
         let cpus = u64::from(self.effective_cpus);
-        let rate = u64::from(JOB_CPU_RATE) + u64::from(peak.outside_cpu_rate);
+        let rate = u64::from(envelope.job_cpu_rate) + u64::from(envelope.outside_cpu_rate);
         if self.effective_cpus < 2
             || self.effective_cpus > self.active_cpus
             || rate > 10_000
@@ -137,11 +442,11 @@ impl Live {
         {
             return Err(reserves.into());
         }
-        self.check_disk(peak)?;
+        self.check_disk(envelope.inner_bytes, envelope.outer_bytes)?;
         Ok(())
     }
 
-    fn check_disk(&self, peak: Peak) -> Result<(), NativeRefusal> {
+    fn check_disk(&self, inner_bytes: u64, outer_bytes: u64) -> Result<(), NativeRefusal> {
         let disk = NativeRefusal::DiskCeilingUnverified;
         let l = &self.limits;
         let inner_free = l.inner_caller_free_bytes.min(l.inner_total_free_bytes);
@@ -168,11 +473,11 @@ impl Live {
         )?;
         if accounted
             .managed_bytes
-            .checked_add(peak.inner_bytes)
+            .checked_add(inner_bytes)
             .is_none_or(|bytes| bytes > ceiling)
-            || peak.inner_bytes > inner
+            || inner_bytes > inner
             || outer
-                .checked_sub(peak.outer_bytes)
+                .checked_sub(outer_bytes)
                 .is_none_or(|bytes| bytes < OUTER_FLOOR)
         {
             return Err(disk);
@@ -196,16 +501,20 @@ trait Host {
     type Slot;
     type Reader: AsyncRead + Unpin;
     type Writer: AsyncWrite + Unpin;
+    type Channel: AsyncRead + Unpin;
 
     /// Hold and validate the selected stock bundle before acquiring the slot.
     fn open_contract(
         &mut self,
         plan: &PausedPlan<'_>,
-    ) -> Result<(Self::Opens, Peak), NativeRefusal>;
+    ) -> Result<(Self::Opens, JobEnvelope), NativeRefusal>;
     /// Provide a bounded sample independently of a pending operation.
-    fn live(&self) -> Result<Live, NativeRefusal>;
+    /// When a controlled fault is armed on the active slot, the next sample
+    /// checks a fresh real sample, records it, applies the mutation and
+    /// returns the resulting refusal through the exact live monitoring path.
+    fn live(&self, envelope: JobEnvelope) -> Result<Live, NativeRefusal>;
     /// Acquire the charged slot atomically, or fail without acquiring it.
-    fn claim(&mut self, live: &Live, peak: Peak) -> Result<Self::Slot, NativeRefusal>;
+    fn claim(&mut self, live: &Live, envelope: JobEnvelope) -> Result<Self::Slot, NativeRefusal>;
     /// Complete any wait needed to confirm the already owned claim.
     async fn confirm_claim(&self, slot: &Self::Slot) -> Result<(), NativeRefusal>;
     async fn create_suspended(
@@ -220,9 +529,10 @@ trait Host {
     async fn verify_child(
         &self,
         slot: &Self::Slot,
+        envelope: JobEnvelope,
     ) -> Result<Pipes<Self::Reader, Self::Writer>, NativeRefusal>;
     async fn resume(&self, slot: &Self::Slot) -> Result<(), NativeRefusal>;
-    /// Recheck the held bundle against the reviewed inventory after prelaunch.
+    /// Recheck the held bundle and any media drive bindings after prelaunch.
     async fn verify_opens(
         &self,
         slot: &Self::Slot,
@@ -235,6 +545,39 @@ trait Host {
         slot: &Self::Slot,
         query: impl Future<Output = Result<(), Failure>>,
     ) -> Result<(), Failure>;
+    async fn open_channel(
+        &self,
+        _slot: &Self::Slot,
+        _name: &SerialName,
+        _cancel: &Shutdown,
+        _cutoff: Tick,
+    ) -> Result<Self::Channel, NativeRefusal> {
+        Err(NativeRefusal::GuestEndpointUnverified)
+    }
+
+    fn mark_phase_complete(&self, _slot: &Self::Slot, _phase: PausedPhase) {}
+    fn mark_prelaunch_quiet(&self, _slot: &Self::Slot) {}
+    fn mark_sec_marker(&self, _slot: &Self::Slot) {}
+    fn record_network_report(&self, _slot: &Self::Slot, _report: ProbeReport) {}
+    fn mark_post_controls(&self, _slot: &Self::Slot) {}
+
+    /// Record completion of the purpose's expected graceful stop protocol.
+    fn mark_stop_protocol_done(&self, _slot: &Self::Slot, _protocol: StopProtocol) {}
+
+    /// Arm a controlled fault on the next live monitoring sample so the
+    /// refusal traverses the exact `LivePoll` refusal-to-stop path.
+    fn arm_fault(&self, _slot: &Self::Slot, _fault: ControlledFault) -> Result<(), NativeRefusal> {
+        Err(NativeRefusal::ReservesUnverified)
+    }
+
+    fn lose_supervisor(&self, _slot: &Self::Slot) -> Result<(), NativeRefusal> {
+        Err(NativeRefusal::JobUnverified)
+    }
+
+    fn completed_stop_protocol(&self, _slot: &Self::Slot) -> Option<StopProtocol> {
+        None
+    }
+
     /// Request termination of only the attributed Job and stop its workers.
     /// This and settle must also work on an incomplete claim or launch.
     fn request_stop(&mut self, slot: &Self::Slot);
@@ -264,7 +607,7 @@ impl<H: Host> Settlement<'_, H> {
         }
     }
 
-    async fn finish(mut self, deadline: Tick) -> StopDisposition {
+    async fn finish(mut self, deadline: Tick, expected_stop: StopProtocol) -> StopDisposition {
         self.stop();
         let slot = self.slot.as_ref().expect("settlement owns a slot");
         let mut stop = by_deadline(deadline, self.host.observe_stop(slot, deadline))
@@ -278,10 +621,23 @@ impl<H: Host> Settlement<'_, H> {
         // Release depends on timely child exit, an empty Job, joined
         // workers, and exclusive reopen. Live activity and reserve samples
         // govern new work, so their expiry cannot block safe settlement.
-        let release = if Tick::now() < deadline {
-            stop.disposition()
-        } else {
+        let release = if Tick::now() >= deadline
+            || !stop.ready_to_verify_release()
+            || !stop.artifacts_reopened
+        {
             StopDisposition::ChargedQuarantine
+        } else {
+            match (expected_stop, self.host.completed_stop_protocol(slot)) {
+                (StopProtocol::QmpQuit, Some(StopProtocol::QmpQuit)) if stop.clean_process_exit => {
+                    StopDisposition::CleanRelease
+                }
+                (StopProtocol::QmpPowerdown, Some(StopProtocol::QmpPowerdown))
+                    if stop.guest_shutdown && stop.clean_process_exit =>
+                {
+                    StopDisposition::CleanRelease
+                }
+                _ => stop.disposition(),
+            }
         };
         self.host
             .settle(self.slot.take().expect("settlement owns a slot"), release)
@@ -351,6 +707,7 @@ struct LivePoll<'a> {
     cancel: &'a Shutdown,
     recheck: &'a dyn Fn() -> Result<Tick, Failure>,
     observation: Cell<Freshness>,
+    stale: Cell<bool>,
     refused: Cell<Option<Failure>>,
 }
 
@@ -364,12 +721,18 @@ impl<'a> LivePoll<'a> {
             cancel,
             recheck,
             observation: Cell::new(observation),
+            stale: Cell::new(false),
             refused: Cell::new(None),
         }
     }
 
     fn cutoff(&self) -> Tick {
         self.observation.get().cutoff
+    }
+
+    /// Force the next monitored poll to take a fresh live sample immediately.
+    fn force_resample(&self) {
+        self.stale.set(true);
     }
 
     fn sample(&self) -> Result<Freshness, Failure> {
@@ -381,6 +744,7 @@ impl<'a> LivePoll<'a> {
         if !observation.fresh_at(now) {
             return Err(NativeRefusal::ReservesUnverified.into());
         }
+        self.stale.set(false);
         self.observation.set(observation);
         Ok(observation)
     }
@@ -388,7 +752,7 @@ impl<'a> LivePoll<'a> {
     fn require_fresh(&self) -> Result<Freshness, Failure> {
         let now = before(self.cancel, self.cutoff())?;
         let observation = self.observation.get();
-        if observation.fresh_at(now) {
+        if !self.stale.get() && observation.fresh_at(now) {
             Ok(observation)
         } else {
             self.sample()
@@ -555,21 +919,35 @@ async fn launch_paused<H: Host>(
     plan: &PausedPlan<'_>,
     opens: &H::Opens,
     gate: &LivePoll<'_>,
+    envelope: JobEnvelope,
 ) -> Result<(), Failure> {
     gate.watch(observe(host.confirm_claim(slot))).await?;
     gate.sample()?;
     gate.watch(observe(host.create_suspended(slot, plan, opens)))
         .await?;
     gate.sample()?;
-    let pipes = gate.watch(observe(host.verify_child(slot))).await?;
+    let pipes = gate
+        .watch(observe(host.verify_child(slot, envelope)))
+        .await?;
     gate.sample()?;
     gate.watch(observe(host.resume(slot))).await?;
+    host.mark_phase_complete(slot, PausedPhase::SuspendedChild);
+
     let Pipes {
         stdout,
         stdin,
         dispatch,
     } = pipes;
     let (cancel, cutoff) = (gate.cancel, gate.cutoff());
+    // Connect channel-bearing modes after workers start and before awaiting
+    // the QMP greeting, preserving same-handle owner/DACL/live-child PID proof.
+    let mut channel = match plan.purpose.channel() {
+        Some(console) => Some(
+            gate.watch(observe(host.open_channel(slot, console, cancel, cutoff)))
+                .await?,
+        ),
+        None => None,
+    };
     gate.sample()?;
     let stdout = LiveIo {
         gate,
@@ -595,8 +973,6 @@ async fn launch_paused<H: Host>(
     // A new observation must still admit the paused child after prelaunch.
     gate.sample()?;
 
-    gate.watch(observe(host.verify_opens(slot, opens))).await?;
-    gate.sample()?;
     gate.watch(host.verify_whpx(slot, async {
         bounded(cancel, cutoff, peer.verify_whpx())
             .await
@@ -604,13 +980,125 @@ async fn launch_paused<H: Host>(
         confirm_dispatch(&dispatch).await
     }))
     .await?;
+    host.mark_phase_complete(slot, PausedPhase::Prelaunch);
     gate.sample()?;
+
+    gate.watch(observe(host.verify_opens(slot, opens))).await?;
+    host.mark_phase_complete(slot, PausedPhase::BundleInventory);
+    gate.sample()?;
+
+    match &plan.purpose {
+        LaunchPurpose::Paused => Ok(()),
+        LaunchPurpose::ControlledFault(fault) => {
+            // Arm the controlled fault and let the active LivePoll monitor
+            // observe the refusal and drive real refusal-to-stop teardown.
+            host.arm_fault(slot, *fault)?;
+            gate.force_resample();
+            gate.watch(std::future::pending::<Result<(), Failure>>())
+                .await
+        }
+        LaunchPurpose::Firmware(_) => {
+            let pipe = channel
+                .as_mut()
+                .ok_or(NativeRefusal::GuestEndpointUnverified)?;
+            gate.watch(verify_prelaunch_quiet(
+                LiveIo {
+                    gate,
+                    inner: &mut *pipe,
+                },
+                PRELAUNCH_QUIET_WINDOW,
+            ))
+            .await?;
+            host.mark_prelaunch_quiet(slot);
+            release_and_confirm_running(&mut peer, &dispatch, gate, cancel).await?;
+            gate.watch(firmware_sec(LiveIo { gate, inner: pipe }))
+                .await?;
+            host.mark_sec_marker(slot);
+            gate.watch(async { Ok(peer.quit(cancel, cutoff).await?) })
+                .await?;
+            gate.watch(confirm_dispatch(&dispatch)).await?;
+            host.mark_stop_protocol_done(slot, StopProtocol::QmpQuit);
+            Ok(())
+        }
+        LaunchPurpose::Network(network) => {
+            let pipe = channel
+                .as_mut()
+                .ok_or(NativeRefusal::GuestEndpointUnverified)?;
+            gate.watch(verify_prelaunch_quiet(
+                LiveIo {
+                    gate,
+                    inner: &mut *pipe,
+                },
+                PRELAUNCH_QUIET_WINDOW,
+            ))
+            .await?;
+            host.mark_prelaunch_quiet(slot);
+            release_and_confirm_running(&mut peer, &dispatch, gate, cancel).await?;
+            let report = gate
+                .watch(async {
+                    crate::vm::guest::network_probe::response(
+                        LiveIo { gate, inner: pipe },
+                        &network.nonce,
+                    )
+                    .await
+                    .map_err(Failure::from)
+                })
+                .await?;
+            host.record_network_report(slot, report);
+            gate.watch(async {
+                if network.source.witnesses.known_live(&network.nonce).await {
+                    Ok(())
+                } else {
+                    Err(NativeRefusal::NetworkFenceUnverified.into())
+                }
+            })
+            .await?;
+            host.mark_post_controls(slot);
+            gate.sample()?;
+            gate.watch(async { Ok(peer.powerdown(cancel).await?) })
+                .await?;
+            gate.watch(confirm_dispatch(&dispatch)).await?;
+            host.mark_stop_protocol_done(slot, StopProtocol::QmpPowerdown);
+            Ok(())
+        }
+        LaunchPurpose::SupervisorLoss => {
+            release_and_confirm_running(&mut peer, &dispatch, gate, cancel).await?;
+            gate.require_fresh()?;
+            host.lose_supervisor(slot)?;
+            Ok(())
+        }
+    }
+}
+
+async fn release_and_confirm_running<R, W>(
+    peer: &mut Qmp<R, W>,
+    dispatch: &DispatchGate,
+    gate: &LivePoll<'_>,
+    cancel: &Shutdown,
+) -> Result<(), Failure>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    gate.watch(async {
+        Ok(peer
+            .release_startup_hold(cancel, || gate.require_fresh().is_ok())
+            .await?)
+    })
+    .await?;
+    gate.watch(confirm_dispatch(dispatch)).await?;
+    gate.sample()?;
+    let status = gate.watch(async { Ok(peer.status(cancel).await?) }).await?;
+    gate.watch(confirm_dispatch(dispatch)).await?;
+    if status != crate::vm::qmp::RunStatus::Running {
+        return Err(Failure::Qmp(ChannelError::Unexpected));
+    }
     Ok(())
 }
 
-fn sample(host: &impl Host, peak: Peak) -> Result<Tick, Failure> {
-    let live = host.live()?;
-    live.check(peak, Tick::now())?;
+fn sample(host: &impl Host, envelope: JobEnvelope) -> Result<Tick, Failure> {
+    let live = host.live(envelope)?;
+    live.check(envelope, Tick::now())?;
     Ok(live.captured)
 }
 
@@ -623,18 +1111,19 @@ async fn run<H: Host>(
 ) -> TrialResult {
     let admitted = (|| {
         before(cancel, cutoff)?;
-        let (opens, peak) = host.open_contract(plan)?;
-        let live = host.live()?;
+        plan.verify_network_isolation()?;
+        let (opens, envelope) = host.open_contract(plan)?;
+        let live = host.live(envelope)?;
         let sampled = Tick::now();
-        live.check(peak, sampled)?;
+        live.check(envelope, sampled)?;
         let observation = Freshness::new(live.captured, sampled, cutoff);
         if !observation.fresh_at(before(cancel, cutoff)?) {
             return Err(NativeRefusal::ReservesUnverified.into());
         }
-        let slot = host.claim(&live, peak)?;
-        Ok((opens, peak, slot, observation))
+        let slot = host.claim(&live, envelope)?;
+        Ok((opens, envelope, slot, observation))
     })();
-    let (opens, peak, slot, observation) = match admitted {
+    let (opens, envelope, slot, observation) = match admitted {
         Ok(admission) => admission,
         Err(failure) => {
             return TrialResult {
@@ -650,7 +1139,7 @@ async fn run<H: Host>(
         stop_requested: false,
     };
     let paused = {
-        let recheck = || sample(settlement.host, peak);
+        let recheck = || sample(settlement.host, envelope);
         let gate = LivePoll::new(cancel, &recheck, observation);
         launch_paused(
             settlement.host,
@@ -658,11 +1147,17 @@ async fn run<H: Host>(
             plan,
             &opens,
             &gate,
+            envelope,
         )
         .await
     };
     // The effect deadline and caller cancellation cannot suppress cleanup.
-    let release = settlement.finish(Tick::now() + settlement_budget).await;
+    let release = settlement
+        .finish(
+            Tick::now() + settlement_budget,
+            plan.purpose.stop_protocol(),
+        )
+        .await;
     TrialResult { paused, release }
 }
 

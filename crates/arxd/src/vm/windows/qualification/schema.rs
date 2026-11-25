@@ -14,14 +14,13 @@
 
 use super::DiagnosticFile;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use sha2::{Digest, Sha256};
 use std::fmt;
 
+use crate::vm::qualification_record::MAX_TRIAL_MS;
 /// The runner's record contract and collector versions.
-pub const RECORD_CONTRACT: u16 = 3;
-pub const RECORD_COLLECTOR: u16 = 1;
-/// Seven hours: no record time may exceed the trial budget.
-const MAX_TRIAL_MS: u64 = 7 * 60 * 60 * 1000;
+pub use crate::vm::qualification_record::{
+    COLLECTOR as RECORD_COLLECTOR, CONTRACT as RECORD_CONTRACT,
+};
 const U16: u64 = u16::MAX as u64;
 const U32: u64 = u32::MAX as u64;
 const U64: u64 = u64::MAX;
@@ -233,6 +232,81 @@ const OBSERVATIONS: &[(&str, &[(&str, Shape)])] = &[
     ),
     ("whpx", &[("present", Shape::Bool)]),
     ("paused_store", &[("validated", Shape::Bool)]),
+    (
+        "firmware_sec",
+        &[
+            ("sec_marker_verified", Shape::Bool),
+            ("prelaunch_quiet", Shape::Bool),
+            ("job_memory_limit_bytes", Shape::Uint(U64)),
+            ("job_cpu_rate", Shape::Uint(U32)),
+            ("clean_release", Shape::Bool),
+        ],
+    ),
+    (
+        "qmp_firmware",
+        &[
+            ("greeting_verified", Shape::Bool),
+            ("whpx_enabled", Shape::Bool),
+            ("quit_clean_eof", Shape::Bool),
+            ("clean_release", Shape::Bool),
+        ],
+    ),
+    (
+        "supervisor_loss",
+        &[
+            ("job_memory_limit_bytes", Shape::Uint(U64)),
+            ("job_cpu_rate", Shape::Uint(U32)),
+            ("active_process_limit", Shape::Uint(U32)),
+            ("child_exited", Shape::Bool),
+            ("job_empty_notified", Shape::Bool),
+            ("dirty_release", Shape::Bool),
+        ],
+    ),
+    (
+        "capacity_exercised",
+        &[
+            ("trial_allocated_bytes", Shape::Uint(U64)),
+            ("recipe_allocated_bytes", Shape::Uint(U64)),
+            ("denial_checks", Shape::Uint(u8::MAX as u64)),
+            ("overlap_excluded", Shape::Bool),
+            ("aggregate_cap_checked", Shape::Bool),
+            ("trial_released", Shape::Bool),
+            ("recipe_released", Shape::Bool),
+        ],
+    ),
+    (
+        "reserve_activity",
+        &[
+            (
+                "controlled_faults",
+                Shape::List(
+                    &Shape::Object(&[
+                        (
+                            "fault",
+                            Shape::Enum(&[
+                                "wts_ambiguity",
+                                "cpu_reserve",
+                                "ram_reserve",
+                                "disk_reserve",
+                            ]),
+                        ),
+                        ("sampled_ms", Shape::Uint(MAX_TRIAL_MS)),
+                        ("settled_ms", Shape::Uint(MAX_TRIAL_MS)),
+                        ("console_idle", Shape::Bool),
+                        ("effective_cpus", Shape::Uint(U32)),
+                        ("available_ram_bytes", Shape::Uint(U64)),
+                        ("inner_free_bytes", Shape::Uint(U64)),
+                        ("outer_free_bytes", Shape::Uint(U64)),
+                    ]),
+                    4,
+                ),
+            ),
+            (
+                "console_transitions_ms",
+                Shape::List(&Shape::Uint(MAX_TRIAL_MS), 5),
+            ),
+        ],
+    ),
     ("paused_trial", &[("verified", Shape::Bool)]),
     (
         "cleanup",
@@ -252,28 +326,12 @@ fn stock_receipt() -> [u8; 32] {
 
 /// The reviewed stock distribution manifest digest (ADR 0054).
 pub(super) fn stock_manifest() -> [u8; 32] {
-    let mut bytes = [0; 32];
-    hex::decode_to_slice(super::STOCK_MANIFEST_1113_SHA256, &mut bytes)
-        .expect("fixed manifest pin");
-    bytes
+    crate::vm::qualification_record::stock_manifest()
 }
 
-/// The release names the evidence contract, as the runner derives it: the
-/// contract and collector versions, this package version and the stock
-/// distribution pins.
+/// The shared release names the evidence contract and reviewed distribution.
 pub(super) fn release() -> [u8; 32] {
-    Sha256::digest(
-        serde_json::to_vec(&(
-            "arx-vm-qualify",
-            RECORD_CONTRACT,
-            RECORD_COLLECTOR,
-            env!("CARGO_PKG_VERSION"),
-            stock_receipt(),
-            stock_manifest(),
-        ))
-        .expect("fixed tuple"),
-    )
-    .into()
+    crate::vm::qualification_record::release()
 }
 
 /// The record files, in manifest order.
@@ -335,11 +393,17 @@ fn rules(file: DiagnosticFile) -> Rules {
                 "supervisor_loss_release",
                 "capacity_trials",
             ],
-            &["capacity", "paused_store", "paused_trial"],
+            &[
+                "capacity",
+                "paused_store",
+                "paused_trial",
+                "supervisor_loss",
+                "capacity_exercised",
+            ],
         ),
         F::ActivityReserves => records(
             &["activity_reserves_baseline", "reserve_activity_trials"],
-            &["activity"],
+            &["activity", "reserve_activity"],
         ),
         F::WhpxQmpEndpoint => records(
             &[
@@ -349,9 +413,9 @@ fn rules(file: DiagnosticFile) -> Rules {
                 "qmp_channel",
                 "installed_guest_endpoint",
             ],
-            &["whpx", "paused_trial"],
+            &["whpx", "paused_trial", "firmware_sec", "qmp_firmware"],
         ),
-        // Recipe and network collectors remain unavailable.
+        // PR 1 can persist network diagnostics, but cannot attest isolation.
         F::NetworkRestrictedTest => records(&["restricted_test_network"], &[]),
         F::RecipeUbuntu => records(&["ubuntu_recipe"], &[]),
         F::RecipeWindows => records(&["windows_recipe"], &[]),

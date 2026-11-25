@@ -223,6 +223,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
             Command::Accelerators => ("query-accelerators", None),
             Command::Continue => ("cont", None),
             Command::Powerdown => ("system_powerdown", None),
+            #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+            Command::Quit => ("quit", None),
             Command::Screendump(filename) => (
                 "screendump",
                 Some(serde_json::json!({
@@ -276,6 +278,8 @@ enum Command<'a> {
     Accelerators,
     Continue,
     Powerdown,
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    Quit,
     Screendump(&'a str),
 }
 
@@ -579,6 +583,35 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
         Ok(())
     }
 
+    /// QEMU's control-plane exit for the diskless firmware probe. Require
+    /// the matching empty reply and a clean stream EOF inside one cutoff.
+    /// The caller still owns all process, Job and writer release checks.
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    pub(super) async fn quit(self, cancel: &Shutdown, cutoff: Instant) -> Result<(), ChannelError> {
+        if !self.started || self.installer.is_some() {
+            return Err(ChannelError::Unexpected);
+        }
+        let mut stream = self.stream.ok_or(ChannelError::Closed)?;
+        let deadline = cutoff.min(Instant::now() + INSTALLER_STOP_GRACE);
+        bounded(cancel, deadline, async {
+            let mut events = Events::default();
+            empty(stream.command(Command::Quit, &mut events).await?)?;
+            loop {
+                match stream.record().await {
+                    Ok(Record::Event(event)) => events.observe(event)?,
+                    Err(ChannelError::Eof)
+                        if stream.pending.is_empty() && !events.guest_shutdown =>
+                    {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                    Ok(_) => return Err(ChannelError::Unexpected),
+                }
+            }
+        })
+        .await
+    }
+
     /// Consumes the channel. Success is guest evidence only, independent of
     /// process exit, Job-empty, worker joins and artifact release.
     pub async fn powerdown(mut self, cancel: &Shutdown) -> Result<(), ChannelError> {
@@ -715,6 +748,63 @@ mod accelerator_tests {
                 qmp.verify_whpx()
             );
             assert_eq!(result.is_ok(), accepted, "{response}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod quit_tests {
+    use super::*;
+    use tokio::io::AsyncBufReadExt;
+
+    #[tokio::test]
+    async fn quit_requires_correlated_reply_and_bounded_clean_eof() {
+        let empty_reply = b"{\"return\":{},\"id\":1}\r\n".as_slice();
+        for (reply, close, expected) in [
+            (empty_reply, true, Ok(())),
+            (b"".as_slice(), true, Err(ChannelError::Eof)),
+            (
+                b"{\"return\":{},\"id\":2}\r\n".as_slice(),
+                true,
+                Err(ChannelError::Unexpected),
+            ),
+            (
+                b"{\"return\":{},\"id\":1}\r\n{".as_slice(),
+                true,
+                Err(ChannelError::Eof),
+            ),
+            (empty_reply, false, Err(ChannelError::Timeout)),
+        ] {
+            let (host, simulated) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(host);
+            let qmp = Qmp {
+                stream: Some(Stream {
+                    reader: BufReader::new(reader),
+                    writer,
+                    next_id: 1,
+                    pending: Vec::new(),
+                }),
+                started: true,
+                installer: None,
+            };
+            let cancel = Shutdown::default();
+            let deadline = Instant::now() + Duration::from_millis(250);
+            let (_, result) = tokio::join!(
+                async {
+                    let mut peer = BufReader::new(simulated);
+                    let mut command = String::new();
+                    peer.read_line(&mut command).await.unwrap();
+                    assert_eq!(command, "{\"execute\":\"quit\",\"id\":1}\r\n");
+                    peer.get_mut().write_all(reply).await.unwrap();
+                    if !close {
+                        tokio::time::sleep_until(deadline).await;
+                        // Keep the peer alive past the deadline.
+                        tokio::task::yield_now().await;
+                    }
+                },
+                qmp.quit(&cancel, deadline),
+            );
+            assert_eq!(result, expected);
         }
     }
 }

@@ -145,6 +145,11 @@ pub struct CommandPlan<'a> {
     image: &'a LocalPath,
     args: Vec<String>,
     binding: Binding<'a>,
+    #[cfg_attr(
+        not(any(test, all(windows, target_arch = "x86_64"))),
+        allow(dead_code, reason = "native input custody is Windows x64 only")
+    )]
+    inputs: Vec<(ArtifactRole, Artifact)>,
 }
 
 impl<'a> CommandPlan<'a> {
@@ -204,6 +209,12 @@ impl<'a> CommandPlan<'a> {
         }
     }
 
+    /// Exact path/role/identity/pin projection for native custody checks.
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    pub(super) fn inputs(&self) -> &[(ArtifactRole, Artifact)] {
+        &self.inputs
+    }
+
     pub fn installer_artifacts(&self) -> &[InstallerArtifact<'a>] {
         match &self.binding {
             Binding::Installer(_, artifacts) => artifacts,
@@ -229,11 +240,16 @@ pub(super) fn golden_info<'a>(
     golden: &Artifact,
     header: &[u8],
 ) -> Result<CommandPlan<'a>, InvalidImage> {
+    let inputs = vec![
+        (ArtifactRole::QemuImg, image.clone()),
+        (ArtifactRole::Golden, golden.clone()),
+    ];
     let (image, args) = golden_info_args(image, golden, header)?;
     Ok(CommandPlan {
         image,
         args,
         binding: Binding::Inspect,
+        inputs,
     })
 }
 
@@ -257,10 +273,18 @@ pub(super) fn offline_info<'a>(
     header: &[u8],
     backing: Option<&Artifact>,
 ) -> Result<CommandPlan<'a>, InvalidImage> {
+    let mut inputs = vec![
+        (ArtifactRole::QemuImg, image.clone()),
+        (ArtifactRole::GuestDisk, disk.clone()),
+    ];
+    if let Some(golden) = backing {
+        inputs.push((ArtifactRole::Golden, golden.clone()));
+    }
     let (image, args) = offline_info_args(image, disk, header, backing)?;
     Ok(CommandPlan {
         image,
         args,
+        inputs,
         binding: Binding::Offline {
             lease,
             mutate: false,
@@ -295,6 +319,7 @@ pub(super) enum SnapshotDiskRole {
 /// native constructor. This alone has no execution authority.
 pub struct SnapshotInfo<'a> {
     disk: &'a Artifact,
+    disk_role: ArtifactRole,
     golden: Option<&'a Artifact>,
     path: &'a LocalPath,
     args: Vec<String>,
@@ -330,6 +355,7 @@ impl<'a> SnapshotInfo<'a> {
         }
         Ok(Self {
             disk,
+            disk_role: expected_role,
             golden: golden.map(|(artifact, _)| artifact),
             path,
             args: info_args(path),
@@ -358,9 +384,17 @@ pub(super) fn offline_snapshot_info<'a>(
     image: &'a Artifact,
     info: &SnapshotInfo<'a>,
 ) -> Result<CommandPlan<'a>, InvalidImage> {
+    let mut inputs = vec![
+        (ArtifactRole::QemuImg, image.clone()),
+        (info.disk_role, info.disk.clone()),
+    ];
+    if let Some(golden) = info.golden {
+        inputs.push((ArtifactRole::Golden, golden.clone()));
+    }
     Ok(CommandPlan {
         image: role(image, ArtifactRole::QemuImg)?,
         args: info.args.clone(),
+        inputs,
         binding: Binding::Offline {
             lease,
             mutate: false,
@@ -379,10 +413,18 @@ pub(super) fn create<'a>(
     size: u64,
     ceiling: u64,
 ) -> Result<CommandPlan<'a>, InvalidImage> {
+    let mut inputs = vec![
+        (ArtifactRole::QemuImg, image.clone()),
+        (ArtifactRole::Staging, staging.clone()),
+    ];
+    if let Some((golden, _)) = backing {
+        inputs.push((ArtifactRole::Golden, golden.clone()));
+    }
     let (image, args) = create_args(image, staging, backing, size, ceiling)?;
     Ok(CommandPlan {
         image,
         args,
+        inputs,
         binding: Binding::Offline {
             lease,
             mutate: true,
@@ -602,10 +644,51 @@ impl BootRecipe<'_> {
                 Binding::Installer(phase, artifacts)
             }
         };
+        let mut inputs = vec![
+            (image_role, self.image.clone()),
+            (Data, self.data.clone()),
+            (FirmwareCode, self.firmware.clone()),
+            (vars_role, self.vars.clone()),
+            (disk_role, self.disk.clone()),
+        ];
+        if let Some(backing) = self.backing {
+            inputs.push((Golden, backing.clone()));
+        }
+        if let Binding::PublicEgress { policy, .. } = &binding {
+            inputs.push((PublicEgressPolicy, (*policy).clone()));
+        }
+        match self.boot {
+            BootPurpose::UbuntuInstall {
+                iso,
+                cidata,
+                kernel,
+                initrd,
+            } => {
+                inputs.extend([
+                    (UbuntuInstallIso, iso.clone()),
+                    (UbuntuCidata, cidata.clone()),
+                    (UbuntuKernel, kernel.clone()),
+                    (UbuntuInitrd, initrd.clone()),
+                ]);
+            }
+            BootPurpose::WindowsSetup {
+                iso,
+                answer,
+                drivers,
+            } => {
+                inputs.extend([
+                    (WindowsInstallIso, iso.clone()),
+                    (WindowsAnswerSeed, answer.clone()),
+                    (WindowsDriverMedium, drivers.clone()),
+                ]);
+            }
+            _ => {}
+        }
         Ok(CommandPlan {
             image,
             args,
             binding,
+            inputs,
         })
     }
 
@@ -712,12 +795,12 @@ fn bind<'a>(
     Ok(path)
 }
 
-fn cd(args: &mut Vec<String>, node: &str, path: &LocalPath, bus: &str) {
+pub(super) fn cd(args: &mut Vec<String>, node: &str, path: &LocalPath, bus: &str) {
     block(args, "raw", node, path, true, None);
     args.extend(["-device".into(), format!("ide-cd,drive={node},bus={bus}")]);
 }
 
-fn block(
+pub(super) fn block(
     args: &mut Vec<String>,
     driver: &str,
     node: &str,
@@ -763,6 +846,56 @@ mod tests {
             header[120..125].copy_from_slice(b"qcow2");
         }
         header
+    }
+
+    #[test]
+    fn installed_plan_keeps_the_exact_backing_and_writable_input_roles() {
+        use ArtifactRole::*;
+        let image = artifact(Qemu, "D:/bundle/qemu-system-x86_64.exe");
+        let data = artifact(Data, "D:/bundle/share");
+        let code = artifact(FirmwareCode, "D:/bundle/share/edk2-x86_64-code.fd");
+        let vars = artifact(Vars, "D:/recipe/run/vars.fd");
+        let disk = artifact(GuestDisk, "D:/recipe/run/disk.qcow2");
+        let golden = artifact(Golden, "D:/recipe/golden.qcow2");
+        let backed = header(Some(golden.path_for(Golden).unwrap().as_str()));
+        let plain = header(None);
+        let serial = SerialName::generate().unwrap();
+        let recipe = BootRecipe {
+            image: &image,
+            data: &data,
+            firmware: &code,
+            vars: &vars,
+            disk: &disk,
+            disk_header: &backed,
+            backing: Some(&golden),
+            backing_header: Some(&plain),
+            serial: &serial,
+            boot: BootPurpose::Installed,
+            ram_mib: 1024,
+            vcpus: 1,
+        };
+        let plan = recipe.plan().unwrap();
+        let expected = [
+            (Qemu, &image),
+            (Data, &data),
+            (FirmwareCode, &code),
+            (Vars, &vars),
+            (GuestDisk, &disk),
+            (Golden, &golden),
+        ];
+        assert_eq!(plan.inputs().len(), expected.len());
+        for ((role, input), (expected_role, expected)) in plan.inputs().iter().zip(expected) {
+            assert_eq!(*role, expected_role);
+            assert_eq!(input.path_for(*role), expected.path_for(expected_role));
+        }
+        assert_eq!(
+            plan.inputs()
+                .iter()
+                .map(|(role, _)| *role)
+                .filter(|role| role.writable())
+                .collect::<Vec<_>>(),
+            [Vars, GuestDisk]
+        );
     }
 
     /// The lease is uninhabited in this slice, so the leased constructors are
