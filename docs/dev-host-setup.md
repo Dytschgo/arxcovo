@@ -447,7 +447,9 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    through checked, owned paths. Canonical `qualification.json` references
    that SHA-256 and byte-length manifest, and local enrollment pins the
    SHA-256 of `qualification.json`. Select only a complete reviewed record.
-   It expires after at most seven days or earlier on material drift. Keep
+   Contract 4 requires the same Windows boot and expires after at most
+   seven days, or earlier on material drift. Run full TEST qualification into
+   a fresh directory after reboot or when replacing a contract 3 dossier. Keep
    raw paths, SID values and endpoints in the local enrollment. Publish only
    sanitized predicates and approved hashes.
 

@@ -106,9 +106,10 @@ impl Storage {
 
 pub(super) struct Scope {
     pub(super) recipe: Storage,
-    production: Storage,
+    pub(super) production: Storage,
     _database: PathPin,
     _lock: PathPin,
+    host: crate::vm::Id,
     pub(super) key: [u8; 32],
 }
 
@@ -132,8 +133,9 @@ impl Scope {
         backing: &PathPin,
         volumes: [&capacity::AnchoredVolume; 2],
         evidence: &LocalPath,
-        owner: PSID,
+        guard: (PSID, CollectMode<'_>),
     ) -> Result<Self, NativeRefusal> {
+        let (owner, mode) = guard;
         let reason = NativeRefusal::PathCustodyUnverified;
         let [trial_volume, outer] = volumes;
         let recipe = Storage::hold(names, &enrollment.recipe, outer, owner)?;
@@ -175,8 +177,22 @@ impl Scope {
             .path
             .join("activity.lock")
             .map_err(|_| reason)?;
-        let database = capacity::walk(names, &production.volume, &database, false, false)?;
-        let lock = capacity::walk(names, &production.volume, &lock, false, false)?;
+        // The daemon's SQLite connection and locked guard already hold the
+        // exact leaves with write access. Open compatible read handles.
+        let database = capacity::walk(
+            names,
+            &production.volume,
+            &database,
+            false,
+            mode.is_foreground(),
+        )?;
+        let lock = capacity::walk(
+            names,
+            &production.volume,
+            &lock,
+            false,
+            mode.is_foreground(),
+        )?;
         if !sink::held_private(&database.leaf, owner)
             || !sink::held_private(&lock.leaf, owner)
             || [database.identity, lock.identity]
@@ -186,7 +202,10 @@ impl Scope {
         {
             return Err(reason);
         }
-        let host = read_store_host(&production.root, &database)?;
+        let host = match mode {
+            CollectMode::Foreground(store) => read_guarded_host(store, &database, &lock)?,
+            CollectMode::Qualifier => read_store_host(&production.root, &database)?,
+        };
         let key = crate::vm::qualification_record::digest(
             &serde_json::to_vec(&(
                 "arx-vm-qualification-storage-v1",
@@ -203,8 +222,20 @@ impl Scope {
             production,
             _database: database,
             _lock: lock,
+            host,
             key,
         })
+    }
+
+    pub(super) fn validate_foreground(
+        &self,
+        store: &crate::store::vm::VmStore,
+    ) -> Result<(), NativeRefusal> {
+        self.validate_live()?;
+        if read_guarded_host(store, &self._database, &self._lock)? != self.host {
+            return Err(NativeRefusal::PathCustodyUnverified);
+        }
+        Ok(())
     }
 
     pub(super) fn within_shared_cap(&self, trial: &Limits) -> bool {
@@ -228,6 +259,30 @@ impl Scope {
             extra_bytes,
         )
     }
+}
+
+fn read_guarded_host(
+    store: &crate::store::vm::VmStore,
+    database: &PathPin,
+    lock: &PathPin,
+) -> Result<crate::vm::Id, NativeRefusal> {
+    let reason = NativeRefusal::PathCustodyUnverified;
+    inventory::binding(database)?;
+    inventory::binding(lock)?;
+    // Verify the held lock leaf is actively exclusively locked (by `store`),
+    // and match `store`'s open SQLite main handle, database handle and lock
+    // handle by exact OS file identity (volume serial + 128-bit file ID).
+    match lock.leaf.try_lock() {
+        Ok(()) => {
+            let _ = lock.leaf.unlock();
+            return Err(reason);
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Err(std::fs::TryLockError::Error(_)) => return Err(reason),
+    }
+    store
+        .read_host_for_identity(database.identity, lock.identity)
+        .map_err(|_| reason)
 }
 
 pub(super) fn aggregate_within_cap(
@@ -624,5 +679,166 @@ mod tests {
         assert!(aggregate_within_cap(GIB, 100 * GIB, 98 * GIB, GIB));
         assert!(!aggregate_within_cap(GIB, 100 * GIB, 98 * GIB, GIB + 1));
         assert!(!aggregate_within_cap(u64::MAX, 1, 0, 0));
+    }
+
+    fn test_storage(root_path: &LocalPath, backing_path: &LocalPath) -> Storage {
+        let drive = &root_path.as_str()[..3];
+        let volume = capacity::anchor_volume(&capacity::MountManager, drive).unwrap();
+        let root =
+            capacity::walk(&capacity::MountManager, &volume, root_path, true, false).unwrap();
+        let backing =
+            capacity::walk(&capacity::MountManager, &volume, backing_path, false, false).unwrap();
+        let vhd = OwnedHandle::from(backing.leaf.try_clone().unwrap());
+        let device = capacity::HeldDevice::test_dummy(&backing.leaf);
+        Storage {
+            volume,
+            root,
+            backing,
+            _vhd: vhd,
+            _device: device,
+            limits: Limits {
+                inner_caller_free_bytes: 0,
+                inner_total_free_bytes: 0,
+                inner_total_bytes: 0,
+                inner_extent_bytes: 0,
+                vhd_virtual_bytes: 0,
+                outer_caller_free_bytes: 0,
+                outer_total_free_bytes: 0,
+                backing_allocated_bytes: 0,
+                backing_length_bytes: 0,
+                disk_ceiling_bytes: DISK_CEILING,
+                outer_floor_bytes: OUTER_FLOOR,
+                disk_budget_bytes: 0,
+                empty_job_memory_limit_bytes: JOB_MEMORY_BYTES as u64,
+                empty_job_cpu_rate: JOB_CPU_RATE,
+            },
+        }
+    }
+
+    fn private_dir(parent: &Path, name: &str) -> LocalPath {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        };
+        let token = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
+        let data = token_data(&token, TokenUser).unwrap();
+        let sid = unsafe { (*data.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut text = null_mut();
+        assert_ne!(unsafe { ConvertSidToStringSidW(sid, &mut text) }, 0);
+        let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+        let user_sid =
+            String::from_utf16(unsafe { std::slice::from_raw_parts(text, len) }).unwrap();
+        unsafe { LocalFree(text.cast()) };
+        let sddl = format!("O:{user_sid}D:P(A;OICI;FA;;;{user_sid})");
+        let path = parent.join(name);
+        let mut descriptor = null_mut();
+        let wide_sddl: Vec<u16> = OsStr::new(&sddl).encode_wide().chain(Some(0)).collect();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide_sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let ok = unsafe { CreateDirectoryW(wide(&path).as_ptr(), &attributes) };
+        unsafe { LocalFree(descriptor) };
+        assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+        LocalPath::parse(path.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn read_guarded_host_and_validate_foreground_bind_exact_store_identity() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let path_a = private_dir(temp.path(), "store-a");
+        let path_b = private_dir(temp.path(), "store-b");
+        let recipe_path = private_dir(temp.path(), "recipe");
+        let dir_a = Path::new(path_a.as_str());
+        let dir_b = Path::new(path_b.as_str());
+        let backing_a = temp.path().join("prod.vhdx");
+        let backing_r = temp.path().join("recipe.vhdx");
+        std::fs::write(&backing_a, b"prod-backing").unwrap();
+        std::fs::write(&backing_r, b"recipe-backing").unwrap();
+
+        let store_a = crate::store::vm::VmStore::open(dir_a, 1_000).unwrap();
+        let store_b = crate::store::vm::VmStore::open(dir_b, 1_000).unwrap();
+        let expected_host = store_a
+            .read_backup_owner(crate::store::vm::static_vm::host_id)
+            .unwrap();
+
+        let db_a = PathPin::open(&path_a.join("activity.sqlite3").unwrap(), false, true).unwrap();
+        let lock_a = PathPin::open(&path_a.join("activity.lock").unwrap(), false, true).unwrap();
+        let lock_b = PathPin::open(&path_b.join("activity.lock").unwrap(), false, true).unwrap();
+
+        // Matching store succeeds and returns the enrolled host ID.
+        assert_eq!(
+            read_guarded_host(&store_a, &db_a, &lock_a),
+            Ok(expected_host)
+        );
+
+        // Different VmStore opened on another directory is refused.
+        assert_eq!(
+            read_guarded_host(&store_b, &db_a, &lock_a),
+            Err(NativeRefusal::PathCustodyUnverified)
+        );
+
+        // Matching database with mismatched lock file identity is refused.
+        assert_eq!(
+            read_guarded_host(&store_a, &db_a, &lock_b),
+            Err(NativeRefusal::PathCustodyUnverified)
+        );
+
+        // Tampered database file identity (same path, wrong OS file ID) is refused.
+        let mut wrong_db =
+            PathPin::open(&path_a.join("activity.sqlite3").unwrap(), false, true).unwrap();
+        wrong_db.identity.file[0] ^= 0xff;
+        assert_eq!(
+            read_guarded_host(&store_a, &wrong_db, &lock_a),
+            Err(NativeRefusal::PathCustodyUnverified)
+        );
+
+        // An unlocked lock file (same directory shape, no active exclusive lock) is refused.
+        let unlocked_path = path_a.join("unlocked.lock").unwrap();
+        std::fs::write(unlocked_path.as_str(), b"").unwrap();
+        let unlocked_pin = PathPin::open(&unlocked_path, false, true).unwrap();
+        assert_eq!(
+            read_guarded_host(&store_a, &db_a, &unlocked_pin),
+            Err(NativeRefusal::PathCustodyUnverified)
+        );
+
+        // Scope::validate_foreground accepts the matching store and refuses a
+        // different store or host-ID drift.
+        let mut scope = Scope {
+            recipe: test_storage(
+                &recipe_path,
+                &LocalPath::parse(backing_r.to_str().unwrap()).unwrap(),
+            ),
+            production: test_storage(
+                &path_a,
+                &LocalPath::parse(backing_a.to_str().unwrap()).unwrap(),
+            ),
+            _database: db_a,
+            _lock: lock_a,
+            host: expected_host,
+            key: [0x55; 32],
+        };
+        assert_eq!(scope.validate_foreground(&store_a), Ok(()));
+        assert_eq!(
+            scope.validate_foreground(&store_b),
+            Err(NativeRefusal::PathCustodyUnverified)
+        );
+        scope.host[0] ^= 0xff;
+        assert_eq!(
+            scope.validate_foreground(&store_a),
+            Err(NativeRefusal::PathCustodyUnverified)
+        );
     }
 }

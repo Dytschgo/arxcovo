@@ -361,7 +361,7 @@ fn seal_for(binding: Binding, origin: Origin, files: &[(FileKind, Vec<u8>)]) -> 
 fn fresh(dependencies: &Dependencies) -> Fresh<'_> {
     Fresh {
         now: T0,
-        issued: T0,
+        boot_marker: [1; 32],
         dependencies,
     }
 }
@@ -1146,13 +1146,10 @@ fn strict_records_reject_duplicate_unknown_missing_and_noncanonical_fields() {
     let encoded = canonical(&record).unwrap();
     assert_eq!(decode::<Record>(&encoded).unwrap(), record);
     let valid = String::from_utf8(encoded).unwrap();
+    let contract = format!("\"contract\":{CONTRACT}");
     for changed in [
-        valid.replacen("\"contract\":3", "\"contract\":3,\"contract\":3", 1),
-        valid.replacen(
-            "\"contract\":3",
-            "\"contract\":3,\"raw_path\":\"private\"",
-            1,
-        ),
+        valid.replacen(&contract, &format!("{contract},{contract}"), 1),
+        valid.replacen(&contract, &format!(r#"{contract},"raw_path":"private""#), 1),
         valid.replacen("\"collector\":1,", "", 1),
         valid.replacen(
             "\"kind\":\"host\"",
@@ -1328,7 +1325,7 @@ fn the_verifier_checks_selection_scope_dependencies_and_time_independently() {
         utc: T0.utc + 10,
         mono_ms: 100_000,
     };
-    let cases: Vec<(&str, Selection, Dependencies, Instant2, Instant2)> = vec![
+    let cases: Vec<(&str, Selection, Dependencies, Instant2, Hash)> = vec![
         (
             "other scope",
             Selection {
@@ -1337,33 +1334,30 @@ fn the_verifier_checks_selection_scope_dependencies_and_time_independently() {
             },
             deps(),
             T0,
-            T0,
+            [1; 32],
         ),
-        ("dependency drift", selection, drifted, T0, T0),
-        ("unmeasured dependency", selection, unmeasured, T0, T0),
+        ("dependency drift", selection, drifted, T0, [1; 32]),
+        ("unmeasured dependency", selection, unmeasured, T0, [1; 32]),
         (
             "expired at the exclusive boundary",
             selection,
             deps(),
             late,
-            T0,
+            [1; 32],
         ),
-        ("UTC behind monotonic", selection, deps(), rolled_back, T0),
         (
-            "other issue time",
+            "UTC behind monotonic",
             selection,
             deps(),
-            T0,
-            Instant2 {
-                utc: T0.utc - 1,
-                mono_ms: 0,
-            },
+            rolled_back,
+            [1; 32],
         ),
+        ("other boot", selection, deps(), T0, [2; 32]),
     ];
-    for (name, selection, dependencies, now, issued) in cases {
+    for (name, selection, dependencies, now, boot_marker) in cases {
         let fresh = Fresh {
             now,
-            issued,
+            boot_marker,
             dependencies: &dependencies,
         };
         assert_eq!(
@@ -1452,6 +1446,11 @@ fn every_dependency_participates_in_the_invalidation_key() {
             release: release(),
             run: RUN,
             dependencies: key,
+            boot: BootAnchor {
+                marker: [1; 32],
+                origin_mono_ms: 0,
+            },
+            issued_mono_ms: 0,
             issued_utc: T0.utc,
             expires_utc: T0.utc + MAX_VALIDITY,
         };
@@ -1507,6 +1506,11 @@ fn validity_is_seven_days_exclusive_and_clocks_must_agree() {
         release: release(),
         run: RUN,
         dependencies: [4; 32],
+        boot: BootAnchor {
+            marker: [1; 32],
+            origin_mono_ms: 0,
+        },
+        issued_mono_ms: 0,
         issued_utc: 100,
         expires_utc: 100 + MAX_VALIDITY,
     };
@@ -1798,7 +1802,7 @@ fn trial_authority_is_private_inert_and_never_launch_authority() {
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod native_glue {
     use super::*;
-    use crate::native::{NativeCollectors, dependencies, diagnostic_file, project, refused};
+    use crate::native::{NativeCollectors, diagnostic_file, project, refused};
     use arxd::vm::qualification::{
         Activity, DiagnosticFile, Distribution, Host, Inputs, Limits, Observation as Timed,
         Preflight, StoreIdentity, Taken,
@@ -1911,7 +1915,7 @@ mod native_glue {
             Class::Test,
             SCOPE,
             RUN,
-            dependencies(p),
+            p.dependencies(),
             T0,
         ));
         let mut collectors = NativeCollectors::new(p, std::time::Instant::now());
@@ -2149,7 +2153,7 @@ mod native_glue {
     #[test]
     fn the_native_projection_binds_exact_host_and_store_identities() {
         let p = preflight(true, 32 * GIB, true);
-        let projected = dependencies(&p);
+        let projected = p.dependencies();
         // No reviewed artifact pin exists yet: explicitly absent.
         assert_eq!(projected.artifact, Measured::Unmeasured);
         assert_eq!(
@@ -2225,6 +2229,11 @@ mod native_glue {
             release: release(),
             run: RUN,
             dependencies: [4; 32],
+            boot: BootAnchor {
+                marker: [1; 32],
+                origin_mono_ms: 0,
+            },
+            issued_mono_ms: 0,
             issued_utc: T0.utc,
             expires_utc: T0.utc + MAX_VALIDITY,
         };
@@ -2458,6 +2467,11 @@ fn typed_host_observations_validate_and_match_the_closed_writer_schema() {
                     release: release(),
                     run: RUN,
                     dependencies: deps().key(SCOPE),
+                    boot: BootAnchor {
+                        marker: [1; 32],
+                        origin_mono_ms: 0,
+                    },
+                    issued_mono_ms: 0,
                     issued_utc: 1_800_000_000,
                     expires_utc: 1_800_604_800,
                 },

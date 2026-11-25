@@ -141,6 +141,14 @@ const BINDING: &[(&str, Shape)] = &[
     ("release", Shape::Bytes(32)),
     ("run", Shape::Bytes(16)),
     ("dependencies", Shape::Bytes(32)),
+    (
+        "boot",
+        Shape::Object(&[
+            ("marker", Shape::Bytes(32)),
+            ("origin_mono_ms", Shape::Uint(U64)),
+        ]),
+    ),
+    ("issued_mono_ms", Shape::Uint(MAX_TRIAL_MS)),
     ("issued_utc", Shape::Uint(U64)),
     ("expires_utc", Shape::Uint(U64)),
 ];
@@ -723,7 +731,7 @@ pub(super) mod tests {
 
     pub(in super::super) fn binding() -> String {
         format!(
-            r#"{{"class":"test","scope":{s},"release":{r},"run":[{run}],"dependencies":{d},"issued_utc":1800000000,"expires_utc":1800604800}}"#,
+            r#"{{"class":"test","scope":{s},"release":{r},"run":[{run}],"dependencies":{d},"boot":{{"marker":{s},"origin_mono_ms":0}},"issued_mono_ms":0,"issued_utc":1800000000,"expires_utc":1800604800}}"#,
             s = hash(1),
             r = hash(2),
             run = vec!["3"; 16].join(","),
@@ -734,7 +742,7 @@ pub(super) mod tests {
     /// One canonical native `inputs.json` record list, as the runner writes it.
     pub(in super::super) fn inputs_record(extra: &str) -> String {
         format!(
-            r#"[{{"contract":3,"collector":1,"origin":"native","binding":{b},"stage":"inputs","started_ms":0,"finished_ms":3,"prior":{p},"result":{{"passed":{{"kind":"input_pins","held_roots":5,"enrollment_private":true,"evidence_private":true,"trial_root_private":true,"evidence_claimed":true{extra}}}}}}}]"#,
+            r#"[{{"contract":{RECORD_CONTRACT},"collector":1,"origin":"native","binding":{b},"stage":"inputs","started_ms":0,"finished_ms":3,"prior":{p},"result":{{"passed":{{"kind":"input_pins","held_roots":5,"enrollment_private":true,"evidence_private":true,"trial_root_private":true,"evidence_claimed":true{extra}}}}}}}]"#,
             b = binding(),
             p = hash(0),
         )
@@ -742,7 +750,7 @@ pub(super) mod tests {
 
     fn summary(late: &str, unwritten: &str) -> String {
         format!(
-            r#"{{"contract":3,"origin":"native","binding":{b},"blocked_at":"disposable_store","unattempted":["suspended_child","cleanup"],"unmeasured":["artifact","owner_profile"],"dispatched_effects":0,"charge_retained":false,"late":{late},"unwritten":{unwritten}}}"#,
+            r#"{{"contract":{RECORD_CONTRACT},"origin":"native","binding":{b},"blocked_at":"disposable_store","unattempted":["suspended_child","cleanup"],"unmeasured":["artifact","owner_profile"],"dispatched_effects":0,"charge_retained":false,"late":{late},"unwritten":{unwritten}}}"#,
             b = binding(),
         )
     }
@@ -773,7 +781,7 @@ pub(super) mod tests {
     fn distribution_record(receipt: [u8; 32], manifest: [u8; 32]) -> String {
         let array = |bytes: [u8; 32]| serde_json::to_string(&bytes).unwrap();
         format!(
-            r#"[{{"contract":3,"collector":1,"origin":"native","binding":{b},"stage":"distribution","started_ms":0,"finished_ms":3,"prior":{p},"result":{{"passed":{{"kind":"distribution","receipt":{r},"receipt_bytes":7438,"manifest":{m},"manifest_bytes":11915,"payload_files":136,"payload_bytes":1}}}}}}]"#,
+            r#"[{{"contract":{RECORD_CONTRACT},"collector":1,"origin":"native","binding":{b},"stage":"distribution","started_ms":0,"finished_ms":3,"prior":{p},"result":{{"passed":{{"kind":"distribution","receipt":{r},"receipt_bytes":7438,"manifest":{m},"manifest_bytes":11915,"payload_files":136,"payload_bytes":1}}}}}}]"#,
             b = binding(),
             p = hash(0),
             r = array(receipt),
@@ -885,7 +893,7 @@ pub(super) mod tests {
             (
                 "wrong contract",
                 DiagnosticFile::Inputs,
-                good.replace(r#""contract":3"#, r#""contract":2"#),
+                good.replace(r#""contract":4"#, r#""contract":2"#),
             ),
             (
                 "short hash",
@@ -896,19 +904,19 @@ pub(super) mod tests {
                 "reordered fields",
                 DiagnosticFile::Inputs,
                 good.replace(
-                    r#""contract":3,"collector":1"#,
-                    r#""collector":1,"contract":3"#,
+                    r#""contract":4,"collector":1"#,
+                    r#""collector":1,"contract":4"#,
                 ),
             ),
             (
                 "duplicate field",
                 DiagnosticFile::Inputs,
-                good.replace(r#""contract":3,"#, r#""contract":3,"contract":3,"#),
+                good.replace(r#""contract":4,"#, r#""contract":4,"contract":4,"#),
             ),
             (
                 "whitespace",
                 DiagnosticFile::Inputs,
-                good.replace(r#""contract":3"#, r#""contract": 2"#),
+                good.replace(r#""contract":4"#, r#""contract": 2"#),
             ),
             (
                 "escaped spelling",

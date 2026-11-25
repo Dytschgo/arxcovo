@@ -685,6 +685,27 @@ impl VmStore {
         read(&db)
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn read_host_for_identity(
+        &self,
+        expected_database: FileIdentity,
+        expected_lock: FileIdentity,
+    ) -> Result<Id> {
+        use std::os::windows::io::AsRawHandle;
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM state unavailable"))?;
+        let main_handle = sqlite_main_handle(&mut db)?;
+        ensure!(
+            windows_file_identity(main_handle)? == expected_database
+                && windows_file_identity(self._database.as_raw_handle())? == expected_database
+                && windows_file_identity(self._lock.as_raw_handle())? == expected_lock,
+            "VM store identity mismatch"
+        );
+        static_vm::host_id(&db)
+    }
+
     pub(crate) fn transact<T>(&self, run: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut db = self
             .db
@@ -931,7 +952,66 @@ fn windows_identity(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<(u
     ))
 }
 
-fn sqlite_main_identity(db: &mut Connection) -> Result<(u64, u64)> {
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn windows_file_identity(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<FileIdentity> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_ID_INFO, FILE_STANDARD_INFO, FILE_TYPE_DISK,
+        FileAttributeTagInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
+        GetFileType,
+    };
+    ensure!(
+        !handle.is_null() && handle != INVALID_HANDLE_VALUE,
+        "invalid VM state handle"
+    );
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+    let mut standard = FILE_STANDARD_INFO::default();
+    let mut id = FILE_ID_INFO::default();
+    // Both retained Rust files and SQLite's borrowed handle outlive these queries.
+    unsafe {
+        ensure!(GetFileType(handle) == FILE_TYPE_DISK, "disk file required");
+        for (class, buffer, size) in [
+            (
+                FileAttributeTagInfo,
+                std::ptr::from_mut(&mut tag).cast(),
+                size_of_val(&tag),
+            ),
+            (
+                FileStandardInfo,
+                std::ptr::from_mut(&mut standard).cast(),
+                size_of_val(&standard),
+            ),
+            (
+                FileIdInfo,
+                std::ptr::from_mut(&mut id).cast(),
+                size_of_val(&id),
+            ),
+        ] {
+            ensure!(
+                GetFileInformationByHandleEx(handle, class, buffer, size as u32) != 0,
+                "unavailable VM state file identity"
+            );
+        }
+    }
+    ensure!(
+        tag.FileAttributes
+            & (FILE_ATTRIBUTE_REPARSE_POINT
+                | FILE_ATTRIBUTE_SPARSE_FILE
+                | FILE_ATTRIBUTE_COMPRESSED)
+            == 0
+            && !standard.Directory
+            && !standard.DeletePending
+            && standard.NumberOfLinks == 1,
+        "single-link regular VM state file required"
+    );
+    Ok(FileIdentity {
+        volume: id.VolumeSerialNumber,
+        file: id.FileId.Identifier,
+    })
+}
+
+fn qualify_sqlite_main(db: &mut Connection) -> Result<*mut ffi::sqlite3> {
     use std::ffi::CStr;
 
     // The bundled extension qualifies both the native VFS and the main file's
@@ -947,8 +1027,32 @@ fn sqlite_main_identity(db: &mut Connection) -> Result<(u64, u64)> {
         },
         "unqualified SQLite VM main database"
     );
+    Ok(handle)
+}
+
+#[cfg(windows)]
+fn sqlite_main_handle(db: &mut Connection) -> Result<windows_sys::Win32::Foundation::HANDLE> {
+    let handle = qualify_sqlite_main(db)?;
+    let mut borrowed: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+    let rc = unsafe {
+        ffi::sqlite3_file_control(
+            handle,
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
+            std::ptr::from_mut(&mut borrowed).cast(),
+        )
+    };
+    ensure!(
+        rc == ffi::SQLITE_OK,
+        "unavailable SQLite VM main database handle"
+    );
+    Ok(borrowed)
+}
+
+fn sqlite_main_identity(db: &mut Connection) -> Result<(u64, u64)> {
     #[cfg(unix)]
     {
+        let handle = qualify_sqlite_main(db)?;
         const MAGIC: u32 = 0x41525849;
         const _: () = assert!(size_of::<ffi::ArxIdentityV1>() == 80);
         let mut identity = ffi::ArxIdentityV1 {
@@ -1001,19 +1105,7 @@ fn sqlite_main_identity(db: &mut Connection) -> Result<(u64, u64)> {
     }
     #[cfg(windows)]
     {
-        let mut borrowed: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
-        let rc = unsafe {
-            ffi::sqlite3_file_control(
-                handle,
-                c"main".as_ptr(),
-                ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
-                std::ptr::from_mut(&mut borrowed).cast(),
-            )
-        };
-        ensure!(
-            rc == ffi::SQLITE_OK,
-            "unavailable SQLite VM main database handle"
-        );
+        let borrowed = sqlite_main_handle(db)?;
         // SQLite retains ownership. Inspect the handle without adopting or closing it.
         windows_identity(borrowed)
     }
