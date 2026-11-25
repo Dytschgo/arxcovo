@@ -22,6 +22,11 @@ mod wire;
 
 pub(crate) use codec::wipe;
 pub use codec::{SecretText, base64_len, encode_base64, sha256_hex, wipe_bytes};
+
+/// Decodes a canonical padded Base64 payload up to `max` decoded bytes.
+pub fn decode_base64_bounded(text: &str, max: usize) -> Option<Vec<u8>> {
+    codec::decode_base64(text, max)
+}
 pub use engine::{
     APPLY_TIMEOUT, Clock, CommandRunner, DOCKER, ENGINE_CWD, ENGINE_ENV, HEALTH_ATTEMPTS,
     HEALTH_INTERVAL, Invocation, MAX_CAPTURE, PULL_TIMEOUT, QUERY_TIMEOUT, RunResult, STOP_TIMEOUT,

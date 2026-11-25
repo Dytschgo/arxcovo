@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::codec::{SecretBytes, SecretText, decode_secret, sha256_hex, wipe};
+use super::codec::{SecretBytes, SecretText, decode_secret, encode_base64, sha256_hex, wipe};
 use super::engine::{
     self, Clock, CommandRunner, HEALTH_ATTEMPTS, HEALTH_INTERVAL, NetworkObservation,
     ObservedContainer, RunResult, VolumeObservation, parse_container_mounts,
@@ -32,6 +32,10 @@ use super::wire::{
     LogEntry, LogEvent, MAX_LOG_PAGE, MAX_SECRET, Observation, OperationKind, OperationStage,
     OperationState, OperationView, ProjectView, RejectCode, STAGE_CHUNK, STAGE_TOTAL, ServiceState,
     ServiceView,
+};
+use crate::compose_backup::{
+    BACKUP_CHUNK_BYTES, BackupHelperError, StagedBackupMeta, expected_chunk_len, is_db_basename,
+    is_volume_slot,
 };
 
 /// State schema version. Bumped to v2 for unified operation phases, pinned
@@ -125,6 +129,43 @@ pub trait ComposeStore: Send {
     ) -> SecretMatch;
     /// Sets the owner of a broker-created volume's empty data root.
     fn prepare_volume(&mut self, name: &str, owner: (u32, u32)) -> Result<(), StoreError>;
+    /// Runs the fixed SQLite Online Backup helper against the held broker-owned
+    /// volume and stages a verified, `quick_check`-passing portable copy under
+    /// root-owned staging. Default returns `Unavailable` for non-backup fakes.
+    fn run_sqlite_backup(
+        &mut self,
+        _operation_id: &str,
+        _volume_name: &str,
+        _owner: (u32, u32),
+        _database: &str,
+        _max_bytes: u64,
+        _deadline: Duration,
+    ) -> Result<StagedBackupMeta, BackupHelperError> {
+        Err(BackupHelperError::Unavailable)
+    }
+    /// Reads an exact byte slice from a root-owned staged backup file.
+    fn read_backup_chunk(
+        &mut self,
+        _operation_id: &str,
+        _offset: u64,
+        _len: usize,
+    ) -> Result<Vec<u8>, StoreError> {
+        Err(StoreError)
+    }
+    /// Re-verifies that a staged backup file exists with exact size and digest.
+    fn verify_backup_staging(
+        &mut self,
+        _operation_id: &str,
+        _expected_bytes: u64,
+        _expected_digest: &str,
+    ) -> bool {
+        false
+    }
+    /// Removes only the broker-owned staged backup file for `operation_id`.
+    /// Never touches project volumes or host backups.
+    fn remove_backup_staging(&mut self, _operation_id: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +260,22 @@ struct OperationRecord {
     baseline_complete: bool,
     #[serde(default)]
     prior_container_ids: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    backup_volume: Option<String>,
+    #[serde(default)]
+    backup_database: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupStagingRecord {
+    operation_id: String,
+    project_id: String,
+    revision: u64,
+    generation: u64,
+    total_bytes: u64,
+    chunks: u32,
+    digest: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -236,6 +293,8 @@ struct State {
     // of receipt retention. A later successful delivery supersedes it.
     #[serde(default)]
     pending_epochs: BTreeMap<String, (u64, u64)>,
+    #[serde(default)]
+    staged_backup: Option<BackupStagingRecord>,
     log: VecDeque<LogEntry>,
     next_log_seq: u64,
 }
@@ -250,6 +309,7 @@ impl State {
             tombstones: VecDeque::new(),
             secret_bindings: BTreeMap::new(),
             pending_epochs: BTreeMap::new(),
+            staged_backup: None,
             log: VecDeque::new(),
             next_log_seq: 1,
         }
@@ -464,6 +524,16 @@ enum Plan {
         base_bindings: BTreeMap<String, SecretBinding>,
         services: Vec<String>,
     },
+    Backup {
+        project_id: String,
+        revision: u64,
+        generation: u64,
+        volume_name: String,
+        owner: (u32, u32),
+        database: String,
+        max_bytes: u64,
+        deadline: Duration,
+    },
 }
 
 /// How a finished operation changes the journal, secret bindings, and project
@@ -481,6 +551,7 @@ struct Settlement {
     file_witness: Option<SecretFileWitness>,
     upsert_secret: Option<SecretBinding>,
     committed_bindings: Option<BTreeMap<String, SecretBinding>>,
+    staged_backup: Option<BackupStagingRecord>,
     event: LogEvent,
 }
 
@@ -499,6 +570,7 @@ impl Settlement {
             file_witness: None,
             upsert_secret: None,
             committed_bindings: None,
+            staged_backup: None,
             event,
         }
     }
@@ -517,6 +589,7 @@ impl Settlement {
             file_witness: None,
             upsert_secret: None,
             committed_bindings: None,
+            staged_backup: None,
             event: LogEvent::OperationFailed,
         }
     }
@@ -535,6 +608,7 @@ impl Settlement {
             file_witness: None,
             upsert_secret: None,
             committed_bindings: None,
+            staged_backup: None,
             event: LogEvent::OperationAmbiguous,
         }
     }
@@ -766,6 +840,36 @@ impl ComposeService {
                 epoch,
                 data,
             ),
+            ComposeRequest::ComposeBackupBegin {
+                id,
+                operation_id,
+                generation,
+                project_id,
+                volume,
+                database,
+                max_bytes,
+                deadline_s,
+            } => self.backup_begin(
+                id,
+                operation_id,
+                generation,
+                project_id,
+                volume,
+                database,
+                max_bytes,
+                deadline_s,
+            ),
+            ComposeRequest::ComposeBackupMeta { id, operation_id } => {
+                self.backup_meta(id, &operation_id)
+            }
+            ComposeRequest::ComposeBackupChunk {
+                id,
+                operation_id,
+                index,
+            } => self.backup_chunk(id, &operation_id, index),
+            ComposeRequest::ComposeBackupRelease { id, operation_id } => {
+                self.backup_release(id, &operation_id)
+            }
         }
     }
 
@@ -1020,6 +1124,8 @@ impl ComposeService {
             services: Vec::new(),
             baseline_complete: false,
             prior_container_ids: BTreeMap::new(),
+            backup_volume: None,
+            backup_database: None,
         };
         let queued = operation_state(id, &op_record);
         let persisted = commit_state(&self.shared, &mut inner, |state| {
@@ -1193,6 +1299,8 @@ impl ComposeService {
             services: Vec::new(),
             baseline_complete: false,
             prior_container_ids: BTreeMap::new(),
+            backup_volume: None,
+            backup_database: None,
         };
         let queued = operation_state(id, &op_record);
         let persisted = commit_state(&self.shared, inner, |state| {
@@ -1301,6 +1409,10 @@ impl ComposeService {
         // Standalone SecretPut reconciliation (read-only).
         if operation.kind == OperationKind::SecretPut {
             return self.reconcile_secret_put(&mut inner, id, &operation);
+        }
+        // Backup reconciliation: verify staged output or settle Failed(NotApplied).
+        if operation.kind == OperationKind::Backup {
+            return self.reconcile_backup(&mut inner, id, &operation);
         }
 
         let project_id = operation.project_id.clone();
@@ -1499,7 +1611,7 @@ impl ComposeService {
                         ReconcileOutcome::Settled(Box::new(s))
                     }
                 },
-                OperationKind::SecretPut => unreachable!("handled above"),
+                OperationKind::SecretPut | OperationKind::Backup => unreachable!("handled above"),
             }
         };
 
@@ -1787,6 +1899,8 @@ impl ComposeService {
                             services: Vec::new(),
                             baseline_complete: false,
                             prior_container_ids: BTreeMap::new(),
+                            backup_volume: None,
+                            backup_database: None,
                         };
                         let saved = commit_settlement(
                             &self.shared,
@@ -1860,6 +1974,8 @@ impl ComposeService {
                 services: affected_services.clone(),
                 baseline_complete: false,
                 prior_container_ids: BTreeMap::new(),
+                backup_volume: None,
+                backup_database: None,
             };
             let queued_view = view(&op_record);
             let staged_digests: BTreeSet<String> =
@@ -1951,6 +2067,8 @@ impl ComposeService {
             services: Vec::new(),
             baseline_complete: false,
             prior_container_ids: BTreeMap::new(),
+            backup_volume: None,
+            backup_database: None,
         };
         let staged_digests: BTreeSet<String> =
             inner.staged.iter().map(|s| s.digest.clone()).collect();
@@ -2166,6 +2284,279 @@ impl ComposeService {
                 operation_state(id, known)
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn backup_begin(
+        &self,
+        id: u32,
+        operation_id: String,
+        generation: u64,
+        project_id: String,
+        volume: String,
+        database: String,
+        max_bytes: u64,
+        deadline_s: u32,
+    ) -> ComposeResponse {
+        let mut inner = lock(&self.shared.inner);
+        if inner.generation != Some(generation) {
+            return reject(id, RejectCode::GenerationMismatch);
+        }
+        if is_tombstoned(&inner, &operation_id) {
+            return reject(id, RejectCode::OperationConflict);
+        }
+        if let Some(known) = find(&inner, &operation_id) {
+            if known.kind == OperationKind::Backup
+                && known.project_id == project_id
+                && known.generation == generation
+                && known.backup_volume.as_deref() == Some(volume.as_str())
+                && known.backup_database.as_deref() == Some(database.as_str())
+            {
+                return operation_state(id, known);
+            }
+            return reject(id, RejectCode::OperationConflict);
+        }
+        if let Some(code) = gate(&inner, &project_id) {
+            return reject(id, code);
+        }
+        if !is_volume_slot(&volume) {
+            return reject(id, RejectCode::UnknownVolume);
+        }
+        if !is_db_basename(&database) {
+            return reject(id, RejectCode::InvalidDatabase);
+        }
+        if let Some(staged) = &inner.state.staged_backup {
+            if staged.generation == generation && staged.operation_id != operation_id {
+                return ComposeResponse::ComposeBackupOccupied {
+                    id,
+                    operation_id: staged.operation_id.clone(),
+                };
+            }
+            // Stale staging from a prior boot generation is cleaned before a new backup.
+            let stale_op = staged.operation_id.clone();
+            let _ = lock(&self.shared.store).remove_backup_staging(&stale_op);
+            let _ = commit_state(&self.shared, &mut inner, |state| {
+                state.staged_backup = None;
+                Ok(())
+            });
+        }
+        let Some(record) = inner.state.projects.get(&project_id) else {
+            return reject(id, RejectCode::UnknownProject);
+        };
+        if record.recovery_required || record.pending.is_some() {
+            return reject(id, RejectCode::ReconcileRequired);
+        }
+        let Some(committed) = &record.committed else {
+            return reject(id, RejectCode::NotCommitted);
+        };
+        let revision = committed.revision;
+        let full_volume_name = volume_name(&project_id, &volume);
+        let Some(vol_record) = inner.state.volumes.get(&full_volume_name) else {
+            return reject(id, RejectCode::UnknownVolume);
+        };
+        if vol_record.project != project_id || vol_record.volume != volume {
+            return reject(id, RejectCode::VolumeCollision);
+        }
+        let owner = (vol_record.uid, vol_record.gid);
+        let op_record = OperationRecord {
+            operation_id: operation_id.clone(),
+            kind: OperationKind::Backup,
+            project_id: project_id.clone(),
+            revision,
+            generation,
+            phase: OperationPhase::Intent,
+            state: OperationState::Running,
+            stage: OperationStage::BackingUp,
+            failure: None,
+            restored_previous: false,
+            digest: None,
+            slot: None,
+            epoch: None,
+            owner: Some(owner),
+            secret_instance: None,
+            file_witness: None,
+            services: Vec::new(),
+            baseline_complete: false,
+            prior_container_ids: BTreeMap::new(),
+            backup_volume: Some(volume),
+            backup_database: Some(database.clone()),
+        };
+        let queued = operation_state(id, &op_record);
+        let persisted = commit_state(&self.shared, &mut inner, |state| {
+            trim_journal(state)?;
+            if state.operations.len() >= MAX_JOURNAL {
+                return Err(RejectCode::JournalFull);
+            }
+            state.operations.push(op_record);
+            push_log(
+                &self.shared,
+                state,
+                &project_id,
+                LogEvent::BackupStarted,
+                None,
+                None,
+            );
+            Ok(())
+        });
+        let plan = Plan::Backup {
+            project_id,
+            revision,
+            generation,
+            volume_name: full_volume_name,
+            owner,
+            database,
+            max_bytes,
+            deadline: Duration::from_secs(u64::from(deadline_s)),
+        };
+        match persisted {
+            Ok(()) => self.spawn_worker(&mut inner, id, operation_id, plan, queued),
+            Err(code) => reject(id, code),
+        }
+    }
+
+    fn backup_meta(&self, id: u32, operation_id: &str) -> ComposeResponse {
+        let inner = lock(&self.shared.inner);
+        let Some(staged) = inner
+            .state
+            .staged_backup
+            .as_ref()
+            .filter(|s| s.operation_id == operation_id)
+        else {
+            return reject(id, RejectCode::BackupNotReady);
+        };
+        if inner.generation != Some(staged.generation) {
+            return reject(id, RejectCode::GenerationMismatch);
+        }
+        ComposeResponse::ComposeBackupReady {
+            id,
+            operation_id: staged.operation_id.clone(),
+            project_id: staged.project_id.clone(),
+            revision: staged.revision,
+            total_bytes: staged.total_bytes,
+            chunks: staged.chunks,
+            digest: staged.digest.clone(),
+        }
+    }
+
+    fn backup_chunk(&self, id: u32, operation_id: &str, index: u32) -> ComposeResponse {
+        let (total_bytes, generation) = {
+            let inner = lock(&self.shared.inner);
+            let Some(staged) = inner
+                .state
+                .staged_backup
+                .as_ref()
+                .filter(|s| s.operation_id == operation_id)
+            else {
+                return reject(id, RejectCode::BackupNotReady);
+            };
+            if inner.generation != Some(staged.generation) {
+                return reject(id, RejectCode::GenerationMismatch);
+            }
+            if index >= staged.chunks {
+                return reject(id, RejectCode::BackupChunkOutOfRange);
+            }
+            (staged.total_bytes, staged.generation)
+        };
+        let Some(expected_len) = expected_chunk_len(total_bytes, index) else {
+            return reject(id, RejectCode::BackupChunkOutOfRange);
+        };
+        let offset = u64::from(index) * BACKUP_CHUNK_BYTES as u64;
+        let bytes =
+            match lock(&self.shared.store).read_backup_chunk(operation_id, offset, expected_len) {
+                Ok(bytes) if bytes.len() == expected_len => bytes,
+                _ => return reject(id, RejectCode::StoreFailure),
+            };
+        // Re-check generation still matches before returning chunk bytes.
+        let inner = lock(&self.shared.inner);
+        if inner.generation != Some(generation) {
+            return reject(id, RejectCode::GenerationMismatch);
+        }
+        ComposeResponse::ComposeBackupData {
+            id,
+            operation_id: operation_id.to_owned(),
+            index,
+            data: encode_base64(&bytes),
+        }
+    }
+
+    fn backup_release(&self, id: u32, operation_id: &str) -> ComposeResponse {
+        let mut inner = lock(&self.shared.inner);
+        if inner.running.as_deref() == Some(operation_id) {
+            return reject(id, RejectCode::Busy);
+        }
+        let project_id = inner
+            .state
+            .staged_backup
+            .as_ref()
+            .filter(|s| s.operation_id == operation_id)
+            .map(|s| s.project_id.clone())
+            .or_else(|| {
+                find(&inner, operation_id)
+                    .filter(|op| op.kind == OperationKind::Backup)
+                    .map(|op| op.project_id.clone())
+            });
+        let removed = match lock(&self.shared.store).remove_backup_staging(operation_id) {
+            Ok(removed) => removed,
+            Err(StoreError) => return reject(id, RejectCode::StoreFailure),
+        };
+        if inner
+            .state
+            .staged_backup
+            .as_ref()
+            .is_some_and(|s| s.operation_id == operation_id)
+            && let Err(code) = commit_state(&self.shared, &mut inner, |state| {
+                state.staged_backup = None;
+                if let Some(project) = &project_id {
+                    push_log(
+                        &self.shared,
+                        state,
+                        project,
+                        LogEvent::BackupReleased,
+                        None,
+                        None,
+                    );
+                }
+                Ok(())
+            })
+        {
+            return reject(id, code);
+        }
+        ComposeResponse::ComposeBackupReleased {
+            id,
+            operation_id: operation_id.to_owned(),
+            removed,
+        }
+    }
+
+    fn reconcile_backup(
+        &self,
+        inner: &mut MutexGuard<'_, Inner>,
+        id: u32,
+        operation: &OperationRecord,
+    ) -> ComposeResponse {
+        let verified = inner
+            .state
+            .staged_backup
+            .as_ref()
+            .filter(|s| s.operation_id == operation.operation_id)
+            .is_some_and(|staged| {
+                lock(&self.shared.store).verify_backup_staging(
+                    &staged.operation_id,
+                    staged.total_bytes,
+                    &staged.digest,
+                )
+            });
+        if verified {
+            let mut s = Settlement::succeeded(LogEvent::Reconciled, None);
+            s.recovery_required = None;
+            let _ = commit_settlement(&self.shared, inner, &operation.operation_id, s);
+        } else {
+            let _ = lock(&self.shared.store).remove_backup_staging(&operation.operation_id);
+            let mut s = Settlement::failed(FailureCode::NotApplied);
+            s.event = LogEvent::Reconciled;
+            let _ = commit_settlement(&self.shared, inner, &operation.operation_id, s);
+        }
+        operation_state(id, find(inner, &operation.operation_id).expect("journaled"))
     }
 }
 
@@ -2486,6 +2877,9 @@ fn apply_settlement_to_state(
         state.pending_epochs.remove(&key);
         state.secret_bindings.insert(key, binding);
     }
+    if let Some(staged_backup) = settlement.staged_backup {
+        state.staged_backup = Some(staged_backup);
+    }
     if let Some(record) = state.projects.get_mut(&project_id) {
         if settlement.promote
             && let Some(pending) = record.pending.take()
@@ -2708,6 +3102,82 @@ impl Steps<'_> {
                 base_bindings,
                 &services,
             ),
+            Plan::Backup {
+                project_id,
+                revision,
+                generation,
+                volume_name,
+                owner,
+                database,
+                max_bytes,
+                deadline,
+            } => self.backup(
+                &project_id,
+                revision,
+                generation,
+                &volume_name,
+                owner,
+                &database,
+                max_bytes,
+                deadline,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn backup(
+        &mut self,
+        project_id: &str,
+        revision: u64,
+        generation: u64,
+        volume_name: &str,
+        owner: (u32, u32),
+        database: &str,
+        max_bytes: u64,
+        deadline: Duration,
+    ) -> Settlement {
+        if let Err(step) = self.checkpoint_effect_started() {
+            return step.into();
+        }
+        self.stage(OperationStage::BackingUp);
+        let outcome = lock(&self.shared.store).run_sqlite_backup(
+            self.operation_id,
+            volume_name,
+            owner,
+            database,
+            max_bytes,
+            deadline,
+        );
+        match outcome {
+            Ok(meta) => {
+                let mut s = Settlement::succeeded(LogEvent::BackupStaged, None);
+                s.recovery_required = None;
+                s.staged_backup = Some(BackupStagingRecord {
+                    operation_id: self.operation_id.to_owned(),
+                    project_id: project_id.to_owned(),
+                    revision,
+                    generation,
+                    total_bytes: meta.total_bytes,
+                    chunks: meta.chunks,
+                    digest: meta.digest,
+                });
+                s
+            }
+            Err(err) => {
+                let _ = lock(&self.shared.store).remove_backup_staging(self.operation_id);
+                let code = match err {
+                    BackupHelperError::NotFound => FailureCode::BackupNotFound,
+                    BackupHelperError::TooLarge => FailureCode::BackupTooLarge,
+                    BackupHelperError::TimedOut => FailureCode::BackupTimedOut,
+                    BackupHelperError::Corrupt => FailureCode::BackupCorrupt,
+                    BackupHelperError::StoreFailed => FailureCode::StoreFailed,
+                    BackupHelperError::Unavailable
+                    | BackupHelperError::InvalidInput
+                    | BackupHelperError::PathViolation
+                    | BackupHelperError::BackupFailed => FailureCode::BackupFailed,
+                };
+                Settlement::failed(code)
+            }
         }
     }
 

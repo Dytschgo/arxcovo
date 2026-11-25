@@ -399,6 +399,7 @@ async fn inspect_vm(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>
             "compose_down",
             "compose_status",
             "compose_logs",
+            "compose_backup",
             "vault_list",
             "vault_get",
             "vault_add_version",

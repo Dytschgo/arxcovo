@@ -207,7 +207,7 @@ fn ci_test_profile_keeps_runtime_checks_when_debuginfo_is_off() {
 #[test]
 fn stdio_guest_refuses_the_compose_handshake_like_a_legacy_guest() {
     let output = run_guest(&["serve-stdio"], Stdio::piped(), |mut input, _| {
-        let request = br#"{"type":"ComposeHello","version":2,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["lifecycle","logs","manifest","secrets","status"]}"#;
+        let request = br#"{"type":"ComposeHello","version":3,"challenge":"0123456789abcdef0123456789abcdef","generation":7,"capabilities":["backup","lifecycle","logs","manifest","secrets","status"]}"#;
         input
             .write_all(&(request.len() as u32).to_be_bytes())
             .unwrap();
@@ -338,4 +338,147 @@ for value in cases:
             3
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn backup_sqlite_helper_subcommand_refuses_bare_invocation_and_runs_isolated_copy() {
+    use std::fs::{self, File, OpenOptions};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::CommandExt;
+
+    use arx_guest::compose_backup::{
+        LINUX_HELPER_CONFIG_FD, LINUX_HELPER_DST_STAT_FD, LINUX_HELPER_RESULT_FD,
+        LINUX_HELPER_VOL_FD, LinuxBackupHelperConfig, LinuxBackupHelperReply, MAX_BACKUP_BYTES,
+        verify_portable_sqlite_file,
+    };
+
+    // Bare invocation without inherited descriptors exits non-zero cleanly.
+    let bare = Command::new(GUEST)
+        .arg("backup-sqlite-helper")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(bare.status.code(), Some(1));
+    assert!(bare.stdout.is_empty());
+
+    // End-to-end invocation of the real binary subcommand with inherited fds.
+    let raw = std::env::temp_dir().join(format!("arx-guest-cli-helper-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&raw);
+    fs::create_dir_all(&raw).unwrap();
+    let root = fs::canonicalize(&raw).unwrap();
+    let vol_data = root.join("vol_data");
+    let staging = root.join("staging");
+    fs::create_dir_all(&vol_data).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+
+    let db_path = vol_data.join("app.sqlite3");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA wal_autocheckpoint=0;
+         CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+         INSERT INTO t(v) VALUES ('cli_helper_wal');",
+    )
+    .unwrap();
+
+    let dst_path = staging.join("out.sqlite3");
+    let dst_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&dst_path)
+        .unwrap();
+    let vol_dir_file = File::open(&vol_data).unwrap();
+
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let cfg = LinuxBackupHelperConfig {
+        database: "app.sqlite3".to_owned(),
+        dst_path: dst_path.to_str().unwrap().to_owned(),
+        vol_path: Some(vol_data.to_str().unwrap().to_owned()),
+        max_bytes: MAX_BACKUP_BYTES,
+        deadline_ms: 15_000,
+        uid,
+        gid,
+        isolate_root: false,
+    };
+    let (cfg_read, mut cfg_write) = std::io::pipe().unwrap();
+    let (mut res_read, res_write) = std::io::pipe().unwrap();
+    cfg_write
+        .write_all(&serde_json::to_vec(&cfg).unwrap())
+        .unwrap();
+    drop(cfg_write);
+
+    let dup_high = |fd: i32| -> OwnedFd {
+        let d = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+        assert!(d >= 10);
+        unsafe { OwnedFd::from_raw_fd(d) }
+    };
+    let vol_h = dup_high(vol_dir_file.as_raw_fd());
+    let dst_h = dup_high(dst_file.as_raw_fd());
+    let cfg_h = dup_high(cfg_read.as_raw_fd());
+    let res_h = dup_high(res_write.as_raw_fd());
+    let (v_raw, d_raw, c_raw, r_raw) = (
+        vol_h.as_raw_fd(),
+        dst_h.as_raw_fd(),
+        cfg_h.as_raw_fd(),
+        res_h.as_raw_fd(),
+    );
+
+    let mut cmd = Command::new(GUEST);
+    cmd.arg("backup-sqlite-helper")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(move || {
+            for (src, dst) in [
+                (v_raw, LINUX_HELPER_VOL_FD),
+                (d_raw, LINUX_HELPER_DST_STAT_FD),
+                (c_raw, LINUX_HELPER_CONFIG_FD),
+                (r_raw, LINUX_HELPER_RESULT_FD),
+            ] {
+                if libc::dup2(src, dst) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    drop(vol_h);
+    drop(dst_h);
+    drop(cfg_h);
+    drop(res_h);
+    drop(cfg_read);
+    drop(res_write);
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    let mut reply_buf = Vec::new();
+    res_read.read_to_end(&mut reply_buf).unwrap();
+    let reply: LinuxBackupHelperReply = serde_json::from_slice(&reply_buf).unwrap();
+    assert!(reply.ok, "{reply:?}");
+
+    // Normalize journal_mode=DELETE as parent does and verify portable SQLite output.
+    {
+        let c = rusqlite::Connection::open(&dst_path).unwrap();
+        c.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
+    }
+    let meta = verify_portable_sqlite_file(&dst_path, MAX_BACKUP_BYTES).unwrap();
+    assert!(meta.total_bytes >= 4096);
+    let check_conn = rusqlite::Connection::open(&dst_path).unwrap();
+    let v: String = check_conn
+        .query_row("SELECT v FROM t WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, "cli_helper_wal");
+    drop(check_conn);
+    drop(conn);
+    let _ = fs::remove_dir_all(&root);
 }

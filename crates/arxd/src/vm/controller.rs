@@ -122,6 +122,40 @@ impl<C: Clock> VmController<C> {
         &self.store
     }
 
+    pub(crate) fn validate_compose_backup_disk(
+        &self,
+        db: &Connection,
+        capacity: Option<Capacity>,
+        staging_bytes: u64,
+    ) -> Result<Result<(), Refusal>> {
+        let Some(capacity) = capacity else {
+            return Ok(Err(Refusal::UnknownHost));
+        };
+        let disk = DiskClaim {
+            staging: staging_bytes,
+            images: 0,
+            metadata: 0,
+        };
+        self.validate_disk(db, capacity, disk)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by owner enrollment and E4 protected backup fixtures"
+    )]
+    pub(crate) fn enroll_compose_backup_target(
+        &self,
+        vm: Id,
+        project: &str,
+        volume: &str,
+        database: &str,
+        max_bytes: u64,
+    ) -> Result<()> {
+        self.store.transact(|db| {
+            store::compose::enroll_backup_target(db, vm, project, volume, database, max_bytes)
+        })
+    }
+
     pub(crate) fn windows_recipe_id() -> Id {
         template::windows_recipe_id()
     }
@@ -2257,8 +2291,11 @@ impl<C: Clock> VmController<C> {
                 }
                 for route in intent.hosts.iter().filter_map(|host| host.route.as_ref()) {
                     if store::count(db, "SELECT count(*) FROM vm_compose_projects p WHERE vm=?1 AND project=?2
-                        AND (recovery_id IS NOT NULL OR EXISTS (SELECT 1 FROM vm_compose_operations o
-                        WHERE o.vm=p.vm AND o.project=p.project AND o.receipt IS NULL AND o.closed IS NULL))",
+                        AND (recovery_id IS NOT NULL
+                             OR EXISTS (SELECT 1 FROM vm_compose_operations o
+                                 WHERE o.vm=p.vm AND o.project=p.project AND o.receipt IS NULL AND o.closed IS NULL)
+                             OR EXISTS (SELECT 1 FROM vm_compose_backup_ops b
+                                 WHERE b.vm=p.vm AND b.project=p.project AND b.status='pending'))",
                         params![vm,route.project_id])? != 0 {return Ok(Err(Refusal::Busy));}
                 }
                 store::publish::reserve(db, intent)?;
@@ -2410,7 +2447,18 @@ impl<C: Clock> VmController<C> {
         request: &super::snapshot::Request,
     ) -> Result<Result<bool, Refusal>> {
         self.store.transact(|db| {
-            store::snapshot::precheck(db, principal, vm, request, utc(self.clock.now())?)
+            let result =
+                store::snapshot::precheck(db, principal, vm, request, utc(self.clock.now())?)?;
+            // A Compose backup ID is outside the snapshot namespace. The
+            // caller's own VM gets the explicit typed refusal; everyone else
+            // keeps the uncorrelated not_found.
+            if matches!(result, Err(Refusal::NotFound))
+                && let super::snapshot::Request::Delete(id) = request
+                && store::compose::owned_backup(db, principal, vm, *id)?
+            {
+                return Ok(Err(Refusal::StaticBackupDeleteForbidden));
+            }
+            Ok(result)
         })
     }
 }

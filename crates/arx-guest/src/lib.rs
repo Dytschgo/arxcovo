@@ -1,4 +1,5 @@
 pub mod compose;
+pub mod compose_backup;
 pub mod protocol;
 pub mod session;
 
