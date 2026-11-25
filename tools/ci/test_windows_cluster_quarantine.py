@@ -862,49 +862,251 @@ C11_CLUSTER = "crates/arxd/src/cluster.rs"
 C11_CONSENSUS = "crates/arxd/src/cluster/consensus.rs"
 C11_BOUND = "crates/arxd/src/cluster/consensus/bound_start.rs"
 C11_ENROLL_DECL = '#[cfg(target_os = "linux")]\nmod enrollment_ingress;'
-# Whole-file raw counts from main. Block-comment removal is pinned to the
-# same numbers: main has no comment-split cfg or ignore. The target file is
-# main's 0,0 plus the one gate. Counts cover every file that declares the
-# path, not a region bounded by `;` or `}`. A semicolon in a trailing
-# comment would otherwise hide an added cfg.
+# Whole-file raw cfg/ignore counts from main, also required after block-comment
+# removal. The target file is main's 0,0 plus the one gate. See docs/ROADMAP.md
+# Known issues, "Quarantined intermittent Linux
+# `retained_joiners_promote_and_reconcile`". Re-pin a count, attribute block,
+# or inner attribute only after confirming the test still compiles on Linux.
+# A pin edit that hides the module is not a quarantine update.
+C11_INNER_NONE = ()
+C11_INNER_ALLOW = ("#![allow(dead_code)]",)
 C11_FILES = (
-    (C11_LIB, 1, 0),
-    (C11_CLUSTER, 2, 0),
-    (C11_CONSENSUS, 63, 0),
-    (C11_BOUND, 106, 0),
-    (C11_PARENT, 14, 0),
-    (C11_MODULE, C11_CFG, C11_IGNORE),
+    # path, raw cfg, raw ignore, whitespace-normalized inner attributes
+    (C11_LIB, 1, 0, C11_INNER_NONE),
+    (C11_CLUSTER, 2, 0, C11_INNER_NONE),
+    (C11_CONSENSUS, 63, 0, C11_INNER_ALLOW),
+    (C11_BOUND, 106, 0, C11_INNER_ALLOW),
+    (C11_PARENT, 14, 0, C11_INNER_NONE),
+    (C11_MODULE, C11_CFG, C11_IGNORE, C11_INNER_NONE),
+)
+# Attribute block directly above the active `mod` line, whitespace-normalized,
+# comments included. The hosted gate is this pin, not a separate substring.
+C11_BLOCK_CLUSTER = ""
+C11_BLOCK_CONSENSUS = ""
+C11_BLOCK_BOUND = ""
+C11_BLOCK_ENROLL = '#[cfg(target_os="linux")]'
+C11_BLOCK_HOSTED = '#[cfg(all(test,target_os="linux"))]'
+C11_BLOCK_PROMOTION = ""
+# Normalized active declaration. Promotion must stay `;` so an inline `{`
+# module cannot replace the file. A same-line attribute fails the line match.
+C11_LINE_CLUSTER = "pubmodcluster;"
+C11_LINE_CONSENSUS = "pubmodconsensus;"
+C11_LINE_BOUND = "modbound_start;"
+C11_LINE_ENROLL = "modenrollment_ingress;"
+C11_LINE_HOSTED = "modhosted{"
+C11_LINE_PROMOTION = "modpromotion_campaign;"
+C11_DECLS = (
+    (C11_LIB, "cluster", C11_BLOCK_CLUSTER, C11_LINE_CLUSTER),
+    (C11_CLUSTER, "consensus", C11_BLOCK_CONSENSUS, C11_LINE_CONSENSUS),
+    (C11_CONSENSUS, "bound_start", C11_BLOCK_BOUND, C11_LINE_BOUND),
+    (C11_BOUND, "enrollment_ingress", C11_BLOCK_ENROLL, C11_LINE_ENROLL),
+    (C11_PARENT, "hosted", C11_BLOCK_HOSTED, C11_LINE_HOSTED),
+    (C11_PARENT, "promotion_campaign", C11_BLOCK_PROMOTION, C11_LINE_PROMOTION),
+)
+_C11_MOD_LINE = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod %s\s*(?:;|\{)\s*$"
 )
 
 
-def _pin_once(source, decl):
-    if source.count(decl) != 1:
-        raise AssertionError("module declaration drifted")
+def _mask_comments(source):
+    """Blank comments and string bodies. Indexes and newlines stay put.
+
+    A `;` or `mod` line inside `//` or `/* */` must not end an attribute
+    block or count as a declaration. The compared block is still the raw text.
+    """
+    out = []
+    i = 0
+    n = len(source)
+    while i < n:
+        c = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if c == "/" and nxt == "/":
+            while i < n and source[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif c == "/" and nxt == "*":
+            out.append(" ")
+            out.append(" ")
+            i += 2
+            while i < n and not (
+                source[i] == "*" and i + 1 < n and source[i + 1] == "/"
+            ):
+                out.append("\n" if source[i] == "\n" else " ")
+                i += 1
+            if i < n:
+                out.append(" ")
+                out.append(" ")
+                i += 2
+        elif c == '"':
+            out.append('"')
+            i += 1
+            while i < n:
+                if source[i] == "\\":
+                    out.append(" ")
+                    i += 1
+                    if i < n:
+                        out.append("\n" if source[i] == "\n" else " ")
+                        i += 1
+                    continue
+                if source[i] == '"':
+                    out.append('"')
+                    i += 1
+                    break
+                out.append("\n" if source[i] == "\n" else " ")
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _attribute_cut(masked):
+    """Start of the trailing attribute, doc-comment, comment, and blank block."""
+    i = len(masked)
+    while i > 0:
+        j = i - 1
+        while j >= 0 and masked[j].isspace():
+            j -= 1
+        if j < 0:
+            return 0
+        if masked[j] != "]":
+            return j + 1
+        depth = 1
+        k = j - 1
+        while k >= 0 and depth:
+            if masked[k] == "]":
+                depth += 1
+            elif masked[k] == "[":
+                depth -= 1
+            k -= 1
+        if depth:
+            return j + 1
+        while k >= 0 and masked[k].isspace():
+            k -= 1
+        if k >= 0 and masked[k] == "!":
+            k -= 1
+            while k >= 0 and masked[k].isspace():
+                k -= 1
+        if k >= 0 and masked[k] == "#":
+            i = k
+            continue
+        return j + 1
+    return 0
+
+
+def _bracket_end(masked, open_at):
+    depth = 0
+    i = open_at
+    n = len(masked)
+    while i < n:
+        if masked[i] == "[":
+            depth += 1
+        elif masked[i] == "]":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def _inner_attributes(source, masked):
+    found = []
+    i = 0
+    n = len(masked)
+    while i < n:
+        if masked[i] != "#":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and masked[j].isspace():
+            j += 1
+        if j >= n or masked[j] != "!":
+            i += 1
+            continue
+        j += 1
+        while j < n and masked[j].isspace():
+            j += 1
+        if j >= n or masked[j] != "[":
+            i += 1
+            continue
+        end = _bracket_end(masked, j)
+        if end < 0:
+            break
+        found.append(_norm(source[i:end]))
+        i = end
+    return tuple(found)
+
+
+def _reject_c11_counts(path, source, cfg, ignore):
+    stripped = _strip_block_comments(source)
+    raw_cfg = source.count("cfg")
+    raw_ignore = source.count("ignore")
+    strip_cfg = stripped.count("cfg")
+    strip_ignore = stripped.count("ignore")
+    if (raw_cfg, raw_ignore, strip_cfg, strip_ignore) != (cfg, ignore, cfg, ignore):
+        raise AssertionError(
+            f"{path}: cfg/ignore raw {raw_cfg}/{raw_ignore} "
+            f"block-stripped {strip_cfg}/{strip_ignore}, "
+            f"expected raw {cfg}/{ignore} block-stripped {cfg}/{ignore}"
+        )
+    raw_path = source.count("#[path")
+    strip_path = stripped.count("#[path")
+    if (raw_path, strip_path) != (0, 0):
+        raise AssertionError(
+            f"{path}: #[path raw {raw_path} block-stripped {strip_path}, "
+            "expected raw 0 block-stripped 0"
+        )
+
+
+def _reject_c11_decl(path, source, masked, name, block, line):
+    pattern = re.compile(_C11_MOD_LINE.pattern % re.escape(name))
+    raw_lines = source.split("\n")
+    masked_lines = masked.split("\n")
+    hits = [i for i, item in enumerate(masked_lines) if pattern.match(item)]
+    if len(hits) != 1:
+        raise AssertionError(
+            f"{path}: mod {name} expected 1 active declaration, found {len(hits)}"
+        )
+    actual_line = _norm(masked_lines[hits[0]])
+    if actual_line != line:
+        raise AssertionError(
+            f"{path}: mod {name} declaration expected {line!r} actual {actual_line!r}"
+        )
+    prefix = "\n".join(raw_lines[: hits[0]])
+    masked_prefix = "\n".join(masked_lines[: hits[0]])
+    actual_block = _norm(prefix[_attribute_cut(masked_prefix) :])
+    if actual_block != block:
+        raise AssertionError(
+            f"{path}: mod {name} attribute block expected {block!r} "
+            f"actual {actual_block!r}"
+        )
 
 
 def assert_c11_linux_quarantine(files):
-    if set(files) != {path for path, _, _ in C11_FILES}:
-        raise AssertionError("module chain drifted")
-    for path, cfg, ignore in C11_FILES:
+    expected = {path for path, *_rest in C11_FILES}
+    if set(files) != expected:
+        raise AssertionError(
+            f"module chain files expected {sorted(expected)} actual {sorted(files)}"
+        )
+    masked = {}
+    for path, cfg, ignore, inners in C11_FILES:
         source = files[path]
-        stripped = _strip_block_comments(source)
-        if (source.count("cfg"), source.count("ignore"),
-                stripped.count("cfg"), stripped.count("ignore")) != (
-                cfg, ignore, cfg, ignore):
-            raise AssertionError("cfg or ignore token count drifted")
-        if (source.count("#[path"), stripped.count("#[path")) != (0, 0):
-            raise AssertionError("path attribute would redirect a module")
+        _reject_c11_counts(path, source, cfg, ignore)
+        masked[path] = _mask_comments(source)
+        actual_inners = _inner_attributes(source, masked[path])
+        if actual_inners != inners:
+            raise AssertionError(
+                f"{path}: inner attributes expected {inners!r} actual {actual_inners!r}"
+            )
+    for path, name, block, line in C11_DECLS:
+        _reject_c11_decl(path, files[path], masked[path], name, block, line)
     module = files[C11_MODULE]
     gate = _norm('#[cfg_attr(' + C11_PREDICATE + ', ignore = "' + C11_REASON + '")]')
-    if _norm(module).count(gate + "asyncfn" + C11_TEST + "(") != 1:
-        raise AssertionError("Linux ignore must stay on the C11 retained-joiners test")
-    parent = files[C11_PARENT]
-    _pin_once(parent, C11_HOSTED_DECL)
-    _pin_once(parent, C11_PROMO_DECL)
-    _pin_once(files[C11_BOUND], C11_ENROLL_DECL)
-    _pin_once(files[C11_CONSENSUS], "mod bound_start;")
-    _pin_once(files[C11_CLUSTER], "pub mod consensus;")
-    _pin_once(files[C11_LIB], "pub mod cluster;")
+    found = _norm(module).count(gate + "asyncfn" + C11_TEST + "(")
+    if found != 1:
+        raise AssertionError(
+            f"{C11_MODULE}: expected 1 C11 linux ignore gate, found {found}"
+        )
 
 
 def _c11_gate(predicate):
@@ -912,7 +1114,7 @@ def _c11_gate(predicate):
 
 
 def _c11_sources():
-    return {path: (ROOT / path).read_text(encoding="utf-8") for path, _, _ in C11_FILES}
+    return {path: (ROOT / path).read_text(encoding="utf-8") for path, *_rest in C11_FILES}
 
 
 def _c11_with(files, path, text):
@@ -1033,6 +1235,55 @@ class C11LinuxQuarantineTests(unittest.TestCase):
                     C11_ENROLL_DECL,
                     "#[cfg(any())] // Fixture is disabled;\n" + C11_ENROLL_DECL,
                     1,
+                ),
+            ),
+            # Review 2. Dropping the redundant durable_join cfg keeps the count
+            # at 14 while `#[cfg(any())]` removes promotion_campaign on Linux.
+            "count-preserving cfg swap before promotion module": (
+                C11_PARENT,
+                parent.replace(
+                    "    #[cfg(test)]\n    mod durable_join_campaign;",
+                    "    mod durable_join_campaign;",
+                    1,
+                ).replace(
+                    C11_PROMO_DECL,
+                    "    #[cfg(any())] // Fixture is disabled;\n" + C11_PROMO_DECL,
+                    1,
+                ),
+            ),
+            "commented-out promotion module": (
+                C11_PARENT,
+                parent.replace(C11_PROMO_DECL, "//" + C11_PROMO_DECL, 1),
+            ),
+            "same-line cfg on promotion module": (
+                C11_PARENT,
+                parent.replace(
+                    "    #[cfg(test)]\n    mod durable_join_campaign;",
+                    "    mod durable_join_campaign;",
+                    1,
+                ).replace(
+                    C11_PROMO_DECL,
+                    "    #[cfg(any())] mod promotion_campaign;",
+                    1,
+                ),
+            ),
+            "count-preserving inner cfg on enrollment file": (
+                C11_PARENT,
+                "#![cfg(any())]\n"
+                + parent.replace(
+                    "    #[cfg(test)]\n    mod durable_join_campaign;",
+                    "    mod durable_join_campaign;",
+                    1,
+                ),
+            ),
+            "doc comment hides promotion module": (
+                C11_PARENT,
+                parent.replace(C11_PROMO_DECL, "///" + C11_PROMO_DECL, 1),
+            ),
+            "block comment hides promotion module": (
+                C11_PARENT,
+                parent.replace(
+                    C11_PROMO_DECL, "/*\n" + C11_PROMO_DECL + "\n*/", 1
                 ),
             ),
         }
