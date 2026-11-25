@@ -279,6 +279,23 @@ fn web_seed_golden_preserves_offline_base_and_installs_exact_web_profile() {
         hex::encode(recipe.recipe_digest()),
         "807f245f5b0d20fa2c44054e70f108a56b1ddc2924f9186979ad54d96285e00f",
     );
+    assert!(
+        !seed
+            .windows(b"arxcovo-test".len())
+            .any(|window| window == b"arxcovo-test")
+    );
+    assert!(
+        !seed
+            .windows(b"60-arxcovo-test.yaml".len())
+            .any(|window| window == b"60-arxcovo-test.yaml")
+    );
+    let test_seed = base.render_test_seed(BUILD, GUEST).unwrap();
+    assert!(
+        test_seed
+            .windows(b"arxcovo-test".len())
+            .any(|window| window == b"arxcovo-test")
+    );
+    assert_ne!(seed, test_seed);
     let original = base.render_seed(BUILD, GUEST).unwrap();
     let original = joliet_files(&original);
     let mut files = joliet_files(&seed);

@@ -2,6 +2,9 @@ use anyhow::Context;
 use std::{path::PathBuf, sync::Arc};
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "backup-retire") {
+        std::process::exit(arxd::vm::backup_retire_cli(&args[1..]));
+    }
     if args.first().is_some_and(|arg| arg == "dashboard-password") {
         if args.len() != 3 || args[1] != "--state-dir" {
             eprintln!("arxd: usage: arxd dashboard-password --state-dir DIRECTORY");

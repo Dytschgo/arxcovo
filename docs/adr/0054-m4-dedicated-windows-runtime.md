@@ -1288,19 +1288,45 @@ idle observation before the next effect. Per-invocation release dispositions
 are recorded in a run-wide ledger that latches `ChargedQuarantine`. Deliberate
 live pressure and console witness runs remain **unverified on real hardware**.
 
-The TEST network probe authenticates the pinned Ubuntu 24.04.3 ISO and binds
-the enrolled kernel and initrd pins directly to `/casper/vmlinuz` and
-`/casper/initrd` inside the held ISO, checks `Targets.dns` against the host's
-configured DNS resolvers, validates full nonce-bound DNS query/reply
-echoes, and checks the generated plan for forwarding, sharing, TAP, IPv6
-and writable media. The guest checks for one active `virtio_net` link and
-the exact `10.0.2.15` lease. It installs and reads back the IPv4 default
-route through `10.0.2.2` if restricted DHCP omits it and checks that the NIC
-has only link-local IPv6 addresses and no IPv6 default route. The held
-channel's nonce-bound `ARXNET2` report carries the setup observations and
-socket results as an incomplete diagnostic. A passing isolation row
-requires independent host-side attribution with live controls. The adapter
-rechecks media drive bindings at create and after prelaunch, keeps QMP
-`powerdown` separate from control-plane `quit`, and retains the seed charge
-on ambiguous creation, open, release or removal.
+The TEST network probe binds the Ubuntu 24.04.3 live kernel and initrd to
+the exact held ISO and checks the sealed plan for forwarding, sharing, TAP,
+IPv6 and writable media. The qualifier self-tests run-local TCP/UDP
+witnesses on the enrolled host IPv4 and IPv6 addresses and the loopback
+slirp alias. The DNS witness binds the exact address of the sole configured
+IPv4 resolver. It refuses an unowned or occupied address, a fallback
+resolver and failure to settle the listeners. Any accept on a random TCP
+witness port during the observation window fails isolation. UDP and DNS
+fail isolation on a nonce-matching receipt. No packet capture, firewall
+mutation, external service or raw payload is part of the observation.
+
+The guest verifies the active `virtio_net` NIC, the `10.0.2.15` lease and
+the default route via `10.0.2.2`, installing it if restricted DHCP omits it.
+A reachable gateway neighbor confirms the on-link control. The
+nonce-bound `ARXNET3` report binds socket attempts to this setup. An IPv4
+local failure blocks qualification, as does any IPv6 result inconsistent
+with the observed absence of a global IPv6 address and route. Host-side
+silence contributes isolation evidence only after all validated attempts,
+the positive control, and verified settlement. The adapter rechecks media
+bindings at create and after prelaunch and keeps QMP guest powerdown
+separate from control-plane quit.
 Live TEST network behavior is **unverified on real hardware**.
+
+Windows Finalize requires both offline Setup observations through the same
+writer-excluded released pair. The bounded reader has synthetic
+qcow2/GPT/NTFS/hive fixtures. A sanitized Windows-produced pair is pending.
+The owner-host full qualification supplies real-image validation. An
+unreadable pair, release mismatch or missing Setup observation prevents a
+complete dossier. Real Windows media and offline layout support are
+**unverified on real hardware**.
+
+The Windows Setup stage consumes a private copy of the exact enrolled
+`windows_setup_vars` artifact. A writer-excluded source pin binds the local
+path, size and SHA-256 before Setup and after verified release. The mutable
+copy carries the one-shot BootNext entry. The reviewed owner-host seed is
+pending, and absent or invalid input yields an incomplete dossier. The
+BootNext handoff is **unverified on real hardware**.
+
+The fixed TEST provisioners configure the guest-only IPv4 default route
+through `10.0.2.2` for the installed VirtIO NIC. The installed endpoint
+checks the route before running the witness probes. The launcher continues
+to enforce slirp `restrict=on` throughout. [ADR 0055 records both pin changes](0055-m4-offline-template-recipes.md#test-guest-default-route-amendment).

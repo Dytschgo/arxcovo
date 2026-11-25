@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { RUST_UBUNTU_RUNNER } from './policy.mjs';
+import yaml from 'js-yaml';
 
 const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
 const playwrightConfig = readFileSync(new URL('../playwright.config.ts', import.meta.url), 'utf8');
@@ -14,6 +15,83 @@ const rustTimeout = "    timeout-minutes: ${{ matrix.os == 'windows-latest' && 1
 const gate = "if ('${{ needs.rust.result }}' -ne 'success' -or '${{ needs.ui.result }}' -ne 'success') { exit 1 }";
 const checkout = 'uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262';
 const steps = id => jobs[id].split('    steps:\n')[1].trimEnd().split(/^ {6}- /m).slice(1).map(step => step.trimEnd());
+const hostedC14Step = `name: Hosted C14 target-authorized delegated build
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python3 -I -B tools/ci/m3-containers/delegated-build-probe.py
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            outcome=success
+            level=notice
+          else
+            outcome=failure
+            level=warning
+          fi
+          echo "Hosted C14 target-authorized delegated build quarantined single case: outcome=\${outcome} exit=\${status}" >> "$GITHUB_STEP_SUMMARY"
+          echo "::\${level} title=Quarantined hosted C14 probe::outcome=\${outcome} exit=\${status}; non-blocking (docs/ROADMAP.md)"
+          exit "$status"`;
+
+function assertHostedC14Quarantine(workflowText) {
+  const keys = workflowText.match(/^[ \t]*continue-on-error\s*:\s*\S+/gm) ?? [];
+  assert.deepEqual(keys, ['        continue-on-error: true']);
+  // Whole-workflow token guard: exactly one spelling anywhere (quoted, flow-style or any case),
+  // it sits inside the single exact C14 step, and no quoted mapping key (which could hide an
+  // escaped spelling) exists anywhere in the workflow.
+  assert.equal((workflowText.match(/continue-on-error/gi) ?? []).length, 1);
+  assert.equal(workflowText.split(hostedC14Step).length, 2);
+  assert.equal(workflowText.split(hostedC14Step).join('').includes('continue-on-error'), false);
+  assert.doesNotMatch(workflowText, /^[ \t]*(?:-[ \t]+)?["'][^\n]*["'][ \t]*:/m);
+  const parsed = Object.fromEntries([...workflowText.split('\njobs:\n')[1].matchAll(/^ {2}(\w+):\n([\s\S]*?)(?=^ {2}\w+:\n|$(?![\s\S]))/gm)].map(([, id, body]) => [id, body]));
+  const bodies = ['rust', 'ui', 'verify'].flatMap(id => parsed[id].split('    steps:\n')[1].trimEnd().split(/^ {6}- /m).slice(1).map(step => step.trimEnd()));
+  const quarantined = bodies.filter(step => step.startsWith('name: Hosted C14 target-authorized delegated build\n'));
+  assert.equal(quarantined.length, 1);
+  assert.equal(quarantined[0], hostedC14Step);
+  for (const step of bodies) {
+    if (step !== quarantined[0]) assert.equal(step.includes('continue-on-error'), false);
+  }
+  assertParsedHostedC14Quarantine(workflowText);
+}
+
+// Structural guard on the parsed YAML, so escapes, flow mappings, explicit keys, tags,
+// escaped line breaks and aliases cannot add a second non-blocking step or job.
+const hostedC14Parsed = {
+  name: 'Hosted C14 target-authorized delegated build',
+  if: "runner.os == 'Linux'",
+  'timeout-minutes': 2,
+  'continue-on-error': true,
+  shell: 'bash',
+  run: `${hostedC14Step.split('run: |\n')[1].split('\n').map(line => line.slice(10)).join('\n')}\n`,
+};
+
+function assertParsedHostedC14Quarantine(workflowText) {
+  let doc;
+  try {
+    doc = yaml.load(workflowText, { schema: yaml.CORE_SCHEMA });
+  } catch (error) {
+    assert.fail(`workflow must parse as plain YAML: ${error.message}`);
+  }
+  const hits = [];
+  const walk = (node, path) => {
+    if (Array.isArray(node)) node.forEach((item, i) => walk(item, `${path}[${i}]`));
+    else if (node && typeof node === 'object') {
+      for (const [key, value] of Object.entries(node)) {
+        if (/^continue[\s_-]*on[\s_-]*error$/i.test(key.trim())) hits.push({ path, node });
+        walk(value, `${path}.${key}`);
+      }
+    }
+  };
+  walk(doc, '$');
+  assert.equal(hits.length, 1);
+  assert.match(hits[0].path, /^\$\.jobs\.rust\.steps\[\d+\]$/);
+  assert.deepEqual(hits[0].node, hostedC14Parsed);
+  const named = Object.values(doc.jobs).flatMap(job => job.steps ?? []).filter(step => step?.name === hostedC14Parsed.name);
+  assert.equal(named.length, 1);
+}
 
 test('CI runs unconditional Rust and UI matrices in parallel behind the existing required checks', () => {
   assert.deepEqual(workflow.split('\n').filter(line => /^\S/.test(line)), ['name: CI', 'on:', 'concurrency:', 'permissions:', 'jobs:']);
@@ -29,7 +107,58 @@ test('CI runs unconditional Rust and UI matrices in parallel behind the existing
   }
   assert.equal(jobs.verify, `    name: verify (\${{ matrix.os }})\n    needs: [rust, ui]\n    if: \${{ always() }}\n${matrix}    runs-on: ubuntu-latest\n    timeout-minutes: 12\n    steps:\n      - name: Require every Rust and UI worker to succeed\n        shell: pwsh\n        run: ${gate}\n`);
   assert.match(workflow, /^permissions:\n {2}contents: read\njobs:/m);
-  assert.doesNotMatch(workflow, /continue-on-error/);
+  assertHostedC14Quarantine(workflow);
+});
+
+test('hosted C14 quarantine cannot widen past that single step', () => {
+  assertHostedC14Quarantine(workflow);
+  const probe = 'python3 -I -B tools/ci/m3-containers/delegated-build-probe.py';
+  const mutants = [
+    workflow.replace('        continue-on-error: true\n', ''),
+    workflow.replace(
+      '      - name: Hosted C16 live three-container acceptance\n',
+      '      - name: Hosted C16 live three-container acceptance\n        continue-on-error: true\n',
+    ),
+    workflow.replace('      - run: npm run smoke\n', '      - run: npm run smoke\n        continue-on-error: true\n'),
+    workflow.replace('continue-on-error: true', 'continue-on-error: false'),
+    workflow.replace(probe, 'true'),
+    workflow.replace('exit "$status"', 'exit 0'),
+    workflow.replace(/ {10}echo "Hosted C14 target-authorized delegated build quarantined single case:.*\n/, ''),
+    workflow.replace('timeout-minutes: 2\n        continue-on-error: true', 'timeout-minutes: 9\n        continue-on-error: true'),
+    workflow.replace(probe, `# ${probe}`),
+    workflow.replace(
+      '      - name: Hosted C16 live three-container acceptance\n',
+      '      -\n        "continue-on-error": true\n        name: Extra\n        run: "true"\n      - name: Hosted C16 live three-container acceptance\n',
+    ),
+    workflow.replace(
+      '      - name: Hosted C16 live three-container acceptance\n',
+      '      - name: Hosted C16 live three-container acceptance\n        "continue\\x2don-error": true\n',
+    ),
+    workflow.replace(
+      '      - name: Hosted C16 live three-container acceptance\n',
+      '      - name: Hosted C16 live three-container acceptance\n        Continue-On-Error: true\n',
+    ),
+  ];
+  // YAML spellings that hide the key from text matching; the parsed guard alone must reject each.
+  const structural = [
+    '      -\n        {name: Extra, "continue\\x2don-error": true, run: "true"}\n',
+    '      - ? "continue\\x2don-error"\n        : true\n        name: Extra\n        run: "true"\n',
+    '      - !!str continue-on-error: true\n        name: Extra\n        run: "true"\n',
+    '      - ? "continue-\\\n          on-error"\n        : true\n        name: Extra\n        run: "true"\n',
+    '      - &extra {name: Extra, "continue\\u002don-error": true, run: "true"}\n      - *extra\n',
+  ].map(extra => workflow.replace(
+    '      - name: Hosted C16 live three-container acceptance\n',
+    `${extra}      - name: Hosted C16 live three-container acceptance\n`,
+  ));
+  for (const mutant of [...mutants, ...structural]) {
+    assert.notEqual(mutant, workflow);
+    assert.throws(() => assertHostedC14Quarantine(mutant), assert.AssertionError);
+  }
+  assertParsedHostedC14Quarantine(workflow);
+  for (const mutant of structural) {
+    assert.doesNotThrow(() => yaml.load(mutant, { schema: yaml.CORE_SCHEMA }));
+    assert.throws(() => assertParsedHostedC14Quarantine(mutant), assert.AssertionError);
+  }
 });
 
 test('required gates accept only both successful matrices, including failed, cancelled, skipped and missing results', () => {
@@ -243,11 +372,7 @@ test('Rust retains every native, Python and package validation with exact comman
         env:
           ARX_EXEC_QUALIFICATION_MODE: build
         run: python3 -I -B tools/ci/m3-containers/executor-probe.py`,
-    `name: Hosted C14 target-authorized delegated build
-        if: runner.os == 'Linux'
-        timeout-minutes: 2
-        shell: bash
-        run: python3 -I -B tools/ci/m3-containers/delegated-build-probe.py`,
+    hostedC14Step,
     `name: Bind ignored C16 AnchorQuery helper to the Linux build
         if: runner.os == 'Linux'
         shell: pwsh

@@ -1,5 +1,5 @@
 //! Project held preflight and paused-trial observations into the closed graph.
-//! Native runs publish an incomplete diagnostic. Later stages remain closed.
+//! Full TEST runs can publish a seal only through their held baseline.
 //!
 //! Native observations are **unverified on real hardware**.
 
@@ -22,6 +22,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub(crate) enum Outcome {
     /// Diagnostics were written; the dossier cannot complete.
     Incomplete,
+    Complete,
 }
 
 struct NativeClock {
@@ -362,6 +363,8 @@ pub(crate) struct PausedCollectors<'a> {
     full_test: bool,
     releases: ReleaseLedger,
     firmware_qmp: Option<FirmwareProbe>,
+    ubuntu_endpoint: Option<Observation>,
+    windows_endpoint: Option<Observation>,
 }
 
 impl<'a> PausedCollectors<'a> {
@@ -381,6 +384,8 @@ impl<'a> PausedCollectors<'a> {
             full_test,
             releases: ReleaseLedger::default(),
             firmware_qmp: None,
+            ubuntu_endpoint: None,
+            windows_endpoint: None,
         }
     }
 }
@@ -420,10 +425,33 @@ impl Collectors<Native> for PausedCollectors<'_> {
                         | Stage::ReserveActivityTrials
                         | Stage::QmpChannel
                         | Stage::RestrictedTestNetwork
+                        | Stage::UbuntuRecipe
+                        | Stage::UbuntuInstalledEndpoint
+                        | Stage::WindowsRecipe
+                        | Stage::WindowsInstalledEndpoint
                 ))
     }
 
     fn previous_effect(&mut self, stage: Stage) -> Option<Collected> {
+        if self.full_test
+            && matches!(
+                stage,
+                Stage::UbuntuInstalledEndpoint | Stage::WindowsInstalledEndpoint
+            )
+        {
+            let endpoint = if stage == Stage::UbuntuInstalledEndpoint {
+                &mut self.ubuntu_endpoint
+            } else {
+                &mut self.windows_endpoint
+            };
+            return Some(Collected::at(
+                self.projected.now_ms(),
+                endpoint.take().map_or(
+                    StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
+                    StageResult::Passed,
+                ),
+            ));
+        }
         if self.full_test && stage == Stage::QmpChannel {
             let result = match &self.firmware_qmp {
                 Some(probe)
@@ -463,9 +491,18 @@ impl Collectors<Native> for PausedCollectors<'_> {
                 Stage::FirstGuestExecution
                     | Stage::SupervisorLossRelease
                     | Stage::RestrictedTestNetwork
+                    | Stage::UbuntuRecipe
+                    | Stage::WindowsRecipe
             ),
-            network: stage == Stage::RestrictedTestNetwork,
-            ..EffectPlan::CONFINED
+            network: matches!(
+                stage,
+                Stage::RestrictedTestNetwork | Stage::UbuntuRecipe | Stage::WindowsRecipe
+            ),
+            disks: if matches!(stage, Stage::UbuntuRecipe | Stage::WindowsRecipe) {
+                2
+            } else {
+                0
+            },
         }
     }
 
@@ -478,6 +515,56 @@ impl Collectors<Native> for PausedCollectors<'_> {
 
     fn effect(&mut self, stage: Stage, _: EffectPlan, _: &PausedStore) -> Collected {
         let started_ms = self.projected.now_ms();
+        if self.full_test && stage == Stage::UbuntuRecipe {
+            let result = match (self.runtime, self.baseline.ubuntu_guest_ready()) {
+                (Some(runtime), Ok(())) => {
+                    match runtime.block_on(self.baseline.run_ubuntu_recipe(&self.cancel)) {
+                        Ok(proof) => {
+                            self.releases.record(stage, StopDisposition::CleanRelease);
+                            self.ubuntu_endpoint = Some(proof.endpoint);
+                            StageResult::Passed(proof.recipe)
+                        }
+                        Err(reason) => {
+                            self.releases
+                                .record(stage, StopDisposition::ChargedQuarantine);
+                            StageResult::Failed(refused(reason))
+                        }
+                    }
+                }
+                (_, Err(reason)) => StageResult::Failed(refused(reason)),
+                _ => StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
+            };
+            return Collected {
+                started_ms,
+                finished_ms: self.projected.now_ms(),
+                result,
+            };
+        }
+        if self.full_test && stage == Stage::WindowsRecipe {
+            let result = match (self.runtime, self.baseline.windows_recipe_ready()) {
+                (Some(runtime), Ok(())) => {
+                    match runtime.block_on(self.baseline.run_windows_recipe(&self.cancel)) {
+                        Ok(proof) => {
+                            self.releases.record(stage, StopDisposition::CleanRelease);
+                            self.windows_endpoint = Some(proof.endpoint);
+                            StageResult::Passed(proof.recipe)
+                        }
+                        Err(reason) => {
+                            self.releases
+                                .record(stage, StopDisposition::ChargedQuarantine);
+                            StageResult::Failed(refused(reason))
+                        }
+                    }
+                }
+                (_, Err(reason)) => StageResult::Failed(refused(reason)),
+                _ => StageResult::Inconclusive(Diagnostic::PrerequisiteMissing),
+            };
+            return Collected {
+                started_ms,
+                finished_ms: self.projected.now_ms(),
+                result,
+            };
+        }
         if self.releases.is_quarantined() {
             return Collected::at(
                 started_ms,
@@ -615,9 +702,10 @@ impl Collectors<Native> for PausedCollectors<'_> {
                 (Some(runtime), Ok(permit)) => {
                     let probe = runtime.block_on(permit.run(&self.cancel));
                     self.releases.record(stage, probe.release);
-                    match probe.diagnostic {
-                        Ok(report) => StageResult::NetworkDiagnostic(report),
-                        Err(reason) => StageResult::Failed(refused(reason)),
+                    match (probe.accepted, probe.diagnostic) {
+                        (Some(evidence), _) => StageResult::Passed(evidence),
+                        (_, Ok(report)) => StageResult::NetworkDiagnostic(report),
+                        (_, Err(reason)) => StageResult::Failed(refused(reason)),
                     }
                 }
                 (_, Err(reason)) => StageResult::Failed(refused(reason)),
@@ -805,7 +893,8 @@ impl DiagnosticSink for BaselineSink<'_> {
 pub(crate) fn run(enrollment: &str, evidence: &str, mode: Mode) -> Result<Outcome, RunError> {
     let runtime = (mode != Mode::Baseline)
         .then(|| {
-            tokio::runtime::Builder::new_current_thread()
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
                 .enable_all()
                 .build()
         })
@@ -824,27 +913,39 @@ pub(crate) fn run(enrollment: &str, evidence: &str, mode: Mode) -> Result<Outcom
     let interrupt = runtime.as_ref().map(|rt| {
         let signal = cancel.clone();
         rt.spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                signal.cancel();
-            }
+            let _ = tokio::signal::ctrl_c().await;
+            signal.cancel();
         })
     });
     let clock = NativeClock {
         origin: baseline.origin(),
         cancel: cancel.clone(),
     };
-    let dependencies = dependencies(baseline.observations());
+    let mut dependencies = dependencies(baseline.observations());
+    let projection = (mode == Mode::Test)
+        .then(|| baseline.recipe_projection().ok())
+        .flatten();
+    if let Some(value) = &projection {
+        value.bind(&mut dependencies);
+    }
     let issued = clock.now();
     // The authority takes the preflight custody. The diagnostic sink and the
     // observations are reached only through the trial's own reference.
     let trial_authority = TrialAuthority::issue(baseline, Class::Test, dependencies, issued);
     let mut trial = Trial::begin(trial_authority);
     trial.drive_native(runtime.as_ref(), mode == Mode::Test, &cancel, &clock);
+    let outcome = if let (Some(projection), Ok(complete)) = (projection, trial.finish(&clock)) {
+        trial
+            .publish_native_complete(complete, &projection, &cancel, &clock)
+            .map(|()| Outcome::Complete)
+    } else {
+        trial.latch_publication_time(&clock);
+        publish_incomplete(&trial, &mut BaselineSink(trial.custody())).map(|()| Outcome::Incomplete)
+    };
     if let Some(handle) = interrupt {
         handle.abort();
     }
-    publish_incomplete(&trial, &mut BaselineSink(trial.custody()))?;
-    Ok(Outcome::Incomplete)
+    outcome
 }
 
 #[cfg(test)]

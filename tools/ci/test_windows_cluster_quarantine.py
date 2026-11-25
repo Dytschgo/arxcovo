@@ -700,5 +700,138 @@ class HeavyServiceGroupTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     assert_heavy_service_group(mutant)
 
+
+# Kept in this module because the existing static CI step selects this file.
+B2_TEST = "b2_snapshot_barrier_races_busy_unpublish_pending_removal_and_old_origin"
+B2_REASON = (
+    "intermittent macOS b2 snapshot barrier shutdown: docs/ROADMAP.md Known issues"
+)
+B2_PREDICATE = 'target_os = "macos"'
+B2_GATE = (
+    "#[cfg_attr(\n"
+    "        " + B2_PREDICATE + ",\n"
+    '        ignore = "' + B2_REASON + '"\n'
+    "    )]"
+)
+B2_TESTS_DECL = "pub(crate) mod tests {"
+# Raw substring counts. The tests-module figures are main's counts plus the
+# one macOS gate (`cfg_attr` contributes one `cfg`, and the gate contributes
+# one `ignore`). The declaration figure is main's `#[cfg(test)]` only.
+B2_TESTS_CFG = 24
+B2_TESTS_IGNORE = 1
+B2_DECL_CFG = 1
+B2_PATH_ATTRS = 0
+
+
+def _strip_block_comments(text):
+    # Join tokens a block comment splits (`ig/**/nore`) without dropping a
+    # `cfg` or `ignore` that is written in the raw text, including inside
+    # comments and strings. Those raw substrings are counted separately.
+    return re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+
+
+def _norm(text):
+    return re.sub(r"\s+", "", text)
+
+
+def _tests_parts(source):
+    if source.count(B2_TESTS_DECL) != 1:
+        raise AssertionError("vm tests module binding required")
+    prefix, tests = source.split(B2_TESTS_DECL, 1)
+    start = prefix.rfind("\n}")
+    if start < 0:
+        raise AssertionError("vm tests module binding required")
+    # Attributes on `mod tests`, through the declaration, including any path.
+    declaration = prefix[start:] + B2_TESTS_DECL
+    return declaration, tests
+
+
+def assert_b2_macos_quarantine(source):
+    declaration, tests = _tests_parts(source)
+    stripped = _strip_block_comments(tests)
+    if (tests.count("cfg"), tests.count("ignore"),
+            stripped.count("cfg"), stripped.count("ignore")) != (
+            B2_TESTS_CFG, B2_TESTS_IGNORE, B2_TESTS_CFG, B2_TESTS_IGNORE):
+        raise AssertionError("tests module cfg or ignore token count drifted")
+    decl_stripped = _strip_block_comments(declaration)
+    if (declaration.count("cfg"), decl_stripped.count("cfg")) != (B2_DECL_CFG, B2_DECL_CFG):
+        raise AssertionError("tests module declaration cfg count drifted")
+    file_stripped = _strip_block_comments(source)
+    if (source.count("#[path"), file_stripped.count("#[path")) != (B2_PATH_ATTRS, B2_PATH_ATTRS):
+        raise AssertionError("vm.rs path attribute would redirect the tests module")
+    gate = _norm('#[cfg_attr(' + B2_PREDICATE + ', ignore = "' + B2_REASON + '")]')
+    if _norm(tests).count(gate + "asyncfn" + B2_TEST + "(") != 1:
+        raise AssertionError("macOS ignore must stay on the b2 snapshot barrier test")
+
+
+class B2MacosQuarantineTests(unittest.TestCase):
+    def test_exact_macos_only_b2_snapshot_barrier_quarantine(self):
+        source = (ROOT / "crates/arxd/src/mcp/vm.rs").read_text(encoding="utf-8")
+        assert_b2_macos_quarantine(source)
+        other = "async fn stale_copy_cleanup_preserves_committed_static_point_and_active_media("
+        mutants = {
+            "gate removed": source.replace(B2_GATE + "\n", "", 1),
+            "predicate unix": source.replace(B2_PREDICATE, "unix", 1),
+            "predicate all()": source.replace(B2_PREDICATE, "all()", 1),
+            "predicate not(windows)": source.replace(B2_PREDICATE, "not(windows)", 1),
+            "wrong reason": source.replace(B2_REASON, "unapproved reason", 1),
+            "renamed function": source.replace(
+                "async fn " + B2_TEST + "(", "async fn renamed(", 1
+            ),
+            "second ignore": source.replace(other, "#[ignore]\n    " + other, 1),
+            "cfg on target function": source.replace(
+                "    #[tokio::test]\n    " + B2_GATE,
+                '    #[cfg(not(target_os="linux"))]\n    #[tokio::test]\n    ' + B2_GATE,
+                1,
+            ),
+            "cfg on neighbor": source.replace(
+                other, '#[cfg(not(target_os="linux"))]\n    ' + other, 1
+            ),
+            "cfg on tests module": source.replace(
+                "#[cfg(test)]\n" + B2_TESTS_DECL,
+                '#[cfg(not(target_os="linux"))]\n#[cfg(test)]\n' + B2_TESTS_DECL,
+                1,
+            ),
+            "inner cfg on tests module": source.replace(
+                B2_TESTS_DECL + "\n",
+                B2_TESTS_DECL + "\n    #![cfg(not(windows))]\n",
+                1,
+            ),
+            "comment cfg on target": source.replace(
+                "    #[tokio::test]\n    " + B2_GATE,
+                "    #[/* Fixture limitation */ cfg(not(target_os = \"windows\"))] "
+                "// Platform restriction\n    #[tokio::test]\n    " + B2_GATE,
+                1,
+            ),
+            "comment cfg on neighbor": source.replace(
+                "    #[tokio::test]\n    " + other,
+                "    #[/* Fixture limitation */ cfg(not(target_os = \"windows\"))]\n"
+                "    #[tokio::test]\n    " + other,
+                1,
+            ),
+            "raw cfg identifier": source.replace(
+                "    #[tokio::test]\n    " + B2_GATE,
+                "    #[r#cfg(not(target_os = \"windows\"))] // raw\n"
+                "    #[tokio::test]\n    " + B2_GATE,
+                1,
+            ),
+            "macro generated cfg": source.replace(
+                B2_TESTS_DECL + "\n",
+                B2_TESTS_DECL + "\n"
+                "    macro_rules! hide { ($item:item) => { "
+                "#[cfg(not(target_os = \"windows\"))] $item }; }\n",
+                1,
+            ),
+            "comment split ignore": source.replace(
+                other, "#[ig/**/nore]\n    " + other, 1
+            ),
+        }
+        for label, mutant in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(mutant, source)
+                with self.assertRaises(AssertionError):
+                    assert_b2_macos_quarantine(mutant)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -356,25 +356,58 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    The first network probe boots the pinned Ubuntu 24.04.3 live installer
    with kernel and initrd pins verified against `/casper/vmlinuz` and
    `/casper/initrd` inside the held ISO and a generated probe-only NoCloud
-   seed. The guest does not install an OS. Enroll controlled TCP echo sockets
-   and a UDP DNS witness matching a configured host DNS resolver. The TCP
-   witnesses must return the exact 16-byte challenge,
-   including the host loopback control for the slirp alias. The DNS witness
-   must return a valid non-truncated reply echoing the exact nonce-bound
-   query. Keep all witnesses live through both host control checks. The guest
+   seed. The guest does not install an OS. Set `network.witnesses` to an
+   object with `ipv4`, `ipv6` and `dns` address strings. Use the host's own
+   non-loopback IPv4 and IPv6 addresses and the exact local address of the
+   host's sole configured IPv4 resolver. The qualifier must be able to bind
+   UDP port 53 on that resolver address. An external or fallback resolver, a
+   missing address, an occupied port or a failed socket control prevents the
+   row from passing. The qualifier binds random TCP and UDP ports on the
+   enrolled IPv4/IPv6 addresses and IPv4 loopback for the slirp host alias.
+   It checks listener reachability before the guest launch and closes and
+   joins the listeners at settlement. No external service or admin capture
+   is required. The guest
    checks for one active `virtio_net` link and the exact `10.0.2.15` lease.
    Restricted slirp DHCP may omit the router option. The guest adds a default
    route via `10.0.2.2` on that NIC when necessary and reads it back. It checks
    for addresses beyond IPv6 link-local scope and for an IPv6 default route
-   on the probe NIC before attempting the probes. The nonce-bound `ARXNET2`
-   report records setup flags and socket observations. Qualification requires
-   independent host-side attribution and probes with both installed guests'
-   actual drivers. The live probe currently writes an incomplete diagnostic.
+   on the probe NIC before attempting the probes. An on-link slirp gateway
+   neighbor reply is the positive guest control. During the probe window any
+   accept on a random TCP witness port or UDP/DNS receipt carrying the launch
+   nonce fails isolation. The nonce-bound `ARXNET3` report distinguishes
+   validated IPv4 timeouts, refusals and sends, the expected IPv6 local
+   failures, and other setup or transport errors. Host-side silence is
+   evaluated only with successful setup, the gateway control, every validated
+   attempt, and clean settlement of both the listeners and trial. Qualification
+   also requires probes with both installed guests' actual drivers.
    Live TEST network behavior is **unverified on real hardware**.
+
+   The fixed TEST provisioners configure the installed guest's IPv4 default
+   route via `10.0.2.2` through a TEST-only Netplan late command
+   (`60-arxcovo-test.yaml`) on Ubuntu and the persistent route store on
+   Windows, while keeping the shared Ubuntu NoCloud profile pin unchanged. The
+   restricted guest scripts check the route before probing. Slirp
+   `restrict=on` remains the egress policy. Use the unchanged shared Ubuntu
+   NoCloud profile pin, the Ubuntu TEST-only command pin, and the revised
+   Windows provisioner pin recorded in
+   [ADR 0055](adr/0055-m4-offline-template-recipes.md#test-guest-default-route-amendment).
 
    Boot the exact Ubuntu offline recipe with the pinned ISO, CIDATA and
    kernel/initrd. Verify the cleaned standalone candidate, detached installed
-   health and clean release of its disposable verification overlay. For Windows,
+   health and clean release of its disposable verification overlay. Enroll the
+   Ubuntu guest binary as `ubuntu_guest` with local `path`, byte `size` and
+   `sha256`. For Windows, use the same pin shape for `windows_setup_vars` and
+   for the `iso`, `driver_medium`, `driver_receipt`, `guest` and nine
+   `driver_files` entries inside `windows_recipe`. Each driver row is INF,
+   CAT and SYS in the order viostor, vioserial, NetKVM. The Windows recipe also
+   binds the reviewed edition metadata, the WinPE driver letter byte and the
+   in-tree provisioner `size` and `sha256`. The owner-reviewed BootNext seed
+   is pending. Setup copies that held, pinned input into disposable VARS and
+   verifies the unchanged source again after release. Missing or invalid
+   input blocks the Windows row. The seed and actual Windows offline reader
+   layout are **unverified on real hardware**.
+
+   For Windows,
    observe headless offline Setup/OOBE without a key, actual WinPE drive
    letters, signed drivers, one-shot BootNext and subsequent resets into disk
    boot. Prove clean detached SCM and guest health, followed by disk-only
@@ -544,3 +577,35 @@ traffic and route drift are **unverified on real hardware**. The public
 profile remains gated on owner-host qualification.
 [Build and policy contract](../tools/qemu/README.md) ·
 [Build receipt pin](../tools/qemu/public-egress-receipt.json)
+
+
+## Retire a Compose backup
+
+Run this maintenance from a local console as the non-elevated account that
+owns the foreground VM state store. Start the current controller once to
+upgrade the store to v15, then stop it before running either command. Use the
+foreground VM state directory containing `activity.sqlite3` and
+`activity.lock`. The command uses the same store lock as the controller.
+
+```text
+arxd backup-retire --state-dir STATE_DIR --list
+arxd backup-retire --state-dir STATE_DIR --backup-root BACKUP_ROOT --backup-id BACKUP_ID
+```
+
+Use the original private Compose backup root containing `staging` and
+`settled`. List prints the ID, status and digest when available. Verify that
+you have the intended copy and that another usable copy exists if you need
+to retain the data. Type the displayed 32-character backup ID and press
+Enter. A successful retirement permanently removes that copy and frees its
+retention slot and disk charge. Restart the controller when finished.
+
+If interrupted, rerun list and repeat retirement with the same account,
+backup ID and root for an entry marked `retirement-pending`. Its charge stays
+in place until the command confirms absence. Leave replacements and
+unattributed leaves intact for owner investigation. A v14 partial shown as
+`partial-unbound-legacy` lacks the namespace identity needed to prove
+absence. Its charge remains in place.
+
+The schema upgrade is forward-only. To roll back the binary, restore a
+matched offline copy of the pre-upgrade ledger and its corresponding backup
+namespace. Restoring only the ledger cannot recover retired backup contents.

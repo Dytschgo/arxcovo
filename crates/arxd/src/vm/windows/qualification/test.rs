@@ -113,6 +113,18 @@ pub(super) struct Scope {
 }
 
 impl Scope {
+    pub(super) fn validate_live(&self) -> Result<(), NativeRefusal> {
+        for scope in [&self.recipe, &self.production] {
+            if !capacity::still_bound(&capacity::MountManager, &scope.volume) {
+                return Err(NativeRefusal::PathCustodyUnverified);
+            }
+            inventory::binding(&scope.root)?;
+            inventory::binding(&scope.backing)?;
+        }
+        inventory::binding(&self._database)?;
+        inventory::binding(&self._lock)
+    }
+
     pub(super) fn hold(
         names: &impl capacity::VolumeNames,
         enrollment: &StorageEnrollment,
@@ -287,12 +299,12 @@ pub(super) struct NetworkEnrollment {
     iso: ReleaseImage,
     kernel: ReleaseImage,
     initrd: ReleaseImage,
-    witnesses: crate::vm::guest::network_probe::Targets,
+    witnesses: super::network::Addresses,
 }
 
 pub(super) struct NetworkInputs {
     pub(super) media: [PathPin; 3],
-    pub(super) witnesses: crate::vm::guest::network_probe::Targets,
+    pub(super) witnesses: super::network::Addresses,
     pub(super) projection: [u8; 32],
 }
 
@@ -312,7 +324,7 @@ impl NetworkInputs {
     ) -> Result<Self, NativeRefusal> {
         use crate::vm::UbuntuRecipe;
         let reason = NativeRefusal::QualificationMissing;
-        if !input.witnesses.valid_with_resolvers(host_resolvers)
+        if !input.witnesses.valid(host_resolvers)
             || input.iso.sha256 != hex::encode(UbuntuRecipe::ISO_SHA256)
         {
             return Err(reason);
@@ -351,12 +363,13 @@ impl NetworkInputs {
             .map_err(|_| NativeRefusal::DistributionUnverified)?;
         let projection = crate::vm::qualification_record::digest(
             &serde_json::to_vec(&(
-                "arx-vm-network-inputs-v1",
+                "arx-vm-network-inputs-v2",
                 (pins[0].size, pins[0].sha256),
                 (pins[1].size, pins[1].sha256),
                 (pins[2].size, pins[2].sha256),
                 crate::vm::qemu_args::NETWORK,
-                input.witnesses.guest_tcp().map(|addr| addr.to_string()),
+                input.witnesses.ipv4.to_string(),
+                input.witnesses.ipv6.to_string(),
                 input.witnesses.dns.to_string(),
             ))
             .map_err(|_| reason)?,

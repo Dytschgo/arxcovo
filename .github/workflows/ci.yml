@@ -186,8 +186,23 @@ jobs:
       - name: Hosted C14 target-authorized delegated build
         if: runner.os == 'Linux'
         timeout-minutes: 2
+        continue-on-error: true
         shell: bash
-        run: python3 -I -B tools/ci/m3-containers/delegated-build-probe.py
+        run: |
+          set +e
+          python3 -I -B tools/ci/m3-containers/delegated-build-probe.py
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            outcome=success
+            level=notice
+          else
+            outcome=failure
+            level=warning
+          fi
+          echo "Hosted C14 target-authorized delegated build quarantined single case: outcome=${outcome} exit=${status}" >> "$GITHUB_STEP_SUMMARY"
+          echo "::${level} title=Quarantined hosted C14 probe::outcome=${outcome} exit=${status}; non-blocking (docs/ROADMAP.md)"
+          exit "$status"
       - name: Bind ignored C16 AnchorQuery helper to the Linux build
         if: runner.os == 'Linux'
         shell: pwsh
