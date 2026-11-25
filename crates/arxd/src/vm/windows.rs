@@ -2669,9 +2669,7 @@ async fn monitor_running<T, E>(
     deadline: tokio::time::Instant,
     interrupted: impl Fn(ChannelError) -> E,
 ) -> Result<T, E> {
-    use tokio::time::{Instant, MissedTickBehavior, interval_at};
-    let mut tick = interval_at(Instant::now() + LIVE_POLL, LIVE_POLL);
-    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    use tokio::time::Instant;
     tokio::pin!(work);
     let check = || {
         if cancel.is_cancelled() {
@@ -2690,7 +2688,7 @@ async fn monitor_running<T, E>(
             biased;
             _ = cancel.cancelled() => break Err(interrupted(ChannelError::Cancelled)),
             _ = tokio::time::sleep_until(deadline) => break Err(interrupted(ChannelError::Timeout)),
-            _ = tick.tick() => observe()?,
+            _ = tokio::time::sleep(LIVE_POLL) => observe()?,
             result = &mut work => break result,
         }
     };
@@ -3073,12 +3071,13 @@ impl CheckedLaunchCore<'_> {
             let release =
                 self.release_evidence_held(successful, successful, release_by, verify_release);
             tokio::pin!(release);
-            let mut tick = tokio::time::interval_at(Instant::now() + LIVE_POLL, LIVE_POLL);
+            // Schedule the next sample after the previous one returns so a
+            // slow observation cannot starve the independently bounded release.
             loop {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled(), if result.is_ok() => result = Err(Failure::Cancelled),
-                    _ = tick.tick(), if result.is_ok() => {
+                    _ = tokio::time::sleep(LIVE_POLL), if result.is_ok() => {
                         result = revalidate().map(|_| ()).map_err(Failure::Native);
                     }
                     proof = &mut release => break proof,
