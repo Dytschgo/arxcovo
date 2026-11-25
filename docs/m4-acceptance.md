@@ -85,8 +85,10 @@ The client checks the kernel server PID on the owner-checked named-pipe handle
 against its held foreground child before writing any credential bytes. The
 same connection carries authentication and every MCP call. A missing PID or
 a mismatch stops the journey.
-The journey checks tool schemas and admission, selects or builds both qualified
-goldens, and checks the clone pairs under 30-minute Ubuntu and 40-minute Windows
+The journey checks tool schemas and admission. `list_activity` must be the
+vault `oneOf` schema; the pre-vault activity object is `schema_changed`.
+The journey then selects or builds both qualified goldens, and checks the
+clone pairs under 30-minute Ubuntu and 40-minute Windows
 leases. The client polls both leases during the Ubuntu expiry wait and continues
 polling Windows through its expiry. It rejects early teardown or more than one
 second of disagreement between UTC and monotonic elapsed time. During the final
@@ -131,5 +133,6 @@ hardware**.
 ## M5 journey
 
 The TEST VM foreground opens the vault with its throwaway-VM tester after the
-startup sweep. M5 acceptance requires a qualified TEST golden and its own
-vault journey. [Foreground vault wiring](../crates/arxd/src/local.rs#L271-L273)
+startup sweep. M5 acceptance requires this qualified TEST runtime and its own
+vault journey. The owner runbook is [M5 owner-host acceptance](m5-acceptance.md).
+[Foreground vault wiring](../crates/arxd/src/local.rs#L271-L273)
