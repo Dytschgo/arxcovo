@@ -975,7 +975,7 @@ pub(super) async fn run_ubuntu(
     };
     let mut seed_bytes = Vec::new();
     recipe
-        .write_seed(
+        .write_test_seed(
             UbuntuAssets {
                 iso: Some(iso_in),
                 kernel: Some(kernel_in),

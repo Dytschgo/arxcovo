@@ -1378,7 +1378,11 @@ pub(super) mod tests {
         assert_eq!(iso, again);
         assert_eq!(
             hex::encode(Sha256::digest(&iso)),
-            "fc3316a810db21082763213be3d86a1bb3a61369e4cb6fe143e738b6c546f044"
+            "7577adbf9adb821162f9a0b533fee4da76b3d14cbbba167d09d6434cb619b61b"
+        );
+        assert!(
+            iso.windows(b"Set-TestDefaultRoute".len())
+                .any(|window| window == b"Set-TestDefaultRoute")
         );
 
         let adversarial = "&<>\"' é\t\u{1f642}\r\n";

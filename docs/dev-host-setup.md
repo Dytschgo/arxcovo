@@ -383,10 +383,13 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    Live TEST network behavior is **unverified on real hardware**.
 
    The fixed TEST provisioners configure the installed guest's IPv4 default
-   route via `10.0.2.2` through Netplan on Ubuntu and the persistent route
-   store on Windows. The restricted guest scripts check the route before
-   probing. Slirp `restrict=on` remains the egress policy. Use the revised
-   NoCloud and Windows provisioner pins recorded in
+   route via `10.0.2.2` through a TEST-only Netplan late command
+   (`60-arxcovo-test.yaml`) on Ubuntu and the persistent route store on
+   Windows, while keeping the shared Ubuntu NoCloud profile pin unchanged. The
+   restricted guest scripts check the route before probing. Slirp
+   `restrict=on` remains the egress policy. Use the unchanged shared Ubuntu
+   NoCloud profile pin, the Ubuntu TEST-only command pin, and the revised
+   Windows provisioner pin recorded in
    [ADR 0055](adr/0055-m4-offline-template-recipes.md#test-guest-default-route-amendment).
 
    Boot the exact Ubuntu offline recipe with the pinned ISO, CIDATA and

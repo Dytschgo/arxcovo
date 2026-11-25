@@ -118,11 +118,11 @@ impl UbuntuRecipe {
     /// SHA256 and length of the schema identifier, user-data template, guest
     /// unit, finalizer, audit unit and audit script, separated by NUL bytes.
     pub const NOCLOUD_PROFILE_PIN: AssetPin = AssetPin {
-        length: 5388,
+        length: 4757,
         sha256: [
-            0x48, 0xe6, 0xff, 0x41, 0x33, 0xae, 0xf0, 0x02, 0x7d, 0x3c, 0x0b, 0x44, 0xde, 0x73,
-            0x35, 0x3d, 0x6f, 0xf4, 0x54, 0x5e, 0x64, 0x4d, 0x0a, 0x86, 0x0b, 0xd1, 0xcb, 0x1e,
-            0xb9, 0x4d, 0xab, 0x29,
+            0x37, 0xaa, 0xba, 0x54, 0x48, 0x07, 0x89, 0x14, 0xff, 0x93, 0xf6, 0x46, 0xcc, 0xe7,
+            0x8d, 0x26, 0x55, 0x88, 0xf1, 0xa1, 0x4d, 0x5d, 0x34, 0xe6, 0x62, 0x55, 0x22, 0x95,
+            0xae, 0xe0, 0x57, 0x2c,
         ],
     };
 
@@ -211,29 +211,6 @@ rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
 rm -rf /root/.ssh
 rm -f /etc/ssh/ssh_host_* /var/lib/systemd/random-seed
 
-# The installer network stayed off. Only the installed TEST NIC uses DHCP
-# and the on-link slirp gateway for positive setup before isolation probes.
-test -f /etc/netplan/00-installer-config.yaml
-test ! -L /etc/netplan/00-installer-config.yaml
-umask 077
-cat > /etc/netplan/00-installer-config.yaml <<'ARX_NETPLAN'
-network:
-  version: 2
-  renderer: networkd
-  ethernets:
-    arxcovo-test:
-      match:
-        driver: virtio_net
-      dhcp4: true
-      dhcp6: false
-      accept-ra: false
-      link-local: []
-      routes:
-        - to: default
-          via: 10.0.2.2
-ARX_NETPLAN
-chmod 0600 /etc/netplan/00-installer-config.yaml
-
 # An empty regular machine-id permits a transient ID on the first boot.
 # Drop the persisted D-Bus fallback and point subsequent lookups to systemd.
 rm -f /etc/machine-id /var/lib/dbus/machine-id
@@ -285,6 +262,33 @@ printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
             .map_err(|error| RecipeError::Write(error.kind()))
     }
 
+    /// Installer-side late command appended only by TEST Ubuntu seeds. It
+    /// leaves `/etc/netplan/00-installer-config.yaml` intact so the offline
+    /// installer network stays off, and adds the installed VirtIO TEST route.
+    pub const TEST_ROUTE_COMMAND: &str = r#"set -eu
+umask 077
+file=/target/etc/netplan/60-arxcovo-test.yaml
+test ! -e "$file"
+test ! -L "$file"
+cat > "$file" <<'ARX_NETPLAN'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    arxcovo-test:
+      match:
+        driver: virtio_net
+      dhcp4: true
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      routes:
+        - to: default
+          via: 10.0.2.2
+ARX_NETPLAN
+chmod 0600 "$file"
+"#;
+
     /// Encode the seed for offline inspection in memory. This verifies the
     /// embedded assets only. Staging media for a build requires `write_seed`,
     /// which also verifies the pinned host-side assets and specific ISO.
@@ -295,6 +299,29 @@ printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
             .write(&mut bytes)
             .map_err(|error| RecipeError::Write(error.kind()))?;
         Ok(bytes)
+    }
+
+    /// Encode the Ubuntu TEST seed for offline inspection in memory. Appends
+    /// the TEST-only VirtIO netplan late command without modifying the shared
+    /// offline finalizer or NoCloud profile pin.
+    pub fn render_test_seed(&self, build_id: Id, guest: &[u8]) -> Result<Vec<u8>, RecipeError> {
+        let mut out = Vec::new();
+        append_test_route_seed(&self.render_seed(build_id, guest)?, &mut out)?;
+        Ok(out)
+    }
+
+    /// Verify all pinned host-side and embedded assets via `write_seed` before
+    /// writing the Ubuntu TEST seed with the TEST-only netplan late command.
+    pub fn write_test_seed(
+        &self,
+        assets: UbuntuAssets<'_>,
+        build_id: Id,
+        guest: &[u8],
+        out: impl Write,
+    ) -> Result<(), RecipeError> {
+        let mut base = Vec::new();
+        self.write_seed(assets, build_id, guest, &mut base)?;
+        append_test_route_seed(&base, out)
     }
 
     fn seed_config(&self, build_id: Id, guest: &[u8]) -> Result<(String, String), RecipeError> {
@@ -840,6 +867,29 @@ fn required(pin: Option<AssetPin>) -> Result<AssetPin, RecipeError> {
         .ok_or(RecipeError::Unqualified)
 }
 
+fn append_test_route_seed(base: &[u8], out: impl Write) -> Result<(), RecipeError> {
+    let mut files = super::ubuntu_web::cidata_files(base).ok_or(RecipeError::Unqualified)?;
+    let mut user = String::from_utf8(files[6].to_vec()).map_err(|_| RecipeError::Unqualified)?;
+    if !user.ends_with(
+        "      curtin in-target --target=/target -- /bin/sh /usr/local/sbin/arx-finalize\n",
+    ) {
+        return Err(RecipeError::Unqualified);
+    }
+    user.push_str("    - |\n");
+    for line in UbuntuRecipe::TEST_ROUTE_COMMAND.lines() {
+        if !line.is_empty() {
+            user.push_str("      ");
+            user.push_str(line);
+        }
+        user.push('\n');
+    }
+    files[6] = user.as_bytes();
+    Image::new(files)
+        .ok_or(RecipeError::Unqualified)?
+        .write(out)
+        .map_err(|error| RecipeError::Write(error.kind()))
+}
+
 fn image<'a>(guest: &'a [u8], meta: &'a str, user: &'a str) -> Result<Image<'a>, RecipeError> {
     Image::new([
         UbuntuRecipe::ACCOUNT_AUDIT_SCRIPT,
@@ -950,6 +1000,92 @@ fn network_probe_seed_has_only_live_nocloud_configuration() {
     );
     assert!(!seed.windows(11).any(|bytes| bytes == b"autoinstall"));
     assert!(seed.len() <= 64 * 1024);
+}
+
+#[cfg(test)]
+#[test]
+fn test_seed_appends_route_without_changing_shared_finalizer() {
+    let pin = |bytes: &[u8]| AssetPin {
+        length: bytes.len() as u64,
+        sha256: Sha256::digest(bytes).into(),
+    };
+    let guest = b"offline-test-guest\x00\xff";
+    let host = Some(pin(b"synthetic host asset"));
+    let recipe = UbuntuRecipe {
+        iso: Some(AssetPin {
+            length: 20,
+            sha256: UbuntuRecipe::ISO_SHA256,
+        }),
+        kernel: host,
+        initrd: host,
+        guest: Some(pin(guest)),
+        service: Some(pin(UbuntuRecipe::SERVICE)),
+        finalize: Some(pin(UbuntuRecipe::FINALIZE)),
+        nocloud_schema: Some(UbuntuRecipe::NOCLOUD_PROFILE_PIN),
+        firmware_code: host,
+        firmware_vars: host,
+        qemu_receipt: host,
+    };
+    let build = [0x5a; 16];
+    let base_iso = recipe.render_seed(build, guest).unwrap();
+    let test_iso = recipe.render_test_seed(build, guest).unwrap();
+    assert_eq!(test_iso, recipe.render_test_seed(build, guest).unwrap());
+    assert_ne!(test_iso, base_iso);
+    assert!(
+        !base_iso
+            .windows(b"arxcovo-test".len())
+            .any(|window| window == b"arxcovo-test")
+    );
+    assert!(
+        !base_iso
+            .windows(b"60-arxcovo-test.yaml".len())
+            .any(|window| window == b"60-arxcovo-test.yaml")
+    );
+
+    let base_files = super::ubuntu_web::cidata_files(&base_iso).unwrap();
+    let test_files = super::ubuntu_web::cidata_files(&test_iso).unwrap();
+    for index in 0..6 {
+        assert_eq!(test_files[index], base_files[index], "cidata file {index}");
+    }
+    assert_eq!(test_files[4], UbuntuRecipe::FINALIZE);
+    assert!(
+        !UbuntuRecipe::FINALIZE
+            .windows(b"arxcovo-test".len())
+            .any(|window| window == b"arxcovo-test")
+    );
+
+    let base_user = std::str::from_utf8(base_files[6]).unwrap();
+    let test_user = std::str::from_utf8(test_files[6]).unwrap();
+    let appended = test_user
+        .strip_prefix(base_user)
+        .unwrap()
+        .strip_prefix("    - |\n")
+        .unwrap();
+    let script = appended
+        .lines()
+        .map(|line| line.strip_prefix("      ").unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(format!("{script}\n"), UbuntuRecipe::TEST_ROUTE_COMMAND);
+    assert_eq!(UbuntuRecipe::TEST_ROUTE_COMMAND.len(), 416);
+    assert_eq!(
+        hex::encode(Sha256::digest(UbuntuRecipe::TEST_ROUTE_COMMAND.as_bytes())),
+        "82d4979ece16cef92ade02e11ee459d7cc29e0c1006e7cd33cf6524ae6bff8ea"
+    );
+    assert!(test_user.contains("60-arxcovo-test.yaml"));
+    assert!(test_user.contains("via: 10.0.2.2"));
+    assert!(!test_user.contains("00-installer-config.yaml"));
+
+    let mut bad_files = base_files;
+    bad_files[6] = b"#cloud-config\nautoinstall:\n  late-commands: []\n";
+    let mut bad_iso = Vec::new();
+    Image::new(bad_files).unwrap().write(&mut bad_iso).unwrap();
+    let mut out = Vec::new();
+    assert!(matches!(
+        append_test_route_seed(&bad_iso, &mut out),
+        Err(RecipeError::Unqualified)
+    ));
+    assert!(out.is_empty());
 }
 
 #[cfg(test)]

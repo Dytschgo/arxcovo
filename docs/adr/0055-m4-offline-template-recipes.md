@@ -61,15 +61,22 @@ R2 runs installer and finalizer boots with QMP-only startup and completion. It o
 
 ## TEST guest default route amendment
 
-The offline Ubuntu installer retains its disabled network configuration.
-The TEST finalizer writes the installed VirtIO NIC's Netplan config with
-DHCPv4 and the guest-only default route via `10.0.2.2`. Windows writes the
-same route for the NetKVM NIC from the privileged provisioning step. The
-installed probes require an active route through that gateway. Egress
-remains subject to the sealed slirp `restrict=on` policy and the host-side
-witnesses. The owner-host behavior is **unverified on real hardware**.
+The offline Ubuntu installer retains its disabled network configuration
+(`/etc/netplan/00-installer-config.yaml`) and the shared Ubuntu finalizer
+(`UbuntuRecipe::FINALIZE`) and NoCloud profile pin remain unchanged (4,757
+bytes, `37aaba5448078914ff93f646cce78d265588f1a14d5d34e662552295aee0572c`), so
+static-web and Compose seeds are unaffected. The Ubuntu TEST qualification seed
+(`render_test_seed` / `write_test_seed`) appends one installer-side late command
+that writes `/target/etc/netplan/60-arxcovo-test.yaml` with DHCPv4 and the
+guest-only default route via `10.0.2.2` without rewriting
+`00-installer-config.yaml`. Windows writes the same route for the NetKVM NIC
+from the privileged provisioning step. The installed probes require an active
+route through that gateway. Egress remains subject to the sealed slirp
+`restrict=on` policy and the host-side witnesses. The owner-host behavior is
+**unverified on real hardware**.
 
-| Pinned input | Previous bytes and SHA-256 | Revised bytes and SHA-256 |
+| Pinned input | Previous bytes and SHA-256 | Current bytes and SHA-256 |
 | --- | --- | --- |
-| Ubuntu NoCloud profile | 4,757 · `37aaba5448078914ff93f646cce78d265588f1a14d5d34e662552295aee0572c` | 5,388 · `48e6ff4133aef0027d3c0b44de73353d6ff4545e644d0a860bd1cb1eb94dab29` |
+| Ubuntu shared NoCloud profile | 4,757 · `37aaba5448078914ff93f646cce78d265588f1a14d5d34e662552295aee0572c` | Unchanged (4,757 · `37aaba5448078914ff93f646cce78d265588f1a14d5d34e662552295aee0572c`) |
+| Ubuntu TEST route late command (`60-arxcovo-test.yaml`) | None | 416 · `82d4979ece16cef92ade02e11ee459d7cc29e0c1006e7cd33cf6524ae6bff8ea` |
 | Windows provisioner | 13,110 · `d12b9627ee20087dcd2478646873a3932d5463b9dbe1af3c8c2056ad766f72cf` | 13,816 · `1c832f7047ce76ede0ff1f627a646f294cf0fa01df2d39a2877b72f77aaa1544` |

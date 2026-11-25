@@ -388,8 +388,63 @@ fn golden_seed_is_deterministic() {
         hex::encode(Sha256::digest(&iso)),
         "08fd082e494459e6a3ed24857ee59b4039feaf312b32e74ebc1d740a6aa66755",
     );
+    assert!(
+        !iso.windows(b"arxcovo-test".len())
+            .any(|window| window == b"arxcovo-test")
+    );
+    assert!(
+        !iso.windows(b"60-arxcovo-test.yaml".len())
+            .any(|window| window == b"60-arxcovo-test.yaml")
+    );
     assert!(read_iso(&iso).is_ok());
     assert_ne!(iso, fixture_recipe().render_seed([0; 16], GUEST).unwrap());
+}
+
+#[test]
+fn ubuntu_test_seed_is_deterministic_and_isolated_from_shared_base() {
+    let base = fixture();
+    let test_iso = fixture_recipe().render_test_seed(ID, GUEST).unwrap();
+    assert_eq!(
+        test_iso,
+        fixture_recipe().render_test_seed(ID, GUEST).unwrap()
+    );
+    assert_ne!(test_iso, base);
+    assert_ne!(
+        test_iso,
+        fixture_recipe().render_test_seed([0; 16], GUEST).unwrap()
+    );
+    let base_files = read_iso(&base).unwrap();
+    let test_files = read_iso(&test_iso).unwrap();
+    check_hashes(&test_files, &fixture_recipe()).unwrap();
+    for name in [
+        "meta-data",
+        "arx-account-audit",
+        "arx-account-audit.service",
+        "arx-guest",
+        "arx-guest.service",
+        "arx-finalize",
+    ] {
+        assert_eq!(test_files[name], base_files[name], "{name}");
+    }
+    assert_eq!(test_files["arx-finalize"], UbuntuRecipe::FINALIZE);
+    let base_user = std::str::from_utf8(base_files["user-data"]).unwrap();
+    let test_user = std::str::from_utf8(test_files["user-data"]).unwrap();
+    let appended = test_user
+        .strip_prefix(base_user)
+        .unwrap()
+        .strip_prefix("    - |\n")
+        .unwrap();
+    let script = appended
+        .lines()
+        .map(|line| line.strip_prefix("      ").unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(format!("{script}\n"), UbuntuRecipe::TEST_ROUTE_COMMAND);
+    assert!(test_user.contains("file=/target/etc/netplan/60-arxcovo-test.yaml"));
+    assert!(test_user.contains("via: 10.0.2.2"));
+    assert!(test_user.contains("activation-mode: 'off'"));
+    assert!(!test_user.contains("00-installer-config.yaml"));
+    assert!(!base_user.contains("arxcovo-test"));
 }
 
 #[test]
@@ -831,6 +886,94 @@ fn final_iso_digest_refusal_does_not_write() {
         )
         .unwrap_err();
     assert!(matches!(error, RecipeError::Unqualified));
+    assert_eq!(iso.position(), HOST_ASSET.len() as u64);
+    assert!(out.is_empty());
+}
+
+fn write_test_fixture(
+    recipe: &UbuntuRecipe,
+    kernel: &mut dyn Read,
+    out: &mut Vec<u8>,
+) -> RecipeError {
+    let [mut iso, mut initrd, mut code, mut vars, mut receipt] = [HOST_ASSET; 5];
+    recipe
+        .write_test_seed(
+            UbuntuAssets {
+                iso: Some(&mut iso),
+                kernel: Some(kernel),
+                initrd: Some(&mut initrd),
+                firmware_code: Some(&mut code),
+                firmware_vars: Some(&mut vars),
+                qemu_receipt: Some(&mut receipt),
+            },
+            ID,
+            GUEST,
+            out,
+        )
+        .unwrap_err()
+}
+
+#[test]
+fn write_test_seed_refuses_unqualified_assets_before_writing() {
+    let mut out = Vec::new();
+    let mut recipe = fixture_recipe();
+    recipe.initrd = None;
+    let mut must_not_read = NeverRead;
+    assert!(matches!(
+        write_test_fixture(&recipe, &mut must_not_read, &mut out),
+        RecipeError::Unqualified
+    ));
+    assert!(out.is_empty());
+
+    assert!(matches!(
+        fixture_recipe().write_test_seed(UbuntuAssets::default(), ID, GUEST, &mut out),
+        Err(RecipeError::Unqualified)
+    ));
+    assert!(out.is_empty());
+
+    let mut other = HOST_ASSET.to_vec();
+    other[0] ^= 1;
+    for mut input in [other.as_slice(), &HOST_ASSET[..HOST_ASSET.len() - 1]] {
+        assert!(matches!(
+            write_test_fixture(&fixture_recipe(), &mut input, &mut out),
+            RecipeError::Unqualified
+        ));
+        assert!(out.is_empty());
+    }
+
+    let mut unending = UnendingReader { count: 0 };
+    assert!(matches!(
+        write_test_fixture(&fixture_recipe(), &mut unending, &mut out),
+        RecipeError::Unqualified
+    ));
+    assert_eq!(unending.count, HOST_ASSET.len() + 1);
+    assert!(out.is_empty());
+
+    let mut broken = BrokenReader;
+    assert!(matches!(
+        write_test_fixture(&fixture_recipe(), &mut broken, &mut out),
+        RecipeError::Unqualified
+    ));
+    assert!(out.is_empty());
+
+    let [mut kernel, mut initrd, mut code, mut vars, mut receipt] = [HOST_ASSET; 5];
+    let mut iso = io::Cursor::new(HOST_ASSET);
+    assert!(matches!(
+        fixture_recipe().write_test_seed(
+            UbuntuAssets {
+                iso: Some(&mut iso),
+                kernel: Some(&mut kernel),
+                initrd: Some(&mut initrd),
+                firmware_code: Some(&mut code),
+                firmware_vars: Some(&mut vars),
+                qemu_receipt: Some(&mut receipt),
+            },
+            ID,
+            GUEST,
+            &mut out,
+        ),
+        Err(RecipeError::Unqualified)
+    ));
     assert_eq!(iso.position(), HOST_ASSET.len() as u64);
     assert!(out.is_empty());
 }
