@@ -373,12 +373,20 @@ fn stage_tables_are_closed_and_class_specific() {
         let sequence = stages(class);
         assert_eq!(&sequence[..15], shared);
         assert_eq!(sequence.last(), Some(&Stage::Cleanup));
-        let endpoint = position(class, Stage::InstalledGuestEndpoint).unwrap();
-        assert_eq!(
-            endpoint,
-            sequence.len() - 2,
-            "endpoint follows the class boots"
-        );
+        let end = sequence.len() - 1;
+        if class == Class::Test {
+            assert_eq!(
+                &sequence[end - 4..end],
+                &[
+                    Stage::UbuntuRecipe,
+                    Stage::UbuntuInstalledEndpoint,
+                    Stage::WindowsRecipe,
+                    Stage::WindowsInstalledEndpoint,
+                ]
+            );
+        } else {
+            assert_eq!(sequence[end - 1], Stage::InstalledGuestEndpoint);
+        }
         for (index, stage) in sequence.iter().enumerate() {
             assert_eq!(position(class, *stage), Some(index), "no duplicate stages");
             assert!(stage.file().required(class));
@@ -921,7 +929,7 @@ fn crossing_the_budget_during_cleanup_never_seals() {
     );
     // Every stage passed and teardown released everything, but it ended
     // after the budget: the settlement is latched and cannot complete.
-    assert_eq!(script.cleanups, [12]);
+    assert_eq!(script.cleanups, [13]);
     assert_eq!(trial.late(), Some(Diagnostic::Expired));
     assert!(!trial.charge_retained());
     assert!(matches!(
@@ -971,7 +979,7 @@ fn a_cancellation_after_cleanup_and_before_finish_never_seals() {
         },
     );
     // The graph ran and settled with no cancellation in sight.
-    assert_eq!(script.cleanups, [12]);
+    assert_eq!(script.cleanups, [13]);
     assert_eq!((trial.blocked_at(), trial.late()), (None, None));
     // Cancellation arrives after cleanup and before the seal.
     cancelled.set(true);
@@ -1076,7 +1084,7 @@ fn an_uncertain_teardown_retains_charge_and_blocks_sealing() {
     assert_eq!(trial.blocked_at(), Some(Stage::Cleanup));
     let summary = trial.incomplete();
     assert!(summary.charge_retained);
-    assert_eq!(summary.dispatched_effects, 12);
+    assert_eq!(summary.dispatched_effects, 13);
     assert!(matches!(
         trial.finish(&Script2::fixed(DONE)),
         Err(RunError::Incomplete)
@@ -1730,7 +1738,8 @@ fn a_blocked_native_run_publishes_only_incomplete_diagnostics_with_the_summary_l
     assert_eq!(summary.dispatched_effects, 0);
     assert!(!summary.charge_retained);
     assert_eq!(summary.unmeasured, ["owner_profile"]);
-    assert_eq!(summary.unattempted, stages(Class::Test)[7..19]);
+    let test = stages(Class::Test);
+    assert_eq!(summary.unattempted, test[7..test.len() - 1]);
     assert!(matches!(
         trial.finish(&Script2::fixed(DONE)),
         Err(RunError::Incomplete)

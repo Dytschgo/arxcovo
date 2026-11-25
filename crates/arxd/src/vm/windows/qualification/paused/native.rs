@@ -253,33 +253,56 @@ impl<'a> SupervisorLossPermit<'a> {
             bios: &bios,
             purpose: LaunchPurpose::SupervisorLoss,
         };
-        let envelope = plan.purpose.envelope();
-        let trial = run(
+        collect_supervisor_loss(
             &mut host,
             &plan,
             cancel,
             Tick::now() + Duration::from_secs(15),
             Duration::from_secs(5),
+            |host| host.loss_signals.get(),
         )
-        .await;
-        let child_exited = host.loss_child_exited.get();
-        let job_empty_notified = host.loss_job_empty.get();
-        let accepted = trial.paused.is_ok()
-            && trial.release == StopDisposition::DirtyRelease
-            && supervisor_loss_released(child_exited, job_empty_notified);
-        let inconclusive = trial.paused.is_ok()
-            && (!job_empty_notified || trial.release == StopDisposition::ChargedQuarantine);
-        SupervisorLossProbe {
-            accepted,
-            inconclusive,
-            refusal: trial.paused.err().map(|_| NativeRefusal::JobUnverified),
-            release: trial.release,
-            job_memory_limit_bytes: envelope.job_memory_bytes as u64,
-            job_cpu_rate: envelope.job_cpu_rate,
-            active_process_limit: 1,
-            child_exited,
-            job_empty_notified,
-        }
+        .await
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct LossSignals {
+    pub(super) child_exited: bool,
+    pub(super) job_empty_notified: bool,
+}
+
+impl LossSignals {
+    fn released(self) -> bool {
+        self.child_exited && self.job_empty_notified
+    }
+}
+
+/// Run the exact collector path from the held launch to the stage row.
+pub(super) async fn collect_supervisor_loss<H: Host>(
+    host: &mut H,
+    plan: &PausedPlan<'_>,
+    cancel: &Shutdown,
+    deadline: Tick,
+    release_budget: Duration,
+    signals: impl FnOnce(&H) -> Option<LossSignals>,
+) -> SupervisorLossProbe {
+    let envelope = plan.purpose.envelope();
+    let trial = run(host, plan, cancel, deadline, release_budget).await;
+    let loss = signals(host).unwrap_or_default();
+    let accepted =
+        trial.paused.is_ok() && trial.release == StopDisposition::DirtyRelease && loss.released();
+    let inconclusive = trial.paused.is_ok()
+        && (!loss.released() || trial.release == StopDisposition::ChargedQuarantine);
+    SupervisorLossProbe {
+        accepted,
+        inconclusive,
+        refusal: trial.paused.err().map(|_| NativeRefusal::JobUnverified),
+        release: trial.release,
+        job_memory_limit_bytes: envelope.job_memory_bytes as u64,
+        job_cpu_rate: envelope.job_cpu_rate,
+        active_process_limit: 1,
+        child_exited: loss.child_exited,
+        job_empty_notified: loss.job_empty_notified,
     }
 }
 
@@ -660,8 +683,24 @@ fn fault_settled(fault: ControlledFault, result: &TrialResult) -> bool {
         && result.release == StopDisposition::DirtyRelease
 }
 
-fn supervisor_loss_released(child_exited: bool, job_empty: bool) -> bool {
-    child_exited && job_empty
+/// Collect the real pre-fault sample only after the injected fault caused
+/// its own refusal and the forced stop returned a verified dirty release.
+pub(super) async fn collect_controlled_fault<H: Host>(
+    host: &mut H,
+    plan: &PausedPlan<'_>,
+    cancel: &Shutdown,
+    deadline: Tick,
+    release_budget: Duration,
+    take_sample: impl FnOnce(&H) -> Option<FaultRecord>,
+) -> (TrialResult, Option<FaultRecord>) {
+    let LaunchPurpose::ControlledFault(fault) = plan.purpose else {
+        unreachable!("controlled fault uses its own fixed launch purpose");
+    };
+    let result = run(host, plan, cancel, deadline, release_budget).await;
+    let sample = fault_settled(fault, &result)
+        .then(|| take_sample(host))
+        .flatten();
+    (result, sample)
 }
 
 impl<'a> ReserveActivityPermit<'a> {
@@ -692,18 +731,17 @@ impl<'a> ReserveActivityPermit<'a> {
                 bios: &bios,
                 purpose: LaunchPurpose::ControlledFault(fault),
             };
-            let result = run(
+            let (result, sample) = collect_controlled_fault(
                 &mut host,
                 &plan,
                 cancel,
                 Tick::now() + Duration::from_secs(15),
                 Duration::from_secs(5),
+                |host| host.fault_sample.take(),
             )
             .await;
             invocations.push(result.release);
-            // The injected fault must traverse LivePoll, cause the exact
-            // expected refusal, and complete verified forced-stop settlement.
-            if !fault_settled(fault, &result) {
+            let Some(mut sample) = sample else {
                 return ReserveActivityProbe {
                     observations: None,
                     release: if invocations.contains(&StopDisposition::ChargedQuarantine) {
@@ -711,13 +749,6 @@ impl<'a> ReserveActivityPermit<'a> {
                     } else {
                         result.release
                     },
-                    invocations,
-                };
-            }
-            let Some(mut sample) = host.fault_sample.take() else {
-                return ReserveActivityProbe {
-                    observations: None,
-                    release: StopDisposition::DirtyRelease,
                     invocations,
                 };
             };
@@ -1089,6 +1120,7 @@ pub struct NetworkProbe {
     pub diagnostic:
         Result<crate::vm::qualification_record::RestrictedNetworkDiagnostic, NativeRefusal>,
     pub release: StopDisposition,
+    pub accepted: Option<crate::vm::qualification_record::Observation>,
 }
 
 pub struct NetworkProbePermit<'a>(Prepared<'a>);
@@ -1121,6 +1153,7 @@ impl<'a> NetworkProbePermit<'a> {
         let absent = |reason| NetworkProbe {
             diagnostic: Err(reason),
             release: StopDisposition::DirtyRelease,
+            accepted: None,
         };
         let setup = (|| {
             getrandom::fill(&mut nonce).map_err(|_| reason)?;
@@ -1129,38 +1162,39 @@ impl<'a> NetworkProbePermit<'a> {
             let vars = data.join(VARS).map_err(|_| reason)?;
             let path = trial.path.join(SEED).map_err(|_| reason)?;
             let console = SerialName::generate().map_err(|_| reason)?;
-            let bytes = crate::vm::template::network_probe_seed(&nonce, &source.witnesses)
-                .map_err(|_| reason)?;
-            if bytes.len() as u64 > MAX_SEED {
-                return Err(reason);
-            }
             let live = host.live(envelope)?;
             live.check(envelope, Tick::now()).map_err(|_| reason)?;
-            Ok((source, code, vars, path, console, bytes))
+            Ok((source, code, vars, path, console))
         })();
-        let (source, code, vars, path, console, bytes) = match setup {
+        let (source, code, vars, path, console) = match setup {
             Ok(setup) => setup,
             Err(reason) => return absent(reason),
         };
         let deadline = Tick::now() + Duration::from_secs(240);
-        let host_controls_pre = matches!(
-            bounded(cancel, deadline, async {
-                Ok(source.witnesses.known_live(&nonce).await)
-            })
-            .await,
-            Ok(true)
-        );
-        if !host_controls_pre {
+        if !host_dns_servers().is_ok_and(|resolvers| source.witnesses.valid(&resolvers)) {
             return absent(reason);
         }
+        let (witnesses, targets) =
+            match super::super::network::Witnesses::prepare(&source.witnesses, nonce).await {
+                Ok(ready) => ready,
+                Err(_) => return absent(reason),
+            };
         let slot = match Slot::claim_named(&trial.leaf, baseline.run(), CHARGE) {
             Ok(slot) => SlotGuard::new(slot),
-            Err(reason) => return absent(reason),
+            Err(reason) => {
+                let _ = witnesses.settle().await;
+                return absent(reason);
+            }
         };
         let mut seed_created = false;
         let mut identity = None;
         let staged = (|| {
             before(cancel, deadline).map_err(|_| reason)?;
+            let bytes =
+                crate::vm::template::network_witness_seed(&nonce, &targets).map_err(|_| reason)?;
+            if bytes.len() as u64 > MAX_SEED {
+                return Err(reason);
+            }
             host.confirm_claim_for_seed(slot.slot(), envelope)?;
             let mut file = sink::create_hidden(&trial.leaf, SEED).map_err(|_| reason)?;
             seed_created = true;
@@ -1217,6 +1251,7 @@ impl<'a> NetworkProbePermit<'a> {
                 release: StopDisposition::DirtyRelease,
             },
         };
+        let receipts = witnesses.settle().await;
         // Retain the seed charge on ANY ambiguous creation, open, release or
         // removal (including when create_hidden succeeded before identity/write failed).
         let seed_removed = if !seed_created {
@@ -1245,19 +1280,64 @@ impl<'a> NetworkProbePermit<'a> {
         // A report can only arrive after the plan and pre-controls passed.
         // Preserve it even if post-controls, guest shutdown or seed cleanup
         // failed so the incomplete record shows where the observation ended.
-        let diagnostic = host.network_report.get().ok_or(reason).map(|guest| {
-            crate::vm::qualification_record::RestrictedNetworkDiagnostic {
-                guest,
-                host_controls_post: host.post_controls.get(),
-                clean_guest_shutdown: host.stop_done.get() == Some(StopProtocol::QmpPowerdown)
-                    && observed.release == StopDisposition::CleanRelease,
-                seed_charge_released: release != StopDisposition::ChargedQuarantine,
-            }
+        let diagnostic = host.network_report.get().ok_or(reason).map(|report| {
+            network_diagnostic(
+                report.diagnostic,
+                host.post_controls.get(),
+                host.stop_done.get(),
+                observed.release,
+                release,
+            )
         });
+        use crate::vm::qualification_record::{Observation, Origin, Stage};
+        let accepted = host
+            .network_report
+            .get()
+            .zip(diagnostic.as_ref().ok())
+            .and_then(|(report, diagnostic)| {
+                let guest = diagnostic.guest;
+                let evidence = Observation::RestrictedNetworkWitness {
+                    ipv4_and_ipv6_setup: guest.nic_ready
+                        && guest.ipv4_lease
+                        && guest.default_route
+                        && guest.no_ipv6_egress_route,
+                    reachable_gateway_control: report.gateway_reachable,
+                    validated_attempts: report.validated_attempts,
+                    witness_receipts: receipts
+                        .as_ref()
+                        .map_or(u8::MAX, |bits| bits.count_ones() as u8),
+                    witnesses_settled: receipts.is_ok(),
+                    clean_guest_shutdown: diagnostic.clean_guest_shutdown,
+                    seed_charge_released: diagnostic.seed_charge_released,
+                };
+                (observed.paused.is_ok()
+                    && !cancel.is_cancelled()
+                    && Tick::now() < deadline
+                    && diagnostic.host_controls_post
+                    && evidence.validates(Stage::RestrictedTestNetwork, Origin::Native))
+                .then_some(evidence)
+            });
         NetworkProbe {
             diagnostic,
             release,
+            accepted,
         }
+    }
+}
+
+fn network_diagnostic(
+    guest: crate::vm::qualification_record::NetworkProbeReport,
+    host_controls_post: bool,
+    stop: Option<StopProtocol>,
+    guest_release: StopDisposition,
+    seed_release: StopDisposition,
+) -> crate::vm::qualification_record::RestrictedNetworkDiagnostic {
+    crate::vm::qualification_record::RestrictedNetworkDiagnostic {
+        guest,
+        host_controls_post,
+        clean_guest_shutdown: stop == Some(StopProtocol::QmpPowerdown)
+            && guest_release == StopDisposition::CleanRelease,
+        seed_charge_released: seed_release != StopDisposition::ChargedQuarantine,
     }
 }
 
@@ -1398,8 +1478,7 @@ impl<'a> Prepared<'a> {
                 network_report: Cell::new(None),
                 post_controls: Cell::new(false),
                 stop_done: Cell::new(None),
-                loss_child_exited: Cell::new(false),
-                loss_job_empty: Cell::new(false),
+                loss_signals: Cell::new(None),
             },
             image,
             data,
@@ -1418,11 +1497,10 @@ struct Windows<'a> {
     fault_sample: Cell<Option<FaultRecord>>,
     prelaunch_quiet: Cell<bool>,
     sec_marker_verified: Cell<bool>,
-    network_report: Cell<Option<NetworkProbeReport>>,
+    network_report: Cell<Option<WitnessReport>>,
     post_controls: Cell<bool>,
     stop_done: Cell<Option<StopProtocol>>,
-    loss_child_exited: Cell<bool>,
-    loss_job_empty: Cell<bool>,
+    loss_signals: Cell<Option<LossSignals>>,
 }
 
 struct Opens<'a> {
@@ -1884,12 +1962,12 @@ impl<'a> Host for Windows<'a> {
         self.sec_marker_verified.set(true);
     }
 
-    fn record_network_report(&self, _: &Slot, report: NetworkProbeReport) {
+    fn record_network_report(&self, _: &Slot, report: WitnessReport) {
         self.network_report.set(Some(report));
     }
 
     async fn network_post_controls(&self, network: &NetworkBoot<'_>) -> bool {
-        network.source.witnesses.known_live(&network.nonce).await
+        host_dns_servers().is_ok_and(|resolvers| network.source.witnesses.valid(&resolvers))
     }
 
     fn mark_post_controls(&self, _: &Slot) {
@@ -1972,56 +2050,7 @@ impl<'a> Host for Windows<'a> {
     }
 
     async fn observe_stop(&mut self, slot: &Slot, deadline: Tick) -> StopEvidence {
-        let (child, workers, uncertain, lost, watch, stop_done) = {
-            let mut state = slot.state.borrow_mut();
-            (
-                state.child.take(),
-                state.workers.take(),
-                state.uncertain,
-                state.lost.take(),
-                state.watch.take(),
-                state.stop_done,
-            )
-        };
-        let (loss_child_exited, loss_job_empty) = match (&lost, &watch) {
-            (Some((process, pid)), Some(watch)) => watch
-                .empty_after_loss(process, *pid, deadline)
-                .await
-                .unwrap_or((false, false)),
-            (None, _) => (true, true),
-            _ => (false, false),
-        };
-        if lost.is_some() {
-            self.loss_child_exited.set(loss_child_exited);
-            self.loss_job_empty.set(loss_job_empty);
-        }
-        let loss_released = supervisor_loss_released(loss_child_exited, loss_job_empty);
-        let reaped = match &child {
-            Some(child) => child.reap(deadline).await.is_ok(),
-            None => true,
-        };
-        let workers_joined = match workers {
-            Some(workers) => workers.join(deadline).await.is_ok(),
-            None => true,
-        };
-        let process_exited = child
-            .as_ref()
-            .is_none_or(|child| matches!(child.exited(), Ok(true)));
-        let job_empty = child
-            .as_ref()
-            .is_none_or(|child| matches!(child.job.active(), Ok(0)));
-        let clean_process_exit = child
-            .as_ref()
-            .is_some_and(|child| child.exit_code() == Ok(0));
-        slot.state.borrow_mut().child = child;
-        StopEvidence {
-            guest_shutdown: stop_done == Some(StopProtocol::QmpPowerdown),
-            process_exited: reaped && process_exited && loss_released && !uncertain,
-            job_empty: reaped && job_empty && loss_released && !uncertain,
-            clean_process_exit,
-            workers_joined: workers_joined && !uncertain,
-            ..StopEvidence::default()
-        }
+        observe_slot_stop(slot, deadline, &self.loss_signals).await
     }
 
     async fn reopen(&mut self, _: &Slot, deadline: Tick) -> bool {
@@ -2033,6 +2062,69 @@ impl<'a> Host for Windows<'a> {
 
     fn settle(&mut self, slot: Slot, disposition: StopDisposition) -> StopDisposition {
         slot.settle(disposition)
+    }
+}
+
+/// Settle the slot's actual Win32 handles. An exited held process and the
+/// matching completion-port notice remain separate checks even after the
+/// supervisor has closed its last Job handle.
+async fn observe_slot_stop(
+    slot: &Slot,
+    deadline: Tick,
+    loss_signals: &Cell<Option<LossSignals>>,
+) -> StopEvidence {
+    let (child, workers, uncertain, lost, watch, stop_done) = {
+        let mut state = slot.state.borrow_mut();
+        (
+            state.child.take(),
+            state.workers.take(),
+            state.uncertain,
+            state.lost.take(),
+            state.watch.take(),
+            state.stop_done,
+        )
+    };
+    let loss = match (&lost, &watch) {
+        (Some((process, pid)), Some(watch)) => {
+            let (child_exited, job_empty_notified) = watch
+                .empty_after_loss(process, *pid, deadline)
+                .await
+                .unwrap_or_default();
+            Some(LossSignals {
+                child_exited,
+                job_empty_notified,
+            })
+        }
+        (Some(_), None) => Some(LossSignals::default()),
+        (None, _) => None,
+    };
+    loss_signals.set(loss);
+    let loss_released = loss.is_none_or(LossSignals::released);
+    let reaped = match &child {
+        Some(child) => child.reap(deadline).await.is_ok(),
+        None => true,
+    };
+    let workers_joined = match workers {
+        Some(workers) => workers.join(deadline).await.is_ok(),
+        None => true,
+    };
+    let process_exited = child
+        .as_ref()
+        .is_none_or(|child| matches!(child.exited(), Ok(true)));
+    let job_empty = child
+        .as_ref()
+        .is_none_or(|child| matches!(child.job.active(), Ok(0)));
+    let clean_process_exit = child
+        .as_ref()
+        .is_some_and(|child| child.exit_code() == Ok(0));
+    slot.state.borrow_mut().child = child;
+    StopEvidence {
+        guest_shutdown: stop_done == Some(StopProtocol::QmpPowerdown),
+        process_exited: reaped && process_exited && loss_released && !uncertain,
+        job_empty: reaped && job_empty && loss_released && !uncertain,
+        clean_process_exit,
+        workers_joined: workers_joined && !uncertain,
+        ..StopEvidence::default()
     }
 }
 
@@ -2104,14 +2196,54 @@ mod tests {
     };
 
     #[test]
-    fn supervisor_loss_requires_both_release_signals() {
-        for exited in [false, true] {
-            for empty in [false, true] {
-                assert_eq!(
-                    supervisor_loss_released(exited, empty),
-                    (exited, empty) == (true, true)
-                );
-            }
+    fn network_diagnostic_projects_post_control_shutdown_and_seed_release_independently() {
+        use crate::vm::qualification_record::{NetworkProbeReport, ProbeOutcome};
+        use StopDisposition::{ChargedQuarantine, CleanRelease, DirtyRelease};
+        let guest = NetworkProbeReport {
+            nic_ready: true,
+            ipv4_lease: true,
+            default_route: true,
+            no_ipv6_egress_route: true,
+            outcomes: [ProbeOutcome::Reachable; 8],
+        };
+        for (post, protocol, vm, seed, clean, released) in [
+            (
+                false,
+                Some(StopProtocol::QmpPowerdown),
+                CleanRelease,
+                CleanRelease,
+                true,
+                true,
+            ),
+            (
+                true,
+                Some(StopProtocol::QmpQuit),
+                CleanRelease,
+                CleanRelease,
+                false,
+                true,
+            ),
+            (
+                true,
+                Some(StopProtocol::QmpPowerdown),
+                DirtyRelease,
+                DirtyRelease,
+                false,
+                true,
+            ),
+            (
+                true,
+                Some(StopProtocol::QmpPowerdown),
+                CleanRelease,
+                ChargedQuarantine,
+                true,
+                false,
+            ),
+        ] {
+            let report = network_diagnostic(guest, post, protocol, vm, seed);
+            assert_eq!(report.host_controls_post, post);
+            assert_eq!(report.clean_guest_shutdown, clean);
+            assert_eq!(report.seed_charge_released, released);
         }
     }
 
@@ -2141,42 +2273,63 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn supervisor_loss_needs_job_empty_evidence_even_if_the_child_has_exited() {
+    #[tokio::test(start_paused = true)]
+    async fn native_stop_observation_requires_both_supervisor_loss_signals() {
         use windows_sys::Win32::System::{
             IO::PostQueuedCompletionStatus, SystemServices::JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO,
         };
 
-        let job = Job::with_process_limit(JOB_MEMORY_BYTES, None, Some(1)).unwrap();
-        let watch = JobWatch::attach(&job).unwrap();
-        let signaled = unsafe { owned(CreateEventW(null(), 1, 1, null())) }.unwrap();
-        let deadline = Tick::now() + Duration::from_millis(40);
-        // Missing empty notice returns (exited=true, empty=false) => inconclusive.
-        assert_eq!(
-            watch
-                .empty_after_loss(&signaled, 11, deadline)
-                .await
-                .unwrap(),
-            (true, false)
-        );
-
-        succeeded(unsafe {
-            PostQueuedCompletionStatus(
-                watch.0.as_raw_handle(),
-                JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO,
-                JOB_KEY,
-                null(),
-            )
-        })
-        .unwrap();
-        let deadline = Tick::now() + Duration::from_secs(1);
-        assert_eq!(
-            watch
-                .empty_after_loss(&signaled, 11, deadline)
-                .await
-                .unwrap(),
-            (true, true)
-        );
+        for (exited, empty, has_watch) in [
+            (true, true, true),
+            (true, false, true),
+            (false, true, true),
+            (false, false, true),
+            (true, false, false),
+        ] {
+            let watch = if has_watch {
+                let job = Job::with_process_limit(JOB_MEMORY_BYTES, None, Some(1)).unwrap();
+                let watch = JobWatch::attach(&job).unwrap();
+                drop(job);
+                if empty {
+                    succeeded(unsafe {
+                        PostQueuedCompletionStatus(
+                            watch.0.as_raw_handle(),
+                            JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO,
+                            JOB_KEY,
+                            null(),
+                        )
+                    })
+                    .unwrap();
+                }
+                Some(watch)
+            } else {
+                None
+            };
+            let process =
+                unsafe { owned(CreateEventW(null(), 1, i32::from(exited), null())) }.unwrap();
+            let slot = Slot {
+                charge: tempfile::tempfile().unwrap(),
+                state: RefCell::new(ChildState {
+                    lost: Some((process, 11)),
+                    watch,
+                    ..ChildState::default()
+                }),
+            };
+            let evidence = Cell::new(None);
+            let stop =
+                observe_slot_stop(&slot, Tick::now() + Duration::from_millis(40), &evidence).await;
+            assert_eq!(
+                evidence.get().unwrap(),
+                LossSignals {
+                    child_exited: exited && has_watch,
+                    job_empty_notified: empty,
+                }
+            );
+            let released = has_watch && exited && empty;
+            assert_eq!(stop.process_exited, released);
+            assert_eq!(stop.job_empty, released);
+            assert_eq!(stop.ready_to_verify_release(), released);
+        }
     }
 
     fn owner_snapshot(

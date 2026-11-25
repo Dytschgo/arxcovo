@@ -12,8 +12,8 @@ pub use native::{
 };
 
 use super::*;
+use crate::vm::guest::network_probe::WitnessReport;
 use crate::vm::qualification_record::ControlledFault;
-use crate::vm::qualification_record::NetworkProbeReport;
 use crate::vm::{qmp::bounded, runtime::capacity};
 use std::{
     cell::Cell,
@@ -558,7 +558,7 @@ trait Host {
     fn mark_phase_complete(&self, _slot: &Self::Slot, _phase: PausedPhase) {}
     fn mark_prelaunch_quiet(&self, _slot: &Self::Slot) {}
     fn mark_sec_marker(&self, _slot: &Self::Slot) {}
-    fn record_network_report(&self, _slot: &Self::Slot, _report: NetworkProbeReport) {}
+    fn record_network_report(&self, _slot: &Self::Slot, _report: WitnessReport) {}
     async fn network_post_controls(&self, _network: &NetworkBoot<'_>) -> bool {
         false
     }
@@ -1039,7 +1039,7 @@ async fn launch_paused<H: Host>(
             release_and_confirm_running(&mut peer, &dispatch, gate, cancel).await?;
             let report = gate
                 .watch(async {
-                    crate::vm::guest::network_probe::response(
+                    crate::vm::guest::network_probe::witness_response(
                         LiveIo { gate, inner: pipe },
                         &network.nonce,
                     )

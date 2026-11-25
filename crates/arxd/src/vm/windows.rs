@@ -2425,6 +2425,7 @@ struct CheckedLaunchCore<'a> {
     setup_vars_handoff: Option<File>,
     writers: Vec<usize>,
     stock: StockLaunch<'a>,
+    workspace: WorkspaceCustody<'a>,
     finalization: Option<(super::PairSlots, [usize; 2])>,
     kind: PlanKind,
     installer: Option<InstallerStage>,
@@ -2580,6 +2581,7 @@ impl<'a> CheckedLaunchCore<'a> {
                 setup_vars_handoff,
                 writers,
                 stock,
+                workspace: inputs.workspace,
                 finalization,
                 kind,
                 installer: inputs.installer,
@@ -2630,6 +2632,9 @@ impl<'a> NativeLaunch<'a> {
         inputs: LaunchInputs<'a>,
         refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
     ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
+        if inputs.plan.kind() == PlanKind::QualifierCreate {
+            return Err(NativeRefusal::QualificationMissing);
+        }
         let offline = inputs.plan.offline_lease();
         let (core, read, write) = CheckedLaunchCore::hold_checked(token, inputs, refresh)?;
         Ok((
@@ -2642,7 +2647,9 @@ impl<'a> NativeLaunch<'a> {
             write,
         ))
     }
+}
 
+impl CheckedLaunchCore<'_> {
     async fn boot(
         &mut self,
         endpoint: Option<(&VmToken, &SerialName)>,
@@ -2652,24 +2659,23 @@ impl<'a> NativeLaunch<'a> {
         mut revalidate: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<BootOutcome, BootFailure> {
-        if let Some(stage) = self.core.installer {
+        if let Some(stage) = self.installer {
             return self
                 .boot_installer(stage, io, cancel, &mut revalidate, verify_release)
                 .await
                 .map_err(BootFailure::Installer);
         }
         let (token, serial) = endpoint
-            .filter(|_| self.core.kind == PlanKind::Boot)
+            .filter(|_| self.kind == PlanKind::Boot)
             .ok_or(BootFailure::Native(NativeRefusal::QmpUnverified))?;
-        self.core
-            .child
+        self.child
             .resume_checked(cancel, &mut revalidate)
             .map_err(BootFailure::Native)?;
         // Workers are already draining. Do not await the QMP greeting while
         // QEMU may be waiting for a client at CreateNamedPipe/ConnectNamedPipe.
         let pipe = connect_serial(
             serial,
-            &self.core.child,
+            &self.child,
             token.account.0,
             &token.entries(),
             cancel,
@@ -2681,6 +2687,9 @@ impl<'a> NativeLaunch<'a> {
         let mut qmp = Qmp::handshake(read, write, cancel)
             .await
             .map_err(|_| BootFailure::Native(NativeRefusal::QmpUnverified))?;
+        qmp.verify_whpx()
+            .await
+            .map_err(|_| BootFailure::Native(NativeRefusal::WhpxUnverified))?;
         self.dispatch_cont(&mut qmp, cancel, &mut revalidate, None)
             .await
             .map_err(|error| {
@@ -2705,13 +2714,12 @@ impl<'a> NativeLaunch<'a> {
         // Resample between the prelaunch status receipt and `cont`, rechecking
         // bundle, search namespace and all consumed input pins before arming.
         let mut refused = None;
-        let gate = self.core.gate.clone();
+        let gate = self.gate.clone();
         let released = qmp
             .release_startup_hold(cancel, || {
                 let armed = self
-                    .core
                     .stock
-                    .recheck_all(&self.core.pins, None)
+                    .recheck_all(&self.pins, Some(&self.workspace))
                     .and_then(|()| revalidate())
                     .and_then(|captured| match stage {
                         Some(stage) => gate.arm_until(captured, Some(stage.deadline().into_std())),
@@ -2738,10 +2746,10 @@ impl<'a> NativeLaunch<'a> {
                 biased;
                 _ = cancel.cancelled() => return Err(InstallerFailureReason::Cancelled),
                 _ = tokio::time::sleep_until(deadline) => return Err(InstallerFailureReason::Timeout),
-                result = self.core.gate.settle(grace) => result,
+                result = self.gate.settle(grace) => result,
             }
         } else {
-            self.core.gate.settle(grace).await
+            self.gate.settle(grace).await
         }
         .map_err(InstallerFailureReason::Native)
     }
@@ -2765,13 +2773,14 @@ impl<'a> NativeLaunch<'a> {
             if Instant::now() >= deadline {
                 return Err(Failure::Timeout);
             }
-            self.core.child.resume_checked_with_handoff(cancel, revalidate, || {
+            self.child.resume_checked_with_handoff(cancel, revalidate, || {
                 // QEMU opens writable pflash by name after resume. The
                 // original object and ancestry pin stays held across it.
-                drop(self.core.setup_vars_handoff.take());
+                drop(self.setup_vars_handoff.take());
             }).map_err(Failure::Native)?;
             let (read, write) = io;
             let mut qmp = Qmp::installer_handshake(read, write, cancel, stage).await?;
+            qmp.verify_whpx().await.map_err(|_| Failure::Native(NativeRefusal::WhpxUnverified))?;
             self.dispatch_cont(&mut qmp, cancel, revalidate, Some(stage)).await?;
             {
                 let progress = qmp.observe_installer_shutdown(cancel);
@@ -2795,9 +2804,9 @@ impl<'a> NativeLaunch<'a> {
                 biased;
                 _ = cancel.cancelled() => Err(Failure::Cancelled),
                 _ = sleep_until(exit_by) => Err(Failure::Timeout),
-                result = self.core.child.reap(exit_by) => {
+                result = self.child.reap(exit_by) => {
                     result.map_err(|_| Failure::ReleaseUnverified)?;
-                    (self.core.child.exit_code() == Ok(0)).then_some(()).ok_or(Failure::ProcessFailed)
+                    (self.child.exit_code() == Ok(0)).then_some(()).ok_or(Failure::ProcessFailed)
                 }
             }
         }.await;
@@ -2806,7 +2815,7 @@ impl<'a> NativeLaunch<'a> {
             Ok(()) => deadline.min(Instant::now() + grace),
             Err(reason) => {
                 // Failure teardown has an independent bound after stage expiry.
-                if self.core.child.job.terminate().is_err() {
+                if self.child.job.terminate().is_err() {
                     return Err(InstallerFailure {
                         phase: stage.phase(),
                         reason,
@@ -2820,19 +2829,15 @@ impl<'a> NativeLaunch<'a> {
             .release_evidence(result.is_ok(), result.is_ok(), release_by, verify_release)
             .await;
         stage.complete(result, observed, cancel.is_cancelled())?;
-        let released = match self.core.finalization {
+        let released = match self.finalization {
             Some((slots, indices)) => {
-                let readers = offline_read::ReleasedPair::hold(
-                    slots,
-                    self.core.pins.clone(),
-                    indices,
-                    observed,
-                )
-                .map_err(|_| InstallerFailure {
-                    phase: stage.phase(),
-                    reason: Failure::ReleaseUnverified,
-                    recovery: StopDisposition::ChargedQuarantine,
-                })?;
+                let readers =
+                    offline_read::ReleasedPair::hold(slots, self.pins.clone(), indices, observed)
+                        .map_err(|_| InstallerFailure {
+                        phase: stage.phase(),
+                        reason: Failure::ReleaseUnverified,
+                        recovery: StopDisposition::ChargedQuarantine,
+                    })?;
                 Some(readers)
             }
             None => None,
@@ -2853,9 +2858,9 @@ impl<'a> NativeLaunch<'a> {
             observed.guest_shutdown = qmp.powerdown(cancel).await.is_ok();
         }
         let grace = tokio::time::Instant::now() + Duration::from_secs(2);
-        if observed.guest_shutdown && self.core.child.reap(grace).await.is_ok() {
-            observed.clean_process_exit = self.core.child.exit_code() == Ok(0);
-        } else if self.core.child.job.terminate().is_err() {
+        if observed.guest_shutdown && self.child.reap(grace).await.is_ok() {
+            observed.clean_process_exit = self.child.exit_code() == Ok(0);
+        } else if self.child.job.terminate().is_err() {
             return StopDisposition::ChargedQuarantine;
         }
         self.release_evidence(
@@ -2879,15 +2884,15 @@ impl<'a> NativeLaunch<'a> {
             clean_process_exit,
             ..StopEvidence::default()
         };
-        observed.process_exited = self.core.child.reap(deadline).await.is_ok();
-        observed.job_empty = matches!(self.core.child.job.active(), Ok(0));
-        observed.workers_joined = if let Some(workers) = self.core.workers.take() {
+        observed.process_exited = self.child.reap(deadline).await.is_ok();
+        observed.job_empty = matches!(self.child.job.active(), Ok(0));
+        observed.workers_joined = if let Some(workers) = self.workers.take() {
             workers.join(deadline).await.is_ok()
         } else {
             false
         };
-        let pins = self.core.pins.clone();
-        let writers = self.core.writers.clone();
+        let pins = self.pins.clone();
+        let writers = self.writers.clone();
         finish_release(
             observed,
             deadline,

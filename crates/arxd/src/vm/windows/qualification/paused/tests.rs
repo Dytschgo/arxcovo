@@ -212,10 +212,11 @@ struct Fake {
     opened_channels: RefCell<Vec<String>>,
     armed_fault: Cell<Option<ControlledFault>>,
     suppress_fault_denial: bool,
+    fault_refusal_override: Option<NativeRefusal>,
     stop_done: Cell<Option<StopProtocol>>,
     clean_exit: bool,
     completed_phases: Cell<PausedCompleted>,
-    network_report: Cell<Option<NetworkProbeReport>>,
+    network_report: Cell<Option<WitnessReport>>,
     network_post_controls_ok: bool,
 }
 
@@ -254,6 +255,7 @@ impl Default for Fake {
             opened_channels: RefCell::default(),
             armed_fault: Cell::default(),
             suppress_fault_denial: false,
+            fault_refusal_override: None,
             stop_done: Cell::default(),
             clean_exit: false,
             completed_phases: Cell::default(),
@@ -312,18 +314,29 @@ impl Fake {
     }
 
     async fn run_purpose(&mut self, purpose: LaunchPurpose<'_>, budget: Duration) -> TrialResult {
-        let lat = |text| LocalPath::parse(text).unwrap();
-        let image = lat(r"X:\fixture\qemu-system-x86_64.exe");
-        let data = lat(r"X:\fixture\share");
-        let bios = lat(r"X:\fixture\share\bios-256k.bin");
-        let plan = PausedPlan {
-            image: &image,
-            data: &data,
-            bios: &bios,
-            purpose,
-        };
+        let paths = fixture_paths();
+        let plan = fixture_plan(&paths, purpose);
         let cancel = self.cancel.clone();
         run(self, &plan, &cancel, Tick::now() + budget, BUDGET).await
+    }
+}
+
+fn fixture_paths() -> [LocalPath; 3] {
+    [
+        r"X:\fixture\qemu-system-x86_64.exe",
+        r"X:\fixture\share",
+        r"X:\fixture\share\bios-256k.bin",
+    ]
+    .map(|path| LocalPath::parse(path).unwrap())
+}
+
+fn fixture_plan<'a>(paths: &'a [LocalPath; 3], purpose: LaunchPurpose<'a>) -> PausedPlan<'a> {
+    let [image, data, bios] = paths;
+    PausedPlan {
+        image,
+        data,
+        bios,
+        purpose,
     }
 }
 
@@ -365,6 +378,9 @@ impl Host for Fake {
         if let Some(fault) = self.armed_fault.take()
             && !self.suppress_fault_denial
         {
+            if let Some(reason) = self.fault_refusal_override {
+                return Err(reason);
+            }
             match fault {
                 ControlledFault::WtsAmbiguity => {
                     return Err(NativeRefusal::OwnerActivityUnverified);
@@ -548,7 +564,7 @@ impl Host for Fake {
         self.stop_done.set(Some(protocol));
     }
 
-    fn record_network_report(&self, _: &FakeSlot, report: NetworkProbeReport) {
+    fn record_network_report(&self, _: &FakeSlot, report: WitnessReport) {
         self.network_report.set(Some(report));
     }
 
@@ -1703,6 +1719,109 @@ async fn controlled_faults_traverse_live_poll_refusal_to_stop_and_quarantine_on_
 }
 
 #[tokio::test(start_paused = true)]
+async fn supervisor_loss_collector_requires_the_independent_observations() {
+    use super::native::{LossSignals, collect_supervisor_loss};
+
+    let paths = fixture_paths();
+    let plan = fixture_plan(&paths, LaunchPurpose::SupervisorLoss);
+    for (exited, empty, reopen) in [
+        (true, true, true),
+        (true, false, true),
+        (false, true, true),
+        (false, false, true),
+        (true, true, false),
+    ] {
+        let mut host = Fake {
+            replies: Some(format!(
+                "{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n\
+                 {{\"return\":{{\"running\":false,\"status\":\"prelaunch\"}},\"id\":3}}\n\
+                 {{\"return\":{{}},\"id\":4}}\n\
+                 {{\"return\":{{\"running\":true,\"status\":\"running\"}},\"id\":5}}\n"
+            )),
+            reopen,
+            ..Fake::default()
+        };
+        let result = collect_supervisor_loss(
+            &mut host,
+            &plan,
+            &Shutdown::default(),
+            Tick::now() + BUDGET,
+            BUDGET,
+            // Intentionally independent from the stop receipt. A regression
+            // in either producer cannot turn a lone signal into a pass.
+            |_| {
+                Some(LossSignals {
+                    child_exited: exited,
+                    job_empty_notified: empty,
+                })
+            },
+        )
+        .await;
+        let complete = exited && empty && reopen;
+        assert_eq!(result.accepted, complete);
+        assert_eq!(result.inconclusive, !complete);
+        assert_eq!(result.refusal, None);
+        assert_eq!(result.child_exited, exited);
+        assert_eq!(result.job_empty_notified, empty);
+        assert_eq!(host.charge_retained, !reopen);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn controlled_fault_collector_requires_its_exact_refusal_and_verified_reopen() {
+    use super::native::collect_controlled_fault;
+    use crate::vm::qualification_record::FaultRecord;
+
+    let paths = fixture_paths();
+    let fault = ControlledFault::CpuReserve;
+    let plan = fixture_plan(&paths, LaunchPurpose::ControlledFault(fault));
+    let sample = FaultRecord {
+        fault,
+        sampled_ms: 10,
+        settled_ms: 0,
+        console_idle: true,
+        effective_cpus: 8,
+        available_ram_bytes: 32 * GIB,
+        inner_free_bytes: 20 * GIB,
+        outer_free_bytes: 30 * GIB,
+    };
+    for (wrong_refusal, reopen, suppress_denial) in [
+        (None, true, false),
+        (Some(NativeRefusal::JobUnverified), true, false),
+        (None, false, false),
+        (None, true, true),
+    ] {
+        let mut host = Fake {
+            fault_refusal_override: wrong_refusal,
+            suppress_fault_denial: suppress_denial,
+            reopen,
+            ..Fake::default()
+        };
+        let sampled = Cell::new(false);
+        let (result, observation) = collect_controlled_fault(
+            &mut host,
+            &plan,
+            &Shutdown::default(),
+            Tick::now() + BUDGET,
+            BUDGET,
+            |_| {
+                sampled.set(true);
+                Some(sample)
+            },
+        )
+        .await;
+        let accepted = wrong_refusal.is_none() && reopen && !suppress_denial;
+        assert_eq!(observation, accepted.then_some(sample));
+        assert_eq!(sampled.get(), accepted);
+        assert_eq!(host.charge_retained, !reopen);
+        if let Some(reason) = wrong_refusal {
+            assert_eq!(result.paused, Err(Failure::Refused(reason)));
+            assert_eq!(result.release, StopDisposition::DirtyRelease);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn network_purpose_verifies_zero_hostfwd_channel_and_clean_powerdown_path() {
     use tokio::io::AsyncWriteExt;
 
@@ -1728,7 +1847,10 @@ async fn network_purpose_verifies_zero_hostfwd_channel_and_clean_powerdown_path(
             make_pin("vmlinuz", b"kernel"),
             make_pin("initrd", b"initrd"),
         ],
-        witnesses: crate::vm::guest::network_probe::fixture_targets(),
+        witnesses: serde_json::from_str(
+            r#"{"ipv4":"192.0.2.10","ipv6":"2001:db8::1","dns":"192.0.2.10"}"#,
+        )
+        .unwrap(),
         projection: [7; 32],
     };
     let seed = make_pin("cidata.iso", b"cidata");
@@ -1828,15 +1950,13 @@ async fn network_purpose_verifies_zero_hostfwd_channel_and_clean_powerdown_path(
             ),
             async {
                 tokio::time::sleep(PRELAUNCH_QUIET_WINDOW + Duration::from_millis(10)).await;
-                let frame = format!("ARXNET2 {} 1111 EEEEEEEE\n", hex::encode(nonce));
+                let frame = format!("ARXNET3 {} 1111 1 TLTSLSSS\n", hex::encode(nonce));
                 ch_write.write_all(frame.as_bytes()).await.unwrap();
             }
         );
         let report = host.network_report.get().unwrap();
-        assert_eq!(
-            report.outcomes,
-            [crate::vm::qualification_record::ProbeOutcome::SocketError; 8]
-        );
+        assert_eq!(report.validated_attempts, 8);
+        assert!(report.gateway_reachable);
         let written = host.written.borrow();
         assert_eq!(
             String::from_utf8_lossy(&written).contains("\"execute\":\"system_powerdown\""),
