@@ -1086,7 +1086,8 @@ async fn observe_console_transitions(
 
 /// Bounded typed observation for the live restricted TEST network probe.
 pub struct NetworkProbe {
-    pub refusal: Option<NativeRefusal>,
+    pub diagnostic:
+        Result<crate::vm::qualification_record::RestrictedNetworkDiagnostic, NativeRefusal>,
     pub release: StopDisposition,
 }
 
@@ -1118,7 +1119,7 @@ impl<'a> NetworkProbePermit<'a> {
         let envelope = JobEnvelope::NETWORK_LIVE;
         let mut nonce = [0; 16];
         let absent = |reason| NetworkProbe {
-            refusal: Some(reason),
+            diagnostic: Err(reason),
             release: StopDisposition::DirtyRelease,
         };
         let setup = (|| {
@@ -1187,7 +1188,6 @@ impl<'a> NetworkProbePermit<'a> {
             )?;
             Ok(seed)
         })();
-        let mut zero_hostfwd = false;
         let observed = match staged {
             Ok(seed) => {
                 let plan = PausedPlan {
@@ -1204,7 +1204,6 @@ impl<'a> NetworkProbePermit<'a> {
                     }),
                 };
                 if plan.verify_network_isolation().is_ok() {
-                    zero_hostfwd = true;
                     run(&mut host, &plan, cancel, deadline, Duration::from_secs(5)).await
                 } else {
                     TrialResult {
@@ -1243,24 +1242,20 @@ impl<'a> NetworkProbePermit<'a> {
         } else {
             slot.settle(StopDisposition::ChargedQuarantine)
         };
-        let report = host.network_report.get();
-        let host_controls_post = host.post_controls.get();
-        let clean_guest_shutdown = host.stop_done.get() == Some(StopProtocol::QmpPowerdown)
-            && observed.release == StopDisposition::CleanRelease;
-        let nic_setup_verified = report
-            .is_some_and(|r| r.nic_ready && r.ipv4_lease && r.default_route && r.ipv6_disabled);
-        let denied_probes = report.map_or(0, |r| r.denied_probes);
-        let seed_released = seed_removed && release == StopDisposition::CleanRelease;
-        let diagnostics_complete = observed.paused.is_ok()
-            && host_controls_pre
-            && host_controls_post
-            && nic_setup_verified
-            && denied_probes == 8
-            && zero_hostfwd
-            && clean_guest_shutdown
-            && seed_released;
+        // A report can only arrive after the plan and pre-controls passed.
+        // Preserve it even if post-controls, guest shutdown or seed cleanup
+        // failed so the incomplete record shows where the observation ended.
+        let diagnostic = host.network_report.get().ok_or(reason).map(|guest| {
+            crate::vm::qualification_record::RestrictedNetworkDiagnostic {
+                guest,
+                host_controls_post: host.post_controls.get(),
+                clean_guest_shutdown: host.stop_done.get() == Some(StopProtocol::QmpPowerdown)
+                    && observed.release == StopDisposition::CleanRelease,
+                seed_charge_released: release != StopDisposition::ChargedQuarantine,
+            }
+        });
         NetworkProbe {
-            refusal: (!diagnostics_complete).then_some(reason),
+            diagnostic,
             release,
         }
     }
@@ -1423,7 +1418,7 @@ struct Windows<'a> {
     fault_sample: Cell<Option<FaultRecord>>,
     prelaunch_quiet: Cell<bool>,
     sec_marker_verified: Cell<bool>,
-    network_report: Cell<Option<ProbeReport>>,
+    network_report: Cell<Option<NetworkProbeReport>>,
     post_controls: Cell<bool>,
     stop_done: Cell<Option<StopProtocol>>,
     loss_child_exited: Cell<bool>,
@@ -1889,8 +1884,12 @@ impl<'a> Host for Windows<'a> {
         self.sec_marker_verified.set(true);
     }
 
-    fn record_network_report(&self, _: &Slot, report: ProbeReport) {
+    fn record_network_report(&self, _: &Slot, report: NetworkProbeReport) {
         self.network_report.set(Some(report));
+    }
+
+    async fn network_post_controls(&self, network: &NetworkBoot<'_>) -> bool {
+        network.source.witnesses.known_live(&network.nonce).await
     }
 
     fn mark_post_controls(&self, _: &Slot) {

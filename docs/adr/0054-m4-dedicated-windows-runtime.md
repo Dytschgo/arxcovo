@@ -1290,11 +1290,17 @@ live pressure and console witness runs remain **unverified on real hardware**.
 
 The TEST network probe authenticates the pinned Ubuntu 24.04.3 ISO and binds
 the enrolled kernel and initrd pins directly to `/casper/vmlinuz` and
-`/casper/initrd` inside the held ISO, binds `Targets.dns` to a real host DNS
-resolver backing the slirp alias, validates full nonce-bound DNS query/reply
-echoes, requires positive `virtio_net` link/DHCP/default-route/no-IPv6 setup
-with attributable per-probe outcomes (`ARXNET2`), proves zero hostfwd/ingress
-and read-only media, rechecks media drive bindings at create and after
-prelaunch, keeps QMP `powerdown` separate from control-plane `quit`, and
-retains the seed charge on any ambiguous creation, open, release or removal.
+`/casper/initrd` inside the held ISO, checks `Targets.dns` against the host's
+configured DNS resolvers, validates full nonce-bound DNS query/reply
+echoes, and checks the generated plan for forwarding, sharing, TAP, IPv6
+and writable media. The guest checks for one active `virtio_net` link and
+the exact `10.0.2.15` lease. It installs and reads back the IPv4 default
+route through `10.0.2.2` if restricted DHCP omits it and checks that the NIC
+has only link-local IPv6 addresses and no IPv6 default route. The held
+channel's nonce-bound `ARXNET2` report carries the setup observations and
+socket results as an incomplete diagnostic. A passing isolation row
+requires independent host-side attribution with live controls. The adapter
+rechecks media drive bindings at create and after prelaunch, keeps QMP
+`powerdown` separate from control-plane `quit`, and retains the seed charge
+on ambiguous creation, open, release or removal.
 Live TEST network behavior is **unverified on real hardware**.

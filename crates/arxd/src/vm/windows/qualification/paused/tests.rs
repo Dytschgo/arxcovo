@@ -215,6 +215,8 @@ struct Fake {
     stop_done: Cell<Option<StopProtocol>>,
     clean_exit: bool,
     completed_phases: Cell<PausedCompleted>,
+    network_report: Cell<Option<NetworkProbeReport>>,
+    network_post_controls_ok: bool,
 }
 
 impl Default for Fake {
@@ -255,6 +257,8 @@ impl Default for Fake {
             stop_done: Cell::default(),
             clean_exit: false,
             completed_phases: Cell::default(),
+            network_report: Cell::default(),
+            network_post_controls_ok: false,
         }
     }
 }
@@ -542,6 +546,15 @@ impl Host for Fake {
 
     fn mark_stop_protocol_done(&self, _: &FakeSlot, protocol: StopProtocol) {
         self.stop_done.set(Some(protocol));
+    }
+
+    fn record_network_report(&self, _: &FakeSlot, report: NetworkProbeReport) {
+        self.network_report.set(Some(report));
+    }
+
+    async fn network_post_controls(&self, _: &NetworkBoot<'_>) -> bool {
+        assert!(self.network_report.get().is_some());
+        self.network_post_controls_ok
     }
 
     fn completed_stop_protocol(&self, _: &FakeSlot) -> Option<StopProtocol> {
@@ -1781,4 +1794,63 @@ async fn network_purpose_verifies_zero_hostfwd_channel_and_clean_powerdown_path(
         host.opened_channels.borrow().as_slice(),
         [console.basename()]
     );
+    assert_eq!(host.network_report.get(), None);
+
+    // A nonce-bound report from the pinned guest is accepted as an
+    // observation. A failed control must still prevent graceful completion.
+    for post_ok in [true, false] {
+        let (ch_read, mut ch_write) = tokio::io::duplex(64);
+        let mut host = Fake {
+            replies: Some(format!(
+                "{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n\
+                 {{\"return\":{{\"running\":false,\"status\":\"prelaunch\"}},\"id\":3}}\n\
+                 {{\"return\":{{}},\"id\":4}}\n\
+                 {{\"return\":{{\"running\":true,\"status\":\"running\"}},\"id\":5}}\n\
+                 {{\"return\":{{}},\"id\":6}}\n\
+                 {{\"event\":\"SHUTDOWN\",\"data\":{{\"guest\":true,\"reason\":\"guest-shutdown\"}}}}\n"
+            )),
+            channel_override: RefCell::new(Some(Box::new(ch_read))),
+            network_post_controls_ok: post_ok,
+            clean_exit: true,
+            ..Fake::default()
+        };
+        let (result, ()) = tokio::join!(
+            host.run_purpose(
+                LaunchPurpose::Network(NetworkBoot {
+                    source: &source,
+                    seed: &seed,
+                    code: &code,
+                    vars: &vars,
+                    console: &console,
+                    nonce,
+                }),
+                BUDGET,
+            ),
+            async {
+                tokio::time::sleep(PRELAUNCH_QUIET_WINDOW + Duration::from_millis(10)).await;
+                let frame = format!("ARXNET2 {} 1111 EEEEEEEE\n", hex::encode(nonce));
+                ch_write.write_all(frame.as_bytes()).await.unwrap();
+            }
+        );
+        let report = host.network_report.get().unwrap();
+        assert_eq!(
+            report.outcomes,
+            [crate::vm::qualification_record::ProbeOutcome::SocketError; 8]
+        );
+        let written = host.written.borrow();
+        assert_eq!(
+            String::from_utf8_lossy(&written).contains("\"execute\":\"system_powerdown\""),
+            post_ok,
+        );
+        if post_ok {
+            assert_eq!(result.paused, Ok(()));
+            assert_eq!(result.release, StopDisposition::CleanRelease);
+        } else {
+            assert_eq!(
+                result.paused,
+                Err(Failure::Refused(NativeRefusal::NetworkFenceUnverified))
+            );
+            assert_eq!(result.release, StopDisposition::DirtyRelease);
+        }
+    }
 }

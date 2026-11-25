@@ -357,16 +357,20 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    with kernel and initrd pins verified against `/casper/vmlinuz` and
    `/casper/initrd` inside the held ISO and a generated probe-only NoCloud
    seed. The guest does not install an OS. Enroll controlled TCP echo sockets
-   and a UDP DNS witness matching a configured host DNS resolver backing the
-   slirp alias. The TCP witnesses must return the exact 16-byte challenge,
+   and a UDP DNS witness matching a configured host DNS resolver. The TCP
+   witnesses must return the exact 16-byte challenge,
    including the host loopback control for the slirp alias. The DNS witness
    must return a valid non-truncated reply echoing the exact nonce-bound
    query. Keep all witnesses live through both host control checks. The guest
-   must positively confirm single `virtio_net` link up, a `10.0.2.x` DHCP
-   lease, default route via `10.0.2.2`, and disabled IPv6 before recording
-   attributable per-probe denials (`ARXNET2`). Repeat the probes with the
-   installed guests and their installed drivers in PR 2. Live TEST network
-   behavior is **unverified on real hardware**.
+   checks for one active `virtio_net` link and the exact `10.0.2.15` lease.
+   Restricted slirp DHCP may omit the router option. The guest adds a default
+   route via `10.0.2.2` on that NIC when necessary and reads it back. It checks
+   for addresses beyond IPv6 link-local scope and for an IPv6 default route
+   on the probe NIC before attempting the probes. The nonce-bound `ARXNET2`
+   report records setup flags and socket observations. Qualification requires
+   independent host-side attribution and probes with both installed guests'
+   actual drivers. The live probe currently writes an incomplete diagnostic.
+   Live TEST network behavior is **unverified on real hardware**.
 
    Boot the exact Ubuntu offline recipe with the pinned ISO, CIDATA and
    kernel/initrd. Verify the cleaned standalone candidate, detached installed
