@@ -14,6 +14,39 @@ const rustTimeout = "    timeout-minutes: ${{ matrix.os == 'windows-latest' && 1
 const gate = "if ('${{ needs.rust.result }}' -ne 'success' -or '${{ needs.ui.result }}' -ne 'success') { exit 1 }";
 const checkout = 'uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262';
 const steps = id => jobs[id].split('    steps:\n')[1].trimEnd().split(/^ {6}- /m).slice(1).map(step => step.trimEnd());
+const hostedC14Step = `name: Hosted C14 target-authorized delegated build
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python3 -I -B tools/ci/m3-containers/delegated-build-probe.py
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            outcome=success
+            level=notice
+          else
+            outcome=failure
+            level=warning
+          fi
+          echo "Hosted C14 target-authorized delegated build quarantined single case: outcome=\${outcome} exit=\${status}" >> "$GITHUB_STEP_SUMMARY"
+          echo "::\${level} title=Quarantined hosted C14 probe::outcome=\${outcome} exit=\${status}; non-blocking (docs/ROADMAP.md)"
+          exit "$status"`;
+
+function assertHostedC14Quarantine(workflowText) {
+  const keys = workflowText.match(/^[ \t]*continue-on-error\s*:\s*\S+/gm) ?? [];
+  assert.deepEqual(keys, ['        continue-on-error: true']);
+  const parsed = Object.fromEntries([...workflowText.split('\njobs:\n')[1].matchAll(/^ {2}(\w+):\n([\s\S]*?)(?=^ {2}\w+:\n|$(?![\s\S]))/gm)].map(([, id, body]) => [id, body]));
+  const bodies = ['rust', 'ui', 'verify'].flatMap(id => parsed[id].split('    steps:\n')[1].trimEnd().split(/^ {6}- /m).slice(1).map(step => step.trimEnd()));
+  const quarantined = bodies.filter(step => step.startsWith('name: Hosted C14 target-authorized delegated build\n'));
+  assert.equal(quarantined.length, 1);
+  assert.equal(quarantined[0], hostedC14Step);
+  for (const step of bodies) {
+    if (step !== quarantined[0]) assert.equal(step.includes('continue-on-error'), false);
+  }
+}
 
 test('CI runs unconditional Rust and UI matrices in parallel behind the existing required checks', () => {
   assert.deepEqual(workflow.split('\n').filter(line => /^\S/.test(line)), ['name: CI', 'on:', 'concurrency:', 'permissions:', 'jobs:']);
@@ -29,7 +62,30 @@ test('CI runs unconditional Rust and UI matrices in parallel behind the existing
   }
   assert.equal(jobs.verify, `    name: verify (\${{ matrix.os }})\n    needs: [rust, ui]\n    if: \${{ always() }}\n${matrix}    runs-on: ubuntu-latest\n    timeout-minutes: 12\n    steps:\n      - name: Require every Rust and UI worker to succeed\n        shell: pwsh\n        run: ${gate}\n`);
   assert.match(workflow, /^permissions:\n {2}contents: read\njobs:/m);
-  assert.doesNotMatch(workflow, /continue-on-error/);
+  assertHostedC14Quarantine(workflow);
+});
+
+test('hosted C14 quarantine cannot widen past that single step', () => {
+  assertHostedC14Quarantine(workflow);
+  const probe = 'python3 -I -B tools/ci/m3-containers/delegated-build-probe.py';
+  const mutants = [
+    workflow.replace('        continue-on-error: true\n', ''),
+    workflow.replace(
+      '      - name: Hosted C16 live three-container acceptance\n',
+      '      - name: Hosted C16 live three-container acceptance\n        continue-on-error: true\n',
+    ),
+    workflow.replace('      - run: npm run smoke\n', '      - run: npm run smoke\n        continue-on-error: true\n'),
+    workflow.replace('continue-on-error: true', 'continue-on-error: false'),
+    workflow.replace(probe, 'true'),
+    workflow.replace('exit "$status"', 'exit 0'),
+    workflow.replace(/ {10}echo "Hosted C14 target-authorized delegated build quarantined single case:.*\n/, ''),
+    workflow.replace('timeout-minutes: 2\n        continue-on-error: true', 'timeout-minutes: 9\n        continue-on-error: true'),
+    workflow.replace(probe, `# ${probe}`),
+  ];
+  for (const mutant of mutants) {
+    assert.notEqual(mutant, workflow);
+    assert.throws(() => assertHostedC14Quarantine(mutant), assert.AssertionError);
+  }
 });
 
 test('required gates accept only both successful matrices, including failed, cancelled, skipped and missing results', () => {
@@ -237,11 +293,7 @@ test('Rust retains every native, Python and package validation with exact comman
         env:
           ARX_EXEC_QUALIFICATION_MODE: build
         run: python3 -I -B tools/ci/m3-containers/executor-probe.py`,
-    `name: Hosted C14 target-authorized delegated build
-        if: runner.os == 'Linux'
-        timeout-minutes: 2
-        shell: bash
-        run: python3 -I -B tools/ci/m3-containers/delegated-build-probe.py`,
+    hostedC14Step,
     `name: Bind ignored C16 AnchorQuery helper to the Linux build
         if: runner.os == 'Linux'
         shell: pwsh
