@@ -117,11 +117,16 @@ def cargo_argv(phase):
 
 # --- Budget ------------------------------------------------------------------------
 def check_anchor(raw, now):
-    """Return the anchor age in whole seconds or gate `anchor`."""
+    """Return the anchor age in whole seconds, or gate a bad anchor.
+
+    A missing, malformed, or non-positive timestamp, and a future anchor,
+    are misconfiguration and gate. Age past CAP_S is a slow runner: return
+    it so admission records skipped_budget instead of failing the job.
+    """
     if not isinstance(raw, str) or not re.fullmatch(r"[1-9][0-9]{0,10}", raw, re.ASCII):
         raise Guard("anchor")
     age = int(now) - int(raw)
-    if age < 0 or age > CAP_S:
+    if age < 0:
         raise Guard("anchor")
     return age
 

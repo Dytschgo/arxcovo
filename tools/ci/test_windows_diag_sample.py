@@ -300,13 +300,15 @@ class BudgetTests(unittest.TestCase):
 
     def test_anchor_cases(self):
         now = 1_800_000_000
-        for raw in (None, "", "abc", "012", "1.5", "-5", " 1", "1\n", "\u0661\u0662",
-                    "123456789012", str(now + 1), str(now - 721)):
+        for raw in (None, "", "0", "abc", "012", "1.5", "-5", " 1", "1\n", "\u0661\u0662",
+                    "123456789012", str(now + 1)):
             with self.subTest(raw=raw), self.assertRaises(w.Guard) as g:
                 w.check_anchor(raw, now)
             self.assertEqual(g.exception.reason, "anchor")
         self.assertEqual(w.check_anchor(str(now), now), 0)
         self.assertEqual(w.check_anchor(str(now - 720), now), 720)
+        self.assertEqual(w.check_anchor(str(now - 721), now), 721)
+        self.assertEqual(w.check_anchor(str(now - 3600), now), 3600)
 
     def test_budget_skip_spawns_nothing_and_exits_zero(self):
         h = Harness()
@@ -326,6 +328,26 @@ class BudgetTests(unittest.TestCase):
         del h.env["ARX_DIAG_T0"]
         self.assertEqual(h.run(), (1, [h.lines[0], "ARXDIAG v1 guard reason=anchor"]))
         self.assertEqual(h.field("e_s"), "-")
+
+    def test_anchor_past_cap_skips_budget_without_diagnostic_work(self):
+        for age in (w.CAP_S + 1, 3600):
+            with self.subTest(age=age):
+                h = Harness()
+                h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) - age)
+                code, lines = h.run()
+                self.assertEqual(code, 0)
+                self.assertEqual(h.field("outcome"), "skipped_budget")
+                self.assertEqual(h.field("e_s"), str(age + w.ANCHOR_PRE_S))
+                self.assertEqual(lines, [lines[0]])
+                self.assertNotIn("guard", lines[0])
+                self.assertEqual(h.log, [])
+
+    def test_negative_age_still_guards(self):
+        h = Harness()
+        h.env["ARX_DIAG_T0"] = str(int(h.clock.time()) + 1)
+        self.assertEqual(h.run(), (1, [h.lines[0], "ARXDIAG v1 guard reason=anchor"]))
+        self.assertEqual(h.field("e_s"), "-")
+        self.assertEqual(h.log, [])
 
 
 class InventoryTests(unittest.TestCase):
