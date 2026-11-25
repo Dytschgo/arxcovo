@@ -677,10 +677,26 @@ claim, and keep raw identities local.
 
 Read WTS activity in the current session and bind it to the foreground token
 and a stable console logon incarnation across queries. Verify the SID mapping
-locally and require the unique active, unlocked owner console with sane input
-and logon timestamps. A SID match alone cannot identify a logon. Require ten
-minutes of inactivity and observations at most five seconds old at dispatch,
-clipped to the phase deadline. Recheck activity and reserves before resume,
+locally and require the unique active, unlocked owner console with sane
+timestamps. A SID match alone cannot identify a logon.
+
+Use WTS last-input time when the corroborating samples provide coherent
+timestamps. If both samples report zero last-input time, `current_user` may use
+`GetLastInputInfo` in the enrolled owner's process after corroborating that
+process's physical-console session and the same logon. Prove ten continuous
+minutes without observed input on a monotonic clock. Reset the observation
+interval on input, stale evidence, lock, disconnect, session change or
+uncertainty. Each WTS sample must be at or after its logon time in the
+zero-input path. A change between corroborated input sources invalidates the
+collector for its lifetime. Re-establish the collector before admission.
+Mixed WTS input, clock wrap and backward steps close admission. The
+diagnostic witness may observe the anchored owner's identity and WTS state
+while switched away. Effects require the original owner console to be
+active, unlocked and freshly verified idle.
+
+Require ten minutes of inactivity and observations at most five seconds old
+at dispatch, clipped to the phase deadline. Recheck activity and reserves
+before resume,
 at dispatch and while running. Recent input closes admission. Lock,
 disconnect, session switch, ambiguity or stale observations also close
 admission. Bring owned work to bounded quiescence when the owner returns or
@@ -1367,4 +1383,38 @@ generation slots and holds both writer-excluded handles after child exit, an
 empty Job and joined stdio workers. Uncertain settlement keeps the generation
 charged. The qualifier's separate disposable path still rejects daemon offline
 leases. Production dispatch, WHPX guest boot and teardown remain
+**unverified on real hardware**.
+
+### 7b PR 4 amendment — production recipe inputs and helper release
+
+The foreground binds the two recipe identities to the native record and
+keeps the measured inputs private. It prepares the Ubuntu seed from the
+held guest, installer and stock assets with the reserved generation as
+the instance identity. Windows preparation retains the checked answer
+ISO and installed-image probe from the same measurement. The initial
+VARS copy comes from the held stock firmware for Ubuntu and from the
+enrolled one-shot Setup VARS for Windows.
+
+The daemon supplies the exact reserved disk, VARS and seed slots. Each
+new leaf requires a separate authorization at its checked create edge,
+with the workspace lease, seal, recipe, phase, content pin and deadline
+bound to the effect. The adapter creates only new leaves relative to
+the held directory. If staging fails partway, the daemon keeps the
+affected reservation charged until it can reconcile custody.
+
+The foreground derives the sealed boot plan from those inputs and the
+ledger-pinned disk, VARS and optional golden. The launch edge compares
+the supplied plan with that derivation, including file identities and
+digests that do not appear in argv. Stock custody independently checks
+the paths and held objects. Initial VARS bytes are rechecked under writer
+exclusion through suspended creation. The fixed recipe uses 4 GiB guest
+RAM and two vCPUs under the qualified 6 GiB, 2500-rate Job. The
+production runtime still needs the 7c issuer before it can dispatch.
+
+Helper settlement carries the exact plan kind and role/identity
+projection along with the live workspace lease and writer exclusions.
+The ledger consumer keeps the proof through inspection and settlement.
+Missing or mismatched exclusions yield charged quarantine and withhold
+helper output. The qualifier still uses its separate authority and
+disposable workspace. Production dispatch and settlement are
 **unverified on real hardware**.

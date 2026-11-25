@@ -1255,6 +1255,18 @@ fn token_identity(
     restricted: bool,
     mode: TokenMode,
 ) -> io::Result<Identity> {
+    inspect_token_identity(token, account, restricted, mode, true)
+}
+
+/// The read-only console witness can query the anchored owner token while
+/// another session is active. Every effect gate uses token_identity above.
+fn inspect_token_identity(
+    token: &OwnedHandle,
+    account: &LocalSid,
+    restricted: bool,
+    mode: TokenMode,
+    require_active_console: bool,
+) -> io::Result<Identity> {
     let user = token_data(token, TokenUser)?;
     let integrity = token_data(token, TokenIntegrityLevel)?;
     let elevation = token_data(token, TokenElevation)?;
@@ -1290,7 +1302,9 @@ fn token_identity(
             || elevation[0] != 0
             || !mode.accepts_elevation(elevation_kind[0] as i32)
             || session == 0
-            || (mode == TokenMode::CurrentUser && WTSGetActiveConsoleSessionId() != session)
+            || (require_active_console
+                && mode == TokenMode::CurrentUser
+                && WTSGetActiveConsoleSessionId() != session)
             || stats.TokenType != TokenPrimary
             || (IsTokenRestricted(token.as_raw_handle()) != 0) != restricted
             || (*logon.as_ptr().cast::<TOKEN_GROUPS>()).GroupCount != 1
@@ -2523,6 +2537,27 @@ impl<'a> CheckedLaunchCore<'a> {
                 setup_vars = Some((index, digest));
             }
         }
+        if kind == PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall) {
+            // The foreground preparation pins the initial stock VARS bytes.
+            // Retain writer exclusion until QEMU opens its writable copy.
+            if let Some((_, vars)) = inputs
+                .plan
+                .inputs()
+                .iter()
+                .find(|(role, _)| *role == ArtifactRole::Vars)
+                && let Some(digest) = vars.pin()
+            {
+                let path = vars
+                    .path_for(ArtifactRole::Vars)
+                    .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
+                let index = inputs
+                    .pins
+                    .iter()
+                    .position(|pin| &pin.path == path)
+                    .ok_or(NativeRefusal::PathCustodyUnverified)?;
+                setup_vars = Some((index, digest));
+            }
+        }
         let gate = std::sync::Arc::new(DispatchGate::default());
         let (stdio, parent) = token.stdio().map_err(|_| NativeRefusal::QmpUnverified)?;
         let job = Job::with_process_limit(inputs.memory, Some(inputs.cpu_rate), Some(1))
@@ -2617,6 +2652,7 @@ impl<'a> CheckedLaunchCore<'a> {
 type PipeQmp = Qmp<tokio::io::DuplexStream, tokio::io::DuplexStream>;
 type SerialGuest = GuestChannel<tokio::net::windows::named_pipe::NamedPipeClient>;
 type BootIo = (tokio::io::DuplexStream, tokio::io::DuplexStream);
+type HeldRelease = (StopDisposition, Option<HeldWriters>);
 
 enum BootOutcome {
     Installed(Box<(PipeQmp, SerialGuest)>),
@@ -2641,12 +2677,26 @@ impl From<ChannelError> for InstallerFailureReason {
 impl CheckedLaunchCore<'_> {
     async fn helper(
         &mut self,
+        io: BootIo,
+        cancel: &Shutdown,
+        deadline: tokio::time::Instant,
+        refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
+    ) -> (Result<Vec<u8>, NativeRefusal>, StopDisposition) {
+        let (output, (disposition, _)) = self
+            .helper_held(io, cancel, deadline, refresh, verify_release)
+            .await;
+        (output, disposition)
+    }
+
+    async fn helper_held(
+        &mut self,
         (mut read, write): BootIo,
         cancel: &Shutdown,
         deadline: tokio::time::Instant,
         mut refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
         verify_release: impl FnOnce() -> bool + Send + 'static,
-    ) -> (Result<Vec<u8>, NativeRefusal>, StopDisposition) {
+    ) -> (Result<Vec<u8>, NativeRefusal>, HeldRelease) {
         use tokio::io::AsyncReadExt;
         let refused = NativeRefusal::JobUnverified;
         let work = async {
@@ -2681,11 +2731,11 @@ impl CheckedLaunchCore<'_> {
         };
         drop(write);
         if result.is_err() && self.child.job.terminate().is_err() {
-            return (result, StopDisposition::ChargedQuarantine);
+            return (result, (StopDisposition::ChargedQuarantine, None));
         }
         let successful = result.is_ok();
         let release = self
-            .release_evidence(
+            .release_evidence_held(
                 successful,
                 successful,
                 tokio::time::Instant::now() + Duration::from_secs(5),
@@ -2936,18 +2986,6 @@ impl CheckedLaunchCore<'_> {
             verify_release,
         )
         .await
-    }
-
-    async fn release_evidence(
-        &mut self,
-        guest_shutdown: bool,
-        clean_process_exit: bool,
-        deadline: tokio::time::Instant,
-        verify_release: impl FnOnce() -> bool + Send + 'static,
-    ) -> StopDisposition {
-        self.release_evidence_held(guest_shutdown, clean_process_exit, deadline, verify_release)
-            .await
-            .0
     }
 
     async fn release_evidence_held(
