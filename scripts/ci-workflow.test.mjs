@@ -181,6 +181,12 @@ test('Rust retains every native, Python and package validation with exact comman
         run: |
           python -I -B scripts/check-bound-sqlite.py --check-loader-env
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $pythonName = if ($IsWindows) { 'python' } else { 'python3' }
+          $python = @(Get-Command -Name $pythonName -CommandType Application -ErrorAction Stop)[0].Source
+          & $python -I -B -c "import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:ARX_TEST_NETWORK_PROBE_PYTHON = $python
+          Write-Output "ARX_TEST_NETWORK_PROBE_PYTHON=$python"
           cargo nextest run --workspace --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($IsLinux) {
