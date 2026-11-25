@@ -302,6 +302,7 @@ main:focus-visible { outline-offset: -4px; }
 .meter-label { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.8rem; font-weight: 600; }
 .meter-detail { color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
 .meter-track { block-size: 0.4rem; border-radius: 999px; background: var(--surface-2); overflow: clip; margin-block-start: 0.2rem; }
+.meter-track[data-unknown] { background: repeating-linear-gradient(135deg, var(--surface-2) 0 0.35rem, transparent 0.35rem 0.7rem); outline: 1px dashed var(--muted); outline-offset: -1px; }
 .meter-fill { block-size: 100%; border-radius: inherit; background: var(--ok); }
 .meter[data-tone="warn"] .meter-fill { background: var(--warn); }
 .meter[data-tone="bad"] .meter-fill { background: var(--bad); }
