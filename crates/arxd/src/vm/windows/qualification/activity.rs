@@ -122,6 +122,7 @@ pub(super) fn local_sample(owner_session: u32) -> Option<LocalSample> {
 struct History {
     last: Option<(u64, u64)>,
     since: Option<u64>,
+    source_changed: bool,
 }
 
 impl History {
@@ -161,8 +162,13 @@ impl Binding {
         view: View,
         history: &mut History,
     ) -> Result<Input, NativeRefusal> {
+        if history.source_changed {
+            return Err(REFUSAL);
+        }
         let source = console_source(evidence, view)?;
         if source != self.source {
+            // Clearing idle credit cannot re-establish the source binding.
+            history.source_changed = true;
             return Err(REFUSAL);
         }
         if source == Source::Wts {
@@ -318,6 +324,60 @@ mod tests {
             logon: evidence.wts[0].logon,
             history: Mutex::default(),
         }
+    }
+
+    #[test]
+    fn zero_wts_input_refuses_a_logon_after_either_current_sample() {
+        let mut evidence = zero_wts();
+        let logon = evidence.now + 2 * IDLE_TICKS;
+        for wts in &mut evidence.wts {
+            wts.logon = logon;
+        }
+        for lsa in &mut evidence.lsa {
+            lsa.logon_time = logon;
+        }
+
+        assert_eq!(console_source(&evidence, View::Admission), Err(REFUSAL));
+
+        // Refuse even if the second WTS sample reaches the logon.
+        evidence.wts[1].current = logon;
+        evidence.now = logon;
+        assert_eq!(console_source(&evidence, View::Admission), Err(REFUSAL));
+
+        evidence.wts[0].current = logon;
+        assert_eq!(
+            console_source(&evidence, View::Admission),
+            Ok(Source::Local)
+        );
+    }
+
+    #[test]
+    fn source_change_permanently_invalidates_existing_wts_binding() {
+        let wts = super::super::tests::console();
+        let binding = Binding {
+            source: Source::Wts,
+            logon: wts.wts[0].logon,
+            history: Mutex::default(),
+        };
+        let mut history = History::default();
+
+        assert!(
+            binding
+                .input(&wts, View::Admission, &mut history)
+                .unwrap()
+                .idle
+        );
+        assert_eq!(
+            binding.input(&zero_wts(), View::Admission, &mut history),
+            Err(REFUSAL)
+        );
+        // Capture errors clear idle credit. That reset must leave this
+        // binding invalidated, including when its original source returns.
+        history.since = None;
+        assert_eq!(
+            binding.input(&wts, View::Admission, &mut history),
+            Err(REFUSAL)
+        );
     }
 
     #[test]

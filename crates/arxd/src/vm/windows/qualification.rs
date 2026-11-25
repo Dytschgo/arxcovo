@@ -1457,7 +1457,8 @@ fn console_source(
         return Err(reason);
     }
     match (first.input, second.input) {
-        (0, 0) => Ok(activity::Source::Local),
+        // Both logon times match and current time cannot decrease.
+        (0, 0) if first.current >= first.logon => Ok(activity::Source::Local),
         (0, _) | (_, 0) => Err(reason),
         _ if first.input >= first.logon
             && second.input >= first.input

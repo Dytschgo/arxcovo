@@ -685,11 +685,14 @@ timestamps. If both samples report zero last-input time, `current_user` may use
 `GetLastInputInfo` in the enrolled owner's process after corroborating that
 process's physical-console session and the same logon. Prove ten continuous
 minutes without observed input on a monotonic clock. Reset the observation
-interval on input, stale evidence, a source change, lock, disconnect, session
-change or uncertainty. Mixed WTS input sources, clock wrap and backward steps
-close admission. The diagnostic witness may observe the anchored owner's
-identity and WTS state while switched away. Effects require the original
-owner console to be active, unlocked and freshly verified idle.
+interval on input, stale evidence, lock, disconnect, session change or
+uncertainty. Each WTS sample must be at or after its logon time in the
+zero-input path. A change between corroborated input sources invalidates the
+collector for its lifetime. Re-establish the collector before admission.
+Mixed WTS input, clock wrap and backward steps close admission. The
+diagnostic witness may observe the anchored owner's identity and WTS state
+while switched away. Effects require the original owner console to be
+active, unlocked and freshly verified idle.
 
 Require ten minutes of inactivity and observations at most five seconds old
 at dispatch, clipped to the phase deadline. Recheck activity and reserves
