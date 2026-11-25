@@ -786,7 +786,7 @@ unsafe fn private_descriptor(actual_owner: PSID, dacl: *const ACL, owner: PSID) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #[path = "foreground_tests.rs"]
     mod foreground;
     const TEST_BOOT: records::BootAnchor = records::BootAnchor {
@@ -1018,6 +1018,47 @@ mod tests {
             Ok(vec![DiagnosticFile::WhpxQmpEndpoint]),
         );
         assert_eq!(names(&other_path), ["claim.json", "incomplete.json"]);
+    }
+
+    pub(crate) fn with_refused_issuer_dossier(
+        stale: bool,
+        run: impl FnOnce(LocalPath, Selection, &dyn Fn(&str, &Selection) -> Result<(), NativeRefusal>),
+    ) {
+        use super::super::foreground::ReadDossier;
+        let work = tempfile::tempdir().unwrap();
+        let (path, dir) = claimed(work.path(), &[]);
+        let (dependencies, _, mut bundle) = complete_test_fixture(&dir);
+        if !stale {
+            let mut seal: records::Seal = serde_json::from_slice(&bundle.seal).unwrap();
+            seal.origin = records::Origin::Fixture;
+            bundle.seal = serde_json::to_vec(&seal).unwrap();
+        }
+        for (kind, bytes) in &bundle.files {
+            dir.commit(&kind.name(), bytes).unwrap();
+        }
+        dir.commit(COMPLETE, &bundle.seal).unwrap();
+        let selection = Selection {
+            seal_sha256: records::digest(&bundle.seal),
+            scope: dir.scope(),
+        };
+        let mut now = TEST_BOOT.on_boot(NOW).unwrap();
+        if stale {
+            now.utc += VALIDITY_SECS + 1;
+            now.mono_ms += (VALIDITY_SECS + 1) * 1000;
+        }
+        let fresh = Fresh {
+            now,
+            boot_marker: TEST_BOOT.marker,
+            dependencies: &dependencies,
+        };
+        let (owner, _) = user();
+        run(path.clone(), selection, &|name, pin| {
+            assert_eq!(name, path.as_str());
+            let dir = ReadDossier::open(PathPin::open(&path, true, false)?, sid(&owner))?;
+            dir.read_selected(pin, &fresh)
+                .map(|_| ())
+                .map_err(|_| NativeRefusal::QualificationMissing)
+        });
     }
 
     fn complete_test_fixture(

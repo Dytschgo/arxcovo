@@ -318,6 +318,94 @@ impl<C: Clock> VmController<C> {
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn finish_native_start(
+        &self,
+        worker: &PendingOperation,
+        epoch: Id,
+        completion: Completion,
+    ) -> Result<Status> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let status: i64 = db.query_row(
+                "SELECT status FROM vm_operations
+                WHERE activity_id=?1 AND operation_id=?2 AND action=3",
+                params![worker.activity_id, epoch],
+                |row| row.get(0),
+            )?;
+            if status == Status::Interrupted.code() {
+                return Ok(Status::Interrupted);
+            }
+            let clock = self.clock.now();
+            let result = if clock.monotonic >= worker.deadline {
+                Completion::CleanupUnconfirmed
+            } else {
+                completion
+            };
+            store::settle_with_script(
+                db,
+                worker.activity_id,
+                utc(clock)?,
+                result,
+                None,
+                (result != Completion::Succeeded).then_some(FailureReason::BootFailed),
+            )
+        })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn native_running_epoch(&self, owner: &str, vm: Id) -> Result<Option<(Id, Id)>> {
+        let db = self.store.try_live_connection()?;
+        Ok(db.query_row("SELECT g.id,r.epoch FROM vm_instances v
+            JOIN vm_generations g ON g.vm_id=v.id AND g.active=1 AND g.static_id IS NULL
+            JOIN vm_snapshot_release r ON r.generation=g.id AND r.disposition IS NULL
+            JOIN vm_operations o ON o.vm=v.id AND o.operation_id=r.epoch AND o.action=3 AND o.status=1
+            WHERE v.id=?1 AND v.principal=?2 AND v.state=2 AND v.expires_ms>?3",
+            params![vm,owner,utc(self.clock.now())?], |row| Ok((row.get(0)?, row.get(1)?))).optional()?)
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn native_quarantine(&self, vm: Id, epoch: Id) -> Result<()> {
+        self.store.transact(|db| {
+            let state: i64 = db.query_row("SELECT v.state FROM vm_instances v
+                JOIN vm_generations g ON g.vm_id=v.id AND g.active=1 AND g.static_id IS NULL
+                JOIN vm_snapshot_release r ON r.generation=g.id AND r.epoch=?2 AND r.disposition IS NULL
+                WHERE v.id=?1", params![vm,epoch], |row| row.get(0))?;
+            if matches!(state, 1 | 2) {
+                let recovery = store::activity(db, "arxd", vm, Action::Recover, utc(self.clock.now())?)?;
+                db.execute("UPDATE vm_instances SET state=3,cleanup_id=?2 WHERE id=?1",params![vm,recovery])?;
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn finish_native_stop(
+        &self,
+        worker: &PendingOperation,
+        vm: Id,
+        epoch: Id,
+    ) -> Result<()> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let clock = self.clock.now();
+            ensure!(store::count(db, "SELECT count(*) FROM vm_operations WHERE vm=?1 AND activity_id=?2 AND action=4 AND status=0",
+                params![vm,worker.activity_id])? == 1, "invalid TEST stop receipt");
+            let label: Option<String> = db.query_row("SELECT r.disposition FROM vm_snapshot_release r
+                JOIN vm_generations g ON g.id=r.generation AND g.active=1 AND g.static_id IS NULL
+                WHERE g.vm_id=?1 AND r.epoch=?2", params![vm,epoch], |row| row.get(0)).optional()?.flatten();
+            let released = matches!(label.as_deref(), Some("clean" | "dirty"));
+            let status = if label.as_deref() == Some("clean") && clock.monotonic < worker.deadline {
+                Status::Succeeded
+            } else { Status::Interrupted };
+            store::finish(db, worker.activity_id, status, utc(clock)?, Some(released))?;
+            if released {
+                db.execute("UPDATE vm_instances SET state=1 WHERE id=?1 AND state=2", [vm])?;
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn native_cleanup_safe(&self, work: &reaper::CleanupWork) -> Result<bool> {
         self.store.transact(|db| {
             let Some(vm) = work.kind.vm() else { return Ok(false) };
@@ -338,7 +426,7 @@ impl<C: Clock> VmController<C> {
             ).map(|n| n == 1);
             match work.kind {
                 reaper::CleanupKind::Expiry { .. } | reaper::CleanupKind::Recovery { .. } =>
-                    generation_released(None),
+                    Ok(store::snapshot::active_release_epoch(db, vm, false)?.is_some()),
                 reaper::CleanupKind::Snapshot { generation, .. } => match work.snapshot_phase.as_deref() {
                     Some("retire") => generation_released(Some(generation)),
                     Some("expiry" | "delete" | "abandoned") => Ok(work.accounted),
@@ -381,11 +469,39 @@ impl<C: Clock> VmController<C> {
         })
     }
 
+    /// The native start keeps the admission allowance for preparation and settlement
+    /// in addition to the full post-cont guest handshake.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn admit_native_operation(
+        &self,
+        request: Request<'_>,
+        host: HostObservation,
+        resources: Resources,
+        stop_epoch: Option<Id>,
+    ) -> Result<Admission> {
+        let boot = matches!(request.operation, Operation::Start);
+        let mut admission = self.admit_for_epoch(request, host, resources, stop_epoch)?;
+        if boot && let Admission::Admitted(worker) = &mut admission {
+            worker.deadline += super::guest::INSTALLED_BOOT_BUDGET;
+        }
+        Ok(admission)
+    }
+
     pub fn admit(
         &self,
         request: Request<'_>,
         host: HostObservation,
         resources: Resources,
+    ) -> Result<Admission> {
+        self.admit_for_epoch(request, host, resources, None)
+    }
+
+    fn admit_for_epoch(
+        &self,
+        request: Request<'_>,
+        host: HostObservation,
+        resources: Resources,
+        stop_epoch: Option<Id>,
     ) -> Result<Admission> {
         if validate_principal(request.principal).is_err() {
             return Ok(Admission::Refused(Refusal::Invalid));
@@ -399,7 +515,30 @@ impl<C: Clock> VmController<C> {
             let now = utc(clock)?;
             let action = request.operation.action();
 
-            let decision = self.admit_inner(db, &request, host, resources, clock, &closed)?;
+            let target = || {
+                if let Some(epoch) = stop_epoch && matches!(request.operation, Operation::Stop) {
+                    // A stop can join this owned TEST start or its recovery. Bind
+                    // the exception to the principal, active generation and boot.
+                    let start: Option<(i64,i64)> = db.query_row(
+                        "SELECT o.activity_id,o.status FROM vm_instances v
+                         JOIN vm_generations g ON g.vm_id=v.id AND g.active=1 AND g.static_id IS NULL
+                         JOIN vm_snapshot_release r ON r.generation=g.id AND r.epoch=?3
+                         JOIN vm_operations o ON o.vm=v.id AND o.operation_id=r.epoch AND o.action=3
+                         WHERE v.id=?1 AND v.principal=?2 AND o.principal=?2 AND r.disposition IS NULL
+                         AND NOT EXISTS(SELECT 1 FROM activity a WHERE a.vm=v.id AND a.status=0
+                         AND (a.action<=6 OR a.action IN (12,18)) AND a.id<>o.activity_id)",
+                        params![request.vm,request.principal,epoch], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+                    let Some((activity,status)) = start else { return Ok(Err(Refusal::Busy)); };
+                    if status == Status::Pending.code() {
+                        // Retire the exact start in the transaction inserting the
+                        // stop. The original worker retains teardown custody.
+                        store::settle_with_script(db,activity,now,Completion::CleanupUnconfirmed,None,Some(FailureReason::BootFailed))?;
+                    }
+                    return Ok(Ok(Target::Existing));
+                }
+                target(db, &request, now)
+            };
+            let decision = self.admit_inner(db, &request, (host, resources), clock, &closed, target)?;
             if let Admission::Refused(reason) = decision {
                 store::refusal(db, request.principal, request.vm, action, now, reason)?;
             }
@@ -415,10 +554,10 @@ impl<C: Clock> VmController<C> {
         &self,
         db: &Connection,
         request: &Request<'_>,
-        host: HostObservation,
-        resources: Resources,
+        (host, resources): (HostObservation, Resources),
         clock: ClockReading,
         gate: &AdmissionGate,
+        check_target: impl Fn() -> Result<Result<Target, Refusal>>,
     ) -> Result<Admission> {
         let now = clock.utc_ms;
         let action = request.operation.action();
@@ -440,7 +579,7 @@ impl<C: Clock> VmController<C> {
             && (gate.custody_uncertain || store::has_failed_clone_cleanup(db)?)
         {
             if action != Action::Clone
-                && let Err(reason) = target(db, request, now)?
+                && let Err(reason) = check_target()?
             {
                 return Ok(Admission::Refused(reason));
             }
@@ -458,7 +597,6 @@ impl<C: Clock> VmController<C> {
         let Some(deadline) = clock.monotonic.checked_add(Duration::from_secs(seconds)) else {
             return Ok(Admission::Refused(Refusal::Invalid));
         };
-        let check_target = || target(db, request, now);
         let target = if action == Action::Stop {
             if request.disk.total() != Some(0) {
                 return Ok(Admission::Refused(Refusal::Invalid));
@@ -876,7 +1014,9 @@ impl<C: Clock> VmController<C> {
                 if let Err(reason) = self.validate_disk(db, capacity, request.disk)? {
                     return Ok(Err(reason));
                 }
-                let pending = self.worker(clock, 120)?;
+                // Linked clones re-read the sealed backing pair and copy VARS in
+                // addition to the short overlay helper. Lease expiry is independent.
+                let pending = self.worker(clock, super::runtime::SNAPSHOT_COPY_MAXIMUM.as_secs())?;
                 request.vm = store::new_id()?;
                 let target = match target(db, &request, now)? {
                     Ok(target) => target,
@@ -2738,6 +2878,7 @@ impl<C: Clock> VmController<C> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn active_release_epoch(&self, vm: Id, is_static: bool) -> Result<Option<(Id, Id)>> {
         self.store
             .transact(|db| store::snapshot::active_release_epoch(db, vm, is_static))

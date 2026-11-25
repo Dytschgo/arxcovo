@@ -109,6 +109,160 @@ fn native_monitor_queries_refuse_store_contention() {
     });
 }
 
+fn native_admit(
+    f: &Fixture,
+    vm: Id,
+    number: u8,
+    principal: &str,
+    operation: Operation<'_>,
+    epoch: Option<Id>,
+) -> Admission {
+    f.ctl
+        .admit_native_operation(
+            Request {
+                principal,
+                request_id: key(f.clock.now().utc_ms, number),
+                vm,
+                disk: DiskClaim::default(),
+                operation,
+            },
+            host(),
+            resources(),
+            epoch,
+        )
+        .unwrap()
+}
+
+#[test]
+fn linked_clone_has_a_bounded_file_verification_window() {
+    let f = Fixture::new();
+    let (_, _, clone) = f.reserve_clone(f.build(41, true), 42);
+    assert_eq!(
+        clone.deadline() - f.clock.now().monotonic,
+        runtime::SNAPSHOT_COPY_MAXIMUM
+    );
+}
+
+#[test]
+fn slow_valid_native_start_still_has_a_publishable_witness_epoch() {
+    let f = Fixture::new();
+    let (vm, slots) = f.clone(f.build(11, true), 12, true);
+    f.ctl
+        .extend_lease(OWNER, vm, key(NOW, 13), 600)
+        .unwrap()
+        .unwrap();
+    let Admission::Admitted(worker) = native_admit(&f, vm, 14, OWNER, Operation::Start, None)
+    else {
+        panic!("start refused")
+    };
+    let epoch = f
+        .ctl
+        .foreground_operation_ref(OWNER, worker.activity_id())
+        .unwrap();
+    f.clock.set(NOW + 150_000, 150);
+    assert!(worker.deadline() > f.clock.now().monotonic);
+    assert_eq!(
+        f.ctl.finish(&worker, Completion::Succeeded).unwrap(),
+        Status::Succeeded
+    );
+    assert_eq!(
+        f.ctl.native_running_epoch(OWNER, vm).unwrap(),
+        Some((slots.disk.generation, epoch))
+    );
+}
+
+#[test]
+fn boot_interrupt_stop_requires_the_current_owner_and_epoch_and_replays() {
+    let f = Fixture::new();
+    let (vm, _) = f.clone(f.build(21, true), 22, true);
+    let start = f.worker(vm, 23, Operation::Start);
+    let epoch = f
+        .ctl
+        .foreground_operation_ref(OWNER, start.activity_id())
+        .unwrap();
+    for (owner, binding) in [("bob", epoch), (OWNER, [0; 16])] {
+        assert!(matches!(
+            native_admit(&f, vm, 24, owner, Operation::Stop, Some(binding)),
+            Admission::Refused(_)
+        ));
+    }
+    let Admission::Admitted(stop) = native_admit(&f, vm, 25, OWNER, Operation::Stop, Some(epoch))
+    else {
+        panic!("stop refused")
+    };
+    assert!(matches!(
+        native_admit(&f, vm, 25, OWNER, Operation::Stop, Some(epoch)),
+        Admission::Existing(_)
+    ));
+    assert!(matches!(
+        native_admit(&f, vm, 26, OWNER, Operation::Stop, Some(epoch)),
+        Admission::Refused(_)
+    ));
+    assert_eq!(
+        f.ctl
+            .finish_native_start(&start, epoch, Completion::Succeeded)
+            .unwrap(),
+        Status::Interrupted
+    );
+    assert_eq!(
+        f.count(
+            "SELECT count(*) FROM activity WHERE vm IS NOT NULL AND action IN (3,4) AND status=0"
+        ),
+        1
+    );
+    f.ctl.finish_native_stop(&stop, vm, epoch).unwrap();
+    assert_eq!(
+        f.count("SELECT count(*) FROM activity WHERE action=4 AND cleanup_confirmed=0"),
+        1
+    );
+}
+
+#[test]
+fn lost_channel_fences_only_its_epoch_and_recovery_waits_for_held_release() {
+    let f = Fixture::new();
+    let (vm, _) = f.clone(f.build(31, true), 32, true);
+    let active = f.ctl.native_start_pair(OWNER, vm).unwrap().unwrap();
+    let start = f.worker(vm, 33, Operation::Start);
+    let epoch = f
+        .ctl
+        .foreground_operation_ref(OWNER, start.activity_id())
+        .unwrap();
+    f.ctl.finish(&start, Completion::Succeeded).unwrap();
+    assert!(f.ctl.native_quarantine(vm, [0; 16]).is_err());
+    f.ctl.native_quarantine(vm, epoch).unwrap();
+    f.ctl.native_quarantine(vm, epoch).unwrap();
+    assert_eq!(
+        f.count("SELECT count(*) FROM vm_instances WHERE state=3 AND cleanup_id IS NOT NULL"),
+        1
+    );
+    let claim = f.ctl.recovery_intents().unwrap().pop().unwrap();
+    let cleanup = f
+        .ctl
+        .reaper_test_store()
+        .transact(|db| store::cleanup_work(db, claim.into()))
+        .unwrap()
+        .unwrap();
+    assert!(!f.ctl.native_cleanup_safe(&cleanup).unwrap());
+    assert_eq!(
+        f.count("SELECT count(*) FROM vm_disk_claims WHERE persistent>0"),
+        1
+    );
+    let Admission::Admitted(stop) = native_admit(&f, vm, 34, OWNER, Operation::Stop, Some(epoch))
+    else {
+        panic!("recovery stop refused")
+    };
+    f.ctl
+        .native_record_release(
+            vm,
+            epoch,
+            active.pair,
+            runtime::StopDisposition::DirtyRelease,
+        )
+        .unwrap();
+    f.ctl.finish_native_stop(&stop, vm, epoch).unwrap();
+    assert!(f.ctl.native_cleanup_safe(&cleanup).unwrap());
+}
+
 #[test]
 fn native_expiry_requires_release_for_the_exact_active_generation() {
     let fixture = Fixture::new();

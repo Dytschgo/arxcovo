@@ -1443,7 +1443,10 @@ with preflight and qualification. Native monitoring and teardown are
 The owner opts in through `test_vms.runtime.execution_profile` set to
 `current_user` and `test_vms.runtime.test_qualification` with the local
 `enrollment` and `dossier` paths and lowercase `sha256` and `scope`
-pins. The runtime and TEST surface must both be enabled. The foreground
+pins. Older profiles can omit the execution profile and continue to parse
+with their dedicated-account setting. An explicit `current_user` selects the
+owner's interactive account for this TEST issuer. Omitting it keeps TEST
+admission closed. The runtime and TEST surface must both be enabled. The foreground
 checks the current primary token, the held store, and both measured
 recipe identities. It assigns a fresh epoch and reuses the store's
 persistent UTC high-water clock. Boot anchoring and record expiry are
@@ -1468,6 +1471,20 @@ ledger commit. Uncertain effects leave their charges in the existing
 cleanup ledger. TEST reconciliation opens only the tracked TEST disk
 and VARS roles. Public publishing remains opt-in and the TEST path has
 no static VM or backup deletion authority.
+
+A native start allows two minutes for preparation, one minute for serial
+and QMP setup, and three minutes for guest readiness. The lease still
+bounds admission. A linked clone has up to fifteen minutes for file
+verification, overlay creation and the VARS copy. The individual helper
+deadline also applies.
+
+An owner stop during boot interrupts the pending start and records the
+stop in the same transaction. The worker keeps its child, Job, stdio
+workers and generation lease through teardown. If release cannot yet
+be proved, the controller records recovery for that generation and keeps
+its charge. A later stop or expiry wakes the same worker for another
+bounded attempt. Recovery can reconcile the generation after the worker
+records matching release evidence.
 
 The existing TEST artifact lookup and snapshot reserve, commit and
 release transactions are compiled into Windows x64 production. Their

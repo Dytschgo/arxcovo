@@ -895,7 +895,7 @@ impl<'a> NativeLaunch<'a> {
         self.stop_generation(cancel, verify_release).await
     }
 
-    async fn stop_generation(
+    pub(crate) async fn stop_generation(
         &mut self,
         cancel: &Shutdown,
         verify_release: impl FnOnce() -> bool + Send + 'static,

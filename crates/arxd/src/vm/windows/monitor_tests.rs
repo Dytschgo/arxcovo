@@ -149,6 +149,33 @@ async fn observes_work_error_and_preserves_reason() {
     assert_eq!(samples.get(), 2);
 }
 
+#[tokio::test]
+async fn timed_out_release_keeps_the_worker_for_a_later_join() {
+    let (finish, wait) = std::sync::mpsc::channel();
+    let workers = WorkerSet {
+        cancel: Shutdown::default(),
+        workers: vec![
+            Worker::start("arx-release-test", move || {
+                wait.recv().map_err(io::Error::other)
+            })
+            .unwrap(),
+        ],
+    };
+    assert_eq!(
+        workers
+            .wait_stopped(Instant::now())
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    finish.send(()).unwrap();
+    workers
+        .join(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+}
+
 struct DelayedExit(Cell<bool>);
 
 impl InstallerChild for DelayedExit {

@@ -405,7 +405,11 @@ impl Supervisor {
             .as_ref()
             .and_then(VmRuntimeProfile::test_qualification)
         {
-            match native_test::SelectedTest::open(&state.controller, selection) {
+            match native_test::SelectedTest::open(
+                &state.controller,
+                selection,
+                crate::vm::qualification::ForegroundQualification::open,
+            ) {
                 Ok(native) => {
                     let recipes = native.recipes();
                     state.recipes[0] =

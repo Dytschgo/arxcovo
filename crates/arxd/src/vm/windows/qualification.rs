@@ -31,6 +31,8 @@ pub(crate) use recipe::{
 };
 mod schema;
 mod sink;
+#[cfg(test)]
+pub(crate) use sink::tests::with_refused_issuer_dossier;
 mod test;
 
 pub use paused::{

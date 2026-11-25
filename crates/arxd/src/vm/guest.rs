@@ -17,6 +17,10 @@ use tokio::{
 /// to answer a challenge issued in this boot. Fixed: no recipe, profile or
 /// caller can extend it.
 pub const GUEST_READY_BUDGET: Duration = Duration::from_secs(180);
+/// Serial connect, QMP setup and the full installed guest readiness wait.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) const INSTALLED_BOOT_BUDGET: Duration =
+    Duration::from_secs(GUEST_READY_BUDGET.as_secs() + 60);
 
 /// Once the first byte of a response arrives, the rest of that frame must
 /// arrive within this bound, inside any outer deadline.

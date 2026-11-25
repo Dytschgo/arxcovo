@@ -1745,7 +1745,7 @@ impl WorkerSet {
         }
     }
 
-    async fn join(mut self, deadline: tokio::time::Instant) -> io::Result<()> {
+    async fn wait_stopped(&self, deadline: tokio::time::Instant) -> io::Result<()> {
         while self.workers.iter().any(|worker| !worker.0.is_finished()) {
             // A cancellation can race a worker entering its next system call.
             // Repeat until the threads finish or the launch must be quarantined.
@@ -1758,6 +1758,11 @@ impl WorkerSet {
             )
             .await;
         }
+        Ok(())
+    }
+
+    async fn join(mut self, deadline: tokio::time::Instant) -> io::Result<()> {
+        self.wait_stopped(deadline).await?;
         for worker in self.workers.drain(..) {
             worker
                 .0
@@ -2473,6 +2478,7 @@ struct LaunchInputs<'a> {
 struct CheckedLaunchCore<'a> {
     child: Child,
     workers: Option<WorkerSet>,
+    workers_joined: bool,
     gate: std::sync::Arc<DispatchGate>,
     pins: std::sync::Arc<[PathPin]>,
     setup_vars_handoff: Option<File>,
@@ -2652,6 +2658,7 @@ impl<'a> CheckedLaunchCore<'a> {
             Self {
                 child,
                 workers: Some(workers),
+                workers_joined: false,
                 gate,
                 pins: inputs.pins.into(),
                 setup_vars_handoff,
@@ -2976,9 +2983,7 @@ impl CheckedLaunchCore<'_> {
             },
             || self.check_running(&mut *refresh.borrow_mut(), false),
             cancel,
-            tokio::time::Instant::now()
-                + super::guest::GUEST_READY_BUDGET
-                + Duration::from_secs(60),
+            tokio::time::Instant::now() + super::guest::INSTALLED_BOOT_BUDGET,
             |_| NativeRefusal::QmpUnverified,
         )
         .await
@@ -3156,7 +3161,10 @@ impl CheckedLaunchCore<'_> {
         let grace = tokio::time::Instant::now() + Duration::from_secs(2);
         if observed.guest_shutdown && self.child.reap(grace).await.is_ok() {
             observed.clean_process_exit = self.child.exit_code() == Ok(0);
-        } else if self.child.job.terminate().is_err() {
+        } else if !(self.child.exited().is_ok_and(|exited| exited)
+            && matches!(self.child.job.active(), Ok(0)))
+            && self.child.job.terminate().is_err()
+        {
             return (StopDisposition::ChargedQuarantine, None);
         }
         self.release_evidence_held(
@@ -3182,11 +3190,13 @@ impl CheckedLaunchCore<'_> {
         };
         observed.process_exited = self.child.reap(deadline).await.is_ok();
         observed.job_empty = matches!(self.child.job.active(), Ok(0));
-        observed.workers_joined = if let Some(workers) = self.workers.take() {
-            workers.join(deadline).await.is_ok()
-        } else {
-            false
-        };
+        if let Some(workers) = &self.workers
+            && workers.wait_stopped(deadline).await.is_ok()
+            && let Some(stopped) = self.workers.take()
+        {
+            self.workers_joined = stopped.join(deadline).await.is_ok();
+        }
+        observed.workers_joined = self.workers_joined;
         let pins = self.pins.clone();
         let writers = self.writers.clone();
         finish_release_held(

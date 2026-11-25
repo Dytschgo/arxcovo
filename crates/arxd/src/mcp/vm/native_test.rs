@@ -57,8 +57,28 @@ struct Witness {
 
 struct Running {
     queue: mpsc::Sender<(OwnerWork, Work)>,
-    cancel: Shutdown,
+    control: RunControl,
+    epoch: Id,
+    stop_worker: Option<PendingOperation>,
     witness: Option<Witness>,
+}
+
+#[derive(Clone, Default)]
+struct RunControl {
+    cancel: Shutdown,
+    stop: Shutdown,
+    retry: Arc<tokio::sync::Notify>,
+}
+
+impl Running {
+    fn request_stop(&mut self) {
+        if self.witness.is_none() {
+            self.control.cancel.cancel();
+        }
+        self.witness = None;
+        self.control.stop.cancel();
+        self.control.retry.notify_one();
+    }
 }
 
 struct OwnerWork {
@@ -96,8 +116,14 @@ impl SelectedTest {
     pub(super) fn open(
         controller: &Controller,
         config: TestQualificationSelection,
+        acquire: impl FnOnce(
+            Arc<crate::store::vm::VmStore>,
+            &str,
+            &str,
+            &crate::vm::qualification_record::Selection,
+        ) -> Result<ForegroundQualification, NativeRefusal>,
     ) -> Result<Self, NativeRefusal> {
-        let qualification = ForegroundQualification::open(
+        let qualification = acquire(
             controller.native_store(),
             config.enrollment.as_str(),
             config.dossier.as_str(),
@@ -413,16 +439,21 @@ impl SelectedTest {
         let vm = mutation.id;
         let key = mutation.key;
         let mut running = self.running.lock().map_err(|_| STATE_UNAVAILABLE)?;
-        let instance = running.get(&vm);
+        let instance = running.get_mut(&vm);
         let active = match mutation.work {
             Work::Start if instance.is_none() => Some(
                 controller
                     .native_start_pair(principal, vm)?
                     .ok_or(Refusal::Busy)?,
             ),
-            Work::Script(..) | Work::Stop
-                if instance.is_some_and(|item| item.witness.is_some()) =>
+            Work::Stop
+                if instance
+                    .as_ref()
+                    .is_some_and(|item| item.stop_worker.is_none()) =>
             {
+                None
+            }
+            Work::Script(..) if instance.as_ref().is_some_and(|item| item.witness.is_some()) => {
                 None
             }
             _ => return caller.refuse(action, Some(vm), NOT_READY),
@@ -436,7 +467,7 @@ impl SelectedTest {
             },
             _ => return Err(INVALID),
         };
-        let admission = controller.admit(
+        let admission = controller.admit_native_operation(
             Request {
                 principal,
                 request_id: key,
@@ -446,6 +477,10 @@ impl SelectedTest {
             },
             host,
             RESOURCES,
+            instance
+                .as_ref()
+                .filter(|item| item.witness.is_none())
+                .map(|item| item.epoch),
         )?;
         let worker = match admission {
             Admission::Admitted(worker) => worker,
@@ -460,12 +495,14 @@ impl SelectedTest {
         let operation = controller.foreground_operation_ref(principal, worker.activity_id())?;
         if let Some(active) = active {
             let (queue, receiver) = mpsc::channel(1);
-            let cancel = Shutdown::default();
+            let control = RunControl::default();
             running.insert(
                 vm,
                 Running {
                     queue,
-                    cancel: cancel.clone(),
+                    control: control.clone(),
+                    epoch: operation,
+                    stop_worker: None,
                     witness: None,
                 },
             );
@@ -482,17 +519,28 @@ impl SelectedTest {
                 caller.supervisor.clone(),
                 move |native, supervisor, executor| {
                     let result = executor
-                        .block_on(native.run_vm(supervisor, vm, &work, active, receiver, cancel));
-                    native
+                        .block_on(native.run_vm(supervisor, vm, &work, active, receiver, control));
+                    let mut running = native
                         .running
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("TEST run custody lost"))?
-                        .remove(&vm);
+                        .map_err(|_| anyhow::anyhow!("TEST run custody lost"))?;
+                    if let Some(instance) = running.remove(&vm)
+                        && let Some(stop) = instance.stop_worker
+                    {
+                        supervisor
+                            .controller
+                            .finish_native_stop(&stop, vm, instance.epoch)?;
+                    }
                     result
                 },
             );
-        } else if let Some(instance) = instance
-            && let Err(error) = instance.queue.try_send((
+        } else if let Some(instance) = instance {
+            if matches!(mutation.work, Work::Stop) {
+                instance.stop_worker = Some(worker);
+                instance.request_stop();
+                return Ok(receipt(operation, None));
+            }
+            if let Err(error) = instance.queue.try_send((
                 OwnerWork {
                     principal: principal.clone(),
                     key,
@@ -501,12 +549,12 @@ impl SelectedTest {
                     worker,
                 },
                 mutation.work,
-            ))
-        {
-            let (worker, _) = error.into_inner();
-            controller.finish(&worker.worker, Completion::CleanupUnconfirmed)?;
-            instance.cancel.cancel();
-            return Err(STATE_UNAVAILABLE);
+            )) {
+                let (worker, _) = error.into_inner();
+                controller.finish(&worker.worker, Completion::CleanupUnconfirmed)?;
+                instance.control.cancel.cancel();
+                return Err(STATE_UNAVAILABLE);
+            }
         }
         Ok(receipt(operation, None))
     }
@@ -780,17 +828,16 @@ impl SelectedTest {
         vm: Id,
         mut row: Value,
     ) -> Value {
-        let witness = self
-            .running
-            .lock()
-            .ok()
-            .and_then(|running| running.get(&vm).and_then(|item| item.witness));
-        let witness = witness.filter(|witness| {
-            row["state"] == "running"
-                && witness.matches(controller.active_release_epoch(vm, false).ok().flatten())
-                && controller
-                    .get_status(principal, vm)
-                    .is_ok_and(|status| status.is_ok())
+        let witness = self.running.lock().ok().and_then(|running| {
+            running.get(&vm)?.witness.filter(|witness| {
+                row["state"] == "running"
+                    && witness.matches(
+                        controller
+                            .native_running_epoch(principal, vm)
+                            .ok()
+                            .flatten(),
+                    )
+            })
         });
         row["ready"] = json!(witness.is_some());
         if row["guest"] == "windows"
@@ -822,12 +869,14 @@ impl SelectedTest {
         work: &OwnerWork,
         active: crate::store::vm::snapshot::Active,
         mut queue: mpsc::Receiver<(OwnerWork, Work)>,
-        cancel: Shutdown,
+        control: RunControl,
     ) -> anyhow::Result<()> {
+        let cancel = control.cancel.clone();
         let controller = &supervisor.controller;
         let recipe = [self.recipes().ubuntu, self.recipes().windows]
             .into_iter()
             .find(|id| id.recipe_sha256 == active.recipe);
+        let prepare_by = work.worker.deadline() - crate::vm::guest::INSTALLED_BOOT_BUDGET;
         let prepared = || -> Result<_, NativeRefusal> {
             let recipe = recipe.ok_or(MISSING)?;
             let (pair, evidence) = active.pair;
@@ -835,22 +884,25 @@ impl SelectedTest {
                 .qualification
                 .generation_workspace(pair.disk.generation, false)?;
             // Verify both stopped bytes before the generation can write again.
-            open_pair(&workspace, pair, evidence, work.worker.deadline())?;
+            open_pair(&workspace, pair, evidence, prepare_by)?;
             let (golden, proof) = active.golden.ok_or(PATH)?;
             let golden_ws = self
                 .qualification
                 .generation_workspace(golden.disk.generation, false)?;
-            let (golden_disk, _) = open_pair(&golden_ws, golden, proof, work.worker.deadline())?;
+            let (golden_disk, _) = open_pair(&golden_ws, golden, proof, prepare_by)?;
             let backing = golden_disk.artifact(ArtifactRole::Golden)?;
             Ok((recipe, workspace, golden_disk, backing))
         };
-        let Ok((recipe, workspace, _golden_pin, backing)) = prepared() else {
-            controller.finish_with_cause(
+        let fail_start = || -> anyhow::Result<()> {
+            controller.finish_native_start(
                 &work.worker,
+                work.operation,
                 Completion::CleanupUnconfirmed,
-                Some(FailureReason::BootFailed),
             )?;
-            return Ok(());
+            Ok(())
+        };
+        let Ok((recipe, workspace, _golden_pin, backing)) = prepared() else {
+            return fail_start();
         };
         let (pair, evidence) = active.pair;
         let ids = evidence.map(|file| file.identity);
@@ -868,25 +920,28 @@ impl SelectedTest {
             Ok(captured)
         };
         let intent = self.intent(supervisor, work, pair.disk.generation, &refresh);
-        let qualified = self
-            .qualification
-            .prepare_boot(BootReservation {
-                workspace: &workspace,
-                recipe,
-                phase: None,
-                pair,
-                identities: ids,
-                backing: Some(&backing),
-                staged: None,
-            })
-            .map_err(|_| anyhow::anyhow!("TEST boot inputs refused"))?;
+        let Ok(qualified) = self.qualification.prepare_boot(BootReservation {
+            workspace: &workspace,
+            recipe,
+            phase: None,
+            pair,
+            identities: ids,
+            backing: Some(&backing),
+            staged: None,
+        }) else {
+            return fail_start();
+        };
         let planner = qualified.planner();
+        let Ok(plan) = planner.plan() else {
+            return fail_start();
+        };
+        if Instant::now() >= prepare_by {
+            return fail_start();
+        }
         let launch = self.launch(
             &intent,
             &workspace,
-            planner
-                .plan()
-                .map_err(|_| anyhow::anyhow!("TEST boot plan refused"))?,
+            plan,
             qualified.cwd(),
             Some(pair),
             None,
@@ -895,12 +950,7 @@ impl SelectedTest {
             &[pair.disk, pair.vars],
         );
         let Ok(mut launch) = launch else {
-            controller.finish_with_cause(
-                &work.worker,
-                Completion::CleanupUnconfirmed,
-                Some(FailureReason::BootFailed),
-            )?;
-            return Ok(());
+            return fail_start();
         };
         let boot_refresh = || {
             if Instant::now() >= work.worker.deadline() {
@@ -908,123 +958,176 @@ impl SelectedTest {
             }
             refresh()
         };
-        if let Err(failure) = launch.boot(&cancel, boot_refresh, || true).await {
-            controller.finish_with_cause(
-                &work.worker,
-                Completion::CleanupUnconfirmed,
-                Some(FailureReason::BootFailed),
-            )?;
-            if failure
-                .released
-                .as_ref()
-                .is_some_and(|proof| proof.matches(workspace.binding(), pair, ids))
-            {
-                let files = read_pair(
-                    &workspace,
-                    pair,
-                    ids,
-                    Instant::now() + Duration::from_secs(20),
-                )
-                .map_err(|_| anyhow::anyhow!("TEST release unreadable"))?;
-                controller.native_record_release(
-                    vm,
+        let failed_release = match launch.boot(&cancel, boot_refresh, || true).await {
+            Err(failure) => {
+                controller.finish_native_start(
+                    &work.worker,
                     work.operation,
-                    (pair, files),
-                    failure.disposition,
+                    Completion::CleanupUnconfirmed,
                 )?;
+                Some((failure.disposition, failure.released.map(|held| *held)))
             }
-            return Ok(());
-        }
-        let witness_id = crate::store::vm::new_id()?;
-        anyhow::ensure!(witness_id != work.operation, "TEST boot witness collision");
-        if controller.finish(&work.worker, Completion::Succeeded)? != Status::Succeeded {
-            let _ = launch.stop(&cancel, || true).await;
-            return Ok(());
-        }
-        self.witness(
-            vm,
-            Some(Witness {
-                generation: pair.disk.generation,
-                operation: work.operation,
-                id: witness_id,
-            }),
-        )?;
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut stop = None;
-        let mut failed_release = None;
-        loop {
-            tokio::select! {
-                biased;
-                _ = supervisor.cancel.cancelled() => break,
-                _ = cancel.cancelled() => break,
-                work = queue.recv() => match work {
-                    Some((worker, Work::Script(script, timeout))) => {
-                        let script_refresh = || {
-                            if Instant::now() >= worker.worker.deadline() { return Err(MISSING); }
-                            refresh()
-                        };
-                        let script_intent = self.intent(supervisor, &worker, pair.disk.generation, &script_refresh);
-                        let Ok(authority) = script_intent.authorize(workspace.binding(), &[pair.disk, pair.vars]) else {
-                            controller.finish_script(&worker.worker, ScriptResult::Unavailable)?;
-                            continue;
-                        };
-                        match launch.run_script(authority, script, timeout, &cancel, script_refresh, || true).await {
-                            Ok(result) => { controller.finish_script(&worker.worker, script_result(result))?; }
-                            Err(failure) => {
-                                self.witness(vm, None)?;
-                                controller.finish_with_cause(&worker.worker, Completion::CleanupUnconfirmed, Some(FailureReason::ExecutionUnknown))?;
-                                failed_release = Some((failure.disposition, failure.released.map(|held| *held)));
-                                break;
+            Ok(()) => {
+                let ready = {
+                    let mut running = self
+                        .running
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("TEST run custody lost"))?;
+                    let instance = running
+                        .get_mut(&vm)
+                        .ok_or_else(|| anyhow::anyhow!("TEST run custody lost"))?;
+                    let witness = crate::store::vm::new_id()
+                        .ok()
+                        .filter(|id| {
+                            *id != work.operation
+                                && !cancel.is_cancelled()
+                                && !supervisor.cancel.is_cancelled()
+                        })
+                        .map(|id| Witness {
+                            generation: pair.disk.generation,
+                            operation: work.operation,
+                            id,
+                        });
+                    let completion = if witness.is_some() {
+                        Completion::Succeeded
+                    } else {
+                        Completion::CleanupUnconfirmed
+                    };
+                    if controller.finish_native_start(&work.worker, work.operation, completion)?
+                        == Status::Succeeded
+                    {
+                        instance.witness = witness;
+                    }
+                    instance.witness.is_some()
+                };
+                if ready {
+                    let mut interval = tokio::time::interval(Duration::from_secs(1));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let mut failed_release = None;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = supervisor.cancel.cancelled() => break,
+                            _ = cancel.cancelled() => break,
+                            _ = control.stop.cancelled() => break,
+                            work = queue.recv() => match work {
+                                Some((worker, Work::Script(script, timeout))) => {
+                                    let script_refresh = || {
+                                        if Instant::now() >= worker.worker.deadline() { return Err(MISSING); }
+                                        refresh()
+                                    };
+                                    let script_intent = self.intent(supervisor, &worker, pair.disk.generation, &script_refresh);
+                                    let Ok(authority) = script_intent.authorize(workspace.binding(), &[pair.disk, pair.vars]) else {
+                                        controller.finish_script(&worker.worker, ScriptResult::Unavailable)?;
+                                        continue;
+                                    };
+                                    match launch.run_script(authority, script, timeout, &cancel, script_refresh, || true).await {
+                                        Ok(result) => { controller.finish_script(&worker.worker, script_result(result))?; }
+                                        Err(failure) => {
+                                            self.witness(vm, None)?;
+                                            controller.finish_with_cause(&worker.worker, Completion::CleanupUnconfirmed, Some(FailureReason::ExecutionUnknown))?;
+                                            failed_release = Some((failure.disposition, failure.released.map(|held| *held)));
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ => break,
+                            },
+                            _ = interval.tick() => {
+                                if let Err(failure) = launch.ping(&cancel, refresh, || true).await {
+                                    failed_release = Some((failure.disposition, failure.released.map(|held| *held)));
+                                    break;
+                                }
                             }
                         }
                     }
-                    Some((worker, Work::Stop)) => { stop = Some(worker); break; }
-                    _ => break,
-                },
-                _ = interval.tick() => {
-                    if let Err(failure) = launch.ping(&cancel, refresh, || true).await {
-                        failed_release = Some((failure.disposition, failure.released.map(|held| *held)));
-                        break;
-                    }
+                    failed_release
+                } else {
+                    None
                 }
             }
-        }
-        self.witness(vm, None)?;
-        let (disposition, released) = match failed_release {
-            Some(failed) => failed,
-            None => launch.stop(&cancel, || true).await,
         };
-        let proof = released
-            .as_ref()
-            .filter(|held| held.matches(workspace.binding(), pair, ids))
-            .and_then(|_| {
-                read_pair(
-                    &workspace,
-                    pair,
-                    ids,
-                    Instant::now() + Duration::from_secs(20),
-                )
-                .ok()
-            })
-            .map(|files| (pair, files));
-        if let Some(worker) = stop {
-            let disposition = if proof.is_some() {
-                disposition
-            } else {
-                StopDisposition::ChargedQuarantine
-            };
-            controller.finish_offline_stop(
-                &worker.worker,
-                vm,
-                work.operation,
-                proof,
-                disposition,
-            )?;
-        } else if let Some(proof) = proof {
-            controller.native_record_release(vm, work.operation, proof, disposition)?;
+        self.witness(vm, None)?;
+        queue.close();
+        while let Ok((queued, _)) = queue.try_recv() {
+            controller.finish_script(&queued.worker, ScriptResult::Unavailable)?;
         }
-        Ok(())
+        let settlement = match failed_release {
+            Some(failed) => failed,
+            None => launch.stop_generation(&cancel, || true).await,
+        };
+        reconcile_release(
+            settlement,
+            &control.retry,
+            |(disposition, held)| {
+                if held
+                    .as_ref()
+                    .is_some_and(|held| held.matches(workspace.binding(), pair, ids))
+                    && let Ok(files) = read_pair(
+                        &workspace,
+                        pair,
+                        ids,
+                        Instant::now() + Duration::from_secs(20),
+                    )
+                {
+                    let mut running = self
+                        .running
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("TEST run custody lost"))?;
+                    let instance = running
+                        .get_mut(&vm)
+                        .ok_or_else(|| anyhow::anyhow!("TEST run custody lost"))?;
+                    if instance
+                        .stop_worker
+                        .as_ref()
+                        .is_some_and(|worker| Instant::now() < worker.deadline())
+                        && controller
+                            .native_running_epoch(&work.principal, vm)
+                            .ok()
+                            .flatten()
+                            == Some((pair.disk.generation, work.operation))
+                        && let Some(stop) = &instance.stop_worker
+                    {
+                        controller.finish_offline_stop(
+                            stop,
+                            vm,
+                            work.operation,
+                            Some((pair, files)),
+                            *disposition,
+                        )?;
+                        instance.stop_worker.take();
+                    } else {
+                        controller.native_record_release(
+                            vm,
+                            work.operation,
+                            (pair, files),
+                            *disposition,
+                        )?;
+                    }
+                    return Ok(true);
+                }
+                Ok(false)
+            },
+            || {
+                controller.native_quarantine(vm, work.operation)?;
+                {
+                    let mut running = self
+                        .running
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("TEST run custody lost"))?;
+                    let instance = running
+                        .get_mut(&vm)
+                        .ok_or_else(|| anyhow::anyhow!("TEST run custody lost"))?;
+                    if let Some(stop) = &instance.stop_worker {
+                        controller.finish_native_stop(stop, vm, work.operation)?;
+                        instance.stop_worker.take();
+                    }
+                }
+                Ok(())
+            },
+            async || launch.stop_generation(&cancel, || true).await,
+        )
+        .await
     }
 
     fn sealed_evidence(
@@ -1556,6 +1659,31 @@ fn native_identity(artifact: &Artifact) -> Result<FileIdentity, NativeRefusal> {
     crate::vm::runtime::test_issuer::artifact_identity(artifact).ok_or(PATH)
 }
 
+/// A bounded attempt can finish without proof. Keep the owned launch in the
+/// caller until evidence is recorded, and let a stop or reaper wake a retry.
+async fn reconcile_release<T>(
+    mut settlement: T,
+    wake: &tokio::sync::Notify,
+    mut record: impl FnMut(&T) -> anyhow::Result<bool>,
+    mut quarantine: impl FnMut() -> anyhow::Result<()>,
+    mut retry: impl AsyncFnMut() -> T,
+) -> anyhow::Result<()> {
+    let mut delay = Duration::from_secs(2);
+    loop {
+        if record(&settlement)? {
+            return Ok(());
+        }
+        drop(settlement);
+        quarantine()?;
+        tokio::select! {
+            _ = wake.notified() => {}
+            _ = tokio::time::sleep(delay) => {}
+        }
+        delay = (delay * 2).min(Duration::from_secs(60));
+        settlement = retry().await;
+    }
+}
+
 fn spawn_owned(
     gate: &mut Gate,
     supervisor: Arc<Supervisor>,
@@ -1685,7 +1813,8 @@ impl runtime::ReaperRuntime for NativeReaper<'_> {
         {
             if !matches!(work.kind, reaper::CleanupKind::Snapshot { .. }) {
                 item.witness = None;
-                item.cancel.cancel();
+                item.control.cancel.cancel();
+                item.control.retry.notify_one();
             }
             return unknown;
         }
