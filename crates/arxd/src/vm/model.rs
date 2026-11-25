@@ -190,6 +190,7 @@ pub enum Refusal {
     StaticBackupDeleteForbidden,
     SnapshotOfflineRequired,
     ComposeRecoveryRequired,
+    BackupLimit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,6 +303,7 @@ pub(crate) const HOST_REFUSAL_ACTION: i64 = 14;
 pub(crate) const PUBLISH_ACTION: i64 = 15;
 pub(crate) const UNPUBLISH_ACTION: i64 = 16;
 pub(crate) const SNAPSHOT_DELETE_ACTION: i64 = 18;
+pub(crate) const COMPOSE_BACKUP_ACTION: i64 = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]

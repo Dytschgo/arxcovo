@@ -1,5 +1,6 @@
 //! VM admission and confined runtime components. Native issuance is closed.
 pub(crate) mod compose;
+pub(crate) mod compose_backup;
 pub(crate) mod compose_secrets;
 pub mod console;
 mod controller;

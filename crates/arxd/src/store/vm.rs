@@ -109,7 +109,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 13;
+const VM_SCHEMA_VERSION: u32 = 14;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -584,6 +584,9 @@ impl VmStore {
         }
         if version < 13 {
             tx.execute_batch(publish::MIGRATE_V13)?;
+        }
+        if version < 14 {
+            tx.execute_batch(compose::MIGRATE_V14)?;
         }
         recover(&tx, now)?;
         check_size(&tx)?;
@@ -1416,7 +1419,9 @@ pub(crate) fn disk_bytes(db: &Connection) -> Result<Option<u64>> {
         UNION ALL SELECT staging FROM vm_static_instances
         UNION ALL SELECT charge FROM vm_restore_points
         UNION ALL SELECT persistent FROM vm_snapshot_work
-        UNION ALL SELECT staging FROM vm_snapshot_work",
+        UNION ALL SELECT staging FROM vm_snapshot_work
+        UNION ALL SELECT host_staging_charge FROM vm_compose_backups
+        UNION ALL SELECT retained_charge FROM vm_compose_backups",
     )?;
     let mut rows = stmt.query([])?;
     let mut total = 0u64;
@@ -4500,5 +4505,434 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn v13_migrates_forward_to_v14_preserving_state_and_enforcing_backup_invariants() -> Result<()>
+    {
+        // Build the v13 seed from the real fixtures so every NOT NULL column
+        // and foreign key matches a live v13 store.
+        let dir = private_temp();
+        let vm = [0x11u8; 16];
+        let (gen_id, seq_before, ledger_before) = {
+            let db = v6_fixture(dir.path());
+            db.execute_batch(MIGRATE_V7)?;
+            db.execute_batch(MIGRATE_V8)?;
+            db.execute_batch(MIGRATE_V9)?;
+            let slots = static_fixture(&db, vm, "v13-static")?;
+            commit_static(&db, vm, slots, 1)?;
+            let gen_id: Id = db.query_row(
+                "SELECT id FROM vm_generations WHERE static_id=?1 AND active=1",
+                [vm],
+                |row| row.get(0),
+            )?;
+            db.execute_batch(publish::MIGRATE_V10)?;
+            db.execute_batch(snapshot::MIGRATE_V11)?;
+            db.execute_batch(compose::MIGRATE_V12)?;
+            db.execute_batch(publish::MIGRATE_V13)?;
+            db.execute_batch(
+                "UPDATE sqlite_sequence SET seq=900 WHERE name='activity'; PRAGMA user_version=13;",
+            )?;
+            db.execute(
+                "INSERT INTO vm_compose_projects(vm,project) VALUES(?1,'calm-life')",
+                [vm],
+            )?;
+            db.execute(
+                "INSERT INTO vm_compose_volumes(vm,project,slot,uid,gid) VALUES(?1,'calm-life','data',10001,10001)",
+                [vm],
+            )?;
+            let seq = count(
+                &db,
+                "SELECT seq FROM sqlite_sequence WHERE name='activity'",
+                [],
+            )?;
+            (gen_id, seq, ledger_ids(&db)?)
+        };
+
+        let store = VmStore::open(dir.path(), NOW)?;
+        store.transact(|db| {
+            assert_eq!(count(db, "PRAGMA user_version", [])?, i64::from(VM_SCHEMA_VERSION));
+            assert_eq!(
+                count(db, "SELECT count(*) FROM vm_compose_projects WHERE vm=?1", [vm])?,
+                1
+            );
+            assert_eq!(ledger_ids(db)?, ledger_before);
+            assert_eq!(
+                count(db, "SELECT seq FROM sqlite_sequence WHERE name='activity'", [])?,
+                seq_before
+            );
+            assert_eq!(count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?, 0);
+            // Enroll backup target on migrated v13 volume.
+            compose::enroll_backup_target(db, vm, "calm-life", "data", "calm-life.sqlite3", 65_536)?;
+            // Insert settled backup and confirm disk_bytes includes retained_charge
+            // and immutability triggers block delete and state downgrade.
+            let b_id = [0x55u8; 16];
+            let op_id = [0x66u8; 16];
+            let before = disk_bytes(db)?.unwrap();
+            db.execute(
+                "INSERT INTO vm_compose_backups(
+                    id,operation_id,principal,vm,project,generation,boot,revision,volume,database,
+                    state,host_staging_charge,guest_staging_charge,retained_charge,size_bytes,sha256,created_ms,settled_ms
+                 ) VALUES(?1,?2,'alice',?3,'calm-life',?4,1,1,'data','calm-life.sqlite3',
+                    'settled',0,0,12345,12345,?5,1000,1001)",
+                params![b_id, op_id, vm, gen_id, [0x77u8; 32]],
+            )?;
+            assert_eq!(disk_bytes(db)?.unwrap() - before, 12_345);
+            assert!(
+                db.execute("DELETE FROM vm_compose_backups WHERE id=?1", [b_id])
+                    .is_err()
+            );
+            // Full immutability: updating ANY column on a settled row is refused.
+            for sql in [
+                "UPDATE vm_compose_backups SET state='cleaned', retained_charge=0 WHERE id=?1",
+                "UPDATE vm_compose_backups SET retained_charge=1 WHERE id=?1",
+                "UPDATE vm_compose_backups SET size_bytes=1 WHERE id=?1",
+                "UPDATE vm_compose_backups SET sha256=zeroblob(32) WHERE id=?1",
+            ] {
+                assert!(
+                    db.execute(sql, [b_id]).is_err(),
+                    "settled immutability trigger failed to block: {sql}"
+                );
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn v14_rollback_retry_retention_cap_retire_and_bounded_failed_rows() -> Result<()> {
+        // 1. Injected v14 upgrade failure rolls back cleanly and retries to v14.
+        let dir = private_temp();
+        let vm = [0x21u8; 16];
+        let (gen_id, seq_before, ledger_before) = {
+            let db = v6_fixture(dir.path());
+            db.execute_batch(MIGRATE_V7)?;
+            db.execute_batch(MIGRATE_V8)?;
+            db.execute_batch(MIGRATE_V9)?;
+            let slots = static_fixture(&db, vm, "v14-rollback")?;
+            commit_static(&db, vm, slots, 1)?;
+            let gen_id: Id = db.query_row(
+                "SELECT id FROM vm_generations WHERE static_id=?1 AND active=1",
+                [vm],
+                |row| row.get(0),
+            )?;
+            db.execute_batch(publish::MIGRATE_V10)?;
+            db.execute_batch(snapshot::MIGRATE_V11)?;
+            db.execute_batch(compose::MIGRATE_V12)?;
+            db.execute_batch(publish::MIGRATE_V13)?;
+            db.execute_batch(
+                "UPDATE sqlite_sequence SET seq=900 WHERE name='activity'; PRAGMA user_version=13;",
+            )?;
+            db.execute(
+                "INSERT INTO vm_compose_projects(vm,project,desired,last_revision,committed,committed_release,rendered_revision,rendered_release,settled_generation)
+                 VALUES(?1,'calm-life','started',1,NULL,NULL,NULL,NULL,?2)",
+                params![vm, gen_id],
+            )?;
+            // Inject a mid-migration failure AFTER activity is rebuilt by pre-creating
+            // vm_compose_backups so CREATE TABLE vm_compose_backups fails inside tx.
+            db.execute_batch("CREATE TABLE vm_compose_backups(stub INTEGER);")?;
+            let seq = count(
+                &db,
+                "SELECT seq FROM sqlite_sequence WHERE name='activity'",
+                [],
+            )?;
+            (gen_id, seq, ledger_ids(&db)?)
+        };
+        assert!(VmStore::open(dir.path(), NOW).is_err());
+        {
+            let db = Connection::open(dir.path().join("activity.sqlite3"))?;
+            assert_eq!(count(&db, "PRAGMA user_version", [])?, 13);
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT count(*) FROM sqlite_schema WHERE name='vm_compose_backup_targets'",
+                    []
+                )?,
+                0
+            );
+            assert_eq!(ledger_ids(&db)?, ledger_before);
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT seq FROM sqlite_sequence WHERE name='activity'",
+                    []
+                )?,
+                seq_before
+            );
+            db.execute_batch("DROP TABLE vm_compose_backups;")?;
+        }
+        let store = VmStore::open(dir.path(), NOW)?;
+        store.transact(|db| {
+            assert_eq!(count(db, "PRAGMA user_version", [])?, i64::from(VM_SCHEMA_VERSION));
+            assert_eq!(ledger_ids(db)?, ledger_before);
+            assert_eq!(count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?, 0);
+            // Set up two projects on the same VM with committed revisions and backup targets.
+            for (project, rel) in [("calm-life", [0xa1u8; 16]), ("second-app", [0xa2u8; 16])] {
+                db.execute(
+                    "INSERT OR IGNORE INTO vm_compose_projects(vm,project) VALUES(?1,?2)",
+                    params![vm, project],
+                )?;
+                db.execute(
+                    "INSERT INTO vm_compose_releases(vm,project,id,digest,manifest)
+                     VALUES(?1,?2,?3,?4,X'7B7D')",
+                    params![vm, project, rel, "a".repeat(64)],
+                )?;
+                db.execute(
+                    "UPDATE vm_compose_projects SET desired='started',last_revision=1,
+                     committed=1,committed_release=?3,rendered_revision=1,rendered_release=?3,
+                     settled_generation=?4 WHERE vm=?1 AND project=?2",
+                    params![vm, project, rel, gen_id],
+                )?;
+                db.execute(
+                    "INSERT INTO vm_compose_volumes(vm,project,slot,uid,gid) VALUES(?1,?2,'data',10001,10001)",
+                    params![vm, project],
+                )?;
+                compose::enroll_backup_target(db, vm, project, "data", "app.sqlite3", 65_536)?;
+            }
+            db.execute("UPDATE vm_static_instances SET state=2 WHERE id=?1", [vm])?;
+            compose::register_boot(db, vm, gen_id, 1)?;
+            Ok(())
+        })?;
+
+        let target1 = crate::vm::compose::Target {
+            vm,
+            project: "calm-life".into(),
+        };
+        let target2 = crate::vm::compose::Target {
+            vm,
+            project: "second-app".into(),
+        };
+        let req_key = |n: u64, ts: i64| crate::vm::RequestId {
+            key: {
+                let mut k = [0u8; 16];
+                k[..8].copy_from_slice(&n.to_be_bytes());
+                k
+            },
+            issued_at_ms: ts,
+        };
+
+        // 2. Failed, cleaned, and partial_uncertain rows do NOT count toward the 2-copy cap.
+        let mut t = NOW;
+        store.transact(|db| {
+            let i_clean = compose::admit_backup(
+                db,
+                "alice",
+                &target1,
+                req_key(1, t),
+                gen_id,
+                1,
+                t,
+                |_, _| Ok(Ok(())),
+            )?
+            .unwrap();
+            compose::settle_backup_failed(db, &i_clean, "backup_not_found", false, true, t)?;
+
+            let i_partial = compose::admit_backup(
+                db,
+                "alice",
+                &target1,
+                req_key(2, t),
+                gen_id,
+                1,
+                t,
+                |_, _| Ok(Ok(())),
+            )?
+            .unwrap();
+            compose::settle_backup_failed(db, &i_partial, "simulated_crash", false, false, t)?;
+            assert_eq!(compose::settled_backup_count(db, &target1)?, 0);
+
+            // Settle 2 backups on target1.
+            for n in [3u64, 4] {
+                let intent = compose::admit_backup(
+                    db,
+                    "alice",
+                    &target1,
+                    req_key(n, t),
+                    gen_id,
+                    1,
+                    t,
+                    |_, _| Ok(Ok(())),
+                )?
+                .unwrap();
+                compose::settle_backup_succeeded(
+                    db,
+                    &intent,
+                    4096,
+                    [n as u8; 32],
+                    1,
+                    [2; 16],
+                    [n as u8; 16],
+                    t,
+                )?;
+            }
+            // Settle-time cap re-check refuses settling a 3rd backup even if a
+            // real staging row bypassed admission (kills settle-time cap mutant G1).
+            let syn_op = [0xe1u8; 16];
+            let syn_bk = [0xe2u8; 16];
+            let syn_req = [0xe3u8; 16];
+            db.execute(
+                "INSERT INTO vm_compose_backups(
+                    id,operation_id,principal,vm,project,generation,boot,revision,volume,database,
+                    state,host_staging_charge,guest_staging_charge,retained_charge,created_ms
+                 ) VALUES(?1,?2,'alice',?3,'calm-life',?4,1,1,'data','app.sqlite3',
+                    'staging',65536,65536,0,?5)",
+                params![syn_bk, syn_op, vm, gen_id, t],
+            )?;
+            db.execute(
+                "INSERT INTO vm_compose_backup_ops(
+                    id,backup_id,principal,request,vm,project,generation,boot,revision,
+                    volume,database,max_bytes,valid_through_ms,sent,status
+                 ) VALUES(?1,?2,'alice',?3,?4,'calm-life',?5,1,1,'data','app.sqlite3',
+                    65536,?6,1,'pending')",
+                params![
+                    syn_op,
+                    syn_bk,
+                    syn_req,
+                    vm,
+                    gen_id,
+                    t + crate::vm::RETRY_WINDOW_MS
+                ],
+            )?;
+            let synthetic_intent = crate::vm::compose_backup::BackupIntent {
+                id: syn_op,
+                backup_id: syn_bk,
+                target: target1.clone(),
+                generation: gen_id,
+                boot: 1,
+                revision: 1,
+                volume: "data".into(),
+                database: "app.sqlite3".into(),
+                max_bytes: 65_536,
+                sent: true,
+                status: crate::vm::compose_backup::BackupOpStatus::Pending,
+                failure: None,
+                size_bytes: None,
+                sha256: None,
+                backup_state: crate::vm::compose_backup::BackupRecordState::Staging,
+                host_staging_charge: 65_536,
+                retained_charge: 0,
+            };
+            assert!(
+                compose::settle_backup_succeeded(
+                    db,
+                    &synthetic_intent,
+                    4096,
+                    [0xee; 32],
+                    1,
+                    [2; 16],
+                    [0xee; 16],
+                    t,
+                )
+                .is_err()
+            );
+            // Clean up synthetic staging row so it does not affect later checks.
+            compose::settle_backup_failed(db, &synthetic_intent, "backup_limit", false, true, t)?;
+            Ok(())
+        })?;
+        drop(store);
+
+        // 3. Reopen store: retention cap survives reopen and applies per project.
+        let store = VmStore::open(dir.path(), NOW)?;
+        store.transact(|db| {
+            let refused = compose::admit_backup(
+                db,
+                "alice",
+                &target1,
+                req_key(5, t),
+                gen_id,
+                1,
+                t,
+                |_, _| Ok(Ok(())),
+            )?;
+            assert!(matches!(
+                refused,
+                Err(crate::vm::compose_backup::BackupFault::BackupLimit)
+            ));
+            // Second project on the same VM can still admit a backup!
+            let i_other = compose::admit_backup(
+                db,
+                "alice",
+                &target2,
+                req_key(6, t),
+                gen_id,
+                1,
+                t,
+                |_, _| Ok(Ok(())),
+            )?
+            .unwrap();
+            // Retire trigger while backup is staging -> op interrupted + backup partial_uncertain.
+            db.execute("UPDATE vm_static_instances SET state=1 WHERE id=?1", [vm])?;
+            let replayed = compose::backup_replay(db, "alice", req_key(6, t).key)?.unwrap();
+            assert_eq!(
+                replayed.status,
+                crate::vm::compose_backup::BackupOpStatus::Interrupted
+            );
+            assert_eq!(replayed.failure.as_deref(), Some("retired_boot"));
+            assert_eq!(
+                replayed.backup_state,
+                crate::vm::compose_backup::BackupRecordState::PartialUncertain
+            );
+            assert_eq!(replayed.host_staging_charge, 65_536);
+            // Post-retire confirmed cleanup via settle_backup_failed updates the
+            // backup row even though the op row was already interrupted.
+            compose::settle_backup_failed(db, &i_other, "cancelled", true, true, t)?;
+            let after_clean = compose::backup_replay(db, "alice", req_key(6, t).key)?.unwrap();
+            assert_eq!(
+                after_clean.backup_state,
+                crate::vm::compose_backup::BackupRecordState::Cleaned
+            );
+            assert_eq!(after_clean.host_staging_charge, 0);
+
+            // Re-activate VM to test bounded failed rows across retry windows (B6).
+            db.execute("UPDATE vm_static_instances SET state=2 WHERE id=?1", [vm])?;
+            compose::register_boot(db, vm, gen_id, 2)?;
+            Ok(())
+        })?;
+
+        // 4. Loop 260 failed attempts across advancing retry windows: both
+        // vm_compose_backup_ops and vm_compose_backups stay bounded (<= 240
+        // cleaned/op rows plus the 2 settled + 1 partial_uncertain rows).
+        store.transact(|db| {
+            for i in 0u64..260 {
+                if i == 200 {
+                    t += crate::vm::RETRY_WINDOW_MS + 10_000;
+                }
+                let intent = compose::admit_backup(
+                    db,
+                    "alice",
+                    &target2,
+                    req_key(1000 + i, t),
+                    gen_id,
+                    2,
+                    t,
+                    |_, _| Ok(Ok(())),
+                )?
+                .unwrap();
+                compose::settle_backup_failed(db, &intent, "backup_not_found", false, true, t)?;
+            }
+            let ops_count = count(
+                db,
+                "SELECT count(*) FROM vm_compose_backup_ops WHERE principal='alice'",
+                [],
+            )?;
+            let cleaned_count = count(
+                db,
+                "SELECT count(*) FROM vm_compose_backups WHERE state='cleaned'",
+                [],
+            )?;
+            let settled_count = count(
+                db,
+                "SELECT count(*) FROM vm_compose_backups WHERE state='settled'",
+                [],
+            )?;
+            assert!(ops_count <= 240, "ops unbounded: {ops_count}");
+            assert!(
+                cleaned_count <= 240,
+                "cleaned backups unbounded: {cleaned_count}"
+            );
+            assert_eq!(settled_count, 2, "settled backups must never be pruned");
+            Ok(())
+        })?;
+        Ok(())
     }
 }

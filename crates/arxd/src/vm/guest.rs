@@ -296,10 +296,19 @@ fn read_error(error: std::io::Error) -> ChannelError {
 
 /// Compose-only channel over a pipe already verified by the boot supervisor.
 /// A timeout, invalid frame or mismatched reply permanently closes the channel.
+///
+/// The inner state is held behind an `Arc<AsyncMutex<_>>` so lifecycle and
+/// protected-backup workers serialize cleanly over the same physical serial
+/// transport without opening a second guest pipe.
 pub struct ComposeChannel {
+    inner: std::sync::Arc<tokio::sync::Mutex<ComposeChannelInner>>,
+    open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    generation: u64,
+}
+
+struct ComposeChannelInner {
     transport: Option<Box<dyn ComposeTransport>>,
     inbound: Inbound,
-    generation: u64,
     next_id: u32,
 }
 
@@ -341,11 +350,27 @@ impl ComposeChannel {
             return Err(ChannelError::Unexpected);
         }
         Ok(Self {
-            transport: Some(Box::new(transport)),
-            inbound,
+            inner: std::sync::Arc::new(tokio::sync::Mutex::new(ComposeChannelInner {
+                transport: Some(Box::new(transport)),
+                inbound,
+                next_id: 1,
+            })),
+            open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             generation,
-            next_id: 1,
         })
+    }
+
+    /// Returns a second handle referencing the same serialized physical pipe.
+    #[allow(
+        dead_code,
+        reason = "reserved for qualified Compose lifecycle/backup transport sharing"
+    )]
+    pub(crate) fn shared(&self) -> Self {
+        Self {
+            inner: std::sync::Arc::clone(&self.inner),
+            open: std::sync::Arc::clone(&self.open),
+            generation: self.generation,
+        }
     }
 
     pub fn generation(&self) -> u64 {
@@ -353,7 +378,7 @@ impl ComposeChannel {
     }
 
     pub(crate) fn is_open(&self) -> bool {
-        self.transport.is_some()
+        self.open.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) async fn exchange(
@@ -361,23 +386,49 @@ impl ComposeChannel {
         cancel: &Shutdown,
         request: impl FnOnce(u32) -> arx_guest::compose::ComposeRequest,
     ) -> anyhow::Result<arx_guest::compose::ComposeResponse> {
-        self.exchange_frame(cancel, request)
+        self.exchange_frame(cancel, FRAME_BOUND, request)
             .await
             .map_err(|_| anyhow::anyhow!("Compose guest exchange unavailable"))
+    }
+
+    pub(crate) async fn exchange_with_timeout(
+        &mut self,
+        cancel: &Shutdown,
+        timeout: Duration,
+        request: impl FnOnce(u32) -> arx_guest::compose::ComposeRequest,
+    ) -> Result<arx_guest::compose::ComposeResponse, ChannelError> {
+        self.exchange_frame(cancel, timeout, request).await
     }
 
     async fn exchange_frame(
         &mut self,
         cancel: &Shutdown,
+        timeout: Duration,
         request: impl FnOnce(u32) -> arx_guest::compose::ComposeRequest,
     ) -> Result<arx_guest::compose::ComposeResponse, ChannelError> {
         use arx_guest::compose::ComposeResponse::*;
-        let mut transport = self.transport.take().ok_or(ChannelError::Closed)?;
-        let id = self.next_id;
-        self.next_id = id.checked_add(1).ok_or(ChannelError::Closed)?;
-        let response = bounded(cancel, Instant::now() + FRAME_BOUND, async {
+        use std::sync::atomic::Ordering;
+
+        struct CloseOnDrop<'a>(&'a std::sync::atomic::AtomicBool, bool);
+        impl Drop for CloseOnDrop<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+        }
+
+        let mut state = self.inner.lock().await;
+        let Some(mut transport) = state.transport.take() else {
+            self.open.store(false, Ordering::Release);
+            return Err(ChannelError::Closed);
+        };
+        let mut guard = CloseOnDrop(&self.open, true);
+        let id = state.next_id;
+        state.next_id = id.checked_add(1).ok_or(ChannelError::Closed)?;
+        let response = bounded(cancel, Instant::now() + timeout, async {
             send_compose(&mut transport, request(id)).await?;
-            self.inbound.next_frame(&mut transport).await
+            state.inbound.next_frame(&mut transport).await
         })
         .await?;
         let echo = match &response {
@@ -388,13 +439,17 @@ impl ComposeChannel {
             | ComposeLogPage { id, .. }
             | ComposeRoutesInstalled { id, .. }
             | ComposeSecretAccepted { id, .. }
+            | ComposeBackupReady { id, .. }
+            | ComposeBackupData { id, .. }
+            | ComposeBackupReleased { id, .. }
             | ComposeRejected { id, .. } => *id,
             ComposeHelloAck { .. } => return Err(ChannelError::Unexpected),
         };
         if echo != id {
             return Err(ChannelError::Unexpected);
         }
-        self.transport = Some(transport);
+        state.transport = Some(transport);
+        guard.1 = false;
         Ok(response)
     }
 }

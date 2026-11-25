@@ -274,7 +274,7 @@ cleanup
 trap - EXIT
 rm -f "$dir"/*.deb
 rmdir "$dir"
-install -d -o root -g root -m 0700 "$target/var/lib/arx-compose" "$target/var/lib/arx-compose/empty" "$target/var/lib/arx-compose/docker-config" "$target/var/lib/docker/volumes"
+install -d -o root -g root -m 0700 "$target/var/lib/arx-compose" "$target/var/lib/arx-compose/empty" "$target/var/lib/arx-compose/docker-config" "$target/var/lib/arx-compose/backup-staging" "$target/var/lib/docker/volumes"
 install -d -m 0755 "$target/etc/systemd/system/arx-guest.service.d"
 cat > "$target/etc/systemd/system/arx-guest.service.d/compose.conf" <<'ARX_GUEST'
 [Unit]
@@ -298,5 +298,7 @@ test -z "$(swapon --noheadings)"
 test "$(findmnt -n -o FSTYPE --mountpoint /run/arx-compose/secrets)" = tmpfs
 test "$(stat -c '%U:%G:%a' /run/arx-compose/secrets)" = root:root:700
 test -z "$(find /run/arx-compose/secrets -mindepth 1 -maxdepth 1 -print -quit)"
+test "$(stat -c '%U:%G:%a' /var/lib/arx-compose/backup-staging)" = root:root:700
+test -z "$(find /var/lib/arx-compose/backup-staging -mindepth 1 -maxdepth 1 -print -quit)"
 printf '%s\n' ubuntu-noble-amd64-compose-v1 | cmp -s - /etc/arxcovo/compose-finalized
 "#;
