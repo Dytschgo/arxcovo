@@ -13,6 +13,10 @@ use rmcp::{
 use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc};
 
+#[cfg(windows)]
+#[path = "inventory/windows_console.rs"]
+mod windows_console;
+
 fn private_dir() -> tempfile::TempDir {
     // macOS exposes its temporary root through /var, a system symlink.
     // Resolve that trusted test root before creating a valid fixture; application
@@ -89,6 +93,11 @@ async fn dashboard_foreground_provisions_password_and_keeps_credentials_out_of_l
     drop(stdin);
     let setup = setup.wait_with_output().await.unwrap();
     assert!(setup.status.success(), "CLI refused synthetic fixture");
+    assert!(setup.stderr.is_empty(), "piped input unexpectedly prompted");
+    assert_eq!(
+        std::str::from_utf8(&setup.stdout).unwrap().trim_end(),
+        "Dashboard password saved for 'owner'. Sign in at the configured dashboard URL (http://localhost:<port> for local HTTP)."
+    );
     let hash = std::fs::read_to_string(state.join("dashboard-owner.phc")).unwrap();
     assert!(hash.starts_with("$argon2id$v=19$m=65536,t=3,p=1$"));
     assert!(!hash.contains(password));
