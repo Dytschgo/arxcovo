@@ -84,6 +84,8 @@ pub enum Stage {
     RestrictedTestNetwork,
     UbuntuRecipe,
     WindowsRecipe,
+    UbuntuInstalledEndpoint,
+    WindowsInstalledEndpoint,
     RestrictedOriginNetwork,
     StaticWebRecipe,
     PublicIpv4Network,
@@ -107,7 +109,7 @@ pub enum StageKind {
 
 // Every class shares the first fifteen stages; each class's installed
 // endpoint check follows its own network probe and recipe boots.
-const TEST: [Stage; 20] = [
+const TEST: [Stage; 21] = [
     Stage::Inputs,
     Stage::HostBaseline,
     Stage::Distribution,
@@ -125,8 +127,9 @@ const TEST: [Stage; 20] = [
     Stage::QmpChannel,
     Stage::RestrictedTestNetwork,
     Stage::UbuntuRecipe,
+    Stage::UbuntuInstalledEndpoint,
     Stage::WindowsRecipe,
-    Stage::InstalledGuestEndpoint,
+    Stage::WindowsInstalledEndpoint,
     Stage::Cleanup,
 ];
 const STATIC_ORIGIN: [Stage; 19] = [
@@ -218,6 +221,11 @@ impl Stage {
                 disks: 0,
                 network: true,
             }),
+            Self::UbuntuRecipe | Self::WindowsRecipe => Some(EffectPlan {
+                paused: false,
+                disks: 2,
+                network: true,
+            }),
             _ => None,
         }
     }
@@ -240,6 +248,8 @@ impl Stage {
             | Self::QemuPrelaunchPause
             | Self::FirstGuestExecution
             | Self::QmpChannel
+            | Self::UbuntuInstalledEndpoint
+            | Self::WindowsInstalledEndpoint
             | Self::InstalledGuestEndpoint => FileKind::WhpxQmpEndpoint,
             Self::RestrictedTestNetwork => FileKind::NetworkRestrictedTest,
             Self::UbuntuRecipe => FileKind::RecipeUbuntu,
@@ -408,6 +418,35 @@ pub struct FaultRecord {
     pub outer_free_bytes: u64,
 }
 
+/// Catalog identity and exact asset/recipe digest qualified by the run.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeIdentity {
+    pub recipe_id: [u8; 16],
+    pub recipe_sha256: Hash,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestRecipes {
+    pub ubuntu: RecipeIdentity,
+    pub windows: RecipeIdentity,
+}
+
+impl TestRecipes {
+    pub fn key(self) -> Hash {
+        digest(&serde_json::to_vec(&("arx-vm-test-recipes-v1", self)).expect("fixed recipe pair"))
+    }
+
+    fn valid(self) -> bool {
+        self.ubuntu.recipe_id == self.ubuntu.recipe_sha256[..16]
+            && self.ubuntu.recipe_id != self.windows.recipe_id
+            && self.windows.recipe_id == super::template::windows_recipe_id()
+            && self.ubuntu.recipe_sha256 != [0; 32]
+            && self.windows.recipe_sha256 != [0; 32]
+    }
+}
+
 /// Passed predicates for baseline and paused-trial stages.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -484,6 +523,15 @@ pub enum Observation {
         clean_guest_shutdown: bool,
         seed_released: bool,
     },
+    RestrictedNetworkWitness {
+        ipv4_and_ipv6_setup: bool,
+        reachable_gateway_control: bool,
+        validated_attempts: u8,
+        witness_receipts: u8,
+        witnesses_settled: bool,
+        clean_guest_shutdown: bool,
+        seed_charge_released: bool,
+    },
     SupervisorLoss {
         job_memory_limit_bytes: u64,
         job_cpu_rate: u32,
@@ -504,6 +552,35 @@ pub enum Observation {
     ReserveActivity {
         controlled_faults: Box<[FaultRecord; 4]>,
         console_transitions_ms: [u64; 5],
+    },
+    UbuntuRecipeVerified {
+        recipe: RecipeIdentity,
+        offline_installer: bool,
+        pinned_seed: bool,
+        detached_health: bool,
+        pair_unchanged: bool,
+        installed_isolation: bool,
+    },
+    WindowsRecipeVerified {
+        recipe: RecipeIdentity,
+        offline_setup_and_boot_next: bool,
+        signed_drivers: bool,
+        installed_readiness: bool,
+        disk_only_finalize: bool,
+        registry_generalized: bool,
+        state_ini_generalized: bool,
+        media_free_health: bool,
+        distinct_clone_identities: bool,
+        pair_unchanged: bool,
+        installed_isolation: bool,
+    },
+    TestInstalledEndpoint {
+        recipe: RecipeIdentity,
+        boot_identity: [u8; 16],
+        live_job_and_same_peer: bool,
+        nonce_bound_script: bool,
+        script_contained: bool,
+        clean_stop: bool,
     },
     PausedTrial {
         verified: bool,
@@ -648,6 +725,27 @@ impl Observation {
             // carry no evidence that the restricted backend denied a packet.
             (Stage::RestrictedTestNetwork, O::RestrictedNetworkLive { .. }) => false,
             (
+                Stage::RestrictedTestNetwork,
+                O::RestrictedNetworkWitness {
+                    ipv4_and_ipv6_setup,
+                    reachable_gateway_control,
+                    validated_attempts,
+                    witness_receipts,
+                    witnesses_settled,
+                    clean_guest_shutdown,
+                    seed_charge_released,
+                },
+            ) => {
+                origin == Origin::Native
+                    && *ipv4_and_ipv6_setup
+                    && *reachable_gateway_control
+                    && *validated_attempts == 8
+                    && *witness_receipts == 0
+                    && *witnesses_settled
+                    && *clean_guest_shutdown
+                    && *seed_charge_released
+            }
+            (
                 Stage::SupervisorLossRelease,
                 O::SupervisorLoss {
                     job_memory_limit_bytes,
@@ -717,6 +815,76 @@ impl Observation {
                     && console_transitions_ms[4] <= MAX_TRIAL_MS
             }
             (Stage::WhpxCapability, O::Whpx { present }) => *present,
+            (
+                Stage::UbuntuRecipe,
+                O::UbuntuRecipeVerified {
+                    recipe,
+                    offline_installer,
+                    pinned_seed,
+                    detached_health,
+                    pair_unchanged,
+                    installed_isolation,
+                },
+            ) => {
+                origin == Origin::Native
+                    && recipe.recipe_id == recipe.recipe_sha256[..16]
+                    && recipe.recipe_sha256 != [0; 32]
+                    && *offline_installer
+                    && *pinned_seed
+                    && *detached_health
+                    && *pair_unchanged
+                    && *installed_isolation
+            }
+            (
+                Stage::WindowsRecipe,
+                O::WindowsRecipeVerified {
+                    recipe,
+                    offline_setup_and_boot_next,
+                    signed_drivers,
+                    installed_readiness,
+                    disk_only_finalize,
+                    registry_generalized,
+                    state_ini_generalized,
+                    media_free_health,
+                    distinct_clone_identities,
+                    pair_unchanged,
+                    installed_isolation,
+                },
+            ) => {
+                origin == Origin::Native
+                    && recipe.recipe_id == super::template::windows_recipe_id()
+                    && recipe.recipe_sha256 != [0; 32]
+                    && *offline_setup_and_boot_next
+                    && *signed_drivers
+                    && *installed_readiness
+                    && *disk_only_finalize
+                    && *registry_generalized
+                    && *state_ini_generalized
+                    && *media_free_health
+                    && *distinct_clone_identities
+                    && *pair_unchanged
+                    && *installed_isolation
+            }
+            (
+                Stage::UbuntuInstalledEndpoint | Stage::WindowsInstalledEndpoint,
+                O::TestInstalledEndpoint {
+                    recipe,
+                    boot_identity,
+                    live_job_and_same_peer,
+                    nonce_bound_script,
+                    script_contained,
+                    clean_stop,
+                },
+            ) => {
+                origin == Origin::Native
+                    && recipe.recipe_id != [0; 16]
+                    && recipe.recipe_sha256 != [0; 32]
+                    && *boot_identity != [0; 16]
+                    && *live_job_and_same_peer
+                    && *nonce_bound_script
+                    && *script_contained
+                    && *clean_stop
+            }
             (Stage::DisposableStore, O::PausedStore { validated }) => {
                 origin == Origin::Native && *validated
             }
@@ -752,6 +920,10 @@ pub enum ProbeOutcome {
     MalformedReply,
     SocketError,
     NotAttempted,
+    DatagramSent,
+    Ipv6PathAbsent,
+    TimedOut,
+    RefusedOrReset,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1022,6 +1194,51 @@ pub struct Seal {
     pub manifest: Vec<ManifestEntry>,
 }
 
+/// Canonical files produced from a settled ordered chain. The native sink
+/// independently reopens and verifies these files before committing.
+pub struct SealBundle {
+    pub seal: Vec<u8>,
+    pub files: Vec<(FileKind, Vec<u8>)>,
+}
+
+pub fn produce_bundle(
+    origin: Origin,
+    binding: Binding,
+    records: &[Record],
+    finished_utc: u64,
+) -> Result<SealBundle, RunError> {
+    let files: Vec<_> = FileKind::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            let group: Vec<_> = records
+                .iter()
+                .filter(|row| row.stage.file() == kind)
+                .collect();
+            (!group.is_empty()).then(|| canonical(&group).map(|bytes| (kind, bytes)))
+        })
+        .collect::<Result<_, _>>()?;
+    let seal = Seal {
+        contract: CONTRACT,
+        collector: COLLECTOR,
+        origin,
+        binding,
+        finished_utc,
+        manifest: files
+            .iter()
+            .map(|(file, bytes)| ManifestEntry {
+                file: *file,
+                length: bytes.len() as u64,
+                sha256: digest(bytes),
+            })
+            .collect(),
+    };
+    check_bundle(&seal, &files, origin)?;
+    Ok(SealBundle {
+        seal: canonical(&seal)?,
+        files,
+    })
+}
+
 #[derive(Debug, Eq, PartialEq)]
 #[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
 pub enum RunError {
@@ -1100,6 +1317,14 @@ pub struct Fresh<'a> {
     pub dependencies: &'a Dependencies,
 }
 
+/// Selection evidence returned only after the native manifest, dependency
+/// projection and matching installed endpoint rows have been verified.
+#[derive(Debug, Eq, PartialEq)]
+pub struct VerifiedEvidence {
+    pub seal: Seal,
+    pub recipes: TestRecipes,
+}
+
 /// Read through a caller-owned evidence directory. The opener must use the
 /// held directory and refuse reparse points. Each name and declared size is
 /// checked before a row can be opened or allocated.
@@ -1109,7 +1334,7 @@ pub fn read_native<R: Read>(
     mut open_row: impl FnMut(FileKind) -> Result<R, RunError>,
     selection: &Selection,
     fresh: &Fresh<'_>,
-) -> Result<Seal, RunError> {
+) -> Result<VerifiedEvidence, RunError> {
     let seal_bytes = read_bounded(seal_file, seal_length)?;
     let seal = selected_seal(&seal_bytes, selection, fresh)?;
     let mut files = Vec::with_capacity(seal.manifest.len());
@@ -1119,8 +1344,8 @@ pub fn read_native<R: Read>(
             read_bounded(open_row(entry.file)?, entry.length)?,
         ));
     }
-    check_bundle(&seal, &files, Origin::Native)?;
-    Ok(seal)
+    let recipes = verify_native_rows(&seal, &files, fresh)?;
+    Ok(VerifiedEvidence { seal, recipes })
 }
 
 /// Verify a complete native bundle already in memory.
@@ -1131,7 +1356,22 @@ pub fn verify_native(
     fresh: &Fresh<'_>,
 ) -> Result<(), RunError> {
     let seal = selected_seal(seal_bytes, selection, fresh)?;
-    check_bundle(&seal, files, Origin::Native)
+    verify_native_rows(&seal, files, fresh).map(|_| ())
+}
+
+fn verify_native_rows(
+    seal: &Seal,
+    files: &[(FileKind, Vec<u8>)],
+    fresh: &Fresh<'_>,
+) -> Result<TestRecipes, RunError> {
+    let checked = bundle_rows(seal, files, Origin::Native)?;
+    let recipes = checked.recipes.ok_or(RunError::Incomplete)?;
+    if fresh.dependencies.recipes != Measured::Measured(recipes.key())
+        || fresh.now.mono_ms < checked.last_finished_ms
+    {
+        return Err(RunError::Untrusted);
+    }
+    Ok(recipes)
 }
 
 fn selected_seal(
@@ -1186,6 +1426,19 @@ pub fn check_bundle(
     files: &[(FileKind, Vec<u8>)],
     origin: Origin,
 ) -> Result<(), RunError> {
+    bundle_rows(seal, files, origin).map(|_| ())
+}
+
+struct BundleRows {
+    recipes: Option<TestRecipes>,
+    last_finished_ms: u64,
+}
+
+fn bundle_rows(
+    seal: &Seal,
+    files: &[(FileKind, Vec<u8>)],
+    origin: Origin,
+) -> Result<BundleRows, RunError> {
     let class = seal.binding.class;
     check_manifest(seal, origin)?;
     if files.len() != seal.manifest.len() {
@@ -1217,6 +1470,10 @@ pub fn check_bundle(
     }
     let mut previous = [0; 32];
     let mut when = 0;
+    let mut ubuntu = None;
+    let mut windows = None;
+    let mut ubuntu_endpoint = None;
+    let mut windows_endpoint = None;
     for (slot, stage) in by_position.into_iter().zip(sequence) {
         let record = slot.ok_or(RunError::Incomplete)?;
         if record.contract != CONTRACT
@@ -1235,8 +1492,60 @@ pub fn check_bundle(
         }
         when = record.finished_ms;
         previous = digest(&canonical(&record)?);
+        match (record.stage, record.result) {
+            (
+                Stage::UbuntuRecipe,
+                StageResult::Passed(Observation::UbuntuRecipeVerified { recipe, .. }),
+            ) => {
+                ubuntu = Some(recipe);
+            }
+            (
+                Stage::WindowsRecipe,
+                StageResult::Passed(Observation::WindowsRecipeVerified { recipe, .. }),
+            ) => {
+                windows = Some(recipe);
+            }
+            (
+                Stage::UbuntuInstalledEndpoint,
+                StageResult::Passed(Observation::TestInstalledEndpoint {
+                    recipe,
+                    boot_identity,
+                    ..
+                }),
+            ) => {
+                ubuntu_endpoint = Some((recipe, boot_identity));
+            }
+            (
+                Stage::WindowsInstalledEndpoint,
+                StageResult::Passed(Observation::TestInstalledEndpoint {
+                    recipe,
+                    boot_identity,
+                    ..
+                }),
+            ) => {
+                windows_endpoint = Some((recipe, boot_identity));
+            }
+            _ => {}
+        }
     }
-    Ok(())
+    let recipes = if origin == Origin::Native && class == Class::Test {
+        let (Some(ubuntu), Some(windows), Some((u, u_boot)), Some((w, w_boot))) =
+            (ubuntu, windows, ubuntu_endpoint, windows_endpoint)
+        else {
+            return Err(RunError::Incomplete);
+        };
+        let pair = TestRecipes { ubuntu, windows };
+        if (ubuntu, windows) != (u, w) || u_boot == w_boot || !pair.valid() {
+            return Err(RunError::Untrusted);
+        }
+        Some(pair)
+    } else {
+        None
+    };
+    Ok(BundleRows {
+        recipes,
+        last_finished_ms: when,
+    })
 }
 
 fn observations_within(record: &Record) -> bool {

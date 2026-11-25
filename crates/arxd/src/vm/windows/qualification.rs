@@ -8,6 +8,9 @@ mod capacity;
 pub(super) mod inventory;
 mod launch;
 pub(super) use launch::WorkspaceCustody;
+pub use launch::{RecipeProbe, RecipeProjection};
+mod network;
+pub(in crate::vm) use network::Targets as WitnessTargets;
 mod paused;
 mod schema;
 mod sink;
@@ -39,7 +42,7 @@ const OUTER_FLOOR: u64 = 50 * GIB;
 const RAM_RESERVE: u64 = 16 * GIB;
 const JOB_MEMORY_BYTES: usize = 2 * (1 << 30);
 const JOB_CPU_RATE: u32 = 2500;
-const MAX_ENROLLMENT_BYTES: u64 = 8192;
+const MAX_ENROLLMENT_BYTES: u64 = 16_384;
 /// Reviewed stock distribution manifest (ADR 0054).
 pub use crate::vm::qualification_record::STOCK_MANIFEST_SHA256 as STOCK_MANIFEST_1113_SHA256;
 /// Five seconds in WTS/FILETIME 100 ns units.
@@ -61,6 +64,9 @@ struct Enrollment {
     release: Option<ReleaseEnrollment>,
     storage: Option<test::StorageEnrollment>,
     network: Option<test::NetworkEnrollment>,
+    windows_setup_vars: Option<ReleaseImage>,
+    windows_recipe: Option<launch::WindowsEnrollment>,
+    ubuntu_guest: Option<ReleaseImage>,
     /// Enrolled witness account for the full TEST console-switch prompt loop.
     witness_session: Option<WitnessEnrollment>,
     stock_bundle: String,
@@ -361,6 +367,9 @@ struct Held {
     _release: Option<[PathPin; 2]>,
     scope: Option<test::Scope>,
     network: Option<test::NetworkInputs>,
+    windows_setup_vars: Result<launch::HeldAsset, NativeRefusal>,
+    windows_recipe: Result<launch::WindowsInputs, NativeRefusal>,
+    ubuntu_guest: Result<launch::HeldAsset, NativeRefusal>,
     witness_session: Option<WtsAccount>,
     trial: PathPin,
     _backing: PathPin,
@@ -372,6 +381,129 @@ struct Held {
 }
 
 impl Baseline {
+    pub fn recipe_projection(&self) -> Result<RecipeProjection, NativeRefusal> {
+        if !self._held.full_test {
+            return Err(NativeRefusal::QualificationMissing);
+        }
+        launch::project_recipes(self)
+    }
+
+    /// A settled full-TEST chain stays borrowed against its exact held
+    /// baseline, release and recipe projection through the marker rename.
+    pub fn publish_test_completion(
+        &self,
+        bundle: &crate::vm::qualification_record::SealBundle,
+        issued: crate::vm::qualification_record::Instant2,
+        cancel: &Shutdown,
+        clock: impl Fn() -> crate::vm::qualification_record::Instant2,
+        dependencies: &crate::vm::qualification_record::Dependencies,
+        projection: &RecipeProjection,
+    ) -> Result<(), SinkError> {
+        use crate::vm::qualification_record::Measured;
+        let held = &self._held;
+        if !held.full_test
+            || projection.run != self.run()
+            || projection.scope != self.scope()
+            || dependencies.install_media != Measured::Measured(projection.install_media)
+            || dependencies.recipes != Measured::Measured(projection.recipes.key())
+            || dependencies.firmware != Measured::Measured(projection.firmware)
+            || dependencies.network_topology != Measured::Measured(projection.network_topology)
+            || dependencies.guest_protocol != Measured::Measured(projection.guest_protocol)
+            || self
+                .observations
+                .reviewed_release
+                .map(Measured::Measured)
+                .as_ref()
+                != Some(&dependencies.artifact)
+        {
+            return Err(SinkError::Invalid);
+        }
+        self.evidence
+            .publish_complete(bundle, issued, cancel, clock, || {
+                let captured = self.paused_live().map_err(|_| SinkError::Invalid)?;
+                let scope = held.scope.as_ref().ok_or(SinkError::Invalid)?;
+                scope.validate_live().map_err(|_| SinkError::Invalid)?;
+                for volume in &held.volumes {
+                    if !capacity::still_bound(&capacity::MountManager, volume) {
+                        return Err(SinkError::Invalid);
+                    }
+                }
+                let (cpus, available) = host_resources().map_err(|_| SinkError::Invalid)?;
+                if cpus < 2
+                    || available < RAM_RESERVE + 7 * GIB
+                    || !hypervisor_present().map_err(|_| SinkError::Invalid)?
+                    || !matches!(&dependencies.host, Measured::Measured(host)
+                    if Ok(host.windows_build) == platform()
+                    && Ok(host.windows_revision) == windows_revision()
+                    && Ok(host.machine) == machine_guid())
+                    || !matches!(&dependencies.owner_profile, Measured::Measured(profile)
+                    if held.token.profile_key().is_ok_and(|live| &live == profile))
+                {
+                    return Err(SinkError::Invalid);
+                }
+                launch::revalidate_assets(self).map_err(|_| SinkError::Invalid)?;
+                let no_charge = |root: &PathPin, forbidden: &[&str]| {
+                    listing_bounded(
+                        &root.leaf,
+                        4096,
+                        Some(Instant::now() + Duration::from_secs(1)),
+                    )
+                    .is_ok_and(|entries| {
+                        entries.iter().all(|(entry, _)| {
+                            forbidden
+                                .iter()
+                                .all(|name| !entry.eq_ignore_ascii_case(name))
+                        })
+                    })
+                };
+                Ok(sink::PublishSample {
+                    dependencies,
+                    live_captured_ms: elapsed(self.origin).min(
+                        u64::try_from(captured.duration_since(self.origin).as_millis())
+                            .unwrap_or(u64::MAX),
+                    ),
+                    settled: no_charge(
+                        &scope.recipe.root,
+                        &[".arx-recipes-charge", ".arx-recipe-capacity-charge"],
+                    ) && no_charge(
+                        &held.trial,
+                        &[".arx-paused-trial-charge", ".arx-network-seed-charge"],
+                    ),
+                })
+            })
+    }
+
+    pub async fn run_ubuntu_recipe(&self, cancel: &Shutdown) -> Result<RecipeProbe, NativeRefusal> {
+        launch::run_ubuntu(self, cancel).await
+    }
+
+    pub fn ubuntu_guest_ready(&self) -> Result<(), NativeRefusal> {
+        self._held
+            .ubuntu_guest
+            .as_ref()
+            .map(|_| ())
+            .map_err(|reason| *reason)
+    }
+
+    pub async fn run_windows_recipe(
+        &self,
+        cancel: &Shutdown,
+    ) -> Result<RecipeProbe, NativeRefusal> {
+        launch::run_windows(self, cancel).await
+    }
+
+    pub fn windows_recipe_ready(&self) -> Result<(), NativeRefusal> {
+        self._held
+            .windows_setup_vars
+            .as_ref()
+            .map_err(|reason| *reason)?;
+        self._held
+            .windows_recipe
+            .as_ref()
+            .map(|_| ())
+            .map_err(|reason| *reason)
+    }
+
     /// Prepare the fixed owner-local trial from held, explicitly enrolled
     /// prerequisites. The caller must consume its permit to dispatch.
     ///
@@ -656,6 +788,37 @@ fn preflight_with(
     } else {
         None
     };
+    // A missing recipe asset blocks its own stage, after earlier evidence
+    // can be committed. The unmodified stock VARS is never a Setup fallback.
+    let recipe_asset = |input, cap| {
+        if !full_test {
+            return Err(NativeRefusal::InstallerPhaseUnavailable);
+        }
+        let held = launch::HeldAsset::open(input, &evidence_path, cap)?;
+        if test_scope
+            .as_ref()
+            .is_some_and(|scope| held.overlaps(&scope.recipe.root.path))
+        {
+            return Err(NativeRefusal::PathCustodyUnverified);
+        }
+        Ok(held)
+    };
+    let windows_setup_vars = recipe_asset(
+        enrollment.windows_setup_vars.as_ref(),
+        super::MAX_SETUP_VARS_BYTES,
+    );
+    let ubuntu_guest = recipe_asset(enrollment.ubuntu_guest.as_ref(), 32 * (1 << 20));
+    let windows_recipe = if full_test {
+        launch::WindowsInputs::open(
+            enrollment.windows_recipe,
+            &evidence_path,
+            test_scope
+                .as_ref()
+                .ok_or(NativeRefusal::QualificationMissing)?,
+        )
+    } else {
+        Err(NativeRefusal::InstallerPhaseUnavailable)
+    };
     let witness_session = match &enrollment.witness_session {
         Some(witness) => {
             let plain = |s: &str| !s.is_empty() && !s.contains('\\') && s.len() <= 128;
@@ -792,6 +955,9 @@ fn preflight_with(
             _release: release_pins,
             scope: test_scope,
             network,
+            windows_setup_vars,
+            windows_recipe,
+            ubuntu_guest,
             witness_session,
             trial: trial_pin,
             _backing: backing_pin,

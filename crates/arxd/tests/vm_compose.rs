@@ -145,4 +145,12 @@ fn compose_offline_closure_attests_order_medium_and_install_profiles() {
         "systemctl --root=\"$target\" mask docker.service docker.socket containerd.service nginx.service"
     ));
     assert!(has("$target/var/lib/arx-compose/backup-staging"));
+    assert!(!has("arxcovo-test"));
+    assert!(!has("60-arxcovo-test.yaml"));
+    let test_seed = base.render_test_seed([1; 16], guest).unwrap();
+    assert!(
+        test_seed
+            .windows(b"arxcovo-test".len())
+            .any(|window| window == b"arxcovo-test")
+    );
 }

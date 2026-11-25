@@ -108,6 +108,8 @@ pub enum PlanKind {
     Inspect,
     /// qemu-img inspection of a writable image, bound to an offline lease.
     InspectWritable,
+    /// qemu-img creation in a fresh slot held by private qualifier custody.
+    QualifierCreate,
     /// Mutating qemu-img operation, bound to an offline lease.
     Mutate,
 }
@@ -130,6 +132,8 @@ enum Binding<'a> {
     },
     Installer(InstallerPhase, Vec<InstallerArtifact<'a>>),
     Inspect,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    QualifierCreate,
     Offline {
         lease: &'a OfflineLease,
         mutate: bool,
@@ -168,6 +172,8 @@ impl<'a> CommandPlan<'a> {
             Binding::PublicEgress { .. } => PlanKind::PublicEgressBoot,
             Binding::Installer(phase, _) => PlanKind::InstallerBoot(phase),
             Binding::Inspect => PlanKind::Inspect,
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            Binding::QualifierCreate => PlanKind::QualifierCreate,
             Binding::Offline { mutate: false, .. } => PlanKind::InspectWritable,
             Binding::Offline { mutate: true, .. } => PlanKind::Mutate,
         }
@@ -201,6 +207,8 @@ impl<'a> CommandPlan<'a> {
     pub fn offline_lease(&self) -> Option<&'a OfflineLease> {
         match self.binding {
             Binding::Offline { lease, .. } => Some(lease),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            Binding::QualifierCreate => None,
             Binding::Boot
             | Binding::StaticWeb(_)
             | Binding::PublicEgress { .. }
@@ -470,6 +478,30 @@ fn create_args<'a>(
         size.to_string(),
     ]);
     Ok((role(image, ArtifactRole::QemuImg)?, args))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(super) fn qualifier_create<'a>(
+    image: &'a Artifact,
+    staging: &Artifact,
+    backing: Option<(&Artifact, &[u8])>,
+    size: u64,
+    ceiling: u64,
+) -> Result<CommandPlan<'a>, InvalidImage> {
+    let mut inputs = vec![
+        (ArtifactRole::QemuImg, image.clone()),
+        (ArtifactRole::Staging, staging.clone()),
+    ];
+    if let Some((golden, _)) = backing {
+        inputs.push((ArtifactRole::Golden, golden.clone()));
+    }
+    let (image, args) = create_args(image, staging, backing, size, ceiling)?;
+    Ok(CommandPlan {
+        image,
+        args,
+        binding: Binding::QualifierCreate,
+        inputs,
+    })
 }
 
 impl BootRecipe<'_> {

@@ -19,7 +19,7 @@
 //! outcome, and a retry uses a fresh empty directory.
 
 use super::*;
-use crate::vm::qualification_record::{self as records, FileKind, Fresh, Selection};
+use crate::vm::qualification_record::{self as records, Fresh, Instant2, SealBundle, Selection};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -83,6 +83,43 @@ pub enum SinkError {
     Invalid,
     Private,
     Io,
+}
+
+/// The independently collected live projection. Custody stays with the
+/// caller and the capture time precedes its first check.
+pub(super) struct PublishSample<'a> {
+    pub(super) dependencies: &'a records::Dependencies,
+    pub(super) live_captured_ms: u64,
+    pub(super) settled: bool,
+}
+
+impl<'a> PublishSample<'a> {
+    fn check(
+        &self,
+        now: Instant2,
+        issued: Instant2,
+        binding: records::Binding,
+        finished_utc: u64,
+    ) -> Result<Fresh<'a>, SinkError> {
+        if !self.settled
+            || self.live_captured_ms < issued.mono_ms
+            || now.mono_ms > records::MAX_TRIAL_MS
+            || now
+                .mono_ms
+                .checked_sub(self.live_captured_ms)
+                .is_none_or(|age| age > records::LIVE_FRESHNESS_MS)
+            || !records::clocks_agree(issued, now)
+            || !binding.live_at(now.utc, self.dependencies.key(binding.scope))
+            || now.utc < finished_utc
+        {
+            return Err(SinkError::Invalid);
+        }
+        Ok(Fresh {
+            now,
+            issued,
+            dependencies: self.dependencies,
+        })
+    }
 }
 
 /// One record as a caller publishes it. The writer adds the contract,
@@ -268,22 +305,37 @@ impl EvidenceDir {
     /// run is consumed and lacks a selection marker.
     pub(super) fn publish_complete<'a>(
         &self,
-        seal_bytes: &[u8],
-        files: &[(FileKind, Vec<u8>)],
-        mut fresh: impl FnMut() -> Result<Fresh<'a>, SinkError>,
+        bundle: &SealBundle,
+        issued: Instant2,
+        cancel: &crate::service::Shutdown,
+        clock: impl Fn() -> Instant2,
+        mut refresh: impl FnMut() -> Result<PublishSample<'a>, SinkError>,
     ) -> Result<(), SinkError> {
         if self.closed.replace(true) {
             return Err(SinkError::Closed);
         }
+        let SealBundle {
+            seal: seal_bytes,
+            files,
+        } = bundle;
         let seal: records::Seal = records::decode(seal_bytes).map_err(|_| SinkError::Invalid)?;
-        if seal.binding.run != self.run || seal.binding.scope != self.scope {
+        if seal.binding.run != self.run
+            || seal.binding.scope != self.scope
+            || seal.binding.issued_utc != issued.utc
+        {
             return Err(SinkError::Invalid);
         }
         let selection = Selection {
             seal_sha256: records::digest(seal_bytes),
             scope: self.scope,
         };
-        records::verify_native(seal_bytes, files, &selection, &fresh()?)
+        let check = |sample: &PublishSample<'a>| {
+            if cancel.is_cancelled() {
+                return Err(SinkError::Invalid);
+            }
+            sample.check(clock(), issued, seal.binding, seal.finished_utc)
+        };
+        records::verify_native(seal_bytes, files, &selection, &check(&refresh()?)?)
             .map_err(|_| SinkError::Invalid)?;
         if self.leaks(seal_bytes) || files.iter().any(|(_, bytes)| self.leaks(bytes)) {
             return Err(SinkError::Private);
@@ -296,7 +348,7 @@ impl EvidenceDir {
         // write/delete sharing across verification and the final rename.
         let mut held = Vec::with_capacity(files.len());
         records::read_native(
-            seal_bytes,
+            seal_bytes.as_slice(),
             seal_bytes.len() as u64,
             |kind| {
                 let file = open_relative(&self.pin.leaf, &kind.name(), Node::File, false, false)
@@ -306,17 +358,21 @@ impl EvidenceDir {
                 Ok(file)
             },
             &selection,
-            &fresh()?,
+            &check(&refresh()?)?,
         )
         .map_err(|_| SinkError::Invalid)?;
         self.commit_checked_at_rename(COMPLETE, seal_bytes, || {
+            let stale = |_| io::Error::other("qualification freshness unavailable");
+            let sample = refresh().map_err(stale)?;
             records::verify_native(
                 seal_bytes,
                 files,
                 &selection,
-                &fresh().map_err(|_| io::Error::other("qualification freshness unavailable"))?,
+                &check(&sample).map_err(stale)?,
             )
-            .map_err(|_| io::Error::other("qualification expired before publication"))
+            .map_err(|_| io::Error::other("qualification invalid before publication"))?;
+            check(&sample).map_err(stale)?;
+            Ok(())
         })
         .map_err(|_| SinkError::Io)?;
         drop(held);
@@ -945,6 +1001,417 @@ mod tests {
             Ok(vec![DiagnosticFile::WhpxQmpEndpoint]),
         );
         assert_eq!(names(&other_path), ["claim.json", "incomplete.json"]);
+    }
+
+    fn complete_test_fixture(
+        dir: &EvidenceDir,
+    ) -> (records::Dependencies, records::TestRecipes, SealBundle) {
+        use records::*;
+        let recipes = TestRecipes {
+            ubuntu: RecipeIdentity {
+                recipe_id: [7; 16],
+                recipe_sha256: [7; 32],
+            },
+            windows: RecipeIdentity {
+                recipe_id: crate::vm::template::windows_recipe_id(),
+                recipe_sha256: [8; 32],
+            },
+        };
+        let deps = Dependencies {
+            release: release(),
+            artifact: Measured::Measured([5; 32]),
+            host: Measured::Measured(HostDependency {
+                windows_build: 26_100,
+                windows_revision: 1,
+                machine: [1; 16],
+            }),
+            store: Measured::Measured(StoreDependency {
+                trial_volume: 1,
+                trial_volume_root: [1; 16],
+                trial_volume_guid: [2; 16],
+                trial_root: [3; 16],
+                outer_volume: 2,
+                outer_volume_root: [4; 16],
+                outer_volume_guid: [5; 16],
+                backing_file: [6; 16],
+                vhd_virtual_bytes: GIB,
+                inner_extent_bytes: GIB,
+                test_scope: Some([6; 32]),
+            }),
+            owner_profile: Measured::Measured([7; 32]),
+            distribution: Measured::Measured(DistributionDependency {
+                receipt: crate::vm::public_egress::STOCK_RECEIPT_1113_SHA256,
+                manifest: stock_manifest(),
+            }),
+            install_media: Measured::Measured([8; 32]),
+            recipes: Measured::Measured(recipes.key()),
+            firmware: Measured::Measured([10; 32]),
+            guest_protocol: Measured::Measured(1),
+            network_topology: Measured::Measured([11; 32]),
+            policy: PolicyDependency::CURRENT,
+        };
+        let binding = Binding {
+            class: Class::Test,
+            scope: dir.scope(),
+            release: release(),
+            run: dir.run(),
+            dependencies: deps.key(dir.scope()),
+            issued_utc: ISSUE.utc,
+            expires_utc: ISSUE.utc + MAX_VALIDITY,
+        };
+        let mut prior = [0; 32];
+        let chain: Vec<_> = stages(Class::Test)
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, stage)| {
+                let start = i as u64 * 100;
+                let result = StageResult::Passed(match stage {
+                    Stage::Inputs => Observation::InputPins {
+                        held_roots: HELD_ROOTS,
+                        enrollment_private: true,
+                        evidence_private: true,
+                        trial_root_private: true,
+                        evidence_claimed: true,
+                    },
+                    Stage::HostBaseline => Observation::Host {
+                        windows_build: 26_100,
+                        windows_revision: 1,
+                    },
+                    Stage::Distribution => Observation::Distribution {
+                        receipt: crate::vm::public_egress::STOCK_RECEIPT_1113_SHA256,
+                        receipt_bytes: STOCK_RECEIPT_BYTES,
+                        manifest: stock_manifest(),
+                        manifest_bytes: STOCK_MANIFEST_BYTES,
+                        payload_files: STOCK_PAYLOAD_FILES,
+                        payload_bytes: 1,
+                    },
+                    Stage::CustodyJobCapacityBaseline => Observation::Capacity {
+                        inner_caller_free_bytes: GIB,
+                        inner_total_free_bytes: GIB,
+                        inner_total_bytes: GIB,
+                        inner_extent_bytes: GIB,
+                        vhd_virtual_bytes: GIB,
+                        outer_caller_free_bytes: OUTER_FLOOR,
+                        outer_total_free_bytes: OUTER_FLOOR,
+                        backing_allocated_bytes: GIB,
+                        backing_length_bytes: GIB,
+                        disk_ceiling_bytes: DISK_CEILING,
+                        outer_floor_bytes: OUTER_FLOOR,
+                        disk_budget_bytes: GIB,
+                        empty_job_memory_limit_bytes: JOB_MEMORY_BYTES,
+                        empty_job_cpu_rate: JOB_CPU_RATE,
+                    },
+                    Stage::ActivityReservesBaseline => Observation::Activity {
+                        console_idle: true,
+                        active_cpus: 8,
+                        available_ram_bytes: 32 * GIB,
+                        owner_ram_reserve_bytes: RAM_RESERVE,
+                        owner_cpu_reserve: 4,
+                    },
+                    Stage::WhpxCapability => Observation::Whpx { present: true },
+                    Stage::DisposableStore => Observation::PausedStore { validated: true },
+                    Stage::SuspendedChild
+                    | Stage::QemuPrelaunchPause
+                    | Stage::HeldBundleInventory => Observation::PausedTrial { verified: true },
+                    Stage::FirstGuestExecution => Observation::FirmwareSec {
+                        sec_marker_verified: true,
+                        prelaunch_quiet: true,
+                        job_memory_limit_bytes: JOB_MEMORY_BYTES,
+                        job_cpu_rate: JOB_CPU_RATE,
+                        clean_release: true,
+                    },
+                    Stage::SupervisorLossRelease => Observation::SupervisorLoss {
+                        job_memory_limit_bytes: JOB_MEMORY_BYTES,
+                        job_cpu_rate: JOB_CPU_RATE,
+                        active_process_limit: 1,
+                        child_exited: true,
+                        job_empty_notified: true,
+                        dirty_release: true,
+                    },
+                    Stage::CapacityTrials => Observation::CapacityExercised {
+                        trial_allocated_bytes: 1 << 20,
+                        recipe_allocated_bytes: 1 << 20,
+                        denial_checks: 5,
+                        overlap_excluded: true,
+                        aggregate_cap_checked: true,
+                        trial_released: true,
+                        recipe_released: true,
+                    },
+                    Stage::ReserveActivityTrials => Observation::ReserveActivity {
+                        controlled_faults: Box::new(std::array::from_fn(|i| FaultRecord {
+                            fault: ControlledFault::ALL[i],
+                            sampled_ms: start + i as u64 * 2,
+                            settled_ms: start + i as u64 * 2 + 1,
+                            console_idle: true,
+                            effective_cpus: 8,
+                            available_ram_bytes: 32 * GIB,
+                            inner_free_bytes: GIB,
+                            outer_free_bytes: OUTER_FLOOR,
+                        })),
+                        console_transitions_ms: [10, 11, 12, 13, 14].map(|n| start + n),
+                    },
+                    Stage::QmpChannel => Observation::QmpFirmware {
+                        greeting_verified: true,
+                        whpx_enabled: true,
+                        quit_clean_eof: true,
+                        clean_release: true,
+                    },
+                    Stage::RestrictedTestNetwork => Observation::RestrictedNetworkWitness {
+                        ipv4_and_ipv6_setup: true,
+                        reachable_gateway_control: true,
+                        validated_attempts: 8,
+                        witness_receipts: 0,
+                        witnesses_settled: true,
+                        clean_guest_shutdown: true,
+                        seed_charge_released: true,
+                    },
+                    Stage::UbuntuRecipe => Observation::UbuntuRecipeVerified {
+                        recipe: recipes.ubuntu,
+                        offline_installer: true,
+                        pinned_seed: true,
+                        detached_health: true,
+                        pair_unchanged: true,
+                        installed_isolation: true,
+                    },
+                    Stage::WindowsRecipe => Observation::WindowsRecipeVerified {
+                        recipe: recipes.windows,
+                        offline_setup_and_boot_next: true,
+                        signed_drivers: true,
+                        installed_readiness: true,
+                        disk_only_finalize: true,
+                        registry_generalized: true,
+                        state_ini_generalized: true,
+                        media_free_health: true,
+                        distinct_clone_identities: true,
+                        pair_unchanged: true,
+                        installed_isolation: true,
+                    },
+                    Stage::UbuntuInstalledEndpoint | Stage::WindowsInstalledEndpoint => {
+                        let ubuntu = stage == Stage::UbuntuInstalledEndpoint;
+                        Observation::TestInstalledEndpoint {
+                            recipe: if ubuntu {
+                                recipes.ubuntu
+                            } else {
+                                recipes.windows
+                            },
+                            boot_identity: [if ubuntu { 1 } else { 2 }; 16],
+                            live_job_and_same_peer: true,
+                            nonce_bound_script: true,
+                            script_contained: true,
+                            clean_stop: true,
+                        }
+                    }
+                    Stage::Cleanup => Observation::Cleanup {
+                        dispatched_effects: 12,
+                        released: true,
+                        charge_retained: false,
+                        late: false,
+                    },
+                    _ => unreachable!("TEST stage"),
+                });
+                let row = Record {
+                    contract: CONTRACT,
+                    collector: COLLECTOR,
+                    origin: Origin::Native,
+                    binding,
+                    stage,
+                    started_ms: start,
+                    finished_ms: start + 16,
+                    prior,
+                    result,
+                };
+                prior = digest(&canonical(&row).unwrap());
+                row
+            })
+            .collect();
+        let bundle = produce_bundle(Origin::Native, binding, &chain, NOW.utc).unwrap();
+        (deps, recipes, bundle)
+    }
+
+    const ISSUE: Instant2 = Instant2 {
+        utc: 1_800_000_000,
+        mono_ms: 0,
+    };
+    const NOW: Instant2 = Instant2 {
+        utc: ISSUE.utc + 3,
+        mono_ms: 3000,
+    };
+
+    #[test]
+    fn complete_native_bundle_round_trips_both_recipes_through_the_held_directory() {
+        use records::{FileKind, Record};
+        let work = tempfile::tempdir().unwrap();
+        let (path, dir) = claimed(work.path(), &[]);
+        let (deps, recipes, bundle) = complete_test_fixture(&dir);
+        let calls = Cell::new(0);
+        dir.publish_complete(
+            &bundle,
+            ISSUE,
+            &crate::service::Shutdown::default(),
+            || NOW,
+            || {
+                let next = calls.get() + 1;
+                calls.set(next);
+                assert!(!names(&path).contains(&COMPLETE.to_owned()));
+                if next == 3 {
+                    for (kind, bytes) in &bundle.files {
+                        assert_eq!(read(&path, &kind.name()), *bytes);
+                        let path = path.join(&kind.name()).unwrap();
+                        assert!(
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .open(path.as_str())
+                                .is_err()
+                        );
+                    }
+                }
+                Ok(PublishSample {
+                    dependencies: &deps,
+                    live_captured_ms: NOW.mono_ms,
+                    settled: true,
+                })
+            },
+        )
+        .unwrap();
+        assert!(deps.complete());
+        assert_eq!(calls.get(), 3);
+        let marker = read(&path, COMPLETE);
+        assert_eq!(marker, bundle.seal);
+        assert!(!names(&path).contains(&DiagnosticFile::Incomplete.name().to_owned()));
+        let expected = [
+            FileKind::Inputs,
+            FileKind::HostBaseline,
+            FileKind::Distribution,
+            FileKind::CustodyJobCapacity,
+            FileKind::ActivityReserves,
+            FileKind::WhpxQmpEndpoint,
+            FileKind::NetworkRestrictedTest,
+            FileKind::RecipeUbuntu,
+            FileKind::RecipeWindows,
+            FileKind::Cleanup,
+        ];
+        let evidence = records::read_native(
+            marker.as_slice(),
+            marker.len() as u64,
+            |kind| Ok(std::io::Cursor::new(read(&path, &kind.name()))),
+            &Selection {
+                seal_sha256: records::digest(&marker),
+                scope: dir.scope(),
+            },
+            &Fresh {
+                now: NOW,
+                issued: ISSUE,
+                dependencies: &deps,
+            },
+        )
+        .unwrap();
+        assert_eq!(evidence.recipes, recipes);
+        assert_eq!(evidence.seal.binding.dependencies, deps.key(dir.scope()));
+        assert_eq!(evidence.seal.binding.issued_utc, ISSUE.utc);
+        assert_eq!(evidence.seal.finished_utc, NOW.utc);
+        assert_eq!(
+            evidence
+                .seal
+                .manifest
+                .iter()
+                .map(|row| row.file)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let mut actual_rows: Vec<Record> = evidence
+            .seal
+            .manifest
+            .iter()
+            .flat_map(|row| records::decode::<Vec<Record>>(&read(&path, &row.file.name())).unwrap())
+            .collect();
+        actual_rows.sort_by_key(|row| row.started_ms);
+        assert_eq!(
+            actual_rows.iter().map(|row| row.stage).collect::<Vec<_>>(),
+            records::stages(records::Class::Test)
+        );
+        assert_eq!(
+            dir.publish(&"test", &deps, ISSUE.utc, &entries(&[]), &body())
+                .unwrap_err(),
+            SinkError::Closed
+        );
+    }
+
+    #[test]
+    fn native_marker_rename_refuses_cancelled_stale_expired_drifted_and_unsettled_runs() {
+        for failure in [
+            "cancelled",
+            "stale",
+            "expired",
+            "utc rollback",
+            "drift",
+            "unsettled",
+        ] {
+            let work = tempfile::tempdir().unwrap();
+            let (path, dir) = claimed(work.path(), &[]);
+            let (deps, _, bundle) = complete_test_fixture(&dir);
+            let mut changed = deps.clone();
+            changed.firmware = records::Measured::Measured([39; 32]);
+            let cancel = crate::service::Shutdown::default();
+            let calls = Cell::new(0);
+            let clock = Cell::new(NOW);
+            let result = dir.publish_complete(
+                &bundle,
+                ISSUE,
+                &cancel,
+                || clock.get(),
+                || {
+                    let next = calls.get() + 1;
+                    calls.set(next);
+                    let at_rename = next == 3;
+                    if at_rename {
+                        assert!(names(&path).contains(&temporary_name(COMPLETE)));
+                        assert!(!names(&path).contains(&COMPLETE.to_owned()));
+                        match failure {
+                            "cancelled" => cancel.cancel(),
+                            "expired" => clock.set(Instant2 {
+                                utc: ISSUE.utc + records::MAX_TRIAL_MS / 1000 + 1,
+                                mono_ms: records::MAX_TRIAL_MS + 1000,
+                            }),
+                            "utc rollback" => clock.set(Instant2 {
+                                utc: ISSUE.utc - 1,
+                                mono_ms: NOW.mono_ms,
+                            }),
+                            "stale" => clock.set(Instant2 {
+                                utc: NOW.utc + 6,
+                                mono_ms: NOW.mono_ms + 6000,
+                            }),
+                            _ => {}
+                        }
+                    }
+                    Ok(PublishSample {
+                        dependencies: if at_rename && failure == "drift" {
+                            &changed
+                        } else {
+                            &deps
+                        },
+                        live_captured_ms: if failure == "stale" {
+                            NOW.mono_ms
+                        } else {
+                            clock.get().mono_ms
+                        },
+                        settled: !(at_rename && failure == "unsettled"),
+                    })
+                },
+            );
+            assert_eq!(calls.get(), 3, "{failure}");
+            assert_eq!(result, Err(SinkError::Io), "{failure}");
+            assert!(!names(&path).contains(&COMPLETE.to_owned()), "{failure}");
+            assert!(
+                !names(&path).contains(&temporary_name(COMPLETE)),
+                "{failure}"
+            );
+            assert_eq!(
+                dir.publish(&"test", &deps, ISSUE.utc, &entries(&[]), &body())
+                    .unwrap_err(),
+                SinkError::Closed
+            );
+        }
     }
 
     #[test]

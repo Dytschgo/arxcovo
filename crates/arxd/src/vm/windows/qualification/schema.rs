@@ -72,6 +72,8 @@ pub(super) const STAGES: &[&str] = &[
     "restricted_test_network",
     "ubuntu_recipe",
     "windows_recipe",
+    "ubuntu_installed_endpoint",
+    "windows_installed_endpoint",
     "restricted_origin_network",
     "static_web_recipe",
     "public_ipv4_network",
@@ -173,6 +175,10 @@ const NETWORK_GUEST: &[(&str, Shape)] = &[
                 "malformed_reply",
                 "socket_error",
                 "not_attempted",
+                "datagram_sent",
+                "ipv6_path_absent",
+                "timed_out",
+                "refused_or_reset",
             ]),
             8,
         ),
@@ -184,6 +190,11 @@ const NETWORK_DIAGNOSTIC: Shape = Shape::Object(&[
     ("host_controls_post", Shape::Bool),
     ("clean_guest_shutdown", Shape::Bool),
     ("seed_charge_released", Shape::Bool),
+]);
+
+const RECIPE_IDENTITY: Shape = Shape::Object(&[
+    ("recipe_id", Shape::Bytes(16)),
+    ("recipe_sha256", Shape::Bytes(32)),
 ]);
 
 const INCOMPLETE: &[(&str, Shape)] = &[
@@ -201,6 +212,56 @@ const INCOMPLETE: &[(&str, Shape)] = &[
 
 /// Every observation kind and its fields, in declaration order.
 const OBSERVATIONS: &[(&str, &[(&str, Shape)])] = &[
+    (
+        "ubuntu_recipe_verified",
+        &[
+            ("recipe", RECIPE_IDENTITY),
+            ("offline_installer", Shape::Bool),
+            ("pinned_seed", Shape::Bool),
+            ("detached_health", Shape::Bool),
+            ("pair_unchanged", Shape::Bool),
+            ("installed_isolation", Shape::Bool),
+        ],
+    ),
+    (
+        "windows_recipe_verified",
+        &[
+            ("recipe", RECIPE_IDENTITY),
+            ("offline_setup_and_boot_next", Shape::Bool),
+            ("signed_drivers", Shape::Bool),
+            ("installed_readiness", Shape::Bool),
+            ("disk_only_finalize", Shape::Bool),
+            ("registry_generalized", Shape::Bool),
+            ("state_ini_generalized", Shape::Bool),
+            ("media_free_health", Shape::Bool),
+            ("distinct_clone_identities", Shape::Bool),
+            ("pair_unchanged", Shape::Bool),
+            ("installed_isolation", Shape::Bool),
+        ],
+    ),
+    (
+        "test_installed_endpoint",
+        &[
+            ("recipe", RECIPE_IDENTITY),
+            ("boot_identity", Shape::Bytes(16)),
+            ("live_job_and_same_peer", Shape::Bool),
+            ("nonce_bound_script", Shape::Bool),
+            ("script_contained", Shape::Bool),
+            ("clean_stop", Shape::Bool),
+        ],
+    ),
+    (
+        "restricted_network_witness",
+        &[
+            ("ipv4_and_ipv6_setup", Shape::Bool),
+            ("reachable_gateway_control", Shape::Bool),
+            ("validated_attempts", Shape::Uint(8)),
+            ("witness_receipts", Shape::Uint(7)),
+            ("witnesses_settled", Shape::Bool),
+            ("clean_guest_shutdown", Shape::Bool),
+            ("seed_charge_released", Shape::Bool),
+        ],
+    ),
     (
         "input_pins",
         &[
@@ -441,16 +502,27 @@ fn rules(file: DiagnosticFile) -> Rules {
                 "qemu_prelaunch_pause",
                 "first_guest_execution",
                 "qmp_channel",
+                "ubuntu_installed_endpoint",
+                "windows_installed_endpoint",
                 "installed_guest_endpoint",
             ],
-            &["whpx", "paused_trial", "firmware_sec", "qmp_firmware"],
+            &[
+                "whpx",
+                "paused_trial",
+                "firmware_sec",
+                "qmp_firmware",
+                "test_installed_endpoint",
+            ],
         ),
         F::NetworkRestrictedTest => Rules {
             network_diagnostic: true,
-            ..records(&["restricted_test_network"], &[])
+            ..records(
+                &["restricted_test_network"],
+                &["restricted_network_witness"],
+            )
         },
-        F::RecipeUbuntu => records(&["ubuntu_recipe"], &[]),
-        F::RecipeWindows => records(&["windows_recipe"], &[]),
+        F::RecipeUbuntu => records(&["ubuntu_recipe"], &["ubuntu_recipe_verified"]),
+        F::RecipeWindows => records(&["windows_recipe"], &["windows_recipe_verified"]),
         F::NetworkRestrictedOrigin => records(&["restricted_origin_network"], &[]),
         F::RecipeStaticWeb => records(&["static_web_recipe"], &[]),
         F::NetworkPublicIpv4 => records(&["public_ipv4_network"], &[]),

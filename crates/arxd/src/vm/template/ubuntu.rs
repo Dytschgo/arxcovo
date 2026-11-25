@@ -262,6 +262,33 @@ printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
             .map_err(|error| RecipeError::Write(error.kind()))
     }
 
+    /// Installer-side late command appended only by TEST Ubuntu seeds. It
+    /// leaves `/etc/netplan/00-installer-config.yaml` intact so the offline
+    /// installer network stays off, and adds the installed VirtIO TEST route.
+    pub const TEST_ROUTE_COMMAND: &str = r#"set -eu
+umask 077
+file=/target/etc/netplan/60-arxcovo-test.yaml
+test ! -e "$file"
+test ! -L "$file"
+cat > "$file" <<'ARX_NETPLAN'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    arxcovo-test:
+      match:
+        driver: virtio_net
+      dhcp4: true
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      routes:
+        - to: default
+          via: 10.0.2.2
+ARX_NETPLAN
+chmod 0600 "$file"
+"#;
+
     /// Encode the seed for offline inspection in memory. This verifies the
     /// embedded assets only. Staging media for a build requires `write_seed`,
     /// which also verifies the pinned host-side assets and specific ISO.
@@ -272,6 +299,104 @@ printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
             .write(&mut bytes)
             .map_err(|error| RecipeError::Write(error.kind()))?;
         Ok(bytes)
+    }
+
+    /// Encode the Ubuntu TEST seed for offline inspection in memory. Appends
+    /// the TEST-only VirtIO netplan late command without modifying the shared
+    /// offline finalizer or NoCloud profile pin.
+    pub fn render_test_seed(&self, build_id: Id, guest: &[u8]) -> Result<Vec<u8>, RecipeError> {
+        let mut out = Vec::new();
+        append_test_route_seed(&self.render_seed(build_id, guest)?, &mut out)?;
+        Ok(out)
+    }
+
+    /// Verify all pinned host-side and embedded assets via `write_seed` before
+    /// writing the Ubuntu TEST seed with the TEST-only netplan late command.
+    pub fn write_test_seed(
+        &self,
+        assets: UbuntuAssets<'_>,
+        build_id: Id,
+        guest: &[u8],
+        out: impl Write,
+    ) -> Result<(), RecipeError> {
+        let mut base = Vec::new();
+        self.write_seed(assets, build_id, guest, &mut base)?;
+        append_test_route_seed(&base, out)
+    }
+
+    /// Compute the sealed Ubuntu TEST recipe digest over the recipe ID,
+    /// seven external asset pins, and the embedded TEST recipe content
+    /// (service unit, shared finalizer, NoCloud profile pin, TEST route late
+    /// command, detached health script, and canonical NoCloud documents).
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    pub(in crate::vm) fn test_recipe_digest(&self) -> Result<[u8; 32], RecipeError> {
+        let schema = required(self.nocloud_schema)?;
+        verify_nocloud_profile(schema)?;
+        let user = user_data(
+            required(self.guest)?,
+            required(self.service)?,
+            required(self.finalize)?,
+        );
+        let meta = nocloud_meta(TEST_RECIPE_DIGEST_BUILD_ID);
+        let test_user = append_test_route_user_data(&user)?;
+        self.test_recipe_digest_with(
+            Self::SERVICE,
+            Self::FINALIZE,
+            Self::NOCLOUD_PROFILE_PIN,
+            Self::TEST_ROUTE_COMMAND,
+            DETACHED_HEALTH,
+            (&meta, &test_user),
+        )
+    }
+
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    fn test_recipe_digest_with(
+        &self,
+        service_bytes: &[u8],
+        finalize_bytes: &[u8],
+        nocloud_profile: AssetPin,
+        test_route_command: &str,
+        detached_health: &str,
+        (meta, user): (&str, &str),
+    ) -> Result<[u8; 32], RecipeError> {
+        let service = required(self.service)?;
+        let finalize = required(self.finalize)?;
+        let schema = required(self.nocloud_schema)?;
+        service.verify(service_bytes)?;
+        finalize.verify(finalize_bytes)?;
+        if schema.length != nocloud_profile.length || schema.sha256 != nocloud_profile.sha256 {
+            return Err(RecipeError::Unqualified);
+        }
+        let mut hash = Sha256::new()
+            .chain_update(b"arxcovo.recipe.ubuntu-test.v2\0")
+            .chain_update(Self::ID);
+        for pin in [
+            self.iso,
+            self.kernel,
+            self.initrd,
+            self.guest,
+            self.firmware_code,
+            self.firmware_vars,
+            self.qemu_receipt,
+        ] {
+            let pin = required(pin)?;
+            hash.update(pin.length.to_be_bytes());
+            hash.update(pin.sha256);
+        }
+        for bytes in [
+            service_bytes,
+            finalize_bytes,
+            test_route_command.as_bytes(),
+            detached_health.as_bytes(),
+            meta.as_bytes(),
+            user.as_bytes(),
+        ] {
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(Sha256::digest(bytes));
+        }
+        hash.update(nocloud_profile.length.to_be_bytes());
+        hash.update(nocloud_profile.sha256);
+        Ok(hash.finalize().into())
     }
 
     fn seed_config(&self, build_id: Id, guest: &[u8]) -> Result<(String, String), RecipeError> {
@@ -285,36 +410,49 @@ printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
         guest_pin.verify(guest)?;
         service.verify(Self::SERVICE)?;
         finalize.verify(Self::FINALIZE)?;
-        let expected = Self::NOCLOUD_PROFILE_PIN;
-        if schema.length != expected.length || schema.sha256 != expected.sha256 {
-            return Err(RecipeError::Unqualified);
-        }
-        let separator: &[u8] = b"\0";
-        schema.verify(
-            Self::NOCLOUD_SCHEMA
-                .chain(separator)
-                .chain(USER_DATA_TEMPLATE.as_bytes())
-                .chain(separator)
-                .chain(Self::SERVICE)
-                .chain(separator)
-                .chain(Self::FINALIZE)
-                .chain(separator)
-                .chain(Self::ACCOUNT_AUDIT_SERVICE)
-                .chain(separator)
-                .chain(Self::ACCOUNT_AUDIT_SCRIPT),
-        )?;
-        let meta = format!(
-            "instance-id: arx-install-{}\nlocal-hostname: arxcovo\n",
-            hex::encode(build_id),
-        );
-        Ok((meta, user_data(guest_pin, service, finalize)))
+        verify_nocloud_profile(schema)?;
+        Ok((
+            nocloud_meta(build_id),
+            user_data(guest_pin, service, finalize),
+        ))
     }
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+const TEST_RECIPE_DIGEST_BUILD_ID: Id = [0; 16];
+
+fn nocloud_meta(build_id: Id) -> String {
+    format!(
+        "instance-id: arx-install-{}\nlocal-hostname: arxcovo\n",
+        hex::encode(build_id),
+    )
+}
+
+fn verify_nocloud_profile(schema: AssetPin) -> Result<(), RecipeError> {
+    let expected = UbuntuRecipe::NOCLOUD_PROFILE_PIN;
+    if schema.length != expected.length || schema.sha256 != expected.sha256 {
+        return Err(RecipeError::Unqualified);
+    }
+    let separator: &[u8] = b"\0";
+    schema.verify(
+        UbuntuRecipe::NOCLOUD_SCHEMA
+            .chain(separator)
+            .chain(USER_DATA_TEMPLATE.as_bytes())
+            .chain(separator)
+            .chain(UbuntuRecipe::SERVICE)
+            .chain(separator)
+            .chain(UbuntuRecipe::FINALIZE)
+            .chain(separator)
+            .chain(UbuntuRecipe::ACCOUNT_AUDIT_SERVICE)
+            .chain(separator)
+            .chain(UbuntuRecipe::ACCOUNT_AUDIT_SCRIPT),
+    )
 }
 
 /// Probe-only NoCloud seed. The live guest reports the launch nonce, NIC
 /// setup observations and socket outcomes from a fixed program. The seed has no
 /// autoinstall stanza, guest service, bootloader action or credential.
-#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+#[cfg(test)]
 pub(in crate::vm) fn network_probe_seed(
     nonce: &[u8; 16],
     targets: &crate::vm::guest::network_probe::Targets,
@@ -346,6 +484,51 @@ pub(in crate::vm) fn network_probe_seed(
     )
     .expect("String write");
     script.push_str(PROBE_BODY);
+    script.push_str(PROBE_ENTRY);
+    write_probe_seed(&encoded_nonce, &script)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(in crate::vm) fn network_witness_seed(
+    nonce: &[u8; 16],
+    targets: &crate::vm::windows::qualification::WitnessTargets,
+) -> Result<Vec<u8>, RecipeError> {
+    network_witness_seed_for(nonce, targets.tcp, targets.udp, targets.dns)
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn network_witness_seed_for(
+    nonce: &[u8; 16],
+    tcp: [std::net::SocketAddr; 3],
+    udp: [std::net::SocketAddr; 3],
+    dns: std::net::SocketAddr,
+) -> Result<Vec<u8>, RecipeError> {
+    use std::fmt::Write;
+    let encoded_nonce = hex::encode(nonce);
+    let mut script = String::from(PROBE_START);
+    writeln!(script, "NONCE = bytes.fromhex({encoded_nonce:?})").expect("String write");
+    for (kind, addresses) in [("TCP", tcp), ("UDP", udp)] {
+        writeln!(script, "{kind} = [").expect("String write");
+        for address in addresses {
+            writeln!(
+                script,
+                "    ({:?}, {}),",
+                address.ip().to_string(),
+                address.port()
+            )
+            .expect("String write");
+        }
+        writeln!(script, "]").expect("String write");
+    }
+    writeln!(script, "DNS = ({:?}, {})", dns.ip().to_string(), dns.port()).expect("String write");
+    script.push_str(PROBE_BODY);
+    script.push_str(WITNESS_ENTRY);
+    write_probe_seed(&encoded_nonce, &script)
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn write_probe_seed(encoded_nonce: &str, script: &str) -> Result<Vec<u8>, RecipeError> {
+    use std::fmt::Write;
     let mut cloud = String::from(
         "#cloud-config\nwrite_files:\n  - path: /run/arxcovo-network-probe.py\n    permissions: '0600'\n    content: |\n",
     );
@@ -431,22 +614,25 @@ def probe_dns(target, bind_v4):
             conn.connect(target)
             conn.send(payload)
             reply = conn.recv(512)
-            if (
-                len(reply) >= len(payload)
-                and reply[:2] == ident
-                and (reply[2] & 0x80) != 0
-                and ((reply[2] >> 3) & 0x0f) == 0
-                and (reply[2] & 0x02) == 0
-                and (reply[3] & 0x0f) in (0, 3)
-                and reply[4:6] == b'\x00\x01'
-                and reply[12:len(payload)] == question
-            ):
-                return 'R'
-            return 'M'
+            return dns_reply(payload, reply)
     except OSError:
         return 'E'
 
-def run_probes(devices):
+def dns_reply(query, reply):
+    if (
+        len(reply) >= len(query)
+        and reply[:2] == query[:2]
+        and (reply[2] & 0x80) != 0
+        and ((reply[2] >> 3) & 0x0f) == 0
+        and (reply[2] & 0x02) == 0
+        and (reply[3] & 0x0f) in (0, 3)
+        and reply[4:6] == b'\x00\x01'
+        and reply[12:len(query)] == query[12:]
+    ):
+        return 'R'
+    return 'M'
+
+def nic_setup(devices):
     ports = [p for p in devices if p.name != 'lo']
     nic_ready = (
         len(ports) == 1
@@ -476,6 +662,10 @@ def run_probes(devices):
 
     ipv4_lease = guest_v4 == '10.0.2.15'
     setup = ''.join('1' if flag else '0' for flag in (nic_ready, ipv4_lease, default_route, no_v6))
+    return setup, guest_v4, ports[0].name if nic_ready else None
+
+def run_probes(devices):
+    setup, guest_v4, _ = nic_setup(devices)
     if setup == '1111':
         outcomes = ''.join(probe_tcp(t, guest_v4) for t in TCP)
         outcomes += probe_dns(DNS, guest_v4) + probe_dns(('10.0.2.3', 53), guest_v4)
@@ -483,7 +673,10 @@ def run_probes(devices):
         outcomes = 'E' * 8
 
     return setup, outcomes
+"#;
 
+#[cfg(test)]
+const PROBE_ENTRY: &str = r#"
 if __name__ == '__main__':
     port = pathlib.Path('/dev/virtio-ports/org.arxcovo.agent.0')
     for _ in range(40):
@@ -497,7 +690,183 @@ if __name__ == '__main__':
             wire.write(b'ARXNET2 ' + NONCE.hex().encode('ascii') + b' ' + setup.encode('ascii') + b' ' + outcomes.encode('ascii') + b'\n')
 "#;
 
-pub(super) const DETACHED_HEALTH: &str = r#"set -eu
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+const WITNESS_ENTRY: &str = r#"
+import errno
+
+def witness_attempt(target, source, nic, tcp, payload=b''):
+    v6 = ':' in target[0]
+    family = socket.AF_INET6 if v6 else socket.AF_INET
+    mode = socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM
+    try:
+        with socket.socket(family, mode) as conn:
+            conn.settimeout(1.0)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, nic.encode('ascii') + b'\0')
+            if not v6:
+                conn.bind((source, 0))
+            try:
+                if tcp:
+                    conn.connect(target)
+                    return 'R'
+                return 'S' if conn.sendto(payload, target) == len(payload) else 'E'
+            except TimeoutError:
+                return 'T'
+            except OSError as error:
+                if v6 and error.errno in (errno.ENETUNREACH, errno.EADDRNOTAVAIL):
+                    return 'L'
+                if not v6 and tcp and error.errno in (errno.ECONNREFUSED, errno.ECONNRESET):
+                    return 'F'
+                return 'E'
+    except OSError:
+        return 'E'
+
+def gateway_reachable(nic):
+    try:
+        reply = subprocess.run(['ip', '-4', 'neigh', 'get', '10.0.2.2', 'dev', nic],
+                               timeout=1, check=True, capture_output=True).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(reply and reply[0] == b'10.0.2.2' and b'lladdr' in reply and b'REACHABLE' in reply)
+
+def witness_dns(target, source, nic, query):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as conn:
+            conn.settimeout(1.0)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, nic.encode('ascii') + b'\0')
+            conn.bind((source, 0))
+            conn.connect(target)
+            if conn.send(query) != len(query):
+                return 'E'
+            try:
+                return dns_reply(query, conn.recv(512))
+            except TimeoutError:
+                # A sent query only. The independent witness determines
+                # whether the datagram crossed the restricted backend.
+                return 'S'
+    except OSError:
+        return 'E'
+
+def witness_results(devices):
+    setup, source, nic = nic_setup(devices)
+    if setup != '1111':
+        return setup, '0', 'EEEEEEEE'
+    # First issue the host-alias UDP probe. Resolving the gateway neighbor
+    # also yields the positive on-link slirp control, separate from IP egress.
+    alias = witness_attempt(UDP[2], source, nic, False, NONCE)
+    for _ in range(10):
+        if gateway_reachable(nic):
+            control = '1'
+            break
+        time.sleep(0.1)
+    else:
+        control = '0'
+    tcp = ''.join(witness_attempt(target, source, nic, True) for target in TCP)
+    udp = ''.join(witness_attempt(target, source, nic, False, NONCE) for target in UDP[:2]) + alias
+    label = b'arx-' + NONCE.hex().encode('ascii')
+    query = NONCE[:2] + bytes.fromhex('01000001000000000000') + bytes([len(label)]) + label
+    query += b'\x07invalid\x00\x00\x01\x00\x01'
+    dns = ''.join(witness_dns(target, source, nic, query) for target in (DNS, ('10.0.2.3', 53)))
+    return setup, control, tcp + udp + dns
+
+if __name__ == '__main__':
+    port = pathlib.Path('/dev/virtio-ports/org.arxcovo.agent.0')
+    for _ in range(40):
+        if port.exists():
+            break
+        time.sleep(0.25)
+    setup, control, outcomes = witness_results(pathlib.Path('/sys/class/net').iterdir())
+    if port.exists():
+        with port.open('wb', buffering=0) as wire:
+            wire.write(('ARXNET3 ' + NONCE.hex() + ' ' + setup + ' ' + control + ' ' + outcomes + '\n').encode('ascii'))
+"#;
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+const INSTALLED_ROUTE_ASSERTION: &str =
+    "assert ip('-4','route','show','default','dev',n)[:3]==[b'default',b'via',b'10.0.2.2']\n";
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(in crate::vm) fn installed_witness_script(
+    nonce: [u8; 16],
+    targets: &crate::vm::windows::qualification::WitnessTargets,
+) -> Result<String, RecipeError> {
+    installed_witness_script_for(nonce, targets.tcp, targets.udp, targets.dns)
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn installed_witness_script_for(
+    nonce: [u8; 16],
+    tcp: [std::net::SocketAddr; 3],
+    udp: [std::net::SocketAddr; 3],
+    dns: std::net::SocketAddr,
+) -> Result<String, RecipeError> {
+    use std::fmt::Write;
+    let mut script = String::from(
+        "set -eu\n/usr/bin/python3 - <<'ARX_NETWORK'\nimport pathlib, socket, subprocess, time\n",
+    );
+    writeln!(script, "NONCE=bytes.fromhex({:?})", hex::encode(nonce)).expect("String write");
+    for (name, addresses) in [
+        ("TCP", tcp.to_vec()),
+        ("UDP", udp.to_vec()),
+        ("DNS", vec![dns, "10.0.2.3:53".parse().expect("fixed")]),
+    ] {
+        writeln!(script, "{name}=[").expect("String write");
+        for target in addresses {
+            writeln!(script, "({:?},{}),", target.ip().to_string(), target.port())
+                .expect("String write");
+        }
+        script.push_str("]\n");
+    }
+    let functions = WITNESS_ENTRY
+        .split("def witness_results(")
+        .next()
+        .expect("fixed script");
+    script.push_str(functions);
+    let dns = PROBE_BODY
+        .split("def dns_reply(")
+        .nth(1)
+        .expect("fixed script");
+    script.push_str("def dns_reply(");
+    script.push_str(dns.split("def nic_setup(").next().expect("fixed script"));
+    script.push_str(r#"
+ports=[p for p in pathlib.Path('/sys/class/net').iterdir() if p.name!='lo']
+assert len(ports)==1 and (ports[0]/'device/driver').resolve().name=='virtio_net'
+assert (ports[0]/'operstate').read_text().strip()=='up'
+n=ports[0].name
+def ip(*args):
+    return subprocess.run(['/usr/sbin/ip', *args],check=True,timeout=1,capture_output=True).stdout.split()
+assert b'10.0.2.15/24' in ip('-4','addr','show','dev',n)
+"#);
+    script.push_str(INSTALLED_ROUTE_ASSERTION);
+    script.push_str(
+        r#"
+assert b'inet6' not in ip('-6','addr','show','dev',n,'scope','global')
+assert not ip('-6','route','show','default','dev',n)
+a=witness_attempt(UDP[2],'10.0.2.15',n,False,NONCE)
+for _ in range(10):
+    if gateway_reachable(n): break
+    time.sleep(.1)
+else: raise SystemExit(1)
+t=[witness_attempt(d,'10.0.2.15',n,True) for d in TCP]
+u=[witness_attempt(d,'10.0.2.15',n,False,NONCE) for d in UDP[:2]]+[a]
+x=b'arx-'+NONCE.hex().encode()
+q=NONCE[:2]+bytes.fromhex('01000001000000000000')+bytes([len(x)])+x+b'\x07invalid\0\0\1\0\1'
+assert t[0] in 'FT' and t[1]=='L' and t[2] in 'FT' and u==list('SLS')
+assert [witness_dns(d,'10.0.2.15',n,q) for d in DNS]==['S','S']
+ARX_NETWORK
+"#,
+    );
+    let script = script
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if script.len() > arx_guest::protocol::MAX_SCRIPT {
+        return Err(RecipeError::MediaLimit);
+    }
+    Ok(script)
+}
+
+pub(in crate::vm) const DETACHED_HEALTH: &str = r#"set -eu
 export LC_ALL=C
 verify_account_result() {
     boot_id=$(cat "$1")
@@ -595,6 +964,35 @@ verify_account_result "$1" "$2"
 fn required(pin: Option<AssetPin>) -> Result<AssetPin, RecipeError> {
     pin.filter(|pin| pin.length != 0)
         .ok_or(RecipeError::Unqualified)
+}
+
+fn append_test_route_seed(base: &[u8], out: impl Write) -> Result<(), RecipeError> {
+    let mut files = super::ubuntu_web::cidata_files(base).ok_or(RecipeError::Unqualified)?;
+    let user = std::str::from_utf8(files[6]).map_err(|_| RecipeError::Unqualified)?;
+    let user = append_test_route_user_data(user)?;
+    files[6] = user.as_bytes();
+    Image::new(files)
+        .ok_or(RecipeError::Unqualified)?
+        .write(out)
+        .map_err(|error| RecipeError::Write(error.kind()))
+}
+
+fn append_test_route_user_data(user: &str) -> Result<String, RecipeError> {
+    if !user.ends_with(
+        "      curtin in-target --target=/target -- /bin/sh /usr/local/sbin/arx-finalize\n",
+    ) {
+        return Err(RecipeError::Unqualified);
+    }
+    let mut user = user.to_owned();
+    user.push_str("    - |\n");
+    for line in UbuntuRecipe::TEST_ROUTE_COMMAND.lines() {
+        if !line.is_empty() {
+            user.push_str("      ");
+            user.push_str(line);
+        }
+        user.push('\n');
+    }
+    Ok(user)
 }
 
 fn image<'a>(guest: &'a [u8], meta: &'a str, user: &'a str) -> Result<Image<'a>, RecipeError> {
@@ -711,18 +1109,110 @@ fn network_probe_seed_has_only_live_nocloud_configuration() {
 
 #[cfg(test)]
 #[test]
+fn test_seed_appends_route_without_changing_shared_finalizer() {
+    let pin = |bytes: &[u8]| AssetPin {
+        length: bytes.len() as u64,
+        sha256: Sha256::digest(bytes).into(),
+    };
+    let guest = b"offline-test-guest\x00\xff";
+    let host = Some(pin(b"synthetic host asset"));
+    let recipe = UbuntuRecipe {
+        iso: Some(AssetPin {
+            length: 20,
+            sha256: UbuntuRecipe::ISO_SHA256,
+        }),
+        kernel: host,
+        initrd: host,
+        guest: Some(pin(guest)),
+        service: Some(pin(UbuntuRecipe::SERVICE)),
+        finalize: Some(pin(UbuntuRecipe::FINALIZE)),
+        nocloud_schema: Some(UbuntuRecipe::NOCLOUD_PROFILE_PIN),
+        firmware_code: host,
+        firmware_vars: host,
+        qemu_receipt: host,
+    };
+    let build = [0x5a; 16];
+    let base_iso = recipe.render_seed(build, guest).unwrap();
+    let test_iso = recipe.render_test_seed(build, guest).unwrap();
+    assert_eq!(test_iso, recipe.render_test_seed(build, guest).unwrap());
+    assert_ne!(test_iso, base_iso);
+    assert!(
+        !base_iso
+            .windows(b"arxcovo-test".len())
+            .any(|window| window == b"arxcovo-test")
+    );
+    assert!(
+        !base_iso
+            .windows(b"60-arxcovo-test.yaml".len())
+            .any(|window| window == b"60-arxcovo-test.yaml")
+    );
+
+    let base_files = super::ubuntu_web::cidata_files(&base_iso).unwrap();
+    let test_files = super::ubuntu_web::cidata_files(&test_iso).unwrap();
+    for index in 0..6 {
+        assert_eq!(test_files[index], base_files[index], "cidata file {index}");
+    }
+    assert_eq!(test_files[4], UbuntuRecipe::FINALIZE);
+    assert!(
+        !UbuntuRecipe::FINALIZE
+            .windows(b"arxcovo-test".len())
+            .any(|window| window == b"arxcovo-test")
+    );
+
+    let base_user = std::str::from_utf8(base_files[6]).unwrap();
+    let test_user = std::str::from_utf8(test_files[6]).unwrap();
+    let appended = test_user
+        .strip_prefix(base_user)
+        .unwrap()
+        .strip_prefix("    - |\n")
+        .unwrap();
+    let script = appended
+        .lines()
+        .map(|line| line.strip_prefix("      ").unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(format!("{script}\n"), UbuntuRecipe::TEST_ROUTE_COMMAND);
+    assert_eq!(UbuntuRecipe::TEST_ROUTE_COMMAND.len(), 416);
+    assert_eq!(
+        hex::encode(Sha256::digest(UbuntuRecipe::TEST_ROUTE_COMMAND.as_bytes())),
+        "82d4979ece16cef92ade02e11ee459d7cc29e0c1006e7cd33cf6524ae6bff8ea"
+    );
+    assert!(test_user.contains("60-arxcovo-test.yaml"));
+    assert!(test_user.contains("via: 10.0.2.2"));
+    assert!(!test_user.contains("00-installer-config.yaml"));
+
+    let mut bad_files = base_files;
+    bad_files[6] = b"#cloud-config\nautoinstall:\n  late-commands: []\n";
+    let mut bad_iso = Vec::new();
+    Image::new(bad_files).unwrap().write(&mut bad_iso).unwrap();
+    let mut out = Vec::new();
+    assert!(matches!(
+        append_test_route_seed(&bad_iso, &mut out),
+        Err(RecipeError::Unqualified)
+    ));
+    assert!(out.is_empty());
+}
+
+#[cfg(test)]
+#[test]
 fn network_probe_python_fixture() {
     // The interpreter is required only for the explicitly enabled guest-script
-    // check. Ordinary Rust test runs have no host Python dependency.
+    // check. Ordinary local Rust test runs have no host Python dependency.
+    // Hosted CI sets CI=true and must name the interpreter; otherwise this
+    // check would pass without running.
     let Some(python) = std::env::var_os("ARX_TEST_NETWORK_PROBE_PYTHON") else {
+        if std::env::var("CI").ok().as_deref() == Some("true") {
+            panic!("ARX_TEST_NETWORK_PROBE_PYTHON must name a Python 3 interpreter when CI=true");
+        }
         return;
     };
     // Run the functions embedded in the seed with a fake socket. No packets
     // are sent and the fixture does not inspect the host's routes.
     let fixture = include_str!("network_probe_fixture.py");
+    let route = serde_json::to_string(INSTALLED_ROUTE_ASSERTION).unwrap();
     // fcntl is Linux-only. These mocked fixture calls never use its ioctl.
     let program = format!(
-        "__name__ = 'fixture'\nimport sys, types\nsys.modules['fcntl'] = types.ModuleType('fcntl')\n{PROBE_START}{PROBE_BODY}\n{PROBE_FIXTURE_BEFORE}\n{fixture}\n{PROBE_FIXTURE_AFTER}"
+        "__name__ = 'fixture'\nimport sys, types\nsys.modules['fcntl'] = types.ModuleType('fcntl')\n{PROBE_START}{PROBE_BODY}\n{PROBE_FIXTURE_BEFORE}\n{fixture}\nROUTE_SOURCE = {route}\n{PROBE_FIXTURE_AFTER}"
     );
     let result = std::process::Command::new(python)
         .args(["-I", "-B", "-c", &program])
@@ -743,6 +1233,18 @@ with patch.object(socket, 'socket') as constructor:
     assert probe_dns(('192.0.2.1', 53), '10.0.2.15') == 'E'
     sock.send.assert_called_once()
     sock.recv.assert_called_once()
+
+label = b'arx-' + NONCE.hex().encode('ascii')
+query = NONCE[:2] + bytes.fromhex('01000001000000000000') + bytes([len(label)]) + label
+query += b'\x07invalid\x00\x00\x01\x00\x01'
+good = query[:2] + b'\x81\x83' + query[4:]
+for reply, expected in [(good, 'R'), (good[:-1], 'M'), (b'\x13' + good[1:], 'M')]:
+    sock = MagicMock()
+    sock.recv.return_value = reply
+    with patch.object(socket, 'socket') as constructor:
+        constructor.return_value.__enter__.return_value = sock
+        assert probe_dns(('192.0.2.1', 53), '10.0.2.15') == expected
+        sock.send.assert_called_once_with(query)
 
 def check_ipv6(addresses, routes, expected):
     def read(path):
@@ -773,4 +1275,576 @@ probe_tcp, probe_dns = MagicMock(return_value='R'), MagicMock(return_value='R')
 assert run_probes([nic]) == ('1110', 'EEEEEEEE')
 probe_tcp.assert_not_called()
 probe_dns.assert_not_called()
+
+for tokens, expected in [
+    (b'default via 10.0.2.2 dev eth0'.split(), True),
+    (b'default via 10.0.2.1 dev eth0'.split(), False),
+    ([], False),
+]:
+    try:
+        exec(ROUTE_SOURCE, {'ip': lambda *args: tokens, 'n': 'eth0'})
+        seen = True
+    except AssertionError:
+        seen = False
+    assert seen is expected
 "#;
+
+#[cfg(test)]
+fn valid_python(path: &std::path::Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    #[cfg(windows)]
+    let metadata = std::fs::symlink_metadata(path);
+    #[cfg(not(windows))]
+    let metadata = std::fs::metadata(path);
+    let Ok(metadata) = metadata else { return false };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    metadata.is_file() && metadata.len() > 0
+}
+
+#[cfg(test)]
+fn resolve_python(override_path: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    if let Some(path) = override_path {
+        return valid_python(&path).then_some(path);
+    }
+    #[cfg(unix)]
+    let names = {
+        let system = std::path::PathBuf::from("/usr/bin/python3");
+        if valid_python(&system) {
+            return Some(system);
+        }
+        ["python3", "python"]
+    };
+    #[cfg(windows)]
+    let names = ["python.exe", "python3.exe"];
+    let paths = std::env::var_os("PATH")?;
+    names
+        .into_iter()
+        .flat_map(|name| {
+            std::env::split_paths(&paths)
+                .filter(|dir| dir.is_absolute())
+                .map(move |dir| dir.join(name))
+        })
+        .find(|path| valid_python(path))
+}
+
+#[cfg(test)]
+fn python_executable() -> &'static std::path::Path {
+    static PYTHON: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PYTHON.get_or_init(|| {
+        resolve_python(std::env::var_os("ARX_TEST_NETWORK_PROBE_PYTHON").map(Into::into))
+            .expect("Python 3 is required for witness script behavioral tests")
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn witness_python_rejects_relative_override() {
+    assert!(resolve_python(Some("python".into())).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn witness_python_rejects_missing_override() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(resolve_python(Some(dir.path().join("missing-python"))).is_none());
+}
+
+#[cfg(test)]
+async fn run_witness_interpreter(
+    program: &std::path::Path,
+    args: &[&str],
+    input: &str,
+    seconds: u64,
+) -> Vec<u8> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    assert!(program.is_absolute());
+    let output = tokio::time::timeout(std::time::Duration::from_secs(seconds), async {
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap_or_else(|e| panic!("could not start {}: {e}", program.display()));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .await
+            .unwrap();
+        child.wait_with_output().await.unwrap()
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} exceeded {seconds}s", program.display()));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+#[cfg(test)]
+async fn run_witness_python(mode: &str, meta: &str, input: &str) -> Vec<u8> {
+    run_witness_interpreter(
+        python_executable(),
+        &[
+            "-I",
+            "-B",
+            "-c",
+            include_str!("witness_script_fixture.py"),
+            mode,
+            meta,
+        ],
+        input,
+        60,
+    )
+    .await
+}
+
+#[cfg(test)]
+fn extract_probe_script_from_cidata(iso: &[u8]) -> String {
+    const BLOCK: usize = 2048;
+    let primary = &iso[16 * BLOCK..17 * BLOCK];
+    assert_eq!(&primary[..7], b"\x01CD001\x01");
+    let root_lba = u32::from_le_bytes(primary[158..162].try_into().unwrap()) as usize;
+    let root_len = u32::from_le_bytes(primary[166..170].try_into().unwrap()) as usize;
+    let mut dir = &iso[root_lba * BLOCK..root_lba * BLOCK + root_len];
+    let mut userdata = None;
+    while let Some(&len) = dir.first().filter(|&&len| len != 0) {
+        let (rec, rest) = dir.split_at(usize::from(len));
+        dir = rest;
+        let name = &rec[33..33 + usize::from(rec[32])];
+        if name == b"USERDATA.;1" {
+            let start = u32::from_le_bytes(rec[2..6].try_into().unwrap()) as usize * BLOCK;
+            let size = u32::from_le_bytes(rec[10..14].try_into().unwrap()) as usize;
+            userdata = Some(std::str::from_utf8(&iso[start..start + size]).unwrap());
+            break;
+        }
+    }
+    let cloud = userdata.expect("USERDATA.;1 in probe ISO");
+    let body = cloud
+        .strip_prefix("#cloud-config\nwrite_files:\n  - path: /run/arxcovo-network-probe.py\n    permissions: '0600'\n    content: |\n")
+        .expect("probe cloud-config prefix")
+        .strip_suffix("runcmd:\n  - [python3, /run/arxcovo-network-probe.py]\n")
+        .expect("probe cloud-config suffix");
+    let mut out = String::new();
+    for line in body.lines() {
+        out.push_str(line.strip_prefix("      ").expect("6-space yaml indent"));
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn ubuntu_test_recipe_identity_binds_embedded_route_and_preserves_shared_goldens() {
+    use super::ubuntu_web::{
+        IsoPoolManifest, IsoPoolVerifier, PROFILE_PIN, PoolPackage, UbuntuWebRecipe,
+    };
+    use crate::vm::paths::ArtifactPin;
+
+    struct OkVerifier;
+    impl IsoPoolVerifier for OkVerifier {
+        fn verify(&self, _: &UbuntuRecipe, _: &IsoPoolManifest<'_>) -> bool {
+            true
+        }
+    }
+
+    let pin = |bytes: &[u8]| AssetPin {
+        length: bytes.len() as u64,
+        sha256: Sha256::digest(bytes).into(),
+    };
+    let guest = b"offline-test-guest\x00\xff";
+    let host = Some(pin(b"synthetic host asset"));
+    let iso_pin = AssetPin {
+        length: 19,
+        sha256: UbuntuRecipe::ISO_SHA256,
+    };
+    let recipe = UbuntuRecipe {
+        iso: Some(iso_pin),
+        kernel: host,
+        initrd: host,
+        guest: Some(pin(guest)),
+        service: Some(pin(UbuntuRecipe::SERVICE)),
+        finalize: Some(pin(UbuntuRecipe::FINALIZE)),
+        nocloud_schema: Some(UbuntuRecipe::NOCLOUD_PROFILE_PIN),
+        firmware_code: host,
+        firmware_vars: host,
+        qemu_receipt: host,
+    };
+
+    let original = recipe.test_recipe_digest().unwrap();
+    let canonical = recipe
+        .render_test_seed(TEST_RECIPE_DIGEST_BUILD_ID, guest)
+        .unwrap();
+    let files = super::ubuntu_web::cidata_files(&canonical).unwrap();
+    let meta = std::str::from_utf8(files[5]).unwrap();
+    let user = std::str::from_utf8(files[6]).unwrap();
+    assert_eq!(meta, nocloud_meta(TEST_RECIPE_DIGEST_BUILD_ID));
+    let (_, base_user) = recipe
+        .seed_config(TEST_RECIPE_DIGEST_BUILD_ID, guest)
+        .unwrap();
+    assert_eq!(user, append_test_route_user_data(&base_user).unwrap());
+    let digest = |meta: &str, user: &str| {
+        recipe
+            .test_recipe_digest_with(
+                UbuntuRecipe::SERVICE,
+                UbuntuRecipe::FINALIZE,
+                UbuntuRecipe::NOCLOUD_PROFILE_PIN,
+                UbuntuRecipe::TEST_ROUTE_COMMAND,
+                DETACHED_HEALTH,
+                (meta, user),
+            )
+            .unwrap()
+    };
+    assert_eq!(digest(meta, user), original);
+    let route_block = user.strip_prefix(&base_user).unwrap();
+    let change_route_block =
+        |old: &str, new: &str| format!("{base_user}{}", route_block.replacen(old, new, 1));
+    let changed_header = change_route_block("    - |\n", "    - |-\n");
+    let changed_indent = change_route_block("      set -eu\n", "     set -eu\n");
+    let changed_meta = meta.replacen(
+        "local-hostname: arxcovo\n",
+        "local-hostname: arxcovo-alt\n",
+        1,
+    );
+    assert_ne!(digest(meta, &changed_header), original);
+    assert_ne!(digest(meta, &changed_indent), original);
+    assert_ne!(digest(&changed_meta, user), original);
+    let first = recipe.render_test_seed([0x11; 16], guest).unwrap();
+    let second = recipe.render_test_seed([0x22; 16], guest).unwrap();
+    assert_ne!(first, second);
+    let first = super::ubuntu_web::cidata_files(&first).unwrap();
+    let second = super::ubuntu_web::cidata_files(&second).unwrap();
+    assert_ne!(first[5], second[5]);
+    for (files, build_id) in [(first, [0x11; 16]), (second, [0x22; 16])] {
+        assert_eq!(files[5], nocloud_meta(build_id).as_bytes());
+        assert_eq!(files[6], user.as_bytes());
+        assert_eq!(
+            digest(meta, std::str::from_utf8(files[6]).unwrap()),
+            original
+        );
+    }
+
+    // Changing one byte of the TEST route late command changes the TEST recipe
+    // digest and 16-byte ID prefix.
+    let modified_route = UbuntuRecipe::TEST_ROUTE_COMMAND.replace("10.0.2.2", "10.0.2.9");
+    assert_ne!(modified_route, UbuntuRecipe::TEST_ROUTE_COMMAND);
+    let with_changed_route = recipe
+        .test_recipe_digest_with(
+            UbuntuRecipe::SERVICE,
+            UbuntuRecipe::FINALIZE,
+            UbuntuRecipe::NOCLOUD_PROFILE_PIN,
+            &modified_route,
+            DETACHED_HEALTH,
+            (meta, user),
+        )
+        .unwrap();
+    assert_ne!(with_changed_route, original);
+    assert_ne!(with_changed_route[..16], original[..16]);
+
+    // Changing FINALIZE, SERVICE, NOCLOUD_PROFILE_PIN or DETACHED_HEALTH also
+    // alters the TEST recipe identity.
+    let mut alt_finalize = UbuntuRecipe::FINALIZE.to_vec();
+    alt_finalize.push(b'\n');
+    let mut recipe_alt_finalize = UbuntuRecipe {
+        finalize: Some(pin(&alt_finalize)),
+        ..UbuntuRecipe {
+            iso: recipe.iso,
+            kernel: recipe.kernel,
+            initrd: recipe.initrd,
+            guest: recipe.guest,
+            service: recipe.service,
+            finalize: recipe.finalize,
+            nocloud_schema: recipe.nocloud_schema,
+            firmware_code: recipe.firmware_code,
+            firmware_vars: recipe.firmware_vars,
+            qemu_receipt: recipe.qemu_receipt,
+        }
+    };
+    assert!(recipe_alt_finalize.test_recipe_digest().is_err());
+    assert_ne!(
+        recipe_alt_finalize
+            .test_recipe_digest_with(
+                UbuntuRecipe::SERVICE,
+                &alt_finalize,
+                UbuntuRecipe::NOCLOUD_PROFILE_PIN,
+                UbuntuRecipe::TEST_ROUTE_COMMAND,
+                DETACHED_HEALTH,
+                (meta, user),
+            )
+            .unwrap(),
+        original
+    );
+    let mut alt_profile = UbuntuRecipe::NOCLOUD_PROFILE_PIN;
+    alt_profile.sha256[0] ^= 1;
+    recipe_alt_finalize.finalize = recipe.finalize;
+    recipe_alt_finalize.nocloud_schema = Some(alt_profile);
+    assert!(recipe_alt_finalize.test_recipe_digest().is_err());
+    assert_ne!(
+        recipe_alt_finalize
+            .test_recipe_digest_with(
+                UbuntuRecipe::SERVICE,
+                UbuntuRecipe::FINALIZE,
+                alt_profile,
+                UbuntuRecipe::TEST_ROUTE_COMMAND,
+                DETACHED_HEALTH,
+                (meta, user),
+            )
+            .unwrap(),
+        original
+    );
+    let alt_health = format!("{DETACHED_HEALTH}\n");
+    assert_ne!(
+        recipe
+            .test_recipe_digest_with(
+                UbuntuRecipe::SERVICE,
+                UbuntuRecipe::FINALIZE,
+                UbuntuRecipe::NOCLOUD_PROFILE_PIN,
+                UbuntuRecipe::TEST_ROUTE_COMMAND,
+                &alt_health,
+                (meta, user),
+            )
+            .unwrap(),
+        original
+    );
+
+    // Shared base Ubuntu seed and static-web seed/recipe goldens stay unchanged.
+    let build = [0x5a; 16];
+    let base_seed = recipe.render_seed(build, guest).unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(&base_seed)),
+        "08fd082e494459e6a3ed24857ee59b4039feaf312b32e74ebc1d740a6aa66755"
+    );
+    let packages = [
+        PoolPackage {
+            name: "nginx-common",
+            version: "1.24.0-2ubuntu7.1",
+            relative_path: "pool/main/n/nginx/nginx-common_all.deb",
+            artifact: ArtifactPin {
+                size: 24,
+                sha256: [
+                    0x2b, 0xec, 0x25, 0x98, 0x51, 0x17, 0xff, 0x20, 0xab, 0xeb, 0xef, 0x50, 0xc1,
+                    0x16, 0xa5, 0x65, 0xde, 0x44, 0xb7, 0xd2, 0x38, 0xbd, 0xcb, 0x25, 0x9a, 0xbd,
+                    0x93, 0xbd, 0xd2, 0x92, 0xf7, 0xa5,
+                ],
+            },
+        },
+        PoolPackage {
+            name: "nginx",
+            version: "1.24.0-2ubuntu7.1",
+            relative_path: "pool/main/n/nginx/nginx_amd64.deb",
+            artifact: ArtifactPin {
+                size: 17,
+                sha256: [
+                    0x17, 0x37, 0x8f, 0xea, 0x18, 0x6a, 0xbd, 0x99, 0x24, 0xc3, 0xb3, 0x32, 0x72,
+                    0x85, 0xd2, 0x27, 0xe6, 0x29, 0xa2, 0x5e, 0x1d, 0xb3, 0xc1, 0x23, 0x85, 0xe0,
+                    0x4c, 0x5b, 0x1f, 0xa3, 0x62, 0x85,
+                ],
+            },
+        },
+    ];
+    let manifest = IsoPoolManifest {
+        iso: iso_pin,
+        signed_metadata: ArtifactPin {
+            size: 17,
+            sha256: [0x83; 32],
+        },
+        packages: &packages,
+    };
+    let web = UbuntuWebRecipe::qualify(
+        &recipe,
+        Some(PROFILE_PIN),
+        &manifest,
+        Some(manifest.canonical_pin().unwrap()),
+        &OkVerifier,
+    )
+    .unwrap();
+    let web_seed = web.render_seed(build, guest).unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(&web_seed)),
+        "5cfdb57ec055450f90a6349d8ed5cc4f2fcee7dbb829f9a370872ad9476adfc0"
+    );
+    assert_eq!(
+        hex::encode(web.recipe_digest()),
+        "807f245f5b0d20fa2c44054e70f108a56b1ddc2924f9186979ad54d96285e00f"
+    );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn arxnet3_witness_seed_script_behavior_with_fake_sockets_and_tools() {
+    use crate::vm::qualification_record::ProbeOutcome;
+    use crate::vm::{guest::network_probe::witness_response, qmp::ChannelError};
+    use std::collections::BTreeMap;
+    use std::net::SocketAddr;
+
+    let nonce = [0xab; 16];
+    let tcp: [SocketAddr; 3] = [
+        "192.0.2.10:40001".parse().unwrap(),
+        "[2001:db8::10]:40002".parse().unwrap(),
+        "10.0.2.2:40003".parse().unwrap(),
+    ];
+    let udp: [SocketAddr; 3] = [
+        "192.0.2.10:40004".parse().unwrap(),
+        "[2001:db8::10]:40005".parse().unwrap(),
+        "10.0.2.2:40006".parse().unwrap(),
+    ];
+    let dns: SocketAddr = "192.0.2.53:53".parse().unwrap();
+
+    let iso = network_witness_seed_for(&nonce, tcp, udp, dns).unwrap();
+    let emitted = extract_probe_script_from_cidata(&iso);
+    let meta = serde_json::json!({
+        "nonce": hex::encode(nonce),
+        "tcp": tcp.map(|a| (a.ip().to_string(), a.port())),
+        "udp": udp.map(|a| (a.ip().to_string(), a.port())),
+        "dns": (dns.ip().to_string(), dns.port()),
+    })
+    .to_string();
+
+    let stdout = run_witness_python("arxnet3", &meta, &emitted).await;
+    let frames: BTreeMap<String, String> = serde_json::from_slice(&stdout).unwrap();
+
+    // Feed the exact emitted ARXNET3 frames into Rust's witness_response parser.
+    let reachable = witness_response(frames["reachable"].as_bytes(), &nonce)
+        .await
+        .unwrap();
+    assert!(reachable.gateway_reachable);
+    assert_eq!(reachable.validated_attempts, 8);
+    assert_eq!(
+        reachable.diagnostic.outcomes,
+        [
+            ProbeOutcome::TimedOut,
+            ProbeOutcome::Ipv6PathAbsent,
+            ProbeOutcome::RefusedOrReset,
+            ProbeOutcome::DatagramSent,
+            ProbeOutcome::Ipv6PathAbsent,
+            ProbeOutcome::DatagramSent,
+            ProbeOutcome::DatagramSent,
+            ProbeOutcome::DatagramSent,
+        ]
+    );
+
+    for key in [
+        "gateway_stale",
+        "gateway_wrong_ip",
+        "gateway_no_lladdr",
+        "gateway_cmd_fail",
+    ] {
+        let parsed = witness_response(frames[key].as_bytes(), &nonce)
+            .await
+            .unwrap();
+        assert!(!parsed.gateway_reachable, "{key}");
+        assert_eq!(parsed.validated_attempts, 8, "{key}");
+    }
+
+    for (key, idx) in [
+        ("ipv4_tcp_local_err", 0),
+        ("ipv4_udp_local_err", 3),
+        ("ipv4_udp_short_send", 5),
+        ("ipv4_dns_local_err", 6),
+    ] {
+        let parsed = witness_response(frames[key].as_bytes(), &nonce)
+            .await
+            .unwrap();
+        assert_eq!(
+            parsed.diagnostic.outcomes[idx],
+            ProbeOutcome::SocketError,
+            "{key}"
+        );
+        assert_eq!(parsed.validated_attempts, 7, "{key}");
+    }
+
+    for key in [
+        "absent_no_lease",
+        "absent_no_route",
+        "absent_no_nic",
+        "absent_global_v6",
+    ] {
+        let parsed = witness_response(frames[key].as_bytes(), &nonce)
+            .await
+            .unwrap();
+        assert!(!parsed.gateway_reachable, "{key}");
+        assert_eq!(parsed.validated_attempts, 0, "{key}");
+        assert!(
+            parsed
+                .diagnostic
+                .outcomes
+                .iter()
+                .all(|o| *o == ProbeOutcome::NotAttempted),
+            "{key}"
+        );
+    }
+
+    for (key, idx, expected) in [
+        ("malformed_dns_short", 6, ProbeOutcome::MalformedReply),
+        ("malformed_dns_wrong_id", 6, ProbeOutcome::MalformedReply),
+        ("malformed_dns_tc", 7, ProbeOutcome::MalformedReply),
+        ("valid_dns_reply", 6, ProbeOutcome::Reachable),
+        ("unexpected_tcp_connect", 0, ProbeOutcome::Reachable),
+    ] {
+        let parsed = witness_response(frames[key].as_bytes(), &nonce)
+            .await
+            .unwrap();
+        assert_eq!(parsed.diagnostic.outcomes[idx], expected, "{key}");
+        assert_eq!(parsed.validated_attempts, 7, "{key}");
+    }
+
+    assert!(matches!(
+        witness_response(frames["absent_port"].as_bytes(), &nonce).await,
+        Err(ChannelError::Eof)
+    ));
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn installed_ubuntu_witness_script_behavior_with_fake_sockets_and_tools() {
+    use std::net::SocketAddr;
+
+    let nonce = [0xcd; 16];
+    let tcp: [SocketAddr; 3] = [
+        "192.0.2.10:41001".parse().unwrap(),
+        "[2001:db8::10]:41002".parse().unwrap(),
+        "10.0.2.2:41003".parse().unwrap(),
+    ];
+    let udp: [SocketAddr; 3] = [
+        "192.0.2.10:41004".parse().unwrap(),
+        "[2001:db8::10]:41005".parse().unwrap(),
+        "10.0.2.2:41006".parse().unwrap(),
+    ];
+    let dns: SocketAddr = "192.0.2.53:53".parse().unwrap();
+
+    let shell_script = installed_witness_script_for(nonce, tcp, udp, dns).unwrap();
+    #[cfg(unix)]
+    {
+        run_witness_interpreter(std::path::Path::new("/bin/sh"), &["-n"], &shell_script, 15).await;
+    }
+
+    let python_body = shell_script
+        .strip_prefix("set -eu\n/usr/bin/python3 - <<'ARX_NETWORK'\n")
+        .expect("installed script shell wrapper prefix")
+        .strip_suffix("\nARX_NETWORK")
+        .expect("installed script heredoc suffix");
+    let meta = serde_json::json!({
+        "nonce": hex::encode(nonce),
+        "tcp": tcp.map(|a| (a.ip().to_string(), a.port())),
+        "udp": udp.map(|a| (a.ip().to_string(), a.port())),
+        "dns": (dns.ip().to_string(), dns.port()),
+    })
+    .to_string();
+
+    run_witness_python("installed", &meta, python_body).await;
+}

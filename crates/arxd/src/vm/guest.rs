@@ -470,7 +470,9 @@ async fn send_compose(
 }
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(super) mod network_probe {
+    #[cfg(test)]
     use serde::Deserialize;
+    #[cfg(test)]
     use std::{
         collections::BTreeSet,
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -480,8 +482,94 @@ pub(super) mod network_probe {
     use super::ChannelError;
     use crate::vm::qualification_record::{NetworkProbeReport, ProbeOutcome};
 
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(in crate::vm) struct WitnessReport {
+        pub diagnostic: NetworkProbeReport,
+        pub gateway_reachable: bool,
+        pub validated_attempts: u8,
+    }
+
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    pub(in crate::vm) async fn witness_response(
+        mut source: impl AsyncRead + Unpin,
+        nonce: &[u8; 16],
+    ) -> Result<WitnessReport, ChannelError> {
+        let mut bytes = [0; 57];
+        source
+            .read_exact(&mut bytes)
+            .await
+            .map_err(|_| ChannelError::Eof)?;
+        let net = std::str::from_utf8(&bytes).map_err(|_| ChannelError::Invalid)?;
+        let net = net
+            .strip_prefix("ARXNET3 ")
+            .and_then(|value| value.strip_suffix('\n'))
+            .ok_or(ChannelError::Invalid)?;
+        let mut parts = net.split(' ');
+        let (Some(received), Some(flags), Some(control), Some(outcomes), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return Err(ChannelError::Invalid);
+        };
+        let flags: [u8; 4] = flags
+            .as_bytes()
+            .try_into()
+            .map_err(|_| ChannelError::Invalid)?;
+        let codes: [u8; 8] = outcomes
+            .as_bytes()
+            .try_into()
+            .map_err(|_| ChannelError::Invalid)?;
+        if received != hex::encode(nonce)
+            || !flags.iter().all(|flag| matches!(flag, b'0' | b'1'))
+            || !matches!(control, "0" | "1")
+            || (flags != *b"1111" && (control != "0" || codes != *b"EEEEEEEE"))
+            || !codes
+                .iter()
+                .all(|code| matches!(code, b'R' | b'F' | b'T' | b'S' | b'L' | b'E' | b'M'))
+            || codes[..6].contains(&b'M')
+        {
+            return Err(ChannelError::Unexpected);
+        }
+        let validated_attempts = codes
+            .into_iter()
+            .enumerate()
+            .filter(|(index, code)| match index {
+                0 | 2 => matches!(code, b'F' | b'T'),
+                1 | 4 => *code == b'L',
+                _ => *code == b'S',
+            })
+            .count() as u8;
+        let [nic_ready, ipv4_lease, default_route, no_ipv6_egress_route] = flags.map(|b| b == b'1');
+        let outcomes = codes.map(|code| match code {
+            b'R' => ProbeOutcome::Reachable,
+            b'M' => ProbeOutcome::MalformedReply,
+            b'S' => ProbeOutcome::DatagramSent,
+            b'L' => ProbeOutcome::Ipv6PathAbsent,
+            b'T' => ProbeOutcome::TimedOut,
+            b'F' => ProbeOutcome::RefusedOrReset,
+            _ if flags != *b"1111" => ProbeOutcome::NotAttempted,
+            _ => ProbeOutcome::SocketError,
+        });
+        Ok(WitnessReport {
+            diagnostic: NetworkProbeReport {
+                nic_ready,
+                ipv4_lease,
+                default_route,
+                no_ipv6_egress_route,
+                outcomes,
+            },
+            gateway_reachable: control == "1",
+            validated_attempts,
+        })
+    }
+
     /// Enrolled witness sockets. The alias control is on the host loopback
     /// and is addressed by its slirp alias only from the probe guest.
+    #[cfg(test)]
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     pub(in crate::vm) struct Targets {
@@ -494,6 +582,7 @@ pub(super) mod network_probe {
         pub dns: SocketAddr,
     }
 
+    #[cfg(test)]
     impl Targets {
         pub(in crate::vm) fn guest_tcp(&self) -> [SocketAddr; 6] {
             [
@@ -557,54 +646,9 @@ pub(super) mod network_probe {
         pub(in crate::vm) fn valid_with_resolvers(&self, host_resolvers: &[IpAddr]) -> bool {
             self.valid() && host_resolvers.contains(&self.dns.ip())
         }
-
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        pub(in crate::vm) async fn known_live(&self, nonce: &[u8; 16]) -> bool {
-            use std::time::Duration;
-            use tokio::{
-                io::AsyncWriteExt,
-                net::{TcpStream, UdpSocket},
-                time::timeout,
-            };
-            if !self.valid() {
-                return false;
-            }
-            let mut controls = self.guest_tcp();
-            controls[3].set_ip(Ipv4Addr::LOCALHOST.into());
-            for address in controls {
-                let result = timeout(Duration::from_secs(2), async {
-                    let mut stream = TcpStream::connect(address).await?;
-                    stream.write_all(nonce).await?;
-                    let mut answer = [0; 16];
-                    stream.read_exact(&mut answer).await?;
-                    std::io::Result::Ok(answer == *nonce)
-                })
-                .await;
-                if !matches!(result, Ok(Ok(true))) {
-                    return false;
-                }
-            }
-            matches!(
-                timeout(Duration::from_secs(2), async {
-                    let bind: SocketAddr = if self.dns.is_ipv4() {
-                        (Ipv4Addr::UNSPECIFIED, 0).into()
-                    } else {
-                        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
-                    };
-                    let socket = UdpSocket::bind(bind).await?;
-                    socket.connect(self.dns).await?;
-                    let query = dns_query(nonce);
-                    socket.send(&query).await?;
-                    let mut response = [0; 512];
-                    let count = socket.recv(&mut response).await?;
-                    std::io::Result::Ok(validate_dns_reply(&query, &response[..count]))
-                })
-                .await,
-                Ok(Ok(true))
-            )
-        }
     }
 
+    #[cfg(test)]
     fn valid_socket(address: SocketAddr) -> bool {
         address.port() != 0
             && !address.ip().is_unspecified()
@@ -623,6 +667,7 @@ pub(super) mod network_probe {
 
     /// Require a full, non-truncated, standard DNS reply whose transaction ID
     /// and echoed question section match the exact nonce-bound query.
+    #[cfg(test)]
     pub(in crate::vm) fn validate_dns_reply(query: &[u8], reply: &[u8]) -> bool {
         if query.len() < 12 || reply.len() < query.len() {
             return false;
@@ -643,6 +688,7 @@ pub(super) mod network_probe {
 
     /// One exact structured response, bound to the seed. The enclosing caller
     /// holds the PID/Job-verified pipe and imposes the absolute read deadline.
+    #[cfg(test)]
     pub(in crate::vm) async fn response(
         mut source: impl AsyncRead + Unpin,
         nonce: &[u8; 16],
@@ -709,6 +755,41 @@ pub(super) mod network_probe {
         }"#,
         )
         .unwrap()
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn installed_witness_frame_counts_only_validated_attempts() {
+        let nonce = [42; 16];
+        let read = |setup, control, outcomes| {
+            format!(
+                "ARXNET3 {} {setup} {control} {outcomes}\n",
+                hex::encode(nonce)
+            )
+        };
+        for (outcomes, count) in [
+            ("TLTSLSSS", 8),
+            ("ELTSLSSS", 7),
+            ("TFTSLSSS", 7),
+            ("TLTSLSSM", 7),
+        ] {
+            let report = witness_response(read("1111", "1", outcomes).as_bytes(), &nonce)
+                .await
+                .unwrap();
+            assert_eq!(report.validated_attempts, count);
+            assert!(report.gateway_reachable);
+            assert!(report.diagnostic.default_route);
+        }
+        let missing = witness_response(read("1101", "0", "EEEEEEEE").as_bytes(), &nonce)
+            .await
+            .unwrap();
+        assert!(!missing.diagnostic.default_route);
+        assert!(!missing.gateway_reachable);
+        assert_eq!(missing.validated_attempts, 0);
+        assert_eq!(
+            witness_response(read("1101", "1", "TLTSLSSS").as_bytes(), &nonce).await,
+            Err(ChannelError::Unexpected),
+        );
     }
 
     #[cfg(test)]
