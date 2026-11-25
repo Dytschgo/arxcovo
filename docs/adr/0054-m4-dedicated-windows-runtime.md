@@ -1368,3 +1368,37 @@ empty Job and joined stdio workers. Uncertain settlement keeps the generation
 charged. The qualifier's separate disposable path still rejects daemon offline
 leases. Production dispatch, WHPX guest boot and teardown remain
 **unverified on real hardware**.
+
+### 7b PR 4 amendment — production recipe inputs and helper release
+
+The foreground binds the two recipe identities to the native record and
+keeps the measured inputs private. It prepares the Ubuntu seed from the
+held guest, installer and stock assets with the reserved generation as
+the instance identity. Windows preparation retains the checked answer
+ISO and installed-image probe from the same measurement. The initial
+VARS copy comes from the held stock firmware for Ubuntu and from the
+enrolled one-shot Setup VARS for Windows.
+
+The daemon supplies the exact reserved disk, VARS and seed slots. Each
+new leaf requires a separate authorization at its checked create edge,
+with the workspace lease, seal, recipe, phase, content pin and deadline
+bound to the effect. The adapter creates only new leaves relative to
+the held directory. If staging fails partway, the daemon keeps the
+affected reservation charged until it can reconcile custody.
+
+The foreground derives the sealed boot plan from those inputs and the
+ledger-pinned disk, VARS and optional golden. The launch edge compares
+the supplied plan with that derivation, including file identities and
+digests that do not appear in argv. Stock custody independently checks
+the paths and held objects. Initial VARS bytes are rechecked under writer
+exclusion through suspended creation. The fixed recipe uses 4 GiB guest
+RAM and two vCPUs under the qualified 6 GiB, 2500-rate Job. The
+production runtime still needs the 7c issuer before it can dispatch.
+
+Helper settlement carries the exact plan kind and role/identity
+projection along with the live workspace lease and writer exclusions.
+The ledger consumer keeps the proof through inspection and settlement.
+Missing or mismatched exclusions yield charged quarantine and withhold
+helper output. The qualifier still uses its separate authority and
+disposable workspace. Production dispatch and settlement are
+**unverified on real hardware**.

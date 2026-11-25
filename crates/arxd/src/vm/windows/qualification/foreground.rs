@@ -8,6 +8,7 @@ use crate::vm::qualification_record::{
 
 pub(crate) struct ForegroundQualification<'a> {
     pub(super) held: Held,
+    pub(super) recipes: std::sync::Mutex<launch::RecipeInputs>,
     store: &'a VmStore,
     dependencies: Dependencies,
     evidence: VerifiedEvidence,
@@ -34,13 +35,18 @@ impl<'a> ForegroundQualification<'a> {
         )?;
         let mut dependencies = observations.dependencies();
         // This projection precedes all reads of the selected seal and rows.
-        launch::project_recipes(&held, [0; 16], [0; 32])?.bind(&mut dependencies);
+        let recipes = launch::measure_recipes(&held, [0; 16], [0; 32])?;
+        recipes.projection.bind(&mut dependencies);
         let fresh = measure_fresh(&held, store, &dependencies)?;
         let (evidence, rows) = dossier
             .read_selected(selection, &fresh)
             .map_err(|_| NativeRefusal::QualificationMissing)?;
+        if recipes.projection.recipes != evidence.recipes {
+            return Err(NativeRefusal::QualificationMissing);
+        }
         Ok(Self {
             held,
+            recipes: std::sync::Mutex::new(recipes),
             store,
             dependencies,
             evidence,
@@ -54,7 +60,7 @@ impl<'a> ForegroundQualification<'a> {
         &self.evidence
     }
 
-    pub(super) fn seal_sha256(&self) -> records::Hash {
+    pub(in crate::vm::windows::qualification) fn seal_sha256(&self) -> records::Hash {
         self.seal_sha256
     }
 

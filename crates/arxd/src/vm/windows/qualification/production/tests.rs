@@ -128,7 +128,7 @@ fn private_dir(parent: &Path, name: &str) -> (Vec<usize>, String, LocalPath) {
     (data, text, path)
 }
 
-fn unbacked_qcow2_header(virtual_size: u64) -> Vec<u8> {
+pub(in crate::vm::windows::qualification) fn unbacked_qcow2_header(virtual_size: u64) -> Vec<u8> {
     let mut cluster = vec![0u8; 65_536];
     cluster[..4].copy_from_slice(b"QFI\xfb");
     cluster[4..8].copy_from_slice(&3u32.to_be_bytes());
@@ -161,7 +161,7 @@ fn synthetic_artifact(role: ArtifactRole, path: LocalPath, id: u8) -> Artifact {
         })
 }
 
-fn held_test_workspace(
+pub(in crate::vm::windows::qualification) fn held_test_workspace(
     temp: &Path,
     generation: Id,
 ) -> (PathPin, ProductionWorkspace, Vec<usize>, String) {
@@ -186,6 +186,77 @@ fn held_test_workspace(
     )
     .unwrap();
     (production, ws, owner_data, owner_text)
+}
+
+#[tokio::test]
+async fn helper_release_retains_writer_exclusion_and_rejects_dropped_custody() {
+    let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    let (_production, ws, _, _) = held_test_workspace(temp.path(), [1; 16]);
+    let slot = pair(ws.binding().generation).disk;
+    let path = slot_path(&ws.root.path, slot);
+    std::fs::write(path.as_str(), b"helper result").unwrap();
+    let pin = PathPin::open(&path, false, true).unwrap();
+    let observed = || StopEvidence {
+        process_exited: true,
+        job_empty: true,
+        workers_joined: true,
+        guest_shutdown: true,
+        clean_process_exit: true,
+        ..StopEvidence::default()
+    };
+    let custody = WorkspaceCustody::production(&ws.root, &ws.lease).unwrap();
+    let inputs = [(ArtifactRole::Staging, pin.identity)];
+    let targets = ReleaseTargets::Helper {
+        kind: PlanKind::Mutate,
+        inputs: inputs.to_vec(),
+    };
+    let pins: std::sync::Arc<[PathPin]> = vec![pin].into();
+    assert!(
+        ReleasedGeneration::checked(
+            ws.binding(),
+            targets.clone(),
+            custody,
+            (pins.clone(), vec![]),
+        )
+        .is_none()
+    );
+    let other_path = ws.root.path.join("unrelated").unwrap();
+    std::fs::write(other_path.as_str(), b"another object").unwrap();
+    let other = PathPin::open(&other_path, false, false).unwrap();
+    assert!(
+        ReleasedGeneration::checked(
+            ws.binding(),
+            targets.clone(),
+            custody,
+            (pins.clone(), vec![other.leaf]),
+        )
+        .is_none()
+    );
+
+    let writers = || std::fs::OpenOptions::new().write(true).open(path.as_str());
+    let open_writer = writers().unwrap();
+    let take_custody = || {
+        let pins = pins.clone();
+        move || Ok((pins.clone(), vec![pins[0].reopen_without_writer()?]))
+    };
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(5);
+    let (disposition, held) =
+        finish_release_held(observed(), deadline(), take_custody(), || true).await;
+    assert_eq!(disposition, StopDisposition::ChargedQuarantine);
+    assert!(held.is_none());
+    drop(open_writer);
+    let (disposition, held) =
+        finish_release_held(observed(), deadline(), take_custody(), || true).await;
+    assert_eq!(disposition, StopDisposition::CleanRelease);
+    let proof = ReleasedGeneration::checked(ws.binding(), targets, custody, held.unwrap()).unwrap();
+    assert!(proof.matches_helper(ws.binding(), PlanKind::Mutate, &inputs));
+    let mut different = ws.binding();
+    different.generation = [2; 16];
+    assert!(!proof.matches_helper(different, PlanKind::Mutate, &inputs));
+    assert!(!proof.matches_helper(ws.binding(), PlanKind::InspectWritable, &inputs));
+    assert!(writers().is_err());
+    drop(proof);
+    assert!(writers().is_ok());
 }
 
 #[test]
@@ -332,6 +403,7 @@ fn launch_permit_fence_requires_uninhabited_authority_and_non_echoed_target() {
         cwd: &root,
         pair: None,
         installer: None,
+        recipe: None,
         memory: 256 << 20,
         cpu_rate: 1000,
     };
@@ -1243,8 +1315,7 @@ async fn released_proof_binds_generation_and_keeps_the_writer_exclusion() {
     assert_eq!(disposition, StopDisposition::DirtyRelease);
     let proof = ReleasedGeneration {
         binding: workspace,
-        pair: slots,
-        ids,
+        targets: ReleaseTargets::Pair { pair: slots, ids },
         _workspace: workspace_custody,
         _held: held.unwrap(),
     };

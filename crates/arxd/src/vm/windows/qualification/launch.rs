@@ -5,8 +5,8 @@ use super::*;
 use std::{cell::Cell, future::Future};
 
 pub(super) struct HeldAsset {
-    pin: PathPin,
-    expected: ArtifactPin,
+    pub(super) pin: PathPin,
+    pub(super) expected: ArtifactPin,
 }
 
 impl HeldAsset {
@@ -36,7 +36,7 @@ impl HeldAsset {
         self.pin.path.overlaps(path)
     }
 
-    fn read(&self) -> Result<Vec<u8>, NativeRefusal> {
+    pub(super) fn read(&self) -> Result<Vec<u8>, NativeRefusal> {
         use std::io::{Seek, SeekFrom};
         let reason = NativeRefusal::InstallerPhaseUnavailable;
         inventory::binding(&self.pin)?;
@@ -353,7 +353,7 @@ fn recipe_live(baseline: &Baseline, peak: u64, allocated: u64) -> Result<Instant
     Ok(captured)
 }
 
-fn artifact(
+pub(super) fn artifact(
     role: ArtifactRole,
     pin: &PathPin,
 ) -> Result<crate::vm::paths::Artifact, NativeRefusal> {
@@ -419,7 +419,7 @@ fn hash_at_rest(
     Ok(expected)
 }
 
-fn header(pin: &PathPin) -> Result<Vec<u8>, NativeRefusal> {
+pub(super) fn header(pin: &PathPin) -> Result<Vec<u8>, NativeRefusal> {
     use std::io::{Seek, SeekFrom};
     let reason = NativeRefusal::PathCustodyUnverified;
     let mut bytes = vec![0; crate::vm::qemu_img::CLUSTER];
@@ -573,7 +573,7 @@ impl RecipeCommands<'_> {
     }
 }
 
-fn stock_asset(
+pub(super) fn stock_asset(
     bundle: &inventory::Bundle,
     name: &str,
     max: u64,
@@ -592,7 +592,7 @@ fn stock_asset(
     Ok(target)
 }
 
-fn held_bytes(pin: &PathPin, limit: u64) -> Result<Vec<u8>, NativeRefusal> {
+pub(super) fn held_bytes(pin: &PathPin, limit: u64) -> Result<Vec<u8>, NativeRefusal> {
     use std::io::{Seek, SeekFrom};
     let reason = NativeRefusal::PathCustodyUnverified;
     let mut file = &pin.leaf;
@@ -832,13 +832,11 @@ pub(super) async fn run_ubuntu(
     baseline: &Baseline,
     cancel: &Shutdown,
 ) -> Result<RecipeProbe, NativeRefusal> {
-    use crate::vm::UbuntuAssets;
     use crate::vm::qualification_record::Observation;
     use crate::vm::runtime::{InstallerBudget, InstallerPhase, InstallerRecipe};
     use crate::vm::template::{UBUNTU_DETACHED_HEALTH, installed_witness_script};
     use arx_guest::protocol::ScriptStatus;
     use sha2::{Digest, Sha256};
-    use std::io::{Seek, SeekFrom};
 
     const DISK: u64 = 24 * GIB;
     const PEAK: u64 = 51 * GIB;
@@ -880,49 +878,12 @@ pub(super) async fn run_ubuntu(
         deadline.into_std(),
     )?;
     let receipt = stock_asset(bundle, "RECEIPT.txt", 16 << 10, deadline.into_std())?;
-    let external = [iso, kernel, initrd, &firmware, &vars_seed, &receipt];
-    let mut sources: Vec<_> = external.iter().map(|pin| &pin.leaf).collect();
-    for source in &mut sources {
-        source.seek(SeekFrom::Start(0)).map_err(|_| reason)?;
-    }
-    let [
-        iso_in,
-        kernel_in,
-        initrd_in,
-        firmware_in,
-        vars_in,
-        receipt_in,
-    ] = sources.as_mut_slice()
-    else {
-        unreachable!("fixed recipe assets")
-    };
-    let external_pins = [
-        content(iso)?,
-        content(kernel)?,
-        content(initrd)?,
-        guest.expected,
-        content(&firmware)?,
-        content(&vars_seed)?,
-        content(&receipt)?,
-    ];
-    let recipe = ubuntu_test_recipe(external_pins);
-    let identity = ubuntu_identity(external_pins)?;
-    let mut seed_bytes = Vec::new();
-    recipe
-        .write_test_seed(
-            UbuntuAssets {
-                iso: Some(iso_in),
-                kernel: Some(kernel_in),
-                initrd: Some(initrd_in),
-                firmware_code: Some(firmware_in),
-                firmware_vars: Some(vars_in),
-                qemu_receipt: Some(receipt_in),
-            },
-            baseline.run(),
-            &guest.read()?,
-            &mut seed_bytes,
-        )
-        .map_err(|_| reason)?;
+    let (identity, seed_bytes) = prepare_ubuntu(
+        [iso, kernel, initrd],
+        [&firmware, &vars_seed, &receipt],
+        guest,
+        baseline.run(),
+    )?;
     commands.live()?;
 
     let staged = workspace.stage_bytes("ubuntu-cidata.iso", &seed_bytes)?;
@@ -1102,8 +1063,8 @@ pub(super) struct WindowsEnrollment {
 
 pub(super) struct WindowsInputs {
     config: WindowsEnrollment,
-    iso: HeldAsset,
-    driver_medium: HeldAsset,
+    pub(super) iso: HeldAsset,
+    pub(super) driver_medium: HeldAsset,
     driver_files: [[HeldAsset; 3]; 3],
     driver_receipt: HeldAsset,
     guest: HeldAsset,
@@ -1737,6 +1698,61 @@ fn ubuntu_identity(
     })
 }
 
+pub(super) fn prepare_ubuntu(
+    [iso, kernel, initrd]: [&PathPin; 3],
+    [firmware, vars, receipt]: [&PathPin; 3],
+    guest: &HeldAsset,
+    generation: crate::vm::Id,
+) -> Result<(crate::vm::qualification_record::RecipeIdentity, Vec<u8>), NativeRefusal> {
+    use crate::vm::UbuntuAssets;
+    use std::io::{Seek, SeekFrom};
+    let reason = NativeRefusal::InstallerPhaseUnavailable;
+    let pins = [
+        content(iso)?,
+        content(kernel)?,
+        content(initrd)?,
+        guest.expected,
+        content(firmware)?,
+        content(vars)?,
+        content(receipt)?,
+    ];
+    let [
+        mut iso,
+        mut kernel,
+        mut initrd,
+        mut firmware,
+        mut vars,
+        mut receipt,
+    ] = [iso, kernel, initrd, firmware, vars, receipt].map(|pin| &pin.leaf);
+    for source in [
+        &mut iso,
+        &mut kernel,
+        &mut initrd,
+        &mut firmware,
+        &mut vars,
+        &mut receipt,
+    ] {
+        source.seek(SeekFrom::Start(0)).map_err(|_| reason)?;
+    }
+    let mut bytes = Vec::new();
+    ubuntu_test_recipe(pins)
+        .write_test_seed(
+            UbuntuAssets {
+                iso: Some(&mut iso),
+                kernel: Some(&mut kernel),
+                initrd: Some(&mut initrd),
+                firmware_code: Some(&mut firmware),
+                firmware_vars: Some(&mut vars),
+                qemu_receipt: Some(&mut receipt),
+            },
+            generation,
+            &guest.read()?,
+            &mut bytes,
+        )
+        .map_err(|_| reason)?;
+    Ok((ubuntu_identity(pins)?, bytes))
+}
+
 pub struct RecipeProjection {
     pub(super) install_media: [u8; 32],
     pub(super) recipes: crate::vm::qualification_record::TestRecipes,
@@ -1763,6 +1779,23 @@ pub(super) fn project_recipes(
     run: [u8; 16],
     scope: [u8; 32],
 ) -> Result<RecipeProjection, NativeRefusal> {
+    Ok(measure_recipes(held, run, scope)?.projection)
+}
+
+pub(super) struct RecipeInputs {
+    pub(super) projection: RecipeProjection,
+    pub(super) code: PathPin,
+    pub(super) vars: PathPin,
+    pub(super) receipt: PathPin,
+    pub(super) windows: crate::vm::template::windows::PreparedWindows,
+    pub(super) answer: Vec<u8>,
+}
+
+pub(super) fn measure_recipes(
+    held: &Held,
+    run: [u8; 16],
+    scope: [u8; 32],
+) -> Result<RecipeInputs, NativeRefusal> {
     use crate::vm::qualification_record::{RecipeIdentity, TestRecipes, digest};
     let reason = NativeRefusal::InstallerPhaseUnavailable;
     let ubuntu_guest = held.ubuntu_guest.as_ref().map_err(|reason| *reason)?;
@@ -1777,7 +1810,7 @@ pub(super) fn project_recipes(
     let receipt = stock_asset(bundle, "RECEIPT.txt", 16 << 10, deadline)?;
     let firmware = [content(&code)?, content(&vars)?, setup_vars.expected];
     let expected = |pin: ArtifactPin| (pin.size, pin.sha256);
-    let prepared = windows.prepare(&code, &vars, &receipt)?.0;
+    let (prepared, answer) = windows.prepare(&code, &vars, &receipt)?;
     let recipes = TestRecipes {
         ubuntu: ubuntu_identity([
             content(iso)?,
@@ -1794,7 +1827,7 @@ pub(super) fn project_recipes(
         },
     };
     let key = |bytes: Vec<u8>| digest(&bytes);
-    Ok(RecipeProjection {
+    let projection = RecipeProjection {
         run,
         scope,
         install_media: key(serde_json::to_vec(&(
@@ -1817,6 +1850,14 @@ pub(super) fn project_recipes(
             network.projection,
         ))
         .map_err(|_| reason)?),
+    };
+    Ok(RecipeInputs {
+        projection,
+        code,
+        vars,
+        receipt,
+        windows: prepared,
+        answer,
     })
 }
 
