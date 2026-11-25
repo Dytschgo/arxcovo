@@ -1437,3 +1437,40 @@ worker-join and writer-exclusion checks after a monitor failure. An absent
 proof keeps the charge quarantined. The console activity source is shared
 with preflight and qualification. Native monitoring and teardown are
 **unverified on real hardware**.
+
+### 7c amendment — foreground TEST issuer and ledger handoff
+
+The owner opts in through `test_vms.runtime.execution_profile` set to
+`current_user` and `test_vms.runtime.test_qualification` with the local
+`enrollment` and `dossier` paths and lowercase `sha256` and `scope`
+pins. The runtime and TEST surface must both be enabled. The foreground
+checks the current primary token, the held store, and both measured
+recipe identities. It assigns a fresh epoch and reuses the store's
+persistent UTC high-water clock. Boot anchoring and record expiry are
+checked independently of the live observation window. A selected catalog
+can report buildable recipes before the owner has idled.
+
+A fresh durable operation yields its worker token. TEST permits bind
+that worker, its caller, request, action and exact generation to the
+selected epoch and the checked plan. Replays return the original
+receipt. A new leaf and helper creation have separate checks. The helper
+checkpoints the exact file identity in its reserved slot under the held
+release before the next phase can use it. The sealed golden retains its
+observed byte charge after the covered build peak has settled.
+
+The owned foreground worker retains the guest session and the generation
+lease. The Windows readiness witness binds the live handshake to the
+active generation and start operation. Runtime loss removes the witness
+and starts teardown. The snapshot and recovery paths reuse the existing
+transactions and record or consume release only for the matching
+generation. Snapshot copies retain their writer exclusions through
+ledger commit. Uncertain effects leave their charges in the existing
+cleanup ledger. TEST reconciliation opens only the tracked TEST disk
+and VARS roles. Public publishing remains opt-in and the TEST path has
+no static VM or backup deletion authority.
+
+The existing TEST artifact lookup and snapshot reserve, commit and
+release transactions are compiled into Windows x64 production. Their
+schema, store version, locking and immutability triggers are unchanged.
+Native build, boot, snapshot, restore and teardown are **unverified on
+real hardware**.

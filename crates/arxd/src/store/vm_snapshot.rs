@@ -779,10 +779,10 @@ pub(super) fn settle_cleanup(
     Ok(true)
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) use effects::*;
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 mod effects {
     use super::*;
     use crate::vm::{

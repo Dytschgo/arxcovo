@@ -382,10 +382,6 @@ fn launch_permit_fence_requires_uninhabited_authority_and_non_echoed_target() {
     }
     let _ = assert_launch_retains_authority;
 
-    // While LaunchAuthority is uninhabited, Option<LaunchAuthority> cannot
-    // hold a Some value; NativeLaunch's `_authority` field is checked above.
-    assert_eq!(size_of::<Option<crate::vm::runtime::LaunchAuthority>>(), 0);
-
     // Explicitly construct LaunchTarget without `..` so reintroducing an
     // echoed `binding` field fails compilation.
     let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();

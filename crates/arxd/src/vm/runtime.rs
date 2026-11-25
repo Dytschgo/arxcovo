@@ -26,13 +26,15 @@ pub enum NativeRefusal {
 
 pub enum NativeCapability {
     Unavailable(NativeRefusal),
-    Qualified(LaunchAuthority),
+    Qualified(()),
 }
 
-/// Intentionally uninhabited until a reviewed issuer can bind the full
-/// qualification record and live evidence to a particular owned operation.
+/// Only the Windows TEST issuer may construct this opaque effect authority.
 pub struct LaunchAuthority {
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     _closed: std::convert::Infallible,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    _issued: (),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,14 +46,36 @@ pub enum NativeMutation {
 
 pub struct CandidateRuntime<'a> {
     profile: Option<&'a VmRuntimeProfile>,
+    native: Option<Box<dyn TestCleanup + 'a>>,
+    selected: bool,
 }
+
+pub(crate) trait TestCleanup:
+    ReaperRuntime + super::reaper::ArtifactCustody + Send + Sync
+{
+}
+impl<T> TestCleanup for T where T: ReaperRuntime + super::reaper::ArtifactCustody + Send + Sync {}
 
 impl<'a> CandidateRuntime<'a> {
     pub fn new(profile: Option<&'a VmRuntimeProfile>) -> Self {
-        Self { profile }
+        Self {
+            profile,
+            native: None,
+            selected: false,
+        }
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn selected_test(mut self, available: bool, cleanup: impl TestCleanup + 'a) -> Self {
+        self.selected = available;
+        self.native = Some(Box::new(cleanup));
+        self
     }
 
     pub fn capability(&self) -> NativeCapability {
+        if self.selected {
+            return NativeCapability::Qualified(());
+        }
         let reason = if !self.profile.is_some_and(VmRuntimeProfile::enabled) {
             NativeRefusal::Disabled
         } else if !cfg!(all(windows, target_arch = "x86_64")) {
@@ -82,11 +106,189 @@ impl<'a> CandidateRuntime<'a> {
     pub fn dispatch<T>(
         &self,
         _operation: NativeMutation,
-        effect: impl FnOnce(LaunchAuthority) -> T,
+        _effect: impl FnOnce(LaunchAuthority) -> T,
     ) -> Result<T, NativeRefusal> {
         match self.capability() {
             NativeCapability::Unavailable(reason) => Err(reason),
-            NativeCapability::Qualified(authority) => Ok(effect(authority)),
+            NativeCapability::Qualified(()) => Err(NativeRefusal::QualificationMissing),
+        }
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) struct NativeEffectBinding<'a> {
+    pub principal: &'a str,
+    pub request: super::RequestId,
+    pub operation: super::Id,
+    pub action: i64,
+    pub generation: super::Id,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) mod test_issuer {
+    use super::{LaunchAuthority, NativeEffectBinding, NativeRefusal, fresh_observation};
+    use crate::service::Shutdown;
+    use crate::vm::paths::{ArtifactPin, ArtifactRole, FileIdentity, LocalPath};
+    use crate::vm::qemu_args::{CommandPlan, PlanKind};
+    use crate::vm::qualification::{
+        LaunchPermit, LaunchPermitBinding, LaunchTarget, WorkspaceBinding,
+    };
+    use crate::vm::qualification_record::{Hash, RecipeIdentity};
+    use crate::vm::{ArtifactSlot, Clock, Id, PairSlots, PendingOperation, VmController};
+    use std::time::Instant;
+
+    const REFUSED: NativeRefusal = NativeRefusal::QualificationMissing;
+
+    pub(crate) fn artifact_identity(artifact: &crate::vm::paths::Artifact) -> Option<FileIdentity> {
+        artifact.identity()
+    }
+
+    pub(crate) fn effect_identities(
+        plan: &CommandPlan<'_>,
+    ) -> Result<Vec<(ArtifactRole, FileIdentity)>, NativeRefusal> {
+        plan.inputs()
+            .iter()
+            .map(|(role, artifact)| Ok((*role, artifact.identity().ok_or(REFUSED)?)))
+            .collect()
+    }
+
+    /// One fresh worker and its exact durable effect target. This value is
+    /// borrowed by the permit and the pre-spawn consumption rechecks it.
+    pub(crate) struct Intent<'a, C: Clock> {
+        pub controller: &'a VmController<C>,
+        pub worker: &'a PendingOperation,
+        pub binding: NativeEffectBinding<'a>,
+        pub epoch: Id,
+        pub seal_sha256: Hash,
+        pub cancel: &'a Shutdown,
+        pub refresh: &'a dyn Fn() -> Result<Instant, NativeRefusal>,
+    }
+
+    impl<C: Clock> Intent<'_, C> {
+        fn verify(
+            &self,
+            workspace: WorkspaceBinding,
+            slots: &[ArtifactSlot],
+        ) -> Result<(), NativeRefusal> {
+            if self.binding.generation != workspace.generation
+                || self.epoch == [0; 16]
+                || self.cancel.is_cancelled()
+                || !self
+                    .controller
+                    .validate_native_effect(self.worker, &self.binding, slots)
+                    .map_err(|_| REFUSED)?
+            {
+                return Err(REFUSED);
+            }
+            fresh_observation((self.refresh)()?, Instant::now(), REFUSED)
+        }
+
+        pub(crate) fn stage(
+            &self,
+            workspace: WorkspaceBinding,
+            slot: ArtifactSlot,
+        ) -> Result<LaunchAuthority, NativeRefusal> {
+            self.authorize(workspace, &[slot])
+        }
+
+        pub(crate) fn authorize(
+            &self,
+            workspace: WorkspaceBinding,
+            slots: &[ArtifactSlot],
+        ) -> Result<LaunchAuthority, NativeRefusal> {
+            self.verify(workspace, slots)?;
+            Ok(LaunchAuthority { _issued: () })
+        }
+
+        pub(crate) fn launch<'a>(
+            &'a self,
+            workspace: WorkspaceBinding,
+            expected: LaunchTarget<'_, '_>,
+            slots: &'a [ArtifactSlot],
+        ) -> Result<Permit<'a, C>, NativeRefusal> {
+            self.verify(workspace, slots)?;
+            Ok(Permit {
+                intent: self,
+                binding: LaunchPermitBinding {
+                    workspace,
+                    seal_sha256: self.seal_sha256,
+                    kind: expected.plan.kind(),
+                },
+                expected: EffectPlan::from_target(expected)?,
+                slots,
+            })
+        }
+    }
+
+    pub(crate) struct Permit<'a, C: Clock> {
+        intent: &'a Intent<'a, C>,
+        binding: LaunchPermitBinding,
+        expected: EffectPlan,
+        slots: &'a [ArtifactSlot],
+    }
+
+    impl<C: Clock> LaunchPermit for Permit<'_, C> {
+        fn consume(
+            self,
+            target: LaunchTarget<'_, '_>,
+        ) -> Result<(LaunchPermitBinding, LaunchAuthority), NativeRefusal> {
+            if self.expected != EffectPlan::from_target(target)? {
+                return Err(REFUSED);
+            }
+            self.intent.verify(self.binding.workspace, self.slots)?;
+            Ok((self.binding, LaunchAuthority { _issued: () }))
+        }
+    }
+
+    #[derive(Eq, PartialEq)]
+    struct EffectInput {
+        role: ArtifactRole,
+        path: LocalPath,
+        identity: Option<FileIdentity>,
+        pin: Option<ArtifactPin>,
+    }
+
+    #[derive(Eq, PartialEq)]
+    struct EffectPlan {
+        kind: PlanKind,
+        argv: Vec<String>,
+        inputs: Vec<EffectInput>,
+        cwd: LocalPath,
+        pair: Option<PairSlots>,
+        installer: Option<(super::InstallerPhase, tokio::time::Instant)>,
+        recipe: Option<RecipeIdentity>,
+        memory: usize,
+        cpu_rate: u32,
+    }
+
+    impl EffectPlan {
+        fn from_target(target: LaunchTarget<'_, '_>) -> Result<Self, NativeRefusal> {
+            let plan: &CommandPlan<'_> = target.plan;
+            let inputs = plan
+                .inputs()
+                .iter()
+                .map(|(role, input)| {
+                    Ok::<_, NativeRefusal>(EffectInput {
+                        role: *role,
+                        path: input.path_for(*role).map_err(|_| REFUSED)?.clone(),
+                        identity: input.identity(),
+                        pin: input.pin(),
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Self {
+                kind: plan.kind(),
+                argv: plan.args().to_vec(),
+                inputs,
+                cwd: target.cwd.clone(),
+                pair: target.pair,
+                installer: target
+                    .installer
+                    .map(|stage| (stage.phase(), stage.deadline())),
+                recipe: target.recipe,
+                memory: target.memory,
+                cpu_rate: target.cpu_rate,
+            })
         }
     }
 }
@@ -333,7 +535,47 @@ impl StopEvidence {
 /// Release must be bound to the old generation and pin the slot against reuse.
 /// An observed process exit or fixture receipt cannot produce this lease.
 pub struct OfflineLease {
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     _closed: std::convert::Infallible,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    workspace: super::qualification::WorkspaceBinding,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    writers: Vec<super::paths::FileIdentity>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    _exclusion: Option<std::fs::File>,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl OfflineLease {
+    pub(in crate::vm) fn new(
+        workspace: super::qualification::WorkspaceBinding,
+        writers: Vec<super::paths::FileIdentity>,
+    ) -> Self {
+        Self {
+            workspace,
+            writers,
+            _exclusion: None,
+        }
+    }
+
+    pub(in crate::vm) fn holding(mut self, file: std::fs::File) -> Self {
+        self._exclusion = Some(file);
+        self
+    }
+
+    pub(in crate::vm) fn matches(
+        &self,
+        workspace: super::qualification::WorkspaceBinding,
+        plan: &super::qemu_args::CommandPlan<'_>,
+    ) -> bool {
+        workspace == self.workspace
+            && plan.inputs().iter().all(|(role, artifact)| {
+                !role.writable()
+                    || artifact
+                        .identity()
+                        .is_some_and(|id| self.writers.contains(&id))
+            })
+    }
 }
 
 pub const SNAPSHOT_COPY_MAXIMUM: Duration = Duration::from_secs(15 * 60);
@@ -381,16 +623,36 @@ pub(crate) enum Quiesced {
 }
 
 impl ReaperRuntime for CandidateRuntime<'_> {
-    fn quiesce(&self, _: &CleanupWork, _: Instant) -> Quiesced {
-        Quiesced::Unconfirmed
+    fn quiesce(&self, work: &CleanupWork, deadline: Instant) -> Quiesced {
+        self.native
+            .as_ref()
+            .map_or(Quiesced::Unconfirmed, |native| {
+                native.quiesce(work, deadline)
+            })
     }
 
-    fn graceful_stop(&self, _: &CleanupWork, _: Instant) -> StopDisposition {
-        StopDisposition::ChargedQuarantine
+    fn graceful_stop(&self, work: &CleanupWork, deadline: Instant) -> StopDisposition {
+        self.native
+            .as_ref()
+            .map_or(StopDisposition::ChargedQuarantine, |native| {
+                native.graceful_stop(work, deadline)
+            })
     }
 
-    fn force_reap(&self, _: &CleanupWork, _: Instant) -> StopDisposition {
-        StopDisposition::ChargedQuarantine
+    fn force_reap(&self, work: &CleanupWork, deadline: Instant) -> StopDisposition {
+        self.native
+            .as_ref()
+            .map_or(StopDisposition::ChargedQuarantine, |native| {
+                native.force_reap(work, deadline)
+            })
+    }
+}
+
+impl super::reaper::ArtifactCustody for CandidateRuntime<'_> {
+    fn reconcile(&self, work: &CleanupWork, deadline: Instant) -> bool {
+        self.native
+            .as_ref()
+            .is_some_and(|native| native.reconcile(work, deadline))
     }
 }
 
@@ -1523,9 +1785,12 @@ pub(crate) mod publication {
             self.origin_release = Some((generation, epoch));
         }
 
-        #[cfg(test)]
+        #[cfg(any(test, all(windows, target_arch = "x86_64")))]
         pub(crate) fn origin_release(&self) -> Option<(Id, Id)> {
-            self.origin_release
+            #[cfg(test)]
+            return self.origin_release;
+            #[cfg(not(test))]
+            None
         }
     }
 

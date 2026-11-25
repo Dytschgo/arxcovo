@@ -2696,7 +2696,7 @@ pub(crate) fn has_test_generation(db: &Connection, principal: &str, vm: Id) -> R
 
 /// Rehydrate the committed pair of a stopped TEST VM after reopen or commit.
 /// The caller re-verifies identity and content before any boot.
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) fn active_test_pair(
     db: &Connection,
     principal: &str,

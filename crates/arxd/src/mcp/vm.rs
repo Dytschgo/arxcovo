@@ -1,4 +1,6 @@
 //! Foreground-only VM tools. This module is selected after local authentication.
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod native_test;
 mod vault_test;
 use crate::{
     config::{TestVms, VmRuntimeProfile},
@@ -252,6 +254,8 @@ struct Gate {
     publish_profile: Option<Arc<Profile>>,
     publish_jobs: tokio::task::JoinSet<anyhow::Result<()>>,
     compose_jobs: tokio::task::JoinSet<anyhow::Result<()>>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    native_jobs: tokio::task::JoinSet<anyhow::Result<()>>,
     compose_active: Arc<Mutex<std::collections::HashSet<Id>>>,
     #[cfg(test)]
     fixture: Option<tests::Fixture>,
@@ -273,6 +277,8 @@ pub(crate) struct Supervisor {
     /// The validated native runtime profile, if configured. It only selects
     /// the closed candidate runtime; it never authorizes a launch here.
     runtime: Option<VmRuntimeProfile>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    native_test: Option<native_test::SelectedTest>,
     publisher: Publication,
     compose: compose::Host,
     compose_backup: compose_backup::BackupHost,
@@ -393,6 +399,26 @@ impl Supervisor {
         gate.publish_profile = profile.publication.map(Arc::from);
         state.recipes[1] = Some((WEB_RECIPE_ID, None));
         state.recipes[2] = Some((Controller::windows_recipe_id(), None));
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(selection) = state
+            .runtime
+            .as_ref()
+            .and_then(VmRuntimeProfile::test_qualification)
+        {
+            match native_test::SelectedTest::open(&state.controller, selection) {
+                Ok(native) => {
+                    let recipes = native.recipes();
+                    state.recipes[0] =
+                        Some((recipes.ubuntu.recipe_id, Some(recipes.ubuntu.recipe_sha256)));
+                    state.recipes[2] = Some((
+                        recipes.windows.recipe_id,
+                        Some(recipes.windows.recipe_sha256),
+                    ));
+                    state.native_test = Some(native);
+                }
+                Err(reason) => state.native_refusal = reason,
+            }
+        }
         Ok(supervisor)
     }
 
@@ -420,6 +446,8 @@ impl Supervisor {
                 publish_profile: None,
                 publish_jobs: Default::default(),
                 compose_jobs: Default::default(),
+                #[cfg(all(windows, target_arch = "x86_64"))]
+                native_jobs: Default::default(),
                 compose_active: Default::default(),
                 #[cfg(test)]
                 fixture: None,
@@ -433,6 +461,8 @@ impl Supervisor {
             recipes: [recipe.map(|(id, digest)| (id, Some(digest))), None, None],
             native_refusal,
             runtime,
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            native_test: None,
             publisher: Publication::default(),
             compose: compose::Host::default(),
             compose_backup: compose_backup::BackupHost::default(),
@@ -548,7 +578,15 @@ impl Supervisor {
     }
 
     fn candidate(&self) -> runtime::CandidateRuntime<'_> {
-        runtime::CandidateRuntime::new(self.runtime.as_ref())
+        let candidate = runtime::CandidateRuntime::new(self.runtime.as_ref());
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(native) = &self.native_test {
+            return candidate.selected_test(
+                native.capability(&self.controller).is_ok(),
+                native.reaper(&self.controller),
+            );
+        }
+        candidate
     }
 
     /// One bounded reaper turn before the listener is published.
@@ -569,6 +607,11 @@ impl Supervisor {
         #[cfg(test)]
         if let Some(reaper) = fixture {
             self.controller.sweep_with(&reaper, &*reaper.custody)?;
+            return Ok(());
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(native) = &self.native_test {
+            native.sweep(&self.controller)?;
             return Ok(());
         }
         self.controller.sweep_once(&self.candidate())?;
@@ -672,6 +715,8 @@ impl Supervisor {
     /// quiescence.
     pub(crate) async fn drain_workers(&self, bound: Duration) -> anyhow::Result<Drained> {
         let deadline = tokio::time::Instant::now() + bound;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        let mut native_jobs = std::mem::take(&mut self.lock()?.native_jobs);
         let (mut publish_jobs, mut compose_jobs) = {
             let mut gate = self.lock()?;
             (
@@ -718,6 +763,10 @@ impl Supervisor {
                 "publication settlement unconfirmed"
             );
             while let Some(job) = compose_jobs.join_next().await {
+                job??;
+            }
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            while let Some(job) = native_jobs.join_next().await {
                 job??;
             }
             Ok::<_, anyhow::Error>(())
@@ -797,6 +846,12 @@ impl Supervisor {
             return json!({"available":true});
         }
         let _ = gate;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(native) = &self.native_test {
+            return native.capability(&self.controller).unwrap_or_else(
+                |reason| json!({"available":false, "reason":native_reason(reason)}),
+            );
+        }
         json!({"available":false,"reason":native_reason(self.native_refusal)})
     }
 }
@@ -1615,6 +1670,10 @@ impl VmInventory {
                 if let Some(fixture) = &mut gate.fixture {
                     return fixture.snapshot(self, action, request, route);
                 }
+                #[cfg(all(windows, target_arch = "x86_64"))]
+                if !is_static && let Some(native) = &self.supervisor.native_test {
+                    return native.dispatch(self, gate, action, request);
+                }
                 let _route = route;
                 return self.refuse(
                     action,
@@ -1635,6 +1694,12 @@ impl VmInventory {
         #[cfg(test)]
         if let Some(fixture) = &mut gate.fixture {
             return fixture.admit(self, action, request, digest);
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if !matches!(request.work, Work::StaticCreate(_))
+            && let Some(native) = &self.supervisor.native_test
+        {
+            return native.dispatch(self, gate, action, request);
         }
         let _ = gate;
         self.refuse(
@@ -1899,7 +1964,12 @@ impl VmInventory {
                 let id = args.id("vm_id")?;
                 args.end()?;
                 let status = controller.get_status(&self.principal, id)??;
-                Ok(vm_row(status, gate, true))
+                let row = vm_row(status, gate, true);
+                #[cfg(all(windows, target_arch = "x86_64"))]
+                if let Some(native) = &self.supervisor.native_test {
+                    return Ok(native.project_status(controller, &self.principal, id, row));
+                }
+                Ok(row)
             }
             ToolName::Operation => {
                 let id = args.id("operation_id")?;
@@ -4730,7 +4800,7 @@ pub(crate) mod tests {
                                 match pair.map(|pair| artifacts.released_pair(pair)).transpose() {
                                     Ok(Some((held, pair))) => {
                                         let mut live = live.lock().unwrap();
-                                        controller.finish_fixture_stop(
+                                        controller.finish_offline_stop(
                                             &worker,
                                             vm,
                                             writer_epoch.unwrap_or([0; 16]),
@@ -4747,7 +4817,7 @@ pub(crate) mod tests {
                                         drop(held);
                                     }
                                     Ok(None) => {
-                                        controller.finish_fixture_stop(
+                                        controller.finish_offline_stop(
                                             &worker,
                                             vm,
                                             writer_epoch.unwrap_or([0; 16]),
@@ -4788,7 +4858,7 @@ pub(crate) mod tests {
                             match pair.map(|pair| artifacts.released_pair(pair)).transpose() {
                                 Ok(Some((held, pair))) => {
                                     let mut live = live.lock().unwrap();
-                                    if controller.finish_fixture_stop(
+                                    if controller.finish_offline_stop(
                                         &worker,
                                         vm,
                                         writer_epoch.unwrap_or([0; 16]),
@@ -4807,7 +4877,7 @@ pub(crate) mod tests {
                                     drop(held);
                                 }
                                 Ok(None) => {
-                                    controller.finish_fixture_stop(
+                                    controller.finish_offline_stop(
                                         &worker,
                                         vm,
                                         writer_epoch.unwrap_or([0; 16]),

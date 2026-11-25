@@ -379,7 +379,7 @@ fn bound_pin(path: &LocalPath, held: &PathPin, limit: u64) -> Result<PathPin, Na
     Ok(pin)
 }
 
-fn hash_at_rest(
+pub(super) fn hash_at_rest(
     pin: &mut PathPin,
     limit: u64,
     deadline: Instant,
@@ -1229,7 +1229,7 @@ $d=$sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($value))
 exit (([BitConverter]::ToInt32($d,0) -band 0x3fffffff) + 1)
 "#;
 
-const WINDOWS_SIGNED: &str = r#"
+pub(super) const WINDOWS_SIGNED: &str = r#"
 $ErrorActionPreference='Stop'
 $drivers=@(Get-CimInstance Win32_PnPSignedDriver)
 foreach ($service in @('viostor','vioser','netkvm')) {

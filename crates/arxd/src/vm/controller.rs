@@ -28,7 +28,7 @@ use std::{
 /// Foreground VM-profile metadata. A successful admission commits intent;
 /// there is no runtime, transport, or process launcher in this controller.
 pub struct VmController<C> {
-    store: VmStore,
+    store: Arc<VmStore>,
     policy: VmPolicy,
     clock: C,
     gate: Mutex<AdmissionGate>,
@@ -169,7 +169,7 @@ impl<C: Clock> VmController<C> {
     }
 
     pub fn open(vm_state_root: &Path, policy: VmPolicy, clock: C) -> Result<Self> {
-        let store = VmStore::open(vm_state_root, utc(clock.now())?)?;
+        let store = Arc::new(VmStore::open(vm_state_root, utc(clock.now())?)?);
         Ok(Self {
             store,
             policy,
@@ -178,6 +178,193 @@ impl<C: Clock> VmController<C> {
             sweeps: Mutex::default(),
             schedule: Mutex::default(),
             worker_binding: Arc::new(()),
+        })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn native_store(&self) -> Arc<VmStore> {
+        self.store.clone()
+    }
+
+    /// Capture the wall clock inside the store transaction. An unrelated
+    /// replay cannot advance the ledger between sampling and comparison.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn advance_native_clock(&self) -> Result<Option<ClockReading>> {
+        self.store.transact(|db| {
+            let clock = self.clock.now();
+            let now = utc(clock)?;
+            let updated = db.execute(
+                "UPDATE vm_retry_clock SET high_water_ms=?1 WHERE singleton=1 AND high_water_ms<=?1",
+                [now],
+            )?;
+            Ok((updated == 1).then_some(clock))
+        })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn validate_native_effect(
+        &self,
+        worker: &PendingOperation,
+        effect: &super::runtime::NativeEffectBinding<'_>,
+        slots: &[ArtifactSlot],
+    ) -> Result<bool> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let reading = self.clock.now();
+            if reading.monotonic >= worker.deadline
+                || !effect
+                    .generation
+                    .iter()
+                    .any(|&byte| byte != 0)
+            {
+                return Ok(false);
+            }
+            let now = utc(reading)?;
+            let matched = store::count(db,
+                "SELECT count(*) FROM vm_operations o JOIN vm_generations g ON g.id=?6
+                 WHERE o.activity_id=?1 AND o.operation_id=?2 AND o.principal=?3 AND o.request_key=?4
+                 AND o.action=?5 AND o.status=0 AND g.static_id IS NULL
+                 AND ((g.build_id IS NOT NULL AND EXISTS
+                    (SELECT 1 FROM vm_build_intents b WHERE b.id=g.build_id
+                     AND b.operation_id=o.operation_id AND b.state='pending'))
+                   OR (g.vm_id=o.vm AND EXISTS
+                    (SELECT 1 FROM vm_instances i WHERE i.id=o.vm AND i.principal=o.principal
+                     AND i.expires_ms>?7)))",
+                params![worker.activity_id, effect.operation, effect.principal, effect.request.key,
+                    effect.action, effect.generation, now])? == 1;
+            if !matched {
+                return Ok(false);
+            }
+            for slot in slots {
+                if slot.generation != effect.generation
+                    || store::count(db,
+                        "SELECT count(*) FROM vm_artifacts
+                         WHERE generation_id=?1 AND role=?2 AND object_key=?3
+                           AND state IN ('planned','created','identified','active')",
+                        params![slot.generation, slot.role, slot.key])? != 1
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn sealed_test_pair_for_template(
+        &self,
+        template: Id,
+        recipes: super::qualification_record::TestRecipes,
+    ) -> Result<Option<(super::qualification_record::RecipeIdentity, PairSlots)>> {
+        self.store.transact(|db| {
+            for identity in [recipes.ubuntu, recipes.windows] {
+                if let Some((matched, slots)) = store::sealed_pair(
+                    db,
+                    &hex::encode(identity.recipe_id),
+                    identity.recipe_sha256,
+                )? && template == matched
+                {
+                    return Ok(Some((identity, slots)));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn native_start_pair(
+        &self,
+        owner: &str,
+        vm: Id,
+    ) -> Result<Option<store::snapshot::Active>> {
+        self.store.transact(|db| {
+            if store::active_test_pair(db, owner, vm)?.is_none() {
+                return Ok(None);
+            }
+            store::snapshot::active(db, vm, false)
+        })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn native_record_release(
+        &self,
+        vm: Id,
+        epoch: Id,
+        pair: store::snapshot::Pair,
+        disposition: super::runtime::StopDisposition,
+    ) -> Result<()> {
+        self.store.transact(|db| {
+            store::snapshot::prove_stop(db, vm, epoch, pair, disposition)?;
+            db.execute(
+                "UPDATE vm_instances SET state=1 WHERE id=?1 AND state=2
+                 AND NOT EXISTS(SELECT 1 FROM vm_operations WHERE vm=?1 AND status=0)",
+                [vm],
+            )?;
+            Ok(())
+        })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn native_cleanup_safe(&self, work: &reaper::CleanupWork) -> Result<bool> {
+        self.store.transact(|db| {
+            let Some(vm) = work.kind.vm() else { return Ok(false) };
+            if store::count(db, "SELECT count(*) FROM vm_instances WHERE id=?1", [vm])? != 1 {
+                return Ok(false);
+            }
+            if let Some(worker) = work.pending_worker
+                && store::count(db, "SELECT count(*) FROM activity WHERE id=?1 AND status=0", [worker])? != 0
+            {
+                return Ok(false);
+            }
+            let generation_released = |generation: Option<Id>| store::count(
+                db,
+                "SELECT count(*) FROM vm_snapshot_release r JOIN vm_generations g ON g.id=r.generation
+                 WHERE g.vm_id=?1 AND g.static_id IS NULL AND r.disposition IS NOT NULL
+                   AND (?2 IS NULL AND g.active=1 OR g.id=?2)",
+                params![vm, generation],
+            ).map(|n| n == 1);
+            match work.kind {
+                reaper::CleanupKind::Expiry { .. } | reaper::CleanupKind::Recovery { .. } =>
+                    generation_released(None),
+                reaper::CleanupKind::Snapshot { generation, .. } => match work.snapshot_phase.as_deref() {
+                    Some("retire") => generation_released(Some(generation)),
+                    Some("expiry" | "delete" | "abandoned") => Ok(work.accounted),
+                    _ => Ok(false),
+                },
+                _ => Ok(false),
+            }
+        })
+    }
+
+    /// Checkpoint creation under the held helper release. The file remains
+    /// mutable for an authorized later phase, so this records object custody
+    /// without publishing or sealing payload bytes.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn native_helper_created(
+        &self,
+        worker: &PendingOperation,
+        slot: ArtifactSlot,
+        evidence: ArtifactEvidence,
+    ) -> Result<()> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            ensure!(self.clock.now().monotonic < worker.deadline, "native helper deadline");
+            ensure!(store::count(db,
+                "SELECT count(*) FROM vm_operations o JOIN vm_generations g ON g.id=?2
+                 WHERE o.activity_id=?1 AND o.status=0 AND g.static_id IS NULL
+                 AND ((o.action=1 AND o.vm=g.vm_id) OR
+                     (o.action=11 AND g.build_id IN
+                       (SELECT id FROM vm_build_intents WHERE operation_id=o.operation_id AND state='pending')))",
+                params![worker.activity_id, slot.generation])? == 1, "native helper receipt changed");
+            store::created(db, slot)?;
+            ensure!(db.execute(
+                "UPDATE vm_artifacts SET volume_id=?4,directory_id=?5,file_id=?6
+                 WHERE generation_id=?1 AND role=?2 AND object_key=?3 AND state='created'
+                   AND (file_id IS NULL OR (volume_id=?4 AND directory_id=?5 AND file_id=?6))",
+                params![slot.generation, slot.role, slot.key, evidence.identity.volume.to_be_bytes(),
+                    evidence.directory, evidence.identity.file],
+            )? == 1, "native helper artifact changed");
+            store::require_headroom(db)
         })
     }
 
@@ -1228,7 +1415,7 @@ impl<C: Clock> VmController<C> {
         turn: &mut VaultSweepPriority<'_>,
         fenced: &AtomicBool,
     ) -> Result<Option<VaultTestCleanup>> {
-        self.sweep_vault_test_with(vm, runtime, &ClosedCustody, turn, fenced)
+        self.sweep_vault_test_with(vm, runtime, runtime, turn, fenced)
     }
 
     pub(crate) fn sweep_vault_test_with(
@@ -1771,7 +1958,7 @@ impl<C: Clock> VmController<C> {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
     pub(crate) fn foreground_operation_ref(&self, principal: &str, receipt: i64) -> Result<Id> {
         self.store.transact(|db| {
             Ok(db.query_row(
@@ -2463,9 +2650,9 @@ impl<C: Clock> VmController<C> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 impl<C: Clock> VmController<C> {
-    pub(crate) fn finish_fixture_stop(
+    pub(crate) fn finish_offline_stop(
         &self,
         worker: &PendingOperation,
         vm: Id,

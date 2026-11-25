@@ -225,7 +225,7 @@ fn recipe_selected(
     }
 }
 
-impl ForegroundQualification<'_> {
+impl ForegroundQualification {
     pub(crate) fn stage_installer<'a>(
         &self,
         reservation: InstallerReservation<'a>,
@@ -486,6 +486,31 @@ impl ForegroundQualification<'_> {
             .windows
             .image
             .probe(validation))
+    }
+
+    pub(crate) fn installer_checks(
+        &self,
+        recipe: RecipeIdentity,
+        before_finalize: bool,
+    ) -> Result<Vec<String>, NativeRefusal> {
+        let recipes = self.evidence().recipes;
+        if recipe == recipes.ubuntu && !before_finalize {
+            return Ok(vec![crate::vm::template::UBUNTU_DETACHED_HEALTH.to_owned()]);
+        }
+        let mut checks = vec![self.windows_health(recipe, before_finalize)?];
+        if before_finalize {
+            checks.push(launch::WINDOWS_SIGNED.to_owned());
+        }
+        Ok(checks)
+    }
+
+    pub(crate) fn firmware_pin(&self) -> Result<ArtifactPin, NativeRefusal> {
+        self.recipes
+            .lock()
+            .map_err(|_| PHASE)?
+            .code
+            .verified_content
+            .ok_or(PHASE)
     }
 
     fn check_workspace(

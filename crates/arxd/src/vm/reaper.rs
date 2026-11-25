@@ -535,6 +535,9 @@ mod reaper_tests {
         sync::{Arc, Barrier, Mutex},
     };
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    mod test_native_ledger;
+
     const NOW: i64 = 1_800_000_000_000;
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;

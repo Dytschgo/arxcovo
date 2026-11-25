@@ -27,6 +27,11 @@ impl ProductionWorkspace {
         self.binding
     }
 
+    pub(crate) fn slot_path(&self, slot: ArtifactSlot) -> Result<LocalPath, NativeRefusal> {
+        self.valid_slot(slot)?;
+        slot_path(&self.root.path, slot)
+    }
+
     pub(super) fn pin_slot(
         &self,
         slot: ArtifactSlot,
@@ -46,9 +51,203 @@ impl ProductionWorkspace {
         }
         Ok(pin)
     }
+
+    pub(crate) fn open_slot(
+        &self,
+        slot: ArtifactSlot,
+        identity: FileIdentity,
+        mutable: bool,
+    ) -> Result<HeldSlot, NativeRefusal> {
+        self.valid_slot(slot)?;
+        Ok(HeldSlot {
+            pin: self.pin_slot(slot, identity, mutable)?,
+            directory: self.binding.workspace.file,
+        })
+    }
+
+    pub(crate) fn create_slot(
+        &self,
+        slot: ArtifactSlot,
+        bytes: &[u8],
+        authority: crate::vm::runtime::LaunchAuthority,
+    ) -> Result<HeldSlot, NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        if bytes.len() > MAX_SETUP_VARS_BYTES as usize {
+            return Err(reason);
+        }
+        let mut writer = self.create_writer(slot, authority)?;
+        writer.write(0, bytes)?;
+        writer.flush()
+    }
+
+    pub(crate) fn create_writer(
+        &self,
+        slot: ArtifactSlot,
+        _authority: crate::vm::runtime::LaunchAuthority,
+    ) -> Result<SlotWriter, NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        self.valid_slot(slot)?;
+        WorkspaceCustody::production(&self.root, &self.lease)?;
+        let path = slot_path(&self.root.path, slot)?;
+        let leaf = path.as_str().rsplit('\\').next().ok_or(reason)?;
+        let file =
+            open_relative(&self.root.leaf, leaf, Node::File, true, true).map_err(|_| reason)?;
+        let (identity, _) = file_identity(&file, false).map_err(|_| reason)?;
+        let held = self.open_slot(slot, identity, true)?;
+        Ok(SlotWriter { held, file })
+    }
+
+    pub(crate) fn fresh_disk(
+        &self,
+        slot: ArtifactSlot,
+        authority: crate::vm::runtime::LaunchAuthority,
+    ) -> Result<(HeldSlot, crate::vm::runtime::OfflineLease), NativeRefusal> {
+        if !matches!(slot.role, "disk" | "verification_overlay") {
+            return Err(NativeRefusal::PathCustodyUnverified);
+        }
+        let pin = self.create_slot(slot, &[], authority)?;
+        let lease = crate::vm::runtime::OfflineLease::new(self.binding, vec![pin.identity()]);
+        Ok((pin, lease))
+    }
+
+    pub(crate) fn remove_released_slot(
+        &self,
+        slot: ArtifactSlot,
+        identity: FileIdentity,
+        directory: Id,
+    ) -> Result<(), NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        self.valid_slot(slot)?;
+        if directory != self.binding.workspace.file {
+            return Err(reason);
+        }
+        WorkspaceCustody::production(&self.root, &self.lease)?;
+        let path = slot_path(&self.root.path, slot)?;
+        let leaf = path.as_str().rsplit('\\').next().ok_or(reason)?;
+        let file = open_relative_with_access(&self.root.leaf, leaf, Node::File, false, false, true)
+            .map_err(|_| reason)?;
+        if file_identity(&file, false).map_err(|_| reason)?.0 != identity {
+            return Err(reason);
+        }
+        crate::vm::publish::windows::delete_on_close(&file).map_err(|_| reason)?;
+        drop(file);
+        match open_relative(&self.root.leaf, leaf, Node::File, false, false) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(reason),
+        }
+    }
+
+    fn valid_slot(&self, slot: ArtifactSlot) -> Result<(), NativeRefusal> {
+        if slot.generation != self.binding.generation
+            || slot.key == [0; 16]
+            || !matches!(slot.role, "disk" | "vars" | "seed" | "verification_overlay")
+        {
+            return Err(NativeRefusal::PathCustodyUnverified);
+        }
+        Ok(())
+    }
 }
 
-impl ForegroundQualification<'_> {
+pub(crate) struct HeldSlot {
+    pin: PathPin,
+    directory: Id,
+}
+
+pub(crate) struct SlotWriter {
+    held: HeldSlot,
+    file: File,
+}
+
+impl SlotWriter {
+    pub(crate) fn held(&self) -> &HeldSlot {
+        &self.held
+    }
+
+    pub(crate) fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<(), NativeRefusal> {
+        use std::io::{Seek, SeekFrom, Write};
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| self.file.write_all(bytes))
+            .map_err(|_| NativeRefusal::PathCustodyUnverified)
+    }
+
+    pub(crate) fn flush(self) -> Result<HeldSlot, NativeRefusal> {
+        self.file
+            .sync_all()
+            .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
+        Ok(self.held)
+    }
+}
+
+impl HeldSlot {
+    pub(crate) fn identity(&self) -> FileIdentity {
+        self.pin.identity
+    }
+
+    pub(crate) fn observation(&self) -> Result<crate::vm::snapshot::Observation, NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        inventory::binding(&self.pin)?;
+        let (identity, _) = file_identity(&self.pin.leaf, false).map_err(|_| reason)?;
+        let size = self.pin.leaf.metadata().map_err(|_| reason)?.len();
+        Ok(crate::vm::snapshot::Observation { identity, size })
+    }
+
+    pub(crate) fn read(&self, offset: u64, bytes: &mut [u8]) -> Result<(), NativeRefusal> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = &self.pin.leaf;
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(bytes))
+            .map_err(|_| NativeRefusal::PathCustodyUnverified)
+    }
+
+    pub(crate) fn prove_offline(
+        &self,
+        workspace: &ProductionWorkspace,
+    ) -> Result<crate::vm::runtime::OfflineLease, NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        if workspace.binding.workspace.file != self.directory {
+            return Err(reason);
+        }
+        let writer_exclusion = self.pin.reopen_without_writer().map_err(|_| reason)?;
+        Ok(
+            crate::vm::runtime::OfflineLease::new(workspace.binding, vec![self.identity()])
+                .holding(writer_exclusion),
+        )
+    }
+
+    pub(crate) fn artifact(
+        &self,
+        role: ArtifactRole,
+    ) -> Result<crate::vm::paths::Artifact, NativeRefusal> {
+        launch::artifact(role, &self.pin)
+    }
+
+    pub(crate) fn header(&self) -> Result<Vec<u8>, NativeRefusal> {
+        launch::header(&self.pin)
+    }
+
+    pub(crate) fn vars(&self) -> Result<Vec<u8>, NativeRefusal> {
+        launch::held_bytes(&self.pin, MAX_SETUP_VARS_BYTES)
+    }
+
+    pub(crate) fn evidence(
+        &mut self,
+        limit: u64,
+        deadline: Instant,
+    ) -> Result<crate::vm::ArtifactEvidence, NativeRefusal> {
+        let pin = launch::hash_at_rest(&mut self.pin, limit, deadline)?;
+        Ok(crate::vm::ArtifactEvidence {
+            identity: self.pin.identity,
+            directory: self.directory,
+            pin,
+        })
+    }
+}
+
+impl ForegroundQualification {
+    pub(crate) fn selected_store_path(&self) -> &LocalPath {
+        &self.production_root().path
+    }
     pub(crate) fn hold_workspace(
         &self,
         root: &LocalPath,
@@ -62,6 +261,73 @@ impl ForegroundQualification<'_> {
             lease_name,
             generation,
         )
+    }
+
+    pub(crate) fn generation_workspace(
+        &self,
+        generation: Id,
+        reserve: bool,
+    ) -> Result<ProductionWorkspace, NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        if generation == [0; 16] {
+            return Err(reason);
+        }
+        let production = self.production_root();
+        let name = hex::encode(generation);
+        let path = production.path.join(&name).map_err(|_| reason)?;
+        let lease = "generation.lease";
+        let created = if reserve {
+            inventory::binding(production)?;
+            let directory = open_relative(&production.leaf, &name, Node::Directory, true, true)
+                .map_err(|_| reason)?;
+            let (id, _) = file_identity(&directory, true).map_err(|_| reason)?;
+            if id.volume != production.identity.volume
+                || !sink::held_private(&directory, self.held.token.account.0)
+            {
+                return Err(reason);
+            }
+            open_relative(&directory, lease, Node::File, true, true)
+                .and_then(|file| file.sync_all())
+                .map_err(|_| reason)?;
+            let read_pin = open_relative(&production.leaf, &name, Node::Directory, true, false)
+                .map_err(|_| reason)?;
+            if file_identity(&read_pin, true).map_err(|_| reason)?.0 != id {
+                return Err(reason);
+            }
+            drop(directory);
+            Some((read_pin, id))
+        } else {
+            None
+        };
+        let workspace = self.hold_workspace(&path, lease, generation)?;
+        if created.is_some_and(|(_, id)| id != workspace.binding().workspace) {
+            return Err(reason);
+        }
+        Ok(workspace)
+    }
+
+    pub(crate) fn read_sealed_pair(
+        &self,
+        pair: PairSlots,
+        deadline: Instant,
+    ) -> Result<[crate::vm::ArtifactEvidence; 2], NativeRefusal> {
+        let workspace = self.generation_workspace(pair.disk.generation, false)?;
+        let reason = NativeRefusal::PathCustodyUnverified;
+        let observe = |slot, limit| {
+            workspace.valid_slot(slot)?;
+            let mut held = HeldSlot {
+                pin: PathPin::open(&slot_path(&workspace.root.path, slot)?, false, false)?,
+                directory: workspace.binding.workspace.file,
+            };
+            if held.identity().volume != workspace.binding.workspace.volume {
+                return Err(reason);
+            }
+            held.evidence(limit, deadline)
+        };
+        Ok([
+            observe(pair.disk, 41 * GIB)?,
+            observe(pair.vars, MAX_SETUP_VARS_BYTES)?,
+        ])
     }
 
     pub(super) fn launch_live(&self, memory: usize) -> Result<Instant, NativeRefusal> {
@@ -221,7 +487,7 @@ pub(crate) struct LaunchRequest<'a> {
 #[must_use = "a created native launch needs stop or teardown"]
 pub(crate) struct NativeLaunch<'a> {
     core: CheckedLaunchCore<'a>,
-    qualification: &'a ForegroundQualification<'a>,
+    qualification: &'a ForegroundQualification,
     binding: WorkspaceBinding,
     targets: ReleaseTargets,
     serial: Option<&'a SerialName>,
@@ -272,6 +538,9 @@ fn validate_launch_request<'a>(
     let kind = plan.kind();
     let offline = plan.offline_lease();
     check_plan_gate(kind, pair.is_some(), offline.is_some())?;
+    if offline.is_some_and(|lease| !lease.matches(workspace_binding, plan)) {
+        return Err(NativeRefusal::PathCustodyUnverified);
+    }
     let bound_pair = match (kind, pair) {
         (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(pair)) => {
             check_pair(workspace_binding, pair)?;
@@ -295,7 +564,7 @@ fn validate_launch_request<'a>(
 
 impl<'a> NativeLaunch<'a> {
     pub(crate) fn hold(
-        qualification: &'a ForegroundQualification<'a>,
+        qualification: &'a ForegroundQualification,
         request: LaunchRequest<'a>,
         permit: impl LaunchPermit,
         refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
@@ -461,6 +730,7 @@ impl<'a> NativeLaunch<'a> {
 
     pub(crate) async fn run_script(
         &mut self,
+        _authority: crate::vm::runtime::LaunchAuthority,
         script: String,
         timeout_s: u32,
         cancel: &Shutdown,

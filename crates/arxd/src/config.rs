@@ -33,8 +33,69 @@ struct RawVmRuntimeProfile {
     state: String,
     disk_ceiling_bytes: u64,
     manifest: VmManifest,
+    #[serde(default)]
+    execution_profile: VmExecutionProfile,
+    #[serde(default, deserialize_with = "present")]
+    test_qualification: Option<Box<RawTestQualification>>,
     #[serde(default, deserialize_with = "present")]
     public_egress: Option<Box<PublicEgressProfile>>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum VmExecutionProfile {
+    #[default]
+    DedicatedAccount,
+    CurrentUser,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTestQualification {
+    enrollment: String,
+    dossier: String,
+    sha256: String,
+    scope: String,
+}
+
+#[derive(Clone)]
+#[cfg_attr(
+    not(all(windows, target_arch = "x86_64")),
+    allow(dead_code, reason = "native TEST startup is Windows x64 only")
+)]
+pub(crate) struct TestQualificationSelection {
+    pub(crate) enrollment: crate::vm::paths::LocalPath,
+    pub(crate) dossier: crate::vm::paths::LocalPath,
+    pub(crate) selection: crate::vm::qualification_record::Selection,
+}
+
+impl RawTestQualification {
+    fn checked(&self) -> Option<TestQualificationSelection> {
+        use crate::vm::paths::LocalPath;
+        let digest = |value: &str| {
+            let mut bytes = [0; 32];
+            (value.len() == 64
+                && value
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                && hex::decode_to_slice(value, &mut bytes).is_ok()
+                && bytes != [0; 32])
+                .then_some(bytes)
+        };
+        let enrollment = LocalPath::parse(&self.enrollment).ok()?;
+        let dossier = LocalPath::parse(&self.dossier).ok()?;
+        if enrollment.overlaps(&dossier) {
+            return None;
+        }
+        Some(TestQualificationSelection {
+            enrollment,
+            dossier,
+            selection: crate::vm::qualification_record::Selection {
+                seal_sha256: digest(&self.sha256)?,
+                scope: digest(&self.scope)?,
+            },
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -127,6 +188,13 @@ impl VmRuntimeProfile {
         {
             bail!(InvalidVmProfile);
         }
+        if let Some(selection) = &raw.test_qualification
+            && (!raw.enabled
+                || raw.execution_profile != VmExecutionProfile::CurrentUser
+                || selection.checked().is_none())
+        {
+            bail!(InvalidVmProfile);
+        }
         raw.validate_paths()?;
         Ok(Self(Box::new(raw)))
     }
@@ -137,6 +205,11 @@ impl VmRuntimeProfile {
 
     pub fn enabled(&self) -> bool {
         self.0.enabled
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn test_qualification(&self) -> Option<TestQualificationSelection> {
+        self.0.test_qualification.as_ref()?.checked()
     }
 
     pub fn manifest_id(&self) -> &'static str {
@@ -177,9 +250,19 @@ impl RawVmRuntimeProfile {
         let bundle = LocalPath::parse(&self.bundle).map_err(invalid_path)?;
         let volume = LocalPath::parse(&self.volume).map_err(invalid_path)?;
         let state = LocalPath::parse(&self.state).map_err(invalid_path)?;
-        if !local_account_sid(&self.owner_sid)
-            || !local_account_sid(&self.supervisor_sid)
-            || self.owner_sid == self.supervisor_sid
+        // Current-user SID canonicalization and elevation checks are made by
+        // the native qualification reader against the live primary token.
+        let identity_pair = match self.execution_profile {
+            VmExecutionProfile::DedicatedAccount => {
+                local_account_sid(&self.owner_sid)
+                    && local_account_sid(&self.supervisor_sid)
+                    && self.owner_sid != self.supervisor_sid
+            }
+            VmExecutionProfile::CurrentUser => {
+                self.owner_sid == self.supervisor_sid && sid_spelling(&self.owner_sid)
+            }
+        };
+        if !identity_pair
             || !volume.is_drive_root()
             || state.is_drive_root()
             || bundle.is_drive_root()
@@ -191,6 +274,30 @@ impl RawVmRuntimeProfile {
         }
         Ok(state)
     }
+}
+
+fn sid_spelling(sid: &str) -> bool {
+    let Some(parts) = sid.strip_prefix("S-1-") else {
+        return false;
+    };
+    let mut values = parts.split('-');
+    let Some(authority) = values.next() else {
+        return false;
+    };
+    let Ok(number) = authority.parse::<u64>() else {
+        return false;
+    };
+    if number >= 1 << 48 || number.to_string() != authority {
+        return false;
+    }
+    let mut count = 0;
+    for value in values {
+        count += 1;
+        if !value.parse::<u32>().is_ok_and(|n| n.to_string() == value) {
+            return false;
+        }
+    }
+    (1..=15).contains(&count)
 }
 
 fn local_account_sid(sid: &str) -> bool {
@@ -1294,6 +1401,38 @@ mod runtime_provenance_tests {
                 "policy": {"length": 512, "sha256": "a3".repeat(32)},
             },
         })
+    }
+
+    #[test]
+    fn test_qualification_selection_is_opt_in_and_strictly_pinned() {
+        let mut profile = runtime();
+        let parse = |value: &serde_json::Value| {
+            super::VmRuntimeProfile::parse(&serde_json::to_vec(value).unwrap())
+        };
+        assert!(parse(&profile).unwrap().0.test_qualification.is_none());
+        let selection = json!({
+            "enrollment": "D:/private/enrollment.json",
+            "dossier": "D:/private/dossier",
+            "sha256": "a1".repeat(32), "scope": "b2".repeat(32),
+        });
+        profile["test_qualification"] = selection.clone();
+        assert!(parse(&profile).is_err());
+        profile["execution_profile"] = json!("current_user");
+        profile["owner_sid"] = json!("S-1-12-1-1-2-3-4");
+        profile["supervisor_sid"] = profile["owner_sid"].clone();
+        let checked = parse(&profile).unwrap().0.test_qualification.unwrap();
+        assert_eq!(checked.checked().unwrap().selection.seal_sha256, [0xa1; 32]);
+        for (field, bad) in [
+            ("sha256", json!("00".repeat(32))),
+            ("scope", json!("F0".repeat(32))),
+            ("enrollment", json!("D:/private/dossier/enrollment.json")),
+            ("dossier", json!("D:/private/../qualification")),
+            ("unknown", json!(true)),
+        ] {
+            profile["test_qualification"] = selection.clone();
+            profile["test_qualification"][field] = bad;
+            assert!(parse(&profile).is_err());
+        }
     }
 
     #[test]

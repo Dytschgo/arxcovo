@@ -270,6 +270,17 @@ fn open_relative(
     mutable: bool,
     create: bool,
 ) -> io::Result<File> {
+    open_relative_with_access(parent, name, node, mutable, create, false)
+}
+
+fn open_relative_with_access(
+    parent: &File,
+    name: &str,
+    node: Node,
+    mutable: bool,
+    create: bool,
+    delete: bool,
+) -> io::Result<File> {
     if name.is_empty() || name.contains(['\\', '/', ':']) {
         return Err(io::Error::other("not a single path component"));
     }
@@ -291,12 +302,18 @@ fn open_relative(
     // Every branch requests data access, so the pin participates in sharing
     // checks: no branch shares delete, so rename and delete of a pinned
     // object are refused. A writable leaf shares write for its consumer.
-    let access = if create {
+    let access = if delete {
+        FILE_GENERIC_READ | DELETE
+    } else if create {
         FILE_GENERIC_WRITE | FILE_GENERIC_READ
     } else {
         FILE_GENERIC_READ | READ_CONTROL
     };
-    let share = FILE_SHARE_READ | if mutable { FILE_SHARE_WRITE } else { 0 };
+    let share = if delete {
+        0
+    } else {
+        FILE_SHARE_READ | if mutable { FILE_SHARE_WRITE } else { 0 }
+    };
     let options = FILE_OPEN_REPARSE_POINT
         | FILE_SYNCHRONOUS_IO_NONALERT
         | match node {
