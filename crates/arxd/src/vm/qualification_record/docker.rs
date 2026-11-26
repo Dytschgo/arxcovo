@@ -28,6 +28,7 @@ impl DockerRecipe {
 
     pub(super) fn valid(self) -> bool {
         recipe_id_valid(self.identity)
+            && self.identity.recipe_sha256 == self.closure
             && [self.web, self.closure, self.medium]
                 .iter()
                 .all(|hash| *hash != [0; 32])
@@ -43,16 +44,21 @@ pub(super) fn recipe_id_valid(identity: RecipeIdentity) -> bool {
 
 /// All hashes are computed from independently held and measured inputs. The
 /// key is distinct from TEST even where individual measurements are shared.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct DockerDependencies {
     pub supervisor_image: Hash,
+    pub qualifier_image: Hash,
     pub host: HostDependency,
     pub owner_logon: Hash,
     pub production_store: Hash,
     pub disposable_store: Hash,
     pub profile: Hash,
     pub installer: Hash,
+    pub guest: Hash,
     pub firmware: Hash,
+    pub stock_inventory: Hash,
+    pub network_fixture: Hash,
+    pub signed_inputs: Hash,
     pub recipe: DockerRecipe,
     pub compose_protocol: u32,
     pub origin_profile: Hash,
@@ -72,19 +78,26 @@ impl DockerDependencies {
             && self.recipe.valid()
             && self.production_store != self.disposable_store
             && self.compose_protocol == arx_guest::compose::COMPOSE_PROTOCOL_VERSION
-            && self.manifest != stock_manifest()
             && REVIEWED_EGRESS_BUILDS.iter().any(|build| {
-                build.qemu.sha256 == self.executable && build.receipt.sha256 == self.receipt
+                build.manifest.sha256 == self.manifest
+                    && build.qemu.sha256 == self.executable
+                    && build.receipt.sha256 == self.receipt
+                    && build.dependency_inventory() == self.loaded_artifacts
             })
             && [
                 scope,
                 self.supervisor_image,
+                self.qualifier_image,
                 self.owner_logon,
                 self.production_store,
                 self.disposable_store,
                 self.profile,
                 self.installer,
+                self.guest,
                 self.firmware,
+                self.stock_inventory,
+                self.network_fixture,
+                self.signed_inputs,
                 self.origin_profile,
                 self.manifest,
                 self.loaded_artifacts,
@@ -163,7 +176,8 @@ pub fn read_native_docker<R: Read>(
         .origin_mono_ms
         .checked_add(rows.last_finished_ms)
         .ok_or(RunError::Untrusted)?;
-    if fresh.now.mono_ms < finished
+    if fresh.now.mono_ms <= finished
+        || rows.docker.host_build != Some(dependencies.host.windows_build)
         || rows.docker.distribution
             != Some([
                 dependencies.manifest,
@@ -186,6 +200,7 @@ pub fn read_native_docker<R: Read>(
 
 #[derive(Default)]
 pub(super) struct Rows {
+    host_build: Option<u32>,
     distribution: Option<[Hash; 4]>,
     recipe: Option<DockerRecipe>,
     network: Option<(Hash, Hash)>,
@@ -196,6 +211,9 @@ impl Rows {
     pub(super) fn observe(&mut self, class: Class, result: &StageResult) -> Result<(), RunError> {
         use Observation as O;
         match result {
+            StageResult::Passed(O::Host { windows_build, .. }) if class == Class::Docker => {
+                self.host_build = Some(*windows_build);
+            }
             StageResult::Passed(O::DockerDistribution {
                 manifest,
                 executable,
