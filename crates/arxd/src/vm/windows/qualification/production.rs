@@ -3,7 +3,11 @@
 use super::recipe::{QualifiedBoot, TEST_JOB_MEMORY};
 use super::*;
 use crate::vm::qualification_record::Hash;
-use crate::vm::{ArtifactSlot, Id, PairSlots};
+use crate::vm::{ArtifactEvidence, ArtifactSlot, Id, PairSlots};
+
+const GENERATION_LEASE: &str = "generation.lease";
+const REFUSAL_OBSERVATION_BUDGET: Duration = Duration::from_secs(20);
+const START_PAIR_LIMITS: [u64; 2] = [41 * GIB, MAX_SETUP_VARS_BYTES];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WorkspaceBinding {
@@ -50,17 +54,9 @@ impl ProductionWorkspace {
 impl ForegroundQualification<'_> {
     pub(crate) fn hold_workspace(
         &self,
-        root: &LocalPath,
-        lease_name: &str,
-        generation: Id,
+        expected: WorkspaceBinding,
     ) -> Result<ProductionWorkspace, NativeRefusal> {
-        hold_workspace_under(
-            self.production_root(),
-            self.held.token.account.0,
-            root,
-            lease_name,
-            generation,
-        )
+        hold_workspace_under(self.production_root(), self.held.token.account.0, expected)
     }
 
     pub(super) fn launch_live(&self, memory: usize) -> Result<Instant, NativeRefusal> {
@@ -101,48 +97,259 @@ fn launch_reserves_sufficient(cpus: u32, available_ram: u64, memory: usize) -> b
     cpus >= 2 && required.is_some_and(|required| available_ram >= required)
 }
 
+fn has_exact_leaf(file: &File, name: &str) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_GUID};
+
+    // The normalized name from the held handle supplies NTFS's stored case.
+    let mut path = vec![0; 32_768];
+    let count = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            path.as_mut_ptr(),
+            path.len() as u32,
+            VOLUME_NAME_GUID,
+        )
+    } as usize;
+    count != 0
+        && count < path.len()
+        && path[..count]
+            .rsplit(|unit| *unit == u16::from(b'\\'))
+            .next()
+            .is_some_and(|leaf| leaf.iter().copied().eq(name.encode_utf16()))
+}
+
 fn hold_workspace_under(
     production: &PathPin,
     owner: PSID,
-    root: &LocalPath,
-    lease_name: &str,
-    generation: Id,
+    expected: WorkspaceBinding,
 ) -> Result<ProductionWorkspace, NativeRefusal> {
     let reason = NativeRefusal::PathCustodyUnverified;
-    if production.path.as_str().eq_ignore_ascii_case(root.as_str())
-        || !production.path.contains(root)
-        || generation == [0; 16]
+    inventory::binding(production)?;
+    if expected.generation == [0; 16]
+        || expected.production != production.identity
+        || file_identity(&production.leaf, true).map_err(|_| reason)?.0 != production.identity
     {
         return Err(reason);
     }
-    root.join(lease_name).map_err(|_| reason)?;
-    let root = PathPin::open(root, true, false)?;
-    if !root
-        ._ancestors
-        .iter()
-        .any(|parent| file_identity(parent, true).is_ok_and(|(id, _)| id == production.identity))
-        || !sink::held_private(&root.leaf, owner)
+    let name = hex::encode(expected.generation);
+    let path = production.path.join(&name).map_err(|_| reason)?;
+    let leaf = open_relative(&production.leaf, &name, Node::Directory, false, false)
+        .map_err(|_| reason)?;
+    let (identity, allocated) = file_identity(&leaf, true).map_err(|_| reason)?;
+    if identity != expected.workspace
+        || identity.volume != production.identity.volume
+        || !has_exact_leaf(&leaf, &name)
+        || !sink::held_private(&leaf, owner)
     {
         return Err(reason);
     }
     let lease =
-        open_relative(&root.leaf, lease_name, Node::File, false, false).map_err(|_| reason)?;
+        open_relative(&leaf, GENERATION_LEASE, Node::File, false, false).map_err(|_| reason)?;
     let (lease_id, _) = file_identity(&lease, false).map_err(|_| reason)?;
-    if !sink::held_private(&lease, owner) {
+    if lease_id != expected.lease
+        || lease_id.volume != identity.volume
+        || !has_exact_leaf(&lease, GENERATION_LEASE)
+        || lease.metadata().map_err(|_| reason)?.len() != 0
+        || !sink::held_private(&lease, owner)
+    {
         return Err(reason);
     }
+    let ancestors = production
+        ._ancestors
+        .iter()
+        .chain(std::iter::once(&production.leaf))
+        .map(File::try_clone)
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(|_| reason)?;
+    let root = PathPin {
+        _ancestors: ancestors,
+        leaf,
+        identity,
+        allocated,
+        path,
+        mutable: false,
+        verified_content: None,
+    };
+    // One nonblocking lock attempt. The returned handle is the lock owner.
     lease.try_lock().map_err(|_| reason)?;
     WorkspaceCustody::production(&root, &lease)?;
     Ok(ProductionWorkspace {
-        binding: WorkspaceBinding {
-            generation,
-            production: production.identity,
-            workspace: root.identity,
-            lease: lease_id,
-        },
+        binding: expected,
         root,
         lease,
     })
+}
+
+/// A refused start keeps its original lease and creation custody available to
+/// the consumer. Only a pre-acquire refusal may attempt to open a lease.
+#[must_use = "settle the refused start while its generation custody is held"]
+pub(crate) struct StartRefusal<'a> {
+    workspace: Option<&'a ProductionWorkspace>,
+    failure: HoldRefusal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartCreation {
+    NeverCreated,
+    Created,
+    Unconfirmed,
+}
+
+pub(crate) struct HeldStartRefusal<'a> {
+    workspace: &'a ProductionWorkspace,
+    pair: PairSlots,
+    release: Option<ReleasedGeneration<'a>>,
+}
+
+impl<'a> HeldStartRefusal<'a> {
+    pub(crate) fn workspace(&self) -> &'a ProductionWorkspace {
+        self.workspace
+    }
+
+    pub(crate) fn pair(&self) -> PairSlots {
+        self.pair
+    }
+
+    pub(crate) fn release(&self) -> Option<&ReleasedGeneration<'a>> {
+        self.release.as_ref()
+    }
+}
+
+impl<'a> StartRefusal<'a> {
+    pub(crate) fn before_create(
+        workspace: Option<&'a ProductionWorkspace>,
+        reason: NativeRefusal,
+    ) -> Self {
+        Self {
+            workspace,
+            failure: reason.into(),
+        }
+    }
+
+    fn while_held<T>(
+        workspace: &'a ProductionWorkspace,
+        attempt: impl FnOnce() -> Result<T, HoldRefusal>,
+    ) -> Result<T, Self> {
+        attempt().map_err(|failure| Self {
+            workspace: Some(workspace),
+            failure,
+        })
+    }
+
+    pub(crate) fn reason(&self) -> NativeRefusal {
+        self.failure.reason
+    }
+
+    pub(crate) fn creation(&self) -> StartCreation {
+        match &self.failure.creation {
+            LaunchCreation::NeverCreated => StartCreation::NeverCreated,
+            LaunchCreation::Created(_) => StartCreation::Created,
+            LaunchCreation::Unconfirmed { .. } => StartCreation::Unconfirmed,
+        }
+    }
+
+    pub(crate) async fn settle_created(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), NativeRefusal> {
+        let reason = NativeRefusal::JobUnverified;
+        match &mut self.failure.creation {
+            LaunchCreation::Created(child) => child.settle(deadline).await.map_err(|_| reason),
+            LaunchCreation::Unconfirmed { job, .. } => {
+                let _ = job.terminate();
+                Err(reason)
+            }
+            LaunchCreation::NeverCreated => Err(reason),
+        }
+    }
+
+    pub(crate) fn with_observation<T>(
+        &self,
+        expected: WorkspaceBinding,
+        (pair, evidence): (PairSlots, [ArtifactEvidence; 2]),
+        deadline: Instant,
+        stop: &dyn Fn() -> bool,
+        acquire: impl FnOnce(WorkspaceBinding) -> Result<ProductionWorkspace, NativeRefusal>,
+        consume: impl FnOnce(Option<HeldStartRefusal<'_>>) -> T,
+    ) -> T {
+        let deadline = deadline.min(Instant::now() + REFUSAL_OBSERVATION_BUDGET);
+        // A pre-acquire refusal can make one later, bounded attempt. A held
+        // refusal always uses its original lock, including after cancellation.
+        let newly_held = if self.workspace.is_none()
+            && self.creation() == StartCreation::NeverCreated
+            && launch::check_preparation(deadline, stop).is_ok()
+        {
+            acquire(expected).ok()
+        } else {
+            None
+        };
+        let observation = self
+            .workspace
+            .or(newly_held.as_ref())
+            .and_then(|workspace| {
+                (workspace.binding() == expected && check_pair(expected, pair).is_ok()).then(|| {
+                    let release = (self.creation() == StartCreation::NeverCreated)
+                        .then(|| {
+                            workspace
+                                .unchanged_pair(pair, evidence, deadline, stop)
+                                .ok()
+                        })
+                        .flatten();
+                    HeldStartRefusal {
+                        workspace,
+                        pair,
+                        release,
+                    }
+                })
+            });
+        consume(observation)
+    }
+}
+
+impl ProductionWorkspace {
+    fn unchanged_pair(
+        &self,
+        pair: PairSlots,
+        evidence: [ArtifactEvidence; 2],
+        deadline: Instant,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<ReleasedGeneration<'_>, NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        launch::check_preparation(deadline, stop)?;
+        let custody = WorkspaceCustody::production(&self.root, &self.lease)?;
+        let [disk, vars] = evidence;
+        if disk.directory != self.binding.workspace.file || vars.directory != disk.directory {
+            return Err(reason);
+        }
+        let pins = [
+            self.pin_slot(pair.disk, disk.identity, false)?,
+            self.pin_slot(pair.vars, vars.identity, false)?,
+        ];
+        // Both exclusions must be held before reading either file and survive
+        // the caller's commit decision.
+        let guards = pins
+            .iter()
+            .map(PathPin::reopen_without_writer)
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(|_| reason)?;
+        for ((guard, limit), expected) in guards.iter().zip(START_PAIR_LIMITS).zip(evidence) {
+            if launch::hash_held(guard, limit, deadline, stop)? != expected.pin {
+                return Err(reason);
+            }
+        }
+        custody.verify()?;
+        launch::check_preparation(deadline, stop)?;
+        ReleasedGeneration::checked(
+            self.binding,
+            ReleaseTargets::Pair {
+                pair,
+                ids: evidence.map(|file| file.identity),
+            },
+            custody,
+            (std::sync::Arc::from(pins), guards),
+        )
+        .ok_or(reason)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,6 +388,8 @@ pub(crate) struct LaunchRequest<'a> {
     pub installer: Option<InstallerStage>,
     pub memory: usize,
     pub cpu_rate: u32,
+    pub prepare_by: Instant,
+    pub cancelled: &'a dyn Fn() -> bool,
 }
 
 /// The live Job, verified QMP and guest connection, and exact writable
@@ -266,7 +475,19 @@ impl<'a> NativeLaunch<'a> {
         request: LaunchRequest<'a>,
         permit: impl LaunchPermit,
         refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
-    ) -> Result<Self, NativeRefusal> {
+    ) -> Result<Self, StartRefusal<'a>> {
+        let workspace = request.workspace;
+        StartRefusal::while_held(workspace, || {
+            Self::hold_inner(qualification, request, permit, refresh)
+        })
+    }
+
+    fn hold_inner(
+        qualification: &'a ForegroundQualification<'a>,
+        request: LaunchRequest<'a>,
+        permit: impl LaunchPermit,
+        refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
+    ) -> Result<Self, HoldRefusal> {
         let LaunchRequest {
             plan,
             boot_inputs,
@@ -276,7 +497,10 @@ impl<'a> NativeLaunch<'a> {
             installer,
             memory,
             cpu_rate,
+            prepare_by,
+            cancelled,
         } = request;
+        launch::check_preparation(prepare_by, cancelled)?;
         let reason = NativeRefusal::QualificationMissing;
         let ValidatedLaunch {
             workspace_binding,
@@ -306,9 +530,9 @@ impl<'a> NativeLaunch<'a> {
                 )?
             }
             (PlanKind::Inspect | PlanKind::InspectWritable | PlanKind::Mutate, None) => {}
-            _ => return Err(reason),
+            _ => return Err(reason.into()),
         }
-        let pins = hold_plan_inputs(&plan)?;
+        let pins = hold_plan_inputs(&plan, prepare_by, cancelled)?;
         let targets = match bound_pair {
             Some((pair, ids)) => ReleaseTargets::Pair { pair, ids },
             None => ReleaseTargets::Helper {
@@ -337,8 +561,7 @@ impl<'a> NativeLaunch<'a> {
             seal_sha256: qualification.seal_sha256(),
             kind,
         };
-        let mut authority = None;
-        let (core, read, write) =
+        let (core, io, authority) =
             CheckedLaunchCore::hold_checked(&qualification.held.token, inputs, |plan| {
                 let live = qualification.launch_live(memory)?;
                 let captured = refresh()?;
@@ -353,10 +576,9 @@ impl<'a> NativeLaunch<'a> {
                 };
                 let (issued, granted) = permit.consume(target)?;
                 check_permit(target_binding, issued)?;
-                authority = Some(granted);
-                Ok(captured.min(live))
+                launch::check_preparation(prepare_by, cancelled)?;
+                Ok((captured.min(live), granted))
             })?;
-        let _authority = authority.ok_or(reason)?;
         Ok(Self {
             core,
             qualification,
@@ -364,9 +586,9 @@ impl<'a> NativeLaunch<'a> {
             targets,
             serial: boot_inputs.map(QualifiedBoot::serial),
             _offline: offline,
-            _authority,
+            _authority: authority,
             memory,
-            io: Some((read, write)),
+            io: Some(io),
             live: None,
         })
     }
@@ -564,16 +786,25 @@ pub(super) fn slot_path(root: &LocalPath, slot: ArtifactSlot) -> Result<LocalPat
         .map_err(|_| NativeRefusal::PathCustodyUnverified)
 }
 
-fn hold_plan_inputs(plan: &CommandPlan<'_>) -> Result<Vec<PathPin>, NativeRefusal> {
+fn hold_plan_inputs(
+    plan: &CommandPlan<'_>,
+    deadline: Instant,
+    stop: &dyn Fn() -> bool,
+) -> Result<Vec<PathPin>, NativeRefusal> {
     use ArtifactRole::*;
     let reason = NativeRefusal::PathCustodyUnverified;
     plan.inputs()
         .iter()
         .map(|(role, artifact)| {
+            launch::check_preparation(deadline, stop)?;
             let path = artifact.path_for(*role).map_err(|_| reason)?;
             let mut pin = PathPin::open(path, *role == Data, role.writable())?;
-            if !matches!(role, Qemu | QemuImg | Data) && !role.writable() {
-                pin.verify_content(artifact.pin().ok_or(reason)?, DISK_CEILING)?;
+            if !matches!(role, Qemu | QemuImg | Data)
+                && !role.writable()
+                && launch::hash_at_rest_until(&mut pin, DISK_CEILING, deadline, stop)?
+                    != artifact.pin().ok_or(reason)?
+            {
+                return Err(reason);
             }
             Ok(pin)
         })
