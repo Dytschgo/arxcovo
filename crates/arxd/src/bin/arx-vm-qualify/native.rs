@@ -838,6 +838,16 @@ impl DiagnosticSink for BaselineSink<'_> {
 }
 
 pub(crate) fn run(enrollment: &str, evidence: &str, mode: Mode) -> Result<Outcome, RunError> {
+    let preflight = match mode {
+        Mode::Baseline => qualification::preflight,
+        Mode::Paused => qualification::preflight_paused,
+        Mode::Test => qualification::preflight_full_test,
+        Mode::Docker => {
+            return qualification::preflight_docker(enrollment, evidence)
+                .map_err(RunError::Native)
+                .map(|closed| match closed {});
+        }
+    };
     let runtime = (mode != Mode::Baseline)
         .then(|| {
             tokio::runtime::Builder::new_multi_thread()
@@ -850,11 +860,6 @@ pub(crate) fn run(enrollment: &str, evidence: &str, mode: Mode) -> Result<Outcom
     // Everything fallible happens before the preflight claims the output,
     // including the writer's own random scope and run. After the claim,
     // every failure settles as a typed diagnostic.
-    let preflight = match mode {
-        Mode::Baseline => qualification::preflight,
-        Mode::Paused => qualification::preflight_paused,
-        Mode::Test => qualification::preflight_full_test,
-    };
     let baseline = preflight(enrollment, evidence).map_err(RunError::Native)?;
     let cancel = Shutdown::default();
     let interrupt = runtime.as_ref().map(|rt| {

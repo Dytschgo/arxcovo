@@ -21,6 +21,8 @@ use arx_guest::compose_backup::{
 };
 use arx_guest::{MAX_SCRIPT, ScriptExecution, ScriptExecutor, ScriptOutcome, serve_with_compose};
 
+mod docker_trial;
+
 const PORT: &str = "org.arxcovo.agent.0";
 const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 const SERVICE: &str = "arx-guest.service";
@@ -34,6 +36,18 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(1);
 
 pub(crate) fn serve_virtio() -> Result<(), &'static str> {
     let port = open_port().map_err(|_| "virtio setup failed")?;
+    if let Some(mode) = docker_trial::mode().map_err(|_| "Compose trial mode refused")? {
+        if !compose_finalized().map_err(|_| "Compose guest marker refused")? {
+            return Err("Compose trial marker required");
+        }
+        return arx_guest::docker_trial::serve(
+            mode,
+            &port,
+            &port,
+            &mut docker_trial::LinuxBootstrap::default(),
+        )
+        .map_err(|_| "Compose trial bootstrap failed");
+    }
     let compose = match compose_finalized() {
         Ok(false) => None,
         Ok(true) => Some(qualify_compose().ok_or("Compose guest qualification failed")?),
