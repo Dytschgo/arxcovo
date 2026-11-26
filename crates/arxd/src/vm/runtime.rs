@@ -448,21 +448,16 @@ pub struct OfflineLease {
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 impl OfflineLease {
-    pub(in crate::vm) fn helper_target(
-        workspace: super::qualification::WorkspaceBinding,
-        target: super::paths::FileIdentity,
-    ) -> Self {
+    /// The only constructor: a held, ledger-identified helper target, which
+    /// only the checked custody code can produce.
+    pub(in crate::vm) fn for_helper(target: &super::qualification::HelperTarget<'_>) -> Self {
         Self {
-            target: (workspace, target),
+            target: (target.binding(), target.identity()),
         }
     }
 
-    pub(in crate::vm) fn binds(
-        &self,
-        workspace: super::qualification::WorkspaceBinding,
-        target: super::paths::FileIdentity,
-    ) -> bool {
-        self.target == (workspace, target)
+    pub(in crate::vm) fn binds(&self, target: &super::qualification::HelperTarget<'_>) -> bool {
+        self.target == (target.binding(), target.identity())
     }
 }
 

@@ -184,7 +184,7 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
         let consistent = match admitted.effect {
             AdmittedEffect::Start => target.writer_epoch == Some(admitted.operation),
             AdmittedEffect::Script { .. } => target.writer_epoch.is_some(),
-            AdmittedEffect::Clone => target.writer_epoch.is_none(),
+            AdmittedEffect::Clone { .. } => target.writer_epoch.is_none(),
             AdmittedEffect::Build { recipe_id, digest } => {
                 let recipe = RecipeIdentity {
                     recipe_id,
@@ -378,7 +378,7 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
                 })
             }
             (
-                AdmittedEffect::Build { .. } | AdmittedEffect::Clone,
+                AdmittedEffect::Build { .. } | AdmittedEffect::Clone { .. },
                 PlanKind::Inspect | PlanKind::InspectWritable | PlanKind::Mutate,
             ) => recipe.is_none(),
             _ => false,
@@ -464,7 +464,7 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         slot: ArtifactSlot,
         content: ArtifactPin,
     ) -> Result<CopyPermit<'_, S, C>, NativeRefusal> {
-        if !matches!(self.effect, AdmittedEffect::Clone)
+        if !matches!(self.effect, AdmittedEffect::Clone { .. })
             || self.target.writer_epoch.is_some()
             || slot.role != "vars"
             || slot.key == [0; 16]

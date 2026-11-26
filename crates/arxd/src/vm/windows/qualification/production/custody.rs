@@ -349,6 +349,10 @@ pub(crate) struct HelperTarget<'l> {
 }
 
 impl HelperTarget<'_> {
+    pub(crate) fn binding(&self) -> WorkspaceBinding {
+        self.binding
+    }
+
     pub(crate) fn slot(&self) -> ArtifactSlot {
         self.slot
     }

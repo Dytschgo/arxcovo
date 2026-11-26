@@ -1413,7 +1413,10 @@ fn recovery_authority_needs_exact_custody_not_selection() {
 #[test]
 fn launch_slots_come_from_the_target() {
     let start = AdmittedEffect::Start;
-    let clone = AdmittedEffect::Clone;
+    let clone = AdmittedEffect::Clone {
+        template: TEMPLATE,
+        golden: ACTIVE,
+    };
     let build = AdmittedEffect::Build {
         recipe_id: recipes().ubuntu.recipe_id,
         digest: recipes().ubuntu.recipe_sha256,
