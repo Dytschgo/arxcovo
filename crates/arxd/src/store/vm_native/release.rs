@@ -198,7 +198,9 @@ pub(crate) fn commit(
             )?;
             Status::Interrupted
         } else {
-            let completion = if clean && now.monotonic < stop.deadline && state == 2 {
+            // A stop admitted while the start was still pending (stopped,
+            // state 1) settles exactly like one admitted while running.
+            let completion = if clean && now.monotonic < stop.deadline && matches!(state, 1 | 2) {
                 Completion::Succeeded
             } else {
                 Completion::CleanupUnconfirmed

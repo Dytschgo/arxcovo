@@ -1943,3 +1943,42 @@ recovery authority. The production installation lands with activation in
 admission stays closed. Static, Compose and public-egress dispatch never
 receive these authorities.
 Native issuance is **unverified on real hardware**.
+
+### Installed TEST boot witness and stop ordering
+
+A fresh start records the exact active pair's writer epoch in the admission
+transaction. The scoped boot permit is consumed at checked creation, which
+records the Job origin before the process can exist. Refusal after acquiring
+the generation lease uses that same lease through the release decision.
+
+Only a child-bound guest-ready handshake, final liveness observation and
+successful commit of the exact start can publish a Windows witness. Its
+random ID is independent of the guest challenge and the start operation ID.
+The witness exists only in the live owner and is omitted on restart.
+vm_get checks the current generation, writer epoch and lease. Stop
+interrupts a pending start in the stop admission transaction and signals
+the exact owner, even when fresh effects are fenced. Stop and detected loss
+withdraw the witness before teardown waits. Teardown keeps process, Job,
+worker join evidence and writer exclusions through bounded retry. An exact
+release can commit independently of the stop receipt.
+
+The six-minute start deadline includes preparation, a setup phase of at
+most 60 seconds, and a guest-ready phase of at most 180 seconds from
+accepted cont. Every phase also observes the current lease, cancellation
+and writer epoch. Teardown has an independent budget and cannot publish
+readiness after a start deadline. Production TEST admission remains closed.
+Native behavior is **unverified on real hardware**.
+
+A refused start keeps retry ownership only while another observation can
+still prove its release: a created child until it settles, or a
+never-created start with a held or once-acquirable lease before its fixed
+cutoff. An unconfirmed creation terminates its Job. Every other refusal
+fences the exact writer epoch and hands it to recovery instead of pinning
+the lease and run registration until drain. The ready commit waits out
+short foreground gate contention, bounded by the start deadline and
+cancellation. A clean, on-time stop admitted while the start was still
+pending settles as a successful stop without recovery. A stop retry reuses
+an earlier graceful exit only while the Job stays empty. A surviving
+process forces termination and a dirty exit. An ordinary reaper turn that
+finds a live run owner wakes that owner's retry and does not compete for
+its generation. Orphan recovery runs only without a registered owner.

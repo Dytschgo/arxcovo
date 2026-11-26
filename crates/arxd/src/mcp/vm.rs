@@ -1,4 +1,6 @@
 //! Foreground-only VM tools. This module is selected after local authentication.
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod native_run;
 mod owned_worker;
 mod vault_test;
 use crate::{
@@ -263,6 +265,8 @@ struct Gate {
 
 pub(crate) struct Supervisor {
     controller: Arc<Controller>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    native_runs: owned_worker::Registry<Arc<native_run::Run>>,
     gate: Mutex<Gate>,
     /// Lock-free foreground admission fence, sampled inside the gate.
     fenced: AtomicBool,
@@ -424,6 +428,8 @@ impl Supervisor {
                 #[cfg(test)]
                 drained: None,
             }),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            native_runs: Default::default(),
             fenced: AtomicBool::new(false),
             cancel: Shutdown::default(),
             cursor_key: hmac::Key::new(hmac::HMAC_SHA256, &secret),
@@ -1397,11 +1403,20 @@ impl VmInventory {
             .ok()
             .and_then(|mut stall| stall.take())
             .map(tests::StallHook::enter);
-        if gate.closed
-            || self.supervisor.fenced.load(Ordering::SeqCst)
-            || self.closed.load(Ordering::SeqCst)
-            || cancelled()
+        // One session/cancellation sample at the dispatch linearization
+        // point, before the exact stop route and the admission fences.
+        if self.closed.load(Ordering::SeqCst) || cancelled() {
+            return Err(SHUTDOWN);
+        }
+        // A current TEST run owner's stop is admitted ahead of the fresh
+        // effect fences, so it still reaches a starting run after closure.
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if request.name == ToolName::Stop.name()
+            && let Some(result) = self.stop_subject(request.arguments.as_ref())
         {
+            return result;
+        }
+        if gate.closed || self.supervisor.fenced.load(Ordering::SeqCst) {
             return Err(SHUTDOWN);
         }
         let name = request.name.as_ref();
@@ -1906,7 +1921,10 @@ impl VmInventory {
                 let id = args.id("vm_id")?;
                 args.end()?;
                 let status = controller.get_status(&self.principal, id)??;
-                Ok(vm_row(status, gate, true))
+                let row = vm_row(status, gate, true);
+                #[cfg(all(windows, target_arch = "x86_64"))]
+                let row = self.project_native_run(id, row);
+                Ok(row)
             }
             ToolName::Operation => {
                 let id = args.id("operation_id")?;
@@ -14012,6 +14030,11 @@ pub(crate) mod tests {
         assert_settled_static_start(&h, &vm, &started);
         drop(a);
         h.shutdown().await.unwrap();
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    mod native_run_tests {
+        include!("vm/native_run/tests.rs");
     }
 
     include!("vm/vault_test_cases.rs");

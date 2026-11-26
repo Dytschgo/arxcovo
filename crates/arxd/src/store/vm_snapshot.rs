@@ -838,20 +838,21 @@ pub(super) fn settle_cleanup(
 }
 
 #[cfg(test)]
-pub(crate) use effects::*;
+pub(crate) use read_pair::Pair;
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+pub(crate) use read_pair::{Active, active};
 
-#[cfg(test)]
-mod effects {
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+mod read_pair {
     use super::*;
-    use crate::vm::{
-        DiskClaim,
-        runtime::publication::SnapshotRoute,
-        snapshot::{Request, SnapshotName},
-    };
 
     pub(crate) type Pair = (PairSlots, [ArtifactEvidence; 2]);
 
     #[derive(Clone, Copy)]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "snapshot effect consumers are deferred")
+    )]
     pub(crate) struct Active {
         pub pair: Pair,
         pub host: Id,
@@ -864,20 +865,7 @@ mod effects {
         pub clean: bool,
     }
 
-    pub(crate) struct Work {
-        pub activity: i64,
-        pub vm: Id,
-        pub is_static: bool,
-        pub action: i64,
-        pub active: Active,
-        pub source: Pair,
-        pub target: Id,
-        pub claim: DiskClaim,
-        pub points: [u32; 2],
-        pub candidate: Option<PairSlots>,
-    }
-
-    fn roles(is_static: bool) -> [&'static str; 2] {
+    pub(super) fn roles(is_static: bool) -> [&'static str; 2] {
         if is_static {
             ["static_disk", "static_vars"]
         } else {
@@ -885,7 +873,12 @@ mod effects {
         }
     }
 
-    fn pair(db: &Connection, generation: Id, is_static: bool, state: &str) -> Result<Pair> {
+    pub(super) fn pair(
+        db: &Connection,
+        generation: Id,
+        is_static: bool,
+        state: &str,
+    ) -> Result<Pair> {
         let [disk_role, vars_role] = roles(is_static);
         let mut stmt = db.prepare(
             "SELECT role,object_key,volume_id,directory_id,file_id,content_digest,bytes
@@ -1014,6 +1007,33 @@ mod effects {
             epoch,
             clean: disposition == "clean",
         }))
+    }
+}
+
+#[cfg(test)]
+pub(crate) use effects::*;
+
+#[cfg(test)]
+mod effects {
+    use super::read_pair::{pair, roles};
+    use super::*;
+    use crate::vm::{
+        DiskClaim,
+        runtime::publication::SnapshotRoute,
+        snapshot::{Request, SnapshotName},
+    };
+
+    pub(crate) struct Work {
+        pub activity: i64,
+        pub vm: Id,
+        pub is_static: bool,
+        pub action: i64,
+        pub active: Active,
+        pub source: Pair,
+        pub target: Id,
+        pub claim: DiskClaim,
+        pub points: [u32; 2],
+        pub candidate: Option<PairSlots>,
     }
 
     pub(crate) fn selected(
