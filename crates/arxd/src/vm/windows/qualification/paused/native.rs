@@ -17,6 +17,8 @@ const VARS: &str = "edk2-i386-vars.fd";
 pub enum PausedVerdict {
     Verified,
     Refused(NativeRefusal),
+    ReserveRefused(ReserveFailure),
+    PausedRefused(PausedCheck),
     OwnerActive,
     Qmp,
     Timeout,
@@ -41,6 +43,7 @@ pub struct PausedCompleted {
 pub struct PausedTrial {
     pub verdict: PausedVerdict,
     pub release: StopDisposition,
+    pub snapshot: Option<PausedSnapshot>,
     pub phase: PausedPhase,
     pub completed: PausedCompleted,
 }
@@ -86,18 +89,25 @@ impl<'a> PausedTrialPermit<'a> {
             PausedPhase::SuspendedChild
         };
         PausedTrial {
-            verdict: match result.paused {
-                Ok(()) => PausedVerdict::Verified,
-                Err(Failure::Refused(reason)) => PausedVerdict::Refused(reason),
-                Err(Failure::OwnerActive) => PausedVerdict::OwnerActive,
-                Err(Failure::Qmp(_)) => PausedVerdict::Qmp,
-                Err(Failure::Timeout) => PausedVerdict::Timeout,
-                Err(Failure::Cancelled) => PausedVerdict::Cancelled,
-            },
+            verdict: paused_verdict(result.paused),
             release: result.release,
+            snapshot: result.snapshot,
             phase,
             completed,
         }
+    }
+}
+
+pub(super) fn paused_verdict(result: Result<(), Failure>) -> PausedVerdict {
+    match result {
+        Ok(()) => PausedVerdict::Verified,
+        Err(Failure::Refused(reason)) => PausedVerdict::Refused(reason),
+        Err(Failure::Reserve(detail)) => PausedVerdict::ReserveRefused(detail),
+        Err(Failure::Paused(detail)) => PausedVerdict::PausedRefused(detail),
+        Err(Failure::OwnerActive) => PausedVerdict::OwnerActive,
+        Err(Failure::Qmp(_)) => PausedVerdict::Qmp,
+        Err(Failure::Timeout) => PausedVerdict::Timeout,
+        Err(Failure::Cancelled) => PausedVerdict::Cancelled,
     }
 }
 
@@ -196,9 +206,12 @@ impl<'a> FirmwareProbePermit<'a> {
             accepted,
             refusal: match trial.paused {
                 Ok(()) => None,
-                Err(Failure::Refused(reason)) => Some(reason),
                 Err(Failure::OwnerActive) => Some(NativeRefusal::OwnerActivityUnverified),
-                Err(_) => Some(NativeRefusal::QmpUnverified),
+                Err(error) => Some(
+                    error
+                        .native_refusal()
+                        .unwrap_or(NativeRefusal::QmpUnverified),
+                ),
             },
             release: trial.release,
             sec_marker_verified,
@@ -477,8 +490,8 @@ impl<'a> CapacityProbePermit<'a> {
 
         let ready: Result<(SlotGuard, u8), Failure> = (|| {
             before(cancel, cutoff)?;
-            let live = host.live(envelope)?;
-            live.check(envelope, Tick::now())?;
+            let live = host.live(envelope, ReserveStep::Admission)?;
+            live.check(envelope, Tick::now(), ReserveStep::Admission)?;
             if live.limits.vhd_virtual_bytes > DISK_CEILING {
                 return Err(reason.into());
             }
@@ -515,8 +528,8 @@ impl<'a> CapacityProbePermit<'a> {
         let trial_result: Result<(), Failure> = async {
             host.confirm_claim(trial_guard.slot()).await?;
             before(cancel, cutoff)?;
-            let initial = host.live(envelope)?;
-            initial.check(envelope, Tick::now())?;
+            let initial = host.live(envelope, ReserveStep::Admission)?;
+            initial.check(envelope, Tick::now(), ReserveStep::Admission)?;
             // Overlapping claim on the same held root must be excluded.
             if Slot::claim(root, host.baseline.run()).is_ok() {
                 return Err(reason.into());
@@ -532,8 +545,8 @@ impl<'a> CapacityProbePermit<'a> {
             writer.sync_all().map_err(|_| reason)?;
             let (_, allocated) = file_identity(writer, false).map_err(|_| reason)?;
             trial_allocated_bytes = allocated;
-            let sampled = host.live(envelope)?;
-            sampled.check(envelope, Tick::now())?;
+            let sampled = host.live(envelope, ReserveStep::Admission)?;
+            sampled.check(envelope, Tick::now(), ReserveStep::Admission)?;
             if allocated < ALLOCATION
                 || sampled
                     .limits
@@ -679,7 +692,7 @@ fn expected_fault_refusal(fault: ControlledFault) -> NativeRefusal {
 }
 
 fn fault_settled(fault: ControlledFault, result: &TrialResult) -> bool {
-    result.paused == Err(Failure::Refused(expected_fault_refusal(fault)))
+    result.paused.err().and_then(Failure::native_refusal) == Some(expected_fault_refusal(fault))
         && result.release == StopDisposition::DirtyRelease
 }
 
@@ -1133,8 +1146,11 @@ impl<'a> NetworkProbePermit<'a> {
             let vars = data.join(VARS).map_err(|_| reason)?;
             let path = trial.path.join(SEED).map_err(|_| reason)?;
             let console = SerialName::generate().map_err(|_| reason)?;
-            let live = host.live(envelope)?;
-            live.check(envelope, Tick::now()).map_err(|_| reason)?;
+            let live = host
+                .live(envelope, ReserveStep::Admission)
+                .map_err(|error| error.native_refusal().unwrap_or(reason))?;
+            live.check(envelope, Tick::now(), ReserveStep::Admission)
+                .map_err(|_| reason)?;
             Ok((source, code, vars, path, console))
         })();
         let (source, code, vars, path, console) = match setup {
@@ -1214,12 +1230,14 @@ impl<'a> NetworkProbePermit<'a> {
                     TrialResult {
                         paused: Err(reason.into()),
                         release: StopDisposition::DirtyRelease,
+                        snapshot: None,
                     }
                 }
             }
             Err(reason) => TrialResult {
                 paused: Err(reason.into()),
                 release: StopDisposition::DirtyRelease,
+                snapshot: None,
             },
         };
         let receipts = witnesses.settle().await;
@@ -1495,6 +1513,7 @@ struct ChildState {
     lost: Option<(OwnedHandle, u32)>,
     parent: Option<Stdio>,
     workers: Option<WorkerSet>,
+    dispatch: Option<Arc<DispatchGate>>,
     uncertain: bool,
 }
 
@@ -1532,8 +1551,13 @@ impl Windows<'_> {
         if slot.state.borrow().uncertain {
             return Err(NativeRefusal::DiskCeilingUnverified);
         }
-        let live = self.live(envelope)?;
-        live.check(envelope, Tick::now())
+        let step = ReserveStep::Monitoring;
+        let live = self.live(envelope, step).map_err(|error| {
+            error
+                .native_refusal()
+                .unwrap_or(NativeRefusal::ReservesUnverified)
+        })?;
+        live.check(envelope, Tick::now(), step)
             .map_err(|_| NativeRefusal::ReservesUnverified)
     }
 
@@ -1626,7 +1650,7 @@ impl Windows<'_> {
 impl<'a> Host for Windows<'a> {
     type Opens = Opens<'a>;
     type Slot = Slot;
-    type Reader = tokio::io::DuplexStream;
+    type Reader = PipeOutput;
     type Writer = tokio::io::DuplexStream;
     type Channel = tokio::net::windows::named_pipe::NamedPipeClient;
 
@@ -1694,7 +1718,7 @@ impl<'a> Host for Windows<'a> {
         ))
     }
 
-    fn live(&self, envelope: JobEnvelope) -> Result<Live, NativeRefusal> {
+    fn live(&self, envelope: JobEnvelope, step: ReserveStep) -> Result<Live, Failure> {
         let captured = Tick::now();
         // Capture the checked two-sample WTS/LSA observation once so any armed
         // WtsAmbiguity fault records original facts from this exact observation.
@@ -1702,8 +1726,9 @@ impl<'a> Host for Windows<'a> {
         let (mut console, input) = held
             .activity
             .capture(&held.token, activity::View::Admission)?;
-        let (active_cpus, available_ram_bytes) = host_resources()?;
-        let effective_cpus = cpu_scope()?;
+        let reserve = |failure| Failure::reserve(step, failure);
+        let (active_cpus, available_ram_bytes) = measured_host_resources().map_err(reserve)?;
+        let effective_cpus = cpu_scope().map_err(reserve)?;
         let whpx = hypervisor_present()?;
         let limits = self.live_limits()?;
         let mut live = Live {
@@ -1721,8 +1746,11 @@ impl<'a> Host for Windows<'a> {
         };
         if let Some(fault) = self.armed_fault.take() {
             // Confirm the unmodified fresh sample passes admission before mutating.
-            live.check(envelope, Tick::now())
-                .map_err(|_| NativeRefusal::ReservesUnverified)?;
+            live.check(envelope, Tick::now(), step)
+                .map_err(|error| match error {
+                    Failure::Reserve(_) => error,
+                    _ => NativeRefusal::ReservesUnverified.into(),
+                })?;
             let original = FaultRecord {
                 fault,
                 sampled_ms: u64::try_from(
@@ -1776,9 +1804,11 @@ impl<'a> Host for Windows<'a> {
         slot: &Slot,
         plan: &PausedPlan<'_>,
         opens: &Opens<'a>,
-    ) -> Result<(), NativeRefusal> {
+    ) -> Result<(), Failure> {
         let token = &self.baseline._held.token;
-        let (stdio, parent) = token.stdio().map_err(|_| NativeRefusal::QmpUnverified)?;
+        let (stdio, parent) = token
+            .stdio()
+            .map_err(|_| Failure::Paused(PausedCheck::PrepareStdio))?;
         let job = Job::with_process_limit(
             opens.envelope.job_memory_bytes,
             Some(opens.envelope.job_cpu_rate),
@@ -1802,11 +1832,12 @@ impl<'a> Host for Windows<'a> {
         self.launch_gate()
             .validate_search_and_bundle(opens.bundle, safe_dll_search())?;
         self.verify_media_bindings(plan)?;
-        let live = self.live(opens.envelope)?;
-        live.check(opens.envelope, Tick::now())
+        let step = ReserveStep::PreCreate;
+        let live = self.live(opens.envelope, step)?;
+        live.check(opens.envelope, Tick::now(), step)
             .map_err(|error| match error {
-                Failure::Refused(reason) => reason,
-                _ => NativeRefusal::OwnerActivityUnverified,
+                Failure::Refused(_) | Failure::Reserve(_) => error,
+                _ => NativeRefusal::OwnerActivityUnverified.into(),
             })?;
         let mut state = slot.state.borrow_mut();
         let (process, thread) = create_suspended(
@@ -1836,7 +1867,7 @@ impl<'a> Host for Windows<'a> {
         &self,
         slot: &Slot,
         envelope: JobEnvelope,
-    ) -> Result<Pipes<Self::Reader, Self::Writer>, NativeRefusal> {
+    ) -> Result<Pipes<Self::Reader, Self::Writer>, Failure> {
         let mut state = slot.state.borrow_mut();
         let child = state.child.as_ref().ok_or(NativeRefusal::JobUnverified)?;
         verify_child_policy(child, &self.baseline._held.token)?;
@@ -1849,12 +1880,16 @@ impl<'a> Host for Windows<'a> {
                 Some(1),
             )
             .map_err(|_| NativeRefusal::JobUnverified)?;
-        let parent = state.parent.take().ok_or(NativeRefusal::QmpUnverified)?;
+        let parent = state
+            .parent
+            .take()
+            .ok_or(Failure::Paused(PausedCheck::StdioMissing))?;
         let dispatch = Arc::new(DispatchGate::default());
         let (stdout, stdin, workers) = start_stdio(parent, dispatch.clone()).map_err(|_| {
             state.uncertain = true;
-            NativeRefusal::QmpUnverified
+            Failure::Paused(PausedCheck::StartStdioWorkers)
         })?;
+        state.dispatch = Some(dispatch.clone());
         state.workers = Some(workers);
         Ok(Pipes {
             stdout,
@@ -1886,10 +1921,7 @@ impl<'a> Host for Windows<'a> {
         slot: &Slot,
         query: impl Future<Output = Result<(), Failure>>,
     ) -> Result<(), Failure> {
-        require_live(slot)?;
-        query.await?;
-        require_live(slot)?;
-        Ok(())
+        between_liveness_gates(|| require_live(slot), query).await
     }
 
     async fn open_channel(
@@ -2005,6 +2037,32 @@ impl<'a> Host for Windows<'a> {
 
     fn completed_stop_protocol(&self, slot: &Slot) -> Option<StopProtocol> {
         slot.state.borrow().stop_done
+    }
+
+    fn refusal_snapshot(&self, slot: &Slot) -> Option<PausedSnapshot> {
+        let state = slot.state.borrow();
+        let child = match &state.child {
+            None => PausedChildState::Absent,
+            Some(child) => match wait(&child.process, 0) {
+                Ok(false) => PausedChildState::Live,
+                Ok(true) => {
+                    let mut status = 0;
+                    let observed =
+                        unsafe { GetExitCodeProcess(child.process.as_raw_handle(), &mut status) };
+                    PausedChildState::Exited {
+                        status: (observed != 0).then_some(status),
+                    }
+                }
+                Err(_) => PausedChildState::Unavailable,
+            },
+        };
+        Some(PausedSnapshot {
+            child,
+            dispatch: state
+                .dispatch
+                .as_ref()
+                .map(|gate| dispatch_state(gate.current())),
+        })
     }
 
     fn request_stop(&mut self, slot: &Slot) {
@@ -2144,20 +2202,46 @@ fn require_live(slot: &Slot) -> Result<(), NativeRefusal> {
         .map_err(|_| NativeRefusal::JobUnverified)
 }
 
-fn cpu_scope() -> Result<u32, NativeRefusal> {
+fn cpu_scope() -> Result<u32, ReserveCheck> {
     let process = unsafe { GetCurrentProcess() };
-    let (mut in_job, mut current, mut system) = (0, 0, 0);
+    check_cpu_scope(
+        || {
+            let mut in_job = 0;
+            (unsafe { IsProcessInJob(process, null_mut(), &mut in_job) } != 0)
+                .then_some(in_job != 0)
+        },
+        || unsafe { GetActiveProcessorGroupCount() },
+        || {
+            let (mut current, mut system) = (0, 0);
+            (unsafe { GetProcessAffinityMask(process, &mut current, &mut system) } != 0)
+                .then_some(current)
+        },
+    )
+}
+
+pub(super) fn check_cpu_scope(
+    in_job: impl FnOnce() -> Option<bool>,
+    groups: impl FnOnce() -> u16,
+    affinity: impl FnOnce() -> Option<usize>,
+) -> Result<u32, ReserveCheck> {
     // Refuse nesting and multiple processor groups until there is a measured
     // effective cap for those configurations.
-    if unsafe {
-        IsProcessInJob(process, null_mut(), &mut in_job) == 0
-            || in_job != 0
-            || GetActiveProcessorGroupCount() != 1
-            || GetProcessAffinityMask(process, &mut current, &mut system) == 0
-    } {
-        return Err(NativeRefusal::ReservesUnverified);
+    if in_job().ok_or(ReserveCheck::JobMembershipUnavailable)? {
+        return Err(ReserveCheck::QualifierInJob);
     }
-    Ok(current.count_ones())
+    let measured_count = groups();
+    if measured_count == 0 {
+        return Err(ReserveCheck::ProcessorGroupsUnavailable);
+    }
+    if measured_count != 1 {
+        return Err(ReserveCheck::ProcessorGroups {
+            measured_count,
+            required_count: 1,
+        });
+    }
+    affinity()
+        .map(usize::count_ones)
+        .ok_or(ReserveCheck::AffinityUnavailable)
 }
 
 #[cfg(test)]
@@ -2227,6 +2311,7 @@ mod tests {
             let result = TrialResult {
                 paused: expected,
                 release: StopDisposition::DirtyRelease,
+                snapshot: None,
             };
             assert!(fault_settled(fault, &result));
             assert!(!fault_settled(
@@ -2240,6 +2325,7 @@ mod tests {
                 fault,
                 &TrialResult {
                     release: StopDisposition::CleanRelease,
+                    snapshot: None,
                     ..result
                 }
             ));

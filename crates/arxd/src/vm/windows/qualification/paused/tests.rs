@@ -6,11 +6,11 @@ use std::{
     rc::Rc,
     task::{Context, Poll},
 };
+use tokio::io::AsyncWriteExt;
 
 const BUDGET: Duration = Duration::from_secs(1);
 const JOB: NativeRefusal = NativeRefusal::JobUnverified;
 const DISK: NativeRefusal = NativeRefusal::DiskCeilingUnverified;
-const RESERVES: NativeRefusal = NativeRefusal::ReservesUnverified;
 const OPENS: NativeRefusal = NativeRefusal::PathCustodyUnverified;
 const DISTRIBUTION: NativeRefusal = NativeRefusal::DistributionUnverified;
 const GREETING: &str = r#"{"QMP":{"version":{"qemu":{"major":11,"minor":1,"micro":3},"package":""},"capabilities":[]}}"#;
@@ -120,7 +120,8 @@ impl AsyncRead for AdvancingGreeting {
 struct FakeWriter {
     written: Rc<RefCell<Vec<u8>>>,
     dispatch: Arc<DispatchGate>,
-    late: bool,
+    late_at: Option<usize>,
+    writes: usize,
     queued_lag: Option<Duration>,
 }
 
@@ -144,7 +145,8 @@ impl AsyncWrite for FakeWriter {
         let written =
             self.dispatch
                 .write_pipe(&mut *self.written.borrow_mut(), bytes, &Shutdown::default());
-        if self.late {
+        self.writes += 1;
+        if self.late_at == Some(self.writes) {
             // The peer may already have replied. Set the worker clock past
             // the tracked window before recording the completion.
             *self.dispatch.test.clock.lock().unwrap() = Some(now + FRESHNESS);
@@ -191,11 +193,17 @@ struct Fake {
     fail: Option<(Step, NativeRefusal)>,
     live_override: Option<LiveOverride>,
     expiring_sample: Option<usize>,
+    qualifier_in_job: bool,
+    child_live: Cell<bool>,
     live_calls: Cell<usize>,
     stop: Stop,
     reopen: bool,
     late_reopen: bool,
-    late_write: bool,
+    late_write_at: Option<usize>,
+    query_accelerator: bool,
+    capture_refusal: bool,
+    pre_stop_exit: Option<u32>,
+    child_exit_at: Option<PausedLivenessGate>,
     queued_write_lag: Option<Duration>,
     pre_resume_lag: Option<Duration>,
     cancel_on_resume: bool,
@@ -234,11 +242,17 @@ impl Default for Fake {
             fail: None,
             live_override: None,
             expiring_sample: None,
+            qualifier_in_job: false,
+            child_live: Cell::default(),
             live_calls: Cell::default(),
             stop: Stop::Confirmed,
             reopen: true,
             late_reopen: false,
-            late_write: false,
+            late_write_at: None,
+            query_accelerator: false,
+            capture_refusal: false,
+            pre_stop_exit: None,
+            child_exit_at: None,
             queued_write_lag: None,
             pre_resume_lag: None,
             cancel_on_resume: false,
@@ -355,8 +369,13 @@ impl Host for Fake {
         Ok((FakeOpens, PEAK))
     }
 
-    fn live(&self, _: JobEnvelope) -> Result<Live, NativeRefusal> {
+    fn live(&self, _: JobEnvelope, step: ReserveStep) -> Result<Live, Failure> {
         let mut observation = live();
+        if self.qualifier_in_job {
+            observation.effective_cpus =
+                native::check_cpu_scope(|| Some(true), || 1, || Some(0xff))
+                    .map_err(|failure| Failure::reserve(step, failure))?;
+        }
         if self.expiring_sample == Some(self.live_calls.get()) {
             observation.captured -= FRESHNESS - OBSERVATION_REMAINING;
         }
@@ -379,11 +398,11 @@ impl Host for Fake {
             && !self.suppress_fault_denial
         {
             if let Some(reason) = self.fault_refusal_override {
-                return Err(reason);
+                return Err(reason.into());
             }
             match fault {
                 ControlledFault::WtsAmbiguity => {
-                    return Err(NativeRefusal::OwnerActivityUnverified);
+                    return Err(NativeRefusal::OwnerActivityUnverified.into());
                 }
                 ControlledFault::CpuReserve => observation.effective_cpus = 1,
                 ControlledFault::RamReserve => observation.available_ram_bytes = RAM_RESERVE,
@@ -410,7 +429,7 @@ impl Host for Fake {
         _: &FakeSlot,
         plan: &PausedPlan<'_>,
         _: &FakeOpens,
-    ) -> Result<(), NativeRefusal> {
+    ) -> Result<(), Failure> {
         assert!(self.charge_retained);
         assert_eq!(plan.image.as_str(), r"X:\fixture\qemu-system-x86_64.exe");
         if matches!(plan.purpose, LaunchPurpose::Paused) {
@@ -448,6 +467,7 @@ impl Host for Fake {
             );
         }
         self.step(Step::Create)?;
+        self.child_live.set(true);
         self.checkpoint(Step::Create).await;
         Ok(())
     }
@@ -456,7 +476,7 @@ impl Host for Fake {
         &self,
         _: &FakeSlot,
         _: JobEnvelope,
-    ) -> Result<Pipes<Self::Reader, Self::Writer>, NativeRefusal> {
+    ) -> Result<Pipes<Self::Reader, Self::Writer>, Failure> {
         self.step(Step::InspectChild)?;
         self.checkpoint(Step::InspectChild).await;
         let stdout: Self::Reader = if let Some(reader) = self.reader_override.borrow_mut().take() {
@@ -486,7 +506,8 @@ impl Host for Fake {
         let stdin = FakeWriter {
             written: self.written.clone(),
             dispatch: dispatch.clone(),
-            late: self.late_write,
+            late_at: self.late_write_at,
+            writes: 0,
             queued_lag: self.queued_write_lag,
         };
         Ok(Pipes {
@@ -523,11 +544,26 @@ impl Host for Fake {
     async fn verify_whpx(
         &self,
         _: &FakeSlot,
-        _: impl Future<Output = Result<(), Failure>>,
+        query: impl Future<Output = Result<(), Failure>>,
     ) -> Result<(), Failure> {
         self.step(Step::VerifyWhpx)?;
         self.checkpoint(Step::VerifyWhpx).await;
-        Ok(())
+        if !self.query_accelerator {
+            return Ok(());
+        }
+        // The held child exits after its prelaunch status, or after the
+        // accelerator reply and dispatch confirmation. The production gates
+        // observe that through the same helper the native adapter uses.
+        let exited =
+            Cell::new(self.child_exit_at == Some(PausedLivenessGate::BeforeAcceleratorQuery));
+        between_liveness_gates(|| if exited.get() { Err(JOB) } else { Ok(()) }, async {
+            query.await?;
+            if self.child_exit_at == Some(PausedLivenessGate::AfterAcceleratorConfirmation) {
+                exited.set(true);
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn open_channel(
@@ -586,6 +622,22 @@ impl Host for Fake {
         Ok(())
     }
 
+    fn refusal_snapshot(&self, _: &FakeSlot) -> Option<PausedSnapshot> {
+        assert!(!self.steps().contains(&Step::Stop));
+        self.capture_refusal.then(|| PausedSnapshot {
+            child: self.pre_stop_exit.map_or(PausedChildState::Live, |status| {
+                PausedChildState::Exited {
+                    status: Some(status),
+                }
+            }),
+            dispatch: self
+                .dispatch
+                .borrow()
+                .as_ref()
+                .map(|gate| dispatch_state(gate.current())),
+        })
+    }
+
     fn request_stop(&mut self, _: &FakeSlot) {
         self.steps.borrow_mut().push(Step::Stop);
         self.proof_workspace_held.set(false);
@@ -596,6 +648,9 @@ impl Host for Fake {
         self.checkpoint(Step::Stop).await;
         if matches!(self.stop, Stop::Late) {
             tokio::time::sleep_until(deadline).await;
+        }
+        if !matches!(self.stop, Stop::ChildAlive | Stop::Late) {
+            self.child_live.set(false);
         }
         StopEvidence {
             guest_shutdown: self.stop_done.get() == Some(StopProtocol::QmpPowerdown),
@@ -633,7 +688,8 @@ async fn exact_recipe_and_qmp_pause_require_custody_and_settle() {
         result,
         TrialResult {
             paused: Ok(()),
-            release: StopDisposition::DirtyRelease
+            release: StopDisposition::DirtyRelease,
+            snapshot: None,
         }
     );
     assert_eq!(host.live_calls.get(), 9);
@@ -746,35 +802,111 @@ async fn preflight_capability_cannot_substitute_for_whpx_initialization() {
 #[tokio::test]
 async fn greeting_reply_correlation_and_paused_state_fail_closed() {
     let stream = format!("{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n");
+    let channel = |step, error| PausedCheck::QmpChannel { step, error };
     let cases = [
         (
+            String::new(),
+            channel(PausedQmpStep::Greeting, ChannelError::Eof),
+        ),
+        (
             stream.replace("\"micro\":3", "\"micro\":2"),
-            ChannelError::Invalid,
+            PausedCheck::QmpGreetingVersion {
+                measured: [11, 1, 2],
+                required: [11, 1, 3],
+            },
+        ),
+        (
+            stream.replace(
+                "\"package\":\"\"",
+                &format!(r#""package":"{}""#, "x".repeat(257)),
+            ),
+            PausedCheck::QmpGreetingPackageBytes {
+                measured_bytes: 257,
+                maximum_bytes: 256,
+            },
+        ),
+        (
+            stream.replace(
+                "\"capabilities\":[]",
+                &format!(r#""capabilities":[{}]"#, vec![r#""x""#; 17].join(",")),
+            ),
+            PausedCheck::QmpGreetingCapabilityCount {
+                measured_count: 17,
+                maximum_count: 16,
+            },
+        ),
+        (
+            stream.replace("\"capabilities\":[]", r#""capabilities":[""]"#),
+            PausedCheck::QmpGreetingCapabilityBytes {
+                measured_bytes: 0,
+                minimum_bytes: 1,
+                maximum_bytes: 64,
+            },
+        ),
+        (
+            format!(
+                "{GREETING}\n{{\"error\":{{\"class\":\"GenericError\",\"desc\":\"private synthetic detail\"}},\"id\":1}}\n"
+            ),
+            channel(PausedQmpStep::Capabilities, ChannelError::Remote),
+        ),
+        (
+            format!("{GREETING}\n{{wrong}}\n"),
+            channel(PausedQmpStep::Capabilities, ChannelError::Invalid),
         ),
         (
             stream.replace("\"id\":1", "\"id\":0"),
-            ChannelError::Unexpected,
+            channel(PausedQmpStep::Capabilities, ChannelError::Unexpected),
         ),
         (
             stream.replace("\"id\":2", "\"id\":1"),
-            ChannelError::Unexpected,
+            channel(PausedQmpStep::QueryStatus, ChannelError::Unexpected),
         ),
         (
             stream.replace("prelaunch", "paused"),
-            ChannelError::Unexpected,
+            PausedCheck::QmpStatus {
+                measured: RunStatus::Paused,
+                required: RunStatus::Prelaunch,
+            },
         ),
         (
             stream.replace("\"running\":false", "\"running\":true"),
-            ChannelError::Invalid,
+            channel(PausedQmpStep::QueryStatus, ChannelError::Invalid),
         ),
-        (format!("{}\n", "x".repeat(65_537)), ChannelError::Oversize),
+        (
+            format!("{}\n", "x".repeat(65_537)),
+            channel(PausedQmpStep::Greeting, ChannelError::Oversize),
+        ),
     ];
     for (replies, reason) in cases {
+        let (client, mut peer) = tokio::io::duplex(70_000);
+        peer.write_all(replies.as_bytes()).await.unwrap();
+        drop(peer);
         let mut host = Fake {
-            replies: Some(replies),
+            reader_override: RefCell::new(Some(Box::new(client))),
             ..Fake::default()
         };
-        assert_eq!(host.run().await.paused, Err(Failure::Qmp(reason)));
+        assert_eq!(host.run().await.paused, Err(Failure::Paused(reason)));
+        assert_eq!(
+            host.steps()
+                .iter()
+                .filter(|&&step| step == Step::Create)
+                .count(),
+            1
+        );
+        assert_eq!(
+            host.steps()
+                .iter()
+                .filter(|&&step| step == Step::Resume)
+                .count(),
+            1
+        );
+        assert!(
+            !host
+                .written
+                .borrow()
+                .windows(4)
+                .any(|window| window == b"cont")
+        );
         assert!(
             host.steps()
                 .ends_with(&[Step::Stop, Step::Reopen, Step::Settle])
@@ -785,19 +917,231 @@ async fn greeting_reply_correlation_and_paused_state_fail_closed() {
 
 #[tokio::test]
 async fn acknowledgement_cannot_cure_late_stdio_write() {
+    for (write, step) in [
+        (1, PausedQmpStep::Capabilities),
+        (2, PausedQmpStep::QueryStatus),
+        (3, PausedQmpStep::QueryAccelerators),
+    ] {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(
+            format!(
+                "{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n{}\n",
+                r#"{"return":{"enabled":"whpx","present":["whpx"]},"id":3}"#,
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        drop(peer);
+        let mut host = Fake {
+            reader_override: RefCell::new(Some(Box::new(client))),
+            late_write_at: Some(write),
+            query_accelerator: true,
+            capture_refusal: true,
+            pre_stop_exit: (write == 3).then_some(42),
+            ..Fake::default()
+        };
+        let result = host.run().await;
+        assert_eq!(
+            result.paused,
+            Err(Failure::Paused(PausedCheck::DispatchUnconfirmed {
+                step,
+                state: PausedDispatchState::Ambiguous,
+                wait_limit_ms: 100,
+                wait_finished: true,
+            }))
+        );
+        let child = if write == 3 {
+            PausedChildState::Exited { status: Some(42) }
+        } else {
+            PausedChildState::Live
+        };
+        assert_eq!(
+            result.snapshot,
+            Some(PausedSnapshot {
+                child,
+                dispatch: Some(PausedDispatchState::Ambiguous)
+            })
+        );
+        assert_eq!(result.release, StopDisposition::DirtyRelease);
+        assert!(!host.child_live.get());
+        assert_eq!(
+            host.written
+                .borrow()
+                .iter()
+                .filter(|&&c| c == b'\n')
+                .count(),
+            write
+        );
+        assert!(!host.steps().contains(&Step::VerifyOpens));
+    }
+}
+
+#[tokio::test]
+async fn child_exit_at_either_accelerator_liveness_gate_names_the_gate_and_snapshots() {
+    const ACCELERATORS: &str = r#"{"return":{"enabled":"whpx","present":["whpx"]},"id":3}"#;
+    for (gate, commands) in [
+        (PausedLivenessGate::BeforeAcceleratorQuery, 2),
+        (PausedLivenessGate::AfterAcceleratorConfirmation, 3),
+    ] {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(
+            format!("{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n{ACCELERATORS}\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        drop(peer);
+        let mut host = Fake {
+            reader_override: RefCell::new(Some(Box::new(client))),
+            query_accelerator: true,
+            capture_refusal: true,
+            pre_stop_exit: Some(3221225477),
+            child_exit_at: Some(gate),
+            ..Fake::default()
+        };
+        let result = host.run().await;
+        let detail = PausedCheck::AcceleratorChildLiveness { gate };
+        assert_eq!(result.paused, Err(Failure::Paused(detail)));
+        // Both gates keep their Job refusal class for other launch purposes.
+        assert_eq!(
+            Failure::Paused(detail).native_refusal(),
+            Some(NativeRefusal::JobUnverified)
+        );
+        assert!(matches!(
+            native::paused_verdict(result.paused),
+            PausedVerdict::PausedRefused(verdict) if verdict == detail
+        ));
+        // The snapshot is taken before the stop request.
+        assert_eq!(
+            result.snapshot,
+            Some(PausedSnapshot {
+                child: PausedChildState::Exited {
+                    status: Some(3221225477)
+                },
+                dispatch: Some(PausedDispatchState::Idle),
+            })
+        );
+        assert_eq!(result.release, StopDisposition::DirtyRelease);
+        assert_eq!(
+            host.written
+                .borrow()
+                .iter()
+                .filter(|&&c| c == b'\n')
+                .count(),
+            commands
+        );
+        assert!(!host.completed_phases.get().prelaunch);
+        assert!(!host.steps().contains(&Step::VerifyOpens));
+        assert!(
+            host.steps()
+                .ends_with(&[Step::Stop, Step::Reopen, Step::Settle])
+        );
+    }
+}
+
+#[tokio::test]
+async fn peer_remote_error_text_never_reaches_the_serialized_record() {
+    use super::super::{DiagnosticFile, sink::tests::publish_blocked_row};
+    use crate::vm::qualification_record::{self as records, PausedFailure, Stage, StageResult};
+
+    const CLASS: &str = "ArxCanaryClass7f3e";
+    const DESC: &str = "arx-canary-desc X:/private-qmp-peer S-1-5-21-424242";
+    let (client, mut peer) = tokio::io::duplex(4096);
+    peer.write_all(
+        format!(
+            "{GREETING}\n{{\"error\":{{\"class\":\"{CLASS}\",\"desc\":\"{DESC}\"}},\"id\":1}}\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    drop(peer);
     let mut host = Fake {
-        late_write: true,
+        reader_override: RefCell::new(Some(Box::new(client))),
+        capture_refusal: true,
         ..Fake::default()
     };
-    assert_eq!(
-        host.run().await.paused,
-        Err(Failure::Qmp(ChannelError::Refused))
-    );
-    assert_eq!(
-        host.written.borrow().as_slice(),
-        b"{\"execute\":\"qmp_capabilities\",\"id\":1}\r\n"
-    );
-    assert!(!host.steps().contains(&Step::VerifyOpens));
+    let result = host.run().await;
+    let detail = PausedCheck::QmpChannel {
+        step: PausedQmpStep::Capabilities,
+        error: ChannelError::Remote,
+    };
+    assert_eq!(result.paused, Err(Failure::Paused(detail)));
+    // The qualifier binary projects a paused verdict onto this row shape.
+    let PausedVerdict::PausedRefused(failure) = native::paused_verdict(result.paused) else {
+        panic!("paused refusal expected");
+    };
+    let row = StageResult::PausedRefusalV1(PausedFailure {
+        failure,
+        snapshot: result.snapshot,
+    });
+    let wire = serde_json::to_string(&row).unwrap();
+    let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    // The held writer also refuses any row carrying a claimed canary.
+    let bytes = publish_blocked_row(
+        root.path(),
+        DiagnosticFile::WhpxQmpEndpoint,
+        "qemu_prelaunch_pause",
+        &wire,
+        &[CLASS, DESC],
+    )
+    .unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    for canary in [CLASS, DESC, "arx-canary", "private-qmp-peer", "S-1-5-21"] {
+        assert!(!text.contains(canary), "peer text reached the record");
+    }
+    let rows: Vec<records::Record> = records::decode(&bytes).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].stage, Stage::QemuPrelaunchPause);
+    assert_eq!(rows[0].result, row);
+}
+
+#[tokio::test]
+async fn paused_accelerator_report_preserves_schema_and_payload_refusals() {
+    for (response, detail) in [
+        (
+            r#"{"enabled":false,"present":["whpx"]}"#,
+            PausedCheck::WhpxChannel {
+                error: ChannelError::Invalid,
+            },
+        ),
+        (
+            r#"{"enabled":"tcg","present":["whpx","tcg"]}"#,
+            PausedCheck::WhpxNotEnabled,
+        ),
+        (
+            r#"{"enabled":"whpx","present":["tcg"]}"#,
+            PausedCheck::WhpxPresenceCount {
+                measured_count: 0,
+                required_count: 1,
+            },
+        ),
+        (
+            r#"{"enabled":"whpx","present":["whpx","private-unknown"]}"#,
+            PausedCheck::WhpxUnknownAccelerator,
+        ),
+    ] {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(
+            format!(
+                "{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n{{\"return\":{response},\"id\":3}}\n",
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        drop(peer);
+        let mut host = Fake {
+            reader_override: RefCell::new(Some(Box::new(client))),
+            query_accelerator: true,
+            ..Fake::default()
+        };
+        let result = host.run().await;
+        assert_eq!(result.paused, Err(Failure::Paused(detail)));
+        assert_eq!(result.release, StopDisposition::DirtyRelease);
+        assert!(!host.completed_phases.get().prelaunch);
+        assert!(!host.steps().contains(&Step::VerifyOpens));
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -806,7 +1150,13 @@ async fn stalled_peer_is_bounded_and_pressure_is_sampled_while_waiting() {
         replies: None,
         ..Fake::default()
     };
-    assert_eq!(stalled.run().await.paused, Err(Failure::Timeout));
+    assert_eq!(
+        stalled.run().await.paused,
+        Err(Failure::Paused(PausedCheck::QmpChannel {
+            step: PausedQmpStep::Greeting,
+            error: ChannelError::Timeout,
+        }))
+    );
     assert!(stalled.live_calls.get() > 5);
     assert!(!stalled.charge_retained);
 
@@ -843,7 +1193,7 @@ async fn cancellation_before_claim_and_after_resume_suppresses_qmp() {
     assert!(after_resume.written.borrow().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn live_pressure_and_freshness_gate_creation_resume_and_prelaunch() {
     let mut before_claim = Fake {
         live_override: Some((0, |sample| {
@@ -872,7 +1222,13 @@ async fn live_pressure_and_freshness_gate_creation_resume_and_prelaunch() {
     };
     assert_eq!(
         before_resume.run().await.paused,
-        Err(Failure::Refused(RESERVES))
+        Err(Failure::reserve(
+            ReserveStep::PreResume,
+            ReserveCheck::SampleStale {
+                age_ms: 5001,
+                limit_ms: 5000
+            },
+        ))
     );
     assert!(!before_resume.steps().contains(&Step::Resume));
 
@@ -882,7 +1238,7 @@ async fn live_pressure_and_freshness_gate_creation_resume_and_prelaunch() {
     };
     assert_eq!(
         after_prelaunch.run().await.paused,
-        Err(Failure::Refused(RESERVES))
+        Err(ram_refusal(ReserveStep::Monitoring, RAM_RESERVE))
     );
     assert!(!after_prelaunch.steps().contains(&Step::VerifyOpens));
     assert!(!after_prelaunch.charge_retained);
@@ -1011,6 +1367,7 @@ async fn cancellation_during_a_pending_claim_or_proof_settles_release() {
             TrialResult {
                 paused: Err(Failure::Cancelled),
                 release: StopDisposition::DirtyRelease,
+                snapshot: None,
             }
         );
         assert!(
@@ -1055,7 +1412,15 @@ async fn slow_proof_is_cut_off_before_next_stage_and_before_success() {
             ..Fake::default()
         };
         let started = Tick::now();
-        assert_eq!(host.run().await.paused, Err(Failure::Timeout));
+        let expected = if proof == Step::VerifyWhpx {
+            Failure::Paused(PausedCheck::QmpChannel {
+                step: PausedQmpStep::QueryAccelerators,
+                error: ChannelError::Timeout,
+            })
+        } else {
+            Failure::Timeout
+        };
+        assert_eq!(host.run().await.paused, Err(expected));
         assert!(Tick::now() - started < BUDGET * 2);
         assert!(
             host.steps()
@@ -1094,8 +1459,9 @@ async fn assert_due_pressure_precedes_proof_release(proof: Step) {
     assert_eq!(
         trial.await,
         TrialResult {
-            paused: Err(Failure::Refused(RESERVES)),
+            paused: Err(ram_refusal(ReserveStep::Monitoring, RAM_RESERVE)),
             release: StopDisposition::DirtyRelease,
+            snapshot: None,
         }
     );
     assert!(
@@ -1132,6 +1498,7 @@ async fn due_pressure_precedes_qmp_greeting_and_capabilities_write() {
         TrialResult {
             paused: Err(Failure::OwnerActive),
             release: StopDisposition::DirtyRelease,
+            snapshot: None,
         }
     );
     assert!(host.written.borrow().is_empty());
@@ -1162,8 +1529,9 @@ async fn assert_independently_ready_proof_refuses(proof: Step) {
     assert_eq!(
         result,
         TrialResult {
-            paused: Err(Failure::Refused(RESERVES)),
+            paused: Err(ram_refusal(ReserveStep::Monitoring, RAM_RESERVE)),
             release: StopDisposition::DirtyRelease,
+            snapshot: None,
         }
     );
     assert!(
@@ -1222,6 +1590,7 @@ fn assert_activity_refusal_without_qmp_writes(host: &Fake, result: TrialResult) 
         TrialResult {
             paused: Err(Failure::OwnerActive),
             release: StopDisposition::DirtyRelease,
+            snapshot: None,
         }
     );
     assert!(host.written.borrow().is_empty());
@@ -1251,6 +1620,7 @@ async fn expiring_observation_gates_the_first_resume_poll() {
             TrialResult {
                 paused: Err(Failure::OwnerActive),
                 release: StopDisposition::DirtyRelease,
+                snapshot: None,
             },
         );
         let steps = host.steps();
@@ -1280,8 +1650,9 @@ async fn expiring_observation_gates_proof_completion_and_pause_acceptance() {
         assert_eq!(
             result,
             TrialResult {
-                paused: Err(Failure::Refused(RESERVES)),
+                paused: Err(ram_refusal(ReserveStep::Monitoring, RAM_RESERVE)),
                 release: StopDisposition::DirtyRelease,
+                snapshot: None,
             },
             "{proof:?}",
         );
@@ -1299,7 +1670,7 @@ async fn expiring_observation_while_a_proof_returns_ready_requires_resampling() 
     let captured = now - (FRESHNESS - OBSERVATION_REMAINING);
     let gate = LivePoll::new(
         &cancel,
-        &|| Err(Failure::OwnerActive),
+        &|_| Err(Failure::OwnerActive),
         Freshness::new(captured, now, now + BUDGET),
     );
     let result = gate
@@ -1322,8 +1693,15 @@ async fn expiring_observation_in_the_final_sample_prevents_accepting_pause() {
     assert_eq!(
         host.run().await,
         TrialResult {
-            paused: Err(Failure::Refused(RESERVES)),
+            paused: Err(Failure::reserve(
+                ReserveStep::Monitoring,
+                ReserveCheck::SampleStale {
+                    age_ms: 5000,
+                    limit_ms: 5000
+                },
+            )),
             release: StopDisposition::DirtyRelease,
+            snapshot: None,
         },
     );
     assert!(
@@ -1362,8 +1740,12 @@ async fn a_queued_qmp_write_cannot_outlive_its_observation_or_pressure_deadline(
         assert_eq!(
             host.run().await,
             TrialResult {
-                paused: Err(Failure::Qmp(ChannelError::Io)),
+                paused: Err(Failure::Paused(PausedCheck::QmpChannel {
+                    step: PausedQmpStep::Capabilities,
+                    error: ChannelError::Io,
+                })),
                 release: StopDisposition::DirtyRelease,
+                snapshot: None,
             }
         );
         assert!(host.written.borrow().is_empty());
@@ -1395,7 +1777,7 @@ fn a_qmp_producer_waiting_for_dispatch_does_not_enqueue_past_cutoff() {
     let cancel = Shutdown::default();
     let live = LivePoll::new(
         &cancel,
-        &|| Ok(Tick::now()),
+        &|_| Ok(Tick::now()),
         Freshness::new(start, start, start + Duration::from_millis(40)),
     );
     let mut writer = LiveWriter {
@@ -1420,6 +1802,59 @@ fn a_qmp_producer_waiting_for_dispatch_does_not_enqueue_past_cutoff() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn dispatch_reports_arm_refusal_and_expiry_without_submitting_bytes() {
+    for expected in [
+        ReserveCheck::DispatchArmRefused,
+        ReserveCheck::DispatchWindowExpired { overdue_ms: 2 },
+    ] {
+        let start = Tick::now();
+        let cancel = Shutdown::default();
+        let gate = LivePoll::new(
+            &cancel,
+            &|_| Ok(Tick::now()),
+            Freshness::new(start, start, start + BUDGET),
+        );
+        let dispatch = DispatchGate::default();
+        if expected == ReserveCheck::DispatchArmRefused {
+            // The locked worker clock rejects the observation as future.
+            *dispatch.test.clock.lock().unwrap() =
+                Some((start - Duration::from_millis(1)).into_std());
+        } else {
+            // A previously armed command cannot use the still fresh sample
+            // to extend its shorter write deadline.
+            *dispatch.test.clock.lock().unwrap() = Some(start.into_std());
+            dispatch
+                .arm_until(
+                    start.into_std(),
+                    Some((start + Duration::from_millis(1)).into_std()),
+                )
+                .unwrap();
+            tokio::time::advance(Duration::from_millis(3)).await;
+        }
+
+        let mut writer = LiveWriter {
+            stream: LiveIo {
+                gate: &gate,
+                inner: Vec::new(),
+            },
+            dispatch: &dispatch,
+        };
+        let outcome = Pin::new(&mut writer).poll_write(
+            &mut Context::from_waker(std::task::Waker::noop()),
+            b"fixture",
+        );
+        assert!(
+            matches!(outcome, Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+        assert!(writer.stream.inner.is_empty());
+        assert_eq!(
+            gate.refused.get(),
+            Some(Failure::reserve(ReserveStep::Dispatch, expected))
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_healthy_delayed_greeting_arms_from_fresh_evidence_at_dispatch() {
     let mut host = Fake {
         greeting_delay: Some(PRESSURE_INTERVAL + Duration::from_millis(50)),
@@ -1432,22 +1867,195 @@ async fn a_healthy_delayed_greeting_arms_from_fresh_evidence_at_dispatch() {
     );
 }
 
+const REQUIRED_RAM: u64 = 19 * GIB;
+
+fn ram_refusal(step: ReserveStep, available_bytes: u64) -> Failure {
+    Failure::reserve(
+        step,
+        ReserveCheck::AvailableRam {
+            available_bytes,
+            required_bytes: REQUIRED_RAM,
+        },
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn inherited_job_refusal_is_projected_before_claim_or_create() {
+    let mut host = Fake {
+        qualifier_in_job: true,
+        ..Fake::default()
+    };
+    let result = host.run().await;
+    let expected = ReserveFailure {
+        step: ReserveStep::Admission,
+        failure: ReserveCheck::QualifierInJob,
+    };
+    assert!(matches!(
+        native::paused_verdict(result.paused),
+        PausedVerdict::ReserveRefused(detail) if detail == expected
+    ));
+    assert_eq!(host.steps(), [Step::ProveContract]);
+    assert!(!host.child_live.get());
+    assert!(!host.charge_retained);
+    assert_eq!(result.release, StopDisposition::DirtyRelease);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ram_at_the_envelope_admits_and_one_byte_less_refuses_before_resume() {
+    for (call, step) in [
+        (0, ReserveStep::Admission),
+        (2, ReserveStep::PostCreate),
+        (3, ReserveStep::PreResume),
+    ] {
+        let mut exact = Fake {
+            live_override: Some((call, |sample| sample.available_ram_bytes = REQUIRED_RAM)),
+            ..Fake::default()
+        };
+        assert_eq!(exact.run().await.paused, Ok(()));
+        assert!(exact.steps().contains(&Step::Resume));
+
+        let mut short = Fake {
+            live_override: Some((call, |sample| sample.available_ram_bytes = REQUIRED_RAM - 1)),
+            ..Fake::default()
+        };
+        let result = short.run().await;
+        assert_eq!(result.paused, Err(ram_refusal(step, REQUIRED_RAM - 1)));
+        assert_eq!(result.release, StopDisposition::DirtyRelease);
+        let steps = short.steps();
+        assert!(!steps.contains(&Step::Resume));
+        assert!(short.written.borrow().is_empty());
+        if call == 0 {
+            assert_eq!(steps, [Step::ProveContract]);
+        } else {
+            assert!(steps.contains(&Step::Create));
+            assert!(steps.ends_with(&[Step::Stop, Step::Reopen, Step::Settle]));
+        }
+        assert!(!short.child_live.get());
+        assert!(!short.charge_retained);
+    }
+
+    let mut uncertain = Fake {
+        live_override: Some((2, |sample| sample.available_ram_bytes = REQUIRED_RAM - 1)),
+        stop: Stop::ChildAlive,
+        ..Fake::default()
+    };
+    let result = uncertain.run().await;
+    assert_eq!(
+        result.paused,
+        Err(ram_refusal(ReserveStep::PostCreate, REQUIRED_RAM - 1))
+    );
+    assert_eq!(result.release, StopDisposition::ChargedQuarantine);
+    assert!(
+        uncertain
+            .steps()
+            .ends_with(&[Step::Create, Step::Stop, Step::Settle])
+    );
+    assert!(uncertain.child_live.get());
+    assert!(uncertain.charge_retained);
+}
+
 #[test]
-fn reserve_check_includes_nested_cpu_capacity_and_outside_job_ram() {
+fn reserve_check_reports_effective_cpu_count_and_rate_boundaries() {
     let mut sample = live();
-    sample.active_cpus = 5;
-    sample.effective_cpus = 3;
+    let step = ReserveStep::Admission;
+    let envelope = JobEnvelope::DISKLESS;
+    sample.active_cpus = 16;
+    sample.effective_cpus = 11;
     assert_eq!(
-        sample.check(PEAK, Tick::now()),
-        Err(Failure::Refused(RESERVES))
+        sample.check(envelope, sample.captured, step),
+        Err(Failure::reserve(
+            step,
+            ReserveCheck::CpuRate {
+                active_count: 16,
+                effective_count: 11,
+                requested_basis_points: 3750,
+                allowed_basis_points: 3125,
+            }
+        ))
     );
-    sample.effective_cpus = 5;
-    assert_eq!(sample.check(PEAK, Tick::now()), Ok(()));
-    sample.available_ram_bytes = RAM_RESERVE + JOB_MEMORY_BYTES as u64 + GIB - 1;
+    sample.effective_cpus = 12;
+    assert_eq!(sample.check(envelope, sample.captured, step), Ok(()));
+    for measured_count in [0, 1, 17] {
+        sample.effective_cpus = measured_count;
+        assert_eq!(
+            sample.check(envelope, sample.captured, step),
+            Err(Failure::reserve(
+                step,
+                ReserveCheck::EffectiveCpus {
+                    measured_count,
+                    minimum_count: 2,
+                    active_count: 16,
+                }
+            ))
+        );
+    }
+}
+
+#[test]
+fn reserve_check_reports_future_samples_and_overflow() {
+    let sample = live();
+    let step = ReserveStep::Admission;
     assert_eq!(
-        sample.check(PEAK, Tick::now()),
-        Err(Failure::Refused(RESERVES))
+        sample.check(PEAK, sample.captured - Duration::from_millis(12), step),
+        Err(Failure::reserve(
+            step,
+            ReserveCheck::SampleFuture { ahead_ms: 12 }
+        ))
     );
+    let too_large = JobEnvelope {
+        outside_ram_bytes: u64::MAX,
+        ..PEAK
+    };
+    assert_eq!(
+        sample.check(too_large, sample.captured, step),
+        Err(Failure::reserve(
+            step,
+            ReserveCheck::EnvelopeOverflow {
+                owner_bytes: RAM_RESERVE,
+                job_bytes: JOB_MEMORY_BYTES as u64,
+                outside_bytes: u64::MAX,
+            }
+        ))
+    );
+}
+
+#[test]
+fn reserve_apis_distinguish_unavailable_and_measured_zero() {
+    use native::check_cpu_scope;
+
+    assert_eq!(
+        check_host_resources(16, || None),
+        Err(ReserveCheck::MemoryStatusUnavailable)
+    );
+    assert_eq!(
+        check_host_resources(16, || Some(0)),
+        Err(ReserveCheck::AvailableRamSourceZero)
+    );
+    assert_eq!(check_host_resources(16, || Some(1)), Ok((16, 1)));
+    assert_eq!(
+        check_host_resources(0, || panic!("CPU count failed before memory could be read")),
+        Err(ReserveCheck::ActiveCpusUnavailable)
+    );
+    assert_eq!(
+        check_cpu_scope(|| None, || 1, || Some(0xffff)),
+        Err(ReserveCheck::JobMembershipUnavailable)
+    );
+    assert_eq!(
+        check_cpu_scope(|| Some(false), || 0, || Some(0xffff)),
+        Err(ReserveCheck::ProcessorGroupsUnavailable)
+    );
+    assert_eq!(
+        check_cpu_scope(|| Some(false), || 2, || Some(0xffff)),
+        Err(ReserveCheck::ProcessorGroups {
+            measured_count: 2,
+            required_count: 1
+        })
+    );
+    assert_eq!(
+        check_cpu_scope(|| Some(false), || 1, || None),
+        Err(ReserveCheck::AffinityUnavailable)
+    );
+    assert_eq!(check_cpu_scope(|| Some(false), || 1, || Some(0)), Ok(0));
 }
 
 #[test]
@@ -1557,6 +2165,7 @@ async fn launch_purpose_derives_exact_channel_prelaunch_quiet_and_stop_verb() {
         TrialResult {
             paused: Ok(()),
             release: StopDisposition::CleanRelease,
+            snapshot: None,
         }
     );
     assert_eq!(
@@ -1670,7 +2279,11 @@ async fn controlled_faults_traverse_live_poll_refusal_to_stop_and_quarantine_on_
         let result = host
             .run_purpose(LaunchPurpose::ControlledFault(fault), BUDGET)
             .await;
-        assert_eq!(result.paused, Err(Failure::Refused(expected)), "{fault:?}");
+        assert_eq!(
+            result.paused.err().and_then(Failure::native_refusal),
+            Some(expected),
+            "{fault:?}"
+        );
         assert_eq!(result.release, StopDisposition::DirtyRelease, "{fault:?}");
         assert!(host.opened_channels.borrow().is_empty());
         assert!(host.steps().ends_with(&[
@@ -1711,8 +2324,9 @@ async fn controlled_faults_traverse_live_poll_refusal_to_stop_and_quarantine_on_
     assert_eq!(
         q,
         TrialResult {
-            paused: Err(Failure::Refused(NativeRefusal::ReservesUnverified)),
+            paused: Err(ram_refusal(ReserveStep::Monitoring, RAM_RESERVE)),
             release: StopDisposition::ChargedQuarantine,
+            snapshot: None,
         }
     );
     assert!(bad_reopen.charge_retained);
