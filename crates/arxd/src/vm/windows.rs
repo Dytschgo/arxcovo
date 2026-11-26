@@ -2727,25 +2727,34 @@ async fn monitor_running<T, E>(
 }
 
 /// Release keeps its own teardown budget so custody evidence is collected
-/// after a refusal too. Output is accepted only if a fresh host sample taken
-/// after release settles, then cancellation and the original cutoff checked
-/// after that sample, all still allow it; this is the same order as the
-/// common monitor tail. The held release is returned in either case.
+/// after a refusal too. Output is accepted only if a host sample taken after
+/// release settles succeeds and its capture time is still fresh, and then
+/// cancellation and the original cutoff, checked after that sample, still
+/// allow it; this is the same order as the common monitor tail. The held
+/// release is returned in either case.
 async fn accept_after_release<T, E, R, S>(
     result: Result<T, E>,
     release: impl std::future::Future<Output = R>,
     cancel: &Shutdown,
     deadline: tokio::time::Instant,
     recheck: impl FnOnce() -> S,
+    stale: E,
     interrupted: impl Fn(ChannelError) -> E,
 ) -> (Result<T, E>, R)
 where
-    S: std::future::Future<Output = Result<(), E>>,
+    S: std::future::Future<Output = Result<std::time::Instant, E>>,
 {
     let release = release.await;
     let result = match result {
         Ok(value) => {
-            let sample = recheck().await;
+            let sample = recheck().await.and_then(|captured| {
+                fresh_observation(
+                    captured,
+                    std::time::Instant::now(),
+                    NativeRefusal::ReservesUnverified,
+                )
+                .map_err(|_| stale)
+            });
             if cancel.is_cancelled() {
                 Err(interrupted(ChannelError::Cancelled))
             } else if tokio::time::Instant::now() >= deadline {
@@ -2823,9 +2832,15 @@ async fn installer_session(
             let by = stage
                 .deadline()
                 .min(Instant::now() + Duration::from_secs(2));
-            tokio::time::timeout_at(by, child.exit(by))
+            let exited = tokio::time::timeout_at(by, child.exit(by))
                 .await
-                .map_err(|_| Failure::Timeout)?
+                .map_err(|_| Failure::Timeout)?;
+            // Expiry wins: an exit observed at or after the grace cutoff is
+            // late even when it was already ready when polled.
+            if Instant::now() >= by {
+                return Err(Failure::Timeout);
+            }
+            exited
         },
         || {
             refresh.borrow_mut()()
@@ -2926,7 +2941,8 @@ impl CheckedLaunchCore<'_> {
                 return Err(NativeRefusal::QualificationMissing);
             }
             self.stock.recheck_all(&self.pins, Some(&self.workspace))?;
-            self.child.resume_checked(cancel, &mut refresh)?;
+            self.child
+                .resume_checked_by(cancel, deadline, &mut refresh)?;
             monitor_running(
                 async {
                     let mut output = Vec::new();
@@ -2964,7 +2980,8 @@ impl CheckedLaunchCore<'_> {
             ),
             cancel,
             deadline,
-            || std::future::ready(refresh().map(drop)),
+            || std::future::ready(refresh()),
+            NativeRefusal::ReservesUnverified,
             |_| refused,
         )
         .await
@@ -3105,7 +3122,7 @@ impl CheckedLaunchCore<'_> {
                 return Err(Failure::Timeout);
             }
             self.child
-                .resume_checked_with_handoff(cancel, revalidate, || {
+                .resume_checked_with_handoff(cancel, Some(deadline), revalidate, || {
                     // QEMU opens writable pflash by name after resume. The
                     // original object and ancestry pin stays held across it.
                     drop(self.setup_vars_handoff.take());
@@ -3327,12 +3344,26 @@ impl Child {
         cancel: &Shutdown,
         revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
-        self.resume_checked_with_handoff(cancel, revalidate, || {})
+        self.resume_checked_with_handoff(cancel, None, revalidate, || {})
+    }
+
+    /// Resume only while the exclusive effect cutoff is still ahead. The
+    /// cutoff and cancellation are checked after revalidation, immediately
+    /// before the thread is released, so a slow sample cannot let the child
+    /// start late.
+    fn resume_checked_by(
+        &mut self,
+        cancel: &Shutdown,
+        cutoff: tokio::time::Instant,
+        revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        self.resume_checked_with_handoff(cancel, Some(cutoff), revalidate, || {})
     }
 
     fn resume_checked_with_handoff(
         &mut self,
         cancel: &Shutdown,
+        cutoff: Option<tokio::time::Instant>,
         revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
         handoff: impl FnOnce(),
     ) -> Result<(), NativeRefusal> {
@@ -3347,6 +3378,11 @@ impl Child {
             std::time::Instant::now(),
             NativeRefusal::ReservesUnverified,
         )?;
+        if let Some(cutoff) = cutoff
+            && (cancel.is_cancelled() || tokio::time::Instant::now() >= cutoff)
+        {
+            return Err(NativeRefusal::JobUnverified);
+        }
         handoff();
         self.resume().map_err(|_| NativeRefusal::JobUnverified)
     }
@@ -4274,6 +4310,59 @@ mod tests {
             })
             .unwrap();
         assert_eq!(calls, 2);
+        ready(&mut read).await;
+        write.write_all(&[42]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        child.reap(deadline).await.unwrap();
+        workers.join(deadline).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_once_the_effect_cutoff_or_cancellation_lands_during_revalidation() {
+        let Some((mut child, stdio)) = fixture_launch(0) else {
+            return;
+        };
+        let (mut read, mut write, workers) = start_stdio(stdio, Default::default()).unwrap();
+        let fresh = Shutdown::default();
+        // The cutoff is still ahead when resume starts and is reached while
+        // the otherwise valid sample runs; the thread must stay suspended.
+        let cutoff = tokio::time::Instant::now() + Duration::from_millis(20);
+        let mut calls = 0;
+        let refused = child.resume_checked_by(&fresh, cutoff, &mut || {
+            calls += 1;
+            std::thread::sleep(Duration::from_millis(40));
+            Ok(std::time::Instant::now())
+        });
+        assert!(tokio::time::Instant::now() >= cutoff);
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!(calls, 1);
+        assert!(child.suspended.is_some(), "thread released at the cutoff");
+        // Cancellation landing inside a valid sample also keeps it held.
+        let cancel = Shutdown::default();
+        let ahead = tokio::time::Instant::now() + Duration::from_secs(30);
+        let refused = child.resume_checked_by(&cancel, ahead, &mut || {
+            calls += 1;
+            cancel.cancel();
+            Ok(std::time::Instant::now())
+        });
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!(calls, 2);
+        assert!(child.suspended.is_some(), "thread released after cancel");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read.read_u8())
+                .await
+                .is_err(),
+            "the held child ran"
+        );
+        // With the cutoff still ahead after the sample, the child runs.
+        child
+            .resume_checked_by(&fresh, ahead, &mut || {
+                calls += 1;
+                Ok(std::time::Instant::now())
+            })
+            .unwrap();
+        assert_eq!(calls, 3);
+        assert!(child.suspended.is_none());
         ready(&mut read).await;
         write.write_all(&[42]).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);

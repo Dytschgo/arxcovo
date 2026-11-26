@@ -310,7 +310,8 @@ async fn cancellation_during_helper_release_withholds_output_and_keeps_proof() {
         },
         &cancel,
         Instant::now() + Duration::from_secs(10),
-        || async { Ok(()) },
+        || async { Ok(std::time::Instant::now()) },
+        ChannelError::Refused,
         |error| error,
     )
     .await;
@@ -329,7 +330,8 @@ async fn helper_release_past_the_cutoff_or_failing_host_withholds_output() {
         },
         &Shutdown::default(),
         deadline,
-        || async { Ok(()) },
+        || async { Ok(std::time::Instant::now()) },
+        ChannelError::Refused,
         |error| error,
     )
     .await;
@@ -341,6 +343,7 @@ async fn helper_release_past_the_cutoff_or_failing_host_withholds_output() {
         &Shutdown::default(),
         Instant::now() + LIVE_POLL,
         || async { Err(NativeRefusal::OwnerActivityUnverified) },
+        NativeRefusal::ReservesUnverified,
         |_| NativeRefusal::QmpUnverified,
     )
     .await;
@@ -350,7 +353,8 @@ async fn helper_release_past_the_cutoff_or_failing_host_withholds_output() {
         async {},
         &Shutdown::default(),
         Instant::now() + LIVE_POLL,
-        || async { Ok(()) },
+        || async { Ok(std::time::Instant::now()) },
+        NativeRefusal::ReservesUnverified,
         |_| NativeRefusal::QmpUnverified,
     )
     .await;
@@ -376,8 +380,9 @@ async fn cancellation_inside_post_release_recheck_withholds_output_and_keeps_pro
             // The sample itself is valid; cancellation lands while it runs.
             samples_ref.set(samples_ref.get() + 1);
             cancel_ref.cancel();
-            Ok(())
+            Ok(std::time::Instant::now())
         },
+        ChannelError::Refused,
         |error| error,
     )
     .await;
@@ -403,12 +408,107 @@ async fn cutoff_inside_post_release_recheck_withholds_output_and_keeps_proof() {
             tokio::time::advance(LIVE_POLL).await;
             assert_eq!(Instant::now(), deadline);
             samples_ref.set(samples_ref.get() + 1);
-            Ok(())
+            Ok(std::time::Instant::now())
         },
+        ChannelError::Refused,
         |error| error,
     )
     .await;
     assert_eq!(result, Err(ChannelError::Timeout));
     assert_eq!(held, HeldProof("release"));
     assert_eq!(samples.get(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_post_release_sample_withholds_output_and_keeps_proof() {
+    use crate::vm::runtime::FRESHNESS;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let samples = Cell::new(0);
+    let samples_ref = &samples;
+    let (result, held) = accept_after_release(
+        Ok::<_, NativeRefusal>(b"helper output"),
+        async { HeldProof("release") },
+        &Shutdown::default(),
+        deadline,
+        move || async move {
+            // Every check inside the sample passed, but its combined capture
+            // time is older than the freshness window when it is accepted.
+            samples_ref.set(samples_ref.get() + 1);
+            Ok(std::time::Instant::now()
+                .checked_sub(FRESHNESS + Duration::from_millis(1))
+                .unwrap())
+        },
+        NativeRefusal::ReservesUnverified,
+        |_| NativeRefusal::QmpUnverified,
+    )
+    .await;
+    // The helper cutoff is still well ahead, so only freshness refuses.
+    assert!(Instant::now() < deadline);
+    assert_eq!(result, Err(NativeRefusal::ReservesUnverified));
+    assert_eq!(held, HeldProof("release"));
+    assert_eq!(samples.get(), 1);
+}
+
+/// The child's exit becomes ready at exactly the grace cutoff it is given. It
+/// moves the paused clock itself so no second timer races the grace timer.
+struct ExitAtGrace(Cell<Option<Instant>>);
+
+impl InstallerChild for ExitAtGrace {
+    fn observe(&self, _: std::time::Instant) -> Result<(), NativeRefusal> {
+        Ok(())
+    }
+
+    async fn dispatch(
+        &self,
+        qmp: &mut PipeQmp,
+        cancel: &Shutdown,
+        _: InstallerStage,
+        mut refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(), InstallerFailureReason> {
+        Ok(qmp
+            .release_startup_hold(cancel, || refresh().is_ok())
+            .await?)
+    }
+
+    async fn exit(&self, by: Instant) -> Result<(), InstallerFailureReason> {
+        self.0.set(Some(by));
+        tokio::time::advance(by.saturating_duration_since(Instant::now())).await;
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn installer_exit_ready_only_at_the_grace_cutoff_is_late() {
+    use crate::vm::runtime::{InstallerBudget, InstallerPhase, InstallerRecipe};
+    use tokio::io::AsyncWriteExt;
+    let stage = InstallerBudget::start(InstallerRecipe::Ubuntu)
+        .stage(InstallerPhase::UbuntuInstall, Duration::from_secs(60))
+        .unwrap();
+    let (read, mut output) = tokio::io::duplex(2048);
+    let (write, _input) = tokio::io::duplex(2048);
+    let replies = concat!(
+        r#"{"QMP":{"version":{"qemu":{"major":11,"minor":1,"micro":3},"package":""},"capabilities":[]}}"#,
+        "\n",
+        r#"{"return":{},"id":1}"#,
+        "\n",
+        r#"{"return":{"enabled":"whpx","present":["whpx"]},"id":2}"#,
+        "\n",
+        r#"{"return":{"running":false,"singlestep":false,"status":"prelaunch"},"id":3}"#,
+        "\n",
+        r#"{"return":{},"id":4}"#,
+        "\n",
+        r#"{"event":"SHUTDOWN","data":{"guest":true,"reason":"guest-shutdown"}}"#,
+        "\n",
+    );
+    output.write_all(replies.as_bytes()).await.unwrap();
+    let child = ExitAtGrace(Cell::new(None));
+    let result = installer_session(&child, stage, (read, write), &Shutdown::default(), || {
+        Ok(std::time::Instant::now())
+    })
+    .await;
+    let by = child.0.get().expect("installer exit was awaited");
+    // The phase deadline is far ahead; only the exit grace refuses.
+    assert_eq!(Instant::now(), by);
+    assert!(by < stage.deadline());
+    assert_eq!(result, Err(InstallerFailureReason::Timeout));
 }
