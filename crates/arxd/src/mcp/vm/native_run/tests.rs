@@ -1754,6 +1754,28 @@ impl ScriptRun {
             "script":format!("{CANARY} {script}"), "timeout_s":timeout_s})
     }
 
+    fn admit_script(
+        &self,
+        controller: &Controller,
+        number: u64,
+        script: &str,
+        timeout: u32,
+    ) -> (PendingOperation, Value) {
+        let script = format!("{CANARY} {script}");
+        let request = Request {
+            principal: "alpha", vm: self.vm, request_id: RequestId::parse(&key(number)).unwrap(),
+            operation: Operation::Script { script: &script, timeout_seconds: timeout.into() },
+            disk: DiskClaim::default(),
+        };
+        let Admission::Admitted(worker) = controller
+            .admit_native_script(&Installation::fixture(), &request, self.owner.target(), HOST, RESOURCES)
+            .unwrap()
+        else { panic!("script admission refused") };
+        let receipt = json!({"ok":true,
+            "operation_id":hex::encode(worker.admitted().unwrap().operation)});
+        (worker, receipt)
+    }
+
     fn stop(&self, number: u64) -> Value {
         json!({"vm_id":self.args["vm_id"], "request_id":key(number)})
     }
@@ -2191,6 +2213,61 @@ async fn a_failed_receipt_retry_past_its_deadline_starts_teardown() {
     finish_script_test(h, vec![client], run).await;
 }
 
+async fn hold_script_store(
+    supervisor: Arc<Supervisor>,
+) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (held, entered) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let holding = tokio::task::spawn_blocking(move || {
+        supervisor.controller.native_store().transact(|_| {
+            held.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+            Ok(())
+        }).unwrap();
+    });
+    entered.await.unwrap();
+    (release, holding)
+}
+
+#[tokio::test]
+async fn a_mismatched_queued_script_keeps_its_witness_during_store_contention() {
+    let h = windows_harness().await;
+    let client = h.client(0).await;
+    let run = script_run(&h, &client, 660).await;
+    let supervisor = h.supervisor().clone();
+
+    run.control.hold_pings.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(3), run.control.ping_hold.wait_entered()).await.unwrap();
+    let (worker, receipt) = run.admit_script(&supervisor.controller, 661, "exit 0", 30);
+    assert!(run.owner.enqueue(native_run::ScriptJob {
+        worker,
+        script: format!("{CANARY} exit 7"),
+        timeout_s: 30,
+    }).is_ok());
+
+    let (release, holding) = hold_script_store(supervisor.clone()).await;
+    run.control.ping_hold.release();
+    let attempted = tokio::time::timeout(Duration::from_secs(3), run.settled(1)).await;
+    let witnessed = run.owner.witnessed();
+    let started = run.teardown.has_entered();
+    drop(release);
+    holding.await.unwrap();
+    assert!(attempted.is_ok(), "the held store mutex delayed the refusal");
+    assert!(witnessed, "store contention withdrew a healthy run's witness");
+    assert!(!started, "store contention triggered teardown");
+
+    let refused = await_operation(&client, &receipt, Duration::from_secs(5)).await;
+    assert_eq!(refused["state"], "failed", "{refused}");
+    assert_eq!(refused["reason"], "cancelled", "{refused}");
+    let status = call(&client, "vm_get", run.args.clone()).await;
+    assert_eq!(status["ready"], true, "{status}");
+    assert_eq!(status["native_boot_witness"], run.witness);
+    assert!(!run.teardown.has_entered());
+    assert!(run.control.received().is_empty());
+    drop(supervisor);
+    finish_script_test(h, vec![client], run).await;
+}
+
 #[tokio::test]
 async fn a_held_store_connection_cannot_delay_script_loss_teardown() {
     let h = windows_harness().await;
@@ -2200,17 +2277,7 @@ async fn a_held_store_connection_cannot_delay_script_loss_teardown() {
     let receipt = call(&client, "vm_run_script", run.script(585, "hold", 60)).await;
     assert_eq!(receipt["ok"], true, "{receipt}");
     tokio::time::timeout(Duration::from_secs(3), run.control.held.wait_entered()).await.unwrap();
-    let (held, entered) = tokio::sync::oneshot::channel();
-    let (release, wait) = std::sync::mpsc::channel::<()>();
-    let holder = supervisor.clone();
-    let holding = tokio::task::spawn_blocking(move || {
-        holder.controller.native_store().transact(|_| {
-            held.send(()).unwrap();
-            let _ = wait.recv_timeout(Duration::from_secs(10));
-            Ok(())
-        }).unwrap();
-    });
-    entered.await.unwrap();
+    let (release, holding) = hold_script_store(supervisor.clone()).await;
     // The owner's final monitor sample refuses while the connection mutex
     // is held. Teardown must start before this other thread releases it.
     run.control.held.release();
@@ -2379,21 +2446,6 @@ async fn dispatch_refuses_mismatched_or_stale_script_bindings_without_an_exchang
     let run = script_run(&h, &client, 600).await;
     let supervisor = h.supervisor().clone();
     let controller = &supervisor.controller;
-    let admit = |number: u64, script: &str, timeout: u32| {
-        let script = format!("{CANARY} {script}");
-        let request = Request {
-            principal: "alpha", vm: run.vm, request_id: RequestId::parse(&key(number)).unwrap(),
-            operation: Operation::Script { script: &script, timeout_seconds: timeout.into() },
-            disk: DiskClaim::default(),
-        };
-        let Admission::Admitted(worker) = controller
-            .admit_native_script(&Installation::fixture(), &request, run.owner.target(), HOST, RESOURCES)
-            .unwrap()
-        else { panic!("script admission refused") };
-        let receipt = json!({"ok":true,
-            "operation_id":hex::encode(worker.admitted().unwrap().operation)});
-        (worker, receipt)
-    };
     let dispatch = async |worker, script: &str, timeout_s| {
         let before = run.owner.scripts_settled();
         let job = native_run::ScriptJob { worker, script: format!("{CANARY} {script}"), timeout_s };
@@ -2402,7 +2454,7 @@ async fn dispatch_refuses_mismatched_or_stale_script_bindings_without_an_exchang
     };
     // Changed bytes or timeout at dispatch are refused before the guest.
     for (number, sent, timeout) in [(601, "exit 7", 30), (602, "exit 0", 31)] {
-        let (worker, receipt) = admit(number, "exit 0", 30);
+        let (worker, receipt) = run.admit_script(controller, number, "exit 0", 30);
         dispatch(worker, sent, timeout).await;
         let refused = operation(&client, &receipt).await;
         assert_eq!(refused["state"], "failed", "{refused}");
@@ -2411,16 +2463,18 @@ async fn dispatch_refuses_mismatched_or_stale_script_bindings_without_an_exchang
         assert_eq!(call(&client, "vm_get", run.args.clone()).await["ready"], true);
     }
     // Positive control on the same direct path.
-    let (worker, receipt) = admit(603, "exit 0", 30);
+    let (worker, receipt) = run.admit_script(controller, 603, "exit 0", 30);
     dispatch(worker, "exit 0", 30).await;
     assert_eq!(operation(&client, &receipt).await["state"], "succeeded");
     assert_eq!(run.control.received().len(), 1);
     // A writer epoch replaced after admission is stale at dispatch.
-    let (worker, receipt) = admit(604, "exit 0", 30);
+    let (worker, receipt) = run.admit_script(controller, 604, "exit 0", 30);
     controller.native_store()
         .transact(|db| store::snapshot::invalidate_release(db, run.vm, [44; 16]))
         .unwrap();
     dispatch(worker, "exit 0", 30).await;
+    assert!(!run.owner.witnessed(), "the replaced writer kept its witness");
+    run.teardown_entered().await;
     let stale = operation(&client, &receipt).await;
     assert_eq!(stale["state"], "failed", "{stale}");
     assert_eq!(stale["reason"], "cancelled", "{stale}");

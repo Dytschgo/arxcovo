@@ -1080,12 +1080,24 @@ impl Run {
             }) {
             Ok(authority) => authority,
             Err(_) => {
-                let verified = self.observe_run(supervisor, true, revoked).is_ok();
-                if !verified {
+                // No exchange was authorized. An unavailable ledger read
+                // cannot establish that this run lost its writer.
+                let lost = revoked()
+                    || self.cancel.is_cancelled()
+                    || supervisor.cancel.is_cancelled()
+                    || matches!(
+                        supervisor.controller.native_run_current(
+                            &self.principal,
+                            self.target,
+                            true
+                        ),
+                        Ok(false)
+                    );
+                if lost {
                     self.withdraw();
                 }
                 let disposition = self.settle_script(supervisor, worker, Settlement::Cancelled);
-                return verified && disposition == ReceiptDisposition::Verified;
+                return !lost && disposition == ReceiptDisposition::Verified;
             }
         };
         let result = {
