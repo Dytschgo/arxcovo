@@ -64,6 +64,7 @@ pub(super) struct ComposeInstallerInputs {
     firmware: [PathPin; 2],
     review: HeldReview,
     recipe: DockerRecipe,
+    pub(super) bootstrap_packages: Hash,
     pub(super) seed: Vec<u8>,
     pub(super) detached_health: String,
 }
@@ -276,6 +277,18 @@ impl ComposeInstallerInputs {
             )?,
         ];
         let medium = Self::hold_medium(paths.medium, closure.medium)?;
+        let versions = arx_guest::docker_trial::PACKAGES.map(|name| {
+            closure
+                .packages
+                .iter()
+                .find(|package| package.name == name)
+                .map(|package| package.version)
+        });
+        let [Some(containerd), Some(engine), Some(cli), Some(plugin)] = versions else {
+            return Err(REFUSAL);
+        };
+        let bootstrap_packages =
+            arx_guest::docker_trial::package_digest([containerd, engine, cli, plugin]);
         let seed = recipe
             .render_seed(generation, &held_bytes(&guest, MAX_GUEST)?)
             .map_err(|_| REFUSAL)?;
@@ -294,6 +307,7 @@ impl ComposeInstallerInputs {
                 closure: receipt.sha256,
                 medium: closure.medium.sha256,
             },
+            bootstrap_packages,
             seed,
             detached_health: recipe.detached_health(),
         })
