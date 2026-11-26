@@ -226,6 +226,17 @@ pub(crate) fn recipe_selected(
     }
 }
 
+/// Shared by staging and the TEST issuer: a staged write targets only the
+/// build's seed or VARS slot, and only in a phase that stages installer
+/// media. Windows finalization stages nothing.
+pub(crate) fn stage_supported(slot: ArtifactSlot, phase: InstallerPhase) -> bool {
+    matches!(slot.role, "seed" | "vars")
+        && matches!(
+            phase,
+            InstallerPhase::UbuntuInstall | InstallerPhase::WindowsSetup
+        )
+}
+
 impl ForegroundQualification<'_> {
     pub(crate) fn stage_installer<'a>(
         &self,
@@ -243,7 +254,11 @@ impl ForegroundQualification<'_> {
         } = reservation;
         let binding = self.check_workspace(workspace)?;
         check_stage_slots(binding, pair, seed)?;
-        if !recipe_selected(recipe, Some(phase), self.evidence().recipes) {
+        if !recipe_selected(recipe, Some(phase), self.evidence().recipes)
+            || ![seed, pair.vars]
+                .into_iter()
+                .all(|slot| stage_supported(slot, phase))
+        {
             return Err(PHASE);
         }
         check_deadline(deadline)?;

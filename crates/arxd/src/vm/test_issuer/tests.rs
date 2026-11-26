@@ -10,6 +10,7 @@ use crate::{
         Operation, OperationRef, Request, RequestId, Resources, ScriptResult, VmPolicy,
         paths::Artifact,
         qemu_args::{BootPurpose, BootRecipe, SerialName},
+        qualification::consume_checked,
         qualification_record::Instant2,
         runtime::{CandidateRuntime, NativeCapability, NativeMutation},
     },
@@ -215,9 +216,16 @@ impl Fixture {
     }
 
     fn build(&self, number: u8) -> (BuildSlots, PendingOperation, OperationRef) {
+        self.build_with(build_request(number))
+    }
+
+    fn build_with(
+        &self,
+        request: BuildRequest<'_>,
+    ) -> (BuildSlots, PendingOperation, OperationRef) {
         let BuildAdmission::Fresh(slots, worker, receipt) = self
             .ctl
-            .admit_build(build_request(number), host(), resources(), |_, _| None)
+            .admit_build(request, host(), resources(), |_, _| None)
             .unwrap()
             .unwrap()
         else {
@@ -865,13 +873,18 @@ fn launch_permit_binds_the_exact_plan_and_refreshes_at_consumption() {
             );
         } else {
             let authority = permit.consume(target(&plan, &cwd, epoch)).unwrap();
+            let binding = authority.binding();
             assert_eq!(
-                authority.binding(),
-                LaunchPermitBinding {
-                    workspace: ws,
-                    seal_sha256: SEAL,
-                    kind: PlanKind::Inspect,
-                }
+                binding,
+                target(&plan, &cwd, epoch).binding(ws, SEAL).unwrap()
+            );
+            assert_eq!(
+                (binding.workspace, binding.seal_sha256, binding.kind),
+                (ws, SEAL, PlanKind::Inspect)
+            );
+            assert_eq!(
+                (binding.writer_epoch, binding.pair, binding.helper),
+                (epoch, None, None)
             );
         }
     }
@@ -996,6 +1009,99 @@ fn start_boot_derives_its_pair_and_admits_only_a_boot() {
     assert_admission_closed();
 }
 
+/// Review 2: the checked launch adapter recomputes the full issuance
+/// binding from its own target, so an authority issued for another target
+/// with the same workspace, seal and plan kind cannot pass the handoff.
+#[test]
+fn checked_launch_adapter_refuses_an_authority_for_another_target() {
+    /// A crate-implementable permit that returns an authority it already
+    /// holds, whatever target it is asked to consume.
+    struct Reused(LaunchAuthority);
+
+    impl LaunchPermit for Reused {
+        fn consume(self, _: LaunchTarget<'_, '_>) -> Result<LaunchAuthority, NativeRefusal> {
+            Ok(self.0)
+        }
+    }
+
+    let inputs = BootInputs::new();
+    let recipe = inputs.recipe();
+    let plan = recipe.plan().unwrap();
+    let mut altered = BootInputs::new();
+    altered.disk = artifact(ArtifactRole::GuestDisk, "D:/vms/work/disk.qcow2", 29);
+    let altered_recipe = altered.recipe();
+    let altered_plan = altered_recipe.plan().unwrap();
+    let cwd = LocalPath::parse("D:/vms/work").unwrap();
+    let other_cwd = LocalPath::parse("D:/vms/other").unwrap();
+    let ws = workspace(ACTIVE);
+    fn boot<'a>(
+        plan: &'a CommandPlan<'a>,
+        cwd: &'a LocalPath,
+        pair: PairSlots,
+        epoch: Id,
+    ) -> LaunchTarget<'a, 'a> {
+        LaunchTarget {
+            pair: Some(pair),
+            recipe: Some(recipes().windows),
+            ..target(plan, cwd, epoch)
+        }
+    }
+    // One real authority, issued for the exact boot of a fresh start.
+    let issued = || {
+        let fixture = Fixture::new();
+        let issuer = fixture.issuer();
+        let (worker, target_gen) = fixture.start();
+        let epoch = target_gen.writer_epoch.unwrap();
+        let intent = issuer.intent(&worker, target_gen, &fixture.cancel).unwrap();
+        let permit = intent.launch(ws, boot(&plan, &cwd, pair(), epoch)).unwrap();
+        let authority = permit.consume(boot(&plan, &cwd, pair(), epoch)).unwrap();
+        (authority, epoch)
+    };
+
+    let (authority, epoch) = issued();
+    let exact = consume_checked(
+        Reused(authority),
+        boot(&plan, &cwd, pair(), epoch),
+        ws,
+        SEAL,
+    );
+    assert_eq!(exact.unwrap().binding().kind, PlanKind::Boot);
+
+    let mut foreign = pair();
+    foreign.disk.key = [9; 16];
+    for name in [
+        "plan",
+        "slots",
+        "writer epoch",
+        "working directory",
+        "limits",
+    ] {
+        let (authority, epoch) = issued();
+        let target = match name {
+            "plan" => boot(&altered_plan, &cwd, pair(), epoch),
+            "slots" => boot(&plan, &cwd, foreign, epoch),
+            "writer epoch" => boot(&plan, &cwd, pair(), START_EPOCH),
+            "working directory" => boot(&plan, &other_cwd, pair(), epoch),
+            _ => LaunchTarget {
+                memory: 2 << 30,
+                ..boot(&plan, &cwd, pair(), epoch)
+            },
+        };
+        let binding = target.binding(ws, SEAL).unwrap();
+        assert_eq!(
+            (binding.workspace, binding.seal_sha256, binding.kind),
+            (ws, SEAL, PlanKind::Boot),
+            "{name}"
+        );
+        assert_eq!(
+            consume_checked(Reused(authority), target, ws, SEAL).err(),
+            Some(REFUSED),
+            "{name}"
+        );
+    }
+    assert_admission_closed();
+}
+
 /// T11/T12/T19: a staged write names its slot, content, the admitted build
 /// recipe and its phase, and a deadline. Consumption refuses substituted
 /// content or a stale epoch.
@@ -1015,6 +1121,8 @@ fn stage_permit_binds_slot_content_phase_and_deadline() {
     let intent = issuer.intent(&worker, target, &fixture.cancel).unwrap();
     let exact = stage_target(slots.seed);
     let mut refused = Vec::new();
+    // Review 2: the build's live guest disk is never a staging slot.
+    refused.push(("build guest disk", stage_target(slots.pair.disk)));
     let mut role = exact;
     role.slot.role = "vars";
     refused.push(("role", role));
@@ -1060,6 +1168,47 @@ fn stage_permit_binds_slot_content_phase_and_deadline() {
         }
         assert!(!issuer.epoch().effects_revoked());
     }
+
+    // Review 2: an admitted Windows build stages only its seed and VARS in
+    // Setup. Its guest disk and the finalization phase are refused at
+    // issuance even though the recipe is selected for that phase.
+    let fixture = Fixture::new();
+    let issuer = fixture.issuer();
+    let windows_id = hex::encode(VmController::<TestClock>::windows_recipe_id());
+    let (slots, worker, _) = fixture.build_with(BuildRequest {
+        recipe: &windows_id,
+        digest: recipes().windows.recipe_sha256,
+        ..build_request(2)
+    });
+    let target = NativeTarget {
+        generation: slots.seed.generation,
+        writer_epoch: None,
+    };
+    let intent = issuer.intent(&worker, target, &fixture.cancel).unwrap();
+    let windows = |slot, phase| StageTarget {
+        recipe: recipes().windows,
+        phase,
+        ..stage_target(slot)
+    };
+    for (name, target) in [
+        (
+            "guest disk",
+            windows(slots.pair.disk, InstallerPhase::WindowsSetup),
+        ),
+        (
+            "finalization VARS",
+            windows(slots.pair.vars, InstallerPhase::WindowsFinalize),
+        ),
+        (
+            "finalization seed",
+            windows(slots.seed, InstallerPhase::WindowsFinalize),
+        ),
+    ] {
+        assert!(intent.stage(target).is_err(), "{name}");
+    }
+    let setup = windows(slots.pair.vars, InstallerPhase::WindowsSetup);
+    let authority = intent.stage(setup).unwrap().consume(setup).unwrap();
+    assert_eq!(authority.target(), &setup);
     assert_admission_closed();
 }
 
@@ -1209,6 +1358,55 @@ fn recovery_authority_needs_exact_custody_not_selection() {
     let mint = |epoch| RecoveryAuthority::mint(&installation, &fixture.ctl, staged, epoch);
     assert!(mint(None).is_ok());
     assert!(mint(Some([46; 16])).is_err());
+    // An untouched reservation has no writer epoch to name.
+    assert!(mint(Some(staged.generation)).is_err());
+
+    // Review 2: the checked creation edge records staged writer history, so
+    // epochless recovery refuses and only the generation's own epoch, with
+    // its recorded origin, recovers.
+    let origin = crate::store::vm::native::recovery::Origin {
+        boot: [5; 32],
+        database: FileIdentity {
+            volume: 1,
+            file: [70; 16],
+        },
+        lock: FileIdentity {
+            volume: 1,
+            file: [71; 16],
+        },
+    };
+    let durable = Scope {
+        generation: staged.generation,
+        production: staged.production,
+        workspace: staged.workspace,
+        lease: staged.lease,
+    };
+    fixture.sql(|db| {
+        crate::store::vm::native::recovery::record_job(db, durable, staged.generation, origin)
+    });
+    assert!(
+        mint(None).is_err(),
+        "epochless recovery after a staged checked-create record"
+    );
+    let authority = mint(Some(staged.generation)).unwrap();
+    assert_eq!(authority.writer_epoch(), Some(staged.generation));
+    assert!(mint(Some([46; 16])).is_err());
+
+    // A missing reservation row is not proof of an untouched reservation.
+    let fixture = Fixture::new();
+    let (slots, _worker, _) = fixture.build(1);
+    let staged = workspace(slots.pair.disk.generation);
+    fixture.bind(staged, "build");
+    fixture.sql(|db| {
+        db.execute(
+            "DELETE FROM vm_native_writer WHERE generation=?1",
+            [staged.generation],
+        )?;
+        Ok(())
+    });
+    let mint = |epoch| RecoveryAuthority::mint(&installation, &fixture.ctl, staged, epoch);
+    assert!(mint(None).is_err());
+    assert!(mint(Some(staged.generation)).is_err());
     assert_admission_closed();
 }
 
