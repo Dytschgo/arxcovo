@@ -279,6 +279,10 @@ impl EvidenceDir {
         Ok(dir)
     }
 
+    pub(super) fn path(&self) -> &LocalPath {
+        &self.pin.path
+    }
+
     pub(super) fn scope(&self) -> [u8; 32] {
         self.scope
     }
@@ -315,11 +319,52 @@ impl EvidenceDir {
             return Err(SinkError::Closed);
         }
         let binding = self.binding(class, dependencies, issued_utc)?;
+        self.write_diagnostics(&binding, entries, summary)
+    }
+
+    pub(super) fn publish_docker_diagnostics<St: Serialize, R: Serialize, B: Serialize>(
+        &self,
+        dependencies: &records::DockerDependencies,
+        issued: Instant2,
+        entries: &[Entry<'_, St, R>],
+        summary: &B,
+    ) -> Result<Vec<DiagnosticFile>, SinkError> {
+        if self.closed.replace(true) {
+            return Err(SinkError::Closed);
+        }
+        let binding = self.docker_binding(dependencies, issued)?;
+        self.write_diagnostics(&json(&binding)?, entries, summary)
+    }
+
+    pub(super) fn docker_binding(
+        &self,
+        dependencies: &records::DockerDependencies,
+        issued: Instant2,
+    ) -> Result<records::Binding, SinkError> {
+        Ok(records::Binding {
+            class: records::Class::Docker,
+            scope: self.scope,
+            release: records::release(),
+            run: self.run,
+            dependencies: dependencies.key(self.scope).ok_or(SinkError::Invalid)?,
+            boot: self.boot,
+            issued_mono_ms: issued.mono_ms,
+            issued_utc: issued.utc,
+            expires_utc: issued.utc.saturating_add(VALIDITY_SECS),
+        })
+    }
+
+    fn write_diagnostics<St: Serialize, R: Serialize, B: Serialize>(
+        &self,
+        binding: &str,
+        entries: &[Entry<'_, St, R>],
+        summary: &B,
+    ) -> Result<Vec<DiagnosticFile>, SinkError> {
         let mut grouped: Vec<Vec<Vec<u8>>> = vec![Vec::new(); super::schema::RECORD_KINDS.len()];
         let mut prior = [0u8; 32];
         let mut composed = true;
         for entry in entries {
-            match record(&binding, entry, prior) {
+            match record(binding, entry, prior) {
                 Some((index, bytes)) => {
                     prior = Sha256::digest(&bytes).into();
                     grouped[index].push(bytes);
@@ -398,7 +443,7 @@ impl EvidenceDir {
         })
     }
 
-    fn publish_docker_with_clock<'a>(
+    pub(super) fn publish_docker_with_clock<'a>(
         &self,
         bundle: &SealBundle,
         issued: Instant2,
@@ -721,6 +766,20 @@ pub(super) fn create_hidden(dir: &File, name: &str) -> io::Result<File> {
     )
 }
 
+/// Create the private charge journal with an exclusive writer. Read-only
+/// observers can check the flushed intent while the writer holds the leaf.
+pub(super) fn create_trial_journal(dir: &File, name: &str) -> io::Result<File> {
+    nt_open(
+        dir,
+        name,
+        FILE_GENERIC_WRITE,
+        FILE_ATTRIBUTE_HIDDEN,
+        FILE_SHARE_READ,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    )
+}
+
 /// Open or create one regular, non-reparse entry relative to the held
 /// directory, with no sharing.
 fn open_child(
@@ -852,7 +911,7 @@ pub(super) fn discard_owned(dir: &File, name: &str, expected: FileIdentity) -> i
 }
 
 /// The held directory has no entries, enumerated through its own handle.
-fn empty(dir: &File) -> Result<bool, NativeRefusal> {
+pub(super) fn empty(dir: &File) -> Result<bool, NativeRefusal> {
     listing(dir)
         .map(|entries| entries.is_empty())
         .map_err(|_| NativeRefusal::PathCustodyUnverified)

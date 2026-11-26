@@ -1455,3 +1455,14 @@ dependencies and disposable settlement before the create-new marker rename.
 The patched runtime effects, receiver measurements and native settlement are
 **unverified on real hardware**. Static activation and publication retain
 their existing gates.
+
+The collector uses a separate disposable workspace claim. It flushes a maximum
+disk charge and each create intent before staging. An uncertain release keeps
+the claim charged and prevents workspace reuse. The settlement path checks the
+held workspace and verifies the Docker dossier before publishing the marker.
+Detached and endpoint copies select their fixed guest bootstrap through
+fw_cfg. The detached copy leaves services masked. The endpoint copy provisions
+the engine using the exact fixed units and accepts only the pinned Compose v3
+hello on that session. The Windows Docker CLI refuses before claiming output
+until the native receiver and route adapter is wired. Hosted tests substitute
+those peers and exercise the same collector and marker-last writer.

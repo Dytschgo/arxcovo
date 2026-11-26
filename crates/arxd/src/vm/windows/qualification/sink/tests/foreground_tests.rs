@@ -706,3 +706,6 @@ fn rebased_completion_must_precede_fresh_uptime() {
         Err(records::RunError::Untrusted)
     );
 }
+
+#[path = "docker_collector_tests.rs"]
+mod docker_collector;
