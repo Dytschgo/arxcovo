@@ -830,6 +830,107 @@ async fn retryable_release_rollback_keeps_the_on_time_stop_and_its_receipt() {
     let _ = h.shutdown().await;
 }
 
+struct ReleaseBarrierOnDrop(Arc<native_run::BlockingBarrier>);
+
+impl Drop for ReleaseBarrierOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[tokio::test]
+async fn retry_fence_serialized_with_concurrent_stop_admission_preserves_on_time_stop() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let Starting {
+        owner,
+        worker,
+        registration: _registration,
+        observed,
+    } = reserved(&h, &client).await;
+    record_checked_creation(&h, &observed);
+    assert!(
+        owner
+            .commit_ready(h.supervisor(), &worker, || Some([42; 16]), || true)
+            .await
+    );
+    let vm = observed.target.vm;
+    let ctl = &h.supervisor().controller;
+    let barrier = native_run::BlockingBarrier::new();
+    let _release_guard = ReleaseBarrierOnDrop(barrier.clone());
+    owner.arm_stop_handoff_barrier(barrier.clone());
+    let after_retry_fence = owner.arm_after_retry_fence();
+
+    let attempts = std::cell::Cell::new(0);
+    let stop = {
+        let stop_fut = call(
+            &client,
+            "vm_stop",
+            json!({"vm_id": hex::encode(vm), "request_id": key(512)}),
+        );
+        let settle_fut = owner.settle_with(
+            h.supervisor(),
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                if attempt == 1 {
+                    anyhow::bail!("injected transient release observation failure");
+                }
+                Ok(())
+            },
+            |_, receipt| {
+                assert!(receipt.is_some(), "the owner did not receive the concurrently admitted stop");
+                ctl.native_store().try_native_transaction(|db| {
+                    native::release::commit(db, &observed, receipt, || ctl.native_clock())
+                        .map(|_| ())
+                })
+            },
+        );
+        tokio::pin!(stop_fut);
+        tokio::pin!(settle_fut);
+        // Pause stop admission under supervisor.gate right after SQLite records
+        // the pending stop receipt and before owner.stop(stop) installs it.
+        tokio::select! {
+            res = &mut stop_fut => panic!("vm_stop completed before barrier release: {res}"),
+            () = barrier.wait_entered() => {}
+        }
+        // Drive the owner through one transient failure and past wait_retry's
+        // conditional fence check while stop admission still holds the gate.
+        tokio::select! {
+            () = &mut settle_fut => panic!("settle_with completed before barrier release"),
+            res = &mut stop_fut => panic!("vm_stop completed before barrier release: {res}"),
+            res = after_retry_fence => res.unwrap(),
+        }
+        // Release stop admission so it installs StopReceipt, wakes the retrying
+        // owner, and returns its pending receipt; then allow the clean release
+        // to commit before the stop deadline.
+        barrier.release();
+        let (stop, ()) = tokio::join!(stop_fut, settle_fut);
+        stop
+    };
+
+    assert_eq!(stop["ok"], true, "{stop}");
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(
+        vm_state(&h, vm),
+        1,
+        "retry fencing moved the VM to recovery instead of preserving the on-time stop"
+    );
+    assert_eq!(unresolved_epoch(&h, vm), None);
+    assert_eq!(
+        ctl.active_release_epoch(vm, false).unwrap(),
+        Some((observed.target.generation, observed.target.epoch))
+    );
+    let settled = terminal(&client, &stop).await;
+    assert_eq!(
+        settled["state"], "succeeded",
+        "retry fencing interrupted the concurrently admitted on-time stop: {settled}"
+    );
+    assert_admission_closed(&h);
+    drop(client);
+    let _ = h.shutdown().await;
+}
+
 #[tokio::test]
 async fn teardown_retry_keeps_one_launch_and_is_woken_by_the_reaper() {
     let mut h = windows_harness().await;

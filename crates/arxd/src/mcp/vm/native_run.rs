@@ -31,12 +31,68 @@ const GATE_RETRY: Duration = Duration::from_millis(10);
 const FENCE_RETRY_DELAY: Duration = Duration::from_millis(20);
 const FENCE_RETRY_WINDOW: Duration = Duration::from_secs(3);
 
+#[cfg(test)]
+pub(super) struct BlockingBarrier {
+    entered: AtomicBool,
+    entered_signal: Notify,
+    released: Mutex<bool>,
+    release_signal: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl BlockingBarrier {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicBool::new(false),
+            entered_signal: Notify::new(),
+            released: Mutex::new(false),
+            release_signal: std::sync::Condvar::new(),
+        })
+    }
+
+    fn pause(&self) {
+        self.entered.store(true, Ordering::SeqCst);
+        self.entered_signal.notify_waiters();
+        let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !*released {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (next, _) = self
+                .release_signal
+                .wait_timeout(released, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            released = next;
+        }
+    }
+
+    pub(super) async fn wait_entered(&self) {
+        let notified = self.entered_signal.notified();
+        tokio::pin!(notified);
+        let _ = notified.as_mut().enable();
+        if !self.entered.load(Ordering::SeqCst) {
+            notified.await;
+        }
+    }
+
+    pub(super) fn release(&self) {
+        let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        *released = true;
+        self.release_signal.notify_all();
+    }
+}
+
 pub(super) struct Run {
     principal: String,
     target: Target,
     cancel: Shutdown,
     state: Mutex<State>,
     retry: Notify,
+    #[cfg(test)]
+    stop_handoff_barrier: Mutex<Option<Arc<BlockingBarrier>>>,
+    #[cfg(test)]
+    after_retry_fence: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[derive(Default)]
@@ -54,6 +110,34 @@ impl Run {
             cancel: Shutdown::default(),
             state: Mutex::default(),
             retry: Notify::new(),
+            #[cfg(test)]
+            stop_handoff_barrier: Mutex::default(),
+            #[cfg(test)]
+            after_retry_fence: Mutex::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn arm_stop_handoff_barrier(&self, barrier: Arc<BlockingBarrier>) {
+        *self.stop_handoff_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(super) fn arm_after_retry_fence(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.after_retry_fence.lock().unwrap() = Some(tx);
+        rx
+    }
+
+    #[cfg(test)]
+    fn pause_stop_handoff(&self) {
+        let barrier = self
+            .stop_handoff_barrier
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(barrier) = barrier {
+            barrier.pause();
         }
     }
 
@@ -188,7 +272,11 @@ impl VmInventory {
             )? {
                 Ok((operation, stop)) => {
                     match stop {
-                        Some(stop) => owner.stop(stop)?,
+                        Some(stop) => {
+                            #[cfg(test)]
+                            owner.pause_stop_handoff();
+                            owner.stop(stop)?;
+                        }
                         // A replayed stop nudges a teardown that is still
                         // retrying its release.
                         None => owner.retry.notify_one(),
@@ -789,8 +877,19 @@ impl Run {
         // A retryable failure under a live exact stop keeps its receipt
         // pending and the VM stopping, so a later attempt can still settle
         // it on time. Without one, or once it expires, fence the epoch.
-        if !self.holds_live_stop() {
+        // Serialize the stop check and conditional fence under the foreground
+        // gate held by stop admission so a retry cannot race an on-time stop
+        // handoff and interrupt its receipt.
+        if let Ok(_gate) = supervisor.gate.try_lock()
+            && !self.holds_live_stop()
+        {
             let _ = supervisor.controller.fence_native_run(self.target);
+        }
+        #[cfg(test)]
+        if let Ok(mut hook) = self.after_retry_fence.lock()
+            && let Some(signal) = hook.take()
+        {
+            let _ = signal.send(());
         }
         tokio::select! {
             biased;
