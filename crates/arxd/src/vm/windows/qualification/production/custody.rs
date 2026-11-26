@@ -561,6 +561,10 @@ impl ReleasedGeneration<'_> {
 }
 
 impl TestRelease<'_> {
+    pub(super) fn observed(&self) -> &native::release::Observed {
+        &self.observed
+    }
+
     pub(crate) fn commit(
         &self,
         store: &crate::store::vm::VmStore,

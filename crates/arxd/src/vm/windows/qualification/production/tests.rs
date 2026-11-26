@@ -399,6 +399,7 @@ fn launch_permit_fence_requires_uninhabited_authority_and_non_echoed_target() {
     let plan = golden_info(&image, &golden, &header).unwrap();
     let target = LaunchTarget {
         plan: &plan,
+        writer_epoch: [5; 16],
         cwd: &root,
         pair: None,
         installer: None,

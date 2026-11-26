@@ -39,13 +39,13 @@ pub(crate) struct GenerationGuards {
     active: Mutex<HashSet<Id>>,
 }
 
-struct GenerationGuard<'g> {
+pub(super) struct GenerationGuard<'g> {
     guards: &'g GenerationGuards,
     generation: Id,
 }
 
 impl GenerationGuards {
-    fn acquire(&self, generation: Id) -> Result<GenerationGuard<'_>, Q> {
+    pub(super) fn acquire(&self, generation: Id) -> Result<GenerationGuard<'_>, Q> {
         let mut active = self.active.lock().map_err(|_| PATH)?;
         if !active.insert(generation) {
             return Err(PATH);
@@ -378,6 +378,7 @@ impl<'a> NativeDisposal<'a> {
             }
             let ws =
                 hold_workspace_under(self.production, self.owner, binding_from_scope(gen_scope))?;
+            let mut exclusions = Vec::with_capacity(artifacts.len());
             for artifact in artifacts {
                 check_deadline(deadline)?;
                 let Some(role) = disposal::test_role(&artifact.role) else {
@@ -406,7 +407,7 @@ impl<'a> NativeDisposal<'a> {
                     return Err(PATH);
                 }
                 let pin = ws.pin_slot(slot, identity, false)?;
-                let _no_writer = pin.reopen_without_writer().map_err(|_| PATH)?;
+                exclusions.push(pin.reopen_without_writer().map_err(|_| PATH)?);
                 if !sink::held_private(&pin.leaf, self.owner)
                     || !has_exact_leaf(&pin.leaf, &leaf_name(slot))
                 {
@@ -849,11 +850,11 @@ fn check_deadline(deadline: Instant) -> Result<(), Q> {
     }
 }
 
-fn leaf_name(slot: ArtifactSlot) -> String {
+pub(super) fn leaf_name(slot: ArtifactSlot) -> String {
     format!("{}-{}", slot.role, hex::encode(slot.key))
 }
 
-fn binding_from_scope(gen_scope: native::Scope) -> WorkspaceBinding {
+pub(super) fn binding_from_scope(gen_scope: native::Scope) -> WorkspaceBinding {
     WorkspaceBinding {
         generation: gen_scope.generation,
         production: gen_scope.production,
