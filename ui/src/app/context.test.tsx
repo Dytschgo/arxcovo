@@ -51,6 +51,10 @@ describe('inventory', () => {
     expect(s.inventory.fresh()).toEqual({});
     s.inventory.put(first, { vms: FIXTURE_VMS });
     expect(s.inventory.fresh()).toEqual({});
+    s.inventory.put(second, { hosts: FIXTURE_HOSTS });
+    // A late result from the first session neither shows nor wipes the second's lists.
+    s.inventory.put(first, { vms: FIXTURE_VMS });
+    expect(s.inventory.fresh()).toEqual({ hosts: FIXTURE_HOSTS, vms: undefined });
     s.inventory.put(second, { vms: FIXTURE_VMS });
     expect(s.inventory.fresh().vms).toBe(FIXTURE_VMS);
   });
