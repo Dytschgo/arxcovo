@@ -2158,6 +2158,17 @@ pub(crate) fn settle_with_script(
     if let Some(status) = static_vm::settle_operation(db, id, now, completion, script, cause)? {
         return Ok(status);
     }
+    settle_test_operation(db, id, now, completion, script, cause)
+}
+
+fn settle_test_operation(
+    db: &Connection,
+    id: i64,
+    now: i64,
+    completion: Completion,
+    script: Option<ScriptResult>,
+    cause: Option<FailureReason>,
+) -> Result<Status> {
     let (vm, action, state, expires_ms): (Id, i64, i64, i64) = db.query_row(
         "SELECT a.vm,a.action,v.state,v.expires_ms FROM activity a JOIN vm_instances v ON a.vm=v.id
          WHERE a.id=?1 AND a.status=0 AND a.action<=4",

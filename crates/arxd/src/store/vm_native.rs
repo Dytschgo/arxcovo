@@ -10,6 +10,10 @@
     not(test),
     allow(dead_code, reason = "consumed by the 7c native TEST issuer")
 )]
+#[cfg_attr(all(test, not(all(windows, target_arch = "x86_64"))), allow(dead_code))]
+#[path = "vm_native/release.rs"]
+pub(crate) mod release;
+
 use super::count;
 use crate::vm::{ArtifactEvidence, ArtifactSlot, Id, paths::FileIdentity};
 use anyhow::{Result, ensure};
