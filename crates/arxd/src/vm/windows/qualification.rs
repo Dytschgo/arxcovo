@@ -7,6 +7,11 @@
 mod activity;
 mod boot;
 mod capacity;
+#[allow(
+    dead_code,
+    reason = "the native receiver and route peer is added in Part B PR 2b"
+)]
+mod docker_trial;
 mod foreground;
 pub(crate) use foreground::ForegroundQualification;
 pub(super) mod inventory;
@@ -777,6 +782,14 @@ fn require_paused(paused: bool) -> Result<(), NativeRefusal> {
 /// Preflight for the explicit paused-trial entry point in the owner runner.
 pub fn preflight_paused(enrollment: &str, evidence: &str) -> Result<Baseline, NativeRefusal> {
     preflight_with(&capacity::MountManager, enrollment, evidence, true, false)
+}
+
+/// Separate, fail-closed entry point for explicit Docker qualification.
+pub fn preflight_docker(
+    enrollment: &str,
+    evidence: &str,
+) -> Result<std::convert::Infallible, NativeRefusal> {
+    docker_trial::preflight(enrollment, evidence)
 }
 
 pub fn preflight_full_test(enrollment: &str, evidence: &str) -> Result<Baseline, NativeRefusal> {

@@ -246,6 +246,9 @@ test('Rust retains every native, Python and package validation with exact comman
           python3 tools/ci/observe_dns.py`,
     `name: Check static acceptance observers with fake transports
         run: python -I -B -m unittest discover -s tools/acceptance -p 'test_static_witness.py'`,
+    `name: Test the M2 acceptance relay with synthetic clients
+        if: runner.os == 'Windows'
+        run: python -I -B -m unittest discover -s tools/acceptance/m2 -v`,
     `name: Pin Windows cluster quarantine scope
         run: python -I -m unittest discover -s tools/ci -p 'test_windows_cluster_quarantine.py'`,
     'run: cargo fmt --all --check',

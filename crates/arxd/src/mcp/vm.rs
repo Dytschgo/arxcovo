@@ -1,4 +1,5 @@
 //! Foreground-only VM tools. This module is selected after local authentication.
+mod owned_worker;
 mod vault_test;
 use crate::{
     config::{TestVms, VmRuntimeProfile},
@@ -252,6 +253,7 @@ struct Gate {
     publish_profile: Option<Arc<Profile>>,
     publish_jobs: tokio::task::JoinSet<anyhow::Result<()>>,
     compose_jobs: tokio::task::JoinSet<anyhow::Result<()>>,
+    test_workers: owned_worker::TestWorkers,
     compose_active: Arc<Mutex<std::collections::HashSet<Id>>>,
     #[cfg(test)]
     fixture: Option<tests::Fixture>,
@@ -415,6 +417,7 @@ impl Supervisor {
                 publish_profile: None,
                 publish_jobs: Default::default(),
                 compose_jobs: Default::default(),
+                test_workers: Default::default(),
                 compose_active: Default::default(),
                 #[cfg(test)]
                 fixture: None,
@@ -674,11 +677,12 @@ impl Supervisor {
     /// quiescence.
     pub(crate) async fn drain_workers(&self, bound: Duration) -> anyhow::Result<Drained> {
         let deadline = tokio::time::Instant::now() + bound;
-        let (mut publish_jobs, mut compose_jobs) = {
+        let (mut publish_jobs, mut compose_jobs, test_workers) = {
             let mut gate = self.lock()?;
             (
                 std::mem::take(&mut gate.publish_jobs),
                 std::mem::take(&mut gate.compose_jobs),
+                std::mem::take(&mut gate.test_workers),
             )
         };
         tokio::time::timeout_at(deadline, async {
@@ -722,6 +726,7 @@ impl Supervisor {
             while let Some(job) = compose_jobs.join_next().await {
                 job??;
             }
+            test_workers.join().await?;
             Ok::<_, anyhow::Error>(())
         })
         .await??;
@@ -2777,7 +2782,7 @@ pub(crate) mod tests {
         task::{JoinHandle, JoinSet},
     };
 
-    const HOST: HostObservation = HostObservation {
+    pub(super) const HOST: HostObservation = HostObservation {
         owner_idle: Some(true),
         logical_cpus: Some(4),
         available_ram: Some(u64::MAX),
@@ -2786,26 +2791,26 @@ pub(crate) mod tests {
             managed_bytes: 0,
         }),
     };
-    const RESOURCES: Resources = Resources {
+    pub(super) const RESOURCES: Resources = Resources {
         vcpus: 1,
         guest_ram: 1024,
         overhead_ram: 1024,
     };
-    const RETAINED: DiskClaim = DiskClaim {
+    pub(super) const RETAINED: DiskClaim = DiskClaim {
         staging: 0,
         images: 128,
         metadata: 0,
     };
-    const TRANSIENT: DiskClaim = DiskClaim {
+    pub(super) const TRANSIENT: DiskClaim = DiskClaim {
         staging: 128,
         images: 128,
         metadata: 0,
     };
-    const UTC: i64 = 1_800_000_000_000;
+    pub(super) const UTC: i64 = 1_800_000_000_000;
     const VAULT_CANARY: &str = "arx-vault-fixture-canary-a58c";
     const VAULT_EXIT_0: &str = "echo arx-vault-fixture-canary-a58c; exit 0";
     const VAULT_EXIT_7: &str = "echo arx-vault-fixture-canary-a58c; exit 7";
-    const RECIPE: (Id, [u8; 32]) = ([3; 16], [4; 32]);
+    pub(super) const RECIPE: (Id, [u8; 32]) = ([3; 16], [4; 32]);
     const WEB_DIGEST: [u8; 32] = [17; 32];
     const WEB_RETAINED: DiskClaim = DiskClaim {
         images: 131_072,
@@ -5520,11 +5525,11 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    fn key(number: u64) -> String {
+    pub(super) fn key(number: u64) -> String {
         format!("{UTC:016x}{number:016x}")
     }
 
-    fn request(name: &str, arguments: Value) -> CallToolRequestParams {
+    pub(super) fn request(name: &str, arguments: Value) -> CallToolRequestParams {
         CallToolRequestParams::new(name.to_owned())
             .with_arguments(arguments.as_object().unwrap().clone())
     }
