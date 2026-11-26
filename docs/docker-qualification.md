@@ -46,7 +46,14 @@ Leave existing VMs, their hypervisor settings and the old Lab Manager untouched.
   network profile and a digest-pinned benign container. Independently
   enroll the policy and complete topology/deny inventory, the public
   TCP/UDP and recursive DNS receivers, the denial targets, and the bounded
-  receiver-capture and controlled route-drift procedures. Include dormant
+  receiver-capture and controlled route-drift procedures. Pin the private
+  receiver inventory file alongside the fixture image, network profile and
+  probe image. Enumerate every reviewed case, transport and receiver identity,
+  including multiple receivers for the same case and transport. The inventory
+  is a bounded JSON array of objects with `case`, `transport` and an
+  `identity` of 32 bytes. Use the case and transport names in the reviewed
+  [witness schema](../crates/arxd/src/vm/windows/qualification/docker_trial/witness.rs).
+  Include dormant
   site adapters, VPNs, host services, routers, public-numbered LAN and WAN
   hairpin. Use an isolated representative uplink if the ordinary site
   cannot sustain the enrolled invariant. Supply the private generation-bound
@@ -199,8 +206,12 @@ at this boundary.
 4. Review the emitted contract 4 Docker dossier and marker-last settlement.
    The public fixture must demonstrate TCP, UDP and valid recursive DNS,
    zero arrivals at denied receivers across the full inventory, LAN inbound refusal,
-   IPv6/ICMP refusal and flow closure on controlled route drift. Restore the
-   original enrolled topology before the installed boot and resample. The
+   IPv6/ICMP refusal and flow closure on controlled route drift. Establish
+   identifiable TCP and UDP flows with observed deliveries before the route
+   changes. Capture one changed route from the enrolled uplink, the closure
+   of each established flow and refused traffic tagged to each flow after
+   that transition. Restore the original enrolled topology before the
+   installed boot and resample. The
    installed boot must bind the exclusive IPv4 loopback listener to the
    held child, verify exact port, TLS profile and boot with a bounded pinned
    CA/SNI health exchange, complete the exact Compose v3 hello, and release

@@ -6,6 +6,7 @@ use std::net::Ipv4Addr;
 const NETWORK: NativeRefusal = NativeRefusal::NetworkFenceUnverified;
 const ENDPOINT: NativeRefusal = NativeRefusal::GuestEndpointUnverified;
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+pub(in crate::vm::windows::qualification) const MAX_INVENTORY_BYTES: u64 = 32 * 1024;
 
 pub(in crate::vm::windows::qualification) struct RouteSample {
     pub ticket: Ticket,
@@ -21,7 +22,7 @@ pub(super) fn route(
     boot: &CheckedBoot<'_>,
     peer: Option<PeerId>,
     dependencies: &DockerDependencies,
-) -> Result<(), NativeRefusal> {
+) -> Result<ObservedRoute, NativeRefusal> {
     let policy = PublicEgressPolicy::parse(&sample.policy_bytes).map_err(|_| NETWORK)?;
     if sample.ticket != boot.ticket()
         || sample.peer != peer
@@ -37,10 +38,11 @@ pub(super) fn route(
     }
     policy
         .verify_route(Some(&sample.route))
-        .map_err(|_| NETWORK)
+        .map_err(|_| NETWORK)?;
+    Ok(sample.route.into())
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub(in crate::vm::windows::qualification) enum Case {
     Public,
     RecursiveDns,
@@ -63,10 +65,9 @@ pub(in crate::vm::windows::qualification) enum Case {
     UdpPeerChange,
     RouteDrift,
     LanInbound,
-    StockTest,
 }
 
-const REQUIRED: [Case; 22] = [
+const REQUIRED: [Case; 21] = [
     Case::Public,
     Case::RecursiveDns,
     Case::Host,
@@ -88,10 +89,9 @@ const REQUIRED: [Case; 22] = [
     Case::UdpPeerChange,
     Case::RouteDrift,
     Case::LanInbound,
-    Case::StockTest,
 ];
 
-#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub(in crate::vm::windows::qualification) enum Transport {
     Tcp,
     Udp,
@@ -113,12 +113,134 @@ impl Case {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::vm::windows::qualification) struct Target {
     pub case: Case,
     pub transport: Transport,
     pub identity: Hash,
+}
+
+/// The reviewed private enrollment is independent of the observer peers.
+/// Its exact file digest is included with the three held fixture input pins
+/// in the existing Docker dependency key.
+pub(in crate::vm::windows::qualification) struct ReceiverEnrollment {
+    targets: Vec<Target>,
+    fixture: Hash,
+}
+
+impl ReceiverEnrollment {
+    pub(in crate::vm::windows::qualification) fn from_manifest(
+        bytes: &[u8],
+        fixture_inputs: [Hash; 3],
+    ) -> Result<Self, NativeRefusal> {
+        if bytes.len() as u64 > MAX_INVENTORY_BYTES {
+            return Err(NETWORK);
+        }
+        let mut targets: Vec<Target> = serde_json::from_slice(bytes).map_err(|_| NETWORK)?;
+        targets.sort_unstable();
+        if targets.len() > 128
+            || targets.windows(2).any(|pair| pair[0] == pair[1])
+            || targets.iter().any(|target| {
+                target.identity == [0; 32] || !target.case.transports().contains(&target.transport)
+            })
+            || !REQUIRED.iter().all(|case| {
+                case.transports().iter().all(|transport| {
+                    targets
+                        .iter()
+                        .any(|target| target.case == *case && target.transport == *transport)
+                })
+            })
+        {
+            return Err(NETWORK);
+        }
+        let binding = serde_json::to_vec(&("arx-docker-fixture-v2", fixture_inputs, digest(bytes)))
+            .map_err(|_| NETWORK)?;
+        Ok(Self {
+            targets,
+            fixture: digest(&binding),
+        })
+    }
+
+    pub(in crate::vm::windows::qualification) fn fixture(&self) -> Hash {
+        self.fixture
+    }
+
+    pub(super) fn check_targets(
+        &self,
+        mut observed: Vec<Target>,
+    ) -> Result<Vec<Target>, NativeRefusal> {
+        if observed.len() != self.targets.len() {
+            return Err(NETWORK);
+        }
+        observed.sort_unstable();
+        if observed != self.targets {
+            return Err(NETWORK);
+        }
+        Ok(observed)
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::vm::windows::qualification) struct ObservedRoute {
+    pub interface_index: u32,
+    pub interface_luid: u64,
+    pub source: Ipv4Addr,
+    pub gateway: Ipv4Addr,
+    pub default_route: bool,
+}
+
+impl From<RouteObservation> for ObservedRoute {
+    fn from(route: RouteObservation) -> Self {
+        Self {
+            interface_index: route.interface_index,
+            interface_luid: route.interface_luid,
+            source: route.source,
+            gateway: route.gateway,
+            default_route: route.default_route,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::vm::windows::qualification) struct FlowEvent {
+    pub flow: Id,
+    pub at_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::vm::windows::qualification) struct RouteChange {
+    pub at_ms: u64,
+    pub before: ObservedRoute,
+    pub after: ObservedRoute,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::vm::windows::qualification) struct Drift {
+    pub established: FlowEvent,
+    pub established_arrivals: u16,
+    pub closed: FlowEvent,
+    pub refused: FlowEvent,
+}
+
+impl Drift {
+    fn verifies(&self, drift_at: u64, counts: &Counts) -> bool {
+        let [open, close] = counts.between_ms;
+        let flow = self.established.flow;
+        flow != [0; 16]
+            && self.established_arrivals == 1
+            && self.closed.flow == flow
+            && self.refused.flow == flow
+            && counts.before_ms <= self.established.at_ms
+            && self.established.at_ms < drift_at
+            && drift_at < self.closed.at_ms
+            && self.closed.at_ms < open
+            && (open..close).contains(&self.refused.at_ms)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,6 +255,8 @@ pub(in crate::vm::windows::qualification) struct Counts {
     pub attempts: u16,
     pub arrivals: u16,
     pub after: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift: Option<Drift>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -142,43 +266,42 @@ pub(in crate::vm::windows::qualification) struct Receivers {
     pub boot: Id,
     pub generation: u64,
     pub nonce: [u8; 16],
+    pub route_change: RouteChange,
     pub observations: Vec<Counts>,
 }
 
 pub(super) fn receivers(
     raw: &[u8],
-    targets: &[Target],
-    ticket: Ticket,
-    peer: PeerId,
-    window: std::ops::Range<u64>,
+    boot: &RunningBoot<'_, '_>,
+    finished_ms: u64,
 ) -> Result<Hash, NativeRefusal> {
-    if raw.len() > MAX_CAPTURE_BYTES
-        || targets.len() > 128
-        || !REQUIRED.iter().all(|case| {
-            case.transports().iter().all(|transport| {
-                targets
-                    .iter()
-                    .any(|target| target.case == *case && target.transport == *transport)
-            })
-        })
-        || targets.iter().enumerate().any(|(index, target)| {
-            target.identity == [0; 32]
-                || !target.case.transports().contains(&target.transport)
-                || targets[..index].contains(target)
-        })
-    {
+    if raw.len() > MAX_CAPTURE_BYTES {
         return Err(NETWORK);
     }
+    let pre_cont = boot.route.ok_or(NETWORK)?;
+    let window = boot.started_ms..finished_ms;
     let capture: Receivers = serde_json::from_slice(raw).map_err(|_| NETWORK)?;
-    if capture.run != ticket.scope.run
-        || capture.boot != peer.boot
-        || capture.generation != ticket.challenge.generation
-        || capture.nonce != ticket.challenge.nonce
-        || capture.observations.len() != targets.len()
+    if capture.run != boot.ticket.scope.run
+        || capture.boot != boot.peer.boot
+        || capture.generation != boot.ticket.challenge.generation
+        || capture.nonce != boot.ticket.challenge.nonce
+        || capture.observations.len() != boot.targets.len()
     {
         return Err(NETWORK);
     }
-    for (counts, expected) in capture.observations.iter().zip(targets) {
+    let change = &capture.route_change;
+    if change.before != pre_cont
+        || change.after == change.before
+        || change.after.interface_index == 0
+        || change.after.interface_luid == 0
+        || change.after.source.is_unspecified()
+        || change.after.gateway.is_unspecified()
+        || change.after.source == change.after.gateway
+    {
+        return Err(NETWORK);
+    }
+    let mut flows = Vec::new();
+    for (counts, expected) in capture.observations.iter().zip(boot.targets) {
         let [open, close] = counts.between_ms;
         if counts.target != *expected
             || !window.contains(&counts.before_ms)
@@ -193,15 +316,25 @@ pub(super) fn receivers(
         {
             return Err(NETWORK);
         }
+        match (expected.case, &counts.drift) {
+            (Case::RouteDrift, Some(drift))
+                if drift.verifies(change.at_ms, counts)
+                    && !flows.contains(&drift.established.flow) =>
+            {
+                flows.push(drift.established.flow);
+            }
+            (Case::RouteDrift, _) | (_, Some(_)) => return Err(NETWORK),
+            (_, None) => {}
+        }
     }
     let canonical =
-        serde_json::to_vec(&("arx-docker-receivers-v1", capture)).map_err(|_| NETWORK)?;
+        serde_json::to_vec(&("arx-docker-receivers-v2", capture)).map_err(|_| NETWORK)?;
     Ok(digest(&canonical))
 }
 
 #[cfg(test)]
 pub(in crate::vm::windows::qualification) fn fixture_targets() -> Vec<Target> {
-    REQUIRED
+    let mut targets: Vec<_> = REQUIRED
         .iter()
         .flat_map(|case| {
             case.transports()
@@ -214,7 +347,14 @@ pub(in crate::vm::windows::qualification) fn fixture_targets() -> Vec<Target> {
             transport,
             identity: [index as u8 + 1; 32],
         })
-        .collect()
+        .collect();
+    targets.push(Target {
+        case: Case::Private,
+        transport: Transport::Tcp,
+        identity: [100; 32],
+    });
+    targets.sort_unstable();
+    targets
 }
 
 /// One exact IPv4 loopback listener on the selected port. Keep the process

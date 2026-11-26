@@ -17,7 +17,7 @@ use arx_guest::docker_trial::{BootMode, Challenge, TrialRequest, TrialResponse};
 use std::io::Write;
 
 pub(in crate::vm::windows) mod witness;
-use witness::{Listener, RouteSample, Target};
+use witness::{Listener, ObservedRoute, ReceiverEnrollment, RouteSample, Target};
 
 const REFUSED: NativeRefusal = NativeRefusal::PathCustodyUnverified;
 // Simultaneous worst-case allocation of the fixture, original and both
@@ -408,6 +408,7 @@ pub(super) struct Run<'a, H, G, C> {
     pub(super) capture: C,
     pub(super) dependencies: DockerDependencies,
     pub(super) stock: static_compose::StockBootInputs<'a>,
+    pub(super) receiver_enrollment: ReceiverEnrollment,
     pub(super) packages: Hash,
     pub(super) custody: Custody,
     pub(super) evidence: &'a sink::EvidenceDir,
@@ -426,6 +427,7 @@ struct RunningBoot<'a, 'plan> {
     targets: &'a [Target],
     plan: &'a CommandPlan<'plan>,
     started_ms: u64,
+    route: Option<ObservedRoute>,
 }
 
 impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
@@ -467,7 +469,8 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
             }
             let public = plan.kind() == PlanKind::PublicEgressBoot;
             let targets = if phase == Phase::PublicFixture {
-                self.host.receiver_targets(ticket)?
+                self.receiver_enrollment
+                    .check_targets(self.host.receiver_targets(ticket)?)?
             } else {
                 Vec::new()
             };
@@ -488,14 +491,16 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
             if peer.pid == 0 || peer.boot == [0; 16] {
                 return Err(NativeRefusal::GuestEndpointUnverified);
             }
-            if public {
-                witness::route(
+            let route = if public {
+                Some(witness::route(
                     self.host.route(&boot, Some(peer), cutoff)?,
                     &boot,
                     Some(peer),
                     &self.dependencies,
-                )?;
-            }
+                )?)
+            } else {
+                None
+            };
             let started_ms = self.host.clock().mono_ms;
             if self.cancel.is_cancelled() || started_ms >= cutoff {
                 return Err(NativeRefusal::QualificationMissing);
@@ -511,6 +516,7 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                     targets: &targets,
                     plan: boot.argv(),
                     started_ms,
+                    route,
                 },
             )
         })();
@@ -558,13 +564,7 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                             boot.targets,
                             boot.started_ms..cutoff,
                         )?;
-                        witness::receivers(
-                            &raw,
-                            boot.targets,
-                            boot.ticket,
-                            boot.peer,
-                            boot.started_ms..host.clock().mono_ms,
-                        )
+                        witness::receivers(&raw, &boot, host.clock().mono_ms)
                     })?;
                 *fixture = Some(peer);
                 Ok(Observation::DockerPublicIpv4 {
@@ -650,6 +650,7 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
         if self.custody.scope.run != self.evidence.run()
             || self.custody.scope.evidence != self.evidence.scope()
             || self.stock.inventory != self.dependencies.stock_inventory
+            || self.receiver_enrollment.fixture() != self.dependencies.network_fixture
             || self
                 .host
                 .measure()

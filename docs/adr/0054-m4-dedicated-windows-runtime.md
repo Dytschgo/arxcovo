@@ -1465,9 +1465,16 @@ fw_cfg. The detached copy leaves services masked. The endpoint copy provisions
 the engine using the exact fixed units and accepts only the pinned Compose v3
 hello on that session. The collector checks the pinned policy, topology and
 uplink before checked create and again after paused prelaunch, before CONT.
-The private capture frame binds the run, boot, generation, challenge and
-enrolled receiver targets to counts. Denial requires an observed attempt,
-zero arrivals and positive controls on both sides of the window. The endpoint
+The Docker fixture projection commits the separately held receiver inventory
+alongside the held fixture image, network profile and probe image. The
+collector compares the observer's full case, transport and receiver set
+against that inventory before create. The private capture frame binds the
+run, boot, generation and challenge to observations for those exact targets.
+Denial requires an attempt, zero arrivals and positive controls on both sides
+of the window. The route-drift verdict also requires observed delivery on
+distinct established TCP and UDP flows, one change from the checked pre-CONT
+route, and closure and subsequent refusal attributed to each flow. The stock
+comparison belongs to the separate TEST receipt. The endpoint
 brackets the boot-bound origin exchange with exact loopback listener PID
 checks. The Windows probe derives the expected PID from the live held Job
 child. Hosted tests substitute deterministic peers and exercise the same
