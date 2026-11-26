@@ -30,6 +30,8 @@ enum Fault {
     LateDispose,
     LateDisposeTrial,
     WrongStockExecutable,
+    WrongStockData,
+    WrongStockDataIdentity,
     WrongStockFirmware,
     WrongPackages,
     ForeignGuest,
@@ -53,6 +55,11 @@ enum Fault {
     ForeignRefusedFlow,
     ReusedDriftFlow,
     WrongDriftBaseline,
+    PublicDeliveryAfterDrift,
+    DnsDeliveryAfterDrift,
+    PublicDeliveryAtDrift,
+    DeniedObservationAfterDrift,
+    RouteDriftArrivalAfterDrift,
     FixtureBoundStockRow,
     MissingBeforeControl,
     MissingAfterControl,
@@ -548,54 +555,117 @@ impl trial::Capture for Capture<'_> {
             generation: ticket.challenge.generation,
             nonce: ticket.challenge.nonce,
             route_change: RouteChange {
-                at_ms: window.start + 3,
+                at_ms: window.start + 8,
                 before,
                 after,
             },
             observations: targets
                 .iter()
                 .enumerate()
-                .map(|(index, target)| Counts {
-                    target: target.clone(),
-                    before_ms: window.start + 1,
-                    between_ms: [window.start + 5, window.start + 7],
-                    after_ms: window.start + 8,
-                    before: 1,
-                    attempts: 1,
-                    arrivals: target.case.expected_arrivals(),
-                    after: 1,
-                    drift: (target.case == Case::RouteDrift)
-                        .then(|| {
-                            let flow = if self.fault == Fault::ReusedDriftFlow {
-                                [201; 16]
-                            } else {
-                                [index as u8 + 1; 16]
-                            };
-                            let stamp = |offset| FlowEvent {
-                                flow,
-                                at_ms: window.start + offset,
-                            };
-                            let mut closed = stamp(4);
-                            let mut refused = stamp(6);
-                            if self.fault == Fault::ForeignClosedFlow {
-                                closed.flow[0] ^= 1;
-                            }
-                            if self.fault == Fault::ForeignRefusedFlow {
-                                refused.flow[0] ^= 1;
-                            }
-                            Drift {
-                                established: stamp(2),
-                                established_arrivals: u16::from(
-                                    self.fault != Fault::NoEstablishedArrivals,
-                                ),
-                                closed,
-                                refused,
-                            }
-                        })
-                        .filter(|_| self.fault != Fault::MissingDriftEvents),
+                .map(|(index, target)| {
+                    let is_drift = target.case == Case::RouteDrift;
+                    let (before_ms, between_ms, after_ms) = if is_drift {
+                        (
+                            window.start + 6,
+                            [window.start + 10, window.start + 12],
+                            window.start + 13,
+                        )
+                    } else {
+                        // Complete the ordinary matrix while the enrolled route is stable.
+                        (
+                            window.start + 1,
+                            [window.start + 2, window.start + 4],
+                            window.start + 5,
+                        )
+                    };
+                    Counts {
+                        target: target.clone(),
+                        before_ms,
+                        between_ms,
+                        after_ms,
+                        before: 1,
+                        attempts: 1,
+                        arrivals: target.case.expected_arrivals(),
+                        after: 1,
+                        drift: is_drift
+                            .then(|| {
+                                let flow = if self.fault == Fault::ReusedDriftFlow {
+                                    [201; 16]
+                                } else {
+                                    [index as u8 + 1; 16]
+                                };
+                                let stamp = |offset| FlowEvent {
+                                    flow,
+                                    at_ms: window.start + offset,
+                                };
+                                let mut closed = stamp(9);
+                                let mut refused = stamp(11);
+                                if self.fault == Fault::ForeignClosedFlow {
+                                    closed.flow[0] ^= 1;
+                                }
+                                if self.fault == Fault::ForeignRefusedFlow {
+                                    refused.flow[0] ^= 1;
+                                }
+                                Drift {
+                                    established: stamp(7),
+                                    established_arrivals: u16::from(
+                                        self.fault != Fault::NoEstablishedArrivals,
+                                    ),
+                                    closed,
+                                    refused,
+                                }
+                            })
+                            .filter(|_| self.fault != Fault::MissingDriftEvents),
+                    }
                 })
                 .collect(),
         };
+        match self.fault {
+            Fault::PublicDeliveryAfterDrift | Fault::DnsDeliveryAfterDrift => {
+                let target_case = if self.fault == Fault::PublicDeliveryAfterDrift {
+                    Case::Public
+                } else {
+                    Case::RecursiveDns
+                };
+                let delivery = capture
+                    .observations
+                    .iter_mut()
+                    .find(|counts| counts.target.case == target_case)
+                    .unwrap();
+                delivery.before_ms = window.start + 6;
+                delivery.between_ms = [window.start + 10, window.start + 12];
+                delivery.after_ms = window.start + 13;
+            }
+            Fault::PublicDeliveryAtDrift => {
+                let delivery = capture
+                    .observations
+                    .iter_mut()
+                    .find(|counts| counts.target.case == Case::Public)
+                    .unwrap();
+                delivery.before_ms = window.start + 1;
+                delivery.between_ms = [window.start + 2, window.start + 7];
+                delivery.after_ms = window.start + 8;
+            }
+            Fault::DeniedObservationAfterDrift => {
+                let denied = capture
+                    .observations
+                    .iter_mut()
+                    .find(|counts| counts.target.case == Case::Host)
+                    .unwrap();
+                denied.before_ms = window.start + 6;
+                denied.between_ms = [window.start + 10, window.start + 12];
+                denied.after_ms = window.start + 13;
+            }
+            Fault::RouteDriftArrivalAfterDrift => {
+                let drift = capture
+                    .observations
+                    .iter_mut()
+                    .find(|counts| counts.target.case == Case::RouteDrift)
+                    .unwrap();
+                drift.arrivals = 1;
+            }
+            _ => {}
+        }
         let denied = capture
             .observations
             .iter_mut()
@@ -730,6 +800,15 @@ fn collect(fault: Fault) {
     };
     let wrong_stock = wrong_pin(&stock);
     let wrong_firmware = wrong_pin(&stock_firmware);
+    let alt_share_path = local(dir.path().join("substituted-share").to_str().unwrap()).unwrap();
+    std::fs::create_dir(alt_share_path.as_str()).unwrap();
+    let alt_share_pin = PathPin::open(&alt_share_path, true, false).unwrap();
+    let wrong_stock_data = Artifact::new(Data, alt_share_pin.path.clone())
+        .unwrap()
+        .with_identity(alt_share_pin.identity);
+    let wrong_stock_data_identity = Artifact::new(Data, stock_data.path_for(Data).unwrap().clone())
+        .unwrap()
+        .with_identity(alt_share_pin.identity);
     let rows = baseline
         .files
         .iter()
@@ -836,10 +915,11 @@ fn collect(fault: Fault) {
         let i = phase as usize;
         BootRecipe {
             image,
-            data: if matches!(phase, Install | Detached) {
-                &stock_data
-            } else {
-                &data
+            data: match phase {
+                Install if fault == Fault::WrongStockData => &wrong_stock_data,
+                Detached if fault == Fault::WrongStockDataIdentity => &wrong_stock_data_identity,
+                Install | Detached => &stock_data,
+                _ => &data,
             },
             firmware: match phase {
                 Detached if fault == Fault::WrongStockFirmware => &wrong_firmware,
@@ -936,6 +1016,8 @@ fn collect(fault: Fault) {
             | Fault::Late
             | Fault::LateDrain
             | Fault::WrongStockExecutable
+            | Fault::WrongStockData
+            | Fault::WrongStockDataIdentity
             | Fault::WrongStockFirmware
     ) || pre_cont_refusal
         || inventory_refusal;
@@ -1006,7 +1088,7 @@ fn collect(fault: Fault) {
     );
     if matches!(
         fault,
-        Fault::Stage | Fault::Scope | Fault::WrongStockExecutable
+        Fault::Stage | Fault::Scope | Fault::WrongStockExecutable | Fault::WrongStockData
     ) {
         assert_eq!(trace.launched, [PublicFixture]);
     }
@@ -1018,7 +1100,10 @@ fn collect(fault: Fault) {
         assert_eq!(trace.launched, [PublicFixture]);
         assert!(trace.continued.is_empty());
     }
-    if matches!(fault, Fault::Dirty | Fault::WrongStockFirmware) {
+    if matches!(
+        fault,
+        Fault::Dirty | Fault::WrongStockFirmware | Fault::WrongStockDataIdentity
+    ) {
         assert_eq!(trace.launched, [PublicFixture, Install]);
     }
 }
@@ -1055,6 +1140,12 @@ fn docker_collector_retains_charge_when_dispose_reply_is_late() {
 fn docker_collector_refuses_wrong_stock_pins_before_dispatch() {
     collect(Fault::WrongStockExecutable);
     collect(Fault::WrongStockFirmware);
+}
+
+#[test]
+fn docker_collector_refuses_substituted_stock_data_directory_before_dispatch() {
+    collect(Fault::WrongStockData);
+    collect(Fault::WrongStockDataIdentity);
 }
 
 #[test]
@@ -1110,6 +1201,19 @@ fn docker_collector_refuses_unbound_route_drift_events() {
         Fault::ForeignRefusedFlow,
         Fault::ReusedDriftFlow,
         Fault::WrongDriftBaseline,
+    ] {
+        collect(fault);
+    }
+}
+
+#[test]
+fn docker_collector_refuses_public_and_dns_deliveries_after_route_drift() {
+    for fault in [
+        Fault::PublicDeliveryAfterDrift,
+        Fault::DnsDeliveryAfterDrift,
+        Fault::PublicDeliveryAtDrift,
+        Fault::DeniedObservationAfterDrift,
+        Fault::RouteDriftArrivalAfterDrift,
     ] {
         collect(fault);
     }

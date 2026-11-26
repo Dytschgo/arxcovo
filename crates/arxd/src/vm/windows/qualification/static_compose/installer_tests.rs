@@ -277,3 +277,260 @@ fn stock_inventory_refuses_a_different_verified_receipt() {
         }
     });
 }
+
+struct MeasureEnv {
+    dir: tempfile::TempDir,
+    stock_fixture: inventory::tests::Fixture,
+    patched_fixture: inventory::tests::Fixture,
+    scope: test::Scope,
+    token: VmToken,
+    route: RouteObservation,
+    policy_bytes: Vec<u8>,
+    topology_bytes: Vec<u8>,
+    manifest_bytes: Vec<u8>,
+}
+
+impl MeasureEnv {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let scope_dir = dir.path().join("scope");
+        fs::create_dir(&scope_dir).unwrap();
+        let scope = test::Scope::fixture(&scope_dir);
+        let token = VmToken::test_current_user();
+        let stock_fixture = inventory::tests::Fixture::new();
+        let patched_fixture = inventory::tests::Fixture::new();
+        for fixture in [&stock_fixture, &patched_fixture] {
+            for path in [fixture.root.path(), &fixture.root.path().join("share")] {
+                inventory::tests::set_dacl(path, inventory::tests::READ_ONLY);
+            }
+        }
+        let route = RouteObservation {
+            interface_index: 1,
+            interface_luid: 2,
+            source: "192.0.2.2".parse().unwrap(),
+            gateway: "192.0.2.1".parse().unwrap(),
+            default_route: true,
+        };
+        let body = concat!(
+            "version=1\ninterface_index=1\ninterface_luid=2\n",
+            "source=192.0.2.2\ngateway=192.0.2.1\n",
+        );
+        let policy_bytes = format!(
+            "{body}fingerprint={}\n",
+            hex::encode(digest(body.as_bytes()))
+        )
+        .into_bytes();
+        let topology_bytes = b"reviewed-topology".to_vec();
+        let manifest_bytes =
+            serde_json::to_vec(&super::super::docker_trial::witness::fixture_targets()).unwrap();
+        Self {
+            dir,
+            stock_fixture,
+            patched_fixture,
+            scope,
+            token,
+            route,
+            policy_bytes,
+            topology_bytes,
+            manifest_bytes,
+        }
+    }
+
+    fn hold_named(&self, name: &str, bytes: &[u8]) -> PathPin {
+        let path = self.dir.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        let local_path = local(path.to_str().unwrap()).unwrap();
+        hold_file(
+            &local_path,
+            ArtifactPin {
+                size: bytes.len() as u64,
+                sha256: digest(bytes),
+            },
+            MAX_METADATA,
+        )
+        .unwrap()
+    }
+
+    fn inputs<'a>(&'a self, recipe: &'a ComposeInstallerInputs) -> HeldDockerInputs<'a> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stock = self.stock_fixture.inspect(deadline).unwrap();
+        let patched = inventory::PatchedBundle {
+            bundle: self.patched_fixture.inspect(deadline).unwrap(),
+            review: crate::vm::public_egress::REVIEWED_EGRESS_BUILDS[0],
+        };
+        HeldDockerInputs {
+            release: [
+                self.hold_named("arxd.exe", b"daemon-binary"),
+                self.hold_named("arx-vm-qualify.exe", b"qualifier-binary"),
+            ],
+            scope: &self.scope,
+            token: &self.token,
+            recipe,
+            profile: self.hold_named("profile.json", b"profile"),
+            policy: self.hold_named("policy.txt", &self.policy_bytes),
+            parsed_policy: PublicEgressPolicy::parse(&self.policy_bytes).unwrap(),
+            patched,
+            stock,
+            stock_inventory: [0x11; 32],
+            fixture: [
+                self.hold_named("fixture.img", b"fixture-image"),
+                self.hold_named("fixture-net.json", b"fixture-network"),
+                self.hold_named("probe.img", b"probe-image"),
+            ],
+            receiver_inventory: self.hold_named("receivers.json", &self.manifest_bytes),
+            topology: self.hold_named("topology.json", &self.topology_bytes),
+            origin_profile: self.hold_named("origin.json", b"origin-profile"),
+        }
+    }
+
+    fn live_topology(&self) -> Hash {
+        digest(&self.topology_bytes)
+    }
+
+    fn assert_measure_passes(&self, inputs: &HeldDockerInputs<'_>, expected_recipe: DockerRecipe) {
+        let result = inputs.measure(&self.route, self.live_topology());
+        if platform().is_ok() {
+            let deps = result.expect("measure should succeed on Windows 11 workstation");
+            assert_eq!(deps.recipe, expected_recipe);
+        } else {
+            // Hosted Windows Server CI fails only at platform()'s workstation check,
+            // strictly after recipe.recheck(), route, topology, scope and bundles pass.
+            assert_eq!(result.err(), Some(NativeRefusal::UnsupportedPlatform));
+        }
+    }
+}
+
+impl Drop for MeasureEnv {
+    fn drop(&mut self) {
+        for fixture in [&self.stock_fixture, &self.patched_fixture] {
+            for path in [fixture.root.path(), &fixture.root.path().join("share")] {
+                inventory::tests::set_dacl(path, inventory::tests::WRITABLE);
+            }
+        }
+    }
+}
+
+#[test]
+fn held_docker_inputs_measure_rechecks_boot_files_and_receipt() {
+    #[derive(Clone, Copy, Debug)]
+    enum BootFile {
+        Kernel,
+        Initrd,
+        Receipt,
+    }
+
+    fn pin_mut(held: &mut ComposeInstallerInputs, target: BootFile) -> &mut PathPin {
+        match target {
+            BootFile::Kernel => &mut held.kernel,
+            BootFile::Initrd => &mut held.initrd,
+            BootFile::Receipt => &mut held.qemu_receipt,
+        }
+    }
+
+    with_fixture(|f| {
+        let env = MeasureEnv::new();
+        for target in [BootFile::Kernel, BootFile::Initrd, BootFile::Receipt] {
+            let disk_path = match target {
+                BootFile::Kernel => f.paths.kernel,
+                BootFile::Initrd => f.paths.initrd,
+                BootFile::Receipt => f.paths.qemu_receipt,
+            };
+
+            // Positive control through HeldDockerInputs::measure.
+            let held = f.hold().unwrap();
+            let expected_recipe = held.recipe;
+            let inputs = env.inputs(&held);
+            env.assert_measure_passes(&inputs, expected_recipe);
+
+            // Changed-after-hold custody: writers, renames, deletes and hard links are refused while held.
+            let raw_path = std::path::Path::new(disk_path.as_str());
+            let original_bytes = fs::read(raw_path).unwrap();
+            let alias = raw_path.with_extension("alias");
+            for refusal in [
+                OpenOptions::new().write(true).open(raw_path).unwrap_err(),
+                fs::rename(raw_path, raw_path.with_extension("moved")).unwrap_err(),
+                fs::remove_file(raw_path).unwrap_err(),
+                fs::hard_link(raw_path, &alias).unwrap_err(),
+            ] {
+                assert_eq!(refusal.raw_os_error(), Some(32));
+            }
+            assert!(!alias.exists());
+            env.assert_measure_passes(&inputs, expected_recipe);
+            drop(inputs);
+
+            // Missing proof (verified_content cleared) must refuse in measure.
+            {
+                let mut held_missing_proof = f.hold().unwrap();
+                pin_mut(&mut held_missing_proof, target).verified_content = None;
+                let inputs = env.inputs(&held_missing_proof);
+                assert_eq!(
+                    inputs.measure(&env.route, env.live_topology()).err(),
+                    Some(NativeRefusal::QualificationMissing),
+                    "measure accepted missing {target:?} proof"
+                );
+            }
+
+            // Missing file at recheck path must refuse in measure.
+            {
+                let mut held_missing_path = f.hold().unwrap();
+                let missing = local(raw_path.with_extension("missing").to_str().unwrap()).unwrap();
+                pin_mut(&mut held_missing_path, target).path = missing;
+                let inputs = env.inputs(&held_missing_path);
+                assert_eq!(
+                    inputs.measure(&env.route, env.live_topology()).err(),
+                    Some(NativeRefusal::QualificationMissing),
+                    "measure accepted missing {target:?} file"
+                );
+            }
+
+            // Same-length changed file at recheck must refuse in measure.
+            {
+                let mut changed = original_bytes.clone();
+                changed[0] ^= 1;
+                let impostor = raw_path.with_extension("same-len");
+                fs::write(&impostor, &changed).unwrap();
+                let mut held_same_len = f.hold().unwrap();
+                pin_mut(&mut held_same_len, target).path =
+                    local(impostor.to_str().unwrap()).unwrap();
+                let inputs = env.inputs(&held_same_len);
+                assert_eq!(
+                    inputs.measure(&env.route, env.live_topology()).err(),
+                    Some(NativeRefusal::QualificationMissing),
+                    "measure accepted same-length substituted {target:?}"
+                );
+                drop(inputs);
+                drop(held_same_len);
+                fs::remove_file(&impostor).unwrap();
+            }
+
+            // Changed length mismatch on proof must refuse in measure.
+            {
+                let mut held_wrong_len = f.hold().unwrap();
+                pin_mut(&mut held_wrong_len, target)
+                    .verified_content
+                    .as_mut()
+                    .unwrap()
+                    .size += 1;
+                let inputs = env.inputs(&held_wrong_len);
+                assert_eq!(
+                    inputs.measure(&env.route, env.live_topology()).err(),
+                    Some(NativeRefusal::QualificationMissing),
+                    "measure accepted length-mismatched {target:?}"
+                );
+            }
+
+            // Drop hold, then verify missing and same-length changed files cannot re-enter measure.
+            drop(held);
+            fs::remove_file(raw_path).unwrap();
+            assert!(f.hold().is_err(), "re-held missing {target:?}");
+            let mut changed = original_bytes.clone();
+            changed[0] ^= 1;
+            fs::write(raw_path, &changed).unwrap();
+            assert!(f.hold().is_err(), "re-held same-length changed {target:?}");
+            fs::write(raw_path, &original_bytes).unwrap();
+            let reheld = f.hold().unwrap();
+            let inputs = env.inputs(&reheld);
+            env.assert_measure_passes(&inputs, expected_recipe);
+        }
+    });
+}
