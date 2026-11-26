@@ -386,6 +386,11 @@ main:focus-visible { outline-offset: -4px; }
 .vm-card-ready svg.i { inline-size: 12px; block-size: 12px; }
 .vm-card-ready[data-ready="false"] { color: var(--ink); }
 
+/* Control edge (WCAG 2.2 SC 1.4.11): the unfocused boundary of a field, chip,
+   segmented group or toggle clears 3:1 on every surface it sits on (3.67 on
+   --raise, 4.1 on --bg); --line2/--line3 are only for decorative hairlines. */
+:root { --edge: #6e6e6e; }
+
 /* --- Search jump list (top bar) ------------------------------------------ */
 .search {
   position: relative;
@@ -395,7 +400,7 @@ main:focus-visible { outline-offset: -4px; }
   flex: 0 1 250px;
   min-block-size: 34px;
   padding: 0 8px 0 12px;
-  border: 1px solid var(--line2);
+  border: 1px solid var(--edge);
   border-radius: var(--r-ctl);
   color: var(--ink3);
   transition: border-color var(--dur-fast);
@@ -485,7 +490,7 @@ kbd {
 .ready[data-off] { color: var(--ink3); }
 
 /* Segmented control and filter chips: the pressed one is white. */
-.seg { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--line2); border-radius: var(--r-ctl); }
+.seg { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--edge); border-radius: var(--r-ctl); }
 .seg button, .fchip {
   display: inline-flex;
   align-items: center;
@@ -501,7 +506,7 @@ kbd {
   /* No colour transition: fill and ink switch together, so the label never
      passes through a low-contrast frame. */
 }
-.fchip { border: 1px solid var(--line2); color: var(--ink2); font-size: var(--fs-sm); padding: 0 11px; }
+.fchip { border: 1px solid var(--edge); color: var(--ink2); font-size: var(--fs-sm); padding: 0 11px; }
 .seg button[aria-pressed="true"], .fchip[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--bg); font-weight: 500; }
 .fchip[aria-pressed="true"] .st, .seg button[aria-pressed="true"] .kind { color: var(--bg); }
 .seg button[aria-pressed="true"] .kind[data-kind="test"] { border-color: var(--bg); }
@@ -515,7 +520,7 @@ kbd {
 .switch { position: relative; display: inline-flex; align-items: center; gap: 9px; color: var(--ink2); font-size: var(--fs-ui); cursor: pointer; }
 /* The native checkbox is clipped, not faded; the label toggles it and the track shows its state. */
 .switch input { position: absolute; inline-size: 1px; block-size: 1px; margin: 0; overflow: clip; clip-path: inset(50%); white-space: nowrap; }
-.switch-track { position: relative; flex: none; inline-size: 34px; block-size: 20px; border-radius: var(--r-ctl); background: var(--line2); }
+.switch-track { position: relative; flex: none; inline-size: 34px; block-size: 20px; border-radius: var(--r-ctl); background: var(--line2); box-shadow: inset 0 0 0 1px var(--edge); }
 .switch-track::after { content: ""; position: absolute; inset: 3px auto auto 3px; inline-size: 14px; block-size: 14px; border-radius: 50%; background: var(--ink2); transition: transform var(--dur-fast) var(--ease); }
 .switch input:checked + .switch-track { background: var(--ink); }
 .switch input:checked + .switch-track::after { transform: translateX(14px); background: var(--bg); }
@@ -737,7 +742,7 @@ a.hn:hover { text-decoration: underline; }
 .state-chips .fchip { min-block-size: 26px; padding: 0 9px; }
 .table-tile > .summary { padding: 0 var(--sp-5) var(--sp-3); }
 .table-tile > .state { margin: 0 var(--sp-5) var(--sp-5); }
-.filter-name { display: flex; align-items: center; gap: var(--sp-2); flex: 0 1 240px; margin-inline-start: auto; min-block-size: 36px; padding: 0 12px; border: 1px solid var(--line2); border-radius: var(--r-ctl); color: var(--ink3); }
+.filter-name { display: flex; align-items: center; gap: var(--sp-2); flex: 0 1 240px; margin-inline-start: auto; min-block-size: 36px; padding: 0 12px; border: 1px solid var(--edge); border-radius: var(--r-ctl); color: var(--ink3); }
 .filter-name:focus-within { border-color: var(--ink); }
 .filter-name input { flex: 1; inline-size: 100%; border: 0; background: none; outline: 0; color: var(--ink); }
 .table-scroll { overflow-x: auto; border-block-start: 1px solid var(--line); }
@@ -835,7 +840,7 @@ a.hn:hover { text-decoration: underline; }
 .host-pick { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
 .hp { display: grid; gap: 4px; padding: 10px 12px; border: 1px solid transparent; border-radius: var(--r-card); color: var(--ink); text-decoration: none; }
 a.hp:hover { background: var(--tile2); }
-a.hp[aria-current] { border-color: var(--line3); background: var(--tile2); }
+a.hp[aria-current] { border-color: var(--edge); background: var(--tile2); }
 .hp[aria-disabled] { color: var(--ink3); cursor: not-allowed; }
 .hp-top { display: flex; align-items: center; gap: var(--sp-2); }
 .hp-top b { font-weight: 500; }
@@ -868,7 +873,7 @@ a.hp[aria-current] { border-color: var(--line3); background: var(--tile2); }
 .terminal-prompt { color: var(--ink3); font-family: var(--mono); }
 .term-form { display: grid; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-5); border-block-start: 1px solid var(--line); }
 .terminal-input { display: flex; align-items: center; gap: var(--sp-2); }
-.terminal-input input { flex: 1; min-block-size: 42px; padding: 0 12px; border: 1px solid var(--line2); border-radius: var(--r-input); background: var(--tile2); color: var(--ink); font-family: var(--mono); outline: 0; }
+.terminal-input input { flex: 1; min-block-size: 42px; padding: 0 12px; border: 1px solid var(--edge); border-radius: var(--r-input); background: var(--tile2); color: var(--ink); font-family: var(--mono); outline: 0; }
 .terminal-input input:focus-visible { border-color: var(--ink); }
 /* Disabled fields: --ink4 and a dashed outline, never an opacity fade. */
 .terminal-input input:disabled, .field select:disabled {
