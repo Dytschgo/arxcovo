@@ -39,6 +39,11 @@
   --line: #1b1b1b;
   --line2: #262626;
   --line3: #3a3a3a;
+  /* Control edge (WCAG 1.4.11, 3:1): the boundary that identifies an enabled
+     field or checkbox. Hairlines (--line*) stay for decoration and for parts
+     a text label already identifies. #666 is 3.66 on --bg, 3.51 on --tile,
+     3.41 on --tile2 and 3.26 on --raise (styles.test.ts checks it). */
+  --edge: #666;
 
   /* Ink. Every step clears 4.5:1 on --raise (#121212) and darker:
      --ink 18.7, --ink2 12.0, --ink3 7.4, --ink4 5.1 (styles.test.ts checks it). */
@@ -244,7 +249,7 @@ main:focus-visible { outline-offset: -4px; }
 @media (hover: hover) and (pointer: fine) {
   .nav a:hover:not([aria-current]) { color: var(--ink); }
   .signout:hover { color: var(--ink); border-color: var(--line3); }
-  .button:hover:not(:disabled) { border-color: #666; }
+  .button:hover:not(:disabled) { border-color: var(--edge); }
   .button-primary:hover:not(:disabled) { background: #e6e6e6; border-color: #e6e6e6; }
   .card:has(.card-link:hover) { border-color: var(--line3); }
   .chip-button:hover { border-color: var(--line3); color: var(--ink); }
@@ -292,19 +297,41 @@ main:focus-visible { outline-offset: -4px; }
 .field input, .field select, .terminal-input input {
   min-block-size: 40px;
   padding: 0 12px;
-  border: 1px solid var(--line2);
+  border: 1px solid var(--edge);
   border-radius: var(--r-input);
   background: var(--tile2);
   color: var(--ink);
   outline: 0;
 }
 .field input:focus-visible, .field select:focus-visible, .terminal-input input:focus-visible { border-color: var(--ink); }
-.field input:disabled, .field select:disabled, .terminal-input input:disabled { border-style: dashed; color: var(--ink4); cursor: not-allowed; }
+/* Disabled controls are exempt from 1.4.11; they keep a dimmer dashed edge. */
+.field input:disabled, .field select:disabled, .terminal-input input:disabled { border-style: dashed; border-color: var(--line3); color: var(--ink4); cursor: not-allowed; }
 /* Chromium's default placeholder (#757575) is 4.25:1 on --tile2; --ink4 is 5.30:1. */
 ::placeholder { color: var(--ink4); opacity: 1; }
 .field-inline { flex-direction: row; align-items: center; gap: var(--sp-2); }
 .check { display: inline-flex; align-items: center; gap: 7px; color: var(--ink2); font-size: var(--fs-ui); }
-.check input { inline-size: 1.1rem; block-size: 1.1rem; accent-color: var(--ink); }
+.check input {
+  appearance: none;
+  display: inline-grid;
+  place-content: center;
+  inline-size: 1.1rem;
+  block-size: 1.1rem;
+  margin: 0;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+}
+.check input:checked { border-color: var(--ink); background: var(--ink); }
+.check input:checked::before {
+  content: "";
+  inline-size: .55rem;
+  block-size: .3rem;
+  border: solid var(--bg);
+  border-width: 0 0 2px 2px;
+  transform: translateY(-1px) rotate(-45deg);
+}
+.check input:disabled { border-style: dashed; border-color: var(--line3); cursor: not-allowed; }
 
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3) var(--sp-5); }
 
@@ -623,6 +650,7 @@ main:focus-visible { outline-offset: -4px; }
 
 @media (forced-colors: active) {
   .pill, .arch, .st { border: 1px solid; }
+  .check input { appearance: auto; }
   .na::before, .meter-track[data-unknown] { border: 1px dashed; }
 }
 

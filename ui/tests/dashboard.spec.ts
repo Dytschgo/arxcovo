@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import { auditText, freezeMotion } from './contrast';
+import { nonTextFailures } from './nontext';
 
 // Runs against `vite dev`, so the deterministic stand-in adapter is active.
 // Screenshots land in test-results/screenshots (gitignored) for the PR.
@@ -157,6 +158,7 @@ for (const motion of ['no-preference', 'reduce'] as const) {
       const { contrast, opacityGroups } = await auditText(page);
       expect.soft(contrast, where).toEqual([]);
       expect.soft(opacityGroups, `${where}: text inside an opacity group`).toEqual([]);
+      expect.soft(await nonTextFailures(page), `${where}: non-text contrast (3:1)`).toEqual([]);
     };
     await page.goto('/');
     if (motion === 'no-preference') await freezeMotion(page);
@@ -238,6 +240,7 @@ test('contrast: in-flight states (signing in, a running command) clear 4.5:1 in 
     const { contrast, opacityGroups } = await auditText(page);
     expect.soft(contrast, 'signing in').toEqual([]);
     expect.soft(opacityGroups, 'signing in: text inside an opacity group').toEqual([]);
+    expect.soft(await nonTextFailures(page), 'signing in: non-text contrast (3:1)').toEqual([]);
   }
   await page.clock.resume();
   await expect(page.getByRole('list', { name: 'Hosts' })).toBeVisible();
@@ -254,6 +257,7 @@ test('contrast: in-flight states (signing in, a running command) clear 4.5:1 in 
     const { contrast, opacityGroups } = await auditText(page);
     expect.soft(contrast, 'command running').toEqual([]);
     expect.soft(opacityGroups, 'command running: text inside an opacity group').toEqual([]);
+    expect.soft(await nonTextFailures(page), 'command running: non-text contrast (3:1)').toEqual([]);
   }
   await page.clock.resume();
   await expect(page.getByRole('log')).toContainText('exit 0');

@@ -1,6 +1,7 @@
 import { expect, test, type BrowserContext, type Page, type Response } from '@playwright/test';
 import path from 'node:path';
 import { auditText } from '../contrast';
+import { nonTextFailures } from '../nontext';
 import { replaySessionStatus } from './replay';
 
 // Runs against a real arxd serving the production ui/dist (see
@@ -45,11 +46,12 @@ async function shot(page: Page, name: string, host?: HostIdentity) {
   await page.screenshot({ path: path.join(SHOTS, `${name}.png`), fullPage: true, mask, maskColor: '#7c8794' });
 }
 
-/** Night Orbit contrast audit and opacity guard of the real page (see ../contrast.ts); soft, so every state is reported. */
+/** Night Orbit text and non-text contrast audits and opacity guard of the real page (see ../contrast.ts); soft, so every state is reported. */
 async function audit(page: Page, where: string) {
   const { contrast, opacityGroups } = await auditText(page);
   expect.soft(contrast, `contrast: ${where}`).toEqual([]);
   expect.soft(opacityGroups, `text inside an opacity group: ${where}`).toEqual([]);
+  expect.soft(await nonTextFailures(page), `non-text contrast (3:1): ${where}`).toEqual([]);
 }
 
 async function signIn(page: Page, hash = '#/hosts') {
