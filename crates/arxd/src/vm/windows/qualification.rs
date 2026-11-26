@@ -9,9 +9,9 @@ mod boot;
 mod capacity;
 #[allow(
     dead_code,
-    reason = "the native receiver and route peer is added in Part B PR 2b"
+    reason = "checked native creation and live witness peers remain gated"
 )]
-mod docker_trial;
+pub(super) mod docker_trial;
 mod foreground;
 pub(crate) use foreground::ForegroundQualification;
 pub(super) mod inventory;

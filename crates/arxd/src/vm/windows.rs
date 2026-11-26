@@ -3372,6 +3372,51 @@ mod tests {
         assert_eq!(marker, [42]);
     }
 
+    #[test]
+    #[ignore = "child-only listener fixture; spawned with a Job and explicit stdio"]
+    fn fixture_listener() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        std::io::stdout().write_all(b"ARX_JOB_READY\n").unwrap();
+        // Emit two binary port bytes after the readiness marker.
+        std::io::stdout()
+            .write_all(&listener.local_addr().unwrap().port().to_le_bytes())
+            .unwrap();
+        std::io::stdout().flush().unwrap();
+        let mut exit = [0];
+        std::io::stdin().read_exact(&mut exit).unwrap();
+        assert_eq!(exit, [42]);
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn docker_trial_listener_belongs_to_the_held_fixture_child() {
+        use qualification::docker_trial::witness::listener;
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let foreign = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let Some((mut child, stdio)) = fixture_spawn("vm::windows::tests::fixture_listener", 0)
+        else {
+            return;
+        };
+        let pid = child.verify_live().unwrap();
+        let (mut read, mut write, workers) = start_stdio(stdio, Default::default()).unwrap();
+        child.resume().unwrap();
+        ready(&mut read).await;
+        let port = tokio::time::timeout(Duration::from_secs(2), read.read_u16_le())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(listener(&child, port).unwrap().check(port, pid).is_ok());
+        assert!(listener(&child, foreign.local_addr().unwrap().port()).is_err());
+        assert!(listener(&child, 0).is_err());
+        write.write_all(&[42]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        child.reap(deadline).await.unwrap();
+        assert_eq!(child.exit_code(), Ok(0));
+        assert!(listener(&child, port).is_err());
+        workers.join(deadline).await.unwrap();
+    }
+
     async fn ready(reader: &mut tokio::io::DuplexStream) {
         tokio::time::timeout(Duration::from_secs(2), async {
             let mut observed = Vec::new();

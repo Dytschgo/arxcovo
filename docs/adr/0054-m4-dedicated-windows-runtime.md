@@ -1463,6 +1463,16 @@ held workspace and verifies the Docker dossier before publishing the marker.
 Detached and endpoint copies select their fixed guest bootstrap through
 fw_cfg. The detached copy leaves services masked. The endpoint copy provisions
 the engine using the exact fixed units and accepts only the pinned Compose v3
-hello on that session. The Windows Docker CLI refuses before claiming output
-until the native receiver and route adapter is wired. Hosted tests substitute
-those peers and exercise the same collector and marker-last writer.
+hello on that session. The collector checks the pinned policy, topology and
+uplink before checked create and again after paused prelaunch, before CONT.
+The private capture frame binds the run, boot, generation, challenge and
+enrolled receiver targets to counts. Denial requires an observed attempt,
+zero arrivals and positive controls on both sides of the window. The endpoint
+brackets the boot-bound origin exchange with exact loopback listener PID
+checks. The Windows probe derives the expected PID from the live held Job
+child. Hosted tests substitute deterministic peers and exercise the same
+collector and marker-last writer. The Docker CLI refuses before claiming
+output until checked native creation, live route enforcement and the reviewed
+capture and HTTPS adapters are wired. The owner preflights a separate E1a
+copy without changing the held bundle predicate.
+[Docker qualification runbook](../docker-qualification.md)
