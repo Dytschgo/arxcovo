@@ -39,12 +39,34 @@ pub struct IsoPoolManifest<'a> {
     pub packages: &'a [PoolPackage<'a>],
 }
 
+/// Only tests may enroll a small synthetic installer.
+#[derive(Clone, Copy)]
+pub(crate) enum ExpectedIso {
+    Official,
+    #[cfg(all(test, windows, target_arch = "x86_64"))]
+    Fixture([u8; 32]),
+}
+
+impl ExpectedIso {
+    fn digest(self) -> [u8; 32] {
+        match self {
+            Self::Official => UbuntuRecipe::ISO_SHA256,
+            #[cfg(all(test, windows, target_arch = "x86_64"))]
+            Self::Fixture(digest) => digest,
+        }
+    }
+}
+
 impl IsoPoolManifest<'_> {
     /// Canonical receipt pin. The owner-reviewed expected pin comes from
     /// outside this receipt and outside any agent-controlled input.
     pub fn canonical_pin(&self) -> Result<ArtifactPin, RecipeError> {
+        self.canonical_pin_for(ExpectedIso::Official)
+    }
+
+    pub(crate) fn canonical_pin_for(&self, iso: ExpectedIso) -> Result<ArtifactPin, RecipeError> {
         let metadata = self.signed_metadata;
-        if self.iso.sha256 != UbuntuRecipe::ISO_SHA256
+        if self.iso.sha256 != iso.digest()
             || self.iso.length == 0
             || !(1..=MAX_METADATA_BYTES).contains(&metadata.size)
             || metadata.sha256 == [0; 32]
@@ -143,8 +165,26 @@ impl<'a> UbuntuWebRecipe<'a> {
         manifest_pin: Option<ArtifactPin>,
         verifier: &impl IsoPoolVerifier,
     ) -> Result<Self, RecipeError> {
+        Self::qualify_for(
+            base,
+            profile_pin,
+            manifest,
+            manifest_pin,
+            verifier,
+            ExpectedIso::Official,
+        )
+    }
+
+    pub(crate) fn qualify_for(
+        base: &'a UbuntuRecipe,
+        profile_pin: Option<ArtifactPin>,
+        manifest: &'a IsoPoolManifest<'a>,
+        manifest_pin: Option<ArtifactPin>,
+        verifier: &impl IsoPoolVerifier,
+        expected_iso: ExpectedIso,
+    ) -> Result<Self, RecipeError> {
         let iso = base.iso.ok_or(RecipeError::Unqualified)?;
-        let manifest_digest = manifest.canonical_pin()?;
+        let manifest_digest = manifest.canonical_pin_for(expected_iso)?;
         if profile_pin != Some(PROFILE_PIN)
             || profile_pin != Some(profile_pin_from_literals())
             || manifest_pin != Some(manifest_digest)
