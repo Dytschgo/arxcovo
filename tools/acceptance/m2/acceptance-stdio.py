@@ -5,18 +5,26 @@ This process launches `arxd mcp-stdio` and appends sanitized tool results to
 the evidence file. It does not embed a machine path or a credential.
 """
 
+import io
 import json
 import os
+import queue
 import re
+import stat
 import sqlite3
 import subprocess
 import sys
 import threading
-from contextlib import closing
+from contextlib import ExitStack, closing, contextmanager
+from time import monotonic
 from pathlib import Path
 
 TOOLS = {"list_hosts", "run_command", "list_activity"}
-LIMIT = 65536
+RESPONSE_LIMIT = 65536
+REQUEST_LIMIT = 8192
+RPC_TIMEOUT = 65
+POLL_INTERVAL = 0.05
+DATABASE_LIMIT = 64 * 1024 * 1024
 
 
 def absolute_path(value):
@@ -26,11 +34,114 @@ def absolute_path(value):
     if not path.is_absolute() or ".." in path.parts:
         raise ValueError("usage")
     if os.name == "nt":
-        drive = re.match(r"^[A-Za-z]:[\\/]", value) is not None
-        unc = value.startswith("\\\\")
-        if not drive and not unc:
+        if not re.match(r"^[A-Za-z]:[\\/]", value) or any(
+            part.endswith((" ", ".")) or Path(part).is_reserved()
+            or any(ord(char) < 32 or char in '<>:"|?*' for char in part)
+            for part in path.parts[1:]
+        ):
             raise ValueError("usage")
     return value
+
+
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    def bind(name, result, *args):
+        function = getattr(kernel, name)
+        function.argtypes = args
+        function.restype = result
+        return function
+
+    HANDLE = wintypes.HANDLE
+    DWORD = wintypes.DWORD
+    create_file = bind("CreateFileW", HANDLE, wintypes.LPCWSTR, DWORD, DWORD,
+                       HANDLE, DWORD, DWORD, HANDLE)
+    file_type = bind("GetFileType", DWORD, HANDLE)
+    close_handle = bind("CloseHandle", wintypes.BOOL, HANDLE)
+
+    class FileInfo(ctypes.Structure):
+        _fields_ = [("attributes", DWORD), ("created", wintypes.FILETIME),
+                    ("accessed", wintypes.FILETIME), ("written", wintypes.FILETIME),
+                    ("volume", DWORD), ("size_high", DWORD), ("size_low", DWORD),
+                    ("links", DWORD), ("index_high", DWORD), ("index_low", DWORD)]
+
+    file_info = bind("GetFileInformationByHandle", wintypes.BOOL, HANDLE,
+                     ctypes.POINTER(FileInfo))
+    INVALID_HANDLE = ctypes.c_void_p(-1).value
+    OPEN_REPARSE_POINT = 0x00200000
+    BACKUP_SEMANTICS = 0x02000000
+    DIRECTORY = 0x10
+    REPARSE_POINT = 0x400
+    SHARE_READ = 1
+    OPEN_EXISTING = 3
+    CREATE_NEW = 1
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+
+    def check_handle(handle, directory=False):
+        info = FileInfo()
+        if (not file_info(handle, ctypes.byref(info)) or file_type(handle) != 1
+                or info.attributes & REPARSE_POINT
+                or bool(info.attributes & DIRECTORY) != directory
+                or (not directory and info.links != 1)):
+            raise ValueError("unsafe file")
+
+    def open_handle(path, access, share, disposition, directory=False):
+        flags = OPEN_REPARSE_POINT | (BACKUP_SEMANTICS if directory else 0)
+        handle = create_file(str(path), access, share, None, disposition, flags, None)
+        if handle == INVALID_HANDLE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            check_handle(handle, directory)
+        except BaseException:
+            close_handle(handle)
+            raise
+        return handle
+
+
+def check_file(stream):
+    if os.name == "nt":
+        check_handle(msvcrt.get_osfhandle(stream.fileno()))
+    else:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("unsafe file")
+
+
+@contextmanager
+def checked_file(value, *, create=False, share_read=False):
+    path = Path(absolute_path(os.fspath(value)))
+    with ExitStack() as stack:
+        if os.name == "nt":
+            # Open prefixes from the volume root down. Retain each directory
+            # without write/delete sharing so later path operations stay under it.
+            for parent in reversed(path.parents):
+                handle = open_handle(parent, 1, SHARE_READ, OPEN_EXISTING, directory=True)
+                stack.callback(close_handle, handle)
+            handle = open_handle(
+                path, GENERIC_WRITE if create else GENERIC_READ, SHARE_READ if share_read else 0,
+                CREATE_NEW if create else OPEN_EXISTING,
+            )
+            try:
+                fd = msvcrt.open_osfhandle(handle, os.O_BINARY | (os.O_WRONLY if create else os.O_RDONLY))
+            except BaseException:
+                close_handle(handle)
+                raise
+        else:
+            parent_fd = None
+            for parent in reversed(path.parents):
+                parent_fd = os.open(parent.name or parent.anchor, os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=parent_fd)
+                stack.callback(os.close, parent_fd)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL if create else os.O_RDONLY | os.O_NONBLOCK
+            fd = os.open(path.name, flags | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+        with os.fdopen(fd, "wb" if create else "rb") as stream:
+            check_file(stream)
+            yield stream
 
 
 def take_flags(argv, required):
@@ -72,8 +183,8 @@ def child_argv(arxd, client):
     return [arxd, "mcp-stdio", "--client-config", client]
 
 
-def read_frame(stream, limit=LIMIT):
-    line = stream.readline(limit + 2)
+def read_frame(stream, limit=RESPONSE_LIMIT):
+    line = stream.readline(limit + 1)
     if not line:
         return None
     if len(line) > limit or not line.endswith(b"\n"):
@@ -84,8 +195,12 @@ def read_frame(stream, limit=LIMIT):
     return value
 
 
-def send(stream, value):
-    stream.write(json.dumps(value, separators=(",", ":")).encode("utf-8") + b"\n")
+def encode(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
+
+
+def send(stream, frame):
+    stream.write(frame)
     stream.flush()
 
 
@@ -164,30 +279,92 @@ def call_allowed(name, args):
     return False
 
 
-def rpc(child, request):
-    send(child.stdin, request)
-    if "id" not in request:
-        return None
-    timer = threading.Timer(65, child.kill)
-    timer.daemon = True
-    timer.start()
-    try:
-        result = read_frame(child.stdout)
-        if result is None or result.get("id") != request["id"]:
-            raise ValueError("response")
+class ChildExit(Exception):
+    def __init__(self, status):
+        self.status = status
+
+
+def require_running(child):
+    status = child.poll()
+    if status is not None:
+        raise ChildExit(status)
+
+
+def receive(child, results, deadline=None):
+    while True:
+        require_running(child)
+        delay = POLL_INTERVAL
+        if deadline is not None:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError("bridge")
+            delay = min(delay, remaining)
+        try:
+            result, failure = results.get(timeout=delay)
+        except queue.Empty:
+            continue
+        require_running(child)
+        if failure is not None:
+            raise failure
         return result
-    finally:
-        timer.cancel()
+
+
+def rpc(child, request):
+    frame = encode(request)
+    if len(frame) > REQUEST_LIMIT:
+        raise ValueError("request frame")
+    results = queue.Queue(1)
+
+    def exchange():
+        try:
+            send(child.stdin, frame)
+            reply = None
+            if "id" in request:
+                reply = read_frame(child.stdout)
+                if reply is None:
+                    raise EOFError("child stdout")
+                if reply.get("id") != request["id"]:
+                    raise ValueError("response")
+            results.put((reply, None))
+        except Exception as failure:
+            results.put((None, failure))
+
+    # The deadline covers the complete pipe exchange, including notifications.
+    deadline = monotonic() + RPC_TIMEOUT
+    threading.Thread(target=exchange, daemon=True).start()
+    try:
+        return receive(child, results, deadline)
+    except (EOFError, BrokenPipeError):
+        # Windows can deliver pipe EOF before the process handle signals exit.
+        status = child.wait(timeout=max(0, deadline - monotonic()))
+        raise ChildExit(status) from None
+
+
+def client_frames(child, inbound):
+    results = queue.Queue(1)
+
+    def read():
+        try:
+            with inbound:
+                while (request := read_frame(inbound, REQUEST_LIMIT)) is not None:
+                    results.put((request, None))
+            results.put((None, None))
+        except Exception as failure:
+            results.put((None, failure))
+
+    threading.Thread(target=read, daemon=True).start()
+    while (request := receive(child, results)) is not None:
+        yield request
 
 
 def error(request, code, message):
     return {"jsonrpc": "2.0", "id": request["id"], "error": {"code": code, "message": message}}
 
 
-def relay(child, trace, inbound, outbound):
+def relay(child, trace, requests, outbound):
+    recorded = set()
     ran = False
-    trace_path = Path(trace)
-    while (request := read_frame(inbound, 8192)) is not None:
+    for request in requests:
         method = request.get("method")
         if "id" not in request:
             if method in ("notifications/initialized", "notifications/cancelled"):
@@ -214,11 +391,13 @@ def relay(child, trace, inbound, outbound):
                     clean = safe_result(name, payload(response))
                     reply = {"jsonrpc": "2.0", "id": request["id"],
                              "result": {"content": [{"type": "text", "text": json.dumps(clean)}]}}
-                    with trace_path.open("a", encoding="utf-8") as handle:
-                        handle.write(json.dumps({"tool": name, "arguments": args, "result": clean}) + "\n")
+                    check_file(trace)
+                    send(trace, encode({"tool": name, "arguments": args, "result": clean}))
+                    recorded.add("activity_lookup" if "activity_id" in args else name)
         else:
             reply = error(request, -32601, "Method unavailable.")
-        send(outbound, reply)
+        send(outbound, encode(reply))
+    return not recorded or recorded == TOOLS | {"activity_lookup"}
 
 
 def discover(child):
@@ -233,14 +412,28 @@ def discover(child):
     if result["outcome"] != "succeeded" or result["execution_mode"] != "current_user" or not any(
         item.get("name") == "cargo" and item.get("found") is True for item in result["tools"]):
         raise ValueError("discovery")
-    print("Local discovery succeeded. Cargo found under current_user.")
 
 
 def verify_database(ident, database):
     if not re.fullmatch(r"[1-9][0-9]{0,15}", ident):
         raise ValueError("id")
-    db = Path(database)
-    with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as connection:
+    # The stopped daemon uses rollback journaling. Read a bounded snapshot
+    # from the checked handle and give SQLite no filesystem path or sidecars.
+    with checked_file(database) as source:
+        for suffix in ("-journal", "-wal", "-shm"):
+            try:
+                os.lstat(database + suffix)
+            except FileNotFoundError:
+                continue
+            raise ValueError("database sidecar")
+        snapshot = source.read(DATABASE_LIMIT + 1)
+        check_file(source)
+    if len(snapshot) > DATABASE_LIMIT or snapshot[18:20] != b"\x01\x01":
+        raise ValueError("database snapshot")
+    with closing(sqlite3.connect(":memory:")) as connection:
+        connection.deserialize(snapshot)
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA query_only=ON")
         row = connection.execute("""
             SELECT id, tool, program, argc, outcome, identity_mode, exit_code,
                    integrity_rid, elevation, observation_point, tree_boundary,
@@ -270,23 +463,55 @@ def main(argv=None):
     if parsed["mode"] == "verify":
         verify_database(parsed["id"], parsed["database"])
         return
-    with open_child(parsed["arxd"], parsed["client"]) as child:
+    with ExitStack() as stack:
+        stack.enter_context(checked_file(parsed["arxd"], share_read=True))
+        stack.enter_context(checked_file(parsed["client"], share_read=True))
+        is_relay = parsed["mode"] == "relay"
+        if is_relay:
+            trace = stack.enter_context(checked_file(parsed["evidence"], create=True))
+            # A daemon reader may still be waiting for the client after an
+            # unexpected child exit. Keep its lock off Python's standard input.
+            inbound = io.open(os.dup(sys.stdin.fileno()), "rb")
+        child = open_child(parsed["arxd"], parsed["client"])
         try:
-            if parsed["mode"] == "discover":
-                discover(child)
+            complete = True
+            if is_relay:
+                complete = relay(child, trace, client_frames(child, inbound), sys.stdout.buffer)
             else:
-                relay(child, parsed["evidence"], sys.stdin.buffer, sys.stdout.buffer)
-        finally:
+                discover(child)
+            require_running(child)
             child.stdin.close()
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
+            status = child.wait(timeout=5)
+        except ChildExit:
+            raise
+        except Exception:
+            status = child.poll()
+            if status is None:
                 child.kill()
                 child.wait(timeout=5)
+                raise
+            raise ChildExit(status) from None
+        child.stdout.close()
+        if status != 0:
+            raise ChildExit(status)
+        if not complete:
+            raise ValueError("partial evidence")
+        if not is_relay:
+            print("Local discovery succeeded. Cargo found under current_user.")
+
+
+def entrypoint():
+    try:
+        main()
+    except ChildExit as failure:
+        print("arxcovo-acceptance-bridge-failed", file=sys.stderr)
+        status = ctypes.c_int(failure.status).value if os.name == "nt" else failure.status
+        return status or 1
+    except Exception:
+        print("arxcovo-acceptance-bridge-failed", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        sys.exit("arxcovo-acceptance-bridge-failed")
+    sys.exit(entrypoint())

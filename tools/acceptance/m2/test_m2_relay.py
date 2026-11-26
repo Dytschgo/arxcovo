@@ -4,10 +4,14 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from queue import Queue
 
 HERE = Path(__file__).resolve().parent
 PREPARE = HERE / "prepare-owner.ps1"
@@ -25,7 +29,7 @@ class ScriptedChild:
         self.stdout = self._Stdout(self)
         self.lines = []
 
-    def kill(self):
+    def poll(self):
         return None
 
     def accept(self, raw):
@@ -135,9 +139,18 @@ def session_handler(request):
     return tool_result(request, body)
 
 
+def junction(test, link, target):
+    result = subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+                            capture_output=True, text=True, timeout=5)
+    test.assertEqual(result.returncode, 0, result.stderr)
+    test.addCleanup(link.rmdir)
+
+
+@unittest.skipUnless(os.name == "nt", "Windows launcher")
 class PrepareTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMP") or None)
+        self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.python = str(self.root / "python.exe")
         self.relay = str(RELAY_PATH)
@@ -145,9 +158,8 @@ class PrepareTests(unittest.TestCase):
         self.client = str(self.root / "client.json")
         self.evidence = str(self.root / "m2-mcp.jsonl")
         self.out = self.root / ".mcp.json"
-
-    def tearDown(self):
-        self.temp.cleanup()
+        for path in (self.python, self.arxd, self.client):
+            Path(path).touch()
 
     def write_config(self, **overrides):
         values = {
@@ -206,6 +218,33 @@ class PrepareTests(unittest.TestCase):
         self.assertIn("absolute", completed.stderr)
 
 
+    def test_prepare_refuses_junctions_for_inputs_and_output(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "config.json").write_bytes(b"original")
+        alias = self.root / "alias"
+        junction(self, alias, outside)
+        for override in (
+            {"OutFile": str(alias / ".mcp.json")},
+            {"ClientConfig": str(alias / "config.json")},
+            {"Evidence": str(alias / "evidence.jsonl")},
+        ):
+            with self.subTest(argument=next(iter(override))):
+                completed = self.write_config(**override)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertFalse(self.out.exists())
+        self.assertEqual({p.name: p.read_bytes() for p in outside.iterdir()}, {"config.json": b"original"})
+
+    def test_prepare_refuses_hardlinks_and_preserves_existing_output(self):
+        os.link(self.client, self.root / "second-name")
+        self.assertNotEqual(self.write_config().returncode, 0)
+        self.assertFalse(self.out.exists())
+        (self.root / "second-name").unlink()
+        self.out.write_bytes(b"original")
+        self.assertNotEqual(self.write_config().returncode, 0)
+        self.assertEqual(self.out.read_bytes(), b"original")
+
+
 class RelayTests(unittest.TestCase):
     def test_relay_requires_absolute_evidence(self):
         with self.assertRaises(ValueError):
@@ -232,7 +271,9 @@ class RelayTests(unittest.TestCase):
         ]
         inbound = io.BytesIO("".join(json.dumps(call) + "\n" for call in calls).encode())
         outbound = io.BytesIO()
-        relay.relay(ScriptedChild(session_handler), evidence, inbound, outbound)
+        child = ScriptedChild(session_handler)
+        with relay.checked_file(evidence, create=True) as trace:
+            self.assertTrue(relay.relay(child, trace, relay.client_frames(child, inbound), outbound))
         rows = [json.loads(line) for line in evidence.read_text(encoding="utf-8").splitlines()]
         self.assertEqual([row["tool"] for row in rows],
                          ["list_hosts", "run_command", "list_activity", "list_activity"])
@@ -270,6 +311,268 @@ class RelayTests(unittest.TestCase):
             "observed_id": "secret", "observed_kind": None, "observed_gid": None, "rights": None,
         }]})
         self.assertFalse(raw["activities"][0]["raw_identity_and_rights_are_null"])
+
+
+# Test the production entry point with a synthetic child and real anonymous
+# pipes. Neither the fixture nor its launcher invokes arxd.
+CHILD = r"""
+import json
+import sys
+import time
+from pathlib import Path
+
+mode = sys.argv[1]
+if mode in ("idle", "idle_zero"):
+    time.sleep(0.2)
+    sys.exit(0 if mode == "idle_zero" else 23)
+if mode == "stall_write":
+    time.sleep(5)
+    sys.exit(24)
+if mode == "clean_eof":
+    sys.exit(0 if not sys.stdin.buffer.read() else 24)
+
+raw = sys.stdin.buffer.readline(8193)
+request = json.loads(raw)
+if mode.startswith("boundary"):
+    expected = "a" if mode == "boundary_ascii" else "é"
+    if len(raw) != 8192 or not raw.endswith(b"\n") or expected not in request["params"]["text"]:
+        sys.exit(24)
+    if expected.encode() not in raw:
+        sys.exit(25)
+    sys.exit(23)
+if mode == "outstanding":
+    sys.exit(23)
+if mode == "stall_read":
+    time.sleep(5)
+    sys.exit(24)
+if mode == "oversize":
+    sys.exit(24)
+
+result = {"content": [{"type": "text", "text": json.dumps({"hosts": []})}]}
+print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+if mode == "after_answer":
+    # Wait for the fixture to observe the sanitized reply while leaving stdin open.
+    marker = Path(sys.argv[2])
+    deadline = time.monotonic() + 5
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    sys.exit(23 if marker.exists() else 24)
+sys.stdin.buffer.read()
+"""
+
+HARNESS = """
+import runpy
+import subprocess
+import sys
+
+source, fixture, mode, marker, arxd, client, evidence = sys.argv[1:]
+entrypoint = runpy.run_path(source)["entrypoint"]
+bridge = entrypoint.__globals__
+bridge["RPC_TIMEOUT"] = 0.75
+bridge["open_child"] = lambda *_: subprocess.Popen(
+    [sys.executable, "-I", "-B", "-c", fixture, mode, marker],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+)
+sys.argv = [source, "--arxd", arxd, "--client-config", client, "--evidence", evidence]
+sys.exit(entrypoint())
+"""
+FAILURE = b"arxcovo-acceptance-bridge-failed"
+LIST_HOSTS = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_hosts"}}\n'
+
+
+class PipeTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMP") or None)
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.arxd = self.root / "arxd.exe"
+        self.client = self.root / "client.json"
+        self.evidence = self.root / "evidence.jsonl"
+        self.marker = self.root / "reply-observed"
+        self.arxd.touch()
+        self.client.touch()
+
+    def start_relay(self, mode, *, evidence=None):
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-B", "-c", HARNESS, str(RELAY_PATH), CHILD, mode,
+             str(self.marker), str(self.arxd), str(self.client), str(evidence or self.evidence)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(self.close_process, child)
+        return child
+
+    @staticmethod
+    def close_process(process):
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None:
+                pipe.close()
+
+    def request(self, child, frame):
+        # Keep the input pipe open so a child failure cannot hide behind client EOF.
+        child.stdin.write(frame)
+        child.stdin.flush()
+
+    def expect_failure(self, child, status):
+        self.assertEqual(child.wait(timeout=3), status)
+        self.assertEqual(child.stdout.read(), b"")
+        self.assertEqual(child.stderr.read().strip(), FAILURE)
+
+    @staticmethod
+    def boundary(character):
+        template = b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{"text":""}}\n'
+        padding = (character * ((8192 - len(template)) // len(character.encode()))).encode()
+        # Pad any unmatched byte with ASCII while retaining the UTF-8 test data.
+        padding += b"a" * (8192 - len(template) - len(padding))
+        return template.replace(b'""', b'"' + padding + b'"')
+
+    def test_ascii_boundary_reaches_child(self):
+        child = self.start_relay("boundary_ascii")
+        self.request(child, self.boundary("a"))
+        self.expect_failure(child, 23)
+
+    def test_utf8_boundary_reaches_child(self):
+        child = self.start_relay("boundary_utf8")
+        self.request(child, self.boundary("é"))
+        self.expect_failure(child, 23)
+
+    def test_encoded_request_over_budget_is_refused_before_send(self):
+        child = self.start_relay("oversize")
+        # Re-encoding the exponent as a float grows the submitted frame.
+        frame = self.boundary("a").replace(b'a"}}', b'"}}', 1)
+        frame = frame.replace(b'"params":{', b'"params":{"number":1e2,').replace(b"a" * 13, b"", 1)
+        self.assertLessEqual(len(frame), 8192)
+        self.assertGreater(len(relay.encode(json.loads(frame))), 8192)
+        self.request(child, frame)
+        self.expect_failure(child, 1)
+
+    def test_watchdog_covers_blocked_write(self):
+        child = self.start_relay("stall_write")
+        self.request(child, self.boundary("a"))
+        self.expect_failure(child, 1)
+
+    def test_unexpected_idle_exit_preserves_status(self):
+        self.expect_failure(self.start_relay("idle"), 23)
+
+    def test_unexpected_idle_exit_zero_still_fails(self):
+        self.expect_failure(self.start_relay("idle_zero"), 1)
+
+    def test_unexpected_exit_with_request_outstanding_preserves_status(self):
+        child = self.start_relay("outstanding")
+        self.request(child, LIST_HOSTS)
+        self.expect_failure(child, 23)
+
+    def test_list_hosts_then_exit_is_a_failure_with_client_idle(self):
+        child = self.start_relay("after_answer")
+        self.request(child, LIST_HOSTS)
+        # The marker releases the synthetic child after the evidence is flushed
+        # and the tool response is observed. The queue bounds that observation.
+        output = Queue()
+        threading.Thread(target=lambda: output.put(child.stdout.readline()), daemon=True).start()
+        self.assertEqual(json.loads(output.get(timeout=3))["id"], 1)
+        self.marker.touch()
+        self.expect_failure(child, 23)
+        self.assertEqual(json.loads(self.evidence.read_bytes())["tool"], "list_hosts")
+
+    def test_watchdog_covers_stalled_read(self):
+        child = self.start_relay("stall_read")
+        self.request(child, LIST_HOSTS)
+        self.expect_failure(child, 1)
+
+    def test_client_eof_allows_clean_shutdown_without_acceptance_calls(self):
+        child = self.start_relay("clean_eof")
+        stdout, stderr = child.communicate(timeout=3)
+        self.assertEqual((child.returncode, stdout, stderr), (0, b"", b""))
+
+    def test_client_eof_with_partial_evidence_fails(self):
+        child = self.start_relay("complete")
+        stdout, stderr = child.communicate(LIST_HOSTS, timeout=3)
+        self.assertEqual((child.returncode, stderr.strip()), (1, FAILURE))
+        self.assertEqual(json.loads(stdout)["id"], 1)
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction")
+    def test_relay_refuses_junction_and_writes_nothing_outside(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        alias = self.root / "alias"
+        junction(self, alias, outside)
+        child = self.start_relay("complete", evidence=alias / "evidence.jsonl")
+        stdout, stderr = child.communicate(LIST_HOSTS, timeout=3)
+        self.assertEqual((child.returncode, stdout, stderr.strip()), (1, b"", FAILURE))
+        self.assertEqual(list(outside.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle sharing")
+    def test_evidence_handle_excludes_other_writers_and_renames(self):
+        with relay.checked_file(self.evidence, create=True) as trace:
+            relay.send(trace, b"first\n")
+            with self.assertRaises(PermissionError):
+                self.evidence.open("ab").close()
+            with self.assertRaises(PermissionError):
+                self.evidence.rename(self.root / "renamed")
+            relay.send(trace, b"second\n")
+        self.assertEqual(self.evidence.read_bytes(), b"first\nsecond\n")
+
+    def test_relay_preserves_existing_evidence_and_hardlinks(self):
+        self.evidence.write_bytes(b"original")
+        alias = self.root / "alias"
+        os.link(self.evidence, alias)
+        self.expect_failure(self.start_relay("complete", evidence=alias), 1)
+        self.assertEqual(self.evidence.read_bytes(), b"original")
+
+
+class VerifierTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMP") or None)
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.outside = self.root / "outside"
+        self.outside.mkdir()
+        self.db = self.outside / "activity.sqlite3"
+        with sqlite3.connect(self.db) as db:
+            db.execute("""CREATE TABLE activity (
+                id INTEGER, tool, program, argc, outcome, identity_mode, exit_code,
+                integrity_rid, elevation, observation_point, tree_boundary, stop_reason,
+                identity_matches_pin, cleanup_confirmed, observed_id, observed_kind,
+                observed_gid, rights, actor_kind, principal)""")
+            db.execute("""INSERT INTO activity VALUES (
+                2, 'run_command', 'cargo', 1, 'succeeded', 'current_user', 0,
+                8192, 0, 'pre_exec', 'windows_job', 'exited', 1, 1, NULL, NULL,
+                NULL, NULL, 'agent', 'claude-code')""")
+        db.close()
+
+    def verify(self, path):
+        return subprocess.run([sys.executable, "-I", "-B", str(RELAY_PATH),
+                               "--verify", "2", "--database", str(path)],
+                              capture_output=True, timeout=3)
+
+    def test_valid_stopped_database_is_verified(self):
+        before = self.db.read_bytes()
+        result = self.verify(self.db)
+        self.assertEqual((result.returncode, result.stderr), (0, b""))
+        self.assertTrue(result.stdout.startswith(b"PASS durable M2 row 2:"))
+        self.assertEqual({p.name: p.read_bytes() for p in self.outside.iterdir()},
+                         {self.db.name: before})
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction")
+    def test_verifier_refuses_junction_without_reading_the_valid_row(self):
+        alias = self.root / "alias"
+        junction(self, alias, self.outside)
+        before = self.db.read_bytes()
+        result = self.verify(alias / self.db.name)
+        self.assertEqual((result.returncode, result.stdout, result.stderr.strip()), (1, b"", FAILURE))
+        self.assertEqual({p.name: p.read_bytes() for p in self.outside.iterdir()},
+                         {self.db.name: before})
+
+    def test_verifier_refuses_hardlink_and_journal(self):
+        alias = self.root / "alias"
+        os.link(self.db, alias)
+        result = self.verify(self.db)
+        self.assertEqual((result.returncode, result.stdout, result.stderr.strip()), (1, b"", FAILURE))
+        alias.unlink()
+        (self.outside / (self.db.name + "-journal")).touch()
+        result = self.verify(self.db)
+        self.assertEqual((result.returncode, result.stdout, result.stderr.strip()), (1, b"", FAILURE))
 
 
 if __name__ == "__main__":

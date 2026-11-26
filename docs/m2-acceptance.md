@@ -19,8 +19,8 @@ window before preparing the session. The window is unelevated.
 ## Client configuration
 
 `tools/acceptance/m2/prepare-owner.ps1` writes one stdio server. The command is
-the installed Python executable. The arguments are `-I`, `-B`, the relay, and
-the owner-supplied arxd, client, and evidence paths:
+the installed Python executable (3.11 or newer). The arguments are `-I`,
+`-B`, the relay, and the owner-supplied arxd, client, and evidence paths:
 
 ```json
 {
@@ -45,10 +45,10 @@ the owner-supplied arxd, client, and evidence paths:
 ```
 
 The relay then launches `arxd mcp-stdio --client-config` with the client file
-from those arguments, and appends sanitized results to the evidence file. Host
-identifiers, hardware amounts, paths, credentials, and arbitrary output stay
-out of the Claude tool results. The derived fields are `inventory_observed`,
-`rights_is_null`, and `raw_identity_and_rights_are_null`.
+from those arguments, creates a fresh evidence file, and appends sanitized
+results. Claude receives only the allowlisted fields from the acceptance
+tools. The derived fields are `inventory_observed`, `rights_is_null`, and
+`raw_identity_and_rights_are_null`.
 
 ## Prepare and connect
 
@@ -76,6 +76,8 @@ task's client file. Remove any ambient API-key or alternate-provider
 variables for that window first. Keep `--strict-mcp-config` and `--tools ''`:
 
 ```powershell
+$env:CLAUDE_CONFIG_DIR = 'D:/acceptance/session/claude-config'
+Set-Location -LiteralPath 'D:/acceptance/session/claude-work'
 & $claude --strict-mcp-config --mcp-config 'D:/acceptance/session/claude-work/.mcp.json' --tools '' --permission-mode default --no-chrome
 ```
 
@@ -104,9 +106,11 @@ Get-Content -LiteralPath 'D:/acceptance/session/evidence/m2-mcp.jsonl' -TotalCou
 ```
 
 Expected: four successful exchanges, including the page and the exact lookup
-of the same action id. Keep the JSONL, UTC time, commit, binary SHA-256, Cargo
-version, and row id. Do not export the Claude transcript, client config, auth
-output, or SQLite database.
+of the same action id. Treat a relay failure as a failed run even if the JSONL
+contains successful exchanges. Use a fresh session directory for another run.
+Keep the JSONL, UTC time, commit, binary SHA-256, Cargo version, and row id.
+Do not export the Claude transcript, client config, auth output, or SQLite
+database.
 
 Stop the daemon with Ctrl+C, then check the stored row. `$rowId` is the
 confirmed numeric id:
@@ -115,7 +119,8 @@ confirmed numeric id:
 & $python -I -B 'D:/Code/Arxcovo/tools/acceptance/m2/acceptance-stdio.py' --verify $rowId --database 'D:/acceptance/session/state/activity.sqlite3'
 ```
 
-Expected: `PASS durable M2 row <ID>`. This is a read-only check. Local
+Expected: `PASS durable M2 row <ID>`. The verifier reads a snapshot of the
+stopped database and requires that its journal sidecars are absent. Local
 discovery, used before the dashboard terminal, takes the same relay and the
 owner-supplied arxd and client paths:
 
