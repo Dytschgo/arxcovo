@@ -723,6 +723,12 @@ impl Child {
 
     fn resume(&mut self) -> io::Result<()> {
         self.verify_live()?;
+        self.release_suspended()
+    }
+
+    /// Releases the retained primary thread without any further checks; the
+    /// caller verifies the live Job immediately before.
+    fn release_suspended(&mut self) -> io::Result<()> {
         let thread = self
             .suspended
             .take()
@@ -3378,13 +3384,25 @@ impl Child {
             std::time::Instant::now(),
             NativeRefusal::ReservesUnverified,
         )?;
-        if let Some(cutoff) = cutoff
-            && (cancel.is_cancelled() || tokio::time::Instant::now() >= cutoff)
-        {
+        let fenced = || {
+            cutoff.is_some_and(|cutoff| {
+                cancel.is_cancelled() || tokio::time::Instant::now() >= cutoff
+            })
+        };
+        if fenced() {
             return Err(NativeRefusal::JobUnverified);
         }
         handoff();
-        self.resume().map_err(|_| NativeRefusal::JobUnverified)
+        // Release edge: the handoff may block, so cancellation and the cutoff
+        // are checked again after the final Job verification. Nothing that can
+        // wait sits between this check and ResumeThread.
+        self.verify_live()
+            .map_err(|_| NativeRefusal::JobUnverified)?;
+        if fenced() {
+            return Err(NativeRefusal::JobUnverified);
+        }
+        self.release_suspended()
+            .map_err(|_| NativeRefusal::JobUnverified)
     }
 }
 
@@ -4362,6 +4380,83 @@ mod tests {
             })
             .unwrap();
         assert_eq!(calls, 3);
+        assert!(child.suspended.is_none());
+        ready(&mut read).await;
+        write.write_all(&[42]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        child.reap(deadline).await.unwrap();
+        workers.join(deadline).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_when_cancellation_or_the_cutoff_lands_during_the_handoff() {
+        let Some((mut child, stdio)) = fixture_launch(0) else {
+            return;
+        };
+        let (mut read, mut write, workers) = start_stdio(stdio, Default::default()).unwrap();
+        let mut samples = 0;
+        let mut handoffs = 0;
+        // Cancellation arrives inside the handoff, after the post-sample guard
+        // already passed.
+        let cancel = Shutdown::default();
+        let ahead = tokio::time::Instant::now() + Duration::from_secs(30);
+        let refused = child.resume_checked_with_handoff(
+            &cancel,
+            Some(ahead),
+            &mut || {
+                samples += 1;
+                Ok(std::time::Instant::now())
+            },
+            || {
+                handoffs += 1;
+                assert!(!cancel.is_cancelled());
+                cancel.cancel();
+            },
+        );
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!((samples, handoffs), (1, 1));
+        assert!(child.suspended.is_some(), "thread released after cancel");
+        // The cutoff is still ahead after the sample and is crossed while the
+        // handoff blocks.
+        let fresh = Shutdown::default();
+        let cutoff = tokio::time::Instant::now() + Duration::from_millis(300);
+        let refused = child.resume_checked_with_handoff(
+            &fresh,
+            Some(cutoff),
+            &mut || {
+                samples += 1;
+                Ok(std::time::Instant::now())
+            },
+            || {
+                handoffs += 1;
+                let now = tokio::time::Instant::now();
+                assert!(now < cutoff);
+                std::thread::sleep((cutoff - now) + Duration::from_millis(5));
+            },
+        );
+        assert!(tokio::time::Instant::now() >= cutoff);
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!((samples, handoffs), (2, 2));
+        assert!(child.suspended.is_some(), "thread released at the cutoff");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read.read_u8())
+                .await
+                .is_err(),
+            "the held child ran"
+        );
+        // With both still clear after the handoff, the child is released.
+        child
+            .resume_checked_with_handoff(
+                &fresh,
+                Some(tokio::time::Instant::now() + Duration::from_secs(30)),
+                &mut || {
+                    samples += 1;
+                    Ok(std::time::Instant::now())
+                },
+                || handoffs += 1,
+            )
+            .unwrap();
+        assert_eq!((samples, handoffs), (3, 3));
         assert!(child.suspended.is_none());
         ready(&mut read).await;
         write.write_all(&[42]).await.unwrap();

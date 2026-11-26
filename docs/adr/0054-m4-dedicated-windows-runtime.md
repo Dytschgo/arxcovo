@@ -1477,6 +1477,9 @@ and before accepting a successful result. Helpers and installer shutdown
 can observe a child that has already exited when its held Job is empty.
 Foreground admission can also sample caller-available and total free space
 from the same held volumes before applying the durable capacity ledger.
+Helper and installer resume check cancellation and the exclusive effect
+cutoff after revalidation, and again after any handoff and the final Job
+verification, immediately before the suspended thread is released.
 
 The foreground exposes monitored guest calls. A boot or guest failure
 stops the owned launch and carries its disposition with the exact held
