@@ -255,6 +255,14 @@ PowerShell, and the wrapper in fresh request directories. Nextest shows the
 `KNOWN-ISSUE` line on test failure and in local `--no-capture` runs.
 Unexpected outcomes also print `CI`, `RUNNER_ENVIRONMENT`, `ImageOS` and
 `RUNNER_OS` to explain how the test classified the runner.
+
+On the same hosted Windows images, the test wrapper used by
+`wrapper_evaluates_utf8_multiline_with_implicit_success` and
+`wrapper_reports_implicit_error` tolerates exactly `Ok(TimedOut)` and emits
+`KNOWN-ISSUE hosted-windows-powershell-wrapper`. Main run `45754992122`
+recorded both wrapper timeouts. The restricted-identity tests continue to
+fail on timeout. Development-host tests require the expected outcomes.
+
 Qualification requires an installed service run on the owner's pinned
 Windows 11 guest and is **unverified on real hardware**.
 

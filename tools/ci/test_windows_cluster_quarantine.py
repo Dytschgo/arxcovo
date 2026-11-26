@@ -1328,5 +1328,76 @@ class C11LinuxQuarantineTests(unittest.TestCase):
                     assert_c11_linux_quarantine(_c11_with(files, path, text))
 
 
+POWERSHELL_WRAPPER_TESTS = (
+    "wrapper_evaluates_utf8_multiline_with_implicit_success",
+    "wrapper_reports_implicit_error",
+)
+POWERSHELL_HOST = (
+    'ci.is_some_and(|value| value.eq_ignore_ascii_case("true"))'
+    ' && runner == Some("github-hosted")'
+    ' && image.is_some_and(|value| value.starts_with("win25"))'
+)
+POWERSHELL_TIMEOUT = "is_hosted_win25(ci, runner, image) && outcome == Ok(ScriptOutcome::TimedOut)"
+POWERSHELL_TIMEOUT_BRANCH = '''
+    if is_known_hosted_wrapper_timeout(
+        outcome,
+        std::env::var("CI").ok().as_deref(),
+        std::env::var("RUNNER_ENVIRONMENT").ok().as_deref(),
+        std::env::var("ImageOS").ok().as_deref(),
+    ) {
+        eprintln!("KNOWN-ISSUE hosted-windows-powershell-wrapper: Ok(TimedOut)");
+        return;
+    }
+    assert_powershell(
+'''
+
+
+def assert_powershell_wrapper_quarantine(source):
+    masked = _mask_comments(source)
+
+    def function(name):
+        matches = list(re.finditer(
+            rf"^    fn {name}\([^{{]*\{{(.*?)^    \}}", masked, re.M | re.S
+        ))
+        assert len(matches) == 1, name
+        match = matches[0]
+        return match.start(), source[match.start(1):match.end(1)]
+
+    assert _norm(function("is_hosted_win25")[1]) == _norm(POWERSHELL_HOST)
+    assert _norm(function("is_known_hosted_wrapper_timeout")[1]) == _norm(POWERSHELL_TIMEOUT)
+    wrapper = "assert_powershell_wrapper"
+    _, body = function(wrapper)
+    assert _norm(POWERSHELL_TIMEOUT_BRANCH) in _norm(body)
+    # Only the two wrapper tests may invoke the harness. The strict assertion
+    # and the restricted-identity tests cannot opt into this timeout exception.
+    assert len(re.findall(rf"\b{wrapper}\b", masked)) == 3
+    assert len(re.findall(r"\bis_known_hosted_wrapper_timeout\b", masked)) == 5
+    for name in POWERSHELL_WRAPPER_TESTS:
+        start, body = function(name)
+        assert _norm(masked[_attribute_cut(masked[:start]):start]) == "#[test]"
+        assert body.strip().startswith(wrapper + "(")
+
+
+class PowerShellWrapperQuarantineTests(unittest.TestCase):
+    def test_exact_hosted_wrapper_timeout_quarantine(self):
+        source = (ROOT / "crates/arx-guest/src/platform/windows.rs").read_text(encoding="utf-8")
+        assert_powershell_wrapper_quarantine(source)
+        extra_test = "fn self_test_admits_the_production_identity() {"
+        for original, replacement in [
+            ('value.eq_ignore_ascii_case("true")', 'value.eq_ignore_ascii_case("false")'),
+            ('Some("github-hosted")', 'Some("self-hosted")'),
+            ('value.starts_with("win25")', 'value.starts_with("win")'),
+            (POWERSHELL_TIMEOUT, "is_hosted_win25(ci, runner, image)"),
+            ('std::env::var("CI").ok().as_deref()', 'Some("true")'),
+            (extra_test, extra_test + '\n        assert_powershell_wrapper(b"", 0);'),
+            ("fn wrapper_reports_implicit_error()", "#[ignore]\n    fn wrapper_reports_implicit_error()"),
+        ]:
+            with self.subTest(replacement=replacement):
+                mutant = source.replace(original, replacement, 1)
+                self.assertNotEqual(mutant, source)
+                with self.assertRaises(AssertionError):
+                    assert_powershell_wrapper_quarantine(mutant)
+
+
 if __name__ == "__main__":
     unittest.main()
