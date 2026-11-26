@@ -136,3 +136,27 @@ these rows.
 
 Native creation, holds and reconciliation are **unverified on real
 hardware**.
+
+## Released TEST writer epoch (7c chunk 06)
+
+The caller keeps the generation lease and both writer exclusions through
+bounded disk and VARS hashing and the immediate ledger transaction. The
+transaction checks the active TEST generation, exact writer epoch, v16
+custody scope, both active role identities and the retained pair charge.
+It records the observed pins and clean or dirty release together.
+Identical proof can replay after a lost commit acknowledgement. A
+different epoch, disposition or pair cannot replace that proof.
+
+Stop admission stamps its optional receipt with the active generation and
+writer epoch. The transaction samples the receipt clock after acquiring
+the write transaction. Only a matching, pending, on-time clean stop can
+succeed. A late or interrupted receipt, or a stop with no receipt, still
+leaves the exact release recorded. Historical receipts retain their
+original disposition. Dirty and overdue active instances remain charged
+for ordinary recovery or expiry.
+
+A failed transaction preserves the borrowed evidence for retry. The
+unreleased epoch, bound slot identities and unchanged claim remain the
+durable retry pointer if the caller yields. The adapter performs the
+transaction outside the in-memory run map. Before activation only scoped
+fixtures reach this adapter. Native release is **unverified on real hardware**.
