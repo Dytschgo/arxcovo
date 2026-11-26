@@ -4252,7 +4252,10 @@ mod tests {
         let accepted = std::cell::Cell::new(None);
         let samples = std::cell::Cell::new(0_u32);
         let now = tokio::time::Instant::now();
-        let (setup_by, boot_by) = (now + Duration::from_secs(60), now + Duration::from_secs(360));
+        let (setup_by, boot_by) = (
+            now + Duration::from_secs(60),
+            now + Duration::from_secs(360),
+        );
         let lag = Duration::from_millis(200);
         let ((), ready_by) = monitor_setup(
             async {
