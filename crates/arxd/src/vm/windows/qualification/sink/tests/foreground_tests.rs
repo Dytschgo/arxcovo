@@ -211,6 +211,19 @@ fn docker_dossier_reads_only_its_own_class_and_exact_rows() {
             &good,
             &DockerFresh {
                 now: Instant2 {
+                    utc: NOW.utc,
+                    mono_ms: TEST_BOOT.origin_mono_ms + 1800,
+                },
+                ..fresh
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        read(
+            &good,
+            &DockerFresh {
+                now: Instant2 {
                     utc: binding.expires_utc,
                     mono_ms: now.mono_ms + MAX_VALIDITY * 1000
                 },
@@ -326,7 +339,7 @@ fn docker_marker_requires_a_fresh_settled_readback_and_create_new_rename() {
                 }
                 Ok(DockerPublishSample {
                     dependencies: &dependencies,
-                    captured_uptime_ms: now.mono_ms + u64::from(case == "stale" && step == 3),
+                    captured_uptime_ms: now.mono_ms,
                     settled: case != "unsettled" || step != 3,
                 })
             },
@@ -335,6 +348,10 @@ fn docker_marker_requires_a_fresh_settled_readback_and_create_new_rename() {
                 let mut clock = now;
                 if case == "clock" && at_rename {
                     clock.utc += 20;
+                }
+                if case == "stale" && at_rename {
+                    clock.utc += 6;
+                    clock.mono_ms += 6_000;
                 }
                 Ok((
                     clock,
@@ -444,6 +461,60 @@ fn docker_selection_rejects_modified_rows_even_with_updated_manifest_pins() {
             "{case}"
         );
     }
+}
+
+#[test]
+fn docker_dependency_key_requires_each_input_role() {
+    use records::{DockerDependencies, Hash};
+
+    let work = tempfile::tempdir().unwrap();
+    let (_, dir) = claimed(work.path(), &[]);
+    let (dependencies, _, _) = docker_fixture(&dir);
+    assert!(dependencies.key(dir.scope()).is_some());
+    let roles: [fn(&mut DockerDependencies) -> &mut Hash; 21] = [
+        |d| &mut d.supervisor_image,
+        |d| &mut d.qualifier_image,
+        |d| &mut d.owner_logon,
+        |d| &mut d.production_store,
+        |d| &mut d.disposable_store,
+        |d| &mut d.profile,
+        |d| &mut d.installer,
+        |d| &mut d.guest,
+        |d| &mut d.firmware,
+        |d| &mut d.stock_inventory,
+        |d| &mut d.network_fixture,
+        |d| &mut d.signed_inputs,
+        |d| &mut d.origin_profile,
+        |d| &mut d.manifest,
+        |d| &mut d.executable,
+        |d| &mut d.receipt,
+        |d| &mut d.loaded_artifacts,
+        |d| &mut d.policy,
+        |d| &mut d.topology,
+        |d| &mut d.recipe.web,
+        |d| &mut d.recipe.medium,
+    ];
+    for (index, role) in roles.into_iter().enumerate() {
+        let mut missing = dependencies.clone();
+        *role(&mut missing) = [0; 32];
+        assert!(missing.key(dir.scope()).is_none(), "input role {index}");
+    }
+    let mut inconsistent = dependencies.clone();
+    inconsistent.recipe.closure = [22; 32];
+    assert!(inconsistent.key(dir.scope()).is_none());
+    inconsistent.recipe = dependencies.recipe;
+    inconsistent.production_store = inconsistent.disposable_store;
+    assert!(inconsistent.key(dir.scope()).is_none());
+    inconsistent = dependencies.clone();
+    inconsistent.host.machine = [0; 16];
+    assert!(inconsistent.key(dir.scope()).is_none());
+    inconsistent.host = dependencies.host.clone();
+    inconsistent.host.windows_build = 21_999;
+    assert!(inconsistent.key(dir.scope()).is_none());
+    inconsistent.host = dependencies.host.clone();
+    inconsistent.compose_protocol = 0;
+    assert!(inconsistent.key(dir.scope()).is_none());
+    assert!(dependencies.key([0; 32]).is_none());
 }
 
 #[test]
