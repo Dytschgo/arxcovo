@@ -111,6 +111,14 @@ export function ConsoleTile({ vm, hostState, live, onRecheck }: { vm: Vm; hostSt
   const gate = consoleGate(vm, hostState);
   const host = hostState.status === 'ready' ? hostState.host : undefined;
   const title = <h2 id="console-title"><Icon name="monitor" />Console</h2>;
+  // The host check gates only the first ticket. Once the viewer is up, a later
+  // host-list reload ("Try again" in Compatible hosts) is metadata only: its
+  // pending state keeps the same viewer and stream, and only a confirmed
+  // closed reason (an offline host) takes it down. Reconnect from closed
+  // starts over, so it waits for the host check again.
+  const [viewerUp, setViewerUp] = useState(false);
+  const showViewer = live && (gate.status === 'connect' || (gate.status === 'checking' && viewerUp));
+  if (showViewer !== viewerUp) setViewerUp(showViewer);
   let body;
   if (gate.status === 'closed') {
     const closed = gate.reason;
@@ -128,7 +136,9 @@ export function ConsoleTile({ vm, hostState, live, onRecheck }: { vm: Vm; hostSt
         <p className="console-meta"><span className="console-lock"><Icon name="lock" /><span className="console-mode">View only</span> · interactive VNC later</span></p>
       </>
     );
-  } else if (live && gate.status === 'checking') {
+  } else if (showViewer) {
+    body = <Viewer vm={vm} title={title} />;
+  } else if (live) {
     // No ticket yet: an offline host would only be learned after the stream opened.
     body = (
       <>
@@ -142,8 +152,6 @@ export function ConsoleTile({ vm, hostState, live, onRecheck }: { vm: Vm; hostSt
         <p className="console-meta"><span className="console-lock"><Icon name="lock" /><span className="console-mode">View only</span> · interactive VNC later</span></p>
       </>
     );
-  } else if (live) {
-    body = <Viewer vm={vm} title={title} />;
   } else {
     body = (
       <>

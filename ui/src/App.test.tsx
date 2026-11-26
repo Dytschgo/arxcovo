@@ -649,6 +649,47 @@ describe('PR #380 review 2: console ticket order and the search shortcut', () =>
     expect(openConsole).toHaveBeenCalledTimes(1);
   });
 
+  /** 503 first, so the console streams on one ticket; then "Try again" in Compatible hosts, held open. */
+  async function streamingThenHostRetry() {
+    const { held, openConsole } = await consoleWithHeldHosts();
+    await act(async () => held[0].reject(new ApiError('unavailable', 'arxd is busy.', 503)));
+    const frame = await screen.findByRole('img', { name: /Console of ubuntu-build-02/ });
+    await settle();
+    expect(openConsole).toHaveBeenCalledTimes(1);
+    const hostsTile = screen.getByRole('region', { name: 'Compatible hosts' });
+    fireEvent.click(within(hostsTile).getByRole('button', { name: 'Try again' }));
+    expect(await within(hostsTile).findByText('Loading the host list…')).toBeTruthy();
+    expect(held).toHaveLength(2);
+    // While the retry is pending the same viewer keeps streaming: no checking state, no new ticket.
+    await settle();
+    expect(screen.queryByText('Checking the host before connecting…')).toBeNull();
+    expect(screen.getByRole('img', { name: /Console of ubuntu-build-02/ })).toBe(frame);
+    expect(frame.isConnected).toBe(true);
+    expect(openConsole).toHaveBeenCalledTimes(1);
+    return { held, openConsole, frame };
+  }
+
+  test('(e) a host-list retry while streaming keeps the same viewer and its one ticket when the host is reachable', async () => {
+    const { held, openConsole, frame } = await streamingThenHostRetry();
+    await act(async () => held[1].resolve(FIXTURE_HOSTS));
+    expect(await screen.findByRole('link', { name: /Run command on atlas/ })).toBeTruthy();
+    await settle();
+    expect(screen.getByRole('img', { name: /Console of ubuntu-build-02/ })).toBe(frame);
+    expect(frame.isConnected).toBe(true);
+    expect(openConsole).toHaveBeenCalledTimes(1);
+  });
+
+  test('(f) a host-list retry while streaming closes the console when the host turns out offline, with no second ticket', async () => {
+    const { held, openConsole, frame } = await streamingThenHostRetry();
+    await act(async () => held[1].resolve(offlineAtlas));
+    expect(await screen.findByText('atlas is offline (No heartbeat for 3 hours), so its VMs have no console.')).toBeTruthy();
+    expect(screen.getByText('Console status:').parentElement!.textContent).toBe('Console status: closed');
+    await settle();
+    expect(frame.isConnected).toBe(false);
+    expect(screen.queryByRole('img', { name: /Console of/ })).toBeNull();
+    expect(openConsole).toHaveBeenCalledTimes(1);
+  });
+
   test('a stopped VM closes at once, even while the host list is still loading', async () => {
     window.location.hash = '#/vms/win11-test-04/console';
     const api = new StandinApi();

@@ -122,7 +122,8 @@ export function VmPage({ id, console: live }: { id: string; console: boolean }) 
               </section>
 
               {/* A stable key: host metadata arriving never remounts a live viewer
-                  (the gate keeps the viewer out until the host is known). */}
+                  (the gate keeps the viewer out until the host is known, and a
+                  later host-list retry keeps a viewer that is already up). */}
               <ConsoleTile key={vm.id} vm={vm} hostState={hostState} live={live} onRecheck={() => { data.reload(); hostList.reload(); }} />
               <div className="s4 stack">
                 <Resources vm={vm} host={host} />
