@@ -67,27 +67,42 @@ pub(crate) mod vm_acl {
 
     /// The ACL and expected SIDs must remain live for the call.
     pub(crate) unsafe fn matches(dacl: *const ACL, expected: &[Entry]) -> bool {
+        unsafe { matches_typed(dacl, expected) }.is_ok_and(|matched| matched)
+    }
+
+    /// The ACL and expected SIDs must remain live for the call.
+    /// Returns `Ok(true)` on exact match, `Ok(false)` on a measured DACL
+    /// mismatch (null DACL, wrong ACE count, or differing ACE), and `Err` on a
+    /// Win32 `GetAce` query failure.
+    pub(crate) unsafe fn matches_typed(
+        dacl: *const ACL,
+        expected: &[Entry],
+    ) -> std::io::Result<bool> {
         // Only basic object-local ACEs in the intended order are recognized.
         unsafe {
-            !dacl.is_null()
-                && usize::from((*dacl).AceCount) == expected.len()
-                && expected.iter().enumerate().all(|(index, entry)| {
-                    let mut ace = ptr::null_mut();
-                    if GetAce(dacl, index as u32, &mut ace) == 0 {
-                        return false;
-                    }
-                    let header = &*ace.cast::<ACE_HEADER>();
-                    if header.AceFlags != 0
-                        || header.AceType != u8::from(entry.deny)
-                        || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
-                    {
-                        return false;
-                    }
-                    // Basic allow and deny ACEs have the same mask and SID layout.
-                    let basic = &*ace.cast::<ACCESS_ALLOWED_ACE>();
-                    let sid = ptr::addr_of!(basic.SidStart).cast_mut().cast();
-                    basic.Mask == entry.mask && EqualSid(sid, entry.sid) != 0
-                })
+            if dacl.is_null() || usize::from((*dacl).AceCount) != expected.len() {
+                return Ok(false);
+            }
+            for (index, entry) in expected.iter().enumerate() {
+                let mut ace = ptr::null_mut();
+                if GetAce(dacl, index as u32, &mut ace) == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let header = &*ace.cast::<ACE_HEADER>();
+                if header.AceFlags != 0
+                    || header.AceType != u8::from(entry.deny)
+                    || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
+                {
+                    return Ok(false);
+                }
+                // Basic allow and deny ACEs have the same mask and SID layout.
+                let basic = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+                let sid = ptr::addr_of!(basic.SidStart).cast_mut().cast();
+                if basic.Mask != entry.mask || EqualSid(sid, entry.sid) == 0 {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
     }
 }
