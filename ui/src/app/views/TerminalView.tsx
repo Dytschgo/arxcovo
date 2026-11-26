@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { exampleCommand, parseCommandLine } from '../../api/command';
 import { isApiError, type Host, type TerminalSession, type TerminalStatus } from '../../api/types';
-import { useApi, useResource, useSession } from '../context';
+import { useApi, useInventory, useResource, useSession } from '../context';
 import { Icon } from '../icons';
 import { href } from '../router';
 import { ArchBadge, Empty, HostStatus, Loaded, OsBadge, Page, TerminalSessionStatus } from '../ui';
@@ -204,7 +204,7 @@ function Terminal({ host }: { host: Host }) {
   );
 }
 
-function HostPicker({ hosts, selected }: { hosts: Host[]; selected: string }) {
+function HostPicker({ hosts, selected }: { hosts: Host[]; selected: string | null }) {
   const reachable = hosts.filter(h => h.reachability !== 'offline').length;
   return (
     <section className="tile term-hosts" aria-labelledby="term-hosts">
@@ -236,14 +236,30 @@ function HostPicker({ hosts, selected }: { hosts: Host[]; selected: string }) {
 }
 
 export function TerminalView({ hostId }: { hostId: string | null }) {
-  const hosts = useResource(api => api.listHosts(), []);
+  const inventory = useInventory();
+  const hosts = useResource(async api => {
+    const epoch = inventory.epoch();
+    const list = await api.listHosts();
+    inventory.put(epoch, { hosts: list });
+    return list;
+  }, []);
   return (
     <Page title="Terminal" lede="Run a tool on a host · not a shell" actions={<span className="tag"><Icon name="shield" />run_command</span>}>
       <Loaded resource={hosts} label="hosts">
         {list => {
           const usable = list.filter(h => h.reachability !== 'offline');
           if (usable.length === 0) return <Empty title="No reachable hosts">A terminal needs at least one online host.</Empty>;
-          const selected = list.find(h => h.id === hostId) ?? usable[0];
+          // A named host that is not in the list is reported, never swapped for
+          // another one: a command must run where the owner asked.
+          const selected = hostId === null ? usable[0] : list.find(h => h.id === hostId);
+          if (!selected) {
+            return (
+              <div className="term-grid">
+                <HostPicker hosts={list} selected={null} />
+                <div className="tile"><Empty title={`No host named ${hostId}`}>It is not in the host list. Choose a host to run a command on.</Empty></div>
+              </div>
+            );
+          }
           return (
             <div className="term-grid">
               <HostPicker hosts={list} selected={selected.id} />

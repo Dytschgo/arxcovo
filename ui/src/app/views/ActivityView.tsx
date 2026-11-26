@@ -1,6 +1,6 @@
 import { useState, type CSSProperties } from 'react';
 import { ACTIVITY_OUTCOMES, type ActivityEntry, type ActivityOutcome, type ActivityQuery } from '../../api/types';
-import { useResource } from '../context';
+import { useInventory, useResource } from '../context';
 import { outcomeCounts } from '../derive';
 import { Empty, Loaded, OUTCOME_STATUS, OutcomeStatus, Page, SelectField, useNow } from '../ui';
 import { Icon } from '../icons';
@@ -51,7 +51,13 @@ export function ActivityView() {
   // cursors[i] is the beforeId that produced page i; page 0 has none.
   const [cursors, setCursors] = useState<(number | undefined)[]>([undefined]);
   const page = cursors.length - 1;
-  const hosts = useResource(api => api.listHosts(), []);
+  const inventory = useInventory();
+  const hosts = useResource(async api => {
+    const epoch = inventory.epoch();
+    const list = await api.listHosts();
+    inventory.put(epoch, { hosts: list });
+    return list;
+  }, []);
   const now = useNow(30_000);
   const query: ActivityQuery = {
     limit: PAGE_SIZE,

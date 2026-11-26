@@ -137,6 +137,32 @@ test('search: the jump list filters hosts, VMs and tools and jumps with the keyb
   await expect(page.getByRole('heading', { level: 1, name: 'web-static' })).toBeFocused();
 });
 
+test('search: Tab leaves the combobox and closes the list; at 390 px the open list stays on screen', async ({ page }) => {
+  await signIn(page);
+  await expect(page.getByRole('list', { name: 'Hosts' })).toBeVisible();
+  const search = page.getByRole('combobox', { name: 'Search hosts, VMs and tools' });
+  const options = page.getByRole('listbox', { name: 'Search results' }).getByRole('option');
+  await search.fill('ubuntu');
+  await expect(options).toHaveCount(2);
+  await page.keyboard.press('Tab');
+  await expect(search).toHaveAttribute('aria-expanded', 'false');
+  await expect(search).not.toBeFocused();
+  expect(await page.evaluate(() => document.activeElement?.getAttribute('role') ?? null)).not.toBe('option');
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(/#\/hosts$/);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await search.fill('a');
+  await expect(options.first()).toBeVisible();
+  for (const option of await options.all()) {
+    const box = (await option.boundingBox())!;
+    expect(box.x, await option.textContent() ?? '').toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(390);
+  }
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
+  await shot(page, '12-search-390');
+});
+
 test('layout: no view overflows the page at 1280 px', async ({ page }) => {
   await signIn(page);
   for (const hash of ['#/hosts', '#/hosts/atlas', '#/hosts/pebble', '#/vms', '#/vms/ubuntu-build-02', '#/vms/web-static/console', '#/terminal/atlas', '#/activity', '#/nowhere']) {

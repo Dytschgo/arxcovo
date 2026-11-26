@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react';
 import { isApiError, type Host, type Vm } from '../api/types';
-import { useApi, useSession } from './context';
+import { INVENTORY_TTL_MS, useApi, useInventory, useSession } from './context';
 import { jumpItems } from './derive';
 import { Icon } from './icons';
 import { href, navigate } from './router';
@@ -8,18 +8,27 @@ import { href, navigate } from './router';
 type Data = { status: 'idle' | 'loading' } | { status: 'ready'; hosts: Host[]; vms: Vm[] } | { status: 'error'; message: string };
 
 /**
- * Top-bar search: a combobox whose jump list filters hosts, VMs and tools on
- * the client. The host and VM lists load once, on first focus, through the
- * same API the views use; nothing is sent per keystroke. `/` focuses it.
+ * Top-bar search: an ARIA combobox (focus stays in the input; options are
+ * reached with the arrows through aria-activedescendant) whose jump list
+ * filters hosts, VMs and tools on the client.
+ *
+ * On focus it reuses the host and VM lists a view already loaded in this
+ * session (the inventory); only a missing or stale list is requested, and
+ * nothing is sent per keystroke. A result or a 401 that arrives after the
+ * session changed, or after the search unmounted, is ignored, so a late
+ * answer from an old session can never sign the owner out of a new one.
  */
 export function Search() {
   const api = useApi();
   const { expire } = useSession();
+  const inventory = useInventory();
+  const mounted = useRef(true);
   const [data, setData] = useState<Data>({ status: 'idle' });
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(-1);
   const input = useRef<HTMLInputElement>(null);
+  const loadedAt = useRef(0);
   const wrap = useRef<HTMLDivElement>(null);
   const listId = useId();
 
@@ -36,18 +45,34 @@ export function Search() {
     };
     document.addEventListener('keydown', onKey);
     document.addEventListener('pointerdown', onPointer);
+    mounted.current = true;
     return () => {
+      mounted.current = false;
       document.removeEventListener('keydown', onKey);
       document.removeEventListener('pointerdown', onPointer);
     };
   }, []);
 
   function load() {
-    if (data.status === 'loading' || data.status === 'ready') return;
+    if (data.status === 'loading') return;
+    const cached = inventory.fresh();
+    if (cached.hosts && cached.vms) {
+      setData({ status: 'ready', hosts: cached.hosts, vms: cached.vms });
+      return;
+    }
+    if (data.status === 'ready' && Date.now() - loadedAt.current <= INVENTORY_TTL_MS) return;
+    const epoch = inventory.epoch();
+    const current = () => mounted.current && epoch !== null && inventory.epoch() === epoch;
     setData({ status: 'loading' });
-    Promise.all([api.listHosts(), api.listVms()]).then(
-      ([hosts, vms]) => setData({ status: 'ready', hosts, vms }),
+    Promise.all([cached.hosts ?? api.listHosts(), cached.vms ?? api.listVms()]).then(
+      ([hosts, vms]) => {
+        if (!current()) return;
+        inventory.put(epoch, { hosts, vms });
+        loadedAt.current = Date.now();
+        setData({ status: 'ready', hosts, vms });
+      },
       (error: unknown) => {
+        if (!current()) return;
         if (isApiError(error, 'unauthorized')) expire();
         setData({ status: 'error', message: isApiError(error) ? error.message : 'Search is unavailable.' });
       },
@@ -75,11 +100,13 @@ export function Search() {
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       if (items.length === 0) return;
       event.preventDefault();
-      setOpen(true);
       const step = event.key === 'ArrowDown' ? 1 : -1;
-      setActive(i => (i + step + items.length) % items.length);
+      // Opening with ArrowUp lands on the last option, ArrowDown on the first.
+      setActive(i => (!expanded || i < 0 ? (step > 0 ? 0 : items.length - 1) : (i + step + items.length) % items.length));
+      setOpen(true);
     } else if (event.key === 'Enter') {
-      if (items.length === 0) return;
+      // Enter acts only on an open list; a hidden result is never activated.
+      if (!expanded || items.length === 0) return;
       event.preventDefault();
       go(Math.max(0, active));
     } else if (event.key === 'Escape') {
@@ -117,6 +144,7 @@ export function Search() {
         maxLength={128}
         value={query}
         onFocus={() => { load(); setOpen(true); }}
+        onBlur={close}
         onChange={e => { setQuery(e.target.value); setActive(-1); setOpen(true); }}
         onKeyDown={onKeyDown}
       />
@@ -124,8 +152,8 @@ export function Search() {
       <div className="jump" hidden={!expanded}>
         <div id={listId} role="listbox" aria-label="Search results">
           {options.map((item, i) => (
-            <a key={item.key} id={`${listId}-${i}`} role="option" aria-selected={i === active} href={href(item.route)}
-              onClick={e => { e.preventDefault(); go(i); }} onPointerEnter={() => setActive(i)}>
+            <a key={item.key} id={`${listId}-${i}`} role="option" aria-selected={i === active} href={href(item.route)} tabIndex={-1}
+              onMouseDown={e => e.preventDefault()} onClick={e => { e.preventDefault(); go(i); }} onPointerEnter={() => setActive(i)}>
               <span className="jump-label">{item.label}</span>
               <small>{item.kind}</small>
             </a>

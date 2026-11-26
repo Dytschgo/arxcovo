@@ -431,6 +431,12 @@ kbd {
   box-shadow: 0 18px 40px rgb(0 0 0 / .7);
 }
 .jump[hidden] { display: none; }
+/* Narrow screens: the search takes its own row and its list spans it, so no
+   result is cut off at the left edge. */
+@media (max-width: 640px) {
+  .search { flex: 1 1 100%; order: 1; }
+  .jump { inset-inline: 0; inline-size: auto; }
+}
 .jump a {
   display: flex;
   align-items: center;

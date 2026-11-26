@@ -1,6 +1,6 @@
 import { useState, type CSSProperties } from 'react';
 import type { Host, VmKind } from '../../api/types';
-import { useResource } from '../context';
+import { useInventory, useResource } from '../context';
 import { boardTotals, groupBoard, type Allocation, type BoardTotals } from '../derive';
 import { formatBytes } from '../format';
 import { Icon } from '../icons';
@@ -73,8 +73,11 @@ function Totals({ totals }: { totals: BoardTotals }) {
 const REASON_ICON = { online: 'check', degraded: 'warn', offline: 'off' } as const;
 
 export function HostsView() {
+  const inventory = useInventory();
   const data = useResource(async api => {
+    const epoch = inventory.epoch();
     const [hosts, vms] = await Promise.all([api.listHosts(), api.listVms()]);
+    inventory.put(epoch, { hosts, vms });
     return { hosts, vms };
   }, []);
   const [kind, setKind] = useState<KindFilter>('all');
@@ -84,7 +87,9 @@ export function HostsView() {
     <Page title="Hosts" hideTitle>
       <Loaded resource={data} label="hosts">
         {({ hosts, vms }) => {
-          if (hosts.length === 0) return <Empty title="No hosts yet">Install arxd on a computer and join it with a one-time join code.</Empty>;
+          // Only an empty cluster gets the empty screen: VMs whose host is not
+          // listed (even when no host is) still show, with their totals.
+          if (hosts.length === 0 && vms.length === 0) return <Empty title="No hosts yet">Install arxd on a computer and join it with a one-time join code.</Empty>;
           const board = groupBoard(hosts, vms, kind);
           return (
             <>
@@ -102,7 +107,7 @@ export function HostsView() {
                 <span><span className="sw" aria-hidden="true" />unavailable</span>
               </p>
               <div className="board" role="region" aria-label="Hosts board" tabIndex={0}>
-                <ul className="board-cols" aria-label="Hosts" style={{ '--cols': board.columns.length } as CSSProperties}>
+                {board.columns.length > 0 ? <ul className="board-cols" aria-label="Hosts" style={{ '--cols': board.columns.length } as CSSProperties}>
                   {board.columns.map(({ host, vms: shown, allocated }) => (
                     // No fade-in entrance: text stays at full contrast in every frame.
                     <li key={host.id} className="col" data-reachability={host.reachability}>
@@ -129,7 +134,7 @@ export function HostsView() {
                       </div>
                     </li>
                   ))}
-                </ul>
+                </ul> : null}
                 {board.orphans.length > 0 ? (
                   <section className="col col-orphan" aria-labelledby="orphans">
                     <div className="col-h">

@@ -106,7 +106,7 @@ describe('hosts', () => {
   });
 
   test('an empty cluster explains how to add a host', async () => {
-    await signIn({ hosts: [] });
+    await signIn({ hosts: [], vms: [] });
     expect(await screen.findByText('No hosts yet')).toBeTruthy();
   });
 
@@ -403,6 +403,7 @@ describe('Night Orbit views: search, console closed state, not found', () => {
     const api = await signIn();
     await screen.findByRole('list', { name: 'Hosts' });
     const listHosts = vi.spyOn(api, 'listHosts');
+    const listVms = vi.spyOn(api, 'listVms');
     const search = screen.getByRole('combobox', { name: 'Search hosts, VMs and tools' });
     fireEvent.keyDown(document.body, { key: '/' });
     expect(document.activeElement).toBe(search);
@@ -412,10 +413,12 @@ describe('Night Orbit views: search, console closed state, not found', () => {
     const options = await within(results).findAllByRole('option');
     expect(options.map(o => o.textContent)).toEqual(['ubuntu-build-02test VM', 'ubuntu-arm-03test VM']);
     expect(search.getAttribute('aria-expanded')).toBe('true');
-    // Typing filters on the client: one load on focus, none per keystroke.
+    // The board already loaded both lists in this session: the search reuses
+    // them, and typing filters on the client. No request at all.
     fireEvent.change(search, { target: { value: 'ubuntu-a' } });
     expect(within(results).getAllByRole('option')).toHaveLength(1);
-    expect(listHosts).toHaveBeenCalledTimes(1);
+    expect(listHosts).not.toHaveBeenCalled();
+    expect(listVms).not.toHaveBeenCalled();
     fireEvent.change(search, { target: { value: 'ubuntu' } });
     fireEvent.keyDown(search, { key: 'ArrowDown' });
     fireEvent.keyDown(search, { key: 'ArrowDown' });
@@ -487,5 +490,97 @@ describe('Night Orbit views: search, console closed state, not found', () => {
     expect(await screen.findByRole('heading', { level: 1, name: 'Page not found' })).toBeTruthy();
     expect(screen.getByText('Nothing lives at this address.')).toBeTruthy();
     expect(screen.getByRole('link', { name: 'Go to hosts' }).getAttribute('href')).toBe('#/hosts');
+  });
+});
+
+describe('PR #380 review 1 findings', () => {
+  const search = () => screen.getByRole('combobox', { name: 'Search hosts, VMs and tools' });
+
+  test('finding 1: a late search 401 from an earlier session never signs out the new one', async () => {
+    const api = await signIn({}, '#/nowhere');
+    await screen.findByRole('heading', { level: 1, name: 'Page not found' });
+    let reject!: (error: unknown) => void;
+    vi.spyOn(api, 'listHosts').mockImplementationOnce(() => new Promise((_, r) => { reject = r; }));
+    fireEvent.focus(search());
+    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await screen.findByText('You are signed out.');
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: DEMO_CREDENTIALS.password } });
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    await screen.findByRole('heading', { level: 1, name: 'Page not found' });
+    await act(async () => reject(new ApiError('unauthorized', 'old session', 401)));
+    expect(screen.queryByText('Your session has ended. Sign in again.')).toBeNull();
+    expect(screen.getByRole('navigation', { name: 'Main' })).toBeTruthy();
+  });
+
+  test('finding 2: options are not tabbable; blur and Escape close; Enter needs an open list; ArrowUp opens on the last option', async () => {
+    await signIn();
+    await screen.findByRole('list', { name: 'Hosts' });
+    fireEvent.focus(search());
+    fireEvent.change(search(), { target: { value: 'ubuntu' } });
+    const options = await within(screen.getByRole('listbox', { name: 'Search results' })).findAllByRole('option');
+    expect(options.map(o => o.getAttribute('tabindex'))).toEqual(['-1', '-1']);
+    fireEvent.keyDown(search(), { key: 'ArrowUp' });
+    expect(document.getElementById(search().getAttribute('aria-activedescendant')!)!.textContent).toBe('ubuntu-arm-03test VM');
+    fireEvent.keyDown(search(), { key: 'Escape' });
+    expect(search().getAttribute('aria-expanded')).toBe('false');
+    expect(search().hasAttribute('aria-activedescendant')).toBe(false);
+    fireEvent.keyDown(search(), { key: 'Enter' });
+    expect(window.location.hash).toBe('#/hosts');
+    fireEvent.change(search(), { target: { value: 'ubuntu-' } });
+    expect(search().getAttribute('aria-expanded')).toBe('true');
+    fireEvent.blur(search());
+    expect(search().getAttribute('aria-expanded')).toBe('false');
+    fireEvent.keyDown(search(), { key: 'Enter' });
+    expect(window.location.hash).toBe('#/hosts');
+  });
+
+  test('finding 4: the console route opens its stream even when the host list fails', async () => {
+    const api = await signIn({ failures: { listHosts: new ApiError('unavailable', 'arxd is busy.', 503) } }, '#/vms/ubuntu-build-02/console');
+    const open = vi.spyOn(api, 'openConsole');
+    expect(await screen.findByRole('img', { name: /Console of ubuntu-build-02/ })).toBeTruthy();
+    expect(screen.getByRole('heading', { level: 1, name: 'Console · ubuntu-build-02' })).toBeTruthy();
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/Could not load the host list\. arxd is busy\./)).toBeTruthy();
+    expect(screen.queryByRole('link', { name: /Run command/ })).toBeNull();
+  });
+
+  test('finding 5: an orphan VM offers no command shortcut, and an unknown terminal host never falls back to another', async () => {
+    const orphan = { ...FIXTURE_VMS[0], hostId: 'gone' };
+    const api = await signIn({ vms: [orphan] }, '#/vms/win11-ci-01');
+    expect(await screen.findByText("This VM's host, gone, is not in the host list.")).toBeTruthy();
+    expect(screen.queryByRole('link', { name: /Run command/ })).toBeNull();
+    expect(screen.queryByText(/Run command/)).toBeNull();
+    const open = vi.spyOn(api, 'openTerminal');
+    go('#/terminal/gone');
+    expect(await screen.findByText('No host named gone')).toBeTruthy();
+    expect(screen.queryByLabelText('Command')).toBeNull();
+    expect(screen.getByRole('list', { name: 'Host' }).querySelector('[aria-current]')).toBeNull();
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  test('finding 6: VMs whose host is not listed still show with their totals when no host is listed', async () => {
+    await signIn({ hosts: [] });
+    const orphans = await screen.findByRole('region', { name: 'Unknown host' });
+    expect(within(orphans).getAllByRole('article')).toHaveLength(FIXTURE_VMS.length);
+    expect(screen.queryByText('No hosts yet')).toBeNull();
+    expect(screen.queryByRole('list', { name: 'Hosts' })).toBeNull();
+    expect(screen.getByText('0 of 0 hosts online')).toBeTruthy();
+    expect(screen.getByText('VMs on all hosts, incl. offline').closest('dl')!.textContent).toBe('VMs on all hosts, incl. offline5 total3 running4 test1 static');
+  });
+
+  test('finding 7: with no list loaded yet the search loads each list once, and a second focus reuses them', async () => {
+    const api = await signIn({}, '#/nowhere');
+    await screen.findByRole('heading', { level: 1, name: 'Page not found' });
+    const listHosts = vi.spyOn(api, 'listHosts');
+    const listVms = vi.spyOn(api, 'listVms');
+    fireEvent.focus(search());
+    fireEvent.change(search(), { target: { value: 'atlas' } });
+    await within(screen.getByRole('listbox', { name: 'Search results' })).findAllByRole('option');
+    fireEvent.blur(search());
+    fireEvent.focus(search());
+    fireEvent.change(search(), { target: { value: 'forge' } });
+    await within(screen.getByRole('listbox', { name: 'Search results' })).findAllByRole('option');
+    expect(listHosts).toHaveBeenCalledTimes(1);
+    expect(listVms).toHaveBeenCalledTimes(1);
   });
 });

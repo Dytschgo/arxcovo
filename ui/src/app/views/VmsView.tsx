@@ -1,6 +1,6 @@
 import { useId, useState } from 'react';
 import { VM_STATES, type Arch, type Host, type Vm, type VmKind, type VmState } from '../../api/types';
-import { useResource } from '../context';
+import { useInventory, useResource } from '../context';
 import { formatBytes, formatDate, formatTimeLeft } from '../format';
 import { Icon, OsGlyph } from '../icons';
 import { href } from '../router';
@@ -23,8 +23,11 @@ function Ready({ vm }: { vm: Vm }) {
 }
 
 export function VmsView() {
+  const inventory = useInventory();
   const data = useResource(async api => {
+    const epoch = inventory.epoch();
     const [vms, hosts] = await Promise.all([api.listVms(), api.listHosts()]);
+    inventory.put(epoch, { hosts, vms });
     return { vms, hosts: new Map(hosts.map(h => [h.id, h])) };
   }, []);
   const [kind, setKind] = useState<KindFilter>('all');

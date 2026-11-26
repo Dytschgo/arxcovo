@@ -1,10 +1,10 @@
 import type { ReactNode } from 'react';
 import type { Host, Vm } from '../../api/types';
-import { useResource } from '../context';
+import { useInventory, useResource } from '../context';
 import { OS_LABEL, formatAgo, formatBytes, formatDate, formatTimeLeft, incompatibility } from '../format';
 import { Icon, OsGlyph } from '../icons';
 import { href } from '../router';
-import { ArchBadge, BackLink, Empty, Facts, Loaded, Maybe, NullValue, OsBadge, Tile, VmStatus, useNow, usePageHeading } from '../ui';
+import { ArchBadge, BackLink, Empty, ErrorState, Facts, Loaded, Loading, Maybe, NullValue, OsBadge, Tile, VmStatus, useNow, usePageHeading } from '../ui';
 import { ConsoleTile } from './ConsoleTile';
 import { expiryLabel } from './VmsView';
 
@@ -49,11 +49,18 @@ function expiryPhrase(vm: Vm, now: number): string {
 }
 
 export function VmPage({ id, console: live }: { id: string; console: boolean }) {
-  const data = useResource(async api => {
-    const [vm, hosts] = await Promise.all([api.getVm(id), api.listHosts()]);
-    return { vm, hosts };
-  }, [id]);
-  const name = data.status === 'ready' ? data.data.vm.name : id;
+  // The VM and the host list load separately: the host list only adds
+  // context (host name, capacity, compatibility, the command shortcut), so its
+  // failure or delay never blocks the VM page or its console.
+  const inventory = useInventory();
+  const data = useResource(api => api.getVm(id), [id]);
+  const hostList = useResource(async api => {
+    const epoch = inventory.epoch();
+    const list = await api.listHosts();
+    inventory.put(epoch, { hosts: list });
+    return list;
+  }, []);
+  const name = data.status === 'ready' ? data.data.name : id;
   const title = live ? `Console · ${name}` : name;
   const heading = usePageHeading(title, data.status);
   const now = useNow(30_000);
@@ -69,8 +76,9 @@ export function VmPage({ id, console: live }: { id: string; console: boolean }) 
         </header>
       ) : null}
       <Loaded resource={data} label="this VM">
-        {({ vm, hosts }) => {
-          const host = hosts.find(h => h.id === vm.hostId);
+        {vm => {
+          const hosts = hostList.status === 'ready' ? hostList.data : null;
+          const host = hosts?.find(h => h.id === vm.hostId);
           const hostName = host?.name ?? vm.hostId;
           const offline = host?.reachability === 'offline';
           return (
@@ -100,13 +108,18 @@ export function VmPage({ id, console: live }: { id: string; console: boolean }) 
                 </div>
                 <div className="vm-hero-side">
                   <p className="tpl">template <b className="mono">{vm.template.id}</b> <span className="arch">v{vm.template.version}</span></p>
-                  {offline
-                    ? <span className="button button-disabled" aria-disabled="true" title={host?.reachabilityReason ?? 'Host is offline'}><Icon name="term" />Run command on {hostName}</span>
-                    : <a className="button" href={href({ name: 'terminal', hostId: vm.hostId })}><Icon name="term" />Run command on {hostName}</a>}
+                  {/* The shortcut needs the VM's own host in the loaded list: an
+                      unknown host (left the list, or the list did not load) gets
+                      no shortcut, so a command can never land on another host. */}
+                  {host === undefined
+                    ? null
+                    : offline
+                      ? <span className="button button-disabled" aria-disabled="true" title={host.reachabilityReason ?? 'Host is offline'}><Icon name="term" />Run command on {hostName}</span>
+                      : <a className="button" href={href({ name: 'terminal', hostId: host.id })}><Icon name="term" />Run command on {hostName}</a>}
                 </div>
               </section>
 
-              <ConsoleTile key={`${vm.id}:${vm.state}:${host?.reachability ?? ''}`} vm={vm} host={host} live={live} onRecheck={data.reload} />
+              <ConsoleTile key={`${vm.id}:${vm.state}:${host?.reachability ?? ''}`} vm={vm} host={host} live={live} onRecheck={() => { data.reload(); hostList.reload(); }} />
               <div className="s4 stack">
                 <Resources vm={vm} host={host} />
                 <Tile id="vm-facts" title="Overview">
@@ -137,10 +150,14 @@ export function VmPage({ id, console: live }: { id: string; console: boolean }) 
                 )}
               </Tile>
 
-
-
               <Tile id="vm-hosts" icon="hosts" title="Compatible hosts" className="s6">
-                <ul className="compat" aria-labelledby="vm-hosts" data-host-identity>
+                {hostList.status === 'loading' ? <Loading label="Loading the host list…" /> : null}
+                {hostList.status === 'error' && hostList.error.code !== 'unauthorized'
+                  ? <ErrorState message={`Could not load the host list. ${hostList.error.message}`} onRetry={hostList.reload} />
+                  : null}
+                {hosts !== null && hosts.length === 0 ? <Empty title="No hosts in the cluster" /> : null}
+                {hosts !== null && host === undefined && hosts.length > 0 ? <p className="note"><Icon name="warn" />This VM's host, {vm.hostId}, is not in the host list.</p> : null}
+                {hosts !== null && hosts.length > 0 ? <ul className="compat" aria-labelledby="vm-hosts" data-host-identity>
                   {hosts.map(h => {
                     const reason = incompatibility(vm, h);
                     const current = h.id === vm.hostId;
@@ -156,7 +173,7 @@ export function VmPage({ id, console: live }: { id: string; console: boolean }) 
                       </li>
                     );
                   })}
-                </ul>
+                </ul> : null}
                 <p className="note">Where this VM could run. Moving VMs between hosts ships after v1.</p>
               </Tile>
             </div>

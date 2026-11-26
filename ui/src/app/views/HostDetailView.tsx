@@ -1,5 +1,5 @@
 import type { Host } from '../../api/types';
-import { useResource } from '../context';
+import { useInventory, useResource } from '../context';
 import { allocation } from '../derive';
 import { OS_LABEL, formatAgo, formatBytes, formatDate, percent } from '../format';
 import { Icon } from '../icons';
@@ -47,8 +47,11 @@ function CpuTile({ host }: { host: Host }) {
 }
 
 export function HostDetailView({ id }: { id: string }) {
+  const inventory = useInventory();
   const data = useResource(async api => {
+    const epoch = inventory.epoch();
     const [host, vms, activity] = await Promise.all([api.getHost(id), api.listVms(), api.listActivity({ hostId: id, limit: 5 })]);
+    inventory.put(epoch, { vms });
     return { host, vms: vms.filter(v => v.hostId === id), activity: activity.entries };
   }, [id]);
   const title = data.status === 'ready' ? data.data.host.name : id;
