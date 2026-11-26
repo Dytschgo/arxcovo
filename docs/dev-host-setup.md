@@ -580,6 +580,8 @@ untouched. No admin or native acceptance action has been performed here.
 
 ## Static VM public-egress build
 
+Use the [owner Docker qualification runbook](docker-qualification.md) for the separately protected E1a copy, preflight and Docker dossier.
+
 ADR 0064 uses the separate Windows x64 build at
 `D:\ArxcovoData\qemu\11.1.3-arx-egress-2`. Its executable contains the
 patched libslirp. Verify its receipt and full payload manifest against the
