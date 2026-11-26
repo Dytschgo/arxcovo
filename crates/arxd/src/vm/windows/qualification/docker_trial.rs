@@ -468,6 +468,9 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                     &self.dependencies,
                 )?;
             }
+            if self.cancel.is_cancelled() || self.host.clock().mono_ms >= cutoff {
+                return Err(NativeRefusal::QualificationMissing);
+            }
             let peer = self.host.prelaunch(&boot, cutoff, self.cancel)?;
             spawned = Some(peer);
             if peer.pid == 0 || peer.boot == [0; 16] {

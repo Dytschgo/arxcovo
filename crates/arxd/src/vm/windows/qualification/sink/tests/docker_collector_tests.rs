@@ -341,8 +341,8 @@ impl<'a> trial::Host for Host<'a> {
             empty_job: true,
             workers_joined: true,
             writers_excluded: true,
-            clean_guest_shutdown: self.fault != Fault::Dirty
-                || ticket.phase != trial::Phase::Install,
+            clean_guest_shutdown: self.trace.borrow().continued.contains(&ticket.phase)
+                && (self.fault != Fault::Dirty || ticket.phase != trial::Phase::Install),
         })
     }
 
@@ -741,10 +741,19 @@ fn collect(fault: Fault) {
     FAULT.set(None);
     let trace = trace.into_inner();
     assert_eq!(trace.staged, trace.drained);
+    let pre_cont_refusal = matches!(
+        fault,
+        Fault::MissingRoute
+            | Fault::ForeignRoute
+            | Fault::MalformedPolicy
+            | Fault::ChangedRoute
+            | Fault::ChangedTopology
+            | Fault::ReplacedPolicy
+    );
     let unresolved = matches!(
         fault,
         Fault::Stage | Fault::Scope | Fault::UnknownCreate | Fault::Dirty
-    );
+    ) || pre_cont_refusal;
     let retained = unresolved || fault == Fault::WorkspaceLeftover;
     assert_eq!(trace.disposed, !unresolved);
     assert_eq!(
@@ -805,15 +814,7 @@ fn collect(fault: Fault) {
     if matches!(fault, Fault::Stage | Fault::Scope) {
         assert_eq!(trace.launched, [PublicFixture]);
     }
-    if matches!(
-        fault,
-        Fault::MissingRoute
-            | Fault::ForeignRoute
-            | Fault::MalformedPolicy
-            | Fault::ChangedRoute
-            | Fault::ChangedTopology
-            | Fault::ReplacedPolicy
-    ) {
+    if pre_cont_refusal {
         assert_eq!(trace.launched, [PublicFixture]);
         assert!(trace.continued.is_empty());
     }
