@@ -20,6 +20,7 @@ pub mod qmp;
 pub mod qualification_record;
 pub(crate) mod reaper;
 pub mod runtime;
+pub(crate) mod selection_epoch;
 pub mod snapshot;
 pub mod static_web;
 mod template;
