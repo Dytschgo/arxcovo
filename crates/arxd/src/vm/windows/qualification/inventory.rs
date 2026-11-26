@@ -27,6 +27,18 @@ pub(in crate::vm::windows) struct Bundle {
 
 impl Bundle {
     pub(in crate::vm::windows) fn check(&self, deadline: Instant) -> Result<(), NativeRefusal> {
+        self.check_typed(deadline).map_err(NativeRefusal::from)
+    }
+
+    pub(super) fn check_typed(&self, deadline: Instant) -> Result<(), Invalidation> {
+        self.check_typed_with(deadline, &mut Instant::now)
+    }
+
+    fn check_typed_with(
+        &self,
+        deadline: Instant,
+        now: &mut impl FnMut() -> Instant,
+    ) -> Result<(), Invalidation> {
         let entries = std::iter::once(("", &self.root.leaf)).chain(
             self.directories
                 .iter()
@@ -43,40 +55,62 @@ impl Bundle {
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
         for (parent, dir) in entries {
-            timely(deadline)?;
-            file_identity(dir, true).map_err(|_| REFUSAL)?;
-            for (name, attributes) in listing_bounded(dir, files.len() + dirs.len(), Some(deadline))
-                .map_err(|_| REFUSAL)?
-            {
-                timely(deadline)?;
+            timely_at(deadline, now)?;
+            let dir_identity = file_identity_typed(dir, true);
+            timely_at(deadline, now)?;
+            dir_identity
+                .map_err(|error| CustodyCheckError::from(error).into_invalidation(REFUSAL))?;
+            let listed = listing_bounded_with(dir, files.len() + dirs.len(), Some(deadline), now);
+            timely_at(deadline, now)?;
+            let listed = listed.map_err(|error| match error {
+                ListingError::LimitExceeded => Invalidation::Confirmed(REFUSAL),
+                ListingError::TimedOut | ListingError::Io(_) => {
+                    Invalidation::Indeterminate(REFUSAL)
+                }
+            })?;
+            for (name, attributes) in listed {
+                timely_at(deadline, now)?;
                 let path = if parent.is_empty() {
                     name
                 } else {
                     format!("{parent}/{name}")
                 };
                 if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    return Err(REFUSAL);
+                    timely_at(deadline, now)?;
+                    return Err(Invalidation::Confirmed(REFUSAL));
                 }
                 if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
                     if !dirs.remove(path.as_str()) {
-                        return Err(REFUSAL);
+                        timely_at(deadline, now)?;
+                        return Err(Invalidation::Confirmed(REFUSAL));
                     }
                 } else {
                     if !files.remove(path.as_str()) {
-                        return Err(REFUSAL);
+                        timely_at(deadline, now)?;
+                        return Err(Invalidation::Confirmed(REFUSAL));
                     }
                     let (file, size) = &self.files[&path];
-                    file_identity(file, false).map_err(|_| REFUSAL)?;
-                    if file.metadata().map_err(|_| REFUSAL)?.len() != *size {
-                        return Err(REFUSAL);
+                    let file_id = file_identity_typed(file, false);
+                    timely_at(deadline, now)?;
+                    file_id.map_err(|error| {
+                        CustodyCheckError::from(error).into_invalidation(REFUSAL)
+                    })?;
+                    let meta = file.metadata();
+                    timely_at(deadline, now)?;
+                    let actual_size = meta
+                        .map_err(|_| Invalidation::Indeterminate(REFUSAL))?
+                        .len();
+                    if actual_size != *size {
+                        return Err(Invalidation::Confirmed(REFUSAL));
                     }
                 }
             }
         }
+        timely_at(deadline, now)?;
         if !files.is_empty() || !dirs.is_empty() {
-            return Err(REFUSAL);
+            return Err(Invalidation::Confirmed(REFUSAL));
         }
-        timely(deadline)
+        timely_at(deadline, now)
     }
 
     pub(in crate::vm::windows) fn identity(
@@ -169,11 +203,24 @@ pub(in crate::vm::windows) fn validate_launch_namespace(
 }
 
 pub(in crate::vm::windows) fn binding(pin: &PathPin) -> Result<(), NativeRefusal> {
+    check_binding(pin).map_err(NativeRefusal::from)
+}
+
+pub(in crate::vm::windows) fn check_binding(pin: &PathPin) -> Result<(), Invalidation> {
+    check_binding_with(pin, verify_volume_root_typed)
+}
+
+fn check_binding_with(
+    pin: &PathPin,
+    verify_root: impl FnOnce(&str, FileIdentity) -> Result<(), CustodyCheckError>,
+) -> Result<(), Invalidation> {
     // PathPin retains every non-reparse component. Reconfirm the one
     // external lookup, the drive letter, against the held volume root.
     let root = pin._ancestors.first().unwrap_or(&pin.leaf);
-    let identity = file_identity(root, true).map_err(|_| REFUSAL)?.0;
-    verify_volume_root(&pin.path.as_str()[..3], identity).map_err(|_| REFUSAL)
+    let identity = file_identity_typed(root, true)
+        .map_err(|error| CustodyCheckError::from(error).into_invalidation(REFUSAL))?
+        .0;
+    verify_root(&pin.path.as_str()[..3], identity).map_err(|error| error.into_invalidation(REFUSAL))
 }
 
 pub(super) fn protected_directory(dir: &File, owner: PSID) -> bool {
@@ -337,7 +384,17 @@ impl Bundle {
 }
 
 fn timely(deadline: Instant) -> Result<(), NativeRefusal> {
-    (Instant::now() < deadline).then_some(()).ok_or(REFUSAL)
+    timely_typed(deadline).map_err(NativeRefusal::from)
+}
+
+fn timely_typed(deadline: Instant) -> Result<(), Invalidation> {
+    timely_at(deadline, &mut Instant::now)
+}
+
+fn timely_at(deadline: Instant, now: &mut impl FnMut() -> Instant) -> Result<(), Invalidation> {
+    (now() < deadline)
+        .then_some(())
+        .ok_or(Invalidation::Indeterminate(REFUSAL))
 }
 
 struct BoundedFile<'a> {
@@ -914,5 +971,198 @@ pub(super) mod tests {
             .set_len(MAX_PAYLOAD_FILE + 1)
             .unwrap();
         f.refuse();
+    }
+
+    #[test]
+    fn binding_confirms_mismatch_keeps_io_indeterminate_and_latches_reverted_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir_path = local(temp.path().to_str().unwrap()).unwrap();
+        let pin = PathPin::open(&dir_path, true, false).unwrap();
+        assert_eq!(check_binding(&pin), Ok(()));
+
+        // Real Win32 mismatch: the held root handle is a subdirectory on the
+        // same volume rather than the volume's root object -> Confirmed.
+        let mut mismatched = PathPin::open(&dir_path, true, false).unwrap();
+        mismatched._ancestors[0] = open_directory(dir_path.as_str()).unwrap();
+        assert_eq!(
+            check_binding(&mismatched),
+            Err(Invalidation::Confirmed(REFUSAL))
+        );
+
+        // Real Win32 API/I/O failure: an unmounted drive letter fails
+        // GetVolumeNameForVolumeMountPointW -> Indeterminate.
+        let mut unmounted = PathPin::open(&dir_path, true, false).unwrap();
+        let bad_drive = unused_drive_root();
+        unmounted.path = LocalPath::parse(&format!("{bad_drive}missing")).unwrap();
+        assert_eq!(
+            check_binding(&unmounted),
+            Err(Invalidation::Indeterminate(REFUSAL))
+        );
+
+        // I/O failure through SelectionEpoch refuses without revoking, and the
+        // same epoch admits the next clean refresh.
+        let (io_epoch, sample) = open_test_epoch();
+        let io_result = io_epoch.refresh(
+            || {
+                check_binding(&unmounted)?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(io_result, Err(Invalidation::Indeterminate(REFUSAL)));
+        assert!(!io_epoch.effects_revoked());
+        assert!(
+            io_epoch
+                .refresh(
+                    || {
+                        check_binding(&pin)?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                )
+                .is_ok()
+        );
+
+        // Observed-then-reverted binding drift latches Confirmed and keeps the
+        // epoch unusable even after the drive binding matches again.
+        let (drift_epoch, sample) = open_test_epoch();
+        let drifted = drift_epoch.refresh(
+            || {
+                check_binding(&mismatched)?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(drifted, Err(Invalidation::Confirmed(REFUSAL)));
+        assert!(drift_epoch.effects_revoked());
+        // Revert to the matching pin; check_binding passes, but the epoch stays revoked.
+        assert_eq!(check_binding(&pin), Ok(()));
+        assert_eq!(
+            drift_epoch.refresh(
+                || {
+                    check_binding(&pin)?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Confirmed(NativeRefusal::QualificationMissing))
+        );
+        assert!(drift_epoch.effects_revoked());
+        assert_admission_closed();
+    }
+
+    #[test]
+    fn bundle_check_confirms_drift_keeps_timeout_indeterminate_and_latches_reverted_extra_file() {
+        let f = Fixture::new();
+        let held = f.inspect(Instant::now() + INVENTORY_TIME).unwrap();
+
+        // An elapsed deadline fails closed as Indeterminate without revoking.
+        let (timeout_epoch, sample) = open_test_epoch();
+        let timed_out = timeout_epoch.refresh(
+            || {
+                held.check_typed(Instant::now())?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(timed_out, Err(Invalidation::Indeterminate(REFUSAL)));
+        assert!(!timeout_epoch.effects_revoked());
+        assert!(
+            timeout_epoch
+                .refresh(
+                    || {
+                        held.check_typed(Instant::now() + INVENTORY_TIME)?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                )
+                .is_ok()
+        );
+
+        // A synchronous directory read that starts before the deadline and
+        // crosses it during the Win32 call returns Indeterminate (TimedOut),
+        // never a terminal Confirmed result — even when the directory holds an
+        // extra entry exceeding `max_entries`.
+        let extra = f.root.path().join("share/unexpected.bin");
+        fs::write(&extra, b"extra").unwrap();
+        let share_dir = open_directory(f.root.path().join("share").to_str().unwrap()).unwrap();
+        let base = Instant::now();
+        let deadline = base + Duration::from_secs(1);
+        let mut listing_ticks = 0usize;
+        let mut listing_clock = || {
+            listing_ticks += 1;
+            // Tick 1 passes the pre-read check; tick 2 crosses the deadline
+            // immediately after GetFileInformationByHandleEx returns.
+            if listing_ticks >= 2 { deadline } else { base }
+        };
+        assert!(matches!(
+            listing_bounded_with(&share_dir, 1, Some(deadline), &mut listing_clock),
+            Err(ListingError::TimedOut)
+        ));
+        let mut ticks = 0usize;
+        let mut crossing_clock = || {
+            ticks += 1;
+            if ticks >= 4 { deadline } else { base }
+        };
+        let crossed = timeout_epoch.refresh(
+            || {
+                held.check_typed_with(deadline, &mut crossing_clock)?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(crossed, Err(Invalidation::Indeterminate(REFUSAL)));
+        assert!(!timeout_epoch.effects_revoked());
+
+        // Even an observed `Unsafe` handle state (a file where a directory is
+        // expected) must resolve as Indeterminate rather than Confirmed if the
+        // deadline elapsed before classifying the handle result.
+        let clean_fixture = Fixture::new();
+        let mut wrong_dir_bundle = clean_fixture
+            .inspect(Instant::now() + INVENTORY_TIME)
+            .unwrap();
+        wrong_dir_bundle.root.leaf =
+            File::open(clean_fixture.root.path().join("RECEIPT.txt")).unwrap();
+        let mut unsafe_ticks = 0usize;
+        let mut late_unsafe_clock = || {
+            unsafe_ticks += 1;
+            if unsafe_ticks >= 2 { deadline } else { base }
+        };
+        assert_eq!(
+            wrong_dir_bundle.check_typed_with(deadline, &mut late_unsafe_clock),
+            Err(Invalidation::Indeterminate(REFUSAL))
+        );
+        // Before the deadline, the same unsafe handle state is Confirmed.
+        assert_eq!(
+            wrong_dir_bundle.check_typed_with(deadline, &mut || base),
+            Err(Invalidation::Confirmed(REFUSAL))
+        );
+
+        // Observed-then-reverted extra file in the bundle directory latches Confirmed.
+        let (drift_epoch, sample) = open_test_epoch();
+        let drifted = drift_epoch.refresh(
+            || {
+                held.check_typed(Instant::now() + INVENTORY_TIME)?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(drifted, Err(Invalidation::Confirmed(REFUSAL)));
+        assert!(drift_epoch.effects_revoked());
+
+        // Delete the extra file so check_typed succeeds again; the epoch stays revoked.
+        fs::remove_file(&extra).unwrap();
+        assert_eq!(held.check_typed(Instant::now() + INVENTORY_TIME), Ok(()));
+        assert_eq!(
+            drift_epoch.refresh(
+                || {
+                    held.check_typed(Instant::now() + INVENTORY_TIME)?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Confirmed(NativeRefusal::QualificationMissing))
+        );
+        assert!(drift_epoch.effects_revoked());
     }
 }

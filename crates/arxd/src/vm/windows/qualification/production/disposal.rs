@@ -27,6 +27,10 @@ const PATH: Q = NativeRefusal::PathCustodyUnverified;
 /// In-process generation-level guard serializing lease-close/delete and
 /// directory-close/delete handoffs alongside the durable ledger fence and
 /// the held `production` parent directory handle.
+///
+/// Exclusion applies only among callers sharing the same instance; the later
+/// 7c issuer/reaper wiring PR must share one process-wide `GenerationGuards`
+/// instance across all disposal callers.
 #[derive(Default)]
 pub(crate) struct GenerationGuards {
     active: Mutex<HashSet<Id>>,
@@ -560,7 +564,10 @@ impl<'a> NativeDisposal<'a> {
                     self.verify_generation_dir(&dir, gen_scope, &gen_name)?;
                     dir
                 }
-                None => self.open_verified_generation_dir(gen_scope, &gen_name)?,
+                None => {
+                    self.ledger.intend_lease_disposal(auth, gen_scope)?;
+                    self.open_verified_generation_dir(gen_scope, &gen_name)?
+                }
             };
             self.remove_exact_lease(&dir, gen_scope, deadline)?;
             verify_dir_empty(&dir, deadline)?;
@@ -574,6 +581,7 @@ impl<'a> NativeDisposal<'a> {
 
         if disposal == GenerationDisposal::Directory {
             check_deadline(deadline)?;
+            self.ledger.intend_directory_disposal(auth, gen_scope)?;
             self.remove_exact_directory(gen_scope, &gen_name, deadline)?;
             self.verify_production_root()?;
             self.ledger.generation_disposed(auth, gen_scope)?;
