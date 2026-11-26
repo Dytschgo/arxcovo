@@ -6,6 +6,7 @@ use crate::{
 use axum::{extract::Query, http::Uri, response::Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::{sync::Mutex, time::Instant};
 
 const MAX_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -58,7 +59,7 @@ pub(super) async fn route(state: &Dashboard, uri: &Uri) -> Result<Response, ApiE
         match (collection.as_str(), target.as_deref()) {
             ("hosts", Some(id)) if id != host_id => Err(ApiError::NOT_FOUND),
             ("hosts", target) => {
-                let host = host(&state.activity, &host_id, now)?;
+                let host = host(&state.activity, &host_id, now, &state.host_probe)?;
                 json_response(if target.is_some() {
                     host
                 } else {
@@ -118,16 +119,151 @@ fn text(value: &str, limit: usize) -> String {
         .collect()
 }
 
-fn host(activity: &Activity, id: &str, now: i64) -> Result<Value, ApiError> {
+/// One decimal place, half away from zero (`f64::round`).
+/// Non-finite values and values outside 0..=100 are `None` (JSON null).
+fn cpu_used_percent(raw: f64) -> Option<f64> {
+    if !raw.is_finite() || !(0.0..=100.0).contains(&raw) {
+        return None;
+    }
+    let scaled = (raw * 10.0).round();
+    if !scaled.is_finite() {
+        return None;
+    }
+    let rounded = scaled / 10.0;
+    (0.0..=100.0).contains(&rounded).then_some(rounded)
+}
+
+fn used_percent_value(used: Option<f64>) -> Value {
+    used.and_then(serde_json::Number::from_f64)
+        .map_or(Value::Null, Value::Number)
+}
+
+fn cpu_object(model: &str, cores: usize, used: Option<f64>) -> Value {
+    json!({
+        "model": text(model, 128),
+        "cores": cores.clamp(1, 4096),
+        "usedPercent": used_percent_value(used),
+    })
+}
+
+/// Usage is published only after two accepted samples. `None` means the
+/// sysinfo interval has not elapsed: it is not a sample, and the last
+/// published value is left unchanged. A non-finite or out-of-range sample clears it.
+#[derive(Default)]
+struct CpuWindow {
+    accepted: u8,
+    published: Option<f64>,
+}
+
+impl CpuWindow {
+    fn observe(&mut self, raw: Option<f32>) -> Option<f64> {
+        if let Some(raw) = raw {
+            self.accepted = self.accepted.saturating_add(1);
+            if self.accepted >= 2 {
+                self.published = cpu_used_percent(f64::from(raw));
+            }
+        }
+        if self.accepted >= 2 {
+            self.published
+        } else {
+            None
+        }
+    }
+}
+
+/// A refresh closer than this does not produce a new sysinfo usage sample.
+/// The request path records the gap and returns; it does not sleep.
+fn cpu_sample_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| {
+        now.saturating_duration_since(last) >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL
+    })
+}
+
+/// Long-lived sysinfo state shared by host reads. The first accepted sample
+/// only opens the window; `usedPercent` stays null until the next one.
+pub(super) struct HostProbe {
+    system: sysinfo::System,
+    last_cpu: Option<Instant>,
+    window: CpuWindow,
+}
+
+struct HostFacts {
+    model: String,
+    cores: usize,
+    total_memory: u64,
+    used_memory: u64,
+    used_percent: Option<f64>,
+}
+
+impl HostProbe {
+    pub(super) fn new() -> Self {
+        Self {
+            system: sysinfo::System::new(),
+            last_cpu: None,
+            window: CpuWindow::default(),
+        }
+    }
+
+    fn snapshot(&mut self) -> HostFacts {
+        let raw = self.poll_cpu();
+        let used_percent = self.window.observe(raw);
+        self.system.refresh_memory();
+        HostFacts {
+            model: self
+                .system
+                .cpus()
+                .first()
+                .map(|cpu| cpu.brand().to_owned())
+                .unwrap_or_default(),
+            cores: self.system.cpus().len(),
+            total_memory: self.system.total_memory(),
+            used_memory: self.system.used_memory(),
+            used_percent,
+        }
+    }
+
+    fn poll_cpu(&mut self) -> Option<f32> {
+        if !cpu_sample_due(self.last_cpu, Instant::now()) {
+            return None;
+        }
+        if self.system.cpus().is_empty() {
+            self.system.refresh_cpu_all();
+        } else {
+            self.system.refresh_cpu_usage();
+        }
+        // An empty list is not a sample, so the next read can try again.
+        // Stamp only after a real list so the gap starts at or after sysinfo's.
+        let sample = accepted_cpu_sample(
+            !self.system.cpus().is_empty(),
+            self.system.global_cpu_usage(),
+        );
+        if sample.is_some() {
+            self.last_cpu = Some(Instant::now());
+        }
+        sample
+    }
+}
+
+fn accepted_cpu_sample(has_cpus: bool, usage: f32) -> Option<f32> {
+    has_cpus.then_some(usage)
+}
+
+fn host(
+    activity: &Activity,
+    id: &str,
+    now: i64,
+    probe: &Mutex<HostProbe>,
+) -> Result<Value, ApiError> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     if !matches!(os, "windows" | "linux") || !matches!(arch, "x86_64" | "aarch64") {
         return Err(ApiError::UNAVAILABLE);
     }
     let arch = if arch == "aarch64" { "arm64" } else { arch };
-    let mut system = sysinfo::System::new();
-    system.refresh_cpu_all();
-    system.refresh_memory();
+    let facts = {
+        let mut probe = probe.lock().map_err(|_| ApiError::UNAVAILABLE)?;
+        probe.snapshot()
+    };
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let (disk_total, disk_free) = disks.iter().fold((0u64, 0u64), |(total, free), disk| {
         (
@@ -170,11 +306,8 @@ fn host(activity: &Activity, id: &str, now: i64) -> Result<Value, ApiError> {
     Ok(json!({
         "id": id, "name": text(&name, 128), "os": os, "arch": arch,
         "osVersion": text(&sysinfo::System::long_os_version().unwrap_or_default(), 128),
-        "cpu": {
-            "model": text(system.cpus().first().map_or("", sysinfo::Cpu::brand), 128),
-            "cores": system.cpus().len().clamp(1, 4096), "usedPercent": null
-        },
-        "memory": {"totalBytes": system.total_memory().min(MAX_INTEGER), "usedBytes": system.used_memory().min(MAX_INTEGER)},
+        "cpu": cpu_object(&facts.model, facts.cores, facts.used_percent),
+        "memory": {"totalBytes": facts.total_memory.min(MAX_INTEGER), "usedBytes": facts.used_memory.min(MAX_INTEGER)},
         "disk": {"totalBytes": disk_total.min(MAX_INTEGER), "freeBytes": disk_free.min(MAX_INTEGER), "capBytes": null},
         "tools": tools, "reachability": "online", "reachabilityReason": null,
         "lastSeenAt": instant_string(now)?, "mode": "always_on",
@@ -274,4 +407,97 @@ fn vm(row: DashboardVm, host_id: &str) -> Result<Value, ApiError> {
         "cpus": row.cpus, "memoryBytes": row.memory, "diskBytes": row.disk.min(MAX_INTEGER),
         "snapshots": snapshots
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Yields injected CPU samples. `None` means this poll is not a new sample.
+    struct ScriptedCpu {
+        samples: Vec<Option<f32>>,
+        next: usize,
+    }
+
+    impl ScriptedCpu {
+        fn new(samples: impl IntoIterator<Item = Option<f32>>) -> Self {
+            Self {
+                samples: samples.into_iter().collect(),
+                next: 0,
+            }
+        }
+
+        fn poll(&mut self) -> Option<f32> {
+            let sample = self.samples.get(self.next).copied().flatten();
+            self.next = self.next.saturating_add(1);
+            sample
+        }
+    }
+
+    fn read_model_cpu(window: &mut CpuWindow, source: &mut ScriptedCpu) -> Value {
+        cpu_object("Test CPU", 4, window.observe(source.poll()))
+    }
+
+    #[test]
+    fn cpu_used_percent_rounds_one_decimal_and_drops_out_of_range() {
+        // 37.4 is already one decimal and stays 37.4. Nearby values use
+        // half-away-from-zero rounding at the first decimal.
+        assert_eq!(cpu_used_percent(37.4), Some(37.4));
+        assert_eq!(cpu_used_percent(37.44), Some(37.4));
+        assert_eq!(cpu_used_percent(37.46), Some(37.5));
+        assert_eq!(cpu_used_percent(0.0), Some(0.0));
+        assert_eq!(cpu_used_percent(100.0), Some(100.0));
+        assert_eq!(cpu_used_percent(f64::NAN), None);
+        assert_eq!(cpu_used_percent(f64::INFINITY), None);
+        assert_eq!(cpu_used_percent(f64::NEG_INFINITY), None);
+        assert_eq!(cpu_used_percent(-0.1), None);
+        assert_eq!(cpu_used_percent(-1.0), None);
+        assert_eq!(cpu_used_percent(100.1), None);
+        assert_eq!(cpu_used_percent(100.04), None);
+        assert_eq!(cpu_used_percent(-0.04), None);
+        assert_eq!(cpu_used_percent(140.0), None);
+    }
+
+    #[test]
+    fn host_read_model_used_percent_is_a_number_after_two_samples() {
+        let mut source = ScriptedCpu::new([
+            None,
+            Some(4.0),
+            Some(37.4),
+            Some(140.0),
+            Some(f32::NAN),
+            Some(-1.0),
+        ]);
+        let mut window = CpuWindow::default();
+        let skipped = read_model_cpu(&mut window, &mut source);
+        assert!(skipped["usedPercent"].is_null());
+        assert_eq!(skipped["model"], "Test CPU");
+        assert_eq!(skipped["cores"], 4);
+        assert!(read_model_cpu(&mut window, &mut source)["usedPercent"].is_null());
+        let ready = read_model_cpu(&mut window, &mut source);
+        assert!(ready["usedPercent"].is_number());
+        assert_eq!(ready["usedPercent"], json!(37.4));
+        assert!(read_model_cpu(&mut window, &mut source)["usedPercent"].is_null());
+        assert!(read_model_cpu(&mut window, &mut source)["usedPercent"].is_null());
+        assert!(read_model_cpu(&mut window, &mut source)["usedPercent"].is_null());
+    }
+
+    #[test]
+    fn cpu_sample_is_due_only_after_the_minimum_interval() {
+        let start = Instant::now();
+        let interval = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
+        assert!(cpu_sample_due(None, start));
+        assert_eq!(cpu_sample_due(Some(start), start), interval.is_zero());
+        if let Some(early) = interval.checked_sub(Duration::from_nanos(1)) {
+            assert!(!cpu_sample_due(Some(start), start + early));
+        }
+        assert!(cpu_sample_due(Some(start), start + interval));
+    }
+
+    #[test]
+    fn empty_cpu_list_is_not_a_sample() {
+        assert_eq!(accepted_cpu_sample(false, 0.0), None);
+        assert_eq!(accepted_cpu_sample(true, 12.5), Some(12.5));
+    }
 }

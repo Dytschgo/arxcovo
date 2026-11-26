@@ -155,6 +155,7 @@ impl Fixture {
             clock: clock.clone(),
             capacity: Arc::new(tokio::sync::Semaphore::new(8)),
             streams,
+            host_probe: Arc::new(Mutex::new(read::HostProbe::new())),
             _password_lock: None,
         };
         let app = state.clone().router();
@@ -939,6 +940,7 @@ async fn dashboard_vm_catalog_shows_ready_test_snapshots_and_hides_pending_delet
         clock: clock.clone(),
         capacity: Arc::new(tokio::sync::Semaphore::new(8)),
         streams: streams::Backends::new(None),
+        host_probe: Arc::new(Mutex::new(read::HostProbe::new())),
         _password_lock: None,
     };
     let f = Fixture {
