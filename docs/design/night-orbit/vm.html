@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arxcovo VM</title>
+<link rel="stylesheet" href="night-orbit.css">
+<script src="arx-data.js"></script>
+<style>
+.bento{margin-top:10px}
+/* hero */
+.hero{display:flex;align-items:flex-end;gap:32px;flex-wrap:wrap}
+.hero .l{flex:1 1 520px}
+.crumb{display:inline-flex;align-items:center;gap:6px;color:var(--ink3);font-size:13px}
+.crumb:hover{color:#fff}
+.name{display:flex;align-items:center;gap:16px;font:600 54px/1.05 var(--mono);letter-spacing:-.04em;margin:14px 0 12px;overflow:hidden}
+.name span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.name .kind{width:16px;height:16px}
+.meta{display:flex;align-items:center;gap:8px;color:var(--ink3);font-size:13.5px;flex-wrap:wrap}
+.meta .sep{color:var(--ink4)}
+.meta a.hl{color:var(--ink2);border-bottom:1px solid var(--line3)}
+.meta a.hl:hover{color:#fff;border-color:#fff}
+.hero .r{display:flex;flex-direction:column;align-items:flex-end;gap:12px}
+.tpl{display:flex;align-items:center;gap:10px;color:var(--ink3);font-size:12.5px}
+.tpl b{font:500 13px var(--mono);color:var(--ink2)}
+/* console */
+.con-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:7px;height:26px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--r-ctl);font-size:12.5px;color:var(--ink2)}
+.pill svg{width:13px;height:13px}
+.pill.streaming{color:#fff;border-color:#444}
+.pill.error,.pill.closed{color:#fff}
+.pill .sp{animation:spin 1s linear infinite;transform-origin:center}
+.con-head .r{margin-left:auto;display:flex;align-items:center;gap:8px}
+.screen-w{margin-top:14px}
+.screen{position:relative;width:100%;max-width:700px;aspect-ratio:4/3;margin:0 auto;background:#000;overflow:hidden;border:1px solid var(--line2);border-radius:10px}
+.screen svg{display:block;width:100%;height:100%;transition:opacity .3s}
+.screen.dim>svg{opacity:.18;filter:grayscale(1)}
+.ovl[hidden]{display:none}
+.ovl{position:absolute;inset:0;display:grid;place-content:center;justify-items:center;gap:10px;text-align:center;padding:24px}
+.ovl svg{width:26px;height:26px;color:#fff;opacity:1}
+.ovl b{font-size:16px;font-weight:600}
+.ovl span{color:var(--ink2);font-size:13px;max-width:380px}
+.ovl .sp{animation:spin 1s linear infinite}
+.con-meta{display:flex;align-items:center;gap:16px;margin-top:10px;color:var(--ink3);font:11.5px var(--mono);flex-wrap:wrap}
+.con-meta b{color:var(--ink2);font-weight:500}
+.con-note{display:flex;align-items:center;gap:7px;margin-left:auto;font:12px var(--font);color:var(--ink3)}
+.con-note svg{width:13px;height:13px}
+/* obligations */
+.ob{padding:14px 0;border-bottom:1px solid var(--line)}
+.ob:last-of-type{border-bottom:0;padding-bottom:4px}
+.ob-h{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:500}
+.ob-h svg{color:var(--ink2)}
+.ob-h .chip{margin-left:auto;font-size:10px;padding:1px 7px}
+.ob-v{display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap}
+.ob-v .big{font-size:22px;font-weight:600;letter-spacing:-.02em}
+.ob-d{margin-top:4px;color:var(--ink3);font-size:12.5px}
+.ob-d .mono{color:var(--ink2);font-size:12px}
+.fence{display:flex;align-items:flex-start;gap:8px;margin-top:10px;padding:9px 11px;border:1px solid var(--line2);border-radius:10px;color:var(--ink2);font-size:12.5px}
+.fence svg{margin-top:1px}
+.pubrow{display:flex;align-items:center;gap:10px;margin-top:8px}
+.pubrow .host{font:500 14px var(--mono)}
+.pubrow .host.off{color:var(--ink4);text-decoration:line-through}
+.pubrow .sw-w{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink3)}
+.toast{margin-top:10px;font-size:12.5px;color:var(--ink2)}
+/* lists */
+.list{margin-top:10px}
+.li{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);font-size:13px}
+.li:last-child{border-bottom:0}
+.li .n{font:500 12.5px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.li .sub{color:var(--ink3);font-size:12px}
+.li .rt{margin-left:auto;font:12px var(--mono);color:var(--ink2);white-space:nowrap}
+.li .ic{width:26px;height:26px;border-radius:8px;border:1px solid var(--line2);display:grid;place-items:center;color:var(--ink2);flex:none}
+.li .ic svg{width:13px;height:13px}
+/* resources */
+.res{display:grid;gap:22px;margin-top:18px}
+.res .row{display:grid;gap:6px}
+.res .rtop{display:flex;align-items:baseline;gap:8px}
+.res .rtop b{font-size:26px;font-weight:600;letter-spacing:-.03em;line-height:1}
+.res .rtop small{color:var(--ink3);font-size:13px}
+.res .rtop .of{margin-left:auto;color:var(--ink3);font:11.5px var(--mono)}
+.res .bar{height:3px;border-radius:2px;background:var(--line2);overflow:hidden}
+.res .bar i{display:block;height:100%;width:0;background:#fff;transition:width 1.2s var(--ease) .5s}
+/* compatible hosts */
+.cmp{display:grid;grid-template-columns:auto auto auto 1fr;align-items:center;gap:0 10px;margin-top:10px}
+.cmp>div{display:contents}
+.cmp>div>*{padding:9px 0;border-bottom:1px solid var(--line)}
+.cmp>div:last-child>*{border-bottom:0}
+.cmp .hn{font:500 12.5px var(--mono)}
+.cmp a.hn:hover{text-decoration:underline}
+.cmp .why{display:flex;align-items:center;gap:6px;color:var(--ink2);font-size:12.5px;min-width:0}
+.cmp .why span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmp .why.ok{color:#fff}
+.cmp .why svg{width:13px;height:13px;flex:none}
+.cmp-sum{margin-top:10px;color:var(--ink3);font-size:12.5px}
+/* activity */
+.acts{margin-top:8px}
+.act{display:grid;grid-template-columns:118px 120px minmax(0,1fr) 190px 90px 64px 52px;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}
+.act:last-child{border-bottom:0}
+.act .tool-n{font:500 12.5px var(--mono);color:#fff}
+.act .sum{color:var(--ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.act .who{display:flex;align-items:center;gap:6px;color:var(--ink3);font-size:12.5px;white-space:nowrap;overflow:hidden}
+.act .who b{color:var(--ink2);font-weight:500}
+.act .hst{font:12px var(--mono);color:var(--ink2)}
+.act .ex{font:11.5px var(--mono);color:var(--ink3)}
+.act .w{text-align:right;color:var(--ink3);font:11.5px var(--mono)}
+dialog.dlg fieldset{border:0;margin:14px 0 0;padding:0;display:grid;gap:6px}
+dialog.dlg legend{color:var(--ink3);font-size:12.5px;margin-bottom:6px;padding:0}
+dialog.dlg label.opt{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line2);border-radius:10px;font-size:13px;cursor:pointer}
+dialog.dlg label.opt:has(input:checked){border-color:#fff}
+dialog.dlg label.opt .rt{margin-left:auto;color:var(--ink3);font:11.5px var(--mono)}
+dialog.dlg input[type=radio]{accent-color:#fff}
+dialog.dlg .own{display:inline-flex;margin-top:12px}
+.foot .api-k{display:inline-flex;align-items:center;gap:6px}
+.foot .demo{display:flex;align-items:center;gap:10px;margin-left:auto}
+/* R4 additions */
+.cmp .why span{white-space:normal;overflow:visible}
+.cmp .why{align-items:flex-start}.cmp .why svg{margin-top:2px}
+.cmp .note{display:block;color:var(--ink3);font-size:11.5px;margin-top:2px}
+.ob-h .apimark{margin-left:0}
+.life-n{display:flex;align-items:baseline;gap:10px;margin-top:16px}
+.life-n .hero-n{font-family:var(--mono);font-size:44px}
+.life-n small{color:var(--ink3);font-size:13px}
+.life-d{margin-top:8px;color:var(--ink3);font-size:12.5px}
+.life-d b{color:var(--ink2);font-weight:500}
+.life .ob:first-of-type{margin-top:8px}
+.snapnote{margin-left:8px}
+.why-off{display:flex;align-items:flex-start;gap:7px;margin-top:8px;color:var(--ink2);font-size:12.5px}
+.why-off svg{width:13px;height:13px;margin-top:2px;flex:none}
+.empty-l{padding:14px 0 4px;color:var(--ink4);font-size:12.5px}
+.nf{padding:56px 20px;display:grid;justify-items:start;gap:14px}
+.nf h1{margin:0;font-size:34px;letter-spacing:-.03em}
+.nf p{margin:0;color:var(--ink3)}
+.demo-strip{margin-top:8px;border-top:1px dashed var(--line2)}
+.demo-strip .kindw{color:var(--ink3)}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="win" viewBox="0 0 16 16"><path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z" fill="currentColor"/></symbol>
+  <symbol id="lin" viewBox="0 0 16 16"><path d="M5 3v10h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-hosts" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
+  <symbol id="i-vm" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
+  <symbol id="i-act" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-move" viewBox="0 0 24 24"><path d="M4 8h13l-3-3M20 16H7l3 3"/></symbol>
+  <symbol id="i-run" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-spin" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-3-6.2"/><path d="M20 4v4h-4"/></symbol>
+  <symbol id="i-fail" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-swap" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18h.01"/></symbol>
+  <symbol id="i-off" viewBox="0 0 24 24"><path d="M3 3l18 18M8.5 8.5A5 5 0 0 0 12 17h4M17 7h-3"/></symbol>
+  <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5l11 7-11 7z"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M3 12h4l2-4 4 8 2-4h6"/></symbol>
+  <symbol id="i-backup" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.6"/><path d="M4 4v4h4M12 8v4l3 2"/></symbol>
+  <symbol id="i-cam" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></symbol>
+  <symbol id="i-bot" viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="11" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01"/></symbol>
+  <symbol id="i-cog" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+  <symbol id="i-mem" viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="10" rx="2"/><path d="M7 17v3M12 17v3M17 17v3"/></symbol>
+  <symbol id="i-disk" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
+  <symbol id="i-signout" viewBox="0 0 24 24"><path d="M14 4h5v16h-5M10 16l-4-4 4-4M6 12h10"/></symbol>
+</svg>
+
+<div class="page">
+  <header class="top rise" style="--i:0">
+    <a class="brand" href="board.html" aria-label="Arxcovo home">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="lgo" gradientUnits="userSpaceOnUse" x1="3" y1="0" x2="29" y2="0"><stop offset="0" stop-color="#4cc2ff"/><stop offset=".5" stop-color="#b9b0e8"/><stop offset="1" stop-color="#f5a524"/></linearGradient></defs><path class="lg-a" pathLength="1" d="M7.5 27 L16 7 L24.5 27"/><g transform="rotate(-14 16 19.5)"><ellipse class="lg-o" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/><ellipse class="lg-c" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/></g><circle class="lg-n" cx="16" cy="7" r="2.9"/><circle class="lg-m" cx="28.2" cy="16.3" r="1.9"/></svg>
+      arxcovo
+    </a>
+    <nav class="nav" aria-label="Main">
+      <a href="board.html" aria-label="Hosts"><svg class="i"><use href="#i-hosts"/></svg></a>
+      <a href="vms.html" aria-current="page"><svg class="i"><use href="#i-vm"/></svg>VMs</a>
+      <a href="terminal.html" aria-label="Terminal"><svg class="i"><use href="#i-term"/></svg></a>
+      <a href="activity.html" aria-label="Activity"><svg class="i"><use href="#i-act"/></svg></a>
+    </nav>
+    <span class="spacer"></span>
+    <span class="sync" title="Every host serves this dashboard"><span class="pulse"></span>served by <b>atlas</b> · synced</span>
+    <label class="search"><svg class="i"><use href="#i-search"/></svg><input type="search" placeholder="Search hosts, VMs, tools" aria-label="Search"><kbd>/</kbd></label>
+    <a class="me" href="login.html?state=signedout" title="Sign out"><svg class="i"><use href="#i-signout"/></svg><span class="vh">Sign out</span></a>
+  </header>
+
+  <main class="bento" id="main"></main>
+
+  <footer class="foot">
+    <span class="mock">Mock data · ◇ = field the API doesn't have yet</span>
+    <span class="demo faint" id="foot-note"></span>
+  </footer>
+  <div class="foot demo-strip demo-flex" data-demo role="group" aria-label="Demo controls" id="demo-strip">
+    <span class="kindw">Demo</span>
+    <span>Console</span>
+    <div class="seg" role="group" aria-label="Demo console state"><button type="button" aria-pressed="true" data-cs="live">as the VM is</button><button type="button" aria-pressed="false" data-cs="stopped">VM stopped</button><button type="button" aria-pressed="false" data-cs="error">error</button></div>
+  </div>
+</div>
+
+<dialog class="dlg" id="restore-dlg" aria-labelledby="rd-h">
+  <form method="dialog">
+    <h2 id="rd-h"></h2>
+    <p>The VM restarts from the chosen backup. Changes made after it are lost.</p>
+    <fieldset id="rd-opts"><legend>Backup</legend></fieldset>
+    <span class="chip own">Owner action</span>
+    <div class="acts"><button class="btn" value="cancel">Cancel</button><button class="btn primary" value="ok">Restore</button></div>
+  </form>
+</dialog>
+<dialog class="dlg" id="pub-dlg" aria-labelledby="pd-h">
+  <form method="dialog">
+    <h2 id="pd-h"></h2>
+    <p id="pd-p"></p>
+    <span class="chip own">Owner action</span>
+    <div class="acts"><button class="btn" value="cancel">Cancel</button><button class="btn primary" value="ok">Publish</button></div>
+  </form>
+</dialog>
+
+<script>
+/* All data, byte maths and move rules come from arx-data.js (ARX). The console frame is a drawn stand-in. */
+const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const ico = (id, cls = 'i') => `<svg class="${cls}" aria-hidden="true"><use href="#${id}"/></svg>`;
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const APIMARK = '<span class="apimark" title="Field the API doesn\'t have yet" aria-hidden="true">◇</span>';
+const STATE = {creating:['i-spin','Creating'],running:['i-run','Running'],stopped:['i-stop','Stopped'],snapshotting:['i-cam','Snapshotting'],migrating:['i-move','Migrating'],failed:['i-fail','Failed'],destroying:['i-trash','Destroying']};
+const OUTCOME = {started:['i-play','started',''],succeeded:['i-check','succeeded',''],failed:['i-fail','failed','bad'],rejected:['i-ban','rejected','bad'],refused:['i-shield','refused','bad'],interrupted:['i-pause','interrupted','bad']};
+const ACTOR = {agent:'i-bot',owner:'i-user',system:'i-cog'};
+const OSG = os => [os === 'windows' ? 'win' : 'lin', ARX.OS_COLOR[os], ARX.OS_LABEL[os]];
+const left = iso => Date.parse(iso) <= Date.now() ? 'expired' : ARX.fmtLeft(iso);
+const split = b => { const [n, u] = ARX.fmtBytes(b).split(' '); return [parseFloat(n), u]; };
+function countGroup(apply, dur = 1100, delay = 350) {
+  if (reduce) { apply(1); return; }
+  apply(0); const t0 = performance.now() + delay;
+  (function f(t) { const p = Math.max(0, Math.min(1, (t - t0) / dur)), e = 1 - Math.pow(1 - p, 3); apply(e); if (p < 1) requestAnimationFrame(f); })(performance.now());
+}
+
+const ID = ARX.param('id') || 'web-static-01';
+const VM = ARX.vm(ID);
+const HOST = VM && ARX.host(VM.hostId);
+const OFF = HOST && HOST.reachability === 'offline';
+const tplName = v => `${v.template.id} v${v.template.version}`;
+
+/* ---------- unknown id ---------- */
+function notFound() {
+  document.title = 'VM not found · Arxcovo';
+  $('#main').innerHTML = `<section class="tile s12 rise" style="--i:1"><div class="nf">
+    <a class="crumb" href="vms.html">${ico('i-back')}VMs</a>
+    <h1>Not found</h1>
+    <p>No VM with the id <span class="mono" style="color:#fff">${esc(ID)}</span>. Test VMs are destroyed when they expire, so an old link can end here.</p>
+    <a class="btn" href="vms.html">${ico('i-back')}Back to VMs</a></div></section>`;
+  $('#demo-strip').remove();
+}
+
+function page() {
+  const isStatic = VM.kind === 'static';
+  document.title = `${VM.name} · Arxcovo`;
+  const [si, sw] = STATE[VM.state], [og, oc, on] = OSG(VM.guestOs);
+  const showReady = ['running', 'snapshotting', 'migrating'].includes(VM.state);
+  const run = OFF
+    ? `<span class="btn" aria-disabled="true" role="link" tabindex="0" title="Host offline: ${esc(HOST.reachabilityReason)}">${ico('i-term')}Run command on ${esc(HOST.name)}<span class="vh">, unavailable: host offline</span></span>`
+    : `<a class="btn" href="terminal.html?host=${encodeURIComponent(HOST.id)}">${ico('i-term')}Run command on ${esc(HOST.name)}</a>`;
+
+  $('#main').innerHTML = `
+  <section class="tile s12 hero rise" style="--i:1" aria-labelledby="vname">
+    <div class="l">
+      <a class="crumb" href="vms.html"><svg class="i" style="width:14px;height:14px"><use href="#i-back"/></svg>VMs</a>
+      <h1 class="name" id="vname"><span class="kind ${VM.kind}" aria-hidden="true"></span><span title="${esc(VM.name)}">${esc(VM.name)}</span></h1>
+      <div class="meta">
+        <span class="kindw" style="font-size:11.5px">${VM.kind}</span><span class="sep" aria-hidden="true">·</span>
+        <span class="osg" style="--c:${oc}" title="${on}">${ico(og, '')}</span><span>${esc(VM.guestOsVersion)}</span><span class="arch">${VM.arch}</span><span class="sep" aria-hidden="true">·</span>
+        <span>on <a class="hl mono" href="host.html?id=${encodeURIComponent(HOST.id)}">${esc(HOST.name)}</a>${OFF ? ' <span class="st off">' + ico('i-off') + 'offline</span>' : ''}</span><span class="sep" aria-hidden="true">·</span>
+        <span class="st${VM.state === 'failed' ? ' bad' : VM.state === 'stopped' ? ' off' : ''}">${ico(si)}${sw}</span>
+        ${showReady ? `<span class="st${VM.ready ? '' : ' bad'}">${ico(VM.ready ? 'i-check' : 'i-warn')}${VM.ready ? 'ready' : 'guest not ready'}</span>` : ''}<span class="sep" aria-hidden="true">·</span>
+        <span>${isStatic ? 'never expires' : `expires in <span class="mono" data-left>${left(VM.expiresAt)}</span>`}</span>
+      </div>
+    </div>
+    <div class="r">
+      <div class="tpl">template <b>${esc(VM.template.id)}</b><span class="chip">v${VM.template.version}</span></div>
+      ${run}
+    </div>
+  </section>
+
+  <section class="tile s8 rise" style="--i:2" id="console" aria-labelledby="con-l">
+    <div class="con-head">
+      <div class="lab" id="con-l"><svg class="i"><use href="#i-monitor"/></svg>Console</div>
+      <span class="pill" id="con-pill" role="status" aria-live="polite"></span>
+      ${VM.state === 'snapshotting' ? `<span class="chip snapnote">${ico('i-cam')}snapshot in progress · frames may pause</span>` : ''}
+      <div class="r"><button type="button" class="btn sm" id="con-re"><svg class="i"><use href="#i-spin"/></svg>Reconnect</button></div>
+    </div>
+    <div class="screen-w">
+      <div class="screen" id="screen">
+        <svg id="frame" viewBox="0 0 1024 768" role="img" aria-label="Console frame"><rect width="1024" height="768" fill="#000"/></svg>
+        <div class="ovl" id="ovl" hidden></div>
+      </div>
+    </div>
+    <div class="con-meta" id="con-meta"></div>
+  </section>
+
+  ${isStatic ? obligationsHtml() : lifetimeHtml()}
+
+  <section class="tile s4 rise" style="--i:4" aria-labelledby="snap-l">
+    <div class="lab" id="snap-l"><svg class="i"><use href="#i-cam"/></svg>Snapshots<span class="r">${VM.snapshots.length}</span></div>
+    <div class="list" role="list">${VM.snapshots.length ? VM.snapshots.map(s => `<div class="li" role="listitem"><span class="ic">${ico('i-cam')}</span>
+      <span style="min-width:0"><span class="n" style="display:block">${esc(s.name)}</span><span class="sub">${s.createdAt == null ? '<span class="na">date unknown</span>' : ARX.fmtAgo(s.createdAt)}</span></span>
+      <span class="rt">${s.sizeBytes == null ? '<span class="na">size unknown</span>' : ARX.fmtBytes(s.sizeBytes)}</span></div>`).join('')
+      : `<p class="empty-l">No snapshots yet. Agents take them with snapshot_vm.</p>`}</div>
+  </section>
+
+  <section class="tile s3 rise" style="--i:5" aria-labelledby="res-l">
+    <div class="lab" id="res-l"><svg class="i"><use href="#i-cpu"/></svg>Resources</div>
+    <div class="res" id="res"></div>
+  </section>
+
+  <section class="tile s5 rise" style="--i:6" aria-labelledby="cmp-l">
+    <div class="lab" id="cmp-l"><svg class="i"><use href="#i-move"/></svg>Compatible hosts<span class="r"><span class="chip">migration · roadmap</span></span></div>
+    <div class="cmp" id="cmp" role="list"></div>
+    <div class="cmp-sum" id="cmp-sum"></div>
+  </section>
+
+  <section class="tile s12 rise" style="--i:7" aria-labelledby="act-l">
+    <div class="lab" id="act-l"><svg class="i"><use href="#i-act"/></svg>Activity for this VM<span class="r"><a href="activity.html?vm=${encodeURIComponent(VM.id)}" class="muted">All activity →</a></span></div>
+    <div class="acts" id="acts" role="list"></div>
+  </section>`;
+
+  $('#foot-note').textContent = isStatic ? "No delete control: static VMs can't be deleted by agents, and the dashboard offers none." : '';
+  if (isStatic) wireObligations(); else setInterval(() => { const t = left(VM.expiresAt); $$('[data-left]').forEach(e => e.textContent = t); }, 1000);
+  resources(); compat(); activity(); initConsole();
+}
+
+/* ---------- static VM obligations (health, backups, publish from vm.x) ---------- */
+function obligationsHtml() {
+  const x = VM.x, h = x.health, offWhy = OFF ? `<div class="why-off">${ico('i-off')}<span>Host offline: ${esc(HOST.reachabilityReason)}. Owner actions wait for it.</span></div>` : '';
+  const health = h.state === 'unknown'
+    ? `<span class="na" style="font-size:13px">unknown</span><span class="faint" style="font-size:12.5px">${OFF ? 'no checks while the host is offline' : 'no result yet'}</span>`
+    : `<span class="st" style="font-size:15px;color:#fff;font-weight:500"><svg class="i" style="width:15px;height:15px"><use href="#${h.state === 'passing' ? 'i-check' : 'i-warn'}"/></svg>${esc(h.state)}</span><span class="faint" style="font-size:12.5px">last check <span id="hc-ago">${ARX.fmtAgo(h.lastAt)}</span></span>`;
+  const bAgo = ARX.fmtAgo(x.backup.lastAt);
+  return `<section class="tile s4 rise" style="--i:3" aria-labelledby="ob-l">
+    <div class="lab" id="ob-l"><span class="kind static" aria-hidden="true"></span>Static VM obligations</div>
+    <div class="ob">
+      <div class="ob-h"><svg class="i"><use href="#i-heart"/></svg>Health check${APIMARK}</div>
+      <div class="ob-v">${health}</div>
+      <div class="ob-d"><span class="mono">${esc(h.check)}</span></div>
+    </div>
+    <div class="ob">
+      <div class="ob-h"><svg class="i"><use href="#i-backup"/></svg>Backups${APIMARK}</div>
+      <div class="ob-v"><span class="big">${bAgo ? bAgo.replace(' ago', '') : '–'}</span><span class="muted" style="font-size:12.5px">since last backup</span>
+        <button type="button" class="btn sm" id="restore-btn" style="margin-left:auto" ${OFF ? `aria-disabled="true" aria-describedby="off-why"` : ''}>Restore…</button></div>
+      <div class="ob-d">Keeps ${esc(x.backup.policy)}</div>
+      <div class="fence"><svg class="i"><use href="#i-shield"/></svg><span>Agents can't delete static VMs or backups. Agents may restore.</span></div>
+      <div class="toast" id="restore-toast" role="status" aria-live="polite"></div>
+    </div>
+    <div class="ob">
+      <div class="ob-h"><svg class="i"><use href="#i-globe"/></svg>Publishing${APIMARK}</div>
+      <div class="pubrow"><span class="st" id="pub-st"></span><span class="host mono" id="pub-host"></span>
+        <span class="sw-w"><button type="button" class="switch" role="switch" id="pub-sw" aria-checked="false" aria-label="Public publishing through Cloudflare Tunnel" ${OFF ? `aria-disabled="true" aria-describedby="off-why"` : ''}></button></span></div>
+      <div class="ob-d">Cloudflare Tunnel · default is off · turning it on is an owner action</div>
+      <div class="ob-d" id="pub-who"></div>
+      ${offWhy.replace('class="why-off"', 'class="why-off" id="off-why"')}
+    </div>
+  </section>`;
+}
+function wireObligations() {
+  const x = VM.x;
+  if (x.health.lastAt) setInterval(() => { const e = $('#hc-ago'); if (e) e.textContent = ARX.fmtAgo(x.health.lastAt); }, 5000);
+  /* restore: options derived from the last backup and the policy */
+  const rd = $('#restore-dlg'), rb = $('#restore-btn'), D = 864e5, last = Date.parse(x.backup.lastAt);
+  $('#rd-h').textContent = `Restore ${VM.name}?`;
+  $('#rd-opts').insertAdjacentHTML('beforeend', [['daily', 0], ['daily', D], ['daily', 2 * D], ['weekly', 7 * D]].map(([k, ms], i) => {
+    const ago = ARX.fmtAgo(new Date(last - ms).toISOString());
+    return `<label class="opt"><input type="radio" name="bk" value="${ago}" ${i ? '' : 'checked'}>${k}<span class="rt">${ago}</span></label>`; }).join(''));
+  rb.addEventListener('click', () => { if (rb.getAttribute('aria-disabled') !== 'true') rd.showModal(); });
+  rd.addEventListener('close', () => {
+    if (rd.returnValue === 'ok') { const v = rd.querySelector('input[name=bk]:checked').value; $('#restore-toast').textContent = `Mock: restore from the backup of ${v} would start here (restore is not in the API yet).`; }
+    rb.focus();
+  });
+  /* publish */
+  let published = x.publish.on;
+  const pd = $('#pub-dlg'), psw = $('#pub-sw'), hn = x.publish.hostname;
+  $('#pd-h').textContent = `Publish ${VM.name}?`;
+  $('#pd-p').innerHTML = hn ? `Anyone on the internet can reach <span class="mono" style="color:#fff">${esc(hn)}</span> through Cloudflare Tunnel. Publishing is off by default.`
+    : 'Anyone on the internet could reach this VM through Cloudflare Tunnel once a hostname is set. Publishing is off by default.';
+  function paintPub() {
+    psw.setAttribute('aria-checked', String(published));
+    $('#pub-st').innerHTML = published ? `${ico('i-globe')}on` : `${ico('i-off')}off`;
+    $('#pub-st').className = 'st' + (published ? '' : ' off');
+    $('#pub-host').textContent = hn || 'no public hostname';
+    $('#pub-host').classList.toggle('off', !published && !!hn); $('#pub-host').classList.toggle('faint', !hn);
+    $('#pub-who').textContent = published ? `Turned on by the ${x.publish.by || 'owner'} ${ARX.fmtAgo(x.publish.at) || ''}`.trim() : hn ? `Off: ${hn} no longer answers` : 'Off (default)';
+  }
+  psw.addEventListener('click', () => { if (psw.getAttribute('aria-disabled') === 'true') return; if (published) { published = false; paintPub(); } else pd.showModal(); });
+  pd.addEventListener('close', () => { if (pd.returnValue === 'ok') { published = true; paintPub(); } psw.focus(); });
+  paintPub();
+}
+
+/* ---------- test VM lifetime ---------- */
+function lifetimeHtml() {
+  const exp = new Date(VM.expiresAt);
+  return `<section class="tile s4 life rise" style="--i:3" aria-labelledby="life-l">
+    <div class="lab" id="life-l"><span class="kind test" aria-hidden="true"></span>Test VM lifetime</div>
+    <div class="life-n"><span class="hero-n" data-left>${left(VM.expiresAt)}</span><small>left</small></div>
+    <div class="life-d">Expires <b>${exp.toLocaleString([], {weekday:'short', hour:'2-digit', minute:'2-digit'})}</b> · destroyed automatically, even when stopped</div>
+    <div class="ob">
+      <div class="ob-h">${ico('i-vm')}Template</div>
+      <div class="ob-v"><span class="mono" style="font-size:14px">${esc(VM.template.id)}</span><span class="chip">v${VM.template.version}</span></div>
+    </div>
+    <div class="fence">${ico('i-bot')}<span>Agents create test VMs over MCP. The dashboard has no create button.</span></div>
+  </section>`;
+}
+
+/* ---------- resources ---------- */
+function resources() {
+  const cap = HOST.disk.capBytes;
+  const rows = [
+    ['vCPU', VM.cpus, '', VM.cpus / HOST.cpu.cores, `of ${HOST.cpu.cores} ${HOST.name} cores`],
+    ['RAM', ...split(VM.memoryBytes), VM.memoryBytes / HOST.memory.totalBytes, `of ${ARX.fmtBytes(HOST.memory.totalBytes)}`],
+    ['Disk', ...split(VM.diskBytes), VM.diskBytes / (cap ?? HOST.disk.totalBytes), cap != null ? `of ${ARX.fmtBytes(cap)} VM cap` : `of ${ARX.fmtBytes(HOST.disk.totalBytes)} · no VM cap`],
+  ];
+  $('#res').innerHTML = rows.map(([k, v, u, f, ofTxt], i) => `<div class="row"><div class="rtop">${v == null ? `<span class="na">${k}: unknown</span>` : `<b><span data-rv="${i}">0</span>${u ? `<small> ${u}</small>` : ''}</b><small>${k}</small>`}<span class="of">${ofTxt}</span></div>
+    <span class="bar" aria-hidden="true"><i data-w="${v == null ? 0 : Math.min(100, f * 100).toFixed(1)}"></i></span></div>`).join('');
+  const els = rows.map((r, i) => $(`[data-rv="${i}"]`));
+  countGroup(e => rows.forEach((r, i) => { if (!els[i]) return; const n = r[1] * e; els[i].textContent = Number.isInteger(r[1]) ? Math.round(n) : n.toFixed(1); }));
+  requestAnimationFrame(() => requestAnimationFrame(() => $$('.res i[data-w]').forEach(i => i.style.width = i.dataset.w + '%')));
+}
+
+/* ---------- compatible hosts: ARX.canMove, the same checker the board uses ---------- */
+function compat() {
+  const rows = [HOST, ...ARX.HOSTS.filter(h => h.id !== HOST.id)].map(h => [h, ARX.canMove(VM, h)]);
+  $('#cmp').innerHTML = rows.map(([h, m]) => { const [og, oc, on] = OSG(h.os);
+    return `<div role="listitem" data-host="${h.id}"><span><span class="osg" style="--c:${oc}" title="${on}">${ico(og, '')}</span></span><span><a class="hn" href="host.html?id=${encodeURIComponent(h.id)}">${esc(h.name)}</a></span><span><span class="arch">${h.arch}</span></span>
+      <span class="why${m.ok ? ' ok' : ''}">${ico(m.home ? 'i-run' : m.ok ? 'i-check' : 'i-ban')}<span>${m.ok ? '<span class="vh">compatible: </span>' : m.home ? '' : '<span class="vh">unavailable: </span>'}<span class="reason">${esc(m.reason)}</span>${m.note ? `<span class="note">${esc(m.note)}</span>` : ''}</span></span></div>`; }).join('');
+  const n = rows.filter(r => r[1].ok).length, others = rows.length - 1;
+  $('#cmp-sum').textContent = n ? `${n} of ${others} other hosts could take this VM.` : `No compatible host right now (0 of ${others}). Migration ships after v1; this list shows where it could go.`;
+}
+
+/* ---------- activity for this VM (ARX.ACTIVITY filtered by vmId) ---------- */
+function activity() {
+  const list = ARX.ACTIVITY.filter(a => a.vmId === VM.id);
+  $('#acts').innerHTML = list.length ? list.map(a => {
+    const [oi, ow, oc] = OUTCOME[a.outcome];
+    const ex = a.exitCode != null ? `<span class="ex">exit ${a.exitCode}</span>` : a.tool === 'run_command' && a.finishedAt ? '<span class="ex">no exit</span>' : '<span></span>';
+    const who = a.actor.kind === 'agent' ? `agent · <b>${esc(a.actor.name)}</b>` : a.actor.kind;
+    return `<div class="act" role="listitem"><span class="st ${oc}">${ico(oi)}${ow}</span><span class="tool-n">${esc(a.tool)}</span><span class="sum" title="${esc(a.summary)}">${esc(a.summary)}</span>
+      <span class="who">${ico(ACTOR[a.actor.kind])}${who}</span><a class="hst" href="host.html?id=${encodeURIComponent(a.hostId)}">${esc(a.hostId)}</a>${ex}<span class="w">${ARX.fmtAgo(a.startedAt)}</span></div>`;
+  }).join('') : `<p class="empty-l">No activity for this VM yet.</p>`;
+}
+
+/* ---------- console (view-only frames, ConsoleStream states) ---------- */
+const con = {status:'connecting', seq:0, at:null, times:[], timer:null, wait:null, title:'', reason:'', demo:'live', cursor:true, canRe:true};
+/* What the console does for this VM as it is: stream, wait, or stay closed with a reason. */
+function natural() {
+  if (OFF) return {status:'closed', title:'Console closed', reason:`Host offline: ${HOST.reachabilityReason}`, canRe:false};
+  if (VM.state === 'running' || VM.state === 'snapshotting') return {status:'streaming'};
+  if (VM.state === 'creating') return {status:'connecting', title:'Waiting for the VM', reason:`Creating from ${tplName(VM)}. Frames start once QEMU is up.`, canRe:false};
+  if (VM.state === 'failed') {
+    const f = ARX.ACTIVITY.find(a => a.vmId === VM.id && a.outcome === 'failed' && a.tool !== 'run_command');
+    return {status:'closed', title:'Console closed', reason:`VM failed: ${f ? f.summary : 'the VM stopped responding'}`, canRe:false};
+  }
+  if (VM.state === 'stopped') return {status:'closed', title:'Console closed', reason:'VM stopped: start it to see its console', canRe:false};
+  if (VM.state === 'migrating') return {status:'closed', title:'Console closed', reason:'VM migrating: the stream reopens on the new host', canRe:true};
+  return {status:'closed', title:'Console closed', reason:'VM is being destroyed', canRe:false};
+}
+function linuxFrame() {
+  const web = VM.id === 'web-static-01', deb = /Debian/.test(VM.guestOsVersion);
+  const L = web ? [
+    ['ok', 'Started docker.service - Docker Application Container Engine.'],
+    ['ok', 'Started containerd.service - containerd container runtime.'],
+    ['ok', 'Started ssh.service - OpenBSD Secure Shell server.'],
+    ['ok', 'Started cloudflared.service - Cloudflare Tunnel connector.'],
+    ['ok', 'Reached target multi-user.target - Multi-User System.'],
+  ] : [
+    ['ok', 'Started systemd-networkd.service - Network Configuration.'],
+    ['ok', 'Started ssh.service - OpenBSD Secure Shell server.'],
+    ['ok', 'Started arxcovo-guest.service - Arxcovo guest agent.'],
+    ['ok', 'Reached target multi-user.target - Multi-User System.'],
+  ];
+  let y = 44, out = '';
+  for (const [, t] of L) { out += `<text x="24" y="${y}"><tspan fill="#d0d0d0">[  </tspan><tspan fill="#6ac04a">OK</tspan><tspan fill="#d0d0d0">  ] ${esc(t)}</tspan></text>`; y += 24; }
+  y += 24;
+  const banner = deb ? `Debian GNU/Linux 12 ${VM.id} tty1` : `${VM.guestOsVersion}.1 LTS ${VM.id} tty1`;
+  out += `<text x="24" y="${y}" fill="#ffffff">${esc(banner)}</text>`; y += 48;
+  const prompt = `${VM.id} login: `;
+  out += `<text x="24" y="${y}" fill="#ffffff">${esc(prompt)}</text>`;
+  if (con.cursor) out += `<rect x="${24 + prompt.length * 9.6}" y="${y - 15}" width="10" height="18" fill="#e0e0e0"/>`;
+  return `<rect width="1024" height="768" fill="#000"/><g font-family="Geist Mono, Consolas, monospace" font-size="16">${out}</g>`;
+}
+function windowsFrame() {
+  const d = new Date(), t = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', hour12:false}), day = d.toLocaleDateString([], {weekday:'long', month:'long', day:'numeric'});
+  return `<defs><linearGradient id="wbg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0b1a2b"/><stop offset="1" stop-color="#020408"/></linearGradient></defs>
+    <rect width="1024" height="768" fill="url(#wbg)"/>
+    <g font-family="Geist, Segoe UI, sans-serif" fill="#fff" text-anchor="middle">
+      <text x="512" y="300" font-size="112" font-weight="600">${t}</text>
+      <text x="512" y="350" font-size="24" fill="#cfd8e3">${esc(day)}</text>
+      <text x="512" y="700" font-size="15" fill="#8fa3b8">${esc(VM.guestOsVersion)} · ${esc(VM.id)}${con.cursor ? '' : ' '}</text>
+    </g>`;
+}
+const frameSvg = () => VM.guestOs === 'windows' ? windowsFrame() : linuxFrame();
+function setOverlay() {
+  const o = $('#ovl'), sc = $('#screen');
+  if (con.status === 'streaming') { o.hidden = true; sc.classList.remove('dim'); return; }
+  const ic = {connecting:'i-spin', closed:'i-stop', error:'i-fail'}[con.status];
+  const title = con.title || {connecting:'Connecting…', closed:'Console closed', error:'Console error'}[con.status];
+  const reason = con.reason || (con.status === 'connecting' ? `Opening a view-only frame stream from QEMU on ${HOST.name}.` : '');
+  o.hidden = false; sc.classList.toggle('dim', con.seq > 0 || con.status !== 'connecting');
+  o.innerHTML = `${ico(ic + (con.status === 'connecting' ? '' : ''), 'i' + (con.status === 'connecting' ? ' sp' : ''))}<b>${esc(title)}</b><span>${esc(reason)}</span>${con.status !== 'connecting' && con.canRe ? '<button type="button" class="btn sm" data-re>Reconnect</button>' : ''}`;
+  o.querySelector('[data-re]')?.addEventListener('click', reconnect);
+}
+function fps() { const t = con.times; if (t.length < 2) return null; return (t.length - 1) / ((t[t.length - 1] - t[0]) / 1000); }
+function paintConsole() {
+  const P = {connecting:['i-spin', 'connecting', true], streaming:[null, 'streaming'], closed:['i-stop', 'closed'], error:['i-fail', 'error']}[con.status];
+  const pill = $('#con-pill'); pill.className = `pill ${con.status}`;
+  pill.innerHTML = (P[0] ? `<svg class="i${P[2] ? ' sp' : ''}" aria-hidden="true"><use href="#${P[0]}"/></svg>` : '<span class="pulse" aria-hidden="true"></span>') + P[1];
+  const f = fps();
+  $('#con-meta').innerHTML = `<span>seq <b>${con.seq || '–'}</b></span><span>capturedAt <b>${con.at ? con.at.toISOString().replace('T', ' ').slice(0, 23) + 'Z' : '–'}</b></span>
+    <span><b>${con.status === 'streaming' && f ? f.toFixed(1) : '–'}</b> fps</span><span>1024×768 · image/svg+xml · stand-in</span>
+    <span class="con-note">${ico('i-lock')}View only in v1 · interactive VNC later</span>`;
+  const re = $('#con-re');
+  if (con.canRe) { re.removeAttribute('aria-disabled'); re.removeAttribute('title'); }
+  else { re.setAttribute('aria-disabled', 'true'); re.title = con.reason; }
+  setOverlay();
+}
+function nextFrame() {
+  con.seq++; con.at = new Date(); con.cursor = !con.cursor;
+  con.times.push(performance.now()); if (con.times.length > 6) con.times.shift();
+  $('#frame').innerHTML = frameSvg();
+  $('#frame').setAttribute('aria-label', `Console frame ${con.seq} from ${VM.id}: ${VM.guestOs === 'windows' ? 'Windows lock screen' : 'text console at the login prompt'}`);
+  paintConsole();
+}
+function stopStream() { clearTimeout(con.timer); clearTimeout(con.wait); con.timer = con.wait = null; }
+function apply(s) { con.status = s.status; con.title = s.title || ''; con.reason = s.reason || ''; con.canRe = s.canRe !== false; }
+const DEMO = {
+  stopped: {status:'closed', title:'Console closed', reason:'The server closed the stream: the VM stopped.'},
+  error: {status:'error', title:'Console error', reason:'Frame metadata arrived twice in a row. The client treats that as a protocol error and closed the stream.'},
+};
+function connect() {
+  stopStream(); con.times = [];
+  if (con.demo === 'live') { const n = natural(); if (n.status === 'closed') { apply(n); paintConsole(); return; } }
+  apply({status:'connecting'}); paintConsole();
+  con.wait = setTimeout(() => {
+    const s = con.demo !== 'live' ? DEMO[con.demo] : natural();
+    if (s.status !== 'streaming') { apply(s); paintConsole(); return; }
+    apply(s); con.seq = 0; nextFrame();
+    const loop = () => { con.timer = setTimeout(() => { if (con.status !== 'streaming') return; nextFrame(); loop(); }, 560 + Math.random() * 220); };
+    loop();
+  }, reduce ? 300 : 1100);
+}
+function reconnect() {
+  if (!con.canRe && con.demo === 'live') return;
+  con.demo = 'live'; $$('[data-cs]').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.cs === 'live'))); connect(); $('#con-re').focus();
+}
+function initConsole() {
+  $('#con-re').addEventListener('click', () => { if ($('#con-re').getAttribute('aria-disabled') !== 'true') reconnect(); });
+  $$('[data-cs]').forEach(b => b.addEventListener('click', () => {
+    con.demo = b.dataset.cs; $$('[data-cs]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+    if (con.demo === 'live') { connect(); return; }
+    stopStream(); apply(DEMO[con.demo]); paintConsole();
+  }));
+  connect();
+}
+
+if (!VM) notFound(); else page();
+</script>
+</body>
+</html>

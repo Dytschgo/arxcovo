@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Arxcovo</title>
+<link rel="stylesheet" href="night-orbit.css">
+<script src="arx-data.js"></script>
+<style>
+body{min-height:100vh;display:grid;grid-template-rows:1fr auto;background:radial-gradient(70% 55% at 50% 38%,#0b0b0d,#000 70%) fixed,#000}
+.wrap{display:grid;place-items:center;padding:48px 16px 24px}
+.box{width:min(380px,100%);display:grid;justify-items:center}
+.logo.big{width:132px;height:132px}
+.logo.big .lg-a{stroke-width:2}
+.logo.big .lg-o{stroke-width:1.2}
+.logo.big .lg-c{stroke-width:1.8}
+.logo.big .lg-n{r:2.4px}
+.logo.big .lg-m,.logo.big .moon{r:1.3px}
+.wm{margin:22px 0 6px;font-size:30px;font-weight:600;letter-spacing:-.03em}
+.wm span{display:inline-block;opacity:0;transform:translateY(6px);animation:rise .5s var(--ease) forwards;animation-delay:calc(1.1s + var(--k)*45ms)}
+.lead{margin:0 0 28px;color:var(--ink3);font-size:14px}
+form{width:100%;display:grid;gap:14px}
+form[hidden],.hintl[hidden]{display:none}
+.input{width:100%;font-size:14px}
+.input[aria-invalid="true"]{border-color:#fff;border-style:dashed}
+.btn.primary{width:100%;justify-content:center;height:42px;margin-top:4px}
+.btn.primary[aria-busy="true"]{cursor:progress}
+.btn.primary[aria-busy="true"] svg{animation:spin 1s linear infinite}
+.msg{display:flex;align-items:flex-start;gap:10px;width:100%;padding:11px 13px;border:1px solid var(--line2);border-radius:12px;font-size:13px;color:var(--ink2);background:var(--tile)}
+.msg svg{margin-top:1px}
+.msg.bad{border-color:var(--line3);border-style:dashed;color:#fff}
+.msg b{font-weight:600;font-family:var(--mono)}
+.msg[hidden]{display:none}
+.hintl{display:flex;align-items:center;gap:8px;margin-top:18px;color:var(--ink3);font-size:12.5px}
+.hintl code{font:12px var(--mono);color:var(--ink2);border:1px solid var(--line2);border-radius:6px;padding:1px 6px}
+.so{width:100%;display:grid;gap:14px;justify-items:center;text-align:center}
+.so[hidden]{display:none}
+.so p{margin:0;color:var(--ink3);font-size:13.5px}
+.so .acts{display:flex;gap:8px}
+footer.ft{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 40px 20px;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink3)}
+footer.ft .spacer{flex:1}
+.demos{align-items:center;gap:6px;flex-wrap:wrap}
+.demos button{font-size:12px;color:var(--ink3);border:1px solid var(--line2);border-radius:var(--r-ctl);padding:3px 10px;transition:color .2s,border-color .2s}
+.demos button:hover{color:#fff;border-color:#666}
+.demos button[aria-pressed="true"]{color:#000;background:#fff;border-color:#fff}
+.served{display:inline-flex;align-items:center;gap:8px}
+</style>
+</head>
+<body>
+<main class="wrap">
+  <div class="box">
+    <svg class="logo big rise" id="mark" style="--i:0" viewBox="0 0 32 32" role="img" aria-label="Arxcovo"><defs><linearGradient id="lgo" gradientUnits="userSpaceOnUse" x1="3" y1="0" x2="29" y2="0"><stop offset="0" stop-color="#4cc2ff"/><stop offset=".5" stop-color="#b9b0e8"/><stop offset="1" stop-color="#f5a524"/></linearGradient></defs><path class="lg-a" pathLength="1" d="M7.5 27 L16 7 L24.5 27"/><g transform="rotate(-14 16 19.5)"><ellipse class="lg-o" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/><ellipse class="lg-c" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/><circle class="moon" r="1.3" fill="#fff" opacity="0"><animateMotion dur="9s" begin="2s" repeatCount="indefinite" path="M29 19.5 A13 4.4 0 1 1 3 19.5 A13 4.4 0 1 1 29 19.5"/><set attributeName="opacity" to="1" begin="2s" fill="freeze"/></circle></g><circle class="lg-n" cx="16" cy="7" r="2.9"/><circle class="lg-m" cx="28.6" cy="16.35" r="1.9"><set attributeName="opacity" to="0" begin="2s" fill="freeze"/></circle></svg>
+
+    <div class="wm" aria-hidden="true"></div>
+    <h1 class="vh">Sign in to Arxcovo</h1>
+    <p class="lead rise" style="--i:2">Sign in to this cluster</p>
+
+    <p class="msg rise" id="notice" style="--i:3" role="status" hidden></p>
+
+    <form id="f" class="rise" style="--i:3" method="post" action="#" novalidate>
+      <p class="msg bad" id="err" role="alert" hidden></p>
+      <div class="field"><label for="u">Username</label>
+        <input class="input" id="u" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" value="owner" required></div>
+      <div class="field"><label for="p">Password</label>
+        <input class="input" id="p" name="password" type="password" autocomplete="current-password" maxlength="1024" required></div>
+      <button class="btn primary" id="go" type="submit"><svg class="i"><use href="#i-lock"/></svg><span>Sign in</span></button>
+    </form>
+
+    <section class="so" id="so" hidden aria-labelledby="so-h">
+      <p class="msg bad" role="alert" id="so-msg"><svg class="i"><use href="#i-warn"/></svg><span><strong id="so-h">Sign-out failed.</strong> You are still signed in as <b>owner</b>; the session may still be active.</span></p>
+      <div class="acts">
+        <button class="btn primary sm" id="retry" type="button" style="width:auto;height:34px;margin:0"><svg class="i"><use href="#i-signout"/></svg><span>Retry sign-out</span></button>
+        <a class="btn sm" href="board.html" style="height:34px"><svg class="i"><use href="#i-back"/></svg>Back to dashboard</a>
+      </div>
+    </section>
+
+    <p class="hintl rise" id="hint" style="--i:4"><svg class="i"><use href="#i-term"/></svg>Reset the password on the host with <code title="arxd dashboard-password">arxd</code></p>
+  </div>
+</main>
+
+<footer class="ft rise" style="--i:5">
+  <span class="served"><span class="pulse"></span>served by <b style="color:var(--ink2);font-weight:500">atlas</b></span>
+  <span class="spacer"></span>
+  <nav class="demos demo-flex" data-demo aria-label="Demo states">
+    <span class="faint">Demo</span>
+    <button type="button" data-state="wrong" aria-pressed="false">Wrong credentials</button>
+    <button type="button" data-state="throttled" aria-pressed="false">Throttled</button>
+    <button type="button" data-state="expired" aria-pressed="false">Session expired</button>
+    <button type="button" data-state="ended" aria-pressed="false">Session ended</button>
+    <button type="button" data-state="signedout" aria-pressed="false">Signed out</button>
+    <button type="button" data-state="signout" aria-pressed="false">Sign-out failed</button>
+    <button type="button" data-state="reset" aria-pressed="false">Reset</button>
+  </nav>
+  <span class="mock">Mock data</span>
+</footer>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+  <symbol id="i-spin" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-3-6.2"/><path d="M20 4v4h-4"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18h.01"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
+  <symbol id="i-signout" viewBox="0 0 24 24"><path d="M14 4h5v16h-5M10 16l-4-4 4-4M6 12h10"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-off" viewBox="0 0 24 24"><path d="M3 3l18 18M8.5 8.5A5 5 0 0 0 12 17h4M17 7h-3"/></symbol>
+</svg>
+
+<script>
+const $ = s => document.querySelector(s);
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)');
+const mark = $('#mark');
+function motion(){ if (REDUCED.matches){ mark.pauseAnimations(); mark.setCurrentTime(0); } else mark.unpauseAnimations(); }
+motion(); REDUCED.addEventListener('change', motion);
+
+$('.wm').innerHTML = [...'arxcovo'].map((c,k)=>`<span style="--k:${k}">${c}</span>`).join('');
+
+const WRONG = 'Wrong username or password.';           // identical for either field
+let mode = 'ok', busy = false, cd = null, attempts = 0;
+/* every pending timeout (submit answer, post-sign-in redirect, sign-out retry) is tracked so a demo switch can cancel it */
+let pending = [];
+const later = (fn, ms) => { const t = setTimeout(() => { pending = pending.filter(x => x !== t); fn(); }, ms); pending.push(t); return t; };
+function cancelPending(){
+  pending.forEach(clearTimeout); pending = [];
+  const r = $('#retry'); r.disabled = false; r.removeAttribute('aria-busy'); r.innerHTML = `${icon('i-signout')}<span>Retry sign-out</span>`;
+}
+const f = $('#f'), u = $('#u'), p = $('#p'), go = $('#go'), err = $('#err'), note = $('#notice');
+
+function icon(id){ return `<svg class="i"><use href="#${id}"/></svg>`; }
+function setErr(html){ err.hidden = !html; err.innerHTML = html || ''; p.setAttribute('aria-invalid', html ? 'true' : 'false'); }
+function setNote(html){ note.hidden = !html; note.innerHTML = html || ''; }
+function setBusy(b, label){
+  busy = b; go.setAttribute('aria-busy', b ? 'true' : 'false'); go.disabled = b || cd !== null;
+  u.readOnly = p.readOnly = b;
+  go.innerHTML = b ? `${icon('i-spin')}<span>${label || 'Signing in…'}</span>` : `${icon('i-lock')}<span>Sign in</span>`;
+}
+function throttle(sec){
+  clearInterval(cd); let left = sec;
+  const draw = () => setErr(`${icon('i-clock')}<span>Too many attempts, try again in <b>${left} s</b></span>`);
+  draw(); cd = setInterval(() => {
+    left--; if (left <= 0){ clearInterval(cd); cd = null; setErr(null); setBusy(false); p.focus(); return; }
+    draw();
+  }, 1000);
+  setBusy(false);
+}
+
+f.addEventListener('submit', e => {
+  e.preventDefault();
+  if (busy || cd !== null) return;
+  if (!u.value || !p.value){ setErr(`${icon('i-warn')}<span>Enter the username and password.</span>`); (u.value ? p : u).focus(); return; }
+  setErr(null); setBusy(true);
+  const m = mode;                                         // the answer belongs to the state the submit was sent in
+  later(() => {
+    if (m === 'wrong'){
+      attempts++; setBusy(false); setErr(`${icon('i-warn')}<span>${WRONG}</span>`); p.value = ''; p.focus();
+      if (attempts >= 5) throttle(30);
+    } else if (m === 'throttled'){
+      throttle(30);                                       // 429
+    } else {
+      setBusy(true, 'Signed in'); go.innerHTML = `${icon('i-check')}<span>Signed in</span>`;
+      later(() => { location.href = 'board.html'; }, 500);
+    }
+  }, 900);
+});
+
+function demo(which){
+  document.querySelectorAll('.demos button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.state === which && which !== 'reset')));
+  cancelPending(); clearInterval(cd); cd = null; setBusy(false); setErr(null); setNote(null);
+  f.hidden = false; $('#so').hidden = true; $('#hint').hidden = false;
+  mode = 'ok';
+  if (which === 'wrong'){ mode = 'wrong'; p.value = 'not-the-password'; f.requestSubmit(); }
+  else if (which === 'throttled'){ mode = 'throttled'; p.value = 'another-try'; f.requestSubmit(); }
+  else if (which === 'expired'){ setNote(`${icon('i-clock')}<span>You were signed out after 12 h idle.</span>`); p.value = ''; p.focus(); }
+  else if (which === 'ended'){ setNote(`${icon('i-off')}<span>Your session ended. Sign in again.</span>`); p.value = ''; p.focus(); }
+  else if (which === 'signedout'){ setNote(`${icon('i-check')}<span>Signed out.</span>`); p.value = ''; p.focus(); }
+  else if (which === 'signout'){ f.hidden = true; $('#hint').hidden = true; $('#so').hidden = false; $('#retry').focus(); }
+  else { p.value = ''; p.focus(); }
+}
+document.querySelector('.demos').addEventListener('click', e => { const b = e.target.closest('button[data-state]'); if (b) demo(b.dataset.state); });
+
+$('#retry').addEventListener('click', () => {
+  const r = $('#retry'); r.disabled = true; r.setAttribute('aria-busy','true');
+  r.innerHTML = `${icon('i-spin')}<span>Signing out…</span>`; r.querySelector('svg').style.animation = 'spin 1s linear infinite';
+  later(() => {                                           // DELETE answered 204: now signed out
+    $('#so').hidden = true; f.hidden = false; $('#hint').hidden = false;
+    r.disabled = false; r.removeAttribute('aria-busy'); r.innerHTML = `${icon('i-signout')}<span>Retry sign-out</span>`;
+    setNote(`${icon('i-check')}<span>Signed out.</span>`); p.value = ''; p.focus();
+    document.querySelectorAll('.demos button').forEach(b => b.setAttribute('aria-pressed','false'));
+  }, 900);
+});
+
+const st = new URLSearchParams(location.search).get('state');
+if (['wrong','throttled','expired','ended','signedout','signout'].includes(st)) demo(st); else p.focus();
+</script>
+</body>
+</html>

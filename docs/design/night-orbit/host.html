@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arxcovo Host</title>
+<link rel="stylesheet" href="night-orbit.css">
+<script src="arx-data.js"></script>
+<style>
+.bento{margin-top:10px}
+/* hero */
+.hero{display:flex;flex-direction:column}
+.crumb{display:inline-flex;align-items:center;gap:6px;color:var(--ink3);font-size:13px;align-self:flex-start}
+.crumb:hover{color:#fff}
+.name{font-size:84px;font-weight:600;letter-spacing:-.045em;line-height:1;margin:18px 0 12px;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.meta{display:flex;align-items:center;gap:8px;color:var(--ink3);font-size:13.5px;flex-wrap:wrap}
+.meta .sep{color:var(--ink4)}
+.reason[hidden]{display:none}
+.reason{display:flex;align-items:center;gap:8px;color:#fff}
+.reason svg{width:14px;height:14px}
+.actions{display:flex;align-items:center;gap:12px;margin-top:auto;padding-top:22px;flex-wrap:wrap}
+.actions .note{color:var(--ink3);font-size:12.5px}
+/* cpu */
+.cpu-top{display:flex;align-items:flex-end;gap:18px;margin-top:10px;flex-wrap:wrap}
+.big{font-size:56px;font-weight:600;letter-spacing:-.04em;line-height:1}
+.big small{font-size:22px;color:var(--ink3);font-weight:500;margin-left:2px}
+.big-sub{color:var(--ink3);font-size:12.5px;padding-bottom:6px}
+.big-na{display:flex;align-items:center;gap:10px;height:56px;color:var(--ink2);font-size:14px}
+.big-na::before{content:"";width:64px;height:30px;border-radius:6px;background:var(--hatch)}
+.hist-head{display:flex;align-items:center;gap:14px;margin-left:auto;padding-bottom:4px;flex-wrap:wrap}
+.mini{color:var(--ink3);font-size:12.5px}
+.mini b{color:#fff;font-weight:600;font-size:15px;margin-left:4px}
+.chart{position:relative;height:140px;margin-top:14px}
+.chart svg{display:block;width:100%;height:100%;overflow:visible}
+.chart .ln{fill:none;stroke:var(--lin);stroke-width:2;stroke-linejoin:round;stroke-dasharray:1;animation:draw 1.6s cubic-bezier(.45,0,.2,1) .4s both}
+.chart .fl{animation:fade 1s ease 1.4s both}
+@keyframes fade{from{opacity:0}}
+.chart .gl{stroke:#141414}
+.chart.done .ln,.chart.done .fl{animation:none}
+.chart .dim{fill:rgba(0,0,0,.66);transition:x .15s,width .15s}
+.chart .edge{stroke:#fff;stroke-opacity:.5;stroke-dasharray:2 3}
+.chart.nodata{background:var(--hatch);border-radius:8px}
+.brush{position:relative;height:24px;margin-top:10px;border-top:1px solid var(--line)}
+.brush .band{position:absolute;top:7px;height:10px;border-radius:5px;background:rgba(255,255,255,.14);border:1px solid #555}
+.brush .h{position:absolute;top:3px;width:12px;height:18px;border-radius:5px;background:#fff;transform:translateX(-50%);cursor:ew-resize;touch-action:none}
+.brush .h:focus-visible{outline-offset:2px}
+.axis{display:flex;justify-content:space-between;color:var(--ink4);font:11px var(--mono);margin-top:4px}
+.winread{margin-top:6px;color:var(--ink3);font:11.5px var(--mono)}
+/* rings */
+.ring-w{display:flex;align-items:center;gap:16px;margin-top:14px}
+.gauge{width:104px;height:104px;flex:none;overflow:visible}
+.gauge circle{fill:none}
+.gauge .bg{stroke:#161616;stroke-width:7}
+.gauge .fg{stroke:#fff;stroke-width:7;stroke-linecap:round;transform:rotate(-90deg);transform-origin:50% 50%;stroke-dasharray:0 264;transition:stroke-dasharray 1.3s var(--ease)}
+.gauge .ibg{stroke:#121212;stroke-width:4}
+.gauge .ifg{stroke:var(--ink3);stroke-width:4;stroke-linecap:round;transform:rotate(-90deg);transform-origin:50% 50%;stroke-dasharray:0 214;transition:stroke-dasharray 1.3s var(--ease) .2s}
+.gauge .capt{stroke:#fff;stroke-width:2.5}
+.gauge .rsv{stroke:#5a5a5a;stroke-width:7;stroke-dasharray:2 2.4;transform:rotate(-90deg);transform-origin:50% 50%}
+.gv b{display:block;font-size:30px;font-weight:600;letter-spacing:-.03em;line-height:1}
+.gv b small{font-size:15px;color:var(--ink3);font-weight:500}
+.gv>span{display:block;color:var(--ink3);font-size:12.5px;margin-top:3px}
+.legend{display:grid;gap:5px;margin-top:14px;font-size:12px;color:var(--ink3)}
+.legend div{display:flex;align-items:center;gap:7px}
+.legend b{color:var(--ink2);font-weight:500;font-family:var(--mono);font-size:11.5px;margin-left:auto}
+.sw{width:12px;height:4px;border-radius:2px;flex:none}
+.sw.tick{width:3px;height:12px;background:var(--lin)}
+.sw.rs{background:repeating-linear-gradient(90deg,#5a5a5a 0 2px,transparent 2px 4px)}
+.na-big{display:flex;flex-direction:column;gap:6px}
+/* facts */
+.facts{margin:12px 0 0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 28px}
+.facts div{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px}
+.facts dt{color:var(--ink3)}
+.facts dd{margin:0 0 0 auto;font-family:var(--mono);font-size:12.5px;color:var(--ink2);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hint{position:relative;display:inline-grid;place-items:center;width:18px;height:18px;border:1px solid var(--line2);border-radius:50%;color:var(--ink3);font:11px var(--mono)}
+.hint:hover,.hint[aria-expanded="true"]{color:#fff;border-color:#666}
+.tip{position:absolute;z-index:20;left:0;top:calc(100% + 8px);width:300px;padding:10px 12px;border:1px solid var(--line2);border-radius:10px;background:#0e0e0e;color:var(--ink2);font:12.5px/1.45 var(--font);text-align:left;box-shadow:0 14px 30px rgba(0,0,0,.6)}
+.tip b{color:#fff;font-weight:500}
+/* vms */
+.vms{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;margin-top:14px}
+.card .c3 .st{font-size:12px}
+.card .c3 svg{width:12px;height:12px}
+.card .arch{margin-left:auto}
+.card .c2 .kindw{flex:none}
+.card .c2 .gtx{overflow:hidden;text-overflow:ellipsis}
+.card .slots .chip.api{padding:0 6px;font-size:10px;margin-left:auto}
+.alloc{display:grid;gap:10px;margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}
+.alloc .ah{color:var(--ink3);font-size:12px}
+.alloc .row{display:grid;grid-template-columns:70px 1fr 180px;align-items:center;gap:12px;font-size:12.5px;color:var(--ink3)}
+.alloc .bar{height:4px;border-radius:2px;background:var(--line2);overflow:hidden}
+.alloc .bar i{display:block;height:100%;width:0;background:#fff;transition:width 1.2s var(--ease) .5s}
+.alloc .row b{font:500 12px var(--mono);color:var(--ink2);text-align:right}
+/* tools */
+.tools{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
+.tool{display:grid;justify-items:center;gap:4px;padding:9px 4px 8px;border:1px solid var(--line);border-radius:12px;font-size:12.5px;transition:border-color .2s,transform .25s var(--ease)}
+.tool:hover{border-color:#333;transform:translateY(-2px)}
+.tool svg{width:18px;height:18px;color:var(--ink2)}
+.tool small{color:var(--ink3);font:10.5px var(--mono)}
+.tool small.unk{color:var(--ink4);font-style:italic}
+.tool.more{color:var(--ink2);font:500 15px var(--mono);align-content:center}
+.tool.more small{font:11px var(--font)}
+.empty{display:grid;justify-items:center;gap:8px;padding:28px 10px;margin-top:14px;border:1px dashed var(--line2);border-radius:12px;text-align:center;color:var(--ink3);font-size:13px}
+.empty svg{width:22px;height:22px;color:var(--ink3)}
+.empty b{color:var(--ink2);font-weight:500}
+/* activity */
+.acts{margin-top:8px}
+.act{display:grid;grid-template-columns:118px 120px minmax(0,1fr) 190px 140px 64px 76px;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}
+.act:last-child{border-bottom:0}
+.act .tool-n{font:500 12.5px var(--mono);color:#fff}
+.act .sum{color:var(--ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.act .who{display:flex;align-items:center;gap:6px;color:var(--ink3);font-size:12.5px;white-space:nowrap;overflow:hidden}
+.act .who b{color:var(--ink2);font-weight:500}
+.act .vm{font:12px var(--mono);color:var(--ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.act a.vm:hover{color:#fff;text-decoration:underline}
+.act .ex{font:11.5px var(--mono);color:var(--ink3)}
+.act .w{text-align:right;color:var(--ink3);font:11.5px var(--mono)}
+.foot .demo{display:flex;align-items:center;gap:10px;margin-left:auto}
+.reason{margin-top:14px;padding:10px 12px;border:1px solid var(--line3);border-left:2px solid #fff;border-radius:10px;background:var(--tile2);font-size:13.5px;align-items:flex-start}
+.reason svg{margin-top:2px}
+.reason b{font-weight:600;margin-right:8px}
+.reason.offline{border-left-color:var(--ink3);color:var(--ink2)}
+.chart .ln{stroke:var(--c,var(--lin))}
+.gauge.stale .fg{stroke:var(--ink2)}
+a.tool{color:inherit}
+.vms .vm-empty{grid-column:1/-1;margin-top:0}
+.nf{display:grid;justify-items:center;gap:10px;padding:64px 20px;text-align:center}
+.nf .ring{width:48px;height:48px;border:1px dashed var(--line3);border-radius:50%;display:grid;place-items:center;color:var(--ink3)}
+.nf h1{margin:4px 0 0;font-size:24px;letter-spacing:-.02em}
+.nf p{margin:0 0 8px;color:var(--ink3);font-size:13.5px}
+.acts .empty{margin-top:6px}
+.card .c3{flex-wrap:wrap;row-gap:4px}
+#disk-f{white-space:nowrap}
+.foot .demo label{display:flex;align-items:center;gap:8px;cursor:pointer}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="win" viewBox="0 0 16 16"><path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z" fill="currentColor"/></symbol>
+  <symbol id="lin" viewBox="0 0 16 16"><path d="M5 3v10h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-hosts" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
+  <symbol id="i-vm" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
+  <symbol id="i-act" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-move" viewBox="0 0 24 24"><path d="M4 8h13l-3-3M20 16H7l3 3"/></symbol>
+  <symbol id="i-run" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-spin" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-3-6.2"/><path d="M20 4v4h-4"/></symbol>
+  <symbol id="i-fail" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-swap" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18h.01"/></symbol>
+  <symbol id="i-off" viewBox="0 0 24 24"><path d="M3 3l18 18M8.5 8.5A5 5 0 0 0 12 17h4M17 7h-3"/></symbol>
+  <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5l11 7-11 7z"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M3 12h4l2-4 4 8 2-4h6"/></symbol>
+  <symbol id="i-backup" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.6"/><path d="M4 4v4h4M12 8v4l3 2"/></symbol>
+  <symbol id="i-cam" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></symbol>
+  <symbol id="i-bot" viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="11" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01"/></symbol>
+  <symbol id="i-cog" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+  <symbol id="i-mem" viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="10" rx="2"/><path d="M7 17v3M12 17v3M17 17v3"/></symbol>
+  <symbol id="i-disk" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
+  <symbol id="i-signout" viewBox="0 0 24 24"><path d="M14 4h5v16h-5M10 16l-4-4 4-4M6 12h10"/></symbol>
+  <!-- page icons -->
+  <symbol id="i-git" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="9" r="2"/><path d="M6 8v8M18 11c0 4-6 3-10 6"/></symbol>
+  <symbol id="i-box" viewBox="0 0 24 24"><path d="M3 8l9-5 9 5v8l-9 5-9-5z"/><path d="M3 8l9 5 9-5M12 13v8"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></symbol>
+  <symbol id="i-chip" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
+  <symbol id="i-hex" viewBox="0 0 24 24"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M9 12h6"/></symbol>
+  <symbol id="i-crate" viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M3 10h18M9 6V3h6v3"/></symbol>
+  <symbol id="i-py" viewBox="0 0 24 24"><path d="M12 3c-4 0-4 2-4 3v2h5M12 21c4 0 4-2 4-3v-2h-5"/><path d="M8 8H6c-2 0-3 1.5-3 4s1 4 3 4h2M16 16h2c2 0 3-1.5 3-4s-1-4-3-4h-2"/></symbol>
+  <symbol id="i-find" viewBox="0 0 24 24"><circle cx="10" cy="10" r="6"/><path d="M20 20l-5.5-5.5"/></symbol>
+  <symbol id="i-wrench" viewBox="0 0 24 24"><path d="M14 6a4 4 0 0 0 5 5l-8 8a2 2 0 0 1-3-3l8-8a4 4 0 0 0-2-2z"/></symbol>
+</svg>
+
+<div class="page">
+  <header class="top rise" style="--i:0">
+    <a class="brand" href="board.html" aria-label="Arxcovo home">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="lgo" gradientUnits="userSpaceOnUse" x1="3" y1="0" x2="29" y2="0"><stop offset="0" stop-color="#4cc2ff"/><stop offset=".5" stop-color="#b9b0e8"/><stop offset="1" stop-color="#f5a524"/></linearGradient></defs><path class="lg-a" pathLength="1" d="M7.5 27 L16 7 L24.5 27"/><g transform="rotate(-14 16 19.5)"><ellipse class="lg-o" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/><ellipse class="lg-c" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/></g><circle class="lg-n" cx="16" cy="7" r="2.9"/><circle class="lg-m" cx="28.2" cy="16.3" r="1.9"/></svg>
+      arxcovo
+    </a>
+    <nav class="nav" aria-label="Main">
+      <a href="board.html" aria-current="page"><svg class="i"><use href="#i-hosts"/></svg>Hosts</a>
+      <a href="vms.html" aria-label="VMs"><svg class="i"><use href="#i-vm"/></svg></a>
+      <a href="terminal.html" aria-label="Terminal"><svg class="i"><use href="#i-term"/></svg></a>
+      <a href="activity.html" aria-label="Activity"><svg class="i"><use href="#i-act"/></svg></a>
+    </nav>
+    <span class="spacer"></span>
+    <span class="sync" title="Every host serves this dashboard"><span class="pulse"></span>served by <b>atlas</b> · synced</span>
+    <label class="search"><svg class="i"><use href="#i-search"/></svg><input type="search" placeholder="Search hosts, VMs, tools" aria-label="Search"><kbd>/</kbd></label>
+    <a class="me" href="login.html?state=signedout" title="Sign out"><svg class="i"><use href="#i-signout"/></svg><span class="vh">Sign out</span></a>
+  </header>
+
+  <main class="bento">
+    <!-- hero -->
+    <section class="tile s5 hero rise" style="--i:1" aria-labelledby="hname">
+      <a class="crumb" href="board.html"><svg class="i" style="width:14px;height:14px"><use href="#i-back"/></svg>Hosts</a>
+      <h1 class="name" id="hname"></h1>
+      <div class="meta" id="hmeta"></div>
+      <div class="reason" id="hreason" hidden></div>
+      <div class="actions" id="hact"></div>
+    </section>
+
+    <!-- cpu -->
+    <section class="tile s7 rise" style="--i:2" aria-labelledby="cpu-l">
+      <div class="lab" id="cpu-l"><svg class="i"><use href="#i-cpu"/></svg>CPU<span class="r" id="cpu-model"></span></div>
+      <div class="cpu-top">
+        <div id="cpu-now"></div>
+        <div class="hist-head">
+          <span class="chip api" id="hist-chip" title="No history endpoint exists; cpu.usedPercent is one nullable sample">needs API: cpu history</span>
+          <span class="mini">avg<b id="avg">–</b></span>
+          <span class="mini">peak<b id="peak">–</b></span>
+          <div class="seg" role="group" aria-label="History range"><button type="button" aria-pressed="false" data-h="1">1h</button><button type="button" aria-pressed="false" data-h="6">6h</button><button type="button" aria-pressed="true" data-h="24">24h</button></div>
+        </div>
+      </div>
+      <div class="chart" id="chart"></div>
+      <div class="brush" id="brush">
+        <div class="band" id="band"></div>
+        <div class="h" id="h0" tabindex="0" role="slider" aria-label="Window start" aria-describedby="winread"></div>
+        <div class="h" id="h1" tabindex="0" role="slider" aria-label="Window end" aria-describedby="winread"></div>
+      </div>
+      <div class="axis" aria-hidden="true"><span>-24 h</span><span>-18 h</span><span>-12 h</span><span>-6 h</span><span>now</span></div>
+      <div class="winread" id="winread" aria-live="polite"></div>
+    </section>
+
+    <!-- memory -->
+    <section class="tile s3 rise" style="--i:3" aria-labelledby="mem-l">
+      <div class="lab" id="mem-l"><svg class="i"><use href="#i-mem"/></svg>Memory</div>
+      <div id="mem-body"></div>
+    </section>
+
+    <!-- disk -->
+    <section class="tile s3 rise" style="--i:4" aria-labelledby="disk-l">
+      <div class="lab" id="disk-l"><svg class="i"><use href="#i-disk"/></svg>Disk</div>
+      <div id="disk-body"></div>
+    </section>
+
+    <!-- facts -->
+    <section class="tile s6 rise" style="--i:5" aria-labelledby="facts-l">
+      <div class="lab" id="facts-l">Facts</div>
+      <dl class="facts" id="facts"></dl>
+    </section>
+
+    <!-- vms -->
+    <section class="tile s7 rise" style="--i:6" aria-labelledby="vms-l">
+      <div class="lab" id="vms-l"><svg class="i"><use href="#i-vm"/></svg>VMs<span class="r" id="vms-r"></span></div>
+      <div class="vms" id="vms"></div>
+      <div class="alloc" id="alloc"></div>
+    </section>
+
+    <!-- tools -->
+    <section class="tile s5 rise" style="--i:7" aria-labelledby="tools-l">
+      <div class="lab" id="tools-l"><svg class="i"><use href="#i-box"/></svg>Tools<span class="r" id="tools-r"></span></div>
+      <div id="tools"></div>
+    </section>
+
+    <!-- activity -->
+    <section class="tile s12 rise" style="--i:8" aria-labelledby="act-l">
+      <div class="lab" id="act-l"><svg class="i"><use href="#i-act"/></svg><span id="act-t">Activity</span><span class="r"><a href="activity.html" id="act-all" class="muted">All activity →</a></span></div>
+      <div class="acts" id="acts" role="list"></div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span class="faint">Mock data · ◇ = field the API doesn't have yet</span>
+    <div class="demo demo-flex" data-demo role="group" aria-label="Demo">
+      <span class="faint">Demo</span>
+      <label><button type="button" class="switch" role="switch" aria-checked="false" id="d-off" aria-label="Host offline"></button>host offline</label>
+      <label><button type="button" class="switch" role="switch" aria-checked="false" id="d-long" aria-label="Long host id"></button>long id</label>
+      <div class="seg" role="group" aria-label="Tools list"><button type="button" aria-pressed="true" data-tools="many">host's tools</button><button type="button" aria-pressed="false" data-tools="none">no tools</button></div>
+    </div>
+  </footer>
+</div>
+
+<script>
+/* Night Orbit R4 host detail: parametric on ?id= over ARX.HOSTS (default atlas). All data comes from arx-data.js. */
+const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const ico = (id, cls = 'i') => `<svg class="${cls}" aria-hidden="true"><use href="#${id}"/></svg>`;
+const AM = '<span class="apimark" title="Not in the API yet">◇</span>';
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const STATE = {creating:['i-spin','Creating'],running:['i-run','Running'],stopped:['i-stop','Stopped'],snapshotting:['i-spin','Snapshotting'],migrating:['i-move','Migrating'],failed:['i-fail','Failed'],destroying:['i-trash','Destroying']};
+const OUTCOME = {started:['i-spin','started',''],succeeded:['i-check','succeeded',''],failed:['i-fail','failed','bad'],rejected:['i-ban','rejected','bad'],refused:['i-shield','refused','bad'],interrupted:['i-pause','interrupted','bad']};
+const ACTOR = {agent:'i-bot',owner:'i-user',system:'i-cog'};
+const REACH = {online:['i-run','Online',''],degraded:['i-warn','Degraded','bad'],offline:['i-off','Offline','off']};
+const TOOL_ICON = {git:'i-git',docker:'i-box',podman:'i-box',compose:'i-layers',qemu:'i-chip',node:'i-hex',cargo:'i-crate',python:'i-py',rg:'i-find'};
+const OS_HEX = {windows:'#4cc2ff', linux:'#f5a524'};
+const osGlyph = (os, extra = '') => `<span class="osg" style="--c:${ARX.OS_COLOR[os]};${extra}" title="${ARX.OS_LABEL[os]}">${ico(os === 'windows' ? 'win' : 'lin', '')}</span>`;
+
+/* byte counters: count in the unit and rounding of the final value, so the last frame equals ARX.fmtBytes */
+const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+function unitFor(final) {
+  let i = 0, n = final; while (n >= 1024 && i < UNITS.length - 1) { n /= 1024; i++; }
+  const dec = !(n >= 100 || Number.isInteger(n));
+  return {u: UNITS[i], num: b => { const v = b / 1024 ** i; return dec ? v.toFixed(1) : String(Math.round(v)); }};
+}
+/* count a group of related numbers from one shared progress value, so they never disagree mid-count */
+function countGroup(apply, dur = 1100, delay = 350) {
+  if (reduce) { apply(1); return; }
+  apply(0); const t0 = performance.now() + delay;
+  (function f(t) { const p = Math.max(0, Math.min(1, (t - t0) / dur)), e = 1 - Math.pow(1 - p, 3); apply(e); if (p < 1) requestAnimationFrame(f); })(performance.now());
+}
+
+/* ---------- which host ---------- */
+const ID = ARX.param('id') || 'atlas';
+const BASE = ARX.host(ID);
+const myVms = BASE ? ARX.vmsOn(BASE.id) : [];
+const demo = {offline: false, long: false, tools: 'many'};
+function host() {
+  const h = structuredClone(BASE);
+  if (demo.long) h.name = 'atlas-rack2-build-x86-primary-0042-lab-west';
+  if (demo.offline && h.reachability !== 'offline') { h.reachability = 'offline'; h.reachabilityReason = 'No heartbeat for 3 h'; h.lastSeenAt = new Date(Date.now() - 3 * 3600e3).toISOString(); h.cpu.usedPercent = null; h.memory.usedBytes = null; }
+  if (demo.tools === 'none') h.tools = [];
+  return h;
+}
+
+/* CPU series: atlas keeps its known series; other hosts get a seeded series that ends on their current sample.
+   25 hourly samples, index 0 = 24 h ago, index 24 = now (mock; needs a cpu history API). */
+const ATLAS_HIST = [38,42,35,30,28,26,31,44,58,66,71,63,59,61,70,74,68,62,57,64,69,61,58,60,61];
+function seriesFor(h) {
+  const now = h.cpu.usedPercent; if (now == null) return null;
+  if (h.id === 'atlas' && now === ATLAS_HIST[24]) return ATLAS_HIST;
+  let seed = [...h.id].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
+  const rnd = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32;
+  const out = Array(25); out[24] = now; let x = now;
+  for (let i = 23; i >= 0; i--) {
+    const base = now + Math.min(18, now * .5) * Math.sin((i / 24) * Math.PI * 2 + 1);
+    x = Math.max(2, Math.min(98, x + (rnd() - .5) * 12 + (base - x) * .25)); out[i] = Math.round(x);
+  }
+  return out;
+}
+
+/* ---------- hero ---------- */
+function renderHero(h) {
+  const n = $('#hname'); n.textContent = h.name; n.title = h.name;
+  const len = h.name.length; n.style.fontSize = len <= 8 ? '84px' : len <= 14 ? '64px' : len <= 24 ? '46px' : '34px';
+  document.title = `${h.name} · Arxcovo`;
+  const [ri, rw, rc] = REACH[h.reachability];
+  $('#hmeta').innerHTML = `${osGlyph(h.os)}<span>${esc(h.osVersion)}</span><span class="arch">${h.arch}</span><span class="sep" aria-hidden="true">·</span>
+    <span class="st ${rc}">${h.reachability === 'online' ? '<span class="pulse" aria-hidden="true"></span>' : ico(ri)}${rw}</span><span class="sep" aria-hidden="true">·</span><span title="${esc(new Date(h.lastSeenAt).toLocaleString())}">seen ${esc(ARX.fmtAgo(h.lastSeenAt))}</span>`;
+  const r = $('#hreason');
+  r.hidden = !h.reachabilityReason;
+  r.className = 'reason ' + h.reachability;
+  r.innerHTML = h.reachabilityReason ? `${ico(h.reachability === 'offline' ? 'i-off' : 'i-warn')}<span><b>${rw}</b>${esc(h.reachabilityReason)}</span>` : '';
+  const offline = h.reachability === 'offline';
+  const rdp = `<button type="button" class="btn" aria-disabled="true" aria-label="Remote desktop, unavailable: not in the v1 API" title="Remote desktop is not in the v1 API">${ico('i-monitor')}Remote desktop${AM}</button>`;
+  $('#hact').innerHTML = offline
+    ? `<a class="btn primary" role="link" aria-disabled="true" aria-describedby="run-why" aria-label="Run command, unavailable: host offline">${ico('i-term')}Run command</a>${rdp}<span class="note" id="run-why">Run command unavailable: ${esc(h.name)} is offline</span>`
+    : `<a class="btn primary" href="terminal.html?host=${encodeURIComponent(h.id)}">${ico('i-term')}Run command</a>${rdp}<span class="note">One discovered tool at a time · not a shell</span>`;
+}
+
+/* ---------- cpu ---------- */
+const chart = $('#chart'), brush = $('#brush'), band = $('#band'), H0 = $('#h0'), H1 = $('#h1');
+const N = 24;
+let win = [0, N], SERIES = null;
+function renderCpuNow(h) {
+  $('#cpu-model').textContent = `${h.cpu.model} · ${h.cpu.cores} cores`;
+  const el = $('#cpu-now');
+  if (h.cpu.usedPercent == null) { el.innerHTML = `<div class="big-na">usage unavailable</div><div class="big-sub">${h.reachability === 'offline' ? 'host offline, no current sample' : 'no current sample'}</div>`; return; }
+  el.innerHTML = `<div style="display:flex;align-items:flex-end;gap:10px"><div class="big"><span id="cpu-v">0</span><small>%</small></div><div class="big-sub">now · current sample</div></div>`;
+  const v = h.cpu.usedPercent, cv = $('#cpu-v'); countGroup(e => { cv.textContent = Math.round(v * e); });
+}
+function buildChart(h) {
+  SERIES = seriesFor(h);
+  chart.style.setProperty('--c', ARX.OS_COLOR[h.os]);
+  chart.classList.toggle('nodata', !SERIES);
+  if (!SERIES) { chart.innerHTML = `<span class="na" style="position:absolute;left:12px;top:12px">${h.reachability === 'offline' ? `no samples while offline · ${esc(h.reachabilityReason || '')}` : 'no samples'}</span>`; return; }
+  const W = chart.clientWidth, Hh = 140, PT = 6, PB = 4, x = i => i * W / N, y = v => PT + (1 - v / 100) * (Hh - PT - PB);
+  let d = `M0 ${y(SERIES[0])}`;
+  for (let i = 1; i <= N; i++) { const dx = x(i) - x(i - 1); d += ` C${x(i - 1) + dx / 2} ${y(SERIES[i - 1])} ${x(i) - dx / 2} ${y(SERIES[i])} ${x(i)} ${y(SERIES[i])}`; }
+  const g = [25, 50, 75].map(v => `<line class="gl" x1="0" x2="${W}" y1="${y(v)}" y2="${y(v)}"/>`).join('');
+  if (chart.dataset.built) chart.classList.add('done'); chart.dataset.built = '1';
+  chart.innerHTML = `<svg viewBox="0 0 ${W} ${Hh}" role="img" aria-label="CPU percent per hour, last 24 hours (mock series; needs a cpu history API)"><defs><linearGradient id="cg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${OS_HEX[h.os]}" stop-opacity=".22"/><stop offset="1" stop-color="${OS_HEX[h.os]}" stop-opacity="0"/></linearGradient></defs>${g}
+  <path class="fl" fill="url(#cg)" d="${d} L${W} ${Hh} L0 ${Hh}Z"/><path class="ln" pathLength="1" d="${d}"/>
+  <rect class="dim" id="dimL" x="0" y="0" width="0" height="${Hh}"/><rect class="dim" id="dimR" x="${W}" y="0" width="0" height="${Hh}"/>
+  <line class="edge" id="edgeL" x1="0" x2="0" y1="0" y2="${Hh}"/><line class="edge" id="edgeR" x1="${W}" x2="${W}" y1="0" y2="${Hh}"/></svg>`;
+}
+const ago = i => N - i; // hours ago
+const agoText = i => ago(i) === 0 ? 'now' : `${ago(i)} hour${ago(i) === 1 ? '' : 's'} ago`;
+function paintWindow() {
+  const W = brush.clientWidth, px = i => i / N * W;
+  H0.style.left = px(win[0]) + 'px'; H1.style.left = px(win[1]) + 'px';
+  band.style.left = px(win[0]) + 'px'; band.style.width = (px(win[1]) - px(win[0])) + 'px';
+  const CW = chart.clientWidth, cx = i => i / N * CW, dl = $('#dimL'), dr = $('#dimR');
+  if (dl) { dl.setAttribute('width', cx(win[0])); dr.setAttribute('x', cx(win[1])); dr.setAttribute('width', CW - cx(win[1]));
+    $('#edgeL').setAttribute('x1', cx(win[0])); $('#edgeL').setAttribute('x2', cx(win[0])); $('#edgeR').setAttribute('x1', cx(win[1])); $('#edgeR').setAttribute('x2', cx(win[1])); }
+  H0.setAttribute('aria-valuemin', -N); H0.setAttribute('aria-valuemax', win[1] - 1 - N); H0.setAttribute('aria-valuenow', win[0] - N); H0.setAttribute('aria-valuetext', agoText(win[0]));
+  H1.setAttribute('aria-valuemin', win[0] + 1 - N); H1.setAttribute('aria-valuemax', 0); H1.setAttribute('aria-valuenow', win[1] - N); H1.setAttribute('aria-valuetext', agoText(win[1]));
+  if (!SERIES) { $('#avg').textContent = '–'; $('#peak').textContent = '–'; }
+  else { const s = SERIES.slice(win[0], win[1] + 1); $('#avg').textContent = Math.round(s.reduce((a, b) => a + b, 0) / s.length) + '%'; $('#peak').textContent = Math.max(...s) + '%'; }
+  $('#winread').textContent = `window ${ago(win[0]) ? '-' + ago(win[0]) + ' h' : 'now'} → ${ago(win[1]) ? '-' + ago(win[1]) + ' h' : 'now'}`;
+  $$('[data-h]').forEach(b => b.setAttribute('aria-pressed', String(win[1] === N && ago(win[0]) === +b.dataset.h)));
+}
+function idxAt(cx) { const r = brush.getBoundingClientRect(); return Math.max(0, Math.min(N, Math.round((cx - r.left) / r.width * N))); }
+function wireBrush() {
+  [H0, H1].forEach((h, k) => {
+    h.addEventListener('pointerdown', e => {
+      h.setPointerCapture(e.pointerId); h.focus();
+      const mv = ev => { const i = idxAt(ev.clientX); if (k === 0) win[0] = Math.min(i, win[1] - 1); else win[1] = Math.max(i, win[0] + 1); paintWindow(); };
+      h.addEventListener('pointermove', mv); h.addEventListener('pointerup', () => h.removeEventListener('pointermove', mv), {once: true});
+    });
+    h.addEventListener('keydown', e => {
+      const step = {ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1, PageDown: -6, PageUp: 6}[e.key];
+      let v = win[k];
+      if (step) v += step; else if (e.key === 'Home') v = -Infinity; else if (e.key === 'End') v = Infinity; else return;
+      e.preventDefault();
+      if (k === 0) win[0] = Math.max(0, Math.min(win[1] - 1, v)); else win[1] = Math.min(N, Math.max(win[0] + 1, v));
+      paintWindow();
+    });
+  });
+  $$('[data-h]').forEach(b => b.addEventListener('click', () => { win = [N - +b.dataset.h, N]; paintWindow(); }));
+}
+
+/* ---------- memory and disk ---------- */
+function renderMem(h) {
+  const A = ARX.allocated(BASE.id), alloc = A.memoryBytes, total = h.memory.totalBytes, used = h.memory.usedBytes;
+  const offline = h.reachability === 'offline';
+  const allocTxt = A.unknown ? '<span class="na">unknown</span>' : ARX.fmtBytes(alloc);
+  if (used == null) {
+    $('#mem-body').innerHTML = `<div class="ring-w"><svg class="gauge" viewBox="0 0 100 100" aria-hidden="true"><circle class="bg" cx="50" cy="50" r="42" style="stroke:#222;stroke-dasharray:2 3"/></svg>
+      <div class="na-big"><span class="na">host used: usage unavailable</span><span class="muted" style="font-size:12.5px">of ${ARX.fmtBytes(total)} · ${offline ? 'host offline, no current sample' : 'no current sample'}</span></div></div>
+      <div class="legend"><div><span class="sw" style="background:var(--ink3)"></span>allocated to VMs${offline ? ' · last known' : ''}<b>${allocTxt}</b></div></div>`;
+    return;
+  }
+  const cu = unitFor(used);
+  $('#mem-body').innerHTML = `<div class="ring-w"><svg class="gauge" viewBox="0 0 100 100" role="img" aria-label="Host used ${ARX.fmtBytes(used)} of ${ARX.fmtBytes(total)}; allocated to VMs ${ARX.fmtBytes(alloc)}">
+      <circle class="bg" cx="50" cy="50" r="42"/><circle class="fg" cx="50" cy="50" r="42" data-v="${used / total}"/>
+      <circle class="ibg" cx="50" cy="50" r="34"/><circle class="ifg" cx="50" cy="50" r="34" data-v="${alloc / total}"/></svg>
+    <div class="gv"><b><span id="mem-u">0</span><small> ${cu.u}</small></b><span>host used · of ${ARX.fmtBytes(total)}</span></div></div>
+    <div class="legend"><div><span class="sw" style="background:#fff"></span>host used</div><div><span class="sw" style="background:var(--ink3)"></span>allocated to VMs<b>${allocTxt}</b></div></div>`;
+  const mu = $('#mem-u'); countGroup(e => { mu.textContent = cu.num(used * e); });
+}
+function renderDisk(h) {
+  const reserve = h.x.reserveBytes ?? ARX.RESERVE;
+  const total = h.disk.totalBytes, free = h.disk.freeBytes, cap = h.disk.capBytes;
+  const used = total - free, vmAlloc = ARX.allocated(BASE.id).diskBytes, rsvFrac = reserve / total;
+  const offline = h.reachability === 'offline';
+  const cu = unitFor(used), cf = unitFor(free);
+  const capRing = cap == null ? '<circle class="ibg" cx="50" cy="50" r="34"/>' : `<circle class="ibg" cx="50" cy="50" r="34" style="stroke-dasharray:${(213.6 * cap / total).toFixed(1)} 214;transform:rotate(-90deg);transform-origin:50% 50%"/>`;
+  const capTick = cap == null ? '' : `<line class="capt" x1="50" y1="11" x2="50" y2="22" transform="rotate(${(cap / total * 360).toFixed(2)} 50 50)"><title>VM cap ${ARX.fmtBytes(cap)}</title></line>`;
+  $('#disk-body').innerHTML = `<div class="ring-w"><svg class="gauge${offline ? ' stale' : ''}" viewBox="0 0 100 100" role="img" aria-label="Disk${offline ? ', last known' : ''}: ${ARX.fmtBytes(used)} used of ${ARX.fmtBytes(total)}, ${ARX.fmtBytes(free)} free. ${cap == null ? 'No VM disk cap' : `VM cap ${ARX.fmtBytes(cap)}`}, ${ARX.fmtBytes(vmAlloc)} allocated to VM disks. Reserve ${ARX.fmtBytes(reserve)}.">
+      <circle class="bg" cx="50" cy="50" r="42"/>
+      <circle class="rsv" cx="50" cy="50" r="42" style="stroke-dasharray:0 ${(263.9 * (1 - rsvFrac)).toFixed(1)} ${(263.9 * rsvFrac).toFixed(1)} 0"/>
+      <circle class="fg" cx="50" cy="50" r="42" data-v="${used / total}"/>
+      ${capRing}<circle class="ifg" cx="50" cy="50" r="34" data-v="${vmAlloc / total}"/>${capTick}</svg>
+    <div class="gv"><b><span id="disk-u">0</span><small> ${cu.u}</small></b><span>${offline ? 'last known · ' : ''}used of ${ARX.fmtBytes(total)} · <span id="disk-f">${ARX.fmtBytes(total)}</span> free</span></div></div>
+    <div class="legend">
+      ${cap == null ? `<div><span class="sw" style="background:var(--ink3)"></span>VM disks<b>${ARX.fmtBytes(vmAlloc)} · <span class="na">no cap</span></b></div>` : `<div><span class="sw tick"></span>VM cap<b>${ARX.fmtBytes(vmAlloc)} / ${ARX.fmtBytes(cap)}</b></div>`}
+      <div><span class="sw rs"></span>reserve${AM}<b>${ARX.fmtBytes(reserve)}</b></div>
+    </div>`;
+  const du = $('#disk-u'), df = $('#disk-f');
+  countGroup(e => { const u = used * e; du.textContent = cu.num(u); df.textContent = `${cf.num(total - u)} ${cf.u}`; });
+}
+function fillRings() {
+  setTimeout(() => $$('.gauge .fg[data-v], .gauge .ifg[data-v]').forEach(c => {
+    const C = c.classList.contains('fg') ? 263.9 : 213.6; c.style.strokeDasharray = `${(Math.min(1, +c.dataset.v) * C).toFixed(1)} ${C + 1}`;
+  }), reduce ? 0 : 450);
+}
+
+/* ---------- facts ---------- */
+function renderFacts(h) {
+  const rows = [
+    ['OS family', `${osGlyph(h.os, 'width:18px;height:18px;display:inline-grid;vertical-align:-4px;margin-right:6px')}${ARX.OS_LABEL[h.os]}`],
+    ['Version', esc(h.osVersion)], ['Arch', h.arch], ['CPU model', esc(h.cpu.model)], ['Cores', h.cpu.cores],
+    ['Mode', h.mode === 'always_on' ? 'always on' : 'opportunistic', true],
+    ['Agent rights', esc(h.agentRights)],
+    ['Last seen', `<span title="${esc(new Date(h.lastSeenAt).toLocaleString())}">${esc(ARX.fmtAgo(h.lastSeenAt))}</span>`],
+    ['Disk cap', h.disk.capBytes == null ? '<span class="na">no cap</span>' : ARX.fmtBytes(h.disk.capBytes)],
+  ];
+  $('#facts').innerHTML = rows.map(([k, v, hint]) => `<div><dt style="display:flex;align-items:center;gap:8px">${k}${hint ? `<span style="position:relative;display:inline-flex"><button type="button" class="hint" aria-expanded="false" aria-controls="mode-tip" aria-label="What host modes mean">?</button><span class="tip" id="mode-tip" role="tooltip" hidden><b>Always on</b>: runs test and static VMs at any time.<br><b>Opportunistic</b>: yields to the person using the machine; test VMs slow down or move away while they are active, and a static VM runs there only if it is pinned.</span></span>` : ''}</dt><dd>${v}</dd></div>`).join('');
+  const b = $('#facts .hint'), tip = $('#mode-tip');
+  const set = o => { b.setAttribute('aria-expanded', String(o)); tip.hidden = !o; };
+  b.addEventListener('click', () => set(tip.hidden));
+  b.addEventListener('mouseenter', () => set(true)); b.parentElement.addEventListener('mouseleave', () => set(false));
+  b.addEventListener('keydown', e => { if (e.key === 'Escape') { set(false); b.focus(); } });
+  b.addEventListener('blur', () => set(false));
+}
+
+/* ---------- VM cards (shared component) ---------- */
+const leftMs = iso => Date.parse(iso) - Date.now();
+function vmCard(v) {
+  const [si, sw] = STATE[v.state];
+  const soon = v.expiresAt != null && leftMs(v.expiresAt) < 3600e3;
+  const exp = v.expiresAt == null ? `<span class="exp" title="Static VMs never expire">never</span>` : `<span class="exp${soon ? ' soon' : ''}" data-exp="${v.expiresAt}" title="Expires in">${ARX.fmtLeft(v.expiresAt)}</span>`;
+  const x = v.x || {};
+  const slots = v.kind === 'static' ? `<div class="slots">
+      <span title="Health check">${ico('i-heart')}${x.health && x.health.state !== 'unknown' ? esc(x.health.state) : '<span class="na">unknown</span>'}</span>
+      <span title="Last backup">${ico('i-backup')}${x.backup?.lastAt ? ARX.fmtAgo(x.backup.lastAt).replace(' ago', '') : '<span class="na">none</span>'}</span>
+      <span title="Public publishing">${ico('i-globe')}${x.publish?.on ? 'on' : 'off'}</span>${AM}</div>` : '';
+  const label = `${v.id}, ${v.kind} VM, ${v.guestOsVersion}, ${v.arch}, ${sw}, ${v.ready ? 'ready' : 'not ready'}, ${v.expiresAt == null ? 'never expires' : 'expires in ' + ARX.fmtLeft(v.expiresAt)}`;
+  return `<a class="card" href="vm.html?id=${encodeURIComponent(v.id)}" aria-label="${esc(label)}">
+    <div class="c1"><span class="kind ${v.kind}" aria-hidden="true"></span><span class="vname">${esc(v.id)}</span><span class="arch">${v.arch}</span></div>
+    <div class="c2"><span class="kindw">${v.kind}</span><span class="gtx">${esc(v.guestOsVersion)} · ${v.cpus ?? '?'} vCPU · ${v.memoryBytes == null ? '?' : ARX.fmtBytes(v.memoryBytes)}</span></div>
+    <div class="c3"><span class="st${v.state === 'failed' ? ' bad' : ''}">${ico(si)}${sw}</span><span class="st${v.ready ? '' : ' bad'}">${ico(v.ready ? 'i-check' : 'i-warn')}${v.ready ? 'ready' : 'not ready'}</span>${exp}</div>${slots}</a>`;
+}
+function renderVms(h) {
+  const s = myVms.filter(v => v.kind === 'static').length, t = myVms.length - s;
+  $('#vms-r').textContent = h.os === 'windows' ? `${t} test · Windows hosts run test VMs only` : [s && `${s} static`, t && `${t} test`].filter(Boolean).join(' · ');
+  $('#vms').innerHTML = myVms.length ? myVms.map(vmCard).join('')
+    : `<div class="empty vm-empty">${ico('i-vm')}<b>No VMs on ${esc(h.name)} yet</b><span>Agents create test VMs here over MCP when they need ${esc(h.arch)} ${ARX.OS_LABEL[h.os]}.${h.mode === 'opportunistic' ? ' Static VMs run here only if pinned.' : ''}</span></div>`;
+  const A = ARX.allocated(BASE.id), cap = h.disk.capBytes, lk = h.reachability === 'offline' ? ' · last known' : '';
+  const row = (k, used, of, txt) => `<div class="row"><span>${k}</span><span class="bar" role="img" aria-label="${k}: ${txt.replace(/<[^>]+>/g, '')}"><i data-w="${Math.min(100, used / of * 100).toFixed(1)}"></i></span><b>${txt}</b></div>`;
+  $('#alloc').innerHTML = `<span class="ah">Allocated to VMs on ${esc(h.name)}${lk}</span>` + row('vCPU', A.cpus, h.cpu.cores, `${A.cpus} / ${h.cpu.cores} cores`) + row('RAM', A.memoryBytes, h.memory.totalBytes, `${ARX.fmtBytes(A.memoryBytes)} / ${ARX.fmtBytes(h.memory.totalBytes)}`)
+    + (cap == null ? row('VM disks', A.diskBytes, h.disk.totalBytes, `${ARX.fmtBytes(A.diskBytes)} · no cap`) : row('VM disks', A.diskBytes, cap, `${ARX.fmtBytes(A.diskBytes)} / ${ARX.fmtBytes(cap)} cap`));
+  requestAnimationFrame(() => requestAnimationFrame(() => $$('.alloc i[data-w]').forEach(i => i.style.width = i.dataset.w + '%')));
+}
+
+/* ---------- tools ---------- */
+let toolsOpen = false;
+function renderTools(h) {
+  const T = h.tools, SHOW = 8;
+  $('#tools-r').textContent = T.length ? `${T.length} discovered` : '';
+  if (!T.length) { $('#tools').innerHTML = `<div class="empty">${ico('i-box')}<b>No tools discovered</b><span>${esc(h.name)} reports no tools yet. Run command can only start a discovered tool.</span></div>`; return; }
+  const off = h.reachability === 'offline';
+  const list = toolsOpen ? T : T.slice(0, SHOW), rest = T.length - SHOW;
+  const inner = t => `${ico(TOOL_ICON[t.name] || 'i-wrench')}<span class="mono">${esc(t.name)}</span>${t.version == null ? '<small class="unk">version unknown</small>' : `<small>${esc(t.version)}</small>`}`;
+  const cell = t => off ? `<div class="tool">${inner(t)}</div>`
+    : `<a class="tool" href="terminal.html?host=${encodeURIComponent(BASE.id)}&amp;tool=${encodeURIComponent(t.name)}" aria-label="Run ${esc(t.name)} on ${esc(BASE.id)}, ${t.version == null ? 'version unknown' : 'version ' + esc(t.version)}">${inner(t)}</a>`;
+  const more = rest > 0 ? `<button type="button" class="tool more" aria-expanded="${toolsOpen}" aria-label="${toolsOpen ? 'Show fewer tools' : `Show ${rest} more tools`}">${toolsOpen ? '−' : '+' + rest}<small>${toolsOpen ? 'fewer' : 'more'}</small></button>` : '';
+  $('#tools').innerHTML = `<div class="tools">${list.map(cell).join('')}${more}</div>`;
+  const b = $('#tools .more'); if (b) b.addEventListener('click', () => { toolsOpen = !toolsOpen; renderTools(host()); $('#tools .more').focus(); });
+}
+
+/* ---------- activity ---------- */
+function actRow(a) {
+  const [oi, ow, oc] = OUTCOME[a.outcome];
+  const vm = !a.vmId ? '<span class="vm faint">host</span>' : ARX.vm(a.vmId) ? `<a class="vm" href="vm.html?id=${encodeURIComponent(a.vmId)}">${esc(a.vmId)}</a>` : `<span class="vm" title="VM no longer exists">${esc(a.vmId)}</span>`;
+  const ex = a.exitCode != null ? `<span class="ex">exit ${a.exitCode}</span>` : a.tool === 'run_command' && a.outcome !== 'started' ? '<span class="ex">no exit</span>' : '<span></span>';
+  return `<div class="act" role="listitem"><span class="st ${oc}">${ico(oi)}${ow}</span><span class="tool-n">${esc(a.tool)}</span><span class="sum" title="${esc(a.summary)}">${esc(a.summary)}</span>
+    <span class="who">${ico(ACTOR[a.actor.kind])}${a.actor.kind}${a.actor.kind === 'agent' ? ` · <b>${esc(a.actor.name)}</b>` : ''}</span>${vm}${ex}<span class="w" title="${esc(new Date(a.startedAt).toLocaleString())}">${esc(ARX.fmtAgo(a.startedAt))}</span></div>`;
+}
+function renderActivity(h) {
+  $('#act-t').textContent = `Activity on ${h.name}`;
+  $('#act-all').href = `activity.html?host=${encodeURIComponent(BASE.id)}`;
+  const rows = ARX.ACTIVITY.filter(a => a.hostId === BASE.id).slice(0, 8);
+  $('#acts').innerHTML = rows.length ? rows.map(actRow).join('') : `<div class="empty" role="listitem">${ico('i-act')}<b>No activity on ${esc(h.name)} yet</b><span>Tool calls that touch this host will show here.</span></div>`;
+}
+
+/* ---------- not found ---------- */
+function notFound() {
+  document.title = 'Host not found · Arxcovo';
+  $('main').innerHTML = `<section class="tile s12 nf rise" style="--i:1" aria-labelledby="nf-h">
+    <div class="ring" aria-hidden="true">${ico('i-hosts')}</div>
+    <h1 id="nf-h">Host not found</h1>
+    <p>No host in this cluster is called <span class="mono">${esc(ID)}</span>. It may have left the cluster, or the link is wrong.</p>
+    <a class="btn" href="board.html">${ico('i-back')}Back to Hosts</a></section>`;
+  $('.foot .demo').remove();
+}
+
+/* ---------- render all ---------- */
+function render() {
+  const h = host();
+  renderHero(h); renderCpuNow(h); buildChart(h); paintWindow();
+  renderMem(h); renderDisk(h); fillRings(); renderFacts(h); renderTools(h);
+  renderVms(h); renderActivity(h);
+}
+if (!BASE) notFound();
+else {
+  wireBrush();
+  render();
+  addEventListener('resize', () => { buildChart(host()); paintWindow(); });
+  /* countdowns tick (absolute instants) */
+  setInterval(() => $$('[data-exp]').forEach(el => { el.textContent = ARX.fmtLeft(el.dataset.exp); el.classList.toggle('soon', leftMs(el.dataset.exp) < 3600e3); }), 1000);
+  /* demo controls (render only with ?demo) */
+  const sw = (id, key) => $(id).addEventListener('click', e => { demo[key] = !demo[key]; e.currentTarget.setAttribute('aria-checked', String(demo[key])); render(); });
+  sw('#d-off', 'offline'); sw('#d-long', 'long');
+  $$('[data-tools]').forEach(b => b.addEventListener('click', () => { demo.tools = b.dataset.tools; toolsOpen = false; $$('[data-tools]').forEach(x => x.setAttribute('aria-pressed', String(x === b))); render(); }));
+}
+</script>
+</body>
+</html>
