@@ -434,6 +434,9 @@ pub enum ReserveCheck {
         available_bytes: u64,
         required_bytes: u64,
     },
+    /// Resource collection measured zero available physical memory. This is
+    /// the source check, distinct from a shortfall at the launch envelope.
+    AvailableRamSourceZero,
     SampleStale {
         age_ms: u64,
         limit_ms: u64,
@@ -481,6 +484,16 @@ pub enum PausedDispatchState {
     WrittenInTime,
     Expired,
     Ambiguous,
+}
+
+/// Which accelerator liveness check found the held child no longer live in
+/// its Job: before `query-accelerators`, or after its reply and dispatch
+/// confirmation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PausedLivenessGate {
+    BeforeAcceleratorQuery,
+    AfterAcceleratorConfirmation,
 }
 
 /// State of the already-held child before requesting teardown.
@@ -567,6 +580,9 @@ pub enum PausedCheck {
         required_count: u32,
     },
     WhpxUnknownAccelerator,
+    AcceleratorChildLiveness {
+        gate: PausedLivenessGate,
+    },
     Disabled,
     QualificationMissing,
     IdentityUnverified,

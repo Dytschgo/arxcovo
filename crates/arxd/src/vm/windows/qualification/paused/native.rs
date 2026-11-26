@@ -1650,7 +1650,7 @@ impl Windows<'_> {
 impl<'a> Host for Windows<'a> {
     type Opens = Opens<'a>;
     type Slot = Slot;
-    type Reader = tokio::io::DuplexStream;
+    type Reader = PipeOutput;
     type Writer = tokio::io::DuplexStream;
     type Channel = tokio::net::windows::named_pipe::NamedPipeClient;
 
@@ -1921,10 +1921,7 @@ impl<'a> Host for Windows<'a> {
         slot: &Slot,
         query: impl Future<Output = Result<(), Failure>>,
     ) -> Result<(), Failure> {
-        require_live(slot)?;
-        query.await?;
-        require_live(slot)?;
-        Ok(())
+        between_liveness_gates(|| require_live(slot), query).await
     }
 
     async fn open_channel(

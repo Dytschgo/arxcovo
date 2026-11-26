@@ -203,6 +203,7 @@ struct Fake {
     query_accelerator: bool,
     capture_refusal: bool,
     pre_stop_exit: Option<u32>,
+    child_exit_at: Option<PausedLivenessGate>,
     queued_write_lag: Option<Duration>,
     pre_resume_lag: Option<Duration>,
     cancel_on_resume: bool,
@@ -251,6 +252,7 @@ impl Default for Fake {
             query_accelerator: false,
             capture_refusal: false,
             pre_stop_exit: None,
+            child_exit_at: None,
             queued_write_lag: None,
             pre_resume_lag: None,
             cancel_on_resume: false,
@@ -546,10 +548,22 @@ impl Host for Fake {
     ) -> Result<(), Failure> {
         self.step(Step::VerifyWhpx)?;
         self.checkpoint(Step::VerifyWhpx).await;
-        if self.query_accelerator {
-            query.await?;
+        if !self.query_accelerator {
+            return Ok(());
         }
-        Ok(())
+        // The held child exits after its prelaunch status, or after the
+        // accelerator reply and dispatch confirmation. The production gates
+        // observe that through the same helper the native adapter uses.
+        let exited =
+            Cell::new(self.child_exit_at == Some(PausedLivenessGate::BeforeAcceleratorQuery));
+        between_liveness_gates(|| if exited.get() { Err(JOB) } else { Ok(()) }, async {
+            query.await?;
+            if self.child_exit_at == Some(PausedLivenessGate::AfterAcceleratorConfirmation) {
+                exited.set(true);
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn open_channel(
@@ -961,6 +975,125 @@ async fn acknowledgement_cannot_cure_late_stdio_write() {
         );
         assert!(!host.steps().contains(&Step::VerifyOpens));
     }
+}
+
+#[tokio::test]
+async fn child_exit_at_either_accelerator_liveness_gate_names_the_gate_and_snapshots() {
+    const ACCELERATORS: &str = r#"{"return":{"enabled":"whpx","present":["whpx"]},"id":3}"#;
+    for (gate, commands) in [
+        (PausedLivenessGate::BeforeAcceleratorQuery, 2),
+        (PausedLivenessGate::AfterAcceleratorConfirmation, 3),
+    ] {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(
+            format!("{GREETING}\n{CAPABILITIES}\n{PRELAUNCH}\n{ACCELERATORS}\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        drop(peer);
+        let mut host = Fake {
+            reader_override: RefCell::new(Some(Box::new(client))),
+            query_accelerator: true,
+            capture_refusal: true,
+            pre_stop_exit: Some(3221225477),
+            child_exit_at: Some(gate),
+            ..Fake::default()
+        };
+        let result = host.run().await;
+        let detail = PausedCheck::AcceleratorChildLiveness { gate };
+        assert_eq!(result.paused, Err(Failure::Paused(detail)));
+        // Both gates keep their Job refusal class for other launch purposes.
+        assert_eq!(
+            Failure::Paused(detail).native_refusal(),
+            Some(NativeRefusal::JobUnverified)
+        );
+        assert!(matches!(
+            native::paused_verdict(result.paused),
+            PausedVerdict::PausedRefused(verdict) if verdict == detail
+        ));
+        // The snapshot is taken before the stop request.
+        assert_eq!(
+            result.snapshot,
+            Some(PausedSnapshot {
+                child: PausedChildState::Exited {
+                    status: Some(3221225477)
+                },
+                dispatch: Some(PausedDispatchState::Idle),
+            })
+        );
+        assert_eq!(result.release, StopDisposition::DirtyRelease);
+        assert_eq!(
+            host.written
+                .borrow()
+                .iter()
+                .filter(|&&c| c == b'\n')
+                .count(),
+            commands
+        );
+        assert!(!host.completed_phases.get().prelaunch);
+        assert!(!host.steps().contains(&Step::VerifyOpens));
+        assert!(
+            host.steps()
+                .ends_with(&[Step::Stop, Step::Reopen, Step::Settle])
+        );
+    }
+}
+
+#[tokio::test]
+async fn peer_remote_error_text_never_reaches_the_serialized_record() {
+    use super::super::{DiagnosticFile, sink::tests::publish_blocked_row};
+    use crate::vm::qualification_record::{self as records, PausedFailure, Stage, StageResult};
+
+    const CLASS: &str = "ArxCanaryClass7f3e";
+    const DESC: &str = "arx-canary-desc X:/private-qmp-peer S-1-5-21-424242";
+    let (client, mut peer) = tokio::io::duplex(4096);
+    peer.write_all(
+        format!(
+            "{GREETING}\n{{\"error\":{{\"class\":\"{CLASS}\",\"desc\":\"{DESC}\"}},\"id\":1}}\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    drop(peer);
+    let mut host = Fake {
+        reader_override: RefCell::new(Some(Box::new(client))),
+        capture_refusal: true,
+        ..Fake::default()
+    };
+    let result = host.run().await;
+    let detail = PausedCheck::QmpChannel {
+        step: PausedQmpStep::Capabilities,
+        error: ChannelError::Remote,
+    };
+    assert_eq!(result.paused, Err(Failure::Paused(detail)));
+    // The qualifier binary projects a paused verdict onto this row shape.
+    let PausedVerdict::PausedRefused(failure) = native::paused_verdict(result.paused) else {
+        panic!("paused refusal expected");
+    };
+    let row = StageResult::PausedRefusalV1(PausedFailure {
+        failure,
+        snapshot: result.snapshot,
+    });
+    let wire = serde_json::to_string(&row).unwrap();
+    let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    // The held writer also refuses any row carrying a claimed canary.
+    let bytes = publish_blocked_row(
+        root.path(),
+        DiagnosticFile::WhpxQmpEndpoint,
+        "qemu_prelaunch_pause",
+        &wire,
+        &[CLASS, DESC],
+    )
+    .unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    for canary in [CLASS, DESC, "arx-canary", "private-qmp-peer", "S-1-5-21"] {
+        assert!(!text.contains(canary), "peer text reached the record");
+    }
+    let rows: Vec<records::Record> = records::decode(&bytes).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].stage, Stage::QemuPrelaunchPause);
+    assert_eq!(rows[0].result, row);
 }
 
 #[tokio::test]
@@ -1896,11 +2029,9 @@ fn reserve_apis_distinguish_unavailable_and_measured_zero() {
     );
     assert_eq!(
         check_host_resources(16, || Some(0)),
-        Err(ReserveCheck::AvailableRam {
-            available_bytes: 0,
-            required_bytes: 1
-        })
+        Err(ReserveCheck::AvailableRamSourceZero)
     );
+    assert_eq!(check_host_resources(16, || Some(1)), Ok((16, 1)));
     assert_eq!(
         check_host_resources(0, || panic!("CPU count failed before memory could be read")),
         Err(ReserveCheck::ActiveCpusUnavailable)

@@ -917,7 +917,7 @@ unsafe fn private_descriptor(actual_owner: PSID, dacl: *const ACL, owner: PSID) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #[path = "foreground_tests.rs"]
     mod foreground;
     const TEST_BOOT: records::BootAnchor = records::BootAnchor {
@@ -1071,6 +1071,29 @@ mod tests {
 
     fn read(path: &LocalPath, name: &str) -> Vec<u8> {
         std::fs::read(format!(r"{}\{name}", path.as_str())).unwrap()
+    }
+
+    /// Publishes one blocked stage row through the held writer of a claimed
+    /// private directory and returns the bytes of its diagnostic file.
+    pub(in crate::vm::windows::qualification) fn publish_blocked_row(
+        parent: &Path,
+        file: DiagnosticFile,
+        stage: &'static str,
+        wire: &str,
+        canaries: &[&str],
+    ) -> Result<Vec<u8>, SinkError> {
+        let (path, dir) = claimed(parent, canaries);
+        dir.publish(
+            &"test",
+            &"projection",
+            1_800_000_000,
+            &entries(&[(stage, raw(wire))]),
+            &Body {
+                blocked_at: Some(stage),
+                ..body()
+            },
+        )?;
+        Ok(read(&path, file.name()))
     }
 
     fn value(path: &LocalPath, name: &str) -> serde_json::Value {

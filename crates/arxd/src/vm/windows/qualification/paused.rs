@@ -15,8 +15,8 @@ use super::*;
 use crate::vm::guest::network_probe::WitnessReport;
 use crate::vm::qmp::RunStatus;
 use crate::vm::qualification_record::{
-    ControlledFault, PausedCheck, PausedChildState, PausedDispatchState, PausedQmpStep,
-    PausedSnapshot, ReserveCheck, ReserveFailure, ReserveStep,
+    ControlledFault, PausedCheck, PausedChildState, PausedDispatchState, PausedLivenessGate,
+    PausedQmpStep, PausedSnapshot, ReserveCheck, ReserveFailure, ReserveStep,
 };
 use crate::vm::{qmp::bounded, runtime::capacity};
 use std::{
@@ -407,6 +407,10 @@ impl Failure {
                 | PausedCheck::WhpxPresenceCount { .. }
                 | PausedCheck::WhpxUnknownAccelerator,
             ) => Some(NativeRefusal::WhpxUnverified),
+            // The liveness gates keep their Job refusal for other launch purposes.
+            Self::Paused(PausedCheck::AcceleratorChildLiveness { .. }) => {
+                Some(NativeRefusal::JobUnverified)
+            }
             Self::Paused(_) => Some(NativeRefusal::QmpUnverified),
             _ => None,
         }
@@ -577,6 +581,19 @@ impl Live {
         }
         Ok(())
     }
+}
+
+/// Runs the accelerator query between the held child's two liveness gates.
+/// Both gates stay in place. A refusal names its gate as a paused check, so
+/// the paused result keeps the step and takes its pre-stop snapshot.
+async fn between_liveness_gates(
+    live: impl Fn() -> Result<(), NativeRefusal>,
+    query: impl Future<Output = Result<(), Failure>>,
+) -> Result<(), Failure> {
+    let refused = |gate| Failure::Paused(PausedCheck::AcceleratorChildLiveness { gate });
+    live().map_err(|_| refused(PausedLivenessGate::BeforeAcceleratorQuery))?;
+    query.await?;
+    live().map_err(|_| refused(PausedLivenessGate::AfterAcceleratorConfirmation))
 }
 
 struct Pipes<R, W> {
