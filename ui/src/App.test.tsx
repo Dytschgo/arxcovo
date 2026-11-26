@@ -405,7 +405,10 @@ describe('Night Orbit views: search, console closed state, not found', () => {
     const listHosts = vi.spyOn(api, 'listHosts');
     const listVms = vi.spyOn(api, 'listVms');
     const search = screen.getByRole('combobox', { name: 'Search hosts, VMs and tools' });
+    // A bare character never takes focus (WCAG 2.2 SC 2.1.4); Ctrl+K does.
     fireEvent.keyDown(document.body, { key: '/' });
+    expect(document.activeElement).not.toBe(search);
+    fireEvent.keyDown(document.body, { key: 'k', ctrlKey: true });
     expect(document.activeElement).toBe(search);
     fireEvent.focus(search);
     fireEvent.change(search, { target: { value: 'ubuntu' } });
@@ -582,5 +585,94 @@ describe('PR #380 review 1 findings', () => {
     await within(screen.getByRole('listbox', { name: 'Search results' })).findAllByRole('option');
     expect(listHosts).toHaveBeenCalledTimes(1);
     expect(listVms).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('PR #380 review 2: console ticket order and the search shortcut', () => {
+  const offlineAtlas: Host[] = FIXTURE_HOSTS.map(h => (h.id === 'atlas' ? { ...h, reachability: 'offline', reachabilityReason: 'No heartbeat for 3 hours' } : h));
+
+  /** Console route with listHosts held open: every call waits for the test to settle it. */
+  async function consoleWithHeldHosts() {
+    window.location.hash = '#/vms/ubuntu-build-02/console';
+    const api = new StandinApi();
+    await api.login(DEMO_CREDENTIALS);
+    const held: { resolve(hosts: Host[]): void; reject(error: unknown): void }[] = [];
+    vi.spyOn(api, 'listHosts').mockImplementation(() => new Promise<Host[]>((resolve, reject) => { held.push({ resolve, reject }); }));
+    const openConsole = vi.spyOn(api, 'openConsole');
+    render(<App api={api} />);
+    // The VM resolves first; the host is still unknown, so no ticket is asked for.
+    expect(await screen.findByText('Checking the host before connecting…')).toBeTruthy();
+    expect(openConsole).not.toHaveBeenCalled();
+    expect(held).toHaveLength(1);
+    return { held, openConsole };
+  }
+
+  const settle = () => act(async () => { await new Promise(r => setTimeout(r, 30)); });
+
+  test('(a) VM first, then the host arrives offline: closed with the reason and no ticket', async () => {
+    const { held, openConsole } = await consoleWithHeldHosts();
+    await act(async () => held[0].resolve(offlineAtlas));
+    expect(await screen.findByText('atlas is offline (No heartbeat for 3 hours), so its VMs have no console.')).toBeTruthy();
+    await settle();
+    expect(openConsole).not.toHaveBeenCalled();
+    expect(screen.queryByRole('img', { name: /Console of/ })).toBeNull();
+  });
+
+  test('(b) VM first, then the host arrives online: exactly one ticket, and the viewer is not remounted', async () => {
+    const { held, openConsole } = await consoleWithHeldHosts();
+    await act(async () => held[0].resolve(FIXTURE_HOSTS));
+    expect(await screen.findByRole('img', { name: /Console of ubuntu-build-02/ })).toBeTruthy();
+    await settle();
+    expect(openConsole).toHaveBeenCalledTimes(1);
+  });
+
+  test('(c) VM first, then the host list fails with 503: the console still connects with one ticket', async () => {
+    const { held, openConsole } = await consoleWithHeldHosts();
+    await act(async () => held[0].reject(new ApiError('unavailable', 'arxd is busy.', 503)));
+    expect(await screen.findByRole('img', { name: /Console of ubuntu-build-02/ })).toBeTruthy();
+    expect(screen.getByText(/Could not load the host list\. arxd is busy\./)).toBeTruthy();
+    await settle();
+    expect(openConsole).toHaveBeenCalledTimes(1);
+  });
+
+  test('(d) Reconnect on a closed console reloads both and obeys the same order', async () => {
+    const { held, openConsole } = await consoleWithHeldHosts();
+    await act(async () => held[0].resolve(offlineAtlas));
+    await screen.findByText('atlas is offline (No heartbeat for 3 hours), so its VMs have no console.');
+    fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
+    expect(await screen.findByText('Checking the host before connecting…')).toBeTruthy();
+    expect(held).toHaveLength(2);
+    expect(openConsole).not.toHaveBeenCalled();
+    await act(async () => held[1].resolve(FIXTURE_HOSTS));
+    expect(await screen.findByRole('img', { name: /Console of ubuntu-build-02/ })).toBeTruthy();
+    await settle();
+    expect(openConsole).toHaveBeenCalledTimes(1);
+  });
+
+  test('a stopped VM closes at once, even while the host list is still loading', async () => {
+    window.location.hash = '#/vms/win11-test-04/console';
+    const api = new StandinApi();
+    await api.login(DEMO_CREDENTIALS);
+    vi.spyOn(api, 'listHosts').mockImplementation(() => new Promise<Host[]>(() => {}));
+    const openConsole = vi.spyOn(api, 'openConsole');
+    render(<App api={api} />);
+    expect(await screen.findByText('win11-test-04 is stopped; start it to see its console.')).toBeTruthy();
+    expect(openConsole).not.toHaveBeenCalled();
+  });
+
+  test('a bare "/" never takes focus; Ctrl+K and ⌘K focus the search', async () => {
+    await signIn();
+    await screen.findByRole('list', { name: 'Hosts' });
+    const search = screen.getByRole('combobox', { name: 'Search hosts, VMs and tools' });
+    expect(search.getAttribute('aria-keyshortcuts')).toBe('Control+K Meta+K');
+    for (const key of ['/', 'k', 'K']) {
+      fireEvent.keyDown(document.body, { key });
+      expect(document.activeElement, key).not.toBe(search);
+    }
+    fireEvent.keyDown(document.body, { key: 'k', ctrlKey: true });
+    expect(document.activeElement).toBe(search);
+    search.blur();
+    fireEvent.keyDown(document.body, { key: 'k', metaKey: true });
+    expect(document.activeElement).toBe(search);
   });
 });

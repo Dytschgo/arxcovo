@@ -10,7 +10,7 @@ type Data = { status: 'idle' | 'loading' } | { status: 'ready'; hosts: Host[]; v
 /**
  * Top-bar search: an ARIA combobox (focus stays in the input; options are
  * reached with the arrows through aria-activedescendant) whose jump list
- * filters hosts, VMs and tools on the client.
+ * filters hosts, VMs and tools on the client. Ctrl+K (⌘K) focuses it.
  *
  * On focus it reuses the host and VM lists a view already loaded in this
  * session (the inventory); only a missing or stale list is requested, and
@@ -18,6 +18,13 @@ type Data = { status: 'idle' | 'loading' } | { status: 'ready'; hosts: Host[]; v
  * session changed, or after the search unmounted, is ignored, so a late
  * answer from an old session can never sign the owner out of a new one.
  */
+/** Ctrl+K or ⌘K, without Alt or Shift. A bare character never counts. */
+export function isSearchShortcut(event: Pick<globalThis.KeyboardEvent, 'key' | 'ctrlKey' | 'metaKey' | 'altKey' | 'shiftKey'>): boolean {
+  return (event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'k';
+}
+
+const APPLE = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform ?? '');
+
 export function Search() {
   const api = useApi();
   const { expire } = useSession();
@@ -33,10 +40,10 @@ export function Search() {
   const listId = useId();
 
   useEffect(() => {
+    // Ctrl+K (⌘K on a Mac) focuses the search. A modifier is required, so no
+    // single character key is taken over (WCAG 2.2 SC 2.1.4).
     const onKey = (event: globalThis.KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (event.key !== '/' || event.ctrlKey || event.metaKey || event.altKey) return;
-      if (target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable)) return;
+      if (!isSearchShortcut(event)) return;
       event.preventDefault();
       input.current?.focus();
     };
@@ -137,6 +144,7 @@ export function Search() {
         aria-expanded={expanded}
         aria-controls={listId}
         aria-autocomplete="list"
+        aria-keyshortcuts="Control+K Meta+K"
         aria-activedescendant={expanded && active >= 0 && items[active] ? `${listId}-${active}` : undefined}
         placeholder="Search hosts, VMs, tools"
         autoComplete="off"
@@ -148,7 +156,7 @@ export function Search() {
         onChange={e => { setQuery(e.target.value); setActive(-1); setOpen(true); }}
         onKeyDown={onKeyDown}
       />
-      <kbd aria-hidden="true">/</kbd>
+      <kbd aria-hidden="true">{APPLE ? '⌘K' : 'Ctrl K'}</kbd>
       <div className="jump" hidden={!expanded}>
         <div id={listId} role="listbox" aria-label="Search results">
           {options.map((item, i) => (

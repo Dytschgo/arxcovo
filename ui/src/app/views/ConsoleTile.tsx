@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { isApiError, type ConsoleStatus, type Host, type Vm } from '../../api/types';
 import { useApi, useSession } from '../context';
-import { consoleClosedReason } from '../derive';
+import { consoleGate, type HostState } from '../derive';
 import { formatDate } from '../format';
 import { Icon } from '../icons';
 import { href } from '../router';
@@ -107,11 +107,13 @@ function Viewer({ vm, title }: { vm: Vm; title: ReactNode }) {
  * waits for "Open console" so a visit to the VM never opens a stream by itself.
  * `onRecheck` reloads the VM and host so a closed console can come back.
  */
-export function ConsoleTile({ vm, host, live, onRecheck }: { vm: Vm; host: Host | undefined; live: boolean; onRecheck(): void }) {
-  const closed = consoleClosedReason(vm, host);
+export function ConsoleTile({ vm, hostState, live, onRecheck }: { vm: Vm; hostState: HostState; live: boolean; onRecheck(): void }) {
+  const gate = consoleGate(vm, hostState);
+  const host = hostState.status === 'ready' ? hostState.host : undefined;
   const title = <h2 id="console-title"><Icon name="monitor" />Console</h2>;
   let body;
-  if (closed !== null) {
+  if (gate.status === 'closed') {
+    const closed = gate.reason;
     body = (
       <>
         <div className="console-bar">
@@ -122,6 +124,20 @@ export function ConsoleTile({ vm, host, live, onRecheck }: { vm: Vm; host: Host 
         </div>
         <div className="console-screen" data-status="closed">
           <p className="console-placeholder console-closed" role="status"><Icon name={host?.reachability === 'offline' ? 'off' : vm.state === 'failed' ? 'fail' : 'stop'} />{closed}</p>
+        </div>
+        <p className="console-meta"><span className="console-lock"><Icon name="lock" /><span className="console-mode">View only</span> · interactive VNC later</span></p>
+      </>
+    );
+  } else if (live && gate.status === 'checking') {
+    // No ticket yet: an offline host would only be learned after the stream opened.
+    body = (
+      <>
+        <div className="console-bar">
+          {title}
+          <ConsoleSessionStatus status="connecting" />
+        </div>
+        <div className="console-screen" data-status="connecting">
+          <p className="console-placeholder" role="status">Checking the host before connecting…</p>
         </div>
         <p className="console-meta"><span className="console-lock"><Icon name="lock" /><span className="console-mode">View only</span> · interactive VNC later</span></p>
       </>

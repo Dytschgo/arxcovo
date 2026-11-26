@@ -6,6 +6,7 @@ import { Icon, OsGlyph } from '../icons';
 import { href } from '../router';
 import { ArchBadge, BackLink, Empty, ErrorState, Facts, Loaded, Loading, Maybe, NullValue, OsBadge, Tile, VmStatus, useNow, usePageHeading } from '../ui';
 import { ConsoleTile } from './ConsoleTile';
+import type { HostState } from '../derive';
 import { expiryLabel } from './VmsView';
 
 // VM detail with the console tile (docs/design/night-orbit/vm.html). Static VM
@@ -79,6 +80,7 @@ export function VmPage({ id, console: live }: { id: string; console: boolean }) 
         {vm => {
           const hosts = hostList.status === 'ready' ? hostList.data : null;
           const host = hosts?.find(h => h.id === vm.hostId);
+          const hostState: HostState = hostList.status === 'loading' ? { status: 'pending' } : hostList.status === 'error' ? { status: 'unavailable' } : { status: 'ready', host };
           const hostName = host?.name ?? vm.hostId;
           const offline = host?.reachability === 'offline';
           return (
@@ -119,7 +121,9 @@ export function VmPage({ id, console: live }: { id: string; console: boolean }) 
                 </div>
               </section>
 
-              <ConsoleTile key={`${vm.id}:${vm.state}:${host?.reachability ?? ''}`} vm={vm} host={host} live={live} onRecheck={() => { data.reload(); hostList.reload(); }} />
+              {/* A stable key: host metadata arriving never remounts a live viewer
+                  (the gate keeps the viewer out until the host is known). */}
+              <ConsoleTile key={vm.id} vm={vm} hostState={hostState} live={live} onRecheck={() => { data.reload(); hostList.reload(); }} />
               <div className="s4 stack">
                 <Resources vm={vm} host={host} />
                 <Tile id="vm-facts" title="Overview">

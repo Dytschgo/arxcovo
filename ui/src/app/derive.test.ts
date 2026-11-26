@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import { FIXTURE_ACTIVITY, FIXTURE_HOSTS, FIXTURE_VMS } from '../api/fixtures';
 import type { Host, Vm } from '../api/types';
-import { JUMP_LIMIT, allocation, boardTotals, consoleClosedReason, groupBoard, jumpItems, outcomeCounts } from './derive';
+import { JUMP_LIMIT, allocation, boardTotals, consoleClosedReason, consoleGate, groupBoard, jumpItems, outcomeCounts } from './derive';
 
 const GiB = 1024 ** 3;
 const host = (id: string, patch: Partial<Host> = {}): Host => ({ ...FIXTURE_HOSTS[0], id, name: id, ...patch });
@@ -157,5 +157,29 @@ describe('outcome counts', () => {
     expect(counts.map(c => c.outcome)).toEqual(['started', 'succeeded', 'failed', 'rejected', 'refused', 'interrupted']);
     expect(counts.reduce((a, c) => a + c.count, 0)).toBe(12);
     expect(Object.fromEntries(counts.map(c => [c.outcome, c.count]))).toEqual({ started: 1, succeeded: 6, failed: 2, rejected: 1, refused: 1, interrupted: 1 });
+  });
+});
+
+describe('console gate (when a live console may ask for a ticket)', () => {
+  const online = host('h1', { reachability: 'online', reachabilityReason: null });
+  const offline = host('h2', { reachability: 'offline', reachabilityReason: 'gone' });
+
+  test('a stopped or failed VM is closed at once, whatever the host list is doing', () => {
+    for (const state of ['stopped', 'failed'] as const) {
+      for (const hostState of [{ status: 'pending' }, { status: 'unavailable' }, { status: 'ready', host: online }] as const) {
+        expect(consoleGate(vm('v', 'h1', { state }), hostState).status, `${state} ${hostState.status}`).toBe('closed');
+      }
+    }
+  });
+
+  test('while the host list loads, a running VM waits', () => {
+    expect(consoleGate(vm('v', 'h1'), { status: 'pending' })).toEqual({ status: 'checking' });
+  });
+
+  test('an offline host closes with its reason; a reachable or unknown host, or a failed list, connects', () => {
+    expect(consoleGate(vm('box', 'h2'), { status: 'ready', host: offline })).toEqual({ status: 'closed', reason: 'h2 is offline (gone), so its VMs have no console.' });
+    expect(consoleGate(vm('v', 'h1'), { status: 'ready', host: online })).toEqual({ status: 'connect' });
+    expect(consoleGate(vm('v', 'gone'), { status: 'ready', host: undefined })).toEqual({ status: 'connect' });
+    expect(consoleGate(vm('v', 'h1'), { status: 'unavailable' })).toEqual({ status: 'connect' });
   });
 });

@@ -436,7 +436,7 @@ main:focus-visible { outline-offset: -4px; }
 .search input, .filter-name input {
   inline-size: 100%;
   min-block-size: 34px;
-  padding: 0 36px 0 34px;
+  padding: 0 58px 0 34px;
   border: 1px solid var(--edge);
   border-radius: var(--r-ctl);
   background: none;

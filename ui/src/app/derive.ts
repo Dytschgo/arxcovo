@@ -119,6 +119,30 @@ export function jumpItems(query: string, hosts: readonly Host[], vms: readonly V
 
 // --- Console ----------------------------------------------------------------
 
+/** What the page knows about the VM's host: still loading, unavailable (the list failed), or settled. */
+export type HostState = { status: 'pending' } | { status: 'unavailable' } | { status: 'ready'; host: Host | undefined };
+
+export type ConsoleGate = { status: 'closed'; reason: string } | { status: 'checking' } | { status: 'connect' };
+
+/**
+ * Whether a live console may ask the server for a ticket yet. A stopped or
+ * failed VM is closed at once (its own state is known). Otherwise the
+ * console waits while the host list is still loading, so a VM on an offline
+ * host never sends a ticket; it closes once the host is known to be offline,
+ * and connects when the host is reachable, unknown to the list, or the list
+ * itself failed (the server then answers for the ticket).
+ */
+export function consoleGate(vm: Vm, hostState: HostState): ConsoleGate {
+  const own = consoleClosedReason(vm, undefined);
+  if (own !== null) return { status: 'closed', reason: own };
+  if (hostState.status === 'pending') return { status: 'checking' };
+  if (hostState.status === 'ready') {
+    const reason = consoleClosedReason(vm, hostState.host);
+    if (reason !== null) return { status: 'closed', reason };
+  }
+  return { status: 'connect' };
+}
+
 /**
  * Why the console opens straight to "closed" without asking the server, or
  * null when it should connect. An offline host comes first: nothing on it can

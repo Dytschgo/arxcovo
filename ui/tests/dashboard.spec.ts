@@ -125,8 +125,12 @@ test('console: a stopped VM opens closed with the reason, without a stream', asy
 test('search: the jump list filters hosts, VMs and tools and jumps with the keyboard', async ({ page }) => {
   await signIn(page);
   await expect(page.getByRole('list', { name: 'Hosts' })).toBeVisible();
-  await page.keyboard.press('/');
   const search = page.getByRole('combobox', { name: 'Search hosts, VMs and tools' });
+  // A bare "/" is an ordinary key (WCAG 2.2 SC 2.1.4); Ctrl+K focuses the search.
+  await page.keyboard.press('/');
+  await expect(search).not.toBeFocused();
+  await expect(search).toHaveAttribute('aria-keyshortcuts', 'Control+K Meta+K');
+  await page.keyboard.press('Control+K');
   await expect(search).toBeFocused();
   await search.fill('cargo');
   const options = page.getByRole('listbox', { name: 'Search results' }).getByRole('option');
@@ -146,21 +150,34 @@ test('search: Tab leaves the combobox and closes the list; at 390 px the open li
   const options = page.getByRole('listbox', { name: 'Search results' }).getByRole('option');
   await search.fill('ubuntu');
   await expect(options).toHaveCount(2);
+  // Tab leaves the combobox for the next control (Sign out) and closes the list.
   await page.keyboard.press('Tab');
+  await expect(page.getByRole('button', { name: 'Sign out' })).toBeFocused();
   await expect(search).toHaveAttribute('aria-expanded', 'false');
-  await expect(search).not.toBeFocused();
   expect(await page.evaluate(() => document.activeElement?.getAttribute('role') ?? null)).not.toBe('option');
-  await page.keyboard.press('Enter');
-  await expect(page).toHaveURL(/#\/hosts$/);
 
+  // Enter on a closed list does nothing: open it, Escape, then Enter on the field itself.
+  await search.focus();
+  await expect(options).toHaveCount(2);
+  await search.press('Escape');
+  await expect(search).toBeFocused();
+  await expect(search).toHaveAttribute('aria-expanded', 'false');
+  await search.press('Enter');
+  await expect(page).toHaveURL(/#\/hosts$/);
+  await expect(page.getByRole('navigation', { name: 'Main' })).toBeVisible();
+  await expect(page.getByRole('list', { name: 'Hosts' })).toBeVisible();
+
+  // At 390 px every option of the open list is on screen (bounds read in one evaluation).
   await page.setViewportSize({ width: 390, height: 844 });
   await search.fill('a');
-  await expect(options.first()).toBeVisible();
-  for (const option of await options.all()) {
-    const box = (await option.boundingBox())!;
-    expect(box.x, await option.textContent() ?? '').toBeGreaterThanOrEqual(0);
-    expect(box.x + box.width).toBeLessThanOrEqual(390);
-  }
+  await expect(options).toHaveCount(8);
+  const bounds = await options.evaluateAll(rows => rows.map(row => {
+    const box = row.getBoundingClientRect();
+    return [box.left, box.right, box.width];
+  }));
+  expect(bounds).toHaveLength(8);
+  expect(bounds.every(([left, right, width]) => width > 0 && left >= 0 && right <= 390), JSON.stringify(bounds)).toBe(true);
+  await expect(search).toHaveAttribute('aria-expanded', 'true');
   expect(await overflowX(page)).toBeLessThanOrEqual(0);
   await shot(page, '12-search-390');
 });
