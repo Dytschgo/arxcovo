@@ -386,3 +386,60 @@ fn test_release_rejects_stale_epoch_and_conflicting_input() -> Result<()> {
         .store()
         .transact(|db| assert_release(db, generation, Some("dirty"), AFTER, 3))
 }
+
+#[test]
+fn starting_stop_with_clean_on_time_release_settles_stopped_without_recovery() -> Result<()> {
+    for (disposition, expected, state, confirmed) in [
+        (
+            StopDisposition::CleanRelease,
+            Status::Succeeded,
+            1,
+            Some(true),
+        ),
+        (
+            StopDisposition::DirtyRelease,
+            Status::Interrupted,
+            3,
+            Some(false),
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let (ws, slots, ids) = clone_pair(&fixture)?;
+        // The start epoch is installed but the VM never reached running.
+        fixture
+            .store()
+            .transact(|db| Ok(db.execute("UPDATE vm_instances SET state=1 WHERE id=?1", [VM])?))?;
+        let held = proof(&ws, slots, ids, disposition);
+        let observed = observe(&held);
+        let now = Instant::now();
+        let (id, stop) = admit_stop(fixture.store(), now + Duration::from_secs(10))?;
+        assert_eq!(
+            observed.commit(fixture.store(), Some(&stop), || clock(now))?,
+            Some(expected)
+        );
+        let clean = disposition == StopDisposition::CleanRelease;
+        fixture.store().transact(|db| {
+            let committed = if clean { "clean" } else { "dirty" };
+            assert_release(db, slots.disk.generation, Some(committed), AFTER, state)?;
+            assert_eq!(receipt(db, id)?.0, expected.code());
+            assert_eq!(receipt(db, id)?.3, confirmed);
+            Ok(())
+        })?;
+    }
+    assert_admission_closed();
+    Ok(())
+}
+
+#[test]
+fn live_stop_release_commits_without_a_stop_receipt() -> Result<()> {
+    let fixture = Fixture::new();
+    let (workspace, slots, ids) = clone_pair(&fixture)?;
+    let proof = proof(&workspace, slots, ids, StopDisposition::DirtyRelease);
+    let release = observe(&proof);
+    release.try_commit_stop(fixture.store(), None, || clock(Instant::now()))?;
+    fixture
+        .store()
+        .transact(|db| assert_release(db, slots.disk.generation, Some("dirty"), AFTER, 3))?;
+    assert_admission_closed();
+    Ok(())
+}

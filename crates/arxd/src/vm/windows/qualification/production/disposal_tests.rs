@@ -1472,6 +1472,132 @@ fn orphan_restart_stale_owner_ack_cannot_skip_durable_release_or_backoff() {
     );
 }
 
+/// Mirrors start admission: the same transaction records the operation,
+/// invalidates the release and installs the never-created writer epoch.
+/// `created` then crosses the checked creation edge with that boot marker.
+fn arm_admitted(fixture: &SweepFixture, vm: Id, pair: PairSlots, created: Option<Hash>) -> Id {
+    use crate::store::vm::native::recovery;
+    let generation = pair.disk.generation;
+    let origin = created.map(|boot| {
+        super::super::recovery::StorePins::open_with_owner(&fixture.production, fixture.owner_sid())
+            .unwrap()
+            .origin(fixture.store(), boot)
+            .unwrap()
+    });
+    fixture
+        .store()
+        .transact(|db| {
+            let receipt = Binding {
+                principal: "alice",
+                key: RequestId::parse("0000000000000065000000000000aaaa").unwrap(),
+                subject: Subject::Vm(vm),
+                action: 3,
+            }
+            .record(db, NOW, Some(vm), None)?
+            .receipt;
+            let epoch = db.query_row(
+                "SELECT operation_id FROM vm_operations WHERE activity_id=?1",
+                [receipt.activity_id],
+                |row| row.get(0),
+            )?;
+            store::snapshot::invalidate_release(db, vm, epoch)?;
+            let GenerationState::Bound { scope, .. } = disposal::generation_state(db, generation)?
+            else {
+                unreachable!();
+            };
+            recovery::admit_epoch(db, scope, epoch)?;
+            if let Some(origin) = origin {
+                recovery::record_job(db, scope, epoch, origin)?;
+            }
+            Ok(epoch)
+        })
+        .unwrap()
+}
+
+#[test]
+fn orphan_restart_before_the_create_edge_releases_only_the_unchanged_pair() {
+    for case in ["unchanged", "changed", "created", "created wrong boot"] {
+        let mut fx = SweepFixture::new_with_store(true);
+        let (vm, slots, evidence) = fx.active_clone(65);
+        let boot = boot::marker().unwrap();
+        let created = match case {
+            "created" => Some(boot),
+            "created wrong boot" => {
+                let mut wrong = boot;
+                wrong[0] ^= 0x80;
+                Some(wrong)
+            }
+            _ => None,
+        };
+        // The process stops between admission and, for the first two cases,
+        // the creation checkpoint. Startup recovery claims the stopped VM.
+        let epoch = arm_admitted(&fx, vm, slots, created);
+        if case == "changed" {
+            std::fs::write(fx.slot_file(slots.disk), b"changed without a creation edge").unwrap();
+        }
+        fx.reopen();
+        assert_eq!(
+            fx.count("SELECT count(*) FROM vm_instances WHERE state=3"),
+            1,
+            "{case}"
+        );
+        let guards = GenerationGuards::default();
+        let custody =
+            NativeRecovery::open_with_owner(fx.store(), fx.state_root(), fx.owner_sid(), &guards)
+                .unwrap();
+        let runtime = RestartReaper {
+            owned: false,
+            can_fence: true,
+            retries: Cell::new(0),
+        };
+        fx.clock.advance(0, 0);
+        assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap(), "{case}");
+        let committed: Option<String> = fx
+            .store()
+            .transact(|db| {
+                Ok(db.query_row(
+                    "SELECT disposition FROM vm_snapshot_release WHERE generation=?1 AND epoch=?2",
+                    params![slots.disk.generation, epoch],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        // Before the edge only an unchanged pair settles, and clean. After
+        // it the exact Job origin is still required, and the release is dirty.
+        let expected = match case {
+            "unchanged" => Some("clean"),
+            "created" => Some("dirty"),
+            _ => None,
+        };
+        assert_eq!(committed.as_deref(), expected, "{case}");
+        assert_eq!(
+            fx.count("SELECT sum(persistent) FROM vm_disk_claims"),
+            CLAIM as i64,
+            "{case}"
+        );
+        assert_eq!(runtime.retries.get(), 0, "{case}");
+        if case == "unchanged" {
+            let digest: Hash = fx
+                .store()
+                .transact(|db| {
+                    Ok(db.query_row(
+                        "SELECT content_digest FROM vm_artifacts WHERE object_key=?1",
+                        [slots.disk.key],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(digest, evidence[0].pin.sha256);
+            fx.clock.advance(0, 0);
+            assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+            assert_eq!(
+                fx.count("SELECT count(*) FROM vm_instances WHERE state=1"),
+                1
+            );
+        }
+    }
+}
+
 #[test]
 fn orphan_checkpointed_build_requires_both_worker_quiescence_and_writer_origin() {
     for fault in ["missing origin", "owned", "wrong boot", "released"] {

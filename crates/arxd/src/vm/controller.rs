@@ -2729,6 +2729,256 @@ impl<C: Clock> VmController<C> {
         &self.store
     }
 
+    /// Read-only replay lookup for occupied-slot or already-known replay
+    /// checks. Preserves exact binding, key-collision and stale-key checks
+    /// without advancing `vm_retry_clock` or pruning expired terminal rows.
+    pub(crate) fn foreground_replay_readonly(
+        &self,
+        principal: &str,
+        key: RequestId,
+        subject: Subject<'_>,
+        action: i64,
+    ) -> Result<Result<Option<store::Replay>, Refusal>> {
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        let closed = gate.closed;
+        let binding = store::Binding {
+            principal,
+            key,
+            subject,
+            action,
+        };
+        self.store
+            .read_only(|db| binding.replay_readonly(db, utc(self.clock.now())?, closed))
+    }
+
+    /// Capture the sealed source and exact stopped pair in the same transaction
+    /// that invalidates its release and installs the start's writer epoch.
+    pub(crate) fn admit_native_start(
+        &self,
+        _installation: &super::test_issuer::Installation,
+        request: &Request<'_>,
+        host: HostObservation,
+        resources: Resources,
+    ) -> Result<(Admission, Option<store::snapshot::Active>)> {
+        ensure!(
+            matches!(request.operation, Operation::Start),
+            "invalid TEST start"
+        );
+        validate_principal(request.principal)?;
+        let gate = self
+            .gate
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        self.store.try_native_transaction(|db| {
+            let clock = self.clock.now();
+            let active = store::snapshot::active(db, request.vm, false)?;
+            let mut decision = self.admit_inner(db, request, host, resources, clock, &gate)?;
+            if let Admission::Admitted(worker) = &mut decision {
+                let (slots, pins) = active
+                    .ok_or_else(|| anyhow::anyhow!("TEST start has no released pair"))?
+                    .pair;
+                let scope = Self::bound_native_workspace(db, slots.disk.generation)?;
+                ensure!(
+                    store::native::pair_matches(db, scope, [slots.disk, slots.vars], pins)?,
+                    "TEST start has no bound released pair"
+                );
+                // Record the exact never-created writer epoch, so a restart
+                // before the creation checkpoint still reaches recovery.
+                let epoch = worker
+                    .admitted()
+                    .ok_or_else(|| anyhow::anyhow!("invalid TEST start"))?
+                    .operation;
+                store::native::recovery::admit_epoch(db, scope, epoch)?;
+                worker.deadline = clock.monotonic + Duration::from_secs(360);
+                return Ok((decision, active));
+            }
+            Ok((decision, None))
+        })
+    }
+
+    pub(crate) fn native_workspace_scope(&self, generation: Id) -> Result<store::native::Scope> {
+        let db = self.store.try_live_connection()?;
+        Self::bound_native_workspace(&db, generation)
+    }
+
+    fn bound_native_workspace(db: &Connection, generation: Id) -> Result<store::native::Scope> {
+        use store::native::disposal::{GenerationDisposal, GenerationState, generation_state};
+        match generation_state(db, generation)? {
+            GenerationState::Bound {
+                scope,
+                disposal: GenerationDisposal::None,
+            } => Ok(scope),
+            _ => anyhow::bail!("TEST workspace is unbound"),
+        }
+    }
+
+    pub(crate) fn native_clock(&self) -> ClockReading {
+        self.clock.now()
+    }
+
+    /// Nonblocking monitor/projection read. An already admitted stop, an
+    /// expired lease or replacement of either durable identity closes the run.
+    pub(crate) fn native_run_current(
+        &self,
+        principal: &str,
+        target: store::native::release::Target,
+        running: bool,
+    ) -> Result<bool> {
+        let db = self.store.try_live_connection()?;
+        Self::native_run_matches(&db, principal, target, running, utc(self.clock.now())?)
+    }
+
+    fn native_run_matches(
+        db: &Connection,
+        principal: &str,
+        target: store::native::release::Target,
+        running: bool,
+        now: i64,
+    ) -> Result<bool> {
+        Ok(store::count(db,
+            "SELECT count(*) FROM vm_instances v
+             JOIN vm_generations g ON g.vm_id=v.id AND g.active=1 AND g.static_id IS NULL
+             JOIN vm_native_generations n ON n.generation=g.id AND n.state='bound'
+             JOIN vm_snapshot_release r ON r.generation=g.id AND r.disposition IS NULL
+             JOIN vm_operations o ON o.operation_id=r.epoch AND o.vm=v.id AND o.action=3
+             WHERE v.id=?1 AND g.id=?2 AND r.epoch=?3 AND v.principal=?4 AND o.principal=?4
+               AND v.expires_ms>?5 AND v.state=?6 AND o.status=?7
+               AND NOT EXISTS(SELECT 1 FROM vm_operations s WHERE s.vm=v.id AND s.action=4 AND s.status=0)",
+            params![target.vm, target.generation, target.epoch, principal, now,
+                if running { 2 } else { 1 }, if running { 1 } else { 0 }],
+        )? == 1)
+    }
+
+    pub(crate) fn finish_native_start(
+        &self,
+        worker: &PendingOperation,
+        principal: &str,
+        target: store::native::release::Target,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<bool> {
+        self.check_worker(worker)?;
+        self.store.try_native_transaction(|db| {
+            let clock = self.clock.now();
+            let now = utc(clock)?;
+            if worker
+                .admitted()
+                .is_none_or(|admitted| admitted.operation != target.epoch)
+                || !Self::native_run_matches(db, principal, target, false, now)?
+                || store::count(
+                    db,
+                    "SELECT count(*) FROM vm_native_writer
+                    WHERE generation=?1 AND epoch=?2 AND boot IS NOT NULL",
+                    params![target.generation, target.epoch],
+                )? != 1
+                || clock.monotonic >= worker.deadline
+                || cancelled()
+            {
+                return Ok(false);
+            }
+            let status =
+                store::settle_operation(db, worker.activity_id, now, Completion::Succeeded)?;
+            let clock = self.clock.now();
+            ensure!(
+                clock.monotonic < worker.deadline
+                    && Self::native_run_matches(db, principal, target, true, utc(clock)?)?
+                    && !cancelled(),
+                "TEST start lost custody during commit"
+            );
+            Ok(status == Status::Succeeded)
+        })
+    }
+
+    /// Only an extant run owner can supply the exact target. The stop receipt
+    /// and interruption of an in-progress start are atomic.
+    pub(crate) fn admit_owned_native_stop(
+        &self,
+        principal: &str,
+        key: RequestId,
+        target: store::native::release::Target,
+    ) -> Result<Result<(Id, Option<store::native::release::StopReceipt>), Refusal>> {
+        validate_principal(principal)?;
+        self.store.try_native_transaction(|db| {
+            let clock = self.clock.now();
+            let now = utc(clock)?;
+            let binding = store::Binding {
+                principal,
+                key,
+                subject: Subject::Vm(target.vm),
+                action: Action::Stop as i64,
+            };
+            match binding.replay(db, now, false)? {
+                Ok(Some(replay)) => return Ok(Ok((replay.operation.id, None))),
+                Err(reason) => return Ok(Err(reason)),
+                Ok(None) => {}
+            }
+            let start = db
+                .query_row(
+                    "SELECT o.activity_id,o.status FROM vm_instances v
+                 JOIN vm_generations g ON g.vm_id=v.id AND g.active=1 AND g.static_id IS NULL
+                 JOIN vm_native_generations n ON n.generation=g.id AND n.state='bound'
+                 JOIN vm_snapshot_release r ON r.generation=g.id AND r.disposition IS NULL
+                 JOIN vm_operations o ON o.vm=v.id AND o.operation_id=r.epoch AND o.action=3
+                 WHERE v.id=?1 AND g.id=?2 AND r.epoch=?3 AND v.principal=?4 AND o.principal=?4
+                   AND v.state IN (1,2,3) AND NOT EXISTS(SELECT 1 FROM vm_operations s
+                       WHERE s.vm=v.id AND s.action=4 AND s.status=0)",
+                    params![target.vm, target.generation, target.epoch, principal],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let Some((activity, status)) = start else {
+                return Ok(Err(Refusal::Busy));
+            };
+            if store::count(db, "SELECT count(*) FROM vm_operations WHERE status=0", [])?
+                >= store::MAX_CALLER_PENDING
+                && status != Status::Pending.code()
+            {
+                return Ok(Err(Refusal::PendingFull));
+            }
+            if status == Status::Pending.code() {
+                store::finish(db, activity, Status::Interrupted, now, Some(false))?;
+            }
+            let operation = binding.record(db, now, Some(target.vm), None)?;
+            let stamp = store::native::release::StopReceipt::at_admission(
+                db,
+                target.vm,
+                operation.receipt.activity_id,
+                clock.monotonic + Duration::from_secs(120),
+            )?;
+            store::require_headroom(db)?;
+            Ok(Ok((operation.id, Some(stamp))))
+        })
+    }
+
+    /// Fence the exact unresolved writer even if no operation receipt is
+    /// pending. An already owned expiry/recovery claim keeps its identity.
+    pub(crate) fn fence_native_run(&self, target: store::native::release::Target) -> Result<()> {
+        self.store.try_native_transaction(|db| {
+            let state = db
+                .query_row(
+                    "SELECT v.state FROM vm_instances v JOIN vm_generations g
+                 ON g.vm_id=v.id AND g.active=1 AND g.static_id IS NULL
+                 JOIN vm_snapshot_release r ON r.generation=g.id AND r.disposition IS NULL
+                 WHERE v.id=?1 AND g.id=?2 AND r.epoch=?3",
+                    params![target.vm, target.generation, target.epoch],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            let Some(state) = state else { return Ok(()) };
+            let now = utc(self.clock.now())?;
+            if matches!(state, 1 | 2) {
+                let id = store::activity(db, "arxd", target.vm, Action::Recover, now)?;
+                db.execute(
+                    "UPDATE vm_instances SET state=3,cleanup_id=?2 WHERE id=?1",
+                    params![target.vm, id],
+                )?;
+            }
+            store::interrupt_pending(db, target.vm, now, false)
+        })
+    }
+
     /// The durable admission one native TEST effect requires, read without
     /// waiting on the store. The worker's admitted claim, fixed by the
     /// controller at admission, names the principal, request, action and

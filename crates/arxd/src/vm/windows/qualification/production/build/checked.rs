@@ -26,10 +26,17 @@ impl<'a> HealthSession for CheckedHealth<'_, 'a> {
 
     async fn boot(&mut self, ready_by: Instant) -> Result<(), Q> {
         let fresh = self.fresh;
-        self.launch
-            .boot(self.cancel, move || fresh(ready_by), || true)
+        match self
+            .launch
+            .boot(self.cancel, ready_by, move || fresh(ready_by))
             .await
-            .map_err(|failed| failed.reason)
+        {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                let _ = self.launch.stop_generation(self.cancel, || true).await;
+                Err(reason)
+            }
+        }
     }
 
     async fn exchange(

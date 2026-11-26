@@ -705,8 +705,9 @@ class HeavyServiceGroupTests(unittest.TestCase):
 B2_TEST = "b2_snapshot_barrier_races_busy_unpublish_pending_removal_and_old_origin"
 B2_TEST_ATTR = "#[tokio::test]"
 B2_TESTS_DECL = "pub(crate) mod tests {"
-# Raw substring counts after the macOS gate was removed.
-B2_TESTS_CFG = 23
+# Raw substring counts after the macOS gate was removed, plus the one
+# Windows x86_64 gate on the included native TEST run fixture module.
+B2_TESTS_CFG = 24
 B2_TESTS_IGNORE = 0
 B2_DECL_CFG = 1
 B2_PATH_ATTRS = 0
