@@ -263,8 +263,47 @@ fn consumed_permit_requires_the_exact_seal_generation_workspace_and_kind() {
         workspace,
         seal_sha256: [7; 32],
         kind: PlanKind::Boot,
+        writer_epoch: [5; 16],
+        pair: None,
+        helper: None,
+        plan_sha256: [6; 32],
     };
     assert_eq!(check_permit(permit, permit), Ok(()));
+    let slot = ArtifactSlot {
+        generation: workspace.generation,
+        role: "disk",
+        key: [8; 16],
+    };
+    for changed in [
+        LaunchPermitBinding {
+            writer_epoch: [9; 16],
+            ..permit
+        },
+        LaunchPermitBinding {
+            pair: Some(PairSlots {
+                disk: slot,
+                vars: ArtifactSlot {
+                    role: "vars",
+                    key: [9; 16],
+                    ..slot
+                },
+            }),
+            ..permit
+        },
+        LaunchPermitBinding {
+            helper: Some(slot),
+            ..permit
+        },
+        LaunchPermitBinding {
+            plan_sha256: [9; 32],
+            ..permit
+        },
+    ] {
+        assert_eq!(
+            check_permit(permit, changed),
+            Err(NativeRefusal::QualificationMissing)
+        );
+    }
     for changed in [
         WorkspaceBinding {
             generation: [4; 16],
@@ -353,15 +392,14 @@ fn consumed_permit_requires_the_exact_seal_generation_workspace_and_kind() {
 }
 
 #[test]
-fn launch_permit_fence_requires_uninhabited_authority_and_non_echoed_target() {
+fn launch_permit_fence_requires_issuer_minted_authority_and_non_echoed_target() {
     struct RefusingPermit;
 
     impl LaunchPermit for RefusingPermit {
         fn consume(
             self,
             _target: LaunchTarget<'_, '_>,
-        ) -> Result<(LaunchPermitBinding, crate::vm::runtime::LaunchAuthority), NativeRefusal>
-        {
+        ) -> Result<crate::vm::runtime::LaunchAuthority, NativeRefusal> {
             Err(NativeRefusal::QualificationMissing)
         }
     }
@@ -371,7 +409,7 @@ fn launch_permit_fence_requires_uninhabited_authority_and_non_echoed_target() {
     fn assert_consume_returns_authority<P: LaunchPermit>(
         permit: P,
         target: LaunchTarget<'_, '_>,
-    ) -> Result<(LaunchPermitBinding, crate::vm::runtime::LaunchAuthority), NativeRefusal> {
+    ) -> Result<crate::vm::runtime::LaunchAuthority, NativeRefusal> {
         permit.consume(target)
     }
     fn assert_launch_retains_authority(
@@ -381,9 +419,15 @@ fn launch_permit_fence_requires_uninhabited_authority_and_non_echoed_target() {
     }
     let _ = assert_launch_retains_authority;
 
-    // While LaunchAuthority is uninhabited, Option<LaunchAuthority> cannot
-    // hold a Some value; NativeLaunch's `_authority` field is checked above.
-    assert_eq!(size_of::<Option<crate::vm::runtime::LaunchAuthority>>(), 0);
+    // Only the TEST issuer's private `Minted` token constructs the authority,
+    // which carries its own binding, and only a fixture installation opens
+    // that issuer before 7c 16.
+    let _: fn(&crate::vm::runtime::LaunchAuthority) -> LaunchPermitBinding =
+        crate::vm::runtime::LaunchAuthority::binding;
+    assert!(matches!(
+        crate::vm::runtime::CandidateRuntime::new(None).capability(),
+        crate::vm::runtime::NativeCapability::Unavailable(NativeRefusal::Disabled)
+    ));
 
     // Explicitly construct LaunchTarget without `..` so reintroducing an
     // echoed `binding` field fails compilation.
@@ -404,6 +448,7 @@ fn launch_permit_fence_requires_uninhabited_authority_and_non_echoed_target() {
         pair: None,
         installer: None,
         recipe: None,
+        helper: None,
         memory: 256 << 20,
         cpu_rate: 1000,
     };

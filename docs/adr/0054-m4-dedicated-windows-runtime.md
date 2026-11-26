@@ -1870,3 +1870,87 @@ fenced for owner recovery. The path provides no PID adoption, manual ledger
 edits, pathname deletion, or additional agent deletion tool. Native recovery
 is **unverified on real hardware**. Production TEST effect admission remains
 closed until the final issuer installation.
+
+## 7c amendment — explicit TEST opt-in, one permit per durable effect
+
+The VM runtime profile gains two optional fields. `execution_profile`
+defaults to `dedicated_account`, so a profile written before this
+amendment keeps its dedicated-account meaning and its two distinct local
+SIDs. `current_user` pins one canonical user SID for both roles; the
+native reader still checks it against the live non-elevated primary
+token. `test_qualification` is the explicit TEST opt-in. It requires an
+enabled `current_user` profile and names the private enrollment file, the
+dossier directory, the lowercase seal digest and the scope, with no
+overlap between the two paths and no unknown field. Any other shape
+refuses the whole profile. The general ADR 0029 host-account default is
+unchanged here.
+
+The issuer opens only when the held dossier's seal digest, scope, TEST
+class and recipe pair match that configuration exactly, and the profile's
+current-user SID names the enrollment owner whose live token the held
+reader verified. The Windows recipe must be the built-in catalog ID and
+the Ubuntu recipe must differ from it and from the web entry. It then
+takes its first selection-epoch observation through the typed freshness
+and high-water reads. The catalog reports the exact seal digest and both
+recipe pins after a fresh observation and before any owner-idle wait.
+
+The controller fixes each TEST worker's admitted request when it admits
+it: principal, request, action, operation and effect. A start, a clone, a
+build with its recipe, or a script with the digest of its exact bytes and
+its timeout. Worker fields and construction stay private to the
+controller. An intent follows that admission. The ledger must still hold
+the pending operation before the worker deadline, and its non-static
+target generation must be owned by that operation: a pending build, a
+creating clone, or an active generation whose unresolved writer epoch
+matches. A start's writer epoch is its own operation. Each worker mints
+one intent and the latch never resets. A replay receives no worker, so it
+mints nothing, and a stop mints no intent.
+
+The admitted effect decides what an intent may mint. A start boots its
+own pair with a selected recipe. A build stages its seed and VARS, boots
+and runs installers only for its own recipe and phase, and runs the
+checked helper. A clone runs only the checked helper, and a script runs
+only the admitted bytes and timeout. The issuer derives each effect's
+identity and ledger slots from its target: a boot's exact disk and VARS
+pair (or `verification_overlay` and VARS for a build's verification
+boot), a Mutate plan's identified helper slot, and none for an
+inspection. It mints one permit per identity. A launch permit binds the
+whole sealed plan, writer epoch, inputs, working directory, pair, helper
+slot, installer phase and deadline, recipe and limits. A staged-write
+permit binds its slot, content pin, recipe phase and deadline, and only
+the build's seed or VARS slot in a staging phase qualifies: the guest
+disk and Windows finalization are refused when the permit is issued, and
+the whole target is compared again when it is consumed. A script
+permit binds its bytes, timeout, generation and writer epoch. Consumption
+refuses any substitution. It then checks cancellation, the ledger
+admission and the deadline, takes a fresh epoch observation, and checks
+all three again. Only then does it issue the effect's own authority,
+within that observation's freshness. Launch, staged-write and script
+authorities are distinct immutable types with private fields, and the
+launch authority carries its full issuance binding: workspace, seal, plan
+kind, writer epoch, exact pair or helper slot, and a digest of the exact
+plan, working directory, installer stage, recipe and limits. The checked
+launch adapter recomputes that binding from its own target and refuses an
+authority issued for any other target. A transient refusal
+refuses only that effect, and confirmed drift revokes the epoch's effect
+authority.
+
+Recovery authority is separate. It needs the exact bound native workspace
+scope of a non-static generation, not a fresh selection, so a revoked or
+absent epoch cannot strand recovery. A generation with writer history
+needs its exact writer epoch: its unresolved release epoch, or, for
+staged work whose checked creation edge recorded the boot and store file
+pins in `vm_native_writer`, the generation's own epoch. Only positive
+proof of an untouched reservation, the v17 reservation row with no
+recorded origin and no release row, recovers without an epoch; a missing
+reservation row proves nothing. Recovery authority never converts into
+an effect authority.
+
+`LaunchAuthority` stays uninhabited off Windows x64. On Windows x64 only
+the issuer's private token constructs it or the other effect authorities,
+and only a fixture holds the installation that opens the issuer or mints
+recovery authority. The production installation lands with activation in
+7c 16, so configured input cannot reach an effect and production TEST
+admission stays closed. Static, Compose and public-egress dispatch never
+receive these authorities.
+Native issuance is **unverified on real hardware**.

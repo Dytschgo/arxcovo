@@ -29,10 +29,110 @@ pub enum NativeCapability {
     Qualified(LaunchAuthority),
 }
 
-/// Intentionally uninhabited until a reviewed issuer can bind the full
-/// qualification record and live evidence to a particular owned operation.
+/// One checked process creation's authority, carrying the binding it was
+/// issued for. Off Windows x64 it is uninhabited. On Windows x64 only a
+/// consumed TEST launch permit mints it, and no production path installs
+/// that issuer before 7c 16. Static and public-egress dispatch never
+/// receive one. Staged writes and guest scripts have their own types.
 pub struct LaunchAuthority {
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     _closed: std::convert::Infallible,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    _issued: super::test_issuer::Minted,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    binding: Box<super::qualification::LaunchPermitBinding>,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl LaunchAuthority {
+    pub(super) fn new(
+        issued: super::test_issuer::Minted,
+        binding: super::qualification::LaunchPermitBinding,
+    ) -> Self {
+        Self {
+            _issued: issued,
+            binding: Box::new(binding),
+        }
+    }
+
+    pub(crate) fn binding(&self) -> super::qualification::LaunchPermitBinding {
+        *self.binding
+    }
+}
+
+/// One staged write's authority, for exactly the target it names.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) struct StageAuthority {
+    _issued: super::test_issuer::Minted,
+    target: super::qualification::StageTarget,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl StageAuthority {
+    pub(super) fn new(
+        issued: super::test_issuer::Minted,
+        target: super::qualification::StageTarget,
+    ) -> Self {
+        Self {
+            _issued: issued,
+            target,
+        }
+    }
+
+    pub(crate) fn target(&self) -> &super::qualification::StageTarget {
+        &self.target
+    }
+}
+
+/// One guest script's authority, for exactly the admitted bytes, timeout,
+/// generation and writer epoch.
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the script channel consumes it in 7c 14")
+)]
+pub(crate) struct ScriptAuthority {
+    _issued: super::test_issuer::Minted,
+    script: super::qualification_record::Hash,
+    timeout_s: u32,
+    generation: super::Id,
+    writer_epoch: super::Id,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the script channel consumes it in 7c 14")
+)]
+impl ScriptAuthority {
+    pub(super) fn new(
+        issued: super::test_issuer::Minted,
+        script: super::qualification_record::Hash,
+        timeout_s: u32,
+        generation: super::Id,
+        writer_epoch: super::Id,
+    ) -> Self {
+        Self {
+            _issued: issued,
+            script,
+            timeout_s,
+            generation,
+            writer_epoch,
+        }
+    }
+
+    /// True only for the exact script this authority was issued for.
+    pub(crate) fn names(
+        &self,
+        generation: super::Id,
+        writer_epoch: super::Id,
+        script: &str,
+        timeout_s: u32,
+    ) -> bool {
+        (self.generation, self.writer_epoch, self.timeout_s)
+            == (generation, writer_epoch, timeout_s)
+            && self.script == super::qualification_record::digest(script.as_bytes())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

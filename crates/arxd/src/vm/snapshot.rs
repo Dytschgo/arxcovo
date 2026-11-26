@@ -1140,7 +1140,7 @@ mod tests {
             budget.check()?;
             assert!(std::ptr::eq(plan, self.plan));
             assert!(budget.deadline() <= worker.deadline());
-            if !Arc::ptr_eq(&self.binding, &worker.binding) {
+            if !Arc::ptr_eq(&self.binding, worker.binding_for_test()) {
                 return Err(Refusal::Custody);
             }
             if self.fault == Fault::Capacity && self.bytes_written > 0 {
@@ -1319,11 +1319,7 @@ mod tests {
     }
 
     fn worker(now: Instant, after: Duration) -> PendingOperation {
-        PendingOperation {
-            activity_id: 1,
-            deadline: now + after,
-            binding: Arc::new(()),
-        }
+        PendingOperation::for_test(1, now + after)
     }
 
     fn fake<'a>(
@@ -1336,7 +1332,7 @@ mod tests {
     ) -> Fake<'a> {
         let mut fake = Fake {
             plan,
-            binding: worker.binding.clone(),
+            binding: worker.binding_for_test().clone(),
             fault,
             now,
             cancelled,

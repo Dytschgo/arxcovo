@@ -16,6 +16,9 @@ pub(super) fn windows_recipe_id() -> super::Id {
     windows::catalog_id()
 }
 
+/// The built-in Ubuntu web catalog entry, never a TEST recipe.
+pub(crate) const WEB_RECIPE_ID: super::Id = [0xff; 16];
+
 pub(super) const WINDOWS_BUILD_LIMIT: std::time::Duration = windows::BUILD_LIMIT;
 
 #[allow(
@@ -1671,8 +1674,10 @@ mod lifecycle {
             };
             let ubuntu_budget = Duration::from_secs(3_900);
             let windows_budget = Duration::from_secs(11_100);
-            assert!((before + ubuntu_budget..=after + ubuntu_budget).contains(&ubuntu.deadline));
-            assert!((before + windows_budget..=after + windows_budget).contains(&worker.deadline));
+            assert!((before + ubuntu_budget..=after + ubuntu_budget).contains(&ubuntu.deadline()));
+            assert!(
+                (before + windows_budget..=after + windows_budget).contains(&worker.deadline())
+            );
         }
 
         #[tokio::test(start_paused = true)]

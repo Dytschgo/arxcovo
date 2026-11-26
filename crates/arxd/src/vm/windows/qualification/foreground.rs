@@ -85,10 +85,6 @@ impl<'a> ForegroundQualification<'a> {
 
     /// One bounded epoch observation: the freshness and store-identity
     /// reads, then the high-water transaction, each keeping its class.
-    #[allow(
-        dead_code,
-        reason = "The native TEST issuer consumes the epoch in a later 7c PR"
-    )]
     pub(crate) fn epoch_sample(
         &self,
         advance: impl FnOnce() -> Result<crate::vm::ClockReading, Invalidation>,
@@ -113,6 +109,43 @@ impl<'a> ForegroundQualification<'a> {
             .production
             .root
     }
+}
+
+impl crate::vm::test_issuer::SelectedSource for ForegroundQualification<'_> {
+    fn seal_sha256(&self) -> records::Hash {
+        self.seal_sha256
+    }
+
+    fn class(&self) -> records::Class {
+        self.evidence.seal.binding.class
+    }
+
+    fn scope(&self) -> records::Hash {
+        self.evidence.seal.binding.scope
+    }
+
+    fn recipes(&self) -> records::TestRecipes {
+        self.evidence.recipes
+    }
+
+    /// Open already bound the live token to the enrollment owner.
+    fn owner_matches(&self, configured: &str) -> bool {
+        sid_matches(&self.held.token.account, configured)
+    }
+
+    fn sample(
+        &self,
+        advance: &dyn Fn() -> Result<crate::vm::ClockReading, Invalidation>,
+    ) -> Result<crate::vm::selection_epoch::Sample, Invalidation> {
+        self.epoch_sample(advance)
+    }
+}
+
+/// The configured SID, in its exact canonical spelling, names `held`.
+fn sid_matches(held: &LocalSid, configured: &str) -> bool {
+    use windows_sys::Win32::Security::EqualSid;
+    // Both SIDs are valid allocations owned for this call.
+    canonical_sid(configured).is_ok_and(|sid| unsafe { EqualSid(sid.0, held.0) } != 0)
 }
 
 /// Measured profile, custody, volume, asset, DNS-witness, host or profile-key
@@ -227,5 +260,24 @@ impl ReadDossier {
         })?;
         rows.push(seal);
         Ok((verified, rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_owner_must_name_the_held_account() {
+        let held = LocalSid::parse("S-1-5-21-1-2-3-1001").unwrap();
+        assert!(sid_matches(&held, "S-1-5-21-1-2-3-1001"));
+        for other in [
+            "S-1-5-21-1-2-3-1002",
+            "S-1-5-21-1-2-3-01001",
+            "S-1-5-18",
+            "",
+        ] {
+            assert!(!sid_matches(&held, other), "{other:?}");
+        }
     }
 }

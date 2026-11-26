@@ -235,24 +235,7 @@ pub enum Admission {
     Refused(Refusal),
 }
 
-/// Only a fresh admission yields a worker handle. A status lookup has no
-/// dispatch authority. Deadlines are process-local and never persisted.
-#[derive(Debug)]
-pub struct PendingOperation {
-    pub(crate) activity_id: i64,
-    pub(crate) deadline: Instant,
-    pub(crate) binding: std::sync::Arc<()>,
-}
-
-impl PendingOperation {
-    pub fn activity_id(&self) -> i64 {
-        self.activity_id
-    }
-
-    pub fn deadline(&self) -> Instant {
-        self.deadline
-    }
-}
+pub use super::controller::PendingOperation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Completion {

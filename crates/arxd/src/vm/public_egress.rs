@@ -7,8 +7,8 @@
 //! the enrolled-uplink route check, the separately pinned patched-binary
 //! manifest and the admission gate. Admission success grants nothing by
 //! itself: native launch of a public-egress plan stays refused with
-//! `NetworkFenceUnverified` and `LaunchAuthority` stays uninhabited. Real
-//! egress is **unverified on real hardware**.
+//! `NetworkFenceUnverified`, and only the closed TEST issuer can mint a
+//! `LaunchAuthority`. Real egress is **unverified on real hardware**.
 
 use super::{
     paths::{Artifact, ArtifactPin, ArtifactRole, FileIdentity, LocalPath},
