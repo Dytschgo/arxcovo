@@ -1,7 +1,7 @@
 import { Component, useEffect, useId, useRef, useState, type ReactNode } from 'react';
-import type { ActivityOutcome, Arch, ConsoleStatus, Reachability, TerminalStatus, Vm, VmKind, VmState } from '../api/types';
+import type { ActivityOutcome, Arch, ConsoleStatus, OsFamily, Reachability, TerminalStatus, Vm, VmKind, VmState } from '../api/types';
 import type { Resource } from './context';
-import { formatBytes, formatTimeLeft } from './format';
+import { OS_LABEL, formatBytes, formatTimeLeft } from './format';
 import { Icon, OsGlyph, type IconName } from './icons';
 import { href } from './router';
 
@@ -16,6 +16,16 @@ export function ArchBadge({ arch }: { arch: Arch }) {
     <span className="arch" data-arch={arch} title={`Machine architecture: ${arch}`}>
       <span className="visually-hidden">Architecture </span>
       {arch}
+    </span>
+  );
+}
+
+/** OS glyph on a small tile (host columns, host lists). The OS word is read out. */
+export function OsBadge({ os }: { os: OsFamily }) {
+  return (
+    <span className="osb" data-os={os} title={OS_LABEL[os]}>
+      <OsGlyph os={os} />
+      <span className="visually-hidden">{OS_LABEL[os]} </span>
     </span>
   );
 }
@@ -208,24 +218,80 @@ export function VmCard({ vm, now, actions }: { vm: Vm; now?: number; actions?: R
   );
 }
 
-/** View wrapper: sets the document title and moves focus to the heading on mount. */
-export function Page({ title, actions, children, eyebrow }: { title: string; eyebrow?: ReactNode; actions?: ReactNode; children: ReactNode }) {
+/**
+ * Sets the document title and moves focus to the page heading on mount.
+ * Attach the ref to the view's h1. A view whose h1 moves (loading head, then
+ * the loaded hero) passes a `phase` so focus follows the heading that remains.
+ */
+export function usePageHeading(title: string, phase?: string) {
   const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
     document.title = `${title} · Arxcovo`;
     heading.current?.focus({ preventScroll: true });
-  }, [title]);
+  }, [title, phase]);
+  return heading;
+}
+
+/**
+ * View wrapper with a page head. `hideTitle` keeps the h1 for assistive
+ * technology and focus while a view's own hero (the board or VM totals)
+ * carries the visible headline.
+ */
+export function Page({ title, actions, children, eyebrow, lede, hideTitle }: { title: string; eyebrow?: ReactNode; lede?: ReactNode; actions?: ReactNode; hideTitle?: boolean; children: ReactNode }) {
+  const heading = usePageHeading(title);
   return (
     <section className="page" aria-labelledby="page-title">
-      <header className="page-head">
-        <div className="page-title">
-          {eyebrow ? <div className="eyebrow">{eyebrow}</div> : null}
-          <h1 id="page-title" tabIndex={-1} ref={heading}>{title}</h1>
-        </div>
-        {actions ? <div className="page-actions">{actions}</div> : null}
+      {hideTitle && !eyebrow && !actions && !lede
+        ? <h1 id="page-title" className="visually-hidden" tabIndex={-1} ref={heading}>{title}</h1>
+        : (
+          <header className="page-head">
+            <div className="page-title">
+              {eyebrow ? <div className="eyebrow">{eyebrow}</div> : null}
+              <h1 id="page-title" className={hideTitle ? 'visually-hidden' : undefined} tabIndex={-1} ref={heading}>{title}</h1>
+              {lede ? <p className="lede">{lede}</p> : null}
+            </div>
+            {actions ? <div className="page-actions">{actions}</div> : null}
+          </header>
+        )}
+      {children}
+    </section>
+  );
+}
+
+/** A back link above a tile title ("‹ Hosts"). */
+export function BackLink({ to, children }: { to: string; children: ReactNode }) {
+  return <a className="back" href={to}><Icon name="back" />{children}</a>;
+}
+
+/** A Night Orbit tile: a titled section with a quiet icon label. */
+export function Tile({ id, icon, title, aside, className, children, ...rest }: { id: string; icon?: IconName; title: ReactNode; aside?: ReactNode; className?: string; children: ReactNode; 'data-host-identity'?: boolean }) {
+  return (
+    <section className={className ? `tile ${className}` : 'tile'} aria-labelledby={id} {...rest}>
+      <header className="tile-head">
+        <h2 id={id}>{icon ? <Icon name={icon} /> : null}{title}</h2>
+        {aside ? <div className="tile-aside">{aside}</div> : null}
       </header>
       {children}
     </section>
+  );
+}
+
+/**
+ * Used against a total, as a thin bar with "used / total" in mono. A null
+ * `used` draws the bar hatched with `reason`; a null or zero total has no bar.
+ */
+export function CapBar({ label, used, total, format, reason, dim }: { label: string; used: number | null; total: number | null; format(n: number): string; reason: string; dim?: boolean }) {
+  const pct = used === null || total === null || total <= 0 ? null : Math.min(100, Math.max(0, (used / total) * 100));
+  return (
+    <div className="cap" data-dim={dim || undefined}>
+      <span className="cap-k">{label}</span>
+      {used === null
+        ? <span className="cap-bar" data-unknown="true" aria-hidden="true" />
+        : <span className="cap-bar" aria-hidden="true"><i style={{ inlineSize: `${pct ?? 0}%` }} /></span>}
+      {used === null
+        ? <NullValue reason={reason} />
+        : <span className="cap-v">{format(used)}{total === null ? null : <> / {format(total)}</>}</span>}
+    </div>
   );
 }
 
@@ -264,25 +330,6 @@ export function Loaded<T>({ resource, label, children }: { resource: Resource<T>
     return <ErrorState message={`Could not load ${label}. ${resource.error.message}`} onRetry={resource.reload} />;
   }
   return <>{children(resource.data)}</>;
-}
-
-export function Meter({ label, value, detail }: { label: string; value: number | null; detail: string }) {
-  const tone = value === null ? 'muted' : value >= 90 ? 'bad' : value >= 75 ? 'warn' : 'ok';
-  return (
-    <div className="meter" data-tone={tone}>
-      <div className="meter-label">
-        <span>{label}</span>
-        <span className="meter-detail">{detail}{value === null ? ' · usage unavailable' : ''}</span>
-      </div>
-      {value === null
-        ? <div className="meter-track" data-unknown="true" aria-hidden="true" />
-        : (
-          <div className="meter-track" role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={value} aria-valuetext={`${value}%`}>
-            <div className="meter-fill" style={{ inlineSize: `${value}%` }} />
-          </div>
-        )}
-    </div>
-  );
 }
 
 export function Facts({ items }: { items: [string, ReactNode][] }) {

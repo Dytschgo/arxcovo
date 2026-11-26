@@ -2,6 +2,7 @@ import { expect, test, type BrowserContext, type Page, type Response } from '@pl
 import path from 'node:path';
 import { auditText } from '../contrast';
 import { nonTextFailures } from '../nontext';
+import { viewPartFailures } from '../nontext-views';
 import { replaySessionStatus } from './replay';
 
 // Runs against a real arxd serving the production ui/dist (see
@@ -32,7 +33,10 @@ async function localHost(page: Page): Promise<HostIdentity> {
 /**
  * Screenshots are committed as M6 evidence, so every host-identifying region
  * (host name and id, OS, CPU, memory and disk) is painted over by Playwright's
- * deterministic mask before the PNG is written.
+ * deterministic mask before the PNG is written. The Night Orbit views mark
+ * those regions with `data-host-identity` (host bento tiles, VM resources);
+ * a board column's head (`.col-h`) and the terminal's host list carry the
+ * same facts. Animations are disabled so the logo is never caught half drawn.
  */
 async function shot(page: Page, name: string, host?: HostIdentity) {
   const mask = host
@@ -40,10 +44,10 @@ async function shot(page: Page, name: string, host?: HostIdentity) {
       page.getByText(host.name),
       page.getByText(host.id),
       page.locator('select', { hasText: host.name }),
-      page.locator('.card-sub, .meters, section[aria-labelledby="host-facts"], section[aria-labelledby="host-resources"]'),
+      page.locator('[data-host-identity], .col-h, .host-pick, .term-head'),
     ]
     : [];
-  await page.screenshot({ path: path.join(SHOTS, `${name}.png`), fullPage: true, mask, maskColor: '#7c8794' });
+  await page.screenshot({ path: path.join(SHOTS, `${name}.png`), fullPage: true, mask, maskColor: '#7c8794', animations: 'disabled' });
 }
 
 /** Night Orbit text and non-text contrast audits and opacity guard of the real page (see ../contrast.ts); soft, so every state is reported. */
@@ -52,6 +56,7 @@ async function audit(page: Page, where: string) {
   expect.soft(contrast, `contrast: ${where}`).toEqual([]);
   expect.soft(opacityGroups, `text inside an opacity group: ${where}`).toEqual([]);
   expect.soft(await nonTextFailures(page), `non-text contrast (3:1): ${where}`).toEqual([]);
+  expect.soft(await viewPartFailures(page), `PR B view parts (3:1): ${where}`).toEqual([]);
 }
 
 async function signIn(page: Page, hash = '#/hosts') {
@@ -121,20 +126,22 @@ test('hosts: the local host list and detail come from arxd', async ({ page }) =>
   expect(body.hosts).toHaveLength(1);
   expect(body.hosts[0]).toMatchObject({ reachability: 'online', mode: 'always_on' });
   const host = { id: body.hosts[0].id as string, name: body.hosts[0].name as string };
+  // The board: one column per host, holding that host's VM cards.
   const cards = page.getByRole('list', { name: 'Hosts' }).getByRole('listitem');
   await expect(cards).toHaveCount(1);
   await expect(cards.first()).toHaveAttribute('data-reachability', 'online');
-  await expect(cards.first().getByTitle(`Machine architecture: ${body.hosts[0].arch}`)).toBeVisible();
+  await expect(cards.first().locator('.col-h').getByTitle(`Machine architecture: ${body.hosts[0].arch}`)).toBeVisible();
+  await expect(cards.first().getByRole('article')).toHaveCount(2);
   await expect(page.getByText('1 of 1 hosts online')).toBeVisible();
   await shot(page, '02-hosts', host);
   await audit(page, '02-hosts');
   const detail = page.waitForResponse(isApi('GET', `/api/v1/hosts/${host.id}`));
-  await cards.first().getByRole('link').click();
+  await cards.first().getByRole('link', { name: host.name, exact: true }).click();
   expect((await detail).status()).toBe(200);
   await expect(page).toHaveURL(new RegExp(`#/hosts/${host.id}$`));
   await expect(page.getByRole('heading', { level: 2, name: /VMs on this host/ })).toContainText('2');
   await expect(page.getByRole('list', { name: 'Recent activity on this host' }).getByRole('listitem').first()).toBeVisible();
-  await expect(page.getByRole('link', { name: 'Open terminal' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Run command' })).toBeVisible();
   await shot(page, '03-host-detail', host);
   await audit(page, '03-host-detail');
 });
@@ -214,7 +221,7 @@ test('terminal: 503 unavailable without an owner executor, shown as documented',
   const host = await localHost(page);
   await page.goto(`/#/hosts/${host.id}`);
   const ticket = page.waitForResponse(isApi('POST', `/api/v1/hosts/${host.id}/terminal`));
-  await page.getByRole('link', { name: 'Open terminal' }).click();
+  await page.getByRole('link', { name: 'Run command' }).click();
   await expectUnavailable(await ticket);
   await expect(page).toHaveURL(new RegExp(`#/terminal/${host.id}$`));
   await expect(page.getByRole('alert')).toHaveText(UNAVAILABLE);
@@ -228,6 +235,8 @@ test('terminal: 503 unavailable without an owner executor, shown as documented',
 test('console: 503 unavailable without a capture source, shown as documented', async ({ page }) => {
   await signIn(page, `#/vms/${VM_RUNNING}`);
   const host = await localHost(page);
+  // The VM page itself opens no stream; the console tile asks only on "Open console".
+  await expect(page.getByRole('heading', { level: 1, name: VM_RUNNING })).toBeVisible();
   const ticket = page.waitForResponse(isApi('POST', `/api/v1/vms/${VM_RUNNING}/console`));
   await page.getByRole('link', { name: 'Open console' }).click();
   await expectUnavailable(await ticket);

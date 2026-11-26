@@ -256,3 +256,18 @@ describe('logo', () => {
     expect(container.querySelector('svg.logo text, svg.logo foreignObject')).toBeNull();
   });
 });
+
+describe('search shortcut', () => {
+  test('only Ctrl+K or Meta+K, never a bare character or another chord', async () => {
+    const { isSearchShortcut } = await import('./Search');
+    const k = (key: string, mods: Partial<Record<'ctrlKey' | 'metaKey' | 'altKey' | 'shiftKey', boolean>> = {}) =>
+      isSearchShortcut({ key, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, ...mods });
+    expect(k('k', { ctrlKey: true })).toBe(true);
+    expect(k('K', { metaKey: true })).toBe(true);
+    expect(k('/')).toBe(false);
+    expect(k('k')).toBe(false);
+    expect(k('/', { ctrlKey: true })).toBe(false);
+    expect(k('k', { ctrlKey: true, altKey: true })).toBe(false);
+    expect(k('k', { ctrlKey: true, shiftKey: true })).toBe(false);
+  });
+});
