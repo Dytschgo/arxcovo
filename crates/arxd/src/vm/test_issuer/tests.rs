@@ -86,7 +86,7 @@ fn configured(enrollment: &str, dossier: &str) -> TestQualificationSelection {
         .unwrap()
 }
 
-fn config() -> TestQualificationSelection {
+pub(crate) fn config() -> TestQualificationSelection {
     configured("D:/private/enrollment.json", "D:/private/dossier")
 }
 
@@ -94,7 +94,7 @@ type Hook = Box<dyn FnOnce() + Send>;
 
 /// The held selection, with a scripted refusal, boot marker and an action
 /// taken during the next sample.
-struct FakeSource {
+pub(crate) struct FakeSource {
     seal: Hash,
     class: Class,
     scope: Hash,
@@ -107,7 +107,7 @@ struct FakeSource {
 }
 
 impl FakeSource {
-    fn new(origin: Instant) -> Self {
+    pub(crate) fn new(origin: Instant) -> Self {
         Self {
             seal: SEAL,
             class: Class::Test,
@@ -547,7 +547,7 @@ fn stage_target(slot: ArtifactSlot) -> StageTarget {
 }
 
 /// The production boundary stays closed whatever the fixture issued.
-fn assert_admission_closed() {
+pub(crate) fn assert_admission_closed() {
     let bytes =
         serde_json::to_vec(&profile("D:/private/enrollment.json", "D:/private/dossier")).unwrap();
     let profile = crate::config::VmRuntimeProfile::parse(&bytes).unwrap();
@@ -1413,7 +1413,10 @@ fn recovery_authority_needs_exact_custody_not_selection() {
 #[test]
 fn launch_slots_come_from_the_target() {
     let start = AdmittedEffect::Start;
-    let clone = AdmittedEffect::Clone;
+    let clone = AdmittedEffect::Clone {
+        template: TEMPLATE,
+        golden: ACTIVE,
+    };
     let build = AdmittedEffect::Build {
         recipe_id: recipes().ubuntu.recipe_id,
         digest: recipes().ubuntu.recipe_sha256,
