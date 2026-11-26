@@ -166,6 +166,46 @@ token.
 - `tools` (≤ 128) is the `discover_tools` result for that host.
 - `mode`: `always_on | opportunistic`. `agentRights`: `standard | admin`.
 
+### `GET /api/v1/hosts/{id}/cpu-history?range=1h|6h|24h` → `CpuHistory`
+
+### `GET /api/v1/hosts/cpu-history?range=24h` → `{"series": CpuHistory[]}` (≤ 256)
+
+Both reads use the host endpoints' owner session and origin checks. The
+`range` parameter is required. An unknown range, extra or repeated parameter,
+or non-24h batch range returns `400 invalid_request`. A well-formed unknown
+host id returns `404 not_found`.
+
+| Range | `bucketSeconds` | Sample count |
+|---|---:|---:|
+| `1h` | 60 | 60 |
+| `6h` | 300 | 72 |
+| `24h` | 600 | 144 |
+
+A series has `hostId`, `range`, `bucketSeconds`, `from`, `to` and `samples`.
+`from` and `to` are UTC bucket boundaries, with `to` exclusive. Sample
+`i` covers `[from + i × bucketSeconds, from + (i + 1) × bucketSeconds)`.
+The final bucket contains the most recent completed minute. It can span
+minutes still in progress or yet to come.
+
+The existing host sampler supplies fresh CPU readings once a second.
+arxd keeps the last 1,440 completed UTC minutes in memory. A minute with
+fewer than 30 valid readings is missing. A bucket averages the available
+minute means and rounds to one decimal in the 0–100 range. It is `null`
+when fewer than half of all its minutes are present, including in a
+partial bucket. Missing periods are left as gaps and restart clears
+history. A stalled sampler leaves already covered minutes available until
+they age out.
+
+The batch uses the same local-host inventory as `GET /api/v1/hosts`.
+Cluster messages carry no CPU history. Remote hosts, when represented in
+the dashboard inventory, have null samples until history can be collected
+for them.
+
+The dashboard computes a selected window's average and peak over the
+non-null buckets and reports how many buckets are missing. Both figures
+are absent when every selected bucket is null. The instantaneous CPU
+reading remains `cpu.usedPercent`.
+
 ## Activity
 
 ### `GET /api/v1/activity` → `ActivityPage`

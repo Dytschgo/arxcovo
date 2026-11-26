@@ -38,6 +38,17 @@ describe('stand-in session', () => {
   });
 });
 
+test('stand-in CPU history is session-bound and preserves gaps for its host inventory', async () => {
+  await expect(new StandinApi().listCpuHistory('24h')).rejects.toMatchObject({ code: 'unauthorized' });
+  const api = await signedIn();
+  const history = await api.getCpuHistory('atlas', '1h');
+  expect(history).toMatchObject({ hostId: 'atlas', range: '1h', bucketSeconds: 60, samples: Array<null>(60).fill(null) });
+  await expect(api.getCpuHistory('missing', '1h')).rejects.toMatchObject({ code: 'not_found' });
+  const batch = await api.listCpuHistory('24h');
+  expect(batch.map(series => series.hostId)).toEqual((await api.listHosts()).map(host => host.id));
+  expect(batch.every(series => series.samples.length === 144 && series.samples.every(sample => sample === null))).toBe(true);
+});
+
 describe('stand-in activity', () => {
   test('pages walk the whole non-read feed exactly once, newest first', async () => {
     const api = await signedIn();
