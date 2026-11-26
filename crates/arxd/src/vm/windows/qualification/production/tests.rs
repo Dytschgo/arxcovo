@@ -168,23 +168,17 @@ pub(in crate::vm::windows::qualification) fn held_test_workspace(
     let (owner_data, owner_text, production_path) = private_dir(temp, "production");
     let workspace_path = create_dir_sddl(
         Path::new(production_path.as_str()),
-        "ws",
+        &hex::encode(generation),
         &format!("O:{owner_text}D:P(A;OICI;FA;;;{owner_text})"),
     );
-    create_file_sddl(
+    let lease = create_file_sddl(
         &workspace_path,
-        "slot.lease",
+        GENERATION_LEASE,
         &format!("O:{owner_text}D:P(A;;FA;;;{owner_text})"),
     );
     let production = PathPin::open(&production_path, true, false).unwrap();
-    let ws = hold_workspace_under(
-        &production,
-        sid_ptr(&owner_data),
-        &workspace_path,
-        "slot.lease",
-        generation,
-    )
-    .unwrap();
+    let expected = fixture_binding(&production, generation, &workspace_path, &lease);
+    let ws = hold_workspace_under(&production, sid_ptr(&owner_data), expected).unwrap();
     (production, ws, owner_data, owner_text)
 }
 
@@ -415,141 +409,143 @@ fn launch_permit_fence_requires_uninhabited_authority_and_non_echoed_target() {
     );
 }
 
-#[test]
-fn hold_workspace_enforces_containment_generation_acls_and_exclusive_lease() {
-    let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
-    let (owner_data, owner_text, production_path) = private_dir(temp.path(), "production");
-    let owner = sid_ptr(&owner_data);
-    let private_sddl = format!("O:{owner_text}D:P(A;OICI;FA;;;{owner_text})");
-    let shared_sddl = format!("O:{owner_text}D:P(A;OICI;FA;;;{owner_text})(A;OICI;FR;;;WD)");
-    let production = PathPin::open(&production_path, true, false).unwrap();
-
-    // Valid private workspace + private lease succeeds and binds all identities.
-    let valid_ws = create_dir_sddl(Path::new(production_path.as_str()), "ws", &private_sddl);
-    let valid_lease = create_file_sddl(
-        &valid_ws,
-        "slot.lease",
-        &format!("O:{owner_text}D:P(A;;FA;;;{owner_text})"),
-    );
-    let generation = [0x22; 16];
-    let held =
-        hold_workspace_under(&production, owner, &valid_ws, "slot.lease", generation).unwrap();
-    assert_eq!(held.binding().generation, generation);
-    assert_eq!(held.binding().production, production.identity);
-    assert_eq!(
-        held.binding().workspace,
-        PathPin::open(&valid_ws, true, false).unwrap().identity
-    );
-    assert_eq!(
-        held.binding().lease,
-        file_identity(&File::open(valid_lease.as_str()).unwrap(), false)
+fn fixture_binding(
+    production: &PathPin,
+    generation: Id,
+    directory: &LocalPath,
+    lease: &LocalPath,
+) -> WorkspaceBinding {
+    WorkspaceBinding {
+        production: production.identity,
+        generation,
+        workspace: PathPin::open(directory, true, false).unwrap().identity,
+        lease: file_identity(&File::open(lease.as_str()).unwrap(), false)
             .unwrap()
-            .0
-    );
+            .0,
+    }
+}
 
-    // Second concurrent lock on the same lease file is refused.
-    assert_eq!(
-        hold_workspace_under(&production, owner, &valid_ws, "slot.lease", generation).err(),
-        Some(NativeRefusal::PathCustodyUnverified)
-    );
+#[test]
+fn hold_workspace_enforces_exact_names_ids_acls_and_exclusive_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let (production, held, owner_data, owner) = held_test_workspace(temp.path(), [0xab; 16]);
+    let expected = held.binding();
+    let acquire = |binding| hold_workspace_under(&production, sid_ptr(&owner_data), binding);
+    assert!(acquire(expected).is_err(), "second lock must be refused");
+    let directory = held.root.path.clone();
+    let lease = directory.join(GENERATION_LEASE).unwrap();
     drop(held);
-    // Dropping the workspace releases the lease lock so a fresh hold succeeds.
-    let reheld =
-        hold_workspace_under(&production, owner, &valid_ws, "slot.lease", generation).unwrap();
-    drop(reheld);
-
-    // Equal root (production itself) is refused.
-    create_file_sddl(
-        &production_path,
-        "root.lease",
-        &format!("O:{owner_text}D:P(A;;FA;;;{owner_text})"),
-    );
-    assert_eq!(
-        hold_workspace_under(
-            &production,
-            owner,
-            &production_path,
-            "root.lease",
-            generation
-        )
-        .err(),
-        Some(NativeRefusal::PathCustodyUnverified)
-    );
-
-    // Outside root (sibling directory) is refused.
-    let outside = create_dir_sddl(temp.path(), "outside", &private_sddl);
-    create_file_sddl(
-        &outside,
-        "slot.lease",
-        &format!("O:{owner_text}D:P(A;;FA;;;{owner_text})"),
-    );
-    assert_eq!(
-        hold_workspace_under(&production, owner, &outside, "slot.lease", generation).err(),
-        Some(NativeRefusal::PathCustodyUnverified)
-    );
-
-    // Zero generation is refused.
-    assert_eq!(
-        hold_workspace_under(&production, owner, &valid_ws, "slot.lease", [0; 16]).err(),
-        Some(NativeRefusal::PathCustodyUnverified)
-    );
-
-    // Unsafe lease name is refused.
-    for bad_lease in ["", "..", r"sub\lease", "CON"] {
-        assert_eq!(
-            hold_workspace_under(&production, owner, &valid_ws, bad_lease, generation).err(),
-            Some(NativeRefusal::PathCustodyUnverified),
-            "{bad_lease}"
-        );
+    assert_eq!(acquire(expected).unwrap().binding(), expected);
+    let different_file = |mut id: FileIdentity| {
+        id.file[0] ^= 1;
+        id
+    };
+    for wrong in [
+        WorkspaceBinding {
+            generation: [0; 16],
+            ..expected
+        },
+        WorkspaceBinding {
+            generation: [0xef; 16],
+            ..expected
+        },
+        WorkspaceBinding {
+            production: identity(7),
+            ..expected
+        },
+        WorkspaceBinding {
+            workspace: different_file(expected.workspace),
+            ..expected
+        },
+        WorkspaceBinding {
+            lease: different_file(expected.lease),
+            ..expected
+        },
+    ] {
+        assert!(acquire(wrong).is_err(), "{wrong:?}");
     }
 
-    // Non-descendant identity (textual path matches, but held production identity
-    // does not appear among opened ancestor handles) is refused.
-    let mut forged_production = PathPin::open(&production_path, true, false).unwrap();
-    forged_production.identity.file[0] ^= 0xff;
-    assert_eq!(
-        hold_workspace_under(
-            &forged_production,
-            owner,
-            &valid_ws,
-            "slot.lease",
-            generation
-        )
-        .err(),
-        Some(NativeRefusal::PathCustodyUnverified)
+    std::fs::write(lease.as_str(), [1]).unwrap();
+    assert!(acquire(expected).is_err(), "populated lease");
+    std::fs::write(lease.as_str(), []).unwrap();
+    let other_name = directory.join("Generation.LEASE").unwrap();
+    let intermediate = directory.join("temporary").unwrap();
+    std::fs::rename(lease.as_str(), intermediate.as_str()).unwrap();
+    assert!(acquire(expected).is_err(), "missing lease");
+    std::fs::rename(intermediate.as_str(), other_name.as_str()).unwrap();
+    assert!(acquire(expected).is_err(), "case-changed lease");
+    std::fs::rename(other_name.as_str(), intermediate.as_str()).unwrap();
+    let new_lease = create_file_sddl(
+        &directory,
+        GENERATION_LEASE,
+        &format!("O:{owner}D:P(A;;FA;;;{owner})"),
     );
+    assert!(acquire(expected).is_err(), "substituted lease");
+    let new_binding = fixture_binding(&production, expected.generation, &directory, &new_lease);
+    let alias = directory.join("lease-link").unwrap();
+    std::fs::hard_link(new_lease.as_str(), alias.as_str()).unwrap();
+    assert!(acquire(new_binding).is_err(), "hard-linked lease");
+    std::fs::remove_file(alias.as_str()).unwrap();
+    assert_eq!(acquire(new_binding).unwrap().binding(), new_binding);
 
-    // Non-private workspace ACL is refused.
-    let shared_ws = create_dir_sddl(
-        Path::new(production_path.as_str()),
-        "shared-ws",
-        &shared_sddl,
+    // Seed the next controls before pinning their parent. Windows refuses
+    // a directory rename while its parent is pinned without delete sharing.
+    let production_path = production.path.clone();
+    drop(production);
+    let parent = Path::new(production_path.as_str());
+    let uppercase_generation = [0xac; 16];
+    let uppercase = create_dir_sddl(
+        parent,
+        &hex::encode_upper(uppercase_generation),
+        &format!("O:{owner}D:P(A;OICI;FA;;;{owner})"),
     );
-    create_file_sddl(
-        &shared_ws,
-        "slot.lease",
-        &format!("O:{owner_text}D:P(A;;FA;;;{owner_text})"),
+    let uppercase_lease = create_file_sddl(
+        &uppercase,
+        GENERATION_LEASE,
+        &format!("O:{owner}D:P(A;;FA;;;{owner})"),
     );
-    assert_eq!(
-        hold_workspace_under(&production, owner, &shared_ws, "slot.lease", generation).err(),
-        Some(NativeRefusal::PathCustodyUnverified)
+    let shared_generation = [0xad; 16];
+    let shared = create_dir_sddl(
+        parent,
+        &hex::encode(shared_generation),
+        &format!("O:{owner}D:P(A;OICI;FA;;;{owner})(A;OICI;FR;;;WD)"),
     );
+    let shared_lease = create_file_sddl(
+        &shared,
+        GENERATION_LEASE,
+        &format!("O:{owner}D:P(A;;FA;;;{owner})"),
+    );
+    let production = PathPin::open(&production_path, true, false).unwrap();
+    let acquire = |binding| hold_workspace_under(&production, sid_ptr(&owner_data), binding);
+    let uppercase_binding = fixture_binding(
+        &production,
+        uppercase_generation,
+        &uppercase,
+        &uppercase_lease,
+    );
+    assert!(
+        acquire(uppercase_binding).is_err(),
+        "case-changed directory"
+    );
+    let shared_binding = fixture_binding(&production, shared_generation, &shared, &shared_lease);
+    assert!(acquire(shared_binding).is_err(), "non-private directory");
+}
 
-    // Private workspace with a non-private lease ACL is refused.
-    let mixed_ws = create_dir_sddl(
-        Path::new(production_path.as_str()),
-        "mixed-ws",
-        &private_sddl,
+#[test]
+fn hold_workspace_refuses_a_non_private_lease_in_a_private_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let (production, held, owner_data, owner) = held_test_workspace(temp.path(), [0xcd; 16]);
+    let generation = held.binding().generation;
+    let directory = held.root.path.clone();
+    drop(held);
+    std::fs::remove_file(directory.join(GENERATION_LEASE).unwrap().as_str()).unwrap();
+    let path = create_file_sddl(
+        &directory,
+        GENERATION_LEASE,
+        &format!("O:{owner}D:P(A;;FA;;;{owner})(A;;FR;;;WD)"),
     );
-    create_file_sddl(
-        &mixed_ws,
-        "shared.lease",
-        &format!("O:{owner_text}D:P(A;;FA;;;{owner_text})(A;;FR;;;WD)"),
-    );
-    assert_eq!(
-        hold_workspace_under(&production, owner, &mixed_ws, "shared.lease", generation).err(),
-        Some(NativeRefusal::PathCustodyUnverified)
-    );
+    let expected = fixture_binding(&production, generation, &directory, &path);
+    assert!(hold_workspace_under(&production, sid_ptr(&owner_data), expected).is_err());
 }
 
 #[test]
@@ -842,7 +838,7 @@ fn hold_plan_inputs_pins_files_and_enforces_read_only_content_digests() {
     };
     let plan = plan_recipe.plan().unwrap();
 
-    let pins = hold_plan_inputs(&plan).unwrap();
+    let pins = hold_plan_inputs(&plan, Instant::now() + Duration::from_secs(5), &|| false).unwrap();
     assert_eq!(pins.len(), 5);
     assert_eq!(pins[0].verified_content, None); // Qemu binary verified via bundle identity
     assert_eq!(pins[1].verified_content, None); // Data directory
@@ -868,7 +864,12 @@ fn hold_plan_inputs_pins_files_and_enforces_read_only_content_digests() {
     };
     let unpinned_plan = unpinned_recipe.plan().unwrap();
     assert_eq!(
-        hold_plan_inputs(&unpinned_plan).err(),
+        hold_plan_inputs(
+            &unpinned_plan,
+            Instant::now() + Duration::from_secs(5),
+            &|| false
+        )
+        .err(),
         Some(NativeRefusal::PathCustodyUnverified)
     );
 
@@ -892,7 +893,12 @@ fn hold_plan_inputs_pins_files_and_enforces_read_only_content_digests() {
     };
     let bad_fw_plan = bad_fw_recipe.plan().unwrap();
     assert_eq!(
-        hold_plan_inputs(&bad_fw_plan).err(),
+        hold_plan_inputs(
+            &bad_fw_plan,
+            Instant::now() + Duration::from_secs(5),
+            &|| false
+        )
+        .err(),
         Some(NativeRefusal::PathCustodyUnverified)
     );
 
@@ -916,7 +922,12 @@ fn hold_plan_inputs_pins_files_and_enforces_read_only_content_digests() {
     };
     let bad_data_plan = bad_data_recipe.plan().unwrap();
     assert_eq!(
-        hold_plan_inputs(&bad_data_plan).err(),
+        hold_plan_inputs(
+            &bad_data_plan,
+            Instant::now() + Duration::from_secs(5),
+            &|| false
+        )
+        .err(),
         Some(NativeRefusal::PathCustodyUnverified)
     );
 }
@@ -1351,4 +1362,490 @@ async fn released_proof_binds_generation_and_keeps_the_writer_exclusion() {
                 .is_ok()
         );
     }
+}
+
+fn start_pair_at(
+    workspace: &ProductionWorkspace,
+    slots: PairSlots,
+    bytes: &[u8],
+) -> (StartPair, [LocalPath; 2]) {
+    use sha2::{Digest, Sha256};
+    let paths = [slots.disk, slots.vars].map(|slot| slot_path(&workspace.root.path, slot));
+    let evidence = paths.each_ref().map(|path| {
+        std::fs::write(path.as_str(), bytes).unwrap();
+        ArtifactEvidence {
+            identity: PathPin::open(path, false, false).unwrap().identity,
+            directory: workspace.binding().workspace.file,
+            pin: ArtifactPin {
+                size: bytes.len() as u64,
+                sha256: Sha256::digest(bytes).into(),
+            },
+        }
+    });
+    (StartPair { slots, evidence }, paths)
+}
+
+fn start_pair(workspace: &ProductionWorkspace) -> (StartPair, [LocalPath; 2]) {
+    let slots = pair(workspace.binding().generation);
+    start_pair_at(workspace, slots, b"stopped synthetic bytes")
+}
+
+#[test]
+fn start_refusal_observes_the_already_locked_pair_through_the_consumer() {
+    let temp = tempfile::tempdir().unwrap();
+    let (production, ws, owner, _) = held_test_workspace(temp.path(), [1; 16]);
+    let (active, paths) = start_pair(&ws);
+    let binding = ws.binding();
+    let writer = |path: &LocalPath| std::fs::OpenOptions::new().write(true).open(path.as_str());
+    let acquire = |binding| hold_workspace_under(&production, sid_ptr(&owner), binding);
+    let deadline = || Instant::now() + Duration::from_secs(5);
+
+    // Validation, plan construction, and the last pre-create refresh all
+    // return through the held failure seam.
+    for reason in [
+        NativeRefusal::PathCustodyUnverified,
+        NativeRefusal::QualificationMissing,
+        NativeRefusal::ReservesUnverified,
+        NativeRefusal::JobUnverified,
+    ] {
+        let mut refused =
+            StartRefusal::while_held(&ws, Some(active), || Err::<(), _>(reason.into()))
+                .err()
+                .unwrap();
+        assert_eq!(refused.reason(), reason);
+        refused.with_observation(
+            deadline(),
+            &|| false,
+            |_| panic!("tried to reacquire the already locked lease"),
+            |observed| {
+                let observed = observed.expect("held observation");
+                assert!(std::ptr::eq(observed.workspace(), &ws));
+                assert_eq!(observed.pair(), Some(active));
+                assert!(acquire(binding).is_err());
+                let released = observed.release.expect("unchanged, exclusive pair");
+                assert!(released.matches_start(binding, active));
+                assert!(paths.iter().all(|path| writer(path).is_err()));
+                drop(released);
+                assert!(paths.iter().all(|path| writer(path).is_ok()));
+            },
+        );
+    }
+
+    let observe = |pair, cutoff, stop: &dyn Fn() -> bool| {
+        let mut refused = StartRefusal::before_create(
+            Some(&ws),
+            binding,
+            Some(pair),
+            NativeRefusal::QualificationMissing,
+        );
+        refused.with_observation(
+            cutoff,
+            stop,
+            |_| panic!("tried to reacquire the already locked lease"),
+            |observed| {
+                let held = observed.expect("retain held workspace even without clean release");
+                assert!(std::ptr::eq(held.workspace, &ws));
+                assert!(held.release().is_none());
+            },
+        );
+    };
+    observe(active, deadline(), &|| true);
+    observe(active, Instant::now(), &|| false);
+    let mut wrong_directory = active;
+    wrong_directory.evidence[0].directory[0] ^= 1;
+    observe(wrong_directory, deadline(), &|| false);
+
+    // A later caller deadline cannot extend the cutoff fixed at construction.
+    let mut expired = StartRefusal::before_create(
+        Some(&ws),
+        binding,
+        Some(active),
+        NativeRefusal::QualificationMissing,
+    );
+    expired.scope.cutoff = Instant::now();
+    expired.with_observation(
+        deadline(),
+        &|| false,
+        |_| panic!("tried to reacquire the already locked lease"),
+        |observed| assert!(observed.expect("held").release().is_none()),
+    );
+
+    let open_writer = writer(&paths[1]).unwrap();
+    observe(active, deadline(), &|| false);
+    drop(open_writer);
+    // Preserve the file identity and length while changing its digest.
+    std::fs::write(
+        paths[0].as_str(),
+        vec![255; active.evidence[0].pin.size as usize],
+    )
+    .unwrap();
+    observe(active, deadline(), &|| false);
+    drop(ws);
+    assert!(acquire(binding).is_ok());
+}
+
+#[test]
+fn start_refusal_proof_is_bound_to_the_requested_pair_and_its_digests() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_production, ws, _, _) = held_test_workspace(temp.path(), [4; 16]);
+    let binding = ws.binding();
+    let (first, _) = start_pair(&ws);
+    let mut slots = pair(binding.generation);
+    slots.disk.key = [3; 16];
+    slots.vars.key = [4; 16];
+    let (second, _) = start_pair_at(&ws, slots, b"second synthetic pair under the lease");
+    assert_ne!(first.evidence[0].identity, second.evidence[0].identity);
+    let mut changed = first;
+    changed.evidence[1].pin.sha256[0] ^= 1;
+    let mixed = StartPair {
+        slots: first.slots,
+        evidence: second.evidence,
+    };
+    let deadline = || Instant::now() + Duration::from_secs(5);
+    let observe = |binding, pair, consume: &dyn Fn(Option<HeldStartRefusal<'_>>)| {
+        let mut refused = StartRefusal::before_create(
+            Some(&ws),
+            binding,
+            Some(pair),
+            NativeRefusal::QualificationMissing,
+        );
+        refused.with_observation(
+            deadline(),
+            &|| false,
+            |_| panic!("tried to reacquire the already locked lease"),
+            consume,
+        );
+    };
+
+    // Each real pair under the same lease yields proof for only that pair
+    // and its exact digests. The identity-only live matcher refuses it.
+    for (requested, other) in [(first, second), (second, first)] {
+        observe(binding, requested, &|observed| {
+            let held = observed.expect("held observation");
+            assert_eq!(held.pair(), Some(requested));
+            let released = held.release().expect("unchanged requested pair");
+            assert!(released.matches_start(binding, requested));
+            for refused in [other, changed, mixed] {
+                assert!(!released.matches_start(binding, refused));
+            }
+            let ids = requested.evidence.map(|file| file.identity);
+            assert!(!released.matches(binding, requested.slots, ids));
+        });
+    }
+    // Changed digests for the same identities, or another pair's files under
+    // these slots, never produce clean proof.
+    for refused in [changed, mixed] {
+        observe(binding, refused, &|observed| {
+            assert!(observed.expect("held").release().is_none());
+        });
+    }
+    // A refusal cannot be rebound to another workspace scope.
+    let mut foreign = binding;
+    foreign.lease.file[0] ^= 1;
+    observe(foreign, first, &|observed| assert!(observed.is_none()));
+
+    // The plan's pair files must be the files named by the bound evidence.
+    let ids = |pair: StartPair| pair.evidence.map(|file| file.identity);
+    assert!(check_start_evidence(None, None).is_ok());
+    assert!(check_start_evidence(Some(first), Some((first.slots, ids(first)))).is_ok());
+    for (start, bound) in [
+        (Some(first), Some((first.slots, ids(second)))),
+        (Some(first), Some((second.slots, ids(first)))),
+        (Some(changed), Some((first.slots, ids(second)))),
+        (Some(first), None),
+        (None, Some((first.slots, ids(first)))),
+    ] {
+        assert!(check_start_evidence(start, bound).is_err());
+    }
+}
+
+#[test]
+fn start_refusal_before_acquisition_spends_its_single_attempt() {
+    use std::cell::RefCell;
+    let temp = tempfile::tempdir().unwrap();
+    let (production, ws, owner, _) = held_test_workspace(temp.path(), [2; 16]);
+    let (active, paths) = start_pair(&ws);
+    let binding = ws.binding();
+    let attempts = RefCell::new(Vec::new());
+    let acquire = |requested| {
+        attempts.borrow_mut().push(requested);
+        hold_workspace_under(&production, sid_ptr(&owner), requested)
+    };
+    let deadline = || Instant::now() + Duration::from_secs(5);
+    let refuse = || {
+        StartRefusal::before_create(
+            None,
+            binding,
+            Some(active),
+            NativeRefusal::PathCustodyUnverified,
+        )
+    };
+
+    // A failed attempt spends the token even after the holder goes away.
+    let mut contended = refuse();
+    contended.with_observation(deadline(), &|| false, acquire, |obs| {
+        assert!(obs.is_none(), "a foreign holder must remain exclusive");
+    });
+    drop(ws);
+    contended.with_observation(deadline(), &|| false, acquire, |obs| {
+        assert!(obs.is_none(), "a spent refusal reopened its acquisition");
+    });
+    assert_eq!(*attempts.borrow(), [binding]);
+
+    // Cancellation or the expired original cutoff spend it without opening.
+    let mut cancelled = refuse();
+    cancelled.with_observation(deadline(), &|| true, acquire, |obs| assert!(obs.is_none()));
+    let mut expired = refuse();
+    expired.scope.cutoff = Instant::now();
+    expired.with_observation(deadline(), &|| false, acquire, |obs| assert!(obs.is_none()));
+    for refused in [&mut cancelled, &mut expired] {
+        refused.with_observation(deadline(), &|| false, acquire, |obs| assert!(obs.is_none()));
+    }
+    assert_eq!(*attempts.borrow(), [binding]);
+
+    // One successful later attempt opens only the bound scope and keeps that
+    // lease for the refusal's lifetime without reopening it.
+    let mut later = refuse();
+    later.with_observation(deadline(), &|| false, acquire, |obs| {
+        let held = obs.expect("one later acquisition");
+        assert_eq!(held.workspace().binding(), binding);
+        let released = held.release.unwrap();
+        assert!(released.matches_start(binding, active));
+        assert!(hold_workspace_under(&production, sid_ptr(&owner), binding).is_err());
+        for path in &paths {
+            assert!(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path.as_str())
+                    .is_err()
+            );
+        }
+    });
+    later.with_observation(
+        deadline(),
+        &|| false,
+        |_| panic!("reopened the lease it already holds"),
+        |obs| assert!(obs.expect("still held").release().is_some()),
+    );
+    assert_eq!(*attempts.borrow(), [binding, binding]);
+    assert!(hold_workspace_under(&production, sid_ptr(&owner), binding).is_err());
+    drop(later);
+    assert!(hold_workspace_under(&production, sid_ptr(&owner), binding).is_ok());
+}
+
+fn refused_child() -> Child {
+    match crate::vm::windows::tests::fixture_launch(0) {
+        Some((child, _stdio)) => child,
+        // Runners that deny nested Jobs still exercise the refusal with an
+        // empty Job and a synthetic signaled exit handle.
+        None => Child {
+            job: Job::new(256 * 1024 * 1024, None).unwrap(),
+            process: unsafe { owned(CreateEventW(null(), 1, 1, null())) }.unwrap(),
+            suspended: None,
+        },
+    }
+}
+
+#[tokio::test]
+async fn start_refusal_after_create_never_proves_an_unchanged_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let (production, ws, owner, _) = held_test_workspace(temp.path(), [3; 16]);
+    let (active, _) = start_pair(&ws);
+    let binding = ws.binding();
+    let assert_fenced = |refused: &mut StartRefusal<'_>| {
+        refused.with_observation(
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+            |_| panic!("post-create refusal tried to acquire the lease again"),
+            |obs| {
+                let held = obs.expect("exact workspace observation");
+                assert!(
+                    held.release.is_none(),
+                    "post-create refusal cannot mint clean proof"
+                );
+                assert_eq!(held.workspace().binding(), binding);
+                assert!(hold_workspace_under(&production, sid_ptr(&owner), binding).is_err());
+            },
+        );
+    };
+
+    let spawn_failed = |stage| {
+        HoldRefusal::from_spawn((
+            at(stage)(io::Error::other("injected create edge refusal")),
+            Job::new(256 * 1024 * 1024, None).unwrap(),
+        ))
+    };
+    let pre_create = StartRefusal::while_held(&ws, Some(active), || {
+        Err::<(), _>(spawn_failed(SpawnStage::Create))
+    })
+    .err()
+    .unwrap();
+    assert_eq!(pre_create.creation(), StartCreation::NeverCreated);
+    let mut unknown = StartRefusal::while_held(&ws, Some(active), || {
+        Err::<(), _>(spawn_failed(SpawnStage::Verify))
+    })
+    .err()
+    .unwrap();
+    assert_fenced(&mut unknown);
+    assert_eq!(unknown.creation(), StartCreation::Unconfirmed);
+    assert!(
+        unknown
+            .settle_created(tokio::time::Instant::now())
+            .await
+            .is_err()
+    );
+
+    for fail_in_attach in [false, true] {
+        let child = refused_child();
+        let (release, blocker) = std::sync::mpsc::channel();
+        let mut refused = StartRefusal::while_held(&ws, Some(active), || {
+            attach_checked_child(
+                child,
+                |_| {
+                    if fail_in_attach {
+                        Ok(())
+                    } else {
+                        Err(NativeRefusal::JobUnverified)
+                    }
+                },
+                |workers| {
+                    assert!(fail_in_attach);
+                    workers.workers.push(
+                        Worker::start("refused-start-fixture", move || {
+                            blocker.recv().map_err(io::Error::other)
+                        })
+                        .unwrap(),
+                    );
+                    Err(NativeRefusal::QmpUnverified)
+                },
+            )
+        })
+        .err()
+        .unwrap();
+        assert_fenced(&mut refused);
+        assert_eq!(refused.creation(), StartCreation::Created);
+        if fail_in_attach {
+            assert!(
+                refused
+                    .settle_created(tokio::time::Instant::now())
+                    .await
+                    .is_err()
+            );
+            let LaunchCreation::Created(child) = &refused.failure.creation else {
+                panic!("lost created-child custody");
+            };
+            assert_eq!(child.workers.workers.len(), 1);
+        }
+        let _ = release.send(());
+        refused
+            .settle_created(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(!refused.worker_failed());
+        assert_fenced(&mut refused);
+    }
+}
+
+#[tokio::test]
+async fn refused_attach_settles_after_one_worker_fails_and_another_exits() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_production, ws, _, _) = held_test_workspace(temp.path(), [5; 16]);
+    let (active, _) = start_pair(&ws);
+    let (finish, finished) = std::sync::mpsc::channel::<()>();
+    let mut refused = StartRefusal::while_held(&ws, Some(active), || {
+        attach_checked_child(
+            refused_child(),
+            |_| Ok(()),
+            |workers| {
+                // The failing worker is joined first.
+                workers.workers.push(
+                    Worker::start("refused-start-error", || {
+                        Err(io::Error::other("injected stdio worker failure"))
+                    })
+                    .unwrap(),
+                );
+                workers.workers.push(
+                    Worker::start("refused-start-exit", move || {
+                        let _ = finished.recv();
+                        Ok(())
+                    })
+                    .unwrap(),
+                );
+                Err(NativeRefusal::QmpUnverified)
+            },
+        )
+    })
+    .err()
+    .unwrap();
+    assert_eq!(refused.creation(), StartCreation::Created);
+    let workers = |refused: &StartRefusal<'_>| match &refused.failure.creation {
+        LaunchCreation::Created(child) => child.workers.workers.len(),
+        _ => panic!("lost created-child custody"),
+    };
+
+    // An unfinished worker keeps both handles, including the failed one.
+    assert!(
+        refused
+            .settle_created(tokio::time::Instant::now())
+            .await
+            .is_err()
+    );
+    assert_eq!(workers(&refused), 2);
+    assert!(!refused.worker_failed());
+
+    // Once both end, settlement drains every handle and confirms, while the
+    // worker failure stays separately visible. A repeat settlement agrees.
+    finish.send(()).unwrap();
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(5);
+    refused.settle_created(deadline()).await.unwrap();
+    assert_eq!(workers(&refused), 0);
+    assert!(refused.worker_failed());
+    refused.settle_created(deadline()).await.unwrap();
+    assert!(refused.worker_failed());
+    refused.with_observation(
+        Instant::now() + Duration::from_secs(5),
+        &|| false,
+        |_| panic!("post-create refusal tried to acquire the lease again"),
+        |obs| assert!(obs.expect("held").release().is_none()),
+    );
+}
+
+#[test]
+fn bounded_hash_checks_stop_between_chunks_and_before_accepting_eof() {
+    use std::cell::Cell;
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("image");
+    let bytes = vec![42; 3 * (256 << 10)];
+    std::fs::write(&file, &bytes).unwrap();
+    let file = File::open(file).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert!(launch::hash_held(&file, bytes.len() as u64, deadline, &|| false).is_ok());
+    for stop_at in [3, 5, 6] {
+        let checks = Cell::new(0);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            checks.get() >= stop_at
+        };
+        assert!(launch::hash_held(&file, bytes.len() as u64, deadline, &stop).is_err());
+        assert_eq!(checks.get(), stop_at);
+    }
+}
+
+#[test]
+fn production_start_admission_stays_closed_with_an_enabled_profile() {
+    use crate::vm::runtime::{CandidateRuntime, NativeMutation};
+    let profile = crate::config::VmRuntimeProfile::parse(
+        br#"{
+        "enabled":true,"owner_sid":"S-1-5-21-1-2-3-1001","supervisor_sid":"S-1-5-21-1-2-3-1002",
+        "bundle":"E:/pinned bundle","volume":"D:/","state":"D:/test_vms/state",
+        "disk_ceiling_bytes":10737418240,"manifest":"qemu-11.1.3-windows-x64"
+    }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        CandidateRuntime::new(Some(&profile)).dispatch::<()>(NativeMutation::Boot, |_| {
+            panic!("production start reached its launch effect")
+        }),
+        Err(NativeRefusal::QualificationMissing)
+    );
 }

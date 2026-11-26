@@ -264,8 +264,17 @@ impl<'a> QualifierLaunch<'a> {
             HeldRecipeScope::from_baseline(baseline),
             inputs,
             |inputs| {
-                let (core, read, write) =
-                    CheckedLaunchCore::hold_checked(&baseline._held.token, inputs, |_| refresh())?;
+                let (core, (read, write), ()) =
+                    CheckedLaunchCore::hold_checked(&baseline._held.token, inputs, |_| {
+                        Ok((refresh()?, ()))
+                    })
+                    .map_err(|failure| {
+                        // Retain the separate qualifier's bounded teardown wait.
+                        if let LaunchCreation::Created(child) = &failure.creation {
+                            let _ = wait(&child.child.process, 2_000);
+                        }
+                        failure.reason
+                    })?;
                 Ok((Self { core }, read, write))
             },
         )
@@ -384,39 +393,73 @@ fn hash_at_rest(
     limit: u64,
     deadline: Instant,
 ) -> Result<ArtifactPin, NativeRefusal> {
+    hash_at_rest_until(pin, limit, deadline, &|| false)
+}
+
+pub(super) fn check_preparation(
+    deadline: Instant,
+    stop: &dyn Fn() -> bool,
+) -> Result<(), NativeRefusal> {
+    if stop() || Instant::now() >= deadline {
+        return Err(NativeRefusal::PathCustodyUnverified);
+    }
+    Ok(())
+}
+
+pub(super) fn hash_at_rest_until(
+    pin: &mut PathPin,
+    limit: u64,
+    deadline: Instant,
+    stop: &dyn Fn() -> bool,
+) -> Result<ArtifactPin, NativeRefusal> {
+    pin.verified_content = None;
+    check_preparation(deadline, stop)?;
+    inventory::binding(pin)?;
+    let expected = hash_held(&pin.leaf, limit, deadline, stop)?;
+    inventory::binding(pin)?;
+    check_preparation(deadline, stop)?;
+    pin.verified_content = Some(expected);
+    Ok(expected)
+}
+
+pub(super) fn hash_held(
+    file: &File,
+    limit: u64,
+    deadline: Instant,
+    stop: &dyn Fn() -> bool,
+) -> Result<ArtifactPin, NativeRefusal> {
     use sha2::{Digest, Sha256};
     use std::io::{Seek, SeekFrom};
     let reason = NativeRefusal::PathCustodyUnverified;
-    inventory::binding(pin)?;
-    let size = pin.leaf.metadata().map_err(|_| reason)?.len();
+    check_preparation(deadline, stop)?;
+    let size = file.metadata().map_err(|_| reason)?.len();
     if !(1..=limit).contains(&size) {
         return Err(reason);
     }
-    let mut reader = &pin.leaf;
+    let mut reader = file;
     reader.seek(SeekFrom::Start(0)).map_err(|_| reason)?;
     let mut digest = Sha256::new();
     let mut work = vec![0; 256 << 10];
     let mut remaining = size;
     while remaining != 0 {
-        if Instant::now() >= deadline {
+        check_preparation(deadline, stop)?;
+        let len = remaining.min(work.len() as u64) as usize;
+        let count = reader.read(&mut work[..len]).map_err(|_| reason)?;
+        if count == 0 {
             return Err(reason);
         }
-        let len = remaining.min(work.len() as u64) as usize;
-        reader.read_exact(&mut work[..len]).map_err(|_| reason)?;
-        digest.update(&work[..len]);
-        remaining -= len as u64;
+        digest.update(&work[..count]);
+        remaining -= count as u64;
     }
-    let mut overflow = [0];
-    if reader.read(&mut overflow).map_err(|_| reason)? != 0 {
+    check_preparation(deadline, stop)?;
+    if reader.read(&mut [0]).map_err(|_| reason)? != 0 {
         return Err(reason);
     }
-    inventory::binding(pin)?;
-    let expected = ArtifactPin {
+    check_preparation(deadline, stop)?;
+    Ok(ArtifactPin {
         size,
         sha256: digest.finalize().into(),
-    };
-    pin.verified_content = Some(expected);
-    Ok(expected)
+    })
 }
 
 pub(super) fn header(pin: &PathPin) -> Result<Vec<u8>, NativeRefusal> {
