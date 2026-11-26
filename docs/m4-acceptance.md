@@ -12,12 +12,42 @@ daemon configuration and client configuration private. The
 [local bridge setup](windows-execution-accounts.md) describes the server identity
 pin. The client derives the media inventory from the foreground's configured
 custody root. Before startup, it verifies an empty store or an idle ledger
-at the VM store schema version compiled into the client. The reader refuses
-older, newer, or unknown versions. The only media allowed are the selected TEST
-goldens. The scan includes generation
-directories, `disk-<key>` and `vars-<key>` leaves, and the ledger metadata.
-The root may also contain the foreground vault database, lock and DELETE-mode
-rollback journal as regular files.
+at the VM store schema version compiled into the client (currently v16). The
+reader refuses older, newer, or unknown versions without mutating the database.
+The only media allowed are the selected sealed TEST goldens, and the generation
+directory set on disk must match those selected goldens exactly. Empty, extra,
+or lease-only directories are never waived. Bounded handle enumeration runs
+before opening unexpected entries. The root allowlist permits only
+`activity.sqlite3`, `activity.lock`, `vault.sqlite3`, `vault.lock`, and
+`vault.sqlite3-journal` as regular single-link non-reparse files; activity
+sidecars (`-journal`, `-wal`, `-shm`) and vault WAL/SHM files are refused.
+
+For each native-bound golden (`vm_native_generations` bound for the current
+store host, protocol 1, `origin = 'build'`, `disposal IS NULL`, matching
+enrolled production root volume and directory ID, and verified
+`vm_native_slots` matching the sealed `disk`/`vars` pair), the scan checks the
+`disk-<key>` and `vars-<key>` leaves plus one separately counted
+`generation.lease` file opened relative to the held generation directory. Each
+lease must have exact lowercase name `generation.lease`, a private owner-only
+ACL, zero length, a single link, no reparse point, matching volume/directory
+and lease IDs, and pass a bounded quiescent exclusive open and nonblocking
+lock check. Retired generations (after restore or normal expiry) must have
+their ledger rows (`vm_generations`, `vm_artifacts`, `vm_native_generations`,
+`vm_native_slots`) removed and their generation directory, `generation.lease`,
+and media leaves physically absent alongside the claim and reconciliation or
+expiry checks.
+
+Historic golden rows upgraded from pre-7c schemas have no
+`vm_native_generations` or `vm_native_slots` custody rows and no
+`generation.lease`. The acceptance reader explicitly separates historic rows
+from native custody: they can be observed read-only only under the historic
+contract, can never supply native TEST eligibility, and are never bound
+silently. To move a host with historic goldens onto native 7c custody, perform
+a checked rebuild or re-enrollment: stop the foreground cleanly, archive or
+remove the historic state directory outside the enrolled root, enroll a fresh
+private store directory on D: (or clear the historic rows and media into a
+clean v16 store), verify startup preflight against the enrolled store pins,
+and rebuild both qualified TEST goldens under native custody.
 
 Prepare an owner-private JSON plan on D:. The qualification digest is an expected
 pin. The client records a digest only after an authenticated daemon receipt
