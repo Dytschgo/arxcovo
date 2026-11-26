@@ -88,6 +88,17 @@ CREATE TRIGGER vm_native_disposal_order BEFORE UPDATE OF disposal ON vm_native_g
     WHEN NEW.disposal IS NOT NULL AND EXISTS(SELECT 1 FROM vm_native_slots
         WHERE generation=NEW.generation AND state<>'absent' AND disposal IS NOT 'absent')
     BEGIN SELECT RAISE(ABORT,'native slots remain'); END;
+-- Legacy writers keep the artifact row's attempt semantics, but once a slot
+-- has native custody its artifact identity can only mirror that custody.
+CREATE TRIGGER vm_native_artifact_identity BEFORE UPDATE ON vm_artifacts
+    WHEN EXISTS(SELECT 1 FROM vm_native_slots WHERE object_key=OLD.object_key)
+      AND (NEW.volume_id IS NOT NULL OR NEW.directory_id IS NOT NULL OR NEW.file_id IS NOT NULL)
+      AND NOT EXISTS(SELECT 1 FROM vm_native_slots s
+          JOIN vm_native_generations n ON n.generation=s.generation
+          WHERE s.object_key=OLD.object_key AND s.object_key=NEW.object_key
+            AND s.generation=NEW.generation_id AND s.role=NEW.role AND s.file IS NOT NULL
+            AND NEW.file_id=s.file AND NEW.directory_id=n.directory AND NEW.volume_id=n.volume)
+    BEGIN SELECT RAISE(ABORT,'native slot identity is fenced'); END;
 ";
 
 /// The operation protocol that reserved a native generation.
@@ -106,6 +117,21 @@ impl Origin {
             Self::Restore => "restore",
         }
     }
+}
+
+/// The workspace object an unbound intent observation names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceLeaf {
+    Directory,
+    Lease,
+}
+
+/// An exact no-follow observation through the held parent. A present object
+/// carries its identity only when it opened as the expected kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Presence {
+    Absent,
+    Present(Option<FileIdentity>),
 }
 
 /// The exact durable workspace scope, mirroring the held workspace binding.
@@ -137,10 +163,14 @@ fn owner_live(db: &Connection, generation: Id) -> Result<bool> {
         "SELECT count(*) FROM vm_native_generations n JOIN vm_generations g ON g.id=n.generation
          WHERE n.generation=?1 AND g.active=0 AND CASE n.origin
             WHEN 'build' THEN EXISTS(SELECT 1 FROM vm_build_intents b
-                WHERE b.id=g.build_id AND b.state='pending')
+                JOIN vm_operations o ON o.operation_id=b.operation_id
+                WHERE b.id=g.build_id AND b.state='pending' AND o.action=11 AND o.status=0)
             WHEN 'clone' THEN EXISTS(SELECT 1 FROM vm_instances v WHERE v.id=g.vm_id AND v.state=0)
             ELSE EXISTS(SELECT 1 FROM vm_snapshot_work w
-                WHERE w.candidate=g.id AND w.vm=g.vm_id AND w.phase='copy') END",
+                JOIN vm_operations o ON o.activity_id=w.activity
+                WHERE w.candidate=g.id AND w.vm=g.vm_id AND w.action=6 AND w.phase='copy'
+                  AND o.vm=g.vm_id AND o.action=6 AND o.status=0
+                  AND o.binding_kind='snapshot') END",
         [generation],
     )? == 1)
 }
@@ -150,45 +180,63 @@ fn volume(identity: FileIdentity) -> [u8; 8] {
 }
 
 /// Durable intent before the generation directory's relative create-new.
-/// A replay with the identical scope is accepted. An `absent` intent may
-/// be renewed.
+/// A replay with the identical scope is accepted and an `absent` intent may
+/// be renewed. A committed directory checkpoint resumes: the caller gets the
+/// recorded directory identity and continues at the lease intent.
 pub(crate) fn intend_workspace(
     db: &Connection,
     generation: Id,
     origin: Origin,
     production: FileIdentity,
-) -> Result<()> {
-    let renewed = db.execute(
-        "UPDATE vm_native_generations SET state='intended'
-         WHERE generation=?1 AND origin=?2 AND volume=?3 AND production=?4
-           AND state IN ('intended','absent')",
-        params![
-            generation,
-            origin.name(),
-            volume(production),
-            production.file
-        ],
-    )?;
-    if renewed == 0 {
-        // Only an untouched generation can be bound. Legacy and attempted
-        // rows never gain native custody.
-        ensure!(
-            count(
-                db,
-                "SELECT count(*)=sum(state='planned') AND count(*)>0 FROM vm_artifacts
-                 WHERE generation_id=?1",
+) -> Result<Option<FileIdentity>> {
+    let existing: Option<(String, Option<Id>)> = db
+        .query_row(
+            "SELECT state,directory FROM vm_native_generations
+             WHERE generation=?1 AND origin=?2 AND volume=?3 AND production=?4",
+            params![
+                generation,
+                origin.name(),
+                volume(production),
+                production.file
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let resume = match existing {
+        Some((state, None)) if matches!(state.as_str(), "intended" | "absent") => {
+            db.execute(
+                "UPDATE vm_native_generations SET state='intended' WHERE generation=?1",
                 [generation],
-            )? == 1,
-            "native custody requires an untouched generation"
-        );
-        db.execute(
-            "INSERT INTO vm_native_generations(generation,host,origin,protocol,volume,production,state)
-             SELECT ?1,id,?2,1,?3,?4,'intended' FROM vm_state_host WHERE singleton=1",
-            params![generation, origin.name(), volume(production), production.file],
-        )?;
-    }
+            )?;
+            None
+        }
+        Some((state, Some(file))) if state == "directory" => Some(FileIdentity {
+            volume: production.volume,
+            file,
+        }),
+        Some(_) => anyhow::bail!("native workspace intent already settled"),
+        None => {
+            // Only an untouched generation can be bound. Legacy and attempted
+            // rows never gain native custody.
+            ensure!(
+                count(
+                    db,
+                    "SELECT count(*)=sum(state='planned') AND count(*)>0 FROM vm_artifacts
+                     WHERE generation_id=?1",
+                    [generation],
+                )? == 1,
+                "native custody requires an untouched generation"
+            );
+            db.execute(
+                "INSERT INTO vm_native_generations(generation,host,origin,protocol,volume,production,state)
+                 SELECT ?1,id,?2,1,?3,?4,'intended' FROM vm_state_host WHERE singleton=1",
+                params![generation, origin.name(), volume(production), production.file],
+            )?;
+            None
+        }
+    };
     ensure!(owner_live(db, generation)?, "native generation owner ended");
-    Ok(())
+    Ok(resume)
 }
 
 /// Identity of the created directory, before the lease create-new.
@@ -256,26 +304,43 @@ pub(crate) fn bound(db: &Connection, scope: Scope) -> Result<bool> {
         )? == 1)
 }
 
-/// Classifies an unbound workspace intent from an exact held observation:
-/// the directory (state `intended`) or the lease (state `directory`).
-/// Absence of a directory disproves the intent. A present unidentified
-/// object is quarantined. Absence of a lease leaves its intent in place.
+/// Classifies an unbound workspace intent from an exact observation of the
+/// named object through the held parent. Absence of an intended directory
+/// disproves the intent. The recorded directory, observed with its identity,
+/// keeps the `directory` checkpoint, so a lost acknowledgement resumes. A
+/// missing or replaced recorded directory, or any present lease without a
+/// recorded identity, is quarantined. Absence of a lease keeps its intent.
 pub(crate) fn settle_workspace_intent(
     db: &Connection,
     generation: Id,
-    present: bool,
+    leaf: WorkspaceLeaf,
+    presence: Presence,
 ) -> Result<()> {
-    let state: Option<String> = db
+    let row: Option<(String, [u8; 8], Option<Id>)> = db
         .query_row(
-            "SELECT state FROM vm_native_generations WHERE generation=?1",
+            "SELECT state,volume,directory FROM vm_native_generations WHERE generation=?1",
             [generation],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let next = match (state.as_deref(), present) {
-        (Some("intended"), false) => "absent",
-        (Some("intended" | "directory"), true) => "quarantined",
-        (Some("directory"), false) => "directory",
+    let Some((state, volume_id, directory)) = row else {
+        anyhow::bail!("no unsettled native workspace intent");
+    };
+    let recorded = directory.map(|file| FileIdentity {
+        volume: u64::from_be_bytes(volume_id),
+        file,
+    });
+    let next = match (state.as_str(), leaf, presence) {
+        ("intended", WorkspaceLeaf::Directory, Presence::Absent) => "absent",
+        ("intended", WorkspaceLeaf::Directory, Presence::Present(_)) => "quarantined",
+        ("directory", WorkspaceLeaf::Directory, Presence::Present(Some(id)))
+            if Some(id) == recorded =>
+        {
+            "directory"
+        }
+        ("directory", WorkspaceLeaf::Directory, _) => "quarantined",
+        ("directory", WorkspaceLeaf::Lease, Presence::Absent) => "directory",
+        ("directory", WorkspaceLeaf::Lease, Presence::Present(_)) => "quarantined",
         _ => anyhow::bail!("no unsettled native workspace intent"),
     };
     db.execute(
@@ -441,7 +506,11 @@ pub(crate) fn pair_matches(
     slots: [ArtifactSlot; 2],
     evidence: [ArtifactEvidence; 2],
 ) -> Result<bool> {
-    if !bound(db, scope)? || slots[0] == slots[1] {
+    if !bound(db, scope)?
+        || !matches!(slots[0].role, "disk" | "verification_overlay")
+        || slots[1].role != "vars"
+        || slots[0].key == slots[1].key
+    {
         return Ok(false);
     }
     for (slot, evidence) in slots.into_iter().zip(evidence) {
@@ -456,6 +525,20 @@ pub(crate) fn pair_matches(
         }
     }
     Ok(true)
+}
+
+/// Whether a slot of this bound scope is identified, not yet verified, as
+/// exactly this object. A writable helper target must still be in this state.
+pub(crate) fn identified_as(
+    db: &Connection,
+    scope: Scope,
+    slot: ArtifactSlot,
+    identity: FileIdentity,
+) -> Result<bool> {
+    Ok(slot.generation == scope.generation
+        && identity.volume == scope.production.volume
+        && bound(db, scope)?
+        && leaf(db, slot)? == Leaf::Identified(identity.file))
 }
 
 pub(crate) fn leaf(db: &Connection, slot: ArtifactSlot) -> Result<Leaf> {

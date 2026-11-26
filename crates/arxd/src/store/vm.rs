@@ -2853,7 +2853,8 @@ mod tests {
             .unwrap();
             compose::settle_backup_failed(db, &intent, "interrupted", true, false, NOW)?;
             db.execute_batch(
-                "DROP TABLE vm_native_slots; DROP TABLE vm_native_generations;
+                "DROP TRIGGER vm_native_artifact_identity;
+                 DROP TABLE vm_native_slots; DROP TABLE vm_native_generations;
                  DROP INDEX vm_artifact_slot;
                  DROP TABLE vm_compose_backup_retirements;
                  ALTER TABLE vm_compose_backups DROP COLUMN namespace_tracked;

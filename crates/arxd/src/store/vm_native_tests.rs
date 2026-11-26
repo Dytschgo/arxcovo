@@ -3,7 +3,9 @@ use super::super::{
 };
 use super::*;
 use crate::service::application::tests::private_temp;
-use crate::vm::{BuildRequest, BuildSlots, DiskClaim, RequestId, Subject, paths::ArtifactPin};
+use crate::vm::{
+    BuildRequest, BuildSlots, DiskClaim, PairSlots, RequestId, Subject, paths::ArtifactPin,
+};
 
 const NOW: i64 = 100;
 
@@ -43,7 +45,10 @@ pub(crate) fn build(db: &Connection, nonce: u8) -> Result<BuildSlots> {
 }
 
 fn bind(db: &Connection, scope: Scope) -> Result<()> {
-    intend_workspace(db, scope.generation, Origin::Build, scope.production)?;
+    assert_eq!(
+        intend_workspace(db, scope.generation, Origin::Build, scope.production)?,
+        None
+    );
     identify_directory(db, scope.generation, scope.workspace)?;
     bind_workspace(db, scope)
 }
@@ -63,8 +68,10 @@ fn dump(db: &Connection) -> Result<Vec<String>> {
     let mut rows = Vec::new();
     for sql in [
         "SELECT hex(id)||hex(build_id)||quote(vm_id)||generation||active FROM vm_generations",
-        "SELECT hex(generation_id)||role||hex(object_key)||state||quote(file_id) FROM vm_artifacts",
-        "SELECT hex(id)||state||staging_bytes FROM vm_build_intents",
+        "SELECT hex(generation_id)||role||hex(object_key)||state||quote(volume_id)
+            ||quote(directory_id)||quote(file_id)||quote(content_digest)||quote(bytes) FROM vm_artifacts",
+        "SELECT hex(id)||state||staging_bytes||health_verified FROM vm_build_intents",
+        "SELECT hex(operation_id)||status||quote(cleanup_confirmed) FROM vm_operations",
         "SELECT name FROM sqlite_schema WHERE name NOT GLOB 'vm_native_*' AND name<>'vm_artifact_slot'",
     ] {
         let mut statement = db.prepare(&format!("{sql} ORDER BY 1"))?;
@@ -82,8 +89,14 @@ fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
     let store = VmStore::open(dir.path(), NOW)?;
     let legacy = store.transact(|db| {
         let slots = build(db, 1)?;
-        // A legacy worker reached identity before the upgrade.
+        // A legacy worker identified the seed with full evidence before the
+        // upgrade: identity, digest and length, with the build charge.
         super::super::created(db, slots.seed)?;
+        super::super::identify(
+            db,
+            slots.seed,
+            evidence(10, scope(slots.seed.generation), b"seed"),
+        )?;
         Ok(slots)
     })?;
     drop(store);
@@ -91,7 +104,8 @@ fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
     let before = VmStore::open(dir.path(), NOW)?.transact(|db| dump(db))?;
     let db = open_sqlite(&dir.path().join("activity.sqlite3"))?;
     db.execute_batch(
-        "DROP TABLE vm_native_slots; DROP TABLE vm_native_generations;
+        "DROP TRIGGER vm_native_artifact_identity;
+         DROP TABLE vm_native_slots; DROP TABLE vm_native_generations;
          DROP INDEX vm_artifact_slot; PRAGMA user_version=15;",
     )?;
     drop(db);
@@ -127,6 +141,7 @@ fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
                 "index:vm_artifact_slot",
                 "table:vm_native_generations",
                 "table:vm_native_slots",
+                "trigger:vm_native_artifact_identity",
                 "trigger:vm_native_disposal_order",
                 "trigger:vm_native_generation_scope",
                 "trigger:vm_native_origin",
@@ -135,6 +150,29 @@ fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
             ]
             .map(String::from)
         );
+        // Every compiled native statement is the exact v16 DDL text, so a
+        // changed constraint, foreign key or trigger body fails here.
+        let mut statement = db.prepare(
+            "SELECT name,sql FROM sqlite_schema
+             WHERE (name GLOB 'vm_native_*' OR name='vm_artifact_slot') AND sql IS NOT NULL",
+        )?;
+        let compiled = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(compiled.len(), 9);
+        for (name, sql) in compiled {
+            assert_eq!(MIGRATE_V16.matches(sql.as_str()).count(), 1, "{name}");
+        }
+        // The fence leaves legacy rows writable by their own protocol.
+        let fresh = build(db, 2)?;
+        super::super::created(db, fresh.seed)?;
+        super::super::identify(
+            db,
+            fresh.seed,
+            evidence(11, scope(fresh.seed.generation), b"seed"),
+        )?;
         // An attempted legacy generation never acquires native custody.
         assert!(
             intend_workspace(db, legacy.pair.disk.generation, Origin::Build, identity(1)).is_err()
@@ -157,8 +195,14 @@ fn workspace_scope_binds_exact_identities_in_order() -> Result<()> {
         for wrong in [Origin::Clone, Origin::Restore] {
             assert!(intend_workspace(db, generation, wrong, scope.production).is_err());
         }
-        intend_workspace(db, generation, Origin::Build, scope.production)?;
-        intend_workspace(db, generation, Origin::Build, scope.production)?;
+        assert_eq!(
+            intend_workspace(db, generation, Origin::Build, scope.production)?,
+            None
+        );
+        assert_eq!(
+            intend_workspace(db, generation, Origin::Build, scope.production)?,
+            None
+        );
         assert!(intend_workspace(db, generation, Origin::Build, identity(9)).is_err());
         assert!(bind_workspace(db, scope).is_err());
         let foreign = FileIdentity {
@@ -218,17 +262,51 @@ fn workspace_scope_binds_exact_identities_in_order() -> Result<()> {
             .is_err()
         );
 
-        // Unbound intents settle only from an exact observation.
+        // Unbound intents settle only from an exact observation of the named
+        // object. A directory checkpoint survives a lost acknowledgement.
+        use Presence::{Absent, Present};
+        use WorkspaceLeaf::{Directory, Lease};
+        let state = |generation: Id| -> Result<String> {
+            Ok(db.query_row(
+                "SELECT state FROM vm_native_generations WHERE generation=?1",
+                [generation],
+                |row| row.get(0),
+            )?)
+        };
         let verification = slots.verification.disk.generation;
         intend_workspace(db, verification, Origin::Build, scope.production)?;
-        settle_workspace_intent(db, verification, false)?;
-        assert!(settle_workspace_intent(db, verification, false).is_err());
+        assert!(settle_workspace_intent(db, verification, Lease, Absent).is_err());
+        settle_workspace_intent(db, verification, Directory, Absent)?;
+        assert_eq!(state(verification)?, "absent");
+        assert!(settle_workspace_intent(db, verification, Directory, Absent).is_err());
         intend_workspace(db, verification, Origin::Build, scope.production)?;
         identify_directory(db, verification, identity(5))?;
-        settle_workspace_intent(db, verification, false)?;
-        settle_workspace_intent(db, verification, true)?;
+        settle_workspace_intent(db, verification, Directory, Present(Some(identity(5))))?;
+        settle_workspace_intent(db, verification, Lease, Absent)?;
+        assert_eq!(state(verification)?, "directory");
+        // The recorded directory resumes with its identity.
+        assert_eq!(
+            intend_workspace(db, verification, Origin::Build, scope.production)?,
+            Some(identity(5))
+        );
+        assert_eq!(state(verification)?, "directory");
+        for (leaf, presence) in [
+            (Directory, Present(None)),
+            (Directory, Present(Some(identity(6)))),
+            (Directory, Absent),
+            (Lease, Present(None)),
+            (Lease, Present(Some(identity(6)))),
+        ] {
+            // Rebuild the recorded directory state for each wrong observation.
+            db.execute(
+                "UPDATE vm_native_generations SET state='directory' WHERE generation=?1",
+                [verification],
+            )?;
+            settle_workspace_intent(db, verification, leaf, presence)?;
+            assert_eq!(state(verification)?, "quarantined", "{leaf:?} {presence:?}");
+        }
         assert!(intend_workspace(db, verification, Origin::Build, scope.production).is_err());
-        assert!(settle_workspace_intent(db, generation, true).is_err());
+        assert!(settle_workspace_intent(db, generation, Directory, Present(None)).is_err());
         Ok(())
     })
 }
@@ -430,6 +508,176 @@ fn legacy_paths_cannot_forget_or_dispose_native_custody() -> Result<()> {
         // A disposing generation accepts no new slot or dispatch scope.
         assert!(!bound(db, scope)?);
         assert!(intend_slot(db, scope, slots.pair.vars).is_err());
+        Ok(())
+    })
+}
+
+/// Legacy identity writers cannot replace or pre-empt the identity behind a
+/// native checkpoint, through the same transaction a legacy worker uses.
+#[test]
+fn legacy_identify_is_fenced_behind_native_custody() -> Result<()> {
+    let dir = private_temp();
+    let store = VmStore::open(dir.path(), NOW)?;
+    let (slots, scope) = store.transact(|db| {
+        let slots = build(db, 1)?;
+        let scope = scope(slots.pair.disk.generation);
+        bind(db, scope)?;
+        intend_slot(db, scope, slots.seed)?;
+        Ok((slots, scope))
+    })?;
+    let legacy = |file: u8| {
+        store.transact(|db| super::super::identify(db, slots.seed, evidence(file, scope, b"seed")))
+    };
+    // Before the native identity, no legacy identity is accepted.
+    assert!(legacy(10).is_err());
+    store.transact(|db| identify_slot(db, scope, slots.seed, identity(10)))?;
+    // A second identity for the same slot is refused, and so is the raw UPDATE.
+    assert!(legacy(11).is_err());
+    assert!(
+        store
+            .transact(|db| Ok(db.execute(
+                "UPDATE vm_artifacts SET file_id=?2 WHERE object_key=?1",
+                params![slots.seed.key, [11u8; 16]],
+            )?))
+            .is_err()
+    );
+    let mut moved = evidence(10, scope, b"seed");
+    moved.directory = [4; 16];
+    assert!(
+        store
+            .transact(|db| super::super::identify(db, slots.seed, moved))
+            .is_err()
+    );
+    // An exactly consistent record remains possible.
+    legacy(10)?;
+    store.transact(|db| {
+        assert_eq!(
+            count(
+                db,
+                "SELECT count(*) FROM vm_artifacts WHERE object_key=?1 AND file_id=?2
+                 AND directory_id=?3",
+                params![slots.seed.key, [10u8; 16], scope.workspace.file],
+            )?,
+            1
+        );
+        assert_eq!(leaf(db, slots.seed)?, Leaf::Identified([10; 16]));
+        Ok(())
+    })
+}
+
+/// A restore candidate's checkpoints need the exact pending restore receipt.
+/// The disposal fence interrupts that receipt, and a snapshot action never
+/// owns a restore candidate.
+#[test]
+fn restore_custody_requires_the_pending_restore_receipt() -> Result<()> {
+    let dir = private_temp();
+    let store = VmStore::open(dir.path(), NOW)?;
+    store.transact(|db| {
+        let candidate = |nonce: u8, action: i64| -> Result<(Id, i64, PairSlots)> {
+            let vm = [nonce; 16];
+            let template = [nonce.wrapping_add(100); 16];
+            db.execute(
+                "INSERT INTO vm_templates VALUES(?1,1,?2,zeroblob(32),zeroblob(32),40)",
+                params![template, [nonce; 32]],
+            )?;
+            db.execute(
+                "INSERT INTO vm_instances(id,template,principal,expires_ms,state)
+                 VALUES(?1,?2,'alice',?3,1)",
+                params![vm, template, NOW + 60_000],
+            )?;
+            let active = super::super::new_id()?;
+            let staged = super::super::new_id()?;
+            for (id, ordinal) in [(active, 1), (staged, 2)] {
+                db.execute(
+                    "INSERT INTO vm_generations(id,vm_id,generation) VALUES(?1,?2,?3)",
+                    params![id, vm, ordinal],
+                )?;
+            }
+            let pair = PairSlots {
+                disk: super::super::plan(db, staged, "disk")?,
+                vars: super::super::plan(db, staged, "vars")?,
+            };
+            let operation = Binding {
+                principal: "alice",
+                key: RequestId::parse(&format!("{:032x}", 0x100 + u32::from(nonce))).unwrap(),
+                subject: Subject::Snapshot([nonce; 16], [nonce; 32]),
+                action,
+            }
+            .record(db, NOW, Some(vm), None)?;
+            db.execute(
+                "INSERT INTO vm_snapshot_work(activity,vm,action,target,expected,source,candidate,
+                    epoch,lineage,phase,persistent,staging)
+                 VALUES(?1,?2,?3,?4,?5,?5,?6,?7,?8,'copy',0,8)",
+                params![
+                    operation.receipt.activity_id,
+                    vm,
+                    action,
+                    [nonce; 16],
+                    active,
+                    staged,
+                    [nonce; 16],
+                    [nonce; 32]
+                ],
+            )?;
+            Ok((staged, operation.receipt.activity_id, pair))
+        };
+        let (restore, activity, pair) = candidate(1, 6)?;
+        let scope = scope(restore);
+        assert!(intend_workspace(db, restore, Origin::Build, scope.production).is_err());
+        intend_workspace(db, restore, Origin::Restore, scope.production)?;
+        identify_directory(db, restore, scope.workspace)?;
+        bind_workspace(db, scope)?;
+        intend_slot(db, scope, pair.disk)?;
+        // The disposal fence interrupts the receipt while the work stays in
+        // its copy phase.
+        super::super::finish(
+            db,
+            activity,
+            crate::vm::Status::Interrupted,
+            NOW,
+            Some(false),
+        )?;
+        assert!(identify_slot(db, scope, pair.disk, identity(10)).is_err());
+        assert!(intend_slot(db, scope, pair.vars).is_err());
+        // A snapshot-action copy row never owns a restore candidate.
+        let (snapshot, _, _) = candidate(2, 5)?;
+        assert!(intend_workspace(db, snapshot, Origin::Restore, scope.production).is_err());
+        Ok(())
+    })
+}
+
+/// The start pair must have the disk-then-VARS shape of a held refusal.
+#[test]
+fn start_pair_shape_is_checked_against_durable_slots() -> Result<()> {
+    let dir = private_temp();
+    let store = VmStore::open(dir.path(), NOW)?;
+    store.transact(|db| {
+        let slots = build(db, 1)?;
+        let scope = scope(slots.pair.disk.generation);
+        bind(db, scope)?;
+        for (slot, file) in [
+            (slots.pair.disk, 10),
+            (slots.pair.vars, 11),
+            (slots.seed, 12),
+        ] {
+            intend_slot(db, scope, slot)?;
+            identify_slot(db, scope, slot, identity(file))?;
+        }
+        let e = |file| evidence(file, scope, b"x");
+        assert!(pair_matches(
+            db,
+            scope,
+            [slots.pair.disk, slots.pair.vars],
+            [e(10), e(11)]
+        )?);
+        for (pair, evidence) in [
+            ([slots.pair.vars, slots.pair.disk], [e(11), e(10)]),
+            ([slots.seed, slots.pair.vars], [e(12), e(11)]),
+            ([slots.pair.disk, slots.pair.vars], [e(11), e(10)]),
+            ([slots.pair.disk, slots.pair.disk], [e(10), e(10)]),
+        ] {
+            assert!(!pair_matches(db, scope, pair, evidence)?);
+        }
         Ok(())
     })
 }

@@ -43,12 +43,12 @@ impl<'a> Recorder<'a> {
         }
     }
 
-    fn step(
+    fn step<T>(
         &self,
         name: &'static str,
         object: Option<String>,
-        commit: impl FnOnce() -> Result<(), NativeRefusal>,
-    ) -> Result<(), NativeRefusal> {
+        commit: impl FnOnce() -> Result<T, NativeRefusal>,
+    ) -> Result<T, NativeRefusal> {
         let observed = object.and_then(|leaf| {
             std::fs::metadata(self.directory.join(leaf))
                 .ok()
@@ -58,11 +58,11 @@ impl<'a> Recorder<'a> {
         if self.fault.get() == Some(Fault::Before(name)) {
             return Err(PATH);
         }
-        commit()?;
+        let committed = commit()?;
         if self.fault.get() == Some(Fault::After(name)) {
             return Err(PATH);
         }
-        Ok(())
+        Ok(committed)
     }
 
     pub(in crate::vm::windows::qualification) fn names(&self) -> Vec<&'static str> {
@@ -79,7 +79,7 @@ impl CustodyCheckpoints for Recorder<'_> {
         &self,
         generation: Id,
         production: FileIdentity,
-    ) -> Result<(), NativeRefusal> {
+    ) -> Result<Option<FileIdentity>, NativeRefusal> {
         self.step("intend_workspace", Some(String::new()), || {
             self.ledger.intend_workspace(generation, production)
         })
@@ -105,9 +105,15 @@ impl CustodyCheckpoints for Recorder<'_> {
         self.step("confirm_bound", None, || self.ledger.confirm_bound(binding))
     }
 
-    fn workspace_intent_settled(&self, generation: Id, present: bool) -> Result<(), NativeRefusal> {
+    fn workspace_intent_settled(
+        &self,
+        generation: Id,
+        leaf: native::WorkspaceLeaf,
+        presence: native::Presence,
+    ) -> Result<(), NativeRefusal> {
         self.step("workspace_intent_settled", None, || {
-            self.ledger.workspace_intent_settled(generation, present)
+            self.ledger
+                .workspace_intent_settled(generation, leaf, presence)
         })
     }
 
@@ -139,6 +145,17 @@ impl CustodyCheckpoints for Recorder<'_> {
     ) -> Result<(), NativeRefusal> {
         self.step("slot_identified", leaf_name(slot), || {
             self.ledger.slot_identified(binding, slot, identity)
+        })
+    }
+
+    fn confirm_identified(
+        &self,
+        binding: WorkspaceBinding,
+        slot: ArtifactSlot,
+        identity: FileIdentity,
+    ) -> Result<(), NativeRefusal> {
+        self.step("confirm_identified", None, || {
+            self.ledger.confirm_identified(binding, slot, identity)
         })
     }
 
@@ -301,9 +318,10 @@ fn workspace_faults_keep_an_exact_intent_or_quarantine_across_reopen() {
             true,
             false,
         ),
+        // A lost directory acknowledgement keeps the known directory.
         (
             Fault::After("workspace_directory"),
-            Some("quarantined"),
+            Some("directory"),
             true,
             false,
         ),
@@ -356,6 +374,87 @@ fn workspace_faults_keep_an_exact_intent_or_quarantine_across_reopen() {
     let recorder = fixture.recorder(generation);
     assert!(recorder.ledger.confirm_bound(binding).is_ok());
     assert!(hold_workspace_under(&fixture.production, sid_ptr(&fixture.owner), binding).is_ok());
+
+    // After the reopen the known directory keeps its checkpoint with the
+    // lease absent. The interrupted build no longer owns the generation, so
+    // a stale retry is refused before any filesystem effect.
+    let generation = generations[2];
+    let path = fixture
+        .temp
+        .path()
+        .join("production")
+        .join(hex::encode(generation));
+    assert!(
+        fixture
+            .reserve(&fixture.recorder(generation), generation)
+            .is_err()
+    );
+    assert!(!exists(&path.join(GENERATION_LEASE)));
+    assert_eq!(
+        fixture.generation_state(generation).as_deref(),
+        Some("directory")
+    );
+    // A settled intent never resumes.
+    let generation = generations[1];
+    assert!(
+        fixture
+            .reserve(&fixture.recorder(generation), generation)
+            .is_err()
+    );
+    assert_eq!(
+        fixture.generation_state(generation).as_deref(),
+        Some("quarantined")
+    );
+}
+
+/// T14: a lost directory acknowledgement resumes at the lease for the live
+/// owner. Nothing is created twice and nothing is quarantined.
+#[test]
+fn lost_directory_acknowledgement_resumes_at_the_lease() {
+    let fixture = Fixture::new();
+    let generation = fixture.builds[0].verification.disk.generation;
+    let path = fixture
+        .temp
+        .path()
+        .join("production")
+        .join(hex::encode(generation));
+    let recorder = fixture.recorder(generation);
+    recorder
+        .fault
+        .set(Some(Fault::After("workspace_directory")));
+    assert!(fixture.reserve(&recorder, generation).is_err());
+    assert_eq!(
+        recorder.names(),
+        [
+            "intend_workspace",
+            "workspace_directory",
+            "workspace_intent_settled"
+        ]
+    );
+    assert!(!exists(&path.join(GENERATION_LEASE)));
+    assert_eq!(
+        fixture.generation_state(generation).as_deref(),
+        Some("directory")
+    );
+    let directory = PathPin::open(
+        &fixture
+            .production
+            .path
+            .join(&hex::encode(generation))
+            .unwrap(),
+        true,
+        false,
+    )
+    .unwrap()
+    .identity;
+    let recorder = fixture.recorder(generation);
+    let ws = fixture.reserve(&recorder, generation).unwrap();
+    assert_eq!(recorder.names(), ["intend_workspace", "workspace_bound"]);
+    assert_eq!(ws.binding().workspace, directory);
+    assert_eq!(
+        fixture.generation_state(generation).as_deref(),
+        Some("bound")
+    );
 }
 
 #[test]
@@ -395,6 +494,16 @@ fn slot_identity_is_durable_before_the_first_write() {
     assert!(ws.create_slot(slots.pair.vars, &recorder).is_err());
     assert_eq!(std::fs::read(vars.as_str()).unwrap(), b"foreign");
     assert_eq!(fixture.leaf(slots.pair.vars), Leaf::Unidentified);
+    // Occupancy by the other kind is known occupancy, not a pending intent.
+    let other = fixture.builds[2].pair.disk;
+    let wrong_kind = fixture.builds[2].seed;
+    let third = fixture
+        .reserve(&fixture.recorder(other.generation), other.generation)
+        .unwrap();
+    std::fs::create_dir(slot_path(&third.root.path, wrong_kind).as_str()).unwrap();
+    assert!(third.create_slot(wrong_kind, &recorder).is_err());
+    assert_eq!(fixture.leaf(wrong_kind), Leaf::Unidentified);
+    assert!(std::path::Path::new(slot_path(&third.root.path, wrong_kind).as_str()).is_dir());
 
     // A lost intent acknowledgement stays charged until exact absence.
     let other = fixture.builds[1];
@@ -504,6 +613,10 @@ fn start_pair_must_name_the_durable_slot_identities() {
     vars.write_all(b"vars").unwrap();
     let vars_id = vars.identity();
     drop(vars);
+    let mut seed = ws.create_slot(slots.seed, &recorder).unwrap();
+    seed.write_all(b"seed").unwrap();
+    let seed_id = seed.identity();
+    drop(seed);
     let binding = ws.binding();
     let evidence = |identity: FileIdentity| ArtifactEvidence {
         identity,
@@ -528,7 +641,24 @@ fn start_pair_must_name_the_durable_slot_identities() {
         slots: fixture.builds[1].pair,
         ..pair
     };
-    for wrong in [swapped, moved, foreign] {
+    // Both the slots and their evidence swapped: each slot still names its
+    // own durable object, but VARS stands in for the disk.
+    let reversed = StartPair {
+        slots: PairSlots {
+            disk: slots.pair.vars,
+            vars: slots.pair.disk,
+        },
+        evidence: [pair.evidence[1], pair.evidence[0]],
+    };
+    // An identified seed in place of the disk.
+    let seeded = StartPair {
+        slots: PairSlots {
+            disk: slots.seed,
+            vars: slots.pair.vars,
+        },
+        evidence: [evidence(seed_id), pair.evidence[1]],
+    };
+    for wrong in [swapped, moved, foreign, reversed, seeded] {
         assert_eq!(recorder.confirm_start_pair(binding, wrong), Err(PATH));
     }
     let substitute = WorkspaceBinding {
@@ -536,4 +666,109 @@ fn start_pair_must_name_the_durable_slot_identities() {
         ..binding
     };
     assert_eq!(recorder.confirm_start_pair(substitute, pair), Err(PATH));
+}
+
+/// I15/T19: a checked Mutate launch accepts only the exact held helper target
+/// that the ledger still records as identified and unverified.
+#[test]
+fn mutate_dispatch_requires_the_durable_helper_target() {
+    let fixture = Fixture::new();
+    let slots = fixture.builds[0];
+    let generation = slots.pair.disk.generation;
+    let recorder = fixture.recorder(generation);
+    let ws = fixture.reserve(&recorder, generation).unwrap();
+    let target = ws
+        .precreate_helper_target(slots.pair.disk, &recorder)
+        .unwrap();
+    let image = synthetic_artifact(
+        ArtifactRole::QemuImg,
+        LocalPath::parse(r"D:\fixture\qemu-img.exe").unwrap(),
+        9,
+    );
+    let staging = |path: LocalPath, identity: FileIdentity| {
+        Artifact::new(ArtifactRole::Staging, path)
+            .unwrap()
+            .with_identity(identity)
+    };
+    let target_path = slot_path(&ws.root.path, slots.pair.disk);
+    let inputs = |artifact: Artifact| {
+        vec![
+            (ArtifactRole::QemuImg, image.clone()),
+            (ArtifactRole::Staging, artifact),
+        ]
+    };
+    let exact = inputs(staging(target_path.clone(), target.identity()));
+    assert_eq!(
+        check_helper_target(PlanKind::Mutate, &exact, &ws, Some(&target)),
+        Ok(())
+    );
+    // The target is required for Mutate and refused for every other kind.
+    assert_eq!(
+        check_helper_target(PlanKind::Mutate, &exact, &ws, None),
+        Err(PATH)
+    );
+    for kind in [PlanKind::InspectWritable, PlanKind::Inspect, PlanKind::Boot] {
+        assert_eq!(
+            check_helper_target(kind, &exact, &ws, Some(&target)),
+            Err(PATH)
+        );
+        assert_eq!(check_helper_target(kind, &exact, &ws, None), Ok(()));
+    }
+    // A substituted empty in-workspace file, by its own identity or under
+    // the target's identity, is refused.
+    let decoy = ws
+        .root
+        .path
+        .join(&format!("disk-{}", hex::encode([0x5a; 16])))
+        .unwrap();
+    std::fs::write(decoy.as_str(), b"").unwrap();
+    let decoy_id = PathPin::open(&decoy, false, false).unwrap().identity;
+    for wrong in [
+        inputs(staging(decoy.clone(), decoy_id)),
+        inputs(staging(decoy.clone(), target.identity())),
+        inputs(staging(target_path.clone(), decoy_id)),
+    ] {
+        assert_eq!(
+            check_helper_target(PlanKind::Mutate, &wrong, &ws, Some(&target)),
+            Err(PATH)
+        );
+    }
+    let mut doubled = exact.clone();
+    doubled.push((ArtifactRole::Scratch, staging(decoy.clone(), decoy_id)));
+    assert_eq!(
+        check_helper_target(PlanKind::Mutate, &doubled, &ws, Some(&target)),
+        Err(PATH)
+    );
+    // A target from another workspace is refused.
+    let other = fixture.builds[1];
+    let other_recorder = fixture.recorder(other.pair.disk.generation);
+    let other_ws = fixture
+        .reserve(&other_recorder, other.pair.disk.generation)
+        .unwrap();
+    let foreign = other_ws
+        .precreate_helper_target(other.pair.disk, &other_recorder)
+        .unwrap();
+    assert_eq!(
+        check_helper_target(PlanKind::Mutate, &exact, &ws, Some(&foreign)),
+        Err(PATH)
+    );
+    // Once the ledger no longer records an unverified target, dispatch stops.
+    recorder
+        .slot_verified(
+            ws.binding(),
+            slots.pair.disk,
+            ArtifactEvidence {
+                identity: target.identity(),
+                directory: ws.binding().workspace.file,
+                pin: ArtifactPin {
+                    size: 1,
+                    sha256: [7; 32],
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        check_helper_target(PlanKind::Mutate, &exact, &ws, Some(&target)),
+        Err(PATH)
+    );
 }

@@ -31,8 +31,17 @@ transition in its own immediate transaction before the effect continues.
   `identified` with the file ID before any write, then `verified` with
   length and SHA-256 after write, sync and held content verification.
 - An intent becomes `absent` only after an exact `NotFound` through the
-  held parent. A present object with no recorded identity, including an
-  occupied leaf, becomes `quarantined` and is never adopted.
+  held parent. The observation is a bounded, attribute-only, no-follow
+  probe of either object kind. A present object with no recorded identity,
+  including an occupied leaf or an object of the other kind, becomes
+  `quarantined` and is never adopted.
+- Workspace settlement names the observed object (directory or lease) and
+  carries its identity. A lost acknowledgement of a committed directory
+  checkpoint finds the recorded directory and keeps `directory`. The live
+  owner's next reservation resumes at the lease without creating the
+  directory again. A missing or replaced recorded directory, or a present
+  lease without an identity, is quarantined. An absent lease keeps its
+  intent.
 
 The four leaf classes are therefore: never attempted (no row), intended or
 absent under exact proof, unidentified present, and identified or verified.
@@ -40,13 +49,23 @@ Only the create-to-checkpoint crash window can leave a new unidentified
 leaf.
 
 Recipe staging verifies the seed in the ledger before the VARS intent
-exists. A failure on VARS still leaves the seed accounted. The helper
-target is precreated empty and identified before the checked qemu-img
-write opens it. Holding a workspace requires the exact bound scope.
+exists. A failure on VARS still leaves the seed accounted. Holding a
+workspace requires the exact bound scope.
 
-Checkpoints refuse once the originating build, clone or restore no longer
-owns the generation. A stale worker after an abandonment or restart cannot
-add custody. Exact reconciliation of an intent stays available.
+The helper target is precreated empty and identified before any helper
+opens it. A checked Mutate launch accepts only that typed `HelperTarget`.
+It must be the plan's only writable input, at its exact slot path and
+identity, and still held by the workspace. The ledger must still record it
+as identified and unverified. Every other plan kind refuses a target.
+
+Checkpoints refuse once the originating work no longer owns the generation:
+a pending build with its pending build operation, a creating clone, or a
+copy-phase restore work row with action 6 and its exact pending restore
+receipt. The disposal fence interrupts that receipt before filesystem I/O,
+so a stale restore worker loses custody authority even while the work stays
+in its copy phase. A snapshot-action copy row never owns a restore
+candidate. A stale worker after an abandonment or restart cannot add
+custody. Exact reconciliation of an intent stays available.
 
 Legacy paths acquire no authority. The migration infers no binding for an
 existing row. A generation can be bound only while every artifact is still
@@ -54,7 +73,10 @@ existing row. A generation can be bound only while every artifact is still
 build cancellation over native rows, and those transactions roll back as a
 whole. The intent also moves the artifact row from `planned` to `created`.
 Ordinary recovery therefore keeps attempted leaves charged and quarantined
-under the existing rules.
+under the existing rules. A trigger fences legacy identity writes on an
+artifact row with native custody. Its volume, directory and file IDs may
+only mirror the native slot's recorded identity and the bound scope.
+Legacy `identify` can neither pre-empt a native identity nor replace it.
 
 ## Bounds
 
@@ -77,8 +99,9 @@ remains present. No production path writes these columns yet.
 
 The migration is additive and runs inside the existing upgrade transaction
 with its foreign key check. It does not rewrite any v15 row. The
-compiled-schema and old-data tests pin the new objects and v15
-preservation. Older openers refuse v16. Rollback is forward-only: stop the
+compiled-schema test pins the exact DDL text of every new object. The
+old-data test preserves an identified legacy row with its identity, digest,
+length and charge. Older openers refuse v16. Rollback is forward-only: stop the
 controller and restore a matched offline copy of the pre-upgrade state
 directory. No down-migration exists. Production TEST admission was closed
 at v15, so no native row predates this version.
@@ -101,9 +124,10 @@ with that settlement path.
 The start refusal from chunk 04 keeps its originally held workspace lease.
 It is bound at construction to the exact `StartPair`: the disk and VARS
 slots with their evidence. The workspace binding it holds is now the durable
-bound scope. `confirm_start_pair` accepts that pair only when both slots are
-identified or verified in this scope with the same file IDs, directory and
-volume. The held release proof still compares content through
+bound scope. `confirm_start_pair` accepts that pair only in the held
+refusal's shape: a disk or verification overlay first, then VARS, with
+distinct keys. Both slots must be identified or verified in this scope with
+the same file IDs, directory and volume. The held release proof still compares content through
 `matches_start`. A refusal from before acquisition spends its one-shot
 attempt within its original cutoff. A production caller makes that attempt
 through `hold_workspace`, which requires the same scope. The
