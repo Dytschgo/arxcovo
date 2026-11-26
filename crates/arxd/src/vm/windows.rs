@@ -615,6 +615,15 @@ impl Job {
         Ok(job)
     }
 
+    fn verify_empty_noninheritable(&self) -> io::Result<()> {
+        let mut flags = 0;
+        succeeded(unsafe { GetHandleInformation(self.0.as_raw_handle(), &mut flags) })?;
+        if flags & HANDLE_FLAG_INHERIT != 0 || self.active()? != 0 {
+            return Err(io::Error::other("Job is inheritable or occupied"));
+        }
+        Ok(())
+    }
+
     fn verify_limits(
         &self,
         memory_limit: usize,
@@ -2785,6 +2794,7 @@ impl<'a> CheckedLaunchCore<'a> {
         token: &'a VmToken,
         inputs: LaunchInputs<'a>,
         refresh: impl FnOnce(&CommandPlan<'_>) -> Result<(std::time::Instant, T), NativeRefusal>,
+        before_spawn: impl FnOnce() -> Result<(), NativeRefusal>,
     ) -> Result<(Self, BootIo, T), HoldRefusal> {
         let kind = inputs.plan.kind();
         // ADR 0064: a public-egress plan also stays closed until its patched
@@ -2895,6 +2905,11 @@ impl<'a> CheckedLaunchCore<'a> {
         // the actual process-creation edge.
         stock.recheck_all(&inputs.pins, Some(&inputs.workspace))?;
         let (captured, authority) = refresh(&inputs.plan)?;
+        // The checked Job is unnamed, owned by this stack frame, omitted
+        // from stdio inheritance and assigned by the kernel at creation.
+        job.verify_empty_noninheritable()
+            .map_err(|_| NativeRefusal::JobUnverified)?;
+        before_spawn()?;
         fresh_observation(
             captured,
             std::time::Instant::now(),

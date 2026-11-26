@@ -10,7 +10,7 @@ use crate::vm::selection_epoch::Invalidation::{self, Confirmed, Indeterminate};
 pub(crate) struct ForegroundQualification<'a> {
     pub(super) held: Held,
     pub(super) recipes: std::sync::Mutex<launch::RecipeInputs>,
-    store: &'a VmStore,
+    pub(super) store: &'a VmStore,
     dependencies: Dependencies,
     evidence: VerifiedEvidence,
     seal_sha256: records::Hash,

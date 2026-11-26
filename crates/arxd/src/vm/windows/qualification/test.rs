@@ -293,7 +293,7 @@ impl Scope {
 
 /// An unheld lock leaf or a handle mismatch is confirmed custody drift.
 /// Store contention is transient, and other failures are indeterminate.
-fn read_guarded_host(
+pub(super) fn read_guarded_host(
     store: &crate::store::vm::VmStore,
     database: &PathPin,
     lock: &PathPin,

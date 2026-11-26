@@ -498,3 +498,32 @@ fn production_test_admission_cannot_enqueue_a_worker() {
         .unwrap();
     assert_eq!(releases, 0);
 }
+
+#[test]
+fn orphan_fence_prevents_reacquisition_and_never_overrides_the_current_owner() {
+    let root = crate::service::application::tests::private_temp();
+    let supervisor = open(root.path());
+    let registry = Registry::default();
+    let subject = [0x46; 16];
+    let owner = registry.register(subject, 1).unwrap();
+    assert!(
+        !supervisor.with_test_orphan_fence(&registry, subject, &mut || {
+            panic!("orphan recovery bypassed the existing owner")
+        })
+    );
+    drop(owner);
+    assert!(
+        supervisor.with_test_orphan_fence(&registry, subject, &mut || {
+            assert!(
+                supervisor.gate.try_lock().is_ok(),
+                "proof held the dispatch gate"
+            );
+            assert!(
+                registry.register(subject, 2).is_err(),
+                "worker reacquired the epoch"
+            );
+            true
+        })
+    );
+    assert!(registry.register(subject, 3).is_ok());
+}

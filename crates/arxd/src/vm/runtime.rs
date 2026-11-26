@@ -356,6 +356,13 @@ pub(crate) trait ReaperRuntime {
     /// including on restart. A missing PID is insufficient.
     fn quiesce(&self, work: &CleanupWork, deadline: Instant) -> Quiesced;
 
+    /// Recheck absence and hold the subject's ownership fence across proof
+    /// and commit. Implementations leave the foreground gate before calling
+    /// the observer and keep the scoped reservation until it returns.
+    fn with_orphan_fence(&self, _work: &CleanupWork, _recover: &mut dyn FnMut() -> bool) -> bool {
+        false
+    }
+
     fn graceful_stop(&self, work: &CleanupWork, deadline: Instant) -> StopDisposition;
 
     /// Invoked only after quiesce returned an owned TEST Job for a lease
@@ -376,6 +383,8 @@ pub(crate) trait ReaperRuntime {
 #[allow(dead_code, reason = "native release authority is an activation gate")]
 pub(crate) enum Quiesced {
     Offline,
+    /// No current owner and reacquisition is fenced for the exact claim.
+    Orphaned,
     OwnedTestJob,
     Unconfirmed,
 }

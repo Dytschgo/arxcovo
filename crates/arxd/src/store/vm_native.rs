@@ -12,6 +12,9 @@
 )]
 #[path = "vm_native/disposal.rs"]
 pub(crate) mod disposal;
+#[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+#[path = "vm_native/recovery.rs"]
+pub(crate) mod recovery;
 #[cfg_attr(all(test, not(all(windows, target_arch = "x86_64"))), allow(dead_code))]
 #[path = "vm_native/release.rs"]
 pub(crate) mod release;

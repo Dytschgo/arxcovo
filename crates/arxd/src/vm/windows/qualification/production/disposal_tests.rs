@@ -201,10 +201,15 @@ struct SweepFixture {
     owner_text: String,
     temp: tempfile::TempDir,
     state: tempfile::TempDir,
+    state_in_production: bool,
 }
 
 impl SweepFixture {
     fn new() -> Self {
+        Self::new_with_store(false)
+    }
+
+    fn new_with_store(state_in_production: bool) -> Self {
         let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
         let (owner, owner_text) = default_owner_sid();
         let production = create_dir_sddl(
@@ -215,7 +220,12 @@ impl SweepFixture {
         let production = PathPin::open(&production, true, false).unwrap();
         let state = crate::service::application::tests::private_temp();
         let clock = FakeClock::new(NOW);
-        let ctl = VmController::open(state.path(), VmPolicy::default(), clock.clone()).unwrap();
+        let root = if state_in_production {
+            Path::new(production.path.as_str())
+        } else {
+            state.path()
+        };
+        let ctl = VmController::open(root, VmPolicy::default(), clock.clone()).unwrap();
         Self {
             ctl: Some(ctl),
             clock,
@@ -224,6 +234,7 @@ impl SweepFixture {
             owner_text,
             temp,
             state,
+            state_in_production,
         }
     }
 
@@ -240,8 +251,16 @@ impl SweepFixture {
     fn reopen(&mut self) {
         drop(self.ctl.take());
         self.ctl = Some(
-            VmController::open(self.state.path(), VmPolicy::default(), self.clock.clone()).unwrap(),
+            VmController::open(self.state_root(), VmPolicy::default(), self.clock.clone()).unwrap(),
         );
+    }
+
+    fn state_root(&self) -> &Path {
+        if self.state_in_production {
+            Path::new(self.production.path.as_str())
+        } else {
+            self.state.path()
+        }
     }
 
     fn owner_sid(&self) -> PSID {
@@ -1029,5 +1048,464 @@ fn resumable_disposal_leaves_production_test_admission_and_default_sweep_closed(
             }),
             Err(NativeRefusal::QualificationMissing)
         );
+    }
+}
+
+/// The runtime has no current worker after reopening. The separate
+/// application-gate fixture covers reservation and late registration.
+struct RestartReaper {
+    owned: bool,
+    can_fence: bool,
+    retries: Cell<usize>,
+}
+
+impl ReaperRuntime for RestartReaper {
+    fn quiesce(&self, work: &CleanupWork, _: Instant) -> Quiesced {
+        if self.owned {
+            Quiesced::OwnedTestJob
+        } else if work.release_only {
+            Quiesced::Orphaned
+        } else {
+            Quiesced::Offline
+        }
+    }
+
+    fn with_orphan_fence(&self, _: &CleanupWork, recover: &mut dyn FnMut() -> bool) -> bool {
+        self.can_fence && recover()
+    }
+
+    fn graceful_stop(&self, _: &CleanupWork, _: Instant) -> StopDisposition {
+        self.retries.set(self.retries.get() + 1);
+        // An optimistic or stale worker response cannot substitute for the
+        // release transaction's current epoch.
+        StopDisposition::CleanRelease
+    }
+
+    fn force_reap(&self, _: &CleanupWork, _: Instant) -> StopDisposition {
+        panic!("restart recovery may not signal an unowned process")
+    }
+}
+
+fn arm_restart(fixture: &SweepFixture, vm: Id, pair: PairSlots, boot: Option<Hash>) -> Id {
+    use crate::store::vm::native::recovery;
+    let generation = pair.disk.generation;
+    let origin = boot.map(|boot| {
+        super::super::recovery::StorePins::open(&fixture.production)
+            .unwrap()
+            .origin(fixture.store(), boot)
+            .unwrap()
+    });
+    fixture
+        .store()
+        .transact(|db| {
+            let receipt = Binding {
+                principal: "alice",
+                key: RequestId::parse("0000000000000064000000000000aaaa").unwrap(),
+                subject: Subject::Vm(vm),
+                action: 3,
+            }
+            .record(db, NOW, Some(vm), None)?
+            .receipt;
+            db.execute("UPDATE vm_instances SET state=2 WHERE id=?1", [vm])?;
+            let epoch = db.query_row(
+                "SELECT operation_id FROM vm_operations WHERE activity_id=?1",
+                [receipt.activity_id],
+                |row| row.get(0),
+            )?;
+            store::snapshot::invalidate_release(db, vm, epoch)?;
+            if let Some(origin) = origin {
+                let GenerationState::Bound { scope, .. } =
+                    disposal::generation_state(db, generation)?
+                else {
+                    unreachable!();
+                };
+                recovery::record_job(db, scope, epoch, origin)?;
+            }
+            Ok(epoch)
+        })
+        .unwrap()
+}
+
+#[test]
+fn orphan_restart_releases_without_selection_and_retains_the_exact_pair() {
+    let mut fx = SweepFixture::new_with_store(true);
+    let (vm, slots, evidence) = fx.active_clone(61);
+    let epoch = arm_restart(&fx, vm, slots, Some(boot::marker().unwrap()));
+    std::fs::write(fx.slot_file(slots.disk), b"changed after the writer start").unwrap();
+    fx.reopen();
+    let guards = GenerationGuards::default();
+    let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+    let runtime = RestartReaper {
+        owned: false,
+        can_fence: true,
+        retries: Cell::new(0),
+    };
+    // A selected effect can fail a temporary live probe while the
+    // independent offline path still settles the interrupted epoch.
+    use crate::vm::selection_epoch::{Invalidation, Sample, SelectionEpoch};
+    let reading = fx.clock.now();
+    let sample = Sample {
+        captured: reading.monotonic,
+        now: crate::vm::qualification_record::Instant2 {
+            utc: u64::try_from(reading.utc_ms / 1_000).unwrap(),
+            mono_ms: boot::uptime(),
+        },
+        boot_marker: boot::marker().unwrap(),
+        reading,
+    };
+    let selection = SelectionEpoch::open([0x55; 16], sample, reading.monotonic).unwrap();
+    let temporarily_unavailable = Invalidation::Transient(NativeRefusal::ReservesUnverified);
+    assert_eq!(
+        selection.refresh(|| Err(temporarily_unavailable), Instant::now),
+        Err(temporarily_unavailable)
+    );
+    assert!(!selection.effects_revoked());
+    assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+    assert_eq!(
+        fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition='dirty'"),
+        1
+    );
+    assert_eq!(
+        fx.count("SELECT count(*) FROM vm_instances WHERE state=3"),
+        1
+    );
+    assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+    assert_eq!(
+        fx.count("SELECT count(*) FROM vm_instances WHERE state=1"),
+        1
+    );
+    assert_eq!(
+        fx.count("SELECT sum(persistent) FROM vm_disk_claims"),
+        CLAIM as i64
+    );
+    fx.store()
+        .transact(|db| {
+            let saved: Id = db.query_row(
+                "SELECT epoch FROM vm_snapshot_release WHERE generation=?1",
+                [slots.disk.generation],
+                |row| row.get(0),
+            )?;
+            assert_eq!(saved, epoch);
+            let dirty: Hash = db.query_row(
+                "SELECT content_digest FROM vm_artifacts WHERE object_key=?1",
+                [slots.disk.key],
+                |row| row.get(0),
+            )?;
+            assert_ne!(dirty, evidence[0].pin.sha256);
+            Ok(())
+        })
+        .unwrap();
+    assert!(exists(&fx.slot_file(slots.disk)) && exists(&fx.slot_file(slots.vars)));
+    assert_eq!(runtime.retries.get(), 0);
+    assert!(
+        crate::vm::runtime::CandidateRuntime::new(None)
+            .dispatch::<()>(crate::vm::runtime::NativeMutation::Boot, |_| {
+                panic!("restart custody minted an effect")
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn orphan_restart_refuses_live_writer_wrong_slot_lease_boot_epoch_store_and_protocol() {
+    for fault in [
+        "disk writer",
+        "vars writer",
+        "live lease",
+        "slot",
+        "lease",
+        "boot",
+        "epoch",
+        "store",
+        "protocol",
+        "reacquire",
+    ] {
+        let mut fx = SweepFixture::new_with_store(true);
+        let (vm, pair, _) = fx.active_clone(62);
+        let boot = match fault {
+            "boot" => Some([0xf7; 32]),
+            "protocol" => None,
+            _ => Some(boot::marker().unwrap()),
+        };
+        arm_restart(&fx, vm, pair, boot);
+        fx.reopen();
+        let mut pinned = None;
+        let mut moved = None;
+        match fault {
+            "disk writer" | "vars writer" => {
+                let slot = if fault == "disk writer" {
+                    pair.disk
+                } else {
+                    pair.vars
+                };
+                pinned = Some(
+                    OpenOptions::new()
+                        .write(true)
+                        .open(fx.slot_file(slot))
+                        .unwrap(),
+                );
+            }
+            "live lease" => {
+                let lease = std::fs::File::open(fx.lease_file(pair.disk.generation)).unwrap();
+                lease.try_lock().unwrap();
+                pinned = Some(lease);
+            }
+            "slot" | "lease" => {
+                let original = if fault == "slot" {
+                    fx.slot_file(pair.vars)
+                } else {
+                    fx.lease_file(pair.disk.generation)
+                };
+                let shifted = original.with_extension("fixture-original");
+                std::fs::rename(&original, &shifted).unwrap();
+                let bytes: &[u8] = if fault == "slot" {
+                    b"foreign vars"
+                } else {
+                    b""
+                };
+                std::fs::write(&original, bytes).unwrap();
+                moved = Some((original, shifted));
+            }
+            "epoch" | "store" => {
+                fx.store()
+                    .transact(|db| {
+                        if fault == "epoch" {
+                            db.execute("UPDATE vm_snapshot_release SET epoch=?1", [[0x48u8; 16]])?;
+                        } else {
+                            db.execute(
+                                "UPDATE vm_native_writer SET database_file=?1",
+                                [[0x48u8; 16]],
+                            )?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let guards = GenerationGuards::default();
+        let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+        let runtime = RestartReaper {
+            owned: false,
+            can_fence: fault != "reacquire",
+            retries: Cell::new(0),
+        };
+        assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+        assert_eq!(
+            fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition IS NULL"),
+            1,
+            "{fault}"
+        );
+        assert_eq!(
+            fx.count("SELECT count(*) FROM vm_instances WHERE state=3"),
+            1,
+            "{fault}"
+        );
+        assert_eq!(
+            fx.count("SELECT sum(persistent) FROM vm_disk_claims"),
+            CLAIM as i64,
+            "{fault}"
+        );
+        drop(pinned);
+        if let Some((original, shifted)) = moved {
+            std::fs::remove_file(&original).unwrap();
+            std::fs::rename(shifted, original).unwrap();
+        }
+    }
+}
+
+#[test]
+fn orphan_restart_stale_owner_ack_cannot_skip_durable_release_or_backoff() {
+    let mut fx = SweepFixture::new_with_store(true);
+    let (vm, pair, _) = fx.active_clone(63);
+    arm_restart(&fx, vm, pair, Some(boot::marker().unwrap()));
+    fx.reopen();
+    let guards = GenerationGuards::default();
+    let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+    let mut runtime = RestartReaper {
+        owned: true,
+        can_fence: true,
+        retries: Cell::new(0),
+    };
+    assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+    assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+    assert_eq!(runtime.retries.get(), 1);
+    assert_eq!(
+        fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition IS NULL"),
+        1
+    );
+    runtime.owned = false;
+    fx.clock.advance(0, 6);
+    assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+    assert_eq!(
+        fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition='dirty'"),
+        1
+    );
+}
+
+#[test]
+fn orphan_checkpointed_build_requires_both_worker_quiescence_and_writer_origin() {
+    for (proved, quiesced) in [(false, true), (true, false), (true, true)] {
+        let mut fx = SweepFixture::new_with_store(true);
+        let (_, slots, _) = fx.stage_build(64);
+        if !proved {
+            fx.store()
+                .transact(|db| {
+                    db.execute(
+                        "DELETE FROM vm_native_writer WHERE generation=?1",
+                        [slots.verification.disk.generation],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        fx.reopen();
+        let guards = GenerationGuards::default();
+        let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+        let runtime = RestartReaper {
+            owned: !quiesced,
+            can_fence: true,
+            retries: Cell::new(0),
+        };
+        // The still-owned fixture reports a successful stop, but hasn't
+        // joined any owned build writer. It must not return Offline.
+        let claimed = proved && quiesced;
+        assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+        assert_eq!(
+            fx.count("SELECT count(*) FROM vm_build_intents"),
+            i64::from(!claimed)
+        );
+        assert_eq!(exists(&fx.slot_file(slots.pair.disk)), !claimed);
+        assert_eq!(exists(&fx.slot_file(slots.verification.disk)), !claimed);
+    }
+}
+
+#[test]
+fn orphan_expiry_commits_release_on_a_distinct_turn_before_disposal() {
+    let mut fx = SweepFixture::new_with_store(true);
+    let (vm, pair, _) = fx.active_clone(65);
+    arm_restart(&fx, vm, pair, Some(boot::marker().unwrap()));
+    fx.reopen();
+    fx.clock.advance(2_000, 0);
+    let guards = GenerationGuards::default();
+    let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+    let runtime = RestartReaper {
+        owned: false,
+        can_fence: true,
+        retries: Cell::new(0),
+    };
+    assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+    assert_eq!(
+        fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition='dirty'"),
+        1
+    );
+    assert!(exists(&fx.slot_file(pair.disk)));
+    assert!(exists(&fx.slot_file(pair.vars)));
+    assert_eq!(
+        fx.count("SELECT sum(persistent) FROM vm_disk_claims"),
+        CLAIM as i64
+    );
+
+    assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+    assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 0);
+    assert!(!exists(&fx.gen_dir(pair.disk.generation)));
+}
+
+struct ReplacedExpiry<'a> {
+    store: &'a VmStore,
+    vm: Id,
+    attempted: Cell<bool>,
+}
+
+impl ReaperRuntime for ReplacedExpiry<'_> {
+    fn quiesce(&self, work: &CleanupWork, _: Instant) -> Quiesced {
+        let CleanupKind::Expiry { vm, activity_id } = work.kind else {
+            panic!("expected resumed expiry work");
+        };
+        assert_eq!(vm, self.vm);
+        self.store
+            .transact(|db| {
+                let replacement =
+                    store::activity(db, "arxd", vm, crate::vm::Action::Expire, NOW + 2_000)?;
+                assert_ne!(replacement, activity_id);
+                assert_eq!(
+                    db.execute(
+                        "UPDATE vm_instances SET cleanup_id=?3 WHERE id=?1 AND cleanup_id=?2",
+                        params![vm, activity_id, replacement],
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+        self.attempted.set(true);
+        Quiesced::Offline
+    }
+
+    fn graceful_stop(&self, _: &CleanupWork, _: Instant) -> StopDisposition {
+        panic!("no owner to stop")
+    }
+
+    fn force_reap(&self, _: &CleanupWork, _: Instant) -> StopDisposition {
+        panic!("no Job to signal")
+    }
+}
+
+#[test]
+fn orphan_expiry_resume_refuses_superseded_scope_before_deleting() {
+    for checkpoint in ["intend_lease_disposal", "intend_directory_disposal"] {
+        let mut fx = SweepFixture::new_with_store(true);
+        let (vm, pair, _) = fx.active_clone(66);
+        arm_restart(&fx, vm, pair, Some(boot::marker().unwrap()));
+        fx.reopen();
+        fx.clock.advance(2_000, 0);
+        {
+            let native_guards = GenerationGuards::default();
+            let custody =
+                NativeRecovery::open(fx.store(), fx.state_root(), &native_guards).unwrap();
+            let runtime = RestartReaper {
+                owned: false,
+                can_fence: true,
+                retries: Cell::new(0),
+            };
+            assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+            assert_eq!(
+                fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition='dirty'"),
+                1
+            );
+            // Interrupt after the durable sidecar intent. Use the same guard
+            // set for both adapters before reopening the process-local state.
+            let ledger = FaultDisposal::new(fx.store(), Some(Fault::After(checkpoint, 1)));
+            let fault = fx.disposal(&ledger, &native_guards);
+            assert!(fx.ctl().sweep_with(&OfflineReaper, &fault).unwrap());
+            assert_eq!(ledger.counts.borrow().get(checkpoint), Some(&1));
+        }
+        fx.reopen();
+        let generation = pair.disk.generation;
+        let dir = fx.gen_dir(generation);
+        let lease = fx.lease_file(generation);
+        assert!(exists(&dir));
+        let lease_remains = checkpoint == "intend_lease_disposal";
+        assert_eq!(exists(&lease), lease_remains);
+
+        let guards = GenerationGuards::default();
+        let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+        let stale = ReplacedExpiry {
+            store: fx.store(),
+            vm,
+            attempted: Cell::new(false),
+        };
+        assert!(fx.ctl().sweep_with(&stale, &custody).unwrap());
+        assert!(stale.attempted.get());
+        assert!(exists(&dir));
+        assert_eq!(exists(&lease), lease_remains);
+        assert_eq!(
+            fx.count("SELECT sum(persistent) FROM vm_disk_claims"),
+            CLAIM as i64
+        );
+
+        assert!(fx.ctl().sweep_with(&OfflineReaper, &custody).unwrap());
+        assert!(!exists(&dir), "fresh scope must converge");
+        assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 0);
     }
 }

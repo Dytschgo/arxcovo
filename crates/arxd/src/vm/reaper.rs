@@ -128,6 +128,16 @@ pub(crate) struct ReconcileOutcome {
 /// Requires the exact generated slots, including each recorded directory and
 /// file identity. A receipt from a fixture is never native custody authority.
 pub(crate) trait ArtifactCustody {
+    /// A read-only takeover following an exact, fenced no-owner observation.
+    fn release_orphan(
+        &self,
+        _work: &CleanupWork,
+        _deadline: Instant,
+        _clock: &dyn Fn() -> super::ClockReading,
+    ) -> bool {
+        false
+    }
+
     fn reconcile(&self, work: &CleanupWork, deadline: Instant) -> bool;
 }
 
@@ -219,6 +229,8 @@ pub(super) fn release(
     work: &CleanupWork,
     runtime: &impl ReaperRuntime,
     cutoff: Option<Instant>,
+    pending_release: bool,
+    mut orphan: impl FnMut(Instant) -> bool,
     now: impl Fn() -> Instant,
 ) -> (bool, Instant) {
     let start = now();
@@ -232,21 +244,34 @@ pub(super) fn release(
     let finish_by = cutoff.map_or(finish_by, |limit| limit.min(finish_by));
     let join_by = join_by.min(finish_by);
     let stop_by = stop_by.min(finish_by);
+    if start >= finish_by {
+        return (false, finish_by);
+    }
     let released = match runtime.quiesce(work, join_by) {
-        Quiesced::Offline => true,
+        Quiesced::Offline => !pending_release,
+        Quiesced::Orphaned => {
+            pending_release
+                && runtime.with_orphan_fence(work, &mut || now() < finish_by && orphan(finish_by))
+        }
         Quiesced::Unconfirmed => false,
-        Quiesced::OwnedTestJob if now() < stop_by => {
+        Quiesced::OwnedTestJob
+            if matches!(
+                work.kind,
+                CleanupKind::Expiry { .. } | CleanupKind::Recovery { .. }
+            ) && now() < stop_by =>
+        {
             let stopped =
                 runtime.graceful_stop(work, stop_by) != StopDisposition::ChargedQuarantine;
             stopped
-                || ((work.accounted || work.release_only)
+                || (!pending_release
+                    && (work.accounted || work.release_only)
                     && matches!(work.kind, CleanupKind::Expiry { .. })
                     && now() < finish_by
                     && runtime.force_reap(work, finish_by) != StopDisposition::ChargedQuarantine)
         }
         Quiesced::OwnedTestJob => false,
     };
-    (released, finish_by)
+    (released && now() < finish_by, finish_by)
 }
 
 pub(super) fn dispose(
@@ -1737,7 +1762,14 @@ mod reaper_tests {
             accounted: false,
             release_only: true,
         };
-        let (released, finish_by) = release(&work, &Runtime::new(offline), None, Instant::now);
+        let (released, finish_by) = release(
+            &work,
+            &Runtime::new(offline),
+            None,
+            false,
+            |_| false,
+            Instant::now,
+        );
         let outcome = dispose(&work, &Probe, released, finish_by, Instant::now);
         assert!(outcome.released);
         assert!(!outcome.disposed);
