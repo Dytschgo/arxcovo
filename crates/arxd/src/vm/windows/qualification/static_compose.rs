@@ -350,10 +350,7 @@ impl ComposeInstallerInputs {
         if self.qemu_receipt.verified_content != Some(stock_receipt) {
             return Err(REFUSAL);
         }
-        projection(
-            "arx-docker-stock-inventory-v1",
-            (stock_distribution.manifest, stock_distribution.receipt),
-        )
+        stock_projection(stock_distribution)
     }
 
     fn hold_medium(path: &LocalPath, expected: ArtifactPin) -> Result<PathPin, NativeRefusal> {
@@ -363,6 +360,102 @@ impl ComposeInstallerInputs {
     pub(super) fn dependency_artifact(&self) -> Result<Artifact, NativeRefusal> {
         self.recheck()?;
         launch::artifact(ArtifactRole::ComposeDependencyMedium, &self.medium)
+    }
+}
+
+fn stock_projection(distribution: &Distribution) -> Result<Hash, NativeRefusal> {
+    projection(
+        "arx-docker-stock-inventory-v1",
+        (distribution.manifest, distribution.receipt),
+    )
+}
+
+/// Exact immutable inputs for the restricted boots. The inventoried objects
+/// and the recipe's firmware pin stay held with the plan through release.
+pub(super) struct StockBootInputs<'a> {
+    bundle: &'a inventory::Bundle,
+    pub(super) inventory: Hash,
+    image: PathPin,
+    data: PathPin,
+    firmware: PathPin,
+}
+
+impl<'a> StockBootInputs<'a> {
+    fn hold(
+        bundle: &'a inventory::Bundle,
+        inventory: Hash,
+        firmware_pin: ArtifactPin,
+        deadline: Instant,
+    ) -> Result<Self, NativeRefusal> {
+        let image = launch::stock_asset(
+            bundle,
+            "qemu-system-x86_64.exe",
+            crate::vm::public_egress::MAX_EXECUTABLE_BYTES,
+            deadline,
+        )?;
+        let firmware =
+            launch::stock_asset(bundle, "share/edk2-x86_64-code.fd", MAX_FIRMWARE, deadline)?;
+        let data_path = bundle.root.path.join("share").map_err(|_| REFUSAL)?;
+        let data = PathPin::open(&data_path, true, false)?;
+        if data.identity != bundle.directory_identity("share")?
+            || firmware.verified_content != Some(firmware_pin)
+        {
+            return Err(REFUSAL);
+        }
+        Ok(Self {
+            bundle,
+            inventory,
+            image,
+            data,
+            firmware,
+        })
+    }
+
+    fn roles(&self) -> [(ArtifactRole, &PathPin); 3] {
+        [
+            (ArtifactRole::Qemu, &self.image),
+            (ArtifactRole::Data, &self.data),
+            (ArtifactRole::FirmwareCode, &self.firmware),
+        ]
+    }
+
+    pub(super) fn require_plan(&self, plan: &CommandPlan<'_>) -> Result<(), NativeRefusal> {
+        inventory::binding(&self.bundle.root)?;
+        for (role, held) in self.roles() {
+            inventory::binding(held)?;
+            let observed = plan
+                .inputs()
+                .iter()
+                .find_map(|(candidate, artifact)| (*candidate == role).then_some(artifact))
+                .ok_or(REFUSAL)?;
+            if observed.path_for(role).ok() != Some(&held.path)
+                || observed.identity() != Some(held.identity)
+                || observed.pin() != held.verified_content
+            {
+                return Err(REFUSAL);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn fixture(
+        bundle: &'a inventory::Bundle,
+        distribution: &Distribution,
+        firmware_pin: ArtifactPin,
+    ) -> Self {
+        Self::hold(
+            bundle,
+            stock_projection(distribution).unwrap(),
+            firmware_pin,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap()
+    }
+
+    pub(super) fn artifacts(&self) -> Result<[Artifact; 3], NativeRefusal> {
+        let [image, data, firmware] = self.roles().map(|(role, pin)| launch::artifact(role, pin));
+        Ok([image?, data?, firmware?])
     }
 }
 
@@ -506,6 +599,18 @@ impl<'a> HeldDockerInputs<'a> {
             topology: private_input(enrollment.topology, MAX_METADATA)?,
             origin_profile: private_input(enrollment.origin_profile, MAX_ENROLLMENT_BYTES)?,
         })
+    }
+
+    pub(super) fn stock_boot_inputs(&self) -> Result<StockBootInputs<'_>, NativeRefusal> {
+        self.recipe.recheck()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        self.stock.protected(self.token.account.0, deadline)?;
+        StockBootInputs::hold(
+            &self.stock,
+            self.stock_inventory,
+            self.recipe.firmware[0].verified_content.ok_or(REFUSAL)?,
+            deadline,
+        )
     }
 
     /// Recheck independent inputs before selecting or writing evidence. The
