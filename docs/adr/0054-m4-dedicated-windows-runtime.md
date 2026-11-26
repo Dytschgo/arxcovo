@@ -1993,3 +1993,47 @@ an earlier graceful exit only while the Job stays empty. A surviving
 process forces termination and a dirty exit. An ordinary reaper turn that
 finds a live run owner wakes that owner's retry and does not compete for
 its generation. Orphan recovery runs only without a registered owner.
+
+## 7c amendment — held release through TEST golden publication
+
+One fresh build intent covers its exact primary and verification reservations.
+Issuance binds the installer phases to the primary pair and the detached boot
+to the reserved overlay pair. The issuer also binds the verification VARS copy
+to that overlay pair and to the source content pin.
+
+The build verifies detached health and rechecks the overlay's backing while
+both release proofs are held. It then closes the verification handles so checked
+disposal can retire the overlay, VARS, lease and directory. Seed disposal uses
+the already-held primary lease. The primary disk and VARS writer exclusions
+stay held until the transaction publishes the golden and receipt. The
+transaction requires durable transient absence and charges the observed pair
+bytes plus the admitted metadata charge, bounded by the original retained
+claim. An interrupted build retains its peak claim until checked recovery and
+disposal settle it.
+
+The production TEST entry point stays closed until 7c 16. Native installation,
+health checks and release are **unverified on real hardware**.
+
+Mutable build slots (the primary disk and VARS, the verification overlay and
+its VARS copy) keep only their durable identity while guests can write to
+them. The staged VARS carries its verified initial content in the held pin.
+Each slot receives its single immutable content digest once, after the final
+writable release of its generation and before the seal, under that release
+proof. The immutable installer seed is still verified before its first boot.
+This keeps schema 17 and its write-once digest triggers. The verification
+VARS copy requires the issuer's consumed copy authority for the exact slot
+and content. A failed build ends every lease and writer hold before its
+failure is settled.
+
+Build health uses an explicit phase. Readiness before Finalize validates the
+Setup phase marker and task, and detached verification requires their
+removal, matching the template's installed targets. Each probe dispatch
+consumes a single-use capability bound to the admitted recipe, the phase, the
+launched workspace and pair, and the exact probe bytes and timeout. The
+verification VARS copy stays held without write sharing from its content
+check until the checked launch, whose plan carries the authorized digest and
+keeps writers excluded until QEMU opens the VARS after resume. Capture
+rechecks cancellation and the cutoff inside its transaction, and the seal
+gate rechecks the pre-seal observation's age. Cancellation, the effect cutoff
+and the controller's worker deadline record no failure cause, and an
+installer stage that reaches its own deadline records its timeout.

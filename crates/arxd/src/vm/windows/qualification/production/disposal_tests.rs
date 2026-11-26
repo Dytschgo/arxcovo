@@ -76,7 +76,7 @@ pub(crate) enum Fault {
 
 /// Real `LedgerDisposal` wrapper that logs every durable checkpoint and can
 /// inject a crash before or after any Nth checkpoint call.
-struct FaultDisposal<'a> {
+pub(in crate::vm::windows::qualification) struct FaultDisposal<'a> {
     inner: LedgerDisposal<'a>,
     fault: Cell<Option<Fault>>,
     counts: RefCell<std::collections::HashMap<&'static str, usize>>,
@@ -84,7 +84,10 @@ struct FaultDisposal<'a> {
 }
 
 impl<'a> FaultDisposal<'a> {
-    fn new(store: &'a VmStore, fault: Option<Fault>) -> Self {
+    pub(in crate::vm::windows::qualification) fn new(
+        store: &'a VmStore,
+        fault: Option<Fault>,
+    ) -> Self {
         Self {
             inner: LedgerDisposal { store },
             fault: Cell::new(fault),
@@ -209,7 +212,7 @@ impl SweepFixture {
         Self::new_with_store(false)
     }
 
-    fn new_with_store(state_in_production: bool) -> Self {
+    pub(crate) fn new_with_store(state_in_production: bool) -> Self {
         let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
         let (owner, owner_text) = default_owner_sid();
         let production = create_dir_sddl(
@@ -255,7 +258,7 @@ impl SweepFixture {
         );
     }
 
-    fn state_root(&self) -> &Path {
+    pub(crate) fn state_root(&self) -> &Path {
         if self.state_in_production {
             Path::new(self.production.path.as_str())
         } else {
@@ -1169,10 +1172,10 @@ fn review_resumed_cleanup_lease_and_directory_deletion_rechecks_authority() {
 
 /// The runtime has no current worker after reopening. The separate
 /// application-gate fixture covers reservation and late registration.
-struct RestartReaper {
-    owned: bool,
-    can_fence: bool,
-    retries: Cell<usize>,
+pub(crate) struct RestartReaper {
+    pub(crate) owned: bool,
+    pub(crate) can_fence: bool,
+    pub(crate) retries: Cell<usize>,
 }
 
 impl ReaperRuntime for RestartReaper {

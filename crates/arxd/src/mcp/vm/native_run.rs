@@ -560,6 +560,7 @@ impl Run {
                         identities: pair.evidence.map(|file| file.identity),
                         backing: Some(&backing),
                         staged: None,
+                        vars_content: None,
                     })
                     .map_err(fail)?;
                 let planner = boot.planner();
