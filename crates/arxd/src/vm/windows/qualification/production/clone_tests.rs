@@ -402,10 +402,22 @@ impl OverlayHelper for FixtureOverlay<'_, '_> {
             size + GIB,
         )
         .unwrap();
+        // The checked creation's own handoff at create.
+        let seal = config().selection().seal_sha256;
         let consumed = if self.mode == Mode::SubstitutedBacking {
-            permit.consume(prepared.launch_target(&substituted, &self.run.cwd))
+            consume_checked(
+                permit,
+                prepared.launch_target(&substituted, &self.run.cwd),
+                binding,
+                seal,
+            )
         } else {
-            permit.consume(prepared.launch_target(&plan, &self.run.cwd))
+            consume_checked(
+                permit,
+                prepared.launch_target(&plan, &self.run.cwd),
+                binding,
+                seal,
+            )
         };
         if let Err(reason) = consumed {
             return HelperSettlement::quarantined(Err(reason));

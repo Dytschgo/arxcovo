@@ -40,7 +40,7 @@ pub struct LaunchAuthority {
     #[cfg(all(windows, target_arch = "x86_64"))]
     _issued: super::test_issuer::Minted,
     #[cfg(all(windows, target_arch = "x86_64"))]
-    binding: super::qualification::LaunchPermitBinding,
+    binding: Box<super::qualification::LaunchPermitBinding>,
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -51,12 +51,12 @@ impl LaunchAuthority {
     ) -> Self {
         Self {
             _issued: issued,
-            binding,
+            binding: Box::new(binding),
         }
     }
 
     pub(crate) fn binding(&self) -> super::qualification::LaunchPermitBinding {
-        self.binding
+        *self.binding
     }
 }
 

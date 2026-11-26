@@ -423,11 +423,20 @@ impl ProductionWorkspace {
     }
 }
 
+/// The full issuance binding of one checked creation: the workspace, seal
+/// and plan kind, the writer epoch, the exact pair or helper slot, and a
+/// digest of the exact plan, working directory, installer stage, recipe and
+/// limits. The adapter recomputes it from its own target, so an authority
+/// issued for any other target cannot pass the handoff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LaunchPermitBinding {
     pub workspace: WorkspaceBinding,
     pub seal_sha256: Hash,
     pub kind: PlanKind,
+    pub writer_epoch: Id,
+    pub pair: Option<PairSlots>,
+    pub helper: Option<ArtifactSlot>,
+    pub plan_sha256: Hash,
 }
 
 pub(crate) struct LaunchTarget<'a, 'plan> {
@@ -442,6 +451,75 @@ pub(crate) struct LaunchTarget<'a, 'plan> {
     pub helper: Option<ArtifactSlot>,
     pub memory: usize,
     pub cpu_rate: u32,
+}
+
+impl LaunchTarget<'_, '_> {
+    /// This exact target's issuance binding. The plan digest is in-process
+    /// only and never persisted.
+    pub(crate) fn binding(
+        &self,
+        workspace: WorkspaceBinding,
+        seal_sha256: Hash,
+    ) -> Result<LaunchPermitBinding, NativeRefusal> {
+        let reason = NativeRefusal::QualificationMissing;
+        let plan = self.plan;
+        let mut bytes = Vec::new();
+        let mut put = |part: &[u8]| {
+            bytes.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(part);
+        };
+        put(format!("{:?}", plan.kind()).as_bytes());
+        put(plan.image().as_str().as_bytes());
+        put(&(plan.args().len() as u64).to_le_bytes());
+        for arg in plan.args() {
+            put(arg.as_bytes());
+        }
+        put(&(plan.inputs().len() as u64).to_le_bytes());
+        for (role, input) in plan.inputs() {
+            put(format!("{role:?}").as_bytes());
+            put(input
+                .path_for(*role)
+                .map_err(|_| reason)?
+                .as_str()
+                .as_bytes());
+            put(format!("{:?}", input.identity()).as_bytes());
+            put(format!("{:?}", input.pin()).as_bytes());
+        }
+        put(self.cwd.as_str().as_bytes());
+        put(format!(
+            "{:?}",
+            self.installer
+                .map(|stage| (stage.phase(), stage.deadline()))
+        )
+        .as_bytes());
+        put(format!("{:?}", self.recipe).as_bytes());
+        put(&(self.memory as u64).to_le_bytes());
+        put(&self.cpu_rate.to_le_bytes());
+        Ok(LaunchPermitBinding {
+            workspace,
+            seal_sha256,
+            kind: plan.kind(),
+            writer_epoch: self.writer_epoch,
+            pair: self.pair,
+            helper: self.helper,
+            plan_sha256: crate::vm::qualification_record::digest(&bytes),
+        })
+    }
+}
+
+/// The checked launch adapter's handoff: consume the permit for exactly this
+/// target, then require the returned authority's issuance binding to name
+/// this workspace, seal, plan, slots and writer epoch.
+pub(crate) fn consume_checked(
+    permit: impl LaunchPermit,
+    target: LaunchTarget<'_, '_>,
+    workspace: WorkspaceBinding,
+    seal_sha256: Hash,
+) -> Result<crate::vm::runtime::LaunchAuthority, NativeRefusal> {
+    let expected = target.binding(workspace, seal_sha256)?;
+    let granted = permit.consume(target)?;
+    check_permit(expected, granted.binding())?;
+    Ok(granted)
 }
 
 /// Implemented by the 7c issuer. Consumption must check the exact sealed
@@ -643,11 +721,6 @@ impl<'a> NativeLaunch<'a> {
             installer,
             finalization_slots,
         };
-        let target_binding = LaunchPermitBinding {
-            workspace: workspace_binding,
-            seal_sha256: qualification.seal_sha256(),
-            kind,
-        };
         let (core, io, authority) = CheckedLaunchCore::hold_checked(
             &qualification.held.token,
             inputs,
@@ -665,8 +738,12 @@ impl<'a> NativeLaunch<'a> {
                     memory,
                     cpu_rate,
                 };
-                let granted = permit.consume(target)?;
-                check_permit(target_binding, granted.binding())?;
+                let granted = consume_checked(
+                    permit,
+                    target,
+                    workspace_binding,
+                    qualification.seal_sha256(),
+                )?;
                 launch::check_preparation(prepare_by, cancelled)?;
                 Ok((captured.min(live), granted))
             },
