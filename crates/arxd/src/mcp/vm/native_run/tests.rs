@@ -21,7 +21,11 @@ struct Starting {
     observed: Observed,
 }
 
-async fn reserved(h: &Harness, client: &Client) -> Starting {
+type BoundClone = (Id, crate::vm::PairSlots, [crate::vm::ArtifactEvidence; 2], native::Scope);
+
+/// A stopped TEST clone whose clean released pair is bound to a native
+/// workspace. Every later request goes through the closed dispatcher.
+async fn bound_clone(h: &Harness, client: &Client) -> BoundClone {
     let build = call(client, "vm_template_build", json!({
         "recipe_id":hex::encode(Controller::windows_recipe_id()), "request_id":key(500)
     })).await;
@@ -66,6 +70,13 @@ async fn reserved(h: &Harness, client: &Client) -> Starting {
     // subsequent request goes through the closed foreground dispatcher.
     supervisor.gate.lock().unwrap().fixture = None;
     assert_admission_closed(h);
+    (vm, slots, pins, scope)
+}
+
+async fn reserved(h: &Harness, client: &Client) -> Starting {
+    let (vm, slots, pins, scope) = bound_clone(h, client).await;
+    let supervisor = h.supervisor();
+    let controller = &supervisor.controller;
     let before = Instant::now();
     let request = Request {
         principal: "alpha", vm, request_id: RequestId::parse(&key(502)).unwrap(),
@@ -86,6 +97,19 @@ async fn reserved(h: &Harness, client: &Client) -> Starting {
     let registration = supervisor.native_runs.register(vm, owner.clone()).unwrap();
     let observed = Observed { target, scope, slots, pins, clean: true };
     Starting { owner, worker, registration, observed }
+}
+
+fn start_request(vm: Id, number: u64) -> Request<'static> {
+    Request {
+        principal: "alpha", vm, request_id: RequestId::parse(&key(number)).unwrap(),
+        operation: Operation::Start, disk: DiskClaim::default(),
+    }
+}
+
+fn operation_count(h: &Harness) -> i64 {
+    h.supervisor().controller.native_store().transact(|db| {
+        Ok(db.query_row("SELECT count(*) FROM vm_operations", [], |r| r.get(0))?)
+    }).unwrap()
 }
 
 fn unresolved_epoch(h: &Harness, vm: Id) -> Option<(Id, Id)> {
@@ -358,6 +382,59 @@ async fn ready_commit_resamples_a_child_lost_while_the_gate_was_busy() {
     let status = call(&client, "vm_get", json!({"vm_id":hex::encode(target.vm)})).await;
     assert_eq!(status["ready"], false);
     assert!(status.get("native_boot_witness").is_none());
+    assert_admission_closed(&h);
+    drop(client);
+    let _ = h.shutdown().await;
+}
+
+#[tokio::test]
+async fn start_behind_a_held_registration_is_busy_without_a_durable_write() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let (vm, _, _, scope) = bound_clone(&h, &client).await;
+    let supervisor = h.supervisor();
+    // A previous owner committed its clean release and still holds its
+    // registration until its worker returns.
+    let previous = Target { vm, generation: scope.generation, epoch: [61; 16] };
+    let held = supervisor.native_runs
+        .register(vm, Arc::new(native_run::Run::new("alpha", previous))).unwrap();
+    let released = supervisor.controller.active_release_epoch(vm, false).unwrap();
+    assert!(released.is_some());
+    let operations = operation_count(&h);
+    let busy = supervisor.gate.lock().unwrap().start_native_run(
+        supervisor, &Installation::fixture(), start_request(vm, 505), HOST, RESOURCES,
+        |_, _, _, _| panic!("a refused start reached its worker"),
+    );
+    assert_eq!(busy.unwrap_err().0, "busy");
+    // No fresh pending operation or writer epoch was committed.
+    assert_eq!(operation_count(&h), operations);
+    assert_eq!(supervisor.controller.active_release_epoch(vm, false).unwrap(), released);
+    assert_eq!(unresolved_epoch(&h, vm), None);
+
+    // Once the previous owner returns, the same fresh request starts and its
+    // parked worker owns the slot. A replay of it writes nothing new.
+    drop(held);
+    let (resume, parked) = std::sync::mpsc::channel::<()>();
+    let started = supervisor.gate.lock().unwrap().start_native_run(
+        supervisor, &Installation::fixture(), start_request(vm, 505), HOST, RESOURCES,
+        move |_, _, _, _| { let _ = parked.recv(); Ok(()) },
+    ).unwrap();
+    let operations = operation_count(&h);
+    assert!(unresolved_epoch(&h, vm).is_some());
+    assert!(supervisor.native_runs.with_entry(vm, |owner| owner.is_some()).unwrap());
+    let replay = supervisor.gate.lock().unwrap().start_native_run(
+        supervisor, &Installation::fixture(), start_request(vm, 505), HOST, RESOURCES,
+        |_, _, _, _| panic!("a replay reached a worker"),
+    ).unwrap();
+    assert_eq!(replay, started);
+    assert_eq!(operation_count(&h), operations);
+    let fresh = supervisor.gate.lock().unwrap().start_native_run(
+        supervisor, &Installation::fixture(), start_request(vm, 506), HOST, RESOURCES,
+        |_, _, _, _| panic!("a refused start reached its worker"),
+    );
+    assert_eq!(fresh.unwrap_err().0, "busy");
+    assert_eq!(operation_count(&h), operations);
+    resume.send(()).unwrap();
     assert_admission_closed(&h);
     drop(client);
     let _ = h.shutdown().await;

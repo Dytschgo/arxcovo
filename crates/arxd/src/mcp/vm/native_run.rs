@@ -192,7 +192,7 @@ impl VmInventory {
     }
 }
 
-struct Start {
+pub(super) struct Start {
     worker: PendingOperation,
     active: store::snapshot::Active,
 }
@@ -201,7 +201,11 @@ struct Start {
 // Until then, only fixtures can construct the installation required here.
 #[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
 impl Gate {
-    fn start_native_run(
+    /// The caller holds the foreground gate. A fresh start commits its pending
+    /// operation and writer epoch only after its run slot is reserved and the
+    /// worker queue is open, so no refusal can follow the durable write. A
+    /// held slot still replays the exact request without a new write.
+    pub(super) fn start_native_run(
         &mut self,
         supervisor: &Arc<Supervisor>,
         installation: &Installation,
@@ -213,6 +217,11 @@ impl Gate {
         if self.closed || supervisor.fenced.load(Ordering::SeqCst) {
             return Err(SHUTDOWN);
         }
+        let slot = match supervisor.native_runs.reserve_owner(request.vm) {
+            Ok(slot) => slot,
+            Err(reason) => return replay_start(supervisor, &request)?.ok_or(reason),
+        };
+        self.test_workers_open(supervisor)?;
         let (decision, active) =
             supervisor
                 .controller
@@ -220,16 +229,7 @@ impl Gate {
         let worker = match decision {
             Admission::Admitted(worker) => worker,
             Admission::Existing(_) => {
-                let previous = supervisor
-                    .controller
-                    .foreground_replay(
-                        request.principal,
-                        request.request_id,
-                        Subject::Vm(request.vm),
-                        Action::Start as i64,
-                    )??
-                    .ok_or(STATE_UNAVAILABLE)?;
-                return Ok(receipt(previous.operation.id, previous.lease_end));
+                return replay_start(supervisor, &request)?.ok_or(STATE_UNAVAILABLE);
             }
             Admission::Refused(reason) => return Err(reason.into()),
         };
@@ -241,31 +241,53 @@ impl Gate {
             epoch,
         };
         let owner = Arc::new(Run::new(request.principal, target));
-        let registration = supervisor.native_runs.register(request.vm, owner.clone())?;
-        self.enqueue_test_worker(
-            supervisor,
-            registration,
-            || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-            },
-            move |supervisor, runtime| match work(
+        let task = owner.clone();
+        let enqueued = slot.install(owner.clone()).and_then(|()| {
+            self.enqueue_test_worker(
                 supervisor,
-                runtime,
-                &owner,
-                Start { worker, active },
-            ) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    owner.withdraw();
-                    supervisor.controller.fence_native_run(owner.target)?;
-                    Err(error)
-                }
-            },
-        )?;
+                slot,
+                || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                },
+                move |supervisor, runtime| match work(
+                    supervisor,
+                    runtime,
+                    &task,
+                    Start { worker, active },
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        task.withdraw();
+                        supervisor.controller.fence_native_run(task.target)?;
+                        Err(error)
+                    }
+                },
+            )
+        });
+        if let Err(reason) = enqueued {
+            // Rollback-safe handoff: no worker owns the committed epoch, so
+            // fence it for ordinary recovery before refusing.
+            owner.withdraw();
+            let _ = supervisor.controller.fence_native_run(target);
+            return Err(reason);
+        }
         Ok(receipt(epoch, None))
     }
+}
+
+#[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
+fn replay_start(supervisor: &Supervisor, request: &Request<'_>) -> Outcome<Option<Value>> {
+    Ok(supervisor
+        .controller
+        .foreground_replay(
+            request.principal,
+            request.request_id,
+            Subject::Vm(request.vm),
+            Action::Start as i64,
+        )??
+        .map(|previous| receipt(previous.operation.id, previous.lease_end)))
 }
 
 #[allow(dead_code, reason = "TEST installation is closed until 7c 16")]

@@ -52,6 +52,13 @@ impl<T> Registry<T> {
         })
     }
 
+    /// Reserve a fresh owner's slot before its durable admission commits.
+    /// Only gated paths fill a slot, so a reservation taken under the gate
+    /// stays available until [`Registration::install`] or drop.
+    pub(super) fn reserve_owner(&self, subject: Id) -> Outcome<Registration<T>> {
+        self.reserve(subject, None)
+    }
+
     /// Fence worker reacquisition for an ordinary or vault release attempt.
     /// Drop removes only this reaper's entry, even across an unwind.
     pub(super) fn fence_orphan(&self, subject: Id) -> Outcome<Registration<T>> {
@@ -77,6 +84,22 @@ pub(super) struct Registration<T> {
     entries: Entries<T>,
     subject: Id,
     owner: Arc<()>,
+}
+
+impl<T> Registration<T> {
+    /// Install the owner in this exact reserved slot. Only this
+    /// reservation's own drop removes the entry, so it cannot be refused.
+    #[allow(dead_code, reason = "TEST producers are installed in later chunks")]
+    pub(super) fn install(&self, value: T) -> Outcome<()> {
+        let mut entries = self.entries.lock().unwrap_or_else(|err| err.into_inner());
+        match entries.get_mut(&self.subject) {
+            Some(entry) if Arc::ptr_eq(&entry.owner, &self.owner) => {
+                entry.value = Some(value);
+                Ok(())
+            }
+            _ => Err(STATE_UNAVAILABLE),
+        }
+    }
 }
 
 impl<T> Drop for Registration<T> {
@@ -146,14 +169,10 @@ impl TestWorkers {
 }
 
 impl Gate {
+    /// Drain finished workers. A failed one fences fresh TEST admission, and
+    /// a closed or fenced supervisor refuses before any durable commit.
     #[allow(dead_code, reason = "TEST producers are installed in later chunks")]
-    pub(super) fn enqueue_test_worker<T: Send + 'static>(
-        &mut self,
-        supervisor: &Arc<Supervisor>,
-        registration: Registration<T>,
-        initialize: fn() -> io::Result<Runtime>,
-        work: impl FnOnce(&Supervisor, &Runtime) -> anyhow::Result<()> + Send + 'static,
-    ) -> Outcome<AbortHandle> {
+    pub(super) fn test_workers_open(&mut self, supervisor: &Supervisor) -> Outcome<()> {
         let workers = &mut self.test_workers;
         while let Some(done) = workers.tasks.try_join_next() {
             workers.failed |= !matches!(done, Ok(Ok(())));
@@ -164,8 +183,20 @@ impl Gate {
         if self.closed || supervisor.fenced.load(Ordering::SeqCst) {
             return Err(SHUTDOWN);
         }
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "TEST producers are installed in later chunks")]
+    pub(super) fn enqueue_test_worker<T: Send + 'static>(
+        &mut self,
+        supervisor: &Arc<Supervisor>,
+        registration: Registration<T>,
+        initialize: fn() -> io::Result<Runtime>,
+        work: impl FnOnce(&Supervisor, &Runtime) -> anyhow::Result<()> + Send + 'static,
+    ) -> Outcome<AbortHandle> {
+        self.test_workers_open(supervisor)?;
         let supervisor = supervisor.clone();
-        Ok(workers.tasks.spawn_blocking(move || {
+        Ok(self.test_workers.tasks.spawn_blocking(move || {
             let _registration = registration;
             let runtime = initialize()?;
             // The worker includes terminal settlement. A failure leaves its
