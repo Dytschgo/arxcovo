@@ -9,8 +9,8 @@
 //! encoding it can produce against this module.
 //!
 //! The writer supplies every free byte array itself (binding and chain).
-//! The only arrays a caller's result may carry are the distribution
-//! digests, and those must equal the reviewed stock pins.
+//! Results carry only closed, typed evidence. Distribution pins for a
+//! complete record are checked against the appropriate reviewed class.
 
 use super::DiagnosticFile;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -116,6 +116,15 @@ const DEPENDENCIES: &[&str] = &[
     "firmware",
     "guest_protocol",
     "network_topology",
+    "qualifier_image",
+    "production_store",
+    "disposable_store",
+    "patched_bundle",
+    "runtime_profile",
+    "egress_policy",
+    "network_fixture",
+    "origin_profile",
+    "signed_compose_inputs",
 ];
 
 const RECORD_FILES: &[&str] = &[
@@ -211,7 +220,10 @@ const INCOMPLETE: &[(&str, Shape)] = &[
     ("binding", Shape::Object(BINDING)),
     ("blocked_at", Shape::Optional(&ANY_STAGE)),
     ("unattempted", Shape::List(&ANY_STAGE, 24)),
-    ("unmeasured", Shape::List(&Shape::Enum(DEPENDENCIES), 10)),
+    (
+        "unmeasured",
+        Shape::List(&Shape::Enum(DEPENDENCIES), DEPENDENCIES.len()),
+    ),
     ("dispatched_effects", Shape::Uint(U16)),
     ("charge_retained", Shape::Bool),
     ("late", Shape::Optional(&Shape::Enum(DIAGNOSTICS))),
@@ -220,6 +232,55 @@ const INCOMPLETE: &[(&str, Shape)] = &[
 
 /// Every observation kind and its fields, in declaration order.
 const OBSERVATIONS: &[(&str, &[(&str, Shape)])] = &[
+    (
+        "docker_distribution",
+        &[
+            ("manifest", Shape::Bytes(32)),
+            ("executable", Shape::Bytes(32)),
+            ("receipt", Shape::Bytes(32)),
+            ("loaded_artifacts", Shape::Bytes(32)),
+        ],
+    ),
+    (
+        "docker_recipe_verified",
+        &[
+            (
+                "recipe",
+                Shape::Object(&[
+                    ("identity", RECIPE_IDENTITY),
+                    ("web", Shape::Bytes(32)),
+                    ("closure", Shape::Bytes(32)),
+                    ("medium", Shape::Bytes(32)),
+                ]),
+            ),
+            ("restricted_install", Shape::Bool),
+            ("detached_health", Shape::Bool),
+            ("independent_pair", Shape::Bool),
+        ],
+    ),
+    (
+        "docker_public_ipv4",
+        &[
+            ("policy", Shape::Bytes(32)),
+            ("topology", Shape::Bytes(32)),
+            ("receiver_witness", Shape::Bytes(32)),
+            ("receiver_controls", Shape::Bool),
+            ("public_tcp_udp", Shape::Bool),
+            ("nonpublic_denied", Shape::Bool),
+            ("ipv6_icmp_denied", Shape::Bool),
+            ("route_drift_denied", Shape::Bool),
+        ],
+    ),
+    (
+        "docker_installed_endpoint",
+        &[
+            ("recipe", RECIPE_IDENTITY),
+            ("compose_protocol", Shape::Uint(U32)),
+            ("exact_pipe_peer", Shape::Bool),
+            ("pinned_origin_tls", Shape::Bool),
+            ("clean_stop", Shape::Bool),
+        ],
+    ),
     (
         "ubuntu_recipe_verified",
         &[
@@ -482,7 +543,7 @@ fn rules(file: DiagnosticFile) -> Rules {
     match file {
         F::Inputs => records(&["inputs"], &["input_pins"]),
         F::HostBaseline => records(&["host_baseline"], &["host"]),
-        F::Distribution => records(&["distribution"], &["distribution"]),
+        F::Distribution => records(&["distribution"], &["distribution", "docker_distribution"]),
         F::CustodyJobCapacity => records(
             &[
                 "custody_job_capacity_baseline",
@@ -520,6 +581,7 @@ fn rules(file: DiagnosticFile) -> Rules {
                 "firmware_sec",
                 "qmp_firmware",
                 "test_installed_endpoint",
+                "docker_installed_endpoint",
             ],
         ),
         F::NetworkRestrictedTest => Rules {
@@ -533,8 +595,8 @@ fn rules(file: DiagnosticFile) -> Rules {
         F::RecipeWindows => records(&["windows_recipe"], &["windows_recipe_verified"]),
         F::NetworkRestrictedOrigin => records(&["restricted_origin_network"], &[]),
         F::RecipeStaticWeb => records(&["static_web_recipe"], &[]),
-        F::NetworkPublicIpv4 => records(&["public_ipv4_network"], &[]),
-        F::RecipeDocker => records(&["docker_recipe"], &[]),
+        F::NetworkPublicIpv4 => records(&["public_ipv4_network"], &["docker_public_ipv4"]),
+        F::RecipeDocker => records(&["docker_recipe"], &["docker_recipe_verified"]),
         F::Cleanup => records(&["cleanup"], &["cleanup"]),
         F::Incomplete => Rules {
             top: Shape::Object(INCOMPLETE),
