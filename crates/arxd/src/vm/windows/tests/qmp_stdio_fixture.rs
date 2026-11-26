@@ -147,13 +147,18 @@ fn inherited(process: &OwnedHandle, expected: HANDLE) -> Result<bool, i32> {
     .map_err(|error| error.raw_os_error().unwrap())?;
     Ok(unsafe { CompareObjectHandles(duplicate.as_raw_handle(), expected) } != 0)
 }
+struct ConcurrentSync<'a> {
+    before_create: &'a std::sync::Barrier,
+    before_resume: &'a std::sync::Barrier,
+}
+
 async fn scenario(
     mode: &str,
     token: Option<&VmToken>,
     console: ConsoleProbe,
     peer: Option<&Path>,
     probe_bundle: bool,
-    concurrent: Option<&tokio::sync::Barrier>,
+    concurrent: Option<ConcurrentSync<'_>>,
 ) -> Option<Vec<u16>> {
     let restricted = token.is_some();
     let own_image = std::env::current_exe().unwrap();
@@ -201,6 +206,11 @@ async fn scenario(
             interactive: console == ConsoleProbe::Interactive,
         }
     };
+    if let Some(sync) = &concurrent {
+        // Align both OS threads immediately before create_suspended so their
+        // LaunchDesktop::new calls genuinely contend on the daemon-wide mutex.
+        sync.before_create.wait();
+    }
     let (process, thread, desktop) = create_suspended(
         &launch,
         image.parent().unwrap(),
@@ -250,8 +260,8 @@ async fn scenario(
             .await
             .is_err()
     );
-    if let Some(concurrent) = concurrent {
-        concurrent.wait().await;
+    if let Some(sync) = &concurrent {
+        sync.before_resume.wait();
     }
     child
         .resume_checked(&Shutdown::default(), &mut || Ok(std::time::Instant::now()))
@@ -547,13 +557,16 @@ async fn restricted_launch_stdout_discriminates_greeting_close_and_null_write() 
         }
         Err(error) => panic!("restricted stdio diagnostic requires the owner login: {error}"),
     };
-    // Held for the whole test so the shared station cannot be recreated
-    // between reads. The launcher may only read this station's security.
-    let station_witness = desktop::StationWitness::open().unwrap();
-    let (station_name, station_flags) = station_witness.identity().unwrap();
-    assert_eq!(station_flags & 1, 0, "logon station is visible"); // WSF_VISIBLE
-    assert!(!station_name.eq_ignore_ascii_case("WinSta0"));
-    let station_security = station_witness.security().unwrap();
+    // Inspect an existing logon station without creating one ahead of the
+    // launcher; if it already exists, hold it across every launch and assert
+    // its owner and DACL never change.
+    let mut station_witness = desktop::StationWitness::open_existing(&token).unwrap();
+    let mut station_before = station_witness.as_ref().map(|witness| {
+        let (name, flags) = witness.identity().unwrap();
+        assert_eq!(flags & 1, 0, "logon station is visible"); // WSF_VISIBLE
+        assert!(!name.eq_ignore_ascii_case("WinSta0"));
+        (name, witness.security().unwrap())
+    });
     let (root, _) = fixture_root();
     let image = build_peer(root.path(), Peer::Qemu);
     let bundled = copy_fixture_dlls(root.path());
@@ -570,31 +583,50 @@ async fn restricted_launch_stdout_discriminates_greeting_close_and_null_write() 
             None,
         )
         .await;
+        if station_witness.is_none() {
+            let witness = desktop::StationWitness::open_existing(&token)
+                .unwrap()
+                .expect("launcher did not create logon station");
+            let (name, flags) = witness.identity().unwrap();
+            assert_eq!(flags & 1, 0, "logon station is visible"); // WSF_VISIBLE
+            assert!(!name.eq_ignore_ascii_case("WinSta0"));
+            station_before = Some((name, witness.security().unwrap()));
+            station_witness = Some(witness);
+        }
     }
+    let (station_name, station_security) =
+        station_before.expect("verified logon station witness must exist after launch");
 
     let station = {
         let _lock = desktop::host_station().unwrap();
         unsafe { GetProcessWindowStation() }
     };
-    let barrier = tokio::sync::Barrier::new(2);
-    let (first, second) = tokio::join!(
-        scenario(
-            "greet",
-            Some(&token),
-            ConsoleProbe::Detached,
-            Some(&image),
-            bundled,
-            Some(&barrier)
-        ),
-        scenario(
-            "greet",
-            Some(&token),
-            ConsoleProbe::Detached,
-            Some(&image),
-            bundled,
-            Some(&barrier)
-        ),
-    );
+    let before_create = std::sync::Barrier::new(2);
+    let before_resume = std::sync::Barrier::new(2);
+    let (first, second) = std::thread::scope(|scope| {
+        let run = || {
+            scope.spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(scenario(
+                    "greet",
+                    Some(&token),
+                    ConsoleProbe::Detached,
+                    Some(&image),
+                    bundled,
+                    Some(ConcurrentSync {
+                        before_create: &before_create,
+                        before_resume: &before_resume,
+                    }),
+                ))
+            })
+        };
+        let a = run();
+        let b = run();
+        (a.join().unwrap(), b.join().unwrap())
+    });
     assert!(
         first.is_some() && second.is_some() && first != second,
         "concurrent children shared a desktop"
@@ -625,7 +657,7 @@ async fn restricted_launch_stdout_discriminates_greeting_close_and_null_write() 
         scenario("greet", Some(&token), case, Some(&image), false, None).await;
     }
     assert_eq!(
-        station_witness.security().unwrap(),
+        station_witness.unwrap().security().unwrap(),
         station_security,
         "launcher changed the shared logon station's owner or DACL"
     );

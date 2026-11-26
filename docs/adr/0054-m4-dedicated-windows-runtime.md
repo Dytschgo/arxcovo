@@ -1559,30 +1559,63 @@ and Docker native boots once they are admitted. For each launch it:
 
 - uses `DETACHED_PROCESS` instead of `CREATE_NO_WINDOW`. The child has no
   console, and QMP stays on the three inherited stdio pipes.
-- obtains the logon-session station with `CreateWindowStationW(NULL, …)`.
+- obtains the logon-session station with
+  `CreateWindowStationW(NULL, 0, WINSTA_CREATEDESKTOP | WINSTA_READATTRIBUTES | READ_CONTROL, …)`.
   This works on fresh and existing logons without Administrators. Creating
   a named private station would require Administrators. The launcher reads
   the station back and refuses unless it is non-visible (`WSF_VISIBLE` clear),
   is not `WinSta0`, and has the exact `Service-0x<hi>-<lo>$` name of the VM
   token's authentication LUID. It reads the station's owner and DACL for the
-  log, but **never modifies the station's security**. The descriptor passed
-  to the call applies only when Windows creates the station.
-- creates a fresh desktop `Arxcovo-<128 random bits>` on that station. Its
-  protected DACL has exactly three entries: deny NETWORK, allow the account,
-  and allow SYSTEM, each with all desktop rights. The account owns it. The
-  launcher reads the owner, protection flag and exact entries back from the
-  returned handle, and refuses on any mismatch.
+  log, but **never modifies an existing station's security**. The descriptor
+  passed to the call applies only when Windows creates the station on a fresh
+  logon and is built separately from the desktop descriptor with station-specific
+  rights: protected DACL (`SE_DACL_PROTECTED`), owner = account, deny NETWORK
+  (`0x000f037f`), allow account (`0x00020024`: `READ_CONTROL`,
+  `WINSTA_ACCESSCLIPBOARD`, `WINSTA_ACCESSGLOBALATOMS`), allow OWNER RIGHTS
+  (`S-1-3-4`, `READ_CONTROL`), allow logon SID (`0x0002012f`: `READ_CONTROL`,
+  `WINSTA_ENUMDESKTOPS`, `WINSTA_READATTRIBUTES`, `WINSTA_ACCESSCLIPBOARD`,
+  `WINSTA_CREATEDESKTOP`, `WINSTA_ACCESSGLOBALATOMS`, `WINSTA_ENUMERATE`), and
+  allow SYSTEM (`0x000f037f`). That denies the restricted child
+  `WINSTA_CREATEDESKTOP`, `WINSTA_WRITEATTRIBUTES`, `WINSTA_EXITWINDOWS`,
+  `WINSTA_READSCREEN`, `DELETE`, `WRITE_DAC`, and `WRITE_OWNER` while letting
+  the unrestricted launcher create and verify private desktops.
+- creates a fresh desktop `Arxcovo-<128 random bits>` on that station with
+  desired handle access `DESKTOP_CREATEWINDOW | READ_CONTROL` (`0x00020002`).
+  Its protected DACL (`SE_DACL_PROTECTED`) has owner = account and exactly four
+  entries:
+  - deny NETWORK: `0x000f01ff` (all desktop rights);
+  - allow account: `0x00020083` (`READ_CONTROL | DESKTOP_READOBJECTS | DESKTOP_CREATEWINDOW | DESKTOP_WRITEOBJECTS`), the measured minimal startup mask;
+  - allow OWNER RIGHTS (`S-1-3-4`): `READ_CONTROL` (`0x00020000`), capping implicit owner rights so ownership by the account SID cannot be used to obtain `WRITE_DAC`;
+  - allow SYSTEM: `0x000f01ff` (all desktop rights).
+  Each bit of `0x00020083` was measured against the restricted QEMU-shaped peer
+  with the pinned DLLs: removing `DESKTOP_READOBJECTS` (`0x0001`) or
+  `DESKTOP_WRITEOBJECTS` (`0x0080`) fails `user32.dll` initialization with
+  `0xC0000142`; removing `DESKTOP_CREATEWINDOW` (`0x0002`) fails `CoInitialize`
+  and `CreateDesktopW`; `READ_CONTROL` (`0x00020000`) allows read-only security
+  inspection matching the OWNER RIGHTS ceiling. Surplus rights
+  (`DESKTOP_HOOKCONTROL`, `WRITE_DAC`, `WRITE_OWNER`, `DELETE`,
+  `DESKTOP_CREATEMENU`, `DESKTOP_JOURNALRECORD`, `DESKTOP_JOURNALPLAYBACK`,
+  `DESKTOP_ENUMERATE`, `DESKTOP_SWITCHDESKTOP`) are omitted and verified denied
+  inside the restricted child. The launcher reads the owner, protection flag
+  and exact four entries back from the returned handle, and refuses on any
+  mismatch.
 - passes the explicit `<station>\<desktop>` path as `lpDesktop`.
 - holds the station and desktop handles with the child, its Job and any
-  partial-create residue until the child settles. They close on every exit
-  path, so the desktop is destroyed once the child is gone.
+  partial-create residue until the child settles. On normal exit and every
+  error path where station/desktop restoration succeeds, both handles close
+  when the lease drops, so the desktop is destroyed once the child is gone.
 
 `CreateDesktopW` creates the desktop on the process's current station, so
 the launcher temporarily switches the process station. A daemon-wide mutex
 serializes the switch, the desktop creation and the restore. An RAII guard
 restores the original station and thread desktop and reads both back. If
 the restore fails, the guard poisons the lock state, and every later launch
-and every owner last-input sample is refused. That fails closed.
+and every owner last-input sample is refused. That fails closed. Windows
+refuses `CloseWindowStation` on a handle still assigned as the process window
+station (and `CloseDesktop` on any still-assigned thread desktop handle); on
+that terminal restore-failure path, the newly created unattached desktop closes
+immediately while the still-assigned station handle remains alive until daemon
+process exit, with the health fence blocking all further launches.
 
 ### USER32 audit of arxd
 
@@ -1606,19 +1639,30 @@ Containment is unchanged or stronger. The token remains
 `DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED` with the restricting set exactly
 `{account}`. Everyone and Authenticated Users were **not** added. The child
 loses access it previously could have attempted: it no longer shares the
-owner's interactive desktop. It can open neither `WinSta0\Default` for
-enumeration, reading or writing, nor its own console. The job, mitigation,
+owner's interactive desktop, and it cannot open `WinSta0\Default` (denied for
+read, enumerate, write, hook, create-window and `MAXIMUM_ALLOWED`), call
+`OpenInputDesktop`, or allocate its own console. On its own private desktop,
+the child receives only `0x00020083` with an OWNER RIGHTS (`S-1-3-4`)
+`READ_CONTROL` ceiling, denying `DESKTOP_HOOKCONTROL`, `WRITE_DAC`,
+`WRITE_OWNER`, `DELETE`, and other surplus desktop rights. The job, mitigation,
 child-process and handle-list attributes are unchanged.
 
-The station's clipboard and global atoms are station-scoped. Other
-non-interactive processes in the owner's logon session share them. A sibling
-VM child can open another launch's desktop, because the owner SID,
-restricting SID and integrity level are the same. Both limits sit inside the
-existing current-user trust boundary of the enrolled PC. Distinct desktops
-prevent accidental sharing and bind cleanup to each launch. Stronger
-separation is future work. It needs a per-launch restricting principal, such
-as a per-launch SID in the restricting set and the desktop, workspace and
-pipe DACLs.
+**Window station access is separate from interactive desktop isolation.**
+Under the current-user logon session, a restricted child can still open and
+assign `WinSta0` itself, including permission checks for
+`WINSTA_ACCESSCLIPBOARD` and `WINSTA_ACCESSGLOBALATOMS`, and the shared
+non-interactive `Service-0x<hi>-<lo>$` station's clipboard and global atoms are
+likewise station-scoped across non-interactive processes in the owner's logon
+session. Interactive desktop denial and private-desktop startup placement
+**do not prove station-resource isolation** (clipboard or global atoms); that
+remains a known limitation inside the existing current-user trust boundary of
+the enrolled PC. Similarly, a sibling VM child shares the account SID,
+restricting SID and integrity level, so it can open another launch's desktop
+with the same minimal `0x00020083` mask (without `DESKTOP_HOOKCONTROL` or
+`WRITE_DAC`). Distinct desktops prevent accidental sharing and bind cleanup to
+each launch. Stronger separation is future work. It needs a per-launch
+restricting principal, such as a per-launch SID in the restricting set and the
+desktop, workspace and pipe DACLs.
 
 ### bcrypt and KsecDD rule
 
@@ -1654,7 +1698,11 @@ private desktop, `DETACHED_PROCESS`, the checked resume and the
 
 Each peer greets, acknowledges `qmp_capabilities`, stays live and exits
 cleanly. The USER32 and QEMU-shaped peers also prove their station is
-non-visible and that they cannot open the interactive desktop.
+non-visible, that they cannot open the interactive desktop or call
+`OpenInputDesktop`, and that their own private desktop denies
+`DESKTOP_HOOKCONTROL`, `WRITE_DAC`, `WRITE_OWNER`, `DELETE`,
+`DESKTOP_CREATEMENU`, `DESKTOP_JOURNALRECORD`, `DESKTOP_JOURNALPLAYBACK`,
+`DESKTOP_ENUMERATE`, `DESKTOP_SWITCHDESKTOP`, and `SetUserObjectSecurity`.
 
 The negative controls each change one variable and end with 0xC0000142 and
 `ERROR_BROKEN_PIPE`:
@@ -1663,11 +1711,16 @@ The negative controls each change one variable and end with 0xC0000142 and
 - an explicit `WinSta0\Default`;
 - a peer that statically imports bcrypt, under the full production launch.
 
-Two concurrent launches receive distinct desktops on the verified station.
-The launcher's station is restored afterwards, the station's owner and DACL
-are identical before and after, and each desktop is gone after settlement.
-Unit tests refuse a visible or foreign station, a desktop descriptor
-mismatch, and every launch after a failed restore.
+Two concurrent launches on separate OS threads contend on the daemon-wide
+station mutex via a pre-create barrier and overlap via a pre-resume barrier;
+they receive distinct desktops on the verified station. The launcher's station
+is restored afterwards, an existing station's owner and DACL are observed
+without creating the station ahead of the launcher and remain identical before
+and after, and each desktop is gone after settlement. Unit tests refuse a
+visible or foreign station, a desktop descriptor mismatch (including full-mask
+or missing OWNER RIGHTS), verify the production first-create station descriptor
+and its `AccessCheck` behavior for launcher and restricted child, and refuse
+every launch after a failed restore.
 
 Real QEMU startup and **WHPX partition creation under this token are
 unverified on real hardware**. `vid.dll` opens `\Device\VidExo` with

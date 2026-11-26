@@ -44,6 +44,15 @@ static void expect(HANDLE pipe, const char *bytes, DWORD length) {
 }
 
 #if defined(FIXTURE_USER32) || defined(FIXTURE_QEMU_SHAPE)
+static void require_own_desktop_denied(const wchar_t *desktop_name, DWORD access, UINT status) {
+    HDESK opened = OpenDesktopW(desktop_name, 0, FALSE, access);
+    if (opened) {
+        CloseDesktop(opened);
+        ExitProcess(status);
+    }
+    require(GetLastError() == ERROR_ACCESS_DENIED, status);
+}
+
 static void verify_desktop(void) {
     require(GetDesktopWindow() != NULL, 20);
     HWINSTA station = GetProcessWindowStation();
@@ -55,6 +64,41 @@ static void verify_desktop(void) {
     require(GetUserObjectInformationW(station, UOI_NAME, name, sizeof(name), &needed), 23);
     require(CompareStringOrdinal(name, 8, L"Service-", 8, TRUE) == CSTR_EQUAL, 24);
 
+    // Verify effective denial on our own private desktop: the restricted child
+    // must receive only the measured startup rights (0x00020083) and must not
+    // gain DESKTOP_HOOKCONTROL, WRITE_DAC, WRITE_OWNER, or other surplus rights
+    // explicitly or through implicit ownership.
+    HDESK own = GetThreadDesktop(GetCurrentThreadId());
+    wchar_t own_name[128];
+    require(own && GetUserObjectInformationW(own, UOI_NAME, own_name, sizeof(own_name), &needed), 69);
+    require(CompareStringOrdinal(own_name, 8, L"Arxcovo-", 8, TRUE) == CSTR_EQUAL, 69);
+    require_own_desktop_denied(own_name, DESKTOP_HOOKCONTROL, 70);
+    require_own_desktop_denied(own_name, WRITE_DAC, 71);
+    require_own_desktop_denied(own_name, WRITE_OWNER, 72);
+    require_own_desktop_denied(own_name, DELETE, 73);
+    require_own_desktop_denied(own_name, DESKTOP_CREATEMENU, 74);
+    require_own_desktop_denied(own_name, DESKTOP_JOURNALRECORD, 75);
+    require_own_desktop_denied(own_name, DESKTOP_JOURNALPLAYBACK, 76);
+    require_own_desktop_denied(own_name, DESKTOP_ENUMERATE, 77);
+    require_own_desktop_denied(own_name, DESKTOP_SWITCHDESKTOP, 78);
+#if defined(FIXTURE_QEMU_SHAPE)
+    {
+        SECURITY_DESCRIPTOR empty_sd;
+        SECURITY_INFORMATION dacl_info = DACL_SECURITY_INFORMATION;
+        require(InitializeSecurityDescriptor(&empty_sd, SECURITY_DESCRIPTOR_REVISION), 79);
+        require(!SetUserObjectSecurity(own, &dacl_info, &empty_sd) &&
+                GetLastError() == ERROR_ACCESS_DENIED, 79);
+    }
+#endif
+
+    HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (input) {
+        CloseDesktop(input);
+        ExitProcess(26);
+    }
+    DWORD input_err = GetLastError();
+    require(input_err == ERROR_ACCESS_DENIED || input_err == ERROR_INVALID_FUNCTION, 26);
+
     HWINSTA interactive = OpenWindowStationW(L"WinSta0", FALSE, MAXIMUM_ALLOWED);
     if (!interactive) {
         require(GetLastError() == ERROR_ACCESS_DENIED, 25);
@@ -64,11 +108,14 @@ static void verify_desktop(void) {
         DWORD rights[] = {
             DESKTOP_ENUMERATE | DESKTOP_READOBJECTS,
             DESKTOP_WRITEOBJECTS | DESKTOP_HOOKCONTROL | DESKTOP_CREATEWINDOW,
+            MAXIMUM_ALLOWED,
         };
         for (DWORD i = 0; i < ARRAYSIZE(rights); ++i) {
             HDESK desktop = OpenDesktopW(L"Default", 0, FALSE, rights[i]);
             require(!desktop && GetLastError() == ERROR_ACCESS_DENIED, 26);
         }
+        HDESK interactive_input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+        require(!interactive_input && GetLastError() == ERROR_ACCESS_DENIED, 26);
         require(SetProcessWindowStation(station), 27);
     } else {
         require(GetLastError() == ERROR_ACCESS_DENIED, 28);
