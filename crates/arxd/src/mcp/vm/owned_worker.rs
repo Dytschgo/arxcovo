@@ -23,7 +23,7 @@ impl<T> Default for Registry<T> {
 
 struct OwnedEntry<T> {
     owner: Arc<()>,
-    value: T,
+    value: Option<T>,
 }
 
 // The TEST producers and recovery adapter are installed in later chunks.
@@ -32,6 +32,10 @@ impl<T> Registry<T> {
     /// Reserve the durable intent and register under the same foreground gate
     /// that recovery synchronizes with before observing worker ownership.
     pub(super) fn register(&self, subject: Id, value: T) -> Outcome<Registration<T>> {
+        self.reserve(subject, Some(value))
+    }
+
+    fn reserve(&self, subject: Id, value: Option<T>) -> Outcome<Registration<T>> {
         let mut entries = self.0.try_lock().map_err(|_| STATE_UNAVAILABLE)?;
         let Entry::Vacant(entry) = entries.entry(subject) else {
             return Err(Refusal::Busy.into());
@@ -48,6 +52,12 @@ impl<T> Registry<T> {
         })
     }
 
+    /// Fence worker reacquisition for an ordinary or vault release attempt.
+    /// Drop removes only this reaper's entry, even across an unwind.
+    pub(super) fn fence_orphan(&self, subject: Id) -> Outcome<Registration<T>> {
+        self.reserve(subject, None)
+    }
+
     /// Access short-lived in-memory state, including a start's run entry.
     /// The callback must leave I/O and ledger work to the caller.
     pub(super) fn with_entry<R>(
@@ -56,7 +66,10 @@ impl<T> Registry<T> {
         f: impl FnOnce(Option<&mut T>) -> R,
     ) -> Outcome<R> {
         let mut entries = self.0.try_lock().map_err(|_| STATE_UNAVAILABLE)?;
-        Ok(f(entries.get_mut(&subject).map(|entry| &mut entry.value)))
+        match entries.get_mut(&subject) {
+            None => Ok(f(None)),
+            Some(entry) => Ok(f(Some(entry.value.as_mut().ok_or(Refusal::Busy)?))),
+        }
     }
 }
 
@@ -82,6 +95,25 @@ impl<T> Drop for Registration<T> {
 }
 
 impl Supervisor {
+    #[allow(dead_code, reason = "native TEST recovery installation is deferred")]
+    pub(super) fn with_test_orphan_fence<T>(
+        &self,
+        registry: &Registry<T>,
+        subject: Id,
+        recover: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        let owner = {
+            let Ok(_gate) = self.gate.try_lock() else {
+                return false;
+            };
+            registry.fence_orphan(subject)
+        };
+        let Ok(_owner) = owner else {
+            return false;
+        };
+        recover()
+    }
+
     #[allow(dead_code, reason = "TEST recovery wiring is deferred")]
     pub(super) fn observe_test_worker<T, R>(
         &self,

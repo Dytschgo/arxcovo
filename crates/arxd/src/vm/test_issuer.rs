@@ -394,7 +394,9 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         let expected = EffectPlan::from_target(&target)?;
         let slots = launch_slots(self.effect, expected.kind, target.pair, target.helper)?;
         check_installer(expected.kind, expected.installer)?;
+        let expected_epoch = self.target.writer_epoch.unwrap_or(self.target.generation);
         if workspace.generation != self.target.generation
+            || expected.writer_epoch != expected_epoch
             || !self.admits_launch(expected.kind, target.recipe)
         {
             return Err(REFUSED);
@@ -500,10 +502,7 @@ impl<S: SelectedSource, C: Clock> LaunchPermit for Permit<'_, S, C> {
         check_installer(self.expected.kind, self.expected.installer)?;
         self.intent.verify(&self.slots)?;
         check_installer(self.expected.kind, self.expected.installer)?;
-        Ok(LaunchAuthority {
-            _issued: Minted(()),
-            binding: self.binding,
-        })
+        Ok(LaunchAuthority::new(Minted(()), self.binding))
     }
 }
 
@@ -522,10 +521,7 @@ impl<S: SelectedSource, C: Clock> StagePermit<'_, S, C> {
         self.intent.check_stage(&target)?;
         self.intent.verify(&[target.slot])?;
         self.intent.check_stage(&target)?;
-        Ok(StageAuthority {
-            _issued: Minted(()),
-            target,
-        })
+        Ok(StageAuthority::new(Minted(()), target))
     }
 }
 
@@ -555,13 +551,13 @@ impl<S: SelectedSource, C: Clock> ScriptPermit<'_, S, C> {
             return Err(REFUSED);
         }
         self.intent.verify(&[])?;
-        Ok(ScriptAuthority {
-            _issued: Minted(()),
-            script: self.script,
+        Ok(ScriptAuthority::new(
+            Minted(()),
+            self.script,
             timeout_s,
             generation,
             writer_epoch,
-        })
+        ))
     }
 }
 
@@ -620,6 +616,7 @@ struct EffectInput {
 #[derive(Eq, PartialEq)]
 struct EffectPlan {
     kind: PlanKind,
+    writer_epoch: Id,
     image: LocalPath,
     argv: Vec<String>,
     inputs: Vec<EffectInput>,
@@ -649,6 +646,7 @@ impl EffectPlan {
             .collect::<Result<_, NativeRefusal>>()?;
         Ok(Self {
             kind: plan.kind(),
+            writer_epoch: target.writer_epoch,
             image: plan.image().clone(),
             argv: plan.args().to_vec(),
             inputs,

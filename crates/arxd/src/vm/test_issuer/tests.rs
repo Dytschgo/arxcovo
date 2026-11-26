@@ -505,9 +505,14 @@ impl BootInputs {
     }
 }
 
-fn target<'a>(plan: &'a CommandPlan<'a>, cwd: &'a LocalPath) -> LaunchTarget<'a, 'a> {
+fn target<'a>(
+    plan: &'a CommandPlan<'a>,
+    cwd: &'a LocalPath,
+    writer_epoch: Id,
+) -> LaunchTarget<'a, 'a> {
     LaunchTarget {
         plan,
+        writer_epoch,
         cwd,
         pair: None,
         installer: None,
@@ -842,20 +847,24 @@ fn launch_permit_binds_the_exact_plan_and_refreshes_at_consumption() {
         let issuer = fixture.issuer();
         let (slots, worker, _) = fixture.build(1);
         let target_gen = build_target(&slots);
+        let epoch = target_gen.generation;
         let intent = issuer.intent(&worker, target_gen, &fixture.cancel).unwrap();
         let ws = workspace(target_gen.generation);
-        let permit = intent.launch(ws, target(&plan, &cwd)).unwrap();
+        let permit = intent.launch(ws, target(&plan, &cwd, epoch)).unwrap();
         // One permit per durable effect; memory is not part of its identity.
         let resized = LaunchTarget {
             memory: 2 << 30,
-            ..target(&plan, &cwd)
+            ..target(&plan, &cwd, epoch)
         };
         assert!(intent.launch(ws, resized).is_err(), "{name}");
         if let Some(drift) = drift {
             drift(&fixture, &slots, &worker);
-            assert!(permit.consume(target(&plan, &cwd)).is_err(), "{name}");
+            assert!(
+                permit.consume(target(&plan, &cwd, epoch)).is_err(),
+                "{name}"
+            );
         } else {
-            let authority = permit.consume(target(&plan, &cwd)).unwrap();
+            let authority = permit.consume(target(&plan, &cwd, epoch)).unwrap();
             assert_eq!(
                 authority.binding(),
                 LaunchPermitBinding {
@@ -871,23 +880,25 @@ fn launch_permit_binds_the_exact_plan_and_refreshes_at_consumption() {
     let issuer = fixture.issuer();
     let (slots, worker, _) = fixture.build(1);
     let target_gen = build_target(&slots);
+    let epoch = target_gen.generation;
     let intent = issuer.intent(&worker, target_gen, &fixture.cancel).unwrap();
     let ws = workspace(target_gen.generation);
     let wrong_ws = workspace(slots.verification.disk.generation);
-    assert!(intent.launch(wrong_ws, target(&plan, &cwd)).is_err());
+    assert!(intent.launch(wrong_ws, target(&plan, &cwd, epoch)).is_err());
+    assert!(intent.launch(ws, target(&plan, &cwd, [9; 16])).is_err());
     // A helper carries no recipe, and an inspection names no slot.
     let with_recipe = LaunchTarget {
         recipe: Some(recipes().ubuntu),
-        ..target(&plan, &cwd)
+        ..target(&plan, &cwd, epoch)
     };
     assert!(intent.launch(ws, with_recipe).is_err());
     let with_slot = LaunchTarget {
         helper: Some(slots.pair.disk),
-        ..target(&plan, &cwd)
+        ..target(&plan, &cwd, epoch)
     };
     assert!(intent.launch(ws, with_slot).is_err());
-    let permit = intent.launch(ws, target(&plan, &cwd)).unwrap();
-    assert!(permit.consume(target(&other, &cwd)).is_err());
+    let permit = intent.launch(ws, target(&plan, &cwd, epoch)).unwrap();
+    assert!(permit.consume(target(&other, &cwd, epoch)).is_err());
     assert_admission_closed();
 }
 
@@ -900,11 +911,6 @@ fn start_boot_derives_its_pair_and_admits_only_a_boot() {
     let recipe = inputs.recipe();
     let plan = recipe.plan().unwrap();
     let cwd = LocalPath::parse("D:/vms/work").unwrap();
-    let boot = |pair, recipe| LaunchTarget {
-        pair: Some(pair),
-        recipe,
-        ..target(&plan, &cwd)
-    };
     let image = artifact(ArtifactRole::QemuImg, "E:/bundle/qemu-img.exe", 10);
     let golden = artifact(ArtifactRole::Golden, "D:/vms/golden/disk.qcow2", 11);
     let header = header();
@@ -913,6 +919,12 @@ fn start_boot_derives_its_pair_and_admits_only_a_boot() {
     let fixture = Fixture::new();
     let issuer = fixture.issuer();
     let (worker, target_gen) = fixture.start();
+    let epoch = target_gen.writer_epoch.unwrap();
+    let boot = |pair, recipe| LaunchTarget {
+        pair: Some(pair),
+        recipe,
+        ..target(&plan, &cwd, epoch)
+    };
     let ws = workspace(ACTIVE);
     // A start's writer epoch is its own operation.
     let stale = NativeTarget {
@@ -943,10 +955,17 @@ fn start_boot_derives_its_pair_and_admits_only_a_boot() {
         ("unrelated slot", boot(unrelated, windows)),
         ("unselected recipe", boot(pair(), foreign_recipe)),
         ("no recipe", boot(pair(), None)),
+        (
+            "wrong writer epoch",
+            LaunchTarget {
+                writer_epoch: START_EPOCH,
+                ..boot(pair(), windows)
+            },
+        ),
     ] {
         assert!(intent.launch(ws, target).is_err(), "{name}");
     }
-    assert!(intent.launch(ws, target(&inspect, &cwd)).is_err());
+    assert!(intent.launch(ws, target(&inspect, &cwd, epoch)).is_err());
     assert!(intent.script(SCRIPT, 30).is_err());
     assert!(intent.stage(stage_target(pair().disk)).is_err());
     // An installed boot carries no installer stage.
@@ -969,7 +988,7 @@ fn start_boot_derives_its_pair_and_admits_only_a_boot() {
     let altered_boot = LaunchTarget {
         pair: Some(pair()),
         recipe: windows,
-        ..target(&altered_plan, &cwd)
+        ..target(&altered_plan, &cwd, epoch)
     };
     assert!(intent.launch(ws, altered_boot).is_err());
     let authority = permit.consume(boot(pair(), windows)).unwrap();
@@ -1071,7 +1090,7 @@ fn script_permit_binds_admitted_bytes_timeout_and_writer_epoch() {
     let cwd = LocalPath::parse("D:/vms/work").unwrap();
     assert!(
         intent
-            .launch(workspace(ACTIVE), target(&inspect, &cwd))
+            .launch(workspace(ACTIVE), target(&inspect, &cwd, START_EPOCH))
             .is_err()
     );
     assert!(intent.stage(stage_target(pair().disk)).is_err());
@@ -1206,6 +1225,11 @@ fn launch_slots_come_from_the_target() {
     overlay.disk.role = "verification_overlay";
     let mut seed = helper;
     seed.role = "seed";
+    let mut swapped = pair();
+    swapped.disk.role = "vars";
+    swapped.vars.role = "disk";
+    let mut seed_pair = pair();
+    seed_pair.disk.role = "seed";
     let mut same_key = pair();
     same_key.vars.key = same_key.disk.key;
     let ok = |effect, kind, pair, helper| launch_slots(effect, kind, pair, helper).ok();
@@ -1243,11 +1267,19 @@ fn launch_slots_come_from_the_target() {
         (start, PlanKind::Boot, None, None),
         (start, PlanKind::Boot, Some(pair()), Some(helper)),
         (start, PlanKind::Boot, Some(overlay), None),
+        (start, PlanKind::Boot, Some(swapped), None),
+        (start, PlanKind::Boot, Some(seed_pair), None),
         (start, PlanKind::Boot, Some(same_key), None),
         (
             build,
             PlanKind::InstallerBoot(InstallerPhase::WindowsSetup),
             Some(overlay),
+            None,
+        ),
+        (
+            build,
+            PlanKind::InstallerBoot(InstallerPhase::WindowsSetup),
+            Some(swapped),
             None,
         ),
         (build, PlanKind::Mutate, None, None),
@@ -1282,10 +1314,11 @@ fn build_verification_boot_and_installer_stage_are_bound() {
     let recipe = inputs.recipe();
     let plan = recipe.plan().unwrap();
     let cwd = LocalPath::parse("D:/vms/work").unwrap();
+    let epoch = slots.verification.disk.generation;
     let boot = || LaunchTarget {
         pair: Some(slots.verification),
         recipe: Some(recipes().ubuntu),
-        ..target(&plan, &cwd)
+        ..target(&plan, &cwd, epoch)
     };
     let permit = intent.launch(ws, boot()).unwrap();
     // Second boot permit on the same verification pair is refused.

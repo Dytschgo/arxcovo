@@ -38,13 +38,23 @@ pub struct LaunchAuthority {
     #[cfg(not(all(windows, target_arch = "x86_64")))]
     _closed: std::convert::Infallible,
     #[cfg(all(windows, target_arch = "x86_64"))]
-    pub(super) _issued: super::test_issuer::Minted,
+    _issued: super::test_issuer::Minted,
     #[cfg(all(windows, target_arch = "x86_64"))]
-    pub(super) binding: super::qualification::LaunchPermitBinding,
+    binding: super::qualification::LaunchPermitBinding,
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 impl LaunchAuthority {
+    pub(super) fn new(
+        issued: super::test_issuer::Minted,
+        binding: super::qualification::LaunchPermitBinding,
+    ) -> Self {
+        Self {
+            _issued: issued,
+            binding,
+        }
+    }
+
     pub(crate) fn binding(&self) -> super::qualification::LaunchPermitBinding {
         self.binding
     }
@@ -53,12 +63,22 @@ impl LaunchAuthority {
 /// One staged write's authority, for exactly the target it names.
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) struct StageAuthority {
-    pub(super) _issued: super::test_issuer::Minted,
-    pub(super) target: super::qualification::StageTarget,
+    _issued: super::test_issuer::Minted,
+    target: super::qualification::StageTarget,
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 impl StageAuthority {
+    pub(super) fn new(
+        issued: super::test_issuer::Minted,
+        target: super::qualification::StageTarget,
+    ) -> Self {
+        Self {
+            _issued: issued,
+            target,
+        }
+    }
+
     pub(crate) fn target(&self) -> &super::qualification::StageTarget {
         &self.target
     }
@@ -72,11 +92,11 @@ impl StageAuthority {
     allow(dead_code, reason = "the script channel consumes it in 7c 14")
 )]
 pub(crate) struct ScriptAuthority {
-    pub(super) _issued: super::test_issuer::Minted,
-    pub(super) script: super::qualification_record::Hash,
-    pub(super) timeout_s: u32,
-    pub(super) generation: super::Id,
-    pub(super) writer_epoch: super::Id,
+    _issued: super::test_issuer::Minted,
+    script: super::qualification_record::Hash,
+    timeout_s: u32,
+    generation: super::Id,
+    writer_epoch: super::Id,
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -85,6 +105,22 @@ pub(crate) struct ScriptAuthority {
     allow(dead_code, reason = "the script channel consumes it in 7c 14")
 )]
 impl ScriptAuthority {
+    pub(super) fn new(
+        issued: super::test_issuer::Minted,
+        script: super::qualification_record::Hash,
+        timeout_s: u32,
+        generation: super::Id,
+        writer_epoch: super::Id,
+    ) -> Self {
+        Self {
+            _issued: issued,
+            script,
+            timeout_s,
+            generation,
+            writer_epoch,
+        }
+    }
+
     /// True only for the exact script this authority was issued for.
     pub(crate) fn names(
         &self,
@@ -420,6 +456,13 @@ pub(crate) trait ReaperRuntime {
     /// including on restart. A missing PID is insufficient.
     fn quiesce(&self, work: &CleanupWork, deadline: Instant) -> Quiesced;
 
+    /// Recheck absence and hold the subject's ownership fence across proof
+    /// and commit. Implementations leave the foreground gate before calling
+    /// the observer and keep the scoped reservation until it returns.
+    fn with_orphan_fence(&self, _work: &CleanupWork, _recover: &mut dyn FnMut() -> bool) -> bool {
+        false
+    }
+
     fn graceful_stop(&self, work: &CleanupWork, deadline: Instant) -> StopDisposition;
 
     /// Invoked only after quiesce returned an owned TEST Job for a lease
@@ -440,6 +483,8 @@ pub(crate) trait ReaperRuntime {
 #[allow(dead_code, reason = "native release authority is an activation gate")]
 pub(crate) enum Quiesced {
     Offline,
+    /// No current owner and reacquisition is fenced for the exact claim.
+    Orphaned,
     OwnedTestJob,
     Unconfirmed,
 }

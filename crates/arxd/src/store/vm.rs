@@ -109,7 +109,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 16;
+const VM_SCHEMA_VERSION: u32 = 17;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -569,6 +569,9 @@ impl VmStore {
         if version < 16 {
             tx.execute_batch(native::MIGRATE_V16)?;
         }
+        if version < 17 {
+            tx.execute_batch(native::recovery::MIGRATE_V17)?;
+        }
         recover(&tx, now)?;
         check_size(&tx)?;
         if upgrade {
@@ -718,6 +721,18 @@ impl VmStore {
             return Err(StoreIdentityMismatch.into());
         }
         static_vm::host_id(&db)
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn try_native_transaction<T>(
+        &self,
+        run: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut db = self.try_live_connection()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = run(&tx)?;
+        tx.commit()?;
+        Ok(result)
     }
 
     pub(crate) fn transact<T>(&self, run: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
@@ -2507,7 +2522,9 @@ pub(crate) fn cleanup_work(db: &Connection, kind: CleanupKind) -> Result<Option<
     if owned != 1 {
         return Ok(None);
     }
-    if route == Some("lease") && snapshot::expiry_waits(db, id)? {
+    if native::recovery::requires_release(db, kind)?
+        || (route == Some("lease") && snapshot::expiry_waits(db, id)?)
+    {
         // Split expiry's release proof from active media disposal: let the
         // reaper quiesce or force-reap the owned TEST job without disposing
         // active media while snapshot pairs remain.
@@ -2681,6 +2698,9 @@ pub(crate) fn settle_cleanup(
         return Ok(true);
     };
     if work.release_only {
+        if !current.release_only || native::recovery::requires_release(db, work.kind)? {
+            return Ok(false);
+        }
         if let Some(vm) = work.kind.vm() {
             interrupt_pending(db, vm, now, outcome.released)?;
         }
@@ -2696,6 +2716,7 @@ pub(crate) fn settle_cleanup(
     }
     let confirmed = outcome.released
         && outcome.disposed
+        && !current.release_only
         && current.accounted
         && current.artifacts == work.artifacts
         && native::disposal::work_disposed(db, &current)?;
@@ -2945,7 +2966,8 @@ mod tests {
             .unwrap();
             compose::settle_backup_failed(db, &intent, "interrupted", true, false, NOW)?;
             db.execute_batch(
-                "DROP TRIGGER vm_native_artifact_identity;
+                "DROP TRIGGER vm_native_writer_reservation; DROP TABLE vm_native_writer;
+                 DROP TRIGGER vm_native_artifact_identity;
                  DROP TABLE vm_native_slots; DROP TABLE vm_native_generations;
                  DROP INDEX vm_artifact_slot;
                  DROP TABLE vm_compose_backup_retirements;

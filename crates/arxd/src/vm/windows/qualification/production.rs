@@ -432,6 +432,7 @@ pub(crate) struct LaunchPermitBinding {
 
 pub(crate) struct LaunchTarget<'a, 'plan> {
     pub plan: &'a CommandPlan<'plan>,
+    pub writer_epoch: Id,
     pub cwd: &'a LocalPath,
     pub pair: Option<PairSlots>,
     pub installer: Option<InstallerStage>,
@@ -458,6 +459,8 @@ pub(crate) struct LaunchRequest<'a> {
     pub boot_inputs: Option<&'a QualifiedBoot<'a>>,
     pub cwd: &'a LocalPath,
     pub workspace: &'a ProductionWorkspace,
+    /// Current start operation, or the reserved generation for staged work.
+    pub writer_epoch: Id,
     /// The requested pair with its durable evidence; a refusal is bound to it.
     pub pair: Option<StartPair>,
     pub installer: Option<InstallerStage>,
@@ -571,6 +574,7 @@ impl<'a> NativeLaunch<'a> {
             boot_inputs,
             cwd,
             workspace,
+            writer_epoch,
             pair: start_pair,
             installer,
             helper_target,
@@ -643,12 +647,15 @@ impl<'a> NativeLaunch<'a> {
             seal_sha256: qualification.seal_sha256(),
             kind,
         };
-        let (core, io, authority) =
-            CheckedLaunchCore::hold_checked(&qualification.held.token, inputs, |plan| {
+        let (core, io, authority) = CheckedLaunchCore::hold_checked(
+            &qualification.held.token,
+            inputs,
+            |plan| {
                 let live = qualification.launch_live(memory)?;
                 let captured = refresh()?;
                 let target = LaunchTarget {
                     plan,
+                    writer_epoch,
                     cwd,
                     pair,
                     installer,
@@ -661,7 +668,26 @@ impl<'a> NativeLaunch<'a> {
                 check_permit(target_binding, granted.binding())?;
                 launch::check_preparation(prepare_by, cancelled)?;
                 Ok((captured.min(live), granted))
-            })?;
+            },
+            || {
+                let store = qualification.store;
+                let pins = recovery::StorePins::open(qualification.production_root())?;
+                let origin = pins.origin(store, boot::marker()?)?;
+                store
+                    .try_native_transaction(|db| {
+                        launch::check_preparation(prepare_by, cancelled)
+                            .map_err(|_| anyhow::anyhow!("TEST creation expired"))?;
+                        crate::store::vm::native::recovery::record_job(
+                            db,
+                            custody::scope(workspace_binding),
+                            writer_epoch,
+                            origin,
+                        )
+                    })
+                    .map_err(|_| NativeRefusal::JobUnverified)?;
+                launch::check_preparation(prepare_by, cancelled)
+            },
+        )?;
         Ok(Self {
             core,
             qualification,
@@ -1082,6 +1108,8 @@ impl FinalizedPair {
 
 mod custody;
 mod disposal;
+mod recovery;
+
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use custody::LedgerCheckpoints;
 use custody::check_helper_target;
@@ -1095,6 +1123,11 @@ pub(super) use custody::{WRITE_FAULT, WriteFault};
     reason = "consumed by the 7c foreground issuer and reaper"
 )]
 pub(crate) use disposal::{DisposalCheckpoints, GenerationGuards, LedgerDisposal, NativeDisposal};
+#[allow(
+    unused_imports,
+    reason = "the production TEST recovery adapter is installed in chunk 16"
+)]
+pub(crate) use recovery::NativeRecovery;
 
 #[cfg(test)]
 pub(super) mod tests;

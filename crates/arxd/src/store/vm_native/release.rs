@@ -11,7 +11,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::time::Instant;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Target {
     pub vm: Id,
     pub generation: Id,

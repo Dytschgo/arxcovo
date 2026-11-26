@@ -1476,7 +1476,28 @@ impl<C: Clock> VmController<C> {
         deadline: Option<Instant>,
     ) -> Result<bool> {
         let now = || self.clock.now().monotonic;
-        let (released, finish_by) = reaper::release(work, runtime, deadline, now);
+        // The scheduler shares this path with vault cleanup. Re-read the
+        // exact claim before using an owner response or asking for takeover.
+        let pending_release = self
+            .store
+            .transact(|db| store::native::recovery::requires_release(db, work.kind))?;
+        let (released, finish_by) = reaper::release(
+            work,
+            runtime,
+            deadline,
+            pending_release,
+            |cutoff| custody.release_orphan(work, cutoff, &|| self.clock.now()),
+            now,
+        );
+        if pending_release {
+            // Allow even a lost acknowledgement to settle the release turn,
+            // but take no disposal action on this turn's old view.
+            let pending = self
+                .store
+                .transact(|db| store::native::recovery::requires_release(db, work.kind))?;
+            sweeps.settle(work, now(), !pending);
+            return Ok(false);
+        }
         if released
             && work.accounted
             && !self

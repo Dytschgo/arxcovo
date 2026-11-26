@@ -153,7 +153,9 @@ pub(crate) fn authorized(
         )? == 1
             && slot_exists(db, slot)?),
         DisposalScope::Cleanup(CleanupKind::Expiry { vm, activity_id }) => {
-            if super::super::snapshot::expiry_waits(db, vm)? {
+            if super::super::snapshot::expiry_waits(db, vm)?
+                || super::recovery::requires_release(db, CleanupKind::Expiry { vm, activity_id })?
+            {
                 return Ok(false);
             }
             Ok(count(
@@ -580,7 +582,7 @@ fn generation_proven_absent(db: &Connection, generation: Id) -> Result<bool> {
 /// eligible claims. Legacy generations (no `vm_native_generations` row) keep
 /// their existing settlement behavior unchanged.
 pub(crate) fn work_disposed(db: &Connection, work: &CleanupWork) -> Result<bool> {
-    if work.release_only {
+    if work.release_only || super::recovery::requires_release(db, work.kind)? {
         return Ok(false);
     }
     if matches!(work.kind, CleanupKind::Recovery { .. }) {

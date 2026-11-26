@@ -1828,6 +1828,49 @@ the public MCP surface:
   Production TEST admission stays closed and the physical owner-host journey
   remains **unverified on real hardware**.
 
+### Restart release and owner-local reconciliation (7c chunk 08)
+
+The ordinary and vault sweeps share a release-only turn for an unresolved
+native TEST writer epoch. A current worker gets one bounded retry through its
+own Job. The reaper reads the ledger again after that attempt. A stop response
+alone cannot settle release or authorize disposal. A failed proof leaves the
+charge and claim in place and retries on the existing monotonic backoff.
+
+Store v17 adds a writer checkpoint to the v16 generation, origin and slot
+checkpoints. A native production create records the exact writer epoch,
+physical database and lock file identities, and kernel boot marker before
+calling the checked Windows creation path. That path creates a sole-owned,
+unnamed, non-inheritable kill-on-close Job, passes the Job at suspended creation,
+and transfers ownership with the child and stdio workers. Helper and installer
+launches use the same edge. Errors after creation retain the Job for teardown,
+and process loss closes its sole handle. A create-edge intent still uses dirty
+release if creation did not complete. An older generation with no checkpoint
+cannot acquire evidence from a PID, the current build version, or a dossier.
+
+After restart the runtime fences the subject against new worker registration.
+The issuer and both sweep routes share one generation guard set per supervisor.
+The sweep checks the exact locked store and pinned root, the prior Job protocol
+and same kernel boot, the current claim and epoch, and the exact workspace and
+lease. It takes both writer exclusions together and holds them and the lease
+while it commits the observed bytes to the existing release transaction. An
+unresolved start without a proved Job checkpoint stays charged. A clean
+release still requires the existing held never-created proof and unchanged
+bytes. Failed build, clone and copy work also requires worker quiescence and
+staging provenance before checked disposal. A new boot or a stale or absent
+qualification selection grants no launch authority. Offline observation opens
+only the held production store and workspace. It does not read the dossier.
+
+If provenance or custody is ambiguous, the owner may quiesce the supervisor
+through its ordinary drain, verify the enrolled store and root locally and
+inspect the affected generation and lease under a bounded maintenance window.
+Use an exact held release or disposal proof through the same transaction and
+scheduler only when the missing evidence can be established independently.
+If that proof is unavailable at the cutoff, keep the claim and all artifacts
+fenced for owner recovery. The path provides no PID adoption, manual ledger
+edits, pathname deletion, or additional agent deletion tool. Native recovery
+is **unverified on real hardware**. Production TEST effect admission remains
+closed until the final issuer installation.
+
 ## 7c amendment — explicit TEST opt-in, one permit per durable effect
 
 The VM runtime profile gains two optional fields. `execution_profile`
@@ -1872,17 +1915,18 @@ identity and ledger slots from its target: a boot's exact disk and VARS
 pair (or `verification_overlay` and VARS for a build's verification
 boot), a Mutate plan's identified helper slot, and none for an
 inspection. It mints one permit per identity. A launch permit binds the
-whole sealed plan, inputs, working directory, pair, helper slot,
-installer phase and deadline, recipe and limits. A staged-write permit
-binds its slot, content pin, recipe phase and deadline. A script permit
-binds its bytes, timeout, generation and writer epoch. Consumption
+whole sealed plan, writer epoch, inputs, working directory, pair, helper
+slot, installer phase and deadline, recipe and limits. A staged-write
+permit binds its slot, content pin, recipe phase and deadline. A script
+permit binds its bytes, timeout, generation and writer epoch. Consumption
 refuses any substitution. It then checks cancellation, the ledger
 admission and the deadline, takes a fresh epoch observation, and checks
 all three again. Only then does it issue the effect's own authority,
 within that observation's freshness. Launch, staged-write and script
-authorities are distinct types, and the launch authority carries its
-issuance binding. A transient refusal refuses only that effect, and
-confirmed drift revokes the epoch's effect authority.
+authorities are distinct immutable types with private fields, and the
+launch authority carries its issuance binding. A transient refusal
+refuses only that effect, and confirmed drift revokes the epoch's effect
+authority.
 
 Recovery authority is separate. It needs the exact bound native workspace
 scope of a non-static generation, not a fresh selection, so a revoked or
