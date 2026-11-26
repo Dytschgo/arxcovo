@@ -561,11 +561,9 @@ async fn owner_reads_bounds_pagination_and_no_credentials_in_activity() {
     let serialized = page.to_string();
     assert!(!serialized.contains(PASSWORD));
     assert!(!serialized.contains(cookie.split_once('=').unwrap().1));
-    // The v1 host contract covers Windows and Linux on x86_64 and arm64; the
-    // reader answers other platforms (macOS CI) with the unavailable envelope.
-    let supported = matches!(std::env::consts::OS, "windows" | "linux")
-        && matches!(std::env::consts::ARCH, "x86_64" | "aarch64");
+    let supported = host_supported();
     if supported {
+        bounded("native host sample", f.state.host.settled()).await;
         let hosts = body(f.get("/api/v1/hosts", &cookie).await).await;
         assert_eq!(hosts["hosts"].as_array().unwrap().len(), 1);
         let id = hosts["hosts"][0]["id"].as_str().unwrap();
@@ -1042,13 +1040,15 @@ fn static_startup_refuses_junctions() {
     fs::remove_dir(dist.join("link")).unwrap();
 }
 
-/// Scripted native boundary for the host sampler. Refresh number `gate_at`
-/// reports itself on `entered` and then blocks until `release` is sent or
-/// dropped. Each requested CPU sample takes the next scripted value.
+/// Scripted native boundary for the host sampler. Every refresh reports its
+/// number on `entered`. Refresh `gate_at` then blocks until `release` is sent
+/// or dropped (bounded by `HOST_BOUND`), and refresh `panic_at` panics. Each
+/// requested CPU sample takes the next scripted value.
 struct GatedSource {
     cpu: std::vec::IntoIter<Option<f32>>,
     calls: usize,
     gate_at: usize,
+    panic_at: usize,
     entered: tokio::sync::mpsc::UnboundedSender<usize>,
     release: Option<std::sync::mpsc::Receiver<()>>,
     finished: Arc<std::sync::atomic::AtomicUsize>,
@@ -1066,12 +1066,17 @@ impl GatedSource {
             cpu: cpu.into_iter().collect::<Vec<_>>().into_iter(),
             calls: 0,
             gate_at,
+            panic_at: usize::MAX,
             entered,
             release,
             finished: Arc::default(),
             dropped: None,
         };
         (source, calls)
+    }
+
+    fn finished(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.finished.clone()
     }
 }
 
@@ -1083,8 +1088,9 @@ impl read::HostSource for GatedSource {
         if call == self.gate_at
             && let Some(release) = self.release.take()
         {
-            let _ = release.recv();
+            let _ = release.recv_timeout(HOST_BOUND);
         }
+        assert_ne!(call, self.panic_at, "injected host refresh panic");
         let cpu = if sample_cpu {
             self.cpu.next().flatten()
         } else {
@@ -1119,65 +1125,192 @@ async fn bounded<T>(what: &str, future: impl std::future::Future<Output = T>) ->
         .unwrap_or_else(|_| panic!("{what} did not finish within the bound"))
 }
 
+/// The v1 host contract covers Windows and Linux on x86_64 and arm64; the
+/// reader answers other platforms (macOS CI) with the unavailable envelope.
+fn host_supported() -> bool {
+    matches!(std::env::consts::OS, "windows" | "linux")
+        && matches!(std::env::consts::ARCH, "x86_64" | "aarch64")
+}
+
+/// Checks a host route response under the platform contract. Returns the
+/// host object where the route is supported, `None` after asserting the
+/// unavailable envelope elsewhere.
+async fn host_contract(response: Response) -> Option<serde_json::Value> {
+    if !host_supported() {
+        error(response, StatusCode::SERVICE_UNAVAILABLE, "unavailable").await;
+        return None;
+    }
+    assert_eq!(response.status(), StatusCode::OK);
+    let data = body(response).await;
+    Some(match data.get("hosts") {
+        Some(hosts) => {
+            assert_eq!(hosts.as_array().unwrap().len(), 1);
+            hosts[0].clone()
+        }
+        None => data,
+    })
+}
+
+/// A sampler read on the blocking pool, as a host request makes it, so a
+/// read that blocks cannot stall the test runtime.
+async fn sampler_read(sampler: &read::HostSampler) -> Result<read::HostFacts, StatusCode> {
+    let sampler = sampler.clone();
+    tokio::task::spawn_blocking(move || sampler.latest().map_err(|error| error.status))
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn host_reads_never_wait_for_an_in_flight_refresh() {
     let (release, gate) = std::sync::mpsc::channel();
     let (source, mut entered) = GatedSource::new([Some(4.0), Some(37.44)], 1, Some(gate));
-    let finished = source.finished.clone();
-    let f = Fixture::with_host(read::HostSampler::start(source, Duration::ZERO));
+    let finished = source.finished();
+    let sampler = read::HostSampler::start(source, Duration::ZERO);
+    let f = Fixture::with_host(sampler.clone());
     let (cookie, _) = f.login(None).await;
-    // The synchronous first sample opens the CPU window: usage stays null.
+    let list = "/api/v1/hosts".to_owned();
+    let detail = format!("/api/v1/hosts/{}", f.activity.host_id().unwrap());
+    // The first sample opens the CPU window: usage stays null.
     assert_eq!(bounded("first sample", entered.recv()).await, Some(0));
-    let first = body(bounded("first read", f.get("/api/v1/hosts", &cookie)).await).await;
-    let host = &first["hosts"][0];
-    assert!(host["cpu"]["usedPercent"].is_null());
-    assert_eq!(host["cpu"]["model"], "Test CPU");
-    assert_eq!(host["memory"]["usedBytes"], 1u64 << 30);
-    let id = host["id"].as_str().unwrap().to_owned();
-    // The background refresh is now in flight and held at the gate.
-    assert_eq!(bounded("gated refresh", entered.recv()).await, Some(1));
-    let detail_path = format!("/api/v1/hosts/{id}");
-    let (list, detail) = bounded("concurrent host reads during a refresh", async {
-        tokio::join!(
-            f.get("/api/v1/hosts", &cookie),
-            f.get(&detail_path, &cookie)
-        )
-    })
-    .await;
-    // Both reads finished while the refresh was still held, so neither waited.
-    assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(list.status(), StatusCode::OK);
-    assert_eq!(detail.status(), StatusCode::OK);
-    let list = body(list).await;
-    let detail = body(detail).await;
-    for host in [&list["hosts"][0], &detail] {
+    bounded("first publish", sampler.settled()).await;
+    let first = sampler_read(&sampler).await.unwrap();
+    assert_eq!((first.used_memory, first.used_percent), (1 << 30, None));
+    if let Some(host) = host_contract(bounded("first read", f.get(&list, &cookie)).await).await {
         assert!(host["cpu"]["usedPercent"].is_null());
+        assert_eq!(host["cpu"]["model"], "Test CPU");
         assert_eq!(host["memory"]["usedBytes"], 1u64 << 30);
     }
-    // Releasing the gate publishes the second sample through the route, rounded.
+    // The next refresh is now in flight and held at the gate.
+    assert_eq!(bounded("gated refresh", entered.recv()).await, Some(1));
+    let (a, b, list_response, detail_response) =
+        bounded("concurrent host reads during a refresh", async {
+            tokio::join!(
+                sampler_read(&sampler),
+                sampler_read(&sampler),
+                f.get(&list, &cookie),
+                f.get(&detail, &cookie)
+            )
+        })
+        .await;
+    // Every read finished while the refresh was still held, so none waited.
+    assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 1);
+    for facts in [a.unwrap(), b.unwrap()] {
+        assert_eq!((facts.used_memory, facts.used_percent), (1 << 30, None));
+    }
+    for response in [list_response, detail_response] {
+        if let Some(host) = host_contract(response).await {
+            assert!(host["cpu"]["usedPercent"].is_null());
+            assert_eq!(host["memory"]["usedBytes"], 1u64 << 30);
+        }
+    }
+    // Releasing the gate publishes the second sample, rounded.
     release.send(()).unwrap();
     assert_eq!(bounded("next refresh", entered.recv()).await, Some(2));
-    let ready = body(bounded("ready read", f.get(&detail_path, &cookie)).await).await;
-    assert_eq!(ready["cpu"]["usedPercent"], json!(37.4));
-    assert!(ready["memory"]["usedBytes"].as_u64().unwrap() >= 2u64 << 30);
+    assert_eq!(
+        sampler_read(&sampler).await.unwrap().used_percent,
+        Some(37.4)
+    );
+    if let Some(host) = host_contract(bounded("ready read", f.get(&detail, &cookie)).await).await {
+        assert_eq!(host["cpu"]["usedPercent"], json!(37.4));
+    }
 }
 
 #[tokio::test]
-async fn host_sampler_stops_when_the_dashboard_is_dropped() {
-    let (mut source, mut entered) = GatedSource::new([], usize::MAX, None);
+async fn a_stalled_first_sample_does_not_delay_serving() {
+    let (release, gate) = std::sync::mpsc::channel();
+    let (source, mut entered) = GatedSource::new([Some(4.0)], 0, Some(gate));
+    let finished = source.finished();
+    // Creating the sampler and the dashboard returns while the first refresh is held.
+    let sampler = read::HostSampler::start(source, Duration::ZERO);
+    let f = Fixture::with_host(sampler.clone());
+    let (cookie, _) = f.login(None).await;
+    assert_eq!(bounded("first sample", entered.recv()).await, Some(0));
+    assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        sampler_read(&sampler).await.err(),
+        Some(StatusCode::SERVICE_UNAVAILABLE)
+    );
+    // Not yet sampled: hosts answer unavailable on every platform, and the
+    // rest of the dashboard serves.
+    error(
+        bounded("pending host read", f.get("/api/v1/hosts", &cookie)).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+    )
+    .await;
+    assert_eq!(
+        body(bounded("vm read", f.get("/api/v1/vms", &cookie)).await).await,
+        json!({"vms": []})
+    );
+    assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 0);
+    release.send(()).unwrap();
+    bounded("first publish", sampler.settled()).await;
+    assert_eq!(sampler_read(&sampler).await.unwrap().used_memory, 1 << 30);
+    if let Some(host) =
+        host_contract(bounded("sampled read", f.get("/api/v1/hosts", &cookie)).await).await
+    {
+        assert!(host["cpu"]["usedPercent"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_refresh_marks_hosts_unavailable_without_stopping_the_dashboard() {
+    // Panic in the first sample, then in a later one after figures were published.
+    for panic_at in [0, 1] {
+        let (mut source, mut entered) = GatedSource::new([Some(4.0)], usize::MAX, None);
+        source.panic_at = panic_at;
+        let sampler = read::HostSampler::start(source, Duration::ZERO);
+        let f = Fixture::with_host(sampler.clone());
+        let (cookie, _) = f.login(None).await;
+        for call in 0..=panic_at {
+            assert_eq!(bounded("refresh", entered.recv()).await, Some(call));
+        }
+        bounded("sampler failure", sampler.failed()).await;
+        // The sampler stopped: no refresh follows the panic.
+        bounded("refresh channel close", async {
+            while let Some(call) = entered.recv().await {
+                panic!("refresh {call} started after the panic");
+            }
+        })
+        .await;
+        assert_eq!(
+            sampler_read(&sampler).await.err(),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        error(
+            bounded("failed host read", f.get("/api/v1/hosts", &cookie)).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+        )
+        .await;
+        assert_eq!(
+            body(bounded("vm read", f.get("/api/v1/vms", &cookie)).await).await,
+            json!({"vms": []})
+        );
+    }
+}
+
+#[tokio::test]
+async fn host_sampler_stops_when_the_dashboard_is_dropped_during_a_refresh() {
+    let (release, gate) = std::sync::mpsc::channel();
+    let (mut source, mut entered) = GatedSource::new([], 1, Some(gate));
     let (dropped, stopped) = tokio::sync::oneshot::channel();
     source.dropped = Some(dropped);
     let f = Fixture::with_host(read::HostSampler::start(source, Duration::ZERO));
-    // Wait for one background refresh, so the task is running.
+    // Drop the dashboard while a background refresh is held at the gate.
     assert_eq!(bounded("first sample", entered.recv()).await, Some(0));
-    assert_eq!(bounded("background refresh", entered.recv()).await, Some(1));
+    assert_eq!(bounded("gated refresh", entered.recv()).await, Some(1));
     drop(f);
+    // Tokio cannot abort a running blocking closure; once it returns, the
+    // source is freed and no further refresh starts.
+    release.send(()).unwrap();
     bounded("sampler shutdown", stopped)
         .await
         .expect("the sampler dropped its source");
-    // No refresh starts after shutdown: the channel closes.
     bounded("refresh channel close", async {
-        while entered.recv().await.is_some() {}
+        while let Some(call) = entered.recv().await {
+            panic!("refresh {call} started after shutdown");
+        }
     })
     .await;
 }

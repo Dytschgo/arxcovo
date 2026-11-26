@@ -7,7 +7,7 @@ use axum::{extract::Query, http::Uri, response::Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -255,11 +255,11 @@ struct HostProbe<S> {
 
 #[derive(Clone)]
 pub(super) struct HostFacts {
-    model: String,
-    cores: usize,
-    total_memory: u64,
-    used_memory: u64,
-    used_percent: Option<f64>,
+    pub(super) model: String,
+    pub(super) cores: usize,
+    pub(super) total_memory: u64,
+    pub(super) used_memory: u64,
+    pub(super) used_percent: Option<f64>,
 }
 
 impl<S: HostSource> HostProbe<S> {
@@ -288,13 +288,25 @@ impl<S: HostSource> HostProbe<S> {
     }
 }
 
+/// What a host read can see. Reads answer `UNAVAILABLE` until the first
+/// sample is published, and again after a refresh panicked.
+#[derive(Clone)]
+enum HostState {
+    Pending,
+    Ready(HostFacts),
+    Failed,
+}
+
 /// Latest host figures, refreshed by one background task. Host reads copy
-/// the published figures and never refresh, so a read never waits for a
-/// native CPU or memory refresh, its own or another request's. The task
-/// stops when the last clone (held by the dashboard state) is dropped.
+/// the published state and never refresh, so a read never waits for a
+/// native CPU or memory refresh, its own or another request's. Every
+/// refresh, the first included, runs on the blocking pool, so creating the
+/// sampler never blocks daemon startup, and a refresh panic only marks the
+/// state failed. The task stops when the last clone (held by the dashboard
+/// state) is dropped.
 #[derive(Clone)]
 pub(super) struct HostSampler {
-    latest: Arc<Mutex<HostFacts>>,
+    latest: tokio::sync::watch::Receiver<HostState>,
     _task: Arc<SamplerTask>,
 }
 
@@ -311,18 +323,18 @@ impl HostSampler {
         Self::start(SysinfoSource(sysinfo::System::new()), SAMPLE_PERIOD)
     }
 
-    /// Takes the first sample now, so a read always has memory figures, then
-    /// refreshes every `period` (see [`sample_period`]) on a background task.
-    /// Must be called inside a Tokio runtime.
+    /// Spawns the sampler: the first refresh starts at once, later ones every
+    /// `period` (see [`sample_period`]). Must be called inside a Tokio runtime.
     pub(super) fn start(source: impl HostSource, period: Duration) -> Self {
         let period = sample_period(period);
-        let mut probe = HostProbe::new(source);
-        let latest = Arc::new(Mutex::new(probe.sample(Instant::now)));
-        let slot = Arc::clone(&latest);
+        let (slot, latest) = tokio::sync::watch::channel(HostState::Pending);
         let task = tokio::spawn(async move {
-            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            let slot = Arc::new(slot);
+            let mut probe = HostProbe::new(source);
+            let mut ticks = tokio::time::interval(period);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
+                // The first tick completes immediately.
                 ticks.tick().await;
                 let target = Arc::clone(&slot);
                 match tokio::task::spawn_blocking(move || {
@@ -333,10 +345,10 @@ impl HostSampler {
                 {
                     Ok(next) => probe = next,
                     Err(_) => {
-                        // The source panicked: keep memory, never a stale percentage.
-                        if let Ok(mut latest) = slot.lock() {
-                            latest.used_percent = None;
-                        }
+                        // Tokio caught the panic on the blocking pool. Degrade to
+                        // unavailable rather than show stale or partial figures.
+                        slot.send_replace(HostState::Failed);
+                        eprintln!("arxd: dashboard host sampler stopped after a refresh failure");
                         return;
                     }
                 }
@@ -348,22 +360,39 @@ impl HostSampler {
         }
     }
 
-    /// Copies the last published figures. The lock is only ever held for a
-    /// copy or a swap, never across a refresh.
-    fn latest(&self) -> Result<HostFacts, ApiError> {
-        self.latest
-            .lock()
-            .map(|facts| facts.clone())
-            .map_err(|_| ApiError::UNAVAILABLE)
+    /// Copies the last published figures. The channel lock is only ever held
+    /// for a copy or a swap, never across a refresh.
+    pub(super) fn latest(&self) -> Result<HostFacts, ApiError> {
+        match &*self.latest.borrow() {
+            HostState::Ready(facts) => Ok(facts.clone()),
+            HostState::Pending | HostState::Failed => Err(ApiError::UNAVAILABLE),
+        }
+    }
+
+    /// Waits until the first sample (or a failure) is published.
+    #[cfg(test)]
+    pub(super) async fn settled(&self) {
+        self.wait(|state| !matches!(state, HostState::Pending))
+            .await;
+    }
+
+    /// Waits until a refresh failure is published.
+    #[cfg(test)]
+    pub(super) async fn failed(&self) {
+        self.wait(|state| matches!(state, HostState::Failed)).await;
+    }
+
+    #[cfg(test)]
+    async fn wait(&self, done: impl FnMut(&HostState) -> bool) {
+        let mut latest = self.latest.clone();
+        let _ = latest.wait_for(done).await;
     }
 }
 
-/// Refreshes outside the published slot's lock, then swaps the result in.
-fn publish<S: HostSource>(probe: &mut HostProbe<S>, slot: &Mutex<HostFacts>) {
+/// Refreshes outside the channel lock, then swaps the result in.
+fn publish<S: HostSource>(probe: &mut HostProbe<S>, slot: &tokio::sync::watch::Sender<HostState>) {
     let facts = probe.sample(Instant::now);
-    if let Ok(mut latest) = slot.lock() {
-        *latest = facts;
-    }
+    slot.send_replace(HostState::Ready(facts));
 }
 
 fn host(activity: &Activity, id: &str, now: i64, sampler: &HostSampler) -> Result<Value, ApiError> {
