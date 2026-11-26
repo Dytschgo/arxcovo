@@ -5,6 +5,7 @@ use crate::store::vm::VmStore;
 use crate::vm::qualification_record::{
     self as records, Fresh, RunError, Selection, VerifiedEvidence,
 };
+use crate::vm::selection_epoch::Invalidation::{self, Confirmed, Indeterminate};
 
 pub(crate) struct ForegroundQualification<'a> {
     pub(super) held: Held,
@@ -64,18 +65,43 @@ impl<'a> ForegroundQualification<'a> {
         self.seal_sha256
     }
 
-    pub(crate) fn fresh(&self) -> Result<Fresh<'_>, NativeRefusal> {
+    /// A new boot, expiry, clock disagreement or dependency drift is
+    /// confirmed. The selected seal was verified at open, so a refused
+    /// issuance anchor means the boot marker changed.
+    pub(crate) fn fresh(&self) -> Result<Fresh<'_>, Invalidation> {
+        let reason = NativeRefusal::QualificationMissing;
         let fresh = measure_fresh(&self.held, self.store, &self.dependencies)?;
         let binding = self.evidence.seal.binding;
         let issued = binding
             .issued_on_boot(fresh.boot_marker)
-            .ok_or(NativeRefusal::QualificationMissing)?;
+            .ok_or(Confirmed(reason))?;
         if !binding.live_at(fresh.now.utc, fresh.dependencies.key(binding.scope))
             || !records::clocks_agree(issued, fresh.now)
         {
-            return Err(NativeRefusal::QualificationMissing);
+            return Err(Confirmed(reason));
         }
         Ok(fresh)
+    }
+
+    /// One bounded epoch observation: the freshness and store-identity
+    /// reads, then the high-water transaction, each keeping its class.
+    #[allow(
+        dead_code,
+        reason = "The native TEST issuer consumes the epoch in a later 7c PR"
+    )]
+    pub(crate) fn epoch_sample(
+        &self,
+        advance: impl FnOnce() -> Result<crate::vm::ClockReading, Invalidation>,
+    ) -> Result<crate::vm::selection_epoch::Sample, Invalidation> {
+        let captured = std::time::Instant::now();
+        let fresh = self.fresh()?;
+        let reading = advance()?;
+        Ok(crate::vm::selection_epoch::Sample {
+            captured,
+            now: fresh.now,
+            boot_marker: fresh.boot_marker,
+            reading,
+        })
     }
 
     pub(in crate::vm::windows) fn production_root(&self) -> &PathPin {
@@ -89,40 +115,55 @@ impl<'a> ForegroundQualification<'a> {
     }
 }
 
+/// Unreadable custody or host values fail closed as indeterminate. Only a
+/// measured host or profile mismatch is confirmed dependency drift.
 fn measure_fresh<'a>(
     held: &Held,
     store: &VmStore,
     dependencies: &'a Dependencies,
-) -> Result<Fresh<'a>, NativeRefusal> {
+) -> Result<Fresh<'a>, Invalidation> {
     let reason = NativeRefusal::QualificationMissing;
     held.token
         .verify_current_profile()
-        .map_err(|_| NativeRefusal::IdentityUnverified)?;
-    inventory::binding(&held._source)?;
+        .map_err(|_| Indeterminate(NativeRefusal::IdentityUnverified))?;
+    inventory::binding(&held._source).map_err(Indeterminate)?;
     held.scope
         .as_ref()
-        .ok_or(reason)?
+        .ok_or(Indeterminate(reason))?
         .validate_foreground(store)?;
     for volume in &held.volumes {
         if !capacity::still_bound(&capacity::MountManager, volume) {
-            return Err(NativeRefusal::PathCustodyUnverified);
+            return Err(Indeterminate(NativeRefusal::PathCustodyUnverified));
         }
     }
-    inventory::binding(&held.trial)?;
-    inventory::binding(&held._backing)?;
-    launch::revalidate_assets(held)?;
-    if !matches!(&dependencies.host, Measured::Measured(host)
-        if Ok(host.windows_build) == platform()
-            && Ok(host.windows_revision) == windows_revision()
-            && Ok(host.machine) == machine_guid())
-        || !matches!(&dependencies.owner_profile, Measured::Measured(profile)
-            if held.token.profile_key().is_ok_and(|live| &live == profile))
+    inventory::binding(&held.trial).map_err(Indeterminate)?;
+    inventory::binding(&held._backing).map_err(Indeterminate)?;
+    launch::revalidate_assets(held).map_err(Indeterminate)?;
+    let live = (
+        platform(),
+        windows_revision(),
+        machine_guid(),
+        held.token.profile_key(),
+    );
+    let (
+        Measured::Measured(host),
+        Measured::Measured(profile),
+        (Ok(build), Ok(revision), Ok(machine), Ok(key)),
+    ) = (&dependencies.host, &dependencies.owner_profile, live)
+    else {
+        return Err(Indeterminate(reason));
+    };
+    if host.windows_build != build
+        || host.windows_revision != revision
+        || host.machine != machine
+        || &key != profile
     {
-        return Err(reason);
+        return Err(Confirmed(reason));
     }
+    let now = boot::now();
     Ok(Fresh {
-        now: boot::now(),
-        boot_marker: boot::marker()?,
+        now,
+        boot_marker: boot::marker().map_err(Indeterminate)?,
         dependencies,
     })
 }
