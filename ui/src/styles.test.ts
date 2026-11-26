@@ -42,6 +42,67 @@ describe('Night Orbit tokens', () => {
   });
 });
 
+/** Top-level and @media rules as selector -> declarations (comments stripped). */
+function rules(): { selector: string; decls: Map<string, string> }[] {
+  const text = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  return [...text.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(m => ({
+    selector: m[1].replace(/@media[^{]*$/, '').trim(),
+    decls: new Map(m[2].split(';').map(d => d.split(':')).filter(p => p.length >= 2).map(([k, ...v]) => [k.trim(), v.join(':').trim()])),
+  }));
+}
+const tokenOf = (value: string | undefined) => value?.match(/^var\(--([\w-]+)\)$/)?.[1];
+const rule = (selector: string) => {
+  const found = rules().find(r => r.selector.split(',').map(x => x.trim()).includes(selector));
+  if (!found) throw new Error(`no rule for ${selector}`);
+  return found.decls;
+};
+
+describe('text on its real backgrounds', () => {
+  // Every pair below is a text colour drawn on a fill other than the page:
+  // placeholders and disabled controls sit on input fills (--tile2) and on
+  // tiles; the current nav item and the primary button are black on white.
+  test.each([
+    ['::placeholder', ['tile2', 'tile', 'bg']],
+    ['.button:disabled', ['bg', 'tile', 'tile2']],
+    ['.button.button-disabled', ['bg', 'tile', 'tile2']],
+    ['.terminal-input input:disabled', ['tile2']],
+    ['.field select:disabled', ['tile2']],
+    ['.button-primary', ['ink']],
+    ['.nav a[aria-current="page"]', ['ink']],
+  ] as const)('%s clears 4.5:1 on its fills', (selector, fills) => {
+    const decls = rule(selector);
+    const fg = tokenOf(decls.get('color'));
+    expect(fg, `${selector} sets a token colour`).toBeDefined();
+    for (const fill of fills) expect(contrast(token(fg!), token(fill)), `${selector} on --${fill}`).toBeGreaterThanOrEqual(4.5);
+  });
+
+  test('placeholders are fully opaque, not the UA default faded grey', () => {
+    expect(rule('::placeholder').get('opacity')).toBe('1');
+  });
+
+  test('every text colour is a text-safe ink token (or black on a white fill)', () => {
+    const allowed = new Set(['var(--ink)', 'var(--ink2)', 'var(--ink3)', 'var(--ink4)', 'var(--bg)', 'inherit', 'currentColor']);
+    const bad = rules().flatMap(r => (r.decls.has('color') && !allowed.has(r.decls.get('color')!) && !/os-glyph/.test(r.selector) ? [`${r.selector}: ${r.decls.get('color')}`] : []));
+    expect(bad).toEqual([]);
+  });
+
+  test('a rule that sets both text and fill tokens pairs them at 4.5:1 or better', () => {
+    for (const r of rules()) {
+      const fg = tokenOf(r.decls.get('color'));
+      const bg = tokenOf(r.decls.get('background') ?? r.decls.get('background-color'));
+      if (fg && bg) expect(contrast(token(fg), token(bg)), r.selector).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  test('nothing that holds text is dimmed with opacity (only entrance animations and the logo light start at 0)', () => {
+    const dimmed = rules().filter(r => {
+      const o = r.decls.get('opacity');
+      return o !== undefined && parseFloat(o) < 1 && !/^(\.rise|\.logo \.lg-c|from|to|\d+%)/.test(r.selector);
+    }).map(r => r.selector);
+    expect(dimmed).toEqual([]);
+  });
+});
+
 describe('fonts', () => {
   test('Geist and Geist Mono are self-hosted with their licence, and nothing loads from another origin', () => {
     const sources = [...css.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/g)].map(m => m[1]);

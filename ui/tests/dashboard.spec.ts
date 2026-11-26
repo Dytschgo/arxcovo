@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { contrastFailures } from './contrast';
 
 // Runs against `vite dev`, so the deterministic stand-in adapter is active.
 // Screenshots land in test-results/screenshots (gitignored) for the PR.
@@ -142,4 +143,70 @@ test('keyboard: skip link and navigation reach every section', async ({ page }) 
     await page.keyboard.press('Enter');
     await expect(page.getByRole('heading', { level: 1, name: heading })).toBeFocused();
   }
+});
+
+test('contrast: every visible text, value and placeholder clears 4.5:1 against what is painted behind it', async ({ page }) => {
+  test.setTimeout(120_000);
+  // Measure settled paint: reduced motion shows every transition's finished
+  // state, so a control caught mid-fade (Cancel turning back into Run) is not
+  // measured halfway.
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  const audit = async (where: string) => {
+    expect.soft(await contrastFailures(page), where).toEqual([]);
+  };
+  await page.goto('/');
+  await expect(page.getByLabel('Password')).toBeFocused();
+  await audit('login');
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await expect(page.getByRole('alert')).toBeVisible();
+  await audit('login error');
+  await page.getByLabel('Password').fill('arxcovo-demo');
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await expect(page.getByRole('list', { name: 'Hosts' })).toBeVisible();
+  await audit('hosts');
+  for (const [hash, ready] of [
+    ['#/hosts/atlas', 'qemu-system-x86_64'],
+    ['#/hosts/pebble', 'No heartbeat for 2 hours'],
+    ['#/vms', '5 of 5 VMs'],
+    ['#/vms/web-static', 'Never (static)'],
+    ['#/vms/ubuntu-arm-03', 'No snapshots yet'],
+    ['#/activity', 'Page 1'],
+    ['#/nowhere', 'Nothing lives at this address.'],
+  ] as const) {
+    await page.goto(`/${hash}`);
+    await expect(page.getByText(ready).first()).toBeVisible();
+    await audit(hash);
+  }
+  await page.goto('/#/activity');
+  await page.getByLabel('Tool').selectOption('list_hosts');
+  await expect(page.getByText('No activity matches these filters')).toBeVisible();
+  await audit('activity, empty filter');
+
+  await page.goto('/#/terminal/atlas');
+  const input = page.getByLabel('Command');
+  await expect(input).toBeEnabled();
+  await expect(input).toHaveAttribute('placeholder', /\S/);
+  await audit('terminal, enabled input showing its placeholder');
+  // The connecting state (disabled input and Run button) is brief, so disable
+  // the controls in the DOM to measure exactly that styling.
+  await page.evaluate(() => document.querySelectorAll('.terminal-input input, .terminal-input button').forEach(el => el.setAttribute('disabled', '')));
+  await expect(input).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Run' })).toBeDisabled();
+  await audit('terminal, disabled input and Run button');
+  await page.goto('/#/hosts'); // hash navigation: a reload would drop the in-memory demo session
+  await page.goto('/#/terminal/atlas');
+  await expect(input).toBeEnabled();
+  await input.fill('git --version');
+  await input.press('Enter');
+  await expect(page.getByRole('log')).toContainText('exit 0');
+  await audit('terminal with output');
+
+  await page.goto('/#/vms/ubuntu-build-02/console');
+  await expect(page.getByText('Console status: streaming')).toBeAttached();
+  await audit('console streaming');
+  await page.getByRole('button', { name: 'Pause' }).click();
+  await audit('console paused');
+  await page.goto('/#/vms/win11-test-04/console');
+  await expect(page.getByText(/is stopped; start it/)).toBeVisible();
+  await audit('console of a stopped VM');
 });

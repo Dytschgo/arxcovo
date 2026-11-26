@@ -276,9 +276,11 @@ main:focus-visible { outline-offset: -4px; }
   cursor: pointer;
 }
 .button:active:not(:disabled) { transform: scale(0.97); }
-.button:disabled, .button-disabled { opacity: 0.45; cursor: not-allowed; }
 .button-primary { background: var(--ink); border-color: var(--ink); color: var(--bg); }
 .button-quiet { border-color: transparent; min-block-size: 32px; padding-inline: 10px; color: var(--ink3); }
+/* Disabled reads as dimmer ink and a dashed outline, never as opacity: fading
+   the whole control took its text below 4.5:1 (4.41 plain, 2.21 primary). */
+.button:disabled, .button.button-disabled { background: none; border-color: var(--line3); border-style: dashed; color: var(--ink4); cursor: not-allowed; }
 @media (prefers-reduced-motion: no-preference) {
   .button { transition: transform 140ms var(--ease), background-color var(--dur-fast), border-color var(--dur-fast); }
 }
@@ -294,6 +296,9 @@ main:focus-visible { outline-offset: -4px; }
   outline: 0;
 }
 .field input:focus-visible, .field select:focus-visible, .terminal-input input:focus-visible { border-color: var(--ink); }
+.field input:disabled, .field select:disabled, .terminal-input input:disabled { border-style: dashed; color: var(--ink4); cursor: not-allowed; }
+/* Chromium's default placeholder (#757575) is 4.25:1 on --tile2; --ink4 is 5.30:1. */
+::placeholder { color: var(--ink4); opacity: 1; }
 .field-inline { flex-direction: row; align-items: center; gap: var(--sp-2); }
 .check { display: inline-flex; align-items: center; gap: 7px; color: var(--ink2); font-size: var(--fs-ui); }
 .check input { inline-size: 1.1rem; block-size: 1.1rem; accent-color: var(--ink); }
