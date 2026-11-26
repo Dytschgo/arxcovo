@@ -33,7 +33,7 @@ fn main() -> std::process::ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).take(4).collect();
     let Some((enrollment, evidence, mode)) = parse_args(&args) else {
         eprintln!(
-            "usage: arx-vm-qualify [--paused-trial | --full-test] ENROLLMENT_JSON EMPTY_EVIDENCE_DIRECTORY"
+            "usage: arx-vm-qualify [--paused-trial | --full-test | --full-docker] ENROLLMENT_JSON EMPTY_EVIDENCE_DIRECTORY"
         );
         eprintln!("{}", failure_line(&frame::RunError::Input));
         return ExitCode::FAILURE;
@@ -62,27 +62,32 @@ enum Mode {
     Baseline,
     Paused,
     Test,
+    Docker,
 }
 
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn parse_args(args: &[std::ffi::OsString]) -> Option<(&str, &str, Mode)> {
-    match args {
-        [enrollment, evidence] if !enrollment.to_str()?.starts_with("--") => {
-            Some((enrollment.to_str()?, evidence.to_str()?, Mode::Baseline))
+    let (enrollment, evidence, mode) = match args {
+        [enrollment, evidence] => (enrollment, evidence, Mode::Baseline),
+        [flag, enrollment, evidence] => {
+            let mode = match flag.to_str()? {
+                "--paused-trial" => Mode::Paused,
+                "--full-test" => Mode::Test,
+                "--full-docker" => Mode::Docker,
+                _ => return None,
+            };
+            (enrollment, evidence, mode)
         }
-        [flag, enrollment, evidence] if flag == "--paused-trial" => {
-            Some((enrollment.to_str()?, evidence.to_str()?, Mode::Paused))
-        }
-        [flag, enrollment, evidence] if flag == "--full-test" => {
-            Some((enrollment.to_str()?, evidence.to_str()?, Mode::Test))
-        }
-        _ => None,
-    }
+        _ => return None,
+    };
+    let (enrollment, evidence) = (enrollment.to_str()?, evidence.to_str()?);
+    (!enrollment.starts_with("--") && !evidence.starts_with("--"))
+        .then_some((enrollment, evidence, mode))
 }
 
 #[cfg(test)]
 #[test]
-fn paused_cli_requires_the_exact_opt_in_and_both_paths() {
+fn qualification_cli_requires_the_exact_opt_in_and_both_paths() {
     for (raw, expected) in [
         (
             vec!["enrollment", "evidence"],
@@ -96,6 +101,19 @@ fn paused_cli_requires_the_exact_opt_in_and_both_paths() {
             vec!["--full-test", "enrollment", "evidence"],
             Some(("enrollment", "evidence", Mode::Test)),
         ),
+        (
+            vec!["--full-docker", "enrollment", "evidence"],
+            Some(("enrollment", "evidence", Mode::Docker)),
+        ),
+        (vec!["--full-docker", "enrollment"], None),
+        (
+            vec!["--full-docker", "enrollment", "evidence", "extra"],
+            None,
+        ),
+        (vec!["--full-docker", "--full-test", "evidence"], None),
+        (vec!["--full-test", "enrollment", "--full-docker"], None),
+        (vec!["enrollment", "--full-docker"], None),
+        (vec!["--FULL-DOCKER", "enrollment", "evidence"], None),
         (vec!["--paused-trial", "enrollment"], None),
         (vec!["--unknown", "enrollment", "evidence"], None),
         (
