@@ -542,6 +542,32 @@ impl BootRecipe<'_> {
         self.plan_with_medium(Some(medium))
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) fn docker_trial_boot(
+        &self,
+        mode: arx_guest::docker_trial::BootMode,
+    ) -> Result<CommandPlan<'_>, InvalidPath> {
+        use arx_guest::docker_trial::{BootMode, FW_CFG};
+        if !matches!(
+            (mode, self.boot),
+            (BootMode::Detached, BootPurpose::DetachedStaticCompose)
+                | (
+                    BootMode::Endpoint,
+                    BootPurpose::InstalledStaticWeb(_, StaticNetwork::PublicEgress(_))
+                )
+        ) || (self.vcpus, self.ram_mib) != (2, 4096)
+            || inspect_header(self.disk_header, None).ok() != Some(32 << 30)
+        {
+            return Err(InvalidPath);
+        }
+        let mut plan = self.plan()?;
+        plan.args.extend([
+            "-fw_cfg".into(),
+            format!("name={FW_CFG},string={}", mode.value()),
+        ]);
+        Ok(plan)
+    }
+
     fn plan_with_medium<'a>(
         &'a self,
         medium: Option<&'a Artifact>,
