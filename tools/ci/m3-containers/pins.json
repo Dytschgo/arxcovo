@@ -5,11 +5,18 @@
     "os": "24.04",
     "profiles": [
       {"image_os": "ubuntu24", "image_version": "20261116.133.1",
-       "kernel": "7.0.0-1014-aws", "systemd_package": "255.4-1ubuntu8.18"},
+       "variants": [
+         {"kernel": "7.0.0-1014-aws", "systemd_package": "255.4-1ubuntu8.18"}
+       ]},
       {"image_os": "ubuntu24", "image_version": "20261116.376.1",
-       "kernel": "7.0.0-1017-azure", "systemd_package": "255.4-1ubuntu8.18"},
+       "variants": [
+         {"kernel": "7.0.0-1017-azure", "systemd_package": "255.4-1ubuntu8.18"}
+       ]},
       {"image_os": "ubuntu24", "image_version": "20261122.23.1",
-       "kernel": "7.0.0-1018-aws", "systemd_package": "255.4-1ubuntu8.19"}
+       "variants": [
+         {"kernel": "7.0.0-1018-aws", "systemd_package": "255.4-1ubuntu8.19"},
+         {"kernel": "7.0.0-1020-azure", "systemd_package": "255.4-1ubuntu8.19"}
+       ]}
     ],
     "rust": "1.95.0-x86_64-unknown-linux-gnu",
     "parent": "/var/lib",
