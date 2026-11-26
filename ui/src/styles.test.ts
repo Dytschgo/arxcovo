@@ -1,0 +1,76 @@
+// Guards for the Night Orbit stylesheet: text contrast, self-hosted fonts,
+// dark only, and the reduced-motion finished state.
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, test } from 'vitest';
+
+// Paths are joined by hand: Vite rewrites `new URL(..., import.meta.url)` into asset URLs.
+const here = dirname(fileURLToPath(import.meta.url));
+const read = (rel: string) => readFileSync(join(here, rel), 'utf8');
+const css = read('./styles.css');
+const html = read('../index.html');
+
+function token(name: string): string {
+  const match = css.match(new RegExp(`--${name}:\\s*(#[0-9a-fA-F]{3,6})\\s*;`));
+  if (!match) throw new Error(`token --${name} missing`);
+  return match[1];
+}
+
+function luminance(hex: string): number {
+  const h = hex.length === 4 ? hex.slice(1).split('').map(c => c + c).join('') : hex.slice(1);
+  const [r, g, b] = [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16) / 255)
+    .map(c => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function contrast(a: string, b: string): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+describe('Night Orbit tokens', () => {
+  test.each(['ink', 'ink2', 'ink3', 'ink4'])('--%s clears 4.5:1 on every surface text sits on', ink => {
+    for (const surface of ['bg', 'tile', 'tile2', 'raise']) {
+      expect(contrast(token(ink), token(surface)), `--${ink} on --${surface}`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  test('the decoration grey is not text-safe, so it stays decoration only', () => {
+    expect(contrast(token('deco'), token('bg'))).toBeLessThan(4.5);
+    expect(css).not.toMatch(/(?:^|[;{\s])color:\s*var\(--deco\)/m);
+  });
+});
+
+describe('fonts', () => {
+  test('Geist and Geist Mono are self-hosted with their licence, and nothing loads from another origin', () => {
+    const sources = [...css.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/g)].map(m => m[1]);
+    expect(sources).toEqual(['/fonts/Geist-Variable.woff2', '/fonts/GeistMono-Variable.woff2']);
+    for (const file of ['Geist-Variable.woff2', 'GeistMono-Variable.woff2', 'OFL-LICENSE.txt']) {
+      expect(existsSync(join(here, '../public/fonts', file)), file).toBe(true);
+    }
+    expect(read('../public/fonts/OFL-LICENSE.txt')).toContain('SIL Open Font License, Version 1.1');
+    expect(css).not.toMatch(/@import|https?:\/\//);
+    expect(html).not.toMatch(/https?:\/\/(?!www\.w3\.org)/);
+    expect(css).toMatch(/--font:\s*"Geist"/);
+    expect(css).toMatch(/--mono:\s*"Geist Mono"/);
+  });
+});
+
+describe('dark only', () => {
+  test('there is no light scheme, theme attribute or scheme query', () => {
+    expect(css).toMatch(/:root\s*{[^}]*color-scheme:\s*dark;/);
+    expect(css).not.toMatch(/light-dark\(|prefers-color-scheme|data-theme|color-scheme:\s*light/);
+    expect(html).toContain('<meta name="color-scheme" content="dark">');
+  });
+});
+
+describe('motion', () => {
+  test('reduced motion shows the finished state', () => {
+    const reduce = css.slice(css.indexOf('@media (prefers-reduced-motion: reduce)'));
+    expect(reduce).toMatch(/animation-duration:\s*\.01ms\s*!important/);
+    expect(reduce).toMatch(/animation-delay:\s*0ms\s*!important/);
+    expect(reduce).toMatch(/transition-duration:\s*\.01ms\s*!important/);
+    expect(reduce).toMatch(/\.rise\s*{\s*opacity:\s*1;\s*transform:\s*none;\s*}/);
+  });
+});

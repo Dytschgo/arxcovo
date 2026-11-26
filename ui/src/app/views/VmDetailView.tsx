@@ -1,7 +1,7 @@
 import { useResource } from '../context';
 import { OS_LABEL, formatBytes, formatDate, incompatibility } from '../format';
 import { href } from '../router';
-import { ArchBadge, Empty, Facts, Loaded, Page, Pill, StatePill } from '../ui';
+import { ArchBadge, Empty, Facts, Loaded, Page, Pill, VmStatus } from '../ui';
 import { expiryLabel } from './VmsView';
 
 export function VmDetailView({ id }: { id: string }) {
@@ -18,7 +18,7 @@ export function VmDetailView({ id }: { id: string }) {
           return (
             <div className="detail">
               <div className="detail-badges">
-                <StatePill value={vm.state} />
+                <VmStatus state={vm.state} />
                 <ArchBadge arch={vm.arch} />
                 <Pill tone={vm.ready ? 'ok' : 'warn'}>{vm.ready ? 'guest ready' : 'guest not ready'}</Pill>
                 <Pill tone="muted">{vm.kind === 'static' ? 'static VM' : 'test VM'}</Pill>

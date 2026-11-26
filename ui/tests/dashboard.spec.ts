@@ -13,7 +13,10 @@ async function signIn(page: Page, hash = '#/hosts') {
 
 const shot = (page: Page, name: string) => page.screenshot({ path: `${SHOTS}/${name}.png`, fullPage: true });
 
-test.use({ viewport: { width: 1280, height: 800 }, colorScheme: 'light' });
+// Night Orbit is dark only (no light scheme, no theme switch).
+test.use({ viewport: { width: 1280, height: 800 } });
+
+const overflowX = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
 
 test('login: demo banner, wrong password, keyboard sign-in', async ({ page }) => {
   await page.goto('/');
@@ -36,6 +39,7 @@ test('hosts: cards with arch badges and reachability', async ({ page }) => {
   await expect(cards.filter({ hasText: 'harbor' }).getByTitle('Machine architecture: arm64')).toBeVisible();
   await expect(cards.filter({ hasText: 'pebble' })).toContainText('No heartbeat for 2 hours');
   await expect(page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Hosts' })).toHaveAttribute('aria-current', 'page');
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
   await shot(page, '02-hosts');
 });
 
@@ -116,13 +120,11 @@ test('console: streams frames of a running VM', async ({ page }) => {
   await expect(page.getByText('Console status: paused')).toBeVisible();
 });
 
-test('responsive and dark: narrow layout and dark theme stay usable', async ({ page }) => {
+test('responsive: the narrow layout stays usable without page overflow', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.emulateMedia({ colorScheme: 'dark' });
   await signIn(page);
   await expect(page.getByRole('list', { name: 'Hosts' }).getByRole('listitem')).toHaveCount(4);
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
-  expect(overflow).toBeLessThanOrEqual(0);
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
   await shot(page, '09-hosts-mobile-dark');
   await page.getByRole('link', { name: 'VMs' }).click();
   await expect(page.getByRole('table')).toBeVisible();

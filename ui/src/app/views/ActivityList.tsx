@@ -1,7 +1,7 @@
 import type { ActivityEntry } from '../../api/types';
 import { formatDate } from '../format';
 import { href } from '../router';
-import { Pill, StatePill } from '../ui';
+import { OutcomeStatus, Pill } from '../ui';
 
 export function ActivityList({ entries, label }: { entries: ActivityEntry[]; label: string }) {
   return (
@@ -20,7 +20,7 @@ export function ActivityList({ entries, label }: { entries: ActivityEntry[]; lab
             {e.vmId ? <a href={href({ name: 'vm', id: e.vmId })}>{e.vmId}</a> : null}
             <time dateTime={e.startedAt ?? undefined}>{formatDate(e.startedAt)}</time>
             {e.exitCode !== null ? <span>exit {e.exitCode}</span> : null}
-            <StatePill value={e.outcome} />
+            <OutcomeStatus outcome={e.outcome} />
           </div>
         </li>
       ))}

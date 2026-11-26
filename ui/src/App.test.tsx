@@ -284,14 +284,20 @@ describe('shell', () => {
     expect(await screen.findByRole('heading', { level: 1, name: 'Page not found' })).toBeTruthy();
   });
 
-  test('the theme toggle cycles system, light and dark on the root element', async () => {
-    await signIn();
-    const toggle = await screen.findByRole('button', { name: /^Theme: system/ });
-    fireEvent.click(toggle);
-    expect(document.documentElement.dataset.theme).toBe('light');
-    fireEvent.click(screen.getByRole('button', { name: /^Theme: light/ }));
-    expect(document.documentElement.dataset.theme).toBe('dark');
-    fireEvent.click(screen.getByRole('button', { name: /^Theme: dark/ }));
+  test('the top bar shows the logo, labels every section and only the current one shows its word; there is no theme control', async () => {
+    await signIn({}, '#/activity');
+    await screen.findByRole('list', { name: 'Activity, page 1' });
+    const home = screen.getByRole('link', { name: 'Arxcovo home' });
+    expect(home.querySelector('svg.logo')).toBeTruthy();
+    const nav = screen.getByRole('navigation', { name: 'Main' });
+    for (const name of ['Hosts', 'VMs', 'Activity', 'Terminal']) {
+      const link = within(nav).getByRole('link', { name });
+      const word = within(link).getByText(name);
+      expect(link.querySelector('svg.i')).toBeTruthy();
+      expect(word.className).toBe(name === 'Activity' ? 'nav-word' : 'visually-hidden');
+    }
+    expect(screen.getByText('Signed in as').parentElement!.textContent).toBe('Signed in as owner');
+    expect(screen.queryByRole('button', { name: /theme/i })).toBeNull();
     expect(document.documentElement.dataset.theme).toBeUndefined();
   });
 });

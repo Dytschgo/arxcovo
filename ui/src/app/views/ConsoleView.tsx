@@ -3,7 +3,7 @@ import { isApiError, type ConsoleStatus, type Vm } from '../../api/types';
 import { useApi, useResource, useSession } from '../context';
 import { formatDate } from '../format';
 import { href } from '../router';
-import { ArchBadge, Loaded, Page, Pill, StatePill, type Tone } from '../ui';
+import { ArchBadge, Loaded, Page, Pill, VmStatus, type Tone } from '../ui';
 
 const TONE: Record<ConsoleStatus, Tone> = { connecting: 'info', streaming: 'ok', closed: 'muted', error: 'bad' };
 
@@ -71,7 +71,7 @@ function Viewer({ vm }: { vm: Vm }) {
     <div className="console">
       <div className="terminal-status">
         <Pill tone={paused ? 'muted' : TONE[status]}><span className="visually-hidden">Console status: </span>{paused ? 'paused' : status}</Pill>
-        <StatePill value={vm.state} />
+        <VmStatus state={vm.state} />
         <ArchBadge arch={vm.arch} />
         <span className="console-mode">View only</span>
         <span className="spacer" />
