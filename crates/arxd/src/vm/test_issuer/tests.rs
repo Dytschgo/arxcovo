@@ -788,6 +788,28 @@ fn script_permit_binds_bytes_timeout_and_writer_epoch() {
         let consumed = permit.consume(generation, epoch, script, timeout);
         assert_eq!(consumed.is_ok(), accepted);
     }
+    // A finished script cannot mint, though its VM, generation and writer
+    // epoch all stay live: only the operation's own status differs.
+    let fixture = Fixture::new();
+    let issuer = fixture.issuer();
+    let (worker, operation) = fixture.script();
+    fixture
+        .ctl
+        .finish_script(&worker, crate::vm::ScriptResult::Exited(0))
+        .unwrap();
+    assert!(
+        issuer
+            .intent(
+                &worker,
+                NativeEffect {
+                    operation,
+                    ..effect
+                },
+                &fixture.cancel
+            )
+            .is_err()
+    );
+
     // A writer epoch the stop path already released cannot run a script.
     let fixture = Fixture::new();
     let issuer = fixture.issuer();

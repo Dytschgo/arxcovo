@@ -65,6 +65,10 @@ struct RawTestQualification {
 /// The configured TEST selection. Configuration alone grants no effect: the
 /// issuer's closed installation boundary decides whether it is ever read.
 #[derive(Clone)]
+#[cfg_attr(
+    not(all(windows, target_arch = "x86_64")),
+    allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
+)]
 pub(crate) struct TestQualificationSelection {
     pub(crate) enrollment: crate::vm::paths::LocalPath,
     pub(crate) dossier: crate::vm::paths::LocalPath,

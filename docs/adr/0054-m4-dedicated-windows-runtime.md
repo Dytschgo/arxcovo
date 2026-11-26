@@ -1528,3 +1528,54 @@ unidentified leaf. The chunk 04 start refusal keeps its original lease. The
 binding it carries is this durable scope. Production TEST admission stays
 closed. Native creation and reconciliation are **unverified on real
 hardware**.
+
+## 7c amendment — explicit TEST opt-in, one permit per durable effect
+
+The VM runtime profile gains two optional fields. `execution_profile`
+defaults to `dedicated_account`, so a profile written before this
+amendment keeps its dedicated-account meaning and its two distinct local
+SIDs. `current_user` pins one canonical user SID for both roles; the
+native reader still checks it against the live non-elevated primary
+token. `test_qualification` is the explicit TEST opt-in. It requires an
+enabled `current_user` profile and names the private enrollment file, the
+dossier directory, the lowercase seal digest and the scope, with no
+overlap between the two paths and no unknown field. Any other shape
+refuses the whole profile. The general ADR 0029 host-account default is
+unchanged here.
+
+The issuer opens only when the held dossier's seal digest, scope, TEST
+class and recipe pair match that configuration exactly. The Windows
+recipe must be the built-in catalog ID and the Ubuntu recipe must differ
+from it and from the web entry. It then takes its first selection-epoch
+observation through the typed freshness and high-water reads. The catalog
+reports the exact seal digest and both recipe pins after a fresh
+observation and before any owner-idle wait.
+
+An intent follows durable admission. It needs the worker's own pending
+operation for the exact principal, request, action and operation, before
+the worker deadline. Its non-static target generation must be owned by
+that operation: a pending build intent, a staging clone, or an active
+generation whose unresolved writer epoch matches. Each worker mints one
+intent, and a replay receives no worker, so it mints nothing. Each launch,
+staged write and guest-script permit names one durable effect, and an
+intent mints one permit per effect. A launch binds the whole sealed plan,
+inputs, working directory, pair, installer phase and deadline, recipe and
+limits. A staged write binds its slot, content pin, recipe phase and
+deadline. A script binds its exact bytes, timeout, generation and writer
+epoch. Consumption refuses any substitution, then rechecks cancellation,
+the ledger admission, the deadline and a fresh epoch observation before
+the authority exists. A transient refusal refuses only that effect, and
+confirmed drift revokes the epoch's effect authority.
+
+Recovery authority is separate. It needs the exact bound native workspace
+scope of a non-static generation and its unresolved writer epoch, not a
+fresh selection, so a revoked or absent epoch cannot strand recovery. It
+never converts into launch authority.
+
+`LaunchAuthority` stays uninhabited off Windows x64. On Windows x64 only
+the issuer's private token constructs it, and only a fixture holds the
+installation that opens the issuer or mints recovery authority. The
+production installation lands with activation in 7c 16, so configured
+input cannot reach an effect and production TEST admission stays closed.
+Static, Compose and public-egress dispatch never receive this authority.
+Native issuance is **unverified on real hardware**.
