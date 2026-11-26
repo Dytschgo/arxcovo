@@ -26,7 +26,7 @@ use super::{
     qemu_args::{CommandPlan, PlanKind},
     qualification::{
         ForegroundQualification, LaunchPermit, LaunchPermitBinding, LaunchTarget, StageTarget,
-        WorkspaceBinding, recipe_selected,
+        WorkspaceBinding, recipe_selected, stage_supported,
     },
     qualification_record::{Class, Hash, RecipeIdentity, TestRecipes, digest},
     runtime::{
@@ -392,6 +392,7 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         target: LaunchTarget<'_, '_>,
     ) -> Result<Permit<'_, S, C>, NativeRefusal> {
         let expected = EffectPlan::from_target(&target)?;
+        let binding = target.binding(workspace, self.issuer.seal_sha256)?;
         let slots = launch_slots(self.effect, expected.kind, target.pair, target.helper)?;
         check_installer(expected.kind, expected.installer)?;
         let expected_epoch = self.target.writer_epoch.unwrap_or(self.target.generation);
@@ -419,11 +420,7 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         self.mint(effect, &slots)?;
         Ok(Permit {
             intent: self,
-            binding: LaunchPermitBinding {
-                workspace,
-                seal_sha256: self.issuer.seal_sha256,
-                kind: expected.kind,
-            },
+            binding,
             expected,
             slots,
         })
@@ -433,6 +430,7 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         if target.workspace.generation != self.target.generation
             || target.slot.generation != self.target.generation
             || target.seal_sha256 != self.issuer.seal_sha256
+            || !stage_supported(target.slot, target.phase)
             || self.build_recipe() != Some(target.recipe)
             || !recipe_selected(target.recipe, Some(target.phase), self.issuer.recipes)
             || Instant::now() >= target.deadline
@@ -443,7 +441,9 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
     }
 
     /// One staged write of exactly this content into this slot, for the
-    /// admitted build's recipe and phase.
+    /// admitted build's recipe and phase. Only the staging slots (seed and
+    /// VARS) in a staging phase qualify; the guest disk and Windows
+    /// finalization never do.
     pub(crate) fn stage(
         &self,
         target: StageTarget,

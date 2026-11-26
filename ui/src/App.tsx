@@ -2,8 +2,9 @@ import { useEffect, useRef } from 'react';
 import type { ArxApi } from './api/types';
 import { AppProviders, useApi, useSession } from './app/context';
 import { href, useRoute, type Route } from './app/router';
-import { NEXT_THEME, useTheme } from './app/theme';
-import { Empty, Loading, Page, ViewBoundary } from './app/ui';
+import { Icon, Logo, type IconName } from './app/icons';
+import { Search } from './app/Search';
+import { Loading, Page, ViewBoundary } from './app/ui';
 import { ActivityView } from './app/views/ActivityView';
 import { ConsoleView } from './app/views/ConsoleView';
 import { HostDetailView } from './app/views/HostDetailView';
@@ -13,11 +14,14 @@ import { TerminalView } from './app/views/TerminalView';
 import { VmDetailView } from './app/views/VmDetailView';
 import { VmsView } from './app/views/VmsView';
 
-const NAV: { label: string; route: Route; matches: Route['name'][] }[] = [
-  { label: 'Hosts', route: { name: 'hosts' }, matches: ['hosts', 'host'] },
-  { label: 'VMs', route: { name: 'vms' }, matches: ['vms', 'vm', 'console'] },
-  { label: 'Activity', route: { name: 'activity' }, matches: ['activity'] },
-  { label: 'Terminal', route: { name: 'terminal', hostId: null }, matches: ['terminal'] },
+// Night Orbit top bar (docs/design/night-orbit/_shell.html): icon nav where
+// only the current section shows its word; the others keep it for assistive
+// technology. Dark only, so there is no theme control.
+const NAV: { label: string; icon: IconName; route: Route; matches: Route['name'][] }[] = [
+  { label: 'Hosts', icon: 'hosts', route: { name: 'hosts' }, matches: ['hosts', 'host'] },
+  { label: 'VMs', icon: 'vm', route: { name: 'vms' }, matches: ['vms', 'vm', 'console'] },
+  { label: 'Activity', icon: 'act', route: { name: 'activity' }, matches: ['activity'] },
+  { label: 'Terminal', icon: 'term', route: { name: 'terminal', hostId: null }, matches: ['terminal'] },
 ];
 
 export function DemoBanner() {
@@ -41,7 +45,12 @@ function View({ route }: { route: Route }) {
     case 'not_found':
       return (
         <Page title="Page not found">
-          <Empty title="Nothing lives at this address."><a href={href({ name: 'hosts' })}>Go to hosts</a></Empty>
+          <div className="calm">
+            <Icon name="search" />
+            <p className="calm-title">Nothing lives at this address.</p>
+            <p>Check the link, or use the search to jump to a host, VM or tool.</p>
+            <a className="button" href={href({ name: 'hosts' })}><Icon name="back" />Go to hosts</a>
+          </div>
         </Page>
       );
   }
@@ -51,44 +60,39 @@ function Shell() {
   const api = useApi();
   const { state, logout, logoutError } = useSession();
   const route = useRoute();
-  const [theme, setTheme] = useTheme();
   const main = useRef<HTMLElement>(null);
 
   useEffect(() => {
     if (state.status === 'authenticated' && route.name === 'login') window.location.replace(href({ name: 'hosts' }));
   }, [state.status, route.name]);
 
-  const themeToggle = (
-    <button type="button" className="button button-quiet theme-toggle" onClick={() => setTheme(NEXT_THEME[theme])} aria-label={`Theme: ${theme}. Switch to ${NEXT_THEME[theme]}`}>
-      <span aria-hidden="true">{theme === 'dark' ? '☾' : theme === 'light' ? '☀' : '◐'}</span>
-      <span className="theme-label">{theme}</span>
-    </button>
-  );
-
   let body;
   if (state.status === 'checking') body = <div className="login"><Loading label="Checking your session…" /></div>;
   else if (state.status === 'anonymous') body = <LoginView notice={state.notice} error={state.error} />;
   else {
     body = (
-      <div className="frame">
-        <nav className="sidebar" aria-label="Main">
-          <a className="brand" href={href({ name: 'hosts' })}><span className="brand-mark" aria-hidden="true" />Arxcovo</a>
-          <ul className="nav">
+      <div className="shell">
+        <header className="top">
+          <a className="brand" href={href({ name: 'hosts' })} aria-label="Arxcovo home"><Logo />arxcovo</a>
+          <nav className="nav" aria-label="Main">
             {NAV.map(item => {
               const current = item.matches.includes(route.name);
               return (
-                <li key={item.label}>
-                  <a href={href(item.route)} aria-current={current ? 'page' : undefined}>{item.label}</a>
-                </li>
+                <a key={item.label} href={href(item.route)} aria-current={current ? 'page' : undefined} title={current ? undefined : item.label}>
+                  <Icon name={item.icon} />
+                  <span className={current ? 'nav-word' : 'visually-hidden'}>{item.label}</span>
+                </a>
               );
             })}
-          </ul>
-          <div className="sidebar-foot">
-            {themeToggle}
-            <span className="user" title="Signed in">{state.session.user.name}</span>
-            <button type="button" className="button button-quiet" onClick={() => void logout()}>Sign out</button>
-          </div>
-        </nav>
+          </nav>
+          <span className="spacer" />
+          <Search />
+          <span className="me" title="Signed in"><span className="visually-hidden">Signed in as </span>{state.session.user.name}</span>
+          <button type="button" className="signout" onClick={() => void logout()} title="Sign out">
+            <Icon name="signout" />
+            <span className="visually-hidden">Sign out</span>
+          </button>
+        </header>
         <main id="main" ref={main} tabIndex={-1}>
           {logoutError ? (
             <div className="banner-error" role="alert">

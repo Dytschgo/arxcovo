@@ -1917,23 +1917,34 @@ boot), a Mutate plan's identified helper slot, and none for an
 inspection. It mints one permit per identity. A launch permit binds the
 whole sealed plan, writer epoch, inputs, working directory, pair, helper
 slot, installer phase and deadline, recipe and limits. A staged-write
-permit binds its slot, content pin, recipe phase and deadline. A script
+permit binds its slot, content pin, recipe phase and deadline, and only
+the build's seed or VARS slot in a staging phase qualifies: the guest
+disk and Windows finalization are refused when the permit is issued, and
+the whole target is compared again when it is consumed. A script
 permit binds its bytes, timeout, generation and writer epoch. Consumption
 refuses any substitution. It then checks cancellation, the ledger
 admission and the deadline, takes a fresh epoch observation, and checks
 all three again. Only then does it issue the effect's own authority,
 within that observation's freshness. Launch, staged-write and script
 authorities are distinct immutable types with private fields, and the
-launch authority carries its issuance binding. A transient refusal
+launch authority carries its full issuance binding: workspace, seal, plan
+kind, writer epoch, exact pair or helper slot, and a digest of the exact
+plan, working directory, installer stage, recipe and limits. The checked
+launch adapter recomputes that binding from its own target and refuses an
+authority issued for any other target. A transient refusal
 refuses only that effect, and confirmed drift revokes the epoch's effect
 authority.
 
 Recovery authority is separate. It needs the exact bound native workspace
 scope of a non-static generation, not a fresh selection, so a revoked or
 absent epoch cannot strand recovery. A generation with writer history
-needs its exact unresolved writer epoch. Only a staged generation that
-never had one recovers without an epoch. Recovery authority never
-converts into an effect authority.
+needs its exact writer epoch: its unresolved release epoch, or, for
+staged work whose checked creation edge recorded the boot and store file
+pins in `vm_native_writer`, the generation's own epoch. Only positive
+proof of an untouched reservation, the v17 reservation row with no
+recorded origin and no release row, recovers without an epoch; a missing
+reservation row proves nothing. Recovery authority never converts into
+an effect authority.
 
 `LaunchAuthority` stays uninhabited off Windows x64. On Windows x64 only
 the issuer's private token constructs it or the other effect authorities,

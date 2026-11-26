@@ -263,8 +263,47 @@ fn consumed_permit_requires_the_exact_seal_generation_workspace_and_kind() {
         workspace,
         seal_sha256: [7; 32],
         kind: PlanKind::Boot,
+        writer_epoch: [5; 16],
+        pair: None,
+        helper: None,
+        plan_sha256: [6; 32],
     };
     assert_eq!(check_permit(permit, permit), Ok(()));
+    let slot = ArtifactSlot {
+        generation: workspace.generation,
+        role: "disk",
+        key: [8; 16],
+    };
+    for changed in [
+        LaunchPermitBinding {
+            writer_epoch: [9; 16],
+            ..permit
+        },
+        LaunchPermitBinding {
+            pair: Some(PairSlots {
+                disk: slot,
+                vars: ArtifactSlot {
+                    role: "vars",
+                    key: [9; 16],
+                    ..slot
+                },
+            }),
+            ..permit
+        },
+        LaunchPermitBinding {
+            helper: Some(slot),
+            ..permit
+        },
+        LaunchPermitBinding {
+            plan_sha256: [9; 32],
+            ..permit
+        },
+    ] {
+        assert_eq!(
+            check_permit(permit, changed),
+            Err(NativeRefusal::QualificationMissing)
+        );
+    }
     for changed in [
         WorkspaceBinding {
             generation: [4; 16],

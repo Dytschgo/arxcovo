@@ -2936,8 +2936,12 @@ impl<C: Clock> VmController<C> {
 
     /// Recovery needs exact durable TEST custody, not a fresh selection: the
     /// bound native workspace scope of a non-static generation. A generation
-    /// with writer history needs its exact unresolved writer epoch. Only a
-    /// staged generation that never had a writer epoch recovers without one.
+    /// with writer history needs its exact writer epoch: an unresolved
+    /// release epoch, or for staged work the generation's own epoch once the
+    /// checked creation edge recorded its boot and file pins. Only positive
+    /// proof of an untouched reservation (the v17 reservation row with no
+    /// recorded origin, and no release row) recovers without an epoch; a
+    /// missing reservation row proves nothing.
     pub(crate) fn native_recovery_bound(
         &self,
         scope: store::native::Scope,
@@ -2948,11 +2952,18 @@ impl<C: Clock> VmController<C> {
                 && store::count(
                     db,
                     "SELECT count(*) FROM vm_generations g
+                     LEFT JOIN vm_native_writer w ON w.generation=g.id
                      WHERE g.id=?1 AND g.static_id IS NULL AND CASE WHEN ?2 IS NULL THEN
                          g.active=0 AND NOT EXISTS(SELECT 1 FROM vm_snapshot_release r
                              WHERE r.generation=g.id)
+                         AND w.epoch=g.id AND w.boot IS NULL AND w.database_file IS NULL
+                         AND w.lock_file IS NULL
                      ELSE EXISTS(SELECT 1 FROM vm_snapshot_release r
-                         WHERE r.generation=g.id AND r.epoch=?2 AND r.disposition IS NULL) END",
+                         WHERE r.generation=g.id AND r.epoch=?2 AND r.disposition IS NULL)
+                         OR (g.active=0 AND ?2=g.id AND NOT EXISTS(SELECT 1
+                             FROM vm_snapshot_release r WHERE r.generation=g.id)
+                             AND w.epoch=?2 AND w.protocol=1 AND w.boot IS NOT NULL
+                             AND w.database_file IS NOT NULL AND w.lock_file IS NOT NULL) END",
                     params![scope.generation, writer_epoch],
                 )? == 1)
         })

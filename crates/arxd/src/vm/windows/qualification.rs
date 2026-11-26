@@ -22,6 +22,8 @@ mod network;
 pub(in crate::vm) use network::Targets as WitnessTargets;
 mod paused;
 mod production;
+#[cfg(test)]
+pub(crate) use production::consume_checked;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use production::{
     FinalizedPair, GenerationGuards, HeldStartRefusal, HelperSettlement, InstallerSettlement,
@@ -33,7 +35,7 @@ mod recipe;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use recipe::{
     BootReservation, InstallerReservation, QualifiedBoot, QualifiedBootPlan, StageTarget,
-    StagedInstaller, recipe_selected,
+    StagedInstaller, recipe_selected, stage_supported,
 };
 mod schema;
 mod sink;
