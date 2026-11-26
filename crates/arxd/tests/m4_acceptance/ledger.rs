@@ -2316,6 +2316,20 @@ fn native_inventory_refuses_every_invalid_or_busy_lease_substitution() {
     restore_private_acl(&ubuntu.lease);
     expected_ok();
 
+    // 4b. Nonprivate ACL on the generation directory itself (non-inheriting
+    // grant so ubuntu.lease stays private and only generation_directory_acl trips).
+    run_icacls(&[
+        ubuntu.dir.as_os_str(),
+        std::ffi::OsStr::new("/grant"),
+        std::ffi::OsStr::new("*S-1-1-0:(R)"),
+    ]);
+    assert_eq!(
+        Ledger::preflight(&state, recipes),
+        Err(Failure::Check("generation_directory_acl"))
+    );
+    restore_private_acl(&ubuntu.dir);
+    expected_ok();
+
     // 5. Populated (non-zero length) lease keeping the exact same file ID and ACL.
     {
         let mut f = OpenOptions::new().write(true).open(&ubuntu.lease).unwrap();

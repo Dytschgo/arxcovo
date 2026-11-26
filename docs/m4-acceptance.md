@@ -40,14 +40,15 @@ expiry checks.
 Historic golden rows upgraded from pre-7c schemas have no
 `vm_native_generations` or `vm_native_slots` custody rows and no
 `generation.lease`. The acceptance reader explicitly separates historic rows
-from native custody: they can be observed read-only only under the historic
-contract, can never supply native TEST eligibility, and are never bound
-silently. To move a host with historic goldens onto native 7c custody, perform
-a checked rebuild or re-enrollment: stop the foreground cleanly, archive or
-remove the historic state directory outside the enrolled root, enroll a fresh
-private store directory on D: (or clear the historic rows and media into a
-clean v16 store), verify startup preflight against the enrolled store pins,
-and rebuild both qualified TEST goldens under native custody.
+from native custody: they can be observed read-only only through the
+test-only historic reader (`observe_historic_preflight` in
+`crates/arxd/tests/m4_acceptance/ledger.rs`), can never supply native TEST
+eligibility, and are never bound silently. To move a host with historic
+goldens onto native 7c custody, perform a checked rebuild or re-enrollment:
+stop the foreground cleanly, archive or remove the historic state directory
+outside the enrolled root, enroll a fresh private store directory on D:,
+verify startup preflight against the enrolled store pins, and rebuild both
+qualified TEST goldens under native custody.
 
 Prepare an owner-private JSON plan on D:. The qualification digest is an expected
 pin. The client records a digest only after an authenticated daemon receipt

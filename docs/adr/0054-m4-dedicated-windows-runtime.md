@@ -1615,9 +1615,10 @@ the public MCP surface:
   handle, paired with the existing claim and reconciliation/expiry checks.
 - **Historic row discrimination.** Pre-7c golden rows without
   `vm_native_generations` / `vm_native_slots` rows and `generation.lease` are
-  explicitly separated from native custody. They may be inspected read-only
-  only under the historic observation contract, cannot satisfy native preflight
-  or acceptance eligibility, and are never bound silently. Moving onto native
+  explicitly separated from native custody. Read-only historic observation
+  exists only in tests (`observe_historic_preflight` in
+  `crates/arxd/tests/m4_acceptance/ledger.rs`), cannot satisfy native preflight
+  or acceptance eligibility, and never binds silently. Moving onto native
   custody requires a checked rebuild or re-enrollment into a clean enrolled v16
   store as documented in [M4 owner-host acceptance](../m4-acceptance.md).
   Production TEST admission stays closed and the physical owner-host journey
