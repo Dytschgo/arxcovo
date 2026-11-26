@@ -159,6 +159,10 @@ token.
 - `reachability`: `online | degraded | offline`; `reachabilityReason` is a
   short explanation when not online (for example the owner reserve is active).
 - `usedPercent`, `usedBytes`, `capBytes` are `null` when unknown or unset.
+  Host telemetry never fails the host record: before arxd has its first
+  CPU and memory sample, and after its sampler fails, `usedPercent` and
+  `usedBytes` are `null` and the rest of the record is served. Before any
+  sample `cpu.model` is `""` and `cores` is the available parallelism.
 - `tools` (≤ 128) is the `discover_tools` result for that host.
 - `mode`: `always_on | opportunistic`. `agentRights`: `standard | admin`.
 
