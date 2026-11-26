@@ -1,8 +1,9 @@
-//! Exact stock bundle inventory. Existing entries are pinned by relative
+//! Exact reviewed bundle inventory. Existing entries are pinned by relative
 //! opens with read-only sharing. Directory ACLs supply namespace protection
 //! against new entries for the paused trial.
 
 use super::*;
+use crate::vm::public_egress::{REVIEWED_EGRESS_BUILDS, ReviewedEgressBuild};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -10,9 +11,7 @@ use std::{
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 
-const MANIFEST_BYTES: usize = 11_915;
-const RECEIPT_BYTES: usize = 7_438;
-const PAYLOAD_ENTRIES: usize = 136;
+const PAYLOAD_ENTRIES: usize = crate::vm::qemu_distribution::STOCK.payload_files;
 const MAX_MANIFEST_BYTES: usize = 32_768;
 const MAX_PAYLOAD_FILE: u64 = 512 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
@@ -284,11 +283,20 @@ impl Bundle {
         manifest: &[u8],
         count: usize,
         deadline: Instant,
+        roles: &[(&str, ArtifactPin)],
     ) -> Result<u64, NativeRefusal> {
-        use crate::vm::public_egress::STOCK_QEMU_1113;
-
+        let entries = parse_manifest(manifest, count).ok_or(REFUSAL)?;
+        // A role must exist under its exact spelling even if all other
+        // payload entries have valid hashes.
+        if roles.iter().any(|&(role, pin)| {
+            !entries
+                .iter()
+                .any(|&(name, hash)| name == role && hash == pin.sha256)
+        }) {
+            return Err(REFUSAL);
+        }
         let mut total = 0u64;
-        for (name, expected) in parse_manifest(manifest, count).ok_or(REFUSAL)? {
+        for (name, expected) in entries {
             timely(deadline)?;
             let mut file = self.add_file(name)?;
             let size = file.metadata().map_err(|_| REFUSAL)?.len();
@@ -296,9 +304,9 @@ impl Bundle {
                 .checked_add(size)
                 .filter(|total| *total <= MAX_PAYLOAD_BYTES && size <= MAX_PAYLOAD_FILE)
                 .ok_or(REFUSAL)?;
-            if (name == "qemu-system-x86_64.exe"
-                && (size != STOCK_QEMU_1113.size || expected != STOCK_QEMU_1113.sha256))
-                || (name == "qemu-img.exe" && size != 2_520_350)
+            if roles
+                .iter()
+                .any(|&(role, pin)| name == role && size != pin.size)
             {
                 return Err(REFUSAL);
             }
@@ -344,32 +352,81 @@ impl Read for BoundedFile<'_> {
 pub(in crate::vm::windows) fn collect(
     root: &LocalPath,
 ) -> Result<(Distribution, Bundle), NativeRefusal> {
-    use crate::vm::public_egress::STOCK_RECEIPT_1113_SHA256;
+    use crate::vm::qemu_distribution::STOCK;
 
+    collect_exact(
+        root,
+        STOCK.manifest,
+        STOCK.receipt,
+        STOCK.payload_files,
+        &[
+            ("qemu-system-x86_64.exe", STOCK.system),
+            ("qemu-img.exe", STOCK.image),
+        ],
+    )
+}
+
+/// A separate read-only inventory lane. Stock trial callers continue to use
+/// `collect`; the patched proof grants no launch or TEST authority.
+pub(super) struct PatchedBundle {
+    pub(super) bundle: Bundle,
+    pub(super) review: ReviewedEgressBuild,
+}
+
+impl PatchedBundle {
+    pub(super) fn hold(
+        root: &LocalPath,
+        binary: crate::vm::public_egress::QualifiedEgressBinary,
+        owner: PSID,
+    ) -> Result<Self, NativeRefusal> {
+        let pins = binary.pin();
+        let review = *REVIEWED_EGRESS_BUILDS
+            .iter()
+            .find(|build| build.qemu == pins.qemu && build.receipt == pins.receipt)
+            .ok_or(REFUSAL)?;
+        let (_, bundle) = collect_exact(
+            root,
+            review.manifest,
+            review.receipt,
+            review.payload_count,
+            &review.execution_roles(),
+        )?;
+        bundle.protected(owner, Instant::now() + INVENTORY_TIME)?;
+        Ok(Self { bundle, review })
+    }
+}
+
+fn collect_exact(
+    root: &LocalPath,
+    manifest_pin: ArtifactPin,
+    receipt_pin: ArtifactPin,
+    count: usize,
+    roles: &[(&str, ArtifactPin)],
+) -> Result<(Distribution, Bundle), NativeRefusal> {
     let deadline = Instant::now() + INVENTORY_TIME;
     let mut bundle = Bundle::open(root)?;
     let receipt =
-        read_bounded(bundle.add_file("RECEIPT.txt")?, RECEIPT_BYTES as u64).map_err(|_| REFUSAL)?;
-    let manifest = read_bounded(bundle.add_file("MANIFEST.sha256")?, MANIFEST_BYTES as u64)
+        read_bounded(bundle.add_file("RECEIPT.txt")?, receipt_pin.size).map_err(|_| REFUSAL)?;
+    let manifest = read_bounded(bundle.add_file("MANIFEST.sha256")?, manifest_pin.size)
         .map_err(|_| REFUSAL)?;
     let receipt_hash: [u8; 32] = Sha256::digest(&receipt).into();
     let manifest_hash: [u8; 32] = Sha256::digest(&manifest).into();
-    if receipt.len() != RECEIPT_BYTES
-        || receipt_hash != STOCK_RECEIPT_1113_SHA256
-        || manifest.len() != MANIFEST_BYTES
-        || hex::encode(manifest_hash) != STOCK_MANIFEST_1113_SHA256
+    if receipt.len() as u64 != receipt_pin.size
+        || receipt_hash != receipt_pin.sha256
+        || manifest.len() as u64 != manifest_pin.size
+        || manifest_hash != manifest_pin.sha256
     {
         return Err(REFUSAL);
     }
 
-    let payload_bytes = bundle.payload(&manifest, PAYLOAD_ENTRIES, deadline)?;
+    let payload_bytes = bundle.payload(&manifest, count, deadline, roles)?;
     Ok((
         Distribution {
             receipt: receipt_hash,
-            receipt_bytes: RECEIPT_BYTES as u64,
+            receipt_bytes: receipt_pin.size,
             manifest: manifest_hash,
-            manifest_bytes: MANIFEST_BYTES as u64,
-            payload_files: PAYLOAD_ENTRIES as u16,
+            manifest_bytes: manifest_pin.size,
+            payload_files: count as u16,
             payload_bytes,
         },
         bundle,
@@ -463,8 +520,19 @@ pub(super) mod tests {
             let mut bundle = Bundle::open(&self.path)?;
             bundle.add_file("RECEIPT.txt")?;
             bundle.add_file("MANIFEST.sha256")?;
-            bundle.payload(self.manifest.as_bytes(), 1, deadline)?;
+            bundle.payload(self.manifest.as_bytes(), 1, deadline, &[])?;
             Ok(bundle)
+        }
+
+        pub(in crate::vm::windows::qualification) fn collect_with_receipt(
+            &self,
+            receipt: ArtifactPin,
+        ) -> Result<(Distribution, Bundle), NativeRefusal> {
+            let manifest = ArtifactPin {
+                size: self.manifest.len() as u64,
+                sha256: Sha256::digest(self.manifest.as_bytes()).into(),
+            };
+            collect_exact(&self.path, manifest, receipt, 1, &[])
         }
 
         fn refuse(&self) {
@@ -719,6 +787,60 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn patched_inventory_binds_metadata_role_and_held_namespace() {
+        let fixture = Fixture::with_payload("qemu-img.exe", BYTES);
+        let pin = |bytes: &[u8]| ArtifactPin {
+            sha256: Sha256::digest(bytes).into(),
+            size: bytes.len() as u64,
+        };
+        let manifest = pin(fixture.manifest.as_bytes());
+        let receipt = pin(b"receipt");
+        let image = pin(BYTES);
+        let inspect = |manifest, receipt, image| {
+            collect_exact(
+                &fixture.path,
+                manifest,
+                receipt,
+                1,
+                &[("qemu-img.exe", image)],
+            )
+        };
+        let (_, held) = inspect(manifest, receipt, image).unwrap();
+        let path = fixture.root.path().join("qemu-img.exe");
+        assert!(OpenOptions::new().write(true).open(&path).is_err());
+        assert!(fs::rename(&path, fixture.root.path().join("other")).is_err());
+        drop(held);
+        assert!(inspect(pin(b"wrong manifest"), receipt, image).is_err());
+        assert!(inspect(manifest, pin(b"changed"), image).is_err());
+        assert!(inspect(manifest, receipt, pin(b"wrong image")).is_err());
+        assert!(
+            inspect(
+                manifest,
+                receipt,
+                ArtifactPin {
+                    size: image.size + 1,
+                    ..image
+                }
+            )
+            .is_err()
+        );
+        let wrong_case = fixture.root.path().join("QEMU-IMG.EXE");
+        let intermediate = fixture.root.path().join("intermediate.exe");
+        fs::rename(&path, &intermediate).unwrap();
+        fs::rename(&intermediate, &wrong_case).unwrap();
+        assert!(inspect(manifest, receipt, image).is_err());
+        fs::rename(&wrong_case, &intermediate).unwrap();
+        fs::rename(&intermediate, &path).unwrap();
+        let extra = fixture.root.path().join("extra.dll");
+        fs::write(&extra, BYTES).unwrap();
+        assert!(inspect(manifest, receipt, image).is_err());
+        fs::remove_file(extra).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::hard_link(&path, outside.path().join("alias.exe")).unwrap();
+        assert!(inspect(manifest, receipt, image).is_err());
+    }
+
+    #[test]
     fn inventory_refuses_a_junction_even_when_its_target_bytes_match() {
         let f = Fixture::new();
         let target = tempfile::tempdir().unwrap();
@@ -764,7 +886,7 @@ pub(super) mod tests {
         let deadline = Instant::now() + INVENTORY_TIME;
         let mut bundle = Bundle::open(&f.path).unwrap();
         assert_eq!(
-            bundle.payload(&[0; MAX_MANIFEST_BYTES + 1], 1, deadline),
+            bundle.payload(&[0; MAX_MANIFEST_BYTES + 1], 1, deadline, &[]),
             Err(REFUSAL)
         );
         assert!(parse_manifest(f.manifest.as_bytes(), PAYLOAD_ENTRIES + 1).is_none());

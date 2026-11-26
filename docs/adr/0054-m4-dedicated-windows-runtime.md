@@ -1418,3 +1418,40 @@ Missing or mismatched exclusions yield charged quarantine and withhold
 helper output. The qualifier still uses its separate authority and
 disposable workspace. Production dispatch and settlement are
 **unverified on real hardware**.
+
+## Amendment for the Docker qualification dossier
+
+Docker qualification uses contract 4 with the existing 19-stage Docker sequence,
+native provenance and the `arx-vm-docker-v1` dependency projection. It measures
+both release images by role and binds the held runtime profile, distinct store
+roles, reviewed stock inventory, guest and installer inputs, firmware, fixture,
+policy, topology, origin trust profile and exact Compose recipe. The network row
+commits a run-scoped digest of the private receiver and control evidence.
+
+For the E1a patched distribution, `loaded_artifacts` commits the reviewed receipt,
+complete exact-case manifest and explicit executable, image-tool and firmware
+roles. The collector must retain the complete reparse-free, writer-excluded
+payload inventory through checked execution and settlement. The pinned E1a
+receipt records recursive import review, static libslirp linkage and the module
+origins observed during paused smoke runs. The held inventory satisfies the
+Docker loaded-dependency requirement for v1 under the restricted search
+namespace from this ADR. Its digest describes that reviewed inventory and
+receipt. Patched guest execution and release still require their own stage
+evidence.
+
+The Windows adapter measures the recipe before opening a selected dossier.
+An independently enrolled receipt pins the reviewed Ubuntu web pool, Docker
+closure and Ubuntu keyring. The dossier binds the exact review receipt. The
+review must verify Ubuntu and Docker signatures,
+the signing identities, signed indices and archive sizes and digests, the exact
+base and package versions, and the inventory of the read-only ARXCOMPOSE image.
+The adapter checks the receipt and every corresponding held input against its
+pin. Treat any missing review or changed input as incomplete evidence. The
+adapter does not rerun an OpenPGP verifier during dossier selection.
+
+The writer checks the Docker chain before output, reopens every exact row
+through the held directory, and resamples the independent boot, uptime,
+dependencies and disposable settlement before the create-new marker rename.
+The patched runtime effects, receiver measurements and native settlement are
+**unverified on real hardware**. Static activation and publication retain
+their existing gates.

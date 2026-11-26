@@ -5,7 +5,7 @@
 //! The writer is the provenance boundary for every opaque value. It draws
 //! the scope and run from its own random generator, derives the release,
 //! the scope-keyed dependency digest and the record chain by hashing, and
-//! the schema pins the distribution digests to the reviewed stock values.
+//! complete publication dispatches to the stock TEST or patched Docker reader.
 //! A caller supplies only stages, times, results and summary fields.
 //!
 //! Every file is committed through a hidden temporary entry that is
@@ -119,6 +119,58 @@ impl<'a> PublishSample<'a> {
             boot_marker: binding.boot.marker,
             dependencies: self.dependencies,
         })
+    }
+}
+
+/// Absolute host uptime, captured before remeasurement by the Docker collector.
+/// The collector owns the held inputs and the disposable release ledger.
+#[allow(
+    dead_code,
+    reason = "used by the disposable Docker collector in Part B"
+)]
+pub(super) struct DockerPublishSample<'a> {
+    pub(super) dependencies: &'a records::DockerDependencies,
+    pub(super) captured_uptime_ms: u64,
+    pub(super) settled: bool,
+}
+
+enum Publication<'a> {
+    Test(Fresh<'a>),
+    #[allow(
+        dead_code,
+        reason = "used by the disposable Docker collector in Part B"
+    )]
+    Docker(records::DockerFresh<'a>),
+}
+
+impl Publication<'_> {
+    fn read<R: Read>(
+        self,
+        seal: &[u8],
+        scope: records::Hash,
+        open: impl FnMut(records::FileKind) -> Result<R, records::RunError>,
+    ) -> Result<(), SinkError> {
+        let seal_sha256 = records::digest(seal);
+        let length = seal.len() as u64;
+        match self {
+            Self::Test(fresh) => records::read_native(
+                seal,
+                length,
+                open,
+                &Selection { seal_sha256, scope },
+                &fresh,
+            )
+            .map(|_| ()),
+            Self::Docker(fresh) => records::read_native_docker(
+                seal,
+                length,
+                open,
+                &records::DockerSelection { seal_sha256, scope },
+                &fresh,
+            )
+            .map(|_| ()),
+        }
+        .map_err(|_| SinkError::Invalid)
     }
 }
 
@@ -318,6 +370,87 @@ impl EvidenceDir {
         clock: impl Fn() -> Instant2,
         mut refresh: impl FnMut() -> Result<PublishSample<'a>, SinkError>,
     ) -> Result<(), SinkError> {
+        let mut last = None;
+        self.publish_seal(bundle, issued, cancel, |seal, sample| {
+            if sample {
+                last = Some(refresh()?);
+            }
+            last.as_ref()
+                .ok_or(SinkError::Invalid)?
+                .check(clock(), issued, seal.binding, seal.finished_utc)
+                .map(Publication::Test)
+        })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by the disposable Docker collector in Part B"
+    )]
+    pub(super) fn publish_docker<'a>(
+        &self,
+        bundle: &SealBundle,
+        issued: Instant2,
+        cancel: &crate::service::Shutdown,
+        refresh: impl FnMut() -> Result<DockerPublishSample<'a>, SinkError>,
+    ) -> Result<(), SinkError> {
+        self.publish_docker_with_clock(bundle, issued, cancel, refresh, || {
+            Ok((boot::now(), boot::marker().map_err(|_| SinkError::Invalid)?))
+        })
+    }
+
+    fn publish_docker_with_clock<'a>(
+        &self,
+        bundle: &SealBundle,
+        issued: Instant2,
+        cancel: &crate::service::Shutdown,
+        mut refresh: impl FnMut() -> Result<DockerPublishSample<'a>, SinkError>,
+        clock: impl Fn() -> Result<(Instant2, records::Hash), SinkError>,
+    ) -> Result<(), SinkError> {
+        let mut last = None;
+        self.publish_seal(bundle, issued, cancel, |seal, sample| {
+            if sample {
+                last = Some(refresh()?);
+            }
+            let live = last.as_ref().ok_or(SinkError::Invalid)?;
+            let (now, marker) = clock()?;
+            let start = seal
+                .binding
+                .issued_on_boot(marker)
+                .ok_or(SinkError::Invalid)?;
+            if !live.settled
+                || live.captured_uptime_ms < start.mono_ms
+                || now.mono_ms.saturating_sub(seal.binding.boot.origin_mono_ms)
+                    > records::MAX_TRIAL_MS
+                || now
+                    .mono_ms
+                    .checked_sub(live.captured_uptime_ms)
+                    .is_none_or(|age| age > records::LIVE_FRESHNESS_MS)
+                || !records::clocks_agree(start, now)
+                || now.utc < seal.finished_utc
+                || !seal.binding.live_at(
+                    now.utc,
+                    live.dependencies
+                        .key(self.scope)
+                        .ok_or(SinkError::Invalid)?,
+                )
+            {
+                return Err(SinkError::Invalid);
+            }
+            Ok(Publication::Docker(records::DockerFresh {
+                now,
+                boot_marker: marker,
+                dependencies: live.dependencies,
+            }))
+        })
+    }
+
+    fn publish_seal<'a>(
+        &self,
+        bundle: &SealBundle,
+        issued: Instant2,
+        cancel: &crate::service::Shutdown,
+        mut check: impl FnMut(&records::Seal, bool) -> Result<Publication<'a>, SinkError>,
+    ) -> Result<(), SinkError> {
         if self.closed.replace(true) {
             return Err(SinkError::Closed);
         }
@@ -331,21 +464,30 @@ impl EvidenceDir {
             || seal.binding.boot != self.boot
             || seal.binding.issued_mono_ms != issued.mono_ms
             || seal.binding.issued_utc != issued.utc
+            || seal.manifest.len() != files.len()
+            || seal
+                .manifest
+                .iter()
+                .zip(files)
+                .any(|(entry, (kind, _))| entry.file != *kind)
         {
             return Err(SinkError::Invalid);
         }
-        let selection = Selection {
-            seal_sha256: records::digest(seal_bytes),
-            scope: self.scope,
+        let memory = |kind| {
+            files
+                .iter()
+                .find(|(file, _)| *file == kind)
+                .map(|(_, bytes)| bytes.as_slice())
+                .ok_or(records::RunError::Output)
         };
-        let check = |sample: &PublishSample<'a>| {
+        let mut check = |refresh| {
+            let fresh = check(&seal, refresh)?;
             if cancel.is_cancelled() {
                 return Err(SinkError::Invalid);
             }
-            sample.check(clock(), issued, seal.binding, seal.finished_utc)
+            Ok(fresh)
         };
-        records::verify_native(seal_bytes, files, &selection, &check(&refresh()?)?)
-            .map_err(|_| SinkError::Invalid)?;
+        check(true)?.read(seal_bytes, self.scope, memory)?;
         if self.leaks(seal_bytes) || files.iter().any(|(_, bytes)| self.leaks(bytes)) {
             return Err(SinkError::Private);
         }
@@ -356,31 +498,20 @@ impl EvidenceDir {
         // Reopen by the held directory, and hold each exact row without
         // write/delete sharing across verification and the final rename.
         let mut held = Vec::with_capacity(files.len());
-        records::read_native(
-            seal_bytes.as_slice(),
-            seal_bytes.len() as u64,
-            |kind| {
-                let file = open_relative(&self.pin.leaf, &kind.name(), Node::File, false, false)
-                    .map_err(|_| records::RunError::Output)?;
-                file_identity(&file, false).map_err(|_| records::RunError::Output)?;
-                held.push(file.try_clone().map_err(|_| records::RunError::Output)?);
-                Ok(file)
-            },
-            &selection,
-            &check(&refresh()?)?,
-        )
-        .map_err(|_| SinkError::Invalid)?;
+        check(true)?.read(seal_bytes, self.scope, |kind| {
+            let file = open_relative(&self.pin.leaf, &kind.name(), Node::File, false, false)
+                .map_err(|_| records::RunError::Output)?;
+            file_identity(&file, false).map_err(|_| records::RunError::Output)?;
+            held.push(file.try_clone().map_err(|_| records::RunError::Output)?);
+            Ok(file)
+        })?;
         self.commit_checked_at_rename(COMPLETE, seal_bytes, || {
             let stale = |_| io::Error::other("qualification freshness unavailable");
-            let sample = refresh().map_err(stale)?;
-            records::verify_native(
-                seal_bytes,
-                files,
-                &selection,
-                &check(&sample).map_err(stale)?,
-            )
-            .map_err(|_| io::Error::other("qualification invalid before publication"))?;
-            check(&sample).map_err(stale)?;
+            check(true)
+                .map_err(stale)?
+                .read(seal_bytes, self.scope, memory)
+                .map_err(|_| io::Error::other("qualification invalid before publication"))?;
+            check(false).map_err(stale)?;
             Ok(())
         })
         .map_err(|_| SinkError::Io)?;
