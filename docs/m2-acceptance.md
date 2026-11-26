@@ -72,10 +72,12 @@ Start the foreground daemon and leave it running:
 ```
 
 In a second unelevated PowerShell 7 window, use a fresh Claude profile and the
-task's client file. Remove any ambient API-key or alternate-provider
+task's client file. Set `$claude` to the absolute path of the selected Claude
+Code executable. Remove any ambient API-key or alternate-provider
 variables for that window first. Keep `--strict-mcp-config` and `--tools ''`:
 
 ```powershell
+$claude = 'C:/Path/To/claude.exe'
 $env:CLAUDE_CONFIG_DIR = 'D:/acceptance/session/claude-config'
 Set-Location -LiteralPath 'D:/acceptance/session/claude-work'
 & $claude --strict-mcp-config --mcp-config 'D:/acceptance/session/claude-work/.mcp.json' --tools '' --permission-mode default --no-chrome
@@ -113,9 +115,11 @@ Do not export the Claude transcript, client config, auth output, or SQLite
 database.
 
 Stop the daemon with Ctrl+C, then check the stored row. `$rowId` is the
-confirmed numeric id:
+confirmed numeric id. Set `$python` to the absolute Python executable path
+used in the generated `.mcp.json`:
 
 ```powershell
+$python = 'C:/Path/To/python.exe'
 & $python -I -B 'D:/Code/Arxcovo/tools/acceptance/m2/acceptance-stdio.py' --verify $rowId --database 'D:/acceptance/session/state/activity.sqlite3'
 ```
 

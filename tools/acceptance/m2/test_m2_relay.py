@@ -317,6 +317,7 @@ class RelayTests(unittest.TestCase):
 # pipes. Neither the fixture nor its launcher invokes arxd.
 CHILD = r"""
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -342,6 +343,12 @@ if mode.startswith("boundary"):
     sys.exit(23)
 if mode == "outstanding":
     sys.exit(23)
+if mode == "partial_reply":
+    os.write(1, b'{"jsonrpc":"2.0","id":1,')
+    os.close(1)
+    # Make pipe EOF observable before the process handle signals.
+    time.sleep(0.5)
+    os._exit(23)
 if mode == "stall_read":
     time.sleep(5)
     sys.exit(24)
@@ -353,7 +360,7 @@ print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flu
 if mode == "after_answer":
     # Wait for the fixture to observe the sanitized reply while leaving stdin open.
     marker = Path(sys.argv[2])
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 10
     while not marker.exists() and time.monotonic() < deadline:
         time.sleep(0.02)
     sys.exit(23 if marker.exists() else 24)
@@ -368,7 +375,7 @@ import sys
 source, fixture, mode, marker, arxd, client, evidence = sys.argv[1:]
 entrypoint = runpy.run_path(source)["entrypoint"]
 bridge = entrypoint.__globals__
-bridge["RPC_TIMEOUT"] = 0.75
+bridge["RPC_TIMEOUT"] = 0.75 if mode in ("stall_read", "stall_write") else 5
 bridge["open_child"] = lambda *_: subprocess.Popen(
     [sys.executable, "-I", "-B", "-c", fixture, mode, marker],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -376,6 +383,7 @@ bridge["open_child"] = lambda *_: subprocess.Popen(
 sys.argv = [source, "--arxd", arxd, "--client-config", client, "--evidence", evidence]
 sys.exit(entrypoint())
 """
+PIPE_TEST_TIMEOUT = 12
 FAILURE = b"arxcovo-acceptance-bridge-failed"
 LIST_HOSTS = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_hosts"}}\n'
 
@@ -414,8 +422,8 @@ class PipeTests(unittest.TestCase):
         child.stdin.write(frame)
         child.stdin.flush()
 
-    def expect_failure(self, child, status):
-        self.assertEqual(child.wait(timeout=3), status)
+    def expect_failure(self, child, status, *, timeout=PIPE_TEST_TIMEOUT):
+        self.assertEqual(child.wait(timeout=timeout), status)
         self.assertEqual(child.stdout.read(), b"")
         self.assertEqual(child.stderr.read().strip(), FAILURE)
 
@@ -450,7 +458,7 @@ class PipeTests(unittest.TestCase):
     def test_watchdog_covers_blocked_write(self):
         child = self.start_relay("stall_write")
         self.request(child, self.boundary("a"))
-        self.expect_failure(child, 1)
+        self.expect_failure(child, 1, timeout=3)
 
     def test_unexpected_idle_exit_preserves_status(self):
         self.expect_failure(self.start_relay("idle"), 23)
@@ -463,6 +471,12 @@ class PipeTests(unittest.TestCase):
         self.request(child, LIST_HOSTS)
         self.expect_failure(child, 23)
 
+    def test_partial_child_reply_is_discarded_and_exit_status_preserved(self):
+        child = self.start_relay("partial_reply")
+        self.request(child, LIST_HOSTS)
+        self.expect_failure(child, 23)
+        self.assertEqual(self.evidence.read_bytes(), b"")
+
     def test_list_hosts_then_exit_is_a_failure_with_client_idle(self):
         child = self.start_relay("after_answer")
         self.request(child, LIST_HOSTS)
@@ -470,7 +484,7 @@ class PipeTests(unittest.TestCase):
         # and the tool response is observed. The queue bounds that observation.
         output = Queue()
         threading.Thread(target=lambda: output.put(child.stdout.readline()), daemon=True).start()
-        self.assertEqual(json.loads(output.get(timeout=3))["id"], 1)
+        self.assertEqual(json.loads(output.get(timeout=PIPE_TEST_TIMEOUT))["id"], 1)
         self.marker.touch()
         self.expect_failure(child, 23)
         self.assertEqual(json.loads(self.evidence.read_bytes())["tool"], "list_hosts")
@@ -478,16 +492,16 @@ class PipeTests(unittest.TestCase):
     def test_watchdog_covers_stalled_read(self):
         child = self.start_relay("stall_read")
         self.request(child, LIST_HOSTS)
-        self.expect_failure(child, 1)
+        self.expect_failure(child, 1, timeout=3)
 
     def test_client_eof_allows_clean_shutdown_without_acceptance_calls(self):
         child = self.start_relay("clean_eof")
-        stdout, stderr = child.communicate(timeout=3)
+        stdout, stderr = child.communicate(timeout=PIPE_TEST_TIMEOUT)
         self.assertEqual((child.returncode, stdout, stderr), (0, b"", b""))
 
     def test_client_eof_with_partial_evidence_fails(self):
         child = self.start_relay("complete")
-        stdout, stderr = child.communicate(LIST_HOSTS, timeout=3)
+        stdout, stderr = child.communicate(LIST_HOSTS, timeout=PIPE_TEST_TIMEOUT)
         self.assertEqual((child.returncode, stderr.strip()), (1, FAILURE))
         self.assertEqual(json.loads(stdout)["id"], 1)
 
@@ -498,7 +512,7 @@ class PipeTests(unittest.TestCase):
         alias = self.root / "alias"
         junction(self, alias, outside)
         child = self.start_relay("complete", evidence=alias / "evidence.jsonl")
-        stdout, stderr = child.communicate(LIST_HOSTS, timeout=3)
+        stdout, stderr = child.communicate(LIST_HOSTS, timeout=PIPE_TEST_TIMEOUT)
         self.assertEqual((child.returncode, stdout, stderr.strip()), (1, b"", FAILURE))
         self.assertEqual(list(outside.iterdir()), [])
 

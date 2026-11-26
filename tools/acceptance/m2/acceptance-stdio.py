@@ -187,8 +187,11 @@ def read_frame(stream, limit=RESPONSE_LIMIT):
     line = stream.readline(limit + 1)
     if not line:
         return None
-    if len(line) > limit or not line.endswith(b"\n"):
+    if len(line) > limit:
         raise ValueError("frame")
+    if not line.endswith(b"\n"):
+        # A short read without a newline reached EOF mid-frame.
+        raise EOFError("unterminated frame")
     value = json.loads(line)
     if not isinstance(value, dict):
         raise ValueError("envelope")
