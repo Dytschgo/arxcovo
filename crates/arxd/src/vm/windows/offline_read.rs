@@ -245,7 +245,7 @@ impl Read for BoundedHashRead<'_> {
             return Err(io::ErrorKind::TimedOut.into());
         }
         if stopped(self.stop) {
-            return Err(io::ErrorKind::Interrupted.into());
+            return Err(io::Error::other("offline verification cancelled"));
         }
         let max = buffer
             .len()
@@ -262,8 +262,15 @@ impl Read for BoundedHashRead<'_> {
         if Instant::now() >= self.deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
+        // Exercise cancellation at the read boundary without racing the file I/O.
+        #[cfg(test)]
+        if n != 0
+            && let Some(stop) = self.stop
+        {
+            cancel_tests::cancel_after_hash_read(stop);
+        }
         if stopped(self.stop) {
-            return Err(io::ErrorKind::Interrupted.into());
+            return Err(io::Error::other("offline verification cancelled"));
         }
         Ok(n)
     }
@@ -312,35 +319,101 @@ fn range(at: u64, size: u64, limit: u64) -> Result<()> {
 #[cfg(test)]
 mod cancel_tests {
     use super::*;
-    use crate::service::Shutdown;
-    use std::io::Write;
-    use std::time::Duration;
+    use crate::{service::Shutdown, vm::paths::ArtifactPin};
+    use sha2::{Digest, Sha256};
+    use std::{cell::Cell, io::Write, sync::mpsc, thread, time::Duration};
 
-    /// Cancelling the owning operation ends the parse budget and an active
-    /// hash read before the deadline.
+    thread_local! {
+        static CANCEL_AFTER_HASH_READ: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn arm_hash_cancellation() {
+        CANCEL_AFTER_HASH_READ.set(true);
+    }
+
+    pub(super) fn cancel_after_hash_read(stop: &Shutdown) {
+        if CANCEL_AFTER_HASH_READ.take() {
+            stop.cancel();
+        }
+    }
+
+    pub(super) fn returns_promptly<T: Send + 'static>(
+        operation: impl FnOnce(Instant) -> T + Send + 'static,
+    ) -> T {
+        let (send, receive) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = operation(Instant::now() + Duration::from_secs(20));
+            let _ = send.send(result);
+        });
+        match receive.recv_timeout(Duration::from_millis(200)) {
+            Ok(result) => {
+                worker.join().unwrap();
+                result
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                worker.join().unwrap();
+                unreachable!()
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("offline cancellation exceeded 200 ms"),
+        }
+    }
+
+    fn verify_cancelled_hash(cancel_before_read: bool) {
+        let contents = [7u8; 32 * 1024];
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&contents).unwrap();
+        file.rewind().unwrap();
+        let pin = ArtifactPin {
+            size: contents.len() as u64,
+            sha256: Sha256::digest(contents).into(),
+        };
+        let remaining = returns_promptly(move |deadline| {
+            let cancel = Shutdown::default();
+            if cancel_before_read {
+                cancel.cancel();
+            } else {
+                arm_hash_cancellation();
+            }
+            let mut remaining = pin.size;
+            let error = pin
+                .verify(
+                    BoundedHashRead {
+                        file: &file,
+                        deadline,
+                        stop: Some(&cancel),
+                        remaining: &mut remaining,
+                    },
+                    pin.size,
+                )
+                .unwrap_err();
+            assert_eq!(error.to_string(), "offline verification cancelled");
+            assert!(cancel.is_cancelled());
+            remaining
+        });
+        if cancel_before_read {
+            assert_eq!(remaining, pin.size);
+        } else {
+            assert!(remaining < pin.size);
+        }
+    }
+
     #[test]
-    fn cancellation_ends_hashing_and_the_offline_parse_before_the_deadline() {
+    fn artifact_verification_returns_promptly_if_already_cancelled() {
+        verify_cancelled_hash(true);
+    }
+
+    #[test]
+    fn artifact_verification_returns_promptly_if_cancelled_after_a_chunk() {
+        verify_cancelled_hash(false);
+    }
+
+    #[test]
+    fn cancellation_ends_the_offline_parse_before_the_deadline() {
         let cancel = Shutdown::default();
-        let deadline = Instant::now() + Duration::from_secs(600);
+        let deadline = Instant::now() + Duration::from_secs(20);
         let budget = Budget::new(deadline).with_stop(Some(cancel.clone()));
         assert_eq!(budget.check_deadline(), Ok(()));
-        let mut file = tempfile::tempfile().unwrap();
-        file.write_all(&[7u8; 4096]).unwrap();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        let mut remaining = 8192;
-        let mut reader = BoundedHashRead {
-            file: &file,
-            deadline,
-            stop: Some(&cancel),
-            remaining: &mut remaining,
-        };
-        let mut buffer = [0u8; 1024];
-        assert_eq!(reader.read(&mut buffer).unwrap(), 1024);
         cancel.cancel();
-        assert_eq!(
-            reader.read(&mut buffer).unwrap_err().kind(),
-            io::ErrorKind::Interrupted
-        );
         assert_eq!(budget.check_deadline(), Err(Invalid));
         // Without a stop the deadline alone still governs.
         assert_eq!(Budget::new(deadline).check_deadline(), Ok(()));

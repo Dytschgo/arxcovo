@@ -4,7 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::super::{Budget, qcow::Image};
+use super::super::{Budget, ReleasedPair, qcow::Image};
+use crate::vm::{ArtifactEvidence, PairSlots};
 
 const CLUSTER: usize = 65_536;
 const START: usize = 64 * 512;
@@ -440,11 +441,15 @@ fn inspect(qcow: Vec<u8>) -> Result<(bool, bool)> {
     inspect_with(qcow, Budget::new(Instant::now() + Duration::from_secs(5)))
 }
 
-#[test]
-fn released_pair_observes_at_the_exact_two_pass_hash_budget() {
-    use super::super::{PathPin, ReleasedPair};
+fn released_pair() -> (
+    tempfile::TempDir,
+    ReleasedPair,
+    PairSlots,
+    [ArtifactEvidence; 2],
+) {
+    use super::super::PathPin;
     use crate::vm::{
-        ArtifactEvidence, ArtifactSlot, PairSlots,
+        ArtifactSlot,
         paths::{ArtifactPin, LocalPath},
         runtime::StopDisposition,
     };
@@ -485,10 +490,32 @@ fn released_pair_observes_at_the_exact_two_pass_hash_budget() {
     };
     let pair =
         ReleasedPair::hold(slots, pins.into(), [0, 1], StopDisposition::CleanRelease).unwrap();
+    (dir, pair, slots, evidence)
+}
+
+#[test]
+fn released_pair_observes_at_the_exact_two_pass_hash_budget() {
+    let (_dir, pair, slots, evidence) = released_pair();
     assert_eq!(
         pair.observe(slots, evidence, Instant::now() + Duration::from_secs(5)),
         Ok((true, true))
     );
+}
+
+#[test]
+fn released_pair_observation_returns_promptly_if_cancelled_after_a_hash_chunk() {
+    use super::super::cancel_tests::{arm_hash_cancellation, returns_promptly};
+    use crate::service::Shutdown;
+
+    let (_dir, pair, slots, evidence) = released_pair();
+    let (observed, cancelled) = returns_promptly(move |deadline| {
+        let cancel = Shutdown::default();
+        arm_hash_cancellation();
+        let observed = pair.observe_until(slots, evidence, deadline, Some(&cancel));
+        (observed, cancel.is_cancelled())
+    });
+    assert_eq!(observed, Err(Invalid));
+    assert!(cancelled);
 }
 
 #[test]
