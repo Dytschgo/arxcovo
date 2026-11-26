@@ -947,6 +947,169 @@ mod tests {
     }
 
     #[test]
+    fn reserve_refusal_v1_writes_bounded_detail_and_reads_legacy_contract_four_rows() {
+        use records::{
+            Diagnostic, Observation, Origin, ReserveCheck, ReserveFailure, ReserveStep, Stage,
+            StageResult,
+        };
+
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let file = DiagnosticFile::CustodyJobCapacity;
+        let detailed = StageResult::ReserveRefusalV1(ReserveFailure {
+            step: ReserveStep::PostCreate,
+            failure: ReserveCheck::AvailableRam {
+                available_bytes: 20_401_094_655,
+                required_bytes: 20_401_094_656,
+            },
+        });
+        let detailed_wire = concat!(
+            r#"{"reserve_refusal_v1":{"step":"post_create","failure":{"check":"available_ram","#,
+            r#""available_bytes":20401094655,"required_bytes":20401094656}}}"#,
+        );
+        for (index, (wire, result, passes)) in [
+            (
+                r#"{"failed":"reserves_unverified"}"#,
+                StageResult::Failed(Diagnostic::ReservesUnverified),
+                false,
+            ),
+            (
+                r#"{"passed":{"kind":"paused_trial","verified":true}}"#,
+                StageResult::Passed(Observation::PausedTrial { verified: true }),
+                true,
+            ),
+            (detailed_wire, detailed, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let case = root.path().join(index.to_string());
+            std::fs::create_dir(&case).unwrap();
+            let (path, dir) = claimed(&case, &["reserve-canary", "76543210"]);
+            assert_eq!(serde_json::to_string(&result).unwrap(), wire);
+            assert_eq!(
+                dir.publish(
+                    &"test",
+                    &"projection",
+                    1_800_000_000,
+                    &entries(&[("suspended_child", raw(wire))]),
+                    &Body {
+                        blocked_at: (!passes).then_some("suspended_child"),
+                        ..body()
+                    },
+                ),
+                Ok(vec![])
+            );
+            let bytes = read(&path, file.name());
+            let rows: Vec<records::Record> = records::decode(&bytes).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].contract, 4);
+            assert_eq!(rows[0].stage, Stage::SuspendedChild);
+            assert_eq!(rows[0].result, result);
+            assert_eq!(
+                rows[0].result.passes(Stage::SuspendedChild, Origin::Native),
+                passes
+            );
+
+            if index == 2 {
+                let row = String::from_utf8(bytes).unwrap();
+                for (key, field) in [
+                    ("path", r#""X:/reserve-canary/vm""#),
+                    ("pid", "76543210"),
+                    ("sid", r#""S-1-5-21-987654321""#),
+                ] {
+                    assert!(!row.contains(&format!(r#""{key}":"#)));
+                    assert!(!row.contains(field));
+                    let extra = row.replacen(
+                        r#""check":"available_ram""#,
+                        &format!(r#""check":"available_ram","{key}":{field}"#),
+                        1,
+                    );
+                    assert!(!super::super::schema::check(file, extra.as_bytes()));
+                    assert!(records::decode::<Vec<records::Record>>(extra.as_bytes()).is_err());
+                }
+                let missing = row.replace(r#""available_bytes":20401094655,"#, "");
+                assert!(!super::super::schema::check(file, missing.as_bytes()));
+                assert!(records::decode::<Vec<records::Record>>(missing.as_bytes()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn paused_refusal_v1_writes_the_prelaunch_subcheck_and_reads_other_refusal() {
+        use crate::vm::qmp::RunStatus;
+        use records::{
+            Diagnostic, Origin, PausedCheck, PausedChildState, PausedDispatchState, PausedFailure,
+            PausedSnapshot, Stage, StageResult,
+        };
+
+        let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let file = DiagnosticFile::WhpxQmpEndpoint;
+        let cases = [
+            (
+                r#"{"failed":"other_refusal"}"#,
+                StageResult::Failed(Diagnostic::OtherRefusal),
+            ),
+            (
+                concat!(
+                    r#"{"paused_refusal_v1":{"failure":{"check":"qmp_status","measured":"paused","required":"prelaunch"},"#,
+                    r#""snapshot":{"child":{"state":"exited","status":42},"dispatch":"idle"}}}"#,
+                ),
+                StageResult::PausedRefusalV1(PausedFailure {
+                    failure: PausedCheck::QmpStatus {
+                        measured: RunStatus::Paused,
+                        required: RunStatus::Prelaunch,
+                    },
+                    snapshot: Some(PausedSnapshot {
+                        child: PausedChildState::Exited { status: Some(42) },
+                        dispatch: Some(PausedDispatchState::Idle),
+                    }),
+                }),
+            ),
+        ];
+        for (index, (wire, expected)) in cases.into_iter().enumerate() {
+            let case = root.path().join(index.to_string());
+            std::fs::create_dir(&case).unwrap();
+            let (path, dir) = claimed(&case, &[]);
+            assert_eq!(serde_json::to_string(&expected).unwrap(), wire);
+            let stage = "qemu_prelaunch_pause";
+            assert_eq!(
+                dir.publish(
+                    &"test",
+                    &"projection",
+                    1_800_000_000,
+                    &entries(&[(stage, raw(wire))]),
+                    &Body {
+                        blocked_at: Some(stage),
+                        ..body()
+                    },
+                ),
+                Ok(vec![])
+            );
+            let bytes = read(&path, file.name());
+            let rows: Vec<records::Record> = records::decode(&bytes).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].contract, 4);
+            assert_eq!(rows[0].stage, Stage::QemuPrelaunchPause);
+            assert_eq!(rows[0].result, expected);
+            assert!(
+                !rows[0]
+                    .result
+                    .passes(Stage::QemuPrelaunchPause, Origin::Native)
+            );
+
+            if index == 1 {
+                let row = String::from_utf8(bytes).unwrap();
+                let private = row.replace(
+                    r#""measured":"paused""#,
+                    r#""measured":"X:/private-qmp-peer""#,
+                );
+                assert!(!super::super::schema::check(file, private.as_bytes()));
+                assert!(records::decode::<Vec<records::Record>>(private.as_bytes()).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn live_network_socket_observations_publish_as_incomplete_only() {
         use records::{
             NetworkProbeReport, Origin, ProbeOutcome, RestrictedNetworkDiagnostic, Stage,

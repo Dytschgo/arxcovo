@@ -1057,16 +1057,40 @@ fn prove_serial_peer(
 }
 
 fn host_resources() -> Result<(u32, u64), NativeRefusal> {
+    measured_host_resources().map_err(|_| NativeRefusal::ReservesUnverified)
+}
+
+fn measured_host_resources() -> Result<(u32, u64), crate::vm::qualification_record::ReserveCheck> {
     let mut memory = MEMORYSTATUSEX {
         dwLength: size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
     };
     // Processor count spans groups; effective Job scope still needs qualification.
     let cpus = unsafe { GetActiveProcessorCount(u16::MAX) };
-    if cpus == 0 || unsafe { GlobalMemoryStatusEx(&mut memory) } == 0 || memory.ullAvailPhys == 0 {
-        return Err(NativeRefusal::ReservesUnverified);
+    check_host_resources(cpus, || {
+        (unsafe { GlobalMemoryStatusEx(&mut memory) } != 0).then_some(memory.ullAvailPhys)
+    })
+}
+
+fn check_host_resources(
+    cpus: u32,
+    memory: impl FnOnce() -> Option<u64>,
+) -> Result<(u32, u64), crate::vm::qualification_record::ReserveCheck> {
+    use crate::vm::qualification_record::ReserveCheck;
+
+    if cpus == 0 {
+        return Err(ReserveCheck::ActiveCpusUnavailable);
     }
-    Ok((cpus, memory.ullAvailPhys))
+    let available_bytes = memory().ok_or(ReserveCheck::MemoryStatusUnavailable)?;
+    // The source gate also refuses a successful zero before checking the
+    // launch envelope. Preserve that order and report the source minimum.
+    if available_bytes == 0 {
+        return Err(ReserveCheck::AvailableRam {
+            available_bytes,
+            required_bytes: 1,
+        });
+    }
+    Ok((cpus, available_bytes))
 }
 
 fn disk_free(root: &LocalPath) -> Result<(u64, u64), NativeRefusal> {
@@ -1960,6 +1984,12 @@ impl DispatchGate {
     /// any write it started, then accept only `WrittenInTime` and disarm.
     /// Every other outcome leaves the gate tripped.
     async fn settle(&self, limit: Duration) -> Result<(), NativeRefusal> {
+        self.settle_observed(limit)
+            .await
+            .map_err(|_| NativeRefusal::ReservesUnverified)
+    }
+
+    async fn settle_observed(&self, limit: Duration) -> Result<(), (Dispatch, bool)> {
         let mut watch = self.state.subscribe();
         let finished = matches!(
             tokio::time::timeout(
@@ -1969,20 +1999,17 @@ impl DispatchGate {
             .await,
             Ok(Ok(_))
         );
-        let mut accepted = false;
+        let mut refusal = None;
         self.state.send_modify(|state| match *state {
-            Dispatch::WrittenInTime(_) if finished => {
-                *state = Dispatch::Idle;
-                accepted = true;
+            Dispatch::WrittenInTime(_) if finished => *state = Dispatch::Idle,
+            observed => {
+                refusal = Some((observed, finished));
+                if !matches!(observed, Dispatch::Expired | Dispatch::Ambiguous) {
+                    *state = Dispatch::Ambiguous;
+                }
             }
-            Dispatch::Expired | Dispatch::Ambiguous => {}
-            _ => *state = Dispatch::Ambiguous,
         });
-        if accepted {
-            Ok(())
-        } else {
-            Err(NativeRefusal::ReservesUnverified)
-        }
+        refusal.map_or(Ok(()), Err)
     }
 }
 

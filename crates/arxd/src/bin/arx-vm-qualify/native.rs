@@ -12,6 +12,7 @@ use arxd::vm::qualification::{
 };
 #[cfg(test)]
 use arxd::vm::qualification::{DiagnosticFile, PausedCompleted};
+use arxd::vm::qualification_record::{PausedFailure, PausedSnapshot};
 use arxd::{
     service::Shutdown,
     vm::runtime::{NativeRefusal, StopDisposition},
@@ -699,6 +700,28 @@ fn paused_phase(stage: Stage) -> Option<PausedPhase> {
     }
 }
 
+fn paused_native_refusal(reason: NativeRefusal, snapshot: Option<PausedSnapshot>) -> StageResult {
+    use NativeRefusal as R;
+    use arxd::vm::qualification_record::PausedCheck as C;
+
+    let detail = match reason {
+        R::Disabled => C::Disabled,
+        R::QualificationMissing => C::QualificationMissing,
+        R::IdentityUnverified => C::IdentityUnverified,
+        R::QmpUnverified => C::QmpUnverified,
+        R::GuestEndpointUnverified => C::GuestEndpointUnverified,
+        R::NetworkFenceUnverified => C::NetworkFenceUnverified,
+        R::InstallerPhaseUnavailable => C::InstallerPhaseUnavailable,
+        R::InstallerPhaseMismatch => C::InstallerPhaseMismatch,
+        R::InstallerDeadlineExpired => C::InstallerDeadlineExpired,
+        other => return StageResult::Failed(refused(other)),
+    };
+    StageResult::PausedRefusalV1(PausedFailure {
+        failure: detail,
+        snapshot,
+    })
+}
+
 fn project_paused(stage: Stage, trial: Option<&PausedTrial>) -> StageResult {
     let Some(phase) = paused_phase(stage) else {
         return StageResult::Unimplemented;
@@ -709,9 +732,14 @@ fn project_paused(stage: Stage, trial: Option<&PausedTrial>) -> StageResult {
     let pass = StageResult::Passed(Observation::PausedTrial { verified: true });
     let failed = |verdict: &PausedVerdict| match verdict {
         PausedVerdict::Verified => pass.clone(),
-        PausedVerdict::Refused(reason) => StageResult::Failed(refused(*reason)),
+        PausedVerdict::Refused(reason) => paused_native_refusal(*reason, trial.snapshot),
+        PausedVerdict::ReserveRefused(detail) => StageResult::ReserveRefusalV1(*detail),
         PausedVerdict::OwnerActive => StageResult::Failed(Diagnostic::OwnerActive),
-        PausedVerdict::Qmp => StageResult::Failed(Diagnostic::OtherRefusal),
+        PausedVerdict::PausedRefused(detail) => StageResult::PausedRefusalV1(PausedFailure {
+            failure: *detail,
+            snapshot: trial.snapshot,
+        }),
+        PausedVerdict::Qmp => paused_native_refusal(NativeRefusal::QmpUnverified, trial.snapshot),
         PausedVerdict::Timeout => StageResult::Failed(Diagnostic::Expired),
         PausedVerdict::Cancelled => StageResult::Failed(Diagnostic::Cancelled),
     };
@@ -902,6 +930,7 @@ mod paused_tests {
     #[test]
     fn projections_are_limited_to_completed_paused_phases() {
         let mut trial = PausedTrial {
+            snapshot: None,
             phase: PausedPhase::BundleInventory,
             completed: PausedCompleted {
                 suspended_child: true,
@@ -935,6 +964,75 @@ mod paused_tests {
         );
         assert!(matches!(paused_teardown(Some(&trial)), Teardown::Released));
         assert!(matches!(paused_teardown(None), Teardown::Released));
+    }
+
+    #[test]
+    fn paused_projection_preserves_the_reserve_refusal() {
+        use arxd::vm::qualification_record::{ReserveCheck, ReserveFailure, ReserveStep};
+
+        let detail = ReserveFailure {
+            step: ReserveStep::Admission,
+            failure: ReserveCheck::QualifierInJob,
+        };
+        let trial = PausedTrial {
+            snapshot: None,
+            phase: PausedPhase::SuspendedChild,
+            completed: PausedCompleted::default(),
+            verdict: PausedVerdict::ReserveRefused(detail),
+            release: StopDisposition::DirtyRelease,
+        };
+        let result = project_paused(Stage::SuspendedChild, Some(&trial));
+        assert_eq!(result, StageResult::ReserveRefusalV1(detail));
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            r#"{"reserve_refusal_v1":{"step":"admission","failure":{"check":"qualifier_in_job"}}}"#,
+        );
+        assert!(matches!(paused_teardown(Some(&trial)), Teardown::Released));
+    }
+
+    #[test]
+    fn paused_projection_keeps_the_prelaunch_subcheck_on_its_failed_row() {
+        use arxd::vm::qmp::ChannelError;
+        use arxd::vm::qualification_record::{
+            PausedCheck, PausedChildState, PausedDispatchState, PausedQmpStep,
+        };
+
+        let detail = PausedCheck::QmpChannel {
+            step: PausedQmpStep::Capabilities,
+            error: ChannelError::Unexpected,
+        };
+        let mut trial = PausedTrial {
+            snapshot: Some(PausedSnapshot {
+                child: PausedChildState::Exited { status: Some(42) },
+                dispatch: Some(PausedDispatchState::Idle),
+            }),
+            phase: PausedPhase::Prelaunch,
+            completed: PausedCompleted {
+                suspended_child: true,
+                ..PausedCompleted::default()
+            },
+            verdict: PausedVerdict::PausedRefused(detail),
+            release: StopDisposition::DirtyRelease,
+        };
+        assert_eq!(
+            project_paused(Stage::SuspendedChild, Some(&trial)),
+            StageResult::Passed(Observation::PausedTrial { verified: true })
+        );
+        assert_eq!(
+            project_paused(Stage::QemuPrelaunchPause, Some(&trial)),
+            StageResult::PausedRefusalV1(PausedFailure {
+                failure: detail,
+                snapshot: trial.snapshot
+            })
+        );
+        trial.verdict = PausedVerdict::Refused(NativeRefusal::QmpUnverified);
+        assert_eq!(
+            project_paused(Stage::QemuPrelaunchPause, Some(&trial)),
+            StageResult::PausedRefusalV1(PausedFailure {
+                failure: PausedCheck::QmpUnverified,
+                snapshot: trial.snapshot
+            })
+        );
     }
 
     #[test]

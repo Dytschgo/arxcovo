@@ -16,11 +16,12 @@ use super::DiagnosticFile;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use std::fmt;
 
-use crate::vm::qualification_record::MAX_TRIAL_MS;
 /// The runner's record contract and collector versions.
 pub use crate::vm::qualification_record::{
     COLLECTOR as RECORD_COLLECTOR, CONTRACT as RECORD_CONTRACT,
 };
+use crate::vm::qualification_record::{MAX_TRIAL_MS, PausedFailure, ReserveFailure, decode};
+use serde_json::value::RawValue;
 const U16: u64 = u16::MAX as u64;
 const U32: u64 = u32::MAX as u64;
 const U64: u64 = u64::MAX;
@@ -46,8 +47,7 @@ enum Shape {
     List(&'static Shape, usize),
     /// Exactly this many items of the inner shape.
     FixedList(&'static Shape, usize),
-    /// `"unimplemented"`, `{"failed":D}`, `{"inconclusive":D}` or
-    /// `{"passed":O}` with an observation kind permitted in this file.
+    /// A passed or non-passing result permitted in this file.
     StageResult,
     /// An observation tagged by `kind`, then that kind's fields.
     Observation,
@@ -681,6 +681,12 @@ impl<'de> Visitor<'de> for Check<'_> {
                     "passed" => &Shape::Observation,
                     "failed" | "inconclusive" => &Shape::Enum(DIAGNOSTICS),
                     "network_diagnostic" if self.rules.network_diagnostic => &NETWORK_DIAGNOSTIC,
+                    "reserve_refusal_v1" if self.rules.kinds.contains(&"paused_trial") => {
+                        return check_detail::<ReserveFailure, _>(map);
+                    }
+                    "paused_refusal_v1" if self.rules.kinds.contains(&"paused_trial") => {
+                        return check_detail::<PausedFailure, _>(map);
+                    }
                     _ => return reject(),
                 };
                 map.next_value_seed(self.with(value))?;
@@ -711,6 +717,18 @@ impl<'de> Visitor<'de> for Check<'_> {
         }
         end(map)
     }
+}
+
+fn check_detail<'de, T, A>(mut map: A) -> Result<(), A::Error>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+    A: MapAccess<'de>,
+{
+    let detail: &RawValue = map.next_value()?;
+    if decode::<T>(detail.get().as_bytes()).is_err() {
+        return reject();
+    }
+    end(map)
 }
 
 /// No key may follow the declared fields; its value is never read.
