@@ -1323,6 +1323,7 @@ mod tests {
             activity_id: 1,
             deadline: now + after,
             binding: Arc::new(()),
+            intent_minted: Default::default(),
         }
     }
 

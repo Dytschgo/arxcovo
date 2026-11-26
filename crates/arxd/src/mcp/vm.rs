@@ -244,7 +244,7 @@ fn native_reason(reason: NativeRefusal) -> &'static str {
 }
 
 // Stable catalog identity while native qualification is unavailable.
-const WEB_RECIPE_ID: Id = [0xff; 16];
+const WEB_RECIPE_ID: Id = crate::vm::WEB_RECIPE_ID;
 type Recipe = (Id, Option<[u8; 32]>);
 
 struct Gate {

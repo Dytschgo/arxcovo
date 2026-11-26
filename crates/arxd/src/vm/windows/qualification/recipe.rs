@@ -14,7 +14,7 @@ pub(super) const TEST_JOB_MEMORY: usize = 6 * GIB as usize;
 const PATH: NativeRefusal = NativeRefusal::PathCustodyUnverified;
 const PHASE: NativeRefusal = NativeRefusal::InstallerPhaseMismatch;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StageTarget {
     pub workspace: WorkspaceBinding,
     pub seal_sha256: Hash,

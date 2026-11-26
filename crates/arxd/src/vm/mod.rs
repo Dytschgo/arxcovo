@@ -25,6 +25,8 @@ pub mod snapshot;
 pub mod static_web;
 mod template;
 #[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) mod test_issuer;
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) mod windows;
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -40,5 +42,6 @@ pub(crate) use controller::{
 pub use model::*;
 pub use policy::{Capacity, HostObservation, Resources, VmPolicy};
 pub use reaper::{MonotonicReaperTicks, ReaperTick};
+pub(crate) use template::WEB_RECIPE_ID;
 pub use template::{AssetPin, RecipeError, UbuntuAssets, UbuntuRecipe};
 pub use template::{ubuntu_compose, ubuntu_web};

@@ -85,10 +85,6 @@ impl<'a> ForegroundQualification<'a> {
 
     /// One bounded epoch observation: the freshness and store-identity
     /// reads, then the high-water transaction, each keeping its class.
-    #[allow(
-        dead_code,
-        reason = "The native TEST issuer consumes the epoch in a later 7c PR"
-    )]
     pub(crate) fn epoch_sample(
         &self,
         advance: impl FnOnce() -> Result<crate::vm::ClockReading, Invalidation>,
@@ -112,6 +108,31 @@ impl<'a> ForegroundQualification<'a> {
             .expect("foreground collector requires TEST scope")
             .production
             .root
+    }
+}
+
+impl crate::vm::test_issuer::SelectedSource for ForegroundQualification<'_> {
+    fn seal_sha256(&self) -> records::Hash {
+        self.seal_sha256
+    }
+
+    fn class(&self) -> records::Class {
+        self.evidence.seal.binding.class
+    }
+
+    fn scope(&self) -> records::Hash {
+        self.evidence.seal.binding.scope
+    }
+
+    fn recipes(&self) -> records::TestRecipes {
+        self.evidence.recipes
+    }
+
+    fn sample(
+        &self,
+        advance: &dyn Fn() -> Result<crate::vm::ClockReading, Invalidation>,
+    ) -> Result<crate::vm::selection_epoch::Sample, Invalidation> {
+        self.epoch_sample(advance)
     }
 }
 

@@ -242,6 +242,9 @@ pub struct PendingOperation {
     pub(crate) activity_id: i64,
     pub(crate) deadline: Instant,
     pub(crate) binding: std::sync::Arc<()>,
+    /// Set when the native TEST issuer mints this worker's one intent. A
+    /// replay never receives a worker, and this worker cannot mint twice.
+    pub(crate) intent_minted: std::sync::atomic::AtomicBool,
 }
 
 impl PendingOperation {

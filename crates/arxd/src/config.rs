@@ -33,8 +33,71 @@ struct RawVmRuntimeProfile {
     state: String,
     disk_ceiling_bytes: u64,
     manifest: VmManifest,
+    /// ADR 0029's execution account for native work. Profiles written before
+    /// the TEST opt-in omit it and keep their dedicated-account meaning.
+    #[serde(default)]
+    execution_profile: VmExecutionProfile,
+    /// The explicit native TEST opt-in (ADR 0054). It requires an enabled
+    /// `current_user` profile and pins the exact sealed dossier and scope.
+    #[serde(default, deserialize_with = "present")]
+    test_qualification: Option<Box<RawTestQualification>>,
     #[serde(default, deserialize_with = "present")]
     public_egress: Option<Box<PublicEgressProfile>>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum VmExecutionProfile {
+    #[default]
+    DedicatedAccount,
+    CurrentUser,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTestQualification {
+    enrollment: String,
+    dossier: String,
+    sha256: String,
+    scope: String,
+}
+
+/// The configured TEST selection. Configuration alone grants no effect: the
+/// issuer's closed installation boundary decides whether it is ever read.
+#[derive(Clone)]
+pub(crate) struct TestQualificationSelection {
+    pub(crate) enrollment: crate::vm::paths::LocalPath,
+    pub(crate) dossier: crate::vm::paths::LocalPath,
+    pub(crate) selection: crate::vm::qualification_record::Selection,
+}
+
+impl RawTestQualification {
+    fn checked(&self) -> Option<TestQualificationSelection> {
+        use crate::vm::paths::LocalPath;
+        let digest = |value: &str| {
+            let mut bytes = [0; 32];
+            (value.len() == 64
+                && value
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                && hex::decode_to_slice(value, &mut bytes).is_ok()
+                && bytes != [0; 32])
+                .then_some(bytes)
+        };
+        let enrollment = LocalPath::parse(&self.enrollment).ok()?;
+        let dossier = LocalPath::parse(&self.dossier).ok()?;
+        if enrollment.overlaps(&dossier) {
+            return None;
+        }
+        Some(TestQualificationSelection {
+            enrollment,
+            dossier,
+            selection: crate::vm::qualification_record::Selection {
+                seal_sha256: digest(&self.sha256)?,
+                scope: digest(&self.scope)?,
+            },
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -127,6 +190,13 @@ impl VmRuntimeProfile {
         {
             bail!(InvalidVmProfile);
         }
+        if let Some(selection) = &raw.test_qualification
+            && (!raw.enabled
+                || raw.execution_profile != VmExecutionProfile::CurrentUser
+                || selection.checked().is_none())
+        {
+            bail!(InvalidVmProfile);
+        }
         raw.validate_paths()?;
         Ok(Self(Box::new(raw)))
     }
@@ -137,6 +207,16 @@ impl VmRuntimeProfile {
 
     pub fn enabled(&self) -> bool {
         self.0.enabled
+    }
+
+    /// The validated TEST opt-in, if configured. `parse` refused any other
+    /// shape, so a present value is always exact.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+    )]
+    pub(crate) fn test_qualification(&self) -> Option<TestQualificationSelection> {
+        self.0.test_qualification.as_ref()?.checked()
     }
 
     pub fn manifest_id(&self) -> &'static str {
@@ -177,9 +257,19 @@ impl RawVmRuntimeProfile {
         let bundle = LocalPath::parse(&self.bundle).map_err(invalid_path)?;
         let volume = LocalPath::parse(&self.volume).map_err(invalid_path)?;
         let state = LocalPath::parse(&self.state).map_err(invalid_path)?;
-        if !local_account_sid(&self.owner_sid)
-            || !local_account_sid(&self.supervisor_sid)
-            || self.owner_sid == self.supervisor_sid
+        // The native reader canonicalizes a current-user SID and checks it
+        // against the live, non-elevated primary token.
+        let identities = match self.execution_profile {
+            VmExecutionProfile::DedicatedAccount => {
+                local_account_sid(&self.owner_sid)
+                    && local_account_sid(&self.supervisor_sid)
+                    && self.owner_sid != self.supervisor_sid
+            }
+            VmExecutionProfile::CurrentUser => {
+                self.owner_sid == self.supervisor_sid && sid_spelling(&self.owner_sid)
+            }
+        };
+        if !identities
             || !volume.is_drive_root()
             || state.is_drive_root()
             || bundle.is_drive_root()
@@ -191,6 +281,28 @@ impl RawVmRuntimeProfile {
         }
         Ok(state)
     }
+}
+
+/// Canonical user-SID spelling: revision 1, a 48-bit authority and one to
+/// fifteen 32-bit subauthorities, without signs or leading zeros.
+fn sid_spelling(sid: &str) -> bool {
+    let Some(parts) = sid.strip_prefix("S-1-") else {
+        return false;
+    };
+    let mut values = parts.split('-');
+    let canonical = |value: &str, max: u64| {
+        value
+            .parse::<u64>()
+            .is_ok_and(|n| n <= max && n.to_string() == value)
+    };
+    if !values
+        .next()
+        .is_some_and(|authority| canonical(authority, (1 << 48) - 1))
+    {
+        return false;
+    }
+    let count = values.clone().count();
+    (1..=15).contains(&count) && values.all(|value| canonical(value, u32::MAX.into()))
 }
 
 fn local_account_sid(sid: &str) -> bool {
@@ -1780,6 +1892,105 @@ mod runtime_provenance_tests {
         assert!(
             serde_json::from_value::<TestVms>(json!({"enabled": true, "runtime": null})).is_err()
         );
+    }
+
+    fn parse(value: &serde_json::Value) -> anyhow::Result<super::VmRuntimeProfile> {
+        super::VmRuntimeProfile::parse(&serde_json::to_vec(value).unwrap())
+    }
+
+    fn selection() -> serde_json::Value {
+        json!({
+            "enrollment": "D:/private/enrollment.json",
+            "dossier": "D:/private/dossier",
+            "sha256": "a1".repeat(32), "scope": "b2".repeat(32),
+        })
+    }
+
+    fn current_user(mut profile: serde_json::Value) -> serde_json::Value {
+        profile["execution_profile"] = json!("current_user");
+        profile["owner_sid"] = json!("S-1-12-1-1-2-3-4");
+        profile["supervisor_sid"] = profile["owner_sid"].clone();
+        profile
+    }
+
+    /// I25: profiles written before the TEST opt-in keep the dedicated
+    /// account meaning, and `current_user` stays a separate explicit choice.
+    #[test]
+    fn old_dedicated_profiles_keep_their_meaning() {
+        let old = parse(&runtime()).unwrap();
+        assert!(old.test_qualification().is_none());
+        let mut explicit = runtime();
+        explicit["execution_profile"] = json!("dedicated_account");
+        assert!(parse(&explicit).unwrap().test_qualification().is_none());
+        // A dedicated account still needs two distinct local-account SIDs.
+        for (owner, supervisor) in [
+            ("S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1001"),
+            ("S-1-12-1-1-2-3-4", "S-1-5-21-1-2-3-1002"),
+        ] {
+            let mut bad = runtime();
+            bad["owner_sid"] = json!(owner);
+            bad["supervisor_sid"] = json!(supervisor);
+            assert!(parse(&bad).is_err(), "{owner}");
+        }
+        // Current-user mode pins one canonical SID for both roles.
+        let current = current_user(runtime());
+        assert!(parse(&current).unwrap().test_qualification().is_none());
+        for (field, value) in [
+            ("supervisor_sid", json!("S-1-5-21-1-2-3-1002")),
+            ("owner_sid", json!("S-1-12-01-1-2-3-4")),
+            ("execution_profile", json!("CurrentUser")),
+        ] {
+            let mut bad = current.clone();
+            bad[field] = value.clone();
+            if field == "owner_sid" {
+                bad["supervisor_sid"] = value;
+            }
+            assert!(parse(&bad).is_err(), "{field}");
+        }
+    }
+
+    /// I01/T02: the TEST opt-in is explicit, needs an enabled current-user
+    /// profile, and pins the exact seal digest, scope and private paths.
+    #[test]
+    fn test_selection_is_opt_in_and_strictly_pinned() {
+        let mut profile = current_user(runtime());
+        profile["test_qualification"] = selection();
+        let checked = parse(&profile).unwrap().test_qualification().unwrap();
+        assert_eq!(checked.selection.seal_sha256, [0xa1; 32]);
+        assert_eq!(checked.selection.scope, [0xb2; 32]);
+        let local = |path| crate::vm::paths::LocalPath::parse(path).unwrap();
+        assert_eq!(checked.enrollment, local("D:/private/enrollment.json"));
+        assert_eq!(checked.dossier, local("D:/private/dossier"));
+
+        let mut dedicated = runtime();
+        dedicated["test_qualification"] = selection();
+        let mut disabled = profile.clone();
+        disabled["enabled"] = json!(false);
+        let mut null = profile.clone();
+        null["test_qualification"] = json!(null);
+        for refused in [dedicated, disabled, null] {
+            assert!(parse(&refused).is_err());
+        }
+        for (field, bad) in [
+            ("sha256", json!("00".repeat(32))),
+            ("sha256", json!("A1".repeat(32))),
+            ("sha256", json!("a1".repeat(31))),
+            ("scope", json!("F0".repeat(32))),
+            ("enrollment", json!("D:/private/dossier/enrollment.json")),
+            ("dossier", json!("D:/private/../qualification")),
+            ("dossier", json!("private/dossier")),
+            ("unknown", json!(true)),
+        ] {
+            let mut refused = profile.clone();
+            refused["test_qualification"][field] = bad;
+            assert!(parse(&refused).is_err(), "{field}");
+        }
+        let mut missing = profile.clone();
+        missing["test_qualification"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scope");
+        assert!(parse(&missing).is_err());
     }
 }
 

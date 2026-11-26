@@ -8,11 +8,11 @@
 //! claiming drift. No outcome gates owned stop, release or recovery: the
 //! epoch id stays available for settlement after revocation.
 //!
-//! The native TEST issuer that consumes this component lands in a later 7c
-//! PR. Production TEST admission stays closed here.
-#![allow(
-    dead_code,
-    reason = "The native TEST issuer consumes the epoch in a later 7c PR"
+//! The Windows x64 TEST issuer consumes this component. Production TEST
+//! admission stays closed until its installation lands.
+#![cfg_attr(
+    not(all(windows, target_arch = "x86_64")),
+    allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
 )]
 
 use super::{
@@ -64,6 +64,13 @@ impl Invalidation {
     }
 
     /// A live owner-activity (WTS) or reserve refusal can clear on its own.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "consumed by the later 7c effect and settlement PRs"
+        )
+    )]
     pub(crate) fn from_live_sample(reason: NativeRefusal) -> Self {
         match reason {
             NativeRefusal::OwnerActivityUnverified | NativeRefusal::ReservesUnverified => {
@@ -91,6 +98,10 @@ pub(crate) struct Sample {
 }
 
 pub(crate) struct SelectionEpoch {
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "consumed by the later 7c settlement PRs")
+    )]
     id: Id,
     boot_marker: Hash,
     start: Instant2,
@@ -112,6 +123,13 @@ impl SelectionEpoch {
     }
 
     /// Settlement keeps this id whether or not effects are still authorized.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "consumed by the later 7c effect and settlement PRs"
+        )
+    )]
     pub(crate) fn id(&self) -> Id {
         self.id
     }

@@ -353,7 +353,7 @@ fn consumed_permit_requires_the_exact_seal_generation_workspace_and_kind() {
 }
 
 #[test]
-fn launch_permit_fence_requires_uninhabited_authority_and_non_echoed_target() {
+fn launch_permit_fence_requires_issuer_minted_authority_and_non_echoed_target() {
     struct RefusingPermit;
 
     impl LaunchPermit for RefusingPermit {
@@ -381,9 +381,13 @@ fn launch_permit_fence_requires_uninhabited_authority_and_non_echoed_target() {
     }
     let _ = assert_launch_retains_authority;
 
-    // While LaunchAuthority is uninhabited, Option<LaunchAuthority> cannot
-    // hold a Some value; NativeLaunch's `_authority` field is checked above.
-    assert_eq!(size_of::<Option<crate::vm::runtime::LaunchAuthority>>(), 0);
+    // Only the TEST issuer's private `Minted` token constructs the authority,
+    // and only a fixture installation opens that issuer before 7c 16.
+    assert_eq!(size_of::<crate::vm::runtime::LaunchAuthority>(), 0);
+    assert!(matches!(
+        crate::vm::runtime::CandidateRuntime::new(None).capability(),
+        crate::vm::runtime::NativeCapability::Unavailable(NativeRefusal::Disabled)
+    ));
 
     // Explicitly construct LaunchTarget without `..` so reintroducing an
     // echoed `binding` field fails compilation.

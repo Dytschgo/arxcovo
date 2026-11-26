@@ -123,9 +123,9 @@ impl<C: Clock> VmController<C> {
     /// transaction, so no other writer moves the high water between the read
     /// and the comparison. A reading below the committed high water is a
     /// rollback. Contention is transient; the connection is never awaited.
-    #[allow(
-        dead_code,
-        reason = "The native TEST issuer consumes the epoch in a later 7c PR"
+    #[cfg_attr(
+        not(all(windows, target_arch = "x86_64")),
+        allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
     )]
     pub(crate) fn advance_native_clock(&self) -> Result<ClockReading, Invalidation> {
         let reason = super::runtime::NativeRefusal::QualificationMissing;
@@ -331,6 +331,7 @@ impl<C: Clock> VmController<C> {
             activity_id: id,
             deadline,
             binding: Arc::clone(&self.worker_binding),
+            intent_minted: AtomicBool::new(false),
         }))
     }
 
@@ -732,6 +733,7 @@ impl<C: Clock> VmController<C> {
                 .checked_add(Duration::from_secs(seconds))
                 .ok_or_else(|| anyhow::anyhow!("invalid VM deadline"))?,
             binding: Arc::clone(&self.worker_binding),
+            intent_minted: AtomicBool::new(false),
         })
     }
 
@@ -2488,6 +2490,97 @@ impl<C: Clock> VmController<C> {
                 store::publish::update(db, nonce, update)?;
             }
             store::publish::finish(db, operation.receipt.activity_id, now, failure, cleanup)
+        })
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl<C: Clock> VmController<C> {
+    pub(crate) fn native_store(&self) -> &VmStore {
+        &self.store
+    }
+
+    /// The durable admission one native TEST effect requires, read without
+    /// waiting on the store: the worker's own pending operation for exactly
+    /// this principal, request and action, before its deadline; a non-static
+    /// target generation that the operation owns; the unresolved writer
+    /// epoch when one applies; and every named slot still live. A replayed
+    /// or completed request, another principal, or any drift is refused.
+    pub(crate) fn native_effect_admitted(
+        &self,
+        worker: &PendingOperation,
+        effect: &super::test_issuer::NativeEffect<'_>,
+        slots: &[ArtifactSlot],
+    ) -> Result<bool> {
+        self.check_worker(worker)?;
+        let mut db = self.store.try_live_connection()?;
+        let tx = db.transaction()?;
+        let reading = self.clock.now();
+        if reading.monotonic >= worker.deadline || effect.generation == [0; 16] {
+            return Ok(false);
+        }
+        let admitted = store::count(
+            &tx,
+            "SELECT count(*) FROM vm_operations o JOIN vm_generations g ON g.id=?6
+             WHERE o.activity_id=?1 AND o.operation_id=?2 AND o.principal=?3
+               AND o.request_key=?4 AND o.action=?5 AND o.status=0 AND g.static_id IS NULL
+               AND CASE WHEN ?8 IS NULL THEN
+                   (g.active=0 AND g.build_id IS NOT NULL AND EXISTS(SELECT 1 FROM vm_build_intents b
+                       WHERE b.id=g.build_id AND b.operation_id=o.operation_id AND b.state='pending'))
+                   OR (g.active=0 AND g.vm_id=o.vm AND o.action=1 AND EXISTS(SELECT 1 FROM vm_instances i
+                       WHERE i.id=o.vm AND i.principal=o.principal AND i.state=0 AND i.expires_ms>?7))
+               ELSE g.active=1 AND g.vm_id=o.vm AND EXISTS(SELECT 1 FROM vm_instances i
+                       WHERE i.id=o.vm AND i.principal=o.principal AND i.expires_ms>?7)
+                   AND EXISTS(SELECT 1 FROM vm_snapshot_release r
+                       WHERE r.generation=g.id AND r.epoch=?8 AND r.disposition IS NULL) END",
+            params![
+                worker.activity_id,
+                effect.operation,
+                effect.principal,
+                effect.request.key,
+                effect.action,
+                effect.generation,
+                utc(reading)?,
+                effect.writer_epoch,
+            ],
+        )? == 1;
+        if !admitted {
+            return Ok(false);
+        }
+        for slot in slots {
+            if slot.generation != effect.generation
+                || store::count(
+                    &tx,
+                    "SELECT count(*) FROM vm_artifacts WHERE generation_id=?1 AND role=?2
+                       AND object_key=?3 AND state IN ('planned','created','identified','active')",
+                    params![slot.generation, slot.role, slot.key],
+                )? != 1
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Recovery needs exact durable TEST custody, not a fresh selection: the
+    /// bound native workspace scope of a non-static generation, and its
+    /// unresolved writer epoch when one is named (none unresolved otherwise).
+    pub(crate) fn native_recovery_bound(
+        &self,
+        scope: store::native::Scope,
+        writer_epoch: Option<Id>,
+    ) -> Result<bool> {
+        self.store.transact(|db| {
+            Ok(store::native::bound(db, scope)?
+                && store::count(
+                    db,
+                    "SELECT count(*) FROM vm_generations g
+                     WHERE g.id=?1 AND g.static_id IS NULL
+                       AND (SELECT count(*) FROM vm_snapshot_release r
+                            WHERE r.generation=g.id AND r.disposition IS NULL
+                              AND (?2 IS NULL OR r.epoch=?2)) = (?2 IS NOT NULL)",
+                    params![scope.generation, writer_epoch],
+                )? == 1)
         })
     }
 }

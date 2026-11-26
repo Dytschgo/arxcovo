@@ -29,10 +29,15 @@ pub enum NativeCapability {
     Qualified(LaunchAuthority),
 }
 
-/// Intentionally uninhabited until a reviewed issuer can bind the full
-/// qualification record and live evidence to a particular owned operation.
+/// One native effect's authority. Off Windows x64 it is uninhabited. On
+/// Windows x64 only the TEST issuer can mint it, from a permit consumed at
+/// the effect edge, and no production path installs that issuer before 7c
+/// 16. Static and public-egress dispatch never receive one.
 pub struct LaunchAuthority {
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     _closed: std::convert::Infallible,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) _issued: super::test_issuer::Minted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -16,6 +16,9 @@ pub(super) fn windows_recipe_id() -> super::Id {
     windows::catalog_id()
 }
 
+/// The built-in Ubuntu web catalog entry, never a TEST recipe.
+pub(crate) const WEB_RECIPE_ID: super::Id = [0xff; 16];
+
 pub(super) const WINDOWS_BUILD_LIMIT: std::time::Duration = windows::BUILD_LIMIT;
 
 #[allow(
