@@ -3,7 +3,8 @@ import type { ArxApi } from './api/types';
 import { AppProviders, useApi, useSession } from './app/context';
 import { href, useRoute, type Route } from './app/router';
 import { Icon, Logo, type IconName } from './app/icons';
-import { Empty, Loading, Page, ViewBoundary } from './app/ui';
+import { Search } from './app/Search';
+import { Loading, Page, ViewBoundary } from './app/ui';
 import { ActivityView } from './app/views/ActivityView';
 import { ConsoleView } from './app/views/ConsoleView';
 import { HostDetailView } from './app/views/HostDetailView';
@@ -44,7 +45,12 @@ function View({ route }: { route: Route }) {
     case 'not_found':
       return (
         <Page title="Page not found">
-          <Empty title="Nothing lives at this address."><a href={href({ name: 'hosts' })}>Go to hosts</a></Empty>
+          <div className="calm">
+            <Icon name="search" />
+            <p className="calm-title">Nothing lives at this address.</p>
+            <p>Check the link, or use the search to jump to a host, VM or tool.</p>
+            <a className="button" href={href({ name: 'hosts' })}><Icon name="back" />Go to hosts</a>
+          </div>
         </Page>
       );
   }
@@ -80,6 +86,7 @@ function Shell() {
             })}
           </nav>
           <span className="spacer" />
+          <Search />
           <span className="me" title="Signed in"><span className="visually-hidden">Signed in as </span>{state.session.user.name}</span>
           <button type="button" className="signout" onClick={() => void logout()} title="Sign out">
             <Icon name="signout" />

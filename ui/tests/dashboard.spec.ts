@@ -32,12 +32,14 @@ test('login: demo banner, wrong password, keyboard sign-in', async ({ page }) =>
   await expect(page.getByRole('heading', { level: 1, name: 'Hosts' })).toBeFocused();
 });
 
-test('hosts: cards with arch badges and reachability', async ({ page }) => {
+test('hosts: board columns with arch badges, reachability and VM cards', async ({ page }) => {
   await signIn(page);
   const cards = page.getByRole('list', { name: 'Hosts' }).getByRole('listitem');
   await expect(cards).toHaveCount(4);
-  await expect(cards.filter({ hasText: 'harbor' }).getByTitle('Machine architecture: arm64')).toBeVisible();
+  await expect(cards.filter({ hasText: 'harbor' }).locator('.col-h').getByTitle('Machine architecture: arm64')).toBeVisible();
   await expect(cards.filter({ hasText: 'pebble' })).toContainText('No heartbeat for 2 hours');
+  await expect(cards.filter({ hasText: 'atlas' }).getByRole('article')).toHaveCount(3);
+  await expect(page.getByText('2 of 4 hosts online')).toBeAttached();
   await expect(page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Hosts' })).toHaveAttribute('aria-current', 'page');
   expect(await overflowX(page)).toBeLessThanOrEqual(0);
   await shot(page, '02-hosts');
@@ -50,7 +52,7 @@ test('host detail: tools, VMs, activity and terminal entry', async ({ page }) =>
   await expect(page.getByText('qemu-system-x86_64')).toBeVisible();
   await expect(page.getByRole('list', { name: 'Recent activity on this host' }).getByRole('listitem').first()).toBeVisible();
   await shot(page, '03-host-detail');
-  await page.getByRole('link', { name: 'Open terminal' }).click();
+  await page.getByRole('link', { name: 'Run command' }).click();
   await expect(page).toHaveURL(/#\/terminal\/atlas$/);
 });
 
@@ -81,8 +83,8 @@ test('activity: filters and paging', async ({ page }) => {
   await shot(page, '06-activity');
   await page.getByRole('button', { name: 'Older' }).click();
   await expect(page.getByRole('list', { name: 'Activity, page 2' })).toBeVisible();
-  await page.getByLabel('Host').selectOption('forge');
-  await page.getByLabel('Outcome').selectOption('failed');
+  await page.getByLabel('Host', { exact: true }).selectOption('forge');
+  await page.getByRole('group', { name: 'Outcome' }).getByRole('button', { name: 'failed' }).click();
   const items = page.getByRole('list', { name: 'Activity, page 1' }).getByRole('listitem');
   await expect(items.first()).toBeVisible();
   for (const item of await items.all()) {
@@ -109,8 +111,57 @@ test('terminal: run, stream, exit, history and a refused tool', async ({ page })
   await shot(page, '07-terminal');
 });
 
+test('console: a stopped VM opens closed with the reason, without a stream', async ({ page }) => {
+  await signIn(page, '#/vms/win11-test-04/console');
+  await expect(page.getByText('win11-test-04 is stopped; start it to see its console.')).toBeVisible();
+  await expect(page.getByText('Console status: closed')).toBeAttached();
+  await expect(page.getByRole('img', { name: /Console of/ })).toHaveCount(0);
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
+});
+
+test('search: the jump list filters hosts, VMs and tools and jumps with the keyboard', async ({ page }) => {
+  await signIn(page);
+  await expect(page.getByRole('list', { name: 'Hosts' })).toBeVisible();
+  await page.keyboard.press('/');
+  const search = page.getByRole('combobox', { name: 'Search hosts, VMs and tools' });
+  await expect(search).toBeFocused();
+  await search.fill('cargo');
+  const options = page.getByRole('listbox', { name: 'Search results' }).getByRole('option');
+  await expect(options).toHaveText([/cargo on atlas/, /cargo on harbor/, /cargo on forge/]);
+  await shot(page, '11-search');
+  await search.fill('web');
+  await expect(options).toHaveText([/web-static/]);
+  await search.press('Enter');
+  await expect(page).toHaveURL(/#\/vms\/web-static$/);
+  await expect(page.getByRole('heading', { level: 1, name: 'web-static' })).toBeFocused();
+});
+
+test('layout: no view overflows the page at 1280 px', async ({ page }) => {
+  await signIn(page);
+  for (const hash of ['#/hosts', '#/hosts/atlas', '#/hosts/pebble', '#/vms', '#/vms/ubuntu-build-02', '#/vms/web-static/console', '#/terminal/atlas', '#/activity', '#/nowhere']) {
+    await page.goto(`/${hash}`);
+    await expect(page.getByRole('heading', { level: 1 })).toBeAttached();
+    await page.waitForLoadState('networkidle');
+    expect(await overflowX(page), hash).toBeLessThanOrEqual(0);
+  }
+});
+
+test('reduced motion: everything shows its finished state', async ({ browser }) => {
+  const context = await browser.newContext({ reducedMotion: 'reduce', viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  await signIn(page);
+  const column = page.getByRole('list', { name: 'Hosts' }).getByRole('listitem').first();
+  await expect(column).toBeVisible();
+  // No wait: the entrance and the logo are already at their end state.
+  expect(await column.evaluate(el => getComputedStyle(el).opacity)).toBe('1');
+  expect(await page.locator('.top .logo .lg-c').evaluate(el => getComputedStyle(el).display)).toBe('none');
+  expect(await page.locator('.top .logo .lg-a').evaluate(el => Number(getComputedStyle(el).strokeDashoffset.replace('px', '')))).toBe(0);
+  await context.close();
+});
+
 test('console: streams frames of a running VM', async ({ page }) => {
   await signIn(page, '#/vms/ubuntu-build-02');
+  await expect(page.getByRole('img', { name: /Console of/ })).toHaveCount(0);
   await page.getByRole('link', { name: 'Open console' }).click();
   await expect(page.getByRole('heading', { level: 1, name: 'Console · ubuntu-build-02' })).toBeVisible();
   await expect(page.getByRole('img', { name: /Console of ubuntu-build-02, frame \d+/ })).toBeVisible();

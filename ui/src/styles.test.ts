@@ -74,3 +74,26 @@ describe('motion', () => {
     expect(reduce).toMatch(/\.rise\s*{\s*opacity:\s*1;\s*transform:\s*none;\s*}/);
   });
 });
+
+describe('view text colours', () => {
+  // Every `color:` in the stylesheet is an ink token (each clears 4.5:1 above),
+  // the background on a white control, an OS data colour on a glyph, or a
+  // listed literal that is checked here against the surface it sits on.
+  const LITERALS: Record<string, string> = { '#454545': '#ffffff' };
+  const ALLOWED = new Set(['var(--ink)', 'var(--ink2)', 'var(--ink3)', 'var(--ink4)', 'var(--bg)', 'var(--win)', 'var(--lin)', 'inherit', 'currentColor', ...Object.keys(LITERALS)]);
+
+  test('text colours come from tokens or checked literals', () => {
+    const values = [...css.matchAll(/(?<![-\w])color:\s*([^;}]+?)\s*[;}]/g)].map(m => m[1].trim());
+    expect(values.length).toBeGreaterThan(50);
+    expect(values.filter(v => !ALLOWED.has(v))).toEqual([]);
+  });
+
+  test('the listed literals clear 4.5:1 on their surface', () => {
+    for (const [fg, bg] of Object.entries(LITERALS)) expect(contrast(fg, bg), fg).toBeGreaterThanOrEqual(4.5);
+  });
+
+  test('the board scrolls inside itself, so wide clusters never overflow the page', () => {
+    expect(css).toMatch(/\.board\s*{[^}]*overflow-x:\s*auto;/);
+    expect(css).toMatch(/\.board-cols\s*{[^}]*min-inline-size:\s*calc\(var\(--cols/);
+  });
+});

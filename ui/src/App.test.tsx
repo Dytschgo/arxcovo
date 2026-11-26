@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, test, vi } from 'vitest';
 import { App } from './App';
-import { DEMO_CREDENTIALS, FIXTURE_ACTIVITY, FIXTURE_HOSTS } from './api/fixtures';
+import { DEMO_CREDENTIALS, FIXTURE_ACTIVITY, FIXTURE_HOSTS, FIXTURE_VMS } from './api/fixtures';
 import { StandinApi, type StandinOptions } from './api/standin';
 import { ApiError, type ArxApi, type Host } from './api/types';
 import { formatDate } from './app/format';
@@ -57,16 +57,45 @@ describe('login and session', () => {
 });
 
 describe('hosts', () => {
-  test('cards show OS, arch badges, reachability and reasons', async () => {
+  test('the board has one column per host with OS, arch badge, reachability, reasons and its VM cards', async () => {
     await signIn();
     const list = await screen.findByRole('list', { name: 'Hosts' });
-    const cards = within(list).getAllByRole('listitem');
-    expect(cards).toHaveLength(FIXTURE_HOSTS.length);
-    const harbor = cards[1];
-    expect(within(harbor).getByText('arm64')).toBeTruthy();
-    expect(within(harbor).getByText('online')).toBeTruthy();
-    expect(within(cards[3]).getByText('No heartbeat for 2 hours')).toBeTruthy();
+    const columns = within(list).getAllByRole('listitem');
+    expect(columns).toHaveLength(FIXTURE_HOSTS.length);
+    const harbor = columns[1];
+    const head = harbor.querySelector('.col-h') as HTMLElement;
+    expect(within(head).getByText('arm64')).toBeTruthy();
+    expect(within(head).getByText('online')).toBeTruthy();
+    expect(within(head).getByRole('link', { name: 'harbor' }).getAttribute('href')).toBe('#/hosts/harbor');
+    expect(within(harbor).getByRole('article', { name: /ubuntu-arm-03/ })).toBeTruthy();
+    expect(harbor.getAttribute('data-reachability')).toBe('online');
+    expect(within(columns[3]).getByText('No heartbeat for 2 hours')).toBeTruthy();
+    expect(within(columns[3]).getByText('No VMs')).toBeTruthy();
+    // atlas holds three VMs; every card sits in its host's column.
+    expect(within(columns[0]).getAllByRole('article')).toHaveLength(3);
     expect(screen.getByText('2 of 4 hosts online')).toBeTruthy();
+  });
+
+  test('the board header totals count every host and VM, and the kind filter only narrows the cards', async () => {
+    await signIn();
+    const list = await screen.findByRole('list', { name: 'Hosts' });
+    const totals = screen.getByText('Hosts not online').closest('dl')!;
+    expect(totals.textContent).toBe('Hosts not online1 degraded1 offline');
+    const vms = screen.getByText('VMs on all hosts, incl. offline').closest('dl')!;
+    expect(vms.textContent).toBe('VMs on all hosts, incl. offline5 total3 running4 test1 static');
+    fireEvent.click(within(screen.getByRole('group', { name: 'Show VMs' })).getByRole('button', { name: 'Static' }));
+    expect(within(list).getAllByRole('article').map(a => a.getAttribute('aria-label'))).toEqual(['web-static, static VM, running']);
+    expect(within(within(list).getAllByRole('listitem')[1]).getByText('No static VMs')).toBeTruthy();
+    expect(vms.textContent).toBe('VMs on all hosts, incl. offline5 total3 running4 test1 static');
+  });
+
+  test('a host without a CPU sample shows usage unavailable on its column, never 0', async () => {
+    await signIn();
+    const list = await screen.findByRole('list', { name: 'Hosts' });
+    const pebble = within(list).getAllByRole('listitem')[3];
+    const cpu = pebble.querySelector('.cpu-now') as HTMLElement;
+    expect(within(cpu).getByText('usage unavailable').getAttribute('data-null')).toBe('true');
+    expect(cpu.textContent).not.toMatch(/\d/);
   });
 
   test('an error offers a retry and an empty cluster explains how to join', async () => {
@@ -86,11 +115,11 @@ describe('hosts', () => {
     expect(await screen.findByText('qemu-system-x86_64')).toBeTruthy();
     expect(screen.getByRole('heading', { level: 1, name: 'atlas' })).toBeTruthy();
     expect(screen.getByRole('link', { name: 'win11-ci-01' })).toBeTruthy();
-    expect(screen.getByRole('link', { name: 'Open terminal' }).getAttribute('href')).toBe('#/terminal/atlas');
+    expect(screen.getByRole('link', { name: 'Run command' }).getAttribute('href')).toBe('#/terminal/atlas');
     go('#/hosts/pebble');
     expect(await screen.findByText('No heartbeat for 2 hours')).toBeTruthy();
-    expect(screen.queryByRole('link', { name: 'Open terminal' })).toBeNull();
-    expect(screen.getByText('Open terminal').getAttribute('aria-disabled')).toBe('true');
+    expect(screen.queryByRole('link', { name: 'Run command' })).toBeNull();
+    expect(screen.getByText('Run command').closest('[aria-disabled]')!.getAttribute('aria-disabled')).toBe('true');
   });
 });
 
@@ -114,23 +143,23 @@ describe('host detail polish', () => {
     expect(cpu.getAttribute('aria-valuetext')).toBe('38%');
     expect(cpu.getAttribute('aria-hidden')).toBeNull();
     expect(cpu.hasAttribute('data-unknown')).toBe(false);
-    expect(within(cpu.closest('.meter') as HTMLElement).queryByText(/usage unavailable/)).toBeNull();
+    expect(within(cpu.closest('section') as HTMLElement).queryByText(/usage unavailable/)).toBeNull();
+    expect(within(cpu.closest('section') as HTMLElement).getByText('38').textContent).toBe('38');
   });
 
   test('when the host reports no CPU usage the row says so instead of faking a bar', async () => {
     const host: Host = { ...atlas, cpu: { ...atlas.cpu, usedPercent: null } };
     await signIn({ hosts: [host] }, '#/hosts/atlas');
-    const row = (await screen.findByText('Processor')).closest('.panels')!.querySelector('.meter') as HTMLElement;
-    expect(within(row).getByText('CPU')).toBeTruthy();
-    // No false 0% for assistive technology: the track is decorative, not a meter.
+    const tile = (await screen.findByRole('heading', { level: 2, name: 'CPU' })).closest('section') as HTMLElement;
+    expect(within(tile).getByText(/16 cores/)).toBeTruthy();
+    // No false 0% for assistive technology: there is no meter and no number at all.
     expect(screen.queryByRole('meter', { name: 'CPU' })).toBeNull();
-    const track = row.querySelector('.meter-track')!;
-    expect(track.getAttribute('aria-hidden')).toBe('true');
-    expect(track.getAttribute('role')).toBeNull();
-    expect(track.hasAttribute('aria-valuenow')).toBe(false);
-    expect(track.hasAttribute('aria-valuetext')).toBe(false);
+    expect(tile.querySelector('.meter-track')).toBeNull();
+    expect(tile.querySelector('[aria-valuenow]')).toBeNull();
+    expect(tile.querySelector('.big')).toBeNull();
     // The state is conveyed by visible text that stays in the accessibility tree.
-    const text = within(row).getByText('16 cores · usage unavailable');
+    const text = within(tile).getByText('usage unavailable');
+    expect(text.getAttribute('data-null')).toBe('true');
     expect(text.closest('[aria-hidden="true"]')).toBeNull();
     // Memory and disk keep real meters.
     expect(screen.getByRole('meter', { name: 'Memory' }).getAttribute('aria-valuenow')).toBe('55');
@@ -175,7 +204,7 @@ describe('activity', () => {
     expect(screen.getByRole('button', { name: 'Newer' })).toHaveProperty('disabled', true);
     fireEvent.click(screen.getByRole('button', { name: 'Older' }));
     expect(await screen.findByRole('list', { name: 'Activity, page 2' })).toBeTruthy();
-    fireEvent.change(screen.getByLabelText('Outcome'), { target: { value: 'refused' } });
+    fireEvent.click(within(screen.getByRole('group', { name: 'Outcome' })).getByRole('button', { name: 'refused' }));
     const filtered = await screen.findByRole('list', { name: 'Activity, page 1' });
     const items = within(filtered).getAllByRole('listitem');
     expect(items.every(i => i.getAttribute('data-outcome') === 'refused')).toBe(true);
@@ -252,9 +281,13 @@ describe('terminal', () => {
 
   test('offline hosts cannot be chosen', async () => {
     await signIn({}, '#/terminal');
-    const select = await screen.findByLabelText('Host');
-    const pebble = within(select).getByRole('option', { name: 'pebble (offline)' });
-    expect(pebble).toHaveProperty('disabled', true);
+    const hosts = await screen.findByRole('list', { name: 'Host' });
+    const pebble = within(hosts).getByText('pebble').closest('li')!;
+    expect(within(pebble).queryByRole('link')).toBeNull();
+    expect(pebble.querySelector('[aria-disabled="true"]')!.textContent).toContain('No heartbeat for 2 hours');
+    const atlas = within(hosts).getByRole('link', { name: /atlas/ });
+    expect(atlas.getAttribute('href')).toBe('#/terminal/atlas');
+    expect(atlas.getAttribute('aria-current')).toBe('true');
   });
 });
 
@@ -354,5 +387,97 @@ describe('round 2: sign-out, stream close and render errors', () => {
   test('an unparseable timestamp formats as a dash instead of throwing', () => {
     expect(formatDate('not a date')).toBe('—');
     expect(formatDate('2026-11-23T12:00:00Z')).not.toBe('—');
+  });
+});
+
+describe('Night Orbit views: search, console closed state, not found', () => {
+  test('the search jump list filters loaded hosts, VMs and tools, moves with the arrows and jumps on Enter', async () => {
+    const api = await signIn();
+    await screen.findByRole('list', { name: 'Hosts' });
+    const listHosts = vi.spyOn(api, 'listHosts');
+    const search = screen.getByRole('combobox', { name: 'Search hosts, VMs and tools' });
+    fireEvent.keyDown(document.body, { key: '/' });
+    expect(document.activeElement).toBe(search);
+    fireEvent.focus(search);
+    fireEvent.change(search, { target: { value: 'ubuntu' } });
+    const results = await screen.findByRole('listbox', { name: 'Search results' });
+    const options = await within(results).findAllByRole('option');
+    expect(options.map(o => o.textContent)).toEqual(['ubuntu-build-02test VM', 'ubuntu-arm-03test VM']);
+    expect(search.getAttribute('aria-expanded')).toBe('true');
+    // Typing filters on the client: one load on focus, none per keystroke.
+    fireEvent.change(search, { target: { value: 'ubuntu-a' } });
+    expect(within(results).getAllByRole('option')).toHaveLength(1);
+    expect(listHosts).toHaveBeenCalledTimes(1);
+    fireEvent.change(search, { target: { value: 'ubuntu' } });
+    fireEvent.keyDown(search, { key: 'ArrowDown' });
+    fireEvent.keyDown(search, { key: 'ArrowDown' });
+    const active = search.getAttribute('aria-activedescendant')!;
+    expect(document.getElementById(active)!.textContent).toBe('ubuntu-arm-03test VM');
+    expect(document.getElementById(active)!.getAttribute('aria-selected')).toBe('true');
+    fireEvent.keyDown(search, { key: 'Enter' });
+    expect(window.location.hash).toBe('#/vms/ubuntu-arm-03');
+    expect(search).toHaveProperty('value', '');
+  });
+
+  test('search lists a tool on reachable hosts only and says when nothing matches', async () => {
+    await signIn();
+    await screen.findByRole('list', { name: 'Hosts' });
+    const search = screen.getByRole('combobox', { name: 'Search hosts, VMs and tools' });
+    fireEvent.focus(search);
+    fireEvent.change(search, { target: { value: 'python3' } });
+    const options = await within(screen.getByRole('listbox', { name: 'Search results' })).findAllByRole('option');
+    expect(options.map(o => o.getAttribute('href'))).toEqual(['#/terminal/atlas', '#/terminal/harbor']);
+    fireEvent.change(search, { target: { value: 'nothing-like-this' } });
+    expect(screen.getByRole('status').textContent).toBe('No host, VM or tool matches “nothing-like-this”');
+    fireEvent.keyDown(search, { key: 'Escape' });
+    expect(search.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  test('a failed VM opens its console closed with the reason and never asks for a stream', async () => {
+    const failed = { ...FIXTURE_VMS[1], state: 'failed' as const, ready: false };
+    const api = await signIn({ vms: [failed] }, '#/vms/ubuntu-build-02/console');
+    const open = vi.spyOn(api, 'openConsole');
+    expect((await screen.findByText(/failed, so there is no picture/)).textContent).toContain('ubuntu-build-02');
+    expect(screen.getByText('Console status:').parentElement!.textContent).toBe('Console status: closed');
+    expect(screen.getByRole('heading', { level: 1, name: 'Console · ubuntu-build-02' })).toBeTruthy();
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  test('a running VM on an offline host opens its console closed with the host reason', async () => {
+    const onPebble = { ...FIXTURE_VMS[3], hostId: 'pebble', state: 'running' as const };
+    const api = await signIn({ vms: [onPebble] }, '#/vms/ubuntu-arm-03/console');
+    const open = vi.spyOn(api, 'openConsole');
+    expect(await screen.findByText('pebble is offline (No heartbeat for 2 hours), so its VMs have no console.')).toBeTruthy();
+    expect(open).not.toHaveBeenCalled();
+    expect(screen.queryByRole('img')).toBeNull();
+  });
+
+  test('the VM page waits for Open console before it opens a stream', async () => {
+    const api = await signIn({}, '#/vms/ubuntu-build-02');
+    const open = vi.spyOn(api, 'openConsole');
+    const link = await screen.findByRole('link', { name: 'Open console' });
+    expect(link.getAttribute('href')).toBe('#/vms/ubuntu-build-02/console');
+    expect(open).not.toHaveBeenCalled();
+    go('#/vms/ubuntu-build-02/console');
+    await screen.findByRole('img', { name: /Console of ubuntu-build-02/ });
+    expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  test('VM sizes the API leaves out are hatched, never 0', async () => {
+    const unsized = { ...FIXTURE_VMS[0], cpus: null, memoryBytes: null };
+    await signIn({ vms: [unsized] }, '#/vms/win11-ci-01');
+    const size = (await screen.findByRole('heading', { level: 2, name: 'Resources' })).closest('section')!;
+    const dd = (label: string) => within(size).getByText(label).closest('div')!.querySelector('dd')!;
+    expect(dd('vCPUs').textContent).toBe('unknown');
+    expect(dd('vCPUs').querySelector('[data-null="true"]')).toBeTruthy();
+    expect(dd('Memory').textContent).toBe('unknown');
+    expect(dd('Disk').textContent).toBe('64 GiB');
+  });
+
+  test('the not-found page explains itself and links back to the hosts', async () => {
+    await signIn({}, '#/nowhere');
+    expect(await screen.findByRole('heading', { level: 1, name: 'Page not found' })).toBeTruthy();
+    expect(screen.getByText('Nothing lives at this address.')).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Go to hosts' }).getAttribute('href')).toBe('#/hosts');
   });
 });

@@ -1,82 +1,172 @@
+import type { ReactNode } from 'react';
+import type { Host, Vm } from '../../api/types';
 import { useResource } from '../context';
-import { OS_LABEL, formatBytes, formatDate, incompatibility } from '../format';
+import { OS_LABEL, formatAgo, formatBytes, formatDate, formatTimeLeft, incompatibility } from '../format';
+import { Icon, OsGlyph } from '../icons';
 import { href } from '../router';
-import { ArchBadge, Empty, Facts, Loaded, Page, Pill, VmStatus } from '../ui';
+import { ArchBadge, BackLink, Empty, Facts, Loaded, Maybe, NullValue, OsBadge, Tile, VmStatus, useNow, usePageHeading } from '../ui';
+import { ConsoleTile } from './ConsoleTile';
 import { expiryLabel } from './VmsView';
 
-export function VmDetailView({ id }: { id: string }) {
+// VM detail with the console tile (docs/design/night-orbit/vm.html). Static VM
+// health, backups and publishing are not in the API and are not drawn; the
+// compatible-hosts list only explains where the VM could run (migration is
+// not shipped).
+
+/** A size against what the host has, with a thin bar when both are known. */
+function Res({ label, value, of, ratio }: { label: string; value: ReactNode; of: string | null; ratio: number | null }) {
+  return (
+    <div className="res">
+      <dt>{label}</dt>
+      <dd>{value}</dd>
+      {of ? <span className="res-of">{of}</span> : null}
+      <span className="res-bar" aria-hidden="true">{ratio === null ? null : <i style={{ inlineSize: `${Math.min(100, Math.max(0, ratio * 100))}%` }} />}</span>
+    </div>
+  );
+}
+
+function Resources({ vm, host }: { vm: Vm; host: Host | undefined }) {
+  const name = host?.name ?? vm.hostId;
+  return (
+    <Tile id="vm-size" icon="cpu" title="Resources">
+      <dl className="facts res-list" data-host-identity>
+        <Res label="vCPUs" value={<Maybe value={vm.cpus} reason="unknown">{n => String(n)}</Maybe>}
+          of={host ? `of ${host.cpu.cores} ${name} cores` : null} ratio={host && vm.cpus !== null ? vm.cpus / host.cpu.cores : null} />
+        <Res label="Memory" value={<Maybe value={vm.memoryBytes} reason="unknown">{formatBytes}</Maybe>}
+          of={host ? `of ${formatBytes(host.memory.totalBytes)}` : null} ratio={host && vm.memoryBytes !== null ? vm.memoryBytes / host.memory.totalBytes : null} />
+        <Res label="Disk" value={formatBytes(vm.diskBytes)}
+          of={host ? (host.disk.capBytes === null ? `of ${formatBytes(host.disk.totalBytes)} disk` : `of ${formatBytes(host.disk.capBytes)} VM cap`) : null}
+          ratio={host ? vm.diskBytes / (host.disk.capBytes ?? host.disk.totalBytes) : null} />
+      </dl>
+    </Tile>
+  );
+}
+
+function expiryPhrase(vm: Vm, now: number): string {
+  if (vm.expiresAt === null) return 'never expires';
+  const left = formatTimeLeft(vm.expiresAt, now);
+  return left.startsWith('in ') ? `expires ${left}` : left;
+}
+
+export function VmPage({ id, console: live }: { id: string; console: boolean }) {
   const data = useResource(async api => {
     const [vm, hosts] = await Promise.all([api.getVm(id), api.listHosts()]);
     return { vm, hosts };
   }, [id]);
-  const title = data.status === 'ready' ? data.data.vm.name : id;
+  const name = data.status === 'ready' ? data.data.vm.name : id;
+  const title = live ? `Console · ${name}` : name;
+  const heading = usePageHeading(title, data.status);
+  const now = useNow(30_000);
+
   return (
-    <Page title={title} eyebrow={<a href={href({ name: 'vms' })}>Virtual machines</a>} actions={data.status === 'ready' ? <a className="button button-primary" href={href({ name: 'console', id })}>Open console</a> : undefined}>
+    <section className="page" aria-labelledby="page-title">
+      {data.status !== 'ready' ? (
+        <header className="page-head">
+          <div className="page-title">
+            <div className="eyebrow"><BackLink to={href({ name: 'vms' })}>VMs</BackLink></div>
+            <h1 id="page-title" tabIndex={-1} ref={heading}>{title}</h1>
+          </div>
+        </header>
+      ) : null}
       <Loaded resource={data} label="this VM">
         {({ vm, hosts }) => {
           const host = hosts.find(h => h.id === vm.hostId);
+          const hostName = host?.name ?? vm.hostId;
+          const offline = host?.reachability === 'offline';
           return (
-            <div className="detail">
-              <div className="detail-badges">
-                <VmStatus state={vm.state} />
-                <ArchBadge arch={vm.arch} />
-                <Pill tone={vm.ready ? 'ok' : 'warn'}>{vm.ready ? 'guest ready' : 'guest not ready'}</Pill>
-                <Pill tone="muted">{vm.kind === 'static' ? 'static VM' : 'test VM'}</Pill>
+            <div className="bento">
+              <section className="tile s12 vm-hero" aria-labelledby="page-title">
+                <div className="vm-hero-main">
+                  <BackLink to={href({ name: 'vms' })}>VMs</BackLink>
+                  <h1 id="page-title" className="vm-name" tabIndex={-1} ref={heading}>
+                    <span className="kind" data-kind={vm.kind} aria-hidden="true" />
+                    {live ? <><span className="visually-hidden">Console ·</span>{' '}</> : null}
+                    {vm.name}
+                  </h1>
+                  <p className="meta">
+                    <span className="kindw">{vm.kind}</span>
+                    <span className="dot" aria-hidden="true">·</span>
+                    <OsBadge os={vm.guestOs} />
+                    <span>{vm.guestOsVersion}</span>
+                    <ArchBadge arch={vm.arch} />
+                    <span className="dot" aria-hidden="true">·</span>
+                    <span>on <a href={href({ name: 'host', id: vm.hostId })}>{hostName}</a></span>
+                    <span className="dot" aria-hidden="true">·</span>
+                    <VmStatus state={vm.state} />
+                    <span className="ready" data-bad={!vm.ready && vm.state === 'running' ? 'true' : undefined}><Icon name={vm.ready ? 'check' : 'warn'} />{vm.ready ? 'guest ready' : 'guest not ready'}</span>
+                    <span className="dot" aria-hidden="true">·</span>
+                    <span className="mono" title={expiryLabel(vm)}>{expiryPhrase(vm, now)}</span>
+                  </p>
+                </div>
+                <div className="vm-hero-side">
+                  <p className="tpl">template <b className="mono">{vm.template.id}</b> <span className="arch">v{vm.template.version}</span></p>
+                  {offline
+                    ? <span className="button button-disabled" aria-disabled="true" title={host?.reachabilityReason ?? 'Host is offline'}><Icon name="term" />Run command on {hostName}</span>
+                    : <a className="button" href={href({ name: 'terminal', hostId: vm.hostId })}><Icon name="term" />Run command on {hostName}</a>}
+                </div>
+              </section>
+
+              <ConsoleTile key={`${vm.id}:${vm.state}:${host?.reachability ?? ''}`} vm={vm} host={host} live={live} onRecheck={data.reload} />
+              <div className="s4 stack">
+                <Resources vm={vm} host={host} />
+                <Tile id="vm-facts" title="Overview">
+                <Facts items={[
+                  ['Guest', <span key="g" className="guest"><OsGlyph os={vm.guestOs} />{OS_LABEL[vm.guestOs]} · {vm.guestOsVersion}</span>],
+                  ['Architecture', <ArchBadge key="a" arch={vm.arch} />],
+                  ['Template', `${vm.template.id} v${vm.template.version}`],
+                  ['Host', <a key="h" href={href({ name: 'host', id: vm.hostId })}>{hostName}</a>],
+                  ['Expires', expiryLabel(vm)],
+                ]} />
+              </Tile>
               </div>
-              <div className="panels">
-                <section className="panel" aria-labelledby="vm-facts">
-                  <h2 id="vm-facts">Overview</h2>
-                  <Facts items={[
-                    ['Guest', `${OS_LABEL[vm.guestOs]} · ${vm.guestOsVersion}`],
-                    ['Architecture', <ArchBadge key="a" arch={vm.arch} />],
-                    ['Template', `${vm.template.id} v${vm.template.version}`],
-                    ['Host', <a key="h" href={href({ name: 'host', id: vm.hostId })}>{host?.name ?? vm.hostId}</a>],
-                    ['Expires', expiryLabel(vm)],
-                  ]} />
-                </section>
-                <section className="panel" aria-labelledby="vm-size">
-                  <h2 id="vm-size">Size</h2>
-                  <Facts items={[
-                    ['vCPUs', vm.cpus === null ? '—' : String(vm.cpus)],
-                    ['Memory', vm.memoryBytes === null ? '—' : formatBytes(vm.memoryBytes)],
-                    ['Disk', formatBytes(vm.diskBytes)],
-                  ]} />
-                </section>
-              </div>
-              <section className="panel" aria-labelledby="vm-snapshots">
-                <h2 id="vm-snapshots">Snapshots <span className="count">{vm.snapshots.length}</span></h2>
+
+              <Tile id="vm-snapshots" icon="cam" title={<>Snapshots <span className="count">{vm.snapshots.length}</span></>} className="s6">
                 {vm.snapshots.length === 0 ? <Empty title="No snapshots yet" /> : (
-                  <ul className="rows">
+                  <ul className="snaps">
                     {vm.snapshots.map(s => (
-                      <li key={s.id} className="row">
-                        <span className="row-title">{s.name}</span>
-                        {s.createdAt === null ? <span>—</span> : <time dateTime={s.createdAt}>{formatDate(s.createdAt)}</time>}
-                        <span>{s.sizeBytes === null ? '—' : formatBytes(s.sizeBytes)}</span>
+                      <li key={s.id}>
+                        <Icon name="cam" />
+                        <div className="snap-main">
+                          <b className="mono">{s.name}</b>
+                          {s.createdAt === null ? <NullValue reason="time unknown" /> : <time dateTime={s.createdAt} title={formatDate(s.createdAt)}>{formatAgo(s.createdAt, now)}</time>}
+                        </div>
+                        {s.sizeBytes === null ? <NullValue reason="size unknown" /> : <span className="mono snap-size">{formatBytes(s.sizeBytes)}</span>}
                       </li>
                     ))}
                   </ul>
                 )}
-              </section>
-              <section className="panel" aria-labelledby="vm-hosts">
-                <h2 id="vm-hosts">Compatible hosts</h2>
-                <p className="panel-note">Where this VM could run or migrate. Incompatible hosts are greyed out with the reason.</p>
-                <ul className="rows" aria-labelledby="vm-hosts">
+              </Tile>
+
+
+
+              <Tile id="vm-hosts" icon="hosts" title="Compatible hosts" className="s6">
+                <ul className="compat" aria-labelledby="vm-hosts" data-host-identity>
                   {hosts.map(h => {
                     const reason = incompatibility(vm, h);
+                    const current = h.id === vm.hostId;
                     return (
-                      <li key={h.id} className="row" data-compatible={reason === null} aria-disabled={reason !== null || undefined}>
-                        <span className="row-title">{h.name}{h.id === vm.hostId ? <span className="row-tag"> (current)</span> : null}</span>
+                      <li key={h.id} data-compatible={reason === null} aria-disabled={reason !== null || undefined}>
+                        <OsBadge os={h.os} />
+                        <b className="mono">{h.name}</b>
                         <ArchBadge arch={h.arch} />
-                        <span className="row-reason">{reason ?? 'Compatible'}</span>
+                        <span className="compat-why">
+                          <Icon name={current ? 'run' : reason === null ? 'check' : 'ban'} />
+                          {reason ?? (current ? 'Current host' : 'Compatible')}
+                        </span>
                       </li>
                     );
                   })}
                 </ul>
-              </section>
+                <p className="note">Where this VM could run. Moving VMs between hosts ships after v1.</p>
+              </Tile>
             </div>
           );
         }}
       </Loaded>
-    </Page>
+    </section>
   );
+}
+
+export function VmDetailView({ id }: { id: string }) {
+  return <VmPage id={id} console={false} />;
 }
