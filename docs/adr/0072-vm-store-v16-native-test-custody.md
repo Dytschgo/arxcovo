@@ -160,6 +160,7 @@ unreleased epoch, bound slot identities and unchanged claim remain the
 durable retry pointer if the caller yields. The adapter performs the
 transaction outside the in-memory run map. Before activation only scoped
 fixtures reach this adapter. Native release is **unverified on real hardware**.
+
 ## Resumable TEST disposal (7c chunk 07)
 
 Chunk 07 consumes the v16 `disposal` columns through `store::vm::native::disposal`
