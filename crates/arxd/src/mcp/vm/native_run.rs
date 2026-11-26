@@ -28,10 +28,66 @@ const OBSERVE: Duration = Duration::from_secs(20);
 /// Short backoff while a concurrent dispatch, such as a `vm_get` poll, holds
 /// the foreground gate at the moment a validated boot is ready to commit.
 const GATE_RETRY: Duration = Duration::from_millis(10);
+/// Prompt bounded retry for establishing a recovery fence after a post-commit
+/// pre-entry failure when the immediate store write fails transiently.
+const FENCE_RETRY_DELAY: Duration = Duration::from_millis(20);
+const FENCE_RETRY_WINDOW: Duration = Duration::from_secs(3);
 /// After a stop, drain or loss signal, an in-flight script exchange gets at
 /// most this long, well inside any script's own timeout, before the owner
 /// abandons it as channel loss and tears down.
 const SCRIPT_INTERRUPT: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+pub(super) struct BlockingBarrier {
+    entered: AtomicBool,
+    entered_signal: Notify,
+    released: Mutex<bool>,
+    release_signal: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl BlockingBarrier {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicBool::new(false),
+            entered_signal: Notify::new(),
+            released: Mutex::new(false),
+            release_signal: std::sync::Condvar::new(),
+        })
+    }
+
+    fn pause(&self) {
+        self.entered.store(true, Ordering::SeqCst);
+        self.entered_signal.notify_waiters();
+        let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !*released {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (next, _) = self
+                .release_signal
+                .wait_timeout(released, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            released = next;
+        }
+    }
+
+    pub(super) async fn wait_entered(&self) {
+        let notified = self.entered_signal.notified();
+        tokio::pin!(notified);
+        let _ = notified.as_mut().enable();
+        if !self.entered.load(Ordering::SeqCst) {
+            notified.await;
+        }
+    }
+
+    pub(super) fn release(&self) {
+        let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        *released = true;
+        self.release_signal.notify_all();
+    }
+}
 
 pub(super) struct Run {
     principal: String,
@@ -42,6 +98,10 @@ pub(super) struct Run {
     scripts: Notify,
     #[cfg(test)]
     settled: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    stop_handoff_barrier: Mutex<Option<Arc<BlockingBarrier>>>,
+    #[cfg(test)]
+    after_retry_fence: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[derive(Default)]
@@ -127,6 +187,34 @@ impl Run {
             scripts: Notify::new(),
             #[cfg(test)]
             settled: Default::default(),
+            #[cfg(test)]
+            stop_handoff_barrier: Mutex::default(),
+            #[cfg(test)]
+            after_retry_fence: Mutex::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn arm_stop_handoff_barrier(&self, barrier: Arc<BlockingBarrier>) {
+        *self.stop_handoff_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(super) fn arm_after_retry_fence(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.after_retry_fence.lock().unwrap() = Some(tx);
+        rx
+    }
+
+    #[cfg(test)]
+    fn pause_stop_handoff(&self) {
+        let barrier = self
+            .stop_handoff_barrier
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(barrier) = barrier {
+            barrier.pause();
         }
     }
 
@@ -352,7 +440,11 @@ impl VmInventory {
         Some((|| match admitted? {
             Ok((operation, stop)) => {
                 match stop {
-                    Some(stop) => owner.stop(stop)?,
+                    Some(stop) => {
+                        #[cfg(test)]
+                        owner.pause_stop_handoff();
+                        owner.stop(stop)?;
+                    }
                     // A replayed stop nudges a teardown that is still
                     // retrying its release.
                     None => owner.retry.notify_one(),
@@ -539,6 +631,35 @@ impl Gate {
         resources: Resources,
         work: impl FnOnce(&Supervisor, &Runtime, &Run, Start) -> anyhow::Result<()> + Send + 'static,
     ) -> Outcome<Value> {
+        self.start_native_run_with(
+            supervisor,
+            installation,
+            request,
+            host,
+            resources,
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+            },
+            #[cfg(test)]
+            || {},
+            work,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn start_native_run_with(
+        &mut self,
+        supervisor: &Arc<Supervisor>,
+        installation: &Installation,
+        request: Request<'_>,
+        host: HostObservation,
+        resources: Resources,
+        initialize: fn() -> std::io::Result<Runtime>,
+        #[cfg(test)] after_admit: impl FnOnce(),
+        work: impl FnOnce(&Supervisor, &Runtime, &Run, Start) -> anyhow::Result<()> + Send + 'static,
+    ) -> Outcome<Value> {
         if self.closed || supervisor.fenced.load(Ordering::SeqCst) {
             return Err(SHUTDOWN);
         }
@@ -566,36 +687,33 @@ impl Gate {
             epoch,
         };
         let owner = Arc::new(Run::new(request.principal, target));
+        #[cfg(test)]
+        after_admit();
         let task = owner.clone();
+        let cleanup_owner = owner.clone();
         let enqueued = slot.install(owner.clone()).and_then(|()| {
-            self.enqueue_test_worker(
+            self.enqueue_test_worker_with_cleanup(
                 supervisor,
                 slot,
-                || {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
+                initialize,
+                move |supervisor| {
+                    cleanup_owner.withdraw();
+                    fence_blocking(supervisor, cleanup_owner.target);
                 },
-                move |supervisor, runtime| match work(
-                    supervisor,
-                    runtime,
-                    &task,
-                    Start { worker, active },
-                ) {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        task.withdraw();
-                        supervisor.controller.fence_native_run(task.target)?;
-                        Err(error)
-                    }
+                move |supervisor, runtime| {
+                    work(supervisor, runtime, &task, Start { worker, active })
                 },
             )
         });
         if let Err(reason) = enqueued {
             // Rollback-safe handoff: no worker owns the committed epoch, so
-            // fence it for ordinary recovery before refusing.
+            // fence it immediately or leave a prompt bounded retry to establish
+            // the recovery claim without blocking the foreground gate.
             owner.withdraw();
-            let _ = supervisor.controller.fence_native_run(target);
+            if supervisor.controller.fence_native_run(target).is_err() {
+                let supervisor = supervisor.clone();
+                self.spawn_test_recovery(async move { retry_fence(supervisor, target).await });
+            }
             return Err(reason);
         }
         Ok(receipt(epoch, None))
@@ -603,10 +721,40 @@ impl Gate {
 }
 
 #[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
+fn fence_blocking(supervisor: &Supervisor, target: Target) {
+    let deadline = Instant::now() + FENCE_RETRY_WINDOW;
+    loop {
+        if supervisor.controller.fence_native_run(target).is_ok() {
+            return;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        std::thread::sleep(FENCE_RETRY_DELAY.min(deadline - now));
+    }
+}
+
+#[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
+async fn retry_fence(supervisor: Arc<Supervisor>, target: Target) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + FENCE_RETRY_WINDOW;
+    loop {
+        if supervisor.controller.fence_native_run(target).is_ok() {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!("TEST pre-entry recovery fence unconfirmed");
+        }
+        tokio::time::sleep(FENCE_RETRY_DELAY.min(deadline - now)).await;
+    }
+}
+
+#[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
 fn replay_start(supervisor: &Supervisor, request: &Request<'_>) -> Outcome<Option<Value>> {
     Ok(supervisor
         .controller
-        .foreground_replay(
+        .foreground_replay_readonly(
             request.principal,
             request.request_id,
             Subject::Vm(request.vm),
@@ -1092,8 +1240,19 @@ impl Run {
         // A retryable failure under a live exact stop keeps its receipt
         // pending and the VM stopping, so a later attempt can still settle
         // it on time. Without one, or once it expires, fence the epoch.
-        if !self.holds_live_stop() {
+        // Serialize the stop check and conditional fence under the foreground
+        // gate held by stop admission so a retry cannot race an on-time stop
+        // handoff and interrupt its receipt.
+        if let Ok(_gate) = supervisor.gate.try_lock()
+            && !self.holds_live_stop()
+        {
             let _ = supervisor.controller.fence_native_run(self.target);
+        }
+        #[cfg(test)]
+        if let Ok(mut hook) = self.after_retry_fence.lock()
+            && let Some(signal) = hook.take()
+        {
+            let _ = signal.send(());
         }
         tokio::select! {
             biased;

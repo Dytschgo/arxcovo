@@ -785,6 +785,7 @@ impl<'a> NativeLaunch<'a> {
         )?;
         check_start_evidence(start_pair, bound_pair)?;
         check_helper_target(kind, plan.inputs(), workspace, helper_target)?;
+        helper::check_helper_lease(kind, offline, workspace, helper_target)?;
         match (kind, boot_inputs) {
             (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(inputs))
                 if memory == TEST_JOB_MEMORY && cpu_rate == JOB_CPU_RATE =>
@@ -1290,8 +1291,10 @@ impl FinalizedPair {
     }
 }
 
+mod clone;
 mod custody;
 mod disposal;
+mod helper;
 mod recovery;
 
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]

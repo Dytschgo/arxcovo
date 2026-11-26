@@ -184,7 +184,7 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
         let consistent = match admitted.effect {
             AdmittedEffect::Start => target.writer_epoch == Some(admitted.operation),
             AdmittedEffect::Script { .. } => target.writer_epoch.is_some(),
-            AdmittedEffect::Clone => target.writer_epoch.is_none(),
+            AdmittedEffect::Clone { .. } => target.writer_epoch.is_none(),
             AdmittedEffect::Build { recipe_id, digest } => {
                 let recipe = RecipeIdentity {
                     recipe_id,
@@ -299,6 +299,7 @@ enum Effect {
     Mutate(ArtifactSlot),
     Inspect(PlanKind, Vec<(ArtifactRole, Option<FileIdentity>)>),
     Stage(ArtifactSlot),
+    Copy(ArtifactSlot),
     Script,
 }
 
@@ -377,7 +378,7 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
                 })
             }
             (
-                AdmittedEffect::Build { .. } | AdmittedEffect::Clone,
+                AdmittedEffect::Build { .. } | AdmittedEffect::Clone { .. },
                 PlanKind::Inspect | PlanKind::InspectWritable | PlanKind::Mutate,
             ) => recipe.is_none(),
             _ => false,
@@ -456,6 +457,29 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         })
     }
 
+    /// One copy of exactly this content into the admitted clone's own VARS
+    /// slot (7c 11).
+    pub(crate) fn copy(
+        &self,
+        slot: ArtifactSlot,
+        content: ArtifactPin,
+    ) -> Result<CopyPermit<'_, S, C>, NativeRefusal> {
+        if !matches!(self.effect, AdmittedEffect::Clone { .. })
+            || self.target.writer_epoch.is_some()
+            || slot.role != "vars"
+            || slot.key == [0; 16]
+            || slot.generation != self.target.generation
+        {
+            return Err(REFUSED);
+        }
+        self.mint(Effect::Copy(slot), &[slot])?;
+        Ok(CopyPermit {
+            intent: self,
+            slot,
+            content,
+        })
+    }
+
     /// One guest script, only with the exact bytes and timeout the admitted
     /// request carried, on the live writer epoch.
     pub(crate) fn script(
@@ -522,6 +546,46 @@ impl<S: SelectedSource, C: Clock> StagePermit<'_, S, C> {
         self.intent.verify(&[target.slot])?;
         self.intent.check_stage(&target)?;
         Ok(StageAuthority::new(Minted(()), target))
+    }
+}
+
+#[must_use]
+pub(crate) struct CopyPermit<'p, S, C> {
+    intent: &'p Intent<'p, S, C>,
+    slot: ArtifactSlot,
+    content: ArtifactPin,
+}
+
+impl<S: SelectedSource, C: Clock> CopyPermit<'_, S, C> {
+    /// At the write: the exact slot and content, still admitted and fresh.
+    pub(crate) fn consume(
+        self,
+        slot: ArtifactSlot,
+        content: ArtifactPin,
+    ) -> Result<CopyAuthority, NativeRefusal> {
+        if (self.slot, self.content) != (slot, content) {
+            return Err(REFUSED);
+        }
+        self.intent.verify(&[slot])?;
+        Ok(CopyAuthority {
+            _minted: Minted(()),
+            slot,
+            content,
+        })
+    }
+}
+
+/// Authority for one clone VARS copy; only a consumed permit yields one.
+#[must_use]
+pub(crate) struct CopyAuthority {
+    _minted: Minted,
+    slot: ArtifactSlot,
+    content: ArtifactPin,
+}
+
+impl CopyAuthority {
+    pub(crate) fn names(&self, slot: ArtifactSlot, content: ArtifactPin) -> bool {
+        (self.slot, self.content) == (slot, content)
     }
 }
 
@@ -664,4 +728,4 @@ impl EffectPlan {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

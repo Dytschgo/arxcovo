@@ -398,6 +398,21 @@ async fn ready_commit_resamples_a_child_lost_while_the_gate_was_busy() {
     let _ = h.shutdown().await;
 }
 
+fn retry_high_water(h: &Harness) -> i64 {
+    h.supervisor().controller.native_store().transact(|db| {
+        Ok(db.query_row("SELECT high_water_ms FROM vm_retry_clock", [], |r| r.get(0))?)
+    }).unwrap()
+}
+
+fn operation_exists(h: &Harness, operation: Id) -> bool {
+    h.supervisor().controller.native_store().transact(|db| {
+        Ok(db.query_row(
+            "SELECT count(*) FROM vm_operations WHERE operation_id=?1",
+            [operation], |r| r.get::<_, i64>(0),
+        )? == 1)
+    }).unwrap()
+}
+
 #[tokio::test]
 async fn start_behind_a_held_registration_is_busy_without_a_durable_write() {
     let mut h = windows_harness().await;
@@ -423,31 +438,263 @@ async fn start_behind_a_held_registration_is_busy_without_a_durable_write() {
     assert_eq!(unresolved_epoch(&h, vm), None);
 
     // Once the previous owner returns, the same fresh request starts and its
-    // parked worker owns the slot. A replay of it writes nothing new.
+    // parked worker owns the slot.
     drop(held);
     let (resume, parked) = std::sync::mpsc::channel::<()>();
     let started = supervisor.gate.lock().unwrap().start_native_run(
         supervisor, &Installation::fixture(), start_request(vm, 505), HOST, RESOURCES,
         move |_, _, _, _| { let _ = parked.recv(); Ok(()) },
     ).unwrap();
-    let operations = operation_count(&h);
     assert!(unresolved_epoch(&h, vm).is_some());
     assert!(supervisor.native_runs.with_entry(vm, |owner| owner.is_some()).unwrap());
+
+    // Insert an unrelated expired terminal operation and advance fake UTC
+    // within the replay window. Occupied-slot replay and refusals must make
+    // zero durable writes (no retry-clock advance and no expired-row pruning).
+    let expired_op: Id = [91; 16];
+    let expired_key: Id = [92; 16];
+    let unrelated_vm: Id = [93; 16];
+    supervisor.controller.native_store().transact(|db| {
+        db.execute(
+            "INSERT INTO activity(principal,vm,action,started_ms,finished_ms,terminal_order,status,actor)
+             VALUES('beta',?1,3,?2,?2,(SELECT coalesce(max(terminal_order),0)+1 FROM activity),1,'agent')",
+            params![unrelated_vm, UTC - 10_000],
+        )?;
+        let activity = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO vm_operations(principal,request_key,operation_id,vm,action,activity_id,
+                valid_through_ms,status,binding_kind,subject_id)
+             VALUES('beta',?1,?2,?3,3,?4,?5,1,'vm',?3)",
+            params![expired_key, expired_op, unrelated_vm, activity, UTC - 1],
+        )?;
+        Ok(())
+    }).unwrap();
+    let operations = operation_count(&h);
+    let high_water_before = retry_high_water(&h);
+    h.now.store(UTC + 5_000, Ordering::SeqCst);
+
+    // Exact replay returns the old receipt with zero durable writes.
     let replay = supervisor.gate.lock().unwrap().start_native_run(
         supervisor, &Installation::fixture(), start_request(vm, 505), HOST, RESOURCES,
         |_, _, _, _| panic!("a replay reached a worker"),
     ).unwrap();
     assert_eq!(replay, started);
+    assert_eq!(retry_high_water(&h), high_water_before, "occupied-slot replay advanced vm_retry_clock");
     assert_eq!(operation_count(&h), operations);
+    assert!(operation_exists(&h, expired_op), "occupied-slot replay pruned an expired operation");
+
+    // Key collision (reusing the vm_create key 501) and stale key are refused
+    // without advancing the retry clock or pruning unrelated rows.
+    let collision = supervisor.gate.lock().unwrap().start_native_run(
+        supervisor, &Installation::fixture(), start_request(vm, 501), HOST, RESOURCES,
+        |_, _, _, _| panic!("a colliding key reached a worker"),
+    );
+    assert_eq!(collision.unwrap_err().0, "key_collision");
+    assert_eq!(retry_high_water(&h), high_water_before);
+    assert!(operation_exists(&h, expired_op));
+
+    let stale_req = Request {
+        principal: "alpha",
+        vm,
+        request_id: RequestId::parse(&format!("{:016x}{:016x}", 1_u64, 599_u64)).unwrap(),
+        operation: Operation::Start,
+        disk: DiskClaim::default(),
+    };
+    let stale = supervisor.gate.lock().unwrap().start_native_run(
+        supervisor, &Installation::fixture(), stale_req, HOST, RESOURCES,
+        |_, _, _, _| panic!("a stale key reached a worker"),
+    );
+    assert_eq!(stale.unwrap_err().0, "stale_key");
+    assert_eq!(retry_high_water(&h), high_water_before);
+    assert!(operation_exists(&h, expired_op));
+
+    // Fresh valid key returns Busy while keeping both high_water_ms and the
+    // unrelated expired terminal operation row intact.
     let fresh = supervisor.gate.lock().unwrap().start_native_run(
         supervisor, &Installation::fixture(), start_request(vm, 506), HOST, RESOURCES,
         |_, _, _, _| panic!("a refused start reached its worker"),
     );
     assert_eq!(fresh.unwrap_err().0, "busy");
+    assert_eq!(retry_high_water(&h), high_water_before, "occupied-slot busy advanced vm_retry_clock");
     assert_eq!(operation_count(&h), operations);
+    assert!(operation_exists(&h, expired_op), "occupied-slot busy pruned an expired operation");
+
     resume.send(()).unwrap();
     assert_admission_closed(&h);
     drop(client);
+    let _ = h.shutdown().await;
+}
+
+fn cleanup_id(h: &Harness, vm: Id) -> Option<i64> {
+    h.supervisor()
+        .controller
+        .native_store()
+        .transact(|db| {
+            Ok(db.query_row(
+                "SELECT cleanup_id FROM vm_instances WHERE id=?1",
+                [vm],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+fn operation_status(h: &Harness, operation: Id) -> i64 {
+    h.supervisor()
+        .controller
+        .native_store()
+        .transact(|db| {
+            Ok(db.query_row(
+                "SELECT status FROM vm_operations WHERE operation_id=?1",
+                [operation],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn pre_entry_runtime_init_error_fences_epoch_and_releases_registration() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let (vm, _, _, scope) = bound_clone(&h, &client).await;
+    let supervisor = h.supervisor().clone();
+    let entered = Arc::new(AtomicBool::new(false));
+    let worker_entered = entered.clone();
+    let started = supervisor
+        .gate
+        .lock()
+        .unwrap()
+        .start_native_run_with(
+            &supervisor,
+            &Installation::fixture(),
+            start_request(vm, 510),
+            HOST,
+            RESOURCES,
+            || Err(std::io::Error::other("injected pre-entry error")),
+            || {},
+            move |_, _, _, _| {
+                worker_entered.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+    let epoch = parse_id(started["operation_id"].as_str().unwrap()).unwrap();
+    eventually("the run slot to be released", || {
+        supervisor
+            .native_runs
+            .with_entry(vm, |owner| owner.is_none())
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(!entered.load(Ordering::SeqCst), "work closure ran despite pre-entry init failure");
+    assert_eq!(
+        vm_state(&h, vm),
+        3,
+        "pre-entry runtime init error stranded the VM without fencing to recovery"
+    );
+    assert!(
+        cleanup_id(&h, vm).is_some(),
+        "pre-entry runtime init error left no recovery cleanup claim"
+    );
+    assert_eq!(
+        operation_status(&h, epoch),
+        Status::Interrupted.code(),
+        "pre-entry runtime init error left the start operation pending"
+    );
+    assert_eq!(unresolved_epoch(&h, vm), Some((scope.generation, epoch)));
+    assert_admission_closed(&h);
+    drop((supervisor, client));
+    let _ = h.shutdown().await;
+}
+
+#[tokio::test]
+async fn enqueue_refusal_with_transient_fence_failure_establishes_recovery_claim_promptly() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let (vm, _, _, scope) = bound_clone(&h, &client).await;
+    let supervisor = h.supervisor().clone();
+    let fault_supervisor = supervisor.clone();
+    let refused = supervisor.gate.lock().unwrap().start_native_run_with(
+        &supervisor,
+        &Installation::fixture(),
+        start_request(vm, 511),
+        HOST,
+        RESOURCES,
+        || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+        },
+        move || {
+            fault_supervisor
+                .controller
+                .native_store()
+                .transact(|db| {
+                    db.execute_batch(
+                        "CREATE TRIGGER fail_pre_entry_fence BEFORE UPDATE OF state ON vm_instances
+                         WHEN NEW.state=3
+                         BEGIN SELECT RAISE(ABORT,'injected transient fence failure'); END;",
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            fault_supervisor.fence();
+        },
+        |_, _, _, _| panic!("a refused start reached its worker"),
+    );
+    assert_eq!(refused.unwrap_err().0, "shutdown");
+    assert!(
+        supervisor
+            .native_runs
+            .with_entry(vm, |owner| owner.is_none())
+            .unwrap(),
+        "enqueue refusal leaked its run registration"
+    );
+    let Some((generation, epoch)) = unresolved_epoch(&h, vm) else {
+        panic!("expected committed unresolved start epoch after post-admit refusal");
+    };
+    assert_eq!(generation, scope.generation);
+    assert_eq!(vm_state(&h, vm), 1, "immediate fence trigger did not block the first fence attempt");
+    assert_eq!(cleanup_id(&h, vm), None);
+    assert_eq!(operation_status(&h, epoch), Status::Pending.code());
+
+    // Clear the transient fence write failure; the prompt bounded retry must
+    // establish the recovery fence and claim without waiting for restart/expiry.
+    supervisor
+        .controller
+        .native_store()
+        .transact(|db| {
+            db.execute_batch("DROP TRIGGER fail_pre_entry_fence")?;
+            Ok(())
+        })
+        .unwrap();
+    let fenced = tokio::time::timeout(Duration::from_secs(2), async {
+        while vm_state(&h, vm) != 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        fenced.is_ok(),
+        "bounded recovery retry failed to fence the epoch after transient write failure cleared"
+    );
+    assert_eq!(vm_state(&h, vm), 3);
+    assert!(cleanup_id(&h, vm).is_some(), "recovery retry left no cleanup claim");
+    assert_eq!(
+        operation_status(&h, epoch),
+        Status::Interrupted.code(),
+        "recovery retry left the start operation pending"
+    );
+    assert_eq!(unresolved_epoch(&h, vm), Some((scope.generation, epoch)));
+    assert!(
+        supervisor
+            .native_runs
+            .with_entry(vm, |owner| owner.is_none())
+            .unwrap()
+    );
+    assert_admission_closed(&h);
+    drop((supervisor, client));
     let _ = h.shutdown().await;
 }
 
@@ -578,6 +825,107 @@ async fn retryable_release_rollback_keeps_the_on_time_stop_and_its_receipt() {
     assert_eq!(ctl.active_release_epoch(vm, false).unwrap(), Some((observed.target.generation, observed.target.epoch)));
     let settled = terminal(&client, &stop).await;
     assert_eq!(settled["state"], "succeeded", "{settled}");
+    assert_admission_closed(&h);
+    drop(client);
+    let _ = h.shutdown().await;
+}
+
+struct ReleaseBarrierOnDrop(Arc<native_run::BlockingBarrier>);
+
+impl Drop for ReleaseBarrierOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[tokio::test]
+async fn retry_fence_serialized_with_concurrent_stop_admission_preserves_on_time_stop() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let Starting {
+        owner,
+        worker,
+        registration: _registration,
+        observed,
+    } = reserved(&h, &client).await;
+    record_checked_creation(&h, &observed);
+    assert!(
+        owner
+            .commit_ready(h.supervisor(), &worker, || Some([42; 16]), || true)
+            .await
+    );
+    let vm = observed.target.vm;
+    let ctl = &h.supervisor().controller;
+    let barrier = native_run::BlockingBarrier::new();
+    let _release_guard = ReleaseBarrierOnDrop(barrier.clone());
+    owner.arm_stop_handoff_barrier(barrier.clone());
+    let after_retry_fence = owner.arm_after_retry_fence();
+
+    let attempts = std::cell::Cell::new(0);
+    let stop = {
+        let stop_fut = call(
+            &client,
+            "vm_stop",
+            json!({"vm_id": hex::encode(vm), "request_id": key(512)}),
+        );
+        let settle_fut = owner.settle_with(
+            h.supervisor(),
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                if attempt == 1 {
+                    anyhow::bail!("injected transient release observation failure");
+                }
+                Ok(())
+            },
+            |_, receipt| {
+                assert!(receipt.is_some(), "the owner did not receive the concurrently admitted stop");
+                ctl.native_store().try_native_transaction(|db| {
+                    native::release::commit(db, &observed, receipt, || ctl.native_clock())
+                        .map(|_| ())
+                })
+            },
+        );
+        tokio::pin!(stop_fut);
+        tokio::pin!(settle_fut);
+        // Pause stop admission under supervisor.gate right after SQLite records
+        // the pending stop receipt and before owner.stop(stop) installs it.
+        tokio::select! {
+            res = &mut stop_fut => panic!("vm_stop completed before barrier release: {res}"),
+            () = barrier.wait_entered() => {}
+        }
+        // Drive the owner through one transient failure and past wait_retry's
+        // conditional fence check while stop admission still holds the gate.
+        tokio::select! {
+            () = &mut settle_fut => panic!("settle_with completed before barrier release"),
+            res = &mut stop_fut => panic!("vm_stop completed before barrier release: {res}"),
+            res = after_retry_fence => res.unwrap(),
+        }
+        // Release stop admission so it installs StopReceipt, wakes the retrying
+        // owner, and returns its pending receipt; then allow the clean release
+        // to commit before the stop deadline.
+        barrier.release();
+        let (stop, ()) = tokio::join!(stop_fut, settle_fut);
+        stop
+    };
+
+    assert_eq!(stop["ok"], true, "{stop}");
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(
+        vm_state(&h, vm),
+        1,
+        "retry fencing moved the VM to recovery instead of preserving the on-time stop"
+    );
+    assert_eq!(unresolved_epoch(&h, vm), None);
+    assert_eq!(
+        ctl.active_release_epoch(vm, false).unwrap(),
+        Some((observed.target.generation, observed.target.epoch))
+    );
+    let settled = terminal(&client, &stop).await;
+    assert_eq!(
+        settled["state"], "succeeded",
+        "retry fencing interrupted the concurrently admitted on-time stop: {settled}"
+    );
     assert_admission_closed(&h);
     drop(client);
     let _ = h.shutdown().await;
