@@ -149,6 +149,14 @@ async fn observes_work_error_and_preserves_reason() {
     assert_eq!(samples.get(), 2);
 }
 
+/// The in-memory peer as the child's stdout, with no native read failure.
+fn output_of(stream: tokio::io::DuplexStream) -> PipeOutput {
+    PipeOutput {
+        stream,
+        failed: Default::default(),
+    }
+}
+
 struct DelayedExit(Cell<bool>);
 
 impl InstallerChild for DelayedExit {
@@ -190,13 +198,19 @@ async fn installer_monitors_silent_accelerator_before_dispatch() {
     ).as_bytes()).await.unwrap();
     let start = Instant::now();
     let child = DelayedExit(Cell::new(false));
-    let result = installer_session(&child, stage, (read, write), &Shutdown::default(), || {
-        if Instant::now() > start {
-            Err(NativeRefusal::ReservesUnverified)
-        } else {
-            Ok(std::time::Instant::now())
-        }
-    })
+    let result = installer_session(
+        &child,
+        stage,
+        (output_of(read), write),
+        &Shutdown::default(),
+        || {
+            if Instant::now() > start {
+                Err(NativeRefusal::ReservesUnverified)
+            } else {
+                Ok(std::time::Instant::now())
+            }
+        },
+    )
     .await;
     assert_eq!(
         result,
@@ -234,13 +248,19 @@ async fn installer_owner_return_after_shutdown_refuses_clean_settlement() {
     output.write_all(replies.as_bytes()).await.unwrap();
     let child = DelayedExit(Cell::new(false));
     let start = Instant::now();
-    let result = installer_session(&child, stage, (read, write), &Shutdown::default(), || {
-        if child.0.get() {
-            Err(NativeRefusal::OwnerActivityUnverified)
-        } else {
-            Ok(std::time::Instant::now())
-        }
-    })
+    let result = installer_session(
+        &child,
+        stage,
+        (output_of(read), write),
+        &Shutdown::default(),
+        || {
+            if child.0.get() {
+                Err(NativeRefusal::OwnerActivityUnverified)
+            } else {
+                Ok(std::time::Instant::now())
+            }
+        },
+    )
     .await;
     assert_eq!(start.elapsed(), LIVE_POLL);
     let failure = stage
@@ -502,9 +522,13 @@ async fn installer_exit_ready_only_at_the_grace_cutoff_is_late() {
     );
     output.write_all(replies.as_bytes()).await.unwrap();
     let child = ExitAtGrace(Cell::new(None));
-    let result = installer_session(&child, stage, (read, write), &Shutdown::default(), || {
-        Ok(std::time::Instant::now())
-    })
+    let result = installer_session(
+        &child,
+        stage,
+        (output_of(read), write),
+        &Shutdown::default(),
+        || Ok(std::time::Instant::now()),
+    )
     .await;
     let by = child.0.get().expect("installer exit was awaited");
     // The phase deadline is far ahead; only the exit grace refuses.
