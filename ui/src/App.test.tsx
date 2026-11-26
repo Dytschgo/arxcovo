@@ -220,6 +220,10 @@ describe('terminal', () => {
     const log = screen.getByRole('log', { name: 'Terminal output for atlas' });
     await waitFor(() => expect(log.textContent).toContain('exit 0 · succeeded'));
     expect(log.textContent).toContain('git version 2.43.0');
+    const status = document.querySelector('.terminal-status .st')!;
+    expect(status.textContent).toBe('Terminal status: ready');
+    expect(status.querySelector('svg[data-icon]')).toBeTruthy();
+    expect(status.querySelector('.st-word')!.textContent).toBe('ready');
     expect(input).toHaveProperty('value', '');
     fireEvent.keyDown(input, { key: 'ArrowUp' });
     expect(input).toHaveProperty('value', 'git --version');
@@ -265,6 +269,10 @@ describe('console', () => {
     const img = await screen.findByRole('img', { name: /Console of ubuntu-build-02, frame \d+/ });
     expect(img.getAttribute('src')).toMatch(/^blob:/);
     expect(screen.getByText('View only')).toBeTruthy();
+    const status = document.querySelector('.terminal-status .st[data-status="streaming"]')!;
+    expect(status.textContent).toBe('Console status: streaming');
+    expect(status.getAttribute('data-status')).toBe('streaming');
+    expect(status.querySelector('svg[data-icon="monitor"]')).toBeTruthy();
   });
 
   test('a stopped VM explains why there is no picture', async () => {

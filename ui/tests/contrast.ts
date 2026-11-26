@@ -1,28 +1,41 @@
 import type { Page } from '@playwright/test';
 
-/** One text run below the threshold, with what was measured. */
-export interface ContrastFailure { what: string; text: string; fg: string; bg: string; ratio: number }
+/** One text run below the threshold, with what was measured and in which animation phase. */
+export interface ContrastFailure { what: string; text: string; phase: string; fg: string; bg: string; ratio: number }
+
+/**
+ * Freezes the page's animation timeline (CSS transitions and animations stay
+ * at their first frame until the audit samples them). Call once per page,
+ * before the actions whose transitions should be measured.
+ */
+export async function freezeMotion(page: Page): Promise<void> {
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Animation.enable');
+  await cdp.send('Animation.setPlaybackRate', { playbackRate: 0 });
+}
 
 /**
  * Rendered WCAG contrast audit (Night Orbit rule: all text >= 4.5:1, large
- * text included). For every visible element with its own text, every
- * form-control value and every shown placeholder, it takes the computed
- * colour, multiplies in the opacity of the element and its ancestors, and
- * composites it over the first opaque background found walking up, with
- * translucent backgrounds blended on the way, once finite transitions and
- * animations have finished. So it measures what Chromium actually paints,
- * including UA defaults such as the placeholder colour, not only the declared
- * tokens.
+ * text included, in every frame).
+ *
+ * It measures painted text whatever its accessibility role (aria-hidden text
+ * is still seen): every element's own text, generated `::before`/`::after`
+ * text, form-control values and shown placeholders. The text colour's alpha,
+ * the pseudo-element's own opacity and the opacity of the element and every
+ * ancestor are multiplied in, and the result is composited over the painted
+ * background: translucent fills (each faded by its own opacity chain) are
+ * blended walking up to the pure black page.
+ *
+ * Every finite CSS transition or animation running at the time is sampled at
+ * its start, middle and end, so a colour or fill caught mid-change is
+ * measured too; they are finished afterwards. Each failure keeps its worst
+ * phase.
  */
 export async function contrastFailures(page: Page, minimum = 4.5): Promise<ContrastFailure[]> {
-  return page.evaluate(async min => {
-    // Measure settled paint: wait for every finite CSS transition and
-    // animation (a just-disabled control fades to its disabled style).
-    await Promise.all(document.getAnimations()
-      .filter(a => a.effect?.getComputedTiming().endTime !== Infinity)
-      .map(a => a.finished.catch(() => undefined)));
+  return page.evaluate(min => {
     type Rgba = [number, number, number, number];
     const parse = (value: string): Rgba => {
+      if (value === 'transparent') return [0, 0, 0, 0];
       const nums = (value.match(/-?[\d.]+(?:e-?\d+)?%?/g) ?? []).map(n => (n.endsWith('%') ? parseFloat(n) / 100 : parseFloat(n)));
       if (value.startsWith('color(srgb')) return [nums[0] * 255, nums[1] * 255, nums[2] * 255, nums[3] ?? 1];
       if (value.startsWith('rgb')) return [nums[0], nums[1], nums[2], nums[3] ?? 1];
@@ -46,8 +59,6 @@ export async function contrastFailures(page: Page, minimum = 4.5): Promise<Contr
       for (let node: Element | null = el; node; node = node.parentElement) o *= parseFloat(getComputedStyle(node).opacity);
       return o;
     };
-    // A background is faded by its element's opacity and every ancestor's
-    // (opacity groups composite whole subtrees); the page under all is black.
     const background = (el: Element): Rgba => {
       const layers: Rgba[] = [];
       for (let node: Element | null = el; node; node = node.parentElement) {
@@ -60,39 +71,67 @@ export async function contrastFailures(page: Page, minimum = 4.5): Promise<Contr
       for (let i = layers.length - 1; i >= 0; i--) result = over(layers[i], result);
       return result;
     };
-    const visible = (el: Element) => {
+    // Painted, not merely exposed: aria-hidden text still counts. Only boxes
+    // that paint nothing (clipped to 1px, hidden, not displayed) are skipped.
+    const painted = (el: Element) => {
       const r = el.getBoundingClientRect();
-      if (r.width <= 1 || r.height <= 1) return false; // includes .visually-hidden
+      if (r.width <= 1 || r.height <= 1) return false;
       const s = getComputedStyle(el);
-      return s.visibility !== 'hidden' && s.display !== 'none' && el.closest('[aria-hidden="true"]') === null;
+      return s.visibility !== 'hidden' && s.display !== 'none';
+    };
+    const describe = (el: Element) => el.tagName.toLowerCase() + (typeof el.className === 'string' && el.className.trim() ? '.' + el.className.trim().split(/\s+/).join('.') : '');
+
+    const failures = new Map<string, { what: string; text: string; phase: string; fg: string; bg: string; ratio: number }>();
+    const measure = (phase: string) => {
+      const check = (el: Element, what: string, text: string, colour: string, extraOpacity = 1) => {
+        const bg = background(el);
+        const fg = parse(colour);
+        const ink = over([fg[0], fg[1], fg[2], fg[3] * extraOpacity * opacity(el)], bg);
+        const r = Math.round(ratio(ink, bg) * 100) / 100;
+        const key = `${what}|${text}`;
+        if (r < min && (!failures.has(key) || failures.get(key)!.ratio > r)) failures.set(key, { what, text: text.slice(0, 60), phase, fg: hex(ink), bg: hex(bg), ratio: r });
+      };
+      for (const el of document.body.querySelectorAll('*')) {
+        if (!painted(el)) continue;
+        for (const pseudo of ['::before', '::after'] as const) {
+          const ps = getComputedStyle(el, pseudo);
+          const content = ps.content.match(/^"(.+)"$/)?.[1];
+          if (content && content.trim()) check(el, describe(el) + pseudo, content, ps.color, parseFloat(ps.opacity));
+        }
+        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          if (el.type === 'checkbox' || el.type === 'radio' || el.type === 'hidden') continue;
+          if (el.value) check(el, describe(el), el.type === 'password' ? '•••' : el.value, getComputedStyle(el).color);
+          else if (el.placeholder) {
+            const ph = getComputedStyle(el, '::placeholder');
+            check(el, `${describe(el)}::placeholder`, el.placeholder, ph.color, parseFloat(ph.opacity));
+          }
+          continue;
+        }
+        if (el instanceof HTMLSelectElement) {
+          check(el, describe(el), el.selectedOptions[0]?.text ?? '', getComputedStyle(el).color);
+          continue;
+        }
+        if (el instanceof HTMLOptionElement) continue; // drawn by the native popup
+        const own = [...el.childNodes].filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent ?? '').join('').trim();
+        if (own) check(el, describe(el), own, getComputedStyle(el).color);
+      }
     };
 
-    const failures: { what: string; text: string; fg: string; bg: string; ratio: number }[] = [];
-    const check = (el: Element, what: string, text: string, colour: string) => {
-      const bg = background(el);
-      const fg = parse(colour);
-      const painted = over([fg[0], fg[1], fg[2], fg[3] * opacity(el)], bg);
-      const r = ratio(painted, bg);
-      if (r < min) failures.push({ what, text: text.slice(0, 60), fg: hex(painted), bg: hex(bg), ratio: Math.round(r * 100) / 100 });
-    };
-    const describe = (el: Element) => el.tagName.toLowerCase() + (el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\s+/).join('.') : '');
-
-    for (const el of document.body.querySelectorAll('*')) {
-      if (!visible(el)) continue;
-      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-        if (el.type === 'checkbox' || el.type === 'radio' || el.type === 'hidden') continue;
-        if (el.value) check(el, describe(el), el.type === 'password' ? '•••' : el.value, getComputedStyle(el).color);
-        else if (el.placeholder) check(el, `${describe(el)}::placeholder`, el.placeholder, getComputedStyle(el, '::placeholder').color);
-        continue;
+    const finite = document.getAnimations().filter(a => {
+      const end = a.effect?.getComputedTiming().endTime;
+      return end !== undefined && Number.isFinite(Number(end));
+    });
+    if (finite.length === 0) measure('settled');
+    else {
+      for (const [phase, at] of [['start', 0], ['middle', 0.5], ['end', 1]] as const) {
+        for (const a of finite) {
+          a.pause();
+          a.currentTime = Number(a.effect!.getComputedTiming().endTime) * at;
+        }
+        measure(phase);
       }
-      if (el instanceof HTMLSelectElement) {
-        check(el, describe(el), el.selectedOptions[0]?.text ?? '', getComputedStyle(el).color);
-        continue;
-      }
-      if (el instanceof HTMLOptionElement) continue; // drawn by the native popup
-      const own = [...el.childNodes].filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent ?? '').join('').trim();
-      if (own) check(el, describe(el), own, getComputedStyle(el).color);
+      for (const a of finite) a.finish();
     }
-    return failures;
+    return [...failures.values()];
   }, minimum);
 }

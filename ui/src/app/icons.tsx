@@ -23,6 +23,8 @@ const PATHS = {
   ban: <><circle cx="12" cy="12" r="9" /><path d="M5.6 5.6l12.8 12.8" /></>,
   shield: <path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" />,
   pause: <path d="M9 6v12M15 6v12" />,
+  play: <path d="M8 5l11 7-11 7z" />,
+  monitor: <><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></>,
   cam: <><path d="M4 8h3l2-3h6l2 3h3v11H4z" /><circle cx="12" cy="13" r="3.5" /></>,
   signout: <path d="M14 4h5v16h-5M10 16l-4-4 4-4M6 12h10" />,
 } satisfies Record<string, ReactNode>;

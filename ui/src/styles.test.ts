@@ -127,11 +127,31 @@ describe('dark only', () => {
 });
 
 describe('motion', () => {
-  test('reduced motion shows the finished state', () => {
+  test('reduced motion shows the finished state at once', () => {
     const reduce = css.slice(css.indexOf('@media (prefers-reduced-motion: reduce)'));
-    expect(reduce).toMatch(/animation-duration:\s*\.01ms\s*!important/);
-    expect(reduce).toMatch(/animation-delay:\s*0ms\s*!important/);
-    expect(reduce).toMatch(/transition-duration:\s*\.01ms\s*!important/);
-    expect(reduce).toMatch(/\.rise\s*{\s*opacity:\s*1;\s*transform:\s*none;\s*}/);
+    expect(reduce).toMatch(/animation-duration:\s*0s\s*!important/);
+    expect(reduce).toMatch(/animation-delay:\s*0s\s*!important/);
+    expect(reduce).toMatch(/transition-duration:\s*0s\s*!important/);
+    expect(reduce).toMatch(/transition-delay:\s*0s\s*!important/);
+    expect(reduce).toMatch(/\.rise\s*{\s*transform:\s*none;\s*}/);
+  });
+
+  // Text must keep 4.5:1 in every frame, so motion may move things or recolour
+  // borders, never change text colour, a fill behind text, or opacity.
+  test('transitions only move things or recolour borders', () => {
+    const allowed = new Set(['transform', 'border-color']);
+    const used = rules().flatMap(r => ['transition', 'transition-property'].filter(k => r.decls.has(k))
+      .flatMap(k => r.decls.get(k)!.split(',').map(part => `${r.selector} -> ${part.trim().split(/\s+/)[0]}`)));
+    expect(used.length).toBeGreaterThan(0);
+    expect(used.filter(u => !allowed.has(u.split(' -> ')[1]))).toEqual([]);
+  });
+
+  test('keyframes never change opacity or colour, except the decorative logo light', () => {
+    const blocks = [...css.matchAll(/@keyframes\s+([\w-]+)\s*\{((?:[^{}]*\{[^{}]*\})*)\s*\}/g)];
+    expect(blocks.map(b => b[1]).sort()).toEqual(['draw', 'lgsweep', 'pop', 'rise', 'spin']);
+    for (const [, name, body] of blocks) {
+      if (name === 'lgsweep') continue; // the logo's sweeping light: an aria-hidden SVG stroke, never text
+      expect(body, `@keyframes ${name}`).not.toMatch(/(?:^|[{;\s])(opacity|color|background(?:-color)?|fill)\s*:/);
+    }
   });
 });

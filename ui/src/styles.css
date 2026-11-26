@@ -139,8 +139,12 @@ a { color: var(--ink); text-decoration-color: var(--line3); text-underline-offse
 svg.i { inline-size: 16px; block-size: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; flex: none; }
 
 /* --- Motion -------------------------------------------------------------- */
-.rise { opacity: 0; transform: translateY(10px); animation: rise var(--dur-rise) var(--ease) forwards; animation-delay: calc(var(--i, 0) * var(--stagger)); }
-@keyframes rise { to { opacity: 1; transform: none; } }
+/* Motion never changes how text reads: transitions and keyframes move things
+   (transform), draw the decorative logo, or recolour borders. Text colour,
+   fills behind text and opacity always switch at once, so every frame keeps
+   4.5:1 (styles.test.ts enforces it). The entrance rise moves, it never fades. */
+.rise { animation: rise var(--dur-rise) var(--ease) both; animation-delay: calc(var(--i, 0) * var(--stagger)); }
+@keyframes rise { from { transform: translateY(10px); } }
 @keyframes draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
 @keyframes pop { from { transform: scale(0); } to { transform: scale(1); } }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -214,7 +218,6 @@ svg.i { inline-size: 16px; block-size: 16px; fill: none; stroke: currentColor; s
   border-radius: var(--r-ctl);
   color: var(--ink3);
   text-decoration: none;
-  transition: color var(--dur-fast);
 }
 .nav a[aria-current="page"] { background: var(--ink); color: var(--bg); font-weight: 500; }
 .nav a:focus-visible { outline-offset: 1px; border-radius: var(--r-ctl); }
@@ -231,7 +234,7 @@ svg.i { inline-size: 16px; block-size: 16px; fill: none; stroke: currentColor; s
   background: none;
   color: var(--ink3);
   cursor: pointer;
-  transition: color var(--dur-fast), border-color var(--dur-fast);
+  transition: border-color var(--dur-fast);
 }
 .signout:focus-visible { border-radius: var(--r-ctl); }
 
@@ -282,7 +285,7 @@ main:focus-visible { outline-offset: -4px; }
    the whole control took its text below 4.5:1 (4.41 plain, 2.21 primary). */
 .button:disabled, .button.button-disabled { background: none; border-color: var(--line3); border-style: dashed; color: var(--ink4); cursor: not-allowed; }
 @media (prefers-reduced-motion: no-preference) {
-  .button { transition: transform 140ms var(--ease), background-color var(--dur-fast), border-color var(--dur-fast); }
+  .button { transition: transform 140ms var(--ease), border-color var(--dur-fast); }
 }
 
 .field { display: flex; flex-direction: column; gap: 6px; color: var(--ink3); font-size: var(--fs-ui); }
@@ -623,14 +626,15 @@ main:focus-visible { outline-offset: -4px; }
   .na::before, .meter-track[data-unknown] { border: 1px dashed; }
 }
 
-/* Reduced motion: every animation and transition shows its finished state. */
+/* Reduced motion: nothing moves; every animation shows its finished state at once. */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
-    animation-duration: .01ms !important;
-    animation-delay: 0ms !important;
+    animation-duration: 0s !important;
+    animation-delay: 0s !important;
     animation-iteration-count: 1 !important;
-    transition-duration: .01ms !important;
+    transition-duration: 0s !important;
+    transition-delay: 0s !important;
   }
-  .rise { opacity: 1; transform: none; }
+  .rise { transform: none; }
   .logo .lg-c { display: none; }
 }
