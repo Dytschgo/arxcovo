@@ -1463,6 +1463,45 @@ held workspace and verifies the Docker dossier before publishing the marker.
 Detached and endpoint copies select their fixed guest bootstrap through
 fw_cfg. The detached copy leaves services masked. The endpoint copy provisions
 the engine using the exact fixed units and accepts only the pinned Compose v3
-hello on that session. The Windows Docker CLI refuses before claiming output
-until the native receiver and route adapter is wired. Hosted tests substitute
-those peers and exercise the same collector and marker-last writer.
+hello on that session. The collector checks the pinned policy, topology and
+uplink before checked create and again after paused prelaunch, before CONT.
+The Docker fixture projection commits the separately held receiver inventory
+alongside the held fixture image, network profile and probe image. The
+collector compares the observer's full case, transport and receiver set
+against that inventory before create. The private capture frame binds the
+run, boot, generation and challenge to observations for those exact targets.
+Denial requires an attempt, zero arrivals and positive controls on both sides
+of the window. The route-drift verdict also requires observed delivery on
+distinct established TCP and UDP flows, one change from the checked pre-CONT
+route, and closure and subsequent refusal attributed to each flow. The stock
+comparison belongs to the separate TEST receipt. The endpoint
+brackets the boot-bound origin exchange with exact loopback listener PID
+checks. The Windows probe derives the expected PID from the live held Job
+child. Hosted tests substitute deterministic peers and exercise the same
+collector and marker-last writer. The Docker CLI refuses before claiming
+output until checked native creation, live route enforcement and the reviewed
+capture and HTTPS adapters are wired. The owner preflights a separate E1a
+copy without changing the held bundle predicate.
+[Docker qualification runbook](../docker-qualification.md)
+
+### 7c amendment — in-flight native monitoring
+
+The checked core refreshes the selected host and console observations and
+checks the same held child, Job limits and input custody while installed
+boot, installer shutdown, guest ping or script, or a helper is pending.
+An observation is required before the wait, at one-second poll intervals,
+and before accepting a successful result. Helpers and installer shutdown
+can observe a child that has already exited when its held Job is empty.
+Foreground admission can also sample caller-available and total free space
+from the same held volumes before applying the durable capacity ledger.
+Helper and installer resume check cancellation and the exclusive effect
+cutoff after revalidation, and again after any handoff and the final Job
+verification, immediately before the suspended thread is released.
+
+The foreground exposes monitored guest calls. A boot or guest failure
+stops the owned launch and carries its disposition with the exact held
+generation proof if release was confirmed. Helpers settle through the same
+worker-join and writer-exclusion checks after a monitor failure. An absent
+proof keeps the charge quarantined. The console activity source is shared
+with preflight and qualification. Native monitoring and teardown are
+**unverified on real hardware**.

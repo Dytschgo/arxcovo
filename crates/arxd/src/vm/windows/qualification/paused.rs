@@ -13,7 +13,11 @@ pub use native::{
 
 use super::*;
 use crate::vm::guest::network_probe::WitnessReport;
-use crate::vm::qualification_record::ControlledFault;
+use crate::vm::qmp::RunStatus;
+use crate::vm::qualification_record::{
+    ControlledFault, PausedCheck, PausedChildState, PausedDispatchState, PausedLivenessGate,
+    PausedQmpStep, PausedSnapshot, ReserveCheck, ReserveFailure, ReserveStep,
+};
 use crate::vm::{qmp::bounded, runtime::capacity};
 use std::{
     cell::Cell,
@@ -379,10 +383,79 @@ async fn firmware_sec(mut source: impl AsyncRead + Unpin) -> Result<(), Failure>
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Failure {
     Refused(NativeRefusal),
+    Reserve(ReserveFailure),
+    Paused(PausedCheck),
     OwnerActive,
     Qmp(ChannelError),
     Timeout,
     Cancelled,
+}
+
+impl Failure {
+    fn reserve(step: ReserveStep, failure: ReserveCheck) -> Self {
+        Self::Reserve(ReserveFailure { step, failure })
+    }
+
+    fn native_refusal(self) -> Option<NativeRefusal> {
+        match self {
+            Self::Refused(reason) => Some(reason),
+            Self::Reserve(_) => Some(NativeRefusal::ReservesUnverified),
+            Self::Paused(
+                PausedCheck::WhpxChannel { .. }
+                | PausedCheck::WhpxNotEnabled
+                | PausedCheck::WhpxAcceleratorCount { .. }
+                | PausedCheck::WhpxPresenceCount { .. }
+                | PausedCheck::WhpxUnknownAccelerator,
+            ) => Some(NativeRefusal::WhpxUnverified),
+            // The liveness gates keep their Job refusal for other launch purposes.
+            Self::Paused(PausedCheck::AcceleratorChildLiveness { .. }) => {
+                Some(NativeRefusal::JobUnverified)
+            }
+            Self::Paused(_) => Some(NativeRefusal::QmpUnverified),
+            _ => None,
+        }
+    }
+
+    fn at_qmp(self, step: PausedQmpStep) -> Self {
+        match self {
+            Self::Qmp(error) => Self::Paused(PausedCheck::QmpChannel { step, error }),
+            Self::Timeout => Self::Paused(PausedCheck::QmpChannel {
+                step,
+                error: ChannelError::Timeout,
+            }),
+            Self::Cancelled => Self::Paused(PausedCheck::QmpChannel {
+                step,
+                error: ChannelError::Cancelled,
+            }),
+            other => other,
+        }
+    }
+    fn at_confirmation(self, step: PausedQmpStep) -> Self {
+        let error = match self {
+            Self::Timeout => ChannelError::Timeout,
+            Self::Cancelled => ChannelError::Cancelled,
+            other => return other,
+        };
+        Self::Paused(PausedCheck::DispatchInterrupted { step, error })
+    }
+}
+
+fn milliseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn sample_age(captured: Tick, now: Tick) -> Result<Duration, ReserveCheck> {
+    now.checked_duration_since(captured)
+        .ok_or_else(|| ReserveCheck::SampleFuture {
+            ahead_ms: milliseconds(captured.duration_since(now)),
+        })
+}
+
+fn stale_sample(age: Duration, limit: Duration) -> ReserveCheck {
+    ReserveCheck::SampleStale {
+        age_ms: milliseconds(age),
+        limit_ms: milliseconds(limit),
+    }
 }
 
 impl From<NativeRefusal> for Failure {
@@ -417,30 +490,54 @@ struct Live {
 }
 
 impl Live {
-    fn check(&self, envelope: JobEnvelope, now: Tick) -> Result<(), Failure> {
-        let reserves = NativeRefusal::ReservesUnverified;
-        fresh_observation(self.captured.into_std(), now.into_std(), reserves)?;
+    fn check(&self, envelope: JobEnvelope, now: Tick, step: ReserveStep) -> Result<(), Failure> {
+        let refuse = |failure| Failure::reserve(step, failure);
+        let age = sample_age(self.captured, now).map_err(refuse)?;
+        if age > FRESHNESS {
+            return Err(refuse(stale_sample(age, FRESHNESS)));
+        }
         if !self.idle {
             return Err(Failure::OwnerActive);
         }
         if !self.whpx {
             return Err(NativeRefusal::WhpxUnverified.into());
         }
+        let job_bytes = envelope.job_memory_bytes as u64;
         let ram_needed = RAM_RESERVE
-            .checked_add(envelope.job_memory_bytes as u64)
+            .checked_add(job_bytes)
             .and_then(|bytes| bytes.checked_add(envelope.outside_ram_bytes))
-            .ok_or(reserves)?;
-        // A Job rate is in units of 1/100 percent. Bound it against the
-        // global capacity and leave the rounded-up half of effective CPUs.
-        let cpus = u64::from(self.effective_cpus);
+            .ok_or_else(|| {
+                refuse(ReserveCheck::EnvelopeOverflow {
+                    owner_bytes: RAM_RESERVE,
+                    job_bytes,
+                    outside_bytes: envelope.outside_ram_bytes,
+                })
+            })?;
+        if self.effective_cpus < 2 || self.effective_cpus > self.active_cpus {
+            return Err(refuse(ReserveCheck::EffectiveCpus {
+                measured_count: self.effective_cpus,
+                minimum_count: 2,
+                active_count: self.active_cpus,
+            }));
+        }
+        // A Job rate is in basis points. Leave the rounded-up half of the
+        // effective CPUs, subject to the global 100% bound.
+        let capacity = (u64::from(self.effective_cpus) / 2) * 10_000;
         let rate = u64::from(envelope.job_cpu_rate) + u64::from(envelope.outside_cpu_rate);
-        if self.effective_cpus < 2
-            || self.effective_cpus > self.active_cpus
-            || rate > 10_000
-            || u64::from(self.active_cpus) * rate > (cpus / 2) * 10_000
-            || self.available_ram_bytes < ram_needed
-        {
-            return Err(reserves.into());
+        let active = u64::from(self.active_cpus);
+        if rate > 10_000 || active * rate > capacity {
+            return Err(refuse(ReserveCheck::CpuRate {
+                active_count: self.active_cpus,
+                effective_count: self.effective_cpus,
+                requested_basis_points: rate,
+                allowed_basis_points: (capacity / active).min(10_000),
+            }));
+        }
+        if self.available_ram_bytes < ram_needed {
+            return Err(refuse(ReserveCheck::AvailableRam {
+                available_bytes: self.available_ram_bytes,
+                required_bytes: ram_needed,
+            }));
         }
         self.check_disk(envelope.inner_bytes, envelope.outer_bytes)?;
         Ok(())
@@ -486,6 +583,19 @@ impl Live {
     }
 }
 
+/// Runs the accelerator query between the held child's two liveness gates.
+/// Both gates stay in place. A refusal names its gate as a paused check, so
+/// the paused result keeps the step and takes its pre-stop snapshot.
+async fn between_liveness_gates(
+    live: impl Fn() -> Result<(), NativeRefusal>,
+    query: impl Future<Output = Result<(), Failure>>,
+) -> Result<(), Failure> {
+    let refused = |gate| Failure::Paused(PausedCheck::AcceleratorChildLiveness { gate });
+    live().map_err(|_| refused(PausedLivenessGate::BeforeAcceleratorQuery))?;
+    query.await?;
+    live().map_err(|_| refused(PausedLivenessGate::AfterAcceleratorConfirmation))
+}
+
 struct Pipes<R, W> {
     stdout: R,
     stdin: W,
@@ -512,7 +622,7 @@ trait Host {
     /// When a controlled fault is armed on the active slot, the next sample
     /// checks a fresh real sample, records it, applies the mutation and
     /// returns the resulting refusal through the exact live monitoring path.
-    fn live(&self, envelope: JobEnvelope) -> Result<Live, NativeRefusal>;
+    fn live(&self, envelope: JobEnvelope, step: ReserveStep) -> Result<Live, Failure>;
     /// Acquire the charged slot atomically, or fail without acquiring it.
     fn claim(&mut self, live: &Live, envelope: JobEnvelope) -> Result<Self::Slot, NativeRefusal>;
     /// Complete any wait needed to confirm the already owned claim.
@@ -522,7 +632,7 @@ trait Host {
         slot: &Self::Slot,
         plan: &PausedPlan<'_>,
         opens: &Self::Opens,
-    ) -> Result<(), NativeRefusal>;
+    ) -> Result<(), Failure>;
     /// Verify held image identity, the restricted child token, creation-time
     /// assignment and the effective one-process Job before releasing the OS
     /// hold. The pipe worker gates the actual write, not the enqueue.
@@ -530,7 +640,7 @@ trait Host {
         &self,
         slot: &Self::Slot,
         envelope: JobEnvelope,
-    ) -> Result<Pipes<Self::Reader, Self::Writer>, NativeRefusal>;
+    ) -> Result<Pipes<Self::Reader, Self::Writer>, Failure>;
     async fn resume(&self, slot: &Self::Slot) -> Result<(), NativeRefusal>;
     /// Recheck the held bundle and any media drive bindings after prelaunch.
     async fn verify_opens(
@@ -578,6 +688,11 @@ trait Host {
     }
 
     fn completed_stop_protocol(&self, _slot: &Self::Slot) -> Option<StopProtocol> {
+        None
+    }
+
+    /// Capture diagnostic state only, before any stop or release checks.
+    fn refusal_snapshot(&self, _slot: &Self::Slot) -> Option<PausedSnapshot> {
         None
     }
 
@@ -660,6 +775,7 @@ impl<H: Host> Drop for Settlement<'_, H> {
 struct TrialResult {
     paused: Result<(), Failure>,
     release: StopDisposition,
+    snapshot: Option<PausedSnapshot>,
 }
 
 fn before(cancel: &Shutdown, cutoff: Tick) -> Result<Tick, Failure> {
@@ -702,14 +818,28 @@ impl Freshness {
     fn fresh_at(self, now: Tick) -> bool {
         (self.captured..self.deadline()).contains(&now)
     }
+
+    fn check(self, now: Tick, step: ReserveStep) -> Result<(), Failure> {
+        if self.fresh_at(now) {
+            return Ok(());
+        }
+        let limit = self.deadline().saturating_duration_since(self.captured);
+        let failure = match sample_age(self.captured, now) {
+            Ok(age) => stale_sample(age, limit),
+            Err(failure) => failure,
+        };
+        Err(Failure::reserve(step, failure))
+    }
 }
 
 /// Timers wake the supervisor, but each decision compares the monotonic
 /// clock to the same pressure, observation and effect deadlines.
 struct LivePoll<'a> {
     cancel: &'a Shutdown,
-    recheck: &'a dyn Fn() -> Result<Tick, Failure>,
+    recheck: &'a dyn Fn(ReserveStep) -> Result<Tick, Failure>,
     observation: Cell<Freshness>,
+    step: Cell<ReserveStep>,
+    qmp_step: Cell<PausedQmpStep>,
     stale: Cell<bool>,
     refused: Cell<Option<Failure>>,
 }
@@ -717,13 +847,15 @@ struct LivePoll<'a> {
 impl<'a> LivePoll<'a> {
     fn new(
         cancel: &'a Shutdown,
-        recheck: &'a dyn Fn() -> Result<Tick, Failure>,
+        recheck: &'a dyn Fn(ReserveStep) -> Result<Tick, Failure>,
         observation: Freshness,
     ) -> Self {
         Self {
             cancel,
             recheck,
             observation: Cell::new(observation),
+            step: Cell::new(ReserveStep::PostClaim),
+            qmp_step: Cell::new(PausedQmpStep::Greeting),
             stale: Cell::new(false),
             refused: Cell::new(None),
         }
@@ -741,12 +873,11 @@ impl<'a> LivePoll<'a> {
     fn sample(&self) -> Result<Freshness, Failure> {
         let cutoff = self.cutoff();
         before(self.cancel, cutoff)?;
-        let captured = (self.recheck)()?;
+        let step = self.step.get();
+        let captured = (self.recheck)(step)?;
         let now = before(self.cancel, cutoff)?;
         let observation = Freshness::new(captured, now, cutoff);
-        if !observation.fresh_at(now) {
-            return Err(NativeRefusal::ReservesUnverified.into());
-        }
+        observation.check(now, step)?;
         self.stale.set(false);
         self.observation.set(observation);
         Ok(observation)
@@ -862,12 +993,18 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for LiveWriter<'_, I> {
             let window = match state {
                 Dispatch::Idle => {
                     let deadline = observation.deadline().into_std();
-                    if let Err(reason) =
-                        dispatch.arm_until(observation.captured.into_std(), Some(deadline))
+                    if dispatch
+                        .arm_until(observation.captured.into_std(), Some(deadline))
+                        .is_err()
                     {
                         // Prefer the current live refusal if the effect
                         // expired while waiting for the dispatch lock.
-                        let failure = gate.require_fresh().err().unwrap_or_else(|| reason.into());
+                        let failure = gate.require_fresh().err().unwrap_or_else(|| {
+                            Failure::reserve(
+                                ReserveStep::Dispatch,
+                                ReserveCheck::DispatchArmRefused,
+                            )
+                        });
                         gate.refused.set(Some(failure));
                         return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
                     }
@@ -877,7 +1014,11 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for LiveWriter<'_, I> {
                 | Dispatch::Writing(deadline)
                 | Dispatch::WrittenInTime(deadline) => deadline,
                 Dispatch::Expired | Dispatch::Ambiguous => {
-                    gate.refused.set(Some(Failure::Qmp(ChannelError::Refused)));
+                    gate.refused
+                        .set(Some(Failure::Paused(PausedCheck::DispatchNotWritable {
+                            step: gate.qmp_step.get(),
+                            state: dispatch_state(state),
+                        })));
                     return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
                 }
             };
@@ -887,9 +1028,13 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for LiveWriter<'_, I> {
                 gate.refused.set(Some(reason));
                 return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
             }
-            if Tick::now().into_std() >= window {
-                gate.refused
-                    .set(Some(NativeRefusal::ReservesUnverified.into()));
+            if let Some(overdue) = Tick::now().into_std().checked_duration_since(window) {
+                gate.refused.set(Some(Failure::reserve(
+                    ReserveStep::Dispatch,
+                    ReserveCheck::DispatchWindowExpired {
+                        overdue_ms: milliseconds(overdue),
+                    },
+                )));
                 return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
             }
             io.poll_write(cx, bytes)
@@ -905,11 +1050,30 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for LiveWriter<'_, I> {
     }
 }
 
-async fn confirm_dispatch(dispatch: &DispatchGate) -> Result<(), Failure> {
+fn dispatch_state(state: Dispatch) -> PausedDispatchState {
+    match state {
+        Dispatch::Idle => PausedDispatchState::Idle,
+        Dispatch::Armed(_) => PausedDispatchState::Armed,
+        Dispatch::Writing(_) => PausedDispatchState::Writing,
+        Dispatch::WrittenInTime(_) => PausedDispatchState::WrittenInTime,
+        Dispatch::Expired => PausedDispatchState::Expired,
+        Dispatch::Ambiguous => PausedDispatchState::Ambiguous,
+    }
+}
+
+async fn confirm_dispatch(dispatch: &DispatchGate, step: PausedQmpStep) -> Result<(), Failure> {
+    const WAIT_MS: u64 = 100;
     dispatch
-        .settle(Duration::from_millis(100))
+        .settle_observed(Duration::from_millis(WAIT_MS))
         .await
-        .map_err(|_| Failure::Qmp(ChannelError::Refused))
+        .map_err(|(state, wait_finished)| {
+            Failure::Paused(PausedCheck::DispatchUnconfirmed {
+                step,
+                state: dispatch_state(state),
+                wait_limit_ms: WAIT_MS,
+                wait_finished,
+            })
+        })
 }
 
 async fn observe<T>(action: impl Future<Output = Result<T, NativeRefusal>>) -> Result<T, Failure> {
@@ -926,15 +1090,27 @@ async fn launch_paused<H: Host>(
 ) -> Result<(), Failure> {
     gate.watch(observe(host.confirm_claim(slot))).await?;
     gate.sample()?;
-    gate.watch(observe(host.create_suspended(slot, plan, opens)))
-        .await?;
+    gate.step.set(ReserveStep::PreCreate);
+    let create = host.create_suspended(slot, plan, opens);
+    gate.watch(async {
+        create.await?;
+        gate.step.set(ReserveStep::PostCreate);
+        Ok(())
+    })
+    .await?;
     gate.sample()?;
-    let pipes = gate
-        .watch(observe(host.verify_child(slot, envelope)))
-        .await?;
+    let pipes = gate.watch(host.verify_child(slot, envelope)).await?;
+    gate.step.set(ReserveStep::PreResume);
     gate.sample()?;
-    gate.watch(observe(host.resume(slot))).await?;
+    let resume = host.resume(slot);
+    gate.watch(async {
+        resume.await?;
+        gate.step.set(ReserveStep::PostResume);
+        Ok(())
+    })
+    .await?;
     host.mark_phase_complete(slot, PausedPhase::SuspendedChild);
+    gate.step.set(ReserveStep::Monitoring);
 
     let Pipes {
         stdout,
@@ -960,29 +1136,74 @@ async fn launch_paused<H: Host>(
         stream: LiveIo { gate, inner: stdin },
         dispatch: &dispatch,
     };
+    let handshake_refusal = Cell::new(None);
     let mut peer = gate
-        .watch(async { Ok(bounded(cancel, cutoff, Qmp::handshake(stdout, stdin, cancel)).await?) })
-        .await?;
-    gate.watch(confirm_dispatch(&dispatch)).await?;
+        .watch(async {
+            Ok(bounded(
+                cancel,
+                cutoff,
+                Qmp::handshake_diagnosed(
+                    stdout,
+                    stdin,
+                    cancel,
+                    || gate.qmp_step.set(PausedQmpStep::Capabilities),
+                    |failure| handshake_refusal.set(Some(failure)),
+                ),
+            )
+            .await?)
+        })
+        .await
+        .map_err(|error| match (error, handshake_refusal.get()) {
+            (Failure::Qmp(_), Some(detail)) => Failure::Paused(detail),
+            _ => error.at_qmp(gate.qmp_step.get()),
+        })?;
+    gate.watch(confirm_dispatch(&dispatch, PausedQmpStep::Capabilities))
+        .await
+        .map_err(|error| error.at_confirmation(PausedQmpStep::Capabilities))?;
 
     gate.sample()?;
+    gate.qmp_step.set(PausedQmpStep::QueryStatus);
     let status = gate
         .watch(async { Ok(bounded(cancel, cutoff, peer.status(cancel)).await?) })
-        .await?;
-    gate.watch(confirm_dispatch(&dispatch)).await?;
-    if status != crate::vm::qmp::RunStatus::Prelaunch {
-        return Err(Failure::Qmp(ChannelError::Unexpected));
+        .await
+        .map_err(|error| error.at_qmp(PausedQmpStep::QueryStatus))?;
+    gate.watch(confirm_dispatch(&dispatch, PausedQmpStep::QueryStatus))
+        .await
+        .map_err(|error| error.at_confirmation(PausedQmpStep::QueryStatus))?;
+    if status != RunStatus::Prelaunch {
+        return Err(Failure::Paused(PausedCheck::QmpStatus {
+            measured: status,
+            required: RunStatus::Prelaunch,
+        }));
     }
     // A new observation must still admit the paused child after prelaunch.
     gate.sample()?;
 
+    let confirming_accelerator = Cell::new(false);
+    gate.qmp_step.set(PausedQmpStep::QueryAccelerators);
     gate.watch(host.verify_whpx(slot, async {
-        bounded(cancel, cutoff, peer.verify_whpx())
-            .await
-            .map_err(|_| NativeRefusal::WhpxUnverified)?;
-        confirm_dispatch(&dispatch).await
+        let refusal = Cell::new(None);
+        bounded(
+            cancel,
+            cutoff,
+            peer.verify_whpx_diagnosed(cancel, |failure| refusal.set(Some(failure))),
+        )
+        .await
+        .map_err(|error| {
+            Failure::Paused(refusal.get().unwrap_or(PausedCheck::WhpxChannel { error }))
+        })?;
+        confirming_accelerator.set(true);
+        confirm_dispatch(&dispatch, PausedQmpStep::QueryAccelerators).await
     }))
-    .await?;
+    .await
+    .map_err(|error| {
+        let step = PausedQmpStep::QueryAccelerators;
+        if confirming_accelerator.get() {
+            error.at_confirmation(step)
+        } else {
+            error.at_qmp(step)
+        }
+    })?;
     host.mark_phase_complete(slot, PausedPhase::Prelaunch);
     gate.sample()?;
 
@@ -1017,9 +1238,11 @@ async fn launch_paused<H: Host>(
             gate.watch(firmware_sec(LiveIo { gate, inner: pipe }))
                 .await?;
             host.mark_sec_marker(slot);
+            gate.qmp_step.set(PausedQmpStep::Quit);
             gate.watch(async { Ok(peer.quit(cancel, cutoff).await?) })
                 .await?;
-            gate.watch(confirm_dispatch(&dispatch)).await?;
+            gate.watch(confirm_dispatch(&dispatch, PausedQmpStep::Quit))
+                .await?;
             host.mark_stop_protocol_done(slot, StopProtocol::QmpQuit);
             Ok(())
         }
@@ -1058,9 +1281,11 @@ async fn launch_paused<H: Host>(
             .await?;
             host.mark_post_controls(slot);
             gate.sample()?;
+            gate.qmp_step.set(PausedQmpStep::Powerdown);
             gate.watch(async { Ok(peer.powerdown(cancel).await?) })
                 .await?;
-            gate.watch(confirm_dispatch(&dispatch)).await?;
+            gate.watch(confirm_dispatch(&dispatch, PausedQmpStep::Powerdown))
+                .await?;
             host.mark_stop_protocol_done(slot, StopProtocol::QmpPowerdown);
             Ok(())
         }
@@ -1083,25 +1308,29 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    gate.qmp_step.set(PausedQmpStep::ReleaseStartup);
     gate.watch(async {
         Ok(peer
             .release_startup_hold(cancel, || gate.require_fresh().is_ok())
             .await?)
     })
     .await?;
-    gate.watch(confirm_dispatch(dispatch)).await?;
+    gate.watch(confirm_dispatch(dispatch, PausedQmpStep::ReleaseStartup))
+        .await?;
     gate.sample()?;
+    gate.qmp_step.set(PausedQmpStep::QueryStatus);
     let status = gate.watch(async { Ok(peer.status(cancel).await?) }).await?;
-    gate.watch(confirm_dispatch(dispatch)).await?;
+    gate.watch(confirm_dispatch(dispatch, PausedQmpStep::QueryStatus))
+        .await?;
     if status != crate::vm::qmp::RunStatus::Running {
         return Err(Failure::Qmp(ChannelError::Unexpected));
     }
     Ok(())
 }
 
-fn sample(host: &impl Host, envelope: JobEnvelope) -> Result<Tick, Failure> {
-    let live = host.live(envelope)?;
-    live.check(envelope, Tick::now())?;
+fn sample(host: &impl Host, envelope: JobEnvelope, step: ReserveStep) -> Result<Tick, Failure> {
+    let live = host.live(envelope, step)?;
+    live.check(envelope, Tick::now(), step)?;
     Ok(live.captured)
 }
 
@@ -1116,13 +1345,12 @@ async fn run<H: Host>(
         before(cancel, cutoff)?;
         plan.verify_network_isolation()?;
         let (opens, envelope) = host.open_contract(plan)?;
-        let live = host.live(envelope)?;
+        let step = ReserveStep::Admission;
+        let live = host.live(envelope, step)?;
         let sampled = Tick::now();
-        live.check(envelope, sampled)?;
+        live.check(envelope, sampled, step)?;
         let observation = Freshness::new(live.captured, sampled, cutoff);
-        if !observation.fresh_at(before(cancel, cutoff)?) {
-            return Err(NativeRefusal::ReservesUnverified.into());
-        }
+        observation.check(before(cancel, cutoff)?, step)?;
         let slot = host.claim(&live, envelope)?;
         Ok((opens, envelope, slot, observation))
     })();
@@ -1132,6 +1360,7 @@ async fn run<H: Host>(
             return TrialResult {
                 paused: Err(failure),
                 release: StopDisposition::DirtyRelease,
+                snapshot: None,
             };
         }
     };
@@ -1142,7 +1371,7 @@ async fn run<H: Host>(
         stop_requested: false,
     };
     let paused = {
-        let recheck = || sample(settlement.host, envelope);
+        let recheck = |step| sample(settlement.host, envelope, step);
         let gate = LivePoll::new(cancel, &recheck, observation);
         launch_paused(
             settlement.host,
@@ -1154,6 +1383,15 @@ async fn run<H: Host>(
         )
         .await
     };
+    let snapshot = if matches!(plan.purpose, LaunchPurpose::Paused)
+        && matches!(paused, Err(Failure::Paused(_) | Failure::Qmp(_)))
+    {
+        settlement
+            .host
+            .refusal_snapshot(settlement.slot.as_ref().expect("settlement owns a slot"))
+    } else {
+        None
+    };
     // The effect deadline and caller cancellation cannot suppress cleanup.
     let release = settlement
         .finish(
@@ -1161,7 +1399,11 @@ async fn run<H: Host>(
             plan.purpose.stop_protocol(),
         )
         .await;
-    TrialResult { paused, release }
+    TrialResult {
+        paused,
+        release,
+        snapshot,
+    }
 }
 
 async fn by_deadline<T>(deadline: Tick, action: impl Future<Output = T>) -> Option<T> {

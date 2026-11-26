@@ -11,7 +11,7 @@ const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta
 const playwrightConfig = readFileSync(new URL('../playwright.config.ts', import.meta.url), 'utf8');
 const jobs = Object.fromEntries([...workflow.split('\njobs:\n')[1].matchAll(/^ {2}(\w+):\n([\s\S]*?)(?=^ {2}\w+:\n|$(?![\s\S]))/gm)].map(([, id, body]) => [id, body]));
 const matrix = '    strategy:\n      fail-fast: false\n      matrix:\n        os: [ubuntu-latest, windows-latest, macos-latest]\n';
-const rustTimeout = "    timeout-minutes: ${{ matrix.os == 'windows-latest' && 13 || 12 }}";
+const rustTimeout = "    timeout-minutes: ${{ matrix.os == 'windows-latest' && 20 || 12 }}";
 const gate = "if ('${{ needs.rust.result }}' -ne 'success' -or '${{ needs.ui.result }}' -ne 'success') { exit 1 }";
 const checkout = 'uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262';
 const steps = id => jobs[id].split('    steps:\n')[1].trimEnd().split(/^ {6}- /m).slice(1).map(step => step.trimEnd());
@@ -251,6 +251,8 @@ test('Rust retains every native, Python and package validation with exact comman
         run: python -I -B -m unittest discover -s tools/acceptance/m2 -v`,
     `name: Pin Windows cluster quarantine scope
         run: python -I -m unittest discover -s tools/ci -p 'test_windows_cluster_quarantine.py'`,
+    `name: Pin hosted guest PowerShell quarantine scope
+        run: python -I -B -m unittest discover -s tools/ci -p 'test_guest_ps_quarantine.py'`,
     'run: cargo fmt --all --check',
     `name: Verify pinned SQLite binding build
         shell: pwsh

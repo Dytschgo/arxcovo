@@ -497,6 +497,7 @@ pub(super) struct DockerInputEnrollment<'a> {
     pub(super) patched_bundle: &'a LocalPath,
     pub(super) fixture_image: EnrolledFile<'a>,
     pub(super) fixture_network_profile: EnrolledFile<'a>,
+    pub(super) receiver_inventory: EnrolledFile<'a>,
     pub(super) probe_image: EnrolledFile<'a>,
     pub(super) topology: EnrolledFile<'a>,
     pub(super) origin_profile: EnrolledFile<'a>,
@@ -514,6 +515,7 @@ pub(super) struct HeldDockerInputs<'a> {
     pub(super) stock: inventory::Bundle,
     stock_inventory: Hash,
     fixture: [PathPin; 3],
+    receiver_inventory: PathPin,
     topology: PathPin,
     origin_profile: PathPin,
 }
@@ -596,6 +598,10 @@ impl<'a> HeldDockerInputs<'a> {
                 private_input(enrollment.fixture_network_profile, MAX_ENROLLMENT_BYTES)?,
                 private_input(enrollment.probe_image, MAX_MEDIUM)?,
             ],
+            receiver_inventory: private_input(
+                enrollment.receiver_inventory,
+                super::docker_trial::witness::MAX_INVENTORY_BYTES,
+            )?,
             topology: private_input(enrollment.topology, MAX_METADATA)?,
             origin_profile: private_input(enrollment.origin_profile, MAX_ENROLLMENT_BYTES)?,
         })
@@ -610,6 +616,19 @@ impl<'a> HeldDockerInputs<'a> {
             self.stock_inventory,
             self.recipe.firmware[0].verified_content.ok_or(REFUSAL)?,
             deadline,
+        )
+    }
+
+    pub(super) fn receiver_enrollment(
+        &self,
+    ) -> Result<super::docker_trial::witness::ReceiverEnrollment, NativeRefusal> {
+        use super::docker_trial::witness::{MAX_INVENTORY_BYTES, ReceiverEnrollment};
+
+        let [image, network, probe] = &self.fixture;
+        recheck_file(&self.receiver_inventory)?;
+        ReceiverEnrollment::from_manifest(
+            &held_bytes(&self.receiver_inventory, MAX_INVENTORY_BYTES)?,
+            [measured(image)?, measured(network)?, measured(probe)?],
         )
     }
 
@@ -634,7 +653,6 @@ impl<'a> HeldDockerInputs<'a> {
             .protected(self.token.account.0, deadline)?;
         let review = self.patched.review;
         let [daemon, qualifier] = &self.release;
-        let [image, network, probe] = &self.fixture;
         let [code, vars] = &self.recipe.firmware;
         Ok(DockerDependencies {
             supervisor_image: measured(daemon)?,
@@ -655,10 +673,7 @@ impl<'a> HeldDockerInputs<'a> {
                 (measured(code)?, measured(vars)?),
             )?,
             stock_inventory: self.stock_inventory,
-            network_fixture: projection(
-                "arx-docker-fixture-v1",
-                (measured(image)?, measured(network)?, measured(probe)?),
-            )?,
+            network_fixture: self.receiver_enrollment()?.fixture(),
             signed_inputs: measured(&self.recipe.review.receipt_file)?,
             recipe: self.recipe.recipe,
             compose_protocol: arx_guest::compose::COMPOSE_PROTOCOL_VERSION,

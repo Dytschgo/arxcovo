@@ -723,6 +723,12 @@ impl Child {
 
     fn resume(&mut self) -> io::Result<()> {
         self.verify_live()?;
+        self.release_suspended()
+    }
+
+    /// Releases the retained primary thread without any further checks; the
+    /// caller verifies the live Job immediately before.
+    fn release_suspended(&mut self) -> io::Result<()> {
         let thread = self
             .suspended
             .take()
@@ -800,10 +806,21 @@ enum SpawnStage {
 struct SpawnError {
     stage: SpawnStage,
     error: io::Error,
+    partial: Option<PartialChild>,
+}
+
+#[derive(Debug)]
+struct PartialChild {
+    _process: Option<OwnedHandle>,
+    _thread: Option<OwnedHandle>,
 }
 
 fn at(stage: SpawnStage) -> impl FnOnce(io::Error) -> SpawnError {
-    move |error| SpawnError { stage, error }
+    move |error| SpawnError {
+        stage,
+        error,
+        partial: None,
+    }
 }
 
 fn spawn(
@@ -812,16 +829,15 @@ fn spawn(
     environment: &[u16],
     job: Job,
     stdio: Stdio,
-) -> Result<Child, SpawnError> {
-    let (process, thread) =
-        create_suspended(&launch, cwd, environment, Assignment::Job(&job), &stdio)?;
-    let child = Child {
-        job,
-        process,
-        suspended: Some(thread),
-    };
-    child.verify_live().map_err(at(SpawnStage::Verify))?;
-    Ok(child)
+) -> Result<Child, (SpawnError, Job)> {
+    match create_suspended(&launch, cwd, environment, Assignment::Job(&job), &stdio) {
+        Ok((process, thread)) => Ok(Child {
+            job,
+            process,
+            suspended: Some(thread),
+        }),
+        Err(error) => Err((error, job)),
+    }
 }
 
 fn create_suspended(
@@ -837,10 +853,7 @@ fn create_suspended(
         #[cfg(test)]
         Launch::Fixture { image, args } => (image, args),
     };
-    let recipe = |message| SpawnError {
-        stage: SpawnStage::Recipe,
-        error: io::Error::other(message),
-    };
+    let recipe = |message| at(SpawnStage::Recipe)(io::Error::other(message));
     if !image.is_absolute() || !cwd.is_absolute() || !environment.ends_with(&[0, 0]) {
         return Err(recipe("invalid launch recipe"));
     }
@@ -875,10 +888,9 @@ fn create_suspended(
         succeeded(unsafe { GetHandleInformation(handle, &mut flags) })
             .map_err(at(SpawnStage::Attributes))?;
         if handles[..index].contains(&handle) || flags & HANDLE_FLAG_INHERIT == 0 {
-            return Err(SpawnError {
-                stage: SpawnStage::Attributes,
-                error: io::Error::other("invalid inherited handle list"),
-            });
+            return Err(at(SpawnStage::Attributes)(io::Error::other(
+                "invalid inherited handle list",
+            )));
         }
     }
     // The guard copies and owns each value until after list destruction.
@@ -946,10 +958,17 @@ fn create_suspended(
     drop(attributes);
     // The kernel has created both handles and assigned the Job before any child instruction.
     let (process, thread) = unsafe { (owned(process.hProcess), owned(process.hThread)) };
-    Ok((
-        process.map_err(at(SpawnStage::Verify))?,
-        thread.map_err(at(SpawnStage::Verify))?,
-    ))
+    match (process, thread) {
+        (Ok(process), Ok(thread)) => Ok((process, thread)),
+        (process, thread) => Err(SpawnError {
+            stage: SpawnStage::Verify,
+            error: io::Error::other("process created without both handles"),
+            partial: Some(PartialChild {
+                _process: process.ok(),
+                _thread: thread.ok(),
+            }),
+        }),
+    }
 }
 
 fn quote_arg(out: &mut Vec<u16>, arg: &[u16]) -> io::Result<()> {
@@ -1057,16 +1076,37 @@ fn prove_serial_peer(
 }
 
 fn host_resources() -> Result<(u32, u64), NativeRefusal> {
+    measured_host_resources().map_err(|_| NativeRefusal::ReservesUnverified)
+}
+
+fn measured_host_resources() -> Result<(u32, u64), crate::vm::qualification_record::ReserveCheck> {
     let mut memory = MEMORYSTATUSEX {
         dwLength: size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
     };
     // Processor count spans groups; effective Job scope still needs qualification.
     let cpus = unsafe { GetActiveProcessorCount(u16::MAX) };
-    if cpus == 0 || unsafe { GlobalMemoryStatusEx(&mut memory) } == 0 || memory.ullAvailPhys == 0 {
-        return Err(NativeRefusal::ReservesUnverified);
+    check_host_resources(cpus, || {
+        (unsafe { GlobalMemoryStatusEx(&mut memory) } != 0).then_some(memory.ullAvailPhys)
+    })
+}
+
+fn check_host_resources(
+    cpus: u32,
+    memory: impl FnOnce() -> Option<u64>,
+) -> Result<(u32, u64), crate::vm::qualification_record::ReserveCheck> {
+    use crate::vm::qualification_record::ReserveCheck;
+
+    if cpus == 0 {
+        return Err(ReserveCheck::ActiveCpusUnavailable);
     }
-    Ok((cpus, memory.ullAvailPhys))
+    let available_bytes = memory().ok_or(ReserveCheck::MemoryStatusUnavailable)?;
+    // The source gate also refuses a successful zero before checking the
+    // launch envelope. Preserve that order under its own source label.
+    if available_bytes == 0 {
+        return Err(ReserveCheck::AvailableRamSourceZero);
+    }
+    Ok((cpus, available_bytes))
 }
 
 fn disk_free(root: &LocalPath) -> Result<(u64, u64), NativeRefusal> {
@@ -1730,6 +1770,7 @@ impl Worker {
     }
 }
 
+#[derive(Default)]
 struct WorkerSet {
     cancel: Shutdown,
     workers: Vec<Worker>,
@@ -1743,7 +1784,7 @@ impl WorkerSet {
         }
     }
 
-    async fn join(mut self, deadline: tokio::time::Instant) -> io::Result<()> {
+    async fn wait_stopped(&self, deadline: tokio::time::Instant) -> io::Result<()> {
         while self.workers.iter().any(|worker| !worker.0.is_finished()) {
             // A cancellation can race a worker entering its next system call.
             // Repeat until the threads finish or the launch must be quarantined.
@@ -1756,14 +1797,32 @@ impl WorkerSet {
             )
             .await;
         }
-        for worker in self.workers.drain(..) {
-            worker
-                .0
-                .join()
-                .map_err(|_| io::Error::other("stdio worker failed"))??;
-        }
         Ok(())
     }
+
+    async fn join(mut self, deadline: tokio::time::Instant) -> io::Result<()> {
+        match self.join_all(deadline).await? {
+            WorkersEnded { failed: false } => Ok(()),
+            WorkersEnded { failed: true } => Err(io::Error::other("stdio worker failed")),
+        }
+    }
+
+    /// Joins every handle, even after one worker returned an error or
+    /// panicked. A timeout keeps all handles for a later attempt. `Ok` proves
+    /// that every worker ended; `failed` separately reports how they ended.
+    async fn join_all(&mut self, deadline: tokio::time::Instant) -> io::Result<WorkersEnded> {
+        self.wait_stopped(deadline).await?;
+        let mut failed = false;
+        for worker in self.workers.drain(..) {
+            failed |= !matches!(worker.0.join(), Ok(Ok(())));
+        }
+        Ok(WorkersEnded { failed })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkersEnded {
+    failed: bool,
 }
 
 impl Drop for WorkerSet {
@@ -1960,6 +2019,12 @@ impl DispatchGate {
     /// any write it started, then accept only `WrittenInTime` and disarm.
     /// Every other outcome leaves the gate tripped.
     async fn settle(&self, limit: Duration) -> Result<(), NativeRefusal> {
+        self.settle_observed(limit)
+            .await
+            .map_err(|_| NativeRefusal::ReservesUnverified)
+    }
+
+    async fn settle_observed(&self, limit: Duration) -> Result<(), (Dispatch, bool)> {
         let mut watch = self.state.subscribe();
         let finished = matches!(
             tokio::time::timeout(
@@ -1969,20 +2034,17 @@ impl DispatchGate {
             .await,
             Ok(Ok(_))
         );
-        let mut accepted = false;
+        let mut refusal = None;
         self.state.send_modify(|state| match *state {
-            Dispatch::WrittenInTime(_) if finished => {
-                *state = Dispatch::Idle;
-                accepted = true;
+            Dispatch::WrittenInTime(_) if finished => *state = Dispatch::Idle,
+            observed => {
+                refusal = Some((observed, finished));
+                if !matches!(observed, Dispatch::Expired | Dispatch::Ambiguous) {
+                    *state = Dispatch::Ambiguous;
+                }
             }
-            Dispatch::Expired | Dispatch::Ambiguous => {}
-            _ => *state = Dispatch::Ambiguous,
         });
-        if accepted {
-            Ok(())
-        } else {
-            Err(NativeRefusal::ReservesUnverified)
-        }
+        refusal.map_or(Ok(()), Err)
     }
 }
 
@@ -1995,30 +2057,60 @@ impl Drop for WorkerStop {
     }
 }
 
-/// Bounded asynchronous ends of the synchronous pipes. A full output buffer
-/// applies backpressure, and stderr is drained without retaining peer bytes.
-fn start_stdio(
-    stdio: Stdio,
-    gate: std::sync::Arc<DispatchGate>,
-) -> io::Result<(tokio::io::DuplexStream, tokio::io::DuplexStream, WorkerSet)> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+/// Async end of the child's stdout. A native read failure in the output
+/// worker crosses the bridge as an I/O error. The closed duplex half alone
+/// would otherwise look like the peer's end of stream.
+struct PipeOutput {
+    stream: tokio::io::DuplexStream,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
-    let (reader, mut output) = duplex(8192);
-    let (writer, mut input) = duplex(8192);
-    let runtime = tokio::runtime::Handle::current();
-    let mut set = WorkerSet {
-        cancel: Shutdown::default(),
-        workers: Vec::new(),
-    };
+impl tokio::io::AsyncRead for PipeOutput {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::{sync::atomic::Ordering, task::Poll};
+        let filled = buf.filled().len();
+        let this = &mut *self;
+        let polled = std::pin::Pin::new(&mut this.stream).poll_read(cx, buf);
+        // Buffered bytes still drain first; only the end itself is classified.
+        if matches!(polled, Poll::Ready(Ok(())))
+            && buf.filled().len() == filled
+            && buf.remaining() > 0
+            && this.failed.load(Ordering::Acquire)
+        {
+            return Poll::Ready(Err(io::ErrorKind::Other.into()));
+        }
+        polled
+    }
+}
 
-    let cancel = set.cancel.clone();
-    let executor = runtime.clone();
-    set.workers.push(Worker::start("arx-vm-output", move || {
-        let mut pipe = File::from(stdio.output);
+/// Stdout worker. It publishes a read failure before it closes the bridge,
+/// so the reader classifies the end it observes as I/O, not EOF.
+fn start_output(
+    mut pipe: impl std::io::Read + Send + 'static,
+    cancel: Shutdown,
+    executor: tokio::runtime::Handle,
+) -> io::Result<(PipeOutput, Worker)> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    let (stream, mut output) = tokio::io::duplex(8192);
+    let failed = std::sync::Arc::new(AtomicBool::new(false));
+    let outcome = failed.clone();
+    let worker = Worker::start("arx-vm-output", move || {
         let mut bytes = [0; 4096];
         while !cancel.is_cancelled() {
-            let Some(count) = read_pipe(&mut pipe, &mut bytes, &cancel)? else {
-                break;
+            let count = match read_pipe(&mut pipe, &mut bytes, &cancel) {
+                Ok(Some(count)) => count,
+                Ok(None) => break,
+                Err(error) => {
+                    outcome.store(true, Ordering::Release);
+                    drop(output);
+                    return Err(error);
+                }
             };
             let result = executor.block_on(async {
                 tokio::select! {
@@ -2032,7 +2124,38 @@ fn start_stdio(
             }
         }
         Ok(())
-    })?);
+    })?;
+    Ok((PipeOutput { stream, failed }, worker))
+}
+
+/// Bounded asynchronous ends of the synchronous pipes. A full output buffer
+/// applies backpressure, and stderr is drained without retaining peer bytes.
+fn start_stdio(
+    stdio: Stdio,
+    gate: std::sync::Arc<DispatchGate>,
+) -> io::Result<(PipeOutput, tokio::io::DuplexStream, WorkerSet)> {
+    let mut workers = WorkerSet::default();
+    let (read, write) = attach_stdio(stdio, gate, &mut workers)?;
+    Ok((read, write, workers))
+}
+
+/// Every successfully started worker is recorded even if a later attach fails.
+fn attach_stdio(
+    stdio: Stdio,
+    gate: std::sync::Arc<DispatchGate>,
+    set: &mut WorkerSet,
+) -> io::Result<BootIo> {
+    use tokio::io::{AsyncReadExt, duplex};
+
+    let (writer, mut input) = duplex(8192);
+    let runtime = tokio::runtime::Handle::try_current().map_err(io::Error::other)?;
+
+    let (reader, output) = start_output(
+        File::from(stdio.output),
+        set.cancel.clone(),
+        runtime.clone(),
+    )?;
+    set.workers.push(output);
     let cancel = set.cancel.clone();
     set.workers.push(Worker::start("arx-vm-input", move || {
         let _stopped = WorkerStop(gate.clone());
@@ -2084,11 +2207,14 @@ fn start_stdio(
         while !cancel.is_cancelled() && read_pipe(&mut pipe, &mut bytes, &cancel)?.is_some() {}
         Ok(())
     })?);
-    Ok((reader, writer, set))
+    Ok((reader, writer))
 }
 
-fn read_pipe(pipe: &mut File, bytes: &mut [u8], cancel: &Shutdown) -> io::Result<Option<usize>> {
-    use std::io::Read;
+fn read_pipe(
+    pipe: &mut impl std::io::Read,
+    bytes: &mut [u8],
+    cancel: &Shutdown,
+) -> io::Result<Option<usize>> {
     match pipe.read(bytes) {
         Ok(0) => Ok(None),
         Ok(count) => Ok(Some(count)),
@@ -2475,6 +2601,8 @@ struct CheckedLaunchCore<'a> {
     pins: std::sync::Arc<[PathPin]>,
     setup_vars_handoff: Option<File>,
     writers: Vec<usize>,
+    memory: usize,
+    cpu_rate: u32,
     stock: StockLaunch<'a>,
     workspace: WorkspaceCustody<'a>,
     finalization: Option<(super::PairSlots, [usize; 2])>,
@@ -2482,12 +2610,103 @@ struct CheckedLaunchCore<'a> {
     installer: Option<InstallerStage>,
 }
 
+/// Creation custody comes from the kernel create edge, independent of the
+/// refusal reason. Keeping the Job also preserves kill-on-close.
+enum LaunchCreation {
+    NeverCreated,
+    Created(Box<CreatedChild>),
+    Unconfirmed {
+        job: Job,
+        _partial: Option<PartialChild>,
+    },
+}
+
+struct CreatedChild {
+    child: Child,
+    /// Retains every unjoined worker handle until settlement drains them.
+    workers: WorkerSet,
+    worker_failed: bool,
+}
+
+impl CreatedChild {
+    /// Confirms an exited child, an empty Job and that every stdio worker
+    /// ended. Any failure leaves the remaining custody for a later attempt.
+    async fn settle(&mut self, deadline: tokio::time::Instant) -> io::Result<()> {
+        self.workers.stop();
+        if !self.child.exited()? || self.child.job.active()? != 0 {
+            self.child.job.terminate()?;
+        }
+        // Reaping confirms both the child exit and an empty Job.
+        self.child.reap(deadline).await?;
+        let ended = self.workers.join_all(deadline).await?;
+        self.worker_failed |= ended.failed;
+        Ok(())
+    }
+}
+
+struct HoldRefusal {
+    reason: NativeRefusal,
+    creation: LaunchCreation,
+}
+
+impl From<NativeRefusal> for HoldRefusal {
+    fn from(reason: NativeRefusal) -> Self {
+        Self {
+            reason,
+            creation: LaunchCreation::NeverCreated,
+        }
+    }
+}
+
+impl HoldRefusal {
+    fn from_spawn((error, job): (SpawnError, Job)) -> Self {
+        let reason = NativeRefusal::JobUnverified;
+        if error.stage == SpawnStage::Verify || !matches!(job.active(), Ok(0)) {
+            let _ = job.terminate();
+            Self {
+                reason,
+                creation: LaunchCreation::Unconfirmed {
+                    job,
+                    _partial: error.partial,
+                },
+            }
+        } else {
+            reason.into()
+        }
+    }
+
+    fn created(reason: NativeRefusal, child: Child, workers: WorkerSet) -> Self {
+        workers.stop();
+        let _ = child.job.terminate();
+        Self {
+            reason,
+            creation: LaunchCreation::Created(Box::new(CreatedChild {
+                child,
+                workers,
+                worker_failed: false,
+            })),
+        }
+    }
+}
+
+fn attach_checked_child(
+    child: Child,
+    verify: impl FnOnce(&Child) -> Result<(), NativeRefusal>,
+    attach: impl FnOnce(&mut WorkerSet) -> Result<BootIo, NativeRefusal>,
+) -> Result<(Child, WorkerSet, BootIo), HoldRefusal> {
+    let mut workers = WorkerSet::default();
+    match verify(&child).and_then(|()| attach(&mut workers)) {
+        Ok(io) => Ok((child, workers, io)),
+        Err(reason) => Err(HoldRefusal::created(reason, child, workers)),
+    }
+}
+
 impl<'a> CheckedLaunchCore<'a> {
-    fn hold_checked(
+    fn hold_checked<T>(
         token: &'a VmToken,
         inputs: LaunchInputs<'a>,
-        refresh: impl FnOnce(&CommandPlan<'_>) -> Result<std::time::Instant, NativeRefusal>,
-    ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
+        refresh: impl FnOnce(&CommandPlan<'_>) -> Result<(std::time::Instant, T), NativeRefusal>,
+    ) -> Result<(Self, BootIo, T), HoldRefusal> {
         let kind = inputs.plan.kind();
         // ADR 0064: a public-egress plan also stays closed until its patched
         // build, policy custody and route evidence have native qualification.
@@ -2498,17 +2717,17 @@ impl<'a> CheckedLaunchCore<'a> {
                 | PlanKind::StaticComposeInstaller
                 | PlanKind::StaticComposeDetached
         ) {
-            return Err(NativeRefusal::NetworkFenceUnverified);
+            return Err(NativeRefusal::NetworkFenceUnverified.into());
         }
         match (kind, inputs.installer) {
             (PlanKind::InstallerBoot(phase), Some(stage))
                 if phase == stage.phase() && tokio::time::Instant::now() >= stage.deadline() =>
             {
-                return Err(NativeRefusal::InstallerDeadlineExpired);
+                return Err(NativeRefusal::InstallerDeadlineExpired.into());
             }
             (PlanKind::InstallerBoot(phase), Some(stage)) if phase == stage.phase() => {}
             (PlanKind::InstallerBoot(_), _) | (_, Some(_)) => {
-                return Err(NativeRefusal::InstallerPhaseMismatch);
+                return Err(NativeRefusal::InstallerPhaseMismatch.into());
             }
             _ => {}
         }
@@ -2547,7 +2766,7 @@ impl<'a> CheckedLaunchCore<'a> {
                 ))
             }
             (PlanKind::InstallerBoot(InstallerPhase::WindowsFinalize), None) | (_, Some(_)) => {
-                return Err(NativeRefusal::InstallerPhaseMismatch);
+                return Err(NativeRefusal::InstallerPhaseMismatch.into());
             }
             (_, None) => None,
         };
@@ -2591,13 +2810,14 @@ impl<'a> CheckedLaunchCore<'a> {
             .installer
             .is_some_and(|stage| tokio::time::Instant::now() >= stage.deadline())
         {
-            return Err(NativeRefusal::InstallerDeadlineExpired);
+            return Err(NativeRefusal::InstallerDeadlineExpired.into());
         }
         // Recheck all consumed inputs, bundle and workspace custody right at
         // the actual process-creation edge.
         stock.recheck_all(&inputs.pins, Some(&inputs.workspace))?;
+        let (captured, authority) = refresh(&inputs.plan)?;
         fresh_observation(
-            refresh(&inputs.plan)?,
+            captured,
             std::time::Instant::now(),
             NativeRefusal::ReservesUnverified,
         )?;
@@ -2611,45 +2831,31 @@ impl<'a> CheckedLaunchCore<'a> {
             job,
             stdio,
         )
-        .map_err(|_| NativeRefusal::JobUnverified)?;
-        // Every post-spawn error must explicitly terminate and wait on the
-        // created child/Job before returning.
-        let settle_spawned = |child: Child| {
-            let _ = child.job.terminate();
-            let _ = wait(&child.process, 2_000);
-            drop(child);
-        };
-        let program = if matches!(kind, PlanKind::Boot | PlanKind::InstallerBoot(_)) {
-            "qemu-system-x86_64.exe"
-        } else {
-            "qemu-img.exe"
-        };
-        let expected_image = match inputs.bundle.identity(program) {
-            Ok(id) => id,
-            Err(reason) => {
-                settle_spawned(child);
-                return Err(reason);
-            }
-        };
-        if let Err(reason) = verify_image(&child, inputs.plan.image(), expected_image)
-            .and_then(|()| verify_child_policy(&child, token))
-            .and_then(|()| {
+        .map_err(HoldRefusal::from_spawn)?;
+        let (child, workers, (read, write)) = attach_checked_child(
+            child,
+            |child| {
+                child
+                    .verify_live()
+                    .map_err(|_| NativeRefusal::JobUnverified)?;
+                let program = if matches!(kind, PlanKind::Boot | PlanKind::InstallerBoot(_)) {
+                    "qemu-system-x86_64.exe"
+                } else {
+                    "qemu-img.exe"
+                };
+                let expected_image = inputs.bundle.identity(program)?;
+                verify_image(child, inputs.plan.image(), expected_image)?;
+                verify_child_policy(child, token)?;
                 child
                     .job
                     .verify_limits(inputs.memory, Some(inputs.cpu_rate), Some(1))
                     .map_err(|_| NativeRefusal::JobUnverified)
-            })
-        {
-            settle_spawned(child);
-            return Err(reason);
-        }
-        let (read, write, workers) = match start_stdio(parent, gate.clone()) {
-            Ok(started) => started,
-            Err(_) => {
-                settle_spawned(child);
-                return Err(NativeRefusal::QmpUnverified);
-            }
-        };
+            },
+            |workers| {
+                attach_stdio(parent, gate.clone(), workers)
+                    .map_err(|_| NativeRefusal::QmpUnverified)
+            },
+        )?;
         Ok((
             Self {
                 child,
@@ -2658,22 +2864,199 @@ impl<'a> CheckedLaunchCore<'a> {
                 pins: inputs.pins.into(),
                 setup_vars_handoff,
                 writers,
+                memory: inputs.memory,
+                cpu_rate: inputs.cpu_rate,
                 stock,
                 workspace: inputs.workspace,
                 finalization,
                 kind,
                 installer: inputs.installer,
             },
-            read,
-            write,
+            (read, write),
+            authority,
         ))
     }
 }
 
-type PipeQmp = Qmp<tokio::io::DuplexStream, tokio::io::DuplexStream>;
+type PipeQmp = Qmp<PipeOutput, tokio::io::DuplexStream>;
 type SerialGuest = GuestChannel<tokio::net::windows::named_pipe::NamedPipeClient>;
-type BootIo = (tokio::io::DuplexStream, tokio::io::DuplexStream);
+type BootIo = (PipeOutput, tokio::io::DuplexStream);
 type HeldRelease = (StopDisposition, Option<HeldWriters>);
+
+const LIVE_POLL: Duration = Duration::from_secs(1);
+
+/// Keep polling the same operation and prefer refusal over a simultaneous
+/// result. The caller owns teardown after this future releases its I/O borrows.
+async fn monitor_running<T, E>(
+    work: impl std::future::Future<Output = Result<T, E>>,
+    mut observe: impl FnMut() -> Result<(), E>,
+    cancel: &Shutdown,
+    deadline: tokio::time::Instant,
+    interrupted: impl Fn(ChannelError) -> E,
+) -> Result<T, E> {
+    use tokio::time::Instant;
+    tokio::pin!(work);
+    let check = || {
+        if cancel.is_cancelled() {
+            Err(interrupted(ChannelError::Cancelled))
+        } else if Instant::now() >= deadline {
+            Err(interrupted(ChannelError::Timeout))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    // An observer refusal, like a work result, still takes the terminal
+    // sample and yields to cancellation or expiry before it is returned.
+    let result = match observe() {
+        Err(error) => Err(error),
+        Ok(()) => loop {
+            check()?;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break Err(interrupted(ChannelError::Cancelled)),
+                _ = tokio::time::sleep_until(deadline) => break Err(interrupted(ChannelError::Timeout)),
+                _ = tokio::time::sleep(LIVE_POLL) => {
+                    if let Err(error) = observe() {
+                        break Err(error);
+                    }
+                }
+                result = &mut work => break result,
+            }
+        },
+    };
+    let terminal = observe();
+    check()?;
+    result.and_then(|value| terminal.map(|()| value))
+}
+
+/// Release keeps its own teardown budget so custody evidence is collected
+/// after a refusal too. Output is accepted only if a host sample taken after
+/// release settles succeeds and its capture time is still fresh, and then
+/// cancellation and the original cutoff, checked after that sample, still
+/// allow it; this is the same order as the common monitor tail. The held
+/// release is returned in either case.
+async fn accept_after_release<T, E, R, S>(
+    result: Result<T, E>,
+    release: impl std::future::Future<Output = R>,
+    cancel: &Shutdown,
+    deadline: tokio::time::Instant,
+    recheck: impl FnOnce() -> S,
+    stale: E,
+    interrupted: impl Fn(ChannelError) -> E,
+) -> (Result<T, E>, R)
+where
+    S: std::future::Future<Output = Result<std::time::Instant, E>>,
+{
+    let release = release.await;
+    let result = match result {
+        Ok(value) => {
+            let sample = recheck().await.and_then(|captured| {
+                fresh_observation(
+                    captured,
+                    std::time::Instant::now(),
+                    NativeRefusal::ReservesUnverified,
+                )
+                .map_err(|_| stale)
+            });
+            if cancel.is_cancelled() {
+                Err(interrupted(ChannelError::Cancelled))
+            } else if tokio::time::Instant::now() >= deadline {
+                Err(interrupted(ChannelError::Timeout))
+            } else {
+                sample.map(|()| value)
+            }
+        }
+        Err(error) => Err(error),
+    };
+    (result, release)
+}
+
+trait InstallerChild {
+    fn observe(&self, captured: std::time::Instant) -> Result<(), NativeRefusal>;
+    async fn dispatch(
+        &self,
+        qmp: &mut PipeQmp,
+        cancel: &Shutdown,
+        stage: InstallerStage,
+        refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(), InstallerFailureReason>;
+    async fn exit(&self, by: tokio::time::Instant) -> Result<(), InstallerFailureReason>;
+}
+
+impl InstallerChild for CheckedLaunchCore<'_> {
+    fn observe(&self, captured: std::time::Instant) -> Result<(), NativeRefusal> {
+        self.check_running(|| Ok(captured), true)
+    }
+
+    async fn dispatch(
+        &self,
+        qmp: &mut PipeQmp,
+        cancel: &Shutdown,
+        stage: InstallerStage,
+        mut refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(), InstallerFailureReason> {
+        self.dispatch_cont(qmp, cancel, &mut refresh, Some(stage))
+            .await
+    }
+
+    async fn exit(&self, by: tokio::time::Instant) -> Result<(), InstallerFailureReason> {
+        self.child
+            .reap(by)
+            .await
+            .map_err(|_| InstallerFailureReason::ReleaseUnverified)?;
+        (self.child.exit_code() == Ok(0))
+            .then_some(())
+            .ok_or(InstallerFailureReason::ProcessFailed)
+    }
+}
+
+async fn installer_session(
+    child: &impl InstallerChild,
+    stage: InstallerStage,
+    (read, write): BootIo,
+    cancel: &Shutdown,
+    refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+) -> Result<(), InstallerFailureReason> {
+    use InstallerFailureReason as Failure;
+    use tokio::time::Instant;
+    let refresh = std::cell::RefCell::new(refresh);
+    monitor_running(
+        async {
+            let mut qmp = Qmp::installer_handshake(read, write, cancel, stage).await?;
+            qmp.verify_whpx(cancel).await.map_err(|error| match error {
+                ChannelError::Timeout | ChannelError::Cancelled => Failure::from(error),
+                _ => Failure::Native(NativeRefusal::WhpxUnverified),
+            })?;
+            child
+                .dispatch(&mut qmp, cancel, stage, || refresh.borrow_mut()())
+                .await?;
+            qmp.observe_installer_shutdown(cancel).await?;
+            // Keep QMP stdin open until the owned child exits.
+            let by = stage
+                .deadline()
+                .min(Instant::now() + Duration::from_secs(2));
+            let exited = tokio::time::timeout_at(by, child.exit(by))
+                .await
+                .map_err(|_| Failure::Timeout)?;
+            // Expiry wins: an exit observed at or after the grace cutoff is
+            // late even when it was already ready when polled.
+            if Instant::now() >= by {
+                return Err(Failure::Timeout);
+            }
+            exited
+        },
+        || {
+            refresh.borrow_mut()()
+                .and_then(|captured| child.observe(captured))
+                .map_err(Failure::Native)
+        },
+        cancel,
+        stage.deadline(),
+        Failure::from,
+    )
+    .await
+}
 
 enum BootOutcome {
     Installed(Box<(PipeQmp, SerialGuest)>),
@@ -2696,6 +3079,37 @@ impl From<ChannelError> for InstallerFailureReason {
 }
 
 impl CheckedLaunchCore<'_> {
+    fn check_running(
+        &self,
+        refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
+        allow_exited: bool,
+    ) -> Result<(), NativeRefusal> {
+        let job_error = NativeRefusal::JobUnverified;
+        let captured = refresh()?;
+        self.stock.recheck_all(&self.pins, Some(&self.workspace))?;
+        self.child
+            .job
+            .verify_limits(self.memory, Some(self.cpu_rate), Some(1))
+            .map_err(|_| job_error)?;
+        let live = self
+            .child
+            .verify_live()
+            .map_err(|_| job_error)
+            .and_then(|_| verify_child_policy(&self.child, self.stock.token));
+        if let Err(reason) = live
+            && !(allow_exited
+                && self.child.exited().is_ok_and(|exited| exited)
+                && matches!(self.child.job.active(), Ok(0)))
+        {
+            return Err(reason);
+        }
+        fresh_observation(
+            captured,
+            std::time::Instant::now(),
+            NativeRefusal::ReservesUnverified,
+        )
+    }
+
     async fn helper(
         &mut self,
         io: BootIo,
@@ -2731,39 +3145,50 @@ impl CheckedLaunchCore<'_> {
                 return Err(NativeRefusal::QualificationMissing);
             }
             self.stock.recheck_all(&self.pins, Some(&self.workspace))?;
-            self.child.resume_checked(cancel, &mut refresh)?;
-            let mut output = Vec::new();
-            (&mut read)
-                .take(16 * 1024 + 1)
-                .read_to_end(&mut output)
-                .await
-                .map_err(|_| refused)?;
-            self.child.reap(deadline).await.map_err(|_| refused)?;
-            if output.len() > 16 * 1024 || self.child.exit_code()? != 0 {
-                return Err(refused);
-            }
-            Ok(output)
+            self.child
+                .resume_checked_by(cancel, deadline, &mut refresh)?;
+            monitor_running(
+                async {
+                    let mut output = Vec::new();
+                    (&mut read)
+                        .take(16 * 1024 + 1)
+                        .read_to_end(&mut output)
+                        .await
+                        .map_err(|_| refused)?;
+                    self.child.reap(deadline).await.map_err(|_| refused)?;
+                    if output.len() > 16 * 1024 || self.child.exit_code()? != 0 {
+                        return Err(refused);
+                    }
+                    Ok(output)
+                },
+                || self.check_running(&mut refresh, true),
+                cancel,
+                deadline,
+                |_| refused,
+            )
+            .await
         };
-        let result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(refused),
-            _ = tokio::time::sleep_until(deadline) => Err(refused),
-            result = work => result,
-        };
+        let result = work.await;
         drop(write);
         if result.is_err() && self.child.job.terminate().is_err() {
             return (result, (StopDisposition::ChargedQuarantine, None));
         }
         let successful = result.is_ok();
-        let release = self
-            .release_evidence_held(
+        accept_after_release(
+            result,
+            self.release_evidence_held(
                 successful,
                 successful,
                 tokio::time::Instant::now() + Duration::from_secs(5),
                 verify_release,
-            )
-            .await;
-        (result, release)
+            ),
+            cancel,
+            deadline,
+            || std::future::ready(refresh()),
+            NativeRefusal::ReservesUnverified,
+            |_| refused,
+        )
+        .await
     }
 
     async fn boot(
@@ -2787,37 +3212,48 @@ impl CheckedLaunchCore<'_> {
         self.child
             .resume_checked(cancel, &mut revalidate)
             .map_err(BootFailure::Native)?;
-        // Workers are already draining. Do not await the QMP greeting while
-        // QEMU may be waiting for a client at CreateNamedPipe/ConnectNamedPipe.
-        let pipe = connect_serial(
-            serial,
-            &self.child,
-            token.account.0,
-            &token.entries(),
+        // The periodic monitor and cont gate both sample synchronously on the
+        // same task. The cell shares the sampler without a borrow across I/O.
+        let refresh = std::cell::RefCell::new(revalidate);
+        monitor_running(
+            async {
+                // QEMU can wait for a serial client before sending QMP greeting.
+                let pipe = connect_serial(
+                    serial,
+                    &self.child,
+                    token.account.0,
+                    &token.entries(),
+                    cancel,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .await?;
+                let (read, write) = io;
+                let mut qmp = Qmp::handshake(read, write, cancel)
+                    .await
+                    .map_err(|_| NativeRefusal::QmpUnverified)?;
+                qmp.verify_whpx(cancel)
+                    .await
+                    .map_err(|_| NativeRefusal::WhpxUnverified)?;
+                self.dispatch_cont(&mut qmp, cancel, &mut || refresh.borrow_mut()(), None)
+                    .await
+                    .map_err(|error| match error {
+                        InstallerFailureReason::Native(reason) => reason,
+                        _ => NativeRefusal::QmpUnverified,
+                    })?;
+                let guest = GuestChannel::ready(pipe, &mut qmp, cancel)
+                    .await
+                    .map_err(|_| NativeRefusal::GuestEndpointUnverified)?;
+                Ok(BootOutcome::Installed(Box::new((qmp, guest))))
+            },
+            || self.check_running(&mut *refresh.borrow_mut(), false),
             cancel,
-            tokio::time::Instant::now() + Duration::from_secs(10),
+            tokio::time::Instant::now()
+                + super::guest::GUEST_READY_BUDGET
+                + Duration::from_secs(60),
+            |_| NativeRefusal::QmpUnverified,
         )
         .await
-        .map_err(BootFailure::Native)?;
-        let (read, write) = io;
-        let mut qmp = Qmp::handshake(read, write, cancel)
-            .await
-            .map_err(|_| BootFailure::Native(NativeRefusal::QmpUnverified))?;
-        qmp.verify_whpx()
-            .await
-            .map_err(|_| BootFailure::Native(NativeRefusal::WhpxUnverified))?;
-        self.dispatch_cont(&mut qmp, cancel, &mut revalidate, None)
-            .await
-            .map_err(|error| {
-                BootFailure::Native(match error {
-                    InstallerFailureReason::Native(reason) => reason,
-                    _ => NativeRefusal::QmpUnverified,
-                })
-            })?;
-        let guest = GuestChannel::ready(pipe, &mut qmp, cancel)
-            .await
-            .map_err(|_| BootFailure::Native(NativeRefusal::GuestEndpointUnverified))?;
-        Ok(BootOutcome::Installed(Box::new((qmp, guest))))
+        .map_err(BootFailure::Native)
     }
 
     async fn dispatch_cont(
@@ -2879,7 +3315,7 @@ impl CheckedLaunchCore<'_> {
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<BootOutcome, (InstallerFailure, Option<HeldWriters>)> {
         use InstallerFailureReason as Failure;
-        use tokio::time::{Instant, sleep_until};
+        use tokio::time::Instant;
         let grace = Duration::from_secs(2);
         let deadline = stage.deadline();
         let result = async {
@@ -2889,43 +3325,16 @@ impl CheckedLaunchCore<'_> {
             if Instant::now() >= deadline {
                 return Err(Failure::Timeout);
             }
-            self.child.resume_checked_with_handoff(cancel, revalidate, || {
-                // QEMU opens writable pflash by name after resume. The
-                // original object and ancestry pin stays held across it.
-                drop(self.setup_vars_handoff.take());
-            }).map_err(Failure::Native)?;
-            let (read, write) = io;
-            let mut qmp = Qmp::installer_handshake(read, write, cancel, stage).await?;
-            qmp.verify_whpx().await.map_err(|_| Failure::Native(NativeRefusal::WhpxUnverified))?;
-            self.dispatch_cont(&mut qmp, cancel, revalidate, Some(stage)).await?;
-            {
-                let progress = qmp.observe_installer_shutdown(cancel);
-                tokio::pin!(progress);
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => return Err(Failure::Cancelled),
-                        result = &mut progress => { result?; break; }
-                        _ = tokio::time::sleep(FRESHNESS) => {
-                            let captured = revalidate().map_err(Failure::Native)?;
-                            fresh_observation(captured, std::time::Instant::now(), NativeRefusal::ReservesUnverified)
-                                .map_err(Failure::Native)?;
-                        }
-                    }
-                }
-            }
-            // Keep QMP's stdin open while QEMU exits voluntarily.
-            let exit_by = deadline.min(Instant::now() + grace);
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => Err(Failure::Cancelled),
-                _ = sleep_until(exit_by) => Err(Failure::Timeout),
-                result = self.child.reap(exit_by) => {
-                    result.map_err(|_| Failure::ReleaseUnverified)?;
-                    (self.child.exit_code() == Ok(0)).then_some(()).ok_or(Failure::ProcessFailed)
-                }
-            }
-        }.await;
+            self.child
+                .resume_checked_with_handoff(cancel, Some(deadline), revalidate, || {
+                    // QEMU opens writable pflash by name after resume. The
+                    // original object and ancestry pin stays held across it.
+                    drop(self.setup_vars_handoff.take());
+                })
+                .map_err(Failure::Native)?;
+            installer_session(self, stage, io, cancel, &mut *revalidate).await
+        }
+        .await;
 
         let release_by = match result {
             Ok(()) => deadline.min(Instant::now() + grace),
@@ -2944,9 +3353,30 @@ impl CheckedLaunchCore<'_> {
                 Instant::now() + grace
             }
         };
-        let (observed, held) = self
-            .release_evidence_held(result.is_ok(), result.is_ok(), release_by, verify_release)
-            .await;
+        let successful = result.is_ok();
+        let mut result = result;
+        let (observed, held) = {
+            let release =
+                self.release_evidence_held(successful, successful, release_by, verify_release);
+            tokio::pin!(release);
+            // Schedule the next sample after the previous one returns so a
+            // slow observation cannot starve the independently bounded release.
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled(), if result.is_ok() => result = Err(Failure::Cancelled),
+                    _ = tokio::time::sleep(LIVE_POLL), if result.is_ok() => {
+                        result = revalidate().map(|_| ()).map_err(Failure::Native);
+                    }
+                    proof = &mut release => break proof,
+                }
+            }
+        };
+        if result.is_ok() {
+            result = self
+                .check_running(revalidate, true)
+                .map_err(Failure::Native);
+        }
         if let Err(failure) = stage.complete(result, observed, cancel.is_cancelled()) {
             return Err((failure, held));
         }
@@ -3118,12 +3548,26 @@ impl Child {
         cancel: &Shutdown,
         revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
-        self.resume_checked_with_handoff(cancel, revalidate, || {})
+        self.resume_checked_with_handoff(cancel, None, revalidate, || {})
+    }
+
+    /// Resume only while the exclusive effect cutoff is still ahead. The
+    /// cutoff and cancellation are checked after revalidation, immediately
+    /// before the thread is released, so a slow sample cannot let the child
+    /// start late.
+    fn resume_checked_by(
+        &mut self,
+        cancel: &Shutdown,
+        cutoff: tokio::time::Instant,
+        revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        self.resume_checked_with_handoff(cancel, Some(cutoff), revalidate, || {})
     }
 
     fn resume_checked_with_handoff(
         &mut self,
         cancel: &Shutdown,
+        cutoff: Option<tokio::time::Instant>,
         revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
         handoff: impl FnOnce(),
     ) -> Result<(), NativeRefusal> {
@@ -3138,8 +3582,25 @@ impl Child {
             std::time::Instant::now(),
             NativeRefusal::ReservesUnverified,
         )?;
+        let fenced = || {
+            cutoff.is_some_and(|cutoff| {
+                cancel.is_cancelled() || tokio::time::Instant::now() >= cutoff
+            })
+        };
+        if fenced() {
+            return Err(NativeRefusal::JobUnverified);
+        }
         handoff();
-        self.resume().map_err(|_| NativeRefusal::JobUnverified)
+        // Release edge: the handoff may block, so cancellation and the cutoff
+        // are checked again after the final Job verification. Nothing that can
+        // wait sits between this check and ResumeThread.
+        self.verify_live()
+            .map_err(|_| NativeRefusal::JobUnverified)?;
+        if fenced() {
+            return Err(NativeRefusal::JobUnverified);
+        }
+        self.release_suspended()
+            .map_err(|_| NativeRefusal::JobUnverified)
     }
 }
 
@@ -3202,6 +3663,9 @@ fn allocated_under(root: &LocalPath, expected: u64, limit: usize) -> Result<u64,
 }
 
 #[cfg(test)]
+mod monitor_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3228,6 +3692,69 @@ mod tests {
         io::{Read, Write},
         os::windows::fs::MetadataExt,
     };
+
+    /// A synthetic native stdout: one partial QMP record, then the end.
+    struct ScriptedPipe(std::collections::VecDeque<io::Result<&'static [u8]>>);
+
+    impl Read for ScriptedPipe {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.pop_front() {
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(error)) => Err(error),
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_stdout_read_failure_reaches_qmp_as_io_and_peer_close_as_eof() {
+        use crate::vm::qmp::{ChannelError, Qmp};
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+        for (end, expected) in [
+            (
+                Some(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
+                ChannelError::Io,
+            ),
+            // A closed peer end is the ordinary end of the child's output.
+            (Some(io::ErrorKind::BrokenPipe.into()), ChannelError::Eof),
+            (None, ChannelError::Eof),
+        ] {
+            let failed = end
+                .as_ref()
+                .is_some_and(|error| error.kind() != io::ErrorKind::BrokenPipe);
+            let mut script = std::collections::VecDeque::from([Ok(&b"{\"QMP\":"[..])]);
+            script.extend(end.map(Err));
+            let cancel = Shutdown::default();
+            let (output, worker) = start_output(
+                ScriptedPipe(script),
+                cancel.clone(),
+                tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+            let refused = tokio::time::timeout(
+                Duration::from_secs(2),
+                Qmp::handshake(output, tokio::io::sink(), &Shutdown::default()),
+            )
+            .await
+            .unwrap()
+            .err();
+            assert_eq!(refused, Some(expected));
+            let joined = tokio::task::spawn_blocking(move || worker.0.join().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(joined.is_err(), failed);
+            if failed {
+                assert_eq!(
+                    joined.unwrap_err().raw_os_error(),
+                    Some(ERROR_ACCESS_DENIED as i32)
+                );
+            }
+        }
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use windows_sys::Win32::Security::Authorization::{
@@ -3285,7 +3812,7 @@ mod tests {
         marker
     }
 
-    fn fixture_launch(probe: usize) -> Option<(Child, Stdio)> {
+    pub(super) fn fixture_launch(probe: usize) -> Option<(Child, Stdio)> {
         fixture_spawn(FIXTURE, probe)
     }
 
@@ -3301,15 +3828,22 @@ mod tests {
         let cwd = image.parent().unwrap();
         let environment = fixture_environment(probe);
         match spawn(launch, cwd, &environment, job, child_io) {
-            Ok(child) => Some((child, parent_io)),
-            Err(SpawnError {
-                stage: SpawnStage::Create,
-                error,
-            }) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            Ok(child) => {
+                child.verify_live().unwrap();
+                Some((child, parent_io))
+            }
+            Err((
+                SpawnError {
+                    stage: SpawnStage::Create,
+                    error,
+                    ..
+                },
+                _,
+            )) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
                 classify_job_refusal(&image, &args, cwd, &environment);
                 None
             }
-            Err(SpawnError { stage, error }) => {
+            Err((SpawnError { stage, error, .. }, _)) => {
                 panic!("fixture launch failed at {stage:?}: {error}")
             }
         }
@@ -3372,7 +3906,52 @@ mod tests {
         assert_eq!(marker, [42]);
     }
 
-    async fn ready(reader: &mut tokio::io::DuplexStream) {
+    #[test]
+    #[ignore = "child-only listener fixture; spawned with a Job and explicit stdio"]
+    fn fixture_listener() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        std::io::stdout().write_all(b"ARX_JOB_READY\n").unwrap();
+        // Emit two binary port bytes after the readiness marker.
+        std::io::stdout()
+            .write_all(&listener.local_addr().unwrap().port().to_le_bytes())
+            .unwrap();
+        std::io::stdout().flush().unwrap();
+        let mut exit = [0];
+        std::io::stdin().read_exact(&mut exit).unwrap();
+        assert_eq!(exit, [42]);
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn docker_trial_listener_belongs_to_the_held_fixture_child() {
+        use qualification::docker_trial::witness::listener;
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let foreign = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let Some((mut child, stdio)) = fixture_spawn("vm::windows::tests::fixture_listener", 0)
+        else {
+            return;
+        };
+        let pid = child.verify_live().unwrap();
+        let (mut read, mut write, workers) = start_stdio(stdio, Default::default()).unwrap();
+        child.resume().unwrap();
+        ready(&mut read).await;
+        let port = tokio::time::timeout(Duration::from_secs(2), read.read_u16_le())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(listener(&child, port).unwrap().check(port, pid).is_ok());
+        assert!(listener(&child, foreign.local_addr().unwrap().port()).is_err());
+        assert!(listener(&child, 0).is_err());
+        write.write_all(&[42]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        child.reap(deadline).await.unwrap();
+        assert_eq!(child.exit_code(), Ok(0));
+        assert!(listener(&child, port).is_err());
+        workers.join(deadline).await.unwrap();
+    }
+
+    async fn ready(reader: &mut PipeOutput) {
         tokio::time::timeout(Duration::from_secs(2), async {
             let mut observed = Vec::new();
             while observed.len() < 4096 {
@@ -4069,6 +4648,136 @@ mod tests {
         workers.join(deadline).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn resume_refuses_once_the_effect_cutoff_or_cancellation_lands_during_revalidation() {
+        let Some((mut child, stdio)) = fixture_launch(0) else {
+            return;
+        };
+        let (mut read, mut write, workers) = start_stdio(stdio, Default::default()).unwrap();
+        let fresh = Shutdown::default();
+        // The cutoff is still ahead when resume starts and is reached while
+        // the otherwise valid sample runs; the thread must stay suspended.
+        let cutoff = tokio::time::Instant::now() + Duration::from_millis(20);
+        let mut calls = 0;
+        let refused = child.resume_checked_by(&fresh, cutoff, &mut || {
+            calls += 1;
+            std::thread::sleep(Duration::from_millis(40));
+            Ok(std::time::Instant::now())
+        });
+        assert!(tokio::time::Instant::now() >= cutoff);
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!(calls, 1);
+        assert!(child.suspended.is_some(), "thread released at the cutoff");
+        // Cancellation landing inside a valid sample also keeps it held.
+        let cancel = Shutdown::default();
+        let ahead = tokio::time::Instant::now() + Duration::from_secs(30);
+        let refused = child.resume_checked_by(&cancel, ahead, &mut || {
+            calls += 1;
+            cancel.cancel();
+            Ok(std::time::Instant::now())
+        });
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!(calls, 2);
+        assert!(child.suspended.is_some(), "thread released after cancel");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read.read_u8())
+                .await
+                .is_err(),
+            "the held child ran"
+        );
+        // With the cutoff still ahead after the sample, the child runs.
+        child
+            .resume_checked_by(&fresh, ahead, &mut || {
+                calls += 1;
+                Ok(std::time::Instant::now())
+            })
+            .unwrap();
+        assert_eq!(calls, 3);
+        assert!(child.suspended.is_none());
+        ready(&mut read).await;
+        write.write_all(&[42]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        child.reap(deadline).await.unwrap();
+        workers.join(deadline).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_when_cancellation_or_the_cutoff_lands_during_the_handoff() {
+        let Some((mut child, stdio)) = fixture_launch(0) else {
+            return;
+        };
+        let (mut read, mut write, workers) = start_stdio(stdio, Default::default()).unwrap();
+        let mut samples = 0;
+        let mut handoffs = 0;
+        // Cancellation arrives inside the handoff, after the post-sample guard
+        // already passed.
+        let cancel = Shutdown::default();
+        let ahead = tokio::time::Instant::now() + Duration::from_secs(30);
+        let refused = child.resume_checked_with_handoff(
+            &cancel,
+            Some(ahead),
+            &mut || {
+                samples += 1;
+                Ok(std::time::Instant::now())
+            },
+            || {
+                handoffs += 1;
+                assert!(!cancel.is_cancelled());
+                cancel.cancel();
+            },
+        );
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!((samples, handoffs), (1, 1));
+        assert!(child.suspended.is_some(), "thread released after cancel");
+        // The cutoff is still ahead after the sample and is crossed while the
+        // handoff blocks.
+        let fresh = Shutdown::default();
+        let cutoff = tokio::time::Instant::now() + Duration::from_millis(300);
+        let refused = child.resume_checked_with_handoff(
+            &fresh,
+            Some(cutoff),
+            &mut || {
+                samples += 1;
+                Ok(std::time::Instant::now())
+            },
+            || {
+                handoffs += 1;
+                let now = tokio::time::Instant::now();
+                assert!(now < cutoff);
+                std::thread::sleep((cutoff - now) + Duration::from_millis(5));
+            },
+        );
+        assert!(tokio::time::Instant::now() >= cutoff);
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!((samples, handoffs), (2, 2));
+        assert!(child.suspended.is_some(), "thread released at the cutoff");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read.read_u8())
+                .await
+                .is_err(),
+            "the held child ran"
+        );
+        // With both still clear after the handoff, the child is released.
+        child
+            .resume_checked_with_handoff(
+                &fresh,
+                Some(tokio::time::Instant::now() + Duration::from_secs(30)),
+                &mut || {
+                    samples += 1;
+                    Ok(std::time::Instant::now())
+                },
+                || handoffs += 1,
+            )
+            .unwrap();
+        assert_eq!((samples, handoffs), (3, 3));
+        assert!(child.suspended.is_none());
+        ready(&mut read).await;
+        write.write_all(&[42]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        child.reap(deadline).await.unwrap();
+        workers.join(deadline).await.unwrap();
+    }
+
     #[test]
     fn attribute_values_outlive_the_list_on_a_creation_error() {
         let job = Job::new(64 * 1024 * 1024, None).unwrap();
@@ -4146,7 +4855,7 @@ mod tests {
         gate: std::sync::Arc<DispatchGate>,
         write: tokio::io::DuplexStream,
         workers: WorkerSet,
-        _read: tokio::io::DuplexStream,
+        _read: PipeOutput,
     }
 
     /// Real pipes and the production stdin worker, with an injected clock.
