@@ -3,9 +3,7 @@ import { isApiError, type ConsoleStatus, type Vm } from '../../api/types';
 import { useApi, useResource, useSession } from '../context';
 import { formatDate } from '../format';
 import { href } from '../router';
-import { ArchBadge, Loaded, Page, Pill, StatePill, type Tone } from '../ui';
-
-const TONE: Record<ConsoleStatus, Tone> = { connecting: 'info', streaming: 'ok', closed: 'muted', error: 'bad' };
+import { ArchBadge, ConsoleSessionStatus, Loaded, Page, VmStatus } from '../ui';
 
 interface FrameView {
   url: string;
@@ -70,8 +68,8 @@ function Viewer({ vm }: { vm: Vm }) {
   return (
     <div className="console">
       <div className="terminal-status">
-        <Pill tone={paused ? 'muted' : TONE[status]}><span className="visually-hidden">Console status: </span>{paused ? 'paused' : status}</Pill>
-        <StatePill value={vm.state} />
+        <ConsoleSessionStatus status={paused ? 'paused' : status} />
+        <VmStatus state={vm.state} />
         <ArchBadge arch={vm.arch} />
         <span className="console-mode">View only</span>
         <span className="spacer" />

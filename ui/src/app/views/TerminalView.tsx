@@ -3,13 +3,11 @@ import { exampleCommand, parseCommandLine } from '../../api/command';
 import { isApiError, type Host, type TerminalSession, type TerminalStatus } from '../../api/types';
 import { useApi, useResource, useSession } from '../context';
 import { href, navigate } from '../router';
-import { ArchBadge, Empty, Loaded, Page, Pill, SelectField, type Tone } from '../ui';
+import { ArchBadge, Empty, Loaded, Page, SelectField, TerminalSessionStatus } from '../ui';
 
 export const MAX_LINES = 2000;
 
 type Line = { id: number; kind: 'cmd' | 'stdout' | 'stderr' | 'exit' | 'error' | 'info'; text: string };
-
-const STATUS_TONE: Record<TerminalStatus, Tone> = { connecting: 'info', ready: 'ok', running: 'info', closed: 'muted', error: 'bad' };
 
 function Terminal({ host }: { host: Host }) {
   const api = useApi();
@@ -133,7 +131,7 @@ function Terminal({ host }: { host: Host }) {
   return (
     <div className="terminal-wrap">
       <div className="terminal-status">
-        <Pill tone={STATUS_TONE[status]}><span className="visually-hidden">Terminal status: </span>{status}</Pill>
+        <TerminalSessionStatus status={status} />
         <span>{host.name}</span>
         <ArchBadge arch={host.arch} />
         {status === 'closed' || status === 'error' ? <button type="button" className="button button-quiet" onClick={() => setAttempt(a => a + 1)}>Reconnect</button> : null}

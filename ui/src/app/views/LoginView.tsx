@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { isApiError } from '../../api/types';
 import { useApi, useSession } from '../context';
+import { Logo } from '../icons';
 
 export function LoginView({ notice, error: initialError }: { notice?: string; error?: string }) {
   const api = useApi();
@@ -39,7 +40,7 @@ export function LoginView({ notice, error: initialError }: { notice?: string; er
   return (
     <div className="login">
       <form className="login-card" onSubmit={submit} noValidate aria-labelledby="login-title" aria-describedby={error ? 'login-error' : undefined}>
-        <div className="brand brand-large" aria-hidden="true"><span className="brand-mark" />Arxcovo</div>
+        <div className="brand brand-large" aria-hidden="true"><Logo />arxcovo</div>
         <h1 id="login-title" className="visually-hidden">Arxcovo</h1>
         <p className="login-lede">Sign in to manage this cluster.</p>
         {notice && !error ? <p className="notice" role="status">{notice}</p> : null}
