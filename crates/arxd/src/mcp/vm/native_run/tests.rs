@@ -123,11 +123,11 @@ async fn live_windows_witness_is_withdrawn_before_teardown_and_never_resurrected
     let target = observed.target;
     let args = json!({"vm_id":hex::encode(target.vm)});
     assert_eq!(call(&client, "vm_get", args.clone()).await["ready"], false);
-    assert!(!owner.commit_ready(h.supervisor(), &worker, || Some([42; 16])).await);
+    assert!(!owner.commit_ready(h.supervisor(), &worker, || Some([42; 16]), || true).await);
     record_checked_creation(&h, &observed);
-    assert!(!owner.commit_ready(h.supervisor(), &worker, || Some(target.epoch)).await);
-    assert!(!owner.commit_ready(h.supervisor(), &worker, || None).await);
-    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16])).await);
+    assert!(!owner.commit_ready(h.supervisor(), &worker, || Some(target.epoch), || true).await);
+    assert!(!owner.commit_ready(h.supervisor(), &worker, || None, || true).await);
+    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16]), || true).await);
 
     let status = call(&client, "vm_get", args.clone()).await;
     assert_eq!(status["ready"], true);
@@ -200,7 +200,7 @@ async fn exact_starting_stop_replays_and_signals_under_closed_admission() {
     // A replay returns the same receipt and nudges the retrying owner.
     assert_eq!(call(&client, "vm_stop", args).await, stop);
     assert!(owner.retry_signalled().await);
-    assert!(!owner.commit_ready(supervisor, &worker, || Some([42; 16])).await);
+    assert!(!owner.commit_ready(supervisor, &worker, || Some([42; 16]), || true).await);
     let ctl = &supervisor.controller;
     ctl.native_store().transact(|db| {
         let state: i64 = db.query_row("SELECT status FROM vm_operations WHERE operation_id=?1",
@@ -225,14 +225,14 @@ async fn unsuccessful_start_commit_and_expired_or_replaced_epochs_cannot_project
     let trigger = "CREATE TRIGGER fail_start BEFORE UPDATE OF status ON vm_operations
         WHEN NEW.action=3 AND NEW.status=1 BEGIN SELECT RAISE(ABORT,'fixture commit failure'); END";
     ctl.native_store().transact(|db| { db.execute_batch(trigger)?; Ok(()) }).unwrap();
-    assert!(!owner.commit_ready(h.supervisor(), &worker, || Some([42; 16])).await);
+    assert!(!owner.commit_ready(h.supervisor(), &worker, || Some([42; 16]), || true).await);
     assert!(ctl.native_run_current("alpha", target, false).unwrap());
     let failed = call(&client, "vm_get", args.clone()).await;
     assert_eq!(failed["ready"], false);
     assert!(failed.get("native_boot_witness").is_none());
     ctl.native_store().transact(|db| { db.execute_batch("DROP TRIGGER fail_start")?; Ok(()) }).unwrap();
 
-    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([43; 16])).await);
+    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([43; 16]), || true).await);
     let expires = call(&client, "vm_get", args.clone()).await["expires_at_ms"].as_i64().unwrap();
     h.now.store(expires, Ordering::SeqCst);
     let expired = call(&client, "vm_get", args.clone()).await;
@@ -258,7 +258,7 @@ async fn idle_stop_and_stale_start_epoch_each_clear_ready() {
         let Starting { owner, worker, registration: _registration, observed } =
             reserved(&h, &client).await;
         record_checked_creation(&h, &observed);
-        assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16])).await);
+        assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16]), || true).await);
         let target = observed.target;
         let args = json!({"vm_id":hex::encode(target.vm)});
         assert_eq!(call(&client, "vm_get", args.clone()).await["ready"], true);
@@ -305,11 +305,59 @@ async fn ready_commit_waits_out_a_concurrent_dispatch_on_the_gate() {
     });
     held.recv().unwrap();
     let waiting = Instant::now();
-    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16])).await);
+    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16]), || true).await);
     assert!(waiting.elapsed() >= Duration::from_millis(100));
     holder.join().unwrap();
     let args = json!({"vm_id":hex::encode(observed.target.vm)});
     assert_eq!(call(&client, "vm_get", args).await["ready"], true);
+    assert_admission_closed(&h);
+    drop(client);
+    let _ = h.shutdown().await;
+}
+
+#[tokio::test]
+async fn ready_commit_resamples_a_child_lost_while_the_gate_was_busy() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let Starting { owner, worker, registration: _registration, observed } = reserved(&h, &client).await;
+    record_checked_creation(&h, &observed);
+    // The final sample passes, then the child exits (or owner custody fails)
+    // while a concurrent dispatch holds the gate. Loss lands before release.
+    let supervisor = h.supervisor().clone();
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (locked, held) = std::sync::mpsc::channel();
+    let holder = {
+        let (supervisor, alive) = (supervisor.clone(), alive.clone());
+        std::thread::spawn(move || {
+            let _gate = supervisor.gate.lock().unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            alive.store(false, Ordering::SeqCst);
+        })
+    };
+    held.recv().unwrap();
+    let samples = std::cell::Cell::new(0);
+    let waiting = Instant::now();
+    let committed = owner.commit_ready(&supervisor, &worker, || Some([42; 16]), || {
+        samples.set(samples.get() + 1);
+        alive.load(Ordering::SeqCst)
+    }).await;
+    let waited = waiting.elapsed();
+    holder.join().unwrap();
+    assert!(!committed, "a witness was committed for an exited child");
+    assert!(samples.get() >= 2, "the final observation was not refreshed after the gate wait");
+    assert!(waited < Duration::from_secs(5), "a lost child delayed teardown");
+    assert!(!owner.witnessed());
+    let target = observed.target;
+    supervisor.controller.native_store().transact(|db| {
+        let state: i64 = db.query_row("SELECT status FROM vm_operations WHERE operation_id=?1",
+            [target.epoch], |r| r.get(0))?;
+        assert_eq!(state, Status::Pending.code(), "the start succeeded for an exited child");
+        Ok(())
+    }).unwrap();
+    let status = call(&client, "vm_get", json!({"vm_id":hex::encode(target.vm)})).await;
+    assert_eq!(status["ready"], false);
+    assert!(status.get("native_boot_witness").is_none());
     assert_admission_closed(&h);
     drop(client);
     let _ = h.shutdown().await;
@@ -403,7 +451,7 @@ async fn teardown_retry_keeps_one_launch_and_is_woken_by_the_reaper() {
     let client = h.client(0).await;
     let Starting { owner, worker, registration: _registration, observed } = reserved(&h, &client).await;
     record_checked_creation(&h, &observed);
-    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16])).await);
+    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16]), || true).await);
     let vm = observed.target.vm;
     let supervisor = h.supervisor();
     let (attempts, settled) = (std::cell::Cell::new(0), std::cell::Cell::new(None));
@@ -442,7 +490,7 @@ async fn reopened_store_has_no_witness_and_reaches_orphan_recovery() {
     let client = h.client(0).await;
     let Starting { owner, worker, registration, observed } = reserved(&h, &client).await;
     record_checked_creation(&h, &observed);
-    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16])).await);
+    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16]), || true).await);
     let target = observed.target;
     let args = json!({"vm_id":hex::encode(target.vm)});
     assert_eq!(call(&client, "vm_get", args.clone()).await["ready"], true);

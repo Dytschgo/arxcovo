@@ -432,13 +432,17 @@ impl Run {
             .boot(&self.cancel, worker.deadline(), refresh)
             .await
             .is_ok()
-            && launch.check_live(refresh).is_ok()
             && self
-                .commit_ready(supervisor, worker, || store::new_id().ok())
+                .commit_ready(
+                    supervisor,
+                    worker,
+                    || store::new_id().ok(),
+                    || launch.check_live(refresh).is_ok(),
+                )
                 .await
         {
-            // The final liveness sample just preceded the commit; the first
-            // periodic ping follows one period later.
+            // The final liveness sample immediately preceded the commit; the
+            // first periodic ping follows one period later.
             let period = Duration::from_secs(1);
             let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -488,18 +492,25 @@ impl Run {
     }
 
     /// Commits the exact start under the foreground gate, then publishes a
-    /// fresh witness. Gate contention backs off until the start deadline.
+    /// fresh witness. Every attempt first takes the final production
+    /// observation (child, Job, host and selection) outside the gate, then
+    /// commits with no await in between. Gate contention backs off until the
+    /// start deadline, and the next attempt observes again.
     pub(super) async fn commit_ready(
         &self,
         supervisor: &Supervisor,
         worker: &PendingOperation,
         new_id: impl FnOnce() -> Option<Id>,
+        mut live: impl FnMut() -> bool,
     ) -> bool {
         let Some(id) = new_id().filter(|id| *id != self.target.epoch && *id != [0; 16]) else {
             return false;
         };
         let cancelled = || self.cancel.is_cancelled() || supervisor.cancel.is_cancelled();
         loop {
+            if !live() {
+                return false;
+            }
             if let Ok(_gate) = supervisor.gate.try_lock() {
                 return supervisor
                     .controller
