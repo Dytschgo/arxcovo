@@ -230,22 +230,64 @@ pub(crate) fn catalog(seal_sha256: Hash, recipes: TestRecipes) -> Value {
     })
 }
 
+fn distinct_pair(pair: PairSlots) -> bool {
+    pair.disk.generation == pair.vars.generation
+        && pair.disk.key != pair.vars.key
+        && ![pair.disk.key, pair.vars.key].contains(&[0; 16])
+}
+
 /// The ledger slots a checked creation touches, derived from its target:
-/// the exact pair of a boot, the identified helper target of a Mutate plan,
-/// and none for a read-only or offline inspection.
+/// the exact pair of a boot (with `verification_overlay` only for a build's
+/// verification boot), the identified helper target of a Mutate plan, and
+/// none for a read-only or offline inspection.
 fn launch_slots(
+    effect: AdmittedEffect,
     kind: PlanKind,
     pair: Option<PairSlots>,
     helper: Option<ArtifactSlot>,
 ) -> Result<Vec<ArtifactSlot>, NativeRefusal> {
+    let is_build = matches!(effect, AdmittedEffect::Build { .. });
     match (kind, pair, helper) {
-        (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(pair), None)
-            if (pair.disk.role, pair.vars.role) == ("disk", "vars") =>
+        (PlanKind::Boot, Some(pair), None)
+            if pair.vars.role == "vars"
+                && (pair.disk.role == "disk"
+                    || (is_build && pair.disk.role == "verification_overlay"))
+                && distinct_pair(pair) =>
         {
             Ok(vec![pair.disk, pair.vars])
         }
-        (PlanKind::Mutate, None, Some(slot)) => Ok(vec![slot]),
+        (PlanKind::InstallerBoot(_), Some(pair), None)
+            if (pair.disk.role, pair.vars.role) == ("disk", "vars") && distinct_pair(pair) =>
+        {
+            Ok(vec![pair.disk, pair.vars])
+        }
+        (PlanKind::Mutate, None, Some(slot))
+            if slot.key != [0; 16]
+                && (slot.role == "disk" || (is_build && slot.role == "verification_overlay")) =>
+        {
+            Ok(vec![slot])
+        }
         (PlanKind::Inspect | PlanKind::InspectWritable, None, None) => Ok(Vec::new()),
+        _ => Err(REFUSED),
+    }
+}
+
+/// Installer boots must carry their matching live `InstallerStage`; other
+/// plan kinds must carry none.
+fn check_installer(
+    kind: PlanKind,
+    installer: Option<(InstallerPhase, tokio::time::Instant)>,
+) -> Result<(), NativeRefusal> {
+    match (kind, installer) {
+        (PlanKind::InstallerBoot(phase), Some((stage_phase, deadline)))
+            if phase == stage_phase && tokio::time::Instant::now() < deadline =>
+        {
+            Ok(())
+        }
+        (
+            PlanKind::Boot | PlanKind::Inspect | PlanKind::InspectWritable | PlanKind::Mutate,
+            None,
+        ) => Ok(()),
         _ => Err(REFUSED),
     }
 }
@@ -253,11 +295,9 @@ fn launch_slots(
 /// One durable effect's identity, derived by the issuer from its target.
 #[derive(Clone, PartialEq)]
 enum Effect {
-    Launch {
-        kind: PlanKind,
-        slots: Vec<ArtifactSlot>,
-        inputs: Vec<(ArtifactRole, Option<FileIdentity>)>,
-    },
+    Boot(PlanKind, PairSlots),
+    Mutate(ArtifactSlot),
+    Inspect(PlanKind, Vec<(ArtifactRole, Option<FileIdentity>)>),
     Stage(ArtifactSlot),
     Script,
 }
@@ -352,20 +392,27 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         target: LaunchTarget<'_, '_>,
     ) -> Result<Permit<'_, S, C>, NativeRefusal> {
         let expected = EffectPlan::from_target(&target)?;
-        let slots = launch_slots(expected.kind, target.pair, target.helper)?;
+        let slots = launch_slots(self.effect, expected.kind, target.pair, target.helper)?;
+        check_installer(expected.kind, expected.installer)?;
         if workspace.generation != self.target.generation
             || !self.admits_launch(expected.kind, target.recipe)
         {
             return Err(REFUSED);
         }
-        let effect = Effect::Launch {
-            kind: expected.kind,
-            slots: slots.clone(),
-            inputs: expected
-                .inputs
-                .iter()
-                .map(|input| (input.role, input.identity))
-                .collect(),
+        let effect = match (expected.kind, target.pair, target.helper) {
+            (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(pair), None) => {
+                Effect::Boot(expected.kind, pair)
+            }
+            (PlanKind::Mutate, None, Some(slot)) => Effect::Mutate(slot),
+            (PlanKind::Inspect | PlanKind::InspectWritable, None, None) => Effect::Inspect(
+                expected.kind,
+                expected
+                    .inputs
+                    .iter()
+                    .map(|input| (input.role, input.identity))
+                    .collect(),
+            ),
+            _ => return Err(REFUSED),
         };
         self.mint(effect, &slots)?;
         Ok(Permit {
@@ -450,7 +497,9 @@ impl<S: SelectedSource, C: Clock> LaunchPermit for Permit<'_, S, C> {
         if self.expected != EffectPlan::from_target(&target)? {
             return Err(REFUSED);
         }
+        check_installer(self.expected.kind, self.expected.installer)?;
         self.intent.verify(&self.slots)?;
+        check_installer(self.expected.kind, self.expected.installer)?;
         Ok(LaunchAuthority {
             _issued: Minted(()),
             binding: self.binding,

@@ -1744,38 +1744,58 @@ refuses the whole profile. The general ADR 0029 host-account default is
 unchanged here.
 
 The issuer opens only when the held dossier's seal digest, scope, TEST
-class and recipe pair match that configuration exactly. The Windows
-recipe must be the built-in catalog ID and the Ubuntu recipe must differ
-from it and from the web entry. It then takes its first selection-epoch
-observation through the typed freshness and high-water reads. The catalog
-reports the exact seal digest and both recipe pins after a fresh
-observation and before any owner-idle wait.
+class and recipe pair match that configuration exactly, and the profile's
+current-user SID names the enrollment owner whose live token the held
+reader verified. The Windows recipe must be the built-in catalog ID and
+the Ubuntu recipe must differ from it and from the web entry. It then
+takes its first selection-epoch observation through the typed freshness
+and high-water reads. The catalog reports the exact seal digest and both
+recipe pins after a fresh observation and before any owner-idle wait.
 
-An intent follows durable admission. It needs the worker's own pending
-operation for the exact principal, request, action and operation, before
-the worker deadline. Its non-static target generation must be owned by
-that operation: a pending build intent, a staging clone, or an active
-generation whose unresolved writer epoch matches. Each worker mints one
-intent, and a replay receives no worker, so it mints nothing. Each launch,
-staged write and guest-script permit names one durable effect, and an
-intent mints one permit per effect. A launch binds the whole sealed plan,
-inputs, working directory, pair, installer phase and deadline, recipe and
-limits. A staged write binds its slot, content pin, recipe phase and
-deadline. A script binds its exact bytes, timeout, generation and writer
-epoch. Consumption refuses any substitution, then rechecks cancellation,
-the ledger admission, the deadline and a fresh epoch observation before
-the authority exists. A transient refusal refuses only that effect, and
+The controller fixes each TEST worker's admitted request when it admits
+it: principal, request, action, operation and effect. A start, a clone, a
+build with its recipe, or a script with the digest of its exact bytes and
+its timeout. Worker fields and construction stay private to the
+controller. An intent follows that admission. The ledger must still hold
+the pending operation before the worker deadline, and its non-static
+target generation must be owned by that operation: a pending build, a
+creating clone, or an active generation whose unresolved writer epoch
+matches. A start's writer epoch is its own operation. Each worker mints
+one intent and the latch never resets. A replay receives no worker, so it
+mints nothing, and a stop mints no intent.
+
+The admitted effect decides what an intent may mint. A start boots its
+own pair with a selected recipe. A build stages its seed and VARS, boots
+and runs installers only for its own recipe and phase, and runs the
+checked helper. A clone runs only the checked helper, and a script runs
+only the admitted bytes and timeout. The issuer derives each effect's
+identity and ledger slots from its target: a boot's exact disk and VARS
+pair, a Mutate plan's identified helper slot, and none for an
+inspection. It mints one permit per identity. A launch permit binds the
+whole sealed plan, inputs, working directory, pair, helper slot,
+installer phase and deadline, recipe and limits. A staged-write permit
+binds its slot, content pin, recipe phase and deadline. A script permit
+binds its bytes, timeout, generation and writer epoch. Consumption
+refuses any substitution. It then checks cancellation, the ledger
+admission and the deadline, takes a fresh epoch observation, and checks
+all three again. Only then does it issue the effect's own authority,
+within that observation's freshness. Launch, staged-write and script
+authorities are distinct types, and the launch authority carries its
+issuance binding. A transient refusal refuses only that effect, and
 confirmed drift revokes the epoch's effect authority.
 
 Recovery authority is separate. It needs the exact bound native workspace
-scope of a non-static generation and its unresolved writer epoch, not a
-fresh selection, so a revoked or absent epoch cannot strand recovery. It
-never converts into launch authority.
+scope of a non-static generation, not a fresh selection, so a revoked or
+absent epoch cannot strand recovery. A generation with writer history
+needs its exact unresolved writer epoch. Only a staged generation that
+never had one recovers without an epoch. Recovery authority never
+converts into an effect authority.
 
 `LaunchAuthority` stays uninhabited off Windows x64. On Windows x64 only
-the issuer's private token constructs it, and only a fixture holds the
-installation that opens the issuer or mints recovery authority. The
-production installation lands with activation in 7c 16, so configured
-input cannot reach an effect and production TEST admission stays closed.
-Static, Compose and public-egress dispatch never receive this authority.
+the issuer's private token constructs it or the other effect authorities,
+and only a fixture holds the installation that opens the issuer or mints
+recovery authority. The production installation lands with activation in
+7c 16, so configured input cannot reach an effect and production TEST
+admission stays closed. Static, Compose and public-egress dispatch never
+receive these authorities.
 Native issuance is **unverified on real hardware**.

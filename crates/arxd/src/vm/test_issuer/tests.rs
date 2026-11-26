@@ -949,8 +949,29 @@ fn start_boot_derives_its_pair_and_admits_only_a_boot() {
     assert!(intent.launch(ws, target(&inspect, &cwd)).is_err());
     assert!(intent.script(SCRIPT, 30).is_err());
     assert!(intent.stage(stage_target(pair().disk)).is_err());
+    // An installed boot carries no installer stage.
+    let stage =
+        crate::vm::runtime::InstallerBudget::start(crate::vm::runtime::InstallerRecipe::Windows)
+            .stage(InstallerPhase::WindowsSetup, Duration::from_secs(60))
+            .unwrap();
+    let with_stage = LaunchTarget {
+        installer: Some(stage),
+        ..boot(pair(), windows)
+    };
+    assert!(intent.launch(ws, with_stage).is_err());
     let permit = intent.launch(ws, boot(pair(), windows)).unwrap();
     assert!(intent.launch(ws, boot(pair(), windows)).is_err());
+    // Varying inputs cannot mint a second boot permit for the same pair.
+    let mut altered_inputs = BootInputs::new();
+    altered_inputs.disk = artifact(ArtifactRole::GuestDisk, "D:/vms/work/disk.qcow2", 29);
+    let altered_recipe = altered_inputs.recipe();
+    let altered_plan = altered_recipe.plan().unwrap();
+    let altered_boot = LaunchTarget {
+        pair: Some(pair()),
+        recipe: windows,
+        ..target(&altered_plan, &cwd)
+    };
+    assert!(intent.launch(ws, altered_boot).is_err());
     let authority = permit.consume(boot(pair(), windows)).unwrap();
     assert_eq!(authority.binding().kind, PlanKind::Boot);
     assert_admission_closed();
@@ -1174,33 +1195,140 @@ fn recovery_authority_needs_exact_custody_not_selection() {
 
 #[test]
 fn launch_slots_come_from_the_target() {
+    let start = AdmittedEffect::Start;
+    let clone = AdmittedEffect::Clone;
+    let build = AdmittedEffect::Build {
+        recipe_id: recipes().ubuntu.recipe_id,
+        digest: recipes().ubuntu.recipe_sha256,
+    };
     let helper = pair().disk;
-    let ok = |kind, pair, helper| launch_slots(kind, pair, helper).ok();
+    let mut overlay = pair();
+    overlay.disk.role = "verification_overlay";
+    let mut seed = helper;
+    seed.role = "seed";
+    let mut same_key = pair();
+    same_key.vars.key = same_key.disk.key;
+    let ok = |effect, kind, pair, helper| launch_slots(effect, kind, pair, helper).ok();
     assert_eq!(
-        ok(PlanKind::Boot, Some(pair()), None),
+        ok(start, PlanKind::Boot, Some(pair()), None),
         Some(vec![pair().disk, pair().vars])
     );
     assert_eq!(
+        ok(build, PlanKind::Boot, Some(overlay), None),
+        Some(vec![overlay.disk, overlay.vars])
+    );
+    assert_eq!(
         ok(
+            build,
             PlanKind::InstallerBoot(InstallerPhase::WindowsSetup),
             Some(pair()),
             None
         ),
         Some(vec![pair().disk, pair().vars])
     );
-    assert_eq!(ok(PlanKind::Mutate, None, Some(helper)), Some(vec![helper]));
-    assert_eq!(ok(PlanKind::Inspect, None, None), Some(vec![]));
-    assert_eq!(ok(PlanKind::InspectWritable, None, None), Some(vec![]));
-    for (kind, pair, helper) in [
-        (PlanKind::Boot, None, None),
-        (PlanKind::Boot, Some(pair()), Some(helper)),
-        (PlanKind::Mutate, None, None),
-        (PlanKind::Mutate, Some(pair()), Some(helper)),
-        (PlanKind::Inspect, Some(pair()), None),
-        (PlanKind::Inspect, None, Some(helper)),
-        (PlanKind::StaticWebBoot, Some(pair()), None),
-        (PlanKind::PublicEgressBoot, Some(pair()), None),
+    assert_eq!(
+        ok(clone, PlanKind::Mutate, None, Some(helper)),
+        Some(vec![helper])
+    );
+    assert_eq!(
+        ok(build, PlanKind::Mutate, None, Some(overlay.disk)),
+        Some(vec![overlay.disk])
+    );
+    assert_eq!(ok(build, PlanKind::Inspect, None, None), Some(vec![]));
+    assert_eq!(
+        ok(build, PlanKind::InspectWritable, None, None),
+        Some(vec![])
+    );
+    for (effect, kind, pair, helper) in [
+        (start, PlanKind::Boot, None, None),
+        (start, PlanKind::Boot, Some(pair()), Some(helper)),
+        (start, PlanKind::Boot, Some(overlay), None),
+        (start, PlanKind::Boot, Some(same_key), None),
+        (
+            build,
+            PlanKind::InstallerBoot(InstallerPhase::WindowsSetup),
+            Some(overlay),
+            None,
+        ),
+        (build, PlanKind::Mutate, None, None),
+        (build, PlanKind::Mutate, Some(pair()), Some(helper)),
+        (build, PlanKind::Mutate, None, Some(seed)),
+        (clone, PlanKind::Mutate, None, Some(overlay.disk)),
+        (build, PlanKind::Inspect, Some(pair()), None),
+        (build, PlanKind::Inspect, None, Some(helper)),
+        (start, PlanKind::StaticWebBoot, Some(pair()), None),
+        (start, PlanKind::PublicEgressBoot, Some(pair()), None),
     ] {
-        assert_eq!(ok(kind, pair, helper), None, "{kind:?}");
+        assert_eq!(ok(effect, kind, pair, helper), None, "{effect:?} {kind:?}");
     }
+}
+
+/// Build verification boots accept `verification_overlay`, and installer boots
+/// require their matching live `InstallerStage` at mint and consumption.
+#[test]
+fn build_verification_boot_and_installer_stage_are_bound() {
+    let fixture = Fixture::new();
+    let issuer = fixture.issuer();
+    let (slots, worker, _) = fixture.build(1);
+    let verify_target = NativeTarget {
+        generation: slots.verification.disk.generation,
+        writer_epoch: None,
+    };
+    let intent = issuer
+        .intent(&worker, verify_target, &fixture.cancel)
+        .unwrap();
+    let ws = workspace(slots.verification.disk.generation);
+    let inputs = BootInputs::new();
+    let recipe = inputs.recipe();
+    let plan = recipe.plan().unwrap();
+    let cwd = LocalPath::parse("D:/vms/work").unwrap();
+    let boot = LaunchTarget {
+        pair: Some(slots.verification),
+        recipe: Some(recipes().ubuntu),
+        ..target(&plan, &cwd)
+    };
+    let permit = intent.launch(ws, boot).unwrap();
+    // Second boot permit on the same verification pair is refused.
+    assert!(intent.launch(ws, boot).is_err());
+    let authority = permit.consume(boot).unwrap();
+    assert_eq!(authority.binding().kind, PlanKind::Boot);
+
+    // Installer stage checks: matching live stage passes; missing, mismatched
+    // phase, or expired deadline is refused.
+    let live =
+        crate::vm::runtime::InstallerBudget::start(crate::vm::runtime::InstallerRecipe::Ubuntu)
+            .stage(InstallerPhase::UbuntuInstall, Duration::from_secs(60))
+            .unwrap();
+    let wrong_phase =
+        crate::vm::runtime::InstallerBudget::start(crate::vm::runtime::InstallerRecipe::Windows)
+            .stage(InstallerPhase::WindowsSetup, Duration::from_secs(60))
+            .unwrap();
+    let expired =
+        crate::vm::runtime::InstallerBudget::start(crate::vm::runtime::InstallerRecipe::Ubuntu)
+            .stage(InstallerPhase::UbuntuInstall, Duration::ZERO)
+            .unwrap();
+    assert!(
+        check_installer(
+            PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall),
+            Some((live.phase(), live.deadline())),
+        )
+        .is_ok()
+    );
+    assert!(check_installer(PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall), None).is_err());
+    assert!(
+        check_installer(
+            PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall),
+            Some((wrong_phase.phase(), wrong_phase.deadline())),
+        )
+        .is_err()
+    );
+    assert!(
+        check_installer(
+            PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall),
+            Some((expired.phase(), expired.deadline())),
+        )
+        .is_err()
+    );
+    assert!(check_installer(PlanKind::Boot, Some((live.phase(), live.deadline()))).is_err());
+    assert_admission_closed();
 }
