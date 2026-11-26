@@ -432,6 +432,32 @@ pub(crate) fn settle_slot_intent(
     Ok(())
 }
 
+/// Whether a start pair names the exact durable slots of its bound scope:
+/// both slots identified or verified with the same file IDs, directory and
+/// volume. Content pins are compared by the held release proof.
+pub(crate) fn pair_matches(
+    db: &Connection,
+    scope: Scope,
+    slots: [ArtifactSlot; 2],
+    evidence: [ArtifactEvidence; 2],
+) -> Result<bool> {
+    if !bound(db, scope)? || slots[0] == slots[1] {
+        return Ok(false);
+    }
+    for (slot, evidence) in slots.into_iter().zip(evidence) {
+        let held = matches!(leaf(db, slot)?,
+            Leaf::Identified(file) | Leaf::Verified(file, _) if file == evidence.identity.file);
+        if slot.generation != scope.generation
+            || !held
+            || evidence.directory != scope.workspace.file
+            || evidence.identity.volume != scope.production.volume
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) fn leaf(db: &Connection, slot: ArtifactSlot) -> Result<Leaf> {
     let row = db
         .query_row(

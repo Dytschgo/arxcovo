@@ -296,11 +296,11 @@ fn pin_of(bytes: &[u8]) -> ArtifactPin {
 fn seed_stays_accounted_when_the_second_leaf_fails() {
     let mut fixture = Fixture::new();
     let cases: [(Option<Fault>, Option<WriteFault>); 5] = [
-        (None, None),
         (Some(Fault::Before("intend_slot")), None),
         (Some(Fault::Before("slot_identified")), None),
         (None, Some(WriteFault::Partial)),
         (None, Some(WriteFault::Sync)),
+        (None, None),
     ];
     let mut outcomes = Vec::new();
     for ((fault, write), slots) in cases.into_iter().zip(fixture.builds.clone()) {

@@ -1774,15 +1774,28 @@ impl WorkerSet {
     }
 
     async fn join(mut self, deadline: tokio::time::Instant) -> io::Result<()> {
-        self.wait_stopped(deadline).await?;
-        for worker in self.workers.drain(..) {
-            worker
-                .0
-                .join()
-                .map_err(|_| io::Error::other("stdio worker failed"))??;
+        match self.join_all(deadline).await? {
+            WorkersEnded { failed: false } => Ok(()),
+            WorkersEnded { failed: true } => Err(io::Error::other("stdio worker failed")),
         }
-        Ok(())
     }
+
+    /// Joins every handle, even after one worker returned an error or
+    /// panicked. A timeout keeps all handles for a later attempt. `Ok` proves
+    /// that every worker ended; `failed` separately reports how they ended.
+    async fn join_all(&mut self, deadline: tokio::time::Instant) -> io::Result<WorkersEnded> {
+        self.wait_stopped(deadline).await?;
+        let mut failed = false;
+        for worker in self.workers.drain(..) {
+            failed |= !matches!(worker.0.join(), Ok(Ok(())));
+        }
+        Ok(WorkersEnded { failed })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkersEnded {
+    failed: bool,
 }
 
 impl Drop for WorkerSet {
@@ -2521,31 +2534,24 @@ enum LaunchCreation {
 
 struct CreatedChild {
     child: Child,
-    workers: Option<WorkerSet>,
-    joined: bool,
+    /// Retains every unjoined worker handle until settlement drains them.
+    workers: WorkerSet,
+    worker_failed: bool,
 }
 
 impl CreatedChild {
+    /// Confirms an exited child, an empty Job and that every stdio worker
+    /// ended. Any failure leaves the remaining custody for a later attempt.
     async fn settle(&mut self, deadline: tokio::time::Instant) -> io::Result<()> {
-        if let Some(workers) = &self.workers {
-            workers.stop();
-        }
+        self.workers.stop();
         if !self.child.exited()? || self.child.job.active()? != 0 {
             self.child.job.terminate()?;
         }
+        // Reaping confirms both the child exit and an empty Job.
         self.child.reap(deadline).await?;
-        if let Some(workers) = &self.workers {
-            workers.wait_stopped(deadline).await?;
-        }
-        if let Some(workers) = self.workers.take() {
-            workers.join(deadline).await?;
-            self.joined = true;
-        }
-        if self.joined {
-            Ok(())
-        } else {
-            Err(io::Error::other("stdio worker settlement unconfirmed"))
-        }
+        let ended = self.workers.join_all(deadline).await?;
+        self.worker_failed |= ended.failed;
+        Ok(())
     }
 }
 
@@ -2587,8 +2593,8 @@ impl HoldRefusal {
             reason,
             creation: LaunchCreation::Created(Box::new(CreatedChild {
                 child,
-                workers: Some(workers),
-                joined: false,
+                workers,
+                worker_failed: false,
             })),
         }
     }

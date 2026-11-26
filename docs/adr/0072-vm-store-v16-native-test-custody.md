@@ -99,11 +99,16 @@ with that settlement path.
 ## Chunk 04 lease handoff
 
 The start refusal from chunk 04 keeps its originally held workspace lease.
-It carries the exact disk and VARS pair, with its evidence, to the consumer.
-The workspace binding it holds is now the durable bound scope. A refusal
-from before acquisition makes its single bounded attempt through
-`hold_workspace`, which requires that same scope. The receipt-independent
-release commit in chunk 06 validates its proof against these rows.
+It is bound at construction to the exact `StartPair`: the disk and VARS
+slots with their evidence. The workspace binding it holds is now the durable
+bound scope. `confirm_start_pair` accepts that pair only when both slots are
+identified or verified in this scope with the same file IDs, directory and
+volume. The held release proof still compares content through
+`matches_start`. A refusal from before acquisition spends its one-shot
+attempt within its original cutoff. A production caller makes that attempt
+through `hold_workspace`, which requires the same scope. The
+receipt-independent release commit in chunk 06 validates its proof against
+these rows.
 
 Native creation, holds and reconciliation are **unverified on real
 hardware**.

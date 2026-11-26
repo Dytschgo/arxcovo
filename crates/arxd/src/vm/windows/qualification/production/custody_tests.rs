@@ -111,6 +111,16 @@ impl CustodyCheckpoints for Recorder<'_> {
         })
     }
 
+    fn confirm_start_pair(
+        &self,
+        binding: WorkspaceBinding,
+        pair: StartPair,
+    ) -> Result<(), NativeRefusal> {
+        self.step("confirm_start_pair", None, || {
+            self.ledger.confirm_start_pair(binding, pair)
+        })
+    }
+
     fn intend_slot(
         &self,
         binding: WorkspaceBinding,
@@ -477,4 +487,53 @@ fn custody_checkpoints_leave_production_admission_closed() {
             Err(NativeRefusal::QualificationMissing)
         );
     }
+}
+
+/// Chunk 04's exact start pair resolves only to the durable slots it names.
+#[test]
+fn start_pair_must_name_the_durable_slot_identities() {
+    let fixture = Fixture::new();
+    let slots = fixture.builds[0];
+    let generation = slots.pair.disk.generation;
+    let recorder = fixture.recorder(generation);
+    let ws = fixture.reserve(&recorder, generation).unwrap();
+    let disk = ws
+        .precreate_helper_target(slots.pair.disk, &recorder)
+        .unwrap();
+    let mut vars = ws.create_slot(slots.pair.vars, &recorder).unwrap();
+    vars.write_all(b"vars").unwrap();
+    let vars_id = vars.identity();
+    drop(vars);
+    let binding = ws.binding();
+    let evidence = |identity: FileIdentity| ArtifactEvidence {
+        identity,
+        directory: binding.workspace.file,
+        pin: ArtifactPin {
+            size: 4,
+            sha256: [1; 32],
+        },
+    };
+    let pair = StartPair {
+        slots: slots.pair,
+        evidence: [evidence(disk.identity()), evidence(vars_id)],
+    };
+    assert_eq!(recorder.confirm_start_pair(binding, pair), Ok(()));
+    let swapped = StartPair {
+        evidence: [pair.evidence[1], pair.evidence[0]],
+        ..pair
+    };
+    let mut moved = pair;
+    moved.evidence[0].directory = binding.production.file;
+    let foreign = StartPair {
+        slots: fixture.builds[1].pair,
+        ..pair
+    };
+    for wrong in [swapped, moved, foreign] {
+        assert_eq!(recorder.confirm_start_pair(binding, wrong), Err(PATH));
+    }
+    let substitute = WorkspaceBinding {
+        lease: binding.workspace,
+        ..binding
+    };
+    assert_eq!(recorder.confirm_start_pair(substitute, pair), Err(PATH));
 }
