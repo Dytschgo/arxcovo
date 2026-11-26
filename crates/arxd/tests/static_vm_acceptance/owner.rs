@@ -1,6 +1,6 @@
 use super::*;
 use arxd::{
-    config::{ExpectedVmStore, pinned_vm_config, with_enrolled_vm_store},
+    config::{ExpectedVmStore, pinned_static_vm_config, with_enrolled_vm_store},
     local::{
         ClientConfig, ForegroundBridgeError, LoadedClient, RESPONSE_LIMIT, bind_foreground_bridge,
     },
@@ -1025,14 +1025,13 @@ fn spawn_daemon(plan: &StaticPlan, pinned_config: &Path) -> Result<Child> {
     )
 }
 
-fn prepare_pinned_config(source: &Path, expected: &ExpectedVmStore) -> Result<tempfile::TempPath> {
-    let bytes = safe(pinned_vm_config(source, expected), "foreground_config_pin")?;
+fn prepare_pinned_config(source: &Path, bytes: &[u8]) -> Result<tempfile::TempPath> {
     let parent = source.parent().ok_or(Failure::Check("input_parent"))?;
     let mut file = safe(
         tempfile::NamedTempFile::new_in(parent),
         "foreground_config_copy",
     )?;
-    safe(file.write_all(&bytes), "foreground_config_copy")?;
+    safe(file.write_all(bytes), "foreground_config_copy")?;
     safe(file.as_file().sync_all(), "foreground_config_copy")?;
     Ok(file.into_temp_path())
 }
@@ -1514,6 +1513,10 @@ async fn run(tunnel: bool) -> Result<()> {
         (&backup_root, &backup_pins),
         (&restore_root, &restore_pins),
     ])?;
+    let pinned = safe(
+        pinned_static_vm_config(&plan.daemon_config, &plan.store, &plan.secret_root),
+        "foreground_root_pins",
+    )?;
     safe(foreground.local.validate(), "foreground_endpoint")?;
 
     let executable = safe(env::current_exe(), "client_executable")?;
@@ -1546,13 +1549,15 @@ async fn run(tunnel: bool) -> Result<()> {
             }),
             "foreground_store_binding",
         )??;
-        let launch_config = prepare_pinned_config(&plan.daemon_config, &plan.store)?;
+        let launch_config = prepare_pinned_config(&plan.daemon_config, pinned.bytes())?;
         let _launch_config = open(&launch_config, false, FILE_SHARE_READ)?;
         let console = Console::allocate()?;
         let _startup_store = pin_store(&state, &plan.store, mounted_volume)?;
+        safe(pinned.verify(), "foreground_root_binding")?;
         let mut daemon = spawn_daemon(&plan, &launch_config)?;
         let observed = async {
             ready(&mut daemon, &foreground.local.address).await?;
+            safe(pinned.verify(), "foreground_root_binding")?;
             let _live_store = pin_store(&state, &plan.store, mounted_volume)?;
             with_client(&plan, &foreground, &state, &daemon, client, &mut evidence).await
         }
@@ -1562,7 +1567,7 @@ async fn run(tunnel: bool) -> Result<()> {
         evidence.drain_failure = drained.clone().err();
         observed
             .and(drained)
-            .and_then(|()| pin_store(&state, &plan.store, mounted_volume).map(|_| ()))
+            .and_then(|()| safe(pinned.verify(), "foreground_root_binding"))
     }
     .await;
 
@@ -1601,6 +1606,18 @@ async fn owner_host_public_tunnel() {
 #[cfg(test)]
 mod owner_tests {
     use super::*;
+
+    #[test]
+    fn owner_preflight_requires_an_independent_secret_root_pin() {
+        let mut plan = sample_plan_json();
+        plan.as_object_mut().unwrap().remove("secret_root");
+        assert!(StaticPlan::parse_bytes(plan.to_string().as_bytes()).is_err());
+        plan["secret_root"] = json!(null);
+        assert!(StaticPlan::parse_bytes(plan.to_string().as_bytes()).is_err());
+        plan["secret_root"] = sample_plan_json()["secret_root"].clone();
+        plan["secret_root"]["directory_file_id"] = json!("1234");
+        assert!(StaticPlan::parse_bytes(plan.to_string().as_bytes()).is_err());
+    }
 
     #[test]
     fn request_key_carries_current_wire_timestamp() {

@@ -516,6 +516,14 @@ Use the [M4 owner-host acceptance runbook](m4-acceptance.md) after qualification
 - **macOS.** The state directory and every ancestor must have no extended ACL, because an ACL can grant another account rename or delete rights that the mode bits do not show. Check with `ls -lde PATH` and remove entries with `chmod -N PATH`, or pick a location without ACLs. Unreadable ACLs are refused too.
 - **Linux and macOS.** Every ancestor must be owned by you or root and must not be group- or other-writable, unless it is sticky (like `/tmp`) and the next entry is yours. Only your own account can then rename a component. POSIX is diagnostic-only; native VMs stay unavailable there.
 
+### Windows x64 Compose secret custody
+
+An enrolled foreground store uses `test_vms.expected_store`. To use Compose secrets with that store, also set `test_vms.compose_secret_root` to an existing, separate owner-private directory and set `test_vms.expected_compose_secret_root` to its independently measured identity. Capture it using the same volume GUID and full `FILE_ID_INFO` procedure as the store in the [M4 acceptance runbook](m4-acceptance.md). Both pins have `volume_guid`, `volume_serial` (16 lowercase hex digits) and `directory_file_id` (32 lowercase hex digits).
+
+Use ordinary local drive-letter paths for both directories. Siblings are allowed. The daemon refuses aliases, reparse points, and either root inside the other. Keep both roots owned by the current Windows login, with access grants limited to that login, SYSTEM and Administrators. The launcher checks the pair before opening the store. It reads fixed `<reference>.dpapi` files through the held secret directory and checks both bindings again before releasing plaintext for delivery.
+
+Existing Windows x64 profiles with no `expected_store` can continue to use `compose_secret_root` without an independent enrollment. To migrate one to an enrolled store, capture both identities and add both expected fields together. Store-only bootstrap profiles need only `expected_store`. Omit unused fields. JSON null is invalid.
+
 ## Owner actions (historical; superseded on this PC by the 2026-11-23 update above)
 
 Kept for reference only. On this PC the execution account is the owner's current login, and agents perform the WHPX, QEMU and disk-cap steps under the scoped exception above. Do not follow the dedicated-account or owner-install steps below here.

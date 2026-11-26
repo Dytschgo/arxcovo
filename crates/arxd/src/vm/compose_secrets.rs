@@ -12,76 +12,74 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 pub(crate) trait SecretSource: Send + Sync {
+    fn verify(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn open(&self, reference: Id) -> Result<Zeroizing<Vec<u8>>>;
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) struct Dpapi {
-    root: std::path::PathBuf,
-    pin: crate::config::RootPin,
+    custody: std::sync::Arc<crate::config::VmCustody>,
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 impl Dpapi {
-    pub(crate) fn new(root: &std::path::Path, state: &std::path::Path) -> Result<Self> {
-        use super::paths::LocalPath;
-        let local = |path: &std::path::Path| {
-            LocalPath::parse(path.to_str().unwrap_or_default())
-                .map_err(|_| anyhow::anyhow!("invalid Compose custody path"))
-        };
-        ensure!(
-            !local(root)?.overlaps(&local(state)?),
-            "Compose custody overlaps VM state"
-        );
-        let pin = crate::config::RootPin::acquire(root)?;
-        crate::local::require_owner(root)?;
-        crate::security::private(root)?;
-        pin.verify(root)?;
-        Ok(Self {
-            root: root.into(),
-            pin,
-        })
+    pub(crate) fn new(custody: std::sync::Arc<crate::config::VmCustody>) -> Self {
+        Self { custody }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_with_binding_check(
+        &self,
+        reference: Id,
+        verify: impl Fn() -> Result<()>,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        self.read_from(reference, verify)
+    }
+
+    fn read_from(
+        &self,
+        reference: Id,
+        verify: impl Fn() -> Result<()>,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        use std::io::Read;
+        const MAX_CIPHERTEXT: u64 = 16 * 1024;
+        let result = (|| {
+            verify()?;
+            let mut file = self.custody.open_ciphertext(reference)?;
+            let length = file.metadata()?.len();
+            ensure!(
+                (1..=MAX_CIPHERTEXT).contains(&length),
+                "invalid Compose custody file"
+            );
+            let mut bytes = Zeroizing::new(Vec::with_capacity(length as usize));
+            (&mut file)
+                .take(MAX_CIPHERTEXT + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 == length && Sha256::digest(&*bytes)[..16] == reference,
+                "Compose ciphertext reference mismatch"
+            );
+            let plaintext = crate::security::unprotect_current_user(&mut bytes, MAX_SECRET)?;
+            verify()?;
+            Ok(plaintext)
+        })();
+        result.map_err(|_: anyhow::Error| anyhow::anyhow!("Compose secret unavailable"))
     }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 impl SecretSource for Dpapi {
+    fn verify(&self) -> Result<()> {
+        self.custody
+            .verify()
+            .map_err(|_| anyhow::anyhow!("Compose secret unavailable"))
+    }
+
     fn open(&self, reference: Id) -> Result<Zeroizing<Vec<u8>>> {
-        use std::{
-            io::Read,
-            os::windows::fs::{MetadataExt, OpenOptionsExt},
-        };
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        };
-        const MAX_CIPHERTEXT: u64 = 16 * 1024;
-        let result = (|| {
-            self.pin.verify(&self.root)?;
-            crate::security::private(&self.root)?;
-            let path = self.root.join(format!("{}.dpapi", hex::encode(reference)));
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(&path)?;
-            let meta = file.metadata()?;
-            ensure!(
-                meta.is_file()
-                    && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
-                    && (1..=MAX_CIPHERTEXT).contains(&meta.len()),
-                "invalid Compose custody file"
-            );
-            crate::local::require_owner(&path)?;
-            crate::security::private(&path)?;
-            let mut bytes = Zeroizing::new(Vec::with_capacity(meta.len() as usize));
-            file.take(MAX_CIPHERTEXT + 1).read_to_end(&mut bytes)?;
-            ensure!(
-                bytes.len() as u64 == meta.len() && Sha256::digest(&*bytes)[..16] == reference,
-                "Compose ciphertext reference mismatch"
-            );
-            crate::security::unprotect_current_user(&mut bytes, MAX_SECRET)
-        })();
-        result.map_err(|_: anyhow::Error| anyhow::anyhow!("Compose secret unavailable"))
+        self.read_from(reference, || self.verify())
     }
 }
 
@@ -135,6 +133,7 @@ impl<'a> Delivery<'a> {
             channel.generation() == self.intent.boot,
             "Compose secret boot mismatch"
         );
+        source.verify()?;
         if submitted {
             // Re-sending the bytes is only a private comparison against the
             // guest's exact journaled file instance. An unknown query never authorizes writing it.
@@ -148,6 +147,7 @@ impl<'a> Delivery<'a> {
         {
             return Ok(());
         }
+        source.verify()?;
         self.prove(channel, cancel).await?;
         ensure!(
             self.send(source, channel, cancel, false, || Ok(())).await?,
