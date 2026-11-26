@@ -1791,3 +1791,39 @@ handle custody:
   provenance stay outside native deletion authority. Production TEST admission
   remains closed. Native disposal and empty-workspace cleanup are **unverified
   on real hardware**.
+
+## 7c amendment — native golden and retired acceptance inventory
+
+The M4 owner-acceptance reader (`crates/arxd/tests/m4_acceptance/ledger.rs` and
+`owner.rs`) aligns with store v16 native custody ([ADR 0072](0072-vm-store-v16-native-test-custody.md))
+and chunk 07 resumable disposal without adding a schema migration or extending
+the public MCP surface:
+
+- **Exact generation and lease inventory.** Quiet preflight and final scans
+  compare the exact expected generation directory set against the selected
+  sealed TEST goldens using bounded handle enumeration before opening
+  unexpected entries. Empty, extra, or lease-only directories are never waived.
+  The root allowlist (`activity.sqlite3`, `activity.lock`, `vault.sqlite3`,
+  `vault.lock`, `vault.sqlite3-journal`), activity sidecar guards, pair
+  byte/SHA-256/qcow2-lineage/charge proofs, and pinned enrolled store binding
+  remain intact. Each native-bound golden counts exactly one `generation.lease`
+  separately from its `disk-<key>` and `vars-<key>` leaves, opened relative to
+  the held generation directory and verified for exact stored case, private
+  owner-only ACL, zero length, single link, no reparse point, matching store
+  volume/production/directory/lease IDs, and a bounded quiescent exclusive open
+  and nonblocking `try_lock`.
+- **Physical retirement proof.** `Ledger::gone` confirms both ledger absence
+  (`vm_generations`, `vm_artifacts`, `vm_native_generations`, `vm_native_slots`)
+  and physical absence of the retired generation directory, its
+  `generation.lease`, and its media leaves through the held production root
+  handle, paired with the existing claim and reconciliation/expiry checks.
+- **Historic row discrimination.** Pre-7c golden rows without
+  `vm_native_generations` / `vm_native_slots` rows and `generation.lease` are
+  explicitly separated from native custody. Read-only historic observation
+  exists only in tests (`observe_historic_preflight` in
+  `crates/arxd/tests/m4_acceptance/ledger.rs`), cannot satisfy native preflight
+  or acceptance eligibility, and never binds silently. Moving onto native
+  custody requires a checked rebuild or re-enrollment into a clean enrolled v16
+  store as documented in [M4 owner-host acceptance](../m4-acceptance.md).
+  Production TEST admission stays closed and the physical owner-host journey
+  remains **unverified on real hardware**.
