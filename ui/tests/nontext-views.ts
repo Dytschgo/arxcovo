@@ -11,9 +11,8 @@ import type { NonTextFailure } from './nontext';
  * - segmented groups (`.seg`): the group's border against the page around it;
  * - the switch (`.switch-track`): its edge (inset ring) against the page, and
  *   the knob against the track, off and on;
- * - capacity bars (`.cap-bar`, `.res-bar`): the fill against its track;
- * - underlined links: the underline against the surface behind the link,
- *   where the underline is the cue that the text is a link.
+ * - capacity bars (`.cap-bar`, `.res-bar`): the fill against its track.
+ * (Link underlines are covered by the shared audit.)
  */
 export async function viewPartFailures(page: Page, minimum = 3): Promise<NonTextFailure[]> {
   return page.evaluate(`(${partsInPage.toString()})((${compositing.toString()})(), ${JSON.stringify(minimum)})`) as Promise<NonTextFailure[]>;
@@ -67,12 +66,6 @@ function partsInPage(C: Compositing, min: number): NonTextFailure[] {
     const fill = bar.querySelector('i');
     if (!fill || !painted(bar) || fill.getBoundingClientRect().width <= 1) continue;
     check(bar, 'capacity fill on its track', 'rest', paintOn(getComputedStyle(fill).backgroundColor, bar), inside(bar));
-  }
-  for (const el of document.body.querySelectorAll('a')) {
-    if (!painted(el)) continue;
-    const s = getComputedStyle(el);
-    if (!s.textDecorationLine.includes('underline')) continue;
-    check(el, 'link underline', 'rest', paintOn(s.textDecorationColor, el), inside(el));
   }
   return failures;
 }

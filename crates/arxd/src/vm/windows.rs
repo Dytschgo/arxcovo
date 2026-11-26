@@ -50,6 +50,7 @@ use windows_sys::Win32::{
     },
 };
 
+mod desktop;
 pub(super) mod offline_read;
 pub mod qualification;
 use qualification::WorkspaceCustody;
@@ -305,6 +306,26 @@ fn open_relative(
         access,
         share,
         if create { FILE_CREATE } else { FILE_OPEN },
+        kind,
+    )
+}
+
+/// Exclusive no-follow delete open of one name relative to a held, checked
+/// parent directory. Unlike `open_relative` (which pins objects without
+/// `FILE_SHARE_DELETE`), this helper requests read and delete access with
+/// `share = 0`, excluding any existing or competing reader, writer or deleter
+/// through identity verification, durable intent commit and `delete_on_close`.
+fn open_relative_delete(parent: &File, name: &str, node: Node) -> io::Result<File> {
+    let kind = match node {
+        Node::Directory => FILE_DIRECTORY_FILE,
+        Node::File => FILE_NON_DIRECTORY_FILE,
+    };
+    nt_open_relative(
+        parent,
+        name,
+        FILE_GENERIC_READ | READ_CONTROL | DELETE,
+        0,
+        FILE_OPEN,
         kind,
     )
 }
@@ -690,6 +711,15 @@ impl Job {
         Ok(job)
     }
 
+    fn verify_empty_noninheritable(&self) -> io::Result<()> {
+        let mut flags = 0;
+        succeeded(unsafe { GetHandleInformation(self.0.as_raw_handle(), &mut flags) })?;
+        if flags & HANDLE_FLAG_INHERIT != 0 || self.active()? != 0 {
+            return Err(io::Error::other("Job is inheritable or occupied"));
+        }
+        Ok(())
+    }
+
     fn verify_limits(
         &self,
         memory_limit: usize,
@@ -824,6 +854,7 @@ struct Child {
     job: Job,
     process: OwnedHandle,
     suspended: Option<OwnedHandle>,
+    _desktop: Option<desktop::LaunchDesktop>,
 }
 
 impl Child {
@@ -899,16 +930,24 @@ fn wait(handle: &impl AsRawHandle, millis: u32) -> io::Result<bool> {
 /// under the restricted token; tests may re-execute their own binary.
 enum Launch<'a> {
     Restricted {
-        token: &'a OwnedHandle,
+        token: &'a VmToken,
         plan: &'a CommandPlan<'a>,
     },
     Paused {
-        token: &'a OwnedHandle,
+        token: &'a VmToken,
         image: &'a LocalPath,
         args: &'a [String],
     },
     #[cfg(test)]
     Fixture { image: &'a Path, args: &'a [String] },
+    #[cfg(test)]
+    ContainedFixture {
+        image: &'a Path,
+        args: &'a [String],
+        legacy_console: bool,
+        token: Option<&'a VmToken>,
+        interactive: bool,
+    },
 }
 
 /// Creation-time Job assignment. Every production launch names one Job.
@@ -935,10 +974,16 @@ struct SpawnError {
     partial: Option<PartialChild>,
 }
 
-#[derive(Debug)]
 struct PartialChild {
     _process: Option<OwnedHandle>,
     _thread: Option<OwnedHandle>,
+    _desktop: Option<desktop::LaunchDesktop>,
+}
+
+impl std::fmt::Debug for PartialChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartialChild").finish_non_exhaustive()
+    }
 }
 
 fn at(stage: SpawnStage) -> impl FnOnce(io::Error) -> SpawnError {
@@ -957,10 +1002,11 @@ fn spawn(
     stdio: Stdio,
 ) -> Result<Child, (SpawnError, Job)> {
     match create_suspended(&launch, cwd, environment, Assignment::Job(&job), &stdio) {
-        Ok((process, thread)) => Ok(Child {
+        Ok((process, thread, desktop)) => Ok(Child {
             job,
             process,
             suspended: Some(thread),
+            _desktop: desktop,
         }),
         Err(error) => Err((error, job)),
     }
@@ -972,12 +1018,14 @@ fn create_suspended(
     environment: &[u16],
     assignment: Assignment<'_>,
     stdio: &Stdio,
-) -> Result<(OwnedHandle, OwnedHandle), SpawnError> {
+) -> Result<(OwnedHandle, OwnedHandle, Option<desktop::LaunchDesktop>), SpawnError> {
     let (image, args): (&Path, &[String]) = match launch {
         Launch::Restricted { plan, .. } => (Path::new(plan.image().as_str()), plan.args()),
         Launch::Paused { image, args, .. } => (Path::new(image.as_str()), args),
         #[cfg(test)]
-        Launch::Fixture { image, args } => (image, args),
+        Launch::Fixture { image, args } | Launch::ContainedFixture { image, args, .. } => {
+            (image, args)
+        }
     };
     let recipe = |message| at(SpawnStage::Recipe)(io::Error::other(message));
     if !image.is_absolute() || !cwd.is_absolute() || !environment.ends_with(&[0, 0]) {
@@ -1000,10 +1048,12 @@ fn create_suspended(
         return Err(recipe("command line too long"));
     }
     let handles = stdio.handles();
-    let restricted = matches!(launch, Launch::Paused { .. } | Launch::Restricted { .. });
+    let contained = matches!(launch, Launch::Paused { .. } | Launch::Restricted { .. });
+    #[cfg(test)]
+    let contained = contained || matches!(launch, Launch::ContainedFixture { .. });
     let mut attributes =
-        Attributes::new(if restricted { 4 } else { 2 }).map_err(at(SpawnStage::Attributes))?;
-    if restricted {
+        Attributes::new(if contained { 4 } else { 2 }).map_err(at(SpawnStage::Attributes))?;
+    if contained {
         attributes
             .insert_paused_policy()
             .map_err(at(SpawnStage::Attributes))?;
@@ -1033,42 +1083,96 @@ fn create_suspended(
     attributes
         .insert(PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, &handles)
         .map_err(at(SpawnStage::Attributes))?;
+    let desktop = match launch {
+        Launch::Paused { token, .. } | Launch::Restricted { token, .. } => {
+            Some(desktop::LaunchDesktop::new(token).map_err(at(SpawnStage::Attributes))?)
+        }
+        // Negative controls vary one launch property at a time: the legacy
+        // console probe keeps the production private desktop.
+        #[cfg(test)]
+        Launch::ContainedFixture {
+            token: Some(token),
+            interactive: false,
+            ..
+        } => Some(desktop::LaunchDesktop::new(token).map_err(at(SpawnStage::Attributes))?),
+        #[cfg(test)]
+        Launch::Fixture { .. } | Launch::ContainedFixture { .. } => None,
+    };
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    if let Some(desktop) = &desktop {
+        startup.StartupInfo.lpDesktop = desktop.path.as_ptr().cast_mut();
+    }
     [
         startup.StartupInfo.hStdInput,
         startup.StartupInfo.hStdOutput,
         startup.StartupInfo.hStdError,
     ] = handles;
+    #[cfg(test)]
+    let interactive_desktop = wide(r"WinSta0\Default");
+    #[cfg(test)]
+    if matches!(
+        launch,
+        Launch::ContainedFixture {
+            interactive: true,
+            ..
+        }
+    ) {
+        startup.StartupInfo.lpDesktop = interactive_desktop.as_ptr().cast_mut();
+    }
     startup.lpAttributeList = attributes.pointer();
     let mut process = PROCESS_INFORMATION::default();
-    let flags = EXTENDED_STARTUPINFO_PRESENT
-        | CREATE_SUSPENDED
-        | CREATE_UNICODE_ENVIRONMENT
-        | CREATE_NO_WINDOW;
+    // CREATE_NO_WINDOW can fail console initialization when the child
+    // process policy is enforced. Start VM processes detached from consoles.
+    let console = if contained {
+        DETACHED_PROCESS
+    } else {
+        CREATE_NO_WINDOW
+    };
+    #[cfg(test)]
+    let console = if matches!(
+        launch,
+        Launch::ContainedFixture {
+            legacy_console: true,
+            ..
+        }
+    ) {
+        CREATE_NO_WINDOW
+    } else {
+        console
+    };
+    let flags =
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | console;
     // All arrays, command buffer, and attribute storage remain live for this call.
-    succeeded(unsafe {
-        match launch {
-            Launch::Restricted { token, .. } | Launch::Paused { token, .. } => {
-                CreateProcessAsUserW(
-                    token.as_raw_handle(),
-                    image.as_ptr(),
-                    command.as_mut_ptr(),
-                    null(),
-                    null(),
-                    1,
-                    flags,
-                    environment.as_ptr().cast(),
-                    cwd.as_ptr(),
-                    &startup.StartupInfo,
-                    &mut process,
-                )
-            }
-            #[cfg(test)]
-            Launch::Fixture { .. } => CreateProcessW(
+    let command = command.as_mut_ptr();
+    let information = std::ptr::from_mut(&mut process);
+    let create_as_user = |token: &VmToken| unsafe {
+        CreateProcessAsUserW(
+            token.token.as_raw_handle(),
+            image.as_ptr(),
+            command,
+            null(),
+            null(),
+            1,
+            flags,
+            environment.as_ptr().cast(),
+            cwd.as_ptr(),
+            &startup.StartupInfo,
+            information,
+        )
+    };
+    succeeded(match launch {
+        Launch::Restricted { token, .. } | Launch::Paused { token, .. } => create_as_user(token),
+        #[cfg(test)]
+        Launch::ContainedFixture {
+            token: Some(token), ..
+        } => create_as_user(token),
+        #[cfg(test)]
+        Launch::Fixture { .. } | Launch::ContainedFixture { .. } => unsafe {
+            CreateProcessW(
                 image.as_ptr(),
-                command.as_mut_ptr(),
+                command,
                 null(),
                 null(),
                 1,
@@ -1076,22 +1180,23 @@ fn create_suspended(
                 environment.as_ptr().cast(),
                 cwd.as_ptr(),
                 &startup.StartupInfo,
-                &mut process,
-            ),
-        }
+                information,
+            )
+        },
     })
     .map_err(at(SpawnStage::Create))?;
     drop(attributes);
     // The kernel has created both handles and assigned the Job before any child instruction.
     let (process, thread) = unsafe { (owned(process.hProcess), owned(process.hThread)) };
     match (process, thread) {
-        (Ok(process), Ok(thread)) => Ok((process, thread)),
+        (Ok(process), Ok(thread)) => Ok((process, thread, desktop)),
         (process, thread) => Err(SpawnError {
             stage: SpawnStage::Verify,
             error: io::Error::other("process created without both handles"),
             partial: Some(PartialChild {
                 _process: process.ok(),
                 _thread: thread.ok(),
+                _desktop: desktop,
             }),
         }),
     }
@@ -2955,6 +3060,7 @@ impl<'a> CheckedLaunchCore<'a> {
         token: &'a VmToken,
         inputs: LaunchInputs<'a>,
         refresh: impl FnOnce(&CommandPlan<'_>) -> Result<(std::time::Instant, T), NativeRefusal>,
+        before_spawn: impl FnOnce() -> Result<(), NativeRefusal>,
     ) -> Result<(Self, BootIo, T), HoldRefusal> {
         let kind = inputs.plan.kind();
         // ADR 0064: a public-egress plan also stays closed until its patched
@@ -3065,6 +3171,11 @@ impl<'a> CheckedLaunchCore<'a> {
         // the actual process-creation edge.
         stock.recheck_all(&inputs.pins, Some(&inputs.workspace))?;
         let (captured, authority) = refresh(&inputs.plan)?;
+        // The checked Job is unnamed, owned by this stack frame, omitted
+        // from stdio inheritance and assigned by the kernel at creation.
+        job.verify_empty_noninheritable()
+            .map_err(|_| NativeRefusal::JobUnverified)?;
+        before_spawn()?;
         fresh_observation(
             captured,
             std::time::Instant::now(),
@@ -3072,7 +3183,7 @@ impl<'a> CheckedLaunchCore<'a> {
         )?;
         let child = spawn(
             Launch::Restricted {
-                token: &token.token,
+                token,
                 plan: &inputs.plan,
             },
             Path::new(inputs.cwd.as_str()),
@@ -3977,6 +4088,8 @@ fn assert_admission_closed() {
 mod tests {
     use super::*;
 
+    mod qmp_stdio_fixture;
+
     #[test]
     fn paused_launch_attributes_and_single_process_job_are_applied() {
         let mut attributes = Attributes::new(4).unwrap();
@@ -4167,7 +4280,7 @@ mod tests {
         assert_ne!(outer, 0, "access denied without an outer runner Job");
         let (child_io, _parent_io) = fixture_stdio();
         let control = Launch::Fixture { image, args };
-        let (process, _thread) = create_suspended(
+        let (process, _thread, _desktop) = create_suspended(
             &control,
             cwd,
             environment,
@@ -5120,7 +5233,8 @@ mod tests {
                 Assignment::Job(&job),
                 &child_io,
             )
-            .unwrap_err();
+            .err()
+            .expect("missing test image refused");
             assert_eq!(failure.stage, SpawnStage::Create);
             assert_eq!(
                 failure.error.raw_os_error(),

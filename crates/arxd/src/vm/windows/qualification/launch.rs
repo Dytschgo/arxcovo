@@ -264,17 +264,19 @@ impl<'a> QualifierLaunch<'a> {
             HeldRecipeScope::from_baseline(baseline),
             inputs,
             |inputs| {
-                let (core, (read, write), ()) =
-                    CheckedLaunchCore::hold_checked(&baseline._held.token, inputs, |_| {
-                        Ok((refresh()?, ()))
-                    })
-                    .map_err(|failure| {
-                        // Retain the separate qualifier's bounded teardown wait.
-                        if let LaunchCreation::Created(child) = &failure.creation {
-                            let _ = wait(&child.child.process, 2_000);
-                        }
-                        failure.reason
-                    })?;
+                let (core, (read, write), ()) = CheckedLaunchCore::hold_checked(
+                    &baseline._held.token,
+                    inputs,
+                    |_| Ok((refresh()?, ())),
+                    || Ok(()),
+                )
+                .map_err(|failure| {
+                    // Retain the separate qualifier's bounded teardown wait.
+                    if let LaunchCreation::Created(child) = &failure.creation {
+                        let _ = wait(&child.child.process, 2_000);
+                    }
+                    failure.reason
+                })?;
                 Ok((Self { core }, read, write))
             },
         )

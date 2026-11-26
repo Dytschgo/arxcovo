@@ -237,7 +237,7 @@ for (const motion of ['no-preference', 'reduce'] as const) {
       expect.soft(contrast, where).toEqual([]);
       expect.soft(opacityGroups, `${where}: text inside an opacity group`).toEqual([]);
       expect.soft(await nonTextFailures(page), `${where}: non-text contrast (3:1)`).toEqual([]);
-      expect.soft(await viewPartFailures(page), `${where}: view parts and link underlines (3:1)`).toEqual([]);
+      expect.soft(await viewPartFailures(page), `${where}: PR B view parts (3:1)`).toEqual([]);
     };
     await page.goto('/');
     if (motion === 'no-preference') await freezeMotion(page);

@@ -58,11 +58,11 @@ fn current_user_sid() -> (Vec<usize>, String) {
     (data, string)
 }
 
-fn sid_ptr(data: &[usize]) -> PSID {
+pub(super) fn sid_ptr(data: &[usize]) -> PSID {
     unsafe { (*data.as_ptr().cast::<TOKEN_USER>()).User.Sid }
 }
 
-fn create_dir_sddl(parent: &Path, name: &str, sddl: &str) -> LocalPath {
+pub(super) fn create_dir_sddl(parent: &Path, name: &str, sddl: &str) -> LocalPath {
     let path = parent.join(name);
     let mut descriptor = null_mut();
     let wide_sddl: Vec<u16> = OsStr::new(sddl).encode_wide().chain(Some(0)).collect();
@@ -399,6 +399,7 @@ fn launch_permit_fence_requires_uninhabited_authority_and_non_echoed_target() {
     let plan = golden_info(&image, &golden, &header).unwrap();
     let target = LaunchTarget {
         plan: &plan,
+        writer_epoch: [5; 16],
         cwd: &root,
         pair: None,
         installer: None,
@@ -1646,6 +1647,7 @@ fn refused_child() -> Child {
             job: Job::new(256 * 1024 * 1024, None).unwrap(),
             process: unsafe { owned(CreateEventW(null(), 1, 1, null())) }.unwrap(),
             suspended: None,
+            _desktop: None,
         },
     }
 }

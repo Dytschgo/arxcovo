@@ -19,6 +19,9 @@ export interface NonTextFailure { what: string; part: string; state: string; fg:
  *   its fill or border against the set it sits in.
  * - Icons (`svg.i`, `.os-glyph`), kind markers and meter fills against what
  *   they are painted on.
+ * - Text-link underlines at rest: where a link's colour matches the text
+ *   around it, its underline is the only cue that it is a link, so the
+ *   decoration colour must reach 3:1 against the surface under it.
  * - Focus indicators: every Tab stop is reached with the real keyboard; the
  *   outline (on the element or the ancestor that draws it) or border that
  *   appears on focus must reach 3:1 against the colour beside it.
@@ -160,6 +163,16 @@ function partsInPage(C: Compositing, min: number): NonTextFailure[] {
     if (!fill || !painted(track) || fill.getBoundingClientRect().width <= 1) continue;
     const ink = C.composite(C.parse(getComputedStyle(fill).backgroundColor), chain(track)).ink;
     report(track, 'meter fill on its track', 'rest', ink, inside(track), C.ratio(ink, inside(track)));
+  }
+
+  for (const link of document.body.querySelectorAll('a[href]')) {
+    if (!painted(link)) continue;
+    const s = getComputedStyle(link);
+    if (!s.textDecorationLine.includes('underline')) continue;
+    const ink = paintOn(s.textDecorationColor, link);
+    const bg = inside(link);
+    const text = (link.textContent ?? '').trim().slice(0, 40);
+    report(link, `link underline "${text}"`, 'rest', ink, bg, C.ratio(ink, bg));
   }
 
   return [...failures.values()].map(f => ({ what: f.what, part: f.part, state: f.state, fg: f.fg, bg: f.bg, ratio: f.ratio, detail: f.detail }));

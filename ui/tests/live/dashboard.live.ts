@@ -56,7 +56,7 @@ async function audit(page: Page, where: string) {
   expect.soft(contrast, `contrast: ${where}`).toEqual([]);
   expect.soft(opacityGroups, `text inside an opacity group: ${where}`).toEqual([]);
   expect.soft(await nonTextFailures(page), `non-text contrast (3:1): ${where}`).toEqual([]);
-  expect.soft(await viewPartFailures(page), `view parts and link underlines (3:1): ${where}`).toEqual([]);
+  expect.soft(await viewPartFailures(page), `PR B view parts (3:1): ${where}`).toEqual([]);
 }
 
 async function signIn(page: Page, hash = '#/hosts') {

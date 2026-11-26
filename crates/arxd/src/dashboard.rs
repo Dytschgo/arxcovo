@@ -1,4 +1,5 @@
 mod assets;
+mod cpu_history;
 mod password;
 mod read;
 mod session;
