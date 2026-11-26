@@ -13,6 +13,7 @@ use super::{
         FRESHNESS, InstallerFailure, InstallerFailureReason, InstallerStage, NativeRefusal,
         StopDisposition, StopEvidence, fresh_observation,
     },
+    selection_epoch::Invalidation,
 };
 use crate::{security::vm_acl, service::Shutdown};
 use std::{
@@ -399,30 +400,122 @@ fn verify_ntfs(root: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// Typed outcome for handle-identity queries so custody checks can separate
+/// measured file-state violations from OS or I/O failures.
+#[derive(Debug)]
+enum FileIdentityError {
+    /// Measured forbidden attribute, wrong node type, delete-pending, or extra hard link.
+    Unsafe,
+    /// Win32 API or I/O failure while querying the handle.
+    Io(io::Error),
+}
+
+impl FileIdentityError {
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::Unsafe => io::Error::other("unsafe file type or alias"),
+            Self::Io(error) => error,
+        }
+    }
+}
+
+/// Typed outcome for volume-root and drive-binding checks feeding the
+/// selection epoch. Only a positive measured mismatch confirms drift.
+#[derive(Debug)]
+pub(in crate::vm::windows) enum CustodyCheckError {
+    /// Positive measured mismatch against the qualified volume or object identity.
+    Mismatch,
+    /// Win32 API or I/O failure; fails closed without claiming drift.
+    Unavailable(io::Error),
+}
+
+impl CustodyCheckError {
+    pub(in crate::vm::windows) fn into_invalidation(self, reason: NativeRefusal) -> Invalidation {
+        match self {
+            Self::Mismatch => Invalidation::Confirmed(reason),
+            Self::Unavailable(_) => Invalidation::Indeterminate(reason),
+        }
+    }
+
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::Mismatch => io::Error::other("drive letter is not a volume root"),
+            Self::Unavailable(error) => error,
+        }
+    }
+}
+
+impl From<FileIdentityError> for CustodyCheckError {
+    fn from(error: FileIdentityError) -> Self {
+        match error {
+            FileIdentityError::Unsafe => Self::Mismatch,
+            FileIdentityError::Io(io_error) => Self::Unavailable(io_error),
+        }
+    }
+}
+
 /// A SUBST or other drive-letter alias for a folder is not a volume mount
 /// point. The pinned drive-letter root must be the volume's own root object.
 pub(crate) fn verify_volume_root(root: &str, pinned: FileIdentity) -> io::Result<()> {
-    let mut name = [0u16; 64];
-    // The fixed buffer exceeds the 49-unit `\\?\Volume{GUID}\` name.
-    succeeded(unsafe {
-        GetVolumeNameForVolumeMountPointW(wide(root).as_ptr(), name.as_mut_ptr(), name.len() as u32)
-    })?;
-    let end = name
-        .iter()
-        .position(|&unit| unit == 0)
-        .ok_or_else(|| io::Error::other("unterminated volume name"))?;
-    let volume = String::from_utf16(&name[..end]).map_err(io::Error::other)?;
-    if !volume.starts_with(r"\\?\Volume{") || !volume.ends_with(r"}\") {
-        return Err(io::Error::other("unexpected volume name"));
-    }
-    let actual = file_identity(&open_directory(&volume)?, true)?.0;
+    verify_volume_root_typed(root, pinned).map_err(CustodyCheckError::into_io)
+}
+
+pub(in crate::vm::windows) fn verify_volume_root_typed(
+    root: &str,
+    pinned: FileIdentity,
+) -> Result<(), CustodyCheckError> {
+    verify_volume_root_with(
+        root,
+        pinned,
+        |mount_point| {
+            let mut name = [0u16; 64];
+            // The fixed buffer exceeds the 49-unit `\\?\Volume{GUID}\` name.
+            succeeded(unsafe {
+                GetVolumeNameForVolumeMountPointW(
+                    wide(mount_point).as_ptr(),
+                    name.as_mut_ptr(),
+                    name.len() as u32,
+                )
+            })?;
+            let end = name
+                .iter()
+                .position(|&unit| unit == 0)
+                .ok_or_else(|| io::Error::other("unterminated volume name"))?;
+            let volume = String::from_utf16(&name[..end]).map_err(io::Error::other)?;
+            if !volume.starts_with(r"\\?\Volume{") || !volume.ends_with(r"}\") {
+                return Err(io::Error::other("unexpected volume name"));
+            }
+            Ok(volume)
+        },
+        |volume| {
+            let dir = open_directory(volume).map_err(FileIdentityError::Io)?;
+            Ok(file_identity_typed(&dir, true)?.0)
+        },
+    )
+}
+
+fn verify_volume_root_with(
+    root: &str,
+    pinned: FileIdentity,
+    resolve: impl FnOnce(&str) -> io::Result<String>,
+    read_root: impl FnOnce(&str) -> Result<FileIdentity, FileIdentityError>,
+) -> Result<(), CustodyCheckError> {
+    let volume = resolve(root).map_err(CustodyCheckError::Unavailable)?;
+    let actual = read_root(&volume).map_err(CustodyCheckError::from)?;
     if actual != pinned {
-        return Err(io::Error::other("drive letter is not a volume root"));
+        return Err(CustodyCheckError::Mismatch);
     }
     Ok(())
 }
 
 fn file_identity(file: &File, directory: bool) -> io::Result<(FileIdentity, u64)> {
+    file_identity_typed(file, directory).map_err(FileIdentityError::into_io)
+}
+
+fn file_identity_typed(
+    file: &File,
+    directory: bool,
+) -> Result<(FileIdentity, u64), FileIdentityError> {
     let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
     let mut standard = FILE_STANDARD_INFO::default();
     let mut id = FILE_ID_INFO::default();
@@ -442,7 +535,8 @@ fn file_identity(file: &File, directory: bool) -> io::Result<(FileIdentity, u64)
                 class,
                 buffer,
                 size as u32,
-            ))?;
+            ))
+            .map_err(FileIdentityError::Io)?;
         }
     }
     if tag.FileAttributes
@@ -452,9 +546,10 @@ fn file_identity(file: &File, directory: bool) -> io::Result<(FileIdentity, u64)
         || standard.DeletePending
         || (!directory && standard.NumberOfLinks != 1)
     {
-        return Err(io::Error::other("unsafe file type or alias"));
+        return Err(FileIdentityError::Unsafe);
     }
-    let allocated = u64::try_from(standard.AllocationSize).map_err(io::Error::other)?;
+    let allocated = u64::try_from(standard.AllocationSize)
+        .map_err(|error| FileIdentityError::Io(io::Error::other(error)))?;
     Ok((
         FileIdentity {
             volume: id.VolumeSerialNumber,
@@ -1393,20 +1488,66 @@ fn captured_groups(entries: &[SID_AND_ATTRIBUTES]) -> io::Result<Vec<(Vec<u8>, u
 
 /// The restricted child must carry exactly the captured parent groups and
 /// masks: same SIDs, same order, same attributes.
-fn groups_match(expected: &[(Vec<u8>, u32)], entries: &[SID_AND_ATTRIBUTES]) -> bool {
-    captured_groups(entries).is_ok_and(|actual| actual == expected)
+fn verify_groups_typed(
+    expected: &[(Vec<u8>, u32)],
+    entries: &[SID_AND_ATTRIBUTES],
+) -> Result<(), TokenCheckError> {
+    let actual = captured_groups(entries).map_err(TokenCheckError::Io)?;
+    if actual != expected {
+        return Err(TokenCheckError::Mismatch(
+            "VM child token groups differ from the policy",
+        ));
+    }
+    Ok(())
+}
+
+/// Typed outcome for execution-profile and token checks feeding the
+/// selection epoch. Permanent policy/profile mismatches confirm drift;
+/// Win32/LSA failures and an inactive console session stay indeterminate.
+#[derive(Debug)]
+enum TokenCheckError {
+    /// Positive measured mismatch in token identity, profile, groups,
+    /// privileges, restrictions, logon, impersonation or child default DACL.
+    Mismatch(&'static str),
+    /// The owner's console session is not currently active (e.g. session switch
+    /// or disconnect). Fails closed without claiming permanent profile drift.
+    ConsoleInactive,
+    /// Win32 or LSA API/I/O failure; no drift is claimed.
+    Io(io::Error),
+}
+
+impl TokenCheckError {
+    fn into_invalidation(self) -> Invalidation {
+        let reason = NativeRefusal::IdentityUnverified;
+        match self {
+            Self::Mismatch(_) => Invalidation::Confirmed(reason),
+            Self::ConsoleInactive | Self::Io(_) => Invalidation::Indeterminate(reason),
+        }
+    }
+
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::Mismatch(message) => io::Error::other(message),
+            Self::ConsoleInactive => io::Error::other("unqualified VM token"),
+            Self::Io(error) => error,
+        }
+    }
 }
 
 fn require_unimpersonated() -> io::Result<()> {
+    require_unimpersonated_typed().map_err(TokenCheckError::into_io)
+}
+
+fn require_unimpersonated_typed() -> Result<(), TokenCheckError> {
     let mut impersonation = null_mut();
     if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut impersonation) } != 0 {
-        drop(unsafe { owned(impersonation) }?);
-        return Err(io::Error::other(
+        drop(unsafe { owned(impersonation) }.map_err(TokenCheckError::Io)?);
+        return Err(TokenCheckError::Mismatch(
             "impersonation is outside the VM token policy",
         ));
     }
     if unsafe { GetLastError() } != ERROR_NO_TOKEN {
-        return Err(io::Error::last_os_error());
+        return Err(TokenCheckError::Io(io::Error::last_os_error()));
     }
     Ok(())
 }
@@ -1429,16 +1570,27 @@ fn inspect_token_identity(
     mode: TokenMode,
     require_active_console: bool,
 ) -> io::Result<Identity> {
-    let user = token_data(token, TokenUser)?;
-    let integrity = token_data(token, TokenIntegrityLevel)?;
-    let elevation = token_data(token, TokenElevation)?;
-    let elevation_kind = token_data(token, TokenElevationType)?;
-    let session = token_data(token, TokenSessionId)?[0] as u32;
-    let stats = token_data(token, TokenStatistics)?;
-    let groups = token_data(token, TokenGroups)?;
-    let logon = token_data(token, TokenLogonSid)?;
+    inspect_token_identity_typed(token, account, restricted, mode, require_active_console)
+        .map_err(TokenCheckError::into_io)
+}
+
+fn inspect_token_identity_typed(
+    token: &OwnedHandle,
+    account: &LocalSid,
+    restricted: bool,
+    mode: TokenMode,
+    require_active_console: bool,
+) -> Result<Identity, TokenCheckError> {
+    let user = token_data(token, TokenUser).map_err(TokenCheckError::Io)?;
+    let integrity = token_data(token, TokenIntegrityLevel).map_err(TokenCheckError::Io)?;
+    let elevation = token_data(token, TokenElevation).map_err(TokenCheckError::Io)?;
+    let elevation_kind = token_data(token, TokenElevationType).map_err(TokenCheckError::Io)?;
+    let session = token_data(token, TokenSessionId).map_err(TokenCheckError::Io)?[0] as u32;
+    let stats = token_data(token, TokenStatistics).map_err(TokenCheckError::Io)?;
+    let groups = token_data(token, TokenGroups).map_err(TokenCheckError::Io)?;
+    let logon = token_data(token, TokenLogonSid).map_err(TokenCheckError::Io)?;
     if restricted && mode == TokenMode::CurrentUser {
-        let restrictions = token_data(token, TokenRestrictedSids)?;
+        let restrictions = token_data(token, TokenRestrictedSids).map_err(TokenCheckError::Io)?;
         // The query owns the pointed-to SID. Require only the enrolled user
         // in the write restriction list, as supplied to CreateRestrictedToken.
         let exact = unsafe {
@@ -1446,7 +1598,9 @@ fn inspect_token_identity(
             groups.GroupCount == 1 && EqualSid(groups.Groups[0].Sid, account.0) != 0
         };
         if !exact {
-            return Err(io::Error::other("unexpected VM token restrictions"));
+            return Err(TokenCheckError::Mismatch(
+                "unexpected VM token restrictions",
+            ));
         }
     }
     // These are the documented layouts of the respective token information
@@ -1457,26 +1611,25 @@ fn inspect_token_identity(
             .Label
             .Sid;
         let stats = &*stats.as_ptr().cast::<TOKEN_STATISTICS>();
-        let entries = token_entries(&groups)?;
+        let entries = token_entries(&groups).map_err(TokenCheckError::Io)?;
         if IsWellKnownSid(actual_user, WinLocalSystemSid) != 0
             || EqualSid(actual_user, account.0) == 0
             || IsWellKnownSid(integrity, WinMediumLabelSid) == 0
             || elevation[0] != 0
             || !mode.accepts_elevation(elevation_kind[0] as i32)
             || session == 0
-            || (require_active_console
-                && mode == TokenMode::CurrentUser
-                && WTSGetActiveConsoleSessionId() != session)
             || stats.TokenType != TokenPrimary
             || (IsTokenRestricted(token.as_raw_handle()) != 0) != restricted
             || (*logon.as_ptr().cast::<TOKEN_GROUPS>()).GroupCount != 1
             || !mode.accepts_groups(entries)
         {
-            return Err(io::Error::other("unqualified VM token"));
+            return Err(TokenCheckError::Mismatch("unqualified VM token"));
         }
         let mut data = null_mut();
         if LsaGetLogonSessionData(&stats.AuthenticationId, &mut data) != 0 || data.is_null() {
-            return Err(io::Error::other("unavailable logon session"));
+            return Err(TokenCheckError::Io(io::Error::other(
+                "unavailable logon session",
+            )));
         }
         let local = !(*data).Sid.is_null()
             && EqualSid((*data).Sid, actual_user) != 0
@@ -1484,9 +1637,15 @@ fn inspect_token_identity(
             && (*data).LogonType == 2; // SECURITY_LOGON_TYPE::Interactive
         LsaFreeReturnBuffer(data.cast());
         if !local {
-            return Err(io::Error::other("unqualified VM logon"));
+            return Err(TokenCheckError::Mismatch("unqualified VM logon"));
         }
-        verify_privileges(token, restricted && mode == TokenMode::CurrentUser)?;
+        verify_privileges_typed(token, restricted && mode == TokenMode::CurrentUser)?;
+        if require_active_console
+            && mode == TokenMode::CurrentUser
+            && WTSGetActiveConsoleSessionId() != session
+        {
+            return Err(TokenCheckError::ConsoleInactive);
+        }
         Ok(Identity {
             logon,
             authentication: stats.AuthenticationId,
@@ -1495,15 +1654,20 @@ fn inspect_token_identity(
     }
 }
 
-fn verify_privileges(token: &OwnedHandle, current_user_child: bool) -> io::Result<()> {
-    let data = token_data(token, TokenPrivileges)?;
+fn verify_privileges_typed(
+    token: &OwnedHandle,
+    current_user_child: bool,
+) -> Result<(), TokenCheckError> {
+    let data = token_data(token, TokenPrivileges).map_err(TokenCheckError::Io)?;
     let privileges = data.as_ptr().cast::<TOKEN_PRIVILEGES>();
     // The kernel returned a variable-length array with this layout.
     let entries = unsafe {
         let count = (*privileges).PrivilegeCount as usize;
         let offset = std::mem::offset_of!(TOKEN_PRIVILEGES, Privileges);
         if count > (size_of_val(data.as_slice()) - offset) / size_of::<LUID_AND_ATTRIBUTES>() {
-            return Err(io::Error::other("invalid token privilege count"));
+            return Err(TokenCheckError::Io(io::Error::other(
+                "invalid token privilege count",
+            )));
         }
         std::slice::from_raw_parts(
             std::ptr::addr_of!((*privileges).Privileges).cast::<LUID_AND_ATTRIBUTES>(),
@@ -1516,8 +1680,10 @@ fn verify_privileges(token: &OwnedHandle, current_user_child: bool) -> io::Resul
         // Resolve only a local privilege ID into the fixed buffer.
         succeeded(unsafe {
             LookupPrivilegeNameW(null(), &entry.Luid, name.as_mut_ptr(), &mut size)
-        })?;
-        let name = String::from_utf16(&name[..size as usize]).map_err(io::Error::other)?;
+        })
+        .map_err(TokenCheckError::Io)?;
+        let name = String::from_utf16(&name[..size as usize])
+            .map_err(|error| TokenCheckError::Io(io::Error::other(error)))?;
         if name != "SeChangeNotifyPrivilege"
             && (current_user_child
                 || entry.Attributes & SE_PRIVILEGE_ENABLED != 0
@@ -1529,7 +1695,7 @@ fn verify_privileges(token: &OwnedHandle, current_user_child: bool) -> io::Resul
                         | "SeTimeZonePrivilege"
                 ))
         {
-            return Err(io::Error::other("unqualified VM token privilege"));
+            return Err(TokenCheckError::Mismatch("unqualified VM token privilege"));
         }
     }
     Ok(())
@@ -1671,15 +1837,35 @@ impl VmToken {
         Ok(hash.finalize().into())
     }
 
-    fn verify_current_profile(&self) -> io::Result<()> {
-        require_unimpersonated()?;
-        let parent = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY)?;
-        let current = token_identity(&parent, &self.account, false, self.mode)?;
-        let groups = captured_groups(token_entries(&token_data(&parent, TokenGroups)?)?)?;
+    fn verify_current_profile(&self) -> Result<(), TokenCheckError> {
+        self.verify_current_profile_with(
+            require_unimpersonated_typed,
+            || {
+                let parent = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY)
+                    .map_err(TokenCheckError::Io)?;
+                let current =
+                    inspect_token_identity_typed(&parent, &self.account, false, self.mode, true)?;
+                let groups_data = token_data(&parent, TokenGroups).map_err(TokenCheckError::Io)?;
+                let entries = token_entries(&groups_data).map_err(TokenCheckError::Io)?;
+                let groups = captured_groups(entries).map_err(TokenCheckError::Io)?;
+                Ok((current, groups))
+            },
+            || self.verify_typed(&self.token),
+        )
+    }
+
+    fn verify_current_profile_with(
+        &self,
+        check_unimpersonated: impl FnOnce() -> Result<(), TokenCheckError>,
+        read_parent: impl FnOnce() -> Result<(Identity, Vec<(Vec<u8>, u32)>), TokenCheckError>,
+        verify_child: impl FnOnce() -> Result<(), TokenCheckError>,
+    ) -> Result<(), TokenCheckError> {
+        check_unimpersonated()?;
+        let (current, groups) = read_parent()?;
         if !self.identity.same_logon(&current) || groups != self.groups {
-            return Err(io::Error::other("VM parent profile changed"));
+            return Err(TokenCheckError::Mismatch("VM parent profile changed"));
         }
-        self.verify(&self.token)
+        verify_child()
     }
 
     fn entries(&self) -> [vm_acl::Entry; 4] {
@@ -1736,26 +1922,30 @@ impl VmToken {
     }
 
     fn verify(&self, token: &OwnedHandle) -> io::Result<()> {
-        let observed = token_identity(token, &self.account, true, self.mode)?;
-        if !groups_match(
-            &self.groups,
-            token_entries(&token_data(token, TokenGroups)?)?,
-        ) {
-            return Err(io::Error::other(
-                "VM child token groups differ from the policy",
+        self.verify_typed(token).map_err(TokenCheckError::into_io)
+    }
+
+    fn verify_typed(&self, token: &OwnedHandle) -> Result<(), TokenCheckError> {
+        let observed = inspect_token_identity_typed(token, &self.account, true, self.mode, true)?;
+        let groups_data = token_data(token, TokenGroups).map_err(TokenCheckError::Io)?;
+        let entries = token_entries(&groups_data).map_err(TokenCheckError::Io)?;
+        verify_groups_typed(&self.groups, entries)?;
+        if !observed.same_logon(&self.identity) {
+            return Err(TokenCheckError::Mismatch(
+                "VM child token differs from the qualified policy",
             ));
         }
-        let data = token_data(token, TokenDefaultDacl)?;
+        let data = token_data(token, TokenDefaultDacl).map_err(TokenCheckError::Io)?;
         // Both identities and the ACL remain backed by the token query allocations.
-        let matches = unsafe {
-            observed.same_logon(&self.identity)
-                && vm_acl::matches(
-                    (*data.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl,
-                    &self.entries(),
-                )
-        };
-        if !matches {
-            return Err(io::Error::other(
+        let acl_matches = unsafe {
+            vm_acl::matches_typed(
+                (*data.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl,
+                &self.entries(),
+            )
+        }
+        .map_err(TokenCheckError::Io)?;
+        if !acl_matches {
+            return Err(TokenCheckError::Mismatch(
                 "VM child token differs from the qualified policy",
             ));
         }
@@ -3801,6 +3991,65 @@ fn allocated_under(root: &LocalPath, expected: u64, limit: usize) -> Result<u64,
 mod monitor_tests;
 
 #[cfg(test)]
+fn open_test_epoch() -> (
+    crate::vm::selection_epoch::SelectionEpoch,
+    crate::vm::selection_epoch::Sample,
+) {
+    use crate::vm::{
+        model::ClockReading,
+        qualification_record::Instant2,
+        selection_epoch::{Sample, SelectionEpoch},
+    };
+    let now = std::time::Instant::now();
+    let sample = Sample {
+        captured: now,
+        now: Instant2 {
+            utc: 1_800_000_000,
+            mono_ms: 3_600_000,
+        },
+        boot_marker: [7; 32],
+        reading: ClockReading {
+            utc_ms: 1_800_000_000_000,
+            monotonic: now,
+        },
+    };
+    let epoch = SelectionEpoch::open([9; 16], sample, now).unwrap();
+    (epoch, sample)
+}
+
+#[cfg(test)]
+fn unused_drive_root() -> String {
+    let mask = unsafe { GetLogicalDrives() };
+    let letter = (0u32..26)
+        .rev()
+        .find(|bit| (mask & (1u32 << bit)) == 0)
+        .map(|bit| (b'A' + bit as u8) as char)
+        .expect("at least one unused Windows drive letter");
+    format!(r"{letter}:\")
+}
+
+#[cfg(test)]
+fn assert_admission_closed() {
+    use crate::vm::runtime::{CandidateRuntime, NativeCapability, NativeMutation};
+    let profile = crate::config::VmRuntimeProfile::parse(
+        &serde_json::to_vec(&serde_json::json!({
+            "enabled": true, "owner_sid": "S-1-5-21-1-2-3-1001",
+            "supervisor_sid": "S-1-5-21-1-2-3-1002", "bundle": "E:/pinned bundle",
+            "volume": "D:/", "state": "D:/test_vms/state",
+            "disk_ceiling_bytes": 10_737_418_240_u64, "manifest": "qemu-11.1.3-windows-x64",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let runtime = CandidateRuntime::new(Some(&profile));
+    assert!(matches!(
+        runtime.capability(),
+        NativeCapability::Unavailable(_)
+    ));
+    assert!(runtime.dispatch(NativeMutation::Boot, |_| ()).is_err());
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -5612,7 +5861,7 @@ mod tests {
         let enabled = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
         let parent = [group(&users, enabled), group(&interactive, enabled)];
         let policy = captured_groups(&parent).unwrap();
-        assert!(groups_match(&policy, &parent));
+        assert!(verify_groups_typed(&policy, &parent).is_ok());
         for (name, child) in [
             (
                 "mask changed",
@@ -5639,7 +5888,305 @@ mod tests {
                 vec![group(&users, enabled), group(&other, enabled)],
             ),
         ] {
-            assert!(!groups_match(&policy, &child), "{name}");
+            let err = verify_groups_typed(&policy, &child).err().unwrap();
+            assert_eq!(
+                err.into_invalidation(),
+                Invalidation::Confirmed(NativeRefusal::IdentityUnverified),
+                "{name}"
+            );
         }
+        // An invalid SID entry fails decoding as I/O (Indeterminate), not Mismatch.
+        let invalid_sid = [SID_AND_ATTRIBUTES {
+            Sid: null_mut(),
+            Attributes: enabled as u32,
+        }];
+        assert_eq!(
+            verify_groups_typed(&policy, &invalid_sid)
+                .err()
+                .unwrap()
+                .into_invalidation(),
+            Invalidation::Indeterminate(NativeRefusal::IdentityUnverified)
+        );
+        // Null DACL is a measured mismatch (Ok(false)), not a GetAce error.
+        let expected_acl = [vm_acl::Entry {
+            deny: false,
+            sid: users.0,
+            mask: FILE_ALL_ACCESS,
+        }];
+        assert!(!unsafe { vm_acl::matches_typed(null(), &expected_acl) }.unwrap());
+        // A malformed ACL whose AceCount exceeds its AclSize makes Win32 GetAce
+        // fail cleanly with an OS error, which must propagate as Err (I/O /
+        // Indeterminate) rather than Ok(false) (Mismatch / Confirmed).
+        let mut malformed = ACL {
+            AclRevision: ACL_REVISION as u8,
+            Sbz1: 0,
+            AclSize: size_of::<ACL>() as u16,
+            AceCount: 0,
+            Sbz2: 0,
+        };
+        assert_ne!(
+            unsafe { InitializeAcl(&mut malformed, size_of::<ACL>() as u32, ACL_REVISION,) },
+            0
+        );
+        malformed.AceCount = 1;
+        let ace_err = unsafe { vm_acl::matches_typed(&malformed, &expected_acl) }
+            .expect_err("GetAce must fail when AceCount exceeds AclSize");
+        assert_eq!(
+            TokenCheckError::Io(ace_err).into_invalidation(),
+            Invalidation::Indeterminate(NativeRefusal::IdentityUnverified)
+        );
+    }
+
+    #[test]
+    fn verify_current_profile_confirms_mismatch_keeps_io_indeterminate_and_latches_reverted_drift()
+    {
+        const ID_REFUSAL: NativeRefusal = NativeRefusal::IdentityUnverified;
+
+        // Real Win32 checks on inspect_token_identity_typed:
+        // 1) A real process token against an enrolled SID that does not match
+        //    is a measured mismatch -> Confirmed.
+        let parent = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
+        let wrong_sid = LocalSid::parse("S-1-5-21-1-2-3-9999").unwrap();
+        let mismatch =
+            inspect_token_identity_typed(&parent, &wrong_sid, false, TokenMode::CurrentUser, false)
+                .err()
+                .unwrap();
+        assert_eq!(
+            mismatch.into_invalidation(),
+            Invalidation::Confirmed(ID_REFUSAL)
+        );
+
+        // 2) Passing a non-token handle fails GetTokenInformation with an OS
+        //    error -> Indeterminate, never Confirmed.
+        let temp = tempfile::tempdir().unwrap();
+        let dummy_path = temp.path().join("not-a-token.bin");
+        std::fs::write(&dummy_path, b"x").unwrap();
+        let not_a_token = OwnedHandle::from(File::open(&dummy_path).unwrap());
+        let io_err = inspect_token_identity_typed(
+            &not_a_token,
+            &wrong_sid,
+            false,
+            TokenMode::CurrentUser,
+            false,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            io_err.into_invalidation(),
+            Invalidation::Indeterminate(ID_REFUSAL)
+        );
+
+        // Construct a real VmToken snapshot from the current process token so
+        // this test runs identically on interactive and CI Windows sessions.
+        let stats_buf = token_data(&parent, TokenStatistics).unwrap();
+        let auth = unsafe { (*stats_buf.as_ptr().cast::<TOKEN_STATISTICS>()).AuthenticationId };
+        let session = token_data(&parent, TokenSessionId).unwrap()[0] as u32;
+        let logon = token_data(&parent, TokenLogonSid).unwrap();
+        let groups_buf = token_data(&parent, TokenGroups).unwrap();
+        let groups = captured_groups(token_entries(&groups_buf).unwrap()).unwrap();
+        let clone_identity = || Identity {
+            logon: logon.clone(),
+            authentication: auth,
+            session,
+        };
+        let token = VmToken {
+            token: parent,
+            account: LocalSid::parse("S-1-5-21-1-2-3-1001").unwrap(),
+            network: LocalSid::parse("S-1-5-2").unwrap(),
+            system: LocalSid::parse("S-1-5-18").unwrap(),
+            identity: clone_identity(),
+            mode: TokenMode::CurrentUser,
+            groups: groups.clone(),
+        };
+
+        // Matching parent and child pass.
+        assert!(
+            token
+                .verify_current_profile_with(
+                    || Ok(()),
+                    || Ok((clone_identity(), groups.clone())),
+                    || Ok(()),
+                )
+                .is_ok()
+        );
+
+        // Measured parent group drift -> Confirmed.
+        let mut drifted_groups = groups.clone();
+        drifted_groups.push((vec![1, 2, 3, 4], 0));
+        assert_eq!(
+            token
+                .verify_current_profile_with(
+                    || Ok(()),
+                    || Ok((clone_identity(), drifted_groups.clone())),
+                    || Ok(()),
+                )
+                .err()
+                .unwrap()
+                .into_invalidation(),
+            Invalidation::Confirmed(ID_REFUSAL)
+        );
+
+        // Measured parent logon session/LUID drift -> Confirmed.
+        let mut drifted_logon = clone_identity();
+        drifted_logon.authentication.LowPart ^= 1;
+        assert_eq!(
+            token
+                .verify_current_profile_with(
+                    || Ok(()),
+                    || Ok((drifted_logon, groups.clone())),
+                    || Ok(()),
+                )
+                .err()
+                .unwrap()
+                .into_invalidation(),
+            Invalidation::Confirmed(ID_REFUSAL)
+        );
+
+        // Measured thread impersonation and child mismatch -> Confirmed.
+        assert_eq!(
+            token
+                .verify_current_profile_with(
+                    || Err(TokenCheckError::Mismatch("impersonation")),
+                    || Ok((clone_identity(), groups.clone())),
+                    || Ok(()),
+                )
+                .err()
+                .unwrap()
+                .into_invalidation(),
+            Invalidation::Confirmed(ID_REFUSAL)
+        );
+        assert_eq!(
+            token
+                .verify_current_profile_with(
+                    || Ok(()),
+                    || Ok((clone_identity(), groups.clone())),
+                    || Err(TokenCheckError::Mismatch("child policy drift")),
+                )
+                .err()
+                .unwrap()
+                .into_invalidation(),
+            Invalidation::Confirmed(ID_REFUSAL)
+        );
+
+        // API/I/O failure stays Indeterminate and does not revoke the epoch.
+        let (io_epoch, sample) = open_test_epoch();
+        let io_refresh = io_epoch.refresh(
+            || {
+                token
+                    .verify_current_profile_with(
+                        || Ok(()),
+                        || Err(TokenCheckError::Io(io::Error::other("LSA busy"))),
+                        || Ok(()),
+                    )
+                    .map_err(TokenCheckError::into_invalidation)?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(io_refresh, Err(Invalidation::Indeterminate(ID_REFUSAL)));
+        assert!(!io_epoch.effects_revoked());
+        assert!(
+            io_epoch
+                .refresh(
+                    || {
+                        token
+                            .verify_current_profile_with(
+                                || Ok(()),
+                                || Ok((clone_identity(), groups.clone())),
+                                || Ok(()),
+                            )
+                            .map_err(TokenCheckError::into_invalidation)?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                )
+                .is_ok()
+        );
+
+        // Inactive console session refuses fail-closed as Indeterminate without
+        // revoking the epoch.
+        let (console_epoch, sample) = open_test_epoch();
+        let console_refresh = console_epoch.refresh(
+            || {
+                token
+                    .verify_current_profile_with(
+                        || Ok(()),
+                        || Err(TokenCheckError::ConsoleInactive),
+                        || Ok(()),
+                    )
+                    .map_err(TokenCheckError::into_invalidation)?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(
+            console_refresh,
+            Err(Invalidation::Indeterminate(ID_REFUSAL))
+        );
+        assert!(!console_epoch.effects_revoked());
+        assert!(
+            console_epoch
+                .refresh(
+                    || {
+                        token
+                            .verify_current_profile_with(
+                                || Ok(()),
+                                || Ok((clone_identity(), groups.clone())),
+                                || Ok(()),
+                            )
+                            .map_err(TokenCheckError::into_invalidation)?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                )
+                .is_ok()
+        );
+
+        // Observed-then-reverted profile drift latches Confirmed and keeps the
+        // epoch unusable even after the parent profile matches again.
+        let (drift_epoch, sample) = open_test_epoch();
+        let drifted = drift_epoch.refresh(
+            || {
+                token
+                    .verify_current_profile_with(
+                        || Ok(()),
+                        || Ok((clone_identity(), drifted_groups.clone())),
+                        || Ok(()),
+                    )
+                    .map_err(TokenCheckError::into_invalidation)?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(drifted, Err(Invalidation::Confirmed(ID_REFUSAL)));
+        assert!(drift_epoch.effects_revoked());
+        // The underlying check passes again after revert, yet the epoch stays revoked.
+        assert!(
+            token
+                .verify_current_profile_with(
+                    || Ok(()),
+                    || Ok((clone_identity(), groups.clone())),
+                    || Ok(()),
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            drift_epoch.refresh(
+                || {
+                    token
+                        .verify_current_profile_with(
+                            || Ok(()),
+                            || Ok((clone_identity(), groups.clone())),
+                            || Ok(()),
+                        )
+                        .map_err(TokenCheckError::into_invalidation)?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Confirmed(NativeRefusal::QualificationMissing))
+        );
+        assert!(drift_epoch.effects_revoked());
+        assert_admission_closed();
     }
 }
