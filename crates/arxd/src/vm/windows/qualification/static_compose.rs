@@ -17,7 +17,7 @@ use crate::vm::{
     template::{
         UbuntuRecipe,
         ubuntu_compose::{Closure, MAX_MEDIUM, OfflineVerifier, UbuntuComposeRecipe},
-        ubuntu_web::{IsoPoolManifest, IsoPoolVerifier, PROFILE_PIN, UbuntuWebRecipe},
+        ubuntu_web::{ExpectedIso, IsoPoolManifest, IsoPoolVerifier, PROFILE_PIN, UbuntuWebRecipe},
     },
 };
 
@@ -57,6 +57,9 @@ impl StaticDossier {
 pub(super) struct ComposeInstallerInputs {
     medium: PathPin,
     installer: PathPin,
+    kernel: PathPin,
+    initrd: PathPin,
+    qemu_receipt: PathPin,
     guest: PathPin,
     firmware: [PathPin; 2],
     review: HeldReview,
@@ -95,6 +98,7 @@ pub(super) struct SignedInputPaths<'a> {
 }
 
 struct HeldReview {
+    expected_iso: ExpectedIso,
     receipt: SignedInputReview,
     receipt_file: PathPin,
     docker_keyring: PathPin,
@@ -110,12 +114,17 @@ impl HeldReview {
         paths: &SignedInputPaths<'_>,
         pool: &IsoPoolManifest<'_>,
         closure: &Closure<'_>,
+        expected_iso: ExpectedIso,
     ) -> Result<Self, NativeRefusal> {
         let file = hold_file(paths.receipt.path, paths.receipt.pin, MAX_REVIEW)?;
         let bytes = held_bytes(&file, MAX_REVIEW)?;
         let receipt: SignedInputReview = serde_json::from_slice(&bytes).map_err(|_| REFUSAL)?;
         if receipt.contract != 1
-            || receipt.web_pool != pool.canonical_pin().map_err(|_| REFUSAL)?.sha256
+            || receipt.web_pool
+                != pool
+                    .canonical_pin_for(expected_iso)
+                    .map_err(|_| REFUSAL)?
+                    .sha256
             || serde_json::to_vec(&receipt).map_err(|_| REFUSAL)? != bytes
         {
             return Err(REFUSAL);
@@ -125,6 +134,7 @@ impl HeldReview {
             size: receipt.ubuntu_keyring_size,
         };
         Ok(Self {
+            expected_iso,
             receipt,
             receipt_file: file,
             docker_keyring: hold_file(
@@ -165,7 +175,7 @@ impl IsoPoolVerifier for HeldReview {
     fn verify(&self, _base: &UbuntuRecipe, pool: &IsoPoolManifest<'_>) -> bool {
         self.web_metadata.verified_content == Some(pool.signed_metadata)
             && pool
-                .canonical_pin()
+                .canonical_pin_for(self.expected_iso)
                 .is_ok_and(|pin| pin.sha256 == self.receipt.web_pool)
     }
 }
@@ -185,6 +195,9 @@ impl OfflineVerifier for HeldReview {
 pub(super) struct ComposeAssetPaths<'a> {
     pub(super) medium: &'a LocalPath,
     pub(super) installer: &'a LocalPath,
+    pub(super) kernel: &'a LocalPath,
+    pub(super) initrd: &'a LocalPath,
+    pub(super) qemu_receipt: &'a LocalPath,
     pub(super) guest: &'a LocalPath,
     pub(super) firmware_code: &'a LocalPath,
     pub(super) firmware_vars: &'a LocalPath,
@@ -201,16 +214,37 @@ impl ComposeInstallerInputs {
         paths: &ComposeAssetPaths<'_>,
         generation: Id,
     ) -> Result<Self, NativeRefusal> {
+        Self::hold_for(
+            base,
+            pool,
+            closure,
+            signed,
+            paths,
+            generation,
+            ExpectedIso::Official,
+        )
+    }
+
+    fn hold_for(
+        base: &UbuntuRecipe,
+        pool: &IsoPoolManifest<'_>,
+        closure: &Closure<'_>,
+        signed: &SignedInputPaths<'_>,
+        paths: &ComposeAssetPaths<'_>,
+        generation: Id,
+        expected_iso: ExpectedIso,
+    ) -> Result<Self, NativeRefusal> {
         if generation == [0; 16] {
             return Err(REFUSAL);
         }
-        let review = HeldReview::hold(signed, pool, closure)?;
-        let web = UbuntuWebRecipe::qualify(
+        let review = HeldReview::hold(signed, pool, closure, expected_iso)?;
+        let web = UbuntuWebRecipe::qualify_for(
             base,
             Some(PROFILE_PIN),
             pool,
-            Some(pool.canonical_pin().map_err(|_| REFUSAL)?),
+            Some(pool.canonical_pin_for(expected_iso).map_err(|_| REFUSAL)?),
             &review,
+            expected_iso,
         )
         .map_err(|_| REFUSAL)?;
         let web_digest = web.recipe_digest();
@@ -225,6 +259,9 @@ impl ComposeInstallerInputs {
             .ok_or(REFUSAL)
         };
         let installer = hold_file(paths.installer, asset(base.iso)?, MAX_ISO)?;
+        let kernel = hold_file(paths.kernel, asset(base.kernel)?, 64 << 20)?;
+        let initrd = hold_file(paths.initrd, asset(base.initrd)?, 512 << 20)?;
+        let qemu_receipt = hold_file(paths.qemu_receipt, asset(base.qemu_receipt)?, 16 << 10)?;
         let guest = hold_file(paths.guest, asset(base.guest)?, MAX_GUEST)?;
         let firmware = [
             hold_file(
@@ -245,6 +282,9 @@ impl ComposeInstallerInputs {
         Ok(Self {
             medium,
             installer,
+            kernel,
+            initrd,
+            qemu_receipt,
             guest,
             firmware,
             review,
@@ -270,14 +310,36 @@ impl ComposeInstallerInputs {
     }
 
     fn recheck(&self) -> Result<(), NativeRefusal> {
-        for pin in [&self.medium, &self.installer, &self.guest]
-            .into_iter()
-            .chain(&self.firmware)
-            .chain(self.review.files())
+        for pin in [
+            &self.medium,
+            &self.installer,
+            &self.kernel,
+            &self.initrd,
+            &self.qemu_receipt,
+            &self.guest,
+        ]
+        .into_iter()
+        .chain(&self.firmware)
+        .chain(self.review.files())
         {
             recheck_file(pin)?;
         }
         Ok(())
+    }
+
+    fn stock_inventory(&self, stock_distribution: &Distribution) -> Result<Hash, NativeRefusal> {
+        self.recheck()?;
+        let stock_receipt = ArtifactPin {
+            size: stock_distribution.receipt_bytes,
+            sha256: stock_distribution.receipt,
+        };
+        if self.qemu_receipt.verified_content != Some(stock_receipt) {
+            return Err(REFUSAL);
+        }
+        projection(
+            "arx-docker-stock-inventory-v1",
+            (stock_distribution.manifest, stock_distribution.receipt),
+        )
     }
 
     fn hold_medium(path: &LocalPath, expected: ArtifactPin) -> Result<PathPin, NativeRefusal> {
@@ -285,7 +347,7 @@ impl ComposeInstallerInputs {
     }
 
     pub(super) fn dependency_artifact(&self) -> Result<Artifact, NativeRefusal> {
-        inventory::binding(&self.medium)?;
+        self.recheck()?;
         launch::artifact(ArtifactRole::ComposeDependencyMedium, &self.medium)
     }
 }
@@ -410,10 +472,7 @@ impl<'a> HeldDockerInputs<'a> {
             inventory::PatchedBundle::hold(enrollment.patched_bundle, binary, token.account.0)?;
         let (stock_distribution, stock) = inventory::collect(enrollment.stock_bundle)?;
         stock.protected(token.account.0, Instant::now() + Duration::from_secs(2))?;
-        let stock_inventory = projection(
-            "arx-docker-stock-inventory-v1",
-            (stock_distribution.manifest, stock_distribution.receipt),
-        )?;
+        let stock_inventory = recipe.stock_inventory(&stock_distribution)?;
         Ok(Self {
             release,
             scope,
@@ -442,13 +501,13 @@ impl<'a> HeldDockerInputs<'a> {
         route: &RouteObservation,
         live_topology: Hash,
     ) -> Result<DockerDependencies, NativeRefusal> {
+        self.recipe.recheck()?;
         self.parsed_policy.verify_route(Some(route))?;
         let topology = measured(&self.topology)?;
         if live_topology != topology {
             return Err(NativeRefusal::NetworkFenceUnverified);
         }
         self.scope.validate_live()?;
-        self.recipe.recheck()?;
         let deadline = Instant::now() + Duration::from_secs(2);
         self.stock.protected(self.token.account.0, deadline)?;
         self.patched
@@ -607,7 +666,7 @@ fn signed_input_review_binds_held_keyrings_indexes_base_and_package_inventory() 
         web_metadata: &web_metadata,
         base_versions: &base_versions,
     };
-    let held = HeldReview::hold(&paths, &pool, &closure).unwrap();
+    let held = HeldReview::hold(&paths, &pool, &closure, ExpectedIso::Official).unwrap();
     assert!(OfflineVerifier::verify(&held, web, &closure));
     assert!(!OfflineVerifier::verify(&held, [9; 32], &closure));
     for file in [
@@ -647,7 +706,7 @@ fn signed_input_review_binds_held_keyrings_indexes_base_and_package_inventory() 
         let mut changed = bytes.clone();
         changed[0] ^= 1;
         fs::write(file.as_str(), changed).unwrap();
-        assert!(HeldReview::hold(&paths, &pool, &closure).is_err());
+        assert!(HeldReview::hold(&paths, &pool, &closure, ExpectedIso::Official).is_err());
         fs::write(file.as_str(), bytes).unwrap();
     }
     let mut modified_versions = packages;
@@ -656,175 +715,9 @@ fn signed_input_review_binds_held_keyrings_indexes_base_and_package_inventory() 
         packages: &modified_versions,
         ..closure
     };
-    let held = HeldReview::hold(&paths, &pool, &wrong_version).unwrap();
+    let held = HeldReview::hold(&paths, &pool, &wrong_version, ExpectedIso::Official).unwrap();
     assert!(!OfflineVerifier::verify(&held, web, &wrong_version));
 }
 
 #[cfg(test)]
-#[test]
-fn installer_hold_refuses_a_mismatched_selected_recipe() {
-    use crate::vm::template::{
-        AssetPin, UbuntuRecipe,
-        ubuntu_compose::{Closure, PackagePin},
-        ubuntu_web::{IsoPoolManifest, IsoPoolVerifier, PROFILE_PIN, PoolPackage},
-    };
-    use sha2::{Digest, Sha256};
-
-    struct Accept;
-
-    impl IsoPoolVerifier for Accept {
-        fn verify(&self, _: &UbuntuRecipe, _: &IsoPoolManifest<'_>) -> bool {
-            true
-        }
-    }
-
-    fn asset(bytes: &[u8]) -> AssetPin {
-        AssetPin {
-            length: bytes.len() as u64,
-            sha256: Sha256::digest(bytes).into(),
-        }
-    }
-
-    fn artifact(bytes: &[u8]) -> ArtifactPin {
-        let pin = asset(bytes);
-        ArtifactPin {
-            size: pin.length,
-            sha256: pin.sha256,
-        }
-    }
-
-    let guest = b"fake-arx-guest";
-    let iso = AssetPin {
-        length: 1,
-        sha256: UbuntuRecipe::ISO_SHA256,
-    };
-    let base = UbuntuRecipe {
-        iso: Some(iso),
-        kernel: Some(asset(b"kernel")),
-        initrd: Some(asset(b"initrd")),
-        guest: Some(asset(guest)),
-        service: Some(asset(UbuntuRecipe::SERVICE)),
-        finalize: Some(asset(UbuntuRecipe::FINALIZE)),
-        nocloud_schema: Some(UbuntuRecipe::NOCLOUD_PROFILE_PIN),
-        firmware_code: Some(asset(b"code")),
-        firmware_vars: Some(asset(b"vars")),
-        qemu_receipt: Some(asset(b"receipt")),
-    };
-    let pool = IsoPoolManifest {
-        iso,
-        signed_metadata: artifact(b"ubuntu-index"),
-        packages: &[PoolPackage {
-            name: "nginx",
-            version: "1.0",
-            relative_path: "pool/nginx.deb",
-            artifact: artifact(b"nginx"),
-        }],
-    };
-    let web = UbuntuWebRecipe::qualify(
-        &base,
-        Some(PROFILE_PIN),
-        &pool,
-        Some(pool.canonical_pin().unwrap()),
-        &Accept,
-    )
-    .unwrap();
-    let medium_bytes = b"fake read-only Compose dependency ISO";
-    let packages = [
-        "containerd.io",
-        "docker-ce-cli",
-        "docker-ce",
-        "docker-compose-plugin",
-    ]
-    .map(|name| PackagePin {
-        name,
-        version: "5:1.2.3-1~noble",
-        archive: artifact(b"deb"),
-    });
-    let closure = Closure {
-        docker_fingerprint: [1; 20],
-        docker_signing_key: artifact(b"key"),
-        signed_docker_metadata: artifact(b"docker-index"),
-        signed_ubuntu_metadata: pool.signed_metadata,
-        base_versions: artifact(b"dpkg-query receipt"),
-        medium: artifact(medium_bytes),
-        packages: &packages,
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let write = |name: &str, bytes: &[u8]| {
-        let path = dir.path().join(name);
-        std::fs::write(&path, bytes).unwrap();
-        LocalPath::parse(path.to_str().unwrap()).unwrap()
-    };
-    let web_digest = web.recipe_digest();
-    let receipt = closure.receipt(web_digest).unwrap();
-    let ubuntu_key = b"ubuntu key";
-    let review = SignedInputReview {
-        contract: 1,
-        web_pool: pool.canonical_pin().unwrap().sha256,
-        compose_closure: receipt.sha256,
-        ubuntu_keyring_sha256: digest(ubuntu_key),
-        ubuntu_keyring_size: ubuntu_key.len() as u64,
-    };
-    let review_bytes = serde_json::to_vec(&review).unwrap();
-    let signed = SignedInputPaths {
-        receipt: EnrolledFile {
-            path: &write("review", &review_bytes),
-            pin: artifact(&review_bytes),
-        },
-        docker_keyring: &write("docker-keyring", b"key"),
-        ubuntu_keyring: &write("ubuntu-keyring", ubuntu_key),
-        docker_metadata: &write("docker-index", b"docker-index"),
-        ubuntu_metadata: &write("ubuntu-index", b"ubuntu-index"),
-        web_metadata: &write("web-index", b"ubuntu-index"),
-        base_versions: &write("base-versions", b"dpkg-query receipt"),
-    };
-    let review = HeldReview::hold(&signed, &pool, &closure).unwrap();
-    let web = UbuntuWebRecipe::qualify(
-        &base,
-        Some(PROFILE_PIN),
-        &pool,
-        Some(pool.canonical_pin().unwrap()),
-        &review,
-    )
-    .unwrap();
-    let recipe = UbuntuComposeRecipe::qualify(&web, &closure, receipt, &review).unwrap();
-    let matched = DockerRecipe {
-        identity: DockerRecipe::identity(recipe.digest()),
-        web: web.recipe_digest(),
-        closure: receipt.sha256,
-        medium: closure.medium.sha256,
-    };
-    let fixture_file =
-        |name, bytes: &[u8]| hold_file(&write(name, bytes), artifact(bytes), MAX_GUEST).unwrap();
-    // The selection boundary takes held inputs. Use a synthetic installer
-    // file here while retaining the official ISO pin in the recipe fixture.
-    let held = ComposeInstallerInputs {
-        medium: ComposeInstallerInputs::hold_medium(
-            &write("compose.iso", medium_bytes),
-            closure.medium,
-        )
-        .unwrap(),
-        installer: fixture_file("installer", b"installer fixture"),
-        guest: fixture_file("guest", guest),
-        firmware: [fixture_file("code", b"code"), fixture_file("vars", b"vars")],
-        review,
-        recipe: matched,
-        seed: recipe.render_seed([1; 16], guest).unwrap(),
-        detached_health: recipe.detached_health(),
-    };
-    let hold = |recipe| {
-        held.require_selected(&VerifiedDockerEvidence::recipe_fixture(recipe))?;
-        Ok::<_, NativeRefusal>(held.detached_health.as_str())
-    };
-    assert!(hold(matched).unwrap().contains("docker-compose-plugin"));
-
-    let mut wrong_medium = matched;
-    wrong_medium.medium[0] ^= 0xff;
-    let mut wrong_web = matched;
-    wrong_web.web[0] ^= 0xff;
-    let mut wrong_identity = matched;
-    wrong_identity.identity = DockerRecipe::identity([9; 32]);
-    for recipe in [wrong_medium, wrong_web, wrong_identity] {
-        assert!(hold(recipe).is_err());
-    }
-}
+mod installer_tests;

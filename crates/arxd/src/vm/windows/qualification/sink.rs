@@ -5,7 +5,7 @@
 //! The writer is the provenance boundary for every opaque value. It draws
 //! the scope and run from its own random generator, derives the release,
 //! the scope-keyed dependency digest and the record chain by hashing, and
-//! the schema pins the distribution digests to the reviewed stock values.
+//! complete publication dispatches to the stock TEST or patched Docker reader.
 //! A caller supplies only stages, times, results and summary fields.
 //!
 //! Every file is committed through a hidden temporary entry that is

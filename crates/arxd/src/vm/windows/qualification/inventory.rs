@@ -524,6 +524,17 @@ pub(super) mod tests {
             Ok(bundle)
         }
 
+        pub(in crate::vm::windows::qualification) fn collect_with_receipt(
+            &self,
+            receipt: ArtifactPin,
+        ) -> Result<(Distribution, Bundle), NativeRefusal> {
+            let manifest = ArtifactPin {
+                size: self.manifest.len() as u64,
+                sha256: Sha256::digest(self.manifest.as_bytes()).into(),
+            };
+            collect_exact(&self.path, manifest, receipt, 1, &[])
+        }
+
         fn refuse(&self) {
             assert_eq!(
                 self.inspect(Instant::now() + INVENTORY_TIME).err(),
