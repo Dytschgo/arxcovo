@@ -115,6 +115,33 @@ pub(super) struct Scope {
 }
 
 impl Scope {
+    #[cfg(test)]
+    pub(super) fn fixture(temp: &Path) -> Self {
+        let recipe_dir = temp.join("recipe");
+        let prod_dir = temp.join("production");
+        std::fs::create_dir_all(&recipe_dir).unwrap();
+        std::fs::create_dir_all(&prod_dir).unwrap();
+        let recipe_backing = temp.join("recipe.vhdx");
+        let prod_backing = temp.join("production.vhdx");
+        std::fs::write(&recipe_backing, b"recipe-backing").unwrap();
+        std::fs::write(&prod_backing, b"production-backing").unwrap();
+        let db_path = prod_dir.join("activity.sqlite3");
+        let lock_path = prod_dir.join("activity.lock");
+        std::fs::write(&db_path, b"db").unwrap();
+        std::fs::write(&lock_path, b"lock").unwrap();
+        let to_local = |path: &Path| LocalPath::parse(path.to_str().unwrap()).unwrap();
+        let db = PathPin::open(&to_local(&db_path), false, false).unwrap();
+        let lock = PathPin::open(&to_local(&lock_path), false, false).unwrap();
+        Self {
+            recipe: tests::test_storage(&to_local(&recipe_dir), &to_local(&recipe_backing)),
+            production: tests::test_storage(&to_local(&prod_dir), &to_local(&prod_backing)),
+            _database: db,
+            _lock: lock,
+            host: [0x33; 16],
+            key: [0x55; 32],
+        }
+    }
+
     pub(super) fn validate_live(&self) -> Result<(), NativeRefusal> {
         for scope in [&self.recipe, &self.production] {
             if !capacity::still_bound(&capacity::MountManager, &scope.volume) {
@@ -686,7 +713,7 @@ mod tests {
         assert!(!aggregate_within_cap(u64::MAX, 1, 0, 0));
     }
 
-    fn test_storage(root_path: &LocalPath, backing_path: &LocalPath) -> Storage {
+    pub(super) fn test_storage(root_path: &LocalPath, backing_path: &LocalPath) -> Storage {
         let drive = &root_path.as_str()[..3];
         let volume = capacity::anchor_volume(&capacity::MountManager, drive).unwrap();
         let root =
