@@ -1510,7 +1510,8 @@ struct ChildState {
     child: Option<Rc<Child>>,
     stop_done: Option<StopProtocol>,
     watch: Option<JobWatch>,
-    lost: Option<(OwnedHandle, u32)>,
+    lost: Option<(OwnedHandle, u32, Option<desktop::LaunchDesktop>)>,
+    _unconfirmed: Option<(Job, PartialChild)>,
     parent: Option<Stdio>,
     workers: Option<WorkerSet>,
     dispatch: Option<Arc<DispatchGate>>,
@@ -1823,7 +1824,7 @@ impl<'a> Host for Windows<'a> {
         let env = environment(&self.cwd.path)?;
         let args = plan.args();
         let launch = Launch::Paused {
-            token: &token.token,
+            token,
             image: plan.image,
             args: &args,
         };
@@ -1840,21 +1841,29 @@ impl<'a> Host for Windows<'a> {
                 _ => NativeRefusal::OwnerActivityUnverified.into(),
             })?;
         let mut state = slot.state.borrow_mut();
-        let (process, thread) = create_suspended(
+        let (process, thread, desktop) = match create_suspended(
             &launch,
             Path::new(self.cwd.path.as_str()),
             &env,
             Assignment::Job(&job),
             &stdio,
-        )
-        .map_err(|error| {
-            state.uncertain = error.stage == SpawnStage::Verify || !matches!(job.active(), Ok(0));
-            NativeRefusal::JobUnverified
-        })?;
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                state.uncertain =
+                    error.stage == SpawnStage::Verify || !matches!(job.active(), Ok(0));
+                if let Some(partial) = error.partial {
+                    let _ = job.terminate();
+                    state._unconfirmed = Some((job, partial));
+                }
+                return Err(NativeRefusal::JobUnverified.into());
+            }
+        };
         state.child = Some(Rc::new(Child {
             job,
             process,
             suspended: Some(thread),
+            _desktop: desktop,
         }));
         state.parent = Some(parent);
         state.watch = watch;
@@ -2023,8 +2032,13 @@ impl<'a> Host for Windows<'a> {
         // dropping `job` closes the actual last Job handle.
         let child = state.child.take().ok_or(reason)?;
         match Rc::try_unwrap(child) {
-            Ok(Child { job, process, .. }) => {
-                state.lost = Some((process, pid));
+            Ok(Child {
+                job,
+                process,
+                _desktop,
+                ..
+            }) => {
+                state.lost = Some((process, pid, _desktop));
                 drop(job);
                 Ok(())
             }
@@ -2116,7 +2130,7 @@ async fn observe_slot_stop(
         )
     };
     let loss = match (&lost, &watch) {
-        (Some((process, pid)), Some(watch)) => {
+        (Some((process, pid, _desktop)), Some(watch)) => {
             let (child_exited, job_empty_notified) = watch
                 .empty_after_loss(process, *pid, deadline)
                 .await
@@ -2369,7 +2383,7 @@ mod tests {
             let slot = Slot {
                 charge: tempfile::tempfile().unwrap(),
                 state: RefCell::new(ChildState {
-                    lost: Some((process, 11)),
+                    lost: Some((process, 11, None)),
                     watch,
                     ..ChildState::default()
                 }),
