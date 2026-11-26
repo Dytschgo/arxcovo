@@ -183,7 +183,9 @@ pub(super) fn receivers(
         if counts.target != *expected
             || !window.contains(&counts.before_ms)
             || !window.contains(&counts.after_ms)
-            || !(counts.before_ms < open && open < close && close < counts.after_ms)
+            || counts.before_ms >= open
+            || open >= close
+            || close >= counts.after_ms
             || counts.before != 1
             || counts.attempts != 1
             || counts.arrivals != expected.case.expected_arrivals()
