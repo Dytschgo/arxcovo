@@ -1,14 +1,15 @@
 //! Production plans derived from the selected TEST recipe and reserved slots.
 
 use super::launch::{artifact, header, held_bytes, prepare_ubuntu};
-use super::production::{ProductionWorkspace, WorkspaceBinding, check_pair, slot_path};
+use super::production::{
+    CustodyCheckpoints, ProductionWorkspace, WorkspaceBinding, check_pair,
+};
 use super::*;
 use crate::vm::paths::Artifact;
 use crate::vm::qemu_args::{BootPurpose, BootRecipe};
 use crate::vm::qualification_record::{Hash, RecipeIdentity, TestRecipes, digest};
 use crate::vm::runtime::{InstallerPhase, LaunchAuthority};
 use crate::vm::{ArtifactEvidence, ArtifactSlot, PairSlots};
-use std::io::Write;
 
 const SEED_LIMIT: u64 = 40 << 20;
 pub(super) const TEST_JOB_MEMORY: usize = 6 * GIB as usize;
@@ -229,6 +230,7 @@ impl ForegroundQualification<'_> {
     pub(crate) fn stage_installer<'a>(
         &self,
         reservation: InstallerReservation<'a>,
+        ledger: &dyn CustodyCheckpoints,
         mut authorize: impl FnMut(StageTarget) -> Result<LaunchAuthority, NativeRefusal>,
     ) -> Result<StagedInstaller<'a>, NativeRefusal> {
         let InstallerReservation {
@@ -300,25 +302,35 @@ impl ForegroundQualification<'_> {
             }
         };
         let seal_sha256 = self.seal_sha256();
-        let mut stage = |slot, bytes: &[u8], limit, mutable| {
-            stage_input(workspace, slot, bytes, limit, mutable, |content| {
-                let captured = self.launch_live(TEST_JOB_MEMORY)?;
-                let authority = authorize(StageTarget {
-                    workspace: binding,
-                    seal_sha256,
-                    recipe,
-                    phase,
-                    slot,
-                    content,
-                    deadline,
-                })?;
-                check_deadline(deadline)?;
-                fresh_observation(captured, Instant::now(), NativeRefusal::ReservesUnverified)?;
-                Ok(authority)
-            })
-        };
-        let seed = stage(seed, &seed_bytes, SEED_LIMIT, false)?;
-        let vars = stage(pair.vars, &vars_bytes, MAX_SETUP_VARS_BYTES, true)?;
+        let leaves = [
+            Leaf {
+                slot: seed,
+                bytes: &seed_bytes,
+                limit: SEED_LIMIT,
+                mutable: false,
+            },
+            Leaf {
+                slot: pair.vars,
+                bytes: &vars_bytes,
+                limit: MAX_SETUP_VARS_BYTES,
+                mutable: true,
+            },
+        ];
+        let [seed, vars] = stage_leaves(workspace, ledger, leaves, |slot, content| {
+            let captured = self.launch_live(TEST_JOB_MEMORY)?;
+            let authority = authorize(StageTarget {
+                workspace: binding,
+                seal_sha256,
+                recipe,
+                phase,
+                slot,
+                content,
+                deadline,
+            })?;
+            check_deadline(deadline)?;
+            fresh_observation(captured, Instant::now(), NativeRefusal::ReservesUnverified)?;
+            Ok(authority)
+        })?;
         check_deadline(deadline)?;
         Ok(StagedInstaller {
             reservation,
@@ -523,41 +535,67 @@ fn check_deadline(deadline: Instant) -> Result<(), NativeRefusal> {
         .ok_or(NativeRefusal::InstallerDeadlineExpired)
 }
 
-fn stage_input<A>(
-    workspace: &ProductionWorkspace,
+#[derive(Clone, Copy)]
+struct Leaf<'b> {
     slot: ArtifactSlot,
-    bytes: &[u8],
+    bytes: &'b [u8],
     limit: u64,
     mutable: bool,
+}
+
+/// Each leaf has its own authorization and checkpoints. The first leaf is
+/// verified in the ledger before the second leaf's intent exists, so a
+/// failure on the second leaf leaves the first accounted.
+fn stage_leaves<A>(
+    workspace: &ProductionWorkspace,
+    ledger: &dyn CustodyCheckpoints,
+    leaves: [Leaf<'_>; 2],
+    mut authorize: impl FnMut(ArtifactSlot, ArtifactPin) -> Result<A, NativeRefusal>,
+) -> Result<[PathPin; 2], NativeRefusal> {
+    let [first, second] = leaves;
+    let first = stage_input(workspace, ledger, first, |pin| authorize(first.slot, pin))?;
+    let second = stage_input(workspace, ledger, second, |pin| authorize(second.slot, pin))?;
+    Ok([first, second])
+}
+
+fn stage_input<A>(
+    workspace: &ProductionWorkspace,
+    ledger: &dyn CustodyCheckpoints,
+    leaf: Leaf<'_>,
     authorize: impl FnOnce(ArtifactPin) -> Result<A, NativeRefusal>,
 ) -> Result<PathPin, NativeRefusal> {
+    let Leaf {
+        slot,
+        bytes,
+        limit,
+        mutable,
+    } = leaf;
+    let binding = workspace.binding();
     let size = bytes.len() as u64;
-    if !(1..=limit).contains(&size) || slot.generation != workspace.binding().generation {
+    if !(1..=limit).contains(&size) || slot.generation != binding.generation {
         return Err(PATH);
     }
-    let path = slot_path(&workspace.root.path, slot)?;
-    let leaf = path.as_str().rsplit('\\').next().ok_or(PATH)?;
     let content = ArtifactPin {
         size,
         sha256: digest(bytes),
     };
     WorkspaceCustody::production(&workspace.root, &workspace.lease)?;
     let _authority = authorize(content)?;
-    let created =
-        open_relative(&workspace.root.leaf, leaf, Node::File, true, true).map_err(|_| PATH)?;
-    let id = file_identity(&created, false).map_err(|_| PATH)?.0;
-    (&created)
-        .write_all(bytes)
-        .and_then(|()| created.sync_all())
-        .map_err(|_| PATH)?;
-    // Bridge the writable creation handle and the final read-only file
-    // pin without releasing the exclusion against rename or replacement.
-    let mut pin = workspace.pin_slot(slot, id, true)?;
-    drop(created);
-    if !mutable {
-        pin = workspace.pin_slot(slot, id, false)?;
-    }
+    // Intent, create-new and identity are durable before the first byte.
+    let mut writer = workspace.create_slot(slot, ledger)?;
+    writer.write_all(bytes)?;
+    writer.sync()?;
+    let mut pin = writer.into_pin(mutable)?;
     pin.verify_content(content, limit)?;
+    ledger.slot_verified(
+        binding,
+        slot,
+        ArtifactEvidence {
+            identity: pin.identity,
+            directory: binding.workspace.file,
+            pin: content,
+        },
+    )?;
     Ok(pin)
 }
 

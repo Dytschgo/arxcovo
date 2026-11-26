@@ -109,7 +109,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 15;
+const VM_SCHEMA_VERSION: u32 = 16;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -485,6 +485,9 @@ pub(crate) mod compose;
 #[path = "vm_static.rs"]
 pub(crate) mod static_vm;
 
+#[path = "vm_native.rs"]
+pub(crate) mod native;
+
 pub(crate) struct VmStore {
     db: Mutex<Connection>,
     _database: fs::File,
@@ -562,6 +565,9 @@ impl VmStore {
         }
         if version < 15 {
             tx.execute_batch(compose::MIGRATE_V15)?;
+        }
+        if version < 16 {
+            tx.execute_batch(native::MIGRATE_V16)?;
         }
         recover(&tx, now)?;
         check_size(&tx)?;
@@ -2847,7 +2853,9 @@ mod tests {
             .unwrap();
             compose::settle_backup_failed(db, &intent, "interrupted", true, false, NOW)?;
             db.execute_batch(
-                "DROP TABLE vm_compose_backup_retirements;
+                "DROP TABLE vm_native_slots; DROP TABLE vm_native_generations;
+                 DROP INDEX vm_artifact_slot;
+                 DROP TABLE vm_compose_backup_retirements;
                  ALTER TABLE vm_compose_backups DROP COLUMN namespace_tracked;
                  PRAGMA user_version=14;",
             )?;
