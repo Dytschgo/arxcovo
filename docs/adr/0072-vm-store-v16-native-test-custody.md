@@ -174,3 +174,19 @@ revalidate durable absence before removing native rows or releasing claims.
 See the chunk 07 amendment in [ADR 0054](0054-m4-dedicated-windows-runtime.md)
 for the exact handle access/share contract and absence rules. Native disposal
 is **unverified on real hardware**.
+
+## 7c chunk 15 amendment — offline snapshot custody
+
+The existing native `restore` origin owns both TEST capture (action 5)
+and TEST restore (action 6) candidates. This supersedes the action 6
+restriction above. Ownership requires the exact copy-phase work row,
+candidate generation, and pending receipt for the same action. This gives
+captured points the same pre-write workspace and slot identity checkpoints
+as restore candidates. Static work stays outside native TEST custody.
+The schema stays at v17.
+
+The ordinary reaper owns disposal of abandoned candidates, deleted TEST
+points and retired pairs. Once a TEST lease expiry is claimed, disposal of
+those generations and ready points waits for the active native generation's
+exact writer release. The final active pair is disposed after the other
+generations. Native execution is **unverified on real hardware**.

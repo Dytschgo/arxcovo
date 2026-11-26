@@ -30,8 +30,8 @@ use super::{
     },
     qualification_record::{Class, Hash, RecipeIdentity, TestRecipes, digest},
     runtime::{
-        InstallerPhase, LaunchAuthority, NativeRefusal, ScriptAuthority, StageAuthority,
-        fresh_observation,
+        InspectionBinding, InstallerPhase, LaunchAuthority, NativeRefusal, OfflineLease,
+        ScriptAuthority, StageAuthority, fresh_observation,
     },
     selection_epoch::{Invalidation, Sample, SelectionEpoch},
 };
@@ -317,12 +317,16 @@ pub(crate) struct Intent<'i, S, C> {
 
 impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
     /// Cancellation, then the durable admission, deadline, target and slots.
-    fn guard(&self, slots: &[ArtifactSlot]) -> Result<(), NativeRefusal> {
+    fn guard(
+        &self,
+        slots: &[ArtifactSlot],
+        inspection: Option<InspectionBinding>,
+    ) -> Result<(), NativeRefusal> {
         if self.cancel.is_cancelled()
             || !self
                 .issuer
                 .controller
-                .native_effect_admitted(self.worker, self.target, slots)
+                .native_effect_admitted(self.worker, self.target, slots, inspection)
                 .map_err(|_| REFUSED)?
         {
             return Err(REFUSED);
@@ -334,15 +338,27 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
     /// that outlives cancellation, the deadline or the pending row refuses,
     /// and the authority is issued within that observation's freshness.
     fn verify(&self, slots: &[ArtifactSlot]) -> Result<(), NativeRefusal> {
-        self.guard(slots)?;
+        self.verify_launch(slots, None)
+    }
+
+    fn verify_launch(
+        &self,
+        slots: &[ArtifactSlot],
+        inspection: Option<InspectionBinding>,
+    ) -> Result<(), NativeRefusal> {
+        self.guard(slots, inspection)?;
         let captured = self.issuer.refresh()?;
-        self.guard(slots)?;
+        self.guard(slots, inspection)?;
         fresh_observation(captured, Instant::now(), REFUSED)
     }
 
     /// One permit per durable effect.
     fn mint(&self, effect: Effect, slots: &[ArtifactSlot]) -> Result<(), NativeRefusal> {
         self.verify(slots)?;
+        self.remember(effect)
+    }
+
+    fn remember(&self, effect: Effect) -> Result<(), NativeRefusal> {
         let mut minted = self.minted.lock().map_err(|_| REFUSED)?;
         if minted.len() >= MAX_EFFECTS || minted.contains(&effect) {
             return Err(REFUSED);
@@ -383,6 +399,7 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
                 AdmittedEffect::Build { .. } | AdmittedEffect::Clone { .. },
                 PlanKind::Inspect | PlanKind::InspectWritable | PlanKind::Mutate,
             ) => recipe.is_none(),
+            (AdmittedEffect::Snapshot, PlanKind::InspectWritable) => recipe.is_none(),
             _ => false,
         }
     }
@@ -398,9 +415,20 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         let binding = target.binding(workspace, self.issuer.seal_sha256)?;
         let slots = launch_slots(self.effect, expected.kind, target.pair, target.helper)?;
         check_installer(expected.kind, expected.installer)?;
-        let expected_epoch = self.target.writer_epoch.unwrap_or(self.target.generation);
-        if workspace.generation != self.target.generation
-            || expected.writer_epoch != expected_epoch
+        let inspection = target
+            .plan
+            .offline_lease()
+            .and_then(OfflineLease::inspection);
+        let generation = match (self.effect, inspection) {
+            (AdmittedEffect::Snapshot, Some(binding)) if binding.workspace == workspace => {
+                workspace.generation
+            }
+            (AdmittedEffect::Snapshot, _) | (_, Some(_)) => return Err(REFUSED),
+            (_, None) if workspace.generation == self.target.generation => self.target.generation,
+            _ => return Err(REFUSED),
+        };
+        let expected_epoch = self.target.writer_epoch.unwrap_or(generation);
+        if expected.writer_epoch != expected_epoch
             || !self.admits_launch(expected.kind, target.recipe)
         {
             return Err(REFUSED);
@@ -420,12 +448,14 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
             ),
             _ => return Err(REFUSED),
         };
-        self.mint(effect, &slots)?;
+        self.verify_launch(&slots, inspection)?;
+        self.remember(effect)?;
         Ok(Permit {
             intent: self,
             binding,
             expected,
             slots,
+            inspection,
         })
     }
 
@@ -523,15 +553,22 @@ pub(crate) struct Permit<'p, S, C> {
     binding: LaunchPermitBinding,
     expected: EffectPlan,
     slots: Vec<ArtifactSlot>,
+    inspection: Option<InspectionBinding>,
 }
 
 impl<S: SelectedSource, C: Clock> LaunchPermit for Permit<'_, S, C> {
     fn consume(self, target: LaunchTarget<'_, '_>) -> Result<LaunchAuthority, NativeRefusal> {
-        if self.expected != EffectPlan::from_target(&target)? {
+        if self.expected != EffectPlan::from_target(&target)?
+            || self.inspection
+                != target
+                    .plan
+                    .offline_lease()
+                    .and_then(OfflineLease::inspection)
+        {
             return Err(REFUSED);
         }
         check_installer(self.expected.kind, self.expected.installer)?;
-        self.intent.verify(&self.slots)?;
+        self.intent.verify_launch(&self.slots, self.inspection)?;
         check_installer(self.expected.kind, self.expected.installer)?;
         Ok(LaunchAuthority::new(Minted(()), self.binding))
     }

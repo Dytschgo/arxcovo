@@ -188,6 +188,21 @@ impl<'a> CommandPlan<'a> {
         }
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) fn reads_snapshot_disk(&self, role: ArtifactRole) -> bool {
+        self.kind() == PlanKind::InspectWritable
+            && self
+                .offline_lease()
+                .and_then(OfflineLease::inspection)
+                .is_some()
+            && matches!(
+                role,
+                ArtifactRole::GuestDisk
+                    | ArtifactRole::SnapshotDisk
+                    | ArtifactRole::SnapshotStagingDisk
+            )
+    }
+
     pub fn static_origin_lease(&self) -> Option<&OriginPortLease> {
         match &self.binding {
             Binding::StaticWeb(lease) | Binding::PublicEgress { lease, .. } => Some(lease),
@@ -403,7 +418,7 @@ impl<'a> SnapshotInfo<'a> {
 pub(super) fn offline_snapshot_info<'a>(
     lease: &'a OfflineLease,
     image: &'a Artifact,
-    info: &SnapshotInfo<'a>,
+    info: &SnapshotInfo<'_>,
 ) -> Result<CommandPlan<'a>, InvalidImage> {
     let mut inputs = vec![
         (ArtifactRole::QemuImg, image.clone()),

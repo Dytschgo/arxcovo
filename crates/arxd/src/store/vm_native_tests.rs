@@ -724,7 +724,9 @@ fn restore_custody_requires_the_pending_restore_receipt() -> Result<()> {
             generation: capture,
             ..scope
         };
+        db.execute_batch("SAVEPOINT clone_probe")?;
         assert!(intend_workspace(db, capture, Origin::Clone, scope.production).is_err());
+        db.execute_batch("ROLLBACK TO clone_probe; RELEASE clone_probe")?;
         intend_workspace(db, capture, Origin::Restore, scope.production)?;
         super::super::finish(
             db,

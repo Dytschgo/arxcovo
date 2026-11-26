@@ -220,18 +220,46 @@ impl<'w> PreparedHelper<'w, '_> {
 }
 
 /// The checked dispatch edge for offline leases: a Mutate plan's lease must
-/// name its exact held helper target. Writable inspection has no consumer
-/// yet and stays closed.
+/// name its exact held helper target. Snapshot inspection accepts only a
+/// read-only plan with the exact held disk; mutation leases cannot inspect.
 pub(super) fn check_helper_lease(
     kind: PlanKind,
     offline: Option<&OfflineLease>,
     workspace: &ProductionWorkspace,
     target: Option<&HelperTarget<'_>>,
+    inputs: &[(ArtifactRole, crate::vm::paths::Artifact)],
 ) -> Result<(), Q> {
     match (kind, offline, target) {
         (PlanKind::Mutate, Some(lease), Some(target))
             if lease.binds(target) && target.binding() == workspace.binding() =>
         {
+            Ok(())
+        }
+        (PlanKind::InspectWritable, Some(lease), None) => {
+            let inspection = lease.inspection().ok_or(PATH)?;
+            let slot = inspection.slot;
+            let binding = workspace.binding();
+            let [(ArtifactRole::QemuImg, _), (role, disk), backing @ ..] = inputs else {
+                return Err(PATH);
+            };
+            if inspection.workspace != binding
+                || slot.role != "disk"
+                || slot.generation != binding.generation
+                || !matches!(
+                    role,
+                    ArtifactRole::GuestDisk
+                        | ArtifactRole::SnapshotDisk
+                        | ArtifactRole::SnapshotStagingDisk
+                )
+                || !matches!(backing, [] | [(ArtifactRole::Golden, _)])
+                || disk.pin().is_none()
+                || disk.identity() != Some(inspection.identity)
+                || disk.path_for(*role).map_err(|_| PATH)?
+                    != &slot_path(&workspace.root.path, slot)?
+            {
+                return Err(PATH);
+            }
+            workspace.pin_slot(slot, inspection.identity, false)?;
             Ok(())
         }
         (PlanKind::Mutate | PlanKind::InspectWritable, ..) => Err(PATH),

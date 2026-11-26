@@ -14,7 +14,7 @@ use crate::store::vm::{
     self as store, Binding,
     native::{Origin, release::Target},
 };
-use crate::vm::reaper::{CleanupKind, CleanupWork};
+use crate::vm::reaper::{CleanupArtifact, CleanupKind, CleanupWork};
 use crate::vm::runtime::{Quiesced, ReaperRuntime};
 use crate::vm::snapshot::Request;
 use crate::vm::test_issuer::tests::{FakeSource, assert_admission_closed, config};
@@ -272,13 +272,15 @@ fn same_work(work: &Work) -> Work {
 
 /// Stands in for the sealed read-only `qemu-img info` child: it reads the
 /// held disk's first cluster and reports what the pinned helper would.
-#[derive(Default)]
-struct FixtureInspector {
+type InspectionCheck<'a> = dyn Fn(&InspectTarget<'_>, &SnapshotInfo<'_>, &CopyBudget<'_>) + 'a;
+
+struct FixtureInspector<'a> {
     calls: u32,
     fail: bool,
+    check: &'a InspectionCheck<'a>,
 }
 
-impl SnapshotInspector for FixtureInspector {
+impl SnapshotInspector for FixtureInspector<'_> {
     fn inspect(
         &mut self,
         target: InspectTarget<'_>,
@@ -295,6 +297,7 @@ impl SnapshotInspector for FixtureInspector {
         {
             return Err(copy::Refusal::Inspection);
         }
+        (self.check)(&target, info, budget);
         let mut header = vec![0; crate::vm::qemu_img::CLUSTER];
         read_exact_at(target.file, 0, &mut header)?;
         let golden = info
@@ -416,6 +419,8 @@ struct Case<'c> {
     copy_content: Option<ArtifactPin>,
     custody: Option<&'c dyn CustodyCheckpoints>,
     inspect_fails: bool,
+    checked_inspection: bool,
+    cancelled: &'c dyn Fn() -> bool,
     lose_commit: bool,
     lose_failure: bool,
 }
@@ -429,6 +434,8 @@ impl Default for Case<'_> {
             copy_content: None,
             custody: None,
             inspect_fails: false,
+            checked_inspection: false,
+            cancelled: &|| false,
             lose_commit: false,
             lose_failure: false,
         }
@@ -471,7 +478,7 @@ fn run(
         work.vm,
     );
     let left = u64::try_from(expires - reading.utc_ms).unwrap_or(0);
-    let stopped = || cancel.is_cancelled();
+    let stopped = || cancel.is_cancelled() || (case.cancelled)();
     let request = SnapshotRequest {
         work: &work,
         worker: &admitted.worker,
@@ -506,9 +513,71 @@ fn run(
         lose_failure: case.lose_failure,
     };
     let holds = Cell::new(0);
+    let check_inspection =
+        |target: &InspectTarget<'_>, info: &SnapshotInfo<'_>, budget: &CopyBudget<'_>| {
+            if !case.checked_inspection {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("qemu-img.exe");
+            std::fs::write(&path, b"fixture image").unwrap();
+            let image = LocalPath::parse(path.to_str().unwrap()).unwrap();
+            let pin = PathPin::open(&image, false, false).unwrap();
+            let image = launch::artifact(ArtifactRole::QemuImg, &pin).unwrap();
+            let cwd = LocalPath::parse(dir.path().to_str().unwrap()).unwrap();
+            let ws = target.workspace;
+            let lease = OfflineLease::for_inspection(ws, target.slot, target.identity);
+            let plan = offline_snapshot_info(&lease, &image, info).unwrap();
+            assert_eq!(
+                helper::check_helper_lease(plan.kind(), Some(&lease), ws, None, plan.inputs()),
+                Ok(())
+            );
+            assert!(
+                helper::check_helper_lease(PlanKind::Mutate, Some(&lease), ws, None, plan.inputs())
+                    .is_err()
+            );
+            let pins = hold_plan_inputs(&plan, budget.deadline(), &|| false).unwrap();
+            assert!(pins.iter().all(|pin| !pin.mutable));
+            assert_eq!(pins[1].identity, target.identity);
+            let binding = ws.binding();
+            let launch_target = inspection_launch_target(&plan, ws, &cwd);
+            let permit = intent.launch(binding, launch_target).unwrap();
+            assert!(
+                permit
+                    .consume(inspection_launch_target(&plan, ws, &cwd))
+                    .is_ok()
+            );
+            assert!(
+                intent
+                    .launch(binding, inspection_launch_target(&plan, ws, &cwd))
+                    .is_err()
+            );
+            let wrong = ArtifactSlot {
+                role: "vars",
+                ..target.slot
+            };
+            let wrong_lease = OfflineLease::for_inspection(ws, wrong, target.identity);
+            let wrong_plan = offline_snapshot_info(&wrong_lease, &image, info).unwrap();
+            assert!(
+                helper::check_helper_lease(
+                    wrong_plan.kind(),
+                    Some(&wrong_lease),
+                    ws,
+                    None,
+                    wrong_plan.inputs()
+                )
+                .is_err()
+            );
+            assert!(
+                intent
+                    .launch(binding, inspection_launch_target(&wrong_plan, ws, &cwd))
+                    .is_err()
+            );
+        };
     let mut inspector = FixtureInspector {
         calls: 0,
         fail: case.inspect_fails,
+        check: &check_inspection,
     };
     let result = copy_offline_snapshot(
         &request,
@@ -520,8 +589,8 @@ fn run(
                 &restore_ledger,
                 &disposal,
                 &work,
-                Instant::now() + Duration::from_secs(30),
-                &|| false,
+                request.cutoff(),
+                request.cancelled,
             )?;
             (case.after_hold)();
             Ok(held)
@@ -591,6 +660,10 @@ fn assert_exact_inventory(fx: &SweepFixture, expected: &[PairSlots]) {
         .collect();
     assert_eq!(names(root), wanted, "exact generation directory set");
     for pair in expected {
+        let generation = pair.disk.generation;
+        let _workspace =
+            hold_workspace_under(&fx.production, fx.owner_sid().0, scope_of(fx, generation))
+                .unwrap();
         let leaves: BTreeSet<String> = [
             super::super::disposal::leaf_name(pair.disk),
             super::super::disposal::leaf_name(pair.vars),
@@ -600,10 +673,14 @@ fn assert_exact_inventory(fx: &SweepFixture, expected: &[PairSlots]) {
         .collect();
         assert_eq!(names(&fx.gen_dir(pair.disk.generation)), leaves);
     }
+    let count = expected.len() as i64;
     assert_eq!(
         fx.count("SELECT count(*) FROM vm_native_generations"),
-        expected.len() as i64
+        count
     );
+    assert_eq!(fx.count("SELECT count(*) FROM vm_generations"), count);
+    assert_eq!(fx.count("SELECT count(*) FROM vm_artifacts"), 2 * count);
+    assert_eq!(fx.count("SELECT count(*) FROM vm_native_slots"), 2 * count);
 }
 
 /// T61/T62/I19: a capture holds the exact released pair and golden, writes
@@ -814,9 +891,10 @@ fn stale_release_refuses_before_any_write_and_again_at_commit() {
                 ..Case::default()
             }
         } else {
-            begin_epoch(&fx, vm, [0x5b; 16]);
-            commit_release(&fx, vm, [0x5b; 16], true);
-            Case::default()
+            Case {
+                after_hold: &restale,
+                ..Case::default()
+            }
         };
         let (result, seen) = run(&fx, &source, &admitted, case);
         assert!(
@@ -875,14 +953,26 @@ fn swapped_dir_lease_or_pair_and_static_or_swapped_roles_refuse_without_staging(
         let mut work = same_work(&admitted.work);
         match swap {
             Swap::Directory => {
-                let moved = dir.with_extension("moved");
-                std::fs::rename(&dir, &moved).unwrap();
+                let recorded = scope_of(&fx, pair.disk.generation);
+                std::fs::remove_dir_all(&dir).unwrap();
                 // A look-alike directory with the same leaf names.
                 std::fs::create_dir(&dir).unwrap();
                 std::fs::write(dir.join(GENERATION_LEASE), b"").unwrap();
                 for slot in [pair.disk, pair.vars] {
                     std::fs::write(fx.slot_file(slot), b"look-alike").unwrap();
                 }
+                let replacement = open_relative(
+                    &fx.production.leaf,
+                    &hex::encode(pair.disk.generation),
+                    Node::Directory,
+                    false,
+                    false,
+                )
+                .unwrap();
+                assert_ne!(
+                    file_identity(&replacement, true).unwrap().0,
+                    recorded.workspace
+                );
             }
             Swap::Lease => {
                 let lease = fx.lease_file(pair.disk.generation);
@@ -923,9 +1013,44 @@ fn swapped_dir_lease_or_pair_and_static_or_swapped_roles_refuse_without_staging(
         assert!(result.is_err(), "{swap:?} accepted");
         assert_eq!(seen.holds, u32::from(!refused_early), "{swap:?}");
         assert_eq!(seen.checkpoints, 0, "{swap:?}");
-        assert_eq!(seen.failed, Some([StagedLeaf::Untouched; 2]), "{swap:?}");
+        let static_work = matches!(swap, Swap::Static);
+        assert_eq!(
+            seen.failed,
+            (!static_work).then_some([StagedLeaf::Untouched; 2]),
+            "{swap:?}"
+        );
         assert!(!exists(&fx.gen_dir(candidate.disk.generation)), "{swap:?}");
         assert_eq!(fx.count("SELECT count(*) FROM vm_restore_points"), 0);
+        if static_work {
+            let mut work = same_work(&admitted.work);
+            work.is_static = true;
+            let ledger = ControllerSnapshot {
+                controller: fx.ctl(),
+                worker: &admitted.worker,
+                work: &work,
+                host: &host,
+                resources: resources(),
+            };
+            let proof = [work.active.pair.1[0], work.active.pair.1[1]];
+            for result in [
+                ledger.checkpoint(),
+                ledger.leaf_verified(candidate.disk, proof[0]),
+                ledger.commit(proof),
+                ledger.fail([StagedLeaf::Untouched; 2]),
+            ] {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "native TEST snapshot adapter refuses Static work"
+                );
+            }
+            assert_eq!(
+                fx.count("SELECT count(*) FROM vm_snapshot_work WHERE phase='copy'"),
+                1
+            );
+            assert_eq!(receipt_status(&fx, work.activity), 0);
+            assert_eq!(disk_bytes(&fx), baseline + work.claim.total().unwrap());
+            continue;
+        }
         sweep(&fx);
         assert_eq!(
             generation_rows(&fx, candidate.disk.generation),
@@ -1378,6 +1503,7 @@ struct LiveExpiry<'a> {
     epoch: Id,
     witness: Cell<bool>,
     owned: RefCell<Option<File>>,
+    quarantine: Cell<bool>,
     calls: RefCell<Vec<&'static str>>,
 }
 
@@ -1403,6 +1529,9 @@ impl ReaperRuntime for LiveExpiry<'_> {
     fn force_reap(&self, work: &CleanupWork, _: Instant) -> StopDisposition {
         assert!(work.release_only && !self.witness.get());
         self.calls.borrow_mut().push("force");
+        if self.quarantine.replace(false) {
+            return StopDisposition::ChargedQuarantine;
+        }
         // Fixture stand-in for confirmed Job exit: the writer closes, then
         // the owned stop path commits the exact epoch's release.
         drop(self.owned.borrow_mut().take().expect("owned writer"));
@@ -1422,14 +1551,8 @@ fn ordinary_expiry_quiesces_a_live_generation_before_any_point_disposal() {
     let source = FakeSource::new(Instant::now());
     let golden = seal_golden(&fx, 10);
     let vm = active_vm(&fx, &golden, 10, "alice", LEASE_MS);
-    let mut points = Vec::new();
-    for number in 1..=2 {
-        let admitted = admit(&fx, vm, number, &Request::Create(None));
-        run(&fx, &source, &admitted, Case::default()).0.unwrap();
-        points.push(admitted.work.candidate.unwrap());
-    }
+    let (points, retired, live) = points_and_retired(&fx, &source, &golden, vm);
     // The generation goes live: a running writer epoch and its open writer.
-    let live = active(&fx, vm).pair.0;
     let epoch = [0xa1; 16];
     begin_epoch(&fx, vm, epoch);
     fx.store()
@@ -1448,6 +1571,7 @@ fn ordinary_expiry_quiesces_a_live_generation_before_any_point_disposal() {
         epoch,
         witness: Cell::new(true),
         owned: RefCell::new(Some(writer)),
+        quarantine: Cell::new(true),
         calls: RefCell::default(),
     };
     let charged = disk_bytes(&fx);
@@ -1455,17 +1579,28 @@ fn ordinary_expiry_quiesces_a_live_generation_before_any_point_disposal() {
     let ledger = LedgerDisposal { store: fx.store() };
     let custody = fx.disposal(&ledger, &guards);
     fx.clock.advance(SWEEP_AT_MS, 0);
-    // The release turn: quiesce first, no disposal.
-    assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
-    assert_eq!(*runtime.calls.borrow(), ["withdraw", "graceful", "force"]);
-    assert_eq!(
-        fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition='dirty'"),
-        1
-    );
-    for pair in points.iter().chain([&live]) {
-        assert!(exists(&fx.slot_file(pair.disk)) && exists(&fx.slot_file(pair.vars)));
+    // A quarantined stop and the release-only retry both preserve every pair.
+    for released in [false, true] {
+        fx.clock.advance(0, 61);
+        assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+        assert_eq!(runtime.owned.borrow().is_none(), released);
+        assert_eq!(
+            fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition='dirty'"),
+            i64::from(released)
+        );
+        for pair in points.iter().chain([&live]) {
+            assert!(exists(&fx.slot_file(pair.disk)) && exists(&fx.slot_file(pair.vars)));
+        }
+        assert!(
+            exists(&fx.gen_dir(retired)),
+            "retired pair disposed on release turn"
+        );
+        assert_eq!(disk_bytes(&fx), charged, "charges visible before proof");
     }
-    assert_eq!(disk_bytes(&fx), charged, "charges visible before proof");
+    assert_eq!(
+        *runtime.calls.borrow(),
+        ["withdraw", "graceful", "force", "graceful", "force"]
+    );
     // Later turns sweep the points, then the active pair.
     let mut active_gone = None;
     for turn in 0..12 {
@@ -1477,12 +1612,16 @@ fn ordinary_expiry_quiesces_a_live_generation_before_any_point_disposal() {
             .count();
         if !exists(&fx.gen_dir(live.disk.generation)) {
             assert_eq!(points_left, 0, "the active pair goes last");
+            assert!(
+                !exists(&fx.gen_dir(retired)),
+                "retired pair goes before active"
+            );
             active_gone = Some(turn);
             break;
         }
     }
     assert!(active_gone.is_some());
-    assert_eq!(runtime.calls.borrow().len(), 3, "one owned stop");
+    assert_eq!(runtime.calls.borrow().len(), 5, "no stop after release");
     assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 0);
     assert!(fx.ctl().expired_status("alice", vm).unwrap().is_some());
     assert_exact_inventory(&fx, &[golden.slots]);
@@ -1639,5 +1778,253 @@ fn snapshot_copy_permits_are_scoped_to_the_candidate_disk_and_vars() {
         intent
             .copy(candidate.vars, admitted.work.source.1[1].pin)
             .is_err()
+    );
+}
+
+/// The snapshot issuer admits read-only inspection of exactly the source
+/// and candidate, including a sealed restore point as the restore source.
+#[test]
+fn checked_inspection_admits_source_and_candidate_but_refuses_writers() {
+    assert_admission_closed();
+    let fx = SweepFixture::new();
+    let source = FakeSource::new(Instant::now());
+    let golden = seal_golden(&fx, 14);
+    let vm = active_vm(&fx, &golden, 14, "alice", LEASE_MS);
+    let admitted = admit(&fx, vm, 1, &Request::Create(None));
+    let check = || Case {
+        checked_inspection: true,
+        ..Case::default()
+    };
+    let (result, seen) = run(&fx, &source, &admitted, check());
+    result.unwrap();
+    assert_eq!(seen.inspections, 2);
+
+    let restored = admit(&fx, vm, 2, &Request::Restore(admitted.work.target));
+    let (result, seen) = run(&fx, &source, &restored, check());
+    result.unwrap();
+    assert_eq!(seen.inspections, 2);
+}
+
+#[test]
+fn dirty_release_refuses_capture_and_allows_restore() {
+    assert_admission_closed();
+    let fx = SweepFixture::new();
+    let source = FakeSource::new(Instant::now());
+    let golden = seal_golden(&fx, 15);
+    let vm = active_vm(&fx, &golden, 15, "alice", LEASE_MS);
+    let point = admit(&fx, vm, 1, &Request::Create(None));
+    run(&fx, &source, &point, Case::default()).0.unwrap();
+    let epoch = [0x57; 16];
+    begin_epoch(&fx, vm, epoch);
+    commit_release(&fx, vm, epoch, false);
+    assert!(!active(&fx, vm).clean);
+    assert_eq!(
+        fx.ctl()
+            .admit_snapshot(
+                "alice",
+                fresh_key(2),
+                vm,
+                5,
+                &Request::Create(None),
+                None,
+                host(),
+                resources()
+            )
+            .unwrap()
+            .err(),
+        Some(crate::vm::Refusal::SnapshotOfflineRequired)
+    );
+    assert_eq!(fx.count("SELECT count(*) FROM vm_snapshot_work"), 0);
+    let restore = admit(&fx, vm, 3, &Request::Restore(point.work.target));
+    run(&fx, &source, &restore, Case::default()).0.unwrap();
+    assert_eq!(active(&fx, vm).pair.0, restore.work.candidate.unwrap());
+    assert!(active(&fx, vm).clean);
+}
+
+#[test]
+fn mid_copy_cancel_and_mismatched_authority_abandon_exact_staging() {
+    assert_admission_closed();
+    for cancel in [true, false] {
+        let fx = SweepFixture::new();
+        let source = FakeSource::new(Instant::now());
+        let golden = seal_golden(&fx, 16);
+        let vm = active_vm(&fx, &golden, 16, "alice", LEASE_MS);
+        let baseline = disk_bytes(&fx);
+        let admitted = admit(&fx, vm, 1, &Request::Create(None));
+        let candidate = admitted.work.candidate.unwrap();
+        // The writer was admitted before cancellation. The first payload
+        // write grows the candidate, making cancellation deterministic.
+        let disk = fx.slot_file(candidate.disk);
+        let wrote = Cell::new(false);
+        let cancelled = || {
+            if cancel && disk.metadata().is_ok_and(|info| info.len() > 0) {
+                wrote.set(true);
+            }
+            wrote.get()
+        };
+        let mut wrong = admitted.work.source.1[0].pin;
+        wrong.sha256[0] ^= 1;
+        let (result, seen) = run(
+            &fx,
+            &source,
+            &admitted,
+            Case {
+                cancelled: &cancelled,
+                copy_content: (!cancel).then_some(wrong),
+                ..Case::default()
+            },
+        );
+        let error = result.unwrap_err().to_string();
+        assert_eq!(wrote.get(), cancel);
+        let failed = seen.failed.unwrap();
+        if cancel {
+            assert_eq!(error, "snapshot copy refused: Cancelled");
+            assert!(
+                failed
+                    .iter()
+                    .all(|leaf| matches!(leaf, StagedLeaf::Identified(..)))
+            );
+        } else {
+            assert_eq!(failed, [StagedLeaf::Untouched; 2]);
+            assert!(!exists(&disk), "mismatched authority reached slot creation");
+        }
+        assert_eq!(seen.fail_holds_free, Some(true));
+        assert_eq!(fx.count("SELECT count(*) FROM vm_restore_points"), 0);
+        sweep(&fx);
+        assert_eq!(disk_bytes(&fx), baseline);
+        assert_exact_inventory(&fx, &[golden.slots, admitted.work.active.pair.0]);
+    }
+}
+
+#[test]
+fn test_delete_disposes_one_point_and_static_backup_delete_is_refused() {
+    assert_admission_closed();
+    let fx = SweepFixture::new();
+    let source = FakeSource::new(Instant::now());
+    let golden = seal_golden(&fx, 17);
+    let vm = active_vm(&fx, &golden, 17, "alice", LEASE_MS);
+    let baseline = disk_bytes(&fx);
+    let point = admit(&fx, vm, 1, &Request::Create(None));
+    run(&fx, &source, &point, Case::default()).0.unwrap();
+    let pair = point.work.candidate.unwrap();
+    let charged = disk_bytes(&fx);
+    let delete = admit(&fx, vm, 2, &Request::Delete(point.work.target));
+    assert!(delete.work.candidate.is_none());
+    assert_eq!(disk_bytes(&fx), charged);
+    assert_eq!(receipt_status(&fx, delete.work.activity), 0);
+    assert!(exists(&fx.gen_dir(pair.disk.generation)));
+    sweep(&fx);
+    assert!(!exists(&fx.gen_dir(pair.disk.generation)));
+    assert_eq!(
+        receipt_status(&fx, delete.work.activity),
+        Status::Succeeded.code()
+    );
+    assert_eq!(disk_bytes(&fx), baseline);
+    assert_exact_inventory(&fx, &[golden.slots, active(&fx, vm).pair.0]);
+
+    use crate::vm::static_web::{StaticName, StaticProvenance};
+    let static_vm = [0x67; 16];
+    let backup = [0x68; 16];
+    let slots = fx
+        .store()
+        .transact(|db| {
+            let slots = store::static_vm::reserve(
+                db,
+                static_vm,
+                &StaticName::parse("fixture-static").unwrap(),
+                "alice",
+                golden.template,
+                StaticProvenance {
+                    source_generation: pair.disk.generation,
+                    recipe_digest: [0x52; 32],
+                    disk_digest: [0x44; 32],
+                    vars_digest: [0x56; 32],
+                },
+                crate::vm::DiskClaim {
+                    images: 64,
+                    ..Default::default()
+                },
+            )?;
+            db.execute(
+                "INSERT INTO vm_restore_points
+                 (id,static_vm,host,captured_ms,state,provenance,generation,lineage,charge)
+             VALUES(?1,?2,(SELECT id FROM vm_state_host WHERE singleton=1),?3,'ready',?4,?4,?5,64)",
+                params![backup, static_vm, NOW, slots.disk.generation, [0x4cu8; 32]],
+            )?;
+            Ok(slots)
+        })
+        .unwrap();
+    let charged = disk_bytes(&fx);
+    assert_eq!(
+        fx.ctl()
+            .foreground_snapshot_precheck("alice", static_vm, &Request::Delete(backup))
+            .unwrap(),
+        Err(crate::vm::Refusal::StaticBackupDeleteForbidden)
+    );
+    let guards = GenerationGuards::default();
+    let ledger = LedgerDisposal { store: fx.store() };
+    let work = CleanupWork {
+        kind: CleanupKind::Snapshot {
+            vm: static_vm,
+            generation: slots.disk.generation,
+        },
+        pending_worker: None,
+        snapshot_phase: Some("delete".into()),
+        artifacts: [slots.disk, slots.vars]
+            .into_iter()
+            .map(|slot| CleanupArtifact {
+                generation: slot.generation,
+                role: slot.role.into(),
+                key: slot.key,
+                directory: None,
+                identity: None,
+                retain: false,
+            })
+            .collect(),
+        accounted: true,
+        release_only: false,
+    };
+    assert_eq!(
+        fx.disposal(&ledger, &guards)
+            .dispose_cleanup(&work, Instant::now() + Duration::from_secs(1)),
+        Err(PATH)
+    );
+    assert_eq!(
+        fx.count("SELECT count(*) FROM vm_restore_points WHERE static_vm IS NOT NULL"),
+        1
+    );
+    assert_eq!(disk_bytes(&fx), charged);
+}
+
+#[test]
+fn lease_extension_preserves_points_and_refuses_after_expiry_is_claimed() {
+    assert_admission_closed();
+    let fx = SweepFixture::new();
+    let source = FakeSource::new(Instant::now());
+    let golden = seal_golden(&fx, 18);
+    let vm = active_vm(&fx, &golden, 18, "alice", LEASE_MS);
+    let point = admit(&fx, vm, 1, &Request::Create(None));
+    run(&fx, &source, &point, Case::default()).0.unwrap();
+    let charged = disk_bytes(&fx);
+    let seconds = 60 * 60;
+    let end = fx
+        .ctl()
+        .extend_lease("alice", vm, fresh_key(2), seconds)
+        .unwrap()
+        .unwrap();
+    assert_eq!(end, NOW + i64::try_from(seconds).unwrap() * 1000);
+    fx.clock.advance(SWEEP_AT_MS, 0);
+    sweep(&fx);
+    assert!(exists(
+        &fx.gen_dir(point.work.candidate.unwrap().disk.generation)
+    ));
+    assert_eq!(disk_bytes(&fx), charged);
+    fx.clock.advance(SWEEP_AT_MS, 0);
+    sweep(&fx);
+    assert_eq!(
+        fx.ctl()
+            .extend_lease("alice", vm, fresh_key(3), seconds)
+            .unwrap(),
+        Err(crate::vm::Refusal::Expired)
     );
 }

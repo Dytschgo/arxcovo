@@ -785,7 +785,7 @@ impl<'a> NativeLaunch<'a> {
         )?;
         check_start_evidence(start_pair, bound_pair)?;
         check_helper_target(kind, plan.inputs(), workspace, helper_target)?;
-        helper::check_helper_lease(kind, offline, workspace, helper_target)?;
+        helper::check_helper_lease(kind, offline, workspace, helper_target, plan.inputs())?;
         match (kind, boot_inputs) {
             (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(inputs))
                 if memory == TEST_JOB_MEMORY && cpu_rate == JOB_CPU_RATE =>
@@ -853,6 +853,11 @@ impl<'a> NativeLaunch<'a> {
                 Ok((captured.min(live), granted))
             },
             || {
+                // The inspection owns no writer epoch. Its input pins
+                // exclude writes throughout the read-only helper Job.
+                if kind == PlanKind::InspectWritable {
+                    return launch::check_preparation(prepare_by, cancelled);
+                }
                 let store = qualification.store;
                 let pins = recovery::StorePins::open(qualification.production_root())?;
                 let origin = pins.origin(store, boot::marker()?)?;
@@ -1203,9 +1208,12 @@ fn hold_plan_inputs(
         .map(|(role, artifact)| {
             launch::check_preparation(deadline, stop)?;
             let path = artifact.path_for(*role).map_err(|_| reason)?;
-            let mut pin = PathPin::open(path, *role == Data, role.writable())?;
+            let inspection = plan.reads_snapshot_disk(*role);
+            let writable = role.writable() && !inspection;
+            let mut pin = PathPin::open(path, *role == Data, writable)?;
             if !matches!(role, Qemu | QemuImg | Data)
-                && !role.writable()
+                && !writable
+                && !inspection
                 && launch::hash_at_rest_until(&mut pin, DISK_CEILING, deadline, stop)?
                     != artifact.pin().ok_or(reason)?
             {
@@ -1353,6 +1361,10 @@ impl<'a> ReleasedGeneration<'a> {
         let expected_writers: Vec<_> = match &targets {
             ReleaseTargets::Pair { ids, .. } => ids.to_vec(),
             ReleaseTargets::Unchanged(pair) => pair.evidence.map(|file| file.identity).to_vec(),
+            ReleaseTargets::Helper {
+                kind: PlanKind::InspectWritable,
+                ..
+            } => Vec::new(),
             ReleaseTargets::Helper { inputs, .. } => inputs
                 .iter()
                 .filter_map(|(role, id)| role.writable().then_some(*id))

@@ -2988,6 +2988,7 @@ impl<C: Clock> VmController<C> {
         worker: &PendingOperation,
         target: super::test_issuer::NativeTarget,
         slots: &[ArtifactSlot],
+        inspection: Option<super::runtime::InspectionBinding>,
     ) -> Result<bool> {
         self.check_worker(worker)?;
         let Some(admitted) = worker.admitted() else {
@@ -3012,7 +3013,13 @@ impl<C: Clock> VmController<C> {
                    OR (g.active=0 AND g.vm_id=o.vm AND o.action IN (5,6) AND o.binding_kind='snapshot'
                        AND EXISTS(SELECT 1 FROM vm_snapshot_work w
                            WHERE w.activity=o.activity_id AND w.vm=o.vm AND w.static_vm IS NULL
-                             AND w.action=o.action AND w.candidate=g.id AND w.phase='copy')
+                             AND w.action=o.action AND w.candidate=g.id AND w.phase='copy'
+                             AND EXISTS(SELECT 1 FROM vm_snapshot_release r
+                                 JOIN vm_generations a ON a.id=r.generation
+                                 WHERE r.generation=w.expected AND r.epoch=w.epoch
+                                   AND a.vm_id=w.vm AND a.active=1
+                                   AND r.disposition IS NOT NULL
+                                   AND (w.action=6 OR r.disposition='clean')))
                        AND EXISTS(SELECT 1 FROM vm_instances i
                            WHERE i.id=o.vm AND i.principal=o.principal AND i.state=1 AND i.expires_ms>?7))
                ELSE g.active=1 AND g.vm_id=o.vm AND EXISTS(SELECT 1 FROM vm_instances i
@@ -3032,6 +3039,43 @@ impl<C: Clock> VmController<C> {
         )? == 1;
         if !owned {
             return Ok(false);
+        }
+        if let Some(inspection) = inspection {
+            let workspace = inspection.workspace;
+            let slot = inspection.slot;
+            if admitted.effect != AdmittedEffect::Snapshot
+                || slot.role != "disk"
+                || slot.generation != workspace.generation
+                || inspection.identity.volume != workspace.workspace.volume
+                || !store::native::bound(
+                    &tx,
+                    store::native::Scope {
+                        generation: workspace.generation,
+                        production: workspace.production,
+                        workspace: workspace.workspace,
+                        lease: workspace.lease,
+                    },
+                )?
+                || store::count(
+                    &tx,
+                    "SELECT count(*) FROM vm_snapshot_work w
+                     JOIN vm_generations g ON g.id=?3 AND g.vm_id=w.vm AND g.static_id IS NULL
+                     JOIN vm_native_slots n ON n.generation=g.id AND n.role='disk'
+                     WHERE w.activity=?1 AND w.candidate=?2 AND w.phase='copy'
+                       AND n.object_key=?4 AND n.file=?5 AND n.disposal IS NULL
+                       AND ((g.id=w.source AND n.state='verified')
+                           OR (g.id=w.candidate AND n.state='identified'))",
+                    params![
+                        worker.activity_id,
+                        target.generation,
+                        slot.generation,
+                        slot.key,
+                        inspection.identity.file,
+                    ],
+                )? != 1
+            {
+                return Ok(false);
+            }
         }
         for slot in slots {
             if slot.generation != target.generation

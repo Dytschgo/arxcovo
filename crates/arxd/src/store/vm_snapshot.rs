@@ -495,6 +495,12 @@ fn cleanup_authority(db: &Connection, vm: Id, generation: Id) -> Result<Option<C
                     WHERE p.id=w.target AND p.vm=w.vm AND p.generation=g.id AND p.state='deleting'))))
             OR (w.static_vm=?1 AND g.static_id=?1 AND w.phase IN ('copy','abandoned') AND w.candidate=g.id))
            AND (w.phase='delete' OR NOT EXISTS(SELECT 1 FROM vm_restore_points WHERE generation=g.id))
+           AND NOT EXISTS(SELECT 1 FROM vm_instances v
+               JOIN vm_generations a ON a.vm_id=v.id
+               JOIN vm_native_generations n ON n.generation=a.id
+               LEFT JOIN vm_snapshot_release r ON r.generation=a.id
+               WHERE v.id=w.vm AND v.state=4 AND v.cleanup_route='lease'
+                 AND a.active=1 AND r.disposition IS NULL)
          UNION ALL
          SELECT NULL,p.id,0,'expiry',e.expiry,0
          FROM vm_snapshot_expiry e JOIN vm_instances v ON v.id=e.vm

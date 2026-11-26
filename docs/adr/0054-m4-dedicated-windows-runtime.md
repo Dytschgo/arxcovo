@@ -1993,3 +1993,26 @@ an earlier graceful exit only while the Job stays empty. A surviving
 process forces termination and a dirty exit. An ordinary reaper turn that
 finds a live run owner wakes that owner's retry and does not compete for
 its generation. Orphan recovery runs only without a registered owner.
+
+## 7c chunk 15 amendment — TEST snapshots and ordinary expiry
+
+Offline TEST capture and restore bind one admitted operation to its
+candidate disk and VARS via per-slot copy permits. The copy holds the
+admitted active pair, selected source and sealed golden from claim
+revalidation through atomic settlement. Checkpoints and commit revalidate
+the active generation's exact released epoch. Capture requires clean
+release. Restore can use a ready point after a dirty active release.
+Native custody records the candidate workspace and both identities before
+writing. A failed copy drops its holds before recording abandonment.
+
+The checked helper inspects only the source disk or the candidate disk
+named by the same pending copy. Its inspection lease binds the held
+workspace, disk slot and file identity. The sealed info plan runs read-only
+and owns no writer epoch. Its bounded output requires an exact clean Job
+release. Fixture coverage leaves production TEST admission closed.
+
+Ordinary TEST lease expiry first quiesces and releases any native active
+writer. The release turn leaves points and retired pairs charged. Later
+turns dispose them before the active pair and settle expiry from the common
+disposal proof. Static VMs and protected backups stay outside TEST copy
+and disposal authority. Native execution is **unverified on real hardware**.

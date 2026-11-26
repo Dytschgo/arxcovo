@@ -1540,7 +1540,7 @@ fn the_helper_lease_names_exactly_the_held_target() {
         .precreate_helper_target(admitted2.slots.disk, &ledger2)
         .unwrap();
     let elsewhere = OfflineLease::for_helper(&target2);
-    let check = |kind, lease, target| check_helper_lease(kind, lease, &ws, target);
+    let check = |kind, lease, target| check_helper_lease(kind, lease, &ws, target, &[]);
     assert_eq!(check(PlanKind::Mutate, Some(&exact), Some(&target)), Ok(()));
     assert_eq!(
         check(PlanKind::Mutate, Some(&elsewhere), Some(&target)),

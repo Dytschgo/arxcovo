@@ -28,8 +28,9 @@
 use super::*;
 use crate::store::vm::native::disposal::{GenerationDisposal, GenerationState};
 use crate::store::vm::snapshot::{Pair, StagedLeaf, Work};
-use crate::vm::paths::ArtifactPin;
-use crate::vm::qemu_args::SnapshotInfo;
+use crate::vm::paths::{Artifact, ArtifactPin};
+use crate::vm::qemu_args::{SnapshotInfo, offline_snapshot_info};
+use crate::vm::runtime::OfflineLease;
 use crate::vm::snapshot::{
     self as copy, ActiveRelease, Compatibility, CopyBudget, CopyCustody, CopyPlan, Destination,
     FileRole, Golden, Leaf, Limits, Lineage, Observation, Side, StoredPair,
@@ -246,16 +247,28 @@ pub(crate) struct ControllerSnapshot<'a, C> {
 
 impl<C: Clock> SnapshotLedger for ControllerSnapshot<'_, C> {
     fn checkpoint(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.work.is_static,
+            "native TEST snapshot adapter refuses Static work"
+        );
         self.controller
             .snapshot_checkpoint(self.worker, self.work, (self.host)(), self.resources)
     }
 
     fn leaf_verified(&self, slot: ArtifactSlot, evidence: ArtifactEvidence) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.work.is_static,
+            "native TEST snapshot adapter refuses Static work"
+        );
         self.controller
             .snapshot_leaf_complete(self.worker, self.work, slot, evidence)
     }
 
     fn commit(&self, proof: [ArtifactEvidence; 2]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.work.is_static,
+            "native TEST snapshot adapter refuses Static work"
+        );
         self.controller.finish_snapshot_copy(
             self.worker,
             self.work,
@@ -267,6 +280,10 @@ impl<C: Clock> SnapshotLedger for ControllerSnapshot<'_, C> {
     }
 
     fn fail(&self, leaves: [StagedLeaf; 2]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.work.is_static,
+            "native TEST snapshot adapter refuses Static work"
+        );
         self.controller
             .fail_snapshot_copy(self.worker, self.work, leaves)
     }
@@ -281,9 +298,8 @@ pub(crate) struct InspectTarget<'a> {
     pub file: &'a File,
 }
 
-/// The sealed read-only `qemu-img info` for one held disk. Production
-/// requires a checked writable-inspection launch, which stays closed until
-/// its consumer installs it; fixtures stand in for the child.
+/// The sealed read-only inspection of one held disk. Fixtures stand in
+/// for the helper child.
 pub(crate) trait SnapshotInspector {
     fn inspect(
         &mut self,
@@ -292,6 +308,128 @@ pub(crate) trait SnapshotInspector {
         output: &mut [u8],
         budget: &CopyBudget<'_>,
     ) -> Result<usize, copy::Refusal>;
+}
+
+/// Checks and runs the read-only helper on the blocking copy worker.
+pub(crate) struct CheckedSnapshotInspector<'a, M, R> {
+    pub qualification: &'a ForegroundQualification<'a>,
+    pub image: &'a Artifact,
+    pub cwd: &'a LocalPath,
+    pub cancel: &'a Shutdown,
+    pub runtime: &'a tokio::runtime::Handle,
+    pub mint: M,
+    pub refresh: R,
+}
+
+fn inspection_launch_target<'a, 'plan>(
+    plan: &'a CommandPlan<'plan>,
+    workspace: &ProductionWorkspace,
+    cwd: &'a LocalPath,
+) -> LaunchTarget<'a, 'plan> {
+    LaunchTarget {
+        plan,
+        writer_epoch: workspace.binding().generation,
+        cwd,
+        pair: None,
+        installer: None,
+        recipe: None,
+        helper: None,
+        memory: JOB_MEMORY_BYTES,
+        cpu_rate: JOB_CPU_RATE,
+    }
+}
+
+impl<M, R, P> SnapshotInspector for CheckedSnapshotInspector<'_, M, R>
+where
+    M: FnMut(WorkspaceBinding, LaunchTarget<'_, '_>) -> Result<P, Q>,
+    P: LaunchPermit,
+    R: FnMut() -> Result<Instant, Q>,
+{
+    fn inspect(
+        &mut self,
+        target: InspectTarget<'_>,
+        info: &SnapshotInfo<'_>,
+        output: &mut [u8],
+        budget: &CopyBudget<'_>,
+    ) -> Result<usize, copy::Refusal> {
+        budget.check()?;
+        let workspace = target.workspace;
+        let binding = workspace.binding();
+        if file_identity(target.file, false)
+            .map_err(|_| copy::Refusal::Io)?
+            .0
+            != target.identity
+        {
+            return Err(copy::Refusal::Identity);
+        }
+        let lease = OfflineLease::for_inspection(workspace, target.slot, target.identity);
+        let plan = offline_snapshot_info(&lease, self.image, info)
+            .map_err(|_| copy::Refusal::Inspection)?;
+        let inputs = plan
+            .inputs()
+            .iter()
+            .map(|(role, input)| Ok((*role, input.identity().ok_or(copy::Refusal::Identity)?)))
+            .collect::<Result<Vec<_>, copy::Refusal>>()?;
+        let deadline =
+            helper::helper_deadline(budget.deadline(), budget.deadline(), Instant::now());
+        let cancelled = || self.cancel.is_cancelled() || budget.check().is_err();
+        let refresh = &mut self.refresh;
+        let mut refresh = || {
+            launch::check_preparation(deadline, &cancelled)?;
+            refresh()
+        };
+        let permit = (self.mint)(
+            binding,
+            inspection_launch_target(&plan, workspace, self.cwd),
+        )
+        .map_err(|_| copy::Refusal::Inspection)?;
+        let request = LaunchRequest {
+            plan,
+            boot_inputs: None,
+            cwd: self.cwd,
+            workspace,
+            writer_epoch: binding.generation,
+            pair: None,
+            installer: None,
+            helper_target: None,
+            memory: JOB_MEMORY_BYTES,
+            cpu_rate: JOB_CPU_RATE,
+            prepare_by: deadline,
+            cancelled: &cancelled,
+        };
+        let deadline = tokio::time::Instant::from_std(deadline);
+        let settlement = self.runtime.block_on(async {
+            match NativeLaunch::hold(self.qualification, request, permit, &mut refresh) {
+                Ok(launch) => {
+                    launch
+                        .run_helper(self.cancel, deadline, refresh, || true)
+                        .await
+                }
+                Err(mut refusal) => {
+                    if refusal.creation() != StartCreation::NeverCreated {
+                        let _ = refusal.settle_created(deadline).await;
+                    }
+                    HelperSettlement::quarantined(Err(refusal.reason()))
+                }
+            }
+        });
+        budget.check()?;
+        if self.cancel.is_cancelled()
+            || tokio::time::Instant::now() >= deadline
+            || settlement.disposition != StopDisposition::CleanRelease
+            || !settlement.released.is_some_and(|proof| {
+                proof.matches_helper(binding, PlanKind::InspectWritable, &inputs)
+            })
+        {
+            return Err(copy::Refusal::Inspection);
+        }
+        let bytes = settlement.output.map_err(|_| copy::Refusal::Inspection)?;
+        output
+            .get_mut(..bytes.len())
+            .ok_or(copy::Refusal::Inspection)?
+            .copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
 }
 
 /// One admitted copy's scope.
@@ -626,7 +764,7 @@ fn plan(request: &SnapshotRequest<'_>, holds: &Holds) -> Result<CopyPlan, Q> {
         },
     )
     .map_err(|_| PATH)?;
-    if plan.additional_claim().total() != work.claim.total() {
+    if plan.additional_claim() != work.claim || plan.additional_claim().total().is_none() {
         return Err(PATH);
     }
     Ok(plan)
@@ -670,6 +808,9 @@ pub(crate) fn copy_offline_snapshot(
     ledger: &dyn SnapshotLedger,
 ) -> anyhow::Result<()> {
     let q = |reason: Q| anyhow::anyhow!("native snapshot custody refused: {reason:?}");
+    if request.work.is_static {
+        return Err(q(PATH));
+    }
     let mut leaves = [StagedLeaf::Untouched; 2];
     let staged = (|| -> anyhow::Result<()> {
         let slots = check_work(request.work, request.worker).map_err(q)?;
