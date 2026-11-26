@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Night Orbit R4</title>
+<link rel="stylesheet" href="night-orbit.css">
+<style>
+:root{color-scheme:dark}
+body{margin:0;background:#000;color:#fff;font:15px/1.5 "Geist",system-ui,sans-serif;padding:32px 40px 60px}
+h1{font-size:40px;letter-spacing:-.03em;margin:0}p{color:#a3a3a3;margin:6px 0 0;max-width:80ch}
+nav{display:flex;gap:10px;margin:22px 0 30px;flex-wrap:wrap}
+nav a{color:#fff;text-decoration:none;border:1px solid #262626;border-radius:999px;padding:6px 14px}
+nav a:hover{border-color:#fff}
+h2{font-size:18px;margin:34px 0 10px}
+iframe{display:block;width:1440px;max-width:100%;border:1px solid #1b1b1b;border-radius:14px;background:#000}
+</style></head><body>
+<h1>Night Orbit · R4</h1>
+<p>All v1 screens of the Arxcovo dashboard in one design language, mock data only. Owner decisions: the board is the v1 Hosts view with migration off (a preview switch shows the roadmap flow with a confirm step); CPU history is requested from the API (dashed "needs API" chips mark every field the API doesn't have yet).</p>
+<nav><a href="login.html">Login</a><a href="board.html">Hosts board</a><a href="host.html">Host · atlas</a><a href="vms.html">VMs</a><a href="vm.html">VM · web-static-01</a><a href="terminal.html">Terminal</a><a href="activity.html">Activity</a><a href="logo.html#O3">Logo</a><a href="SPEC.md">Spec</a><a href="R4-CHANGES.md">R4 changes</a><a href="CPU-HISTORY-API.md">CPU history API proposal</a><a href="board.html?demo">Board with demo controls</a></nav>
+<h2>Hosts board</h2><iframe src="board.html" height="1060" title="Board"></iframe>
+<h2>Host detail</h2><iframe src="host.html" height="1410" title="Host"></iframe>
+<h2>VMs</h2><iframe src="vms.html" height="910" title="VMs"></iframe>
+<h2>VM detail + console</h2><iframe src="vm.html" height="1520" title="VM"></iframe>
+<h2>Terminal</h2><iframe src="terminal.html" height="960" title="Terminal"></iframe>
+<h2>Activity</h2><iframe src="activity.html" height="1600" title="Activity"></iframe>
+<h2>Login</h2><iframe src="login.html" height="900" title="Login"></iframe>
+</body></html>

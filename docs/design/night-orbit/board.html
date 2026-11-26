@@ -1,0 +1,724 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arxcovo Hosts</title>
+<link rel="stylesheet" href="night-orbit.css">
+<script src="arx-data.js"></script>
+<style>
+/* header strip */
+.head{display:flex;flex-wrap:wrap;align-items:flex-end;gap:14px 30px;padding:16px 0 14px;border-bottom:1px solid var(--line)}
+.hero{display:flex;align-items:baseline;gap:8px}
+.hero .of{font-size:52px;font-weight:600;letter-spacing:-.04em;line-height:1;color:var(--ink4)}
+.hero .w{color:var(--ink3);font-size:17px;letter-spacing:-.01em}
+.grp{display:grid;gap:5px;padding-bottom:5px}
+.grp>i{font-style:normal;color:var(--ink4);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase}
+.grp>span{display:flex;gap:18px;color:var(--ink3);font-size:13px}
+.grp b{color:#fff;font-weight:600;font-size:15px;margin-right:4px}
+.ctl{display:flex;align-items:center;gap:16px;padding-bottom:4px;margin-left:auto}
+.pvw{display:flex;align-items:center;gap:9px;font-size:13px;color:var(--ink2);cursor:pointer;white-space:nowrap}
+.legend{display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px;padding:10px 0 0;font-size:12px;color:var(--ink3)}
+.legend>span{display:inline-flex;align-items:center;gap:7px}
+.legend .sw{width:16px;height:9px;border-radius:3px;background:var(--hatch)}
+.legend>.pvnote{display:none;color:#fff}
+body.preview .legend>.pvnote{display:inline-flex}
+.chip.tiny{font-size:9.5px;padding:0 5px;line-height:15px}
+
+/* board: one column per host, then the join ghost; scrolls with a visible bar when it doesn't fit */
+.board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(190px,1fr);gap:10px;padding:14px 0 10px;overflow-x:auto;scrollbar-width:thin;scrollbar-color:#4a4a4a transparent}
+.board::-webkit-scrollbar{height:8px}.board::-webkit-scrollbar-thumb{background:#4a4a4a;border-radius:4px}
+.col{position:relative;display:flex;flex-direction:column;min-height:540px;border:1px solid var(--line);border-radius:16px;background:var(--tile);transition:border-color .25s,background .25s,transform .25s var(--ease)}
+.col-h{padding:13px 12px 12px;border-bottom:1px solid var(--line)}
+.col-t{display:flex;align-items:center;gap:8px;height:24px}
+.col-t .hn{font-weight:600;font-size:16px;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.col-t .hn:hover{text-decoration:underline;text-underline-offset:3px}
+.more{display:none;margin-left:auto;width:24px;height:24px;border-radius:7px;place-items:center;color:var(--ink2)}
+body.preview .more{display:grid}
+.more:hover,.more[aria-expanded="true"]{background:#1a1a1a;color:#fff}
+.col-s{display:flex;align-items:center;gap:6px;margin-top:8px}
+.col-s .arch{margin-left:auto}
+.ver{margin-top:4px;color:var(--ink3);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cpu{display:flex;align-items:baseline;gap:6px;margin-top:12px;height:26px}
+.cpu .k{color:var(--ink3);font-size:11.5px;margin-right:auto}
+.cpu b{font-size:24px;font-weight:600;letter-spacing:-.03em;line-height:1}
+.cpu .u{color:var(--ink3);font-size:13px}
+.cpu .k{white-space:nowrap}
+.cpu .na{align-self:center;font-size:11px;gap:5px;white-space:nowrap}.cpu .na::before{width:12px}
+.spark{display:block;width:100%;height:30px;margin-top:6px;overflow:visible}
+.spark path.l{fill:none;stroke:var(--c);stroke-width:1.4;stroke-linejoin:round;stroke-dasharray:1}
+.intro .spark path.l{animation:draw 1.3s var(--ease) both;animation-delay:calc(400ms + var(--i)*80ms)}
+.spark path.f{fill:var(--c);opacity:.08}
+.spark-na{height:30px;margin-top:6px;border-radius:4px;background:var(--hatch)}
+.axis{display:flex;justify-content:space-between;margin-top:3px;font:10px var(--mono);color:var(--ink4)}
+.alloc{margin-top:10px}
+.alloc .k{color:var(--ink3);font-size:11.5px;margin-bottom:5px}
+.alloc .k em{font-style:normal;color:var(--ink2)}
+.cap{display:grid;grid-template-columns:34px 1fr auto;gap:5px 7px;align-items:center;font-size:11.5px;color:var(--ink3)}
+.cap .bar{height:3px;border-radius:2px;background:var(--line2);overflow:hidden}
+.cap .bar i{display:block;height:100%;background:#fff;transition:width .9s var(--ease)}
+.cap.last .bar i{background:var(--ink4)}
+.cap .v{font:11px var(--mono);color:var(--ink2)}
+.why{margin-top:9px;font-size:12px;color:var(--ink2);display:flex;gap:6px;align-items:flex-start}
+.why svg{width:13px;height:13px;margin-top:1px}
+.col-b{flex:1;display:flex;flex-direction:column;gap:8px;padding:10px}
+.empty{display:grid;place-items:center;text-align:center;color:var(--ink4);font-size:12px;border:1px dashed var(--line2);border-radius:12px;padding:22px 10px}
+
+/* join ghost column */
+.col.join{border:1px dashed var(--line3);background:transparent;padding:18px 14px;gap:10px;align-items:flex-start}
+.col.join h3{margin:6px 0 0;font-size:16px;font-weight:600;letter-spacing:-.01em}
+.col.join p{margin:0;color:var(--ink3);font-size:12.5px}
+.plus{width:34px;height:34px;border-radius:10px;border:1px dashed var(--line3);display:grid;place-items:center;color:var(--ink2)}
+.code{display:none;width:100%;padding:12px;border:1px solid var(--line2);border-radius:12px;background:var(--tile2)}
+.code b{display:block;font:500 15px var(--mono);letter-spacing:.06em}
+.code span{display:block;margin-top:4px;color:var(--ink3);font-size:11.5px}
+.col.join.has .code{display:block}
+
+/* VM card (page additions on top of the shared .card) */
+.card .vname:hover{text-decoration:underline;text-underline-offset:3px}
+.card .c2 .g{width:11px;height:11px;flex:none}
+.card .c2 .gos{overflow:hidden;text-overflow:ellipsis}
+.card .c2 .arch{margin-left:auto;flex:none}
+.card .c2b{display:flex;align-items:center;gap:6px;margin-top:4px;color:var(--ink3);font-size:12px;white-space:nowrap}
+.card .c3{flex-wrap:wrap;row-gap:3px}
+.card .c3 .exp{flex:none}
+.card .c4{display:flex;align-items:center;gap:5px;margin-top:6px;font-size:11.5px;color:var(--ink3)}
+.card .c4 svg{width:12px;height:12px}
+.card .c4.no{color:#fff}
+.card .slots{display:grid;grid-template-columns:1fr 1fr;gap:5px 8px}
+.card .slots .na{font-size:11.5px}.card .slots .na::before{width:12px;height:9px}
+.card .slots .on{color:#fff}
+.mv{margin-left:auto;width:24px;height:24px;border-radius:7px;display:none;place-items:center;color:var(--ink2);flex:none}
+body.preview .mv{display:grid}
+.mv:hover,.mv[aria-expanded="true"]{background:#1a1a1a;color:#fff}
+body.preview .card.vm{cursor:grab;user-select:none;touch-action:none}
+.card a{-webkit-user-drag:none}
+.card.lifting{opacity:.25}
+.card.landed{animation:landIn .5s var(--ease)}
+@keyframes landIn{from{transform:scale(.94);opacity:0}}
+.card.migrating{border-color:#5a5a5a}
+.mig{display:flex;align-items:center;gap:8px;margin-top:9px}
+.prog{flex:1;height:3px;border-radius:2px;background:var(--line2);overflow:hidden}
+.prog i{display:block;height:100%;background:#fff}
+.mig .btn.sm{height:26px;padding:0 10px;font-size:12px}
+.incoming{display:flex;align-items:center;gap:7px;padding:12px;border:1px dashed var(--line3);border-radius:12px;color:var(--ink2);font-size:12px}
+.incoming b{font:500 12px var(--mono);color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.incoming span{margin-left:auto;font:11px var(--mono);white-space:nowrap}
+.ghost{position:fixed;z-index:40;pointer-events:none;transform:rotate(-2deg) scale(1.03);box-shadow:0 18px 50px rgba(0,0,0,.8),0 0 0 1px #fff;opacity:.97;margin:0}
+body.grabbing,body.grabbing *{cursor:grabbing!important}
+
+/* drag targets: reason always at full contrast */
+.drop{display:none;align-items:center;justify-content:center;gap:6px;min-height:52px;padding:8px 10px;border-radius:12px;text-align:center;font-size:12px;color:var(--ink2);border:1px dashed var(--line3)}
+.drop svg{width:13px;height:13px}
+.board.dragging .col.ok .drop,.board.dragging .col.no .drop{display:flex}
+.board.dragging .col.ok{border-color:var(--line3)}
+.board.dragging .col.ok.over{border-color:#fff;background:#0d0d0d;transform:translateY(-2px)}
+.board.dragging .col.ok.over .drop{border-color:#fff;color:#fff}
+.board.dragging .col.no>.col-h,.board.dragging .col.no .card,.board.dragging .col.no .empty,.board.dragging .col.no .incoming,.board.dragging .col.join{opacity:.3;transition:opacity .25s}
+.board.dragging .col.no .drop{background:var(--hatch);border:1px solid var(--line2);color:#fff}
+.board.dragging .col.no .drop span{display:inline-flex;align-items:center;gap:6px;background:#000;padding:3px 8px;border-radius:6px}
+
+/* menu additions */
+.menu{width:286px}
+.menu [role="menuitem"]{align-items:flex-start}
+.menu .mi{display:grid;gap:1px}
+.menu .mi em{font-style:normal;font-size:11.5px;color:var(--ink3)}
+.menu [aria-disabled="true"] .mi>span{color:var(--ink3)}
+.menu .osg{width:18px;height:18px;border-radius:5px;margin-top:1px}
+.menu .osg svg{width:10px;height:10px}
+.menu [role="menuitem"] svg.i{margin-top:2px}
+
+/* dialogs */
+dialog.dlg .chips{display:flex;gap:6px;margin-bottom:12px}
+dialog.dlg .path{display:flex;align-items:center;gap:8px;margin-top:14px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font:12px var(--mono);color:var(--ink2)}
+dialog.dlg .path svg{width:13px;height:13px}
+dialog.dlg.wide{width:min(560px,92vw)}
+.drain{list-style:none;margin:14px 0 0;padding:0;display:grid;gap:2px}
+.drain li{display:grid;grid-template-columns:12px minmax(0,150px) 1fr;gap:10px;align-items:start;padding:9px 0;border-bottom:1px solid var(--line);font-size:13px}
+.drain li .kind{margin-top:4px}
+.drain li b{font:500 12.5px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.drain .to{display:flex;align-items:center;gap:7px;color:#fff}
+.drain .to .osg{width:18px;height:18px;border-radius:5px}.drain .to .osg svg{width:10px;height:10px}
+.drain .no{display:flex;gap:6px;color:var(--ink2);font-size:12.5px}
+.drain .no svg{width:13px;height:13px;margin-top:2px}
+.steps{display:flex;align-items:center;gap:8px;margin-top:16px;font-size:12.5px;color:var(--ink2);flex-wrap:wrap}
+.steps span{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--line2);border-radius:999px}
+.steps span.cur{background:#fff;color:#000;border-color:#fff}
+.steps svg{width:13px;height:13px;color:var(--ink4)}
+
+/* footer ticker */
+.foot .ev{display:flex;align-items:center;gap:10px;min-width:0;flex:1;white-space:nowrap;overflow:hidden}
+.foot .ev>*{flex:none}
+.foot .ev .sum{flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;color:var(--ink2)}
+.foot .ev b{font:500 12.5px var(--mono);color:#fff}
+.foot .ev .who{display:inline-flex;align-items:center;gap:5px}
+.foot .ev .who svg,.foot .ev .oc svg{width:13px;height:13px}
+.foot .ev .oc{display:inline-flex;align-items:center;gap:5px;color:var(--ink2)}
+.foot .ev .oc.bad{color:#fff;font-weight:500}
+.foot .ev.flash{animation:flash 1.2s var(--ease)}
+@keyframes flash{from{opacity:.2}}
+.foot .n{font:11px var(--mono);color:var(--ink4)}
+.foot a{color:var(--ink2);white-space:nowrap}
+.foot a:hover{color:#fff}
+@media (prefers-reduced-motion:reduce){.card.landed{animation:none}}
+/* R4 additions */
+.ctl .btn.sm{white-space:nowrap}
+.st.migfail{white-space:normal;color:#fff;font-weight:500;align-items:flex-start}
+.st.migfail svg{margin-top:2px}
+.retry{display:none}
+body.preview .retry{display:inline-flex}
+dialog.dlg .note{display:flex;gap:8px;align-items:flex-start;margin-top:12px;color:var(--ink2);font-size:13px}
+dialog.dlg .note svg{width:14px;height:14px;margin-top:2px;flex:none}
+dialog.dlg .note[hidden]{display:none}
+#joinDlg .code{display:block;margin-top:14px}
+#joinDlg .code:empty{display:none}
+.demo-strip{margin-top:8px;border-top:1px dashed var(--line2)}
+.demo-strip .kindw{color:var(--ink3)}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="win" viewBox="0 0 16 16"><path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z" fill="currentColor"/></symbol>
+  <symbol id="lin" viewBox="0 0 16 16"><path d="M5 3v10h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-hosts" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
+  <symbol id="i-vm" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
+  <symbol id="i-act" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-move" viewBox="0 0 24 24"><path d="M4 8h13l-3-3M20 16H7l3 3"/></symbol>
+  <symbol id="i-run" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-spin" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-3-6.2"/><path d="M20 4v4h-4"/></symbol>
+  <symbol id="i-fail" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-swap" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18h.01"/></symbol>
+  <symbol id="i-off" viewBox="0 0 24 24"><path d="M3 3l18 18M8.5 8.5A5 5 0 0 0 12 17h4M17 7h-3"/></symbol>
+  <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5l11 7-11 7z"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M3 12h4l2-4 4 8 2-4h6"/></symbol>
+  <symbol id="i-backup" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.6"/><path d="M4 4v4h4M12 8v4l3 2"/></symbol>
+  <symbol id="i-cam" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></symbol>
+  <symbol id="i-bot" viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="11" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01"/></symbol>
+  <symbol id="i-cog" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+  <symbol id="i-mem" viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="10" rx="2"/><path d="M7 17v3M12 17v3M17 17v3"/></symbol>
+  <symbol id="i-disk" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
+  <symbol id="i-signout" viewBox="0 0 24 24"><path d="M14 4h5v16h-5M10 16l-4-4 4-4M6 12h10"/></symbol>
+  <!-- page icons -->
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.4" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-drain" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+</svg>
+
+<div class="page">
+  <header class="top rise" style="--i:0">
+    <a class="brand" href="board.html" aria-label="Arxcovo home">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="lgo" gradientUnits="userSpaceOnUse" x1="3" y1="0" x2="29" y2="0"><stop offset="0" stop-color="#4cc2ff"/><stop offset=".5" stop-color="#b9b0e8"/><stop offset="1" stop-color="#f5a524"/></linearGradient></defs><path class="lg-a" pathLength="1" d="M7.5 27 L16 7 L24.5 27"/><g transform="rotate(-14 16 19.5)"><ellipse class="lg-o" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/><ellipse class="lg-c" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/></g><circle class="lg-n" cx="16" cy="7" r="2.9"/><circle class="lg-m" cx="28.2" cy="16.3" r="1.9"/></svg>
+      arxcovo
+    </a>
+    <nav class="nav" aria-label="Main">
+      <a href="board.html" aria-current="page"><svg class="i"><use href="#i-hosts"/></svg>Hosts</a>
+      <a href="vms.html" aria-label="VMs"><svg class="i"><use href="#i-vm"/></svg></a>
+      <a href="terminal.html" aria-label="Terminal"><svg class="i"><use href="#i-term"/></svg></a>
+      <a href="activity.html" aria-label="Activity"><svg class="i"><use href="#i-act"/></svg></a>
+    </nav>
+    <span class="spacer"></span>
+    <span class="sync" title="Every host serves this dashboard"><span class="pulse"></span>served by <b>atlas</b> · synced</span>
+    <label class="search"><svg class="i"><use href="#i-search"/></svg><input type="search" placeholder="Search hosts, VMs, tools" aria-label="Search"><kbd>/</kbd></label>
+    <a class="me" href="login.html?state=signedout" title="Sign out"><svg class="i"><use href="#i-signout"/></svg><span class="vh">Sign out</span></a>
+  </header>
+
+  <section class="rise" style="--i:1" aria-label="Summary">
+    <div class="head">
+      <div class="hero"><b class="hero-n" data-count id="nOnline">0</b><span class="of">/<span id="nHosts">0</span></span><span class="w">hosts online</span></div>
+      <div class="grp"><i>Hosts not online</i><span><span><b data-count id="nDeg">0</b>degraded</span><span><b data-count id="nOff">0</b>offline</span></span></div>
+      <div class="grp"><i>VMs on all hosts, incl. offline</i><span><span><b data-count id="nVms">0</b>total</span><span><b data-count id="nRun">0</b>running</span><span><b data-count id="nTest">0</b>test</span><span><b data-count id="nStatic">0</b>static</span></span></div>
+      <div class="ctl">
+        <label class="pvw"><button class="switch" id="pv" role="switch" aria-checked="false" aria-labelledby="pvl"></button><span id="pvl">Preview migration (roadmap)</span></label>
+        <div class="seg" role="group" aria-label="Show VMs">
+          <button aria-pressed="true" data-f="all">All</button><button aria-pressed="false" data-f="test">Test</button><button aria-pressed="false" data-f="static">Static</button>
+        </div>
+        <button class="btn sm" id="joinBtn" aria-haspopup="dialog"><svg class="i"><use href="#i-plus"/></svg>Join a host</button>
+      </div>
+    </div>
+    <div class="legend">
+      <span><span class="kind test"></span>test VM, expires</span>
+      <span><span class="kind static"></span>static VM, never expires</span>
+      <span><span class="sw"></span>unavailable</span>
+      <span><span class="chip api">needs API: cpu history</span>24 h traces</span>
+      <span class="pvnote"><svg class="i"><use href="#i-move"/></svg>Roadmap preview, not in v1: drag a VM or use ⇄ to see the move flow</span>
+    </div>
+  </section>
+
+  <h1 class="vh">Hosts</h1>
+  <main class="board intro" id="board" aria-label="Hosts board"></main>
+
+  <footer class="foot rise" style="--i:10">
+    <span class="pulse"></span>
+    <span class="ev" id="ev" aria-label="Latest activity"></span>
+    <span class="n" id="evn"></span>
+    <a href="activity.html">All activity →</a>
+    <span class="mock">Mock data · ◇ = field the API doesn't have yet</span>
+  </footer>
+  <div class="foot demo-strip demo-flex" data-demo role="group" aria-label="Demo controls">
+    <span class="kindw">Demo</span>
+    <label class="pvw"><button class="switch" id="failSw" role="switch" aria-checked="false" aria-labelledby="failL"></button><span id="failL">Next move fails at cutover</span></label>
+  </div>
+  <div class="vh" aria-live="polite" id="live"></div>
+</div>
+
+<dialog class="dlg" id="mvDlg" aria-labelledby="mvT" aria-describedby="mvD mvNote">
+  <div class="chips"><span class="chip"><svg class="i" style="width:12px;height:12px"><use href="#i-user"/></svg>Owner action</span><span class="chip">roadmap preview</span></div>
+  <h2 id="mvT"></h2>
+  <p id="mvD"></p>
+  <p class="note" id="mvNote" hidden></p>
+  <div class="path" id="mvPath"></div>
+  <div class="acts"><button class="btn" id="mvCancel" autofocus>Cancel</button><button class="btn primary" id="mvGo"><svg class="i"><use href="#i-move"/></svg>Move</button></div>
+</dialog>
+
+<dialog class="dlg wide" id="drDlg" aria-labelledby="drT">
+  <div class="chips"><span class="chip"><svg class="i" style="width:12px;height:12px"><use href="#i-user"/></svg>Owner action</span><span class="chip">roadmap preview</span></div>
+  <h2 id="drT"></h2>
+  <p>Each VM moves to a compatible host by the same rules as drag. VMs that can't move stay and keep running.</p>
+  <ul class="drain" id="drList"></ul>
+  <div class="steps" aria-label="Host update sequence"><span class="cur">1 Drain</span><svg class="i" aria-hidden="true"><use href="#i-next"/></svg><span>2 Update</span><svg class="i" aria-hidden="true"><use href="#i-next"/></svg><span>3 Move back</span></div>
+  <div class="acts"><button class="btn" id="drClose">Close</button><button class="btn primary" aria-disabled="true" title="Roadmap: drain isn't in v1" aria-describedby="drWhy"><svg class="i"><use href="#i-drain"/></svg>Start drain</button><span class="vh" id="drWhy">Unavailable: drain is on the roadmap, not in v1</span></div>
+</dialog>
+
+<dialog class="dlg" id="joinDlg" aria-labelledby="joinT">
+  <h2 id="joinT">Join a host<span class="apimark" title="Join codes are a field the API doesn't have yet" aria-hidden="true">◇</span></h2>
+  <p>Create a one-time code here, then paste it on the new machine. It works once and expires after 15 minutes.</p>
+  <div class="code" id="joinCode" aria-live="polite"></div>
+  <div class="acts"><button class="btn" id="joinClose">Close</button><button class="btn primary" id="joinNew">Create join code</button></div>
+</dialog>
+
+<script>
+/* All data, byte maths and move rules come from arx-data.js (ARX). Only the CPU series and the ticker copy are page-local. */
+const {HOSTS, VMS, fmtBytes, canMove} = ARX;
+const ACT = ARX.ACTIVITY.slice();
+
+const OSC = ARX.OS_COLOR;
+const STATE = {   // icon, word, extra class
+  creating:['i-spin','Creating',''], running:['i-run','Running',''], stopped:['i-stop','Stopped','off'],
+  snapshotting:['i-cam','Snapshotting',''], migrating:['i-swap','Migrating',''], failed:['i-fail','Failed','bad'], destroying:['i-trash','Destroying','off']};
+const HOST_ST = {online:['i-check','Online',''], degraded:['i-warn','Degraded','bad'], offline:['i-off','Offline','off']};
+const OUTCOME = {started:['i-play',''], succeeded:['i-check',''], failed:['i-fail','bad'], rejected:['i-ban','bad'], refused:['i-shield','bad'], interrupted:['i-pause','bad']};
+const ACTOR = {agent:'i-bot', owner:'i-user', system:'i-cog'};
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const $ = s => document.querySelector(s);
+const board = $('#board');
+const APIMARK = '<span class="apimark" title="Field the API doesn\'t have yet" aria-hidden="true">◇</span>';
+let filter = 'all', preview = false, mig = null, migFail = null, failNext = false, prevW = {};
+
+/* ---------- formatting ---------- */
+const icon = (id, cls='i') => `<svg class="${cls}" aria-hidden="true"><use href="#${id}"/></svg>`;
+const expLabel = iso => Date.parse(iso) <= Date.now() ? 'expired' : 'in ' + ARX.fmtLeft(iso);
+const soon = iso => Date.parse(iso) - Date.now() < 3600e3;
+/** "16/64 GiB": both sides through ARX.fmtBytes, unit printed once when it matches. */
+function ratio(a, total) {
+  const T = fmtBytes(total), unit = T.split(' ')[1];
+  if (!a) return `0/${T}`;
+  const A = fmtBytes(a);
+  return A.endsWith(' ' + unit) ? `${A.split(' ')[0]}/${T}` : `${A}/${T}`;
+}
+const who = a => a.actor.kind === 'agent' ? `agent · ${a.actor.name}` : a.actor.kind;
+/* CPU series: page-local stand-in built from each host's current ARX sample (no history API yet). */
+function series(h, i) {
+  let s = [], v = h.cpu.usedPercent, seed = i * 97 + 13;
+  for (let k = 0; k < 24; k++) { seed = (seed * 9301 + 49297) % 233280; v = Math.max(4, Math.min(95, v + (seed / 233280 - .5) * 12)); s.push(v); }
+  s[23] = h.cpu.usedPercent; return s;
+}
+function sparkSvg(s) {
+  const W = 200, H = 30, x = i => i * W / 23, y = v => H - 2 - (v / 100) * (H - 4);
+  let d = `M0 ${y(s[0])}`;
+  for (let i = 1; i < 24; i++) { const dx = x(i) - x(i-1); d += ` C${x(i-1)+dx/2} ${y(s[i-1])} ${x(i)-dx/2} ${y(s[i])} ${x(i)} ${y(s[i])}`; }
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true"><path class="f" d="${d} L${W} ${H} L0 ${H}Z"/><path class="l" pathLength="1" vector-effect="non-scaling-stroke" d="${d}"/></svg>`;
+}
+
+/* ---------- rendering ---------- */
+function slotsHtml(v) {
+  const x = v.x, hs = x.health.state, h = ARX.host(v.hostId);
+  const health = hs === 'unknown'
+    ? `<span class="na" title="Health unknown${h.reachability === 'offline' ? ' while the host is offline' : ''}"><span class="vh">health </span>unknown${APIMARK}</span>`
+    : `<span title="Health check ${hs}: ${x.health.check}">${icon(hs === 'passing' ? 'i-heart' : 'i-warn')}<span class="vh">health </span>${hs}${APIMARK}</span>`;
+  const ago = ARX.fmtAgo(x.backup.lastAt);
+  const backup = ago ? `<span title="Last backup ${ago}">${icon('i-backup')}<span class="vh">last backup </span>${ago.replace(' ago', '')}${APIMARK}</span>` : `<span class="na"><span class="vh">last backup </span>none${APIMARK}</span>`;
+  const pub = x.publish.on
+    ? `<span class="on" title="Published at ${x.publish.hostname}; the ${x.publish.by} turned it on">${icon('i-globe')}<span class="vh">publishing </span>on${APIMARK}</span>`
+    : `<span title="Public publishing off (default)">${icon('i-globe')}<span class="vh">publishing </span>off${APIMARK}</span>`;
+  return `<div class="slots">${health}${backup}${pub}</div>`;
+}
+function cardHtml(v) {
+  const [ic, word, cls] = STATE[v.state];
+  const moving = mig && mig.vm === v, failed = !moving && migFail && migFail.vmId === v.id;
+  const label = moving ? (mig.phase === 'precopy' ? `Pre-copy ${Math.round(mig.p)}%` : 'Cutover')
+    : failed ? `Migration failed · VM still on ${migFail.from}` : word;
+  const exp = v.kind === 'static' ? `<span class="exp">never</span>`
+    : `<span class="exp${soon(v.expiresAt) ? ' soon' : ''}" data-exp="${v.id}" title="Expires ${new Date(v.expiresAt).toLocaleString()}">${expLabel(v.expiresAt)}</span>`;
+  const showReady = ['running','snapshotting','migrating'].includes(v.state);
+  const ready = !showReady ? '' : v.ready ? `<div class="c4">${icon('i-check')}ready</div>` : `<div class="c4 no">${icon('i-warn')}guest not ready</div>`;
+  const migUi = moving ? `<div class="mig"><div class="prog" role="progressbar" aria-label="Pre-copy of ${v.id}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(mig.p)}"><i style="width:${mig.p}%"></i></div>
+      <button class="cx btn sm" data-vm="${v.id}" ${mig.phase === 'cutover' ? 'aria-disabled="true" title="Cutover can\'t be cancelled"' : ''}>Cancel<span class="vh"> move of ${v.id}</span></button></div>`
+    : failed ? `<div class="mig"><button class="retry btn sm" data-vm="${v.id}">${icon('i-spin')}Retry<span class="vh"> move of ${v.id} to ${migFail.to}</span></button></div>` : '';
+  const stCls = moving ? '' : failed ? 'bad migfail' : cls;
+  return `<article class="card vm${moving ? ' migrating' : ''}" data-vm="${v.id}" aria-label="${v.id}, ${v.kind} VM, ${failed ? 'migration failed' : word}">
+    <div class="c1"><span class="kind ${v.kind}" aria-hidden="true" title="${v.kind === 'static' ? 'Static VM, never expires' : 'Test VM, expires'}"></span><a class="vname" href="vm.html?id=${v.id}" draggable="false">${v.id}</a>
+      <button class="mv" aria-label="Move ${v.id} to another host" aria-haspopup="menu" aria-expanded="false" data-vm="${v.id}">${icon('i-move')}</button></div>
+    <div class="c2"><svg class="g" style="color:${OSC[v.guestOs]}" aria-hidden="true"><use href="#${v.guestOs === 'windows' ? 'win' : 'lin'}"/></svg><span class="gos" title="${v.guestOsVersion}">${v.guestOsVersion.replace(/^Windows /, '')}</span><span class="vh">${v.guestOs === 'windows' ? ' Windows' : ''}</span><span class="arch">${v.arch}</span></div>
+    <div class="c2b"><span class="kindw">${v.kind}</span>· ${v.cpus} vCPU · ${fmtBytes(v.memoryBytes)}</div>
+    <div class="c3"><span class="st ${stCls}">${icon(moving ? 'i-swap' : failed ? 'i-fail' : ic)}<span class="lbl">${label}</span></span>${exp}</div>
+    ${ready}${v.kind === 'static' ? slotsHtml(v) : ''}${migUi}
+  </article>`;
+}
+
+function colHtml(h, i, first) {
+  const off = h.reachability === 'offline', a = ARX.allocated(h.id);
+  const [sic, sword, scls] = HOST_ST[h.reachability];
+  const list = ARX.vmsOn(h.id).filter(v => filter === 'all' || v.kind === filter);
+  const incoming = mig && mig.to === h.id ? `<div class="incoming">${icon('i-swap')}<b>${mig.vm.id}</b><span class="ip">${mig.phase === 'precopy' ? 'pre-copy ' + Math.round(mig.p) + '%' : 'cutover'}</span></div>` : '';
+  const wCpu = a.cpus / h.cpu.cores * 100, wMem = a.memoryBytes / h.memory.totalBytes * 100;
+  const pc = prevW[h.id + 'c'] ?? 0, pm = prevW[h.id + 'm'] ?? 0;
+  prevW[h.id + 'c'] = wCpu; prevW[h.id + 'm'] = wMem;
+  const cpuNow = h.cpu.usedPercent == null
+    ? `<span class="k">CPU now</span><span class="na">usage unavailable</span>`
+    : `<span class="k">CPU now</span><b data-count="${h.cpu.usedPercent}">${first && !reduce ? 0 : h.cpu.usedPercent}</b><span class="u">%</span>`;
+  const noTrace = h.cpu.usedPercent == null || off || !h.x.cpuHistory;
+  return `<section class="col${first ? ' rise' : ''}" style="--i:${i + 2};--c:${OSC[h.os]}" data-host="${h.id}" aria-labelledby="hn-${h.id}">
+    <div class="col-h">
+      <div class="col-t"><span class="osg" title="${ARX.OS_LABEL[h.os]} host">${icon(h.os === 'windows' ? 'win' : 'lin', '')}</span><a class="hn" id="hn-${h.id}" href="host.html?id=${h.id}">${h.name}</a><span class="vh">, ${h.os} host, ${sword}</span>
+        <button class="more" aria-label="More actions for ${h.name}" aria-haspopup="menu" aria-expanded="false" data-host="${h.id}">${icon('i-more')}</button></div>
+      <div class="col-s"><span class="st ${scls}" title="Last seen ${ARX.fmtAgo(h.lastSeenAt)}">${icon(sic)}${sword}</span><span class="arch">${h.arch}</span></div>
+      <div class="ver" title="${h.osVersion} · ${h.cpu.model}, ${h.cpu.cores} cores">${h.osVersion}</div>
+      <div class="cpu">${cpuNow}</div>
+      ${noTrace ? `<div class="spark-na" title="No CPU samples while offline"></div>` : sparkSvg(series(h, i))}
+      <div class="axis" aria-hidden="true"><span>24 h</span><span>now</span></div>
+      <div class="alloc">
+        <div class="k">allocated to VMs${off ? ' · <em>last known</em>' : ''}</div>
+        <div class="cap${off ? ' last' : ''}">
+          <span>vCPU</span><span class="bar" aria-hidden="true"><i style="width:${pc}%" data-w="${wCpu}"></i></span><span class="v">${a.cpus}/${h.cpu.cores}</span>
+          <span>RAM</span><span class="bar" aria-hidden="true"><i style="width:${pm}%" data-w="${wMem}"></i></span><span class="v">${ratio(a.memoryBytes, h.memory.totalBytes)}</span>
+        </div>
+      </div>
+      ${h.reachabilityReason ? `<div class="why">${icon(off ? 'i-off' : 'i-warn')}<span>${h.reachabilityReason}</span></div>` : ''}
+    </div>
+    <div class="col-b"><div class="drop"><span></span></div>${incoming}${list.length ? list.map(cardHtml).join('') : `<div class="empty">No ${filter === 'all' ? '' : filter + ' '}VMs</div>`}</div>
+  </section>`;
+}
+
+function render(first) {
+  const focusSel = focusKey();
+  board.innerHTML = HOSTS.map((h, i) => colHtml(h, i, first)).join('');
+  requestAnimationFrame(() => requestAnimationFrame(() => board.querySelectorAll('.cap i[data-w]').forEach(b => b.style.width = b.dataset.w + '%')));
+  restoreFocus(focusSel);
+  totals();
+}
+function focusKey() {
+  const a = document.activeElement; if (!a || !board.contains(a)) return null;
+  if (a.dataset.vm) return `.${[...a.classList][0]}[data-vm="${a.dataset.vm}"]`;
+  if (a.dataset.host) return `.more[data-host="${a.dataset.host}"]`;
+  if (a.classList.contains('vname')) return `.card[data-vm="${a.closest('.card').dataset.vm}"] .vname`;
+  if (a.classList.contains('hn')) return '#' + a.id;
+  return null;
+}
+function restoreFocus(sel) { if (sel) { const el = board.querySelector(sel); el && el.focus(); } }
+
+function totals(firstRun) {
+  const T = ARX.totals();
+  const t = {nHosts:T.hosts, nOnline:T.online, nDeg:T.degraded, nOff:T.offline, nVms:T.vms, nRun:T.running, nTest:T.test, nStatic:T.static};
+  for (const k in t) { const el = document.getElementById(k); if (!el) continue; if (firstRun && el.hasAttribute('data-count')) el.dataset.count = t[k]; else el.textContent = t[k]; }
+}
+function countUp() {
+  document.querySelectorAll('[data-count]').forEach(el => {
+    const to = +el.dataset.count; if (reduce) { el.textContent = to; return; }
+    const t0 = performance.now(), D = 900;
+    (function step(t) { const p = Math.min(1, (t - t0) / D); el.textContent = Math.round(to * (1 - Math.pow(1 - p, 3))); if (p < 1) requestAnimationFrame(step); })(t0);
+  });
+}
+
+render(true); totals(true); countUp();
+setTimeout(() => { board.classList.remove('intro'); board.querySelectorAll('.col.rise').forEach(c => c.classList.remove('rise')); }, 2600);
+
+/* ---------- preview switch, filter, demo switch ---------- */
+$('#pv').addEventListener('click', e => {
+  preview = !preview; e.currentTarget.setAttribute('aria-checked', preview);
+  document.body.classList.toggle('preview', preview); closeMenu(false);
+  announce(preview ? 'Migration preview on. Cards can be dragged; each card has a Move button.' : 'Migration preview off.');
+});
+document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
+  filter = b.dataset.f; document.querySelectorAll('.seg button').forEach(x => x.setAttribute('aria-pressed', x === b)); render(false);
+}));
+$('#failSw').addEventListener('click', e => { failNext = !failNext; e.currentTarget.setAttribute('aria-checked', failNext); });
+function announce(t) { $('#live').textContent = t; }
+
+/* ---------- generic menu with roving focus ---------- */
+let menu = null;
+function openMenu(trigger, title, items, onPick) {
+  closeMenu(false);
+  const m = document.createElement('div'); m.className = 'menu'; m.id = 'menu'; m.setAttribute('role', 'menu'); m.setAttribute('aria-label', title);
+  m.innerHTML = `<p aria-hidden="true">${title}</p>` + items.map((it, i) =>
+    `<button role="menuitem" tabindex="-1" data-i="${i}" ${it.disabled ? 'aria-disabled="true"' : ''} aria-label="${it.aria}">${it.html}</button>`).join('');
+  document.body.appendChild(m);
+  const r = trigger.getBoundingClientRect(), mw = m.offsetWidth, mh = m.offsetHeight;
+  m.style.position = 'fixed';
+  m.style.left = Math.max(8, Math.min(r.right - mw, innerWidth - mw - 8)) + 'px';
+  m.style.top = (r.bottom + 6 + mh > innerHeight ? Math.max(8, r.top - mh - 6) : r.bottom + 6) + 'px';
+  trigger.setAttribute('aria-expanded', 'true'); trigger.setAttribute('aria-controls', 'menu');
+  const els = [...m.querySelectorAll('[role=menuitem]')];
+  let idx = els.findIndex(e => !e.hasAttribute('aria-disabled')); if (idx < 0) idx = 0;
+  const go = i => { idx = (i + els.length) % els.length; els.forEach((e, k) => e.tabIndex = k === idx ? 0 : -1); els[idx].focus(); };
+  go(idx);
+  const pick = i => { if (els[i].hasAttribute('aria-disabled')) return; closeMenu(false); onPick(items[i]); };
+  m.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); go(idx + 1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); go(idx - 1); }
+    else if (e.key === 'Home') { e.preventDefault(); go(0); }
+    else if (e.key === 'End') { e.preventDefault(); go(els.length - 1); }
+    else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(idx); }
+    else if (e.key === 'Escape' || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); closeMenu(true); }
+  });
+  m.addEventListener('click', e => { const b = e.target.closest('[role=menuitem]'); if (b) pick(+b.dataset.i); });
+  menu = {el:m, trigger};
+}
+/* the trigger may have been re-rendered: find its current twin by data attribute */
+const liveTrigger = t => document.contains(t) ? t
+  : t.dataset.vm ? board.querySelector(`.mv[data-vm="${t.dataset.vm}"]`)
+  : t.dataset.host ? board.querySelector(`.more[data-host="${t.dataset.host}"]`) : null;
+function closeMenu(refocus) {
+  if (!menu) return; const t = menu.trigger; menu.el.remove(); menu = null;
+  t.setAttribute('aria-expanded', 'false'); t.removeAttribute('aria-controls');
+  if (refocus) liveTrigger(t)?.focus();
+}
+document.addEventListener('pointerdown', e => { if (menu && !e.target.closest('.menu') && e.target.closest('button') !== menu.trigger) closeMenu(false); });
+board.addEventListener('scroll', () => closeMenu(false)); addEventListener('resize', () => closeMenu(false));
+
+/* menu item: label and reason come straight from ARX.canMove */
+const hostItem = (h, m) => ({value:h.id, disabled:!m.ok,
+  aria: m.ok ? `${h.name}: ${m.reason}` : `${h.name}, unavailable: ${m.reason}`,
+  html: `<span class="osg" style="--c:${OSC[h.os]}">${icon(h.os === 'windows' ? 'win' : 'lin', '')}</span><span class="mi"><span>${h.name}</span><em>${m.reason}</em></span>`});
+
+board.addEventListener('click', e => {
+  const mv = e.target.closest('.mv'), more = e.target.closest('.more'), cx = e.target.closest('.cx'), rt = e.target.closest('.retry');
+  if (mv) {
+    if (menu && menu.trigger === mv) return closeMenu(false);
+    const vm = ARX.vm(mv.dataset.vm);
+    openMenu(mv, `Move ${vm.id} to`, HOSTS.filter(h => h.id !== vm.hostId).map(h => hostItem(h, canMove(vm, h))), it => openConfirm(vm, ARX.host(it.value)));
+  } else if (more) {
+    if (menu && menu.trigger === more) return closeMenu(false);
+    const h = ARX.host(more.dataset.host);
+    openMenu(more, h.name, [{value:'drain', aria:'Drain (roadmap): move every VM off this host', html:`${icon('i-drain')}<span class="mi"><span>Drain (roadmap)</span><em>Move every VM away, then update</em></span>`}], () => openDrain(h, more));
+  } else if (cx) {
+    if (cx.getAttribute('aria-disabled') === 'true') return;
+    cancelMigration();
+  } else if (rt && migFail) {
+    openConfirm(ARX.vm(rt.dataset.vm), ARX.host(migFail.to));
+  }
+});
+
+/* ---------- confirm dialog (owner drag asks first) ---------- */
+const mvDlg = $('#mvDlg'); let pending = null;
+function openConfirm(vm, h) {
+  if (mig) { announce('One move at a time in this preview. Wait for the current move to finish.'); liveTrigger(board.querySelector(`.mv[data-vm="${vm.id}"]`))?.focus(); return; }
+  const m = canMove(vm, h);
+  if (!m.ok) { announce(`${vm.id} can't move to ${h.name}: ${m.reason}`); return; }
+  pending = {vm, h};
+  const a = ARX.allocated(h.id);
+  $('#mvT').textContent = `Move ${vm.id} to ${h.name}?`;
+  $('#mvD').textContent = `${m.reason}. Owner action.`;
+  const note = $('#mvNote'); note.hidden = !m.note; note.innerHTML = m.note ? `${icon('i-warn')}<span>${m.note}</span>` : '';
+  $('#mvPath').innerHTML = `${vm.hostId} ${icon('i-swap')} ${h.name} · after cutover ${h.name}: ${a.cpus + vm.cpus}/${h.cpu.cores} vCPU, ${ratio(a.memoryBytes + vm.memoryBytes, h.memory.totalBytes)}`;
+  board.querySelector(`.mv[data-vm="${vm.id}"]`)?.focus();   // the dialog restores focus here on close
+  mvDlg.showModal(); $('#mvCancel').focus();
+}
+$('#mvCancel').addEventListener('click', () => mvDlg.close('cancel'));
+$('#mvGo').addEventListener('click', () => mvDlg.close('move'));
+mvDlg.addEventListener('close', () => {
+  const p = pending; pending = null; if (!p) return;
+  if (mvDlg.returnValue === 'move') startMigration(p.vm, p.h.id);
+  else board.querySelector(`.mv[data-vm="${p.vm.id}"]`)?.focus();
+  mvDlg.returnValue = '';
+});
+
+/* ---------- drain dialog (roadmap): plans with ARX.canMove, placing VMs one by one ---------- */
+const drDlg = $('#drDlg'); let drTrigger = null;
+function openDrain(h, trigger) {
+  drTrigger = trigger;
+  $('#drT').textContent = `Drain ${h.name}?`;
+  const vms = ARX.vmsOn(h.id), targets = HOSTS.filter(t => t.id !== h.id), placed = [];
+  let rows;
+  try {
+    rows = vms.map(vm => {
+      const res = targets.map(t => ({t, m:canMove(vm, t)}));
+      const okk = res.find(r => r.m.ok);
+      if (okk) {
+        placed.push([vm, vm.hostId]); vm.hostId = okk.t.id;   // count it on the target for the next VM's check
+        return `<li><span class="kind ${vm.kind}" aria-hidden="true"></span><b>${vm.id}</b><span class="to">${icon('i-swap')}<span class="osg" style="--c:${OSC[okk.t.os]}">${icon(okk.t.os === 'windows' ? 'win' : 'lin', '')}</span>${okk.t.name}<span class="vh">: ${okk.m.reason}</span></span></li>`;
+      }
+      const groups = {}; res.forEach(r => (groups[r.m.reason] ||= []).push(r.t.name));
+      const keys = Object.keys(groups);
+      const why = keys.length === 1 ? keys[0] : keys.map(k => `${groups[k].join(', ')}: ${k}`).join(' · ');
+      return `<li><span class="kind ${vm.kind}" aria-hidden="true"></span><b>${vm.id}</b><span class="no">${icon('i-ban')}<span>Stays. ${why}</span></span></li>`;
+    });
+  } finally { placed.forEach(([vm, src]) => vm.hostId = src); }
+  $('#drList').innerHTML = rows.length ? rows.join('') : `<li><span></span><span class="faint">No VMs on this host</span><span></span></li>`;
+  trigger.focus();                       // the dialog restores focus to the More actions trigger
+  drDlg.showModal(); $('#drClose').focus();
+}
+$('#drClose').addEventListener('click', () => drDlg.close());
+drDlg.addEventListener('close', () => { const t = drTrigger && liveTrigger(drTrigger); drTrigger = null; if (t) { t.focus(); setTimeout(() => t.focus(), 0); } });
+
+/* ---------- join a host (header button → dialog) ---------- */
+const joinDlg = $('#joinDlg'); let joinState = null;
+function paintJoin() {
+  $('#joinCode').innerHTML = joinState ? `<b>${joinState.code}</b><span data-join>expires ${expLabel(new Date(joinState.until).toISOString())}</span><span>one use · mutual TLS after join</span>` : '';
+  $('#joinNew').textContent = joinState ? 'New code' : 'Create join code';
+}
+$('#joinBtn').addEventListener('click', () => { paintJoin(); joinDlg.showModal(); $('#joinNew').focus(); });
+$('#joinNew').addEventListener('click', () => {
+  const c = () => Math.random().toString(36).slice(2, 6).toUpperCase().replace(/[^A-Z0-9]/g, 'X').padEnd(4, 'K');
+  joinState = {code:`${c()}-${c()}-${c()}`, until:Date.now() + 15 * 60e3}; paintJoin();
+});
+$('#joinClose').addEventListener('click', () => joinDlg.close());
+joinDlg.addEventListener('close', () => $('#joinBtn').focus());
+
+/* ---------- simulated warm migration: pre-copy (cancellable) → cutover → done or failed ---------- */
+const PRECOPY_MS = 6000, CUTOVER_MS = 1600;
+function startMigration(vm, to) {
+  const from = vm.hostId;
+  if (migFail && migFail.vmId === vm.id) migFail = null;
+  mig = {vm, from, to, prev:vm.state, p:0, phase:'precopy', t0:performance.now()};
+  vm.state = 'migrating';
+  logAct({tool:'migrate_vm', outcome:'started', actor:{kind:'owner', name:'owner'}, hostId:from, vmId:vm.id, summary:`${from} → ${to}, pre-copy`, exitCode:null});
+  announce(`Moving ${vm.id} to ${to}. Pre-copy started. Capacity changes at cutover.`);
+  render(false);
+  board.querySelector(`.cx[data-vm="${vm.id}"]`)?.focus();
+  if (reduce) tick();                     // reduced motion: pre-copy completes at once, no stuck 0 %
+  else mig.timer = setInterval(tick, 80);
+}
+function tick() {
+  if (!mig || mig.phase !== 'precopy') return;
+  const p = reduce ? 100 : Math.min(100, (performance.now() - mig.t0) / PRECOPY_MS * 100);
+  mig.p = p;
+  const card = board.querySelector(`.card[data-vm="${mig.vm.id}"]`);
+  if (card) { card.querySelector('.prog i').style.width = p + '%'; card.querySelector('.prog').setAttribute('aria-valuenow', Math.round(p)); card.querySelector('.lbl').textContent = `Pre-copy ${Math.round(p)}%`; }
+  const ip = board.querySelector('.incoming .ip'); if (ip) ip.textContent = `pre-copy ${Math.round(p)}%`;
+  if (p >= 100) {
+    clearInterval(mig.timer); mig.phase = 'cutover';
+    announce(`Cutover of ${mig.vm.id}: about 3 minutes of downtime.`);
+    render(false);
+    mig.timer = setTimeout(() => failNext ? failMigration() : finishMigration(), CUTOVER_MS);
+  }
+}
+function finishMigration() {
+  const {vm, from, to, prev} = mig; mig = null;
+  vm.hostId = to; vm.state = prev;                       // capacity moves only now, at cutover
+  logAct({tool:'migrate_vm', outcome:'succeeded', actor:{kind:'owner', name:'owner'}, hostId:to, vmId:vm.id, summary:`${from} → ${to}`, exitCode:null});
+  announce(`${vm.id} moved to ${to}.`);
+  render(false);
+  board.querySelector(`.card[data-vm="${vm.id}"]`)?.classList.add('landed');
+  board.querySelector(`.mv[data-vm="${vm.id}"]`)?.focus();
+}
+function failMigration() {
+  const {vm, from, to, prev} = mig; mig = null; vm.state = prev;   // card stays on (returns to) its source
+  migFail = {vmId:vm.id, from, to};
+  failNext = false; $('#failSw').setAttribute('aria-checked', 'false');   // "next move" only
+  logAct({tool:'migrate_vm', outcome:'failed', actor:{kind:'owner', name:'owner'}, hostId:from, vmId:vm.id, summary:`${from} → ${to}: cutover failed; VM still on ${from}`, exitCode:null});
+  announce(`Move of ${vm.id} failed at cutover. ${vm.id} is still on ${from}. Retry is on its card.`);
+  render(false);
+  board.querySelector(`.retry[data-vm="${vm.id}"]`)?.focus();
+}
+function cancelMigration() {
+  if (!mig || mig.phase !== 'precopy') return;
+  clearInterval(mig.timer);
+  const {vm, from, prev, p} = mig; mig = null; vm.state = prev;
+  logAct({tool:'migrate_vm', outcome:'interrupted', actor:{kind:'owner', name:'owner'}, hostId:from, vmId:vm.id, summary:`cancelled at pre-copy ${Math.round(p)}%; stays on ${from}`, exitCode:null});
+  announce(`Move cancelled. ${vm.id} stays on ${from}.`);
+  render(false);
+  board.querySelector(`.mv[data-vm="${vm.id}"]`)?.focus();
+}
+
+/* ---------- drag (preview only) with pointer events ---------- */
+let drag = null, justDragged = false;
+board.addEventListener('pointerdown', e => {
+  if (!preview || e.button !== 0) return;
+  const card = e.target.closest('.card.vm'); if (!card || e.target.closest('button')) return;
+  const vm = ARX.vm(card.dataset.vm), r = card.getBoundingClientRect();
+  drag = {card, vm, x0:e.clientX, y0:e.clientY, started:false, dx:e.clientX - r.left, dy:e.clientY - r.top, pid:e.pointerId};
+});
+addEventListener('pointermove', e => {
+  if (!drag) return;
+  if (!drag.started) { if (Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < 5) return; startDrag(); }
+  drag.ghost.style.left = (e.clientX - drag.dx) + 'px'; drag.ghost.style.top = (e.clientY - drag.dy) + 'px';
+  const el = document.elementFromPoint(e.clientX, e.clientY), col = el && el.closest('.col[data-host]');
+  board.querySelectorAll('.col.over').forEach(c => c !== col && c.classList.remove('over'));
+  drag.over = col && col.classList.contains('ok') ? col.dataset.host : null;
+  if (drag.over) col.classList.add('over');
+  const br = board.getBoundingClientRect();
+  if (e.clientX > br.right - 40) board.scrollLeft += 12; else if (e.clientX < br.left + 40) board.scrollLeft -= 12;
+});
+addEventListener('pointerup', () => {
+  if (!drag) return; const d = drag; endDrag();
+  if (d.started) { justDragged = true; setTimeout(() => justDragged = false, 0); if (d.over) openConfirm(d.vm, ARX.host(d.over)); }
+});
+addEventListener('pointercancel', () => drag && endDrag());
+board.addEventListener('click', e => { if (justDragged) { e.preventDefault(); e.stopPropagation(); } }, true);
+function startDrag() {
+  drag.started = true; closeMenu(false);
+  const r = drag.card.getBoundingClientRect(), g = drag.card.cloneNode(true);
+  g.classList.add('ghost'); g.removeAttribute('aria-label'); g.setAttribute('aria-hidden', 'true'); g.style.width = r.width + 'px';
+  document.body.appendChild(g); drag.ghost = g;
+  drag.card.classList.add('lifting'); document.body.classList.add('grabbing'); board.classList.add('dragging');
+  board.querySelectorAll('.col[data-host]').forEach(c => {
+    const m = canMove(drag.vm, ARX.host(c.dataset.host)); if (m.home) return;
+    c.classList.add(m.ok ? 'ok' : 'no');
+    c.querySelector('.drop').innerHTML = m.ok ? `${icon('i-move')}<span class="lbl-ok">${m.reason}</span>` : `<span>${icon('i-ban')}${m.reason}</span>`;
+  });
+}
+function endDrag() {
+  drag.ghost?.remove(); drag.card.classList.remove('lifting');
+  document.body.classList.remove('grabbing'); board.classList.remove('dragging');
+  board.querySelectorAll('.col').forEach(c => c.classList.remove('ok', 'no', 'over')); drag = null;
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && drag) endDrag(); });
+
+/* ---------- footer ticker (ActivityEntry from ARX.ACTIVITY) ---------- */
+let evIdx = 0, evPaused = false, evHeld = 0;   // a fresh event stays up for 12 s before the ticker rotates
+const foot = $('.foot');
+foot.addEventListener('pointerenter', () => evPaused = true); foot.addEventListener('pointerleave', () => evPaused = false);
+foot.addEventListener('focusin', () => evPaused = true); foot.addEventListener('focusout', () => evPaused = false);
+function showEv(flash) {
+  const a = ACT[evIdx], [oic, ocls] = OUTCOME[a.outcome];
+  const hl = a.hostId ? (ARX.host(a.hostId) ? `<a class="mono" href="host.html?id=${a.hostId}">${a.hostId}</a>` : `<span class="mono">${a.hostId}</span>`) : '';
+  const vl = a.vmId ? (ARX.vm(a.vmId) ? `<a class="mono" href="vm.html?id=${a.vmId}">${a.vmId}</a>` : `<span class="mono">${a.vmId}</span>`) : '';
+  const ev = $('#ev');
+  ev.innerHTML = `<span class="oc ${ocls}">${icon(oic)}${a.outcome}</span><b>${a.tool}</b><span class="sum">${a.summary}</span>
+    <span class="who">${icon(ACTOR[a.actor.kind])}${who(a)}</span>
+    ${hl}${hl && vl ? '<span class="faint">/</span>' : ''}${vl}${a.exitCode != null ? `<span class="mono">exit ${a.exitCode}</span>` : ''}<span>${ARX.fmtAgo(a.startedAt)}</span>`;
+  $('#evn').textContent = `${evIdx + 1}/${ACT.length}`;
+  if (flash && !reduce) { ev.classList.remove('flash'); void ev.offsetWidth; ev.classList.add('flash'); }
+}
+function logAct(a) { const now = new Date().toISOString(); ACT.unshift({id:ACT[0].id + 1, startedAt:now, finishedAt:a.outcome === 'started' ? null : now, ...a}); evIdx = 0; evHeld = Date.now() + 12e3; showEv(true); }
+showEv(false);
+if (!reduce) setInterval(() => { if (evPaused || mig || Date.now() < evHeld) return; evIdx = (evIdx + 1) % ACT.length; showEv(true); }, 6000);
+
+/* ---------- countdowns: absolute instants, keep counting for every state ---------- */
+setInterval(() => {
+  board.querySelectorAll('[data-exp]').forEach(el => {
+    const v = ARX.vm(el.dataset.exp);
+    el.textContent = expLabel(v.expiresAt); el.classList.toggle('soon', soon(v.expiresAt));
+  });
+  const j = document.querySelector('[data-join]');
+  if (j && joinState) j.textContent = joinState.until > Date.now() ? `expires ${expLabel(new Date(joinState.until).toISOString())}` : 'expired, create a new code';
+}, 1000);
+</script>
+</body>
+</html>
