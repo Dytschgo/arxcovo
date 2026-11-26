@@ -1359,3 +1359,88 @@ async fn host_sampler_stops_when_the_dashboard_is_dropped_during_a_refresh() {
         "a refresh started after shutdown"
     );
 }
+
+#[tokio::test]
+async fn cpu_history_requires_a_session_and_trusted_origin() {
+    let f = Fixture::new();
+    let host_id = f.activity.host_id().unwrap();
+    let (cookie, _) = f.login(None).await;
+    for path in [
+        format!("/api/v1/hosts/{host_id}/cpu-history?range=1h"),
+        "/api/v1/hosts/cpu-history?range=24h".to_owned(),
+    ] {
+        let response = f
+            .send(f.request(Method::GET, &path, None), Body::empty())
+            .await;
+        error(response, StatusCode::UNAUTHORIZED, "unauthorized").await;
+        let response = f
+            .send(
+                f.request(Method::GET, &path, Some("https://wrong.example"))
+                    .header("cookie", &cookie),
+                Body::empty(),
+            )
+            .await;
+        error(response, StatusCode::FORBIDDEN, "forbidden").await;
+    }
+}
+
+#[tokio::test]
+async fn cpu_history_rejects_unknown_hosts_and_invalid_queries() {
+    let f = Fixture::new();
+    let (cookie, _) = f.login(None).await;
+    let host_id = f.activity.host_id().unwrap();
+    let unknown = f
+        .get("/api/v1/hosts/unknown/cpu-history?range=1h", &cookie)
+        .await;
+    error(unknown, StatusCode::NOT_FOUND, "not_found").await;
+
+    for path in [
+        format!("/api/v1/hosts/{host_id}/cpu-history?range=2h"),
+        format!("/api/v1/hosts/{host_id}/cpu-history"),
+        "/api/v1/hosts/bad/id/cpu-history?range=1h".to_owned(),
+        "/api/v1/hosts/cpu-history?range=1h".to_owned(),
+        "/api/v1/hosts/cpu-history?range=24h&range=24h".to_owned(),
+        "/api/v1/hosts/cpu-history?range=24h&limit=257".to_owned(),
+        format!("/api/v1/hosts/cpu-history?range=24h{}", "&".repeat(2_000)),
+    ] {
+        error(
+            f.get(&path, &cookie).await,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn cpu_history_returns_fixed_windows_and_a_bounded_batch() {
+    let (source, _) = GatedSource::new([], usize::MAX, None);
+    let f = Fixture::with_host(read::HostSampler::start(source, Duration::ZERO));
+    let (cookie, _) = f.login(None).await;
+    let host_id = f.activity.host_id().unwrap();
+    let end = (NOW.div_euclid(600_000) + 1) * 600_000;
+    f.clock
+        .advance(Duration::from_millis((end + 300_000 - NOW) as u64));
+    for second in 0..300 {
+        f.state.host.record_cpu_sample(end + second * 1_000, 42.5);
+    }
+
+    for (range, width, points) in [("1h", 60, 60), ("6h", 300, 72), ("24h", 600, 144)] {
+        let path = format!("/api/v1/hosts/{host_id}/cpu-history?range={range}");
+        let response = f.get(&path, &cookie).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let series = body(response).await;
+        assert_eq!(series["hostId"], host_id);
+        assert_eq!(series["range"], range);
+        assert_eq!(series["bucketSeconds"], width);
+        let samples = series["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), points);
+        assert_eq!(samples[0], serde_json::Value::Null);
+        assert_eq!(samples[points - 1], 42.5);
+        if range == "24h" {
+            let batch = f.get("/api/v1/hosts/cpu-history?range=24h", &cookie).await;
+            assert_eq!(batch.status(), StatusCode::OK);
+            assert_eq!(body(batch).await, json!({"series": [series]}));
+        }
+    }
+}

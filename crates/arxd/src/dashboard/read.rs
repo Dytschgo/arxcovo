@@ -1,4 +1,8 @@
-use super::{ApiError, Dashboard, instant_string, json_response};
+use super::{
+    ApiError, Clock, Dashboard, SystemClock,
+    cpu_history::{self, CpuHistory, MinuteHistory, Range},
+    instant_string, json_response,
+};
 use crate::{
     store::{Activity, ListActivity, Outcome},
     vm::{DashboardVm, Guest},
@@ -7,7 +11,7 @@ use axum::{extract::Query, http::Uri, response::Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -31,6 +35,14 @@ pub(super) async fn route(state: &Dashboard, uri: &Uri) -> Result<Response, ApiE
         .path()
         .strip_prefix("/api/v1/")
         .ok_or(ApiError::NOT_FOUND)?;
+    if let Some(target) = path.strip_prefix("hosts/") {
+        if target == "cpu-history" {
+            return cpu_history::route(state, uri, None).await;
+        }
+        if let Some(id) = target.strip_suffix("/cpu-history") {
+            return cpu_history::route(state, uri, Some(id)).await;
+        }
+    }
     let (collection, target) = path
         .split_once('/')
         .map_or((path, None), |(collection, target)| {
@@ -301,18 +313,22 @@ impl<S: HostSource> HostProbe<S> {
 
     /// `now` is read before the refresh (is a CPU sample due?) and after it
     /// (the stamp), so the next gap starts at or after sysinfo's own.
-    fn sample(&mut self, mut now: impl FnMut() -> Instant) -> HostFacts {
+    fn sample(&mut self, mut now: impl FnMut() -> Instant) -> (HostFacts, Option<f32>) {
         let reading = self.source.refresh(cpu_sample_due(self.last_cpu, now()));
         if reading.cpu.is_some() {
             self.last_cpu = Some(now());
         }
-        HostFacts {
+        let used_percent = self.window.observe(reading.cpu);
+        let facts = HostFacts {
             model: reading.model,
             cores: reading.cores,
             total_memory: reading.total_memory,
             used_memory: reading.used_memory,
-            used_percent: self.window.observe(reading.cpu),
-        }
+            used_percent,
+        };
+        // Only a fresh, valid sample contributes to history. Keep its raw
+        // value so the bucket mean is rounded just once, after aggregation.
+        (facts, used_percent.and(reading.cpu))
     }
 }
 
@@ -336,6 +352,7 @@ enum HostState {
 #[derive(Clone)]
 pub(super) struct HostSampler {
     latest: tokio::sync::watch::Receiver<HostState>,
+    history: Arc<Mutex<MinuteHistory>>,
     _task: Arc<SamplerTask>,
 }
 
@@ -357,6 +374,8 @@ impl HostSampler {
     pub(super) fn start(source: impl HostSource, period: Duration) -> Self {
         let period = sample_period(period);
         let (slot, latest) = tokio::sync::watch::channel(HostState::Pending);
+        let history = Arc::new(Mutex::new(MinuteHistory::default()));
+        let task_history = Arc::clone(&history);
         let task = tokio::spawn(async move {
             let slot = Arc::new(slot);
             let mut probe = HostProbe::new(source);
@@ -366,8 +385,15 @@ impl HostSampler {
                 // The first tick completes immediately.
                 ticks.tick().await;
                 let target = Arc::clone(&slot);
+                let history = Arc::clone(&task_history);
                 match tokio::task::spawn_blocking(move || {
-                    publish(&mut probe, &target);
+                    publish(
+                        &mut probe,
+                        &target,
+                        &history,
+                        SystemClock.now().utc_ms,
+                        Instant::now,
+                    );
                     probe
                 })
                 .await
@@ -392,8 +418,19 @@ impl HostSampler {
         });
         Self {
             latest,
+            history,
             _task: Arc::new(SamplerTask(task)),
         }
+    }
+
+    pub(super) fn history(&self, range: Range, id: &str, now: i64) -> Result<CpuHistory, ApiError> {
+        let history = self.history.lock().map_err(|_| ApiError::UNAVAILABLE)?;
+        range.series(id, now, &history)
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_cpu_sample(&self, now: i64, percent: f32) {
+        self.history.lock().unwrap().record(now, percent);
     }
 
     /// Copies the last published figures. The channel lock is only ever held
@@ -447,8 +484,19 @@ impl HostSampler {
 }
 
 /// Refreshes outside the channel lock, then swaps the result in.
-fn publish<S: HostSource>(probe: &mut HostProbe<S>, slot: &tokio::sync::watch::Sender<HostState>) {
-    let facts = probe.sample(Instant::now);
+fn publish<S: HostSource>(
+    probe: &mut HostProbe<S>,
+    slot: &tokio::sync::watch::Sender<HostState>,
+    history: &Mutex<MinuteHistory>,
+    utc_ms: i64,
+    now: impl FnMut() -> Instant,
+) {
+    let (facts, fresh_cpu) = probe.sample(now);
+    if let Some(percent) = fresh_cpu
+        && let Ok(mut history) = history.lock()
+    {
+        history.record(utc_ms, percent);
+    }
     slot.send_replace(HostState::Ready(facts));
 }
 
@@ -701,7 +749,8 @@ mod tests {
         ]));
         // A due poll without a sample (empty CPU list) is not a sample and
         // is not stamped, so the next poll is due again.
-        let gap = probe.sample(at(start));
+        let (gap, fresh) = probe.sample(at(start));
+        assert_eq!(fresh, None);
         assert_eq!(gap.used_percent, None);
         assert_eq!(gap.model, "Test CPU");
         assert_eq!(
@@ -709,28 +758,79 @@ mod tests {
             (4, 8 << 30, 2 << 30)
         );
         // The first real sample opens the window: still null.
-        assert_eq!(probe.sample(at(start)).used_percent, None);
+        assert_eq!(probe.sample(at(start)).1, None);
         // Inside the minimum interval no CPU sample is requested.
         if !min.is_zero() {
-            assert_eq!(probe.sample(at(start)).used_percent, None);
+            assert_eq!(probe.sample(at(start)).1, None);
         }
         // The second sample publishes, rounded to one decimal.
-        assert_eq!(probe.sample(at(tick(1))).used_percent, Some(37.4));
+        let (facts, fresh) = probe.sample(at(tick(1)));
+        assert_eq!(facts.used_percent, Some(37.4));
+        assert_eq!(fresh, Some(37.44));
         // An early read keeps the published value.
         if !min.is_zero() {
-            assert_eq!(probe.sample(at(tick(1))).used_percent, Some(37.4));
+            let (facts, fresh) = probe.sample(at(tick(1)));
+            assert_eq!(facts.used_percent, Some(37.4));
+            assert_eq!(fresh, None);
         }
         // Out-of-range and non-finite samples clear it; a valid one restores it.
-        assert_eq!(probe.sample(at(tick(2))).used_percent, None);
-        assert_eq!(probe.sample(at(tick(3))).used_percent, Some(12.0));
-        assert_eq!(probe.sample(at(tick(4))).used_percent, None);
-        assert_eq!(probe.sample(at(tick(5))).used_percent, None);
+        let (facts, fresh) = probe.sample(at(tick(2)));
+        assert_eq!(facts.used_percent, None);
+        assert_eq!(fresh, None);
+        assert_eq!(probe.sample(at(tick(3))).0.used_percent, Some(12.0));
+        let (facts, fresh) = probe.sample(at(tick(4)));
+        assert_eq!(facts.used_percent, None);
+        assert_eq!(fresh, None);
+        let (facts, fresh) = probe.sample(at(tick(5)));
+        assert_eq!(facts.used_percent, None);
+        assert_eq!(fresh, None);
         let expected = if min.is_zero() {
             vec![true; 7]
         } else {
             vec![true, true, false, true, false, true, true, true, true]
         };
         assert_eq!(probe.source.requested, expected);
+    }
+
+    #[test]
+    fn publish_feeds_history_without_reusing_a_stale_cpu_value() -> Result<(), &'static str> {
+        let step = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.max(SAMPLE_FLOOR);
+        let start = Instant::now();
+        let mut probe = HostProbe::new(ScriptedSource::new(
+            [Some(5.0)]
+                .into_iter()
+                .chain(std::iter::repeat_n(Some(42.5), 30)),
+        ));
+        let (sender, _) = tokio::sync::watch::channel(HostState::Pending);
+        let history = Mutex::new(MinuteHistory::default());
+        for second in 0..60_u32 {
+            publish(
+                &mut probe,
+                &sender,
+                &history,
+                i64::from(second) * 1_000,
+                at(start + step * second),
+            );
+        }
+        // The source has stopped returning CPU readings, but the live host
+        // reading still retains the last published CPU value.
+        for second in 60..120_u32 {
+            publish(
+                &mut probe,
+                &sender,
+                &history,
+                i64::from(second) * 1_000,
+                at(start + step * second),
+            );
+        }
+        let response = json!(
+            Range::Hour
+                .series("atlas", 120_000, &history.lock().unwrap())
+                .map_err(|error| error.code)?
+        );
+        let samples = response["samples"].as_array().unwrap();
+        assert_eq!(&samples[58..], &[json!(42.5), Value::Null]);
+        Ok(())
     }
 
     #[test]
