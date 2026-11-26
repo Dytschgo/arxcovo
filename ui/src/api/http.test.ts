@@ -115,6 +115,29 @@ describe('data endpoints', () => {
     expect((await api.getVm('ubuntu-arm-03')).arch).toBe('arm64');
   });
 
+  test('CPU history uses the host and batch endpoints and checks the returned identity', async () => {
+    const series = {
+      hostId: 'atlas', range: '24h', bucketSeconds: 600,
+      from: '2026-11-25T10:20:00Z', to: '2026-11-26T10:20:00Z',
+      samples: Array<null>(144).fill(null),
+    };
+    const { fetchImpl, calls } = fakeFetch({
+      'GET /api/v1/hosts/atlas/cpu-history': () => json(200, series),
+      'GET /api/v1/hosts/harbor/cpu-history': () => json(200, series),
+      'GET /api/v1/hosts/cpu-history': () => json(200, { series: [series] }),
+    });
+    const api = new HttpApi({ fetch: fetchImpl });
+    expect(await api.getCpuHistory('atlas', '24h')).toEqual(series);
+    expect(await api.listCpuHistory('24h')).toEqual([series]);
+    await expect(api.getCpuHistory('harbor', '24h')).rejects.toMatchObject({ code: 'bad_response' });
+    await expect(api.getCpuHistory('../atlas', '24h')).rejects.toMatchObject({ code: 'invalid_request' });
+    expect(calls.map(call => call.url)).toEqual([
+      '/api/v1/hosts/atlas/cpu-history?range=24h',
+      '/api/v1/hosts/cpu-history?range=24h',
+      '/api/v1/hosts/harbor/cpu-history?range=24h',
+    ]);
+  });
+
   test('activity query parameters are validated and encoded', () => {
     expect(activitySearch()).toBe('limit=20');
     expect(activitySearch({ limit: 5, beforeId: 40, outcome: 'failed', tool: 'run_command', hostId: 'atlas', includeReads: true }))

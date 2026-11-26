@@ -23,6 +23,9 @@ import {
   type ConsoleStatus,
   type ConsoleStream,
   type Credentials,
+  CPU_HISTORY_RANGES,
+  type CpuHistory,
+  type CpuHistoryRange,
   type Host,
   type Session,
   type TerminalCommand,
@@ -49,10 +52,23 @@ export interface StandinOptions {
   vms?: Vm[];
   activity?: ActivityEntry[];
   /** Force a method to reject, for error-state tests. */
-  failures?: Partial<Record<'logout' | 'listHosts' | 'getHost' | 'listActivity' | 'listVms' | 'getVm' | 'openTerminal' | 'openConsole', ApiError>>;
+  failures?: Partial<Record<'logout' | 'listHosts' | 'getHost' | 'getCpuHistory' | 'listCpuHistory' | 'listActivity' | 'listVms' | 'getVm' | 'openTerminal' | 'openConsole', ApiError>>;
 }
 
 const clone = <T,>(v: T): T => structuredClone(v);
+
+function emptyCpuHistory(hostId: string, range: CpuHistoryRange): CpuHistory {
+  const { bucketSeconds, points } = CPU_HISTORY_RANGES[range];
+  const width = bucketSeconds * 1000;
+  const lastMinuteEnd = Math.floor(FIXTURE_NOW / 60_000) * 60_000;
+  const end = Math.ceil(lastMinuteEnd / width) * width;
+  return {
+    hostId, range, bucketSeconds,
+    from: new Date(end - points * width).toISOString(),
+    to: new Date(end).toISOString(),
+    samples: Array<null>(points).fill(null),
+  };
+}
 
 export class StandinApi implements ArxApi {
   readonly kind = 'standin' as const;
@@ -147,6 +163,23 @@ export class StandinApi implements ArxApi {
       const host = this.opts.hosts.find(h => h.id === id);
       if (!host) throw new ApiError('not_found', `No host named ${id}.`, 404);
       return clone(host);
+    });
+  }
+
+  getCpuHistory(hostId: string, range: CpuHistoryRange): Promise<CpuHistory> {
+    return this.delay(() => {
+      this.guard('getCpuHistory');
+      if (!Object.hasOwn(CPU_HISTORY_RANGES, range)) throw new ApiError('invalid_request', 'Invalid CPU history range.');
+      if (!this.opts.hosts.some(host => host.id === hostId)) throw new ApiError('not_found', `No host named ${hostId}.`, 404);
+      return emptyCpuHistory(hostId, range);
+    });
+  }
+
+  listCpuHistory(range: '24h'): Promise<CpuHistory[]> {
+    return this.delay(() => {
+      this.guard('listCpuHistory');
+      if (range !== '24h') throw new ApiError('invalid_request', 'The CPU history batch requires a 24h range.');
+      return this.opts.hosts.map(host => emptyCpuHistory(host.id, range));
     });
   }
 
