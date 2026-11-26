@@ -1164,6 +1164,7 @@ impl LiveLaunch for FixtureLaunch {
         _authority: crate::vm::runtime::ScriptAuthority,
         _script: String,
         _timeout_s: u32,
+        _deadline: Instant,
         _cancel: &Shutdown,
         _refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(arx_guest::ScriptStatus, Option<u32>), NativeRefusal> {
@@ -1628,8 +1629,9 @@ async fn script_qmp(stream: DuplexStream) {
 }
 
 /// A known fixture child whose guest channel passed the real readiness
-/// handshake. Its script exchange does not observe cancellation, as if
-/// blocked in pipe I/O, so only the owner's own bound can interrupt it.
+/// handshake. Its script exchange observes neither cancellation nor the
+/// worker deadline, as if blocked in pipe I/O, so only the owner's own
+/// bounds can end it early.
 /// After the first verified ping, periodic pings check liveness only, so
 /// the test's authenticated reads never contend with a monitor sample.
 struct ScriptLaunch {
@@ -1692,6 +1694,7 @@ impl LiveLaunch for ScriptLaunch {
         _authority: crate::vm::runtime::ScriptAuthority,
         script: String,
         timeout_s: u32,
+        _deadline: Instant,
         _cancel: &Shutdown,
         _refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(arx_guest::ScriptStatus, Option<u32>), NativeRefusal> {
@@ -2258,4 +2261,60 @@ async fn a_script_admitted_as_its_run_is_lost_is_settled_not_stranded() {
     assert_eq!(vm_state(&h, run.vm), 3);
     drop(supervisor);
     finish_script_test(h, vec![client], run).await;
+}
+
+#[tokio::test]
+async fn a_script_past_its_admitted_deadline_withdraws_and_tears_down() {
+    // A 1 s script is admitted with a 1 s + 5 s worker deadline while the
+    // run is busy in a ping, so its exchange starts late. Either its typed
+    // reply would land after that deadline, or its authorization expires in
+    // the queue. Both receipts can only settle as unconfirmed, so the run
+    // must withdraw and tear down at the deadline instead of serving on.
+    for (number, held_past_deadline) in [(630, false), (635, true)] {
+        let h = windows_harness().await;
+        let client = h.client(0).await;
+        let run = script_run(&h, &client, number).await;
+        let supervisor = h.supervisor().clone();
+        run.control.hold_pings.store(true, Ordering::SeqCst);
+        let parked = tokio::time::timeout(Duration::from_secs(20), run.control.ping_hold.wait_entered()).await;
+        assert!(parked.is_ok(), "the run never parked in a ping");
+        let receipt = call(&client, "vm_run_script", run.script(number + 1, "hold", 1)).await;
+        assert_eq!(receipt["ok"], true, "{receipt}");
+        // The worker deadline is at most 6 s after this instant.
+        let admitted = tokio::time::Instant::now();
+        let deadline = admitted + Duration::from_secs(6);
+        if held_past_deadline {
+            tokio::time::sleep_until(deadline + Duration::from_secs(1)).await;
+            assert!(!run.teardown.has_entered());
+            run.control.ping_hold.release();
+        } else {
+            // Dispatch at +4 s: the exchange's own 6 s bound would run to
+            // +10 s, past the worker deadline at +6 s.
+            tokio::time::sleep_until(admitted + Duration::from_secs(4)).await;
+            run.control.ping_hold.release();
+            let held = tokio::time::timeout(Duration::from_secs(1), run.control.held.wait_entered()).await;
+            assert!(held.is_ok(), "the guest never received the script");
+        }
+        // Teardown starts at the deadline, well before the exchange's own
+        // bound at +10 s, without any read prompting it.
+        let entered = tokio::time::timeout_at(
+            admitted + Duration::from_secs(9),
+            run.teardown.wait_entered(),
+        ).await;
+        assert!(entered.is_ok(), "held={held_past_deadline}: the run served on past the deadline");
+        assert!(!run.control.replied.load(Ordering::SeqCst));
+        let blocked = call(&client, "vm_get", run.args.clone()).await;
+        assert_eq!(blocked["ready"], false, "{blocked}");
+        assert!(blocked.get("native_boot_witness").is_none());
+        let script = operation(&client, &receipt).await;
+        assert_eq!(script["state"], "interrupted", "held={held_past_deadline}: {script}");
+        assert!(script.get("script_status").is_none(), "{script}");
+        let reason = if held_past_deadline { "cancelled" } else { "execution_unknown" };
+        assert_eq!(script["reason"], reason, "{script}");
+        assert_eq!(run.control.received().len(), usize::from(!held_past_deadline));
+        run.released(&h, &supervisor).await;
+        assert_eq!(vm_state(&h, run.vm), 3);
+        drop(supervisor);
+        finish_script_test(h, vec![client], run).await;
+    }
 }

@@ -937,7 +937,7 @@ impl<'a> NativeLaunch<'a> {
         cancel: &Shutdown,
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
-        self.guest_exchange(GuestRequest::Ping, cancel, refresh)
+        self.guest_exchange(GuestRequest::Ping, None, cancel, refresh)
             .await
             .map(|_| ())
     }
@@ -947,12 +947,14 @@ impl<'a> NativeLaunch<'a> {
     /// A typed guest result, including a nonzero exit or the guest's own
     /// timeout, is returned as is. Any transport failure returns before
     /// teardown, like [`Self::ping`], so the owner withdraws the witness
-    /// first and settles the same launch.
+    /// first and settles the same launch. The exchange never outlasts
+    /// `deadline`, the admitted worker's own cutoff.
     pub(crate) async fn run_script(
         &mut self,
         authority: crate::vm::runtime::ScriptAuthority,
         script: String,
         timeout_s: u32,
+        deadline: Instant,
         cancel: &Shutdown,
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(ScriptStatus, Option<u32>), NativeRefusal> {
@@ -964,14 +966,20 @@ impl<'a> NativeLaunch<'a> {
         ) {
             return Err(NativeRefusal::QualificationMissing);
         }
-        self.guest_exchange(GuestRequest::Script(script, timeout_s), cancel, refresh)
-            .await?
-            .ok_or(NativeRefusal::GuestEndpointUnverified)
+        self.guest_exchange(
+            GuestRequest::Script(script, timeout_s),
+            Some(deadline),
+            cancel,
+            refresh,
+        )
+        .await?
+        .ok_or(NativeRefusal::GuestEndpointUnverified)
     }
 
     async fn guest_exchange(
         &mut self,
         request: GuestRequest,
+        cap: Option<Instant>,
         cancel: &Shutdown,
         mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<Option<(ScriptStatus, Option<u32>)>, NativeRefusal> {
@@ -982,7 +990,10 @@ impl<'a> NativeLaunch<'a> {
                 u64::from(*timeout) + crate::vm::guest::SCRIPT_EXCHANGE_SLACK.as_secs()
             }
         };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        let mut deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        if let Some(cap) = cap {
+            deadline = deadline.min(cap.into());
+        }
         match self.live.as_deref_mut() {
             Some((_, guest)) if !cancel.is_cancelled() => {
                 monitor_running(

@@ -555,13 +555,15 @@ pub(super) trait LiveLaunch {
     ) -> Result<(), NativeRefusal>;
 
     /// One script under an authority consumed for exactly these bytes and
-    /// this timeout. A typed guest result is `Ok`; any transport failure
-    /// returns before teardown.
+    /// this timeout, never outlasting the admitted worker `deadline`. A
+    /// typed guest result is `Ok`; any transport failure returns before
+    /// teardown.
     async fn run_script(
         &mut self,
         authority: ScriptAuthority,
         script: String,
         timeout_s: u32,
+        deadline: Instant,
         cancel: &Shutdown,
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(ScriptStatus, Option<u32>), NativeRefusal>;
@@ -603,10 +605,14 @@ impl<'a> LiveLaunch for NativeLaunch<'a> {
         authority: ScriptAuthority,
         script: String,
         timeout_s: u32,
+        deadline: Instant,
         cancel: &Shutdown,
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(ScriptStatus, Option<u32>), NativeRefusal> {
-        NativeLaunch::run_script(self, authority, script, timeout_s, cancel, refresh).await
+        NativeLaunch::run_script(
+            self, authority, script, timeout_s, deadline, cancel, refresh,
+        )
+        .await
     }
 
     async fn stop(&mut self) -> Option<Self::Proof> {
@@ -985,8 +991,9 @@ impl Run {
 
     /// One admitted script on the owned channel, authorized at dispatch.
     /// Returns whether the channel is still verified. A stop, drain or loss
-    /// interrupts the exchange within [`SCRIPT_INTERRUPT`], and a result
-    /// counts only if the run is still current after it arrived.
+    /// interrupts the exchange within [`SCRIPT_INTERRUPT`], the admitted
+    /// worker deadline caps it, and a result counts only if it arrived
+    /// before that deadline with the run still current.
     async fn dispatch<L: LiveLaunch>(
         &self,
         supervisor: &Supervisor,
@@ -1000,6 +1007,7 @@ impl Run {
             script,
             timeout_s,
         } = job;
+        let deadline = worker.deadline();
         let Target {
             generation, epoch, ..
         } = self.target;
@@ -1012,31 +1020,40 @@ impl Run {
             .ok()
             .filter(|authority| authority.names(generation, epoch, &script, timeout_s));
         let Some(authority) = authority else {
-            // Nothing reached the guest; the channel stays verified.
+            // Nothing reached the guest. The channel stays verified unless
+            // the receipt can only settle past its deadline.
+            let within = self.within(deadline);
             self.settle_script(supervisor, worker, Settlement::Cancelled);
-            return true;
+            return within && self.within(deadline);
         };
         let result = {
-            let exchange = launch.run_script(authority, script, timeout_s, &self.cancel, || {
-                self.observe_run(supervisor, true, revoked)
-            });
+            let exchange =
+                launch.run_script(authority, script, timeout_s, deadline, &self.cancel, || {
+                    self.observe_run(supervisor, true, revoked)
+                });
             tokio::pin!(exchange);
             tokio::select! {
                 biased;
                 result = &mut exchange => result,
                 () = self.interrupted(supervisor) => Err(NativeRefusal::GuestEndpointUnverified),
+                () = tokio::time::sleep_until(deadline.into()) => Err(REFUSED),
             }
         };
-        // The terminal cutoff: a stop, revocation or lost run after the
-        // final sample suppresses the result.
+        // The terminal cutoff: the worker deadline, or a stop, revocation or
+        // lost run after the final sample, suppresses the result.
         let result = result
-            .and_then(|result| self.observe_run(supervisor, true, revoked).map(|_| result))
+            .and_then(|result| {
+                if Instant::now() >= deadline {
+                    return Err(REFUSED);
+                }
+                self.observe_run(supervisor, true, revoked).map(|_| result)
+            })
             .ok()
             .and_then(|(status, code)| guest_result(status, code));
         match result {
             Some(result) => {
                 self.settle_script(supervisor, worker, Settlement::Guest(result));
-                true
+                self.within(deadline)
             }
             None => {
                 // Withdraw at loss detection, before the receipt or teardown.
@@ -1051,6 +1068,17 @@ impl Run {
                 false
             }
         }
+    }
+
+    /// A receipt settled at or after its admitted deadline is recorded as
+    /// unconfirmed and takes the VM into recovery, so the channel no longer
+    /// counts as verified: withdraw before teardown.
+    fn within(&self, deadline: Instant) -> bool {
+        let within = Instant::now() < deadline;
+        if !within {
+            self.withdraw();
+        }
+        within
     }
 
     async fn interrupted(&self, supervisor: &Supervisor) {
