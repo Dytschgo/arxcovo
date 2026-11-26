@@ -2087,6 +2087,48 @@ pub(crate) fn settle_clone(
     Ok(status)
 }
 
+/// Whether a native TEST clone's custody holds exactly this verified pair:
+/// a bound clone-origin workspace with no disposal progress, and both slots
+/// verified as these objects with these contents (7c 11).
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+)]
+pub(crate) fn native_clone_verified(
+    db: &Connection,
+    pair: PairSlots,
+    proof: [ArtifactEvidence; 2],
+) -> Result<bool> {
+    use native::disposal::{GenerationDisposal, GenerationState, generation_state};
+    let GenerationState::Bound {
+        scope,
+        disposal: GenerationDisposal::None,
+    } = generation_state(db, pair.disk.generation)?
+    else {
+        return Ok(false);
+    };
+    if count(
+        db,
+        "SELECT count(*) FROM vm_native_generations WHERE generation=?1 AND origin='clone'",
+        [scope.generation],
+    )? != 1
+    {
+        return Ok(false);
+    }
+    for (slot, evidence) in [(pair.disk, proof[0]), (pair.vars, proof[1])] {
+        if slot.generation != scope.generation
+            || evidence.directory != scope.workspace.file
+            || evidence.identity.volume != scope.production.volume
+            || native::leaf(db, slot)?
+                != native::Leaf::Verified(evidence.identity.file, evidence.pin)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn abandon_inactive(db: &Connection, generation: Option<Id>) -> Result<()> {
     // Identity is custody evidence, never evidence that a process exited.
     // Keep every charge and never publish an incomplete generation.

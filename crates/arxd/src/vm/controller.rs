@@ -2716,6 +2716,41 @@ impl<C: Clock> VmController<C> {
         Ok(true)
     }
 
+    /// Settles a native TEST clone (7c 11). The pair publishes only when its
+    /// ledger custody is a bound clone workspace holding both slots verified
+    /// as exactly these objects and contents, and the existing timeliness
+    /// rules hold. Anything else abandons the staging generation to the
+    /// shared disposal route with its claim retained.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+    )]
+    pub(crate) fn finish_native_clone(
+        &self,
+        worker: &PendingOperation,
+        slots: PairSlots,
+        outcome: Result<[ArtifactEvidence; 2], FailureReason>,
+    ) -> Result<Status> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let clock = self.clock.now();
+            let (proof, cause) = match outcome {
+                Ok(pair) if store::native_clone_verified(db, slots, pair)? => (Some(pair), None),
+                Ok(_) => (None, Some(FailureReason::CloneFailed)),
+                Err(cause) => (None, Some(cause)),
+            };
+            store::settle_clone(
+                db,
+                worker.activity_id,
+                slots,
+                proof,
+                clock.monotonic < worker.deadline,
+                utc(clock)?,
+                cause,
+            )
+        })
+    }
+
     /// Recovery needs exact durable TEST custody, not a fresh selection: the
     /// bound native workspace scope of a non-static generation. A generation
     /// with writer history needs its exact unresolved writer epoch. Only a
