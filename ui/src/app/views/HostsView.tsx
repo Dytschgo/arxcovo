@@ -104,7 +104,7 @@ export function HostsView() {
               <div className="board" role="region" aria-label="Hosts board" tabIndex={0}>
                 <ul className="board-cols" aria-label="Hosts" style={{ '--cols': board.columns.length } as CSSProperties}>
                   {board.columns.map(({ host, vms: shown, allocated }) => (
-                    // No opacity entrance: text stays at full contrast in every frame.
+                    // No fade-in entrance: text stays at full contrast in every frame.
                     <li key={host.id} className="col" data-reachability={host.reachability}>
                       <div className="col-h">
                         <div className="col-t">
