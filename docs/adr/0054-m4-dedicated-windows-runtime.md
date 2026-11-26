@@ -1576,8 +1576,12 @@ handle custody:
   production root and generation guard held, opens the exact generation
   directory via `open_relative_delete`, re-verifies identity, case, private ACL
   and empty listing, deletes it by handle, confirms final absence through the
-  held production root, and commits `disposal = 'absent'`. Unexpected extra
-  siblings refuse before lease deletion and before directory deletion.
+  held production root, and commits `disposal = 'absent'`. On retry or restart,
+  every resumed `'lease'` or `'directory'` deletion first re-commits the
+  idempotent `intend_lease_disposal` or `intend_directory_disposal` transition
+  so the current `DisposalScope` is re-checked immediately before each handle
+  delete. Unexpected extra siblings refuse before lease deletion and before
+  directory deletion.
 - **Settlement and authority fences.** Final ledger settlement (`settle_cleanup`,
   `forget_generation` and `publish_build`) revalidates the work and durable
   `disposal = 'absent'` proof before freeing eligible claims or removing native
