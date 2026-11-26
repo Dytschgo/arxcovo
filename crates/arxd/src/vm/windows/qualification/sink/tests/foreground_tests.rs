@@ -2,6 +2,216 @@ use super::*;
 use crate::vm::windows::qualification::foreground::ReadDossier;
 
 #[test]
+fn docker_dossier_reads_only_its_own_class_and_exact_rows() {
+    use records::*;
+    let work = tempfile::tempdir().unwrap();
+    let (path, dir) = claimed(work.path(), &[]);
+    let (test_dependencies, _, test_bundle) = complete_test_fixture(&dir);
+    let build = crate::vm::public_egress::REVIEWED_EGRESS_BUILDS[0];
+    let recipe = DockerRecipe {
+        identity: DockerRecipe::identity([9; 32]),
+        web: [8; 32],
+        closure: [9; 32],
+        medium: [10; 32],
+    };
+    let mut dependencies = DockerDependencies {
+        supervisor_image: [1; 32],
+        host: HostDependency {
+            windows_build: 26_100,
+            windows_revision: 1,
+            machine: [1; 16],
+        },
+        owner_logon: [2; 32],
+        production_store: [3; 32],
+        disposable_store: [4; 32],
+        profile: [5; 32],
+        installer: [6; 32],
+        firmware: [7; 32],
+        recipe,
+        compose_protocol: arx_guest::compose::COMPOSE_PROTOCOL_VERSION,
+        origin_profile: [11; 32],
+        manifest: [12; 32],
+        executable: build.qemu.sha256,
+        receipt: build.receipt.sha256,
+        loaded_artifacts: [13; 32],
+        policy: [14; 32],
+        topology: [15; 32],
+    };
+    let test_seal: Seal = decode(&test_bundle.seal).unwrap();
+    let binding = Binding {
+        class: Class::Docker,
+        dependencies: dependencies.key(dir.scope()).unwrap(),
+        ..test_seal.binding
+    };
+    let baseline: Vec<Record> = test_bundle
+        .files
+        .iter()
+        .flat_map(|(_, bytes)| decode::<Vec<Record>>(bytes).unwrap())
+        .collect();
+    let bundle = |policy| {
+        let mut prior = [0; 32];
+        let rows: Vec<_> = stages(Class::Docker)
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, stage)| {
+                let result = match stage {
+                    Stage::Distribution => Observation::DockerDistribution {
+                        manifest: [12; 32],
+                        executable: build.qemu.sha256,
+                        receipt: build.receipt.sha256,
+                        loaded_artifacts: [13; 32],
+                    },
+                    Stage::DockerRecipe => Observation::DockerRecipeVerified {
+                        recipe,
+                        restricted_install: true,
+                        detached_health: true,
+                        independent_pair: true,
+                    },
+                    Stage::PublicIpv4Network => Observation::DockerPublicIpv4 {
+                        policy,
+                        topology: [15; 32],
+                        receiver_controls: true,
+                        public_tcp_udp: true,
+                        nonpublic_denied: true,
+                        ipv6_icmp_denied: true,
+                        route_drift_denied: true,
+                    },
+                    Stage::InstalledGuestEndpoint => Observation::DockerInstalledEndpoint {
+                        recipe: recipe.identity,
+                        compose_protocol: arx_guest::compose::COMPOSE_PROTOCOL_VERSION,
+                        exact_pipe_peer: true,
+                        pinned_origin_tls: true,
+                        clean_stop: true,
+                    },
+                    _ => {
+                        let row = baseline.iter().find(|row| row.stage == stage).unwrap();
+                        let StageResult::Passed(result) = &row.result else {
+                            unreachable!()
+                        };
+                        result.clone()
+                    }
+                };
+                let row = Record {
+                    contract: CONTRACT,
+                    collector: COLLECTOR,
+                    origin: Origin::Native,
+                    binding,
+                    stage,
+                    started_ms: i as u64 * 100,
+                    finished_ms: i as u64 * 100 + 16,
+                    prior,
+                    result: StageResult::Passed(result),
+                };
+                prior = digest(&canonical(&row).unwrap());
+                row
+            })
+            .collect();
+        produce_bundle(Origin::Native, binding, &rows, NOW.utc).unwrap()
+    };
+    let good = bundle(dependencies.policy);
+    let wrong_policy = bundle([99; 32]);
+    for (kind, bytes) in &good.files {
+        dir.commit(&kind.name(), bytes).unwrap();
+    }
+    dir.commit(COMPLETE, &good.seal).unwrap();
+    let selection = DockerSelection {
+        seal_sha256: digest(&good.seal),
+        scope: dir.scope(),
+    };
+    let now = TEST_BOOT.on_boot(NOW).unwrap();
+    let fresh = DockerFresh {
+        now,
+        boot_marker: TEST_BOOT.marker,
+        dependencies: &dependencies,
+    };
+    let (user, _) = user();
+    let dossier = crate::vm::windows::qualification::static_compose::StaticDossier::open(
+        &path,
+        sid(&user),
+        &selection,
+        &fresh,
+    )
+    .unwrap();
+    assert_eq!(dossier.evidence.recipe(), recipe);
+    assert!(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(
+                path.join(&FileKind::NetworkPublicIpv4.name())
+                    .unwrap()
+                    .as_str()
+            )
+            .is_err()
+    );
+
+    let read = |bundle: &SealBundle, fresh: &DockerFresh<'_>| {
+        read_native_docker(
+            bundle.seal.as_slice(),
+            bundle.seal.len() as u64,
+            |kind| {
+                bundle
+                    .files
+                    .iter()
+                    .find(|(file, _)| *file == kind)
+                    .map(|(_, data)| data.as_slice())
+                    .ok_or(RunError::Output)
+            },
+            &DockerSelection {
+                seal_sha256: digest(&bundle.seal),
+                ..selection
+            },
+            fresh,
+        )
+    };
+    assert_eq!(read(&wrong_policy, &fresh).err(), Some(RunError::Untrusted));
+    assert_eq!(read(&test_bundle, &fresh).err(), Some(RunError::Untrusted));
+    assert!(
+        read(
+            &good,
+            &DockerFresh {
+                boot_marker: [99; 32],
+                ..fresh
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        read(
+            &good,
+            &DockerFresh {
+                now: Instant2 {
+                    utc: binding.expires_utc,
+                    mono_ms: now.mono_ms + MAX_VALIDITY * 1000
+                },
+                ..fresh
+            }
+        )
+        .is_err()
+    );
+    let test_fresh = Fresh {
+        now,
+        boot_marker: TEST_BOOT.marker,
+        dependencies: &test_dependencies,
+    };
+    assert!(
+        read_native::<&[u8]>(
+            good.seal.as_slice(),
+            good.seal.len() as u64,
+            |_| panic!("wrong class opened a row"),
+            &Selection {
+                seal_sha256: selection.seal_sha256,
+                scope: selection.scope
+            },
+            &test_fresh,
+        )
+        .is_err()
+    );
+    dependencies.executable = crate::vm::public_egress::STOCK_QEMU_1113.sha256;
+    assert!(dependencies.key(dir.scope()).is_none());
+}
+
+#[test]
 fn existing_dossier_retains_read_only_seal_and_every_row() {
     let work = tempfile::tempdir().unwrap();
     let (path, dir) = claimed(work.path(), &[]);

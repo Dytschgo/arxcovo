@@ -98,6 +98,8 @@ pub enum ArtifactRole {
     UbuntuCidata,
     UbuntuKernel,
     UbuntuInitrd,
+    /// Read-only offline dependency ISO, usable only by a static Compose installer.
+    ComposeDependencyMedium,
     WindowsInstallIso,
     WindowsAnswerSeed,
     WindowsDriverMedium,

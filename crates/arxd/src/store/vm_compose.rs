@@ -303,6 +303,15 @@ END;
 ";
 
 pub(crate) fn enroll(store: &VmStore, releases: &[Enrollment]) -> Result<()> {
+    enroll_with_backup_targets(store, releases, &[])
+}
+
+pub(crate) fn enroll_with_backup_targets(
+    store: &VmStore,
+    releases: &[Enrollment],
+    targets: &[compose_backup::TargetEnrollment],
+) -> Result<()> {
+    compose_backup::validate_targets(targets)?;
     store.transact(|db| {
         for release in releases {
             let target = &release.target;
@@ -354,6 +363,16 @@ pub(crate) fn enroll(store: &VmStore, releases: &[Enrollment]) -> Result<()> {
                 db.execute("INSERT OR IGNORE INTO vm_compose_release_epochs VALUES(?1,?2,?3,?4,?5)",
                     params![vm, project, release.id, secret.slot, secret.epoch])?;
             }
+        }
+        for target in targets {
+            enroll_backup_target(
+                db,
+                target.vm,
+                &target.project,
+                &target.volume,
+                &target.database,
+                target.max_bytes,
+            )?;
         }
         require_headroom(db)
     })
@@ -841,13 +860,7 @@ pub(crate) fn enroll_backup_target(
     database: &str,
     max_bytes: u64,
 ) -> Result<()> {
-    ensure!(
-        arx_guest::compose::is_project_id(project)
-            && arx_guest::compose_backup::is_volume_slot(volume)
-            && arx_guest::compose_backup::is_db_basename(database)
-            && (1..=arx_guest::compose_backup::MAX_BACKUP_BYTES).contains(&max_bytes),
-        "invalid Compose backup target"
-    );
+    compose_backup::validate_target(project, volume, database, max_bytes)?;
     ensure!(
         count(
             db,

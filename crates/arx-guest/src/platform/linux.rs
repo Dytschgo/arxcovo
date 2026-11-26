@@ -34,8 +34,11 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(1);
 
 pub(crate) fn serve_virtio() -> Result<(), &'static str> {
     let port = open_port().map_err(|_| "virtio setup failed")?;
-    // Compose is served only when the recipe's fixed roots and engine qualify.
-    let compose = qualify_compose();
+    let compose = match compose_finalized() {
+        Ok(false) => None,
+        Ok(true) => Some(qualify_compose().ok_or("Compose guest qualification failed")?),
+        Err(_) => return Err("Compose guest marker refused"),
+    };
     // Design §3: the script runner shares the guest network namespace and has
     // no ingress-isolation witness for UID/GID 65534, so legacy scripts stay
     // disabled on a Compose-qualified guest.
@@ -1062,6 +1065,38 @@ fn invalid() -> io::Error {
 const OPERATION_DRAIN: Duration = Duration::from_secs(30 * 60);
 use std::os::unix::fs::PermissionsExt;
 const ROOT_UID: u32 = 0;
+
+fn compose_finalized() -> io::Result<bool> {
+    match walk_owned_dirs("/etc/arxcovo", ROOT_UID) {
+        Ok(dir) => finalized_marker(dir.as_fd(), ROOT_UID),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn finalized_marker(dir: BorrowedFd<'_>, owner: u32) -> io::Result<bool> {
+    const VALUE: &str = "ubuntu-noble-amd64-compose-v1\n";
+    let file = match open_at(
+        dir,
+        "compose-finalized",
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        0,
+    ) {
+        Ok(file) => File::from(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.uid() != owner
+        || meta.gid() != 0 && owner == ROOT_UID
+        || meta.mode() & 0o022 != 0
+        || bounded_read(file, VALUE.len() as u64)? != VALUE
+    {
+        return Err(invalid());
+    }
+    Ok(true)
+}
 
 fn qualify_compose() -> Option<ComposeService> {
     if effective_uid() != ROOT_UID || verify_engine(compose::DOCKER).is_err() {
@@ -3007,6 +3042,27 @@ mod compose_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn static_compose_marker_refuses_replaced_or_untrusted_files() {
+        use std::os::unix::fs::symlink;
+        let scratch = Scratch::new();
+        let dir = File::open(&scratch.0).unwrap();
+        let marker = scratch.0.join("compose-finalized");
+        let check = || finalized_marker(dir.as_fd(), effective_uid());
+        assert!(!check().unwrap());
+        symlink("missing", &marker).unwrap();
+        assert!(check().is_err());
+        fs::remove_file(&marker).unwrap();
+        fs::write(&marker, "ubuntu-noble-amd64-compose-v1\n").unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(check().unwrap());
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(check().is_err());
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&marker, "ubuntu-noble-amd64-compose-v1\ntrailing").unwrap();
+        assert!(check().is_err());
     }
 
     #[test]

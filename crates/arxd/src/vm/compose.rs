@@ -20,6 +20,9 @@ use tokio::{
     time::{Instant, sleep},
 };
 
+#[cfg(test)]
+mod static_tests;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Target {
     pub vm: Id,
@@ -176,6 +179,15 @@ fn opaque_id(raw: &str) -> Result<Id> {
     Ok(id)
 }
 
+pub(super) fn enrolled_vm_id<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Id, D::Error> {
+    let raw = String::deserialize(value)?;
+    let vm = opaque_id(&raw).map_err(serde::de::Error::custom)?;
+    if vm == [0; 16] {
+        return Err(serde::de::Error::custom("invalid Compose VM binding"));
+    }
+    Ok(vm)
+}
+
 pub(crate) fn nonce() -> Result<Id> {
     let mut id = [0; 16];
     getrandom::fill(&mut id).map_err(|_| anyhow::anyhow!("Compose entropy unavailable"))?;
@@ -286,6 +298,51 @@ pub(crate) struct Session {
     channel: AsyncMutex<ComposeChannel>,
 }
 
+#[allow(dead_code, reason = "consumed by the Part B static boot transaction")]
+pub(crate) struct PreparedStaticSessions {
+    pub lifecycle: Session,
+    pub backup: super::compose_backup::BackupSession,
+    pub channel: ComposeChannel,
+}
+
+impl PreparedStaticSessions {
+    /// Called with the single attributed pipe after checked boot and TLS
+    /// readiness. Nothing here publishes a session or mutates the ledger.
+    #[allow(dead_code, reason = "consumed by the Part B checked boot")]
+    pub(crate) async fn negotiate(
+        transport: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        origin: &super::runtime::publication::Origin,
+        wire_boot: u64,
+    ) -> Result<Self> {
+        let retired = origin.retired.token();
+        let channel = ComposeChannel::negotiate(transport, wire_boot, retired)
+            .await
+            .map_err(|_| anyhow::anyhow!("static Compose negotiation refused"))?;
+        ensure!(!retired.is_cancelled(), "static Compose boot retired");
+        Ok(Self {
+            lifecycle: Session::for_origin(origin, channel.shared()),
+            backup: super::compose_backup::BackupSession::new(origin.generation, channel.shared()),
+            channel,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrivateRoutes {
+    #[serde(rename = "vm_id", deserialize_with = "enrolled_vm_id")]
+    vm: Id,
+    zone: String,
+    routes: Vec<arx_guest::compose::routing::RouteTarget>,
+}
+
+impl PrivateRoutes {
+    pub(crate) fn validate(&self) -> Result<()> {
+        arx_guest::compose::routing::validate_routes(Some(&self.zone), &self.routes)
+            .map_err(|_| anyhow::anyhow!("invalid private Compose route bindings"))
+    }
+}
+
 #[allow(
     dead_code,
     reason = "reserved for qualified activation and fake peer fixtures"
@@ -315,14 +372,6 @@ impl Session {
             self.generation == intent.generation && self.origin_boot == Some(intent.boot),
             "route session boot mismatch"
         );
-        let mut channel = self
-            .channel
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("guest channel busy"))?;
-        ensure!(
-            db.transact(|tx| store::live_boot(tx, intent.vm, self.generation, self.wire_boot))?,
-            "route session retired"
-        );
         let routes = intent
             .hosts
             .iter()
@@ -334,19 +383,79 @@ impl Session {
                 Ok(slot.target(&host.hostname))
             })
             .collect::<Result<Vec<_>>>()?;
+        self.apply_routes(
+            db,
+            readiness.as_str(),
+            &PrivateRoutes {
+                vm: intent.vm,
+                zone: zone.as_str().into(),
+                routes,
+            },
+            cancel,
+        )
+        .await
+    }
+
+    pub(crate) async fn install_private_routes(
+        &self,
+        db: &crate::store::vm::VmStore,
+        vm: Id,
+        origin: &super::runtime::publication::Origin,
+        routes: &PrivateRoutes,
+    ) -> Result<()> {
+        ensure!(
+            vm == routes.vm
+                && self.generation == origin.generation
+                && self.origin_boot == Some(origin.boot)
+                && !origin.retired.is_retired(),
+            "route session boot mismatch"
+        );
+        let identity =
+            super::static_web::StaticOriginIdentity::for_generation(origin.origin_generation);
+        self.apply_routes(
+            db,
+            identity.provisioning().server_name(),
+            routes,
+            origin.retired.token(),
+        )
+        .await
+    }
+
+    async fn apply_routes(
+        &self,
+        db: &crate::store::vm::VmStore,
+        readiness: &str,
+        routes: &PrivateRoutes,
+        cancel: &Shutdown,
+    ) -> Result<()> {
+        arx_guest::compose::routing::RoutingTable::new(
+            readiness,
+            Some(routes.zone.clone()),
+            arx_guest::compose::routing::SLIRP_FORWARD_PEER,
+            routes.routes.clone(),
+        )
+        .map_err(|_| anyhow::anyhow!("invalid Compose route table"))?;
+        let mut channel = self
+            .channel
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("guest channel busy"))?;
+        let live =
+            || db.transact(|tx| store::live_boot(tx, routes.vm, self.generation, self.wire_boot));
+        ensure!(live()? && !cancel.is_cancelled(), "route session retired");
         let ack = channel
             .exchange(cancel, |id| Req::ComposeInstallRoutes {
                 id,
                 generation: self.wire_boot,
-                readiness_host: readiness.as_str().into(),
-                zone: zone.as_str().into(),
-                routes,
+                readiness_host: readiness.into(),
+                zone: routes.zone.clone(),
+                routes: routes.routes.clone(),
             })
             .await?;
         ensure!(
             matches!(ack, Resp::ComposeRoutesInstalled{generation,..} if generation==self.wire_boot),
             "guest route installation unconfirmed"
         );
+        ensure!(live()? && !cancel.is_cancelled(), "route session retired");
         Ok(())
     }
 

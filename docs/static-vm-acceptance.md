@@ -2,6 +2,16 @@
 
 The local journey checks Calm Life and a synthetic second project through a PID-bound, authenticated foreground MCP session. A separate ignored test drives the public tunnel. Both require a qualified Windows x64 host and the owner's non-elevated login. Native Docker, public-only networking, Windows custody, persistence and Cloudflare publishing remain **unverified on real hardware**. The product gaps below currently prevent a live acceptance claim. See [ADR 0058](adr/0058-v1-scope-static-vms-and-cloudflare.md), [ADR 0064](adr/0064-v1-scope-docker-static-vm.md) and the [M4 host procedure](m4-acceptance.md).
 
+## Native adapter status
+
+The foreground parser recognizes an owner-local `test_vms.static_compose` block. Its presence requires Windows x64 and an independently enrolled store. A configured Compose secret root also requires its own identity pin. This build refuses the static block before opening the store or binding the endpoint. Omit it for existing profiles.
+
+- `selection` carries a separate `enrollment`, `dossier`, `seal_sha256` and `scope` for the Docker class. All seal inputs must come from independent measurements. The TEST dossier has its own selection and grant.
+- Optional `backup` carries an existing owner-private D: `root` and bounded `targets`. Each target has `vm_id`, `project_id`, `volume`, `database` and `max_bytes`. Release and target enrollment use one transaction. Live access also requires an independently held backup root and fresh capacity.
+- Optional `private_routes` carries the enrolled `vm_id`, `zone` and sorted `routes`. Use the same fixed hostname, project, service and slot fields as the publication block. Private installation uses the verified origin's serial session and needs no Cloudflare credentials or public setting.
+
+Live acceptance still requires the Docker-class collector and disposable witness, reviewed signed closure, co-pinned roots, native static issuer, checked boot and route monitoring, and durable boot and recovery integration. The selected recipe ID derives from the Compose recipe class and digest. Its sealed template is ineligible for a TEST clone. Owner steps below apply after live activation is available.
+
 ## Enroll a dedicated acceptance VM
 
 1. Complete M4 host setup, independently review the M4 and patched public-egress qualification receipts, and qualify the digest-pinned Calm Life release. Prepare a new isolated state directory on D: and enroll its volume and directory identities using the M4 procedure. Never select an existing owner workload for this journey.

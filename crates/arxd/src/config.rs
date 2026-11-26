@@ -1131,6 +1131,165 @@ pub(crate) struct TestVms {
     compose_secret_root: Option<PathBuf>,
     #[serde(default, deserialize_with = "present")]
     expected_compose_secret_root: Option<Box<ExpectedComposeSecretRoot>>,
+    #[serde(default, deserialize_with = "present")]
+    static_compose: Option<Box<StaticComposeProfile>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticComposeProfile {
+    selection: StaticComposeSelection,
+    #[serde(default, deserialize_with = "present")]
+    backup: Option<StaticComposeBackup>,
+    #[serde(default, deserialize_with = "present")]
+    private_routes: Option<crate::vm::compose::PrivateRoutes>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticComposeSelection {
+    enrollment: String,
+    dossier: String,
+    seal_sha256: String,
+    scope: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticComposeBackup {
+    root: String,
+    targets: Vec<crate::vm::compose_backup::TargetEnrollment>,
+}
+
+impl StaticComposeProfile {
+    fn validate(&self) -> Result<()> {
+        let path = |raw: &str| {
+            let path = crate::vm::paths::LocalPath::parse(raw)
+                .map_err(|_| anyhow::anyhow!("invalid static Compose path"))?;
+            anyhow::ensure!(!path.is_drive_root(), "invalid static Compose path");
+            Ok(path)
+        };
+        let enrollment = path(&self.selection.enrollment)?;
+        let dossier = path(&self.selection.dossier)?;
+        anyhow::ensure!(
+            !enrollment.overlaps(&dossier),
+            "static Compose path overlap"
+        );
+        self.selection.pins()?;
+        if let Some(backup) = &self.backup {
+            let root = path(&backup.root)?;
+            anyhow::ensure!(
+                root.as_str().as_bytes()[0].eq_ignore_ascii_case(&b'D')
+                    && !backup.targets.is_empty(),
+                "invalid static Compose backup profile"
+            );
+            crate::vm::compose_backup::validate_targets(&backup.targets)?;
+        }
+        if let Some(routes) = &self.private_routes {
+            routes.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl StaticComposeSelection {
+    fn pins(&self) -> Result<crate::vm::qualification_record::DockerSelection> {
+        let hash = |text: &str| {
+            let mut bytes = [0; 32];
+            anyhow::ensure!(
+                text.len() == 64
+                    && text
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    && hex::decode_to_slice(text, &mut bytes).is_ok()
+                    && bytes != [0; 32],
+                "invalid static Compose selection"
+            );
+            Ok(bytes)
+        };
+        Ok(crate::vm::qualification_record::DockerSelection {
+            seal_sha256: hash(&self.seal_sha256)?,
+            scope: hash(&self.scope)?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod static_compose_profile_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn static_compose_activation_is_closed_before_opening_state() {
+        let selection = json!({
+            "enrollment": "D:/qualification/enrollment.json",
+            "dossier": "D:/qualification/dossier",
+            "seal_sha256": "aa".repeat(32),
+            "scope": "bb".repeat(32),
+        });
+        let mut raw = json!({
+            "enabled": true,
+            "expected_store": {
+                "volume_guid": "fixture", "volume_serial": "fixture", "directory_file_id": "fixture"
+            },
+            "static_compose": {
+                "selection": selection,
+                "backup": {
+                    "root": "D:/private/backup",
+                    "targets": [{
+                        "vm_id": "aa".repeat(16), "project_id":"app", "volume":"data",
+                        "database":"store.sqlite3", "max_bytes":8192
+                    }]
+                }
+            }
+        });
+        let profile: TestVms = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!profile.allow_agent_public_sites);
+        assert!(profile.static_compose.as_ref().unwrap().validate().is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("unused");
+        let endpoint = crate::local::Endpoint {
+            address: "unused".into(),
+            client_identity: "unused".into(),
+        };
+        let error = profile.validate(&state, &endpoint).err().unwrap();
+        let expected = if cfg!(all(windows, target_arch = "x86_64")) {
+            "native static Compose activation is closed"
+        } else {
+            "static Compose requires Windows x64"
+        };
+        assert_eq!(error.to_string(), expected);
+        let mut with_secrets = raw.clone();
+        with_secrets["compose_secret_root"] = json!("D:/private/secrets");
+        let profile: TestVms = serde_json::from_value(with_secrets.clone()).unwrap();
+        assert!(
+            profile
+                .validate(&state, &endpoint)
+                .err()
+                .unwrap()
+                .is::<ComposeCustodyRefusal>()
+        );
+        if cfg!(all(windows, target_arch = "x86_64")) {
+            with_secrets["expected_compose_secret_root"] = json!({
+                "volume_guid": "fixture", "volume_serial": "fixture", "directory_file_id": "secret"
+            });
+            let profile: TestVms = serde_json::from_value(with_secrets).unwrap();
+            assert_eq!(
+                profile
+                    .validate(&state, &endpoint)
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                expected
+            );
+        }
+        assert!(!state.exists());
+        raw["static_compose"]["backup"]["root"] = json!("C:/backup");
+        let profile: TestVms = serde_json::from_value(raw.clone()).unwrap();
+        assert!(profile.static_compose.unwrap().validate().is_err());
+        raw["static_compose"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<TestVms>(raw).is_err());
+    }
 }
 
 #[derive(Deserialize)]
@@ -1228,6 +1387,20 @@ impl TestVms {
                 == (self.compose_secret_root.is_some() && self.expected_store.is_some()),
             ComposeCustodyRefusal
         );
+        if let Some(profile) = &self.static_compose {
+            anyhow::ensure!(
+                cfg!(all(windows, target_arch = "x86_64")),
+                "static Compose requires Windows x64"
+            );
+            anyhow::ensure!(
+                self.expected_store.is_some(),
+                "static Compose requires an enrolled VM store"
+            );
+            profile.validate()?;
+            // Part B must supply the static issuer, rooted custody and live monitor.
+            bail!("native static Compose activation is closed");
+        }
+
         let layout = crate::service::layout::Layout::system()?;
         let reserved = layout.endpoint().to_string_lossy();
         anyhow::ensure!(

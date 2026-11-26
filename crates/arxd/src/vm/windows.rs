@@ -2491,7 +2491,13 @@ impl<'a> CheckedLaunchCore<'a> {
         let kind = inputs.plan.kind();
         // ADR 0064: a public-egress plan also stays closed until its patched
         // build, policy custody and route evidence have native qualification.
-        if matches!(kind, PlanKind::StaticWebBoot | PlanKind::PublicEgressBoot) {
+        if matches!(
+            kind,
+            PlanKind::StaticWebBoot
+                | PlanKind::PublicEgressBoot
+                | PlanKind::StaticComposeInstaller
+                | PlanKind::StaticComposeDetached
+        ) {
             return Err(NativeRefusal::NetworkFenceUnverified);
         }
         match (kind, inputs.installer) {

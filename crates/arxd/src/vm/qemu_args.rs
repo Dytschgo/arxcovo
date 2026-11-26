@@ -50,6 +50,8 @@ pub enum StaticNetwork<'a> {
 #[derive(Clone, Copy)]
 pub enum BootPurpose<'a> {
     Installed,
+    /// Restricted disk-only verification and provisioning before publication.
+    DetachedStaticCompose,
     InstalledStaticWeb(&'a OriginPortLease, StaticNetwork<'a>),
     UbuntuInstall {
         iso: &'a Artifact,
@@ -68,7 +70,7 @@ pub enum BootPurpose<'a> {
 impl BootPurpose<'_> {
     fn phase(self) -> Option<InstallerPhase> {
         match self {
-            Self::Installed | Self::InstalledStaticWeb(..) => None,
+            Self::Installed | Self::DetachedStaticCompose | Self::InstalledStaticWeb(..) => None,
             Self::UbuntuInstall { .. } => Some(InstallerPhase::UbuntuInstall),
             Self::WindowsSetup { .. } => Some(InstallerPhase::WindowsSetup),
             Self::WindowsFinalize => Some(InstallerPhase::WindowsFinalize),
@@ -104,6 +106,9 @@ pub enum PlanKind {
     PublicEgressBoot,
     /// A QMP-only installer or finalization recipe.
     InstallerBoot(InstallerPhase),
+    /// Offline static Compose install. Never a TEST installer phase.
+    StaticComposeInstaller,
+    StaticComposeDetached,
     /// Read-only qemu-img inspection of the immutable golden image.
     Inspect,
     /// qemu-img inspection of a writable image, bound to an offline lease.
@@ -131,6 +136,8 @@ enum Binding<'a> {
         image: &'a Artifact,
     },
     Installer(InstallerPhase, Vec<InstallerArtifact<'a>>),
+    StaticComposeInstaller(Vec<InstallerArtifact<'a>>),
+    StaticComposeDetached,
     Inspect,
     #[cfg(all(windows, target_arch = "x86_64"))]
     QualifierCreate,
@@ -171,6 +178,8 @@ impl<'a> CommandPlan<'a> {
             Binding::StaticWeb(_) => PlanKind::StaticWebBoot,
             Binding::PublicEgress { .. } => PlanKind::PublicEgressBoot,
             Binding::Installer(phase, _) => PlanKind::InstallerBoot(phase),
+            Binding::StaticComposeInstaller(_) => PlanKind::StaticComposeInstaller,
+            Binding::StaticComposeDetached => PlanKind::StaticComposeDetached,
             Binding::Inspect => PlanKind::Inspect,
             #[cfg(all(windows, target_arch = "x86_64"))]
             Binding::QualifierCreate => PlanKind::QualifierCreate,
@@ -213,6 +222,8 @@ impl<'a> CommandPlan<'a> {
             | Binding::StaticWeb(_)
             | Binding::PublicEgress { .. }
             | Binding::Installer(..)
+            | Binding::StaticComposeInstaller(_)
+            | Binding::StaticComposeDetached
             | Binding::Inspect => None,
         }
     }
@@ -225,7 +236,9 @@ impl<'a> CommandPlan<'a> {
 
     pub fn installer_artifacts(&self) -> &[InstallerArtifact<'a>] {
         match &self.binding {
-            Binding::Installer(_, artifacts) => artifacts,
+            Binding::Installer(_, artifacts) | Binding::StaticComposeInstaller(artifacts) => {
+                artifacts
+            }
             _ => &[],
         }
     }
@@ -509,11 +522,43 @@ impl BootRecipe<'_> {
     /// violation. The disk may reference only the approved golden, the golden
     /// must be unbacked, and neither may name an external data file.
     pub fn plan(&self) -> Result<CommandPlan<'_>, InvalidPath> {
+        self.plan_with_medium(None)
+    }
+
+    /// Build the restricted install argv for a qualified static Compose
+    /// recipe. The separate native checked-create edge remains closed.
+    pub fn static_compose_installer<'a>(
+        &'a self,
+        medium: &'a Artifact,
+    ) -> Result<CommandPlan<'a>, InvalidPath> {
+        if !matches!(self.boot, BootPurpose::UbuntuInstall { .. })
+            || !medium.pin().is_some_and(|pin| {
+                (1..=super::template::ubuntu_compose::MAX_MEDIUM).contains(&pin.size)
+                    && pin.sha256 != [0; 32]
+            })
+        {
+            return Err(InvalidPath);
+        }
+        self.plan_with_medium(Some(medium))
+    }
+
+    fn plan_with_medium<'a>(
+        &'a self,
+        medium: Option<&'a Artifact>,
+    ) -> Result<CommandPlan<'a>, InvalidPath> {
         use ArtifactRole::*;
         if !(1..=4).contains(&self.vcpus) || !(256..=8192).contains(&self.ram_mib) {
             return Err(InvalidPath);
         }
         let phase = self.boot.phase();
+        let detached_compose = matches!(self.boot, BootPurpose::DetachedStaticCompose);
+        let compose = medium.is_some() || detached_compose;
+        if compose
+            && ((self.vcpus, self.ram_mib) != (2, 4096)
+                || inspect_header(self.disk_header, None).ok() != Some(32 << 30))
+        {
+            return Err(InvalidPath);
+        }
         let static_origin = match self.boot {
             BootPurpose::InstalledStaticWeb(lease, network) if lease.verify() => {
                 Some((lease, network))
@@ -521,13 +566,18 @@ impl BootRecipe<'_> {
             BootPurpose::InstalledStaticWeb(..) => return Err(InvalidPath),
             _ => None,
         };
-        let (disk_role, vars_role) = match (static_origin, phase) {
-            (Some(_), _) => (StaticDisk, StaticVars),
-            (_, Some(InstallerPhase::WindowsSetup)) => (TestInstallDisk, WindowsSetupVars),
-            (_, Some(_)) => (TestInstallDisk, Vars),
-            _ => (GuestDisk, Vars),
+        let (disk_role, vars_role) = if static_origin.is_some() || compose {
+            (StaticDisk, StaticVars)
+        } else {
+            match phase {
+                Some(InstallerPhase::WindowsSetup) => (TestInstallDisk, WindowsSetupVars),
+                Some(_) => (TestInstallDisk, Vars),
+                None => (GuestDisk, Vars),
+            }
         };
-        if (phase.is_some() || static_origin.is_some()) && self.backing.is_some() {
+        if (phase.is_some() || static_origin.is_some() || detached_compose)
+            && self.backing.is_some()
+        {
             return Err(InvalidPath);
         }
         let (network, image_role, nic) = match static_origin {
@@ -653,6 +703,7 @@ impl BootRecipe<'_> {
         );
         let binding = match phase {
             None => match static_origin {
+                None if detached_compose => Binding::StaticComposeDetached,
                 None => Binding::Boot,
                 Some((lease, StaticNetwork::RestrictedOrigin)) => Binding::StaticWeb(lease),
                 Some((lease, StaticNetwork::PublicEgress(policy))) => Binding::PublicEgress {
@@ -673,7 +724,17 @@ impl BootRecipe<'_> {
                     bind(&mut artifacts, artifact, role, role == WindowsSetupVars)?;
                 }
                 self.installer_args(&mut args, &mut artifacts)?;
-                Binding::Installer(phase, artifacts)
+                if let Some(medium) = medium {
+                    let path = bind(&mut artifacts, medium, ComposeDependencyMedium, true)?;
+                    args.extend([
+                        "-device".into(),
+                        "ich9-ahci,id=arxmedia,bus=pcie.0,addr=0x1e".into(),
+                    ]);
+                    cd(&mut args, "arxcompose", path, "arxmedia.0");
+                    Binding::StaticComposeInstaller(artifacts)
+                } else {
+                    Binding::Installer(phase, artifacts)
+                }
             }
         };
         let mut inputs = vec![
@@ -685,6 +746,9 @@ impl BootRecipe<'_> {
         ];
         if let Some(backing) = self.backing {
             inputs.push((Golden, backing.clone()));
+        }
+        if let Some(medium) = medium {
+            inputs.push((ComposeDependencyMedium, medium.clone()));
         }
         if let Binding::PublicEgress { policy, .. } = &binding {
             inputs.push((PublicEgressPolicy, (*policy).clone()));
@@ -772,6 +836,7 @@ impl BootRecipe<'_> {
             }
             BootPurpose::WindowsFinalize
             | BootPurpose::Installed
+            | BootPurpose::DetachedStaticCompose
             | BootPurpose::InstalledStaticWeb(..) => {}
         }
         Ok(())
@@ -856,6 +921,105 @@ mod tests {
 
     fn artifact(role: ArtifactRole, path: &str) -> Artifact {
         Artifact::new(role, LocalPath::parse(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn static_compose_media_is_read_only_and_confined_to_install() {
+        use ArtifactRole::*;
+        let pinned = |role, name, value| {
+            artifact(role, &format!("D:/trial/{name}"))
+                .with_identity(FileIdentity {
+                    volume: 1,
+                    file: [value; 16],
+                })
+                .with_pin(ArtifactPin {
+                    size: 32,
+                    sha256: [value; 32],
+                })
+        };
+        let image = pinned(Qemu, "qemu.exe", 1);
+        let data = pinned(Data, "share", 2);
+        let firmware = pinned(FirmwareCode, "code.fd", 3);
+        let vars = pinned(StaticVars, "vars.fd", 4);
+        let disk = pinned(StaticDisk, "disk.qcow2", 5);
+        let iso = pinned(UbuntuInstallIso, "os.iso", 6);
+        let cidata = pinned(UbuntuCidata, "seed.iso", 7);
+        let kernel = pinned(UbuntuKernel, "kernel", 8);
+        let initrd = pinned(UbuntuInitrd, "initrd", 9);
+        let medium = pinned(ComposeDependencyMedium, "closure.iso", 10);
+        let mut header = header(None);
+        header[24..32].copy_from_slice(&(32u64 << 30).to_be_bytes());
+        let serial = SerialName::generate().unwrap();
+        let mut recipe = BootRecipe {
+            image: &image,
+            data: &data,
+            firmware: &firmware,
+            vars: &vars,
+            disk: &disk,
+            disk_header: &header,
+            backing: None,
+            backing_header: None,
+            serial: &serial,
+            boot: BootPurpose::UbuntuInstall {
+                iso: &iso,
+                cidata: &cidata,
+                kernel: &kernel,
+                initrd: &initrd,
+            },
+            ram_mib: 4096,
+            vcpus: 2,
+        };
+        assert!(
+            recipe.plan().is_err(),
+            "static disk must fail the TEST install plan"
+        );
+        assert!(recipe.static_compose_installer(&iso).is_err());
+        let unheld = artifact(ComposeDependencyMedium, "D:/trial/other.iso");
+        assert!(recipe.static_compose_installer(&unheld).is_err());
+        let colliding = pinned(ComposeDependencyMedium, "closure.iso", 6);
+        assert!(recipe.static_compose_installer(&colliding).is_err());
+        let plan = recipe.static_compose_installer(&medium).unwrap();
+        assert_eq!(plan.kind(), PlanKind::StaticComposeInstaller);
+        assert!(plan.args().iter().any(|arg| arg == NETWORK));
+        assert!(!plan.args().iter().any(|arg| arg.contains("hostfwd")));
+        let block: Value = plan
+            .args()
+            .iter()
+            .filter_map(|arg| serde_json::from_str::<Value>(arg).ok())
+            .find(|arg| arg["node-name"] == "arxcompose")
+            .unwrap();
+        assert_eq!(block["read-only"], true);
+        assert_eq!(block["file"]["read-only"], true);
+        assert_eq!(
+            block["file"]["filename"],
+            medium.path_for(ComposeDependencyMedium).unwrap().as_str()
+        );
+        assert!(plan.installer_artifacts().iter().any(|input| {
+            input.role == ComposeDependencyMedium
+                && input.pin == medium.pin()
+                && Some(input.identity) == medium.identity()
+        }));
+
+        recipe.boot = BootPurpose::DetachedStaticCompose;
+        let plan = recipe.plan().unwrap();
+        assert_eq!(plan.kind(), PlanKind::StaticComposeDetached);
+        assert!(plan.args().iter().any(|arg| arg == NETWORK));
+        assert!(!plan.args().iter().any(|arg| arg.contains("hostfwd")));
+        assert!(
+            plan.args()
+                .iter()
+                .any(|arg| arg.starts_with("pipe,id=arxguest,"))
+        );
+        assert_eq!(
+            plan.inputs()
+                .iter()
+                .map(|(role, _)| *role)
+                .collect::<Vec<_>>(),
+            [Qemu, Data, FirmwareCode, StaticVars, StaticDisk]
+        );
+        assert!(recipe.static_compose_installer(&medium).is_err());
+        recipe.vcpus = 1;
+        assert!(recipe.plan().is_err());
     }
 
     /// An 11.1.x `QCowHeader` (112 bytes, `block/qcow2.h`) with the optional
