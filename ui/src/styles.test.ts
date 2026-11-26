@@ -160,6 +160,19 @@ describe('non-text contrast (3:1)', () => {
     expect(forced).toMatch(/\.check input\s*{\s*appearance:\s*auto;\s*}/);
   });
 
+  test('link underlines keep 3:1: they take the link ink, and any underline colour is an ink token', () => {
+    expect(rule('a').has('text-decoration-color')).toBe(false);
+    const inks = ['ink', 'ink2', 'ink3', 'ink4'];
+    for (const r of rules()) {
+      const colours = [r.decls.get('text-decoration-color'), r.decls.get('text-decoration')]
+        .flatMap(v => (v ? [...v.matchAll(/var\(--([\w-]+)\)|#[0-9a-fA-F]{3,6}/g)].map(m => m[1] ?? m[0]) : []));
+      for (const c of colours) {
+        expect(inks, `${r.selector} underline ${c}`).toContain(c);
+        for (const surface of surfaces) expect(contrast(token(c), token(surface)), `${r.selector} on --${surface}`).toBeGreaterThanOrEqual(3);
+      }
+    }
+  });
+
   test('every focus ring is --ink, which reaches 3:1 on every surface', () => {
     const rings = rules().filter(r => /:focus-visible/.test(r.selector) && /solid|dashed|dotted/.test(r.decls.get('outline') ?? ''));
     expect(rings.length).toBeGreaterThan(0);
