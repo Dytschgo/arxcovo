@@ -307,7 +307,7 @@ pub(crate) struct Supervisor {
     /// reaper and any detached close or recovery hold this supervisor, so a
     /// late store write after an unconfirmed result still runs under the
     /// same namespace guarantee. `None` only for in-module fixtures.
-    root_pin: Option<Box<crate::config::RootPin>>,
+    custody: Option<Arc<crate::config::VmCustody>>,
     /// Blocks final recovery until released; see [`tests::Stall`].
     #[cfg(test)]
     stall_recovery: Mutex<Option<tests::StallHook>>,
@@ -335,7 +335,7 @@ impl Supervisor {
     pub(crate) fn open(
         root: &Path,
         mut profile: TestVms,
-        pin: Box<crate::config::RootPin>,
+        custody: Arc<crate::config::VmCustody>,
     ) -> anyhow::Result<Arc<Self>> {
         let reason = if !profile.enabled {
             NativeRefusal::Disabled
@@ -346,6 +346,7 @@ impl Supervisor {
         };
         let policy = profile.policy();
         let recipe = profile.recipe()?;
+        custody.verify()?;
         let mut supervisor = Self::new(
             root,
             policy,
@@ -359,22 +360,15 @@ impl Supervisor {
         )?;
         let state = Arc::get_mut(&mut supervisor)
             .ok_or_else(|| anyhow::anyhow!("VM supervisor shared before open"))?;
-        if let Some(secret_root) = profile.compose_secret_root.as_deref() {
-            #[cfg(all(windows, target_arch = "x86_64"))]
-            {
-                *state
-                    .compose
-                    .secrets
-                    .get_mut()
-                    .map_err(|_| anyhow::anyhow!("Compose custody unavailable"))? = Some(Arc::new(
-                    crate::vm::compose_secrets::Dpapi::new(secret_root, root)?,
-                ));
-            }
-            #[cfg(not(all(windows, target_arch = "x86_64")))]
-            {
-                let _ = secret_root;
-                anyhow::bail!("Compose secret custody requires Windows x64");
-            }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if custody.has_compose_root() {
+            *state
+                .compose
+                .secrets
+                .get_mut()
+                .map_err(|_| anyhow::anyhow!("Compose custody unavailable"))? = Some(Arc::new(
+                crate::vm::compose_secrets::Dpapi::new(custody.clone()),
+            ));
         }
         if !profile.compose_releases.is_empty() {
             let enrollments = profile
@@ -382,9 +376,10 @@ impl Supervisor {
                 .into_iter()
                 .map(compose::ReleaseInput::enroll)
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            custody.verify()?;
             crate::store::vm::compose::enroll(state.controller.compose_store(), &enrollments)?;
         }
-        state.root_pin = Some(pin);
+        state.custody = Some(custody);
         let gate = state
             .gate
             .get_mut()
@@ -457,7 +452,7 @@ impl Supervisor {
             hold: Mutex::new(None),
             #[cfg(test)]
             closed_connections: Default::default(),
-            root_pin: None,
+            custody: None,
             #[cfg(test)]
             stall_recovery: Mutex::new(None),
             #[cfg(test)]
@@ -473,11 +468,18 @@ impl Supervisor {
         }))
     }
 
-    /// The canonical root still denotes the pinned directory.
-    pub(crate) fn verify_root(&self, root: &Path) -> anyhow::Result<()> {
-        match &self.root_pin {
-            Some(pin) => pin.verify(root),
+    /// The configured roots still denote the held directories.
+    pub(crate) fn verify_roots(&self) -> anyhow::Result<()> {
+        match &self.custody {
+            Some(custody) => custody.verify(),
             None => anyhow::bail!("VM state root not pinned"),
+        }
+    }
+
+    pub(crate) async fn wait_for_root_loss(&self) {
+        match &self.custody {
+            Some(custody) => custody.lost().await,
+            None => std::future::pending().await,
         }
     }
 
@@ -807,7 +809,7 @@ impl Drop for Supervisor {
     /// controller would break that; activation must keep this assertion.
     fn drop(&mut self) {
         debug_assert!(
-            self.root_pin.is_none()
+            self.custody.is_none()
                 || std::thread::panicking()
                 || Arc::strong_count(&self.controller) == 1,
             "a VM store user outlived the pinned state root"

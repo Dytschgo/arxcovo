@@ -1183,6 +1183,15 @@ fn current_user() -> io::Result<Vec<usize>> {
     token_data(&token, TokenUser)
 }
 
+pub(crate) fn require_held_private(file: &File) -> io::Result<()> {
+    let user = current_user()?;
+    if sink::held_private(file, user_sid(&user)) {
+        Ok(())
+    } else {
+        Err(io::Error::other("private owner-only permissions required"))
+    }
+}
+
 fn user_sid(data: &[usize]) -> PSID {
     // TokenUser data begins with a TOKEN_USER that points into the buffer.
     unsafe { (*data.as_ptr().cast::<TOKEN_USER>()).User.Sid }
