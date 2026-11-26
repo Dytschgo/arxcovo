@@ -23,6 +23,7 @@ enum Fault {
     ForeignGuest,
     WrongCompose,
     WrongOrigin,
+    WrongTrustProfile,
     WrongFixture,
     MissingControls,
     ReplayedBoot,
@@ -395,7 +396,11 @@ impl trial::Capture for Capture {
             } else {
                 port
             },
-            tls_profile: self.profile,
+            tls_profile: if self.fault == Fault::WrongTrustProfile {
+                [99; 32]
+            } else {
+                self.profile
+            },
         })
     }
 }
@@ -673,6 +678,7 @@ fn docker_collector_retains_staged_crashes_and_refuses_bad_or_late_proofs() {
         Fault::ForeignGuest,
         Fault::WrongCompose,
         Fault::WrongOrigin,
+        Fault::WrongTrustProfile,
         Fault::WrongFixture,
         Fault::MissingControls,
         Fault::ReplayedBoot,
