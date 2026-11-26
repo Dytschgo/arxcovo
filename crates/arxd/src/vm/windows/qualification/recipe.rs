@@ -242,6 +242,7 @@ impl ForegroundQualification<'_> {
         &self,
         reservation: InstallerReservation<'a>,
         ledger: &dyn CustodyCheckpoints,
+        cancelled: &dyn Fn() -> bool,
         mut authorize: impl FnMut(StageTarget) -> Result<StageAuthority, NativeRefusal>,
     ) -> Result<StagedInstaller<'a>, NativeRefusal> {
         let InstallerReservation {
@@ -261,7 +262,7 @@ impl ForegroundQualification<'_> {
         {
             return Err(PHASE);
         }
-        check_deadline(deadline)?;
+        super::launch::check_preparation(deadline, cancelled)?;
         self.fresh()?;
         let (media, seed_bytes, vars_bytes) = {
             // The held source handles are seekable and can be shared by
@@ -317,47 +318,24 @@ impl ForegroundQualification<'_> {
             }
         };
         let seal_sha256 = self.seal_sha256();
-        let leaves = [
-            Leaf {
-                slot: seed,
-                bytes: &seed_bytes,
-                limit: SEED_LIMIT,
-                mutable: false,
-            },
-            Leaf {
-                slot: pair.vars,
-                bytes: &vars_bytes,
-                limit: MAX_SETUP_VARS_BYTES,
-                mutable: true,
-            },
-        ];
-        let [seed, vars] = stage_leaves(workspace, ledger, leaves, |slot, content| {
-            let captured = self.launch_live(TEST_JOB_MEMORY)?;
-            let target = StageTarget {
-                workspace: binding,
-                seal_sha256,
-                recipe,
-                phase,
-                slot,
-                content,
-                deadline,
-            };
-            let authority = authorize(target)?;
-            if authority.target() != &target {
-                return Err(PHASE);
-            }
-            check_deadline(deadline)?;
-            fresh_observation(captured, Instant::now(), NativeRefusal::ReservesUnverified)?;
-            Ok(authority)
-        })?;
-        check_deadline(deadline)?;
-        Ok(StagedInstaller {
+        stage_prepared(
             reservation,
+            ledger,
             seal_sha256,
-            seed,
-            vars,
             media,
-        })
+            [&seed_bytes, &vars_bytes],
+            cancelled,
+            |target| {
+                let captured = self.launch_live(TEST_JOB_MEMORY)?;
+                let authority = authorize(target)?;
+                if authority.target() != &target {
+                    return Err(PHASE);
+                }
+                super::launch::check_preparation(deadline, cancelled)?;
+                fresh_observation(captured, Instant::now(), NativeRefusal::ReservesUnverified)?;
+                Ok(authority)
+            },
+        )
     }
 
     pub(crate) fn prepare_boot<'a>(
@@ -532,6 +510,73 @@ impl ForegroundQualification<'_> {
     }
 }
 
+/// Stages the recipe's already prepared media using one consumed permit for
+/// each exact leaf. The fixture supplies bounded byte slices at this boundary.
+pub(super) fn stage_prepared<'a>(
+    reservation: InstallerReservation<'a>,
+    ledger: &dyn CustodyCheckpoints,
+    seal_sha256: Hash,
+    media: Vec<Artifact>,
+    [seed_bytes, vars_bytes]: [&[u8]; 2],
+    cancelled: &dyn Fn() -> bool,
+    mut authorize: impl FnMut(StageTarget) -> Result<StageAuthority, NativeRefusal>,
+) -> Result<StagedInstaller<'a>, NativeRefusal> {
+    let InstallerReservation {
+        workspace,
+        pair,
+        seed,
+        recipe,
+        phase,
+        deadline,
+    } = reservation;
+    let binding = workspace.binding();
+    check_stage_slots(binding, pair, seed)?;
+    if !stage_supported(seed, phase) {
+        return Err(PHASE);
+    }
+    let check = || super::launch::check_preparation(deadline, cancelled);
+    let leaves = [
+        Leaf {
+            slot: seed,
+            bytes: seed_bytes,
+            limit: SEED_LIMIT,
+            mutable: false,
+        },
+        Leaf {
+            slot: pair.vars,
+            bytes: vars_bytes,
+            limit: MAX_SETUP_VARS_BYTES,
+            mutable: true,
+        },
+    ];
+    let [seed, vars] = stage_leaves(workspace, ledger, leaves, &check, |slot, content| {
+        check()?;
+        let target = StageTarget {
+            workspace: binding,
+            seal_sha256,
+            recipe,
+            phase,
+            slot,
+            content,
+            deadline,
+        };
+        let authority = authorize(target)?;
+        if authority.target() != &target {
+            return Err(PHASE);
+        }
+        check()?;
+        Ok(authority)
+    })?;
+    check()?;
+    Ok(StagedInstaller {
+        reservation,
+        seal_sha256,
+        seed,
+        vars,
+        media,
+    })
+}
+
 fn check_stage_slots(
     binding: WorkspaceBinding,
     pair: PairSlots,
@@ -548,12 +593,6 @@ fn check_stage_slots(
     Ok(())
 }
 
-fn check_deadline(deadline: Instant) -> Result<(), NativeRefusal> {
-    (Instant::now() < deadline)
-        .then_some(())
-        .ok_or(NativeRefusal::InstallerDeadlineExpired)
-}
-
 #[derive(Clone, Copy)]
 struct Leaf<'b> {
     slot: ArtifactSlot,
@@ -562,18 +601,24 @@ struct Leaf<'b> {
     mutable: bool,
 }
 
-/// Each leaf has its own authorization and checkpoints. The first leaf is
-/// verified in the ledger before the second leaf's intent exists, so a
-/// failure on the second leaf leaves the first accounted.
+/// Each leaf has its own authorization and checkpoints. The immutable first
+/// leaf is verified in the ledger before the second leaf's intent exists, so
+/// a failure on the second leaf leaves the first accounted. The mutable
+/// second leaf stays identified with its content verified in the held pin.
 fn stage_leaves<A>(
     workspace: &ProductionWorkspace,
     ledger: &dyn CustodyCheckpoints,
     leaves: [Leaf<'_>; 2],
+    check: &dyn Fn() -> Result<(), NativeRefusal>,
     mut authorize: impl FnMut(ArtifactSlot, ArtifactPin) -> Result<A, NativeRefusal>,
 ) -> Result<[PathPin; 2], NativeRefusal> {
     let [first, second] = leaves;
-    let first = stage_input(workspace, ledger, first, |pin| authorize(first.slot, pin))?;
-    let second = stage_input(workspace, ledger, second, |pin| authorize(second.slot, pin))?;
+    let first = stage_input(workspace, ledger, first, check, |pin| {
+        authorize(first.slot, pin)
+    })?;
+    let second = stage_input(workspace, ledger, second, check, |pin| {
+        authorize(second.slot, pin)
+    })?;
     Ok([first, second])
 }
 
@@ -581,6 +626,7 @@ fn stage_input<A>(
     workspace: &ProductionWorkspace,
     ledger: &dyn CustodyCheckpoints,
     leaf: Leaf<'_>,
+    check: &dyn Fn() -> Result<(), NativeRefusal>,
     authorize: impl FnOnce(ArtifactPin) -> Result<A, NativeRefusal>,
 ) -> Result<PathPin, NativeRefusal> {
     let Leaf {
@@ -602,19 +648,29 @@ fn stage_input<A>(
     let _authority = authorize(content)?;
     // Intent, create-new and identity are durable before the first byte.
     let mut writer = workspace.create_slot(slot, ledger)?;
-    writer.write_all(bytes)?;
+    for chunk in bytes.chunks(256 << 10) {
+        check()?;
+        writer.write_all(chunk)?;
+    }
+    check()?;
     writer.sync()?;
+    check()?;
     let mut pin = writer.into_pin(mutable)?;
     pin.verify_content(content, limit)?;
-    ledger.slot_verified(
-        binding,
-        slot,
-        ArtifactEvidence {
-            identity: pin.identity,
-            directory: binding.workspace.file,
-            pin: content,
-        },
-    )?;
+    check()?;
+    // A mutable leaf keeps its verified initial content only in the held pin.
+    // Its single durable digest is committed after its final writable phase.
+    if !mutable {
+        ledger.slot_verified(
+            binding,
+            slot,
+            ArtifactEvidence {
+                identity: pin.identity,
+                directory: binding.workspace.file,
+                pin: content,
+            },
+        )?;
+    }
     Ok(pin)
 }
 

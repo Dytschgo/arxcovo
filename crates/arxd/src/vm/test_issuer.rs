@@ -152,7 +152,7 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
     }
 
     /// One bounded observation. Only confirmed drift revokes the epoch.
-    fn refresh(&self) -> Result<Instant, NativeRefusal> {
+    pub(crate) fn refresh(&self) -> Result<Instant, NativeRefusal> {
         self.epoch
             .refresh(
                 || {
@@ -190,7 +190,15 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
                     recipe_id,
                     recipe_sha256: digest,
                 };
-                target.writer_epoch.is_none() && recipe_selected(recipe, None, self.recipes)
+                target.writer_epoch.is_none()
+                    && admitted.build.is_some_and(|(slots, _, _)| {
+                        [
+                            slots.pair.disk.generation,
+                            slots.verification.disk.generation,
+                        ]
+                        .contains(&target.generation)
+                    })
+                    && recipe_selected(recipe, None, self.recipes)
             }
         };
         if !consistent {
@@ -316,11 +324,18 @@ pub(crate) struct Intent<'i, S, C> {
 impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
     /// Cancellation, then the durable admission, deadline, target and slots.
     fn guard(&self, slots: &[ArtifactSlot]) -> Result<(), NativeRefusal> {
+        let target = match slots.first() {
+            Some(slot) if matches!(self.effect, AdmittedEffect::Build { .. }) => NativeTarget {
+                generation: slot.generation,
+                writer_epoch: None,
+            },
+            _ => self.target,
+        };
         if self.cancel.is_cancelled()
             || !self
                 .issuer
                 .controller
-                .native_effect_admitted(self.worker, self.target, slots)
+                .native_effect_admitted(self.worker, target, slots)
                 .map_err(|_| REFUSED)?
         {
             return Err(REFUSED);
@@ -349,7 +364,7 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         Ok(())
     }
 
-    fn build_recipe(&self) -> Option<RecipeIdentity> {
+    pub(crate) fn build_recipe(&self) -> Option<RecipeIdentity> {
         match self.effect {
             AdmittedEffect::Build { recipe_id, digest } => Some(RecipeIdentity {
                 recipe_id,
@@ -396,8 +411,38 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         let binding = target.binding(workspace, self.issuer.seal_sha256)?;
         let slots = launch_slots(self.effect, expected.kind, target.pair, target.helper)?;
         check_installer(expected.kind, expected.installer)?;
-        let expected_epoch = self.target.writer_epoch.unwrap_or(self.target.generation);
-        if workspace.generation != self.target.generation
+        if let Some((build, _, _)) = self.worker.admitted().and_then(|admitted| admitted.build) {
+            let exact = match (expected.kind, target.pair, target.helper) {
+                (PlanKind::Boot, Some(pair), _) => {
+                    pair == build.verification
+                        || (pair == build.pair
+                            && self.build_recipe() == Some(self.issuer.recipes.windows))
+                }
+                (PlanKind::InstallerBoot(_), Some(pair), _) => pair == build.pair,
+                (PlanKind::Mutate, _, Some(slot)) => {
+                    slot == build.pair.disk || slot == build.verification.disk
+                }
+                (PlanKind::Inspect | PlanKind::InspectWritable, None, None) => true,
+                _ => false,
+            };
+            if !exact {
+                return Err(REFUSED);
+            }
+        }
+        let verification = matches!(self.effect, AdmittedEffect::Build { .. })
+            && slots.first().is_some_and(|slot| {
+                slot.role == "verification_overlay" && slot.generation == workspace.generation
+            });
+        let expected_generation = if verification {
+            workspace.generation
+        } else {
+            self.target.generation
+        };
+        let expected_epoch = self.target.writer_epoch.unwrap_or(expected_generation);
+        if workspace.generation != expected_generation
+            || slots
+                .iter()
+                .any(|slot| slot.generation != workspace.generation)
             || expected.writer_epoch != expected_epoch
             || !self.admits_launch(expected.kind, target.recipe)
         {
@@ -432,6 +477,13 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
             || target.slot.generation != self.target.generation
             || target.seal_sha256 != self.issuer.seal_sha256
             || !stage_supported(target.slot, target.phase)
+            || !self
+                .worker
+                .admitted()
+                .and_then(|admitted| admitted.build)
+                .is_some_and(|(slots, _, _)| {
+                    target.slot == slots.seed || target.slot == slots.pair.vars
+                })
             || self.build_recipe() != Some(target.recipe)
             || !recipe_selected(target.recipe, Some(target.phase), self.issuer.recipes)
             || Instant::now() >= target.deadline
@@ -477,6 +529,32 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
             intent: self,
             slot,
             content,
+            verification: None,
+        })
+    }
+
+    /// One detached build verification VARS copy, bound to both reserved slots.
+    pub(crate) fn copy_verification(
+        &self,
+        pair: PairSlots,
+        content: ArtifactPin,
+    ) -> Result<CopyPermit<'_, S, C>, NativeRefusal> {
+        if !self
+            .worker
+            .admitted()
+            .and_then(|admitted| admitted.build)
+            .is_some_and(|(slots, _, _)| pair == slots.verification)
+            || !distinct_pair(pair)
+            || (pair.disk.role, pair.vars.role) != ("verification_overlay", "vars")
+        {
+            return Err(REFUSED);
+        }
+        self.mint(Effect::Copy(pair.vars), &[pair.disk, pair.vars])?;
+        Ok(CopyPermit {
+            intent: self,
+            slot: pair.vars,
+            content,
+            verification: Some(pair),
         })
     }
 
@@ -554,6 +632,7 @@ pub(crate) struct CopyPermit<'p, S, C> {
     intent: &'p Intent<'p, S, C>,
     slot: ArtifactSlot,
     content: ArtifactPin,
+    verification: Option<PairSlots>,
 }
 
 impl<S: SelectedSource, C: Clock> CopyPermit<'_, S, C> {
@@ -566,7 +645,10 @@ impl<S: SelectedSource, C: Clock> CopyPermit<'_, S, C> {
         if (self.slot, self.content) != (slot, content) {
             return Err(REFUSED);
         }
-        self.intent.verify(&[slot])?;
+        match self.verification {
+            Some(pair) => self.intent.verify(&[pair.disk, slot])?,
+            None => self.intent.verify(&[slot])?,
+        }
         Ok(CopyAuthority {
             _minted: Minted(()),
             slot,

@@ -26,10 +26,10 @@ mod production;
 pub(crate) use production::consume_checked;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use production::{
-    FinalizedPair, GenerationGuards, HeldStartRefusal, HelperSettlement, InstallerSettlement,
-    LaunchFailure, LaunchPermit, LaunchPermitBinding, LaunchRequest, LaunchTarget, NativeLaunch,
-    NativeRecovery, ProductionWorkspace, ReleasedGeneration, StartCreation, StartPair,
-    StartRefusal, WorkspaceBinding,
+    BuildSeal, FinalizedPair, GenerationGuards, HeldStartRefusal, HelperSettlement,
+    InstallerSettlement, LaunchFailure, LaunchPermit, LaunchPermitBinding, LaunchRequest,
+    LaunchTarget, NativeLaunch, NativeRecovery, ProductionWorkspace, ReleasedGeneration,
+    StartCreation, StartPair, StartRefusal, WorkspaceBinding,
 };
 mod recipe;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]

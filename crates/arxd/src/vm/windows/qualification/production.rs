@@ -934,10 +934,12 @@ impl<'a> NativeLaunch<'a> {
             .await
         {
             Ok(BootOutcome::InstallerReleased(finalization, held)) => {
+                let mut generation = self
+                    .release_proof(held)
+                    .ok_or(NativeRefusal::PathCustodyUnverified)?;
+                generation.stop_disposition = Some(StopDisposition::CleanRelease);
                 Ok(InstallerSettlement::Released {
-                    generation: self
-                        .release_proof(held)
-                        .ok_or(NativeRefusal::PathCustodyUnverified)?,
+                    generation,
                     finalization: finalization.map(FinalizedPair),
                 })
             }
@@ -1184,12 +1186,14 @@ impl FinalizedPair {
     }
 }
 
+mod build;
 mod clone;
 mod custody;
 mod disposal;
 mod helper;
 mod recovery;
 
+pub(crate) use build::BuildSeal;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use custody::LedgerCheckpoints;
 use custody::check_helper_target;

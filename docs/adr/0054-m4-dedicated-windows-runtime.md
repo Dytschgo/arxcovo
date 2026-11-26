@@ -1954,3 +1954,35 @@ recovery authority. The production installation lands with activation in
 admission stays closed. Static, Compose and public-egress dispatch never
 receive these authorities.
 Native issuance is **unverified on real hardware**.
+
+
+## 7c amendment — held release through TEST golden publication
+
+One fresh build intent covers its exact primary and verification reservations.
+Issuance binds the installer phases to the primary pair and the detached boot
+to the reserved overlay pair. The issuer also binds the verification VARS copy
+to that overlay pair and to the source content pin.
+
+The build verifies detached health and rechecks the overlay's backing while
+both release proofs are held. It then closes the verification handles so checked
+disposal can retire the overlay, VARS, lease and directory. Seed disposal uses
+the already-held primary lease. The primary disk and VARS writer exclusions
+stay held until the transaction publishes the golden and receipt. The
+transaction requires durable transient absence and charges the observed pair
+bytes plus the admitted metadata charge, bounded by the original retained
+claim. An interrupted build retains its peak claim until checked recovery and
+disposal settle it.
+
+The production TEST entry point stays closed until 7c 16. Native installation,
+health checks and release are **unverified on real hardware**.
+
+Mutable build slots (the primary disk and VARS, the verification overlay and
+its VARS copy) keep only their durable identity while guests can write to
+them. The staged VARS carries its verified initial content in the held pin.
+Each slot receives its single immutable content digest once, after the final
+writable release of its generation and before the seal, under that release
+proof. The immutable installer seed is still verified before its first boot.
+This keeps schema 17 and its write-once digest triggers. The verification
+VARS copy requires the issuer's consumed copy authority for the exact slot
+and content. A failed build ends every lease and writer hold before its
+failure is settled.

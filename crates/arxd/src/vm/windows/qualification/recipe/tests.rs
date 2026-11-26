@@ -213,22 +213,39 @@ fn stage_requires_exact_reservation_and_preserves_the_staged_identity() {
     };
     let path = slot_path(&ws.root.path, slot).unwrap();
     assert!(
-        stage_input::<()>(&ws, &recorder, leaf(wrong, b"seed", 10), |_| panic!(
-            "wrong generation"
-        ))
+        stage_input::<()>(
+            &ws,
+            &recorder,
+            leaf(wrong, b"seed", 10),
+            &|| Ok(()),
+            |_| panic!("wrong generation")
+        )
         .is_err()
     );
     assert!(
-        stage_input::<()>(&ws, &recorder, leaf(slot, b"seed", 3), |_| panic!(
-            "over limit"
-        ))
+        stage_input::<()>(
+            &ws,
+            &recorder,
+            leaf(slot, b"seed", 3),
+            &|| Ok(()),
+            |_| panic!("over limit")
+        )
         .is_err()
     );
-    assert!(stage_input::<()>(&ws, &recorder, leaf(slot, b"seed", 10), |_| Err(PHASE)).is_err());
+    assert!(
+        stage_input::<()>(
+            &ws,
+            &recorder,
+            leaf(slot, b"seed", 10),
+            &|| Ok(()),
+            |_| Err(PHASE)
+        )
+        .is_err()
+    );
     // Authorization precedes the durable intent.
     assert!(recorder.log.borrow().is_empty());
     assert!(!std::path::Path::new(path.as_str()).exists());
-    let staged = stage_input(&ws, &recorder, leaf(slot, b"seed", 10), |pin| {
+    let staged = stage_input(&ws, &recorder, leaf(slot, b"seed", 10), &|| Ok(()), |pin| {
         assert_eq!(pin.sha256, digest(b"seed"));
         assert!(!std::path::Path::new(path.as_str()).exists());
         Ok(())
@@ -253,7 +270,12 @@ fn stage_requires_exact_reservation_and_preserves_the_staged_identity() {
             .open(path.as_str())
             .is_err()
     );
-    assert!(stage_input(&ws, &recorder, leaf(slot, b"new", 10), |_| Ok(())).is_err());
+    assert!(
+        stage_input(&ws, &recorder, leaf(slot, b"new", 10), &|| Ok(()), |_| Ok(
+            ()
+        ))
+        .is_err()
+    );
     assert_eq!(
         ws.pin_slot(slot, staged.identity, false).unwrap().identity,
         staged.identity
@@ -291,7 +313,8 @@ fn pin_of(bytes: &[u8]) -> ArtifactPin {
 }
 
 /// T15/T17: the seed is verified in the ledger before the VARS intent, so
-/// each VARS fault leaves the seed accounted, also after a reopen.
+/// each VARS fault leaves the seed accounted, also after a reopen. The
+/// mutable VARS stays identified until its final writable phase.
 #[test]
 fn seed_stays_accounted_when_the_second_leaf_fails() {
     let mut fixture = Fixture::new();
@@ -322,7 +345,7 @@ fn seed_stays_accounted_when_the_second_leaf_fails() {
                 mutable: true,
             },
         ];
-        let staged = stage_leaves(&ws, &recorder, leaves, |slot, _| {
+        let staged = stage_leaves(&ws, &recorder, leaves, &|| Ok(()), |slot, _| {
             if slot == slots.pair.vars {
                 recorder.fault.set(fault);
                 WRITE_FAULT.set(write);
@@ -351,7 +374,15 @@ fn seed_stays_accounted_when_the_second_leaf_fails() {
         let bytes = std::fs::read(vars_path.as_str()).ok();
         match (fault, write) {
             (None, None) => {
-                assert!(matches!(vars, Custody::Verified(..)));
+                // The mutable VARS keeps only its identity durable. Its
+                // verified initial content is carried by the held pin.
+                let staged = staged.as_ref().unwrap();
+                assert!(
+                    matches!(vars, Custody::Identified(file) if file == staged[1].identity.file),
+                    "{vars:?}"
+                );
+                assert_eq!(staged[1].verified_content, Some(pin_of(b"vars-initial")));
+                assert_eq!(staged[0].verified_content, Some(pin_of(b"seed")));
                 assert_eq!(bytes.as_deref(), Some(&b"vars-initial"[..]));
             }
             (Some(Fault::Before("intend_slot")), _) => {
