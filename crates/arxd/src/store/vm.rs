@@ -685,12 +685,15 @@ impl VmStore {
         read(&db)
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    pub(crate) fn try_live_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        // Live qualification runs on the task responsible for stopping the child.
-        self.db
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("VM state unavailable"))
+    /// Never waits for the connection. Live qualification runs on the task
+    /// responsible for stopping the child.
+    pub(crate) fn try_live_connection(
+        &self,
+    ) -> std::result::Result<std::sync::MutexGuard<'_, Connection>, LiveAccess> {
+        self.db.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => LiveAccess::Contended,
+            std::sync::TryLockError::Poisoned(_) => LiveAccess::Poisoned,
+        })
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
@@ -702,12 +705,12 @@ impl VmStore {
         use std::os::windows::io::AsRawHandle;
         let mut db = self.try_live_connection()?;
         let main_handle = sqlite_main_handle(&mut db)?;
-        ensure!(
-            windows_file_identity(main_handle)? == expected_database
-                && windows_file_identity(self._database.as_raw_handle())? == expected_database
-                && windows_file_identity(self._lock.as_raw_handle())? == expected_lock,
-            "VM store identity mismatch"
-        );
+        if windows_file_identity(main_handle)? != expected_database
+            || windows_file_identity(self._database.as_raw_handle())? != expected_database
+            || windows_file_identity(self._lock.as_raw_handle())? != expected_lock
+        {
+            return Err(StoreIdentityMismatch.into());
+        }
         static_vm::host_id(&db)
     }
 
@@ -1141,6 +1144,53 @@ impl std::fmt::Display for StateHeadroom {
 
 impl std::error::Error for StateHeadroom {}
 
+/// Why the nonblocking live connection was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LiveAccess {
+    /// Another holder has the connection now. A later attempt can pass.
+    Contended,
+    /// A holder panicked, so the connection state is unknown.
+    Poisoned,
+}
+
+impl std::fmt::Display for LiveAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Contended => "VM state busy",
+            Self::Poisoned => "VM state unavailable",
+        })
+    }
+}
+
+impl std::error::Error for LiveAccess {}
+
+/// Positive evidence that the open store handles are not the held custody.
+#[cfg_attr(
+    not(all(windows, target_arch = "x86_64")),
+    allow(dead_code, reason = "Only the Windows identity read observes handles")
+)]
+#[derive(Debug)]
+pub(crate) struct StoreIdentityMismatch;
+
+impl std::fmt::Display for StoreIdentityMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VM store identity mismatch")
+    }
+}
+
+impl std::error::Error for StoreIdentityMismatch {}
+
+/// Contention that a later attempt can clear: the in-process connection
+/// is held, or SQLite reports BUSY or LOCKED after its bounded wait.
+pub(crate) fn contended(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LiveAccess>() == Some(&LiveAccess::Contended)
+        || matches!(
+            error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(err, _))
+                if matches!(err.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        )
+}
+
 pub(crate) fn require_headroom(db: &Connection) -> Result<()> {
     ensure!(headroom(db)?, StateHeadroom);
     Ok(())
@@ -1302,7 +1352,7 @@ pub(crate) fn prune(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn retry_time(db: &Connection, now: i64) -> Result<i64> {
+pub(crate) fn retry_time(db: &Connection, now: i64) -> Result<i64> {
     Ok(db.query_row(
         "UPDATE vm_retry_clock SET high_water_ms=max(high_water_ms,?1) RETURNING high_water_ms",
         [now],

@@ -3,6 +3,7 @@ use super::{
     policy::*,
     reaper::{self, ArtifactCustody, ClosedCustody, ReaperTick, Sweeps},
     runtime::{CandidateRuntime, ReaperRuntime},
+    selection_epoch::Invalidation,
     static_web::StaticState,
     template,
 };
@@ -116,6 +117,34 @@ impl AdmissionGate {
 impl<C: Clock> VmController<C> {
     pub(crate) fn compose_now(&self) -> Result<i64> {
         utc(self.clock.now())
+    }
+
+    /// Advance `vm_retry_clock` with the wall clock read inside the store
+    /// transaction, so no other writer moves the high water between the read
+    /// and the comparison. A reading below the committed high water is a
+    /// rollback. Contention is transient; the connection is never awaited.
+    #[allow(
+        dead_code,
+        reason = "The native TEST issuer consumes the epoch in a later 7c PR"
+    )]
+    pub(crate) fn advance_native_clock(&self) -> Result<ClockReading, Invalidation> {
+        let reason = super::runtime::NativeRefusal::QualificationMissing;
+        let classify = |error: anyhow::Error| Invalidation::from_store(&error, reason);
+        let mut db = self
+            .store
+            .try_live_connection()
+            .map_err(|error| classify(error.into()))?;
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| classify(error.into()))?;
+        let clock = self.clock.now();
+        let now = utc(clock).map_err(|_| Invalidation::Indeterminate(reason))?;
+        let high_water = store::retry_time(&tx, now).map_err(classify)?;
+        tx.commit().map_err(|error| classify(error.into()))?;
+        if high_water > now {
+            return Err(Invalidation::Confirmed(reason));
+        }
+        Ok(clock)
     }
 
     pub(crate) fn compose_store(&self) -> &VmStore {
