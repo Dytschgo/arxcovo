@@ -40,7 +40,7 @@ pub struct PendingOperation {
         not(all(windows, target_arch = "x86_64")),
         allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
     )]
-    admitted: Option<Admitted>,
+    admitted: Option<Box<Admitted>>,
     /// Set once, when the native TEST issuer mints this worker's intent.
     #[cfg_attr(
         not(all(windows, target_arch = "x86_64")),
@@ -61,7 +61,7 @@ impl PendingOperation {
     /// The request fixed at admission, when it may carry native TEST work.
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn admitted(&self) -> Option<&Admitted> {
-        self.admitted.as_ref()
+        self.admitted.as_deref()
     }
 
     /// Claims this worker's single native TEST intent. The latch never
@@ -110,14 +110,14 @@ pub(crate) struct Admitted {
 }
 
 impl Admitted {
-    fn new(binding: &store::Binding<'_>, operation: Id, effect: AdmittedEffect) -> Self {
-        Self {
+    fn new(binding: &store::Binding<'_>, operation: Id, effect: AdmittedEffect) -> Box<Self> {
+        Box::new(Self {
             principal: binding.principal.to_owned(),
             request: binding.key,
             action: binding.action,
             operation,
             effect,
-        }
+        })
     }
 }
 
@@ -750,7 +750,7 @@ impl<C: Clock> VmController<C> {
             Box::new(slots),
             PendingOperation {
                 activity_id: operation.receipt.activity_id,
-                admitted: Some(Admitted::new(&binding, operation.id, effect)),
+                admitted: Some(Admitted::new(binding, operation.id, effect)),
                 ..pending
             },
             operation,

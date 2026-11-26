@@ -1282,15 +1282,15 @@ fn build_verification_boot_and_installer_stage_are_bound() {
     let recipe = inputs.recipe();
     let plan = recipe.plan().unwrap();
     let cwd = LocalPath::parse("D:/vms/work").unwrap();
-    let boot = LaunchTarget {
+    let boot = || LaunchTarget {
         pair: Some(slots.verification),
         recipe: Some(recipes().ubuntu),
         ..target(&plan, &cwd)
     };
-    let permit = intent.launch(ws, boot).unwrap();
+    let permit = intent.launch(ws, boot()).unwrap();
     // Second boot permit on the same verification pair is refused.
-    assert!(intent.launch(ws, boot).is_err());
-    let authority = permit.consume(boot).unwrap();
+    assert!(intent.launch(ws, boot()).is_err());
+    let authority = permit.consume(boot()).unwrap();
     assert_eq!(authority.binding().kind, PlanKind::Boot);
 
     // Installer stage checks: matching live stage passes; missing, mismatched
