@@ -394,7 +394,8 @@ main:focus-visible { outline-offset: -4px; }
 }
 .search:focus-within { border-color: var(--ink); }
 .search input { flex: 1; inline-size: 100%; border: 0; background: none; outline: 0; color: var(--ink); }
-.search input::placeholder, .filter-name input::placeholder { color: var(--ink4); }
+/* Placeholders: --ink4 at full opacity (5.3:1 on --tile2, more on --bg). */
+.search input::placeholder, .filter-name input::placeholder, .terminal-input input::placeholder { color: var(--ink4); opacity: 1; }
 .search input::-webkit-search-cancel-button { display: none; }
 kbd {
   display: inline-grid;
@@ -492,7 +493,8 @@ kbd {
   color: var(--ink3);
   font-size: var(--fs-ui);
   cursor: pointer;
-  transition: background-color var(--dur-fast), color var(--dur-fast);
+  /* No colour transition: fill and ink switch together, so the label never
+     passes through a low-contrast frame. */
 }
 .fchip { border: 1px solid var(--line2); color: var(--ink2); font-size: var(--fs-sm); padding: 0 11px; }
 .seg button[aria-pressed="true"], .fchip[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--bg); font-weight: 500; }
@@ -859,6 +861,15 @@ a.hp[aria-current] { border-color: var(--line3); background: var(--tile2); }
 .terminal-input { display: flex; align-items: center; gap: var(--sp-2); }
 .terminal-input input { flex: 1; min-block-size: 42px; padding: 0 12px; border: 1px solid var(--line2); border-radius: var(--r-input); background: var(--tile2); color: var(--ink); font-family: var(--mono); outline: 0; }
 .terminal-input input:focus-visible { border-color: var(--ink); }
+/* Disabled fields: --ink4 and a dashed outline, never an opacity fade. */
+.terminal-input input:disabled, .field select:disabled {
+  border-style: dashed;
+  border-color: var(--line3);
+  color: var(--ink4);
+  -webkit-text-fill-color: var(--ink4);
+  opacity: 1;
+  cursor: not-allowed;
+}
 .terminal-help { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); color: var(--ink3); font-size: var(--fs-sm); }
 .term-rules { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) 18px; padding-block-start: var(--sp-3); border-block-start: 1px solid var(--line); color: var(--ink3); font-size: var(--fs-sm); }
 .term-rules > span { display: inline-flex; align-items: center; gap: 6px; }
