@@ -356,6 +356,57 @@ pub(crate) struct ManagedBackupDir {
     flush_published: fn(&File) -> std::io::Result<()>,
 }
 
+#[derive(Clone, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TargetEnrollment {
+    #[serde(rename = "vm_id", deserialize_with = "super::compose::enrolled_vm_id")]
+    pub vm: Id,
+    #[serde(rename = "project_id")]
+    pub project: String,
+    pub volume: String,
+    pub database: String,
+    pub max_bytes: u64,
+}
+
+pub(crate) fn validate_target(
+    project: &str,
+    volume: &str,
+    database: &str,
+    max_bytes: u64,
+) -> Result<()> {
+    ensure!(
+        arx_guest::compose::is_project_id(project)
+            && arx_guest::compose_backup::is_volume_slot(volume)
+            && arx_guest::compose_backup::is_db_basename(database)
+            && (1..=arx_guest::compose_backup::MAX_BACKUP_BYTES).contains(&max_bytes),
+        "invalid Compose backup target"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_targets(targets: &[TargetEnrollment]) -> Result<()> {
+    ensure!(
+        targets.len() <= 32,
+        "Compose backup target count out of bounds"
+    );
+    let mut bindings = std::collections::BTreeMap::new();
+    for target in targets {
+        validate_target(
+            &target.project,
+            &target.volume,
+            &target.database,
+            target.max_bytes,
+        )?;
+        if let Some(prior) = bindings.insert((target.vm, target.project.as_str()), target) {
+            ensure!(
+                prior == target,
+                "conflicting Compose backup target bindings"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[allow(
     dead_code,
     reason = "reserved for qualified backup custody activation and E4 fixtures"

@@ -314,6 +314,8 @@ fn consumed_permit_requires_the_exact_seal_generation_workspace_and_kind() {
         PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall),
         PlanKind::InstallerBoot(InstallerPhase::WindowsSetup),
         PlanKind::InstallerBoot(InstallerPhase::WindowsFinalize),
+        PlanKind::StaticComposeInstaller,
+        PlanKind::StaticComposeDetached,
     ] {
         assert_eq!(
             check_permit(

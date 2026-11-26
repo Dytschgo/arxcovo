@@ -284,6 +284,8 @@ printf '%s\n' 'tmpfs /run/arx-compose/secrets tmpfs rw,nosuid,nodev,noexec,mode=
 systemctl --root="$target" mask sleep.target suspend.target hibernate.target hybrid-sleep.target
 sed -i '/^[^#].*[[:space:]]swap[[:space:]]/s/^/#/' "$target/etc/fstab"
 printf '%s\n' ubuntu-noble-amd64-compose-v1 > "$target/etc/arxcovo/compose-finalized"
+chown root:root "$target/etc/arxcovo/compose-finalized"
+chmod 0644 "$target/etc/arxcovo/compose-finalized"
 "#;
 
 const DETACHED_COMPOSE: &str = r#"

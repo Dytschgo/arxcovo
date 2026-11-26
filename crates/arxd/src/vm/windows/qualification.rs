@@ -31,6 +31,7 @@ pub(crate) use recipe::{
 };
 mod schema;
 mod sink;
+mod static_compose;
 mod test;
 
 pub use paused::{

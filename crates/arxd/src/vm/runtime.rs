@@ -565,40 +565,19 @@ pub(crate) mod publication {
                     self.routes.len() == self.hostnames.len(),
                     "publication route count mismatch"
                 );
-                let mut route_slots = std::collections::BTreeSet::new();
-                let mut ports = std::collections::BTreeSet::new();
-                let mut project_slots = std::collections::BTreeMap::new();
-                let mut slot_projects = std::collections::BTreeMap::new();
+                let mut routes = Vec::with_capacity(self.routes.len());
                 for (expected_host, binding) in self.hostnames.iter().zip(&self.routes) {
                     ensure!(
                         binding.hostname == *expected_host,
                         "publication route hostname order mismatch"
                     );
-                    let slot = binding.slot();
-                    ensure!(slot.validate().is_ok(), "invalid publication route slot");
-                    ensure!(
-                        route_slots.insert(slot.route_slot),
-                        "duplicate publication route slot"
-                    );
-                    if let Some(&existing) = project_slots.get(binding.project_id.as_str()) {
-                        ensure!(
-                            existing == slot.project_slot,
-                            "publication project slot conflict"
-                        );
-                    } else {
-                        project_slots.insert(binding.project_id.as_str(), slot.project_slot);
-                    }
-                    if let Some(&existing) = slot_projects.get(&slot.project_slot) {
-                        ensure!(
-                            existing == binding.project_id.as_str(),
-                            "publication project slot conflict"
-                        );
-                    } else {
-                        slot_projects.insert(slot.project_slot, binding.project_id.as_str());
-                    }
-                    let port = slot.loopback_port();
-                    ensure!(ports.insert(port), "duplicate publication loopback port");
+                    routes.push(binding.slot().target(expected_host));
                 }
+                arx_guest::compose::routing::validate_routes(
+                    self.zone_name.as_ref().map(Hostname::as_str),
+                    &routes,
+                )
+                .map_err(|_| anyhow::anyhow!("invalid publication route bindings"))?;
             }
             Ok(())
         }

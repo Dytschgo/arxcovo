@@ -1505,6 +1505,45 @@ impl Target {
     }
 }
 
+#[cfg(test)]
+mod static_compose_tests {
+    use super::*;
+
+    #[test]
+    fn static_compose_template_is_ineligible_for_test_clone() -> Result<()> {
+        let (_dir, store, _, _) = store::backup_owner_fixture()?;
+        let template = [5u8; 16];
+        let digest = [6u8; 32];
+        let now = 1_800_000_000_000;
+        let request = Request {
+            principal: "alice",
+            vm: [7; 16],
+            request_id: super::super::RequestId::parse(&format!("{now:016x}{:016x}", 1)).unwrap(),
+            operation: Operation::Clone {
+                template,
+                lease_seconds: None,
+            },
+            disk: DiskClaim {
+                images: 4096,
+                ..Default::default()
+            },
+        };
+        store.transact(|db| {
+            db.execute("INSERT INTO vm_templates VALUES(?1,1,?2,?2,?2,4096)", params![template, digest])?;
+            db.execute(
+                "INSERT INTO vm_build_intents(id,recipe_id,recipe_digest,staging_bytes,template_id,health_verified,state)
+                 VALUES(?1,?2,?3,0,?4,1,'sealed')",
+                params![[4u8; 16], hex::encode(crate::vm::qualification_record::DockerRecipe::identity(digest).recipe_id), digest, template],
+            )?;
+            assert!(matches!(target(db, &request, now)?, Err(Refusal::NotFound)));
+            db.execute("UPDATE vm_build_intents SET recipe_id=?1 WHERE template_id=?2",
+                params![hex::encode(&digest[..16]), template])?;
+            assert!(matches!(target(db, &request, now)?, Ok(Target::Clone { .. })));
+            Ok(())
+        })
+    }
+}
+
 fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Target, Refusal>> {
     if let Operation::Clone {
         template,
@@ -1520,6 +1559,7 @@ fn target(db: &Connection, request: &Request<'_>, now: i64) -> Result<Result<Tar
             "SELECT EXISTS(SELECT 1 FROM vm_templates WHERE id=?1)",
             [template],
         )? == 0
+            || store::static_vm::is_compose_template(db, template)?
         {
             return Ok(Err(Refusal::NotFound));
         }
@@ -2072,6 +2112,9 @@ impl<C: Clock> VmController<C> {
             }
             if store::static_vm::launch_busy(db)? {
                 return Ok(Err(Refusal::Busy));
+            }
+            if store::static_vm::is_compose_template(db, template)? {
+                return Ok(Err(Refusal::RecipeUnqualified));
             }
             let Some(provenance) = store::static_vm::source(db, template, source, web_digest)?
             else {

@@ -90,6 +90,25 @@ pub(crate) fn instance_count(db: &Connection) -> Result<i64> {
     )
 }
 
+/// The sealed build binds this class by its domain-derived recipe ID. Legacy
+/// templates with no build row remain eligible for the existing TEST path.
+pub(crate) fn is_compose_template(db: &Connection, template: Id) -> Result<bool> {
+    let recipe: Option<(String, [u8; 32])> = db
+        .query_row(
+            "SELECT b.recipe_id,t.recipe_digest FROM vm_templates t
+         JOIN vm_build_intents b ON b.template_id=t.id WHERE t.id=?1",
+            [template],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(recipe.is_some_and(|(recipe, digest)| {
+        recipe
+            == hex::encode(
+                crate::vm::qualification_record::DockerRecipe::identity(digest).recipe_id,
+            )
+    }))
+}
+
 pub(crate) fn launch_busy(db: &Connection) -> Result<bool> {
     Ok(count(
         db,
@@ -380,7 +399,7 @@ pub(crate) fn name_occupied(db: &Connection, name: &StaticName) -> Result<bool> 
     )? != 0)
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) fn source(
     db: &Connection,
     template: Id,
@@ -422,6 +441,22 @@ pub(crate) fn source(
             },
         )
         .optional()?)
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+#[allow(dead_code, reason = "consumed by the Part B static create admission")]
+pub(crate) fn compose_source(
+    db: &Connection,
+    template: Id,
+    inputs: (PairSlots, [ArtifactEvidence; 2]),
+    selected: &crate::vm::qualification_record::VerifiedDockerEvidence,
+) -> Result<Option<StaticProvenance>> {
+    let recipe = selected.recipe().identity;
+    let sealed = sealed_pair(db, &hex::encode(recipe.recipe_id), recipe.recipe_sha256)?;
+    if sealed != Some((template, inputs.0)) {
+        return Ok(None);
+    }
+    source(db, template, inputs, recipe.recipe_sha256)
 }
 
 #[cfg(test)]

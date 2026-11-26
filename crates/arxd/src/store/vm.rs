@@ -2881,6 +2881,84 @@ mod tests {
         })
     }
 
+    #[test]
+    fn static_compose_backup_targets_enroll_with_releases_or_roll_back_together() -> Result<()> {
+        let (_dir, store, target, _) = backup_owner_fixture()?;
+        let project = "owner-site";
+        let release: crate::vm::compose::ReleaseInput = serde_json::from_value(
+            serde_json::json!({
+                "vm_id": hex::encode(target.vm),
+                "release_id": hex::encode([42; 16]),
+                "manifest": {
+                    "schema": arx_guest::compose::MANIFEST_SCHEMA,
+                    "project_id": project,
+                    "volumes": [{"name":"data", "uid":10001, "gid":10001}],
+                    "secrets": [],
+                    "services": [{
+                        "name":"web", "image":format!("example.invalid/app@sha256:{}", "a".repeat(64)),
+                        "platform":arx_guest::compose::PLATFORM,
+                        "uid":10001, "gid":10001, "read_only_rootfs":true,
+                        "http_port":8080, "health_path":"/health", "environment":[],
+                        "mounts":[{"volume":"data", "target":"/data", "read_only":false}],
+                        "secrets":[], "limits":{"cpu_millis":500,"memory_mib":512,"pids":64}
+                    }]
+                }
+            }),
+        )?;
+        let releases = [release.enroll()?];
+        let target = crate::vm::compose_backup::TargetEnrollment {
+            vm: target.vm,
+            project: project.into(),
+            volume: "data".into(),
+            database: "app.sqlite3".into(),
+            max_bytes: 65536,
+        };
+        let wrong_volume = crate::vm::compose_backup::TargetEnrollment {
+            volume: "absent".into(),
+            ..target.clone()
+        };
+        assert!(compose::enroll_with_backup_targets(&store, &releases, &[wrong_volume]).is_err());
+        assert_eq!(
+            store.transact(|db| count(
+                db,
+                "SELECT count(*) FROM vm_compose_projects WHERE project=?1",
+                [project]
+            ))?,
+            0
+        );
+
+        let conflict = crate::vm::compose_backup::TargetEnrollment {
+            max_bytes: target.max_bytes + 1,
+            ..target.clone()
+        };
+        assert!(
+            compose::enroll_with_backup_targets(&store, &releases, &[target.clone(), conflict])
+                .is_err()
+        );
+        assert_eq!(
+            store.transact(|db| count(
+                db,
+                "SELECT count(*) FROM vm_compose_releases WHERE project=?1",
+                [project]
+            ))?,
+            0
+        );
+
+        let targets = [target.clone(), target];
+        compose::enroll_with_backup_targets(&store, &releases, &targets)?;
+        compose::enroll_with_backup_targets(&store, &releases, &targets)?;
+        assert_eq!(
+            store.transact(|db| count(
+                db,
+                "SELECT count(*) FROM vm_compose_backup_targets WHERE project=?1 AND volume='data'
+             AND database='app.sqlite3' AND max_bytes=65536",
+                [project],
+            ))?,
+            1
+        );
+        Ok(())
+    }
+
     fn legacy_binding(nonce: u64, vm: Id, action: Action) -> Binding<'static> {
         Binding {
             principal: "alice",
