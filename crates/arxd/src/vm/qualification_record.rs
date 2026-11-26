@@ -391,6 +391,209 @@ pub enum Diagnostic {
     OtherRefusal,
 }
 
+/// Where the paused launcher evaluated a reserve sample.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReserveStep {
+    Admission,
+    PostClaim,
+    PreCreate,
+    PostCreate,
+    PreResume,
+    PostResume,
+    Monitoring,
+    Dispatch,
+}
+
+/// Closed diagnostic payload with only the measurements used by the failed check.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "check", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReserveCheck {
+    ActiveCpusUnavailable,
+    MemoryStatusUnavailable,
+    JobMembershipUnavailable,
+    QualifierInJob,
+    ProcessorGroupsUnavailable,
+    ProcessorGroups {
+        measured_count: u16,
+        required_count: u16,
+    },
+    AffinityUnavailable,
+    EffectiveCpus {
+        measured_count: u32,
+        minimum_count: u32,
+        active_count: u32,
+    },
+    CpuRate {
+        active_count: u32,
+        effective_count: u32,
+        requested_basis_points: u64,
+        allowed_basis_points: u64,
+    },
+    AvailableRam {
+        available_bytes: u64,
+        required_bytes: u64,
+    },
+    /// Resource collection measured zero available physical memory. This is
+    /// the source check, distinct from a shortfall at the launch envelope.
+    AvailableRamSourceZero,
+    SampleStale {
+        age_ms: u64,
+        limit_ms: u64,
+    },
+    SampleFuture {
+        ahead_ms: u64,
+    },
+    EnvelopeOverflow {
+        owner_bytes: u64,
+        job_bytes: u64,
+        outside_bytes: u64,
+    },
+    DispatchArmRefused,
+    DispatchWindowExpired {
+        overdue_ms: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReserveFailure {
+    pub step: ReserveStep,
+    pub failure: ReserveCheck,
+}
+
+/// Fixed QMP operations shared by the paused evidence collector and its reader.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PausedQmpStep {
+    Greeting,
+    Capabilities,
+    QueryStatus,
+    QueryAccelerators,
+    ReleaseStartup,
+    Quit,
+    Powerdown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PausedDispatchState {
+    Idle,
+    Armed,
+    Writing,
+    WrittenInTime,
+    Expired,
+    Ambiguous,
+}
+
+/// Which accelerator liveness check found the held child no longer live in
+/// its Job: before `query-accelerators`, or after its reply and dispatch
+/// confirmation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PausedLivenessGate {
+    BeforeAcceleratorQuery,
+    AfterAcceleratorConfirmation,
+}
+
+/// State of the already-held child before requesting teardown.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PausedChildState {
+    Absent,
+    Live,
+    Exited { status: Option<u32> },
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PausedSnapshot {
+    pub child: PausedChildState,
+    pub dispatch: Option<PausedDispatchState>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PausedFailure {
+    pub failure: PausedCheck,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<PausedSnapshot>,
+}
+
+/// Non-reserve subchecks that previously collapsed to an opaque refusal.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "check", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PausedCheck {
+    PrepareStdio,
+    StdioMissing,
+    StartStdioWorkers,
+    QmpChannel {
+        step: PausedQmpStep,
+        error: super::qmp::ChannelError,
+    },
+    QmpGreetingVersion {
+        measured: [u16; 3],
+        required: [u16; 3],
+    },
+    QmpGreetingPackageBytes {
+        measured_bytes: u32,
+        maximum_bytes: u32,
+    },
+    QmpGreetingCapabilityCount {
+        measured_count: u32,
+        maximum_count: u32,
+    },
+    QmpGreetingCapabilityBytes {
+        measured_bytes: u32,
+        minimum_bytes: u32,
+        maximum_bytes: u32,
+    },
+    QmpStatus {
+        measured: super::qmp::RunStatus,
+        required: super::qmp::RunStatus,
+    },
+    DispatchUnconfirmed {
+        step: PausedQmpStep,
+        state: PausedDispatchState,
+        wait_limit_ms: u64,
+        wait_finished: bool,
+    },
+    DispatchInterrupted {
+        step: PausedQmpStep,
+        error: super::qmp::ChannelError,
+    },
+    DispatchNotWritable {
+        step: PausedQmpStep,
+        state: PausedDispatchState,
+    },
+    WhpxChannel {
+        error: super::qmp::ChannelError,
+    },
+    WhpxNotEnabled,
+    WhpxAcceleratorCount {
+        measured_count: u32,
+        maximum_count: u32,
+    },
+    WhpxPresenceCount {
+        measured_count: u32,
+        required_count: u32,
+    },
+    WhpxUnknownAccelerator,
+    AcceleratorChildLiveness {
+        gate: PausedLivenessGate,
+    },
+    Disabled,
+    QualificationMissing,
+    IdentityUnverified,
+    QmpUnverified,
+    GuestEndpointUnverified,
+    NetworkFenceUnverified,
+    InstallerPhaseUnavailable,
+    InstallerPhaseMismatch,
+    InstallerDeadlineExpired,
+}
+
 /// Controlled mutations apply only inside the owner-local trial. The
 /// record describes the fresh sample before the fault and its settlement.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1061,6 +1264,11 @@ pub enum StageResult {
     /// A live TEST probe report without independent packet attribution.
     /// The graph treats this as non-passing.
     NetworkDiagnostic(RestrictedNetworkDiagnostic),
+    /// Additive, versioned incomplete evidence. Contract-4 passing rows and
+    /// the legacy generic reserve refusal retain their canonical encodings.
+    ReserveRefusalV1(ReserveFailure),
+    /// Additive incomplete evidence for paused protocol and native checks.
+    PausedRefusalV1(PausedFailure),
     /// The native collector for this stage is not implemented in this
     /// contract version. Never completes a dossier.
     Unimplemented,

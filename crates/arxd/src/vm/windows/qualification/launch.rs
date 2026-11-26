@@ -258,7 +258,7 @@ impl<'a> QualifierLaunch<'a> {
         baseline: &'a Baseline,
         inputs: LaunchInputs<'a>,
         refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
-    ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
+    ) -> Result<(Self, PipeOutput, tokio::io::DuplexStream), NativeRefusal> {
         Self::hold(
             permit,
             HeldRecipeScope::from_baseline(baseline),
