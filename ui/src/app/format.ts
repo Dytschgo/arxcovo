@@ -37,6 +37,22 @@ export function formatTimeLeft(iso: string, now: number): string {
   return h > 0 ? `in ${h}h ${String(m).padStart(2, '0')}m` : `in ${m}m`;
 }
 
+/**
+ * How long ago an instant was, coarse and calm: "just now", "12 m ago",
+ * "3 h ago", "2 d ago". Never throws: an unparseable timestamp renders as a dash.
+ */
+export function formatAgo(iso: string | null, now: number): string {
+  if (!iso) return '—';
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return '—';
+  const minutes = Math.floor((now - at) / 60_000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
+}
+
 export const OS_LABEL: Record<OsFamily, string> = { windows: 'Windows', linux: 'Linux' };
 
 export function percent(used: number | null, total: number): number | null {

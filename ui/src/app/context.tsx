@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { ApiError, isApiError, type ArxApi, type Credentials, type Session } from '../api/types';
+import { ApiError, isApiError, type ArxApi, type Credentials, type Host, type Session, type Vm } from '../api/types';
 
 const ApiContext = createContext<ArxApi | null>(null);
 
@@ -26,6 +26,32 @@ interface SessionValue {
 }
 
 const SessionContext = createContext<SessionValue | null>(null);
+
+/** How long a loaded host or VM list counts as fresh for reuse (search jump list). */
+export const INVENTORY_TTL_MS = 60_000;
+
+/**
+ * The host and VM lists the views already loaded in this session, so the
+ * search jump list can reuse them instead of asking again. Every entry is
+ * tied to the session that loaded it: `epoch()` names the current session,
+ * `put` drops results from an older one, and a new sign-in starts empty.
+ */
+export interface Inventory {
+  /** The current session's identity, or null when signed out. Capture it before a request. */
+  epoch(): object | null;
+  /** Lists loaded in the current session within the TTL. */
+  fresh(now?: number): { hosts?: Host[]; vms?: Vm[] };
+  /** Records lists loaded under `epoch`; ignored when that session is gone. */
+  put(epoch: object | null, lists: { hosts?: Host[]; vms?: Vm[] }, now?: number): void;
+}
+
+const InventoryContext = createContext<Inventory | null>(null);
+
+export function useInventory(): Inventory {
+  const value = useContext(InventoryContext);
+  if (!value) throw new Error('useInventory outside AppProviders');
+  return value;
+}
 
 export function useSession(): SessionValue {
   const value = useContext(SessionContext);
@@ -74,9 +100,32 @@ export function AppProviders({ api, children }: { api: ArxApi; children: ReactNo
   }, []);
 
   const value = useMemo(() => ({ state, logoutError, login, logout, expire }), [state, logoutError, login, logout, expire]);
+
+  // The session object is the epoch: a new sign-in is a new object, signed out is null.
+  const epochRef = useRef<object | null>(null);
+  const lists = useRef<{ epoch: object | null; hosts?: { data: Host[]; at: number }; vms?: { data: Vm[]; at: number } }>({ epoch: null });
+  epochRef.current = state.status === 'authenticated' ? state.session : null;
+  const inventory = useMemo<Inventory>(() => ({
+    epoch: () => epochRef.current,
+    fresh: (now = Date.now()) => {
+      const l = lists.current;
+      if (l.epoch === null || l.epoch !== epochRef.current) return {};
+      const ok = (e?: { at: number }) => e !== undefined && now - e.at <= INVENTORY_TTL_MS;
+      return { hosts: ok(l.hosts) ? l.hosts!.data : undefined, vms: ok(l.vms) ? l.vms!.data : undefined };
+    },
+    put: (epoch, { hosts, vms }, now = Date.now()) => {
+      if (epoch === null || epoch !== epochRef.current) return;
+      if (lists.current.epoch !== epoch) lists.current = { epoch };
+      if (hosts) lists.current.hosts = { data: hosts, at: now };
+      if (vms) lists.current.vms = { data: vms, at: now };
+    },
+  }), []);
+
   return (
     <ApiContext.Provider value={api}>
-      <SessionContext.Provider value={value}>{children}</SessionContext.Provider>
+      <SessionContext.Provider value={value}>
+        <InventoryContext.Provider value={inventory}>{children}</InventoryContext.Provider>
+      </SessionContext.Provider>
     </ApiContext.Provider>
   );
 }

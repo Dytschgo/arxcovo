@@ -233,3 +233,31 @@ describe('motion', () => {
     }
   });
 });
+
+describe('hosts board', () => {
+  test('the board scrolls inside itself, so wide clusters never overflow the page', () => {
+    expect(css).toMatch(/\.board\s*{[^}]*overflow-x:\s*auto;/);
+    expect(css).toMatch(/\.board-cols\s*{[^}]*min-inline-size:\s*calc\(var\(--cols/);
+  });
+});
+
+describe('control edges (WCAG 2.2 SC 1.4.11)', () => {
+  test('--edge clears 3:1 on every surface a control sits on, including the hover fill', () => {
+    for (const surface of ['bg', 'tile', 'tile2', 'raise']) {
+      expect(contrast(token('edge'), token(surface)), `--edge on --${surface}`).toBeGreaterThanOrEqual(3);
+    }
+    expect(contrast(token('edge'), '#1a1a1a')).toBeGreaterThanOrEqual(3);
+  });
+
+  test('PR B fields, chips, segmented groups, the toggle and the current host use --edge', () => {
+    const block = (selector: string) => {
+      const start = css.indexOf(`\n${selector} {`);
+      expect(start, selector).toBeGreaterThan(-1);
+      return css.slice(start, css.indexOf('}', start));
+    };
+    for (const selector of ['.search input, .filter-name input', '.seg', '.fchip', '.terminal-input input', 'a.hp[aria-current]']) {
+      expect(block(selector), selector).toMatch(/var\(--edge\)/);
+    }
+    expect(block('.switch-track')).toMatch(/box-shadow:\s*inset 0 0 0 1px var\(--edge\)/);
+  });
+});
