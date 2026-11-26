@@ -681,3 +681,37 @@ fn start_pair_shape_is_checked_against_durable_slots() -> Result<()> {
         Ok(())
     })
 }
+
+/// A writable helper target must still be identified, and unverified, as the
+/// exact object in its bound scope.
+#[test]
+fn identified_target_must_be_the_exact_unverified_object() -> Result<()> {
+    let dir = private_temp();
+    let store = VmStore::open(dir.path(), NOW)?;
+    store.transact(|db| {
+        let slots = build(db, 1)?;
+        let scope = scope(slots.pair.disk.generation);
+        bind(db, scope)?;
+        let disk = slots.pair.disk;
+        assert!(!identified_as(db, scope, disk, identity(10))?);
+        intend_slot(db, scope, disk)?;
+        assert!(!identified_as(db, scope, disk, identity(10))?);
+        identify_slot(db, scope, disk, identity(10))?;
+        assert!(identified_as(db, scope, disk, identity(10))?);
+        let foreign = FileIdentity {
+            volume: 8,
+            ..identity(10)
+        };
+        let parent = Scope {
+            workspace: identity(4),
+            ..scope
+        };
+        assert!(!identified_as(db, scope, disk, identity(11))?);
+        assert!(!identified_as(db, scope, disk, foreign)?);
+        assert!(!identified_as(db, parent, disk, identity(10))?);
+        assert!(!identified_as(db, scope, slots.pair.vars, identity(10))?);
+        verify_slot(db, scope, disk, evidence(10, scope, b"disk"))?;
+        assert!(!identified_as(db, scope, disk, identity(10))?);
+        Ok(())
+    })
+}

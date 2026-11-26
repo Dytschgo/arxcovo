@@ -182,6 +182,24 @@ impl CustodyCheckpoints for Recorder<'_> {
     }
 }
 
+/// The owner the reservation's new objects receive. Production refuses an
+/// elevated token, so this is the user. An elevated test runner assigns new
+/// objects to its default owner instead, so the fixture expects that owner
+/// and gives it the private root. The returned data keeps the SID at the
+/// same offset as `TOKEN_USER`, as `sid_ptr` expects.
+fn default_owner_sid() -> (Vec<usize>, String) {
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    let token = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
+    let data = token_data(&token, TokenOwner).unwrap();
+    let sid = unsafe { (*data.as_ptr().cast::<TOKEN_OWNER>()).Owner };
+    let mut text = std::ptr::null_mut();
+    assert_ne!(unsafe { ConvertSidToStringSidW(sid, &mut text) }, 0);
+    let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+    let string = String::from_utf16(unsafe { std::slice::from_raw_parts(text, len) }).unwrap();
+    unsafe { LocalFree(text.cast()) };
+    (data, string)
+}
+
 /// A private production root, a store with five pending builds, and the
 /// owner SID that the reservation checks.
 /// Fields drop in order: handles close before the directories go.
@@ -197,7 +215,12 @@ pub(in crate::vm::windows::qualification) struct Fixture {
 impl Fixture {
     pub(in crate::vm::windows::qualification) fn new() -> Self {
         let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
-        let (owner, _, production) = private_dir(temp.path(), "production");
+        let (owner, text) = default_owner_sid();
+        let production = create_dir_sddl(
+            temp.path(),
+            "production",
+            &format!("O:{text}D:P(A;OICI;FA;;;{text})"),
+        );
         let production = PathPin::open(&production, true, false).unwrap();
         let state = crate::service::application::tests::private_temp();
         let store = VmStore::open(state.path(), 100).unwrap();
