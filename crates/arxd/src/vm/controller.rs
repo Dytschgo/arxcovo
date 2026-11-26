@@ -2649,6 +2649,31 @@ impl<C: Clock> VmController<C> {
         &self.store
     }
 
+    /// Read-only replay lookup for occupied-slot or already-known replay
+    /// checks. Preserves exact binding, key-collision and stale-key checks
+    /// without advancing `vm_retry_clock` or pruning expired terminal rows.
+    pub(crate) fn foreground_replay_readonly(
+        &self,
+        principal: &str,
+        key: RequestId,
+        subject: Subject<'_>,
+        action: i64,
+    ) -> Result<Result<Option<store::Replay>, Refusal>> {
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        let closed = gate.closed;
+        let binding = store::Binding {
+            principal,
+            key,
+            subject,
+            action,
+        };
+        self.store
+            .read_only(|db| binding.replay_readonly(db, utc(self.clock.now())?, closed))
+    }
+
     /// Capture the sealed source and exact stopped pair in the same transaction
     /// that invalidates its release and installs the start's writer epoch.
     pub(crate) fn admit_native_start(

@@ -398,6 +398,21 @@ async fn ready_commit_resamples_a_child_lost_while_the_gate_was_busy() {
     let _ = h.shutdown().await;
 }
 
+fn retry_high_water(h: &Harness) -> i64 {
+    h.supervisor().controller.native_store().transact(|db| {
+        Ok(db.query_row("SELECT high_water_ms FROM vm_retry_clock", [], |r| r.get(0))?)
+    }).unwrap()
+}
+
+fn operation_exists(h: &Harness, operation: Id) -> bool {
+    h.supervisor().controller.native_store().transact(|db| {
+        Ok(db.query_row(
+            "SELECT count(*) FROM vm_operations WHERE operation_id=?1",
+            [operation], |r| r.get::<_, i64>(0),
+        )? == 1)
+    }).unwrap()
+}
+
 #[tokio::test]
 async fn start_behind_a_held_registration_is_busy_without_a_durable_write() {
     let mut h = windows_harness().await;
@@ -423,28 +438,87 @@ async fn start_behind_a_held_registration_is_busy_without_a_durable_write() {
     assert_eq!(unresolved_epoch(&h, vm), None);
 
     // Once the previous owner returns, the same fresh request starts and its
-    // parked worker owns the slot. A replay of it writes nothing new.
+    // parked worker owns the slot.
     drop(held);
     let (resume, parked) = std::sync::mpsc::channel::<()>();
     let started = supervisor.gate.lock().unwrap().start_native_run(
         supervisor, &Installation::fixture(), start_request(vm, 505), HOST, RESOURCES,
         move |_, _, _, _| { let _ = parked.recv(); Ok(()) },
     ).unwrap();
-    let operations = operation_count(&h);
     assert!(unresolved_epoch(&h, vm).is_some());
     assert!(supervisor.native_runs.with_entry(vm, |owner| owner.is_some()).unwrap());
+
+    // Insert an unrelated expired terminal operation and advance fake UTC
+    // within the replay window. Occupied-slot replay and refusals must make
+    // zero durable writes (no retry-clock advance and no expired-row pruning).
+    let expired_op: Id = [91; 16];
+    let expired_key: Id = [92; 16];
+    let unrelated_vm: Id = [93; 16];
+    supervisor.controller.native_store().transact(|db| {
+        db.execute(
+            "INSERT INTO activity(principal,vm,action,started_ms,finished_ms,terminal_order,status,actor)
+             VALUES('beta',?1,3,?2,?2,(SELECT coalesce(max(terminal_order),0)+1 FROM activity),1,'agent')",
+            params![unrelated_vm, UTC - 10_000],
+        )?;
+        let activity = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO vm_operations(principal,request_key,operation_id,vm,action,activity_id,
+                valid_through_ms,status,binding_kind,subject_id)
+             VALUES('beta',?1,?2,?3,3,?4,?5,1,'vm',?3)",
+            params![expired_key, expired_op, unrelated_vm, activity, UTC - 1],
+        )?;
+        Ok(())
+    }).unwrap();
+    let operations = operation_count(&h);
+    let high_water_before = retry_high_water(&h);
+    h.now.store(UTC + 5_000, Ordering::SeqCst);
+
+    // Exact replay returns the old receipt with zero durable writes.
     let replay = supervisor.gate.lock().unwrap().start_native_run(
         supervisor, &Installation::fixture(), start_request(vm, 505), HOST, RESOURCES,
         |_, _, _, _| panic!("a replay reached a worker"),
     ).unwrap();
     assert_eq!(replay, started);
+    assert_eq!(retry_high_water(&h), high_water_before, "occupied-slot replay advanced vm_retry_clock");
     assert_eq!(operation_count(&h), operations);
+    assert!(operation_exists(&h, expired_op), "occupied-slot replay pruned an expired operation");
+
+    // Key collision (reusing the vm_create key 501) and stale key are refused
+    // without advancing the retry clock or pruning unrelated rows.
+    let collision = supervisor.gate.lock().unwrap().start_native_run(
+        supervisor, &Installation::fixture(), start_request(vm, 501), HOST, RESOURCES,
+        |_, _, _, _| panic!("a colliding key reached a worker"),
+    );
+    assert_eq!(collision.unwrap_err().0, "key_collision");
+    assert_eq!(retry_high_water(&h), high_water_before);
+    assert!(operation_exists(&h, expired_op));
+
+    let stale_req = Request {
+        principal: "alpha",
+        vm,
+        request_id: RequestId::parse(&format!("{:016x}{:016x}", 1_u64, 599_u64)).unwrap(),
+        operation: Operation::Start,
+        disk: DiskClaim::default(),
+    };
+    let stale = supervisor.gate.lock().unwrap().start_native_run(
+        supervisor, &Installation::fixture(), stale_req, HOST, RESOURCES,
+        |_, _, _, _| panic!("a stale key reached a worker"),
+    );
+    assert_eq!(stale.unwrap_err().0, "stale_key");
+    assert_eq!(retry_high_water(&h), high_water_before);
+    assert!(operation_exists(&h, expired_op));
+
+    // Fresh valid key returns Busy while keeping both high_water_ms and the
+    // unrelated expired terminal operation row intact.
     let fresh = supervisor.gate.lock().unwrap().start_native_run(
         supervisor, &Installation::fixture(), start_request(vm, 506), HOST, RESOURCES,
         |_, _, _, _| panic!("a refused start reached its worker"),
     );
     assert_eq!(fresh.unwrap_err().0, "busy");
+    assert_eq!(retry_high_water(&h), high_water_before, "occupied-slot busy advanced vm_retry_clock");
     assert_eq!(operation_count(&h), operations);
+    assert!(operation_exists(&h, expired_op), "occupied-slot busy pruned an expired operation");
+
     resume.send(()).unwrap();
     assert_admission_closed(&h);
     drop(client);

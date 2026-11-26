@@ -346,7 +346,7 @@ impl Gate {
 fn replay_start(supervisor: &Supervisor, request: &Request<'_>) -> Outcome<Option<Value>> {
     Ok(supervisor
         .controller
-        .foreground_replay(
+        .foreground_replay_readonly(
             request.principal,
             request.request_id,
             Subject::Vm(request.vm),
