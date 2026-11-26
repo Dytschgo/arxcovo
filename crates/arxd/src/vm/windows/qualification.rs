@@ -1612,11 +1612,47 @@ fn listing(dir: &File) -> io::Result<Vec<(String, u32)>> {
     listing_bounded(dir, 4096, None)
 }
 
+enum ListingError {
+    /// Directory contains more entries than the qualified bound allows.
+    LimitExceeded,
+    /// Enumeration hit its wall-clock deadline before finishing.
+    TimedOut,
+    /// OS / Win32 I/O or malformed directory-record failure.
+    Io(io::Error),
+}
+
+impl ListingError {
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::LimitExceeded => io::Error::other("directory entry limit exceeded"),
+            Self::TimedOut => io::ErrorKind::TimedOut.into(),
+            Self::Io(error) => error,
+        }
+    }
+}
+
 fn listing_bounded(
     dir: &File,
     max_entries: usize,
     deadline: Option<Instant>,
 ) -> io::Result<Vec<(String, u32)>> {
+    listing_bounded_typed(dir, max_entries, deadline).map_err(ListingError::into_io)
+}
+
+fn listing_bounded_typed(
+    dir: &File,
+    max_entries: usize,
+    deadline: Option<Instant>,
+) -> Result<Vec<(String, u32)>, ListingError> {
+    listing_bounded_with(dir, max_entries, deadline, &mut Instant::now)
+}
+
+fn listing_bounded_with(
+    dir: &File,
+    max_entries: usize,
+    deadline: Option<Instant>,
+    now: &mut impl FnMut() -> Instant,
+) -> Result<Vec<(String, u32)>, ListingError> {
     let mut buffer = vec![0u64; 8192];
     let capacity = buffer.len() * size_of::<u64>();
     let header = size_of::<FILE_FULL_DIR_INFO>();
@@ -1624,8 +1660,8 @@ fn listing_bounded(
     let mut found = Vec::new();
     let mut class = FileFullDirectoryRestartInfo;
     loop {
-        if deadline.is_some_and(|until| Instant::now() >= until) {
-            return Err(io::ErrorKind::TimedOut.into());
+        if deadline.is_some_and(|until| now() >= until) {
+            return Err(ListingError::TimedOut);
         }
         // The aligned buffer receives a chain of variable-length records.
         let ok = unsafe {
@@ -1636,25 +1672,35 @@ fn listing_bounded(
                 capacity as u32,
             )
         };
-        if ok == 0 {
-            let error = io::Error::last_os_error();
+        let os_error = (ok == 0).then(io::Error::last_os_error);
+        // Check the deadline after capturing the Win32 status so `now()`
+        // cannot clobber `GetLastError` and a read that crosses the cutoff
+        // cannot resolve as a terminal inventory result.
+        if deadline.is_some_and(|until| now() >= until) {
+            return Err(ListingError::TimedOut);
+        }
+        if let Some(error) = os_error {
             if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
                 return Ok(found);
             }
-            return Err(error);
+            return Err(ListingError::Io(error));
         }
         class = FileFullDirectoryInfo;
         let bytes = buffer.as_ptr().cast::<u8>();
         let mut offset = 0;
         loop {
             if offset + header > capacity {
-                return Err(io::Error::other("directory record out of bounds"));
+                return Err(ListingError::Io(io::Error::other(
+                    "directory record out of bounds",
+                )));
             }
             // The record starts inside the buffer at an 8-byte boundary.
             let entry = unsafe { &*bytes.add(offset).cast::<FILE_FULL_DIR_INFO>() };
             let length = entry.FileNameLength as usize;
             if offset + name_offset + length > capacity || !length.is_multiple_of(2) {
-                return Err(io::Error::other("directory name out of bounds"));
+                return Err(ListingError::Io(io::Error::other(
+                    "directory name out of bounds",
+                )));
             }
             // The name lies inside the buffer, as checked above.
             let units = unsafe {
@@ -1663,10 +1709,11 @@ fn listing_bounded(
                     length / 2,
                 )
             };
-            let name = String::from_utf16(units).map_err(io::Error::other)?;
+            let name = String::from_utf16(units)
+                .map_err(|error| ListingError::Io(io::Error::other(error)))?;
             if name != "." && name != ".." {
                 if found.len() == max_entries {
-                    return Err(io::Error::other("directory entry limit exceeded"));
+                    return Err(ListingError::LimitExceeded);
                 }
                 found.push((name, entry.FileAttributes));
             }
@@ -1675,7 +1722,9 @@ fn listing_bounded(
             }
             let next = entry.NextEntryOffset as usize;
             if next < name_offset + length || !next.is_multiple_of(8) {
-                return Err(io::Error::other("invalid directory record offset"));
+                return Err(ListingError::Io(io::Error::other(
+                    "invalid directory record offset",
+                )));
             }
             offset += next;
         }
