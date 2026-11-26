@@ -128,10 +128,21 @@ impl Admitted {
     allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
 )]
 pub(crate) enum AdmittedEffect {
-    Clone,
+    /// A linked clone of the sealed golden generation admission verified
+    /// for this template.
+    Clone {
+        template: Id,
+        golden: Id,
+    },
     Start,
-    Script { digest: [u8; 32], timeout_s: u64 },
-    Build { recipe_id: Id, digest: [u8; 32] },
+    Script {
+        digest: [u8; 32],
+        timeout_s: u64,
+    },
+    Build {
+        recipe_id: Id,
+        digest: [u8; 32],
+    },
 }
 
 /// Foreground VM-profile metadata. A successful admission commits intent;
@@ -846,7 +857,14 @@ impl<C: Clock> VmController<C> {
                 store::require_headroom(db)?;
                 Ok(Ok(CloneAdmission::Fresh(request.vm, slots, PendingOperation {
                     activity_id: operation.receipt.activity_id,
-                    admitted: Some(Admitted::new(&binding, operation.id, AdmittedEffect::Clone)),
+                    admitted: Some(Admitted::new(
+                        &binding,
+                        operation.id,
+                        AdmittedEffect::Clone {
+                            template,
+                            golden: golden.disk.generation,
+                        },
+                    )),
                     ..pending
                 }, operation)))
         }))
@@ -2716,6 +2734,95 @@ impl<C: Clock> VmController<C> {
         Ok(true)
     }
 
+    /// The exact sealed golden this clone worker was admitted for (7c 11),
+    /// re-read from the active sealed ledger with both native slots
+    /// verified. Only this method produces a [`SealedGolden`].
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+    )]
+    pub(crate) fn admitted_sealed_golden(
+        &self,
+        worker: &PendingOperation,
+    ) -> Result<Option<SealedGolden>> {
+        self.check_worker(worker)?;
+        let Some(AdmittedEffect::Clone { template, golden }) =
+            worker.admitted().map(|admitted| admitted.effect)
+        else {
+            return Ok(None);
+        };
+        self.store.transact(|db| {
+            Ok(
+                store::sealed_golden(db, template, golden, worker.activity_id)?.map(
+                    |(slots, evidence, retained)| SealedGolden {
+                        template,
+                        slots,
+                        evidence,
+                        retained,
+                    },
+                ),
+            )
+        })
+    }
+
+    /// Settles a native TEST clone (7c 11). The pair publishes only when,
+    /// inside this transaction, the worker is neither cancelled nor past its
+    /// effect cutoff, its admitted golden is still exactly the active sealed
+    /// one, and its ledger custody is a bound clone workspace holding both
+    /// slots verified as exactly these objects and contents within the
+    /// retained claim. The existing timeliness and TTL rules still apply.
+    /// Anything else abandons the staging generation to the shared disposal
+    /// route with its claim retained.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+    )]
+    pub(crate) fn finish_native_clone(
+        &self,
+        worker: &PendingOperation,
+        slots: PairSlots,
+        outcome: Result<[ArtifactEvidence; 2], FailureReason>,
+        gate: ClonePublication<'_>,
+    ) -> Result<Status> {
+        self.check_worker(worker)?;
+        let admitted = worker.admitted().map(|admitted| admitted.effect);
+        self.store.transact(|db| {
+            let clock = self.clock.now();
+            let golden = match (admitted, gate.golden) {
+                (Some(AdmittedEffect::Clone { template, golden }), Some(held))
+                    if held.template == template && held.slots.disk.generation == golden =>
+                {
+                    store::sealed_golden(db, template, golden, worker.activity_id)?.is_some_and(
+                        |(slots, evidence, _)| (slots, evidence) == (held.slots, held.evidence),
+                    )
+                }
+                _ => false,
+            };
+            let cancelled = (gate.cancelled)();
+            let (proof, cause) = match outcome {
+                Ok(_) if cancelled => (None, Some(FailureReason::Cancelled)),
+                Ok(pair)
+                    if golden
+                        && clock.monotonic < gate.effect_cutoff
+                        && store::native_clone_verified(db, slots, pair)? =>
+                {
+                    (Some(pair), None)
+                }
+                Ok(_) => (None, Some(FailureReason::CloneFailed)),
+                Err(cause) => (None, Some(cause)),
+            };
+            store::settle_clone(
+                db,
+                worker.activity_id,
+                slots,
+                proof,
+                clock.monotonic < worker.deadline,
+                utc(clock)?,
+                cause,
+            )
+        })
+    }
+
     /// Recovery needs exact durable TEST custody, not a fresh selection: the
     /// bound native workspace scope of a non-static generation. A generation
     /// with writer history needs its exact writer epoch: an unresolved
@@ -2750,6 +2857,47 @@ impl<C: Clock> VmController<C> {
                 )? == 1)
         })
     }
+}
+
+/// The sealed golden a clone worker was admitted for, read from the active
+/// sealed ledger: exact slots, verified evidence and the clone's retained
+/// claim. Only [`VmController::admitted_sealed_golden`] constructs one.
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SealedGolden {
+    template: Id,
+    slots: PairSlots,
+    evidence: [ArtifactEvidence; 2],
+    retained: u64,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+)]
+impl SealedGolden {
+    pub(crate) fn slots(&self) -> PairSlots {
+        self.slots
+    }
+
+    pub(crate) fn evidence(&self) -> [ArtifactEvidence; 2] {
+        self.evidence
+    }
+
+    /// The clone's retained claim, which bounds its staged pair.
+    pub(crate) fn retained(&self) -> u64 {
+        self.retained
+    }
+}
+
+/// What the clone publication decides on inside its transaction.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) struct ClonePublication<'a> {
+    pub golden: Option<&'a SealedGolden>,
+    /// The monotonic effect cutoff, on the controller clock.
+    pub effect_cutoff: Instant,
+    pub cancelled: &'a dyn Fn() -> bool,
 }
 
 #[cfg(test)]

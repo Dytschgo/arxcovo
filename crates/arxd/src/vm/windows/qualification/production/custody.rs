@@ -344,11 +344,15 @@ impl SlotWriter<'_> {
 pub(crate) struct HelperTarget<'l> {
     binding: WorkspaceBinding,
     slot: ArtifactSlot,
-    pin: PathPin,
+    pub(super) pin: PathPin,
     ledger: &'l dyn CustodyCheckpoints,
 }
 
 impl HelperTarget<'_> {
+    pub(crate) fn binding(&self) -> WorkspaceBinding {
+        self.binding
+    }
+
     pub(crate) fn slot(&self) -> ArtifactSlot {
         self.slot
     }

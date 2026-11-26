@@ -41,6 +41,8 @@ pub(crate) use controller::{
     ActivityReceipt, CatalogEntry, ForegroundSubject, Precheck, VaultSweepPriority,
     VaultTestCleanup,
 };
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) use controller::{ClonePublication, SealedGolden};
 pub use model::*;
 pub use policy::{Capacity, HostObservation, Resources, VmPolicy};
 pub use reaper::{MonotonicReaperTicks, ReaperTick};

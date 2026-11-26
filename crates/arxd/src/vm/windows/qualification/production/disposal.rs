@@ -887,4 +887,4 @@ fn verify_dir_empty(dir: &File, deadline: Instant) -> Result<(), Q> {
 
 #[cfg(test)]
 #[path = "disposal_tests.rs"]
-mod tests;
+pub(super) mod tests;

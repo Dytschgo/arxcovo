@@ -432,8 +432,33 @@ impl StopEvidence {
 
 /// Release must be bound to the old generation and pin the slot against reuse.
 /// An observed process exit or fixture receipt cannot produce this lease.
+/// On Windows x64 only a held, ledger-identified helper target produces one
+/// (7c 11), and the checked launch accepts it only for that exact target. It
+/// is a binding, not effect authority: creation still needs a consumed
+/// `LaunchAuthority`.
 pub struct OfflineLease {
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     _closed: std::convert::Infallible,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    target: (
+        super::qualification::WorkspaceBinding,
+        super::paths::FileIdentity,
+    ),
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl OfflineLease {
+    /// The only constructor: a held, ledger-identified helper target, which
+    /// only the checked custody code can produce.
+    pub(in crate::vm) fn for_helper(target: &super::qualification::HelperTarget<'_>) -> Self {
+        Self {
+            target: (target.binding(), target.identity()),
+        }
+    }
+
+    pub(in crate::vm) fn binds(&self, target: &super::qualification::HelperTarget<'_>) -> bool {
+        self.target == (target.binding(), target.identity())
+    }
 }
 
 pub const SNAPSHOT_COPY_MAXIMUM: Duration = Duration::from_secs(15 * 60);
