@@ -77,6 +77,10 @@ Before resuming, the supervisor checks the held child, its Job membership,
 and the dedicated token policy, including account, integrity, logon identity,
 groups, privileges and default DACL.
 
+Every restricted launch starts detached on a fresh private desktop of the
+non-visible logon-session station. See the
+[2026-11-26 launch-desktop amendment](#amendment-2026-11-26--private-non-interactive-desktop-for-vm-launches).
+
 The guest connection targets a fresh local pipe basename and the fixed
 `org.arxcovo.agent.0` virtio-serial port. The parent starts draining stdio,
 resumes the process for device initialization, and connects the serial
@@ -1483,3 +1487,146 @@ output until checked native creation, live route enforcement and the reviewed
 capture and HTTPS adapters are wired. The owner preflights a separate E1a
 copy without changing the held bundle predicate.
 [Docker qualification runbook](../docker-qualification.md)
+
+## Amendment 2026-11-26 — Private non-interactive desktop for VM launches
+
+Paused trials 8 and 9 lost QEMU during Windows process initialization. The
+child exited with `STATUS_DLL_INIT_FAILED` (0xC0000142), and the greeting
+read saw EOF before any QMP byte. Two independent diagnoses found three
+separate causes:
+
+1. `CREATE_NO_WINDOW` gives the child a hidden console, which needs a
+   conhost child process. `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`
+   blocks that process, so console initialization fails.
+2. A child that imports USER32 cannot initialize on the inherited
+   `WinSta0\Default` desktop under the write-restricted token. The token's
+   restricting set contains only the account SID, which cannot write there.
+3. `bcrypt.dll` initialization opens `\Device\KsecDD` for write. That device
+   grants write to Everyone and not to the account SID, so the restricted
+   pass denies it. arxd's own test image imports bcrypt. The pinned QEMU
+   11.1.3 bundle does not.
+
+### Launch shape
+
+The shared launcher is used by every restricted purpose: the paused trial,
+the installer boot, the installed boot, `qemu-img` helpers, and the static
+and Docker native boots once they are admitted. For each launch it:
+
+- uses `DETACHED_PROCESS` instead of `CREATE_NO_WINDOW`. The child has no
+  console, and QMP stays on the three inherited stdio pipes.
+- obtains the logon-session station with `CreateWindowStationW(NULL, …)`.
+  This works on fresh and existing logons without Administrators. Creating
+  a named private station would require Administrators. The launcher reads
+  the station back and refuses unless it is non-visible (`WSF_VISIBLE` clear),
+  is not `WinSta0`, and has the exact `Service-0x<hi>-<lo>$` name of the VM
+  token's authentication LUID. It reads the station's owner and DACL for the
+  log, but **never modifies the station's security**. The descriptor passed
+  to the call applies only when Windows creates the station.
+- creates a fresh desktop `Arxcovo-<128 random bits>` on that station. Its
+  protected DACL has exactly three entries: deny NETWORK, allow the account,
+  and allow SYSTEM, each with all desktop rights. The account owns it. The
+  launcher reads the owner, protection flag and exact entries back from the
+  returned handle, and refuses on any mismatch.
+- passes the explicit `<station>\<desktop>` path as `lpDesktop`.
+- holds the station and desktop handles with the child, its Job and any
+  partial-create residue until the child settles. They close on every exit
+  path, so the desktop is destroyed once the child is gone.
+
+`CreateDesktopW` creates the desktop on the process's current station, so
+the launcher temporarily switches the process station. A daemon-wide mutex
+serializes the switch, the desktop creation and the restore. An RAII guard
+restores the original station and thread desktop and reads both back. If
+the restore fails, the guard poisons the lock state, and every later launch
+and every owner last-input sample is refused. That fails closed.
+
+### USER32 audit of arxd
+
+arxd creates no windows, hooks, message loops or clipboard owners. Its direct
+Windows UI-adjacent calls are:
+
+- `GetLastInputInfo`, for the owner-activity sample. It runs under the same
+  mutex, so it never observes the switched station.
+- `SHGetKnownFolderPath` and `CommandLineToArgvW` in shell32. These are pure
+  helpers with no station state.
+- `SetConsoleCtrlHandler` in the dashboard password prompt. This is
+  console-scoped kernel32.
+- The station and desktop calls of this launcher.
+
+The tray is a separate process. No other thread depends on the process
+station during the switch.
+
+### Containment
+
+Containment is unchanged or stronger. The token remains
+`DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED` with the restricting set exactly
+`{account}`. Everyone and Authenticated Users were **not** added. The child
+loses access it previously could have attempted: it no longer shares the
+owner's interactive desktop. It can open neither `WinSta0\Default` for
+enumeration, reading or writing, nor its own console. The job, mitigation,
+child-process and handle-list attributes are unchanged.
+
+The station's clipboard and global atoms are station-scoped. Other
+non-interactive processes in the owner's logon session share them. A sibling
+VM child can open another launch's desktop, because the owner SID,
+restricting SID and integrity level are the same. Both limits sit inside the
+existing current-user trust boundary of the enrolled PC. Distinct desktops
+prevent accidental sharing and bind cleanup to each launch. Stronger
+separation is future work. It needs a per-launch restricting principal, such
+as a per-launch SID in the restricting set and the desktop, workspace and
+pipe DACLs.
+
+### bcrypt and KsecDD rule
+
+A VM child must not load `bcrypt.dll`, or any other component that opens
+`\Device\KsecDD` or `\Device\CNG` for write. The write-restricted token is
+denied `FILE_WRITE_DATA` on both devices. Their DACLs grant write only to
+Everyone among the token's identities. A static import fails the process
+with 0xC0000142 before the entry point.
+
+The pinned QEMU 11.1.3 `qemu-system-x86_64.exe`, `qemu-img.exe` and their
+16 DLLs reference bcrypt neither statically nor by delay load. Their RNG
+path uses CryptoAPI through cryptsp and rsaenh. A future bundle that pulls
+in bcrypt must either be refused or come with a reviewed token change. A
+held-inventory check that refuses PE import closures naming `bcrypt.dll` or
+`ncrypt.dll` is a later hardening item. It needs an import-table reader at
+the held-inventory edge, so it is not part of this amendment. If a
+production image ever genuinely needs bcrypt, adding Everyone to the
+restricting set is the known remedy. That is a containment change and
+requires its own security review.
+
+### Verification
+
+The integrated Windows test drives the production `Launch::Paused` path:
+the restricted owner token, the Job, the policies, the handle list, the
+private desktop, `DETACHED_PROCESS`, the checked resume and the
+`start_output` bridge. It drives that path with three compiled peers:
+
+- a kernel32-only peer;
+- a bare USER32 peer;
+- a QEMU-shaped peer, with the pinned system imports, CryptoAPI, Winsock,
+  COM, multimedia timers, the read-only WHPX capability query, and
+  optionally the pinned DLL copies.
+
+Each peer greets, acknowledges `qmp_capabilities`, stays live and exits
+cleanly. The USER32 and QEMU-shaped peers also prove their station is
+non-visible and that they cannot open the interactive desktop.
+
+The negative controls each change one variable and end with 0xC0000142 and
+`ERROR_BROKEN_PIPE`:
+
+- `CREATE_NO_WINDOW` on the private desktop;
+- an explicit `WinSta0\Default`;
+- a peer that statically imports bcrypt, under the full production launch.
+
+Two concurrent launches receive distinct desktops on the verified station.
+The launcher's station is restored afterwards, the station's owner and DACL
+are identical before and after, and each desktop is gone after settlement.
+Unit tests refuse a visible or foreign station, a desktop descriptor
+mismatch, and every launch after a failed restore.
+
+Real QEMU startup and **WHPX partition creation under this token are
+unverified on real hardware**. `vid.dll` opens `\Device\VidExo` with
+`GENERIC_READ` only, which the token is granted. vid.sys could still apply
+its own write-type check to partition IOCTLs. Paused trial 10 exercises this
+path. If it fails with `E_ACCESSDENIED`, the narrowest known remedy is a
+reviewed restricting-set change.
