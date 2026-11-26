@@ -2,7 +2,7 @@ import type { Host } from '../../api/types';
 import { useResource } from '../context';
 import { OS_LABEL, formatBytes, formatDate, percent } from '../format';
 import { href } from '../router';
-import { ArchBadge, Empty, Loaded, Meter, Page, StatePill } from '../ui';
+import { ArchBadge, Empty, HostStatus, Loaded, Meter, Page } from '../ui';
 
 export function HostMeters({ host }: { host: Host }) {
   const diskUsed = host.disk.totalBytes - host.disk.freeBytes;
@@ -22,7 +22,7 @@ function HostCard({ host }: { host: Host }) {
         <h2 className="card-title">
           <a className="card-link" href={href({ name: 'host', id: host.id })}>{host.name}</a>
         </h2>
-        <StatePill value={host.reachability} />
+        <HostStatus reachability={host.reachability} />
       </div>
       <p className="card-sub">
         <span>{OS_LABEL[host.os]} · {host.osVersion}</span>

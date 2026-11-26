@@ -3,7 +3,7 @@ import type { Arch, Vm } from '../../api/types';
 import { useResource } from '../context';
 import { OS_LABEL, formatDate } from '../format';
 import { href } from '../router';
-import { ArchBadge, Empty, Loaded, Page, Pill, SelectField, StatePill } from '../ui';
+import { ArchBadge, Empty, Loaded, Page, Pill, SelectField, VmStatus } from '../ui';
 
 export function expiryLabel(vm: Vm): string {
   return vm.expiresAt === null ? 'Never (static)' : formatDate(vm.expiresAt);
@@ -55,7 +55,7 @@ export function VmsView() {
                           <td><a href={href({ name: 'host', id: vm.hostId })}>{hostNames.get(vm.hostId) ?? vm.hostId}</a></td>
                           <td>
                             <span className="cell-pills">
-                              <StatePill value={vm.state} />
+                              <VmStatus state={vm.state} />
                               {vm.state === 'running' && !vm.ready ? <Pill tone="warn">not ready</Pill> : null}
                               {vm.ready ? <Pill tone="ok">ready</Pill> : null}
                             </span>

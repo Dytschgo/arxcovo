@@ -220,6 +220,10 @@ describe('terminal', () => {
     const log = screen.getByRole('log', { name: 'Terminal output for atlas' });
     await waitFor(() => expect(log.textContent).toContain('exit 0 · succeeded'));
     expect(log.textContent).toContain('git version 2.43.0');
+    const status = document.querySelector('.terminal-status .st')!;
+    expect(status.textContent).toBe('Terminal status: ready');
+    expect(status.querySelector('svg[data-icon]')).toBeTruthy();
+    expect(status.querySelector('.st-word')!.textContent).toBe('ready');
     expect(input).toHaveProperty('value', '');
     fireEvent.keyDown(input, { key: 'ArrowUp' });
     expect(input).toHaveProperty('value', 'git --version');
@@ -265,6 +269,10 @@ describe('console', () => {
     const img = await screen.findByRole('img', { name: /Console of ubuntu-build-02, frame \d+/ });
     expect(img.getAttribute('src')).toMatch(/^blob:/);
     expect(screen.getByText('View only')).toBeTruthy();
+    const status = document.querySelector('.terminal-status .st[data-status="streaming"]')!;
+    expect(status.textContent).toBe('Console status: streaming');
+    expect(status.getAttribute('data-status')).toBe('streaming');
+    expect(status.querySelector('svg[data-icon="monitor"]')).toBeTruthy();
   });
 
   test('a stopped VM explains why there is no picture', async () => {
@@ -284,14 +292,20 @@ describe('shell', () => {
     expect(await screen.findByRole('heading', { level: 1, name: 'Page not found' })).toBeTruthy();
   });
 
-  test('the theme toggle cycles system, light and dark on the root element', async () => {
-    await signIn();
-    const toggle = await screen.findByRole('button', { name: /^Theme: system/ });
-    fireEvent.click(toggle);
-    expect(document.documentElement.dataset.theme).toBe('light');
-    fireEvent.click(screen.getByRole('button', { name: /^Theme: light/ }));
-    expect(document.documentElement.dataset.theme).toBe('dark');
-    fireEvent.click(screen.getByRole('button', { name: /^Theme: dark/ }));
+  test('the top bar shows the logo, labels every section and only the current one shows its word; there is no theme control', async () => {
+    await signIn({}, '#/activity');
+    await screen.findByRole('list', { name: 'Activity, page 1' });
+    const home = screen.getByRole('link', { name: 'Arxcovo home' });
+    expect(home.querySelector('svg.logo')).toBeTruthy();
+    const nav = screen.getByRole('navigation', { name: 'Main' });
+    for (const name of ['Hosts', 'VMs', 'Activity', 'Terminal']) {
+      const link = within(nav).getByRole('link', { name });
+      const word = within(link).getByText(name);
+      expect(link.querySelector('svg.i')).toBeTruthy();
+      expect(word.className).toBe(name === 'Activity' ? 'nav-word' : 'visually-hidden');
+    }
+    expect(screen.getByText('Signed in as').parentElement!.textContent).toBe('Signed in as owner');
+    expect(screen.queryByRole('button', { name: /theme/i })).toBeNull();
     expect(document.documentElement.dataset.theme).toBeUndefined();
   });
 });

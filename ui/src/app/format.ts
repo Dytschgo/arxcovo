@@ -21,6 +21,22 @@ export function formatDate(iso: string | null): string {
   return Number.isNaN(date.getTime()) ? '—' : dateFormat.format(date);
 }
 
+/**
+ * Time left until an absolute instant, at minute precision: "in 2h 05m",
+ * "in 14m", "in under a minute", or "expired". Never throws: an unparseable
+ * timestamp renders as a dash.
+ */
+export function formatTimeLeft(iso: string, now: number): string {
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return '—';
+  const minutes = Math.floor((at - now) / 60_000);
+  if (at <= now) return 'expired';
+  if (minutes < 1) return 'in under a minute';
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return h > 0 ? `in ${h}h ${String(m).padStart(2, '0')}m` : `in ${m}m`;
+}
+
 export const OS_LABEL: Record<OsFamily, string> = { windows: 'Windows', linux: 'Linux' };
 
 export function percent(used: number | null, total: number): number | null {

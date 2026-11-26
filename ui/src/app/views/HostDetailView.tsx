@@ -1,7 +1,7 @@
 import { useResource } from '../context';
 import { OS_LABEL, formatDate } from '../format';
 import { href } from '../router';
-import { ArchBadge, Empty, Facts, Loaded, Page, StatePill } from '../ui';
+import { ArchBadge, Empty, Facts, HostStatus, Loaded, Page, VmStatus } from '../ui';
 import { ActivityList } from './ActivityList';
 import { HostMeters } from './HostsView';
 
@@ -21,7 +21,7 @@ export function HostDetailView({ id }: { id: string }) {
         {({ host, vms, activity }) => (
           <div className="detail">
             <div className="detail-badges">
-              <StatePill value={host.reachability} />
+              <HostStatus reachability={host.reachability} />
               <ArchBadge arch={host.arch} />
               {host.reachabilityReason ? <span className="card-reason">{host.reachabilityReason}</span> : null}
             </div>
@@ -58,7 +58,7 @@ export function HostDetailView({ id }: { id: string }) {
                     <li key={v.id} className="row">
                       <a href={href({ name: 'vm', id: v.id })}>{v.name}</a>
                       <ArchBadge arch={v.arch} />
-                      <StatePill value={v.state} />
+                      <VmStatus state={v.state} />
                     </li>
                   ))}
                 </ul>
