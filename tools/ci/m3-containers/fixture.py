@@ -38,11 +38,18 @@ TOOLS = {
 }
 HOST_PROFILES = [
     {"image_os": "ubuntu24", "image_version": "20261116.133.1",
-     "kernel": "7.0.0-1014-aws", "systemd_package": "255.4-1ubuntu8.18"},
+     "variants": [
+         {"kernel": "7.0.0-1014-aws", "systemd_package": "255.4-1ubuntu8.18"},
+     ]},
     {"image_os": "ubuntu24", "image_version": "20261116.376.1",
-     "kernel": "7.0.0-1017-azure", "systemd_package": "255.4-1ubuntu8.18"},
+     "variants": [
+         {"kernel": "7.0.0-1017-azure", "systemd_package": "255.4-1ubuntu8.18"},
+     ]},
     {"image_os": "ubuntu24", "image_version": "20261122.23.1",
-     "kernel": "7.0.0-1018-aws", "systemd_package": "255.4-1ubuntu8.19"},
+     "variants": [
+         {"kernel": "7.0.0-1018-aws", "systemd_package": "255.4-1ubuntu8.19"},
+         {"kernel": "7.0.0-1020-azure", "systemd_package": "255.4-1ubuntu8.19"},
+     ]},
 ]
 NETWORK = {
     "nodes": {node: [f"192.168.72.{i}", f"02:72:00:00:00:{i}"] for i, node in enumerate("abc", 11)},
@@ -81,9 +88,35 @@ def bounded_read(path, limit):
     return data
 
 
+def check_host_profiles(profiles, *, image_category="pins-schema", variant_category="pins-schema"):
+    require(isinstance(profiles, list) and len(profiles) >= 1, image_category)
+    seen_images = set()
+    for profile in profiles:
+        require(isinstance(profile, dict) and set(profile) == {"image_os", "image_version", "variants"},
+                image_category)
+        image_os, image_version = profile["image_os"], profile["image_version"]
+        require(type(image_os) is str and image_os != "" and type(image_version) is str and image_version != "",
+                image_category)
+        identity = (image_os, image_version)
+        require(identity not in seen_images, image_category)
+        seen_images.add(identity)
+    for profile in profiles:
+        variants = profile["variants"]
+        require(isinstance(variants, list) and len(variants) >= 1, variant_category)
+        seen_kernels = set()
+        for variant in variants:
+            require(isinstance(variant, dict) and set(variant) == {"kernel", "systemd_package"}, variant_category)
+            kernel, systemd = variant["kernel"], variant["systemd_package"]
+            require(type(kernel) is str and kernel != "" and type(systemd) is str and systemd != ""
+                    and kernel not in seen_kernels, variant_category)
+            seen_kernels.add(kernel)
+    return profiles
+
+
 def check_pins(pins):
     # Structural equality also rejects an unknown nested key. JSON canonical comparison
     # distinguishes bool, float and integer representations.
+    check_host_profiles(HOST_PROFILES)
     expected = {
         "schema": "arxcovo/r2/1",
         "host": {
