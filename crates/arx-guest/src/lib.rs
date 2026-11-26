@@ -1,5 +1,6 @@
 pub mod compose;
 pub mod compose_backup;
+pub mod docker_trial;
 pub mod protocol;
 pub mod session;
 

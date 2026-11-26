@@ -87,6 +87,11 @@ impl Bundle {
         Ok(file_identity(file, false).map_err(|_| REFUSAL)?.0)
     }
 
+    pub(super) fn directory_identity(&self, name: &str) -> Result<FileIdentity, NativeRefusal> {
+        let dir = self.directories.get(name).ok_or(REFUSAL)?;
+        Ok(file_identity(dir, true).map_err(|_| REFUSAL)?.0)
+    }
+
     pub(super) fn protected(&self, owner: PSID, deadline: Instant) -> Result<(), NativeRefusal> {
         if !std::iter::once(&self.root.leaf)
             .chain(self.directories.values())
@@ -487,6 +492,7 @@ pub(super) mod tests {
         pub(in crate::vm::windows::qualification) root: tempfile::TempDir,
         path: LocalPath,
         manifest: String,
+        count: usize,
     }
 
     impl Fixture {
@@ -498,18 +504,29 @@ pub(super) mod tests {
             name: &str,
             bytes: &[u8],
         ) -> Self {
+            Self::with_payloads(&[(name, bytes)])
+        }
+
+        pub(in crate::vm::windows::qualification) fn with_payloads(
+            files: &[(&str, &[u8])],
+        ) -> Self {
             let root = tempfile::tempdir().unwrap();
             let path = local(root.path().to_str().unwrap()).unwrap();
-            let file = root.path().join(name);
-            fs::create_dir_all(file.parent().unwrap()).unwrap();
-            fs::write(file, bytes).unwrap();
+            let mut manifest = String::new();
+            for (name, bytes) in files {
+                use std::fmt::Write;
+                let file = root.path().join(name);
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(file, bytes).unwrap();
+                writeln!(manifest, "{}  {name}", hex::encode(Sha256::digest(bytes))).unwrap();
+            }
             fs::write(root.path().join("RECEIPT.txt"), b"receipt").unwrap();
-            let manifest = format!("{}  {name}\n", hex::encode(Sha256::digest(bytes)));
             fs::write(root.path().join("MANIFEST.sha256"), &manifest).unwrap();
             Self {
                 root,
                 path,
                 manifest,
+                count: files.len(),
             }
         }
 
@@ -520,7 +537,7 @@ pub(super) mod tests {
             let mut bundle = Bundle::open(&self.path)?;
             bundle.add_file("RECEIPT.txt")?;
             bundle.add_file("MANIFEST.sha256")?;
-            bundle.payload(self.manifest.as_bytes(), 1, deadline, &[])?;
+            bundle.payload(self.manifest.as_bytes(), self.count, deadline, &[])?;
             Ok(bundle)
         }
 
@@ -532,7 +549,7 @@ pub(super) mod tests {
                 size: self.manifest.len() as u64,
                 sha256: Sha256::digest(self.manifest.as_bytes()).into(),
             };
-            collect_exact(&self.path, manifest, receipt, 1, &[])
+            collect_exact(&self.path, manifest, receipt, self.count, &[])
         }
 
         fn refuse(&self) {

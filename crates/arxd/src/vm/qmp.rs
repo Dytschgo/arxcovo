@@ -1,9 +1,10 @@
 use super::{
     qemu_args::QEMU_VERSION,
+    qualification_record::{PausedCheck, PausedQmpStep},
     runtime::{InstallerPhase, InstallerStage},
 };
 use crate::service::Shutdown;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{future::Future, time::Duration};
 use tokio::{
@@ -19,7 +20,8 @@ const INSTALLER_STOP_GRACE: Duration = Duration::from_secs(2);
 const SETUP_PROGRESS: Duration = Duration::from_secs(60 * 60);
 const MAX_SETUP_RESETS: u8 = 16;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChannelError {
     Timeout,
     Cancelled,
@@ -54,7 +56,7 @@ pub(super) async fn bounded<T>(
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RunStatus {
     Prelaunch,
@@ -356,6 +358,50 @@ impl InstallerEvents {
     }
 }
 
+fn verify_greeting(greeting: GreetingBody) -> Result<(), PausedCheck> {
+    const MAX_PACKAGE_BYTES: usize = 256;
+    const MAX_CAPABILITIES: usize = 16;
+    const MAX_CAPABILITY_BYTES: usize = 64;
+    let release = greeting.version.qemu;
+    if format!("{}.{}.{}", release.major, release.minor, release.micro) != QEMU_VERSION {
+        let mut required = QEMU_VERSION.split('.');
+        return Err(PausedCheck::QmpGreetingVersion {
+            measured: [release.major, release.minor, release.micro],
+            required: std::array::from_fn(|_| {
+                required
+                    .next()
+                    .and_then(|part| part.parse().ok())
+                    .expect("pinned QEMU version")
+            }),
+        });
+    }
+    if greeting.version.package.len() > MAX_PACKAGE_BYTES {
+        return Err(PausedCheck::QmpGreetingPackageBytes {
+            measured_bytes: greeting.version.package.len() as u32,
+            maximum_bytes: MAX_PACKAGE_BYTES as u32,
+        });
+    }
+    if greeting.capabilities.len() > MAX_CAPABILITIES {
+        return Err(PausedCheck::QmpGreetingCapabilityCount {
+            measured_count: greeting.capabilities.len() as u32,
+            maximum_count: MAX_CAPABILITIES as u32,
+        });
+    }
+    if let Some(length) = greeting
+        .capabilities
+        .iter()
+        .map(String::len)
+        .find(|length| !(1..=MAX_CAPABILITY_BYTES).contains(length))
+    {
+        return Err(PausedCheck::QmpGreetingCapabilityBytes {
+            measured_bytes: length as u32,
+            minimum_bytes: 1,
+            maximum_bytes: MAX_CAPABILITY_BYTES as u32,
+        });
+    }
+    Ok(())
+}
+
 /// Protocol engine. Native callers must supply the two owned parent stdio
 /// streams from the same verified Job launch.
 pub struct Qmp<R, W> {
@@ -389,7 +435,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
     }
 
     pub async fn handshake(reader: R, writer: W, cancel: &Shutdown) -> Result<Self, ChannelError> {
-        Self::handshake_for(reader, writer, cancel, None).await
+        Self::handshake_for(reader, writer, cancel, None, || {}, |_| {}).await
     }
 
     pub async fn installer_handshake(
@@ -398,7 +444,18 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
         cancel: &Shutdown,
         stage: InstallerStage,
     ) -> Result<Self, ChannelError> {
-        Self::handshake_for(reader, writer, cancel, Some(stage)).await
+        Self::handshake_for(reader, writer, cancel, Some(stage), || {}, |_| {}).await
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) async fn handshake_diagnosed(
+        reader: R,
+        writer: W,
+        cancel: &Shutdown,
+        on_capabilities: impl FnOnce(),
+        report: impl FnMut(PausedCheck),
+    ) -> Result<Self, ChannelError> {
+        Self::handshake_for(reader, writer, cancel, None, on_capabilities, report).await
     }
 
     async fn handshake_for(
@@ -406,6 +463,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
         writer: W,
         cancel: &Shutdown,
         stage: Option<InstallerStage>,
+        on_capabilities: impl FnOnce(),
+        mut report: impl FnMut(PausedCheck),
     ) -> Result<Self, ChannelError> {
         let mut stream = Stream {
             reader: BufReader::new(reader),
@@ -425,20 +484,27 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
         };
         let deadline = setup_deadline(stage);
         bounded(cancel, deadline, async {
-            let Greeting { qmp: greeting } = stream.record().await?;
-            let release = greeting.version.qemu;
-            if format!("{}.{}.{}", release.major, release.minor, release.micro) != QEMU_VERSION
-                || greeting.version.package.len() > 256
-                || greeting.capabilities.len() > 16
-                || greeting
-                    .capabilities
-                    .iter()
-                    .any(|name| name.is_empty() || name.len() > 64)
-            {
+            let Greeting { qmp: greeting } = stream.record().await.inspect_err(|error| {
+                report(PausedCheck::QmpChannel {
+                    step: PausedQmpStep::Greeting,
+                    error: *error,
+                });
+            })?;
+            if let Err(failure) = verify_greeting(greeting) {
+                report(failure);
                 return Err(ChannelError::Invalid);
             }
-            let result = stream.command(Command::Capabilities, &mut events).await?;
-            empty(result)
+            on_capabilities();
+            stream
+                .command(Command::Capabilities, &mut events)
+                .await
+                .and_then(empty)
+                .inspect_err(|error| {
+                    report(PausedCheck::QmpChannel {
+                        step: PausedQmpStep::Capabilities,
+                        error: *error,
+                    });
+                })
         })
         .await?;
         Ok(Self {
@@ -472,6 +538,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
     /// Checks which accelerator the held paused QEMU child actually initialized.
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub(super) async fn verify_whpx(&mut self) -> Result<(), ChannelError> {
+        self.verify_whpx_diagnosed(|_| {}).await
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) async fn verify_whpx_diagnosed(
+        &mut self,
+        report: impl FnOnce(PausedCheck),
+    ) -> Result<(), ChannelError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Accelerators {
@@ -485,24 +559,36 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
             .await?;
         let actual: Accelerators =
             serde_json::from_value(response).map_err(|_| ChannelError::Invalid)?;
-        if actual.enabled != "whpx"
-            || actual.present.len() > 8
-            || actual
-                .present
-                .iter()
-                .filter(|name| name.as_str() == "whpx")
-                .count()
-                != 1
-            || actual.present.iter().any(|name| {
-                !matches!(
-                    name.as_str(),
-                    "hvf" | "kvm" | "mshv" | "nvmm" | "qtest" | "tcg" | "whpx" | "xen"
-                )
-            })
-        {
-            return Err(ChannelError::Unexpected);
-        }
-        Ok(())
+        const MAX_ACCELERATORS: usize = 8;
+        let whpx_count = actual
+            .present
+            .iter()
+            .filter(|name| name.as_str() == "whpx")
+            .count();
+        let failure = if actual.enabled != "whpx" {
+            PausedCheck::WhpxNotEnabled
+        } else if actual.present.len() > MAX_ACCELERATORS {
+            PausedCheck::WhpxAcceleratorCount {
+                measured_count: actual.present.len() as u32,
+                maximum_count: MAX_ACCELERATORS as u32,
+            }
+        } else if whpx_count != 1 {
+            PausedCheck::WhpxPresenceCount {
+                measured_count: whpx_count as u32,
+                required_count: 1,
+            }
+        } else if actual.present.iter().any(|name| {
+            !matches!(
+                name.as_str(),
+                "hvf" | "kvm" | "mshv" | "nvmm" | "qtest" | "tcg" | "whpx" | "xen"
+            )
+        }) {
+            PausedCheck::WhpxUnknownAccelerator
+        } else {
+            return Ok(());
+        };
+        report(failure);
+        Err(ChannelError::Unexpected)
     }
 
     /// One-time release of the `-S` hold. `revalidate` runs after the
