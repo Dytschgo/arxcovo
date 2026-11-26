@@ -634,3 +634,197 @@ fn independent_pair(db: &Connection, source: Id, pair: [ArtifactEvidence; 2]) ->
             })
         }))
 }
+
+#[cfg(test)]
+#[test]
+fn compose_source_refuses_a_swapped_sealed_pair() -> Result<()> {
+    use crate::vm::{
+        paths::ArtifactPin,
+        qualification_record::{DockerRecipe, VerifiedDockerEvidence},
+    };
+
+    struct Sealed {
+        template: Id,
+        slots: PairSlots,
+        evidence: [ArtifactEvidence; 2],
+    }
+
+    struct Row {
+        template: Id,
+        build: Id,
+        generation: Id,
+        disk_key: Id,
+        vars_key: Id,
+        digest: [u8; 32],
+        disk_digest: [u8; 32],
+        vars_digest: [u8; 32],
+        recipe_id: String,
+    }
+
+    fn proof(file: u8, digest: [u8; 32]) -> ArtifactEvidence {
+        ArtifactEvidence {
+            identity: FileIdentity {
+                volume: 7,
+                file: [file; 16],
+            },
+            directory: [0x11; 16],
+            pin: ArtifactPin {
+                size: 4,
+                sha256: digest,
+            },
+        }
+    }
+
+    fn insert(db: &Connection, row: &Row) -> Result<Sealed> {
+        let disk = proof(row.disk_key[0], row.disk_digest);
+        let vars = proof(row.vars_key[0], row.vars_digest);
+        db.execute(
+            "INSERT INTO vm_templates (id,guest,recipe_digest,disk_digest,vars_digest,bytes)
+             VALUES (?1,1,?2,?3,?4,64)",
+            params![row.template, row.digest, row.disk_digest, row.vars_digest],
+        )?;
+        db.execute(
+            "INSERT INTO vm_build_intents
+                (id,recipe_id,recipe_digest,staging_bytes,template_id,health_verified,state)
+             VALUES (?1,?2,?3,0,?4,1,'sealed')",
+            params![row.build, row.recipe_id, row.digest, row.template],
+        )?;
+        db.execute(
+            "INSERT INTO vm_generations (id,build_id,generation,active) VALUES (?1,?2,1,1)",
+            params![row.generation, row.build],
+        )?;
+        for (role, key, item) in [("disk", row.disk_key, disk), ("vars", row.vars_key, vars)] {
+            db.execute(
+                "INSERT INTO vm_artifacts
+                    (generation_id,role,object_key,state,volume_id,directory_id,file_id,
+                     content_digest,bytes)
+                 VALUES (?1,?2,?3,'sealed',?4,?5,?6,?7,?8)",
+                params![
+                    row.generation,
+                    role,
+                    key,
+                    item.identity.volume.to_be_bytes(),
+                    item.directory,
+                    item.identity.file,
+                    item.pin.sha256,
+                    item.pin.size
+                ],
+            )?;
+        }
+        Ok(Sealed {
+            template: row.template,
+            slots: PairSlots {
+                disk: ArtifactSlot {
+                    generation: row.generation,
+                    role: "disk",
+                    key: row.disk_key,
+                },
+                vars: ArtifactSlot {
+                    generation: row.generation,
+                    role: "vars",
+                    key: row.vars_key,
+                },
+            },
+            evidence: [disk, vars],
+        })
+    }
+
+    let dir = crate::service::application::tests::private_temp();
+    let store = VmStore::open(dir.path(), 1)?;
+    store.transact(|db| {
+        let digest = [0x21; 32];
+        let identity = DockerRecipe::identity(digest);
+        let selected = VerifiedDockerEvidence::recipe_fixture(DockerRecipe {
+            identity,
+            web: [0x41; 32],
+            closure: [0x42; 32],
+            medium: [0x43; 32],
+        });
+        let sealed = insert(
+            db,
+            &Row {
+                template: [0xA1; 16],
+                build: [0xB1; 16],
+                generation: [0xC1; 16],
+                disk_key: [0xD1; 16],
+                vars_key: [0xD2; 16],
+                digest,
+                disk_digest: [0x51; 32],
+                vars_digest: [0x52; 32],
+                recipe_id: hex::encode(identity.recipe_id),
+            },
+        )?;
+        let other_digest = [0x31; 32];
+        let other = insert(
+            db,
+            &Row {
+                template: [0xA2; 16],
+                build: [0xB2; 16],
+                generation: [0xC2; 16],
+                disk_key: [0xD3; 16],
+                vars_key: [0xD4; 16],
+                digest: other_digest,
+                disk_digest: [0x61; 32],
+                vars_digest: [0x62; 32],
+                recipe_id: hex::encode(DockerRecipe::identity(other_digest).recipe_id),
+            },
+        )?;
+        let found = compose_source(
+            db,
+            sealed.template,
+            (sealed.slots, sealed.evidence),
+            &selected,
+        )?
+        .unwrap();
+        assert_eq!(found.source_generation, sealed.slots.disk.generation);
+        assert_eq!(found.recipe_digest, digest);
+        assert_eq!(found.disk_digest, sealed.evidence[0].pin.sha256);
+        assert_eq!(found.vars_digest, sealed.evidence[1].pin.sha256);
+
+        let swapped_slots = PairSlots {
+            disk: sealed.slots.vars,
+            vars: sealed.slots.disk,
+        };
+        let swapped_evidence = [sealed.evidence[1], sealed.evidence[0]];
+        assert!(
+            compose_source(
+                db,
+                sealed.template,
+                (swapped_slots, swapped_evidence),
+                &selected,
+            )?
+            .is_none()
+        );
+        assert!(
+            compose_source(db, other.template, (other.slots, other.evidence), &selected)?.is_none()
+        );
+        assert!(
+            compose_source(
+                db,
+                sealed.template,
+                (other.slots, other.evidence),
+                &selected
+            )?
+            .is_none()
+        );
+
+        // Files and digest still match the selected recipe. The sealed build's
+        // recipe id now names a different pair. `source` still accepts the
+        // files; the adapter must refuse them.
+        db.execute(
+            "UPDATE vm_build_intents SET recipe_id=?1 WHERE template_id=?2",
+            params!["swapped-sealed-pair", sealed.template],
+        )?;
+        assert!(source(db, sealed.template, (sealed.slots, sealed.evidence), digest)?.is_some());
+        assert!(
+            compose_source(
+                db,
+                sealed.template,
+                (sealed.slots, sealed.evidence),
+                &selected
+            )?
+            .is_none()
+        );
+        Ok(())
+    })
+}

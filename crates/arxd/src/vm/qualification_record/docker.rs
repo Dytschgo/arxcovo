@@ -129,6 +129,35 @@ impl VerifiedDockerEvidence {
     pub fn recipe(&self) -> DockerRecipe {
         self.recipe
     }
+
+    /// The seal is unread by adapters that only call [`Self::recipe`].
+    #[cfg(test)]
+    pub(crate) fn recipe_fixture(recipe: DockerRecipe) -> Self {
+        Self {
+            seal: Seal {
+                contract: 0,
+                collector: 0,
+                origin: Origin::Fixture,
+                binding: Binding {
+                    class: Class::Docker,
+                    scope: [1; 32],
+                    release: [2; 32],
+                    run: [3; 16],
+                    dependencies: [4; 32],
+                    boot: BootAnchor {
+                        marker: [5; 32],
+                        origin_mono_ms: 1,
+                    },
+                    issued_mono_ms: 1,
+                    issued_utc: 1,
+                    expires_utc: 2,
+                },
+                finished_utc: 1,
+                manifest: Vec::new(),
+            },
+            recipe,
+        }
+    }
 }
 
 pub fn read_native_docker<R: Read>(
