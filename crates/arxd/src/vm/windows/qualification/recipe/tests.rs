@@ -332,6 +332,11 @@ fn seed_stays_accounted_when_the_second_leaf_fails() {
         WRITE_FAULT.set(None);
         let names = recorder.names();
         assert_eq!(staged.is_ok(), fault.is_none() && write.is_none());
+        let seed = fixture.leaf(slots.seed);
+        assert!(
+            matches!(seed, Custody::Verified(_, pin) if pin == pin_of(b"seed")),
+            "{fault:?} {write:?}"
+        );
         assert_eq!(
             names[..4],
             [
@@ -340,11 +345,6 @@ fn seed_stays_accounted_when_the_second_leaf_fails() {
                 "slot_verified",
                 "intend_slot"
             ]
-        );
-        let seed = fixture.leaf(slots.seed);
-        assert!(
-            matches!(seed, Custody::Verified(_, pin) if pin == pin_of(b"seed")),
-            "{fault:?} {write:?}"
         );
         let vars = fixture.leaf(slots.pair.vars);
         let vars_path = slot_path(&ws.root.path, slots.pair.vars).unwrap();
