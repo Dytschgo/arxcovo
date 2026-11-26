@@ -1,6 +1,6 @@
 // Guards for the Night Orbit stylesheet: text contrast, self-hosted fonts,
 // dark only, and the reduced-motion finished state.
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'vitest';
@@ -94,12 +94,28 @@ describe('text on its real backgrounds', () => {
     }
   });
 
-  test('nothing that holds text is dimmed with opacity (only entrance animations and the logo light start at 0)', () => {
+  // Opacity fades a box and everything inside it as one group, text included,
+  // so nothing that holds text, and no ancestor of text, may be below 1. The
+  // single exception is the logo light (`.logo .lg-c`): an SVG stroke in an
+  // aria-hidden graphic with no text (asserted in app/ui.test.tsx). Keyframes
+  // are guarded under "motion"; the rendered audit (ui/tests/contrast.ts)
+  // also fails any painted text inside an opacity group, however it got there.
+  test('nothing that holds text, or contains it, is dimmed with opacity (only the logo light fades)', () => {
     const dimmed = rules().filter(r => {
       const o = r.decls.get('opacity');
-      return o !== undefined && parseFloat(o) < 1 && !/^(\.rise|\.logo \.lg-c|from|to|\d+%)/.test(r.selector);
+      return o !== undefined && parseFloat(o) < 1 && !/^(\.logo \.lg-c|from|to|\d+%)/.test(r.selector);
     }).map(r => r.selector);
     expect(dimmed).toEqual([]);
+  });
+
+  test('components never set opacity from script or inline styles', () => {
+    // A `style={{ opacity }}` or a CSSOM write would bypass the stylesheet rule above.
+    const sources = (readdirSync(here, { recursive: true }) as string[])
+      .filter(f => /\.(ts|tsx)$/.test(f) && !/\.test\.tsx?$/.test(f) && !/test-setup\.ts$/.test(f));
+    expect(sources.length).toBeGreaterThan(10);
+    const offenders = sources.flatMap(f => read(f).split('\n')
+      .flatMap((line, i) => (/opacity/i.test(line) ? [`${f.replace(/\\/g, '/')}:${i + 1}: ${line.trim()}`] : [])));
+    expect(offenders).toEqual([]);
   });
 });
 
