@@ -806,10 +806,21 @@ enum SpawnStage {
 struct SpawnError {
     stage: SpawnStage,
     error: io::Error,
+    partial: Option<PartialChild>,
+}
+
+#[derive(Debug)]
+struct PartialChild {
+    _process: Option<OwnedHandle>,
+    _thread: Option<OwnedHandle>,
 }
 
 fn at(stage: SpawnStage) -> impl FnOnce(io::Error) -> SpawnError {
-    move |error| SpawnError { stage, error }
+    move |error| SpawnError {
+        stage,
+        error,
+        partial: None,
+    }
 }
 
 fn spawn(
@@ -818,16 +829,15 @@ fn spawn(
     environment: &[u16],
     job: Job,
     stdio: Stdio,
-) -> Result<Child, SpawnError> {
-    let (process, thread) =
-        create_suspended(&launch, cwd, environment, Assignment::Job(&job), &stdio)?;
-    let child = Child {
-        job,
-        process,
-        suspended: Some(thread),
-    };
-    child.verify_live().map_err(at(SpawnStage::Verify))?;
-    Ok(child)
+) -> Result<Child, (SpawnError, Job)> {
+    match create_suspended(&launch, cwd, environment, Assignment::Job(&job), &stdio) {
+        Ok((process, thread)) => Ok(Child {
+            job,
+            process,
+            suspended: Some(thread),
+        }),
+        Err(error) => Err((error, job)),
+    }
 }
 
 fn create_suspended(
@@ -843,10 +853,7 @@ fn create_suspended(
         #[cfg(test)]
         Launch::Fixture { image, args } => (image, args),
     };
-    let recipe = |message| SpawnError {
-        stage: SpawnStage::Recipe,
-        error: io::Error::other(message),
-    };
+    let recipe = |message| at(SpawnStage::Recipe)(io::Error::other(message));
     if !image.is_absolute() || !cwd.is_absolute() || !environment.ends_with(&[0, 0]) {
         return Err(recipe("invalid launch recipe"));
     }
@@ -881,10 +888,9 @@ fn create_suspended(
         succeeded(unsafe { GetHandleInformation(handle, &mut flags) })
             .map_err(at(SpawnStage::Attributes))?;
         if handles[..index].contains(&handle) || flags & HANDLE_FLAG_INHERIT == 0 {
-            return Err(SpawnError {
-                stage: SpawnStage::Attributes,
-                error: io::Error::other("invalid inherited handle list"),
-            });
+            return Err(at(SpawnStage::Attributes)(io::Error::other(
+                "invalid inherited handle list",
+            )));
         }
     }
     // The guard copies and owns each value until after list destruction.
@@ -952,10 +958,17 @@ fn create_suspended(
     drop(attributes);
     // The kernel has created both handles and assigned the Job before any child instruction.
     let (process, thread) = unsafe { (owned(process.hProcess), owned(process.hThread)) };
-    Ok((
-        process.map_err(at(SpawnStage::Verify))?,
-        thread.map_err(at(SpawnStage::Verify))?,
-    ))
+    match (process, thread) {
+        (Ok(process), Ok(thread)) => Ok((process, thread)),
+        (process, thread) => Err(SpawnError {
+            stage: SpawnStage::Verify,
+            error: io::Error::other("process created without both handles"),
+            partial: Some(PartialChild {
+                _process: process.ok(),
+                _thread: thread.ok(),
+            }),
+        }),
+    }
 }
 
 fn quote_arg(out: &mut Vec<u16>, arg: &[u16]) -> io::Result<()> {
@@ -1757,6 +1770,7 @@ impl Worker {
     }
 }
 
+#[derive(Default)]
 struct WorkerSet {
     cancel: Shutdown,
     workers: Vec<Worker>,
@@ -1770,7 +1784,7 @@ impl WorkerSet {
         }
     }
 
-    async fn join(mut self, deadline: tokio::time::Instant) -> io::Result<()> {
+    async fn wait_stopped(&self, deadline: tokio::time::Instant) -> io::Result<()> {
         while self.workers.iter().any(|worker| !worker.0.is_finished()) {
             // A cancellation can race a worker entering its next system call.
             // Repeat until the threads finish or the launch must be quarantined.
@@ -1783,14 +1797,32 @@ impl WorkerSet {
             )
             .await;
         }
-        for worker in self.workers.drain(..) {
-            worker
-                .0
-                .join()
-                .map_err(|_| io::Error::other("stdio worker failed"))??;
-        }
         Ok(())
     }
+
+    async fn join(mut self, deadline: tokio::time::Instant) -> io::Result<()> {
+        match self.join_all(deadline).await? {
+            WorkersEnded { failed: false } => Ok(()),
+            WorkersEnded { failed: true } => Err(io::Error::other("stdio worker failed")),
+        }
+    }
+
+    /// Joins every handle, even after one worker returned an error or
+    /// panicked. A timeout keeps all handles for a later attempt. `Ok` proves
+    /// that every worker ended; `failed` separately reports how they ended.
+    async fn join_all(&mut self, deadline: tokio::time::Instant) -> io::Result<WorkersEnded> {
+        self.wait_stopped(deadline).await?;
+        let mut failed = false;
+        for worker in self.workers.drain(..) {
+            failed |= !matches!(worker.0.join(), Ok(Ok(())));
+        }
+        Ok(WorkersEnded { failed })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkersEnded {
+    failed: bool,
 }
 
 impl Drop for WorkerSet {
@@ -2102,14 +2134,21 @@ fn start_stdio(
     stdio: Stdio,
     gate: std::sync::Arc<DispatchGate>,
 ) -> io::Result<(PipeOutput, tokio::io::DuplexStream, WorkerSet)> {
+    let mut workers = WorkerSet::default();
+    let (read, write) = attach_stdio(stdio, gate, &mut workers)?;
+    Ok((read, write, workers))
+}
+
+/// Every successfully started worker is recorded even if a later attach fails.
+fn attach_stdio(
+    stdio: Stdio,
+    gate: std::sync::Arc<DispatchGate>,
+    set: &mut WorkerSet,
+) -> io::Result<BootIo> {
     use tokio::io::{AsyncReadExt, duplex};
 
     let (writer, mut input) = duplex(8192);
-    let runtime = tokio::runtime::Handle::current();
-    let mut set = WorkerSet {
-        cancel: Shutdown::default(),
-        workers: Vec::new(),
-    };
+    let runtime = tokio::runtime::Handle::try_current().map_err(io::Error::other)?;
 
     let (reader, output) = start_output(
         File::from(stdio.output),
@@ -2168,7 +2207,7 @@ fn start_stdio(
         while !cancel.is_cancelled() && read_pipe(&mut pipe, &mut bytes, &cancel)?.is_some() {}
         Ok(())
     })?);
-    Ok((reader, writer, set))
+    Ok((reader, writer))
 }
 
 fn read_pipe(
@@ -2571,12 +2610,103 @@ struct CheckedLaunchCore<'a> {
     installer: Option<InstallerStage>,
 }
 
+/// Creation custody comes from the kernel create edge, independent of the
+/// refusal reason. Keeping the Job also preserves kill-on-close.
+enum LaunchCreation {
+    NeverCreated,
+    Created(Box<CreatedChild>),
+    Unconfirmed {
+        job: Job,
+        _partial: Option<PartialChild>,
+    },
+}
+
+struct CreatedChild {
+    child: Child,
+    /// Retains every unjoined worker handle until settlement drains them.
+    workers: WorkerSet,
+    worker_failed: bool,
+}
+
+impl CreatedChild {
+    /// Confirms an exited child, an empty Job and that every stdio worker
+    /// ended. Any failure leaves the remaining custody for a later attempt.
+    async fn settle(&mut self, deadline: tokio::time::Instant) -> io::Result<()> {
+        self.workers.stop();
+        if !self.child.exited()? || self.child.job.active()? != 0 {
+            self.child.job.terminate()?;
+        }
+        // Reaping confirms both the child exit and an empty Job.
+        self.child.reap(deadline).await?;
+        let ended = self.workers.join_all(deadline).await?;
+        self.worker_failed |= ended.failed;
+        Ok(())
+    }
+}
+
+struct HoldRefusal {
+    reason: NativeRefusal,
+    creation: LaunchCreation,
+}
+
+impl From<NativeRefusal> for HoldRefusal {
+    fn from(reason: NativeRefusal) -> Self {
+        Self {
+            reason,
+            creation: LaunchCreation::NeverCreated,
+        }
+    }
+}
+
+impl HoldRefusal {
+    fn from_spawn((error, job): (SpawnError, Job)) -> Self {
+        let reason = NativeRefusal::JobUnverified;
+        if error.stage == SpawnStage::Verify || !matches!(job.active(), Ok(0)) {
+            let _ = job.terminate();
+            Self {
+                reason,
+                creation: LaunchCreation::Unconfirmed {
+                    job,
+                    _partial: error.partial,
+                },
+            }
+        } else {
+            reason.into()
+        }
+    }
+
+    fn created(reason: NativeRefusal, child: Child, workers: WorkerSet) -> Self {
+        workers.stop();
+        let _ = child.job.terminate();
+        Self {
+            reason,
+            creation: LaunchCreation::Created(Box::new(CreatedChild {
+                child,
+                workers,
+                worker_failed: false,
+            })),
+        }
+    }
+}
+
+fn attach_checked_child(
+    child: Child,
+    verify: impl FnOnce(&Child) -> Result<(), NativeRefusal>,
+    attach: impl FnOnce(&mut WorkerSet) -> Result<BootIo, NativeRefusal>,
+) -> Result<(Child, WorkerSet, BootIo), HoldRefusal> {
+    let mut workers = WorkerSet::default();
+    match verify(&child).and_then(|()| attach(&mut workers)) {
+        Ok(io) => Ok((child, workers, io)),
+        Err(reason) => Err(HoldRefusal::created(reason, child, workers)),
+    }
+}
+
 impl<'a> CheckedLaunchCore<'a> {
-    fn hold_checked(
+    fn hold_checked<T>(
         token: &'a VmToken,
         inputs: LaunchInputs<'a>,
-        refresh: impl FnOnce(&CommandPlan<'_>) -> Result<std::time::Instant, NativeRefusal>,
-    ) -> Result<(Self, PipeOutput, tokio::io::DuplexStream), NativeRefusal> {
+        refresh: impl FnOnce(&CommandPlan<'_>) -> Result<(std::time::Instant, T), NativeRefusal>,
+    ) -> Result<(Self, BootIo, T), HoldRefusal> {
         let kind = inputs.plan.kind();
         // ADR 0064: a public-egress plan also stays closed until its patched
         // build, policy custody and route evidence have native qualification.
@@ -2587,17 +2717,17 @@ impl<'a> CheckedLaunchCore<'a> {
                 | PlanKind::StaticComposeInstaller
                 | PlanKind::StaticComposeDetached
         ) {
-            return Err(NativeRefusal::NetworkFenceUnverified);
+            return Err(NativeRefusal::NetworkFenceUnverified.into());
         }
         match (kind, inputs.installer) {
             (PlanKind::InstallerBoot(phase), Some(stage))
                 if phase == stage.phase() && tokio::time::Instant::now() >= stage.deadline() =>
             {
-                return Err(NativeRefusal::InstallerDeadlineExpired);
+                return Err(NativeRefusal::InstallerDeadlineExpired.into());
             }
             (PlanKind::InstallerBoot(phase), Some(stage)) if phase == stage.phase() => {}
             (PlanKind::InstallerBoot(_), _) | (_, Some(_)) => {
-                return Err(NativeRefusal::InstallerPhaseMismatch);
+                return Err(NativeRefusal::InstallerPhaseMismatch.into());
             }
             _ => {}
         }
@@ -2636,7 +2766,7 @@ impl<'a> CheckedLaunchCore<'a> {
                 ))
             }
             (PlanKind::InstallerBoot(InstallerPhase::WindowsFinalize), None) | (_, Some(_)) => {
-                return Err(NativeRefusal::InstallerPhaseMismatch);
+                return Err(NativeRefusal::InstallerPhaseMismatch.into());
             }
             (_, None) => None,
         };
@@ -2680,13 +2810,14 @@ impl<'a> CheckedLaunchCore<'a> {
             .installer
             .is_some_and(|stage| tokio::time::Instant::now() >= stage.deadline())
         {
-            return Err(NativeRefusal::InstallerDeadlineExpired);
+            return Err(NativeRefusal::InstallerDeadlineExpired.into());
         }
         // Recheck all consumed inputs, bundle and workspace custody right at
         // the actual process-creation edge.
         stock.recheck_all(&inputs.pins, Some(&inputs.workspace))?;
+        let (captured, authority) = refresh(&inputs.plan)?;
         fresh_observation(
-            refresh(&inputs.plan)?,
+            captured,
             std::time::Instant::now(),
             NativeRefusal::ReservesUnverified,
         )?;
@@ -2700,45 +2831,31 @@ impl<'a> CheckedLaunchCore<'a> {
             job,
             stdio,
         )
-        .map_err(|_| NativeRefusal::JobUnverified)?;
-        // Every post-spawn error must explicitly terminate and wait on the
-        // created child/Job before returning.
-        let settle_spawned = |child: Child| {
-            let _ = child.job.terminate();
-            let _ = wait(&child.process, 2_000);
-            drop(child);
-        };
-        let program = if matches!(kind, PlanKind::Boot | PlanKind::InstallerBoot(_)) {
-            "qemu-system-x86_64.exe"
-        } else {
-            "qemu-img.exe"
-        };
-        let expected_image = match inputs.bundle.identity(program) {
-            Ok(id) => id,
-            Err(reason) => {
-                settle_spawned(child);
-                return Err(reason);
-            }
-        };
-        if let Err(reason) = verify_image(&child, inputs.plan.image(), expected_image)
-            .and_then(|()| verify_child_policy(&child, token))
-            .and_then(|()| {
+        .map_err(HoldRefusal::from_spawn)?;
+        let (child, workers, (read, write)) = attach_checked_child(
+            child,
+            |child| {
+                child
+                    .verify_live()
+                    .map_err(|_| NativeRefusal::JobUnverified)?;
+                let program = if matches!(kind, PlanKind::Boot | PlanKind::InstallerBoot(_)) {
+                    "qemu-system-x86_64.exe"
+                } else {
+                    "qemu-img.exe"
+                };
+                let expected_image = inputs.bundle.identity(program)?;
+                verify_image(child, inputs.plan.image(), expected_image)?;
+                verify_child_policy(child, token)?;
                 child
                     .job
                     .verify_limits(inputs.memory, Some(inputs.cpu_rate), Some(1))
                     .map_err(|_| NativeRefusal::JobUnverified)
-            })
-        {
-            settle_spawned(child);
-            return Err(reason);
-        }
-        let (read, write, workers) = match start_stdio(parent, gate.clone()) {
-            Ok(started) => started,
-            Err(_) => {
-                settle_spawned(child);
-                return Err(NativeRefusal::QmpUnverified);
-            }
-        };
+            },
+            |workers| {
+                attach_stdio(parent, gate.clone(), workers)
+                    .map_err(|_| NativeRefusal::QmpUnverified)
+            },
+        )?;
         Ok((
             Self {
                 child,
@@ -2755,8 +2872,8 @@ impl<'a> CheckedLaunchCore<'a> {
                 kind,
                 installer: inputs.installer,
             },
-            read,
-            write,
+            (read, write),
+            authority,
         ))
     }
 }
@@ -3695,7 +3812,7 @@ mod tests {
         marker
     }
 
-    fn fixture_launch(probe: usize) -> Option<(Child, Stdio)> {
+    pub(super) fn fixture_launch(probe: usize) -> Option<(Child, Stdio)> {
         fixture_spawn(FIXTURE, probe)
     }
 
@@ -3711,15 +3828,22 @@ mod tests {
         let cwd = image.parent().unwrap();
         let environment = fixture_environment(probe);
         match spawn(launch, cwd, &environment, job, child_io) {
-            Ok(child) => Some((child, parent_io)),
-            Err(SpawnError {
-                stage: SpawnStage::Create,
-                error,
-            }) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            Ok(child) => {
+                child.verify_live().unwrap();
+                Some((child, parent_io))
+            }
+            Err((
+                SpawnError {
+                    stage: SpawnStage::Create,
+                    error,
+                    ..
+                },
+                _,
+            )) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
                 classify_job_refusal(&image, &args, cwd, &environment);
                 None
             }
-            Err(SpawnError { stage, error }) => {
+            Err((SpawnError { stage, error, .. }, _)) => {
                 panic!("fixture launch failed at {stage:?}: {error}")
             }
         }
@@ -3780,6 +3904,51 @@ mod tests {
         let mut marker = [0];
         std::io::stdin().read_exact(&mut marker).unwrap();
         assert_eq!(marker, [42]);
+    }
+
+    #[test]
+    #[ignore = "child-only listener fixture; spawned with a Job and explicit stdio"]
+    fn fixture_listener() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        std::io::stdout().write_all(b"ARX_JOB_READY\n").unwrap();
+        // Emit two binary port bytes after the readiness marker.
+        std::io::stdout()
+            .write_all(&listener.local_addr().unwrap().port().to_le_bytes())
+            .unwrap();
+        std::io::stdout().flush().unwrap();
+        let mut exit = [0];
+        std::io::stdin().read_exact(&mut exit).unwrap();
+        assert_eq!(exit, [42]);
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn docker_trial_listener_belongs_to_the_held_fixture_child() {
+        use qualification::docker_trial::witness::listener;
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let foreign = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let Some((mut child, stdio)) = fixture_spawn("vm::windows::tests::fixture_listener", 0)
+        else {
+            return;
+        };
+        let pid = child.verify_live().unwrap();
+        let (mut read, mut write, workers) = start_stdio(stdio, Default::default()).unwrap();
+        child.resume().unwrap();
+        ready(&mut read).await;
+        let port = tokio::time::timeout(Duration::from_secs(2), read.read_u16_le())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(listener(&child, port).unwrap().check(port, pid).is_ok());
+        assert!(listener(&child, foreign.local_addr().unwrap().port()).is_err());
+        assert!(listener(&child, 0).is_err());
+        write.write_all(&[42]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        child.reap(deadline).await.unwrap();
+        assert_eq!(child.exit_code(), Ok(0));
+        assert!(listener(&child, port).is_err());
+        workers.join(deadline).await.unwrap();
     }
 
     async fn ready(reader: &mut PipeOutput) {

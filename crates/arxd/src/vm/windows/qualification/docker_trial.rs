@@ -16,6 +16,9 @@ use arx_guest::compose::{COMPOSE_PROTOCOL_VERSION, ComposeResponse};
 use arx_guest::docker_trial::{BootMode, Challenge, TrialRequest, TrialResponse};
 use std::io::Write;
 
+pub(in crate::vm::windows) mod witness;
+use witness::{Listener, ObservedRoute, ReceiverEnrollment, RouteSample, Target};
+
 const REFUSED: NativeRefusal = NativeRefusal::PathCustodyUnverified;
 // Simultaneous worst-case allocation of the fixture, original and both
 // independent verification pairs, including qcow2 metadata, VARS and seed.
@@ -51,7 +54,8 @@ pub(super) fn preflight(
     let bytes = read_bounded(&source.leaf, MAX_ENROLLMENT_BYTES)
         .map_err(|_| NativeRefusal::QualificationMissing)?;
     require_enrollment(&bytes)?;
-    // Receiver and route custody are required even for an owner opt-in.
+    // Checked native creation, live route enforcement and independently reviewed
+    // capture/HTTPS adapters are required even for an owner opt-in.
     // Stop before claiming an evidence directory or admitting any effect.
     Err(NativeRefusal::NetworkFenceUnverified)
 }
@@ -263,7 +267,7 @@ impl Custody {
 
 /// A create intent in one disposable root. A peer can only consume it via
 /// the collector after the sealed argv has been checked against that root.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) struct Ticket {
     pub(super) scope: Scope,
     pub(super) phase: Phase,
@@ -309,19 +313,6 @@ pub(super) struct Reply {
     pub(super) frame: Vec<u8>,
 }
 
-pub(super) struct FixtureProof {
-    pub(super) peer: PeerId,
-    pub(super) challenge: Challenge,
-    pub(super) receiver_digest: Hash,
-    pub(super) policy: Hash,
-    pub(super) topology: Hash,
-    pub(super) receiver_controls: bool,
-    pub(super) public_tcp_udp: bool,
-    pub(super) nonpublic_denied: bool,
-    pub(super) ipv6_icmp_denied: bool,
-    pub(super) route_drift_denied: bool,
-}
-
 pub(super) struct OriginProof {
     pub(super) peer: PeerId,
     pub(super) challenge: Challenge,
@@ -363,12 +354,23 @@ pub(super) trait Host {
     // Begin staging only after receiving the ticket. Implementations own
     // staged leaves and the child/job even when start or monitoring fails.
     fn stage(&mut self, ticket: Ticket, cutoff: u64) -> Result<Self::Prepared, NativeRefusal>;
-    fn boot(
+    fn route(
+        &mut self,
+        boot: &CheckedBoot<'_>,
+        peer: Option<PeerId>,
+        cutoff: u64,
+    ) -> Result<RouteSample, NativeRefusal>;
+    fn receiver_targets(&mut self, ticket: Ticket) -> Result<Vec<Target>, NativeRefusal>;
+    // Checked create through QMP prelaunch, with guest execution still paused.
+    fn prelaunch(
         &mut self,
         boot: &CheckedBoot<'_>,
         cutoff: u64,
         cancel: &Shutdown,
     ) -> Result<PeerId, NativeRefusal>;
+    fn cont(&mut self, peer: PeerId, cutoff: u64, cancel: &Shutdown) -> Result<(), NativeRefusal>;
+    fn listener(&mut self, peer: PeerId, port: u16, cutoff: u64)
+    -> Result<Listener, NativeRefusal>;
     fn drain(&mut self, ticket: Ticket, cutoff: u64) -> Result<Release, NativeRefusal>;
     fn dispose(&mut self, scope: Scope, cutoff: u64) -> Result<WorkspaceRelease, NativeRefusal>;
     fn copies_independent_and_original_unchanged(&mut self) -> bool;
@@ -387,9 +389,10 @@ pub(super) trait Capture {
     fn fixture(
         &mut self,
         peer: PeerId,
-        challenge: Challenge,
-        cutoff: u64,
-    ) -> Result<FixtureProof, NativeRefusal>;
+        ticket: Ticket,
+        targets: &[Target],
+        window: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>, NativeRefusal>;
     fn origin(
         &mut self,
         peer: PeerId,
@@ -405,6 +408,7 @@ pub(super) struct Run<'a, H, G, C> {
     pub(super) capture: C,
     pub(super) dependencies: DockerDependencies,
     pub(super) stock: static_compose::StockBootInputs<'a>,
+    pub(super) receiver_enrollment: ReceiverEnrollment,
     pub(super) packages: Hash,
     pub(super) custody: Custody,
     pub(super) evidence: &'a sink::EvidenceDir,
@@ -417,18 +421,21 @@ pub(super) enum Outcome {
     Incomplete,
 }
 
+struct RunningBoot<'a, 'plan> {
+    peer: PeerId,
+    ticket: Ticket,
+    targets: &'a [Target],
+    plan: &'a CommandPlan<'plan>,
+    started_ms: u64,
+    route: Option<ObservedRoute>,
+}
+
 impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
     fn run_boot<T>(
         &mut self,
         phase: Phase,
         cutoff: u64,
-        verify: impl FnOnce(
-            &mut G,
-            &mut C,
-            PeerId,
-            Challenge,
-            &CommandPlan<'_>,
-        ) -> Result<T, NativeRefusal>,
+        verify: impl FnOnce(&mut H, &mut G, &mut C, RunningBoot<'_, '_>) -> Result<T, NativeRefusal>,
     ) -> Result<(T, PeerId), NativeRefusal> {
         let available = self.host.headroom()?;
         if self.cancel.is_cancelled() || self.host.clock().mono_ms >= cutoff {
@@ -460,18 +467,57 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
             if self.cancel.is_cancelled() || self.host.clock().mono_ms >= cutoff {
                 return Err(NativeRefusal::QualificationMissing);
             }
+            let public = plan.kind() == PlanKind::PublicEgressBoot;
+            let targets = if phase == Phase::PublicFixture {
+                self.receiver_enrollment
+                    .check_targets(self.host.receiver_targets(ticket)?)?
+            } else {
+                Vec::new()
+            };
             let boot = CheckedBoot { ticket, plan };
-            let peer = self.host.boot(&boot, cutoff, self.cancel)?;
+            if public {
+                witness::route(
+                    self.host.route(&boot, None, cutoff)?,
+                    &boot,
+                    None,
+                    &self.dependencies,
+                )?;
+            }
+            if self.cancel.is_cancelled() || self.host.clock().mono_ms >= cutoff {
+                return Err(NativeRefusal::QualificationMissing);
+            }
+            let peer = self.host.prelaunch(&boot, cutoff, self.cancel)?;
             spawned = Some(peer);
             if peer.pid == 0 || peer.boot == [0; 16] {
                 return Err(NativeRefusal::GuestEndpointUnverified);
             }
+            let route = if public {
+                Some(witness::route(
+                    self.host.route(&boot, Some(peer), cutoff)?,
+                    &boot,
+                    Some(peer),
+                    &self.dependencies,
+                )?)
+            } else {
+                None
+            };
+            let started_ms = self.host.clock().mono_ms;
+            if self.cancel.is_cancelled() || started_ms >= cutoff {
+                return Err(NativeRefusal::QualificationMissing);
+            }
+            self.host.cont(peer, cutoff, self.cancel)?;
             verify(
+                &mut self.host,
                 &mut self.guest,
                 &mut self.capture,
-                peer,
-                ticket.challenge,
-                boot.argv(),
+                RunningBoot {
+                    peer,
+                    ticket,
+                    targets: &targets,
+                    plan: boot.argv(),
+                    started_ms,
+                    route,
+                },
             )
         })();
         let release_start = self.host.clock();
@@ -510,40 +556,32 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                 loaded_artifacts: dependencies.loaded_artifacts,
             }),
             Stage::PublicIpv4Network => {
-                let (proof, peer) = self.run_boot(
-                    Phase::PublicFixture,
-                    cutoff,
-                    |_, capture, peer, challenge, _| {
-                        let proof = capture.fixture(peer, challenge, cutoff)?;
-                        if proof.peer != peer
-                            || proof.challenge != challenge
-                            || proof.receiver_digest == [0; 32]
-                            || proof.policy != dependencies.policy
-                            || proof.topology != dependencies.topology
-                        {
-                            return Err(NativeRefusal::NetworkFenceUnverified);
-                        }
-                        Ok(proof)
-                    },
-                )?;
+                let (receiver_witness, peer) =
+                    self.run_boot(Phase::PublicFixture, cutoff, |host, _, capture, boot| {
+                        let raw = capture.fixture(
+                            boot.peer,
+                            boot.ticket,
+                            boot.targets,
+                            boot.started_ms..cutoff,
+                        )?;
+                        witness::receivers(&raw, &boot, host.clock().mono_ms)
+                    })?;
                 *fixture = Some(peer);
-                // The witness adapter validates the underlying capture and supplies
-                // the closed verdict. The record validator requires every control.
                 Ok(Observation::DockerPublicIpv4 {
                     policy: dependencies.policy,
                     topology: dependencies.topology,
-                    receiver_witness: proof.receiver_digest,
-                    receiver_controls: proof.receiver_controls,
-                    public_tcp_udp: proof.public_tcp_udp,
-                    nonpublic_denied: proof.nonpublic_denied,
-                    ipv6_icmp_denied: proof.ipv6_icmp_denied,
-                    route_drift_denied: proof.route_drift_denied,
+                    receiver_witness,
+                    receiver_controls: true,
+                    public_tcp_udp: true,
+                    nonpublic_denied: true,
+                    ipv6_icmp_denied: true,
+                    route_drift_denied: true,
                 })
             }
             Stage::DockerRecipe => {
-                self.run_boot(Phase::Install, cutoff, |_, _, _, _, _| Ok(()))?;
-                self.run_boot(Phase::Detached, cutoff, |guest, _, peer, challenge, _| {
-                    health(guest, peer, challenge, packages, cutoff)
+                self.run_boot(Phase::Install, cutoff, |_, _, _, _| Ok(()))?;
+                self.run_boot(Phase::Detached, cutoff, |_, guest, _, boot| {
+                    health(guest, boot.peer, boot.ticket.challenge, packages, cutoff)
                 })?;
                 if !self.host.copies_independent_and_original_unchanged() {
                     return Err(REFUSED);
@@ -556,43 +594,43 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                 })
             }
             Stage::InstalledGuestEndpoint => {
-                self.run_boot(
-                    Phase::Endpoint,
-                    cutoff,
-                    |guest, capture, peer, challenge, plan| {
-                        if !fixture.is_some_and(|first| first.boot != peer.boot) {
-                            return Err(NativeRefusal::GuestEndpointUnverified);
-                        }
-                        health(guest, peer, challenge, packages, cutoff)?;
-                        let provision: TrialResponse = exchange(
-                            guest,
-                            peer,
-                            &TrialRequest::DockerTrialProvision { challenge },
-                            cutoff,
-                        )?;
-                        let ack: ComposeResponse = exchange(
-                            guest,
-                            peer,
-                            &arx_guest::docker_trial::compose_hello(challenge),
-                            cutoff,
-                        )?;
-                        if provision != (TrialResponse::DockerTrialProvisioned { challenge })
-                            || !arx_guest::docker_trial::matches_compose_ack(challenge, &ack)
-                        {
-                            return Err(NativeRefusal::GuestEndpointUnverified);
-                        }
-                        let port = plan.static_origin_lease().ok_or(REFUSED)?.port();
-                        let proof = capture.origin(peer, challenge, port, cutoff)?;
-                        if proof.peer != peer
-                            || proof.challenge != challenge
-                            || proof.port != port
-                            || proof.tls_profile != dependencies.origin_profile
-                        {
-                            return Err(NativeRefusal::GuestEndpointUnverified);
-                        }
-                        Ok(())
-                    },
-                )?;
+                self.run_boot(Phase::Endpoint, cutoff, |host, guest, capture, boot| {
+                    let peer = boot.peer;
+                    let challenge = boot.ticket.challenge;
+                    if !fixture.is_some_and(|first| first.boot != peer.boot) {
+                        return Err(NativeRefusal::GuestEndpointUnverified);
+                    }
+                    health(guest, peer, challenge, packages, cutoff)?;
+                    let provision: TrialResponse = exchange(
+                        guest,
+                        peer,
+                        &TrialRequest::DockerTrialProvision { challenge },
+                        cutoff,
+                    )?;
+                    let ack: ComposeResponse = exchange(
+                        guest,
+                        peer,
+                        &arx_guest::docker_trial::compose_hello(challenge),
+                        cutoff,
+                    )?;
+                    if provision != (TrialResponse::DockerTrialProvisioned { challenge })
+                        || !arx_guest::docker_trial::matches_compose_ack(challenge, &ack)
+                    {
+                        return Err(NativeRefusal::GuestEndpointUnverified);
+                    }
+                    let port = boot.plan.static_origin_lease().ok_or(REFUSED)?.port();
+                    host.listener(peer, port, cutoff)?.check(port, peer.pid)?;
+                    let proof = capture.origin(peer, challenge, port, cutoff)?;
+                    host.listener(peer, port, cutoff)?.check(port, peer.pid)?;
+                    if proof.peer != peer
+                        || proof.challenge != challenge
+                        || proof.port != port
+                        || proof.tls_profile != dependencies.origin_profile
+                    {
+                        return Err(NativeRefusal::GuestEndpointUnverified);
+                    }
+                    Ok(())
+                })?;
                 if !self.host.copies_independent_and_original_unchanged() {
                     return Err(REFUSED);
                 }
@@ -612,6 +650,7 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
         if self.custody.scope.run != self.evidence.run()
             || self.custody.scope.evidence != self.evidence.scope()
             || self.stock.inventory != self.dependencies.stock_inventory
+            || self.receiver_enrollment.fixture() != self.dependencies.network_fixture
             || self
                 .host
                 .measure()
