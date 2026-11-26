@@ -4,7 +4,7 @@
 //! for the qemu-img child only; every other edge is the production code.
 
 use super::super::disposal::tests::{CLAIM, NOW, SweepFixture, build_request, exists};
-use super::super::helper::{HELPER_BUDGET, check_helper_lease, helper_deadline};
+use super::super::helper::{AFTER_REPIN, HELPER_BUDGET, check_helper_lease, helper_deadline};
 use super::super::tests::unbacked_qcow2_header;
 use super::*;
 use crate::service::Shutdown;
@@ -12,6 +12,7 @@ use crate::store::vm::{
     self as store, Binding,
     native::{Leaf, Origin, disposal::GenerationState},
 };
+use crate::vm::paths::ArtifactPin;
 use crate::vm::reaper::CleanupWork;
 use crate::vm::runtime::{OfflineLease, Quiesced, ReaperRuntime};
 use crate::vm::test_issuer::tests::{FakeSource, assert_admission_closed, config};
@@ -162,7 +163,11 @@ fn resources() -> Resources {
     }
 }
 
-fn clone_request(golden: &Golden, key: u16, ttl: u64) -> Request<'static> {
+/// The fixture clone's retained claim: the overlay plan's peak for `SIZE`
+/// plus the VARS copy fits.
+const CLONE_CLAIM: u64 = 2 * GIB;
+
+fn clone_request(golden: &Golden, key: u16, ttl: u64, images: u64) -> Request<'static> {
     Request {
         principal: "alice",
         request_id: fresh_key(0x9000 + u32::from(key)),
@@ -172,7 +177,7 @@ fn clone_request(golden: &Golden, key: u16, ttl: u64) -> Request<'static> {
             lease_seconds: Some(ttl),
         },
         disk: DiskClaim {
-            images: CLAIM,
+            images,
             metadata: 0,
             staging: 0,
         },
@@ -187,10 +192,14 @@ struct Admitted {
 }
 
 fn admit(fx: &SweepFixture, golden: &Golden, key: u16, ttl: u64) -> Admitted {
+    admit_with(fx, golden, key, ttl, CLONE_CLAIM)
+}
+
+fn admit_with(fx: &SweepFixture, golden: &Golden, key: u16, ttl: u64, images: u64) -> Admitted {
     match fx
         .ctl()
         .admit_linked_clone(
-            clone_request(golden, key, ttl),
+            clone_request(golden, key, ttl, images),
             host(),
             resources(),
             golden.slots,
@@ -214,7 +223,7 @@ fn replay(fx: &SweepFixture, golden: &Golden, key: u16, ttl: u64) -> OperationRe
     match fx
         .ctl()
         .admit_linked_clone(
-            clone_request(golden, key, ttl),
+            clone_request(golden, key, ttl, CLONE_CLAIM),
             host(),
             resources(),
             golden.slots,
@@ -228,21 +237,15 @@ fn replay(fx: &SweepFixture, golden: &Golden, key: u16, ttl: u64) -> OperationRe
     }
 }
 
-fn hold(fx: &SweepFixture, golden: &Golden) -> Result<HeldGolden, Q> {
-    let ledger = LedgerCheckpoints {
-        store: fx.store(),
-        origin: Origin::Clone,
-    };
-    HeldGolden::hold(
-        &fx.production,
-        fx.owner_sid().0,
-        &ledger,
-        golden.scope,
-        golden.slots,
-        golden.evidence,
-        Instant::now() + Duration::from_secs(30),
-        &|| false,
-    )
+/// The golden's workspace lease is free again.
+fn golden_released(fx: &SweepFixture, golden: &Golden) -> bool {
+    hold_workspace_under(&fx.production, fx.owner_sid().0, golden.scope).is_ok()
+}
+
+/// The exact backing name a clone of this golden must carry.
+fn golden_backing(fx: &SweepFixture, golden: &Golden) -> LocalPath {
+    let ws = hold_workspace_under(&fx.production, fx.owner_sid().0, golden.scope).unwrap();
+    slot_path(&ws.root.path, golden.slots.disk).unwrap()
 }
 
 /// An unbacked header plus the qcow2 backing-format extension and the
@@ -320,8 +323,9 @@ impl<'f> Run<'f> {
 }
 
 /// Stands in for the qemu-img child behind the checked creation: it mints
-/// through the real intent, consumes at create, writes only after a
-/// consumed permit, and reports the release the core would.
+/// for the stage's plan through the real intent, consumes at create through
+/// `consume_checked`, writes only after a consumed permit, and reports the
+/// release the core would.
 struct FixtureOverlay<'f, 'i> {
     run: &'f Run<'f>,
     intent: &'f Intent<'i, &'f FakeSource, FxClock>,
@@ -352,31 +356,14 @@ fn held_release<'a>(
 }
 
 impl OverlayHelper for FixtureOverlay<'_, '_> {
-    fn image(&self) -> FileIdentity {
-        self.run.image.identity().unwrap()
-    }
-
     async fn create<'a>(
         self,
         prepared: &'a PreparedHelper<'a, 'a>,
-        golden: &'a HeldGolden,
-        size: u64,
+        plan: CommandPlan<'a>,
     ) -> HelperSettlement<'a>
     where
         Self: 'a,
     {
-        let backing = golden.backing().unwrap();
-        let header = golden.header().unwrap();
-        let staging = prepared.staging().unwrap();
-        let plan = crate::vm::qemu_img::create(
-            prepared.lease(),
-            &self.run.image,
-            &staging,
-            Some((&backing, &header)),
-            size,
-            size + GIB,
-        )
-        .unwrap();
         let binding = prepared.workspace().binding();
         let permit = match self
             .intent
@@ -386,20 +373,27 @@ impl OverlayHelper for FixtureOverlay<'_, '_> {
             Err(reason) => return HelperSettlement::quarantined(Err(reason)),
         };
         (self.before_consume)();
+        let staging = prepared.staging().unwrap();
+        let backing = plan
+            .inputs()
+            .iter()
+            .find(|(role, _)| *role == ArtifactRole::Golden)
+            .map(|(_, input)| input.clone())
+            .unwrap();
         let other = Artifact::new(
             ArtifactRole::Golden,
             staging.path_for(ArtifactRole::Staging).unwrap().clone(),
         )
         .unwrap()
         .with_identity(prepared.identity())
-        .with_pin(golden.evidence[0].pin);
+        .with_pin(backing.pin().unwrap());
         let substituted = crate::vm::qemu_img::create(
             prepared.lease(),
             &self.run.image,
             &staging,
-            Some((&other, &header)),
-            size,
-            size + GIB,
+            Some((&other, &unbacked_qcow2_header(SIZE))),
+            SIZE,
+            CLONE_CLAIM,
         )
         .unwrap();
         // The checked creation's own handoff at create.
@@ -437,7 +431,7 @@ impl OverlayHelper for FixtureOverlay<'_, '_> {
             .open(target.as_str())
             .and_then(|mut file| {
                 use std::io::Write;
-                file.write_all(&backed_header(size, &name))
+                file.write_all(&backed_header(SIZE, &name))
             })
             .unwrap();
         self.writes.set(self.writes.get() + 1);
@@ -491,6 +485,16 @@ struct Case<'f> {
     tamper: Option<&'f dyn Fn([ArtifactEvidence; 2]) -> [ArtifactEvidence; 2]>,
     before_consume: &'f dyn Fn(),
     before_vars: &'f dyn Fn(),
+    /// Runs inside the settlement, just before the controller decides.
+    before_settle: &'f dyn Fn(),
+    /// Cancels right after the copy permit is consumed.
+    cancel_after_copy: bool,
+    /// Mints and consumes the copy authority for this content instead.
+    copy_content: Option<ArtifactPin>,
+    /// Cancels inside the settlement, just before the controller decides.
+    cancel_at_settle: bool,
+    /// Replaces the lease-derived effect cutoff.
+    effect_cutoff: Option<Duration>,
     ledger: Option<&'f dyn CustodyCheckpoints>,
     settle_fault: Option<SettleFault>,
 }
@@ -511,6 +515,11 @@ impl<'f> Case<'f> {
             tamper: None,
             before_consume: &|| {},
             before_vars: &|| {},
+            before_settle: &|| {},
+            cancel_after_copy: false,
+            copy_content: None,
+            cancel_at_settle: false,
+            effect_cutoff: None,
             ledger: None,
             settle_fault: None,
         }
@@ -550,7 +559,8 @@ impl<'f> Case<'f> {
             slots: admitted.slots,
             size: SIZE,
             worker_deadline: admitted.worker.deadline(),
-            effect_cutoff: reading.monotonic + Duration::from_millis(left),
+            effect_cutoff: reading.monotonic
+                + self.effect_cutoff.unwrap_or(Duration::from_millis(left)),
             owner: fx.owner_sid().0,
             cancelled: &is_cancelled,
         };
@@ -563,30 +573,48 @@ impl<'f> Case<'f> {
             before_consume: self.before_consume,
         };
         let golden = self.golden;
+        let owner = fx.owner_sid().0;
         let clone_generation = admitted.slots.disk.generation;
         let status = stage_linked_clone(
-            || hold(fx, golden),
-            || reserve_workspace_under(&fx.production, fx.owner_sid().0, clone_generation, ledger),
+            || {
+                fx.ctl()
+                    .admitted_sealed_golden(&admitted.worker)
+                    .ok()
+                    .flatten()
+                    .ok_or(PATH)
+            },
+            |sealed| {
+                HeldGolden::hold(
+                    &fx.production,
+                    owner,
+                    ledger,
+                    golden.scope,
+                    sealed,
+                    Instant::now() + Duration::from_secs(30),
+                    &|| false,
+                )
+            },
+            || reserve_workspace_under(&fx.production, owner, clone_generation, ledger),
             ledger,
             &request,
+            &run.image,
             helper,
             |slot, content| {
                 (self.before_vars)();
-                let authority = intent.copy(slot, content)?.consume(slot, content)?;
-                authority
-                    .names(slot, content)
-                    .then_some(())
-                    .ok_or(NativeRefusal::QualificationMissing)
+                let named = self.copy_content.unwrap_or(content);
+                let authority = intent.copy(slot, named)?.consume(slot, named)?;
+                if self.cancel_after_copy {
+                    cancelled.set(true);
+                }
+                Ok(authority)
             },
-            |outcome| {
+            |outcome, gate| {
                 let mut seen = observed.borrow_mut();
-                let owner = fx.owner_sid().0;
                 let state = fx
                     .store()
                     .transact(|db| store::native::disposal::generation_state(db, clone_generation))
                     .unwrap();
-                seen.golden_lease_free =
-                    Some(hold_workspace_under(&fx.production, owner, golden.scope).is_ok());
+                seen.golden_lease_free = Some(golden_released(fx, golden));
                 if let GenerationState::Bound { scope, .. } = state {
                     let binding = super::super::disposal::binding_from_scope(scope);
                     seen.clone_lease_free =
@@ -612,20 +640,25 @@ impl<'f> Case<'f> {
                             .is_ok(),
                 );
                 drop(seen);
+                (self.before_settle)();
+                if self.cancel_at_settle {
+                    cancelled.set(true);
+                }
                 let outcome = match (outcome, self.tamper) {
                     (Ok(pair), Some(tamper)) => Ok(tamper(pair)),
                     (outcome, _) => outcome,
                 };
+                let finish = |outcome, gate| {
+                    fx.ctl()
+                        .finish_native_clone(&admitted.worker, admitted.slots, outcome, gate)
+                };
                 match self.settle_fault {
                     Some(SettleFault::BeforeCommit) => anyhow::bail!("settlement lost"),
                     Some(SettleFault::AfterCommit) => {
-                        fx.ctl()
-                            .finish_native_clone(&admitted.worker, admitted.slots, outcome)?;
+                        finish(outcome, gate)?;
                         anyhow::bail!("acknowledgement lost")
                     }
-                    None => fx
-                        .ctl()
-                        .finish_native_clone(&admitted.worker, admitted.slots, outcome),
+                    None => finish(outcome, gate),
                 }
             },
         )
@@ -686,7 +719,7 @@ fn assert_golden_intact(fx: &SweepFixture, golden: &Golden) {
         .unwrap();
     assert!(sealed, "the golden stays sealed");
     assert!(
-        hold(fx, golden).is_ok(),
+        golden_released(fx, golden),
         "the golden is released after the worker"
     );
 }
@@ -764,15 +797,11 @@ async fn clone_publishes_only_the_verified_pair_under_the_held_golden() {
             "SELECT persistent FROM vm_disk_claims WHERE vm=?1",
             admitted.vm
         ),
-        i64::try_from(CLAIM).unwrap()
+        i64::try_from(CLONE_CLAIM).unwrap()
     );
     let overlay = std::fs::read(fx.slot_file(admitted.slots.disk)).unwrap();
-    let backing = hold(&fx, &golden).unwrap().backing().unwrap();
     assert_eq!(
-        crate::vm::qemu_img::inspect_header(
-            &overlay,
-            Some(backing.path_for(ArtifactRole::Golden).unwrap())
-        ),
+        crate::vm::qemu_img::inspect_header(&overlay, Some(&golden_backing(&fx, &golden))),
         Ok(SIZE)
     );
     assert_eq!(
@@ -1170,26 +1199,54 @@ async fn stale_permit_or_wrong_backing_writes_nothing() {
         assert_eq!(claims(&fx, admitted.vm), 0);
         assert_admission_closed();
     }
-    // Wrong sealed identity, content or roles: refused at hold.
+    // Admission refuses tampered sealed evidence; the held golden is the
+    // controller's admitted sealed golden, and only in its own bound scope.
     {
         let fx = SweepFixture::new();
         let golden = seal_golden(&fx, 7);
-        assert!(hold(&fx, &golden).is_ok(), "positive control");
-        let mut wrong = golden;
-        wrong.evidence[0].identity.file[0] ^= 1;
-        assert!(hold(&fx, &wrong).is_err());
-        let mut wrong = golden;
-        wrong.evidence[0].pin.sha256[0] ^= 1;
-        assert!(hold(&fx, &wrong).is_err());
-        let mut wrong = golden;
-        wrong.evidence[1].pin.sha256[0] ^= 1;
-        assert!(hold(&fx, &wrong).is_err());
-        let mut wrong = golden;
-        wrong.slots = PairSlots {
-            disk: golden.slots.vars,
-            vars: golden.slots.disk,
+        let other = seal_golden(&fx, 17);
+        let mut wrong = golden.evidence;
+        wrong[0].pin.sha256[0] ^= 1;
+        assert!(matches!(
+            fx.ctl()
+                .admit_linked_clone(
+                    clone_request(&golden, 21, TTL, CLONE_CLAIM),
+                    host(),
+                    resources(),
+                    golden.slots,
+                    wrong,
+                )
+                .unwrap(),
+            Err(Refusal::NotFound)
+        ));
+        let admitted = admit(&fx, &golden, 22, TTL);
+        let sealed = fx
+            .ctl()
+            .admitted_sealed_golden(&admitted.worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (sealed.slots(), sealed.evidence(), sealed.retained()),
+            (golden.slots, golden.evidence, CLONE_CLAIM)
+        );
+        let ledger = LedgerCheckpoints {
+            store: fx.store(),
+            origin: Origin::Clone,
         };
-        assert!(hold(&fx, &wrong).is_err());
+        let hold_in = |scope| {
+            HeldGolden::hold(
+                &fx.production,
+                fx.owner_sid().0,
+                &ledger,
+                scope,
+                &sealed,
+                Instant::now() + Duration::from_secs(30),
+                &|| false,
+            )
+            .map(drop)
+        };
+        assert_eq!(hold_in(golden.scope), Ok(()), "positive control");
+        assert_eq!(hold_in(other.scope), Err(PATH), "another golden's scope");
         assert_admission_closed();
     }
     // Stale permits: cancellation, an expired worker, or a substituted plan
@@ -1452,21 +1509,43 @@ fn the_helper_lease_names_exactly_the_held_target() {
     let target = ws
         .precreate_helper_target(admitted.slots.disk, &ledger)
         .unwrap();
-    let exact = OfflineLease::helper_target(ws.binding(), target.identity());
-    let mut other_id = target.identity();
-    other_id.file[0] ^= 1;
-    let other = OfflineLease::helper_target(ws.binding(), other_id);
-    let mut other_binding = ws.binding();
-    other_binding.generation = golden.scope.generation;
-    let elsewhere = OfflineLease::helper_target(other_binding, target.identity());
+    let exact = OfflineLease::for_helper(&target);
+    // Another held target in another production root: its lease and its
+    // target are both foreign to this workspace.
+    let fx2 = SweepFixture::new();
+    let golden2 = seal_golden(&fx2, 23);
+    let admitted2 = admit(&fx2, &golden2, 71, TTL);
+    let ledger2 = LedgerCheckpoints {
+        store: fx2.store(),
+        origin: Origin::Clone,
+    };
+    let ws2 = reserve_workspace_under(
+        &fx2.production,
+        fx2.owner_sid().0,
+        admitted2.slots.disk.generation,
+        &ledger2,
+    )
+    .unwrap();
+    let target2 = ws2
+        .precreate_helper_target(admitted2.slots.disk, &ledger2)
+        .unwrap();
+    let elsewhere = OfflineLease::for_helper(&target2);
     let check = |kind, lease, target| check_helper_lease(kind, lease, &ws, target);
     assert_eq!(check(PlanKind::Mutate, Some(&exact), Some(&target)), Ok(()));
-    for lease in [&other, &elsewhere] {
-        assert_eq!(
-            check(PlanKind::Mutate, Some(lease), Some(&target)),
-            Err(PATH)
-        );
-    }
+    assert_eq!(
+        check(PlanKind::Mutate, Some(&elsewhere), Some(&target)),
+        Err(PATH)
+    );
+    assert_eq!(
+        check(PlanKind::Mutate, Some(&exact), Some(&target2)),
+        Err(PATH),
+        "a target held for another workspace"
+    );
+    assert_eq!(
+        check(PlanKind::Mutate, Some(&elsewhere), Some(&target2)),
+        Err(PATH),
+        "a consistent lease and target that are not this workspace's"
+    );
     assert_eq!(check(PlanKind::Mutate, None, Some(&target)), Err(PATH));
     assert_eq!(check(PlanKind::Mutate, Some(&exact), None), Err(PATH));
     assert_eq!(
@@ -1650,4 +1729,265 @@ fn helper_output_needs_a_matched_clean_release_and_a_final_check() {
         );
     }
     assert_admission_closed();
+}
+
+/// Standards 1 (I08/T23): a cancellation or the exclusive cutoff landing
+/// during the final re-pin observation still refuses the output and keeps
+/// the matched proof.
+#[test]
+fn a_cancellation_or_cutoff_during_the_final_repin_refuses_the_output() {
+    for late in ["cancellation", "cutoff"] {
+        let fx = SweepFixture::new();
+        let golden = seal_golden(&fx, 18);
+        let admitted = admit(&fx, &golden, 91, TTL);
+        let ledger = LedgerCheckpoints {
+            store: fx.store(),
+            origin: Origin::Clone,
+        };
+        let ws = reserve_workspace_under(
+            &fx.production,
+            fx.owner_sid().0,
+            admitted.slots.disk.generation,
+            &ledger,
+        )
+        .unwrap();
+        let far = Instant::now() + HELPER_BUDGET * 2;
+        let cutoff = Instant::now() + Duration::from_secs(2);
+        let prepared = ws
+            .prepare_helper(admitted.slots.disk, &ledger, far, cutoff, &|| false)
+            .unwrap();
+        let inputs = [
+            (
+                ArtifactRole::QemuImg,
+                FileIdentity {
+                    volume: prepared.identity().volume,
+                    file: [0x52; 16],
+                },
+            ),
+            (ArtifactRole::Staging, prepared.identity()),
+            (ArtifactRole::Golden, golden.evidence[0].identity),
+        ];
+        let settlement = HelperSettlement {
+            output: Ok(b"ok".to_vec()),
+            disposition: StopDisposition::CleanRelease,
+            released: Some(held_release(
+                &ws,
+                prepared.slot(),
+                prepared.identity(),
+                inputs.to_vec(),
+            )),
+        };
+        let cancelled = std::rc::Rc::new(Cell::new(false));
+        let ran = std::rc::Rc::new(Cell::new(false));
+        let (set, hooked, deadline) = (cancelled.clone(), ran.clone(), prepared.deadline());
+        let cancellation = late == "cancellation";
+        AFTER_REPIN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                hooked.set(true);
+                if cancellation {
+                    set.set(true);
+                } else {
+                    std::thread::sleep(
+                        deadline.saturating_duration_since(Instant::now())
+                            + Duration::from_millis(20),
+                    );
+                }
+            }));
+        });
+        let writable = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fx.slot_file(admitted.slots.disk))
+                .is_ok()
+        };
+        match prepared.accept(settlement, &inputs, &|| cancelled.get()) {
+            HelperOutcome::Refused { proof, .. } => {
+                assert!(ran.get(), "{late}: the re-pin observation ran");
+                assert!(!writable(), "{late}: the refused output keeps its proof");
+                drop(proof);
+                assert!(writable());
+            }
+            _ => panic!("{late} during the re-pin must refuse the output"),
+        }
+        AFTER_REPIN.with(|hook| hook.borrow_mut().take());
+        assert_admission_closed();
+    }
+}
+
+/// Spec 1 (I05/I06, T25/T26): the worker stages only the sealed golden its
+/// admission verified. Holding another sealed golden writes nothing.
+#[tokio::test]
+async fn a_worker_stages_only_its_admitted_sealed_golden() {
+    let fx = SweepFixture::new();
+    let admitted_golden = seal_golden(&fx, 41);
+    let substitute = seal_golden(&fx, 42);
+    assert_ne!(admitted_golden.template, substitute.template);
+    let source = FakeSource::new(Instant::now());
+    let run = Run::new(&fx, &source);
+    let admitted = admit(&fx, &admitted_golden, 110, TTL);
+    let (status, writes, seen) = Case::new(&fx, &substitute, Mode::Clean)
+        .stage(&run, &admitted)
+        .await;
+    assert_eq!((status.unwrap(), writes), (Status::Interrupted, 0));
+    assert!(
+        !exists(&fx.gen_dir(admitted.slots.disk.generation)),
+        "no clone write under another golden"
+    );
+    assert_eq!(seen.golden_lease_free, Some(true));
+    assert!(sweep_until_retired(&fx, admitted.vm));
+    assert_eq!(claims(&fx, admitted.vm), 0);
+    assert_golden_intact(&fx, &admitted_golden);
+    assert_golden_intact(&fx, &substitute);
+    assert_admission_closed();
+}
+
+/// Spec 2 (I06, T11/T12): VARS are staged only with a consumed copy
+/// authority naming the exact slot and content.
+#[tokio::test]
+async fn vars_need_a_consumed_authority_for_the_exact_content() {
+    let fx = SweepFixture::new();
+    let golden = seal_golden(&fx, 43);
+    let source = FakeSource::new(Instant::now());
+    let run = Run::new(&fx, &source);
+    let admitted = admit(&fx, &golden, 111, TTL);
+    let mut altered: ArtifactPin = golden.evidence[1].pin;
+    altered.sha256[0] ^= 1;
+    let mut case = Case::new(&fx, &golden, Mode::Clean);
+    case.copy_content = Some(altered);
+    let (status, ..) = case.stage(&run, &admitted).await;
+    assert_eq!(status.unwrap(), Status::Interrupted);
+    assert!(!exists(&fx.slot_file(admitted.slots.vars)), "no VARS slot");
+    assert!(sweep_until_retired(&fx, admitted.vm));
+    assert_eq!(claims(&fx, admitted.vm), 0);
+    assert_admission_closed();
+}
+
+/// Standards 2 (I06/I24, T11/T26/T27): cancellation after the consumed copy
+/// permit creates no VARS slot, and cancellation or the effect cutoff at
+/// the publication decision prevents activation and keeps the claim.
+#[tokio::test]
+async fn cancellation_or_cutoff_after_the_last_check_prevents_the_effect() {
+    for (index, point) in [
+        "after the copy permit",
+        "at publication",
+        "cutoff at publication",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fx = SweepFixture::new();
+        let golden = seal_golden(&fx, 44);
+        let source = FakeSource::new(Instant::now());
+        let run = Run::new(&fx, &source);
+        let admitted = admit(&fx, &golden, 112 + index as u16, TTL);
+        let mut case = Case::new(&fx, &golden, Mode::Clean);
+        let past_cutoff = || fx.clock.advance(0, 11);
+        match point {
+            "after the copy permit" => case.cancel_after_copy = true,
+            "at publication" => case.cancel_at_settle = true,
+            _ => {
+                case.effect_cutoff = Some(Duration::from_secs(10));
+                case.before_settle = &past_cutoff;
+            }
+        }
+        let (status, ..) = case.stage(&run, &admitted).await;
+        assert_eq!(status.unwrap(), Status::Interrupted, "{point}");
+        if index == 0 {
+            assert!(
+                !exists(&fx.slot_file(admitted.slots.vars)),
+                "{point}: no VARS slot"
+            );
+        }
+        assert_eq!(
+            count(
+                &fx,
+                "SELECT count(*) FROM vm_instances WHERE id=?1 AND state=1",
+                admitted.vm
+            ),
+            0,
+            "{point}: never activated"
+        );
+        if index == 1 {
+            let cancelled: bool = fx
+                .store()
+                .transact(|db| {
+                    Ok(db.query_row(
+                        "SELECT failure_reason=?2 FROM vm_operations WHERE activity_id=?1",
+                        rusqlite::params![
+                            admitted.operation.receipt.activity_id,
+                            FailureReason::Cancelled as i64
+                        ],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert!(cancelled, "{point}: the transaction saw the cancellation");
+        }
+        assert_eq!(claims(&fx, admitted.vm), 1, "{point}: claim retained");
+        assert!(sweep_until_retired(&fx, admitted.vm), "{point}");
+        assert_eq!(claims(&fx, admitted.vm), 0, "{point}");
+        assert_golden_intact(&fx, &golden);
+        assert_admission_closed();
+    }
+}
+
+/// Spec 3 (I18, T25–T27): the overlay plan is bounded by the admitted claim
+/// before dispatch, and a verified pair above the retained claim is not
+/// published and stays charged until checked disposal.
+#[tokio::test]
+async fn the_staged_pair_is_bounded_by_the_admitted_claim() {
+    // A claim below the overlay plan's peak dispatches nothing.
+    {
+        let fx = SweepFixture::new();
+        let golden = seal_golden(&fx, 46);
+        let source = FakeSource::new(Instant::now());
+        let run = Run::new(&fx, &source);
+        let admitted = admit_with(&fx, &golden, 114, TTL, CLAIM);
+        let (status, writes, _) = Case::new(&fx, &golden, Mode::Clean)
+            .stage(&run, &admitted)
+            .await;
+        assert_eq!((status.unwrap(), writes), (Status::Interrupted, 0));
+        assert_eq!(claims(&fx, admitted.vm), 1);
+        assert!(sweep_until_retired(&fx, admitted.vm));
+        assert_eq!(claims(&fx, admitted.vm), 0);
+        assert_admission_closed();
+    }
+    // A verified pair above the retained claim at the publication decision.
+    {
+        let fx = SweepFixture::new();
+        let golden = seal_golden(&fx, 47);
+        let source = FakeSource::new(Instant::now());
+        let run = Run::new(&fx, &source);
+        let admitted = admit(&fx, &golden, 115, TTL);
+        let vm = admitted.vm;
+        let shrink = || {
+            fx.store()
+                .transact(|db| {
+                    db.execute(
+                        "UPDATE vm_disk_claims SET persistent=1024 WHERE vm=?1",
+                        [vm],
+                    )?;
+                    Ok(())
+                })
+                .unwrap()
+        };
+        let mut case = Case::new(&fx, &golden, Mode::Clean);
+        case.before_settle = &shrink;
+        let (status, ..) = case.stage(&run, &admitted).await;
+        assert_eq!(status.unwrap(), Status::Interrupted);
+        assert_eq!(
+            count(
+                &fx,
+                "SELECT count(*) FROM vm_instances WHERE id=?1 AND state=1",
+                vm
+            ),
+            0
+        );
+        assert_eq!(claims(&fx, vm), 1, "the rejected clone stays charged");
+        assert!(exists(&fx.slot_file(admitted.slots.disk)));
+        assert!(sweep_until_retired(&fx, vm));
+        assert_eq!(claims(&fx, vm), 0);
+        assert_golden_intact(&fx, &golden);
+        assert_admission_closed();
+    }
 }

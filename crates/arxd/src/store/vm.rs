@@ -2186,7 +2186,124 @@ pub(crate) fn native_clone_verified(
             return Ok(false);
         }
     }
-    Ok(true)
+    // The verified bytes must fit the clone's single retained claim, as
+    // the build publication requires of its pair.
+    let mut claims = db.prepare(
+        "SELECT c.persistent FROM vm_disk_claims c JOIN vm_generations g ON g.vm_id=c.vm
+         WHERE g.id=?1 AND c.snapshot IS NULL",
+    )?;
+    let retained = claims
+        .query_map([scope.generation], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let [retained] = retained.as_slice() else {
+        return Ok(false);
+    };
+    Ok(proof[0]
+        .pin
+        .size
+        .checked_add(proof[1].pin.size)
+        .zip(u64::try_from(*retained).ok())
+        .is_some_and(|(bytes, retained)| bytes <= retained))
+}
+
+/// The exact sealed golden a pending clone operation was admitted for: an
+/// active sealed generation of `template`, both slots sealed in the ledger
+/// and verified in native custody as the same objects and contents, and
+/// the clone's single positive retained claim (7c 11).
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+)]
+pub(crate) fn sealed_golden(
+    db: &Connection,
+    template: Id,
+    generation: Id,
+    activity_id: i64,
+) -> Result<Option<(PairSlots, [ArtifactEvidence; 2], u64)>> {
+    if count(
+        db,
+        "SELECT count(*) FROM vm_build_intents b JOIN vm_generations g ON g.build_id=b.id
+         WHERE b.template_id=?1 AND b.state='sealed' AND g.active=1 AND g.id=?2
+           AND g.static_id IS NULL",
+        params![template, generation],
+    )? != 1
+    {
+        return Ok(None);
+    }
+    let mut claims = db.prepare(
+        "SELECT c.persistent FROM vm_disk_claims c JOIN vm_operations o ON o.activity_id=c.activity_id
+         WHERE c.activity_id=?1 AND c.vm=o.vm AND c.snapshot IS NULL AND o.status=0 AND o.action=1",
+    )?;
+    let retained = claims
+        .query_map([activity_id], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let Some(retained) = (match retained.as_slice() {
+        [bytes] => u64::try_from(*bytes).ok().filter(|bytes| *bytes > 0),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let mut found = Vec::with_capacity(2);
+    for role in ["disk", "vars"] {
+        let row = db
+            .query_row(
+                "SELECT object_key,volume_id,directory_id,file_id,content_digest,bytes
+                 FROM vm_artifacts WHERE generation_id=?1 AND role=?2 AND state='sealed'",
+                params![generation, role],
+                |row| {
+                    Ok((
+                        row.get::<_, Id>(0)?,
+                        row.get::<_, Option<[u8; 8]>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Option<[u8; 32]>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((key, Some(volume), Some(directory), Some(file), Some(sha256), Some(size))) = row
+        else {
+            return Ok(None);
+        };
+        let (Some(directory), Some(file), Ok(size)) = (
+            identity_bytes(directory),
+            identity_bytes(file),
+            u64::try_from(size),
+        ) else {
+            return Ok(None);
+        };
+        let slot = ArtifactSlot {
+            generation,
+            role,
+            key,
+        };
+        let pin = crate::vm::paths::ArtifactPin { size, sha256 };
+        if native::leaf(db, slot)? != native::Leaf::Verified(file, pin) {
+            return Ok(None);
+        }
+        let evidence = ArtifactEvidence {
+            identity: FileIdentity {
+                volume: u64::from_be_bytes(volume),
+                file,
+            },
+            directory,
+            pin,
+        };
+        found.push((slot, evidence));
+    }
+    let [(disk, disk_evidence), (vars, vars_evidence)] = found.as_slice() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        PairSlots {
+            disk: *disk,
+            vars: *vars,
+        },
+        [*disk_evidence, *vars_evidence],
+        retained,
+    )))
 }
 
 fn abandon_inactive(db: &Connection, generation: Option<Id>) -> Result<()> {

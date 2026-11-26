@@ -20,6 +20,13 @@ use crate::vm::runtime::OfflineLease;
 
 type Q = NativeRefusal;
 const PATH: Q = NativeRefusal::PathCustodyUnverified;
+#[cfg(test)]
+thread_local! {
+    /// Runs once inside `accept`, after the final re-pin observation.
+    pub(super) static AFTER_REPIN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The individual helper bound (spec §1 phase budgets).
 pub(crate) const HELPER_BUDGET: Duration = Duration::from_secs(30);
 
@@ -54,7 +61,7 @@ impl ProductionWorkspace {
         let deadline = helper_deadline(worker_deadline, effect_cutoff, Instant::now());
         launch::check_preparation(deadline, cancelled)?;
         let target = self.precreate_helper_target(slot, ledger)?;
-        let lease = OfflineLease::helper_target(self.binding, target.identity());
+        let lease = OfflineLease::for_helper(&target);
         launch::check_preparation(deadline, cancelled)?;
         Ok(PreparedHelper {
             workspace: self,
@@ -153,10 +160,16 @@ impl<'w> PreparedHelper<'w, '_> {
             Ok(_) if disposition != StopDisposition::CleanRelease => Err(PATH),
             output => output,
         };
+        // The initial check spares the observation; the recheck after it
+        // keeps a cancellation or cutoff during the re-pin from exposing
+        // output.
         match output.and_then(|output| {
             launch::check_preparation(self.deadline, cancelled)?;
             self.workspace
                 .pin_slot(self.slot(), self.identity(), false)?;
+            #[cfg(test)]
+            AFTER_REPIN.with(|hook| hook.borrow_mut().take().map(|hook| hook()));
+            launch::check_preparation(self.deadline, cancelled)?;
             Ok(output)
         }) {
             Ok(output) => HelperOutcome::Accepted { output, proof },
@@ -217,7 +230,7 @@ pub(super) fn check_helper_lease(
 ) -> Result<(), Q> {
     match (kind, offline, target) {
         (PlanKind::Mutate, Some(lease), Some(target))
-            if lease.binds(workspace.binding(), target.identity()) =>
+            if lease.binds(target) && target.binding() == workspace.binding() =>
         {
             Ok(())
         }

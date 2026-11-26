@@ -1,17 +1,22 @@
 //! Linked clone staging and failed clone claim release (ADR 0054, 7c
 //! chunk 11).
 //!
-//! The exact sealed golden is held without writers and checked against its
-//! sealed evidence before any clone write, and stays held through
-//! publication. The overlay is created by the shared checked helper; its
-//! release proof stays held while the overlay header names exactly that
-//! golden and its content is checkpointed as verified. VARS are copied from
-//! the held golden under a consumed copy permit. Publication happens once,
-//! under every hold, before the earliest cutoff. Any other outcome drops all
-//! holds first and then settles the clone as failed, which abandons its
-//! staging generation to the shared resumable disposal route (7c 07): known
-//! objects retire through their durable identity, an unidentified present
-//! leaf stays charged. Native execution is **unverified on real hardware**.
+//! The worker stages only the sealed golden its admission verified: the
+//! controller's [`SealedGolden`] re-reads that exact golden from the active
+//! sealed ledger. It is held without writers and checked against its sealed
+//! evidence before any clone write, and stays held through publication. The
+//! overlay plan is built here and bounded by the admitted claim before any
+//! dispatch; the shared checked helper runs it, and its release proof stays
+//! held while the overlay header names exactly that golden and its content
+//! is checkpointed as verified. VARS are copied from the held golden only
+//! with a consumed [`CopyAuthority`] naming the exact slot and content.
+//! Cancellation and the cutoff are rechecked after every observation that
+//! precedes an effect, and the controller's publication transaction decides
+//! on them again. Any other outcome drops all holds first and then settles
+//! the clone as failed, which abandons its staging generation to the shared
+//! resumable disposal route (7c 07): known objects retire through their
+//! durable identity, an unidentified present leaf stays charged. Native
+//! execution is **unverified on real hardware**.
 #![cfg_attr(
     not(test),
     allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
@@ -20,15 +25,16 @@
 use super::helper::{HelperOutcome, PreparedHelper};
 use super::*;
 use crate::vm::paths::{Artifact, ArtifactPin};
-use crate::vm::{FailureReason, Status};
+use crate::vm::test_issuer::CopyAuthority;
+use crate::vm::{ClonePublication, FailureReason, SealedGolden, Status};
 
 type Q = NativeRefusal;
 const PATH: Q = NativeRefusal::PathCustodyUnverified;
 /// A fresh overlay is metadata over its backing golden.
 const OVERLAY_LIMIT: u64 = 64 << 20;
 
-/// The sealed golden a clone backs onto: its bound workspace lease, both
-/// slots pinned and writer-excluded, content checked against the sealed
+/// The admitted sealed golden a clone backs onto: its bound workspace lease,
+/// both slots pinned and writer-excluded, content checked against the sealed
 /// evidence.
 pub(crate) struct HeldGolden {
     workspace: ProductionWorkspace,
@@ -39,19 +45,18 @@ pub(crate) struct HeldGolden {
 }
 
 impl HeldGolden {
-    /// T25: the exact bound golden and its sealed pair before any write.
-    #[allow(clippy::too_many_arguments, reason = "one held golden's scope")]
+    /// T25: the exact admitted golden, in its bound scope, before any write.
     pub(super) fn hold(
         production: &PathPin,
         owner: PSID,
         ledger: &dyn CustodyCheckpoints,
         scope: WorkspaceBinding,
-        slots: PairSlots,
-        evidence: [ArtifactEvidence; 2],
+        golden: &SealedGolden,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self, Q> {
         launch::check_preparation(deadline, cancelled)?;
+        let (slots, evidence) = (golden.slots(), golden.evidence());
         if slots.disk.role != "disk" {
             return Err(PATH);
         }
@@ -108,8 +113,7 @@ impl ForegroundQualification<'_> {
         &self,
         ledger: &dyn CustodyCheckpoints,
         scope: WorkspaceBinding,
-        slots: PairSlots,
-        evidence: [ArtifactEvidence; 2],
+        golden: &SealedGolden,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<HeldGolden, Q> {
@@ -118,8 +122,7 @@ impl ForegroundQualification<'_> {
             self.held.token.account.0,
             ledger,
             scope,
-            slots,
-            evidence,
+            golden,
             deadline,
             cancelled,
         )
@@ -147,28 +150,23 @@ impl CloneRequest<'_> {
     }
 }
 
-/// One checked overlay creation against the prepared target. Production
-/// uses [`CheckedOverlay`]; fixtures stand in for the helper child.
+/// One checked creation of the stage's overlay plan against the prepared
+/// target. Production uses [`CheckedOverlay`]; fixtures stand in for the
+/// helper child.
 pub(crate) trait OverlayHelper {
-    /// The pinned qemu-img identity the release proof must name.
-    fn image(&self) -> FileIdentity;
-
     async fn create<'a>(
         self,
         prepared: &'a PreparedHelper<'a, 'a>,
-        golden: &'a HeldGolden,
-        size: u64,
+        plan: CommandPlan<'a>,
     ) -> HelperSettlement<'a>
     where
         Self: 'a;
 }
 
-/// The production overlay helper: the sealed qemu-img create plan, one
-/// permit minted for exactly that plan, and the checked creation.
-/// **Unverified on real hardware.**
+/// The production overlay helper: one permit minted for exactly the stage's
+/// plan, then the checked creation. **Unverified on real hardware.**
 pub(crate) struct CheckedOverlay<'q, M, R> {
     pub qualification: &'q ForegroundQualification<'q>,
-    pub image: &'q Artifact,
     pub cwd: &'q LocalPath,
     pub cancel: &'q Shutdown,
     pub cancelled: &'q dyn Fn() -> bool,
@@ -183,41 +181,17 @@ where
     P: LaunchPermit,
     R: FnMut() -> Result<Instant, NativeRefusal>,
 {
-    fn image(&self) -> FileIdentity {
-        self.image.identity().unwrap_or(FileIdentity {
-            volume: 0,
-            file: [0; 16],
-        })
-    }
-
     async fn create<'a>(
         self,
         prepared: &'a PreparedHelper<'a, 'a>,
-        golden: &'a HeldGolden,
-        size: u64,
+        plan: CommandPlan<'a>,
     ) -> HelperSettlement<'a>
     where
         Self: 'a,
     {
-        let plan = match (golden.backing(), golden.header(), prepared.staging()) {
-            (Ok(backing), Ok(header), Ok(staging)) => crate::vm::qemu_img::create(
-                prepared.lease(),
-                self.image,
-                &staging,
-                Some((&backing, &header)),
-                size,
-                size.saturating_add(GIB),
-            )
-            .map_err(|_| PATH),
-            _ => Err(PATH),
-        };
-        let permit = plan.and_then(|plan| {
-            let binding = prepared.workspace().binding();
-            let permit = (self.mint)(binding, prepared.launch_target(&plan, self.cwd))?;
-            Ok((plan, permit))
-        });
-        match permit {
-            Ok((plan, permit)) => {
+        let binding = prepared.workspace().binding();
+        match (self.mint)(binding, prepared.launch_target(&plan, self.cwd)) {
+            Ok(permit) => {
                 prepared
                     .run(
                         self.qualification,
@@ -233,6 +207,31 @@ where
             Err(reason) => HelperSettlement::quarantined(Err(reason)),
         }
     }
+}
+
+/// I18/T25: the overlay's sealed create plan, bounded by the admitted claim.
+/// Its peak must fit the retained bytes left after the VARS copy, or nothing
+/// is dispatched.
+fn overlay_plan<'a>(
+    prepared: &'a PreparedHelper<'a, 'a>,
+    image: &'a Artifact,
+    golden: &HeldGolden,
+    sealed: &SealedGolden,
+    size: u64,
+) -> Result<CommandPlan<'a>, Q> {
+    let ceiling = sealed
+        .retained()
+        .checked_sub(sealed.evidence()[1].pin.size)
+        .ok_or(PATH)?;
+    crate::vm::qemu_img::create(
+        prepared.lease(),
+        image,
+        &prepared.staging()?,
+        Some((&golden.backing()?, &golden.header()?)),
+        size,
+        ceiling,
+    )
+    .map_err(|_| PATH)
 }
 
 /// T20/T26: the accepted overlay names exactly the held golden as its
@@ -275,14 +274,16 @@ fn verify_overlay<'a>(
     Ok((evidence, proof))
 }
 
-/// The golden VARS, copied into the identified clone slot under a permit
-/// consumed at the write, then verified and writer-excluded.
+/// The golden VARS, copied into the identified clone slot only with a
+/// consumed copy authority naming this exact slot and content. Cancellation
+/// and the cutoff are rechecked after the authority, after the identity
+/// checkpoint and before the write.
 fn copy_vars(
     workspace: &ProductionWorkspace,
     golden: &HeldGolden,
     ledger: &dyn CustodyCheckpoints,
     request: &CloneRequest<'_>,
-    authorize: impl FnOnce(ArtifactSlot, ArtifactPin) -> Result<(), Q>,
+    authorize: impl FnOnce(ArtifactSlot, ArtifactPin) -> Result<CopyAuthority, Q>,
 ) -> Result<(ArtifactEvidence, File), Q> {
     let slot = request.slots.vars;
     let bytes = launch::held_bytes(&golden.pins[1], MAX_SETUP_VARS_BYTES)?;
@@ -294,8 +295,13 @@ fn copy_vars(
         return Err(PATH);
     }
     request.check()?;
-    authorize(slot, content)?;
+    let authority = authorize(slot, content)?;
+    if !authority.names(slot, content) {
+        return Err(PATH);
+    }
+    request.check()?;
     let mut writer = workspace.create_slot(slot, ledger)?;
+    request.check()?;
     writer.write_all(&bytes)?;
     writer.sync()?;
     let pin = writer.into_pin(false)?;
@@ -320,20 +326,34 @@ fn copy_vars(
 }
 
 /// Stages one linked clone and settles it exactly once (T25–T27, I15,
-/// I18, I24). `settle` receives the verified pair while every hold is
-/// live, or the failure after every hold has been dropped. A settlement
-/// error is returned without a second settlement; the durable pending
-/// receipt stays visible to recovery.
+/// I18, I24). `sealed` is the controller's admitted golden. `settle`
+/// receives the verified pair while every hold is live, or the failure
+/// after every hold has been dropped, with the publication gate the
+/// controller decides on in its transaction. A settlement error is returned
+/// without a second settlement; the durable pending receipt stays visible
+/// to recovery.
+#[allow(clippy::too_many_arguments, reason = "one clone's staging steps")]
 pub(crate) async fn stage_linked_clone(
-    hold_golden: impl FnOnce() -> Result<HeldGolden, Q>,
+    sealed: impl FnOnce() -> Result<SealedGolden, Q>,
+    hold_golden: impl FnOnce(&SealedGolden) -> Result<HeldGolden, Q>,
     reserve: impl FnOnce() -> Result<ProductionWorkspace, Q>,
     ledger: &dyn CustodyCheckpoints,
     request: &CloneRequest<'_>,
+    image: &Artifact,
     helper: impl OverlayHelper,
-    authorize_vars: impl FnOnce(ArtifactSlot, ArtifactPin) -> Result<(), Q>,
-    settle: impl FnOnce(Result<[ArtifactEvidence; 2], FailureReason>) -> anyhow::Result<Status>,
+    authorize_vars: impl FnOnce(ArtifactSlot, ArtifactPin) -> Result<CopyAuthority, Q>,
+    settle: impl FnOnce(
+        Result<[ArtifactEvidence; 2], FailureReason>,
+        ClonePublication<'_>,
+    ) -> anyhow::Result<Status>,
 ) -> anyhow::Result<Status> {
     let mut settle = Some(settle);
+    let sealed = sealed();
+    let gate = |golden| ClonePublication {
+        golden,
+        effect_cutoff: request.effect_cutoff,
+        cancelled: request.cancelled,
+    };
     let staged = async {
         let slots = request.slots;
         if (slots.disk.role, slots.vars.role) != ("disk", "vars")
@@ -343,7 +363,8 @@ pub(crate) async fn stage_linked_clone(
             return Err(PATH);
         }
         request.check()?;
-        let golden = hold_golden()?;
+        let sealed = sealed.as_ref().map_err(|reason| *reason)?;
+        let golden = hold_golden(sealed)?;
         let workspace = reserve()?;
         if workspace.binding().generation != slots.disk.generation {
             return Err(PATH);
@@ -356,24 +377,29 @@ pub(crate) async fn stage_linked_clone(
             request.cancelled,
         )?;
         let inputs = [
-            (ArtifactRole::QemuImg, helper.image()),
+            (ArtifactRole::QemuImg, image.identity().ok_or(PATH)?),
             (ArtifactRole::Staging, prepared.identity()),
             (ArtifactRole::Golden, golden.identity()),
         ];
-        let settlement = helper.create(&prepared, &golden, request.size).await;
+        let plan = overlay_plan(&prepared, image, &golden, sealed, request.size)?;
+        request.check()?;
+        let settlement = helper.create(&prepared, plan).await;
         let outcome = prepared.accept(settlement, &inputs, request.cancelled);
         let (disk, _overlay) = verify_overlay(&prepared, &golden, ledger, outcome, request)?;
         let (vars, _vars) = copy_vars(&workspace, &golden, ledger, request, authorize_vars)?;
         request.check()?;
         golden.recheck()?;
         WorkspaceCustody::production(&workspace.root, &workspace.lease)?;
+        request.check()?;
         let settle = settle.take().ok_or(PATH)?;
-        Ok(settle(Ok([disk, vars])))
+        Ok(settle(Ok([disk, vars]), gate(Some(sealed))))
     }
     .await;
     match (staged, settle) {
         (Ok(published), _) => published,
-        (Err(_), Some(settle)) => settle(Err(FailureReason::CloneFailed)),
+        (Err(_), Some(settle)) => {
+            settle(Err(FailureReason::CloneFailed), gate(sealed.as_ref().ok()))
+        }
         (Err(_), None) => anyhow::bail!("clone settlement already attempted"),
     }
 }
