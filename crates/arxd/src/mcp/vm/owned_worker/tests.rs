@@ -478,4 +478,23 @@ fn production_test_admission_cannot_enqueue_a_worker() {
         })
         .unwrap();
     assert_eq!(intents, 0);
+
+    drop(gate);
+    // Native release is fixture-only, including when a stop is requested
+    // for an instance that has no admitted native worker.
+    let result = connection.inventory().dispatch(
+        request(
+            "vm_stop",
+            json!({"vm_id":"7358295852574b59a1146cab94dd5451","request_id":key(2)}),
+        ),
+        || false,
+    );
+    assert!(result.is_err());
+    assert!(supervisor.lock().unwrap().test_workers.tasks.is_empty());
+    let releases: i64 = db
+        .query_row("SELECT count(*) FROM vm_snapshot_release", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(releases, 0);
 }
