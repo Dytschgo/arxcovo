@@ -2,7 +2,6 @@
 
 use super::recipe::{QualifiedBoot, TEST_JOB_MEMORY};
 use super::*;
-use crate::store::vm::native;
 use crate::vm::qualification_record::Hash;
 use crate::vm::{ArtifactEvidence, ArtifactSlot, Id, PairSlots};
 
@@ -50,337 +49,6 @@ impl ProductionWorkspace {
         }
         Ok(pin)
     }
-
-    fn valid_slot(&self, slot: ArtifactSlot) -> Result<String, NativeRefusal> {
-        if slot.generation != self.binding.generation
-            || slot.key == [0; 16]
-            || !matches!(slot.role, "disk" | "vars" | "seed" | "verification_overlay")
-        {
-            return Err(NativeRefusal::PathCustodyUnverified);
-        }
-        Ok(format!("{}-{}", slot.role, hex::encode(slot.key)))
-    }
-
-    /// Creates one new slot relative to the held directory. The ledger
-    /// records the create intent before the create-new and the object's
-    /// identity before the returned writer can write. An occupied leaf, or
-    /// a created leaf whose identity was not recorded, stays quarantined.
-    pub(super) fn create_slot(
-        &self,
-        slot: ArtifactSlot,
-        ledger: &dyn CustodyCheckpoints,
-    ) -> Result<SlotWriter<'_>, NativeRefusal> {
-        let reason = NativeRefusal::PathCustodyUnverified;
-        let leaf = self.valid_slot(slot)?;
-        let custody = WorkspaceCustody::production(&self.root, &self.lease)?;
-        ledger.intend_slot(self.binding, slot)?;
-        let identified = open_relative(&self.root.leaf, &leaf, Node::File, true, true)
-            .ok()
-            .and_then(|file| {
-                let (identity, _) = file_identity(&file, false).ok()?;
-                (identity.volume == self.binding.workspace.volume
-                    && has_exact_leaf(&file, &leaf)
-                    && custody.verify().is_ok()
-                    && ledger.slot_identified(self.binding, slot, identity).is_ok())
-                .then_some((file, identity))
-            });
-        match identified {
-            Some((file, identity)) => Ok(SlotWriter {
-                workspace: self,
-                slot,
-                identity,
-                file,
-            }),
-            None => {
-                // Classify the intent only after any creation handle closed.
-                let _ = self.settle_intended(slot, ledger);
-                Err(reason)
-            }
-        }
-    }
-
-    /// Settles an unidentified slot intent from the held directory. Only an
-    /// exact `NotFound` proves absence. A present object is never adopted.
-    pub(crate) fn settle_intended(
-        &self,
-        slot: ArtifactSlot,
-        ledger: &dyn CustodyCheckpoints,
-    ) -> Result<(), NativeRefusal> {
-        let leaf = self.valid_slot(slot)?;
-        WorkspaceCustody::production(&self.root, &self.lease)?;
-        let present = observe_leaf(&self.root.leaf, &leaf, Node::File)?;
-        ledger.slot_intent_settled(self.binding, slot, present)
-    }
-
-    /// Precreates the empty target of a checked qemu-img write. Its
-    /// identity is durable before any helper can open it for writing.
-    pub(crate) fn precreate_helper_target(
-        &self,
-        slot: ArtifactSlot,
-        ledger: &dyn CustodyCheckpoints,
-    ) -> Result<HelperTarget, NativeRefusal> {
-        let reason = NativeRefusal::PathCustodyUnverified;
-        if !matches!(slot.role, "disk" | "verification_overlay") {
-            return Err(reason);
-        }
-        let writer = self.create_slot(slot, ledger)?;
-        writer.sync()?;
-        let pin = writer.into_pin(true)?;
-        if pin.leaf.metadata().map_err(|_| reason)?.len() != 0 {
-            return Err(reason);
-        }
-        Ok(HelperTarget { slot, pin })
-    }
-}
-
-/// `Ok(true)` for a present object and `Ok(false)` only for exact absence
-/// relative to the held parent.
-fn observe_leaf(parent: &File, name: &str, node: Node) -> Result<bool, NativeRefusal> {
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    match open_relative(parent, name, node, false, false) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Ok(true),
-        Err(_) => Err(NativeRefusal::PathCustodyUnverified),
-    }
-}
-
-/// Durable custody checkpoints over the VM ledger (ADR 0072). Each call
-/// commits one exact transition before it returns. An error stops the
-/// effect before its next filesystem mutation, so the last committed
-/// checkpoint keeps the charge and names the recovery route.
-pub(crate) trait CustodyCheckpoints {
-    fn intend_workspace(
-        &self,
-        generation: Id,
-        production: FileIdentity,
-    ) -> Result<(), NativeRefusal>;
-    /// Records the directory identity and the lease create intent.
-    fn workspace_directory(
-        &self,
-        generation: Id,
-        directory: FileIdentity,
-    ) -> Result<(), NativeRefusal>;
-    fn workspace_bound(&self, binding: WorkspaceBinding) -> Result<(), NativeRefusal>;
-    /// The exact durable scope every hold, slot and dispatch requires.
-    fn confirm_bound(&self, binding: WorkspaceBinding) -> Result<(), NativeRefusal>;
-    fn workspace_intent_settled(&self, generation: Id, present: bool) -> Result<(), NativeRefusal>;
-    /// The exact start pair names the durable slots of this bound scope.
-    fn confirm_start_pair(
-        &self,
-        binding: WorkspaceBinding,
-        pair: StartPair,
-    ) -> Result<(), NativeRefusal>;
-    fn intend_slot(
-        &self,
-        binding: WorkspaceBinding,
-        slot: ArtifactSlot,
-    ) -> Result<(), NativeRefusal>;
-    fn slot_identified(
-        &self,
-        binding: WorkspaceBinding,
-        slot: ArtifactSlot,
-        identity: FileIdentity,
-    ) -> Result<(), NativeRefusal>;
-    fn slot_verified(
-        &self,
-        binding: WorkspaceBinding,
-        slot: ArtifactSlot,
-        evidence: ArtifactEvidence,
-    ) -> Result<(), NativeRefusal>;
-    fn slot_intent_settled(
-        &self,
-        binding: WorkspaceBinding,
-        slot: ArtifactSlot,
-        present: bool,
-    ) -> Result<(), NativeRefusal>;
-}
-
-/// Ledger checkpoints for one reserved generation. The issuer supplies the
-/// origin protocol of the operation that owns it.
-pub(crate) struct LedgerCheckpoints<'a> {
-    pub store: &'a crate::store::vm::VmStore,
-    pub origin: native::Origin,
-}
-
-fn scope(binding: WorkspaceBinding) -> native::Scope {
-    native::Scope {
-        generation: binding.generation,
-        production: binding.production,
-        workspace: binding.workspace,
-        lease: binding.lease,
-    }
-}
-
-impl LedgerCheckpoints<'_> {
-    fn commit(
-        &self,
-        run: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<()>,
-    ) -> Result<(), NativeRefusal> {
-        self.store
-            .transact(|db| run(db))
-            .map_err(|_| NativeRefusal::PathCustodyUnverified)
-    }
-}
-
-impl CustodyCheckpoints for LedgerCheckpoints<'_> {
-    fn intend_workspace(
-        &self,
-        generation: Id,
-        production: FileIdentity,
-    ) -> Result<(), NativeRefusal> {
-        self.commit(|db| native::intend_workspace(db, generation, self.origin, production))
-    }
-
-    fn workspace_directory(
-        &self,
-        generation: Id,
-        directory: FileIdentity,
-    ) -> Result<(), NativeRefusal> {
-        self.commit(|db| native::identify_directory(db, generation, directory))
-    }
-
-    fn workspace_bound(&self, binding: WorkspaceBinding) -> Result<(), NativeRefusal> {
-        self.commit(|db| native::bind_workspace(db, scope(binding)))
-    }
-
-    fn confirm_bound(&self, binding: WorkspaceBinding) -> Result<(), NativeRefusal> {
-        self.commit(|db| {
-            anyhow::ensure!(native::bound(db, scope(binding))?, "unbound native scope");
-            Ok(())
-        })
-    }
-
-    fn workspace_intent_settled(&self, generation: Id, present: bool) -> Result<(), NativeRefusal> {
-        self.commit(|db| native::settle_workspace_intent(db, generation, present))
-    }
-
-    fn confirm_start_pair(
-        &self,
-        binding: WorkspaceBinding,
-        pair: StartPair,
-    ) -> Result<(), NativeRefusal> {
-        let slots = [pair.slots.disk, pair.slots.vars];
-        self.commit(|db| {
-            anyhow::ensure!(
-                native::pair_matches(db, scope(binding), slots, pair.evidence)?,
-                "start pair outside its durable scope"
-            );
-            Ok(())
-        })
-    }
-
-    fn intend_slot(
-        &self,
-        binding: WorkspaceBinding,
-        slot: ArtifactSlot,
-    ) -> Result<(), NativeRefusal> {
-        self.commit(|db| native::intend_slot(db, scope(binding), slot))
-    }
-
-    fn slot_identified(
-        &self,
-        binding: WorkspaceBinding,
-        slot: ArtifactSlot,
-        identity: FileIdentity,
-    ) -> Result<(), NativeRefusal> {
-        self.commit(|db| native::identify_slot(db, scope(binding), slot, identity))
-    }
-
-    fn slot_verified(
-        &self,
-        binding: WorkspaceBinding,
-        slot: ArtifactSlot,
-        evidence: ArtifactEvidence,
-    ) -> Result<(), NativeRefusal> {
-        self.commit(|db| native::verify_slot(db, scope(binding), slot, evidence))
-    }
-
-    fn slot_intent_settled(
-        &self,
-        binding: WorkspaceBinding,
-        slot: ArtifactSlot,
-        present: bool,
-    ) -> Result<(), NativeRefusal> {
-        self.commit(|db| native::settle_slot_intent(db, scope(binding), slot, present))
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum WriteFault {
-    /// Writes the first half of the payload, then fails.
-    Partial,
-    Sync,
-}
-
-#[cfg(test)]
-thread_local! {
-    pub(super) static WRITE_FAULT: std::cell::Cell<Option<WriteFault>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Write access to one slot whose identity the ledger already holds.
-pub(super) struct SlotWriter<'w> {
-    workspace: &'w ProductionWorkspace,
-    slot: ArtifactSlot,
-    identity: FileIdentity,
-    file: File,
-}
-
-impl SlotWriter<'_> {
-    pub(super) fn identity(&self) -> FileIdentity {
-        self.identity
-    }
-
-    pub(super) fn write_all(&mut self, bytes: &[u8]) -> Result<(), NativeRefusal> {
-        use std::io::Write;
-        let reason = NativeRefusal::PathCustodyUnverified;
-        #[cfg(test)]
-        if WRITE_FAULT.get() == Some(WriteFault::Partial) {
-            let _ = self.file.write_all(&bytes[..bytes.len() / 2]);
-            return Err(reason);
-        }
-        self.file.write_all(bytes).map_err(|_| reason)
-    }
-
-    pub(super) fn sync(&self) -> Result<(), NativeRefusal> {
-        #[cfg(test)]
-        if WRITE_FAULT.get() == Some(WriteFault::Sync) {
-            return Err(NativeRefusal::PathCustodyUnverified);
-        }
-        self.file
-            .sync_all()
-            .map_err(|_| NativeRefusal::PathCustodyUnverified)
-    }
-
-    /// Bridges to a held pin without releasing the exclusion against rename
-    /// or replacement.
-    pub(super) fn into_pin(self, mutable: bool) -> Result<PathPin, NativeRefusal> {
-        let pin = self.workspace.pin_slot(self.slot, self.identity, true)?;
-        drop(self.file);
-        if mutable {
-            Ok(pin)
-        } else {
-            self.workspace.pin_slot(self.slot, self.identity, false)
-        }
-    }
-}
-
-/// An empty, ledger-identified, writable helper target.
-pub(crate) struct HelperTarget {
-    slot: ArtifactSlot,
-    pin: PathPin,
-}
-
-impl HelperTarget {
-    pub(crate) fn slot(&self) -> ArtifactSlot {
-        self.slot
-    }
-
-    pub(crate) fn identity(&self) -> FileIdentity {
-        self.pin.identity
-    }
 }
 
 impl ForegroundQualification<'_> {
@@ -392,20 +60,6 @@ impl ForegroundQualification<'_> {
     ) -> Result<ProductionWorkspace, NativeRefusal> {
         ledger.confirm_bound(expected)?;
         hold_workspace_under(self.production_root(), self.held.token.account.0, expected)
-    }
-
-    /// Creates and binds a new generation workspace (ADR 0072).
-    pub(crate) fn reserve_workspace(
-        &self,
-        generation: Id,
-        ledger: &dyn CustodyCheckpoints,
-    ) -> Result<ProductionWorkspace, NativeRefusal> {
-        reserve_workspace_under(
-            self.production_root(),
-            self.held.token.account.0,
-            generation,
-            ledger,
-        )
     }
 
     pub(super) fn launch_live(&self, memory: usize) -> Result<Instant, NativeRefusal> {
@@ -527,73 +181,6 @@ fn hold_workspace_under(
         root,
         lease,
     })
-}
-
-/// Intent, create-new and identity for the generation directory, then for
-/// its lease, each committed before the next mutation. Bridging handles
-/// share write so the exclusive hold can open both objects without ever
-/// releasing the exclusion against rename or replacement.
-fn reserve_workspace_under(
-    production: &PathPin,
-    owner: PSID,
-    generation: Id,
-    ledger: &dyn CustodyCheckpoints,
-) -> Result<ProductionWorkspace, NativeRefusal> {
-    let reason = NativeRefusal::PathCustodyUnverified;
-    inventory::binding(production)?;
-    if generation == [0; 16]
-        || file_identity(&production.leaf, true).map_err(|_| reason)?.0 != production.identity
-    {
-        return Err(reason);
-    }
-    let name = hex::encode(generation);
-    let settle = |parent: &File, leaf: &str, node| {
-        if let Ok(present) = observe_leaf(parent, leaf, node) {
-            let _ = ledger.workspace_intent_settled(generation, present);
-        }
-    };
-    ledger.intend_workspace(generation, production.identity)?;
-    let directory = open_relative(&production.leaf, &name, Node::Directory, true, true)
-        .ok()
-        .and_then(|created| {
-            let (id, _) = file_identity(&created, true).ok()?;
-            let bridge =
-                open_relative(&production.leaf, &name, Node::Directory, true, false).ok()?;
-            (id.volume == production.identity.volume
-                && file_identity(&bridge, true).is_ok_and(|(held, _)| held == id)
-                && has_exact_leaf(&created, &name)
-                && sink::held_private(&created, owner)
-                && ledger.workspace_directory(generation, id).is_ok())
-            .then_some((bridge, id))
-        });
-    let Some((directory, workspace)) = directory else {
-        settle(&production.leaf, &name, Node::Directory);
-        return Err(reason);
-    };
-    let lease = open_relative(&directory, GENERATION_LEASE, Node::File, true, true)
-        .ok()
-        .and_then(|created| {
-            created.sync_all().ok()?;
-            let (lease, _) = file_identity(&created, false).ok()?;
-            let bridge =
-                open_relative(&directory, GENERATION_LEASE, Node::File, true, false).ok()?;
-            let binding = WorkspaceBinding {
-                generation,
-                production: production.identity,
-                workspace,
-                lease,
-            };
-            (lease.volume == workspace.volume
-                && file_identity(&bridge, false).is_ok_and(|(held, _)| held == lease)
-                && sink::held_private(&created, owner)
-                && ledger.workspace_bound(binding).is_ok())
-            .then_some((bridge, binding))
-        });
-    let Some((_lease_bridge, binding)) = lease else {
-        settle(&directory, GENERATION_LEASE, Node::File);
-        return Err(reason);
-    };
-    hold_workspace_under(production, owner, binding)
 }
 
 /// The requested pair and the durable evidence (identities, directory and
@@ -838,6 +425,9 @@ pub(crate) struct LaunchRequest<'a> {
     /// The requested pair with its durable evidence; a refusal is bound to it.
     pub pair: Option<StartPair>,
     pub installer: Option<InstallerStage>,
+    /// The ledger-identified empty target a Mutate plan writes, and nothing
+    /// for any other plan kind.
+    pub helper_target: Option<&'a HelperTarget<'a>>,
     pub memory: usize,
     pub cpu_rate: u32,
     pub prepare_by: Instant,
@@ -947,6 +537,7 @@ impl<'a> NativeLaunch<'a> {
             workspace,
             pair: start_pair,
             installer,
+            helper_target,
             memory,
             cpu_rate,
             prepare_by,
@@ -970,6 +561,7 @@ impl<'a> NativeLaunch<'a> {
             cpu_rate,
         )?;
         check_start_evidence(start_pair, bound_pair)?;
+        check_helper_target(kind, plan.inputs(), workspace, helper_target)?;
         match (kind, boot_inputs) {
             (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(inputs))
                 if memory == TEST_JOB_MEMORY && cpu_rate == JOB_CPU_RATE =>
@@ -1355,6 +947,16 @@ impl FinalizedPair {
             .map_err(|_| NativeRefusal::InstallerPhaseMismatch)
     }
 }
+
+mod custody;
+#[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
+pub(crate) use custody::LedgerCheckpoints;
+use custody::check_helper_target;
+#[cfg(test)]
+use custody::reserve_workspace_under;
+pub(crate) use custody::{CustodyCheckpoints, HelperTarget};
+#[cfg(test)]
+pub(super) use custody::{WRITE_FAULT, WriteFault};
 
 #[cfg(test)]
 pub(super) mod tests;
