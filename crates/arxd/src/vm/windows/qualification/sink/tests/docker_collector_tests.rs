@@ -8,7 +8,7 @@ use crate::vm::{public_egress::RouteObservation, qualification_record::digest};
 use arx_guest::docker_trial::{self as wire, Challenge, TrialRequest, TrialResponse};
 use records::{DockerDependencies, Hash, Observation, Record, Stage, StageResult, decode};
 use std::cell::{Cell, RefCell};
-use trial::witness::{self, Case, Counts, Listener, Receivers, RouteSample, Target};
+use trial::witness::{self, Case, Counts, Listener, Receivers, RouteSample, Target, Transport};
 
 const PACKAGES: Hash = [31; 32];
 
@@ -30,6 +30,7 @@ enum Fault {
     WrongReceiverBoot,
     WrongReceiverGeneration,
     MissingReceiver,
+    MissingReceiverTransport,
     MalformedReceiver,
     WrongReceiverTarget,
     MissingControls,
@@ -208,7 +209,13 @@ impl<'a> trial::Host for Host<'a> {
 
     fn receiver_targets(&mut self, ticket: trial::Ticket) -> Result<Vec<Target>, NativeRefusal> {
         assert_eq!(ticket.phase, trial::Phase::PublicFixture);
-        Ok(witness::fixture_targets())
+        let mut targets = witness::fixture_targets();
+        if self.fault == Fault::MissingReceiverTransport {
+            targets.retain(|target| {
+                target.case != Case::Private || target.transport != Transport::Udp
+            });
+        }
+        Ok(targets)
     }
 
     fn prelaunch(
@@ -487,7 +494,7 @@ impl trial::Capture for Capture<'_> {
         let denied = capture
             .observations
             .iter_mut()
-            .find(|counts| counts.target.case == Case::HostTcp)
+            .find(|counts| counts.target.case == Case::Host)
             .unwrap();
         match self.fault {
             Fault::WrongFixture => capture.nonce[0] ^= 1,
@@ -871,6 +878,7 @@ fn docker_collector_refuses_missing_foreign_and_malformed_witnesses() {
         Fault::WrongReceiverBoot,
         Fault::WrongReceiverGeneration,
         Fault::MissingReceiver,
+        Fault::MissingReceiverTransport,
         Fault::MalformedReceiver,
         Fault::WrongReceiverTarget,
         Fault::ForbiddenArrival,

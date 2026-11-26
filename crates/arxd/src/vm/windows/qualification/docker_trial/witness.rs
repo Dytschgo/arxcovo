@@ -42,12 +42,9 @@ pub(super) fn route(
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub(in crate::vm::windows::qualification) enum Case {
-    PublicTcp,
-    PublicUdp,
-    RecursiveDnsTcp,
-    RecursiveDnsUdp,
-    HostTcp,
-    HostUdp,
+    Public,
+    RecursiveDns,
+    Host,
     SlirpHostAlias,
     SlirpDnsAlias,
     Private,
@@ -64,20 +61,15 @@ pub(in crate::vm::windows::qualification) enum Case {
     GuestOverride,
     DnsRebinding,
     UdpPeerChange,
-    RouteDriftTcp,
-    RouteDriftUdp,
+    RouteDrift,
     LanInbound,
-    StockTestTcp,
-    StockTestUdp,
+    StockTest,
 }
 
-const REQUIRED: [Case; 27] = [
-    Case::PublicTcp,
-    Case::PublicUdp,
-    Case::RecursiveDnsTcp,
-    Case::RecursiveDnsUdp,
-    Case::HostTcp,
-    Case::HostUdp,
+const REQUIRED: [Case; 22] = [
+    Case::Public,
+    Case::RecursiveDns,
+    Case::Host,
     Case::SlirpHostAlias,
     Case::SlirpDnsAlias,
     Case::Private,
@@ -94,19 +86,30 @@ const REQUIRED: [Case; 27] = [
     Case::GuestOverride,
     Case::DnsRebinding,
     Case::UdpPeerChange,
-    Case::RouteDriftTcp,
-    Case::RouteDriftUdp,
+    Case::RouteDrift,
     Case::LanInbound,
-    Case::StockTestTcp,
-    Case::StockTestUdp,
+    Case::StockTest,
 ];
 
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub(in crate::vm::windows::qualification) enum Transport {
+    Tcp,
+    Udp,
+    Icmp,
+}
+
 impl Case {
+    fn transports(self) -> &'static [Transport] {
+        match self {
+            Self::Icmp => &[Transport::Icmp],
+            Self::LanInbound => &[Transport::Tcp],
+            Self::UdpPeerChange => &[Transport::Udp],
+            _ => &[Transport::Tcp, Transport::Udp],
+        }
+    }
+
     pub(in crate::vm::windows::qualification) fn expected_arrivals(self) -> u16 {
-        u16::from(matches!(
-            self,
-            Self::PublicTcp | Self::PublicUdp | Self::RecursiveDnsTcp | Self::RecursiveDnsUdp
-        ))
+        u16::from(matches!(self, Self::Public | Self::RecursiveDns))
     }
 }
 
@@ -114,6 +117,7 @@ impl Case {
 #[serde(deny_unknown_fields)]
 pub(in crate::vm::windows::qualification) struct Target {
     pub case: Case,
+    pub transport: Transport,
     pub identity: Hash,
 }
 
@@ -150,13 +154,18 @@ pub(super) fn receivers(
 ) -> Result<Hash, NativeRefusal> {
     if raw.len() > MAX_CAPTURE_BYTES
         || targets.len() > 128
-        || !REQUIRED
-            .iter()
-            .all(|case| targets.iter().any(|target| target.case == *case))
-        || targets
-            .iter()
-            .enumerate()
-            .any(|(index, target)| target.identity == [0; 32] || targets[..index].contains(target))
+        || !REQUIRED.iter().all(|case| {
+            case.transports().iter().all(|transport| {
+                targets
+                    .iter()
+                    .any(|target| target.case == *case && target.transport == *transport)
+            })
+        })
+        || targets.iter().enumerate().any(|(index, target)| {
+            target.identity == [0; 32]
+                || !target.case.transports().contains(&target.transport)
+                || targets[..index].contains(target)
+        })
     {
         return Err(NETWORK);
     }
@@ -192,9 +201,15 @@ pub(super) fn receivers(
 pub(in crate::vm::windows::qualification) fn fixture_targets() -> Vec<Target> {
     REQUIRED
         .iter()
+        .flat_map(|case| {
+            case.transports()
+                .iter()
+                .map(move |transport| (*case, *transport))
+        })
         .enumerate()
-        .map(|(index, case)| Target {
-            case: *case,
+        .map(|(index, (case, transport))| Target {
+            case,
+            transport,
             identity: [index as u8 + 1; 32],
         })
         .collect()
