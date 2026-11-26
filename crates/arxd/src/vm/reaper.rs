@@ -263,8 +263,7 @@ pub(super) fn release(
             let stopped =
                 runtime.graceful_stop(work, stop_by) != StopDisposition::ChargedQuarantine;
             stopped
-                || (!pending_release
-                    && (work.accounted || work.release_only)
+                || ((work.accounted || work.release_only)
                     && matches!(work.kind, CleanupKind::Expiry { .. })
                     && now() < finish_by
                     && runtime.force_reap(work, finish_by) != StopDisposition::ChargedQuarantine)

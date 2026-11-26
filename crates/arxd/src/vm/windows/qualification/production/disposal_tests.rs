@@ -1275,6 +1275,7 @@ fn orphan_restart_releases_without_selection_and_retains_the_exact_pair() {
         Err(temporarily_unavailable)
     );
     assert!(!selection.effects_revoked());
+    fx.clock.advance(0, 0);
     assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
     assert_eq!(
         fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition='dirty'"),
@@ -1284,6 +1285,7 @@ fn orphan_restart_releases_without_selection_and_retains_the_exact_pair() {
         fx.count("SELECT count(*) FROM vm_instances WHERE state=3"),
         1
     );
+    fx.clock.advance(0, 0);
     assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
     assert_eq!(
         fx.count("SELECT count(*) FROM vm_instances WHERE state=1"),
@@ -1405,6 +1407,7 @@ fn orphan_restart_refuses_live_writer_wrong_slot_lease_boot_epoch_store_and_prot
             can_fence: fault != "reacquire",
             retries: Cell::new(0),
         };
+        fx.clock.advance(0, 0);
         assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
         assert_eq!(
             fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition IS NULL"),
@@ -1442,6 +1445,7 @@ fn orphan_restart_stale_owner_ack_cannot_skip_durable_release_or_backoff() {
         can_fence: true,
         retries: Cell::new(0),
     };
+    fx.clock.advance(0, 0);
     assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
     assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
     assert_eq!(runtime.retries.get(), 1);
@@ -1460,35 +1464,58 @@ fn orphan_restart_stale_owner_ack_cannot_skip_durable_release_or_backoff() {
 
 #[test]
 fn orphan_checkpointed_build_requires_both_worker_quiescence_and_writer_origin() {
-    for (proved, quiesced) in [(false, true), (true, false), (true, true)] {
+    for fault in ["missing origin", "owned", "wrong boot", "released"] {
         let mut fx = SweepFixture::new_with_store(true);
         let (_, slots, _) = fx.stage_build(64);
-        if !proved {
-            fx.store()
+        let generation = slots.verification.disk.generation;
+        match fault {
+            "missing origin" => fx
+                .store()
                 .transact(|db| {
                     db.execute(
                         "DELETE FROM vm_native_writer WHERE generation=?1",
-                        [slots.verification.disk.generation],
+                        [generation],
                     )?;
                     Ok(())
                 })
-                .unwrap();
+                .unwrap(),
+            "wrong boot" => {
+                let mut wrong_boot = boot::marker().unwrap();
+                wrong_boot[0] ^= 0x80;
+                let origin = super::super::recovery::StorePins::open(&fx.production)
+                    .unwrap()
+                    .origin(fx.store(), wrong_boot)
+                    .unwrap();
+                fx.store()
+                    .transact(|db| {
+                        let GenerationState::Bound { scope, .. } =
+                            disposal::generation_state(db, generation)?
+                        else {
+                            unreachable!();
+                        };
+                        native::recovery::record_job(db, scope, generation, origin)
+                    })
+                    .unwrap();
+            }
+            _ => {}
         }
         fx.reopen();
         let guards = GenerationGuards::default();
         let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
         let runtime = RestartReaper {
-            owned: !quiesced,
+            owned: fault == "owned",
             can_fence: true,
             retries: Cell::new(0),
         };
         // The still-owned fixture reports a successful stop, but hasn't
         // joined any owned build writer. It must not return Offline.
-        let claimed = proved && quiesced;
+        let claimed = fault == "released";
+        fx.clock.advance(0, 0);
         assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
         assert_eq!(
             fx.count("SELECT count(*) FROM vm_build_intents"),
-            i64::from(!claimed)
+            i64::from(!claimed),
+            "{fault}"
         );
         assert_eq!(exists(&fx.slot_file(slots.pair.disk)), !claimed);
         assert_eq!(exists(&fx.slot_file(slots.verification.disk)), !claimed);
@@ -1509,6 +1536,7 @@ fn orphan_expiry_commits_release_on_a_distinct_turn_before_disposal() {
         can_fence: true,
         retries: Cell::new(0),
     };
+    fx.clock.advance(0, 0);
     assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
     assert_eq!(
         fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition='dirty'"),
@@ -1521,6 +1549,7 @@ fn orphan_expiry_commits_release_on_a_distinct_turn_before_disposal() {
         CLAIM as i64
     );
 
+    fx.clock.advance(0, 0);
     assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
     assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 0);
     assert!(!exists(&fx.gen_dir(pair.disk.generation)));
@@ -1583,6 +1612,7 @@ fn orphan_expiry_resume_refuses_superseded_scope_before_deleting() {
                 can_fence: true,
                 retries: Cell::new(0),
             };
+            fx.clock.advance(0, 0);
             assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
             assert_eq!(
                 fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition='dirty'"),
@@ -1592,6 +1622,7 @@ fn orphan_expiry_resume_refuses_superseded_scope_before_deleting() {
             // set for both adapters before reopening the process-local state.
             let ledger = FaultDisposal::new(fx.store(), Some(Fault::After(checkpoint, 1)));
             let fault = fx.disposal(&ledger, &native_guards);
+            fx.clock.advance(0, 0);
             assert!(fx.ctl().sweep_with(&OfflineReaper, &fault).unwrap());
             assert_eq!(ledger.counts.borrow().get(checkpoint), Some(&1));
         }
@@ -1610,6 +1641,7 @@ fn orphan_expiry_resume_refuses_superseded_scope_before_deleting() {
             vm,
             attempted: Cell::new(false),
         };
+        fx.clock.advance(0, 0);
         assert!(fx.ctl().sweep_with(&stale, &custody).unwrap());
         assert!(stale.attempted.get());
         assert!(exists(&dir));
@@ -1619,8 +1651,120 @@ fn orphan_expiry_resume_refuses_superseded_scope_before_deleting() {
             CLAIM as i64
         );
 
+        fx.clock.advance(0, 0);
         assert!(fx.ctl().sweep_with(&OfflineReaper, &custody).unwrap());
         assert!(!exists(&dir), "fresh scope must converge");
         assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 0);
     }
+}
+
+struct HungExpiry<'a> {
+    fixture: &'a SweepFixture,
+    target: native::release::Target,
+    pair: PairSlots,
+    identities: [FileIdentity; 2],
+    owned: RefCell<Option<(ProductionWorkspace, File)>>,
+    graceful_attempts: Cell<usize>,
+    forced_attempts: Cell<usize>,
+}
+
+impl ReaperRuntime for HungExpiry<'_> {
+    fn quiesce(&self, _: &CleanupWork, _: Instant) -> Quiesced {
+        if self.owned.borrow().is_some() {
+            Quiesced::OwnedTestJob
+        } else {
+            Quiesced::Offline
+        }
+    }
+
+    fn graceful_stop(&self, work: &CleanupWork, _: Instant) -> StopDisposition {
+        assert!(work.release_only);
+        assert!(self.owned.borrow().is_some());
+        self.graceful_attempts.set(self.graceful_attempts.get() + 1);
+        StopDisposition::ChargedQuarantine
+    }
+
+    fn force_reap(&self, work: &CleanupWork, deadline: Instant) -> StopDisposition {
+        assert!(matches!(work.kind, CleanupKind::Expiry { vm, .. } if vm == self.target.vm));
+        assert!(work.release_only);
+        self.forced_attempts.set(self.forced_attempts.get() + 1);
+        let (workspace, writer) = self.owned.borrow_mut().take().expect("current owner");
+        // Fixture stand-in for confirmed Job exit and worker join. The same
+        // workspace lease stays held through the actual release transaction.
+        drop(writer);
+        let proof = super::super::release_tests::proof(
+            &workspace,
+            self.pair,
+            self.identities,
+            StopDisposition::DirtyRelease,
+        );
+        proof
+            .observe_test_release(self.target, deadline, &|| false)
+            .unwrap()
+            .commit(self.fixture.store(), None, || self.fixture.clock.now())
+            .unwrap();
+        StopDisposition::DirtyRelease
+    }
+}
+
+#[test]
+fn orphan_expiry_force_reaps_owned_hung_guest_before_a_later_disposal_turn() {
+    let fx = SweepFixture::new_with_store(true);
+    let (vm, pair, evidence) = fx.active_clone(67);
+    let epoch = arm_restart(&fx, vm, pair, Some(boot::marker().unwrap()));
+    let generation = pair.disk.generation;
+    let scope = fx
+        .store()
+        .transact(|db| {
+            let GenerationState::Bound { scope, .. } = disposal::generation_state(db, generation)?
+            else {
+                unreachable!();
+            };
+            Ok(scope)
+        })
+        .unwrap();
+    let workspace =
+        hold_workspace_under(&fx.production, fx.owner_sid(), binding_from_scope(scope)).unwrap();
+    let writer = OpenOptions::new()
+        .write(true)
+        .open(fx.slot_file(pair.disk))
+        .unwrap();
+    let runtime = HungExpiry {
+        fixture: &fx,
+        target: native::release::Target {
+            vm,
+            generation,
+            epoch,
+        },
+        pair,
+        identities: evidence.map(|file| file.identity),
+        owned: RefCell::new(Some((workspace, writer))),
+        graceful_attempts: Cell::new(0),
+        forced_attempts: Cell::new(0),
+    };
+    let guards = GenerationGuards::default();
+    let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+
+    fx.clock.advance(2_000, 0);
+    assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+    assert_eq!(runtime.graceful_attempts.get(), 1);
+    assert_eq!(runtime.forced_attempts.get(), 1);
+    assert!(runtime.owned.borrow().is_none());
+    assert_eq!(
+        fx.count("SELECT count(*) FROM vm_snapshot_release WHERE disposition='dirty'"),
+        1
+    );
+    assert_eq!(
+        fx.count("SELECT sum(persistent) FROM vm_disk_claims"),
+        CLAIM as i64
+    );
+    assert!(exists(&fx.slot_file(pair.disk)));
+    assert!(exists(&fx.slot_file(pair.vars)));
+    assert!(exists(&fx.lease_file(generation)));
+
+    fx.clock.advance(0, 0);
+    assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
+    assert_eq!(runtime.forced_attempts.get(), 1);
+    assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 0);
+    assert!(!exists(&fx.gen_dir(generation)));
 }
