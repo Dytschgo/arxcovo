@@ -251,6 +251,8 @@ test('Rust retains every native, Python and package validation with exact comman
         run: python -I -B -m unittest discover -s tools/acceptance/m2 -v`,
     `name: Pin Windows cluster quarantine scope
         run: python -I -m unittest discover -s tools/ci -p 'test_windows_cluster_quarantine.py'`,
+    `name: Pin hosted guest PowerShell quarantine scope
+        run: python -I -B -m unittest discover -s tools/ci -p 'test_guest_ps_quarantine.py'`,
     'run: cargo fmt --all --check',
     `name: Verify pinned SQLite binding build
         shell: pwsh
