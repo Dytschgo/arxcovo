@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { isApiError, type ConsoleStatus, type Host, type Vm } from '../../api/types';
+import { isApiError, type ConsoleStatus, type Vm } from '../../api/types';
 import { useApi, useSession } from '../context';
 import { consoleGate, type HostState } from '../derive';
 import { formatDate } from '../format';
