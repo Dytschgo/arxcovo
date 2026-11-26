@@ -12,6 +12,9 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
 
+#[path = "custody_tests.rs"]
+pub(in crate::vm::windows::qualification) mod custody;
+
 fn identity(id: u8) -> FileIdentity {
     FileIdentity {
         volume: 1,

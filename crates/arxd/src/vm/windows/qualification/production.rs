@@ -53,10 +53,13 @@ impl ProductionWorkspace {
 }
 
 impl ForegroundQualification<'_> {
+    /// Requires the exact durable scope before taking the lease.
     pub(crate) fn hold_workspace(
         &self,
         expected: WorkspaceBinding,
+        ledger: &dyn CustodyCheckpoints,
     ) -> Result<ProductionWorkspace, NativeRefusal> {
+        ledger.confirm_bound(expected)?;
         hold_workspace_under(self.production_root(), self.held.token.account.0, expected)
     }
 
@@ -455,6 +458,9 @@ pub(crate) struct LaunchRequest<'a> {
     /// The requested pair with its durable evidence; a refusal is bound to it.
     pub pair: Option<StartPair>,
     pub installer: Option<InstallerStage>,
+    /// The ledger-identified empty target a Mutate plan writes, and nothing
+    /// for any other plan kind.
+    pub helper_target: Option<&'a HelperTarget<'a>>,
     pub memory: usize,
     pub cpu_rate: u32,
     pub prepare_by: Instant,
@@ -564,6 +570,7 @@ impl<'a> NativeLaunch<'a> {
             workspace,
             pair: start_pair,
             installer,
+            helper_target,
             memory,
             cpu_rate,
             prepare_by,
@@ -587,6 +594,7 @@ impl<'a> NativeLaunch<'a> {
             cpu_rate,
         )?;
         check_start_evidence(start_pair, bound_pair)?;
+        check_helper_target(kind, plan.inputs(), workspace, helper_target)?;
         match (kind, boot_inputs) {
             (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(inputs))
                 if memory == TEST_JOB_MEMORY && cpu_rate == JOB_CPU_RATE =>
@@ -1064,6 +1072,16 @@ impl FinalizedPair {
             .map_err(|_| NativeRefusal::InstallerPhaseMismatch)
     }
 }
+
+mod custody;
+#[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
+pub(crate) use custody::LedgerCheckpoints;
+use custody::check_helper_target;
+#[cfg(test)]
+use custody::reserve_workspace_under;
+pub(crate) use custody::{CustodyCheckpoints, HelperTarget};
+#[cfg(test)]
+pub(super) use custody::{WRITE_FAULT, WriteFault};
 
 #[cfg(test)]
 pub(super) mod tests;
