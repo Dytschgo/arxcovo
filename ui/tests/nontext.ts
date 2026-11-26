@@ -144,6 +144,18 @@ function partsInPage(C: Compositing, min: number): NonTextFailure[] {
   }
 
   for (const track of document.body.querySelectorAll('[role=meter]')) {
+    // A bar meter's fill is its first child, painted with background-color.
+    // An SVG meter (a ring) marks its parts: the fill's stroke is measured
+    // against the track's stroke, both over the meter's own surface.
+    const svgFill = track.querySelector<SVGElement>('[data-meter-fill]');
+    const svgTrack = track.querySelector<SVGElement>('[data-meter-track]');
+    if (svgFill && svgTrack) {
+      if (!painted(track)) continue;
+      const ink = C.composite(C.parse(getComputedStyle(svgFill).stroke), chain(track)).ink;
+      const under = C.composite(C.parse(getComputedStyle(svgTrack).stroke), chain(track)).ink;
+      report(track, 'meter fill on its track', 'rest', ink, under, C.ratio(ink, under));
+      continue;
+    }
     const fill = track.firstElementChild;
     if (!fill || !painted(track) || fill.getBoundingClientRect().width <= 1) continue;
     const ink = C.composite(C.parse(getComputedStyle(fill).backgroundColor), chain(track)).ink;

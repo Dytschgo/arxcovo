@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import { auditText, freezeMotion } from './contrast';
 import { nonTextFailures } from './nontext';
+import { viewPartFailures } from './nontext-views';
 
 // Runs against `vite dev`, so the deterministic stand-in adapter is active.
 // Screenshots land in test-results/screenshots (gitignored) for the PR.
@@ -236,6 +237,7 @@ for (const motion of ['no-preference', 'reduce'] as const) {
       expect.soft(contrast, where).toEqual([]);
       expect.soft(opacityGroups, `${where}: text inside an opacity group`).toEqual([]);
       expect.soft(await nonTextFailures(page), `${where}: non-text contrast (3:1)`).toEqual([]);
+      expect.soft(await viewPartFailures(page), `${where}: view parts and link underlines (3:1)`).toEqual([]);
     };
     await page.goto('/');
     if (motion === 'no-preference') await freezeMotion(page);

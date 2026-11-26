@@ -16,8 +16,8 @@ import { ActivityList } from './ActivityList';
 function Ring({ label, pct }: { label: string; pct: number | null }) {
   const art = (
     <svg className="ring-svg" viewBox="0 0 100 100" aria-hidden="true" focusable="false">
-      <circle className="ring-track" cx="50" cy="50" r="42" pathLength={100} />
-      {pct === null ? null : <circle className="ring-fill" cx="50" cy="50" r="42" pathLength={100} strokeDasharray={`${pct} 100`} />}
+      <circle className="ring-track" data-meter-track="" cx="50" cy="50" r="42" pathLength={100} />
+      {pct === null ? null : <circle className="ring-fill" data-meter-fill="" cx="50" cy="50" r="42" pathLength={100} strokeDasharray={`${pct} 100`} />}
     </svg>
   );
   return pct === null

@@ -81,7 +81,7 @@ function Viewer({ vm, title }: { vm: Vm; title: ReactNode }) {
         {title}
         <ConsoleSessionStatus status={shown} />
         <span className="spacer" />
-        <button type="button" className="button button-quiet" onClick={() => setPaused(p => !p)} aria-pressed={paused}>
+        <button type="button" className="button button-quiet" onClick={() => setPaused(p => !p)}>
           <Icon name={paused ? 'play' : 'pause'} />{paused ? 'Resume' : 'Pause'}
         </button>
         {!paused && (status === 'closed' || status === 'error')

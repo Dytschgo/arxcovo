@@ -124,7 +124,8 @@ input, select { font-size: max(16px, 1rem); }
 button, a { touch-action: manipulation; }
 button { user-select: none; -webkit-user-select: none; }
 code, .mono { font-family: var(--mono); font-size: 0.92em; }
-a { color: var(--ink); text-decoration-color: var(--line3); text-underline-offset: 0.2em; }
+/* A link's underline is its cue: --edge keeps it at 3:1 or better on every surface (SC 1.4.11). */
+a { color: var(--ink); text-decoration-color: var(--edge); text-underline-offset: 0.2em; }
 
 :focus-visible {
   outline: 1px solid var(--ink);
@@ -423,17 +424,24 @@ main:focus-visible { outline-offset: -4px; }
   position: relative;
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
   flex: 0 1 250px;
+  color: var(--ink3);
+}
+/* The field itself draws the 3:1 edge and the white focus border (SC 1.4.11);
+   the search icon and the "/" hint sit on top of it. */
+.search > svg.i, .filter-name > svg.i { position: absolute; inset-inline-start: 12px; pointer-events: none; }
+.search > kbd { position: absolute; inset-inline-end: 8px; pointer-events: none; }
+.search input, .filter-name input {
+  inline-size: 100%;
   min-block-size: 34px;
-  padding: 0 8px 0 12px;
+  padding: 0 36px 0 34px;
   border: 1px solid var(--edge);
   border-radius: var(--r-ctl);
-  color: var(--ink3);
-  transition: border-color var(--dur-fast);
+  background: none;
+  color: var(--ink);
+  outline: 0;
 }
-.search:focus-within { border-color: var(--ink); }
-.search input { flex: 1; inline-size: 100%; border: 0; background: none; outline: 0; color: var(--ink); }
+.search input:focus-visible, .filter-name input:focus-visible { border-color: var(--ink); }
 .search input::-webkit-search-cancel-button { display: none; }
 kbd {
   display: inline-grid;
@@ -468,13 +476,16 @@ kbd {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  padding: 7px 8px;
+  padding: 6px 7px;
+  border: 1px solid transparent;
   border-radius: 8px;
   color: var(--ink2);
   font-size: var(--fs-ui);
   text-decoration: none;
 }
-.jump a[aria-selected="true"], .jump a:hover { background: #1a1a1a; color: var(--ink); outline: 1px solid var(--ink); outline-offset: -1px; }
+/* The active option is marked by a white border (SC 1.4.11: 3:1 against the
+   list and its own fill), not by the fill alone. */
+.jump a[aria-selected="true"], .jump a:hover { background: #1a1a1a; border-color: var(--ink); color: var(--ink); }
 .jump-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .jump small { margin-inline-start: auto; color: var(--ink3); font: var(--fs-xs) var(--mono); white-space: nowrap; }
 .jump p { margin: 6px 8px; color: var(--ink3); font-size: var(--fs-sm); }
@@ -775,9 +786,8 @@ a.hn:hover { text-decoration: underline; }
 .state-chips .fchip { min-block-size: 26px; padding: 0 9px; }
 .table-tile > .summary { padding: 0 var(--sp-5) var(--sp-3); }
 .table-tile > .state { margin: 0 var(--sp-5) var(--sp-5); }
-.filter-name { display: flex; align-items: center; gap: var(--sp-2); flex: 0 1 240px; margin-inline-start: auto; min-block-size: 36px; padding: 0 12px; border: 1px solid var(--edge); border-radius: var(--r-ctl); color: var(--ink3); }
-.filter-name:focus-within { border-color: var(--ink); }
-.filter-name input { flex: 1; inline-size: 100%; border: 0; background: none; outline: 0; color: var(--ink); }
+.filter-name { position: relative; display: flex; align-items: center; flex: 0 1 240px; margin-inline-start: auto; color: var(--ink3); }
+.filter-name input { min-block-size: 36px; padding-inline-end: 12px; }
 .table-scroll { overflow-x: auto; border-block-start: 1px solid var(--line); }
 .table { inline-size: 100%; border-collapse: collapse; font-size: var(--fs-ui); }
 .table th, .table td { padding: 11px 9px; border-block-end: 1px solid var(--line); text-align: start; vertical-align: middle; }

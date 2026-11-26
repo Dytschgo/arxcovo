@@ -242,7 +242,7 @@ describe('control edges (WCAG 2.2 SC 1.4.11)', () => {
       expect(start, selector).toBeGreaterThan(-1);
       return css.slice(start, css.indexOf('}', start));
     };
-    for (const selector of ['.search', '.seg', '.fchip', '.filter-name', '.terminal-input input', 'a.hp[aria-current]']) {
+    for (const selector of ['.search input, .filter-name input', '.seg', '.fchip', '.terminal-input input', 'a.hp[aria-current]']) {
       expect(block(selector), selector).toMatch(/var\(--edge\)/);
     }
     expect(block('.switch-track')).toMatch(/box-shadow:\s*inset 0 0 0 1px var\(--edge\)/);
