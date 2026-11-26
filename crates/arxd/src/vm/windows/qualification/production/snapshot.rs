@@ -298,6 +298,19 @@ pub(crate) struct InspectTarget<'a> {
     pub file: &'a File,
 }
 
+impl InspectTarget<'_> {
+    fn verify_identity(&self) -> Result<(), copy::Refusal> {
+        if file_identity(self.file, false)
+            .map_err(|_| copy::Refusal::Io)?
+            .0
+            != self.identity
+        {
+            return Err(copy::Refusal::Identity);
+        }
+        Ok(())
+    }
+}
+
 /// The sealed read-only inspection of one held disk. Fixtures stand in
 /// for the helper child.
 pub(crate) trait SnapshotInspector {
@@ -355,13 +368,7 @@ where
         budget.check()?;
         let workspace = target.workspace;
         let binding = workspace.binding();
-        if file_identity(target.file, false)
-            .map_err(|_| copy::Refusal::Io)?
-            .0
-            != target.identity
-        {
-            return Err(copy::Refusal::Identity);
-        }
+        target.verify_identity()?;
         let lease = OfflineLease::for_inspection(workspace, target.slot, target.identity);
         let plan = offline_snapshot_info(&lease, self.image, info)
             .map_err(|_| copy::Refusal::Inspection)?;
@@ -413,23 +420,45 @@ where
                 }
             }
         });
-        budget.check()?;
-        if self.cancel.is_cancelled()
-            || tokio::time::Instant::now() >= deadline
-            || settlement.disposition != StopDisposition::CleanRelease
-            || !settlement.released.is_some_and(|proof| {
-                proof.matches_helper(binding, PlanKind::InspectWritable, &inputs)
-            })
-        {
-            return Err(copy::Refusal::Inspection);
-        }
-        let bytes = settlement.output.map_err(|_| copy::Refusal::Inspection)?;
-        output
-            .get_mut(..bytes.len())
-            .ok_or(copy::Refusal::Inspection)?
-            .copy_from_slice(&bytes);
-        Ok(bytes.len())
+        accept_inspection(
+            settlement,
+            binding,
+            &inputs,
+            deadline,
+            self.cancel,
+            budget,
+            output,
+        )
     }
+}
+
+/// Exposes the helper's output only after a fresh budget sample and an
+/// exact, clean release before the inspection cutoff.
+fn accept_inspection(
+    settlement: HelperSettlement<'_>,
+    binding: WorkspaceBinding,
+    inputs: &[(ArtifactRole, FileIdentity)],
+    deadline: tokio::time::Instant,
+    cancel: &Shutdown,
+    budget: &CopyBudget<'_>,
+    output: &mut [u8],
+) -> Result<usize, copy::Refusal> {
+    budget.check()?;
+    if cancel.is_cancelled()
+        || tokio::time::Instant::now() >= deadline
+        || settlement.disposition != StopDisposition::CleanRelease
+        || !settlement
+            .released
+            .is_some_and(|proof| proof.matches_helper(binding, PlanKind::InspectWritable, inputs))
+    {
+        return Err(copy::Refusal::Inspection);
+    }
+    let bytes = settlement.output.map_err(|_| copy::Refusal::Inspection)?;
+    output
+        .get_mut(..bytes.len())
+        .ok_or(copy::Refusal::Inspection)?
+        .copy_from_slice(&bytes);
+    Ok(bytes.len())
 }
 
 /// One admitted copy's scope.

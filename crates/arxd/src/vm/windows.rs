@@ -3470,6 +3470,19 @@ impl From<ChannelError> for InstallerFailureReason {
     }
 }
 
+fn helper_release_deadline(
+    kind: PlanKind,
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let release_by = now + Duration::from_secs(5);
+    if kind == PlanKind::InspectWritable {
+        release_by.min(deadline)
+    } else {
+        release_by
+    }
+}
+
 impl CheckedLaunchCore<'_> {
     fn check_running(
         &self,
@@ -3566,12 +3579,7 @@ impl CheckedLaunchCore<'_> {
             return (result, (StopDisposition::ChargedQuarantine, None));
         }
         let successful = result.is_ok();
-        let release_by = tokio::time::Instant::now() + Duration::from_secs(5);
-        let release_by = if self.kind == PlanKind::InspectWritable {
-            release_by.min(deadline)
-        } else {
-            release_by
-        };
+        let release_by = helper_release_deadline(self.kind, tokio::time::Instant::now(), deadline);
         accept_after_release(
             result,
             self.release_evidence_held(successful, successful, release_by, verify_release),

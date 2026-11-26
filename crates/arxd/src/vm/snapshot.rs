@@ -416,6 +416,21 @@ pub struct CopyBudget<'a> {
     now: &'a dyn Fn() -> Instant,
 }
 
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+impl<'a> CopyBudget<'a> {
+    pub(super) fn fixture(
+        deadline: Instant,
+        cancelled: &'a dyn Fn() -> bool,
+        now: &'a dyn Fn() -> Instant,
+    ) -> Self {
+        Self {
+            deadline,
+            cancelled,
+            now,
+        }
+    }
+}
+
 impl CopyBudget<'_> {
     pub fn deadline(&self) -> Instant {
         self.deadline

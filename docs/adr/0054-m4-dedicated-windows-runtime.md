@@ -2016,3 +2016,5 @@ writer. The release turn leaves points and retired pairs charged. Later
 turns dispose them before the active pair and settle expiry from the common
 disposal proof. Static VMs and protected backups stay outside TEST copy
 and disposal authority. Native execution is **unverified on real hardware**.
+
+Read-only inspection skips the `StorePins` store and boot-marker check because it owns no writer epoch.

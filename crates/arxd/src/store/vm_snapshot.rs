@@ -497,6 +497,7 @@ fn cleanup_authority(db: &Connection, vm: Id, generation: Id) -> Result<Option<C
            AND (w.phase='delete' OR NOT EXISTS(SELECT 1 FROM vm_restore_points WHERE generation=g.id))
            AND NOT EXISTS(SELECT 1 FROM vm_instances v
                JOIN vm_generations a ON a.vm_id=v.id
+               -- Legacy fixture VMs have no native row. The inner join keeps the active native pair last.
                JOIN vm_native_generations n ON n.generation=a.id
                LEFT JOIN vm_snapshot_release r ON r.generation=a.id
                WHERE v.id=w.vm AND v.state=4 AND v.cleanup_route='lease'

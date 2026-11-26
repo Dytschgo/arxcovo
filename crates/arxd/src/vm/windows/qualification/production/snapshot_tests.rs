@@ -2028,3 +2028,212 @@ fn lease_extension_preserves_points_and_refuses_after_expiry_is_claimed() {
         Err(crate::vm::Refusal::Expired)
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn checked_inspection_accepts_only_bounded_output_with_an_exact_clean_release() {
+    use super::super::tests::held_test_workspace;
+
+    assert_admission_closed();
+    let temp = tempfile::tempdir().unwrap();
+    let (_production, workspace, _, _) = held_test_workspace(temp.path(), [0x71; 16]);
+    let binding = workspace.binding();
+    let path = workspace.root.path.join("inspection-disk").unwrap();
+    std::fs::write(path.as_str(), b"held disk").unwrap();
+    let pin = PathPin::open(&path, false, false).unwrap();
+    let inputs = [
+        (
+            ArtifactRole::QemuImg,
+            FileIdentity {
+                file: [0x72; 16],
+                ..pin.identity
+            },
+        ),
+        (ArtifactRole::SnapshotStagingDisk, pin.identity),
+    ];
+    let custody = WorkspaceCustody::production(&workspace.root, &workspace.lease).unwrap();
+    let pins: std::sync::Arc<[PathPin]> = vec![pin].into();
+    let proof = |kind, inputs: &[(ArtifactRole, FileIdentity)]| {
+        let guards = if kind == PlanKind::Mutate {
+            vec![pins[0].reopen_without_writer().unwrap()]
+        } else {
+            Vec::new()
+        };
+        ReleasedGeneration::checked(
+            binding,
+            ReleaseTargets::Helper {
+                kind,
+                inputs: inputs.to_vec(),
+            },
+            custody,
+            (pins.clone(), guards),
+        )
+        .expect("fixture release")
+    };
+    let exact = || Some(proof(PlanKind::InspectWritable, &inputs));
+    let clean = |released| HelperSettlement {
+        output: Ok(b"info".to_vec()),
+        disposition: StopDisposition::CleanRelease,
+        released,
+    };
+
+    let tick = Duration::from_millis(1);
+    let deadline = tokio::time::Instant::now() + tick;
+    let budget_now = Instant::now();
+    let now = || budget_now;
+    let cancelled = Cell::new(false);
+    let budget_cancelled = || cancelled.get();
+    let budget_end = budget_now + Duration::from_secs(1);
+    let budget = CopyBudget::fixture(budget_end, &budget_cancelled, &now);
+    let cancel = Shutdown::default();
+    let mut wrong_workspace = binding;
+    wrong_workspace.generation = [0x73; 16];
+    let mut wrong_inputs = inputs;
+    wrong_inputs.swap(0, 1);
+    let accept = |settlement, expected_workspace, budget: &CopyBudget<'_>| {
+        let mut output = [0xff; 5];
+        let result = accept_inspection(
+            settlement,
+            expected_workspace,
+            &inputs,
+            deadline,
+            &cancel,
+            budget,
+            &mut output,
+        );
+        (result, output)
+    };
+    let refused = (Err(copy::Refusal::Inspection), [0xff; 5]);
+
+    assert_eq!(
+        accept(clean(exact()), binding, &budget),
+        (Ok(4), *b"info\xff")
+    );
+    for disposition in [
+        StopDisposition::DirtyRelease,
+        StopDisposition::ChargedQuarantine,
+    ] {
+        let settlement = HelperSettlement {
+            disposition,
+            ..clean(exact())
+        };
+        assert_eq!(
+            accept(settlement, binding, &budget),
+            refused,
+            "{disposition:?}"
+        );
+    }
+    for (case, settlement, expected_workspace) in [
+        ("missing proof", clean(None), binding),
+        (
+            "wrong kind",
+            clean(Some(proof(PlanKind::Mutate, &inputs))),
+            binding,
+        ),
+        (
+            "wrong inputs",
+            clean(Some(proof(PlanKind::InspectWritable, &wrong_inputs))),
+            binding,
+        ),
+        ("wrong workspace", clean(exact()), wrong_workspace),
+        (
+            "oversized output",
+            HelperSettlement {
+                output: Ok(vec![0; 6]),
+                ..clean(exact())
+            },
+            binding,
+        ),
+        (
+            "failed output",
+            HelperSettlement {
+                output: Err(NativeRefusal::JobUnverified),
+                ..clean(exact())
+            },
+            binding,
+        ),
+    ] {
+        assert_eq!(
+            accept(settlement, expected_workspace, &budget),
+            refused,
+            "{case}"
+        );
+    }
+
+    cancelled.set(true);
+    assert_eq!(
+        accept(clean(exact()), binding, &budget),
+        (Err(copy::Refusal::Cancelled), [0xff; 5]),
+    );
+    cancelled.set(false);
+    let expired = || budget_end;
+    let spent_budget = CopyBudget::fixture(budget_end, &budget_cancelled, &expired);
+    assert_eq!(
+        accept(clean(exact()), binding, &spent_budget),
+        (Err(copy::Refusal::Deadline), [0xff; 5]),
+    );
+
+    let stopped = Shutdown::default();
+    stopped.cancel();
+    let mut output = [0xff; 5];
+    assert_eq!(
+        accept_inspection(
+            clean(exact()),
+            binding,
+            &inputs,
+            deadline,
+            &stopped,
+            &budget,
+            &mut output
+        ),
+        Err(copy::Refusal::Inspection),
+    );
+    assert_eq!(output, [0xff; 5]);
+
+    tokio::time::advance(tick).await;
+    assert_eq!(tokio::time::Instant::now(), deadline);
+    assert_eq!(
+        accept(clean(exact()), binding, &budget),
+        refused,
+        "at cutoff"
+    );
+    tokio::time::advance(tick).await;
+    assert_eq!(tokio::time::Instant::now(), deadline + tick);
+    assert_eq!(
+        accept(clean(exact()), binding, &budget),
+        refused,
+        "one tick after cutoff"
+    );
+}
+
+#[test]
+fn checked_inspection_rejects_a_different_held_file_identity() {
+    use super::super::tests::held_test_workspace;
+
+    assert_admission_closed();
+    let temp = tempfile::tempdir().unwrap();
+    let (_production, workspace, _, _) = held_test_workspace(temp.path(), [0x74; 16]);
+    let slot = ArtifactSlot {
+        generation: workspace.binding().generation,
+        role: "disk",
+        key: [0x75; 16],
+    };
+    let path = slot_path(&workspace.root.path, slot).unwrap();
+    let other = workspace.root.path.join("different").unwrap();
+    for path in [&path, &other] {
+        std::fs::write(path.as_str(), b"identical bytes").unwrap();
+    }
+    let disk = PathPin::open(&path, false, false).unwrap();
+    let unrelated = PathPin::open(&other, false, false).unwrap();
+    let target = InspectTarget {
+        workspace: &workspace,
+        slot,
+        identity: disk.identity,
+        file: &disk.leaf,
+    };
+    assert_eq!(target.verify_identity(), Ok(()));
+    let swapped = InspectTarget {
+        file: &unrelated.leaf,
+        ..target
+    };
+    assert_eq!(swapped.verify_identity(), Err(copy::Refusal::Identity));
+}

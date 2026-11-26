@@ -733,6 +733,19 @@ fn validate_launch_request<'a>(
     })
 }
 
+fn finish_spawn_preparation(
+    kind: PlanKind,
+    prepare_by: Instant,
+    cancelled: &dyn Fn() -> bool,
+    record_writer: impl FnOnce() -> Result<(), NativeRefusal>,
+) -> Result<(), NativeRefusal> {
+    // The read-only inspection's pins exclude writes for the whole Job.
+    if kind != PlanKind::InspectWritable {
+        record_writer()?;
+    }
+    launch::check_preparation(prepare_by, cancelled)
+}
+
 impl<'a> NativeLaunch<'a> {
     pub(crate) fn hold(
         qualification: &'a ForegroundQualification<'a>,
@@ -853,27 +866,23 @@ impl<'a> NativeLaunch<'a> {
                 Ok((captured.min(live), granted))
             },
             || {
-                // The inspection owns no writer epoch. Its input pins
-                // exclude writes throughout the read-only helper Job.
-                if kind == PlanKind::InspectWritable {
-                    return launch::check_preparation(prepare_by, cancelled);
-                }
-                let store = qualification.store;
-                let pins = recovery::StorePins::open(qualification.production_root())?;
-                let origin = pins.origin(store, boot::marker()?)?;
-                store
-                    .try_native_transaction(|db| {
-                        launch::check_preparation(prepare_by, cancelled)
-                            .map_err(|_| anyhow::anyhow!("TEST creation expired"))?;
-                        crate::store::vm::native::recovery::record_job(
-                            db,
-                            custody::scope(workspace_binding),
-                            writer_epoch,
-                            origin,
-                        )
-                    })
-                    .map_err(|_| NativeRefusal::JobUnverified)?;
-                launch::check_preparation(prepare_by, cancelled)
+                finish_spawn_preparation(kind, prepare_by, cancelled, || {
+                    let store = qualification.store;
+                    let pins = recovery::StorePins::open(qualification.production_root())?;
+                    let origin = pins.origin(store, boot::marker()?)?;
+                    store
+                        .try_native_transaction(|db| {
+                            launch::check_preparation(prepare_by, cancelled)
+                                .map_err(|_| anyhow::anyhow!("TEST creation expired"))?;
+                            crate::store::vm::native::recovery::record_job(
+                                db,
+                                custody::scope(workspace_binding),
+                                writer_epoch,
+                                origin,
+                            )
+                        })
+                        .map_err(|_| NativeRefusal::JobUnverified)
+                })
             },
         )?;
         Ok(Self {
