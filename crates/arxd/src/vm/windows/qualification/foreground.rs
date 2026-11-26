@@ -136,8 +136,9 @@ impl crate::vm::test_issuer::SelectedSource for ForegroundQualification<'_> {
     }
 }
 
-/// Unreadable custody or host values fail closed as indeterminate. Only a
-/// measured host or profile mismatch is confirmed dependency drift.
+/// Measured profile, custody, volume, asset, DNS-witness, host or profile-key
+/// mismatches confirm drift. API or I/O failures, missing observations and an
+/// inactive console session fail closed as indeterminate.
 fn measure_fresh<'a>(
     held: &Held,
     store: &VmStore,
@@ -146,20 +147,19 @@ fn measure_fresh<'a>(
     let reason = NativeRefusal::QualificationMissing;
     held.token
         .verify_current_profile()
-        .map_err(|_| Indeterminate(NativeRefusal::IdentityUnverified))?;
-    inventory::binding(&held._source).map_err(Indeterminate)?;
+        .map_err(TokenCheckError::into_invalidation)?;
+    inventory::check_binding(&held._source)?;
     held.scope
         .as_ref()
         .ok_or(Indeterminate(reason))?
         .validate_foreground(store)?;
     for volume in &held.volumes {
-        if !capacity::still_bound(&capacity::MountManager, volume) {
-            return Err(Indeterminate(NativeRefusal::PathCustodyUnverified));
-        }
+        capacity::check_still_bound(&capacity::MountManager, volume)
+            .map_err(|error| error.into_invalidation(NativeRefusal::PathCustodyUnverified))?;
     }
-    inventory::binding(&held.trial).map_err(Indeterminate)?;
-    inventory::binding(&held._backing).map_err(Indeterminate)?;
-    launch::revalidate_assets(held).map_err(Indeterminate)?;
+    inventory::check_binding(&held.trial)?;
+    inventory::check_binding(&held._backing)?;
+    launch::revalidate_assets(held)?;
     let live = (
         platform(),
         windows_revision(),
