@@ -5,14 +5,13 @@ import { consoleClosedReason } from '../derive';
 import { formatDate } from '../format';
 import { Icon } from '../icons';
 import { href } from '../router';
-import { Pill, type Tone } from '../ui';
+import { ConsoleSessionStatus } from '../ui';
 
 // The VM console tile: view-only frames (1–2 fps screendumps), states
 // connecting / streaming / closed / error. Interactive VNC is later. A failed
 // or stopped VM, or one on an offline host, opens straight to "closed" with
 // the reason and never asks the server for a stream.
 
-const TONE: Record<ConsoleStatus, Tone> = { connecting: 'info', streaming: 'ok', closed: 'muted', error: 'bad' };
 
 interface FrameView {
   url: string;
@@ -21,10 +20,6 @@ interface FrameView {
   height: number;
   mime: string;
   capturedAt: string;
-}
-
-function StatusPill({ label }: { label: string }) {
-  return <Pill tone={label === 'streaming' ? 'ok' : label === 'error' ? 'bad' : label === 'connecting' ? 'info' : 'muted'}><span className="visually-hidden">Console status: </span>{label}</Pill>;
 }
 
 function Viewer({ vm, title }: { vm: Vm; title: ReactNode }) {
@@ -84,7 +79,7 @@ function Viewer({ vm, title }: { vm: Vm; title: ReactNode }) {
     <>
       <div className="console-bar">
         {title}
-        <StatusPill label={shown} />
+        <ConsoleSessionStatus status={shown} />
         <span className="spacer" />
         <button type="button" className="button button-quiet" onClick={() => setPaused(p => !p)} aria-pressed={paused}>
           <Icon name={paused ? 'play' : 'pause'} />{paused ? 'Resume' : 'Pause'}
@@ -94,7 +89,7 @@ function Viewer({ vm, title }: { vm: Vm; title: ReactNode }) {
           : null}
       </div>
       {reason ? <p className={status === 'error' ? 'form-error' : 'notice'} role={status === 'error' ? 'alert' : 'status'}>{reason}</p> : null}
-      <div className="console-screen" data-status={TONE[status]}>
+      <div className="console-screen" data-status={status}>
         {frame
           ? <img src={frame.url} width={frame.width} height={frame.height} alt={label} />
           : <p className="console-placeholder" role="status">{status === 'connecting' ? 'Connecting to the console…' : 'No picture yet.'}</p>}
@@ -121,11 +116,11 @@ export function ConsoleTile({ vm, host, live, onRecheck }: { vm: Vm; host: Host 
       <>
         <div className="console-bar">
           {title}
-          <StatusPill label="closed" />
+          <ConsoleSessionStatus status="closed" />
           <span className="spacer" />
           <button type="button" className="button" onClick={onRecheck}><Icon name="spin" />Reconnect</button>
         </div>
-        <div className="console-screen" data-status="muted">
+        <div className="console-screen" data-status="closed">
           <p className="console-placeholder console-closed" role="status"><Icon name={host?.reachability === 'offline' ? 'off' : vm.state === 'failed' ? 'fail' : 'stop'} />{closed}</p>
         </div>
         <p className="console-meta"><span className="console-lock"><Icon name="lock" /><span className="console-mode">View only</span> · interactive VNC later</span></p>

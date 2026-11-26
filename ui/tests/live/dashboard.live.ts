@@ -1,5 +1,6 @@
 import { expect, test, type BrowserContext, type Page, type Response } from '@playwright/test';
 import path from 'node:path';
+import { contrastFailures } from '../contrast';
 import { replaySessionStatus } from './replay';
 
 // Runs against a real arxd serving the production ui/dist (see
@@ -47,6 +48,11 @@ async function shot(page: Page, name: string, host?: HostIdentity) {
   await page.screenshot({ path: path.join(SHOTS, `${name}.png`), fullPage: true, mask, maskColor: '#7c8794', animations: 'disabled' });
 }
 
+/** Night Orbit contrast audit of the real page (see ../contrast.ts); soft, so every state is reported. */
+async function audit(page: Page, where: string) {
+  expect.soft(await contrastFailures(page), `contrast: ${where}`).toEqual([]);
+}
+
 async function signIn(page: Page, hash = '#/hosts') {
   await page.goto(`/${hash}`);
   await page.getByLabel('Password').fill(PASSWORD);
@@ -88,11 +94,13 @@ test('login: production bundle, server-side refusal, then sign-in', async ({ pag
   await expect(page.getByText('The session is kept in a secure, HTTP-only cookie on this host.')).toBeVisible();
   expect(await sessionStatus(page)).toBe(401);
   await shot(page, '01-login');
+  await audit(page, '01-login');
   await page.getByLabel('Password').fill('not-the-owner-password');
   const refused = page.waitForResponse(isApi('POST', '/api/v1/session'));
   await page.getByRole('button', { name: 'Sign in' }).click();
   expect((await refused).status()).toBe(401);
   await expect(page.getByRole('alert')).toHaveText('Invalid username or password.');
+  await audit(page, 'login refused');
   await page.getByLabel('Password').fill(PASSWORD);
   const accepted = page.waitForResponse(isApi('POST', '/api/v1/session'));
   await page.getByRole('button', { name: 'Sign in' }).click();
@@ -120,6 +128,7 @@ test('hosts: the local host list and detail come from arxd', async ({ page }) =>
   await expect(cards.first().getByRole('article')).toHaveCount(2);
   await expect(page.getByText('1 of 1 hosts online')).toBeVisible();
   await shot(page, '02-hosts', host);
+  await audit(page, '02-hosts');
   const detail = page.waitForResponse(isApi('GET', `/api/v1/hosts/${host.id}`));
   await cards.first().getByRole('link', { name: host.name, exact: true }).click();
   expect((await detail).status()).toBe(200);
@@ -128,6 +137,7 @@ test('hosts: the local host list and detail come from arxd', async ({ page }) =>
   await expect(page.getByRole('list', { name: 'Recent activity on this host' }).getByRole('listitem').first()).toBeVisible();
   await expect(page.getByRole('link', { name: 'Run command' })).toBeVisible();
   await shot(page, '03-host-detail', host);
+  await audit(page, '03-host-detail');
 });
 
 test('VMs: catalog rows, architecture badges and detail with size and snapshot', async ({ page }) => {
@@ -143,6 +153,7 @@ test('VMs: catalog rows, architecture badges and detail with size and snapshot',
   await expect(table.getByRole('row').filter({ hasText: VM_RUNNING })).toContainText('running');
   await expect(table.getByRole('row').filter({ hasText: VM_STOPPED })).toContainText('stopped');
   await shot(page, '04-vms', host);
+  await audit(page, '04-vms');
   const detail = page.waitForResponse(isApi('GET', `/api/v1/vms/${VM_RUNNING}`));
   await table.getByRole('link', { name: VM_RUNNING }).click();
   expect(await (await detail).json()).toMatchObject({
@@ -162,6 +173,7 @@ test('VMs: catalog rows, architecture badges and detail with size and snapshot',
   await expect(snapshot).toHaveCount(1);
   await expect(snapshot.locator('span').last()).toHaveText('1.0 GiB');
   await shot(page, '05-vm-detail', host);
+  await audit(page, '05-vm-detail');
 });
 
 test('activity: newest first with server cursor paging', async ({ page }) => {
@@ -180,6 +192,7 @@ test('activity: newest first with server cursor paging', async ({ page }) => {
   const first = page.getByRole('list', { name: 'Activity, page 1' }).getByRole('listitem');
   await expect(first).toHaveCount(20);
   await shot(page, '06-activity', host);
+  await audit(page, '06-activity');
   const secondPage = page.waitForResponse(r => new URL(r.url()).pathname === '/api/v1/activity' && new URL(r.url()).searchParams.get('before_id') === String(one.nextBeforeId));
   await page.getByRole('button', { name: 'Older' }).click();
   const two = await (await secondPage).json();
@@ -192,6 +205,7 @@ test('activity: newest first with server cursor paging', async ({ page }) => {
   await expect(page.getByRole('list', { name: 'Activity, page 2' }).getByRole('listitem')).toHaveCount(ACTIVITY_ROWS - 20);
   await expect(page.getByRole('button', { name: 'Older' })).toBeDisabled();
   await shot(page, '07-activity-page-2', host);
+  await audit(page, '07-activity-page-2');
   await page.getByRole('button', { name: 'Newer' }).click();
   await expect(first).toHaveCount(20);
 });
@@ -209,6 +223,7 @@ test('terminal: 503 unavailable without an owner executor, shown as documented',
   await expect(page.getByLabel('Command')).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Reconnect' })).toBeVisible();
   await shot(page, '08-terminal-unavailable', host);
+  await audit(page, '08-terminal-unavailable');
 });
 
 test('console: 503 unavailable without a capture source, shown as documented', async ({ page }) => {
@@ -224,6 +239,7 @@ test('console: 503 unavailable without a capture source, shown as documented', a
   await expect(page.getByText('Console status: error')).toBeAttached();
   await expect(page.getByRole('img', { name: /Console of/ })).toHaveCount(0);
   await shot(page, '09-console-unavailable', host);
+  await audit(page, '09-console-unavailable');
 });
 
 test('sign out revokes the server session', async ({ page, context }) => {
@@ -239,6 +255,7 @@ test('sign out revokes the server session', async ({ page, context }) => {
   // The old cookie, sent explicitly, no longer authenticates.
   expect(await replayStatus(value)).toBe(401);
   await shot(page, '10-signed-out');
+  await audit(page, '10-signed-out');
 });
 
 test('a session ended elsewhere returns the open dashboard to login', async ({ page, context }) => {
@@ -262,4 +279,5 @@ test('a session ended elsewhere returns the open dashboard to login', async ({ p
   await expect(page.getByRole('status')).toHaveText('Your session has ended. Sign in again.');
   await expect(page.getByLabel('Password')).toBeVisible();
   await shot(page, '11-session-ended');
+  await audit(page, '11-session-ended');
 });

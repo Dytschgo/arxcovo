@@ -1,17 +1,19 @@
 import { act, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import type { ActivityOutcome, Reachability, Vm, VmState } from '../api/types';
+import type { ActivityOutcome, ConsoleStatus, Reachability, TerminalStatus, Vm, VmState } from '../api/types';
 import { formatTimeLeft } from './format';
 import { Logo } from './icons';
 import {
-  ArchBadge, HostStatus, KindMarker, Maybe, NullValue, OUTCOME_STATUS, OutcomeStatus, REACHABILITY_STATUS,
-  VM_STATUS, VmCard, VmStatus,
+  ArchBadge, CONSOLE_STATUS, ConsoleSessionStatus, HostStatus, KindMarker, Maybe, NullValue, OUTCOME_STATUS, OutcomeStatus,
+  REACHABILITY_STATUS, TERMINAL_STATUS, TerminalSessionStatus, VM_STATUS, VmCard, VmStatus,
 } from './ui';
 
 // Every value of the API unions, spelled out so a new member must be added here too.
 const VM_STATES: VmState[] = ['creating', 'running', 'stopped', 'snapshotting', 'migrating', 'failed', 'destroying'];
 const OUTCOMES: ActivityOutcome[] = ['started', 'succeeded', 'failed', 'rejected', 'refused', 'interrupted'];
 const REACHABILITY: Reachability[] = ['online', 'degraded', 'offline'];
+const TERMINAL: TerminalStatus[] = ['connecting', 'ready', 'running', 'closed', 'error'];
+const CONSOLE: (ConsoleStatus | 'paused')[] = ['connecting', 'streaming', 'paused', 'closed', 'error'];
 
 const NOW = Date.parse('2026-11-26T12:00:00Z');
 const at = (ms: number) => new Date(NOW + ms).toISOString();
@@ -48,7 +50,34 @@ describe('status icon + word', () => {
     expect(container.querySelector('svg')!.getAttribute('data-icon')).toBe(REACHABILITY_STATUS[reachability].icon);
   });
 
+  test.each(TERMINAL)('terminal session %s renders an icon and its word, read as "Terminal status: …"', status => {
+    const { container } = render(<TerminalSessionStatus status={status} />);
+    const st = container.querySelector('.st')!;
+    expect(st.getAttribute('data-status')).toBe(status);
+    expect(st.querySelector('.st-word')!.textContent).toBe(status);
+    expect(st.textContent).toBe(`Terminal status: ${status}`);
+    expect(st.querySelector('.visually-hidden')!.textContent).toBe('Terminal status: ');
+    expect(st.querySelector('svg')!.getAttribute('data-icon')).toBe(TERMINAL_STATUS[status].icon);
+  });
+
+  test.each(CONSOLE)('console session %s renders an icon and its word, read as "Console status: …"', status => {
+    const { container } = render(<ConsoleSessionStatus status={status} />);
+    const st = container.querySelector('.st')!;
+    expect(st.textContent).toBe(`Console status: ${status}`);
+    expect(st.querySelector('svg')!.getAttribute('data-icon')).toBe(CONSOLE_STATUS[status].icon);
+  });
+
+  test('a status without a label reads as the bare word', () => {
+    const { container } = render(<VmStatus state="running" />);
+    expect(container.querySelector('.visually-hidden')).toBeNull();
+    expect(container.textContent).toBe('running');
+  });
+
   test('the maps cover exactly the API unions, and states that need the owner read as bad', () => {
+    expect(Object.keys(TERMINAL_STATUS).sort()).toEqual([...TERMINAL].sort());
+    expect(Object.keys(CONSOLE_STATUS).sort()).toEqual([...CONSOLE].sort());
+    expect(TERMINAL_STATUS.error.tone).toBe('bad');
+    expect(CONSOLE_STATUS.error.tone).toBe('bad');
     expect(Object.keys(VM_STATUS).sort()).toEqual([...VM_STATES].sort());
     expect(Object.keys(OUTCOME_STATUS).sort()).toEqual([...OUTCOMES].sort());
     expect(Object.keys(REACHABILITY_STATUS).sort()).toEqual([...REACHABILITY].sort());
@@ -62,8 +91,10 @@ describe('status icon + word', () => {
   test('distinct VM states never share an icon, so the glyph alone still tells them apart', () => {
     const icons = VM_STATES.map(s => VM_STATUS[s].icon);
     expect(new Set(icons).size).toBe(icons.length);
-    const outcomeIcons = OUTCOMES.map(o => OUTCOME_STATUS[o].icon);
-    expect(new Set(outcomeIcons).size).toBe(outcomeIcons.length);
+    for (const map of [OUTCOME_STATUS, TERMINAL_STATUS, CONSOLE_STATUS]) {
+      const all = Object.values(map).map(look => look.icon);
+      expect(new Set(all).size).toBe(all.length);
+    }
   });
 });
 

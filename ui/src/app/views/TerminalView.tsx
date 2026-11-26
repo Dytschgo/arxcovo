@@ -4,13 +4,11 @@ import { isApiError, type Host, type TerminalSession, type TerminalStatus } from
 import { useApi, useResource, useSession } from '../context';
 import { Icon } from '../icons';
 import { href } from '../router';
-import { ArchBadge, Empty, HostStatus, Loaded, OsBadge, Page, Pill, type Tone } from '../ui';
+import { ArchBadge, Empty, HostStatus, Loaded, OsBadge, Page, TerminalSessionStatus } from '../ui';
 
 export const MAX_LINES = 2000;
 
 type Line = { id: number; kind: 'cmd' | 'stdout' | 'stderr' | 'exit' | 'error' | 'info'; text: string };
-
-const STATUS_TONE: Record<TerminalStatus, Tone> = { connecting: 'info', ready: 'ok', running: 'info', closed: 'muted', error: 'bad' };
 
 function Terminal({ host }: { host: Host }) {
   const api = useApi();
@@ -136,7 +134,7 @@ function Terminal({ host }: { host: Host }) {
       <header className="term-head">
         <h2 id="term-title" className="term-host"><OsBadge os={host.os} /><span>{host.name}</span></h2>
         <ArchBadge arch={host.arch} />
-        <Pill tone={STATUS_TONE[status]}><span className="visually-hidden">Terminal status: </span>{status}</Pill>
+        <TerminalSessionStatus status={status} />
         {status === 'closed' || status === 'error' ? <button type="button" className="button button-quiet" onClick={() => setAttempt(a => a + 1)}><Icon name="spin" />Reconnect</button> : null}
         <span className="spacer" />
         <span className="term-legend" aria-hidden="true"><span>› stdout</span><span>! stderr</span></span>

@@ -139,8 +139,12 @@ a { color: var(--ink); text-decoration-color: var(--line3); text-underline-offse
 svg.i { inline-size: 16px; block-size: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; flex: none; }
 
 /* --- Motion -------------------------------------------------------------- */
-.rise { opacity: 0; transform: translateY(10px); animation: rise var(--dur-rise) var(--ease) forwards; animation-delay: calc(var(--i, 0) * var(--stagger)); }
-@keyframes rise { to { opacity: 1; transform: none; } }
+/* Motion never changes how text reads: transitions and keyframes move things
+   (transform), draw the decorative logo, or recolour borders. Text colour,
+   fills behind text and opacity always switch at once, so every frame keeps
+   4.5:1 (styles.test.ts enforces it). The entrance rise moves, it never fades. */
+.rise { animation: rise var(--dur-rise) var(--ease) both; animation-delay: calc(var(--i, 0) * var(--stagger)); }
+@keyframes rise { from { transform: translateY(10px); } }
 @keyframes draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
 @keyframes pop { from { transform: scale(0); } to { transform: scale(1); } }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -214,7 +218,6 @@ svg.i { inline-size: 16px; block-size: 16px; fill: none; stroke: currentColor; s
   border-radius: var(--r-ctl);
   color: var(--ink3);
   text-decoration: none;
-  transition: color var(--dur-fast);
 }
 .nav a[aria-current="page"] { background: var(--ink); color: var(--bg); font-weight: 500; }
 .nav a:focus-visible { outline-offset: 1px; border-radius: var(--r-ctl); }
@@ -231,7 +234,7 @@ svg.i { inline-size: 16px; block-size: 16px; fill: none; stroke: currentColor; s
   background: none;
   color: var(--ink3);
   cursor: pointer;
-  transition: color var(--dur-fast), border-color var(--dur-fast);
+  transition: border-color var(--dur-fast);
 }
 .signout:focus-visible { border-radius: var(--r-ctl); }
 
@@ -276,11 +279,13 @@ main:focus-visible { outline-offset: -4px; }
   cursor: pointer;
 }
 .button:active:not(:disabled) { transform: scale(0.97); }
-.button:disabled, .button-disabled { opacity: 0.45; cursor: not-allowed; }
 .button-primary { background: var(--ink); border-color: var(--ink); color: var(--bg); }
 .button-quiet { border-color: transparent; min-block-size: 32px; padding-inline: 10px; color: var(--ink3); }
+/* Disabled reads as dimmer ink and a dashed outline, never as opacity: fading
+   the whole control took its text below 4.5:1 (4.41 plain, 2.21 primary). */
+.button:disabled, .button.button-disabled { background: none; border-color: var(--line3); border-style: dashed; color: var(--ink4); cursor: not-allowed; }
 @media (prefers-reduced-motion: no-preference) {
-  .button { transition: transform 140ms var(--ease), background-color var(--dur-fast), border-color var(--dur-fast); }
+  .button { transition: transform 140ms var(--ease), border-color var(--dur-fast); }
 }
 
 .field { display: flex; flex-direction: column; gap: 6px; color: var(--ink3); font-size: var(--fs-ui); }
@@ -294,6 +299,9 @@ main:focus-visible { outline-offset: -4px; }
   outline: 0;
 }
 .field input:focus-visible, .field select:focus-visible, .terminal-input input:focus-visible { border-color: var(--ink); }
+.field input:disabled, .field select:disabled, .terminal-input input:disabled { border-style: dashed; color: var(--ink4); cursor: not-allowed; }
+/* Chromium's default placeholder (#757575) is 4.25:1 on --tile2; --ink4 is 5.30:1. */
+::placeholder { color: var(--ink4); opacity: 1; }
 .field-inline { flex-direction: row; align-items: center; gap: var(--sp-2); }
 .check { display: inline-flex; align-items: center; gap: 7px; color: var(--ink2); font-size: var(--fs-ui); }
 .check input { inline-size: 1.1rem; block-size: 1.1rem; accent-color: var(--ink); }
@@ -394,8 +402,6 @@ main:focus-visible { outline-offset: -4px; }
 }
 .search:focus-within { border-color: var(--ink); }
 .search input { flex: 1; inline-size: 100%; border: 0; background: none; outline: 0; color: var(--ink); }
-/* Placeholders: --ink4 at full opacity (5.3:1 on --tile2, more on --bg). */
-.search input::placeholder, .filter-name input::placeholder, .terminal-input input::placeholder { color: var(--ink4); opacity: 1; }
 .search input::-webkit-search-cancel-button { display: none; }
 kbd {
   display: inline-grid;
@@ -468,10 +474,9 @@ kbd {
   block-size: 22px;
   flex: none;
   border-radius: 6px;
-  background: color-mix(in srgb, currentColor 16%, transparent);
 }
-.osb[data-os="windows"] { color: var(--win); }
-.osb[data-os="linux"] { color: var(--lin); }
+.osb[data-os="windows"] { background: color-mix(in srgb, var(--win) 16%, transparent); }
+.osb[data-os="linux"] { background: color-mix(in srgb, var(--lin) 16%, transparent); }
 .osb .os-glyph { inline-size: 11px; block-size: 11px; }
 
 .ready { display: inline-flex; align-items: center; gap: 5px; color: var(--ink2); font-size: var(--fs-sm); white-space: nowrap; }
@@ -503,13 +508,14 @@ kbd {
 .seg button[aria-pressed="true"] .kind[data-kind="static"] { background: var(--bg); }
 .fchip .st { font-size: inherit; }
 .seg-n { color: var(--ink3); font: var(--fs-xs) var(--mono); }
-[aria-pressed="true"] > .seg-n { color: #454545; }
+[aria-pressed="true"] > .seg-n { color: var(--bg); }
 .chips-group { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .chips-k { color: var(--ink4); font: var(--fs-micro) var(--mono); text-transform: uppercase; letter-spacing: .06em; }
 
 .switch { position: relative; display: inline-flex; align-items: center; gap: 9px; color: var(--ink2); font-size: var(--fs-ui); cursor: pointer; }
-.switch input { position: absolute; inset-inline-start: 0; inline-size: 34px; block-size: 20px; margin: 0; opacity: 0; cursor: pointer; }
-.switch-track { position: relative; flex: none; inline-size: 34px; block-size: 20px; border-radius: var(--r-ctl); background: var(--line2); transition: background-color var(--dur-fast); }
+/* The native checkbox is clipped, not faded; the label toggles it and the track shows its state. */
+.switch input { position: absolute; inline-size: 1px; block-size: 1px; margin: 0; overflow: clip; clip-path: inset(50%); white-space: nowrap; }
+.switch-track { position: relative; flex: none; inline-size: 34px; block-size: 20px; border-radius: var(--r-ctl); background: var(--line2); }
 .switch-track::after { content: ""; position: absolute; inset: 3px auto auto 3px; inline-size: 14px; block-size: 14px; border-radius: 50%; background: var(--ink2); transition: transform var(--dur-fast) var(--ease); }
 .switch input:checked + .switch-track { background: var(--ink); }
 .switch input:checked + .switch-track::after { transform: translateX(14px); background: var(--bg); }
@@ -931,14 +937,15 @@ a.hp[aria-current] { border-color: var(--line3); background: var(--tile2); }
   .seg button[aria-pressed="true"], .fchip[aria-pressed="true"] { outline: 2px solid; }
 }
 
-/* Reduced motion: every animation and transition shows its finished state. */
+/* Reduced motion: nothing moves; every animation shows its finished state at once. */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
-    animation-duration: .01ms !important;
-    animation-delay: 0ms !important;
+    animation-duration: 0s !important;
+    animation-delay: 0s !important;
     animation-iteration-count: 1 !important;
-    transition-duration: .01ms !important;
+    transition-duration: 0s !important;
+    transition-delay: 0s !important;
   }
-  .rise { opacity: 1; transform: none; }
+  .rise { transform: none; }
   .logo .lg-c { display: none; }
 }

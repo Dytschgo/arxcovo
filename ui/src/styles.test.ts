@@ -42,6 +42,67 @@ describe('Night Orbit tokens', () => {
   });
 });
 
+/** Top-level and @media rules as selector -> declarations (comments stripped). */
+function rules(): { selector: string; decls: Map<string, string> }[] {
+  const text = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  return [...text.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(m => ({
+    selector: m[1].replace(/@media[^{]*$/, '').trim(),
+    decls: new Map(m[2].split(';').map(d => d.split(':')).filter(p => p.length >= 2).map(([k, ...v]) => [k.trim(), v.join(':').trim()])),
+  }));
+}
+const tokenOf = (value: string | undefined) => value?.match(/^var\(--([\w-]+)\)$/)?.[1];
+const rule = (selector: string) => {
+  const found = rules().find(r => r.selector.split(',').map(x => x.trim()).includes(selector));
+  if (!found) throw new Error(`no rule for ${selector}`);
+  return found.decls;
+};
+
+describe('text on its real backgrounds', () => {
+  // Every pair below is a text colour drawn on a fill other than the page:
+  // placeholders and disabled controls sit on input fills (--tile2) and on
+  // tiles; the current nav item and the primary button are black on white.
+  test.each([
+    ['::placeholder', ['tile2', 'tile', 'bg']],
+    ['.button:disabled', ['bg', 'tile', 'tile2']],
+    ['.button.button-disabled', ['bg', 'tile', 'tile2']],
+    ['.terminal-input input:disabled', ['tile2']],
+    ['.field select:disabled', ['tile2']],
+    ['.button-primary', ['ink']],
+    ['.nav a[aria-current="page"]', ['ink']],
+  ] as const)('%s clears 4.5:1 on its fills', (selector, fills) => {
+    const decls = rule(selector);
+    const fg = tokenOf(decls.get('color'));
+    expect(fg, `${selector} sets a token colour`).toBeDefined();
+    for (const fill of fills) expect(contrast(token(fg!), token(fill)), `${selector} on --${fill}`).toBeGreaterThanOrEqual(4.5);
+  });
+
+  test('placeholders are fully opaque, not the UA default faded grey', () => {
+    expect(rule('::placeholder').get('opacity')).toBe('1');
+  });
+
+  test('every text colour is a text-safe ink token (or black on a white fill)', () => {
+    const allowed = new Set(['var(--ink)', 'var(--ink2)', 'var(--ink3)', 'var(--ink4)', 'var(--bg)', 'inherit', 'currentColor']);
+    const bad = rules().flatMap(r => (r.decls.has('color') && !allowed.has(r.decls.get('color')!) && !/os-glyph/.test(r.selector) ? [`${r.selector}: ${r.decls.get('color')}`] : []));
+    expect(bad).toEqual([]);
+  });
+
+  test('a rule that sets both text and fill tokens pairs them at 4.5:1 or better', () => {
+    for (const r of rules()) {
+      const fg = tokenOf(r.decls.get('color'));
+      const bg = tokenOf(r.decls.get('background') ?? r.decls.get('background-color'));
+      if (fg && bg) expect(contrast(token(fg), token(bg)), r.selector).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  test('nothing that holds text is dimmed with opacity (only entrance animations and the logo light start at 0)', () => {
+    const dimmed = rules().filter(r => {
+      const o = r.decls.get('opacity');
+      return o !== undefined && parseFloat(o) < 1 && !/^(\.rise|\.logo \.lg-c|from|to|\d+%)/.test(r.selector);
+    }).map(r => r.selector);
+    expect(dimmed).toEqual([]);
+  });
+});
+
 describe('fonts', () => {
   test('Geist and Geist Mono are self-hosted with their licence, and nothing loads from another origin', () => {
     const sources = [...css.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/g)].map(m => m[1]);
@@ -66,32 +127,36 @@ describe('dark only', () => {
 });
 
 describe('motion', () => {
-  test('reduced motion shows the finished state', () => {
+  test('reduced motion shows the finished state at once', () => {
     const reduce = css.slice(css.indexOf('@media (prefers-reduced-motion: reduce)'));
-    expect(reduce).toMatch(/animation-duration:\s*\.01ms\s*!important/);
-    expect(reduce).toMatch(/animation-delay:\s*0ms\s*!important/);
-    expect(reduce).toMatch(/transition-duration:\s*\.01ms\s*!important/);
-    expect(reduce).toMatch(/\.rise\s*{\s*opacity:\s*1;\s*transform:\s*none;\s*}/);
+    expect(reduce).toMatch(/animation-duration:\s*0s\s*!important/);
+    expect(reduce).toMatch(/animation-delay:\s*0s\s*!important/);
+    expect(reduce).toMatch(/transition-duration:\s*0s\s*!important/);
+    expect(reduce).toMatch(/transition-delay:\s*0s\s*!important/);
+    expect(reduce).toMatch(/\.rise\s*{\s*transform:\s*none;\s*}/);
+  });
+
+  // Text must keep 4.5:1 in every frame, so motion may move things or recolour
+  // borders, never change text colour, a fill behind text, or opacity.
+  test('transitions only move things or recolour borders', () => {
+    const allowed = new Set(['transform', 'border-color']);
+    const used = rules().flatMap(r => ['transition', 'transition-property'].filter(k => r.decls.has(k))
+      .flatMap(k => r.decls.get(k)!.split(',').map(part => `${r.selector} -> ${part.trim().split(/\s+/)[0]}`)));
+    expect(used.length).toBeGreaterThan(0);
+    expect(used.filter(u => !allowed.has(u.split(' -> ')[1]))).toEqual([]);
+  });
+
+  test('keyframes never change opacity or colour, except the decorative logo light', () => {
+    const blocks = [...css.matchAll(/@keyframes\s+([\w-]+)\s*\{((?:[^{}]*\{[^{}]*\})*)\s*\}/g)];
+    expect(blocks.map(b => b[1]).sort()).toEqual(['draw', 'lgsweep', 'pop', 'rise', 'spin']);
+    for (const [, name, body] of blocks) {
+      if (name === 'lgsweep') continue; // the logo's sweeping light: an aria-hidden SVG stroke, never text
+      expect(body, `@keyframes ${name}`).not.toMatch(/(?:^|[{;\s])(opacity|color|background(?:-color)?|fill)\s*:/);
+    }
   });
 });
 
-describe('view text colours', () => {
-  // Every `color:` in the stylesheet is an ink token (each clears 4.5:1 above),
-  // the background on a white control, an OS data colour on a glyph, or a
-  // listed literal that is checked here against the surface it sits on.
-  const LITERALS: Record<string, string> = { '#454545': '#ffffff' };
-  const ALLOWED = new Set(['var(--ink)', 'var(--ink2)', 'var(--ink3)', 'var(--ink4)', 'var(--bg)', 'var(--win)', 'var(--lin)', 'inherit', 'currentColor', ...Object.keys(LITERALS)]);
-
-  test('text colours come from tokens or checked literals', () => {
-    const values = [...css.matchAll(/(?<![-\w])color:\s*([^;}]+?)\s*[;}]/g)].map(m => m[1].trim());
-    expect(values.length).toBeGreaterThan(50);
-    expect(values.filter(v => !ALLOWED.has(v))).toEqual([]);
-  });
-
-  test('the listed literals clear 4.5:1 on their surface', () => {
-    for (const [fg, bg] of Object.entries(LITERALS)) expect(contrast(fg, bg), fg).toBeGreaterThanOrEqual(4.5);
-  });
-
+describe('hosts board', () => {
   test('the board scrolls inside itself, so wide clusters never overflow the page', () => {
     expect(css).toMatch(/\.board\s*{[^}]*overflow-x:\s*auto;/);
     expect(css).toMatch(/\.board-cols\s*{[^}]*min-inline-size:\s*calc\(var\(--cols/);

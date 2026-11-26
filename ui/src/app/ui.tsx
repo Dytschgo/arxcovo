@@ -1,5 +1,5 @@
 import { Component, useEffect, useId, useRef, useState, type ReactNode } from 'react';
-import type { ActivityOutcome, Arch, OsFamily, Reachability, Vm, VmKind, VmState } from '../api/types';
+import type { ActivityOutcome, Arch, ConsoleStatus, OsFamily, Reachability, TerminalStatus, Vm, VmKind, VmState } from '../api/types';
 import type { Resource } from './context';
 import { OS_LABEL, formatBytes, formatTimeLeft } from './format';
 import { Icon, OsGlyph, type IconName } from './icons';
@@ -73,15 +73,35 @@ export const REACHABILITY_STATUS: Record<Reachability, StatusLook> = {
   offline: { icon: 'off', word: 'offline', tone: 'off' },
 };
 
+/** Every terminal session `TerminalStatus` (the bounded run_command session), as icon + word. */
+export const TERMINAL_STATUS: Record<TerminalStatus, StatusLook> = {
+  connecting: { icon: 'spin', word: 'connecting', tone: 'busy' },
+  ready: { icon: 'check', word: 'ready', tone: 'plain' },
+  running: { icon: 'play', word: 'running', tone: 'plain' },
+  closed: { icon: 'stop', word: 'closed', tone: 'off' },
+  error: { icon: 'fail', word: 'error', tone: 'bad' },
+};
+
+/** Every console `ConsoleStatus` (view-only frames), plus the viewer's own `paused`, as icon + word. */
+export const CONSOLE_STATUS: Record<ConsoleStatus | 'paused', StatusLook> = {
+  connecting: { icon: 'spin', word: 'connecting', tone: 'busy' },
+  streaming: { icon: 'monitor', word: 'streaming', tone: 'plain' },
+  paused: { icon: 'pause', word: 'paused', tone: 'off' },
+  closed: { icon: 'stop', word: 'closed', tone: 'off' },
+  error: { icon: 'fail', word: 'error', tone: 'bad' },
+};
+
 /**
  * Status icon + word. `status` is the raw API value and lands in
  * `data-status`, so a view can style one state (for example the activity
- * outcome borders in PR B) without new props.
+ * outcome borders in PR B) without new props. `label`, when given, is read
+ * before the word ("Terminal status: ready") but not shown.
  */
-export function StatusWord({ look, status }: { look: StatusLook; status: string }) {
+export function StatusWord({ look, status, label }: { look: StatusLook; status: string; label?: string }) {
   return (
     <span className="st" data-tone={look.tone} data-status={status}>
       <Icon name={look.icon} />
+      {label ? <span className="visually-hidden">{label}: </span> : null}
       <span className="st-word">{look.word}</span>
     </span>
   );
@@ -97,6 +117,16 @@ export function OutcomeStatus({ outcome }: { outcome: ActivityOutcome }) {
 
 export function HostStatus({ reachability }: { reachability: Reachability }) {
   return <StatusWord look={REACHABILITY_STATUS[reachability]} status={reachability} />;
+}
+
+/** Terminal session status, read as "Terminal status: <word>". */
+export function TerminalSessionStatus({ status }: { status: TerminalStatus }) {
+  return <StatusWord look={TERMINAL_STATUS[status]} status={status} label="Terminal status" />;
+}
+
+/** Console stream status (or `paused` by the viewer), read as "Console status: <word>". */
+export function ConsoleSessionStatus({ status }: { status: ConsoleStatus | 'paused' }) {
+  return <StatusWord look={CONSOLE_STATUS[status]} status={status} label="Console status" />;
 }
 
 export const KIND_TITLE: Record<VmKind, string> = { test: 'Test VM, expires', static: 'Static VM, never expires' };
