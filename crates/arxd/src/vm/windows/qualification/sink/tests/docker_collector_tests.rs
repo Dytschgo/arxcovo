@@ -4,11 +4,16 @@ use crate::vm::paths::Artifact;
 use crate::vm::qemu_args::{BootPurpose, BootRecipe, NETWORK, StaticNetwork};
 use crate::vm::static_web::OriginPortLease;
 use crate::vm::windows::qualification::{docker_trial as trial, static_compose};
+use crate::vm::{public_egress::RouteObservation, qualification_record::digest};
 use arx_guest::docker_trial::{self as wire, Challenge, TrialRequest, TrialResponse};
 use records::{DockerDependencies, Hash, Observation, Record, Stage, StageResult, decode};
 use std::cell::{Cell, RefCell};
 use std::io::Read;
 use std::os::windows::fs::OpenOptionsExt;
+use trial::witness::{
+    self, Case, Counts, Drift, FlowEvent, Listener, ReceiverEnrollment, Receivers, RouteChange,
+    RouteSample, Target, Transport,
+};
 
 const PACKAGES: Hash = [31; 32];
 
@@ -32,7 +37,38 @@ enum Fault {
     WrongOrigin,
     WrongTrustProfile,
     WrongFixture,
-    MissingControls,
+    WrongReceiverBoot,
+    WrongReceiverGeneration,
+    MissingReceiver,
+    MissingReceiverTransport,
+    MalformedReceiver,
+    WrongReceiverTarget,
+    OmittedEnrolledReceiver,
+    ExtraEnrolledReceiver,
+    SubstitutedEnrolledReceiver,
+    NoRouteChange,
+    MissingDriftEvents,
+    ForeignClosedFlow,
+    NoEstablishedArrivals,
+    ForeignRefusedFlow,
+    ReusedDriftFlow,
+    WrongDriftBaseline,
+    FixtureBoundStockRow,
+    MissingBeforeControl,
+    MissingAfterControl,
+    ForbiddenArrival,
+    NoAttempt,
+    ReplayedReceiverWindow,
+    MissingRoute,
+    ForeignRoute,
+    MalformedPolicy,
+    ChangedRoute,
+    ChangedTopology,
+    ReplacedPolicy,
+    ForeignListener,
+    MissingListener,
+    WrongOriginBoot,
+    WrongOriginGeneration,
     ReplayedBoot,
     Sink,
 }
@@ -41,6 +77,8 @@ enum Fault {
 struct Trace {
     staged: Vec<trial::Phase>,
     launched: Vec<trial::Phase>,
+    continued: Vec<trial::Phase>,
+    listener_checks: usize,
     drained: Vec<trial::Phase>,
     disposed: bool,
 }
@@ -164,7 +202,72 @@ impl<'a> trial::Host for Host<'a> {
         })
     }
 
-    fn boot(
+    fn route(
+        &mut self,
+        boot: &trial::CheckedBoot<'_>,
+        peer: Option<trial::PeerId>,
+        _: u64,
+    ) -> Result<RouteSample, NativeRefusal> {
+        let ticket = boot.ticket();
+        let trace = self.trace.borrow();
+        if peer.is_some() {
+            assert_eq!(trace.launched.last(), Some(&ticket.phase));
+        }
+        assert!(!trace.continued.contains(&ticket.phase));
+        let mut sample = RouteSample {
+            ticket,
+            peer,
+            policy_bytes: policy_bytes(),
+            policy_identity: boot
+                .argv()
+                .public_egress_policy()
+                .unwrap()
+                .identity()
+                .unwrap(),
+            topology: self.dependencies.topology,
+            route: fixture_route(),
+        };
+        // The sample before create is valid. The live recheck must refuse.
+        if peer.is_some() {
+            match self.fault {
+                Fault::MissingRoute => return Err(NativeRefusal::NetworkFenceUnverified),
+                Fault::ForeignRoute => sample.peer.as_mut().unwrap().boot[0] ^= 1,
+                Fault::MalformedPolicy => sample.policy_bytes.push(0),
+                Fault::ChangedRoute => sample.route.interface_luid += 1,
+                Fault::ChangedTopology => sample.topology[0] ^= 1,
+                Fault::ReplacedPolicy => sample.policy_identity.file[0] ^= 1,
+                _ => {}
+            }
+        }
+        Ok(sample)
+    }
+
+    fn receiver_targets(&mut self, ticket: trial::Ticket) -> Result<Vec<Target>, NativeRefusal> {
+        assert_eq!(ticket.phase, trial::Phase::PublicFixture);
+        let mut targets = witness::fixture_targets();
+        match self.fault {
+            Fault::MissingReceiverTransport => targets.retain(|target| {
+                target.case != Case::Private || target.transport != Transport::Udp
+            }),
+            Fault::OmittedEnrolledReceiver => targets.retain(|target| target.identity != [100; 32]),
+            Fault::ExtraEnrolledReceiver => targets.push(Target {
+                case: Case::Private,
+                transport: Transport::Tcp,
+                identity: [101; 32],
+            }),
+            Fault::SubstitutedEnrolledReceiver => {
+                targets
+                    .iter_mut()
+                    .find(|target| target.identity == [100; 32])
+                    .unwrap()
+                    .identity = [101; 32];
+            }
+            _ => {}
+        }
+        Ok(targets)
+    }
+
+    fn prelaunch(
         &mut self,
         boot: &trial::CheckedBoot<'_>,
         _: u64,
@@ -249,6 +352,33 @@ impl<'a> trial::Host for Host<'a> {
         Ok(peer(ticket.phase, self.fault))
     }
 
+    fn cont(&mut self, peer_id: trial::PeerId, _: u64, _: &Shutdown) -> Result<(), NativeRefusal> {
+        let mut trace = self.trace.borrow_mut();
+        let phase = *trace.launched.last().unwrap();
+        assert_eq!(peer(phase, self.fault), peer_id);
+        trace.continued.push(phase);
+        Ok(())
+    }
+
+    fn listener(
+        &mut self,
+        peer: trial::PeerId,
+        port: u16,
+        _: u64,
+    ) -> Result<Listener, NativeRefusal> {
+        let mut trace = self.trace.borrow_mut();
+        assert_eq!(trace.continued.last(), Some(&trial::Phase::Endpoint));
+        trace.listener_checks += 1;
+        // Model a foreign listener that replaces the original during HTTPS.
+        match self.fault {
+            Fault::ForeignListener if trace.listener_checks == 2 => {
+                Ok(Listener::fixture(port, peer.pid + 1))
+            }
+            Fault::MissingListener => Err(NativeRefusal::GuestEndpointUnverified),
+            _ => Ok(Listener::fixture(port, peer.pid)),
+        }
+    }
+
     fn drain(
         &mut self,
         ticket: trial::Ticket,
@@ -268,8 +398,8 @@ impl<'a> trial::Host for Host<'a> {
             empty_job: true,
             workers_joined: true,
             writers_excluded: true,
-            clean_guest_shutdown: self.fault != Fault::Dirty
-                || ticket.phase != trial::Phase::Install,
+            clean_guest_shutdown: self.trace.borrow().continued.contains(&ticket.phase)
+                && (self.fault != Fault::Dirty || ticket.phase != trial::Phase::Install),
         })
     }
 
@@ -389,35 +519,112 @@ impl trial::Guest for Guest {
     }
 }
 
-struct Capture {
+struct Capture<'a> {
     fault: Fault,
     profile: Hash,
-    policy: Hash,
-    topology: Hash,
+    trace: &'a RefCell<Trace>,
 }
 
-impl trial::Capture for Capture {
+impl trial::Capture for Capture<'_> {
     fn fixture(
         &mut self,
         peer: trial::PeerId,
-        mut challenge: Challenge,
-        _: u64,
-    ) -> Result<trial::FixtureProof, NativeRefusal> {
-        if self.fault == Fault::WrongFixture {
-            challenge.nonce[0] ^= 1;
+        ticket: trial::Ticket,
+        targets: &[Target],
+        window: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>, NativeRefusal> {
+        assert_eq!(self.trace.borrow().continued.last(), Some(&ticket.phase));
+        let mut before = witness::ObservedRoute::from(fixture_route());
+        let mut after = before;
+        if self.fault != Fault::NoRouteChange {
+            after.interface_luid += 1;
         }
-        Ok(trial::FixtureProof {
-            peer,
-            challenge,
-            receiver_digest: [33; 32],
-            policy: self.policy,
-            topology: self.topology,
-            receiver_controls: self.fault != Fault::MissingControls,
-            public_tcp_udp: true,
-            nonpublic_denied: true,
-            ipv6_icmp_denied: true,
-            route_drift_denied: true,
-        })
+        if self.fault == Fault::WrongDriftBaseline {
+            before.interface_luid += 2;
+        }
+        let mut capture = Receivers {
+            run: ticket.scope.run,
+            boot: peer.boot,
+            generation: ticket.challenge.generation,
+            nonce: ticket.challenge.nonce,
+            route_change: RouteChange {
+                at_ms: window.start + 3,
+                before,
+                after,
+            },
+            observations: targets
+                .iter()
+                .enumerate()
+                .map(|(index, target)| Counts {
+                    target: target.clone(),
+                    before_ms: window.start + 1,
+                    between_ms: [window.start + 5, window.start + 7],
+                    after_ms: window.start + 8,
+                    before: 1,
+                    attempts: 1,
+                    arrivals: target.case.expected_arrivals(),
+                    after: 1,
+                    drift: (target.case == Case::RouteDrift)
+                        .then(|| {
+                            let flow = if self.fault == Fault::ReusedDriftFlow {
+                                [201; 16]
+                            } else {
+                                [index as u8 + 1; 16]
+                            };
+                            let stamp = |offset| FlowEvent {
+                                flow,
+                                at_ms: window.start + offset,
+                            };
+                            let mut closed = stamp(4);
+                            let mut refused = stamp(6);
+                            if self.fault == Fault::ForeignClosedFlow {
+                                closed.flow[0] ^= 1;
+                            }
+                            if self.fault == Fault::ForeignRefusedFlow {
+                                refused.flow[0] ^= 1;
+                            }
+                            Drift {
+                                established: stamp(2),
+                                established_arrivals: u16::from(
+                                    self.fault != Fault::NoEstablishedArrivals,
+                                ),
+                                closed,
+                                refused,
+                            }
+                        })
+                        .filter(|_| self.fault != Fault::MissingDriftEvents),
+                })
+                .collect(),
+        };
+        let denied = capture
+            .observations
+            .iter_mut()
+            .find(|counts| counts.target.case == Case::Host)
+            .unwrap();
+        match self.fault {
+            Fault::WrongFixture => capture.nonce[0] ^= 1,
+            Fault::WrongReceiverBoot => capture.boot[0] ^= 1,
+            Fault::WrongReceiverGeneration => capture.generation += 1,
+            Fault::MissingReceiver => {
+                capture.observations.pop();
+            }
+            Fault::MalformedReceiver => return Ok(b"{".to_vec()),
+            Fault::WrongReceiverTarget => denied.target.identity[0] ^= 1,
+            Fault::MissingBeforeControl => denied.before = 0,
+            Fault::MissingAfterControl => denied.after = 0,
+            Fault::ForbiddenArrival => denied.arrivals = 1,
+            Fault::NoAttempt => denied.attempts = 0,
+            Fault::ReplayedReceiverWindow => denied.before_ms = window.start - 1,
+            _ => {}
+        }
+        let json = serde_json::to_string(&capture).unwrap();
+        if self.fault == Fault::FixtureBoundStockRow {
+            assert!(json.contains(r#""case":"Host""#));
+            return Ok(json
+                .replacen(r#""case":"Host""#, r#""case":"StockTest""#, 1)
+                .into_bytes());
+        }
+        Ok(json.into_bytes())
     }
 
     fn origin(
@@ -427,9 +634,18 @@ impl trial::Capture for Capture {
         port: u16,
         _: u64,
     ) -> Result<trial::OriginProof, NativeRefusal> {
+        assert_eq!(self.trace.borrow().listener_checks, 1);
+        let mut observed = peer;
+        let mut binding = challenge;
+        if self.fault == Fault::WrongOriginBoot {
+            observed.boot[0] ^= 1;
+        }
+        if self.fault == Fault::WrongOriginGeneration {
+            binding.generation += 1;
+        }
         Ok(trial::OriginProof {
-            peer,
-            challenge,
+            peer: observed,
+            challenge: binding,
             port: if self.fault == Fault::WrongOrigin {
                 port ^ 1
             } else {
@@ -444,6 +660,28 @@ impl trial::Capture for Capture {
     }
 }
 
+fn fixture_route() -> RouteObservation {
+    RouteObservation {
+        interface_index: 1,
+        interface_luid: 2,
+        source: "192.0.2.2".parse().unwrap(),
+        gateway: "192.0.2.1".parse().unwrap(),
+        default_route: true,
+    }
+}
+
+fn policy_bytes() -> Vec<u8> {
+    let body = concat!(
+        "version=1\ninterface_index=1\ninterface_luid=2\n",
+        "source=192.0.2.2\ngateway=192.0.2.1\n",
+    );
+    format!(
+        "{body}fingerprint={}\n",
+        hex::encode(digest(body.as_bytes()))
+    )
+    .into_bytes()
+}
+
 fn collect(fault: Fault) {
     use ArtifactRole::*;
     use trial::Phase::*;
@@ -454,6 +692,11 @@ fn collect(fault: Fault) {
     let volume = pin.identity.volume;
     let custody = trial::Custody::claim(pin, &evidence, sid(&owner)).unwrap();
     let (mut dependencies, baseline, _) = docker_fixture(&evidence);
+    dependencies.policy = digest(&policy_bytes());
+    let manifest = serde_json::to_vec(&witness::fixture_targets()).unwrap();
+    let receiver_enrollment =
+        ReceiverEnrollment::from_manifest(&manifest, [[51; 32], [52; 32], [53; 32]]).unwrap();
+    dependencies.network_fixture = receiver_enrollment.fixture();
     let firmware_bytes = b"reviewed firmware fixture";
     let inventory = inventory::tests::Fixture::with_payloads(&[
         (
@@ -651,12 +894,12 @@ fn collect(fault: Fault) {
         capture: Capture {
             fault,
             profile: dependencies.origin_profile,
-            policy: dependencies.policy,
-            topology: dependencies.topology,
+            trace: &trace,
         },
         packages: PACKAGES,
         dependencies: dependencies.clone(),
         stock: stock_inputs,
+        receiver_enrollment,
         custody,
         evidence: &evidence,
         cancel: &Shutdown::default(),
@@ -668,6 +911,22 @@ fn collect(fault: Fault) {
     FAULT.set(None);
     let trace = trace.into_inner();
     assert_eq!(trace.staged, trace.drained);
+    let pre_cont_refusal = matches!(
+        fault,
+        Fault::MissingRoute
+            | Fault::ForeignRoute
+            | Fault::MalformedPolicy
+            | Fault::ChangedRoute
+            | Fault::ChangedTopology
+            | Fault::ReplacedPolicy
+    );
+    let inventory_refusal = matches!(
+        fault,
+        Fault::OmittedEnrolledReceiver
+            | Fault::ExtraEnrolledReceiver
+            | Fault::SubstitutedEnrolledReceiver
+            | Fault::MissingReceiverTransport
+    );
     let unresolved = matches!(
         fault,
         Fault::Stage
@@ -678,7 +937,8 @@ fn collect(fault: Fault) {
             | Fault::LateDrain
             | Fault::WrongStockExecutable
             | Fault::WrongStockFirmware
-    );
+    ) || pre_cont_refusal
+        || inventory_refusal;
     let retained = unresolved
         || matches!(
             fault,
@@ -705,6 +965,8 @@ fn collect(fault: Fault) {
     if fault == Fault::None {
         assert_eq!(result, Ok(trial::Outcome::Complete));
         assert_eq!(trace.launched, phases);
+        assert_eq!(trace.continued, phases);
+        assert_eq!(trace.listener_checks, 2);
         let seal = read(&output, COMPLETE);
         let selection = records::DockerSelection {
             seal_sha256: records::digest(&seal),
@@ -747,6 +1009,14 @@ fn collect(fault: Fault) {
         Fault::Stage | Fault::Scope | Fault::WrongStockExecutable
     ) {
         assert_eq!(trace.launched, [PublicFixture]);
+    }
+    if inventory_refusal {
+        assert!(trace.launched.is_empty());
+        assert!(trace.continued.is_empty());
+    }
+    if pre_cont_refusal {
+        assert_eq!(trace.launched, [PublicFixture]);
+        assert!(trace.continued.is_empty());
     }
     if matches!(fault, Fault::Dirty | Fault::WrongStockFirmware) {
         assert_eq!(trace.launched, [PublicFixture, Install]);
@@ -799,8 +1069,87 @@ fn docker_collector_retains_staged_crashes_and_refuses_bad_proofs() {
         Fault::WrongOrigin,
         Fault::WrongTrustProfile,
         Fault::WrongFixture,
-        Fault::MissingControls,
         Fault::ReplayedBoot,
+    ] {
+        collect(fault);
+    }
+}
+
+#[test]
+fn docker_collector_refuses_silence_without_before_control() {
+    collect(Fault::MissingBeforeControl);
+}
+
+#[test]
+fn docker_collector_refuses_silence_without_after_control() {
+    collect(Fault::MissingAfterControl);
+}
+
+#[test]
+fn docker_collector_refuses_omitted_or_extra_enrolled_receivers() {
+    collect(Fault::OmittedEnrolledReceiver);
+    collect(Fault::ExtraEnrolledReceiver);
+}
+
+#[test]
+fn docker_collector_refuses_substituted_enrolled_receiver() {
+    collect(Fault::SubstitutedEnrolledReceiver);
+}
+
+#[test]
+fn docker_collector_refuses_route_drift_silence_without_change() {
+    collect(Fault::NoRouteChange);
+}
+
+#[test]
+fn docker_collector_refuses_unbound_route_drift_events() {
+    for fault in [
+        Fault::MissingDriftEvents,
+        Fault::ForeignClosedFlow,
+        Fault::NoEstablishedArrivals,
+        Fault::ForeignRefusedFlow,
+        Fault::ReusedDriftFlow,
+        Fault::WrongDriftBaseline,
+    ] {
+        collect(fault);
+    }
+}
+
+#[test]
+fn docker_collector_refuses_stock_row_on_patched_boot() {
+    collect(Fault::FixtureBoundStockRow);
+}
+
+#[test]
+fn docker_collector_rechecks_live_policy_route_before_cont() {
+    collect(Fault::ChangedRoute);
+}
+
+#[test]
+fn docker_collector_refuses_foreign_listener_after_https() {
+    collect(Fault::ForeignListener);
+}
+
+#[test]
+fn docker_collector_refuses_missing_foreign_and_malformed_witnesses() {
+    for fault in [
+        Fault::WrongReceiverBoot,
+        Fault::WrongReceiverGeneration,
+        Fault::MissingReceiver,
+        Fault::MissingReceiverTransport,
+        Fault::MalformedReceiver,
+        Fault::WrongReceiverTarget,
+        Fault::ForbiddenArrival,
+        Fault::NoAttempt,
+        Fault::ReplayedReceiverWindow,
+        Fault::MissingRoute,
+        Fault::ForeignRoute,
+        Fault::MalformedPolicy,
+        Fault::ChangedTopology,
+        Fault::ReplacedPolicy,
+        Fault::MissingListener,
+        Fault::WrongOriginBoot,
+        Fault::WrongOriginGeneration,
     ] {
         collect(fault);
     }
