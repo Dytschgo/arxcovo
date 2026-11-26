@@ -516,8 +516,8 @@ fn pinned_config(
 
 /// The identity of the validated VM state root, bound to its canonical name.
 ///
-/// Windows holds the root and every ancestor directory open without delete
-/// sharing, so no component of the name can be renamed, deleted or replaced
+/// Windows holds the root and every ancestor directory open without write
+/// or delete sharing, so no component of the name can be renamed, deleted or replaced
 /// while the pin lives; [`RootPin::verify`] then also compares volume and
 /// file ID from the handle with a fresh open of the name. Operators must stop
 /// the foreground before renaming or moving the root or any parent folder
@@ -1012,16 +1012,16 @@ mod enrolled_store_tests {
 mod compose_custody_tests;
 
 /// An ordinary local directory opened without following a reparse point and
-/// without delete sharing.
+/// without write or delete sharing.
 #[cfg(windows)]
 fn pin_directory(path: &Path) -> Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
     };
     Ok(std::fs::OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?)
 }

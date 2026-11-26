@@ -512,7 +512,7 @@ Use the [M4 owner-host acceptance runbook](m4-acceptance.md) after qualification
 
 `arxd --config FILE` with a `test_vms` section serves the foreground VM tools from the configured `state_dir`. That directory must be an existing, owner-private, ordinary local directory: no link or reparse point, and not inside the protected service workspace or the executable's folder.
 
-- **Windows.** From validation until the process exits, the foreground holds the state directory **and every ancestor up to the drive root** open without delete sharing. While it runs, nobody can rename, move or delete the state directory or any parent folder; Explorer and `Move-Item` fail with a sharing violation. Stop the foreground (Ctrl+C, or end the process) before you rename or move `state_dir` or a folder above it.
+- **Windows.** From validation until the process exits, the foreground holds the state directory **and every ancestor up to the drive root** open with read-only sharing. Competing write and delete opens on those directories fail with a sharing violation. Stop the foreground (Ctrl+C, or end the process) before you rename or move `state_dir` or a folder above it.
 - **macOS.** The state directory and every ancestor must have no extended ACL, because an ACL can grant another account rename or delete rights that the mode bits do not show. Check with `ls -lde PATH` and remove entries with `chmod -N PATH`, or pick a location without ACLs. Unreadable ACLs are refused too.
 - **Linux and macOS.** Every ancestor must be owned by you or root and must not be group- or other-writable, unless it is sticky (like `/tmp`) and the next entry is yours. Only your own account can then rename a component. POSIX is diagnostic-only; native VMs stay unavailable there.
 
@@ -523,6 +523,8 @@ An enrolled foreground store uses `test_vms.expected_store`. To use Compose secr
 Use ordinary local drive-letter paths for both directories. Siblings are allowed. The daemon refuses aliases, reparse points, and either root inside the other. Keep both roots owned by the current Windows login, with access grants limited to that login, SYSTEM and Administrators. The launcher checks the pair before opening the store. It reads fixed `<reference>.dpapi` files through the held secret directory and checks both bindings again before releasing plaintext for delivery.
 
 Existing Windows x64 profiles with no `expected_store` can continue to use `compose_secret_root` without an independent enrollment. To migrate one to an enrolled store, capture both identities and add both expected fields together. Store-only bootstrap profiles need only `expected_store`. Omit unused fields. JSON null is invalid.
+
+DPAPI ciphertext leaves must be ordinary, uncompressed files. Before upgrading an existing profile with NTFS-compressed ciphertext, stop the foreground and run `compact /u "<ciphertext-file-path>"` on each affected `.dpapi` leaf as its owner. This removes NTFS compression while preserving the ciphertext bytes, filename and enrolled reference. Disable inherited compression on the secret directory before provisioning new ciphertext files.
 
 ## Owner actions (historical; superseded on this PC by the 2026-11-23 update above)
 

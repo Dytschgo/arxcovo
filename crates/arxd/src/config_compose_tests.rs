@@ -128,6 +128,53 @@ fn release_count(root: &Path) -> i64 {
 }
 
 #[test]
+fn held_roots_and_ancestors_deny_competing_directory_writes() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::{
+        Foundation::ERROR_SHARING_VIOLATION,
+        Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        },
+    };
+
+    let roots = Roots::new();
+    let writer = |path: &Path| {
+        fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    };
+    let assert_write_denied = |path: &Path| {
+        assert_eq!(
+            writer(path).unwrap_err().raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION as i32)
+        );
+    };
+    let parent = roots.state.parent().unwrap();
+    let paths = [roots.state.as_path(), roots.secrets.as_path(), parent];
+    for path in paths {
+        drop(writer(path).expect("disposable directory supports a write open"));
+    }
+
+    // Verify both the absolute anchoring open and the production relative walk.
+    let anchor = pin_directory(parent).unwrap();
+    assert_write_denied(parent);
+    drop(anchor);
+
+    let vm = roots.load(&roots.profile()).unwrap();
+    for path in paths {
+        assert_write_denied(path);
+    }
+    fs::write(roots.state.join("new-child"), b"fixture").unwrap();
+    vm.custody.verify().unwrap();
+    drop(vm);
+    for path in paths {
+        drop(writer(path).expect("write open succeeds after custody ends"));
+    }
+}
+
+#[test]
 fn opens_enrolled_store_and_dpapi_and_enrolls_release_there() {
     let roots = Roots::new();
     let canary = protect(0);

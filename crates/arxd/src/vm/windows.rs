@@ -261,7 +261,7 @@ enum Node {
 }
 
 pub(crate) fn hold_child_directory(parent: &File, name: &str) -> io::Result<File> {
-    open_relative(parent, name, Node::Directory, true, false)
+    open_relative(parent, name, Node::Directory, false, false)
 }
 
 pub(crate) fn read_private_child(parent: &File, name: &str, volume: u64) -> io::Result<File> {
