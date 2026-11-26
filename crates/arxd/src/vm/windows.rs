@@ -308,6 +308,26 @@ fn open_relative(
     )
 }
 
+/// Exclusive no-follow delete open of one name relative to a held, checked
+/// parent directory. Unlike `open_relative` (which pins objects without
+/// `FILE_SHARE_DELETE`), this helper requests read and delete access with
+/// `share = 0`, excluding any existing or competing reader, writer or deleter
+/// through identity verification, durable intent commit and `delete_on_close`.
+fn open_relative_delete(parent: &File, name: &str, node: Node) -> io::Result<File> {
+    let kind = match node {
+        Node::Directory => FILE_DIRECTORY_FILE,
+        Node::File => FILE_NON_DIRECTORY_FILE,
+    };
+    nt_open_relative(
+        parent,
+        name,
+        FILE_GENERIC_READ | READ_CONTROL | DELETE,
+        0,
+        FILE_OPEN,
+        kind,
+    )
+}
+
 /// Attribute-only, no-follow open of one name of either kind. It requests
 /// no data access, so it neither conflicts with nor grants a sharing mode.
 /// Callers use it only to classify presence and never to adopt the object.

@@ -1860,6 +1860,7 @@ pub(crate) fn publish_build(
             request.digest, request.principal, request.key.key, peak],
     )? == 1, "invalid build publication binding");
     // The caller has proved release and removed the transient files.
+    native::disposal::forget_disposed_seed(db, slots)?;
     ensure!(db.execute(
         "DELETE FROM vm_artifacts WHERE generation_id=?1 AND role='seed' AND object_key=?2 AND state='identified'",
         params![slots.pair.disk.generation, slots.seed.key],
@@ -1910,6 +1911,7 @@ fn activate(db: &Connection, pair: PairSlots, state: &str) -> Result<()> {
 }
 
 fn forget_generation(db: &Connection, generation: Id) -> Result<()> {
+    native::disposal::forget_disposed(db, generation)?;
     db.execute(
         "DELETE FROM vm_artifacts WHERE generation_id=?1",
         [generation],
@@ -2695,7 +2697,8 @@ pub(crate) fn settle_cleanup(
     let confirmed = outcome.released
         && outcome.disposed
         && current.accounted
-        && current.artifacts == work.artifacts;
+        && current.artifacts == work.artifacts
+        && native::disposal::work_disposed(db, &current)?;
     if let Some(vm) = work.kind.vm() {
         interrupt_pending(db, vm, now, confirmed)?;
     }

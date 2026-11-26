@@ -1077,6 +1077,7 @@ impl FinalizedPair {
 }
 
 mod custody;
+mod disposal;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use custody::LedgerCheckpoints;
 use custody::check_helper_target;
@@ -1085,6 +1086,11 @@ use custody::reserve_workspace_under;
 pub(crate) use custody::{CustodyCheckpoints, HelperTarget};
 #[cfg(test)]
 pub(super) use custody::{WRITE_FAULT, WriteFault};
+#[allow(
+    unused_imports,
+    reason = "consumed by the 7c foreground issuer and reaper"
+)]
+pub(crate) use disposal::{DisposalCheckpoints, GenerationGuards, LedgerDisposal, NativeDisposal};
 
 #[cfg(test)]
 pub(super) mod tests;
