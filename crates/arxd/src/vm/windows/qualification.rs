@@ -1672,14 +1672,14 @@ fn listing_bounded_with(
                 capacity as u32,
             )
         };
-        // Check the deadline immediately after the synchronous Win32 call so a
-        // read that crosses the cutoff cannot resolve as a terminal inventory
-        // result (`LimitExceeded` or truncated/complete entry set).
+        let os_error = (ok == 0).then(io::Error::last_os_error);
+        // Check the deadline after capturing the Win32 status so `now()`
+        // cannot clobber `GetLastError` and a read that crosses the cutoff
+        // cannot resolve as a terminal inventory result.
         if deadline.is_some_and(|until| now() >= until) {
             return Err(ListingError::TimedOut);
         }
-        if ok == 0 {
-            let error = io::Error::last_os_error();
+        if let Some(error) = os_error {
             if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
                 return Ok(found);
             }

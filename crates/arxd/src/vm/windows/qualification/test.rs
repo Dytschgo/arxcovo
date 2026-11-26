@@ -966,21 +966,24 @@ mod tests {
         assert_eq!(scope.validate_foreground_with(&names, &store_a), Ok(()));
 
         // Scope::validate_foreground_with: a different GUID alias resolving to
-        // the same root identity refuses as Indeterminate and keeps the epoch.
+        // the same safe root identity passes consecutive refreshes on the same
+        // epoch while the alternate alias persists.
         let (alias_epoch, sample) = open_test_epoch();
         names.guid.set(Some(OTHER_VOLUME));
         names.root.set(Some(same_root));
-        assert_eq!(
-            alias_epoch.refresh(
-                || {
-                    scope.validate_foreground_with(&names, &store_a)?;
-                    Ok(sample)
-                },
-                || sample.captured,
-            ),
-            Err(Invalidation::Indeterminate(CUSTODY))
-        );
-        assert!(!alias_epoch.effects_revoked());
+        for _ in 0..2 {
+            assert_eq!(
+                alias_epoch.refresh(
+                    || {
+                        scope.validate_foreground_with(&names, &store_a)?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                ),
+                Ok(sample.captured)
+            );
+            assert!(!alias_epoch.effects_revoked());
+        }
         names.guid.set(None);
         names.root.set(None);
         assert!(

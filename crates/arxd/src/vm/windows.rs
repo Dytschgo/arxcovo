@@ -5807,6 +5807,27 @@ mod tests {
             mask: FILE_ALL_ACCESS,
         }];
         assert!(!unsafe { vm_acl::matches_typed(null(), &expected_acl) }.unwrap());
+        // A malformed ACL whose AceCount exceeds its AclSize makes Win32 GetAce
+        // fail cleanly with an OS error, which must propagate as Err (I/O /
+        // Indeterminate) rather than Ok(false) (Mismatch / Confirmed).
+        let mut malformed = ACL {
+            AclRevision: ACL_REVISION as u8,
+            Sbz1: 0,
+            AclSize: size_of::<ACL>() as u16,
+            AceCount: 0,
+            Sbz2: 0,
+        };
+        assert_ne!(
+            unsafe { InitializeAcl(&mut malformed, size_of::<ACL>() as u32, ACL_REVISION,) },
+            0
+        );
+        malformed.AceCount = 1;
+        let ace_err = unsafe { vm_acl::matches_typed(&malformed, &expected_acl) }
+            .expect_err("GetAce must fail when AceCount exceeds AclSize");
+        assert_eq!(
+            TokenCheckError::Io(ace_err).into_invalidation(),
+            Invalidation::Indeterminate(NativeRefusal::IdentityUnverified)
+        );
     }
 
     #[test]

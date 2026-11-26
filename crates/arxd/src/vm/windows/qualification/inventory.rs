@@ -56,17 +56,18 @@ impl Bundle {
             .collect::<BTreeSet<_>>();
         for (parent, dir) in entries {
             timely_at(deadline, now)?;
-            file_identity_typed(dir, true)
-                .map_err(|error| CustodyCheckError::from(error).into_invalidation(REFUSAL))?;
+            let dir_identity = file_identity_typed(dir, true);
             timely_at(deadline, now)?;
-            let listed = listing_bounded_with(dir, files.len() + dirs.len(), Some(deadline), now)
-                .map_err(|error| match error {
+            dir_identity
+                .map_err(|error| CustodyCheckError::from(error).into_invalidation(REFUSAL))?;
+            let listed = listing_bounded_with(dir, files.len() + dirs.len(), Some(deadline), now);
+            timely_at(deadline, now)?;
+            let listed = listed.map_err(|error| match error {
                 ListingError::LimitExceeded => Invalidation::Confirmed(REFUSAL),
                 ListingError::TimedOut | ListingError::Io(_) => {
                     Invalidation::Indeterminate(REFUSAL)
                 }
             })?;
-            timely_at(deadline, now)?;
             for (name, attributes) in listed {
                 timely_at(deadline, now)?;
                 let path = if parent.is_empty() {
@@ -89,14 +90,16 @@ impl Bundle {
                         return Err(Invalidation::Confirmed(REFUSAL));
                     }
                     let (file, size) = &self.files[&path];
-                    file_identity_typed(file, false).map_err(|error| {
+                    let file_id = file_identity_typed(file, false);
+                    timely_at(deadline, now)?;
+                    file_id.map_err(|error| {
                         CustodyCheckError::from(error).into_invalidation(REFUSAL)
                     })?;
-                    let actual_size = file
-                        .metadata()
+                    let meta = file.metadata();
+                    timely_at(deadline, now)?;
+                    let actual_size = meta
                         .map_err(|_| Invalidation::Indeterminate(REFUSAL))?
                         .len();
-                    timely_at(deadline, now)?;
                     if actual_size != *size {
                         return Err(Invalidation::Confirmed(REFUSAL));
                     }
@@ -1110,6 +1113,30 @@ pub(super) mod tests {
         );
         assert_eq!(crossed, Err(Invalidation::Indeterminate(REFUSAL)));
         assert!(!timeout_epoch.effects_revoked());
+
+        // Even an observed `Unsafe` handle state (a file where a directory is
+        // expected) must resolve as Indeterminate rather than Confirmed if the
+        // deadline elapsed before classifying the handle result.
+        let clean_fixture = Fixture::new();
+        let mut wrong_dir_bundle = clean_fixture
+            .inspect(Instant::now() + INVENTORY_TIME)
+            .unwrap();
+        wrong_dir_bundle.root.leaf =
+            File::open(clean_fixture.root.path().join("RECEIPT.txt")).unwrap();
+        let mut unsafe_ticks = 0usize;
+        let mut late_unsafe_clock = || {
+            unsafe_ticks += 1;
+            if unsafe_ticks >= 2 { deadline } else { base }
+        };
+        assert_eq!(
+            wrong_dir_bundle.check_typed_with(deadline, &mut late_unsafe_clock),
+            Err(Invalidation::Indeterminate(REFUSAL))
+        );
+        // Before the deadline, the same unsafe handle state is Confirmed.
+        assert_eq!(
+            wrong_dir_bundle.check_typed_with(deadline, &mut || base),
+            Err(Invalidation::Confirmed(REFUSAL))
+        );
 
         // Observed-then-reverted extra file in the bundle directory latches Confirmed.
         let (drift_epoch, sample) = open_test_epoch();

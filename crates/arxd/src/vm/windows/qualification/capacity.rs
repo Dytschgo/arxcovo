@@ -274,18 +274,22 @@ pub(super) fn walk(
 }
 
 /// The drive letter still names the anchored volume and its root object.
-/// Checked after the observations: a rebinding during them closes the run.
+/// Checked after enrollment and capacity observations that derive GUID-form
+/// query paths from `volume.guid`: a rebinding during them closes the run.
 pub(super) fn still_bound(names: &impl VolumeNames, volume: &AnchoredVolume) -> bool {
-    check_still_bound(names, volume).is_ok()
+    names
+        .drive_guid(&volume.drive)
+        .is_some_and(|guid| guid.eq_ignore_ascii_case(&volume.guid))
+        && check_still_bound(names, volume).is_ok()
 }
 
 /// Typed volume-binding check for the selection epoch. Windows may return a
-/// different `\\?\Volume{GUID}\` alias for the same volume, so the returned
-/// path is always opened and compared by resolved root identity (`FileIdentity`)
-/// before confirming drift. A genuinely different root identity (or unsafe root
-/// state) is `Mismatch` (`Confirmed`); an unreadable query or a different GUID
-/// alias that still resolves to the same root identity is `Unavailable`
-/// (`Indeterminate`), refusing the current effect without revoking the epoch.
+/// different `\\?\Volume{GUID}\` alias for the same volume, so the GUID path
+/// is used only to locate and open the volume root; the resolved `FileIdentity`
+/// is authoritative. Same safe root identity passes (`Ok(())`); a genuinely
+/// different root identity or unsafe root state is `Mismatch` (`Confirmed`);
+/// an unreadable mount-manager or directory query is `Unavailable`
+/// (`Indeterminate`).
 pub(super) fn check_still_bound(
     names: &impl VolumeNames,
     volume: &AnchoredVolume,
@@ -301,11 +305,6 @@ pub(super) fn check_still_bound(
         .map_err(CustodyCheckError::from)?;
     if identity != volume.identity {
         return Err(CustodyCheckError::Mismatch);
-    }
-    if !guid.eq_ignore_ascii_case(&volume.guid) {
-        return Err(CustodyCheckError::Unavailable(io::Error::other(
-            "volume GUID alias differs for same root",
-        )));
     }
     Ok(())
 }
@@ -850,22 +849,26 @@ mod tests {
         );
 
         // Same volume with two different GUID path strings: resolves to the
-        // same root identity, so it refuses as Indeterminate (NOT Confirmed),
-        // does not revoke the epoch, and the epoch stays usable.
+        // same safe root identity, so `check_still_bound` passes and
+        // consecutive refreshes succeed while the alternate alias persists.
+        // Legacy name-based `still_bound` keeps its exact-GUID enrollment gate.
         let (alias_epoch, sample) = open_test_epoch();
         names.response.set(Some(OTHER));
         names.root.set(RootReply::Identity(volume.identity));
         assert!(!still_bound(&names, &volume));
-        let alias_result = alias_epoch.refresh(
-            || {
-                check_still_bound(&names, &volume)
-                    .map_err(|error| error.into_invalidation(CUSTODY))?;
-                Ok(sample)
-            },
-            || sample.captured,
-        );
-        assert_eq!(alias_result, Err(Invalidation::Indeterminate(CUSTODY)));
-        assert!(!alias_epoch.effects_revoked());
+        assert!(check_still_bound(&names, &volume).is_ok());
+        for _ in 0..2 {
+            let alias_result = alias_epoch.refresh(
+                || {
+                    check_still_bound(&names, &volume)
+                        .map_err(|error| error.into_invalidation(CUSTODY))?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            );
+            assert_eq!(alias_result, Ok(sample.captured));
+            assert!(!alias_epoch.effects_revoked());
+        }
         names.response.set(None);
         names.root.set(RootReply::Real);
         assert!(
