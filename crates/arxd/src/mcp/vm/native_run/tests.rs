@@ -525,6 +525,179 @@ async fn start_behind_a_held_registration_is_busy_without_a_durable_write() {
     let _ = h.shutdown().await;
 }
 
+fn cleanup_id(h: &Harness, vm: Id) -> Option<i64> {
+    h.supervisor()
+        .controller
+        .native_store()
+        .transact(|db| {
+            Ok(db.query_row(
+                "SELECT cleanup_id FROM vm_instances WHERE id=?1",
+                [vm],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+fn operation_status(h: &Harness, operation: Id) -> i64 {
+    h.supervisor()
+        .controller
+        .native_store()
+        .transact(|db| {
+            Ok(db.query_row(
+                "SELECT status FROM vm_operations WHERE operation_id=?1",
+                [operation],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn pre_entry_runtime_init_error_fences_epoch_and_releases_registration() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let (vm, _, _, scope) = bound_clone(&h, &client).await;
+    let supervisor = h.supervisor().clone();
+    let entered = Arc::new(AtomicBool::new(false));
+    let worker_entered = entered.clone();
+    let started = supervisor
+        .gate
+        .lock()
+        .unwrap()
+        .start_native_run_with(
+            &supervisor,
+            &Installation::fixture(),
+            start_request(vm, 510),
+            HOST,
+            RESOURCES,
+            || Err(std::io::Error::other("injected pre-entry error")),
+            || {},
+            move |_, _, _, _| {
+                worker_entered.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+    let epoch = parse_id(started["operation_id"].as_str().unwrap()).unwrap();
+    eventually("the run slot to be released", || {
+        supervisor
+            .native_runs
+            .with_entry(vm, |owner| owner.is_none())
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(!entered.load(Ordering::SeqCst), "work closure ran despite pre-entry init failure");
+    assert_eq!(
+        vm_state(&h, vm),
+        3,
+        "pre-entry runtime init error stranded the VM without fencing to recovery"
+    );
+    assert!(
+        cleanup_id(&h, vm).is_some(),
+        "pre-entry runtime init error left no recovery cleanup claim"
+    );
+    assert_eq!(
+        operation_status(&h, epoch),
+        Status::Interrupted.code(),
+        "pre-entry runtime init error left the start operation pending"
+    );
+    assert_eq!(unresolved_epoch(&h, vm), Some((scope.generation, epoch)));
+    assert_admission_closed(&h);
+    drop((supervisor, client));
+    let _ = h.shutdown().await;
+}
+
+#[tokio::test]
+async fn enqueue_refusal_with_transient_fence_failure_establishes_recovery_claim_promptly() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let (vm, _, _, scope) = bound_clone(&h, &client).await;
+    let supervisor = h.supervisor().clone();
+    let fault_supervisor = supervisor.clone();
+    let refused = supervisor.gate.lock().unwrap().start_native_run_with(
+        &supervisor,
+        &Installation::fixture(),
+        start_request(vm, 511),
+        HOST,
+        RESOURCES,
+        || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+        },
+        move || {
+            fault_supervisor
+                .controller
+                .native_store()
+                .transact(|db| {
+                    db.execute_batch(
+                        "CREATE TRIGGER fail_pre_entry_fence BEFORE UPDATE OF state ON vm_instances
+                         WHEN NEW.state=3
+                         BEGIN SELECT RAISE(ABORT,'injected transient fence failure'); END;",
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            fault_supervisor.fence();
+        },
+        |_, _, _, _| panic!("a refused start reached its worker"),
+    );
+    assert_eq!(refused.unwrap_err().0, "shutdown");
+    assert!(
+        supervisor
+            .native_runs
+            .with_entry(vm, |owner| owner.is_none())
+            .unwrap(),
+        "enqueue refusal leaked its run registration"
+    );
+    let Some((generation, epoch)) = unresolved_epoch(&h, vm) else {
+        panic!("expected committed unresolved start epoch after post-admit refusal");
+    };
+    assert_eq!(generation, scope.generation);
+    assert_eq!(vm_state(&h, vm), 1, "immediate fence trigger did not block the first fence attempt");
+    assert_eq!(cleanup_id(&h, vm), None);
+    assert_eq!(operation_status(&h, epoch), Status::Pending.code());
+
+    // Clear the transient fence write failure; the prompt bounded retry must
+    // establish the recovery fence and claim without waiting for restart/expiry.
+    supervisor
+        .controller
+        .native_store()
+        .transact(|db| {
+            db.execute_batch("DROP TRIGGER fail_pre_entry_fence")?;
+            Ok(())
+        })
+        .unwrap();
+    let fenced = tokio::time::timeout(Duration::from_secs(2), async {
+        while vm_state(&h, vm) != 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        fenced.is_ok(),
+        "bounded recovery retry failed to fence the epoch after transient write failure cleared"
+    );
+    assert_eq!(vm_state(&h, vm), 3);
+    assert!(cleanup_id(&h, vm).is_some(), "recovery retry left no cleanup claim");
+    assert_eq!(
+        operation_status(&h, epoch),
+        Status::Interrupted.code(),
+        "recovery retry left the start operation pending"
+    );
+    assert_eq!(unresolved_epoch(&h, vm), Some((scope.generation, epoch)));
+    assert!(
+        supervisor
+            .native_runs
+            .with_entry(vm, |owner| owner.is_none())
+            .unwrap()
+    );
+    assert_admission_closed(&h);
+    drop((supervisor, client));
+    let _ = h.shutdown().await;
+}
+
 #[tokio::test]
 async fn reaper_wakes_a_live_owner_and_recovers_only_without_one() {
     let mut h = windows_harness().await;

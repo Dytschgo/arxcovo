@@ -26,6 +26,10 @@ const OBSERVE: Duration = Duration::from_secs(20);
 /// Short backoff while a concurrent dispatch, such as a `vm_get` poll, holds
 /// the foreground gate at the moment a validated boot is ready to commit.
 const GATE_RETRY: Duration = Duration::from_millis(10);
+/// Prompt bounded retry for establishing a recovery fence after a post-commit
+/// pre-entry failure when the immediate store write fails transiently.
+const FENCE_RETRY_DELAY: Duration = Duration::from_millis(20);
+const FENCE_RETRY_WINDOW: Duration = Duration::from_secs(3);
 
 pub(super) struct Run {
     principal: String,
@@ -279,6 +283,35 @@ impl Gate {
         resources: Resources,
         work: impl FnOnce(&Supervisor, &Runtime, &Run, Start) -> anyhow::Result<()> + Send + 'static,
     ) -> Outcome<Value> {
+        self.start_native_run_with(
+            supervisor,
+            installation,
+            request,
+            host,
+            resources,
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+            },
+            #[cfg(test)]
+            || {},
+            work,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn start_native_run_with(
+        &mut self,
+        supervisor: &Arc<Supervisor>,
+        installation: &Installation,
+        request: Request<'_>,
+        host: HostObservation,
+        resources: Resources,
+        initialize: fn() -> std::io::Result<Runtime>,
+        #[cfg(test)] after_admit: impl FnOnce(),
+        work: impl FnOnce(&Supervisor, &Runtime, &Run, Start) -> anyhow::Result<()> + Send + 'static,
+    ) -> Outcome<Value> {
         if self.closed || supervisor.fenced.load(Ordering::SeqCst) {
             return Err(SHUTDOWN);
         }
@@ -306,39 +339,66 @@ impl Gate {
             epoch,
         };
         let owner = Arc::new(Run::new(request.principal, target));
+        #[cfg(test)]
+        after_admit();
         let task = owner.clone();
+        let cleanup_owner = owner.clone();
         let enqueued = slot.install(owner.clone()).and_then(|()| {
-            self.enqueue_test_worker(
+            self.enqueue_test_worker_with_cleanup(
                 supervisor,
                 slot,
-                || {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
+                initialize,
+                move |supervisor| {
+                    cleanup_owner.withdraw();
+                    fence_blocking(supervisor, cleanup_owner.target);
                 },
-                move |supervisor, runtime| match work(
-                    supervisor,
-                    runtime,
-                    &task,
-                    Start { worker, active },
-                ) {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        task.withdraw();
-                        supervisor.controller.fence_native_run(task.target)?;
-                        Err(error)
-                    }
+                move |supervisor, runtime| {
+                    work(supervisor, runtime, &task, Start { worker, active })
                 },
             )
         });
         if let Err(reason) = enqueued {
             // Rollback-safe handoff: no worker owns the committed epoch, so
-            // fence it for ordinary recovery before refusing.
+            // fence it immediately or leave a prompt bounded retry to establish
+            // the recovery claim without blocking the foreground gate.
             owner.withdraw();
-            let _ = supervisor.controller.fence_native_run(target);
+            if supervisor.controller.fence_native_run(target).is_err() {
+                let supervisor = supervisor.clone();
+                self.spawn_test_recovery(async move { retry_fence(supervisor, target).await });
+            }
             return Err(reason);
         }
         Ok(receipt(epoch, None))
+    }
+}
+
+#[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
+fn fence_blocking(supervisor: &Supervisor, target: Target) {
+    let deadline = Instant::now() + FENCE_RETRY_WINDOW;
+    loop {
+        if supervisor.controller.fence_native_run(target).is_ok() {
+            return;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        std::thread::sleep(FENCE_RETRY_DELAY.min(deadline - now));
+    }
+}
+
+#[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
+async fn retry_fence(supervisor: Arc<Supervisor>, target: Target) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + FENCE_RETRY_WINDOW;
+    loop {
+        if supervisor.controller.fence_native_run(target).is_ok() {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!("TEST pre-entry recovery fence unconfirmed");
+        }
+        tokio::time::sleep(FENCE_RETRY_DELAY.min(deadline - now)).await;
     }
 }
 
