@@ -886,10 +886,13 @@ mod tests {
         const CUSTODY: NativeRefusal = NativeRefusal::PathCustodyUnverified;
         const DIST: NativeRefusal = NativeRefusal::DistributionUnverified;
         const OTHER_VOLUME: &str = r"\\?\Volume{11111111-2222-3333-4444-555555555555}\";
-        struct SwitchNames(std::cell::Cell<Option<&'static str>>);
+        struct SwitchNames {
+            guid: std::cell::Cell<Option<&'static str>>,
+            root: std::cell::Cell<Option<FileIdentity>>,
+        }
         impl capacity::VolumeNames for SwitchNames {
             fn drive_guid(&self, drive: &str) -> Option<String> {
-                match self.0.get() {
+                match self.guid.get() {
                     Some("") => None,
                     Some(other) => Some(other.to_owned()),
                     None => capacity::MountManager.drive_guid(drive),
@@ -897,6 +900,12 @@ mod tests {
             }
             fn final_guid_path(&self, file: &File) -> Option<String> {
                 capacity::MountManager.final_guid_path(file)
+            }
+            fn root_identity(&self, guid: &str) -> Result<FileIdentity, FileIdentityError> {
+                match self.root.get() {
+                    Some(id) => Ok(id),
+                    None => capacity::MountManager.root_identity(guid),
+                }
             }
         }
 
@@ -947,13 +956,50 @@ mod tests {
             host: expected_host,
             key: [0x55; 32],
         };
-        let names = SwitchNames(std::cell::Cell::new(None));
+        let same_root = scope.recipe.volume.identity;
+        let mut other_root = same_root;
+        other_root.volume ^= 0x55;
+        let names = SwitchNames {
+            guid: std::cell::Cell::new(None),
+            root: std::cell::Cell::new(None),
+        };
         assert_eq!(scope.validate_foreground_with(&names, &store_a), Ok(()));
+
+        // Scope::validate_foreground_with: a different GUID alias resolving to
+        // the same root identity refuses as Indeterminate and keeps the epoch.
+        let (alias_epoch, sample) = open_test_epoch();
+        names.guid.set(Some(OTHER_VOLUME));
+        names.root.set(Some(same_root));
+        assert_eq!(
+            alias_epoch.refresh(
+                || {
+                    scope.validate_foreground_with(&names, &store_a)?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Indeterminate(CUSTODY))
+        );
+        assert!(!alias_epoch.effects_revoked());
+        names.guid.set(None);
+        names.root.set(None);
+        assert!(
+            alias_epoch
+                .refresh(
+                    || {
+                        scope.validate_foreground_with(&names, &store_a)?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                )
+                .is_ok()
+        );
 
         // Scope::validate_foreground_with: mount-manager failure is Indeterminate
         // and keeps the epoch usable once resolved.
         let (io_epoch, sample) = open_test_epoch();
-        names.0.set(Some(""));
+        names.guid.set(Some(""));
+        names.root.set(None);
         assert_eq!(
             io_epoch.refresh(
                 || {
@@ -965,7 +1011,7 @@ mod tests {
             Err(Invalidation::Indeterminate(CUSTODY))
         );
         assert!(!io_epoch.effects_revoked());
-        names.0.set(None);
+        names.guid.set(None);
         assert!(
             io_epoch
                 .refresh(
@@ -978,10 +1024,11 @@ mod tests {
                 .is_ok()
         );
 
-        // Observed-then-reverted volume rebind in validate_foreground latches
-        // Confirmed and leaves the epoch unusable even after reverting.
+        // Observed-then-reverted volume rebind to a genuinely different volume
+        // in validate_foreground latches Confirmed and leaves the epoch unusable.
         let (drift_epoch, sample) = open_test_epoch();
-        names.0.set(Some(OTHER_VOLUME));
+        names.guid.set(Some(OTHER_VOLUME));
+        names.root.set(Some(other_root));
         assert_eq!(
             drift_epoch.refresh(
                 || {
@@ -993,7 +1040,8 @@ mod tests {
             Err(Invalidation::Confirmed(CUSTODY))
         );
         assert!(drift_epoch.effects_revoked());
-        names.0.set(None);
+        names.guid.set(None);
+        names.root.set(None);
         assert_eq!(scope.validate_foreground_with(&names, &store_a), Ok(()));
         assert_eq!(
             drift_epoch.refresh(

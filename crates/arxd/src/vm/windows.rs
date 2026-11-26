@@ -1412,8 +1412,17 @@ fn captured_groups(entries: &[SID_AND_ATTRIBUTES]) -> io::Result<Vec<(Vec<u8>, u
 
 /// The restricted child must carry exactly the captured parent groups and
 /// masks: same SIDs, same order, same attributes.
-fn groups_match(expected: &[(Vec<u8>, u32)], entries: &[SID_AND_ATTRIBUTES]) -> bool {
-    captured_groups(entries).is_ok_and(|actual| actual == expected)
+fn verify_groups_typed(
+    expected: &[(Vec<u8>, u32)],
+    entries: &[SID_AND_ATTRIBUTES],
+) -> Result<(), TokenCheckError> {
+    let actual = captured_groups(entries).map_err(TokenCheckError::Io)?;
+    if actual != expected {
+        return Err(TokenCheckError::Mismatch(
+            "VM child token groups differ from the policy",
+        ));
+    }
+    Ok(())
 }
 
 /// Typed outcome for execution-profile and token checks feeding the
@@ -1816,22 +1825,22 @@ impl VmToken {
         let observed = inspect_token_identity_typed(token, &self.account, true, self.mode, true)?;
         let groups_data = token_data(token, TokenGroups).map_err(TokenCheckError::Io)?;
         let entries = token_entries(&groups_data).map_err(TokenCheckError::Io)?;
-        let actual_groups = captured_groups(entries).map_err(TokenCheckError::Io)?;
-        if actual_groups != self.groups {
+        verify_groups_typed(&self.groups, entries)?;
+        if !observed.same_logon(&self.identity) {
             return Err(TokenCheckError::Mismatch(
-                "VM child token groups differ from the policy",
+                "VM child token differs from the qualified policy",
             ));
         }
         let data = token_data(token, TokenDefaultDacl).map_err(TokenCheckError::Io)?;
         // Both identities and the ACL remain backed by the token query allocations.
-        let matches = unsafe {
-            observed.same_logon(&self.identity)
-                && vm_acl::matches(
-                    (*data.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl,
-                    &self.entries(),
-                )
-        };
-        if !matches {
+        let acl_matches = unsafe {
+            vm_acl::matches_typed(
+                (*data.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl,
+                &self.entries(),
+            )
+        }
+        .map_err(TokenCheckError::Io)?;
+        if !acl_matches {
             return Err(TokenCheckError::Mismatch(
                 "VM child token differs from the qualified policy",
             ));
@@ -5745,7 +5754,7 @@ mod tests {
         let enabled = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
         let parent = [group(&users, enabled), group(&interactive, enabled)];
         let policy = captured_groups(&parent).unwrap();
-        assert!(groups_match(&policy, &parent));
+        assert!(verify_groups_typed(&policy, &parent).is_ok());
         for (name, child) in [
             (
                 "mask changed",
@@ -5772,8 +5781,32 @@ mod tests {
                 vec![group(&users, enabled), group(&other, enabled)],
             ),
         ] {
-            assert!(!groups_match(&policy, &child), "{name}");
+            let err = verify_groups_typed(&policy, &child).err().unwrap();
+            assert_eq!(
+                err.into_invalidation(),
+                Invalidation::Confirmed(NativeRefusal::IdentityUnverified),
+                "{name}"
+            );
         }
+        // An invalid SID entry fails decoding as I/O (Indeterminate), not Mismatch.
+        let invalid_sid = [SID_AND_ATTRIBUTES {
+            Sid: null_mut(),
+            Attributes: enabled as u32,
+        }];
+        assert_eq!(
+            verify_groups_typed(&policy, &invalid_sid)
+                .err()
+                .unwrap()
+                .into_invalidation(),
+            Invalidation::Indeterminate(NativeRefusal::IdentityUnverified)
+        );
+        // Null DACL is a measured mismatch (Ok(false)), not a GetAce error.
+        let expected_acl = [vm_acl::Entry {
+            deny: false,
+            sid: users.0,
+            mask: FILE_ALL_ACCESS,
+        }];
+        assert!(!unsafe { vm_acl::matches_typed(null(), &expected_acl) }.unwrap());
     }
 
     #[test]

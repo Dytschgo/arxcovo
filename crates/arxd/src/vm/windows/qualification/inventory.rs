@@ -31,6 +31,14 @@ impl Bundle {
     }
 
     pub(super) fn check_typed(&self, deadline: Instant) -> Result<(), Invalidation> {
+        self.check_typed_with(deadline, &mut Instant::now)
+    }
+
+    fn check_typed_with(
+        &self,
+        deadline: Instant,
+        now: &mut impl FnMut() -> Instant,
+    ) -> Result<(), Invalidation> {
         let entries = std::iter::once(("", &self.root.leaf)).chain(
             self.directories
                 .iter()
@@ -47,32 +55,37 @@ impl Bundle {
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
         for (parent, dir) in entries {
-            timely_typed(deadline)?;
+            timely_at(deadline, now)?;
             file_identity_typed(dir, true)
                 .map_err(|error| CustodyCheckError::from(error).into_invalidation(REFUSAL))?;
-            let listed = listing_bounded_typed(dir, files.len() + dirs.len(), Some(deadline))
+            timely_at(deadline, now)?;
+            let listed = listing_bounded_with(dir, files.len() + dirs.len(), Some(deadline), now)
                 .map_err(|error| match error {
-                    ListingError::LimitExceeded => Invalidation::Confirmed(REFUSAL),
-                    ListingError::TimedOut | ListingError::Io(_) => {
-                        Invalidation::Indeterminate(REFUSAL)
-                    }
-                })?;
+                ListingError::LimitExceeded => Invalidation::Confirmed(REFUSAL),
+                ListingError::TimedOut | ListingError::Io(_) => {
+                    Invalidation::Indeterminate(REFUSAL)
+                }
+            })?;
+            timely_at(deadline, now)?;
             for (name, attributes) in listed {
-                timely_typed(deadline)?;
+                timely_at(deadline, now)?;
                 let path = if parent.is_empty() {
                     name
                 } else {
                     format!("{parent}/{name}")
                 };
                 if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    timely_at(deadline, now)?;
                     return Err(Invalidation::Confirmed(REFUSAL));
                 }
                 if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
                     if !dirs.remove(path.as_str()) {
+                        timely_at(deadline, now)?;
                         return Err(Invalidation::Confirmed(REFUSAL));
                     }
                 } else {
                     if !files.remove(path.as_str()) {
+                        timely_at(deadline, now)?;
                         return Err(Invalidation::Confirmed(REFUSAL));
                     }
                     let (file, size) = &self.files[&path];
@@ -83,16 +96,18 @@ impl Bundle {
                         .metadata()
                         .map_err(|_| Invalidation::Indeterminate(REFUSAL))?
                         .len();
+                    timely_at(deadline, now)?;
                     if actual_size != *size {
                         return Err(Invalidation::Confirmed(REFUSAL));
                     }
                 }
             }
         }
+        timely_at(deadline, now)?;
         if !files.is_empty() || !dirs.is_empty() {
             return Err(Invalidation::Confirmed(REFUSAL));
         }
-        timely_typed(deadline)
+        timely_at(deadline, now)
     }
 
     pub(in crate::vm::windows) fn identity(
@@ -370,7 +385,11 @@ fn timely(deadline: Instant) -> Result<(), NativeRefusal> {
 }
 
 fn timely_typed(deadline: Instant) -> Result<(), Invalidation> {
-    (Instant::now() < deadline)
+    timely_at(deadline, &mut Instant::now)
+}
+
+fn timely_at(deadline: Instant, now: &mut impl FnMut() -> Instant) -> Result<(), Invalidation> {
+    (now() < deadline)
         .then_some(())
         .ok_or(Invalidation::Indeterminate(REFUSAL))
 }
@@ -1057,10 +1076,43 @@ pub(super) mod tests {
                 .is_ok()
         );
 
-        // Observed-then-reverted extra file in the bundle directory latches Confirmed.
-        let (drift_epoch, sample) = open_test_epoch();
+        // A synchronous directory read that starts before the deadline and
+        // crosses it during the Win32 call returns Indeterminate (TimedOut),
+        // never a terminal Confirmed result — even when the directory holds an
+        // extra entry exceeding `max_entries`.
         let extra = f.root.path().join("share/unexpected.bin");
         fs::write(&extra, b"extra").unwrap();
+        let share_dir = open_directory(f.root.path().join("share").to_str().unwrap()).unwrap();
+        let base = Instant::now();
+        let deadline = base + Duration::from_secs(1);
+        let mut listing_ticks = 0usize;
+        let mut listing_clock = || {
+            listing_ticks += 1;
+            // Tick 1 passes the pre-read check; tick 2 crosses the deadline
+            // immediately after GetFileInformationByHandleEx returns.
+            if listing_ticks >= 2 { deadline } else { base }
+        };
+        assert!(matches!(
+            listing_bounded_with(&share_dir, 1, Some(deadline), &mut listing_clock),
+            Err(ListingError::TimedOut)
+        ));
+        let mut ticks = 0usize;
+        let mut crossing_clock = || {
+            ticks += 1;
+            if ticks >= 4 { deadline } else { base }
+        };
+        let crossed = timeout_epoch.refresh(
+            || {
+                held.check_typed_with(deadline, &mut crossing_clock)?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(crossed, Err(Invalidation::Indeterminate(REFUSAL)));
+        assert!(!timeout_epoch.effects_revoked());
+
+        // Observed-then-reverted extra file in the bundle directory latches Confirmed.
+        let (drift_epoch, sample) = open_test_epoch();
         let drifted = drift_epoch.refresh(
             || {
                 held.check_typed(Instant::now() + INVENTORY_TIME)?;

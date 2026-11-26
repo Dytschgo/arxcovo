@@ -1644,6 +1644,15 @@ fn listing_bounded_typed(
     max_entries: usize,
     deadline: Option<Instant>,
 ) -> Result<Vec<(String, u32)>, ListingError> {
+    listing_bounded_with(dir, max_entries, deadline, &mut Instant::now)
+}
+
+fn listing_bounded_with(
+    dir: &File,
+    max_entries: usize,
+    deadline: Option<Instant>,
+    now: &mut impl FnMut() -> Instant,
+) -> Result<Vec<(String, u32)>, ListingError> {
     let mut buffer = vec![0u64; 8192];
     let capacity = buffer.len() * size_of::<u64>();
     let header = size_of::<FILE_FULL_DIR_INFO>();
@@ -1651,7 +1660,7 @@ fn listing_bounded_typed(
     let mut found = Vec::new();
     let mut class = FileFullDirectoryRestartInfo;
     loop {
-        if deadline.is_some_and(|until| Instant::now() >= until) {
+        if deadline.is_some_and(|until| now() >= until) {
             return Err(ListingError::TimedOut);
         }
         // The aligned buffer receives a chain of variable-length records.
@@ -1663,6 +1672,12 @@ fn listing_bounded_typed(
                 capacity as u32,
             )
         };
+        // Check the deadline immediately after the synchronous Win32 call so a
+        // read that crosses the cutoff cannot resolve as a terminal inventory
+        // result (`LimitExceeded` or truncated/complete entry set).
+        if deadline.is_some_and(|until| now() >= until) {
+            return Err(ListingError::TimedOut);
+        }
         if ok == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
