@@ -1057,16 +1057,37 @@ fn prove_serial_peer(
 }
 
 fn host_resources() -> Result<(u32, u64), NativeRefusal> {
+    measured_host_resources().map_err(|_| NativeRefusal::ReservesUnverified)
+}
+
+fn measured_host_resources() -> Result<(u32, u64), crate::vm::qualification_record::ReserveCheck> {
     let mut memory = MEMORYSTATUSEX {
         dwLength: size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
     };
     // Processor count spans groups; effective Job scope still needs qualification.
     let cpus = unsafe { GetActiveProcessorCount(u16::MAX) };
-    if cpus == 0 || unsafe { GlobalMemoryStatusEx(&mut memory) } == 0 || memory.ullAvailPhys == 0 {
-        return Err(NativeRefusal::ReservesUnverified);
+    check_host_resources(cpus, || {
+        (unsafe { GlobalMemoryStatusEx(&mut memory) } != 0).then_some(memory.ullAvailPhys)
+    })
+}
+
+fn check_host_resources(
+    cpus: u32,
+    memory: impl FnOnce() -> Option<u64>,
+) -> Result<(u32, u64), crate::vm::qualification_record::ReserveCheck> {
+    use crate::vm::qualification_record::ReserveCheck;
+
+    if cpus == 0 {
+        return Err(ReserveCheck::ActiveCpusUnavailable);
     }
-    Ok((cpus, memory.ullAvailPhys))
+    let available_bytes = memory().ok_or(ReserveCheck::MemoryStatusUnavailable)?;
+    // The source gate also refuses a successful zero before checking the
+    // launch envelope. Preserve that order under its own source label.
+    if available_bytes == 0 {
+        return Err(ReserveCheck::AvailableRamSourceZero);
+    }
+    Ok((cpus, available_bytes))
 }
 
 fn disk_free(root: &LocalPath) -> Result<(u64, u64), NativeRefusal> {
@@ -1960,6 +1981,12 @@ impl DispatchGate {
     /// any write it started, then accept only `WrittenInTime` and disarm.
     /// Every other outcome leaves the gate tripped.
     async fn settle(&self, limit: Duration) -> Result<(), NativeRefusal> {
+        self.settle_observed(limit)
+            .await
+            .map_err(|_| NativeRefusal::ReservesUnverified)
+    }
+
+    async fn settle_observed(&self, limit: Duration) -> Result<(), (Dispatch, bool)> {
         let mut watch = self.state.subscribe();
         let finished = matches!(
             tokio::time::timeout(
@@ -1969,20 +1996,17 @@ impl DispatchGate {
             .await,
             Ok(Ok(_))
         );
-        let mut accepted = false;
+        let mut refusal = None;
         self.state.send_modify(|state| match *state {
-            Dispatch::WrittenInTime(_) if finished => {
-                *state = Dispatch::Idle;
-                accepted = true;
+            Dispatch::WrittenInTime(_) if finished => *state = Dispatch::Idle,
+            observed => {
+                refusal = Some((observed, finished));
+                if !matches!(observed, Dispatch::Expired | Dispatch::Ambiguous) {
+                    *state = Dispatch::Ambiguous;
+                }
             }
-            Dispatch::Expired | Dispatch::Ambiguous => {}
-            _ => *state = Dispatch::Ambiguous,
         });
-        if accepted {
-            Ok(())
-        } else {
-            Err(NativeRefusal::ReservesUnverified)
-        }
+        refusal.map_or(Ok(()), Err)
     }
 }
 
@@ -1995,30 +2019,60 @@ impl Drop for WorkerStop {
     }
 }
 
-/// Bounded asynchronous ends of the synchronous pipes. A full output buffer
-/// applies backpressure, and stderr is drained without retaining peer bytes.
-fn start_stdio(
-    stdio: Stdio,
-    gate: std::sync::Arc<DispatchGate>,
-) -> io::Result<(tokio::io::DuplexStream, tokio::io::DuplexStream, WorkerSet)> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+/// Async end of the child's stdout. A native read failure in the output
+/// worker crosses the bridge as an I/O error. The closed duplex half alone
+/// would otherwise look like the peer's end of stream.
+struct PipeOutput {
+    stream: tokio::io::DuplexStream,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
-    let (reader, mut output) = duplex(8192);
-    let (writer, mut input) = duplex(8192);
-    let runtime = tokio::runtime::Handle::current();
-    let mut set = WorkerSet {
-        cancel: Shutdown::default(),
-        workers: Vec::new(),
-    };
+impl tokio::io::AsyncRead for PipeOutput {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::{sync::atomic::Ordering, task::Poll};
+        let filled = buf.filled().len();
+        let this = &mut *self;
+        let polled = std::pin::Pin::new(&mut this.stream).poll_read(cx, buf);
+        // Buffered bytes still drain first; only the end itself is classified.
+        if matches!(polled, Poll::Ready(Ok(())))
+            && buf.filled().len() == filled
+            && buf.remaining() > 0
+            && this.failed.load(Ordering::Acquire)
+        {
+            return Poll::Ready(Err(io::ErrorKind::Other.into()));
+        }
+        polled
+    }
+}
 
-    let cancel = set.cancel.clone();
-    let executor = runtime.clone();
-    set.workers.push(Worker::start("arx-vm-output", move || {
-        let mut pipe = File::from(stdio.output);
+/// Stdout worker. It publishes a read failure before it closes the bridge,
+/// so the reader classifies the end it observes as I/O, not EOF.
+fn start_output(
+    mut pipe: impl std::io::Read + Send + 'static,
+    cancel: Shutdown,
+    executor: tokio::runtime::Handle,
+) -> io::Result<(PipeOutput, Worker)> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    let (stream, mut output) = tokio::io::duplex(8192);
+    let failed = std::sync::Arc::new(AtomicBool::new(false));
+    let outcome = failed.clone();
+    let worker = Worker::start("arx-vm-output", move || {
         let mut bytes = [0; 4096];
         while !cancel.is_cancelled() {
-            let Some(count) = read_pipe(&mut pipe, &mut bytes, &cancel)? else {
-                break;
+            let count = match read_pipe(&mut pipe, &mut bytes, &cancel) {
+                Ok(Some(count)) => count,
+                Ok(None) => break,
+                Err(error) => {
+                    outcome.store(true, Ordering::Release);
+                    drop(output);
+                    return Err(error);
+                }
             };
             let result = executor.block_on(async {
                 tokio::select! {
@@ -2032,7 +2086,31 @@ fn start_stdio(
             }
         }
         Ok(())
-    })?);
+    })?;
+    Ok((PipeOutput { stream, failed }, worker))
+}
+
+/// Bounded asynchronous ends of the synchronous pipes. A full output buffer
+/// applies backpressure, and stderr is drained without retaining peer bytes.
+fn start_stdio(
+    stdio: Stdio,
+    gate: std::sync::Arc<DispatchGate>,
+) -> io::Result<(PipeOutput, tokio::io::DuplexStream, WorkerSet)> {
+    use tokio::io::{AsyncReadExt, duplex};
+
+    let (writer, mut input) = duplex(8192);
+    let runtime = tokio::runtime::Handle::current();
+    let mut set = WorkerSet {
+        cancel: Shutdown::default(),
+        workers: Vec::new(),
+    };
+
+    let (reader, output) = start_output(
+        File::from(stdio.output),
+        set.cancel.clone(),
+        runtime.clone(),
+    )?;
+    set.workers.push(output);
     let cancel = set.cancel.clone();
     set.workers.push(Worker::start("arx-vm-input", move || {
         let _stopped = WorkerStop(gate.clone());
@@ -2087,8 +2165,11 @@ fn start_stdio(
     Ok((reader, writer, set))
 }
 
-fn read_pipe(pipe: &mut File, bytes: &mut [u8], cancel: &Shutdown) -> io::Result<Option<usize>> {
-    use std::io::Read;
+fn read_pipe(
+    pipe: &mut impl std::io::Read,
+    bytes: &mut [u8],
+    cancel: &Shutdown,
+) -> io::Result<Option<usize>> {
     match pipe.read(bytes) {
         Ok(0) => Ok(None),
         Ok(count) => Ok(Some(count)),
@@ -2487,7 +2568,7 @@ impl<'a> CheckedLaunchCore<'a> {
         token: &'a VmToken,
         inputs: LaunchInputs<'a>,
         refresh: impl FnOnce(&CommandPlan<'_>) -> Result<std::time::Instant, NativeRefusal>,
-    ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
+    ) -> Result<(Self, PipeOutput, tokio::io::DuplexStream), NativeRefusal> {
         let kind = inputs.plan.kind();
         // ADR 0064: a public-egress plan also stays closed until its patched
         // build, policy custody and route evidence have native qualification.
@@ -2670,9 +2751,9 @@ impl<'a> CheckedLaunchCore<'a> {
     }
 }
 
-type PipeQmp = Qmp<tokio::io::DuplexStream, tokio::io::DuplexStream>;
+type PipeQmp = Qmp<PipeOutput, tokio::io::DuplexStream>;
 type SerialGuest = GuestChannel<tokio::net::windows::named_pipe::NamedPipeClient>;
-type BootIo = (tokio::io::DuplexStream, tokio::io::DuplexStream);
+type BootIo = (PipeOutput, tokio::io::DuplexStream);
 type HeldRelease = (StopDisposition, Option<HeldWriters>);
 
 enum BootOutcome {
@@ -3228,6 +3309,69 @@ mod tests {
         io::{Read, Write},
         os::windows::fs::MetadataExt,
     };
+
+    /// A synthetic native stdout: one partial QMP record, then the end.
+    struct ScriptedPipe(std::collections::VecDeque<io::Result<&'static [u8]>>);
+
+    impl Read for ScriptedPipe {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.pop_front() {
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(error)) => Err(error),
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_stdout_read_failure_reaches_qmp_as_io_and_peer_close_as_eof() {
+        use crate::vm::qmp::{ChannelError, Qmp};
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+        for (end, expected) in [
+            (
+                Some(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
+                ChannelError::Io,
+            ),
+            // A closed peer end is the ordinary end of the child's output.
+            (Some(io::ErrorKind::BrokenPipe.into()), ChannelError::Eof),
+            (None, ChannelError::Eof),
+        ] {
+            let failed = end
+                .as_ref()
+                .is_some_and(|error| error.kind() != io::ErrorKind::BrokenPipe);
+            let mut script = std::collections::VecDeque::from([Ok(&b"{\"QMP\":"[..])]);
+            script.extend(end.map(Err));
+            let cancel = Shutdown::default();
+            let (output, worker) = start_output(
+                ScriptedPipe(script),
+                cancel.clone(),
+                tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+            let refused = tokio::time::timeout(
+                Duration::from_secs(2),
+                Qmp::handshake(output, tokio::io::sink(), &Shutdown::default()),
+            )
+            .await
+            .unwrap()
+            .err();
+            assert_eq!(refused, Some(expected));
+            let joined = tokio::task::spawn_blocking(move || worker.0.join().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(joined.is_err(), failed);
+            if failed {
+                assert_eq!(
+                    joined.unwrap_err().raw_os_error(),
+                    Some(ERROR_ACCESS_DENIED as i32)
+                );
+            }
+        }
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use windows_sys::Win32::Security::Authorization::{
@@ -3372,7 +3516,7 @@ mod tests {
         assert_eq!(marker, [42]);
     }
 
-    async fn ready(reader: &mut tokio::io::DuplexStream) {
+    async fn ready(reader: &mut PipeOutput) {
         tokio::time::timeout(Duration::from_secs(2), async {
             let mut observed = Vec::new();
             while observed.len() < 4096 {
@@ -4146,7 +4290,7 @@ mod tests {
         gate: std::sync::Arc<DispatchGate>,
         write: tokio::io::DuplexStream,
         workers: WorkerSet,
-        _read: tokio::io::DuplexStream,
+        _read: PipeOutput,
     }
 
     /// Real pipes and the production stdin worker, with an injected clock.
