@@ -180,12 +180,44 @@ fn hold_workspace_under(
     })
 }
 
+/// The requested pair and the durable evidence (identities, directory and
+/// digests) a never-created start must still match to release cleanly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StartPair {
+    pub slots: PairSlots,
+    pub evidence: [ArtifactEvidence; 2],
+}
+
 /// A refused start keeps its original lease and creation custody available to
-/// the consumer. Only a pre-acquire refusal may attempt to open a lease.
+/// the consumer. Its scope is fixed at construction: the exact workspace
+/// binding and requested pair, together with one observation cutoff. Only a
+/// pre-acquire refusal carries a one-shot token for a single later attempt.
 #[must_use = "settle the refused start while its generation custody is held"]
 pub(crate) struct StartRefusal<'a> {
     workspace: Option<&'a ProductionWorkspace>,
+    scope: Box<RefusalScope>,
     failure: HoldRefusal,
+}
+
+struct RefusalScope {
+    binding: WorkspaceBinding,
+    pair: Option<StartPair>,
+    acquired: Option<ProductionWorkspace>,
+    /// Spent by the first observation, whatever that attempt's outcome.
+    acquisition: Option<()>,
+    cutoff: Instant,
+}
+
+impl RefusalScope {
+    fn new(binding: WorkspaceBinding, pair: Option<StartPair>, acquisition: bool) -> Box<Self> {
+        Box::new(Self {
+            binding,
+            pair,
+            acquired: None,
+            acquisition: acquisition.then_some(()),
+            cutoff: Instant::now() + REFUSAL_OBSERVATION_BUDGET,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,22 +227,22 @@ pub(crate) enum StartCreation {
     Unconfirmed,
 }
 
-pub(crate) struct HeldStartRefusal<'a> {
-    workspace: &'a ProductionWorkspace,
-    pair: PairSlots,
-    release: Option<ReleasedGeneration<'a>>,
+pub(crate) struct HeldStartRefusal<'r> {
+    workspace: &'r ProductionWorkspace,
+    pair: Option<StartPair>,
+    release: Option<ReleasedGeneration<'r>>,
 }
 
-impl<'a> HeldStartRefusal<'a> {
-    pub(crate) fn workspace(&self) -> &'a ProductionWorkspace {
+impl<'r> HeldStartRefusal<'r> {
+    pub(crate) fn workspace(&self) -> &'r ProductionWorkspace {
         self.workspace
     }
 
-    pub(crate) fn pair(&self) -> PairSlots {
+    pub(crate) fn pair(&self) -> Option<StartPair> {
         self.pair
     }
 
-    pub(crate) fn release(&self) -> Option<&ReleasedGeneration<'a>> {
+    pub(crate) fn release(&self) -> Option<&ReleasedGeneration<'r>> {
         self.release.as_ref()
     }
 }
@@ -218,20 +250,25 @@ impl<'a> HeldStartRefusal<'a> {
 impl<'a> StartRefusal<'a> {
     pub(crate) fn before_create(
         workspace: Option<&'a ProductionWorkspace>,
+        binding: WorkspaceBinding,
+        pair: Option<StartPair>,
         reason: NativeRefusal,
     ) -> Self {
         Self {
             workspace,
+            scope: RefusalScope::new(binding, pair, workspace.is_none()),
             failure: reason.into(),
         }
     }
 
     fn while_held<T>(
         workspace: &'a ProductionWorkspace,
+        pair: Option<StartPair>,
         attempt: impl FnOnce() -> Result<T, HoldRefusal>,
     ) -> Result<T, Self> {
         attempt().map_err(|failure| Self {
             workspace: Some(workspace),
+            scope: RefusalScope::new(workspace.binding(), pair, false),
             failure,
         })
     }
@@ -246,6 +283,12 @@ impl<'a> StartRefusal<'a> {
             LaunchCreation::Created(_) => StartCreation::Created,
             LaunchCreation::Unconfirmed { .. } => StartCreation::Unconfirmed,
         }
+    }
+
+    /// Whether a stdio worker of a created child ended with an error. This is
+    /// separate from settlement, which only needs every worker to have ended.
+    pub(crate) fn worker_failed(&self) -> bool {
+        matches!(&self.failure.creation, LaunchCreation::Created(child) if child.worker_failed)
     }
 
     pub(crate) async fn settle_created(
@@ -263,44 +306,39 @@ impl<'a> StartRefusal<'a> {
         }
     }
 
+    /// Observes the bound scope only. The caller's deadline can shorten, never
+    /// extend, the cutoff fixed when the refusal was constructed.
     pub(crate) fn with_observation<T>(
-        &self,
-        expected: WorkspaceBinding,
-        (pair, evidence): (PairSlots, [ArtifactEvidence; 2]),
+        &mut self,
         deadline: Instant,
         stop: &dyn Fn() -> bool,
         acquire: impl FnOnce(WorkspaceBinding) -> Result<ProductionWorkspace, NativeRefusal>,
         consume: impl FnOnce(Option<HeldStartRefusal<'_>>) -> T,
     ) -> T {
-        let deadline = deadline.min(Instant::now() + REFUSAL_OBSERVATION_BUDGET);
+        let never_created = self.creation() == StartCreation::NeverCreated;
+        let scope = &mut *self.scope;
+        let deadline = deadline.min(scope.cutoff);
         // A pre-acquire refusal can make one later, bounded attempt. A held
         // refusal always uses its original lock, including after cancellation.
-        let newly_held = if self.workspace.is_none()
-            && self.creation() == StartCreation::NeverCreated
+        if scope.acquisition.take().is_some()
+            && never_created
             && launch::check_preparation(deadline, stop).is_ok()
         {
-            acquire(expected).ok()
-        } else {
-            None
-        };
+            scope.acquired = acquire(scope.binding)
+                .ok()
+                .filter(|workspace| workspace.binding() == scope.binding);
+        }
+        let (binding, pair) = (scope.binding, scope.pair);
         let observation = self
             .workspace
-            .or(newly_held.as_ref())
-            .and_then(|workspace| {
-                (workspace.binding() == expected && check_pair(expected, pair).is_ok()).then(|| {
-                    let release = (self.creation() == StartCreation::NeverCreated)
-                        .then(|| {
-                            workspace
-                                .unchanged_pair(pair, evidence, deadline, stop)
-                                .ok()
-                        })
-                        .flatten();
-                    HeldStartRefusal {
-                        workspace,
-                        pair,
-                        release,
-                    }
-                })
+            .or(scope.acquired.as_ref())
+            .filter(|workspace| workspace.binding() == binding)
+            .map(|workspace| HeldStartRefusal {
+                workspace,
+                pair,
+                release: pair
+                    .filter(|_| never_created)
+                    .and_then(|pair| workspace.unchanged_pair(pair, deadline, stop).ok()),
             });
         consume(observation)
     }
@@ -309,21 +347,21 @@ impl<'a> StartRefusal<'a> {
 impl ProductionWorkspace {
     fn unchanged_pair(
         &self,
-        pair: PairSlots,
-        evidence: [ArtifactEvidence; 2],
+        StartPair { slots, evidence }: StartPair,
         deadline: Instant,
         stop: &dyn Fn() -> bool,
     ) -> Result<ReleasedGeneration<'_>, NativeRefusal> {
         let reason = NativeRefusal::PathCustodyUnverified;
         launch::check_preparation(deadline, stop)?;
+        check_pair(self.binding, slots)?;
         let custody = WorkspaceCustody::production(&self.root, &self.lease)?;
         let [disk, vars] = evidence;
         if disk.directory != self.binding.workspace.file || vars.directory != disk.directory {
             return Err(reason);
         }
         let pins = [
-            self.pin_slot(pair.disk, disk.identity, false)?,
-            self.pin_slot(pair.vars, vars.identity, false)?,
+            self.pin_slot(slots.disk, disk.identity, false)?,
+            self.pin_slot(slots.vars, vars.identity, false)?,
         ];
         // Both exclusions must be held before reading either file and survive
         // the caller's commit decision.
@@ -341,10 +379,7 @@ impl ProductionWorkspace {
         launch::check_preparation(deadline, stop)?;
         ReleasedGeneration::checked(
             self.binding,
-            ReleaseTargets::Pair {
-                pair,
-                ids: evidence.map(|file| file.identity),
-            },
+            ReleaseTargets::Unchanged(StartPair { slots, evidence }),
             custody,
             (std::sync::Arc::from(pins), guards),
         )
@@ -384,7 +419,8 @@ pub(crate) struct LaunchRequest<'a> {
     pub boot_inputs: Option<&'a QualifiedBoot<'a>>,
     pub cwd: &'a LocalPath,
     pub workspace: &'a ProductionWorkspace,
-    pub pair: Option<PairSlots>,
+    /// The requested pair with its durable evidence; a refusal is bound to it.
+    pub pair: Option<StartPair>,
     pub installer: Option<InstallerStage>,
     pub memory: usize,
     pub cpu_rate: u32,
@@ -476,8 +512,8 @@ impl<'a> NativeLaunch<'a> {
         permit: impl LaunchPermit,
         refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
     ) -> Result<Self, StartRefusal<'a>> {
-        let workspace = request.workspace;
-        StartRefusal::while_held(workspace, || {
+        let (workspace, pair) = (request.workspace, request.pair);
+        StartRefusal::while_held(workspace, pair, || {
             Self::hold_inner(qualification, request, permit, refresh)
         })
     }
@@ -493,7 +529,7 @@ impl<'a> NativeLaunch<'a> {
             boot_inputs,
             cwd,
             workspace,
-            pair,
+            pair: start_pair,
             installer,
             memory,
             cpu_rate,
@@ -501,6 +537,7 @@ impl<'a> NativeLaunch<'a> {
             cancelled,
         } = request;
         launch::check_preparation(prepare_by, cancelled)?;
+        let pair = start_pair.map(|pair| pair.slots);
         let reason = NativeRefusal::QualificationMissing;
         let ValidatedLaunch {
             workspace_binding,
@@ -516,6 +553,7 @@ impl<'a> NativeLaunch<'a> {
             memory,
             cpu_rate,
         )?;
+        check_start_evidence(start_pair, bound_pair)?;
         match (kind, boot_inputs) {
             (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(inputs))
                 if memory == TEST_JOB_MEMORY && cpu_rate == JOB_CPU_RATE =>
@@ -767,6 +805,22 @@ fn check_permit(
         .ok_or(NativeRefusal::QualificationMissing)
 }
 
+/// The evidence a refusal is bound to must name the plan's exact pair files.
+fn check_start_evidence(
+    start: Option<StartPair>,
+    bound: Option<(PairSlots, [FileIdentity; 2])>,
+) -> Result<(), NativeRefusal> {
+    match (start, bound) {
+        (None, None) => Ok(()),
+        (Some(start), Some((slots, ids)))
+            if start.slots == slots && start.evidence.map(|file| file.identity) == ids =>
+        {
+            Ok(())
+        }
+        _ => Err(NativeRefusal::PathCustodyUnverified),
+    }
+}
+
 pub(super) fn check_pair(
     workspace: WorkspaceBinding,
     pair: PairSlots,
@@ -903,6 +957,8 @@ enum ReleaseTargets {
         pair: PairSlots,
         ids: [FileIdentity; 2],
     },
+    /// A never-created start's pair, proven against its original evidence.
+    Unchanged(StartPair),
     Helper {
         kind: PlanKind,
         inputs: Vec<(ArtifactRole, FileIdentity)>,
@@ -918,6 +974,7 @@ impl<'a> ReleasedGeneration<'a> {
     ) -> Option<Self> {
         let expected_writers: Vec<_> = match &targets {
             ReleaseTargets::Pair { ids, .. } => ids.to_vec(),
+            ReleaseTargets::Unchanged(pair) => pair.evidence.map(|file| file.identity).to_vec(),
             ReleaseTargets::Helper { inputs, .. } => inputs
                 .iter()
                 .filter_map(|(role, id)| role.writable().then_some(*id))
@@ -952,6 +1009,13 @@ impl<'a> ReleasedGeneration<'a> {
                 self.targets, ReleaseTargets::Pair { pair: held, ids: held_ids }
                     if held == pair && held_ids == ids
             )
+    }
+
+    /// The consumer-facing check for a refused start compares the full pair
+    /// evidence, including both digests, not only slots and file IDs.
+    pub(crate) fn matches_start(&self, workspace: WorkspaceBinding, pair: StartPair) -> bool {
+        self.binding == workspace
+            && matches!(self.targets, ReleaseTargets::Unchanged(held) if held == pair)
     }
 
     pub(crate) fn matches_helper(

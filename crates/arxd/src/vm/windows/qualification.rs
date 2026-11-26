@@ -21,7 +21,7 @@ mod production;
 pub(crate) use production::{
     FinalizedPair, HeldStartRefusal, HelperSettlement, InstallerSettlement, LaunchPermit,
     LaunchPermitBinding, LaunchRequest, LaunchTarget, NativeLaunch, ProductionWorkspace,
-    ReleasedGeneration, StartCreation, StartRefusal, WorkspaceBinding,
+    ReleasedGeneration, StartCreation, StartPair, StartRefusal, WorkspaceBinding,
 };
 mod recipe;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]

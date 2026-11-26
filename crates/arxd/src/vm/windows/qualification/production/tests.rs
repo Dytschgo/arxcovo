@@ -1364,14 +1364,14 @@ async fn released_proof_binds_generation_and_keeps_the_writer_exclusion() {
     }
 }
 
-fn start_pair(
+fn start_pair_at(
     workspace: &ProductionWorkspace,
-) -> ((PairSlots, [ArtifactEvidence; 2]), [LocalPath; 2]) {
+    slots: PairSlots,
+    bytes: &[u8],
+) -> (StartPair, [LocalPath; 2]) {
     use sha2::{Digest, Sha256};
-    let slots = pair(workspace.binding().generation);
     let paths = [slots.disk, slots.vars].map(|slot| slot_path(&workspace.root.path, slot));
     let evidence = paths.each_ref().map(|path| {
-        let bytes = b"stopped synthetic bytes";
         std::fs::write(path.as_str(), bytes).unwrap();
         ArtifactEvidence {
             identity: PathPin::open(path, false, false).unwrap().identity,
@@ -1382,7 +1382,12 @@ fn start_pair(
             },
         }
     });
-    ((slots, evidence), paths)
+    (StartPair { slots, evidence }, paths)
+}
+
+fn start_pair(workspace: &ProductionWorkspace) -> (StartPair, [LocalPath; 2]) {
+    let slots = pair(workspace.binding().generation);
+    start_pair_at(workspace, slots, b"stopped synthetic bytes")
 }
 
 #[test]
@@ -1403,23 +1408,22 @@ fn start_refusal_observes_the_already_locked_pair_through_the_consumer() {
         NativeRefusal::ReservesUnverified,
         NativeRefusal::JobUnverified,
     ] {
-        let refused = StartRefusal::while_held(&ws, || Err::<(), _>(reason.into()))
-            .err()
-            .unwrap();
+        let mut refused =
+            StartRefusal::while_held(&ws, Some(active), || Err::<(), _>(reason.into()))
+                .err()
+                .unwrap();
         assert_eq!(refused.reason(), reason);
         refused.with_observation(
-            binding,
-            active,
             deadline(),
             &|| false,
             |_| panic!("tried to reacquire the already locked lease"),
             |observed| {
                 let observed = observed.expect("held observation");
                 assert!(std::ptr::eq(observed.workspace(), &ws));
-                assert_eq!(observed.pair(), active.0);
+                assert_eq!(observed.pair(), Some(active));
                 assert!(acquire(binding).is_err());
                 let released = observed.release.expect("unchanged, exclusive pair");
-                assert!(released.matches(binding, active.0, active.1.map(|e| e.identity)));
+                assert!(released.matches_start(binding, active));
                 assert!(paths.iter().all(|path| writer(path).is_err()));
                 drop(released);
                 assert!(paths.iter().all(|path| writer(path).is_ok()));
@@ -1427,11 +1431,14 @@ fn start_refusal_observes_the_already_locked_pair_through_the_consumer() {
         );
     }
 
-    let refused = StartRefusal::before_create(Some(&ws), NativeRefusal::QualificationMissing);
-    let observe = |active, cutoff, stop: &dyn Fn() -> bool| {
-        refused.with_observation(
+    let observe = |pair, cutoff, stop: &dyn Fn() -> bool| {
+        let mut refused = StartRefusal::before_create(
+            Some(&ws),
             binding,
-            active,
+            Some(pair),
+            NativeRefusal::QualificationMissing,
+        );
+        refused.with_observation(
             cutoff,
             stop,
             |_| panic!("tried to reacquire the already locked lease"),
@@ -1445,49 +1452,165 @@ fn start_refusal_observes_the_already_locked_pair_through_the_consumer() {
     observe(active, deadline(), &|| true);
     observe(active, Instant::now(), &|| false);
     let mut wrong_directory = active;
-    wrong_directory.1[0].directory[0] ^= 1;
+    wrong_directory.evidence[0].directory[0] ^= 1;
     observe(wrong_directory, deadline(), &|| false);
+
+    // A later caller deadline cannot extend the cutoff fixed at construction.
+    let mut expired = StartRefusal::before_create(
+        Some(&ws),
+        binding,
+        Some(active),
+        NativeRefusal::QualificationMissing,
+    );
+    expired.scope.cutoff = Instant::now();
+    expired.with_observation(
+        deadline(),
+        &|| false,
+        |_| panic!("tried to reacquire the already locked lease"),
+        |observed| assert!(observed.expect("held").release().is_none()),
+    );
 
     let open_writer = writer(&paths[1]).unwrap();
     observe(active, deadline(), &|| false);
     drop(open_writer);
     // Preserve the file identity and length while changing its digest.
-    std::fs::write(paths[0].as_str(), vec![255; active.1[0].pin.size as usize]).unwrap();
+    std::fs::write(
+        paths[0].as_str(),
+        vec![255; active.evidence[0].pin.size as usize],
+    )
+    .unwrap();
     observe(active, deadline(), &|| false);
     drop(ws);
     assert!(acquire(binding).is_ok());
 }
 
 #[test]
-fn start_refusal_before_acquisition_can_retry_once_inside_its_bound() {
-    use std::cell::Cell;
+fn start_refusal_proof_is_bound_to_the_requested_pair_and_its_digests() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_production, ws, _, _) = held_test_workspace(temp.path(), [4; 16]);
+    let binding = ws.binding();
+    let (first, _) = start_pair(&ws);
+    let mut slots = pair(binding.generation);
+    slots.disk.key = [3; 16];
+    slots.vars.key = [4; 16];
+    let (second, _) = start_pair_at(&ws, slots, b"second synthetic pair under the lease");
+    assert_ne!(first.evidence[0].identity, second.evidence[0].identity);
+    let mut changed = first;
+    changed.evidence[1].pin.sha256[0] ^= 1;
+    let mixed = StartPair {
+        slots: first.slots,
+        evidence: second.evidence,
+    };
+    let deadline = || Instant::now() + Duration::from_secs(5);
+    let observe = |binding, pair, consume: &dyn Fn(Option<HeldStartRefusal<'_>>)| {
+        let mut refused = StartRefusal::before_create(
+            Some(&ws),
+            binding,
+            Some(pair),
+            NativeRefusal::QualificationMissing,
+        );
+        refused.with_observation(
+            deadline(),
+            &|| false,
+            |_| panic!("tried to reacquire the already locked lease"),
+            consume,
+        );
+    };
+
+    // Each real pair under the same lease yields proof for only that pair
+    // and its exact digests. The identity-only live matcher refuses it.
+    for (requested, other) in [(first, second), (second, first)] {
+        observe(binding, requested, &|observed| {
+            let held = observed.expect("held observation");
+            assert_eq!(held.pair(), Some(requested));
+            let released = held.release().expect("unchanged requested pair");
+            assert!(released.matches_start(binding, requested));
+            for refused in [other, changed, mixed] {
+                assert!(!released.matches_start(binding, refused));
+            }
+            let ids = requested.evidence.map(|file| file.identity);
+            assert!(!released.matches(binding, requested.slots, ids));
+        });
+    }
+    // Changed digests for the same identities, or another pair's files under
+    // these slots, never produce clean proof.
+    for refused in [changed, mixed] {
+        observe(binding, refused, &|observed| {
+            assert!(observed.expect("held").release().is_none());
+        });
+    }
+    // A refusal cannot be rebound to another workspace scope.
+    let mut foreign = binding;
+    foreign.lease.file[0] ^= 1;
+    observe(foreign, first, &|observed| assert!(observed.is_none()));
+
+    // The plan's pair files must be the files named by the bound evidence.
+    let ids = |pair: StartPair| pair.evidence.map(|file| file.identity);
+    assert!(check_start_evidence(None, None).is_ok());
+    assert!(check_start_evidence(Some(first), Some((first.slots, ids(first)))).is_ok());
+    for (start, bound) in [
+        (Some(first), Some((first.slots, ids(second)))),
+        (Some(first), Some((second.slots, ids(first)))),
+        (Some(changed), Some((first.slots, ids(second)))),
+        (Some(first), None),
+        (None, Some((first.slots, ids(first)))),
+    ] {
+        assert!(check_start_evidence(start, bound).is_err());
+    }
+}
+
+#[test]
+fn start_refusal_before_acquisition_spends_its_single_attempt() {
+    use std::cell::RefCell;
     let temp = tempfile::tempdir().unwrap();
     let (production, ws, owner, _) = held_test_workspace(temp.path(), [2; 16]);
     let (active, paths) = start_pair(&ws);
     let binding = ws.binding();
-    let attempts = Cell::new(0);
-    let acquire = |binding| {
-        attempts.set(attempts.get() + 1);
-        hold_workspace_under(&production, sid_ptr(&owner), binding)
+    let attempts = RefCell::new(Vec::new());
+    let acquire = |requested| {
+        attempts.borrow_mut().push(requested);
+        hold_workspace_under(&production, sid_ptr(&owner), requested)
     };
     let deadline = || Instant::now() + Duration::from_secs(5);
-    let refused = StartRefusal::before_create(None, NativeRefusal::PathCustodyUnverified);
-    refused.with_observation(binding, active, deadline(), &|| false, acquire, |obs| {
+    let refuse = || {
+        StartRefusal::before_create(
+            None,
+            binding,
+            Some(active),
+            NativeRefusal::PathCustodyUnverified,
+        )
+    };
+
+    // A failed attempt spends the token even after the holder goes away.
+    let mut contended = refuse();
+    contended.with_observation(deadline(), &|| false, acquire, |obs| {
         assert!(obs.is_none(), "a foreign holder must remain exclusive");
     });
-    assert_eq!(attempts.get(), 1);
     drop(ws);
-    for (cutoff, cancelled) in [(Instant::now(), false), (deadline(), true)] {
-        refused.with_observation(binding, active, cutoff, &|| cancelled, acquire, |obs| {
-            assert!(obs.is_none());
-        });
+    contended.with_observation(deadline(), &|| false, acquire, |obs| {
+        assert!(obs.is_none(), "a spent refusal reopened its acquisition");
+    });
+    assert_eq!(*attempts.borrow(), [binding]);
+
+    // Cancellation or the expired original cutoff spend it without opening.
+    let mut cancelled = refuse();
+    cancelled.with_observation(deadline(), &|| true, acquire, |obs| assert!(obs.is_none()));
+    let mut expired = refuse();
+    expired.scope.cutoff = Instant::now();
+    expired.with_observation(deadline(), &|| false, acquire, |obs| assert!(obs.is_none()));
+    for refused in [&mut cancelled, &mut expired] {
+        refused.with_observation(deadline(), &|| false, acquire, |obs| assert!(obs.is_none()));
     }
-    assert_eq!(attempts.get(), 1);
-    refused.with_observation(binding, active, deadline(), &|| false, acquire, |obs| {
+    assert_eq!(*attempts.borrow(), [binding]);
+
+    // One successful later attempt opens only the bound scope and keeps that
+    // lease for the refusal's lifetime without reopening it.
+    let mut later = refuse();
+    later.with_observation(deadline(), &|| false, acquire, |obs| {
         let held = obs.expect("one later acquisition");
         assert_eq!(held.workspace().binding(), binding);
         let released = held.release.unwrap();
-        assert!(released.matches(binding, active.0, active.1.map(|e| e.identity)));
+        assert!(released.matches_start(binding, active));
         assert!(hold_workspace_under(&production, sid_ptr(&owner), binding).is_err());
         for path in &paths {
             assert!(
@@ -1498,8 +1621,29 @@ fn start_refusal_before_acquisition_can_retry_once_inside_its_bound() {
             );
         }
     });
-    assert_eq!(attempts.get(), 2);
-    assert!(acquire(binding).is_ok());
+    later.with_observation(
+        deadline(),
+        &|| false,
+        |_| panic!("reopened the lease it already holds"),
+        |obs| assert!(obs.expect("still held").release().is_some()),
+    );
+    assert_eq!(*attempts.borrow(), [binding, binding]);
+    assert!(hold_workspace_under(&production, sid_ptr(&owner), binding).is_err());
+    drop(later);
+    assert!(hold_workspace_under(&production, sid_ptr(&owner), binding).is_ok());
+}
+
+fn refused_child() -> Child {
+    match crate::vm::windows::tests::fixture_launch(0) {
+        Some((child, _stdio)) => child,
+        // Runners that deny nested Jobs still exercise the refusal with an
+        // empty Job and a synthetic signaled exit handle.
+        None => Child {
+            job: Job::new(256 * 1024 * 1024, None).unwrap(),
+            process: unsafe { owned(CreateEventW(null(), 1, 1, null())) }.unwrap(),
+            suspended: None,
+        },
+    }
 }
 
 #[tokio::test]
@@ -1508,10 +1652,8 @@ async fn start_refusal_after_create_never_proves_an_unchanged_start() {
     let (production, ws, owner, _) = held_test_workspace(temp.path(), [3; 16]);
     let (active, _) = start_pair(&ws);
     let binding = ws.binding();
-    let assert_fenced = |refused: &StartRefusal<'_>| {
+    let assert_fenced = |refused: &mut StartRefusal<'_>| {
         refused.with_observation(
-            binding,
-            active,
             Instant::now() + Duration::from_secs(5),
             &|| false,
             |_| panic!("post-create refusal tried to acquire the lease again"),
@@ -1533,16 +1675,18 @@ async fn start_refusal_after_create_never_proves_an_unchanged_start() {
             Job::new(256 * 1024 * 1024, None).unwrap(),
         ))
     };
-    let pre_create =
-        StartRefusal::while_held(&ws, || Err::<(), _>(spawn_failed(SpawnStage::Create)))
-            .err()
-            .unwrap();
+    let pre_create = StartRefusal::while_held(&ws, Some(active), || {
+        Err::<(), _>(spawn_failed(SpawnStage::Create))
+    })
+    .err()
+    .unwrap();
     assert_eq!(pre_create.creation(), StartCreation::NeverCreated);
-    let mut unknown =
-        StartRefusal::while_held(&ws, || Err::<(), _>(spawn_failed(SpawnStage::Verify)))
-            .err()
-            .unwrap();
-    assert_fenced(&unknown);
+    let mut unknown = StartRefusal::while_held(&ws, Some(active), || {
+        Err::<(), _>(spawn_failed(SpawnStage::Verify))
+    })
+    .err()
+    .unwrap();
+    assert_fenced(&mut unknown);
     assert_eq!(unknown.creation(), StartCreation::Unconfirmed);
     assert!(
         unknown
@@ -1552,18 +1696,9 @@ async fn start_refusal_after_create_never_proves_an_unchanged_start() {
     );
 
     for fail_in_attach in [false, true] {
-        let child = match crate::vm::windows::tests::fixture_launch(0) {
-            Some((child, _stdio)) => child,
-            // Runners that deny nested Jobs still exercise the refusal with
-            // an empty Job and a synthetic signaled exit handle.
-            None => Child {
-                job: Job::new(256 * 1024 * 1024, None).unwrap(),
-                process: unsafe { owned(CreateEventW(null(), 1, 1, null())) }.unwrap(),
-                suspended: None,
-            },
-        };
+        let child = refused_child();
         let (release, blocker) = std::sync::mpsc::channel();
-        let mut refused = StartRefusal::while_held(&ws, || {
+        let mut refused = StartRefusal::while_held(&ws, Some(active), || {
             attach_checked_child(
                 child,
                 |_| {
@@ -1587,7 +1722,7 @@ async fn start_refusal_after_create_never_proves_an_unchanged_start() {
         })
         .err()
         .unwrap();
-        assert_fenced(&refused);
+        assert_fenced(&mut refused);
         assert_eq!(refused.creation(), StartCreation::Created);
         if fail_in_attach {
             assert!(
@@ -1599,15 +1734,80 @@ async fn start_refusal_after_create_never_proves_an_unchanged_start() {
             let LaunchCreation::Created(child) = &refused.failure.creation else {
                 panic!("lost created-child custody");
             };
-            assert_eq!(child.workers.as_ref().unwrap().workers.len(), 1);
+            assert_eq!(child.workers.workers.len(), 1);
         }
         let _ = release.send(());
         refused
             .settle_created(tokio::time::Instant::now() + Duration::from_secs(5))
             .await
             .unwrap();
-        assert_fenced(&refused);
+        assert!(!refused.worker_failed());
+        assert_fenced(&mut refused);
     }
+}
+
+#[tokio::test]
+async fn refused_attach_settles_after_one_worker_fails_and_another_exits() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_production, ws, _, _) = held_test_workspace(temp.path(), [5; 16]);
+    let (active, _) = start_pair(&ws);
+    let (finish, finished) = std::sync::mpsc::channel::<()>();
+    let mut refused = StartRefusal::while_held(&ws, Some(active), || {
+        attach_checked_child(
+            refused_child(),
+            |_| Ok(()),
+            |workers| {
+                // The failing worker is joined first.
+                workers.workers.push(
+                    Worker::start("refused-start-error", || {
+                        Err(io::Error::other("injected stdio worker failure"))
+                    })
+                    .unwrap(),
+                );
+                workers.workers.push(
+                    Worker::start("refused-start-exit", move || {
+                        let _ = finished.recv();
+                        Ok(())
+                    })
+                    .unwrap(),
+                );
+                Err(NativeRefusal::QmpUnverified)
+            },
+        )
+    })
+    .err()
+    .unwrap();
+    assert_eq!(refused.creation(), StartCreation::Created);
+    let workers = |refused: &StartRefusal<'_>| match &refused.failure.creation {
+        LaunchCreation::Created(child) => child.workers.workers.len(),
+        _ => panic!("lost created-child custody"),
+    };
+
+    // An unfinished worker keeps both handles, including the failed one.
+    assert!(
+        refused
+            .settle_created(tokio::time::Instant::now())
+            .await
+            .is_err()
+    );
+    assert_eq!(workers(&refused), 2);
+    assert!(!refused.worker_failed());
+
+    // Once both end, settlement drains every handle and confirms, while the
+    // worker failure stays separately visible. A repeat settlement agrees.
+    finish.send(()).unwrap();
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(5);
+    refused.settle_created(deadline()).await.unwrap();
+    assert_eq!(workers(&refused), 0);
+    assert!(refused.worker_failed());
+    refused.settle_created(deadline()).await.unwrap();
+    assert!(refused.worker_failed());
+    refused.with_observation(
+        Instant::now() + Duration::from_secs(5),
+        &|| false,
+        |_| panic!("post-create refusal tried to acquire the lease again"),
+        |obs| assert!(obs.expect("held").release().is_none()),
+    );
 }
 
 #[test]
