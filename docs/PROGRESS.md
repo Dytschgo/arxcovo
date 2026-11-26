@@ -961,7 +961,7 @@ Per-task provider, effort and outcome for this batch. Where a report or the coor
     - #343 Grok opened at 0/3. The Sol review FAIL counted as 1/3. Merged at 1/3.
     - #341 Astra is 2/3. The coordinator commits are recorded and are not an Astra tally increment. The Sol witness builder is 1/3 on its own budget. Merged at those tallies.
     - #346 Grok is 0/3. The mutation that demonstrated the missing regression was intended. Merged at 0/3.
-    - 7c Sol builder is 3/3. Astra, its own budget in the Opus role, is 3/3. Opus 5.5 high was authorized at 0/3. One later commit is on #344. No builder report in this batch advances that 0/3.
+    - 7c Sol builder is 3/3. Astra, its own budget in the Opus role, is 3/3. Opus 5.5 high was authorized at 0/3 and its report `D:/Temp/arx-m4-7c-build/report-opus.md` (`d3340066…0708`) records a shared 2/3 across #344 and #345 (both counted failures were #345 targeted runs).
     - Paused-trial runs 2, 3 and 4 are owner runs. They are not counted builder failures.
   - **Review rounds.** Holds and passes, apart from the attempt counters. The status id on each merged head is in the table above.
     - #339: Neon PASS `a4425b34…8e08`, status `59886051325` on `5fd59ac8`. Astra refresh PASS `d3d75fbc…6bd6`, status `59889342099` on `ac2a786c`.
@@ -989,7 +989,7 @@ Per-task provider, effort and outcome for this batch. Where a report or the coor
 | #343 M5 acceptance driver | Grok 4.7; Sol 6.2 high review | Grok 1/3 | Merged `bf775720`. Status `59897557508`. Re-review 2 PASS `88272cda…cca6`. Reused-operation P3 closed by #346. Throwaway VM **unverified on real hardware**. |
 | #341 static-VM driver | Neon draft; Astra 6.2 high; coordinator `82e1755d` and `d5e56ec3`; Sol 6.2 high witness; Grok 4.7 test-tier review | Astra 2/3; Sol witness 1/3 | Merged `2b46cc39`. Status `59912822491`. Live blockers: store/secret co-pinning and native Compose wiring. **Unverified on real hardware**. |
 | #346 reused operation | Grok 4.7; Sol 6.2 review | Grok 0/3 | Merged `afbd10de`. Status `59913733759`. PASS `068e1487…b94e`. |
-| #344 7c monitor | Sol 6.2 high; Astra 6.2 high; Claude Opus 5.5 high | Sol 3/3; Astra 3/3; Opus authorized 0/3 | Open at `62577844`. No agent-review status. No merge. **Unverified on real hardware**. |
+| #344 7c monitor | Sol 6.2 high; Astra 6.2 high; Claude Opus 5.5 high | Sol 3/3; Astra 3/3; Opus 2/3 (authorized 0/3, shared with #345) | Open at `62577844`. No agent-review status. No merge. **Unverified on real hardware**. |
 | #345 7c issuer | Same 7c builders; Grok pre-review only; separate Sol review | Same tallies | Open at `79e595de` (Opus 2/3). No agent-review status. No merge. **Unverified on real hardware**. |
 | Paused-trial runs 2–4 | Owner, retained binaries | No counted failure | Run 2 exit 2 `owner_activity_unverified` before #342. Run 3 exit 2 `owner_active`; owner confirmed PC use 17:15–17:25Z. Run 4 exit 2 `owner_active`. Zero effects. Launched path **unverified on real hardware**. |
 | Neon quota | Gemini 4 Neon out; Astra covers the Opus role | Counters unchanged | Quota reached 2026-11-25 around 16:15Z, about 127 hours. |
