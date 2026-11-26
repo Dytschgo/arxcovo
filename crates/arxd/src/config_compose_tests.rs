@@ -127,6 +127,36 @@ fn release_count(root: &Path) -> i64 {
         .unwrap()
 }
 
+/// DELETE access, sharing read, write and delete. A pin that omits
+/// `FILE_SHARE_DELETE` refuses this even when it still shares nothing writable.
+fn open_for_delete(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{
+            CreateFileW, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+    };
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { fs::File::from_raw_handle(handle) })
+    }
+}
+
 #[test]
 fn held_roots_and_ancestors_deny_competing_directory_writes() {
     use std::os::windows::fs::OpenOptionsExt;
@@ -145,9 +175,9 @@ fn held_roots_and_ancestors_deny_competing_directory_writes() {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
     };
-    let assert_write_denied = |path: &Path| {
+    let assert_sharing_denied = |open: std::io::Result<fs::File>| {
         assert_eq!(
-            writer(path).unwrap_err().raw_os_error(),
+            open.unwrap_err().raw_os_error(),
             Some(ERROR_SHARING_VIOLATION as i32)
         );
     };
@@ -155,22 +185,28 @@ fn held_roots_and_ancestors_deny_competing_directory_writes() {
     let paths = [roots.state.as_path(), roots.secrets.as_path(), parent];
     for path in paths {
         drop(writer(path).expect("disposable directory supports a write open"));
+        drop(open_for_delete(path).expect("disposable directory supports a delete open"));
     }
 
     // Verify both the absolute anchoring open and the production relative walk.
+    // Delete-only access is separate from the write open: sharing delete without
+    // sharing write still admits this probe.
     let anchor = pin_directory(parent).unwrap();
-    assert_write_denied(parent);
+    assert_sharing_denied(writer(parent));
+    assert_sharing_denied(open_for_delete(parent));
     drop(anchor);
 
     let vm = roots.load(&roots.profile()).unwrap();
     for path in paths {
-        assert_write_denied(path);
+        assert_sharing_denied(writer(path));
+        assert_sharing_denied(open_for_delete(path));
     }
     fs::write(roots.state.join("new-child"), b"fixture").unwrap();
     vm.custody.verify().unwrap();
     drop(vm);
     for path in paths {
         drop(writer(path).expect("write open succeeds after custody ends"));
+        drop(open_for_delete(path).expect("delete open succeeds after custody ends"));
     }
 }
 

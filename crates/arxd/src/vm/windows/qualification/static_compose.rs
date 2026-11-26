@@ -659,3 +659,172 @@ fn signed_input_review_binds_held_keyrings_indexes_base_and_package_inventory() 
     let held = HeldReview::hold(&paths, &pool, &wrong_version).unwrap();
     assert!(!OfflineVerifier::verify(&held, web, &wrong_version));
 }
+
+#[cfg(test)]
+#[test]
+fn installer_hold_refuses_a_mismatched_selected_recipe() {
+    use crate::vm::template::{
+        AssetPin, UbuntuRecipe,
+        ubuntu_compose::{Closure, PackagePin},
+        ubuntu_web::{IsoPoolManifest, IsoPoolVerifier, PROFILE_PIN, PoolPackage},
+    };
+    use sha2::{Digest, Sha256};
+
+    struct Accept;
+
+    impl IsoPoolVerifier for Accept {
+        fn verify(&self, _: &UbuntuRecipe, _: &IsoPoolManifest<'_>) -> bool {
+            true
+        }
+    }
+
+    fn asset(bytes: &[u8]) -> AssetPin {
+        AssetPin {
+            length: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+        }
+    }
+
+    fn artifact(bytes: &[u8]) -> ArtifactPin {
+        let pin = asset(bytes);
+        ArtifactPin {
+            size: pin.length,
+            sha256: pin.sha256,
+        }
+    }
+
+    let guest = b"fake-arx-guest";
+    let iso = AssetPin {
+        length: 1,
+        sha256: UbuntuRecipe::ISO_SHA256,
+    };
+    let base = UbuntuRecipe {
+        iso: Some(iso),
+        kernel: Some(asset(b"kernel")),
+        initrd: Some(asset(b"initrd")),
+        guest: Some(asset(guest)),
+        service: Some(asset(UbuntuRecipe::SERVICE)),
+        finalize: Some(asset(UbuntuRecipe::FINALIZE)),
+        nocloud_schema: Some(UbuntuRecipe::NOCLOUD_PROFILE_PIN),
+        firmware_code: Some(asset(b"code")),
+        firmware_vars: Some(asset(b"vars")),
+        qemu_receipt: Some(asset(b"receipt")),
+    };
+    let pool = IsoPoolManifest {
+        iso,
+        signed_metadata: artifact(b"ubuntu-index"),
+        packages: &[PoolPackage {
+            name: "nginx",
+            version: "1.0",
+            relative_path: "pool/nginx.deb",
+            artifact: artifact(b"nginx"),
+        }],
+    };
+    let web = UbuntuWebRecipe::qualify(
+        &base,
+        Some(PROFILE_PIN),
+        &pool,
+        Some(pool.canonical_pin().unwrap()),
+        &Accept,
+    )
+    .unwrap();
+    let medium_bytes = b"fake read-only Compose dependency ISO";
+    let packages = [
+        "containerd.io",
+        "docker-ce-cli",
+        "docker-ce",
+        "docker-compose-plugin",
+    ]
+    .map(|name| PackagePin {
+        name,
+        version: "5:1.2.3-1~noble",
+        archive: artifact(b"deb"),
+    });
+    let closure = Closure {
+        docker_fingerprint: [1; 20],
+        docker_signing_key: artifact(b"key"),
+        signed_docker_metadata: artifact(b"docker-index"),
+        signed_ubuntu_metadata: pool.signed_metadata,
+        base_versions: artifact(b"dpkg-query receipt"),
+        medium: artifact(medium_bytes),
+        packages: &packages,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        LocalPath::parse(path.to_str().unwrap()).unwrap()
+    };
+    let web_digest = web.recipe_digest();
+    let receipt = closure.receipt(web_digest).unwrap();
+    let ubuntu_key = b"ubuntu key";
+    let review = SignedInputReview {
+        contract: 1,
+        web_pool: pool.canonical_pin().unwrap().sha256,
+        compose_closure: receipt.sha256,
+        ubuntu_keyring_sha256: digest(ubuntu_key),
+        ubuntu_keyring_size: ubuntu_key.len() as u64,
+    };
+    let review_bytes = serde_json::to_vec(&review).unwrap();
+    let signed = SignedInputPaths {
+        receipt: EnrolledFile {
+            path: &write("review", &review_bytes),
+            pin: artifact(&review_bytes),
+        },
+        docker_keyring: &write("docker-keyring", b"key"),
+        ubuntu_keyring: &write("ubuntu-keyring", ubuntu_key),
+        docker_metadata: &write("docker-index", b"docker-index"),
+        ubuntu_metadata: &write("ubuntu-index", b"ubuntu-index"),
+        web_metadata: &write("web-index", b"ubuntu-index"),
+        base_versions: &write("base-versions", b"dpkg-query receipt"),
+    };
+    let review = HeldReview::hold(&signed, &pool, &closure).unwrap();
+    let web = UbuntuWebRecipe::qualify(
+        &base,
+        Some(PROFILE_PIN),
+        &pool,
+        Some(pool.canonical_pin().unwrap()),
+        &review,
+    )
+    .unwrap();
+    let recipe = UbuntuComposeRecipe::qualify(&web, &closure, receipt, &review).unwrap();
+    let matched = DockerRecipe {
+        identity: DockerRecipe::identity(recipe.digest()),
+        web: web.recipe_digest(),
+        closure: receipt.sha256,
+        medium: closure.medium.sha256,
+    };
+    let fixture_file =
+        |name, bytes: &[u8]| hold_file(&write(name, bytes), artifact(bytes), MAX_GUEST).unwrap();
+    // The selection boundary takes held inputs. Use a synthetic installer
+    // file here while retaining the official ISO pin in the recipe fixture.
+    let held = ComposeInstallerInputs {
+        medium: ComposeInstallerInputs::hold_medium(
+            &write("compose.iso", medium_bytes),
+            closure.medium,
+        )
+        .unwrap(),
+        installer: fixture_file("installer", b"installer fixture"),
+        guest: fixture_file("guest", guest),
+        firmware: [fixture_file("code", b"code"), fixture_file("vars", b"vars")],
+        review,
+        recipe: matched,
+        seed: recipe.render_seed([1; 16], guest).unwrap(),
+        detached_health: recipe.detached_health(),
+    };
+    let hold = |recipe| {
+        held.require_selected(&VerifiedDockerEvidence::recipe_fixture(recipe))?;
+        Ok::<_, NativeRefusal>(held.detached_health.as_str())
+    };
+    assert!(hold(matched).unwrap().contains("docker-compose-plugin"));
+
+    let mut wrong_medium = matched;
+    wrong_medium.medium[0] ^= 0xff;
+    let mut wrong_web = matched;
+    wrong_web.web[0] ^= 0xff;
+    let mut wrong_identity = matched;
+    wrong_identity.identity = DockerRecipe::identity([9; 32]);
+    for recipe in [wrong_medium, wrong_web, wrong_identity] {
+        assert!(hold(recipe).is_err());
+    }
+}
