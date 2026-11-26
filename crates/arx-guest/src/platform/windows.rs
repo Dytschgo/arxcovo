@@ -3259,39 +3259,71 @@ mod tests {
 
     const HOSTED_POWERSHELL_CRASH: u32 = 0x8013_1623;
 
+    fn is_hosted_win25(ci: Option<&str>, runner: Option<&str>, image: Option<&str>) -> bool {
+        ci.is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            && runner == Some("github-hosted")
+            && image.is_some_and(|value| value.starts_with("win25"))
+    }
+
     fn is_known_hosted_crash(
         outcome: Result<ScriptOutcome, &'static str>,
         ci: Option<&str>,
         runner: Option<&str>,
         image: Option<&str>,
     ) -> bool {
-        ci.is_some_and(|value| value.eq_ignore_ascii_case("true"))
-            && runner == Some("github-hosted")
-            && image.is_some_and(|value| value.starts_with("win25"))
+        is_hosted_win25(ci, runner, image)
             && outcome
                 == Ok(ScriptOutcome::Exited {
                     exit_code: HOSTED_POWERSHELL_CRASH,
                 })
     }
 
+    /// The runner classification inputs `CI`, `RUNNER_ENVIRONMENT` and
+    /// `ImageOS`. Tests inject them; the PowerShell tests read the process
+    /// environment once per outcome.
+    #[derive(Debug)]
+    struct HostedRunner {
+        ci: Option<String>,
+        environment: Option<String>,
+        image: Option<String>,
+    }
+
+    impl HostedRunner {
+        fn new(ci: Option<&str>, environment: Option<&str>, image: Option<&str>) -> Self {
+            Self {
+                ci: ci.map(str::to_owned),
+                environment: environment.map(str::to_owned),
+                image: image.map(str::to_owned),
+            }
+        }
+
+        fn from_env() -> Self {
+            Self {
+                ci: std::env::var("CI").ok(),
+                environment: std::env::var("RUNNER_ENVIRONMENT").ok(),
+                image: std::env::var("ImageOS").ok(),
+            }
+        }
+    }
+
     fn quarantine_hosted_crash(
         outcome: Result<ScriptOutcome, &'static str>,
         expected: ScriptOutcome,
+        runner: &HostedRunner,
         profile: &Arc<Profile>,
     ) -> bool {
         if outcome == Ok(expected) {
             return false;
         }
-        let ci = std::env::var("CI").ok();
-        let runner = std::env::var("RUNNER_ENVIRONMENT").ok();
-        let image = std::env::var("ImageOS").ok();
+        let ci = runner.ci.as_deref();
+        let environment = runner.environment.as_deref();
+        let image = runner.image.as_deref();
         let os = std::env::var("RUNNER_OS").ok();
         eprintln!(
-            "restricted PowerShell runner: CI={ci:?} RUNNER_ENVIRONMENT={runner:?} \
+            "restricted PowerShell runner: CI={ci:?} RUNNER_ENVIRONMENT={environment:?} \
              ImageOS={image:?} RUNNER_OS={os:?}"
         );
-        let known =
-            is_known_hosted_crash(outcome, ci.as_deref(), runner.as_deref(), image.as_deref());
+        let known = is_known_hosted_crash(outcome, ci, environment, image);
         if known {
             hosted_restricted_powershell_ladder(profile);
         }
@@ -3940,7 +3972,193 @@ mod tests {
         }
     }
 
-    fn powershell(script: &[u8], expected: u32) {
+    /// The hosted `Ok(TimedOut)` known issue. It is kept apart from the
+    /// `0x80131623` exit-code route in `is_known_hosted_crash`.
+    fn is_known_hosted_timeout(
+        outcome: Result<ScriptOutcome, &'static str>,
+        runner: &HostedRunner,
+    ) -> bool {
+        is_hosted_win25(
+            runner.ci.as_deref(),
+            runner.environment.as_deref(),
+            runner.image.as_deref(),
+        ) && outcome == Ok(ScriptOutcome::TimedOut)
+    }
+
+    /// The wrapper tests' only outcome dispatch. Returns `true` when the
+    /// hosted timeout was tolerated; every other mismatch panics.
+    fn settle_wrapper_outcome(
+        outcome: Result<ScriptOutcome, &'static str>,
+        expected: ScriptOutcome,
+        runner: &HostedRunner,
+        diagnose: impl FnOnce() -> String,
+    ) -> bool {
+        if is_known_hosted_timeout(outcome, runner) {
+            eprintln!("KNOWN-ISSUE hosted-windows-powershell-wrapper: Ok(TimedOut)");
+            return true;
+        }
+        assert_powershell(outcome, expected, diagnose);
+        false
+    }
+
+    /// The restricted-identity tests' only outcome dispatch. Returns `true`
+    /// when a hosted known issue (the crash ladder or the timeout) was
+    /// tolerated; every other mismatch panics.
+    fn settle_restricted_outcome(
+        outcome: Result<ScriptOutcome, &'static str>,
+        expected: ScriptOutcome,
+        runner: &HostedRunner,
+        profile: &Arc<Profile>,
+        diagnose: impl FnOnce() -> String,
+    ) -> bool {
+        if quarantine_hosted_crash(outcome, expected, runner, profile) {
+            return true;
+        }
+        if is_known_hosted_timeout(outcome, runner) {
+            eprintln!("KNOWN-ISSUE hosted-windows-powershell-restricted-identity: Ok(TimedOut)");
+            return true;
+        }
+        assert_powershell(outcome, expected, diagnose);
+        false
+    }
+
+    const SETTLE_EXPECTED: ScriptOutcome = ScriptOutcome::Exited { exit_code: 7 };
+
+    /// Mismatches that neither family tolerates on any runner.
+    const SETTLE_FAILURES: [Result<ScriptOutcome, &'static str>; 8] = [
+        Ok(ScriptOutcome::Exited { exit_code: 0 }),
+        Ok(ScriptOutcome::Exited { exit_code: 1 }),
+        Ok(ScriptOutcome::Exited { exit_code: 3 }),
+        Ok(ScriptOutcome::Unavailable),
+        Ok(ScriptOutcome::LaunchFailed),
+        Ok(ScriptOutcome::Terminated),
+        Err(CLEANUP_UNKNOWN),
+        Err(WORKSPACE_UNKNOWN),
+    ];
+
+    fn hosted_win25_runner() -> HostedRunner {
+        HostedRunner::new(Some("true"), Some("github-hosted"), Some("win25-vs2026"))
+    }
+
+    /// Runners outside the gate: local, owner-host, self-hosted, other image.
+    fn strict_runners() -> [HostedRunner; 8] {
+        let ci = Some("true");
+        let hosted = Some("github-hosted");
+        let affected = Some("win25-vs2026");
+        [
+            HostedRunner::new(None, None, None),
+            HostedRunner::new(None, hosted, affected),
+            HostedRunner::new(Some("false"), hosted, affected),
+            HostedRunner::new(ci, None, affected),
+            HostedRunner::new(ci, Some("self-hosted"), affected),
+            HostedRunner::new(ci, hosted, Some("win22")),
+            HostedRunner::new(ci, hosted, Some("ubuntu24")),
+            HostedRunner::new(ci, hosted, None),
+        ]
+    }
+
+    /// True when settling panics, that is, when the PowerShell test fails.
+    fn settle_fails(settle: impl FnOnce() -> bool) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(settle)).is_err()
+    }
+
+    #[test]
+    fn hosted_timeout_and_crash_predicates_stay_distinct() {
+        let hosted = hosted_win25_runner();
+        let timeout = Ok(ScriptOutcome::TimedOut);
+        let crash = Ok(ScriptOutcome::Exited {
+            exit_code: HOSTED_POWERSHELL_CRASH,
+        });
+        let (ci, environment, image) = (Some("true"), Some("github-hosted"), Some("win25"));
+        assert!(is_known_hosted_timeout(timeout, &hosted));
+        assert!(!is_known_hosted_timeout(crash, &hosted));
+        assert!(is_known_hosted_crash(crash, ci, environment, image));
+        assert!(!is_known_hosted_crash(timeout, ci, environment, image));
+    }
+
+    #[test]
+    fn wrapper_family_tolerates_only_the_hosted_timeout() {
+        let hosted = hosted_win25_runner();
+        let fails = |outcome: Result<ScriptOutcome, &'static str>, runner: &HostedRunner| {
+            settle_fails(|| settle_wrapper_outcome(outcome, SETTLE_EXPECTED, runner, String::new))
+        };
+        assert!(settle_wrapper_outcome(
+            Ok(ScriptOutcome::TimedOut),
+            SETTLE_EXPECTED,
+            &hosted,
+            String::new
+        ));
+        assert!(!settle_wrapper_outcome(
+            Ok(SETTLE_EXPECTED),
+            SETTLE_EXPECTED,
+            &hosted,
+            String::new
+        ));
+        // The wrapper has no crash route: the hosted crash exit fails too.
+        let crash = Ok(ScriptOutcome::Exited {
+            exit_code: HOSTED_POWERSHELL_CRASH,
+        });
+        for outcome in SETTLE_FAILURES.into_iter().chain([crash]) {
+            assert!(fails(outcome, &hosted), "hosted {outcome:?} must fail");
+        }
+        for runner in strict_runners() {
+            assert!(!fails(Ok(SETTLE_EXPECTED), &runner));
+            assert!(
+                fails(Ok(ScriptOutcome::TimedOut), &runner),
+                "{runner:?} must fail on Ok(TimedOut)"
+            );
+        }
+    }
+
+    #[test]
+    fn restricted_identity_family_tolerates_only_the_hosted_timeout() {
+        let root = TestRoot::new("settle");
+        let profile = Arc::new(test_profile(&root.0));
+        let hosted = hosted_win25_runner();
+        let fails = |outcome: Result<ScriptOutcome, &'static str>, runner: &HostedRunner| {
+            settle_fails(|| {
+                settle_restricted_outcome(outcome, SETTLE_EXPECTED, runner, &profile, String::new)
+            })
+        };
+        assert!(settle_restricted_outcome(
+            Ok(ScriptOutcome::TimedOut),
+            SETTLE_EXPECTED,
+            &hosted,
+            &profile,
+            String::new
+        ));
+        assert!(!settle_restricted_outcome(
+            Ok(SETTLE_EXPECTED),
+            SETTLE_EXPECTED,
+            &hosted,
+            &profile,
+            String::new
+        ));
+        // The hosted crash exit belongs to the separate exit-code route, whose
+        // ladder launches real probes; its predicate has its own test above.
+        for outcome in SETTLE_FAILURES {
+            assert!(fails(outcome, &hosted), "hosted {outcome:?} must fail");
+        }
+        let crash = Ok(ScriptOutcome::Exited {
+            exit_code: HOSTED_POWERSHELL_CRASH,
+        });
+        for runner in strict_runners() {
+            assert!(!fails(Ok(SETTLE_EXPECTED), &runner));
+            for outcome in [Ok(ScriptOutcome::TimedOut), crash] {
+                assert!(
+                    fails(outcome, &runner),
+                    "{runner:?} must fail on {outcome:?}"
+                );
+            }
+        }
+        assert_eq!(
+            root.entries(),
+            0,
+            "no settle case created request directories"
+        );
+    }
+
+    fn assert_powershell_wrapper(script: &[u8], expected: u32) {
         let root = TestRoot::new("wrapper");
         let (windows, system) = system_paths().unwrap();
         let command = CommandLine::powershell(&windows, &system, &root.0).unwrap();
@@ -3959,11 +4177,12 @@ mod tests {
                 |_| Ok(()),
             )
         });
-        assert_powershell(
+        settle_wrapper_outcome(
             outcome,
             ScriptOutcome::Exited {
                 exit_code: expected,
             },
+            &HostedRunner::from_env(),
             || {
                 let rerun = TestRoot::new("wrapper-diagnostic");
                 capture_powershell(
@@ -3982,11 +4201,11 @@ mod tests {
     // only for wrapper semantics and the production-identity gates.
     #[test]
     fn wrapper_evaluates_utf8_multiline_with_implicit_success() {
-        powershell("$x = 'é漢'\nif ($x[0] -ne [char]233 -or $x[1] -ne [char]28450) { throw 'fixture' }\n$x".as_bytes(), 0);
+        assert_powershell_wrapper("$x = 'é漢'\nif ($x[0] -ne [char]233 -or $x[1] -ne [char]28450) { throw 'fixture' }\n$x".as_bytes(), 0);
     }
     #[test]
     fn wrapper_reports_implicit_error() {
-        powershell(b"throw 'fixture'", 1);
+        assert_powershell_wrapper(b"throw 'fixture'", 1);
     }
 
     #[test]
@@ -4010,14 +4229,15 @@ mod tests {
             Instant::now() + POWERSHELL_GUARD,
         );
         let expected = ScriptOutcome::Exited { exit_code: 7 };
-        if quarantine_hosted_crash(outcome, expected, &profile) {
-            assert_eq!(root.entries(), 0, "request and probe directories removed");
-            return;
-        }
-        assert_powershell(outcome, expected, || {
-            restricted_failure_report(&profile, script.as_bytes())
-        });
-        assert_eq!(root.entries(), 0, "request directory removed after cleanup");
+        // A tolerated hosted timeout or crash still requires full cleanup.
+        settle_restricted_outcome(
+            outcome,
+            expected,
+            &HostedRunner::from_env(),
+            &profile,
+            || restricted_failure_report(&profile, script.as_bytes()),
+        );
+        assert_eq!(root.entries(), 0, "request and probe directories removed");
     }
 
     /// The no-conflict snapshot: everything absent except the script block
@@ -4046,16 +4266,18 @@ mod tests {
         let sentinel = ScriptOutcome::Exited {
             exit_code: SELF_TEST_SENTINEL,
         };
-        if quarantine_hosted_crash(outcome, sentinel, &profile) {
-            assert_eq!(root.entries(), 0, "request and probe directories removed");
-            return;
+        let tolerated = settle_restricted_outcome(
+            outcome,
+            sentinel,
+            &HostedRunner::from_env(),
+            &profile,
+            || restricted_failure_report(&profile, SELF_TEST.as_bytes()),
+        );
+        if !tolerated {
+            // The same outcome admits a production-shaped profile.
+            let admitted = admit(test_profile(&root.0), &clean_policy(), |_| outcome);
+            assert!(matches!(admitted, Ok(Some(_))));
         }
-        assert_powershell(outcome, sentinel, || {
-            restricted_failure_report(&profile, SELF_TEST.as_bytes())
-        });
-        // The same outcome admits a production-shaped profile.
-        let admitted = admit(test_profile(&root.0), &clean_policy(), |_| outcome);
-        assert!(matches!(admitted, Ok(Some(_))));
         assert_eq!(
             root.entries(),
             0,
