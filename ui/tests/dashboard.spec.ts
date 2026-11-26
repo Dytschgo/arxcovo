@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { contrastFailures, freezeMotion } from './contrast';
+import { auditText, freezeMotion } from './contrast';
 
 // Runs against `vite dev`, so the deterministic stand-in adapter is active.
 // Screenshots land in test-results/screenshots (gitignored) for the PR.
@@ -154,7 +154,9 @@ for (const motion of ['no-preference', 'reduce'] as const) {
     test.setTimeout(120_000);
     await page.emulateMedia({ reducedMotion: motion });
     const audit = async (where: string) => {
-      expect.soft(await contrastFailures(page), where).toEqual([]);
+      const { contrast, opacityGroups } = await auditText(page);
+      expect.soft(contrast, where).toEqual([]);
+      expect.soft(opacityGroups, `${where}: text inside an opacity group`).toEqual([]);
     };
     await page.goto('/');
     if (motion === 'no-preference') await freezeMotion(page);
@@ -232,7 +234,11 @@ test('contrast: in-flight states (signing in, a running command) clear 4.5:1 in 
   await page.clock.pauseAt(Date.now() + 60_000);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('button', { name: 'Signing in…' })).toBeDisabled();
-  expect.soft(await contrastFailures(page), 'signing in').toEqual([]);
+  {
+    const { contrast, opacityGroups } = await auditText(page);
+    expect.soft(contrast, 'signing in').toEqual([]);
+    expect.soft(opacityGroups, 'signing in: text inside an opacity group').toEqual([]);
+  }
   await page.clock.resume();
   await expect(page.getByRole('list', { name: 'Hosts' })).toBeVisible();
 
@@ -244,7 +250,11 @@ test('contrast: in-flight states (signing in, a running command) clear 4.5:1 in 
   await input.press('Enter');
   await expect(page.getByRole('button', { name: 'Cancel' })).toBeVisible();
   await expect(page.getByText('Terminal status: running')).toBeAttached();
-  expect.soft(await contrastFailures(page), 'command running').toEqual([]);
+  {
+    const { contrast, opacityGroups } = await auditText(page);
+    expect.soft(contrast, 'command running').toEqual([]);
+    expect.soft(opacityGroups, 'command running: text inside an opacity group').toEqual([]);
+  }
   await page.clock.resume();
   await expect(page.getByRole('log')).toContainText('exit 0');
 });

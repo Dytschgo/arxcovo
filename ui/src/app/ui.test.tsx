@@ -243,4 +243,16 @@ describe('logo', () => {
       expect(svg.querySelector('.lg-c')!.getAttribute('stroke')).toBe(`url(#${ids[i]})`);
     });
   });
+
+  test('its light, the one element allowed to fade, is a text-free shape inside the aria-hidden graphic', () => {
+    // styles.test.ts lets only `.logo .lg-c` go below opacity 1; that is safe
+    // only while it holds no text and the whole graphic stays decorative.
+    const { container } = render(<Logo />);
+    const light = container.querySelector('.logo .lg-c')!;
+    expect(light.tagName.toLowerCase()).toBe('ellipse');
+    expect(light.closest('svg')!.getAttribute('aria-hidden')).toBe('true');
+    expect(light.childNodes).toHaveLength(0);
+    expect(container.querySelector('svg.logo')!.textContent).toBe('');
+    expect(container.querySelector('svg.logo text, svg.logo foreignObject')).toBeNull();
+  });
 });
