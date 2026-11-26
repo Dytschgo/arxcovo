@@ -3900,12 +3900,39 @@ pub(crate) mod tests {
         }
     }
 
+    type TickCompletion = Option<tokio::sync::oneshot::Sender<()>>;
+
     /// Injected reaper turns for the supervised runner.
-    pub(super) struct TestTicks(tokio::sync::mpsc::UnboundedReceiver<()>);
+    pub(super) struct TestTicks {
+        requests: tokio::sync::mpsc::UnboundedReceiver<TickCompletion>,
+        completed: TickCompletion,
+    }
+
+    impl TestTicks {
+        fn channel() -> (tokio::sync::mpsc::UnboundedSender<TickCompletion>, Self) {
+            let (send, requests) = tokio::sync::mpsc::unbounded_channel();
+            (
+                send,
+                Self {
+                    requests,
+                    completed: None,
+                },
+            )
+        }
+    }
 
     impl ReaperTick for TestTicks {
         async fn next_tick(&mut self) -> bool {
-            self.0.recv().await.is_some()
+            // The runner requests the next tick after publication and the
+            // blocking custody sweep have both returned.
+            if let Some(completed) = self.completed.take() {
+                let _ = completed.send(());
+            }
+            let Some(completed) = self.requests.recv().await else {
+                return false;
+            };
+            self.completed = completed;
+            true
         }
     }
 
@@ -5618,7 +5645,7 @@ pub(crate) mod tests {
         supervisor: Option<Arc<Supervisor>>,
         endpoint: Endpoint,
         tokens: [String; 2],
-        ticks: tokio::sync::mpsc::UnboundedSender<()>,
+        ticks: tokio::sync::mpsc::UnboundedSender<TickCompletion>,
         trip: Arc<Notify>,
         interrupt: Option<tokio::sync::oneshot::Sender<()>>,
         server: Option<JoinHandle<Result<()>>>,
@@ -5699,8 +5726,8 @@ pub(crate) mod tests {
                 ));
             }
             supervisor.gate.lock().unwrap().fixture = Some(fixture);
-            let (ticks, receiver) = tokio::sync::mpsc::unbounded_channel();
-            *supervisor.ticks.lock().unwrap() = Some(TestTicks(receiver));
+            let (ticks, receiver) = TestTicks::channel();
+            *supervisor.ticks.lock().unwrap() = Some(receiver);
             supervisor.startup_sweep().unwrap();
             let endpoint = Endpoint {
                 #[cfg(unix)]
@@ -5867,7 +5894,16 @@ pub(crate) mod tests {
         }
 
         async fn tick(&self) {
-            self.ticks.send(()).unwrap();
+            self.ticks.send(None).unwrap();
+        }
+
+        async fn tick_and_wait(&self) {
+            let (completed, wait) = tokio::sync::oneshot::channel();
+            self.ticks.send(Some(completed)).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .expect("reaper turn did not complete")
+                .expect("reaper exited before completing the turn");
         }
     }
 
@@ -8128,10 +8164,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "intermittent macOS b2 snapshot barrier shutdown: docs/ROADMAP.md Known issues"
-    )]
     async fn b2_snapshot_barrier_races_busy_unpublish_pending_removal_and_old_origin() {
         use std::sync::atomic::Ordering::SeqCst;
         let mut h = Harness::start_with_web(false, false, true).await;
@@ -10808,7 +10840,9 @@ pub(crate) mod tests {
     }
 
     async fn settle(h: &Harness, a: &Client, vm: &Value) -> Value {
-        h.tick().await;
+        // Publication can report unpublished before the same turn finishes
+        // fencing and reconciling VM custody.
+        h.tick_and_wait().await;
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let row = phase(a, vm).await;
@@ -14999,8 +15033,8 @@ pub(crate) mod tests {
             let temp = crate::service::application::tests::private_temp();
             let supervisor = idle_supervisor(&temp);
             let ticks = reaper.then(|| {
-                let (ticks, receiver) = tokio::sync::mpsc::unbounded_channel();
-                *supervisor.ticks.lock().unwrap() = Some(TestTicks(receiver));
+                let (ticks, receiver) = TestTicks::channel();
+                *supervisor.ticks.lock().unwrap() = Some(receiver);
                 ticks
             });
             let mut stall = Stall::install(if reaper {
@@ -15042,7 +15076,7 @@ pub(crate) mod tests {
             ));
             let call = match &ticks {
                 Some(ticks) => {
-                    ticks.send(()).unwrap();
+                    ticks.send(None).unwrap();
                     None
                 }
                 None => {

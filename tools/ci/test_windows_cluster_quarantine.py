@@ -703,22 +703,11 @@ class HeavyServiceGroupTests(unittest.TestCase):
 
 # Kept in this module because the existing static CI step selects this file.
 B2_TEST = "b2_snapshot_barrier_races_busy_unpublish_pending_removal_and_old_origin"
-B2_REASON = (
-    "intermittent macOS b2 snapshot barrier shutdown: docs/ROADMAP.md Known issues"
-)
-B2_PREDICATE = 'target_os = "macos"'
-B2_GATE = (
-    "#[cfg_attr(\n"
-    "        " + B2_PREDICATE + ",\n"
-    '        ignore = "' + B2_REASON + '"\n'
-    "    )]"
-)
+B2_TEST_ATTR = "#[tokio::test]"
 B2_TESTS_DECL = "pub(crate) mod tests {"
-# Raw substring counts. The tests-module figures are main's counts plus the
-# one macOS gate (`cfg_attr` contributes one `cfg`, and the gate contributes
-# one `ignore`). The declaration figure is main's `#[cfg(test)]` only.
-B2_TESTS_CFG = 24
-B2_TESTS_IGNORE = 1
+# Raw substring counts after the macOS gate was removed.
+B2_TESTS_CFG = 23
+B2_TESTS_IGNORE = 0
 B2_DECL_CFG = 1
 B2_PATH_ATTRS = 0
 
@@ -746,7 +735,7 @@ def _tests_parts(source):
     return declaration, tests
 
 
-def assert_b2_macos_quarantine(source):
+def assert_b2_runs_on_all_platforms(source):
     declaration, tests = _tests_parts(source)
     stripped = _strip_block_comments(tests)
     if (tests.count("cfg"), tests.count("ignore"),
@@ -759,29 +748,36 @@ def assert_b2_macos_quarantine(source):
     file_stripped = _strip_block_comments(source)
     if (source.count("#[path"), file_stripped.count("#[path")) != (B2_PATH_ATTRS, B2_PATH_ATTRS):
         raise AssertionError("vm.rs path attribute would redirect the tests module")
-    gate = _norm('#[cfg_attr(' + B2_PREDICATE + ', ignore = "' + B2_REASON + '")]')
-    if _norm(tests).count(gate + "asyncfn" + B2_TEST + "(") != 1:
-        raise AssertionError("macOS ignore must stay on the b2 snapshot barrier test")
+    masked = _mask_comments(tests)
+    starts = list(re.finditer(r"^[ \t]*async fn " + B2_TEST + r"\(", masked, re.M))
+    if len(starts) != 1:
+        raise AssertionError("b2 snapshot barrier test must have one active definition")
+    start = starts[0].start()
+    cut = _attribute_cut(masked[:start])
+    if _norm(tests[cut:start]) != B2_TEST_ATTR:
+        raise AssertionError("b2 snapshot barrier must stay an unconditional test")
 
 
-class B2MacosQuarantineTests(unittest.TestCase):
-    def test_exact_macos_only_b2_snapshot_barrier_quarantine(self):
+class B2SnapshotBarrierCoverageTests(unittest.TestCase):
+    def test_b2_snapshot_barrier_runs_on_all_platforms(self):
         source = (ROOT / "crates/arxd/src/mcp/vm.rs").read_text(encoding="utf-8")
-        assert_b2_macos_quarantine(source)
+        assert_b2_runs_on_all_platforms(source)
+        signature = "async fn " + B2_TEST + "("
+        target = B2_TEST_ATTR + "\n    " + signature
         other = "async fn stale_copy_cleanup_preserves_committed_static_point_and_active_media("
         mutants = {
-            "gate removed": source.replace(B2_GATE + "\n", "", 1),
-            "predicate unix": source.replace(B2_PREDICATE, "unix", 1),
-            "predicate all()": source.replace(B2_PREDICATE, "all()", 1),
-            "predicate not(windows)": source.replace(B2_PREDICATE, "not(windows)", 1),
-            "wrong reason": source.replace(B2_REASON, "unapproved reason", 1),
-            "renamed function": source.replace(
-                "async fn " + B2_TEST + "(", "async fn renamed(", 1
+            "macOS gate restored": source.replace(
+                signature,
+                '#[cfg_attr(target_os = "macos", ignore = "flaky")]\n    ' + signature,
+                1,
             ),
-            "second ignore": source.replace(other, "#[ignore]\n    " + other, 1),
+            "test attribute removed": source.replace(target, signature, 1),
+            "test attribute commented out": source.replace(target, "// " + target, 1),
+            "renamed function": source.replace(signature, "async fn renamed(", 1),
+            "neighbor ignore": source.replace(other, "#[ignore]\n    " + other, 1),
             "cfg on target function": source.replace(
-                "    #[tokio::test]\n    " + B2_GATE,
-                '    #[cfg(not(target_os="linux"))]\n    #[tokio::test]\n    ' + B2_GATE,
+                target,
+                '    #[cfg(not(target_os="linux"))]\n    ' + target,
                 1,
             ),
             "cfg on neighbor": source.replace(
@@ -798,9 +794,9 @@ class B2MacosQuarantineTests(unittest.TestCase):
                 1,
             ),
             "comment cfg on target": source.replace(
-                "    #[tokio::test]\n    " + B2_GATE,
+                target,
                 "    #[/* Fixture limitation */ cfg(not(target_os = \"windows\"))] "
-                "// Platform restriction\n    #[tokio::test]\n    " + B2_GATE,
+                "// Platform restriction\n    " + target,
                 1,
             ),
             "comment cfg on neighbor": source.replace(
@@ -810,9 +806,8 @@ class B2MacosQuarantineTests(unittest.TestCase):
                 1,
             ),
             "raw cfg identifier": source.replace(
-                "    #[tokio::test]\n    " + B2_GATE,
-                "    #[r#cfg(not(target_os = \"windows\"))] // raw\n"
-                "    #[tokio::test]\n    " + B2_GATE,
+                target,
+                "    #[r#cfg(not(target_os = \"windows\"))] // raw\n    " + target,
                 1,
             ),
             "macro generated cfg": source.replace(
@@ -830,7 +825,7 @@ class B2MacosQuarantineTests(unittest.TestCase):
             with self.subTest(mutant=label):
                 self.assertNotEqual(mutant, source)
                 with self.assertRaises(AssertionError):
-                    assert_b2_macos_quarantine(mutant)
+                    assert_b2_runs_on_all_platforms(mutant)
 
 
 # The C11 case is compiled only inside hosted, which is Linux-only. The
