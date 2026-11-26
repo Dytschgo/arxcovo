@@ -595,9 +595,10 @@ profile remains gated on owner-host qualification.
 
 Run this maintenance from a local console as the non-elevated account that
 owns the foreground VM state store. Start the current controller once to
-upgrade the store to v15, then stop it before running either command. Use the
-foreground VM state directory containing `activity.sqlite3` and
-`activity.lock`. The command uses the same store lock as the controller.
+upgrade the store to its current version, then stop it before running
+either command. Use the foreground VM state directory containing
+`activity.sqlite3` and `activity.lock`. The command uses the same store
+lock as the controller.
 
 ```text
 arxd backup-retire --state-dir STATE_DIR --list
