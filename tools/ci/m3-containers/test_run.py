@@ -619,8 +619,12 @@ class RunnerTests(unittest.TestCase):
     def test_each_runner_profile_requires_its_own_kernel_and_package(self):
         host = fixture.load_pins()["host"]
         vetted = {**fixture.TOOLS, "ip": "/usr/bin/ip"}
-        first, second = host["profiles"]
-        for profile, other in ((first, second), (second, first)):
+        profiles = host["profiles"]
+        identities = [(item["image_os"], item["image_version"]) for item in profiles]
+        self.assertEqual(len(identities), len(set(identities)))
+        self.assertIn(("ubuntu24", "20261122.23.1"), identities)
+        for profile in profiles:
+            other = next(item for item in profiles if item["kernel"] != profile["kernel"])
             env = self.hosted_env(profile)
             head = env["GITHUB_SHA"]
             end = 1
@@ -641,7 +645,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(receipt["kernel"], profile["kernel"])
                 self.assertEqual(receipt["systemd"], profile["systemd_package"])
 
-                package.return_value = "255.4-1ubuntu8.19"
+                package.return_value = profile["systemd_package"] + "-refused"
                 with self.assertRaisesRegex(fixture.Refusal, "runner-systemd"):
                     run.checked_runner_platform(env, host, head, end, vetted)
 
