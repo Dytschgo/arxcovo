@@ -3294,6 +3294,30 @@ async fn monitor_running<T, E>(
     result.and_then(|value| terminal.map(|()| value))
 }
 
+/// Runs the installed setup phase under the live monitor. The setup future
+/// stamps its accepted `cont` itself, so the monitor's terminal sample and
+/// any later scheduling count against the guest-ready budget it returns.
+async fn monitor_setup<T>(
+    setup: impl std::future::Future<Output = Result<T, NativeRefusal>>,
+    observe: impl FnMut() -> Result<(), NativeRefusal>,
+    cancel: &Shutdown,
+    setup_by: tokio::time::Instant,
+    boot_by: tokio::time::Instant,
+) -> Result<(T, tokio::time::Instant), NativeRefusal> {
+    let (value, accepted) = monitor_running(
+        async {
+            let value = setup.await?;
+            Ok::<_, NativeRefusal>((value, tokio::time::Instant::now()))
+        },
+        observe,
+        cancel,
+        setup_by,
+        |_| NativeRefusal::QmpUnverified,
+    )
+    .await?;
+    Ok((value, guest_ready_cutoff(boot_by, accepted)))
+}
+
 /// Release keeps its own teardown budget so custody evidence is collected
 /// after a refusal too. Output is accepted only if a host sample taken after
 /// release settles succeeds and its capture time is still fresh, and then
@@ -3598,7 +3622,7 @@ impl CheckedLaunchCore<'_> {
             .resume_checked_by(cancel, setup_by, &mut revalidate)
             .map_err(BootFailure::Native)?;
         let refresh = std::cell::RefCell::new(revalidate);
-        let (mut qmp, pipe) = monitor_running(
+        let ((mut qmp, pipe), ready_by) = monitor_setup(
             async {
                 // QEMU can wait for a serial client before sending QMP greeting.
                 let pipe = connect_serial(
@@ -3633,12 +3657,11 @@ impl CheckedLaunchCore<'_> {
             || self.check_running(&mut *refresh.borrow_mut(), false),
             cancel,
             setup_by,
-            |_| NativeRefusal::QmpUnverified,
+            boot_by,
         )
         .await
         .map_err(BootFailure::Native)?;
-        // The guest-ready phase starts at the accepted `cont`.
-        let ready_by = guest_ready_cutoff(boot_by, tokio::time::Instant::now());
+        // The guest-ready phase started at the accepted `cont`.
         let guest = monitor_running(
             async {
                 GuestChannel::ready(pipe, &mut qmp, cancel)
@@ -4222,6 +4245,42 @@ mod tests {
         // A late accepted `cont` cannot extend readiness past the start cutoff.
         let accepted = distant - Duration::from_secs(10);
         assert_eq!(guest_ready_cutoff(distant, accepted), distant);
+    }
+
+    #[tokio::test]
+    async fn guest_ready_cutoff_counts_the_terminal_sample_after_accepted_cont() {
+        let accepted = std::cell::Cell::new(None);
+        let samples = std::cell::Cell::new(0_u32);
+        let now = tokio::time::Instant::now();
+        let (setup_by, boot_by) = (now + Duration::from_secs(60), now + Duration::from_secs(360));
+        let lag = Duration::from_millis(200);
+        let ((), ready_by) = monitor_setup(
+            async {
+                accepted.set(Some(tokio::time::Instant::now()));
+                Ok::<_, NativeRefusal>(())
+            },
+            || {
+                samples.set(samples.get() + 1);
+                // The terminal sample after the accepted `cont` is slow.
+                if accepted.get().is_some() {
+                    std::thread::sleep(lag);
+                }
+                Ok(())
+            },
+            &Shutdown::default(),
+            setup_by,
+            boot_by,
+        )
+        .await
+        .unwrap();
+        let accepted = accepted.get().unwrap();
+        let budget = crate::vm::guest::GUEST_READY_BUDGET;
+        assert!(samples.get() >= 2, "the terminal sample did not run");
+        assert!(ready_by >= accepted + budget);
+        assert!(
+            ready_by < accepted + budget + lag,
+            "the guest-ready phase started after the terminal sample"
+        );
     }
 
     #[test]
