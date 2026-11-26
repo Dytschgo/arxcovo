@@ -68,6 +68,10 @@ describe('board totals', () => {
     expect(boardTotals([], [])).toEqual({ hosts: 0, online: 0, degraded: 0, offline: 0, vms: 0, running: 0, test: 0, static: 0 });
   });
 
+  test('VMs count even when their host is not in the host list', () => {
+    expect(boardTotals([host('a')], [vm('v1', 'a'), vm('lost', 'gone')])).toMatchObject({ hosts: 1, vms: 2, test: 2 });
+  });
+
   test('only running counts as running', () => {
     const states = (['creating', 'running', 'stopped', 'snapshotting', 'migrating', 'failed', 'destroying'] as const).map((state, i) => vm(`v${i}`, 'a', { state }));
     expect(boardTotals([], states).running).toBe(1);
