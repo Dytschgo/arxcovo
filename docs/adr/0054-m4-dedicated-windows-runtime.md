@@ -1505,3 +1505,26 @@ worker-join and writer-exclusion checks after a monitor failure. An absent
 proof keeps the charge quarantined. The console activity source is shared
 with preflight and qualification. Native monitoring and teardown are
 **unverified on real hardware**.
+
+## 7c amendment — durable generation and slot identity before writes
+
+[ADR 0072](0072-vm-store-v16-native-test-custody.md) adds store v16 custody
+rows. A new generation records its intent, then the directory identity,
+then the synced lease identity, each before the next relative create-new.
+The workspace is held only after the ledger binds the exact store host,
+production root, directory, lease and origin protocol. Every later hold of
+that workspace checks the same scope. Each slot records its intent before
+create-new and its identity under the held handle before any write or
+writable child. It records length and digest only after a write, sync and
+held content check. A lost directory acknowledgement resumes at the lease.
+
+Installer staging authorizes and checkpoints the seed and the initial VARS
+separately. The seed is verified in the ledger before the VARS intent.
+The empty helper target is identified before the checked qemu-img write,
+and a checked Mutate launch accepts only that ledger-identified target.
+An occupied or unidentified leaf stays charged and quarantined and is never
+adopted. Only the create-to-checkpoint crash window can leave a new
+unidentified leaf. The chunk 04 start refusal keeps its original lease. The
+binding it carries is this durable scope. Production TEST admission stays
+closed. Native creation and reconciliation are **unverified on real
+hardware**.
