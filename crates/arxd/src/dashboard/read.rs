@@ -209,12 +209,13 @@ pub(super) struct HostReading {
     pub(super) cpu: Option<f32>,
 }
 
-/// The production source: one long-lived `sysinfo::System`.
-struct SysinfoSource(sysinfo::System);
+/// The production source: one long-lived `sysinfo::System`, created by the
+/// first refresh on the blocking pool rather than at daemon startup.
+struct SysinfoSource(Option<sysinfo::System>);
 
 impl HostSource for SysinfoSource {
     fn refresh(&mut self, sample_cpu: bool) -> HostReading {
-        let system = &mut self.0;
+        let system = self.0.get_or_insert_with(sysinfo::System::new);
         let cpu = if sample_cpu {
             if system.cpus().is_empty() {
                 system.refresh_cpu_all();
@@ -262,6 +263,33 @@ pub(super) struct HostFacts {
     pub(super) used_percent: Option<f64>,
 }
 
+impl HostFacts {
+    fn inventory(&self) -> HostInventory {
+        HostInventory {
+            model: self.model.clone(),
+            cores: self.cores,
+            total_memory: self.total_memory,
+        }
+    }
+}
+
+/// Static host facts. They do not change while the daemon runs, so they stay
+/// valid after the sampler fails.
+#[derive(Clone)]
+pub(super) struct HostInventory {
+    pub(super) model: String,
+    pub(super) cores: usize,
+    pub(super) total_memory: u64,
+}
+
+/// What a host read reports. Telemetry is `None` unless a live sample is
+/// published; `inventory` is `None` until any sample has been taken.
+pub(super) struct HostView {
+    pub(super) inventory: Option<HostInventory>,
+    pub(super) used_memory: Option<u64>,
+    pub(super) used_percent: Option<f64>,
+}
+
 impl<S: HostSource> HostProbe<S> {
     fn new(source: S) -> Self {
         Self {
@@ -288,21 +316,22 @@ impl<S: HostSource> HostProbe<S> {
     }
 }
 
-/// What a host read can see. Reads answer `UNAVAILABLE` until the first
-/// sample is published, and again after a refresh panicked.
+/// Published sampler state. `Failed` keeps the inventory of the last
+/// sample, if there was one.
 #[derive(Clone)]
 enum HostState {
     Pending,
     Ready(HostFacts),
-    Failed,
+    Failed(Option<HostInventory>),
 }
 
 /// Latest host figures, refreshed by one background task. Host reads copy
 /// the published state and never refresh, so a read never waits for a
 /// native CPU or memory refresh, its own or another request's. Every
 /// refresh, the first included, runs on the blocking pool, so creating the
-/// sampler never blocks daemon startup, and a refresh panic only marks the
-/// state failed. The task stops when the last clone (held by the dashboard
+/// sampler never blocks daemon startup. Telemetry problems never fail a host
+/// read: before the first sample, or after a refresh panic, the read reports
+/// null telemetry. The task stops when the last clone (held by the dashboard
 /// state) is dropped.
 #[derive(Clone)]
 pub(super) struct HostSampler {
@@ -320,7 +349,7 @@ impl Drop for SamplerTask {
 
 impl HostSampler {
     pub(super) fn native() -> Self {
-        Self::start(SysinfoSource(sysinfo::System::new()), SAMPLE_PERIOD)
+        Self::start(SysinfoSource(None), SAMPLE_PERIOD)
     }
 
     /// Spawns the sampler: the first refresh starts at once, later ones every
@@ -345,9 +374,16 @@ impl HostSampler {
                 {
                     Ok(next) => probe = next,
                     Err(_) => {
-                        // Tokio caught the panic on the blocking pool. Degrade to
-                        // unavailable rather than show stale or partial figures.
-                        slot.send_replace(HostState::Failed);
+                        // Tokio caught the panic on the blocking pool. Keep the
+                        // static inventory; stop publishing telemetry.
+                        slot.send_modify(|state| {
+                            let inventory = match state {
+                                HostState::Ready(facts) => Some(facts.inventory()),
+                                HostState::Failed(inventory) => inventory.clone(),
+                                HostState::Pending => None,
+                            };
+                            *state = HostState::Failed(inventory);
+                        });
                         eprintln!("arxd: dashboard host sampler stopped after a refresh failure");
                         return;
                     }
@@ -362,10 +398,23 @@ impl HostSampler {
 
     /// Copies the last published figures. The channel lock is only ever held
     /// for a copy or a swap, never across a refresh.
-    pub(super) fn latest(&self) -> Result<HostFacts, ApiError> {
+    pub(super) fn latest(&self) -> HostView {
         match &*self.latest.borrow() {
-            HostState::Ready(facts) => Ok(facts.clone()),
-            HostState::Pending | HostState::Failed => Err(ApiError::UNAVAILABLE),
+            HostState::Ready(facts) => HostView {
+                inventory: Some(facts.inventory()),
+                used_memory: Some(facts.used_memory),
+                used_percent: facts.used_percent,
+            },
+            HostState::Failed(inventory) => HostView {
+                inventory: inventory.clone(),
+                used_memory: None,
+                used_percent: None,
+            },
+            HostState::Pending => HostView {
+                inventory: None,
+                used_memory: None,
+                used_percent: None,
+            },
         }
     }
 
@@ -379,7 +428,15 @@ impl HostSampler {
     /// Waits until a refresh failure is published.
     #[cfg(test)]
     pub(super) async fn failed(&self) {
-        self.wait(|state| matches!(state, HostState::Failed)).await;
+        self.wait(|state| matches!(state, HostState::Failed(_)))
+            .await;
+    }
+
+    /// Waits until a published sample satisfies `done`.
+    #[cfg(test)]
+    pub(super) async fn sampled(&self, mut done: impl FnMut(&HostFacts) -> bool) {
+        self.wait(|state| matches!(state, HostState::Ready(facts) if done(facts)))
+            .await;
     }
 
     #[cfg(test)]
@@ -395,6 +452,19 @@ fn publish<S: HostSource>(probe: &mut HostProbe<S>, slot: &tokio::sync::watch::S
     slot.send_replace(HostState::Ready(facts));
 }
 
+/// Inventory for a read before any sample exists (pending, or the first
+/// refresh failed): a memory-only native read local to this request, with no
+/// CPU counters and no shared state; the available parallelism; no model.
+fn fallback_inventory() -> HostInventory {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
+    HostInventory {
+        model: String::new(),
+        cores: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        total_memory: system.total_memory(),
+    }
+}
+
 fn host(activity: &Activity, id: &str, now: i64, sampler: &HostSampler) -> Result<Value, ApiError> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
@@ -402,7 +472,8 @@ fn host(activity: &Activity, id: &str, now: i64, sampler: &HostSampler) -> Resul
         return Err(ApiError::UNAVAILABLE);
     }
     let arch = if arch == "aarch64" { "arm64" } else { arch };
-    let facts = sampler.latest()?;
+    let view = sampler.latest();
+    let inventory = view.inventory.unwrap_or_else(fallback_inventory);
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let (disk_total, disk_free) = disks.iter().fold((0u64, 0u64), |(total, free), disk| {
         (
@@ -445,8 +516,11 @@ fn host(activity: &Activity, id: &str, now: i64, sampler: &HostSampler) -> Resul
     Ok(json!({
         "id": id, "name": text(&name, 128), "os": os, "arch": arch,
         "osVersion": text(&sysinfo::System::long_os_version().unwrap_or_default(), 128),
-        "cpu": cpu_object(&facts.model, facts.cores, facts.used_percent),
-        "memory": {"totalBytes": facts.total_memory.min(MAX_INTEGER), "usedBytes": facts.used_memory.min(MAX_INTEGER)},
+        "cpu": cpu_object(&inventory.model, inventory.cores, view.used_percent),
+        "memory": {
+            "totalBytes": inventory.total_memory.min(MAX_INTEGER),
+            "usedBytes": view.used_memory.map(|used| used.min(MAX_INTEGER)),
+        },
         "disk": {"totalBytes": disk_total.min(MAX_INTEGER), "freeBytes": disk_free.min(MAX_INTEGER), "capBytes": null},
         "tools": tools, "reachability": "online", "reachabilityReason": null,
         "lastSeenAt": instant_string(now)?, "mode": "always_on",

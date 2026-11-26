@@ -1153,11 +1153,58 @@ async fn host_contract(response: Response) -> Option<serde_json::Value> {
 
 /// A sampler read on the blocking pool, as a host request makes it, so a
 /// read that blocks cannot stall the test runtime.
-async fn sampler_read(sampler: &read::HostSampler) -> Result<read::HostFacts, StatusCode> {
+async fn sampler_read(sampler: &read::HostSampler) -> read::HostView {
     let sampler = sampler.clone();
-    tokio::task::spawn_blocking(move || sampler.latest().map_err(|error| error.status))
+    tokio::task::spawn_blocking(move || sampler.latest())
         .await
         .unwrap()
+}
+
+/// Asserts a full host record whose telemetry is unavailable: CPU usage and
+/// used memory are null. The inventory is the last sample's (`Some(model)`,
+/// from `GatedSource`) or the request-local fallback (`None`).
+fn assert_degraded(host: &serde_json::Value, model: Option<&str>) {
+    for key in [
+        "id",
+        "name",
+        "os",
+        "arch",
+        "osVersion",
+        "cpu",
+        "memory",
+        "disk",
+        "tools",
+        "reachability",
+        "lastSeenAt",
+        "mode",
+        "agentRights",
+    ] {
+        assert!(host.get(key).is_some(), "host record lacks {key}");
+    }
+    assert_eq!(host["reachability"], "online");
+    assert!(host["cpu"]["usedPercent"].is_null());
+    assert!(host["memory"]["usedBytes"].is_null());
+    assert!(host["cpu"]["cores"].as_u64().unwrap() >= 1);
+    assert!(host["memory"]["totalBytes"].as_u64().unwrap() > 0);
+    match model {
+        Some(model) => {
+            assert_eq!(host["cpu"]["model"], model);
+            assert_eq!(host["cpu"]["cores"], 4);
+            assert_eq!(host["memory"]["totalBytes"], 8u64 << 30);
+        }
+        None => assert_eq!(host["cpu"]["model"], ""),
+    }
+}
+
+/// Both host routes answer with a degraded record where the route is
+/// supported, and with the platform's unavailable envelope elsewhere.
+async fn assert_host_routes_degraded(f: &Fixture, cookie: &str, model: Option<&str>) {
+    let detail = format!("/api/v1/hosts/{}", f.activity.host_id().unwrap());
+    for path in ["/api/v1/hosts", detail.as_str()] {
+        if let Some(host) = host_contract(bounded(path, f.get(path, cookie)).await).await {
+            assert_degraded(&host, model);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1173,8 +1220,11 @@ async fn host_reads_never_wait_for_an_in_flight_refresh() {
     // The first sample opens the CPU window: usage stays null.
     assert_eq!(bounded("first sample", entered.recv()).await, Some(0));
     bounded("first publish", sampler.settled()).await;
-    let first = sampler_read(&sampler).await.unwrap();
-    assert_eq!((first.used_memory, first.used_percent), (1 << 30, None));
+    let first = sampler_read(&sampler).await;
+    assert_eq!(
+        (first.used_memory, first.used_percent),
+        (Some(1 << 30), None)
+    );
     if let Some(host) = host_contract(bounded("first read", f.get(&list, &cookie)).await).await {
         assert!(host["cpu"]["usedPercent"].is_null());
         assert_eq!(host["cpu"]["model"], "Test CPU");
@@ -1194,8 +1244,8 @@ async fn host_reads_never_wait_for_an_in_flight_refresh() {
         .await;
     // Every read finished while the refresh was still held, so none waited.
     assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 1);
-    for facts in [a.unwrap(), b.unwrap()] {
-        assert_eq!((facts.used_memory, facts.used_percent), (1 << 30, None));
+    for view in [a, b] {
+        assert_eq!((view.used_memory, view.used_percent), (Some(1 << 30), None));
     }
     for response in [list_response, detail_response] {
         if let Some(host) = host_contract(response).await {
@@ -1203,20 +1253,22 @@ async fn host_reads_never_wait_for_an_in_flight_refresh() {
             assert_eq!(host["memory"]["usedBytes"], 1u64 << 30);
         }
     }
-    // Releasing the gate publishes the second sample, rounded.
+    // Releasing the gate lets the second CPU sample publish, rounded. Wait
+    // for the published state, not for the next refresh to start.
     release.send(()).unwrap();
-    assert_eq!(bounded("next refresh", entered.recv()).await, Some(2));
-    assert_eq!(
-        sampler_read(&sampler).await.unwrap().used_percent,
-        Some(37.4)
-    );
+    bounded(
+        "second CPU sample",
+        sampler.sampled(|facts| facts.used_percent.is_some()),
+    )
+    .await;
+    assert_eq!(sampler_read(&sampler).await.used_percent, Some(37.4));
     if let Some(host) = host_contract(bounded("ready read", f.get(&detail, &cookie)).await).await {
         assert_eq!(host["cpu"]["usedPercent"], json!(37.4));
     }
 }
 
 #[tokio::test]
-async fn a_stalled_first_sample_does_not_delay_serving() {
+async fn a_stalled_first_sample_serves_hosts_with_null_telemetry() {
     let (release, gate) = std::sync::mpsc::channel();
     let (source, mut entered) = GatedSource::new([Some(4.0)], 0, Some(gate));
     let finished = source.finished();
@@ -1226,18 +1278,12 @@ async fn a_stalled_first_sample_does_not_delay_serving() {
     let (cookie, _) = f.login(None).await;
     assert_eq!(bounded("first sample", entered.recv()).await, Some(0));
     assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert_eq!(
-        sampler_read(&sampler).await.err(),
-        Some(StatusCode::SERVICE_UNAVAILABLE)
-    );
-    // Not yet sampled: hosts answer unavailable on every platform, and the
-    // rest of the dashboard serves.
-    error(
-        bounded("pending host read", f.get("/api/v1/hosts", &cookie)).await,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "unavailable",
-    )
-    .await;
+    let pending = sampler_read(&sampler).await;
+    assert!(pending.inventory.is_none());
+    assert_eq!((pending.used_memory, pending.used_percent), (None, None));
+    // Not yet sampled: the host record is served with null telemetry and the
+    // request-local inventory, and the rest of the dashboard serves.
+    assert_host_routes_degraded(&f, &cookie, None).await;
     assert_eq!(
         body(bounded("vm read", f.get("/api/v1/vms", &cookie)).await).await,
         json!({"vms": []})
@@ -1245,16 +1291,18 @@ async fn a_stalled_first_sample_does_not_delay_serving() {
     assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 0);
     release.send(()).unwrap();
     bounded("first publish", sampler.settled()).await;
-    assert_eq!(sampler_read(&sampler).await.unwrap().used_memory, 1 << 30);
+    assert_eq!(sampler_read(&sampler).await.used_memory, Some(1 << 30));
     if let Some(host) =
         host_contract(bounded("sampled read", f.get("/api/v1/hosts", &cookie)).await).await
     {
         assert!(host["cpu"]["usedPercent"].is_null());
+        assert_eq!(host["cpu"]["model"], "Test CPU");
+        assert_eq!(host["memory"]["usedBytes"], 1u64 << 30);
     }
 }
 
 #[tokio::test]
-async fn a_panicking_refresh_marks_hosts_unavailable_without_stopping_the_dashboard() {
+async fn a_panicking_refresh_keeps_hosts_serving_with_null_telemetry() {
     // Panic in the first sample, then in a later one after figures were published.
     for panic_at in [0, 1] {
         let (mut source, mut entered) = GatedSource::new([Some(4.0)], usize::MAX, None);
@@ -1272,16 +1320,15 @@ async fn a_panicking_refresh_marks_hosts_unavailable_without_stopping_the_dashbo
             None,
             "a refresh started after the panic"
         );
+        // Telemetry is gone; the static inventory of an earlier sample stays.
+        let failed = sampler_read(&sampler).await;
+        assert_eq!((failed.used_memory, failed.used_percent), (None, None));
+        let model = (panic_at > 0).then_some("Test CPU");
         assert_eq!(
-            sampler_read(&sampler).await.err(),
-            Some(StatusCode::SERVICE_UNAVAILABLE)
+            failed.inventory.map(|inventory| inventory.model),
+            model.map(str::to_owned)
         );
-        error(
-            bounded("failed host read", f.get("/api/v1/hosts", &cookie)).await,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-        )
-        .await;
+        assert_host_routes_degraded(&f, &cookie, model).await;
         assert_eq!(
             body(bounded("vm read", f.get("/api/v1/vms", &cookie)).await).await,
             json!({"vms": []})
