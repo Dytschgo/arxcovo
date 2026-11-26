@@ -41,6 +41,8 @@ HOST_PROFILES = [
      "kernel": "7.0.0-1014-aws", "systemd_package": "255.4-1ubuntu8.18"},
     {"image_os": "ubuntu24", "image_version": "20261116.376.1",
      "kernel": "7.0.0-1017-azure", "systemd_package": "255.4-1ubuntu8.18"},
+    {"image_os": "ubuntu24", "image_version": "20261122.23.1",
+     "kernel": "7.0.0-1018-aws", "systemd_package": "255.4-1ubuntu8.19"},
 ]
 NETWORK = {
     "nodes": {node: [f"192.168.72.{i}", f"02:72:00:00:00:{i}"] for i, node in enumerate("abc", 11)},

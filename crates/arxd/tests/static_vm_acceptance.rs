@@ -85,6 +85,7 @@ struct StaticPlan {
     daemon_config: PathBuf,
     client_config: PathBuf,
     store: ExpectedVmStore,
+    secret_root: arxd::config::ExpectedComposeSecretRoot,
     qualification_sha256: String,
     m4_qualification_sha256: String,
     network_receipt: PathBuf,
@@ -236,6 +237,11 @@ impl StaticPlan {
             opaque_hex(&self.store.volume_serial, 16)
                 && opaque_hex(&self.store.directory_file_id, 32),
             "store_identity",
+        )?;
+        check(
+            opaque_hex(&self.secret_root.0.volume_serial, 16)
+                && opaque_hex(&self.secret_root.0.directory_file_id, 32),
+            "secret_root_identity",
         )?;
         check(
             opaque_nonzero_hex(&self.static_vm.vm_id, 32)
@@ -1427,6 +1433,11 @@ fn sample_plan_json() -> Value {
             "volume_guid": r"\\?\Volume{12345678-1234-1234-1234-1234567890ab}\",
             "volume_serial": "0123456789abcdef",
             "directory_file_id": "22".repeat(16)
+        },
+        "secret_root": {
+            "volume_guid": r"\\?\Volume{12345678-1234-1234-1234-1234567890ab}\",
+            "volume_serial": "0123456789abcdef",
+            "directory_file_id": "23".repeat(16)
         },
         "qualification_sha256": "33".repeat(32),
         "m4_qualification_sha256": "34".repeat(32),

@@ -1251,8 +1251,8 @@ async fn foreground_opens_enrolled_state_through_the_stable_volume_path() {
 }
 
 #[tokio::test]
-async fn enrolled_store_with_compose_secret_root_refuses_at_config_load() {
-    use arxd::config::{ForegroundConfig, VmStoreComposeConflict};
+async fn enrolled_store_with_unpinned_compose_secret_root_refuses_at_config_load() {
+    use arxd::config::{ComposeCustodyRefusal, ForegroundConfig};
 
     let fixture = private_fixture::private_dir();
     let root = fixture_drive_path(fixture.path());
@@ -1277,7 +1277,7 @@ async fn enrolled_store_with_compose_secret_root_refuses_at_config_load() {
     assert!(!exit.status.success());
     assert_eq!(exit.stderr, b"arxd: server-config\n");
     let refused = ForegroundConfig::load(&launch).err().unwrap();
-    assert!(refused.is::<VmStoreComposeConflict>());
+    assert!(refused.is::<ComposeCustodyRefusal>());
 }
 
 #[tokio::test]

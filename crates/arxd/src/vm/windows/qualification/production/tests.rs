@@ -1233,6 +1233,8 @@ fn plan_gate_enforces_pair_and_offline_lease_matrix_for_every_plan_kind() {
         PlanKind::Boot,
         PlanKind::StaticWebBoot,
         PlanKind::PublicEgressBoot,
+        PlanKind::StaticComposeInstaller,
+        PlanKind::StaticComposeDetached,
         PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall),
         PlanKind::InstallerBoot(InstallerPhase::WindowsSetup),
         PlanKind::InstallerBoot(InstallerPhase::WindowsFinalize),

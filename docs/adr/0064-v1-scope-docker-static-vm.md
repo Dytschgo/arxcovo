@@ -18,7 +18,7 @@ The accepted network default is public IPv4 TCP/UDP only. Native IPv6 and Intern
 
 - Registry images are digest-pinned. The broker renders Compose from a typed project. Agents may deploy, start, stop and bring a project down within policy.
 - The first VM envelope is 2 vCPU, 4 GB RAM and a 32 GB disk, inside the existing host reserve.
-- Secrets use current-user DPAPI ciphertext on the host. Runtime bytes go to a per-service guest tmpfs over the verified serial channel. Plaintext stays out of source, the host store, logs, audit, MCP and backups.
+- Secrets use current-user DPAPI ciphertext on the host. An enrolled Windows x64 foreground store with a Compose secret root requires an independent volume GUID, serial and directory ID for each root. The daemon holds both disjoint directories and checks their bindings before opening the store and at each secret read boundary. Ciphertext opens relative to the held owner-private secret directory. Runtime bytes go to a per-service guest tmpfs over the verified serial channel. Plaintext stays out of source, the host store, logs, audit, MCP and backups.
 - Diagnostics are typed and bounded. Raw container logs are not an agent tool.
 - Agents cannot delete volumes or backups, and they still cannot delete the static VM. Deletion stays outside agent authority.
 - nginx remains the single guest reverse proxy. Publishing stays off by default, on one tunnel, for a bounded list of exact names. Unpublish removes the route.

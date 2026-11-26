@@ -250,30 +250,23 @@ pub async fn run_vm_profile(profile: crate::config::VmForeground) -> Result<()> 
     let crate::config::VmForeground {
         config,
         profile,
-        root,
+        custody,
     } = profile;
     let endpoint = config.local.as_ref().context("server-config")?;
-    root.verify(&config.state_dir).context("server-state")?;
     // The supervisor owns the pin from here, so every store user, including
     // a detached close or recovery after an unconfirmed result, keeps it.
-    let state = root.state_path(&config.state_dir);
+    let state = custody.state_path(&config.state_dir);
     let supervisor = state
-        .access(|path| Supervisor::open(path, profile, root))
+        .access(|path| Supervisor::open(path, profile, custody))
         .context("server-state")?;
-    supervisor
-        .verify_root(&config.state_dir)
-        .context("server-state")?;
+    supervisor.verify_roots().context("server-state")?;
     // One bounded sweep before any tool is published.
     supervisor.startup_sweep().context("server-state")?;
-    supervisor
-        .verify_root(&config.state_dir)
-        .context("server-state")?;
+    supervisor.verify_roots().context("server-state")?;
     state
         .access(|path| supervisor.open_vault(path))
         .context("server-state")?;
-    supervisor
-        .verify_root(&config.state_dir)
-        .context("server-state")?;
+    supervisor.verify_roots().context("server-state")?;
     let listener = Listener::bind(endpoint).context("server-bind")?;
     serve_vm_profile(listener, Arc::new(config), supervisor, async {
         tokio::signal::ctrl_c().await.context("server-listener")
@@ -330,6 +323,7 @@ pub(crate) async fn serve_vm_profile_within(
     let (origin, listener_done, reaper_done) = tokio::select! {
         result = &mut listener_task => (joined_task(result, "server-listener"), true, false),
         result = &mut reaper => (joined_task(result, "server-state"), false, true),
+        () = supervisor.wait_for_root_loss() => (Err(anyhow::anyhow!("server-state")), false, false),
         result = interrupt => (result, false, false),
     };
     supervisor.fence();

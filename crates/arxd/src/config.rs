@@ -367,9 +367,7 @@ pub enum ForegroundConfig {
 pub struct VmForeground {
     pub(crate) config: Config,
     pub(crate) profile: TestVms,
-    /// The validated state root, held from validation through composition
-    /// and serving. `config.state_dir` is its canonical name.
-    pub(crate) root: Box<RootPin>,
+    pub(crate) custody: std::sync::Arc<VmCustody>,
 }
 
 /// The independently enrolled Windows volume name and FILE_ID_INFO.
@@ -380,6 +378,11 @@ pub struct ExpectedVmStore {
     pub volume_serial: String,
     pub directory_file_id: String,
 }
+
+/// Independent enrollment for the Compose secret directory.
+#[derive(Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub struct ExpectedComposeSecretRoot(pub ExpectedVmStore);
 
 #[derive(Debug)]
 pub struct VmStoreIdentityRefusal;
@@ -393,15 +396,15 @@ impl std::fmt::Display for VmStoreIdentityRefusal {
 impl std::error::Error for VmStoreIdentityRefusal {}
 
 #[derive(Debug)]
-pub struct VmStoreComposeConflict;
+pub struct ComposeCustodyRefusal;
 
-impl std::fmt::Display for VmStoreComposeConflict {
+impl std::fmt::Display for ComposeCustodyRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("enrolled VM store requires a profile without Compose secret custody")
+        f.write_str("Compose secret custody refused")
     }
 }
 
-impl std::error::Error for VmStoreComposeConflict {}
+impl std::error::Error for ComposeCustodyRefusal {}
 
 #[cfg(windows)]
 struct EnrolledStoreIdentity {
@@ -468,6 +471,15 @@ impl ExpectedVmStore {
 /// caller holds the original config and its parent while writing the copy.
 #[cfg(windows)]
 pub fn pinned_vm_config(path: &Path, expected: &ExpectedVmStore) -> Result<Vec<u8>> {
+    pinned_config(path, expected, None)
+}
+
+#[cfg(windows)]
+fn pinned_config(
+    path: &Path,
+    expected: &ExpectedVmStore,
+    secret: Option<&ExpectedComposeSecretRoot>,
+) -> Result<Vec<u8>> {
     let parent = path.parent().ok_or(VmStoreIdentityRefusal)?;
     checked_path(parent)?;
     crate::security::private(parent)?;
@@ -486,6 +498,17 @@ pub fn pinned_vm_config(path: &Path, expected: &ExpectedVmStore) -> Result<Vec<u
         "VM config already has a store pin"
     );
     profile.insert("expected_store".into(), serde_json::to_value(expected)?);
+    if let Some(secret) = secret {
+        secret.0.identity().map_err(|_| ComposeCustodyRefusal)?;
+        anyhow::ensure!(
+            !profile.contains_key("expected_compose_secret_root"),
+            "VM config already has a Compose secret pin"
+        );
+        profile.insert(
+            "expected_compose_secret_root".into(),
+            serde_json::to_value(secret)?,
+        );
+    }
     let bytes = serde_json::to_vec(&config)?;
     anyhow::ensure!(bytes.len() <= 16384, "configuration too large");
     Ok(bytes)
@@ -493,8 +516,8 @@ pub fn pinned_vm_config(path: &Path, expected: &ExpectedVmStore) -> Result<Vec<u
 
 /// The identity of the validated VM state root, bound to its canonical name.
 ///
-/// Windows holds the root and every ancestor directory open without delete
-/// sharing, so no component of the name can be renamed, deleted or replaced
+/// Windows holds the root and every ancestor directory open without write
+/// or delete sharing, so no component of the name can be renamed, deleted or replaced
 /// while the pin lives; [`RootPin::verify`] then also compares volume and
 /// file ID from the handle with a fresh open of the name. Operators must stop
 /// the foreground before renaming or moving the root or any parent folder
@@ -564,6 +587,14 @@ impl RootPin {
                 if matches!(part, Component::Prefix(_)) {
                     continue;
                 }
+                #[cfg(target_arch = "x86_64")]
+                let handle = if let Some(parent) = ancestors.last() {
+                    let name = part.as_os_str().to_str().ok_or(VmStoreIdentityRefusal)?;
+                    crate::vm::windows::hold_child_directory(parent, name)?
+                } else {
+                    pin_directory(&prefix)?
+                };
+                #[cfg(not(target_arch = "x86_64"))]
                 let handle = pin_directory(&prefix)?;
                 if components.peek().is_none() {
                     let identity = directory_identity(&handle)?;
@@ -658,6 +689,183 @@ impl RootPin {
         );
         Ok(())
     }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl RootPin {
+    fn verify_mounted_name(&self, configured: &Path) -> Result<()> {
+        use crate::vm::paths::LocalPath;
+        let raw = LocalPath::parse(configured.to_str().ok_or(ComposeCustodyRefusal)?)
+            .map_err(|_| ComposeCustodyRefusal)?;
+        let drive = &raw.as_str()[..3];
+        let current = Self::acquire(Path::new(raw.as_str()))?;
+        let drive_root = current._ancestors.first().unwrap_or(&current.leaf);
+        crate::vm::windows::verify_volume_root(drive, full_directory_identity(drive_root)?)?;
+        let volume = held_volume_path(drive_root)?;
+        let name = volume.join(&raw.as_str()[3..]);
+        let held = held_volume_path(&self.leaf)?;
+        let identity = full_directory_identity(&self.leaf)?;
+        // Confirm that ordinary Win32 lookup of the configured spelling
+        // agrees with the relative walk, including case-sensitive directories.
+        let by_name = pin_directory(configured)?;
+        anyhow::ensure!(
+            full_directory_identity(&current.leaf)? == identity
+                && full_directory_identity(&by_name)? == identity
+                && windows_path_contains(&name, &held)
+                && windows_path_contains(&held, &name)
+                && held_volume_path(&current.leaf)? == held
+                && held_volume_path(&by_name)? == held,
+            ComposeCustodyRefusal
+        );
+        Ok(())
+    }
+
+    pub(crate) fn require_disjoint(&self, other: &Self) -> Result<()> {
+        let first = full_directory_identity(&self.leaf)?;
+        let second = full_directory_identity(&other.leaf)?;
+        anyhow::ensure!(first != second, ComposeCustodyRefusal);
+        for (leaf, root) in [(first, other), (second, self)] {
+            for ancestor in &root._ancestors {
+                anyhow::ensure!(
+                    full_directory_identity(ancestor)? != leaf,
+                    ComposeCustodyRefusal
+                );
+            }
+        }
+        let first = held_volume_path(&self.leaf)?;
+        let second = held_volume_path(&other.leaf)?;
+        anyhow::ensure!(
+            !windows_path_contains(&first, &second) && !windows_path_contains(&second, &first),
+            ComposeCustodyRefusal
+        );
+        Ok(())
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn windows_path_contains(parent: &Path, child: &Path) -> bool {
+    // The raw configured spellings have already passed LocalPath. These
+    // components come from held handles or a verified volume-root name.
+    let mut child = child.components();
+    parent.components().all(|parent| {
+        child.next().is_some_and(|child| {
+            // CompareStringOrdinal takes explicit UTF-16 lengths.
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+            let parent: Vec<_> = parent.as_os_str().encode_wide().collect();
+            let child: Vec<_> = child.as_os_str().encode_wide().collect();
+            unsafe {
+                CompareStringOrdinal(
+                    parent.as_ptr(),
+                    parent.len() as i32,
+                    child.as_ptr(),
+                    child.len() as i32,
+                    1,
+                ) == CSTR_EQUAL
+            }
+        })
+    })
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+struct ComposeRoot {
+    configured: PathBuf,
+    pin: RootPin,
+}
+
+/// Held for the lifetime of the store and by outstanding secret workers.
+pub(crate) struct VmCustody {
+    configured_state: PathBuf,
+    state: RootPin,
+    lost: crate::service::Shutdown,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    secret: Option<ComposeRoot>,
+}
+
+impl VmCustody {
+    pub(crate) fn state_path(&self, canonical: &Path) -> VmStatePath {
+        self.state.state_path(canonical)
+    }
+
+    pub(crate) fn verify(&self) -> Result<()> {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(secret) = &self.secret {
+            return self.verify_pair(&self.configured_state, &secret.configured);
+        }
+        self.state.verify(&self.configured_state)
+    }
+
+    pub(crate) async fn lost(&self) {
+        self.lost.cancelled().await;
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn verify_pair(&self, state_name: &Path, secret_name: &Path) -> Result<()> {
+        let verify = || {
+            use crate::vm::windows::qualification::require_held_private;
+            anyhow::ensure!(!self.lost.is_cancelled(), ComposeCustodyRefusal);
+            let secret = self.secret.as_ref().ok_or(ComposeCustodyRefusal)?;
+            self.state.verify(state_name)?;
+            secret.pin.verify(secret_name)?;
+            self.state.verify_mounted_name(state_name)?;
+            secret.pin.verify_mounted_name(secret_name)?;
+            require_held_private(&self.state.leaf)?;
+            require_held_private(&secret.pin.leaf)?;
+            Ok::<_, anyhow::Error>(())
+        };
+        verify().map_err(|_| {
+            self.lost.cancel();
+            ComposeCustodyRefusal.into()
+        })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn has_compose_root(&self) -> bool {
+        self.secret.is_some()
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn open_ciphertext(&self, reference: crate::vm::Id) -> Result<std::fs::File> {
+        let secret = self.secret.as_ref().ok_or(ComposeCustodyRefusal)?;
+        let volume = full_directory_identity(&secret.pin.leaf)?.volume;
+        let name = format!("{}.dpapi", hex::encode(reference));
+        Ok(crate::vm::windows::read_private_child(
+            &secret.pin.leaf,
+            &name,
+            volume,
+        )?)
+    }
+}
+
+/// Private acceptance launch bytes, together with the roots checked by the daemon.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub struct PinnedStaticVmConfig {
+    bytes: Vec<u8>,
+    custody: std::sync::Arc<VmCustody>,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl PinnedStaticVmConfig {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        self.custody.verify()
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub fn pinned_static_vm_config(
+    path: &Path,
+    store: &ExpectedVmStore,
+    secret: &ExpectedComposeSecretRoot,
+) -> Result<PinnedStaticVmConfig> {
+    let bytes = pinned_config(path, store, Some(secret))?;
+    let file: VmFile =
+        serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid VM configuration"))?;
+    let (_, custody) = file.test_vms.validate(&file.state_dir, &file.local)?;
+    Ok(PinnedStaticVmConfig { bytes, custody })
 }
 
 /// Holds the enrolled volume path across synchronous acceptance read batches.
@@ -799,17 +1007,21 @@ mod enrolled_store_tests {
     }
 }
 
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+#[path = "config_compose_tests.rs"]
+mod compose_custody_tests;
+
 /// An ordinary local directory opened without following a reparse point and
-/// without delete sharing.
+/// without write or delete sharing.
 #[cfg(windows)]
 fn pin_directory(path: &Path) -> Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
     };
     Ok(std::fs::OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?)
 }
@@ -916,7 +1128,9 @@ pub(crate) struct TestVms {
     #[serde(default)]
     pub(crate) compose_releases: Vec<crate::vm::compose::ReleaseInput>,
     #[serde(default, deserialize_with = "present")]
-    pub(crate) compose_secret_root: Option<PathBuf>,
+    compose_secret_root: Option<PathBuf>,
+    #[serde(default, deserialize_with = "present")]
+    expected_compose_secret_root: Option<Box<ExpectedComposeSecretRoot>>,
     #[serde(default, deserialize_with = "present")]
     static_compose: Option<Box<StaticComposeProfile>>,
 }
@@ -1045,6 +1259,30 @@ mod static_compose_profile_tests {
             "static Compose requires Windows x64"
         };
         assert_eq!(error.to_string(), expected);
+        let mut with_secrets = raw.clone();
+        with_secrets["compose_secret_root"] = json!("D:/private/secrets");
+        let profile: TestVms = serde_json::from_value(with_secrets.clone()).unwrap();
+        assert!(
+            profile
+                .validate(&state, &endpoint)
+                .err()
+                .unwrap()
+                .is::<ComposeCustodyRefusal>()
+        );
+        if cfg!(all(windows, target_arch = "x86_64")) {
+            with_secrets["expected_compose_secret_root"] = json!({
+                "volume_guid": "fixture", "volume_serial": "fixture", "directory_file_id": "secret"
+            });
+            let profile: TestVms = serde_json::from_value(with_secrets).unwrap();
+            assert_eq!(
+                profile
+                    .validate(&state, &endpoint)
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                expected
+            );
+        }
         assert!(!state.exists());
         raw["static_compose"]["backup"]["root"] = json!("C:/backup");
         let profile: TestVms = serde_json::from_value(raw.clone()).unwrap();
@@ -1106,7 +1344,7 @@ impl ForegroundConfig {
         crate::local::require_owner(path)?;
         let file: VmFile = serde_json::from_value(value)
             .map_err(|_| anyhow::anyhow!("invalid VM configuration"))?;
-        let (state_dir, root) = file.test_vms.validate(&file.state_dir, &file.local)?;
+        let (state_dir, custody) = file.test_vms.validate(&file.state_dir, &file.local)?;
         let config = Config {
             state_dir,
             agents: file.agents,
@@ -1121,23 +1359,34 @@ impl ForegroundConfig {
             "reserved VM principal"
         );
         config.validate()?;
-        root.verify(&config.state_dir)?;
+        custody.verify()?;
         Ok(Self::TestVms(VmForeground {
             config,
             profile: file.test_vms,
-            root: Box::new(root),
+            custody,
         }))
     }
 }
 
 impl TestVms {
-    /// Returns the canonical exclusive root that composition must open and
-    /// its pin; the raw configured string is never reopened after
-    /// validation. The pin is taken before the path-based owner, privacy and
-    /// overlap checks, so on Windows they inspect the pinned objects.
-    fn validate(&self, root: &Path, local: &crate::local::Endpoint) -> Result<(PathBuf, RootPin)> {
+    /// Hold the state directory and any Compose secret directory before
+    /// composition can open SQLite or write release enrollments.
+    fn validate(
+        &self,
+        root: &Path,
+        local: &crate::local::Endpoint,
+    ) -> Result<(PathBuf, std::sync::Arc<VmCustody>)> {
         use crate::vm::paths::LocalPath;
 
+        anyhow::ensure!(
+            self.compose_secret_root.is_none() || cfg!(all(windows, target_arch = "x86_64")),
+            ComposeCustodyRefusal
+        );
+        anyhow::ensure!(
+            self.expected_compose_secret_root.is_some()
+                == (self.compose_secret_root.is_some() && self.expected_store.is_some()),
+            ComposeCustodyRefusal
+        );
         if let Some(profile) = &self.static_compose {
             anyhow::ensure!(
                 cfg!(all(windows, target_arch = "x86_64")),
@@ -1152,10 +1401,6 @@ impl TestVms {
             bail!("native static Compose activation is closed");
         }
 
-        anyhow::ensure!(
-            self.expected_store.is_none() || self.compose_secret_root.is_none(),
-            VmStoreComposeConflict
-        );
         let layout = crate::service::layout::Layout::system()?;
         let reserved = layout.endpoint().to_string_lossy();
         anyhow::ensure!(
@@ -1166,6 +1411,7 @@ impl TestVms {
             },
             "reserved local endpoint"
         );
+        let configured_state = root.to_owned();
         let (root, pin) = if let Some(expected) = &self.expected_store {
             #[cfg(windows)]
             {
@@ -1186,6 +1432,24 @@ impl TestVms {
         anyhow::ensure!(root.is_dir(), "VM state directory required");
         crate::security::private(&root)?;
         crate::local::require_owner(&root)?;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        let secret = self
+            .compose_secret_root
+            .as_deref()
+            .map(|path| {
+                let configured = vm_path(path)?;
+                let secret = match &self.expected_compose_secret_root {
+                    Some(expected) => RootPin::acquire_enrolled(&configured, &expected.0)?,
+                    None => RootPin::acquire(&configured)?,
+                };
+                pin.require_disjoint(&secret)?;
+                Ok::<_, anyhow::Error>(ComposeRoot {
+                    configured: path.to_owned(),
+                    pin: secret,
+                })
+            })
+            .transpose()
+            .map_err(|_| ComposeCustodyRefusal)?;
         anyhow::ensure!(
             layout.workspace_disjoint(
                 root.to_str()
@@ -1254,8 +1518,15 @@ impl TestVms {
                 recipe.digest(&root)?;
             }
         }
-        pin.verify(&root)?;
-        Ok((root, pin))
+        let custody = VmCustody {
+            configured_state,
+            state: pin,
+            lost: Default::default(),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            secret,
+        };
+        custody.verify()?;
+        Ok((root, std::sync::Arc::new(custody)))
     }
 
     pub(crate) fn recipe(&self) -> Result<Option<([u8; 16], [u8; 32])>> {
@@ -1441,6 +1712,32 @@ pub fn checked_path(path: &Path) -> Result<()> {
 mod runtime_provenance_tests {
     use super::TestVms;
     use serde_json::json;
+
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    #[test]
+    fn compose_roots_require_windows_x64() {
+        let endpoint = crate::local::Endpoint {
+            address: "unused".into(),
+            client_identity: "unused".into(),
+        };
+        let plain = json!({"enabled": false, "compose_secret_root": "D:/secrets"});
+        let pin = json!({
+            "volume_guid": r"\\?\Volume{12345678-1234-1234-1234-1234567890ab}\",
+            "volume_serial": "0".repeat(16),
+            "directory_file_id": "0".repeat(32),
+        });
+        let mut pinned = plain.clone();
+        pinned["expected_store"] = pin.clone();
+        pinned["expected_compose_secret_root"] = pin;
+        for profile in [plain, pinned] {
+            let profile: TestVms = serde_json::from_value(profile).unwrap();
+            let error = profile
+                .validate(std::path::Path::new("unused"), &endpoint)
+                .err()
+                .unwrap();
+            assert!(error.is::<super::ComposeCustodyRefusal>());
+        }
+    }
 
     fn runtime() -> serde_json::Value {
         json!({
