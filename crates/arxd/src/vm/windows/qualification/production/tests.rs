@@ -58,11 +58,11 @@ fn current_user_sid() -> (Vec<usize>, String) {
     (data, string)
 }
 
-fn sid_ptr(data: &[usize]) -> PSID {
+pub(super) fn sid_ptr(data: &[usize]) -> PSID {
     unsafe { (*data.as_ptr().cast::<TOKEN_USER>()).User.Sid }
 }
 
-fn create_dir_sddl(parent: &Path, name: &str, sddl: &str) -> LocalPath {
+pub(super) fn create_dir_sddl(parent: &Path, name: &str, sddl: &str) -> LocalPath {
     let path = parent.join(name);
     let mut descriptor = null_mut();
     let wide_sddl: Vec<u16> = OsStr::new(sddl).encode_wide().chain(Some(0)).collect();

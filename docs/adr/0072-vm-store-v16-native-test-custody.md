@@ -160,3 +160,17 @@ unreleased epoch, bound slot identities and unchanged claim remain the
 durable retry pointer if the caller yields. The adapter performs the
 transaction outside the in-memory run map. Before activation only scoped
 fixtures reach this adapter. Native release is **unverified on real hardware**.
+
+## Resumable TEST disposal (7c chunk 07)
+
+Chunk 07 consumes the v16 `disposal` columns through `store::vm::native::disposal`
+and `production::disposal::NativeDisposal` without altering the schema. Every
+slot deletion follows `NULL -> 'intended' -> 'absent'` under a checked
+`DisposalScope` shared by transient-build disposal and ordinary sweep. Empty
+bound generations follow `NULL -> 'lease' -> 'directory' -> 'absent'` under the
+held production parent and an in-process per-generation guard spanning both
+handle handoffs. `settle_cleanup`, `forget_generation` and `publish_build`
+revalidate durable absence before removing native rows or releasing claims.
+See the chunk 07 amendment in [ADR 0054](0054-m4-dedicated-windows-runtime.md)
+for the exact handle access/share contract and absence rules. Native disposal
+is **unverified on real hardware**.

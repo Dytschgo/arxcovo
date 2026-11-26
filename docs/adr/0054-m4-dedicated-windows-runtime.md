@@ -1728,3 +1728,66 @@ unverified on real hardware**. `vid.dll` opens `\Device\VidExo` with
 its own write-type check to partition IOCTLs. Paused trial 10 exercises this
 path. If it fails with `E_ACCESSDENIED`, the narrowest known remedy is a
 reviewed restricting-set change.
+
+## 7c amendment — resumable TEST disposal through the lease and directory
+
+Native TEST disposal reuses the v16 `disposal` columns from
+[ADR 0072](0072-vm-store-v16-native-test-custody.md) without adding a new
+migration. Both transient-build disposal (removing the primary `seed` leaf and
+the verification generation before `publish_build`) and the ordinary reaper
+sweep share one typed disposal boundary (`DisposalScope` / `NativeDisposal`).
+
+Every deletion requires durable typed TEST provenance (`vm_native_generations`
+and `vm_native_slots` for the current store host and protocol 1) and scoped
+handle custody:
+
+- **Parent-relative delete open.** Existing `PathPin` and `open_relative` pins
+  omit `FILE_SHARE_DELETE` (preserving the #353 delete-sharing contract).
+  Disposal uses `open_relative_delete` over the same `nt_open_relative`
+  primitive with `FILE_GENERIC_READ | READ_CONTROL | DELETE`, `share = 0`,
+  `FILE_OPEN_REPARSE_POINT` and `OBJ_DONT_REPARSE`, then marks the verified
+  handle with `delete_on_close`. Any competing reader, writer or deleter fails
+  the open with a sharing violation and leaves the object untouched and
+  charged.
+- **Per-slot intent and absence semantics.** Under the held bound workspace,
+  disposal validates the exact leaf identity, stored case, private ACL and
+  `WorkspaceCustody`, commits durable `vm_native_slots.disposal = 'intended'`
+  while still holding the exclusive delete handle, unlinks via that handle,
+  verifies `NotFound` through the same bound parent and name (`observe` with
+  type-agnostic `probe_relative`), and commits `disposal = 'absent'`. On retry
+  or restart, a still-present exact match is retried; a replacement (wrong file
+  ID, wrong node kind, reparse point, hard link, or wrong case/ACL) is
+  quarantined and never deleted. Prior absence is accepted **only** under an
+  exact durable `disposal = 'intended'` checkpoint or a separately proved
+  uncreated reservation (`NeverAttempted` / `Intended -> Absent` with zero
+  identified artifacts and observed `NotFound` under the held parent).
+- **Lease/directory cleanup guard.** Once all slots of a disposed generation
+  are durably absent and bounded handle enumeration (`listing_bounded`) proves
+  `generation.lease` is the sole entry in the generation directory, disposal
+  acquires an in-process per-generation guard (`GenerationGuards`), commits
+  `vm_native_generations.disposal = 'lease'` (durably closing `bound()` and
+  `vm_native_slot_scope` while `vm_native_disposal_order` enforces zero
+  remaining slots), and only then closes the lease handle while keeping the
+  generation directory and enrolled production root pinned. It opens
+  `generation.lease` via `open_relative_delete`, re-verifies identity, case,
+  zero length, private ACL, lock and sole-entry status, deletes it by handle,
+  confirms absence and an empty directory, and commits `disposal = 'directory'`.
+  It then closes the generation directory handle while keeping the enrolled
+  production root and generation guard held, opens the exact generation
+  directory via `open_relative_delete`, re-verifies identity, case, private ACL
+  and empty listing, deletes it by handle, confirms final absence through the
+  held production root, and commits `disposal = 'absent'`. On retry or restart,
+  every resumed `'lease'` or `'directory'` deletion first re-commits the
+  idempotent `intend_lease_disposal` or `intend_directory_disposal` transition
+  so the current `DisposalScope` is re-checked immediately before each handle
+  delete. Unexpected extra siblings refuse before lease deletion and before
+  directory deletion.
+- **Settlement and authority fences.** Final ledger settlement (`settle_cleanup`,
+  `forget_generation` and `publish_build`) revalidates the work and durable
+  `disposal = 'absent'` proof before freeing eligible claims or removing native
+  rows. Recovery-only work, retained active pairs and release-only expiry carry
+  no deletion permit. Static VMs, static roles (`static_disk`, `static_vars`),
+  sealed goldens, backups, foreign objects and legacy rows without native
+  provenance stay outside native deletion authority. Production TEST admission
+  remains closed. Native disposal and empty-workspace cleanup are **unverified
+  on real hardware**.
