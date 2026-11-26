@@ -412,7 +412,9 @@ pub(super) fn abandon_copies(db: &Connection, vm: Option<Id>) -> Result<()> {
 }
 
 /// Expiry captures the exact non-active TEST work owned by this instance.
-/// The active pair is disposed last by the ordinary lease cleanup.
+/// The active pair is disposed last by the ordinary lease cleanup. A native
+/// live generation is quiesced first: its points wait for the committed
+/// release of the active epoch (T66, 7c 15).
 pub(super) fn claim_expiry(db: &Connection, vm: Id, activity_id: i64, now: i64) -> Result<()> {
     let pending = db.query_row(
         "SELECT w.activity FROM vm_snapshot_work w JOIN vm_operations o ON o.activity_id=w.activity
@@ -500,7 +502,11 @@ fn cleanup_authority(db: &Connection, vm: Id, generation: Id) -> Result<Option<C
          JOIN vm_restore_points p ON p.vm=e.vm AND p.generation=g.id
          WHERE e.vm=?1 AND e.generation=?2 AND v.cleanup_id=e.expiry
            AND v.state=4 AND v.cleanup_route='lease' AND p.state='ready'
-           AND NOT EXISTS(SELECT 1 FROM vm_snapshot_work w WHERE w.vm=e.vm)",
+           AND NOT EXISTS(SELECT 1 FROM vm_snapshot_work w WHERE w.vm=e.vm)
+           AND NOT EXISTS(SELECT 1 FROM vm_generations a
+               JOIN vm_native_generations n ON n.generation=a.id
+               LEFT JOIN vm_snapshot_release r ON r.generation=a.id
+               WHERE a.vm_id=e.vm AND a.active=1 AND r.disposition IS NULL)",
         params![vm, generation],
         |row| Ok(CleanupAuthority {
             activity: row.get(0)?,
@@ -837,10 +843,8 @@ pub(super) fn settle_cleanup(
     Ok(true)
 }
 
-#[cfg(test)]
-pub(crate) use read_pair::Pair;
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
-pub(crate) use read_pair::{Active, active};
+pub(crate) use read_pair::{Active, Pair, active};
 
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
 mod read_pair {
@@ -1010,10 +1014,16 @@ mod read_pair {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) use effects::*;
 
-#[cfg(test)]
+/// Offline capture and restore effects. The native TEST copy adapter (7c 15)
+/// consumes them on Windows x64; its installation stays closed until 7c 16.
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+)]
 mod effects {
     use super::read_pair::{pair, roles};
     use super::*;
@@ -1141,9 +1151,15 @@ mod effects {
         epoch: Id,
         route: Option<&SnapshotRoute>,
     ) -> Result<bool> {
+        // Outside fixtures no local-origin release proof exists, so a
+        // Static route never passes on the native TEST build (I22).
+        #[cfg(test)]
+        let origin = SnapshotRoute::origin_release;
+        #[cfg(not(test))]
+        let origin = |_: &SnapshotRoute| None::<(Id, Id)>;
         Ok(!is_static
             || (route.is_some_and(|route| {
-                route.vm() == vm && route.origin_release() == Some((generation, epoch))
+                route.vm() == vm && origin(route) == Some((generation, epoch))
             }) && route_quiescent(db, vm)?))
     }
 
@@ -1244,6 +1260,20 @@ mod effects {
                 work.source.0.disk.generation, work.candidate.map(|p| p.disk.generation),
                 work.active.epoch, work.active.lineage, if work.action == 18 {"delete"} else {"copy"}],
         )? == 1)
+    }
+
+    /// I19/T61: the exact released epoch this work was admitted on is still
+    /// the active generation's committed release, for the same pair and
+    /// lineage. A later writer epoch, a reopened release or a moved pointer
+    /// makes the admitted release stale, before any copy write and again
+    /// inside the commit.
+    pub(crate) fn release_current(db: &Connection, work: &Work) -> Result<bool> {
+        Ok(active(db, work.vm, work.is_static)?.is_some_and(|current| {
+            current.pair == work.active.pair
+                && current.epoch == work.active.epoch
+                && current.lineage == work.active.lineage
+                && current.clean == work.active.clean
+        }))
     }
 
     pub(crate) fn can_copy(db: &Connection, work: &Work, now: i64) -> Result<bool> {
@@ -1507,14 +1537,9 @@ mod effects {
                 )?,
             "snapshot commit fenced"
         );
+        ensure!(release_current(db, work)?, "active release changed");
         let current = active(db, work.vm, work.is_static)?
             .ok_or_else(|| anyhow::anyhow!("active release invalidated"))?;
-        ensure!(
-            current.pair == work.active.pair
-                && current.epoch == work.active.epoch
-                && current.lineage == work.active.lineage,
-            "active generation changed"
-        );
         let (target, charge): (Id, u64) = db.query_row(
             "SELECT target,persistent FROM vm_snapshot_work WHERE activity=?1",
             [work.activity],

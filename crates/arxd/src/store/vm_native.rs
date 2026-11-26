@@ -165,7 +165,10 @@ pub(crate) enum Leaf {
 }
 
 /// The originating work still owns the generation. A stale worker after an
-/// abandonment or restart cannot add custody.
+/// abandonment or restart cannot add custody. The `restore` origin names the
+/// offline snapshot copy protocol: a TEST capture (action 5) or restore
+/// (action 6) candidate, owned only while its copy-phase work row and exact
+/// pending snapshot receipt stand (7c 15).
 fn owner_live(db: &Connection, generation: Id) -> Result<bool> {
     Ok(count(
         db,
@@ -177,8 +180,8 @@ fn owner_live(db: &Connection, generation: Id) -> Result<bool> {
             WHEN 'clone' THEN EXISTS(SELECT 1 FROM vm_instances v WHERE v.id=g.vm_id AND v.state=0)
             ELSE EXISTS(SELECT 1 FROM vm_snapshot_work w
                 JOIN vm_operations o ON o.activity_id=w.activity
-                WHERE w.candidate=g.id AND w.vm=g.vm_id AND w.action=6 AND w.phase='copy'
-                  AND o.vm=g.vm_id AND o.action=6 AND o.status=0
+                WHERE w.candidate=g.id AND w.vm=g.vm_id AND w.action IN (5,6) AND w.phase='copy'
+                  AND o.vm=g.vm_id AND o.action=w.action AND o.status=0
                   AND o.binding_kind='snapshot') END",
         [generation],
     )? == 1)

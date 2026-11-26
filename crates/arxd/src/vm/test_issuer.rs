@@ -184,7 +184,9 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
         let consistent = match admitted.effect {
             AdmittedEffect::Start => target.writer_epoch == Some(admitted.operation),
             AdmittedEffect::Script { .. } => target.writer_epoch.is_some(),
-            AdmittedEffect::Clone { .. } => target.writer_epoch.is_none(),
+            AdmittedEffect::Clone { .. } | AdmittedEffect::Snapshot => {
+                target.writer_epoch.is_none()
+            }
             AdmittedEffect::Build { recipe_id, digest } => {
                 let recipe = RecipeIdentity {
                     recipe_id,
@@ -458,15 +460,20 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
     }
 
     /// One copy of exactly this content into the admitted clone's own VARS
-    /// slot (7c 11).
+    /// slot (7c 11), or into one slot of the admitted snapshot copy's own
+    /// candidate pair (7c 15).
     pub(crate) fn copy(
         &self,
         slot: ArtifactSlot,
         content: ArtifactPin,
     ) -> Result<CopyPermit<'_, S, C>, NativeRefusal> {
-        if !matches!(self.effect, AdmittedEffect::Clone { .. })
+        let role_admitted = match self.effect {
+            AdmittedEffect::Clone { .. } => slot.role == "vars",
+            AdmittedEffect::Snapshot => matches!(slot.role, "disk" | "vars"),
+            _ => false,
+        };
+        if !role_admitted
             || self.target.writer_epoch.is_some()
-            || slot.role != "vars"
             || slot.key == [0; 16]
             || slot.generation != self.target.generation
         {
@@ -575,7 +582,8 @@ impl<S: SelectedSource, C: Clock> CopyPermit<'_, S, C> {
     }
 }
 
-/// Authority for one clone VARS copy; only a consumed permit yields one.
+/// Authority for one clone VARS or snapshot slot copy; only a consumed
+/// permit yields one.
 #[must_use]
 pub(crate) struct CopyAuthority {
     _minted: Minted,

@@ -26,21 +26,25 @@ use std::cell::Cell;
 type FxClock = super::super::disposal::tests::FakeClock;
 type Issuer<'f> = TestIssuer<'f, &'f FakeSource, FxClock>;
 
-const SIZE: u64 = 1 << 30;
+pub(in crate::vm::windows::qualification::production) const SIZE: u64 = 1 << 30;
 const TTL: u64 = 3_600;
-const GOLDEN_VARS: &[u8] = b"sealed golden vars";
+pub(in crate::vm::windows::qualification::production) const GOLDEN_VARS: &[u8] =
+    b"sealed golden vars";
 
 #[derive(Clone, Copy)]
-struct Golden {
-    template: Id,
-    scope: WorkspaceBinding,
-    slots: PairSlots,
-    evidence: [ArtifactEvidence; 2],
+pub(in crate::vm::windows::qualification::production) struct Golden {
+    pub template: Id,
+    pub scope: WorkspaceBinding,
+    pub slots: PairSlots,
+    pub evidence: [ArtifactEvidence; 2],
 }
 
 /// A sealed native golden through the real build ledger and transient
 /// disposal: a valid unbacked qcow2 disk and private VARS.
-fn seal_golden(fx: &SweepFixture, nonce: u8) -> Golden {
+pub(in crate::vm::windows::qualification::production) fn seal_golden(
+    fx: &SweepFixture,
+    nonce: u8,
+) -> Golden {
     let claim = DiskClaim {
         images: 1 << 20,
         metadata: 0,
@@ -139,11 +143,11 @@ fn seal_golden(fx: &SweepFixture, nonce: u8) -> Golden {
 }
 
 /// A request key stamped with the fixture's UTC time.
-fn fresh_key(number: u32) -> RequestId {
+pub(in crate::vm::windows::qualification::production) fn fresh_key(number: u32) -> RequestId {
     RequestId::parse(&format!("{NOW:016x}{number:016x}")).unwrap()
 }
 
-fn host() -> HostObservation {
+pub(in crate::vm::windows::qualification::production) fn host() -> HostObservation {
     HostObservation {
         owner_idle: Some(true),
         logical_cpus: Some(8),
@@ -155,7 +159,7 @@ fn host() -> HostObservation {
     }
 }
 
-fn resources() -> Resources {
+pub(in crate::vm::windows::qualification::production) fn resources() -> Resources {
     Resources {
         vcpus: 2,
         guest_ram: 4 * GIB,
@@ -243,14 +247,20 @@ fn golden_released(fx: &SweepFixture, golden: &Golden) -> bool {
 }
 
 /// The exact backing name a clone of this golden must carry.
-fn golden_backing(fx: &SweepFixture, golden: &Golden) -> LocalPath {
+pub(in crate::vm::windows::qualification::production) fn golden_backing(
+    fx: &SweepFixture,
+    golden: &Golden,
+) -> LocalPath {
     let ws = hold_workspace_under(&fx.production, fx.owner_sid().0, golden.scope).unwrap();
     slot_path(&ws.root.path, golden.slots.disk).unwrap()
 }
 
 /// An unbacked header plus the qcow2 backing-format extension and the
 /// backing name, as the pinned qemu-img create writes it.
-fn backed_header(size: u64, backing: &str) -> Vec<u8> {
+pub(in crate::vm::windows::qualification::production) fn backed_header(
+    size: u64,
+    backing: &str,
+) -> Vec<u8> {
     let mut cluster = unbacked_qcow2_header(size);
     cluster[104..108].copy_from_slice(&0xe279_2acau32.to_be_bytes());
     cluster[108..112].copy_from_slice(&5u32.to_be_bytes());

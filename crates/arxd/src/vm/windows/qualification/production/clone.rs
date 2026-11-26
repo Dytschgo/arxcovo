@@ -406,4 +406,4 @@ pub(crate) async fn stage_linked_clone(
 
 #[cfg(test)]
 #[path = "clone_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -1296,6 +1296,7 @@ mod custody;
 mod disposal;
 mod helper;
 mod recovery;
+mod snapshot;
 
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use custody::LedgerCheckpoints;
