@@ -91,6 +91,8 @@ async fn reserved(h: &Harness, client: &Client) -> Starting {
     // operation as the unresolved writer epoch of the exact generation.
     assert_eq!(unresolved_epoch(h, vm), Some((target.generation, target.epoch)));
     assert_eq!(controller.active_release_epoch(vm, false).unwrap(), None);
+    // The same transaction records the exact never-created writer epoch.
+    assert_eq!(writer_epoch(h, target.generation), (target.epoch, false));
     assert!(controller.native_run_current("alpha", target, false).unwrap());
     assert!(!controller.native_run_current("alpha", target, true).unwrap());
     let owner = Arc::new(native_run::Run::new("alpha", target));
@@ -109,6 +111,13 @@ fn start_request(vm: Id, number: u64) -> Request<'static> {
 fn operation_count(h: &Harness) -> i64 {
     h.supervisor().controller.native_store().transact(|db| {
         Ok(db.query_row("SELECT count(*) FROM vm_operations", [], |r| r.get(0))?)
+    }).unwrap()
+}
+
+fn writer_epoch(h: &Harness, generation: Id) -> (Id, bool) {
+    h.supervisor().controller.native_store().transact(|db| {
+        Ok(db.query_row("SELECT epoch,boot IS NOT NULL FROM vm_native_writer WHERE generation=?1",
+            [generation], |r| Ok((r.get(0)?, r.get(1)?)))?)
     }).unwrap()
 }
 

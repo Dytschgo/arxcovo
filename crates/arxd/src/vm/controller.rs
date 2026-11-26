@@ -2680,6 +2680,13 @@ impl<C: Clock> VmController<C> {
                     store::native::pair_matches(db, scope, [slots.disk, slots.vars], pins)?,
                     "TEST start has no bound released pair"
                 );
+                // Record the exact never-created writer epoch, so a restart
+                // before the creation checkpoint still reaches recovery.
+                let epoch = worker
+                    .admitted()
+                    .ok_or_else(|| anyhow::anyhow!("invalid TEST start"))?
+                    .operation;
+                store::native::recovery::admit_epoch(db, scope, epoch)?;
                 worker.deadline = clock.monotonic + Duration::from_secs(360);
                 return Ok((decision, active));
             }
