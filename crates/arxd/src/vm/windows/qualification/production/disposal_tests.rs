@@ -22,11 +22,11 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const NOW: i64 = 1_800_000_000_000;
-const CLAIM: u64 = 4096;
+pub(crate) const NOW: i64 = 1_800_000_000_000;
+pub(crate) const CLAIM: u64 = 4096;
 
 #[derive(Clone)]
-struct FakeClock(Arc<Mutex<ClockReading>>);
+pub(crate) struct FakeClock(Arc<Mutex<ClockReading>>);
 
 impl FakeClock {
     fn new(utc_ms: i64) -> Self {
@@ -36,7 +36,7 @@ impl FakeClock {
         })))
     }
 
-    fn advance(&self, utc_ms: i64, secs: u64) {
+    pub(crate) fn advance(&self, utc_ms: i64, secs: u64) {
         let mut guard = self.0.lock().unwrap();
         guard.utc_ms += utc_ms;
         let stepped = guard.monotonic + Duration::from_secs(secs);
@@ -50,7 +50,7 @@ impl Clock for FakeClock {
     }
 }
 
-struct OfflineReaper;
+pub(crate) struct OfflineReaper;
 
 impl ReaperRuntime for OfflineReaper {
     fn quiesce(&self, _: &CleanupWork, _: Instant) -> Quiesced {
@@ -67,7 +67,7 @@ impl ReaperRuntime for OfflineReaper {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Fault {
+pub(crate) enum Fault {
     /// Fail before the Nth (1-based) call to `step`.
     Before(&'static str, usize),
     /// Commit the Nth (1-based) call to `step`, then simulate lost ack / crash.
@@ -193,10 +193,10 @@ impl DisposalCheckpoints for FaultDisposal<'_> {
 
 /// Real `VmController` + private NTFS production root for end-to-end sweep and
 /// crash-reopen tests with zero volatile state across reopens.
-struct SweepFixture {
+pub(crate) struct SweepFixture {
     ctl: Option<VmController<FakeClock>>,
-    clock: FakeClock,
-    production: PathPin,
+    pub(crate) clock: FakeClock,
+    pub(crate) production: PathPin,
     owner: Arc<LocalSid>,
     owner_text: String,
     temp: tempfile::TempDir,
@@ -205,7 +205,7 @@ struct SweepFixture {
 }
 
 impl SweepFixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::new_with_store(false)
     }
 
@@ -238,17 +238,17 @@ impl SweepFixture {
         }
     }
 
-    fn ctl(&self) -> &VmController<FakeClock> {
+    pub(crate) fn ctl(&self) -> &VmController<FakeClock> {
         self.ctl.as_ref().unwrap()
     }
 
-    fn store(&self) -> &VmStore {
+    pub(crate) fn store(&self) -> &VmStore {
         self.ctl().reaper_test_store()
     }
 
     /// Reopens a brand-new `VmController` and `VmStore` from disk with zero
     /// volatile caches, guards or sweep state.
-    fn reopen(&mut self) {
+    pub(crate) fn reopen(&mut self) {
         drop(self.ctl.take());
         self.ctl = Some(
             VmController::open(self.state_root(), VmPolicy::default(), self.clock.clone()).unwrap(),
@@ -263,23 +263,23 @@ impl SweepFixture {
         }
     }
 
-    fn owner_sid(&self) -> &Arc<LocalSid> {
+    pub(crate) fn owner_sid(&self) -> &Arc<LocalSid> {
         &self.owner
     }
 
-    fn gen_dir(&self, generation: Id) -> PathBuf {
+    pub(crate) fn gen_dir(&self, generation: Id) -> PathBuf {
         Path::new(self.production.path.as_str()).join(hex::encode(generation))
     }
 
-    fn slot_file(&self, slot: ArtifactSlot) -> PathBuf {
+    pub(crate) fn slot_file(&self, slot: ArtifactSlot) -> PathBuf {
         self.gen_dir(slot.generation).join(leaf_name(slot))
     }
 
-    fn lease_file(&self, generation: Id) -> PathBuf {
+    pub(crate) fn lease_file(&self, generation: Id) -> PathBuf {
         self.gen_dir(generation).join(GENERATION_LEASE)
     }
 
-    fn disposal<'a>(
+    pub(crate) fn disposal<'a>(
         &'a self,
         ledger: &'a dyn DisposalCheckpoints,
         guards: &'a GenerationGuards,
@@ -287,20 +287,20 @@ impl SweepFixture {
         NativeDisposal::under(&self.production, self.owner_sid().0, ledger, guards)
     }
 
-    fn sweep(&self, fault: Option<Fault>) -> bool {
+    pub(crate) fn sweep(&self, fault: Option<Fault>) -> bool {
         let ledger = FaultDisposal::new(self.store(), fault);
         let guards = GenerationGuards::default();
         let custody = self.disposal(&ledger, &guards);
         self.ctl().sweep_with(&OfflineReaper, &custody).unwrap()
     }
 
-    fn count(&self, sql: &str) -> i64 {
+    pub(crate) fn count(&self, sql: &str) -> i64 {
         self.store()
             .transact(|db| store::count(db, sql, []))
             .unwrap()
     }
 
-    fn stage_slot(
+    pub(crate) fn stage_slot(
         &self,
         ws: &ProductionWorkspace,
         ledger: &LedgerCheckpoints<'_>,
@@ -328,7 +328,7 @@ impl SweepFixture {
 
     /// Reserves and stages a full native build (primary disk/vars/seed +
     /// verification overlay/vars) with both bound workspaces on NTFS.
-    fn stage_build(&self, nonce: u8) -> (i64, BuildSlots, [ArtifactEvidence; 2]) {
+    pub(crate) fn stage_build(&self, nonce: u8) -> (i64, BuildSlots, [ArtifactEvidence; 2]) {
         let request = build_request(nonce);
         let (activity, slots) = self
             .store()
@@ -454,7 +454,7 @@ fn default_owner_sid() -> (LocalSid, String) {
     (LocalSid::parse(&string).unwrap(), string)
 }
 
-fn build_request(nonce: u8) -> BuildRequest<'static> {
+pub(crate) fn build_request(nonce: u8) -> BuildRequest<'static> {
     BuildRequest {
         principal: "alice",
         key: RequestId::parse(&format!("{nonce:032x}")).unwrap(),
@@ -473,7 +473,7 @@ fn build_request(nonce: u8) -> BuildRequest<'static> {
     }
 }
 
-fn exists(path: &Path) -> bool {
+pub(crate) fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
