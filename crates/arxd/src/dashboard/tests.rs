@@ -1267,12 +1267,11 @@ async fn a_panicking_refresh_marks_hosts_unavailable_without_stopping_the_dashbo
         }
         bounded("sampler failure", sampler.failed()).await;
         // The sampler stopped: no refresh follows the panic.
-        bounded("refresh channel close", async {
-            while let Some(call) = entered.recv().await {
-                panic!("refresh {call} started after the panic");
-            }
-        })
-        .await;
+        assert_eq!(
+            bounded("refresh channel close", entered.recv()).await,
+            None,
+            "a refresh started after the panic"
+        );
         assert_eq!(
             sampler_read(&sampler).await.err(),
             Some(StatusCode::SERVICE_UNAVAILABLE)
@@ -1307,10 +1306,9 @@ async fn host_sampler_stops_when_the_dashboard_is_dropped_during_a_refresh() {
     bounded("sampler shutdown", stopped)
         .await
         .expect("the sampler dropped its source");
-    bounded("refresh channel close", async {
-        while let Some(call) = entered.recv().await {
-            panic!("refresh {call} started after shutdown");
-        }
-    })
-    .await;
+    assert_eq!(
+        bounded("refresh channel close", entered.recv()).await,
+        None,
+        "a refresh started after shutdown"
+    );
 }
