@@ -614,7 +614,7 @@ fn t69_t70_t71_ordinary_sweep_resumes_after_every_unlink_and_reopen() {
         assert_eq!(fx.count("SELECT count(*) FROM vm_native_slots"), 0);
         assert_eq!(
             fx.store()
-                .transact(|db| Ok(store::tombstone_proof(db, "alice", vm)?))
+                .transact(|db| store::tombstone_proof(db, "alice", vm))
                 .unwrap()
                 .and_then(|(_, confirmed)| confirmed),
             Some(true),
