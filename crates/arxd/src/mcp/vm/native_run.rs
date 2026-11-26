@@ -14,9 +14,11 @@ use crate::{
             ProductionWorkspace, ReleasedGeneration, StartCreation, StartPair, StartRefusal,
             WorkspaceBinding,
         },
+        runtime::ScriptAuthority,
         test_issuer::{Installation, NativeTarget, SelectedSource, TestIssuer},
     },
 };
+use arx_guest::ScriptStatus;
 use tokio::{runtime::Runtime, sync::Notify};
 
 const PATH: NativeRefusal = NativeRefusal::PathCustodyUnverified;
@@ -26,6 +28,10 @@ const OBSERVE: Duration = Duration::from_secs(20);
 /// Short backoff while a concurrent dispatch, such as a `vm_get` poll, holds
 /// the foreground gate at the moment a validated boot is ready to commit.
 const GATE_RETRY: Duration = Duration::from_millis(10);
+/// After a stop, drain or loss signal, an in-flight script exchange gets at
+/// most this long, well inside any script's own timeout, before the owner
+/// abandons it as channel loss and tears down.
+const SCRIPT_INTERRUPT: Duration = Duration::from_secs(2);
 
 pub(super) struct Run {
     principal: String,
@@ -33,6 +39,9 @@ pub(super) struct Run {
     cancel: Shutdown,
     state: Mutex<State>,
     retry: Notify,
+    scripts: Notify,
+    #[cfg(test)]
+    settled: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -40,6 +49,71 @@ struct State {
     witness: Option<Id>,
     ended: bool,
     stop: Option<Arc<StopReceipt>>,
+    /// One admitted script waiting for the owned channel. The ledger admits
+    /// at most one pending script per VM.
+    queued: Option<ScriptJob>,
+    /// Admitted receipts whose settlement failed; retried, never dropped.
+    unsettled: Vec<(PendingOperation, Settlement)>,
+}
+
+/// One durably admitted guest script for the owned channel.
+pub(super) struct ScriptJob {
+    pub(super) worker: PendingOperation,
+    pub(super) script: String,
+    pub(super) timeout_s: u32,
+}
+
+/// How an admitted script receipt settles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Settlement {
+    /// A typed guest result that passed the terminal cutoff.
+    Guest(ScriptResult),
+    /// The channel was lost with the script sent: execution is unknown and
+    /// the VM enters recovery.
+    Lost,
+    /// An admitted owner stop interrupted the sent script: execution is
+    /// unknown, and the stop's own release settles the VM.
+    Stopped,
+    /// Never dispatched: refused authorization, queued at stop or loss.
+    Cancelled,
+}
+
+/// Authorizes one admitted script at channel dispatch, consuming a fresh
+/// single-use permit for its exact bytes, timeout and live writer epoch.
+pub(super) trait ScriptAuthorizer {
+    fn authorize(
+        &self,
+        worker: &PendingOperation,
+        target: NativeTarget,
+        script: &str,
+        timeout_s: u32,
+        cancel: &Shutdown,
+    ) -> Result<ScriptAuthority, NativeRefusal>;
+}
+
+impl<S: SelectedSource, C: Clock> ScriptAuthorizer for TestIssuer<'_, S, C> {
+    fn authorize(
+        &self,
+        worker: &PendingOperation,
+        target: NativeTarget,
+        script: &str,
+        timeout_s: u32,
+        cancel: &Shutdown,
+    ) -> Result<ScriptAuthority, NativeRefusal> {
+        let epoch = target.writer_epoch.ok_or(REFUSED)?;
+        self.intent(worker, target, cancel)?
+            .script(script, timeout_s)?
+            .consume(target.generation, epoch, script, timeout_s)
+    }
+}
+
+/// The fixture-installed admission inputs for owned scripts. No production
+/// path installs it before 7c 16, so the script route stays closed.
+#[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
+pub(super) struct NativeScripts {
+    pub(super) installation: Installation,
+    pub(super) host: Arc<dyn Fn() -> HostObservation + Send + Sync>,
+    pub(super) resources: Resources,
 }
 
 impl Run {
@@ -50,7 +124,16 @@ impl Run {
             cancel: Shutdown::default(),
             state: Mutex::default(),
             retry: Notify::new(),
+            scripts: Notify::new(),
+            #[cfg(test)]
+            settled: Default::default(),
         }
+    }
+
+    /// Script receipt settlement attempts so far.
+    #[cfg(test)]
+    pub(super) fn scripts_settled(&self) -> usize {
+        self.settled.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -80,6 +163,74 @@ impl Run {
             state.ended = true;
             state.witness = None;
         }
+    }
+
+    /// Whether a new script could still be queued for this live run.
+    fn accepts_script(&self) -> bool {
+        !self.cancel.is_cancelled()
+            && self
+                .state
+                .lock()
+                .is_ok_and(|state| !state.ended && state.queued.is_none())
+    }
+
+    /// Queues an admitted script, or returns it when the run has ended so
+    /// the caller settles its receipt. Ending and the final drain take the
+    /// same lock, so no job is left behind.
+    pub(super) fn enqueue(&self, job: ScriptJob) -> Result<(), ScriptJob> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err(job);
+        };
+        if state.ended || self.cancel.is_cancelled() || state.queued.is_some() {
+            return Err(job);
+        }
+        state.queued = Some(job);
+        self.scripts.notify_one();
+        Ok(())
+    }
+
+    fn take_script(&self) -> Option<ScriptJob> {
+        self.state.lock().ok()?.queued.take()
+    }
+
+    /// Settles one receipt, keeping it for a later retry if the ledger
+    /// refuses. A receipt is never dropped by a settlement failure.
+    pub(super) fn settle_script(
+        &self,
+        supervisor: &Supervisor,
+        worker: PendingOperation,
+        settlement: Settlement,
+    ) {
+        // A receipt that a fence or recovery already settled is done.
+        if finish_script(supervisor, &worker, settlement).is_err()
+            && !matches!(
+                supervisor.controller.native_receipt_pending(&worker),
+                Ok(false)
+            )
+            && let Ok(mut state) = self.state.lock()
+        {
+            state.unsettled.push((worker, settlement));
+        }
+        #[cfg(test)]
+        self.settled.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// One retry of every receipt whose settlement failed. Returns whether
+    /// none remains.
+    fn retry_receipts(&self, supervisor: &Supervisor) -> bool {
+        let Ok(pending) = self
+            .state
+            .lock()
+            .map(|mut state| std::mem::take(&mut state.unsettled))
+        else {
+            return false;
+        };
+        for (worker, settlement) in pending {
+            self.settle_script(supervisor, worker, settlement);
+        }
+        self.state
+            .lock()
+            .is_ok_and(|state| state.unsettled.is_empty())
     }
 
     fn publish(&self, id: Id, supervisor: &Supervisor) -> bool {
@@ -176,24 +327,110 @@ impl VmInventory {
             Err(reason) => return Some(Err(reason)),
         };
         let action = Action::Stop as i64;
-        Some(
-            (|| match self.supervisor.controller.admit_owned_native_stop(
-                &self.principal,
-                request.key,
-                owner.target,
-            )? {
-                Ok((operation, stop)) => {
-                    match stop {
-                        Some(stop) => owner.stop(stop)?,
-                        // A replayed stop nudges a teardown that is still
-                        // retrying its release.
-                        None => owner.retry.notify_one(),
-                    }
-                    Ok(receipt(operation, None))
+        // A script still queued never reached the guest; one the run already
+        // took is in flight. Taking it here means it can no longer dispatch.
+        let queued = owner.take_script();
+        let script = if queued.is_some() {
+            FailureReason::Cancelled
+        } else {
+            FailureReason::ExecutionUnknown
+        };
+        let admitted = self.supervisor.controller.admit_owned_native_stop(
+            &self.principal,
+            request.key,
+            owner.target,
+            script,
+        );
+        // A fresh stop settled the queued receipt with it. Otherwise the job
+        // returns to its run, or settles if the run has ended.
+        if !matches!(admitted, Ok(Ok((_, Some(_)))))
+            && let Some(job) = queued
+            && let Err(job) = owner.enqueue(job)
+        {
+            owner.settle_script(&self.supervisor, job.worker, Settlement::Cancelled);
+        }
+        Some((|| match admitted? {
+            Ok((operation, stop)) => {
+                match stop {
+                    Some(stop) => owner.stop(stop)?,
+                    // A replayed stop nudges a teardown that is still
+                    // retrying its release.
+                    None => owner.retry.notify_one(),
                 }
-                Err(reason) => self.refuse(action, request.vm(), reason.into()),
-            })(),
-        )
+                Ok(receipt(operation, None))
+            }
+            Err(reason) => self.refuse(action, request.vm(), reason.into()),
+        })())
+    }
+
+    /// One script for the caller's current TEST run owner, under the
+    /// foreground gate after the generic replay and state precheck. The
+    /// queue slot is checked before the durable admission; a run that ended
+    /// in between settles the admitted receipt as cancelled. Without the
+    /// fixture-only installation this route never matches.
+    pub(super) fn script_subject(
+        &self,
+        action: i64,
+        request: &Mutation,
+        script: &str,
+        timeout_s: u32,
+    ) -> Option<Outcome<Value>> {
+        let scripts = self.supervisor.native_scripts.get()?;
+        let owner = match self
+            .supervisor
+            .native_runs
+            .with_entry(request.id, |owner| owner.cloned())
+        {
+            Ok(Some(owner)) if owner.principal == self.principal => owner,
+            Ok(_) => return None,
+            Err(reason) => return Some(Err(reason)),
+        };
+        if !owner.accepts_script() {
+            return Some(self.refuse(action, request.vm(), Refusal::Busy.into()));
+        }
+        let supervisor = &self.supervisor;
+        let admission = supervisor.controller.admit_native_script(
+            &scripts.installation,
+            &Request {
+                principal: &self.principal,
+                vm: request.id,
+                request_id: request.key,
+                operation: Operation::Script {
+                    script,
+                    timeout_seconds: timeout_s.into(),
+                },
+                disk: DiskClaim::default(),
+            },
+            owner.target,
+            (scripts.host)(),
+            scripts.resources,
+        );
+        Some((|| match admission? {
+            Admission::Admitted(worker) => {
+                let operation = worker.admitted().ok_or(STATE_UNAVAILABLE)?.operation;
+                let job = ScriptJob {
+                    worker,
+                    script: script.to_owned(),
+                    timeout_s,
+                };
+                if let Err(job) = owner.enqueue(job) {
+                    owner.settle_script(supervisor, job.worker, Settlement::Cancelled);
+                }
+                Ok(receipt(operation, None))
+            }
+            // A concurrent replay of the same request returns its receipt.
+            Admission::Existing(_) => supervisor
+                .controller
+                .foreground_replay(
+                    &self.principal,
+                    request.key,
+                    Subject::Vm(request.id),
+                    action,
+                )??
+                .map(|previous| receipt(previous.operation.id, previous.lease_end))
+                .ok_or(STATE_UNAVAILABLE),
+            Admission::Refused(reason) => self.refuse(action, request.vm(), reason.into()),
+        })())
     }
 }
 
@@ -225,6 +462,18 @@ pub(super) trait LiveLaunch {
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal>;
 
+    /// One script under an authority consumed for exactly these bytes and
+    /// this timeout. A typed guest result is `Ok`; any transport failure
+    /// returns before teardown.
+    async fn run_script(
+        &mut self,
+        authority: ScriptAuthority,
+        script: String,
+        timeout_s: u32,
+        cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(ScriptStatus, Option<u32>), NativeRefusal>;
+
     /// One bounded teardown attempt that keeps every handle. `None` leaves
     /// the same launch for the next retry.
     async fn stop(&mut self) -> Option<Self::Proof>;
@@ -255,6 +504,17 @@ impl<'a> LiveLaunch for NativeLaunch<'a> {
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
         NativeLaunch::ping(self, cancel, refresh).await
+    }
+
+    async fn run_script(
+        &mut self,
+        authority: ScriptAuthority,
+        script: String,
+        timeout_s: u32,
+        cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(ScriptStatus, Option<u32>), NativeRefusal> {
+        NativeLaunch::run_script(self, authority, script, timeout_s, cancel, refresh).await
     }
 
     async fn stop(&mut self) -> Option<Self::Proof> {
@@ -466,6 +726,7 @@ impl Run {
                             supervisor,
                             &start.worker,
                             &mut launch,
+                            issuer,
                             || issuer.epoch().effects_revoked(),
                             async |proof| self.settle_proof(supervisor, &proof).await,
                         )
@@ -513,13 +774,15 @@ impl Run {
         Ok(captured)
     }
 
-    /// Boots the owned launch, commits readiness, pings it while live and
-    /// settles its teardown. `revoked` reports selection-epoch revocation.
+    /// Boots the owned launch, commits readiness, then serves queued scripts
+    /// and pings on the one owned channel while live, and settles its
+    /// teardown. `revoked` reports selection-epoch revocation.
     pub(super) async fn live<L: LiveLaunch>(
         &self,
         supervisor: &Supervisor,
         worker: &PendingOperation,
         launch: &mut L,
+        authorize: &impl ScriptAuthorizer,
         revoked: impl Fn() -> bool,
         settle: impl AsyncFnOnce(L::Proof),
     ) {
@@ -547,15 +810,23 @@ impl Run {
                     biased;
                     _ = supervisor.cancel.cancelled() => break,
                     _ = self.cancel.cancelled() => break,
+                    _ = self.scripts.notified() => {}
                     _ = ping.tick() => {}
                 }
-                if launch
-                    .ping(&self.cancel, || {
-                        self.observe_run(supervisor, true, &revoked)
-                    })
-                    .await
-                    .is_err()
-                {
+                self.retry_receipts(supervisor);
+                let verified = match self.take_script() {
+                    Some(job) => {
+                        self.dispatch(supervisor, launch, authorize, &revoked, job)
+                            .await
+                    }
+                    None => launch
+                        .ping(&self.cancel, || {
+                            self.observe_run(supervisor, true, &revoked)
+                        })
+                        .await
+                        .is_ok(),
+                };
+                if !verified {
                     break;
                 }
             }
@@ -564,8 +835,89 @@ impl Run {
             .await;
     }
 
-    /// Withdraws the witness before the first teardown attempt, then keeps
-    /// the same launch, its handles and join evidence through bounded retries.
+    /// One admitted script on the owned channel, authorized at dispatch.
+    /// Returns whether the channel is still verified. A stop, drain or loss
+    /// interrupts the exchange within [`SCRIPT_INTERRUPT`], and a result
+    /// counts only if the run is still current after it arrived.
+    async fn dispatch<L: LiveLaunch>(
+        &self,
+        supervisor: &Supervisor,
+        launch: &mut L,
+        authorize: &impl ScriptAuthorizer,
+        revoked: &impl Fn() -> bool,
+        job: ScriptJob,
+    ) -> bool {
+        let ScriptJob {
+            worker,
+            script,
+            timeout_s,
+        } = job;
+        let Target {
+            generation, epoch, ..
+        } = self.target;
+        let target = NativeTarget {
+            generation,
+            writer_epoch: Some(epoch),
+        };
+        let authority = authorize
+            .authorize(&worker, target, &script, timeout_s, &self.cancel)
+            .ok()
+            .filter(|authority| authority.names(generation, epoch, &script, timeout_s));
+        let Some(authority) = authority else {
+            // Nothing reached the guest; the channel stays verified.
+            self.settle_script(supervisor, worker, Settlement::Cancelled);
+            return true;
+        };
+        let result = {
+            let exchange = launch.run_script(authority, script, timeout_s, &self.cancel, || {
+                self.observe_run(supervisor, true, revoked)
+            });
+            tokio::pin!(exchange);
+            tokio::select! {
+                biased;
+                result = &mut exchange => result,
+                () = self.interrupted(supervisor) => Err(NativeRefusal::GuestEndpointUnverified),
+            }
+        };
+        // The terminal cutoff: a stop, revocation or lost run after the
+        // final sample suppresses the result.
+        let result = result
+            .and_then(|result| self.observe_run(supervisor, true, revoked).map(|_| result))
+            .ok()
+            .and_then(|(status, code)| guest_result(status, code));
+        match result {
+            Some(result) => {
+                self.settle_script(supervisor, worker, Settlement::Guest(result));
+                true
+            }
+            None => {
+                // Withdraw at loss detection, before the receipt or teardown.
+                self.withdraw();
+                let stopped = self.state.lock().is_ok_and(|state| state.stop.is_some());
+                let settlement = if stopped {
+                    Settlement::Stopped
+                } else {
+                    Settlement::Lost
+                };
+                self.settle_script(supervisor, worker, settlement);
+                false
+            }
+        }
+    }
+
+    async fn interrupted(&self, supervisor: &Supervisor) {
+        tokio::select! {
+            _ = self.cancel.cancelled() => {}
+            _ = supervisor.cancel.cancelled() => {}
+        }
+        tokio::time::sleep(SCRIPT_INTERRUPT).await;
+    }
+
+    /// Withdraws the witness and settles any queued script before the first
+    /// teardown attempt, then keeps the same launch, its handles and join
+    /// evidence through bounded retries. Receipts whose settlement failed
+    /// are retried after teardown until they settle or drain hands them to
+    /// recovery.
     pub(super) async fn settle_live<P>(
         &self,
         supervisor: &Supervisor,
@@ -573,6 +925,9 @@ impl Run {
         settle: impl AsyncFnOnce(P),
     ) {
         self.withdraw();
+        if let Some(job) = self.take_script() {
+            self.settle_script(supervisor, job.worker, Settlement::Cancelled);
+        }
         loop {
             if let Some(proof) = stop().await {
                 settle(proof).await;
@@ -580,6 +935,14 @@ impl Run {
             }
             if !self.wait_retry(supervisor).await {
                 break;
+            }
+        }
+        while !self.retry_receipts(supervisor) {
+            tokio::select! {
+                biased;
+                _ = supervisor.cancel.cancelled() => return,
+                _ = self.retry.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }
     }
@@ -763,6 +1126,42 @@ impl Supervisor {
             Err(_) => false,
         }
     }
+}
+
+fn finish_script(
+    supervisor: &Supervisor,
+    worker: &PendingOperation,
+    settlement: Settlement,
+) -> anyhow::Result<()> {
+    let controller = &supervisor.controller;
+    match settlement {
+        Settlement::Guest(result) => controller.finish_script(worker, result),
+        Settlement::Lost => controller.finish_with_cause(
+            worker,
+            Completion::CleanupUnconfirmed,
+            Some(FailureReason::ExecutionUnknown),
+        ),
+        Settlement::Stopped => controller.finish_with_cause(
+            worker,
+            Completion::Failed,
+            Some(FailureReason::ExecutionUnknown),
+        ),
+        Settlement::Cancelled => {
+            controller.finish_with_cause(worker, Completion::Failed, Some(FailureReason::Cancelled))
+        }
+    }
+    .map(drop)
+}
+
+/// The typed guest outcome. An exit without its code is malformed.
+fn guest_result(status: ScriptStatus, code: Option<u32>) -> Option<ScriptResult> {
+    Some(match status {
+        ScriptStatus::Exited => ScriptResult::Exited(code?),
+        ScriptStatus::Unavailable => ScriptResult::Unavailable,
+        ScriptStatus::TimedOut => ScriptResult::TimedOut,
+        ScriptStatus::LaunchFailed => ScriptResult::LaunchFailed,
+        ScriptStatus::Terminated => ScriptResult::Terminated,
+    })
 }
 
 fn binding(scope: Scope) -> WorkspaceBinding {

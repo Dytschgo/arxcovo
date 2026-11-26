@@ -2694,6 +2694,65 @@ impl<C: Clock> VmController<C> {
         })
     }
 
+    /// Admit one guest script for the exact running epoch of a current TEST
+    /// run owner. The run check and the durable receipt share one
+    /// transaction; a receipt for any other run rolls back as busy. The
+    /// worker deadline covers the guest's own timeout plus the channel's
+    /// exchange slack, so a typed guest timeout still settles as a result.
+    pub(crate) fn admit_native_script(
+        &self,
+        _installation: &super::test_issuer::Installation,
+        request: &Request<'_>,
+        target: store::native::release::Target,
+        host: HostObservation,
+        resources: Resources,
+    ) -> Result<Admission> {
+        let Operation::Script {
+            timeout_seconds, ..
+        } = request.operation
+        else {
+            anyhow::bail!("invalid TEST script");
+        };
+        ensure!(request.vm == target.vm, "invalid TEST script");
+        validate_principal(request.principal)?;
+        let gate = self
+            .gate
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        let stale = std::cell::Cell::new(false);
+        let result = self.store.try_native_transaction(|db| {
+            let clock = self.clock.now();
+            let mut decision = self.admit_inner(db, request, host, resources, clock, &gate)?;
+            if let Admission::Admitted(worker) = &mut decision {
+                if !Self::native_run_matches(db, request.principal, target, true, utc(clock)?)? {
+                    stale.set(true);
+                    anyhow::bail!("TEST script has no current run");
+                }
+                worker.deadline = clock.monotonic
+                    + Duration::from_secs(timeout_seconds)
+                    + super::guest::SCRIPT_EXCHANGE_SLACK;
+            }
+            Ok(decision)
+        });
+        if stale.get() {
+            return Ok(Admission::Refused(Refusal::Busy));
+        }
+        result
+    }
+
+    /// Whether an admitted worker's receipt is still pending. A fence or
+    /// recovery may have settled it first.
+    pub(crate) fn native_receipt_pending(&self, worker: &PendingOperation) -> Result<bool> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            Ok(store::count(
+                db,
+                "SELECT count(*) FROM activity WHERE id=?1 AND status=0",
+                [worker.activity_id],
+            )? == 1)
+        })
+    }
+
     pub(crate) fn native_workspace_scope(&self, generation: Id) -> Result<store::native::Scope> {
         let db = self.store.try_live_connection()?;
         Self::bound_native_workspace(&db, generation)
@@ -2787,12 +2846,16 @@ impl<C: Clock> VmController<C> {
     }
 
     /// Only an extant run owner can supply the exact target. The stop receipt
-    /// and interruption of an in-progress start are atomic.
+    /// and interruption of an in-progress start are atomic. The ledger admits
+    /// one pending operation per VM, so a pending script on the run settles
+    /// as failed with `script` in the same transaction, while the owner
+    /// cancels its exchange.
     pub(crate) fn admit_owned_native_stop(
         &self,
         principal: &str,
         key: RequestId,
         target: store::native::release::Target,
+        script: FailureReason,
     ) -> Result<Result<(Id, Option<store::native::release::StopReceipt>), Refusal>> {
         validate_principal(principal)?;
         self.store.try_native_transaction(|db| {
@@ -2834,6 +2897,23 @@ impl<C: Clock> VmController<C> {
             }
             if status == Status::Pending.code() {
                 store::finish(db, activity, Status::Interrupted, now, Some(false))?;
+            }
+            let pending_script = db
+                .query_row(
+                    "SELECT id FROM activity WHERE vm=?1 AND action=2 AND status=0",
+                    [target.vm],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(pending_script) = pending_script {
+                store::settle_with_script(
+                    db,
+                    pending_script,
+                    now,
+                    Completion::Failed,
+                    None,
+                    Some(script),
+                )?;
             }
             let operation = binding.record(db, now, Some(target.vm), None)?;
             let stamp = store::native::release::StopReceipt::at_admission(

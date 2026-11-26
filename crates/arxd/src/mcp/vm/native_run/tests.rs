@@ -810,6 +810,18 @@ impl LiveLaunch for FixtureLaunch {
         Ok(())
     }
 
+    /// The line fixture has no script channel.
+    async fn run_script(
+        &mut self,
+        _authority: crate::vm::runtime::ScriptAuthority,
+        _script: String,
+        _timeout_s: u32,
+        _cancel: &Shutdown,
+        _refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(arx_guest::ScriptStatus, Option<u32>), NativeRefusal> {
+        Err(NativeRefusal::GuestEndpointUnverified)
+    }
+
     async fn stop(&mut self) -> Option<Observed> {
         self.teardown.mark_entered();
         self.teardown.wait_release().await;
@@ -903,7 +915,8 @@ async fn composed_start_replays_publishes_after_ping_and_withdraws_on_loss() {
             })?;
             let mut launch = launch;
             launch.proof = Some(Observed { target, scope, slots, pins, clean: true });
-            runtime.block_on(owner.live(supervisor, &start.worker, &mut launch, || false,
+            let authorize = FixtureAuthorizer { controller: &supervisor.controller };
+            runtime.block_on(owner.live(supervisor, &start.worker, &mut launch, &authorize, || false,
                 async |proof: Observed| {
                     owner.settle_with(supervisor, || Ok(()), |_, receipt| {
                         supervisor.controller.native_store().try_native_transaction(|db| {
@@ -1049,4 +1062,852 @@ async fn composed_start_restarted_before_creation_reaches_the_real_recovery_comm
     assert_admission_closed(&h);
     drop(client);
     let _ = h.shutdown().await;
+}
+
+// ---- 7c 14: scripts on the owned channel, cancelled by stop ----
+
+/// Script bytes that must never reach the ledger, a receipt or a read.
+const CANARY: &str = "canary-7c14-0f3a";
+const BOOT_MS: u64 = 3_600_000;
+const SELECTION_SEAL: crate::vm::qualification_record::Hash = [0xa1; 32];
+const SELECTION_SCOPE: crate::vm::qualification_record::Hash = [0xb2; 32];
+const SELECTION_OWNER: &str = "S-1-12-1-1-2-3-4";
+
+/// A held TEST selection over the harness clock. The production issuer
+/// body mints and consumes every script permit against the real ledger.
+struct FixtureSelection {
+    origin: Instant,
+}
+
+impl crate::vm::test_issuer::SelectedSource for FixtureSelection {
+    fn seal_sha256(&self) -> crate::vm::qualification_record::Hash {
+        SELECTION_SEAL
+    }
+
+    fn class(&self) -> crate::vm::qualification_record::Class {
+        crate::vm::qualification_record::Class::Test
+    }
+
+    fn scope(&self) -> crate::vm::qualification_record::Hash {
+        SELECTION_SCOPE
+    }
+
+    fn recipes(&self) -> crate::vm::qualification_record::TestRecipes {
+        use crate::vm::qualification_record::RecipeIdentity;
+        crate::vm::qualification_record::TestRecipes {
+            ubuntu: RecipeIdentity { recipe_id: [0x11; 16], recipe_sha256: [1; 32] },
+            windows: RecipeIdentity {
+                recipe_id: Controller::windows_recipe_id(),
+                recipe_sha256: [0x22; 32],
+            },
+        }
+    }
+
+    fn owner_matches(&self, configured: &str) -> bool {
+        configured == SELECTION_OWNER
+    }
+
+    fn sample(
+        &self,
+        advance: &dyn Fn() -> Result<ClockReading, crate::vm::selection_epoch::Invalidation>,
+    ) -> Result<crate::vm::selection_epoch::Sample, crate::vm::selection_epoch::Invalidation> {
+        let captured = Instant::now();
+        let reading = advance()?;
+        let elapsed = reading.monotonic.saturating_duration_since(self.origin).as_millis();
+        Ok(crate::vm::selection_epoch::Sample {
+            captured,
+            now: crate::vm::qualification_record::Instant2 {
+                utc: u64::try_from(reading.utc_ms / 1_000).unwrap(),
+                mono_ms: BOOT_MS + u64::try_from(elapsed).unwrap(),
+            },
+            boot_marker: [7; 32],
+            reading,
+        })
+    }
+}
+
+fn selection_config() -> crate::config::TestQualificationSelection {
+    let profile = json!({
+        "enabled": true, "owner_sid": SELECTION_OWNER, "supervisor_sid": SELECTION_OWNER,
+        "bundle": "E:/pinned bundle", "volume": "D:/", "state": "D:/test_vms/state",
+        "disk_ceiling_bytes": 10_737_418_240_u64, "manifest": "qemu-11.1.3-windows-x64",
+        "execution_profile": "current_user",
+        "test_qualification": {
+            "enrollment": "D:/private/enrollment.json", "dossier": "D:/private/dossier",
+            "sha256": hex::encode(SELECTION_SEAL), "scope": hex::encode(SELECTION_SCOPE),
+        },
+    });
+    crate::config::VmRuntimeProfile::parse(&serde_json::to_vec(&profile).unwrap())
+        .unwrap()
+        .test_qualification()
+        .unwrap()
+}
+
+/// Opens a fresh selection epoch per dispatch, because the harness UTC
+/// clock stands still, and delegates to the production issuer authorizer.
+struct FixtureAuthorizer<'a> {
+    controller: &'a Controller,
+}
+
+impl native_run::ScriptAuthorizer for FixtureAuthorizer<'_> {
+    fn authorize(
+        &self,
+        worker: &PendingOperation,
+        target: crate::vm::test_issuer::NativeTarget,
+        script: &str,
+        timeout_s: u32,
+        cancel: &Shutdown,
+    ) -> Result<crate::vm::runtime::ScriptAuthority, NativeRefusal> {
+        let issuer = crate::vm::test_issuer::TestIssuer::open(
+            &Installation::fixture(),
+            self.controller,
+            FixtureSelection { origin: Instant::now() },
+            &selection_config(),
+        )?;
+        issuer.authorize(worker, target, script, timeout_s, cancel)
+    }
+}
+
+/// What the duplex guest service saw and did.
+#[derive(Default)]
+struct GuestControl {
+    scripts: Mutex<Vec<(String, u32)>>,
+    challenges: Mutex<Vec<String>>,
+    /// A script ending in " hold" parks here until released.
+    held: TeardownBarrier,
+    replied: AtomicBool,
+    /// While set, each periodic ping parks until released or cancelled.
+    hold_pings: AtomicBool,
+    ping_hold: TeardownBarrier,
+}
+
+impl GuestControl {
+    fn received(&self) -> Vec<(String, u32)> {
+        self.scripts.lock().unwrap().clone()
+    }
+}
+
+/// The real guest wire protocol over a duplex pipe. The script's last word
+/// picks the reply: `exit 7`, `timeout`, `hold`, `drop` (close the channel),
+/// `garbage` (a malformed frame), anything else exits 0.
+async fn script_guest(mut stream: DuplexStream, control: Arc<GuestControl>) {
+    use arx_guest::{Request, Response, ScriptExecution, ScriptStatus};
+    while let Ok(length) = stream.read_u32().await {
+        if length as usize > arx_guest::MAX_FRAME {
+            return;
+        }
+        let mut payload = vec![0; length as usize + 4];
+        payload[..4].copy_from_slice(&length.to_be_bytes());
+        if stream.read_exact(&mut payload[4..]).await.is_err() {
+            return;
+        }
+        let Ok(Some(request)) = arx_guest::read_frame::<Request>(&mut payload.as_slice()) else {
+            return;
+        };
+        let response = match request {
+            Request::Hello { version, challenge } => {
+                control.challenges.lock().unwrap().push(challenge.clone());
+                Response::HelloAck { version, challenge, script_execution: ScriptExecution::Available }
+            }
+            Request::Ping { id } => Response::Pong { id },
+            Request::RunScript { id, script, timeout_s } => {
+                control.scripts.lock().unwrap().push((script.clone(), timeout_s));
+                let (status, exit_code) = match script.rsplit(' ').next() {
+                    Some("hold") => {
+                        control.held.mark_entered();
+                        control.held.wait_release().await;
+                        (ScriptStatus::Exited, Some(0))
+                    }
+                    Some("7") => (ScriptStatus::Exited, Some(7)),
+                    Some("timeout") => (ScriptStatus::TimedOut, None),
+                    Some("drop") => return,
+                    Some("garbage") => {
+                        let junk = br#"{"not":"a guest response"}"#;
+                        let mut frame = u32::try_from(junk.len()).unwrap().to_be_bytes().to_vec();
+                        frame.extend_from_slice(junk);
+                        let _ = stream.write_all(&frame).await;
+                        std::future::pending::<()>().await;
+                        return;
+                    }
+                    _ => (ScriptStatus::Exited, Some(0)),
+                };
+                control.replied.store(true, Ordering::SeqCst);
+                Response::ScriptResult { id, status, exit_code }
+            }
+        };
+        let mut frame = Vec::new();
+        if arx_guest::write_frame(&mut frame, &response).is_err()
+            || stream.write_all(&frame).await.is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Starts the guest port the real readiness handshake waits for.
+async fn script_qmp(stream: DuplexStream) {
+    let [major, minor, micro] = crate::vm::qemu_args::QEMU_VERSION
+        .split('.')
+        .map(|part| part.parse::<u32>().unwrap())
+        .collect::<Vec<_>>()[..]
+    else {
+        unreachable!("pinned QEMU version is major.minor.micro");
+    };
+    let mut peer = BufReader::new(stream);
+    let greeting = json!({"QMP":{"version":{"qemu":{"major":major,"minor":minor,"micro":micro},"package":""},"capabilities":[]}});
+    if peer.get_mut().write_all(format!("{greeting}\n").as_bytes()).await.is_err() {
+        return;
+    }
+    let mut line = String::new();
+    while peer.read_line(&mut line).await.is_ok_and(|read| read > 0) {
+        let Ok(command) = serde_json::from_str::<Value>(&line) else { return };
+        line.clear();
+        let result = match command["execute"].as_str() {
+            Some("query-status") => json!({"status":"prelaunch","running":false}),
+            Some(_) => json!({}),
+            None => return,
+        };
+        if send(&mut peer, json!({"return":result,"id":command["id"]})).await.is_err() {
+            return;
+        }
+        if command["execute"] == "cont" {
+            let open = json!({"event":"VSERPORT_CHANGE","data":{"id":crate::vm::qemu_args::GUEST_PORT_ID,"open":true}});
+            if send(&mut peer, open).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// A known fixture child whose guest channel passed the real readiness
+/// handshake. Its script exchange does not observe cancellation, as if
+/// blocked in pipe I/O, so only the owner's own bound can interrupt it.
+/// After the first verified ping, periodic pings check liveness only, so
+/// the test's authenticated reads never contend with a monitor sample.
+struct ScriptLaunch {
+    alive: Arc<AtomicBool>,
+    pings: Arc<AtomicUsize>,
+    channel: GuestChannel<DuplexStream>,
+    _qmp: Monitor,
+    control: Arc<GuestControl>,
+    teardown: Arc<TeardownBarrier>,
+    proof: Option<Observed>,
+}
+
+impl LiveLaunch for ScriptLaunch {
+    type Proof = Observed;
+
+    async fn boot(
+        &mut self,
+        _cancel: &Shutdown,
+        _boot_by: Instant,
+        mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        refresh().map(|_| ())
+    }
+
+    fn check_live(
+        &self,
+        refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        if !self.alive.load(Ordering::SeqCst) {
+            return Err(NativeRefusal::JobUnverified);
+        }
+        refresh().map(|_| ())
+    }
+
+    async fn ping(
+        &mut self,
+        cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        let refused = NativeRefusal::GuestEndpointUnverified;
+        if self.control.hold_pings.load(Ordering::SeqCst) {
+            self.control.ping_hold.mark_entered();
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(refused),
+                () = self.control.ping_hold.wait_release() => {}
+            }
+        }
+        if self.pings.load(Ordering::SeqCst) == 0 {
+            self.channel.ping(cancel).await.map_err(|_| refused)?;
+            self.check_live(refresh)?;
+        } else if !self.alive.load(Ordering::SeqCst) {
+            return Err(NativeRefusal::JobUnverified);
+        }
+        self.pings.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn run_script(
+        &mut self,
+        _authority: crate::vm::runtime::ScriptAuthority,
+        script: String,
+        timeout_s: u32,
+        _cancel: &Shutdown,
+        _refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(arx_guest::ScriptStatus, Option<u32>), NativeRefusal> {
+        self.channel
+            .run_script(&Shutdown::default(), script, timeout_s)
+            .await
+            .map_err(|_| NativeRefusal::GuestEndpointUnverified)
+    }
+
+    async fn stop(&mut self) -> Option<Observed> {
+        self.teardown.mark_entered();
+        self.teardown.wait_release().await;
+        self.proof.take()
+    }
+}
+
+/// One installed run serving scripts through the real start adapter,
+/// worker and owned loop, with real authenticated MCP requests.
+struct ScriptRun {
+    vm: Id,
+    epoch: Id,
+    scope: native::Scope,
+    owner: Arc<native_run::Run>,
+    control: Arc<GuestControl>,
+    alive: Arc<AtomicBool>,
+    revoked: Arc<AtomicBool>,
+    teardown: Arc<TeardownBarrier>,
+    finished: Arc<AtomicBool>,
+    witness: Value,
+    args: Value,
+    _cleanup: ComposedCleanup,
+}
+
+impl Drop for ScriptRun {
+    /// Frees any held reply or ping before the composed cleanup aborts the
+    /// peers, releases teardown and, on a panic, fences the supervisor.
+    fn drop(&mut self) {
+        self.control.held.release();
+        self.control.ping_hold.release();
+    }
+}
+
+impl ScriptRun {
+    fn script(&self, number: u64, script: &str, timeout_s: u32) -> Value {
+        json!({"vm_id":self.args["vm_id"], "request_id":key(number),
+            "script":format!("{CANARY} {script}"), "timeout_s":timeout_s})
+    }
+
+    fn stop(&self, number: u64) -> Value {
+        json!({"vm_id":self.args["vm_id"], "request_id":key(number)})
+    }
+
+    async fn settled(&self, at_least: usize) {
+        eventually("the script receipt to settle", || self.owner.scripts_settled() >= at_least).await;
+    }
+
+    async fn teardown_entered(&self) {
+        let entered = tokio::time::timeout(Duration::from_secs(15), self.teardown.wait_entered()).await;
+        assert!(entered.is_ok(), "teardown never started");
+    }
+
+    async fn released(&self, h: &Harness, supervisor: &Supervisor) {
+        self.teardown.release();
+        eventually("the worker to finish", || self.finished.load(Ordering::SeqCst)).await;
+        eventually("the run slot to be released", || {
+            supervisor.native_runs.with_entry(self.vm, |owner| owner.is_none()).unwrap_or(false)
+        }).await;
+        assert_eq!(unresolved_epoch(h, self.vm), None);
+        assert_eq!(
+            supervisor.controller.active_release_epoch(self.vm, false).unwrap(),
+            Some((self.scope.generation, self.epoch))
+        );
+    }
+}
+
+async fn script_run(h: &Harness, client: &Client, number: u64) -> ScriptRun {
+    let (vm, slots, pins, scope) = bound_clone(h, client).await;
+    let supervisor = h.supervisor().clone();
+    assert!(supervisor.native_scripts.set(native_run::NativeScripts {
+        installation: Installation::fixture(),
+        host: Arc::new(|| HOST),
+        resources: RESOURCES,
+    }).is_ok());
+    let control = Arc::new(GuestControl::default());
+    let (host, peer) = tokio::io::duplex(4096);
+    let (serial, guest) = tokio::io::duplex(8192);
+    let qmp_peer = tokio::spawn(script_qmp(peer));
+    let guest_peer = tokio::spawn(script_guest(guest, control.clone()));
+    let alive = Arc::new(AtomicBool::new(true));
+    let teardown = Arc::new(TeardownBarrier::default());
+    let cleanup = ComposedCleanup {
+        start_gate: None,
+        alive: alive.clone(),
+        teardown: teardown.clone(),
+        supervisor: supervisor.clone(),
+        peers: [qmp_peer.abort_handle(), guest_peer.abort_handle()],
+    };
+    let ready = Shutdown::default();
+    let (read, write) = split(host);
+    let mut qmp = Qmp::handshake(read, write, &ready).await.unwrap();
+    qmp.release_startup_hold(&ready, || true).await.unwrap();
+    let channel = GuestChannel::ready(serial, &mut qmp, &ready).await.unwrap();
+    let pings = Arc::new(AtomicUsize::new(0));
+    let launch = ScriptLaunch {
+        alive: alive.clone(),
+        pings: pings.clone(),
+        channel,
+        _qmp: qmp,
+        control: control.clone(),
+        teardown: teardown.clone(),
+        proof: None,
+    };
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_finished = finished.clone();
+    let revoked = Arc::new(AtomicBool::new(false));
+    let selection_revoked = revoked.clone();
+    let started = supervisor.gate.lock().unwrap().start_native_run(
+        &supervisor, &Installation::fixture(), start_request(vm, number), HOST, RESOURCES,
+        move |supervisor, runtime, owner, start| {
+            let target = owner.target();
+            supervisor.controller.native_store().transact(|db| {
+                native::recovery::record_job(db, scope, target.epoch, fixture_origin(scope))
+            })?;
+            let mut launch = launch;
+            launch.proof = Some(Observed { target, scope, slots, pins, clean: true });
+            let authorize = FixtureAuthorizer { controller: &supervisor.controller };
+            let revoked = || selection_revoked.load(Ordering::SeqCst);
+            runtime.block_on(owner.live(supervisor, &start.worker, &mut launch, &authorize, revoked,
+                async |proof: Observed| {
+                    owner.settle_with(supervisor, || Ok(()), |_, receipt| {
+                        supervisor.controller.native_store().try_native_transaction(|db| {
+                            native::release::commit(db, &proof, receipt,
+                                || supervisor.controller.native_clock()).map(|_| ())
+                        })
+                    }).await;
+                }));
+            worker_finished.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+    ).unwrap();
+    let epoch = parse_id(started["operation_id"].as_str().unwrap()).unwrap();
+    // Ready after the validated handshake, the start commit and one verified
+    // ping. The wait reads only atomics while the worker samples the store.
+    eventually("a verified ping", || {
+        assert!(!teardown.has_entered() && !finished.load(Ordering::SeqCst),
+            "the worker entered teardown before its first ping");
+        pings.load(Ordering::SeqCst) >= 1
+    }).await;
+    let owner = supervisor.native_runs.with_entry(vm, |owner| owner.cloned()).unwrap().unwrap();
+    let args = json!({"vm_id":hex::encode(vm)});
+    let status = call(client, "vm_get", args.clone()).await;
+    assert_eq!(status["ready"], true, "{status}");
+    assert_eq!(status["native_boot_witness"]["operation_id"], hex::encode(epoch));
+    ScriptRun {
+        vm, epoch, scope, owner, control, alive, revoked, teardown, finished,
+        witness: status["native_boot_witness"].clone(), args, _cleanup: cleanup,
+    }
+}
+
+async fn operation(client: &Client, receipt: &Value) -> Value {
+    call(client, "vm_operation", json!({"operation_id":receipt["operation_id"]})).await
+}
+
+/// Every stored text or blob value, so a raw script, nonce or witness can
+/// be ruled out of the whole ledger.
+fn ledger_contains(h: &Harness, needle: &[u8]) -> bool {
+    h.supervisor().controller.native_store().transact(|db| {
+        let tables: Vec<String> = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for table in tables {
+            let mut statement = db.prepare(&format!("SELECT * FROM \"{table}\""))?;
+            let columns = statement.column_count();
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                for column in 0..columns {
+                    let bytes = match row.get_ref(column)? {
+                        rusqlite::types::ValueRef::Text(bytes)
+                        | rusqlite::types::ValueRef::Blob(bytes) => bytes,
+                        _ => continue,
+                    };
+                    if bytes.windows(needle.len()).any(|window| window == needle) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }).unwrap()
+}
+
+async fn finish_script_test(mut h: Harness, clients: Vec<Client>, run: ScriptRun) {
+    drop(run);
+    assert_admission_closed(&h);
+    drop(clients);
+    let _ = h.shutdown().await;
+}
+
+#[tokio::test]
+async fn owned_scripts_keep_typed_results_and_the_witness_without_leaking_bytes() {
+    let h = windows_harness().await;
+    let client = h.client(0).await;
+    let run = script_run(&h, &client, 520).await;
+    let cases = [
+        ("exit 0", 30, "succeeded", json!(0), "exited"),
+        ("exit 7", 45, "failed", json!(7), "exited"),
+        ("timeout", 2, "failed", Value::Null, "timed_out"),
+    ];
+    let mut receipts = Vec::new();
+    for (number, (script, timeout, state, code, status)) in (530..).zip(cases.clone()) {
+        let args = run.script(number, script, timeout);
+        let before = run.owner.scripts_settled();
+        let receipt = call(&client, "vm_run_script", args.clone()).await;
+        assert_eq!(receipt["ok"], true, "{receipt}");
+        run.settled(before + 1).await;
+        let settled = operation(&client, &receipt).await;
+        assert_eq!(settled["action"], "run_script", "{settled}");
+        assert_eq!(settled["state"], state, "{settled}");
+        assert_eq!(settled["script_status"], status, "{settled}");
+        assert_eq!(settled.get("exit_code").cloned().unwrap_or(Value::Null), code, "{settled}");
+        assert!(settled.get("reason").is_none() || state == "failed", "{settled}");
+        // The channel stayed verified, so the same witness stays published.
+        let current = call(&client, "vm_get", run.args.clone()).await;
+        assert_eq!(current["ready"], true, "{current}");
+        assert_eq!(current["native_boot_witness"], run.witness);
+        for read in [&receipt, &settled, &current] {
+            assert!(!read.to_string().contains(CANARY), "script bytes leaked: {read}");
+        }
+        receipts.push((args, receipt));
+    }
+    // Each exchange carried exactly the admitted bytes and timeout, once.
+    let expected: Vec<_> = cases.iter()
+        .map(|(script, timeout, ..)| (format!("{CANARY} {script}"), *timeout))
+        .collect();
+    assert_eq!(run.control.received(), expected);
+    // A same-request replay returns the original receipt with no exchange.
+    let settled = run.owner.scripts_settled();
+    for (args, receipt) in &receipts {
+        assert_eq!(call(&client, "vm_run_script", args.clone()).await, *receipt);
+    }
+    assert_eq!(run.control.received().len(), 3);
+    assert_eq!(run.owner.scripts_settled(), settled);
+    // No raw script, challenge nonce or witness reaches the ledger.
+    let witness = parse_id(run.witness["witness_id"].as_str().unwrap()).unwrap();
+    let challenges = run.control.challenges.lock().unwrap().clone();
+    assert!(!challenges.is_empty());
+    assert!(!ledger_contains(&h, CANARY.as_bytes()));
+    assert!(!ledger_contains(&h, &witness));
+    assert!(!ledger_contains(&h, hex::encode(witness).as_bytes()));
+    for challenge in challenges {
+        assert!(!ledger_contains(&h, challenge.as_bytes()));
+    }
+    finish_script_test(h, vec![client], run).await;
+}
+
+#[tokio::test]
+async fn owner_stop_interrupts_a_paused_script_before_its_timeout_and_stops_cleanly() {
+    // Without a reply only the interrupt bound ends the exchange; a reply
+    // that lands after the stop cannot replace the receipt the stop settled.
+    for reply_after_stop in [false, true] {
+        let h = windows_harness().await;
+        let client = h.client(0).await;
+        let other = h.client(1).await;
+        let run = script_run(&h, &client, 540).await;
+        let supervisor = h.supervisor().clone();
+        let args = run.script(541, "hold", 60);
+        let receipt = call(&client, "vm_run_script", args.clone()).await;
+        assert_eq!(receipt["ok"], true, "{receipt}");
+        let held = tokio::time::timeout(Duration::from_secs(20), run.control.held.wait_entered()).await;
+        assert!(held.is_ok(), "the guest never received the script");
+        // In flight: the witness stays, a replay returns the same receipt and
+        // a competing script or foreign stop is refused, all without a
+        // second exchange.
+        assert_eq!(call(&client, "vm_get", run.args.clone()).await["ready"], true);
+        assert_eq!(call(&client, "vm_run_script", args.clone()).await, receipt);
+        let competing = call(&client, "vm_run_script", run.script(542, "exit 0", 30)).await;
+        assert_eq!(competing["ok"], false, "{competing}");
+        assert_eq!(call(&other, "vm_stop", run.stop(543)).await["ok"], false);
+        assert_eq!(call(&client, "vm_get", run.args.clone()).await["ready"], true);
+
+        let stopped_at = Instant::now();
+        let stop = call(&client, "vm_stop", run.stop(544)).await;
+        assert_eq!(stop["ok"], true, "{stop}");
+        // Withdrawn at stop admission, while the exchange is still blocked.
+        let stopping = call(&client, "vm_get", run.args.clone()).await;
+        assert_eq!(stopping["ready"], false, "{stopping}");
+        assert!(stopping.get("native_boot_witness").is_none());
+        assert_eq!(call(&client, "vm_stop", run.stop(545)).await["ok"], false);
+        assert_eq!(call(&client, "vm_stop", run.stop(544)).await, stop);
+        if reply_after_stop {
+            run.control.held.release();
+        }
+        run.teardown_entered().await;
+        assert!(stopped_at.elapsed() < Duration::from_secs(15),
+            "the 60 s script held teardown for {:?}", stopped_at.elapsed());
+        assert_eq!(run.control.replied.load(Ordering::SeqCst), reply_after_stop);
+        // While teardown is blocked: still unready, and the in-flight
+        // script settled with the stop as unknown, with no guest result.
+        let blocked = call(&client, "vm_get", run.args.clone()).await;
+        assert_eq!(blocked["ready"], false, "{blocked}");
+        assert!(blocked.get("native_boot_witness").is_none());
+        let script = operation(&client, &receipt).await;
+        assert_eq!(script["state"], "failed", "{script}");
+        assert_eq!(script["reason"], "execution_unknown", "{script}");
+        assert!(script.get("script_status").is_none(), "{script}");
+        assert!(!run.finished.load(Ordering::SeqCst));
+        run.released(&h, &supervisor).await;
+        let settled = terminal(&client, &stop).await;
+        assert_eq!(settled["state"], "succeeded", "{settled}");
+        assert_eq!(vm_state(&h, run.vm), 1, "the owner stop did not stop cleanly");
+        assert_eq!(run.control.received().len(), 1);
+        drop(supervisor);
+        finish_script_test(h, vec![client, other], run).await;
+    }
+}
+
+#[tokio::test]
+async fn stop_or_loss_settles_a_queued_script_that_never_reached_the_guest() {
+    for (number, by_stop) in [(550, true), (555, false)] {
+        let h = windows_harness().await;
+        let client = h.client(0).await;
+        let run = script_run(&h, &client, number).await;
+        let supervisor = h.supervisor().clone();
+        run.control.hold_pings.store(true, Ordering::SeqCst);
+        let parked = tokio::time::timeout(Duration::from_secs(20), run.control.ping_hold.wait_entered()).await;
+        assert!(parked.is_ok(), "the run never parked in a ping");
+        // The loop is busy in its ping, so the admitted script stays queued.
+        let receipt = call(&client, "vm_run_script", run.script(number + 1, "exit 0", 30)).await;
+        assert_eq!(receipt["ok"], true, "{receipt}");
+        let stop = if by_stop {
+            let stop = call(&client, "vm_stop", run.stop(number + 2)).await;
+            assert_eq!(stop["ok"], true, "{stop}");
+            Some(stop)
+        } else {
+            // The child is lost; the parked ping returns and finds it gone.
+            run.alive.store(false, Ordering::SeqCst);
+            run.control.ping_hold.release();
+            None
+        };
+        run.teardown_entered().await;
+        let script = operation(&client, &receipt).await;
+        assert_eq!(script["state"], "failed", "stop={by_stop}: {script}");
+        assert_eq!(script["reason"], "cancelled", "stop={by_stop}: {script}");
+        assert!(run.control.received().is_empty(), "a queued script reached the guest");
+        assert_eq!(call(&client, "vm_get", run.args.clone()).await["ready"], false);
+        run.released(&h, &supervisor).await;
+        if let Some(stop) = stop {
+            assert_eq!(terminal(&client, &stop).await["state"], "succeeded");
+            assert_eq!(vm_state(&h, run.vm), 1);
+        } else {
+            assert_eq!(vm_state(&h, run.vm), 3);
+        }
+        drop(supervisor);
+        finish_script_test(h, vec![client], run).await;
+    }
+}
+
+#[tokio::test]
+async fn a_script_result_after_revocation_loses_to_the_terminal_cutoff() {
+    let h = windows_harness().await;
+    let client = h.client(0).await;
+    let run = script_run(&h, &client, 620).await;
+    let supervisor = h.supervisor().clone();
+    let receipt = call(&client, "vm_run_script", run.script(621, "hold", 30)).await;
+    assert_eq!(receipt["ok"], true, "{receipt}");
+    let held = tokio::time::timeout(Duration::from_secs(20), run.control.held.wait_entered()).await;
+    assert!(held.is_ok(), "the guest never received the script");
+    // The selection is revoked after the exchange's last sample; the guest's
+    // successful reply then arrives and must not count.
+    run.revoked.store(true, Ordering::SeqCst);
+    run.control.held.release();
+    run.teardown_entered().await;
+    assert!(run.control.replied.load(Ordering::SeqCst));
+    let script = operation(&client, &receipt).await;
+    assert_eq!(script["state"], "interrupted", "{script}");
+    assert_eq!(script["reason"], "execution_unknown", "{script}");
+    assert!(script.get("script_status").is_none(), "{script}");
+    assert_eq!(call(&client, "vm_get", run.args.clone()).await["ready"], false);
+    run.released(&h, &supervisor).await;
+    assert_eq!(vm_state(&h, run.vm), 3);
+    drop(supervisor);
+    finish_script_test(h, vec![client], run).await;
+}
+
+#[tokio::test]
+async fn transport_loss_during_a_script_withdraws_before_teardown_and_reaches_recovery() {
+    for (number, fault) in [(560, "drop"), (570, "garbage")] {
+        let h = windows_harness().await;
+        let client = h.client(0).await;
+        let run = script_run(&h, &client, number).await;
+        let supervisor = h.supervisor().clone();
+        let receipt = call(&client, "vm_run_script", run.script(number + 1, fault, 30)).await;
+        assert_eq!(receipt["ok"], true, "{receipt}");
+        run.teardown_entered().await;
+        let lost = call(&client, "vm_get", run.args.clone()).await;
+        assert_eq!(lost["ready"], false, "{fault}: {lost}");
+        assert!(lost.get("native_boot_witness").is_none());
+        let script = operation(&client, &receipt).await;
+        assert_eq!(script["state"], "interrupted", "{fault}: {script}");
+        assert_eq!(script["reason"], "execution_unknown", "{fault}: {script}");
+        assert!(script.get("script_status").is_none(), "{script}");
+        assert_eq!(vm_state(&h, run.vm), 3, "{fault}: a lost channel must enter recovery");
+        assert_eq!(unresolved_epoch(&h, run.vm), Some((run.scope.generation, run.epoch)));
+        assert!(!run.finished.load(Ordering::SeqCst));
+        run.released(&h, &supervisor).await;
+        assert_eq!(run.control.received().len(), 1);
+        drop(supervisor);
+        finish_script_test(h, vec![client], run).await;
+    }
+}
+
+const FAIL_SCRIPT_RECEIPT: &str = "CREATE TRIGGER fail_script BEFORE UPDATE OF status ON vm_operations
+    WHEN NEW.action=2 BEGIN SELECT RAISE(ABORT,'fixture receipt failure'); END";
+
+fn sql(h: &Harness, batch: &str) {
+    h.supervisor().controller.native_store().transact(|db| { db.execute_batch(batch)?; Ok(()) }).unwrap();
+}
+
+#[tokio::test]
+async fn failed_script_receipt_keeps_its_typed_result_until_the_ledger_settles_it() {
+    let h = windows_harness().await;
+    let client = h.client(0).await;
+    let run = script_run(&h, &client, 580).await;
+    sql(&h, FAIL_SCRIPT_RECEIPT);
+    let receipt = call(&client, "vm_run_script", run.script(581, "exit 7", 30)).await;
+    assert_eq!(receipt["ok"], true, "{receipt}");
+    run.settled(1).await;
+    // The first settlement failed; the receipt is kept, not dropped, and the
+    // still-verified channel keeps its witness.
+    assert_eq!(operation(&client, &receipt).await["state"], "pending");
+    assert_eq!(call(&client, "vm_get", run.args.clone()).await["ready"], true);
+    run.settled(2).await;
+    assert_eq!(operation(&client, &receipt).await["state"], "pending");
+    sql(&h, "DROP TRIGGER fail_script");
+    let settled = await_operation(&client, &receipt, Duration::from_secs(20)).await;
+    assert_eq!(settled["state"], "failed", "{settled}");
+    assert_eq!(settled["script_status"], "exited", "{settled}");
+    assert_eq!(settled["exit_code"], 7, "{settled}");
+    // Retrying the receipt never repeats the guest exchange.
+    assert_eq!(run.control.received().len(), 1);
+    assert_eq!(call(&client, "vm_get", run.args.clone()).await["ready"], true);
+    finish_script_test(h, vec![client], run).await;
+}
+
+#[tokio::test]
+async fn failed_loss_receipt_cannot_strand_the_withdrawn_teardown() {
+    let h = windows_harness().await;
+    let client = h.client(0).await;
+    let run = script_run(&h, &client, 590).await;
+    let supervisor = h.supervisor().clone();
+    sql(&h, FAIL_SCRIPT_RECEIPT);
+    let receipt = call(&client, "vm_run_script", run.script(591, "drop", 30)).await;
+    assert_eq!(receipt["ok"], true, "{receipt}");
+    run.teardown_entered().await;
+    // The loss receipt could not settle, so the ledger still reads running:
+    // only the owner's withdrawal at loss detection keeps the witness off.
+    assert_eq!(vm_state(&h, run.vm), 2);
+    let lost = call(&client, "vm_get", run.args.clone()).await;
+    assert_eq!(lost["ready"], false, "{lost}");
+    assert!(lost.get("native_boot_witness").is_none());
+    assert_eq!(operation(&client, &receipt).await["state"], "pending");
+    assert!(!run.finished.load(Ordering::SeqCst));
+    // The release keeps retrying behind the failing ledger, then settles both
+    // the release and the pending receipt once the ledger recovers.
+    run.teardown.release();
+    sql(&h, "DROP TRIGGER fail_script");
+    run.released(&h, &supervisor).await;
+    let script = operation(&client, &receipt).await;
+    assert_eq!(script["state"], "interrupted", "{script}");
+    assert_eq!(vm_state(&h, run.vm), 3);
+    assert_eq!(run.control.received().len(), 1);
+    drop(supervisor);
+    finish_script_test(h, vec![client], run).await;
+}
+
+#[tokio::test]
+async fn dispatch_refuses_mismatched_or_stale_script_bindings_without_an_exchange() {
+    let h = windows_harness().await;
+    let client = h.client(0).await;
+    let run = script_run(&h, &client, 600).await;
+    let supervisor = h.supervisor().clone();
+    let controller = &supervisor.controller;
+    let admit = |number: u64, script: &str, timeout: u32| {
+        let script = format!("{CANARY} {script}");
+        let request = Request {
+            principal: "alpha", vm: run.vm, request_id: RequestId::parse(&key(number)).unwrap(),
+            operation: Operation::Script { script: &script, timeout_seconds: timeout.into() },
+            disk: DiskClaim::default(),
+        };
+        let Admission::Admitted(worker) = controller
+            .admit_native_script(&Installation::fixture(), &request, run.owner.target(), HOST, RESOURCES)
+            .unwrap()
+        else { panic!("script admission refused") };
+        let receipt = json!({"ok":true,
+            "operation_id":hex::encode(worker.admitted().unwrap().operation)});
+        (worker, receipt)
+    };
+    let dispatch = async |worker, script: &str, timeout_s| {
+        let before = run.owner.scripts_settled();
+        let job = native_run::ScriptJob { worker, script: format!("{CANARY} {script}"), timeout_s };
+        assert!(run.owner.enqueue(job).is_ok());
+        run.settled(before + 1).await;
+    };
+    // Changed bytes or timeout at dispatch are refused before the guest.
+    for (number, sent, timeout) in [(601, "exit 7", 30), (602, "exit 0", 31)] {
+        let (worker, receipt) = admit(number, "exit 0", 30);
+        dispatch(worker, sent, timeout).await;
+        let refused = operation(&client, &receipt).await;
+        assert_eq!(refused["state"], "failed", "{refused}");
+        assert_eq!(refused["reason"], "cancelled", "{refused}");
+        assert!(run.control.received().is_empty(), "a mismatched script reached the guest");
+        assert_eq!(call(&client, "vm_get", run.args.clone()).await["ready"], true);
+    }
+    // Positive control on the same direct path.
+    let (worker, receipt) = admit(603, "exit 0", 30);
+    dispatch(worker, "exit 0", 30).await;
+    assert_eq!(operation(&client, &receipt).await["state"], "succeeded");
+    assert_eq!(run.control.received().len(), 1);
+    // A writer epoch replaced after admission is stale at dispatch.
+    let (worker, receipt) = admit(604, "exit 0", 30);
+    controller.native_store()
+        .transact(|db| store::snapshot::invalidate_release(db, run.vm, [44; 16]))
+        .unwrap();
+    dispatch(worker, "exit 0", 30).await;
+    let stale = operation(&client, &receipt).await;
+    assert_eq!(stale["state"], "failed", "{stale}");
+    assert_eq!(stale["reason"], "cancelled", "{stale}");
+    assert_eq!(run.control.received().len(), 1);
+    drop(supervisor);
+    finish_script_test(h, vec![client], run).await;
+}
+
+#[tokio::test]
+async fn a_script_admitted_as_its_run_is_lost_is_settled_not_stranded() {
+    let h = windows_harness().await;
+    let client = h.client(0).await;
+    let run = script_run(&h, &client, 610).await;
+    let supervisor = h.supervisor().clone();
+    let script = format!("{CANARY} exit 0");
+    let request = Request {
+        principal: "alpha", vm: run.vm, request_id: RequestId::parse(&key(611)).unwrap(),
+        operation: Operation::Script { script: &script, timeout_seconds: 30 },
+        disk: DiskClaim::default(),
+    };
+    let Admission::Admitted(worker) = supervisor.controller
+        .admit_native_script(&Installation::fixture(), &request, run.owner.target(), HOST, RESOURCES)
+        .unwrap()
+    else { panic!("script admission refused") };
+    let receipt = json!({"ok":true, "operation_id":hex::encode(worker.admitted().unwrap().operation)});
+    // The route admits and hands off under the foreground gate, which a stop
+    // also takes; only a loss can end the run in between.
+    run.alive.store(false, Ordering::SeqCst);
+    run.teardown_entered().await;
+    let job = native_run::ScriptJob { worker, script, timeout_s: 30 };
+    let Err(job) = run.owner.enqueue(job) else { panic!("an ended run queued a script") };
+    // The route's hand-off failure path settles the receipt it admitted.
+    run.owner.settle_script(&supervisor, job.worker, native_run::Settlement::Cancelled);
+    let settled = operation(&client, &receipt).await;
+    assert_eq!(settled["state"], "failed", "{settled}");
+    assert_eq!(settled["reason"], "cancelled", "{settled}");
+    assert!(run.control.received().is_empty());
+    run.released(&h, &supervisor).await;
+    assert_eq!(vm_state(&h, run.vm), 3);
+    drop(supervisor);
+    finish_script_test(h, vec![client], run).await;
 }

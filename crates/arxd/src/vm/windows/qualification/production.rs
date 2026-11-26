@@ -661,6 +661,8 @@ pub(crate) struct NativeLaunch<'a> {
     core: CheckedLaunchCore<'a>,
     qualification: &'a ForegroundQualification<'a>,
     binding: WorkspaceBinding,
+    /// The exact unresolved writer epoch this launch was created under.
+    writer_epoch: Id,
     targets: ReleaseTargets,
     serial: Option<&'a SerialName>,
     _offline: Option<&'a crate::vm::runtime::OfflineLease>,
@@ -872,6 +874,7 @@ impl<'a> NativeLaunch<'a> {
             core,
             qualification,
             binding: workspace_binding,
+            writer_epoch,
             targets,
             serial: boot_inputs.map(QualifiedBoot::serial),
             _offline: offline,
@@ -938,21 +941,31 @@ impl<'a> NativeLaunch<'a> {
             .map(|_| ())
     }
 
+    /// One guest script, only under an authority consumed for exactly these
+    /// bytes, this timeout and this launch's generation and writer epoch.
+    /// A typed guest result, including a nonzero exit or the guest's own
+    /// timeout, is returned as is. Any transport failure returns before
+    /// teardown, like [`Self::ping`], so the owner withdraws the witness
+    /// first and settles the same launch.
     pub(crate) async fn run_script(
         &mut self,
+        authority: crate::vm::runtime::ScriptAuthority,
         script: String,
         timeout_s: u32,
         cancel: &Shutdown,
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
-        verify_release: impl FnOnce() -> bool + Send + 'static,
-    ) -> Result<(ScriptStatus, Option<u32>), LaunchFailure<'a>> {
-        match self
-            .guest_exchange(GuestRequest::Script(script, timeout_s), cancel, refresh)
-            .await
-        {
-            Ok(result) => Ok(result.expect("script request returns a script result")),
-            Err(reason) => Err(self.settle_failure(reason, cancel, verify_release).await),
+    ) -> Result<(ScriptStatus, Option<u32>), NativeRefusal> {
+        if !authority.names(
+            self.binding.generation,
+            self.writer_epoch,
+            &script,
+            timeout_s,
+        ) {
+            return Err(NativeRefusal::QualificationMissing);
         }
+        self.guest_exchange(GuestRequest::Script(script, timeout_s), cancel, refresh)
+            .await?
+            .ok_or(NativeRefusal::GuestEndpointUnverified)
     }
 
     async fn guest_exchange(
@@ -964,7 +977,9 @@ impl<'a> NativeLaunch<'a> {
         let unavailable = NativeRefusal::GuestEndpointUnverified;
         let seconds = match &request {
             GuestRequest::Ping => 5,
-            GuestRequest::Script(_, timeout) => u64::from(*timeout) + 5,
+            GuestRequest::Script(_, timeout) => {
+                u64::from(*timeout) + crate::vm::guest::SCRIPT_EXCHANGE_SLACK.as_secs()
+            }
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
         match self.live.as_deref_mut() {
@@ -992,20 +1007,6 @@ impl<'a> NativeLaunch<'a> {
                 .await
             }
             _ => Err(unavailable),
-        }
-    }
-
-    async fn settle_failure(
-        &mut self,
-        reason: NativeRefusal,
-        cancel: &Shutdown,
-        verify_release: impl FnOnce() -> bool + Send + 'static,
-    ) -> LaunchFailure<'a> {
-        let (disposition, released) = self.stop_generation(cancel, verify_release).await;
-        LaunchFailure {
-            reason,
-            disposition,
-            released: released.map(Box::new),
         }
     }
 
@@ -1143,13 +1144,6 @@ impl custody::TestRelease<'_> {
 enum GuestRequest {
     Ping,
     Script(String, u32),
-}
-
-#[must_use = "settle the failed effect with its held proof or retain its charge"]
-pub(crate) struct LaunchFailure<'a> {
-    pub reason: NativeRefusal,
-    pub disposition: StopDisposition,
-    pub released: Option<Box<ReleasedGeneration<'a>>>,
 }
 
 fn check_permit(
