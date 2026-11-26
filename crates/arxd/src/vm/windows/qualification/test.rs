@@ -2,6 +2,7 @@
 //! independently read-only production store.
 
 use super::*;
+use crate::vm::selection_epoch::Invalidation;
 use sha2::{Digest, Sha256};
 use std::{
     io::{Read, Seek, SeekFrom},
@@ -230,10 +231,12 @@ impl Scope {
     pub(super) fn validate_foreground(
         &self,
         store: &crate::store::vm::VmStore,
-    ) -> Result<(), NativeRefusal> {
-        self.validate_live()?;
+    ) -> Result<(), Invalidation> {
+        self.validate_live().map_err(Invalidation::Indeterminate)?;
         if read_guarded_host(store, &self._database, &self._lock)? != self.host {
-            return Err(NativeRefusal::PathCustodyUnverified);
+            return Err(Invalidation::Confirmed(
+                NativeRefusal::PathCustodyUnverified,
+            ));
         }
         Ok(())
     }
@@ -261,28 +264,30 @@ impl Scope {
     }
 }
 
+/// An unheld lock leaf or a handle mismatch is confirmed custody drift.
+/// Store contention is transient, and other failures are indeterminate.
 fn read_guarded_host(
     store: &crate::store::vm::VmStore,
     database: &PathPin,
     lock: &PathPin,
-) -> Result<crate::vm::Id, NativeRefusal> {
+) -> Result<crate::vm::Id, Invalidation> {
     let reason = NativeRefusal::PathCustodyUnverified;
-    inventory::binding(database)?;
-    inventory::binding(lock)?;
+    inventory::binding(database).map_err(Invalidation::Indeterminate)?;
+    inventory::binding(lock).map_err(Invalidation::Indeterminate)?;
     // Verify the held lock leaf is actively exclusively locked (by `store`),
     // and match `store`'s open SQLite main handle, database handle and lock
     // handle by exact OS file identity (volume serial + 128-bit file ID).
     match lock.leaf.try_lock() {
         Ok(()) => {
             let _ = lock.leaf.unlock();
-            return Err(reason);
+            return Err(Invalidation::Confirmed(reason));
         }
         Err(std::fs::TryLockError::WouldBlock) => {}
-        Err(std::fs::TryLockError::Error(_)) => return Err(reason),
+        Err(std::fs::TryLockError::Error(_)) => return Err(Invalidation::Indeterminate(reason)),
     }
     store
         .read_host_for_identity(database.identity, lock.identity)
-        .map_err(|_| reason)
+        .map_err(|error| Invalidation::from_store(&error, reason))
 }
 
 pub(super) fn aggregate_within_cap(
@@ -757,6 +762,8 @@ mod tests {
 
     #[test]
     fn read_guarded_host_and_validate_foreground_bind_exact_store_identity() {
+        const CUSTODY: NativeRefusal = NativeRefusal::PathCustodyUnverified;
+        const CUSTODY_DRIFT: Invalidation = Invalidation::Confirmed(CUSTODY);
         let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
         let path_a = private_dir(temp.path(), "store-a");
         let path_b = private_dir(temp.path(), "store-b");
@@ -784,16 +791,42 @@ mod tests {
             Ok(expected_host)
         );
 
+        // Holding the real connection refuses without waiting and without
+        // claiming drift. Releasing it admits the next read.
+        let held = store_a
+            .read_backup_owner(|_| Ok(read_guarded_host(&store_a, &db_a, &lock_a)))
+            .unwrap();
+        assert_eq!(held, Err(Invalidation::Transient(CUSTODY)));
+        assert_eq!(
+            read_guarded_host(&store_a, &db_a, &lock_a),
+            Ok(expected_host)
+        );
+
+        // SQLite BUSY from another connection's exclusive lock is transient.
+        let other =
+            rusqlite::Connection::open(path_a.join("activity.sqlite3").unwrap().as_str()).unwrap();
+        other.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        assert_eq!(
+            read_guarded_host(&store_a, &db_a, &lock_a),
+            Err(Invalidation::Transient(CUSTODY))
+        );
+        other.execute_batch("ROLLBACK;").unwrap();
+        drop(other);
+        assert_eq!(
+            read_guarded_host(&store_a, &db_a, &lock_a),
+            Ok(expected_host)
+        );
+
         // Different VmStore opened on another directory is refused.
         assert_eq!(
             read_guarded_host(&store_b, &db_a, &lock_a),
-            Err(NativeRefusal::PathCustodyUnverified)
+            Err(CUSTODY_DRIFT)
         );
 
         // Matching database with mismatched lock file identity is refused.
         assert_eq!(
             read_guarded_host(&store_a, &db_a, &lock_b),
-            Err(NativeRefusal::PathCustodyUnverified)
+            Err(CUSTODY_DRIFT)
         );
 
         // Tampered database file identity (same path, wrong OS file ID) is refused.
@@ -802,7 +835,7 @@ mod tests {
         wrong_db.identity.file[0] ^= 0xff;
         assert_eq!(
             read_guarded_host(&store_a, &wrong_db, &lock_a),
-            Err(NativeRefusal::PathCustodyUnverified)
+            Err(CUSTODY_DRIFT)
         );
 
         // An unlocked lock file (same directory shape, no active exclusive lock) is refused.
@@ -811,7 +844,7 @@ mod tests {
         let unlocked_pin = PathPin::open(&unlocked_path, false, true).unwrap();
         assert_eq!(
             read_guarded_host(&store_a, &db_a, &unlocked_pin),
-            Err(NativeRefusal::PathCustodyUnverified)
+            Err(CUSTODY_DRIFT)
         );
 
         // Scope::validate_foreground accepts the matching store and refuses a
@@ -831,14 +864,8 @@ mod tests {
             key: [0x55; 32],
         };
         assert_eq!(scope.validate_foreground(&store_a), Ok(()));
-        assert_eq!(
-            scope.validate_foreground(&store_b),
-            Err(NativeRefusal::PathCustodyUnverified)
-        );
+        assert_eq!(scope.validate_foreground(&store_b), Err(CUSTODY_DRIFT));
         scope.host[0] ^= 0xff;
-        assert_eq!(
-            scope.validate_foreground(&store_a),
-            Err(NativeRefusal::PathCustodyUnverified)
-        );
+        assert_eq!(scope.validate_foreground(&store_a), Err(CUSTODY_DRIFT));
     }
 }

@@ -754,6 +754,12 @@ impl Child {
 
     fn resume(&mut self) -> io::Result<()> {
         self.verify_live()?;
+        self.release_suspended()
+    }
+
+    /// Releases the retained primary thread without any further checks; the
+    /// caller verifies the live Job immediately before.
+    fn release_suspended(&mut self) -> io::Result<()> {
         let thread = self
             .suspended
             .take()
@@ -2626,6 +2632,8 @@ struct CheckedLaunchCore<'a> {
     pins: std::sync::Arc<[PathPin]>,
     setup_vars_handoff: Option<File>,
     writers: Vec<usize>,
+    memory: usize,
+    cpu_rate: u32,
     stock: StockLaunch<'a>,
     workspace: WorkspaceCustody<'a>,
     finalization: Option<(super::PairSlots, [usize; 2])>,
@@ -2887,6 +2895,8 @@ impl<'a> CheckedLaunchCore<'a> {
                 pins: inputs.pins.into(),
                 setup_vars_handoff,
                 writers,
+                memory: inputs.memory,
+                cpu_rate: inputs.cpu_rate,
                 stock,
                 workspace: inputs.workspace,
                 finalization,
@@ -2903,6 +2913,181 @@ type PipeQmp = Qmp<PipeOutput, tokio::io::DuplexStream>;
 type SerialGuest = GuestChannel<tokio::net::windows::named_pipe::NamedPipeClient>;
 type BootIo = (PipeOutput, tokio::io::DuplexStream);
 type HeldRelease = (StopDisposition, Option<HeldWriters>);
+
+const LIVE_POLL: Duration = Duration::from_secs(1);
+
+/// Keep polling the same operation and prefer refusal over a simultaneous
+/// result. The caller owns teardown after this future releases its I/O borrows.
+async fn monitor_running<T, E>(
+    work: impl std::future::Future<Output = Result<T, E>>,
+    mut observe: impl FnMut() -> Result<(), E>,
+    cancel: &Shutdown,
+    deadline: tokio::time::Instant,
+    interrupted: impl Fn(ChannelError) -> E,
+) -> Result<T, E> {
+    use tokio::time::Instant;
+    tokio::pin!(work);
+    let check = || {
+        if cancel.is_cancelled() {
+            Err(interrupted(ChannelError::Cancelled))
+        } else if Instant::now() >= deadline {
+            Err(interrupted(ChannelError::Timeout))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    // An observer refusal, like a work result, still takes the terminal
+    // sample and yields to cancellation or expiry before it is returned.
+    let result = match observe() {
+        Err(error) => Err(error),
+        Ok(()) => loop {
+            check()?;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break Err(interrupted(ChannelError::Cancelled)),
+                _ = tokio::time::sleep_until(deadline) => break Err(interrupted(ChannelError::Timeout)),
+                _ = tokio::time::sleep(LIVE_POLL) => {
+                    if let Err(error) = observe() {
+                        break Err(error);
+                    }
+                }
+                result = &mut work => break result,
+            }
+        },
+    };
+    let terminal = observe();
+    check()?;
+    result.and_then(|value| terminal.map(|()| value))
+}
+
+/// Release keeps its own teardown budget so custody evidence is collected
+/// after a refusal too. Output is accepted only if a host sample taken after
+/// release settles succeeds and its capture time is still fresh, and then
+/// cancellation and the original cutoff, checked after that sample, still
+/// allow it; this is the same order as the common monitor tail. The held
+/// release is returned in either case.
+async fn accept_after_release<T, E, R, S>(
+    result: Result<T, E>,
+    release: impl std::future::Future<Output = R>,
+    cancel: &Shutdown,
+    deadline: tokio::time::Instant,
+    recheck: impl FnOnce() -> S,
+    stale: E,
+    interrupted: impl Fn(ChannelError) -> E,
+) -> (Result<T, E>, R)
+where
+    S: std::future::Future<Output = Result<std::time::Instant, E>>,
+{
+    let release = release.await;
+    let result = match result {
+        Ok(value) => {
+            let sample = recheck().await.and_then(|captured| {
+                fresh_observation(
+                    captured,
+                    std::time::Instant::now(),
+                    NativeRefusal::ReservesUnverified,
+                )
+                .map_err(|_| stale)
+            });
+            if cancel.is_cancelled() {
+                Err(interrupted(ChannelError::Cancelled))
+            } else if tokio::time::Instant::now() >= deadline {
+                Err(interrupted(ChannelError::Timeout))
+            } else {
+                sample.map(|()| value)
+            }
+        }
+        Err(error) => Err(error),
+    };
+    (result, release)
+}
+
+trait InstallerChild {
+    fn observe(&self, captured: std::time::Instant) -> Result<(), NativeRefusal>;
+    async fn dispatch(
+        &self,
+        qmp: &mut PipeQmp,
+        cancel: &Shutdown,
+        stage: InstallerStage,
+        refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(), InstallerFailureReason>;
+    async fn exit(&self, by: tokio::time::Instant) -> Result<(), InstallerFailureReason>;
+}
+
+impl InstallerChild for CheckedLaunchCore<'_> {
+    fn observe(&self, captured: std::time::Instant) -> Result<(), NativeRefusal> {
+        self.check_running(|| Ok(captured), true)
+    }
+
+    async fn dispatch(
+        &self,
+        qmp: &mut PipeQmp,
+        cancel: &Shutdown,
+        stage: InstallerStage,
+        mut refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(), InstallerFailureReason> {
+        self.dispatch_cont(qmp, cancel, &mut refresh, Some(stage))
+            .await
+    }
+
+    async fn exit(&self, by: tokio::time::Instant) -> Result<(), InstallerFailureReason> {
+        self.child
+            .reap(by)
+            .await
+            .map_err(|_| InstallerFailureReason::ReleaseUnverified)?;
+        (self.child.exit_code() == Ok(0))
+            .then_some(())
+            .ok_or(InstallerFailureReason::ProcessFailed)
+    }
+}
+
+async fn installer_session(
+    child: &impl InstallerChild,
+    stage: InstallerStage,
+    (read, write): BootIo,
+    cancel: &Shutdown,
+    refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+) -> Result<(), InstallerFailureReason> {
+    use InstallerFailureReason as Failure;
+    use tokio::time::Instant;
+    let refresh = std::cell::RefCell::new(refresh);
+    monitor_running(
+        async {
+            let mut qmp = Qmp::installer_handshake(read, write, cancel, stage).await?;
+            qmp.verify_whpx(cancel).await.map_err(|error| match error {
+                ChannelError::Timeout | ChannelError::Cancelled => Failure::from(error),
+                _ => Failure::Native(NativeRefusal::WhpxUnverified),
+            })?;
+            child
+                .dispatch(&mut qmp, cancel, stage, || refresh.borrow_mut()())
+                .await?;
+            qmp.observe_installer_shutdown(cancel).await?;
+            // Keep QMP stdin open until the owned child exits.
+            let by = stage
+                .deadline()
+                .min(Instant::now() + Duration::from_secs(2));
+            let exited = tokio::time::timeout_at(by, child.exit(by))
+                .await
+                .map_err(|_| Failure::Timeout)?;
+            // Expiry wins: an exit observed at or after the grace cutoff is
+            // late even when it was already ready when polled.
+            if Instant::now() >= by {
+                return Err(Failure::Timeout);
+            }
+            exited
+        },
+        || {
+            refresh.borrow_mut()()
+                .and_then(|captured| child.observe(captured))
+                .map_err(Failure::Native)
+        },
+        cancel,
+        stage.deadline(),
+        Failure::from,
+    )
+    .await
+}
 
 enum BootOutcome {
     Installed(Box<(PipeQmp, SerialGuest)>),
@@ -2925,6 +3110,37 @@ impl From<ChannelError> for InstallerFailureReason {
 }
 
 impl CheckedLaunchCore<'_> {
+    fn check_running(
+        &self,
+        refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
+        allow_exited: bool,
+    ) -> Result<(), NativeRefusal> {
+        let job_error = NativeRefusal::JobUnverified;
+        let captured = refresh()?;
+        self.stock.recheck_all(&self.pins, Some(&self.workspace))?;
+        self.child
+            .job
+            .verify_limits(self.memory, Some(self.cpu_rate), Some(1))
+            .map_err(|_| job_error)?;
+        let live = self
+            .child
+            .verify_live()
+            .map_err(|_| job_error)
+            .and_then(|_| verify_child_policy(&self.child, self.stock.token));
+        if let Err(reason) = live
+            && !(allow_exited
+                && self.child.exited().is_ok_and(|exited| exited)
+                && matches!(self.child.job.active(), Ok(0)))
+        {
+            return Err(reason);
+        }
+        fresh_observation(
+            captured,
+            std::time::Instant::now(),
+            NativeRefusal::ReservesUnverified,
+        )
+    }
+
     async fn helper(
         &mut self,
         io: BootIo,
@@ -2960,39 +3176,50 @@ impl CheckedLaunchCore<'_> {
                 return Err(NativeRefusal::QualificationMissing);
             }
             self.stock.recheck_all(&self.pins, Some(&self.workspace))?;
-            self.child.resume_checked(cancel, &mut refresh)?;
-            let mut output = Vec::new();
-            (&mut read)
-                .take(16 * 1024 + 1)
-                .read_to_end(&mut output)
-                .await
-                .map_err(|_| refused)?;
-            self.child.reap(deadline).await.map_err(|_| refused)?;
-            if output.len() > 16 * 1024 || self.child.exit_code()? != 0 {
-                return Err(refused);
-            }
-            Ok(output)
+            self.child
+                .resume_checked_by(cancel, deadline, &mut refresh)?;
+            monitor_running(
+                async {
+                    let mut output = Vec::new();
+                    (&mut read)
+                        .take(16 * 1024 + 1)
+                        .read_to_end(&mut output)
+                        .await
+                        .map_err(|_| refused)?;
+                    self.child.reap(deadline).await.map_err(|_| refused)?;
+                    if output.len() > 16 * 1024 || self.child.exit_code()? != 0 {
+                        return Err(refused);
+                    }
+                    Ok(output)
+                },
+                || self.check_running(&mut refresh, true),
+                cancel,
+                deadline,
+                |_| refused,
+            )
+            .await
         };
-        let result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(refused),
-            _ = tokio::time::sleep_until(deadline) => Err(refused),
-            result = work => result,
-        };
+        let result = work.await;
         drop(write);
         if result.is_err() && self.child.job.terminate().is_err() {
             return (result, (StopDisposition::ChargedQuarantine, None));
         }
         let successful = result.is_ok();
-        let release = self
-            .release_evidence_held(
+        accept_after_release(
+            result,
+            self.release_evidence_held(
                 successful,
                 successful,
                 tokio::time::Instant::now() + Duration::from_secs(5),
                 verify_release,
-            )
-            .await;
-        (result, release)
+            ),
+            cancel,
+            deadline,
+            || std::future::ready(refresh()),
+            NativeRefusal::ReservesUnverified,
+            |_| refused,
+        )
+        .await
     }
 
     async fn boot(
@@ -3016,37 +3243,48 @@ impl CheckedLaunchCore<'_> {
         self.child
             .resume_checked(cancel, &mut revalidate)
             .map_err(BootFailure::Native)?;
-        // Workers are already draining. Do not await the QMP greeting while
-        // QEMU may be waiting for a client at CreateNamedPipe/ConnectNamedPipe.
-        let pipe = connect_serial(
-            serial,
-            &self.child,
-            token.account.0,
-            &token.entries(),
+        // The periodic monitor and cont gate both sample synchronously on the
+        // same task. The cell shares the sampler without a borrow across I/O.
+        let refresh = std::cell::RefCell::new(revalidate);
+        monitor_running(
+            async {
+                // QEMU can wait for a serial client before sending QMP greeting.
+                let pipe = connect_serial(
+                    serial,
+                    &self.child,
+                    token.account.0,
+                    &token.entries(),
+                    cancel,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .await?;
+                let (read, write) = io;
+                let mut qmp = Qmp::handshake(read, write, cancel)
+                    .await
+                    .map_err(|_| NativeRefusal::QmpUnverified)?;
+                qmp.verify_whpx(cancel)
+                    .await
+                    .map_err(|_| NativeRefusal::WhpxUnverified)?;
+                self.dispatch_cont(&mut qmp, cancel, &mut || refresh.borrow_mut()(), None)
+                    .await
+                    .map_err(|error| match error {
+                        InstallerFailureReason::Native(reason) => reason,
+                        _ => NativeRefusal::QmpUnverified,
+                    })?;
+                let guest = GuestChannel::ready(pipe, &mut qmp, cancel)
+                    .await
+                    .map_err(|_| NativeRefusal::GuestEndpointUnverified)?;
+                Ok(BootOutcome::Installed(Box::new((qmp, guest))))
+            },
+            || self.check_running(&mut *refresh.borrow_mut(), false),
             cancel,
-            tokio::time::Instant::now() + Duration::from_secs(10),
+            tokio::time::Instant::now()
+                + super::guest::GUEST_READY_BUDGET
+                + Duration::from_secs(60),
+            |_| NativeRefusal::QmpUnverified,
         )
         .await
-        .map_err(BootFailure::Native)?;
-        let (read, write) = io;
-        let mut qmp = Qmp::handshake(read, write, cancel)
-            .await
-            .map_err(|_| BootFailure::Native(NativeRefusal::QmpUnverified))?;
-        qmp.verify_whpx()
-            .await
-            .map_err(|_| BootFailure::Native(NativeRefusal::WhpxUnverified))?;
-        self.dispatch_cont(&mut qmp, cancel, &mut revalidate, None)
-            .await
-            .map_err(|error| {
-                BootFailure::Native(match error {
-                    InstallerFailureReason::Native(reason) => reason,
-                    _ => NativeRefusal::QmpUnverified,
-                })
-            })?;
-        let guest = GuestChannel::ready(pipe, &mut qmp, cancel)
-            .await
-            .map_err(|_| BootFailure::Native(NativeRefusal::GuestEndpointUnverified))?;
-        Ok(BootOutcome::Installed(Box::new((qmp, guest))))
+        .map_err(BootFailure::Native)
     }
 
     async fn dispatch_cont(
@@ -3108,7 +3346,7 @@ impl CheckedLaunchCore<'_> {
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<BootOutcome, (InstallerFailure, Option<HeldWriters>)> {
         use InstallerFailureReason as Failure;
-        use tokio::time::{Instant, sleep_until};
+        use tokio::time::Instant;
         let grace = Duration::from_secs(2);
         let deadline = stage.deadline();
         let result = async {
@@ -3118,43 +3356,16 @@ impl CheckedLaunchCore<'_> {
             if Instant::now() >= deadline {
                 return Err(Failure::Timeout);
             }
-            self.child.resume_checked_with_handoff(cancel, revalidate, || {
-                // QEMU opens writable pflash by name after resume. The
-                // original object and ancestry pin stays held across it.
-                drop(self.setup_vars_handoff.take());
-            }).map_err(Failure::Native)?;
-            let (read, write) = io;
-            let mut qmp = Qmp::installer_handshake(read, write, cancel, stage).await?;
-            qmp.verify_whpx().await.map_err(|_| Failure::Native(NativeRefusal::WhpxUnverified))?;
-            self.dispatch_cont(&mut qmp, cancel, revalidate, Some(stage)).await?;
-            {
-                let progress = qmp.observe_installer_shutdown(cancel);
-                tokio::pin!(progress);
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => return Err(Failure::Cancelled),
-                        result = &mut progress => { result?; break; }
-                        _ = tokio::time::sleep(FRESHNESS) => {
-                            let captured = revalidate().map_err(Failure::Native)?;
-                            fresh_observation(captured, std::time::Instant::now(), NativeRefusal::ReservesUnverified)
-                                .map_err(Failure::Native)?;
-                        }
-                    }
-                }
-            }
-            // Keep QMP's stdin open while QEMU exits voluntarily.
-            let exit_by = deadline.min(Instant::now() + grace);
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => Err(Failure::Cancelled),
-                _ = sleep_until(exit_by) => Err(Failure::Timeout),
-                result = self.child.reap(exit_by) => {
-                    result.map_err(|_| Failure::ReleaseUnverified)?;
-                    (self.child.exit_code() == Ok(0)).then_some(()).ok_or(Failure::ProcessFailed)
-                }
-            }
-        }.await;
+            self.child
+                .resume_checked_with_handoff(cancel, Some(deadline), revalidate, || {
+                    // QEMU opens writable pflash by name after resume. The
+                    // original object and ancestry pin stays held across it.
+                    drop(self.setup_vars_handoff.take());
+                })
+                .map_err(Failure::Native)?;
+            installer_session(self, stage, io, cancel, &mut *revalidate).await
+        }
+        .await;
 
         let release_by = match result {
             Ok(()) => deadline.min(Instant::now() + grace),
@@ -3173,9 +3384,30 @@ impl CheckedLaunchCore<'_> {
                 Instant::now() + grace
             }
         };
-        let (observed, held) = self
-            .release_evidence_held(result.is_ok(), result.is_ok(), release_by, verify_release)
-            .await;
+        let successful = result.is_ok();
+        let mut result = result;
+        let (observed, held) = {
+            let release =
+                self.release_evidence_held(successful, successful, release_by, verify_release);
+            tokio::pin!(release);
+            // Schedule the next sample after the previous one returns so a
+            // slow observation cannot starve the independently bounded release.
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled(), if result.is_ok() => result = Err(Failure::Cancelled),
+                    _ = tokio::time::sleep(LIVE_POLL), if result.is_ok() => {
+                        result = revalidate().map(|_| ()).map_err(Failure::Native);
+                    }
+                    proof = &mut release => break proof,
+                }
+            }
+        };
+        if result.is_ok() {
+            result = self
+                .check_running(revalidate, true)
+                .map_err(Failure::Native);
+        }
         if let Err(failure) = stage.complete(result, observed, cancel.is_cancelled()) {
             return Err((failure, held));
         }
@@ -3347,12 +3579,26 @@ impl Child {
         cancel: &Shutdown,
         revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
-        self.resume_checked_with_handoff(cancel, revalidate, || {})
+        self.resume_checked_with_handoff(cancel, None, revalidate, || {})
+    }
+
+    /// Resume only while the exclusive effect cutoff is still ahead. The
+    /// cutoff and cancellation are checked after revalidation, immediately
+    /// before the thread is released, so a slow sample cannot let the child
+    /// start late.
+    fn resume_checked_by(
+        &mut self,
+        cancel: &Shutdown,
+        cutoff: tokio::time::Instant,
+        revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        self.resume_checked_with_handoff(cancel, Some(cutoff), revalidate, || {})
     }
 
     fn resume_checked_with_handoff(
         &mut self,
         cancel: &Shutdown,
+        cutoff: Option<tokio::time::Instant>,
         revalidate: &mut dyn FnMut() -> Result<std::time::Instant, NativeRefusal>,
         handoff: impl FnOnce(),
     ) -> Result<(), NativeRefusal> {
@@ -3367,8 +3613,25 @@ impl Child {
             std::time::Instant::now(),
             NativeRefusal::ReservesUnverified,
         )?;
+        let fenced = || {
+            cutoff.is_some_and(|cutoff| {
+                cancel.is_cancelled() || tokio::time::Instant::now() >= cutoff
+            })
+        };
+        if fenced() {
+            return Err(NativeRefusal::JobUnverified);
+        }
         handoff();
-        self.resume().map_err(|_| NativeRefusal::JobUnverified)
+        // Release edge: the handoff may block, so cancellation and the cutoff
+        // are checked again after the final Job verification. Nothing that can
+        // wait sits between this check and ResumeThread.
+        self.verify_live()
+            .map_err(|_| NativeRefusal::JobUnverified)?;
+        if fenced() {
+            return Err(NativeRefusal::JobUnverified);
+        }
+        self.release_suspended()
+            .map_err(|_| NativeRefusal::JobUnverified)
     }
 }
 
@@ -3429,6 +3692,9 @@ fn allocated_under(root: &LocalPath, expected: u64, limit: usize) -> Result<u64,
     }
     Ok(total)
 }
+
+#[cfg(test)]
+mod monitor_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4406,6 +4672,136 @@ mod tests {
             })
             .unwrap();
         assert_eq!(calls, 2);
+        ready(&mut read).await;
+        write.write_all(&[42]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        child.reap(deadline).await.unwrap();
+        workers.join(deadline).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_once_the_effect_cutoff_or_cancellation_lands_during_revalidation() {
+        let Some((mut child, stdio)) = fixture_launch(0) else {
+            return;
+        };
+        let (mut read, mut write, workers) = start_stdio(stdio, Default::default()).unwrap();
+        let fresh = Shutdown::default();
+        // The cutoff is still ahead when resume starts and is reached while
+        // the otherwise valid sample runs; the thread must stay suspended.
+        let cutoff = tokio::time::Instant::now() + Duration::from_millis(20);
+        let mut calls = 0;
+        let refused = child.resume_checked_by(&fresh, cutoff, &mut || {
+            calls += 1;
+            std::thread::sleep(Duration::from_millis(40));
+            Ok(std::time::Instant::now())
+        });
+        assert!(tokio::time::Instant::now() >= cutoff);
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!(calls, 1);
+        assert!(child.suspended.is_some(), "thread released at the cutoff");
+        // Cancellation landing inside a valid sample also keeps it held.
+        let cancel = Shutdown::default();
+        let ahead = tokio::time::Instant::now() + Duration::from_secs(30);
+        let refused = child.resume_checked_by(&cancel, ahead, &mut || {
+            calls += 1;
+            cancel.cancel();
+            Ok(std::time::Instant::now())
+        });
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!(calls, 2);
+        assert!(child.suspended.is_some(), "thread released after cancel");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read.read_u8())
+                .await
+                .is_err(),
+            "the held child ran"
+        );
+        // With the cutoff still ahead after the sample, the child runs.
+        child
+            .resume_checked_by(&fresh, ahead, &mut || {
+                calls += 1;
+                Ok(std::time::Instant::now())
+            })
+            .unwrap();
+        assert_eq!(calls, 3);
+        assert!(child.suspended.is_none());
+        ready(&mut read).await;
+        write.write_all(&[42]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        child.reap(deadline).await.unwrap();
+        workers.join(deadline).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_when_cancellation_or_the_cutoff_lands_during_the_handoff() {
+        let Some((mut child, stdio)) = fixture_launch(0) else {
+            return;
+        };
+        let (mut read, mut write, workers) = start_stdio(stdio, Default::default()).unwrap();
+        let mut samples = 0;
+        let mut handoffs = 0;
+        // Cancellation arrives inside the handoff, after the post-sample guard
+        // already passed.
+        let cancel = Shutdown::default();
+        let ahead = tokio::time::Instant::now() + Duration::from_secs(30);
+        let refused = child.resume_checked_with_handoff(
+            &cancel,
+            Some(ahead),
+            &mut || {
+                samples += 1;
+                Ok(std::time::Instant::now())
+            },
+            || {
+                handoffs += 1;
+                assert!(!cancel.is_cancelled());
+                cancel.cancel();
+            },
+        );
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!((samples, handoffs), (1, 1));
+        assert!(child.suspended.is_some(), "thread released after cancel");
+        // The cutoff is still ahead after the sample and is crossed while the
+        // handoff blocks.
+        let fresh = Shutdown::default();
+        let cutoff = tokio::time::Instant::now() + Duration::from_millis(300);
+        let refused = child.resume_checked_with_handoff(
+            &fresh,
+            Some(cutoff),
+            &mut || {
+                samples += 1;
+                Ok(std::time::Instant::now())
+            },
+            || {
+                handoffs += 1;
+                let now = tokio::time::Instant::now();
+                assert!(now < cutoff);
+                std::thread::sleep((cutoff - now) + Duration::from_millis(5));
+            },
+        );
+        assert!(tokio::time::Instant::now() >= cutoff);
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!((samples, handoffs), (2, 2));
+        assert!(child.suspended.is_some(), "thread released at the cutoff");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read.read_u8())
+                .await
+                .is_err(),
+            "the held child ran"
+        );
+        // With both still clear after the handoff, the child is released.
+        child
+            .resume_checked_with_handoff(
+                &fresh,
+                Some(tokio::time::Instant::now() + Duration::from_secs(30)),
+                &mut || {
+                    samples += 1;
+                    Ok(std::time::Instant::now())
+                },
+                || handoffs += 1,
+            )
+            .unwrap();
+        assert_eq!((samples, handoffs), (3, 3));
+        assert!(child.suspended.is_none());
         ready(&mut read).await;
         write.write_all(&[42]).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);

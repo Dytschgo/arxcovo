@@ -1484,6 +1484,28 @@ capture and HTTPS adapters are wired. The owner preflights a separate E1a
 copy without changing the held bundle predicate.
 [Docker qualification runbook](../docker-qualification.md)
 
+### 7c amendment — in-flight native monitoring
+
+The checked core refreshes the selected host and console observations and
+checks the same held child, Job limits and input custody while installed
+boot, installer shutdown, guest ping or script, or a helper is pending.
+An observation is required before the wait, at one-second poll intervals,
+and before accepting a successful result. Helpers and installer shutdown
+can observe a child that has already exited when its held Job is empty.
+Foreground admission can also sample caller-available and total free space
+from the same held volumes before applying the durable capacity ledger.
+Helper and installer resume check cancellation and the exclusive effect
+cutoff after revalidation, and again after any handoff and the final Job
+verification, immediately before the suspended thread is released.
+
+The foreground exposes monitored guest calls. A boot or guest failure
+stops the owned launch and carries its disposition with the exact held
+generation proof if release was confirmed. Helpers settle through the same
+worker-join and writer-exclusion checks after a monitor failure. An absent
+proof keeps the charge quarantined. The console activity source is shared
+with preflight and qualification. Native monitoring and teardown are
+**unverified on real hardware**.
+
 ## 7c amendment — durable generation and slot identity before writes
 
 [ADR 0072](0072-vm-store-v16-native-test-custody.md) adds store v16 custody

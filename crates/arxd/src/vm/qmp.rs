@@ -537,13 +537,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
 
     /// Checks which accelerator the held paused QEMU child actually initialized.
     #[cfg(all(windows, target_arch = "x86_64"))]
-    pub(super) async fn verify_whpx(&mut self) -> Result<(), ChannelError> {
-        self.verify_whpx_diagnosed(|_| {}).await
+    pub(super) async fn verify_whpx(&mut self, cancel: &Shutdown) -> Result<(), ChannelError> {
+        self.verify_whpx_diagnosed(cancel, |_| {}).await
     }
 
+    /// As `verify_whpx`, reporting the specific accelerator refusal. The query
+    /// keeps the setup deadline and cancellation, and a refusal consumes the
+    /// stream.
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub(super) async fn verify_whpx_diagnosed(
         &mut self,
+        cancel: &Shutdown,
         report: impl FnOnce(PausedCheck),
     ) -> Result<(), ChannelError> {
         #[derive(Deserialize)]
@@ -553,10 +557,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
             present: Vec<String>,
         }
 
-        let stream = self.stream.as_mut().ok_or(ChannelError::Closed)?;
-        let response = stream
-            .command(Command::Accelerators, &mut Events::default())
-            .await?;
+        let mut events = self.installer.take().unwrap_or_default();
+        let deadline = setup_deadline(events.installer.as_ref().map(|installer| installer.stage));
+        let mut stream = self.stream.take().ok_or(ChannelError::Closed)?;
+        let response = bounded(cancel, deadline, async {
+            stream.command(Command::Accelerators, &mut events).await
+        })
+        .await?;
         let actual: Accelerators =
             serde_json::from_value(response).map_err(|_| ChannelError::Invalid)?;
         const MAX_ACCELERATORS: usize = 8;
@@ -585,6 +592,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
         }) {
             PausedCheck::WhpxUnknownAccelerator
         } else {
+            self.installer = events.installer.is_some().then_some(events);
+            self.stream = Some(stream);
             return Ok(());
         };
         report(failure);
@@ -796,6 +805,46 @@ mod accelerator_tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+    #[tokio::test(start_paused = true)]
+    async fn silent_accelerator_respects_setup_deadline_and_cancellation() {
+        for interrupt in [false, true] {
+            let (host, simulated) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(host);
+            let mut qmp = Qmp {
+                stream: Some(Stream {
+                    reader: BufReader::new(reader),
+                    writer,
+                    next_id: 1,
+                    pending: Vec::new(),
+                }),
+                started: false,
+                installer: None,
+            };
+            let cancel = Shutdown::default();
+            let mut peer = BufReader::new(simulated);
+            let (_, result) = tokio::join!(
+                async {
+                    let mut command = String::new();
+                    peer.read_line(&mut command).await.unwrap();
+                    assert!(command.contains("query-accelerators"));
+                    if interrupt {
+                        cancel.cancel();
+                    }
+                },
+                tokio::time::timeout(SETUP * 2, qmp.verify_whpx(&cancel))
+            );
+            assert_eq!(
+                result.unwrap(),
+                Err(if interrupt {
+                    ChannelError::Cancelled
+                } else {
+                    ChannelError::Timeout
+                })
+            );
+            assert!(qmp.stream.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn paused_trial_requires_typed_whpx_selection() {
         for (response, accepted) in [
@@ -820,6 +869,7 @@ mod accelerator_tests {
                 started: false,
                 installer: None,
             };
+            let cancel = Shutdown::default();
             let (_, result) = tokio::join!(
                 async {
                     let mut peer = BufReader::new(simulated);
@@ -831,7 +881,7 @@ mod accelerator_tests {
                         .await
                         .unwrap();
                 },
-                qmp.verify_whpx()
+                qmp.verify_whpx(&cancel)
             );
             assert_eq!(result.is_ok(), accepted, "{response}");
         }
