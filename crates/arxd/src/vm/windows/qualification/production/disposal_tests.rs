@@ -1,6 +1,6 @@
 //! Resumable native TEST disposal through real NTFS handles and the VM ledger
 //! (T33, T67-T71, I16-I18, I22-I23).
-use super::super::tests::{create_dir_sddl, sid_ptr};
+use super::super::tests::create_dir_sddl;
 use super::*;
 use crate::store::vm::{
     self as store, Binding, VmStore,
@@ -197,7 +197,7 @@ struct SweepFixture {
     ctl: Option<VmController<FakeClock>>,
     clock: FakeClock,
     production: PathPin,
-    owner: Vec<usize>,
+    owner: Arc<LocalSid>,
     owner_text: String,
     temp: tempfile::TempDir,
     state: tempfile::TempDir,
@@ -230,7 +230,7 @@ impl SweepFixture {
             ctl: Some(ctl),
             clock,
             production,
-            owner,
+            owner: Arc::new(owner),
             owner_text,
             temp,
             state,
@@ -263,8 +263,8 @@ impl SweepFixture {
         }
     }
 
-    fn owner_sid(&self) -> PSID {
-        sid_ptr(&self.owner)
+    fn owner_sid(&self) -> &Arc<LocalSid> {
+        &self.owner
     }
 
     fn gen_dir(&self, generation: Id) -> PathBuf {
@@ -284,7 +284,7 @@ impl SweepFixture {
         ledger: &'a dyn DisposalCheckpoints,
         guards: &'a GenerationGuards,
     ) -> NativeDisposal<'a> {
-        NativeDisposal::under(&self.production, self.owner_sid(), ledger, guards)
+        NativeDisposal::under(&self.production, self.owner_sid().0, ledger, guards)
     }
 
     fn sweep(&self, fault: Option<Fault>) -> bool {
@@ -351,7 +351,7 @@ impl SweepFixture {
         };
         let primary_ws = reserve_workspace_under(
             &self.production,
-            self.owner_sid(),
+            self.owner_sid().0,
             slots.pair.disk.generation,
             &ledger,
         )
@@ -363,7 +363,7 @@ impl SweepFixture {
 
         let verify_ws = reserve_workspace_under(
             &self.production,
-            self.owner_sid(),
+            self.owner_sid().0,
             slots.verification.disk.generation,
             &ledger,
         )
@@ -418,7 +418,7 @@ impl SweepFixture {
         };
         let ws = reserve_workspace_under(
             &self.production,
-            self.owner_sid(),
+            self.owner_sid().0,
             slots.disk.generation,
             &ledger,
         )
@@ -441,7 +441,7 @@ impl SweepFixture {
     }
 }
 
-fn default_owner_sid() -> (Vec<usize>, String) {
+fn default_owner_sid() -> (LocalSid, String) {
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     let token = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
     let data = token_data(&token, TokenOwner).unwrap();
@@ -451,7 +451,7 @@ fn default_owner_sid() -> (Vec<usize>, String) {
     let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
     let string = String::from_utf16(unsafe { std::slice::from_raw_parts(text, len) }).unwrap();
     unsafe { LocalFree(text.cast()) };
-    (data, string)
+    (LocalSid::parse(&string).unwrap(), string)
 }
 
 fn build_request(nonce: u8) -> BuildRequest<'static> {
@@ -779,7 +779,8 @@ fn t68_negative_controls_retain_claims_and_never_delete_protected_objects() {
         let wrong_parent = PathPin::open(&other_dir, true, false).unwrap();
         let ledger = LedgerDisposal { store: fx.store() };
         let guards = GenerationGuards::default();
-        let wrong_custody = NativeDisposal::under(&wrong_parent, fx.owner_sid(), &ledger, &guards);
+        let wrong_custody =
+            NativeDisposal::under(&wrong_parent, fx.owner_sid().0, &ledger, &guards);
         fx.clock.advance(0, 0);
         assert!(fx.ctl().sweep_with(&OfflineReaper, &wrong_custody).unwrap());
         assert!(exists(&fx.slot_file(slots.disk)));
@@ -1205,7 +1206,7 @@ fn arm_restart(fixture: &SweepFixture, vm: Id, pair: PairSlots, boot: Option<Has
     use crate::store::vm::native::recovery;
     let generation = pair.disk.generation;
     let origin = boot.map(|boot| {
-        super::super::recovery::StorePins::open(&fixture.production)
+        super::super::recovery::StorePins::open_with_owner(&fixture.production, fixture.owner_sid())
             .unwrap()
             .origin(fixture.store(), boot)
             .unwrap()
@@ -1249,7 +1250,9 @@ fn orphan_restart_releases_without_selection_and_retains_the_exact_pair() {
     std::fs::write(fx.slot_file(slots.disk), b"changed after the writer start").unwrap();
     fx.reopen();
     let guards = GenerationGuards::default();
-    let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+    let custody =
+        NativeRecovery::open_with_owner(fx.store(), fx.state_root(), fx.owner_sid(), &guards)
+            .unwrap();
     let runtime = RestartReaper {
         owned: false,
         can_fence: true,
@@ -1401,7 +1404,9 @@ fn orphan_restart_refuses_live_writer_wrong_slot_lease_boot_epoch_store_and_prot
             _ => {}
         }
         let guards = GenerationGuards::default();
-        let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+        let custody =
+            NativeRecovery::open_with_owner(fx.store(), fx.state_root(), fx.owner_sid(), &guards)
+                .unwrap();
         let runtime = RestartReaper {
             owned: false,
             can_fence: fault != "reacquire",
@@ -1439,7 +1444,9 @@ fn orphan_restart_stale_owner_ack_cannot_skip_durable_release_or_backoff() {
     arm_restart(&fx, vm, pair, Some(boot::marker().unwrap()));
     fx.reopen();
     let guards = GenerationGuards::default();
-    let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+    let custody =
+        NativeRecovery::open_with_owner(fx.store(), fx.state_root(), fx.owner_sid(), &guards)
+            .unwrap();
     let mut runtime = RestartReaper {
         owned: true,
         can_fence: true,
@@ -1482,10 +1489,13 @@ fn orphan_checkpointed_build_requires_both_worker_quiescence_and_writer_origin()
             "wrong boot" => {
                 let mut wrong_boot = boot::marker().unwrap();
                 wrong_boot[0] ^= 0x80;
-                let origin = super::super::recovery::StorePins::open(&fx.production)
-                    .unwrap()
-                    .origin(fx.store(), wrong_boot)
-                    .unwrap();
+                let origin = super::super::recovery::StorePins::open_with_owner(
+                    &fx.production,
+                    fx.owner_sid(),
+                )
+                .unwrap()
+                .origin(fx.store(), wrong_boot)
+                .unwrap();
                 fx.store()
                     .transact(|db| {
                         let GenerationState::Bound { scope, .. } =
@@ -1501,7 +1511,9 @@ fn orphan_checkpointed_build_requires_both_worker_quiescence_and_writer_origin()
         }
         fx.reopen();
         let guards = GenerationGuards::default();
-        let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+        let custody =
+            NativeRecovery::open_with_owner(fx.store(), fx.state_root(), fx.owner_sid(), &guards)
+                .unwrap();
         let runtime = RestartReaper {
             owned: fault == "owned",
             can_fence: true,
@@ -1530,7 +1542,9 @@ fn orphan_expiry_commits_release_on_a_distinct_turn_before_disposal() {
     fx.reopen();
     fx.clock.advance(2_000, 0);
     let guards = GenerationGuards::default();
-    let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+    let custody =
+        NativeRecovery::open_with_owner(fx.store(), fx.state_root(), fx.owner_sid(), &guards)
+            .unwrap();
     let runtime = RestartReaper {
         owned: false,
         can_fence: true,
@@ -1605,8 +1619,13 @@ fn orphan_expiry_resume_refuses_superseded_scope_before_deleting() {
         fx.clock.advance(2_000, 0);
         {
             let native_guards = GenerationGuards::default();
-            let custody =
-                NativeRecovery::open(fx.store(), fx.state_root(), &native_guards).unwrap();
+            let custody = NativeRecovery::open_with_owner(
+                fx.store(),
+                fx.state_root(),
+                fx.owner_sid(),
+                &native_guards,
+            )
+            .unwrap();
             let runtime = RestartReaper {
                 owned: false,
                 can_fence: true,
@@ -1635,7 +1654,9 @@ fn orphan_expiry_resume_refuses_superseded_scope_before_deleting() {
         assert_eq!(exists(&lease), lease_remains);
 
         let guards = GenerationGuards::default();
-        let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+        let custody =
+            NativeRecovery::open_with_owner(fx.store(), fx.state_root(), fx.owner_sid(), &guards)
+                .unwrap();
         let stale = ReplacedExpiry {
             store: fx.store(),
             vm,
@@ -1724,7 +1745,7 @@ fn orphan_expiry_force_reaps_owned_hung_guest_before_a_later_disposal_turn() {
         })
         .unwrap();
     let workspace =
-        hold_workspace_under(&fx.production, fx.owner_sid(), binding_from_scope(scope)).unwrap();
+        hold_workspace_under(&fx.production, fx.owner_sid().0, binding_from_scope(scope)).unwrap();
     let writer = OpenOptions::new()
         .write(true)
         .open(fx.slot_file(pair.disk))
@@ -1743,7 +1764,9 @@ fn orphan_expiry_force_reaps_owned_hung_guest_before_a_later_disposal_turn() {
         forced_attempts: Cell::new(0),
     };
     let guards = GenerationGuards::default();
-    let custody = NativeRecovery::open(fx.store(), fx.state_root(), &guards).unwrap();
+    let custody =
+        NativeRecovery::open_with_owner(fx.store(), fx.state_root(), fx.owner_sid(), &guards)
+            .unwrap();
 
     fx.clock.advance(2_000, 0);
     assert!(fx.ctl().sweep_with(&runtime, &custody).unwrap());
@@ -1767,4 +1790,23 @@ fn orphan_expiry_force_reaps_owned_hung_guest_before_a_later_disposal_turn() {
     assert_eq!(runtime.forced_attempts.get(), 1);
     assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 0);
     assert!(!exists(&fx.gen_dir(generation)));
+}
+
+#[test]
+fn recovery_fixture_owner_does_not_change_production_token_user() {
+    let fx = SweepFixture::new_with_store(true);
+    let guards = GenerationGuards::default();
+    super::super::recovery::StorePins::open_with_owner(&fx.production, fx.owner_sid()).unwrap();
+    NativeRecovery::open_with_owner(fx.store(), fx.state_root(), fx.owner_sid(), &guards).unwrap();
+
+    let token_user = current_user().unwrap();
+    let owners_match = unsafe { EqualSid(user_sid(&token_user), fx.owner_sid().0) } != 0;
+    assert_eq!(
+        super::super::recovery::StorePins::open(&fx.production).is_ok(),
+        owners_match
+    );
+    assert_eq!(
+        NativeRecovery::open(fx.store(), fx.state_root(), &guards).is_ok(),
+        owners_match
+    );
 }

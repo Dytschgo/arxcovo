@@ -9,6 +9,28 @@ use crate::vm::{
     reaper::{ArtifactCustody, CleanupKind, CleanupWork},
 };
 
+enum RecoveryOwner {
+    TokenUser(Vec<usize>),
+    #[cfg(test)]
+    Fixture(std::sync::Arc<LocalSid>),
+}
+
+impl RecoveryOwner {
+    fn current() -> Result<Self, NativeRefusal> {
+        current_user()
+            .map(Self::TokenUser)
+            .map_err(|_| NativeRefusal::PathCustodyUnverified)
+    }
+
+    fn sid(&self) -> PSID {
+        match self {
+            Self::TokenUser(user) => user_sid(user),
+            #[cfg(test)]
+            Self::Fixture(owner) => owner.0,
+        }
+    }
+}
+
 pub(super) struct StorePins {
     database: PathPin,
     lock: PathPin,
@@ -16,6 +38,19 @@ pub(super) struct StorePins {
 
 impl StorePins {
     pub(super) fn open(production: &PathPin) -> Result<Self, NativeRefusal> {
+        let owner = RecoveryOwner::current()?;
+        Self::open_for_owner(production, owner.sid())
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_with_owner(
+        production: &PathPin,
+        owner: &LocalSid,
+    ) -> Result<Self, NativeRefusal> {
+        Self::open_for_owner(production, owner.0)
+    }
+
+    fn open_for_owner(production: &PathPin, owner: PSID) -> Result<Self, NativeRefusal> {
         let reason = NativeRefusal::PathCustodyUnverified;
         inventory::binding(production)?;
         let pin = |name| {
@@ -28,7 +63,9 @@ impl StorePins {
             {
                 return Err(reason);
             }
-            require_held_private(&pin.leaf).map_err(|_| reason)?;
+            if !sink::held_private(&pin.leaf, owner) {
+                return Err(reason);
+            }
             Ok(pin)
         };
         Ok(Self {
@@ -54,7 +91,7 @@ pub(crate) struct NativeRecovery<'a> {
     store: &'a VmStore,
     production: PathPin,
     files: StorePins,
-    owner: Vec<usize>,
+    owner: RecoveryOwner,
     guards: &'a GenerationGuards,
 }
 
@@ -64,14 +101,32 @@ impl<'a> NativeRecovery<'a> {
         root: &std::path::Path,
         guards: &'a GenerationGuards,
     ) -> Result<Self, NativeRefusal> {
+        Self::open_for_owner(store, root, RecoveryOwner::current()?, guards)
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_with_owner(
+        store: &'a VmStore,
+        root: &std::path::Path,
+        owner: &std::sync::Arc<LocalSid>,
+        guards: &'a GenerationGuards,
+    ) -> Result<Self, NativeRefusal> {
+        Self::open_for_owner(store, root, RecoveryOwner::Fixture(owner.clone()), guards)
+    }
+
+    fn open_for_owner(
+        store: &'a VmStore,
+        root: &std::path::Path,
+        owner: RecoveryOwner,
+        guards: &'a GenerationGuards,
+    ) -> Result<Self, NativeRefusal> {
         let reason = NativeRefusal::PathCustodyUnverified;
-        let owner = current_user().map_err(|_| reason)?;
         let root = local(root.to_str().ok_or(reason)?)?;
         let production = PathPin::open(&root, true, false)?;
-        if root.is_drive_root() || !sink::held_private(&production.leaf, user_sid(&owner)) {
+        if root.is_drive_root() || !sink::held_private(&production.leaf, owner.sid()) {
             return Err(reason);
         }
-        let files = StorePins::open(&production)?;
+        let files = StorePins::open_for_owner(&production, owner.sid())?;
         files.origin(store, boot::marker()?)?;
         Ok(Self {
             store,
@@ -102,7 +157,7 @@ impl<'a> NativeRecovery<'a> {
             .guards
             .acquire(expected.target.generation)
             .map_err(|_| path())?;
-        let owner = user_sid(&self.owner);
+        let owner = self.owner.sid();
         let workspace = hold_workspace_under(
             &self.production,
             owner,
@@ -218,12 +273,45 @@ impl ArtifactCustody for NativeRecovery<'_> {
             }
         }
         let ledger = LedgerDisposal { store: self.store };
-        NativeDisposal::under(
-            &self.production,
-            user_sid(&self.owner),
-            &ledger,
-            self.guards,
-        )
-        .reconcile(work, deadline)
+        NativeDisposal::under(&self.production, self.owner.sid(), &ledger, self.guards)
+            .reconcile(work, deadline)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn production_recovery_requires_token_user_on_the_exact_store() {
+        let root = crate::service::application::tests::private_temp();
+        let store = VmStore::open(root.path(), 100).unwrap();
+        for path in [
+            root.path(),
+            &root.path().join("activity.sqlite3"),
+            &root.path().join("activity.lock"),
+        ] {
+            crate::dashboard::tests::set_owner_private(path);
+        }
+        let production =
+            PathPin::open(&local(root.path().to_str().unwrap()).unwrap(), true, false).unwrap();
+        let guards = GenerationGuards::default();
+        let pins = StorePins::open(&production).unwrap();
+        pins.origin(&store, boot::marker().unwrap()).unwrap();
+        NativeRecovery::open(&store, root.path(), &guards).unwrap();
+
+        // Administrators may appear in the allowed DACL and can be the
+        // default TokenOwner on an elevated runner. It still cannot stand
+        // in for the TokenUser that owns these particular objects.
+        let administrators = Arc::new(LocalSid::parse("S-1-5-32-544").unwrap());
+        assert!(matches!(
+            StorePins::open_with_owner(&production, &administrators),
+            Err(NativeRefusal::PathCustodyUnverified)
+        ));
+        assert!(matches!(
+            NativeRecovery::open_with_owner(&store, root.path(), &administrators, &guards),
+            Err(NativeRefusal::PathCustodyUnverified)
+        ));
     }
 }
