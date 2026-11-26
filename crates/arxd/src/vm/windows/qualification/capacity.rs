@@ -271,12 +271,41 @@ pub(super) fn walk(
 /// The drive letter still names the anchored volume and its root object.
 /// Checked after the observations: a rebinding during them closes the run.
 pub(super) fn still_bound(names: &impl VolumeNames, volume: &AnchoredVolume) -> bool {
-    names
+    check_still_bound(names, volume).is_ok()
+}
+
+/// Typed volume-binding check for the selection epoch. A resolved different
+/// volume GUID or root object identity is confirmed drift; an unreadable
+/// mount-manager or directory query is indeterminate.
+pub(super) fn check_still_bound(
+    names: &impl VolumeNames,
+    volume: &AnchoredVolume,
+) -> Result<(), CustodyCheckError> {
+    check_still_bound_with(names, volume, |guid| {
+        let root = open_directory(guid).map_err(FileIdentityError::Io)?;
+        Ok(file_identity_typed(&root, true)?.0)
+    })
+}
+
+fn check_still_bound_with(
+    names: &impl VolumeNames,
+    volume: &AnchoredVolume,
+    read_root: impl FnOnce(&str) -> Result<FileIdentity, FileIdentityError>,
+) -> Result<(), CustodyCheckError> {
+    let guid = names
         .drive_guid(&volume.drive)
-        .is_some_and(|guid| guid.eq_ignore_ascii_case(&volume.guid))
-        && open_directory(&volume.guid)
-            .and_then(|root| file_identity(&root, true))
-            .is_ok_and(|(identity, _)| identity == volume.identity)
+        .filter(|guid| guid_spelling(guid))
+        .ok_or_else(|| {
+            CustodyCheckError::Unavailable(io::Error::other("volume GUID unavailable"))
+        })?;
+    if !guid.eq_ignore_ascii_case(&volume.guid) {
+        return Err(CustodyCheckError::Mismatch);
+    }
+    let identity = read_root(&volume.guid).map_err(CustodyCheckError::from)?;
+    if identity != volume.identity {
+        return Err(CustodyCheckError::Mismatch);
+    }
+    Ok(())
 }
 
 pub(super) struct VhdFacts {
@@ -760,5 +789,125 @@ mod tests {
         ] {
             assert!(!on_volume(&actual, guid, r"Arx\t.vhdx"), "{actual}");
         }
+    }
+
+    #[test]
+    fn still_bound_confirms_drift_keeps_io_indeterminate_and_latches_reverted_rebind() {
+        const CUSTODY: NativeRefusal = NativeRefusal::PathCustodyUnverified;
+        struct ToggleNames {
+            response: Cell<Option<&'static str>>,
+        }
+        impl VolumeNames for ToggleNames {
+            fn drive_guid(&self, drive: &str) -> Option<String> {
+                match self.response.get() {
+                    Some("") => None,
+                    Some(other) => Some(other.to_owned()),
+                    None => MountManager.drive_guid(drive),
+                }
+            }
+            fn final_guid_path(&self, file: &File) -> Option<String> {
+                MountManager.final_guid_path(file)
+            }
+        }
+
+        let (_dir, path) = long_temp();
+        let volume = anchor_volume(&MountManager, &path.as_str()[..3]).unwrap();
+        let names = ToggleNames {
+            response: Cell::new(None),
+        };
+        assert!(check_still_bound(&names, &volume).is_ok());
+
+        // Measured drive-letter rebind -> Confirmed.
+        names.response.set(Some(OTHER));
+        assert_eq!(
+            check_still_bound(&names, &volume)
+                .err()
+                .unwrap()
+                .into_invalidation(CUSTODY),
+            Invalidation::Confirmed(CUSTODY)
+        );
+
+        // Measured root-object identity mismatch -> Confirmed.
+        names.response.set(None);
+        let mut wrong_id = volume.identity;
+        wrong_id.file[0] ^= 0xff;
+        assert_eq!(
+            check_still_bound_with(&names, &volume, |_| Ok(wrong_id))
+                .err()
+                .unwrap()
+                .into_invalidation(CUSTODY),
+            Invalidation::Confirmed(CUSTODY)
+        );
+
+        // Root-open / handle-query I/O failure -> Indeterminate.
+        assert_eq!(
+            check_still_bound_with(&names, &volume, |_| {
+                Err(FileIdentityError::Io(io::Error::other("root open failed")))
+            })
+            .err()
+            .unwrap()
+            .into_invalidation(CUSTODY),
+            Invalidation::Indeterminate(CUSTODY)
+        );
+
+        // Mount-manager API failure (`drive_guid` -> None) stays Indeterminate
+        // and does not revoke the SelectionEpoch.
+        let (io_epoch, sample) = open_test_epoch();
+        names.response.set(Some(""));
+        let io_result = io_epoch.refresh(
+            || {
+                check_still_bound(&names, &volume)
+                    .map_err(|error| error.into_invalidation(CUSTODY))?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(io_result, Err(Invalidation::Indeterminate(CUSTODY)));
+        assert!(!io_epoch.effects_revoked());
+        names.response.set(None);
+        assert!(
+            io_epoch
+                .refresh(
+                    || {
+                        check_still_bound(&names, &volume)
+                            .map_err(|error| error.into_invalidation(CUSTODY))?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                )
+                .is_ok()
+        );
+
+        // Observed-then-reverted drive-letter rebind latches Confirmed and
+        // leaves the epoch unusable even after the drive points back.
+        let (drift_epoch, sample) = open_test_epoch();
+        names.response.set(Some(OTHER));
+        let drifted = drift_epoch.refresh(
+            || {
+                check_still_bound(&names, &volume)
+                    .map_err(|error| error.into_invalidation(CUSTODY))?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(drifted, Err(Invalidation::Confirmed(CUSTODY)));
+        assert!(drift_epoch.effects_revoked());
+
+        // Revert the drive letter back to the anchored volume.
+        names.response.set(None);
+        assert!(check_still_bound(&names, &volume).is_ok());
+        assert_eq!(
+            drift_epoch.refresh(
+                || {
+                    check_still_bound(&names, &volume)
+                        .map_err(|error| error.into_invalidation(CUSTODY))?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Confirmed(NativeRefusal::QualificationMissing))
+        );
+        assert!(drift_epoch.effects_revoked());
+        assert_admission_closed();
     }
 }

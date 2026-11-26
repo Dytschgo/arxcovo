@@ -115,16 +115,19 @@ pub(super) struct Scope {
 }
 
 impl Scope {
-    pub(super) fn validate_live(&self) -> Result<(), NativeRefusal> {
+    pub(super) fn validate_live(&self) -> Result<(), Invalidation> {
+        self.validate_live_with(&capacity::MountManager)
+    }
+
+    fn validate_live_with(&self, names: &impl capacity::VolumeNames) -> Result<(), Invalidation> {
         for scope in [&self.recipe, &self.production] {
-            if !capacity::still_bound(&capacity::MountManager, &scope.volume) {
-                return Err(NativeRefusal::PathCustodyUnverified);
-            }
-            inventory::binding(&scope.root)?;
-            inventory::binding(&scope.backing)?;
+            capacity::check_still_bound(names, &scope.volume)
+                .map_err(|error| error.into_invalidation(NativeRefusal::PathCustodyUnverified))?;
+            inventory::check_binding(&scope.root)?;
+            inventory::check_binding(&scope.backing)?;
         }
-        inventory::binding(&self._database)?;
-        inventory::binding(&self._lock)
+        inventory::check_binding(&self._database)?;
+        inventory::check_binding(&self._lock)
     }
 
     pub(super) fn hold(
@@ -232,7 +235,15 @@ impl Scope {
         &self,
         store: &crate::store::vm::VmStore,
     ) -> Result<(), Invalidation> {
-        self.validate_live().map_err(Invalidation::Indeterminate)?;
+        self.validate_foreground_with(&capacity::MountManager, store)
+    }
+
+    fn validate_foreground_with(
+        &self,
+        names: &impl capacity::VolumeNames,
+        store: &crate::store::vm::VmStore,
+    ) -> Result<(), Invalidation> {
+        self.validate_live_with(names)?;
         if read_guarded_host(store, &self._database, &self._lock)? != self.host {
             return Err(Invalidation::Confirmed(
                 NativeRefusal::PathCustodyUnverified,
@@ -264,16 +275,17 @@ impl Scope {
     }
 }
 
-/// An unheld lock leaf or a handle mismatch is confirmed custody drift.
-/// Store contention is transient, and other failures are indeterminate.
+/// An unheld lock leaf, a binding mismatch or a handle mismatch is confirmed
+/// custody drift. Store contention is transient, and I/O failures are
+/// indeterminate.
 fn read_guarded_host(
     store: &crate::store::vm::VmStore,
     database: &PathPin,
     lock: &PathPin,
 ) -> Result<crate::vm::Id, Invalidation> {
     let reason = NativeRefusal::PathCustodyUnverified;
-    inventory::binding(database).map_err(Invalidation::Indeterminate)?;
-    inventory::binding(lock).map_err(Invalidation::Indeterminate)?;
+    inventory::check_binding(database)?;
+    inventory::check_binding(lock)?;
     // Verify the held lock leaf is actively exclusively locked (by `store`),
     // and match `store`'s open SQLite main handle, database handle and lock
     // handle by exact OS file identity (volume serial + 128-bit file ID).
@@ -867,5 +879,133 @@ mod tests {
         assert_eq!(scope.validate_foreground(&store_b), Err(CUSTODY_DRIFT));
         scope.host[0] ^= 0xff;
         assert_eq!(scope.validate_foreground(&store_a), Err(CUSTODY_DRIFT));
+    }
+
+    #[test]
+    fn read_guarded_host_and_validate_foreground_classify_binding_and_volume_drift() {
+        const CUSTODY: NativeRefusal = NativeRefusal::PathCustodyUnverified;
+        const DIST: NativeRefusal = NativeRefusal::DistributionUnverified;
+        const OTHER_VOLUME: &str = r"\\?\Volume{11111111-2222-3333-4444-555555555555}\";
+        struct SwitchNames(std::cell::Cell<Option<&'static str>>);
+        impl capacity::VolumeNames for SwitchNames {
+            fn drive_guid(&self, drive: &str) -> Option<String> {
+                match self.0.get() {
+                    Some("") => None,
+                    Some(other) => Some(other.to_owned()),
+                    None => capacity::MountManager.drive_guid(drive),
+                }
+            }
+            fn final_guid_path(&self, file: &File) -> Option<String> {
+                capacity::MountManager.final_guid_path(file)
+            }
+        }
+
+        let temp = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let path_a = private_dir(temp.path(), "store-a");
+        let recipe_path = private_dir(temp.path(), "recipe");
+        let backing_a = temp.path().join("prod.vhdx");
+        let backing_r = temp.path().join("recipe.vhdx");
+        std::fs::write(&backing_a, b"prod-backing").unwrap();
+        std::fs::write(&backing_r, b"recipe-backing").unwrap();
+
+        let store_a = crate::store::vm::VmStore::open(Path::new(path_a.as_str()), 1_000).unwrap();
+        let expected_host = store_a
+            .read_backup_owner(crate::store::vm::static_vm::host_id)
+            .unwrap();
+        let db_a = PathPin::open(&path_a.join("activity.sqlite3").unwrap(), false, true).unwrap();
+        let lock_a = PathPin::open(&path_a.join("activity.lock").unwrap(), false, true).unwrap();
+
+        // read_guarded_host: binding mismatch on database -> Confirmed;
+        // unmounted-drive I/O failure -> Indeterminate.
+        let mut mismatched_db =
+            PathPin::open(&path_a.join("activity.sqlite3").unwrap(), false, true).unwrap();
+        mismatched_db._ancestors[0] = open_directory(path_a.as_str()).unwrap();
+        assert_eq!(
+            read_guarded_host(&store_a, &mismatched_db, &lock_a),
+            Err(Invalidation::Confirmed(DIST))
+        );
+        let mut unmounted_db =
+            PathPin::open(&path_a.join("activity.sqlite3").unwrap(), false, true).unwrap();
+        unmounted_db.path =
+            LocalPath::parse(&format!("{}activity.sqlite3", unused_drive_root())).unwrap();
+        assert_eq!(
+            read_guarded_host(&store_a, &unmounted_db, &lock_a),
+            Err(Invalidation::Indeterminate(DIST))
+        );
+
+        let scope = Scope {
+            recipe: test_storage(
+                &recipe_path,
+                &LocalPath::parse(backing_r.to_str().unwrap()).unwrap(),
+            ),
+            production: test_storage(
+                &path_a,
+                &LocalPath::parse(backing_a.to_str().unwrap()).unwrap(),
+            ),
+            _database: db_a,
+            _lock: lock_a,
+            host: expected_host,
+            key: [0x55; 32],
+        };
+        let names = SwitchNames(std::cell::Cell::new(None));
+        assert_eq!(scope.validate_foreground_with(&names, &store_a), Ok(()));
+
+        // Scope::validate_foreground_with: mount-manager failure is Indeterminate
+        // and keeps the epoch usable once resolved.
+        let (io_epoch, sample) = open_test_epoch();
+        names.0.set(Some(""));
+        assert_eq!(
+            io_epoch.refresh(
+                || {
+                    scope.validate_foreground_with(&names, &store_a)?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Indeterminate(CUSTODY))
+        );
+        assert!(!io_epoch.effects_revoked());
+        names.0.set(None);
+        assert!(
+            io_epoch
+                .refresh(
+                    || {
+                        scope.validate_foreground_with(&names, &store_a)?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                )
+                .is_ok()
+        );
+
+        // Observed-then-reverted volume rebind in validate_foreground latches
+        // Confirmed and leaves the epoch unusable even after reverting.
+        let (drift_epoch, sample) = open_test_epoch();
+        names.0.set(Some(OTHER_VOLUME));
+        assert_eq!(
+            drift_epoch.refresh(
+                || {
+                    scope.validate_foreground_with(&names, &store_a)?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Confirmed(CUSTODY))
+        );
+        assert!(drift_epoch.effects_revoked());
+        names.0.set(None);
+        assert_eq!(scope.validate_foreground_with(&names, &store_a), Ok(()));
+        assert_eq!(
+            drift_epoch.refresh(
+                || {
+                    scope.validate_foreground_with(&names, &store_a)?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Confirmed(NativeRefusal::QualificationMissing))
+        );
+        assert!(drift_epoch.effects_revoked());
+        assert_admission_closed();
     }
 }
