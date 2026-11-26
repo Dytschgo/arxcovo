@@ -790,6 +790,8 @@ pub enum Observation {
     DockerPublicIpv4 {
         policy: Hash,
         topology: Hash,
+        /// Run-scoped digest of the private receiver and control observations.
+        receiver_witness: Hash,
         receiver_controls: bool,
         public_tcp_udp: bool,
         nonpublic_denied: bool,
@@ -858,6 +860,7 @@ impl Observation {
                 O::DockerPublicIpv4 {
                     policy,
                     topology,
+                    receiver_witness,
                     receiver_controls,
                     public_tcp_udp,
                     nonpublic_denied,
@@ -868,6 +871,7 @@ impl Observation {
                 origin == Origin::Native
                     && *policy != [0; 32]
                     && *topology != [0; 32]
+                    && *receiver_witness != [0; 32]
                     && *receiver_controls
                     && *public_tcp_udp
                     && *nonpublic_denied
