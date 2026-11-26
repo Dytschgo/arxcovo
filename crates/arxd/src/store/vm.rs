@@ -1888,6 +1888,56 @@ pub(crate) fn publish_build(
     proof: [ArtifactEvidence; 2],
     now: i64,
 ) -> Result<()> {
+    publish_build_inner(db, activity_id, slots, request, guest, proof, now, false)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one native build publication transaction"
+)]
+pub(crate) fn publish_native_build(
+    db: &Connection,
+    activity_id: i64,
+    slots: BuildSlots,
+    request: BuildRequest<'_>,
+    guest: Guest,
+    scope: native::Scope,
+    proof: [ArtifactEvidence; 2],
+    now: i64,
+) -> Result<()> {
+    ensure!(
+        native::bound(db, scope)?
+            && slots.pair.disk.generation == scope.generation
+            && slots.pair.vars.generation == scope.generation,
+        "invalid native build scope"
+    );
+    for (slot, evidence) in [slots.pair.disk, slots.pair.vars].into_iter().zip(proof) {
+        ensure!(
+            evidence.directory == scope.workspace.file
+                && evidence.identity.volume == scope.production.volume
+                && native::leaf(db, slot)?
+                    == native::Leaf::Verified(evidence.identity.file, evidence.pin),
+            "invalid native golden evidence"
+        );
+    }
+    publish_build_inner(db, activity_id, slots, request, guest, proof, now, true)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one build publication transaction"
+)]
+fn publish_build_inner(
+    db: &Connection,
+    activity_id: i64,
+    slots: BuildSlots,
+    request: BuildRequest<'_>,
+    guest: Guest,
+    proof: [ArtifactEvidence; 2],
+    now: i64,
+    native: bool,
+) -> Result<()> {
     let [disk, vars] = proof;
     let retained = request
         .retained
@@ -1915,6 +1965,16 @@ pub(crate) fn publish_build(
             && evidence_matches(db, slots.pair.vars, vars, "identified")?,
         "invalid sealed artifact evidence"
     );
+    let retained = if native {
+        disk.pin
+            .size
+            .checked_add(vars.pin.size)
+            .and_then(|bytes| bytes.checked_add(request.retained.metadata))
+            .filter(|bytes| *bytes <= retained)
+            .ok_or_else(|| anyhow::anyhow!("build exceeds admitted retained claim"))?
+    } else {
+        retained
+    };
     let template = slots.id;
     ensure!(db.execute(
         "INSERT INTO vm_templates

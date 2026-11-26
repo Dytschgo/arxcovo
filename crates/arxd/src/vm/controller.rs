@@ -107,6 +107,7 @@ pub(crate) struct Admitted {
     pub(crate) action: i64,
     pub(crate) operation: Id,
     pub(crate) effect: AdmittedEffect,
+    pub(crate) build: Option<(BuildSlots, DiskClaim, DiskClaim)>,
 }
 
 impl Admitted {
@@ -117,6 +118,7 @@ impl Admitted {
             action: binding.action,
             operation,
             effect,
+            build: None,
         })
     }
 }
@@ -757,11 +759,13 @@ impl<C: Clock> VmController<C> {
             recipe_id,
             digest: request.digest,
         };
+        let mut admitted = Admitted::new(binding, operation.id, effect);
+        admitted.build = Some((slots, request.retained, request.transient));
         Ok(Ok(BuildAdmission::Fresh(
             Box::new(slots),
             PendingOperation {
                 activity_id: operation.receipt.activity_id,
-                admitted: Some(Admitted::new(binding, operation.id, effect)),
+                admitted: Some(admitted),
                 ..pending
             },
             operation,
@@ -942,6 +946,64 @@ impl<C: Clock> VmController<C> {
             )?;
             Ok(Status::Succeeded)
         })
+    }
+
+    /// Seal the native build while its exact primary writer exclusions are held.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+    )]
+    pub(crate) fn finish_native_build(
+        &self,
+        worker: &PendingOperation,
+        slots: BuildSlots,
+        request: BuildRequest<'_>,
+        seal: &super::qualification::BuildSeal<'_>,
+        check: impl Fn() -> bool,
+    ) -> Result<Status> {
+        self.check_worker(worker)?;
+        let admitted = worker
+            .admitted()
+            .ok_or_else(|| anyhow::anyhow!("missing build admission"))?;
+        ensure!(
+            admitted.build == Some((slots, request.retained, request.transient)),
+            "invalid native build claim"
+        );
+        self.store.transact(|db| {
+            ensure!(check(), "native build interrupted");
+            let reading = self.clock.now();
+            ensure!(
+                reading.monotonic < worker.deadline,
+                "native build interrupted"
+            );
+            let (scope, proof) = seal.evidence(slots.pair)?;
+            store::publish_native_build(
+                db,
+                worker.activity_id,
+                slots,
+                request,
+                Self::build_guest(request.recipe),
+                scope,
+                proof,
+                utc(reading)?,
+            )?;
+            ensure!(
+                check() && self.clock.now().monotonic < worker.deadline,
+                "native build interrupted"
+            );
+            Ok(Status::Succeeded)
+        })
+    }
+
+    /// Whether the controller's clock has reached the worker's deadline.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+    )]
+    pub(crate) fn worker_expired(&self, worker: &PendingOperation) -> bool {
+        self.clock.now().monotonic >= worker.deadline
     }
 
     pub(crate) fn fail_build(

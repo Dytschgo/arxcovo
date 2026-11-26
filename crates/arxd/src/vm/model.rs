@@ -102,7 +102,7 @@ pub struct Request<'a> {
 
 /// Worst-case additional bytes. Include old/new coexistence and temporary
 /// artifacts in staging, and format overhead in metadata.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DiskClaim {
     pub staging: u64,
     pub images: u64,

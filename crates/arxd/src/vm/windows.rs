@@ -3134,9 +3134,13 @@ impl<'a> CheckedLaunchCore<'a> {
                 setup_vars = Some((index, digest));
             }
         }
-        if kind == PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall) {
-            // The foreground preparation pins the initial stock VARS bytes.
-            // Retain writer exclusion until QEMU opens its writable copy.
+        if matches!(
+            kind,
+            PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall) | PlanKind::Boot
+        ) {
+            // The foreground preparation pins the initial stock VARS bytes,
+            // or an installed boot pins its authorized VARS copy. Retain
+            // writer exclusion until QEMU opens its writable copy.
             if let Some((_, vars)) = inputs
                 .plan
                 .inputs()
@@ -3619,7 +3623,11 @@ impl CheckedLaunchCore<'_> {
             .ok_or(BootFailure::Native(NativeRefusal::QmpUnverified))?;
         let setup_by = setup_cutoff(boot_by, tokio::time::Instant::now());
         self.child
-            .resume_checked_by(cancel, setup_by, &mut revalidate)
+            .resume_checked_with_handoff(cancel, Some(setup_by), &mut revalidate, || {
+                // A pinned VARS copy stays writer-excluded until QEMU opens
+                // its writable pflash by name after resume.
+                drop(self.setup_vars_handoff.take());
+            })
             .map_err(BootFailure::Native)?;
         let refresh = std::cell::RefCell::new(revalidate);
         let ((mut qmp, pipe), ready_by) = monitor_setup(
