@@ -523,6 +523,43 @@ pub struct EgressBinaryPin {
 pub struct ReviewedEgressBuild {
     pub qemu: ArtifactPin,
     pub receipt: ArtifactPin,
+    pub manifest: ArtifactPin,
+    pub payload_count: usize,
+    pub qemu_img: ArtifactPin,
+    pub firmware_code: ArtifactPin,
+    pub firmware_vars: ArtifactPin,
+}
+
+impl ReviewedEgressBuild {
+    pub(crate) fn dependency_inventory(self) -> [u8; 32] {
+        use crate::vm::qualification_record::digest;
+
+        // The manifest closes the complete payload, including the non-system
+        // DLLs and share tree. The receipt binds the native import review and
+        // static libslirp linkage. These roles cover the explicit plan inputs.
+        let pin = |pin: ArtifactPin| (pin.size, pin.sha256);
+        digest(
+            &serde_json::to_vec(&(
+                "arx-egress-held-inventory-v1",
+                EGRESS_MANIFEST,
+                pin(self.manifest),
+                pin(self.receipt),
+                self.payload_count,
+                self.execution_roles()
+                    .map(|(name, artifact)| (name, pin(artifact))),
+            ))
+            .expect("fixed reviewed inventory"),
+        )
+    }
+
+    pub(crate) fn execution_roles(self) -> [(&'static str, ArtifactPin); 4] {
+        [
+            ("qemu-system-x86_64.exe", self.qemu),
+            ("qemu-img.exe", self.qemu_img),
+            ("share/edk2-x86_64-code.fd", self.firmware_code),
+            ("share/edk2-i386-vars.fd", self.firmware_vars),
+        ]
+    }
 }
 
 /// Independently reviewed patched builds. Each entry pairs the exact executable
@@ -536,6 +573,23 @@ pub const REVIEWED_EGRESS_BUILDS: &[ReviewedEgressBuild] = &[ReviewedEgressBuild
     receipt: ArtifactPin {
         size: 5_192,
         sha256: hex32("68cbd5c35db0f270b82808ed7167920823e7d678667cefe9357191f0eded5402"),
+    },
+    manifest: ArtifactPin {
+        size: 11_917,
+        sha256: hex32("932738b2b45bc2da88c3785210465f9d23c228c686101b06d52e988cd9597773"),
+    },
+    payload_count: 136,
+    qemu_img: ArtifactPin {
+        size: 2_520_350,
+        sha256: hex32("ceb9e343d074204675830ff23ea5752b7a8032f258160f4f8442ebd49226cb15"),
+    },
+    firmware_code: ArtifactPin {
+        size: 3_653_632,
+        sha256: hex32("33090cc07675baa5190d9f1e84bf5176b33bcbfa9bacac522961150cdb6dbb2a"),
+    },
+    firmware_vars: ArtifactPin {
+        size: 540_672,
+        sha256: hex32("5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e"),
     },
 }];
 
@@ -1171,6 +1225,7 @@ mod tests {
         [ReviewedEgressBuild {
             qemu: binary.qemu,
             receipt: binary.receipt,
+            ..REVIEWED_EGRESS_BUILDS[0]
         }]
     }
 
