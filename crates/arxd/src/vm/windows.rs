@@ -260,6 +260,21 @@ enum Node {
     File,
 }
 
+pub(crate) fn hold_child_directory(parent: &File, name: &str) -> io::Result<File> {
+    open_relative(parent, name, Node::Directory, false, false)
+}
+
+pub(crate) fn read_private_child(parent: &File, name: &str, volume: u64) -> io::Result<File> {
+    let file = open_relative(parent, name, Node::File, false, false)?;
+    if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK
+        || file_identity(&file, false)?.0.volume != volume
+    {
+        return Err(io::Error::other("invalid private file"));
+    }
+    qualification::require_held_private(&file)?;
+    Ok(file)
+}
+
 /// Opens one name relative to a held, already-checked directory handle. The
 /// parent's current name is never parsed again, a reparse point on the named
 /// object is opened rather than followed, and any reparse encountered fails.
@@ -354,7 +369,7 @@ fn verify_ntfs(root: &File) -> io::Result<()> {
 
 /// A SUBST or other drive-letter alias for a folder is not a volume mount
 /// point. The pinned drive-letter root must be the volume's own root object.
-fn verify_volume_root(root: &str, pinned: FileIdentity) -> io::Result<()> {
+pub(crate) fn verify_volume_root(root: &str, pinned: FileIdentity) -> io::Result<()> {
     let mut name = [0u16; 64];
     // The fixed buffer exceeds the 49-unit `\\?\Volume{GUID}\` name.
     succeeded(unsafe {
@@ -2478,7 +2493,13 @@ impl<'a> CheckedLaunchCore<'a> {
         let kind = inputs.plan.kind();
         // ADR 0064: a public-egress plan also stays closed until its patched
         // build, policy custody and route evidence have native qualification.
-        if matches!(kind, PlanKind::StaticWebBoot | PlanKind::PublicEgressBoot) {
+        if matches!(
+            kind,
+            PlanKind::StaticWebBoot
+                | PlanKind::PublicEgressBoot
+                | PlanKind::StaticComposeInstaller
+                | PlanKind::StaticComposeDetached
+        ) {
             return Err(NativeRefusal::NetworkFenceUnverified);
         }
         match (kind, inputs.installer) {

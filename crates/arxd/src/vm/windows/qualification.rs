@@ -31,6 +31,7 @@ pub(crate) use recipe::{
 };
 mod schema;
 mod sink;
+mod static_compose;
 mod test;
 
 pub use paused::{
@@ -1181,6 +1182,15 @@ fn empty_job() -> Result<(), NativeRefusal> {
 fn current_user() -> io::Result<Vec<usize>> {
     let token = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY)?;
     token_data(&token, TokenUser)
+}
+
+pub(crate) fn require_held_private(file: &File) -> io::Result<()> {
+    let user = current_user()?;
+    if sink::held_private(file, user_sid(&user)) {
+        Ok(())
+    } else {
+        Err(io::Error::other("private owner-only permissions required"))
+    }
 }
 
 fn user_sid(data: &[usize]) -> PSID {

@@ -83,10 +83,6 @@ impl RouteSlot {
         }
         Ok(())
     }
-
-    pub(crate) fn loopback_port(&self) -> u16 {
-        arx_guest::compose::loopback_port(self.project_slot, usize::from(self.service_index))
-    }
 }
 
 fn valid_service_name(text: &str) -> bool {

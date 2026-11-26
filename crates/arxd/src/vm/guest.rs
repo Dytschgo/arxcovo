@@ -303,6 +303,7 @@ fn read_error(error: std::io::Error) -> ChannelError {
 pub struct ComposeChannel {
     inner: std::sync::Arc<tokio::sync::Mutex<ComposeChannelInner>>,
     open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    retired: Shutdown,
     generation: u64,
 }
 
@@ -324,6 +325,9 @@ impl ComposeChannel {
         use arx_guest::compose::{
             COMPOSE_CAPABILITIES, COMPOSE_PROTOCOL_VERSION, ComposeRequest, ComposeResponse,
         };
+        if generation == 0 {
+            return Err(ChannelError::Invalid);
+        }
         let mut random = [0; 16];
         getrandom::fill(&mut random).map_err(|_| ChannelError::Io)?;
         let challenge = hex::encode(random);
@@ -356,6 +360,7 @@ impl ComposeChannel {
                 next_id: 1,
             })),
             open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            retired: Shutdown::default(),
             generation,
         })
     }
@@ -369,6 +374,7 @@ impl ComposeChannel {
         Self {
             inner: std::sync::Arc::clone(&self.inner),
             open: std::sync::Arc::clone(&self.open),
+            retired: self.retired.clone(),
             generation: self.generation,
         }
     }
@@ -378,7 +384,13 @@ impl ComposeChannel {
     }
 
     pub(crate) fn is_open(&self) -> bool {
-        self.open.load(std::sync::atomic::Ordering::Acquire)
+        !self.retired.is_cancelled() && self.open.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[allow(dead_code, reason = "called by the Part B exact-boot teardown")]
+    pub(crate) async fn retire(&self) {
+        self.retired.cancel();
+        self.inner.lock().await.transport.take();
     }
 
     pub(crate) async fn exchange(
@@ -393,6 +405,19 @@ impl ComposeChannel {
 
     pub(crate) async fn exchange_until(
         &mut self,
+        cancel: &Shutdown,
+        deadline: Instant,
+        request: impl FnOnce(u32) -> arx_guest::compose::ComposeRequest,
+    ) -> Result<arx_guest::compose::ComposeResponse, ChannelError> {
+        tokio::select! {
+            biased;
+            _ = self.retired.cancelled() => Err(ChannelError::Closed),
+            result = self.exchange_open(cancel, deadline, request) => result,
+        }
+    }
+
+    async fn exchange_open(
+        &self,
         cancel: &Shutdown,
         deadline: Instant,
         request: impl FnOnce(u32) -> arx_guest::compose::ComposeRequest,
@@ -439,6 +464,9 @@ impl ComposeChannel {
         };
         if echo != id {
             return Err(ChannelError::Unexpected);
+        }
+        if self.retired.is_cancelled() {
+            return Err(ChannelError::Closed);
         }
         state.transport = Some(transport);
         guard.1 = false;

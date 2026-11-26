@@ -307,7 +307,7 @@ pub(crate) struct Supervisor {
     /// reaper and any detached close or recovery hold this supervisor, so a
     /// late store write after an unconfirmed result still runs under the
     /// same namespace guarantee. `None` only for in-module fixtures.
-    root_pin: Option<Box<crate::config::RootPin>>,
+    custody: Option<Arc<crate::config::VmCustody>>,
     /// Blocks final recovery until released; see [`tests::Stall`].
     #[cfg(test)]
     stall_recovery: Mutex<Option<tests::StallHook>>,
@@ -335,7 +335,7 @@ impl Supervisor {
     pub(crate) fn open(
         root: &Path,
         mut profile: TestVms,
-        pin: Box<crate::config::RootPin>,
+        custody: Arc<crate::config::VmCustody>,
     ) -> anyhow::Result<Arc<Self>> {
         let reason = if !profile.enabled {
             NativeRefusal::Disabled
@@ -346,6 +346,7 @@ impl Supervisor {
         };
         let policy = profile.policy();
         let recipe = profile.recipe()?;
+        custody.verify()?;
         let mut supervisor = Self::new(
             root,
             policy,
@@ -359,22 +360,15 @@ impl Supervisor {
         )?;
         let state = Arc::get_mut(&mut supervisor)
             .ok_or_else(|| anyhow::anyhow!("VM supervisor shared before open"))?;
-        if let Some(secret_root) = profile.compose_secret_root.as_deref() {
-            #[cfg(all(windows, target_arch = "x86_64"))]
-            {
-                *state
-                    .compose
-                    .secrets
-                    .get_mut()
-                    .map_err(|_| anyhow::anyhow!("Compose custody unavailable"))? = Some(Arc::new(
-                    crate::vm::compose_secrets::Dpapi::new(secret_root, root)?,
-                ));
-            }
-            #[cfg(not(all(windows, target_arch = "x86_64")))]
-            {
-                let _ = secret_root;
-                anyhow::bail!("Compose secret custody requires Windows x64");
-            }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if custody.has_compose_root() {
+            *state
+                .compose
+                .secrets
+                .get_mut()
+                .map_err(|_| anyhow::anyhow!("Compose custody unavailable"))? = Some(Arc::new(
+                crate::vm::compose_secrets::Dpapi::new(custody.clone()),
+            ));
         }
         if !profile.compose_releases.is_empty() {
             let enrollments = profile
@@ -382,9 +376,10 @@ impl Supervisor {
                 .into_iter()
                 .map(compose::ReleaseInput::enroll)
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            custody.verify()?;
             crate::store::vm::compose::enroll(state.controller.compose_store(), &enrollments)?;
         }
-        state.root_pin = Some(pin);
+        state.custody = Some(custody);
         let gate = state
             .gate
             .get_mut()
@@ -457,7 +452,7 @@ impl Supervisor {
             hold: Mutex::new(None),
             #[cfg(test)]
             closed_connections: Default::default(),
-            root_pin: None,
+            custody: None,
             #[cfg(test)]
             stall_recovery: Mutex::new(None),
             #[cfg(test)]
@@ -473,11 +468,18 @@ impl Supervisor {
         }))
     }
 
-    /// The canonical root still denotes the pinned directory.
-    pub(crate) fn verify_root(&self, root: &Path) -> anyhow::Result<()> {
-        match &self.root_pin {
-            Some(pin) => pin.verify(root),
+    /// The configured roots still denote the held directories.
+    pub(crate) fn verify_roots(&self) -> anyhow::Result<()> {
+        match &self.custody {
+            Some(custody) => custody.verify(),
             None => anyhow::bail!("VM state root not pinned"),
+        }
+    }
+
+    pub(crate) async fn wait_for_root_loss(&self) {
+        match &self.custody {
+            Some(custody) => custody.lost().await,
+            None => std::future::pending().await,
         }
     }
 
@@ -807,7 +809,7 @@ impl Drop for Supervisor {
     /// controller would break that; activation must keep this assertion.
     fn drop(&mut self) {
         debug_assert!(
-            self.root_pin.is_none()
+            self.custody.is_none()
                 || std::thread::panicking()
                 || Arc::strong_count(&self.controller) == 1,
             "a VM store user outlived the pinned state root"
@@ -3900,12 +3902,39 @@ pub(crate) mod tests {
         }
     }
 
+    type TickCompletion = Option<tokio::sync::oneshot::Sender<()>>;
+
     /// Injected reaper turns for the supervised runner.
-    pub(super) struct TestTicks(tokio::sync::mpsc::UnboundedReceiver<()>);
+    pub(super) struct TestTicks {
+        requests: tokio::sync::mpsc::UnboundedReceiver<TickCompletion>,
+        completed: TickCompletion,
+    }
+
+    impl TestTicks {
+        fn channel() -> (tokio::sync::mpsc::UnboundedSender<TickCompletion>, Self) {
+            let (send, requests) = tokio::sync::mpsc::unbounded_channel();
+            (
+                send,
+                Self {
+                    requests,
+                    completed: None,
+                },
+            )
+        }
+    }
 
     impl ReaperTick for TestTicks {
         async fn next_tick(&mut self) -> bool {
-            self.0.recv().await.is_some()
+            // The runner requests the next tick after publication and the
+            // blocking custody sweep have both returned.
+            if let Some(completed) = self.completed.take() {
+                let _ = completed.send(());
+            }
+            let Some(completed) = self.requests.recv().await else {
+                return false;
+            };
+            self.completed = completed;
+            true
         }
     }
 
@@ -5618,7 +5647,7 @@ pub(crate) mod tests {
         supervisor: Option<Arc<Supervisor>>,
         endpoint: Endpoint,
         tokens: [String; 2],
-        ticks: tokio::sync::mpsc::UnboundedSender<()>,
+        ticks: tokio::sync::mpsc::UnboundedSender<TickCompletion>,
         trip: Arc<Notify>,
         interrupt: Option<tokio::sync::oneshot::Sender<()>>,
         server: Option<JoinHandle<Result<()>>>,
@@ -5699,8 +5728,8 @@ pub(crate) mod tests {
                 ));
             }
             supervisor.gate.lock().unwrap().fixture = Some(fixture);
-            let (ticks, receiver) = tokio::sync::mpsc::unbounded_channel();
-            *supervisor.ticks.lock().unwrap() = Some(TestTicks(receiver));
+            let (ticks, receiver) = TestTicks::channel();
+            *supervisor.ticks.lock().unwrap() = Some(receiver);
             supervisor.startup_sweep().unwrap();
             let endpoint = Endpoint {
                 #[cfg(unix)]
@@ -5867,7 +5896,16 @@ pub(crate) mod tests {
         }
 
         async fn tick(&self) {
-            self.ticks.send(()).unwrap();
+            self.ticks.send(None).unwrap();
+        }
+
+        async fn tick_and_wait(&self) {
+            let (completed, wait) = tokio::sync::oneshot::channel();
+            self.ticks.send(Some(completed)).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .expect("reaper turn did not complete")
+                .expect("reaper exited before completing the turn");
         }
     }
 
@@ -8128,10 +8166,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "intermittent macOS b2 snapshot barrier shutdown: docs/ROADMAP.md Known issues"
-    )]
     async fn b2_snapshot_barrier_races_busy_unpublish_pending_removal_and_old_origin() {
         use std::sync::atomic::Ordering::SeqCst;
         let mut h = Harness::start_with_web(false, false, true).await;
@@ -10808,7 +10842,9 @@ pub(crate) mod tests {
     }
 
     async fn settle(h: &Harness, a: &Client, vm: &Value) -> Value {
-        h.tick().await;
+        // Publication can report unpublished before the same turn finishes
+        // fencing and reconciling VM custody.
+        h.tick_and_wait().await;
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let row = phase(a, vm).await;
@@ -14999,8 +15035,8 @@ pub(crate) mod tests {
             let temp = crate::service::application::tests::private_temp();
             let supervisor = idle_supervisor(&temp);
             let ticks = reaper.then(|| {
-                let (ticks, receiver) = tokio::sync::mpsc::unbounded_channel();
-                *supervisor.ticks.lock().unwrap() = Some(TestTicks(receiver));
+                let (ticks, receiver) = TestTicks::channel();
+                *supervisor.ticks.lock().unwrap() = Some(receiver);
                 ticks
             });
             let mut stall = Stall::install(if reaper {
@@ -15042,7 +15078,7 @@ pub(crate) mod tests {
             ));
             let call = match &ticks {
                 Some(ticks) => {
-                    ticks.send(()).unwrap();
+                    ticks.send(None).unwrap();
                     None
                 }
                 None => {

@@ -142,6 +142,29 @@ impl ReadDossier {
         selection: &Selection,
         fresh: &Fresh<'_>,
     ) -> Result<(VerifiedEvidence, Vec<File>), RunError> {
+        self.read_with(|seal, length, open| {
+            records::read_native(seal, length, open, selection, fresh)
+        })
+    }
+
+    pub(super) fn read_selected_docker(
+        &self,
+        selection: &records::DockerSelection,
+        fresh: &records::DockerFresh<'_>,
+    ) -> Result<(records::VerifiedDockerEvidence, Vec<File>), RunError> {
+        self.read_with(|seal, length, open| {
+            records::read_native_docker(seal, length, open, selection, fresh)
+        })
+    }
+
+    fn read_with<T>(
+        &self,
+        read: impl FnOnce(
+            &File,
+            u64,
+            &mut dyn FnMut(records::FileKind) -> Result<File, RunError>,
+        ) -> Result<T, RunError>,
+    ) -> Result<(T, Vec<File>), RunError> {
         inventory::binding(&self.0).map_err(|_| RunError::Output)?;
         let open = |name: &str| {
             let file = open_relative(&self.0.leaf, name, Node::File, false, false)
@@ -155,18 +178,12 @@ impl ReadDossier {
         let seal = open("qualification.json")?;
         let length = seal.metadata().map_err(|_| RunError::Output)?.len();
         let mut rows = Vec::with_capacity(records::FileKind::ALL.len() + 1);
-        let verified = records::read_native(
-            &seal,
-            length,
-            |kind| {
-                let name = kind.name();
-                let file = open(&name)?;
-                rows.push(file.try_clone().map_err(|_| RunError::Output)?);
-                Ok(file)
-            },
-            selection,
-            fresh,
-        )?;
+        let verified = read(&seal, length, &mut |kind| {
+            let name = kind.name();
+            let file = open(&name)?;
+            rows.push(file.try_clone().map_err(|_| RunError::Output)?);
+            Ok(file)
+        })?;
         rows.push(seal);
         Ok((verified, rows))
     }

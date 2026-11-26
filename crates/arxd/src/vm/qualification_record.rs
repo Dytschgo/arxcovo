@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
+mod docker;
+pub use docker::{
+    DockerDependencies, DockerFresh, DockerRecipe, DockerSelection, VerifiedDockerEvidence,
+    read_native_docker,
+};
+
 pub type Hash = [u8; 32];
 
 pub const CONTRACT: u16 = 4;
@@ -582,6 +588,34 @@ pub enum Observation {
         script_contained: bool,
         clean_stop: bool,
     },
+    DockerDistribution {
+        manifest: Hash,
+        executable: Hash,
+        receipt: Hash,
+        loaded_artifacts: Hash,
+    },
+    DockerRecipeVerified {
+        recipe: DockerRecipe,
+        restricted_install: bool,
+        detached_health: bool,
+        independent_pair: bool,
+    },
+    DockerPublicIpv4 {
+        policy: Hash,
+        topology: Hash,
+        receiver_controls: bool,
+        public_tcp_udp: bool,
+        nonpublic_denied: bool,
+        ipv6_icmp_denied: bool,
+        route_drift_denied: bool,
+    },
+    DockerInstalledEndpoint {
+        recipe: RecipeIdentity,
+        compose_protocol: u32,
+        exact_pipe_peer: bool,
+        pinned_origin_tls: bool,
+        clean_stop: bool,
+    },
     PausedTrial {
         verified: bool,
     },
@@ -603,6 +637,73 @@ impl Observation {
     pub fn validates(&self, stage: Stage, origin: Origin) -> bool {
         use Observation as O;
         match (stage, self) {
+            (
+                Stage::Distribution,
+                O::DockerDistribution {
+                    manifest,
+                    executable,
+                    receipt,
+                    loaded_artifacts,
+                },
+            ) => {
+                origin == Origin::Native
+                    && [manifest, executable, receipt, loaded_artifacts]
+                        .iter()
+                        .all(|hash| **hash != [0; 32])
+            }
+            (
+                Stage::DockerRecipe,
+                O::DockerRecipeVerified {
+                    recipe,
+                    restricted_install,
+                    detached_health,
+                    independent_pair,
+                },
+            ) => {
+                origin == Origin::Native
+                    && recipe.valid()
+                    && *restricted_install
+                    && *detached_health
+                    && *independent_pair
+            }
+            (
+                Stage::PublicIpv4Network,
+                O::DockerPublicIpv4 {
+                    policy,
+                    topology,
+                    receiver_controls,
+                    public_tcp_udp,
+                    nonpublic_denied,
+                    ipv6_icmp_denied,
+                    route_drift_denied,
+                },
+            ) => {
+                origin == Origin::Native
+                    && *policy != [0; 32]
+                    && *topology != [0; 32]
+                    && *receiver_controls
+                    && *public_tcp_udp
+                    && *nonpublic_denied
+                    && *ipv6_icmp_denied
+                    && *route_drift_denied
+            }
+            (
+                Stage::InstalledGuestEndpoint,
+                O::DockerInstalledEndpoint {
+                    recipe,
+                    compose_protocol,
+                    exact_pipe_peer,
+                    pinned_origin_tls,
+                    clean_stop,
+                },
+            ) => {
+                origin == Origin::Native
+                    && docker::recipe_id_valid(*recipe)
+                    && *compose_protocol == arx_guest::compose::COMPOSE_PROTOCOL_VERSION
+                    && *exact_pipe_peer
+                    && *pinned_origin_tls
+                    && *clean_stop
+            }
             (
                 Stage::Inputs,
                 O::InputPins {
@@ -1408,22 +1509,44 @@ fn selected_seal(
     selection: &Selection,
     fresh: &Fresh<'_>,
 ) -> Result<Seal, RunError> {
-    if seal_bytes.len() > RECORD_LIMIT || digest(seal_bytes) != selection.seal_sha256 {
+    selected_native_seal(
+        seal_bytes,
+        selection.seal_sha256,
+        selection.scope,
+        Class::Test,
+        fresh.now,
+        fresh.boot_marker,
+        fresh
+            .dependencies
+            .complete()
+            .then(|| fresh.dependencies.key(selection.scope)),
+    )
+}
+
+fn selected_native_seal(
+    seal_bytes: &[u8],
+    seal_sha256: Hash,
+    scope: Hash,
+    class: Class,
+    now: Instant2,
+    boot_marker: Hash,
+    dependency_key: Option<Hash>,
+) -> Result<Seal, RunError> {
+    if seal_bytes.len() > RECORD_LIMIT || digest(seal_bytes) != seal_sha256 {
         return Err(RunError::Untrusted);
     }
     let seal: Seal = decode(seal_bytes)?;
     let binding = seal.binding;
     let issued = binding
-        .issued_on_boot(fresh.boot_marker)
+        .issued_on_boot(boot_marker)
         .ok_or(RunError::Untrusted)?;
     if seal.origin != Origin::Native
-        || binding.class != Class::Test
-        || binding.scope != selection.scope
-        || !fresh.dependencies.complete()
-        || !binding.live_at(fresh.now.utc, fresh.dependencies.key(binding.scope))
-        || !clocks_agree(issued, fresh.now)
+        || binding.class != class
+        || binding.scope != scope
+        || !dependency_key.is_some_and(|key| binding.live_at(now.utc, key))
+        || !clocks_agree(issued, now)
         || seal.finished_utc < binding.issued_utc
-        || seal.finished_utc > fresh.now.utc
+        || seal.finished_utc > now.utc
     {
         return Err(RunError::Untrusted);
     }
@@ -1462,6 +1585,7 @@ pub fn check_bundle(
 
 struct BundleRows {
     recipes: Option<TestRecipes>,
+    docker: docker::Rows,
     last_finished_ms: u64,
 }
 
@@ -1505,6 +1629,7 @@ fn bundle_rows(
     let mut windows = None;
     let mut ubuntu_endpoint = None;
     let mut windows_endpoint = None;
+    let mut docker = docker::Rows::default();
     for (slot, stage) in by_position.into_iter().zip(sequence) {
         let record = slot.ok_or(RunError::Incomplete)?;
         if record.contract != CONTRACT
@@ -1523,6 +1648,9 @@ fn bundle_rows(
         }
         when = record.finished_ms;
         previous = digest(&canonical(&record)?);
+        if origin == Origin::Native {
+            docker.observe(class, &record.result)?;
+        }
         match (record.stage, record.result) {
             (
                 Stage::UbuntuRecipe,
@@ -1575,6 +1703,7 @@ fn bundle_rows(
     };
     Ok(BundleRows {
         recipes,
+        docker,
         last_finished_ms: when,
     })
 }

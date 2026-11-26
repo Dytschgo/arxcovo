@@ -163,73 +163,10 @@ pub mod routing {
             if trusted_peer != SLIRP_FORWARD_PEER {
                 return Err(RoutingError::InvalidTrustedPeer);
             }
-            if routes.is_empty() {
-                return Err(RoutingError::EmptyRoutes);
+            validate_routes(zone_name.as_deref(), &routes)?;
+            if routes.iter().any(|route| route.hostname == readiness_host) {
+                return Err(RoutingError::ReadinessHostCollision);
             }
-            if routes.len() > MAX_ROUTES {
-                return Err(RoutingError::TooManyRoutes);
-            }
-            if let Some(zone) = &zone_name
-                && !is_exact_hostname(zone)
-            {
-                return Err(RoutingError::ZoneMismatch);
-            }
-
-            let mut route_slots = BTreeSet::new();
-            let mut ports = BTreeSet::new();
-            let mut project_slots: BTreeMap<&str, u8> = BTreeMap::new();
-            let mut slot_projects: BTreeMap<u8, &str> = BTreeMap::new();
-
-            for (index, route) in routes.iter().enumerate() {
-                if !is_exact_hostname(&route.hostname) {
-                    return Err(RoutingError::InvalidHostname);
-                }
-                if route.hostname == readiness_host {
-                    return Err(RoutingError::ReadinessHostCollision);
-                }
-                if index > 0 && routes[index - 1].hostname >= route.hostname {
-                    return Err(RoutingError::UnsortedOrDuplicateHostname);
-                }
-                if !is_project_id(&route.project_id) {
-                    return Err(RoutingError::InvalidProject);
-                }
-                if !is_service_name(&route.service) {
-                    return Err(RoutingError::InvalidService);
-                }
-                if usize::from(route.project_slot) >= MAX_PROJECTS
-                    || usize::from(route.service_index) >= MAX_SERVICES
-                    || usize::from(route.route_slot) >= MAX_ROUTES
-                {
-                    return Err(RoutingError::SlotOutOfBounds);
-                }
-                if !route_slots.insert(route.route_slot) {
-                    return Err(RoutingError::DuplicateRouteSlot);
-                }
-                if let Some(&existing) = project_slots.get(route.project_id.as_str()) {
-                    if existing != route.project_slot {
-                        return Err(RoutingError::ProjectSlotConflict);
-                    }
-                } else {
-                    project_slots.insert(route.project_id.as_str(), route.project_slot);
-                }
-                if let Some(&existing) = slot_projects.get(&route.project_slot) {
-                    if existing != route.project_id.as_str() {
-                        return Err(RoutingError::ProjectSlotConflict);
-                    }
-                } else {
-                    slot_projects.insert(route.project_slot, route.project_id.as_str());
-                }
-                let port = route.loopback_port();
-                if !(LOOPBACK_MIN..=LOOPBACK_MAX).contains(&port) || !ports.insert(port) {
-                    return Err(RoutingError::PortCollision);
-                }
-            }
-
-            let host_refs: Vec<&str> = routes.iter().map(|r| r.hostname.as_str()).collect();
-            if !share_enrolled_zone(&host_refs, zone_name.as_deref()) {
-                return Err(RoutingError::ZoneMismatch);
-            }
-
             Ok(Self {
                 readiness_host,
                 zone_name,
@@ -241,7 +178,81 @@ pub mod routing {
         pub fn readiness_host(&self) -> &str {
             &self.readiness_host
         }
+    }
 
+    /// Shared validation for owner enrollment and the boot-bound guest table.
+    pub fn validate_routes(
+        zone_name: Option<&str>,
+        routes: &[RouteTarget],
+    ) -> Result<(), RoutingError> {
+        if routes.is_empty() {
+            return Err(RoutingError::EmptyRoutes);
+        }
+        if routes.len() > MAX_ROUTES {
+            return Err(RoutingError::TooManyRoutes);
+        }
+        if let Some(zone) = zone_name
+            && !is_exact_hostname(zone)
+        {
+            return Err(RoutingError::ZoneMismatch);
+        }
+
+        let mut route_slots = BTreeSet::new();
+        let mut ports = BTreeSet::new();
+        let mut project_slots: BTreeMap<&str, u8> = BTreeMap::new();
+        let mut slot_projects: BTreeMap<u8, &str> = BTreeMap::new();
+
+        for (index, route) in routes.iter().enumerate() {
+            if !is_exact_hostname(&route.hostname) {
+                return Err(RoutingError::InvalidHostname);
+            }
+            if index > 0 && routes[index - 1].hostname >= route.hostname {
+                return Err(RoutingError::UnsortedOrDuplicateHostname);
+            }
+            if !is_project_id(&route.project_id) {
+                return Err(RoutingError::InvalidProject);
+            }
+            if !is_service_name(&route.service) {
+                return Err(RoutingError::InvalidService);
+            }
+            if usize::from(route.project_slot) >= MAX_PROJECTS
+                || usize::from(route.service_index) >= MAX_SERVICES
+                || usize::from(route.route_slot) >= MAX_ROUTES
+            {
+                return Err(RoutingError::SlotOutOfBounds);
+            }
+            if !route_slots.insert(route.route_slot) {
+                return Err(RoutingError::DuplicateRouteSlot);
+            }
+            if let Some(&existing) = project_slots.get(route.project_id.as_str()) {
+                if existing != route.project_slot {
+                    return Err(RoutingError::ProjectSlotConflict);
+                }
+            } else {
+                project_slots.insert(route.project_id.as_str(), route.project_slot);
+            }
+            if let Some(&existing) = slot_projects.get(&route.project_slot) {
+                if existing != route.project_id.as_str() {
+                    return Err(RoutingError::ProjectSlotConflict);
+                }
+            } else {
+                slot_projects.insert(route.project_slot, route.project_id.as_str());
+            }
+            let port = route.loopback_port();
+            if !(LOOPBACK_MIN..=LOOPBACK_MAX).contains(&port) || !ports.insert(port) {
+                return Err(RoutingError::PortCollision);
+            }
+        }
+
+        let host_refs: Vec<&str> = routes.iter().map(|r| r.hostname.as_str()).collect();
+        if !share_enrolled_zone(&host_refs, zone_name) {
+            return Err(RoutingError::ZoneMismatch);
+        }
+
+        Ok(())
+    }
+
+    impl RoutingTable {
         pub fn zone_name(&self) -> Option<&str> {
             self.zone_name.as_deref()
         }
