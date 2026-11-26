@@ -7,7 +7,8 @@ use arxd::{
     vm::paths::{FileIdentity, LocalPath},
 };
 use ledger::{
-    Claim, Id, Ledger, LiveLedger, Pair, PairProof, config, digest, id, open, pin_root, safe,
+    Claim, Id, InventorySummary, Ledger, LiveLedger, Pair, PairProof, config, digest, id, open,
+    pin_root, safe,
 };
 use rmcp::{
     RoleClient, ServiceExt, model::CallToolRequestParams, service::RunningService,
@@ -759,7 +760,13 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
             initial.len() == initial_goldens.len() && initial.len() <= 2,
             "isolated_golden_inventory",
         )?;
-        ledger.inventory(&initial_goldens.iter().collect::<Vec<_>>())?;
+        let initial_inventory = ledger.inventory(&initial_goldens.iter().collect::<Vec<_>>())?;
+        check(
+            initial_inventory.generations == initial_goldens.len()
+                && initial_inventory.artifacts == initial_goldens.len() * 2
+                && initial_inventory.leases == initial_goldens.len(),
+            "physical_inventory",
+        )?;
         Ok((initial, ledger.aggregate()?, ledger.metadata_bytes()?))
     })?;
     accept.evidence.record(
@@ -945,34 +952,60 @@ async fn journey(accept: &mut Acceptance<'_>, plan: &Plan, entries: &[Value]) ->
         .record("windows_still_charged", windows_charge.evidence());
     accept.expiry(&w, None, None).await?;
 
-    let (remaining, ledger_bytes) = accept.ledger.read(|ledger| {
-        for (golden, recipe, guest) in [
-            (&ubuntu, &plan.ubuntu, Guest::Ubuntu),
-            (&windows, &plan.windows, Guest::Windows),
-        ] {
-            let (after, charge) = ledger.golden(
-                golden.template,
-                &recipe.recipe_id,
-                &recipe.recipe_sha256,
-                guest.code(),
-            )?;
+    // Retry the entire pinned final scan across a short bounded quiet window
+    // only if an ordinary daemon transaction briefly opens a DELETE-mode
+    // rollback journal during the scan.
+    let mut final_scan = None;
+    for attempt in 0..5 {
+        match accept.ledger.read(|ledger| {
+            for (golden, recipe, guest) in [
+                (&ubuntu, &plan.ubuntu, Guest::Ubuntu),
+                (&windows, &plan.windows, Guest::Windows),
+            ] {
+                let (after, charge) = ledger.golden(
+                    golden.template,
+                    &recipe.recipe_id,
+                    &recipe.recipe_sha256,
+                    guest.code(),
+                )?;
+                check(
+                    after == golden.pair
+                        && charge == golden.charge
+                        && ledger.inspect(&after, None, true)? == golden.proof,
+                    "golden_unchanged",
+                )?;
+            }
+            check(ledger.goldens()?.len() == 2, "isolated_golden_inventory")?;
+            for retired_pair in [&u.pair, &w.pair, &old, &snapshot] {
+                check(ledger.gone(retired_pair)?, "retired_generation_absent")?;
+            }
+            ledger.quiet()?;
+            let inventory = ledger.inventory(&[&ubuntu.pair, &windows.pair])?;
             check(
-                after == golden.pair
-                    && charge == golden.charge
-                    && ledger.inspect(&after, None, true)? == golden.proof,
-                "golden_unchanged",
+                inventory.generations == 2 && inventory.artifacts == 4 && inventory.leases == 2,
+                "physical_inventory",
             )?;
+            Ok((ledger.aggregate()?, ledger.metadata_bytes()?, inventory))
+        }) {
+            Ok(measured) => {
+                final_scan = Some(measured);
+                break;
+            }
+            Err(Failure::Check("unsettled_ledger_sidecar")) if attempt < 4 => {
+                sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => return Err(error),
         }
-        ledger.quiet()?;
-        ledger.inventory(&[&ubuntu.pair, &windows.pair])?;
-        Ok((ledger.aggregate()?, ledger.metadata_bytes()?))
-    })?;
+    }
+    let (remaining, ledger_bytes, final_inventory) =
+        final_scan.ok_or(Failure::Check("unsettled_ledger_sidecar"))?;
     check(
         remaining == ubuntu.charge + windows.charge,
         "remaining_charges",
     )?;
     accept.evidence.record("final_ledger",json!({"goldens_unchanged":true,"golden_charged_bytes":remaining,
         "golden_allocated_bytes":ubuntu.proof.allocated.iter().chain(windows.proof.allocated.iter()).sum::<u64>(),
+        "golden_leases":final_inventory.leases,
         "non_golden_charged_bytes":0,"unattributed_media":0,"ledger_bytes":ledger_bytes}));
     accept.correlate().await
 }
@@ -1247,7 +1280,14 @@ async fn foreground_opens_enrolled_state_through_the_stable_volume_path() {
         Ok(())
     );
     let live = LiveLedger::open(&state, &expected).unwrap();
-    assert_eq!(live.read(|ledger| ledger.inventory(&[])), Ok(()));
+    assert_eq!(
+        live.read(|ledger| ledger.inventory(&[])),
+        Ok(InventorySummary {
+            generations: 0,
+            artifacts: 0,
+            leases: 0,
+        })
+    );
 }
 
 #[tokio::test]

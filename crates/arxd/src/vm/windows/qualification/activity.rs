@@ -105,9 +105,11 @@ pub(super) fn local_sample(owner_session: u32) -> Option<LocalSample> {
         cbSize: size_of::<LASTINPUTINFO>() as u32,
         dwTime: 0,
     };
-    if unsafe { GetLastInputInfo(&mut input) } == 0
-        || unsafe { WTSGetActiveConsoleSessionId() } != session
-    {
+    let sampled = {
+        let _host_station = super::super::desktop::host_station().ok()?;
+        unsafe { GetLastInputInfo(&mut input) }
+    };
+    if sampled == 0 || unsafe { WTSGetActiveConsoleSessionId() } != session {
         return None;
     }
     Some(LocalSample {

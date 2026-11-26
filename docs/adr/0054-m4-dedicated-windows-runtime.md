@@ -77,6 +77,10 @@ Before resuming, the supervisor checks the held child, its Job membership,
 and the dedicated token policy, including account, integrity, logon identity,
 groups, privileges and default DACL.
 
+Every restricted launch starts detached on a fresh private desktop of the
+non-visible logon-session station. See the
+[2026-11-26 launch-desktop amendment](#amendment-2026-11-26--private-non-interactive-desktop-for-vm-launches).
+
 The guest connection targets a fresh local pipe basename and the fixed
 `org.arxcovo.agent.0` virtio-serial port. The parent starts draining stdio,
 resumes the process for device initialization, and connects the serial
@@ -1528,3 +1532,341 @@ unidentified leaf. The chunk 04 start refusal keeps its original lease. The
 binding it carries is this durable scope. Production TEST admission stays
 closed. Native creation and reconciliation are **unverified on real
 hardware**.
+
+## Amendment 2026-11-26 — Private non-interactive desktop for VM launches
+
+Paused trials 8 and 9 lost QEMU during Windows process initialization. The
+child exited with `STATUS_DLL_INIT_FAILED` (0xC0000142), and the greeting
+read saw EOF before any QMP byte. Two independent diagnoses found three
+separate causes:
+
+1. `CREATE_NO_WINDOW` gives the child a hidden console, which needs a
+   conhost child process. `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`
+   blocks that process, so console initialization fails.
+2. A child that imports USER32 cannot initialize on the inherited
+   `WinSta0\Default` desktop under the write-restricted token. The token's
+   restricting set contains only the account SID, which cannot write there.
+3. `bcrypt.dll` initialization opens `\Device\KsecDD` for write. That device
+   grants write to Everyone and not to the account SID, so the restricted
+   pass denies it. arxd's own test image imports bcrypt. The pinned QEMU
+   11.1.3 bundle does not.
+
+### Launch shape
+
+The shared launcher is used by every restricted purpose: the paused trial,
+the installer boot, the installed boot, `qemu-img` helpers, and the static
+and Docker native boots once they are admitted. For each launch it:
+
+- uses `DETACHED_PROCESS` instead of `CREATE_NO_WINDOW`. The child has no
+  console, and QMP stays on the three inherited stdio pipes.
+- obtains the logon-session station with
+  `CreateWindowStationW(NULL, 0, WINSTA_CREATEDESKTOP | WINSTA_READATTRIBUTES | READ_CONTROL, …)`.
+  This works on fresh and existing logons without Administrators. Creating
+  a named private station would require Administrators. The launcher reads
+  the station back and refuses unless it is non-visible (`WSF_VISIBLE` clear),
+  is not `WinSta0`, and has the exact `Service-0x<hi>-<lo>$` name of the VM
+  token's authentication LUID. It reads the station's owner and DACL for the
+  log, but **never modifies an existing station's security**. The descriptor
+  passed to the call applies only when Windows creates the station on a fresh
+  logon and is built separately from the desktop descriptor with station-specific
+  rights: protected DACL (`SE_DACL_PROTECTED`), owner = account, deny NETWORK
+  (`0x000f037f`), allow account (`0x00020024`: `READ_CONTROL`,
+  `WINSTA_ACCESSCLIPBOARD`, `WINSTA_ACCESSGLOBALATOMS`), allow OWNER RIGHTS
+  (`S-1-3-4`, `READ_CONTROL`), allow logon SID (`0x0002012f`: `READ_CONTROL`,
+  `WINSTA_ENUMDESKTOPS`, `WINSTA_READATTRIBUTES`, `WINSTA_ACCESSCLIPBOARD`,
+  `WINSTA_CREATEDESKTOP`, `WINSTA_ACCESSGLOBALATOMS`, `WINSTA_ENUMERATE`), and
+  allow SYSTEM (`0x000f037f`). That denies the restricted child
+  `WINSTA_CREATEDESKTOP`, `WINSTA_WRITEATTRIBUTES`, `WINSTA_EXITWINDOWS`,
+  `WINSTA_READSCREEN`, `DELETE`, `WRITE_DAC`, and `WRITE_OWNER` while letting
+  the unrestricted launcher create and verify private desktops.
+- creates a fresh desktop `Arxcovo-<128 random bits>` on that station with
+  desired handle access `DESKTOP_CREATEWINDOW | READ_CONTROL` (`0x00020002`).
+  Its protected DACL (`SE_DACL_PROTECTED`) has owner = account and exactly four
+  entries:
+  - deny NETWORK: `0x000f01ff` (all desktop rights);
+  - allow account: `0x00020083` (`READ_CONTROL | DESKTOP_READOBJECTS | DESKTOP_CREATEWINDOW | DESKTOP_WRITEOBJECTS`), the measured minimal startup mask;
+  - allow OWNER RIGHTS (`S-1-3-4`): `READ_CONTROL` (`0x00020000`), capping implicit owner rights so ownership by the account SID cannot be used to obtain `WRITE_DAC`;
+  - allow SYSTEM: `0x000f01ff` (all desktop rights).
+  Each bit of `0x00020083` was measured against the restricted QEMU-shaped peer
+  with the pinned DLLs: removing `DESKTOP_READOBJECTS` (`0x0001`) or
+  `DESKTOP_WRITEOBJECTS` (`0x0080`) fails `user32.dll` initialization with
+  `0xC0000142`; removing `DESKTOP_CREATEWINDOW` (`0x0002`) fails `CoInitialize`
+  and `CreateDesktopW`; `READ_CONTROL` (`0x00020000`) allows read-only security
+  inspection matching the OWNER RIGHTS ceiling. Surplus rights
+  (`DESKTOP_HOOKCONTROL`, `WRITE_DAC`, `WRITE_OWNER`, `DELETE`,
+  `DESKTOP_CREATEMENU`, `DESKTOP_JOURNALRECORD`, `DESKTOP_JOURNALPLAYBACK`,
+  `DESKTOP_ENUMERATE`, `DESKTOP_SWITCHDESKTOP`) are omitted and verified denied
+  inside the restricted child. The launcher reads the owner, protection flag
+  and exact four entries back from the returned handle, and refuses on any
+  mismatch.
+- passes the explicit `<station>\<desktop>` path as `lpDesktop`.
+- holds the station and desktop handles with the child, its Job and any
+  partial-create residue until the child settles. On normal exit and every
+  error path where station/desktop restoration succeeds, both handles close
+  when the lease drops, so the desktop is destroyed once the child is gone.
+
+`CreateDesktopW` creates the desktop on the process's current station, so
+the launcher temporarily switches the process station. A daemon-wide mutex
+serializes the switch, the desktop creation and the restore. An RAII guard
+restores the original station and thread desktop and reads both back. If
+the restore fails, the guard poisons the lock state, and every later launch
+and every owner last-input sample is refused. That fails closed. Windows
+refuses `CloseWindowStation` on a handle still assigned as the process window
+station (and `CloseDesktop` on any still-assigned thread desktop handle); on
+that terminal restore-failure path, the newly created unattached desktop closes
+immediately while the still-assigned station handle remains alive until daemon
+process exit, with the health fence blocking all further launches.
+
+### USER32 audit of arxd
+
+arxd creates no windows, hooks, message loops or clipboard owners. Its direct
+Windows UI-adjacent calls are:
+
+- `GetLastInputInfo`, for the owner-activity sample. It runs under the same
+  mutex, so it never observes the switched station.
+- `SHGetKnownFolderPath` and `CommandLineToArgvW` in shell32. These are pure
+  helpers with no station state.
+- `SetConsoleCtrlHandler` in the dashboard password prompt. This is
+  console-scoped kernel32.
+- The station and desktop calls of this launcher.
+
+The tray is a separate process. No other thread depends on the process
+station during the switch.
+
+### Containment
+
+Containment is unchanged or stronger. The token remains
+`DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED` with the restricting set exactly
+`{account}`. Everyone and Authenticated Users were **not** added. The child
+loses access it previously could have attempted: it no longer shares the
+owner's interactive desktop, and it cannot open `WinSta0\Default` (denied for
+read, enumerate, write, hook, create-window and `MAXIMUM_ALLOWED`), call
+`OpenInputDesktop`, or allocate its own console. On its own private desktop,
+the child receives only `0x00020083` with an OWNER RIGHTS (`S-1-3-4`)
+`READ_CONTROL` ceiling, denying `DESKTOP_HOOKCONTROL`, `WRITE_DAC`,
+`WRITE_OWNER`, `DELETE`, and other surplus desktop rights. The job, mitigation,
+child-process and handle-list attributes are unchanged.
+
+**Window station access is separate from interactive desktop isolation.**
+Under the current-user logon session, a restricted child can still open and
+assign `WinSta0` itself, including permission checks for
+`WINSTA_ACCESSCLIPBOARD` and `WINSTA_ACCESSGLOBALATOMS`, and the shared
+non-interactive `Service-0x<hi>-<lo>$` station's clipboard and global atoms are
+likewise station-scoped across non-interactive processes in the owner's logon
+session. Interactive desktop denial and private-desktop startup placement
+**do not prove station-resource isolation** (clipboard or global atoms); that
+remains a known limitation inside the existing current-user trust boundary of
+the enrolled PC. Similarly, a sibling VM child shares the account SID,
+restricting SID and integrity level, so it can open another launch's desktop
+with the same minimal `0x00020083` mask (without `DESKTOP_HOOKCONTROL` or
+`WRITE_DAC`). Distinct desktops prevent accidental sharing and bind cleanup to
+each launch. Stronger separation is future work. It needs a per-launch
+restricting principal, such as a per-launch SID in the restricting set and the
+desktop, workspace and pipe DACLs.
+
+### bcrypt and KsecDD rule
+
+A VM child must not load `bcrypt.dll`, or any other component that opens
+`\Device\KsecDD` or `\Device\CNG` for write. The write-restricted token is
+denied `FILE_WRITE_DATA` on both devices. Their DACLs grant write only to
+Everyone among the token's identities. A static import fails the process
+with 0xC0000142 before the entry point.
+
+The pinned QEMU 11.1.3 `qemu-system-x86_64.exe`, `qemu-img.exe` and their
+16 DLLs reference bcrypt neither statically nor by delay load. Their RNG
+path uses CryptoAPI through cryptsp and rsaenh. A future bundle that pulls
+in bcrypt must either be refused or come with a reviewed token change. A
+held-inventory check that refuses PE import closures naming `bcrypt.dll` or
+`ncrypt.dll` is a later hardening item. It needs an import-table reader at
+the held-inventory edge, so it is not part of this amendment. If a
+production image ever genuinely needs bcrypt, adding Everyone to the
+restricting set is the known remedy. That is a containment change and
+requires its own security review.
+
+### Verification
+
+The integrated Windows test drives the production `Launch::Paused` path:
+the restricted owner token, the Job, the policies, the handle list, the
+private desktop, `DETACHED_PROCESS`, the checked resume and the
+`start_output` bridge. It drives that path with three compiled peers:
+
+- a kernel32-only peer;
+- a bare USER32 peer;
+- a QEMU-shaped peer, with the pinned system imports, CryptoAPI, Winsock,
+  COM, multimedia timers, the read-only WHPX capability query, and
+  optionally the pinned DLL copies.
+
+Each peer greets, acknowledges `qmp_capabilities`, stays live and exits
+cleanly. The USER32 and QEMU-shaped peers also prove their station is
+non-visible, that they cannot open the interactive desktop or call
+`OpenInputDesktop`, and that their own private desktop denies
+`DESKTOP_HOOKCONTROL`, `WRITE_DAC`, `WRITE_OWNER`, `DELETE`,
+`DESKTOP_CREATEMENU`, `DESKTOP_JOURNALRECORD`, `DESKTOP_JOURNALPLAYBACK`,
+`DESKTOP_ENUMERATE`, `DESKTOP_SWITCHDESKTOP`, and `SetUserObjectSecurity`.
+
+The negative controls each change one variable and end with 0xC0000142 and
+`ERROR_BROKEN_PIPE`:
+
+- `CREATE_NO_WINDOW` on the private desktop;
+- an explicit `WinSta0\Default`;
+- a peer that statically imports bcrypt, under the full production launch.
+
+Two concurrent launches on separate OS threads contend on the daemon-wide
+station mutex via a pre-create barrier and overlap via a pre-resume barrier;
+they receive distinct desktops on the verified station. The launcher's station
+is restored afterwards, an existing station's owner and DACL are observed
+without creating the station ahead of the launcher and remain identical before
+and after, and each desktop is gone after settlement. Unit tests refuse a
+visible or foreign station, a desktop descriptor mismatch (including full-mask
+or missing OWNER RIGHTS), verify the production first-create station descriptor
+and its `AccessCheck` behavior for launcher and restricted child, and refuse
+every launch after a failed restore.
+
+Real QEMU startup and **WHPX partition creation under this token are
+unverified on real hardware**. `vid.dll` opens `\Device\VidExo` with
+`GENERIC_READ` only, which the token is granted. vid.sys could still apply
+its own write-type check to partition IOCTLs. Paused trial 10 exercises this
+path. If it fails with `E_ACCESSDENIED`, the narrowest known remedy is a
+reviewed restricting-set change.
+
+## 7c amendment — resumable TEST disposal through the lease and directory
+
+Native TEST disposal reuses the v16 `disposal` columns from
+[ADR 0072](0072-vm-store-v16-native-test-custody.md) without adding a new
+migration. Both transient-build disposal (removing the primary `seed` leaf and
+the verification generation before `publish_build`) and the ordinary reaper
+sweep share one typed disposal boundary (`DisposalScope` / `NativeDisposal`).
+
+Every deletion requires durable typed TEST provenance (`vm_native_generations`
+and `vm_native_slots` for the current store host and protocol 1) and scoped
+handle custody:
+
+- **Parent-relative delete open.** Existing `PathPin` and `open_relative` pins
+  omit `FILE_SHARE_DELETE` (preserving the #353 delete-sharing contract).
+  Disposal uses `open_relative_delete` over the same `nt_open_relative`
+  primitive with `FILE_GENERIC_READ | READ_CONTROL | DELETE`, `share = 0`,
+  `FILE_OPEN_REPARSE_POINT` and `OBJ_DONT_REPARSE`, then marks the verified
+  handle with `delete_on_close`. Any competing reader, writer or deleter fails
+  the open with a sharing violation and leaves the object untouched and
+  charged.
+- **Per-slot intent and absence semantics.** Under the held bound workspace,
+  disposal validates the exact leaf identity, stored case, private ACL and
+  `WorkspaceCustody`, commits durable `vm_native_slots.disposal = 'intended'`
+  while still holding the exclusive delete handle, unlinks via that handle,
+  verifies `NotFound` through the same bound parent and name (`observe` with
+  type-agnostic `probe_relative`), and commits `disposal = 'absent'`. On retry
+  or restart, a still-present exact match is retried; a replacement (wrong file
+  ID, wrong node kind, reparse point, hard link, or wrong case/ACL) is
+  quarantined and never deleted. Prior absence is accepted **only** under an
+  exact durable `disposal = 'intended'` checkpoint or a separately proved
+  uncreated reservation (`NeverAttempted` / `Intended -> Absent` with zero
+  identified artifacts and observed `NotFound` under the held parent).
+- **Lease/directory cleanup guard.** Once all slots of a disposed generation
+  are durably absent and bounded handle enumeration (`listing_bounded`) proves
+  `generation.lease` is the sole entry in the generation directory, disposal
+  acquires an in-process per-generation guard (`GenerationGuards`), commits
+  `vm_native_generations.disposal = 'lease'` (durably closing `bound()` and
+  `vm_native_slot_scope` while `vm_native_disposal_order` enforces zero
+  remaining slots), and only then closes the lease handle while keeping the
+  generation directory and enrolled production root pinned. It opens
+  `generation.lease` via `open_relative_delete`, re-verifies identity, case,
+  zero length, private ACL, lock and sole-entry status, deletes it by handle,
+  confirms absence and an empty directory, and commits `disposal = 'directory'`.
+  It then closes the generation directory handle while keeping the enrolled
+  production root and generation guard held, opens the exact generation
+  directory via `open_relative_delete`, re-verifies identity, case, private ACL
+  and empty listing, deletes it by handle, confirms final absence through the
+  held production root, and commits `disposal = 'absent'`. On retry or restart,
+  every resumed `'lease'` or `'directory'` deletion first re-commits the
+  idempotent `intend_lease_disposal` or `intend_directory_disposal` transition
+  so the current `DisposalScope` is re-checked immediately before each handle
+  delete. Unexpected extra siblings refuse before lease deletion and before
+  directory deletion.
+- **Settlement and authority fences.** Final ledger settlement (`settle_cleanup`,
+  `forget_generation` and `publish_build`) revalidates the work and durable
+  `disposal = 'absent'` proof before freeing eligible claims or removing native
+  rows. Recovery-only work, retained active pairs and release-only expiry carry
+  no deletion permit. Static VMs, static roles (`static_disk`, `static_vars`),
+  sealed goldens, backups, foreign objects and legacy rows without native
+  provenance stay outside native deletion authority. Production TEST admission
+  remains closed. Native disposal and empty-workspace cleanup are **unverified
+  on real hardware**.
+
+## 7c amendment — native golden and retired acceptance inventory
+
+The M4 owner-acceptance reader (`crates/arxd/tests/m4_acceptance/ledger.rs` and
+`owner.rs`) aligns with store v16 native custody ([ADR 0072](0072-vm-store-v16-native-test-custody.md))
+and chunk 07 resumable disposal without adding a schema migration or extending
+the public MCP surface:
+
+- **Exact generation and lease inventory.** Quiet preflight and final scans
+  compare the exact expected generation directory set against the selected
+  sealed TEST goldens using bounded handle enumeration before opening
+  unexpected entries. Empty, extra, or lease-only directories are never waived.
+  The root allowlist (`activity.sqlite3`, `activity.lock`, `vault.sqlite3`,
+  `vault.lock`, `vault.sqlite3-journal`), activity sidecar guards, pair
+  byte/SHA-256/qcow2-lineage/charge proofs, and pinned enrolled store binding
+  remain intact. Each native-bound golden counts exactly one `generation.lease`
+  separately from its `disk-<key>` and `vars-<key>` leaves, opened relative to
+  the held generation directory and verified for exact stored case, private
+  owner-only ACL, zero length, single link, no reparse point, matching store
+  volume/production/directory/lease IDs, and a bounded quiescent exclusive open
+  and nonblocking `try_lock`.
+- **Physical retirement proof.** `Ledger::gone` confirms both ledger absence
+  (`vm_generations`, `vm_artifacts`, `vm_native_generations`, `vm_native_slots`)
+  and physical absence of the retired generation directory, its
+  `generation.lease`, and its media leaves through the held production root
+  handle, paired with the existing claim and reconciliation/expiry checks.
+- **Historic row discrimination.** Pre-7c golden rows without
+  `vm_native_generations` / `vm_native_slots` rows and `generation.lease` are
+  explicitly separated from native custody. Read-only historic observation
+  exists only in tests (`observe_historic_preflight` in
+  `crates/arxd/tests/m4_acceptance/ledger.rs`), cannot satisfy native preflight
+  or acceptance eligibility, and never binds silently. Moving onto native
+  custody requires a checked rebuild or re-enrollment into a clean enrolled v16
+  store as documented in [M4 owner-host acceptance](../m4-acceptance.md).
+  Production TEST admission stays closed and the physical owner-host journey
+  remains **unverified on real hardware**.
+
+### Restart release and owner-local reconciliation (7c chunk 08)
+
+The ordinary and vault sweeps share a release-only turn for an unresolved
+native TEST writer epoch. A current worker gets one bounded retry through its
+own Job. The reaper reads the ledger again after that attempt. A stop response
+alone cannot settle release or authorize disposal. A failed proof leaves the
+charge and claim in place and retries on the existing monotonic backoff.
+
+Store v17 adds a writer checkpoint to the v16 generation, origin and slot
+checkpoints. A native production create records the exact writer epoch,
+physical database and lock file identities, and kernel boot marker before
+calling the checked Windows creation path. That path creates a sole-owned,
+unnamed, non-inheritable kill-on-close Job, passes the Job at suspended creation,
+and transfers ownership with the child and stdio workers. Helper and installer
+launches use the same edge. Errors after creation retain the Job for teardown,
+and process loss closes its sole handle. A create-edge intent still uses dirty
+release if creation did not complete. An older generation with no checkpoint
+cannot acquire evidence from a PID, the current build version, or a dossier.
+
+After restart the runtime fences the subject against new worker registration.
+The issuer and both sweep routes share one generation guard set per supervisor.
+The sweep checks the exact locked store and pinned root, the prior Job protocol
+and same kernel boot, the current claim and epoch, and the exact workspace and
+lease. It takes both writer exclusions together and holds them and the lease
+while it commits the observed bytes to the existing release transaction. An
+unresolved start without a proved Job checkpoint stays charged. A clean
+release still requires the existing held never-created proof and unchanged
+bytes. Failed build, clone and copy work also requires worker quiescence and
+staging provenance before checked disposal. A new boot or a stale or absent
+qualification selection grants no launch authority. Offline observation opens
+only the held production store and workspace. It does not read the dossier.
+
+If provenance or custody is ambiguous, the owner may quiesce the supervisor
+through its ordinary drain, verify the enrolled store and root locally and
+inspect the affected generation and lease under a bounded maintenance window.
+Use an exact held release or disposal proof through the same transaction and
+scheduler only when the missing evidence can be established independently.
+If that proof is unavailable at the cutoff, keep the claim and all artifacts
+fenced for owner recovery. The path provides no PID adoption, manual ledger
+edits, pathname deletion, or additional agent deletion tool. Native recovery
+is **unverified on real hardware**. Production TEST effect admission remains
+closed until the final issuer installation.

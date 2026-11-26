@@ -2,7 +2,7 @@
 // The VM decoder accepts null for metadata that older catalogs did not record.
 // The session lives in an httpOnly cookie the page cannot read; the CSRF token
 // lives only in this object's memory and is sent on every unsafe request.
-import { decodeActivityPage, decodeHost, decodeHosts, decodeSession, decodeVm, decodeVms, isIsoInstant, isValidId } from './decode';
+import { decodeActivityPage, decodeCpuHistory, decodeCpuHistoryBatch, decodeHost, decodeHosts, decodeSession, decodeVm, decodeVms, isIsoInstant, isValidId } from './decode';
 import { Emitter } from './emitter';
 import {
   ACTIVITY_OUTCOMES,
@@ -16,6 +16,9 @@ import {
   type ConsoleStatus,
   type ConsoleStream,
   type Credentials,
+  CPU_HISTORY_RANGES,
+  type CpuHistory,
+  type CpuHistoryRange,
   type Host,
   type Session,
   STREAM_CLOSE_CODES,
@@ -289,6 +292,20 @@ export class HttpApi implements ArxApi {
 
   async getHost(id: string): Promise<Host> {
     return decodeHost(await this.request('GET', `${API_PREFIX}/hosts/${pathId(id)}`));
+  }
+
+  async getCpuHistory(hostId: string, range: CpuHistoryRange): Promise<CpuHistory> {
+    if (!Object.hasOwn(CPU_HISTORY_RANGES, range)) throw new ApiError('invalid_request', 'Invalid CPU history range.');
+    const history = decodeCpuHistory(await this.request('GET', `${API_PREFIX}/hosts/${pathId(hostId)}/cpu-history?range=${range}`));
+    if (history.hostId !== hostId || history.range !== range) {
+      throw new ApiError('bad_response', 'CPU history did not match the requested host and range.');
+    }
+    return history;
+  }
+
+  async listCpuHistory(range: '24h'): Promise<CpuHistory[]> {
+    if (range !== '24h') throw new ApiError('invalid_request', 'The CPU history batch requires a 24h range.');
+    return decodeCpuHistoryBatch(await this.request('GET', `${API_PREFIX}/hosts/cpu-history?range=${range}`));
   }
 
   async listActivity(query: ActivityQuery = {}): Promise<ActivityPage> {

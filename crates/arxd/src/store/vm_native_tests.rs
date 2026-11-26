@@ -83,6 +83,83 @@ fn dump(db: &Connection) -> Result<Vec<String>> {
     Ok(rows)
 }
 
+const DROP_V17: &str = "
+DROP TRIGGER vm_native_writer_reservation;
+DROP TABLE vm_native_writer;
+";
+
+fn assert_v17_writer_schema(db: &Connection) -> Result<()> {
+    assert_eq!(count(db, "PRAGMA user_version", [])?, 17);
+    assert_eq!(
+        count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?,
+        0
+    );
+    let mut statement = db.prepare(
+        "SELECT type||':'||name,sql FROM sqlite_schema
+         WHERE name GLOB 'vm_native_writer*' ORDER BY 1",
+    )?;
+    let compiled = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert_eq!(compiled.len(), 2);
+    for ((name, sql), expected) in compiled.iter().zip([
+        "table:vm_native_writer",
+        "trigger:vm_native_writer_reservation",
+    ]) {
+        assert_eq!(name, expected);
+        assert_eq!(
+            recovery::MIGRATE_V17.matches(sql.as_str()).count(),
+            1,
+            "{name}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn v17_upgrade_preserves_v16_custody_without_inventing_writer_provenance() -> Result<()> {
+    let dir = private_temp();
+    let store = VmStore::open(dir.path(), NOW)?;
+    let (scope, slot, observed) = store.transact(|db| {
+        let slot = build(db, 1)?.seed;
+        let scope = scope(slot.generation);
+        bind(db, scope)?;
+        intend_slot(db, scope, slot)?;
+        let observed = evidence(10, scope, b"seed");
+        identify_slot(db, scope, slot, observed.identity)?;
+        verify_slot(db, scope, slot, observed)?;
+        assert_eq!(count(db, "SELECT count(*) FROM vm_native_writer", [])?, 1);
+        Ok((scope, slot, observed))
+    })?;
+    drop(store);
+
+    let db = open_sqlite(&dir.path().join("activity.sqlite3"))?;
+    db.execute_batch(DROP_V17)?;
+    db.pragma_update(None, "user_version", 16)?;
+    drop(db);
+
+    for _ in 0..2 {
+        let store = VmStore::open(dir.path(), NOW)?;
+        store.transact(|db| {
+            assert_v17_writer_schema(db)?;
+            assert!(bound(db, scope)?);
+            assert_eq!(
+                leaf(db, slot)?,
+                Leaf::Verified(observed.identity.file, observed.pin)
+            );
+            assert_eq!(
+                count(db, "SELECT count(*) FROM vm_native_generations", [])?,
+                1
+            );
+            assert_eq!(count(db, "SELECT count(*) FROM vm_native_writer", [])?, 0);
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 #[test]
 fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
     let dir = private_temp();
@@ -100,9 +177,10 @@ fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
         Ok(slots)
     })?;
     drop(store);
-    // Recovery is idempotent: settle it at v16 before taking the baseline.
+    // Run recovery once before taking the baseline for the upgrade.
     let before = VmStore::open(dir.path(), NOW)?.transact(|db| dump(db))?;
     let db = open_sqlite(&dir.path().join("activity.sqlite3"))?;
+    db.execute_batch(DROP_V17)?;
     db.execute_batch(
         "DROP TRIGGER vm_native_artifact_identity;
          DROP TABLE vm_native_slots; DROP TABLE vm_native_generations;
@@ -112,7 +190,7 @@ fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
 
     let store = VmStore::open(dir.path(), NOW)?;
     store.transact(|db| {
-        assert_eq!(count(db, "PRAGMA user_version", [])?, 16);
+        assert_v17_writer_schema(db)?;
         assert_eq!(dump(db)?, before);
         assert_eq!(
             count(
@@ -123,14 +201,12 @@ fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
             )?,
             0
         );
-        assert_eq!(
-            count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?,
-            0
-        );
-        // The exact compiled v16 objects.
+        assert_eq!(count(db, "SELECT count(*) FROM vm_native_writer", [])?, 0);
+        // The exact compiled v16 objects, independent of the v17 additions.
         let mut statement = db.prepare(
             "SELECT type||':'||name FROM sqlite_schema
-             WHERE name GLOB 'vm_native_*' OR name='vm_artifact_slot' ORDER BY 1",
+             WHERE (name GLOB 'vm_native_*' AND name NOT GLOB 'vm_native_writer*')
+                OR name='vm_artifact_slot' ORDER BY 1",
         )?;
         let objects = statement
             .query_map([], |row| row.get::<_, String>(0))?
@@ -154,7 +230,8 @@ fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
         // changed constraint, foreign key or trigger body fails here.
         let mut statement = db.prepare(
             "SELECT name,sql FROM sqlite_schema
-             WHERE (name GLOB 'vm_native_*' OR name='vm_artifact_slot') AND sql IS NOT NULL",
+             WHERE ((name GLOB 'vm_native_*' AND name NOT GLOB 'vm_native_writer*')
+                 OR name='vm_artifact_slot') AND sql IS NOT NULL",
         )?;
         let compiled = statement
             .query_map([], |row| {

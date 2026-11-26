@@ -99,7 +99,7 @@ impl ProductionWorkspace {
 /// A bounded, type-agnostic, no-follow observation of one name through the
 /// held parent. Only an exact `NotFound` is absence. Any opened object is
 /// present. Its identity is reported only when it is the expected kind.
-fn observe(parent: &File, name: &str, node: Node) -> Result<Presence, Q> {
+pub(super) fn observe(parent: &File, name: &str, node: Node) -> Result<Presence, Q> {
     match probe_relative(parent, name) {
         Ok(object) => Ok(Presence::Present(
             file_identity(&object, node == Node::Directory)
@@ -172,7 +172,7 @@ pub(crate) struct LedgerCheckpoints<'a> {
     pub origin: native::Origin,
 }
 
-fn scope(binding: WorkspaceBinding) -> native::Scope {
+pub(super) fn scope(binding: WorkspaceBinding) -> native::Scope {
     native::Scope {
         generation: binding.generation,
         production: binding.production,
@@ -561,6 +561,10 @@ impl ReleasedGeneration<'_> {
 }
 
 impl TestRelease<'_> {
+    pub(super) fn observed(&self) -> &native::release::Observed {
+        &self.observed
+    }
+
     pub(crate) fn commit(
         &self,
         store: &crate::store::vm::VmStore,

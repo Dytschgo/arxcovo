@@ -79,7 +79,7 @@ fn clone_pair(fixture: &Fixture) -> Result<(ProductionWorkspace, PairSlots, [Fil
     Ok((ws, slots, evidence.map(|file| file.identity)))
 }
 
-fn proof<'a>(
+pub(super) fn proof<'a>(
     ws: &'a ProductionWorkspace,
     slots: PairSlots,
     ids: [FileIdentity; 2],

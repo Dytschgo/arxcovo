@@ -513,6 +513,29 @@ fn cleanup_authority(db: &Connection, vm: Id, generation: Id) -> Result<Option<C
     ).optional()?)
 }
 
+pub(super) fn test_disposal_authorized(db: &Connection, vm: Id, generation: Id) -> Result<bool> {
+    let Some(authority) = cleanup_authority(db, vm, generation)? else {
+        return Ok(false);
+    };
+    if authority.is_static {
+        return Ok(false);
+    }
+    if authority.phase == "copy" {
+        let Some(activity) = authority.activity else {
+            return Ok(false);
+        };
+        if count(
+            db,
+            "SELECT count(*) FROM activity WHERE id=?1 AND status=0",
+            [activity],
+        )? != 0
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn cleanup_work(
     db: &Connection,
     kind: CleanupKind,
@@ -567,6 +590,21 @@ pub(super) fn cleanup_work(
                     if state == "planned"
                         && leaf.directory.is_none()
                         && leaf.identity.is_none() => {}
+                "abandoned"
+                    if !authority.is_static
+                        && state == "quarantined"
+                        && leaf.directory.is_none()
+                        && leaf.identity.is_none()
+                        && count(
+                            db,
+                            "SELECT count(*) FROM vm_native_slots
+                             WHERE generation=?1 AND role=?2 AND object_key=?3
+                               AND state IN ('intended','absent')",
+                            params![generation, leaf.role, leaf.key],
+                        )? == 1 =>
+                {
+                    artifacts.push(leaf);
+                }
                 "copy" if matches!(state.as_str(), "created" | "identified") && identified => {
                     artifacts.push(leaf);
                 }
@@ -574,6 +612,21 @@ pub(super) fn cleanup_work(
                     if state == "planned"
                         && leaf.directory.is_none()
                         && leaf.identity.is_none() => {}
+                "copy"
+                    if !authority.is_static
+                        && state == "created"
+                        && leaf.directory.is_none()
+                        && leaf.identity.is_none()
+                        && count(
+                            db,
+                            "SELECT count(*) FROM vm_native_slots
+                             WHERE generation=?1 AND role=?2 AND object_key=?3
+                               AND state IN ('intended','absent')",
+                            params![generation, leaf.role, leaf.key],
+                        )? == 1 =>
+                {
+                    artifacts.push(leaf);
+                }
                 _ => {
                     accounted = false;
                     break;
@@ -705,7 +758,11 @@ pub(super) fn settle_cleanup(
         {
             finish(db, activity, Status::Interrupted, now, Some(false))?;
         }
-        if !(outcome.disposed && current.accounted && current.artifacts == work.artifacts) {
+        if !(outcome.disposed
+            && current.accounted
+            && current.artifacts == work.artifacts
+            && super::native::disposal::work_disposed(db, &current)?)
+        {
             // Preserve untouched ('planned') leaves, move identified leaves to
             // pending_disposal, and quarantine attempted-without-identity leaves.
             db.execute(
@@ -728,7 +785,8 @@ pub(super) fn settle_cleanup(
     } else if !(outcome.released
         && outcome.disposed
         && current.accounted
-        && current.artifacts == work.artifacts)
+        && current.artifacts == work.artifacts
+        && super::native::disposal::work_disposed(db, &current)?)
     {
         if outcome.released && authority.phase == "abandoned" {
             audit_quarantine_once(db, &authority, vm, generation, now)?;
