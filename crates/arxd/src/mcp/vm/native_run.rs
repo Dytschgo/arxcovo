@@ -66,6 +66,11 @@ impl Run {
     }
 
     #[cfg(test)]
+    pub(super) fn target(&self) -> Target {
+        self.target
+    }
+
+    #[cfg(test)]
     pub(super) fn witnessed(&self) -> bool {
         self.state.lock().is_ok_and(|state| state.witness.is_some())
     }
@@ -193,8 +198,68 @@ impl VmInventory {
 }
 
 pub(super) struct Start {
-    worker: PendingOperation,
-    active: store::snapshot::Active,
+    pub(super) worker: PendingOperation,
+    pub(super) active: store::snapshot::Active,
+}
+
+/// The owned launch surface a live run drives. Production implements it for
+/// [`NativeLaunch`]; fixtures supply a known child with duplex peers.
+pub(super) trait LiveLaunch {
+    type Proof;
+
+    async fn boot(
+        &mut self,
+        cancel: &Shutdown,
+        boot_by: Instant,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal>;
+
+    fn check_live(
+        &self,
+        refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal>;
+
+    async fn ping(
+        &mut self,
+        cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal>;
+
+    /// One bounded teardown attempt that keeps every handle. `None` leaves
+    /// the same launch for the next retry.
+    async fn stop(&mut self) -> Option<Self::Proof>;
+}
+
+impl<'a> LiveLaunch for NativeLaunch<'a> {
+    type Proof = ReleasedGeneration<'a>;
+
+    async fn boot(
+        &mut self,
+        cancel: &Shutdown,
+        boot_by: Instant,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        NativeLaunch::boot(self, cancel, boot_by, refresh).await
+    }
+
+    fn check_live(
+        &self,
+        refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        NativeLaunch::check_live(self, refresh)
+    }
+
+    async fn ping(
+        &mut self,
+        cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        NativeLaunch::ping(self, cancel, refresh).await
+    }
+
+    async fn stop(&mut self) -> Option<Self::Proof> {
+        self.stop_generation(&Shutdown::default(), || true).await.1
+    }
 }
 
 // The activation chunk supplies the selected source on the tracked worker.
@@ -394,11 +459,17 @@ impl Run {
                         cancelled: &cancelled,
                     },
                     permit,
-                    || self.observe_run(supervisor, false, issuer.epoch()),
+                    || self.observe_run(supervisor, false, &|| issuer.epoch().effects_revoked()),
                 ) {
                     Ok(mut launch) => {
-                        self.live(supervisor, &start.worker, &mut launch, issuer.epoch())
-                            .await
+                        self.live(
+                            supervisor,
+                            &start.worker,
+                            &mut launch,
+                            || issuer.epoch().effects_revoked(),
+                            async |proof| self.settle_proof(supervisor, &proof).await,
+                        )
+                        .await
                     }
                     Err(refusal) => {
                         self.settle_refusal(supervisor, refusal, |_| Err(PATH))
@@ -426,10 +497,10 @@ impl Run {
         &self,
         supervisor: &Supervisor,
         running: bool,
-        epoch: &selection_epoch::SelectionEpoch,
+        revoked: &dyn Fn() -> bool,
     ) -> Result<Instant, NativeRefusal> {
         let captured = Instant::now();
-        if epoch.effects_revoked()
+        if revoked()
             || self.cancel.is_cancelled()
             || supervisor.cancel.is_cancelled()
             || !supervisor
@@ -442,14 +513,17 @@ impl Run {
         Ok(captured)
     }
 
-    async fn live(
+    /// Boots the owned launch, commits readiness, pings it while live and
+    /// settles its teardown. `revoked` reports selection-epoch revocation.
+    pub(super) async fn live<L: LiveLaunch>(
         &self,
         supervisor: &Supervisor,
         worker: &PendingOperation,
-        launch: &mut NativeLaunch<'_>,
-        epoch: &selection_epoch::SelectionEpoch,
+        launch: &mut L,
+        revoked: impl Fn() -> bool,
+        settle: impl AsyncFnOnce(L::Proof),
     ) {
-        let refresh = || self.observe_run(supervisor, false, epoch);
+        let refresh = || self.observe_run(supervisor, false, &revoked);
         if launch
             .boot(&self.cancel, worker.deadline(), refresh)
             .await
@@ -476,7 +550,9 @@ impl Run {
                     _ = ping.tick() => {}
                 }
                 if launch
-                    .ping(&self.cancel, || self.observe_run(supervisor, true, epoch))
+                    .ping(&self.cancel, || {
+                        self.observe_run(supervisor, true, &revoked)
+                    })
                     .await
                     .is_err()
                 {
@@ -484,13 +560,8 @@ impl Run {
                 }
             }
         }
-        let teardown = Shutdown::default();
-        self.settle_live(
-            supervisor,
-            async || launch.stop_generation(&teardown, || true).await.1,
-            async |proof| self.settle_proof(supervisor, &proof).await,
-        )
-        .await;
+        self.settle_live(supervisor, async || launch.stop().await, settle)
+            .await;
     }
 
     /// Withdraws the witness before the first teardown attempt, then keeps

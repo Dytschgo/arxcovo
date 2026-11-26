@@ -7,6 +7,8 @@ use crate::{
     vm::{paths::FileIdentity, test_issuer::Installation},
 };
 use rusqlite::{OptionalExtension, params};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use super::super::native_run::LiveLaunch;
 
 fn assert_admission_closed(h: &Harness) {
     let candidate = h.supervisor().candidate();
@@ -646,6 +648,404 @@ async fn reopened_store_has_no_witness_and_reaches_orphan_recovery() {
     let mut recovered = false;
     assert!(supervisor.reap_native_run(target.vm, &mut || { recovered = true; true }));
     assert!(recovered);
+    assert_admission_closed(&h);
+    drop(client);
+    let _ = h.shutdown().await;
+}
+
+/// The synthetic Job origin of a fixture child's checked creation edge.
+fn fixture_origin(scope: native::Scope) -> native::recovery::Origin {
+    native::recovery::Origin {
+        boot: [34; 32],
+        database: FileIdentity { volume: scope.production.volume, file: [35; 16] },
+        lock: FileIdentity { volume: scope.production.volume, file: [36; 16] },
+    }
+}
+
+/// Holds a fixture teardown until the test has observed the projection.
+/// Both signals are latched, so neither side can lose the other's wakeup.
+#[derive(Default)]
+struct TeardownBarrier {
+    entered: AtomicBool,
+    entered_signal: Notify,
+    released: AtomicBool,
+    release_signal: Notify,
+}
+
+impl TeardownBarrier {
+    fn mark_entered(&self) {
+        self.entered.store(true, Ordering::SeqCst);
+        self.entered_signal.notify_waiters();
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release_signal.notify_waiters();
+    }
+
+    fn has_entered(&self) -> bool {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    async fn wait_entered(&self) {
+        Self::wait(&self.entered_signal, &self.entered).await;
+    }
+
+    async fn wait_release(&self) {
+        Self::wait(&self.release_signal, &self.released).await;
+    }
+
+    async fn wait(signal: &Notify, latched: &AtomicBool) {
+        let notified = signal.notified();
+        tokio::pin!(notified);
+        let _ = notified.as_mut().enable();
+        if !latched.load(Ordering::SeqCst) {
+            notified.await;
+        }
+    }
+}
+
+/// Unblocks the parked worker, the teardown barrier and both duplex peers on
+/// every exit, including a panic, so a failed run can never hang its drop.
+struct ComposedCleanup {
+    start_gate: Option<std::sync::mpsc::Sender<()>>,
+    alive: Arc<AtomicBool>,
+    teardown: Arc<TeardownBarrier>,
+    supervisor: Arc<Supervisor>,
+    peers: [tokio::task::AbortHandle; 2],
+}
+
+impl ComposedCleanup {
+    fn release_worker(&mut self) {
+        if let Some(gate) = self.start_gate.take() {
+            let _ = gate.send(());
+        }
+    }
+}
+
+impl Drop for ComposedCleanup {
+    fn drop(&mut self) {
+        drop(self.start_gate.take());
+        self.alive.store(false, Ordering::SeqCst);
+        for peer in &self.peers {
+            peer.abort();
+        }
+        self.teardown.release();
+        if std::thread::panicking() {
+            // Wakes the ping loop and any bounded retry at once.
+            self.supervisor.fence();
+        }
+    }
+}
+
+/// A known fixture child: a liveness flag stands in for the process and its
+/// Job, and duplex QMP and guest peers answer like the real endpoints.
+struct FixtureLaunch {
+    alive: Arc<AtomicBool>,
+    booted: Arc<AtomicBool>,
+    pings: Arc<AtomicUsize>,
+    qmp: BufReader<DuplexStream>,
+    guest: BufReader<DuplexStream>,
+    teardown: Arc<TeardownBarrier>,
+    proof: Option<Observed>,
+}
+
+const QMP_CONT: &str = r#"{"execute":"cont"}"#;
+const QMP_RETURN: &str = r#"{"return":{}}"#;
+
+async fn fixture_exchange(
+    stream: &mut BufReader<DuplexStream>,
+    send: Option<&str>,
+    expect: &str,
+) -> Result<(), NativeRefusal> {
+    let refused = NativeRefusal::GuestEndpointUnverified;
+    if let Some(line) = send {
+        stream.write_all(format!("{line}\n").as_bytes()).await.map_err(|_| refused)?;
+    }
+    let mut line = String::new();
+    match stream.read_line(&mut line).await {
+        Ok(read) if read > 0 && line.trim() == expect => Ok(()),
+        _ => Err(refused),
+    }
+}
+
+impl LiveLaunch for FixtureLaunch {
+    type Proof = Observed;
+
+    async fn boot(
+        &mut self,
+        cancel: &Shutdown,
+        _boot_by: Instant,
+        mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        refresh()?;
+        fixture_exchange(&mut self.qmp, Some(QMP_CONT), QMP_RETURN).await?;
+        fixture_exchange(&mut self.guest, None, "READY").await?;
+        if cancel.is_cancelled() {
+            return Err(NativeRefusal::GuestEndpointUnverified);
+        }
+        refresh()?;
+        self.booted.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn check_live(
+        &self,
+        refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        if !self.alive.load(Ordering::SeqCst) {
+            return Err(NativeRefusal::JobUnverified);
+        }
+        refresh().map(|_| ())
+    }
+
+    async fn ping(
+        &mut self,
+        _cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        fixture_exchange(&mut self.guest, Some("PING"), "PONG").await?;
+        self.check_live(refresh)?;
+        self.pings.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Option<Observed> {
+        self.teardown.mark_entered();
+        self.teardown.wait_release().await;
+        self.proof.take()
+    }
+}
+
+async fn qmp_peer(stream: DuplexStream) {
+    let mut stream = BufReader::new(stream);
+    let mut line = String::new();
+    while stream.read_line(&mut line).await.is_ok_and(|read| read > 0) {
+        if line.trim() == QMP_CONT
+            && stream.write_all(format!("{QMP_RETURN}\n").as_bytes()).await.is_err()
+        {
+            return;
+        }
+        line.clear();
+    }
+}
+
+/// Reports ready, answers exactly one ping, then holds the channel silent
+/// until it is aborted. A second ping parks without sampling the store, so
+/// the test's own reads cannot contend with the live monitor.
+async fn guest_peer(stream: DuplexStream) {
+    let mut stream = BufReader::new(stream);
+    if stream.write_all(b"READY\n").await.is_err() {
+        return;
+    }
+    let mut line = String::new();
+    if stream.read_line(&mut line).await.is_ok_and(|read| read > 0)
+        && line.trim() == "PING"
+        && stream.write_all(b"PONG\n").await.is_ok()
+    {
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let waited = tokio::time::timeout(Duration::from_secs(20), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await;
+    assert!(waited.is_ok(), "timed out waiting for {what}");
+}
+
+#[tokio::test]
+async fn composed_start_replays_publishes_after_ping_and_withdraws_on_loss() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let (vm, slots, pins, scope) = bound_clone(&h, &client).await;
+    let supervisor = h.supervisor().clone();
+    let (launch_qmp, peer_qmp) = tokio::io::duplex(1024);
+    let (launch_guest, peer_guest) = tokio::io::duplex(1024);
+    let qmp = tokio::spawn(qmp_peer(peer_qmp));
+    let guest = tokio::spawn(guest_peer(peer_guest));
+    let alive = Arc::new(AtomicBool::new(true));
+    let (booted, pings) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+    let teardown = Arc::new(TeardownBarrier::default());
+    let (release_worker, worker_gate) = std::sync::mpsc::channel::<()>();
+    let mut cleanup = ComposedCleanup {
+        start_gate: Some(release_worker),
+        alive: alive.clone(),
+        teardown: teardown.clone(),
+        supervisor: supervisor.clone(),
+        peers: [qmp.abort_handle(), guest.abort_handle()],
+    };
+    let launch = FixtureLaunch {
+        alive: alive.clone(),
+        booted: booted.clone(),
+        pings: pings.clone(),
+        qmp: BufReader::new(launch_qmp),
+        guest: BufReader::new(launch_guest),
+        teardown: teardown.clone(),
+        proof: None,
+    };
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_finished = finished.clone();
+    let started = supervisor.gate.lock().unwrap().start_native_run(
+        &supervisor, &Installation::fixture(), start_request(vm, 508), HOST, RESOURCES,
+        move |supervisor, runtime, owner, start| {
+            // The worker owns its slot but waits until the replay is checked,
+            // so the test's store reads cannot race the live monitor.
+            if worker_gate.recv().is_err() {
+                return Ok(());
+            }
+            let target = owner.target();
+            // The fixture child crosses the checked creation edge once.
+            supervisor.controller.native_store().transact(|db| {
+                native::recovery::record_job(db, scope, target.epoch, fixture_origin(scope))
+            })?;
+            let mut launch = launch;
+            launch.proof = Some(Observed { target, scope, slots, pins, clean: true });
+            runtime.block_on(owner.live(supervisor, &start.worker, &mut launch, || false,
+                async |proof: Observed| {
+                    owner.settle_with(supervisor, || Ok(()), |_, receipt| {
+                        supervisor.controller.native_store().try_native_transaction(|db| {
+                            native::release::commit(db, &proof, receipt,
+                                || supervisor.controller.native_clock()).map(|_| ())
+                        })
+                    }).await;
+                }));
+            worker_finished.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+    ).unwrap();
+    let epoch = parse_id(started["operation_id"].as_str().unwrap()).unwrap();
+    let operations = operation_count(&h);
+    // One replay of the exact request while its worker owns the slot.
+    let replay = supervisor.gate.lock().unwrap().start_native_run(
+        &supervisor, &Installation::fixture(), start_request(vm, 508), HOST, RESOURCES,
+        |_, _, _, _| panic!("a replay reached a worker"),
+    ).unwrap();
+    assert_eq!(replay, started);
+    assert_eq!(operation_count(&h), operations);
+    cleanup.release_worker();
+
+    // Ready after the validated handshake and one ping. The wait reads only
+    // atomics while boot, commit and the ping sample the store.
+    eventually("a successful ping", || {
+        if pings.load(Ordering::SeqCst) >= 1 {
+            return true;
+        }
+        assert!(
+            !teardown.has_entered() && !finished.load(Ordering::SeqCst),
+            "the worker entered teardown before its first ping (booted={})",
+            booted.load(Ordering::SeqCst),
+        );
+        false
+    }).await;
+    assert!(booted.load(Ordering::SeqCst));
+    assert!(!teardown.has_entered());
+    // The guest now stays silent, so authenticated reads cannot race a ping.
+    let args = json!({"vm_id":hex::encode(vm)});
+    let status = call(&client, "vm_get", args.clone()).await;
+    assert_eq!(status["state"], "running", "{status}");
+    assert_eq!(status["ready"], true, "{status}");
+    let witness = &status["native_boot_witness"];
+    assert_eq!(witness["source"], "guest_ready_handshake");
+    assert_eq!(witness["vm_id"], hex::encode(vm));
+    assert_eq!(witness["generation"], hex::encode(scope.generation));
+    assert_eq!(witness["operation_id"], hex::encode(epoch));
+    let witness_id = parse_id(witness["witness_id"].as_str().unwrap()).unwrap();
+    assert_ne!(witness_id, epoch);
+    assert_ne!(witness_id, [0; 16]);
+    let start = call(&client, "vm_operation", json!({"operation_id":hex::encode(epoch)})).await;
+    assert_eq!(start["state"], "succeeded", "{start}");
+
+    // The child is lost while teardown is blocked: the read stays unready.
+    alive.store(false, Ordering::SeqCst);
+    guest.abort();
+    let entered = tokio::time::timeout(Duration::from_secs(20), teardown.wait_entered()).await;
+    assert!(entered.is_ok(), "teardown never started after the child was lost");
+    let lost = call(&client, "vm_get", args.clone()).await;
+    assert_eq!(lost["ready"], false, "{lost}");
+    assert!(lost.get("native_boot_witness").is_none());
+    assert!(!finished.load(Ordering::SeqCst));
+    assert_eq!(unresolved_epoch(&h, vm), Some((scope.generation, epoch)));
+    teardown.release();
+
+    // The real release commits on the owner's proof, and the slot is freed.
+    eventually("the worker to finish", || finished.load(Ordering::SeqCst)).await;
+    eventually("the run slot to be released", || {
+        supervisor.native_runs.with_entry(vm, |owner| owner.is_none()).unwrap_or(false)
+    }).await;
+    assert_eq!(unresolved_epoch(&h, vm), None);
+    assert_eq!(
+        supervisor.controller.active_release_epoch(vm, false).unwrap(),
+        Some((scope.generation, epoch))
+    );
+    assert_eq!(vm_state(&h, vm), 3, "an unreceipted release hands the VM to recovery");
+    let released = call(&client, "vm_get", args).await;
+    assert_eq!(released["ready"], false);
+    assert!(released.get("native_boot_witness").is_none());
+    drop(cleanup);
+    assert_admission_closed(&h);
+    drop((supervisor, client));
+    let _ = h.shutdown().await;
+}
+
+#[tokio::test]
+async fn composed_start_restarted_before_creation_reaches_the_real_recovery_commit() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let (vm, slots, pins, scope) = bound_clone(&h, &client).await;
+    let supervisor = h.supervisor().clone();
+    let (resume, parked) = std::sync::mpsc::channel::<()>();
+    let started = supervisor.gate.lock().unwrap().start_native_run(
+        &supervisor, &Installation::fixture(), start_request(vm, 509), HOST, RESOURCES,
+        move |_, _, _, _| {
+            // The process ends after admission, before the creation edge.
+            let _ = parked.recv();
+            Ok(())
+        },
+    ).unwrap();
+    let epoch = parse_id(started["operation_id"].as_str().unwrap()).unwrap();
+    let target = Target { vm, generation: scope.generation, epoch };
+    assert_eq!(writer_epoch(&h, scope.generation), (epoch, false));
+    resume.send(()).unwrap();
+    eventually("the run slot to be released", || {
+        supervisor.native_runs.with_entry(vm, |owner| owner.is_none()).unwrap_or(false)
+    }).await;
+    drop((supervisor, client));
+    let _ = h.shutdown().await;
+
+    let mut h = h.reopen(|fixture| fixture.windows_recipe = true).await;
+    let client = h.client(0).await;
+    let reopened = call(&client, "vm_get", json!({"vm_id":hex::encode(vm)})).await;
+    assert_eq!(reopened["ready"], false, "{reopened}");
+    assert!(reopened.get("native_boot_witness").is_none());
+    let supervisor = h.supervisor();
+    assert_eq!(vm_state(&h, vm), 3, "startup recovery did not claim the VM");
+    assert_eq!(unresolved_epoch(&h, vm), Some((scope.generation, epoch)));
+    let store = supervisor.controller.native_store();
+    let cleanup: i64 = store.transact(|db| {
+        Ok(db.query_row("SELECT cleanup_id FROM vm_instances WHERE id=?1", [vm], |r| r.get(0))?)
+    }).unwrap();
+    let kind = crate::vm::reaper::CleanupKind::Recovery { vm, activity_id: cleanup };
+    let origin = fixture_origin(scope);
+    let observed = Observed { target, scope, slots, pins, clean: true };
+    let mut created = None;
+    assert!(supervisor.reap_native_run(vm, &mut || {
+        store.try_native_transaction(|db| {
+            let expected = native::recovery::orphan(db, kind, origin)?
+                .ok_or_else(|| anyhow::anyhow!("no exact orphan"))?;
+            created = Some(expected.created);
+            native::recovery::commit(db, kind, origin, expected, &observed,
+                || supervisor.controller.native_clock())
+        }).is_ok()
+    }));
+    assert_eq!(created, Some(false));
+    assert_eq!(unresolved_epoch(&h, vm), None);
+    assert_eq!(
+        supervisor.controller.active_release_epoch(vm, false).unwrap(),
+        Some((scope.generation, epoch))
+    );
     assert_admission_closed(&h);
     drop(client);
     let _ = h.shutdown().await;
