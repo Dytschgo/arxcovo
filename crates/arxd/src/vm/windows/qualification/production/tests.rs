@@ -488,35 +488,47 @@ fn hold_workspace_enforces_exact_names_ids_acls_and_exclusive_lease() {
     std::fs::remove_file(alias.as_str()).unwrap();
     assert_eq!(acquire(new_binding).unwrap().binding(), new_binding);
 
-    let uppercase = production
-        .path
-        .join(&hex::encode_upper(expected.generation))
-        .unwrap();
-    let aside = production.path.join("aside").unwrap();
-    std::fs::rename(directory.as_str(), aside.as_str()).unwrap();
-    std::fs::rename(aside.as_str(), uppercase.as_str()).unwrap();
-    assert!(acquire(new_binding).is_err(), "case-changed directory");
-    let replacement = create_dir_sddl(
-        Path::new(production.path.as_str()),
-        &hex::encode(expected.generation),
+    // Seed the next controls before pinning their parent. Windows refuses
+    // a directory rename while its parent is pinned without delete sharing.
+    let production_path = production.path.clone();
+    drop(production);
+    let parent = Path::new(production_path.as_str());
+    let uppercase_generation = [0xac; 16];
+    let uppercase = create_dir_sddl(
+        parent,
+        &hex::encode_upper(uppercase_generation),
+        &format!("O:{owner}D:P(A;OICI;FA;;;{owner})"),
+    );
+    let uppercase_lease = create_file_sddl(
+        &uppercase,
+        GENERATION_LEASE,
+        &format!("O:{owner}D:P(A;;FA;;;{owner})"),
+    );
+    let shared_generation = [0xad; 16];
+    let shared = create_dir_sddl(
+        parent,
+        &hex::encode(shared_generation),
         &format!("O:{owner}D:P(A;OICI;FA;;;{owner})(A;OICI;FR;;;WD)"),
     );
-    let replacement_lease = create_file_sddl(
-        &replacement,
+    let shared_lease = create_file_sddl(
+        &shared,
         GENERATION_LEASE,
-        &format!("O:{owner}D:P(A;;FA;;;{owner})(A;;FR;;;WD)"),
+        &format!("O:{owner}D:P(A;;FA;;;{owner})"),
     );
-    let replacement_binding = fixture_binding(
+    let production = PathPin::open(&production_path, true, false).unwrap();
+    let acquire = |binding| hold_workspace_under(&production, sid_ptr(&owner_data), binding);
+    let uppercase_binding = fixture_binding(
         &production,
-        expected.generation,
-        &replacement,
-        &replacement_lease,
+        uppercase_generation,
+        &uppercase,
+        &uppercase_lease,
     );
-    assert!(acquire(new_binding).is_err(), "substituted directory");
     assert!(
-        acquire(replacement_binding).is_err(),
-        "non-private directory"
+        acquire(uppercase_binding).is_err(),
+        "case-changed directory"
     );
+    let shared_binding = fixture_binding(&production, shared_generation, &shared, &shared_lease);
+    assert!(acquire(shared_binding).is_err(), "non-private directory");
 }
 
 #[test]
