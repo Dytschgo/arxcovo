@@ -51,7 +51,7 @@ Work is split into three coherent PRs following [IMPLEMENTATION-HANDOFF.md](../d
 
 ## Not shipped
 
-The following items appear in the mockups under [docs/design/night-orbit/](../design/night-orbit/) for exploration or future continuity and **must not** be fabricated or shipped in v1:
+The following items appear in the mockups under [docs/design/night-orbit/](../design/night-orbit/) for exploration or future continuity. None may be fabricated in the product. Migration preview and host drain stay post-v1. The API-dependent items ship only once the corresponding backend API exists; CPU history is being built for v1, so its traces may ship in v1 if that API lands first:
 
 - **Migration preview and host drain:** drag-and-drop migration, Move menus, cutover flows, and drain dialogs stay post-v1 (tracked in [docs/ROADMAP.md](../ROADMAP.md)).
 - **`◇` API-mark fields (`x` fields in `arx-data.js`):** static VM health checks, backups, publish state, per-host disk reserve, opportunistic host pins, and board join code — plus the wishlist items (activity time-range slider, host remote desktop, and notifications settings) — do not ship unless and until corresponding backend API fields exist.

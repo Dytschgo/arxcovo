@@ -24,4 +24,4 @@ Where this file and SPEC.md disagree, **this file wins**.
 - Under reduced motion the pre-copy timer completes instantly (no stuck 0 %).
 
 ## Owner-facing open items recorded in SPEC (don't build UI for them)
-Light theme (dark only for now, owner to confirm), notifications settings (not in v1 API), host remote desktop (not in v1 API; one disabled "Remote desktop ◇" action on host detail is OK), agents-may-publish cluster setting (◇).
+Light theme (not planned: the owner decided dark only on 2026-11-26, ADR 0073), notifications settings (not in v1 API), host remote desktop (not in v1 API; one disabled "Remote desktop ◇" action on host detail is OK), agents-may-publish cluster setting (◇).
