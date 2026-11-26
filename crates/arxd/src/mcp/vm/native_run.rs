@@ -9,6 +9,7 @@ use crate::{
         },
     },
     vm::{
+        OwnedStop,
         qualification::{
             BootReservation, ForegroundQualification, LaunchRequest, LaunchTarget, NativeLaunch,
             ProductionWorkspace, ReleasedGeneration, StartCreation, StartPair, StartRefusal,
@@ -108,6 +109,7 @@ pub(super) struct Run {
 struct State {
     witness: Option<Id>,
     ended: bool,
+    stop_requested: bool,
     stop: Option<Arc<StopReceipt>>,
     /// One admitted script waiting for the owned channel. The ledger admits
     /// at most one pending script per VM.
@@ -136,6 +138,12 @@ pub(super) enum Settlement {
     Stopped,
     /// Never dispatched: refused authorization, queued at stop or loss.
     Cancelled,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum ReceiptDisposition {
+    Verified,
+    Withdrawn,
 }
 
 /// Authorizes one admitted script at channel dispatch, consuming a fresh
@@ -288,37 +296,51 @@ impl Run {
         supervisor: &Supervisor,
         worker: PendingOperation,
         settlement: Settlement,
-    ) {
-        // A receipt that a fence or recovery already settled is done.
-        if finish_script(supervisor, &worker, settlement).is_err()
-            && !matches!(
-                supervisor.controller.native_receipt_pending(&worker),
-                Ok(false)
-            )
-            && let Ok(mut state) = self.state.lock()
-        {
-            state.unsettled.push((worker, settlement));
+    ) -> ReceiptDisposition {
+        let mut disposition = ReceiptDisposition::Verified;
+        let settled = finish_script(supervisor, &worker, self.target, settlement, || {
+            self.withdraw();
+            disposition = ReceiptDisposition::Withdrawn;
+        });
+        if settled.is_err() {
+            if supervisor.controller.native_clock().monotonic >= worker.deadline() {
+                self.withdraw();
+                disposition = ReceiptDisposition::Withdrawn;
+            }
+            if let Ok(mut state) = self.state.lock() {
+                state.unsettled.push((worker, settlement));
+            }
         }
         #[cfg(test)]
         self.settled.fetch_add(1, Ordering::SeqCst);
+        disposition
     }
 
-    /// One retry of every receipt whose settlement failed. Returns whether
-    /// none remains.
-    fn retry_receipts(&self, supervisor: &Supervisor) -> bool {
+    fn retry_receipts(&self, supervisor: &Supervisor) -> ReceiptDisposition {
         let Ok(pending) = self
             .state
             .lock()
             .map(|mut state| std::mem::take(&mut state.unsettled))
         else {
-            return false;
+            return ReceiptDisposition::Withdrawn;
         };
+        let mut disposition = ReceiptDisposition::Verified;
         for (worker, settlement) in pending {
-            self.settle_script(supervisor, worker, settlement);
+            if self.settle_script(supervisor, worker, settlement) == ReceiptDisposition::Withdrawn {
+                disposition = ReceiptDisposition::Withdrawn;
+            }
         }
+        disposition
+    }
+
+    fn receipt_deadline(&self) -> Option<Instant> {
         self.state
             .lock()
-            .is_ok_and(|state| state.unsettled.is_empty())
+            .ok()?
+            .unsettled
+            .iter()
+            .map(|(worker, _)| worker.deadline())
+            .min()
     }
 
     fn publish(&self, id: Id, supervisor: &Supervisor) -> bool {
@@ -331,11 +353,21 @@ impl Run {
         })
     }
 
-    fn stop(&self, receipt: StopReceipt) -> Outcome<()> {
+    fn stop_requested(&self) -> bool {
+        self.state.lock().is_ok_and(|state| state.stop_requested)
+    }
+
+    fn stop(&self, receipt: Option<StopReceipt>) -> Outcome<()> {
         let mut state = self.state.lock().map_err(|_| STATE_UNAVAILABLE)?;
         state.ended = true;
         state.witness = None;
-        state.stop = Some(Arc::new(receipt));
+        state.stop_requested = true;
+        state.stop = receipt.map(Arc::new);
+        for (_, settlement) in &mut state.unsettled {
+            if matches!(settlement, Settlement::Guest(_)) {
+                *settlement = Settlement::Stopped;
+            }
+        }
         self.cancel.cancel();
         self.retry.notify_one();
         Ok(())
@@ -428,11 +460,15 @@ impl VmInventory {
             request.key,
             owner.target,
             script,
+            owner.stop_requested(),
         );
-        // A fresh stop settled the queued receipt with it. Otherwise the job
-        // returns to its run, or settles if the run has ended.
-        if !matches!(admitted, Ok(Ok((_, Some(_)))))
-            && let Some(job) = queued
+        // The normal stop replaces the queued receipt in the ledger. A
+        // refusal or replay returns the job to its owner.
+        let mut queued = queued;
+        if !matches!(
+            admitted,
+            Ok(Ok((_, OwnedStop::Pending(_) | OwnedStop::Recovery)))
+        ) && let Some(job) = queued.take()
             && let Err(job) = owner.enqueue(job)
         {
             owner.settle_script(&self.supervisor, job.worker, Settlement::Cancelled);
@@ -440,14 +476,22 @@ impl VmInventory {
         Some((|| match admitted? {
             Ok((operation, stop)) => {
                 match stop {
-                    Some(stop) => {
+                    OwnedStop::Pending(stop) => {
                         #[cfg(test)]
                         owner.pause_stop_handoff();
-                        owner.stop(stop)?;
+                        owner.stop(Some(stop))?;
                     }
-                    // A replayed stop nudges a teardown that is still
-                    // retrying its release.
-                    None => owner.retry.notify_one(),
+                    OwnedStop::Recovery => {
+                        owner.stop(None)?;
+                        if let Some(job) = queued {
+                            owner.settle_script(
+                                &self.supervisor,
+                                job.worker,
+                                Settlement::Cancelled,
+                            );
+                        }
+                    }
+                    OwnedStop::Replay => owner.retry.notify_one(),
                 }
                 Ok(receipt(operation, None))
             }
@@ -961,14 +1005,23 @@ impl Run {
             let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
+                let receipt_deadline = self.receipt_deadline();
                 tokio::select! {
                     biased;
                     _ = supervisor.cancel.cancelled() => break,
                     _ = self.cancel.cancelled() => break,
+                    _ = async {
+                        match receipt_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {}
                     _ = self.scripts.notified() => {}
                     _ = ping.tick() => {}
                 }
-                self.retry_receipts(supervisor);
+                if self.retry_receipts(supervisor) == ReceiptDisposition::Withdrawn {
+                    break;
+                }
                 let verified = match self.take_script() {
                     Some(job) => {
                         self.dispatch(supervisor, launch, authorize, &revoked, job)
@@ -1016,16 +1069,24 @@ impl Run {
             generation,
             writer_epoch: Some(epoch),
         };
-        let authority = authorize
+        let authority = match authorize
             .authorize(&worker, target, &script, timeout_s, &self.cancel)
-            .ok()
-            .filter(|authority| authority.names(generation, epoch, &script, timeout_s));
-        let Some(authority) = authority else {
-            // Nothing reached the guest. The channel stays verified unless
-            // the receipt can only settle past its deadline.
-            let within = self.within(deadline);
-            self.settle_script(supervisor, worker, Settlement::Cancelled);
-            return within && self.within(deadline);
+            .and_then(|authority| {
+                if authority.names(generation, epoch, &script, timeout_s) {
+                    Ok(authority)
+                } else {
+                    Err(REFUSED)
+                }
+            }) {
+            Ok(authority) => authority,
+            Err(_) => {
+                let verified = self.observe_run(supervisor, true, revoked).is_ok();
+                if !verified {
+                    self.withdraw();
+                }
+                let disposition = self.settle_script(supervisor, worker, Settlement::Cancelled);
+                return verified && disposition == ReceiptDisposition::Verified;
+            }
         };
         let result = {
             let exchange =
@@ -1053,14 +1114,13 @@ impl Run {
             .and_then(|(status, code)| guest_result(status, code));
         match result {
             Some(result) => {
-                self.settle_script(supervisor, worker, Settlement::Guest(result));
-                self.within(deadline)
+                self.settle_script(supervisor, worker, Settlement::Guest(result))
+                    == ReceiptDisposition::Verified
             }
             None => {
                 // Withdraw at loss detection, before the receipt or teardown.
                 self.withdraw();
-                let stopped = self.state.lock().is_ok_and(|state| state.stop.is_some());
-                let settlement = if stopped {
+                let settlement = if self.stop_requested() {
                     Settlement::Stopped
                 } else {
                     Settlement::Lost
@@ -1069,17 +1129,6 @@ impl Run {
                 false
             }
         }
-    }
-
-    /// A receipt settled at or after its admitted deadline is recorded as
-    /// unconfirmed and takes the VM into recovery, so the channel no longer
-    /// counts as verified: withdraw before teardown.
-    fn within(&self, deadline: Instant) -> bool {
-        let within = Instant::now() < deadline;
-        if !within {
-            self.withdraw();
-        }
-        within
     }
 
     async fn interrupted(&self, supervisor: &Supervisor) {
@@ -1114,13 +1163,15 @@ impl Run {
                 break;
             }
         }
-        while !self.retry_receipts(supervisor) {
+        self.retry_receipts(supervisor);
+        while self.receipt_deadline().is_some() {
             tokio::select! {
                 biased;
                 _ = supervisor.cancel.cancelled() => return,
                 _ = self.retry.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
+            self.retry_receipts(supervisor);
         }
     }
 
@@ -1244,6 +1295,7 @@ impl Run {
                     .stop
                     .clone();
                 if stop.is_none() {
+                    self.retry_receipts(supervisor);
                     supervisor.controller.fence_native_run(self.target)?;
                 }
                 commit(&observed, stop.as_deref())
@@ -1319,26 +1371,35 @@ impl Supervisor {
 fn finish_script(
     supervisor: &Supervisor,
     worker: &PendingOperation,
+    target: Target,
     settlement: Settlement,
+    withdraw: impl FnOnce(),
 ) -> anyhow::Result<()> {
-    let controller = &supervisor.controller;
-    match settlement {
-        Settlement::Guest(result) => controller.finish_script(worker, result),
-        Settlement::Lost => controller.finish_with_cause(
-            worker,
+    let (completion, script, cause) = match settlement {
+        Settlement::Guest(result) => (
+            if result == ScriptResult::Exited(0) {
+                Completion::Succeeded
+            } else {
+                Completion::Failed
+            },
+            Some(result),
+            None,
+        ),
+        Settlement::Lost => (
             Completion::CleanupUnconfirmed,
+            None,
             Some(FailureReason::ExecutionUnknown),
         ),
-        Settlement::Stopped => controller.finish_with_cause(
-            worker,
+        Settlement::Stopped => (
             Completion::Failed,
+            None,
             Some(FailureReason::ExecutionUnknown),
         ),
-        Settlement::Cancelled => {
-            controller.finish_with_cause(worker, Completion::Failed, Some(FailureReason::Cancelled))
-        }
-    }
-    .map(drop)
+        Settlement::Cancelled => (Completion::Failed, None, Some(FailureReason::Cancelled)),
+    };
+    supervisor
+        .controller
+        .settle_native_script(worker, target, completion, script, cause, withdraw)
 }
 
 /// The typed guest outcome. An exit without its code is malformed.

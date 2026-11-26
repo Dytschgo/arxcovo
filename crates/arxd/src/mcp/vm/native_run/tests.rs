@@ -1264,7 +1264,11 @@ async fn composed_start_replays_publishes_after_ping_and_withdraws_on_loss() {
             })?;
             let mut launch = launch;
             launch.proof = Some(Observed { target, scope, slots, pins, clean: true });
-            let authorize = FixtureAuthorizer { controller: &supervisor.controller };
+            let revoked = AtomicBool::new(false);
+            let authorize = FixtureAuthorizer {
+                controller: &supervisor.controller,
+                revoked: &revoked,
+            };
             runtime.block_on(owner.live(supervisor, &start.worker, &mut launch, &authorize, || false,
                 async |proof: Observed| {
                     owner.settle_with(supervisor, || Ok(()), |_, receipt| {
@@ -1424,11 +1428,12 @@ const SELECTION_OWNER: &str = "S-1-12-1-1-2-3-4";
 
 /// A held TEST selection over the harness clock. The production issuer
 /// body mints and consumes every script permit against the real ledger.
-struct FixtureSelection {
+struct FixtureSelection<'a> {
     origin: Instant,
+    revoked: &'a AtomicBool,
 }
 
-impl crate::vm::test_issuer::SelectedSource for FixtureSelection {
+impl crate::vm::test_issuer::SelectedSource for FixtureSelection<'_> {
     fn seal_sha256(&self) -> crate::vm::qualification_record::Hash {
         SELECTION_SEAL
     }
@@ -1460,6 +1465,11 @@ impl crate::vm::test_issuer::SelectedSource for FixtureSelection {
         &self,
         advance: &dyn Fn() -> Result<ClockReading, crate::vm::selection_epoch::Invalidation>,
     ) -> Result<crate::vm::selection_epoch::Sample, crate::vm::selection_epoch::Invalidation> {
+        if self.revoked.load(Ordering::SeqCst) {
+            return Err(crate::vm::selection_epoch::Invalidation::Confirmed(
+                NativeRefusal::QualificationMissing,
+            ));
+        }
         let captured = Instant::now();
         let reading = advance()?;
         let elapsed = reading.monotonic.saturating_duration_since(self.origin).as_millis();
@@ -1496,6 +1506,7 @@ fn selection_config() -> crate::config::TestQualificationSelection {
 /// clock stands still, and delegates to the production issuer authorizer.
 struct FixtureAuthorizer<'a> {
     controller: &'a Controller,
+    revoked: &'a AtomicBool,
 }
 
 impl native_run::ScriptAuthorizer for FixtureAuthorizer<'_> {
@@ -1510,7 +1521,7 @@ impl native_run::ScriptAuthorizer for FixtureAuthorizer<'_> {
         let issuer = crate::vm::test_issuer::TestIssuer::open(
             &Installation::fixture(),
             self.controller,
-            FixtureSelection { origin: Instant::now() },
+            FixtureSelection { origin: Instant::now(), revoked: self.revoked },
             &selection_config(),
         )?;
         issuer.authorize(worker, target, script, timeout_s, cancel)
@@ -1820,7 +1831,10 @@ async fn script_run(h: &Harness, client: &Client, number: u64) -> ScriptRun {
             })?;
             let mut launch = launch;
             launch.proof = Some(Observed { target, scope, slots, pins, clean: true });
-            let authorize = FixtureAuthorizer { controller: &supervisor.controller };
+            let authorize = FixtureAuthorizer {
+                controller: &supervisor.controller,
+                revoked: &selection_revoked,
+            };
             let revoked = || selection_revoked.load(Ordering::SeqCst);
             runtime.block_on(owner.live(supervisor, &start.worker, &mut launch, &authorize, revoked,
                 async |proof: Observed| {
@@ -1988,9 +2002,11 @@ async fn owner_stop_interrupts_a_paused_script_before_its_timeout_and_stops_clea
         if reply_after_stop {
             run.control.held.release();
         }
-        run.teardown_entered().await;
-        assert!(stopped_at.elapsed() < Duration::from_secs(15),
-            "the 60 s script held teardown for {:?}", stopped_at.elapsed());
+        let entered = tokio::time::timeout_at(
+            (stopped_at + Duration::from_secs(3)).into(),
+            run.teardown.wait_entered(),
+        ).await;
+        assert!(entered.is_ok(), "teardown exceeded the 2 s interrupt bound with 1 s tolerance");
         assert_eq!(run.control.replied.load(Ordering::SeqCst), reply_after_stop);
         // While teardown is blocked: still unready, and the in-flight
         // script settled with the stop as unknown, with no guest result.
@@ -2137,6 +2153,191 @@ async fn failed_script_receipt_keeps_its_typed_result_until_the_ledger_settles_i
     // Retrying the receipt never repeats the guest exchange.
     assert_eq!(run.control.received().len(), 1);
     assert_eq!(call(&client, "vm_get", run.args.clone()).await["ready"], true);
+    finish_script_test(h, vec![client], run).await;
+}
+
+#[tokio::test]
+async fn a_failed_receipt_retry_past_its_deadline_starts_teardown() {
+    let h = windows_harness().await;
+    let client = h.client(0).await;
+    let run = script_run(&h, &client, 582).await;
+    let supervisor = h.supervisor().clone();
+    sql(&h, FAIL_SCRIPT_RECEIPT);
+    let receipt = call(&client, "vm_run_script", run.script(583, "exit 7", 1)).await;
+    assert_eq!(receipt["ok"], true, "{receipt}");
+    let after_admission = tokio::time::Instant::now();
+    run.settled(1).await;
+    assert_eq!(operation(&client, &receipt).await["state"], "pending");
+    assert!(run.owner.witnessed());
+
+    // Keep the already-started exchange parked through the cutoff. On
+    // resuming, the retry itself must enter teardown before another exchange.
+    run.control.hold_pings.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(3), run.control.ping_hold.wait_entered()).await.unwrap();
+    tokio::time::sleep_until(after_admission + Duration::from_secs(6)).await;
+    sql(&h, "DROP TRIGGER fail_script");
+    run.control.ping_hold.release();
+    let entered = tokio::time::timeout(Duration::from_secs(2), run.teardown.wait_entered()).await;
+    assert!(entered.is_ok(), "the deadline retry did not start teardown");
+    assert!(!run.owner.witnessed());
+    let script = operation(&client, &receipt).await;
+    assert_eq!(script["state"], "interrupted", "{script}");
+    assert_eq!(script["reason"], "execution_unknown", "{script}");
+    assert!(script.get("exit_code").is_none(), "{script}");
+    run.released(&h, &supervisor).await;
+    assert_eq!(vm_state(&h, run.vm), 3);
+    assert_eq!(run.control.received().len(), 1);
+    drop(supervisor);
+    finish_script_test(h, vec![client], run).await;
+}
+
+#[tokio::test]
+async fn a_held_store_connection_cannot_delay_script_loss_teardown() {
+    let h = windows_harness().await;
+    let client = h.client(0).await;
+    let run = script_run(&h, &client, 584).await;
+    let supervisor = h.supervisor().clone();
+    let receipt = call(&client, "vm_run_script", run.script(585, "hold", 60)).await;
+    assert_eq!(receipt["ok"], true, "{receipt}");
+    tokio::time::timeout(Duration::from_secs(3), run.control.held.wait_entered()).await.unwrap();
+    let (held, entered) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let holder = supervisor.clone();
+    let holding = tokio::task::spawn_blocking(move || {
+        holder.controller.native_store().transact(|_| {
+            held.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+            Ok(())
+        }).unwrap();
+    });
+    entered.await.unwrap();
+    // The owner's final monitor sample refuses while the connection mutex
+    // is held. Teardown must start before this other thread releases it.
+    run.control.held.release();
+    let started = tokio::time::timeout(Duration::from_secs(2), run.teardown.wait_entered()).await;
+    drop(release);
+    holding.await.unwrap();
+    assert!(started.is_ok(), "the held store mutex delayed teardown");
+    assert!(!run.owner.witnessed());
+    assert_eq!(operation(&client, &receipt).await["state"], "pending");
+    run.released(&h, &supervisor).await;
+    let script = operation(&client, &receipt).await;
+    assert_eq!(script["state"], "interrupted", "{script}");
+    assert_eq!(script["reason"], "execution_unknown", "{script}");
+    assert_eq!(vm_state(&h, run.vm), 3);
+    drop(supervisor);
+    finish_script_test(h, vec![client], run).await;
+}
+
+#[tokio::test]
+async fn a_script_receipt_write_fault_preserves_the_owner_stop_and_starts_teardown() {
+    let h = windows_harness().await;
+    let client = h.client(0).await;
+    let run = script_run(&h, &client, 586).await;
+    let supervisor = h.supervisor().clone();
+    let receipt = call(&client, "vm_run_script", run.script(587, "hold", 60)).await;
+    assert_eq!(receipt["ok"], true, "{receipt}");
+    tokio::time::timeout(Duration::from_secs(3), run.control.held.wait_entered()).await.unwrap();
+    sql(&h, FAIL_SCRIPT_RECEIPT);
+    let args = run.stop(588);
+    let stop = call(&client, "vm_stop", args.clone()).await;
+    assert_eq!(stop["ok"], true, "{stop}");
+    let entered = tokio::time::timeout(Duration::from_secs(3), run.teardown.wait_entered()).await;
+    assert!(entered.is_ok(), "the receipt write fault suppressed owner cancellation");
+    assert!(!run.owner.witnessed());
+    assert_eq!(call(&client, "vm_stop", args).await, stop);
+    let competing = call(&client, "vm_stop", run.stop(589)).await;
+    assert_eq!(competing["ok"], false, "{competing}");
+    let stop = operation(&client, &stop).await;
+    assert_eq!(stop["state"], "interrupted", "{stop}");
+    assert_eq!(stop["reason"], "cleanup_unconfirmed", "{stop}");
+    assert_eq!(operation(&client, &receipt).await["state"], "pending");
+    assert_eq!(unresolved_epoch(&h, run.vm), Some((run.scope.generation, run.epoch)));
+
+    sql(&h, "DROP TRIGGER fail_script");
+    run.released(&h, &supervisor).await;
+    let script = operation(&client, &receipt).await;
+    assert_eq!(script["state"], "failed", "{script}");
+    assert_eq!(script["reason"], "execution_unknown", "{script}");
+    assert_eq!(vm_state(&h, run.vm), 3);
+    drop(supervisor);
+    finish_script_test(h, vec![client], run).await;
+}
+
+#[tokio::test]
+async fn pending_cap_counts_the_script_replaced_by_an_authenticated_stop() {
+    for (number, in_flight) in [(645, true), (650, false)] {
+        let h = windows_harness().await;
+        let client = h.client(0).await;
+        let run = script_run(&h, &client, number).await;
+        let supervisor = h.supervisor().clone();
+        let script = if in_flight {
+            let script = call(&client, "vm_run_script", run.script(number + 1, "hold", 60)).await;
+            assert_eq!(script["ok"], true, "{script}");
+            tokio::time::timeout(Duration::from_secs(3), run.control.held.wait_entered()).await.unwrap();
+            Some(script)
+        } else {
+            None
+        };
+        supervisor.controller.native_store().transact(|db| {
+            for _ in 0..store::MAX_CALLER_PENDING - i64::from(in_flight) {
+                db.execute(
+                    "INSERT INTO activity(principal,actor,vm,action,started_ms)
+                     VALUES('capfixture','agent',randomblob(16),2,0)",
+                    [],
+                )?;
+                db.execute(
+                    "INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,valid_through_ms)
+                     SELECT principal,randomblob(16),vm,action,id,0 FROM activity WHERE id=last_insert_rowid()",
+                    [],
+                )?;
+            }
+            assert_eq!(store::count(db, "SELECT count(*) FROM vm_operations WHERE status=0", [])?,
+                store::MAX_CALLER_PENDING);
+            Ok(())
+        }).unwrap();
+        let args = run.stop(number + 2);
+        let stop = call(&client, "vm_stop", args.clone()).await;
+        if let Some(script) = script {
+            assert_eq!(stop["ok"], true, "{stop}");
+            assert_eq!(operation(&client, &script).await["reason"], "execution_unknown");
+        } else {
+            assert_eq!(stop["reason"], "pending_full", "{stop}");
+            assert!(run.owner.witnessed());
+        }
+        sql(&h, "DELETE FROM vm_operations WHERE principal='capfixture';
+                 DELETE FROM activity WHERE principal='capfixture'");
+        let stop = if in_flight { stop } else { call(&client, "vm_stop", args).await };
+        assert_eq!(stop["ok"], true, "{stop}");
+        run.teardown_entered().await;
+        run.released(&h, &supervisor).await;
+        assert_eq!(terminal(&client, &stop).await["state"], "succeeded");
+        drop(supervisor);
+        finish_script_test(h, vec![client], run).await;
+    }
+}
+
+#[tokio::test]
+async fn revocation_of_a_queued_script_withdraws_on_authorization_refusal() {
+    let h = windows_harness().await;
+    let client = h.client(0).await;
+    let run = script_run(&h, &client, 655).await;
+    let supervisor = h.supervisor().clone();
+    run.control.hold_pings.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(3), run.control.ping_hold.wait_entered()).await.unwrap();
+    let receipt = call(&client, "vm_run_script", run.script(656, "exit 0", 60)).await;
+    assert_eq!(receipt["ok"], true, "{receipt}");
+    run.revoked.store(true, Ordering::SeqCst);
+    run.control.ping_hold.release();
+    let entered = tokio::time::timeout(Duration::from_secs(2), run.teardown.wait_entered()).await;
+    assert!(entered.is_ok(), "refused authorization left the revoked run serving");
+    assert!(!run.owner.witnessed());
+    assert!(run.control.received().is_empty());
+    let script = operation(&client, &receipt).await;
+    assert_eq!(script["state"], "failed", "{script}");
+    assert_eq!(script["reason"], "cancelled", "{script}");
+    run.released(&h, &supervisor).await;
+    drop(supervisor);
     finish_script_test(h, vec![client], run).await;
 }
 

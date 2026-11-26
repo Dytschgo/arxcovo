@@ -966,6 +966,20 @@ impl<'a> NativeLaunch<'a> {
         ) {
             return Err(NativeRefusal::QualificationMissing);
         }
+        self.exchange_script(script, timeout_s, deadline, cancel, refresh)
+            .await
+    }
+
+    // Both callers consume their own scope and payload authority before
+    // entering this transport. Each caller owns its own failure teardown.
+    async fn exchange_script(
+        &mut self,
+        script: String,
+        timeout_s: u32,
+        deadline: Instant,
+        cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(ScriptStatus, Option<u32>), NativeRefusal> {
         self.guest_exchange(
             GuestRequest::Script(script, timeout_s),
             Some(deadline),
@@ -990,13 +1004,9 @@ impl<'a> NativeLaunch<'a> {
                 u64::from(*timeout) + crate::vm::guest::SCRIPT_EXCHANGE_SLACK.as_secs()
             }
         };
-        let mut deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
-        if let Some(cap) = cap {
-            deadline = deadline.min(cap.into());
-        }
         match self.live.as_deref_mut() {
             Some((_, guest)) if !cancel.is_cancelled() => {
-                monitor_running(
+                monitor_guest_exchange(
                     async {
                         match request {
                             GuestRequest::Ping => guest.ping(cancel).await.map(|()| None),
@@ -1013,8 +1023,8 @@ impl<'a> NativeLaunch<'a> {
                         )
                     },
                     cancel,
-                    deadline,
-                    |_| unavailable,
+                    Duration::from_secs(seconds),
+                    cap,
                 )
                 .await
             }
@@ -1152,6 +1162,55 @@ impl custody::TestRelease<'_> {
             crate::store::vm::native::release::commit(db, self.observed(), stop, clock)?;
             Ok(())
         })
+    }
+}
+
+async fn monitor_guest_exchange<T>(
+    exchange: impl std::future::Future<Output = Result<T, NativeRefusal>>,
+    observe: impl FnMut() -> Result<(), NativeRefusal>,
+    cancel: &Shutdown,
+    budget: Duration,
+    cap: Option<Instant>,
+) -> Result<T, NativeRefusal> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = cap.map_or(deadline, |cap| deadline.min(cap.into()));
+    monitor_running(exchange, observe, cancel, deadline, |_| {
+        NativeRefusal::GuestEndpointUnverified
+    })
+    .await
+}
+
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn guest_exchange_applies_the_admitted_cutoff_to_typed_replies() {
+    use tokio::time::{Instant, sleep_until};
+
+    let cancel = Shutdown::default();
+    let cap = Duration::from_secs(1);
+    let typed = (ScriptStatus::Exited, Some(7));
+    for reply_after in [
+        Duration::from_millis(500),
+        cap,
+        cap + Duration::from_millis(1),
+    ] {
+        let started = Instant::now();
+        let result = monitor_guest_exchange(
+            async {
+                sleep_until(started + reply_after).await;
+                Ok(typed)
+            },
+            || Ok(()),
+            &cancel,
+            Duration::from_secs(6),
+            Some((started + cap).into_std()),
+        )
+        .await;
+        if reply_after < cap {
+            assert_eq!(result.unwrap(), typed);
+        } else {
+            assert_eq!(result.unwrap_err(), NativeRefusal::GuestEndpointUnverified);
+            assert!((cap..=cap + Duration::from_millis(5)).contains(&started.elapsed()));
+        }
     }
 }
 

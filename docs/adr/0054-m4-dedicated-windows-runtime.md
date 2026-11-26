@@ -2037,3 +2037,14 @@ rechecks cancellation and the cutoff inside its transaction, and the seal
 gate rechecks the pre-seal observation's age. Cancellation, the effect cutoff
 and the controller's worker deadline record no failure cause, and an
 installer stage that reaches its own deadline records its timeout.
+
+## 7c amendment — stop when the script receipt cannot be written
+
+The v17 pending-activity index permits one pending operation per VM. A
+normal owned stop replaces the pending script receipt in the admission
+transaction. If just that settlement fails, roll back the script writes
+to a savepoint and record an interrupted, replayable stop against the
+exact owned VM. Fence the generation into recovery without changing the
+pending script. Signal the live owner to start teardown and retain the
+script obligation. The release still requires proof for the same writer
+epoch. An interrupted stop does not report a successful release.
