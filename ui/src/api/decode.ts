@@ -4,10 +4,12 @@
 import {
   ACTIVITY_OUTCOMES,
   ApiError,
+  CPU_HISTORY_RANGES,
   VM_STATES,
   type ActivityEntry,
   type ActivityPage,
   type Arch,
+  type CpuHistory,
   type Host,
   type OsFamily,
   type Session,
@@ -144,6 +146,36 @@ export function decodeHost(v: unknown, path = 'host'): Host {
 
 export function decodeHosts(v: unknown): Host[] {
   return arr(obj(v, 'response').hosts, 'hosts', LIMITS.hosts, decodeHost);
+}
+
+export function decodeCpuHistory(v: unknown, path = 'cpuHistory'): CpuHistory {
+  const o = obj(v, path);
+  const range = oneOf(o.range, ['1h', '6h', '24h'] as const, `${path}.range`);
+  const { bucketSeconds, points } = CPU_HISTORY_RANGES[range];
+  if (o.bucketSeconds !== bucketSeconds) fail(`${path}.bucketSeconds`);
+  const from = iso(o.from, `${path}.from`);
+  const to = iso(o.to, `${path}.to`);
+  const start = Date.parse(from);
+  const width = bucketSeconds * 1000;
+  if (start % width !== 0 || Date.parse(to) !== start + points * width) fail(path);
+  const samples = arr(o.samples, `${path}.samples`, points, (v, p) => {
+    if (v === null) return null;
+    const percent = num(v, p, 0, 100);
+    if (!Number.isInteger(percent * 10)) fail(p);
+    return percent;
+  });
+  if (samples.length !== points) fail(`${path}.samples`);
+  return { hostId: id(o.hostId, `${path}.hostId`), range, bucketSeconds, from, to, samples };
+}
+
+export function decodeCpuHistoryBatch(v: unknown): CpuHistory[] {
+  const hostIds = new Set<string>();
+  return arr(obj(v, 'response').series, 'series', LIMITS.hosts, (v, path) => {
+    const history = decodeCpuHistory(v, path);
+    if (history.range !== '24h' || hostIds.has(history.hostId)) fail(path);
+    hostIds.add(history.hostId);
+    return history;
+  });
 }
 
 export function decodeActivityEntry(v: unknown, path = 'entry'): ActivityEntry {
