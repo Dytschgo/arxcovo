@@ -286,6 +286,51 @@ fn open_relative(
     mutable: bool,
     create: bool,
 ) -> io::Result<File> {
+    // Every branch requests data access, so the pin participates in sharing
+    // checks: no branch shares delete, so rename and delete of a pinned
+    // object are refused. A writable leaf shares write for its consumer.
+    let access = if create {
+        FILE_GENERIC_WRITE | FILE_GENERIC_READ
+    } else {
+        FILE_GENERIC_READ | READ_CONTROL
+    };
+    let share = FILE_SHARE_READ | if mutable { FILE_SHARE_WRITE } else { 0 };
+    let kind = match node {
+        Node::Directory => FILE_DIRECTORY_FILE,
+        Node::File => FILE_NON_DIRECTORY_FILE,
+    };
+    nt_open_relative(
+        parent,
+        name,
+        access,
+        share,
+        if create { FILE_CREATE } else { FILE_OPEN },
+        kind,
+    )
+}
+
+/// Attribute-only, no-follow open of one name of either kind. It requests
+/// no data access, so it neither conflicts with nor grants a sharing mode.
+/// Callers use it only to classify presence and never to adopt the object.
+fn probe_relative(parent: &File, name: &str) -> io::Result<File> {
+    nt_open_relative(
+        parent,
+        name,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        0,
+    )
+}
+
+fn nt_open_relative(
+    parent: &File,
+    name: &str,
+    access: u32,
+    share: u32,
+    disposition: u32,
+    kind: u32,
+) -> io::Result<File> {
     if name.is_empty() || name.contains(['\\', '/', ':']) {
         return Err(io::Error::other("not a single path component"));
     }
@@ -304,21 +349,7 @@ fn open_relative(
         SecurityDescriptor: null(),
         SecurityQualityOfService: null(),
     };
-    // Every branch requests data access, so the pin participates in sharing
-    // checks: no branch shares delete, so rename and delete of a pinned
-    // object are refused. A writable leaf shares write for its consumer.
-    let access = if create {
-        FILE_GENERIC_WRITE | FILE_GENERIC_READ
-    } else {
-        FILE_GENERIC_READ | READ_CONTROL
-    };
-    let share = FILE_SHARE_READ | if mutable { FILE_SHARE_WRITE } else { 0 };
-    let options = FILE_OPEN_REPARSE_POINT
-        | FILE_SYNCHRONOUS_IO_NONALERT
-        | match node {
-            Node::Directory => FILE_DIRECTORY_FILE,
-            Node::File => FILE_NON_DIRECTORY_FILE,
-        };
+    let options = FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | kind;
     let mut handle = null_mut();
     // Zero is a valid initial state for this output-only status block.
     let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
@@ -332,7 +363,7 @@ fn open_relative(
             null(),
             FILE_ATTRIBUTE_NORMAL,
             share,
-            if create { FILE_CREATE } else { FILE_OPEN },
+            disposition,
             options,
             null(),
             0,
