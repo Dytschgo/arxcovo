@@ -63,6 +63,13 @@ impl ForegroundQualification<'_> {
         hold_workspace_under(self.production_root(), self.held.token.account.0, expected)
     }
 
+    pub(crate) fn hold_start_workspace(
+        &self,
+        expected: WorkspaceBinding,
+    ) -> Result<ProductionWorkspace, NativeRefusal> {
+        hold_workspace_under(self.production_root(), self.held.token.account.0, expected)
+    }
+
     pub(super) fn launch_live(&self, memory: usize) -> Result<Instant, NativeRefusal> {
         self.observe_host(memory).map(|(captured, _)| captured)
     }
@@ -242,6 +249,7 @@ struct RefusalScope {
     /// Spent by the first observation, whatever that attempt's outcome.
     acquisition: Option<()>,
     cutoff: Instant,
+    child_settled: bool,
 }
 
 impl RefusalScope {
@@ -252,6 +260,7 @@ impl RefusalScope {
             acquired: None,
             acquisition: acquisition.then_some(()),
             cutoff: Instant::now() + REFUSAL_OBSERVATION_BUDGET,
+            child_settled: false,
         })
     }
 }
@@ -333,13 +342,36 @@ impl<'a> StartRefusal<'a> {
     ) -> Result<(), NativeRefusal> {
         let reason = NativeRefusal::JobUnverified;
         match &mut self.failure.creation {
-            LaunchCreation::Created(child) => child.settle(deadline).await.map_err(|_| reason),
+            LaunchCreation::Created(child) => {
+                child.settle(deadline).await.map_err(|_| reason)?;
+                self.scope.child_settled = true;
+                Ok(())
+            }
             LaunchCreation::Unconfirmed { job, .. } => {
                 let _ = job.terminate();
                 Err(reason)
             }
             LaunchCreation::NeverCreated => Err(reason),
         }
+    }
+
+    /// Whether a later observation could still prove this release. An
+    /// unconfirmed creation never can. A never-created start needs a held or
+    /// still acquirable workspace before its fixed cutoff. A created child
+    /// keeps retry ownership until it settles and its held pair is proved.
+    pub(crate) fn can_progress(&self) -> bool {
+        let scope = &*self.scope;
+        scope.pair.is_some()
+            && match self.creation() {
+                StartCreation::Unconfirmed => false,
+                StartCreation::Created => true,
+                StartCreation::NeverCreated => {
+                    Instant::now() < scope.cutoff
+                        && (self.workspace.is_some()
+                            || scope.acquired.is_some()
+                            || scope.acquisition.is_some())
+                }
+            }
     }
 
     /// Observes the bound scope only. The caller's deadline can shorten, never
@@ -351,6 +383,15 @@ impl<'a> StartRefusal<'a> {
         acquire: impl FnOnce(WorkspaceBinding) -> Result<ProductionWorkspace, NativeRefusal>,
         consume: impl FnOnce(Option<HeldStartRefusal<'_>>) -> T,
     ) -> T {
+        consume(self.observe(deadline, stop, acquire))
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        deadline: Instant,
+        stop: &dyn Fn() -> bool,
+        acquire: impl FnOnce(WorkspaceBinding) -> Result<ProductionWorkspace, NativeRefusal>,
+    ) -> Option<HeldStartRefusal<'_>> {
         let never_created = self.creation() == StartCreation::NeverCreated;
         let scope = &mut *self.scope;
         let deadline = deadline.min(scope.cutoff);
@@ -365,22 +406,84 @@ impl<'a> StartRefusal<'a> {
                 .filter(|workspace| workspace.binding() == scope.binding);
         }
         let (binding, pair) = (scope.binding, scope.pair);
-        let observation = self
-            .workspace
+        self.workspace
             .or(scope.acquired.as_ref())
             .filter(|workspace| workspace.binding() == binding)
             .map(|workspace| HeldStartRefusal {
                 workspace,
                 pair,
-                release: pair
-                    .filter(|_| never_created)
-                    .and_then(|pair| workspace.unchanged_pair(pair, deadline, stop).ok()),
-            });
-        consume(observation)
+                release: pair.and_then(|pair| {
+                    if never_created {
+                        workspace.unchanged_pair(pair, deadline, stop).ok()
+                    } else if scope.child_settled {
+                        workspace.released_start_pair(pair).ok()
+                    } else {
+                        None
+                    }
+                }),
+            })
     }
 }
 
 impl ProductionWorkspace {
+    pub(crate) fn check_start_pair(
+        &self,
+        pair: StartPair,
+        deadline: Instant,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(), NativeRefusal> {
+        self.unchanged_pair(pair, deadline, stop).map(drop)
+    }
+
+    pub(crate) fn start_backing(
+        &self,
+        (slot, evidence): (ArtifactSlot, ArtifactEvidence),
+        deadline: Instant,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<crate::vm::paths::Artifact, NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        if slot.role != "disk" || evidence.directory != self.binding.workspace.file {
+            return Err(reason);
+        }
+        let mut pin = self.pin_slot(slot, evidence.identity, false)?;
+        if launch::hash_at_rest_until(&mut pin, START_PAIR_LIMITS[0], deadline, stop)?
+            != evidence.pin
+        {
+            return Err(reason);
+        }
+        launch::artifact(ArtifactRole::Golden, &pin)
+    }
+
+    fn released_start_pair(
+        &self,
+        pair: StartPair,
+    ) -> Result<ReleasedGeneration<'_>, NativeRefusal> {
+        let reason = NativeRefusal::PathCustodyUnverified;
+        check_pair(self.binding, pair.slots)?;
+        let ids = pair.evidence.map(|file| file.identity);
+        let pins = [
+            self.pin_slot(pair.slots.disk, ids[0], false)?,
+            self.pin_slot(pair.slots.vars, ids[1], false)?,
+        ];
+        let writers = pins
+            .iter()
+            .map(PathPin::reopen_without_writer)
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(|_| reason)?;
+        let mut proof = ReleasedGeneration::checked(
+            self.binding,
+            ReleaseTargets::Pair {
+                pair: pair.slots,
+                ids,
+            },
+            WorkspaceCustody::production(&self.root, &self.lease)?,
+            (std::sync::Arc::from(pins), writers),
+        )
+        .ok_or(reason)?;
+        proof.stop_disposition = Some(StopDisposition::DirtyRelease);
+        Ok(proof)
+    }
+
     fn unchanged_pair(
         &self,
         StartPair { slots, evidence }: StartPair,
@@ -780,37 +883,37 @@ impl<'a> NativeLaunch<'a> {
         })
     }
 
+    pub(crate) const START_MEMORY: usize = TEST_JOB_MEMORY;
+    pub(crate) const START_CPU_RATE: u32 = JOB_CPU_RATE;
+
     pub(crate) async fn boot(
         &mut self,
         cancel: &Shutdown,
+        boot_by: Instant,
         mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
-        verify_release: impl FnOnce() -> bool + Send + 'static,
-    ) -> Result<(), LaunchFailure<'a>> {
-        let outcome = match (self.core.kind, self.serial, self.io.take()) {
+    ) -> Result<(), NativeRefusal> {
+        match (self.core.kind, self.serial, self.io.take()) {
             (PlanKind::Boot, Some(serial), Some(io)) => {
-                self.core
-                    .boot(
-                        Some((&self.qualification.held.token, serial)),
+                match self
+                    .core
+                    .boot_until(
+                        Some((&self.qualification.held.token, serial, boot_by.into())),
                         io,
                         cancel,
                         || Ok(self.qualification.launch_live(self.memory)?.min(refresh()?)),
                         || false,
                     )
                     .await
+                {
+                    Ok(BootOutcome::Installed(live)) => {
+                        self.live = Some(live);
+                        Ok(())
+                    }
+                    Err(BootFailure::Native(reason)) => Err(reason),
+                    _ => Err(NativeRefusal::QualificationMissing),
+                }
             }
-            _ => Err(BootFailure::Native(NativeRefusal::QualificationMissing)),
-        };
-        match outcome {
-            Ok(BootOutcome::Installed(live)) => {
-                self.live = Some(live);
-                Ok(())
-            }
-            Err(BootFailure::Native(reason)) => {
-                Err(self.settle_failure(reason, cancel, verify_release).await)
-            }
-            _ => Err(self
-                .settle_failure(NativeRefusal::QualificationMissing, cancel, verify_release)
-                .await),
+            _ => Err(NativeRefusal::QualificationMissing),
         }
     }
 
@@ -824,13 +927,14 @@ impl<'a> NativeLaunch<'a> {
         )
     }
 
+    /// A failed exchange returns before teardown so the owner can withdraw
+    /// the public witness while the same launch still owns every handle.
     pub(crate) async fn ping(
         &mut self,
         cancel: &Shutdown,
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
-        verify_release: impl FnOnce() -> bool + Send + 'static,
-    ) -> Result<(), LaunchFailure<'a>> {
-        self.guest_exchange(GuestRequest::Ping, cancel, refresh, verify_release)
+    ) -> Result<(), NativeRefusal> {
+        self.guest_exchange(GuestRequest::Ping, cancel, refresh)
             .await
             .map(|_| ())
     }
@@ -843,14 +947,13 @@ impl<'a> NativeLaunch<'a> {
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<(ScriptStatus, Option<u32>), LaunchFailure<'a>> {
-        self.guest_exchange(
-            GuestRequest::Script(script, timeout_s),
-            cancel,
-            refresh,
-            verify_release,
-        )
-        .await
-        .map(|result| result.expect("script request returns a script result"))
+        match self
+            .guest_exchange(GuestRequest::Script(script, timeout_s), cancel, refresh)
+            .await
+        {
+            Ok(result) => Ok(result.expect("script request returns a script result")),
+            Err(reason) => Err(self.settle_failure(reason, cancel, verify_release).await),
+        }
     }
 
     async fn guest_exchange(
@@ -858,15 +961,14 @@ impl<'a> NativeLaunch<'a> {
         request: GuestRequest,
         cancel: &Shutdown,
         mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
-        verify_release: impl FnOnce() -> bool + Send + 'static,
-    ) -> Result<Option<(ScriptStatus, Option<u32>)>, LaunchFailure<'a>> {
+    ) -> Result<Option<(ScriptStatus, Option<u32>)>, NativeRefusal> {
         let unavailable = NativeRefusal::GuestEndpointUnverified;
         let seconds = match &request {
             GuestRequest::Ping => 5,
             GuestRequest::Script(_, timeout) => u64::from(*timeout) + 5,
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
-        let outcome = match self.live.as_deref_mut() {
+        match self.live.as_deref_mut() {
             Some((_, guest)) if !cancel.is_cancelled() => {
                 monitor_running(
                     async {
@@ -891,10 +993,6 @@ impl<'a> NativeLaunch<'a> {
                 .await
             }
             _ => Err(unavailable),
-        };
-        match outcome {
-            Ok(result) => Ok(result),
-            Err(reason) => Err(self.settle_failure(reason, cancel, verify_release).await),
         }
     }
 
@@ -1001,7 +1099,7 @@ impl<'a> NativeLaunch<'a> {
         self.stop_generation(cancel, verify_release).await
     }
 
-    async fn stop_generation(
+    pub(crate) async fn stop_generation(
         &mut self,
         cancel: &Shutdown,
         verify_release: impl FnOnce() -> bool + Send + 'static,
@@ -1025,6 +1123,21 @@ impl<'a> NativeLaunch<'a> {
             self.core.workspace,
             held,
         )
+    }
+}
+
+impl custody::TestRelease<'_> {
+    /// Store contention leaves the caller's writer exclusions in place.
+    pub(crate) fn try_commit_stop(
+        &self,
+        store: &crate::store::vm::VmStore,
+        stop: Option<&crate::store::vm::native::release::StopReceipt>,
+        clock: impl FnOnce() -> crate::vm::ClockReading,
+    ) -> anyhow::Result<()> {
+        store.try_native_transaction(|db| {
+            crate::store::vm::native::release::commit(db, self.observed(), stop, clock)?;
+            Ok(())
+        })
     }
 }
 

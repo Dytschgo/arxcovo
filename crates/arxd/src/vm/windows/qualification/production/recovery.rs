@@ -192,7 +192,13 @@ impl<'a> NativeRecovery<'a> {
             (pins, writers),
         )
         .ok_or_else(path)?;
-        proof.stop_disposition = Some(StopDisposition::DirtyRelease);
+        // Without a crossed creation edge nothing ran, and the ledger settles
+        // only the unchanged recorded pair, so the release may be clean.
+        proof.stop_disposition = Some(if expected.created {
+            StopDisposition::DirtyRelease
+        } else {
+            StopDisposition::CleanRelease
+        });
         let observation = proof
             .observe_test_release(expected.target, deadline, &|| false)
             .map_err(|_| path())?;

@@ -1,5 +1,6 @@
 //! Durable provenance for the checked TEST process-creation edge.
 use super::{Scope, bound, owner_live, release};
+use crate::store::vm::evidence_matches;
 use crate::vm::reaper::CleanupKind;
 use crate::vm::{ArtifactSlot, ClockReading, Id, PairSlots, paths::FileIdentity};
 use anyhow::{Result, ensure};
@@ -83,6 +84,30 @@ pub(crate) fn record_job(db: &Connection, scope: Scope, epoch: Id, origin: Origi
     Ok(())
 }
 
+/// Start admission installs its operation as the exact writer epoch in the
+/// same transaction that invalidates the released pair. The null origin
+/// records that no checked creation edge was crossed for this epoch yet;
+/// only [`record_job`] at that edge can set it.
+pub(crate) fn admit_epoch(db: &Connection, scope: Scope, epoch: Id) -> Result<()> {
+    ensure!(bound(db, scope)?, "unbound TEST writer scope");
+    ensure!(
+        super::count(
+            db,
+            "SELECT count(*) FROM vm_snapshot_release
+             WHERE generation=?1 AND epoch=?2 AND disposition IS NULL",
+            params![scope.generation, epoch],
+        )? == 1,
+        "TEST writer epoch is not the unresolved release"
+    );
+    db.execute(
+        "INSERT INTO vm_native_writer(generation,epoch,protocol) VALUES(?1,?2,1)
+         ON CONFLICT(generation) DO UPDATE
+         SET epoch=excluded.epoch,boot=NULL,database_file=NULL,lock_file=NULL",
+        params![scope.generation, epoch],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn requires_release(db: &Connection, kind: CleanupKind) -> Result<bool> {
     let (vm, activity) = match kind {
         CleanupKind::Recovery { vm, activity_id } | CleanupKind::Expiry { vm, activity_id } => {
@@ -107,6 +132,8 @@ pub(crate) struct Orphan {
     pub scope: Scope,
     pub slots: PairSlots,
     pub identities: [FileIdentity; 2],
+    /// Whether the exact epoch crossed its checked creation edge.
+    pub created: bool,
 }
 
 pub(crate) fn orphan(db: &Connection, kind: CleanupKind, origin: Origin) -> Result<Option<Orphan>> {
@@ -116,14 +143,17 @@ pub(crate) fn orphan(db: &Connection, kind: CleanupKind, origin: Origin) -> Resu
         CleanupKind::Expiry { vm, activity_id } => (vm, activity_id, 4, Some("lease")),
         _ => return Ok(None),
     };
-    let Some((generation, epoch)) = db
+    // An epoch that crossed its creation edge needs its exact Job origin.
+    // One that never crossed it has a null origin and no process to prove.
+    let Some((generation, epoch, created)) = db
         .query_row(
-            "SELECT g.id,r.epoch FROM vm_instances v JOIN vm_generations g ON g.vm_id=v.id
+            "SELECT g.id,r.epoch,w.boot IS NOT NULL FROM vm_instances v
+         JOIN vm_generations g ON g.vm_id=v.id
          JOIN vm_snapshot_release r ON r.generation=g.id
          JOIN vm_native_writer w ON w.generation=g.id AND w.epoch=r.epoch
          WHERE v.id=?1 AND v.cleanup_id=?2 AND v.state=?3 AND v.cleanup_route IS ?4
-           AND g.active=1 AND g.static_id IS NULL AND r.disposition IS NULL
-           AND w.protocol=1 AND w.boot=?5 AND w.database_file=?6 AND w.lock_file=?7",
+           AND g.active=1 AND g.static_id IS NULL AND r.disposition IS NULL AND w.protocol=1
+           AND (w.boot IS NULL OR (w.boot=?5 AND w.database_file=?6 AND w.lock_file=?7))",
             params![
                 vm,
                 activity_id,
@@ -133,7 +163,7 @@ pub(crate) fn orphan(db: &Connection, kind: CleanupKind, origin: Origin) -> Resu
                 origin.database.file,
                 origin.lock.file
             ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?
     else {
@@ -182,6 +212,7 @@ pub(crate) fn orphan(db: &Connection, kind: CleanupKind, origin: Origin) -> Resu
         scope,
         slots: PairSlots { disk, vars },
         identities: [disk_id, vars_id],
+        created,
     }))
 }
 
@@ -199,11 +230,29 @@ pub(crate) fn commit(
             && observed.scope == expected.scope
             && observed.slots == expected.slots
             && observed.pins.map(|pin| pin.identity) == expected.identities
-            && !observed.clean,
+            // After the creation edge only a dirty release is exact. Before
+            // it nothing ran, so only the unchanged recorded pair settles.
+            && if expected.created {
+                !observed.clean
+            } else {
+                unchanged(db, observed)?
+            },
         "stale TEST orphan release"
     );
     release::commit(db, observed, None, clock)?;
     Ok(())
+}
+
+fn unchanged(db: &Connection, observed: &release::Observed) -> Result<bool> {
+    for (slot, pin) in [observed.slots.disk, observed.slots.vars]
+        .into_iter()
+        .zip(observed.pins)
+    {
+        if !evidence_matches(db, slot, pin, "active")? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// A staged generation is safe to hand to checked disposal only if its

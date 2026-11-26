@@ -735,6 +735,19 @@ impl VmStore {
         Ok(result)
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn read_only<T>(
+        &self,
+        read: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM state unavailable"))?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        read(&tx)
+    }
+
     pub(crate) fn transact<T>(&self, run: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut db = self
             .db
@@ -1381,6 +1394,15 @@ pub(crate) fn retry_time(db: &Connection, now: i64) -> Result<i64> {
     )?)
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn retry_time_readonly(db: &Connection, now: i64) -> Result<i64> {
+    Ok(db.query_row(
+        "SELECT max(high_water_ms,?1) FROM vm_retry_clock",
+        [now],
+        |row| row.get(0),
+    )?)
+}
+
 pub(crate) struct Binding<'a> {
     pub principal: &'a str,
     pub key: RequestId,
@@ -1394,13 +1416,12 @@ pub(crate) struct Replay {
 }
 
 impl Binding<'_> {
-    pub(crate) fn replay(
+    fn lookup_replay(
         &self,
         db: &Connection,
         now: i64,
-        closed: bool,
+        retry_now: i64,
     ) -> Result<Result<Option<Replay>, Refusal>> {
-        let retry_now = retry_time(db, now)?;
         if self.valid_through() < retry_now {
             return Ok(Err(Refusal::StaleKey));
         }
@@ -1457,6 +1478,40 @@ impl Binding<'_> {
         if self.key.issued_at_ms > now || compose::compacted_key(db, self.principal, self.key.key)?
         {
             return Ok(Err(Refusal::StaleKey));
+        }
+        Ok(Ok(None))
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn replay_readonly(
+        &self,
+        db: &Connection,
+        now: i64,
+        closed: bool,
+    ) -> Result<Result<Option<Replay>, Refusal>> {
+        let retry_now = retry_time_readonly(db, now)?;
+        match self.lookup_replay(db, now, retry_now)? {
+            Ok(Some(prior)) => return Ok(Ok(Some(prior))),
+            Err(reason) => return Ok(Err(reason)),
+            Ok(None) => {}
+        }
+        if closed {
+            return Ok(Err(Refusal::Shutdown));
+        }
+        Ok(Ok(None))
+    }
+
+    pub(crate) fn replay(
+        &self,
+        db: &Connection,
+        now: i64,
+        closed: bool,
+    ) -> Result<Result<Option<Replay>, Refusal>> {
+        let retry_now = retry_time(db, now)?;
+        match self.lookup_replay(db, now, retry_now)? {
+            Ok(Some(prior)) => return Ok(Ok(Some(prior))),
+            Err(reason) => return Ok(Err(reason)),
+            Ok(None) => {}
         }
         if closed {
             return Ok(Err(Refusal::Shutdown));

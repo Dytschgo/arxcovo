@@ -2950,7 +2950,9 @@ struct LaunchInputs<'a> {
 /// entry points. Neither entry can mint or convert into the other's authority.
 struct CheckedLaunchCore<'a> {
     child: Child,
-    workers: Option<WorkerSet>,
+    workers: WorkerSet,
+    shutdown_observed: Option<(bool, bool)>,
+    workers_ended: Option<WorkersEnded>,
     gate: std::sync::Arc<DispatchGate>,
     pins: std::sync::Arc<[PathPin]>,
     setup_vars_handoff: Option<File>,
@@ -3219,7 +3221,9 @@ impl<'a> CheckedLaunchCore<'a> {
         Ok((
             Self {
                 child,
-                workers: Some(workers),
+                workers,
+                shutdown_observed: None,
+                workers_ended: None,
                 gate,
                 pins: inputs.pins.into(),
                 setup_vars_handoff,
@@ -3290,6 +3294,30 @@ async fn monitor_running<T, E>(
     result.and_then(|value| terminal.map(|()| value))
 }
 
+/// Runs the installed setup phase under the live monitor. The setup future
+/// stamps its accepted `cont` itself, so the monitor's terminal sample and
+/// any later scheduling count against the guest-ready budget it returns.
+async fn monitor_setup<T>(
+    setup: impl std::future::Future<Output = Result<T, NativeRefusal>>,
+    observe: impl FnMut() -> Result<(), NativeRefusal>,
+    cancel: &Shutdown,
+    setup_by: tokio::time::Instant,
+    boot_by: tokio::time::Instant,
+) -> Result<(T, tokio::time::Instant), NativeRefusal> {
+    let (value, accepted) = monitor_running(
+        async {
+            let value = setup.await?;
+            Ok::<_, NativeRefusal>((value, tokio::time::Instant::now()))
+        },
+        observe,
+        cancel,
+        setup_by,
+        |_| NativeRefusal::QmpUnverified,
+    )
+    .await?;
+    Ok((value, guest_ready_cutoff(boot_by, accepted)))
+}
+
 /// Release keeps its own teardown budget so custody evidence is collected
 /// after a refusal too. Output is accepted only if a host sample taken after
 /// release settles succeeds and its capture time is still fresh, and then
@@ -3356,7 +3384,7 @@ impl InstallerChild for CheckedLaunchCore<'_> {
         stage: InstallerStage,
         mut refresh: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
     ) -> Result<(), InstallerFailureReason> {
-        self.dispatch_cont(qmp, cancel, &mut refresh, Some(stage))
+        self.dispatch_cont(qmp, cancel, &mut refresh, Some(stage.deadline()))
             .await
     }
 
@@ -3556,7 +3584,27 @@ impl CheckedLaunchCore<'_> {
         endpoint: Option<(&VmToken, &SerialName)>,
         io: BootIo,
         cancel: &Shutdown,
-        // Returns the monotonic capture time of a fresh resource sample.
+        revalidate: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
+        verify_release: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<BootOutcome, BootFailure> {
+        let cutoff = tokio::time::Instant::now()
+            + Duration::from_secs(60)
+            + super::guest::GUEST_READY_BUDGET;
+        self.boot_until(
+            endpoint.map(|(token, serial)| (token, serial, cutoff)),
+            io,
+            cancel,
+            revalidate,
+            verify_release,
+        )
+        .await
+    }
+
+    async fn boot_until(
+        &mut self,
+        endpoint: Option<(&VmToken, &SerialName, tokio::time::Instant)>,
+        io: BootIo,
+        cancel: &Shutdown,
         mut revalidate: impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> Result<BootOutcome, BootFailure> {
@@ -3566,16 +3614,15 @@ impl CheckedLaunchCore<'_> {
                 .await
                 .map_err(|(failure, held)| BootFailure::Installer(failure, held));
         }
-        let (token, serial) = endpoint
+        let (token, serial, boot_by) = endpoint
             .filter(|_| self.kind == PlanKind::Boot)
             .ok_or(BootFailure::Native(NativeRefusal::QmpUnverified))?;
+        let setup_by = setup_cutoff(boot_by, tokio::time::Instant::now());
         self.child
-            .resume_checked(cancel, &mut revalidate)
+            .resume_checked_by(cancel, setup_by, &mut revalidate)
             .map_err(BootFailure::Native)?;
-        // The periodic monitor and cont gate both sample synchronously on the
-        // same task. The cell shares the sampler without a borrow across I/O.
         let refresh = std::cell::RefCell::new(revalidate);
-        monitor_running(
+        let ((mut qmp, pipe), ready_by) = monitor_setup(
             async {
                 // QEMU can wait for a serial client before sending QMP greeting.
                 let pipe = connect_serial(
@@ -3584,7 +3631,7 @@ impl CheckedLaunchCore<'_> {
                     token.account.0,
                     &token.entries(),
                     cancel,
-                    tokio::time::Instant::now() + Duration::from_secs(10),
+                    setup_by.min(tokio::time::Instant::now() + Duration::from_secs(10)),
                 )
                 .await?;
                 let (read, write) = io;
@@ -3594,26 +3641,41 @@ impl CheckedLaunchCore<'_> {
                 qmp.verify_whpx(cancel)
                     .await
                     .map_err(|_| NativeRefusal::WhpxUnverified)?;
-                self.dispatch_cont(&mut qmp, cancel, &mut || refresh.borrow_mut()(), None)
-                    .await
-                    .map_err(|error| match error {
-                        InstallerFailureReason::Native(reason) => reason,
-                        _ => NativeRefusal::QmpUnverified,
-                    })?;
-                let guest = GuestChannel::ready(pipe, &mut qmp, cancel)
-                    .await
-                    .map_err(|_| NativeRefusal::GuestEndpointUnverified)?;
-                Ok(BootOutcome::Installed(Box::new((qmp, guest))))
+                self.dispatch_cont(
+                    &mut qmp,
+                    cancel,
+                    &mut || refresh.borrow_mut()(),
+                    Some(setup_by),
+                )
+                .await
+                .map_err(|error| match error {
+                    InstallerFailureReason::Native(reason) => reason,
+                    _ => NativeRefusal::QmpUnverified,
+                })?;
+                Ok((qmp, pipe))
             },
             || self.check_running(&mut *refresh.borrow_mut(), false),
             cancel,
-            tokio::time::Instant::now()
-                + super::guest::GUEST_READY_BUDGET
-                + Duration::from_secs(60),
-            |_| NativeRefusal::QmpUnverified,
+            setup_by,
+            boot_by,
         )
         .await
-        .map_err(BootFailure::Native)
+        .map_err(BootFailure::Native)?;
+        // The guest-ready phase started at the accepted `cont`.
+        let guest = monitor_running(
+            async {
+                GuestChannel::ready(pipe, &mut qmp, cancel)
+                    .await
+                    .map_err(|_| NativeRefusal::GuestEndpointUnverified)
+            },
+            || self.check_running(&mut *refresh.borrow_mut(), false),
+            cancel,
+            ready_by,
+            |_| NativeRefusal::GuestEndpointUnverified,
+        )
+        .await
+        .map_err(BootFailure::Native)?;
+        Ok(BootOutcome::Installed(Box::new((qmp, guest))))
     }
 
     async fn dispatch_cont(
@@ -3621,7 +3683,7 @@ impl CheckedLaunchCore<'_> {
         qmp: &mut PipeQmp,
         cancel: &Shutdown,
         revalidate: &mut impl FnMut() -> Result<std::time::Instant, NativeRefusal>,
-        stage: Option<InstallerStage>,
+        cutoff: Option<tokio::time::Instant>,
     ) -> Result<(), InstallerFailureReason> {
         // Resample between the prelaunch status receipt and `cont`, rechecking
         // bundle, search namespace and all consumed input pins before arming.
@@ -3633,8 +3695,8 @@ impl CheckedLaunchCore<'_> {
                     .stock
                     .recheck_all(&self.pins, Some(&self.workspace))
                     .and_then(|()| revalidate())
-                    .and_then(|captured| match stage {
-                        Some(stage) => gate.arm_until(captured, Some(stage.deadline().into_std())),
+                    .and_then(|captured| match cutoff {
+                        Some(deadline) => gate.arm_until(captured, Some(deadline.into_std())),
                         None => gate.arm(captured),
                     });
                 match armed {
@@ -3652,8 +3714,7 @@ impl CheckedLaunchCore<'_> {
         // The acknowledgement does not touch the gate. Accept it only once the
         // worker has finished its write and recorded it as in time.
         let grace = Duration::from_secs(2);
-        if let Some(stage) = stage {
-            let deadline = stage.deadline();
+        if let Some(deadline) = cutoff {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(InstallerFailureReason::Cancelled),
@@ -3780,19 +3841,42 @@ impl CheckedLaunchCore<'_> {
         cancel: &Shutdown,
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> (StopDisposition, Option<HeldWriters>) {
-        let mut observed = StopEvidence::default();
-        if let Some(qmp) = qmp {
-            observed.guest_shutdown = qmp.powerdown(cancel).await.is_ok();
-        }
-        let grace = tokio::time::Instant::now() + Duration::from_secs(2);
-        if observed.guest_shutdown && self.child.reap(grace).await.is_ok() {
-            observed.clean_process_exit = self.child.exit_code() == Ok(0);
-        } else if self.child.job.terminate().is_err() {
-            return (StopDisposition::ChargedQuarantine, None);
-        }
+        let (guest_shutdown, clean_process_exit) = match self.shutdown_observed {
+            Some(_) => {
+                let job_empty = matches!(self.child.job.active(), Ok(0));
+                let (workers, job) = (&self.workers, &self.child.job);
+                match retry_shutdown_observation(&mut self.shutdown_observed, job_empty, || {
+                    workers.stop();
+                    job.terminate()
+                }) {
+                    Some(observed) => observed,
+                    None => return (StopDisposition::ChargedQuarantine, None),
+                }
+            }
+            None => {
+                let guest_shutdown = match qmp {
+                    Some(qmp) => qmp.powerdown(cancel).await.is_ok(),
+                    None => false,
+                };
+                let grace = tokio::time::Instant::now() + Duration::from_secs(2);
+                let clean_process_exit = if guest_shutdown && self.child.reap(grace).await.is_ok() {
+                    self.child.exit_code() == Ok(0)
+                } else {
+                    self.workers.stop();
+                    if !matches!(self.child.job.active(), Ok(0))
+                        && self.child.job.terminate().is_err()
+                    {
+                        return (StopDisposition::ChargedQuarantine, None);
+                    }
+                    false
+                };
+                self.shutdown_observed = Some((guest_shutdown, clean_process_exit));
+                (guest_shutdown, clean_process_exit)
+            }
+        };
         self.release_evidence_held(
-            observed.guest_shutdown,
-            observed.clean_process_exit,
+            guest_shutdown,
+            clean_process_exit,
             tokio::time::Instant::now() + Duration::from_secs(2),
             verify_release,
         )
@@ -3813,11 +3897,13 @@ impl CheckedLaunchCore<'_> {
         };
         observed.process_exited = self.child.reap(deadline).await.is_ok();
         observed.job_empty = matches!(self.child.job.active(), Ok(0));
-        observed.workers_joined = if let Some(workers) = self.workers.take() {
-            workers.join(deadline).await.is_ok()
-        } else {
-            false
-        };
+        if self.workers_ended.is_none() {
+            self.workers_ended = self.workers.join_all(deadline).await.ok();
+        }
+        if let Some(ended) = self.workers_ended {
+            observed.workers_joined = true;
+            observed.clean_process_exit &= !ended.failed;
+        }
         let pins = self.pins.clone();
         let writers = self.writers.clone();
         finish_release_held(
@@ -3839,6 +3925,51 @@ impl CheckedLaunchCore<'_> {
 }
 
 type HeldWriters = (std::sync::Arc<[PathPin]>, Vec<File>);
+
+/// The installed setup phase (resume through accepted `cont`) never outlives
+/// 60 seconds or the start's own cutoff.
+fn setup_cutoff(boot_by: tokio::time::Instant, now: tokio::time::Instant) -> tokio::time::Instant {
+    boot_by.min(now + Duration::from_secs(60))
+}
+
+/// The guest-ready phase starts at the accepted `cont` and never outlives
+/// `GUEST_READY_BUDGET` or the start's own cutoff.
+fn guest_ready_cutoff(
+    boot_by: tokio::time::Instant,
+    accepted: tokio::time::Instant,
+) -> tokio::time::Instant {
+    boot_by.min(accepted + super::guest::GUEST_READY_BUDGET)
+}
+
+/// Returns the shutdown observation for a stop retry and whether the retry
+/// must terminate a Job that is no longer empty.
+fn demote_on_live_job(
+    (guest_shutdown, clean_process_exit): (bool, bool),
+    job_empty: bool,
+) -> ((bool, bool), bool) {
+    if job_empty {
+        ((guest_shutdown, clean_process_exit), false)
+    } else {
+        ((guest_shutdown, false), true)
+    }
+}
+
+/// A stop retry reuses the cached graceful observation only while the Job
+/// stays empty. A survivor demotes it to a dirty exit, and the demotion is
+/// cached before termination is attempted, so a failed terminate cannot
+/// restore the clean result on a later retry. `None` keeps the charge.
+fn retry_shutdown_observation(
+    cache: &mut Option<(bool, bool)>,
+    job_empty: bool,
+    terminate: impl FnOnce() -> io::Result<()>,
+) -> Option<(bool, bool)> {
+    let (observed, survivor) = demote_on_live_job((*cache)?, job_empty);
+    *cache = Some(observed);
+    if survivor && terminate().is_err() {
+        return None;
+    }
+    Some(observed)
+}
 
 /// The worker owns custody and can only report evidence. The async caller
 /// alone accepts it and decides release. A detached worker may finish I/O,
@@ -3903,6 +4034,7 @@ impl Child {
     /// Checks cancellation, the live held child and a fresh resource sample,
     /// then releases the suspended thread. Nothing runs between the resource
     /// check and `ResumeThread` except the held-child liveness recheck.
+    #[cfg(test)]
     fn resume_checked(
         &mut self,
         cancel: &Shutdown,
@@ -4089,6 +4221,124 @@ mod tests {
     use super::*;
 
     mod qmp_stdio_fixture;
+
+    #[test]
+    fn installed_boot_phases_clamp_to_their_own_budgets_and_the_start_cutoff() {
+        let now = tokio::time::Instant::now();
+        let tick = Duration::from_nanos(1);
+        let setup = Duration::from_secs(60);
+        let ready = crate::vm::guest::GUEST_READY_BUDGET;
+        assert_eq!(ready, Duration::from_secs(180));
+        // A distant start cutoff leaves each phase its own budget.
+        let distant = now + Duration::from_secs(360);
+        assert_eq!(setup_cutoff(distant, now), now + setup);
+        assert_eq!(guest_ready_cutoff(distant, now), now + ready);
+        // One tick either side of each nested budget.
+        for (cutoff, budget) in [
+            (setup_cutoff as fn(_, _) -> _, setup),
+            (guest_ready_cutoff as fn(_, _) -> _, ready),
+        ] {
+            assert_eq!(cutoff(now + budget - tick, now), now + budget - tick);
+            assert_eq!(cutoff(now + budget, now), now + budget);
+            assert_eq!(cutoff(now + budget + tick, now), now + budget);
+        }
+        // A late accepted `cont` cannot extend readiness past the start cutoff.
+        let accepted = distant - Duration::from_secs(10);
+        assert_eq!(guest_ready_cutoff(distant, accepted), distant);
+    }
+
+    #[tokio::test]
+    async fn guest_ready_cutoff_counts_the_terminal_sample_after_accepted_cont() {
+        let accepted = std::cell::Cell::new(None);
+        let samples = std::cell::Cell::new(0_u32);
+        let now = tokio::time::Instant::now();
+        let (setup_by, boot_by) = (
+            now + Duration::from_secs(60),
+            now + Duration::from_secs(360),
+        );
+        let lag = Duration::from_millis(200);
+        let ((), ready_by) = monitor_setup(
+            async {
+                accepted.set(Some(tokio::time::Instant::now()));
+                Ok::<_, NativeRefusal>(())
+            },
+            || {
+                samples.set(samples.get() + 1);
+                // The terminal sample after the accepted `cont` is slow.
+                if accepted.get().is_some() {
+                    std::thread::sleep(lag);
+                }
+                Ok(())
+            },
+            &Shutdown::default(),
+            setup_by,
+            boot_by,
+        )
+        .await
+        .unwrap();
+        let accepted = accepted.get().unwrap();
+        let budget = crate::vm::guest::GUEST_READY_BUDGET;
+        assert!(samples.get() >= 2, "the terminal sample did not run");
+        assert!(ready_by >= accepted + budget);
+        assert!(
+            ready_by < accepted + budget + lag,
+            "the guest-ready phase started after the terminal sample"
+        );
+    }
+
+    #[test]
+    fn stop_retry_demotes_a_graceful_exit_while_the_job_still_has_a_process() {
+        for guest in [false, true] {
+            for clean in [false, true] {
+                assert_eq!(
+                    demote_on_live_job((guest, clean), true),
+                    ((guest, clean), false)
+                );
+                assert_eq!(
+                    demote_on_live_job((guest, clean), false),
+                    ((guest, false), true)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_terminate_keeps_the_demoted_observation_for_the_exact_release() {
+        // A cached graceful exit meets a live Job whose termination fails.
+        let mut cache = Some((true, true));
+        let terminated = std::cell::Cell::new(0);
+        let failed = retry_shutdown_observation(&mut cache, false, || {
+            terminated.set(terminated.get() + 1);
+            Err(io::Error::other("fixture terminate failure"))
+        });
+        assert_eq!(failed, None);
+        assert_eq!(terminated.get(), 1);
+        assert_eq!(cache, Some((true, false)), "the dirty downgrade was lost");
+        // The next retry finds an empty Job and must not reuse the clean exit.
+        let observed = retry_shutdown_observation(&mut cache, true, || {
+            panic!("an empty Job needs no termination")
+        })
+        .unwrap();
+        assert_eq!(observed, (true, false));
+        // The exact proof: exited child, empty Job, joined workers and
+        // reacquired writer exclusions. Its disposition stays dirty.
+        let (disposition, held) = finish_release_held(
+            StopEvidence {
+                guest_shutdown: observed.0,
+                clean_process_exit: observed.1,
+                process_exited: true,
+                job_empty: true,
+                workers_joined: true,
+                ..StopEvidence::default()
+            },
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            || Ok(()),
+            || true,
+        )
+        .await;
+        assert_eq!(disposition, StopDisposition::DirtyRelease);
+        assert!(held.is_some());
+    }
 
     #[test]
     fn paused_launch_attributes_and_single_process_job_are_applied() {

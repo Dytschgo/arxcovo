@@ -1463,6 +1463,7 @@ fn start_refusal_observes_the_already_locked_pair_through_the_consumer() {
                 .err()
                 .unwrap();
         assert_eq!(refused.reason(), reason);
+        assert!(refused.can_progress());
         refused.with_observation(
             deadline(),
             &|| false,
@@ -1519,6 +1520,7 @@ fn start_refusal_observes_the_already_locked_pair_through_the_consumer() {
         |_| panic!("tried to reacquire the already locked lease"),
         |observed| assert!(observed.expect("held").release().is_none()),
     );
+    assert!(!expired.can_progress(), "an expired held refusal hands off");
 
     let open_writer = writer(&paths[1]).unwrap();
     observe(active, deadline(), &|| false);
@@ -1633,9 +1635,14 @@ fn start_refusal_before_acquisition_spends_its_single_attempt() {
 
     // A failed attempt spends the token even after the holder goes away.
     let mut contended = refuse();
+    assert!(contended.can_progress(), "one later attempt remains");
     contended.with_observation(deadline(), &|| false, acquire, |obs| {
         assert!(obs.is_none(), "a foreign holder must remain exclusive");
     });
+    assert!(
+        !contended.can_progress(),
+        "a spent attempt cannot prove release"
+    );
     drop(ws);
     contended.with_observation(deadline(), &|| false, acquire, |obs| {
         assert!(obs.is_none(), "a spent refusal reopened its acquisition");
@@ -1650,6 +1657,7 @@ fn start_refusal_before_acquisition_spends_its_single_attempt() {
     expired.with_observation(deadline(), &|| false, acquire, |obs| assert!(obs.is_none()));
     for refused in [&mut cancelled, &mut expired] {
         refused.with_observation(deadline(), &|| false, acquire, |obs| assert!(obs.is_none()));
+        assert!(!refused.can_progress());
     }
     assert_eq!(*attempts.borrow(), [binding]);
 
@@ -1676,6 +1684,10 @@ fn start_refusal_before_acquisition_spends_its_single_attempt() {
         &|| false,
         |_| panic!("reopened the lease it already holds"),
         |obs| assert!(obs.expect("still held").release().is_some()),
+    );
+    assert!(
+        later.can_progress(),
+        "the acquired lease stays with the refusal"
     );
     assert_eq!(*attempts.borrow(), [binding, binding]);
     assert!(hold_workspace_under(&production, sid_ptr(&owner), binding).is_err());
@@ -1732,6 +1744,7 @@ async fn start_refusal_after_create_never_proves_an_unchanged_start() {
     .err()
     .unwrap();
     assert_eq!(pre_create.creation(), StartCreation::NeverCreated);
+    assert!(pre_create.can_progress());
     let mut unknown = StartRefusal::while_held(&ws, Some(active), || {
         Err::<(), _>(spawn_failed(SpawnStage::Verify))
     })
@@ -1739,6 +1752,10 @@ async fn start_refusal_after_create_never_proves_an_unchanged_start() {
     .unwrap();
     assert_fenced(&mut unknown);
     assert_eq!(unknown.creation(), StartCreation::Unconfirmed);
+    assert!(
+        !unknown.can_progress(),
+        "unconfirmed custody hands off to recovery"
+    );
     assert!(
         unknown
             .settle_created(tokio::time::Instant::now())
@@ -1775,6 +1792,10 @@ async fn start_refusal_after_create_never_proves_an_unchanged_start() {
         .unwrap();
         assert_fenced(&mut refused);
         assert_eq!(refused.creation(), StartCreation::Created);
+        assert!(
+            refused.can_progress(),
+            "a created child keeps retry ownership"
+        );
         if fail_in_attach {
             assert!(
                 refused
@@ -1793,7 +1814,24 @@ async fn start_refusal_after_create_never_proves_an_unchanged_start() {
             .await
             .unwrap();
         assert!(!refused.worker_failed());
-        assert_fenced(&mut refused);
+        refused.with_observation(
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+            |_| panic!("settled created child tried to acquire the held lease"),
+            |observation| {
+                let held = observation.unwrap();
+                let proof = held
+                    .release()
+                    .expect("held teardown proves writer quiescence");
+                assert!(proof.matches(
+                    binding,
+                    active.slots,
+                    active.evidence.map(|pin| pin.identity)
+                ));
+                assert!(!proof.matches_start(binding, active));
+                assert_eq!(proof.stop_disposition, Some(StopDisposition::DirtyRelease));
+            },
+        );
     }
 }
 
@@ -1853,11 +1891,20 @@ async fn refused_attach_settles_after_one_worker_fails_and_another_exits() {
     assert!(refused.worker_failed());
     refused.settle_created(deadline()).await.unwrap();
     assert!(refused.worker_failed());
+    // Settled custody proves writer quiescence, never an unchanged start: a
+    // failed stdio worker still yields only a held dirty release.
     refused.with_observation(
         Instant::now() + Duration::from_secs(5),
         &|| false,
         |_| panic!("post-create refusal tried to acquire the lease again"),
-        |obs| assert!(obs.expect("held").release().is_none()),
+        |obs| {
+            let held = obs.expect("held");
+            let proof = held
+                .release()
+                .expect("settled child proves writer quiescence");
+            assert!(!proof.matches_start(held.workspace().binding(), active));
+            assert_eq!(proof.stop_disposition, Some(StopDisposition::DirtyRelease));
+        },
     );
 }
 
