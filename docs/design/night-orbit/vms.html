@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arxcovo VMs</title>
+<link rel="stylesheet" href="night-orbit.css">
+<script src="arx-data.js"></script>
+<style>
+.head{display:flex;align-items:flex-end;gap:28px;margin:26px 0 22px;flex-wrap:wrap}
+.head .hero-n{display:flex;align-items:baseline;gap:12px;margin:0}
+.head .hero-n small{font-size:22px;font-weight:500;color:var(--ink3);letter-spacing:-.02em}
+.stats{display:flex;align-items:center;gap:16px;color:var(--ink3);font-size:13.5px;margin:0;padding-bottom:7px}
+.stats span{display:inline-flex;align-items:center;gap:7px}
+.stats b{color:#fff;font-weight:600}
+.stats .dotsep{width:3px;height:3px;border-radius:50%;background:var(--deco)}
+.head .legend-cta{margin-left:auto;padding-bottom:6px}
+
+.bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px 16px 10px}
+.bar2{display:flex;align-items:center;gap:10px;padding:0 16px 14px;border-bottom:1px solid var(--line)}
+.bar2 .bl{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink4);margin-right:4px}
+.seg button{display:inline-flex;align-items:center;gap:6px}
+.seg button .n{font:11px var(--mono);opacity:.75}
+.chips{display:flex;gap:4px;flex-wrap:wrap}
+.fchip{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--r-ctl);color:var(--ink3);font-size:12px;transition:background .2s,color .2s,border-color .2s}
+.fchip svg{width:12px;height:12px}
+.fchip .n{font:11px var(--mono);color:var(--ink4)}
+.fchip:hover{border-color:#555;color:#fff}
+.fchip[aria-pressed="true"]{background:#fff;color:#000;border-color:#fff}
+.fchip[aria-pressed="true"] .n{color:#333}
+.fchip.zero{color:var(--ink4)}
+.vsep{width:1px;height:20px;background:var(--line2)}
+.sel{height:30px;padding:0 28px 0 12px;border:1px solid var(--line2);border-radius:var(--r-ctl);background:var(--bg) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23a3a3a3' stroke-width='1.4'/%3E%3C/svg%3E") no-repeat right 11px center;appearance:none;color:var(--ink2);font-size:12.5px;outline:0}
+.sel:focus-visible{border-color:#fff;outline:1px solid #fff;outline-offset:2px}
+.filt{display:flex;align-items:center;gap:8px;height:30px;width:220px;padding:0 12px;border:1px solid var(--line2);border-radius:var(--r-ctl);color:var(--ink3)}
+.filt input{flex:1;background:none;border:0;outline:0;font:12.5px var(--mono);color:#fff}
+.filt input::placeholder{color:var(--ink4);font-family:var(--font)}
+.filt:focus-within{border-color:#fff}
+.shown{font-size:12px;color:var(--ink4);white-space:nowrap;margin-left:auto}
+
+.tw{container-type:inline-size}
+.tile.tbl-tile{padding:0;overflow:hidden}
+.tbl td,.tbl th{white-space:nowrap}
+.tbl th:first-child,.tbl td:first-child{padding-left:18px}
+.tbl th:last-child,.tbl td:last-child{padding-right:18px}
+.tbl th button{display:inline-flex;align-items:center;gap:5px;color:inherit;font:inherit;letter-spacing:inherit;text-transform:inherit}
+.tbl th button:hover{color:#fff}
+.tbl th .sa{width:10px;height:10px;opacity:0;transition:opacity .2s,transform .2s}
+.tbl th[aria-sort] .sa{opacity:1;color:#fff}
+.tbl th[aria-sort="descending"] .sa{transform:rotate(180deg)}
+.tbl th[aria-sort]{color:var(--ink2)}
+.tbl th.num button{flex-direction:row-reverse}
+.tbl tbody tr{position:relative}
+.tbl tbody tr.rise td{animation:none}
+.tbl td{height:52px}
+.k{display:inline-flex;align-items:center;gap:8px}
+.vn{font:500 13px var(--mono)}
+.vn:hover{text-decoration:underline;text-underline-offset:3px;text-decoration-color:var(--line3)}
+.g{display:inline-flex;align-items:center;gap:7px;color:var(--ink2)}
+.g svg{width:11px;height:11px;color:var(--c)}
+.g .ver{color:var(--ink3)}
+.h{display:inline-flex;align-items:center;gap:8px}
+.h a{font:13px var(--mono)}
+.h a:hover{text-decoration:underline;text-underline-offset:3px;text-decoration-color:var(--line3)}
+.h .hs{display:inline-flex;color:var(--ink3)}
+.h .hs svg{width:12px;height:12px}
+.st .spin{animation:spin 1.4s linear infinite;transform-origin:center}
+.sub{display:block;color:var(--ink4);font-size:11px;margin-top:1px}
+.exp{font:12.5px var(--mono);color:var(--ink2)}
+.exp.soon{color:#fff;font-weight:500}
+.exp.never{color:var(--ink4)}
+.na.nr::before{width:16px}
+td.num{color:var(--ink2)}
+td.num .u{color:var(--ink4);margin-left:2px;font-size:11.5px}
+.size{font:12.5px var(--mono);color:var(--ink2)}
+.size i{font-style:normal;color:var(--ink4);margin:0 5px}
+.snaps{display:inline-flex;align-items:center;gap:5px;font:12.5px var(--mono);color:var(--ink2)}
+.snaps svg{width:12px;height:12px;color:var(--ink3)}
+.snaps.z{color:var(--ink4)}
+/* row quick actions: revealed on hover/focus, never take layout width */
+td.qa{width:0;padding:0!important;position:relative}
+.qa-in{position:absolute;right:14px;top:50%;transform:translate(6px,-50%);display:flex;gap:6px;opacity:0;pointer-events:none;transition:opacity .18s,transform .25s var(--ease);padding-left:56px;background:linear-gradient(90deg,transparent,#0a0a0a 44px)}
+tr:hover .qa-in,tr:focus-within .qa-in{opacity:1;transform:translate(0,-50%);pointer-events:auto}
+.qa-in a{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 11px;border:1px solid var(--line3);border-radius:var(--r-ctl);background:#0c0c0c;font-size:12.5px;color:#fff}
+.qa-in a:hover{border-color:#fff}
+.qa-in a svg{width:13px;height:13px}
+.qa-in a[aria-disabled="true"]{color:var(--ink4);border-color:var(--line2);cursor:not-allowed}
+.c-size{display:none}
+@container (max-width:1300px){
+  .c-cpu,.c-ram,.c-disk{display:none}
+  .c-size{display:table-cell}
+  .kw{display:none}
+}
+.empty{display:none;padding:56px 20px;text-align:center}
+.empty.on{display:block}
+.empty .ring{width:44px;height:44px;margin:0 auto 14px;border:1px dashed var(--line3);border-radius:50%;display:grid;place-items:center;color:var(--ink3)}
+.empty h2{margin:0 0 4px;font-size:16px;font-weight:600}
+.empty p{margin:0 0 16px;color:var(--ink3);font-size:13px}
+
+.legend{display:flex;align-items:center;gap:22px;flex-wrap:wrap;padding:14px 18px;border-top:1px solid var(--line);font-size:12px;color:var(--ink3)}
+.legend .grp{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.legend .grp>b{font-weight:500;color:var(--ink4);font-size:11px;letter-spacing:.05em;text-transform:uppercase}
+.legend span.it{display:inline-flex;align-items:center;gap:6px}
+.legend svg{width:12px;height:12px}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="win" viewBox="0 0 16 16"><path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z" fill="currentColor"/></symbol>
+  <symbol id="lin" viewBox="0 0 16 16"><path d="M5 3v10h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-hosts" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
+  <symbol id="i-vm" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
+  <symbol id="i-act" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-move" viewBox="0 0 24 24"><path d="M4 8h13l-3-3M20 16H7l3 3"/></symbol>
+  <symbol id="i-run" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-spin" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-3-6.2"/><path d="M20 4v4h-4"/></symbol>
+  <symbol id="i-fail" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-swap" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18h.01"/></symbol>
+  <symbol id="i-off" viewBox="0 0 24 24"><path d="M3 3l18 18M8.5 8.5A5 5 0 0 0 12 17h4M17 7h-3"/></symbol>
+  <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5l11 7-11 7z"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M3 12h4l2-4 4 8 2-4h6"/></symbol>
+  <symbol id="i-backup" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.6"/><path d="M4 4v4h4M12 8v4l3 2"/></symbol>
+  <symbol id="i-cam" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></symbol>
+  <symbol id="i-bot" viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="11" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01"/></symbol>
+  <symbol id="i-cog" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+  <symbol id="i-mem" viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="10" rx="2"/><path d="M7 17v3M12 17v3M17 17v3"/></symbol>
+  <symbol id="i-disk" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
+  <symbol id="i-signout" viewBox="0 0 24 24"><path d="M14 4h5v16h-5M10 16l-4-4 4-4M6 12h10"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-cut" viewBox="0 0 24 24"><path d="M4 12h5M15 12h5"/><path d="M11 7l2 10"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><path d="M12 5v10M7 11l5 5 5-5M5 20h14"/></symbol>
+</svg>
+<div class="page">
+<header class="top rise" style="--i:0">
+  <a class="brand" href="board.html" aria-label="Arxcovo home">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="lgo" gradientUnits="userSpaceOnUse" x1="3" y1="0" x2="29" y2="0"><stop offset="0" stop-color="#4cc2ff"/><stop offset=".5" stop-color="#b9b0e8"/><stop offset="1" stop-color="#f5a524"/></linearGradient></defs><path class="lg-a" pathLength="1" d="M7.5 27 L16 7 L24.5 27"/><g transform="rotate(-14 16 19.5)"><ellipse class="lg-o" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/><ellipse class="lg-c" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/></g><circle class="lg-n" cx="16" cy="7" r="2.9"/><circle class="lg-m" cx="28.2" cy="16.3" r="1.9"/></svg>
+    arxcovo
+  </a>
+  <nav class="nav" aria-label="Main">
+    <a href="board.html" aria-label="Hosts"><svg class="i"><use href="#i-hosts"/></svg></a>
+    <a href="vms.html" aria-current="page"><svg class="i"><use href="#i-vm"/></svg>VMs</a>
+    <a href="terminal.html" aria-label="Terminal"><svg class="i"><use href="#i-term"/></svg></a>
+    <a href="activity.html" aria-label="Activity"><svg class="i"><use href="#i-act"/></svg></a>
+  </nav>
+  <span class="spacer"></span>
+  <span class="sync" title="Every host serves this dashboard"><span class="pulse"></span>served by <b>atlas</b> · synced</span>
+  <label class="search"><svg class="i"><use href="#i-search"/></svg><input type="search" placeholder="Search hosts, VMs, tools" aria-label="Search"><kbd>/</kbd></label>
+  <a class="me" href="login.html?state=signedout" title="Sign out"><svg class="i"><use href="#i-signout"/></svg><span class="vh">Sign out</span></a>
+</header>
+
+<main>
+  <section class="head rise" style="--i:1" aria-labelledby="h">
+    <h1 id="h" class="hero-n"><span id="total" data-count="0">0</span><small>VMs</small></h1>
+    <p class="stats" id="stats"></p>
+  </section>
+
+  <section class="tile tbl-tile rise" style="--i:2" aria-label="VM list">
+    <div class="bar" role="group" aria-label="Filters">
+      <div class="seg" role="group" aria-label="Kind" id="kindSeg"></div>
+      <label class="vh" for="hostSel">Host</label>
+      <select class="sel" id="hostSel"></select>
+      <span class="shown" id="shown" aria-live="polite"></span>
+      <label class="filt"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg><input id="q" type="search" placeholder="Filter by name" aria-label="Filter VMs by name" autocomplete="off" spellcheck="false"></label>
+    </div>
+    <div class="bar2"><span class="bl" id="stl">State</span><div class="chips" role="group" aria-labelledby="stl" id="stateChips"></div></div>
+    <div class="tw">
+      <table class="tbl" id="tbl">
+        <caption class="vh">Virtual machines. Column headers sort the table.</caption>
+        <thead><tr id="thead"></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div class="empty" id="empty">
+        <div class="ring" aria-hidden="true"><svg class="i"><use href="#i-search"/></svg></div>
+        <h2>No VMs match</h2>
+        <p id="emptyWhy">Nothing fits these filters.</p>
+        <button class="btn sm" type="button" id="clear">Clear filters</button>
+      </div>
+    </div>
+    <div class="legend" aria-label="Legend">
+      <div class="grp"><b>Kind</b>
+        <span class="it"><span class="kind test" aria-hidden="true"></span>ring = test, expires</span>
+        <span class="it"><span class="kind static" aria-hidden="true"></span>diamond = static, never expires</span>
+      </div>
+      <div class="grp"><b>Data</b>
+        <span class="it"><span class="na nr">not recorded</span></span>
+        <span class="it">Countdowns keep running while a VM is stopped</span>
+      </div>
+    </div>
+  </section>
+
+  <footer class="foot rise" style="--i:3">
+    <span>Hover a row for Console (view-only frames) and Run command on its host. VMs are created by agents over MCP; agents cannot delete static VMs.</span>
+    <span class="spacer"></span>
+    <span class="faint">Mock data · ◇ = field the API doesn't have yet</span>
+  </footer>
+</main>
+</div>
+
+<script>
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const H = 3600e3;
+/* everything comes from arx-data.js; expiresAt is an absolute instant (ISO, null for static) */
+const HOSTS = ARX.HOSTS;
+const HOST = Object.fromEntries(HOSTS.map(h => [h.id, h]));
+const VMS = ARX.VMS.map(v => ({ ...v, expiresAt: v.expiresAt == null ? null : Date.parse(v.expiresAt) }));
+const STATES = {
+  running: { icon: 'i-run', word: 'running' },
+  creating: { icon: 'i-spin', word: 'creating', spin: true },
+  snapshotting: { icon: 'i-cam', word: 'snapshotting' },
+  migrating: { icon: 'i-move', word: 'migrating' },
+  stopped: { icon: 'i-stop', word: 'stopped', cls: 'off' },
+  failed: { icon: 'i-fail', word: 'failed', cls: 'bad' },
+  destroying: { icon: 'i-trash', word: 'destroying', cls: 'off' },
+};
+const STATE_ORDER = ['running', 'creating', 'snapshotting', 'migrating', 'stopped', 'failed', 'destroying'];
+const ic = (id, cls = '') => `<svg class="i ${cls}" aria-hidden="true"><use href="#${id}"/></svg>`;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const stateHtml = s => { const d = STATES[s]; return `<span class="st ${d.cls || ''}">${ic(d.icon, d.spin ? 'spin' : '')}${d.word}</span>`; };
+
+/* header numbers, computed */
+const count = (f) => VMS.filter(f).length;
+const totals = { all: VMS.length, running: count(v => v.state === 'running'), test: count(v => v.kind === 'test'), static: count(v => v.kind === 'static') };
+document.getElementById('total').dataset.count = totals.all;
+document.getElementById('stats').innerHTML =
+  `<span>${ic('i-run')}<b>${totals.running}</b> running</span><span class="dotsep" aria-hidden="true"></span>` +
+  `<span><span class="kind test" aria-hidden="true"></span><b>${totals.test}</b> test</span><span class="dotsep" aria-hidden="true"></span>` +
+  `<span><span class="kind static" aria-hidden="true"></span><b>${totals.static}</b> static</span>`;
+function countUp(el) {
+  const to = +el.dataset.count; if (RM) { el.textContent = to; return; }
+  const t0 = performance.now() + 140, d = 700;
+  (function step(t) { const k = Math.min(1, Math.max(0, (t - t0) / d)); el.textContent = Math.round(to * (1 - Math.pow(1 - k, 3))); if (k < 1) requestAnimationFrame(step); })(t0);
+}
+countUp(document.getElementById('total'));
+
+
+/* filters */
+const F = { kind: 'all', states: new Set(), host: '', q: '' };
+const kindSeg = document.getElementById('kindSeg');
+kindSeg.innerHTML = [['all', 'All', totals.all], ['test', 'Test', totals.test], ['static', 'Static', totals.static]]
+  .map(([k, w, n]) => `<button type="button" data-k="${k}" aria-pressed="${k === 'all'}">${k === 'all' ? '' : `<span class="kind ${k}" aria-hidden="true" style="${k === 'test' ? 'border-color:currentColor' : 'background:currentColor'}"></span>`}${w}<span class="n">${n}</span></button>`).join('');
+kindSeg.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; F.kind = b.dataset.k; kindSeg.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', x === b)); render(); });
+const chips = document.getElementById('stateChips');
+chips.innerHTML = STATE_ORDER.map(s => { const n = count(v => v.state === s), d = STATES[s]; return `<button type="button" class="fchip${n ? '' : ' zero'}" data-s="${s}" aria-pressed="false" aria-label="${d.word}, ${n} VM${n === 1 ? '' : 's'}">${ic(d.icon)}${d.word}<span class="n" aria-hidden="true">${n}</span></button>`; }).join('');
+chips.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; const s = b.dataset.s; F.states.has(s) ? F.states.delete(s) : F.states.add(s); b.setAttribute('aria-pressed', F.states.has(s)); render(); });
+const hostSel = document.getElementById('hostSel');
+hostSel.innerHTML = `<option value="">All hosts</option>` + HOSTS.map(h => `<option value="${h.id}">${h.id}${h.reachability === 'online' ? '' : ' (' + h.reachability + ')'}</option>`).join('');
+hostSel.addEventListener('change', () => { F.host = hostSel.value; render(); });
+const q = document.getElementById('q');
+q.addEventListener('input', () => { F.q = q.value.trim().toLowerCase(); render(); });
+document.getElementById('clear').addEventListener('click', () => {
+  F.kind = 'all'; F.states.clear(); F.host = ''; F.q = ''; q.value = ''; hostSel.value = '';
+  kindSeg.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', x.dataset.k === 'all'));
+  chips.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', 'false'));
+  render(); kindSeg.querySelector('button').focus();
+});
+
+/* columns */
+const COLS = [
+  { key: 'kind', label: 'Kind', get: v => v.kind },
+  { key: 'name', label: 'Name', get: v => v.id },
+  { key: 'guest', label: 'Guest', get: v => v.guestOsVersion },
+  { key: 'arch', label: 'Arch', get: v => v.arch },
+  { key: 'host', label: 'Host', get: v => v.hostId },
+  { key: 'state', label: 'State', get: v => STATE_ORDER.indexOf(v.state) },
+  { key: 'ready', label: 'Ready', get: v => v.ready ? 0 : 1 },
+  { key: 'expires', label: 'Expires', get: v => v.expiresAt ?? Infinity },
+  { key: 'cpu', label: 'vCPU', num: true, cls: 'c-cpu', get: v => v.cpus ?? -1 },
+  { key: 'ram', label: 'RAM', num: true, cls: 'c-ram', get: v => v.memoryBytes ?? -1 },
+  { key: 'disk', label: 'Disk', num: true, cls: 'c-disk', get: v => v.diskBytes },
+  { key: 'size', label: 'vCPU · RAM · Disk', cls: 'c-size', sortLabel: 'RAM', get: v => v.memoryBytes ?? -1 },
+  { key: 'snaps', label: 'Snap', aria: 'Snapshots', num: true, get: v => v.snapshots.length },
+];
+let sort = { key: 'name', dir: 1 };
+const thead = document.getElementById('thead');
+function renderHead() {
+  thead.innerHTML = COLS.map(c => `<th scope="col" class="${c.num ? 'num ' : ''}${c.cls || ''}"${sort.key === c.key ? ` aria-sort="${sort.dir > 0 ? 'ascending' : 'descending'}"` : ''}><button type="button" data-key="${c.key}" aria-label="${c.aria || c.label}${c.sortLabel ? ', sorts by ' + c.sortLabel : ''}">${c.label}<svg class="i sa" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg></button></th>`).join('') +
+    `<th scope="col" class="qa"><span class="vh">Quick actions</span></th>`;
+}
+thead.addEventListener('click', e => {
+  const b = e.target.closest('button[data-key]'); if (!b) return;
+  const k = b.dataset.key; sort = sort.key === k ? { key: k, dir: -sort.dir } : { key: k, dir: 1 };
+  render(); thead.querySelector(`button[data-key="${k}"]`).focus();
+});
+
+const fmtB = b => b == null ? null : ARX.fmtBytes(b);
+const splitB = b => { const t = fmtB(b); if (t == null) return [null, '']; const i = t.lastIndexOf(' '); return [t.slice(0, i), t.slice(i + 1)]; };
+function left(ms) {
+  if (ms <= 0) return 'expired';
+  const s = Math.floor(ms / 1e3), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), ss = s % 60;
+  const p = n => String(n).padStart(2, '0');
+  return h ? `${h}h ${p(m)}m ${p(ss)}s` : `${m}m ${p(ss)}s`;
+}
+const absTime = t => new Date(t).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+function bytesCell(c, b) { const [n, u] = splitB(b); return numCell(c, n, u); }
+function numCell(c, val, unit) {
+  return val == null ? `<td class="num ${c}"><span class="na nr" title="Not recorded: the VM catalog predates this observation">not recorded</span></td>` : `<td class="num ${c}">${val}${unit ? `<span class="u">${unit}</span>` : ''}</td>`;
+}
+function row(v, i) {
+  const h = HOST[v.hostId], st = STATES[v.state];
+  const osC = o => o === 'windows' ? 'var(--win)' : 'var(--lin)';
+  const reach = h.reachability, why = h.reachabilityReason || '';
+  const hostNote = reach === 'online' ? '' : `<span class="hs" title="${esc(why)}" aria-label="host ${reach}: ${esc(why)}">${ic(reach === 'offline' ? 'i-off' : 'i-warn')}</span>`;
+  const stateSub = v.state === 'stopped' && reach === 'offline' ? '<span class="sub">host offline</span>' : '';
+  const ready = v.ready ? `<span class="st">${ic('i-check')}yes</span>`
+    : v.state === 'running' ? `<span class="st bad" title="Guest agent did not answer its readiness check">${ic('i-warn')}no</span>`
+    : `<span class="st off">no</span>`;
+  const exp = v.expiresAt == null ? `<span class="exp never">never</span>`
+    : `<time class="exp${v.expiresAt - Date.now() < H ? ' soon' : ''}" data-exp="${v.expiresAt}" datetime="${new Date(v.expiresAt).toISOString()}" title="Expires ${absTime(v.expiresAt)}">${left(v.expiresAt - Date.now())}</time>`;
+  const size = [v.cpus == null ? null : v.cpus + ' vCPU', fmtB(v.memoryBytes), fmtB(v.diskBytes)];
+  const sizeCell = `<td class="c-size"><span class="size">${size.map(x => x == null ? '<span class="na nr" title="Not recorded">n/r</span>' : x).join('<i aria-hidden="true">·</i>')}</span></td>`;
+  const n = v.snapshots.length;
+  const conOff = v.state === 'stopped' ? 'VM is stopped' : v.state === 'failed' ? 'VM failed' : reach === 'offline' ? 'host offline' : '';
+  const runOff = reach === 'offline' ? `${h.id} is offline` : '';
+  const qa = `<td class="qa"><div class="qa-in">` +
+    (conOff ? `<a role="link" aria-disabled="true" tabindex="0" aria-label="Console for ${v.id}, unavailable: ${conOff}" title="${conOff}">${ic('i-monitor')}Console</a>`
+      : `<a href="vm.html?id=${encodeURIComponent(v.id)}#console" aria-label="Console for ${v.id} (view-only frames)">${ic('i-monitor')}Console</a>`) +
+    (runOff ? `<a role="link" aria-disabled="true" tabindex="0" aria-label="Run command on ${h.id}, unavailable: ${runOff}" title="${runOff}">${ic('i-term')}Run command</a>`
+      : `<a href="terminal.html?host=${encodeURIComponent(h.id)}" aria-label="Run command on host ${h.id}">${ic('i-term')}Run command</a>`) +
+    `</div></td>`;
+  return `<tr class="rise" style="--i:${3 + i * .6}" data-vm="${v.id}">
+    <td><span class="k"><span class="kind ${v.kind}" aria-hidden="true"></span><span class="kindw kw">${v.kind}</span><span class="vh">${v.kind} VM</span></span></td>
+    <td><a class="vn" href="vm.html?id=${encodeURIComponent(v.id)}">${esc(v.id)}</a></td>
+    <td><span class="g" style="--c:${osC(v.guestOs)}"><svg class="i" aria-hidden="true"><use href="#${v.guestOs === 'windows' ? 'win' : 'lin'}"/></svg>${esc(v.guestOsVersion)}</span></td>
+    <td><span class="arch">${v.arch}</span></td>
+    <td><span class="h"><span class="osg" style="--c:${osC(h.os)}" aria-hidden="true"><svg><use href="#${h.os === 'windows' ? 'win' : 'lin'}"/></svg></span><a href="host.html?id=${encodeURIComponent(h.id)}">${esc(h.id)}</a>${hostNote}</span></td>
+    <td>${stateHtml(v.state)}${stateSub}</td>
+    <td>${ready}</td>
+    <td>${exp}</td>
+    ${numCell('c-cpu', v.cpus)}${bytesCell('c-ram', v.memoryBytes)}${bytesCell('c-disk', v.diskBytes)}
+    ${sizeCell}
+    <td class="num"><span class="snaps${n ? '' : ' z'}" aria-label="${n} snapshot${n === 1 ? '' : 's'}" title="${esc(v.snapshots.map(x => x.name).join(', ') || 'No snapshots')}">${ic('i-cam')}${n}</span></td>
+    ${qa}
+  </tr>`;
+}
+const tbody = document.getElementById('tbody'), empty = document.getElementById('empty'), shown = document.getElementById('shown');
+let first = true;
+function render() {
+  renderHead();
+  const col = COLS.find(c => c.key === sort.key);
+  const list = VMS.filter(v => (F.kind === 'all' || v.kind === F.kind) && (!F.states.size || F.states.has(v.state)) && (!F.host || v.hostId === F.host) && (!F.q || v.id.toLowerCase().includes(F.q)))
+    .sort((a, b) => { const x = col.get(a), y = col.get(b); return (x < y ? -1 : x > y ? 1 : a.id < b.id ? -1 : 1) * sort.dir; });
+  tbody.innerHTML = list.map(row).join('');
+  if (!first || RM) tbody.querySelectorAll('tr.rise').forEach(r => r.classList.remove('rise'));
+  first = false;
+  const filtered = F.kind !== 'all' || F.states.size || F.host || F.q;
+  shown.textContent = filtered ? `${list.length} of ${VMS.length} shown` : '';
+  empty.classList.toggle('on', list.length === 0);
+  document.getElementById('tbl').hidden = list.length === 0;
+  if (!list.length) {
+    const adj = [F.kind !== 'all' ? F.kind : '', F.states.size ? [...F.states].join(' or ') : ''].filter(Boolean).join(', ');
+    const tail = [F.host ? 'on ' + esc(F.host) : '', F.q ? `named “${esc(F.q)}”` : ''].filter(Boolean).join(' ');
+    document.getElementById('emptyWhy').innerHTML = `No ${adj ? adj + ' ' : ''}VMs ${tail ? tail + ' ' : ''}right now.`;
+  }
+}
+render();
+setInterval(() => document.querySelectorAll('time[data-exp]').forEach(t => { const ms = +t.dataset.exp - Date.now(); t.textContent = left(ms); t.classList.toggle('soon', ms < H); }), 1000);
+
+</script>
+</body>
+</html>

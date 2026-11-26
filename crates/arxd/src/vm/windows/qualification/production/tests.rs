@@ -1650,6 +1650,7 @@ fn refused_child() -> Child {
             job: Job::new(256 * 1024 * 1024, None).unwrap(),
             process: unsafe { owned(CreateEventW(null(), 1, 1, null())) }.unwrap(),
             suspended: None,
+            _desktop: None,
         },
     }
 }

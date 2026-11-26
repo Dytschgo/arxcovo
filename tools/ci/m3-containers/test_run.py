@@ -40,11 +40,29 @@ class FixtureTests(unittest.TestCase):
                 with self.assertRaisesRegex(fixture.Refusal, "pins-schema"):
                     fixture.check_pins(modified)
         profiles = pins["host"]["profiles"]
-        for replacement in (profiles[:1], [profiles[0], profiles[0]],
-                            [{**profiles[0], "kernel": profiles[1]["kernel"]}, profiles[1]]):
+        for replacement in (
+            profiles[:1],
+            [profiles[0], profiles[0]],
+            [{**profiles[0], "variants": profiles[1]["variants"]}, *profiles[1:]],
+            [{**profiles[0], "variants": []}, *profiles[1:]],
+            [*profiles[:2], {**profiles[2], "variants": [profiles[2]["variants"][0], profiles[2]["variants"][0]]}],
+            [{**profiles[0], "variants": [{**profiles[0]["variants"][0], "extra": "x"}]}, *profiles[1:]],
+        ):
             modified = {**pins, "host": {**pins["host"], "profiles": replacement}}
             with self.assertRaisesRegex(fixture.Refusal, "pins-schema"):
                 fixture.check_pins(modified)
+        for bad_profiles in (
+            [],
+            [profiles[0], {**profiles[0], "variants": profiles[1]["variants"]}],
+            [{**profiles[0], "variants": []}],
+            [{**profiles[0], "variants": [profiles[0]["variants"][0], profiles[0]["variants"][0]]}],
+            [{**profiles[0], "variants": [profiles[0]["variants"][0],
+                                          {**profiles[0]["variants"][0], "systemd_package": "255.4-1ubuntu8.99"}]}],
+            [{**profiles[0], "variants": [{"kernel": "", "systemd_package": "255.4-1ubuntu8.18"}]}],
+            [{**profiles[0], "variants": [{"kernel": "7.0.0-1014-aws", "systemd_package": 123}]}],
+        ):
+            with self.assertRaisesRegex(fixture.Refusal, "pins-schema"):
+                fixture.check_host_profiles(bad_profiles)
         with self.assertRaisesRegex(fixture.Refusal, "duplicate-json-key"):
             json.loads('{"host": 1, "host": 2}', object_pairs_hook=fixture.unique_pairs)
 
@@ -624,30 +642,145 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(identities), len(set(identities)))
         self.assertIn(("ubuntu24", "20261122.23.1"), identities)
         for profile in profiles:
-            other = next(item for item in profiles if item["kernel"] != profile["kernel"])
+            own_kernels = {variant["kernel"] for variant in profile["variants"]}
+            other_kernel = next(
+                variant["kernel"]
+                for item in profiles
+                for variant in item["variants"]
+                if variant["kernel"] not in own_kernels
+            )
             env = self.hosted_env(profile)
             head = env["GITHUB_SHA"]
             end = 1
-            with self.subTest(image=profile["image_version"]), patch.object(
+            for variant in profile["variants"]:
+                with self.subTest(image=profile["image_version"], kernel=variant["kernel"]), patch.object(
+                    run, "os_version", return_value="24.04"
+                ), patch.object(run.os, "uname", create=True) as uname, patch.object(
+                    run, "host_command", return_value=variant["systemd_package"]
+                ) as package:
+                    uname.return_value = SimpleNamespace(release=other_kernel, machine="x86_64")
+                    with self.assertRaisesRegex(fixture.Refusal, "^runner-kernel-os$"):
+                        run.checked_runner_platform(env, host, head, end, vetted)
+                    package.assert_not_called()
+
+                    uname.return_value = SimpleNamespace(release=variant["kernel"], machine="x86_64")
+                    receipt = run.checked_runner_platform(env, host, head, end, vetted)
+                    package.assert_called_once_with("dpkg", end, "-W", "-f=${Version}", "systemd", tools=vetted)
+                    self.assertEqual(receipt["image_version"], profile["image_version"])
+                    self.assertEqual(receipt["kernel"], variant["kernel"])
+                    self.assertEqual(receipt["systemd"], variant["systemd_package"])
+
+                    package.return_value = variant["systemd_package"] + "-refused"
+                    with self.assertRaisesRegex(fixture.Refusal, "^runner-systemd$"):
+                        run.checked_runner_platform(env, host, head, end, vetted)
+
+    def test_20261122_accepts_pinned_aws_and_azure_variants_and_refuses_unknown_kernel(self):
+        host = fixture.load_pins()["host"]
+        vetted = {**fixture.TOOLS, "ip": "/usr/bin/ip"}
+        profile = next(item for item in host["profiles"]
+                       if (item["image_os"], item["image_version"]) == ("ubuntu24", "20261122.23.1"))
+        env = self.hosted_env(profile)
+        head = env["GITHUB_SHA"]
+        end = 1
+
+        for kernel in ("7.0.0-1018-aws", "7.0.0-1020-azure"):
+            with self.subTest(accepted_kernel=kernel), patch.object(
                 run, "os_version", return_value="24.04"
-            ), patch.object(run.os, "uname", create=True) as uname, patch.object(
-                run, "host_command", return_value=profile["systemd_package"]
-            ) as package:
-                uname.return_value = SimpleNamespace(release=other["kernel"], machine="x86_64")
-                with self.assertRaisesRegex(fixture.Refusal, "runner-kernel-os"):
+            ), patch.object(
+                run.os, "uname", return_value=SimpleNamespace(release=kernel, machine="x86_64"), create=True
+            ), patch.object(run, "host_command", return_value="255.4-1ubuntu8.19\n") as package:
+                receipt = run.checked_runner_platform(env, host, head, end, vetted)
+                package.assert_called_once_with("dpkg", end, "-W", "-f=${Version}", "systemd", tools=vetted)
+                self.assertEqual(receipt["image_os"], "ubuntu24")
+                self.assertEqual(receipt["image_version"], "20261122.23.1")
+                self.assertEqual(receipt["kernel"], kernel)
+                self.assertEqual(receipt["systemd"], "255.4-1ubuntu8.19")
+
+        for unknown_kernel in ("7.0.0-1021-azure", "7.0.0-1014-aws", "7.0.0-1020", "7.0.0-1020-azure-extra"):
+            with self.subTest(unknown_kernel=unknown_kernel), patch.object(
+                run, "os_version", return_value="24.04"
+            ), patch.object(
+                run.os, "uname", return_value=SimpleNamespace(release=unknown_kernel, machine="x86_64"), create=True
+            ), patch.object(run, "host_command", return_value="255.4-1ubuntu8.19") as package:
+                with self.assertRaisesRegex(fixture.Refusal, "^runner-kernel-os$"):
                     run.checked_runner_platform(env, host, head, end, vetted)
                 package.assert_not_called()
 
-                uname.return_value = SimpleNamespace(release=profile["kernel"], machine="x86_64")
-                receipt = run.checked_runner_platform(env, host, head, end, vetted)
-                package.assert_called_once_with("dpkg", end, "-W", "-f=${Version}", "systemd", tools=vetted)
-                self.assertEqual(receipt["image_version"], profile["image_version"])
-                self.assertEqual(receipt["kernel"], profile["kernel"])
-                self.assertEqual(receipt["systemd"], profile["systemd_package"])
+    def test_variant_systemd_check_binds_to_the_matched_variant_only(self):
+        host = {
+            "os": "24.04",
+            "profiles": [
+                {
+                    "image_os": "ubuntu24",
+                    "image_version": "20261122.23.1",
+                    "variants": [
+                        {"kernel": "7.0.0-1018-aws", "systemd_package": "255.4-1ubuntu8.19"},
+                        {"kernel": "7.0.0-1020-azure", "systemd_package": "255.4-1ubuntu8.20"},
+                    ],
+                },
+            ],
+        }
+        vetted = {**fixture.TOOLS, "ip": "/usr/bin/ip"}
+        env = self.hosted_env(host["profiles"][0])
+        head = env["GITHUB_SHA"]
+        with patch.object(run, "os_version", return_value="24.04"), patch.object(
+            run.os, "uname", return_value=SimpleNamespace(release="7.0.0-1020-azure", machine="x86_64"), create=True
+        ), patch.object(run, "host_command", return_value="255.4-1ubuntu8.19"):
+            with self.assertRaisesRegex(fixture.Refusal, "^runner-systemd$"):
+                run.checked_runner_platform(env, host, head, 1, vetted)
+        with patch.object(run, "os_version", return_value="24.04"), patch.object(
+            run.os, "uname", return_value=SimpleNamespace(release="7.0.0-1020-azure", machine="x86_64"), create=True
+        ), patch.object(run, "host_command", return_value="255.4-1ubuntu8.20"):
+            receipt = run.checked_runner_platform(env, host, head, 1, vetted)
+        self.assertEqual(receipt["kernel"], "7.0.0-1020-azure")
+        self.assertEqual(receipt["systemd"], "255.4-1ubuntu8.20")
 
-                package.return_value = profile["systemd_package"] + "-refused"
-                with self.assertRaisesRegex(fixture.Refusal, "runner-systemd"):
-                    run.checked_runner_platform(env, host, head, end, vetted)
+    def test_duplicate_image_profiles_and_duplicate_variants_are_refused(self):
+        base_host = fixture.load_pins()["host"]
+        profiles = base_host["profiles"]
+        target = profiles[2]
+        env = self.hosted_env(target)
+        head = env["GITHUB_SHA"]
+        vetted = {**fixture.TOOLS, "ip": "/usr/bin/ip"}
+
+        cases = (
+            ("duplicate-target-image", [*profiles, {
+                "image_os": target["image_os"], "image_version": target["image_version"],
+                "variants": [{"kernel": "7.0.0-1099-gcp", "systemd_package": "255.4-1ubuntu8.19"}],
+            }], "^runner-image$"),
+            ("duplicate-other-image", [profiles[0], profiles[0], target], "^runner-image$"),
+            ("duplicate-exact-variant", [*profiles[:2], {
+                **target, "variants": [target["variants"][0], target["variants"][0]],
+            }], "^runner-kernel-os$"),
+            ("duplicate-kernel-different-systemd", [*profiles[:2], {
+                **target, "variants": [
+                    target["variants"][0],
+                    {"kernel": target["variants"][0]["kernel"], "systemd_package": "255.4-1ubuntu8.20"},
+                ],
+            }], "^runner-kernel-os$"),
+            ("duplicate-variant-in-other-profile", [{
+                **profiles[0], "variants": [profiles[0]["variants"][0], profiles[0]["variants"][0]],
+            }, profiles[1], target], "^runner-kernel-os$"),
+            ("empty-variants", [*profiles[:2], {**target, "variants": []}], "^runner-kernel-os$"),
+        )
+        for label, bad_profiles, pattern in cases:
+            bad_host = {**base_host, "profiles": bad_profiles}
+            with self.subTest(case=label), patch.object(run, "os_version", return_value="24.04"), patch.object(
+                run.os, "uname", return_value=SimpleNamespace(release="7.0.0-1020-azure", machine="x86_64"),
+                create=True,
+            ), patch.object(run, "host_command") as package:
+                with self.assertRaisesRegex(fixture.Refusal, pattern):
+                    run.provenance(env, bad_host, head)
+                with self.assertRaisesRegex(fixture.Refusal, pattern):
+                    run.checked_runner_platform(env, bad_host, head, 1, vetted)
+                package.assert_not_called()
+
+        with patch.object(run, "os_version", return_value="24.04"), patch.object(
+            run.os, "uname", return_value=SimpleNamespace(release="7.0.0-1020-azure", machine="x86_64"), create=True
+        ), patch.object(run, "host_command") as package:
+            with self.assertRaisesRegex(fixture.Refusal, "^runner-image$"):
+                run.checked_runner_platform({**env, "ImageVersion": "20261199.1.1"}, base_host, head, 1, vetted)
+            package.assert_not_called()
 
     def test_preflight_vets_tools_before_any_host_command(self):
         pins = fixture.load_pins()
@@ -688,7 +821,7 @@ class RunnerTests(unittest.TestCase):
              patch.object(run, "vet_tools", side_effect=fake_vet), \
              patch.object(run, "host_command", side_effect=fake_cmd), \
              patch.object(run, "os_version", return_value="24.04"), \
-             patch.object(run.os, "uname", return_value=SimpleNamespace(release=profile["kernel"], machine="x86_64"),
+             patch.object(run.os, "uname", return_value=SimpleNamespace(release=profile["variants"][0]["kernel"], machine="x86_64"),
                           create=True):
             with self.assertRaisesRegex(fixture.Refusal, "stop-after-platform"):
                 run.checked_metadata(env, pins, 1001, 10)

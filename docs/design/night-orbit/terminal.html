@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terminal · Arxcovo</title>
+<link rel="stylesheet" href="night-orbit.css">
+<script src="arx-data.js"></script>
+<style>
+.head{display:flex;align-items:flex-end;gap:16px;margin:18px 0 18px}
+.head .h1{font-size:40px}
+.head .sub{color:var(--ink3);font-size:14px;padding-bottom:4px}
+.head .spacer{flex:1}
+.grid{display:grid;grid-template-columns:272px minmax(0,1fr);gap:12px;align-items:start}
+
+/* host picker */
+.hosts{padding:14px}
+.hosts .lab{padding:4px 6px 10px}
+.hl{list-style:none;margin:0;padding:0;display:grid;gap:4px}
+.hb{display:grid;grid-template-columns:22px 1fr auto;align-items:center;gap:4px 10px;width:100%;padding:10px;border:1px solid transparent;border-radius:12px;text-align:left;transition:background .2s,border-color .2s}
+.hb:hover{background:#0d0d0d}
+.hb[aria-current="true"]{background:var(--tile2);border-color:var(--line3)}
+.hb[aria-current="true"] .hn::after{content:"";display:inline-block;width:5px;height:5px;border-radius:50%;background:#fff;margin-left:8px;vertical-align:2px}
+.hb .hn{font:500 13.5px var(--mono)}
+.hb .hm{grid-column:2/4;display:flex;align-items:center;gap:8px;color:var(--ink3);font-size:12px}
+.hb .why{grid-column:2/4;color:var(--ink3);font-size:12px;line-height:1.35}
+.hb[aria-disabled="true"]{cursor:not-allowed}
+.hb[aria-disabled="true"] .hn{color:var(--ink3)}
+.hb[aria-disabled="true"] .osg{filter:grayscale(1);opacity:.6}
+.hosts .note{margin:12px 6px 2px;padding-top:12px;border-top:1px solid var(--line);color:var(--ink3);font-size:12px;display:flex;gap:8px}
+.hosts .note svg{margin-top:1px}
+
+/* main */
+.main{padding:0;overflow:hidden}
+.bar{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line)}
+.bar .tgt{display:flex;align-items:center;gap:10px;font:500 15px var(--mono)}
+.pill{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--r-ctl);font-size:12px;color:var(--ink2)}
+.pill svg{width:12px;height:12px}
+.pill[data-s="connecting"] svg{animation:spin 1s linear infinite}
+.pill[data-s="ready"]{border-color:var(--line3);color:#fff}
+.pill[data-s="running"]{background:#fff;color:#000;border-color:#fff}
+.pill[data-s="closed"],.pill[data-s="error"]{color:var(--ink3);border-style:dashed}
+.legend{margin-left:auto;display:flex;gap:14px;font:11.5px var(--mono);color:var(--ink3)}
+.legend b{font-weight:500;color:var(--ink2)}
+.legend .e b{color:#fff}
+
+.out{height:440px;overflow:auto;padding:14px 20px 18px;font:12.5px/1.55 var(--mono);background:#030303;scrollbar-color:#333 transparent}
+.out:focus-visible{outline-offset:-2px;border-radius:0}
+.empty{height:100%;display:grid;place-content:center;justify-items:center;gap:10px;color:var(--ink3);font:13px var(--font);text-align:center}
+.empty svg{width:28px;height:28px;color:var(--ink4)}
+.blk{border:1px solid var(--line);border-radius:12px;margin-bottom:12px;background:#060606;animation:rise .45s var(--ease) both}
+.bh{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid var(--line)}
+.bh .tg{width:13px;height:13px;color:var(--ink3)}
+.bh .cmd{color:#fff;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.actor .kw{color:var(--ink3)}
+.degr{display:flex;align-items:center;gap:8px;padding:9px 20px;border-bottom:1px solid var(--line);font-size:12.5px;color:var(--ink2);background:repeating-linear-gradient(135deg,rgba(255,255,255,.025) 0 1px,transparent 1px 6px)}
+.degr b{color:#fff;font-weight:500}
+.toolnote{display:flex;align-items:center;gap:6px;margin-top:8px;color:var(--ink3);font-size:12.5px}
+.toolnote[hidden]{display:none}
+.bh .meta{margin-left:auto;display:flex;align-items:center;gap:10px;color:var(--ink3);font-size:11.5px;white-space:nowrap}
+.actor{display:inline-flex;align-items:center;gap:5px;color:var(--ink2)}
+.actor svg{width:12px;height:12px}
+.lines{padding:8px 12px}
+.ln{display:grid;grid-template-columns:16px 1fr;gap:6px;white-space:pre-wrap;word-break:break-word}
+.ln .g{user-select:none}
+.ln.o{color:var(--ink2)}.ln.o .g{color:var(--ink4)}
+.ln.e{color:#f2f2f2;background:repeating-linear-gradient(135deg,rgba(255,255,255,.035) 0 1px,transparent 1px 6px);border-left:1px dashed var(--ink4);margin-left:-6px;padding-left:5px}
+.ln.e .g{color:#fff;font-weight:500}
+.caret{display:inline-block;width:7px;height:13px;background:#fff;vertical-align:-2px;animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.bf{display:flex;align-items:center;gap:14px;padding:8px 12px;border-top:1px solid var(--line);font-size:11.5px;color:var(--ink3)}
+.bf .oc{display:inline-flex;align-items:center;gap:5px;color:var(--ink2);font:500 12px var(--font)}
+.bf .oc svg{width:13px;height:13px}
+.bf .oc.bad{color:#fff}
+.bf .code b{color:#fff;font-weight:500}
+.bf .null{display:inline-flex;align-items:center;gap:6px}
+.bf .null::before{content:"";width:16px;height:8px;border-radius:2px;background:var(--hatch)}
+.bf .tr{margin-left:auto}
+.ended{display:flex;align-items:center;gap:14px;margin:4px 0 8px;padding:14px;border:1px dashed var(--line3);border-radius:12px;font:13px var(--font);color:var(--ink2)}
+.ended svg{width:20px;height:20px}
+.ended .btn{margin-left:auto}
+
+/* composer */
+.comp{padding:16px 20px 18px;border-top:1px solid var(--line)}
+.row{display:grid;grid-template-columns:200px minmax(0,1fr) 112px auto auto;gap:10px;align-items:end}
+.field select.input{appearance:none;padding-right:30px;background-image:linear-gradient(45deg,transparent 50%,var(--ink3) 50%),linear-gradient(135deg,var(--ink3) 50%,transparent 50%);background-position:calc(100% - 16px) 17px,calc(100% - 11px) 17px;background-size:5px 5px;background-repeat:no-repeat;background-color:var(--tile2);font-family:var(--mono);font-size:13px}
+.input.mono{font-family:var(--mono);font-size:13px}
+.input[aria-invalid="true"]{border-color:#fff;border-style:dashed}
+.input:disabled,.btn:disabled{opacity:.45}
+.btn.primary{height:40px}
+.comp .btn{height:40px}
+.toks{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-height:22px;margin-top:10px;font:11.5px var(--mono);color:var(--ink3)}
+.tok{color:var(--ink2);border:1px solid var(--line2);border-radius:6px;padding:0 6px;background:var(--tile2)}
+.toks .cnt{margin-left:auto;color:var(--ink3)}
+.err{display:flex;align-items:center;gap:6px;margin-top:8px;color:#fff;font-size:12.5px}
+.err[hidden]{display:none}
+.hint{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid var(--line);color:var(--ink3);font-size:12px}
+.hint span{display:inline-flex;align-items:center;gap:6px}
+.hist{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
+.hist .lab{margin-right:4px}
+.hc{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--r-ctl);font:12px var(--mono);color:var(--ink2);transition:border-color .2s,color .2s}
+.hc:hover{border-color:#666;color:#fff}
+.hc small{color:var(--ink3);font-size:11px}
+
+.unavail{display:grid;place-content:center;justify-items:center;gap:12px;height:620px;text-align:center}
+.unavail .big{width:56px;height:56px;border-radius:18px;border:1px dashed var(--line3);display:grid;place-items:center;color:var(--ink3)}
+.unavail .big svg{width:24px;height:24px}
+.unavail h2{margin:0;font-size:20px;letter-spacing:-.01em}
+.unavail p{margin:0;color:var(--ink3)}
+
+.demobar{align-items:center;gap:8px;flex-wrap:wrap}
+.demobar .lab{margin-right:4px}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="win" viewBox="0 0 16 16"><path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z" fill="currentColor"/></symbol>
+  <symbol id="lin" viewBox="0 0 16 16"><path d="M5 3v10h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-hosts" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
+  <symbol id="i-vm" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
+  <symbol id="i-act" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-move" viewBox="0 0 24 24"><path d="M4 8h13l-3-3M20 16H7l3 3"/></symbol>
+  <symbol id="i-run" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-spin" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-3-6.2"/><path d="M20 4v4h-4"/></symbol>
+  <symbol id="i-fail" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-swap" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18h.01"/></symbol>
+  <symbol id="i-off" viewBox="0 0 24 24"><path d="M3 3l18 18M8.5 8.5A5 5 0 0 0 12 17h4M17 7h-3"/></symbol>
+  <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5l11 7-11 7z"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M3 12h4l2-4 4 8 2-4h6"/></symbol>
+  <symbol id="i-backup" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.6"/><path d="M4 4v4h4M12 8v4l3 2"/></symbol>
+  <symbol id="i-cam" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></symbol>
+  <symbol id="i-bot" viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="11" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01"/></symbol>
+  <symbol id="i-cog" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+  <symbol id="i-mem" viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="10" rx="2"/><path d="M7 17v3M12 17v3M17 17v3"/></symbol>
+  <symbol id="i-disk" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
+  <symbol id="i-signout" viewBox="0 0 24 24"><path d="M14 4h5v16h-5M10 16l-4-4 4-4M6 12h10"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-dot" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="currentColor"/></symbol>
+  <symbol id="i-tool" viewBox="0 0 24 24"><path d="M14.5 5.5a4 4 0 0 0 5 5L12 18a2.1 2.1 0 0 1-3-3z"/><path d="M14.5 5.5l2-2 1.5 1.5M19.5 10.5l2-2"/><path d="M9 15l-4.5 4.5"/></symbol>
+  <symbol id="i-cut" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h9"/><path d="M17 16l4 4M21 16l-4 4"/></symbol>
+</svg>
+
+<div class="page">
+<header class="top rise" style="--i:0">
+  <a class="brand" href="board.html" aria-label="Arxcovo home">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="lgo" gradientUnits="userSpaceOnUse" x1="3" y1="0" x2="29" y2="0"><stop offset="0" stop-color="#4cc2ff"/><stop offset=".5" stop-color="#b9b0e8"/><stop offset="1" stop-color="#f5a524"/></linearGradient></defs><path class="lg-a" pathLength="1" d="M7.5 27 L16 7 L24.5 27"/><g transform="rotate(-14 16 19.5)"><ellipse class="lg-o" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/><ellipse class="lg-c" pathLength="1" cx="16" cy="19.5" rx="13" ry="4.4"/></g><circle class="lg-n" cx="16" cy="7" r="2.9"/><circle class="lg-m" cx="28.2" cy="16.3" r="1.9"/></svg>
+    arxcovo
+  </a>
+  <nav class="nav" aria-label="Main">
+    <a href="board.html" aria-label="Hosts"><svg class="i"><use href="#i-hosts"/></svg></a>
+    <a href="vms.html" aria-label="VMs"><svg class="i"><use href="#i-vm"/></svg></a>
+    <a href="terminal.html" aria-current="page"><svg class="i"><use href="#i-term"/></svg>Terminal</a>
+    <a href="activity.html" aria-label="Activity"><svg class="i"><use href="#i-act"/></svg></a>
+  </nav>
+  <span class="spacer"></span>
+  <span class="sync" title="Every host serves this dashboard"><span class="pulse"></span>served by <b>atlas</b> · synced</span>
+  <label class="search"><svg class="i"><use href="#i-search"/></svg><input type="search" placeholder="Search hosts, VMs, tools" aria-label="Search"><kbd>/</kbd></label>
+  <a class="me" href="login.html?state=signedout" title="Sign out"><svg class="i"><use href="#i-signout"/></svg><span class="vh">Sign out</span></a>
+</header>
+
+<div class="head rise" style="--i:1">
+  <h1 class="h1">Terminal</h1>
+  <span class="sub">Run a tool on a host · not a shell</span>
+  <span class="spacer"></span>
+  <span class="chip" title="Same executor as agents over MCP"><svg class="i" style="width:12px;height:12px"><use href="#i-shield"/></svg>run_command</span>
+</div>
+
+<div class="grid">
+  <aside class="tile hosts rise" style="--i:2" aria-labelledby="hl-lab">
+    <div class="lab" id="hl-lab"><svg class="i"><use href="#i-hosts"/></svg>Host<span class="r" id="hcount"></span></div>
+    <ul class="hl" id="hostlist"></ul>
+    <p class="note"><svg class="i"><use href="#i-lock"/></svg><span>Tools are the ones the host discovered. Offline hosts answer 503.</span></p>
+  </aside>
+
+  <section class="tile main rise" style="--i:3" aria-label="Run command" id="main"></section>
+</div>
+
+<footer class="foot rise" style="--i:4">
+  <div class="demobar demo-flex" data-demo role="group" aria-label="Demo controls">
+    <span class="lab">Demo</span>
+    <button class="btn sm" id="d-fail" type="button"><svg class="i"><use href="#i-fail"/></svg>Simulate failure</button>
+    <button class="btn sm" id="d-trunc" type="button"><svg class="i"><use href="#i-cut"/></svg>Truncated output</button>
+    <button class="btn sm" id="d-4401" type="button"><svg class="i"><use href="#i-off"/></svg>Session ended (4401)</button>
+    <button class="btn sm" id="d-reset" type="button"><svg class="i"><use href="#i-spin"/></svg>Reconnect</button>
+  </div>
+  <span class="spacer"></span>
+  <span class="mock">Mock data</span>
+</footer>
+</div>
+
+<script>
+/* hosts and their discovered tools come from the shared fixture (ARX.HOSTS, types.ts Host) */
+const HOSTS = ARX.HOSTS.map(h => ({ id:h.id, os:h.os, ver:h.osVersion, arch:h.arch, reach:h.reachability, reason:h.reachabilityReason,
+  tools:h.tools.map(t => [t.name, t.version]) }));
+const hasTool = (hid, tool) => !!HOSTS.find(h => h.id === hid)?.tools.some(t => t[0] === tool);
+/* recent owner commands: run_command entries with actor.kind = owner from ARX.ACTIVITY, then a few local samples;
+   only tools the host actually discovered are offered */
+const RECENT = [
+  ...ARX.ACTIVITY.filter(a => a.actor.kind === 'owner' && a.tool === 'run_command' && a.hostId).map(a => {
+    const [tool, ...rest] = a.summary.split(' '); return { host:a.hostId, tool, args:rest.join(' ') };
+  }),
+  { host:'atlas', tool:'docker', args:'compose ps' },
+  { host:'atlas', tool:'git', args:'log --oneline -n 5' },
+  { host:'atlas', tool:'rg', args:'-n TODO' },
+  { host:'forge', tool:'qemu', args:'--version' },
+  { host:'ember', tool:'docker', args:'compose ps' },
+  { host:'pine',  tool:'node', args:'--version' },
+].filter(r => hasTool(r.host, r.tool)).slice(0, 6);
+const CANNED = {
+  'docker compose ps': { lines:[
+    ['o','NAME          IMAGE          SERVICE   STATUS          PORTS'],
+    ['o','web-1         nginx:1.27     web       Up 6 hours      0.0.0.0:8080->80/tcp'],
+    ['o','app-1         demo-app:3     app       Up 6 hours'],
+    ['o','db-1          postgres:16    db        Up 6 hours      5432/tcp'],
+    ['o','worker-1      demo-app:3     worker    Up 6 hours'] ], exit:0, outcome:'succeeded' },
+  'git log --oneline -n 5': { lines:[
+    ['o','9f3c21a fix: retry health check on cold start'],
+    ['o','4b7e0d2 feat: nightly snapshot label'],
+    ['o','e11a6f8 chore: bump nginx to 1.27'],
+    ['o','2c09b44 docs: deploy notes'],
+    ['o','71d5e3a feat: compose profile for workers'] ], exit:0, outcome:'succeeded' },
+  'rg -n TODO': { lines: Array.from({length:24},(_,i)=>['o',`src/${['api','web','jobs','db'][i%4]}/mod${(i*7)%13}.rs:${12+i*9}:    // TODO: ${['tighten bound','handle retry','log redaction','drop clone'][i%4]}`]), exit:0, outcome:'succeeded', truncated:true, fast:true },
+};
+const FAIL_PY = { tool:'python', args:'check.py', lines:[
+  ['o','Checking 12 templates…'],['o','ok   ubuntu-web v3'],['o','ok   ubuntu-base v4'],
+  ['e','Traceback (most recent call last):'],['e','  File "check.py", line 41, in <module>'],['e',"KeyError: 'health_check'"] ], exit:1, outcome:'failed' };
+const FAIL_GIT = { tool:'git', args:'status', lines:[['e','fatal: not a git repository (or any of the parent directories): .git']], exit:128, outcome:'failed' };
+/* every host discovered git, so the truncation demo works anywhere */
+const TRUNC = { tool:'git', args:'log --oneline', fast:true, truncated:true, exit:0, outcome:'succeeded',
+  lines: Array.from({length:30}, (_, i) => ['o', `${(0x9f3c21a - i*0x1a2b3).toString(16).padStart(7,'0')} ${['fix','feat','chore','docs','test'][i%5]}: ${['retry health check','nightly snapshot label','bump nginx','deploy notes','compose profile','bounded output','timeout 1–3600 s'][i%7]}`]) };
+const OUTCOME = { started:'i-spin', succeeded:'i-check', failed:'i-fail', rejected:'i-shield', refused:'i-ban', interrupted:'i-stop' };
+const STATUS = { connecting:['i-spin','Connecting'], ready:['i-dot','Ready'], running:['i-run','Running'], closed:['i-off','Closed'], error:['i-fail','Error'] };
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const clock = d => d.toTimeString().slice(0,8);
+const hostOf = id => HOSTS.find(h => h.id === id);
+
+let hostId = ARX.param('host') || 'atlas';
+let wantTool = ARX.param('tool');               /* ?tool= pre-selects that tool once */
+let status = 'connecting', running = null, blocks = [], sessionEnded = false, timers = [], seq = 0;
+
+/* ---------- host list ---------- */
+function stateHtml(h){
+  if (h.reach === 'online') return `<span class="st"><svg class="i"><use href="#i-dot"/></svg>Online</span>`;
+  if (h.reach === 'degraded') return `<span class="st bad"><svg class="i"><use href="#i-warn"/></svg>Degraded</span>`;
+  return `<span class="st off"><svg class="i"><use href="#i-off"/></svg>Offline</span>`;
+}
+function renderHosts(){
+  $('#hcount').textContent = `${HOSTS.filter(h=>h.reach!=='offline').length} of ${HOSTS.length} reachable`;
+  $('#hostlist').innerHTML = HOSTS.map(h => {
+    const off = h.reach === 'offline';
+    const label = `${h.id}, ${h.ver}, ${h.arch}, ${h.reach}` + (h.reason ? `: ${h.reason}` : '') + (off ? '. Terminal unavailable, 503' : '');
+    return `<li><button type="button" class="hb" data-host="${h.id}" aria-label="${esc(label)}" ${h.id===hostId?'aria-current="true"':''} ${off?'aria-disabled="true"':''}>
+      <span class="osg" style="--c:var(--${h.os==='windows'?'win':'lin'})"><svg><use href="#${h.os==='windows'?'win':'lin'}"/></svg></span>
+      <span class="hn">${h.id}</span>${stateHtml(h)}
+      <span class="hm"><span>${esc(h.ver)}</span><span class="arch">${h.arch}</span></span>
+      ${h.reason ? `<span class="why">${esc(h.reason)}${off?' · 503':''}</span>` : ''}
+    </button></li>`;
+  }).join('');
+}
+$('#hostlist').addEventListener('click', e => {
+  const b = e.target.closest('.hb'); if (!b) return;
+  if (b.getAttribute('aria-disabled') === 'true') return;
+  selectHost(b.dataset.host);
+});
+function selectHost(id){
+  if (id === hostId && !sessionEnded) return;
+  hostId = id; wantTool = null;
+  const u = new URL(location.href); u.searchParams.set('host', id); u.searchParams.delete('tool'); history.replaceState(null,'',u);
+  stopTimers(); running = null; blocks = []; sessionEnded = false;
+  renderHosts(); renderMain(); connect();
+}
+
+/* ---------- main ---------- */
+function renderMain(){
+  const h = hostOf(hostId);
+  const main = $('#main');
+  if (!h){
+    main.innerHTML = `<div class="unavail">
+      <span class="big"><svg class="i"><use href="#i-search"/></svg></span>
+      <h2>Not found</h2>
+      <p>No host named <span class="mono">${esc(hostId)}</span> has joined this cluster.</p>
+      <button class="btn sm" type="button" id="pick-atlas"><svg class="i"><use href="#i-back"/></svg>Use atlas</button>
+    </div>`;
+    $('#pick-atlas').onclick = () => selectHost('atlas');
+    return;
+  }
+  if (h.reach === 'offline'){
+    main.innerHTML = `<div class="unavail">
+      <span class="big"><svg class="i"><use href="#i-off"/></svg></span>
+      <h2>${h.id} is offline</h2>
+      <p>${esc(h.reason)}</p>
+      <span class="chip">503 · terminal unavailable</span>
+      <button class="btn sm" type="button" id="pick-atlas"><svg class="i"><use href="#i-back"/></svg>Use atlas</button>
+    </div>`;
+    $('#pick-atlas').onclick = () => selectHost('atlas');
+    return;
+  }
+  main.innerHTML = `
+    <div class="bar">
+      <span class="tgt"><span class="osg" style="--c:var(--${h.os==='windows'?'win':'lin'})"><svg><use href="#${h.os==='windows'?'win':'lin'}"/></svg></span>${h.id}<span class="arch">${h.arch}</span></span>
+      <span class="pill" id="pill" role="status" aria-live="polite"></span>
+      <span class="legend" aria-hidden="true"><span><b>›</b> stdout</span><span class="e"><b>!</b> stderr</span></span>
+    </div>
+    ${h.reach === 'degraded' ? `<p class="degr" role="note"><svg class="i"><use href="#i-warn"/></svg><span><b>Degraded:</b> ${esc(h.reason)}. Commands still run.</span></p>` : ''}
+    <div class="out" id="out" role="log" aria-live="polite" aria-label="Command output on ${h.id}" tabindex="0"></div>
+    <form class="comp" id="comp" autocomplete="off" novalidate>
+      <div class="row">
+        <div class="field"><label for="tool">Tool</label>
+          <select class="input" id="tool">${h.tools.map(([n,v])=>`<option value="${n}">${n}${v?' '+v:''}</option>`).join('')}</select></div>
+        <div class="field"><label for="args">Arguments</label>
+          <input class="input mono" id="args" spellcheck="false" autocapitalize="none" placeholder="compose ps" aria-describedby="toks err"></div>
+        <div class="field"><label for="tmo">Timeout s</label>
+          <input class="input mono" id="tmo" inputmode="numeric" placeholder="none" aria-describedby="err" title="Optional, 1–3600 seconds"></div>
+        <button class="btn primary" id="run" type="submit"><svg class="i"><use href="#i-play"/></svg>Run</button>
+        <button class="btn" id="cancel" type="button" disabled><svg class="i"><use href="#i-stop"/></svg>Cancel</button>
+      </div>
+      <div class="toks" id="toks" aria-live="polite"></div>
+      <p class="err" id="err" role="alert" hidden></p>
+      <p class="toolnote" id="toolnote" role="status" hidden></p>
+      <div class="hist" id="hist"><span class="lab"><svg class="i"><use href="#i-clock"/></svg>Recent</span></div>
+      <div class="hint">
+        <span><svg class="i"><use href="#i-run"/></svg>One command at a time</span>
+        <span><svg class="i"><use href="#i-mem"/></svg>Output bounded</span>
+        <span><svg class="i"><use href="#i-shield"/></svg>Same policy and limits as agents over MCP</span>
+        <span><svg class="i"><use href="#i-act"/></svg>Logged to Activity as owner</span>
+        <span style="margin-left:auto"><kbd>Enter</kbd> run <kbd>Esc</kbd> cancel</span>
+      </div>
+    </form>`;
+  $('#hist').insertAdjacentHTML('beforeend', RECENT.map((r,i)=>`<button type="button" class="hc" data-i="${i}" aria-label="Fill ${r.tool} ${r.args} on ${r.host}">${r.tool} ${esc(r.args)}${r.host!==hostId?` <small>${r.host}</small>`:''}</button>`).join(''));
+  $('#hist').addEventListener('click', e => {
+    const b = e.target.closest('.hc'); if (!b) return;
+    const r = RECENT[+b.dataset.i];
+    if (r.host !== hostId) selectHost(r.host);
+    $('#tool').value = r.tool; $('#args').value = r.args; updateToks(); $('#args').focus();
+  });
+  const defArgs = t => t === 'docker' ? 'compose ps' : '--version';
+  let pick = h.tools.some(t=>t[0]==='docker') ? 'docker' : h.tools[0][0];
+  if (wantTool){
+    if (hasTool(h.id, wantTool)) pick = wantTool;
+    else { const n = $('#toolnote'); n.hidden = false; n.innerHTML = `<svg class="i"><use href="#i-warn"/></svg><span><span class="mono">${esc(wantTool)}</span> isn't a tool ${h.id} discovered; pick one from the list.</span>`; }
+  }
+  $('#tool').value = pick;
+  $('#args').value = defArgs(pick);
+  $('#tool').addEventListener('change', () => {
+    $('#toolnote').hidden = true; wantTool = $('#tool').value;
+    const u = new URL(location.href); u.searchParams.set('tool', $('#tool').value); history.replaceState(null,'',u);
+  });
+  $('#args').addEventListener('input', updateToks);
+  $('#tmo').addEventListener('input', () => showErr(null));
+  $('#comp').addEventListener('submit', e => { e.preventDefault(); submit(); });
+  $('#cancel').addEventListener('click', cancel);
+  $('#comp').addEventListener('keydown', e => { if (e.key === 'Escape' && running){ e.preventDefault(); cancel(); } });
+  updateToks(); renderLog(); renderStatus();
+}
+
+/* split like the real client: whitespace separated, single/double quotes group, no shell expansion */
+function splitArgs(s){
+  const out = []; let cur = '', q = null, has = false;
+  for (const ch of s){
+    if (q){ if (ch === q) q = null; else cur += ch; }
+    else if (ch === '"' || ch === "'"){ q = ch; has = true; }
+    else if (/\s/.test(ch)){ if (cur || has){ out.push(cur); cur=''; has=false; } }
+    else cur += ch;
+  }
+  if (q) return { error:'Close the quote in the arguments.' };
+  if (cur || has) out.push(cur);
+  if (out.length > 128) return { error:`${out.length} arguments; the limit is 128.`, args:out };
+  if (out.some(a => a.length > 8192)) return { error:'An argument is longer than 8192 characters.' };
+  return { args:out };
+}
+function updateToks(){
+  const r = splitArgs($('#args').value);
+  const t = $('#toks');
+  if (r.error && !r.args){ t.innerHTML = `<span>args</span><span class="cnt">—</span>`; return; }
+  t.innerHTML = `<span>args</span>` + (r.args.length ? r.args.slice(0,12).map(a=>`<span class="tok">${esc(a)||'""'}</span>`).join('') + (r.args.length>12?`<span>+${r.args.length-12}</span>`:'') : `<span class="faint">none</span>`)
+    + `<span class="cnt">${r.args.length} / 128</span>`;
+  $('#args').setAttribute('aria-invalid', r.error ? 'true' : 'false');
+  if (!r.error) showErr(null);
+}
+function showErr(msg){
+  const e = $('#err'); if (!e) return;
+  if (!msg){ e.hidden = true; e.textContent=''; return; }
+  e.hidden = false; e.innerHTML = `<svg class="i"><use href="#i-warn"/></svg>${esc(msg)}`;
+}
+
+function renderStatus(){
+  const p = $('#pill'); if (!p) return;
+  const [ic, w] = STATUS[status];
+  p.dataset.s = status;
+  p.innerHTML = `<svg class="i"><use href="#${ic}"/></svg>${w}${status==='closed'&&sessionEnded?' · 4401':''}`;
+  const locked = status !== 'ready';
+  $('#run').disabled = locked; $('#tool').disabled = locked; $('#args').disabled = status==='closed'||status==='connecting'; $('#tmo').disabled = status==='closed'||status==='connecting';
+  $('#cancel').disabled = status !== 'running';
+  document.querySelectorAll('.hc').forEach(b => b.disabled = status !== 'ready');
+}
+function setStatus(s){ status = s; renderStatus(); }
+
+function blockHtml(b){
+  const lines = b.lines.map(([k,t]) => `<div class="ln ${k}"><span class="g" aria-hidden="true">${k==='e'?'!':'›'}</span><span><span class="vh">${k==='e'?'stderr: ':''}</span>${esc(t)}</span></div>`).join('');
+  let foot = '';
+  if (b.exit){
+    const x = b.exit;
+    foot = `<div class="bf">
+      <span class="code">exit ${x.code===null?'<span class="null">null</span>':`<b>${x.code}</b>`}</span>
+      <span class="oc ${x.outcome==='succeeded'?'':'bad'}"><svg class="i"><use href="#${OUTCOME[x.outcome]}"/></svg>${x.outcome}</span>
+      <span>${x.dur}</span>
+      ${x.truncated?'<span class="chip tr"><svg class="i" style="width:12px;height:12px"><use href="#i-warn"/></svg>output truncated</span>':''}
+    </div>`;
+  } else if (b.lost){
+    foot = `<div class="bf"><span class="null">no exit received</span><span>stream closed · the server records it as interrupted in Activity</span></div>`;
+  } else {
+    foot = `<div class="bf"><span class="oc"><svg class="i" style="animation:spin 1s linear infinite"><use href="#i-spin"/></svg>running</span><span class="caret" aria-hidden="true"></span></div>`;
+  }
+  return `<article class="blk" aria-label="${esc(b.tool+' '+b.args)}">
+    <div class="bh"><svg class="i tg" role="img" aria-label="tool"><use href="#i-tool"/></svg><span class="cmd">${esc(b.tool)}${b.args?' '+esc(b.args):''}</span>
+      <span class="meta">${b.timeout?`<span>timeout ${b.timeout} s</span>`:''}<span>${b.started}</span><span class="actor" title="Actor kind: owner"><svg class="i"><use href="#i-user"/></svg><span class="vh">actor </span>owner</span></span></div>
+    ${lines ? `<div class="lines">${lines}</div>` : ''}${foot}</article>`;
+}
+function renderLog(){
+  const o = $('#out'); if (!o) return;
+  if (!blocks.length && !sessionEnded){
+    o.innerHTML = `<div class="empty"><svg class="i"><use href="#i-term"/></svg><span>${status==='connecting'?'Connecting…':'Pick a tool, add arguments, press Enter.'}</span></div>`;
+  } else {
+    o.innerHTML = blocks.map(blockHtml).join('') + (sessionEnded ? `<div class="ended" role="alert"><svg class="i"><use href="#i-lock"/></svg><span>Session ended. Sign in again to run commands.</span><a class="btn primary sm" href="login.html?state=ended">Sign in</a></div>` : '');
+  }
+  o.scrollTop = o.scrollHeight;
+}
+
+/* ---------- session simulation ---------- */
+function later(fn, ms){ const t = setTimeout(fn, REDUCED ? Math.min(ms, 60) : ms); timers.push(t); return t; }
+function stopTimers(){ timers.forEach(clearTimeout); timers = []; }
+function connect(){
+  status = 'connecting'; renderMain();
+  const h = hostOf(hostId);
+  if (!h || h.reach === 'offline') return;
+  later(() => { setStatus('ready'); renderLog(); }, 800);
+}
+
+function submit(){
+  if (status !== 'ready') return;
+  const tool = $('#tool').value, raw = $('#args').value.trim();
+  const r = splitArgs(raw);
+  if (r.error){ showErr(r.error); $('#args').focus(); return; }
+  const tv = $('#tmo').value.trim();
+  let timeout = null;
+  if (tv){
+    if (!/^\d+$/.test(tv) || +tv < 1 || +tv > 3600){ showErr('Timeout must be a whole number from 1 to 3600 seconds.'); $('#tmo').setAttribute('aria-invalid','true'); $('#tmo').focus(); return; }
+    timeout = +tv;
+  }
+  $('#tmo').setAttribute('aria-invalid','false'); showErr(null);
+  const args = r.args.join(' ');
+  const key = `${tool} ${args}`.trim();
+  const h = hostOf(hostId);
+  let plan = CANNED[key];
+  if (!plan){
+    const ver = (h.tools.find(t=>t[0]===tool)||[])[1];
+    plan = r.args.includes('--version') ? { lines:[['o',`${tool} version ${ver ?? 'unknown'}`]], exit:0, outcome:'succeeded' }
+      : { lines:[['o',`mock: no sample output for "${key}"`]], exit:0, outcome:'succeeded' };
+  }
+  start(tool, args, timeout, plan);
+}
+function start(tool, args, timeout, plan){
+  const b = { id:++seq, tool, args, timeout, started: clock(new Date()), t0: performance.now(), lines:[], exit:null };
+  blocks.push(b); running = b; setStatus('running'); renderLog();
+  const step = plan.fast ? 70 : 260;
+  plan.lines.forEach((l, i) => later(() => { if (running !== b) return; b.lines.push(l); renderLog(); }, 300 + i*step));
+  later(() => { if (running !== b) return; finish(b, plan.exit, plan.outcome, !!plan.truncated); }, 300 + plan.lines.length*step + 250);
+}
+function dur(b){ const s = (performance.now() - b.t0)/1000; return s < 10 ? s.toFixed(1)+' s' : Math.round(s)+' s'; }
+function finish(b, code, outcome, truncated){
+  b.exit = { code, outcome, truncated, dur: dur(b) };
+  running = null; setStatus('ready'); renderLog();
+  $('#args')?.focus();
+}
+function cancel(){
+  if (!running) return;
+  const b = running; stopTimers();
+  finish(b, null, 'interrupted', false);
+}
+function endSession(){
+  stopTimers();
+  if (running){ running.lost = true; running = null; }
+  sessionEnded = true; setStatus('closed'); renderLog();
+}
+
+function demoRun(pickPlan){
+  const h = hostOf(hostId);
+  if (!h || h.reach === 'offline') return;
+  if (status === 'running') cancel();
+  if (status !== 'ready') return;
+  const f = pickPlan(h);
+  $('#tool').value = f.tool; $('#args').value = f.args; updateToks();
+  start(f.tool, f.args, null, f);
+}
+$('#d-fail').addEventListener('click', () => demoRun(h => h.tools.some(t=>t[0]==='python') ? FAIL_PY : FAIL_GIT));
+$('#d-trunc').addEventListener('click', () => demoRun(() => TRUNC));
+$('#d-4401').addEventListener('click', () => { const h = hostOf(hostId); if (h && h.reach !== 'offline') endSession(); });
+$('#d-reset').addEventListener('click', () => { stopTimers(); running = null; blocks = []; sessionEnded = false; connect(); });
+/* `/`, the search jump list and ?stale are wired by arx-data.js */
+
+renderHosts(); connect();
+</script>
+</body>
+</html>
