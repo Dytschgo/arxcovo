@@ -21,7 +21,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fixture import (ANCHOR_TEST, ENV, HERE, LIVE_TIME, MIB, ROOT, TIME, TOOLS, Refusal, bounded_read, capture,
-                     file_digest, host_command, load_pins, plain_path, require, select_daemon,
+                     check_host_profiles, file_digest, host_command, load_pins, plain_path, require, select_daemon,
                      stage_copy, stage_rootfs, verify_manifest, vet_tools, build_descriptor, install_live,
                      node_endpoint, open_artifact, remaining, select_anchor_probe)
 from isolation import Resources, check_host_routes, json_rows, stable_rules
@@ -48,7 +48,9 @@ def provenance(env, host, checkout):
     require(re.fullmatch(re.escape(REPO) + r"/\.github/workflows/ci\.yml@refs/(heads/main|pull/[1-9][0-9]{0,14}/merge)",
                          workflow) and env.get("GITHUB_WORKFLOW_SHA") == head == checkout,
             "source-workflow-head")
-    profiles = [profile for profile in host["profiles"]
+    all_profiles = check_host_profiles(host["profiles"], image_category="runner-image",
+                                       variant_category="runner-kernel-os")
+    profiles = [profile for profile in all_profiles
                 if (profile["image_os"], profile["image_version"])
                 == (env.get("ImageOS"), env.get("ImageVersion"))]
     require(len(profiles) == 1, "runner-image")
@@ -76,10 +78,12 @@ def os_version(file):
 def checked_runner_platform(env, host, head, end, tools):
     receipt, profile = provenance(env, host, head)
     uname = os.uname()
+    variants = [variant for variant in profile["variants"] if variant["kernel"] == uname.release]
     require(os_version(Path("/usr/lib/os-release")) == host["os"]
-            and uname.release == profile["kernel"] and uname.machine == "x86_64", "runner-kernel-os")
+            and uname.machine == "x86_64" and len(variants) == 1, "runner-kernel-os")
+    variant = variants[0]
     systemd = host_command("dpkg", end, "-W", "-f=${Version}", "systemd", tools=tools).strip()
-    require(systemd == profile["systemd_package"], "runner-systemd")
+    require(systemd == variant["systemd_package"], "runner-systemd")
     receipt.update(os=host["os"], kernel=uname.release, systemd=systemd)
     return receipt
 

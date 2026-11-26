@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
-import { decodeActivityPage, decodeHost, decodeHosts, decodeSession, decodeVm, decodeVms, LIMITS } from './decode';
+import { summarizeCpuHistory } from './cpuHistory';
+import { decodeActivityPage, decodeCpuHistory, decodeCpuHistoryBatch, decodeHost, decodeHosts, decodeSession, decodeVm, decodeVms, LIMITS } from './decode';
 import { FIXTURE_ACTIVITY, FIXTURE_HOSTS, FIXTURE_VMS } from './fixtures';
 import { ApiError } from './types';
 
@@ -62,5 +63,57 @@ describe('decoders reject malformed payloads', () => {
     rejects(() => decodeActivityPage({ entries: FIXTURE_ACTIVITY.slice(0, 51), nextBeforeId: null }));
     rejects(() => decodeActivityPage({ entries: [{ ...FIXTURE_ACTIVITY[0], id: 0 }], nextBeforeId: null }));
     rejects(() => decodeActivityPage({ entries: [{ ...FIXTURE_ACTIVITY[0], outcome: 'maybe' }], nextBeforeId: null }));
+  });
+});
+
+describe('CPU history', () => {
+  const day = {
+    hostId: 'atlas',
+    range: '24h',
+    bucketSeconds: 600,
+    from: '2026-11-25T10:20:00Z',
+    to: '2026-11-26T10:20:00Z',
+    samples: [0, 38.2, 100, ...Array<null>(141).fill(null)],
+  };
+
+  test('preserves coverage gaps and decodes bounded batches', () => {
+    expect(decodeCpuHistory(day)).toEqual(day);
+    expect(decodeCpuHistoryBatch({ series: [day, { ...day, hostId: 'harbor' }] }))
+      .toEqual([day, { ...day, hostId: 'harbor' }]);
+  });
+
+  test('requires a known range, matching dimensions and aligned UTC timestamps', () => {
+    rejects(() => decodeCpuHistory({ ...day, range: '2h' }));
+    rejects(() => decodeCpuHistory({ ...day, bucketSeconds: 300 }));
+    rejects(() => decodeCpuHistory({ ...day, from: '2026-11-25T10:21:00Z', to: '2026-11-26T10:21:00Z' }));
+    rejects(() => decodeCpuHistory({ ...day, to: '2026-11-26T10:30:00Z' }));
+    rejects(() => decodeCpuHistory({ ...day, to: '2026-11-26' }));
+    rejects(() => decodeCpuHistory({ ...day, hostId: '../atlas' }));
+  });
+
+  test('requires exactly the advertised point count and finite one-decimal percentages or null', () => {
+    rejects(() => decodeCpuHistory({ ...day, samples: day.samples.slice(1) }));
+    rejects(() => decodeCpuHistory({ ...day, samples: [...day.samples, null] }));
+    for (const bad of [-0.1, 101, NaN, Infinity, '37', 38.21, undefined]) {
+      rejects(() => decodeCpuHistory({ ...day, samples: [bad, ...day.samples.slice(1)] }));
+    }
+  });
+
+  test('batch refuses excess series, duplicate hosts and non-24h data', () => {
+    const atLimit = Array.from({ length: LIMITS.hosts }, (_, i) => ({ ...day, hostId: `host-${i}` }));
+    expect(decodeCpuHistoryBatch({ series: atLimit })).toHaveLength(LIMITS.hosts);
+    rejects(() => decodeCpuHistoryBatch({ series: [...atLimit, day] }));
+    rejects(() => decodeCpuHistoryBatch({ series: [day, day] }));
+    const hour = { ...day, range: '1h', bucketSeconds: 60, from: '2026-11-26T09:20:00Z', samples: day.samples.slice(0, 60) };
+    expect(decodeCpuHistory(hour)).toEqual(hour);
+    rejects(() => decodeCpuHistoryBatch({ series: [hour] }));
+  });
+
+  test('window average and peak use only present buckets and report the number missing', () => {
+    expect(summarizeCpuHistory([null, 32, 0, null, 64])).toEqual({ avg: 32, peak: 64, missing: 2 });
+    expect(summarizeCpuHistory([25, 75])).toEqual({ avg: 50, peak: 75, missing: 0 });
+    expect(summarizeCpuHistory([0, null])).toEqual({ avg: 0, peak: 0, missing: 1 });
+    expect(summarizeCpuHistory([null, null])).toEqual({ avg: null, peak: null, missing: 2 });
+    expect(summarizeCpuHistory([])).toEqual({ avg: null, peak: null, missing: 0 });
   });
 });

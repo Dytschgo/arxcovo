@@ -570,6 +570,7 @@ fn t33_transient_build_disposal_resumes_across_every_edge_to_publish_and_ordinar
         // Crash & reopen: zero volatile state, `recover()` abandons pending build.
         fx.reopen();
         assert_eq!(fx.count("SELECT count(*) FROM vm_build_intents"), 1);
+        fx.clock.advance(0, 0);
         assert!(fx.sweep(None));
         assert_eq!(
             fx.count("SELECT count(*) FROM vm_build_intents"),
@@ -619,6 +620,7 @@ fn t69_t70_t71_ordinary_sweep_resumes_after_every_unlink_and_reopen() {
 
         // Crash and reopen with zero volatile receipts, guards or backoff maps.
         fx.reopen();
+        fx.clock.advance(0, 0);
         assert!(fx.sweep(None));
 
         // Exact physical absence (leaves, lease AND directory) and ledger settlement.
@@ -713,6 +715,7 @@ fn t68_negative_controls_retain_claims_and_never_delete_protected_objects() {
             assert!(fx.sweep(Some(Fault::Before("slot_disposed", 1))));
             assert!(!exists(&disk_path));
             fx.reopen();
+            fx.clock.advance(0, 0);
         } else {
             std::fs::remove_file(&disk_path).unwrap();
         }
@@ -735,6 +738,7 @@ fn t68_negative_controls_retain_claims_and_never_delete_protected_objects() {
             assert!(fx.sweep(Some(Fault::Before("intend_directory_disposal", 1))));
             assert!(!exists(&fx.lease_file(slots.disk.generation)));
             fx.reopen();
+            fx.clock.advance(0, 0);
         }
         std::fs::write(&extra, b"keep-me").unwrap();
         assert!(fx.sweep(None));
@@ -776,6 +780,7 @@ fn t68_negative_controls_retain_claims_and_never_delete_protected_objects() {
         let ledger = LedgerDisposal { store: fx.store() };
         let guards = GenerationGuards::default();
         let wrong_custody = NativeDisposal::under(&wrong_parent, fx.owner_sid(), &ledger, &guards);
+        fx.clock.advance(0, 0);
         assert!(fx.ctl().sweep_with(&OfflineReaper, &wrong_custody).unwrap());
         assert!(exists(&fx.slot_file(slots.disk)));
         assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 1);
@@ -941,6 +946,7 @@ fn recovery_retains_files_release_only_refuses_and_uncreated_reservation_proves_
             store::recover(db, NOW)
         })
         .unwrap();
+    fx.clock.advance(0, 0);
     assert!(fx.sweep(None));
     assert!(exists(&fx.slot_file(slots.disk)));
     assert!(exists(&fx.slot_file(slots.vars)));
@@ -984,6 +990,7 @@ fn recovery_retains_files_release_only_refuses_and_uncreated_reservation_proves_
         .unwrap();
     let _ = act;
     assert!(!exists(&fx.gen_dir(uncreated.pair.disk.generation)));
+    fx.clock.advance(0, 0);
     assert!(fx.sweep(None));
     assert_eq!(fx.count("SELECT count(*) FROM vm_build_intents"), 0);
 
@@ -1048,6 +1055,114 @@ fn resumable_disposal_leaves_production_test_admission_and_default_sweep_closed(
             }),
             Err(NativeRefusal::QualificationMissing)
         );
+    }
+}
+
+/// Reviewer lead (PR #372): a resumed lease or directory deletion must
+/// re-check the current `DisposalScope` before the destructive operation.
+#[test]
+fn review_resumed_lease_and_directory_deletion_rechecks_authority() {
+    for (nonce, fault, lease_phase) in [
+        (0x71u8, Fault::After("intend_lease_disposal", 1), true),
+        (0x72u8, Fault::After("intend_directory_disposal", 1), false),
+    ] {
+        let fx = SweepFixture::new();
+        let (activity, slots, _) = fx.stage_build(nonce);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let verification = slots.verification.disk.generation;
+        {
+            let guards = GenerationGuards::default();
+            let faulty = FaultDisposal::new(fx.store(), Some(fault));
+            assert!(
+                fx.disposal(&faulty, &guards)
+                    .dispose_build_transient(activity, slots, deadline)
+                    .is_err()
+            );
+        }
+        assert!(exists(&fx.gen_dir(verification)));
+        assert_eq!(exists(&fx.lease_file(verification)), lease_phase);
+        let clean = LedgerDisposal { store: fx.store() };
+        let guards = GenerationGuards::default();
+        assert!(
+            fx.disposal(&clean, &guards)
+                .dispose_build_transient(activity + 1000, slots, deadline)
+                .is_err()
+        );
+        if lease_phase {
+            assert!(
+                exists(&fx.lease_file(verification)),
+                "lease deleted before authority re-check ({fault:?})"
+            );
+        }
+        assert!(
+            exists(&fx.gen_dir(verification)),
+            "directory deleted before authority re-check ({fault:?})"
+        );
+        // Positive control: the authorized scope still converges.
+        fx.disposal(&clean, &guards)
+            .dispose_build_transient(activity, slots, deadline)
+            .unwrap();
+        assert!(!exists(&fx.gen_dir(verification)));
+    }
+}
+
+/// Resumed ordinary-cleanup (`CleanupKind::Expiry`) lease and directory
+/// deletions also refuse a stale/wrong `activity_id` before unlinking.
+#[test]
+fn review_resumed_cleanup_lease_and_directory_deletion_rechecks_authority() {
+    for (nonce, fault, lease_phase) in [
+        (0x73u8, Fault::After("intend_lease_disposal", 1), true),
+        (0x74u8, Fault::After("intend_directory_disposal", 1), false),
+    ] {
+        let fx = SweepFixture::new();
+        let (vm, slots, _) = fx.active_clone(nonce);
+        let generation = slots.disk.generation;
+        fx.clock.advance(2_000, 10);
+        assert!(fx.sweep(Some(fault)));
+        assert!(exists(&fx.gen_dir(generation)));
+        assert_eq!(exists(&fx.lease_file(generation)), lease_phase);
+
+        let activity_id: i64 = fx
+            .store()
+            .transact(|db| {
+                Ok(db.query_row(
+                    "SELECT cleanup_id FROM vm_instances WHERE id=?1",
+                    [vm],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        let mut stale_work = fx
+            .store()
+            .transact(|db| store::cleanup_work(db, CleanupKind::Expiry { vm, activity_id }))
+            .unwrap()
+            .expect("expiry cleanup work");
+        stale_work.kind = CleanupKind::Expiry {
+            vm,
+            activity_id: activity_id + 1000,
+        };
+        let clean = LedgerDisposal { store: fx.store() };
+        let guards = GenerationGuards::default();
+        assert_eq!(
+            fx.disposal(&clean, &guards)
+                .dispose_cleanup(&stale_work, Instant::now() + Duration::from_secs(30)),
+            Err(PATH)
+        );
+        if lease_phase {
+            assert!(
+                exists(&fx.lease_file(generation)),
+                "cleanup lease deleted before authority re-check ({fault:?})"
+            );
+        }
+        assert!(
+            exists(&fx.gen_dir(generation)),
+            "cleanup directory deleted before authority re-check ({fault:?})"
+        );
+        // Positive control: the authorized ordinary sweep converges cleanly.
+        fx.clock.advance(0, 61);
+        assert!(fx.sweep(None));
+        assert!(!exists(&fx.gen_dir(generation)));
+        assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 0);
     }
 }
 
@@ -1506,114 +1621,6 @@ fn orphan_expiry_resume_refuses_superseded_scope_before_deleting() {
 
         assert!(fx.ctl().sweep_with(&OfflineReaper, &custody).unwrap());
         assert!(!exists(&dir), "fresh scope must converge");
-        assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 0);
-    }
-}
-
-/// Reviewer lead (PR #372): a resumed lease or directory deletion must
-/// re-check the current `DisposalScope` before the destructive operation.
-#[test]
-fn review_resumed_lease_and_directory_deletion_rechecks_authority() {
-    for (nonce, fault, lease_phase) in [
-        (0x71u8, Fault::After("intend_lease_disposal", 1), true),
-        (0x72u8, Fault::After("intend_directory_disposal", 1), false),
-    ] {
-        let fx = SweepFixture::new();
-        let (activity, slots, _) = fx.stage_build(nonce);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let verification = slots.verification.disk.generation;
-        {
-            let guards = GenerationGuards::default();
-            let faulty = FaultDisposal::new(fx.store(), Some(fault));
-            assert!(
-                fx.disposal(&faulty, &guards)
-                    .dispose_build_transient(activity, slots, deadline)
-                    .is_err()
-            );
-        }
-        assert!(exists(&fx.gen_dir(verification)));
-        assert_eq!(exists(&fx.lease_file(verification)), lease_phase);
-        let clean = LedgerDisposal { store: fx.store() };
-        let guards = GenerationGuards::default();
-        assert!(
-            fx.disposal(&clean, &guards)
-                .dispose_build_transient(activity + 1000, slots, deadline)
-                .is_err()
-        );
-        if lease_phase {
-            assert!(
-                exists(&fx.lease_file(verification)),
-                "lease deleted before authority re-check ({fault:?})"
-            );
-        }
-        assert!(
-            exists(&fx.gen_dir(verification)),
-            "directory deleted before authority re-check ({fault:?})"
-        );
-        // Positive control: the authorized scope still converges.
-        fx.disposal(&clean, &guards)
-            .dispose_build_transient(activity, slots, deadline)
-            .unwrap();
-        assert!(!exists(&fx.gen_dir(verification)));
-    }
-}
-
-/// Resumed ordinary-cleanup (`CleanupKind::Expiry`) lease and directory
-/// deletions also refuse a stale/wrong `activity_id` before unlinking.
-#[test]
-fn review_resumed_cleanup_lease_and_directory_deletion_rechecks_authority() {
-    for (nonce, fault, lease_phase) in [
-        (0x73u8, Fault::After("intend_lease_disposal", 1), true),
-        (0x74u8, Fault::After("intend_directory_disposal", 1), false),
-    ] {
-        let fx = SweepFixture::new();
-        let (vm, slots, _) = fx.active_clone(nonce);
-        let generation = slots.disk.generation;
-        fx.clock.advance(2_000, 10);
-        assert!(fx.sweep(Some(fault)));
-        assert!(exists(&fx.gen_dir(generation)));
-        assert_eq!(exists(&fx.lease_file(generation)), lease_phase);
-
-        let activity_id: i64 = fx
-            .store()
-            .transact(|db| {
-                Ok(db.query_row(
-                    "SELECT cleanup_id FROM vm_instances WHERE id=?1",
-                    [vm],
-                    |r| r.get(0),
-                )?)
-            })
-            .unwrap();
-        let mut stale_work = fx
-            .store()
-            .transact(|db| store::cleanup_work(db, CleanupKind::Expiry { vm, activity_id }))
-            .unwrap()
-            .expect("expiry cleanup work");
-        stale_work.kind = CleanupKind::Expiry {
-            vm,
-            activity_id: activity_id + 1000,
-        };
-        let clean = LedgerDisposal { store: fx.store() };
-        let guards = GenerationGuards::default();
-        assert_eq!(
-            fx.disposal(&clean, &guards)
-                .dispose_cleanup(&stale_work, Instant::now() + Duration::from_secs(30)),
-            Err(PATH)
-        );
-        if lease_phase {
-            assert!(
-                exists(&fx.lease_file(generation)),
-                "cleanup lease deleted before authority re-check ({fault:?})"
-            );
-        }
-        assert!(
-            exists(&fx.gen_dir(generation)),
-            "cleanup directory deleted before authority re-check ({fault:?})"
-        );
-        // Positive control: the authorized ordinary sweep converges cleanly.
-        fx.clock.advance(0, 61);
-        assert!(fx.sweep(None));
-        assert!(!exists(&fx.gen_dir(generation)));
         assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 0);
     }
 }
