@@ -67,6 +67,12 @@ impl StopReceipt {
         })
     }
 
+    /// The stop may still succeed only before this monotonic deadline.
+    #[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     fn status(&self, db: &Transaction<'_>, target: Target) -> Result<Option<Status>> {
         ensure!(
             (self.target.vm, self.target.generation, self.target.epoch)

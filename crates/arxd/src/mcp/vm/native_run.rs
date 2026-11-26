@@ -643,13 +643,31 @@ impl Run {
         }
     }
 
+    /// Whether this owner holds an admitted stop that can still succeed.
+    fn holds_live_stop(&self) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .stop
+                .as_ref()
+                .is_some_and(|stop| Instant::now() < stop.deadline())
+        })
+    }
+
     async fn wait_retry(&self, supervisor: &Supervisor) -> bool {
         // Keep the Job, lease, proof and retry ownership on the same worker.
-        // On drain the durable unresolved epoch hands off to orphan recovery.
-        let _ = supervisor.controller.fence_native_run(self.target);
+        // A retryable failure under a live exact stop keeps its receipt
+        // pending and the VM stopping, so a later attempt can still settle
+        // it on time. Without one, or once it expires, fence the epoch.
+        if !self.holds_live_stop() {
+            let _ = supervisor.controller.fence_native_run(self.target);
+        }
         tokio::select! {
             biased;
-            _ = supervisor.cancel.cancelled() => false,
+            _ = supervisor.cancel.cancelled() => {
+                // Drain hands the durable unresolved epoch to orphan recovery.
+                let _ = supervisor.controller.fence_native_run(self.target);
+                false
+            }
             _ = self.retry.notified() => true,
             _ = tokio::time::sleep(Duration::from_secs(1)) => true,
         }

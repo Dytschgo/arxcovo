@@ -532,6 +532,56 @@ async fn release_after_owner_stop_carries_the_receipt_without_fencing() {
 }
 
 #[tokio::test]
+async fn retryable_release_rollback_keeps_the_on_time_stop_and_its_receipt() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let Starting { owner, worker, registration: _registration, observed } = reserved(&h, &client).await;
+    record_checked_creation(&h, &observed);
+    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16]), || true).await);
+    let vm = observed.target.vm;
+    let stop = call(&client, "vm_stop", json!({"vm_id":hex::encode(vm), "request_id":key(507)})).await;
+    assert_eq!(stop["ok"], true, "{stop}");
+    let ctl = &h.supervisor().controller;
+    // A one-shot SQLite rollback of the first release attempt. The failure
+    // clears before the owner retries with the same clean proof.
+    let trigger = "CREATE TRIGGER fail_release BEFORE UPDATE OF disposition ON vm_snapshot_release
+        BEGIN SELECT RAISE(ABORT,'fixture release rollback'); END";
+    ctl.native_store().transact(|db| { db.execute_batch(trigger)?; Ok(()) }).unwrap();
+    let attempts = std::cell::Cell::new(0);
+    owner.settle_with(h.supervisor(), || Ok(()), |_, receipt| {
+        attempts.set(attempts.get() + 1);
+        assert!(receipt.is_some(), "the owner lost its stop receipt");
+        let committed = ctl.native_store().try_native_transaction(|db| {
+            native::release::commit(db, &observed, receipt, || ctl.native_clock()).map(|_| ())
+        });
+        match attempts.get() {
+            1 => {
+                assert!(committed.is_err(), "the fixture rollback did not fire");
+                assert_eq!(vm_state(&h, vm), 2, "the rollback changed the VM state");
+                ctl.native_store().transact(|db| {
+                    db.execute_batch("DROP TRIGGER fail_release")?;
+                    Ok(())
+                }).unwrap();
+            }
+            2 => assert!(committed.is_ok(), "{committed:?}"),
+            _ => panic!("the clean release kept failing: {committed:?}"),
+        }
+        committed
+    }).await;
+    assert_eq!(attempts.get(), 2);
+    // The second attempt released on time: stopped, clean and the original
+    // stop receipt succeeded instead of being interrupted by a fence.
+    assert_eq!(vm_state(&h, vm), 1, "the retry interrupted the on-time stop");
+    assert_eq!(unresolved_epoch(&h, vm), None);
+    assert_eq!(ctl.active_release_epoch(vm, false).unwrap(), Some((observed.target.generation, observed.target.epoch)));
+    let settled = terminal(&client, &stop).await;
+    assert_eq!(settled["state"], "succeeded", "{settled}");
+    assert_admission_closed(&h);
+    drop(client);
+    let _ = h.shutdown().await;
+}
+
+#[tokio::test]
 async fn teardown_retry_keeps_one_launch_and_is_woken_by_the_reaper() {
     let mut h = windows_harness().await;
     let client = h.client(0).await;
