@@ -1,5 +1,5 @@
-// Guards for the Night Orbit stylesheet: text contrast, self-hosted fonts,
-// dark only, and the reduced-motion finished state.
+// Guards for the Night Orbit stylesheet: text and non-text contrast,
+// self-hosted fonts, dark only, and the reduced-motion finished state.
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -116,6 +116,55 @@ describe('text on its real backgrounds', () => {
     const offenders = sources.flatMap(f => read(f).split('\n')
       .flatMap((line, i) => (/opacity/i.test(line) ? [`${f.replace(/\\/g, '/')}:${i + 1}: ${line.trim()}`] : [])));
     expect(offenders).toEqual([]);
+  });
+});
+
+// WCAG 2.2 SC 1.4.11: what identifies a control or its state reaches 3:1.
+// The rendered audit (ui/tests/nontext.ts) measures the painted page; these
+// pin the stylesheet so a hover, focus or invalid rule cannot quietly undo it.
+describe('non-text contrast (3:1)', () => {
+  const surfaces = ['bg', 'tile', 'tile2', 'raise'];
+  const edgeOf = (decls: Map<string, string>) => decls.get('border-color') ?? decls.get('border')?.match(/var\(--[\w-]+\)|#[0-9a-fA-F]{3,6}\b/)?.[0];
+
+  test('--edge, the control boundary, reaches 3:1 on every surface a control sits on', () => {
+    for (const surface of surfaces) expect(contrast(token('edge'), token(surface)), `--edge on --${surface}`).toBeGreaterThanOrEqual(3);
+    // ...and the hairlines it replaces for controls do not, which is why they stay decoration.
+    expect(contrast(token('line2'), token('tile'))).toBeLessThan(3);
+  });
+
+  test('enabled fields and checkboxes keep a 3:1 edge in every state; disabled ones keep a dashed edge', () => {
+    const controls = rules().filter(r => r.selector.split(',').some(sel => /(^|[\s>+~])(input|select|textarea)\b/.test(sel.trim()) && !/::/.test(sel)));
+    const edged = controls.filter(r => edgeOf(r.decls));
+    expect(edged.map(r => r.selector)).toEqual(expect.arrayContaining([
+      '.field input, .field select, .terminal-input input',
+      '.field input:focus-visible, .field select:focus-visible, .terminal-input input:focus-visible',
+      '.check input',
+      '.check input:checked',
+    ]));
+    for (const r of edged) {
+      if (r.selector.split(',').every(sel => sel.includes(':disabled'))) {
+        expect(r.decls.get('border-style'), r.selector).toBe('dashed');
+        continue;
+      }
+      expect(['var(--edge)', 'var(--ink)'], `${r.selector} edge ${edgeOf(r.decls)}`).toContain(edgeOf(r.decls));
+    }
+  });
+
+  test('checkboxes are drawn by the stylesheet (measurable), and native again under forced colours', () => {
+    const box = rule('.check input');
+    expect(box.get('appearance')).toBe('none');
+    expect(box.get('border')).toMatch(/var\(--edge\)/);
+    expect(rule('.check input:checked').get('background')).toBe('var(--ink)');
+    expect(rule('.check input:checked::before').get('border')).toMatch(/var\(--bg\)/);
+    const forced = css.slice(css.indexOf('@media (forced-colors: active)'));
+    expect(forced).toMatch(/\.check input\s*{\s*appearance:\s*auto;\s*}/);
+  });
+
+  test('every focus ring is --ink, which reaches 3:1 on every surface', () => {
+    const rings = rules().filter(r => /:focus-visible/.test(r.selector) && /solid|dashed|dotted/.test(r.decls.get('outline') ?? ''));
+    expect(rings.length).toBeGreaterThan(0);
+    for (const r of rings) expect(r.decls.get('outline'), r.selector).toMatch(/var\(--ink\)/);
+    for (const surface of surfaces) expect(contrast(token('ink'), token(surface))).toBeGreaterThanOrEqual(3);
   });
 });
 
