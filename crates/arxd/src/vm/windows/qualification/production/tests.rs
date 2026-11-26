@@ -360,8 +360,7 @@ fn launch_permit_fence_requires_issuer_minted_authority_and_non_echoed_target() 
         fn consume(
             self,
             _target: LaunchTarget<'_, '_>,
-        ) -> Result<(LaunchPermitBinding, crate::vm::runtime::LaunchAuthority), NativeRefusal>
-        {
+        ) -> Result<crate::vm::runtime::LaunchAuthority, NativeRefusal> {
             Err(NativeRefusal::QualificationMissing)
         }
     }
@@ -371,7 +370,7 @@ fn launch_permit_fence_requires_issuer_minted_authority_and_non_echoed_target() 
     fn assert_consume_returns_authority<P: LaunchPermit>(
         permit: P,
         target: LaunchTarget<'_, '_>,
-    ) -> Result<(LaunchPermitBinding, crate::vm::runtime::LaunchAuthority), NativeRefusal> {
+    ) -> Result<crate::vm::runtime::LaunchAuthority, NativeRefusal> {
         permit.consume(target)
     }
     fn assert_launch_retains_authority(
@@ -382,8 +381,10 @@ fn launch_permit_fence_requires_issuer_minted_authority_and_non_echoed_target() 
     let _ = assert_launch_retains_authority;
 
     // Only the TEST issuer's private `Minted` token constructs the authority,
-    // and only a fixture installation opens that issuer before 7c 16.
-    assert_eq!(size_of::<crate::vm::runtime::LaunchAuthority>(), 0);
+    // which carries its own binding, and only a fixture installation opens
+    // that issuer before 7c 16.
+    let _: fn(&crate::vm::runtime::LaunchAuthority) -> LaunchPermitBinding =
+        crate::vm::runtime::LaunchAuthority::binding;
     assert!(matches!(
         crate::vm::runtime::CandidateRuntime::new(None).capability(),
         crate::vm::runtime::NativeCapability::Unavailable(NativeRefusal::Disabled)
@@ -407,6 +408,7 @@ fn launch_permit_fence_requires_issuer_minted_authority_and_non_echoed_target() 
         pair: None,
         installer: None,
         recipe: None,
+        helper: None,
         memory: 256 << 20,
         cpu_rate: 1000,
     };

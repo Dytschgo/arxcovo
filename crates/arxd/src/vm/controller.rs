@@ -26,6 +26,114 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Only a fresh admission yields a worker handle. A status lookup has no
+/// dispatch authority. Deadlines are process-local and never persisted.
+/// Every field is private to the controller: no other code can mint a
+/// worker, change its admitted identity or reset its one-intent latch.
+#[derive(Debug)]
+pub struct PendingOperation {
+    activity_id: i64,
+    deadline: Instant,
+    binding: Arc<()>,
+    /// The exact request this admission authorized, for native TEST work.
+    #[cfg_attr(
+        not(all(windows, target_arch = "x86_64")),
+        allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
+    )]
+    admitted: Option<Admitted>,
+    /// Set once, when the native TEST issuer mints this worker's intent.
+    #[cfg_attr(
+        not(all(windows, target_arch = "x86_64")),
+        allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
+    )]
+    intent_minted: AtomicBool,
+}
+
+impl PendingOperation {
+    pub fn activity_id(&self) -> i64 {
+        self.activity_id
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// The request fixed at admission, when it may carry native TEST work.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn admitted(&self) -> Option<&Admitted> {
+        self.admitted.as_ref()
+    }
+
+    /// Claims this worker's single native TEST intent. The latch never
+    /// resets.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) fn claim_intent(&self) -> bool {
+        !self.intent_minted.swap(true, Ordering::AcqRel)
+    }
+
+    /// A detached worker for fixtures that never reach the controller.
+    #[cfg(test)]
+    pub(crate) fn for_test(activity_id: i64, deadline: Instant) -> Self {
+        Self {
+            activity_id,
+            deadline,
+            binding: Arc::new(()),
+            admitted: None,
+            intent_minted: AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn binding_for_test(&self) -> &Arc<()> {
+        &self.binding
+    }
+
+    #[cfg(test)]
+    pub(crate) fn extend_deadline_for_test(&mut self, by: Duration) {
+        self.deadline += by;
+    }
+}
+
+/// The request a fresh admission authorized, fixed when its worker is
+/// minted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(all(windows, target_arch = "x86_64")),
+    allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
+)]
+pub(crate) struct Admitted {
+    pub(crate) principal: String,
+    pub(crate) request: RequestId,
+    pub(crate) action: i64,
+    pub(crate) operation: Id,
+    pub(crate) effect: AdmittedEffect,
+}
+
+impl Admitted {
+    fn new(binding: &store::Binding<'_>, operation: Id, effect: AdmittedEffect) -> Self {
+        Self {
+            principal: binding.principal.to_owned(),
+            request: binding.key,
+            action: binding.action,
+            operation,
+            effect,
+        }
+    }
+}
+
+/// What kind of native TEST effect the admitted request asked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(all(windows, target_arch = "x86_64")),
+    allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
+)]
+pub(crate) enum AdmittedEffect {
+    Clone,
+    Start,
+    Script { digest: [u8; 32], timeout_s: u64 },
+    Build { recipe_id: Id, digest: [u8; 32] },
+}
+
 /// Foreground VM-profile metadata. A successful admission commits intent;
 /// there is no runtime, transport, or process launcher in this controller.
 pub struct VmController<C> {
@@ -313,10 +421,8 @@ impl<C: Clock> VmController<C> {
             Target::Clone { expires, .. } => Some(expires),
             _ => None,
         };
-        let id = binding
-            .record(db, now, Some(request.vm), lease_end)?
-            .receipt
-            .activity_id;
+        let operation = binding.record(db, now, Some(request.vm), lease_end)?;
+        let id = operation.receipt.activity_id;
         target.insert(db, request, id, resources)?;
         if action == Action::Start {
             let epoch = db.query_row(
@@ -327,10 +433,22 @@ impl<C: Clock> VmController<C> {
             store::snapshot::invalidate_release(db, request.vm, epoch)?;
         }
         store::require_headroom(db)?;
+        let effect = match request.operation {
+            Operation::Start => Some(AdmittedEffect::Start),
+            Operation::Script {
+                script,
+                timeout_seconds,
+            } => Some(AdmittedEffect::Script {
+                digest: Sha256::digest(script.as_bytes()).into(),
+                timeout_s: timeout_seconds,
+            }),
+            _ => None,
+        };
         Ok(Admission::Admitted(PendingOperation {
             activity_id: id,
             deadline,
             binding: Arc::clone(&self.worker_binding),
+            admitted: effect.map(|effect| Admitted::new(&binding, operation.id, effect)),
             intent_minted: AtomicBool::new(false),
         }))
     }
@@ -622,10 +740,17 @@ impl<C: Clock> VmController<C> {
         let operation = binding.record(db, now, None, None)?;
         let slots = store::reserve_build(db, request, operation, peak)?;
         store::require_headroom(db)?;
+        let mut recipe_id = [0; 16];
+        hex::decode_to_slice(request.recipe, &mut recipe_id)?;
+        let effect = AdmittedEffect::Build {
+            recipe_id,
+            digest: request.digest,
+        };
         Ok(Ok(BuildAdmission::Fresh(
             Box::new(slots),
             PendingOperation {
                 activity_id: operation.receipt.activity_id,
+                admitted: Some(Admitted::new(&binding, operation.id, effect)),
                 ..pending
             },
             operation,
@@ -720,7 +845,9 @@ impl<C: Clock> VmController<C> {
                 let slots = store::plan_clone(db, request.vm)?;
                 store::require_headroom(db)?;
                 Ok(Ok(CloneAdmission::Fresh(request.vm, slots, PendingOperation {
-                    activity_id: operation.receipt.activity_id, ..pending
+                    activity_id: operation.receipt.activity_id,
+                    admitted: Some(Admitted::new(&binding, operation.id, AdmittedEffect::Clone)),
+                    ..pending
                 }, operation)))
         }))
     }
@@ -733,6 +860,7 @@ impl<C: Clock> VmController<C> {
                 .checked_add(Duration::from_secs(seconds))
                 .ok_or_else(|| anyhow::anyhow!("invalid VM deadline"))?,
             binding: Arc::clone(&self.worker_binding),
+            admitted: None,
             intent_minted: AtomicBool::new(false),
         })
     }
@@ -2501,25 +2629,30 @@ impl<C: Clock> VmController<C> {
     }
 
     /// The durable admission one native TEST effect requires, read without
-    /// waiting on the store: the worker's own pending operation for exactly
-    /// this principal, request and action, before its deadline; a non-static
-    /// target generation that the operation owns; the unresolved writer
-    /// epoch when one applies; and every named slot still live. A replayed
-    /// or completed request, another principal, or any drift is refused.
+    /// waiting on the store. The worker's admitted claim, fixed by the
+    /// controller at admission, names the principal, request, action and
+    /// operation; the row must still be pending, before the worker deadline.
+    /// The non-static target generation must belong to that operation: a
+    /// pending build, a creating clone, or an active generation whose
+    /// unresolved writer epoch is the named one. Every named slot must be
+    /// live in that generation.
     pub(crate) fn native_effect_admitted(
         &self,
         worker: &PendingOperation,
-        effect: &super::test_issuer::NativeEffect<'_>,
+        target: super::test_issuer::NativeTarget,
         slots: &[ArtifactSlot],
     ) -> Result<bool> {
         self.check_worker(worker)?;
+        let Some(admitted) = worker.admitted() else {
+            return Ok(false);
+        };
         let mut db = self.store.try_live_connection()?;
         let tx = db.transaction()?;
         let reading = self.clock.now();
-        if reading.monotonic >= worker.deadline || effect.generation == [0; 16] {
+        if reading.monotonic >= worker.deadline || target.generation == [0; 16] {
             return Ok(false);
         }
-        let admitted = store::count(
+        let owned = store::count(
             &tx,
             "SELECT count(*) FROM vm_operations o JOIN vm_generations g ON g.id=?6
              WHERE o.activity_id=?1 AND o.operation_id=?2 AND o.principal=?3
@@ -2535,20 +2668,20 @@ impl<C: Clock> VmController<C> {
                        WHERE r.generation=g.id AND r.epoch=?8 AND r.disposition IS NULL) END",
             params![
                 worker.activity_id,
-                effect.operation,
-                effect.principal,
-                effect.request.key,
-                effect.action,
-                effect.generation,
+                admitted.operation,
+                admitted.principal,
+                admitted.request.key,
+                admitted.action,
+                target.generation,
                 utc(reading)?,
-                effect.writer_epoch,
+                target.writer_epoch,
             ],
         )? == 1;
-        if !admitted {
+        if !owned {
             return Ok(false);
         }
         for slot in slots {
-            if slot.generation != effect.generation
+            if slot.generation != target.generation
                 || store::count(
                     &tx,
                     "SELECT count(*) FROM vm_artifacts WHERE generation_id=?1 AND role=?2
@@ -2563,8 +2696,9 @@ impl<C: Clock> VmController<C> {
     }
 
     /// Recovery needs exact durable TEST custody, not a fresh selection: the
-    /// bound native workspace scope of a non-static generation, and its
-    /// unresolved writer epoch when one is named (none unresolved otherwise).
+    /// bound native workspace scope of a non-static generation. A generation
+    /// with writer history needs its exact unresolved writer epoch. Only a
+    /// staged generation that never had a writer epoch recovers without one.
     pub(crate) fn native_recovery_bound(
         &self,
         scope: store::native::Scope,
@@ -2575,10 +2709,11 @@ impl<C: Clock> VmController<C> {
                 && store::count(
                     db,
                     "SELECT count(*) FROM vm_generations g
-                     WHERE g.id=?1 AND g.static_id IS NULL
-                       AND (SELECT count(*) FROM vm_snapshot_release r
-                            WHERE r.generation=g.id AND r.disposition IS NULL
-                              AND (?2 IS NULL OR r.epoch=?2)) = (?2 IS NOT NULL)",
+                     WHERE g.id=?1 AND g.static_id IS NULL AND CASE WHEN ?2 IS NULL THEN
+                         g.active=0 AND NOT EXISTS(SELECT 1 FROM vm_snapshot_release r
+                             WHERE r.generation=g.id)
+                     ELSE EXISTS(SELECT 1 FROM vm_snapshot_release r
+                         WHERE r.generation=g.id AND r.epoch=?2 AND r.disposition IS NULL) END",
                     params![scope.generation, writer_epoch],
                 )? == 1)
         })

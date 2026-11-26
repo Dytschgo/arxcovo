@@ -436,18 +436,21 @@ pub(crate) struct LaunchTarget<'a, 'plan> {
     pub pair: Option<PairSlots>,
     pub installer: Option<InstallerStage>,
     pub recipe: Option<crate::vm::qualification_record::RecipeIdentity>,
+    /// The ledger-identified slot a Mutate plan writes, and nothing for any
+    /// other plan kind.
+    pub helper: Option<ArtifactSlot>,
     pub memory: usize,
     pub cpu_rate: u32,
 }
 
 /// Implemented by the 7c issuer. Consumption must check the exact sealed
 /// plan, durable intent, charges, deadline and cancellation at create, and
-/// return the issuance-time binding together with `LaunchAuthority`.
+/// return a `LaunchAuthority` that carries its issuance-time binding.
 pub(crate) trait LaunchPermit {
     fn consume(
         self,
         target: LaunchTarget<'_, '_>,
-    ) -> Result<(LaunchPermitBinding, crate::vm::runtime::LaunchAuthority), NativeRefusal>;
+    ) -> Result<crate::vm::runtime::LaunchAuthority, NativeRefusal>;
 }
 
 pub(crate) struct LaunchRequest<'a> {
@@ -650,11 +653,12 @@ impl<'a> NativeLaunch<'a> {
                     pair,
                     installer,
                     recipe: boot_inputs.map(QualifiedBoot::recipe_identity),
+                    helper: helper_target.map(HelperTarget::slot),
                     memory,
                     cpu_rate,
                 };
-                let (issued, granted) = permit.consume(target)?;
-                check_permit(target_binding, issued)?;
+                let granted = permit.consume(target)?;
+                check_permit(target_binding, granted.binding())?;
                 launch::check_preparation(prepare_by, cancelled)?;
                 Ok((captured.min(live), granted))
             })?;

@@ -1,12 +1,15 @@
 //! The native TEST issuer (ADR 0054, 7c chunk 10).
 //!
-//! Selection opens one epoch over the exact selected seal, scope and recipe
-//! pair. An intent follows durable admission: only a fresh admission yields
-//! a worker, and each worker mints at most one intent. Every permit names one
-//! durable effect and its exact target. Consumption rechecks cancellation,
-//! the ledger admission, the worker deadline and a fresh epoch observation
-//! before the authority exists. Recovery authority is separate and cannot
-//! launch.
+//! Selection opens one epoch over the exact selected seal, scope, recipe
+//! pair and configured owner. An intent follows durable admission: only a
+//! fresh admission yields a worker, the controller fixes that worker's
+//! admitted request, and each worker mints at most one intent. The admitted
+//! request decides which effects the intent may mint, and the issuer derives
+//! each effect's identity from its target. Every permit names one effect.
+//! Consumption refuses any substitution, then checks cancellation, the ledger
+//! and the deadline on both sides of a fresh epoch observation before the
+//! effect's own authority type exists. Recovery authority is separate and
+//! cannot launch.
 //!
 //! No production path constructs an [`Installation`] before 7c 16, so no
 //! configured input reaches an effect here. Native paths are **unverified on
@@ -17,38 +20,32 @@
 )]
 
 use super::{
-    ArtifactSlot, Clock, ClockReading, Id, PairSlots, PendingOperation, RequestId, VmController,
-    WEB_RECIPE_ID,
+    AdmittedEffect, ArtifactSlot, Clock, ClockReading, Id, PairSlots, PendingOperation,
+    VmController, WEB_RECIPE_ID,
     paths::{ArtifactPin, ArtifactRole, FileIdentity, LocalPath},
     qemu_args::{CommandPlan, PlanKind},
     qualification::{
         ForegroundQualification, LaunchPermit, LaunchPermitBinding, LaunchTarget, StageTarget,
-        WorkspaceBinding,
+        WorkspaceBinding, recipe_selected,
     },
     qualification_record::{Class, Hash, RecipeIdentity, TestRecipes, digest},
-    runtime::{InstallerPhase, LaunchAuthority, NativeRefusal},
+    runtime::{
+        InstallerPhase, LaunchAuthority, NativeRefusal, ScriptAuthority, StageAuthority,
+        fresh_observation,
+    },
     selection_epoch::{Invalidation, Sample, SelectionEpoch},
 };
 use crate::{config::TestQualificationSelection, service::Shutdown, store::vm::native::Scope};
 use serde_json::{Value, json};
-use std::{
-    sync::{Mutex, atomic::Ordering},
-    time::Instant,
-};
+use std::{sync::Mutex, time::Instant};
 
 const REFUSED: NativeRefusal = NativeRefusal::QualificationMissing;
 /// One worker's intent names at most this many distinct effects.
 const MAX_EFFECTS: usize = 16;
 
-/// Only this module can construct it, so only a consumed permit yields a
-/// [`LaunchAuthority`].
+/// Only this module can construct it, so only a consumed permit yields an
+/// effect authority.
 pub(crate) struct Minted(());
-
-fn authority() -> LaunchAuthority {
-    LaunchAuthority {
-        _issued: Minted(()),
-    }
-}
 
 /// The single installation point for native TEST effects and recovery. Its
 /// production constructor lands with activation in 7c 16. Until then only
@@ -69,6 +66,9 @@ pub(crate) trait SelectedSource {
     fn class(&self) -> Class;
     fn scope(&self) -> Hash;
     fn recipes(&self) -> TestRecipes;
+    /// The configured SID names the enrolled owner whose live token the
+    /// source verified.
+    fn owner_matches(&self, configured: &str) -> bool;
     /// The freshness and store-identity reads, then `advance`, each keeping
     /// its typed refusal class.
     fn sample(
@@ -77,16 +77,13 @@ pub(crate) trait SelectedSource {
     ) -> Result<Sample, Invalidation>;
 }
 
-/// The exact durable effect an admitted worker owns.
-#[derive(Clone, Copy)]
-pub(crate) struct NativeEffect<'a> {
-    pub principal: &'a str,
-    pub request: RequestId,
-    pub operation: Id,
-    pub action: i64,
+/// The generation an admitted worker's effects target. The ledger confirms
+/// that the admitted operation owns it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeTarget {
     pub generation: Id,
-    /// The unresolved writer epoch of an active generation, for effects on a
-    /// running or starting VM. Build and clone staging have none.
+    /// The unresolved writer epoch of an active generation: the start's own
+    /// operation, or the running epoch a script uses. Staging has none.
     pub writer_epoch: Option<Id>,
 }
 
@@ -107,32 +104,36 @@ impl<'a, C: Clock> TestIssuer<'a, ForegroundQualification<'a>, C> {
     ) -> Result<Self, NativeRefusal> {
         let source = ForegroundQualification::open(
             controller.native_store(),
-            config.enrollment.as_str(),
-            config.dossier.as_str(),
-            &config.selection,
+            config.enrollment().as_str(),
+            config.dossier().as_str(),
+            config.selection(),
         )?;
         Self::open(installation, controller, source, config)
     }
 }
 
 impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
-    /// T01/T02: the held seal, scope, class and recipe pair must match the
-    /// configured selection exactly before the first epoch observation.
+    /// T01/T02: the held seal, scope, class, recipe pair and owner must match
+    /// the configured selection exactly before the first epoch observation.
     pub(crate) fn open(
         _: &Installation,
         controller: &'a VmController<C>,
         source: S,
         config: &TestQualificationSelection,
     ) -> Result<Self, NativeRefusal> {
+        let selection = config.selection();
         let recipes = source.recipes();
         let windows = VmController::<C>::windows_recipe_id();
-        if source.seal_sha256() != config.selection.seal_sha256
-            || source.scope() != config.selection.scope
+        if source.seal_sha256() != selection.seal_sha256
+            || source.scope() != selection.scope
             || source.class() != Class::Test
             || recipes.windows.recipe_id != windows
             || [windows, WEB_RECIPE_ID, [0; 16]].contains(&recipes.ubuntu.recipe_id)
         {
             return Err(REFUSED);
+        }
+        if !source.owner_matches(config.owner_sid()) {
+            return Err(NativeRefusal::IdentityUnverified);
         }
         let sample = source.sample(&|| controller.advance_native_clock())?;
         let id = crate::store::vm::new_id().map_err(|_| REFUSED)?;
@@ -141,7 +142,7 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
             controller,
             source,
             epoch,
-            seal_sha256: config.selection.seal_sha256,
+            seal_sha256: selection.seal_sha256,
             recipes,
         })
     }
@@ -171,36 +172,43 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
     }
 
     /// I05: an intent follows durable admission. Only a fresh admission
-    /// yields a worker, and a worker mints one intent, so a replay mints
-    /// nothing.
+    /// yields a worker with an admitted request, and a worker mints one
+    /// intent, so a replay mints nothing.
     pub(crate) fn intent<'i>(
         &'i self,
         worker: &'i PendingOperation,
-        effect: NativeEffect<'i>,
+        target: NativeTarget,
         cancel: &'i Shutdown,
     ) -> Result<Intent<'i, S, C>, NativeRefusal> {
+        let admitted = worker.admitted().ok_or(REFUSED)?;
+        let consistent = match admitted.effect {
+            AdmittedEffect::Start => target.writer_epoch == Some(admitted.operation),
+            AdmittedEffect::Script { .. } => target.writer_epoch.is_some(),
+            AdmittedEffect::Clone => target.writer_epoch.is_none(),
+            AdmittedEffect::Build { recipe_id, digest } => {
+                let recipe = RecipeIdentity {
+                    recipe_id,
+                    recipe_sha256: digest,
+                };
+                target.writer_epoch.is_none() && recipe_selected(recipe, None, self.recipes)
+            }
+        };
+        if !consistent {
+            return Err(REFUSED);
+        }
         let intent = Intent {
             issuer: self,
             worker,
-            effect,
+            effect: admitted.effect,
+            target,
             cancel,
             minted: Mutex::default(),
         };
         intent.verify(&[])?;
-        if worker.intent_minted.swap(true, Ordering::AcqRel) {
+        if !worker.claim_intent() {
             return Err(REFUSED);
         }
         Ok(intent)
-    }
-
-    fn selected(&self, recipe: RecipeIdentity, phase: Option<InstallerPhase>) -> bool {
-        match phase {
-            Some(InstallerPhase::UbuntuInstall) => recipe == self.recipes.ubuntu,
-            Some(InstallerPhase::WindowsSetup | InstallerPhase::WindowsFinalize) => {
-                recipe == self.recipes.windows
-            }
-            None => recipe == self.recipes.ubuntu || recipe == self.recipes.windows,
-        }
     }
 }
 
@@ -222,9 +230,34 @@ pub(crate) fn catalog(seal_sha256: Hash, recipes: TestRecipes) -> Value {
     })
 }
 
+/// The ledger slots a checked creation touches, derived from its target:
+/// the exact pair of a boot, the identified helper target of a Mutate plan,
+/// and none for a read-only or offline inspection.
+fn launch_slots(
+    kind: PlanKind,
+    pair: Option<PairSlots>,
+    helper: Option<ArtifactSlot>,
+) -> Result<Vec<ArtifactSlot>, NativeRefusal> {
+    match (kind, pair, helper) {
+        (PlanKind::Boot | PlanKind::InstallerBoot(_), Some(pair), None)
+            if (pair.disk.role, pair.vars.role) == ("disk", "vars") =>
+        {
+            Ok(vec![pair.disk, pair.vars])
+        }
+        (PlanKind::Mutate, None, Some(slot)) => Ok(vec![slot]),
+        (PlanKind::Inspect | PlanKind::InspectWritable, None, None) => Ok(Vec::new()),
+        _ => Err(REFUSED),
+    }
+}
+
+/// One durable effect's identity, derived by the issuer from its target.
 #[derive(Clone, PartialEq)]
 enum Effect {
-    Launch(PlanKind, Vec<ArtifactSlot>),
+    Launch {
+        kind: PlanKind,
+        slots: Vec<ArtifactSlot>,
+        inputs: Vec<(ArtifactRole, Option<FileIdentity>)>,
+    },
     Stage(ArtifactSlot),
     Script,
 }
@@ -233,25 +266,35 @@ enum Effect {
 pub(crate) struct Intent<'i, S, C> {
     issuer: &'i TestIssuer<'i, S, C>,
     worker: &'i PendingOperation,
-    effect: NativeEffect<'i>,
+    effect: AdmittedEffect,
+    target: NativeTarget,
     cancel: &'i Shutdown,
     minted: Mutex<Vec<Effect>>,
 }
 
 impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
-    /// Cancellation, then the durable admission, deadline and target, then a
-    /// fresh epoch observation. Mint and every consumption run this.
-    fn verify(&self, slots: &[ArtifactSlot]) -> Result<(), NativeRefusal> {
+    /// Cancellation, then the durable admission, deadline, target and slots.
+    fn guard(&self, slots: &[ArtifactSlot]) -> Result<(), NativeRefusal> {
         if self.cancel.is_cancelled()
             || !self
                 .issuer
                 .controller
-                .native_effect_admitted(self.worker, &self.effect, slots)
+                .native_effect_admitted(self.worker, self.target, slots)
                 .map_err(|_| REFUSED)?
         {
             return Err(REFUSED);
         }
-        self.issuer.refresh().map(drop)
+        Ok(())
+    }
+
+    /// The guard on both sides of a fresh epoch observation, so a refresh
+    /// that outlives cancellation, the deadline or the pending row refuses,
+    /// and the authority is issued within that observation's freshness.
+    fn verify(&self, slots: &[ArtifactSlot]) -> Result<(), NativeRefusal> {
+        self.guard(slots)?;
+        let captured = self.issuer.refresh()?;
+        self.guard(slots)?;
+        fresh_observation(captured, Instant::now(), REFUSED)
     }
 
     /// One permit per durable effect.
@@ -265,22 +308,66 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         Ok(())
     }
 
-    /// One checked process creation for exactly this plan and these slots.
-    pub(crate) fn launch<'p>(
-        &'p self,
+    fn build_recipe(&self) -> Option<RecipeIdentity> {
+        match self.effect {
+            AdmittedEffect::Build { recipe_id, digest } => Some(RecipeIdentity {
+                recipe_id,
+                recipe_sha256: digest,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The admitted request authorizes this kind of creation with this
+    /// recipe: a start boots its pair, a build boots and runs installers for
+    /// its own recipe, and builds and clones run the checked helper.
+    fn admits_launch(&self, kind: PlanKind, recipe: Option<RecipeIdentity>) -> bool {
+        let recipes = self.issuer.recipes;
+        match (self.effect, kind) {
+            (AdmittedEffect::Start, PlanKind::Boot) => {
+                recipe.is_some_and(|recipe| recipe_selected(recipe, None, recipes))
+            }
+            (AdmittedEffect::Build { .. }, PlanKind::Boot) => {
+                recipe.is_some() && recipe == self.build_recipe()
+            }
+            (AdmittedEffect::Build { .. }, PlanKind::InstallerBoot(phase)) => {
+                recipe.is_some_and(|recipe| {
+                    Some(recipe) == self.build_recipe()
+                        && recipe_selected(recipe, Some(phase), recipes)
+                })
+            }
+            (
+                AdmittedEffect::Build { .. } | AdmittedEffect::Clone,
+                PlanKind::Inspect | PlanKind::InspectWritable | PlanKind::Mutate,
+            ) => recipe.is_none(),
+            _ => false,
+        }
+    }
+
+    /// One checked creation for exactly this plan. The effect identity and
+    /// its ledger slots come from the target, never from the caller.
+    pub(crate) fn launch(
+        &self,
         workspace: WorkspaceBinding,
         target: LaunchTarget<'_, '_>,
-        slots: &'p [ArtifactSlot],
-    ) -> Result<Permit<'p, S, C>, NativeRefusal> {
+    ) -> Result<Permit<'_, S, C>, NativeRefusal> {
         let expected = EffectPlan::from_target(&target)?;
-        if workspace.generation != self.effect.generation
-            || target
-                .recipe
-                .is_some_and(|recipe| !self.issuer.selected(recipe, expected.phase()))
+        let slots = launch_slots(expected.kind, target.pair, target.helper)?;
+        if workspace.generation != self.target.generation
+            || !self.admits_launch(expected.kind, target.recipe)
         {
             return Err(REFUSED);
         }
-        self.mint(Effect::Launch(expected.kind, slots.to_vec()), slots)?;
+        let effect = Effect::Launch {
+            kind: expected.kind,
+            slots: slots.clone(),
+            inputs: expected
+                .inputs
+                .iter()
+                .map(|input| (input.role, input.identity))
+                .collect(),
+        };
+        self.mint(effect, &slots)?;
         Ok(Permit {
             intent: self,
             binding: LaunchPermitBinding {
@@ -294,10 +381,11 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
     }
 
     fn check_stage(&self, target: &StageTarget) -> Result<(), NativeRefusal> {
-        if target.workspace.generation != self.effect.generation
-            || target.slot.generation != self.effect.generation
+        if target.workspace.generation != self.target.generation
+            || target.slot.generation != self.target.generation
             || target.seal_sha256 != self.issuer.seal_sha256
-            || !self.issuer.selected(target.recipe, Some(target.phase))
+            || self.build_recipe() != Some(target.recipe)
+            || !recipe_selected(target.recipe, Some(target.phase), self.issuer.recipes)
             || Instant::now() >= target.deadline
         {
             return Err(REFUSED);
@@ -305,7 +393,8 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         Ok(())
     }
 
-    /// One staged write of exactly this content into this slot and phase.
+    /// One staged write of exactly this content into this slot, for the
+    /// admitted build's recipe and phase.
     pub(crate) fn stage(
         &self,
         target: StageTarget,
@@ -318,20 +407,31 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         })
     }
 
-    /// One guest script on the live writer epoch, bound to its exact bytes
-    /// and timeout.
+    /// One guest script, only with the exact bytes and timeout the admitted
+    /// request carried, on the live writer epoch.
     pub(crate) fn script(
         &self,
         script: &str,
         timeout_s: u32,
     ) -> Result<ScriptPermit<'_, S, C>, NativeRefusal> {
-        let writer_epoch = self.effect.writer_epoch.ok_or(REFUSED)?;
+        let AdmittedEffect::Script {
+            digest: admitted,
+            timeout_s: admitted_timeout,
+        } = self.effect
+        else {
+            return Err(REFUSED);
+        };
+        let script = digest(script.as_bytes());
+        let writer_epoch = self.target.writer_epoch.ok_or(REFUSED)?;
+        if script != admitted || u64::from(timeout_s) != admitted_timeout {
+            return Err(REFUSED);
+        }
         self.mint(Effect::Script, &[])?;
         Ok(ScriptPermit {
             intent: self,
-            generation: self.effect.generation,
+            generation: self.target.generation,
             writer_epoch,
-            script: digest(script.as_bytes()),
+            script,
             timeout_s,
         })
     }
@@ -342,19 +442,19 @@ pub(crate) struct Permit<'p, S, C> {
     intent: &'p Intent<'p, S, C>,
     binding: LaunchPermitBinding,
     expected: EffectPlan,
-    slots: &'p [ArtifactSlot],
+    slots: Vec<ArtifactSlot>,
 }
 
 impl<S: SelectedSource, C: Clock> LaunchPermit for Permit<'_, S, C> {
-    fn consume(
-        self,
-        target: LaunchTarget<'_, '_>,
-    ) -> Result<(LaunchPermitBinding, LaunchAuthority), NativeRefusal> {
+    fn consume(self, target: LaunchTarget<'_, '_>) -> Result<LaunchAuthority, NativeRefusal> {
         if self.expected != EffectPlan::from_target(&target)? {
             return Err(REFUSED);
         }
-        self.intent.verify(self.slots)?;
-        Ok((self.binding, authority()))
+        self.intent.verify(&self.slots)?;
+        Ok(LaunchAuthority {
+            _issued: Minted(()),
+            binding: self.binding,
+        })
     }
 }
 
@@ -366,13 +466,17 @@ pub(crate) struct StagePermit<'p, S, C> {
 
 impl<S: SelectedSource, C: Clock> StagePermit<'_, S, C> {
     /// At the staged write: the exact target, still in phase, still fresh.
-    pub(crate) fn consume(self, target: StageTarget) -> Result<LaunchAuthority, NativeRefusal> {
+    pub(crate) fn consume(self, target: StageTarget) -> Result<StageAuthority, NativeRefusal> {
         if self.target != target {
             return Err(REFUSED);
         }
         self.intent.check_stage(&target)?;
         self.intent.verify(&[target.slot])?;
-        Ok(authority())
+        self.intent.check_stage(&target)?;
+        Ok(StageAuthority {
+            _issued: Minted(()),
+            target,
+        })
     }
 }
 
@@ -394,7 +498,7 @@ impl<S: SelectedSource, C: Clock> ScriptPermit<'_, S, C> {
         writer_epoch: Id,
         script: &str,
         timeout_s: u32,
-    ) -> Result<LaunchAuthority, NativeRefusal> {
+    ) -> Result<ScriptAuthority, NativeRefusal> {
         if (self.generation, self.writer_epoch, self.timeout_s)
             != (generation, writer_epoch, timeout_s)
             || self.script != digest(script.as_bytes())
@@ -402,13 +506,19 @@ impl<S: SelectedSource, C: Clock> ScriptPermit<'_, S, C> {
             return Err(REFUSED);
         }
         self.intent.verify(&[])?;
-        Ok(authority())
+        Ok(ScriptAuthority {
+            _issued: Minted(()),
+            script: self.script,
+            timeout_s,
+            generation,
+            writer_epoch,
+        })
     }
 }
 
 /// Settlement authority over exact durable TEST custody. It needs no fresh
 /// selection, so a revoked or absent epoch cannot strand recovery, and no
-/// path converts it into a [`LaunchAuthority`].
+/// path converts it into an effect authority.
 #[must_use]
 pub(crate) struct RecoveryAuthority {
     scope: WorkspaceBinding,
@@ -466,6 +576,7 @@ struct EffectPlan {
     inputs: Vec<EffectInput>,
     cwd: LocalPath,
     pair: Option<PairSlots>,
+    helper: Option<ArtifactSlot>,
     installer: Option<(InstallerPhase, tokio::time::Instant)>,
     recipe: Option<RecipeIdentity>,
     memory: usize,
@@ -494,6 +605,7 @@ impl EffectPlan {
             inputs,
             cwd: target.cwd.clone(),
             pair: target.pair,
+            helper: target.helper,
             installer: target
                 .installer
                 .map(|stage| (stage.phase(), stage.deadline())),
@@ -501,13 +613,6 @@ impl EffectPlan {
             memory: target.memory,
             cpu_rate: target.cpu_rate,
         })
-    }
-
-    fn phase(&self) -> Option<InstallerPhase> {
-        match self.kind {
-            PlanKind::InstallerBoot(phase) => Some(phase),
-            _ => None,
-        }
     }
 }
 

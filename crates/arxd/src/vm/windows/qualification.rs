@@ -33,7 +33,7 @@ mod recipe;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use recipe::{
     BootReservation, InstallerReservation, QualifiedBoot, QualifiedBootPlan, StageTarget,
-    StagedInstaller,
+    StagedInstaller, recipe_selected,
 };
 mod schema;
 mod sink;

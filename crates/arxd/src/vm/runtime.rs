@@ -29,15 +29,74 @@ pub enum NativeCapability {
     Qualified(LaunchAuthority),
 }
 
-/// One native effect's authority. Off Windows x64 it is uninhabited. On
-/// Windows x64 only the TEST issuer can mint it, from a permit consumed at
-/// the effect edge, and no production path installs that issuer before 7c
-/// 16. Static and public-egress dispatch never receive one.
+/// One checked process creation's authority, carrying the binding it was
+/// issued for. Off Windows x64 it is uninhabited. On Windows x64 only a
+/// consumed TEST launch permit mints it, and no production path installs
+/// that issuer before 7c 16. Static and public-egress dispatch never
+/// receive one. Staged writes and guest scripts have their own types.
 pub struct LaunchAuthority {
     #[cfg(not(all(windows, target_arch = "x86_64")))]
     _closed: std::convert::Infallible,
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub(super) _issued: super::test_issuer::Minted,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) binding: super::qualification::LaunchPermitBinding,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl LaunchAuthority {
+    pub(crate) fn binding(&self) -> super::qualification::LaunchPermitBinding {
+        self.binding
+    }
+}
+
+/// One staged write's authority, for exactly the target it names.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) struct StageAuthority {
+    pub(super) _issued: super::test_issuer::Minted,
+    pub(super) target: super::qualification::StageTarget,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+impl StageAuthority {
+    pub(crate) fn target(&self) -> &super::qualification::StageTarget {
+        &self.target
+    }
+}
+
+/// One guest script's authority, for exactly the admitted bytes, timeout,
+/// generation and writer epoch.
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the script channel consumes it in 7c 14")
+)]
+pub(crate) struct ScriptAuthority {
+    pub(super) _issued: super::test_issuer::Minted,
+    pub(super) script: super::qualification_record::Hash,
+    pub(super) timeout_s: u32,
+    pub(super) generation: super::Id,
+    pub(super) writer_epoch: super::Id,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the script channel consumes it in 7c 14")
+)]
+impl ScriptAuthority {
+    /// True only for the exact script this authority was issued for.
+    pub(crate) fn names(
+        &self,
+        generation: super::Id,
+        writer_epoch: super::Id,
+        script: &str,
+        timeout_s: u32,
+    ) -> bool {
+        (self.generation, self.writer_epoch, self.timeout_s)
+            == (generation, writer_epoch, timeout_s)
+            && self.script == super::qualification_record::digest(script.as_bytes())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

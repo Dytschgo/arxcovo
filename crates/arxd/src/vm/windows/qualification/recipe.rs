@@ -6,7 +6,7 @@ use super::*;
 use crate::vm::paths::Artifact;
 use crate::vm::qemu_args::{BootPurpose, BootRecipe};
 use crate::vm::qualification_record::{Hash, RecipeIdentity, TestRecipes, digest};
-use crate::vm::runtime::{InstallerPhase, LaunchAuthority};
+use crate::vm::runtime::{InstallerPhase, StageAuthority};
 use crate::vm::{ArtifactEvidence, ArtifactSlot, PairSlots};
 
 const SEED_LIMIT: u64 = 40 << 20;
@@ -210,7 +210,9 @@ fn check_boot_plan(
     .ok_or(PHASE)
 }
 
-fn recipe_selected(
+/// Shared by staging and the TEST issuer: each installer phase belongs to
+/// one selected recipe, and a boot without a phase to either.
+pub(crate) fn recipe_selected(
     recipe: RecipeIdentity,
     phase: Option<InstallerPhase>,
     selected: TestRecipes,
@@ -229,7 +231,7 @@ impl ForegroundQualification<'_> {
         &self,
         reservation: InstallerReservation<'a>,
         ledger: &dyn CustodyCheckpoints,
-        mut authorize: impl FnMut(StageTarget) -> Result<LaunchAuthority, NativeRefusal>,
+        mut authorize: impl FnMut(StageTarget) -> Result<StageAuthority, NativeRefusal>,
     ) -> Result<StagedInstaller<'a>, NativeRefusal> {
         let InstallerReservation {
             workspace,
@@ -316,7 +318,7 @@ impl ForegroundQualification<'_> {
         ];
         let [seed, vars] = stage_leaves(workspace, ledger, leaves, |slot, content| {
             let captured = self.launch_live(TEST_JOB_MEMORY)?;
-            let authority = authorize(StageTarget {
+            let target = StageTarget {
                 workspace: binding,
                 seal_sha256,
                 recipe,
@@ -324,7 +326,11 @@ impl ForegroundQualification<'_> {
                 slot,
                 content,
                 deadline,
-            })?;
+            };
+            let authority = authorize(target)?;
+            if authority.target() != &target {
+                return Err(PHASE);
+            }
             check_deadline(deadline)?;
             fresh_observation(captured, Instant::now(), NativeRefusal::ReservesUnverified)?;
             Ok(authority)

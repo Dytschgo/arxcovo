@@ -62,21 +62,47 @@ struct RawTestQualification {
     scope: String,
 }
 
-/// The configured TEST selection. Configuration alone grants no effect: the
-/// issuer's closed installation boundary decides whether it is ever read.
+/// The configured TEST selection, only from a validated profile. It keeps
+/// the profile's current-user SID so startup can require the enrollment
+/// owner and the live token to be that account. Configuration alone grants
+/// no effect: the issuer's closed installation decides whether it is read.
 #[derive(Clone)]
 #[cfg_attr(
     not(all(windows, target_arch = "x86_64")),
     allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
 )]
 pub(crate) struct TestQualificationSelection {
-    pub(crate) enrollment: crate::vm::paths::LocalPath,
-    pub(crate) dossier: crate::vm::paths::LocalPath,
-    pub(crate) selection: crate::vm::qualification_record::Selection,
+    enrollment: crate::vm::paths::LocalPath,
+    dossier: crate::vm::paths::LocalPath,
+    selection: crate::vm::qualification_record::Selection,
+    owner_sid: String,
+}
+
+#[cfg_attr(
+    not(all(windows, target_arch = "x86_64")),
+    allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
+)]
+impl TestQualificationSelection {
+    pub(crate) fn enrollment(&self) -> &crate::vm::paths::LocalPath {
+        &self.enrollment
+    }
+
+    pub(crate) fn dossier(&self) -> &crate::vm::paths::LocalPath {
+        &self.dossier
+    }
+
+    pub(crate) fn selection(&self) -> &crate::vm::qualification_record::Selection {
+        &self.selection
+    }
+
+    /// The profile's one current-user SID (owner and supervisor agree).
+    pub(crate) fn owner_sid(&self) -> &str {
+        &self.owner_sid
+    }
 }
 
 impl RawTestQualification {
-    fn checked(&self) -> Option<TestQualificationSelection> {
+    fn checked(&self, owner_sid: &str) -> Option<TestQualificationSelection> {
         use crate::vm::paths::LocalPath;
         let digest = |value: &str| {
             let mut bytes = [0; 32];
@@ -100,6 +126,7 @@ impl RawTestQualification {
                 seal_sha256: digest(&self.sha256)?,
                 scope: digest(&self.scope)?,
             },
+            owner_sid: owner_sid.to_owned(),
         })
     }
 }
@@ -197,7 +224,7 @@ impl VmRuntimeProfile {
         if let Some(selection) = &raw.test_qualification
             && (!raw.enabled
                 || raw.execution_profile != VmExecutionProfile::CurrentUser
-                || selection.checked().is_none())
+                || selection.checked(&raw.owner_sid).is_none())
         {
             bail!(InvalidVmProfile);
         }
@@ -220,7 +247,10 @@ impl VmRuntimeProfile {
         allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
     )]
     pub(crate) fn test_qualification(&self) -> Option<TestQualificationSelection> {
-        self.0.test_qualification.as_ref()?.checked()
+        self.0
+            .test_qualification
+            .as_ref()?
+            .checked(&self.0.owner_sid)
     }
 
     pub fn manifest_id(&self) -> &'static str {
@@ -1960,11 +1990,12 @@ mod runtime_provenance_tests {
         let mut profile = current_user(runtime());
         profile["test_qualification"] = selection();
         let checked = parse(&profile).unwrap().test_qualification().unwrap();
-        assert_eq!(checked.selection.seal_sha256, [0xa1; 32]);
-        assert_eq!(checked.selection.scope, [0xb2; 32]);
+        assert_eq!(checked.selection().seal_sha256, [0xa1; 32]);
+        assert_eq!(checked.selection().scope, [0xb2; 32]);
+        assert_eq!(checked.owner_sid(), "S-1-12-1-1-2-3-4");
         let local = |path| crate::vm::paths::LocalPath::parse(path).unwrap();
-        assert_eq!(checked.enrollment, local("D:/private/enrollment.json"));
-        assert_eq!(checked.dossier, local("D:/private/dossier"));
+        assert_eq!(checked.enrollment(), &local("D:/private/enrollment.json"));
+        assert_eq!(checked.dossier(), &local("D:/private/dossier"));
 
         let mut dedicated = runtime();
         dedicated["test_qualification"] = selection();

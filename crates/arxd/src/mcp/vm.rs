@@ -4874,7 +4874,7 @@ pub(crate) mod tests {
                     let mut boot = *boot;
                     let hold = self.script_hold.take();
                     let supervisor = inventory.supervisor.clone();
-                    worker.deadline += Duration::from_secs(6);
+                    worker.extend_deadline_for_test(Duration::from_secs(6));
                     let controller = controller.clone();
                     self.jobs.spawn(async move {
                         let _working = working;
