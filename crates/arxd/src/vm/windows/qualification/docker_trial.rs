@@ -1,7 +1,6 @@
 //! Disposable Docker qualification. The native witness adapter is a separate
 //! boundary. Only the deterministic tests can currently supply its peer.
 use super::*;
-use crate::vm::qualification_record as records;
 use crate::vm::{
     Id,
     paths::Artifact,
@@ -306,6 +305,13 @@ pub(super) struct FixtureProof {
     pub(super) peer: PeerId,
     pub(super) challenge: Challenge,
     pub(super) receiver_digest: Hash,
+    pub(super) policy: Hash,
+    pub(super) topology: Hash,
+    pub(super) receiver_controls: bool,
+    pub(super) public_tcp_udp: bool,
+    pub(super) nonpublic_denied: bool,
+    pub(super) ipv6_icmp_denied: bool,
+    pub(super) route_drift_denied: bool,
 }
 
 pub(super) struct OriginProof {
@@ -749,7 +755,7 @@ fn health(
     packages: Hash,
     cutoff: u64,
 ) -> Result<(), NativeRefusal> {
-    let reply = exchange(
+    let reply: TrialResponse = exchange(
         guest,
         peer,
         &TrialRequest::DockerTrialHealth { challenge },

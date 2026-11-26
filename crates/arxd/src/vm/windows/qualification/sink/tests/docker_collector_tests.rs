@@ -5,7 +5,7 @@ use crate::vm::qemu_args::{BootPurpose, BootRecipe, NETWORK, StaticNetwork};
 use crate::vm::static_web::OriginPortLease;
 use crate::vm::windows::qualification::docker_trial as trial;
 use arx_guest::docker_trial::{self as wire, Challenge, TrialRequest, TrialResponse};
-use records::{DockerDependencies, Hash, Observation, Origin, Record, Stage, StageResult, decode};
+use records::{DockerDependencies, Hash, Observation, Record, Stage, StageResult, decode};
 use std::cell::{Cell, RefCell};
 
 const PACKAGES: Hash = [31; 32];
