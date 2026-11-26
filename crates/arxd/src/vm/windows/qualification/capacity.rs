@@ -131,6 +131,11 @@ pub(super) trait VolumeNames {
     fn drive_guid(&self, drive: &str) -> Option<String>;
     /// The GUID-form final path of a held handle.
     fn final_guid_path(&self, file: &File) -> Option<String>;
+    /// The resolved NTFS root object identity of a volume GUID path.
+    fn root_identity(&self, guid: &str) -> Result<FileIdentity, FileIdentityError> {
+        let root = open_directory(guid).map_err(FileIdentityError::Io)?;
+        Ok(file_identity_typed(&root, true)?.0)
+    }
 }
 
 pub(super) struct MountManager;
@@ -269,14 +274,39 @@ pub(super) fn walk(
 }
 
 /// The drive letter still names the anchored volume and its root object.
-/// Checked after the observations: a rebinding during them closes the run.
+/// Checked after enrollment and capacity observations that derive GUID-form
+/// query paths from `volume.guid`: a rebinding during them closes the run.
 pub(super) fn still_bound(names: &impl VolumeNames, volume: &AnchoredVolume) -> bool {
     names
         .drive_guid(&volume.drive)
         .is_some_and(|guid| guid.eq_ignore_ascii_case(&volume.guid))
-        && open_directory(&volume.guid)
-            .and_then(|root| file_identity(&root, true))
-            .is_ok_and(|(identity, _)| identity == volume.identity)
+        && check_still_bound(names, volume).is_ok()
+}
+
+/// Typed volume-binding check for the selection epoch. Windows may return a
+/// different `\\?\Volume{GUID}\` alias for the same volume, so the GUID path
+/// is used only to locate and open the volume root; the resolved `FileIdentity`
+/// is authoritative. Same safe root identity passes (`Ok(())`); a genuinely
+/// different root identity or unsafe root state is `Mismatch` (`Confirmed`);
+/// an unreadable mount-manager or directory query is `Unavailable`
+/// (`Indeterminate`).
+pub(super) fn check_still_bound(
+    names: &impl VolumeNames,
+    volume: &AnchoredVolume,
+) -> Result<(), CustodyCheckError> {
+    let guid = names
+        .drive_guid(&volume.drive)
+        .filter(|guid| guid_spelling(guid))
+        .ok_or_else(|| {
+            CustodyCheckError::Unavailable(io::Error::other("volume GUID unavailable"))
+        })?;
+    let identity = names
+        .root_identity(&guid)
+        .map_err(CustodyCheckError::from)?;
+    if identity != volume.identity {
+        return Err(CustodyCheckError::Mismatch);
+    }
+    Ok(())
 }
 
 pub(super) struct VhdFacts {
@@ -760,5 +790,194 @@ mod tests {
         ] {
             assert!(!on_volume(&actual, guid, r"Arx\t.vhdx"), "{actual}");
         }
+    }
+
+    #[test]
+    fn still_bound_confirms_drift_keeps_io_indeterminate_and_latches_reverted_rebind() {
+        const CUSTODY: NativeRefusal = NativeRefusal::PathCustodyUnverified;
+        #[derive(Clone, Copy)]
+        enum RootReply {
+            Real,
+            Identity(FileIdentity),
+            IoError,
+        }
+        struct ToggleNames {
+            response: Cell<Option<&'static str>>,
+            root: Cell<RootReply>,
+        }
+        impl VolumeNames for ToggleNames {
+            fn drive_guid(&self, drive: &str) -> Option<String> {
+                match self.response.get() {
+                    Some("") => None,
+                    Some(other) => Some(other.to_owned()),
+                    None => MountManager.drive_guid(drive),
+                }
+            }
+            fn final_guid_path(&self, file: &File) -> Option<String> {
+                MountManager.final_guid_path(file)
+            }
+            fn root_identity(&self, guid: &str) -> Result<FileIdentity, FileIdentityError> {
+                match self.root.get() {
+                    RootReply::Real => MountManager.root_identity(guid),
+                    RootReply::Identity(id) => Ok(id),
+                    RootReply::IoError => {
+                        Err(FileIdentityError::Io(io::Error::other("root open failed")))
+                    }
+                }
+            }
+        }
+
+        let (_dir, path) = long_temp();
+        let volume = anchor_volume(&MountManager, &path.as_str()[..3]).unwrap();
+        let mut wrong_id = volume.identity;
+        wrong_id.file[0] ^= 0xff;
+        let names = ToggleNames {
+            response: Cell::new(None),
+            root: Cell::new(RootReply::Real),
+        };
+        assert!(check_still_bound(&names, &volume).is_ok());
+
+        // Real Win32 MountManager path: a mismatched pinned root identity is Confirmed.
+        let mut wrong_volume = anchor_volume(&MountManager, &path.as_str()[..3]).unwrap();
+        wrong_volume.identity.file[0] ^= 0xff;
+        assert_eq!(
+            check_still_bound(&MountManager, &wrong_volume)
+                .err()
+                .unwrap()
+                .into_invalidation(CUSTODY),
+            Invalidation::Confirmed(CUSTODY)
+        );
+
+        // Same volume with two different GUID path strings: resolves to the
+        // same safe root identity, so `check_still_bound` passes and
+        // consecutive refreshes succeed while the alternate alias persists.
+        // Legacy name-based `still_bound` keeps its exact-GUID enrollment gate.
+        let (alias_epoch, sample) = open_test_epoch();
+        names.response.set(Some(OTHER));
+        names.root.set(RootReply::Identity(volume.identity));
+        assert!(!still_bound(&names, &volume));
+        assert!(check_still_bound(&names, &volume).is_ok());
+        for _ in 0..2 {
+            let alias_result = alias_epoch.refresh(
+                || {
+                    check_still_bound(&names, &volume)
+                        .map_err(|error| error.into_invalidation(CUSTODY))?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            );
+            assert_eq!(alias_result, Ok(sample.captured));
+            assert!(!alias_epoch.effects_revoked());
+        }
+        names.response.set(None);
+        names.root.set(RootReply::Real);
+        assert!(
+            alias_epoch
+                .refresh(
+                    || {
+                        check_still_bound(&names, &volume)
+                            .map_err(|error| error.into_invalidation(CUSTODY))?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                )
+                .is_ok()
+        );
+
+        // Different GUID path whose root cannot be read (I/O failure) -> Indeterminate.
+        names.response.set(Some(OTHER));
+        names.root.set(RootReply::IoError);
+        assert_eq!(
+            check_still_bound(&names, &volume)
+                .err()
+                .unwrap()
+                .into_invalidation(CUSTODY),
+            Invalidation::Indeterminate(CUSTODY)
+        );
+
+        // Same GUID path with root-open / handle-query I/O failure -> Indeterminate.
+        names.response.set(None);
+        names.root.set(RootReply::IoError);
+        assert_eq!(
+            check_still_bound(&names, &volume)
+                .err()
+                .unwrap()
+                .into_invalidation(CUSTODY),
+            Invalidation::Indeterminate(CUSTODY)
+        );
+
+        // Same GUID path with a different root object identity -> Confirmed.
+        names.response.set(None);
+        names.root.set(RootReply::Identity(wrong_id));
+        assert_eq!(
+            check_still_bound(&names, &volume)
+                .err()
+                .unwrap()
+                .into_invalidation(CUSTODY),
+            Invalidation::Confirmed(CUSTODY)
+        );
+
+        // Mount-manager resolution failure (`drive_guid` -> None) stays
+        // Indeterminate and does not revoke the SelectionEpoch.
+        let (io_epoch, sample) = open_test_epoch();
+        names.response.set(Some(""));
+        names.root.set(RootReply::Real);
+        let io_result = io_epoch.refresh(
+            || {
+                check_still_bound(&names, &volume)
+                    .map_err(|error| error.into_invalidation(CUSTODY))?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(io_result, Err(Invalidation::Indeterminate(CUSTODY)));
+        assert!(!io_epoch.effects_revoked());
+        names.response.set(None);
+        assert!(
+            io_epoch
+                .refresh(
+                    || {
+                        check_still_bound(&names, &volume)
+                            .map_err(|error| error.into_invalidation(CUSTODY))?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                )
+                .is_ok()
+        );
+
+        // Observed-then-reverted drive-letter rebind to a genuinely different
+        // volume latches Confirmed and leaves the epoch unusable after revert.
+        let (drift_epoch, sample) = open_test_epoch();
+        names.response.set(Some(OTHER));
+        names.root.set(RootReply::Identity(wrong_id));
+        let drifted = drift_epoch.refresh(
+            || {
+                check_still_bound(&names, &volume)
+                    .map_err(|error| error.into_invalidation(CUSTODY))?;
+                Ok(sample)
+            },
+            || sample.captured,
+        );
+        assert_eq!(drifted, Err(Invalidation::Confirmed(CUSTODY)));
+        assert!(drift_epoch.effects_revoked());
+
+        // Revert the drive letter back to the anchored volume.
+        names.response.set(None);
+        names.root.set(RootReply::Real);
+        assert!(check_still_bound(&names, &volume).is_ok());
+        assert_eq!(
+            drift_epoch.refresh(
+                || {
+                    check_still_bound(&names, &volume)
+                        .map_err(|error| error.into_invalidation(CUSTODY))?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Confirmed(NativeRefusal::QualificationMissing))
+        );
+        assert!(drift_epoch.effects_revoked());
+        assert_admission_closed();
     }
 }
