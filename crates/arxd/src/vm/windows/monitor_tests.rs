@@ -310,7 +310,7 @@ async fn cancellation_during_helper_release_withholds_output_and_keeps_proof() {
         },
         &cancel,
         Instant::now() + Duration::from_secs(10),
-        || Ok(()),
+        || async { Ok(()) },
         |error| error,
     )
     .await;
@@ -329,7 +329,7 @@ async fn helper_release_past_the_cutoff_or_failing_host_withholds_output() {
         },
         &Shutdown::default(),
         deadline,
-        || Ok(()),
+        || async { Ok(()) },
         |error| error,
     )
     .await;
@@ -340,7 +340,7 @@ async fn helper_release_past_the_cutoff_or_failing_host_withholds_output() {
         async {},
         &Shutdown::default(),
         Instant::now() + LIVE_POLL,
-        || Err(NativeRefusal::OwnerActivityUnverified),
+        || async { Err(NativeRefusal::OwnerActivityUnverified) },
         |_| NativeRefusal::QmpUnverified,
     )
     .await;
@@ -350,9 +350,65 @@ async fn helper_release_past_the_cutoff_or_failing_host_withholds_output() {
         async {},
         &Shutdown::default(),
         Instant::now() + LIVE_POLL,
-        || Ok(()),
+        || async { Ok(()) },
         |_| NativeRefusal::QmpUnverified,
     )
     .await;
     assert_eq!(accepted, Ok(1));
+}
+
+/// The held release a helper returns; it must come back unchanged when output
+/// is refused so custody can still be confirmed.
+#[derive(Debug, PartialEq, Eq)]
+struct HeldProof(&'static str);
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_inside_post_release_recheck_withholds_output_and_keeps_proof() {
+    let cancel = Shutdown::default();
+    let samples = Cell::new(0);
+    let (cancel_ref, samples_ref) = (&cancel, &samples);
+    let (result, held) = accept_after_release(
+        Ok::<_, ChannelError>(b"helper output"),
+        async { HeldProof("release") },
+        &cancel,
+        Instant::now() + Duration::from_secs(10),
+        move || async move {
+            // The sample itself is valid; cancellation lands while it runs.
+            samples_ref.set(samples_ref.get() + 1);
+            cancel_ref.cancel();
+            Ok(())
+        },
+        |error| error,
+    )
+    .await;
+    assert_eq!(result, Err(ChannelError::Cancelled));
+    assert_eq!(held, HeldProof("release"));
+    assert_eq!(samples.get(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cutoff_inside_post_release_recheck_withholds_output_and_keeps_proof() {
+    let deadline = Instant::now() + LIVE_POLL;
+    let samples = Cell::new(0);
+    let samples_ref = &samples;
+    let (result, held) = accept_after_release(
+        Ok::<_, ChannelError>(b"helper output"),
+        async { HeldProof("release") },
+        &Shutdown::default(),
+        deadline,
+        move || async move {
+            // The sample is valid but the clock reaches the cutoff exactly
+            // while it runs.
+            assert!(Instant::now() < deadline);
+            tokio::time::advance(LIVE_POLL).await;
+            assert_eq!(Instant::now(), deadline);
+            samples_ref.set(samples_ref.get() + 1);
+            Ok(())
+        },
+        |error| error,
+    )
+    .await;
+    assert_eq!(result, Err(ChannelError::Timeout));
+    assert_eq!(held, HeldProof("release"));
+    assert_eq!(samples.get(), 1);
 }

@@ -2727,27 +2727,35 @@ async fn monitor_running<T, E>(
 }
 
 /// Release keeps its own teardown budget so custody evidence is collected
-/// after a refusal too. Output is accepted only if cancellation, the original
-/// cutoff and a fresh host sample still allow it after release settles. The
-/// held release is returned in either case.
-async fn accept_after_release<T, E, R>(
+/// after a refusal too. Output is accepted only if a fresh host sample taken
+/// after release settles, then cancellation and the original cutoff checked
+/// after that sample, all still allow it; this is the same order as the
+/// common monitor tail. The held release is returned in either case.
+async fn accept_after_release<T, E, R, S>(
     result: Result<T, E>,
     release: impl std::future::Future<Output = R>,
     cancel: &Shutdown,
     deadline: tokio::time::Instant,
-    recheck: impl FnOnce() -> Result<(), E>,
+    recheck: impl FnOnce() -> S,
     interrupted: impl Fn(ChannelError) -> E,
-) -> (Result<T, E>, R) {
+) -> (Result<T, E>, R)
+where
+    S: std::future::Future<Output = Result<(), E>>,
+{
     let release = release.await;
-    let result = result.and_then(|value| {
-        if cancel.is_cancelled() {
-            Err(interrupted(ChannelError::Cancelled))
-        } else if tokio::time::Instant::now() >= deadline {
-            Err(interrupted(ChannelError::Timeout))
-        } else {
-            recheck().map(|()| value)
+    let result = match result {
+        Ok(value) => {
+            let sample = recheck().await;
+            if cancel.is_cancelled() {
+                Err(interrupted(ChannelError::Cancelled))
+            } else if tokio::time::Instant::now() >= deadline {
+                Err(interrupted(ChannelError::Timeout))
+            } else {
+                sample.map(|()| value)
+            }
         }
-    });
+        Err(error) => Err(error),
+    };
     (result, release)
 }
 
@@ -2956,7 +2964,7 @@ impl CheckedLaunchCore<'_> {
             ),
             cancel,
             deadline,
-            || refresh().map(drop),
+            || std::future::ready(refresh().map(drop)),
             |_| refused,
         )
         .await
