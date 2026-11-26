@@ -3819,20 +3819,16 @@ impl CheckedLaunchCore<'_> {
         verify_release: impl FnOnce() -> bool + Send + 'static,
     ) -> (StopDisposition, Option<HeldWriters>) {
         let (guest_shutdown, clean_process_exit) = match self.shutdown_observed {
-            Some(observed) => {
-                // A retry reuses the first graceful observation only while
-                // the Job stays empty. A survivor forces termination and
-                // demotes that observation to a dirty exit.
-                let (observed, terminate) =
-                    demote_on_live_job(observed, matches!(self.child.job.active(), Ok(0)));
-                if terminate {
-                    self.workers.stop();
-                    if self.child.job.terminate().is_err() {
-                        return (StopDisposition::ChargedQuarantine, None);
-                    }
+            Some(_) => {
+                let job_empty = matches!(self.child.job.active(), Ok(0));
+                let (workers, job) = (&self.workers, &self.child.job);
+                match retry_shutdown_observation(&mut self.shutdown_observed, job_empty, || {
+                    workers.stop();
+                    job.terminate()
+                }) {
+                    Some(observed) => observed,
+                    None => return (StopDisposition::ChargedQuarantine, None),
                 }
-                self.shutdown_observed = Some(observed);
-                observed
             }
             None => {
                 let guest_shutdown = match qmp {
@@ -3933,6 +3929,23 @@ fn demote_on_live_job(
     } else {
         ((guest_shutdown, false), true)
     }
+}
+
+/// A stop retry reuses the cached graceful observation only while the Job
+/// stays empty. A survivor demotes it to a dirty exit, and the demotion is
+/// cached before termination is attempted, so a failed terminate cannot
+/// restore the clean result on a later retry. `None` keeps the charge.
+fn retry_shutdown_observation(
+    cache: &mut Option<(bool, bool)>,
+    job_empty: bool,
+    terminate: impl FnOnce() -> io::Result<()>,
+) -> Option<(bool, bool)> {
+    let (observed, survivor) = demote_on_live_job((*cache)?, job_empty);
+    *cache = Some(observed);
+    if survivor && terminate().is_err() {
+        return None;
+    }
+    Some(observed)
 }
 
 /// The worker owns custody and can only report evidence. The async caller
@@ -4225,6 +4238,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn failed_terminate_keeps_the_demoted_observation_for_the_exact_release() {
+        // A cached graceful exit meets a live Job whose termination fails.
+        let mut cache = Some((true, true));
+        let terminated = std::cell::Cell::new(0);
+        let failed = retry_shutdown_observation(&mut cache, false, || {
+            terminated.set(terminated.get() + 1);
+            Err(io::Error::other("fixture terminate failure"))
+        });
+        assert_eq!(failed, None);
+        assert_eq!(terminated.get(), 1);
+        assert_eq!(cache, Some((true, false)), "the dirty downgrade was lost");
+        // The next retry finds an empty Job and must not reuse the clean exit.
+        let observed = retry_shutdown_observation(&mut cache, true, || {
+            panic!("an empty Job needs no termination")
+        })
+        .unwrap();
+        assert_eq!(observed, (true, false));
+        // The exact proof: exited child, empty Job, joined workers and
+        // reacquired writer exclusions. Its disposition stays dirty.
+        let (disposition, held) = finish_release_held(
+            StopEvidence {
+                guest_shutdown: observed.0,
+                clean_process_exit: observed.1,
+                process_exited: true,
+                job_empty: true,
+                workers_joined: true,
+                ..StopEvidence::default()
+            },
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            || Ok(()),
+            || true,
+        )
+        .await;
+        assert_eq!(disposition, StopDisposition::DirtyRelease);
+        assert!(held.is_some());
     }
 
     #[test]
