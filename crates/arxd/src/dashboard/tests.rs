@@ -118,6 +118,14 @@ impl Fixture {
     }
 
     pub(super) fn with_streams(catalog: bool, streams: streams::Backends) -> Self {
+        Self::build(catalog, streams, read::HostSampler::native())
+    }
+
+    fn with_host(host: read::HostSampler) -> Self {
+        Self::build(false, streams::Backends::new(None), host)
+    }
+
+    fn build(catalog: bool, streams: streams::Backends, host: read::HostSampler) -> Self {
         let dir = directory();
         let assets = dir.path().join("dist");
         fs::create_dir(&assets).unwrap();
@@ -155,7 +163,7 @@ impl Fixture {
             clock: clock.clone(),
             capacity: Arc::new(tokio::sync::Semaphore::new(8)),
             streams,
-            host_probe: Arc::new(Mutex::new(read::HostProbe::new())),
+            host,
             _password_lock: None,
         };
         let app = state.clone().router();
@@ -940,7 +948,7 @@ async fn dashboard_vm_catalog_shows_ready_test_snapshots_and_hides_pending_delet
         clock: clock.clone(),
         capacity: Arc::new(tokio::sync::Semaphore::new(8)),
         streams: streams::Backends::new(None),
-        host_probe: Arc::new(Mutex::new(read::HostProbe::new())),
+        host: read::HostSampler::native(),
         _password_lock: None,
     };
     let f = Fixture {
@@ -1032,4 +1040,144 @@ fn static_startup_refuses_junctions() {
     assert!(Assets::load(&dist.join("link")).is_err());
     assert!(Assets::load(dist).is_err());
     fs::remove_dir(dist.join("link")).unwrap();
+}
+
+/// Scripted native boundary for the host sampler. Refresh number `gate_at`
+/// reports itself on `entered` and then blocks until `release` is sent or
+/// dropped. Each requested CPU sample takes the next scripted value.
+struct GatedSource {
+    cpu: std::vec::IntoIter<Option<f32>>,
+    calls: usize,
+    gate_at: usize,
+    entered: tokio::sync::mpsc::UnboundedSender<usize>,
+    release: Option<std::sync::mpsc::Receiver<()>>,
+    finished: Arc<std::sync::atomic::AtomicUsize>,
+    dropped: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl GatedSource {
+    fn new(
+        cpu: impl IntoIterator<Item = Option<f32>>,
+        gate_at: usize,
+        release: Option<std::sync::mpsc::Receiver<()>>,
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<usize>) {
+        let (entered, calls) = tokio::sync::mpsc::unbounded_channel();
+        let source = Self {
+            cpu: cpu.into_iter().collect::<Vec<_>>().into_iter(),
+            calls: 0,
+            gate_at,
+            entered,
+            release,
+            finished: Arc::default(),
+            dropped: None,
+        };
+        (source, calls)
+    }
+}
+
+impl read::HostSource for GatedSource {
+    fn refresh(&mut self, sample_cpu: bool) -> read::HostReading {
+        let call = self.calls;
+        self.calls += 1;
+        let _ = self.entered.send(call);
+        if call == self.gate_at
+            && let Some(release) = self.release.take()
+        {
+            let _ = release.recv();
+        }
+        let cpu = if sample_cpu {
+            self.cpu.next().flatten()
+        } else {
+            None
+        };
+        self.finished
+            .store(call + 1, std::sync::atomic::Ordering::SeqCst);
+        read::HostReading {
+            model: "Test CPU".into(),
+            cores: 4,
+            total_memory: 8 << 30,
+            used_memory: (call as u64 + 1) << 30,
+            cpu,
+        }
+    }
+}
+
+impl Drop for GatedSource {
+    fn drop(&mut self) {
+        if let Some(dropped) = self.dropped.take() {
+            let _ = dropped.send(());
+        }
+    }
+}
+
+/// Failure bound only; the passing path never waits on it.
+const HOST_BOUND: Duration = Duration::from_secs(10);
+
+async fn bounded<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(HOST_BOUND, future)
+        .await
+        .unwrap_or_else(|_| panic!("{what} did not finish within the bound"))
+}
+
+#[tokio::test]
+async fn host_reads_never_wait_for_an_in_flight_refresh() {
+    let (release, gate) = std::sync::mpsc::channel();
+    let (source, mut entered) = GatedSource::new([Some(4.0), Some(37.44)], 1, Some(gate));
+    let finished = source.finished.clone();
+    let f = Fixture::with_host(read::HostSampler::start(source, Duration::ZERO));
+    let (cookie, _) = f.login(None).await;
+    // The synchronous first sample opens the CPU window: usage stays null.
+    assert_eq!(bounded("first sample", entered.recv()).await, Some(0));
+    let first = body(bounded("first read", f.get("/api/v1/hosts", &cookie)).await).await;
+    let host = &first["hosts"][0];
+    assert!(host["cpu"]["usedPercent"].is_null());
+    assert_eq!(host["cpu"]["model"], "Test CPU");
+    assert_eq!(host["memory"]["usedBytes"], 1u64 << 30);
+    let id = host["id"].as_str().unwrap().to_owned();
+    // The background refresh is now in flight and held at the gate.
+    assert_eq!(bounded("gated refresh", entered.recv()).await, Some(1));
+    let detail_path = format!("/api/v1/hosts/{id}");
+    let (list, detail) = bounded("concurrent host reads during a refresh", async {
+        tokio::join!(
+            f.get("/api/v1/hosts", &cookie),
+            f.get(&detail_path, &cookie)
+        )
+    })
+    .await;
+    // Both reads finished while the refresh was still held, so neither waited.
+    assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(list.status(), StatusCode::OK);
+    assert_eq!(detail.status(), StatusCode::OK);
+    let list = body(list).await;
+    let detail = body(detail).await;
+    for host in [&list["hosts"][0], &detail] {
+        assert!(host["cpu"]["usedPercent"].is_null());
+        assert_eq!(host["memory"]["usedBytes"], 1u64 << 30);
+    }
+    // Releasing the gate publishes the second sample through the route, rounded.
+    release.send(()).unwrap();
+    assert_eq!(bounded("next refresh", entered.recv()).await, Some(2));
+    let ready = body(bounded("ready read", f.get(&detail_path, &cookie)).await).await;
+    assert_eq!(ready["cpu"]["usedPercent"], json!(37.4));
+    assert!(ready["memory"]["usedBytes"].as_u64().unwrap() >= 2u64 << 30);
+}
+
+#[tokio::test]
+async fn host_sampler_stops_when_the_dashboard_is_dropped() {
+    let (mut source, mut entered) = GatedSource::new([], usize::MAX, None);
+    let (dropped, stopped) = tokio::sync::oneshot::channel();
+    source.dropped = Some(dropped);
+    let f = Fixture::with_host(read::HostSampler::start(source, Duration::ZERO));
+    // Wait for one background refresh, so the task is running.
+    assert_eq!(bounded("first sample", entered.recv()).await, Some(0));
+    assert_eq!(bounded("background refresh", entered.recv()).await, Some(1));
+    drop(f);
+    bounded("sampler shutdown", stopped)
+        .await
+        .expect("the sampler dropped its source");
+    // No refresh starts after shutdown: the channel closes.
+    bounded("refresh channel close", async {
+        while entered.recv().await.is_some() {}
+    })
+    .await;
 }

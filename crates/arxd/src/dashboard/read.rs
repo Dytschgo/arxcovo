@@ -6,7 +6,10 @@ use crate::{
 use axum::{extract::Query, http::Uri, response::Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{sync::Mutex, time::Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 const MAX_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -59,7 +62,7 @@ pub(super) async fn route(state: &Dashboard, uri: &Uri) -> Result<Response, ApiE
         match (collection.as_str(), target.as_deref()) {
             ("hosts", Some(id)) if id != host_id => Err(ApiError::NOT_FOUND),
             ("hosts", target) => {
-                let host = host(&state.activity, &host_id, now, &state.host_probe)?;
+                let host = host(&state.activity, &host_id, now, &state.host)?;
                 json_response(if target.is_some() {
                     host
                 } else {
@@ -172,75 +175,69 @@ impl CpuWindow {
 }
 
 /// A refresh closer than this does not produce a new sysinfo usage sample.
-/// The request path records the gap and returns; it does not sleep.
+/// The sampler records the gap and moves on; it does not sleep.
 fn cpu_sample_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| {
         now.saturating_duration_since(last) >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL
     })
 }
 
-/// Long-lived sysinfo state shared by host reads. The first accepted sample
-/// only opens the window; `usedPercent` stays null until the next one.
-pub(super) struct HostProbe {
-    system: sysinfo::System,
-    last_cpu: Option<Instant>,
-    window: CpuWindow,
+/// Background refresh period of the host sampler.
+const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
+/// Lower bound for any sampler period, also where sysinfo reports a zero minimum.
+const SAMPLE_FLOOR: Duration = Duration::from_millis(100);
+
+/// Never below sysinfo's minimum CPU interval, so each tick can take a sample.
+fn sample_period(requested: Duration) -> Duration {
+    requested
+        .max(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL)
+        .max(SAMPLE_FLOOR)
 }
 
-struct HostFacts {
-    model: String,
-    cores: usize,
-    total_memory: u64,
-    used_memory: u64,
-    used_percent: Option<f64>,
+/// One native refresh of host facts. Tests replace this boundary.
+pub(super) trait HostSource: Send + 'static {
+    /// Refreshes memory, and CPU usage when `sample_cpu` is true. `cpu` is
+    /// `None` when no usage sample was taken.
+    fn refresh(&mut self, sample_cpu: bool) -> HostReading;
 }
 
-impl HostProbe {
-    pub(super) fn new() -> Self {
-        Self {
-            system: sysinfo::System::new(),
-            last_cpu: None,
-            window: CpuWindow::default(),
-        }
-    }
+pub(super) struct HostReading {
+    pub(super) model: String,
+    pub(super) cores: usize,
+    pub(super) total_memory: u64,
+    pub(super) used_memory: u64,
+    pub(super) cpu: Option<f32>,
+}
 
-    fn snapshot(&mut self) -> HostFacts {
-        let raw = self.poll_cpu();
-        let used_percent = self.window.observe(raw);
-        self.system.refresh_memory();
-        HostFacts {
-            model: self
-                .system
+/// The production source: one long-lived `sysinfo::System`.
+struct SysinfoSource(sysinfo::System);
+
+impl HostSource for SysinfoSource {
+    fn refresh(&mut self, sample_cpu: bool) -> HostReading {
+        let system = &mut self.0;
+        let cpu = if sample_cpu {
+            if system.cpus().is_empty() {
+                system.refresh_cpu_all();
+            } else {
+                system.refresh_cpu_usage();
+            }
+            // An empty list is not a sample, so the next tick can try again.
+            accepted_cpu_sample(!system.cpus().is_empty(), system.global_cpu_usage())
+        } else {
+            None
+        };
+        system.refresh_memory();
+        HostReading {
+            model: system
                 .cpus()
                 .first()
                 .map(|cpu| cpu.brand().to_owned())
                 .unwrap_or_default(),
-            cores: self.system.cpus().len(),
-            total_memory: self.system.total_memory(),
-            used_memory: self.system.used_memory(),
-            used_percent,
+            cores: system.cpus().len(),
+            total_memory: system.total_memory(),
+            used_memory: system.used_memory(),
+            cpu,
         }
-    }
-
-    fn poll_cpu(&mut self) -> Option<f32> {
-        if !cpu_sample_due(self.last_cpu, Instant::now()) {
-            return None;
-        }
-        if self.system.cpus().is_empty() {
-            self.system.refresh_cpu_all();
-        } else {
-            self.system.refresh_cpu_usage();
-        }
-        // An empty list is not a sample, so the next read can try again.
-        // Stamp only after a real list so the gap starts at or after sysinfo's.
-        let sample = accepted_cpu_sample(
-            !self.system.cpus().is_empty(),
-            self.system.global_cpu_usage(),
-        );
-        if sample.is_some() {
-            self.last_cpu = Some(Instant::now());
-        }
-        sample
     }
 }
 
@@ -248,22 +245,135 @@ fn accepted_cpu_sample(has_cpus: bool, usage: f32) -> Option<f32> {
     has_cpus.then_some(usage)
 }
 
-fn host(
-    activity: &Activity,
-    id: &str,
-    now: i64,
-    probe: &Mutex<HostProbe>,
-) -> Result<Value, ApiError> {
+/// Sampling state around a source. The first accepted sample only opens
+/// the window; `usedPercent` stays null until the next one.
+struct HostProbe<S> {
+    source: S,
+    last_cpu: Option<Instant>,
+    window: CpuWindow,
+}
+
+#[derive(Clone)]
+pub(super) struct HostFacts {
+    model: String,
+    cores: usize,
+    total_memory: u64,
+    used_memory: u64,
+    used_percent: Option<f64>,
+}
+
+impl<S: HostSource> HostProbe<S> {
+    fn new(source: S) -> Self {
+        Self {
+            source,
+            last_cpu: None,
+            window: CpuWindow::default(),
+        }
+    }
+
+    /// `now` is read before the refresh (is a CPU sample due?) and after it
+    /// (the stamp), so the next gap starts at or after sysinfo's own.
+    fn sample(&mut self, mut now: impl FnMut() -> Instant) -> HostFacts {
+        let reading = self.source.refresh(cpu_sample_due(self.last_cpu, now()));
+        if reading.cpu.is_some() {
+            self.last_cpu = Some(now());
+        }
+        HostFacts {
+            model: reading.model,
+            cores: reading.cores,
+            total_memory: reading.total_memory,
+            used_memory: reading.used_memory,
+            used_percent: self.window.observe(reading.cpu),
+        }
+    }
+}
+
+/// Latest host figures, refreshed by one background task. Host reads copy
+/// the published figures and never refresh, so a read never waits for a
+/// native CPU or memory refresh, its own or another request's. The task
+/// stops when the last clone (held by the dashboard state) is dropped.
+#[derive(Clone)]
+pub(super) struct HostSampler {
+    latest: Arc<Mutex<HostFacts>>,
+    _task: Arc<SamplerTask>,
+}
+
+struct SamplerTask(tokio::task::JoinHandle<()>);
+
+impl Drop for SamplerTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl HostSampler {
+    pub(super) fn native() -> Self {
+        Self::start(SysinfoSource(sysinfo::System::new()), SAMPLE_PERIOD)
+    }
+
+    /// Takes the first sample now, so a read always has memory figures, then
+    /// refreshes every `period` (see [`sample_period`]) on a background task.
+    /// Must be called inside a Tokio runtime.
+    pub(super) fn start(source: impl HostSource, period: Duration) -> Self {
+        let period = sample_period(period);
+        let mut probe = HostProbe::new(source);
+        let latest = Arc::new(Mutex::new(probe.sample(Instant::now)));
+        let slot = Arc::clone(&latest);
+        let task = tokio::spawn(async move {
+            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                let target = Arc::clone(&slot);
+                match tokio::task::spawn_blocking(move || {
+                    publish(&mut probe, &target);
+                    probe
+                })
+                .await
+                {
+                    Ok(next) => probe = next,
+                    Err(_) => {
+                        // The source panicked: keep memory, never a stale percentage.
+                        if let Ok(mut latest) = slot.lock() {
+                            latest.used_percent = None;
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+        Self {
+            latest,
+            _task: Arc::new(SamplerTask(task)),
+        }
+    }
+
+    /// Copies the last published figures. The lock is only ever held for a
+    /// copy or a swap, never across a refresh.
+    fn latest(&self) -> Result<HostFacts, ApiError> {
+        self.latest
+            .lock()
+            .map(|facts| facts.clone())
+            .map_err(|_| ApiError::UNAVAILABLE)
+    }
+}
+
+/// Refreshes outside the published slot's lock, then swaps the result in.
+fn publish<S: HostSource>(probe: &mut HostProbe<S>, slot: &Mutex<HostFacts>) {
+    let facts = probe.sample(Instant::now);
+    if let Ok(mut latest) = slot.lock() {
+        *latest = facts;
+    }
+}
+
+fn host(activity: &Activity, id: &str, now: i64, sampler: &HostSampler) -> Result<Value, ApiError> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     if !matches!(os, "windows" | "linux") || !matches!(arch, "x86_64" | "aarch64") {
         return Err(ApiError::UNAVAILABLE);
     }
     let arch = if arch == "aarch64" { "arm64" } else { arch };
-    let facts = {
-        let mut probe = probe.lock().map_err(|_| ApiError::UNAVAILABLE)?;
-        probe.snapshot()
-    };
+    let facts = sampler.latest()?;
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let (disk_total, disk_free) = disks.iter().fold((0u64, 0u64), |(total, free), disk| {
         (
@@ -412,31 +522,44 @@ fn vm(row: DashboardVm, host_id: &str) -> Result<Value, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    /// Yields injected CPU samples. `None` means this poll is not a new sample.
-    struct ScriptedCpu {
-        samples: Vec<Option<f32>>,
-        next: usize,
+    /// Scripted native boundary. Each requested CPU sample takes the next
+    /// scripted value; `None` (or an exhausted script) is not a sample.
+    struct ScriptedSource {
+        cpu: std::collections::VecDeque<Option<f32>>,
+        requested: Vec<bool>,
     }
 
-    impl ScriptedCpu {
-        fn new(samples: impl IntoIterator<Item = Option<f32>>) -> Self {
+    impl ScriptedSource {
+        fn new(cpu: impl IntoIterator<Item = Option<f32>>) -> Self {
             Self {
-                samples: samples.into_iter().collect(),
-                next: 0,
+                cpu: cpu.into_iter().collect(),
+                requested: Vec::new(),
             }
         }
+    }
 
-        fn poll(&mut self) -> Option<f32> {
-            let sample = self.samples.get(self.next).copied().flatten();
-            self.next = self.next.saturating_add(1);
-            sample
+    impl HostSource for ScriptedSource {
+        fn refresh(&mut self, sample_cpu: bool) -> HostReading {
+            self.requested.push(sample_cpu);
+            let cpu = if sample_cpu {
+                self.cpu.pop_front().flatten()
+            } else {
+                None
+            };
+            HostReading {
+                model: "Test CPU".into(),
+                cores: 4,
+                total_memory: 8 << 30,
+                used_memory: 2 << 30,
+                cpu,
+            }
         }
     }
 
-    fn read_model_cpu(window: &mut CpuWindow, source: &mut ScriptedCpu) -> Value {
-        cpu_object("Test CPU", 4, window.observe(source.poll()))
+    /// A synthetic clock fixed at `at`.
+    fn at(at: Instant) -> impl FnMut() -> Instant {
+        move || at
     }
 
     #[test]
@@ -460,27 +583,59 @@ mod tests {
     }
 
     #[test]
-    fn host_read_model_used_percent_is_a_number_after_two_samples() {
-        let mut source = ScriptedCpu::new([
+    fn host_probe_publishes_usage_only_after_two_samples_with_synthetic_timestamps() {
+        let min = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
+        let start = Instant::now();
+        let tick = |n: u32| start + min * n;
+        let mut probe = HostProbe::new(ScriptedSource::new([
             None,
             Some(4.0),
-            Some(37.4),
+            Some(37.44),
             Some(140.0),
+            Some(12.0),
             Some(f32::NAN),
             Some(-1.0),
-        ]);
-        let mut window = CpuWindow::default();
-        let skipped = read_model_cpu(&mut window, &mut source);
-        assert!(skipped["usedPercent"].is_null());
-        assert_eq!(skipped["model"], "Test CPU");
-        assert_eq!(skipped["cores"], 4);
-        assert!(read_model_cpu(&mut window, &mut source)["usedPercent"].is_null());
-        let ready = read_model_cpu(&mut window, &mut source);
-        assert!(ready["usedPercent"].is_number());
-        assert_eq!(ready["usedPercent"], json!(37.4));
-        assert!(read_model_cpu(&mut window, &mut source)["usedPercent"].is_null());
-        assert!(read_model_cpu(&mut window, &mut source)["usedPercent"].is_null());
-        assert!(read_model_cpu(&mut window, &mut source)["usedPercent"].is_null());
+        ]));
+        // A due poll without a sample (empty CPU list) is not a sample and
+        // is not stamped, so the next poll is due again.
+        let gap = probe.sample(at(start));
+        assert_eq!(gap.used_percent, None);
+        assert_eq!(gap.model, "Test CPU");
+        assert_eq!(
+            (gap.cores, gap.total_memory, gap.used_memory),
+            (4, 8 << 30, 2 << 30)
+        );
+        // The first real sample opens the window: still null.
+        assert_eq!(probe.sample(at(start)).used_percent, None);
+        // Inside the minimum interval no CPU sample is requested.
+        if !min.is_zero() {
+            assert_eq!(probe.sample(at(start)).used_percent, None);
+        }
+        // The second sample publishes, rounded to one decimal.
+        assert_eq!(probe.sample(at(tick(1))).used_percent, Some(37.4));
+        // An early read keeps the published value.
+        if !min.is_zero() {
+            assert_eq!(probe.sample(at(tick(1))).used_percent, Some(37.4));
+        }
+        // Out-of-range and non-finite samples clear it; a valid one restores it.
+        assert_eq!(probe.sample(at(tick(2))).used_percent, None);
+        assert_eq!(probe.sample(at(tick(3))).used_percent, Some(12.0));
+        assert_eq!(probe.sample(at(tick(4))).used_percent, None);
+        assert_eq!(probe.sample(at(tick(5))).used_percent, None);
+        let expected = if min.is_zero() {
+            vec![true; 7]
+        } else {
+            vec![true, true, false, true, false, true, true, true, true]
+        };
+        assert_eq!(probe.source.requested, expected);
+    }
+
+    #[test]
+    fn sampler_period_never_drops_below_the_cpu_minimum() {
+        let floor = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.max(SAMPLE_FLOOR);
+        assert_eq!(sample_period(Duration::ZERO), floor);
+        assert_eq!(sample_period(SAMPLE_PERIOD), SAMPLE_PERIOD.max(floor));
+        assert!(SAMPLE_PERIOD >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
     }
 
     #[test]

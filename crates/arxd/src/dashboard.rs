@@ -27,7 +27,7 @@ use std::{
     fs::File,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 use time::format_description::well_known::Rfc3339;
@@ -112,7 +112,7 @@ struct Dashboard {
     clock: Arc<dyn Clock>,
     capacity: Arc<tokio::sync::Semaphore>,
     streams: streams::Backends,
-    host_probe: Arc<Mutex<read::HostProbe>>,
+    host: read::HostSampler,
     _password_lock: Option<Arc<File>>,
 }
 
@@ -146,7 +146,7 @@ impl Listener {
             clock: Arc::new(SystemClock),
             capacity: Arc::new(tokio::sync::Semaphore::new(8)),
             streams: streams::Backends::new(owner_executor),
-            host_probe: Arc::new(Mutex::new(read::HostProbe::new())),
+            host: read::HostSampler::native(),
             _password_lock: Some(Arc::new(lock)),
         }
         .router())
