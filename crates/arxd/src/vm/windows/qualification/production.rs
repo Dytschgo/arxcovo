@@ -150,8 +150,11 @@ fn observe_leaf(parent: &File, name: &str, node: Node) -> Result<bool, NativeRef
 /// effect before its next filesystem mutation, so the last committed
 /// checkpoint keeps the charge and names the recovery route.
 pub(crate) trait CustodyCheckpoints {
-    fn intend_workspace(&self, generation: Id, production: FileIdentity)
-    -> Result<(), NativeRefusal>;
+    fn intend_workspace(
+        &self,
+        generation: Id,
+        production: FileIdentity,
+    ) -> Result<(), NativeRefusal>;
     /// Records the directory identity and the lease create intent.
     fn workspace_directory(
         &self,
@@ -161,10 +164,12 @@ pub(crate) trait CustodyCheckpoints {
     fn workspace_bound(&self, binding: WorkspaceBinding) -> Result<(), NativeRefusal>;
     /// The exact durable scope every hold, slot and dispatch requires.
     fn confirm_bound(&self, binding: WorkspaceBinding) -> Result<(), NativeRefusal>;
-    fn workspace_intent_settled(&self, generation: Id, present: bool)
-    -> Result<(), NativeRefusal>;
-    fn intend_slot(&self, binding: WorkspaceBinding, slot: ArtifactSlot)
-    -> Result<(), NativeRefusal>;
+    fn workspace_intent_settled(&self, generation: Id, present: bool) -> Result<(), NativeRefusal>;
+    fn intend_slot(
+        &self,
+        binding: WorkspaceBinding,
+        slot: ArtifactSlot,
+    ) -> Result<(), NativeRefusal>;
     fn slot_identified(
         &self,
         binding: WorkspaceBinding,
@@ -240,11 +245,7 @@ impl CustodyCheckpoints for LedgerCheckpoints<'_> {
         })
     }
 
-    fn workspace_intent_settled(
-        &self,
-        generation: Id,
-        present: bool,
-    ) -> Result<(), NativeRefusal> {
+    fn workspace_intent_settled(&self, generation: Id, present: bool) -> Result<(), NativeRefusal> {
         self.commit(|db| native::settle_workspace_intent(db, generation, present))
     }
 
@@ -535,7 +536,8 @@ fn reserve_workspace_under(
         .ok()
         .and_then(|created| {
             let (id, _) = file_identity(&created, true).ok()?;
-            let bridge = open_relative(&production.leaf, &name, Node::Directory, true, false).ok()?;
+            let bridge =
+                open_relative(&production.leaf, &name, Node::Directory, true, false).ok()?;
             (id.volume == production.identity.volume
                 && file_identity(&bridge, true).is_ok_and(|(held, _)| held == id)
                 && has_exact_leaf(&created, &name)

@@ -1,9 +1,7 @@
 //! Production plans derived from the selected TEST recipe and reserved slots.
 
 use super::launch::{artifact, header, held_bytes, prepare_ubuntu};
-use super::production::{
-    CustodyCheckpoints, ProductionWorkspace, WorkspaceBinding, check_pair,
-};
+use super::production::{CustodyCheckpoints, ProductionWorkspace, WorkspaceBinding, check_pair};
 use super::*;
 use crate::vm::paths::Artifact;
 use crate::vm::qemu_args::{BootPurpose, BootRecipe};

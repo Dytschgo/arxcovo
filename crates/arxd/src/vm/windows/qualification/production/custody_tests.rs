@@ -105,11 +105,7 @@ impl CustodyCheckpoints for Recorder<'_> {
         self.step("confirm_bound", None, || self.ledger.confirm_bound(binding))
     }
 
-    fn workspace_intent_settled(
-        &self,
-        generation: Id,
-        present: bool,
-    ) -> Result<(), NativeRefusal> {
+    fn workspace_intent_settled(&self, generation: Id, present: bool) -> Result<(), NativeRefusal> {
         self.step("workspace_intent_settled", None, || {
             self.ledger.workspace_intent_settled(generation, present)
         })
@@ -275,12 +271,13 @@ fn reserved_workspace_commits_each_identity_before_the_next_create() {
         assert_eq!(recorder.ledger.confirm_bound(substitute), Err(PATH));
     }
     // The returned workspace owns the only lease lock.
-    assert!(
-        hold_workspace_under(&fixture.production, sid_ptr(&fixture.owner), binding).is_err()
-    );
+    assert!(hold_workspace_under(&fixture.production, sid_ptr(&fixture.owner), binding).is_err());
     // A repeated reservation never adopts the existing directory.
     assert!(fixture.reserve(&recorder, generation).is_err());
-    assert_eq!(fixture.generation_state(generation).as_deref(), Some("bound"));
+    assert_eq!(
+        fixture.generation_state(generation).as_deref(),
+        Some("bound")
+    );
 }
 
 #[test]
@@ -316,7 +313,10 @@ fn workspace_faults_keep_an_exact_intent_or_quarantine_across_reopen() {
     for ((fault, state, directory, lease), generation) in cases.into_iter().zip(&generations) {
         let recorder = fixture.recorder(*generation);
         recorder.fault.set(Some(fault));
-        assert!(fixture.reserve(&recorder, *generation).is_err(), "{fault:?}");
+        assert!(
+            fixture.reserve(&recorder, *generation).is_err(),
+            "{fault:?}"
+        );
         let path = fixture
             .temp
             .path()
@@ -336,7 +336,11 @@ fn workspace_faults_keep_an_exact_intent_or_quarantine_across_reopen() {
     }
     // A lost bind acknowledgement leaves an exact scope the owner can hold.
     let generation = generations[4];
-    let directory = fixture.production.path.join(&hex::encode(generation)).unwrap();
+    let directory = fixture
+        .production
+        .path
+        .join(&hex::encode(generation))
+        .unwrap();
     let lease = directory.join(GENERATION_LEASE).unwrap();
     let binding = fixture_binding(&fixture.production, generation, &directory, &lease);
     let recorder = fixture.recorder(generation);
@@ -349,7 +353,9 @@ fn slot_identity_is_durable_before_the_first_write() {
     let mut fixture = Fixture::new();
     let slots = fixture.builds[0];
     let generation = slots.pair.disk.generation;
-    let ws = fixture.reserve(&fixture.recorder(generation), generation).unwrap();
+    let ws = fixture
+        .reserve(&fixture.recorder(generation), generation)
+        .unwrap();
     let recorder = fixture.recorder(generation);
     let mut writer = ws.create_slot(slots.seed, &recorder).unwrap();
     assert_eq!(
@@ -383,7 +389,9 @@ fn slot_identity_is_durable_before_the_first_write() {
     // A lost intent acknowledgement stays charged until exact absence.
     let other = fixture.builds[1];
     let generation = other.pair.disk.generation;
-    let second = fixture.reserve(&fixture.recorder(generation), generation).unwrap();
+    let second = fixture
+        .reserve(&fixture.recorder(generation), generation)
+        .unwrap();
     let recorder = fixture.recorder(generation);
     recorder.fault.set(Some(Fault::After("intend_slot")));
     assert!(second.create_slot(other.seed, &recorder).is_err());
@@ -403,14 +411,18 @@ fn helper_target_is_identified_and_empty_before_any_write() {
     let fixture = Fixture::new();
     let slots = fixture.builds[0];
     let generation = slots.pair.disk.generation;
-    let ws = fixture.reserve(&fixture.recorder(generation), generation).unwrap();
+    let ws = fixture
+        .reserve(&fixture.recorder(generation), generation)
+        .unwrap();
     let recorder = fixture.recorder(generation);
     assert!(
         ws.precreate_helper_target(slots.pair.vars, &recorder)
             .is_err()
     );
     assert!(recorder.log.borrow().is_empty());
-    let target = ws.precreate_helper_target(slots.pair.disk, &recorder).unwrap();
+    let target = ws
+        .precreate_helper_target(slots.pair.disk, &recorder)
+        .unwrap();
     assert_eq!(target.slot(), slots.pair.disk);
     assert_eq!(
         *recorder.log.borrow(),
@@ -441,7 +453,10 @@ fn custody_checkpoints_leave_production_admission_closed() {
     let generation = slots.pair.disk.generation;
     let recorder = fixture.recorder(generation);
     let ws = fixture.reserve(&recorder, generation).unwrap();
-    drop(ws.precreate_helper_target(slots.pair.disk, &recorder).unwrap());
+    drop(
+        ws.precreate_helper_target(slots.pair.disk, &recorder)
+            .unwrap(),
+    );
     let profile = crate::config::VmRuntimeProfile::parse(
         br#"{
         "enabled":true,"owner_sid":"S-1-5-21-1-2-3-1001","supervisor_sid":"S-1-5-21-1-2-3-1002",

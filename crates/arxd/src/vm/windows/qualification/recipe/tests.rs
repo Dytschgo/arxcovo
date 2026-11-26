@@ -334,7 +334,12 @@ fn seed_stays_accounted_when_the_second_leaf_fails() {
         assert_eq!(staged.is_ok(), fault.is_none() && write.is_none());
         assert_eq!(
             names[..4],
-            ["intend_slot", "slot_identified", "slot_verified", "intend_slot"]
+            [
+                "intend_slot",
+                "slot_identified",
+                "slot_verified",
+                "intend_slot"
+            ]
         );
         let seed = fixture.leaf(slots.seed);
         assert!(

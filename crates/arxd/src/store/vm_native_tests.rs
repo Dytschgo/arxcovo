@@ -137,13 +137,7 @@ fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
         );
         // An attempted legacy generation never acquires native custody.
         assert!(
-            intend_workspace(
-                db,
-                legacy.pair.disk.generation,
-                Origin::Build,
-                identity(1)
-            )
-            .is_err()
+            intend_workspace(db, legacy.pair.disk.generation, Origin::Build, identity(1)).is_err()
         );
         Ok(())
     })
@@ -393,7 +387,11 @@ fn legacy_paths_cannot_forget_or_dispose_native_custody() -> Result<()> {
         })
     };
     // Each refused legacy transaction rolls back as a whole.
-    assert!(store.transact(|db| forget_generation(db, generation)).is_err());
+    assert!(
+        store
+            .transact(|db| forget_generation(db, generation))
+            .is_err()
+    );
     assert_eq!(artifacts(&store)?, 3);
     store.transact(|db| intend_slot(db, scope, slots.seed))?;
     let activity: i64 = store.transact(|db| {
@@ -409,7 +407,11 @@ fn legacy_paths_cannot_forget_or_dispose_native_custody() -> Result<()> {
             .transact(|db| cancel_untouched_build(db, slots, activity, NOW))
             .is_err()
     );
-    assert!(store.transact(|db| forget_generation(db, generation)).is_err());
+    assert!(
+        store
+            .transact(|db| forget_generation(db, generation))
+            .is_err()
+    );
     assert_eq!(artifacts(&store)?, 3);
     store.transact(|db| {
         identify_slot(db, scope, slots.seed, identity(10))?;

@@ -162,7 +162,12 @@ pub(crate) fn intend_workspace(
         "UPDATE vm_native_generations SET state='intended'
          WHERE generation=?1 AND origin=?2 AND volume=?3 AND production=?4
            AND state IN ('intended','absent')",
-        params![generation, origin.name(), volume(production), production.file],
+        params![
+            generation,
+            origin.name(),
+            volume(production),
+            production.file
+        ],
     )?;
     if renewed == 0 {
         // Only an untouched generation can be bound. Legacy and attempted
@@ -255,7 +260,11 @@ pub(crate) fn bound(db: &Connection, scope: Scope) -> Result<bool> {
 /// the directory (state `intended`) or the lease (state `directory`).
 /// Absence of a directory disproves the intent. A present unidentified
 /// object is quarantined. Absence of a lease leaves its intent in place.
-pub(crate) fn settle_workspace_intent(db: &Connection, generation: Id, present: bool) -> Result<()> {
+pub(crate) fn settle_workspace_intent(
+    db: &Connection,
+    generation: Id,
+    present: bool,
+) -> Result<()> {
     let state: Option<String> = db
         .query_row(
             "SELECT state FROM vm_native_generations WHERE generation=?1",
@@ -324,8 +333,12 @@ pub(crate) fn identify_slot(
     require_scope(db, scope, slot)?;
     ensure!(
         identity.volume == scope.production.volume
-            && ![scope.production.file, scope.workspace.file, scope.lease.file]
-                .contains(&identity.file),
+            && ![
+                scope.production.file,
+                scope.workspace.file,
+                scope.lease.file
+            ]
+            .contains(&identity.file),
         "invalid native slot identity"
     );
     ensure!(
