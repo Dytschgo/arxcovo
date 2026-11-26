@@ -596,6 +596,9 @@ kbd {
 /* One column per host. The board scrolls inside itself (visible bar) when the
    columns don't fit, so the page never scrolls sideways. */
 .board {
+  /* Containing block for the visually hidden text inside it, so that text
+     stays inside the scroll clip instead of widening the page. */
+  position: relative;
   display: flex;
   gap: 10px;
   padding-block: 14px 10px;
@@ -615,7 +618,7 @@ kbd {
   padding: 0;
   list-style: none;
 }
-.col { display: flex; flex-direction: column; min-block-size: 460px; border: 1px solid var(--line); border-radius: 16px; background: var(--tile); }
+.col { position: relative; display: flex; flex-direction: column; min-block-size: 460px; border: 1px solid var(--line); border-radius: 16px; background: var(--tile); }
 .col[data-reachability="offline"] { background: var(--bg); }
 .col-orphan { flex: 0 0 230px; border-style: dashed; border-color: var(--line3); }
 .col-h { padding: 13px 12px 12px; border-block-end: 1px solid var(--line); }

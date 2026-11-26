@@ -236,9 +236,45 @@ for (const motion of ['no-preference', 'reduce'] as const) {
       await expect(page.getByText(ready).first()).toBeVisible();
       await audit(hash);
     }
-    await page.getByLabel('Tool').selectOption('list_hosts');
+    await page.getByLabel('Tool', { exact: true }).selectOption('list_hosts');
     await expect(page.getByText('No activity matches these filters')).toBeVisible();
     await audit('activity, empty filter');
+    await page.getByText('Include reads').click();
+    await page.getByRole('group', { name: 'Outcome' }).getByRole('button', { name: 'succeeded' }).click();
+    await expect(page.getByRole('list', { name: 'Activity, page 1' }).getByRole('listitem').first()).toBeVisible();
+    await audit('activity, outcome chip pressed and reads switch on');
+
+    // PR B views: the board filter, the search jump list, VM table filters and the idle console tile.
+    await page.goto('/#/hosts');
+    await expect(page.getByRole('list', { name: 'Hosts' })).toBeVisible();
+    await page.getByRole('group', { name: 'Show VMs' }).getByRole('button', { name: 'Static' }).click();
+    await expect(page.getByText('No static VMs').first()).toBeVisible();
+    await audit('hosts board, static filter pressed');
+    const search = page.getByRole('combobox', { name: 'Search hosts, VMs and tools' });
+    await search.fill('a');
+    const options = page.getByRole('listbox', { name: 'Search results' }).getByRole('option');
+    await expect(options.first()).toBeVisible();
+    await search.press('ArrowDown');
+    await expect(options.first()).toHaveAttribute('aria-selected', 'true');
+    await audit('search listbox, first option active');
+    await search.fill('zzz-nothing');
+    await expect(page.getByText('No host, VM or tool matches “zzz-nothing”')).toBeVisible();
+    await audit('search, no match');
+    await search.press('Escape');
+
+    await page.goto('/#/vms');
+    await expect(page.getByText('5 of 5 VMs')).toBeVisible();
+    await page.getByRole('group', { name: 'State' }).getByRole('button', { name: /running/ }).click();
+    await page.getByRole('group', { name: 'Kind' }).getByRole('button', { name: /Test/ }).click();
+    await expect(page.getByText('2 of 5 VMs')).toBeVisible();
+    await audit('VMs, state chip and kind pressed');
+    await page.getByLabel('Filter by name').fill('zzz');
+    await expect(page.getByText('No VMs match these filters')).toBeVisible();
+    await audit('VMs, name filter with no match');
+
+    await page.goto('/#/vms/ubuntu-build-02');
+    await expect(page.getByRole('link', { name: 'Open console' })).toBeVisible();
+    await audit('VM page, idle console tile');
 
     await page.goto('/#/terminal/atlas');
     const input = page.getByLabel('Command');
