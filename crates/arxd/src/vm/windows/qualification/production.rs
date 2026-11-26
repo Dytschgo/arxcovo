@@ -902,7 +902,10 @@ impl<'a> NativeLaunch<'a> {
         drop(self.io.take());
         let (disposition, held) = self.core.stop_held(qmp, cancel, verify_release).await;
         match held.and_then(|held| self.release_proof(held)) {
-            Some(proof) => (disposition, Some(proof)),
+            Some(mut proof) => {
+                proof.stop_disposition = Some(disposition);
+                (disposition, Some(proof))
+            }
             None => (StopDisposition::ChargedQuarantine, None),
         }
     }
@@ -1090,6 +1093,7 @@ pub(super) mod tests;
 pub(crate) struct ReleasedGeneration<'a> {
     binding: WorkspaceBinding,
     targets: ReleaseTargets,
+    stop_disposition: Option<StopDisposition>,
     _workspace: WorkspaceCustody<'a>,
     _held: HeldWriters,
 }
@@ -1136,6 +1140,7 @@ impl<'a> ReleasedGeneration<'a> {
         Some(Self {
             binding,
             targets,
+            stop_disposition: None,
             _workspace: workspace,
             _held: held,
         })
@@ -1174,3 +1179,6 @@ impl<'a> ReleasedGeneration<'a> {
             )
     }
 }
+
+#[cfg(test)]
+mod release_tests;

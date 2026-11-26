@@ -491,3 +491,82 @@ pub(super) fn reserve_workspace_under(
     };
     hold_workspace_under(production, owner, binding)
 }
+
+/// Bounded observation of the exact released TEST pair. Keep the original
+/// lease and both writer exclusions borrowed across every commit attempt.
+pub(crate) struct TestRelease<'proof> {
+    _held: &'proof HeldWriters,
+    observed: native::release::Observed,
+}
+
+impl ReleasedGeneration<'_> {
+    pub(crate) fn observe_test_release(
+        &self,
+        target: native::release::Target,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<TestRelease<'_>, NativeRefusal> {
+        launch::check_preparation(deadline, cancelled)?;
+        self._workspace.verify()?;
+        if target.generation != self.binding.generation {
+            return Err(PATH);
+        }
+        let (slots, pins, clean) = match self.targets {
+            ReleaseTargets::Unchanged(pair) => (pair.slots, pair.evidence, true),
+            ReleaseTargets::Pair { pair, ids } => {
+                let clean = match self.stop_disposition {
+                    Some(StopDisposition::CleanRelease) => true,
+                    Some(StopDisposition::DirtyRelease) => false,
+                    _ => return Err(PATH),
+                };
+                let evidence = |index: usize| -> Result<ArtifactEvidence, NativeRefusal> {
+                    let identity = ids[index];
+                    let guard = self
+                        ._held
+                        .1
+                        .iter()
+                        .find(|guard| {
+                            file_identity(guard, false).is_ok_and(|(held, _)| held == identity)
+                        })
+                        .ok_or(PATH)?;
+                    let pin =
+                        launch::hash_held(guard, START_PAIR_LIMITS[index], deadline, cancelled)?;
+                    Ok(ArtifactEvidence {
+                        identity,
+                        directory: self.binding.workspace.file,
+                        pin,
+                    })
+                };
+                (pair, [evidence(0)?, evidence(1)?], clean)
+            }
+            ReleaseTargets::Helper { .. } => return Err(PATH),
+        };
+        check_pair(self.binding, slots)?;
+        if slots.disk.role != "disk" {
+            return Err(PATH);
+        }
+        self._workspace.verify()?;
+        launch::check_preparation(deadline, cancelled)?;
+        Ok(TestRelease {
+            _held: &self._held,
+            observed: native::release::Observed {
+                target,
+                scope: scope(self.binding),
+                slots,
+                pins,
+                clean,
+            },
+        })
+    }
+}
+
+impl TestRelease<'_> {
+    pub(crate) fn commit(
+        &self,
+        store: &crate::store::vm::VmStore,
+        stop: Option<&native::release::StopReceipt>,
+        clock: impl FnOnce() -> crate::vm::ClockReading,
+    ) -> anyhow::Result<Option<crate::vm::Status>> {
+        store.transact(|db| native::release::commit(db, &self.observed, stop, clock))
+    }
+}

@@ -1334,6 +1334,7 @@ async fn released_proof_binds_generation_and_keeps_the_writer_exclusion() {
     let proof = ReleasedGeneration {
         binding: workspace,
         targets: ReleaseTargets::Pair { pair: slots, ids },
+        stop_disposition: None,
         _workspace: workspace_custody,
         _held: held.unwrap(),
     };
