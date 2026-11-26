@@ -551,6 +551,7 @@ fn t33_transient_build_disposal_resumes_across_every_edge_to_publish_and_ordinar
         // Crash & reopen: zero volatile state, `recover()` abandons pending build.
         fx.reopen();
         assert_eq!(fx.count("SELECT count(*) FROM vm_build_intents"), 1);
+        fx.clock.advance(0, 0);
         assert!(fx.sweep(None));
         assert_eq!(
             fx.count("SELECT count(*) FROM vm_build_intents"),
@@ -600,6 +601,7 @@ fn t69_t70_t71_ordinary_sweep_resumes_after_every_unlink_and_reopen() {
 
         // Crash and reopen with zero volatile receipts, guards or backoff maps.
         fx.reopen();
+        fx.clock.advance(0, 0);
         assert!(fx.sweep(None));
 
         // Exact physical absence (leaves, lease AND directory) and ledger settlement.
@@ -694,6 +696,7 @@ fn t68_negative_controls_retain_claims_and_never_delete_protected_objects() {
             assert!(fx.sweep(Some(Fault::Before("slot_disposed", 1))));
             assert!(!exists(&disk_path));
             fx.reopen();
+            fx.clock.advance(0, 0);
         } else {
             std::fs::remove_file(&disk_path).unwrap();
         }
@@ -716,6 +719,7 @@ fn t68_negative_controls_retain_claims_and_never_delete_protected_objects() {
             assert!(fx.sweep(Some(Fault::Before("intend_directory_disposal", 1))));
             assert!(!exists(&fx.lease_file(slots.disk.generation)));
             fx.reopen();
+            fx.clock.advance(0, 0);
         }
         std::fs::write(&extra, b"keep-me").unwrap();
         assert!(fx.sweep(None));
@@ -757,6 +761,7 @@ fn t68_negative_controls_retain_claims_and_never_delete_protected_objects() {
         let ledger = LedgerDisposal { store: fx.store() };
         let guards = GenerationGuards::default();
         let wrong_custody = NativeDisposal::under(&wrong_parent, fx.owner_sid(), &ledger, &guards);
+        fx.clock.advance(0, 0);
         assert!(fx.ctl().sweep_with(&OfflineReaper, &wrong_custody).unwrap());
         assert!(exists(&fx.slot_file(slots.disk)));
         assert_eq!(fx.count("SELECT count(*) FROM vm_disk_claims"), 1);
@@ -922,6 +927,7 @@ fn recovery_retains_files_release_only_refuses_and_uncreated_reservation_proves_
             store::recover(db, NOW)
         })
         .unwrap();
+    fx.clock.advance(0, 0);
     assert!(fx.sweep(None));
     assert!(exists(&fx.slot_file(slots.disk)));
     assert!(exists(&fx.slot_file(slots.vars)));
@@ -965,6 +971,7 @@ fn recovery_retains_files_release_only_refuses_and_uncreated_reservation_proves_
         .unwrap();
     let _ = act;
     assert!(!exists(&fx.gen_dir(uncreated.pair.disk.generation)));
+    fx.clock.advance(0, 0);
     assert!(fx.sweep(None));
     assert_eq!(fx.count("SELECT count(*) FROM vm_build_intents"), 0);
 

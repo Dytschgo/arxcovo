@@ -51,6 +51,25 @@ export interface Host {
   agentRights: AgentRights;
 }
 
+export const CPU_HISTORY_RANGES = {
+  '1h': { bucketSeconds: 60, points: 60 },
+  '6h': { bucketSeconds: 300, points: 72 },
+  '24h': { bucketSeconds: 600, points: 144 },
+} as const;
+
+export type CpuHistoryRange = keyof typeof CPU_HISTORY_RANGES;
+
+export interface CpuHistory {
+  hostId: string;
+  range: CpuHistoryRange;
+  bucketSeconds: 60 | 300 | 600;
+  /** UTC bucket boundaries. The end is exclusive. */
+  from: string;
+  to: string;
+  /** CPU utilization from 0 to 100. Null marks insufficient coverage. */
+  samples: (number | null)[];
+}
+
 export type ActivityOutcome = 'started' | 'succeeded' | 'failed' | 'rejected' | 'refused' | 'interrupted';
 export type ActorKind = 'agent' | 'owner' | 'system';
 
@@ -185,6 +204,8 @@ export interface ArxApi {
   logout(): Promise<void>;
   listHosts(): Promise<Host[]>;
   getHost(id: string): Promise<Host>;
+  getCpuHistory(hostId: string, range: CpuHistoryRange): Promise<CpuHistory>;
+  listCpuHistory(range: '24h'): Promise<CpuHistory[]>;
   listActivity(query?: ActivityQuery): Promise<ActivityPage>;
   listVms(): Promise<Vm[]>;
   getVm(id: string): Promise<Vm>;

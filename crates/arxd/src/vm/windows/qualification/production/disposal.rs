@@ -30,7 +30,10 @@ const PATH: Q = NativeRefusal::PathCustodyUnverified;
 ///
 /// Exclusion applies only among callers sharing the same instance; the later
 /// 7c issuer/reaper wiring PR must share one process-wide `GenerationGuards`
-/// instance across all disposal callers.
+/// instance across all disposal callers. The reaper derives each cleanup
+/// deadline from its injected `Clock` while `NativeDisposal` reads the real
+/// monotonic clock (`Instant::now()`), so the wiring PR must also keep both
+/// on the same monotonic time base.
 #[derive(Default)]
 pub(crate) struct GenerationGuards {
     active: Mutex<HashSet<Id>>,
