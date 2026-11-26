@@ -3132,9 +3132,13 @@ impl<'a> CheckedLaunchCore<'a> {
                 setup_vars = Some((index, digest));
             }
         }
-        if kind == PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall) {
-            // The foreground preparation pins the initial stock VARS bytes.
-            // Retain writer exclusion until QEMU opens its writable copy.
+        if matches!(
+            kind,
+            PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall) | PlanKind::Boot
+        ) {
+            // The foreground preparation pins the initial stock VARS bytes,
+            // or an installed boot pins its authorized VARS copy. Retain
+            // writer exclusion until QEMU opens its writable copy.
             if let Some((_, vars)) = inputs
                 .plan
                 .inputs()
@@ -3570,7 +3574,11 @@ impl CheckedLaunchCore<'_> {
             .filter(|_| self.kind == PlanKind::Boot)
             .ok_or(BootFailure::Native(NativeRefusal::QmpUnverified))?;
         self.child
-            .resume_checked(cancel, &mut revalidate)
+            .resume_checked_with_handoff(cancel, None, &mut revalidate, || {
+                // A pinned VARS copy stays writer-excluded until QEMU opens
+                // its writable pflash by name after resume.
+                drop(self.setup_vars_handoff.take());
+            })
             .map_err(BootFailure::Native)?;
         // The periodic monitor and cont gate both sample synchronously on the
         // same task. The cell shares the sampler without a borrow across I/O.

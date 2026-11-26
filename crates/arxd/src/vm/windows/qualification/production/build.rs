@@ -17,6 +17,7 @@ use crate::vm::test_issuer::CopyAuthority;
 use crate::vm::{
     BuildRequest, BuildSlots, Clock, FailureReason, PendingOperation, Status, VmController,
 };
+use health::HealthPhase;
 use std::cell::Cell;
 
 type Q = NativeRefusal;
@@ -138,7 +139,33 @@ impl ReleasedGeneration<'_> {
 #[derive(Clone, Copy)]
 enum Phase {
     Install(InstallerStage),
-    Health { verification: bool },
+    Health(HealthPhase),
+}
+
+/// The authorized verification VARS copy, held without write sharing from
+/// its content check until the checked launch takes over the exclusion.
+struct VarsHandoff {
+    pin: PathPin,
+    content: crate::vm::paths::ArtifactPin,
+}
+
+impl VarsHandoff {
+    /// Rehash the exact copy through the held handle immediately before it
+    /// is handed to the launch.
+    fn confirm(
+        &self,
+        file: ArtifactEvidence,
+        by: Instant,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), Q> {
+        if self.pin.identity != file.identity
+            || self.content != file.pin
+            || launch::hash_held(&self.pin.leaf, MAX_SETUP_VARS_BYTES, by, cancel)? != self.content
+        {
+            return Err(PATH);
+        }
+        Ok(())
+    }
 }
 
 struct Boot<'a> {
@@ -148,7 +175,29 @@ struct Boot<'a> {
     phase: Phase,
     staged: Option<&'a StagedInstaller<'a>>,
     backing: Option<&'a Artifact>,
+    /// Released by the launch only at the writable-open boundary.
+    vars: Option<VarsHandoff>,
     cutoff: Instant,
+}
+
+/// What a failed build has established about its cause so far.
+struct Progress {
+    stage: Cell<FailureReason>,
+    refusal: Cell<Option<Q>>,
+    cutoff: Cell<Instant>,
+}
+
+/// Cancellation, the effect cutoff and the controller's worker deadline are
+/// interruptions with no proven guest-side cause.
+fn interrupted<C: Clock>(
+    controller: &VmController<C>,
+    worker: &PendingOperation,
+    cancel: &Shutdown,
+    cutoff: Instant,
+) -> bool {
+    cancel.is_cancelled()
+        || Instant::now() >= cutoff.min(worker.deadline())
+        || controller.worker_expired(worker)
 }
 
 enum Finalized {
@@ -158,10 +207,10 @@ enum Finalized {
 }
 
 impl Finalized {
-    fn check(&self, pair: StartPair, deadline: Instant) -> Result<(), Q> {
+    fn check(&self, pair: StartPair, deadline: Instant, cancel: &Shutdown) -> Result<(), Q> {
         let generalized = match self {
             Self::Native(finalized) => {
-                finalized.observe(pair.slots, pair.evidence, deadline)? == (true, true)
+                finalized.observe(pair.slots, pair.evidence, deadline, cancel)? == (true, true)
             }
             #[cfg(test)]
             Self::Fixture(generalized) => *generalized,
@@ -186,6 +235,9 @@ trait Effects {
     fn image(&self) -> Result<Artifact, Q>;
     #[cfg(test)]
     fn inside_seal(&self) {}
+    /// A named point between two build steps, for adverse-ordering fixtures.
+    #[cfg(test)]
+    fn crossing(&self, _point: &'static str) {}
     async fn helper<'w>(
         &'w self,
         prepared: &'w PreparedHelper<'w, '_>,
@@ -234,12 +286,15 @@ impl<C: Clock> Build<'_, C> {
     ) -> Result<BootRelease<'w>, Q> {
         let expected = match request.phase {
             Phase::Install(stage) => Some(stage.phase()),
-            Phase::Health { .. } => None,
+            Phase::Health(_) => None,
         };
         let pair = request.pair;
         let cutoff = request.cutoff;
         self.check(cutoff)?;
         self.ledger.confirm_start_pair(workspace.binding(), pair)?;
+        if let Some(vars) = &request.vars {
+            vars.confirm(pair.evidence[1], cutoff, &|| self.cancel.is_cancelled())?;
+        }
         let result = effects.boot(request, workspace).await?;
         self.check(cutoff)?;
         if result.phase != expected
@@ -314,6 +369,7 @@ impl<C: Clock> Build<'_, C> {
     #[allow(clippy::too_many_arguments, reason = "one released pair's checks")]
     fn capture(
         &self,
+        effects: &impl Effects,
         workspace: &ProductionWorkspace,
         release: &ReleasedGeneration<'_>,
         pair: StartPair,
@@ -334,12 +390,19 @@ impl<C: Clock> Build<'_, C> {
             return Err(PATH);
         }
         if let Some(finalized) = finalized {
-            finalized.check(pair, cutoff)?;
+            finalized.check(pair, cutoff, self.cancel)?;
         }
         self.check(cutoff)?;
+        #[cfg(test)]
+        effects.crossing("capture");
+        #[cfg(not(test))]
+        let _ = effects;
         self.controller
             .native_store()
             .transact(|db| {
+                // The store mutex may be contended. Cancellation and the cutoff
+                // are rechecked once it is held and again before commit.
+                anyhow::ensure!(self.check(cutoff).is_ok(), "build capture interrupted");
                 for (slot, evidence) in [pair.slots.disk, pair.slots.vars]
                     .into_iter()
                     .zip(pair.evidence)
@@ -351,6 +414,7 @@ impl<C: Clock> Build<'_, C> {
                         evidence,
                     )?;
                 }
+                anyhow::ensure!(self.check(cutoff).is_ok(), "build capture interrupted");
                 Ok(())
             })
             .map_err(|_| PATH)?;
@@ -375,9 +439,13 @@ impl<C: Clock> Build<'_, C> {
                 && self.request.digest == self.recipe.recipe_sha256,
             "invalid native build request"
         );
-        let stage = Cell::new(FailureReason::StagingFailed);
+        let progress = Progress {
+            stage: Cell::new(FailureReason::StagingFailed),
+            refusal: Cell::new(None),
+            cutoff: Cell::new(self.worker.deadline()),
+        };
         let result = self
-            .drive(effects, &primary, reserve_verification, &stage)
+            .drive(effects, &primary, reserve_verification, &progress)
             .await;
         drop(primary);
         match result {
@@ -387,16 +455,28 @@ impl<C: Clock> Build<'_, C> {
                     self.worker,
                     self.slots,
                     false,
-                    self.cause(stage.get()),
+                    self.cause(&progress),
                 )?;
                 Err(error)
             }
         }
     }
 
-    /// Cancellation and the worker deadline have no proven guest-side cause.
-    fn cause(&self, stage: FailureReason) -> Option<FailureReason> {
-        (!self.cancel.is_cancelled() && Instant::now() < self.worker.deadline()).then_some(stage)
+    /// An interruption has no proven guest-side cause. An installer stage
+    /// that reached its own deadline keeps its typed timeout.
+    fn cause(&self, progress: &Progress) -> Option<FailureReason> {
+        if interrupted(
+            self.controller,
+            self.worker,
+            self.cancel,
+            progress.cutoff.get(),
+        ) {
+            return None;
+        }
+        match progress.refusal.get() {
+            Some(NativeRefusal::InstallerDeadlineExpired) => Some(FailureReason::InstallTimedOut),
+            _ => Some(progress.stage.get()),
+        }
     }
 
     /// All holds taken here, including the staged installer, each boot's
@@ -406,9 +486,13 @@ impl<C: Clock> Build<'_, C> {
         effects: &impl Effects,
         primary: &ProductionWorkspace,
         reserve_verification: impl FnOnce() -> Result<ProductionWorkspace, Q>,
-        stage: &Cell<FailureReason>,
+        progress: &Progress,
     ) -> anyhow::Result<Status> {
-        let run = |error: Q| anyhow::anyhow!("TEST build refused: {error:?}");
+        let stage = &progress.stage;
+        let run = |error: Q| {
+            progress.refusal.set(Some(error));
+            anyhow::anyhow!("TEST build refused: {error:?}")
+        };
         let slots = self.slots;
         let deadline = self.worker.deadline();
         let windows = self.request.recipe == hex::encode(VmController::<C>::windows_recipe_id());
@@ -453,6 +537,7 @@ impl<C: Clock> Build<'_, C> {
             .clip(deadline.saturating_duration_since(Instant::now()))
             .into_std()
             .min(deadline);
+        progress.cutoff.set(cutoff);
         let installer = |phase| {
             budget
                 .stage(phase, cutoff.saturating_duration_since(Instant::now()))
@@ -465,6 +550,7 @@ impl<C: Clock> Build<'_, C> {
             phase,
             staged: None,
             backing: None,
+            vars: None,
             cutoff,
         };
         stage.set(FailureReason::InstallFailed);
@@ -486,9 +572,7 @@ impl<C: Clock> Build<'_, C> {
             self.boot(
                 effects,
                 primary,
-                start(Phase::Health {
-                    verification: false,
-                }),
+                start(Phase::Health(HealthPhase::Readiness)),
             )
             .await
             .map_err(run)?;
@@ -510,6 +594,7 @@ impl<C: Clock> Build<'_, C> {
         stage.set(FailureReason::SealFailed);
         let golden = self
             .capture(
+                effects,
                 primary,
                 &released.release,
                 original,
@@ -525,7 +610,7 @@ impl<C: Clock> Build<'_, C> {
             primary,
             golden,
             cutoff,
-            stage,
+            progress,
         )
         .await
         .map_err(run)?;
@@ -549,7 +634,15 @@ impl<C: Clock> Build<'_, C> {
             .finish_native_build(self.worker, slots, self.request, &seal, || {
                 #[cfg(test)]
                 effects.inside_seal();
+                // The pre-seal observation's age is rechecked at the gate
+                // without reentering the store.
                 self.check(cutoff).is_ok()
+                    && fresh_observation(
+                        captured,
+                        Instant::now(),
+                        NativeRefusal::ReservesUnverified,
+                    )
+                    .is_ok()
             })
     }
 
@@ -560,8 +653,9 @@ impl<C: Clock> Build<'_, C> {
         primary: &ProductionWorkspace,
         golden: StartPair,
         cutoff: Instant,
-        stage: &Cell<FailureReason>,
+        progress: &Progress,
     ) -> Result<(), Q> {
+        let stage = &progress.stage;
         stage.set(FailureReason::StagingFailed);
         let pair = self.slots.verification;
         let [disk, vars] = golden.evidence;
@@ -619,7 +713,10 @@ impl<C: Clock> Build<'_, C> {
             directory: workspace.binding().workspace.file,
             pin: content,
         };
-        drop(pin);
+        // Writers stay excluded from the content check until the launch.
+        let handoff = VarsHandoff { pin, content };
+        #[cfg(test)]
+        effects.crossing("copy");
         let pair = StartPair {
             slots: pair,
             evidence: [disk, vars],
@@ -633,14 +730,16 @@ impl<C: Clock> Build<'_, C> {
                     workspace: &workspace,
                     pair,
                     recipe: self.recipe,
-                    phase: Phase::Health { verification: true },
+                    phase: Phase::Health(HealthPhase::Verification),
                     staged: None,
                     backing: Some(&backing),
+                    vars: Some(handoff),
                     cutoff,
                 },
             )
             .await?;
         self.capture(
+            effects,
             &workspace,
             &verified.release,
             pair,
@@ -654,6 +753,7 @@ impl<C: Clock> Build<'_, C> {
 }
 
 mod checked;
+mod health;
 
 #[cfg(test)]
 #[path = "build_tests.rs"]

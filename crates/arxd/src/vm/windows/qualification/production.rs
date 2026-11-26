@@ -1179,9 +1179,10 @@ impl FinalizedPair {
         slots: PairSlots,
         files: [crate::vm::ArtifactEvidence; 2],
         deadline: Instant,
+        cancel: &Shutdown,
     ) -> Result<(bool, bool), NativeRefusal> {
         self.0
-            .observe(slots, files, deadline)
+            .observe_until(slots, files, deadline, Some(cancel))
             .map_err(|_| NativeRefusal::InstallerPhaseMismatch)
     }
 }

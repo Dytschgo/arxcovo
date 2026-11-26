@@ -2,9 +2,65 @@
 //! offline image helper. Scope recording and teardown stay on the shared
 //! native launch path.
 
+use super::health::{AdmittedProbe, HealthRun, HealthSession, run_health};
 use super::*;
+use crate::vm::runtime::InstallerFailureReason;
 use crate::vm::test_issuer::{Intent, NativeTarget, TestIssuer};
 use crate::vm::windows::qualification::recipe::BootReservation;
+
+/// A held installed boot driven by the shared health runner.
+struct CheckedHealth<'s, 'a> {
+    launch: NativeLaunch<'a>,
+    cancel: &'s Shutdown,
+    fresh: &'s dyn Fn(Instant) -> Result<Instant, Q>,
+    binding: WorkspaceBinding,
+    pair: PairSlots,
+}
+
+impl<'a> HealthSession for CheckedHealth<'_, 'a> {
+    type Release = ReleasedGeneration<'a>;
+
+    fn scope(&self) -> (WorkspaceBinding, PairSlots) {
+        (self.binding, self.pair)
+    }
+
+    async fn boot(&mut self, ready_by: Instant) -> Result<(), Q> {
+        let fresh = self.fresh;
+        self.launch
+            .boot(self.cancel, move || fresh(ready_by), || true)
+            .await
+            .map_err(|failed| failed.reason)
+    }
+
+    async fn exchange(
+        &mut self,
+        probe: AdmittedProbe,
+        by: Instant,
+    ) -> Result<(ScriptStatus, Option<u32>), Q> {
+        let (script, timeout_s) = probe.into_parts();
+        let fresh = self.fresh;
+        self.launch
+            .run_script(script, timeout_s, self.cancel, move || fresh(by), || true)
+            .await
+            .map_err(|failed| failed.reason)
+    }
+
+    async fn stop(self) -> Option<ReleasedGeneration<'a>> {
+        self.launch.stop(self.cancel, || true).await.1
+    }
+}
+
+/// A settled installer failure keeps its typed deadline or native refusal.
+fn installer_refusal(reason: InstallerFailureReason) -> Q {
+    match reason {
+        InstallerFailureReason::Timeout => NativeRefusal::InstallerDeadlineExpired,
+        InstallerFailureReason::Native(refusal) => refusal,
+        InstallerFailureReason::Cancelled
+        | InstallerFailureReason::Protocol(_)
+        | InstallerFailureReason::ReleaseUnverified
+        | InstallerFailureReason::ProcessFailed => PHASE,
+    }
+}
 
 struct Checked<'a, C> {
     qualification: &'a ForegroundQualification<'a>,
@@ -103,6 +159,7 @@ impl<C: Clock> Effects for Checked<'_, C> {
             phase,
             staged,
             backing,
+            vars,
             cutoff,
         } = request;
         if source.binding() != workspace.binding() {
@@ -110,7 +167,7 @@ impl<C: Clock> Effects for Checked<'_, C> {
         }
         let installer = match phase {
             Phase::Install(stage) => Some(stage),
-            Phase::Health { .. } => None,
+            Phase::Health(_) => None,
         };
         let qualified = self.qualification.prepare_boot(BootReservation {
             workspace,
@@ -120,13 +177,14 @@ impl<C: Clock> Effects for Checked<'_, C> {
             identities: pair.evidence.map(|file| file.identity),
             backing,
             staged,
+            vars_content: vars.as_ref().map(|handoff| handoff.content),
         })?;
         let planner = qualified.planner();
         let plan = planner.plan()?;
         let cancel = self.cancel;
         let cancelled = || cancel.is_cancelled();
         let check = |by| launch::check_preparation(by, &cancelled);
-        let fresh = |by| {
+        let fresh = |by: Instant| -> Result<Instant, Q> {
             check(by)?;
             let captured = self.fresh()?;
             check(by)?;
@@ -181,6 +239,9 @@ impl<C: Clock> Effects for Checked<'_, C> {
                 return Err(refusal.reason());
             }
         };
+        // The held launch now excludes writers from a pinned VARS copy until
+        // QEMU opens it after resume.
+        drop(vars);
         let (release, finalized) = match phase {
             Phase::Install(_) => match launch
                 .run_installer(cancel, || fresh(cutoff), || true)
@@ -190,56 +251,37 @@ impl<C: Clock> Effects for Checked<'_, C> {
                     generation,
                     finalization,
                 }) => (generation, finalization.map(Finalized::Native)),
-                Ok(InstallerSettlement::Failed { .. }) => return Err(PHASE),
+                Ok(InstallerSettlement::Failed { failure, .. }) => {
+                    return Err(installer_refusal(failure.reason));
+                }
                 Err(reason) => {
                     let _ = launch.stop(cancel, || true).await;
                     return Err(reason);
                 }
             },
-            Phase::Health { verification } => {
-                launch
-                    .boot(cancel, || fresh(ready_by), || true)
-                    .await
-                    .map_err(|failed| failed.reason)?;
-                // Boot readiness has its own budget. Script preparation and
-                // the guest exchange are bounded by the phase cutoff.
-                let checked = (|| {
-                    check(cutoff)?;
-                    let script = if recipe == self.qualification.evidence().recipes.windows {
-                        self.qualification.windows_health(recipe, verification)?
-                    } else {
-                        crate::vm::template::UBUNTU_DETACHED_HEALTH.to_owned()
-                    };
-                    Ok(script)
-                })();
-                let health = match checked {
-                    Ok(script) => {
-                        // The guest exchange allows its reply five seconds
-                        // past the script timeout.
-                        let health_by = cutoff.min(
-                            Instant::now() + Duration::from_secs(u64::from(SCRIPT_TIMEOUT) + 5),
-                        );
-                        let result = launch
-                            .run_script(
-                                script,
-                                SCRIPT_TIMEOUT,
-                                cancel,
-                                || fresh(health_by),
-                                || true,
-                            )
-                            .await
-                            .map_err(|failed| failed.reason)?;
-                        check(health_by).and_then(|()| {
-                            (result == (ScriptStatus::Exited, Some(0)))
-                                .then_some(())
-                                .ok_or(HEALTH)
-                        })
-                    }
-                    Err(reason) => Err(reason),
+            Phase::Health(health_phase) => {
+                // Boot readiness has its own budget. Probe selection and the
+                // guest exchange are bounded by the phase cutoff.
+                let session = CheckedHealth {
+                    launch,
+                    cancel,
+                    fresh: &fresh,
+                    binding: workspace.binding(),
+                    pair: pair.slots,
                 };
-                let (_, release) = launch.stop(cancel, || true).await;
-                health?;
-                (release.ok_or(PATH)?, None)
+                let run = HealthRun {
+                    recipe,
+                    windows: self.qualification.evidence().recipes.windows,
+                    phase: health_phase,
+                    ready_by,
+                    cutoff,
+                    cancelled: &cancelled,
+                };
+                let release = run_health(session, run, |validation| {
+                    self.qualification.windows_health(recipe, validation)
+                })
+                .await?;
+                (release, None)
             }
         };
         fresh(cutoff)?;
@@ -294,12 +336,10 @@ impl<'q> ForegroundQualification<'q> {
         let (intent, recipe, cwd, primary) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                controller.fail_build_with(
-                    worker,
-                    slots,
-                    false,
-                    Some(FailureReason::StagingFailed),
-                )?;
+                // A cancelled or expired preparation has no proven cause.
+                let cause = (!interrupted(controller, worker, cancel, worker.deadline()))
+                    .then_some(FailureReason::StagingFailed);
+                controller.fail_build_with(worker, slots, false, cause)?;
                 return Err(error);
             }
         };

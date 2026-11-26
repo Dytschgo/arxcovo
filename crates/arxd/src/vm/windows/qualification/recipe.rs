@@ -72,6 +72,9 @@ pub(crate) struct BootReservation<'a> {
     /// A ledger-pinned golden for an installed linked clone.
     pub backing: Option<&'a Artifact>,
     pub staged: Option<&'a StagedInstaller<'a>>,
+    /// The authorized content of an installed boot's VARS copy. The checked
+    /// launch reconfirms it under writer exclusion until QEMU opens it.
+    pub vars_content: Option<ArtifactPin>,
 }
 
 pub(crate) struct QualifiedBoot<'a> {
@@ -350,6 +353,7 @@ impl ForegroundQualification<'_> {
             identities,
             backing,
             staged,
+            vars_content,
         } = reservation;
         let binding = self.check_workspace(workspace)?;
         check_pair(binding, pair)?;
@@ -363,7 +367,7 @@ impl ForegroundQualification<'_> {
             (
                 Some(phase @ (InstallerPhase::UbuntuInstall | InstallerPhase::WindowsSetup)),
                 Some(staged),
-            ) => {
+            ) if vars_content.is_none() => {
                 let issued = &staged.reservation;
                 check_boot_binding(
                     issued.workspace.binding(),
@@ -390,7 +394,8 @@ impl ForegroundQualification<'_> {
                 media.insert(1, artifact(seed_role, &staged.seed)?);
                 (vars_role, staged.vars.verified_content, media)
             }
-            (None | Some(InstallerPhase::WindowsFinalize), None) => {
+            (None, None) => (ArtifactRole::Vars, vars_content, Vec::new()),
+            (Some(InstallerPhase::WindowsFinalize), None) if vars_content.is_none() => {
                 (ArtifactRole::Vars, None, Vec::new())
             }
             _ => return Err(PHASE),

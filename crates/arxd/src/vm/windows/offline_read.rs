@@ -36,6 +36,8 @@ pub(super) struct Budget {
     steps: u64,
     heap_bytes: u64,
     deadline: Instant,
+    /// The owning operation's cancellation, checked with the deadline.
+    stop: Option<crate::service::Shutdown>,
 }
 
 impl Budget {
@@ -62,7 +64,14 @@ impl Budget {
             steps,
             heap_bytes,
             deadline,
+            stop: None,
         }
+    }
+
+    /// Also end the parse promptly when the owning operation is cancelled.
+    pub(super) fn with_stop(mut self, stop: Option<crate::service::Shutdown>) -> Self {
+        self.stop = stop;
+        self
     }
 
     pub(super) fn spend_io(&mut self, size: usize) -> Result<()> {
@@ -86,7 +95,7 @@ impl Budget {
     }
 
     pub(super) fn check_deadline(&self) -> Result<()> {
-        (Instant::now() < self.deadline)
+        (Instant::now() < self.deadline && !stopped(self.stop.as_ref()))
             .then_some(())
             .ok_or(Invalid)
     }
@@ -135,6 +144,18 @@ impl ReleasedPair {
         files: [ArtifactEvidence; 2],
         deadline: Instant,
     ) -> Result<(bool, bool)> {
+        self.observe_until(slots, files, deadline, None)
+    }
+
+    /// As [`ReleasedPair::observe`], also ending both hash passes and the
+    /// offline parse promptly when `stop` is cancelled.
+    pub(in crate::vm) fn observe_until(
+        &self,
+        slots: PairSlots,
+        files: [ArtifactEvidence; 2],
+        deadline: Instant,
+        stop: Option<&crate::service::Shutdown>,
+    ) -> Result<(bool, bool)> {
         if self.slots != slots || files[0].directory != files[1].directory {
             return Err(Invalid);
         }
@@ -147,14 +168,14 @@ impl ReleasedPair {
             .and_then(|total| total.checked_mul(2))
             .filter(|&total| total <= 2 * (MAX_DISK_BYTES + MAX_VARS_BYTES))
             .ok_or(Invalid)?;
-        self.verify(files, deadline, &mut hash_remaining)?;
+        self.verify(files, deadline, stop, &mut hash_remaining)?;
         // Finalize attests the standalone candidate, never a clone.
         let result = ntfs::setup_state(&mut qcow::Image::open(
             &self.readers[0],
             None,
-            Budget::new(deadline),
+            Budget::new(deadline).with_stop(stop.cloned()),
         )?);
-        self.verify(files, deadline, &mut hash_remaining)?;
+        self.verify(files, deadline, stop, &mut hash_remaining)?;
         result
     }
 
@@ -163,6 +184,7 @@ impl ReleasedPair {
         &self,
         files: [ArtifactEvidence; 2],
         deadline: Instant,
+        stop: Option<&crate::service::Shutdown>,
         hash_remaining: &mut u64,
     ) -> Result<()> {
         for (((index, mut file), expected), limit) in self
@@ -183,6 +205,7 @@ impl ReleasedPair {
                 || file_identity(file, false).map_err(|_| Invalid)?.0 != expected.identity
                 || file.metadata().map_err(|_| Invalid)?.len() != expected.pin.size
                 || Instant::now() >= deadline
+                || stopped(stop)
             {
                 return Err(Invalid);
             }
@@ -191,11 +214,12 @@ impl ReleasedPair {
                 BoundedHashRead {
                     file,
                     deadline,
+                    stop,
                     remaining: hash_remaining,
                 },
                 limit,
             );
-            if !matches!(observed, Ok(true)) || Instant::now() >= deadline {
+            if !matches!(observed, Ok(true)) || Instant::now() >= deadline || stopped(stop) {
                 return Err(Invalid);
             }
         }
@@ -207,13 +231,21 @@ impl ReleasedPair {
 struct BoundedHashRead<'a> {
     file: &'a File,
     deadline: Instant,
+    stop: Option<&'a crate::service::Shutdown>,
     remaining: &'a mut u64,
+}
+
+fn stopped(stop: Option<&crate::service::Shutdown>) -> bool {
+    stop.is_some_and(crate::service::Shutdown::is_cancelled)
 }
 
 impl Read for BoundedHashRead<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if Instant::now() >= self.deadline {
             return Err(io::ErrorKind::TimedOut.into());
+        }
+        if stopped(self.stop) {
+            return Err(io::ErrorKind::Interrupted.into());
         }
         let max = buffer
             .len()
@@ -229,6 +261,9 @@ impl Read for BoundedHashRead<'_> {
             .ok_or_else(|| io::Error::other("hash byte budget exhausted"))?;
         if Instant::now() >= self.deadline {
             return Err(io::ErrorKind::TimedOut.into());
+        }
+        if stopped(self.stop) {
+            return Err(io::ErrorKind::Interrupted.into());
         }
         Ok(n)
     }
@@ -272,4 +307,42 @@ fn range(at: u64, size: u64, limit: u64) -> Result<()> {
         .filter(|end| *end <= limit)
         .map(|_| ())
         .ok_or(Invalid)
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use crate::service::Shutdown;
+    use std::io::Write;
+    use std::time::Duration;
+
+    /// Cancelling the owning operation ends the parse budget and an active
+    /// hash read before the deadline.
+    #[test]
+    fn cancellation_ends_hashing_and_the_offline_parse_before_the_deadline() {
+        let cancel = Shutdown::default();
+        let deadline = Instant::now() + Duration::from_secs(600);
+        let budget = Budget::new(deadline).with_stop(Some(cancel.clone()));
+        assert_eq!(budget.check_deadline(), Ok(()));
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&[7u8; 4096]).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut remaining = 8192;
+        let mut reader = BoundedHashRead {
+            file: &file,
+            deadline,
+            stop: Some(&cancel),
+            remaining: &mut remaining,
+        };
+        let mut buffer = [0u8; 1024];
+        assert_eq!(reader.read(&mut buffer).unwrap(), 1024);
+        cancel.cancel();
+        assert_eq!(
+            reader.read(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(budget.check_deadline(), Err(Invalid));
+        // Without a stop the deadline alone still governs.
+        assert_eq!(Budget::new(deadline).check_deadline(), Ok(()));
+    }
 }

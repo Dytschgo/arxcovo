@@ -996,6 +996,16 @@ impl<C: Clock> VmController<C> {
         })
     }
 
+    /// Whether the controller's clock has reached the worker's deadline.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+    )]
+    pub(crate) fn worker_expired(&self, worker: &PendingOperation) -> bool {
+        self.clock.now().monotonic >= worker.deadline
+    }
+
     pub(crate) fn fail_build(
         &self,
         worker: &PendingOperation,

@@ -1986,3 +1986,16 @@ This keeps schema 17 and its write-once digest triggers. The verification
 VARS copy requires the issuer's consumed copy authority for the exact slot
 and content. A failed build ends every lease and writer hold before its
 failure is settled.
+
+Build health uses an explicit phase. Readiness before Finalize validates the
+Setup phase marker and task, and detached verification requires their
+removal, matching the template's installed targets. Each probe dispatch
+consumes a single-use capability bound to the admitted recipe, the phase, the
+launched workspace and pair, and the exact probe bytes and timeout. The
+verification VARS copy stays held without write sharing from its content
+check until the checked launch, whose plan carries the authorized digest and
+keeps writers excluded until QEMU opens the VARS after resume. Capture
+rechecks cancellation and the cutoff inside its transaction, and the seal
+gate rechecks the pre-seal observation's age. Cancellation, the effect cutoff
+and the controller's worker deadline record no failure cause, and an
+installer stage that reaches its own deadline records its timeout.

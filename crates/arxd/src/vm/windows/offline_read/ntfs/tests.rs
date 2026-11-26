@@ -503,6 +503,7 @@ fn hash_reader_refuses_a_byte_beyond_the_budget() {
         file: &file,
         remaining: &mut remaining,
         deadline: Instant::now() + Duration::from_secs(5),
+        stop: None,
     };
     let mut bytes = [0; 3];
     reader.read_exact(&mut bytes).unwrap();

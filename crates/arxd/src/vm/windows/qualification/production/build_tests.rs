@@ -52,6 +52,16 @@ enum Fault {
     /// A genuine permit for different content.
     CopyContent,
     CancelAtCopy,
+    /// Cancellation arrives while capture waits for the store.
+    CancelAtCapture,
+    /// The pre-seal observation ages past freshness before the seal gate.
+    StaleSample,
+    /// The installer stage reaches its own deadline.
+    InstallerTimeout,
+    CancelBeforeStage,
+    /// Something tries to change the verification VARS copy in place
+    /// between the copy and its launch.
+    VarsMutation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -75,6 +85,7 @@ struct Peer<'a> {
     seal_checks: Cell<u32>,
     verification_settled: Cell<bool>,
     origin: native::recovery::Origin,
+    mutation_refused: Cell<Option<bool>>,
 }
 
 impl Peer<'_> {
@@ -206,7 +217,30 @@ impl Peer<'_> {
 
 impl Effects for Peer<'_> {
     fn fresh(&self) -> Result<Instant, Q> {
+        if self.fault == Fault::StaleSample {
+            // Still fresh before the seal transaction, stale inside it.
+            return Ok(Instant::now() - Duration::from_secs(4));
+        }
         self.issuer.refresh()
+    }
+
+    fn crossing(&self, point: &'static str) {
+        match (point, self.fault) {
+            ("capture", Fault::CancelAtCapture) => self.cancel.cancel(),
+            ("copy", Fault::VarsMutation) => {
+                use std::io::Write;
+                let path = self.fx.slot_file(self.slots.verification.vars);
+                match std::fs::OpenOptions::new().write(true).open(path) {
+                    Ok(mut file) => {
+                        // Same object, same length, one changed byte.
+                        file.write_all(b"X").unwrap();
+                        self.mutation_refused.set(Some(false));
+                    }
+                    Err(_) => self.mutation_refused.set(Some(true)),
+                }
+            }
+            _ => {}
+        }
     }
 
     fn stage<'w>(
@@ -326,9 +360,10 @@ impl Effects for Peer<'_> {
 
     async fn boot<'w>(
         &self,
-        request: Boot<'_>,
+        mut request: Boot<'_>,
         workspace: &'w ProductionWorkspace,
     ) -> Result<BootRelease<'w>, Q> {
+        let handoff = request.vars.take();
         let pair = request.pair;
         let installer = match request.phase {
             Phase::Install(stage) => Some(stage),
@@ -339,10 +374,12 @@ impl Effects for Peer<'_> {
             (Some(InstallerPhase::UbuntuInstall), _) => Step::UbuntuInstall,
             (Some(InstallerPhase::WindowsSetup), _) => Step::WindowsSetup,
             (Some(InstallerPhase::WindowsFinalize), _) => Step::WindowsFinalize,
-            (None, Phase::Health { verification: true }) => Step::Verification,
+            (None, Phase::Health(HealthPhase::Verification)) => Step::Verification,
             (None, _) => Step::WindowsHealth,
         };
         self.checked_boot(&request, installer)?;
+        // The child opens its writable VARS after resume.
+        drop(handoff);
         self.record_job(workspace);
         self.steps.borrow_mut().push(step);
         let verify = step == Step::Verification;
@@ -350,6 +387,9 @@ impl Effects for Peer<'_> {
             || verify && self.fault == Fault::VerificationBoot
         {
             return Err(HEALTH);
+        }
+        if self.fault == Fault::InstallerTimeout && installer.is_some() {
+            return Err(NativeRefusal::InstallerDeadlineExpired);
         }
         // Each successful launch writes to the staged pair. The final ledger
         // pins must describe these bytes and not the pre-launch contents.
@@ -455,6 +495,9 @@ impl Effects for Peer<'_> {
         }
         let check = self.seal_checks.get() + 1;
         self.seal_checks.set(check);
+        if check == 1 && self.fault == Fault::StaleSample {
+            std::thread::sleep(Duration::from_millis(1_500));
+        }
         if check == 2 {
             match self.fault {
                 Fault::SealRollback => self.cancel.cancel(),
@@ -492,6 +535,7 @@ struct Outcome {
     verification_settled: bool,
     /// The recorded failure cause, or 0 for none.
     cause: i64,
+    mutation_refused: Option<bool>,
 }
 
 fn request(recipe: &str, digest: Hash, nonce: u32) -> BuildRequest<'_> {
@@ -603,6 +647,7 @@ async fn run(fx: &SweepFixture, windows: bool, fault: Fault, nonce: u32) -> Outc
         seal_checks: Cell::new(0),
         verification_settled: Cell::new(false),
         origin,
+        mutation_refused: Cell::new(None),
     };
     let ledger = Recorder::new(fx.store(), &fx.production.path, slots.pair.disk.generation);
     let ledger_disposal = FaultDisposal::new(
@@ -632,6 +677,9 @@ async fn run(fx: &SweepFixture, windows: bool, fault: Fault, nonce: u32) -> Outc
         ledger
             .fault
             .set(Some(CustodyFault::Before("slot_identified")));
+    }
+    if fault == Fault::CancelBeforeStage {
+        cancel.cancel();
     }
     if fault == Fault::SealSql {
         fx.store()
@@ -680,6 +728,7 @@ async fn run(fx: &SweepFixture, windows: bool, fault: Fault, nonce: u32) -> Outc
         seal_checks: peer.seal_checks.get(),
         verification_settled: peer.verification_settled.get(),
         cause,
+        mutation_refused: peer.mutation_refused.get(),
     }
 }
 
@@ -733,6 +782,55 @@ async fn build_seals_both_recipes_with_observed_charge_and_live_writer_exclusion
     }
 }
 
+/// I06/I15: the authorized verification VARS copy stays writer-excluded
+/// from its content check until the launch, so an in-place change between
+/// copy and launch is refused and the boot uses exactly the copied bytes.
+#[tokio::test]
+async fn build_keeps_the_verification_vars_copy_writer_excluded_until_launch() {
+    for windows in [false, true] {
+        assert_admission_closed();
+        let fx = SweepFixture::new();
+        let outcome = run(&fx, windows, Fault::VarsMutation, 66).await;
+        assert_eq!(outcome.mutation_refused, Some(true), "{windows}");
+        assert_eq!(outcome.status.unwrap(), Status::Succeeded);
+        assert!(outcome.steps.contains(&Step::Verification));
+    }
+}
+
+/// The launch-side content recheck refuses a same-identity in-place change
+/// if writer exclusion were ever lost, and the handed-off pin itself
+/// refuses a writer.
+#[test]
+fn vars_handoff_refuses_an_in_place_change_of_the_same_object() {
+    use std::io::Write;
+    let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    let path = dir.path().join("vars");
+    std::fs::write(&path, VARS).unwrap();
+    let local = LocalPath::parse(path.to_str().unwrap()).unwrap();
+    // A write-sharing pin stands in for a handoff whose exclusion was lost.
+    let pin = PathPin::open(&local, false, true).unwrap();
+    let file = ArtifactEvidence {
+        identity: pin.identity,
+        directory: [0; 16],
+        pin: pin_bytes(VARS),
+    };
+    let handoff = VarsHandoff {
+        pin,
+        content: pin_bytes(VARS),
+    };
+    let by = Instant::now() + Duration::from_secs(5);
+    assert_eq!(handoff.confirm(file, by, &|| false), Ok(()));
+    let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    writer.write_all(b"X").unwrap();
+    drop(writer);
+    assert_eq!(handoff.confirm(file, by, &|| false), Err(PATH));
+    drop(handoff);
+    std::fs::write(&path, VARS).unwrap();
+    let held = PathPin::open(&local, false, false).unwrap();
+    assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+    drop(held);
+}
+
 #[tokio::test]
 async fn build_faults_keep_work_attributed_and_prevent_seal() {
     for fault in [
@@ -759,6 +857,10 @@ async fn build_faults_keep_work_attributed_and_prevent_seal() {
         Fault::SealSql,
         Fault::CopyContent,
         Fault::CancelAtCopy,
+        Fault::CancelAtCapture,
+        Fault::StaleSample,
+        Fault::InstallerTimeout,
+        Fault::CancelBeforeStage,
     ] {
         assert_admission_closed();
         let fx = SweepFixture::new();
@@ -770,6 +872,7 @@ async fn build_faults_keep_work_attributed_and_prevent_seal() {
             seal_checks,
             verification_settled,
             cause,
+            ..
         } = run(&fx, true, fault, 22).await;
         assert!(status.is_err(), "{fault:?}");
         // Staging, installer, health and seal failures keep their proven
@@ -790,13 +893,19 @@ async fn build_faults_keep_work_attributed_and_prevent_seal() {
             | Fault::VerificationHealth
             | Fault::VerificationLineage
             | Fault::VerificationTeardown => Some(FailureReason::HealthFailed),
-            Fault::Finalization | Fault::OverRetained | Fault::SealSql => {
+            Fault::Finalization | Fault::OverRetained | Fault::SealSql | Fault::StaleSample => {
                 Some(FailureReason::SealFailed)
             }
+            Fault::InstallerTimeout => Some(FailureReason::InstallTimedOut),
+            // Cancellation, the controller's worker deadline (SealCutoff) and
+            // a cancelled preparation are interruptions without a cause.
             Fault::CancelDuringStage
             | Fault::CancelAfterRelease
             | Fault::CancelAtCopy
-            | Fault::SealRollback => Some(FailureReason::CleanupUnconfirmed),
+            | Fault::CancelAtCapture
+            | Fault::CancelBeforeStage
+            | Fault::SealRollback
+            | Fault::SealCutoff => Some(FailureReason::CleanupUnconfirmed),
             _ => None,
         };
         if let Some(expected) = expected {
@@ -806,7 +915,10 @@ async fn build_faults_keep_work_attributed_and_prevent_seal() {
             assert!(!exists(&fx.slot_file(slots.verification.vars)), "{fault:?}");
             assert!(exists(&fx.slot_file(slots.verification.disk)), "{fault:?}");
         }
-        if matches!(fault, Fault::OverRetained | Fault::Finalization) {
+        if matches!(
+            fault,
+            Fault::OverRetained | Fault::Finalization | Fault::CancelAtCapture
+        ) {
             // The refused pair never received a durable digest.
             assert_eq!(
                 fx.count(
@@ -818,8 +930,11 @@ async fn build_faults_keep_work_attributed_and_prevent_seal() {
             );
             assert!(!steps.contains(&Step::Verification), "{fault:?}");
         }
-        if fault == Fault::SealSql {
-            assert_eq!(seal_checks, 1);
+        if matches!(fault, Fault::SealSql | Fault::StaleSample) {
+            assert_eq!(seal_checks, 1, "{fault:?}");
+        }
+        if fault == Fault::CancelBeforeStage {
+            assert!(steps.is_empty());
         }
         assert_eq!(
             fx.count("SELECT count(*) FROM vm_templates"),
