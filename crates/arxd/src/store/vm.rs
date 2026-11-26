@@ -686,16 +686,21 @@ impl VmStore {
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn try_live_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        // Live qualification runs on the task responsible for stopping the child.
+        self.db
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("VM state unavailable"))
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn read_host_for_identity(
         &self,
         expected_database: FileIdentity,
         expected_lock: FileIdentity,
     ) -> Result<Id> {
         use std::os::windows::io::AsRawHandle;
-        let mut db = self
-            .db
-            .lock()
-            .map_err(|_| anyhow::anyhow!("VM state unavailable"))?;
+        let mut db = self.try_live_connection()?;
         let main_handle = sqlite_main_handle(&mut db)?;
         ensure!(
             windows_file_identity(main_handle)? == expected_database
@@ -2779,6 +2784,29 @@ pub(crate) use tests::backup_owner_fixture;
 mod tests {
     use super::*;
     use crate::vm::{BUILD_ACTION, static_web::StaticState};
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn live_identity_read_refuses_while_transaction_is_held() -> Result<()> {
+        use std::{os::windows::io::AsRawHandle, sync::mpsc, time::Duration};
+        let dir = private_temp();
+        let store = VmStore::open(dir.path(), NOW)?;
+        let database = windows_file_identity(store._database.as_raw_handle())?;
+        let lock = windows_file_identity(store._lock.as_raw_handle())?;
+        store.read_host_for_identity(database, lock)?;
+        std::thread::scope(|scope| {
+            let guard = store.db.lock().unwrap();
+            let (tx, rx) = mpsc::channel();
+            let store = &store;
+            scope.spawn(move || {
+                let _ = tx.send(store.read_host_for_identity(database, lock).is_err());
+            });
+            let refused = rx.recv_timeout(Duration::from_secs(2));
+            drop(guard);
+            assert_eq!(refused, Ok(true));
+        });
+        Ok(())
+    }
 
     pub(crate) fn backup_owner_fixture()
     -> Result<(tempfile::TempDir, VmStore, crate::vm::compose::Target, Id)> {
