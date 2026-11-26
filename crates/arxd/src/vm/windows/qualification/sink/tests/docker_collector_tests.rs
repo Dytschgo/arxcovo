@@ -3,10 +3,12 @@ use crate::service::Shutdown;
 use crate::vm::paths::Artifact;
 use crate::vm::qemu_args::{BootPurpose, BootRecipe, NETWORK, StaticNetwork};
 use crate::vm::static_web::OriginPortLease;
-use crate::vm::windows::qualification::docker_trial as trial;
+use crate::vm::windows::qualification::{docker_trial as trial, static_compose};
 use arx_guest::docker_trial::{self as wire, Challenge, TrialRequest, TrialResponse};
 use records::{DockerDependencies, Hash, Observation, Record, Stage, StageResult, decode};
 use std::cell::{Cell, RefCell};
+use std::io::Read;
+use std::os::windows::fs::OpenOptionsExt;
 
 const PACKAGES: Hash = [31; 32];
 
@@ -19,6 +21,11 @@ enum Fault {
     WorkspaceLeftover,
     Dirty,
     Late,
+    LateDrain,
+    LateDispose,
+    LateDisposeTrial,
+    WrongStockExecutable,
+    WrongStockFirmware,
     WrongPackages,
     ForeignGuest,
     WrongCompose,
@@ -116,10 +123,29 @@ impl<'a> trial::Host for Host<'a> {
     }
 
     fn stage(&mut self, ticket: trial::Ticket, _: u64) -> Result<Self::Prepared, NativeRefusal> {
-        // The journal is already open with exclusive write access. The
-        // create intent must name the phase before the peer attempts creation.
-        assert!(std::fs::exists(self.journal.as_str()).unwrap());
-        self.trace.borrow_mut().staged.push(ticket.phase);
+        // Read the durable journal before the fake peer stages any leaf.
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(self.journal.as_str())
+            .unwrap();
+        let mut charge = Vec::new();
+        reader.take(256).read_to_end(&mut charge).unwrap();
+        let mut trace = self.trace.borrow_mut();
+        let expected: Vec<u8> = trace
+            .staged
+            .iter()
+            .copied()
+            .chain([ticket.phase])
+            .map(|phase| phase as u8)
+            .collect();
+        let header_bytes = b"ARXDOCKER1".len() + 16 + 32 + 8;
+        assert_eq!(
+            &charge[header_bytes..],
+            expected,
+            "stage intent must already be present"
+        );
+        trace.staged.push(ticket.phase);
         let mut scope = ticket.scope;
         if ticket.phase == trial::Phase::Install {
             match self.fault {
@@ -187,7 +213,7 @@ impl<'a> trial::Host for Host<'a> {
                 assert_eq!(blocks.len(), 3);
             }
             trial::Phase::Install | trial::Phase::Detached => {
-                assert!(plan.image().as_str().ends_with("stock.exe"));
+                assert!(plan.image().as_str().ends_with("qemu-system-x86_64.exe"));
                 assert_eq!(network, [NETWORK]);
                 if ticket.phase == trial::Phase::Install {
                     assert_eq!(plan.kind(), PlanKind::StaticComposeInstaller);
@@ -223,10 +249,18 @@ impl<'a> trial::Host for Host<'a> {
         Ok(peer(ticket.phase, self.fault))
     }
 
-    fn drain(&mut self, ticket: trial::Ticket, _: u64) -> Result<trial::Release, NativeRefusal> {
+    fn drain(
+        &mut self,
+        ticket: trial::Ticket,
+        cutoff: u64,
+    ) -> Result<trial::Release, NativeRefusal> {
         self.trace.borrow_mut().drained.push(ticket.phase);
-        if self.fault == Fault::Late && ticket.phase == trial::Phase::Endpoint {
-            self.time.set(records::MAX_TRIAL_MS + 10);
+        if ticket.phase == trial::Phase::Endpoint {
+            match self.fault {
+                Fault::Late => self.time.set(records::MAX_TRIAL_MS + 10),
+                Fault::LateDrain => self.time.set(cutoff + 1),
+                _ => {}
+            }
         }
         Ok(trial::Release {
             peer: peer(ticket.phase, self.fault),
@@ -242,11 +276,16 @@ impl<'a> trial::Host for Host<'a> {
     fn dispose(
         &mut self,
         scope: trial::Scope,
-        _: u64,
+        cutoff: u64,
     ) -> Result<trial::WorkspaceRelease, NativeRefusal> {
         self.trace.borrow_mut().disposed = true;
-        if self.fault == Fault::WorkspaceLeftover {
-            std::fs::File::create_new(self.orphan.as_str()).unwrap();
+        match self.fault {
+            Fault::WorkspaceLeftover => {
+                std::fs::File::create_new(self.orphan.as_str()).unwrap();
+            }
+            Fault::LateDispose => self.time.set(cutoff + 1),
+            Fault::LateDisposeTrial => self.time.set(records::MAX_TRIAL_MS + 10),
+            _ => {}
         }
         Ok(trial::WorkspaceRelease {
             scope,
@@ -414,7 +453,40 @@ fn collect(fault: Fault) {
     let pin = PathPin::open(&root, true, true).unwrap();
     let volume = pin.identity.volume;
     let custody = trial::Custody::claim(pin, &evidence, sid(&owner)).unwrap();
-    let (dependencies, baseline, _) = docker_fixture(&evidence);
+    let (mut dependencies, baseline, _) = docker_fixture(&evidence);
+    let firmware_bytes = b"reviewed firmware fixture";
+    let inventory = inventory::tests::Fixture::with_payloads(&[
+        (
+            "qemu-system-x86_64.exe",
+            b"reviewed stock executable fixture",
+        ),
+        ("share/edk2-x86_64-code.fd", firmware_bytes),
+    ]);
+    let (distribution, stock_bundle) = inventory
+        .collect_with_receipt(ArtifactPin {
+            size: b"receipt".len() as u64,
+            sha256: records::digest(b"receipt"),
+        })
+        .unwrap();
+    let stock_inputs = static_compose::StockBootInputs::fixture(
+        &stock_bundle,
+        &distribution,
+        ArtifactPin {
+            size: firmware_bytes.len() as u64,
+            sha256: records::digest(firmware_bytes),
+        },
+    );
+    dependencies.stock_inventory = stock_inputs.inventory;
+    let [stock, stock_data, stock_firmware] = stock_inputs.artifacts().unwrap();
+    let wrong_pin = |asset: &Artifact| {
+        let pin = asset.pin().unwrap();
+        asset.clone().with_pin(ArtifactPin {
+            sha256: [99; 32],
+            ..pin
+        })
+    };
+    let wrong_stock = wrong_pin(&stock);
+    let wrong_firmware = wrong_pin(&stock_firmware);
     let rows = baseline
         .files
         .iter()
@@ -430,7 +502,6 @@ fn collect(fault: Fault) {
             })
             .with_pin(ArtifactPin { size: 32, sha256 })
     };
-    let stock = artifact(Qemu, &path, "stock.exe", 1, [1; 32]);
     let patched = artifact(
         PublicEgressQemu,
         &path,
@@ -501,7 +572,11 @@ fn collect(fault: Fault) {
                 BootPurpose::InstalledStaticWeb(&ports[0], StaticNetwork::PublicEgress(&policy)),
             ),
             Install => (
-                &stock,
+                if fault == Fault::WrongStockExecutable {
+                    &wrong_stock
+                } else {
+                    &stock
+                },
                 BootPurpose::UbuntuInstall {
                     iso: &iso,
                     cidata: &seed,
@@ -518,8 +593,16 @@ fn collect(fault: Fault) {
         let i = phase as usize;
         BootRecipe {
             image,
-            data: &data,
-            firmware: &firmware,
+            data: if matches!(phase, Install | Detached) {
+                &stock_data
+            } else {
+                &data
+            },
+            firmware: match phase {
+                Detached if fault == Fault::WrongStockFirmware => &wrong_firmware,
+                Install | Detached => &stock_firmware,
+                _ => &firmware,
+            },
             vars: &vars[i],
             disk: &disks[i],
             disk_header: &header,
@@ -573,6 +656,7 @@ fn collect(fault: Fault) {
         },
         packages: PACKAGES,
         dependencies: dependencies.clone(),
+        stock: stock_inputs,
         custody,
         evidence: &evidence,
         cancel: &Shutdown::default(),
@@ -586,9 +670,20 @@ fn collect(fault: Fault) {
     assert_eq!(trace.staged, trace.drained);
     let unresolved = matches!(
         fault,
-        Fault::Stage | Fault::Scope | Fault::UnknownCreate | Fault::Dirty
+        Fault::Stage
+            | Fault::Scope
+            | Fault::UnknownCreate
+            | Fault::Dirty
+            | Fault::Late
+            | Fault::LateDrain
+            | Fault::WrongStockExecutable
+            | Fault::WrongStockFirmware
     );
-    let retained = unresolved || fault == Fault::WorkspaceLeftover;
+    let retained = unresolved
+        || matches!(
+            fault,
+            Fault::WorkspaceLeftover | Fault::LateDispose | Fault::LateDisposeTrial
+        );
     assert_eq!(trace.disposed, !unresolved);
     assert_eq!(
         std::fs::exists(orphan.as_str()).unwrap(),
@@ -641,12 +736,19 @@ fn collect(fault: Fault) {
     assert_eq!(incomplete["charge_retained"], retained);
     assert_eq!(
         incomplete["late"].as_str(),
-        (fault == Fault::Late).then_some("expired")
+        matches!(
+            fault,
+            Fault::Late | Fault::LateDispose | Fault::LateDisposeTrial
+        )
+        .then_some("expired")
     );
-    if matches!(fault, Fault::Stage | Fault::Scope) {
+    if matches!(
+        fault,
+        Fault::Stage | Fault::Scope | Fault::WrongStockExecutable
+    ) {
         assert_eq!(trace.launched, [PublicFixture]);
     }
-    if fault == Fault::Dirty {
+    if matches!(fault, Fault::Dirty | Fault::WrongStockFirmware) {
         assert_eq!(trace.launched, [PublicFixture, Install]);
     }
 }
@@ -668,12 +770,29 @@ fn docker_collector_requires_clean_release() {
 }
 
 #[test]
-fn docker_collector_retains_staged_crashes_and_refuses_bad_or_late_proofs() {
+fn docker_collector_retains_charge_when_drain_reply_is_late() {
+    collect(Fault::LateDrain);
+    collect(Fault::Late);
+}
+
+#[test]
+fn docker_collector_retains_charge_when_dispose_reply_is_late() {
+    collect(Fault::LateDispose);
+    collect(Fault::LateDisposeTrial);
+}
+
+#[test]
+fn docker_collector_refuses_wrong_stock_pins_before_dispatch() {
+    collect(Fault::WrongStockExecutable);
+    collect(Fault::WrongStockFirmware);
+}
+
+#[test]
+fn docker_collector_retains_staged_crashes_and_refuses_bad_proofs() {
     for fault in [
         Fault::Stage,
         Fault::UnknownCreate,
         Fault::WorkspaceLeftover,
-        Fault::Late,
         Fault::WrongPackages,
         Fault::ForeignGuest,
         Fault::WrongCompose,

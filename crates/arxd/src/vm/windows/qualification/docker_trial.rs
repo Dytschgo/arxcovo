@@ -158,7 +158,8 @@ impl Custody {
             evidence: evidence.scope(),
             workspace: root.identity,
         };
-        let mut journal = sink::create_hidden(&root.leaf, CHARGE_FILE).map_err(|_| REFUSED)?;
+        let mut journal =
+            sink::create_trial_journal(&root.leaf, CHARGE_FILE).map_err(|_| REFUSED)?;
         journal.write_all(b"ARXDOCKER1").map_err(|_| REFUSED)?;
         journal.write_all(&scope.run).map_err(|_| REFUSED)?;
         journal.write_all(&scope.evidence).map_err(|_| REFUSED)?;
@@ -234,7 +235,11 @@ impl Custody {
         Ok(())
     }
 
-    fn settle(&mut self, release: WorkspaceRelease) -> Result<(), NativeRefusal> {
+    fn settle(
+        &mut self,
+        release: WorkspaceRelease,
+        fresh: impl FnOnce() -> bool,
+    ) -> Result<(), NativeRefusal> {
         if release.scope != self.scope || !release.owned_leaves_absent || !release.helpers_joined {
             return Err(REFUSED);
         }
@@ -244,6 +249,9 @@ impl Custody {
             if name == CHARGE_FILE
                 && attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0)
         {
+            return Err(REFUSED);
+        }
+        if !fresh() {
             return Err(REFUSED);
         }
         self.journal.write_all(b"released").map_err(|_| REFUSED)?;
@@ -396,6 +404,7 @@ pub(super) struct Run<'a, H, G, C> {
     pub(super) guest: G,
     pub(super) capture: C,
     pub(super) dependencies: DockerDependencies,
+    pub(super) stock: static_compose::StockBootInputs<'a>,
     pub(super) packages: Hash,
     pub(super) custody: Custody,
     pub(super) evidence: &'a sink::EvidenceDir,
@@ -433,6 +442,9 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
             let recipe = prepared.recipe();
             let plan = phase.plan(&recipe, prepared.dependency_medium())?;
             self.custody.bind(ticket, prepared.scope(), &plan)?;
+            if matches!(phase, Phase::Install | Phase::Detached) {
+                self.stock.require_plan(&plan)?;
+            }
             for (role, observed) in plan.inputs() {
                 let expected = match role {
                     ArtifactRole::PublicEgressQemu => self.dependencies.executable,
@@ -462,17 +474,23 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                 boot.argv(),
             )
         })();
-        let release_cutoff = self.host.clock().mono_ms.saturating_add(RELEASE_BUDGET_MS);
+        let release_start = self.host.clock();
+        let release_cutoff = release_start.mono_ms.saturating_add(RELEASE_BUDGET_MS);
         let release = self.host.drain(ticket, release_cutoff);
-        drop(prepared);
         let peer = spawned.ok_or(REFUSED)?;
-        if !release?.clean(peer) {
+        if !release?.clean(peer)
+            || !release_in_time(
+                self.cancel,
+                release_start,
+                cutoff,
+                release_cutoff,
+                self.host.clock(),
+            )
+        {
             return Err(REFUSED);
         }
+        drop(prepared);
         self.custody.release_uncertain = false;
-        if self.cancel.is_cancelled() || self.host.clock().mono_ms >= cutoff {
-            return Err(NativeRefusal::QualificationMissing);
-        }
         result.map(|proof| (proof, peer))
     }
 
@@ -593,6 +611,7 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
     pub(super) fn run(mut self) -> Result<Outcome, RunError> {
         if self.custody.scope.run != self.evidence.run()
             || self.custody.scope.evidence != self.evidence.scope()
+            || self.stock.inventory != self.dependencies.stock_inventory
             || self
                 .host
                 .measure()
@@ -617,22 +636,33 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
         for &stage in stages(Class::Docker) {
             let start = self.host.clock();
             let result = if stage == Stage::Cleanup {
-                // A failed drain leaves provenance uncertain and keeps the
-                // charge. A fully observed late cleanup can settle storage.
-                if !self.custody.release_uncertain {
-                    let release_cutoff = start.mono_ms.saturating_add(RELEASE_BUDGET_MS);
+                // Settlement may release the charge only while both the
+                // release deadline and the whole trial are still live.
+                if !self.custody.release_uncertain
+                    && !late
+                    && in_time(self.cancel, issued, cutoff, start)
+                {
+                    let release_cutoff =
+                        start.mono_ms.saturating_add(RELEASE_BUDGET_MS).min(cutoff);
                     if let Ok(proof) = self.host.dispose(self.custody.scope, release_cutoff) {
-                        let _ = self.custody.settle(proof);
+                        let _ = self.custody.settle(proof, || {
+                            let now = self.host.clock();
+                            let fresh =
+                                release_in_time(self.cancel, start, cutoff, release_cutoff, now)
+                                    && clocks_agree(issued, now);
+                            late |= !fresh;
+                            fresh
+                        });
                     }
                 }
-                late |= !self.in_time(issued, cutoff, self.host.clock());
+                late |= !in_time(self.cancel, issued, cutoff, self.host.clock());
                 StageResult::Passed(Observation::Cleanup {
                     dispatched_effects: self.custody.dispatched,
                     released: !self.custody.charged,
                     charge_retained: self.custody.charged,
                     late,
                 })
-            } else if passed && self.in_time(issued, cutoff, start) {
+            } else if passed && in_time(self.cancel, issued, cutoff, start) {
                 match self.collect(stage, cutoff, &mut fixture) {
                     Ok(observation) => StageResult::Passed(observation),
                     Err(_) if self.custody.release_uncertain => {
@@ -644,7 +674,7 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                 StageResult::Inconclusive(Diagnostic::PrerequisiteMissing)
             };
             finished = self.host.clock();
-            late |= !self.in_time(issued, cutoff, finished);
+            late |= !in_time(self.cancel, issued, cutoff, finished);
             passed &= result.passes(stage, Origin::Native) && !late;
             let row = Record {
                 contract: CONTRACT,
@@ -742,10 +772,20 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
         }
         Ok(Outcome::Incomplete)
     }
+}
 
-    fn in_time(&self, start: Instant2, cutoff: u64, now: Instant2) -> bool {
-        !self.cancel.is_cancelled() && now.mono_ms < cutoff && clocks_agree(start, now)
-    }
+fn in_time(cancel: &Shutdown, start: Instant2, cutoff: u64, now: Instant2) -> bool {
+    !cancel.is_cancelled() && now.mono_ms < cutoff && clocks_agree(start, now)
+}
+
+fn release_in_time(
+    cancel: &Shutdown,
+    start: Instant2,
+    trial_cutoff: u64,
+    release_cutoff: u64,
+    now: Instant2,
+) -> bool {
+    in_time(cancel, start, trial_cutoff, now) && now.mono_ms < release_cutoff
 }
 
 fn health(

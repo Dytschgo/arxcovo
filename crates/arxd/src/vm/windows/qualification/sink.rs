@@ -766,6 +766,20 @@ pub(super) fn create_hidden(dir: &File, name: &str) -> io::Result<File> {
     )
 }
 
+/// Create the private charge journal with an exclusive writer. Read-only
+/// observers can check the flushed intent while the writer holds the leaf.
+pub(super) fn create_trial_journal(dir: &File, name: &str) -> io::Result<File> {
+    nt_open(
+        dir,
+        name,
+        FILE_GENERIC_WRITE,
+        FILE_ATTRIBUTE_HIDDEN,
+        FILE_SHARE_READ,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    )
+}
+
 /// Open or create one regular, non-reparse entry relative to the held
 /// directory, with no sharing.
 fn open_child(
