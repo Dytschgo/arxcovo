@@ -697,14 +697,6 @@ impl VmStore {
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
-    pub(crate) fn try_live_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        // Live qualification runs on the task responsible for stopping the child.
-        self.db
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("VM state unavailable"))
-    }
-
-    #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn read_host_for_identity(
         &self,
         expected_database: FileIdentity,
