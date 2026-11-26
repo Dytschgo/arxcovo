@@ -256,12 +256,18 @@ PowerShell, and the wrapper in fresh request directories. Nextest shows the
 Unexpected outcomes also print `CI`, `RUNNER_ENVIRONMENT`, `ImageOS` and
 `RUNNER_OS` to explain how the test classified the runner.
 
-On the same hosted Windows images, the test wrapper used by
+On the same hosted Windows images, a separate test-only route tolerates
+exactly `Ok(TimedOut)` in four tests: the wrapper tests
 `wrapper_evaluates_utf8_multiline_with_implicit_success` and
-`wrapper_reports_implicit_error` tolerates exactly `Ok(TimedOut)` and emits
-`KNOWN-ISSUE hosted-windows-powershell-wrapper`. Main run `45754992122`
-recorded both wrapper timeouts. The restricted-identity tests continue to
-fail on timeout. Development-host tests require the expected outcomes.
+`wrapper_reports_implicit_error`, and the restricted-identity tests above.
+Main run `45754992122` recorded all four timeouts. Each family has one outcome
+dispatch (`settle_wrapper_outcome`, `settle_restricted_outcome`) that emits
+`KNOWN-ISSUE hosted-windows-powershell-wrapper` or
+`KNOWN-ISSUE hosted-windows-powershell-restricted-identity` and otherwise
+reaches the strict assertion. The timeout predicate is distinct from the
+`0x80131623` exit-code predicate; they share only the runner gate. A tolerated
+restricted-identity timeout still requires the request directory to be
+removed. Development-host and owner-host tests require the expected outcomes.
 
 Qualification requires an installed service run on the owner's pinned
 Windows 11 guest and is **unverified on real hardware**.
