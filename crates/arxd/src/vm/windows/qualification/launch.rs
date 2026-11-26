@@ -1904,12 +1904,24 @@ pub(super) fn measure_recipes(
     })
 }
 
-pub(super) fn revalidate_assets(held: &Held) -> Result<(), NativeRefusal> {
+pub(super) fn revalidate_assets(held: &Held) -> Result<(), Invalidation> {
     let reason = NativeRefusal::InstallerPhaseUnavailable;
-    let windows = held.windows_recipe.as_ref().map_err(|r| *r)?;
-    let setup = held.windows_setup_vars.as_ref().map_err(|r| *r)?;
-    let ubuntu = held.ubuntu_guest.as_ref().map_err(|r| *r)?;
-    let network = held.network.as_ref().ok_or(reason)?;
+    let windows = held
+        .windows_recipe
+        .as_ref()
+        .map_err(|r| Invalidation::Indeterminate(*r))?;
+    let setup = held
+        .windows_setup_vars
+        .as_ref()
+        .map_err(|r| Invalidation::Indeterminate(*r))?;
+    let ubuntu = held
+        .ubuntu_guest
+        .as_ref()
+        .map_err(|r| Invalidation::Indeterminate(*r))?;
+    let network = held
+        .network
+        .as_ref()
+        .ok_or(Invalidation::Indeterminate(reason))?;
     let assets = [
         &windows.iso,
         &windows.driver_medium,
@@ -1920,27 +1932,66 @@ pub(super) fn revalidate_assets(held: &Held) -> Result<(), NativeRefusal> {
     ]
     .into_iter()
     .chain(windows.driver_files.iter().flatten());
-    let release = held._release.as_ref().ok_or(reason)?;
+    let release = held
+        ._release
+        .as_ref()
+        .ok_or(Invalidation::Indeterminate(reason))?;
     for (pin, expected) in assets.map(|asset| (&asset.pin, asset.expected)).chain(
         network
             .media
             .iter()
             .chain(release)
-            .map(|pin| content(pin).map(|expected| (pin, expected)))
+            .map(|pin| {
+                content(pin)
+                    .map(|expected| (pin, expected))
+                    .map_err(Invalidation::Indeterminate)
+            })
             .collect::<Result<Vec<_>, _>>()?,
     ) {
-        inventory::binding(pin)?;
-        if pin.mutable || pin.leaf.metadata().map_err(|_| reason)?.len() != expected.size {
-            return Err(reason);
-        }
+        revalidate_pinned_asset(pin, expected, reason)?;
     }
-    if !host_dns_servers().is_ok_and(|resolvers| network.witnesses.valid(&resolvers)) {
-        return Err(NativeRefusal::NetworkFenceUnverified);
-    }
+    revalidate_dns_witnesses(&network.witnesses, host_dns_servers)?;
     held.bundle
         .as_ref()
-        .ok_or(reason)?
-        .check(Instant::now() + Duration::from_secs(1))?;
+        .ok_or(Invalidation::Indeterminate(reason))?
+        .check_typed(Instant::now() + Duration::from_secs(1))?;
+    Ok(())
+}
+
+fn revalidate_pinned_asset(
+    pin: &PathPin,
+    expected: ArtifactPin,
+    reason: NativeRefusal,
+) -> Result<(), Invalidation> {
+    revalidate_pinned_asset_with(pin, expected, reason, |file| Ok(file.metadata()?.len()))
+}
+
+fn revalidate_pinned_asset_with(
+    pin: &PathPin,
+    expected: ArtifactPin,
+    reason: NativeRefusal,
+    read_len: impl FnOnce(&File) -> io::Result<u64>,
+) -> Result<(), Invalidation> {
+    inventory::check_binding(pin)?;
+    if pin.mutable {
+        return Err(Invalidation::Confirmed(reason));
+    }
+    let actual_size = read_len(&pin.leaf).map_err(|_| Invalidation::Indeterminate(reason))?;
+    if actual_size != expected.size {
+        return Err(Invalidation::Confirmed(reason));
+    }
+    Ok(())
+}
+
+fn revalidate_dns_witnesses(
+    witnesses: &super::network::Addresses,
+    read_resolvers: impl FnOnce() -> io::Result<Vec<std::net::IpAddr>>,
+) -> Result<(), Invalidation> {
+    let reason = NativeRefusal::NetworkFenceUnverified;
+    let resolvers = read_resolvers().map_err(|_| Invalidation::Indeterminate(reason))?;
+    if !witnesses.valid(&resolvers) {
+        return Err(Invalidation::Confirmed(reason));
+    }
     Ok(())
 }
 
@@ -2482,5 +2533,158 @@ foreach ($case in @(
             permit.check([2; 16], 1, PlanKind::Boot, false),
             Err(NativeRefusal::QualificationMissing)
         );
+    }
+
+    #[test]
+    fn revalidate_assets_confirms_asset_and_dns_drift_and_latches_reverted_changes() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        const ASSET_REFUSAL: NativeRefusal = NativeRefusal::InstallerPhaseUnavailable;
+        const NET_REFUSAL: NativeRefusal = NativeRefusal::NetworkFenceUnverified;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = local(temp.path().to_str().unwrap()).unwrap();
+        let file_path = dir.join("asset.bin").unwrap();
+        let bytes = b"pinned-asset-bytes";
+        std::fs::write(file_path.as_str(), bytes).unwrap();
+        let pin = PathPin::open(&file_path, false, false).unwrap();
+        let expected = ArtifactPin {
+            size: bytes.len() as u64,
+            sha256: [1; 32],
+        };
+        assert_eq!(
+            revalidate_pinned_asset(&pin, expected, ASSET_REFUSAL),
+            Ok(())
+        );
+
+        // Metadata I/O error stays Indeterminate without revoking the epoch.
+        let (io_epoch, sample) = open_test_epoch();
+        assert_eq!(
+            io_epoch.refresh(
+                || {
+                    revalidate_pinned_asset_with(&pin, expected, ASSET_REFUSAL, |_| {
+                        Err(io::Error::other("metadata unavailable"))
+                    })?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Indeterminate(ASSET_REFUSAL))
+        );
+        assert!(!io_epoch.effects_revoked());
+        assert!(
+            io_epoch
+                .refresh(
+                    || {
+                        revalidate_pinned_asset(&pin, expected, ASSET_REFUSAL)?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                )
+                .is_ok()
+        );
+
+        // Measured asset size mismatch latches Confirmed even after revert.
+        let (asset_epoch, sample) = open_test_epoch();
+        assert_eq!(
+            asset_epoch.refresh(
+                || {
+                    revalidate_pinned_asset_with(&pin, expected, ASSET_REFUSAL, |_| {
+                        Ok(expected.size + 1)
+                    })?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Confirmed(ASSET_REFUSAL))
+        );
+        assert!(asset_epoch.effects_revoked());
+        assert_eq!(
+            revalidate_pinned_asset(&pin, expected, ASSET_REFUSAL),
+            Ok(())
+        );
+        assert_eq!(
+            asset_epoch.refresh(
+                || {
+                    revalidate_pinned_asset(&pin, expected, ASSET_REFUSAL)?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Confirmed(NativeRefusal::QualificationMissing))
+        );
+        assert!(asset_epoch.effects_revoked());
+
+        // Mutable pin is Confirmed.
+        let mut mutable_pin = PathPin::open(&file_path, false, false).unwrap();
+        mutable_pin.mutable = true;
+        assert_eq!(
+            revalidate_pinned_asset(&mutable_pin, expected, ASSET_REFUSAL),
+            Err(Invalidation::Confirmed(ASSET_REFUSAL))
+        );
+
+        // DNS witnesses: API failure is Indeterminate (does not revoke),
+        // observed-then-reverted resolver drift latches Confirmed.
+        let witnesses = super::network::Addresses {
+            ipv4: Ipv4Addr::new(192, 0, 2, 10),
+            ipv6: Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 10),
+            dns: Ipv4Addr::new(192, 0, 2, 53),
+        };
+        let expected_dns = vec![IpAddr::V4(witnesses.dns)];
+        let drifted_dns = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        let (dns_io_epoch, sample) = open_test_epoch();
+        assert_eq!(
+            dns_io_epoch.refresh(
+                || {
+                    revalidate_dns_witnesses(&witnesses, || {
+                        Err(io::Error::other("GetNetworkParams failed"))
+                    })?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Indeterminate(NET_REFUSAL))
+        );
+        assert!(!dns_io_epoch.effects_revoked());
+        assert!(
+            dns_io_epoch
+                .refresh(
+                    || {
+                        revalidate_dns_witnesses(&witnesses, || Ok(expected_dns.clone()))?;
+                        Ok(sample)
+                    },
+                    || sample.captured,
+                )
+                .is_ok()
+        );
+
+        let (dns_drift_epoch, sample) = open_test_epoch();
+        assert_eq!(
+            dns_drift_epoch.refresh(
+                || {
+                    revalidate_dns_witnesses(&witnesses, || Ok(drifted_dns.clone()))?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Confirmed(NET_REFUSAL))
+        );
+        assert!(dns_drift_epoch.effects_revoked());
+        assert_eq!(
+            revalidate_dns_witnesses(&witnesses, || Ok(expected_dns.clone())),
+            Ok(())
+        );
+        assert_eq!(
+            dns_drift_epoch.refresh(
+                || {
+                    revalidate_dns_witnesses(&witnesses, || Ok(expected_dns.clone()))?;
+                    Ok(sample)
+                },
+                || sample.captured,
+            ),
+            Err(Invalidation::Confirmed(NativeRefusal::QualificationMissing))
+        );
+        assert!(dns_drift_epoch.effects_revoked());
+        assert_admission_closed();
     }
 }
