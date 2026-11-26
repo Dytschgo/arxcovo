@@ -1186,7 +1186,7 @@ async fn launch_paused<H: Host>(
         bounded(
             cancel,
             cutoff,
-            peer.verify_whpx_diagnosed(|failure| refusal.set(Some(failure))),
+            peer.verify_whpx_diagnosed(cancel, |failure| refusal.set(Some(failure))),
         )
         .await
         .map_err(|error| {
