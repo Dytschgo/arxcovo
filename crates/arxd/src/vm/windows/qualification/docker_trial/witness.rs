@@ -324,7 +324,11 @@ pub(super) fn receivers(
                 flows.push(drift.established.flow);
             }
             (Case::RouteDrift, _) | (_, Some(_)) => return Err(NETWORK),
-            (_, None) => {}
+            (_, None) => {
+                if counts.after_ms >= change.at_ms {
+                    return Err(NETWORK);
+                }
+            }
         }
     }
     let canonical =

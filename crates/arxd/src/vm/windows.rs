@@ -1493,6 +1493,34 @@ impl VmToken {
         Self::derive_for(account, TokenMode::CurrentUser)
     }
 
+    #[cfg(test)]
+    fn test_current_user() -> Self {
+        let token = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
+        let (_, user) = tests::current_user();
+        let logon = token_data(&token, TokenLogonSid).unwrap();
+        assert_eq!(
+            unsafe { (*logon.as_ptr().cast::<TOKEN_GROUPS>()).GroupCount },
+            1
+        );
+        let stats = token_data(&token, TokenStatistics).unwrap();
+        let authentication =
+            unsafe { (*stats.as_ptr().cast::<TOKEN_STATISTICS>()).AuthenticationId };
+        let session = token_data(&token, TokenSessionId).unwrap()[0] as u32;
+        Self {
+            token,
+            account: LocalSid::parse(&user).unwrap(),
+            network: LocalSid::parse("S-1-5-2").unwrap(),
+            system: LocalSid::parse("S-1-5-18").unwrap(),
+            identity: Identity {
+                logon,
+                authentication,
+                session,
+            },
+            mode: TokenMode::CurrentUser,
+            groups: Vec::new(),
+        }
+    }
+
     fn derive_for(account: LocalSid, mode: TokenMode) -> io::Result<Self> {
         let supervisor = process_token(
             unsafe { GetCurrentProcess() },
@@ -4336,7 +4364,7 @@ mod tests {
     }
 
     /// The current TokenUser allocation and its SDDL string form.
-    fn current_user() -> (Vec<usize>, String) {
+    pub(super) fn current_user() -> (Vec<usize>, String) {
         // The pseudo-handle needs no close; the token handle is owned.
         let token = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
         let data = token_data(&token, TokenUser).unwrap();
