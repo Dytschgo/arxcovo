@@ -1729,6 +1729,105 @@ its own write-type check to partition IOCTLs. Paused trial 10 exercises this
 path. If it fails with `E_ACCESSDENIED`, the narrowest known remedy is a
 reviewed restricting-set change.
 
+## 7c amendment — resumable TEST disposal through the lease and directory
+
+Native TEST disposal reuses the v16 `disposal` columns from
+[ADR 0072](0072-vm-store-v16-native-test-custody.md) without adding a new
+migration. Both transient-build disposal (removing the primary `seed` leaf and
+the verification generation before `publish_build`) and the ordinary reaper
+sweep share one typed disposal boundary (`DisposalScope` / `NativeDisposal`).
+
+Every deletion requires durable typed TEST provenance (`vm_native_generations`
+and `vm_native_slots` for the current store host and protocol 1) and scoped
+handle custody:
+
+- **Parent-relative delete open.** Existing `PathPin` and `open_relative` pins
+  omit `FILE_SHARE_DELETE` (preserving the #353 delete-sharing contract).
+  Disposal uses `open_relative_delete` over the same `nt_open_relative`
+  primitive with `FILE_GENERIC_READ | READ_CONTROL | DELETE`, `share = 0`,
+  `FILE_OPEN_REPARSE_POINT` and `OBJ_DONT_REPARSE`, then marks the verified
+  handle with `delete_on_close`. Any competing reader, writer or deleter fails
+  the open with a sharing violation and leaves the object untouched and
+  charged.
+- **Per-slot intent and absence semantics.** Under the held bound workspace,
+  disposal validates the exact leaf identity, stored case, private ACL and
+  `WorkspaceCustody`, commits durable `vm_native_slots.disposal = 'intended'`
+  while still holding the exclusive delete handle, unlinks via that handle,
+  verifies `NotFound` through the same bound parent and name (`observe` with
+  type-agnostic `probe_relative`), and commits `disposal = 'absent'`. On retry
+  or restart, a still-present exact match is retried; a replacement (wrong file
+  ID, wrong node kind, reparse point, hard link, or wrong case/ACL) is
+  quarantined and never deleted. Prior absence is accepted **only** under an
+  exact durable `disposal = 'intended'` checkpoint or a separately proved
+  uncreated reservation (`NeverAttempted` / `Intended -> Absent` with zero
+  identified artifacts and observed `NotFound` under the held parent).
+- **Lease/directory cleanup guard.** Once all slots of a disposed generation
+  are durably absent and bounded handle enumeration (`listing_bounded`) proves
+  `generation.lease` is the sole entry in the generation directory, disposal
+  acquires an in-process per-generation guard (`GenerationGuards`), commits
+  `vm_native_generations.disposal = 'lease'` (durably closing `bound()` and
+  `vm_native_slot_scope` while `vm_native_disposal_order` enforces zero
+  remaining slots), and only then closes the lease handle while keeping the
+  generation directory and enrolled production root pinned. It opens
+  `generation.lease` via `open_relative_delete`, re-verifies identity, case,
+  zero length, private ACL, lock and sole-entry status, deletes it by handle,
+  confirms absence and an empty directory, and commits `disposal = 'directory'`.
+  It then closes the generation directory handle while keeping the enrolled
+  production root and generation guard held, opens the exact generation
+  directory via `open_relative_delete`, re-verifies identity, case, private ACL
+  and empty listing, deletes it by handle, confirms final absence through the
+  held production root, and commits `disposal = 'absent'`. On retry or restart,
+  every resumed `'lease'` or `'directory'` deletion first re-commits the
+  idempotent `intend_lease_disposal` or `intend_directory_disposal` transition
+  so the current `DisposalScope` is re-checked immediately before each handle
+  delete. Unexpected extra siblings refuse before lease deletion and before
+  directory deletion.
+- **Settlement and authority fences.** Final ledger settlement (`settle_cleanup`,
+  `forget_generation` and `publish_build`) revalidates the work and durable
+  `disposal = 'absent'` proof before freeing eligible claims or removing native
+  rows. Recovery-only work, retained active pairs and release-only expiry carry
+  no deletion permit. Static VMs, static roles (`static_disk`, `static_vars`),
+  sealed goldens, backups, foreign objects and legacy rows without native
+  provenance stay outside native deletion authority. Production TEST admission
+  remains closed. Native disposal and empty-workspace cleanup are **unverified
+  on real hardware**.
+
+## 7c amendment — native golden and retired acceptance inventory
+
+The M4 owner-acceptance reader (`crates/arxd/tests/m4_acceptance/ledger.rs` and
+`owner.rs`) aligns with store v16 native custody ([ADR 0072](0072-vm-store-v16-native-test-custody.md))
+and chunk 07 resumable disposal without adding a schema migration or extending
+the public MCP surface:
+
+- **Exact generation and lease inventory.** Quiet preflight and final scans
+  compare the exact expected generation directory set against the selected
+  sealed TEST goldens using bounded handle enumeration before opening
+  unexpected entries. Empty, extra, or lease-only directories are never waived.
+  The root allowlist (`activity.sqlite3`, `activity.lock`, `vault.sqlite3`,
+  `vault.lock`, `vault.sqlite3-journal`), activity sidecar guards, pair
+  byte/SHA-256/qcow2-lineage/charge proofs, and pinned enrolled store binding
+  remain intact. Each native-bound golden counts exactly one `generation.lease`
+  separately from its `disk-<key>` and `vars-<key>` leaves, opened relative to
+  the held generation directory and verified for exact stored case, private
+  owner-only ACL, zero length, single link, no reparse point, matching store
+  volume/production/directory/lease IDs, and a bounded quiescent exclusive open
+  and nonblocking `try_lock`.
+- **Physical retirement proof.** `Ledger::gone` confirms both ledger absence
+  (`vm_generations`, `vm_artifacts`, `vm_native_generations`, `vm_native_slots`)
+  and physical absence of the retired generation directory, its
+  `generation.lease`, and its media leaves through the held production root
+  handle, paired with the existing claim and reconciliation/expiry checks.
+- **Historic row discrimination.** Pre-7c golden rows without
+  `vm_native_generations` / `vm_native_slots` rows and `generation.lease` are
+  explicitly separated from native custody. Read-only historic observation
+  exists only in tests (`observe_historic_preflight` in
+  `crates/arxd/tests/m4_acceptance/ledger.rs`), cannot satisfy native preflight
+  or acceptance eligibility, and never binds silently. Moving onto native
+  custody requires a checked rebuild or re-enrollment into a clean enrolled v16
+  store as documented in [M4 owner-host acceptance](../m4-acceptance.md).
+  Production TEST admission stays closed and the physical owner-host journey
+  remains **unverified on real hardware**.
+
 ## 7c amendment — explicit TEST opt-in, one permit per durable effect
 
 The VM runtime profile gains two optional fields. `execution_profile`
@@ -1770,7 +1869,8 @@ and runs installers only for its own recipe and phase, and runs the
 checked helper. A clone runs only the checked helper, and a script runs
 only the admitted bytes and timeout. The issuer derives each effect's
 identity and ledger slots from its target: a boot's exact disk and VARS
-pair, a Mutate plan's identified helper slot, and none for an
+pair (or `verification_overlay` and VARS for a build's verification
+boot), a Mutate plan's identified helper slot, and none for an
 inspection. It mints one permit per identity. A launch permit binds the
 whole sealed plan, inputs, working directory, pair, helper slot,
 installer phase and deadline, recipe and limits. A staged-write permit
