@@ -317,6 +317,15 @@ class LauncherTests(unittest.TestCase):
             "C13 first phase=promotion-transfer category=assertion "
             "at=m3_activation_linux.rs:766 message=process-exited",
         )
+        self.assertEqual(
+            RUN.JOIN_QUARANTINE,
+            "C13 first phase=join category=assertion "
+            "at=m3_activation_linux.rs:1368 message=join-refused",
+        )
+        self.assertEqual(
+            sorted(RUN.QUARANTINE_NAMES),
+            ["join-refused", "mint-refused", "promotion-transfer-process-exited"],
+        )
 
     def test_clean_signatures_quarantine_and_mutants_stay_red(self):
         mint_cleanup = ("C13 cleanup spawned=3 signaled=3 reaped=3 clean=2 "
@@ -447,6 +456,14 @@ class LauncherTests(unittest.TestCase):
             summary.read_text(encoding="utf-8"),
             "C13 quarantined signature=mint-refused\n"
             "C13 quarantined signature=promotion-transfer-process-exited\n",
+        )
+        marker.write_bytes(b"join-refused\n")
+        self.assertEqual(launch(0), 0)
+        self.assertEqual(
+            summary.read_text(encoding="utf-8"),
+            "C13 quarantined signature=mint-refused\n"
+            "C13 quarantined signature=promotion-transfer-process-exited\n"
+            "C13 quarantined signature=join-refused\n",
         )
         summary.write_bytes(b"")
         marker.unlink()
@@ -647,6 +664,150 @@ class LauncherTests(unittest.TestCase):
         for name, payload in cases:
             with self.subTest(name=name):
                 self.assert_quarantine_refused(payload)
+
+    def test_join_refused_admission_exchange_quarantine(self):
+        # Run 45906354582 attempt 1 (node c) and run 45845285816 attempt 1
+        # (node b). The node letter is paired across the owner line and the
+        # admission-exchange identity diagnostic. It is not a single letter.
+        due_cleanup = ("C13 cleanup spawned=3 signaled=3 reaped=3 clean=2 "
+                       "helpers=17 helpers_reaped=17 helper_unknown=0")
+        archived_cleanup = ("C13 cleanup spawned=2 signaled=1 reaped=2 clean=1 "
+                            "helpers=11 helpers_reaped=11 helper_unknown=0")
+        clean = {"code": 101, "truncated": False, "fixture": "removed", "retained": 0, "unknown": 0}
+
+        def owner(node, action="join", exit_code="8"):
+            return f"C13 owner node={node} action={action} exit={exit_code}"
+
+        def diagnostic(node, stage="admission-exchange", category="identity", companion=True):
+            lines = [f"C13 diagnostic node={node} stage={stage} category={category}"]
+            if companion:
+                lines.append(f"C13 diagnostic node={node} stage=join-admission category=unconfirmed")
+            return ("\n".join(lines) + "\n").encode("ascii")
+
+        incidents = (
+            ("due run", "c", due_cleanup, diagnostic("c")),
+            ("archived run", "b", archived_cleanup, diagnostic("b")),
+            ("identity line alone", "c", due_cleanup, diagnostic("c", companion=False)),
+        )
+        for name, node, cleanup, diag in incidents:
+            with self.subTest(quarantined=name):
+                lines, _ = self.evidence(RUN.JOIN_QUARANTINE, cleanup, owner(node))
+                self.assertEqual(
+                    RUN.quarantine_signature(
+                        RUN.JOIN_QUARANTINE, lines, diagnostic=diag, **clean),
+                    "join-refused",
+                )
+        # The other two signatures ignore stderr. A join diagnostic must not
+        # change their result.
+        mint_cleanup = ("C13 cleanup spawned=3 signaled=3 reaped=3 clean=2 "
+                        "helpers=16 helpers_reaped=16 helper_unknown=0")
+        mint_lines, _ = self.evidence(RUN.MINT_QUARANTINE, mint_cleanup, RUN.MINT_OWNER_QUARANTINE)
+        self.assertEqual(
+            RUN.quarantine_signature(
+                RUN.MINT_QUARANTINE, mint_lines, diagnostic=diagnostic("a"), **clean),
+            "mint-refused",
+        )
+        promotion_lines, _ = self.evidence(RUN.PROMOTION_QUARANTINE, due_cleanup)
+        self.assertEqual(
+            RUN.quarantine_signature(
+                RUN.PROMOTION_QUARANTINE, promotion_lines, diagnostic=diagnostic("c"), **clean),
+            "promotion-transfer-process-exited",
+        )
+
+        lines, _ = self.evidence(RUN.JOIN_QUARANTINE, due_cleanup, owner("c"))
+        other_phase = RUN.JOIN_QUARANTINE.replace("phase=join", "phase=publication")
+        other_phase_lines, _ = self.evidence(other_phase, due_cleanup, owner("c"))
+        other_category = RUN.JOIN_QUARANTINE.replace("category=assertion", "category=spawn")
+        other_category_lines, _ = self.evidence(other_category, due_cleanup, owner("c"))
+        other_at = RUN.JOIN_QUARANTINE.replace(
+            "m3_activation_linux.rs:1368", "m3_activation_linux.rs:1155")
+        other_at_lines, _ = self.evidence(other_at, due_cleanup, owner("c"))
+        other_message = RUN.JOIN_QUARANTINE.replace("message=join-refused", "message=mint-refused")
+        other_message_lines, _ = self.evidence(other_message, due_cleanup, owner("c"))
+        still_join = RUN.JOIN_QUARANTINE.replace("message=join-refused", "message=process-exited")
+        still_join_lines, _ = self.evidence(still_join, due_cleanup, owner("c"))
+        dirty_cleanup = due_cleanup.replace("helper_unknown=0", "helper_unknown=1")
+        dirty_lines, _ = self.evidence(RUN.JOIN_QUARANTINE, dirty_cleanup, owner("c"))
+        mint_owner_lines, _ = self.evidence(RUN.JOIN_QUARANTINE, due_cleanup, owner("c", action="mint"))
+        missing_owner_lines, _ = self.evidence(RUN.JOIN_QUARANTINE, due_cleanup)
+        two_owners, _ = self.evidence(
+            RUN.JOIN_QUARANTINE, due_cleanup, owner("c"), extra=(owner("b"),))
+        stdout_diag, _ = self.evidence(
+            RUN.JOIN_QUARANTINE, due_cleanup, owner("c"),
+            extra=("C13 diagnostic node=c stage=admission-exchange category=identity",),
+        )
+        cases = (
+            ("dirty teardown", RUN.JOIN_QUARANTINE, lines, diagnostic("c"),
+             {**clean, "fixture": "retained", "retained": 8}),
+            ("dirty cleanup", RUN.JOIN_QUARANTINE, dirty_lines, diagnostic("c"), clean),
+            ("other phase", other_phase, other_phase_lines, diagnostic("c"), clean),
+            ("other category", other_category, other_category_lines, diagnostic("c"), clean),
+            ("other diagnostic category", RUN.JOIN_QUARANTINE, lines,
+             diagnostic("c", category="busy"), clean),
+            ("other stage", RUN.JOIN_QUARANTINE, lines,
+             diagnostic("c", stage="admission-reply"), clean),
+            ("other at", other_at, other_at_lines, diagnostic("c"), clean),
+            ("other message", other_message, other_message_lines, diagnostic("c"), clean),
+            ("other phase=join", still_join, still_join_lines, diagnostic("c"), clean),
+            ("owner action", RUN.JOIN_QUARANTINE, mint_owner_lines, diagnostic("c"), clean),
+            ("owner exit", RUN.JOIN_QUARANTINE,
+             self.evidence(RUN.JOIN_QUARANTINE, due_cleanup, owner("c", exit_code="9"))[0],
+             diagnostic("c"), clean),
+            ("diagnostic node mismatch", RUN.JOIN_QUARANTINE, lines, diagnostic("b"), clean),
+            ("missing diagnostic", RUN.JOIN_QUARANTINE, lines, b"", clean),
+            ("diagnostic on stdout", RUN.JOIN_QUARANTINE, stdout_diag, b"", clean),
+            ("duplicate identity", RUN.JOIN_QUARANTINE, lines,
+             diagnostic("c", companion=False) + diagnostic("c", companion=False), clean),
+            ("missing owner", RUN.JOIN_QUARANTINE, missing_owner_lines, diagnostic("c"), clean),
+            ("two owners", RUN.JOIN_QUARANTINE, two_owners, diagnostic("c"), clean),
+            ("timeout", RUN.JOIN_QUARANTINE, lines, diagnostic("c"), {**clean, "code": None}),
+            ("truncated output", RUN.JOIN_QUARANTINE, lines, diagnostic("c"),
+             {**clean, "truncated": True}),
+        )
+        for name, first, evidence, diag, fields in cases:
+            with self.subTest(refused=name):
+                self.assertIsNone(RUN.quarantine_signature(first, evidence, diagnostic=diag, **fields))
+
+        harness = (
+            b"running 1 test\n"
+            b"test c13 ... FAILED\n"
+            b"thread 'c13' panicked at m3_activation_linux.rs:1368:9:\n"
+            b"note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+        )
+        framed = (owner("c") + "\n" + due_cleanup + "\n" + RUN.JOIN_QUARANTINE + "\n").encode("ascii")
+        capture = RUN.Capture()
+        capture.feed(harness + framed)
+        with patch.object(RUN, "write_quarantine_marker") as marker:
+            status, output, roles, commands = self.fixture_campaign(101, capture, diagnostic("c"))
+        self.assertEqual(status, 0)
+        self.assertEqual((roles, commands), (8, 9))
+        line = "C13 quarantined signature=join-refused\n"
+        self.assertIn(line, output)
+        self.assertIn(f"::warning::{line}", output)
+        marker.assert_called_once_with("/tmp/arx-c13-abcdefgh", "join-refused")
+
+        refused_campaigns = (
+            ("dirty teardown", RUN.JOIN_QUARANTINE, due_cleanup, owner("c"), diagnostic("c"), "retained"),
+            ("other category", other_category, due_cleanup, owner("c"), diagnostic("c"), "removed"),
+            ("other diagnostic category", RUN.JOIN_QUARANTINE, due_cleanup, owner("c"),
+             diagnostic("c", category="busy"), "removed"),
+            ("other at", other_at, due_cleanup, owner("c"), diagnostic("c"), "removed"),
+            ("other message", other_message, due_cleanup, owner("c"), diagnostic("c"), "removed"),
+            ("other phase=join", still_join, due_cleanup, owner("c"), diagnostic("c"), "removed"),
+        )
+        for name, first, cleanup, owner_line, diag, role in refused_campaigns:
+            with self.subTest(privileged=name):
+                _, refused_capture = self.evidence(first, cleanup, owner_line)
+                with patch.object(RUN, "write_quarantine_marker") as marker:
+                    status, output, _, _ = self.fixture_campaign(101, refused_capture, diag, role)
+                self.assertEqual(status, 1)
+                self.assertNotIn("quarantined", output)
+                self.assertNotIn("::warning::", output)
+                marker.assert_not_called()
+
+        stage = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        RUN.write_quarantine_marker(stage, "join-refused")
+        self.assertEqual(RUN.read_quarantine_marker(stage), "join-refused")
 
     def test_launcher_timeout_is_not_quarantined(self):
         stage = Path("/tmp/arx-c13-abcdefgh")
