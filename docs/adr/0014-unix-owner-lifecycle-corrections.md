@@ -630,29 +630,42 @@ capture on the owner's Mac mini remains **unverified on real hardware**.
 0, empty stderr and exactly one block whose header is
 `system/com.arxcovo.arxd = {`. Nested blocks must balance by tab depth and only
 top-level lines are read, so a nested `state =` or `path =` line never counts.
-Every top-level line must be `key = value` or `key = {`. The block must contain
-exactly one `path`, `state` and `program` line and one `arguments` block.
+Every top-level line must be `key = value` or `key = {`. `path`, `state` and
+`program` must each appear exactly once as scalars, and `arguments` exactly
+once as a block; uniqueness and shape are checked across scalar and block
+entries before dispatch. The only blank lines allowed are completely empty
+lines between top-level entries. A whitespace-only line, a blank line inside a
+nested block or the argument vector, and anything after the closing `}` except
+one final newline are `Unknown`.
 
-- `Foreign`: the path is not `/Library/LaunchDaemons/com.arxcovo.arxd.plist`,
-  the program is not `/Library/Application Support/Arxcovo/libexec/arxd`, or
-  the argument vector is not exactly that program, `service`, `run`. This
-  meets the empty-profile requirement for domain, label, plist path and
-  program/argv identity.
+- `Unknown` first: a missing, duplicated, wrongly shaped or malformed field,
+  an unbalanced block, trailing content, CR or NUL, or any state string other
+  than those below. The state is validated before identity, so an
+  unrecognized state is never reported as `Foreign`.
+- `Foreign`: a recognized state, but the path is not
+  `/Library/LaunchDaemons/com.arxcovo.arxd.plist`, the program is not
+  `/Library/Application Support/Arxcovo/libexec/arxd`, or the argument vector
+  is not exactly that program, `service`, `run`. This meets the empty-profile
+  requirement for domain, label, plist path and program/argv identity. The
+  CLI reports it as `service-foreign-registration`.
 - `Ours(Running)` for `running`; `Ours(Starting)` for `spawn scheduled` or
   `starting`; `Ours(Stopped)` for `not running` or `waiting`.
-- `Unknown`: a missing, duplicated or malformed field, an unbalanced block,
-  trailing content, CR or NUL, or any other state string.
 
 This grammar has no native fixture of an installed arxd job. Until one is
 captured on the Mac mini, a real loaded job may fail closed as `Unknown`, which
-halts stop and uninstall with `service-manager`. It is never misreported as
-absent.
+returns `service-manager`. It is never misreported as absent. Stop and
+uninstall query launchd before `disable`, before `bootout` and after it; only
+a failure at the first query changes nothing. A later failure leaves the
+partial state that decision 3's halt rules already allow (boot intent
+disabled, or the job booted out with the plist still present).
 
 **Status.** macOS status now also maps (identical plist, `Ours(Starting)`) to
 `starting`, and (identical plist, `Ours(Stopped)`) to `stopped`. Every other
-pair outside the three earlier ones still returns `Manager`. A loaded idle job
-can only arise after a clean exit outside the owner lifecycle, because
-`service stop` boots the job out. `service start` skips `bootstrap` for a
-loaded job, so the owner recovers with `service stop` and then `service
-start`. Plans, gates and the allowlist are unchanged; no `kickstart` vector is
-added.
+pair outside the three earlier ones still returns `Manager`. The `stopped`
+token is therefore ambiguous: it covers an unloaded job with the identical
+plist installed and a loaded job in launchd state `not running` or `waiting`.
+The parser does not read launchd's last exit code, so the token does not say
+why the daemon is not running. `service start` skips `bootstrap` for a loaded
+job, so the owner recovers a loaded, not-running job with `service stop` and
+then `service start`. Plans, gates and the allowlist are unchanged; no
+`kickstart` vector is added.

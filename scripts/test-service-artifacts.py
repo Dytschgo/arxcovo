@@ -15,33 +15,139 @@ OWNER_QUERY = ROOT / "crates/arxd/src/service/owner_query.rs"
 LAYOUT = ROOT / "crates/arxd/src/service/layout.rs"
 
 
-def rust_str_consts(path):
-    """Plain `const NAME: &str = "...";` literals only; no evaluation."""
-    text = path.read_text(encoding="utf-8")
-    return dict(re.findall(r'^(?:pub )?const ([A-Z_]+): &str = "([^"\\]*)";$', text, re.M))
+# Rust char literal such as '"', '\\', '\n' or '\u{7f}'; lifetimes never match.
+CHAR_LITERAL = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]{1,6}\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
+RAW_STRING = re.compile(r'r(#*)"')
+
+
+def strip_rust_comments(text):
+    """Remove // and /* */ comments outside string and char literals."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        boundary = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        raw = RAW_STRING.match(text, i) if boundary else None
+        char = CHAR_LITERAL.match(text, i)
+        if raw:
+            end = text.index('"' + raw.group(1), raw.end())
+            stop = end + 1 + len(raw.group(1))
+            out.append(text[i:stop])
+            i = stop
+        elif char:
+            out.append(char.group(0))
+            i = char.end()
+        elif text[i] == '"':
+            j = i + 1
+            while text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            i = text.find("\n", i)
+            i = n if i < 0 else i
+        elif text.startswith("/*", i):
+            i = text.index("*/", i) + 2
+            out.append(" ")
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def rust_str_consts(text):
+    """Plain `const NAME: &str = "...";` literals only, each defined once."""
+    pairs = re.findall(r'^\s*(?:pub )?const ([A-Z_]+): &str = "([^"\\]*)";$',
+                       strip_rust_comments(text), re.M)
+    names = [name for name, _ in pairs]
+    if len(names) != len(set(names)):
+        raise AssertionError("duplicate string constant")
+    return dict(pairs)
+
+
+def unix_layout_binaries(text):
+    """Binary (first tuple element) and artifact constant of each arm in the
+    active `Layout::unix` match, read from comment-free source."""
+    code = strip_rust_comments(text)
+    body = re.search(r"fn unix\(platform: Platform\) -> Self \{(.*?)\n    \}\n", code, re.S)
+    if body is None:
+        raise AssertionError("Layout::unix not found")
+    arms = re.findall(r'(Platform::Linux|_) => \(\s*"([^"]+)",(?:\s*"[^"]*",){3}\s*super::owner_query::([A-Z_]+),',
+                      body.group(1))
+    if [arm for arm, _, _ in arms] != ["Platform::Linux", "_"]:
+        raise AssertionError("unexpected Layout::unix arms")
+    return {arm: (binary, artifact) for arm, binary, artifact in arms}
+
+
+def require(condition):
+    """Explicit check that survives `python -O`."""
+    if not condition:
+        raise AssertionError("service artifact contract mismatch")
+
+
+def check_contract(owner_query, layout, plist, unit):
+    """Raise AssertionError when manager files and Rust constants disagree."""
+    consts = rust_str_consts(owner_query)
+    require(consts["UNIT_PATH"] == "/etc/systemd/system/" + LINUX.name)
+    require(consts["DROPIN_PATH"] == "/etc/systemd/system/arxd.service.d/50-arxcovo-standard-rights.conf")
+    require(consts["PLIST_PATH"] == "/Library/LaunchDaemons/" + PLIST.name)
+    require(consts["LAUNCHD_LABEL"] == plist["Label"])
+    require(consts["LAUNCHD_TARGET"] == "system/" + plist["Label"])
+    # launchd prefers `Program` over ProgramArguments[0]; the parser expects argv[0].
+    require("Program" not in plist)
+    require(consts["LAUNCHD_PROGRAM"] == plist["ProgramArguments"][0])
+    require(('const LAUNCHD_ARGUMENTS: &[&str] = &[LAUNCHD_PROGRAM, "service", "run"];')
+            in strip_rust_comments(owner_query))
+    require(plist["ProgramArguments"][1:] == ["service", "run"])
+    arms = unix_layout_binaries(layout)
+    exec_start = unit["Service"]["ExecStart"].split(" ")
+    require(arms["Platform::Linux"] == (exec_start[0], "UNIT_PATH"))
+    require(exec_start[1:] == ["service", "run"])
+    require(arms["_"] == (plist["ProgramArguments"][0], "PLIST_PATH"))
+
+
+def read_unit():
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str
+    parser.read_string(LINUX.read_text(encoding="utf-8"))
+    return parser
 
 
 class Artifacts(unittest.TestCase):
+    def inputs(self):
+        return (OWNER_QUERY.read_text(encoding="utf-8"), LAYOUT.read_text(encoding="utf-8"),
+                plistlib.loads(PLIST.read_bytes()), read_unit())
+
     def test_artifacts_match_owner_query_constants(self):
         # The installer embeds these bytes at the owner_query paths, and the
         # launchd parser accepts only this label, plist path and argv.
-        consts = rust_str_consts(OWNER_QUERY)
-        self.assertEqual(consts["UNIT_PATH"], "/etc/systemd/system/" + LINUX.name)
-        self.assertEqual(consts["DROPIN_PATH"],
-                         "/etc/systemd/system/arxd.service.d/50-arxcovo-standard-rights.conf")
-        self.assertTrue((LINUX.parent / pathlib.PurePosixPath(consts["DROPIN_PATH"]).name).is_file())
-        self.assertEqual(consts["PLIST_PATH"], "/Library/LaunchDaemons/" + PLIST.name)
-        plist = plistlib.loads(PLIST.read_bytes())
-        self.assertEqual(consts["LAUNCHD_LABEL"], plist["Label"])
-        self.assertEqual(consts["LAUNCHD_TARGET"], "system/" + plist["Label"])
-        self.assertEqual(consts["LAUNCHD_PROGRAM"], plist["ProgramArguments"][0])
-        self.assertIn('LAUNCHD_ARGUMENTS: &[&str] = &[LAUNCHD_PROGRAM, "service", "run"];',
-                      OWNER_QUERY.read_text(encoding="utf-8"))
-        self.assertEqual(plist["ProgramArguments"][1:], ["service", "run"])
-        # Fixed binary paths in the service layout match both manager files.
-        layout = LAYOUT.read_text(encoding="utf-8")
-        self.assertIn('"/usr/local/libexec/arxcovo/arxd"', layout)
-        self.assertIn('"%s"' % plist["ProgramArguments"][0], layout)
+        check_contract(*self.inputs())
+        self.assertTrue((LINUX.parent / "50-arxcovo-standard-rights.conf").is_file())
+
+    def test_contract_rejects_effective_drift(self):
+        owner_query, layout, plist, unit = self.inputs()
+        linux_bin = '"/usr/local/libexec/arxcovo/arxd",'
+        mac_bin = '"/Library/Application Support/Arxcovo/libexec/arxd",\n                "/Library/Application Support/Arxcovo/config'
+        self.assertEqual(layout.count(linux_bin), 1)
+        self.assertEqual(layout.count(mac_bin), 1)
+        mutations = [
+            # Active binary changed while the old literal survives in a comment.
+            (owner_query, layout.replace(linux_bin, '// "/usr/local/libexec/arxcovo/arxd",\n                "/opt/arxd",'), plist, unit),
+            (owner_query, layout.replace(mac_bin, '/* "/Library/Application Support/Arxcovo/libexec/arxd", */ "/opt/arxd",\n                "/Library/Application Support/Arxcovo/config'), plist, unit),
+            # A conflicting or even identical Program key in the plist.
+            (owner_query, layout, {**plist, "Program": "/opt/arxd"}, unit),
+            (owner_query, layout, {**plist, "Program": plist["ProgramArguments"][0]}, unit),
+            # owner_query constant shadowed only by a comment.
+            (owner_query.replace('pub const LAUNCHD_LABEL: &str = "com.arxcovo.arxd";',
+                                 '// pub const LAUNCHD_LABEL: &str = "com.arxcovo.arxd";\npub const LAUNCHD_LABEL: &str = "com.other";'),
+             layout, plist, unit),
+        ]
+        for index, args in enumerate(mutations):
+            self.assertNotEqual(args[:3], (owner_query, layout, plist), index)
+            with self.assertRaises(AssertionError, msg=index):
+                check_contract(*args)
+        changed = read_unit()
+        changed["Service"]["ExecStart"] = "/opt/arxd service run"
+        with self.assertRaises(AssertionError):
+            check_contract(owner_query, layout, plist, changed)
 
 
     def test_systemd(self):

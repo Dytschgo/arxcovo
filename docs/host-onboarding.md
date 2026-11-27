@@ -159,9 +159,10 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`, ADR 0015):
    `/Library/Application Support/Arxcovo` must stay `0755` so your login can
    reach the endpoint folder. If Gatekeeper quarantines a downloaded binary,
    inspect it before clearing the attribute yourself.
-3. **(admin)** Register the daemon. Install writes the plist, runs `launchctl
-   disable system/com.arxcovo.arxd`, and confirms that `launchctl print`
-   reports the job absent. It does not load or start it.
+3. **(admin)** Register the daemon. Install first checks that the job is not
+   loaded, runs `launchctl disable system/com.arxcovo.arxd`, then writes the
+   plist, and finally confirms that `launchctl print` reports the job absent
+   (`owner_plan.rs`). It does not load or start it.
 
    ```sh
    sudo "/Library/Application Support/Arxcovo/libexec/arxd" service install
@@ -184,16 +185,28 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`, ADR 0015):
    `start` runs `launchctl enable system/com.arxcovo.arxd` and then
    `launchctl bootstrap system /Library/LaunchDaemons/com.arxcovo.arxd.plist`
    when the job is not loaded. macOS status tokens: `not-installed`,
-   `stopped` (not loaded, or loaded but idle), `starting` (`spawn
-   scheduled`), `running`.
+   `stopped`, `starting` (`spawn scheduled` or `starting`), `running`.
+   `stopped` is ambiguous on purpose: it covers both a job that is not loaded
+   while the matching plist is installed, and a loaded job whose launchd state
+   is `not running` or `waiting`. The parser does not read launchd's last exit
+   code, so `stopped` says nothing about why the daemon is not running.
 
-   If `status` keeps printing `stopped` after `start`, the job is loaded but
-   idle after a clean exit; run `service stop` and then `service start`.
-   If `status`, `stop` or `uninstall` prints `arxd: service-manager` while the
-   job is loaded, the real `launchctl print` output did not match the
-   synthetic loaded grammar. That fails closed and changes nothing. Keep the
-   job as it is and report the macOS version; the fix is a reviewed fixture,
-   not a manual workaround.
+   If `status` keeps printing `stopped` after `start`, the job is probably
+   loaded but not running: `start` skips `bootstrap` for a loaded job. Run
+   `service stop` and then `service start`, and check
+   `/Library/Logs/Arxcovo/arxd.log` for why it exited.
+
+   If `status` prints `arxd: service-manager` while the job is loaded, the real
+   `launchctl print` output did not match the synthetic loaded grammar; status
+   changes nothing. `stop` and `uninstall` re-query launchd at several points.
+   A failure at the first query changes nothing, but a later failure can leave
+   a partial stop: `disable` may already have run (the job will not start at
+   boot), or `bootout` may already have stopped the job while the plist stays
+   in place. Rerunning the same command is safe once the cause is fixed.
+   Report the macOS version; the fix is a reviewed fixture, not a manual
+   workaround. `arxd: service-foreign-registration` means launchd reports a
+   job with this label whose plist path, program or arguments differ from
+   Arxcovo's; nothing is changed, and you inspect that job yourself.
 6. Cluster join: not available on macOS in this version. The cluster runtime is
    Linux-only (`cluster/consensus/bound_start.rs`), `--cluster-config` exits
    with the config error on macOS, and the service refuses a `cluster`

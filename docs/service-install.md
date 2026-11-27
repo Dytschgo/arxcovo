@@ -269,11 +269,17 @@ The following lifecycle plans describe Linux/macOS; Windows SCM details follow.
 - On macOS, `owner_query::launchd` accepts absence only as exit 113, empty
   stdout and the exact `Could not find service "com.arxcovo.arxd" in domain for
   system` stderr, pinned from hosted macOS CI evidence and rechecked by a
-  native test on every hosted macOS run. A loaded job must match the fixed
-  plist path, program and arguments; any other output is `service-manager`.
-  The loaded grammar and a root capture on a real Mac remain **unverified on
-  real hardware**. A job that is loaded but idle reports `stopped`; recover it
-  with `service stop` and then `service start`.
+  native test on every hosted macOS run. A well-formed loaded job with a
+  recognized state but a different plist path, program or arguments is
+  `service-foreign-registration`; malformed, ambiguous or unrecognized output
+  is `service-manager`. The loaded grammar and a root capture on a real Mac
+  remain **unverified on real hardware**. On macOS, `stopped` covers both an
+  unloaded job with the plist installed and a loaded job that launchd reports
+  as `not running` or `waiting`; the exit reason is not read. For the loaded
+  case, `service start` skips `bootstrap`, so run `service stop` and then
+  `service start`. A `service-manager` failure after stop or uninstall has run
+  `disable` or `bootout` can leave a partial stop; rerun once the cause is
+  fixed.
 - You do not create `/run/arxcovo` or `/private/var/run/arxcovo` yourself.
   systemd creates the Linux directory at each start, and the service creates
   macOS `.../Arxcovo/run`. If either directory has the wrong owner or mode,

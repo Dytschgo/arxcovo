@@ -296,6 +296,12 @@ fn absent_stderr(label: &str) -> String {
 /// Top-level fields of exactly one `system/<label> = { ... }` block. Nested
 /// blocks must balance by tab depth and are ignored, except the top-level
 /// argument vector, whose entries are compared in order.
+///
+/// Grammar: the only permitted blank lines are completely empty lines between
+/// top-level entries. A whitespace-only line, a blank line inside any nested
+/// block (including the argument vector) and anything after the closing `}`
+/// other than one final newline are Unknown. `path`, `state` and `program`
+/// must be scalars and `arguments` a block, each exactly once.
 fn loaded(text: &str, profile: &LaunchdProfile<'_>) -> Query {
     if text.contains(['\r', '\0']) {
         return Query::Unknown;
@@ -306,13 +312,20 @@ fn loaded(text: &str, profile: &LaunchdProfile<'_>) -> Query {
     }
     let (mut path, mut state, mut program) = (None, None, None);
     let mut arguments: Option<Vec<&str>> = None;
+    let mut seen = [false; 4];
     let mut collecting = false;
     let mut depth = 1usize;
     for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
         if depth == 0 {
+            return Query::Unknown;
+        }
+        if line.is_empty() {
+            if depth == 1 {
+                continue;
+            }
+            return Query::Unknown;
+        }
+        if line.trim().is_empty() {
             return Query::Unknown;
         }
         let tabs = line.bytes().take_while(|b| *b == b'\t').count();
@@ -350,24 +363,28 @@ fn loaded(text: &str, profile: &LaunchdProfile<'_>) -> Query {
         let Some((key, value)) = body.split_once(" = ") else {
             return Query::Unknown;
         };
-        if value == "{" {
-            if key == "arguments" {
-                if arguments.replace(Vec::new()).is_some() {
-                    return Query::Unknown;
-                }
-                collecting = true;
-            }
-            depth += 1;
-            continue;
-        }
-        let slot = match key {
-            "path" => &mut path,
-            "state" => &mut state,
-            "program" => &mut program,
-            _ => continue,
-        };
-        if slot.replace(value).is_some() {
+        let block = value == "{";
+        // Uniqueness and shape of required keys are settled before dispatch,
+        // across both scalar and block entries.
+        let required = ["path", "state", "program", "arguments"]
+            .iter()
+            .position(|k| *k == key);
+        if let Some(index) = required
+            && (std::mem::replace(&mut seen[index], true) || block != (key == "arguments"))
+        {
             return Query::Unknown;
+        }
+        match key {
+            "path" => path = Some(value),
+            "state" => state = Some(value),
+            "program" => program = Some(value),
+            "arguments" => {
+                arguments = Some(Vec::new());
+                collecting = true;
+                depth += 1;
+            }
+            _ if block => depth += 1,
+            _ => {}
         }
     }
     if depth != 0 {
@@ -378,15 +395,17 @@ fn loaded(text: &str, profile: &LaunchdProfile<'_>) -> Query {
     else {
         return Query::Unknown;
     };
+    // An unrecognized state is ambiguous output, never proof of a foreign job.
+    let state = match state {
+        "running" => State::Running,
+        "spawn scheduled" | "starting" => State::Starting,
+        "not running" | "waiting" => State::Stopped,
+        _ => return Query::Unknown,
+    };
     if path != profile.plist || program != profile.program || arguments != profile.arguments {
         return Query::Foreign;
     }
-    match state {
-        "running" => Query::Ours(State::Running),
-        "spawn scheduled" | "starting" => Query::Ours(State::Starting),
-        "not running" | "waiting" => Query::Ours(State::Stopped),
-        _ => Query::Unknown,
-    }
+    Query::Ours(state)
 }
 
 #[cfg(test)]
@@ -834,6 +853,114 @@ mod launchd_profile_tests {
             q(good[..good.len() - 1].to_vec()),
             Query::Ours(State::Running)
         );
+    }
+    #[test]
+    fn review_malformed_loaded_variants_are_unknown() {
+        let exit0 = LaunchdTermination::Exited(0);
+        let good = String::from_utf8(ours("running", "")).unwrap();
+        assert_eq!(
+            observe(exit0, good.as_bytes(), b""),
+            Query::Ours(State::Running)
+        );
+        let program = LAUNCHD_PROGRAM;
+        let argv_open = "\targuments = {\n";
+        let mut variants = vec![
+            // Whitespace-only or empty lines inside the argument vector.
+            good.replacen(argv_open, &format!("{argv_open}\t\t\n"), 1),
+            good.replacen(argv_open, &format!("{argv_open}\t\t \n"), 1),
+            good.replacen(argv_open, &format!("{argv_open}\n"), 1),
+            good.replacen("\t\trun\n", "\t\trun\n\t\t\n", 1),
+            // Blank lines inside another nested block.
+            good.replacen(
+                "\tdefault environment = {\n",
+                "\tdefault environment = {\n\n",
+                1,
+            ),
+            // Whitespace-only line at top level.
+            good.replacen("\ttype = LaunchDaemon\n", "\ttype = LaunchDaemon\n\t\n", 1),
+            good.replacen("\ttype = LaunchDaemon\n", "\ttype = LaunchDaemon\n \n", 1),
+            // Trailing blank or whitespace lines after the closing brace.
+            format!("{good}\n"),
+            format!("{good}\t\n"),
+            format!("{good} \n"),
+            format!("{good}\n\n"),
+        ];
+        // Block-valued required scalars, alone or duplicating the scalar.
+        for (key, line) in [
+            ("path", format!("\tpath = {PLIST_PATH}\n")),
+            ("state", "\tstate = running\n".to_owned()),
+            ("program", format!("\tprogram = {program}\n")),
+        ] {
+            let block = format!("\t{key} = {{\n\t\tx\n\t}}\n");
+            variants.push(good.replacen(&line, &format!("{line}{block}"), 1));
+            variants.push(good.replacen(&line, &format!("{block}{line}"), 1));
+            variants.push(good.replacen(&line, &block, 1));
+        }
+        // Scalar-valued arguments, alone or duplicating the block.
+        let argv_block = format!("{argv_open}\t\t{program}\n\t\tservice\n\t\trun\n\t}}\n");
+        assert!(good.contains(&argv_block));
+        for replacement in [
+            format!("{argv_block}\targuments = {program}\n"),
+            format!("\targuments = {program}\n{argv_block}"),
+            format!("\targuments = {program}\n"),
+        ] {
+            variants.push(good.replacen(&argv_block, &replacement, 1));
+        }
+        for variant in variants {
+            assert_ne!(variant, good);
+            assert_eq!(
+                observe(exit0, variant.as_bytes(), b""),
+                Query::Unknown,
+                "{variant:?}"
+            );
+        }
+    }
+    #[test]
+    fn unknown_state_is_never_reported_as_foreign() {
+        let exit0 = LaunchdTermination::Exited(0);
+        for state in ["exited", "", "Running"] {
+            for bytes in [
+                print(
+                    "/Library/LaunchDaemons/other.plist",
+                    state,
+                    LAUNCHD_PROGRAM,
+                    LAUNCHD_ARGUMENTS,
+                    "",
+                ),
+                print(
+                    PLIST_PATH,
+                    state,
+                    "/usr/local/bin/arxd",
+                    LAUNCHD_ARGUMENTS,
+                    "",
+                ),
+                print(
+                    PLIST_PATH,
+                    state,
+                    LAUNCHD_PROGRAM,
+                    &["/tmp/arxd", "service", "run"],
+                    "",
+                ),
+                print(
+                    "/Library/LaunchDaemons/other.plist",
+                    state,
+                    "/x",
+                    &["/x"],
+                    "",
+                ),
+            ] {
+                assert_eq!(observe(exit0, &bytes, b""), Query::Unknown, "{state:?}");
+            }
+        }
+        // A recognized state with a mismatched identity is still Foreign.
+        let foreign = print(
+            "/Library/LaunchDaemons/other.plist",
+            "waiting",
+            "/x",
+            &["/x"],
+            "",
+        );
+        assert_eq!(observe(exit0, &foreign, b""), Query::Foreign);
     }
     #[test]
     fn probe_label_only_changes_the_expected_absence_label() {
