@@ -29,7 +29,31 @@ pub(crate) struct FixtureQualification {
 }
 
 impl FixtureQualification {
+    /// Gives objects this process creates from now on the token user as
+    /// owner, as the service does before creating any object
+    /// (`set_current_token_owner`). Production custody, `StorePins::open`
+    /// and `NativeRecovery` expect that owner. An elevated runner otherwise
+    /// stamps new objects with its default owner, Administrators, and each
+    /// check then refuses the workspace. The call is a no-op where
+    /// TokenOwner is already TokenUser. nextest runs each test in its own
+    /// process, so the change never reaches another test.
+    pub(crate) fn create_as_token_user() {
+        crate::service::windows::set_current_token_owner().expect("TokenOwner = TokenUser");
+        let token = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
+        let owner = token_data(&token, TokenOwner).unwrap();
+        let user = token_data(&token, TokenUser).unwrap();
+        // Both buffers stay alive across the comparison of their interior SIDs.
+        let same = unsafe {
+            windows_sys::Win32::Security::EqualSid(
+                (*owner.as_ptr().cast::<TOKEN_OWNER>()).Owner,
+                user_sid(&user),
+            )
+        };
+        assert_ne!(same, 0, "new objects must get the token user as owner");
+    }
+
     pub(crate) fn open(root: &Path, now: Instant) -> Self {
+        Self::create_as_token_user();
         let production =
             PathPin::open(&local(root.to_str().unwrap()).unwrap(), true, false).unwrap();
         let assets = tempfile::tempdir().unwrap();

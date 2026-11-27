@@ -322,6 +322,14 @@ fn inventory(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<
         .collect()
 }
 
+/// The private state root, created after the process's default owner is the
+/// token user, as in the service. Every later object, from the vault to each
+/// generation workspace, is then owned as production custody expects, also
+/// on an elevated runner whose TokenOwner is Administrators.
+fn fixture_root() -> tempfile::TempDir {
+    FixtureQualification::create_as_token_user();
+    crate::service::application::tests::private_temp()
+}
 fn fixture_recipes() -> crate::vm::qualification_record::TestRecipes {
     use crate::vm::test_issuer::SelectedSource;
     let source = crate::vm::test_issuer::tests::FakeSource::new(Instant::now());
@@ -330,7 +338,7 @@ fn fixture_recipes() -> crate::vm::qualification_record::TestRecipes {
 
 #[tokio::test]
 async fn closed_and_opted_in_foreground_use_the_same_native_two_golden_ledger() {
-    let dir = crate::service::application::tests::private_temp();
+    let dir = fixture_root();
     let root = dir.path();
     let now = Arc::new(AtomicI64::new(UTC));
     let recipes = fixture_recipes();
@@ -765,7 +773,7 @@ fn tick(now: &Arc<AtomicI64>, origin: Instant) -> tokio::task::JoinHandle<()> {
 /// receipt instead of entering recovery.
 #[tokio::test]
 async fn closed_admission_withdraws_witness_and_settles_exact_owner_stop() {
-    let dir = crate::service::application::tests::private_temp();
+    let dir = fixture_root();
     let root = dir.path();
     let now = Arc::new(AtomicI64::new(UTC));
     let (supervisor, origin) = fixture_foreground(root, &now);
@@ -858,7 +866,7 @@ async fn closed_admission_withdraws_witness_and_settles_exact_owner_stop() {
 /// refused, audited, as unqualified rather than unknown.
 #[tokio::test]
 async fn selected_dispatch_refuses_a_static_vm_as_unqualified() {
-    let dir = crate::service::application::tests::private_temp();
+    let dir = fixture_root();
     let root = dir.path();
     let now = Arc::new(AtomicI64::new(UTC));
     let (supervisor, _) = fixture_foreground(root, &now);
