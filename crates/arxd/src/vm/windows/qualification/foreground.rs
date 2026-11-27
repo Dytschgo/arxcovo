@@ -227,6 +227,10 @@ impl ReadDossier {
         inventory::binding(&self.0)
     }
 
+    pub(super) fn path(&self) -> &LocalPath {
+        &self.0.path
+    }
+
     pub(super) fn seal(&self) -> Result<File, NativeRefusal> {
         self.verify()?;
         self.open_file("qualification.json")

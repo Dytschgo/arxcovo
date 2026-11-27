@@ -5,6 +5,10 @@
     reason = "consumed by the Part B disposable collector and foreground adapter"
 )]
 
+mod enrollment;
+mod reviewed_network;
+mod route_watch;
+
 use super::*;
 use crate::vm::{
     Id,
@@ -88,35 +92,168 @@ impl PreparedStaticDossier {
 
     pub(crate) fn select(
         &self,
-        fresh: Result<DockerFresh<'_>, NativeRefusal>,
+        m4: &ForegroundQualification,
     ) -> Result<StaticDossier, NativeRefusal> {
         self.verify()?;
-        StaticDossier::open(self.root.clone(), &self.selection, &fresh?)
+        m4.fresh()?;
+        let enrollment_file = self
+            .enrollment
+            .reopen_without_writer()
+            .map_err(|_| REFUSAL)?;
+        let bytes = read_bounded(&enrollment_file, MAX_ENROLLMENT_BYTES).map_err(|_| REFUSAL)?;
+        let enrollment: enrollment::Enrollment =
+            serde_json::from_slice(&bytes).map_err(|_| REFUSAL)?;
+        if enrollment.class != crate::vm::qualification_record::Class::Docker {
+            return Err(REFUSAL);
+        }
+        let witness = enrollment.network_witness.file();
+        let reviewed = hold_file(witness.path, witness.pin, reviewed_network::MAX_BYTES)
+            .map_err(|_| NativeRefusal::NetworkFenceUnverified)?;
+        if !sink::held_private(&reviewed.leaf, m4.owner())
+            || [self.root.path(), &m4.production_root().path]
+                .into_iter()
+                .any(|root| root.overlaps(witness.path))
+        {
+            return Err(NativeRefusal::NetworkFenceUnverified);
+        }
+
+        // Seed rendering needs a nonzero build ID. Selection uses the
+        // stable recipe ID only; builders render a new seed for their generation.
+        let recipe = enrollment.recipe.hold(m4, [1; 16])?;
+        let held = HeldDockerInputs::hold(
+            &DockerInputEnrollment {
+                release: &enrollment.release,
+                runtime_profile: enrollment.runtime_profile.file(),
+                policy: &local(&enrollment.policy)?,
+                stock_bundle: &local(&enrollment.stock_bundle)?,
+                patched_bundle: &local(&enrollment.patched_bundle)?,
+                fixture_image: enrollment.fixture_image.file(),
+                fixture_network_profile: enrollment.fixture_network_profile.file(),
+                receiver_inventory: enrollment.receiver_inventory.file(),
+                probe_image: enrollment.probe_image.file(),
+                topology: enrollment.topology.file(),
+                origin_profile: enrollment.origin_profile.file(),
+            },
+            self.root.path(),
+            CollectMode::Foreground(&m4.store),
+            &m4.held.token,
+            m4.held.scope.as_ref().ok_or(REFUSAL)?,
+            &recipe,
+        )?;
+        let public_targets = reviewed_network::verify(
+            &held_bytes(&reviewed, reviewed_network::MAX_BYTES)?,
+            self.selection.seal_sha256,
+            m4.seal_sha256(),
+            recipe.recipe.identity.recipe_sha256,
+            measured(&held.policy)?,
+            held.patched.review.qemu.sha256,
+            &held.parsed_policy,
+        )?;
+        let (dependencies, watch) = held.measure_live(&public_targets)?;
+        let fresh = DockerFresh {
+            now: boot::now(),
+            boot_marker: boot::marker()?,
+            dependencies: &dependencies,
+        };
+        let (evidence, rows) = self.read_measured(&fresh)?;
+        recipe.require_selected(&evidence)?;
+        let selected = StaticDossier {
+            root: self.root.clone(),
+            _rows: rows,
+            evidence,
+            seal_sha256: self.selection.seal_sha256,
+            watch,
+            policy: held.parsed_policy,
+            policy_file: held.policy,
+            reviewed,
+            public_targets,
+            dependencies,
+            token: m4.held.token.clone(),
+            patched: held.patched,
+            stock: held.stock,
+            release: held.release,
+            inputs: [
+                held.profile,
+                held.receiver_inventory,
+                held.topology,
+                held.origin_profile,
+            ],
+            fixture: held.fixture,
+            recipe,
+        };
+        selected.require_current()?;
+        Ok(selected)
+    }
+
+    pub(super) fn read_measured(
+        &self,
+        fresh: &DockerFresh<'_>,
+    ) -> Result<(VerifiedDockerEvidence, Vec<File>), NativeRefusal> {
+        self.verify()?;
+        self.root
+            .read_selected_docker(&self.selection, fresh)
+            .map_err(|_| REFUSAL)
     }
 }
 
 pub(crate) struct StaticDossier {
-    _root: Arc<foreground::ReadDossier>,
+    root: Arc<foreground::ReadDossier>,
     _rows: Vec<File>,
     pub(crate) evidence: VerifiedDockerEvidence,
     pub(crate) seal_sha256: Hash,
+    watch: route_watch::RouteWatch,
+    policy: PublicEgressPolicy,
+    policy_file: PathPin,
+    reviewed: PathPin,
+    public_targets: [std::net::Ipv4Addr; 2],
+    dependencies: DockerDependencies,
+    token: Arc<VmToken>,
+    patched: inventory::PatchedBundle,
+    stock: inventory::Bundle,
+    release: [PathPin; 2],
+    inputs: [PathPin; 4],
+    fixture: [PathPin; 3],
+    recipe: ComposeInstallerInputs,
 }
 
 impl StaticDossier {
-    pub(super) fn open(
-        root: Arc<foreground::ReadDossier>,
-        selection: &DockerSelection,
-        fresh: &DockerFresh<'_>,
-    ) -> Result<Self, NativeRefusal> {
-        let (evidence, rows) = root
-            .read_selected_docker(selection, fresh)
-            .map_err(|_| REFUSAL)?;
-        Ok(Self {
-            _root: root,
-            _rows: rows,
-            evidence,
-            seal_sha256: selection.seal_sha256,
-        })
+    pub(crate) fn require_current(&self) -> Result<(), NativeRefusal> {
+        self.watch.require_current()?;
+        self.root.verify()?;
+        self.recipe.recheck()?;
+        inventory::binding(&self.patched.bundle.root)?;
+        inventory::binding(&self.stock.root)?;
+        for file in self.release.iter().chain(&self.inputs).chain(&self.fixture) {
+            recheck_file(file)?;
+        }
+        for file in [&self.policy_file, &self.reviewed] {
+            recheck_file(file).map_err(|_| NativeRefusal::NetworkFenceUnverified)?;
+            require_held_private(&file.leaf).map_err(|_| NativeRefusal::NetworkFenceUnverified)?;
+        }
+        self.token
+            .verify_current_profile()
+            .map_err(|error| NativeRefusal::from(error.into_invalidation()))?;
+        let expected = &self.dependencies.host;
+        if expected.windows_build != platform()?
+            || expected.windows_revision != windows_revision()?
+            || expected.machine != machine_guid()?
+        {
+            return Err(REFUSAL);
+        }
+        let binding = self.evidence.seal().binding;
+        let issued = binding.issued_on_boot(boot::marker()?).ok_or(REFUSAL)?;
+        let now = boot::now();
+        let key = self.dependencies.key(binding.scope).ok_or(REFUSAL)?;
+        if !binding.live_at(now.utc, key)
+            || !crate::vm::qualification_record::clocks_agree(issued, now)
+        {
+            return Err(REFUSAL);
+        }
+        self.watch.require_baseline(
+            &self.policy,
+            &self.public_targets,
+            self.dependencies.topology,
+        )
     }
 }
 
@@ -618,6 +755,9 @@ impl<'a> HeldDockerInputs<'a> {
         let config =
             crate::config::VmRuntimeProfile::parse(&held_bytes(&profile, MAX_ENROLLMENT_BYTES)?)
                 .map_err(|_| REFUSAL)?;
+        if !config.enabled() {
+            return Err(REFUSAL);
+        }
         let policy = private_input(
             EnrolledFile {
                 path: enrollment.policy,
@@ -696,6 +836,22 @@ impl<'a> HeldDockerInputs<'a> {
             &held_bytes(&self.receiver_inventory, MAX_INVENTORY_BYTES)?,
             [measured(image)?, measured(network)?, measured(probe)?],
         )
+    }
+
+    /// Arm notifications before the first observation. The returned watch
+    /// belongs to the same observation and remains closed after drift.
+    pub(super) fn measure_live(
+        &self,
+        public_targets: &[std::net::Ipv4Addr],
+    ) -> Result<(DockerDependencies, route_watch::RouteWatch), NativeRefusal> {
+        let watch = route_watch::RouteWatch::arm(&self.parsed_policy)?;
+        let (route, topology) = watch.observe(&self.parsed_policy, public_targets)?;
+        let dependencies = self.measure(&route, topology)?;
+        if watch.observe(&self.parsed_policy, public_targets)? != (route, topology) {
+            return Err(NativeRefusal::NetworkFenceUnverified);
+        }
+        watch.require_current()?;
+        Ok((dependencies, watch))
     }
 
     /// Recheck independent inputs before selecting or writing evidence. The

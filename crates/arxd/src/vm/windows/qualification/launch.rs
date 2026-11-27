@@ -1699,7 +1699,7 @@ pub(super) async fn run_windows(
     })
 }
 
-fn ubuntu_test_recipe(pins: [ArtifactPin; 7]) -> crate::vm::UbuntuRecipe {
+pub(super) fn ubuntu_test_recipe(pins: [ArtifactPin; 7]) -> crate::vm::UbuntuRecipe {
     use crate::vm::UbuntuRecipe;
     use sha2::{Digest, Sha256};
     let [

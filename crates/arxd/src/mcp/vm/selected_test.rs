@@ -137,7 +137,7 @@ impl SelectedTest {
         self.native_source().test_host()
     }
 
-    fn native_source(&self) -> &ForegroundQualification {
+    pub(super) fn native_source(&self) -> &ForegroundQualification {
         #[cfg(not(test))]
         return self.source();
         #[cfg(test)]
