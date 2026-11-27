@@ -1814,18 +1814,19 @@ impl VmInventory {
             };
             return self.refuse(action, request.vm(), reason);
         }
-        if let Some(reason) = self.supervisor.static_refusal() {
-            let static_effect = match request.work {
-                Work::StaticCreate(_) => true,
-                Work::Build => self.supervisor.recipes[3].is_some_and(|(id, _)| id == request.id),
-                Work::Start | Work::Stop | Work::Script(..) => !controller
-                    .foreground_static_rows(&self.principal, Some(request.id), None, 1)?
-                    .is_empty(),
-                _ => false,
-            };
-            if static_effect {
-                return self.refuse(action, request.vm(), Fault::new(native_reason(reason)));
+        let static_effect = match request.work {
+            Work::StaticCreate(_) => true,
+            Work::Build => {
+                request.id == WEB_RECIPE_ID
+                    || self.supervisor.recipes[3].is_some_and(|(id, _)| id == request.id)
             }
+            Work::Start | Work::Stop | Work::Script(..) | Work::Extend(_) => !controller
+                .foreground_static_rows(&self.principal, Some(request.id), None, 1)?
+                .is_empty(),
+            _ => false,
+        };
+        if static_effect {
+            return self.static_effect(gate, action, request, digest);
         }
         // A current TEST run owner serves its scripts on the owned channel.
         #[cfg(all(windows, target_arch = "x86_64"))]
@@ -1843,6 +1844,28 @@ impl VmInventory {
             return selected.dispatch(self, gate, action, request);
         }
         let _ = gate;
+        self.refuse(
+            action,
+            request.vm(),
+            Fault::new(native_reason(self.supervisor.native_refusal)),
+        )
+    }
+
+    fn static_effect(
+        &self,
+        gate: &mut Gate,
+        action: i64,
+        request: Mutation,
+        digest: Option<[u8; 32]>,
+    ) -> Outcome<Value> {
+        if let Some(reason) = self.supervisor.static_refusal() {
+            return self.refuse(action, request.vm(), Fault::new(native_reason(reason)));
+        }
+        #[cfg(test)]
+        if let Some(fixture) = &mut gate.fixture {
+            return fixture.admit(self, action, request, digest);
+        }
+        let _ = (gate, digest);
         self.refuse(
             action,
             request.vm(),
@@ -2163,18 +2186,21 @@ impl VmInventory {
             .map(|value| self.decode_cursor(tool, value))
             .transpose()?;
         let mut capability = self.supervisor.capability(gate);
+        let mut recipes = self.supervisor.recipes.map(|entry| entry.map(|(id, _)| id));
+        let mut static_available = false;
         if tool == ToolName::Catalog {
             if let Some(reason) = self.supervisor.static_refusal() {
                 capability["static_compose"] =
                     json!({"available":false,"reason":native_reason(reason)});
-            }
-            if let Some(selected) = self.supervisor.static_selection() {
+                recipes[3] = None;
+            } else if let Some(selected) = self.supervisor.static_selection() {
+                static_available = true;
+                capability["static_compose"] = json!({"available":true});
                 capability["selected_static_qualification"] = selected.catalog();
             }
         }
         let controller = &self.supervisor.controller;
         let available = capability["available"] == true;
-        let recipes = self.supervisor.recipes.map(|entry| entry.map(|(id, _)| id));
         let mut rows: Vec<((u8, Id), Value)> = if tool == ToolName::Catalog {
             controller
                 .foreground_catalog(
@@ -2187,9 +2213,7 @@ impl VmInventory {
                 .map(|entry| {
                     let buildable =
                         if self.supervisor.recipes[3].is_some_and(|(id, _)| id == entry.id) {
-                            self.supervisor
-                                .static_selection()
-                                .is_some_and(|selected| selected.buildable())
+                            static_available
                         } else {
                             available
                                 && self
@@ -13752,11 +13776,49 @@ pub(crate) mod tests {
         refused(&supervisor, "vm_run_script", script);
         refused(&supervisor, "publish_site", args(6));
 
-        // B1 never registers a native Compose recipe. Supply one only here
-        // to exercise the build guard after the known-recipe precheck.
-        Arc::get_mut(&mut supervisor).unwrap().recipes[3] =
-            Some((compose.recipe_id, Some(compose.recipe_sha256)));
+        // A measured fixture opens the selection. Once that observation
+        // retires, neither the catalog nor fresh admissions can use it.
+        Arc::get_mut(&mut supervisor)
+            .unwrap()
+            .install_static_selection(Ok(selected_static::FixtureStaticQualification::select()))
+            .unwrap();
+        let catalog = dispatch(&supervisor, "vm_catalog", json!({})).unwrap();
+        assert_eq!(catalog["capability"]["static_compose"]["available"], true);
+        assert_eq!(
+            catalog["capability"]["selected_static_qualification"]["compose_recipe"]["recipe_id"],
+            compose_id,
+        );
+        assert!(
+            catalog["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["recipe_id"] == compose_id && entry["state"] == "buildable" })
+        );
+
+        supervisor
+            .static_selection()
+            .unwrap()
+            .retire_fixture_network();
+        let catalog = dispatch(&supervisor, "vm_catalog", json!({})).unwrap();
+        assert_eq!(
+            catalog["capability"]["static_compose"]["reason"],
+            "network_fence_unverified"
+        );
+        assert!(
+            catalog["capability"]
+                .get("selected_static_qualification")
+                .is_none()
+        );
+        assert!(
+            catalog["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| { entry["recipe_id"] != compose_id })
+        );
         refused(&supervisor, "vm_template_build", build(7));
+        refused(&supervisor, "publish_site", args(8));
         supervisor
             .controller
             .store_for_test()
@@ -15786,6 +15848,10 @@ pub(crate) mod tests {
                     .contains(&json!({"recipe_id":id,"guest":"ubuntu","state":"buildable"}))
             );
             assert_eq!(
+                catalog["capability"]["static_compose"],
+                json!({"available":true}),
+            );
+            assert_eq!(
                 catalog["capability"]["selected_static_qualification"]["compose_recipe"],
                 json!({"recipe_id":id,"recipe_sha256":hex::encode(selected.recipe_sha256)}),
             );
@@ -15945,6 +16011,11 @@ pub(crate) mod tests {
         ]);
         let (vm, fake) = enrolled_multi(&h, &a, 4100, false, profile.clone()).await;
         let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+
+        let mut script = args(4109);
+        script["script"] = json!("exit 0");
+        let refused = call(&a, "vm_run_script", script).await;
+        assert_eq!(refused["reason"], "disabled", "{refused}");
 
         // Policy off refuses with zero connector starts and zero DNS effects.
         let refused = call(&a, "publish_site", args(4110)).await;

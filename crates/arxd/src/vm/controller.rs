@@ -2322,7 +2322,17 @@ fn static_target(
                 return Ok(Err(Refusal::Busy));
             }
         }
-        (Operation::Stop | Operation::Script { .. }, StaticState::Running) => {}
+        (Operation::Script { .. }, StaticState::Running) => {
+            let template: Id = db.query_row(
+                "SELECT template FROM vm_static_instances WHERE id=?1",
+                [request.vm],
+                |row| row.get(0),
+            )?;
+            if store::static_vm::is_compose_template(db, template)? {
+                return Ok(Err(Refusal::Disabled));
+            }
+        }
+        (Operation::Stop, StaticState::Running) => {}
         (Operation::Snapshot { .. } | Operation::Restore { .. }, _) => {
             return Ok(Err(Refusal::NotFound));
         }

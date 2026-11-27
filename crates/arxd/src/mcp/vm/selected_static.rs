@@ -59,7 +59,16 @@ impl SelectedStatic {
             #[cfg(all(windows, target_arch = "x86_64"))]
             Source::Native(_) => false,
             #[cfg(test)]
-            Source::Fixture(_) => true,
+            Source::Fixture(ref fixture) => fixture.network_live.load(Ordering::Acquire),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn retire_fixture_network(&self) {
+        match &self.0 {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            Source::Native(_) => panic!("expected fixture selection"),
+            Source::Fixture(fixture) => fixture.network_live.store(false, Ordering::Release),
         }
     }
 
@@ -75,6 +84,7 @@ impl SelectedStatic {
 
 #[cfg(test)]
 pub(super) struct FixtureStaticQualification {
+    network_live: AtomicBool,
     seal_sha256: Hash,
     evidence: VerifiedDockerEvidence,
 }
@@ -86,6 +96,7 @@ impl FixtureStaticQualification {
 
         let closure = [0x71; 32];
         SelectedStatic(Source::Fixture(Self {
+            network_live: AtomicBool::new(true),
             seal_sha256: [0x70; 32],
             evidence: VerifiedDockerEvidence::recipe_fixture(DockerRecipe {
                 identity: DockerRecipe::identity(closure),
