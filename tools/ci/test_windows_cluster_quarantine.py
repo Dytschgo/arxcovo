@@ -18,7 +18,16 @@ TLS_NON_WINDOWS_GATE = (
     '#[cfg_attr(\n    not(target_os = "windows"),\n    ignore = "'
     + TLS_NON_WINDOWS_REASON + '"\n)]\n'
 )
-TLS_FIXTURE = ['enrolled_target_binding_revocation_and_stale_acceptance', TLS_SENDER_MISMATCH, 'store_lock_wait_does_not_block_runtime']
+TLS_STORE_LOCK = 'store_lock_wait_does_not_block_runtime'
+TLS_STORE_LOCK_MACOS_REASON = (
+    'ADR 0056 macOS single-case quarantine: main run 45906354582 attempt 1 '
+    '([DIAG-3n] lag=288@738 ticks=10 cand=Cpu)'
+)
+TLS_STORE_LOCK_MACOS_GATE = (
+    '#[cfg_attr(\n    target_os = "macos",\n    ignore = "'
+    + TLS_STORE_LOCK_MACOS_REASON + '"\n)]\n'
+)
+TLS_FIXTURE = ['enrolled_target_binding_revocation_and_stale_acceptance', TLS_SENDER_MISMATCH, TLS_STORE_LOCK]
 TLS_REQUIRED = ['live_verifier_does_not_retain_store_and_poison_refuses', 'founder_joiner_mutual_tls_real_identities', 'learner_catch_up_gives_joiner_own_registry']
 TLS_PURE = ['tls_single_node_directory_precondition']
 MEMBERSHIP_UNSAMPLED = ['interrupted_joint_exact_guarded_flatten']
@@ -154,12 +163,14 @@ def assert_real_identity_body(source):
 
 def assert_tls_engine_quarantine(source):
     assert_real_identity_body(source)
-    # Strip only the pinned exception, then apply the unchanged Windows fixture rules.
     windows_gate = '#[cfg_attr(\n    target_os = "windows",\n    ignore = "' + REASON_FIXTURE + '"\n)]\n'
     windows_binding = windows_gate + 'async fn ' + TLS_SENDER_MISMATCH + '('
     binding = TLS_NON_WINDOWS_GATE + windows_binding
     assert source.count(binding) == 1
-    assert_fixture_quarantine(source.replace(binding, windows_binding, 1),
+    macos_binding = TLS_STORE_LOCK_MACOS_GATE + windows_gate + 'async fn ' + TLS_STORE_LOCK + '('
+    assert source.count(TLS_STORE_LOCK_MACOS_GATE) == source.count(macos_binding) == 1
+    stripped = source.replace(binding, windows_binding, 1).replace(TLS_STORE_LOCK_MACOS_GATE, '', 1)
+    assert_fixture_quarantine(stripped,
                               ((TLS_FIXTURE, REASON_FIXTURE),), TLS_PURE, required=TLS_REQUIRED)
     segments = re.split(r'(?m)^((?:async )?fn [a-z0-9_]+\()', source)
     constructors = []
@@ -346,6 +357,25 @@ class QuarantineTests(unittest.TestCase):
                 self.assertNotEqual(mutant, source)
                 with self.assertRaises(AssertionError):
                     assert_tls_engine_quarantine(mutant)
+
+    def test_exact_macos_store_lock_quarantine(self):
+        source = (ROOT / 'crates/arxd/src/cluster/consensus/tls_engine_tests.rs').read_text(encoding='utf-8')
+        assert_tls_engine_quarantine(source)
+        gate = TLS_STORE_LOCK_MACOS_GATE
+        required = 'async fn ' + TLS_REQUIRED[0] + '('
+        extra = source.replace(required, gate + required, 1)
+        mutants = [
+            source.replace(gate, ''), extra.replace(gate, '', 1), extra,
+            source.replace(TLS_STORE_LOCK_MACOS_REASON, 'unapproved reason'),
+            source.replace(gate, gate.replace(' = "' + TLS_STORE_LOCK_MACOS_REASON + '"', '')),
+        ]
+        for predicate in ('target_os = "linux"', 'not(target_os = "linux")',
+                          'any(target_os = "macos", target_os = "linux")', 'all()'):
+            mutants.append(source.replace(gate, gate.replace('target_os = "macos"', predicate)))
+        for mutant in mutants:
+            self.assertNotEqual(mutant, source)
+            with self.assertRaises(AssertionError):
+                assert_tls_engine_quarantine(mutant)
 
     def test_exact_windows_only_quarantine(self):
         base = ROOT / "crates/arxd/src/cluster/consensus"
