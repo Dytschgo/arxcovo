@@ -88,12 +88,17 @@ test('activity: filters and paging', async ({ page }) => {
   await expect(page.getByRole('list', { name: 'Activity, page 2' })).toBeVisible();
   await page.getByLabel('Host', { exact: true }).selectOption('forge');
   await page.getByRole('group', { name: 'Outcome' }).getByRole('button', { name: 'failed' }).click();
-  const items = page.getByRole('list', { name: 'Activity, page 1' }).getByRole('listitem');
+  const list = page.getByRole('list', { name: 'Activity, page 1' });
+  const items = list.getByRole('listitem');
+  // The host-only page (11 forge rows) can still be on screen while the
+  // host+outcome query loads, so wait for the exact filtered count (6 failed
+  // forge rows in the fixtures) and check every row with retrying locators
+  // instead of a one-time items.all() snapshot.
+  await expect(items).toHaveCount(6);
   await expect(items.first()).toBeVisible();
-  for (const item of await items.all()) {
-    await expect(item).toHaveAttribute('data-outcome', 'failed');
-    await expect(item).toContainText('forge');
-  }
+  await expect(list.locator('li:not([data-outcome="failed"])')).toHaveCount(0);
+  // String form is case-sensitive, like the per-row toContainText it replaces.
+  await expect(items).toContainText(Array<string>(6).fill('forge'));
 });
 
 test('terminal: run, stream, exit, history and a refused tool', async ({ page }) => {
