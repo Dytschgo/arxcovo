@@ -1394,7 +1394,8 @@ pub(crate) fn retry_time(db: &Connection, now: i64) -> Result<i64> {
     )?)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+/// The retry clock's high water as [`retry_time`] would return it, without
+/// advancing it, for reads such as an operation poll.
 fn retry_time_readonly(db: &Connection, now: i64) -> Result<i64> {
     Ok(db.query_row(
         "SELECT max(high_water_ms,?1) FROM vm_retry_clock",
@@ -1626,7 +1627,9 @@ pub(crate) fn operation_status(
     operation: Id,
     now: i64,
 ) -> Result<Option<OperationStatus>> {
-    let now = retry_time(db, now)?;
+    // A poll never writes: no journal or flush holds the store lock that
+    // nonblocking TEST workers and monitors try.
+    let now = retry_time_readonly(db, now)?;
     Ok(db
         .query_row(
             // Only immutable ledger evidence names a template. A legacy clone

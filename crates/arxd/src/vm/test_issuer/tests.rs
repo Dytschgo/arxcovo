@@ -1565,3 +1565,71 @@ fn build_verification_boot_and_installer_stage_are_bound() {
     assert!(check_installer(PlanKind::Boot, Some((live.phase(), live.deadline()))).is_err());
     assert_admission_closed();
 }
+
+/// A background permit rides out a transient hold of the store lock, such
+/// as a concurrent operation poll, and the epoch stays current.
+#[test]
+fn intent_rides_out_transient_store_contention() {
+    let fixture = Fixture::new();
+    let issuer = fixture.issuer();
+    let (worker, target) = fixture.script();
+    let store = fixture.ctl.store_for_test();
+    let held = std::sync::Barrier::new(2);
+    let minted = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            store
+                .read_only(|_| {
+                    held.wait();
+                    std::thread::sleep(Duration::from_millis(60));
+                    Ok(())
+                })
+                .unwrap()
+        });
+        held.wait();
+        issuer.intent(&worker, target, &fixture.cancel).is_ok()
+    });
+    assert!(minted, "transient store contention refused the intent");
+    assert!(!issuer.epoch().effects_revoked());
+    assert_admission_closed();
+}
+
+/// The contention retry ends at once on cancellation or on a revoked
+/// selection epoch, instead of spinning to its bound.
+#[test]
+fn contention_retry_stops_at_cancellation_or_revocation() {
+    for revoke in [false, true] {
+        let fixture = Fixture::new();
+        let issuer = fixture.issuer();
+        let (worker, target) = fixture.script();
+        if revoke {
+            fixture.fault(Some(Confirmed(REFUSED)));
+            assert!(issuer.refresh().is_err());
+            fixture.fault(None);
+            assert!(issuer.epoch().effects_revoked());
+        } else {
+            fixture.cancel.cancel();
+        }
+        let store = fixture.ctl.store_for_test();
+        let held = std::sync::Barrier::new(2);
+        let elapsed = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                store
+                    .read_only(|_| {
+                        held.wait();
+                        std::thread::sleep(CONTENTION_BUDGET * 2);
+                        Ok(())
+                    })
+                    .unwrap()
+            });
+            held.wait();
+            let began = Instant::now();
+            assert!(issuer.intent(&worker, target, &fixture.cancel).is_err());
+            began.elapsed()
+        });
+        assert!(
+            elapsed < CONTENTION_BUDGET / 5,
+            "revoke={revoke}: {elapsed:?}"
+        );
+    }
+    assert_admission_closed();
+}

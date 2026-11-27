@@ -421,28 +421,32 @@ impl SelectedTest {
                     }
                 };
                 let cutoff = lease_cutoff(ctl, lease);
+                let principal = principal.to_owned();
                 gate.spawn_test_worker(supervisor, registration, move |supervisor, runtime| {
                     let selected = installed(supervisor)?;
+                    let ctl = &supervisor.controller;
                     #[cfg(test)]
                     if let Source::Fixture(source) = selected.source() {
-                        return runtime.block_on(source.clone_test(
-                            &supervisor.controller,
+                        let result = runtime.block_on(source.clone_test(
+                            ctl,
                             selected,
                             worker,
                             slots,
                             cutoff,
                             &supervisor.cancel,
                         ));
+                        return settled(ctl, &principal, reference.id, result);
                     }
-                    runtime.block_on(selected.native_source().clone_test(
-                        &supervisor.controller,
+                    let result = runtime.block_on(selected.native_source().clone_test(
+                        ctl,
                         selected,
                         worker,
                         slots,
                         size,
                         cutoff,
                         &supervisor.cancel,
-                    ))
+                    ));
+                    settled(ctl, &principal, reference.id, result)
                 });
                 Ok(receipt(reference.id, Some(lease)))
             }

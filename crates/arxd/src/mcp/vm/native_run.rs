@@ -16,7 +16,10 @@ use crate::{
             WorkspaceBinding,
         },
         runtime::ScriptAuthority,
-        test_issuer::{Installation, NativeTarget, SelectedSource, TestIssuer},
+        test_issuer::{
+            CONTENTION_BUDGET, Installation, NativeTarget, SelectedSource, TestIssuer,
+            retry_contended_async,
+        },
     },
 };
 use arx_guest::ScriptStatus;
@@ -844,7 +847,20 @@ impl Run {
             slots: start.active.pair.0,
             evidence: start.active.pair.1,
         };
-        let expected = binding(controller.native_workspace_scope(self.target.generation)?);
+        let stopped = || self.cancel.is_cancelled() || supervisor.cancel.is_cancelled();
+        let revoked = || issuer.epoch().effects_revoked();
+        let Ok(scope) = retry_contended_async(&stopped, &revoked, || {
+            controller.native_workspace_scope(self.target.generation)
+        })
+        .await
+        else {
+            // No workspace was touched. Hand the committed epoch to recovery
+            // instead of failing the worker, which would fence all TEST
+            // admission.
+            self.hand_off(supervisor).await;
+            return Ok(());
+        };
+        let expected = binding(scope);
         let workspace = qualification.hold_start_workspace(expected);
         if let Ok(workspace) = workspace {
             // An already spent preparation window refuses at the first check.
@@ -863,9 +879,11 @@ impl Run {
                     .map_err(fail)?;
                 let (slots, evidence) = start.active.golden.ok_or_else(|| fail(PATH))?;
                 let golden = binding(
-                    controller
-                        .native_workspace_scope(slots.disk.generation)
-                        .map_err(|_| fail(PATH))?,
+                    retry_contended_async(&stopped, &revoked, || {
+                        controller.native_workspace_scope(slots.disk.generation)
+                    })
+                    .await
+                    .map_err(|_| fail(PATH))?,
                 );
                 let backing = qualification
                     .hold_start_workspace(golden)
@@ -1220,15 +1238,26 @@ impl Run {
             return false;
         };
         let cancelled = || self.cancel.is_cancelled() || supervisor.cancel.is_cancelled();
+        // A refused observation or ledger read may be transient store
+        // contention: observe again, bounded. Loss stays loss once the
+        // contention budget is spent; cancellation ends it at once.
+        let contended_until = Instant::now() + CONTENTION_BUDGET;
         loop {
-            if !live() {
+            if live() {
+                if let Ok(_gate) = supervisor.gate.try_lock() {
+                    match supervisor.controller.finish_native_start(
+                        worker,
+                        &self.principal,
+                        self.target,
+                        cancelled,
+                    ) {
+                        Ok(committed) => return committed && self.publish(id, supervisor),
+                        Err(_) if Instant::now() >= contended_until => return false,
+                        Err(_) => {}
+                    }
+                }
+            } else if Instant::now() >= contended_until {
                 return false;
-            }
-            if let Ok(_gate) = supervisor.gate.try_lock() {
-                return supervisor
-                    .controller
-                    .finish_native_start(worker, &self.principal, self.target, cancelled)
-                    .is_ok_and(|committed| committed && self.publish(id, supervisor));
             }
             if cancelled() || Instant::now() + GATE_RETRY >= worker.deadline() {
                 return false;
@@ -1273,7 +1302,7 @@ impl Run {
         }
     }
 
-    async fn hand_off(&self, supervisor: &Supervisor) {
+    pub(super) async fn hand_off(&self, supervisor: &Supervisor) {
         while supervisor.controller.fence_native_run(self.target).is_err() {
             tokio::select! {
                 biased;

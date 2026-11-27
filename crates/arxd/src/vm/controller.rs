@@ -552,7 +552,7 @@ impl<C: Clock> VmController<C> {
         if validate_principal(principal).is_err() {
             return Ok(Err(Refusal::NotFound));
         }
-        self.store.transact(|db| {
+        self.store.read_only(|db| {
             Ok(
                 store::operation_status(db, principal, id, utc(self.clock.now())?)?
                     .ok_or(Refusal::NotFound),
@@ -2777,7 +2777,7 @@ impl<C: Clock> VmController<C> {
                     "SELECT g.id,t.recipe_digest FROM vm_generations g
                      JOIN vm_instances v ON v.id=g.vm_id
                      JOIN vm_templates t ON t.id=v.template
-                     WHERE v.id=?1 AND g.active=1",
+                     WHERE v.id=?1 AND g.active=1 AND g.static_id IS NULL",
                     [vm],
                     |row| Ok((row.get::<_, Id>(0)?, row.get::<_, [u8; 32]>(1)?)),
                 )

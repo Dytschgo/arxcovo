@@ -2,7 +2,7 @@ use super::*;
 use crate::store::vm::{native::Origin, snapshot::Work};
 use crate::vm::{
     ClonePublication, FailureReason, HostObservation, PendingOperation, Resources, VmController,
-    test_issuer::{NativeTarget, SelectedSource, TestIssuer},
+    test_issuer::{NativeTarget, SelectedSource, TestIssuer, retry_contended},
 };
 use clone::{CheckedOverlay, CloneRequest, stage_linked_clone};
 use snapshot::{
@@ -70,8 +70,10 @@ impl ForegroundQualification {
                     .ok_or(NativeRefusal::PathCustodyUnverified)
             },
             |golden| {
-                let scope = controller
-                    .native_workspace_scope(golden.slots().disk.generation)
+                let scope =
+                    retry_contended(&cancelled, &|| issuer.epoch().effects_revoked(), || {
+                        controller.native_workspace_scope(golden.slots().disk.generation)
+                    })
                     .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
                 self.hold_golden(
                     &ledger,

@@ -39,12 +39,51 @@ use serde_json::{Value, json};
 use std::{
     ops::Deref,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 const REFUSED: NativeRefusal = NativeRefusal::QualificationMissing;
 /// One worker's intent names at most this many distinct effects.
 const MAX_EFFECTS: usize = 16;
+/// A background worker's preparation or permit call rides out transient
+/// store contention, such as a concurrent `vm_operation` poll, for at most
+/// this long. Monitors keep their single nonblocking sample.
+pub(crate) const CONTENTION_BUDGET: Duration = Duration::from_millis(500);
+const CONTENTION_RETRY: Duration = Duration::from_millis(5);
+
+/// Retries `attempt` through transient refusal until it succeeds, the
+/// worker is cancelled, the selection epoch is revoked or
+/// [`CONTENTION_BUDGET`] passes, and returns the last result.
+pub(crate) fn retry_contended<T, E>(
+    cancelled: &dyn Fn() -> bool,
+    revoked: &dyn Fn() -> bool,
+    mut attempt: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let deadline = Instant::now() + CONTENTION_BUDGET;
+    loop {
+        let result = attempt();
+        if result.is_ok() || cancelled() || revoked() || Instant::now() >= deadline {
+            return result;
+        }
+        std::thread::sleep(CONTENTION_RETRY);
+    }
+}
+
+/// [`retry_contended`] for a worker's async preparation.
+pub(crate) async fn retry_contended_async<T, E>(
+    cancelled: &dyn Fn() -> bool,
+    revoked: &dyn Fn() -> bool,
+    mut attempt: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let deadline = Instant::now() + CONTENTION_BUDGET;
+    loop {
+        let result = attempt();
+        if result.is_ok() || cancelled() || revoked() || Instant::now() >= deadline {
+            return result;
+        }
+        tokio::time::sleep(CONTENTION_RETRY).await;
+    }
+}
 
 /// Only this module can construct it, so only a consumed permit yields an
 /// effect authority.
@@ -427,10 +466,18 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         slots: &[ArtifactSlot],
         inspection: Option<InspectionBinding>,
     ) -> Result<(), NativeRefusal> {
-        self.guard(slots, inspection)?;
-        let captured = self.issuer.refresh()?;
-        self.guard(slots, inspection)?;
-        fresh_observation(captured, Instant::now(), REFUSED)
+        // A worker's ledger reads are nonblocking. Transient contention is
+        // retried, bounded, while neither cancellation nor revocation holds.
+        retry_contended(
+            &|| self.cancel.is_cancelled(),
+            &|| self.issuer.epoch.effects_revoked(),
+            || {
+                self.guard(slots, inspection)?;
+                let captured = self.issuer.refresh()?;
+                self.guard(slots, inspection)?;
+                fresh_observation(captured, Instant::now(), REFUSED)
+            },
+        )
     }
 
     /// One permit per durable effect.

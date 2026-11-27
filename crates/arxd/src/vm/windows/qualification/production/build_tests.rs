@@ -10,7 +10,9 @@ use super::*;
 use crate::vm::paths::ArtifactPin;
 use crate::vm::qemu_args::{BootPurpose, BootRecipe, SerialName};
 use crate::vm::test_issuer::tests::{FakeSource, assert_admission_closed, config};
-use crate::vm::test_issuer::{Installation, Intent, NativeTarget, SelectedSource, TestIssuer};
+use crate::vm::test_issuer::{
+    Installation, Intent, NativeTarget, SelectedSource, TestIssuer, retry_contended,
+};
 use crate::vm::{BuildAdmission, Capacity, DiskClaim, HostObservation, RequestId, Resources};
 use std::cell::{Cell, RefCell};
 
@@ -1207,21 +1209,39 @@ impl super::super::FixtureQualification {
             reserve_workspace_under(&self.production, self.owner(), generation, &ledger)
                 .map_err(|_| anyhow::anyhow!("fixture build reservation"))
         };
-        let intent = issuer
-            .intent(
-                worker,
-                NativeTarget {
-                    generation: slots.pair.disk.generation,
-                    writer_epoch: None,
-                },
-                cancel,
-            )
-            .map_err(|_| anyhow::anyhow!("fixture build intent"))?;
-        let recipe = intent.build_recipe().expect("admitted build recipe");
-        let origin = StorePins::open(&self.production)
-            .unwrap()
-            .origin(store, boot::marker().unwrap())
-            .unwrap();
+        let cancelled = || cancel.is_cancelled();
+        let revoked = || issuer.epoch().effects_revoked();
+        // As in production, a refusal before the build runs settles the
+        // admitted operation instead of leaving it pending.
+        let prepared = (|| {
+            let intent = issuer
+                .intent(
+                    worker,
+                    NativeTarget {
+                        generation: slots.pair.disk.generation,
+                        writer_epoch: None,
+                    },
+                    cancel,
+                )
+                .map_err(|_| anyhow::anyhow!("fixture build intent"))?;
+            let recipe = intent
+                .build_recipe()
+                .ok_or_else(|| anyhow::anyhow!("admitted build recipe"))?;
+            let origin = retry_contended(&cancelled, &revoked, || {
+                StorePins::open(&self.production)?.origin(store, boot::marker()?)
+            })
+            .map_err(|_| anyhow::anyhow!("fixture build origin"))?;
+            let primary = reserve(slots.pair.disk.generation)?;
+            Ok::<_, anyhow::Error>((intent, recipe, origin, primary))
+        })();
+        let (intent, recipe, origin, primary) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let cause = (!cancelled()).then_some(FailureReason::StagingFailed);
+                controller.fail_build_with(worker, slots, false, cause)?;
+                return Err(error);
+            }
+        };
         let peer = Peer {
             store,
             root: &self.production.path,
@@ -1255,7 +1275,7 @@ impl super::super::FixtureQualification {
             owner: self.owner(),
             size: SIZE,
         }
-        .run(&peer, reserve(slots.pair.disk.generation)?, || {
+        .run(&peer, primary, || {
             reserve_workspace_under(
                 &self.production,
                 self.owner(),

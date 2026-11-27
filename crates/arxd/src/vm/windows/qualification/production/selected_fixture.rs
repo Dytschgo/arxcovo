@@ -7,7 +7,7 @@ use crate::vm::{
     paths::{Artifact, ArtifactPin},
     qualification_record::{Class, Hash, TestRecipes},
     selection_epoch::{Invalidation, Sample},
-    test_issuer::{NativeTarget, SelectedSource, TestIssuer, tests::FakeSource},
+    test_issuer::{NativeTarget, SelectedSource, TestIssuer, retry_contended, tests::FakeSource},
 };
 use clone::{CloneRequest, HeldGolden, OverlayHelper, stage_linked_clone};
 use snapshot::{ControllerSnapshot, Holds, SnapshotRequest, copy_offline_snapshot};
@@ -77,10 +77,12 @@ impl FixtureQualification {
         golden: &SealedGolden,
         cutoff: Instant,
         cancelled: &dyn Fn() -> bool,
+        revoked: &dyn Fn() -> bool,
     ) -> Result<HeldGolden, NativeRefusal> {
-        let binding = controller
-            .native_workspace_scope(golden.slots().disk.generation)
-            .map_err(|_| PATH)?;
+        let binding = retry_contended(cancelled, revoked, || {
+            controller.native_workspace_scope(golden.slots().disk.generation)
+        })
+        .map_err(|_| PATH)?;
         HeldGolden::hold(
             &self.production,
             self.owner(),
@@ -127,30 +129,45 @@ impl FixtureQualification {
         cutoff: Instant,
         cancel: &Shutdown,
     ) -> anyhow::Result<()> {
-        let intent = issuer
-            .intent(
+        let cancelled = || cancel.is_cancelled();
+        let revoked = || issuer.epoch().effects_revoked();
+        // As in production, a refusal before staging settles the clone.
+        let prepared = (|| {
+            let intent = issuer.intent(
                 &worker,
                 NativeTarget {
                     generation: slots.disk.generation,
                     writer_epoch: None,
                 },
                 cancel,
-            )
-            .map_err(|_| anyhow::anyhow!("fixture clone intent"))?;
+            )?;
+            Ok::<_, NativeRefusal>((intent, self.image()?))
+        })();
+        let Ok((intent, image)) = prepared else {
+            controller.finish_native_clone(
+                &worker,
+                slots,
+                Err(crate::vm::FailureReason::CloneFailed),
+                crate::vm::ClonePublication {
+                    golden: None,
+                    effect_cutoff: cutoff,
+                    cancelled: &cancelled,
+                },
+            )?;
+            anyhow::bail!("fixture clone preparation refused");
+        };
         let store = controller.native_store();
         let ledger = LedgerCheckpoints {
             store,
             origin: Origin::Clone,
         };
-        let cancelled = || cancel.is_cancelled();
-        let image = self.image().map_err(|_| anyhow::anyhow!("fixture image"))?;
         let helper = SimulatedOverlay {
             create: |prepared: &helper::PreparedHelper<'_, '_>, plan: &CommandPlan<'_>| {
                 let scope = prepared.workspace().binding();
                 let target = || prepared.launch_target(plan, &self.cwd);
                 let permit = intent.launch(scope, target())?;
                 consume_checked(permit, target(), scope, self.seal_sha256())?;
-                self.record_creation(store, scope, scope.generation)?;
+                self.record_creation(store, scope, scope.generation, &cancelled, &revoked)?;
                 Ok(())
             },
         };
@@ -162,7 +179,7 @@ impl FixtureQualification {
                     .flatten()
                     .ok_or(PATH)
             },
-            |golden| self.hold_golden(controller, &ledger, golden, cutoff, &cancelled),
+            |golden| self.hold_golden(controller, &ledger, golden, cutoff, &cancelled, &revoked),
             || {
                 reserve_workspace_under(
                     &self.production,
@@ -205,16 +222,21 @@ impl FixtureQualification {
         runtime: &tokio::runtime::Handle,
     ) -> anyhow::Result<()> {
         let slots = work.candidate.expect("admitted copy");
-        let intent = issuer
-            .intent(
+        // As in production, a refusal before the copy settles it untouched.
+        let Ok(intent) = issuer.intent(
+            &worker,
+            NativeTarget {
+                generation: slots.disk.generation,
+                writer_epoch: None,
+            },
+            cancel,
+        ) else {
+            return controller.fail_snapshot_copy(
                 &worker,
-                NativeTarget {
-                    generation: slots.disk.generation,
-                    writer_epoch: None,
-                },
-                cancel,
-            )
-            .map_err(|_| anyhow::anyhow!("fixture snapshot intent"))?;
+                &work,
+                [crate::store::vm::snapshot::StagedLeaf::Untouched; 2],
+            );
+        };
         let store = controller.native_store();
         let custody = LedgerCheckpoints {
             store,
@@ -294,6 +316,7 @@ impl FixtureQualification {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn hold_run<C: Clock>(
         &self,
         controller: &VmController<C>,
@@ -301,15 +324,25 @@ impl FixtureQualification {
         epoch: Id,
         pair: StartPair,
         cutoff: Instant,
+        cancelled: &dyn Fn() -> bool,
+        revoked: &dyn Fn() -> bool,
     ) -> anyhow::Result<ProductionWorkspace> {
-        let binding = binding_from_scope(controller.native_workspace_scope(generation)?);
+        let binding = binding_from_scope(retry_contended(cancelled, revoked, || {
+            controller.native_workspace_scope(generation)
+        })?);
         let workspace = hold_workspace_under(&self.production, self.owner(), binding)
             .map_err(|_| anyhow::anyhow!("fixture run hold"))?;
         workspace
             .check_start_pair(pair, cutoff, &|| false)
             .map_err(|_| anyhow::anyhow!("fixture start pair"))?;
-        self.record_creation(controller.native_store(), binding, epoch)
-            .map_err(|_| anyhow::anyhow!("fixture creation checkpoint"))?;
+        self.record_creation(
+            controller.native_store(),
+            binding,
+            epoch,
+            cancelled,
+            revoked,
+        )
+        .map_err(|_| anyhow::anyhow!("fixture creation checkpoint"))?;
         Ok(workspace)
     }
 
@@ -349,18 +382,23 @@ impl FixtureQualification {
         store: &crate::store::vm::VmStore,
         binding: WorkspaceBinding,
         epoch: Id,
+        cancelled: &dyn Fn() -> bool,
+        revoked: &dyn Fn() -> bool,
     ) -> Result<(), NativeRefusal> {
-        let origin = recovery::StorePins::open(&self.production)?.origin(store, boot::marker()?)?;
-        store
-            .try_native_transaction(|db| {
-                crate::store::vm::native::recovery::record_job(
-                    db,
-                    custody::scope(binding),
-                    epoch,
-                    origin,
-                )
-            })
-            .map_err(|_| PATH)
+        retry_contended(cancelled, revoked, || {
+            let origin =
+                recovery::StorePins::open(&self.production)?.origin(store, boot::marker()?)?;
+            store
+                .try_native_transaction(|db| {
+                    crate::store::vm::native::recovery::record_job(
+                        db,
+                        custody::scope(binding),
+                        epoch,
+                        origin,
+                    )
+                })
+                .map_err(|_| PATH)
+        })
     }
 }
 

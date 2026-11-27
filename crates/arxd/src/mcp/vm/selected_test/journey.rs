@@ -20,15 +20,25 @@ pub(super) async fn run(
         slots: start.active.pair.0,
         evidence: start.active.pair.1,
     };
-    let workspace = source.hold_run(
+    let stopped = || owner.stop_signalled() || supervisor.cancel.is_cancelled();
+    let revoked = || issuer.epoch().effects_revoked();
+    let Ok(workspace) = source.hold_run(
         &supervisor.controller,
         target.generation,
         target.epoch,
         pair,
         start.worker.deadline(),
-    )?;
+        &stopped,
+        &revoked,
+    ) else {
+        // As in production: nothing was created, so the committed epoch
+        // goes to recovery and the start settles instead of staying pending.
+        owner.hand_off(supervisor).await;
+        return Ok(());
+    };
     let mut launch = GuestPeer {
         source,
+        issuer,
         generation: target.generation,
         epoch: target.epoch,
     };
@@ -50,8 +60,27 @@ pub(super) async fn run(
 
 struct GuestPeer<'a> {
     source: &'a FixtureQualification,
+    issuer: &'a SelectedTest,
     generation: Id,
     epoch: Id,
+}
+
+impl GuestPeer<'_> {
+    /// One sample per synthetic exchange. A sample refused by transient
+    /// store contention is retried like any background worker read, but
+    /// never past cancellation or revocation.
+    async fn sample(
+        &self,
+        cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<Instant, NativeRefusal> {
+        crate::vm::test_issuer::retry_contended_async(
+            &|| cancel.is_cancelled(),
+            &|| self.issuer.epoch().effects_revoked(),
+            refresh,
+        )
+        .await
+    }
 }
 
 impl native_run::LiveLaunch for GuestPeer<'_> {
@@ -59,11 +88,11 @@ impl native_run::LiveLaunch for GuestPeer<'_> {
 
     async fn boot(
         &mut self,
-        _: &Shutdown,
+        cancel: &Shutdown,
         _: Instant,
-        mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
-        refresh().map(|_| ())
+        self.sample(cancel, refresh).await.map(|_| ())
     }
 
     fn check_live(
@@ -75,10 +104,10 @@ impl native_run::LiveLaunch for GuestPeer<'_> {
 
     async fn ping(
         &mut self,
-        _: &Shutdown,
-        mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+        cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
-        refresh().map(|_| ())
+        self.sample(cancel, refresh).await.map(|_| ())
     }
 
     async fn run_script(
@@ -88,7 +117,7 @@ impl native_run::LiveLaunch for GuestPeer<'_> {
         timeout_s: u32,
         deadline: Instant,
         cancel: &Shutdown,
-        mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(ScriptStatus, Option<u32>), NativeRefusal> {
         if Instant::now() >= deadline
             || cancel.is_cancelled()
@@ -96,7 +125,7 @@ impl native_run::LiveLaunch for GuestPeer<'_> {
         {
             return Err(NativeRefusal::GuestEndpointUnverified);
         }
-        refresh()?;
+        self.sample(cancel, refresh).await?;
         assert_eq!(script.trim(), "exit 0");
         Ok((ScriptStatus::Exited, Some(0)))
     }
@@ -590,6 +619,26 @@ async fn closed_and_opted_in_foreground_use_the_same_native_two_golden_ledger() 
         extended["expires_at_ms"]
     );
 
+    // Extension of a running TEST VM. Every selected effect needs a fresh
+    // epoch whose UTC and monotonic clocks agree, so it precedes any jump.
+    let windows_id = id_of(&windows_vm);
+    let start = session
+        .mutate("vm_start", json!({"vm_id":windows_vm}))
+        .unwrap();
+    session.succeeded(start).await;
+    let running = session
+        .mutate("vm_extend", json!({"vm_id":windows_vm,"ttl_s":3600}))
+        .unwrap();
+    let status = session.call("vm_get", json!({"vm_id":windows_vm})).unwrap();
+    assert_eq!(status["expires_at_ms"], running["expires_at_ms"]);
+    assert!(running["expires_at_ms"].as_i64() > extended["expires_at_ms"].as_i64());
+    assert_eq!(status["ready"], true);
+    let stop = session
+        .mutate("vm_stop", json!({"vm_id":windows_vm}))
+        .unwrap();
+    session.succeeded(stop).await;
+    assert_eq!(session.vm_state(windows_id), 1);
+
     // Ordinary expiry ends a live run: the first turn withdraws it and
     // waits out its release instead of only waking a retry.
     let start = session
@@ -632,23 +681,123 @@ async fn closed_and_opted_in_foreground_use_the_same_native_two_golden_ledger() 
             .unwrap()
     );
 
-    // Extension of a running TEST VM.
+    // Ordinary expiry of the stopped VM disposes everything but the goldens.
+    now.fetch_add(3_601_000, Ordering::SeqCst);
+    session
+        .sweep_until(&supervisor, |session| {
+            session.count("SELECT count(*) FROM vm_instances") == 0
+        })
+        .await;
+    assert_eq!(session.count("SELECT count(*) FROM vm_restore_points"), 0);
+    assert_eq!(session.count("SELECT count(*) FROM vm_disk_claims"), 0);
+    assert_eq!(session.count("SELECT count(*) FROM vm_generations"), 2);
+    assert_eq!(
+        session.count("SELECT count(*) FROM vm_operations WHERE status=0"),
+        0
+    );
+    assert_eq!(inventory(root), goldens);
+
+    supervisor.close();
+    supervisor
+        .drain_workers(Duration::from_secs(5))
+        .await
+        .unwrap();
+    supervisor.recover(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(inventory(root), goldens);
+    advance.abort();
+}
+
+/// A foreground whose fixture selection is installed through the
+/// production installation route, after its startup sweep.
+fn fixture_foreground(root: &Path, now: &Arc<AtomicI64>, origin: Instant) -> Arc<Supervisor> {
+    let source = FixtureQualification::open(root, origin);
+    let recipes = crate::vm::test_issuer::SelectedSource::recipes(&source);
+    let path = |leaf| root.join(leaf).to_str().unwrap().replace('\\', "/");
+    let state = root.to_str().unwrap().replace('\\', "/");
+    let mut profile = profile(&path("missing.json"), &path("dossier"));
+    profile["state"] = json!(state);
+    profile["volume"] = json!(&state[..3]);
+    let runtime = VmRuntimeProfile::parse(&serde_json::to_vec(&profile).unwrap()).unwrap();
+    let mut supervisor = Supervisor::new(
+        root,
+        VmPolicy::default(),
+        ForegroundClock {
+            utc: Some(now.clone()),
+        },
+        Some((recipes.ubuntu.recipe_id, recipes.ubuntu.recipe_sha256)),
+        NativeRefusal::QualificationMissing,
+        Some(runtime),
+    )
+    .unwrap();
+    for path in [
+        root.to_owned(),
+        root.join("activity.sqlite3"),
+        root.join("activity.lock"),
+    ] {
+        crate::dashboard::tests::set_owner_private(&path);
+    }
+    {
+        let supervisor = Arc::get_mut(&mut supervisor).unwrap();
+        supervisor.custody = Some(Arc::new(crate::config::VmCustody::test_only(root).unwrap()));
+        supervisor.install_test_with(|controller, selection| {
+            TestIssuer::open_owned_fixture(controller, Source::Fixture(Box::new(source)), selection)
+        });
+    }
+    supervisor.startup_sweep().unwrap();
+    supervisor
+}
+
+/// The UTC clock follows the monotonic one, as on a real host.
+fn tick(now: &Arc<AtomicI64>, origin: Instant) -> tokio::task::JoinHandle<()> {
+    let now = now.clone();
+    tokio::spawn(async move {
+        loop {
+            now.fetch_max(UTC + origin.elapsed().as_millis() as i64, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+}
+
+/// I12/T49/T50: closure withdraws the live witness and refuses fresh
+/// effects, while the exact owner stop still admits and settles with its
+/// receipt instead of entering recovery.
+#[tokio::test]
+async fn closed_admission_withdraws_witness_and_settles_exact_owner_stop() {
+    let dir = crate::service::application::tests::private_temp();
+    let root = dir.path();
+    let now = Arc::new(AtomicI64::new(UTC));
+    let origin = Instant::now();
+    let supervisor = fixture_foreground(root, &now, origin);
+    let advance = tick(&now, origin);
+    let _close = CloseOnDrop(supervisor.clone());
+    let mut session = Session::new(&supervisor, now.clone());
+    set_busy(&supervisor, false);
+    let recipes = installed(&supervisor).unwrap().recipes();
+    let build = session
+        .mutate(
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(recipes.windows.recipe_id)}),
+        )
+        .unwrap();
+    let template = session.succeeded(build).await["template_id"].clone();
+    let create = session
+        .mutate("vm_create", json!({"template_id":template,"ttl_s":2400}))
+        .unwrap();
+    let windows_vm = session.succeeded(create).await["vm_id"].clone();
     let windows_id = id_of(&windows_vm);
     let start = session
         .mutate("vm_start", json!({"vm_id":windows_vm}))
         .unwrap();
-    session.succeeded(start).await;
-    let running = session
-        .mutate("vm_extend", json!({"vm_id":windows_vm,"ttl_s":3600}))
-        .unwrap();
+    session.succeeded(start.clone()).await;
     let status = session.call("vm_get", json!({"vm_id":windows_vm})).unwrap();
-    assert_eq!(status["expires_at_ms"], running["expires_at_ms"]);
-    assert!(running["expires_at_ms"].as_i64() > extended["expires_at_ms"].as_i64());
     assert_eq!(status["ready"], true);
+    assert_eq!(
+        status["native_boot_witness"]["operation_id"],
+        start["operation_id"]
+    );
 
-    // Closed admission: fresh effects refuse, the exact owner stop still
-    // admits and settles with its receipt. The held guest stop keeps the
-    // drained owner registered until the stop is admitted.
+    // The held guest stop keeps the drained owner registered until the
+    // stop is admitted.
     let Source::Fixture(fixture) = installed(&supervisor).unwrap().source() else {
         unreachable!();
     };
@@ -696,28 +845,60 @@ async fn closed_and_opted_in_foreground_use_the_same_native_two_golden_ledger() 
         1,
         "the receipted stop entered recovery"
     );
-
-    // Ordinary expiry of the stopped VM disposes everything but the goldens.
-    now.fetch_add(3_601_000, Ordering::SeqCst);
-    session
-        .sweep_until(&supervisor, |session| {
-            session.count("SELECT count(*) FROM vm_instances") == 0
-        })
-        .await;
-    assert_eq!(session.count("SELECT count(*) FROM vm_restore_points"), 0);
-    assert_eq!(session.count("SELECT count(*) FROM vm_disk_claims"), 0);
-    assert_eq!(session.count("SELECT count(*) FROM vm_generations"), 2);
-    assert_eq!(
-        session.count("SELECT count(*) FROM vm_operations WHERE status=0"),
-        0
-    );
-    assert_eq!(inventory(root), goldens);
-
     supervisor
         .drain_workers(Duration::from_secs(5))
         .await
         .unwrap();
     supervisor.recover(Duration::from_secs(5)).await.unwrap();
-    assert_eq!(inventory(root), goldens);
     advance.abort();
+}
+
+/// P2-2: a caller-owned Static VM reaching the selected TEST dispatch is
+/// refused, audited, as unqualified rather than unknown.
+#[tokio::test]
+async fn selected_dispatch_refuses_a_static_vm_as_unqualified() {
+    let dir = crate::service::application::tests::private_temp();
+    let root = dir.path();
+    let now = Arc::new(AtomicI64::new(UTC));
+    let supervisor = fixture_foreground(root, &now, Instant::now());
+    let _close = CloseOnDrop(supervisor.clone());
+    let session = Session::new(&supervisor, now.clone());
+    set_busy(&supervisor, false);
+    supervisor
+        .controller
+        .native_store()
+        .transact(|db| {
+            db.execute_batch(
+                "INSERT INTO vm_static_instances(id,name,principal,host,template,source_generation,
+                    recipe_digest,disk_digest,vars_digest,state,persistent,staging,origin_generation)
+                 SELECT unhex('02020202020202020202020202020202'),'web-site','alice',id,zeroblob(16),
+                    unhex('20000000000000000000000000000001'),zeroblob(32),zeroblob(32),zeroblob(32),
+                    1,4096,0,unhex('20000000000000000000000000000001')
+                 FROM vm_state_host WHERE singleton=1;
+                 INSERT INTO vm_generations(id,static_id,generation,active)
+                 VALUES(unhex('20000000000000000000000000000001'),
+                    unhex('02020202020202020202020202020202'),1,1);",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let audited = "SELECT count(*) FROM activity WHERE status=4
+        AND vm=unhex('02020202020202020202020202020202')";
+    assert_eq!(session.count(audited), 0);
+    let selected = supervisor.selected_test.clone().unwrap();
+    let refused = {
+        let mut gate = supervisor.lock().unwrap();
+        selected.dispatch(
+            &session.inventory,
+            &mut gate,
+            Action::Start as i64,
+            Mutation {
+                key: RequestId::parse(&crate::mcp::vm::tests::key(7)).unwrap(),
+                id: [2; 16],
+                work: Work::Start,
+            },
+        )
+    };
+    assert_eq!(refused.unwrap_err().0, "qualification_missing");
+    assert_eq!(session.count(audited), 1);
 }
